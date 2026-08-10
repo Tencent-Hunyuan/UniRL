@@ -89,29 +89,34 @@ class MediaPreview(Batch):
 def _ref_aligned_prefix_len(decoded: Any, min_items: int) -> int:
     """Smallest sample count >= ``min_items`` landing on a TensorRef ref boundary.
 
-    ``decoded`` reaches the driver dehydrated: its tensor leaf (``Images.pixels``
-    / ``Videos.frames``) is a ``TensorRef`` whose refs partition the batch by DP
-    shard, and ``TensorRef`` only supports ref-boundary slicing. The cheapest
-    preview prefix is the first shard boundary covering ``min_items`` samples, so
-    media logging hydrates one shard instead of the full decoded batch.
-    ``Videos`` ref sizes count frames (PACKED), so shard frame boundaries are
-    mapped back to sample indices via the driver-side ``cu_seqlens``. Returns the
-    full batch size when the leaf is already a real tensor (nothing to save) or a
-    boundary cannot be mapped.
+    ``decoded`` reaches the driver dehydrated: its packed tensor leaf
+    (``Images.packed_pixels`` / ``Videos.frames``) is a ``TensorRef`` whose refs
+    partition the batch by DP shard, and ``TensorRef`` only supports ref-boundary
+    slicing. The cheapest preview prefix is the first shard boundary covering
+    ``min_items`` samples, so media logging hydrates one shard instead of the full
+    decoded batch. Ref sizes count packed pixels for ``Images`` and frames for
+    ``Videos``, so both are mapped back to sample indices via the driver-side
+    ``cu_seqlens``. Returns the full batch size when the leaf is already a real
+    tensor (nothing to save) or a boundary cannot be mapped.
     """
     from unirl.distributed.tensor import TensorRef
 
     total = len(decoded)
     want = max(1, min(int(min_items), total))
     if isinstance(decoded, Images):
-        meta = decoded.pixels
-        if not isinstance(meta, TensorRef):
+        meta = decoded.packed_pixels
+        cu = decoded.cu_seqlens
+        if not isinstance(meta, TensorRef) or cu is None:
             return total
-        rows = 0
+        sample_at_pixel = {int(v): i for i, v in enumerate(cu.tolist())}
+        pixels = 0
         for size in meta.sizes:
-            rows += int(size)
-            if rows >= want:
-                return rows
+            pixels += int(size)
+            sample_idx = sample_at_pixel.get(pixels)
+            if sample_idx is None:
+                return total
+            if sample_idx >= want:
+                return sample_idx
         return total
     meta = decoded.frames
     cu = decoded.cu_seqlens
@@ -140,16 +145,17 @@ def build_media_preview_for_part(
 
     ``prompts`` is a per-sample caption list aligned 1:1 with this Part's samples
     (the original prompt texts); ``None`` yields empty captions. ``input_image``
-    is the it2i source image (the chained image input Part's ``Images``), paired
-    beside the output as an edit preview when present.
+    is the it2i source image (the chained image input Part's packed ``Images``),
+    paired beside the output as an edit preview when present.
 
     Two parallel modality paths:
 
-    - **Image path** (``isinstance(part.primitives["image"], Images)``): unbinds
-      ``Images.pixels`` along batch dim into per-sample 3D ``[C, H, W]``
-      tensors and converts each to PIL via ``tensor_frame_to_pil`` (the
-      wandb boundary). Slices to the first 3 channels first — drops
-      alpha / model-specific 4th channel so wandb gets RGB.
+    - **Image path** (``isinstance(part.primitives["image"], Images)``): hydrates
+      packed storage, reconstructs per-sample 3D ``[C, H, W]`` tensors via
+      ``Images.to_list()``, and converts each to PIL via
+      ``tensor_frame_to_pil`` (the wandb boundary). Slices to the first 3
+      channels first — drops alpha / model-specific 4th channel so wandb gets
+      RGB.
     - **Video path** (``isinstance(part.primitives["video"], Videos)``): reads
       per-sample 4D ``[C, T, H, W]`` CPU ``float32`` tensors via
       ``Videos.to_list()`` + ``permute(1, 0, 2, 3)``; keeps them raw,
@@ -185,20 +191,21 @@ def build_media_preview_for_part(
     if isinstance(decoded, Images):
         from unirl.utils.media import hstack_pils, tensor_frame_to_pil
 
-        pixels = decoded.pixels
-        if pixels is None:
+        per_sample = decoded.to_list()
+        if not per_sample:
             return None
-        input_pixels = None
-        if isinstance(input_image, Images) and input_image.pixels is not None:
+        input_pixels: Optional[List[Any]] = None
+        if isinstance(input_image, Images):
             input_image = map_tree(input_image, hydrate)
-            input_pixels = input_image.pixels
-        show_edit_pairs = input_pixels is not None and int(input_pixels.shape[0]) >= int(pixels.shape[0])
-        for idx in range(int(pixels.shape[0])):
+            input_pixels = [image.pixels for image in input_image.to_list()]
+        show_edit_pairs = input_pixels is not None and len(input_pixels) >= len(per_sample)
+        for idx, image in enumerate(per_sample):
             if len(selected_indices) >= limit:
                 break
-            out_pil = tensor_frame_to_pil(pixels[idx][:3])
+            out_pil = tensor_frame_to_pil(image.pixels[:3])
             if show_edit_pairs:
-                in_pil = tensor_frame_to_pil(input_pixels[idx][:3])
+                input_tensor = input_pixels[idx]
+                in_pil = tensor_frame_to_pil(input_tensor[:3])
                 images.append(hstack_pils(in_pil, out_pil))
             else:
                 images.append(out_pil)

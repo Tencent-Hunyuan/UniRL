@@ -33,6 +33,7 @@ _BUILTIN_SCORERS: Dict[str, Tuple[str, str]] = {
     "clap": ("unirl.reward.local.clap", "CLAPRewardScorer"),
     "imagebind": ("unirl.reward.local.imagebind", "ImageBindRewardScorer"),
     "t2av_composite": ("unirl.reward.local.t2av_composite", "T2AVCompositeScorer"),
+    "per_domain": ("unirl.reward.local.per_domain", "PerDomainRewardScorer"),
 }
 
 _BUILTIN_SPECS: Dict[str, Tuple[str, str]] = {
@@ -52,6 +53,7 @@ _BUILTIN_SPECS: Dict[str, Tuple[str, str]] = {
     "clap": ("unirl.reward.local.clap", "CLAPSpec"),
     "imagebind": ("unirl.reward.local.imagebind", "ImageBindSpec"),
     "t2av_composite": ("unirl.reward.local.t2av_composite", "T2AVCompositeSpec"),
+    "per_domain": ("unirl.reward.local.per_domain", "PerDomainSpec"),
 }
 
 

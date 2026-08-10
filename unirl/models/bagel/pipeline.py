@@ -11,7 +11,7 @@ linked gen Parts).
 
 Task routing (``_resolve_task``): explicit ``sample.parts[0].control["task"]`` wins;
 else both ``ar`` + ``diffusion`` gen Parts ⇒ ``t2ti``; an ``ar`` gen Part only ⇒
-text-out; a chained ``Images`` input ⇒ ``it2i`` (editing), else ``t2i``.
+text-out; a chained image input ⇒ ``it2i`` (editing), else ``t2i``.
 
 Per prompt the pipeline builds the three KV-cache contexts the sampler needs
 (mirroring ``InterleaveInferencer.interleave_inference``, ``think=False``;
@@ -198,7 +198,7 @@ class BagelPipeline(Pipeline):
 
         Requires an ``Images`` primitive in the conditioning chain, a ViT-loaded
         bundle (``enable_vit``), and — when prompts are present — a matching
-        per-sample count.
+        per-sample count. Packed storage preserves each input's native resolution.
         """
         images_prim = next((c for c in conditioning if isinstance(c, Images)), None)
         if not isinstance(images_prim, Images):
@@ -210,7 +210,7 @@ class BagelPipeline(Pipeline):
                 f"BagelPipeline.generate ({task}): the bundle was built without the und ViT; "
                 "set BagelPipelineConfig.enable_vit=true for image-input tasks."
             )
-        pil_images = [img.to_pil() for img in images_prim.to_list()]
+        pil_images = images_prim.to_pils()
         if n_prompts is not None and len(pil_images) != n_prompts:
             raise ValueError(
                 f"BagelPipeline.generate ({task}): image count {len(pil_images)} != prompt count {n_prompts}"
@@ -404,9 +404,9 @@ class BagelPipeline(Pipeline):
 
         Inference from the pre-forked gen Parts + chained inputs: both an ``ar`` +
         a ``diffusion`` gen Part ⇒ ``t2ti`` (think-then-generate); an ``ar`` gen
-        Part only ⇒ text-out (``it2t`` with an ``Images`` input, else ``t2t``; pure
+        Part only ⇒ text-out (``it2t`` with an image input, else ``t2t``; pure
         ``i2t`` — image, no prompt — must be explicit); a ``diffusion`` gen Part
-        only ⇒ image-out (``it2i`` with an ``Images`` input, else ``t2i``).
+        only ⇒ image-out (``it2i`` with an image input, else ``t2i``).
         """
         task = (sample.parts[0].control or {}).get("task")
         if task is not None:

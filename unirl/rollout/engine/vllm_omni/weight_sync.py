@@ -3,7 +3,7 @@
 ``WeightSync`` is a plain object the engine constructs over the seam: it takes
 the backend and the LoRA transport choice explicitly and owns ALL sync/LoRA
 state (``_lora_loaded`` / ``_weights_released`` / ``_last_lora_*``). Method
-names mirror the frozen ``synchronous.py`` surface minus ``track_prefix`` (the
+names mirror the frozen ``base.py`` surface minus ``track_prefix`` (the
 engine's forwards absorb that), so a grep for a trainer-side entry point lands
 here. The transports declared are exactly what vllm-omni supports: bucketed
 CUDA-IPC, NCCL (init/transfer/destroy), the SGLang-shape tensor bag, and the

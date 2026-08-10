@@ -31,6 +31,7 @@ from .base import (
     _gaussian_kl_div,
     _reference_kl_loss,
     _reference_replay_means,
+    _require_replay_anchor_for_batched_replay,
     _resolve_reference_model,
     _transition_sigma,
     gather_sde_field,
@@ -206,6 +207,7 @@ class FlowDPPO(StageAlgorithm):
             self.old_logp_source in ("rollout", "replay"),
             f"FlowDPPO: old_logp_source must be 'rollout' or 'replay'; got {old_logp_source!r}",
         )
+        _require_replay_anchor_for_batched_replay(self.stage, self.old_logp_source, algo="FlowDPPO")
         self.conditions_cls = conditions_cls
 
     def prepare_segment(

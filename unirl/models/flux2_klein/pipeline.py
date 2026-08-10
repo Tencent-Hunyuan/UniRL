@@ -87,6 +87,7 @@ class Flux2KleinPipeline(Pipeline):
         autocast_precision: str = "bf16",
         trajectory_precision: str = "fp16",
         logprob_precision: str = "fp32",
+        batch_replay_steps: bool = False,
         max_sequence_length: int = 512,
         qwen3_extraction_layers: Tuple[int, ...] = (9, 18, 27),
     ) -> None:
@@ -109,6 +110,7 @@ class Flux2KleinPipeline(Pipeline):
                 autocast_precision=autocast_precision,
                 trajectory_precision=trajectory_precision,
                 logprob_precision=logprob_precision,
+                batch_replay_steps=batch_replay_steps,
             )
         self.diffusion = diffusion
         self.vae_decode = vae_decode if vae_decode is not None else Flux2KleinVAEDecodeStage(bundle)
@@ -182,6 +184,7 @@ class Flux2KleinPipeline(Pipeline):
             autocast_precision=config.autocast_precision,
             trajectory_precision=config.trajectory_precision,
             logprob_precision=config.logprob_precision,
+            batch_replay_steps=config.batch_replay_steps,
         )
         vae_decode = Flux2KleinVAEDecodeStage(bundle)
         return cls(
@@ -259,11 +262,9 @@ class Flux2KleinPipeline(Pipeline):
 
         klein_conds = self.build_conditions(texts, guidance_scale=float(params.guidance_scale))
         if source_image is not None:
-            if source_image.pixels is None or int(source_image.pixels.shape[0]) != len(texts.texts):
+            if len(source_image) != len(texts.texts):
                 raise ValueError(
-                    f"Flux2KleinPipeline.generate: image count "
-                    f"{None if source_image.pixels is None else int(source_image.pixels.shape[0])} "
-                    f"!= text count {len(texts.texts)}"
+                    f"Flux2KleinPipeline.generate: image count {len(source_image)} != text count {len(texts.texts)}"
                 )
             image_tokens, image_ids = self.vae_encode.encode(
                 source_image,

@@ -6,7 +6,7 @@ picked from the registry by ``config.model_family``, owns the
 owns the SRT runtime — server subprocess + HTTP, or the in-process Engine,
 picked by ``config.backend``). Weight sync is a :class:`WeightSync` component
 constructed over the seam; the offload lifecycle (the two staged flags) lives
-directly on the engine. The frozen ``synchronous.py`` surface is implemented as thin
+directly on the engine. The frozen ``base.py`` surface is implemented as thin
 forwards here — they must be real class attributes anyway (``Worker.call``
 dispatches by name; ``@distributed`` binds the most-derived attribute) — which
 also absorbs the surface quirks (``track_prefix``) so the component keeps clean
@@ -14,7 +14,7 @@ signatures.
 
 One-shot construction: after ``__init__`` returns, the SRT server is spawned and
 healthy and the engine is usable. ``generate`` / ``sleep`` / ``wake_up``
-re-apply ``@distributed`` (the decorator is not inherited — see ``synchronous.py``).
+re-apply ``@distributed`` (the decorator is not inherited — see ``base.py``).
 No environment mutation happens here — the spawn-scoped env the SRT
 subprocesses need is quarantined in the backends' ``boot``.
 """
@@ -28,18 +28,18 @@ import torch
 
 from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, distributed
+from unirl.rollout.engine.base import BaseRolloutEngine
 from unirl.rollout.engine.sglang.adapters import get_adapter
 from unirl.rollout.engine.sglang.backends import HTTPBackend, NativeBackend
 from unirl.rollout.engine.sglang.config import SGLangEngineConfig, SGLangPorts
 from unirl.rollout.engine.sglang.utils import resolve_sampling
 from unirl.rollout.engine.sglang.weight_sync import WeightSync
-from unirl.rollout.engine.synchronous import SyncRolloutEngine
 from unirl.types.sample import Sample
 
 logger = logging.getLogger(__name__)
 
 
-class SGLangRolloutEngine(SyncRolloutEngine):
+class SGLangRolloutEngine(BaseRolloutEngine):
     """LLM/VLM rollout engine backed by a SGLang SRT server (v2 layout)."""
 
     _component_name = "sglang"
@@ -176,7 +176,7 @@ class SGLangRolloutEngine(SyncRolloutEngine):
             uses_lora=bool(engine_kwargs.get("enable_lora", False)),
         )
 
-        self._weight_version = 0
+        self._version = 0
 
     def _prepare_generation(self, sample: Sample) -> Any:
         require(
@@ -192,7 +192,7 @@ class SGLangRolloutEngine(SyncRolloutEngine):
         return prepared
 
     def _finish_generation(self, sample: Sample, prepared: Any, raw: List[Any]) -> Sample:
-        return self._stamp_weight_version(self.adapter.build_response(sample, prepared, raw))
+        return self._stamp_output_version(self.adapter.build_response(sample, prepared, raw))
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
     def generate(self, sample: Sample) -> Sample:
@@ -332,7 +332,7 @@ class SGLangRolloutEngine(SyncRolloutEngine):
             load_format=load_format,
             flush_cache=flush_cache,
         )
-        self._weight_version += 1
+        self._version += 1
 
     def init_weights_update_group(
         self,
@@ -383,7 +383,7 @@ class SGLangRolloutEngine(SyncRolloutEngine):
             group_name=group_name,
             flush_cache=flush_cache,
         )
-        self._weight_version += 1
+        self._version += 1
 
     def destroy_weights_update_group(
         self,

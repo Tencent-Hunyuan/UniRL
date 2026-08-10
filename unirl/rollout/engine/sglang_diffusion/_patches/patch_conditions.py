@@ -79,6 +79,17 @@ from dataclasses import field
 
 logger = logging.getLogger(__name__)
 
+# The condition fields default to None and are typed
+# ``list[torch.Tensor] | None`` (one entry per text encoder) on
+# OutputBatch; ``Any``-typed on GenerationResult to match its existing style.
+#
+# ``image_latent`` is represented as ``list[encoder=1][B, S_img, C]``.
+# Expanded outputs belong to one prompt and share ``S_img``; mixed-resolution
+# prompts remain separate GenerationResults and become ragged in the adapter.
+#
+# ``image_latent_sizes`` (Edit-Plus only) carries the prompt's
+# ``vae_image_sizes`` (a ``list[tuple[int, int]]`` of pixel (W, H) pairs from
+# upstream's ``preprocess_vae_image``) as ``list[encoder][source_image]``.
 _COND_FIELDS = (
     "prompt_embeds",
     "audio_prompt_embeds",
@@ -253,27 +264,25 @@ def _copy_conditions(src, output_batch) -> None:
         _copy_mapped_conditions(src, output_batch, _POS_MAP)
     if getattr(src, "return_negative_prompt_embeds", False):
         _copy_mapped_conditions(src, output_batch, _NEG_MAP)
+    # A request group contains replicas of one prompt, so its image latents
+    # share one token grid and can remain a regular [B, S_img, C] tensor.
     image_latent = getattr(src, "image_latent", None)
     if image_latent is not None:
-        import torch
+        values = image_latent if isinstance(image_latent, (list, tuple)) else [image_latent]
+        output_batch.image_latent = _to_cpu_embed_list(values)
 
-        if torch.is_tensor(image_latent):
-            output_batch.image_latent = [image_latent.detach().cpu()]
-        elif isinstance(image_latent, (list, tuple)):
-            output_batch.image_latent = [t.detach().cpu() if torch.is_tensor(t) else t for t in image_latent]
     vae_image_sizes = getattr(src, "vae_image_sizes", None)
     if vae_image_sizes is not None:
         output_batch.image_latent_sizes = [vae_image_sizes]
+
     condition_image_latent_ids = getattr(src, "condition_image_latent_ids", None)
     if condition_image_latent_ids is not None:
-        import torch
-
-        if torch.is_tensor(condition_image_latent_ids):
-            output_batch.condition_image_latent_ids = [condition_image_latent_ids.detach().cpu()]
-        elif isinstance(condition_image_latent_ids, (list, tuple)):
-            output_batch.condition_image_latent_ids = [
-                t.detach().cpu() if torch.is_tensor(t) else t for t in condition_image_latent_ids
-            ]
+        values = (
+            condition_image_latent_ids
+            if isinstance(condition_image_latent_ids, (list, tuple))
+            else [condition_image_latent_ids]
+        )
+        output_batch.condition_image_latent_ids = _to_cpu_embed_list(values)
 
 
 def _copy_mapped_conditions(src, output_batch, mapping) -> None:
@@ -440,6 +449,7 @@ def _merge_conditions(merged, output_batches) -> None:
             if any(t is None for t in tensors):
                 merged_list.append(None)
             elif name == "image_latent_sizes":
+                # Expanded outputs share one prompt and therefore one source grid.
                 merged_list.append(tensors[0])
             else:
                 merged_list.append(torch.cat(tensors, dim=0))
@@ -471,10 +481,7 @@ def _wrap_result_common(DiffGenerator) -> None:
         idx = 0 if output_index is None else int(output_index)
         for name in _COND_FIELDS:
             val = getattr(output_batch, name, None)
-            if name == "image_latent_sizes":
-                common[name] = val
-            else:
-                common[name] = _slice_embed_list(val, idx)
+            common[name] = val if name == "image_latent_sizes" else _slice_embed_list(val, idx)
         return common
 
     setattr(_result_common, _RESULT_COMMON_SENTINEL, True)

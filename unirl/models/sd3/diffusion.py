@@ -26,6 +26,7 @@ from typing import ClassVar, List, Optional, Set, Tuple
 
 import torch
 
+from unirl.models.types.batched_replay import BatchedStepReplayMixin
 from unirl.models.types.diffusion import DiffusionStage, DiffusionStep
 from unirl.models.types.replay_result import ReplayResult
 from unirl.sde.kernels import SDEStrategy, StepStrategy
@@ -223,7 +224,7 @@ class SD3DiffusionStep(DiffusionStep[SD3Bundle, SD3Conditions]):
         )
 
 
-class SD3DiffusionStage(DiffusionStage[SD3Conditions]):
+class SD3DiffusionStage(BatchedStepReplayMixin, DiffusionStage[SD3Conditions]):
     """SD3 rollout-level diffusion stage.
 
     Owns the SDE ``strategy`` (stateful strategies like ``DPM2Strategy``
@@ -487,74 +488,8 @@ class SD3DiffusionStage(DiffusionStage[SD3Conditions]):
         means_t = torch.stack(prev_sample_means, dim=1).to(dtype=self.trajectory_dtype) if prev_sample_means else None
         return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
 
-    def _replay_batched_steps(
-        self,
-        conditions: SD3Conditions,
-        *,
-        segment: LatentSegment,
-        params: DiffusionSamplingParams,
-        target: List[int],
-        sigmas: torch.Tensor,
-        sigma_max: torch.Tensor,
-        device: torch.device,
-    ) -> ReplayResult:
-        """Replay all ``target`` SDE steps in a single batched forward.
-
-        Equivalent to the serial loop above but stacks the S steps on the batch
-        dim: ``sample``/``prev_sample`` become ``[S*B, C, H, W]`` (step-major),
-        the conditioning text embeds are tiled S× to ``[S*B, ...]``, and the
-        per-step ``sigma``/``sigma_next`` ride as ``[S*B]`` vectors. One
-        ``step_with_logp`` call then does ONE transformer forward (CFG batching,
-        noise prediction) and one vectorized SDE transition over the whole stack;
-        the per-step log-probs are reshaped back to ``[B, S]``. The SD3
-        transformer has no cross-sample interaction, so per-sample results match
-        the serial path up to bf16 batch-shape rounding — and because the π_old
-        anchor is replayed through this same method, the on-policy ratio is still
-        exactly 1.
-
-        ``step_index`` is passed as ``target[0]`` for signature parity; the
-        guarded stateless SDE strategies ignore it.
-        """
-        S = len(target)
-        sample_all = torch.cat([segment.latents_at(i).to(device) for i in target], dim=0)
-        prev_all = torch.cat([segment.latents_at(i + 1).to(device) for i in target], dim=0)
-        B = sample_all.shape[0] // S
-        sigma_all = torch.cat([sigmas[i].to(torch.float32).expand(B) for i in target], dim=0)
-        sigma_next_all = torch.cat([sigmas[i + 1].to(torch.float32).expand(B) for i in target], dim=0)
-        tiled = self._tile_conditions(conditions, S)
-
-        _, log_prob_all, prev_mean_all = self.step.step_with_logp(
-            self.model,
-            tiled,
-            strategy=self.strategy,
-            sample=sample_all,
-            prev_sample=prev_all,
-            sigma=sigma_all,
-            sigma_next=sigma_next_all,
-            guidance_scale=float(params.guidance_scale),
-            eta=float(params.eta),
-            sigma_max=sigma_max,
-            step_index=int(target[0]),
-        )
-        if log_prob_all is None:
-            raise RuntimeError(
-                "SD3DiffusionStage._replay_batched_steps: strategy returned None log-prob "
-                "(deterministic mode); batched replay requires a stochastic SDE strategy."
-            )
-        log_probs_t = log_prob_all.view(S, B).transpose(0, 1).contiguous().to(dtype=self.logprob_dtype)
-        means_t = None
-        if prev_mean_all is not None:
-            tail = prev_mean_all.shape[1:]
-            means_t = prev_mean_all.view(S, B, *tail).transpose(0, 1).contiguous().to(dtype=self.trajectory_dtype)
-        return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
-
     @staticmethod
     def _tile_conditions(conditions: SD3Conditions, repeats: int) -> SD3Conditions:
-        """Repeat the text (and CFG-negative) embeds ``repeats``× along the batch
-        dim so they align with the step-major ``[S*B, ...]`` sample stack — each
-        block of B reuses the same per-sample conditioning, since all S steps
-        replay the SAME B trajectories at different timesteps."""
-
         def _rep(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
             return t.repeat(repeats, *([1] * (t.dim() - 1))) if t is not None else None
 

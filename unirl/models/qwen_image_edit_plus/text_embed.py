@@ -99,7 +99,7 @@ class QwenImageEditPlusTextEmbedStage(ImageConditionedEmbedStage[Texts, Images, 
         )
 
     def _condition_pils(self, images: Images):
-        """Convert source ``Images`` to per-sample PILs resized to the
+        """Convert source images to per-sample PILs resized to the
         condition grid (≈384², aspect-preserving), mirroring upstream's
         ``image_processor.resize`` before the VL processor."""
         import PIL.Image

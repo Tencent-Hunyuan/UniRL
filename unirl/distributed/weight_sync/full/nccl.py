@@ -197,7 +197,6 @@ class NCCLWeightSync(FullWeightSync):
             for _, tensor in bucket:
                 dist.broadcast(tensor.data.contiguous(), 0, group=self._model_update_group)
             ray.get(recv_refs)
-        self.weight_version += 1
 
 
 __all__ = ["NCCLWeightSync"]

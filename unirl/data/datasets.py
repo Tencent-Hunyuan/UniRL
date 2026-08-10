@@ -123,9 +123,11 @@ def normalize_prompt_example(
 def _resolve_media_uri(raw_path: str, *, base_dir: Optional[str] = None) -> str:
     """Resolve a media path to an absolute URI.
 
-    - Absolute paths and URLs (http://, https://, s3://, gs://) are returned as-is.
+    - Absolute paths and HTTP(S) URLs are returned as-is.
     - Relative paths are joined with *base_dir* (if provided) to produce an
       absolute filesystem path.
+    - ``s3://`` / ``gs://`` pass through here but are rejected when constructing
+      :class:`MediaRef` until a materialize step exists.
     """
     if raw_path.startswith(("http://", "https://", "s3://", "gs://")):
         return raw_path

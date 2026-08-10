@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import torch
 
@@ -50,6 +50,10 @@ def _tensor_stats(prefix: str, tensor: Optional[torch.Tensor]) -> Dict[str, floa
     if tensor is None or (not torch.is_tensor(tensor)) or tensor.numel() == 0:
         return {}
     flat = tensor.detach().to(dtype=torch.float32).reshape(-1).cpu()
+    # Non-finite marks "not scored" rows (per-domain component rewards use NaN).
+    flat = flat[torch.isfinite(flat)]
+    if flat.numel() == 0:
+        return {}
     return {
         f"{prefix}_mean": float(flat.mean().item()),
         f"{prefix}_std": float(flat.std(unbiased=False).item()),
@@ -160,6 +164,37 @@ def compute_rollout_sample_metrics(*, sample: Any, trunc_len: Optional[int] = No
                 cat = tensor.detach().to(dtype=torch.float32).reshape(-1).cpu()
                 metrics.update(_tensor_stats(f"{prefix}reward_{safe_name}", cat))
 
+    return metrics
+
+
+def pooled_window_reward_metrics(parts: Sequence[Any]) -> Dict[str, float]:
+    """Reward metrics pooled over an accumulation window's gen Parts.
+
+    Emits the same keys as the single-gen-part branch of
+    :func:`compute_rollout_sample_metrics` (``num_samples``, ``reward_*``,
+    ``reward_<component>_*``, group stats), so the trainer can merge them over
+    the final rollout's partial view via ``extra_metrics``. With per-domain
+    scorers each rollout carries NaN outside its own domain; pooling plus the
+    finite-filter in :func:`_tensor_stats` gives every domain a finite point.
+    """
+    metrics: Dict[str, float] = {"num_samples": float(sum(int(p.batch_size) for p in parts))}
+    rewards = [getattr(p, "rewards", None) for p in parts]
+    if all(torch.is_tensor(r) and r.numel() > 0 for r in rewards):
+        pooled = torch.cat([r.detach().to(dtype=torch.float32).reshape(-1).cpu() for r in rewards])
+        metrics.update(_tensor_stats("reward", pooled))
+        group_ids = [g for p in parts for g in (getattr(p, "group_ids", None) or [])]
+        zero_cnt, group_cnt = _zero_std_group_counts_from_ids(pooled, group_ids)
+        if group_cnt > 0:
+            metrics["zero_std_group_ratio"] = float(zero_cnt) / float(group_cnt)
+            metrics["zero_std_group_count"] = float(zero_cnt)
+            metrics["group_count"] = float(group_cnt)
+    components = [getattr(p, "component_rewards", None) for p in parts]
+    if components and all(isinstance(c, dict) for c in components):
+        for cname in sorted(set.intersection(*(set(c) for c in components))):
+            tensors = [c[cname] for c in components]
+            if all(torch.is_tensor(t) and t.numel() > 0 for t in tensors):
+                pooled_c = torch.cat([t.detach().to(dtype=torch.float32).reshape(-1).cpu() for t in tensors])
+                metrics.update(_tensor_stats(f"reward_{str(cname).replace('/', '_')}", pooled_c))
     return metrics
 
 

@@ -22,6 +22,7 @@ modulo the model they wrap.
 from __future__ import annotations
 
 from unirl.models.types.ar import ARSamplingParams, ARStage, ARStep
+from unirl.models.types.batched_replay import BatchedStepReplayMixin
 from unirl.models.types.bundle import Bundle
 from unirl.models.types.codec import DecodeStage, EncodeStage
 from unirl.models.types.diffusion import DiffusionStage, DiffusionStep
@@ -33,6 +34,7 @@ __all__ = [
     "ARSamplingParams",
     "ARStage",
     "ARStep",
+    "BatchedStepReplayMixin",
     "Bundle",
     "DecodeStage",
     "DiffusionStage",

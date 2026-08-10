@@ -238,7 +238,7 @@ class ImageAdapter(ModelAdapter):
         )
 
     def build_decoded(self, sample: Sample, results: List[RawResult]):
-        return utils.stack_decoded_images(results, squeeze_single_frame_4d=self.squeeze_single_frame_4d)
+        return utils.pack_decoded_images(results, squeeze_single_frame_4d=self.squeeze_single_frame_4d)
 
     def build_condition(self, results: List[RawResult]) -> Dict[str, Any]:
         text_cond, neg_text_cond = utils.fuse_text_conditions(results, allow_mask_pad=self.pad_mask_to_embeds)

@@ -1,0 +1,117 @@
+# @package _global_
+# Qwen3-Omni Thinker · standalone WAV audio QA · LoRA SFT · 4 GPU.
+#
+# Prepare (--supervised defaults to datasets/dcase2025_audio_qa_sft):
+#   python datasets/dcase2025_audio_qa/convert_dcase2025_audio_qa_to_unirl.py \
+#     --snapshot /path/to/dcase2025-audio-qa \
+#     --supervised
+#
+# Launch:
+#   QWEN3_OMNI_PATH=/path/to/Qwen3-Omni-30B-A3B-Instruct \
+#   SFT_DATA=datasets/dcase2025_audio_qa_sft/train.jsonl \
+#   SFT_EVAL_DATA=datasets/dcase2025_audio_qa_sft/val.jsonl \
+#   ENTRY=train_sft bash examples/run_experiment_single_node.sh \
+#     sft/validation/qwen3_omni_audio_sft_lora
+
+num_devices: 4
+devices_per_node: 4
+batch_size: 4
+num_steps: 200
+eval_interval: 10
+eval_batch_size: 4
+eval_num_samples: 64
+save_interval: 50
+save_dir: ${oc.env:SFT_SAVE_DIR,checkpoints/sft_qwen3_omni_audio}
+save_mode: auto
+
+logging:
+  report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,false}}
+  project_name: ${oc.env:WANDB_PROJECT,unirl-qwen3-omni-sft}
+  run_name: ${oc.env:WANDB_RUN_NAME,qwen3-omni-dcase-audio-sft-lora}
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: [sft, qwen3-omni, thinker, audio, standalone-audio, lora, dcase]
+
+bundle:
+  _target_: unirl.models.qwen3_omni.bundle.Qwen3OmniBundle.from_config
+  config:
+    _target_: unirl.models.qwen3_omni.config.Qwen3OmniPipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:QWEN3_OMNI_PATH,/path/to/Qwen3-Omni-30B-A3B-Instruct}
+    model_precision: bf16
+    attn_implementation: flash_attention_2
+    freeze_vision_tower: true
+    freeze_audio_tower: true
+    use_lora: true
+    lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
+    use_gradient_checkpointing: true
+    max_prompt_length: 16384
+    use_audio_in_video: false
+
+pipeline:
+  _target_: unirl.models.qwen3_omni.pipeline.Qwen3OmniPipeline.from_bundle
+  max_prompt_length: 16384
+  use_audio_in_video: false
+  autocast_precision: bf16
+  logprob_precision: fp32
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["Qwen3OmniMoeThinkerTextDecoderLayer"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    forward_prefetch: true
+    activation_checkpointing: false
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 1.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: cosine
+    warmup_steps: 5
+    total_steps: ${num_steps}
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 32
+    alpha: 64
+    dropout: 0.0
+    bias: none
+    task_type: CAUSAL_LM
+    target_modules:
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+    exclude_modules: ".*visual.*|.*audio_tower.*"
+
+algorithm:
+  _target_: unirl.algorithms.sft.SFT
+  stage_attr: ar
+  loss_agg_mode: token-mean
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.qwen3_omni.conditions.Qwen3OmniARConditions
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+
+track_builder:
+  _target_: unirl.train.sft.track_builder.ARSupervisedTrackBuilder
+  max_response_length: 128
+
+data_source:
+  _target_: unirl.data.sft.SupervisedDataSource
+  manifest_path: ${oc.env:SFT_DATA,datasets/dcase2025_audio_qa_sft/train.jsonl}
+  eval_manifest_path: ${oc.env:SFT_EVAL_DATA,datasets/dcase2025_audio_qa_sft/val.jsonl}
+  seed: 42

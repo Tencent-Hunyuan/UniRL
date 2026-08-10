@@ -26,7 +26,7 @@ is always required.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Dict, List, Optional
 
 import torch
 
@@ -64,6 +64,72 @@ class QwenImageEditPlusDiffusionStep(QwenImageDiffusionStep):
         latent_w: int,
         distilled_guidance_scale: Optional[float] = None,
     ) -> torch.Tensor:
+        """Run shape-homogeneous microbatches and restore sample order.
+
+        Source-image latent grids depend on each input's native aspect ratio.
+        Grouping here is shared by rollout and replay, so neither path pads or
+        warps a condition latent and both execute the same transformer calls.
+        """
+        image_latent_cond = conditions.image_latent
+        if image_latent_cond is None or not image_latent_cond.latents:
+            raise ValueError(
+                "QwenImageEditPlusDiffusionStep.predict_noise: conditions.image_latent is None. "
+                "Edit-Plus is edit-only and requires a source image."
+            )
+        if len(image_latent_cond.latents) != int(sample.shape[0]):
+            raise ValueError(
+                "QwenImageEditPlusDiffusionStep.predict_noise: source-image latent count "
+                f"{len(image_latent_cond.latents)} != sample batch {int(sample.shape[0])}"
+            )
+
+        groups: Dict[tuple[int, ...], List[int]] = {}
+        for index, latent in enumerate(image_latent_cond.latents):
+            if latent.ndim != 3:
+                raise ValueError(
+                    "QwenImageEditPlusDiffusionStep.predict_noise: each source-image latent "
+                    f"must be [C, H, W], got {tuple(latent.shape)}"
+                )
+            groups.setdefault(tuple(latent.shape), []).append(index)
+
+        result = None
+        for indices in groups.values():
+            batch_indices = torch.tensor(indices, device=sample.device, dtype=torch.long)
+            sub_conditions = conditions.select(indices)
+            sub_sigma = (
+                sigma.index_select(0, batch_indices.to(sigma.device))
+                if sigma.dim() > 0 and int(sigma.shape[0]) == int(sample.shape[0])
+                else sigma
+            )
+            sub_image_latents = torch.stack(sub_conditions.image_latent.latents, dim=0)
+            prediction = self._predict_noise_uniform(
+                model,
+                sample.index_select(0, batch_indices),
+                sub_sigma,
+                sub_conditions,
+                sub_image_latents,
+                guidance_scale=guidance_scale,
+                latent_h=latent_h,
+                latent_w=latent_w,
+                distilled_guidance_scale=distilled_guidance_scale,
+            )
+            if result is None:
+                result = prediction.new_empty(sample.shape)
+            result.index_copy_(0, batch_indices, prediction)
+        return result
+
+    def _predict_noise_uniform(
+        self,
+        model: QwenImageEditPlusBundle,
+        sample: torch.Tensor,
+        sigma: torch.Tensor,
+        conditions: QwenImageEditPlusConditions,
+        image_latents: torch.Tensor,
+        *,
+        guidance_scale: float,
+        latent_h: int,
+        latent_w: int,
+        distilled_guidance_scale: Optional[float] = None,
+    ) -> torch.Tensor:
         """Run the Edit-Plus transformer with source-image token concat + CFG.
 
         Packs ``sample`` ``[B, C, H, W]`` → ``[B, (H/2)*(W/2), C*4]``. When
@@ -90,13 +156,8 @@ class QwenImageEditPlusDiffusionStep(QwenImageDiffusionStep):
         packed = _pack_latents(sample).to(dtype=dtype)
         noise_seq_len = int(packed.shape[1])
 
-        image_latent_cond = conditions.image_latent
-        if image_latent_cond is None or image_latent_cond.latents is None:
-            raise ValueError(
-                "QwenImageEditPlusDiffusionStep.predict_noise: conditions.image_latent is None. "
-                "Edit-Plus is edit-only and requires a source image."
-            )
-        image_latents = image_latent_cond.latents.to(device=device, dtype=dtype)
+        # --- Source-image latent concat (Edit-Plus extension) -------------
+        image_latents = image_latents.to(device=device, dtype=dtype)
         img_latent_h = int(image_latents.shape[-2])
         img_latent_w = int(image_latents.shape[-1])
         image_packed = _pack_latents(image_latents)
@@ -115,12 +176,10 @@ class QwenImageEditPlusDiffusionStep(QwenImageDiffusionStep):
             guidance_value = guidance_scale if distilled_guidance_scale is None else float(distilled_guidance_scale)
             guidance = torch.tensor([guidance_value], device=device, dtype=torch.float32).expand(batch_size)
 
-        true_lens = prompt_embeds_mask.sum(dim=1).to(torch.long)
-        max_true = int(true_lens.max().item())
+        max_true = int(prompt_embeds_mask.sum(dim=1).max().item())
         if prompt_embeds.shape[1] > max_true:
             prompt_embeds = prompt_embeds[:, :max_true]
             prompt_embeds_mask = prompt_embeds_mask[:, :max_true]
-        txt_seq_lens = true_lens.tolist()
 
         noise_pred_packed = model.transformer(
             hidden_states=packed,
@@ -129,7 +188,6 @@ class QwenImageEditPlusDiffusionStep(QwenImageDiffusionStep):
             encoder_hidden_states_mask=prompt_embeds_mask,
             encoder_hidden_states=prompt_embeds,
             img_shapes=img_shapes,
-            txt_seq_lens=txt_seq_lens,
             return_dict=False,
         )[0]
 
@@ -144,12 +202,10 @@ class QwenImageEditPlusDiffusionStep(QwenImageDiffusionStep):
                     raise ValueError(
                         "QwenImageEditPlusDiffusionStep.predict_noise: conditions.negative_text.attn_mask is None"
                     )
-                neg_true = negative_prompt_embeds_mask.sum(dim=1).to(torch.long)
-                neg_max = int(neg_true.max().item())
+                neg_max = int(negative_prompt_embeds_mask.sum(dim=1).max().item())
                 if negative_prompt_embeds.shape[1] > neg_max:
                     negative_prompt_embeds = negative_prompt_embeds[:, :neg_max]
                     negative_prompt_embeds_mask = negative_prompt_embeds_mask[:, :neg_max]
-                negative_txt_seq_lens = neg_true.tolist()
                 negative_noise_pred_packed = model.transformer(
                     hidden_states=packed,
                     timestep=timestep,
@@ -157,7 +213,6 @@ class QwenImageEditPlusDiffusionStep(QwenImageDiffusionStep):
                     encoder_hidden_states_mask=negative_prompt_embeds_mask,
                     encoder_hidden_states=negative_prompt_embeds,
                     img_shapes=img_shapes,
-                    txt_seq_lens=negative_txt_seq_lens,
                     return_dict=False,
                 )[0]
                 negative_noise_pred_packed = negative_noise_pred_packed[:, :noise_seq_len]
@@ -179,9 +234,24 @@ class QwenImageEditPlusDiffusionStage(QwenImageDiffusionStage):
     all pick up the source-image concat automatically (verified delegation
     chain: ``step_with_logp`` → ``step`` → ``self.predict_noise``).
 
-    The type parameter widens to :class:`QwenImageEditPlusConditions`; no
-    body override is needed.
+    The denoising loop remains inherited. ``_tile_conditions`` only extends
+    batched-step replay so the source-image latent list is tiled with the text
+    conditions instead of being dropped by the base Qwen-Image implementation.
     """
+
+    @staticmethod
+    def _tile_conditions(
+        conditions: QwenImageEditPlusConditions,
+        repeats: int,
+    ) -> QwenImageEditPlusConditions:
+        """Tile text and ragged image conditions in step-major order.
+
+        Batched-step replay stacks ``repeats`` copies of the trajectory batch.
+        Concatenating the typed condition batch preserves that same order and,
+        unlike the base Qwen-Image implementation, retains every per-sample
+        source-image latent without padding its spatial grid.
+        """
+        return QwenImageEditPlusConditions.concat([conditions] * repeats)
 
 
 __all__ = [

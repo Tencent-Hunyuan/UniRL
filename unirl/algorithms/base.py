@@ -297,6 +297,25 @@ def _resolve_reference_model(backend: Any, *, beta: float, algo: str) -> Any:
     return model
 
 
+def _require_replay_anchor_for_batched_replay(stage: Any, old_logp_source: str, *, algo: str) -> None:
+    """Reject ``batch_replay_steps`` paired with a rollout-sourced π_old anchor.
+
+    Call from every diffusion algorithm that drives ``stage.replay`` against an
+    anchor — today ``FlowGRPO`` (with its ``BagelFlowUniGRPO`` subclass) and
+    ``FlowDPPO``. Rationale: :mod:`unirl.models.types.batched_replay`.
+    """
+    if not getattr(stage, "batch_replay_steps", False):
+        return
+    if old_logp_source != "replay":
+        raise ValueError(
+            f"{algo}: pipeline.batch_replay_steps=True requires old_logp_source='replay', "
+            f"got {old_logp_source!r}. The batched replay path is numerically equivalent to "
+            f"the serial one but not bit-identical to the rollout forward, so a "
+            f"rollout-sourced anchor puts the PPO ratio outside clip_range. Set "
+            f"old_logp_source='replay', or disable pipeline.batch_replay_steps."
+        )
+
+
 @dataclass(frozen=True)
 class AlgorithmStepResult:
     """Result of one micro-step under the stage-driven contract.

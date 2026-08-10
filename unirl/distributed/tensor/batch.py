@@ -134,11 +134,11 @@ def packed_field(**kwargs: Any) -> Any:
     hidden instance state on the ``Batch`` container — the user neither
     declares a sibling cu_seqlens field nor sets one explicitly.
 
-    Construction is via the regular ``@dataclass`` constructor: pass a
-    ``Sequence[Tensor]`` of per-sample tensors and the framework's
-    ``Batch.__post_init__`` packs them and computes cu_seqlens. Multiple
-    ``packed_field``s on the same dataclass must agree on per-sample sizes
-    (they share the single instance-level cu_seqlens).
+    User-facing construction is via :meth:`Batch.pack`: pass a
+    ``Sequence[Tensor]`` of per-sample tensors and it packs them while computing
+    cu_seqlens. The regular dataclass constructor is reserved for already-packed
+    internal values whose cu_seqlens are attached by framework operations.
+    Multiple packed fields must agree on per-sample sizes.
 
     See :class:`Batch` for the auto-pack / propagation contract and
     :attr:`Batch.cu_seqlens` / :attr:`Batch.lengths` for read access
@@ -356,6 +356,9 @@ def _repeat_interleave_value(value: Any, n: int, batch_size: int) -> Any:
         return tuple(v for v in value for _ in range(n))
     if isinstance(value, dict):
         return {k: _repeat_interleave_value(v, n, batch_size) for k, v in value.items()}
+    if hasattr(value, "select_ranges") and getattr(value, "batch_size", None) == batch_size:
+        ranges = [(index, index + 1) for index in range(batch_size) for _ in range(n)]
+        return value.select_ranges(ranges)
     if isinstance(value, Batch):
         return value.repeat_interleave(n)
     return value
@@ -501,9 +504,14 @@ def _repeat_interleave_packed_data(
             "construct via the regular dataclass __init__ with per-sample lists."
         )
     if n <= 0:
+        if hasattr(value, "select_ranges"):
+            return value.select_ranges([])
         return value[:0].clone()
     if n == 1:
         return value.clone()
+    if hasattr(value, "select_ranges"):
+        ranges = [(int(cu[i].item()), int(cu[i + 1].item())) for i in range(int(cu.numel()) - 1) for _ in range(n)]
+        return value.select_ranges(ranges)
     chunks: List[torch.Tensor] = []
     for i in range(int(cu.numel()) - 1):
         chunk = value[int(cu[i].item()) : int(cu[i + 1].item())]

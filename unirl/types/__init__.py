@@ -18,6 +18,8 @@ _LAZY_ATTRS: Dict[str, Tuple[str, str]] = {
     "RewardType": ("unirl.types.reward", "RewardType"),
     "EngineConfig": ("unirl.types.engine", "EngineConfig"),
     "MediaPreview": ("unirl.types.media_preview", "MediaPreview"),
+    "MediaRef": ("unirl.types.media", "MediaRef"),
+    "MediaRefs": ("unirl.types.media", "MediaRefs"),
     "Sample": ("unirl.types.sample", "Sample"),
     "Part": ("unirl.types.sample", "Part"),
     "Primitive": ("unirl.types.sample", "Primitive"),

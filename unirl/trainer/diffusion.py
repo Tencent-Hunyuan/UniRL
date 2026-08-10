@@ -5,11 +5,11 @@ import os
 import sys
 import time
 from contextlib import contextmanager
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Set, Tuple
 
 import torch
 from hydra.utils import get_class, get_object, instantiate
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
@@ -20,6 +20,7 @@ from unirl.types.primitives import Texts
 from unirl.types.sample import Sample
 from unirl.types.sampling import BaseSamplingParams, total_samples_per_prompt
 from unirl.utils.hydra import parse_hydra_cfg, remote_hydra
+from unirl.utils.wandb_metrics import pooled_window_reward_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +107,147 @@ def _validate_diffusion_dp_geometry(
         )
 
 
+# Per-field eval knobs the overlay replaced (or dropped), and what to write instead.
+_RETIRED_EVAL_KEYS = {
+    "eval_cfg_text_scale": "eval_sampling: {guidance_scale: X}   (BAGEL family: cfg_text_scale)",
+    "eval_num_inference_steps": "eval_sampling: {num_inference_steps: X}",
+    "eval_height": "eval_sampling: {height: X}",
+    "eval_width": "eval_sampling: {width: X}",
+    "eval_media_max_items": "logging: {log_media: true, media_max_items: X}",
+    "eval_shift": "no equivalent: the per-request time-shift override was dropped (static-shift models keep their checkpoint shift)",
+    "eval_mu": "not needed: dynamic-shift μ re-derives from the eval steps/resolution",
+}
+
+# Engine/driver-owned object fields the overlay cannot carry: overrides come from
+# plain YAML (never hydra-instantiated), so a nested ``_target_`` would ride into
+# the params as a bare dict and only blow up deep inside the first eval's request
+# build (``'dict' object has no attribute 'get_sde_indices'``). Rejected by name.
+_UNSUPPORTED_OVERLAY_FIELDS = frozenset(
+    {"scheduler", "sde_strategy", "sigmas", "noise_group_ids", "init_noise_latent_shape"}
+)
+
+
+def cfg_scale_of(params: Any) -> float:
+    """The CFG scale a diffusion params object will actually be sampled with.
+
+    BAGEL-family params carry ``cfg_text_scale``; every other family carries
+    ``guidance_scale``. Log lines read the scale through here so they report the
+    field the pipeline actually consumes.
+    """
+    scale = getattr(params, "cfg_text_scale", None)
+    return float(params.guidance_scale if scale is None else scale)
+
+
+def reject_retired_eval_keys(cfg: Any) -> None:
+    """Fail fast on the per-field ``eval_*`` knobs that ``eval_sampling:`` replaced.
+
+    Ignoring them would silently evaluate at the rollout's own setting — the exact
+    train/eval mismatch the overlay exists to make explicit.
+    """
+    present = sorted(key for key in _RETIRED_EVAL_KEYS if cfg is not None and cfg.get(key) is not None)
+    if not present:
+        return
+    moves = "\n".join(f"  {key}: X   ->   {_RETIRED_EVAL_KEYS[key]}" for key in present)
+    raise ValueError(
+        "These per-field eval knobs are not supported — most moved into the `eval_sampling:` overlay, "
+        f"which accepts ANY plain DiffusionSamplingParams field:\n{moves}"
+    )
+
+
+def build_eval_sampling(
+    sampling_params: Dict[str, BaseSamplingParams],
+    *,
+    eta: float = 0.0,
+    samples_per_prompt: Optional[int] = None,
+    overrides: Any = None,
+) -> Dict[str, BaseSamplingParams]:
+    """Return ``sampling_params`` with its ``diffusion`` entry rebuilt for evaluation.
+
+    Eval INHERITS the training ``sampling:`` block and overlays only what the
+    recipe asks for, later winning over earlier:
+
+    1. ``eta`` — recipe ``eval_eta`` (default ``0.0``: deterministic ODE eval).
+    2. ``samples_per_prompt`` when given — recipe ``eval_samples_per_prompt``.
+    3. ``overrides`` — the recipe's ``eval_sampling:`` block: any plain
+       :class:`~unirl.types.sampling.DiffusionSamplingParams` field
+       (``guidance_scale``, ``num_inference_steps``, ``height`` / ``width``,
+       ``seed``, ...). Unknown keys raise rather than being silently dropped,
+       and so do the engine/driver-owned object fields
+       (``_UNSUPPORTED_OVERLAY_FIELDS``) that plain YAML cannot express.
+
+    CFG needs no knob of its own: an unmentioned ``guidance_scale`` inherits the
+    training guidance, so a CFG-off run cannot silently evaluate with CFG on, and
+    naming it decouples the two. It is the field the pipeline consumes, so a
+    family that reads ``cfg_text_scale`` must be given THAT one — the inert
+    sibling raises instead of being accepted and ignored.
+
+    A resolved ``eta <= 0`` then clears the SDE gate (``sde_indices=[]``,
+    ``scheduler=None``): eta=0 with gated steps is a contradictory request — the
+    central kernel degrades such steps to ODE, and worker-resident schedulers
+    (BAGEL) refuse the pair outright. A resolved ``eta > 0`` keeps the training
+    gate, whose indices are resolved against the ROLLOUT's step count, so a step
+    override is rejected here rather than addressing a schedule it cannot reach.
+
+    The rollout's params are never mutated, so eval settings cannot leak into the
+    trajectories the policy is trained on.
+    """
+    base = sampling_params.get("diffusion")
+    if base is None:
+        raise ValueError("build_eval_sampling: sampling params carry no `diffusion` entry to override.")
+    field_names = {f.name for f in dataclasses.fields(base)}
+
+    updates: Dict[str, Any] = {"eta": float(eta)}
+    if samples_per_prompt is not None:
+        updates["samples_per_prompt"] = int(samples_per_prompt)
+    updates.update(_resolve_overrides(overrides, field_names))
+
+    # Only the cfg_text_scale families declare both; elsewhere the sibling is not a
+    # field at all and _resolve_overrides already rejected it.
+    if "cfg_text_scale" in field_names and "guidance_scale" in updates:
+        raise ValueError(
+            f"eval_sampling sets `guidance_scale`, which {type(base).__name__} declares but its "
+            "pipeline discards — the eval would silently run at the training CFG. "
+            "Set `cfg_text_scale` instead."
+        )
+
+    steps = int(updates.get("num_inference_steps", base.num_inference_steps))
+    if float(updates["eta"]) <= 0.0:
+        updates["sde_indices"] = []
+        updates["scheduler"] = None
+    elif steps != int(base.num_inference_steps):
+        raise ValueError(
+            f"eval eta={updates['eta']} leaves the SDE gate on, but eval_sampling.num_inference_steps"
+            f"={steps} differs from the rollout's {base.num_inference_steps}: the gated step indices "
+            "are resolved against the rollout's step count and cannot address the eval schedule. "
+            "Set eval_eta: 0, or drop the step override."
+        )
+    return {**sampling_params, "diffusion": dataclasses.replace(base, **updates)}
+
+
+def _resolve_overrides(overrides: Any, field_names: Set[str]) -> Dict[str, Any]:
+    """Validate a recipe ``eval_sampling:`` block into plain ``dataclasses.replace`` kwargs."""
+    if overrides is None:
+        return {}
+    if OmegaConf.is_config(overrides):
+        overrides = OmegaConf.to_container(overrides, resolve=True)
+    if not isinstance(overrides, Mapping):
+        raise TypeError(
+            "eval_sampling must be a mapping of diffusion sampling fields, "
+            f"got {type(overrides).__name__}. It overlays `sampling:`, so it takes no `_target_`."
+        )
+    unknown = sorted(set(overrides) - field_names)
+    if unknown:
+        raise ValueError(f"eval_sampling has unknown field(s) {unknown}; valid fields are {sorted(field_names)}.")
+    unsupported = sorted(set(overrides) & _UNSUPPORTED_OVERLAY_FIELDS)
+    if unsupported:
+        raise ValueError(
+            f"eval_sampling cannot override {unsupported}: engine/driver-owned object fields "
+            "(plain YAML cannot carry instantiated objects), so eval keeps the rollout's own. "
+            "The SDE gate is governed by eval_eta: <= 0 clears it, > 0 keeps the training gate."
+        )
+    return dict(overrides)
+
+
 class DiffusionTrainer(BaseTrainer):
     """Reference trainer: train + rollout colocated on the whole pool.
 
@@ -123,7 +265,7 @@ class DiffusionTrainer(BaseTrainer):
         pipeline_cfg: DictConfig,
         backend_cfg: DictConfig,
         rollout_cfg: DictConfig,
-        reward_cfg: DictConfig,
+        reward_cfg: Optional[DictConfig],
         algorithm_cfg: DictConfig,
         stack_cfg: DictConfig,
         data_source_cfg: DictConfig,
@@ -137,16 +279,18 @@ class DiffusionTrainer(BaseTrainer):
         offload_train_during_reward: bool = False,
         rollout_sleep_after_generate: bool = True,
         adv_use_global_std: bool = False,
+        accumulate_rollouts: int = 1,
         eval_interval: int = 0,
         eval_num_prompts: int = 64,
         eval_samples_per_prompt: int = 4,
         eval_chunk_prompts: int = 16,
-        eval_cfg_text_scale: float = 4.0,
         eval_eta: float = 0.0,
+        eval_sampling_cfg: Optional[Any] = None,
         eval_rewards_cfg: Optional[Any] = None,
         task_config: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
+        reject_retired_eval_keys(cfg)
         self.batch_size = batch_size
         self._layout = str(layout)
         self._train_fraction = float(train_fraction)
@@ -163,7 +307,6 @@ class DiffusionTrainer(BaseTrainer):
         self.eval_num_prompts = int(eval_num_prompts)
         self.eval_samples_per_prompt = int(eval_samples_per_prompt)
         self.eval_chunk_prompts = int(eval_chunk_prompts)
-        self.eval_cfg_text_scale = float(eval_cfg_text_scale)
         self.eval_eta = float(eval_eta)
         self._eval_rewards_cfg = eval_rewards_cfg
         self._eval_suites: List[EvalRewardSuite] = []
@@ -175,14 +318,56 @@ class DiffusionTrainer(BaseTrainer):
         self._data_source_cfg = data_source_cfg
 
         self.sampling_params: Dict[str, BaseSamplingParams] = build_sampling_dict(sampling_cfg)
+        # Frozen at init, so overlay contradictions surface at startup rather than an
+        # hour in.
+        self._eval_sampling_params: Dict[str, BaseSamplingParams] = build_eval_sampling(
+            self.sampling_params,
+            eta=self.eval_eta,
+            samples_per_prompt=self.eval_samples_per_prompt,
+            overrides=eval_sampling_cfg,
+        )
 
         self._noise_latent_shape: Optional[list] = (
             None
             if os.environ.get("DISABLE_DRIVER_XT")
-            else self._resolve_noise_latent_shape(pipeline_cfg=pipeline_cfg, model_cfg=bundle_cfg)
+            else self._resolve_noise_latent_shape(
+                pipeline_cfg=pipeline_cfg,
+                model_cfg=bundle_cfg,
+                sampling_spec=self.sampling_params.get("diffusion"),
+            )
         )
+        # Eval may render at its own resolution, so the driver-authored x_T has to
+        # match THAT geometry rather than the rollout's.
+        self._eval_noise_latent_shape: Optional[list] = (
+            None
+            if self._noise_latent_shape is None
+            else self._resolve_noise_latent_shape(
+                pipeline_cfg=pipeline_cfg,
+                model_cfg=bundle_cfg,
+                sampling_spec=self._eval_sampling_params.get("diffusion"),
+            )
+        )
+        if self.eval_interval > 0 and bool((self.logging_cfg or {}).get("log_media", False)):
+            eval_diffusion = self._eval_sampling_params.get("diffusion")
+            if self._eval_noise_latent_shape is None or bool(eval_diffusion.disable_driver_xt):
+                logger.warning(
+                    "logging.log_media is on, but eval has no driver-authored x_T "
+                    "(DISABLE_DRIVER_XT / disable_driver_xt, or latent_shape() opted out), so "
+                    "every eval draws fresh noise and the eval panel will not be comparable "
+                    "across evals."
+                )
+            elif float(eval_diffusion.eta) > 0.0:
+                logger.warning(
+                    "logging.log_media is on with eval eta=%.2f > 0: x_T is prompt-keyed, but "
+                    "per-step SDE noise is seeded from the eval step's sample ids, so eval "
+                    "panels differ by noise as well as policy. Set eval_eta: 0 for a "
+                    "like-for-like filmstrip.",
+                    float(eval_diffusion.eta),
+                )
 
         self.weight_sync = None
+        # None when the recipe has no ``reward:`` block (validated below).
+        self.reward = None
 
         reward_fraction = float(reward_fraction)
         if not 0.0 <= reward_fraction < 1.0:
@@ -193,6 +378,11 @@ class DiffusionTrainer(BaseTrainer):
                 f"+ reward_fraction ({reward_fraction}) must be < 1.0"
             )
         reward_separate = reward_fraction > 0.0
+        if reward_separate and reward_cfg is None:
+            raise ValueError(
+                f"reward_fraction={reward_fraction} carves reward its own slab, but the recipe "
+                "has no `reward:` block — drop reward_fraction or configure a reward."
+            )
         self._reward_is_separate = reward_separate
 
         train_cfgs = dict(
@@ -224,15 +414,77 @@ class DiffusionTrainer(BaseTrainer):
                 self.reward = remote_hydra(reward_cfg)
                 self._wire_eval_suites()
 
+        self._validate_reward_config()
+        # Cross-rollout gradient accumulation: one optimizer step per M rollouts
+        # (the MOPD task-cycle contract).
+        self.accumulate_rollouts = int(accumulate_rollouts)
+        self._validate_accumulation(stack_cfg)
+
         self._validate_residency_config()
         _validate_diffusion_dp_geometry(
             batch_size=int(batch_size),
             samples_per_prompt=total_samples_per_prompt(self.sampling_params),
             num_updates_per_batch=int(stack_cfg.get("num_updates_per_batch", 1)),
             rollout_dp_size=int(self.rollout.dp_size),
-            reward_dp_size=int(self.reward.dp_size),
+            reward_dp_size=int(self.reward.dp_size) if self.reward is not None else 1,
             train_dp_size=int(self.stack.dp_size),
         )
+
+    def _validate_reward_config(self) -> None:
+        """A missing ``reward:`` block is legal only for requires_advantages=False algorithms."""
+        if self.reward is not None:
+            return
+        if self._algo_requires_advantages:
+            raise ValueError(
+                "The recipe has no `reward:` block, but the algorithm requires advantages "
+                "(requires_advantages=True) — RL training cannot run without a reward model. "
+                "Only supervised/teacher-anchored algorithms may omit `reward:`."
+            )
+        if self.eval_interval > 0:
+            raise ValueError(
+                f"eval_interval={self.eval_interval} needs a reward to score eval generations, "
+                "but the recipe has no `reward:` block. Set eval_interval: 0 or configure a "
+                "(monitoring-only) reward."
+            )
+
+    def _validate_accumulation(self, stack_cfg: DictConfig) -> None:
+        """``accumulate_rollouts > 1`` needs single-update, non-EMA, cycle-aligned cadences."""
+        acc = self.accumulate_rollouts
+        if acc < 1:
+            raise ValueError(f"accumulate_rollouts must be >= 1, got {acc}")
+        if acc == 1:
+            return
+        n_updates = int(stack_cfg.get("num_updates_per_batch", 1) or 1)
+        if n_updates != 1:
+            raise ValueError(
+                f"accumulate_rollouts={acc} requires stack.num_updates_per_batch == 1 "
+                f"(got {n_updates}): extra optimizer steps inside one accumulation window "
+                "would re-step on partial gradients."
+            )
+        if self._uses_ema:
+            raise ValueError(
+                f"accumulate_rollouts={acc} is not validated with requires_ema_rollout "
+                "algorithms (EMA updates fire per rollout boundary, not per optimizer step)."
+            )
+        if self.pool.transport_kind in ("transfer_queue", "tq"):
+            raise ValueError(
+                f"accumulate_rollouts={acc} is not validated with the transfer_queue transport: "
+                "buffers are reclaimed once per window (after train_step), so the pool would "
+                "have to hold every rollout of the window."
+            )
+        if self.eval_interval > 0 and self.eval_interval % acc:
+            raise ValueError(
+                f"eval_interval={self.eval_interval} is not a multiple of accumulate_rollouts={acc}: "
+                "eval runs between windows, so this cadence would never fire."
+            )
+        domains = getattr(self.data_source, "domains", None)
+        if domains and acc % len(domains) != 0:
+            raise ValueError(
+                f"accumulate_rollouts={acc} must be a multiple of the data source's domain "
+                f"count ({len(domains)}), or each optimizer step would cover an uneven subset "
+                "of the task cycle (mirrors the official DiffusionOPD assert on "
+                "num_batches_per_epoch % len(teachers))."
+            )
 
     def _wire_eval_suites(self) -> None:
         """Build the ``eval_rewards`` suites in the CALLER's placement scope.
@@ -273,6 +525,8 @@ class DiffusionTrainer(BaseTrainer):
             self._wire_eval_suites()
         algo_cls = get_class(str(algorithm_cfg.get("_target_", "")))
         self._uses_ema = getattr(algo_cls, "requires_ema_rollout", False)
+        # requires_advantages=False algorithms keep rewards for monitoring only.
+        self._algo_requires_advantages = getattr(algo_cls, "requires_advantages", True)
         if self._uses_ema and self._offload_train_during_reward:
             raise ValueError(
                 "offload_train_during_reward is not supported with EMA/DiffusionNFT algorithms "
@@ -342,7 +596,9 @@ class DiffusionTrainer(BaseTrainer):
         else:
             self.weight_sync.set_rollout_targets([(self.rollout.role_name, self.rollout.workers)])
 
-    def _resolve_noise_latent_shape(self, *, pipeline_cfg: DictConfig, model_cfg: DictConfig) -> Optional[list]:
+    def _resolve_noise_latent_shape(
+        self, *, pipeline_cfg: DictConfig, model_cfg: DictConfig, sampling_spec: Any
+    ) -> Optional[list]:
         """Per-sample latent shape for the driver-authored x_T recipe, or ``None``.
 
         Delegates to the pipeline's ``latent_shape`` classmethod — the framework's
@@ -357,6 +613,9 @@ class DiffusionTrainer(BaseTrainer):
         In practice every shipped pipeline returns a shape, so a recipe is
         authored for all models; recipe *consumption* is currently SD3-only (see
         the scope caveat in ``__init__``).
+
+        ``sampling_spec`` selects whose geometry to resolve — the rollout's or
+        eval's, which may render at a different resolution.
         """
         target = getattr(pipeline_cfg, "_target_", None)
         if not isinstance(target, str):
@@ -367,7 +626,7 @@ class DiffusionTrainer(BaseTrainer):
         if latent_shape_fn is None:
             return None
         try:
-            shape = latent_shape_fn(model_config=model_cfg, sampling_spec=self.sampling_params.get("diffusion"))
+            shape = latent_shape_fn(model_config=model_cfg, sampling_spec=sampling_spec)
         except NotImplementedError:
             return None
         return [int(x) for x in shape]
@@ -397,10 +656,11 @@ class DiffusionTrainer(BaseTrainer):
         its own deterministic params); ``None`` uses ``self.sampling_params``.
         """
         sp = sampling if sampling is not None else self.sampling_params
+        noise_latent_shape = self._eval_noise_latent_shape if sampling is not None else self._noise_latent_shape
         diffusion = sp.get("diffusion")
         sde_indices = diffusion.resolve_sde_indices(rollout_id)
         diffusion = dataclasses.replace(
-            diffusion, sde_indices=sde_indices, scheduler=None, init_noise_latent_shape=self._noise_latent_shape
+            diffusion, sde_indices=sde_indices, scheduler=None, init_noise_latent_shape=noise_latent_shape
         )
         request = prepare_input_sample(
             inputs,
@@ -412,7 +672,7 @@ class DiffusionTrainer(BaseTrainer):
         samples_per_prompt = total_samples_per_prompt(sp)
         request = request.fork(samples_per_prompt, sampling_params=diffusion)
 
-        if sampling is not None and self._noise_latent_shape is not None:
+        if sampling is not None and noise_latent_shape is not None:
             from unirl.sde.noise import make_prompt_seed_group_id
 
             texts = next((value for value in request.conditioning() if isinstance(value, Texts)), None)
@@ -517,32 +777,28 @@ class DiffusionTrainer(BaseTrainer):
             sleep_rollout=self._rollout_sleep_after_generate,
         )
 
-    def train_step(
+    def _rollout_and_score(
         self,
         sample: Sample,
         *,
-        training_progress: float = 0.0,
         sync_weights: bool = False,
         rollout_id: int = 0,
-    ) -> Tuple[TrainStepResult, float]:
-        """One ``rollout → reward → advantage → optimizer step`` pass.
-
-        ``training_progress`` in ``[0, 1]`` drives clip-range / LR schedules
-        inside the algorithm. The reference trainer is stateless — the
-        outer training loop owns step counting; ``rollout_id`` only keys the
-        wandb panels (see :meth:`UniRLWandBLogger.log_rollout_step`).
+    ) -> Tuple[Sample, float]:
+        """One ``rollout → reward → advantage`` pass; training happens per window.
 
         ``sync_weights`` pushes the latest LoRA into the engine between
         ``wake_up`` and ``generate`` — one wake/sleep instead of two, with this
         ``generate`` already using the fresh adapter.
 
-        Returns ``(train_result, mean_reward)`` — the mean unnormalized
-        per-sample reward of the frontier gen Part (0.0 if none), for the log line.
+        Returns ``(sample, mean_reward)`` — the scored Sample (advantages and
+        row metadata attached) and the mean unnormalized per-sample reward of
+        the frontier gen Part (0.0 if none), for the log line.
         """
-        t0 = time.perf_counter()
         sample = self._generate_for_training(sample, sync_weights=sync_weights)
-        with self._reward_phase():
-            sample = self.reward.score_and_attach(sample)
+        # With no reward configured, ``part.rewards`` stays None and the block below no-ops.
+        if self.reward is not None:
+            with self._reward_phase():
+                sample = self.reward.score_and_attach(sample)
 
         part = sample.parts[-1]
         mean_reward = 0.0
@@ -551,13 +807,62 @@ class DiffusionTrainer(BaseTrainer):
             if isinstance(part.component_rewards, dict):
                 part.component_rewards = {name: hydrate(value) for name, value in part.component_rewards.items()}
             mean_reward = float(part.rewards.to(torch.float32).mean().item())
-            part = part.compute_advantages(normalize=True, use_global_std=self._adv_use_global_std)
-            sample = sample.with_parts([*sample.parts[:-1], part])
+            if self._algo_requires_advantages:
+                part = part.compute_advantages(normalize=True, use_global_std=self._adv_use_global_std)
+                sample = sample.with_parts([*sample.parts[:-1], part])
+
+        # Project root-Part metadata onto the gen Part's rows (DiffusionOPD routes
+        # on metadata["domain"]); only ever fills an empty field.
+        gen_part = sample.parts[-1]
+        if not gen_part.metadata:
+            root_md = sample.root_metadata(-1)
+            if any(md for md in root_md):
+                gen_part.metadata = [dict(md) if md else {} for md in root_md]
 
         self._drop_decoded(sample, rollout_id=rollout_id)
-        result = self.stack.train_track(sample.parts[-1], training_progress=float(training_progress))
-        self.wandb_logger.log_rollout_step(rollout_id, result, sample, step_time_s=time.perf_counter() - t0)
-        return result, mean_reward
+        return sample, mean_reward
+
+    def train_step(
+        self,
+        window_ids: Sequence[int],
+        *,
+        num_rollouts: int,
+        weight_sync_interval: int = 1,
+        force_sync_at: Optional[int] = None,
+    ) -> Tuple[TrainStepResult, float]:
+        """One accumulation window: rollouts → one optimizer step → one log point.
+
+        The NAME is a framework seam — :class:`BaseTrainer` wraps ``train_step``
+        for transfer-queue buffer reclamation and ``install_phase_timing`` for
+        ``perf/*`` attribution. The reclaim fires when this returns: after the
+        window has trained, the only point with no live ``TensorRef`` into the
+        queue. Returns ``(train_result, window-mean reward)``.
+        """
+        t0 = time.perf_counter()
+        samples: List[Sample] = []
+        window_rewards: List[float] = []
+        for rollout_id in window_ids:
+            inputs = self.data_source.get_samples(self.batch_size)
+            sample = self._build_request_sample(inputs, rollout_id)
+            sync_weights = (rollout_id > 0 and rollout_id % weight_sync_interval == 0) or (rollout_id == force_sync_at)
+            sample, mean_reward = self._rollout_and_score(sample, sync_weights=sync_weights, rollout_id=rollout_id)
+            samples.append(sample)
+            window_rewards.append(mean_reward)
+        final_id = window_ids[-1]
+        training_progress = final_id / max(1, num_rollouts - 1)
+        parts = tuple(sample.parts[-1] for sample in samples)
+        result = self.stack.train_track(
+            parts if len(parts) > 1 else parts[0], training_progress=float(training_progress)
+        )
+        # Reward stats must cover the whole window: with per-domain scorers each
+        # rollout is NaN outside its own domain, so the final sample alone would
+        # leave every other domain's curve empty. The pooled keys override the
+        # final sample's partial ones inside log_rollout_step.
+        extra = pooled_window_reward_metrics(list(parts)) if len(parts) > 1 else None
+        self.wandb_logger.log_rollout_step(
+            final_id, result, samples[-1], step_time_s=time.perf_counter() - t0, extra_metrics=extra
+        )
+        return result, sum(window_rewards) / len(window_rewards)
 
     def evaluate(
         self,
@@ -568,11 +873,12 @@ class DiffusionTrainer(BaseTrainer):
     ) -> float:
         """Periodic eval on the eval set (no training); returns the mean reward.
 
-        Mirrors :meth:`train_step`'s rollout+reward path but skips advantage/backward.
-        Generates at the deterministic best-quality setting (``cfg_text_scale=
-        eval_cfg_text_scale``, ``eta=eval_eta``; ``eval_samples_per_prompt`` x_T per
-        prompt) and scores. The training reward plus every shared-set
-        ``eval_rewards`` suite scores the SAME generated images over the default
+        Mirrors :meth:`_rollout_and_score`'s rollout+reward path but skips advantage/backward.
+        Eval sampling INHERITS the training ``sampling:`` block and overlays the
+        ``eval_*`` knobs plus the recipe's ``eval_sampling:`` block on top — see
+        :func:`build_eval_sampling` for the precedence.
+        The training reward plus every shared-set ``eval_rewards`` suite scores the
+        SAME generated images over the default
         eval set (``run.eval_data_path``, ``eval_num_prompts`` prompts); each
         own-set suite then gets its own generation pass over its own prompts.
         All means land in one ``eval/*`` row (``eval/reward`` + ``eval/<suite>``);
@@ -583,17 +889,13 @@ class DiffusionTrainer(BaseTrainer):
         only when both ``sleep_after`` and ``rollout_sleep_after_generate`` are true;
         the async trainer and fully resident recipes disable the appropriate knob.
         """
-        base_diffusion = self.sampling_params.get("diffusion")
-        replace_kwargs = dict(
-            samples_per_prompt=self.eval_samples_per_prompt,
-            eta=self.eval_eta,
-        )
-        if "cfg_text_scale" in {f.name for f in dataclasses.fields(base_diffusion)}:
-            replace_kwargs["cfg_text_scale"] = self.eval_cfg_text_scale
-        else:
-            replace_kwargs["guidance_scale"] = self.eval_cfg_text_scale
-        eval_diffusion = dataclasses.replace(base_diffusion, **replace_kwargs)
-        eval_sp = {**self.sampling_params, "diffusion": eval_diffusion}
+        if self.reward is None:
+            raise RuntimeError(
+                "DiffusionTrainer.evaluate: no reward configured (the recipe has no `reward:` "
+                "block) — evaluation scores generations and needs one."
+            )
+        eval_sp = self._eval_sampling_params
+        eval_diffusion = eval_sp.get("diffusion")
         sync_requested = bool(sync_weights)
         sleep_requested = sleep_after and self._rollout_sleep_after_generate
         # A no-sync evaluation must preserve the already-resident adapter.
@@ -618,6 +920,7 @@ class DiffusionTrainer(BaseTrainer):
                 sync_weights=sync_pending,
                 sync_each_wake=sleep_each_chunk and sync_requested,
                 sleep_rollout=sleep_each_chunk,
+                media_prefix="eval",
             )
             generated_any = generated_any or pass_generated
             for suite in self._eval_suites:
@@ -632,6 +935,7 @@ class DiffusionTrainer(BaseTrainer):
                         sync_weights=sync_pending,
                         sync_each_wake=sleep_each_chunk and sync_requested,
                         sleep_rollout=sleep_each_chunk,
+                        media_prefix=f"eval/{suite.name}",
                     )
                     generated_any = generated_any or pass_generated
                     metrics.update(suite_metrics)
@@ -648,11 +952,14 @@ class DiffusionTrainer(BaseTrainer):
                     preserve_active_error=sys.exc_info()[0] is not None,
                 )
         logger.info(
-            "EVAL step %d  (%d samples/prompt, cfg=%.1f eta=%.1f)  %s",
+            "EVAL step %d  (%d samples/prompt, %d steps, %dx%d, cfg=%.1f eta=%.1f)  %s",
             step,
-            self.eval_samples_per_prompt,
-            self.eval_cfg_text_scale,
-            self.eval_eta,
+            int(eval_diffusion.samples_per_prompt),
+            int(eval_diffusion.num_inference_steps),
+            int(eval_diffusion.height),
+            int(eval_diffusion.width),
+            cfg_scale_of(eval_diffusion),
+            float(eval_diffusion.eta),
             "  ".join(f"{k}={v:.4f}" for k, v in metrics.items()),
         )
         self.wandb_logger.log_eval(step, metrics)
@@ -686,6 +993,7 @@ class DiffusionTrainer(BaseTrainer):
         sync_weights: bool,
         sync_each_wake: bool,
         sleep_rollout: bool,
+        media_prefix: Optional[str] = None,
     ) -> Tuple[Dict[str, float], bool, bool]:
         """One generate→score sweep, pending-sync state, and whether it generated.
 
@@ -693,6 +1001,10 @@ class DiffusionTrainer(BaseTrainer):
         never holds N x the KV/decoded on the driver (the it2i memory
         bottleneck). Scores the single scorable (segment-carrying) track with
         every scorer — single-track for now; revisit if multi-track lands.
+
+        ``media_prefix`` names the wandb key family for the preview grid drawn
+        from the FIRST chunk (see :meth:`BaseTrainer._log_eval_media`); the first
+        scorer's Sample is used, so captions carry its reward.
         """
         all_inputs = data_source.get_eval_samples(num_prompts)
         n_prompts = all_inputs.batch_size
@@ -717,14 +1029,24 @@ class DiffusionTrainer(BaseTrainer):
                 sleep_rollout=sleep_rollout,
             )
             sync_pending = False
+            first_scored: Optional[Sample] = None
             with self._reward_phase():
                 for name, reward in scorers:
                     scored = reward.score_and_attach(generated)
+                    if first_scored is None:
+                        first_scored = scored
                     rewards = scored.parts[-1].rewards
                     if rewards is not None:
                         r = hydrate(rewards).to(torch.float32)
+                        if scored is first_scored:
+                            # Captions read part.rewards, which remote scoring returns dehydrated.
+                            scored.parts[-1].rewards = r
                         sums[name] += float(r.sum().item())
                         counts[name] += int(r.numel())
+            # Outside _reward_phase: the driver-side media upload must not hold
+            # the train-offload window open.
+            if media_prefix and start == 0 and first_scored is not None:
+                self._log_eval_media(first_scored, step, prefix=media_prefix)
         metrics = {name: sums[name] / max(1, counts[name]) for name, _ in scorers}
         return metrics, sync_pending, n_prompts > 0
 
@@ -738,10 +1060,12 @@ class DiffusionTrainer(BaseTrainer):
         load_dir: Optional[str] = None,
         save_mode: str = "auto",
     ) -> None:
-        """Minimal training loop: ``num_rollouts`` iterations of ``train_step``.
+        """Minimal training loop: ``num_rollouts`` rollouts in windows of
+        ``accumulate_rollouts``, one ``train_track`` call (= one optimizer
+        step) per window; logging/eval/save run between windows.
 
         ``weight_sync_interval``: sync the adapter into the engine every N
-        rollouts (fused into ``train_step``'s generate; no-op trainside).
+        rollouts (fused into the rollout's generate; no-op trainside).
 
         ``save_interval``: write a checkpoint every N rollouts (and on the last
         one); ``0`` disables it. ``save_dir`` is the output folder (defaults to
@@ -751,33 +1075,46 @@ class DiffusionTrainer(BaseTrainer):
         saved step — ``num_rollouts`` is the TOTAL budget, so resuming
         checkpoint-500 with ``num_rollouts=600`` runs rollouts 500..599.
         """
-        interval = max(1, weight_sync_interval)
+        # ${oc.env:...} interpolations arrive as strings.
+        num_rollouts = int(num_rollouts)
+        save_interval = int(save_interval)
+        interval = max(1, int(weight_sync_interval))
         start_rollout = self.maybe_load_checkpoint(load_dir, num_rollouts=num_rollouts)
         resumed = bool(load_dir)
+        # A window is ONE train_track call, so checkpoints can never split it;
+        # cadences are checked at window ends and must land on them to fire.
+        acc = self.accumulate_rollouts
+        if acc > 1:
+            if num_rollouts % acc:
+                raise ValueError(
+                    f"num_rollouts={num_rollouts} is not a multiple of accumulate_rollouts={acc}: "
+                    "the MOPD protocol steps once per FULL task cycle."
+                )
+            if save_interval > 0 and save_interval % acc:
+                raise ValueError(
+                    f"save_interval={save_interval} is not a multiple of accumulate_rollouts={acc}: "
+                    "checkpoints are written between windows, so this cadence would never fire."
+                )
         for _ in range(start_rollout):
             self.data_source.get_samples(self.batch_size)
         self._init_wandb(num_rollouts=num_rollouts)
         try:
             if self.eval_interval > 0:
                 self.evaluate(start_rollout)
-            for rollout_id in range(start_rollout, num_rollouts):
-                training_progress = rollout_id / max(1, num_rollouts - 1)
-                inputs = self.data_source.get_samples(self.batch_size)
-                sample = self._build_request_sample(inputs, rollout_id)
-                sync_weights = (rollout_id > 0 and rollout_id % interval == 0) or (
-                    resumed and rollout_id == start_rollout
-                )
+            for window_start in range(start_rollout, num_rollouts, acc):
+                window_ids = range(window_start, min(window_start + acc, num_rollouts))
                 result, mean_reward = self.train_step(
-                    sample,
-                    training_progress=training_progress,
-                    sync_weights=sync_weights,
-                    rollout_id=rollout_id,
+                    window_ids,
+                    num_rollouts=num_rollouts,
+                    weight_sync_interval=interval,
+                    force_sync_at=start_rollout if resumed else None,
                 )
-                self.wandb_logger.log_progress(rollout_id, num_rollouts, result, mean_reward, logger=logger)
-                if self.eval_interval > 0 and (rollout_id + 1) % self.eval_interval == 0:
-                    self.evaluate(rollout_id + 1)
+                final_id = window_ids[-1]
+                self.wandb_logger.log_progress(final_id, num_rollouts, result, mean_reward, logger=logger)
+                if self.eval_interval > 0 and (final_id + 1) % self.eval_interval == 0:
+                    self.evaluate(final_id + 1)
                 self.maybe_save_checkpoint(
-                    rollout_id, num_rollouts, save_interval=save_interval, save_dir=save_dir, save_mode=save_mode
+                    final_id, num_rollouts, save_interval=save_interval, save_dir=save_dir, save_mode=save_mode
                 )
         finally:
             self._finish_wandb()

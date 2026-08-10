@@ -7,7 +7,7 @@
 # Owners must have write access or GitHub silently skips them.
 
 # --- fallback ---------------------------------------------------------------
-*                                       @haonan3 @CjhHa1 @leviking98z-rgb @celve
+*                                       @CjhHa1 @leviking98z-rgb @celve
 
 # --- build, packaging, CI ---------------------------------------------------
 /pyproject.toml                         @CjhHa1 @celve

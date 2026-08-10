@@ -27,6 +27,7 @@ from .base import (
     _grpo_clip_loss,
     _reference_kl_loss,
     _reference_replay_means,
+    _require_replay_anchor_for_batched_replay,
     _resolve_clip_range_from_schedule,
     _resolve_reference_model,
     _transition_sigma,
@@ -120,6 +121,7 @@ class FlowGRPO(StageAlgorithm):
             self.old_logp_source in ("rollout", "replay"),
             f"FlowGRPO: old_logp_source must be 'rollout' or 'replay'; got {old_logp_source!r}",
         )
+        _require_replay_anchor_for_batched_replay(self.stage, self.old_logp_source, algo="FlowGRPO")
         self.conditions_cls = conditions_cls
 
     def prepare_segment(
