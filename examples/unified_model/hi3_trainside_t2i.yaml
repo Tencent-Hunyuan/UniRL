@@ -33,8 +33,9 @@ workers_per_device: 1
 eval_num_prompts: 8
 eval_samples_per_prompt: 1
 eval_chunk_prompts: 8
-eval_cfg_text_scale: 1.0
 eval_eta: 0.0
+eval_sampling:
+  guidance_scale: 1.0          # pinned: eval stays unguided even if the rollout CFG changes
 
 task_config:
   task: t2i
