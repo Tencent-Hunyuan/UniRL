@@ -100,13 +100,9 @@ stack:
 
 track_builder:
   _target_: unirl.train.sft.track_builder.VideoDiffusionSupervisedTrackBuilder
-  encode_stage:
-    _target_: unirl.models.wan21.video_encode.WANVideoLatentEncodeStage
-    bundle: ${bundle}
-    num_frames: 17
-    height: 256
-    width: 448
   num_frames: 17
+  height: 256
+  width: 448
   guidance_scale: 1.0
   max_decode_frames: 256
 

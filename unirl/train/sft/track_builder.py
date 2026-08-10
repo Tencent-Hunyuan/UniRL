@@ -40,6 +40,7 @@ from unirl.types.primitives import Images, Texts, Video, Videos
 from unirl.types.sample import Part
 from unirl.types.segments.latent import make_image_segment, make_video_segment
 from unirl.types.segments.text import TextSegment
+from unirl.utils.video import load_video
 
 logger = logging.getLogger(__name__)
 
@@ -47,9 +48,15 @@ Record = Dict[str, Any]
 
 
 class _VideoSFTPipeline(Protocol):
-    bundle: Any
-
     def build_conditions(self, texts: Texts, *, guidance_scale: float) -> Any: ...
+
+    def build_video_encoder(
+        self,
+        *,
+        num_frames: int,
+        height: int,
+        width: int,
+    ) -> EncodeStage[Videos, ImageLatentCondition]: ...
 
 
 def _load_pil_image(uri: str):
@@ -388,80 +395,38 @@ class DiffusionSupervisedTrackBuilder(SupervisedTrackBuilder):
         return torch.stack(rows, dim=0)
 
 
-def _decode_video(uri: str, *, max_frames: int) -> Video:
-    """Decode one local video (or tensor fixture) to ``Video[T,C,H,W]``."""
-    if uri.startswith(("http://", "https://", "s3://", "gs://")):
-        raise NotImplementedError(
-            f"VideoDiffusionSupervisedTrackBuilder: remote media URIs are not supported yet ({uri!r}); "
-            "download to local/shared storage and reference the path."
-        )
-    if uri.endswith((".pt", ".pth")):
-        frames = torch.load(uri, map_location="cpu", weights_only=True)
-    elif uri.endswith((".npy", ".npz")):
-        import numpy as np
-
-        loaded = np.load(uri)
-        if isinstance(loaded, np.lib.npyio.NpzFile):
-            try:
-                frames = torch.as_tensor(loaded["frames"])
-            finally:
-                loaded.close()
-        else:
-            frames = torch.as_tensor(loaded)
-    else:
-        import av
-
-        frames = []
-        with av.open(uri) as container:
-            for frame in container.decode(video=0):
-                array = frame.to_ndarray(format="rgb24")
-                frames.append(torch.from_numpy(array).permute(2, 0, 1).contiguous())
-                if len(frames) >= max_frames:
-                    break
-        if not frames:
-            raise ValueError(f"VideoDiffusionSupervisedTrackBuilder: target video has no decoded frames: {uri}")
-        frames = torch.stack(frames)
-    if not isinstance(frames, torch.Tensor) or frames.ndim != 4 or int(frames.shape[1]) != 3:
-        raise ValueError(
-            f"VideoDiffusionSupervisedTrackBuilder: expected decoded frames [T, 3, H, W], "
-            f"got {type(frames).__name__ if not isinstance(frames, torch.Tensor) else tuple(frames.shape)} "
-            f"from {uri!r}."
-        )
-    if frames.numel() == 0 or int(frames.shape[0]) < 1:
-        raise ValueError(f"VideoDiffusionSupervisedTrackBuilder: target video has no decoded frames: {uri}")
-    if frames.dtype == torch.uint8:
-        frames = frames.to(dtype=torch.float32).div_(255.0)
-    else:
-        frames = frames.to(dtype=torch.float32).clamp_(0.0, 1.0)
-    return Video(frames=frames)
-
-
 class VideoDiffusionSupervisedTrackBuilder(SupervisedTrackBuilder):
     """Dataset records → video-diffusion ``Part`` with a clean x0 latent.
 
     Records must contain one ``(modality="video", role="target")`` media ref.
-    Decoding and WAN VAE encoding both happen on the training worker.
+    The builder owns manifest decoding and ``Part`` assembly; the configured
+    model stage owns frame shaping and VAE encoding.
     """
 
     def __init__(
         self,
         *,
         pipeline: _VideoSFTPipeline,
-        encode_stage: EncodeStage[Videos, ImageLatentCondition],
         num_frames: int,
+        height: int,
+        width: int,
         guidance_scale: float = 1.0,
         max_decode_frames: int = 256,
     ) -> None:
         super().__init__()
         self.pipeline = pipeline
-        self._encode = encode_stage
-        self._num_frames = int(num_frames)
+        num_frames = int(num_frames)
+        self._encode = pipeline.build_video_encoder(
+            num_frames=num_frames,
+            height=height,
+            width=width,
+        )
         self._conditions_kwargs: Dict[str, Any] = {"guidance_scale": float(guidance_scale)}
         self._max_decode_frames = int(max_decode_frames)
-        if self._max_decode_frames < self._num_frames:
+        if self._max_decode_frames < num_frames:
             raise ValueError(
                 "VideoDiffusionSupervisedTrackBuilder: max_decode_frames must be >= num_frames "
-                f"({self._num_frames}), got {self._max_decode_frames}."
+                f"({num_frames}), got {self._max_decode_frames}."
             )
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
@@ -499,7 +464,7 @@ class VideoDiffusionSupervisedTrackBuilder(SupervisedTrackBuilder):
                     f"VideoDiffusionSupervisedTrackBuilder: record {r.get('sample_id')!r} must carry exactly "
                     f"one role='target' video media ref (got {len(uris)})."
                 )
-            rows.append(_decode_video(uris[0], max_frames=self._max_decode_frames))
+            rows.append(Video(frames=load_video(uris[0], max_frames=self._max_decode_frames)))
         return Videos.from_list(rows)
 
 
