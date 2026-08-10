@@ -361,17 +361,33 @@ class VLLMOmniBackend:
     def _stage_ids(self) -> List[int]:
         return list(range(self.num_stages()))
 
+    @staticmethod
+    def _require_ack_success(action: str, stage_id: int, acks: object) -> None:
+        # Worker handlers catch their own exceptions and answer
+        # ``OmniACK(status="ERROR")`` instead of raising, so a discarded return
+        # value turns a failed sleep/wake into a silent partial transition — the
+        # exact state the engine's transition latch exists to refuse.
+        for ack in acks if isinstance(acks, list) else [acks]:
+            status = getattr(ack, "status", None)
+            if status is not None and status != "SUCCESS":
+                raise RuntimeError(
+                    f"vllm-omni {action} failed on stage {stage_id}: worker rank "
+                    f"{getattr(ack, 'rank', '?')} answered status={status!r} "
+                    f"error={getattr(ack, 'error_msg', None)!r}"
+                )
+
     def sleep_task(self) -> None:
         """Fan ``handle_sleep_task`` to every stage's workers (level 2)."""
         import uuid
 
         omni = self._require_omni()
         for sid in self._stage_ids():
-            omni.engine.collective_rpc(
+            acks = omni.engine.collective_rpc(
                 method="handle_sleep_task",
                 args=(self._rt["OmniSleepTask"](level=1, task_id=str(uuid.uuid4())),),
                 stage_ids=[int(sid)],
             )
+            self._require_ack_success("sleep", int(sid), acks)
 
     def wake_task(self) -> None:
         """Fan ``handle_wake_task`` to every stage's workers + sync CUDA."""
@@ -381,11 +397,12 @@ class VLLMOmniBackend:
 
         omni = self._require_omni()
         for sid in self._stage_ids():
-            omni.engine.collective_rpc(
+            acks = omni.engine.collective_rpc(
                 method="handle_wake_task",
                 args=(self._rt["OmniWakeTask"](tags=None, task_id=str(uuid.uuid4())),),
                 stage_ids=[int(sid)],
             )
+            self._require_ack_success("wake", int(sid), acks)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
 

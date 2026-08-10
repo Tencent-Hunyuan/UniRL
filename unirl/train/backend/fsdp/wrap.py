@@ -58,7 +58,7 @@ def fsdp_wrap(
     reshard_after_forward: bool = True,
     forward_prefetch: bool = False,
     activation_checkpointing: bool = False,
-    ac_wrap_order: str = "inside",
+    ac_wrap_order: str = "outside",
     use_torch_compile: bool = False,
     master_dtype: Optional[str] = None,
     root_wrap: bool = True,
@@ -144,22 +144,18 @@ def fsdp_wrap(
             ),
             check_fn=lambda module: id(module) in block_ids,
         )
-        # Where fully_shard lands relative to the AC wrapper is a real trade-off,
-        # not a style choice — each order fixes one failure mode and has the other:
+        # Where fully_shard lands relative to the AC wrapper decides whether the
+        # recompute re-enters FSDP's gather/cast hooks:
         #
-        # * "inside" (fully_shard on the INNER block; FSDP hooks re-run during
-        #   recompute): REQUIRED for models whose blocks run several times in one
-        #   autograd graph (BAGEL replays every diffusion step through the same
-        #   block) — after the first use's post-backward reshard, only a re-entered
-        #   pre-forward hook re-gathers params for the next recompute; without it
-        #   the recompute hits sharded DTensors (mixed Tensor/DTensor mul).
-        #   Failure mode: the gather + mp_policy cast happen inside the region on
-        #   forward but not on recompute, so dtype-branching modules diverge.
-        # * "outside" (fully_shard on the CheckpointWrapper; torchtitan order):
-        #   REQUIRED for single-use blocks with dtype-branching modules (HI3's
-        #   RMSNorm) or data-dependent dispatch (MoE routing): gather/cast stay
-        #   outside the region and both executions see identical param state.
-        #   Failure mode: breaks multi-use blocks as above.
+        # * "outside" (default; fully_shard on the CheckpointWrapper, torchtitan
+        #   order): hooks fire once per use, outside the checkpoint region. This
+        #   matches the composition every pre-knob AC recipe ran — the old
+        #   forward-monkeypatch checkpoint also recomputed without re-entering
+        #   hooks — so untouched recipes keep their validated behavior.
+        # * "inside" (fully_shard on the INNER block): the recompute goes through
+        #   the module's __call__, re-running the pre-forward gather and the
+        #   mp_policy cast. Opt in per recipe where this order was actually
+        #   smoke-validated (the BAGEL it2i replay recipe pins it).
         if ac_wrap_order == "outside":
             from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
 
