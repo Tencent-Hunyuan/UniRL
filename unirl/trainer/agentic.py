@@ -14,7 +14,7 @@ from omegaconf import DictConfig
 
 from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
-from unirl.rollout.manager import RolloutManager, resolve_worker_inflight
+from unirl.rollout.manager import RolloutManager, validate_worker_inflight
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample, unwrap_replicated_int
 from unirl.trainer.hydra import parse_hydra_cfg, remote_hydra
@@ -127,7 +127,7 @@ class AgenticTrainer(BaseTrainer):
             raise ValueError(f"batch_size must be positive; got {batch_size}")
         # Mirrors the DevicePool default in BaseTrainer; checked here so a bad combination
         # fails before any expensive runtime construction.
-        resolve_worker_inflight(
+        validate_worker_inflight(
             per_worker_inflight,
             worker_max_concurrency=int(cfg.get("worker_max_concurrency", 1)),
             engine_concurrency=None,

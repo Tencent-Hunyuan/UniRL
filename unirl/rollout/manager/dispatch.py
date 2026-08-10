@@ -218,30 +218,32 @@ class RolloutPool:
             self._condition.notify_all()
 
 
-def resolve_worker_inflight(
-    requested: int,
+def validate_worker_inflight(
+    per_worker_inflight: int,
     *,
     worker_max_concurrency: int,
     engine_concurrency: Optional[int],
 ) -> int:
     """Validate per-worker rollout concurrency against actor and engine capacity."""
-    requested = int(requested)
-    if requested <= 0:
-        raise ValueError(f"per_worker_inflight must be positive; got {requested}")
+    per_worker_inflight = int(per_worker_inflight)
+    if per_worker_inflight <= 0:
+        raise ValueError(f"per_worker_inflight must be positive; got {per_worker_inflight}")
 
     # Reserve two actor threads for control calls such as set_stopping, sleep,
     # and weight synchronization while rollout calls occupy their own slots.
     worker_max_concurrency = int(worker_max_concurrency)
-    required_concurrency = requested + 2
+    required_concurrency = per_worker_inflight + 2
     if worker_max_concurrency < required_concurrency:
         raise ValueError(
             f"worker_max_concurrency ({worker_max_concurrency}) must be >= per_worker_inflight + 2 "
             f"({required_concurrency}) so rollout calls cannot starve control calls"
         )
 
-    if engine_concurrency is not None and requested > int(engine_concurrency):
-        raise ValueError(f"per_worker_inflight ({requested}) exceeds engine concurrency ({int(engine_concurrency)})")
-    return requested
+    if engine_concurrency is not None and per_worker_inflight > int(engine_concurrency):
+        raise ValueError(
+            f"per_worker_inflight ({per_worker_inflight}) exceeds engine concurrency ({int(engine_concurrency)})"
+        )
+    return per_worker_inflight
 
 
-__all__ = ["RolloutPool", "resolve_worker_inflight"]
+__all__ = ["RolloutPool", "validate_worker_inflight"]
