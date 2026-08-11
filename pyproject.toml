@@ -34,7 +34,6 @@ dependencies = [
   # exclude_modules support (>=0.14) used by LoRA/NFT adapter injection.
   "peft>=0.20",
   "safetensors>=0.4",
-  "av>=14.2,<19 ; sys_platform == 'linux'",
   "Pillow>=10",
   "requests>=2.31",
   "psutil>=5.9",
@@ -80,10 +79,12 @@ vllm = [
   "torch==2.11.0+cu129 ; sys_platform == 'linux'",
   "torchvision==0.26.0+cu129 ; sys_platform == 'linux'",
   "torchaudio==2.11.0+cu129 ; sys_platform == 'linux'",
+  "av>=14.2,<19 ; sys_platform == 'linux'",
 ]
 train = [
   "wandb>=0.16,<0.20",
   "aiohttp>=3.9",
+  "av>=14.2,<19 ; sys_platform == 'linux'",
   # MathVerifyRewardScorer (unirl/reward/local/mathverify.py) — the paper's grader.
   "math-verify>=0.6",
 ]

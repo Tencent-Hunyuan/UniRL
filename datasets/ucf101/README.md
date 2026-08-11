@@ -11,6 +11,20 @@ recipe:
 Raw videos and generated manifests are local artifacts and must not be
 committed. The repository `.gitignore` excludes `raw/` and `processed/`.
 
+Install UniRL using one of the supported environments in
+[`INSTALL.md`](../../INSTALL.md). For example, a supported vLLM/CUDA 12.9
+training environment can be installed with:
+
+```bash
+uv venv --python 3.12 --seed .venv
+source .venv/bin/activate
+export VLLM_USE_PRECOMPILED=1
+uv pip install -e ".[vllm,train,infer]"
+```
+
+The `train` extra installs PyAV automatically for video decoding; no separate
+`av` installation or runtime selection is needed.
+
 ## 1. Download and place the data
 
 Run the following commands from the UniRL repository root. The `hf` command is
