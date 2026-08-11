@@ -20,13 +20,13 @@
 num_devices: 32
 batch_size: 64 # prompts_per_rollout
 num_rollouts: 800
-worker_max_concurrency: 18 # sixteen rollout calls + two control-call threads per worker
 
 # Train slab share (rollout gets the rest). 0.5 -> equal split.
 train_fraction: 0.5
 max_inflight: 2          # globally admitted batch-equivalents
-per_worker_inflight: 16  # concurrent prompt trees per rollout worker
-weight_sync_interval: 3  # trained batches per publication; also configures the output-version lag filter
+per_worker_inflight: 14  # concurrent prompt trees per rollout worker
+weight_sync_interval: 1  # trained batches per publication; also configures the output-version lag filter
+buffer_max_staleness: 2  # maximum allowed rollout-version lag
 
 eval_interval: 10
 adv_normalization_scope: group

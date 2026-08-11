@@ -20,6 +20,17 @@ logger = logging.getLogger(__name__)
 _TEARDOWN_FLUSH_TIMEOUT_S = float(os.environ.get("UNIRL_TEARDOWN_FLUSH_TIMEOUT_S", "120"))
 
 
+def resolve_worker_max_concurrency(cfg: DictConfig) -> int:
+    """Resolve actor concurrency, deriving it from rollout lanes when omitted."""
+    configured = cfg.get("worker_max_concurrency")
+    if configured is not None:
+        return int(configured)
+    per_worker_inflight = cfg.get("per_worker_inflight")
+    if per_worker_inflight is not None:
+        return int(per_worker_inflight) + 2
+    return 1
+
+
 def prepare_input_sample(
     inputs: Sample,
     rollout_id: int,
@@ -123,7 +134,7 @@ class BaseTrainer:
             workers_per_device=int(cfg.get("workers_per_device", 1)),
             transport_kind=cfg.get("transport_kind", "colocate_store"),
             tq_handoff=init_transfer_queue(cfg),
-            worker_max_concurrency=int(cfg.get("worker_max_concurrency", 1)),
+            worker_max_concurrency=resolve_worker_max_concurrency(cfg),
         )
         self.pool.setup()
 

@@ -16,7 +16,13 @@ from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
 from unirl.rollout.manager import RolloutManager, validate_worker_inflight
 from unirl.train.stack import TrainStepResult
-from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample, unwrap_replicated_int
+from unirl.trainer.base import (
+    BaseTrainer,
+    build_sampling_dict,
+    prepare_input_sample,
+    resolve_worker_max_concurrency,
+    unwrap_replicated_int,
+)
 from unirl.trainer.hydra import parse_hydra_cfg, remote_hydra
 from unirl.types.advantages import finite_mean_std
 from unirl.types.primitives import Texts
@@ -125,11 +131,10 @@ class AgenticTrainer(BaseTrainer):
     ) -> None:
         if int(batch_size) <= 0:
             raise ValueError(f"batch_size must be positive; got {batch_size}")
-        # Mirrors the DevicePool default in BaseTrainer; checked here so a bad combination
-        # fails before any expensive runtime construction.
+        # Mirrors BaseTrainer resolution; checked here before runtime construction.
         validate_worker_inflight(
             per_worker_inflight,
-            worker_max_concurrency=int(cfg.get("worker_max_concurrency", 1)),
+            worker_max_concurrency=resolve_worker_max_concurrency(cfg),
             engine_concurrency=None,
         )
         if sync_cfg is None:
