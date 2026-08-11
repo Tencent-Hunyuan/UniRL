@@ -1,8 +1,8 @@
 """EditReward scorer — multi-dimensional reward for instruction-guided image editing.
 
 Wraps the EditRewardInferencer (Qwen2.5-VL-7B based) from the EditReward
-package. Evaluates how well an edited image follows the editing instruction
-(dim1: instruction following) and visual quality (dim2: visual quality).
+package. The model evaluates instruction following and visual quality before
+the configured head-pooling strategy produces the returned columns.
 
 Column semantics depend on the pinned model config. With the official
 EditReward-MiMo-VL-7B-SFT-2508 config (``pooling_strategy: mean``,
@@ -25,8 +25,11 @@ from __future__ import annotations
 
 import torch
 
+from reward_service.logging_utils import get_logger
 from reward_service.scorers.base import BaseScorer, ScoreItem
 from reward_service.scorers.registry import register
+
+logger = get_logger(__name__)
 
 
 class EditRewardScorer(BaseScorer):
@@ -60,9 +63,7 @@ class EditRewardScorer(BaseScorer):
         # offload_between_calls this does not change per-score behavior — the
         # parent drives onload/offload through the lifecycle endpoints.
         boot_offloaded = os.environ.get("UNIRL_SCORER_BOOT_OFFLOADED") == "1"
-        initial_device = (
-            "cpu" if (self._offload_between_calls or boot_offloaded) else self._target_device
-        )
+        initial_device = "cpu" if (self._offload_between_calls or boot_offloaded) else self._target_device
 
         # If checkpoint_path looks like a HF repo ID (not a local dir),
         # download it via huggingface_hub first.
@@ -108,12 +109,7 @@ class EditRewardScorer(BaseScorer):
         edits: list = []
         for i, item in enumerate(items):
             try:
-                if len(item.history) < 2:
-                    raise ValueError(f"EditReward requires 2 history turns (source + edited), got {len(item.history)}")
-                prompt, source_image = item.history[0]
-                _, edited_image = item.history[1]
-                if source_image is None or edited_image is None:
-                    raise ValueError("Both source and edited images must be provided")
+                prompt, source_image, edited_image = self._unpack_item(item)
                 rows.append(i)
                 prompts.append(prompt)
                 srcs.append(source_image)
@@ -126,9 +122,12 @@ class EditRewardScorer(BaseScorer):
                 rewards = self.inferencer.reward(prompts=prompts, image_src=srcs, image_paths=edits)
                 for row, i in enumerate(rows):
                     results[i] = self._shape_reward(rewards, row)
+            except torch.cuda.OutOfMemoryError:
+                raise
             except Exception:
                 # A single bad item must not nan the whole batch — fall back to
                 # the one-at-a-time path only on the error case.
+                logger.exception("EditReward batch scoring failed; retrying items individually")
                 for i in rows:
                     try:
                         results[i] = self._score_single(items[i])
@@ -167,7 +166,17 @@ class EditRewardScorer(BaseScorer):
                 first: scores[0] if scores else float("nan"),
                 second: scores[1] if len(scores) > 1 else float("nan"),
             }
-        return {k: float("nan") for k in self.sub_metric_names}
+        raise TypeError(f"unsupported EditReward reward output: {type(rewards).__name__}")
+
+    @staticmethod
+    def _unpack_item(item: ScoreItem):
+        if len(item.history) < 2:
+            raise ValueError(f"EditReward requires 2 history turns (source + edited), got {len(item.history)}")
+        prompt, source_image = item.history[0]
+        _, edited_image = item.history[1]
+        if source_image is None or edited_image is None:
+            raise ValueError("Both source and edited images must be provided")
+        return prompt, source_image, edited_image
 
     def _score_single(self, item: ScoreItem) -> dict[str, float]:
         """Score a single item.
@@ -176,14 +185,7 @@ class EditRewardScorer(BaseScorer):
             history[0] = (prompt, source_image)
             history[1] = (prompt, edited_image)
         """
-        if len(item.history) < 2:
-            raise ValueError(f"EditReward requires 2 history turns (source + edited), got {len(item.history)}")
-
-        prompt, source_image = item.history[0]
-        _, edited_image = item.history[1]
-
-        if source_image is None or edited_image is None:
-            raise ValueError("Both source and edited images must be provided")
+        prompt, source_image, edited_image = self._unpack_item(item)
 
         # EditRewardInferencer.reward() accepts paths or PIL images
         # (process_vision_info handles PIL.Image directly)

@@ -280,5 +280,5 @@ class EditRewardInferencer:
 
     def reward(self, prompts, image_src, image_paths):
         batch = self.prepare_batch(image_src, image_paths, prompts)
-        rewards = self.model(return_dict=True, **batch)["logits"]
-        return rewards
+        output = self.model(return_dict=True, **batch)
+        return output["logits"] if isinstance(output, Mapping) else output
