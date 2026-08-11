@@ -317,8 +317,23 @@ def create_direct_app(
             if app.state.lifecycle_state == "stopping" and action != "shutdown":
                 raise HTTPException(status_code=409, detail="scorer is stopping")
             if action in {"load", "onload"}:
-                await asyncio.to_thread(scorer.onload)
-                app.state.lifecycle_state = "resident"
+                if app.state.lifecycle_state != "resident":
+                    app.state.lifecycle_state = "loading"
+                    try:
+                        await asyncio.to_thread(scorer.onload)
+                    except Exception:
+                        if scorer.supports_offload:
+                            try:
+                                await asyncio.to_thread(scorer.offload)
+                            except Exception:
+                                app.state.lifecycle_state = "error"
+                                logger.exception("failed to roll back scorer after onload error")
+                            else:
+                                app.state.lifecycle_state = "offloaded"
+                        else:
+                            app.state.lifecycle_state = "error"
+                        raise
+                    app.state.lifecycle_state = "resident"
             elif action == "offload":
                 if not scorer.supports_offload:
                     raise HTTPException(status_code=409, detail=f"scorer {scorer_name!r} does not support offload")
@@ -327,9 +342,10 @@ def create_direct_app(
                 await asyncio.to_thread(scorer.offload)
                 app.state.lifecycle_state = "offloaded"
             elif action == "drain":
+                previous_state = app.state.lifecycle_state
                 app.state.lifecycle_state = "draining"
                 await asyncio.to_thread(scorer.drain)
-                app.state.lifecycle_state = "resident"
+                app.state.lifecycle_state = previous_state
             else:
                 app.state.lifecycle_state = "stopping"
                 await asyncio.to_thread(scorer.drain)

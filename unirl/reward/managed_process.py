@@ -266,8 +266,9 @@ class ManagedScorerProcessBackend(RemoteRewardBackend):
             response = self._session.post(f"{self.base_url}/lifecycle/{action}", timeout=timeout)
             response.raise_for_status()
             return True
-        except requests.RequestException:
+        except requests.RequestException as exc:
             if tolerate_failure:
+                logger.warning("managed scorer lifecycle %s failed during cleanup: %s", action, exc)
                 return False
             raise
 
@@ -275,15 +276,20 @@ class ManagedScorerProcessBackend(RemoteRewardBackend):
         if self.process_config.lifecycle != "per_call":
             return super().compute_rewards(request)
         with self._lifecycle_lock:
-            self.onload()
             try:
+                self.onload()
                 response = super().compute_rewards(request)
             except BaseException:
-                # A child that crashed mid-score fails this offload too; that
-                # lifecycle error must not replace the real scoring failure.
+                # A failed onload or score can also make cleanup fail; preserve
+                # the operation that caused the request to fail.
                 self._lifecycle("offload", tolerate_failure=True)
                 raise
-            self.offload()
+            if all(response.successes):
+                self.offload()
+            else:
+                # The direct server reports scorer failures as HTTP 200 with
+                # per-item errors. Preserve those details if cleanup also fails.
+                self._lifecycle("offload", tolerate_failure=True)
             return response
 
     def is_available(self) -> bool:
