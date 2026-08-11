@@ -724,12 +724,14 @@ class DiffusionTrainer(BaseTrainer):
         sleep_rollout: bool,
     ) -> Sample:
         """Generate with exception-safe EMA, rollout, and FSDP lifecycle cleanup."""
+        # No EMA term: _validate_residency_config already rejected the EMA x
+        # offload x colocated-external combination at startup, fail-fast
+        # instead of silently skipping the requested offload here.
         should_offload_train = (
-            self._enable_fsdp_offload
-            and self._layout != "separate"
-            and not self._rollout_is_trainside
-            and not self._uses_ema
+            self._enable_fsdp_offload and self._layout != "separate" and not self._rollout_is_trainside
         )
+        # Swap EMA weights only for trainside rollout; remote engines receive
+        # them through weight sync.
         should_swap_ema = self._uses_ema and self._rollout_is_trainside
         wake_attempted = False
         train_offload_attempted = False
@@ -941,7 +943,6 @@ class DiffusionTrainer(BaseTrainer):
                     metrics.update(suite_metrics)
             if not generated_any:
                 self._prepare_empty_evaluation(sync_weights=sync_pending, sleep_rollout=sleep_requested)
-                sync_pending = False
             elif sleep_at_end:
                 self.rollout.sleep()
             evaluation_succeeded = True

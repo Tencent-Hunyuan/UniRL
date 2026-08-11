@@ -130,6 +130,7 @@ def fsdp_wrap(
     if activation_checkpointing:
         from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
             CheckpointImpl,
+            CheckpointWrapper,
             apply_activation_checkpointing,
             checkpoint_wrapper,
         )
@@ -157,8 +158,6 @@ def fsdp_wrap(
         #   mp_policy cast. Opt in per recipe where this order was actually
         #   smoke-validated (the BAGEL it2i replay recipe pins it).
         if ac_wrap_order == "outside":
-            from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
-
             wrapped = [m for m in model.modules() if isinstance(m, CheckpointWrapper)]
             require(
                 len(wrapped) == len(block_instances),
