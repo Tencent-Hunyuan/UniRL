@@ -187,7 +187,7 @@ reward:
       scorer:
         _target_: unirl.reward.managed_process.ManagedScorerConfig
         name: editreward
-        input_kind: image_edit
+        history_kind: image_edit
         version: "1"
         params:
           checkpoint_path: ${oc.env:EDITREWARD_CHECKPOINT,TIGER-Lab/EditReward-MiMo-VL-7B-SFT-2508}
@@ -208,7 +208,7 @@ reward:
         sub_metric_reduce: first
         aggregation_method: weighted_sum
         input_kind: image
-      lifecycle: resident
+      gpu_residency: resident
 
 algorithm:
   _target_: unirl.algorithms.flowgrpo.FlowGRPO
