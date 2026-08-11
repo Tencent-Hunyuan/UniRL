@@ -367,36 +367,33 @@ class VLLMOmniBackend:
         # ``OmniACK(status="ERROR")`` instead of raising, so a discarded return
         # value turns a failed sleep/wake into a silent partial transition — the
         # exact state the engine's transition latch exists to refuse.
-        successes = 0
+        success_count = 0
 
         def ack_field(ack: object, name: str, default: object = None) -> object:
             return ack.get(name, default) if isinstance(ack, Mapping) else getattr(ack, name, default)
 
-        def inspect(result: object) -> None:
-            nonlocal successes
+        def ack_error(ack: object) -> object:
+            return ack_field(ack, "error_msg", ack_field(ack, "error"))
+
+        def validate_result(result: object) -> None:
+            nonlocal success_count
             if result is None:
                 # Non-reporting worker ranks legitimately return None; at least
                 # one explicit rank-0 SUCCESS ACK is still required below.
                 return
             if isinstance(result, (list, tuple)):
                 for item in result:
-                    inspect(item)
+                    validate_result(item)
                 return
 
             status = ack_field(result, "status")
             if status is None:
-                supported = ack_field(result, "supported")
-                error = ack_field(result, "error", ack_field(result, "error_msg"))
-                todo = ack_field(result, "todo")
-                raise RuntimeError(
-                    f"vllm-omni {action} returned no ACK status for stage {stage_id}: "
-                    f"supported={supported!r} todo={todo!r} error={error!r} result={result!r}"
-                )
+                raise RuntimeError(f"vllm-omni {action} returned no ACK status for stage {stage_id}: result={result!r}")
             if status != "SUCCESS":
                 raise RuntimeError(
                     f"vllm-omni {action} failed on stage {stage_id}: worker rank "
                     f"{ack_field(result, 'rank', '?')} answered status={status!r} "
-                    f"error={ack_field(result, 'error_msg', ack_field(result, 'error'))!r}"
+                    f"error={ack_error(result)!r}"
                 )
             ack_stage_id = ack_field(result, "stage_id")
             ack_task_id = ack_field(result, "task_id")
@@ -407,10 +404,10 @@ class VLLMOmniBackend:
                     f"vllm-omni {action} ACK task mismatch on stage {stage_id}: "
                     f"expected {task_id!r}, got {ack_task_id!r}"
                 )
-            successes += 1
+            success_count += 1
 
-        inspect(acks)
-        if successes == 0:
+        validate_result(acks)
+        if success_count == 0:
             raise RuntimeError(f"vllm-omni {action} returned no successful ACK for stage {stage_id}")
 
     def sleep_task(self) -> None:

@@ -181,8 +181,8 @@ class WeightSync:
         """The engine released the runtime memory — the worker-side LoRA pool
         is gone until restored. Unlike sglang_diffusion's passive model (the
         next trainer-driven sync re-pushes), this engine actively re-pushes on
-        wake from the cached tensors, so the loaded-intent flag survives the
-        release; only the pool-valid bit flips."""
+        wake from the cached tensors, so the cached adapter intent survives;
+        only the worker-pool validity changes."""
         self._weights_released = True
 
     def restore_lora_after_wake(self) -> None:
