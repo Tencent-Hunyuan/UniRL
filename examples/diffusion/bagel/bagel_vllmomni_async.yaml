@@ -20,7 +20,6 @@ save_interval: 0
 
 transport_kind: colocate_store
 workers_per_device: 1
-worker_max_concurrency: 3      # one rollout call + two control-call threads per worker
 
 # AsyncDiffusionTrainer requires disjoint train/rollout slabs.
 layout: separate
