@@ -40,7 +40,7 @@ class ManagedProcessConfig:
 @dataclass
 class ManagedScorerConfig:
     name: str = ""
-    input_kind: str = "image"
+    history_kind: str = "image"
     params: dict[str, Any] = field(default_factory=dict)
     version: str | None = None
 
@@ -55,7 +55,7 @@ class ManagedScorerProcessSpec(BaseRewardComponentSpec):
             required_rewards=("placeholder",),
         )
     )
-    lifecycle: str = "resident"
+    gpu_residency: str = "resident"
     idempotency_cache_size: int = 1024
 
     def __post_init__(self) -> None:
@@ -70,8 +70,8 @@ class ManagedScorerProcessSpec(BaseRewardComponentSpec):
         require(Path(self.process.service_root).is_dir(), f"reward service root not found: {self.process.service_root}")
         require(bool(self.scorer.name.strip()), "managed scorer name must be non-empty")
         require(
-            self.scorer.input_kind in {"image", "image_edit"},
-            f"managed scorer initial scope is image/image_edit; got {self.scorer.input_kind!r}",
+            self.scorer.history_kind in {"image", "image_edit"},
+            f"managed scorer history_kind must be image or image_edit; got {self.scorer.history_kind!r}",
         )
         require(
             tuple(self.client.required_rewards) == (self.scorer.name,),
@@ -81,7 +81,7 @@ class ManagedScorerProcessSpec(BaseRewardComponentSpec):
             self.client.input_kind == "image",
             f"managed image scorer requires client.input_kind='image'; got {self.client.input_kind!r}",
         )
-        require(self.lifecycle in {"resident", "per_call"}, "lifecycle must be resident or per_call")
+        require(self.gpu_residency in {"resident", "per_call"}, "gpu_residency must be resident or per_call")
         require(self.process.startup_timeout > 0, "startup_timeout must be positive")
         require(self.process.shutdown_timeout > 0, "shutdown_timeout must be positive")
         require(self.idempotency_cache_size > 0, "idempotency_cache_size must be positive")
@@ -104,12 +104,12 @@ class ManagedScorerProcessBackend(RemoteRewardBackend):
     """Own one persistent loopback scorer child on this reward worker's GPU."""
 
     def __init__(self, *, config: ManagedScorerProcessSpec, base_device: str) -> None:
-        self.process_config = config
+        self.spec = config
         self._process: subprocess.Popen[bytes] | None = None
         self._process_log: BinaryIO | None = None
         self._disposed = False
         self._atexit_registered = False
-        self._lifecycle_lock = threading.RLock()
+        self._residency_lock = threading.RLock()
         try:
             base_url = self._start_child()
             remote_spec = replace(
@@ -134,7 +134,7 @@ class ManagedScorerProcessBackend(RemoteRewardBackend):
         self._atexit_registered = True
 
     def _child_env(self) -> dict[str, str]:
-        cfg = self.process_config
+        cfg = self.spec
         env = dict(os.environ)
         existing_pythonpath = env.get("PYTHONPATH")
         env["PYTHONPATH"] = cfg.process.service_root + (
@@ -146,7 +146,7 @@ class ManagedScorerProcessBackend(RemoteRewardBackend):
             env["TRANSFORMERS_OFFLINE"] = "1"
         env.pop("RAY_ADDRESS", None)
         env["UNIRL_REWARD_PARENT_PID"] = str(os.getpid())
-        if cfg.lifecycle == "per_call":
+        if cfg.gpu_residency == "per_call":
             # Construction-time hint: scorers that can build on CPU (e.g.
             # EditReward) read this and never touch the GPU during boot, closing
             # the bootstrap window entirely instead of merely shrinking it.
@@ -160,7 +160,7 @@ class ManagedScorerProcessBackend(RemoteRewardBackend):
         return env
 
     def _start_child(self) -> str:
-        cfg = self.process_config
+        cfg = self.spec
         env = self._child_env()
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -182,14 +182,14 @@ class ManagedScorerProcessBackend(RemoteRewardBackend):
                 str(listener.fileno()),
                 "--scorer",
                 cfg.scorer.name,
-                "--input-kind",
-                cfg.scorer.input_kind,
+                "--history-kind",
+                cfg.scorer.history_kind,
                 "--cache-size",
                 str(cfg.idempotency_cache_size),
                 "--params-json",
                 json.dumps(cfg.scorer.params, separators=(",", ":")),
             ]
-            if cfg.lifecycle == "per_call":
+            if cfg.gpu_residency == "per_call":
                 command.append("--boot-offloaded")
             logger.info(
                 "starting managed reward child scorer=%s port=%d cuda_visible=%s python=%s log=%s",
@@ -215,7 +215,7 @@ class ManagedScorerProcessBackend(RemoteRewardBackend):
         # A per_call child boots offloaded (--boot-offloaded): the scorer must be
         # off the GPU by the time it first reports ready, so that is the ready
         # state to wait for. Resident children report "resident" as before.
-        expected_state = "offloaded" if cfg.lifecycle == "per_call" else "resident"
+        expected_state = "offloaded" if cfg.gpu_residency == "per_call" else "resident"
         deadline = time.monotonic() + float(cfg.process.startup_timeout)
         try:
             while time.monotonic() < deadline:
@@ -226,7 +226,7 @@ class ManagedScorerProcessBackend(RemoteRewardBackend):
                         " (an 'unrecognized arguments: --boot-offloaded' log means "
                         f"unirl-reward-service at {cfg.process.service_root!r} predates "
                         "the per_call boot protocol)"
-                        if cfg.lifecycle == "per_call"
+                        if cfg.gpu_residency == "per_call"
                         else ""
                     )
                     raise RuntimeError(
@@ -242,9 +242,9 @@ class ManagedScorerProcessBackend(RemoteRewardBackend):
                             and body.get("state") == expected_state
                             and scorer.get("input_kind") == "image"
                         ):
-                            if cfg.lifecycle == "per_call" and not scorer.get("supports_offload"):
+                            if cfg.gpu_residency == "per_call" and not scorer.get("supports_offload"):
                                 raise RuntimeError(
-                                    f"managed scorer {cfg.scorer.name!r} does not support lifecycle='per_call'"
+                                    f"managed scorer {cfg.scorer.name!r} does not support gpu_residency='per_call'"
                                 )
                             if cfg.scorer.version is not None and scorer.get("version") != cfg.scorer.version:
                                 raise RuntimeError(
@@ -261,7 +261,7 @@ class ManagedScorerProcessBackend(RemoteRewardBackend):
         self._stop_child()
         raise TimeoutError(f"reward child did not become ready within {cfg.process.startup_timeout}s; log={log_path}")
 
-    def _lifecycle(self, action: str, *, timeout: float = 30.0, tolerate_failure: bool = False) -> bool:
+    def _post_lifecycle(self, action: str, *, timeout: float = 30.0, tolerate_failure: bool = False) -> bool:
         try:
             response = self._session.post(f"{self.base_url}/lifecycle/{action}", timeout=timeout)
             response.raise_for_status()
@@ -273,23 +273,20 @@ class ManagedScorerProcessBackend(RemoteRewardBackend):
             raise
 
     def compute_rewards(self, request: RewardRequest) -> RewardResponse:
-        if self.process_config.lifecycle != "per_call":
+        if self.spec.gpu_residency != "per_call":
             return super().compute_rewards(request)
-        with self._lifecycle_lock:
+        with self._residency_lock:
             try:
-                self.onload()
+                self._post_lifecycle("onload")
                 response = super().compute_rewards(request)
             except BaseException:
                 # A failed onload or score can also make cleanup fail; preserve
                 # the operation that caused the request to fail.
-                self._lifecycle("offload", tolerate_failure=True)
+                self._post_lifecycle("offload", tolerate_failure=True)
                 raise
-            if all(response.successes):
-                self.offload()
-            else:
-                # The direct server reports scorer failures as HTTP 200 with
-                # per-item errors. Preserve those details if cleanup also fails.
-                self._lifecycle("offload", tolerate_failure=True)
+            # The direct server reports scorer failures as HTTP 200 with
+            # per-item errors. Preserve those details if cleanup also fails.
+            self._post_lifecycle("offload", tolerate_failure=not all(response.successes))
             return response
 
     def is_available(self) -> bool:
@@ -298,15 +295,15 @@ class ManagedScorerProcessBackend(RemoteRewardBackend):
         return super().is_available()
 
     def offload(self) -> None:
-        with self._lifecycle_lock:
-            self._lifecycle("offload")
+        with self._residency_lock:
+            self._post_lifecycle("offload")
 
     def onload(self) -> None:
-        with self._lifecycle_lock:
-            self._lifecycle("onload")
+        with self._residency_lock:
+            self._post_lifecycle("onload")
 
     def dispose(self) -> None:
-        with self._lifecycle_lock:
+        with self._residency_lock:
             if self._disposed:
                 return
             self._disposed = True
@@ -314,13 +311,12 @@ class ManagedScorerProcessBackend(RemoteRewardBackend):
                 atexit.unregister(self._stop_child)
                 self._atexit_registered = False
             try:
-                if hasattr(self, "_session"):
-                    self._lifecycle(
-                        "shutdown",
-                        timeout=float(self.process_config.process.shutdown_timeout),
-                        tolerate_failure=True,
-                    )
-                    super().dispose()
+                self._post_lifecycle(
+                    "shutdown",
+                    timeout=float(self.spec.process.shutdown_timeout),
+                    tolerate_failure=True,
+                )
+                super().dispose()
             finally:
                 self._stop_child()
 
@@ -333,7 +329,7 @@ class ManagedScorerProcessBackend(RemoteRewardBackend):
             except ProcessLookupError:
                 pass
             try:
-                process.wait(timeout=float(self.process_config.process.shutdown_timeout))
+                process.wait(timeout=float(self.spec.process.shutdown_timeout))
             except subprocess.TimeoutExpired:
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
@@ -343,12 +339,6 @@ class ManagedScorerProcessBackend(RemoteRewardBackend):
         if self._process_log is not None:
             self._process_log.close()
             self._process_log = None
-
-    def __del__(self) -> None:
-        try:
-            self._stop_child()
-        except Exception:
-            pass
 
 
 __all__ = [

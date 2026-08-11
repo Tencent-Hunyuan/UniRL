@@ -85,7 +85,7 @@ backend:
     scorer:
       _target_: unirl.reward.managed_process.ManagedScorerConfig
       name: editreward
-      input_kind: image_edit
+      history_kind: image_edit
       params: {device: cuda, checkpoint_path: /models/EditReward}
     client:
       _target_: unirl.reward.remote.RemoteRewardSpec
@@ -93,11 +93,13 @@ backend:
       required_rewards: [editreward]
       input_kind: image
       request_batch_size: 8
+    gpu_residency: resident
 ```
 
 `request_batch_size` bounds transport/scorer calls independently from the DP
-shard size. Identity echo is required for managed children, and lifecycle calls
-map to explicit child `onload`/`offload`/`drain` endpoints.
+shard size. Identity echo is required for managed children. The parent manages
+GPU residency through the child's `onload`, `offload`, and `shutdown` endpoints;
+`drain` remains available for explicit synchronization.
 
 **Extending it:** a new local scorer is usually a file in `local/` subclassing
 `LocalRewardBackend` (set `canonical_model_name`, implement `_load_model` +

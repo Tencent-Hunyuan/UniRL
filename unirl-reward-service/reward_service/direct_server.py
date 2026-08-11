@@ -22,7 +22,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException
 
 from reward_service.logging_utils import get_logger
-from reward_service.schemas import RewardIdentity, ScoreRequest, ScoreResponse
+from reward_service.schemas import PROTOCOL_VERSION, RewardIdentity, ScoreRequest, ScoreResponse
 from reward_service.scorers.registry import SCORER_MODULES, get_scorer_cls
 from reward_service.wire import request_to_item
 
@@ -127,12 +127,12 @@ def create_direct_app(
     scorer_name: str,
     params: dict[str, Any],
     *,
-    input_kind: str = "image",
+    history_kind: str = "image",
     cache_size: int = 1024,
     boot_offloaded: bool = False,
 ) -> FastAPI:
-    if input_kind not in {"image", "image_edit"}:
-        raise ValueError(f"direct managed scorer supports image/image_edit only, got {input_kind!r}")
+    if history_kind not in {"image", "image_edit"}:
+        raise ValueError(f"history_kind must be image or image_edit, got {history_kind!r}")
     if cache_size < 1:
         raise ValueError(f"cache_size must be positive, got {cache_size}")
 
@@ -153,8 +153,7 @@ def create_direct_app(
             # misconfiguration must not pay a full model load (possibly onto the
             # exact GPU the protocol protects) just to be told no.
             raise ValueError(
-                f"--boot-offloaded requires scorer {scorer_name!r} to support offload "
-                "(needed for lifecycle='per_call')"
+                f"--boot-offloaded requires scorer {scorer_name!r} to support offload (needed for lifecycle='per_call')"
             )
         logger.info("direct scorer loading name=%s params=%s", scorer_name, params)
         scorer = await asyncio.to_thread(scorer_cls, **params)
@@ -205,7 +204,7 @@ def create_direct_app(
 
     @app.post("/score", response_model=ScoreResponse)
     async def score(body: ScoreRequest) -> ScoreResponse:
-        if body.protocol_version != "1":
+        if body.protocol_version != PROTOCOL_VERSION:
             raise HTTPException(status_code=400, detail=f"unsupported protocol_version={body.protocol_version!r}")
         if not body.requests:
             return ScoreResponse(results=[], errors=[], identities=[])
@@ -213,6 +212,8 @@ def create_direct_app(
             unknown = [name for name in request.required_rewards if name != scorer_name]
             if unknown:
                 raise HTTPException(status_code=400, detail=f"unknown rewards for this worker: {unknown}")
+            if history_kind == "image_edit" and len(request.history) < 2:
+                raise HTTPException(status_code=400, detail="image_edit requests require source and edited turns")
 
         # Fingerprinting (and the decode below) is CPU work proportional to the b64
         # media in the chunk. Run on the event loop it stalls /health and the
@@ -308,21 +309,23 @@ def create_direct_app(
 
     @app.post("/lifecycle/{action}")
     async def lifecycle(action: str) -> dict:
-        if action not in {"load", "health", "onload", "offload", "drain", "shutdown"}:
+        if action not in {"onload", "offload", "drain", "shutdown"}:
             raise HTTPException(status_code=404, detail=f"unknown lifecycle action {action!r}")
-        if action == "health":
-            return await health()
         async with app.state.score_lock:
             scorer = app.state.scorer
             if app.state.lifecycle_state == "stopping" and action != "shutdown":
                 raise HTTPException(status_code=409, detail="scorer is stopping")
-            if action in {"load", "onload"}:
-                if app.state.lifecycle_state != "resident":
+            if action == "onload":
+                if app.state.lifecycle_state == "resident":
+                    pass
+                else:
                     app.state.lifecycle_state = "loading"
                     try:
                         await asyncio.to_thread(scorer.onload)
                     except Exception:
-                        if scorer.supports_offload:
+                        if not scorer.supports_offload:
+                            app.state.lifecycle_state = "error"
+                        else:
                             try:
                                 await asyncio.to_thread(scorer.offload)
                             except Exception:
@@ -330,17 +333,20 @@ def create_direct_app(
                                 logger.exception("failed to roll back scorer after onload error")
                             else:
                                 app.state.lifecycle_state = "offloaded"
-                        else:
-                            app.state.lifecycle_state = "error"
                         raise
                     app.state.lifecycle_state = "resident"
             elif action == "offload":
                 if not scorer.supports_offload:
                     raise HTTPException(status_code=409, detail=f"scorer {scorer_name!r} does not support offload")
-                app.state.lifecycle_state = "draining"
-                await asyncio.to_thread(scorer.drain)
-                await asyncio.to_thread(scorer.offload)
-                app.state.lifecycle_state = "offloaded"
+                if app.state.lifecycle_state != "offloaded":
+                    app.state.lifecycle_state = "draining"
+                    try:
+                        await asyncio.to_thread(scorer.drain)
+                        await asyncio.to_thread(scorer.offload)
+                    except Exception:
+                        app.state.lifecycle_state = "error"
+                        raise
+                    app.state.lifecycle_state = "offloaded"
             elif action == "drain":
                 previous_state = app.state.lifecycle_state
                 app.state.lifecycle_state = "draining"
@@ -419,7 +425,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--scorer", required=True)
     parser.add_argument("--params-json", required=True)
-    parser.add_argument("--input-kind", default="image")
+    parser.add_argument("--history-kind", default="image")
     parser.add_argument("--cache-size", type=int, default=1024)
     parser.add_argument(
         "--boot-offloaded",
@@ -440,7 +446,7 @@ def main() -> None:
     app = create_direct_app(
         args.scorer,
         params,
-        input_kind=args.input_kind,
+        history_kind=args.history_kind,
         cache_size=args.cache_size,
         boot_offloaded=args.boot_offloaded,
     )

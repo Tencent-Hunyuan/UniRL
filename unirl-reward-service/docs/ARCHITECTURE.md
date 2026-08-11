@@ -308,12 +308,12 @@ The server:
 
 - owns exactly one registered scorer;
 - accepts image/image-edit histories only in the initial protocol;
-- serializes calls unless a future scorer capability says otherwise;
+- serializes scoring and lifecycle transitions;
 - echoes request/sample/group/policy/scorer identity;
 - caches idempotency keys for safe retries;
 - rejects non-finite outputs;
-- exposes explicit `health`, `onload`, `offload`, `drain`, and `shutdown`
-  lifecycle operations.
+- exposes `GET /health` plus explicit `onload`, `offload`, `drain`, and
+  `shutdown` lifecycle operations.
 
 The full gateway remains the multi-reward, multi-replica deployment. The direct
 server is a rank-local process/environment boundary, not a replacement for it.
