@@ -21,7 +21,7 @@ from fastapi import FastAPI, HTTPException
 
 from reward_service.config import ServiceCfg
 from reward_service.logging_utils import get_logger
-from reward_service.schemas import RewardRequest, ScoreRequest, ScoreResponse
+from reward_service.schemas import PROTOCOL_VERSION, RewardRequest, ScoreRequest, ScoreResponse
 from reward_service.scorers import ScoreItem
 from reward_service.wire import request_to_item
 from reward_service.workers.pool import WorkerPool
@@ -110,7 +110,7 @@ def create_app(cfg: ServiceCfg) -> FastAPI:
     @app.post("/score", response_model=ScoreResponse)
     async def score(body: ScoreRequest) -> ScoreResponse:
         pool: WorkerPool = app.state.pool
-        if body.protocol_version != "1":
+        if body.protocol_version != PROTOCOL_VERSION:
             raise HTTPException(status_code=400, detail=f"unsupported protocol_version={body.protocol_version!r}")
         if any(request.scorer_version is not None for request in body.requests):
             # One gateway request may name several rewards and the pool reports no
@@ -121,7 +121,8 @@ def create_app(cfg: ServiceCfg) -> FastAPI:
                 status_code=400,
                 detail=(
                     "scorer_version pinning is not supported by the multi-reward gateway; "
-                    "drop expected_scorer_version or point the client at a managed single-scorer child"
+                    "omit the scorer_version pin (expected_scorer_version in RemoteRewardSpec) "
+                    "or point the client at a managed single-scorer child"
                 ),
             )
         if not body.requests:

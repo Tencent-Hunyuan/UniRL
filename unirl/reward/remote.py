@@ -386,11 +386,10 @@ class RemoteRewardBackend(RewardBackend):
 
     def _post_score_requests(self, wire_requests: List[Dict[str, Any]]) -> Dict[str, Any]:
         if not wire_requests:
-            return {"protocol_version": "1", "results": [], "errors": [], "identities": []}
+            return {"protocol_version": "1", "results": [], "errors": []}
         request_batch_size = self.request_batch_size or len(wire_requests)
         merged_results: List[Dict[str, Dict[str, float]]] = []
         merged_errors: List[Dict[str, str]] = []
-        merged_identities: List[Dict[str, Any]] = []
 
         for start in range(0, len(wire_requests), request_batch_size):
             chunk = wire_requests[start : start + request_batch_size]
@@ -418,32 +417,14 @@ class RemoteRewardBackend(RewardBackend):
                     self._validate_identity_echo(expected, actual)
             elif self.require_identity_echo:
                 raise ValueError("RewardService response omitted required item identities")
-            else:
-                identities = [
-                    {
-                        key: request.get(key)
-                        for key in (
-                            "request_id",
-                            "sample_id",
-                            "group_id",
-                            "source_rank",
-                            "policy_version",
-                            "scorer_version",
-                            "idempotency_key",
-                        )
-                    }
-                    for request in chunk
-                ]
 
             merged_results.extend(results)
             merged_errors.extend(errors)
-            merged_identities.extend(identities)
 
         return {
             "protocol_version": "1",
             "results": merged_results,
             "errors": merged_errors,
-            "identities": merged_identities,
         }
 
     def _validate_identity_echo(self, expected: Dict[str, Any], actual: Dict[str, Any]) -> None:
@@ -477,6 +458,9 @@ class RemoteRewardBackend(RewardBackend):
                     self.max_retries,
                 )
             except http_requests.exceptions.RequestException as e:
+                response = getattr(e, "response", None)
+                if response is not None and 400 <= response.status_code < 500 and response.status_code != 429:
+                    raise
                 last_exc = e
                 logger.warning(
                     "RemoteRewardBackend: %s (attempt %d/%d)",
