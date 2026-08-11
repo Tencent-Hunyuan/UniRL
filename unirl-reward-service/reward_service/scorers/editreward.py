@@ -63,7 +63,6 @@ class EditRewardScorer(BaseScorer):
         initial_device = (
             "cpu" if (self._offload_between_calls or boot_offloaded) else self._target_device
         )
-        self._rm_head_type = rm_head_type
 
         # If checkpoint_path looks like a HF repo ID (not a local dir),
         # download it via huggingface_hub first.
@@ -146,31 +145,27 @@ class EditRewardScorer(BaseScorer):
         by the instance's ``sub_metric_names``.
         """
         first, second = self.sub_metric_names
-        if self._rm_head_type == "ranknet_multi_head":
-            if isinstance(rewards, torch.Tensor):
-                if rewards.dim() >= 2 and rewards.shape[-1] >= 2:
-                    return {
-                        first: float(rewards[row, 0].item()),
-                        second: float(rewards[row, 1].item()),
-                    }
+        if isinstance(rewards, torch.Tensor):
+            if rewards.dim() >= 2 and rewards.shape[-1] >= 2:
                 return {
-                    first: float(rewards[row].item()),
-                    second: float("nan"),
+                    first: float(rewards[row, 0].item()),
+                    second: float(rewards[row, 1].item()),
                 }
-            if isinstance(rewards, (list, tuple)):
-                scores = [float(r[row].item()) if torch.is_tensor(r) else float(r) for r in rewards]
-                return {
-                    first: scores[0] if len(scores) > 0 else float("nan"),
-                    second: scores[1] if len(scores) > 1 else float("nan"),
-                }
-        else:
-            if isinstance(rewards, torch.Tensor):
-                val = float(rewards[row, 0].item()) if rewards.dim() >= 2 else float(rewards[row].item())
-            else:
-                val = float(rewards[row])
             return {
-                first: val,
+                first: float(rewards[row].item()),
                 second: float("nan"),
+            }
+        if isinstance(rewards, (list, tuple)):
+            scores = []
+            for reward in rewards:
+                if torch.is_tensor(reward):
+                    value = reward[row]
+                    scores.append(float(value.reshape(-1)[0].item()))
+                else:
+                    scores.append(float(reward))
+            return {
+                first: scores[0] if scores else float("nan"),
+                second: scores[1] if len(scores) > 1 else float("nan"),
             }
         return {k: float("nan") for k in self.sub_metric_names}
 

@@ -252,7 +252,11 @@ class EditRewardInferencer:
             batch = self._prepare_inputs(batch)
             return batch, image_inputs
 
-        if self.rm_head_type == "ranknet_multi_head":
+        if self.rm_head_type in {
+            "ranknet_multi_head",
+            "ranknet_multi_head_regression",
+            "ranknet_share_head",
+        }:
             batch_dim1, image_inputs_1 = _build_batch(prompts, image_src, image_paths, reward_dim="dim1")
             batch_dim2, image_inputs_2 = _build_batch(prompts, image_src, image_paths, reward_dim="dim2")
             return {
