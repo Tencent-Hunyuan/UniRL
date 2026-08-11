@@ -119,6 +119,10 @@ class ModelAdapter(ABC):
         target_modules = list(self.cfg.target_modules or ("transformer",))
         return prefix, target_modules
 
+    def lora_tensor_routes(self) -> Dict[str, str]:
+        """Map model-side tensor prefixes to SGLang transformer targets."""
+        return {}
+
     def validate(self) -> None:
         mc = self.model_config
         require(

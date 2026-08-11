@@ -41,11 +41,13 @@ class WeightSync:
         pipeline_prefix: str,
         target_modules: List[str],
         uses_lora: bool,
+        lora_tensor_routes: Optional[Dict[str, str]] = None,
     ) -> None:
         self._backend = backend
         self._pipeline_prefix = pipeline_prefix
         self._target_modules = list(target_modules)
         self._uses_lora = uses_lora
+        self._lora_tensor_routes = dict(lora_tensor_routes or {})
         self._active_adapter: Optional[str] = None
         self._lora_loaded = False
 
@@ -118,28 +120,34 @@ class WeightSync:
     ) -> None:
         """Push a LoRA adapter from in-memory tensors.
 
-        The nickname is ``adapter_name`` verbatim on every push: SGLang's
-        diffusion ``_register_lora_state_dict`` clears and replaces the registry
-        entry for a re-used nickname and ``set_lora`` always reloads from
-        tensors, so same-name pushes serve fresh weights. Versioned nicknames
-        (the ``sglang`` rotation) leak here instead — the diffusion
-        ``lora_adapters`` registry never evicts other nicknames, so each sync
-        would strand one GPU-resident adapter copy (~34 MB/sync measured).
+        Stable nicknames are reused on every push so refreshed tensors replace
+        their registry entries without leaking GPU-resident adapter copies.
         """
         stripped = adapt_lora_for_sglang(
             lora_tensors,
             pipeline_prefix=self._pipeline_prefix,
         )
-        nickname = adapter_name
         adapter_alpha = None
         if peft_config is not None:
             adapter_alpha = peft_config.get("lora_alpha")
-        self._backend.set_lora(
-            lora_nickname=nickname,
-            lora_tensors=stripped,
-            lora_alpha=(float(adapter_alpha) if adapter_alpha is not None else None),
-        )
-        self._active_adapter = nickname
+        routed = self._route_lora_tensors(stripped)
+        alpha = float(adapter_alpha) if adapter_alpha is not None else None
+        for target, tensors in routed.items():
+            nickname = adapter_name if target == "all" else f"{adapter_name}__{target}"
+            status = self._backend.set_lora(
+                lora_nickname=nickname,
+                lora_tensors=tensors,
+                target=target,
+                lora_alpha=alpha,
+            )
+            logger.info(
+                "SGLang LoRA target %s active on %s/%s layers (nickname=%s)",
+                target,
+                status.get("active_layers", "?"),
+                status.get("total_layers", "?"),
+                nickname,
+            )
+        self._active_adapter = adapter_name
         self._lora_loaded = True
 
         layer_names = set()
@@ -153,11 +161,43 @@ class WeightSync:
                     break
             layer_names.add(base)
         logger.info(
-            "SGLang LoRA loaded from tensors (adapter=%s, nickname=%s) — %d layers",
+            "SGLang LoRA loaded from tensors (adapter=%s, targets=%s) — %d source layers",
             adapter_name,
-            nickname,
+            ",".join(routed),
             len(layer_names),
         )
+
+    def _route_lora_tensors(self, tensors: Dict[str, torch.Tensor]) -> Dict[str, Dict[str, torch.Tensor]]:
+        if not self._lora_tensor_routes:
+            return {"all": tensors}
+
+        routed: Dict[str, Dict[str, torch.Tensor]] = {target: {} for target in self._lora_tensor_routes.values()}
+        unmatched = []
+        for key, tensor in tensors.items():
+            matches = [
+                (prefix, target) for prefix, target in self._lora_tensor_routes.items() if key.startswith(prefix)
+            ]
+            if len(matches) != 1:
+                unmatched.append(key)
+                continue
+            prefix, target = matches[0]
+            local_key = key[len(prefix) :]
+            if local_key in routed[target]:
+                raise ValueError(f"Duplicate routed LoRA tensor {local_key!r} for SGLang target {target!r}")
+            routed[target][local_key] = tensor
+
+        if unmatched:
+            examples = ", ".join(unmatched[:4])
+            raise ValueError(
+                "LoRA tensor routing requires exactly one model-prefix match per tensor; "
+                f"{len(unmatched)} tensor(s) did not match uniquely. Examples: {examples}"
+            )
+        missing = [target for target, values in routed.items() if not values]
+        if missing:
+            raise ValueError(
+                "LoRA tensor routing produced no tensors for required SGLang target(s): " + ", ".join(missing)
+            )
+        return routed
 
     def loaded_param_checksums(self, *, names: List[str]) -> Dict[int, List[Dict[str, str]]]:
         output = self._backend.weights_checksum(module_names=list(names))

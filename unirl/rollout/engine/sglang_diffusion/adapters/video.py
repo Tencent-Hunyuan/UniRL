@@ -173,16 +173,16 @@ class Wan22T2VAdapter(VideoAdapter):
     WAN 2.2-A14B runs two ``WanTransformer3DModel`` experts switched at a sigma
     boundary (``boundary_ratio=0.875``): high-noise for ``sigma >= boundary``
     (coarse structure, early steps), low-noise for ``sigma < boundary`` (detail).
-    The entire dual-expert mechanism lives ENGINE-SIDE in sglang and needs no
-    adapter work: ``composed_pipeline_base.load_modules`` auto-loads ``transformer_2``
+    The denoising switch lives ENGINE-SIDE in sglang:
+    ``composed_pipeline_base.load_modules`` auto-loads ``transformer_2``
     when the checkpoint's ``model_index.json`` carries ``boundary_ratio`` + both
     ``transformer``/``transformer_2`` (the A14B-Diffusers ckpt does), and the generic
     ``DenoisingStage._select_and_manage_model`` routes per-step by the boundary
-    timestep (and applies ``guidance_scale_2`` to the low-noise branch). So the
-    UniRL side is byte-identical to WAN 2.1 — same UMT5 single-text fuse, same 6-D
-    video trajectory + ``video_pickscore`` consumer, same segment contract (no aux
-    audio). The trainside ``WAN22DiffusionStage`` replays with the SAME boundary
-    routing, so rollout↔replay stays aligned.
+    timestep (and applies ``guidance_scale_2`` to the low-noise branch). UniRL
+    additionally routes high/low LoRA tensor prefixes to those two engine modules;
+    the UMT5 fuse, video trajectory, and segment contract otherwise match WAN 2.1.
+    The trainside ``WAN22DiffusionStage`` replays with the SAME boundary routing,
+    so rollout↔replay stays aligned.
 
     ``build_sampling`` additionally forwards ``guidance_scale_2`` so the engine's
     low-noise CFG branch matches the trainside; it is omitted (engine falls back to
@@ -195,6 +195,12 @@ class Wan22T2VAdapter(VideoAdapter):
         if g2 is not None:
             kwargs["guidance_scale_2"] = float(g2)
         return kwargs
+
+    def lora_tensor_routes(self) -> Dict[str, str]:
+        return {
+            "high_noise.": "transformer",
+            "low_noise.": "transformer_2",
+        }
 
 
 @register_adapter("wan21")

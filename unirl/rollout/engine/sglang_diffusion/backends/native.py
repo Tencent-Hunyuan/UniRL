@@ -288,7 +288,7 @@ class SGLangBackend:
         target: str = "all",
         strength: float = 1.0,
         lora_alpha: Optional[float] = None,
-    ) -> None:
+    ) -> dict:
         request = self._rt["SetLoraFromTensorsReq"](
             lora_nickname=str(lora_nickname),
             lora_tensors=lora_tensors,
@@ -300,6 +300,17 @@ class SGLangBackend:
         error = getattr(response, "error", None)
         if error is not None:
             raise RuntimeError(f"set_lora_from_tensors failed: {error}")
+        output = getattr(response, "output", None)
+        if not isinstance(output, dict):
+            raise RuntimeError(f"set_lora_from_tensors returned invalid status: {output!r}")
+        active = int(output.get("active_layers", -1))
+        total = int(output.get("total_layers", -1))
+        if total <= 0 or active != total:
+            raise RuntimeError(
+                "set_lora_from_tensors did not activate every target layer: "
+                f"target={target!r}, active={active}, total={total}"
+            )
+        return output
 
     def weights_checksum(self, *, module_names: List[str]) -> dict:
         response = self._rt["sync_scheduler_client"].forward(

@@ -393,7 +393,36 @@ def _set_lora_from_tensors(
         lora_tensors=lora_tensors,
         lora_alpha=lora_alpha,
     )
-    return OutputBatch()
+    targets = [target] if isinstance(target, str) else list(target)
+    total_layers = 0
+    active_layers = 0
+    inactive_examples = []
+    for current_target in targets:
+        target_modules, error = self.pipeline._get_target_lora_layers(current_target)
+        if error:
+            return OutputBatch(error=error)
+        for module_name, layers in target_modules:
+            total_layers += len(layers)
+            for layer_name, layer in layers.items():
+                active = (
+                    layer.lora_A is not None and layer.lora_B is not None and not getattr(layer, "disable_lora", False)
+                )
+                if active:
+                    active_layers += 1
+                elif len(inactive_examples) < 8:
+                    inactive_examples.append(f"{module_name}.{layer_name}")
+
+    status = {
+        "target": target,
+        "active_layers": active_layers,
+        "total_layers": total_layers,
+    }
+    if total_layers <= 0 or active_layers != total_layers:
+        message = f"LoRA activation incomplete for target={target!r}: active={active_layers}/{total_layers}"
+        if inactive_examples:
+            message += f"; inactive examples: {', '.join(inactive_examples)}"
+        return OutputBatch(output=status, error=message)
+    return OutputBatch(output=status)
 
 
 def _get_module_device(self, module: torch.nn.Module) -> str:

@@ -108,6 +108,7 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
             pipeline_prefix=pipeline_prefix,
             target_modules=target_modules,
             uses_lora=bool(model_config.use_lora),
+            lora_tensor_routes=self.adapter.lora_tensor_routes(),
         )
 
         self.schedule_policy = self.adapter.schedule_policy()
