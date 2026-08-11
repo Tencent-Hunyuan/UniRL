@@ -1,55 +1,60 @@
 # @package _global_
-# Validation run: Qwen2.5-VL-7B LoRA SFT on llava-instruct-mix (~8k rows).
+# Qwen3-8B LoRA SFT on multi-turn tool-calling trajectories.
 #
-# Launch (1×8):
-#   ENTRY=train_sft bash examples/run_experiment_single_node.sh sft/validation/qwen_vl_sft_lora
+# Prepare:
+#   python -m unirl.utils.prepare_sft_agent \
+#     --out-dir datasets/sft_agent_toolcall_12k
+#
+# Launch (1x8):
+#   ENTRY=train_sft bash examples/run_experiment_single_node.sh \
+#     sft/qwen3_agent_sft_lora
 
 num_devices: 8
-batch_size: 32
-num_steps: 400
-eval_interval: 40
+batch_size: 64
+num_steps: 600
+eval_interval: 20
 eval_batch_size: 16
-eval_num_samples: -1
-save_interval: 100
-save_dir: ${oc.env:SFT_SAVE_DIR,checkpoints/sft_qwen_vl}
+eval_num_samples: 64
+save_interval: 20
+save_dir: ${oc.env:SFT_SAVE_DIR,checkpoints/sft_qwen3_agent}
 save_mode: auto
 
 logging:
   report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,true}}
-  project_name: ${oc.env:WANDB_PROJECT,unirl-sft-validation}
-  run_name: ${oc.env:WANDB_RUN_NAME,qwen-vl-7b-lora-llava}
+  project_name: ${oc.env:WANDB_PROJECT,unirl-agent-sft}
+  run_name: ${oc.env:WANDB_RUN_NAME,qwen3-8b-lora-toolcall}
   entity: ${oc.env:WANDB_ENTITY,null}
-  tags: [sft, qwen-vl, vlm, lora, validation]
+  tags: [sft, agent, tool-call, qwen3, llm, lora]
 
 bundle:
-  _target_: unirl.models.qwen_vl.bundle.QwenVLBundle.from_config
+  _target_: unirl.models.qwen3.bundle.Qwen3Bundle.from_config
   config:
-    _target_: unirl.models.qwen_vl.config.QwenVLPipelineConfig
-    pretrained_model_ckpt_path: ${oc.env:QWEN_VL_PATH,Qwen/Qwen2.5-VL-7B-Instruct}
-    model_precision: fp32
-    attn_implementation: flash_attention_2
-    freeze_vision_tower: true
+    _target_: unirl.models.qwen3.config.Qwen3PipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:QWEN3_PATH,Qwen/Qwen3-8B}
+    model_precision: bf16
     use_gradient_checkpointing: true
-    max_prompt_length: 2048
+    attn_implementation: flex_attention
 
 pipeline:
-  _target_: unirl.models.qwen_vl.pipeline.QwenVLPipeline.from_bundle
-  max_prompt_length: 2048
+  _target_: unirl.models.qwen3.pipeline.Qwen3Pipeline.from_bundle
+  enable_thinking: true
+  max_prompt_length: 8192
+  autocast_precision: bf16
+  logprob_precision: fp32
 
 backend:
   _target_: unirl.train.backend.fsdp.FSDPBackend
-  block_class_names: ["Qwen2_5_VLDecoderLayer"]
+  block_class_names: ["Qwen3DecoderLayer"]
   trainable_attr: transformer
   fsdp_cfg:
     _target_: unirl.train.configs.FSDPConfig
     param_dtype: bf16
-    master_dtype: fp32
     cpu_offload: false
     mixed_precision: true
     fsdp_mode: full
     reshard_after_forward: true
-    forward_prefetch: true
     activation_checkpointing: false
+    master_dtype: fp32
     use_torch_compile: false
   optimizer_cfg:
     _target_: unirl.train.backend.base.OptimizerConfig
@@ -61,12 +66,12 @@ backend:
   scheduler_cfg:
     _target_: unirl.train.backend.base.LrSchedulerConfig
     type: cosine
-    warmup_steps: 10
+    warmup_steps: 20
     total_steps: ${num_steps}
   lora_cfg:
     _target_: unirl.train.configs.LoraConfig
-    rank: 16
-    alpha: 32
+    rank: 32
+    alpha: 64
     dropout: 0.0
     bias: none
     task_type: CAUSAL_LM
@@ -82,7 +87,7 @@ algorithm:
   loss_agg_mode: token-mean
   conditions_cls:
     _target_: hydra.utils.get_class
-    path: unirl.models.qwen_vl.conditions.QwenVLARConditions
+    path: unirl.models.qwen3.conditions.Qwen3ARConditions
 
 stack:
   _target_: unirl.train.stack.TrainStack
@@ -95,6 +100,6 @@ track_builder:
 
 data_source:
   _target_: unirl.data.sft.SupervisedDataSource
-  manifest_path: ${oc.env:SFT_DATA}
-  eval_manifest_path: ${oc.env:SFT_EVAL_DATA,${oc.env:SFT_DATA}}
+  manifest_path: ${oc.env:SFT_DATA,datasets/sft_agent_toolcall_12k/train.jsonl}
+  eval_manifest_path: ${oc.env:SFT_EVAL_DATA,datasets/sft_agent_toolcall_12k/val.jsonl}
   seed: 42
