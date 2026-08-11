@@ -34,7 +34,12 @@ def _clone_checkpoint_kwarg(value: Any) -> Any:
 
 
 def _checkpoint_with_kwarg_snapshots(function: Any, *args: Any, **kwargs: Any) -> Any:
-    """Checkpoint a module call while replaying mutable kwargs from snapshots."""
+    """Checkpoint mutable kwargs from a frozen call-time mapping snapshot.
+
+    The outer clone isolates the saved checkpoint frame from later caller
+    mutation; ``run`` clones that frozen mapping again so neither the original
+    forward nor recompute can mutate the replay source.
+    """
     from torch.utils import checkpoint as torch_checkpoint
 
     checkpoint_kwargs = {key: _clone_checkpoint_kwarg(value) for key, value in kwargs.items()}
@@ -91,6 +96,10 @@ def fsdp_wrap(
     target_dtype = parse_torch_dtype(param_dtype, field_name="training.fsdp.param_dtype")
     trainable_dtype = (
         parse_torch_dtype(master_dtype, field_name="training.fsdp.master_dtype") if master_dtype is not None else None
+    )
+    require(
+        ac_wrap_order in {"inside", "outside"},
+        f"fsdp_wrap: ac_wrap_order must be 'inside' or 'outside', got {ac_wrap_order!r}",
     )
 
     fsdp_kwargs: Dict[str, object] = {
@@ -156,7 +165,7 @@ def fsdp_wrap(
         # * "inside" (fully_shard on the INNER block): the recompute goes through
         #   the module's __call__, re-running the pre-forward gather and the
         #   mp_policy cast. Opt in per recipe where this order was actually
-        #   smoke-validated (the BAGEL it2i replay recipe pins it).
+        #   smoke-validated (the stacked BAGEL it2i consumer pins it).
         if ac_wrap_order == "outside":
             wrapped = [m for m in model.modules() if isinstance(m, CheckpointWrapper)]
             require(
@@ -164,11 +173,6 @@ def fsdp_wrap(
                 f"fsdp_wrap: expected {len(block_instances)} checkpoint wrappers, found {len(wrapped)}",
             )
             block_instances = wrapped
-        else:
-            require(
-                ac_wrap_order == "inside",
-                f"fsdp_wrap: ac_wrap_order must be 'inside' or 'outside', got {ac_wrap_order!r}",
-            )
 
     for layer in block_instances:
         fully_shard(layer, **fsdp_kwargs)
