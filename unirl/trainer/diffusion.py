@@ -25,12 +25,9 @@ from unirl.utils.wandb_metrics import pooled_window_reward_metrics
 logger = logging.getLogger(__name__)
 
 
-def _run_cleanup_steps(
-    steps: List[Tuple[str, Callable[[], None]]],
-    *,
-    preserve_active_error: bool,
-) -> None:
+def _run_cleanup_steps(steps: List[Tuple[str, Callable[[], None]]]) -> None:
     """Run every cleanup step, preserving an active phase failure when present."""
+    preserve_active_error = sys.exc_info()[0] is not None
     first_error: Optional[Exception] = None
     for name, cleanup in steps:
         try:
@@ -541,6 +538,11 @@ class DiffusionTrainer(BaseTrainer):
 
     def _validate_residency_config(self) -> None:
         """Reject requested residency policies that the selected topology drops."""
+        if self._offload_train_during_reward and self.reward is None:
+            raise ValueError(
+                "offload_train_during_reward requires a configured reward: this run has no reward phase "
+                "to borrow train memory. Disable the unused policy or configure a reward."
+            )
         if (
             self._uses_ema
             and self._enable_fsdp_offload
@@ -698,18 +700,13 @@ class DiffusionTrainer(BaseTrainer):
     def _reward_phase(self) -> Iterator[None]:
         """Temporarily offload FSDP state while a colocated reward is active."""
         should_offload = self._offload_for_reward_phase()
-        offload_attempted = False
         try:
             if should_offload:
-                offload_attempted = True
                 self.backend.offload()
             yield
         finally:
-            if offload_attempted:
-                _run_cleanup_steps(
-                    [("reward train onload", self.backend.onload)],
-                    preserve_active_error=sys.exc_info()[0] is not None,
-                )
+            if should_offload:
+                _run_cleanup_steps([("reward train onload", self.backend.onload)])
 
     def _sleep_rollout_then_onload_train(self) -> None:
         """Restore train state only after the colocated rollout is safely asleep."""
@@ -733,12 +730,10 @@ class DiffusionTrainer(BaseTrainer):
         # Swap EMA weights only for trainside rollout; remote engines receive
         # them through weight sync.
         should_swap_ema = self._uses_ema and self._rollout_is_trainside
-        wake_attempted = False
         train_offload_attempted = False
         ema_apply_attempted = False
         generation_succeeded = False
         try:
-            wake_attempted = True
             self.rollout.wake_up()
             if sync_weights and self.weight_sync is not None:
                 self.weight_sync.sync()
@@ -755,7 +750,7 @@ class DiffusionTrainer(BaseTrainer):
             cleanup_steps: List[Tuple[str, Callable[[], None]]] = []
             if ema_apply_attempted:
                 cleanup_steps.append(("EMA restore", self.backend.restore_from_eval))
-            should_sleep_rollout = wake_attempted and (sleep_rollout or not generation_succeeded)
+            should_sleep_rollout = sleep_rollout or not generation_succeeded
             if should_sleep_rollout and train_offload_attempted:
                 # These operations are dependent: if sleep fails, loading FSDP
                 # into a still-resident rollout can turn the original error into
@@ -767,10 +762,7 @@ class DiffusionTrainer(BaseTrainer):
                 cleanup_steps.append(("rollout sleep", self.rollout.sleep))
             elif train_offload_attempted:
                 cleanup_steps.append(("generate train onload", self.backend.onload))
-            _run_cleanup_steps(
-                cleanup_steps,
-                preserve_active_error=sys.exc_info()[0] is not None,
-            )
+            _run_cleanup_steps(cleanup_steps)
 
     def _generate_for_training(self, sample: Sample, *, sync_weights: bool) -> Sample:
         return self._generate_with_residency(
@@ -906,6 +898,7 @@ class DiffusionTrainer(BaseTrainer):
         # sleep once at the end. Base-model engines have no such restriction.
         sleep_each_chunk = sleep_requested and (sync_requested or self.weight_sync is None)
         sleep_at_end = sleep_requested and not sleep_each_chunk
+        resync_after_sleep = sleep_requested and sync_requested
         sync_pending = sync_requested
         generated_any = False
         evaluation_succeeded = False
@@ -920,7 +913,7 @@ class DiffusionTrainer(BaseTrainer):
                 eval_sp,
                 step,
                 sync_weights=sync_pending,
-                sync_each_wake=sleep_each_chunk and sync_requested,
+                resync_after_sleep=resync_after_sleep,
                 sleep_rollout=sleep_each_chunk,
                 media_prefix="eval",
             )
@@ -935,7 +928,7 @@ class DiffusionTrainer(BaseTrainer):
                         eval_sp,
                         step,
                         sync_weights=sync_pending,
-                        sync_each_wake=sleep_each_chunk and sync_requested,
+                        resync_after_sleep=resync_after_sleep,
                         sleep_rollout=sleep_each_chunk,
                         media_prefix=f"eval/{suite.name}",
                     )
@@ -948,10 +941,7 @@ class DiffusionTrainer(BaseTrainer):
             evaluation_succeeded = True
         finally:
             if not evaluation_succeeded:
-                _run_cleanup_steps(
-                    [("evaluation rollout sleep", self.rollout.sleep)],
-                    preserve_active_error=sys.exc_info()[0] is not None,
-                )
+                _run_cleanup_steps([("evaluation rollout sleep", self.rollout.sleep)])
         logger.info(
             "EVAL step %d  (%d samples/prompt, %d steps, %dx%d, cfg=%.1f eta=%.1f)  %s",
             step,
@@ -968,20 +958,15 @@ class DiffusionTrainer(BaseTrainer):
 
     def _prepare_empty_evaluation(self, *, sync_weights: bool, sleep_rollout: bool) -> None:
         """Preserve evaluation wake/sync/sleep semantics when every set is empty."""
-        wake_attempted = False
         prepare_succeeded = False
         try:
-            wake_attempted = True
             self.rollout.wake_up()
             if sync_weights and self.weight_sync is not None:
                 self.weight_sync.sync()
             prepare_succeeded = True
         finally:
-            if wake_attempted and (sleep_rollout or not prepare_succeeded):
-                _run_cleanup_steps(
-                    [("empty evaluation rollout sleep", self.rollout.sleep)],
-                    preserve_active_error=sys.exc_info()[0] is not None,
-                )
+            if sleep_rollout or not prepare_succeeded:
+                _run_cleanup_steps([("empty evaluation rollout sleep", self.rollout.sleep)])
 
     def _eval_pass(
         self,
@@ -992,7 +977,7 @@ class DiffusionTrainer(BaseTrainer):
         step: int,
         *,
         sync_weights: bool,
-        sync_each_wake: bool,
+        resync_after_sleep: bool,
         sleep_rollout: bool,
         media_prefix: Optional[str] = None,
     ) -> Tuple[Dict[str, float], bool, bool]:
@@ -1026,7 +1011,7 @@ class DiffusionTrainer(BaseTrainer):
                 request,
                 # Engines whose sleep releases the adapter (e.g. SGLang) need
                 # the requested policy re-pushed after every eval-chunk wake.
-                sync_weights=sync_pending or sync_each_wake,
+                sync_weights=sync_pending or resync_after_sleep,
                 sleep_rollout=sleep_rollout,
             )
             sync_pending = False
