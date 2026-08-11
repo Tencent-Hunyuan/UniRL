@@ -189,7 +189,7 @@ reward:
       scorer:
         _target_: unirl.reward.managed_process.ManagedScorerConfig
         name: editscore
-        input_kind: image_edit
+        history_kind: image_edit
         version: "1"
         params:
           model_name_or_path: ${oc.env:EDITSCORE_BASE_MODEL,Qwen/Qwen3-VL-8B-Instruct}
@@ -216,7 +216,7 @@ reward:
         sub_metric_reduce: mean
         aggregation_method: weighted_sum
         input_kind: image
-      lifecycle: per_call
+      gpu_residency: per_call
 
 algorithm:
   _target_: unirl.algorithms.flowgrpo.FlowGRPO
