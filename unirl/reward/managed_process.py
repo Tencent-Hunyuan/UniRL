@@ -332,7 +332,27 @@ class ManagedScorerProcessBackend(RemoteRewardBackend):
                 "managed differentiable scoring expects an image batch [B, C, H, W]; "
                 f"got {getattr(media_tensor, 'shape', type(media_tensor))}"
             )
-        return score_differentiable(self, media_tensor, list(prompts))
+        if self.process_config.lifecycle == "per_call":
+            # The forward+backward pair is indivisible: a per_call offload
+            # between the two RPCs releases the child's retained subgraph, so
+            # every backward would 409. Reject the combination at the entry
+            # instead of failing on the first score deep inside training.
+            raise RuntimeError(
+                "differentiable scoring requires lifecycle='resident'; "
+                "per_call offloads between the forward and backward RPCs and "
+                "drops the retained child-side graph"
+            )
+        prompts = list(prompts)
+        if media_tensor.shape[0] == 0:
+            raise ValueError("differentiable scoring got an empty image batch")
+        if len(prompts) != media_tensor.shape[0]:
+            # Fewer prompts than images would silently score (and backprop
+            # through) only a prefix of the batch.
+            raise ValueError(
+                f"differentiable scoring got {len(prompts)} prompts for a batch "
+                f"of {media_tensor.shape[0]} images; counts must match"
+            )
+        return score_differentiable(self, media_tensor, prompts)
 
     def _post_lifecycle(self, action: str, *, timeout: float = 30.0, tolerate_failure: bool = False) -> bool:
         try:
