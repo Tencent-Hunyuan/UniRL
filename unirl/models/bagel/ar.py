@@ -224,20 +224,24 @@ class BagelARStage(ARStage[BagelARConditions]):
         )
 
     @staticmethod
-    def _split_image_and_prompt_ids(splits: List[Dict[str, Any]]) -> Tuple[Optional[Any], List[int]]:
-        """From a sample's ordered splits, pull the (single) ViT image tensor and the
-        concatenated prompt token ids (already ``[bos]+enc+[eos]`` wrapped)."""
-        image: Optional[Any] = None
-        prompt_ids: List[int] = []
-        for sp in splits:
-            kind = sp.get("kind")
-            if kind == "vit":
-                image = sp["image"]
-            elif kind == "text":
-                prompt_ids.extend(int(t) for t in sp["ids"].tolist())
-            else:
-                raise ValueError(f"BagelARStage.replay: unknown split kind {kind!r}.")
-        return image, prompt_ids
+    def _split_context_and_trailing_text(
+        splits: List[Dict[str, Any]],
+    ) -> Tuple[List[Dict[str, Any]], List[int]]:
+        """Ordered splits → (context splits, concatenated trailing-text ids).
+
+        The trailing text run (everything after the last image split — the whole
+        prompt when there is no image) rides the inference-replay grad forward;
+        every split before it is prefilled as frozen context. Preserves prompt
+        order for interleaved multi-image trajectories.
+        """
+        cut = len(splits)
+        while cut > 0 and splits[cut - 1].get("kind") == "text":
+            cut -= 1
+        for sp in splits[:cut]:
+            if sp.get("kind") not in ("text", "vit"):
+                raise ValueError(f"BagelARStage.replay: unknown split kind {sp.get('kind')!r}.")
+        trailing_ids = [int(t) for sp in splits[cut:] for t in sp["ids"].tolist()]
+        return splits[:cut], trailing_ids
 
     def replay(
         self,
@@ -309,10 +313,12 @@ class BagelARStage(ARStage[BagelARConditions]):
         temperature: float,
         device: torch.device,
     ) -> List[torch.Tensor]:
-        """Train-mode replay: one grad ``forward_train`` per sample over ``[image | prompt |
-        response_input]`` with the image-full/text-causal nested mask. Trains the und
-        path including the image. forward_train ≠ rollout's forward_inference, so the
-        on-policy ratio carries a ~1e-2 kernel gap (see the recipe note)."""
+        """Train-mode replay: one grad ``forward_train`` per sample over the ordered
+        prompt splits + ``response_input``, with image-full/text-causal nested-mask
+        blocks in split order (interleaved multi-image trajectories included). Trains
+        the und path including the image(s). forward_train ≠ rollout's
+        forward_inference, so the on-policy ratio carries a ~1e-2 kernel gap (see the
+        recipe note)."""
         bagel = self.model.model
         new_token_ids = self.model.new_token_ids
         temp = float(temperature) if float(temperature) > 0.0 else 1.0
@@ -324,15 +330,13 @@ class BagelARStage(ARStage[BagelARConditions]):
                 if n == 0:
                     continue
                 response = segment.tokens[cu[i] : cu[i] + n].to(device=device, dtype=torch.long)
-                image, prompt_ids = self._split_image_and_prompt_ids(splits)
                 response_input = torch.cat(
                     [torch.tensor([start_id], device=device, dtype=torch.long), response[:-1]], dim=0
                 )
                 packed = rl_ops.pack_und_forward_inputs(
                     bagel,
                     new_token_ids=new_token_ids,
-                    prompt_ids=prompt_ids,
-                    image=image,
+                    splits=splits,
                     response_input=response_input,
                     device=device,
                 )
@@ -352,9 +356,10 @@ class BagelARStage(ARStage[BagelARConditions]):
         temperature: float,
         device: torch.device,
     ) -> List[torch.Tensor]:
-        """Inference-mode replay: image prefilled under no_grad (frozen), then one grad
-        ``forward_inference`` over ``[prompt+response]``. Kernel-matched to rollout
-        (ratio ~1), FSDP-safe (single grad forward), image not trained."""
+        """Inference-mode replay: every split up to the last image prefilled under
+        no_grad (frozen context, in prompt order), then one grad ``forward_inference``
+        over ``[trailing text + response]``. Kernel-matched to rollout (ratio ~1),
+        FSDP-safe (single grad forward), images not trained."""
         bagel = self.model.model
         bagel.language_model.eval()
         rl_ops.require_inference_dispatch(bagel)
@@ -365,18 +370,14 @@ class BagelARStage(ARStage[BagelARConditions]):
                 if n == 0:
                     continue
                 response = segment.tokens[cu[i] : cu[i] + n]
-                image, prompt_ids = self._split_image_and_prompt_ids(splits)
+                context_splits, trailing_ids = self._split_context_and_trailing_text(splits)
                 with torch.no_grad():
-                    ctx = rl_ops.init_und_context(bagel)
-                    if image is not None:
-                        ctx = rl_ops.prefill_vit_split(
-                            bagel, ctx, image_tensor=image, new_token_ids=self.model.new_token_ids, device=device
-                        )
+                    ctx = self._prefill(context_splits, device=device)
                 parts.append(
                     rl_ops.score_response_with_prompt(
                         bagel,
                         ctx,
-                        prompt_ids=torch.tensor(prompt_ids, dtype=torch.long, device=device),
+                        prompt_ids=torch.tensor(trailing_ids, dtype=torch.long, device=device),
                         response_ids=response,
                         start_token_id=start_id,
                         temperature=float(temperature),

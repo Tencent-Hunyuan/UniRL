@@ -28,6 +28,7 @@ is flash-free too (torch + diffusers only).
 """
 
 from .ar import BagelARParams, BagelARStage, BagelARStep
+from .chat_template import BagelChatTemplateStage
 from .conditions import BagelARConditions, BagelDiffusionConditions
 from .config import BAGEL_MOE_GEN_LORA_TARGETS, BAGEL_UND_LORA_TARGETS, BagelPipelineConfig
 from .diffusion import BagelDiffusionParams, BagelDiffusionStage, BagelDiffusionStep
@@ -41,6 +42,7 @@ __all__ = [
     "BagelARParams",
     "BagelARStage",
     "BagelARStep",
+    "BagelChatTemplateStage",
     "BagelDiffusionConditions",
     "BagelDiffusionParams",
     "BagelDiffusionStage",
