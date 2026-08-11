@@ -72,6 +72,10 @@ train → resume → export → upload lifecycle is in
 WAN2.1 transformer finetuning from caption/target-video manifests on an
 18-class UCF-101 sports/action subset.
 
+See [`datasets/ucf101/README.md`](../datasets/ucf101/README.md) for the exact
+download location, expected directory layout, cooking command, manifest
+format, and training command.
+
 The UCF-101 run used 2,367 training videos and 128 held-out videos, 17 frames at
 256x448, global batch 8, learning rate `2e-6`, and 300 optimizer steps on one
 8xH20 node. Deterministic held-out eval loss improved from `0.21981` at

@@ -2,17 +2,12 @@
 # WAN 2.1 T2V-1.3B full-transformer SFT on an 18-class sports/action
 # subset of UCF-101.
 #
-# Prepare:
-#   hf download quchenyuan/UCF101-ZIP UCF-101.zip \
-#       --repo-type dataset --local-dir /path/to/ucf101
-#   unzip /path/to/ucf101/UCF-101.zip -d /path/to/ucf101
-#   python -m unirl.utils.prepare_sft_t2v_ucf101 \
-#       --data-root /path/to/ucf101/UCF-101 \
-#       --out-dir data/sft_ucf101_sports
+# Download/cook guide:
+#   datasets/ucf101/README.md
 #
 # Train:
-#   ENTRY=train_sft SFT_DATA=data/sft_ucf101_sports/train.jsonl \
-#   SFT_EVAL_DATA=data/sft_ucf101_sports/val.jsonl \
+#   ENTRY=train_sft SFT_DATA=datasets/ucf101/processed/train.jsonl \
+#   SFT_EVAL_DATA=datasets/ucf101/processed/val.jsonl \
 #   OUTPUT_DIR=outputs/wan21_t2v_ucf101_full \
 #   bash examples/run_experiment_single_node.sh sft/wan21_t2v_ucf101_full
 
