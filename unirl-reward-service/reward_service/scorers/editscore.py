@@ -49,6 +49,13 @@ class EditScoreScorer(BaseScorer):
     name = "editscore"
     version = "1"
     input_kind = "image"
+    # Class-level capability (checked by the server BEFORE construction so a
+    # per_call misconfiguration does not pay a full engine load): the vLLM
+    # backbones CAN offload — via sleep mode. Whether this instance actually
+    # may is config-dependent (enable_sleep_mode); onload/offload raise a
+    # pointed error otherwise instead of silently no-oping, which would report
+    # state=offloaded while the engine still holds the GPU.
+    supports_offload = True
     sub_metric_names = ("prompt_following", "consistency", "perceptual_quality", "overall")
 
     def __init__(
@@ -258,13 +265,21 @@ class EditScoreScorer(BaseScorer):
     def _engine(self):
         return self.es.model.model  # EditScore -> Qwen3VL wrapper -> vllm.LLM
 
+    def _require_sleep_mode(self, action: str) -> None:
+        if not self._sleep_enabled:
+            raise RuntimeError(
+                f"EditScore {action} requires enable_sleep_mode: true in the scorer params — "
+                "without it the vLLM engine cannot leave the GPU, and silently no-oping would "
+                "report an offloaded state the memory does not reflect (per_call needs sleep mode)"
+            )
+
     def onload(self) -> None:
-        if self._sleep_enabled:
-            self._engine().wake_up()
+        self._require_sleep_mode("onload")
+        self._engine().wake_up()
 
     def offload(self) -> None:
-        if self._sleep_enabled:
-            self._engine().sleep(level=1)
+        self._require_sleep_mode("offload")
+        self._engine().sleep(level=1)
 
     def close(self) -> None:
         if hasattr(self, "es"):
