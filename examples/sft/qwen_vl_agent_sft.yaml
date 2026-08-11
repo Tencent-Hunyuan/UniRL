@@ -65,9 +65,9 @@ backend:
   fsdp_cfg:
     _target_: unirl.train.configs.FSDPConfig
     param_dtype: bf16
-    # no master_dtype: the frozen bf16 vision tower shares the FSDP root group with
-    # trainable params, and fsdp2 requires one dtype per group (the geo3k GRPO recipe
-    # runs the same uniform-bf16 layout)
+    # no master_dtype: uniform bf16 masters, the geo3k GRPO layout this smoke was
+    # verified on — the frozen bf16 vision tower shares the FSDP root group with
+    # trainable params, and pre-2.11 fsdp2 asserts one dtype per group
     cpu_offload: false
     mixed_precision: true
     fsdp_mode: full
