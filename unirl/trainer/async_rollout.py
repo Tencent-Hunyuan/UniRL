@@ -39,16 +39,20 @@ def boundary_launch_units(
     num_rollouts: int,
     hard_boundary: int,
     batches_since_sync: int,
-    weight_sync_interval: int,
+    max_staleness_batches: int,
 ) -> int:
-    """Prompt units admissible without crossing a sync or hard boundary."""
+    """Prompt units admissible within capacity, staleness, and hard boundaries."""
     if max_inflight_units % batch_size:
         raise ValueError(f"max_inflight_units ({max_inflight_units}) must be divisible by batch_size ({batch_size})")
     if outstanding_units % batch_size:
         raise RuntimeError(
             f"prompt-unit outstanding count must stay batch-aligned to {batch_size}; got {outstanding_units}"
         )
-    freshness_batches = max(0, weight_sync_interval - batches_since_sync)
+    # A newly launched unit uses the currently published weights. It may be
+    # consumed now (lag=batches_since_sync), then one batch later, and so on.
+    # Keep enough horizon for cross-publication carry when the configured lag
+    # budget permits it; unlike a sync boundary, eval/save/final remain hard.
+    freshness_batches = max(0, max_staleness_batches - batches_since_sync + 1)
     remaining_batches = max(0, min(num_rollouts, hard_boundary) - trained_batches)
     allowed_units = min(freshness_batches, remaining_batches) * batch_size
     return max(0, min(max_inflight_units - outstanding_units, allowed_units - outstanding_units))
@@ -141,9 +145,16 @@ class AsyncRolloutTrainerMixin:
         return False
 
     def _score_completed(self, rollout_id: int, completed: "Sample") -> "Sample":
-        scored = self.reward.score_and_attach(completed)
-        self._drop_decoded(scored, rollout_id=rollout_id)
-        return scored
+        for attempt in range(2):
+            try:
+                scored = self.reward.score_and_attach(completed)
+                self._drop_decoded(scored, rollout_id=rollout_id)
+                return scored
+            except Exception:
+                if attempt:
+                    raise
+                logger.warning("reward scoring failed for rollout %d; retrying the same completed batch", rollout_id)
+        raise AssertionError("unreachable")
 
     def _train_async_loop(
         self,
@@ -163,7 +174,8 @@ class AsyncRolloutTrainerMixin:
         self._batches_since_sync = 0
         for _ in range(start_rollout):
             self.data_source.get_samples(self.batch_size)
-        staleness_budget = (self._weight_sync_interval - 1) * self._num_updates_per_batch
+        max_staleness = getattr(self, "_max_staleness", self._weight_sync_interval - 1)
+        staleness_budget = max_staleness * self._num_updates_per_batch
         self._init_wandb(
             num_rollouts=num_rollouts,
             extra={
@@ -171,7 +183,7 @@ class AsyncRolloutTrainerMixin:
                 "max_inflight_units": self._max_inflight_units,
                 "per_worker_inflight": self._per_worker_inflight,
                 "weight_sync_interval": self._weight_sync_interval,
-                "max_staleness": self._weight_sync_interval - 1,
+                "max_staleness": max_staleness,
                 "staleness_budget": staleness_budget,
                 "num_updates_per_batch": self._num_updates_per_batch,
                 **self._async_wandb_extra(),
@@ -257,8 +269,9 @@ class AsyncRolloutTrainerMixin:
             self._batches_since_sync = 0
             return
 
-        # Admission exhausts at this publication boundary, so regular sync does
-        # not intentionally carry generated work across output versions.
+        # Quiesce engine work before weight publication, but keep completed
+        # groups in the manager. The lag filter decides whether buffered work
+        # remains trainable after publication, matching continuous-unit carry.
         carried = manager.quiesce(current_version=self._train_version)
         if require_empty and (carried or not manager.empty):
             raise RuntimeError("eval/checkpoint boundary requires an empty RolloutManager")
@@ -285,19 +298,22 @@ class AsyncRolloutTrainerMixin:
             num_rollouts=num_rollouts,
             hard_boundary=hard_boundary,
             batches_since_sync=self._batches_since_sync,
-            weight_sync_interval=self._weight_sync_interval,
+            max_staleness_batches=self._max_staleness,
         )
         self._submit_prompt_units(units)
 
-        groups = manager.collect(self.batch_size, current_version=self._train_version)
+        groups = manager.collect(
+            self.batch_size,
+            current_version=self._train_version,
+        )
         completed, output_version = combine_rollout_units(
             groups,
             require_single_rollout_id=getattr(self, "_require_single_generation", False),
         )
 
-        # Collecting a train batch releases one batch-equivalent of admission
-        # credit. Refill it before reward scoring so rollout engines stay busy
-        # while the CPU/reward workers process the completed batch.
+        # Consuming a batch releases capacity immediately. Refill before reward
+        # and training so rollout generation overlaps both, as in the original
+        # unit_continuous controller.
         inflight_count, ready_count = manager.counts
         units = boundary_launch_units(
             outstanding_units=inflight_count + ready_count,
@@ -307,11 +323,12 @@ class AsyncRolloutTrainerMixin:
             num_rollouts=num_rollouts,
             hard_boundary=hard_boundary,
             batches_since_sync=self._batches_since_sync + 1,
-            weight_sync_interval=self._weight_sync_interval,
+            max_staleness_batches=self._max_staleness,
         )
         self._submit_prompt_units(units)
 
         scored = self._score_completed(rollout_id, completed)
+
         return scored, output_version
 
     def _submit_prompt_units(self, count: int) -> None:

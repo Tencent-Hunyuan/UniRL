@@ -53,6 +53,7 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
         max_inflight: int = 1,
         per_worker_inflight: int = 1,
         weight_sync_interval: int = 1,
+        buffer_max_staleness: Optional[int] = None,
     ) -> None:
         self._allowed_input_primitives = ar_preflight(
             pipeline_cfg=pipeline_cfg,
@@ -103,6 +104,13 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
         self._num_updates_per_batch = int(stack_cfg.get("num_updates_per_batch", 1))
         if self._weight_sync_interval < 1:
             raise ValueError(f"weight_sync_interval must be >= 1, got {self._weight_sync_interval}")
+        self._max_staleness = (
+            self._weight_sync_interval - 1
+            if buffer_max_staleness is None
+            else int(buffer_max_staleness)
+        )
+        if self._max_staleness < 0:
+            raise ValueError(f"buffer_max_staleness must be >= 0, got {self._max_staleness}")
         if self._num_updates_per_batch < 1:
             raise ValueError(f"num_updates_per_batch must be >= 1, got {self._num_updates_per_batch}")
         self._train_version = 0
