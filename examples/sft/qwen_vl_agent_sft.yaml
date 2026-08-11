@@ -65,7 +65,9 @@ backend:
   fsdp_cfg:
     _target_: unirl.train.configs.FSDPConfig
     param_dtype: bf16
-    master_dtype: fp32              # bf16-loaded base: fp32 trainable master + Adam states
+    # no master_dtype: the frozen bf16 vision tower shares the FSDP root group with
+    # trainable params, and fsdp2 requires one dtype per group (the geo3k GRPO recipe
+    # runs the same uniform-bf16 layout)
     cpu_offload: false
     mixed_precision: true
     fsdp_mode: full

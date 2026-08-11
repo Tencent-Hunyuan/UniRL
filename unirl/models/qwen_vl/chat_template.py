@@ -125,8 +125,15 @@ class QwenVLChatTemplateStage:
         processor = self.bundle.processor
         per_sample_inputs = []
         for messages, sample_tools in zip(conversations, tools):
+            # transformers 4.5x ProcessorMixin iterates every message's content as a
+            # part list (string content TypeErrors); 5.x normalizes internally. Wrap
+            # strings as single text parts — byte-identical under the chat template.
+            normalized = [
+                {**m, "content": [{"type": "text", "text": m["content"]}]} if isinstance(m.get("content"), str) else m
+                for m in messages
+            ]
             inputs = processor.apply_chat_template(
-                list(messages),
+                normalized,
                 tools=sample_tools,
                 add_generation_prompt=True,
                 tokenize=True,
@@ -189,10 +196,14 @@ class QwenVLChatTemplateStage:
             pixel_values.append(pv.to(device=device, dtype=dtype) if pv is not None else None)
             image_grid_thw.append(igt.to(device=device) if igt is not None else None)
 
+        # Always batch-aligned lists (None per image-free row), never a collapsed
+        # None: concat drops None contributors, so a collapsed value from one DP
+        # shard would desync the merged list from the batch rows (and a later
+        # slice would broadcast it whole). _merge_pv/_merge_igt filter row Nones.
         return QwenVLARConditions(
             prompt=TextTokenCondition(input_ids=input_ids, attention_mask=attention_mask),
-            pixel_values=pixel_values if any(p is not None for p in pixel_values) else None,
-            image_grid_thw=image_grid_thw if any(g is not None for g in image_grid_thw) else None,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
         )
 
 
