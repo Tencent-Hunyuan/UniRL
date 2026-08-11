@@ -22,8 +22,8 @@ export VLLM_USE_PRECOMPILED=1
 uv pip install -e ".[vllm,train,infer]"
 ```
 
-The `train` extra installs PyAV automatically for video decoding; no separate
-`av` installation or runtime selection is needed.
+The documented `vllm` extra already installs PyAV for raw video decoding, so
+this setup needs no separate `av` installation or runtime selection.
 
 ## 1. Download and place the data
 

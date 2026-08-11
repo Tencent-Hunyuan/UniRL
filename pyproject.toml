@@ -84,7 +84,6 @@ vllm = [
 train = [
   "wandb>=0.16,<0.20",
   "aiohttp>=3.9",
-  "av>=14.2,<19 ; sys_platform == 'linux'",
   # MathVerifyRewardScorer (unirl/reward/local/mathverify.py) — the paper's grader.
   "math-verify>=0.6",
 ]
