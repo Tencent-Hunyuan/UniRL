@@ -91,6 +91,7 @@ class CandidateIndex:
                    JOIN entries e USING(entry_id)
                    JOIN assets a ON a.asset_id = e.asset_id
                    WHERE qe.query_id = ? AND e.download_status = 'downloaded'
+                     AND e.search_type = 'image'
                    ORDER BY qe.source_rank""",
                 (query_id,),
             ).fetchall()
@@ -145,14 +146,18 @@ def build_trace_conversation(
             result_parts.append({"type": "image", "image": path})
             used_paths.append(path)
 
-    # Every real selection must be present in the shown candidates.
+    # Every real selection must be present in the shown candidates. The selection
+    # target welds the two numbering spaces together explicitly: candidates are
+    # "Image <global position>", kept references are "Reference Image <selection
+    # order>" (the numbering the refined prompt cites verbatim).
     selection_lines: List[str] = []
-    for sel in selections:
+    for ref_no, sel in enumerate(selections, start=1):
         pos = position_by_entry.get((sel["query_id"], sel["entry_id"]))
         if pos is None:
             return None
         reasoning = str(sel.get("selection_reasoning") or "").strip()
-        selection_lines.append(f"Selected Image {pos}: {reasoning}" if reasoning else f"Selected Image {pos}")
+        line = f"Selected Image {pos} as Reference Image {ref_no}"
+        selection_lines.append(f"{line}: {reasoning}" if reasoning else line)
 
     analysis = trace.get("s1_prompt_analysis") or {}
     analysis_text = str(analysis.get("analysis_reasoning") or "").strip()
@@ -180,7 +185,9 @@ def build_trace_conversation(
     return conversation, used_paths
 
 
-def expand_trace(trace_id: str, conversation: List[Dict[str, Any]], *, metadata: Dict[str, Any]) -> List[Dict[str, Any]]:
+def expand_trace(
+    trace_id: str, conversation: List[Dict[str, Any]], *, metadata: Dict[str, Any]
+) -> List[Dict[str, Any]]:
     """One linearized trace → one record per supervised assistant turn (s1/s2/s3)."""
     records = []
     stage_names = iter(("s1_analysis", "s2_selection", "s3_refine"))
@@ -231,7 +238,11 @@ class ShardExtractor:
 
         done: Dict[str, str] = {}
         wanted = set(members)
-        with tarfile.open(os.path.join(self.corpus_root, shard)) as tf:
+        shard_abs = os.path.join(self.corpus_root, shard)
+        if not os.path.exists(shard_abs):
+            print(f"warning: shard {shard} missing from the corpus mirror — dropping {len(wanted)} member(s)")
+            return done
+        with tarfile.open(shard_abs) as tf:
             while wanted:
                 member = tf.next()
                 if member is None:
@@ -276,6 +287,7 @@ class ShardExtractor:
         done: Dict[str, str] = {}
         pending: Dict[str, List[str]] = defaultdict(list)
         index = self._load_index()
+        unindexed = 0
         for path in dict.fromkeys(portable_paths):
             uri = self.out_name(path)
             if os.path.exists(os.path.join(self.out_dir, os.path.basename(uri))):
@@ -283,8 +295,11 @@ class ShardExtractor:
                 continue
             shard = index.get(path)
             if shard is None:
+                unindexed += 1
                 continue
             pending[shard].append(path)
+        if unindexed:
+            print(f"warning: {unindexed} member(s) absent from the shard index — their traces will be dropped")
 
         if pending:
             print(f"extracting {sum(len(m) for m in pending.values())} image(s) from {len(pending)} shard(s)...")
@@ -321,11 +336,19 @@ def _write_jsonl(path: str, rows: Iterable[Dict[str, Any]]) -> int:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--searchgen-root", required=True, help="dir containing searchgen-20k/ and searchgen-corpus-1m/")
+    parser.add_argument(
+        "--searchgen-root", required=True, help="dir containing searchgen-20k/ and searchgen-corpus-1m/"
+    )
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--max-traces", type=int, default=0, help="cap on rendered traces (0 = all)")
     parser.add_argument("--candidates-per-query", type=int, default=4)
-    parser.add_argument("--max-image-px", type=int, default=512, help="long-side cap for extracted candidate images")
+    parser.add_argument(
+        "--max-image-px",
+        type=int,
+        default=448,
+        help="long-side cap for extracted candidate images (the budget the agent-SFT recipes assume); "
+        "changing it does not re-extract existing images — use a fresh --out-dir",
+    )
     parser.add_argument("--extract-workers", type=int, default=8, help="parallel shard readers for image extraction")
     parser.add_argument("--max-target-chars", type=int, default=8000, help="drop records with longer target turns")
     parser.add_argument("--val-fraction", type=float, default=0.02)

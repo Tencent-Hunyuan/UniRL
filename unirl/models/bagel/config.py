@@ -77,8 +77,6 @@ class BagelPipelineConfig:
 
     enable_vit: bool = False
 
-    max_prompt_length: int = 8192
-
     weight_sync_param_name_prefix: str = "language_model."
 
     use_lora: bool = False

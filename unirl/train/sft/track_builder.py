@@ -173,8 +173,7 @@ class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
                 raise ValueError("ARSupervisedTrackBuilder: a batch may not mix prompt/response and agent records.")
             if any(r.get("media_refs") for r in records):
                 raise ValueError(
-                    "ARSupervisedTrackBuilder: agent records carry images inside message content parts, "
-                    "not media_refs."
+                    "ARSupervisedTrackBuilder: agent records carry images inside message content parts, not media_refs."
                 )
             embed_messages = getattr(self._chat_stage, "embed_messages", None)
             if not callable(embed_messages):

@@ -180,7 +180,6 @@ class BagelPipeline(Pipeline):
             trajectory_precision=config.trajectory_precision,
             logprob_precision=config.logprob_precision,
             shift=float(config.shift),
-            max_prompt_length=int(_cfg_get(config, "max_prompt_length", 8192)),
         )
 
     def _autocast_ctx(self):

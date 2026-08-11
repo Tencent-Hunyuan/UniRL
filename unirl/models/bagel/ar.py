@@ -359,7 +359,10 @@ class BagelARStage(ARStage[BagelARConditions]):
         """Inference-mode replay: every split up to the last image prefilled under
         no_grad (frozen context, in prompt order), then one grad ``forward_inference``
         over ``[trailing text + response]``. Kernel-matched to rollout (ratio ~1),
-        FSDP-safe (single grad forward), images not trained."""
+        FSDP-safe (single grad forward), images not trained. A history that ENDS on
+        an image has no trailing text — the whole prompt is then frozen and only the
+        response carries gradient; use ``replay_mode: train`` when prompt-side
+        gradients matter (the agent-SFT recipes do)."""
         bagel = self.model.model
         bagel.language_model.eval()
         rl_ops.require_inference_dispatch(bagel)

@@ -50,7 +50,6 @@ bundle:
     model_precision: bf16
     shift: 3.0
     enable_vit: true                 # image-input task: the und ViT tower must load
-    max_prompt_length: 24576         # interleaved histories: ~1.2k ViT tokens per 448px image
     use_lora: true
     lora_target_modules:             # = BAGEL_UND_LORA_TARGETS (und experts only)
       - self_attn.q_proj

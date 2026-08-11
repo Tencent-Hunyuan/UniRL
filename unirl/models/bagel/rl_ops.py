@@ -63,7 +63,7 @@ function serves rollout, the ratio test, and training.
 from __future__ import annotations
 
 import sys
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Tuple
 
 import torch
 import torch.nn.functional as F
