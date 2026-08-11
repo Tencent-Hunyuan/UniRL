@@ -105,9 +105,7 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
         if self._weight_sync_interval < 1:
             raise ValueError(f"weight_sync_interval must be >= 1, got {self._weight_sync_interval}")
         self._max_staleness = (
-            self._weight_sync_interval - 1
-            if buffer_max_staleness is None
-            else int(buffer_max_staleness)
+            self._weight_sync_interval - 1 if buffer_max_staleness is None else int(buffer_max_staleness)
         )
         if self._max_staleness < 0:
             raise ValueError(f"buffer_max_staleness must be >= 0, got {self._max_staleness}")
