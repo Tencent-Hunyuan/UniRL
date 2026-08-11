@@ -82,20 +82,6 @@ class EditRewardScorer(BaseScorer):
             rm_head_type=rm_head_type,
         )
 
-        # Column semantics come from the pinned model config, not this wrapper.
-        # With in-model head pooling and the uncertainty loss, reward() returns
-        # [pooled reward, pooled log-sigma] — NOT two semantic scores; naming
-        # the second column "edit_quality" would log (and, under
-        # sub_metric_reduce: mean, optimize) the critic's own spread as a score.
-        # Per-head score pairs keep the semantic names.
-        if (
-            self._rm_head_type == "ranknet_multi_head"
-            and self.inferencer.pooling_strategy is not None
-            and self.inferencer.output_dim == 2
-            and self.inferencer.loss_type == "uncertainty"
-        ):
-            self.sub_metric_names = ("reward", "log_sigma")
-
     @torch.inference_mode()
     def score(self, items: list[ScoreItem]) -> list[dict[str, float]]:
         if not items:
