@@ -332,13 +332,13 @@ class ManagedScorerProcessBackend(RemoteRewardBackend):
                 "managed differentiable scoring expects an image batch [B, C, H, W]; "
                 f"got {getattr(media_tensor, 'shape', type(media_tensor))}"
             )
-        if self.process_config.lifecycle == "per_call":
+        if self.spec.gpu_residency == "per_call":
             # The forward+backward pair is indivisible: a per_call offload
             # between the two RPCs releases the child's retained subgraph, so
             # every backward would 409. Reject the combination at the entry
             # instead of failing on the first score deep inside training.
             raise RuntimeError(
-                "differentiable scoring requires lifecycle='resident'; "
+                "differentiable scoring requires gpu_residency='resident'; "
                 "per_call offloads between the forward and backward RPCs and "
                 "drops the retained child-side graph"
             )

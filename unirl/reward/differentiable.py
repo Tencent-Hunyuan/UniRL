@@ -44,7 +44,7 @@ class _ManagedScore(torch.autograd.Function):
         if not images.is_cuda:
             raise RuntimeError("differentiable scoring requires CUDA image tensors")
         call_id = uuid.uuid4().hex
-        scorer_name = backend.process_config.scorer.name
+        scorer_name = backend.spec.scorer.name
         # detach+contiguous gives the wire a stable storage to share; the child
         # copies out of it (torch.stack) while this request is in flight.
         shipped = images.detach().contiguous()
