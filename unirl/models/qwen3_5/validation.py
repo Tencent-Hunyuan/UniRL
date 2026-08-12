@@ -145,4 +145,7 @@ def validate_qwen3_5_training_contract(
     )
 
 
-__all__ = ["is_qwen3_5_pipeline_config", "validate_qwen3_5_training_contract"]
+# Generic hook name the AR trainers dispatch to (see unirl.trainer.ar.ar_preflight).
+validate_training_contract = validate_qwen3_5_training_contract
+
+__all__ = ["is_qwen3_5_pipeline_config", "validate_qwen3_5_training_contract", "validate_training_contract"]

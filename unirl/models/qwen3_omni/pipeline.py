@@ -26,6 +26,11 @@ class Qwen3OmniPipeline(Pipeline):
     conditions are written back to that frontier for per-turn replay.
     """
 
+    # URI-backed MediaRefs are an Omni prompt-input channel; the AR trainers
+    # read this declaration (unirl.trainer.ar.ar_preflight) instead of
+    # special-casing the model.
+    extra_input_primitives = ("media",)
+
     def __init__(
         self,
         *,
