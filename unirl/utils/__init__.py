@@ -1,6 +1,5 @@
 """unirl Utilities."""
 
-from .adapter_utils import switch_adapter
 from .media import tensor_frame_to_pil, tensor_to_pil
 from .misc import clear_memory, configure_logger, flatten_dict, load_function, set_seed
 from .scheduler_utils import (
@@ -24,7 +23,6 @@ __all__ = [
     "configure_logger",
     "clear_memory",
     "flatten_dict",
-    "switch_adapter",
     "UniRLWandBLogger",
     "init_logger",
     "aggregate_metrics",
