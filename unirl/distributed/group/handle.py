@@ -39,10 +39,13 @@ from unirl.distributed.group.dispatch import (
     DISTRIBUTED_CONFIG_ATTR,
     Dispatch,
     Execute,
+    has_partial_localization,
+    remap_required_store_keys,
+    required_store_keys,
     resolve_backward_dispatch_mode,
 )
 from unirl.distributed.group.remote import RankInfo, Remote
-from unirl.distributed.tensor import TensorRef, WorkerLocalTransport, map_tree
+from unirl.distributed.tensor import TensorRef, TensorSpan, WorkerLocalTransport, map_tree
 from unirl.distributed.tensor.backend.gpu_store.handle import GPUTensorHandle
 from unirl.distributed.tensor.grad_context import (
     RPCBackwardNode,
@@ -328,6 +331,7 @@ class PendingHandleCall:
         method_name: str,
         refs: List[Any],
         worker_local: bool,
+        passthrough: Optional[Dict[str, Any]] = None,
         *,
         targets: Optional[List[Any]] = None,
         collect_fn: Optional[Callable] = None,
@@ -336,6 +340,7 @@ class PendingHandleCall:
         self._method_name = method_name
         self._refs = refs
         self._worker_local = worker_local
+        self._passthrough = passthrough
         self._targets = targets
         self._collect_fn = collect_fn
         self._consumed = False
@@ -357,11 +362,12 @@ class PendingHandleCall:
         handle = self._handle
         collect_fn = self._collect_fn
         if collect_fn is None:
-            _, _, collect_fn, _ = handle._method_configs[self._method_name]
+            _, collect_fn, _, _ = handle._method_configs[self._method_name]
         self._value = handle._resolve_call(
             collect_fn,
             self._refs,
             worker_local=self._worker_local,
+            passthrough=self._passthrough,
             targets=self._targets,
         )
         self._consumed = True
@@ -616,17 +622,23 @@ class Handle:
             else:
                 execute_fn = self._execute_rank_zero
 
-            self._method_configs[name] = (config["dispatch_mode"], dispatch_fn, collect_fn, execute_fn)
-            bound = self._make_handle_fn(name, config["dispatch_mode"], dispatch_fn, collect_fn, execute_fn)
+            self._method_configs[name] = (dispatch_fn, collect_fn, execute_fn, config)
+            bound = self._make_handle_fn(
+                name,
+                dispatch_fn,
+                collect_fn,
+                execute_fn,
+                config,
+            )
             setattr(self, name, bound)
 
     def _make_handle_fn(
         self,
         method_name: str,
-        dispatch_mode: Dispatch,
         dispatch_fn: Callable,
         collect_fn: Callable,
         execute_fn: Callable,
+        config: Dict[str, Any],
     ) -> Callable:
         """Create handle method: dispatch → localize → execute → collect → rebind.
 
@@ -638,7 +650,16 @@ class Handle:
         Both this blocking form and :meth:`launch_nowait` +
         :meth:`PendingHandleCall.result` are thin sequencing over the shared
         :meth:`_launch_call` / :meth:`_resolve_call` phases.
+
+        ``config`` is the method's ``@distributed`` config: when it carries a
+        ``reads=`` / ``skips=`` selector, localize narrows to the refs the callee
+        needs and the rest round-trip dehydrated (see ``_rebind_tree``'s
+        ``passthrough``).
         """
+        dispatch_mode = config["dispatch_mode"]
+        partial_localize = issubclass(self.pool.transport_cls, WorkerLocalTransport) and has_partial_localization(
+            config
+        )
 
         def handle_fn(*args, **kwargs):
             ray_get_timeout = kwargs.pop("_ray_get_timeout", None)
@@ -648,11 +669,18 @@ class Handle:
             input_metas = []
             bwd_dispatch_mode = None
             if ctx is not None:
+                if partial_localize:
+                    raise ValueError(
+                        f"Method '{method_name}' declares reads=/skips=... (partial localization), "
+                        f"which does not support auto-backward: the refs it does not read are never "
+                        f"resolved on the worker, so they have no grad leaf to chain back to. "
+                        f"Do not call this method inside enable_grad()."
+                    )
                 bwd_dispatch_mode = resolve_backward_dispatch_mode(method_name, dispatch_mode, self.rank_infos)
                 call_id = f"{method_name}_{next(self._grad_call_counter)}"
                 input_metas = collect_leaves(args, TensorRef) + collect_leaves(tuple(kwargs.values()), TensorRef)
 
-            refs, worker_local = self._launch_call(
+            refs, worker_local, passthrough = self._launch_call(
                 method_name,
                 dispatch_mode,
                 dispatch_fn,
@@ -661,11 +689,13 @@ class Handle:
                 kwargs,
                 grad_mode=ctx is not None,
                 call_id=call_id,
+                config=config,
             )
             collected = self._resolve_call(
                 collect_fn,
                 refs,
                 worker_local=worker_local,
+                passthrough=passthrough,
                 ray_get_timeout=ray_get_timeout,
             )
 
@@ -698,8 +728,9 @@ class Handle:
         *,
         grad_mode: bool,
         call_id: Optional[str],
-    ) -> Tuple[List, bool]:
-        """Launch a distributed call; returns ``(refs, worker_local)``.
+        config: Dict[str, Any],
+    ) -> Tuple[List, bool, Optional[Dict[str, Any]]]:
+        """Launch a distributed call; returns ``(refs, worker_local, passthrough)``.
 
         Runs dispatch → localize → execute for both the blocking
         ``handle_fn`` and the non-blocking :meth:`launch_nowait`.
@@ -715,9 +746,45 @@ class Handle:
         shards = dispatch_fn(self, args, kwargs, batch_size)
         transport_cls = self.pool.transport_cls
         worker_local = issubclass(transport_cls, WorkerLocalTransport)
-        shards = transport_cls.localize(shards, self.pool, self.device_ids, self.worker_ids)
-        refs = execute_fn(method_name, shards, grad_mode=grad_mode, call_id=call_id)
-        return refs, worker_local
+        partial_localize = worker_local and has_partial_localization(config)
+
+        def required_masks(current_shards):
+            cache = {}
+            masks = []
+            for s_args, s_kwargs in current_shards:
+                shard_id = (id(s_args), id(s_kwargs))
+                if shard_id not in cache:
+                    cache[shard_id] = required_store_keys(config, s_args, s_kwargs)
+                masks.append(cache[shard_id])
+            return masks
+
+        required_before = required_masks(shards) if partial_localize else None
+        before_localize = shards
+        if partial_localize:
+            shards = transport_cls.localize(
+                shards,
+                self.pool,
+                self.device_ids,
+                self.worker_ids,
+                required_before,
+            )
+        else:
+            shards = transport_cls.localize(shards, self.pool, self.device_ids, self.worker_ids)
+
+        if partial_localize:
+            required = [
+                remap_required_store_keys(mask, *before, *after)
+                for before, after, mask in zip(before_localize, shards, required_before)
+            ]
+            # Keep every post-localization handle alive through result collection.
+            # A dehydrated ref that round-trips is restored to this exact object,
+            # avoiding a duplicate decref finalizer on its deserialized copy.
+            passthrough = self._handles_by_store_key(shards)
+        else:
+            required = None
+            passthrough = None
+        refs = execute_fn(method_name, shards, grad_mode=grad_mode, call_id=call_id, required=required)
+        return refs, worker_local, passthrough
 
     def _resolve_call(
         self,
@@ -725,6 +792,7 @@ class Handle:
         refs: List,
         *,
         worker_local: bool,
+        passthrough: Optional[Dict[str, Any]] = None,
         ray_get_timeout: Optional[float] = None,
         targets: Optional[List[Any]] = None,
     ):
@@ -735,7 +803,23 @@ class Handle:
         """
         results = ray.get(refs, timeout=ray_get_timeout)
         workers = self.workers if targets is None else targets
-        results = [self._rebind_tree(r, workers[i], worker_local=worker_local) for i, r in enumerate(results)]
+        worker_ids = self.worker_ids if targets is None else [None] * len(targets)
+        for result, worker_id in zip(results, worker_ids):
+            self._validate_rebind_tree(
+                result,
+                worker_local=worker_local,
+                passthrough=passthrough,
+                worker_id=worker_id,
+            )
+        results = [
+            self._rebind_tree(
+                result,
+                workers[i],
+                worker_local=worker_local,
+                passthrough=passthrough,
+            )
+            for i, result in enumerate(results)
+        ]
         return collect_fn(self, results)
 
     def launch_nowait(self, method_name: str, *args, **kwargs) -> PendingHandleCall:
@@ -747,39 +831,108 @@ class Handle:
         assumption is untouched). ``result()`` on the returned
         :class:`PendingHandleCall` runs the resolution phase.
         """
+        if current_grad_context() is not None:
+            raise RuntimeError(f"launch_nowait({method_name!r}) is not valid inside a GradContext")
         try:
-            dispatch_mode, dispatch_fn, _, execute_fn = self._method_configs[method_name]
+            dispatch_fn, _, execute_fn, config = self._method_configs[method_name]
         except KeyError:
             raise AttributeError(
                 f"{method_name!r} is not a @distributed method of {_owning_class(self.role_cls).__name__}"
             ) from None
 
-        refs, worker_local = self._launch_call(
+        refs, worker_local, passthrough = self._launch_call(
             method_name,
-            dispatch_mode,
+            config["dispatch_mode"],
             dispatch_fn,
             execute_fn,
             args,
             kwargs,
             grad_mode=False,
             call_id=None,
+            config=config,
         )
-        return PendingHandleCall(self, method_name, refs, worker_local)
+        return PendingHandleCall(self, method_name, refs, worker_local, passthrough)
 
-    def _execute_all(self, method_name: str, shards: List, grad_mode: bool = False, call_id=None) -> List:
+    def _execute_all(
+        self,
+        method_name: str,
+        shards: List,
+        grad_mode: bool = False,
+        call_id=None,
+        required: Optional[List[Optional[set]]] = None,
+    ) -> List:
         """Send RPC to all Workers."""
+        masks = required if required is not None else [None] * len(shards)
         return [
-            w.call.remote(self.role_name, method_name, s_args, s_kwargs, grad_mode, call_id)
-            for w, (s_args, s_kwargs) in zip(self.workers, shards)
+            w.call.remote(self.role_name, method_name, s_args, s_kwargs, grad_mode, call_id, mask)
+            for w, (s_args, s_kwargs), mask in zip(self.workers, shards, masks)
         ]
 
-    def _execute_rank_zero(self, method_name: str, shards: List, grad_mode: bool = False, call_id=None) -> List:
+    def _execute_rank_zero(
+        self,
+        method_name: str,
+        shards: List,
+        grad_mode: bool = False,
+        call_id=None,
+        required: Optional[List[Optional[set]]] = None,
+    ) -> List:
         """Send RPC to rank 0 only."""
+        mask = required[0] if required is not None else None
         return [
-            self.workers[0].call.remote(self.role_name, method_name, shards[0][0], shards[0][1], grad_mode, call_id)
+            self.workers[0].call.remote(
+                self.role_name,
+                method_name,
+                shards[0][0],
+                shards[0][1],
+                grad_mode,
+                call_id,
+                mask,
+            )
         ]
 
-    def _rebind_tree(self, obj, worker_handle, *, worker_local: bool = True):
+    # ── TensorHandle rebinding ──
+
+    @staticmethod
+    def _handles_by_store_key(shards: List) -> Dict[str, Any]:
+        """Index post-localization handles for lifetime pinning and swap-back."""
+        handles: Dict[str, Any] = {}
+        for s_args, s_kwargs in shards:
+            for ref in collect_leaves(s_args, TensorRef) + collect_leaves(s_kwargs, TensorRef):
+                for span in ref.spans:
+                    key = getattr(span.handle, "store_key", None)
+                    if key is not None:
+                        handles.setdefault(key, span.handle)
+        return handles
+
+    def _validate_rebind_tree(self, obj, *, worker_local: bool, passthrough, worker_id) -> None:
+        """Validate result-handle ownership before any result is rebound."""
+        if not worker_local or passthrough is None or worker_id is None:
+            return
+        transport_cls = self.pool.transport_cls
+        device_id = self.pool.device_id_of(worker_id)
+
+        def validate(handle) -> None:
+            key = getattr(handle, "store_key", None)
+            if key in passthrough or getattr(handle, "object_ref", None) is not None:
+                return
+            if not transport_cls._is_local(handle, worker_id, device_id, self.pool):
+                raise RuntimeError(
+                    f"partial localization: worker {worker_id!r} returned a ref owned by "
+                    f"{handle.source_id!r} that was not an argument of this call. A role must not "
+                    f"retain refs it did not localize — the driver cannot bind them to an owner."
+                )
+
+        def validate_leaf(o):
+            if isinstance(o, GPUTensorHandle):
+                validate(o)
+            elif isinstance(o, TensorRef):
+                for span in o.spans:
+                    validate(span.handle)
+            return o
+
+        map_tree(obj, validate_leaf)
+
+    def _rebind_tree(self, obj, worker_handle, *, worker_local: bool = True, passthrough=None):
         """Rebind every ref leaf onto ``worker_handle`` and wrap bare handles in TensorRef.
 
         For worker-local backends, ``rebind`` attaches the worker actor handle and
@@ -788,16 +941,43 @@ class Handle:
         refs need not be TensorHandle). Only the per-leaf rebind policy lives here;
         the tree recursion (Batch/tuple/list/dict, cu_seqlens preserved) is delegated
         to the shared :func:`map_tree`.
+
+        ``passthrough`` (partial localization only) maps store key → the handle
+        this driver already holds. A ref that rode the RPC dehydrated comes back
+        as a deserialized copy still naming its producing worker; restoring the
+        original handle keeps it pointing at that worker and keeps its single
+        decref finalizer, which rebinding the copy would duplicate. Result ownership
+        is validated for every worker before this mutation starts.
         """
+
+        def restore(handle):
+            return passthrough.get(getattr(handle, "store_key", None)) if passthrough else None
+
+        def claim(handle) -> None:
+            """Bind a handle the callee produced after the ownership pre-pass."""
+            if worker_local:
+                handle.rebind(worker_handle)
 
         def rebind_leaf(o):
             if isinstance(o, GPUTensorHandle):
-                if worker_local:
-                    o.rebind(worker_handle)
+                original = restore(o)
+                if original is not None:
+                    return TensorRef.from_handles([original])
+                claim(o)
                 return TensorRef.from_handles([o])
-            if isinstance(o, TensorRef) and worker_local:
-                for s in o.spans:
-                    s.handle.rebind(worker_handle)
+            if isinstance(o, TensorRef):
+                # Mutate spans in place rather than rebuilding via ``with_spans``,
+                # which would drop grad / retain_grad_flag off a ref that carries
+                # them. The result tree is freshly deserialized, so it is ours.
+                spans = []
+                for span in o.spans:
+                    original = restore(span.handle)
+                    if original is not None:
+                        spans.append(TensorSpan(original, span.start, span.stop))
+                        continue
+                    claim(span.handle)
+                    spans.append(span)
+                o.spans = spans
             return o
 
         return map_tree(obj, rebind_leaf)

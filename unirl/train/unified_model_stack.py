@@ -55,6 +55,16 @@ from unirl.utils.misc import aggregate_numeric_metrics
 logger = logging.getLogger(__name__)
 
 
+def _lineage_skips(sample: Sample, **_) -> list:
+    """Decoded payloads this whole-lineage training call never reads.
+
+    Unlike the ordinary ``TrainStack`` path, this call receives the root input
+    Part as well as generated Parts, so the root's decoded input can still be
+    present after ``BaseTrainer._drop_decoded`` clears generated outputs.
+    """
+    return [part.primitives for part in sample.parts]
+
+
 class UnifiedModelTrainStack(Remote):
     """Single-backbone, multi-algorithm train stack.
 
@@ -279,7 +289,7 @@ class UnifiedModelTrainStack(Remote):
             self._profiler_cache = cached
         return cached
 
-    @distributed(dispatch_mode=Dispatch.DP_SCATTER)
+    @distributed(dispatch_mode=Dispatch.DP_SCATTER, skips=_lineage_skips)
     def train_track(
         self,
         sample: Sample,
