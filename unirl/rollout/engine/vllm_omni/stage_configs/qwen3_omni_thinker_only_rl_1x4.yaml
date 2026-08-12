@@ -26,7 +26,7 @@ stage_args:
       limit_mm_per_prompt:
         audio: 1
         video: 1
-        image: 0
+        image: 1
 
       mm_processor_cache_gb: 0
 

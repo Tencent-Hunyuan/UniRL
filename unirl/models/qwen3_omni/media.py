@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import PIL.Image
@@ -68,6 +68,44 @@ def load_image_rgb(path: str) -> PIL.Image.Image:
         )
     with PIL.Image.open(source) as image:
         return image.convert("RGB")
+
+
+def omni_processor_media_kwargs(
+    processor: Any,
+    *,
+    has_image: bool,
+    has_video: bool,
+    image_max_pixels: Optional[int],
+    video_fps: float,
+    video_max_pixels: Optional[int],
+) -> Dict[str, Any]:
+    """Build modality-scoped processor kwargs shared by HF and vLLM.
+
+    Image and video resize limits must use separate nested kwargs: a flat
+    ``size`` value is accepted by the HF processor but is ambiguous when one
+    request contains both modalities. The returned mapping can be passed
+    directly to HF's processor or forwarded as vLLM ``mm_processor_kwargs``.
+    """
+    kwargs: Dict[str, Any] = {}
+    if has_image and image_max_pixels is not None:
+        kwargs["images_kwargs"] = {
+            "size": {
+                "shortest_edge": int(processor.image_processor.size["shortest_edge"]),
+                "longest_edge": int(image_max_pixels),
+            }
+        }
+    if has_video:
+        videos_kwargs: Dict[str, Any] = {
+            "fps": float(video_fps),
+            "do_sample_frames": False,
+        }
+        if video_max_pixels is not None:
+            videos_kwargs["size"] = {
+                "shortest_edge": int(processor.video_processor.size["shortest_edge"]),
+                "longest_edge": int(video_max_pixels),
+            }
+        kwargs["videos_kwargs"] = videos_kwargs
+    return kwargs
 
 
 @dataclass
@@ -177,5 +215,6 @@ __all__ = [
     "load_audio_pyav",
     "load_image_rgb",
     "load_qwen3_audio",
+    "omni_processor_media_kwargs",
     "prepare_omni_media",
 ]

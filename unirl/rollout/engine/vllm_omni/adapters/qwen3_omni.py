@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from unirl.config.require import require
-from unirl.models.qwen3_omni.media import prepare_omni_media
+from unirl.models.qwen3_omni.media import omni_processor_media_kwargs, prepare_omni_media
 from unirl.models.types.conversations import build_omni_messages
 from unirl.rollout.engine.vllm_omni.adapters.base import ModelAdapter, register_adapter
 from unirl.rollout.engine.vllm_omni.adapters.hi3 import Hi3TextOutputAdapter
@@ -85,6 +85,7 @@ class Qwen3OmniThinkerInputAdapter:
         modality: str,
         *,
         model_path: str,
+        image_max_pixels: Optional[int] = None,
         video_fps: float = 1.0,
         video_max_frames: Optional[int] = None,
         video_max_pixels: Optional[int] = None,
@@ -95,6 +96,7 @@ class Qwen3OmniThinkerInputAdapter:
     ) -> None:
         self.modality = modality
         self.model_path = str(model_path)
+        self.image_max_pixels = int(image_max_pixels) if image_max_pixels else None
         self.video_fps = float(video_fps)
         self.video_max_frames = int(video_max_frames) if video_max_frames is not None else None
         self.video_max_pixels = int(video_max_pixels) if video_max_pixels else None
@@ -130,19 +132,22 @@ class Qwen3OmniThinkerInputAdapter:
 
         self._last_encodings: List[Dict[str, Any]] = []
 
-    def _multimodal_processor_kwargs(self, *, video_fps: float) -> Dict[str, Any]:
+    def _multimodal_processor_kwargs(
+        self,
+        *,
+        has_image: bool,
+        has_video: bool,
+        video_fps: float,
+    ) -> Dict[str, Any]:
         """Processor kwargs shared by driver encoding and vLLM."""
-        kwargs: Dict[str, Any] = {
-            "fps": video_fps,
-            "do_sample_frames": False,
-            "truncation": True,
-        }
-        if self.video_max_pixels is not None:
-            kwargs["size"] = {
-                "shortest_edge": int(self._processor.video_processor.size["shortest_edge"]),
-                "longest_edge": self.video_max_pixels,
-            }
-        return kwargs
+        return omni_processor_media_kwargs(
+            self._processor,
+            has_image=has_image,
+            has_video=has_video,
+            image_max_pixels=self.image_max_pixels,
+            video_fps=video_fps,
+            video_max_pixels=self.video_max_pixels,
+        )
 
     def _token_id(self, token: str) -> int:
         token_id = self._tokenizer.convert_tokens_to_ids(token)
@@ -219,10 +224,16 @@ class Qwen3OmniThinkerInputAdapter:
             template_kwargs.update(add_generation_prompt=True, tokenize=False)
             prompt_text = self._processor.apply_chat_template(prepared, **template_kwargs)
             processor_kwargs: Dict[str, Any] = {"text": [prompt_text], "truncation": True, "return_tensors": "pt"}
+            processor_kwargs.update(
+                self._multimodal_processor_kwargs(
+                    has_image=image is not None,
+                    has_video=video_frames is not None,
+                    video_fps=effective_fps,
+                )
+            )
             if image is not None:
                 processor_kwargs["images"] = [image]
             if video_frames is not None:
-                processor_kwargs.update(self._multimodal_processor_kwargs(video_fps=effective_fps))
                 processor_kwargs["videos"] = [video_frames]
             if audio_wave is not None:
                 processor_kwargs["audio"] = [audio_wave]
@@ -231,8 +242,6 @@ class Qwen3OmniThinkerInputAdapter:
             encoding = self._processor(**processor_kwargs)
             return encoding, image, video_frames, effective_fps, audio_wave, audio_sample_rate, audio_in_video
 
-        if video_frames is not None:
-            template_kwargs.update(self._multimodal_processor_kwargs(video_fps=effective_fps))
         template_kwargs.update(
             add_generation_prompt=True,
             tokenize=True,
@@ -256,7 +265,7 @@ class Qwen3OmniThinkerInputAdapter:
         )
         require(
             bool(conversations),
-            "Qwen3OmniThinkerInputAdapter: Sample carries no text/video conditioning turns.",
+            "Qwen3OmniThinkerInputAdapter: Sample carries no text or prompt-media conditioning turns.",
         )
         require(
             len(conversations) == len(frontier.sample_ids),
@@ -282,8 +291,8 @@ class Qwen3OmniThinkerInputAdapter:
                 if image is not None or video_frames is not None or audio_wave is not None:
                     raise ValueError(
                         f"Qwen3OmniThinkerInputAdapter: multimodal prompt produced {len(expanded_ids)} tokens, "
-                        f"exceeding max_prompt_length={self.max_prompt_length}. Reduce video_max_frames, "
-                        "video_max_pixels, or video_fps, or raise max_prompt_length."
+                        f"exceeding max_prompt_length={self.max_prompt_length}. Reduce image_max_pixels, "
+                        "video_max_frames, video_max_pixels, or video_fps, or raise max_prompt_length."
                     )
                 enc = dict(enc)
                 enc["input_ids"] = enc["input_ids"][..., -self.max_prompt_length :]
@@ -308,8 +317,13 @@ class Qwen3OmniThinkerInputAdapter:
                 entry["multi_modal_data"] = media
             if image is not None or video_frames is not None or audio_wave is not None:
                 mm_processor_kwargs: Dict[str, Any] = {"truncation": True}
-                if video_frames is not None:
-                    mm_processor_kwargs.update(self._multimodal_processor_kwargs(video_fps=effective_fps))
+                mm_processor_kwargs.update(
+                    self._multimodal_processor_kwargs(
+                        has_image=image is not None,
+                        has_video=video_frames is not None,
+                        video_fps=effective_fps,
+                    )
+                )
                 if audio_in_video:
                     mm_processor_kwargs["use_audio_in_video"] = True
                     temporal_patch_size = int(getattr(self._processor.video_processor, "temporal_patch_size", 2))
@@ -508,15 +522,19 @@ class Qwen3OmniThinkerAdapter(ModelAdapter):
 
         mc = model_config
         model_path = str(config.model_path)
+        image_max_pixels = getattr(mc, "image_max_pixels", None) if mc is not None else None
         video_fps = float(getattr(mc, "video_fps", 1.0)) if mc is not None else 1.0
         video_max_frames = getattr(mc, "video_max_frames", None) if mc is not None else None
         video_max_pixels = getattr(mc, "video_max_pixels", None) if mc is not None else None
         use_audio_in_video = bool(getattr(mc, "use_audio_in_video", False)) if mc is not None else False
         max_prompt_length = int(getattr(mc, "max_prompt_length", 12288)) if mc is not None else 12288
+        config_image_max_pixels = getattr(config, "image_max_pixels", None)
         config_video_fps = getattr(config, "video_fps", None)
         config_video_max_pixels = getattr(config, "video_max_pixels", None)
         config_use_audio_in_video = getattr(config, "use_audio_in_video", None)
         config_max_prompt_length = getattr(config, "max_prompt_length", None)
+        if config_image_max_pixels is not None:
+            image_max_pixels = int(config_image_max_pixels)
         if config_video_fps is not None:
             video_fps = float(config_video_fps)
         if config_video_max_pixels is not None:
@@ -529,10 +547,11 @@ class Qwen3OmniThinkerAdapter(ModelAdapter):
         chat_template_kwargs = dict(getattr(config, "chat_template_kwargs", {}) or {})
 
         logger.info(
-            "Resolved Qwen3-Omni rollout adapter config: model_path=%s video_fps=%s "
+            "Resolved Qwen3-Omni rollout adapter config: model_path=%s image_max_pixels=%s video_fps=%s "
             "video_max_frames=%s video_max_pixels=%s use_audio_in_video=%s max_prompt_length=%s "
             "system_instruction_set=%s model_config_available=%s",
             model_path,
+            image_max_pixels,
             video_fps,
             video_max_frames,
             video_max_pixels,
@@ -545,6 +564,7 @@ class Qwen3OmniThinkerAdapter(ModelAdapter):
         self.input_adapter = Qwen3OmniThinkerInputAdapter(
             self.modality,
             model_path=model_path,
+            image_max_pixels=image_max_pixels,
             video_fps=video_fps,
             video_max_frames=video_max_frames,
             video_max_pixels=video_max_pixels,

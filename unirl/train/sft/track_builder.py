@@ -26,21 +26,37 @@ from __future__ import annotations
 
 import inspect
 import logging
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple
 
 import torch
 
 from unirl.data.sft import tokenize_agent_target
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
-from unirl.types.primitives import Images, Texts
+from unirl.models.types.codec import EncodeStage
+from unirl.types.conditions import ImageLatentCondition
+from unirl.types.media import MediaRef, MediaRefs
+from unirl.types.primitives import Images, Texts, Video, Videos
 from unirl.types.sample import Part
-from unirl.types.segments.latent import make_image_segment
+from unirl.types.segments.latent import make_image_segment, make_video_segment
 from unirl.types.segments.text import TextSegment
+from unirl.utils.video import load_video
 
 logger = logging.getLogger(__name__)
 
 Record = Dict[str, Any]
+
+
+class _VideoSFTPipeline(Protocol):
+    def build_conditions(self, texts: Texts, *, guidance_scale: float) -> Any: ...
+
+    def build_video_encoder(
+        self,
+        *,
+        num_frames: int,
+        height: int,
+        width: int,
+    ) -> EncodeStage[Videos, ImageLatentCondition]: ...
 
 
 def _load_pil_image(uri: str):
@@ -55,15 +71,13 @@ def _load_pil_image(uri: str):
     return PILImage.open(uri).convert("RGB")
 
 
-def _media_uris(record: Record, *, role: str) -> List[str]:
-    """URIs of the record's media refs with the given role (dataclass or dict form)."""
-    uris: List[str] = []
-    for ref in record.get("media_refs", []) or []:
-        ref_role = getattr(ref, "role", None) if not isinstance(ref, dict) else ref.get("role")
-        ref_uri = getattr(ref, "uri", None) if not isinstance(ref, dict) else ref.get("uri")
-        if ref_role == role and ref_uri:
-            uris.append(str(ref_uri))
-    return uris
+def _media_uris(record: Record, *, role: str, modality: Optional[str] = None) -> List[str]:
+    """URIs of normalized media refs matching ``role`` and ``modality``."""
+    return [
+        ref.uri
+        for ref in record.get("media_refs", []) or []
+        if isinstance(ref, MediaRef) and ref.role == role and (modality is None or ref.modality == modality)
+    ]
 
 
 def _sample_ids(records: Sequence[Record]) -> List[str]:
@@ -127,6 +141,7 @@ class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
         self.max_response_length = max_response_length
         self.append_eos = append_eos
         self._embed_takes_images = "images" in inspect.signature(self._chat_stage.embed).parameters
+        self._embed_sft_prompt = getattr(self._chat_stage, "embed_sft_prompt", None)
         self._warned_truncation = False
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
@@ -168,11 +183,34 @@ class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
             return embed_messages(histories, tools=tools)
 
         texts = Texts(texts=[str(r["prompt"]) for r in records])
+        # The data layer normalizes every manifest media entry to MediaRef, so no dict form here.
+        prompt_media_rows: List[List[MediaRef]] = [
+            [ref for ref in (r.get("media_refs") or []) if isinstance(ref, MediaRef) and ref.role == "prompt"]
+            for r in records
+        ]
+        if any(prompt_media_rows):
+            if not callable(self._embed_sft_prompt):
+                raise ValueError(
+                    "ARSupervisedTrackBuilder: this pipeline's chat stage does not support "
+                    "role='prompt' media through embed_sft_prompt(texts, media_refs)."
+                )
+            return self._embed_sft_prompt(
+                texts=texts,
+                media_refs=MediaRefs.from_rows(prompt_media_rows),
+            )
+
         if not self._embed_takes_images:
+            unconsumed = [r.get("sample_id") for r in records if r.get("media_refs")]
+            if unconsumed:
+                raise ValueError(
+                    f"ARSupervisedTrackBuilder: records {unconsumed[:3]} carry media_refs that this chat stage "
+                    "cannot consume — prompt media must use role='prompt' (see unirl/data/sft.py row shapes). "
+                    "Embedding them as text-only would train the model without the media, undetectably."
+                )
             return self._chat_stage.embed(texts)
         images: List[Optional[Any]] = []
         for r in records:
-            uris = _media_uris(r, role="condition")
+            uris = _media_uris(r, role="condition", modality="image")
             if len(uris) > 1:
                 raise ValueError(
                     f"ARSupervisedTrackBuilder: at most one role='condition' image per record "
@@ -342,7 +380,7 @@ class DiffusionSupervisedTrackBuilder(SupervisedTrackBuilder):
 
         rows: List[torch.Tensor] = []
         for r in records:
-            uris = _media_uris(r, role="target")
+            uris = _media_uris(r, role="target", modality="image")
             if len(uris) != 1:
                 raise ValueError(
                     f"DiffusionSupervisedTrackBuilder: record {r.get('sample_id')!r} must carry exactly one "
@@ -357,8 +395,82 @@ class DiffusionSupervisedTrackBuilder(SupervisedTrackBuilder):
         return torch.stack(rows, dim=0)
 
 
+class VideoDiffusionSupervisedTrackBuilder(SupervisedTrackBuilder):
+    """Dataset records → video-diffusion ``Part`` with a clean x0 latent.
+
+    Records must contain one ``(modality="video", role="target")`` media ref.
+    The builder owns manifest decoding and ``Part`` assembly; the configured
+    model stage owns frame shaping and VAE encoding.
+    """
+
+    def __init__(
+        self,
+        *,
+        pipeline: _VideoSFTPipeline,
+        num_frames: int,
+        height: int,
+        width: int,
+        guidance_scale: float = 1.0,
+        max_decode_frames: int = 256,
+    ) -> None:
+        super().__init__()
+        self.pipeline = pipeline
+        num_frames = int(num_frames)
+        self._encode = pipeline.build_video_encoder(
+            num_frames=num_frames,
+            height=height,
+            width=width,
+        )
+        self._conditions_kwargs: Dict[str, Any] = {"guidance_scale": float(guidance_scale)}
+        self._max_decode_frames = int(max_decode_frames)
+        if self._max_decode_frames < num_frames:
+            raise ValueError(
+                "VideoDiffusionSupervisedTrackBuilder: max_decode_frames must be >= num_frames "
+                f"({num_frames}), got {self._max_decode_frames}."
+            )
+
+    @distributed(dispatch_mode=Dispatch.DP_SCATTER)
+    def build(self, records: List[Record]) -> Part:
+        if not records:
+            raise ValueError("VideoDiffusionSupervisedTrackBuilder.build: empty record shard.")
+        with torch.no_grad():
+            texts = Texts(texts=[str(r["prompt"]) for r in records])
+            conditions = self.pipeline.build_conditions(texts, **self._conditions_kwargs)
+            videos = self._load_target_videos(records)
+            latents = self._encode.encode(videos).latents
+        if latents.shape[0] != len(records):
+            raise RuntimeError(
+                f"VideoDiffusionSupervisedTrackBuilder.build: encoded {latents.shape[0]} latents "
+                f"from {len(records)} records."
+            )
+        loss_mask = torch.tensor([not is_pad for is_pad in _pad_flags(records)], dtype=torch.float32)
+        segment = make_video_segment(
+            latents=latents.unsqueeze(1),
+            loss_mask=loss_mask.to(latents.device),
+        )
+        return Part(
+            sample_ids=_sample_ids(records),
+            conditions=conditions.to_dict(),
+            segment=segment,
+            metadata=[dict(record.get("metadata") or {}) for record in records],
+        )
+
+    def _load_target_videos(self, records: Sequence[Record]) -> Videos:
+        rows: List[Video] = []
+        for r in records:
+            uris = _media_uris(r, role="target", modality="video")
+            if len(uris) != 1:
+                raise ValueError(
+                    f"VideoDiffusionSupervisedTrackBuilder: record {r.get('sample_id')!r} must carry exactly "
+                    f"one role='target' video media ref (got {len(uris)})."
+                )
+            rows.append(Video(frames=load_video(uris[0], max_frames=self._max_decode_frames)))
+        return Videos.from_list(rows)
+
+
 __all__ = [
     "ARSupervisedTrackBuilder",
     "DiffusionSupervisedTrackBuilder",
     "SupervisedTrackBuilder",
+    "VideoDiffusionSupervisedTrackBuilder",
 ]

@@ -124,6 +124,7 @@ backend:
     fsdp_mode: full
     reshard_after_forward: true
     activation_checkpointing: true    # 80B + multi-step replay: required
+    ac_wrap_order: outside            # keep FSDP gather/cast outside HI3's dtype-sensitive AC region
     use_torch_compile: false
     root_wrap: false                  # frozen mixed-dtype VAE/ViT siblings live under the trainable attr
   optimizer_cfg:

@@ -68,6 +68,10 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
         self.rank = rank
         self.model_config = model_config
         self._is_offloaded = False
+        # A transition failure means sequential stage RPCs may have left the
+        # engine partially awake/asleep. Normalize through sleep before another
+        # wake; generate refuses until residency is consistent again.
+        self._transition_failed = False
         logger.info(
             "VLLM-Omni engine config (complete typed config): %s; model_config_available=%s model_config=%s",
             config,
@@ -114,9 +118,13 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
 
     def _generate_core(self, sample: Sample) -> Sample:
         """Synchronous whole-Sample generation: validate, σ-pin, run, decode."""
+        # Defense-in-depth for logical and partially completed lifecycle
+        # transitions: callers that swallow a wake/sleep exception must never
+        # generate with base weights or with only a subset of stages resident.
         require(
-            not self._is_offloaded,
-            "VLLMOmniRolloutEngine.generate: engine is offloaded (wake_up first).",
+            not self._is_offloaded and not self._transition_failed,
+            "VLLMOmniRolloutEngine.generate: engine is offloaded or its last lifecycle transition failed "
+            "(wake_up first).",
         )
         self.adapter.validate_request(sample)
         if self.adapter.needs_sigmas:
@@ -138,29 +146,85 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
         """
         ensure_sample_sigmas(sample, self.schedule_policy)
 
+    def _mark_consistently_offloaded(self) -> None:
+        """Record a successful all-stage sleep and invalidate worker LoRA state."""
+        self._is_offloaded = True
+        self._transition_failed = False
+        self._weight_sync.mark_weights_released()
+
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def sleep(self) -> None:
-        """Fan ``handle_sleep_task`` to every stage's workers (level 2)."""
-        if self._is_offloaded:
+        """Fan ``handle_sleep_task`` to every stage's workers (level 1)."""
+        if self._is_offloaded and not self._transition_failed:
             return
-        self._backend.sleep_task()
-        self._is_offloaded = True
-        self._weight_sync.mark_weights_released()
+        try:
+            self._backend.sleep_task()
+        except Exception:
+            # Stage RPCs are sequential. A later failure may leave only a
+            # prefix asleep, so neither generate nor wake may trust the old
+            # physical flag; a subsequent sleep/wake retries normalization.
+            self._is_offloaded = False
+            self._transition_failed = True
+            raise
+        self._mark_consistently_offloaded()
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def wake_up(self) -> None:
         """Fan ``handle_wake_task`` to every stage's workers + restore LoRA."""
+        if self._transition_failed:
+            # Recover an unknown partial stage state to one known boundary
+            # before attempting another wake. If this retry fails, retain the
+            # latch so generate remains blocked and cleanup can retry sleep.
+            try:
+                self._backend.sleep_task()
+            except Exception:
+                logger.exception("vLLM-Omni failed to normalize a partial lifecycle transition")
+                raise
+            self._mark_consistently_offloaded()
+
         if not self._is_offloaded:
             return
+
+        # This body executes INSIDE each colocated train actor (BROADCAST).
+        # Return the actor's train-phase allocation peak to the driver before
+        # the engine subprocess re-maps its ~50 GiB weight pool: without
+        # activation checkpointing the peak stays reserved in the actor's
+        # caching allocator and the post-wake generate OOMs at a 2 MiB
+        # allocation (LIN-382 qwen e2e-c/d — a driver-side flush in
+        # trainer.train_step demonstrably does NOT reach this process).
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        self._backend.wake_task()
+        try:
+            self._backend.wake_task()
+        except Exception:
+            # ``wake_task`` fans stages sequentially. Mark the physical
+            # state unknown before rollback so caller cleanup never skips
+            # sleep merely because the pre-wake flag was True.
+            self._is_offloaded = False
+            self._transition_failed = True
+            try:
+                self._backend.sleep_task()
+            except Exception:
+                logger.exception("vLLM-Omni rollback sleep failed after partial wake")
+            else:
+                self._mark_consistently_offloaded()
+            raise
+        self._is_offloaded = False  # physical state changed before LoRA restore
         try:
             self._weight_sync.restore_lora_after_wake()
         except Exception:
-            self._is_offloaded = True
+            # Roll back the physically awakened engine. Because all-stage sleep
+            # is sequential, a rollback failure means physical residency is
+            # unknown rather than reliably awake.
+            try:
+                self._backend.sleep_task()
+            except Exception:
+                self._is_offloaded = False
+                self._transition_failed = True
+                logger.exception("vLLM-Omni rollback sleep failed after LoRA restore error")
+            else:
+                self._mark_consistently_offloaded()
             raise
-        self._is_offloaded = False
 
     @property
     def is_offloaded(self) -> bool:

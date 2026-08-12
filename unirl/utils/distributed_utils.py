@@ -5,7 +5,6 @@ from __future__ import annotations
 from datetime import timedelta
 from typing import Any
 
-import torch
 import torch.distributed as dist
 from torch.distributed.distributed_c10d import (
     Backend,
@@ -102,40 +101,3 @@ def init_process_group(
 
     _world.pg_group_ranks[pg] = {i: i for i in range(world_size)}
     return pg
-
-
-def distributed_masked_whiten(
-    values: torch.Tensor,
-    mask: torch.Tensor,
-    process_group: dist.ProcessGroup | None = None,
-    shift_mean: bool = True,
-    epsilon: float = 1e-8,
-):
-    """Whiten tensors using global statistics across the process group."""
-    local_sum = (values * mask).sum()
-    local_sum_sq = ((values**2) * mask).sum()
-    local_mask_sum = mask.sum()
-
-    stats_tensor = torch.tensor(
-        [local_sum, local_sum_sq, local_mask_sum],
-        device=values.device,
-        dtype=torch.float32,
-    )
-    dist.all_reduce(stats_tensor, group=process_group)
-
-    global_sum, global_sum_sq, global_mask_sum = stats_tensor
-    if global_mask_sum.item() == 0:
-        raise ValueError("The global mask sum across all participating GPUs is zero.")
-
-    global_mean = global_sum / global_mask_sum
-    global_mean_sq = global_sum_sq / global_mask_sum
-    global_var = global_mean_sq - global_mean**2
-
-    if global_mask_sum.item() >= 2:
-        bessel_correction = global_mask_sum / (global_mask_sum - 1)
-        global_var = global_var * bessel_correction
-
-    whitened_values = (values - global_mean) * torch.rsqrt(global_var + epsilon)
-    if not shift_mean:
-        whitened_values += global_mean
-    return whitened_values
