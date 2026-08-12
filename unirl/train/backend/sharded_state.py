@@ -26,6 +26,17 @@ logger = logging.getLogger(__name__)
 
 StateDict = Dict[str, object]
 
+# ``checkpoint_wrapper`` (activation checkpointing) interposes this segment in
+# ``named_parameters()`` names while ``state_dict()`` stays canonical (the
+# wrapper's state-dict hooks strip it), so any name-keyed match between module
+# params and checkpoint keys must compare canonical names.
+_AC_WRAP_SEGMENT = "_checkpoint_wrapped_module."
+
+
+def _canonical_param_name(name: str) -> str:
+    """Strip activation-checkpoint wrapper segments from a parameter name."""
+    return name.replace(_AC_WRAP_SEGMENT, "")
+
 
 def gather_state_dict(model: nn.Module) -> StateDict:
     """Rank-0 DCP gather.  Returns full state on rank 0, empty on others."""

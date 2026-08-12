@@ -11,6 +11,7 @@ and :class:`WAN21CLIPVisionEncodeStage` (``Images`` → CLIP penultimate patch
 embeddings, forwarded as ``encoder_hidden_states_image``). Both
 fire only when the I2V checkpoint declares ``transformer.config.image_dim
 > 0``; T2V bundles skip them and the pipeline is unchanged.
+``WANVideoLatentEncodeStage`` is the target-video encoder used by T2V SFT.
 
 Importing this package re-exports its bundle / pipeline / config classes;
 recipes wire them by ``_target_`` dotpath.
@@ -27,7 +28,7 @@ from unirl.models.wan21.diffusion import (
 from unirl.models.wan21.image_encode import WAN21ImageLatentEncodeStage
 from unirl.models.wan21.pipeline import WAN21Pipeline
 from unirl.models.wan21.text_embed import WAN21TextEmbedStage
-from unirl.models.wan21.vae import WAN21VAEDecodeStage
+from unirl.models.wan21.vae import WAN21VAEDecodeStage, WANVideoLatentEncodeStage
 
 __all__ = [
     "WAN21Bundle",
@@ -40,4 +41,5 @@ __all__ = [
     "WAN21PipelineConfig",
     "WAN21TextEmbedStage",
     "WAN21VAEDecodeStage",
+    "WANVideoLatentEncodeStage",
 ]

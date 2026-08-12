@@ -533,6 +533,7 @@ class UniRLWandBLogger:
         key: str = "rollout/generated_media",
         video_key: Optional[str] = None,
         video_fps: int = 8,
+        step_key: str = "rollout/step",
     ) -> None:
         """Log rollout media preview payload produced by the rollout pipeline.
 
@@ -543,8 +544,10 @@ class UniRLWandBLogger:
 
         Images and videos go to *separate* wandb keys so wandb renders each
         as its native panel type. Both are logged in a single ``wandb.log``
-        call sharing ``"rollout/step"`` so the panels line up on the same
-        step axis. Captions ("``{prompt:.100} | reward: {r:.2f}``") are
+        call sharing ``step_key`` so the panels line up on the same step
+        axis; it must be the axis ``key``'s namespace was declared against
+        in :meth:`_init_metric_axes` (``eval/*`` panels need
+        ``"eval/step"``). Captions ("``{prompt:.100} | reward: {r:.2f}``") are
         built once and applied to both ``wandb.Image`` and ``wandb.Video``
         so a sample's image and video panels show identical caption text.
 
@@ -616,7 +619,7 @@ class UniRLWandBLogger:
                     return f"{prompt[:100]} | reward: {reward_values[idx]:.2f}"
                 return f"{prompt[:100]}"
 
-            payload: Dict[str, Any] = {"rollout/step": int(rollout_id)}
+            payload: Dict[str, Any] = {step_key: int(rollout_id)}
 
             if has_images:
                 wandb_images = [
@@ -693,6 +696,17 @@ class UniRLWandBLogger:
         logging is off, disabled, or this rollout isn't on the cadence.
         """
         return self.enabled and self.log_media and (int(rollout_id) % self.media_log_interval == 0)
+
+    def should_log_eval_media(self) -> bool:
+        """Whether eval generations should be captured/logged — ``eval_interval`` is the only cadence.
+
+        Same master switch as the rollout panel (``log_media``), but
+        ``media_log_interval`` deliberately does NOT apply: it paces the rollout
+        panel against the per-rollout clock, while eval already fires on its own,
+        much coarser ``eval_interval``. Intersecting the two would silently drop
+        most eval grids — the panel a run is actually read from.
+        """
+        return self.enabled and self.log_media
 
     def log_rollout_step(
         self,

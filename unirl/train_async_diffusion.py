@@ -15,7 +15,8 @@ Launch (single node):
 
 Extra config knobs vs the synchronous separate recipe:
   * ``max_inflight`` — must be ``1``; other values fail during trainer initialization.
-  * ``weight_sync_interval`` — rollout batches one published snapshot serves; max staleness is interval - 1.
+  * ``weight_sync_interval`` — trained batches between publications; also derives
+    the default output-version lag filter.
 ``layout`` is forced to ``separate`` (async needs disjoint train/rollout slabs).
 """
 
@@ -46,13 +47,20 @@ def main(cfg: DictConfig) -> None:
         layout="separate",
         train_fraction=cfg.get("train_fraction", 0.5),
         reward_fraction=cfg.get("reward_fraction", 0.0),
+        # Forwarded so the trainer can reject it — async scores at reap time outside
+        # _reward_phase(), and dropping the key here would silently ignore the policy.
+        offload_train_during_reward=cfg.get("offload_train_during_reward", False),
+        # Async default False (sync entry defaults True): the dedicated rollout
+        # slab stays resident; evaluate() also passes sleep_after=False here.
+        rollout_sleep_after_generate=cfg.get("rollout_sleep_after_generate", False),
         adv_use_global_std=cfg.get("adv_use_global_std", False),
         eval_interval=cfg.get("eval_interval", 0),
         eval_num_prompts=cfg.get("eval_num_prompts", 64),
         eval_samples_per_prompt=cfg.get("eval_samples_per_prompt", 4),
         eval_chunk_prompts=cfg.get("eval_chunk_prompts", 16),
-        eval_cfg_text_scale=cfg.get("eval_cfg_text_scale", 4.0),
         eval_eta=cfg.get("eval_eta", 0.0),
+        # Any DiffusionSamplingParams field; everything it omits inherits `sampling`.
+        eval_sampling_cfg=cfg.get("eval_sampling"),
         eval_rewards_cfg=cfg.get("eval_rewards"),
         task_config=cfg.get("task_config"),
         max_inflight=int(cfg.get("max_inflight", 1)),

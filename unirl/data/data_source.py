@@ -20,6 +20,7 @@ from torch.utils.data import DataLoader
 from unirl.types.media import MediaRef, MediaRefs
 from unirl.types.primitives import Image, Images, Texts, Videos
 from unirl.types.sample import Part, PrimitiveMap, Sample
+from unirl.utils.video import load_video
 
 from .datasets import PromptExampleDataset, TextPromptDataset, normalize_prompt_example
 
@@ -77,8 +78,6 @@ def _load_condition_videos(media_refs: List[Any]) -> Optional[List[Any]]:
     """
     if not media_refs or not any(media_refs):
         return None
-    import torchvision.io
-
     from unirl.types.primitives import Video as PrimVideo
 
     videos_per_prompt: List[Any] = []
@@ -95,28 +94,7 @@ def _load_condition_videos(media_refs: List[Any]) -> Optional[List[Any]]:
         if len(selected) > 1:
             raise ValueError(f"WAN V2V expects <=1 (video, condition) MediaRef per prompt, got {len(selected)}")
 
-        uri = selected[0].uri
-        if str(uri).endswith((".pt", ".pth")):
-            frames = torch.load(uri, map_location="cpu", weights_only=True)
-        elif str(uri).endswith((".npy", ".npz")):
-            import numpy as np
-
-            loaded = np.load(uri)
-            frames = loaded["frames"] if isinstance(loaded, np.lib.npyio.NpzFile) else loaded
-            frames = torch.as_tensor(frames)
-        else:
-            frames, _, _ = torchvision.io.read_video(uri, pts_unit="sec", output_format="TCHW")
-        if frames.numel() == 0:
-            raise ValueError(f"Condition video has no decoded frames: {uri}")
-        if frames.dtype == torch.uint8:
-            frames = frames.to(dtype=torch.float32).div_(255.0)
-        else:
-            frames = frames.to(dtype=torch.float32).clamp_(0.0, 1.0)
-        if int(frames.shape[1]) != 3:
-            raise ValueError(
-                f"WAN V2V expects RGB condition video frames [T, 3, H, W], got {tuple(frames.shape)} from {uri}"
-            )
-        videos_per_prompt.append(PrimVideo(frames=frames))
+        videos_per_prompt.append(PrimVideo(frames=load_video(selected[0].uri)))
         any_loaded = True
 
     if not any_loaded:

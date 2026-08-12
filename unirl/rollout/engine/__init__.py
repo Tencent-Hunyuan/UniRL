@@ -1,12 +1,7 @@
 """Rollout engines over the canonical ``Sample`` request type.
 
-Two halves of one design: ``synchronous.py`` records the worker-side sync contracts
-(``BaseRolloutEngine`` — the broad ABC including coordinator engines — and
-``SyncRolloutEngine``, the ``Sample`` → ``Sample`` refinement the per-backend
-subpackages implement); ``asynchronous.py`` records the driver side (the
-batch/agentic async engines and their mechanisms).
+``base.py`` records the worker-side ``Sample -> Sample`` contract. Driver-side
+scheduling lives in ``unirl.rollout.manager``.
 
-Deliberately empty otherwise: importing the driver-side ``asynchronous`` module
-must stay ray/torch-free, so this init imports nothing and consumers import the
-halves directly.
+This module remains empty so consumers import the required layer directly.
 """

@@ -1,8 +1,5 @@
 # @package _global_
-# M2 — Deep-research agentic RL: the REAL deep-research run. Same AgenticTrainer
-# + AgenticRolloutEngine as M1 (unchanged), swapping ONLY the tools (search + visit)
-# and the reward backend (LLM-as-judge). This is the proof that the design isolates
-# "what tools / what reward" from "how to train".
+# Deep-research agentic RL with the single service-scored barrier trainer.
 #
 # Prerequisites (operational — set on the pod):
 #   - QWEN3_INSTRUCT_PATH : local Qwen3-Instruct checkpoint dir
@@ -22,21 +19,25 @@
 num_devices: 2
 batch_size: 4 # P prompts_per_rollout; P*n = 8 must be divisible by num_devices
 num_rollouts: 200
-weight_sync_interval: 1
-eval_interval: 0
 
-worker_max_concurrency: 8
+worker_max_concurrency: 10
+per_worker_inflight: 4 # per-slot trajectory cap (2 slots x 4 covers the 8 concurrent tasks)
 stop: ["</tool_call>"]
 
-adv_normalization_scope: group
-normalize_adv_by_std: true
+sampling:
+  _target_: unirl.types.sampling.ARSamplingParams
+  samples_per_prompt: 2
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 0
+  max_new_tokens: 2048
 
 logging:
   report_to_wandb: false
   project_name: unirl-deep-research
   run_name: deepresearch_search_judge_qwen3
   entity: ${oc.env:WANDB_ENTITY,null}
-  tags: [deep-research, agentic, search, visit, llm-judge, qwen3, m2]
+  tags: [deep-research, agentic, search, visit, llm-judge, qwen3]
 
 bundle:
   _target_: unirl.models.qwen3.bundle.Qwen3Bundle.from_config
@@ -85,8 +86,7 @@ rollout:
   _target_: unirl.rollout.engine.agentic.engine.AgenticRolloutEngine
   config:
     _target_: unirl.rollout.engine.agentic.config.AgenticRolloutEngineConfig
-    max_turns: 8 # research trajectories need more turns than the calculator smoke
-    per_worker_concurrency: 8
+    max_turns: 8
     inner:
       _target_: unirl.rollout.engine.sglang.config.SGLangEngineConfig
       backend: native
@@ -127,13 +127,7 @@ rollout:
         - _target_: unirl.rollout.env.tools.visit.VisitTool
           endpoint: ${oc.env:SUMMARY_URL,""}
           model: ${oc.env:SUMMARY_MODEL,""}
-    episode_sampling:
-      _target_: unirl.types.sampling.ARSamplingParams
-      samples_per_prompt: 2
-      temperature: 1.0
-      top_p: 1.0
-      top_k: 0
-      max_new_tokens: 2048
+    episode_sampling: ${sampling}
 
 reward:
   # LLM-as-judge over text: the judge decides whether the trajectory's <answer> is
@@ -157,7 +151,7 @@ algorithm:
   clip_schedule: constant
   loss_agg_mode: seq-mean-token-mean
   horizon: 2048
-  sampling_temperature: 1.0 # MUST equal episode_sampling.temperature
+  sampling_temperature: ${sampling.temperature}
   conditions_cls:
     _target_: hydra.utils.get_class
     path: unirl.models.qwen3.conditions.Qwen3ARConditions
@@ -179,15 +173,6 @@ data_source:
   args:
     run:
       data_path: ${oc.env:DATA_PATH} # ASearcher jsonl: {"prompt": ..., "metadata": {"answer": ...}}
-      eval_data_path: ${oc.env:EVAL_DATA_PATH,${oc.env:DATA_PATH}} # unused (eval_interval=0); defaults to train
       seed: 42
     algorithm:
-      prompts_per_rollout: 4 # == batch_size (P)
-
-sampling:
-  _target_: unirl.types.sampling.ARSamplingParams
-  samples_per_prompt: 2
-  temperature: 1.0
-  top_p: 1.0
-  top_k: 0
-  max_new_tokens: 2048
+      prompts_per_rollout: ${batch_size}

@@ -11,7 +11,7 @@ trainside unchanged).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Callable, Literal, Mapping, Optional, Protocol
+from typing import TYPE_CHECKING, Callable, Literal, Mapping, Protocol
 
 if TYPE_CHECKING:
     from unirl.types.sample import Sample
@@ -23,26 +23,15 @@ class HarnessOutcome:
 
     ``completed`` — the trajectory is terminal; ``sample`` is the full trace.
     ``suspended`` — cooperatively stopped at a harness-chosen safe point;
-      ``sample`` is the checkpoint. Whether it can be RESUBMITTED depends on
-      the environment, not this contract: a stateless env (tools derive state
-      from the Sample) resumes; a stateful env (own episodes/sessions, torn
-      down by ``close``) cannot, and its recipes must pair with
-      ``tail_policy: drop``. Config-time validation of that pairing is
-      deferred to the config-selected-harness step.
+      ``sample`` is the partial trace returned to the hosting runtime.
     ``failed`` — the task hit an infrastructure fault (backend outage, tool
       timeout, context overflow); ``sample`` is the partial trace. The hosting
       runtime marks it so a fault never enters advantage math as a legitimate
       low-scoring sibling.
-
-    ``env_reward`` — an env-sourced per-trajectory return, when the task's
-    environment emits one (``info["reward"]``; last value wins). Captured here
-    because reading it is task semantics; ATTACHING it to the trace is tensor
-    work the hosting runtime does, keeping harness modules torch-free.
     """
 
     sample: "Sample"
     status: Literal["completed", "suspended", "failed"]
-    env_reward: Optional[float] = None
 
 
 @dataclass(frozen=True)

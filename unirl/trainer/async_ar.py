@@ -1,10 +1,13 @@
-"""Async autoregressive RL over separate train and rollout GPU slabs, with the rollout engine resident."""
+"""Async autoregressive RL over separate train and rollout GPU slabs.
+
+The trainer owns optimizer progress and publication cadence. The driver-side
+``RolloutManager`` owns bounded dispatch, grouping, filtering, and published
+rollout state.
+"""
 
 import inspect
-import logging
-import sys
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 from hydra.utils import instantiate
@@ -13,22 +16,13 @@ from omegaconf import DictConfig
 from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
 from unirl.models.qwen3_5.validation import validate_qwen3_5_training_contract
-from unirl.rollout.engine.asynchronous import AsyncBatchRolloutEngine, RolloutBatch
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.ar import ARTrainer
-from unirl.trainer.async_batch_control import (
-    AsyncBatchControl,
-    log_admission_notes,
-    max_publication_gap_batches,
-    next_hard_boundary,
-    unwrap_replicated_int,
-)
+from unirl.trainer.async_rollout import AsyncRolloutTrainerMixin, training_version_metrics
 from unirl.trainer.base import BaseTrainer, build_sampling_dict
 from unirl.types.sample import Sample
 from unirl.types.sampling import BaseSamplingParams, total_samples_per_prompt
 from unirl.utils.hydra import parse_hydra_cfg, remote_hydra
-
-logger = logging.getLogger(__name__)
 
 
 def _rollout_dp_size_from_parsed_config(rollout_parsed: dict, *, world_size: int) -> int:
@@ -46,7 +40,7 @@ def _rollout_dp_size_from_parsed_config(rollout_parsed: dict, *, world_size: int
     return world_size // non_dp_width
 
 
-class AsyncARTrainer(ARTrainer):
+class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
     """Disaggregated async AR trainer (two slabs, resident engine, NCCL sync)."""
 
     def __init__(
@@ -114,10 +108,14 @@ class AsyncARTrainer(ARTrainer):
 
         self._train_fraction = float(train_fraction)
         self._max_inflight = max(1, int(max_inflight))
-        self._control = AsyncBatchControl(
-            weight_sync_interval=weight_sync_interval,
-            num_updates_per_batch=stack_cfg.get("num_updates_per_batch", 1),
-        )
+        self._weight_sync_interval = int(weight_sync_interval)
+        self._num_updates_per_batch = int(stack_cfg.get("num_updates_per_batch", 1))
+        if self._weight_sync_interval < 1:
+            raise ValueError(f"weight_sync_interval must be >= 1, got {self._weight_sync_interval}")
+        if self._num_updates_per_batch < 1:
+            raise ValueError(f"num_updates_per_batch must be >= 1, got {self._num_updates_per_batch}")
+        self._train_version = 0
+        self._batches_since_sync = 0
         self._train_devices = int(round(self.num_devices * self._train_fraction))
         if self._train_devices <= 0 or self._train_devices >= self.num_devices:
             raise ValueError(
@@ -163,7 +161,7 @@ class AsyncARTrainer(ARTrainer):
     def _prepare_rollout(self, *, sync_weights: bool) -> bool:
         """Sync a resident separate-slab engine without colocate handoffs."""
         if sync_weights:
-            self._control.sync_rollout(self._async_engine, self.rollout, self.weight_sync)
+            self._sync_rollout(require_empty=True)
         return False
 
     def _finish_rollout(self, *, train_state_offloaded: bool) -> None:
@@ -199,22 +197,6 @@ class AsyncARTrainer(ARTrainer):
             pp_size=pp_size,
         )
 
-    def _build_async_sample(self, gen_id: int) -> Sample:
-        """Consume one data batch and build the request Sample for ``gen_id``."""
-        return self._build_request_sample(self.data_source.get_samples(self.batch_size), gen_id)
-
-    def _score_completed(self, gen_id: int, completed: Sample) -> List[Sample]:
-        """Score a completed Sample and split it into tree-complete groups.
-
-        Runs at reap time inside the engine. Scoring must precede
-        ``_drop_decoded`` (the reward reads the decoded primitive). Keyed by
-        ``gen_id`` so media panels behave like the old path. The filled
-        ``Sample`` is self-contained (it carries its input Parts).
-        """
-        scored = self.reward.score_and_attach(completed)
-        self._drop_decoded(scored, rollout_id=gen_id)
-        return scored.split()
-
     def _advantage_and_train(
         self,
         sample: Sample,
@@ -242,9 +224,17 @@ class AsyncARTrainer(ARTrainer):
         if self.balance_shards:
             train_part = part.balance_shards(self._train_devices)
         result = self.stack.train_track(train_part, training_progress=float(training_progress))
-        self._control.record_optimizer_updates(result.optimizer_updates)
+        self._train_version += result.optimizer_updates
+        self._batches_since_sync += 1
         if extra_metrics is not None:
-            extra_metrics.update(self._control.train_metrics(result.optimizer_updates))
+            extra_metrics.update(
+                training_version_metrics(
+                    train_version=self._train_version,
+                    published_version=self._rollout_manager.published_version,
+                    optimizer_updates=result.optimizer_updates,
+                    batches_since_sync=self._batches_since_sync,
+                )
+            )
         self.wandb_logger.log_rollout_step(
             rollout_id,
             result,
@@ -265,135 +255,16 @@ class AsyncARTrainer(ARTrainer):
         load_dir: Optional[str] = None,
         save_mode: str = "full",
     ) -> None:
-        start_rollout = self.maybe_load_checkpoint(load_dir, num_rollouts=num_rollouts)
-        resumed = bool(load_dir)
-        train_version = unwrap_replicated_int(
-            self.backend.get_optimizer_step_count(),
-            name="backend optimizer step count",
-        )
-        self._control.restore(train_version)
-        for _ in range(start_rollout):
-            self.data_source.get_samples(self.batch_size)
-        self._init_wandb(
+        self._train_async_loop(
             num_rollouts=num_rollouts,
-            extra={
-                "adv_normalization_scope": self.adv_normalization_scope,
-                "max_inflight": self._max_inflight,
-                "weight_sync_interval": self._control.weight_sync_interval,
-                "max_staleness": self._control.max_staleness,
-                "staleness_budget": self._control.staleness_budget,
-                "num_updates_per_batch": self._control.num_updates_per_batch,
-                "max_publication_gap_batches": max_publication_gap_batches(
-                    self._control,
-                    eval_interval=self.eval_interval,
-                    save_interval=save_interval,
-                ),
-            },
-        )
-        # Not in __init__: save_interval arrives with train() and clamps the publication interval.
-        log_admission_notes(
-            self._control,
-            max_inflight=self._max_inflight,
-            eval_interval=self.eval_interval,
             save_interval=save_interval,
+            save_dir=save_dir,
+            load_dir=load_dir,
+            save_mode=save_mode,
         )
 
-        self._async_engine = AsyncBatchRolloutEngine(
-            self.rollout,
-            process_completion=self._score_completed,
-            groups_per_batch=self.batch_size,
-            start_gen_id=start_rollout,
-        )
+    def _async_wandb_extra(self) -> Dict[str, object]:
+        return {"adv_normalization_scope": self.adv_normalization_scope}
 
-        if resumed or self.eval_interval > 0:
-            self._control.sync_rollout(self._async_engine, self.rollout, self.weight_sync, force=True)
-        if self.eval_interval > 0:
-            self.evaluate(rollout_id=-1)
-
-        try:
-            for rollout_id in range(start_rollout, num_rollouts):
-                t0 = time.perf_counter()
-                hard_boundary = next_hard_boundary(
-                    rollout_id,
-                    num_rollouts=num_rollouts,
-                    eval_interval=self.eval_interval,
-                    save_interval=save_interval,
-                )
-                batch = self._next_rollout_batch(
-                    rollout_id,
-                    num_rollouts=num_rollouts,
-                    hard_boundary=hard_boundary,
-                )
-                sample = Sample.concat(batch.groups)
-                training_progress = rollout_id / max(1, num_rollouts - 1)
-                result, mean_reward = self._advantage_and_train(
-                    sample,
-                    training_progress=training_progress,
-                    rollout_id=rollout_id,
-                    t0=t0,
-                    extra_metrics=self._control.output_metrics(batch.output_version),
-                )
-                self.wandb_logger.log_progress(rollout_id, num_rollouts, result, mean_reward, logger=logger)
-
-                step = rollout_id + 1
-                eval_due = self.eval_interval > 0 and step % self.eval_interval == 0
-                save_due = save_interval > 0 and (step % save_interval == 0 or step >= num_rollouts)
-                sync_due = step < num_rollouts and self._control.publication_due
-                if eval_due or save_due or sync_due:
-                    self._control.sync_rollout(self._async_engine, self.rollout, self.weight_sync)
-
-                if eval_due:
-                    self.evaluate(rollout_id=rollout_id)
-                if save_due:
-                    self.maybe_save_checkpoint(
-                        rollout_id,
-                        num_rollouts,
-                        save_interval=save_interval,
-                        save_dir=save_dir,
-                        save_mode=save_mode,
-                    )
-        finally:
-            active_exception = sys.exc_info()[0] is not None
-            try:
-                self._async_engine.quiesce()
-            except Exception:
-                if not active_exception:
-                    raise
-                logger.exception("Failed to drain in-flight generations during trainer teardown")
-            finally:
-                self._finish_wandb()
-
-    def _next_rollout_batch(
-        self,
-        rollout_id: int,
-        *,
-        num_rollouts: int,
-        hard_boundary: int,
-    ) -> RolloutBatch:
-        """Reap, launch, and consume one FIFO train batch; reaping first frees the slot admission needs to overlap."""
-        engine = self._async_engine
-        while True:
-            engine.poll()
-            slots = self._control.launch_slots(
-                inflight_count=engine.inflight_count,
-                ready_count=engine.ready_count,
-                max_inflight=self._max_inflight,
-                trained_batches=rollout_id,
-                num_rollouts=num_rollouts,
-                hard_boundary=hard_boundary,
-            )
-            for _ in range(slots):
-                engine.submit(
-                    self._build_async_sample(engine.next_gen_id),
-                    output_version=self._control.published_version,
-                )
-            batch = engine.pop_next_batch(
-                train_version=self._control.train_version,
-                staleness_budget=self._control.staleness_budget,
-            )
-            if batch is not None:
-                return batch
-            if engine.inflight_count:
-                engine.wait_oldest()
-            else:
-                raise RuntimeError("async rollout queue is empty and the staleness budget admits no new generation")
+    def _boundary_evaluate(self, rollout_id: int, *, initial: bool) -> None:
+        self.evaluate(rollout_id=-1 if initial else rollout_id)
