@@ -45,8 +45,9 @@ wrong objective.
   AR and diffusion Parts.
 - **The engines.** `trainside` (in-process — the train actor's pipeline *is* the
   sampler), `sglang_diffusion` (dedicated diffusion), `sglang` (dedicated AR), `vllm_omni`
-  (dedicated; HI3 / SD3 / HunyuanVideo), and `composed` (chains an AR child + a
-  diffusion child for prompt enhancement) are the five single-turn engines.
+  (dedicated; HI3 / SD3 / HunyuanVideo), `fastvideo` (in-process accelerated video
+  sampling), and `composed` (chains an AR child + a
+  diffusion child for prompt enhancement) are the six single-turn engines.
   `agentic` wraps one of them with an environment to produce multi-turn
   trajectories. Each diffusion engine consumes the Part's pinned sigmas verbatim,
   and dedicated engines regenerate `x_T` from the recipe, so two engines start a
@@ -75,6 +76,36 @@ concurrent callers if it should serve as an agentic inner, else serialized
 internally — and dispatch `generate` with `DP_SCATTER`). A dedicated engine also
 implements its weight-receive method and a matching `sync:` handler in
 `../distributed/weight_sync`.
+
+## Engine anatomy, and adding a model to an existing engine
+
+Engine dirs come in two tiers. **Local engines** (`trainside`, `fastvideo`,
+`composed`, `agentic`) are just `config.py` + `engine.py`. **Dedicated-server
+engines** (`sglang`, `sglang_diffusion`, `vllm_omni`) share a standard anatomy:
+`config.py` + `engine.py` + `adapters/` (per-model wire-format translation) +
+`backends/` (server process management) + `utils/` + `weight_sync.py`, plus a
+runtime-patch dir for the pinned upstream (`sglang_diffusion/_patches/`,
+`vllm_omni/patches/` — the naming difference is historical; don't churn it).
+`vllm_omni` additionally carries worker-subprocess code (`pipelines/`, `worker/`,
+`stage_configs/`).
+
+Model onboarding is per-engine, and the adapter file is usually **not** the whole
+change surface:
+
+- **`sglang` (AR/VLM):** add `adapters/<model>.py` overriding `TextAdapter` steps,
+  register with `@register_adapter("<model_family>")`, and import it in
+  `adapters/__init__.py` (registration fires on import).
+- **`sglang_diffusion`:** the same adapter + registration + `adapters/__init__.py`
+  import, **plus** — if the model's conditions add new tensor fields that must
+  cross the wire — an entry in `_COND_FIELDS` in `_patches/patch_conditions.py`
+  (the transport allowlist; forgetting it silently drops the field), and hijack
+  wiring in `_patches/hijack.py` if the model needs a new upstream patch. Every
+  model onboarded so far has touched shared `_patches/` files; expect reviewers to
+  check those edits against the pinned upstream source.
+- **`vllm_omni`:** an `adapters/<family>.py` binder (keyed by modality), a
+  worker-side `pipelines/<model>/pipeline.py` (worker-subprocess-only imports), a
+  `stage_configs/<model>_*_rl.yaml`, and — if the AR/DiT worker needs new
+  behavior — a `worker/` extension or a `patches/compat_<model>.py`.
 
 ## Gotchas
 

@@ -144,24 +144,17 @@ For causal-LM or multimodal AR paths:
 - Expose `trainable_module()` when training-side LoRA/FSDP injection needs the wrapped transformer root.
 - Use `ARSamplingParams` for common generation controls and a package-specific params dataclass only for model-specific knobs.
 
-## Tests To Add
+## What To Verify
 
-Prefer small CPU tests with fakes or monkeypatches rather than loading real checkpoints:
+There is no committed test tree (removed by policy in #99/#267 — do not recreate it under any name). Instead, write **one-off verification harnesses** in a scratch directory outside the repo, run them, and quote the exact commands plus results in the PR's Test Plan (per the CLAUDE.md verification-harness rule). Prefer small CPU harnesses with fakes or monkeypatches rather than loading real checkpoints.
 
-- `tests/models/test_<model>_conditions.py`: `from_dict` / `to_dict` round trips, optional slots, wrong-typed slot errors, and missing required slot errors. Follow `tests/models/test_sd3_conditions.py` and `tests/models/test_hunyuan_image3_conditions.py`.
-- `tests/models/test_<model>_diffusion_step_<topic>.py`: CFG batching, timestep scaling, masks, vision kwargs, and private transformer kwargs using fakes. Follow the WAN21 diffusion-step tests.
-- `tests/models/test_<model>_pipeline.py` when pipeline wiring changed: construct fake stages, call `generate(sample)`, and assert lineage preservation, generation-Part conditions/segment/primitives, and pinned-sigma validation.
-- AR models: add or adapt `tests/test_qwen3_ar_stage.py`-style tests for generation and replay alignment.
-- Shared condition or stage behavior: update `tests/types/test_conditions.py` or `tests/models/test_stages.py` only when shared contracts changed.
-- Config registration and instantiation: use the patterns in `tests/config/test_config_registration.py` and `tests/config/test_config_instantiate.py` when adding Hydra config behavior.
+Cover the same targets the old test suite did:
 
-Run targeted tests first, then broaden if shared condition, stage, or pipeline behavior changed:
-
-```bash
-pytest tests/models/test_<model>_conditions.py tests/models/test_<model>_diffusion_step_*.py tests/models/test_stages.py tests/types/test_conditions.py
-```
-
-Adjust the command to real files before running. If the model is AR-only or pipeline-only, replace diffusion-step tests with the relevant AR or pipeline tests.
+- **Conditions**: `from_dict` / `to_dict` round trips, optional slots, wrong-typed slot errors, and missing required slot errors.
+- **Diffusion step**: CFG batching (uncond+cond in one transformer call), timestep scaling, masks, vision kwargs, and private transformer kwargs, using fake transformers.
+- **Pipeline wiring**: construct fake stages, call `generate(sample)`, and assert lineage preservation, generation-Part conditions/segment/primitives, and pinned-sigma validation (`generate` must raise when `params.sigmas is None`).
+- **AR models**: generation and replay token/log-prob alignment on a tiny fake model.
+- **Recipe resolution**: the recipe-target pre-commit hook validates `_target_` dotpaths; run `SKIP=no-commit-to-branch pre-commit run --from-ref main --to-ref HEAD` before publishing.
 
 ## Review Before Finishing
 
