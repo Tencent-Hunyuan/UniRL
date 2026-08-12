@@ -53,6 +53,21 @@ class EditRewardScorer(BaseScorer):
     ) -> None:
         import os
 
+        # CUDA-13 forward-compat deployments (torch cu130 on an older driver via
+        # cuda-compat) segfault in the Qwen2.5-VL vision conv3d under cuDNN for
+        # real image sizes; the native conv path is stable and the perf cost is
+        # negligible (conv3d is a tiny fraction of a 7B VLM forward). Opt-in via
+        # env so native-driver deployments keep cuDNN.
+        if os.environ.get("EDITREWARD_DISABLE_CUDNN") == "1":
+            torch.backends.cudnn.enabled = False
+            # cu130 forward-compat also segfaults inside the cuDNN SDPA attention
+            # kernel (cudnnCreate -> _cudnn_attention_forward); steer SDPA to a
+            # non-cuDNN backend (flash / mem-efficient / math).
+            try:
+                torch.backends.cuda.enable_cudnn_sdp(False)
+            except Exception:
+                pass
+
         from reward_service.scorers._editreward import EditRewardInferencer
 
         self._target_device = device if torch.cuda.is_available() else "cpu"

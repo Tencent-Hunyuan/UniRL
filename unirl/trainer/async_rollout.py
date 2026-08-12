@@ -6,6 +6,7 @@ import logging
 import time
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
+from unirl.reward.async_dispatch import chain_reward
 from unirl.rollout.manager import (
     RolloutManager,
     keep_within_lag,
@@ -191,9 +192,21 @@ class AsyncRolloutTrainerMixin:
         raise NotImplementedError
 
     def _score_completed(self, rollout_id: int, completed: "Sample") -> "Sample":
-        scored = self.reward.score_and_attach(completed)
-        self._drop_decoded(scored, rollout_id=rollout_id)
-        return scored
+        if getattr(self, "_async_reward", False):
+            if completed.parts[-1].rewards is None:
+                raise RuntimeError("async reward pipeline returned a completed group without attached rewards")
+            self._drop_decoded(completed, rollout_id=rollout_id)
+            return completed
+        for attempt in range(2):
+            try:
+                scored = self.reward.score_and_attach(completed)
+                self._drop_decoded(scored, rollout_id=rollout_id)
+                return scored
+            except Exception:
+                if attempt:
+                    raise
+                logger.warning("reward scoring failed for rollout %d; retrying the same completed batch", rollout_id)
+        raise AssertionError("unreachable")
 
     def _train_async_loop(
         self,
@@ -230,7 +243,18 @@ class AsyncRolloutTrainerMixin:
 
         self._next_generation_id = start_rollout
         engine_slots = self.rollout.engine_slots
-        launchers = [lambda sample, slot=slot: slot.launch("generate_on_slot", sample) for slot in engine_slots]
+        if getattr(self, "_async_reward", False):
+            if self.reward is None:
+                raise ValueError("async_reward=true requires a configured `reward:` service")
+            launchers = [
+                lambda sample, slot=slot: chain_reward(
+                    slot.launch("generate_on_slot", sample),
+                    self.reward,
+                )
+                for slot in engine_slots
+            ]
+        else:
+            launchers = [lambda sample, slot=slot: slot.launch("generate_on_slot", sample) for slot in engine_slots]
         self._rollout_manager = RolloutManager(
             self.rollout,
             launchers=launchers,

@@ -31,8 +31,10 @@ class DevicePool:
         tq_handoff: Optional[dict] = None,
         worker_max_concurrency: int | Sequence[int] = 1,
     ) -> None:
-        if num_devices % devices_per_node != 0:
-            raise ValueError(f"num_devices ({num_devices}) must be divisible by devices_per_node ({devices_per_node})")
+        if num_devices <= 0:
+            raise ValueError(f"num_devices must be positive, got {num_devices}")
+        if devices_per_node <= 0:
+            raise ValueError(f"devices_per_node must be positive, got {devices_per_node}")
         self.num_devices = num_devices
         self.devices_per_node = devices_per_node
         self.workers_per_device = workers_per_device
@@ -105,11 +107,15 @@ class DevicePool:
             self._setup_nccl()
 
     def _create_placement_groups(self) -> None:
-        """Create one STRICT_PACK PlacementGroup per node."""
-        num_nodes = self.num_devices // self.devices_per_node
+        """Create one STRICT_PACK PlacementGroup per requested node slice."""
         extra_cpu = 1 if self.transport_kind in ("gpu_store", "gpu") else 0
-        bundles = [{"GPU": 1, "CPU": self.workers_per_device + extra_cpu} for _ in range(self.devices_per_node)]
-        pgs = [placement_group(bundles, strategy="STRICT_PACK") for _ in range(num_nodes)]
+        pgs = []
+        remaining = self.num_devices
+        while remaining > 0:
+            node_devices = min(self.devices_per_node, remaining)
+            bundles = [{"GPU": 1, "CPU": self.workers_per_device + extra_cpu} for _ in range(node_devices)]
+            pgs.append(placement_group(bundles, strategy="STRICT_PACK"))
+            remaining -= node_devices
         ray.get([pg.ready() for pg in pgs])
         self._pgs = pgs
 

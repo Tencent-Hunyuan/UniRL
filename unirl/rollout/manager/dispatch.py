@@ -25,7 +25,12 @@ class _PendingUnit:
 
 
 class RolloutPool:
-    """Background dispatch thread keeping every launcher filled up to its capacity."""
+    """Background dispatch thread keeping every launcher filled up to its capacity.
+
+    A pending call may expose ``capacity_ready()`` to release its launcher before
+    its final ``ready()`` result. This lets generation lanes refill while chained
+    reward work remains in flight.
+    """
 
     _PROBE_INTERVAL_S = 0.01
 
@@ -47,6 +52,7 @@ class RolloutPool:
 
         self._queue: Deque[tuple[int, "Sample"]] = deque()
         self._running: List[_PendingUnit] = []
+        self._waiting: List[_PendingUnit] = []
         self._completed: Deque[_PendingUnit] = deque()
         self._reserved = [0] * len(self._launchers)
         self._next_sequence = 0
@@ -89,7 +95,7 @@ class RolloutPool:
 
     def drain(self) -> List[_PendingUnit]:
         with self._condition:
-            while (self._running or any(self._reserved)) and self._failure is None:
+            while (self._running or self._waiting or any(self._reserved)) and self._failure is None:
                 self._condition.wait()
             self._raise_if_failed()
             completed = list(self._completed)
@@ -100,14 +106,14 @@ class RolloutPool:
         """Run an isolated task prefix to completion while the pool is otherwise idle."""
         with self._condition:
             self._raise_if_unavailable()
-            if self._queue or self._running or self._completed or any(self._reserved):
+            if self._queue or self._running or self._waiting or self._completed or any(self._reserved):
                 raise RuntimeError("run_to_completion requires an idle RolloutPool")
             for task in tasks:
                 self._queue.append((self._next_sequence, task))
                 self._next_sequence += 1
             self._paused = False
             self._condition.notify_all()
-            while (self._queue or self._running or any(self._reserved)) and self._failure is None:
+            while (self._queue or self._running or self._waiting or any(self._reserved)) and self._failure is None:
                 self._condition.wait()
             self._raise_if_failed()
             self._paused = True
@@ -119,13 +125,13 @@ class RolloutPool:
     def live(self) -> bool:
         with self._condition:
             self._raise_if_failed()
-            return bool(self._queue or self._running or self._completed or any(self._reserved))
+            return bool(self._queue or self._running or self._waiting or self._completed or any(self._reserved))
 
     @property
     def counts(self) -> tuple[int, int]:
         with self._condition:
             self._raise_if_failed()
-            inflight = len(self._queue) + len(self._running) + sum(self._reserved)
+            inflight = len(self._queue) + len(self._running) + len(self._waiting) + sum(self._reserved)
             return inflight, len(self._completed)
 
     def close(self) -> None:
@@ -138,14 +144,15 @@ class RolloutPool:
             self._condition.notify_all()
         self._thread.join()
         with self._condition:
-            pending = [*self._running, *self._completed]
+            pending = [*self._running, *self._waiting, *self._completed]
             self._running.clear()
+            self._waiting.clear()
             self._completed.clear()
         for unit in pending:
             unit.pending.discard_on_completion()
 
     def _has_remote_work(self) -> bool:
-        return bool(self._queue or self._running or any(self._reserved))
+        return bool(self._queue or self._running or self._waiting or any(self._reserved))
 
     def _raise_if_unavailable(self) -> None:
         self._raise_if_failed()
@@ -165,7 +172,8 @@ class RolloutPool:
                     return
                 plan = self._plan_launches()
                 running = list(self._running)
-                if not plan and not running:
+                waiting = list(self._waiting)
+                if not plan and not running and not waiting:
                     self._condition.wait()
                     continue
 
@@ -173,21 +181,41 @@ class RolloutPool:
                 return
 
             try:
-                ready = [unit for unit in running if unit.pending.ready()]
+                released = []
+                ready = []
+                for unit in running:
+                    capacity_probe = getattr(unit.pending, "capacity_ready", None)
+                    if capacity_probe is None:
+                        if unit.pending.ready():
+                            ready.append(unit)
+                    elif capacity_probe():
+                        if unit.pending.ready():
+                            ready.append(unit)
+                        else:
+                            released.append(unit)
+                ready.extend(unit for unit in waiting if unit.pending.ready())
             except BaseException as exc:
                 self._record_failure(exc)
                 return
-            if not ready:
+            if not released and not ready:
                 if not plan:
                     with self._condition:
                         self._condition.wait(timeout=self._PROBE_INTERVAL_S)
                 continue
 
             with self._condition:
-                for unit in ready:
+                for unit in released:
                     if unit not in self._running:
                         continue
                     self._running.remove(unit)
+                    self._waiting.append(unit)
+                for unit in ready:
+                    if unit in self._running:
+                        self._running.remove(unit)
+                    elif unit in self._waiting:
+                        self._waiting.remove(unit)
+                    else:
+                        continue
                     self._completed.append(unit)
                 self._condition.notify_all()
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
 
@@ -69,8 +70,18 @@ class BaseRolloutEngine(Remote, ABC):
         """Synchronously fill and return one request ``Sample``; each concrete contract owns its dispatch mode."""
 
     def generate_on_slot(self, sample: Sample) -> Sample:
-        """Undecorated per-engine entry point for driver-side lane dispatch."""
-        return self.generate(sample)
+        """Undecorated per-engine entry point for driver-side lane dispatch.
+
+        Opt-in (``UNIRL_LANE_CPU_MAP=1``): move generated CUDA tensors to CPU so
+        driver-local or cross-slab reward consumers can resolve them through the
+        global object store.
+        """
+        result = self.generate(sample)
+        if os.environ.get("UNIRL_LANE_CPU_MAP") != "1":
+            return result
+        from unirl.distributed.tensor.ref import map_tree
+
+        return map_tree(result, lambda value: value.cpu() if isinstance(value, torch.Tensor) and value.is_cuda else value)
 
     def abort(self, ids: Optional[List[str]] = None) -> List[Sample]:
         """Best-effort cancel of in-flight generation; return any partials. Default no-op."""
