@@ -1,4 +1,4 @@
-"""Typed text and TMRoPE video conditions for Qwen3-Omni."""
+"""Typed text and multimodal TMRoPE conditions for Qwen3-Omni."""
 
 from __future__ import annotations
 

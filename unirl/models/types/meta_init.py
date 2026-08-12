@@ -51,6 +51,50 @@ def capture_init_state(model: nn.Module) -> dict:
     return {"buffers": buffers, "attrs": attrs}
 
 
+def _canonical_named_modules(model: nn.Module) -> dict[str, nn.Module]:
+    """Index modules by names from before activation-checkpoint wrapping.
+
+    Activation checkpointing and PEFT both interpose module shells after the
+    capture: ``CheckpointWrapper`` moves a block below
+    ``_checkpoint_wrapped_module`` and a tuner layer moves the original module
+    below ``base_layer``. Traverse the actual wrappers structurally so a real
+    child that merely has either reserved-looking name is left untouched.
+    """
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
+
+    def unwrap(module: nn.Module) -> nn.Module:
+        seen = set()
+        while id(module) not in seen:
+            seen.add(id(module))
+            if isinstance(module, CheckpointWrapper):
+                module = module._checkpoint_wrapped_module
+                continue
+            get_base_layer = getattr(module, "get_base_layer", None)
+            if callable(get_base_layer):
+                base_layer = get_base_layer()
+                if isinstance(base_layer, nn.Module) and base_layer is not module:
+                    module = base_layer
+                    continue
+            break
+        return module
+
+    modules: dict[str, nn.Module] = {}
+    visited = set()
+
+    def visit(module: nn.Module, name: str) -> None:
+        module = unwrap(module)
+        if id(module) in visited:
+            return
+        visited.add(id(module))
+        modules[name] = module
+        for child_name, child in module.named_children():
+            child_fqn = f"{name}.{child_name}" if name else child_name
+            visit(child, child_fqn)
+
+    visit(model, "")
+    return modules
+
+
 def restore_init_state(model: nn.Module, captured: Optional[dict]) -> int:
     """Copy a :func:`capture_init_state` snapshot back onto a materialized module.
 
@@ -62,13 +106,31 @@ def restore_init_state(model: nn.Module, captured: Optional[dict]) -> int:
         return 0
     buffers = captured.get("buffers", {})
     attrs = captured.get("attrs", {})
-    modules = dict(model.named_modules())
+    modules = _canonical_named_modules(model)
+    buffer_targets = []
+    attr_targets = []
+    missing = []
     for fqn, value in buffers.items():
         mod_name, _, buf_name = fqn.rpartition(".")
-        owner = modules.get(mod_name) if mod_name else model
+        owner = modules.get(mod_name)
         if owner is None or not hasattr(owner, buf_name):
+            missing.append(fqn)
             continue
         live = getattr(owner, buf_name)
+        buffer_targets.append((fqn, live, value))
+    for (mod_name, attr), value in attrs.items():
+        owner = modules.get(mod_name)
+        if owner is None or attr not in vars(owner):
+            missing.append(f"{mod_name}.{attr}" if mod_name else attr)
+            continue
+        attr_targets.append((owner, attr, value))
+    if missing:
+        raise RuntimeError(
+            "restore_init_state: could not resolve captured tensor owner(s) after model wrapping; "
+            f"missing {len(missing)} entry(s): {missing[:8]}"
+        )
+
+    for fqn, live, value in buffer_targets:
         tgt = live.to_local() if hasattr(live, "to_local") else live
         src = value.to(device=tgt.device, dtype=tgt.dtype)
         if tuple(tgt.shape) != tuple(src.shape):
@@ -77,11 +139,9 @@ def restore_init_state(model: nn.Module, captured: Optional[dict]) -> int:
                 f"does not match live local shape {tuple(tgt.shape)}."
             )
         tgt.copy_(src)
-    for (mod_name, attr), value in attrs.items():
-        owner = modules.get(mod_name)
-        if owner is not None:
-            owner.__dict__[attr] = value
-    n = len(buffers) + len(attrs)
+    for owner, attr, value in attr_targets:
+        owner.__dict__[attr] = value
+    n = len(buffer_targets) + len(attr_targets)
     if n:
         logger.info("restore_init_state: recovered %d non-persistent buffer(s) + plain attr(s)", n)
     return n

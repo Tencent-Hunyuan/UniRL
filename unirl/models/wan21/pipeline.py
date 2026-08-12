@@ -40,7 +40,7 @@ from .config import WAN21PipelineConfig
 from .diffusion import WAN21DiffusionStage, WAN21DiffusionStep
 from .image_encode import WAN21ImageLatentEncodeStage
 from .text_embed import WAN21TextEmbedStage
-from .vae import WAN21VAEDecodeStage
+from .vae import WAN21VAEDecodeStage, WANVideoLatentEncodeStage
 
 
 class WAN21Pipeline(Pipeline):
@@ -184,6 +184,20 @@ class WAN21Pipeline(Pipeline):
             negatives = Texts(texts=[""] * len(texts.texts))
         negative_text_cond = self.text_embed.embed(negatives) if negatives is not None else None
         return WAN21Conditions(text=text_cond, negative_text=negative_text_cond)
+
+    def build_video_encoder(
+        self,
+        *,
+        num_frames: int,
+        height: int,
+        width: int,
+    ) -> WANVideoLatentEncodeStage:
+        return WANVideoLatentEncodeStage(
+            self.bundle,
+            num_frames=num_frames,
+            height=height,
+            width=width,
+        )
 
     def generate(self, sample: Sample) -> Sample:
         """Run WAN 2.1 T2V (or I2V) end-to-end, filling the frontier (pre-forked) gen Part.

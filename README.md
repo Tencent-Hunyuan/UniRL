@@ -81,6 +81,7 @@ dimension; all listed models are supported (✅).
 | LTX-Video-2.3 | Video diffusion | Text → Audio + Video | ✅ |
 | Qwen-VL | Vision-language AR | Text + Image → Text | ✅ |
 | Qwen3 | LLM AR | Text → Text | ✅ |
+| Qwen3-Omni Thinker | Omni-modality | Text/Image/Audio/Video → Text | ✅ |
 | Prompt-Enhancer | LLM + diffusion | Text → Text → Image | ✅ |
 | HunyuanImage3 | Unified AR + diffusion | Text → Image | ✅ |
 | Bagel | Unified AR + diffusion | Text / Text + Image → Image | ✅ |

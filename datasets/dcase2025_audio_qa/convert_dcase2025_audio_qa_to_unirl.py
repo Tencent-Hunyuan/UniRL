@@ -17,6 +17,8 @@ from typing import Any, Iterable
 
 LETTERS = "ABCD"
 DEFAULT_OUT_DIR = Path("datasets/dcase2025_audio_qa")
+# Separate default: the two modes write different prompts, so one must not overwrite the other.
+DEFAULT_SUPERVISED_OUT_DIR = Path("datasets/dcase2025_audio_qa_sft")
 
 
 def _answer_letter(answer: Any, choices: list[str]) -> str | None:
@@ -43,6 +45,15 @@ def _build_prompt(question: str, choices: list[str]) -> str:
         f"{question}\n\n{options}\n\n"
         "Reason step by step, then provide the final answer in the exact format: "
         "The answer is [X]."
+    )
+
+
+def _build_sft_prompt(question: str, choices: list[str]) -> str:
+    options = "\n".join(f"{letter}. {choice}" for letter, choice in zip(LETTERS, choices))
+    return (
+        "Listen to the audio carefully, then answer the following multiple-choice question:\n\n"
+        f"{question}\n\n{options}\n\n"
+        "Provide the final answer in the exact format: The answer is [X]."
     )
 
 
@@ -86,6 +97,7 @@ def _convert_split(
     *,
     source_split: str,
     output_name: str,
+    supervised: bool = False,
 ) -> Counter[str]:
     paths = sorted(source_dir.glob(f"{source_split}-*.parquet"))
     if not paths:
@@ -126,7 +138,7 @@ def _convert_split(
 
             source_id = str(row.get("id") or audio_name).strip()
             record = {
-                "prompt": _build_prompt(question, choices),
+                "prompt": (_build_sft_prompt if supervised else _build_prompt)(question, choices),
                 "prompt_id": f"dcase2025:{source_split}:{source_id}:{stats['source_rows']}",
                 "media_refs": [
                     {
@@ -147,6 +159,8 @@ def _convert_split(
                     "source_file": source_path.name,
                 },
             }
+            if supervised:
+                record["response"] = f"The answer is {letter}."
             output.write(json.dumps(record, ensure_ascii=False) + "\n")
             stats["written_rows"] += 1
 
@@ -154,7 +168,7 @@ def _convert_split(
     return stats
 
 
-def convert(snapshot: Path, out_dir: Path) -> dict[str, Any]:
+def convert(snapshot: Path, out_dir: Path, *, supervised: bool = False) -> dict[str, Any]:
     snapshot = snapshot.expanduser().resolve(strict=True)
     out_dir = out_dir.expanduser().resolve()
     source_dir = snapshot / "data"
@@ -163,11 +177,27 @@ def convert(snapshot: Path, out_dir: Path) -> dict[str, Any]:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     split_stats = {
-        "train": _convert_split(source_dir, out_dir, source_split="train", output_name="train.jsonl"),
-        "val": _convert_split(source_dir, out_dir, source_split="test", output_name="val.jsonl"),
+        "train": _convert_split(
+            source_dir,
+            out_dir,
+            source_split="train",
+            output_name="train.jsonl",
+            supervised=supervised,
+        ),
+        "val": _convert_split(
+            source_dir,
+            out_dir,
+            source_split="test",
+            output_name="val.jsonl",
+            supervised=supervised,
+        ),
     }
     manifest = {
-        "format": "UniRL prompt-first standalone-audio MCQA JSONL",
+        "format": (
+            "UniRL supervised standalone-audio MCQA JSONL"
+            if supervised
+            else "UniRL prompt-first standalone-audio MCQA JSONL"
+        ),
         "source": "gijs/dcase2025-audio-qa",
         "source_snapshot": snapshot.name,
         "split_mapping": {"train": "train", "val": "test"},
@@ -184,9 +214,20 @@ def convert(snapshot: Path, out_dir: Path) -> dict[str, Any]:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--snapshot", type=Path, required=True, help="local Hugging Face dataset snapshot")
-    parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
+    parser.add_argument(
+        "--out-dir",
+        type=Path,
+        default=None,
+        help=f"default: {DEFAULT_OUT_DIR} (RL) or {DEFAULT_SUPERVISED_OUT_DIR} (--supervised)",
+    )
+    parser.add_argument(
+        "--supervised",
+        action="store_true",
+        help="include response targets and use the SFT-compatible answer prompt",
+    )
     args = parser.parse_args()
-    manifest = convert(args.snapshot, args.out_dir)
+    out_dir = args.out_dir or (DEFAULT_SUPERVISED_OUT_DIR if args.supervised else DEFAULT_OUT_DIR)
+    manifest = convert(args.snapshot, out_dir, supervised=args.supervised)
     print(json.dumps(manifest["stats"], ensure_ascii=False, sort_keys=True))
 
 

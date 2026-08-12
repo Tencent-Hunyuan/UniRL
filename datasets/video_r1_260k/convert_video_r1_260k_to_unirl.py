@@ -1,20 +1,23 @@
-"""Convert Video-R1-260k video multiple-choice rows to UniRL jsonl.
+"""Convert Video-R1-260k image/video multiple-choice rows to UniRL JSONL.
 
-Video paths are resolved under ``--data-root`` and stored as absolute
+Media paths are resolved under ``--data-root`` and stored as absolute
 ``media_refs[].uri`` values. Unzip each source archive before conversion::
 
     ROOT=/path/to/Video-R1-data
-    for d in CLEVRER STAR NeXT-QA PerceptionTest LLaVA-Video-178K General Spatial; do
+    for d in CLEVRER STAR NeXT-QA PerceptionTest LLaVA-Video-178K \
+             Chart General Knowledge Math OCR Spatial; do
       for z in "$ROOT/$d"/*_part*.zip; do [ -f "$z" ] && unzip -o -q "$z" -d "$ROOT/$d"; done
     done
 
-Missing videos are skipped unless ``--keep-missing`` is set. Example::
+Select ``image``, ``video``, or both with ``--modality``. Missing media is
+skipped unless ``--keep-missing`` is set. Example::
 
     python datasets/video_r1_260k/convert_video_r1_260k_to_unirl.py \
         --data-root /path/to/Video-R1-data \
-        --out-dir datasets/video_r1_260k \
-        --sources CLEVRER,STAR,NeXT-QA,PerceptionTest \
-        --max-total 20000 --val-count 200
+        --out-dir datasets/video_r1_260k_image \
+        --modality image \
+        --sources Chart,General,Knowledge,Math,OCR,Spatial \
+        --val-count 1000
 """
 
 from __future__ import annotations
@@ -55,14 +58,22 @@ def _build_prompt(problem: str, options: List[str]) -> str:
     )
 
 
-def _iter_rows(data_root: str, sources: Optional[set], keep_missing: bool):
-    """Yield (source, abs_video_path, prompt, answer) for eligible video-MC rows."""
+def _iter_rows(
+    data_root: str,
+    modality: str,
+    sources: Optional[set],
+    keep_missing: bool,
+):
+    """Yield eligible A-D multiple-choice rows for the selected modality."""
     with open(os.path.join(data_root, "Video-R1-260k.json"), encoding="utf-8") as f:
         data = json.load(f)
 
     stats = collections.Counter()
     for row in data:
-        if row.get("data_type") != "video" or row.get("problem_type") != "multiple choice":
+        row_modality = str(row.get("data_type", ""))
+        if modality != "all" and row_modality != modality:
+            continue
+        if row_modality not in {"image", "video"} or row.get("problem_type") != "multiple choice":
             continue
         rel = str(row.get("path", "")).lstrip("./")
         source = rel.split("/")[0] if rel else ""
@@ -73,13 +84,14 @@ def _iter_rows(data_root: str, sources: Optional[set], keep_missing: bool):
         if answer is None:
             stats["bad_answer"] += 1
             continue
-        abs_path = os.path.join(data_root, rel)
+        abs_path = os.path.abspath(os.path.join(data_root, rel))
         if not keep_missing and not os.path.isfile(abs_path):
             stats[f"missing:{source}"] += 1
             continue
         prompt = _build_prompt(str(row.get("problem", "")), row.get("options") or [])
         stats[f"kept:{source}"] += 1
-        yield source, abs_path, prompt, answer, int(row.get("problem_id", -1))
+        stats[f"kept_modality:{row_modality}"] += 1
+        yield source, row_modality, abs_path, prompt, answer, int(row.get("problem_id", -1))
 
     _iter_rows.last_stats = stats  # type: ignore[attr-defined]
 
@@ -96,28 +108,39 @@ def main() -> None:
     ap.add_argument("--data-root", default=DEFAULT_DATA_ROOT, help="HF snapshot dir (holds Video-R1-260k.json)")
     ap.add_argument("--out-dir", default="datasets/video_r1_260k", help="output dataset dir")
     ap.add_argument(
+        "--modality",
+        choices=("image", "video", "all"),
+        default="video",
+        help="media rows to convert (default: video; all emits a heterogeneous image/video dataset)",
+    )
+    ap.add_argument(
         "--sources",
         default="",
-        help="comma-separated source folders to KEEP (e.g. CLEVRER,STAR,NeXT-QA,PerceptionTest); empty = all",
+        help="comma-separated top-level source folders to KEEP; empty = all",
     )
     ap.add_argument("--max-per-source", type=int, default=0, help="cap rows per source (0 = no cap)")
     ap.add_argument("--max-total", type=int, default=0, help="cap total kept rows (0 = no cap)")
     ap.add_argument("--val-count", type=int, default=200, help="hold out last N (post-shuffle) rows for val.jsonl")
     ap.add_argument("--seed", type=int, default=42, help="shuffle seed (deterministic split)")
-    ap.add_argument("--keep-missing", action="store_true", help="emit rows even if the mp4 is not on disk yet")
+    ap.add_argument("--keep-missing", action="store_true", help="emit rows even if the media file is not on disk yet")
     args = ap.parse_args()
 
     sources = {s.strip() for s in args.sources.split(",") if s.strip()} or None
 
     per_source: Dict[str, List[Dict]] = collections.defaultdict(list)
-    for source, abs_path, prompt, answer, pid in _iter_rows(args.data_root, sources, args.keep_missing):
+    for source, modality, abs_path, prompt, answer, pid in _iter_rows(
+        args.data_root,
+        args.modality,
+        sources,
+        args.keep_missing,
+    ):
         if args.max_per_source and len(per_source[source]) >= args.max_per_source:
             continue
         per_source[source].append(
             {
                 "prompt": prompt,
                 "prompt_id": f"video_r1_260k:{source}:{pid}",
-                "media_refs": [{"modality": "video", "role": "prompt", "uri": abs_path}],
+                "media_refs": [{"modality": modality, "role": "prompt", "uri": abs_path}],
                 "metadata": {"answer": answer},
             }
         )
@@ -127,14 +150,18 @@ def main() -> None:
     missing = {k.split(":", 1)[1]: v for k, v in stats.items() if k.startswith("missing:")}
     print(f"[stats] kept per source: {dict(sorted(kept.items(), key=lambda kv: -kv[1]))}")
     if missing:
-        print(f"[stats] skipped (mp4 not on disk) per source: {dict(sorted(missing.items(), key=lambda kv: -kv[1]))}")
+        print(f"[stats] skipped (media not on disk) per source: {dict(sorted(missing.items(), key=lambda kv: -kv[1]))}")
         print("        → run the unzip step (see module docstring) or pass --keep-missing.")
     print(f"[stats] bad/no answer: {stats.get('bad_answer', 0)}")
+    print(
+        "[stats] kept per modality: "
+        f"{dict(sorted((k.split(':', 1)[1], v) for k, v in stats.items() if k.startswith('kept_modality:')))}"
+    )
 
     rows: List[Dict] = [r for rs in per_source.values() for r in rs]
     if not rows:
         raise SystemExit(
-            "No usable video multiple-choice rows found. The videos are likely still "
+            f"No usable {args.modality} multiple-choice rows found. The media is likely still "
             "zipped/downloading — unzip the per-source archives first (see docstring)."
         )
 
