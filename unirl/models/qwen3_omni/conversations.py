@@ -13,8 +13,8 @@ from typing import Any, Dict, List, Optional
 
 from unirl.models.types.conversations import (
     Conversation,
-    _group_consecutive_roles,
-    _system_prefix,
+    group_consecutive_roles,
+    system_prefix,
 )
 from unirl.types.media import MediaRef, MediaRefs
 from unirl.types.primitives import Audios, Images, Texts, Videos
@@ -80,8 +80,8 @@ def build_omni_messages(
         )
 
     roles = [turn.role for turn in turns]
-    role_groups = _group_consecutive_roles(roles)
-    prefix = _system_prefix(system_instruction, roles)
+    role_groups = group_consecutive_roles(roles)
+    prefix = system_prefix(system_instruction, roles)
     columns: List[List[Any]] = []
     for turn in turns:
         if isinstance(turn.content, Texts):

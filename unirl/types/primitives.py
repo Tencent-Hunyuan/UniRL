@@ -53,6 +53,7 @@ import torch
 
 from unirl.distributed.tensor.batch import Batch, FieldKind, concat_field, field, packed_field
 from unirl.types.media import MediaRefs
+from unirl.types.tool_calls import ToolCalls
 
 
 @dataclass
@@ -352,14 +353,15 @@ def _cumsum(values: List[int]) -> List[int]:
     return out
 
 
-PrimitiveValue = Union[Texts, Images, Videos, Audios, MediaRefs]
+PrimitiveValue = Union[Texts, Images, Videos, Audios, MediaRefs, ToolCalls]
 
 
-def primitive_modality_key(prim: Texts | Images | Videos | Audios | MediaRefs) -> str:
+def primitive_modality_key(prim: PrimitiveValue) -> str:
     """Map a batched primitive to its modality slot key.
 
     ``Texts -> "text"``, ``Images -> "image"``, ``Videos -> "video"``,
-    ``Audios -> "audio"``, ``MediaRefs -> "media"`` — the keying convention shared by
+    ``Audios -> "audio"``, ``MediaRefs -> "media"``, ``ToolCalls -> "tool_calls"``
+    — the keying convention shared by
     ``RewardRequest.primitives`` / ``generated`` and the slots
     :meth:`Sample.conditioning` surfaces. Inverse of a backend's
     ``preferred_input_kind``.
@@ -374,6 +376,8 @@ def primitive_modality_key(prim: Texts | Images | Videos | Audios | MediaRefs) -
         return "audio"
     if isinstance(prim, MediaRefs):
         return "media"
+    if isinstance(prim, ToolCalls):
+        return "tool_calls"
     raise TypeError(f"primitive_modality_key: unknown primitive type {type(prim).__name__!r}")
 
 
@@ -389,6 +393,7 @@ __all__ = [
     "TextAndVideo",
     "Texts",
     "PrimitiveValue",
+    "ToolCalls",
     "Video",
     "Videos",
     "primitive_modality_key",

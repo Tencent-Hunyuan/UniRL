@@ -84,3 +84,34 @@ it is the authoritative bundle / pipeline / stage / conditions contract.
   it's `None`; never build the σ tensor inside `generate`.
 - **CFG empty-negative differs per model** (SD3 `""`, Qwen-Image `" "`) — use the
   model's canonical upstream value or the rollout/replay ratio drifts off 1.0.
+
+## Conversation composition and the canonical trace format
+
+Multi-turn / agent conversation data has one canonical external format and one
+composition layer; every path (rollout render, replay, trace SFT) goes through
+them.
+
+- **Canonical external format: OpenAI-style messages.** Manifests and converted
+  agent traces are `{"messages": [{role, content|null, tool_calls}], "tools":
+  [...]}` — the industry trainer-facing shape (OpenAI/HF/TRL). Per-source
+  converters (`datasets/<name>/convert_*.py`) may accept anything; what they
+  *emit* is this schema, unextended. RL metadata (rewards, outcome labels,
+  trace ids) rides as sibling fields next to `messages`, never inside it.
+  `tool_calls.function.arguments` is normalized to a **dict** at ingest
+  (`normalize_tool_arguments`) — HF chat templates mis-render the OpenAI
+  JSON-string dialect.
+- **One composition layer: `unirl/models/types/conversations.py`.** Rules that
+  decide how a conversation is assembled — system-instruction precedence, role
+  fusion, structured tool-call emission — live there and only there (Turn-based
+  and message-based dialects side by side; the sglang wire render imports the
+  same helpers). Model chat stages own *encoding* (chat template / processor /
+  Bagel splits), never composition rules.
+- **One system rule, zero stances:** the config `system_instruction` is a
+  default; an explicit `system` turn in the data wins. A path that wants
+  "data is the sole source of truth" leaves `system_instruction` unset in the
+  recipe — never adds a code branch.
+- **Structured tool calls are typed, not regex.** An assistant part carries
+  `unirl.types.tool_calls.ToolCalls` under the `"tool_calls"` primitive key; a tool
+  result pairs back via `Sample.observe(..., tool_call_id=...)`. `Sample.turns()`
+  surfaces both on the `Turn`, and `build_text_messages` /
+  `turns_from_messages` round-trip them to and from OpenAI messages.
