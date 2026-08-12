@@ -3,7 +3,7 @@
 ``WeightSync`` is a plain object the engine constructs over the seam: it takes
 the backend and the LoRA transport choice explicitly and owns ALL sync/LoRA
 state (``_lora_loaded`` / ``_weights_released`` / ``_last_lora_*``). Method
-names mirror the frozen ``synchronous.py`` surface minus ``track_prefix`` (the
+names mirror the frozen ``base.py`` surface minus ``track_prefix`` (the
 engine's forwards absorb that), so a grep for a trainer-side entry point lands
 here. The transports declared are exactly what vllm-omni supports: bucketed
 CUDA-IPC, NCCL (init/transfer/destroy), the SGLang-shape tensor bag, and the
@@ -181,8 +181,8 @@ class WeightSync:
         """The engine released the runtime memory — the worker-side LoRA pool
         is gone until restored. Unlike sglang_diffusion's passive model (the
         next trainer-driven sync re-pushes), this engine actively re-pushes on
-        wake from the cached tensors, so the loaded-intent flag survives the
-        release; only the pool-valid bit flips."""
+        wake from the cached tensors, so the cached adapter intent survives;
+        only the worker-pool validity changes."""
         self._weights_released = True
 
     def restore_lora_after_wake(self) -> None:
@@ -190,11 +190,18 @@ class WeightSync:
 
         sleep(level=1) preserves base weights but LoRA adapters may be
         discarded; re-sending after wake ensures rollout uses the adapted
-        model. Fail-fast on failure: clears the activation flag and raises so
-        the training loop crashes instead of shipping silent base-model
-        rollouts (the caller — the engine's ``wake_up`` — stays offloaded).
+        model. The gate is the CACHE, not ``_lora_loaded``: the cache is the
+        durable "an adapter should be active" intent, while ``_lora_loaded``
+        is only the "currently pushed" state that a failed re-push clears —
+        gating on the flag would make the retry after such a failure return
+        early "successfully" without re-pushing, and generate would silently
+        run base weights. Fail-fast on failure: clears the activation flag
+        and raises so the training loop crashes instead of shipping silent
+        base-model rollouts (the caller — the engine's ``wake_up`` — rolls the
+        engine back to offloaded, or latches an unknown partial transition when
+        even the rollback fails, so ``generate`` refuses either way).
         """
-        if not (self._lora_loaded and self._last_lora_tensors is not None):
+        if self._last_lora_tensors is None:
             self._weights_released = False
             return
         logger.info(

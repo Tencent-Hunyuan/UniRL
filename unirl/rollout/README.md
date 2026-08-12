@@ -2,23 +2,20 @@
 
 > **Where it fits:** the *rollout* step of the loop —
 > **rollout** → reward → advantage → train → sync. In: a request `Sample` from
-> the trainer. Out: a filled `Sample`, or a trajectory `list[Sample]` from the
-> agentic coordinator. Full map: [`../README.md`](../README.md).
+> the trainer. Out: a filled `Sample`. Full map: [`../README.md`](../README.md).
 
 <div align="center">
-  <img src="../../assets/rollout-engines-new.png" alt="UniRL rollout: five single-turn Sample engines plus the agentic trajectory coordinator, selected by _target_, across direct, separate, and colocated deployment modes" width="100%">
+  <img src="../../assets/rollout-engines-new.png" alt="UniRL rollout engines selected by _target_ across direct, separate, and colocated deployment modes" width="100%">
 </div>
 
-*Six engines share one broad ABC: five single-turn engines dispatch
-`generate(sample) → Sample` with `DP_SCATTER`; the agentic coordinator dispatches
-`generate(sample) → list[Sample]` with rank-zero broadcast.*
+*Every rollout engine fills one `Sample`. Agentic scheduling and group assembly live
+in the driver-side rollout manager.*
 
 ## What it is
 
 `unirl.rollout` owns the rollout engines — the box that fills a typed `Sample` by
-running a model pipeline and the SDE step kernels. Single-turn engines return that
-filled `Sample`; the agentic engine coordinates repeated model/environment turns
-and returns a trajectory list. It does not compute reward or loss.
+running a model pipeline and the SDE step kernels. The agentic engine runs the
+model/environment turns for one trajectory. It does not compute reward or loss.
 
 ## Why it exists
 
@@ -35,16 +32,12 @@ wrong objective.
 
 ## How it works
 
-- **One synchronous generation interface.** `BaseRolloutEngine` (`engine/synchronous.py`)
+- **One generation interface.** `BaseRolloutEngine` (`engine/base.py`)
   is a `Remote` whose concrete engines implement synchronous `generate(sample)`;
-  each keeps its native batching/runtime path. Single-turn engines return one
-  `Sample` and dispatch `generate` with `DP_SCATTER`; the agentic coordinator
-  returns a trajectory list with rank-zero broadcast dispatch. Concurrency is
-  threads, not asyncio: the agentic engine drives one trajectory per drain
-  thread, so an engine meant to serve as its inner must make `generate` safe for
-  concurrent callers (the SGLang backends keep concurrent in-flight requests
-  batching together on the runtime; an event loop survives only inside the
-  native backend, where the in-process SRT runtime requires one).
+  each returns one `Sample`. Batch engines dispatch `generate` with `DP_SCATTER`.
+  Agentic `generate` is undecorated because the driver manager addresses one
+  engine slot per trajectory; Ray actor concurrency lets the inner backend batch
+  concurrent calls.
 - **The typed boundary** (`../types/`). A `Sample` is an ordered chain of `Part`s.
   Each Part carries lineage ids, a raw `primitive`, an encoded `segment`, replay
   conditions, sampling params (including the σ schedule), and optional decoded
@@ -63,19 +56,17 @@ wrong objective.
   ratio is 1 on the first update; *separate* — a dedicated engine on its own GPUs
   plus a `sync:` block; *colocate* — a dedicated engine sharing GPUs with train,
   plus offload/onload and `sync:`.
-- **Driver-side async engines** (`engine/asynchronous.py`, the driver-side half next
-  to `engine/synchronous.py`'s worker-side sync contracts). `AsyncBatchRolloutEngine`
-  (batch granularity; non-blocking `Handle.launch_nowait` generations, stamps the
-  synced train version at launch, and exposes completion-order FIFO train batches
-  to `AsyncARTrainer`/`AsyncDiffusionTrainer`) and `AsyncAgenticRolloutEngine`
-  (trajectory granularity over the agentic rank-0
-  coordinator; normalizes the `[0]` unwraps, assembles n-sibling GRPO groups,
-  stamps sync-generation versions at completion, and retains the
-  `drain_freshest`/`pop_evicted` surface used by partial/async agentic trainers).
+- **Driver-side scheduling.** One `manager.RolloutManager` serves batch and
+  agentic trainers. Its progress thread dispatches bounded work and observes
+  readiness; trainer-thread collection resolves results, assembles agentic
+  siblings, and applies the configured filter. Async batch trainers own training
+  progress and publication cadence; the manager owns the published rollout version
+  and preserves completed generations as FIFO batch chunks. `AgenticTrainer` collects
+  one complete barrier batch per step.
 
 **Extending it:** a new single-turn engine adds `engine/<name>/config.py` (a
 `BaseEngineConfig` whose `make_engine(**deps)` lazily imports and builds it) and
-`engine/<name>/engine.py` (subclass `SyncRolloutEngine`, implement
+`engine/<name>/engine.py` (subclass `BaseRolloutEngine`, implement
 synchronous generation over the whole-`Sample` contract — thread-safe for
 concurrent callers if it should serve as an agentic inner, else serialized
 internally — and dispatch `generate` with `DP_SCATTER`). A dedicated engine also
@@ -87,21 +78,17 @@ implements its weight-receive method and a matching `sync:` handler in
 - **Never recompute σ inside an engine** — the generated Part's pinned sigmas are
   the single source of truth; `engine/sigma_verify.py` checks the backend echo (it
   guards the GRPO log-prob ratio).
-- **Single-turn `generate` must dispatch `DP_SCATTER`** — broadcast would return a
-  list of per-worker Samples and break single-Sample consumption. Agentic is the
-  intentional exception: `BROADCAST + RANK_ZERO` returns its trajectory list.
+- **Batch `generate` must dispatch `DP_SCATTER`.** Agentic is the intentional
+  exception: its undecorated method is reached through one `Handle.slot(...)`.
 - **Direct sampling forbids a `sync:` block; dedicated requires one.** The trainside
   engine also can't live on a `layout: separate` slab — `_build_rollout` raises.
-- **Quiesce before weight sync / eval / checkpoint on the batch async path** —
-  `AsyncBatchRolloutEngine.quiesce()` drains every in-flight generation; a
-  weight + KV update corrupts one mid-flight. A batch weight publication also
-  requires the completed FIFO to be empty; hard-boundary admission guarantees
-  this rather than silently discarding data. The agentic quiesce is a
-  turn-boundary `abort` + final poll, folded into
-  `AsyncAgenticRolloutEngine.quiesce()`; its `sync_weights()` rejects a live
-  drive, then pairs the weight push with the version bump and logs the sync.
-  Reap-vs-launch ordering is trainer statement order (diffusion polls before
-  topping up; see its `_next_rollout_batch`).
+- **Quiesce before weight sync / eval / checkpoint on async paths** —
+  `RolloutManager.quiesce()` pauses dispatch, drains batch work, and cooperatively
+  suspends agentic trajectories at turn boundaries. `sync_weights()` rejects queued
+  or in-flight work, pushes weights, and publishes the optimizer-update
+  `output_version`; immutable buffered groups keep their original provenance and
+  remain subject to the configured filter. Eval/checkpoint admission still requires
+  an empty manager. Launch and scoring order remains trainer policy.
 - **Reward/advantage methods are not engine code** — `Part.compute_advantages` and
   `Sample.propagate_rewards` are called by the trainer after scoring. An engine
   fills generation fields such as `segment`, `conditions`, `primitive`, and

@@ -8,7 +8,7 @@ from typing import List
 from unirl.distributed.tensor.batch import Batch, concat_field
 
 SUPPORTED_MEDIA_MODALITIES = frozenset({"image", "audio", "video"})
-SUPPORTED_MEDIA_ROLES = frozenset({"prompt", "condition"})
+SUPPORTED_MEDIA_ROLES = frozenset({"prompt", "condition", "target"})
 
 
 def normalize_media_uri(uri: object, *, context: str = "MediaRef") -> str:
@@ -34,11 +34,12 @@ def normalize_media_uri(uri: object, *, context: str = "MediaRef") -> str:
 
 @dataclass(frozen=True)
 class MediaRef:
-    """A lightweight reference to one per-sample media input.
+    """A lightweight reference to one per-sample media item.
 
     The reference is intentionally small and serializable. Actual media loading
     happens on the actor/sampler side so the driver does not move large tensors
-    through Ray.
+    through Ray. ``target`` is reserved for supervised manifests and is never a
+    rollout input.
     """
 
     modality: str

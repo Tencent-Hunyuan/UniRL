@@ -31,8 +31,8 @@ import torch
 from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.models.pe.instruction import postprocess_pe_texts
+from unirl.rollout.engine.base import BaseRolloutEngine
 from unirl.rollout.engine.composed.config import ComposedRolloutEngineConfig
-from unirl.rollout.engine.synchronous import SyncRolloutEngine
 from unirl.types.primitives import Texts
 from unirl.types.sample import Part, Sample
 from unirl.types.sampling import ARSamplingParams, DiffusionSamplingParams
@@ -50,7 +50,7 @@ def _cleanup_constructed_child(name: str, child: Any) -> None:
         logger.warning("Child %r cleanup after construction failure raised: %s", name, exc)
 
 
-class ComposedRolloutEngine(SyncRolloutEngine):
+class ComposedRolloutEngine(BaseRolloutEngine):
     """Two-child rollout engine for prompt-enhancement (PE) serial flow."""
 
     _component_name = "composed"
@@ -79,8 +79,8 @@ class ComposedRolloutEngine(SyncRolloutEngine):
         ar = config.ar.make_engine(strategy=None, **deps)
         try:
             require(
-                isinstance(ar, SyncRolloutEngine),
-                f"ComposedRolloutEngine ar child must be a SyncRolloutEngine; got {type(ar).__name__}",
+                isinstance(ar, BaseRolloutEngine),
+                f"ComposedRolloutEngine ar child must be a BaseRolloutEngine; got {type(ar).__name__}",
             )
         except BaseException:
             _cleanup_constructed_child("ar", ar)
@@ -93,8 +93,8 @@ class ComposedRolloutEngine(SyncRolloutEngine):
             raise
         try:
             require(
-                isinstance(diffusion, SyncRolloutEngine),
-                f"ComposedRolloutEngine diffusion child must be a SyncRolloutEngine; got {type(diffusion).__name__}",
+                isinstance(diffusion, BaseRolloutEngine),
+                f"ComposedRolloutEngine diffusion child must be a BaseRolloutEngine; got {type(diffusion).__name__}",
             )
         except BaseException:
             _cleanup_constructed_child("diffusion", diffusion)
@@ -104,7 +104,7 @@ class ComposedRolloutEngine(SyncRolloutEngine):
         self._ar = ar
         self._diffusion = diffusion
 
-        self._child_by_name: Dict[str, SyncRolloutEngine] = {
+        self._child_by_name: Dict[str, BaseRolloutEngine] = {
             "ar": self._ar,
             "diffusion": self._diffusion,
         }
@@ -358,7 +358,7 @@ class ComposedRolloutEngine(SyncRolloutEngine):
                 result[child_name] = subset
         return result
 
-    def _children_for_track_prefix(self, track_prefix: str) -> List[SyncRolloutEngine]:
+    def _children_for_track_prefix(self, track_prefix: str) -> List[BaseRolloutEngine]:
         """Resolve the tensor-payload track routing hint to child engines."""
         if not track_prefix:
             return list(self._child_by_name.values())

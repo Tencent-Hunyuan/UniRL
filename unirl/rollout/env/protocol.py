@@ -33,9 +33,9 @@ class Environment(Protocol):
         """Optional guaranteed teardown (LIN-533), called from the harness's ``finally`` on every
         path — success, crash, and abort. The harness invokes it via ``getattr(env, "close", None)``,
         so an env holding no per-trajectory resource need not implement it (default: no-op). Stateful
-        envs use it to release handles exactly once — tool sessions
-        (:meth:`~unirl.rollout.env.tool_environment.ToolEnvironment.close`) or ALFWorld episodes/
-        pooled templates. Must be idempotent and **must not raise**.
+        envs use it to release handles exactly once, such as tool sessions managed by
+        :meth:`~unirl.rollout.env.tool_environment.ToolEnvironment.close`. Must be idempotent
+        and **must not raise**.
         """
         ...
 

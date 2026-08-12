@@ -1,17 +1,18 @@
+import importlib
+import importlib.util
 import inspect
 import logging
 import math
 import time
 from contextlib import contextmanager, nullcontext
-from typing import Dict, Iterator, Optional, Tuple
+from typing import Dict, Iterator, Optional, Set, Tuple
 
 import torch
-from hydra.utils import instantiate
+from hydra.utils import get_object, instantiate
 from omegaconf import DictConfig
 
 from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
-from unirl.models.qwen3_5.validation import validate_qwen3_5_training_contract
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample
 from unirl.types.sample import Sample
@@ -22,6 +23,46 @@ from unirl.utils.hydra import parse_hydra_cfg, remote_hydra
 logger = logging.getLogger(__name__)
 
 _ROLLOUT_SHUTDOWN_TIMEOUT_S = 60.0
+
+
+def ar_preflight(
+    *,
+    pipeline_cfg: DictConfig,
+    backend_cfg: DictConfig,
+    rollout_cfg: DictConfig,
+    stack_cfg: DictConfig,
+) -> Set[str]:
+    """Model-blind pre-flight shared by :class:`ARTrainer` and ``AsyncARTrainer``.
+
+    Runs on the driver before any model or rollout actor is created. Dispatches
+    the optional fail-fast contract check a model package declares as
+    ``unirl.models.<pkg>.validation.validate_training_contract`` (so the trainer
+    never imports a concrete model family), then returns the prompt-input
+    primitives the pipeline accepts: the decoded ``text``/``image``/``video``
+    contract plus whatever the pipeline class opts into via its
+    ``extra_input_primitives`` attribute (e.g. Omni's URI-backed ``media``
+    channel) — a miswired dataset then fails at request build instead of
+    silently dropping inputs.
+    """
+    target = str(pipeline_cfg.get("_target_", "") or "")
+    parts = target.split(".")
+    if target.startswith("unirl.models.") and len(parts) > 3:
+        validation_module = f"unirl.models.{parts[2]}.validation"
+        if importlib.util.find_spec(validation_module) is not None:
+            validate = getattr(importlib.import_module(validation_module), "validate_training_contract", None)
+            if validate is not None:
+                validate(
+                    pipeline_cfg=pipeline_cfg,
+                    backend_cfg=backend_cfg,
+                    rollout_cfg=rollout_cfg,
+                    stack_cfg=stack_cfg,
+                )
+    allowed: Set[str] = {"text", "image", "video"}
+    if target:
+        resolved = get_object(target)
+        pipeline_cls = resolved if isinstance(resolved, type) else getattr(resolved, "__self__", None)
+        allowed.update(getattr(pipeline_cls, "extra_input_primitives", ()))
+    return allowed
 
 
 class ARTrainer(BaseTrainer):
@@ -67,20 +108,13 @@ class ARTrainer(BaseTrainer):
         rollout_anchor_device: Optional[int] = None,
         enable_fsdp_offload: bool = True,
     ) -> None:
-        validate_qwen3_5_training_contract(
+        self._allowed_input_primitives = ar_preflight(
             pipeline_cfg=pipeline_cfg,
             backend_cfg=backend_cfg,
             rollout_cfg=rollout_cfg,
             stack_cfg=stack_cfg,
         )
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
-        # ``media`` (URI-backed MediaRefs) is an Omni prompt-input channel.
-        # Keep other AR models on the decoded image/video contract so a miswired
-        # dataset fails at request build instead of silently dropping media.
-        self._allowed_input_primitives = {"text", "image", "video"}
-        pipeline_target = str(pipeline_cfg.get("_target_", ""))
-        if "qwen3_omni" in pipeline_target:
-            self._allowed_input_primitives.add("media")
         self.batch_size = batch_size
         self.adv_normalization_scope = adv_normalization_scope
         self.normalize_adv_by_std = normalize_adv_by_std

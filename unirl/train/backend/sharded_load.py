@@ -28,7 +28,7 @@ from typing import Dict
 import torch
 from torch import nn
 
-from unirl.train.backend.sharded_state import _build_state_dict_options, _current_rank
+from unirl.train.backend.sharded_state import _build_state_dict_options, _canonical_param_name, _current_rank
 from unirl.train.backend.veomni.ep.models.qwen3_moe import build_local_fused_block
 from unirl.train.backend.veomni.ep.placement import assign_local_block, ep_named_parameters
 
@@ -289,8 +289,8 @@ def _load_state_dict_ep_sliced(
         return key_to_handle[key].get_tensor(key)
 
     ep_shard_dims = _ep_shard_dims_from_plan(module)
-    named = dict(module.named_parameters())
-    named.update(dict(module.named_buffers()))
+    named = {_canonical_param_name(n): p for n, p in module.named_parameters()}
+    named.update({_canonical_param_name(n): b for n, b in module.named_buffers()})
 
     missing, loaded, local_elems = [], 0, 0
     for name, dst in named.items():
@@ -523,8 +523,8 @@ def _pack_qwen_moe_expert_keys(state_dict: StateDict, model: nn.Module) -> State
     if not any(_QWEN_MOE_EXPERT_RE.match(key) for key in state_dict):
         return state_dict
 
-    model_tensors = dict(model.named_parameters())
-    model_tensors.update(dict(model.named_buffers()))
+    model_tensors = {_canonical_param_name(n): t for n, t in model.named_parameters()}
+    model_tensors.update({_canonical_param_name(n): b for n, b in model.named_buffers()})
     targets = sorted(
         name for name in model_tensors if name.endswith((".mlp.experts.gate_up_proj", ".mlp.experts.down_proj"))
     )
@@ -636,7 +636,9 @@ def _remap_hf_checkpoint_keys(state_dict: StateDict, model: nn.Module) -> StateD
         return key
 
     renamed = {rename(k): v for k, v in state_dict.items()}
-    ref_keys = {n for n, _ in ref.named_parameters()} | {n for n, _ in ref.named_buffers()}
+    ref_keys = {_canonical_param_name(n) for n, _ in ref.named_parameters()} | {
+        _canonical_param_name(n) for n, _ in ref.named_buffers()
+    }
     matched_old = sum(k in ref_keys for k in state_dict)
     matched_new = sum(k in ref_keys for k in renamed)
     if matched_new <= matched_old:  # keys already matched — keep the original
@@ -657,7 +659,7 @@ def _assert_state_dict_covers_model(state_dict: StateDict, model: nn.Module) -> 
     garbage. Buffers and tied params are legitimately absent, hence the low
     25% bar — this only trips on a wholesale key mismatch.
     """
-    params = {n for n, _ in getattr(model, "module", model).named_parameters()}
+    params = {_canonical_param_name(n) for n, _ in getattr(model, "module", model).named_parameters()}
     matched = sum(k in params for k in state_dict)
     if params and matched < 0.25 * len(params):
         raise ValueError(
@@ -676,8 +678,8 @@ def _remap_lora_base_keys(state_dict: StateDict, model: nn.Module) -> StateDict:
     weight moves to ``<module>.base_layer.weight``.  The base checkpoint still
     uses the original key — insert the ``base_layer`` hop where (and only
     where) the model expects it."""
-    model_keys = {n for n, _ in model.named_parameters()}
-    model_keys.update(n for n, _ in model.named_buffers())
+    model_keys = {_canonical_param_name(n) for n, _ in model.named_parameters()}
+    model_keys.update(_canonical_param_name(n) for n, _ in model.named_buffers())
     remapped: StateDict = {}
     for key, value in state_dict.items():
         if key not in model_keys:

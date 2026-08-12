@@ -14,11 +14,15 @@
 #                   "media": [{"modality": "image", "role": "target", "uri": ...}]})
 #   SFT_EVAL_DATA   eval manifest (defaults to SFT_DATA — supply a real split!)
 #
-# Data prep: shared with sd3_sft (python -m unirl.utils.prepare_sft_t2i).
+# Data prep: shared with sd3_sft_lora (python -m unirl.utils.prepare_sft_t2i).
 #
 # Launch:
 #   ENTRY=train_sft SFT_DATA=data/sft_t2i/train.jsonl SFT_EVAL_DATA=data/sft_t2i/val.jsonl \
-#   bash examples/run_experiment_single_node.sh sft/bagel_sft
+#   bash examples/run_experiment_single_node.sh sft/bagel_sft_lora
+#
+# The reported validation run used the same config with checkpointing on:
+#   ... sft/bagel_sft_lora num_steps=1500 eval_interval=0 \
+#     save_interval=300 save_dir=checkpoints/sft_bagel
 
 num_devices: 8
 batch_size: 16
@@ -32,11 +36,11 @@ transport_kind: colocate_store
 workers_per_device: 1
 
 logging:
-  report_to_wandb: false
-  project_name: unirl-sft
-  run_name: bagel_sft_t2i
-  entity: null
-  tags: [sft, bagel, unified-model]
+  report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,false}}
+  project_name: ${oc.env:WANDB_PROJECT,unirl-sft}
+  run_name: ${oc.env:WANDB_RUN_NAME,bagel_sft_t2i}
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: [sft, bagel, unified-model, lora]
 
 bundle:
   _target_: unirl.models.bagel.bundle.BagelBundle.from_config

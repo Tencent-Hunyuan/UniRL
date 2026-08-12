@@ -8,7 +8,8 @@ No handle is returned — the DTensors ARE the handle.  Ported from
 from __future__ import annotations
 
 import logging
-from typing import Dict, Optional, Tuple
+from functools import partial
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 from torch import nn
@@ -17,6 +18,37 @@ from unirl.config.require import require
 from unirl.utils.dtypes import parse_torch_dtype
 
 logger = logging.getLogger(__name__)
+
+
+def _clone_checkpoint_kwarg(value: Any) -> Any:
+    """Snapshot mutable KV-cache mappings without duplicating tensor storage."""
+    if not (hasattr(value, "key_cache") and hasattr(value, "value_cache")):
+        return value
+    cloned = type(value)(value.num_layers)
+    # BAGEL cache updates replace per-layer entries; they do not mutate the
+    # existing K/V tensors. Copying the mappings is therefore sufficient to
+    # freeze replay state and avoids O(num_layers**2) tensor duplication.
+    cloned.key_cache = dict(value.key_cache)
+    cloned.value_cache = dict(value.value_cache)
+    return cloned
+
+
+def _checkpoint_with_kwarg_snapshots(function: Any, *args: Any, **kwargs: Any) -> Any:
+    """Checkpoint mutable kwargs from a frozen call-time mapping snapshot.
+
+    The outer clone isolates the saved checkpoint frame from later caller
+    mutation; ``run`` clones that frozen mapping again so neither the original
+    forward nor recompute can mutate the replay source.
+    """
+    from torch.utils import checkpoint as torch_checkpoint
+
+    checkpoint_kwargs = {key: _clone_checkpoint_kwarg(value) for key, value in kwargs.items()}
+
+    def run(*inner_args: Any, **inner_kwargs: Any) -> Any:
+        call_kwargs = {key: _clone_checkpoint_kwarg(value) for key, value in inner_kwargs.items()}
+        return function(*inner_args, **call_kwargs)
+
+    return torch_checkpoint.checkpoint(run, *args, use_reentrant=False, **checkpoint_kwargs)
 
 
 def fsdp_wrap(
@@ -31,6 +63,7 @@ def fsdp_wrap(
     reshard_after_forward: bool = True,
     forward_prefetch: bool = False,
     activation_checkpointing: bool = False,
+    ac_wrap_order: str = "outside",
     use_torch_compile: bool = False,
     master_dtype: Optional[str] = None,
     root_wrap: bool = True,
@@ -63,6 +96,10 @@ def fsdp_wrap(
     target_dtype = parse_torch_dtype(param_dtype, field_name="training.fsdp.param_dtype")
     trainable_dtype = (
         parse_torch_dtype(master_dtype, field_name="training.fsdp.master_dtype") if master_dtype is not None else None
+    )
+    require(
+        ac_wrap_order in {"inside", "outside"},
+        f"fsdp_wrap: ac_wrap_order must be 'inside' or 'outside', got {ac_wrap_order!r}",
     )
 
     fsdp_kwargs: Dict[str, object] = {
@@ -99,6 +136,44 @@ def fsdp_wrap(
             p.data = p.data.to(dst)
             casts += 1
 
+    if activation_checkpointing:
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+            CheckpointImpl,
+            CheckpointWrapper,
+            apply_activation_checkpointing,
+            checkpoint_wrapper,
+        )
+
+        block_ids = {id(layer) for layer in block_instances}
+        apply_activation_checkpointing(
+            model,
+            checkpoint_wrapper_fn=partial(
+                checkpoint_wrapper,
+                checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+                checkpoint_fn=_checkpoint_with_kwarg_snapshots,
+            ),
+            check_fn=lambda module: id(module) in block_ids,
+        )
+        # Where fully_shard lands relative to the AC wrapper decides whether the
+        # recompute re-enters FSDP's gather/cast hooks:
+        #
+        # * "outside" (default; fully_shard on the CheckpointWrapper, torchtitan
+        #   order): hooks fire once per use, outside the checkpoint region. This
+        #   matches the composition every pre-knob AC recipe ran — the old
+        #   forward-monkeypatch checkpoint also recomputed without re-entering
+        #   hooks — so untouched recipes keep their validated behavior.
+        # * "inside" (fully_shard on the INNER block): the recompute goes through
+        #   the module's __call__, re-running the pre-forward gather and the
+        #   mp_policy cast. Opt in per recipe where this order was actually
+        #   smoke-validated (the stacked BAGEL it2i consumer pins it).
+        if ac_wrap_order == "outside":
+            wrapped = [m for m in model.modules() if isinstance(m, CheckpointWrapper)]
+            require(
+                len(wrapped) == len(block_instances),
+                f"fsdp_wrap: expected {len(block_instances)} checkpoint wrappers, found {len(wrapped)}",
+            )
+            block_instances = wrapped
+
     for layer in block_instances:
         fully_shard(layer, **fsdp_kwargs)
 
@@ -130,21 +205,6 @@ def fsdp_wrap(
         fsdp_groups = [m for m in model.modules() if isinstance(m, FSDPModule)]
         for cur, nxt in zip(fsdp_groups, fsdp_groups[1:]):
             cur.set_modules_to_forward_prefetch([nxt])
-
-    if activation_checkpointing:
-        from torch.utils import checkpoint as _ckpt
-
-        def _make_ckpt_forward(orig_fwd: object) -> object:
-            def wrapped(*args: object, **kwargs: object) -> object:
-                def fn(*a: object) -> object:
-                    return orig_fwd(*a, **kwargs)
-
-                return _ckpt.checkpoint(fn, *args, use_reentrant=False)
-
-            return wrapped
-
-        for layer in block_instances:
-            layer.forward = _make_ckpt_forward(layer.forward)
 
     if use_torch_compile:
         for layer in block_instances:

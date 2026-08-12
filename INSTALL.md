@@ -26,8 +26,8 @@ uv pip install -e ".[sglang,train,infer]" --prerelease=allow
 
 | Extra | Adds | Use when |
 |---|---|---|
-| `vllm` | `vllm`, `vllm-omni`, torch +cu129 stack | Running any vllm-omni-based example |
-| `sglang` | `sglang[diffusion]`, `flash-attn-4`, torch +cu130 stack | Running VLM/LLM examples or `sd3_sglang_*` |
+| `vllm` | `vllm`, `vllm-omni`, torch +cu129 stack, PyAV | Running any vllm-omni-based example |
+| `sglang` | `sglang[diffusion]`, `flash-attn-4`, torch +cu130 stack, PyAV | Running VLM/LLM examples or `sd3_sglang_*` |
 | `train` | `wandb`, `aiohttp` | Training runs (almost always wanted) |
 | `infer` | `accelerate` | HunyuanImage3 and similar models |
 | `eval` | `torchvision`, `easyocr` | OCR-based reward components |

@@ -50,12 +50,12 @@ def _require_version(distribution: str, minimum: Version, *, reason: str) -> Non
         raise RuntimeError(f"Qwen3.5 {reason} requires {distribution}>={minimum} (installed: {installed}).")
 
 
-def is_qwen3_5_pipeline_config(pipeline_cfg: Any) -> bool:
+def _is_qwen3_5_pipeline_config(pipeline_cfg: Any) -> bool:
     """Whether a Hydra pipeline config targets the Qwen3.5 package."""
     return "unirl.models.qwen3_5." in _target(pipeline_cfg)
 
 
-def validate_qwen3_5_training_contract(
+def validate_training_contract(
     *,
     pipeline_cfg: Any,
     backend_cfg: Any,
@@ -68,7 +68,7 @@ def validate_qwen3_5_training_contract(
     so prompt-policy and dependency mistakes fail before allocating GPUs.
     Other model families are untouched.
     """
-    if not is_qwen3_5_pipeline_config(pipeline_cfg):
+    if not _is_qwen3_5_pipeline_config(pipeline_cfg):
         return
 
     backend_target = _target(backend_cfg)
@@ -145,4 +145,4 @@ def validate_qwen3_5_training_contract(
     )
 
 
-__all__ = ["is_qwen3_5_pipeline_config", "validate_qwen3_5_training_contract"]
+__all__ = ["validate_training_contract"]
