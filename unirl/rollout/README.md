@@ -92,20 +92,23 @@ runtime-patch dir for the pinned upstream (`sglang_diffusion/_patches/`,
 Model onboarding is per-engine, and the adapter file is usually **not** the whole
 change surface:
 
-- **`sglang` (AR/VLM):** add `adapters/<model>.py` overriding `TextAdapter` steps,
-  register with `@register_adapter("<model_family>")`, and import it in
-  `adapters/__init__.py` (registration fires on import).
+- **`sglang` (AR/VLM):** add `adapters/<model>.py` extending `TextLMAdapter`
+  (text-only) or `VLMAdapter` (multimodal), register it with
+  `@register_adapter("<model_family>")`, and import it in `adapters/__init__.py`
+  (registration fires on import).
 - **`sglang_diffusion`:** the same adapter + registration + `adapters/__init__.py`
   import, **plus** — if the model's conditions add new tensor fields that must
   cross the wire — an entry in `_COND_FIELDS` in `_patches/patch_conditions.py`
   (the transport allowlist; forgetting it silently drops the field), and hijack
-  wiring in `_patches/hijack.py` if the model needs a new upstream patch. Every
-  model onboarded so far has touched shared `_patches/` files; expect reviewers to
-  check those edits against the pinned upstream source.
-- **`vllm_omni`:** an `adapters/<family>.py` binder (keyed by modality), a
-  worker-side `pipelines/<model>/pipeline.py` (worker-subprocess-only imports), a
-  `stage_configs/<model>_*_rl.yaml`, and — if the AR/DiT worker needs new
-  behavior — a `worker/` extension or a `patches/compat_<model>.py`.
+  wiring in `_patches/hijack.py` if the model needs a new upstream patch. When
+  onboarding touches shared `_patches/` files, reviewers should check those edits
+  against the pinned upstream source.
+- **`vllm_omni`:** add an `adapters/<family>.py` binder (keyed by modality),
+  register it, import it in `adapters/__init__.py`, and add a
+  `stage_configs/<model>_*_rl.yaml`. DiT families additionally need a worker-side
+  `pipelines/<model>/pipeline.py` (worker-subprocess-only imports); if the AR/DiT
+  worker needs new behavior, add a `worker/` extension or
+  `patches/compat_<model>.py`.
 
 ## Gotchas
 
