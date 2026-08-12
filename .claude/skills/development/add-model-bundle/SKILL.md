@@ -146,15 +146,15 @@ For causal-LM or multimodal AR paths:
 
 ## What To Verify
 
-There is no committed test tree (removed by policy in #99/#267 — do not recreate it under any name). Instead, write **one-off verification harnesses** in a scratch directory outside the repo, run them, and quote the exact commands plus results in the PR's Test Plan (per the CLAUDE.md verification-harness rule). Prefer small CPU harnesses with fakes or monkeypatches rather than loading real checkpoints.
-
-Cover the same targets the old test suite did:
+Follow the `CLAUDE.md` verification-harness rule: run small, uncommitted CPU
+harnesses with fakes or monkeypatches and quote the commands and results in the
+PR's Test Plan.
 
 - **Conditions**: `from_dict` / `to_dict` round trips, optional slots, wrong-typed slot errors, and missing required slot errors.
 - **Diffusion step**: CFG batching (uncond+cond in one transformer call), timestep scaling, masks, vision kwargs, and private transformer kwargs, using fake transformers.
 - **Pipeline wiring**: construct fake stages, call `generate(sample)`, and assert lineage preservation, generation-Part conditions/segment/primitives, and pinned-sigma validation (`generate` must raise when `params.sigmas is None`).
 - **AR models**: generation and replay token/log-prob alignment on a tiny fake model.
-- **Recipe resolution**: the recipe-target pre-commit hook validates `_target_` dotpaths; run `SKIP=no-commit-to-branch pre-commit run --from-ref main --to-ref HEAD` before publishing.
+- **Recipe/config wiring**: instantiate added configs and recipes with lightweight fakes and verify their `_target_` paths resolve.
 
 ## Review Before Finishing
 

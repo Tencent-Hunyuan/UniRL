@@ -45,14 +45,13 @@ wrong objective.
   AR and diffusion Parts.
 - **The engines.** `trainside` (in-process — the train actor's pipeline *is* the
   sampler), `sglang_diffusion` (dedicated diffusion), `sglang` (dedicated AR), `vllm_omni`
-  (dedicated; HI3 / SD3 / HunyuanVideo), `fastvideo` (in-process accelerated video
+  (dedicated; HI3 / SD3 / HunyuanVideo), `fastvideo` (dedicated accelerated video
   sampling), and `composed` (chains an AR child + a
   diffusion child for prompt enhancement) are the six single-turn engines.
   `agentic` wraps one of them with an environment to produce multi-turn
   trajectories. Each diffusion engine consumes the Part's pinned sigmas verbatim,
-  and dedicated engines regenerate `x_T` from the recipe, so two engines start a
-  rollout from the same noise. `forward_batch_size` bounds peak memory by slicing
-  the Sample and concatenating the results.
+  while initial-noise construction is engine-specific. `forward_batch_size` bounds
+  peak memory by slicing the Sample and concatenating the results.
 - **Deployment modes:** *direct sampling* — the trainside engine, no `sync:`, the
   ratio is 1 on the first update; *separate* — a dedicated engine on its own GPUs
   plus a `sync:` block; *colocate* — a dedicated engine sharing GPUs with train,
@@ -79,36 +78,33 @@ implements its weight-receive method and a matching `sync:` handler in
 
 ## Engine anatomy, and adding a model to an existing engine
 
-Engine dirs come in two tiers. **Local engines** (`trainside`, `fastvideo`,
-`composed`, `agentic`) are just `config.py` + `engine.py`. **Dedicated-server
-engines** (`sglang`, `sglang_diffusion`, `vllm_omni`) share a standard anatomy:
-`config.py` + `engine.py` + `adapters/` (per-model wire-format translation) +
-`backends/` (server process management) + `utils/` + `weight_sync.py`, plus a
+Engine dirs use two layouts. The compact engines (`trainside`, `fastvideo`,
+`composed`, `agentic`) contain `config.py` + `engine.py`. Server-backed engines
+(`sglang`, `sglang_diffusion`, `vllm_omni`) also carry `adapters/`
+(per-family/modality wire-format translation), `backends/` (server process
+management), `utils/`, `weight_sync.py`, and a
 runtime-patch dir for the pinned upstream (`sglang_diffusion/_patches/`,
-`vllm_omni/patches/` — the naming difference is historical; don't churn it).
-`vllm_omni` additionally carries worker-subprocess code (`pipelines/`, `worker/`,
-`stage_configs/`).
+`vllm_omni/patches/`). `vllm_omni` additionally carries worker-subprocess code
+(`pipelines/`, `worker/`) and stage boot configs (`stage_configs/`).
 
 Model onboarding is per-engine, and the adapter file is usually **not** the whole
 change surface:
 
-- **`sglang` (AR/VLM):** add `adapters/<model>.py` extending `TextLMAdapter`
-  (text-only) or `VLMAdapter` (multimodal), register it with
-  `@register_adapter("<model_family>")`, and import it in `adapters/__init__.py`
-  (registration fires on import).
-- **`sglang_diffusion`:** the same adapter + registration + `adapters/__init__.py`
-  import, **plus** — if the model's conditions add new tensor fields that must
-  cross the wire — an entry in `_COND_FIELDS` in `_patches/patch_conditions.py`
-  (the transport allowlist; forgetting it silently drops the field), and hijack
-  wiring in `_patches/hijack.py` if the model needs a new upstream patch. When
-  onboarding touches shared `_patches/` files, reviewers should check those edits
-  against the pinned upstream source.
+- **`sglang` (AR/VLM):** onboarding is normally config-only: text models use the
+  `text` adapter, while `image_token` selects `vlm`. Add and register a new adapter
+  only for a genuinely new wire shape, extending `TextLMAdapter` or `VLMAdapter`
+  and importing it in `adapters/__init__.py`.
+- **`sglang_diffusion`:** add `adapters/<family>.py` extending `ImageAdapter` or
+  `VideoAdapter`, register it by `model_family`, and import it in
+  `adapters/__init__.py`. New condition fields that cross the wire also need an
+  entry in `_COND_FIELDS` and either `_POS_MAP` / `_NEG_MAP` or an explicit copy
+  branch in `_copy_conditions`; add `_patches/hijack.py` wiring only when the
+  model needs a new upstream patch.
 - **`vllm_omni`:** add an `adapters/<family>.py` binder (keyed by modality),
-  register it, import it in `adapters/__init__.py`, and add a
-  `stage_configs/<model>_*_rl.yaml`. DiT families additionally need a worker-side
-  `pipelines/<model>/pipeline.py` (worker-subprocess-only imports); if the AR/DiT
-  worker needs new behavior, add a `worker/` extension or
-  `patches/compat_<model>.py`.
+  register it, import it in `adapters/__init__.py`, and add the appropriate boot
+  YAML under `stage_configs/`. DiT families additionally need a worker-side
+  `pipelines/<model>/pipeline.py`; if the AR/DiT worker needs new behavior, add a
+  `worker/` extension or `patches/compat_<model>.py`.
 
 ## Gotchas
 
