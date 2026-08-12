@@ -21,6 +21,7 @@ Usage:
 import functools
 import logging
 import os
+import threading
 import time
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Union
@@ -143,11 +144,20 @@ class PhaseTimer:
 
     Phases sum to ~``total()``; the residual is whatever ran outside any
     ``phase`` block (cheap glue like logging).
+
+    Thread-safe accumulation: stage-pipelined rollout
+    (``rollout_pipeline_chunks > 1``) runs concurrent chunk threads that both enter
+    ``phase("ar_generate")``, and ``phases[name] = phases.get(name) + d`` is a
+    read-modify-write that loses an update when interleaved. With concurrent phases
+    a name's total is the SUM of each thread's span and can exceed wall-clock —
+    that is intended (it is what reveals the overlap), but the accumulation itself
+    must not drop samples.
     """
 
     def __init__(self) -> None:
         self._t0 = time.perf_counter()
         self.phases: Dict[str, float] = {}
+        self._lock = threading.Lock()
 
     @contextmanager
     def phase(self, name: str) -> Iterator[None]:
@@ -156,7 +166,9 @@ class PhaseTimer:
         try:
             yield
         finally:
-            self.phases[name] = self.phases.get(name, 0.0) + (time.perf_counter() - t)
+            elapsed = time.perf_counter() - t
+            with self._lock:
+                self.phases[name] = self.phases.get(name, 0.0) + elapsed
 
     def total(self) -> float:
         """Wall-clock seconds since construction (the whole step)."""
