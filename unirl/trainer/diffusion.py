@@ -2,8 +2,10 @@ import dataclasses
 import inspect
 import logging
 import os
+import sys
 import time
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
+from contextlib import contextmanager
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Set, Tuple
 
 import torch
 from hydra.utils import get_class, get_object, instantiate
@@ -21,6 +23,85 @@ from unirl.utils.hydra import parse_hydra_cfg, remote_hydra
 from unirl.utils.wandb_metrics import pooled_window_reward_metrics
 
 logger = logging.getLogger(__name__)
+
+
+def _run_cleanup_steps(steps: List[Tuple[str, Callable[[], None]]]) -> None:
+    """Run every cleanup step, preserving an active phase failure when present."""
+    preserve_active_error = sys.exc_info()[0] is not None
+    first_error: Optional[Exception] = None
+    for name, cleanup in steps:
+        try:
+            cleanup()
+        except Exception as exc:
+            logger.exception("Diffusion lifecycle cleanup failed during %s", name)
+            if first_error is None:
+                first_error = exc
+    if first_error is not None and not preserve_active_error:
+        raise first_error
+
+
+def _validate_prompt_tree_dp_geometry(
+    *,
+    batch_size: int,
+    rollout_dp_size: int,
+    reward_dp_size: int,
+    context: str,
+) -> None:
+    for role, dp_size in (("rollout", rollout_dp_size), ("reward", reward_dp_size)):
+        if batch_size % dp_size:
+            raise ValueError(
+                f"{context}: {role} dp_size={dp_size} must divide batch_size={batch_size} "
+                "root prompt trees; DP_SCATTER preserves each prompt's whole subtree."
+            )
+
+
+def _validate_diffusion_dp_geometry(
+    *,
+    batch_size: int,
+    samples_per_prompt: int,
+    num_updates_per_batch: int,
+    rollout_dp_size: int,
+    reward_dp_size: int,
+    train_dp_size: int,
+) -> None:
+    """Validate prompt-tree dispatch separately from generated-sample training.
+
+    Rollout and reward receive a ``Sample`` and therefore shard its root prompt
+    trees. The train stack receives the generated frontier ``Part`` and shards its
+    flattened rows. Treating both as ``batch_size * samples_per_prompt`` hides the
+    common ``8 prompts / DP16`` failure until the distributed call.
+    """
+    values = {
+        "batch_size": batch_size,
+        "samples_per_prompt": samples_per_prompt,
+        "num_updates_per_batch": num_updates_per_batch,
+        "rollout_dp_size": rollout_dp_size,
+        "reward_dp_size": reward_dp_size,
+        "train_dp_size": train_dp_size,
+    }
+    invalid = {name: value for name, value in values.items() if int(value) < 1}
+    if invalid:
+        raise ValueError(f"Diffusion DP geometry values must be positive; got {invalid}.")
+
+    _validate_prompt_tree_dp_geometry(
+        batch_size=batch_size,
+        rollout_dp_size=rollout_dp_size,
+        reward_dp_size=reward_dp_size,
+        context="training",
+    )
+
+    total_generated = batch_size * samples_per_prompt
+    if total_generated % train_dp_size:
+        raise ValueError(
+            f"batch_size({batch_size}) * samples_per_prompt({samples_per_prompt}) = "
+            f"{total_generated} generated samples must be divisible by train dp_size={train_dp_size}."
+        )
+    per_train_rank = total_generated // train_dp_size
+    if per_train_rank % num_updates_per_batch:
+        raise ValueError(
+            f"Per-train-rank generated batch {per_train_rank} must be divisible by "
+            f"num_updates_per_batch={num_updates_per_batch}."
+        )
 
 
 # Per-field eval knobs the overlay replaced (or dropped), and what to write instead.
@@ -192,6 +273,8 @@ class DiffusionTrainer(BaseTrainer):
         train_fraction: float = 0.5,
         reward_fraction: float = 0.0,
         enable_fsdp_offload: bool = False,
+        offload_train_during_reward: bool = False,
+        rollout_sleep_after_generate: bool = True,
         adv_use_global_std: bool = False,
         accumulate_rollouts: int = 1,
         eval_interval: int = 0,
@@ -209,6 +292,13 @@ class DiffusionTrainer(BaseTrainer):
         self._layout = str(layout)
         self._train_fraction = float(train_fraction)
         self._enable_fsdp_offload = bool(enable_fsdp_offload)
+        # Independent from generate-time offload: when enabled, a reward that
+        # shares the train slab may borrow its GPU after generation completes.
+        self._offload_train_during_reward = bool(offload_train_during_reward)
+        # Process lifetime is independent from weight residency. False keeps an
+        # external rollout engine's weights resident after generate/eval; the
+        # default preserves the historical phase-sleep behavior.
+        self._rollout_sleep_after_generate = bool(rollout_sleep_after_generate)
         self._adv_use_global_std = bool(adv_use_global_std)
         self.eval_interval = int(eval_interval)
         self.eval_num_prompts = int(eval_num_prompts)
@@ -290,6 +380,7 @@ class DiffusionTrainer(BaseTrainer):
                 f"reward_fraction={reward_fraction} carves reward its own slab, but the recipe "
                 "has no `reward:` block — drop reward_fraction or configure a reward."
             )
+        self._reward_is_separate = reward_separate
 
         train_cfgs = dict(
             bundle_cfg=bundle_cfg,
@@ -326,17 +417,15 @@ class DiffusionTrainer(BaseTrainer):
         self.accumulate_rollouts = int(accumulate_rollouts)
         self._validate_accumulation(stack_cfg)
 
-        # Require rollout counts to divide both policy and reward DP sizes.
-        n_samples = batch_size * total_samples_per_prompt(self.sampling_params)
-        reward_dp = self.reward.dp_size if self.reward is not None else 1
-        if n_samples % self.rollout.dp_size or n_samples % reward_dp:
-            raise ValueError(
-                f"batch_size({batch_size}) * samples_per_prompt = {n_samples} samples/rollout must be "
-                f"divisible by BOTH rollout dp_size={self.rollout.dp_size} and reward dp_size="
-                f"{reward_dp}. reward_fraction={reward_fraction} placed reward on its own slab, "
-                f"leaving the policy/rollout on {self.rollout.dp_size} GPU(s) — pick batch_size * "
-                f"samples_per_prompt divisible by both."
-            )
+        self._validate_residency_config()
+        _validate_diffusion_dp_geometry(
+            batch_size=int(batch_size),
+            samples_per_prompt=total_samples_per_prompt(self.sampling_params),
+            num_updates_per_batch=int(stack_cfg.get("num_updates_per_batch", 1)),
+            rollout_dp_size=int(self.rollout.dp_size),
+            reward_dp_size=int(self.reward.dp_size) if self.reward is not None else 1,
+            train_dp_size=int(self.stack.dp_size),
+        )
 
     def _validate_reward_config(self) -> None:
         """A missing ``reward:`` block is legal only for requires_advantages=False algorithms."""
@@ -435,10 +524,37 @@ class DiffusionTrainer(BaseTrainer):
         self._uses_ema = getattr(algo_cls, "requires_ema_rollout", False)
         # requires_advantages=False algorithms keep rewards for monitoring only.
         self._algo_requires_advantages = getattr(algo_cls, "requires_advantages", True)
+        if self._uses_ema and self._offload_train_during_reward:
+            raise ValueError(
+                "offload_train_during_reward is not supported with EMA/DiffusionNFT algorithms "
+                f"({algo_cls.__name__} sets requires_ema_rollout): the reward-phase offload has "
+                "not been validated against backend.ema state. Disable one of the two instead of "
+                "having the trainer silently ignore the requested policy."
+            )
         needs_backend = self._uses_ema or getattr(algo_cls, "requires_backend", False)
         algo_extra = {"backend": self.backend} if needs_backend else {}
         self.algorithm = remote_hydra(algorithm_cfg, pipeline=self.pipeline, **algo_extra)
         self.stack = remote_hydra(stack_cfg, fsdp_backend=self.backend, algorithm=self.algorithm)
+
+    def _validate_residency_config(self) -> None:
+        """Reject requested residency policies that the selected topology drops."""
+        if self._offload_train_during_reward and self.reward is None:
+            raise ValueError(
+                "offload_train_during_reward requires a configured reward: this run has no reward phase "
+                "to borrow train memory. Disable the unused policy or configure a reward."
+            )
+        if (
+            self._uses_ema
+            and self._enable_fsdp_offload
+            and self._layout != "separate"
+            and not self._rollout_is_trainside
+        ):
+            raise ValueError(
+                "enable_fsdp_offload is not supported with EMA/DiffusionNFT algorithms and an "
+                "external colocated rollout: generation-time train offload has not been validated "
+                "against backend.ema state. Disable one of the two instead of having the trainer "
+                "silently ignore the requested policy."
+            )
 
     def _build_rollout(self, rollout_cfg, *, allow_pipeline: bool):
         """Build the rollout remote in the currently active placement scope.
@@ -576,6 +692,85 @@ class DiffusionTrainer(BaseTrainer):
             request = request.with_parts([*request.parts[:-1], frontier])
         return request
 
+    def _offload_for_reward_phase(self) -> bool:
+        """Whether a colocated reward may temporarily borrow the train cards."""
+        return self._offload_train_during_reward and not self._reward_is_separate
+
+    @contextmanager
+    def _reward_phase(self) -> Iterator[None]:
+        """Temporarily offload FSDP state while a colocated reward is active."""
+        should_offload = self._offload_for_reward_phase()
+        try:
+            if should_offload:
+                self.backend.offload()
+            yield
+        finally:
+            if should_offload:
+                _run_cleanup_steps([("reward train onload", self.backend.onload)])
+
+    def _sleep_rollout_then_onload_train(self) -> None:
+        """Restore train state only after the colocated rollout is safely asleep."""
+        self.rollout.sleep()
+        self.backend.onload()
+
+    def _generate_with_residency(
+        self,
+        sample: Sample,
+        *,
+        sync_weights: bool,
+        sleep_rollout: bool,
+    ) -> Sample:
+        """Generate with exception-safe EMA, rollout, and FSDP lifecycle cleanup."""
+        # No EMA term: _validate_residency_config already rejected the EMA x
+        # offload x colocated-external combination at startup, fail-fast
+        # instead of silently skipping the requested offload here.
+        should_offload_train = (
+            self._enable_fsdp_offload and self._layout != "separate" and not self._rollout_is_trainside
+        )
+        # Swap EMA weights only for trainside rollout; remote engines receive
+        # them through weight sync.
+        should_swap_ema = self._uses_ema and self._rollout_is_trainside
+        train_offload_attempted = False
+        ema_apply_attempted = False
+        generation_succeeded = False
+        try:
+            self.rollout.wake_up()
+            if sync_weights and self.weight_sync is not None:
+                self.weight_sync.sync()
+            if should_offload_train:
+                train_offload_attempted = True
+                self.backend.offload()
+            if should_swap_ema:
+                ema_apply_attempted = True
+                self.backend.apply_eval_ema()
+            result = self.rollout.generate(sample)
+            generation_succeeded = True
+            return result
+        finally:
+            cleanup_steps: List[Tuple[str, Callable[[], None]]] = []
+            if ema_apply_attempted:
+                cleanup_steps.append(("EMA restore", self.backend.restore_from_eval))
+            should_sleep_rollout = sleep_rollout or not generation_succeeded
+            if should_sleep_rollout and train_offload_attempted:
+                # These operations are dependent: if sleep fails, loading FSDP
+                # into a still-resident rollout can turn the original error into
+                # a second OOM and leave both roles partially initialized.
+                cleanup_steps.append(
+                    ("rollout sleep before generate train onload", self._sleep_rollout_then_onload_train)
+                )
+            elif should_sleep_rollout:
+                cleanup_steps.append(("rollout sleep", self.rollout.sleep))
+            elif train_offload_attempted:
+                cleanup_steps.append(("generate train onload", self.backend.onload))
+            _run_cleanup_steps(cleanup_steps)
+
+    def _generate_for_training(self, sample: Sample, *, sync_weights: bool) -> Sample:
+        return self._generate_with_residency(
+            sample,
+            sync_weights=sync_weights,
+            sleep_rollout=self._rollout_sleep_after_generate,
+        )
+
     def _rollout_and_score(
         self,
         sample: Sample,
@@ -593,31 +788,11 @@ class DiffusionTrainer(BaseTrainer):
         row metadata attached) and the mean unnormalized per-sample reward of
         the frontier gen Part (0.0 if none), for the log line.
         """
-        self.rollout.wake_up()
-        if sync_weights and self.weight_sync is not None:
-            self.weight_sync.sync()
-        _do_fsdp_offload = (
-            self._enable_fsdp_offload
-            and self._layout != "separate"
-            and not self._rollout_is_trainside
-            and not self._uses_ema
-        )
-        if _do_fsdp_offload:
-            self.backend.offload()
-        # Swap EMA weights only for trainside rollout; remote engines receive them through weight sync.
-        _inproc_ema_swap = self._uses_ema and self._rollout_is_trainside
-        if _inproc_ema_swap:
-            self.backend.apply_eval_ema()
-        sample = self.rollout.generate(sample)
-        if _inproc_ema_swap:
-            self.backend.restore_from_eval()
-        self.rollout.sleep()
-        if _do_fsdp_offload:
-            self.backend.onload()
-
+        sample = self._generate_for_training(sample, sync_weights=sync_weights)
         # With no reward configured, ``part.rewards`` stays None and the block below no-ops.
         if self.reward is not None:
-            sample = self.reward.score_and_attach(sample)
+            with self._reward_phase():
+                sample = self.reward.score_and_attach(sample)
 
         part = sample.parts[-1]
         mean_reward = 0.0
@@ -704,10 +879,9 @@ class DiffusionTrainer(BaseTrainer):
         returns ``eval/reward``.
 
         ``sync_weights=False`` evaluates the policy already resident in the rollout
-        engine without changing its weight version, and ``sleep_after=False`` leaves
-        a dedicated engine resident afterwards — what the async trainer needs so
-        evaluation does not perturb its pipeline. The defaults preserve the
-        synchronous trainer's existing behavior.
+        engine without changing its weight version. The engine sleeps afterward
+        only when both ``sleep_after`` and ``rollout_sleep_after_generate`` are true;
+        the async trainer and fully resident recipes disable the appropriate knob.
         """
         if self.reward is None:
             raise RuntimeError(
@@ -716,32 +890,58 @@ class DiffusionTrainer(BaseTrainer):
             )
         eval_sp = self._eval_sampling_params
         eval_diffusion = eval_sp.get("diffusion")
-        self.rollout.wake_up()
+        sync_requested = bool(sync_weights)
+        sleep_requested = sleep_after and self._rollout_sleep_after_generate
+        # A no-sync evaluation must preserve the already-resident adapter.
+        # Engines such as SGLang discard their LoRA pool on sleep and cannot
+        # reconstruct it without a push, so keep them awake across chunks and
+        # sleep once at the end. Base-model engines have no such restriction.
+        sleep_each_chunk = sleep_requested and (sync_requested or self.weight_sync is None)
+        sleep_at_end = sleep_requested and not sleep_each_chunk
+        resync_after_sleep = sleep_requested and sync_requested
+        sync_pending = sync_requested
+        generated_any = False
+        evaluation_succeeded = False
         try:
-            if sync_weights and self.weight_sync is not None:
-                self.weight_sync.sync()
             scorers = [("reward", self.reward)] + [
                 (s.name, s.reward) for s in self._eval_suites if s.data_source is None
             ]
-            metrics = self._eval_pass(
-                self.data_source, self.eval_num_prompts, scorers, eval_sp, step, media_prefix="eval"
+            metrics, sync_pending, pass_generated = self._eval_pass(
+                self.data_source,
+                self.eval_num_prompts,
+                scorers,
+                eval_sp,
+                step,
+                sync_weights=sync_pending,
+                resync_after_sleep=resync_after_sleep,
+                sleep_rollout=sleep_each_chunk,
+                media_prefix="eval",
             )
+            generated_any = generated_any or pass_generated
             for suite in self._eval_suites:
                 if suite.data_source is not None:
                     n = suite.num_prompts or self.eval_num_prompts
-                    metrics.update(
-                        self._eval_pass(
-                            suite.data_source,
-                            n,
-                            [(suite.name, suite.reward)],
-                            eval_sp,
-                            step,
-                            media_prefix=f"eval/{suite.name}",
-                        )
+                    suite_metrics, sync_pending, pass_generated = self._eval_pass(
+                        suite.data_source,
+                        n,
+                        [(suite.name, suite.reward)],
+                        eval_sp,
+                        step,
+                        sync_weights=sync_pending,
+                        resync_after_sleep=resync_after_sleep,
+                        sleep_rollout=sleep_each_chunk,
+                        media_prefix=f"eval/{suite.name}",
                     )
-        finally:
-            if sleep_after:
+                    generated_any = generated_any or pass_generated
+                    metrics.update(suite_metrics)
+            if not generated_any:
+                self._prepare_empty_evaluation(sync_weights=sync_pending, sleep_rollout=sleep_requested)
+            elif sleep_at_end:
                 self.rollout.sleep()
+            evaluation_succeeded = True
+        finally:
+            if not evaluation_succeeded:
+                _run_cleanup_steps([("evaluation rollout sleep", self.rollout.sleep)])
         logger.info(
             "EVAL step %d  (%d samples/prompt, %d steps, %dx%d, cfg=%.1f eta=%.1f)  %s",
             step,
@@ -756,6 +956,18 @@ class DiffusionTrainer(BaseTrainer):
         self.wandb_logger.log_eval(step, metrics)
         return metrics["reward"]
 
+    def _prepare_empty_evaluation(self, *, sync_weights: bool, sleep_rollout: bool) -> None:
+        """Preserve evaluation wake/sync/sleep semantics when every set is empty."""
+        prepare_succeeded = False
+        try:
+            self.rollout.wake_up()
+            if sync_weights and self.weight_sync is not None:
+                self.weight_sync.sync()
+            prepare_succeeded = True
+        finally:
+            if sleep_rollout or not prepare_succeeded:
+                _run_cleanup_steps([("empty evaluation rollout sleep", self.rollout.sleep)])
+
     def _eval_pass(
         self,
         data_source: Any,
@@ -764,9 +976,12 @@ class DiffusionTrainer(BaseTrainer):
         eval_sp: Dict[str, BaseSamplingParams],
         step: int,
         *,
+        sync_weights: bool,
+        resync_after_sleep: bool,
+        sleep_rollout: bool,
         media_prefix: Optional[str] = None,
-    ) -> Dict[str, float]:
-        """One generate→score sweep over one eval set; returns each scorer's mean.
+    ) -> Tuple[Dict[str, float], bool, bool]:
+        """One generate→score sweep, pending-sync state, and whether it generated.
 
         The eval prompts are CHUNKED (``eval_chunk_prompts``) so one generate
         never holds N x the KV/decoded on the driver (the it2i memory
@@ -782,26 +997,44 @@ class DiffusionTrainer(BaseTrainer):
         chunk = max(1, self.eval_chunk_prompts)
         sums = {name: 0.0 for name, _ in scorers}
         counts = {name: 0 for name, _ in scorers}
+        sync_pending = bool(sync_weights)
         for start in range(0, n_prompts, chunk):
             sub = all_inputs.slice(start, min(start + chunk, n_prompts))
+            _validate_prompt_tree_dp_geometry(
+                batch_size=int(sub.batch_size),
+                rollout_dp_size=int(self.rollout.dp_size),
+                reward_dp_size=int(self.reward.dp_size),
+                context=f"evaluation chunk [{start}:{start + sub.batch_size}]",
+            )
             request = self._build_request_sample(sub, step, sampling=eval_sp)
-            generated = self.rollout.generate(request)
+            generated = self._generate_with_residency(
+                request,
+                # Engines whose sleep releases the adapter (e.g. SGLang) need
+                # the requested policy re-pushed after every eval-chunk wake.
+                sync_weights=sync_pending or resync_after_sleep,
+                sleep_rollout=sleep_rollout,
+            )
+            sync_pending = False
             first_scored: Optional[Sample] = None
-            for name, reward in scorers:
-                scored = reward.score_and_attach(generated)
-                if first_scored is None:
-                    first_scored = scored
-                rewards = scored.parts[-1].rewards
-                if rewards is not None:
-                    r = hydrate(rewards).to(torch.float32)
-                    if scored is first_scored:
-                        # Captions read part.rewards, which remote scoring returns dehydrated.
-                        scored.parts[-1].rewards = r
-                    sums[name] += float(r.sum().item())
-                    counts[name] += int(r.numel())
+            with self._reward_phase():
+                for name, reward in scorers:
+                    scored = reward.score_and_attach(generated)
+                    if first_scored is None:
+                        first_scored = scored
+                    rewards = scored.parts[-1].rewards
+                    if rewards is not None:
+                        r = hydrate(rewards).to(torch.float32)
+                        if scored is first_scored:
+                            # Captions read part.rewards, which remote scoring returns dehydrated.
+                            scored.parts[-1].rewards = r
+                        sums[name] += float(r.sum().item())
+                        counts[name] += int(r.numel())
+            # Outside _reward_phase: the driver-side media upload must not hold
+            # the train-offload window open.
             if media_prefix and start == 0 and first_scored is not None:
                 self._log_eval_media(first_scored, step, prefix=media_prefix)
-        return {name: sums[name] / max(1, counts[name]) for name, _ in scorers}
+        metrics = {name: sums[name] / max(1, counts[name]) for name, _ in scorers}
+        return metrics, sync_pending, n_prompts > 0
 
     def train(
         self,

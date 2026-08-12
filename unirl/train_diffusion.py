@@ -56,6 +56,8 @@ def main(cfg: DictConfig) -> None:
         train_fraction=cfg.get("train_fraction", 0.5),
         reward_fraction=cfg.get("reward_fraction", 0.0),
         enable_fsdp_offload=cfg.get("enable_fsdp_offload", False),
+        offload_train_during_reward=cfg.get("offload_train_during_reward", False),
+        rollout_sleep_after_generate=cfg.get("rollout_sleep_after_generate", True),
         adv_use_global_std=cfg.get("adv_use_global_std", False),
         accumulate_rollouts=cfg.get("accumulate_rollouts", 1),
         eval_interval=cfg.get("eval_interval", 0),

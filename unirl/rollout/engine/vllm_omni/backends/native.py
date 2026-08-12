@@ -35,7 +35,7 @@ from __future__ import annotations
 import logging
 import os
 from pprint import pformat
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from unirl.rollout.engine.vllm_omni.backends.base import (
     STAGE_KIND_AR,
@@ -361,17 +361,68 @@ class VLLMOmniBackend:
     def _stage_ids(self) -> List[int]:
         return list(range(self.num_stages()))
 
+    @staticmethod
+    def _require_ack_success(action: str, stage_id: int, task_id: str, acks: object) -> None:
+        # Worker handlers catch their own exceptions and answer
+        # ``OmniACK(status="ERROR")`` instead of raising, so a discarded return
+        # value turns a failed sleep/wake into a silent partial transition — the
+        # exact state the engine's transition latch exists to refuse.
+        success_count = 0
+
+        def ack_field(ack: object, name: str, default: object = None) -> object:
+            return ack.get(name, default) if isinstance(ack, Mapping) else getattr(ack, name, default)
+
+        def ack_error(ack: object) -> object:
+            return ack_field(ack, "error_msg", ack_field(ack, "error"))
+
+        def validate_result(result: object) -> None:
+            nonlocal success_count
+            if result is None:
+                # Non-reporting worker ranks legitimately return None; at least
+                # one explicit rank-0 SUCCESS ACK is still required below.
+                return
+            if isinstance(result, (list, tuple)):
+                for item in result:
+                    validate_result(item)
+                return
+
+            status = ack_field(result, "status")
+            if status is None:
+                raise RuntimeError(f"vllm-omni {action} returned no ACK status for stage {stage_id}: result={result!r}")
+            if status != "SUCCESS":
+                raise RuntimeError(
+                    f"vllm-omni {action} failed on stage {stage_id}: worker rank "
+                    f"{ack_field(result, 'rank', '?')} answered status={status!r} "
+                    f"error={ack_error(result)!r}"
+                )
+            ack_stage_id = ack_field(result, "stage_id")
+            ack_task_id = ack_field(result, "task_id")
+            if ack_stage_id is None or int(ack_stage_id) != stage_id:
+                raise RuntimeError(f"vllm-omni {action} ACK stage mismatch: expected {stage_id}, got {ack_stage_id!r}")
+            if ack_task_id is None or str(ack_task_id) != task_id:
+                raise RuntimeError(
+                    f"vllm-omni {action} ACK task mismatch on stage {stage_id}: "
+                    f"expected {task_id!r}, got {ack_task_id!r}"
+                )
+            success_count += 1
+
+        validate_result(acks)
+        if success_count == 0:
+            raise RuntimeError(f"vllm-omni {action} returned no successful ACK for stage {stage_id}")
+
     def sleep_task(self) -> None:
-        """Fan ``handle_sleep_task`` to every stage's workers (level 2)."""
+        """Fan ``handle_sleep_task`` to every stage's workers (level 1)."""
         import uuid
 
         omni = self._require_omni()
         for sid in self._stage_ids():
-            omni.engine.collective_rpc(
+            task_id = str(uuid.uuid4())
+            acks = omni.engine.collective_rpc(
                 method="handle_sleep_task",
-                args=(self._rt["OmniSleepTask"](level=1, task_id=str(uuid.uuid4())),),
+                args=(self._rt["OmniSleepTask"](level=1, task_id=task_id),),
                 stage_ids=[int(sid)],
             )
+            self._require_ack_success("sleep", int(sid), task_id, acks)
 
     def wake_task(self) -> None:
         """Fan ``handle_wake_task`` to every stage's workers + sync CUDA."""
@@ -381,11 +432,13 @@ class VLLMOmniBackend:
 
         omni = self._require_omni()
         for sid in self._stage_ids():
-            omni.engine.collective_rpc(
+            task_id = str(uuid.uuid4())
+            acks = omni.engine.collective_rpc(
                 method="handle_wake_task",
-                args=(self._rt["OmniWakeTask"](tags=None, task_id=str(uuid.uuid4())),),
+                args=(self._rt["OmniWakeTask"](tags=None, task_id=task_id),),
                 stage_ids=[int(sid)],
             )
+            self._require_ack_success("wake", int(sid), task_id, acks)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
 

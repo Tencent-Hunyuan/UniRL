@@ -124,12 +124,22 @@ def _stamp_zero_checkpoint_absent_params(transformer: nn.Module, weights_dir: st
         return
 
     def _zero_absent(model: nn.Module) -> None:
+        from unirl.train.backend.sharded_state import _canonical_param_name
+
         zeroed: List[str] = []
         with torch.no_grad():
             for name, param in model.named_parameters():
-                if name in absent:
+                # The deferred op runs post-wrap: activation checkpointing
+                # interposes wrapper segments the captured names never had.
+                if _canonical_param_name(name) in absent:
                     param.zero_()
                     zeroed.append(name)
+        if len(zeroed) != len(absent):
+            raise RuntimeError(
+                f"FLUX.2-klein meta-init: zeroed {len(zeroed)} of {len(absent)} checkpoint-absent "
+                f"param(s); the unmatched ones keep to_empty garbage. absent={sorted(absent)[:8]} "
+                f"zeroed={sorted(zeroed)[:8]}"
+            )
         if zeroed:
             logger.info(
                 "FLUX.2-klein meta-init: zero-initialized %d checkpoint-absent param(s): %s",
