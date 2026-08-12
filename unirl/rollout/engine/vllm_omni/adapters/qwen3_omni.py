@@ -576,4 +576,7 @@ class Qwen3OmniThinkerAdapter(ModelAdapter):
         return self.output_adapter.build(sample, per_request)
 
 
-__all__ = ["Qwen3OmniThinkerAdapter", "Qwen3OmniThinkerInputAdapter"]
+__all__ = [
+    "Qwen3OmniThinkerAdapter",
+    "Qwen3OmniThinkerInputAdapter",
+]

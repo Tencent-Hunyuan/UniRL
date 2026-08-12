@@ -68,6 +68,7 @@ def inject_lora(
         task_type=str(task_type),
     )
     inject_adapter_in_model(peft_cfg, model, adapter_name=adapter_name)
+    _enforce_model_lora_trainability_contract(model)
 
     if _current_rank() == 0:
         n_trainable = sum(1 for p in model.parameters() if p.requires_grad)
@@ -86,6 +87,40 @@ def inject_lora(
         )
 
     _stamp(model, partial(_reset_adapter, name=adapter_name))
+
+
+def _enforce_model_lora_trainability_contract(model: nn.Module) -> None:
+    """Apply optional model-owned freeze/validation markers after injection."""
+    if bool(getattr(model, "_unirl_freeze_mtp_after_lora", False)):
+        code_predictor = getattr(model, "code_predictor", None)
+        if code_predictor is None:
+            raise RuntimeError("Model requested post-LoRA MTP freezing but has no code_predictor")
+        code_predictor.requires_grad_(False)
+    if bool(getattr(model, "_unirl_freeze_embeddings_after_lora", False)):
+        get_embeddings = getattr(model, "get_input_embeddings", None)
+        if not callable(get_embeddings):
+            raise RuntimeError("Model requested post-LoRA embedding freezing but has no embedding accessor")
+        get_embeddings().requires_grad_(False)
+    if not bool(getattr(model, "_unirl_phase1_layer0_lora_only", False)):
+        return
+
+    named_parameters = list(model.named_parameters())
+    trainable = [name for name, parameter in named_parameters if parameter.requires_grad]
+    invalid = [
+        name
+        for name in trainable
+        if "lora_" not in name or name.startswith("code_predictor.") or ".code_predictor." in name
+    ]
+    mtp_lora = [
+        name
+        for name, _parameter in named_parameters
+        if "lora_" in name and (name.startswith("code_predictor.") or ".code_predictor." in name)
+    ]
+    if not trainable or invalid or mtp_lora:
+        raise RuntimeError(
+            "Phase-1 Talker trainability contract requires LoRA only outside MTP; "
+            f"trainable={trainable[:12]}, invalid={invalid[:12]}, mtp_lora={mtp_lora[:12]}"
+        )
 
 
 def _reset_adapter(model: nn.Module, *, name: str) -> None:

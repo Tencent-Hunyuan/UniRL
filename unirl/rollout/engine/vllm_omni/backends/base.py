@@ -113,6 +113,10 @@ class OmniRawResult(Protocol):
       nested vLLM ``RequestOutput`` (``.outputs[0].token_ids`` / ``.logprobs``
       / ``.text``) — and ``prompt_token_ids`` (the sample's true, un-padded
       prompt; vLLM runs prompts per-request with no batch padding).
+      The capability-gated Qwen3-Omni direct-TTS path additionally requires
+      ``custom_output["unirl_qwen3_omni_direct_tts"]`` on both the Talker and
+      Code2Wav final outputs; its adapter validates every field and rejects
+      upstream spoken-response-only runtimes before spawn.
     - DiT stage (``"image"`` / ``"video"``): ``images`` (PIL list; per-prompt
       frame list for video), ``trajectory_latents`` ``[1, T+1, ...]`` (dense —
       every step recorded), ``trajectory_timesteps`` ``[T+1]`` (the field name
@@ -207,6 +211,7 @@ class Backend(Protocol):
         adapter_name: str,
         lora_tensors: Dict[str, Any],
         peft_config: Optional[dict],
+        stage_ids: Optional[List[int]],
     ) -> None: ...
     def set_lora_copy(
         self,
@@ -214,9 +219,16 @@ class Backend(Protocol):
         adapter_name: str,
         lora_tensors: Dict[str, Any],
         peft_config: Optional[dict],
+        stage_ids: Optional[List[int]],
     ) -> None: ...
     def param_checksums(self, *, names: List[str]) -> dict: ...
-    def lora_checksums(self, *, adapter_id: int, names: Optional[List[str]]) -> dict: ...
+    def lora_checksums(
+        self,
+        *,
+        adapter_id: int,
+        names: Optional[List[str]],
+        stage_ids: Optional[List[int]],
+    ) -> dict: ...
 
 
 __all__ = [

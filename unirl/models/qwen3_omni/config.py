@@ -46,7 +46,8 @@ class Qwen3OmniPipelineConfig:
     # Whether to include the video's audio track in TMRoPE inputs.
     use_audio_in_video: bool = False
 
-    # Unsupported until the FSDP loader remaps checkpoint ``thinker.`` keys.
+    # Talker direct-TTS supports meta-init and prefix-selective ``talker.*``
+    # loading. The legacy Thinker-only path remains eager-only.
     meta_init_transformer: bool = False
 
     system_instruction: Optional[str] = None
@@ -54,6 +55,27 @@ class Qwen3OmniPipelineConfig:
     # (for example tool schemas). Required tensor/tokenization return-shape
     # kwargs are enforced by the chat-template stage.
     chat_template_kwargs: Dict[str, Any] = field(default_factory=dict)
+
+    # --- Talker TTS RL / SFT ---
+    # Compatibility switch: Qwen3OmniBundle.from_config delegates to the
+    # standalone Qwen3OmniTalkerBundle. It loads only the frozen Thinker input
+    # embedding table, Talker+MTP, and frozen Code2Wav.
+    enable_talker: bool = False
+    # Legacy option retained for recipe compatibility; direct TTS has no full
+    # Thinker to freeze and always freezes its embedding provider.
+    freeze_thinker: bool = True
+    # Always freeze Code2Wav (decode-for-reward / SFT observation only).
+    freeze_code2wav: bool = True
+    # Phase-1 RL freezes the residual decoder and both embedding providers.
+    freeze_mtp: bool = False
+    freeze_talker_embeddings: bool = True
+    phase1_layer0_lora_only: bool = False
+    # Default TTS system prompt when the dataset does not supply one.
+    tts_system_instruction: Optional[str] = (
+        "You are a high-quality TTS model. Convert the user's text into natural speech audio."
+    )
+    # Default speaker when Part metadata omits ``speaker``.
+    default_speaker: str = "Ethan"
 
     def __post_init__(self) -> None:
         validate_precision_type(self.model_precision, field="Qwen3OmniPipelineConfig.model_precision")
@@ -63,6 +85,17 @@ class Qwen3OmniPipelineConfig:
             raise ValueError(f"Qwen3OmniPipelineConfig.video_max_frames must be >= 1, got {self.video_max_frames!r}")
         if self.video_max_pixels is not None and int(self.video_max_pixels) < 1:
             raise ValueError(f"Qwen3OmniPipelineConfig.video_max_pixels must be >= 1, got {self.video_max_pixels!r}")
+        if self.phase1_layer0_lora_only and not self.use_lora:
+            raise ValueError(
+                "Qwen3OmniPipelineConfig.phase1_layer0_lora_only requires use_lora=True"
+            )
+        if self.phase1_layer0_lora_only and not (
+            self.freeze_mtp and self.freeze_code2wav and self.freeze_talker_embeddings
+        ):
+            raise ValueError(
+                "Phase-1 layer0-LoRA mode requires freeze_mtp, freeze_code2wav, "
+                "and freeze_talker_embeddings"
+            )
 
 
 __all__ = ["Qwen3OmniPipelineConfig"]

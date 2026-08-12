@@ -1,0 +1,87 @@
+# Qwen3-Omni direct-TTS rollout: prefix -> Talker(+frozen MTP) -> Code2Wav.
+#
+# This is NOT upstream's Thinker -> Talker spoken-response pipeline. Startup is
+# gated by capabilities.require_direct_tts_runtime(). Upstream vllm-omni 0.20.0
+# does not advertise the required v1 trajectory contract and must fail before
+# spawning. A compatible patched runtime must consume additional_information
+# ["unirl_qwen3_omni_direct_tts"] at the Talker stage and echo the complete
+# layer0/processed-logprob/residual/prefix/speaker/EOS contract on custom_output.
+stage_args:
+  - stage_id: 0
+    stage_type: llm
+    runtime:
+      devices: "0,1,2,3"
+    engine_args:
+      model_stage: talker
+      model_arch: Qwen3OmniMoeForConditionalGeneration
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      engine_output_type: latent
+      hf_config_name: talker_config
+
+      tensor_parallel_size: 4
+      distributed_executor_backend: "mp"
+
+      gpu_memory_utilization: 0.35
+      max_num_seqs: 32
+      max_num_batched_tokens: 16384
+      enable_chunked_prefill: true
+
+      dtype: bfloat16
+      load_format: safetensors
+      trust_remote_code: true
+      enable_prefix_caching: false
+      enforce_eager: false
+
+      enable_lora: true
+      max_lora_rank: 64
+      max_loras: 1
+
+      worker_extension_cls: unirl.rollout.engine.vllm_omni.worker.qwen3_omni_ar_extension.Qwen3OmniTalkerWeightSyncExtension
+
+      enable_sleep_mode: true
+      logprobs_mode: processed_logprobs
+      disable_log_stats: true
+    final_output: true
+    final_output_type: text
+    is_comprehension: false
+
+  - stage_id: 1
+    stage_type: llm
+    runtime:
+      devices: "0"
+    engine_args:
+      model_stage: code2wav
+      model_arch: Qwen3OmniMoeForConditionalGeneration
+      worker_type: generation
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      engine_output_type: audio
+      # vLLM-Omni's Qwen3-Omni wrapper selects code2wav_config internally.
+      # The stage loader itself must receive the parent Thinker config.
+      hf_config_name: thinker_config
+
+      tensor_parallel_size: 1
+      distributed_executor_backend: "mp"
+      gpu_memory_utilization: 0.10
+      max_num_seqs: 32
+      max_num_batched_tokens: 1000000
+      enable_prefix_caching: false
+      async_scheduling: false
+      enforce_eager: true
+      trust_remote_code: true
+      enable_lora: false
+      enable_sleep_mode: true
+      disable_log_stats: true
+    engine_input_source: [0]
+    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_omni.talker2code2wav
+    final_output: true
+    final_output_type: audio
+    is_comprehension: false
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      seed: 42
+      detokenize: true
+      repetition_penalty: 1.1

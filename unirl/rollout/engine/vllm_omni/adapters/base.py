@@ -107,6 +107,9 @@ class ModelAdapter(ABC):
     #: Re-push LoRA after wake via the byte-copy transport (TP>1 stages where
     #: the zero-copy handle crashes ranks 2..N; v1 wake branch).
     lora_copy_transport: bool = False
+    #: Optional stage allowlist for LoRA registration/activation. ``None``
+    #: preserves the historical all-stage behavior.
+    lora_stage_ids: Optional[Tuple[int, ...]] = None
 
     def __init__(
         self,

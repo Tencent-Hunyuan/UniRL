@@ -419,6 +419,17 @@ class VLLMOmniBackend:
     def _stage_ids(self) -> List[int]:
         return list(range(self.num_stages()))
 
+    def _selected_stage_ids(self, stage_ids: Optional[Sequence[int]]) -> List[int]:
+        available = set(self._stage_ids())
+        selected = sorted(available if stage_ids is None else {int(stage_id) for stage_id in stage_ids})
+        invalid = sorted(set(selected) - available)
+        if invalid or not selected:
+            raise RuntimeError(
+                f"VLLMOmniBackend: invalid/empty stage allowlist {stage_ids!r}; "
+                f"available={sorted(available)}"
+            )
+        return selected
+
     # ------------------------------------------------------------------ #
     # Memory / lifecycle / health
     # ------------------------------------------------------------------ #
@@ -612,6 +623,7 @@ class VLLMOmniBackend:
         adapter_name: str,
         lora_tensors: Dict[str, Any],
         peft_config: Optional[dict],
+        stage_ids: Optional[List[int]] = None,
     ) -> None:
         """Zero-copy LoRA push via ``MultiprocessingSerializer`` shm handles.
 
@@ -633,7 +645,8 @@ class VLLMOmniBackend:
 
         omni = self._require_omni()
         lora_tensors = self._wrap_peft_envelope(lora_tensors)
-        self._remove_existing_lora(int(DIFFRL_LORA_INT_ID))
+        selected_stage_ids = self._selected_stage_ids(stage_ids)
+        self._remove_existing_lora(int(DIFFRL_LORA_INT_ID), stage_ids=selected_stage_ids)
 
         # Pass primitive fields, not an ``OmniTensorLoRARequest``: vllm's
         # msgspec wire encoder doesn't recognise our Struct subclass and
@@ -644,7 +657,7 @@ class VLLMOmniBackend:
             MultiprocessingSerializer,
         )
 
-        for sid in self._stage_ids():
+        for sid in selected_stage_ids:
             cloned = {
                 name: t.detach().clone() if isinstance(t, torch.Tensor) else t for name, t in lora_tensors.items()
             }
@@ -667,6 +680,7 @@ class VLLMOmniBackend:
         adapter_name: str,
         lora_tensors: Dict[str, Any],
         peft_config: Optional[dict],
+        stage_ids: Optional[List[int]] = None,
     ) -> None:
         """Byte-copy LoRA push (``torch.save`` + base64) — TP>1-broadcast-safe.
 
@@ -689,7 +703,8 @@ class VLLMOmniBackend:
 
         omni = self._require_omni()
         lora_tensors = self._wrap_peft_envelope(lora_tensors)
-        self._remove_existing_lora(int(DIFFRL_LORA_INT_ID))
+        selected_stage_ids = self._selected_stage_ids(stage_ids)
+        self._remove_existing_lora(int(DIFFRL_LORA_INT_ID), stage_ids=selected_stage_ids)
 
         cpu_tensors = {
             name: t.detach().to("cpu") if isinstance(t, torch.Tensor) else t for name, t in lora_tensors.items()
@@ -698,7 +713,7 @@ class VLLMOmniBackend:
         torch.save(cpu_tensors, buf)
         serialized = base64.b64encode(buf.getvalue()).decode("ascii")
 
-        for sid in self._stage_ids():
+        for sid in selected_stage_ids:
             omni.engine.collective_rpc(
                 method="set_lora_from_tensor_dict_copy",
                 args=(
@@ -726,7 +741,12 @@ class VLLMOmniBackend:
             return adapt_lora_for_vllm(lora_tensors)
         return lora_tensors
 
-    def _remove_existing_lora(self, adapter_id: int) -> None:
+    def _remove_existing_lora(
+        self,
+        adapter_id: int,
+        *,
+        stage_ids: Optional[Sequence[int]] = None,
+    ) -> None:
         """Drop the existing adapter on every stage before re-adding.
 
         Matches the receive-side ``_diffrl_load_bucket`` ordering.
@@ -734,7 +754,7 @@ class VLLMOmniBackend:
         call — subsequent failures still flow up via the add below.
         """
         omni = self._require_omni()
-        for sid in self._stage_ids():
+        for sid in self._selected_stage_ids(stage_ids):
             try:
                 omni.engine.collective_rpc(
                     method="remove_lora",
@@ -766,11 +786,17 @@ class VLLMOmniBackend:
             out[int(sid)] = results[0] if isinstance(results, list) and results else results
         return out
 
-    def lora_checksums(self, *, adapter_id: int, names: Optional[List[str]]) -> dict:
+    def lora_checksums(
+        self,
+        *,
+        adapter_id: int,
+        names: Optional[List[str]],
+        stage_ids: Optional[List[int]] = None,
+    ) -> dict:
         """Fan ``_diffrl_loaded_lora_checksums`` across stages and ranks."""
         omni = self._require_omni()
         out: dict = {}
-        for sid in self._stage_ids():
+        for sid in self._selected_stage_ids(stage_ids):
             results = omni.engine.collective_rpc(
                 method="_diffrl_loaded_lora_checksums",
                 args=(int(adapter_id), list(names) if names else None),

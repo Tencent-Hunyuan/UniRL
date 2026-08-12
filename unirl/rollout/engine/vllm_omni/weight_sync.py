@@ -40,6 +40,7 @@ class WeightSync:
         *,
         uses_lora: bool,
         lora_copy_transport: bool,
+        lora_stage_ids: Optional[List[int]] = None,
     ) -> None:
         self._backend = backend
         self._uses_lora = bool(uses_lora)
@@ -47,6 +48,7 @@ class WeightSync:
         # byte-copy transport (the zero-copy handle's one-shot fd pops after
         # the first consumer, crashing ranks 2..N).
         self._lora_copy_transport = bool(lora_copy_transport)
+        self._lora_stage_ids = None if lora_stage_ids is None else [int(stage_id) for stage_id in lora_stage_ids]
         #: An adapter has been pushed and should be active on generate.
         self._lora_loaded = False
         #: The runtime released its memory since the last push (sleep) — the
@@ -171,7 +173,12 @@ class WeightSync:
     ) -> None:
         """Hot-swap the adapter via the zero-copy shm-handle transport."""
         self._cache_lora(adapter_name, lora_tensors, peft_config)
-        self._backend.set_lora_handle(adapter_name=adapter_name, lora_tensors=lora_tensors, peft_config=peft_config)
+        self._backend.set_lora_handle(
+            adapter_name=adapter_name,
+            lora_tensors=lora_tensors,
+            peft_config=peft_config,
+            stage_ids=self._lora_stage_ids,
+        )
         self._lora_loaded = True
         self._weights_released = False
 
@@ -184,7 +191,12 @@ class WeightSync:
     ) -> None:
         """Hot-swap the adapter via the TP>1-safe byte-copy transport."""
         self._cache_lora(adapter_name, lora_tensors, peft_config)
-        self._backend.set_lora_copy(adapter_name=adapter_name, lora_tensors=lora_tensors, peft_config=peft_config)
+        self._backend.set_lora_copy(
+            adapter_name=adapter_name,
+            lora_tensors=lora_tensors,
+            peft_config=peft_config,
+            stage_ids=self._lora_stage_ids,
+        )
         self._lora_loaded = True
         self._weights_released = False
 
@@ -207,7 +219,11 @@ class WeightSync:
         return self._backend.param_checksums(names=list(names))
 
     def loaded_lora_checksums(self, *, adapter_id: int, names: Optional[List[str]] = None) -> dict:
-        return self._backend.lora_checksums(adapter_id=int(adapter_id), names=names)
+        return self._backend.lora_checksums(
+            adapter_id=int(adapter_id),
+            names=names,
+            stage_ids=self._lora_stage_ids,
+        )
 
     # ------------------------------------------------------------------ #
     # Weights-released event + the wake-time restore

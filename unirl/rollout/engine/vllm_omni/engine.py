@@ -113,6 +113,11 @@ class VLLMOmniRolloutEngine(BaseSingleTurnRolloutEngine):
             self._backend,
             uses_lora=bool(getattr(model_config, "use_lora", False)),
             lora_copy_transport=self.adapter.lora_copy_transport,
+            lora_stage_ids=(
+                list(self.adapter.lora_stage_ids)
+                if self.adapter.lora_stage_ids is not None
+                else None
+            ),
         )
 
     def _tokenize_prompt(self, text: str, *, task: str, sys_type: str) -> List[int]:
@@ -254,6 +259,14 @@ class VLLMOmniRolloutEngine(BaseSingleTurnRolloutEngine):
         stage YAML at boot). The IPC weight-sync handler needs this to skip
         orphan train ranks that exceed a stage's TP size."""
         return self._backend.tp_per_stage()
+
+    def lora_tp_per_stage(self) -> Dict[int, int]:
+        """Topology of stages on which this adapter permits LoRA."""
+        topology = self._backend.tp_per_stage()
+        allowed = self.adapter.lora_stage_ids
+        if allowed is None:
+            return topology
+        return {int(stage_id): topology[int(stage_id)] for stage_id in allowed}
 
     # ------------------------------------------------------------------ #
     # Weight sync — frozen base.py surface; thin forwards to the component.

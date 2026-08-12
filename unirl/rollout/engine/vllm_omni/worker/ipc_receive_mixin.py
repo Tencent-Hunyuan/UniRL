@@ -133,6 +133,9 @@ class BucketedIPCReceiveMixin:
     ) -> None:
         if peft_config and base_sync_done:
             tensors = dict(weights)
+            validator = getattr(self, "_diffrl_validate_lora_tensors", None)
+            if callable(validator):
+                validator(tensors)
             lora_request = OmniTensorLoRARequest(
                 lora_name=DIFFRL_LORA_NAME,
                 lora_int_id=DIFFRL_LORA_INT_ID,
@@ -278,6 +281,9 @@ class BucketedIPCReceiveMixin:
                 f"deserialised lora_tensors expected dict, got "
                 f"{type(lora_tensors).__name__}"
             )
+        validator = getattr(self, "_diffrl_validate_lora_tensors", None)
+        if callable(validator):
+            validator(lora_tensors)
         request = OmniTensorLoRARequest(
             lora_name=str(lora_name),
             lora_int_id=int(lora_int_id),
@@ -324,6 +330,9 @@ class BucketedIPCReceiveMixin:
                 f"deserialised lora_tensors expected dict, got "
                 f"{type(lora_tensors).__name__}"
             )
+        validator = getattr(self, "_diffrl_validate_lora_tensors", None)
+        if callable(validator):
+            validator(lora_tensors)
         from unirl.rollout.engine.vllm_omni.patches.runtime import (
             OmniTensorLoRARequest,
         )

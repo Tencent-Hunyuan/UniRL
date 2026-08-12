@@ -1,0 +1,121 @@
+# @package _global_
+# Direct-TTS SFT — standalone Talker(+MTP), frozen Thinker embedding/Code2Wav.
+#
+# Data MUST be produced offline and carry exact model/codec fingerprints.
+#
+# Prep:
+#   python -m unirl.utils.prepare_talker_tts_data \
+#     --input_jsonl /path/raw_tts.jsonl --output_jsonl data/talker_sft/train.jsonl \
+#     --talker_model "$QWEN3_OMNI_PATH" --mimi_model "$MIMI_PATH"
+# Copy both printed SHA-256 values into TALKER_MODEL_FINGERPRINT and
+# TALKER_CODEC_FINGERPRINT. No fingerprint has a recipe fallback.
+#
+# Four-GPU smoke (all future GPU smokes use exactly this visibility):
+#   CUDA_VISIBLE_DEVICES=0,1,2,3 GPUS_PER_NODE=4 ENTRY=train_sft \
+#   QWEN3_OMNI_PATH=... SFT_DATA=data/talker_sft/train.jsonl \
+#   SFT_EVAL_DATA=data/talker_sft/val.jsonl \
+#   TALKER_MODEL_FINGERPRINT=... TALKER_CODEC_FINGERPRINT=... \
+#   bash examples/run_experiment_single_node.sh sft/qwen3_omni_talker_sft
+
+num_devices: 8
+batch_size: 8
+num_steps: 500
+eval_interval: 50
+eval_batch_size: 4
+eval_num_samples: -1
+save_interval: 100
+save_mode: auto
+
+logging:
+  report_to_wandb: true
+  project_name: unirl-qwen3-omni-talker
+  run_name: qwen3_omni_talker_sft
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: [sft, qwen3-omni, talker, tts]
+
+# PEFT receives one adapter, but these independently overrideable regexes select
+# the main Talker and nested MTP subtrees. Optimizer LRs are split separately.
+talker_lora_targets: '^(?!code_predictor\.).*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)$'
+mtp_lora_targets: '^code_predictor\..*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)$'
+
+bundle:
+  _target_: unirl.models.qwen3_omni.talker_bundle.Qwen3OmniTalkerBundle.from_config
+  config:
+    _target_: unirl.models.qwen3_omni.config.Qwen3OmniPipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:QWEN3_OMNI_PATH}
+    model_precision: bf16
+    attn_implementation: sdpa
+    enable_talker: true
+    freeze_thinker: true
+    freeze_code2wav: true
+    use_gradient_checkpointing: true
+    max_prompt_length: 2048
+    default_speaker: Ethan
+
+pipeline:
+  _target_: unirl.models.qwen3_omni.talker_pipeline.Qwen3OmniTalkerPipeline.from_bundle
+  max_prompt_length: 2048
+  decode_audio: false
+  autocast_precision: bf16
+  logprob_precision: fp32
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["Qwen3OmniMoeTalkerDecoderLayer"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: false
+    use_torch_compile: false
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 8
+    alpha: 16
+    target_modules: '${talker_lora_targets}|${mtp_lora_targets}'
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: ${oc.env:TALKER_LR,2.0e-5}
+    param_group_lrs:
+      code_predictor: ${oc.env:TALKER_MTP_LR,2.0e-5}
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.01
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: cosine
+    warmup_steps: 25
+    total_steps: ${num_steps}
+
+algorithm:
+  _target_: unirl.algorithms.talker_sft.TalkerSFT
+  stage_attr: ar
+  lambda_sft: ${oc.env:TALKER_SFT_LAMBDA,2.0}
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.qwen3_omni.talker_conditions.Qwen3OmniTalkerConditions
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+
+track_builder:
+  _target_: unirl.models.qwen3_omni.talker_sft.TalkerSupervisedTrackBuilder
+  max_response_length: 2048
+  max_prompt_length: 2048
+  append_codec_eos: true
+  expected_codec_fingerprint: ${oc.env:TALKER_CODEC_FINGERPRINT}
+  expected_model_fingerprint: ${oc.env:TALKER_MODEL_FINGERPRINT}
+  strict_fingerprints: true
+
+data_source:
+  _target_: unirl.data.sft.SupervisedDataSource
+  manifest_path: ${oc.env:SFT_DATA}
+  eval_manifest_path: ${oc.env:SFT_EVAL_DATA,${oc.env:SFT_DATA}}
+  seed: 42

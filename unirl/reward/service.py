@@ -10,7 +10,7 @@ attached to the frontier Part, under DP-sharded distributed dispatch.
 from __future__ import annotations
 
 import logging
-from typing import Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 
@@ -20,10 +20,70 @@ from unirl.types.primitives import Images, Texts, primitive_modality_key
 from unirl.types.reward import RewardRequest, RewardResponse
 from unirl.types.sample import Primitive, Sample, _part_with_field
 from unirl.types.sampling import ARSamplingParams
+from unirl.types.segments import SegmentStatus
 
 from .base import DifferentiableReward, RewardBackend
 
 logger = logging.getLogger(__name__)
+
+
+def _codec_statistics(tokens: torch.Tensor) -> Dict[str, Any]:
+    values = [int(value) for value in tokens.detach().cpu().view(-1).tolist()]
+    count = len(values)
+    if count == 0:
+        return {
+            "num_codec_tokens": 0,
+            "codec_unique_ratio": 0.0,
+            "codec_max_run_fraction": 1.0,
+            "codec_repetition_fraction": 1.0,
+        }
+    max_run = run = 1
+    for previous, current in zip(values, values[1:]):
+        run = run + 1 if current == previous else 1
+        max_run = max(max_run, run)
+    ngram_size = min(4, count)
+    ngrams = [tuple(values[i : i + ngram_size]) for i in range(count - ngram_size + 1)]
+    repeated = len(ngrams) - len(set(ngrams))
+    return {
+        "num_codec_tokens": count,
+        "codec_unique_ratio": len(set(values)) / count,
+        "codec_max_run_fraction": max_run / count,
+        "codec_repetition_fraction": repeated / len(ngrams) if ngrams else 0.0,
+        "last_codec_token_id": values[-1],
+    }
+
+
+def _frontier_rollout_metadata(frontier, index: int) -> Dict[str, Any]:
+    rollout: Dict[str, Any] = {}
+    status = frontier.status
+    if status is None and frontier.segment is not None:
+        status = getattr(frontier.segment, "status", None)
+    if status is not None and index < int(status.numel()):
+        status_value = int(status[index].item())
+        rollout["segment_status"] = SegmentStatus(status_value).name.lower()
+        rollout["has_eos"] = status_value == int(SegmentStatus.COMPLETED)
+        rollout["decode_failure"] = status_value == int(SegmentStatus.ABORTED)
+
+    segment = frontier.segment
+    if segment is not None:
+        tokens = getattr(segment, "tokens", None)
+        cu = getattr(segment, "cu_seqlens", None)
+        if tokens is not None and cu is not None and index + 1 < int(cu.numel()):
+            start, end = int(cu[index].item()), int(cu[index + 1].item())
+            sample_tokens = tokens[start:end]
+            rollout.update(_codec_statistics(sample_tokens))
+            behavior = frontier.conditions.get("behavior_sampling") if isinstance(frontier.conditions, dict) else None
+            eos_id = behavior.get("eos_token_id") if isinstance(behavior, dict) else None
+            if eos_id is not None:
+                rollout["has_eos"] = bool(sample_tokens.numel() and int(sample_tokens[-1].item()) == int(eos_id))
+
+    sampling_params = frontier.sampling_params
+    if isinstance(sampling_params, ARSamplingParams):
+        rollout["max_new_tokens"] = int(sampling_params.max_new_tokens)
+    audio_meta = frontier.primitive_metadata.get("audio", {})
+    if "decode_failure" in audio_meta:
+        rollout["decode_failure"] = bool(audio_meta["decode_failure"])
+    return rollout
 
 
 def _build_reward_request(sample: Sample, preferred_input_kind: str) -> RewardRequest:
@@ -49,7 +109,17 @@ def _build_reward_request(sample: Sample, preferred_input_kind: str) -> RewardRe
             f"{sorted(frontier.primitives)!r}; check the recipe's reward/model pairing."
         )
 
-    metadata = sample.root_metadata(-1)
+    root_metadata = sample.root_metadata(-1)
+    frontier_metadata: List[Dict[str, Any]] = list(frontier.metadata or [])
+    metadata: List[Dict[str, Any]] = []
+    for index in range(frontier.batch_size):
+        merged = dict(root_metadata[index] or {}) if index < len(root_metadata) else {}
+        if index < len(frontier_metadata):
+            merged.update(frontier_metadata[index] or {})
+        rollout = dict(merged.get("rollout") or {})
+        rollout.update(_frontier_rollout_metadata(frontier, index))
+        merged["rollout"] = rollout
+        metadata.append(merged)
     generated = dict(frontier.primitives)
     audio_sample_rate: Optional[int] = None
     audio_metadata = frontier.primitive_metadata.get("audio", {})
@@ -62,7 +132,7 @@ def _build_reward_request(sample: Sample, preferred_input_kind: str) -> RewardRe
         prompt_ids=[str(sid) for sid in frontier.sample_ids],
         sample_ids=list(frontier.sample_ids),
         group_ids=list(frontier.group_ids),
-        metadata=(metadata if any(m is not None for m in metadata) else None),
+        metadata=metadata,
     )
 
 
@@ -77,6 +147,11 @@ class RewardService(Remote):
         overlong_penalty_factor: float = 1.0,
     ) -> None:
         super().__init__()
+        if not bool(getattr(backend, "training_eligible", True)):
+            raise ValueError(
+                f"{type(backend).__name__} is diagnostic-only (dry_run/unavailable) and cannot be "
+                "registered with the training RewardService."
+            )
         self.backend = backend
         # How to score AR generations that hit max_new_tokens (sglang finish=="length"):
         #   "zero" — force reward 0 on truncated traces (anti-ramble; the default).
@@ -101,9 +176,9 @@ class RewardService(Remote):
     def preferred_input_kind(self) -> str:
         """The decoded media kind the backend consumes (image/video/text)."""
         kind = str(getattr(self.backend, "preferred_input_kind", "") or "").strip().lower()
-        if kind not in {"image", "video", "text"}:
+        if kind not in {"image", "video", "text", "audio"}:
             raise ValueError(
-                f"Reward backend must expose preferred_input_kind as 'image', 'video', or 'text'. Got {kind!r}."
+                f"Reward backend must expose preferred_input_kind as 'image', 'video', 'text', or 'audio'. Got {kind!r}."
             )
         return kind
 

@@ -33,6 +33,11 @@ _BUILTIN_SCORERS: Dict[str, Tuple[str, str]] = {
     "clap": ("unirl.reward.local.clap", "CLAPRewardScorer"),
     "imagebind": ("unirl.reward.local.imagebind", "ImageBindRewardScorer"),
     "t2av_composite": ("unirl.reward.local.t2av_composite", "T2AVCompositeScorer"),
+    "tts_wer": ("unirl.reward.local.tts_wer", "TTSWerRewardScorer"),
+    "tts_speaker_sim": ("unirl.reward.local.tts_speaker_sim", "TTSSpeakerSimRewardScorer"),
+    "tts_utmos": ("unirl.reward.local.tts_utmos", "TTSUTMOSRewardScorer"),
+    "tts_stability": ("unirl.reward.local.tts_stability", "TTSStabilityRewardScorer"),
+    "tts_composite": ("unirl.reward.local.tts_composite", "TTSCompositeScorer"),
 }
 
 _BUILTIN_SPECS: Dict[str, Tuple[str, str]] = {
@@ -52,6 +57,11 @@ _BUILTIN_SPECS: Dict[str, Tuple[str, str]] = {
     "clap": ("unirl.reward.local.clap", "CLAPSpec"),
     "imagebind": ("unirl.reward.local.imagebind", "ImageBindSpec"),
     "t2av_composite": ("unirl.reward.local.t2av_composite", "T2AVCompositeSpec"),
+    "tts_wer": ("unirl.reward.local.tts_wer", "TTSWerSpec"),
+    "tts_speaker_sim": ("unirl.reward.local.tts_speaker_sim", "TTSSpeakerSimSpec"),
+    "tts_utmos": ("unirl.reward.local.tts_utmos", "TTSUTMOSSpec"),
+    "tts_stability": ("unirl.reward.local.tts_stability", "TTSStabilitySpec"),
+    "tts_composite": ("unirl.reward.local.tts_composite", "TTSCompositeSpec"),
 }
 
 

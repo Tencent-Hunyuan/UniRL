@@ -19,4 +19,22 @@ class Qwen3OmniARWeightSyncExtension(
     pass
 
 
-__all__ = ["Qwen3OmniARWeightSyncExtension"]
+class Qwen3OmniTalkerWeightSyncExtension(
+    BucketedIPCReceiveMixin,
+    NcclBroadcastReceiveMixin,
+):
+    """Talker-only receiver that rejects MTP/Thinker/Code2Wav LoRA keys."""
+
+    @staticmethod
+    def _diffrl_validate_lora_tensors(tensors) -> None:
+        from unirl.distributed.weight_sync.lora.qwen3_omni_talker import (
+            validate_talker_lora_keys,
+        )
+
+        validate_talker_lora_keys(tensors, engine_envelope=True)
+
+
+__all__ = [
+    "Qwen3OmniARWeightSyncExtension",
+    "Qwen3OmniTalkerWeightSyncExtension",
+]

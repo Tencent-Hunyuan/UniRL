@@ -22,13 +22,18 @@ import logging
 import os
 import re
 from fnmatch import fnmatchcase
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 from torch import nn
 
 from unirl.train.backend.sharded_state import _build_state_dict_options, _current_rank
-from unirl.train.backend.veomni.ep.models.qwen3_moe import build_local_fused_block
+from unirl.train.backend.veomni.ep.models.qwen3_moe import (
+    build_local_fused_block,
+    fused_expert_kind,
+    is_fused_expert_param,
+    normalize_fused_param_name,
+)
 from unirl.train.backend.veomni.ep.placement import assign_local_block, ep_named_parameters
 
 logger = logging.getLogger(__name__)
@@ -63,7 +68,14 @@ def load_trainable_weights(
     """
     weights_path = getattr(bundle, "_transformer_weights_path", None)
     if weights_path is not None:
-        load_sharded(model, weights_path, device=device, strict=False)
+        # Composite HF checkpoints can keep the trainable root below a prefix
+        # (for example Qwen3-Omni stores the standalone Talker as ``talker.*``).
+        # The prefix is stripped while reading so the backend still loads the
+        # standalone module's native state-dict layout. Reading is prefix-aware,
+        # not a post-load filter, to avoid materializing unrelated checkpoint
+        # tensors on rank 0.
+        key_prefix = getattr(bundle, "_transformer_weights_key_prefix", None)
+        load_sharded(model, weights_path, device=device, strict=False, key_prefix=key_prefix)
         # Recover init-computed non-persistent buffers/attrs (RoPE inv_freq, sincos
         # tables, …) captured on the bundle before meta-init's `to_empty` clobbered
         # them and not carried by the checkpoint. Restoring here — in the shared
@@ -81,7 +93,10 @@ def load_trainable_weights(
         # and nothing learns; SGLang ties its own lm_head so old_logp is fine).
         # tie_weights() re-points lm_head.weight at the loaded embed_tokens.weight.
         retied = False
-        if getattr(getattr(model, "config", None), "tie_word_embeddings", False) and hasattr(model, "tie_weights"):
+        tied_keys = getattr(getattr(model, "module", model), "_tied_weights_keys", None)
+        if (
+            getattr(getattr(model, "config", None), "tie_word_embeddings", False) or tied_keys
+        ) and hasattr(model, "tie_weights"):
             model.tie_weights()
             retied = True
         logger.info(
@@ -121,6 +136,7 @@ def load_sharded(
     *,
     device: torch.device,
     strict: bool = False,
+    key_prefix: Optional[str] = None,
 ) -> None:
     """Materialize ``module`` from a (diffusers-layout) safetensors directory.
 
@@ -136,12 +152,21 @@ def load_sharded(
     # mmap'd ``get_slice`` and uses DTensor-native ``distribute_tensor`` to fill
     # its exact local shard. Non-EP models keep the rank-0-broadcast path verbatim.
     if hasattr(module, "_extra_parallel_param_groups"):
+        if key_prefix:
+            raise NotImplementedError(
+                "EP sliced loading does not yet support composite-checkpoint "
+                f"key_prefix={key_prefix!r}; use the FSDP backend for this bundle."
+            )
         if _module_has_meta_param(module):
             module.to_empty(device=device)
         _load_state_dict_ep_sliced(module, weights_dir, device=device, strict=strict)
         return
 
-    state_dict = _read_safetensors_dir(weights_dir) if _current_rank() == 0 else {}
+    state_dict = (
+        _read_safetensors_dir(weights_dir, key_prefix=key_prefix)
+        if _current_rank() == 0
+        else {}
+    )
     _load_state_dict_sharded(module, state_dict, device=device, strict=strict)
 
 
@@ -407,6 +432,7 @@ def _load_state_dict_sharded(
         # Align raw-checkpoint keys to the constructed model's key layout *before*
         # the LoRA base_layer hop, then guard against a silent no-load.
         state_dict = _remap_hf_checkpoint_keys(state_dict, module)
+        state_dict = _fuse_hf_expert_keys(state_dict, module)
         state_dict = _remap_lora_base_keys(state_dict, module)
         _assert_state_dict_covers_model(state_dict, module)
 
@@ -428,12 +454,66 @@ def _module_has_meta_param(module: nn.Module) -> bool:
     return any(p.is_meta for p in module.parameters(recurse=True))
 
 
-def _read_safetensors_dir(weights_dir: str) -> StateDict:
+def _fuse_hf_expert_keys(state_dict: StateDict, model: nn.Module) -> StateDict:
+    """Convert HF per-expert projections into this model's stacked tensors.
+
+    Qwen3-Omni checkpoints store ``experts.{e}.{gate,up,down}_proj.weight``
+    while the Transformers runtime uses ``experts.{gate_up,down}_proj`` 3-D
+    parameters. ``from_pretrained(strict=False)`` silently leaves those stacked
+    parameters uninitialized, so direct safetensors/FSDP loading must perform
+    the same explicit layout conversion used by the EP loader.
+    """
+    available = set(state_dict)
+    fused = 0
+    unwrapped = getattr(model, "module", model)
+
+    def get_tensor(key: str) -> torch.Tensor:
+        value = state_dict[key]
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(f"sharded_load: expert checkpoint value {key!r} is not a tensor")
+        return value
+
+    for name, parameter in unwrapped.named_parameters():
+        normalized = normalize_fused_param_name(name)
+        if normalized in state_dict or not is_fused_expert_param(normalized):
+            continue
+        block = build_local_fused_block(
+            fused_param_name=normalized,
+            expected_shape=tuple(parameter.shape),
+            ep_rank=0,
+            available_keys=available,
+            get_tensor=get_tensor,
+        )
+        if block is None:
+            continue
+        state_dict[normalized] = block
+        fused += 1
+
+        prefix = normalized.rsplit(".experts.", 1)[0]
+        num_experts = int(parameter.shape[0])
+        kind = fused_expert_kind(normalized)
+        projections = ("gate_proj", "up_proj") if kind == "gate_up" else ("down_proj",)
+        for expert in range(num_experts):
+            for projection in projections:
+                source = f"{prefix}.experts.{expert}.{projection}.weight"
+                state_dict.pop(source, None)
+                available.discard(source)
+
+    if fused:
+        logger.info("sharded_load: fused %d HF per-expert parameter blocks", fused)
+    return state_dict
+
+
+def _read_safetensors_dir(
+    weights_dir: str,
+    *,
+    key_prefix: Optional[str] = None,
+) -> StateDict:
     """Merge all ``*.safetensors`` shards in a directory.
 
     Loading every shard makes the index json unnecessary and covers both
     single-file and sharded checkpoints."""
-    from safetensors.torch import load_file
+    from safetensors import safe_open
 
     if not os.path.isdir(weights_dir):
         raise FileNotFoundError(
@@ -446,7 +526,31 @@ def _read_safetensors_dir(weights_dir: str) -> StateDict:
         raise FileNotFoundError(f"sharded_load: no *.safetensors files under {weights_dir!r}")
     state_dict: StateDict = {}
     for shard in shards:
-        state_dict.update(load_file(shard, device="cpu"))
+        # ``safe_open`` reads only selected tensors. This matters for composite
+        # checkpoints where Talker is much smaller than the sibling Thinker:
+        # loading a shard with ``load_file`` before filtering would transiently
+        # materialize the full Omni shard and defeat meta-init's memory contract.
+        with safe_open(shard, framework="pt", device="cpu") as handle:
+            for source_key in handle.keys():
+                if key_prefix is not None:
+                    if not source_key.startswith(key_prefix):
+                        continue
+                    target_key = source_key[len(key_prefix) :]
+                    if not target_key:
+                        continue
+                else:
+                    target_key = source_key
+                if target_key in state_dict:
+                    raise ValueError(
+                        f"sharded_load: duplicate target key {target_key!r} "
+                        f"after stripping prefix {key_prefix!r}"
+                    )
+                state_dict[target_key] = handle.get_tensor(source_key)
+    if key_prefix is not None and not state_dict:
+        raise ValueError(
+            f"sharded_load: no checkpoint tensors matched key prefix {key_prefix!r} "
+            f"under {weights_dir!r}"
+        )
     return state_dict
 
 
@@ -484,8 +588,21 @@ def _remap_hf_checkpoint_keys(state_dict: StateDict, model: nn.Module) -> StateD
         from torch.distributed.fsdp import FSDPModule
 
         if isinstance(unwrapped, FSDPModule):
-            hf_cls = type(unwrapped).__mro__[FSDPModule._orig_cls_mro_index]
-    except (ImportError, IndexError):
+            original_index = getattr(FSDPModule, "_orig_cls_mro_index", None)
+            if original_index is not None:
+                hf_cls = type(unwrapped).__mro__[int(original_index)]
+            else:
+                # Some torch releases no longer expose the private index.
+                # FSDP2 dynamically mixes FSDPModule into the original class;
+                # recover the first Transformers PreTrainedModel in that MRO.
+                hf_cls = next(
+                    cls
+                    for cls in type(unwrapped).__mro__
+                    if cls is not type(unwrapped)
+                    and issubclass(cls, PreTrainedModel)
+                    and cls is not PreTrainedModel
+                )
+    except (ImportError, IndexError, StopIteration):
         pass
     if not issubclass(hf_cls, PreTrainedModel):
         return state_dict
@@ -564,4 +681,10 @@ def _remap_lora_base_keys(state_dict: StateDict, model: nn.Module) -> StateDict:
     return remapped
 
 
-__all__ = ["load_trainable_weights", "load_sharded", "_load_state_dict_sharded", "StateDict"]
+__all__ = [
+    "load_trainable_weights",
+    "load_sharded",
+    "_load_state_dict_sharded",
+    "_read_safetensors_dir",
+    "StateDict",
+]

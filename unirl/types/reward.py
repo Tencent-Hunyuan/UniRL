@@ -130,6 +130,10 @@ class RewardResponse(Batch):
 
     rewards: List[float] = concat_field(default_factory=list)
     component_rewards: Dict[str, List[float]] = concat_field(default_factory=dict)
+    # Per-sample non-scalar diagnostics (for example ASR transcripts and raw
+    # edit counts). These are deliberately kept separate from
+    # ``component_rewards``: only the latter is attached as training tensors.
+    details: List[Dict[str, Any]] = concat_field(default_factory=list)
     successes: List[bool] = concat_field(default_factory=list)
     errors: List[Optional[str]] = concat_field(default_factory=list)
     compute_time: float = max_field(default=0.0)

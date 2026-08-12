@@ -166,7 +166,7 @@ class RemoteLoraWeightSync(LoraWeightSyncBase):
         pending = [
             (
                 role,
-                worker.call.remote(role, "tp_per_stage", (), {}),
+                worker.call.remote(role, "lora_tp_per_stage", (), {}),
                 worker.call.remote(role, "loaded_lora_checksums", (), {"adapter_id": int(DIFFRL_LORA_INT_ID)}),
             )
             for role, workers in self._targets

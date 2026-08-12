@@ -1,0 +1,176 @@
+# @package _global_
+# Talker TTS GSPO — Phase 1B direct-TTS vLLM-Omni.
+#
+# The pinned upstream vllm-omni 0.20.0 is intentionally rejected: it exposes
+# Thinker -> Talker spoken-response, not the required direct-prefix RL contract.
+# Startup requires UNIRL_DIRECT_TTS_ROLLOUT_CAPABILITIES contract v1; until a
+# patched engine advertises it, use the trainside recipe:
+#   ar/qwen3_omni_talker_tts_gspo_lora_trainside_1x8
+#
+# Opt-in real-engine 1x4 smoke (all future GPU smokes use exactly this visibility):
+#   CUDA_VISIBLE_DEVICES=0,1,2,3 GPUS_PER_NODE=4 \
+#   QWEN3_OMNI_PATH=... DATA_PATH=data/talker_rl/train.jsonl \
+#   TTS_ASR_MODEL=... TTS_SPEAKER_MODEL=... \
+#   TTS_SPEAKER_REFERENCE_BANK=... TTS_MOS_BACKEND=utmos TTS_MOS_MODEL=... \
+#   ENTRY=train_ar bash examples/run_experiment_single_node.sh \
+#     ar/qwen3_omni_talker_tts_gspo_lora_vllm_omni_1x8
+
+num_devices: 8
+devices_per_node: ${oc.env:GPUS_PER_NODE,8}
+batch_size: 4
+
+num_rollouts: 500
+weight_sync_interval: 1
+adv_normalization_scope: group
+
+rollout_anchor_device: 1
+enable_fsdp_offload: true
+
+logging:
+  report_to_wandb: true
+  project_name: unirl-qwen3-omni-talker
+  run_name: qwen3_omni_talker_tts_gspo_lora_vllm_omni_1x8
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: [gspo, qwen3-omni, talker, tts, vllm-omni, lora]
+
+bundle:
+  _target_: unirl.models.qwen3_omni.talker_bundle.Qwen3OmniTalkerBundle.from_config
+  config:
+    _target_: unirl.models.qwen3_omni.config.Qwen3OmniPipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:QWEN3_OMNI_PATH}
+    model_precision: bf16
+    attn_implementation: sdpa
+    enable_talker: true
+    meta_init_transformer: true
+    freeze_thinker: true
+    freeze_mtp: true
+    freeze_talker_embeddings: true
+    freeze_code2wav: true
+    freeze_vision_tower: true
+    freeze_audio_tower: true
+    phase1_layer0_lora_only: true
+    use_lora: true
+    lora_target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+    use_gradient_checkpointing: true
+    max_prompt_length: 2048
+    default_speaker: Ethan
+
+pipeline:
+  _target_: unirl.models.qwen3_omni.talker_pipeline.Qwen3OmniTalkerPipeline.from_bundle
+  max_prompt_length: 2048
+  decode_audio: true
+  autocast_precision: bf16
+  logprob_precision: fp32
+  do_sample: true
+  repetition_penalty: 1.05
+  suppress_special_tokens: true
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["Qwen3OmniMoeTalkerDecoderLayer"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: false
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 8
+    alpha: 16
+    target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+    exclude_modules: ".*code_predictor.*"
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 1.0e-5
+
+rollout:
+  _target_: unirl.rollout.engine.vllm_omni.engine.VLLMOmniRolloutEngine
+  model_config: ${bundle.config}
+  config:
+    _target_: unirl.rollout.engine.vllm_omni.config.VLLMOmniEngineConfig
+    model_path: ${oc.env:QWEN3_OMNI_PATH}
+    modality: qwen3_omni_talker
+    stage_yaml_override: qwen3_omni_talker_tts_rl_1x4.yaml
+    enable_sleep_mode: true
+    max_prompt_length: 2048
+    omni_extra:
+      stage_init_timeout: 1200
+      init_timeout: 1800
+
+sync:
+  _target_: unirl.distributed.weight_sync.lora.qwen3_omni_talker.Qwen3OmniTalkerLoraWeightSync
+  param_prefix: "talker."
+  adapter_name: default
+  verify: true
+  copy: true
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  truncated_reward: zero
+  backend:
+    _target_: unirl.reward.local.tts_composite.TTSCompositeScorer
+    base_device: ${oc.env:TTS_REWARD_DEVICE,cuda}
+    config:
+      _target_: unirl.reward.local.tts_composite.TTSCompositeSpec
+      batch_size: 4
+      device: auto
+      weights:
+        tts_wer: 0.60
+        tts_speaker_sim: 0.15
+        tts_utmos: 0.15
+        tts_stability: 0.10
+      content_component: tts_wer
+      min_content_weight_fraction: 0.50
+      quality_gates:
+        tts_stability: 1.0
+        tts_utmos: 0.30
+      penalty_thresholds:
+        tts_speaker_sim: 0.40
+      penalty_factors:
+        tts_speaker_sim: 0.50
+      component_configs:
+        tts_wer:
+          asr_model_id: ${oc.env:TTS_ASR_MODEL}
+        tts_speaker_sim:
+          speaker_model_id: ${oc.env:TTS_SPEAKER_MODEL}
+          reference_bank_path: ${oc.env:TTS_SPEAKER_REFERENCE_BANK}
+        tts_utmos:
+          backend: ${oc.env:TTS_MOS_BACKEND}
+          model_path: ${oc.env:TTS_MOS_MODEL}
+
+algorithm:
+  _target_: unirl.algorithms.gspo.GSPO
+  stage_attr: ar
+  clip_range: 3.0e-4
+  old_logp_source: rollout
+  sampling_temperature: 0.9
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.qwen3_omni.talker_conditions.Qwen3OmniTalkerConditions
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+
+sampling:
+  _target_: unirl.types.sampling.ARSamplingParams
+  samples_per_prompt: 4
+  max_new_tokens: 512
+  temperature: 0.9
+  top_p: 1.0
+  top_k: 50
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: ${oc.env:DATA_PATH,data/talker_rl/train.jsonl}
+      eval_data_path: ${oc.env:EVAL_DATA_PATH,${oc.env:DATA_PATH,data/talker_rl/train.jsonl}}
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+      samples_per_prompt: ${sampling.samples_per_prompt}

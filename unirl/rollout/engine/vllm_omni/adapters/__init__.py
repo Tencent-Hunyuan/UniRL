@@ -1,4 +1,4 @@
-"""Adapter registry — importing this package registers all 10 modalities.
+"""Adapter registry — importing this package registers all supported modalities.
 
 Modality adapters are grouped by model family and composed from input/output
 sub-adapters (the binder constructs both in ``__init__`` and delegates the
@@ -9,6 +9,7 @@ two conversion verbs):
 - ``hv15`` — hv15_t2v
 - ``qwen_image`` — qwen_image_t2i
 - ``bagel`` — bagel_t2i
+- ``qwen3_omni`` — thinker-only generation and direct-TTS Talker generation
 
 ``dit`` holds the universal single-stage DiT skeletons
 (:class:`DitInputAdapter` / :class:`DitOutputAdapter`) the families derive
@@ -51,6 +52,11 @@ from unirl.rollout.engine.vllm_omni.adapters.qwen3_omni import (
     Qwen3OmniThinkerAdapter,
     Qwen3OmniThinkerInputAdapter,
 )
+from unirl.rollout.engine.vllm_omni.adapters.qwen3_omni_talker import (
+    Qwen3OmniTalkerAdapter,
+    Qwen3OmniTalkerInputAdapter,
+    Qwen3OmniTalkerOutputAdapter,
+)
 from unirl.rollout.engine.vllm_omni.adapters.qwen_image import (
     QwenImageGroupedInputAdapter,
     QwenImageInputAdapter,
@@ -82,6 +88,9 @@ __all__ = [
     "Hv15VideoOutputAdapter",
     "ModelAdapter",
     "QwenImageGroupedInputAdapter",
+    "Qwen3OmniTalkerAdapter",
+    "Qwen3OmniTalkerInputAdapter",
+    "Qwen3OmniTalkerOutputAdapter",
     "Qwen3OmniThinkerAdapter",
     "Qwen3OmniThinkerInputAdapter",
     "QwenImageInputAdapter",
