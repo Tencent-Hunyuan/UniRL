@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Union
 
 import torch
 
-from unirl.models.types.conversations import build_omni_messages
+from unirl.models.qwen3_omni.conversations import build_omni_messages
 from unirl.types.conditions import TextTokenCondition
 from unirl.types.primitives import Texts
 from unirl.types.sample import Turn

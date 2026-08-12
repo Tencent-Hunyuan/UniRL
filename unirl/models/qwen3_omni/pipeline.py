@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from unirl.models.types.conversations import build_omni_messages
+from unirl.models.qwen3_omni.conversations import build_omni_messages
 from unirl.models.types.pipeline import Pipeline
 from unirl.types.primitives import Texts
 from unirl.types.sample import Sample, Turn
