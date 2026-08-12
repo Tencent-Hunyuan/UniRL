@@ -147,9 +147,10 @@ rollout:
 
 reward:
   # math-verify (the paper's grader, Appendix D). 1.0 if the parsed answer matches
-  # the ground truth else 0.0. Unlike MathBoxed it extracts the final answer even
-  # without \boxed{} (Qwen3-Base + thinking often reasons to the answer unboxed),
-  # so it does not under-count correct generations / inflate zero-advantage groups.
+  # the ground truth else 0.0. Unlike a `\boxed{}`-only matcher it extracts the
+  # final answer even without \boxed{} (Qwen3-Base + thinking often reasons to the
+  # answer unboxed), so it does not under-count correct generations / inflate
+  # zero-advantage groups.
   _target_: unirl.reward.service.RewardService
   # keep = score the partial text of truncated (length-capped) traces instead of
   # forcing 0, matching verl's dapo reward manager with overlong_buffer disabled.

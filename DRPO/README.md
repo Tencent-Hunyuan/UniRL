@@ -31,10 +31,12 @@ that preserves the same Binary-TV trust-region geometry while providing continuo
 reweighting — attenuating diverging updates and providing corrective signals beyond the
 boundary.
 
-The reward here is **rule-based**: `MathBoxedRewardScorer`
-([`unirl/reward/local/math_boxed.py`](../unirl/reward/local/math_boxed.py)) checks the
-`\boxed{}` answer against the DAPO-Math ground truth — exactly the verifiable reward the
-paper trains on, not a learned reward model.
+The reward here is **rule-based**: `MathVerifyRewardScorer`
+([`unirl/reward/local/mathverify.py`](../unirl/reward/local/mathverify.py)) grades the
+parsed final answer against the DAPO-Math ground truth with HuggingFace
+`math-verify` — the paper's grader (Appendix D), not a learned reward model. Unlike a
+`\boxed{}`-requiring matcher it also extracts answers from free-form text, so
+correct-but-unboxed generations (common for Qwen3-Base + thinking) are not under-counted.
 
 ![drpo overview: the prompt to SGLang rollout (behavior policy mu) to group advantage to replay for new logp pi to ratio r and TV shift |pi - mu| to reweighted REINFORCE pipeline (single update), with the centerpiece contrast between DPPO's hard-mask step (full gradient, then a cliff to 0 at the threshold delta) and the paper's smooth, bounded DRPO weight that ramps down and crosses zero into a corrective region past delta.](../assets/drpo_overview.png)
 
@@ -127,7 +129,7 @@ The practical consequence:
 1. `unirl.train_ar` builds `ARTrainer` for the text-only Qwen3 recipe.
 2. `SGLangRolloutEngine` samples completions and fills the AR `Part` with packed
    `TextSegment.tokens`, `log_probs`, `lengths`, and masks.
-3. `MathBoxedRewardScorer` scores each completion correct/incorrect.
+3. `MathVerifyRewardScorer` scores each completion correct/incorrect.
 4. `Part.compute_advantages(normalize=False, scope="group")` mean-centers rewards
    within each prompt group; the recipe sets `normalize_adv_by_std: false`, so there is **no
    std division**.
