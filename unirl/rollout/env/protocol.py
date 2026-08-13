@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from typing import Optional, Protocol, Tuple
 
-from unirl.types.sample import Primitive, Sample
+from unirl.types.primitives import PrimitiveValue
+from unirl.types.sample import Sample
 
 
 class Environment(Protocol):
@@ -14,7 +15,7 @@ class Environment(Protocol):
         """Optional per-episode setup; return the (possibly augmented) request Sample."""
         ...
 
-    def step(self, sample: Sample) -> Tuple[Optional[Primitive], bool, dict]:
+    def step(self, sample: Sample) -> Tuple[Optional[PrimitiveValue], bool, dict]:
         """Consume the latest action; return ``(observation, done, info)``."""
         ...
 

@@ -10,7 +10,6 @@ from typing import ClassVar, List, Optional, Tuple, Union
 import torch
 
 GeneratorLike = Optional[Union[torch.Generator, List[torch.Generator]]]
-NoiseGenerator = GeneratorLike
 
 
 class StepStrategy(ABC):

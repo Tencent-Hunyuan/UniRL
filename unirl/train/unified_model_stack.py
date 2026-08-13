@@ -226,9 +226,9 @@ class UnifiedModelTrainStack(Remote):
         ar_part = ar_part.to_device(device)
         image_part = image_part.to_device(device)
 
-        from unirl.utils.profiling import profile_scope
+        from unirl.utils.profiling import profile_mode
 
-        scope = profile_scope()
+        scope = profile_mode()
         if scope == "one-update" and not getattr(self, "_warned_one_update", False):
             self._warned_one_update = True
             logger.warning(

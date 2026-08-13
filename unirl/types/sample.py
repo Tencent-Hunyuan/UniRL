@@ -36,8 +36,7 @@ from unirl.utils.shard_balance import lpt_shard_permutation, shard_token_spread
 
 logger = logging.getLogger(__name__)
 
-Primitive = PrimitiveValue
-PrimitiveMap = Dict[str, Primitive]
+PrimitiveMap = Dict[str, PrimitiveValue]
 PrimitiveMetadata = Dict[str, Dict[str, Any]]
 PRIMITIVE_MODALITY_ORDER = ("text", "image", "video", "audio", "media")
 
@@ -49,7 +48,7 @@ class Turn:
     """One conditioning turn: a role tag + its frontier-aligned content primitive."""
 
     role: str
-    content: Primitive
+    content: PrimitiveValue
 
 
 @dataclass
@@ -606,7 +605,7 @@ class Sample(Batch):
         )
         return type(self)(parts=[*self.parts, child], reward_compute_s=self.reward_compute_s)
 
-    def observe(self, observation: Primitive, *, role: str = "tool") -> "Sample":
+    def observe(self, observation: PrimitiveValue, *, role: str = "tool") -> "Sample":
         """Append an observation as a branch-1, mask-0 *input* Part off the frontier."""
         if not self.parts:
             raise ValueError("Sample.observe: no parts to observe from (empty Sample)")
@@ -683,7 +682,7 @@ class Sample(Batch):
         out.reverse()
         return out
 
-    def conditioning(self) -> List[Primitive]:
+    def conditioning(self) -> List[PrimitiveValue]:
         """Conditioning primitives for generating the frontier (last) part: each"""
         return [t.content for t in self.turns()]
 
@@ -700,7 +699,7 @@ class Sample(Batch):
             )
         return media
 
-    def conditioning_at(self, index: int) -> List[Primitive]:
+    def conditioning_at(self, index: int) -> List[PrimitiveValue]:
         """:meth:`conditioning` for generating ``parts[index]`` rather than the frontier."""
         if not self.parts:
             raise ValueError("Sample.conditioning_at: Sample has no Parts")
@@ -745,7 +744,6 @@ class Sample(Batch):
 __all__ = [
     "Sample",
     "Part",
-    "Primitive",
     "PrimitiveMap",
     "PrimitiveMetadata",
     "PRIMITIVE_MODALITY_ORDER",

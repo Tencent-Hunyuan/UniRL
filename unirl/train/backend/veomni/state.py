@@ -7,14 +7,7 @@ import logging
 import torch
 from torch import Tensor, nn
 
-from unirl.train.backend.sharded_state import (
-    StateDict,
-    _maybe_dtensor_to_tensor,
-    gather_state_dict,
-    load_model_state_dict,
-    move_optimizer_state,
-    trainable_params,
-)
+from unirl.train.backend.sharded_state import _maybe_dtensor_to_tensor
 
 logger = logging.getLogger(__name__)
 
@@ -62,12 +55,7 @@ def veomni_onload(model: nn.Module, device: torch.device) -> None:
 
 
 __all__ = [
-    "StateDict",
     "clip_grad_norm",
-    "gather_state_dict",
-    "load_model_state_dict",
-    "move_optimizer_state",
-    "trainable_params",
     "veomni_offload",
     "veomni_onload",
 ]

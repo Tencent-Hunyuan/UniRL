@@ -59,6 +59,4 @@ class ColocateStoreTransport(WorkerLocalTransport):
         return self._store._nccl_recv(src_rank, shapes, dtypes)
 
 
-TensorStoreTransport = ColocateStoreTransport
-
-__all__ = ["ColocateStoreTransport", "TensorStoreTransport"]
+__all__ = ["ColocateStoreTransport"]

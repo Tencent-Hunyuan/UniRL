@@ -18,7 +18,6 @@ from unirl.train.backend.sharded_state import (
 from unirl.train.backend.veomni.ep.placement import (
     ep_named_parameters,
     gather_stacked_expert_block,
-    has_ep_params,
     materialize_local_block,
 )
 
@@ -212,8 +211,6 @@ def _current_rank() -> int:
 
 __all__ = [
     "EP_CHECKPOINT_VERSION",
-    "has_ep_params",
-    "ep_named_parameters",
     "gather_ep_model_state_dict",
     "load_ep_model_state_dict",
     "gather_ep_optimizer_state_dict",

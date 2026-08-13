@@ -51,7 +51,7 @@ def is_direct_sampling(cfg: DictConfig) -> bool:
 
 def validate_dynamic_dotpaths(cfg: DictConfig) -> None:
     """Fail-fast import of every dynamic dotpath the driver will later resolve."""
-    from unirl.utils import load_function
+    from unirl.utils.misc import load_function
 
     dotpath = str(cfg.run.data_source_dotpath or "").strip()
     require(

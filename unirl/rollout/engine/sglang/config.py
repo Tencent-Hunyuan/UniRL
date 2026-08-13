@@ -106,7 +106,6 @@ class SGLangEngineConfig(BaseEngineConfig):
     enable_expert_parallel: Optional[bool] = None
 
     host: Optional[str] = None
-    port: Optional[int] = None
 
     backend: str = "http"
 

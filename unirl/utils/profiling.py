@@ -60,11 +60,6 @@ def profile_enabled() -> bool:
     return profile_mode() != "off"
 
 
-def profile_scope() -> str:
-    """The region being profiled: ``one-update`` or ``train`` (or ``off``)."""
-    return profile_mode()
-
-
 def _out_dir() -> str:
     """Trace output dir."""
     return os.environ.get("UNIRL_PROFILE_DIR", "").strip() or "outputs/profiler"
@@ -224,5 +219,4 @@ __all__ = [
     "maybe_profile_update",
     "profile_mode",
     "profile_enabled",
-    "profile_scope",
 ]

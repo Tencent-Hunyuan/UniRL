@@ -11,7 +11,7 @@ import torch
 
 from unirl.models.types.diffusion import DiffusionStage, DiffusionStep
 from unirl.models.types.replay_result import ReplayResult
-from unirl.sde.kernels import NoiseGenerator, StepStrategy
+from unirl.sde.kernels import GeneratorLike, StepStrategy
 from unirl.types.conditions import ImageEmbedCondition
 from unirl.types.noise_recipe import NoiseRecipe
 from unirl.types.sampling import DiffusionSamplingParams, compute_trajectory_positions
@@ -324,7 +324,7 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
         sigma_max: float = 0.99,
         eta: float = 1.0,
         step_index: int = 0,
-        generator: NoiseGenerator = None,
+        generator: GeneratorLike = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         return strategy.denoise(
             noise_pred=noise_pred,
@@ -353,7 +353,7 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
         eta: float = 1.0,
         step_index: int = 0,
         state: Optional[HunyuanImage3DiffusionState] = None,
-        generator: NoiseGenerator = None,
+        generator: GeneratorLike = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         noise_pred = self.predict_noise(
             model,
@@ -392,7 +392,7 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
         eta: float = 1.0,
         step_index: int = 0,
         state: Optional[HunyuanImage3DiffusionState] = None,
-        generator: NoiseGenerator = None,
+        generator: GeneratorLike = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         return self.step(
             model,

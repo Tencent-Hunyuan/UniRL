@@ -84,10 +84,6 @@ class BagelFlowUniGRPO(FlowGRPO):
             return False
         return any(isinstance(m, LoraLayer) for m in transformer.modules())
 
-    def _snapshot_reference(self, transformer: Any) -> None:
-        """Deprecated no-op shim — the v_ref base snapshot is now captured lazily in :meth:`_reference_weights`."""
-        return None
-
     @contextmanager
     def _reference_weights(self, transformer: Any) -> Iterator[None]:
         """Swap the frozen base weights into the trainable params for a v_ref forward."""

@@ -29,8 +29,6 @@ class Qwen3PipelineConfig:
 
     meta_init_transformer: bool = False
 
-    lora_materialization: str = "merged_dense"
-
     use_lora: bool = False
     lora_target_modules: Optional[List[str]] = None
 

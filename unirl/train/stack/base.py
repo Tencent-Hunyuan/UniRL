@@ -355,9 +355,9 @@ class TrainStack(Remote):
                     micro_batch_size=self.micro_batch_size,
                 )
             )
-        from unirl.utils.profiling import profile_scope
+        from unirl.utils.profiling import profile_mode
 
-        profiler = self._train_step_profiler() if profile_scope() == "train" else None
+        profiler = self._train_step_profiler() if profile_mode() == "train" else None
         with profiler.record("train_track") if profiler is not None else nullcontext():
             if len(arranged) == 1:
                 part, plans = arranged[0]
@@ -419,9 +419,9 @@ class TrainStack(Remote):
         training_progress: float,
     ) -> TrainStepResult:
         """Run ``num_updates_per_batch`` optimizer steps over disjoint updates."""
-        from unirl.utils.profiling import maybe_profile_update, profile_scope
+        from unirl.utils.profiling import maybe_profile_update, profile_mode
 
-        scope_update = profile_scope() == "one-update"
+        scope_update = profile_mode() == "one-update"
         results = []
         for micros in plans:
             cm = (

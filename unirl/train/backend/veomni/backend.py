@@ -19,10 +19,10 @@ from unirl.train.backend.veomni.ep.checkpoint import (
     EP_CHECKPOINT_VERSION,
     gather_ep_model_state_dict,
     gather_ep_optimizer_state_dict,
-    has_ep_params,
     load_ep_model_state_dict,
     load_ep_optimizer_state_dict,
 )
+from unirl.train.backend.veomni.ep.placement import has_ep_params
 from unirl.train.backend.veomni.state import clip_grad_norm, veomni_offload, veomni_onload
 from unirl.train.backend.veomni.wrap import veomni_parallelize
 from unirl.train.configs import (

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional, Tuple
+from typing import Any, Tuple
 
 from unirl.config.validation import validate_precision_type
 
@@ -13,7 +13,6 @@ class HunyuanImage3PipelineConfig:
     """Construction args for ``HunyuanImage3Pipeline.from_config``."""
 
     pretrained_model_ckpt_path: str
-    vit_ckpt_path: Optional[str] = None
     vae_dtype: Any = None
     text_encoder_dtype: Any = None
     model_precision: Any = "bf16"

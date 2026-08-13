@@ -9,8 +9,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from uuid import uuid4
 
 from unirl.rollout.env.tools.base import StatefulTool, Tool
-from unirl.types.primitives import Texts
-from unirl.types.sample import Primitive, Sample, _part_with_field
+from unirl.types.primitives import PrimitiveValue, Texts
+from unirl.types.sample import Sample, _part_with_field
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +112,7 @@ class ToolEnvironment:
         control["tool_sessions"] = sessions
         return Sample.request(_part_with_field(root, "control", control))
 
-    def step(self, sample: Sample) -> Tuple[Optional[Primitive], bool, dict]:
+    def step(self, sample: Sample) -> Tuple[Optional[PrimitiveValue], bool, dict]:
         """Consume the frontier action; return ``(observation, done, info)``."""
         turn = len(sample.gen_parts())
         frontier = sample.parts[-1].primitives.get("text")

@@ -12,8 +12,7 @@ from unirl.models.types.conversations import Conversation, group_consecutive_rol
 from unirl.types.media import MediaRefs
 from unirl.types.primitives import Texts
 from unirl.types.sample import Turn
-
-from .video import limit_video_frames, sample_video_frames_pyav
+from unirl.utils.video import limit_video_frames, sample_video_frames_pyav
 
 
 def build_omni_messages(

@@ -132,7 +132,7 @@ text_track = response.tracks["ar"]
 After:
 
 ```python
-from unirl.types import Part, Sample
+from unirl.types.sample import Part, Sample
 from unirl.types.primitives import Texts
 from unirl.types.sampling import ARSamplingParams
 
