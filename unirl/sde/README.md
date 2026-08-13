@@ -80,3 +80,18 @@ MixGRPO keeps `FlowSDEStrategy` and adds a `WindowScheduler` under
 - **Don't "simplify" the static-σ branch to call diffusers** — it exists to avoid
   the double-shift bug (#13243) and is tagged `DELETE-WHEN` for when upstream is
   fixed.
+- **`transition_std` and `step`'s `std_var` must stay equal** — `transition_std` is
+  the normalizer for the FlowDPPO KL `(Δmean)²/(2·std²)`, and both derive from the
+  same `_std_dev_t` (a pure function of schedule + `eta`, independent of model
+  output). Splitting them silently desyncs the KL from the transition. `CPSStrategy`
+  overrides `transition_std` deliberately: its noise carries no `sqrt(-dt)` factor.
+- **The dtype round-trip in `_finalize_logp` is not a no-op cast.** It simulates
+  trajectory *storage* precision so replay-time log-prob matches sampling-time
+  log-prob. Delete it as dead code and the ratio drifts. Skipped for `eta<1e-7`.
+- **`ensure_sample_sigmas` takes height/width/steps with no defaults, on purpose** —
+  a silent `1024×1024` mis-derives μ for dynamic-shift models rendering at anything
+  else (e.g. WAN T2V at 480×832).
+- **`shift_terminal` is truthiness-gated by diffusers**, so `0` / `0.0` means
+  *disabled*, not "stretch to zero" — normalize falsy values to `None`.
+- **`compute_mu` is the single per-model μ override point.** FLUX.2-klein's μ depends
+  on **both** `image_seq_len` and `num_inference_steps`, unlike the base formula.
