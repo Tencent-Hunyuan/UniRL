@@ -58,7 +58,7 @@ def _stamp_zero_checkpoint_absent_params(transformer: nn.Module, weights_dir: st
     """Zero-init (post-load, deferred) transformer params the checkpoint omits."""
     from safetensors import safe_open
 
-    from unirl.train.deferred import _stamp
+    from unirl.models.types.post_materialize import defer_after_materialize
 
     ckpt_keys: set = set()
     if os.path.isdir(weights_dir):
@@ -93,7 +93,7 @@ def _stamp_zero_checkpoint_absent_params(transformer: nn.Module, weights_dir: st
                 zeroed[:8],
             )
 
-    _stamp(transformer, _zero_absent)
+    defer_after_materialize(transformer, _zero_absent)
 
 
 class Flux2KleinBundle(Bundle):

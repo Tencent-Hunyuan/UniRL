@@ -10,7 +10,7 @@ from typing import Dict, List, Mapping, Optional, Tuple, Union
 
 import torch
 
-from unirl.algorithms import AlgorithmStepResult, StageAlgorithm
+from unirl.algorithms.base import AlgorithmStepResult, StageAlgorithm
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
 from unirl.distributed.tensor.batch import _move_value

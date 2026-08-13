@@ -3,11 +3,19 @@
 > **Where it fits:** shared helpers used across the loop. Full map:
 > [`../README.md`](../README.md).
 
-`utils/` is a grab-bag — each module is a small, self-contained helper
-(`timing.py`, `wandb_logger.py`, `hydra.py`, `media.py`, `misc.py`,
-`profiling.py`, …), named for what it does and carrying a one-line docstring.
-Read the module you need directly; it is short enough. The one exception
-documented here is **GPU memory monitoring**, because it spans two files
+`utils/` holds narrowly named, domain-agnostic supporting mechanisms. It is not
+the default home for every reusable function: model preprocessing stays with
+its model, dataset conversion stays under `datasets/`, scheduler/SDE policy
+stays under `sde/`, and backend-specific helpers stay with that backend. A new
+utility belongs here only when its semantics are stable and it has multiple
+independent owners.
+
+Some older modules predate this rule and remain staged migration candidates; do
+not treat their placement as precedent. Each module (`timing.py`,
+`wandb_logger.py`, `hydra.py`, `media.py`, `misc.py`, `profiling.py`, …) is
+named for what it does and carries a one-line docstring — read the one you need
+directly; it is short enough. The one cross-module feature documented here is
+**GPU memory monitoring**, because it spans two files
 (`memory_utils.py` + `memory_monitor.py`) and three subsystems (sampling on the
 workers, orchestration here, hooks in the trainer).
 

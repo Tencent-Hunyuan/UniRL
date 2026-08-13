@@ -98,3 +98,12 @@ repos:
         language: python
         pass_filenames: false
         files: \.py$
+      # Lock the dependency directions that are already clean. The checker is
+      # deliberately narrower than a full layer DAG: rollout/model integration
+      # seams and known staged-migration debt are not hidden behind allowlists.
+      - id: check-core-dependencies
+        name: core dependency directions hold
+        entry: python lint/check_core_dependencies.py
+        language: python
+        pass_filenames: false
+        always_run: true

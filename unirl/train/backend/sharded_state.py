@@ -6,8 +6,10 @@ import logging
 from typing import Dict, Iterator, Optional
 
 import torch
-from torch import Tensor, nn
+from torch import nn
 from torch.nn.parameter import Parameter
+
+from unirl.distributed.tensor.local import local_view
 
 logger = logging.getLogger(__name__)
 
@@ -205,13 +207,6 @@ def nft_state_dict(
         return {}
     token = f".{shadow_adapter}."
     return {k: v for k, v in full_sd.items() if ("lora_A" in k or "lora_B" in k) and token in k}
-
-
-def local_view(tensor: Tensor) -> Tensor:
-    """DTensor -> local shard.  Identity for non-DTensors."""
-    if hasattr(tensor, "_local_tensor"):
-        return tensor._local_tensor
-    return tensor
 
 
 def is_materialized(model: nn.Module) -> bool:
