@@ -8,8 +8,7 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from unirl.config.require import require
-from unirl.models.qwen3_omni.media import omni_processor_media_kwargs, prepare_omni_media
-from unirl.models.types.conversations import build_omni_messages
+from unirl.models.qwen3_omni.media import build_omni_messages, omni_processor_media_kwargs, prepare_omni_media
 from unirl.rollout.engine.vllm_omni.adapters.base import ModelAdapter, register_adapter
 from unirl.rollout.engine.vllm_omni.adapters.hi3 import Hi3TextOutputAdapter
 from unirl.rollout.engine.vllm_omni.backends import (

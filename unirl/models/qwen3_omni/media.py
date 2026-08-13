@@ -1,14 +1,90 @@
-"""Shared media helpers for Qwen3-Omni prompt processing."""
+"""Shared media helpers and the prompt-media contract for Qwen3-Omni."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import PIL.Image
 
+from unirl.models.types.conversations import Conversation, group_consecutive_roles, system_prefix
+from unirl.types.media import MediaRefs
+from unirl.types.primitives import Texts
+from unirl.types.sample import Turn
+
 from .video import limit_video_frames, sample_video_frames_pyav
+
+
+def build_omni_messages(
+    turns: List[Turn],
+    system_instruction: Optional[str] = None,
+) -> List[Conversation]:
+    """Render the trajectory as Qwen3-Omni chat conversations, one per frontier row.
+
+    Qwen3-Omni's prompt-media contract: media rides as URI-backed ``MediaRefs`` and
+    each ref becomes a ``{"type": modality, modality: uri}`` content part (the
+    serving side decodes the file), with at most one prompt input per modality per
+    row. Decoded frame/waveform primitives are rejected so tensors cannot bypass the
+    URI contract.
+
+    Both parity sides call this: the HF trainside chat stage and the vLLM-Omni
+    rollout adapter, so replay and rollout compose the same messages. The transpose
+    rules it builds on (:func:`system_prefix`, :func:`group_consecutive_roles`) are
+    shared with the text/vision renders.
+    """
+    if not turns:
+        return []
+    unsupported = [type(turn.content).__name__ for turn in turns if not isinstance(turn.content, (Texts, MediaRefs))]
+    if unsupported:
+        raise ValueError(
+            "build_omni_messages: Qwen3-Omni prompt media must be URI-backed MediaRefs; "
+            f"unsupported turn content: {unsupported}."
+        )
+
+    n_rows = len(turns[0].content)
+    mismatched = [i for i, turn in enumerate(turns) if len(turn.content) != n_rows]
+    if mismatched:
+        raise ValueError(
+            f"build_omni_messages: frontier-aligned turns must share batch size {n_rows}; "
+            f"mismatched turn indices {mismatched}."
+        )
+
+    roles = [turn.role for turn in turns]
+    role_groups = group_consecutive_roles(roles)
+    prefix = system_prefix(system_instruction, roles)
+    columns: List[List[Any]] = [
+        list(turn.content.texts) if isinstance(turn.content, Texts) else [list(refs) for refs in turn.content.rows]
+        for turn in turns
+    ]
+
+    conversations: List[Conversation] = []
+    for row in range(n_rows):
+        messages: Conversation = list(prefix)
+        seen_modalities: set[str] = set()
+        for role, indices in role_groups:
+            media_blocks: List[Dict[str, Any]] = []
+            text_blocks: List[Dict[str, Any]] = []
+            for index in indices:
+                value = columns[index][row]
+                if isinstance(turns[index].content, Texts):
+                    text_blocks.append({"type": "text", "text": value})
+                    continue
+                for ref in value:
+                    if ref.role != "prompt":
+                        raise ValueError(
+                            f"build_omni_messages: row {row} MediaRefs only supports role='prompt', got {ref.role!r}."
+                        )
+                    if ref.modality in seen_modalities:
+                        raise ValueError(
+                            f"build_omni_messages: row {row} has more than one {ref.modality} prompt input."
+                        )
+                    seen_modalities.add(ref.modality)
+                    media_blocks.append({"type": ref.modality, ref.modality: ref.uri})
+            if media_blocks or text_blocks:
+                messages.append({"role": role, "content": media_blocks + text_blocks})
+        conversations.append(messages)
+    return conversations
 
 
 def load_audio_pyav(path: str, target_sr: int = 16000) -> Optional[np.ndarray]:
@@ -210,6 +286,7 @@ def prepare_omni_media(
 
 
 __all__ = [
+    "build_omni_messages",
     "PreparedOmniMedia",
     "extract_audio_from_video_pyav",
     "load_audio_pyav",

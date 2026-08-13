@@ -248,8 +248,6 @@ class Videos(Batch):
 
     frames: torch.Tensor = field(kind=FieldKind.PACKED, default=None)
 
-    uris: Optional[List[str]] = concat_field(default=None)
-
     @property
     def cu_frames(self) -> Optional[torch.Tensor]:
         """Per-sample cumulative frame offsets — alias for :attr:`cu_seqlens`.
@@ -285,13 +283,6 @@ class Videos(Batch):
             frames_list = resized
         return cls.pack(frames=frames_list)
 
-    @classmethod
-    def from_uris(cls, uris: List[str]) -> "Videos":
-        """Build frame-less videos carrying batch-aligned source paths."""
-        if not uris:
-            raise ValueError("Cannot build Videos from an empty uris list")
-        return cls(uris=list(uris))
-
     def to_list(self) -> List[Video]:
         cu = self.cu_seqlens
         if cu is None or self.frames is None:
@@ -300,9 +291,7 @@ class Videos(Batch):
 
     def __len__(self) -> int:
         cu = self.cu_seqlens
-        if cu is not None:
-            return int(cu.shape[0]) - 1
-        return len(self.uris) if self.uris is not None else 0
+        return int(cu.shape[0]) - 1 if cu is not None else 0
 
 
 @dataclass
@@ -355,7 +344,7 @@ def _cumsum(values: List[int]) -> List[int]:
 PrimitiveValue = Union[Texts, Images, Videos, Audios, MediaRefs]
 
 
-def primitive_modality_key(prim: Texts | Images | Videos | Audios | MediaRefs) -> str:
+def primitive_modality_key(prim: PrimitiveValue) -> str:
     """Map a batched primitive to its modality slot key.
 
     ``Texts -> "text"``, ``Images -> "image"``, ``Videos -> "video"``,

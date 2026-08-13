@@ -7,15 +7,19 @@ row per frontier sample (``P`` prompts × ``n`` fan-out = ``P*n`` rows). These
 helpers transpose that into ``P`` per-sample message lists and de-expand the
 ``*n`` fan-out back to the unique conversations the backend fans out server-side.
 
-Pure (only :mod:`unirl.types`): no tokenizer, no processor, no engine state — so
-the message-shape logic unit-tests with canned ``Sample``s. The *model-specific*
-encode (``apply_chat_template`` / processor) stays in the adapter.
+Pure (no tokenizer, no processor, no engine state) — so the message-shape
+logic unit-tests with canned ``Sample``s. The *model-specific* encode
+(``apply_chat_template`` / processor) stays in the adapter. Composition rules
+(system precedence, role fusion) are imported from the single composition
+layer, :mod:`unirl.models.types.conversations`; only the wire-specific ``*n``
+de-expand lives here.
 """
 
 from __future__ import annotations
 
 from typing import Any, Dict, List, Tuple
 
+from unirl.models.types.conversations import group_consecutive_roles, system_prefix
 from unirl.types.primitives import Images
 from unirl.types.sample import Sample
 
@@ -54,30 +58,6 @@ def unique_group_indices(group_ids: List[str]) -> Tuple[List[int], int]:
     return rep_indices, next(iter(k_values))
 
 
-def _group_consecutive_roles(roles: List[str]) -> List[Tuple[str, List[int]]]:
-    """Group consecutive turn indices that share a role → ``[(role, [idx…]), …]``.
-
-    Multi-input modalities ride as separate same-role turns (e.g. it2i is a text
-    ``user`` turn + an image ``user`` turn); a chat message holds one role, so
-    consecutive same-role turns fuse into one message.
-    """
-    groups: List[Tuple[str, List[int]]] = []
-    for j, role in enumerate(roles):
-        if groups and groups[-1][0] == role:
-            groups[-1][1].append(j)
-        else:
-            groups.append((role, [j]))
-    return groups
-
-
-def _system_prefix(system_instruction: Any, roles: List[str]) -> Conversation:
-    """The config ``system_instruction`` as a leading message, unless the
-    trajectory already carries an explicit ``system`` turn (which wins)."""
-    if system_instruction and "system" not in roles:
-        return [{"role": "system", "content": system_instruction}]
-    return []
-
-
 def build_text_conversations(
     sample: Sample,
     system_instruction: Any = None,
@@ -93,7 +73,7 @@ def build_text_conversations(
     rep, k = unique_group_indices(sample.parts[-1].group_ids)
     roles = [t.role for t in turns]
     cols = [t.content.texts for t in turns]
-    prefix = _system_prefix(system_instruction, roles)
+    prefix = system_prefix(system_instruction, roles)
 
     conversations = [prefix + [{"role": roles[j], "content": cols[j][row]} for j in range(len(turns))] for row in rep]
     return conversations, k
@@ -117,8 +97,8 @@ def build_vision_conversations(
     roles = [t.role for t in turns]
     is_image = [isinstance(t.content, Images) for t in turns]
     cols = [t.content.to_pils() if im else t.content.texts for t, im in zip(turns, is_image)]
-    role_groups = _group_consecutive_roles(roles)
-    prefix = _system_prefix(system_instruction, roles)
+    role_groups = group_consecutive_roles(roles)
+    prefix = system_prefix(system_instruction, roles)
 
     conversations: List[Conversation] = []
     images_list: List[List[Any]] = []

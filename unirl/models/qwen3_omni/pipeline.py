@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from unirl.models.types.conversations import build_omni_messages
 from unirl.models.types.pipeline import Pipeline
 from unirl.types.primitives import Texts
 from unirl.types.sample import Sample, Turn
@@ -15,6 +14,7 @@ from .bundle import Qwen3OmniBundle
 from .chat_template import Qwen3OmniChatTemplateStage
 from .conditions import Qwen3OmniARConditions
 from .config import Qwen3OmniPipelineConfig
+from .media import build_omni_messages
 
 
 class Qwen3OmniPipeline(Pipeline):

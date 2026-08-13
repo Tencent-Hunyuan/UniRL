@@ -177,7 +177,6 @@ Those decoded modality keys remain the contract for **condition** media
 (diffusion / V2V / image-edit): loaded `Images` / `Videos` tensors with
 `role="condition"`.
 
-`build_omni_messages` still accepts deprecated URI-backed `Videos.from_uris`
-and normalizes them to video `MediaRef` rows; migrate callers to `MediaRefs`.
-Waveform `Audios` and decoded frame `Videos` / `Images` stay rejected for
-Omni prompts.
+`build_omni_messages` (`unirl/models/qwen3_omni/media.py`) accepts `MediaRefs`
+prompt media only; waveform `Audios` and decoded frame `Videos` / `Images` are
+rejected for Omni prompts.

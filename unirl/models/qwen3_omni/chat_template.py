@@ -6,7 +6,6 @@ from typing import Any, Dict, List, Optional, Union
 
 import torch
 
-from unirl.models.types.conversations import build_omni_messages
 from unirl.types.conditions import TextTokenCondition
 from unirl.types.media import MediaRefs
 from unirl.types.primitives import Texts
@@ -14,7 +13,7 @@ from unirl.types.sample import Turn
 
 from .bundle import Qwen3OmniBundle
 from .conditions import Qwen3OmniARConditions
-from .media import omni_processor_media_kwargs, prepare_omni_media
+from .media import build_omni_messages, omni_processor_media_kwargs, prepare_omni_media
 
 Qwen3OmniChatInput = Union[List[Turn], Texts]
 
