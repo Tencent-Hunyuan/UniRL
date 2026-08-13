@@ -133,18 +133,26 @@ def _normalize_message_content(content: Any, *, turn: int, base_dir: Optional[st
         if not isinstance(part, dict):
             raise TypeError(f"Agent message {turn} content[{j}] must be a dict, got {type(part).__name__}.")
         kind = part.get("type")
+        if kind not in {"text", "image"}:
+            raise ValueError(f"Agent message {turn} content[{j}] has unsupported part type {kind!r}.")
+        # Both kinds carry their value under a field named after the type, so this is the whole contract.
+        extra = sorted(set(part) - {"type", kind})
+        if extra:
+            raise ValueError(
+                f"Agent message {turn} content[{j}] has unsupported field(s) {extra} — a {kind!r} part "
+                f"carries only 'type' and {kind!r}. Accepting and dropping them would train on a record "
+                "the manifest does not describe."
+            )
         if kind == "text":
             text = part.get("text")
             if not isinstance(text, str) or not text:
                 raise ValueError(f"Agent message {turn} content[{j}] text part needs a non-empty 'text' string.")
             parts.append({"type": "text", "text": text})
-        elif kind == "image":
+        else:
             uri = part.get("image")
             if not isinstance(uri, str) or not uri.strip():
                 raise ValueError(f"Agent message {turn} content[{j}] image part needs a non-empty 'image' URI.")
             parts.append({"type": "image", "image": _resolve_media_uri(uri.strip(), base_dir=base_dir)})
-        else:
-            raise ValueError(f"Agent message {turn} content[{j}] has unsupported part type {kind!r}.")
     return parts
 
 

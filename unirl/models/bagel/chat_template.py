@@ -127,6 +127,12 @@ class BagelChatTemplateStage:
             if self.system_instruction and not any(m.get("role") == "system" for m in messages):
                 splits.append(self._text_split(self.system_instruction))
             for turn, message in enumerate(messages):
+                if message.get("role") == "tool":
+                    raise ValueError(
+                        f"BagelChatTemplateStage.embed_messages: conversation {row} message {turn} has "
+                        "role='tool' — Bagel has no tool template, and rendering a tool result as a bare "
+                        "text chunk would present it as the model's own utterance."
+                    )
                 if message.get("tool_calls"):
                     raise ValueError(
                         f"BagelChatTemplateStage.embed_messages: conversation {row} message {turn} carries "
@@ -158,6 +164,14 @@ class BagelChatTemplateStage:
     def tokenize_agent_target(self, record: Dict[str, Any]) -> List[int]:
         """Final assistant turn → ``encode(text) + [<|im_end|>]`` (the AR segment layout)."""
         target = record["messages"][-1]
+        # Manifests may carry tool-call targets (prepare_sft_agent supervises them on Qwen);
+        # tokenizing only this turn's text would drop the tool call out of the CE target silently.
+        if target.get("tool_calls"):
+            raise ValueError(
+                f"BagelChatTemplateStage.tokenize_agent_target: record {record.get('sample_id')!r} target "
+                "turn carries tool_calls — Bagel has no tool-call rendering, so only its text would be "
+                "supervised. Filter tool-call targets out of Bagel manifests during preparation."
+            )
         content = target.get("content")
         if not isinstance(content, str) or not content:
             raise ValueError(

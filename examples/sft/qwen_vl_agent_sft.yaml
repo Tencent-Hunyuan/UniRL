@@ -16,15 +16,15 @@
 #
 # Env:
 #   QWEN_VL_PATH    HF id or local checkpoint (default Qwen/Qwen2.5-VL-7B-Instruct)
-#   SFT_DATA        train manifest (prepare_sft_searchgen train.jsonl)
+#   SFT_DATA        train manifest (searchgen prepare_sft train.jsonl)
 #   SFT_EVAL_DATA   eval manifest (defaults to SFT_DATA — supply a real split!)
 #
-# Data prep:
-#   python -m unirl.utils.prepare_sft_searchgen \
-#     --searchgen-root /path/to/Datasets/searchgen --out-dir data/sft_searchgen
+# Download/cook guide:
+#   datasets/searchgen/README.md
 #
 # Launch:
-#   ENTRY=train_sft SFT_DATA=data/sft_searchgen/train.jsonl SFT_EVAL_DATA=data/sft_searchgen/val.jsonl \
+#   ENTRY=train_sft SFT_DATA=datasets/searchgen/processed/train.jsonl \
+#   SFT_EVAL_DATA=datasets/searchgen/processed/val.jsonl \
 #   bash examples/run_experiment_single_node.sh sft/qwen_vl_agent_sft
 
 num_devices: 8

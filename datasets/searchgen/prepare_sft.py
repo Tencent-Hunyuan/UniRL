@@ -22,10 +22,12 @@ Generated images and judge scores are deliberately untouched — that is GRPO
 group-shaped preference data, not SFT.
 
 Usage:
-  python -m unirl.utils.prepare_sft_searchgen \
+  python datasets/searchgen/prepare_sft.py \
     --searchgen-root /path/to/Datasets/searchgen \
-    --out-dir datasets/sft_searchgen \
+    --out-dir datasets/searchgen/processed \
     --max-traces 0                    # 0 = all full traces
+
+See ``datasets/searchgen/README.md`` for download and training instructions.
 """
 
 from __future__ import annotations
@@ -78,7 +80,7 @@ class CandidateIndex:
     def __init__(self, corpus_root: str) -> None:
         db_path = os.path.join(corpus_root, "metadata", "search.sqlite")
         if not os.path.exists(db_path):
-            raise FileNotFoundError(f"prepare_sft_searchgen: corpus database not found at {db_path}")
+            raise FileNotFoundError(f"searchgen prepare_sft: corpus database not found at {db_path}")
         self._db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         self._cache: Dict[str, List[Tuple[str, str, str]]] = {}
 
@@ -396,7 +398,7 @@ def main() -> None:
         if args.max_traces > 0 and len(conversations) >= args.max_traces:
             break
     if len(conversations) < 2:
-        raise SystemExit(f"prepare_sft_searchgen: only {len(conversations)} renderable traces found.")
+        raise SystemExit(f"searchgen prepare_sft: only {len(conversations)} renderable traces found.")
 
     extractor = ShardExtractor(
         corpus,
@@ -421,7 +423,7 @@ def main() -> None:
 
     row_ids = sorted(by_row)
     if len(row_ids) < 2:
-        raise SystemExit("prepare_sft_searchgen: fewer than two source rows survived filtering.")
+        raise SystemExit("searchgen prepare_sft: fewer than two source rows survived filtering.")
     random.Random(args.seed).shuffle(row_ids)
     n_val_rows = min(len(row_ids) - 1, max(1, round(len(row_ids) * args.val_fraction)))
     val_rows = set(row_ids[:n_val_rows])

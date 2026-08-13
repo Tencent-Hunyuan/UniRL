@@ -15,13 +15,14 @@
 #
 # Env:
 #   BAGEL_PATH      HF id or local ckpt (default ByteDance-Seed/BAGEL-7B-MoT)
-#   SFT_DATA        train manifest (prepare_sft_searchgen train.jsonl)
+#   SFT_DATA        train manifest (searchgen prepare_sft train.jsonl)
 #   SFT_EVAL_DATA   eval manifest (defaults to SFT_DATA — supply a real split!)
 #
-# Data prep: shared with qwen_vl_agent_sft (python -m unirl.utils.prepare_sft_searchgen).
+# Download/cook guide: datasets/searchgen/README.md (manifests shared with qwen_vl_agent_sft).
 #
 # Launch:
-#   ENTRY=train_sft SFT_DATA=data/sft_searchgen/train.jsonl SFT_EVAL_DATA=data/sft_searchgen/val.jsonl \
+#   ENTRY=train_sft SFT_DATA=datasets/searchgen/processed/train.jsonl \
+#   SFT_EVAL_DATA=datasets/searchgen/processed/val.jsonl \
 #   bash examples/run_experiment_single_node.sh sft/bagel_agent_sft
 
 num_devices: 8
