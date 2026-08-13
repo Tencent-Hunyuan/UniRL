@@ -79,6 +79,8 @@ class VeOmniBackend(BaseFSDP2Backend):
         self._sp_size = int(getattr(fsdp_cfg, "sp_size", 1) or 1)
         if world % self._sp_size != 0:
             raise ValueError(f"VeOmniBackend: world_size {world} not divisible by sp_size {self._sp_size}")
+        # Dynamic SP picks a per-microbatch Ulysses degree <= sp_size at runtime; no planner is wired yet.
+        self._sp_planner = _resolve_sp_planner(getattr(fsdp_cfg, "dynamic_sp", False))
         # ep_size > 1 requires get_parallel_plan() for fused expert tensors.
         self._ep_size = _validate_ep_size(getattr(fsdp_cfg, "ep_size", 1), world_size=world)
         extra_parallel_kwargs = (
@@ -219,6 +221,15 @@ def _validate_fsdp_cfg(fsdp_cfg: FSDPConfig) -> None:
         raise ValueError("VeOmniBackend: cpu_offload=true unsupported in v1 (use FSDPBackend).")
     if not fsdp_cfg.mixed_precision:
         raise ValueError("VeOmniBackend: mixed_precision=false unsupported in v1 (bf16-parity mode is fixed).")
+
+
+def _resolve_sp_planner(dynamic_sp: object):
+    """Return a per-microbatch Ulysses planner when dynamic_sp is set, else None (static sp_size)."""
+    if not dynamic_sp:
+        return None
+    raise NotImplementedError(
+        "VeOmniBackend: dynamic_sp is set but no SequenceParallelPlanner is wired yet; set dynamic_sp=false."
+    )
 
 
 def _validate_ep_size(value: object, *, world_size: int) -> int:

@@ -50,6 +50,12 @@ class FSDPBackend(BaseFSDP2Backend):
         super().__init__()
         self._check_lora_exclusivity(lora_cfg, ema_lora_cfg)
 
+        # This backend is single-track and has no sequence parallelism; reject SP knobs instead of ignoring them.
+        if int(getattr(fsdp_cfg, "sp_size", 1) or 1) > 1 or getattr(fsdp_cfg, "dynamic_sp", False):
+            raise NotImplementedError(
+                "FSDPBackend: sequence parallelism (sp_size>1 / dynamic_sp) is unsupported; use the VeOmni backend."
+            )
+
         self._bundle = bundle
         self._rank = int(rank)
         self._device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
