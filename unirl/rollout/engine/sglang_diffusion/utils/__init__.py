@@ -1,9 +1,4 @@
-"""Pure, model-agnostic helpers the ``sglang_diffusion`` adapters call.
-
-No SGLang import, no engine state — fully unit-testable with canned data. The
-*customizable* conversion steps live as overridable methods on the adapters; this
-package is the generic mechanics those methods lean on.
-"""
+"""Pure, model-agnostic helpers the ``sglang_diffusion`` adapters call."""
 
 from unirl.rollout.engine.sglang_diffusion.utils.prompts import (
     deexpand_prompts_from_groups,

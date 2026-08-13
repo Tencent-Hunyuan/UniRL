@@ -11,14 +11,7 @@ def deexpand_prompts_from_groups(
     prompts: List[str],
     group_ids: List[str],
 ) -> Tuple[List[str], int]:
-    """Collapse K-expanded prompts back to unique prompts when groups agree.
-
-    Returns ``(unique_prompts, k)`` where ``k`` is the repeat count to set as
-    ``num_outputs_per_prompt`` on SGLang (one text-encode pass per group instead
-    of K). Falls through to ``(prompts, 1)`` when the structure doesn't admit a
-    clean collapse: heterogeneous K per group, mismatched prompt strings within a
-    group, or empty groups.
-    """
+    """Collapse K-expanded prompts back to unique prompts when groups agree."""
     n = len(prompts)
     if n == 0 or len(group_ids) != n:
         return list(prompts), 1

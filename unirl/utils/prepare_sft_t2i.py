@@ -1,4 +1,13 @@
-"""Build a local T2I SFT manifest (caption + target image) from an HF dataset.
+"""Build a local T2I SFT manifest (caption + target image) from an HF dataset."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import random
+
+_HELP = """Build a local T2I SFT manifest (caption + target image) from an HF dataset.
 
 Converts an image-caption dataset into the supervised manifest layout
 (``unirl/data/sft.py``) the diffusion SFT recipes read::
@@ -17,16 +26,9 @@ Usage:
 Set HF_ENDPOINT for a mirror.
 """
 
-from __future__ import annotations
-
-import argparse
-import json
-import os
-import random
-
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=_HELP)
     parser.add_argument("--dataset", default="lambdalabs/naruto-blip-captions")
     parser.add_argument("--split", default="train")
     parser.add_argument("--caption-key", default="text")

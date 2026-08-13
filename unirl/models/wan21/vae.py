@@ -1,19 +1,4 @@
-"""WAN 3D VAE codec stages.
-
-``WANVideoLatentEncodeStage`` maps target-video pixels to the clean VAE
-latent consumed by diffusion SFT. It owns WAN's frame layout, resize and
-normalization conventions; model-independent video file decoding stays in
-``unirl.utils.video``.
-
-``WAN21VAEDecodeStage`` maps the final clean latent in a ``LatentSegment``
-back to video pixels. All latent un-normalization, spatial tiling, nested
-gradient checkpointing, and ``Conv3dActGradOnly`` optimizations are owned by
-``WanVideoVAE`` itself.
-
-I2V reference-image encoding remains in ``image_encode.py`` because it
-produces a model condition payload containing both a temporal mask and VAE
-latents rather than a plain clean target latent.
-"""
+"""WAN 3D VAE codec stages."""
 
 from __future__ import annotations
 
@@ -41,13 +26,7 @@ class _VAEBundle(Protocol):
 
 
 class WANVideoLatentEncodeStage(EncodeStage[Videos, ImageLatentCondition]):
-    """Encode fixed-length RGB videos with the WAN 3D VAE.
-
-    Input videos use the framework layout ``[T, 3, H, W]`` with values in
-    ``[0, 1]``. The stage uniformly samples ``num_frames``, resizes each frame,
-    maps pixels to ``[-1, 1]``, and returns the normalized latent convention
-    consumed by WAN's diffusion transformer.
-    """
+    """Encode fixed-length RGB videos with the WAN 3D VAE."""
 
     def __init__(
         self,
@@ -151,20 +130,7 @@ class WAN21VAEDecodeStage(DecodeStage[LatentSegment, Videos]):
         self.bundle = bundle
 
     def decode(self, s: LatentSegment, *, grad: bool = False, activation_checkpoint: bool = False) -> Videos:
-        """Decode the final-step latents in *s* into a packed ``Videos`` payload.
-
-        Reads ``s.latents[:, -1]`` (the final stored position, which is
-        ``T`` — the clean latent ``x_0``) as a 5D channel-first tensor
-        ``[B, C, T_lat, H_lat, W_lat]``. VAE forward runs in fp32; output
-        is normalized from ``[-1, 1]`` to ``[0, 1]`` and clamped before
-        being packed sample-by-sample into a ``Videos`` primitive.
-
-        ``grad=False`` (default) keeps the rollout path under ``torch.no_grad()``.
-        ``grad=True`` (ReFL direct-reward backprop) runs the decode WITH grad so it
-        flows from the reward through the frozen VAE into ``clean``; the VAE has no
-        trainable params, so only ``clean``'s graph is extended. ``activation_checkpoint``
-        (grad only) recomputes the decode in backward to trade compute for memory.
-        """
+        """Decode the final-step latents in *s* into a packed ``Videos`` payload."""
         if self.bundle.vae is None:
             raise RuntimeError(
                 "WAN21VAEDecodeStage.decode: no VAE loaded (load_vae=False). "

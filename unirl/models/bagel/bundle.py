@@ -1,22 +1,4 @@
-"""BagelBundle — weights+params holder for BAGEL-7B-MoT (gen-only T2I).
-
-Implements the empty :class:`Bundle` Protocol. Pure container of the modules
-BAGEL ships with for text-to-image: one MoT transformer (``Bagel`` wrapping a
-``Qwen2ForCausalLM`` whose ``Qwen2MoTDecoderLayer`` blocks hold both und and gen
-experts) + one FLUX-style VAE + one tokenizer. The und ViT tower is opt-in
-(``config.enable_vit`` → ``visual_und=True``): pure T2I needs only the gen
-expert + VAE; image-INPUT tasks (it2i editing / i2t / it2t) need the ViT to
-prefill image semantics into the KV context.
-
-LoRA injection / FSDP wrap / autocast lifecycle are owned outside the bundle
-(the train backend), so ``from_config`` only loads + freezes. The trainable
-surface is ``model.language_model`` (the MoT, where the ``*_moe_gen`` experts
-live); the FSDP block class is ``Qwen2MoTDecoderLayer``.
-
-Construction mirrors flow_grpo's ``train_bagel.py`` setup so the vendored
-``InterleaveInferencer`` / ``generate_image`` path the diffusion stage delegates
-to behaves identically.
-"""
+"""BagelBundle — weights+params holder for BAGEL-7B-MoT (gen-only T2I)."""
 
 from __future__ import annotations
 
@@ -89,18 +71,7 @@ class BagelBundle(Bundle):
 
     @classmethod
     def from_config(cls, config: BagelPipelineConfig) -> "BagelBundle":
-        """Load BAGEL-7B-MoT (gen + optional und ViT) from a local checkpoint dir.
-
-        Replicates flow_grpo/train_bagel.py:316-414 minus LoRA/optimizer (which
-        the train backend owns). Loads the EMA weights via
-        ``load_checkpoint_and_dispatch`` onto a single device; the FSDP wrap and
-        LoRA injection run later in :class:`FSDPBackend`.
-
-        Note: ``load_checkpoint_and_dispatch`` attaches accelerate device hooks.
-        For the dedicated FSDP path (Phase 6) those may need removal via
-        ``accelerate.hooks.remove_hook_from_module`` before ``fully_shard``; for
-        the standalone bundle smoke they are harmless.
-        """
+        """Load BAGEL-7B-MoT (gen + optional und ViT) from a local checkpoint dir."""
         device = config.device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         if isinstance(device, str):
             device = torch.device(device)
@@ -202,13 +173,7 @@ class BagelBundle(Bundle):
         )
 
     def trainable_module(self) -> "torch.nn.Module":
-        """Return the MoT transformer — the FSDP wrap target / trainable root.
-
-        ``model.language_model`` holds the ``Qwen2MoTDecoderLayer`` blocks whose
-        ``*_moe_gen`` experts are the only trained params (via LoRA). The gen
-        heads (``vae2llm`` / ``time_embedder`` / ``llm2vae`` / ``latent_pos_embed``)
-        sit on the parent ``Bagel`` module and stay frozen in the LoRA setup.
-        """
+        """Return the MoT transformer — the FSDP wrap target / trainable root."""
         return self.transformer
 
 

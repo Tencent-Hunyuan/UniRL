@@ -12,13 +12,7 @@ SUPPORTED_MEDIA_ROLES = frozenset({"prompt", "condition", "target"})
 
 
 def normalize_media_uri(uri: object, *, context: str = "MediaRef") -> str:
-    """Normalize a media URI and reject unsupported object-store schemes.
-
-    Supported forms today: HTTP(S) URLs and local filesystem paths. ``s3://`` /
-    ``gs://`` must be materialized before they enter the typed contract; existence
-    checks for local paths happen on the actor that opens the media, not on the
-    driver during collation.
-    """
+    """Normalize a media URI and reject unsupported object-store schemes."""
     if not isinstance(uri, str):
         raise TypeError(f"{context}: uri must be a str, got {type(uri).__name__}.")
     normalized = uri.strip()
@@ -34,13 +28,7 @@ def normalize_media_uri(uri: object, *, context: str = "MediaRef") -> str:
 
 @dataclass(frozen=True)
 class MediaRef:
-    """A lightweight reference to one per-sample media item.
-
-    The reference is intentionally small and serializable. Actual media loading
-    happens on the actor/sampler side so the driver does not move large tensors
-    through Ray. ``target`` is reserved for supervised manifests and is never a
-    rollout input.
-    """
+    """A lightweight reference to one per-sample media item."""
 
     modality: str
     role: str
@@ -69,13 +57,7 @@ class MediaRef:
 
 @dataclass
 class MediaRefs(Batch):
-    """Batch-aligned sparse URI media inputs.
-
-    ``rows[i]`` is the ordered list of media references for sample ``i``. An
-    empty row represents a text-only sample. Keeping sparsity inside each row
-    preserves the normal rectangular :class:`Batch` contract, so CONCAT
-    selection, slicing, transport, and rollout fan-out remain row-aligned.
-    """
+    """Batch-aligned sparse URI media inputs."""
 
     rows: List[List[MediaRef]] = concat_field(default_factory=list)
 

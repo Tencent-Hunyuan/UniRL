@@ -1,32 +1,4 @@
-"""PEPipeline — ``Sample → Sample`` end-to-end for Prompt Enhancement.
-
-Implements the two-phase composed flow over a pre-forked request ``Sample``::
-
-    [input, ar_shell, diff_shell]
-       │        │           │
-       │   llm.generate     │     P prompts → P*N rewrites  (ar Part)
-       │        └──────────diffusion.generate──▶ P*N*M images (diffusion Part)
-       ▼
-    [input, ar_part, diffusion_part]   (lineage is positional: parent = preceding part)
-
-PE composes two child :class:`Pipeline` instances at the *pipeline* layer, not the
-stage layer. Each child remains a fully self-contained ``Sample → Sample`` unit (its
-bundle, stages, CFG-empty-negative handling, etc.) and is reusable in non-PE
-pipelines. PE's job is sequencing, lineage, and response merging — it mirrors the
-served-path :class:`~unirl.rollout.engine.composed.ComposedRolloutEngine`, driving
-in-process child pipelines instead of child engines.
-
-The request is pre-forked by the trainer (``PETrainer._build_request_sample``):
-``[input, ar_shell, diff_shell]`` — the AR shell carries ``ARSamplingParams``
-(branch N), the diffusion shell ``DiffusionSamplingParams`` (branch M, σ / x_T
-recipe). Shells are located by ``sampling_params`` type, not strictly position.
-
-σ schedule contract
--------------------
-The hosting trainside engine pins the σ schedule onto the diffusion shell's
-``DiffusionSamplingParams.sigmas`` before ``generate``; PE forwards that shell to
-the diffusion child verbatim. The LLM child reads no σ (AR-only).
-"""
+"""PEPipeline — ``Sample → Sample`` end-to-end for Prompt Enhancement."""
 
 from __future__ import annotations
 
@@ -45,20 +17,7 @@ logger = logging.getLogger(__name__)
 
 
 class PEPipeline(Pipeline):
-    """PE generate pipeline: ``Sample → Sample``.
-
-    Consumes a pre-forked request ``Sample`` ``[input, ar_shell, diff_shell]`` and
-    fills both gen Parts:
-
-    - ``ar_part`` (from the LLM child): ``segment=TextSegment``,
-      ``primitives['text']=Texts`` (the rewritten prompts, marker-extracted).
-    - ``diffusion_part`` (from the diffusion child): ``segment=LatentSegment``,
-      ``primitives['image']=Images``, ``conditions`` carried from the child for replay.
-
-    Lineage is positional (parent = preceding part), so GRPO groups by prompt on
-    the ar Part and by rewrite on the diffusion Part. ``ar_part.conditions`` is left
-    empty (the AR child's trainside path re-tokenizes on replay).
-    """
+    """PE generate pipeline: ``Sample → Sample``."""
 
     def __init__(
         self,
@@ -82,12 +41,7 @@ class PEPipeline(Pipeline):
 
     @property
     def diffusion(self):
-        """The trainable diffusion stage (delegates to the diffusion child).
-
-        Lets a trainside rollout engine resolve the diffusion module via
-        ``getattr(pe_pipeline, "diffusion").trainable_module()`` —
-        ``stage_attrs=["diffusion", "ar"]`` eval-scopes both PE models.
-        """
+        """The trainable diffusion stage (delegates to the diffusion child)."""
         return self.diffusion_pipeline.diffusion
 
     @property
@@ -96,14 +50,7 @@ class PEPipeline(Pipeline):
         return self.llm_pipeline.ar
 
     def build_schedule_policy(self):
-        """σ-schedule policy for the diffusion track (delegates to the diffusion child).
-
-        PE forwards the diffusion shell verbatim to the diffusion child, so the
-        parent schedule *is* the diffusion child's. The trainside engine calls this
-        to pin sigmas onto the diffusion shell's ``DiffusionSamplingParams`` before
-        ``generate``; the composed ``PEBundle`` has no ``pretrained_path``/``shift``
-        of its own, so we reach through to the diffusion child.
-        """
+        """σ-schedule policy for the diffusion track (delegates to the diffusion child)."""
         diff = self.diffusion_pipeline
         builder = getattr(diff, "build_schedule_policy", None)
         if callable(builder):
@@ -116,16 +63,7 @@ class PEPipeline(Pipeline):
         )
 
     def generate(self, sample: Sample) -> Sample:
-        """Run the PE serial flow over the pre-forked request ``Sample``.
-
-        ``[input, ar_shell, diff_shell]`` → ``[input, ar_part, diffusion_part]``:
-        the LLM child rewrites P prompts → P*N candidates (ar shell branch N), the
-        diffusion child generates M images per rewrite (diff shell branch M). The
-        child pipelines are driven via their own ``generate(Sample)``; this method
-        sequences them, maps outputs back onto the lineage-correct shells, and
-        merges into the filled 3-part Sample. Mirrors
-        :meth:`ComposedRolloutEngine.generate`.
-        """
+        """Run the PE serial flow over the pre-forked request ``Sample``."""
         input_part, ar_shell, diff_shell = self._unpack_request(sample)
 
         P = len(input_part.sample_ids)
@@ -197,11 +135,7 @@ class PEPipeline(Pipeline):
 
     @staticmethod
     def _unpack_request(sample: Sample) -> tuple:
-        """Resolve the pre-forked ``[input, ar_shell, diff_shell]`` request.
-
-        This serial pipeline currently accepts exactly one input Part. Reject
-        extra inputs explicitly instead of dropping them from the returned
-        lineage when the two generated Parts are filled."""
+        """Resolve the pre-forked ``[input, ar_shell, diff_shell]`` request."""
         if not sample.parts or not sample.parts[0].is_root:
             raise ValueError("PEPipeline.generate: requires a root input Part at parts[0]")
         if len(sample.parts) != 3:
@@ -217,8 +151,7 @@ class PEPipeline(Pipeline):
         return input_part, ar_shell, diff_shell
 
     def _ar_control(self, control: Dict[str, Any]) -> Dict[str, Any]:
-        """The LLM child input Part's ``control``: parent's "chat" + "ar" subsets
-        with pe_instruction injected on both (matching ComposedRolloutEngine)."""
+        """The LLM child input Part's ``control``: the parent's chat + ar subsets with pe_instruction injected."""
         ar_control: Dict[str, Any] = {key: dict(control[key]) for key in ("chat", "ar") if key in control}
         if self.pe_instruction:
             for key in ("ar", "chat"):
@@ -226,10 +159,7 @@ class PEPipeline(Pipeline):
         return ar_control
 
     def _extract_pe(self, pe_texts: Texts, user_prompts: Texts, samples_per_prompt: int) -> Texts:
-        """Optional marker-based PE extraction: keep only the substring after the
-        marker so the diffusion child sees the rewritten prompt instead of the LLM's
-        reasoning preamble. Off-format outputs fall back to the original user
-        prompt to keep diffusion from collapsing to blank text."""
+        """Optional marker-based PE extraction; off-format outputs fall back to the original user prompt."""
         if not self.pe_marker:
             return pe_texts
         cleaned_texts, stats = postprocess_pe_texts(

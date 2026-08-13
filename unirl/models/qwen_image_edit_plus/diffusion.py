@@ -1,28 +1,4 @@
-"""Qwen-Image-Edit-Plus diffusion: per-step kernel + (inherited) stage.
-
-``QwenImageEditPlusDiffusionStep`` overrides only
-:meth:`predict_noise` to concatenate the VAE-encoded source-image latent
-onto the packed noise latent along the token dimension, extend
-``img_shapes`` to carry both segments, and slice the transformer output
-back to the noise segment. The CFG negative branch reuses the same
-concatenated input (the source image is shared across CFG branches).
-Mirrors ``vde_editplus.py:232,246`` and the FLUX.2-Klein pattern
-(``flux2_klein/diffusion.py:160-183``).
-
-``QwenImageEditPlusDiffusionStage`` is a thin subclass of
-:class:`QwenImageDiffusionStage` — the loop, trajectory storage, replay,
-and ``predict_noise_at_step`` bodies are inherited unchanged because they
-are image-agnostic (they operate on spatial ``[B, C, H, W]`` latents and
-delegate transformer calls to ``self.step.predict_noise``, which is the
-overridden Edit-Plus step). Verified: ``step_with_logp`` → ``step`` →
-``self.predict_noise`` (``qwen_image/diffusion.py:326→349→304``), so the
-override propagates to ``replay`` automatically.
-
-Edit-Plus is edit-only: :meth:`predict_noise` requires
-``conditions.image_latent`` and raises ``ValueError`` when it is ``None``
-(fail-fast, constraint #27). There is no T2I fall-through — a source image
-is always required.
-"""
+"""Qwen-Image-Edit-Plus diffusion: per-step kernel + (inherited) stage."""
 
 from __future__ import annotations
 
@@ -42,15 +18,7 @@ from .conditions import QwenImageEditPlusConditions
 
 
 class QwenImageEditPlusDiffusionStep(QwenImageDiffusionStep):
-    """Per-step Edit-Plus denoising kernel — adds source-image token concat.
-
-    Overrides :meth:`predict_noise` to concatenate the packed source-image
-    latent onto the packed noise latent before the transformer call. All
-    other protocol surface (``forward`` / ``step`` / ``step_with_logp``)
-    is inherited from :class:`QwenImageDiffusionStep` and routes through
-    this override — so ``diffuse`` and ``replay`` pick up the concat
-    automatically.
-    """
+    """Per-step Edit-Plus denoising kernel — adds source-image token concat."""
 
     def predict_noise(
         self,
@@ -64,12 +32,7 @@ class QwenImageEditPlusDiffusionStep(QwenImageDiffusionStep):
         latent_w: int,
         distilled_guidance_scale: Optional[float] = None,
     ) -> torch.Tensor:
-        """Run shape-homogeneous microbatches and restore sample order.
-
-        Source-image latent grids depend on each input's native aspect ratio.
-        Grouping here is shared by rollout and replay, so neither path pads or
-        warps a condition latent and both execute the same transformer calls.
-        """
+        """Run shape-homogeneous microbatches and restore sample order."""
         image_latent_cond = conditions.image_latent
         if image_latent_cond is None or not image_latent_cond.latents:
             raise ValueError(
@@ -130,16 +93,7 @@ class QwenImageEditPlusDiffusionStep(QwenImageDiffusionStep):
         latent_w: int,
         distilled_guidance_scale: Optional[float] = None,
     ) -> torch.Tensor:
-        """Run the Edit-Plus transformer with source-image token concat + CFG.
-
-        Packs ``sample`` ``[B, C, H, W]`` → ``[B, (H/2)*(W/2), C*4]``. When
-        ``conditions.image_latent`` is present, packs the source-image
-        latent the same way and concatenates along the token dimension
-        (``torch.cat([noise, image], dim=1)``). ``img_shapes`` is extended
-        to ``[[(1, noise_h//2, noise_w//2), (1, img_h//2, img_w//2)]] * B``.
-        After the transformer call the prediction is sliced back to the
-        noise token count: ``[:, :noise_seq_len]``.
-        """
+        """Run the Edit-Plus transformer with source-image token concat + CFG."""
         if conditions.text is None:
             raise ValueError("QwenImageEditPlusDiffusionStep.predict_noise: conditions.text is None")
         text = conditions.text
@@ -225,32 +179,14 @@ class QwenImageEditPlusDiffusionStep(QwenImageDiffusionStep):
 
 
 class QwenImageEditPlusDiffusionStage(QwenImageDiffusionStage):
-    """Edit-Plus rollout-level diffusion stage — inherits the loop unchanged.
-
-    The base :class:`QwenImageDiffusionStage` is image-agnostic: it
-    operates on spatial ``[B, C, H, W]`` latents and delegates transformer
-    calls to ``self.step.predict_noise``. With an :class:`QwenImageEditPlusDiffusionStep`
-    injected at construction, ``diffuse`` / ``replay`` / ``predict_noise_at_step``
-    all pick up the source-image concat automatically (verified delegation
-    chain: ``step_with_logp`` → ``step`` → ``self.predict_noise``).
-
-    The denoising loop remains inherited. ``_tile_conditions`` only extends
-    batched-step replay so the source-image latent list is tiled with the text
-    conditions instead of being dropped by the base Qwen-Image implementation.
-    """
+    """Edit-Plus rollout-level diffusion stage — inherits the loop unchanged."""
 
     @staticmethod
     def _tile_conditions(
         conditions: QwenImageEditPlusConditions,
         repeats: int,
     ) -> QwenImageEditPlusConditions:
-        """Tile text and ragged image conditions in step-major order.
-
-        Batched-step replay stacks ``repeats`` copies of the trajectory batch.
-        Concatenating the typed condition batch preserves that same order and,
-        unlike the base Qwen-Image implementation, retains every per-sample
-        source-image latent without padding its spatial grid.
-        """
+        """Tile text and ragged image conditions in step-major order."""
         return QwenImageEditPlusConditions.concat([conditions] * repeats)
 
 

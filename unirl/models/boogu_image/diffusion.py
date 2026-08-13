@@ -1,55 +1,4 @@
-"""Boogu-Image diffusion: per-step kernel + rollout-level stage.
-
-Two classes mirror :mod:`unirl.models.z_image.diffusion`:
-
-- :class:`BooguImageDiffusionStep` — stateless per-step kernel. Wraps
-  :meth:`predict_noise` (which adapts the vendored
-  ``BooguImageTransformer2DModel`` forward to the framework's batched
-  ``[B, C, H, W]`` SDE math) around ``StepStrategy.denoise``. The
-  protocol-matching ``forward`` / ``step`` / ``step_with_logp`` ride on top.
-- :class:`BooguImageDiffusionStage` — implements
-  ``DiffusionStage[BooguImageConditions]``. Owns the SDE strategy, the loop
-  bookkeeping, and the cached rotary tables; segment latents stay in spatial
-  ``[B, C, H, W]`` so :class:`BooguImageVAEDecodeStage` reads them directly.
-
-Transformer adapter
--------------------
-The vendored DiT consumes batched 4D latents directly (it lifts to a
-per-sample list internally for variable-length packing). :meth:`predict_noise`:
-
-1. passes ``t = 1 - sigma`` as the timestep in **model dtype** (the reference
-   ``predict`` does ``t.expand(B).to(latents.dtype)``; the transformer scales
-   by ``timestep_scale=1000`` internally);
-2. forwards positionally per the reference
-   (``transformer(latents, timestep, instruction_embeds, freqs_cis,
-   instruction_attention_mask, ref_image_hidden_states=None)``) — the
-   default ``return_dict=False`` returns a **bare tensor**, not a tuple
-   (indexing ``[0]`` would take sample 0 of the batch);
-3. applies CFG with Boogu's convention — gate ``guidance_scale > 1.0``
-   (1.0 == off), a **second sequential forward** on the negative branch
-   (the reference runs branches sequentially; positive/negative embeds are
-   padded to different lengths), plain linear combine
-   ``out + (g - 1) * (out - neg_out)`` with no norm correction;
-4. **negates** the result: Boogu integrates ``x += (t_next - t)·v`` in the
-   t-convention (t = 1 - σ, toward data), so the σ-convention FlowMatch
-   velocity ``FlowSDEStrategy`` expects is ``-v`` (z_image precedent).
-
-Rotary tables (``freqs_cis``) are the reference pipeline's per-call input:
-built once from ``(axes_dim_rope, axes_lens, theta=10000)`` — resolution
-independent — and cached per device on the stage.
-
-CFG range
----------
-The reference gates guidance by step fraction (``cfg_range``,
-pipeline_boogu.py:3367-3381; default ``(0, 1)`` == always on). The stage
-collapses that into a per-step *effective* guidance scale
-(:meth:`BooguImageDiffusionStage._effective_guidance_scale`); scale 1.0 makes
-the kernel skip the negative forward exactly like the reference's skipped
-branch. ``cfg_range`` rides in ``DiffusionSamplingParams.sampler_kwargs``.
-
-Math mirrors the reference ``BooguImagePipeline.processing`` T2I denoising
-loop (pipeline_boogu.py:3243-3688).
-"""
+"""Boogu-Image diffusion: per-step kernel + rollout-level stage."""
 
 from __future__ import annotations
 
@@ -71,13 +20,7 @@ from .vendor.rope import BooguImageRotaryPosEmbed
 
 
 def build_freqs_cis(transformer_config, device: torch.device) -> List[torch.Tensor]:
-    """Build the reference pipeline's rotary tables for the vendored DiT.
-
-    Depends only on ``(axes_dim_rope, axes_lens, theta)`` — resolution
-    independent; the per-(H, W) position gather happens inside the
-    transformer's ``rope_embedder``. Mirrors the reference ``__call__``
-    (pipeline_boogu.py:2896-2900).
-    """
+    """Build the reference pipeline's rotary tables for the vendored DiT."""
     tables = BooguImageRotaryPosEmbed.get_freqs_cis(
         list(transformer_config.axes_dim_rope),
         list(transformer_config.axes_lens),
@@ -99,9 +42,7 @@ class BooguImageDiffusionStep(DiffusionStep[BooguImageBundle, BooguImageConditio
         guidance_scale: float,
         freqs_cis: Optional[List[torch.Tensor]] = None,
     ) -> torch.Tensor:
-        """Run the vendored DiT and return the FlowMatch velocity
-        ``[B, C, H, W]`` (negated model output, with Boogu's text CFG applied
-        when ``guidance_scale > 1.0``)."""
+        """Run the vendored DiT and return the FlowMatch velocity ``[B, C, H, W]`` (negated, text CFG applied)."""
         if conditions.text is None or conditions.text.embeds is None:
             raise ValueError("BooguImageDiffusionStep.predict_noise: conditions.text is None")
 
@@ -239,11 +180,7 @@ class BooguImageDiffusionStep(DiffusionStep[BooguImageBundle, BooguImageConditio
         step_index: int = 0,
         freqs_cis: Optional[List[torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """Run model forward + SDE transition.
-
-        Returns ``(prev_sample, log_prob, prev_sample_mean)``. ``log_prob``
-        and ``prev_sample_mean`` are ``None`` for deterministic strategies.
-        """
+        """Run model forward + SDE transition."""
         return self.step(
             model,
             conditions,
@@ -261,22 +198,7 @@ class BooguImageDiffusionStep(DiffusionStep[BooguImageBundle, BooguImageConditio
 
 
 class BooguImageDiffusionStage(DiffusionStage[BooguImageConditions]):
-    """Boogu-Image rollout-level diffusion stage.
-
-    Owns the SDE ``strategy``, the bundle, the stateless kernel, the
-    precision policy, and the per-device rotary-table cache.
-
-    Segment latents stay in spatial ``[B, C, H, W]`` (standard 2D FLUX
-    ``AutoencoderKL``), so :class:`BooguImageVAEDecodeStage` reads
-    ``segment.latents[:, -1]`` without per-shape handling.
-
-    ``_no_split_modules`` is the model-side fallback used by FSDPPolicy when
-    HF auto-discovery yields nothing. NOTE: FSDP wrap matching is by exact
-    concrete class name — recipes must list the five INSTANTIATED block
-    classes (the bare ``BooguImageTransformerBlock`` is never instantiated,
-    and ``BooguImageDoubleStreamTransformerBlock`` is a separate class, not
-    a subclass).
-    """
+    """Boogu-Image rollout-level diffusion stage."""
 
     _no_split_modules: ClassVar[Tuple[str, ...]] = (
         "BooguImageTransformerBlock",
@@ -323,14 +245,7 @@ class BooguImageDiffusionStage(DiffusionStage[BooguImageConditions]):
 
     @staticmethod
     def _effective_guidance_scale(step_index: int, num_steps: int, params: DiffusionSamplingParams) -> float:
-        """Collapse the reference's ``cfg_range`` step-fraction gate into a
-        per-step scale (pipeline_boogu.py:3367-3381, inclusive bounds; the
-        out-of-range value is 1.0 == CFG off in Boogu's convention).
-
-        ``cfg_range`` rides in ``params.sampler_kwargs``; the default
-        ``(0.0, 1.0)`` keeps guidance on at every step. Deterministic in
-        ``(step_index, num_steps)``, so replay reproduces rollout exactly.
-        """
+        """Collapse the reference's ``cfg_range`` step gate into a per-step scale (out-of-range 1.0 = CFG off)."""
         lo, hi = params.sampler_kwargs.get("cfg_range", (0.0, 1.0))
         fraction = step_index / num_steps if num_steps > 0 else 0.0
         if float(lo) <= fraction <= float(hi):
@@ -345,11 +260,7 @@ class BooguImageDiffusionStage(DiffusionStage[BooguImageConditions]):
         params: DiffusionSamplingParams,
         initial_latents: Optional[torch.Tensor] = None,
     ) -> LatentSegment:
-        """Run full Boogu-Image sampling. Returns a ``LatentSegment``.
-
-        ``initial_latents`` (optional) — x_T resolved from the request
-        ``Sample``'s diffusion generation Part.
-        """
+        """Run full Boogu-Image sampling. Returns a ``LatentSegment``."""
         from unirl.sde.noise import generate_latents
 
         if conditions.text is None or conditions.text.embeds is None:
@@ -463,11 +374,7 @@ class BooguImageDiffusionStage(DiffusionStage[BooguImageConditions]):
         params: DiffusionSamplingParams,
         step_indices: Optional[List[int]] = None,
     ) -> ReplayResult:
-        """Segment-based log-prob replay over the rollout's SDE transitions.
-
-        Caller is responsible for ``.train()`` mode + grad scope; this method
-        only manages the autocast scope.
-        """
+        """Segment-based log-prob replay over the rollout's SDE transitions."""
         if segment.sde_indices is None or segment.latents is None:
             raise ValueError("BooguImageDiffusionStage.replay: segment.sde_indices / latents missing")
         if segment.sigmas is None:
@@ -540,13 +447,7 @@ class BooguImageDiffusionStage(DiffusionStage[BooguImageConditions]):
         sigma: torch.Tensor,
         params: DiffusionSamplingParams,
     ) -> torch.Tensor:
-        """Single ``(xt, sigma)`` model forward — no scheduler iteration.
-
-        Delegates to ``BooguImageDiffusionStep.predict_noise`` so CFG and
-        guidance handling stay identical to the sampling path. Forward-process
-        algorithms carry no loop index, so the ``cfg_range`` fraction gate is
-        not applied here (the default ``(0, 1)`` makes this moot).
-        """
+        """Single ``(xt, sigma)`` model forward — no scheduler iteration."""
         return self.step.predict_noise(
             self.model,
             sample,
@@ -557,9 +458,7 @@ class BooguImageDiffusionStage(DiffusionStage[BooguImageConditions]):
         )
 
     def trainable_module(self) -> "torch.nn.Module":
-        """Return the module the diffusion forward operates on — the
-        bundle's vendored ``BooguImageTransformer2DModel`` (the FSDP wrap
-        target)."""
+        """The module the diffusion forward operates on — the vendored transformer, the FSDP wrap target."""
         return self.model.transformer
 
 

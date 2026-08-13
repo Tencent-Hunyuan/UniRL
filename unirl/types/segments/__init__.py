@@ -1,12 +1,4 @@
-"""Segment types — SoA batched containers for generation outputs.
-
-A ``Segment`` is always batched (SoA); rows are 1:1 with the enclosing
-track's samples, so per-sample access is plain row indexing. Each
-modality has its own subclass:
-
-- ``LatentSegment`` covers image / video / audio diffusion rollouts.
-- ``TextSegment`` covers AR token rollouts (varlen-packed).
-"""
+"""Segment types — SoA batched containers for generation outputs."""
 
 from __future__ import annotations
 

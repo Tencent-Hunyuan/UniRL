@@ -1,34 +1,4 @@
-"""Prepare interleaved-image agent SFT manifests from the SearchGen-20K traces.
-
-Linearizes each full reasoner trace (prompt analysis → image search → reference
-selection → prompt refinement) into ONE conversation with the retrieved
-candidate images interleaved mid-history, then expands it into one record per
-supervised assistant turn (the ``prepare_sft_agent`` convention):
-
-    user:      <user_prompt>
-    assistant: s1 analysis + search queries                 [record :s1]
-    user:      per-query candidate images (interleaved)
-    assistant: s2 selections + reasoning                    [record :s2]
-    user:      refinement instruction
-    assistant: s3 refined prompt + reference indices        [record :s3]
-
-Candidate images come from the searchgen-corpus-1m search database
-(``query_id → query_entries → entries → assets``) and are extracted from the
-corpus TAR shards into ``<out-dir>/images/`` (downscaled, RGB JPEG); records
-reference them with manifest-relative URIs. The selection targets re-index the
-selected entries against OUR candidate presentation (the original presentation
-order is not recoverable from the release; the selected entry identity is).
-Generated images and judge scores are deliberately untouched — that is GRPO
-group-shaped preference data, not SFT.
-
-Usage:
-  python datasets/searchgen/prepare_sft.py \
-    --searchgen-root /path/to/Datasets/searchgen \
-    --out-dir datasets/searchgen/processed \
-    --max-traces 0                    # 0 = all full traces
-
-See ``datasets/searchgen/README.md`` for download and training instructions.
-"""
+"""Prepare interleaved-image agent SFT manifests from the SearchGen-20K traces — see README.md."""
 
 from __future__ import annotations
 
@@ -108,12 +78,7 @@ def build_trace_conversation(
     index: CandidateIndex,
     candidates_per_query: int,
 ) -> Optional[Tuple[List[Dict[str, Any]], List[str]]]:
-    """One trace → (6-turn conversation with image URIs as portable paths, used paths).
-
-    Returns ``None`` when the trace cannot be rendered faithfully: no resolvable
-    selection, or a selected entry missing from its query's downloadable
-    candidates.
-    """
+    """One trace → (6-turn conversation with image URIs as portable paths, used paths)."""
     queries = [q for q in trace.get("s1d1_search_queries", []) if q.get("query_id")]
     if not queries:
         return None
@@ -208,12 +173,7 @@ def expand_trace(
 
 
 class ShardExtractor:
-    """Extract corpus TAR members → downscaled RGB JPEGs under ``<out>/images``.
-
-    Members are hash-named and spread uniformly across ~5 GB shards, so shards
-    are streamed in parallel (one thread per shard, each with its own tar
-    handle) — the header walk over a shard is the dominant cost on network FS.
-    """
+    """Extract corpus TAR members → downscaled RGB JPEGs under ``<out>/images``."""
 
     def __init__(self, corpus_root: str, out_images_dir: str, *, max_image_px: int, workers: int = 8) -> None:
         self.corpus_root = corpus_root
@@ -278,11 +238,7 @@ class ShardExtractor:
         return done
 
     def extract(self, portable_paths: Sequence[str]) -> Dict[str, str]:
-        """Materialize the given members; returns {portable_path: manifest-relative URI}.
-
-        Unopenable payloads and members missing from the shard index are
-        skipped (callers drop the affected traces).
-        """
+        """Materialize the given members; returns {portable_path: manifest-relative URI}."""
         from concurrent.futures import ThreadPoolExecutor
 
         os.makedirs(self.out_dir, exist_ok=True)

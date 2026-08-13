@@ -1,25 +1,4 @@
-"""WAN21Pipeline — ``Sample → Sample`` end-to-end for WAN 2.1 T2V/I2V.
-
-Implements the new four-tier flow::
-
-    Texts ──text_embed──▶ WAN21Conditions ──diffuse──▶ LatentSegment ──vae_decode──▶ Videos
-
-Hydra constructs a pipeline via
-``WAN21Pipeline.from_config(WAN21PipelineConfig)`` (see ``config.py``);
-``from_config`` loads the ``WAN21Bundle`` then constructs the four
-stages with the precision policy from the config.
-
-Default SDE strategy is :class:`DanceSDEStrategy` (legacy WAN default in
-``samplers/fsdp/wan_sampler.py::FSDPWanSampler.__init__``). Callers
-running other strategies (Flow / CPS / DPM2) should pass an explicit
-``strategy=`` built from ``cfg.sampling.sde_strategy``.
-
-Schedule policy: WAN does NOT have a diffusers-side scheduler that
-ships with the checkpoint (the bundle may set ``scheduler=None``); the
-pipeline always uses :func:`unirl.sde.runtime.get_sigma_schedule`
-with the configured ``shift``. This mirrors legacy
-``samplers/fsdp/wan_sampler.py::sample()``.
-"""
+"""WAN21Pipeline — ``Sample → Sample`` end-to-end for WAN 2.1 T2V/I2V."""
 
 from __future__ import annotations
 
@@ -44,19 +23,7 @@ from .vae import WAN21VAEDecodeStage, WANVideoLatentEncodeStage
 
 
 class WAN21Pipeline(Pipeline):
-    """WAN 2.1 T2V/I2V generate pipeline: ``Sample → Sample``.
-
-    Consumes a request ``Sample`` whose frontier Part is a pre-forked diffusion gen
-    shell carrying ``DiffusionSamplingParams`` (with ``sigmas`` pinned by the
-    hosting engine). Reads the prompt — and, for I2V, the chained first-frame image
-    — via ``sample.conditioning()`` and fills the frontier Part:
-
-    - ``segment: LatentSegment`` — the denoising trajectory.
-    - ``primitives["video"]: Videos`` — the decoded videos.
-
-    ``Part.conditions`` carries the encoded conditions for trainer-side replay (the train stack re-types them via ``conditions_cls.from_dict``). User-supplied text negatives are
-    deferred; CFG uses a synthesized empty negative.
-    """
+    """WAN 2.1 T2V/I2V generate pipeline: ``Sample → Sample``."""
 
     def __init__(
         self,
@@ -94,13 +61,7 @@ class WAN21Pipeline(Pipeline):
 
     @classmethod
     def latent_shape(cls, *, model_config: Any, sampling_spec: Any) -> tuple:
-        """Per-sample 5D latent shape ``(C, T_lat, H_lat, W_lat)`` for
-        driver-side noise pre-computation. Matches
-        ``WAN21DiffusionStage._latent_shape``.
-
-        WAN 2.1: ``AutoencoderKLWan`` is 16-channel, /8 spatial, /4
-        temporal. ``T_lat = (num_frames - 1) // 4 + 1``.
-        """
+        """Per-sample 5D latent shape ``(C, T_lat, H_lat, W_lat)`` for"""
         height = int(sampling_spec.height)
         width = int(sampling_spec.width)
         num_frames = int(sampling_spec.num_frames)
@@ -120,14 +81,7 @@ class WAN21Pipeline(Pipeline):
         *,
         strategy: Optional[StepStrategy] = None,
     ) -> "WAN21Pipeline":
-        """Build the full pipeline from a config.
-
-        ``strategy`` is the SDE step strategy. Defaults to
-        :class:`DanceSDEStrategy` (legacy WAN default in
-        ``samplers/fsdp/wan_sampler.py``); callers running GRPO with
-        Flow / CPS / DPM2 should pass an explicit strategy built from
-        ``cfg.sampling.sde_strategy``.
-        """
+        """Build the full pipeline from a config."""
         bundle = WAN21Bundle.from_config(config)
         text_embed = WAN21TextEmbedStage(bundle, max_sequence_length=int(config.max_sequence_length))
         step = WAN21DiffusionStep()
@@ -155,25 +109,7 @@ class WAN21Pipeline(Pipeline):
         negatives: Optional[Texts] = None,
         guidance_scale: float = 1.0,
     ) -> WAN21Conditions:
-        """Encode prompts (+ optional CFG negatives) into ``WAN21Conditions``.
-
-        Builds only the text-conditioning slots (``text`` / ``negative_text``);
-        the optional I2V ``image_latent`` / ``image_embed`` slots are left
-        ``None`` and attached by :meth:`generate` when an input image is
-        supplied (their encode path needs ``req`` / ``params``, outside this
-        text-only contract).
-
-        CFG negative encoding: WAN's training-time convention encodes
-        an empty-string negative when none is provided (legacy
-        ``models/wan21.py::encode_inputs`` does ``[""] * len(prompts)``
-        — and so does diffusers' upstream WAN pipeline). Without this,
-        falling back to ``torch.zeros_like(prompt_embeds)`` in
-        ``WAN21DiffusionStep.predict_noise`` would silently use a
-        different unconditional embedding than what the model was
-        trained against, shifting the distribution and making the
-        rollout / replay log-prob ratio drift away from 1.0 in GRPO.
-        Encoding ``[""] * B`` explicitly here keeps both sides aligned.
-        """
+        """Encode prompts (+ optional CFG negatives) into ``WAN21Conditions``."""
         if negatives is not None and len(negatives.texts) != len(texts.texts):
             raise ValueError(
                 f"WAN21Pipeline.build_conditions: negative_text length "
@@ -200,12 +136,7 @@ class WAN21Pipeline(Pipeline):
         )
 
     def generate(self, sample: Sample) -> Sample:
-        """Run WAN 2.1 T2V (or I2V) end-to-end, filling the frontier (pre-forked) gen Part.
-
-        Requires σ to be pinned onto the gen part's ``DiffusionSamplingParams.sigmas``
-        by the hosting engine before the call; see the σ ownership note in
-        ``unirl.models.types.pipeline``.
-        """
+        """Run WAN 2.1 T2V (or I2V) end-to-end, filling the frontier (pre-forked) gen Part."""
         frontier = sample.parts[-1]
         params = frontier.sampling_params
         if not isinstance(params, DiffusionSamplingParams):

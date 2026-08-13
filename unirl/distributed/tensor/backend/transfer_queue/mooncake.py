@@ -11,12 +11,7 @@ from unirl.distributed.tensor.backend.transfer_queue.base import Backend
 
 @dataclass
 class MooncakeZeroCopyConfig:
-    """Zero-copy buffer sizing for the Mooncake backend.
-
-    ``single_controller_*`` fields override ``tensor_buffer_size_gb`` /
-    ``bytes_buffer_size_gb`` on the controller-only client (see
-    ``MooncakeBackend.specialize_for_controller``).
-    """
+    """Zero-copy buffer sizing for the Mooncake backend."""
 
     enable: bool = True
     tensor_buffer_size_gb: float = 2.0
@@ -67,11 +62,7 @@ class MooncakeBackendConfig:
 
 
 def _zero_copy_to_dict(zero_copy: Any) -> Dict[str, Any]:
-    """Pull zero_copy fields into a plain dict regardless of source shape.
-
-    ``hydra.utils.instantiate`` may pass a DictConfig, a dataclass, or a plain
-    dict depending on conversion settings; attribute access works on all three.
-    """
+    """Pull zero_copy fields into a plain dict regardless of source shape."""
     return {
         "enable": bool(zero_copy.enable),
         "tensor_buffer_size_gb": float(zero_copy.tensor_buffer_size_gb),

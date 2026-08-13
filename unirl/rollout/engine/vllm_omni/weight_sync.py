@@ -1,23 +1,4 @@
-"""Weight sync — the canonical sync ops + LoRA lifecycle, owned by one component.
-
-``WeightSync`` is a plain object the engine constructs over the seam: it takes
-the backend and the LoRA transport choice explicitly and owns ALL sync/LoRA
-state (``_lora_loaded`` / ``_weights_released`` / ``_last_lora_*``). Method
-names mirror the frozen ``base.py`` surface minus ``track_prefix`` (the
-engine's forwards absorb that), so a grep for a trainer-side entry point lands
-here. The transports declared are exactly what vllm-omni supports: bucketed
-CUDA-IPC, NCCL (init/transfer/destroy), the SGLang-shape tensor bag, and the
-two LoRA tensor-bag transports (zero-copy handle vs. TP>1-safe byte copy).
-
-LoRA lifecycle (v1 parity — the *active re-push* model, NOT sglang_diffusion's
-passive ``lora_dirty``-only model): every ``set_lora_from_tensors*`` clones the
-tensors into ``_last_lora_*`` so :meth:`restore_lora_after_wake` can re-push
-after a sleep/wake cycle discards the worker-side adapter pool. The engine's
-``sleep()`` fires :meth:`mark_weights_released` (the named weights-released
-event); its ``wake_up()`` visibly calls :meth:`restore_lora_after_wake` and
-fails fast on a re-push failure — silent base-model rollouts drift the GRPO
-ratio invisibly until PPO clip fraction blows up.
-"""
+"""Weight sync — the canonical sync ops + LoRA lifecycle, owned by one component."""
 
 from __future__ import annotations
 
@@ -178,29 +159,11 @@ class WeightSync:
         return self._backend.lora_checksums(adapter_id=int(adapter_id), names=names)
 
     def mark_weights_released(self) -> None:
-        """The engine released the runtime memory — the worker-side LoRA pool
-        is gone until restored. Unlike sglang_diffusion's passive model (the
-        next trainer-driven sync re-pushes), this engine actively re-pushes on
-        wake from the cached tensors, so the cached adapter intent survives;
-        only the worker-pool validity changes."""
+        """The engine released the runtime memory — the worker-side LoRA pool"""
         self._weights_released = True
 
     def restore_lora_after_wake(self) -> None:
-        """Re-push the cached adapter after a wake (v1 parity).
-
-        sleep(level=1) preserves base weights but LoRA adapters may be
-        discarded; re-sending after wake ensures rollout uses the adapted
-        model. The gate is the CACHE, not ``_lora_loaded``: the cache is the
-        durable "an adapter should be active" intent, while ``_lora_loaded``
-        is only the "currently pushed" state that a failed re-push clears —
-        gating on the flag would make the retry after such a failure return
-        early "successfully" without re-pushing, and generate would silently
-        run base weights. Fail-fast on failure: clears the activation flag
-        and raises so the training loop crashes instead of shipping silent
-        base-model rollouts (the caller — the engine's ``wake_up`` — rolls the
-        engine back to offloaded, or latches an unknown partial transition when
-        even the rollback fails, so ``generate`` refuses either way).
-        """
+        """Re-push the cached adapter after a wake (v1 parity)."""
         if self._last_lora_tensors is None:
             self._weights_released = False
             return

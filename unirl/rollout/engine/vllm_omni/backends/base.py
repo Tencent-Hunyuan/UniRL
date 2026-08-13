@@ -1,25 +1,4 @@
-"""The backend seam contract — the ``Backend`` protocol + the wire types.
-
-Every ``vllm_omni`` collaborator reaches the vllm-omni runtime through this
-protocol; the real implementation lives beside it (``native.py`` — the in-process
-``Omni`` orchestrator). This module holds no runtime code at all, so it is
-trivially CPU-importable.
-
-**No RL types cross this seam.** ``generate`` takes :class:`GenerateCall`\\ s —
-plain prompt dicts + :class:`StageSampling` intent (kind + kwargs; the impl
-constructs the real ``vllm.SamplingParams`` / ``OmniDiffusionSamplingParams``
-objects) — and returns per-request-grouped lists of :class:`OmniRawResult`
-(a structural view of vllm-omni's ``OmniRequestOutput``). The engine core +
-adapters do the ``Sample``↔wire translation.
-
-The seam absorbs the transport asymmetries: ``Omni.generate``'s flat output
-list is grouped back to per-request order by the ``"{i}_{uuid}"`` request-id
-prefix (the impl owns that parsing), LoRA activation objects
-(``OmniLoRARequest`` attach + the HI3 ``lora_request`` generate kwarg) are
-constructed inside the impl, and AR prompt tokenization (vllm-omni's
-``build_prompt_tokens``) is exposed as the :meth:`Backend.tokenize_prompt`
-verb so adapters never import the runtime.
-"""
+"""The backend seam contract — the ``Backend`` protocol + the wire types."""
 
 from __future__ import annotations
 
@@ -44,13 +23,7 @@ STAGE_KIND_DIFFUSION = "diffusion"
 
 @dataclass(frozen=True)
 class StageSampling:
-    """Sampling-params intent for one stage — kind + plain ctor kwargs.
-
-    Adapters build these instead of the runtime's params objects (which would
-    require importing vllm / vllm-omni); the impl maps ``kind`` to the real
-    class. ``kwargs`` may carry tensors (e.g. ``extra_args.initial_noise_batch``)
-    — vllm-omni routes ``extra_args`` to the worker preserving tensor values.
-    """
+    """Sampling-params intent for one stage — kind + plain ctor kwargs."""
 
     kind: str
     kwargs: Dict[str, Any] = field(default_factory=dict)
@@ -64,19 +37,7 @@ class StageSampling:
 
 @dataclass(frozen=True)
 class GenerateCall:
-    """One ``Omni.generate`` invocation — prompts + per-stage sampling intent.
-
-    Adapters return a list of these from ``build_inputs``: normally one call
-    carrying the whole batch; ``dit_recaption`` returns N single-prompt calls so
-    each image gets its own sampling seed (see the adapter for why seeds can't
-    ride a shared per-stage params object).
-
-    ``group_by_request_id`` selects how the impl groups the call's flat output
-    back to per-request lists: ``True`` (default) parses the ``"{i}_{uuid}"``
-    request-id prefix; ``False`` treats the whole flat list as the single
-    request's group (only valid for single-prompt calls — preserves the v1
-    ``dit_recaption`` per-prompt path byte-for-byte).
-    """
+    """One ``Omni.generate`` invocation — prompts + per-stage sampling intent."""
 
     prompts: List[Any]
     sampling: List[StageSampling]
@@ -95,35 +56,7 @@ class GenerateCall:
 
 
 class OmniRawResult(Protocol):
-    """Structural view of vllm-omni's ``OmniRequestOutput`` — the wire fields
-    this engine consumes. The native impl passes ``OmniRequestOutput`` through
-    (it satisfies this protocol structurally); test fakes (``SimpleNamespace``
-    with the fields) stand in. Adapters/utils annotate against it and stay
-    vllm-omni-free.
-
-    Population by stage kind:
-
-    - Every output: ``request_id`` (``"{i}_{uuid}"``; the impl consumes it for
-      grouping), ``stage_id``, ``final_output_type`` (``"text"`` for the AR
-      stage, ``"image"`` / ``"video"`` for the final DiT stage).
-    - AR stage (``final_output_type == "text"``): ``request_output`` — the
-      nested vLLM ``RequestOutput`` (``.outputs[0].token_ids`` / ``.logprobs``
-      / ``.text``) — and ``prompt_token_ids`` (the sample's true, un-padded
-      prompt; vLLM runs prompts per-request with no batch padding).
-    - DiT stage (``"image"`` / ``"video"``): ``images`` (PIL list; per-prompt
-      frame list for video), ``trajectory_latents`` ``[1, T+1, ...]`` (dense —
-      every step recorded), ``trajectory_timesteps`` ``[T+1]`` (the field name
-      reads "timesteps" but the RL pipeline subclass overwrites its contents
-      with the true [0, 1] σ schedule), ``trajectory_log_probs`` ``[1, K]``
-      (K = SDE-gated step count; 0 for NFT/forward-process), and
-      ``custom_output`` — the dataclass-routed capture dict that survives the
-      worker IPC boundary. Documented keys: ``"fused_mm_capture"`` (HI3
-      ``prepare_inputs_for_generation`` capture), ``"text_capture"`` (SD3 /
-      HV1.5 ``encode_prompt`` capture), ``"sde_step_indices"`` (the SDE-gated
-      step ids echoed by the scheduler). Missing capture is a fatal
-      misconfiguration the *adapter* raises on — the seam passes the dict
-      through structurally.
-    """
+    """Wire view of vllm-omni output: ``trajectory_latents [1, T+1, ...]``, ``trajectory_log_probs [1, K]``."""
 
     request_id: str
     stage_id: Optional[int]

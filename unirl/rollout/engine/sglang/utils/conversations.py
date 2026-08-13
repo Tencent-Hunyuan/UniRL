@@ -1,19 +1,4 @@
-"""Trajectory → chat-conversation rendering (pure, tokenizer-free).
-
-The AR adapters encode one chat conversation per *prompt*, but the trajectory
-view :meth:`Sample.text_conditioning` / :meth:`Sample.vision_conditioning`
-surfaces it turn-major and **frontier-aligned**: ``T`` turns, each holding one
-row per frontier sample (``P`` prompts × ``n`` fan-out = ``P*n`` rows). These
-helpers transpose that into ``P`` per-sample message lists and de-expand the
-``*n`` fan-out back to the unique conversations the backend fans out server-side.
-
-Pure (no tokenizer, no processor, no engine state) — so the message-shape
-logic unit-tests with canned ``Sample``s. The *model-specific* encode
-(``apply_chat_template`` / processor) stays in the adapter. Composition rules
-(system precedence, role fusion) are imported from the single composition
-layer, :mod:`unirl.models.types.conversations`; only the wire-specific ``*n``
-de-expand lives here.
-"""
+"""Trajectory → chat-conversation rendering (pure, tokenizer-free)."""
 
 from __future__ import annotations
 
@@ -27,19 +12,7 @@ Conversation = List[Dict[str, Any]]
 
 
 def unique_group_indices(group_ids: List[str]) -> Tuple[List[int], int]:
-    """Representative row index per fan-out group + the uniform repeat ``k``.
-
-    The frontier is group-by-parent **contiguous** (siblings adjacent — the
-    ``fork`` contract), so the first occurrence of each parent id yields the
-    group-order representatives ``[0, k, 2k, …]``. That order is the one
-    ``TextLMAdapter.build_response`` expects for ``raw`` (``[conv0×k, conv1×k,
-    …]``), so the de-expanded ``wire`` lines up with the filled gen rows.
-
-    Returns ``(rep_indices, k)``. Falls back to ``(range(n), 1)`` — one
-    conversation per row, no de-expand — when groups are non-uniform or empty
-    (e.g. a tree-shaped trajectory with branch>1 at an intermediate turn), which
-    degrades safely rather than mis-collapsing.
-    """
+    """Representative row index per fan-out group + the uniform repeat ``k``."""
     n = len(group_ids)
     if n == 0:
         return [], 1
@@ -62,13 +35,7 @@ def build_text_conversations(
     sample: Sample,
     system_instruction: Any = None,
 ) -> Tuple[List[Conversation], int]:
-    """The all-text trajectory as ``P`` unique chat conversations + fan-out ``k``.
-
-    Transposes :meth:`Sample.text_conditioning` (turn-major, frontier-aligned)
-    into one message list per unique prompt, then de-expands the ``*n`` siblings.
-    Degenerates to today's single ``user`` message when no roles are set, so it
-    is byte-identical on single-turn workloads.
-    """
+    """The all-text trajectory as ``P`` unique chat conversations + fan-out ``k``."""
     turns = sample.text_conditioning()
     rep, k = unique_group_indices(sample.parts[-1].group_ids)
     roles = [t.role for t in turns]
@@ -83,15 +50,7 @@ def build_vision_conversations(
     sample: Sample,
     system_instruction: Any = None,
 ) -> Tuple[List[Conversation], List[List[Any]], int]:
-    """The text+image trajectory as ``P`` conversations, their per-conv PIL
-    images, and fan-out ``k``.
-
-    Same transpose as :func:`build_text_conversations`, but consecutive same-role
-    turns fuse into one message whose content is ``[image blocks…, text blocks…]``
-    — image-before-text, matching ``VLMAdapter.encode_mm`` and the trainside
-    ``QwenVLChatTemplateStage`` ordering. ``images_list[g]`` are that
-    conversation's PILs in placeholder order, for the processor.
-    """
+    """The text+image trajectory as ``P`` conversations, their per-conv PIL"""
     turns, _ = sample.vision_conditioning()
     rep, k = unique_group_indices(sample.parts[-1].group_ids)
     roles = [t.role for t in turns]

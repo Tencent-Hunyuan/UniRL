@@ -1,17 +1,4 @@
-"""Sample + Part — the rollout endomorphism types (LIN-446).
-
-See ``unirl/types/README.md``. One recursive type for the rollout
-boundary (``step: Sample -> Sample``), replacing the ``RolloutReq → RolloutResp``
-pair. A ``Sample`` holds an ordered ``parts: List[Part]`` whose position *is* the
-lineage chain — a part's parent is the entry before it (index ``i-1``), so parts
-carry no name/key. Within a part, each sample's parent is recovered from its id
-path (``sample_ids``; see ``unirl/types/README.md`` and
-:mod:`unirl.types.sample_id`), not a stored index. A *request* is a ``Sample`` with
-only input Part(s); ``fork``
-appends a generation shell and the fill step populates it. Conditioning is collected
-from the ancestor prefix as primitives (:meth:`Sample.conditioning`), not stored.
-Reward/advantage/split machinery is ported from ``rollout_resp.py``.
-"""
+"""Sample + Part — the rollout endomorphism types (LIN-446)."""
 
 from __future__ import annotations
 
@@ -49,8 +36,7 @@ from unirl.utils.shard_balance import lpt_shard_permutation, shard_token_spread
 
 logger = logging.getLogger(__name__)
 
-Primitive = PrimitiveValue
-PrimitiveMap = Dict[str, Primitive]
+PrimitiveMap = Dict[str, PrimitiveValue]
 PrimitiveMetadata = Dict[str, Dict[str, Any]]
 PRIMITIVE_MODALITY_ORDER = ("text", "image", "video", "audio", "media")
 
@@ -59,31 +45,15 @@ TURN_ROLES = ("system", "user", "assistant", "tool")
 
 @dataclass
 class Turn:
-    """One conditioning turn: a role tag + its frontier-aligned content primitive.
-
-    The unit :meth:`Sample.turns` surfaces — a role-aware view over the
-    :meth:`Sample.conditioning` ancestor walk, so a multi-turn (agent) trajectory
-    can be rendered into an LLM/VLM conversation. A plain return type (not a
-    :class:`Batch`): ``content`` is already a batched primitive (one row per
-    frontier sample).
-    """
+    """One conditioning turn: a role tag + its frontier-aligned content primitive."""
 
     role: str
-    content: Primitive
+    content: PrimitiveValue
 
 
 @dataclass
 class Part(Batch):
-    """One rollout slice in a Sample lineage.
-
-    A node in a :class:`Sample`'s positional chain: its parent is the preceding
-    entry in ``Sample.parts`` (index ``i-1``). Each sample's parent *within* that
-    preceding part is recovered from its id path (``parent_id(sample_ids[i])``,
-    located by id; see :mod:`unirl.types.sample_id`) — there is no stored parent
-    index; :attr:`is_root` marks the chain head. ``segment`` holds the encoded
-    payload, ``primitives`` its decoded/raw content keyed by modality. Conditioning is collected
-    from the prefix (:meth:`Sample.conditioning`), not stored.
-    """
+    """One rollout slice in a Sample lineage."""
 
     sample_ids: List[str] = concat_field(default_factory=list)
 
@@ -165,13 +135,7 @@ class Part(Batch):
         metadata: Optional[List[Optional[Dict[str, Any]]]] = None,
         role: Optional[str] = None,
     ) -> "Part":
-        """Build a turn-0 input Part (the prompt, a root; untrained).
-
-        ``segment`` is the encoded prompt; ``primitives`` optionally carries the same
-        content in raw form (what :meth:`Sample.conditioning` surfaces). Always a
-        root — its ids carry no lineage segment, so they must not contain the ``/``
-        path delimiter (this is the boundary where driver-supplied ids enter).
-        """
+        """Build a turn-0 input Part (the prompt, a root; untrained)."""
         bad = [s for s in sample_ids if "/" in s]
         if bad:
             raise ValueError(
@@ -187,16 +151,7 @@ class Part(Batch):
         )
 
     def input_child(self, primitives: PrimitiveMap, *, role: Optional[str] = None) -> "Part":
-        """A branch-1 *input* child carrying additional conditioning primitives.
-
-        Multi-input multimodal (e.g. image+text → image) usually puts each
-        conversation turn in a chained input Part. One child is created per
-        parent sample (ids extended by ``/0``), with ``sampling_params`` left
-        None because it generates nothing. Chaining keeps only the head a root,
-        so the Sample stays valid and
-        :meth:`Sample.conditioning` surfaces every input primitive in turn order
-        (root → …). See ``unirl/types/README.md``.
-        """
+        """A branch-1 *input* child carrying additional conditioning primitives."""
         if not self.sample_ids:
             raise ValueError("Part.input_child: parent has no sample_ids")
         return Part(
@@ -213,39 +168,27 @@ class Part(Batch):
 
     @property
     def is_root(self) -> bool:
-        """Whether this is a chain head (input/root) — its sample ids carry no
-        lineage segment. An empty part is not a root (no samples to root)."""
+        """Whether this is a chain head (input/root) — its sample ids carry no"""
         return bool(self.sample_ids) and not any("/" in sid for sid in self.sample_ids)
 
     @property
     def is_gen(self) -> bool:
-        """Whether this part was generated by the policy — it carries the
-        ``sampling_params`` it was forked with. THE kind signal: ``gen_parts``,
-        turn counting, and role derivation all key off it. Input parts
-        (``input`` / ``input_child`` / ``observe``) never carry params."""
+        """Whether this part was generated by the policy — it carries the"""
         return self.sampling_params is not None
 
     def resolved_role(self) -> str:
-        """This turn's conversation role, deriving when :attr:`role` is unset.
-
-        Explicit :attr:`role` wins; otherwise a generated part (:attr:`is_gen`)
-        is ``"assistant"`` and an input part is ``"user"``.
-        ``system`` / ``tool`` turns are not derivable — set :attr:`role` for them.
-        """
+        """This turn's conversation role, deriving when :attr:`role` is unset."""
         if self.role is not None:
             return self.role
         return "assistant" if self.is_gen else "user"
 
     @property
     def group_ids(self) -> List[str]:
-        """Grouping labels: each sample's parent id (siblings = one group), or its
-        own id for a root (each sample its own group)."""
+        """Grouping labels: each sample's parent id (siblings = one group), or its"""
         return [p if (p := parent_id(sid)) is not None else sid for sid in self.sample_ids]
 
     def balance_shards(self, num_shards: int, *, min_spread: float = 0.05) -> "Part":
-        """Reorder samples so ``num_shards`` equal contiguous shards carry ~equal
-        tokens (verl ``balance_batch`` parity, greedy LPT). No-op when balancing
-        can't apply or shards are already within ``min_spread``."""
+        """Reorder samples so ``num_shards`` equal contiguous shards carry ~equal"""
         if self.segment is None or self.segment.lengths is None or num_shards <= 1:
             return self
         total = self.batch_size
@@ -272,16 +215,7 @@ class Part(Batch):
         sampling_params: BaseSamplingParams,
         new_segment: Optional[Segment] = None,
     ) -> "Part":
-        """Create a child generation shell — ``N`` self-samples → ``N*branch``.
-
-        The mechanic behind :meth:`Sample.fork` (which appends the child so its
-        parent is positionally ``self``). Child ids extend each parent id with one
-        ``/{branch}`` segment, group-by-parent contiguous (siblings adjacent) — so the
-        id *is* the lineage and ``parent_id`` recovers the parent. Fork is the
-        generation edge: ``sampling_params`` is required, so the shell is
-        :attr:`is_gen` by construction. ``segment`` is left for the fill step. No
-        conditioning assembled (collected via :meth:`Sample.conditioning`).
-        """
+        """Create a child generation shell — ``N`` self-samples → ``N*branch``."""
         if not self.sample_ids:
             raise ValueError("Part.fork: parent has no sample_ids")
         if branch < 1:
@@ -306,13 +240,7 @@ class Part(Batch):
         status: Optional[torch.Tensor] = None,
         output_version: Optional[int] = None,
     ) -> "Part":
-        """Return a copy of this gen-shell part with generation outputs written.
-
-        The producer-side counterpart of :meth:`fork`: ``fork`` makes the empty
-        shell (ids + ``sampling_params``), the engine generates, then ``fill``
-        writes the results. Only non-``None`` arguments are written; ids,
-        ``sampling_params`` and everything else are preserved.
-        """
+        """Return a copy of this gen-shell part with generation outputs written."""
         kwargs: Dict[str, Any] = {f.name: getattr(self, f.name) for f in dc_fields(self)}
         for name, value in (
             ("segment", segment),
@@ -335,23 +263,7 @@ class Part(Batch):
         use_global_std: bool = False,
         group_layer: Optional[int] = None,
     ) -> "Part":
-        """GRPO per-group advantage ``(reward - group_mean) / (group_std + eps)``.
-
-        ``scope`` picks the normalization mode: ``"group"`` (default) normalizes
-        per group; ``"global"`` z-scores the whole batch with population std
-        (``unbiased=False``, matching agentic) and ignores the grouping knobs. Under
-        ``scope="group"``, ``group_layer`` picks the lineage layer whose ancestor
-        id labels the groups (the id's first ``layer + 1`` segments): ``None``
-        (default) groups by the immediate parent (:attr:`group_ids`; a root part
-        degenerates to per-sample groups → advantage 0), ``0`` by the root prompt.
-        Labels must be group-by-parent contiguous with uniform branching (``fork``
-        guarantees this at every layer), so the reduce is one ``view``.
-        ``use_global_std`` keeps per-group means but one batch-wide std. Non-finite
-        rewards are excluded from statistics and receive zero advantage; population
-        std makes ``branch=1`` (and other single-finite groups) degenerate to
-        advantage 0. The denominator is ``std + eps`` (not ``sqrt(var + eps)``),
-        so ``eps`` only avoids div-by-zero and does not soft-floor near-zero variance.
-        """
+        """GRPO per-group advantage ``(reward - group_mean) / (group_std + eps)``."""
         if self.rewards is None:
             raise ValueError("Part.compute_advantages: part has no rewards")
         n = len(self.sample_ids)
@@ -414,13 +326,7 @@ class Part(Batch):
         gamma: float = 1.0,
         gae_lambda: float = 0.95,
     ) -> "Part":
-        """Attach packed token advantages and returns for an AR PPO update.
-
-        ``loss_mask`` controls which tokens later contribute to the policy and
-        value losses. It deliberately does not control the GAE recursion:
-        masked actions are still states in the same trajectory, so terminal
-        reward must propagate across them.
-        """
+        """Attach packed token advantages and returns for an AR PPO update."""
         if self.rewards is None:
             raise ValueError("Part.compute_gae_advantages: part has no rewards")
         if not isinstance(self.segment, TextSegment):
@@ -499,10 +405,7 @@ def _part_with_field(part: Part, field_name: str, value: Any) -> Part:
 
 @dataclass
 class Sample(Batch):
-    """Rollout container — an ordered ``parts: List[Part]`` (the merged
-    ``RolloutReq`` + ``RolloutResp``). Position is lineage (parent = the preceding
-    part); per-Part invariants (the chain foreign-keys) are checked in
-    :meth:`__post_init__`."""
+    """Rollout container — an ordered ``parts: List[Part]`` (the merged"""
 
     parts: List[Part] = field(kind=FieldKind.CONCAT, default_factory=list)
     reward_compute_s: float = max_field(default=0.0)
@@ -530,9 +433,7 @@ class Sample(Batch):
 
     @classmethod
     def concat(cls, items: Sequence["Sample"]) -> "Sample":
-        """Concat Samples (e.g. DP gather): concat each part position-wise across
-        shards. All shards carry the same parts in the same order (shards of one
-        Sample). ``reward_compute_s`` reduces by max."""
+        """Concat Samples (e.g. DP gather): concat each part position-wise across"""
         if not items:
             raise ValueError("Sample.concat: cannot concat an empty sequence")
         if len(items) == 1:
@@ -543,24 +444,12 @@ class Sample(Batch):
 
     @classmethod
     def request(cls, *input_parts: Part) -> "Sample":
-        """A *request* — a ``Sample`` of only input Part(s), e.g.
-        ``Sample.request(Part.input(ids, seg))``.
-
-        Multi-input multimodal chains the extra inputs off the head via
-        :meth:`Part.input_child` so only the head is a root, e.g.::
-
-            text = Part.input(ids, primitives={"text": Texts(...)})
-            Sample.request(text, text.input_child({"image": Images.from_dense(...)}))  # image+text
-
-        :meth:`Sample.conditioning` then surfaces both primitives (text, image)
-        in turn order for the gen step. See ``unirl/types/README.md``.
-        """
+        """A *request* — a ``Sample`` of only input Part(s), e.g."""
         return cls(parts=list(input_parts))
 
     @property
     def batch_size(self) -> int:
-        """Size of the root Part (one prompt + its fan-out = "one sample"); max
-        across parts when the root isn't unique."""
+        """Size of the root Part (one prompt + its fan-out = "one sample"); max"""
         if not self.parts:
             return 0
         roots = [p for p in self.parts if p.is_root]
@@ -569,8 +458,7 @@ class Sample(Batch):
         return max(p.batch_size for p in self.parts)
 
     def split(self) -> List["Sample"]:
-        """Split into one ``Sample`` per root-group, tree-complete: each shard holds
-        one prompt's whole subtree across all parts. Requires a unique root."""
+        """Split into one ``Sample`` per root-group, tree-complete: each shard holds"""
         if not self.parts:
             return [self]
 
@@ -599,26 +487,13 @@ class Sample(Batch):
         return results
 
     def root_group_ids(self, part_index: int) -> List[str]:
-        """Root-prompt group label per sample of ``parts[part_index]`` — the
-        ``ancestor_id(sid, 0)`` projection (the id's first segment; the path IS
-        the lineage, so no walk is needed).
-
-        Groups a descendant Part by the prompt it descends from (coarser than its
-        immediate parent) for GRPO — what ``compute_advantages(group_layer=0)``
-        uses. The labels stay group-by-parent contiguous (the lineage keeps a
-        prompt's samples consecutive)."""
+        """Root-prompt group label per sample of ``parts[part_index]`` — the"""
         if not self.parts:
             return []
         return [ancestor_id(sid, 0) for sid in self.parts[part_index].sample_ids]
 
     def root_metadata(self, part_index: int = -1) -> List[Optional[Dict[str, Any]]]:
-        """Root Part's per-sample metadata aligned to ``parts[part_index]`` rows.
-
-        Input metadata (e.g. geneval specs) is authored once on the prompt — the
-        root input Part's ``metadata`` — so scoring a descendant Part needs it
-        projected onto that Part's samples. A root group label *is* the root
-        sample id (:meth:`root_group_ids`), so the root row is looked up by id.
-        Returns ``[None] * batch_size`` when the root carries no metadata."""
+        """Root Part's per-sample metadata aligned to ``parts[part_index]`` rows."""
         if not self.parts:
             return []
         n = self.parts[part_index].batch_size
@@ -629,9 +504,7 @@ class Sample(Batch):
         return [by_root_id.get(rgid) for rgid in self.root_group_ids(part_index)]
 
     def gen_parts(self) -> List[Part]:
-        """The generated (non-input) Parts — those with :attr:`Part.is_gen`.
-        Input Parts (the prompt head and any :meth:`Part.input_child`) have
-        ``sampling_params is None`` and are skipped."""
+        """The generated (non-input) Parts — those with :attr:`Part.is_gen`."""
         return [p for p in self.parts if p.is_gen]
 
     def _gen_part_indices(self, params_type: type) -> List[int]:
@@ -651,24 +524,14 @@ class Sample(Batch):
         return indices[0]
 
     def gen_part(self, params_type: type) -> Part:
-        """The unique gen Part whose sampling params match ``params_type``.
-
-        Type lookup names a stage only when the type occurs once. Repeated
-        agent turns deliberately fail instead of silently selecting an older
-        stage; generation code should use :meth:`frontier_gen_part` when it
-        means the shell appended by the latest :meth:`fork`.
-        """
+        """The unique gen Part whose sampling params match ``params_type``."""
         index = self._require_unique_gen_part_index(
             self._gen_part_indices(params_type), params_type, caller="Sample.gen_part"
         )
         return self.parts[index]
 
     def gen_part_or_none(self, params_type: type) -> Optional[Part]:
-        """:meth:`gen_part`, returning ``None`` only when there is no match.
-
-        Multiple matching Parts remain an error: optionality does not make an
-        ambiguous repeated-stage lookup safe.
-        """
+        """:meth:`gen_part`, returning ``None`` only when there is no match."""
         indices = self._gen_part_indices(params_type)
         if not indices:
             return None
@@ -682,12 +545,7 @@ class Sample(Batch):
         )
 
     def frontier_gen_part(self, params_type: type) -> Part:
-        """Return the final Part after validating it is a gen of ``params_type``.
-
-        This is the generation-path selector: :meth:`fork` appends the shell an
-        engine must fill, so accepting an earlier type match would overwrite
-        trajectory history when a parameter type repeats across agent turns.
-        """
+        """Return the final Part after validating it is a gen of ``params_type``."""
         if not self.parts:
             raise ValueError("Sample.frontier_gen_part: Sample has no Parts")
         index = len(self.parts) - 1
@@ -704,21 +562,11 @@ class Sample(Batch):
         return frontier
 
     def with_parts(self, parts: List[Part]) -> "Sample":
-        """A copy carrying replacement ``parts`` but the same ``reward_compute_s``
-        — the idiom for swapping in advantage-filled Parts without dropping the
-        accumulated reward-compute time."""
+        """A copy carrying replacement ``parts`` but the same ``reward_compute_s``"""
         return type(self)(parts=list(parts), reward_compute_s=self.reward_compute_s)
 
     def map_sample_ids(self, mapper: Callable[[str], str]) -> "Sample":
-        """Rewrite every Part's ids and revalidate the complete lineage tree.
-
-        Request preparation and eval padding both need to rewrite roots without
-        leaving descendant ids behind.  Mapping the whole tree in one operation
-        makes that invariant explicit; ``mapper`` must preserve parent/child
-        relationships (for example by prefixing every id, or replacing only its
-        root segment).  Construction of the returned :class:`Sample` validates
-        the resulting foreign-key chain.
-        """
+        """Rewrite every Part's ids and revalidate the complete lineage tree."""
         return self.with_parts(
             [
                 _part_with_field(part, "sample_ids", [mapper(sample_id) for sample_id in part.sample_ids])
@@ -727,22 +575,13 @@ class Sample(Batch):
         )
 
     def slice(self, start: int, end: int) -> "Sample":
-        """Shard ``[start, end)`` along the batch dim (the P root prompts) by whole
-        prompt-TREE, not by the ``parts`` list.
-
-        A ``Sample``'s batch dim is its P root prompts, but its only CONCAT field
-        is ``parts`` (length = #stages, 2-3) — so the inherited ``Batch.slice``
-        would wrongly slice the parts list and hand every shard the full Sample.
-        Route through :meth:`split`/:meth:`concat` so each shard holds whole prompt
-        subtrees across all parts. This is the hook ``@distributed(DP_SCATTER)``
-        (via ``Batch.chunk`` -> ``slice``) and trainside micro-batching rely on."""
+        """Shard ``[start, end)`` along the batch dim (the P root prompts) by whole"""
         picked = self.split()[start:end]
         parts = Sample.concat(picked).parts if picked else []
         return type(self)(parts=parts, reward_compute_s=self.reward_compute_s)
 
     def select(self, indices: "torch.Tensor") -> "Sample":
-        """Gather whole root prompt-trees by index (shuffle / subsample), mirroring
-        :meth:`slice`'s tree-sharding rather than the inherited parts-list select."""
+        """Gather whole root prompt-trees by index (shuffle / subsample), mirroring"""
         groups = self.split()
         idx = indices.tolist() if hasattr(indices, "tolist") else list(indices)
         picked = [groups[int(i)] for i in idx]
@@ -756,8 +595,7 @@ class Sample(Batch):
         sampling_params: BaseSamplingParams,
         new_segment: Optional[Segment] = None,
     ) -> "Sample":
-        """Append a generation shell forked from the frontier (the last part) — the
-        sole fan-out edge (§5), the "fork" half of ``step: fork → fill``."""
+        """Append a generation shell forked from the frontier (the last part) — the"""
         if not self.parts:
             raise ValueError("Sample.fork: no parts to fork from (empty Sample)")
         child = self.parts[-1].fork(
@@ -767,31 +605,15 @@ class Sample(Batch):
         )
         return type(self)(parts=[*self.parts, child], reward_compute_s=self.reward_compute_s)
 
-    def observe(self, observation: Primitive, *, role: str = "tool") -> "Sample":
-        """Append an observation as a branch-1, mask-0 *input* Part off the frontier.
-
-        The world-response half of an agentic turn (``unirl/rollout/env/README.md``): the
-        observation rides as a chained input Part — one child per frontier sample, ids
-        extended by ``/0`` — carrying no ``sampling_params``. So it is excluded from
-        :meth:`gen_parts` (never trained) and surfaced to the next turn by
-        :meth:`conditioning`. Reuses :meth:`Part.input_child` (the same branch-1 input-child
-        mechanic), appended to the frontier rather than chained at the root.
-
-        ``role`` tags the observation's conversation turn for role-aware rendering
-        (:meth:`Part.resolved_role`), defaulting to ``"tool"`` — the agentic world-response is a
-        tool result, so the chat template wraps it as a ``<tool_response>``. A non-tool world
-        (e.g. a user simulator) can pass ``role="user"``.
-        """
+    def observe(self, observation: PrimitiveValue, *, role: str = "tool") -> "Sample":
+        """Append an observation as a branch-1, mask-0 *input* Part off the frontier."""
         if not self.parts:
             raise ValueError("Sample.observe: no parts to observe from (empty Sample)")
         obs_part = self.parts[-1].input_child({primitive_modality_key(observation): observation}, role=role)
         return type(self)(parts=[*self.parts, obs_part], reward_compute_s=self.reward_compute_s)
 
     def propagate_rewards(self, op: Literal["mean", "max", "sum"] = "mean") -> "Sample":
-        """Aggregate child rewards up the chain (leaf → root) into unscored parents.
-        Walks ``parts`` in reverse; per parent, reduces the successor's rewards
-        ``view(n_parent, branch).reduce(dim=1)``. Direct rewards win. Single-child
-        only (the chain guarantees it; §7)."""
+        """Aggregate child rewards up the chain (leaf → root) into unscored parents."""
         new_parts = list(self.parts)
         for i in range(len(new_parts) - 1, -1, -1):
             part = self.parts[i]
@@ -829,16 +651,7 @@ class Sample(Batch):
         return type(self)(parts=new_parts, reward_compute_s=self.reward_compute_s)
 
     def turns(self) -> List[Turn]:
-        """Role-tagged, turn-ordered, frontier-aligned conditioning — the agent
-        substrate. The same ancestor walk as :meth:`conditioning`, but each
-        surfaced primitive is paired with its part's :meth:`Part.resolved_role`,
-        so a multi-turn trajectory can be rendered into an LLM/VLM conversation.
-
-        Ancestors are walked by id: ``active_ids`` are the ancestor ids aligned to
-        the frontier's samples, climbed one level per step via ``parent_id``; each
-        level's rows are looked up by id (position-independent). Ancestors with
-        no populated ``primitives`` are skipped; for a non-frontier part's turns
-        (replay), call this on ``parts[:i+1]``."""
+        """Role-tagged, turn-ordered, frontier-aligned conditioning — the agent"""
         if not self.parts:
             return []
         frontier = self.parts[-1]
@@ -869,22 +682,12 @@ class Sample(Batch):
         out.reverse()
         return out
 
-    def conditioning(self) -> List[Primitive]:
-        """Conditioning primitives for generating the frontier (last) part: each
-        ancestor's raw primitives, row-aligned to the frontier's
-        samples, in chronological order (root → frontier-parent). The role-stripped
-        view of :meth:`turns` — the bare-primitive escape unified models consume
-        (replay: call on ``parts[:i+1]``)."""
+    def conditioning(self) -> List[PrimitiveValue]:
+        """Conditioning primitives for generating the frontier (last) part: each"""
         return [t.content for t in self.turns()]
 
     def prompt_media_refs(self) -> Optional[MediaRefs]:
-        """Return typed URI prompt-media refs from the root input Part, if any.
-
-        ``(image|audio|video, prompt)`` inputs live under
-        ``Part.primitives["media"]`` as :class:`MediaRefs`. Decoded condition
-        ``primitives["image"]`` / ``primitives["video"]`` used by diffusion and
-        edit paths are intentionally not returned here.
-        """
+        """Return typed URI prompt-media refs from the root input Part, if any."""
         if not self.parts:
             return None
         media = self.parts[0].primitives.get("media")
@@ -896,16 +699,8 @@ class Sample(Batch):
             )
         return media
 
-    def conditioning_at(self, index: int) -> List[Primitive]:
-        """:meth:`conditioning` for generating ``parts[index]`` rather than the frontier.
-
-        :meth:`conditioning` always aligns to the LAST Part, so a multi-stage pipeline
-        filling an *interior* gen Part (the ``ar`` of an ``[input, ar, diffusion]``
-        chain) must re-root the view on that Part — reading the frontier view instead
-        conditions the AR pass at the final ``P*N*M`` width when the Part holds ``P*N``.
-        Names the ``parts[:index+1]`` replay idiom as an operation so the two-stage
-        pipelines share one implementation. Accepts negative indices (``-2`` = the
-        stage before the frontier)."""
+    def conditioning_at(self, index: int) -> List[PrimitiveValue]:
+        """:meth:`conditioning` for generating ``parts[index]`` rather than the frontier."""
         if not self.parts:
             raise ValueError("Sample.conditioning_at: Sample has no Parts")
         if not -len(self.parts) <= index < len(self.parts):
@@ -914,8 +709,7 @@ class Sample(Batch):
         return type(self)(parts=list(self.parts[:stop]), reward_compute_s=self.reward_compute_s).conditioning()
 
     def text_conditioning(self) -> List[Turn]:
-        """LLM render: the trajectory as an all-text conversation. Fails loud on
-        any non-text turn — this consumer has no image channel."""
+        """LLM render: the trajectory as an all-text conversation. Fails loud on"""
         ts = self.turns()
         non_text = [primitive_modality_key(t.content) for t in ts if not isinstance(t.content, Texts)]
         if non_text:
@@ -923,10 +717,7 @@ class Sample(Batch):
         return ts
 
     def vision_conditioning(self) -> tuple[List[Turn], List[Images]]:
-        """VLM render: the trajectory as a text+image conversation. Returns the
-        role-tagged turns (for placeholder ordering) plus the image collection
-        (1..k, for the processor). Fails loud on zero images or any non-text/image
-        modality."""
+        """VLM render: the trajectory as a text+image conversation. Returns the"""
         ts = self.turns()
         images = [t.content for t in ts if isinstance(t.content, Images)]
         extra = [primitive_modality_key(t.content) for t in ts if not isinstance(t.content, (Texts, Images))]
@@ -938,27 +729,21 @@ class Sample(Batch):
         return ts, images
 
     def has_image_input(self) -> bool:
-        """Whether any non-frontier Part carries an image primitive — the
-        boolean replacement for the retired ``image_input_part`` reject/require
-        guards."""
+        """Whether any non-frontier Part carries an image primitive — the"""
         return any("image" in p.primitives for p in self.parts[:-1])
 
     def replace_frontier(self, part: Part) -> "Sample":
-        """Swap the frontier (last) part, preserving the chain (``parts[:-1]``) and
-        ``reward_compute_s`` — the structural write-back for the adapter output
-        rebuild and chunk slice/concat (mirrors trainside; never drops intermediates)."""
+        """Swap the frontier (last) part, preserving the chain (``parts[:-1]``) and"""
         return self.with_parts([*self.parts[:-1], part])
 
     def with_filled_frontier(self, **fill_kwargs: Any) -> "Sample":
-        """Fill the frontier gen shell with generation outputs, chain preserved —
-        ``with_filled_frontier(segment=…, primitives=…, conditions=…)``."""
+        """Fill the frontier gen shell with generation outputs, chain preserved —"""
         return self.replace_frontier(self.parts[-1].fill(**fill_kwargs))
 
 
 __all__ = [
     "Sample",
     "Part",
-    "Primitive",
     "PrimitiveMap",
     "PrimitiveMetadata",
     "PRIMITIVE_MODALITY_ORDER",

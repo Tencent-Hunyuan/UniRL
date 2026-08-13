@@ -1,15 +1,4 @@
-"""The native ``Backend`` impl — ``DiffGenerator`` + the ZMQ scheduler client.
-
-The ONLY module that imports the SGLang runtime or does I/O. Covers both local
-mode (``from_pretrained`` spawns the worker in-process) and the existing remote
-mode (``local_mode=False`` connects the scheduler client to an externally launched
-server's ``scheduler_port``). Weight-sync ``*ReqInput`` io_struct types stay
-*inside* this module.
-
-Because the SGLang import is lazy (only in :meth:`SGLangBackend.boot` and the
-verbs), the module imports on CPU — the rest of the package is exercisable
-without a GPU.
-"""
+"""The native ``Backend`` impl — ``DiffGenerator`` + the ZMQ scheduler client."""
 
 from __future__ import annotations
 
@@ -23,19 +12,7 @@ logger = logging.getLogger(__name__)
 
 
 def _import_sglang_runtime() -> Dict[str, Any]:
-    """Install the UniRL patch suite, then import the runtime types. Once per process.
-
-    Stock upstream sglang (>= 0.5.12.post1) replaced the fork: the RL additions
-    (weight-sync verbs, in-memory LoRA, sleep/wake, rollout IO fields) are
-    re-hosted as in-process patches under ``unirl.rollout.engine.sglang_diffusion._patches``
-    and MUST be installed before any scheduler/worker spawns — ``hijack()`` also
-    wraps the mp process target so spawned children re-install (mirrors the v1
-    engine, ``sglang/engine.py``).
-
-    Import sourcing mirrors v1: types that exist upstream come from upstream;
-    fork-only req types come from ``_patches.io_struct`` / ``_patches.lora_req``
-    (``patch_scheduler`` registers handlers keyed on those exact classes).
-    """
+    """Install the UniRL patch suite, then import the runtime types. Once per process."""
     from unirl.rollout.engine.sglang_diffusion._patches import SglangDiffusionHijack
 
     SglangDiffusionHijack.hijack()
@@ -75,17 +52,7 @@ def _import_sglang_runtime() -> Dict[str, Any]:
 
 
 class _RawResultView:
-    """Flat ``RawResult`` view over upstream's ``GenerationResult``.
-
-    Stock upstream packs the rollout trajectory + native log-probs into the
-    nested ``rollout_trajectory_data`` (RolloutTrajectoryData) instead of the
-    fork's flat ``trajectory_latents`` / ``trajectory_timesteps`` /
-    ``trajectory_log_probs``. This view flattens that path (rtd-only, tolerant
-    of missing levels — mirrors the v1 ``response.py`` accessors; GRPO uses the
-    ``dit_trajectory`` latents so the trajectory stays aligned with
-    ``rollout_log_probs``) and passes every other wire field through, keeping
-    adapters/utils on the unchanged ``RawResult`` protocol.
-    """
+    """Flat ``RawResult`` view over upstream's ``GenerationResult``."""
 
     __slots__ = ("_result",)
 
@@ -104,9 +71,7 @@ class _RawResultView:
 
     @property
     def aux_trajectory_latents(self) -> Any:
-        """LTX-2's co-denoised AUDIO trajectory ([B, T+1, ...]), attached onto
-        ``dit_trajectory.audio_latents`` by ``patch_ltx2_rollout_sde`` and carried
-        through the per-output concat/slice. ``None`` for models without it."""
+        """LTX-2's co-denoised AUDIO trajectory ``[B, T+1, ...]``; ``None`` for models without one."""
         rtd = getattr(self._result, "rollout_trajectory_data", None)
         return getattr(getattr(rtd, "dit_trajectory", None), "audio_latents", None)
 
@@ -134,14 +99,7 @@ class SGLangBackend:
         *,
         local_mode: bool,
     ) -> "SGLangBackend":
-        """Filter intent against ServerArgs, build the generator, return the backend.
-
-        ``server_intent`` is the model/parallelism/port intent dict from
-        ``config.server_intent`` (reserved ports already overlaid — including
-        ``master_port``, the spawned workers' dist init, so no ``MASTER_PORT``
-        env manipulation happens here). We filter it to real ServerArgs fields
-        here (the only place that knows them), then spawn.
-        """
+        """Filter intent against ServerArgs, build the generator, return the backend."""
         rt = _import_sglang_runtime()
         allowed = {f.name for f in dataclasses.fields(rt["ServerArgs"])}
         server_kwargs = {k: v for k, v in server_intent.items() if k in allowed}

@@ -89,6 +89,9 @@ implements its weight-receive method and a matching `sync:` handler in
   `output_version`; immutable buffered groups keep their original provenance and
   remain subject to the configured filter. Eval/checkpoint admission still requires
   an empty manager. Launch and scoring order remains trainer policy.
+- **A resolve/route failure poisons the `RolloutManager`** — samples may already be
+  lost, so every later call (including `empty` / `counts`) re-raises the original
+  error rather than reporting clean state; only `close()` stays safe.
 - **Reward/advantage methods are not engine code** — `Part.compute_advantages` and
   `Sample.propagate_rewards` are called by the trainer after scoring. An engine
   fills generation fields such as `segment`, `conditions`, `primitive`, and

@@ -1,12 +1,4 @@
-"""
-Data source implementations for GRPO training.
-
-The default data-source contract is prompt-first:
-- prompts plus optional typed media references and metadata for rollout/eval input
-
-Runtime prompt embeddings are produced inside rollout engines and training
-pipelines, not provided by the external dataset.
-"""
+"""Data source implementations for GRPO training."""
 
 import logging
 import os
@@ -28,13 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 def _load_condition_images(media_refs: List[Any]) -> Optional[List[Image]]:
-    """Load ``(modality="image", role="condition")`` media refs into ``Image``.
-
-    Returns one image per prompt, or ``None`` when the batch has no condition
-    images. Partially populated batches are rejected here.
-
-    Raises ``ValueError`` if any prompt carries more than one condition image.
-    """
+    """Load ``(modality="image", role="condition")`` media refs into ``Image``."""
     if not media_refs or not any(media_refs):
         return None
     import PIL.Image
@@ -70,12 +56,7 @@ def _load_condition_images(media_refs: List[Any]) -> Optional[List[Image]]:
 
 
 def _load_condition_videos(media_refs: List[Any]) -> Optional[List[Any]]:
-    """Load ``(modality="video", role="condition")`` media refs into ``Video``.
-
-    Returns a per-prompt list of ``Video`` (or ``None`` for prompts that carry
-    no condition video), or ``None`` when no prompt in the batch has a
-    condition video. WAN V2V consumes one reference video per prompt.
-    """
+    """Load ``(modality="video", role="condition")`` media refs into ``Video``."""
     if not media_refs or not any(media_refs):
         return None
     from unirl.types.primitives import Video as PrimVideo
@@ -153,14 +134,7 @@ def _prompt_media_primitive(
     *,
     context: str,
 ) -> Optional[MediaRefs]:
-    """Build a batch-aligned sparse prompt-media primitive.
-
-    The outer row list remains rectangular while each row may carry a different
-    image/video/audio combination (or no prompt media at all). Schema and URI
-    normalization live here; model-specific cardinality (e.g. Qwen3-Omni's one
-    input per modality) is enforced by the Omni adapter, not the data layer.
-    Local-path existence is checked when the actor opens the media.
-    """
+    """Build a batch-aligned sparse prompt-media primitive."""
     rows: List[List[MediaRef]] = []
     any_prompt_media = False
     for row, refs in enumerate(media_refs):
@@ -182,21 +156,7 @@ def _prompt_media_primitive(
 
 
 def _reject_unsupported_media_refs(batch: Dict[str, Any], *, context: str) -> None:
-    """Fail loud when a dataset hands unsupported media_refs to the driver.
-
-    The ``media_refs`` channel carries a ``MediaRef(uri, modality, role)``
-    URI list. The driver consumes condition media into chained primitive
-    Parts and preserves sparse prompt image/audio/video refs in a typed
-    ``MediaRefs`` input Part. Condition images use packed ``Images`` so their
-    per-sample source resolutions remain ragged until a model consumes them;
-    all other (modality, role) combinations are not yet typed and
-    would be silently dropped (degrading I2V/V2V/text-conditioned jobs
-    into a misconfigured run).
-
-    Supported set: see :data:`_SUPPORTED_MEDIA_REF_ROLES`. Anything else
-    raises ``NotImplementedError`` with a per-prompt index of the first
-    offending entry so debugging is straightforward.
-    """
+    """Fail loud when a dataset hands unsupported media_refs to the driver."""
     refs = batch.get("media_refs")
     if not refs:
         return
@@ -253,30 +213,10 @@ def _input_sample(
 
 
 class MultimodalRLDataSource:
-    """
-    Multimodal runtime data source for RL training.
-
-    This layer owns run-time example ordering, batching, and train/eval source
-    selection. Dataset implementations stay responsible for loading indexed
-    examples from storage.
-
-    Accepted user-facing formats:
-    - JSON/TXT/JSONL prompt datasets
-    - JSON manifests with ``prompt`` or ``caption`` plus optional ``media``
-      references and extra metadata
-    """
+    """Multimodal runtime data source for RL training."""
 
     def __init__(self, args):
-        """
-        Initialize data source from arguments.
-
-        Args:
-            args: Hydra ``cfg`` (DictConfig) with:
-                - run.data_path: Path to data file (JSON, JSONL, or TXT)
-                - run.seed: Random seed
-                - run.shuffle: Whether to shuffle the training prompts (default: True)
-                - algorithm.prompts_per_rollout: Batch size
-        """
+        """Initialize data source from arguments."""
         self.args = args
         self.data_path = args.run.data_path
         self.eval_data_path = args.run.eval_data_path
@@ -468,20 +408,7 @@ class MultimodalRLDataSource:
         *,
         eval_num_prompts: int = -1,
     ) -> Iterator[Sample]:
-        """Yield the evaluation prompt source in deterministic batches.
-
-        Args:
-            batch_size: number of prompts per yielded batch. ``batch_size <= 0``
-                yields nothing (safer than clamping to 1, which would silently
-                iterate the full dataset prompt-by-prompt).
-            eval_num_prompts: cap on total prompts iterated across all batches.
-                Sentinel encoding (matches the trainer's ``eval_num_prompts``
-                config knob):
-                  * ``-1`` (default, or any negative value) — full eval dataset.
-                  * ``0`` — yield nothing (explicit opt-out).
-                  * ``N > 0`` — first ``min(N, len(eval_dataset))`` prompts; the
-                    tail batch may be shorter than ``batch_size``.
-        """
+        """Yield the evaluation prompt source in deterministic batches."""
         batch_size = int(batch_size)
         eval_num_prompts = int(eval_num_prompts)
         if batch_size <= 0 or eval_num_prompts == 0:
@@ -514,11 +441,7 @@ class MultimodalRLDataSource:
             yield self._prompt_examples_to_batch(prompt_examples)
 
     def get_eval_samples(self, batch_size: int) -> Sample:
-        """Return the first eval batch (BC shim over :meth:`iter_eval_batches`).
-
-        ``batch_size <= 0`` returns an empty batch. Otherwise yields the first
-        deterministic batch of up to ``batch_size`` prompts.
-        """
+        """Return the first eval batch (BC shim over :meth:`iter_eval_batches`)."""
         batch_size = int(batch_size)
         if batch_size <= 0:
             return self._prompt_examples_to_batch([])
@@ -529,35 +452,7 @@ class MultimodalRLDataSource:
 
 
 class MultiDomainRLDataSource:
-    """Round-robin multi-domain prompt source — one domain per rollout batch.
-
-    Composes one ``TextPromptDataset`` + ``DataLoader`` per named domain and
-    cycles them across ``get_samples()`` calls, so every rollout batch is
-    single-domain. Every row is stamped with ``metadata["domain"] = <name>``;
-    downstream components route on that tag (``DiffusionOPD`` picks the frozen
-    teacher adapter of the same name, ``PerDomainRewardScorer`` dispatches each
-    row to its domain's scorer). Because routing is carried by the data itself,
-    resume fast-forwarding or reordering can never desynchronize a batch from
-    its domain.
-
-    Config (Hydra ``args``)::
-
-        args:
-          run:
-            domains:
-              - name: pickscore
-                data_path: datasets/pickscore/train.txt
-                eval_data_path: datasets/pickscore/test.txt   # optional
-              - name: ocr
-                data_path: datasets/ocr/train.txt
-            seed: 42
-          algorithm:
-            prompts_per_rollout: ${batch_size}
-
-    Text-only prompts (``media_refs`` are rejected). Prompt ids are prefixed
-    with the domain name so ids stay unique across domains — including inside
-    the concatenated eval Sample.
-    """
+    """Round-robin multi-domain prompt source — one domain per rollout batch."""
 
     def __init__(self, args):
         run_cfg = args.run
@@ -657,11 +552,7 @@ class MultiDomainRLDataSource:
         return self._domain_examples_to_batch(domain, batch, tag="train")
 
     def get_samples(self, batch_size: int) -> Sample:
-        """Next single-domain batch; domains cycle in declaration order.
-
-        ``batch_size`` is nominal — the actual size is ``prompts_per_rollout``,
-        fixed at construction (mirrors :class:`MultimodalRLDataSource`).
-        """
+        """Next single-domain batch; domains cycle in declaration order."""
         idx = self._iter_counter % len(self.domains)
         self._iter_counter += 1
         try:
@@ -682,14 +573,7 @@ class MultiDomainRLDataSource:
         return self._eval_datasets
 
     def get_eval_samples(self, batch_size: int) -> Sample:
-        """One deterministic eval Sample of up to ``batch_size`` prompts.
-
-        The budget is split evenly across domains (remainder to the earlier
-        ones) and the per-domain slices are concatenated, so every domain is
-        represented in a single eval pass — the trainer chunks the returned
-        Sample itself. ``batch_size <= 0`` returns an empty batch, mirroring
-        :meth:`MultimodalRLDataSource.get_eval_samples`.
-        """
+        """One deterministic eval Sample of up to ``batch_size`` prompts."""
         batch_size = int(batch_size)
         if batch_size <= 0:
             return self._domain_examples_to_batch(self.domains[0]["name"], [], tag="eval")
@@ -713,19 +597,10 @@ class MultiDomainRLDataSource:
 
 
 class DefaultDataSource:
-    """
-    Default data source that returns simple prompts.
-
-    Used when no data_path is specified or as fallback.
-    """
+    """Default data source that returns simple prompts."""
 
     def __init__(self, args):
-        """
-        Initialize default data source.
-
-        Args:
-            args: Hydra ``cfg`` (DictConfig)
-        """
+        """Initialize default data source."""
         self.args = args
         self.drop_last = False
 
@@ -769,16 +644,7 @@ class DefaultDataSource:
         *,
         eval_num_prompts: int = -1,
     ) -> Iterator[Sample]:
-        """Yield the default eval prompts in deterministic batches.
-
-        Args:
-            batch_size: number of prompts per yielded batch. ``batch_size <= 0``
-                yields nothing.
-            eval_num_prompts: cap on total prompts iterated. Same sentinel
-                encoding as :meth:`MultimodalRLDataSource.iter_eval_batches`:
-                ``-1`` (default) = full list; ``0`` = empty; ``N > 0`` = first
-                ``min(N, len(self.prompts))``.
-        """
+        """Yield the default eval prompts in deterministic batches."""
         batch_size = int(batch_size)
         eval_num_prompts = int(eval_num_prompts)
         if batch_size <= 0 or eval_num_prompts == 0:

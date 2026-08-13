@@ -1,9 +1,4 @@
-"""Async diffusion RL over separate train and rollout GPU slabs.
-
-The trainer owns optimizer progress and publication cadence. The driver-side
-``RolloutManager`` owns dispatch, grouping, filtering, and published rollout
-state. A completed batch is scored before its replacement is submitted.
-"""
+"""Async diffusion RL over separate train and rollout GPU slabs."""
 
 from __future__ import annotations
 

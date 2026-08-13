@@ -1,34 +1,4 @@
-"""HunyuanVideoPipeline -- ``Sample -> Sample`` end-to-end for HunyuanVideo-1.0.
-
-Implements the four-tier flow::
-
-    Texts --text_embed (llama + clip)--> HunyuanVideoConditions
-        --diffuse--> LatentSegment (6D video) --vae_decode--> Videos
-
-Hydra constructs a pipeline via
-``HunyuanVideoPipeline.from_config(HunyuanVideoPipelineConfig)``;
-``from_config`` loads the :class:`HunyuanVideoBundle` then constructs
-the stages with the precision policy from the config.
-
-sigma schedule contract
------------------------
-The hosting engine (``TrainsideRolloutEngine`` / ``SGLangDiffusionRolloutEngine``
-/ ``VLLMOmniRolloutEngine``) pins the σ schedule onto the gen Part's
-``DiffusionSamplingParams.sigmas`` BEFORE calling ``generate(sample)``; this
-pipeline reads ``params.sigmas`` and uses it
-verbatim. HunyuanVideo-1.0 uses **static** flow-match shift (default
-5.0); the engine builds
-:meth:`FlowMatchSchedulePolicy.from_pretrained(path, shift=pipeline.shift)`
-and the checkpoint's ``scheduler_config.json`` carries
-``use_dynamic_shifting=False``, so the policy stays on the static branch.
-
-No negative prompts (guidance embedding)
------------------------------------------
-HunyuanVideo-1.0 uses guidance embedding (``guidance_embeds=True``) instead
-of classifier-free guidance. The guidance scale is passed as a tensor to
-the transformer -- there is NO negative branch encoding. This simplifies
-the pipeline significantly vs HV15.
-"""
+"""HunyuanVideoPipeline -- ``Sample -> Sample`` end-to-end for HunyuanVideo-1.0."""
 
 from __future__ import annotations
 
@@ -53,18 +23,7 @@ from .vae import HunyuanVideoVAEDecodeStage
 
 
 class HunyuanVideoPipeline(Pipeline):
-    """HunyuanVideo-1.0 generate pipeline (T2V): ``Sample → Sample``.
-
-    Consumes a request ``Sample`` whose frontier Part is a pre-forked diffusion gen
-    shell carrying ``DiffusionSamplingParams`` (with ``sigmas`` pinned by the
-    hosting engine). Reads the prompt via ``sample.conditioning()`` and fills the
-    frontier Part:
-
-    - ``segment: LatentSegment`` (6D video) — the denoising trajectory.
-    - ``primitives["video"]: Videos`` — the decoded videos.
-
-    ``Part.conditions`` carries the encoded conditions for trainer-side replay (the train stack re-types them via ``conditions_cls.from_dict``). No CFG negative branch (T2V).
-    """
+    """HunyuanVideo-1.0 generate pipeline (T2V): ``Sample → Sample``."""
 
     def __init__(
         self,
@@ -112,15 +71,7 @@ class HunyuanVideoPipeline(Pipeline):
 
     @classmethod
     def latent_shape(cls, *, model_config: Any, sampling_spec: Any) -> tuple:
-        """Per-sample 5D latent shape ``(C, T_lat, H_lat, W_lat)`` for
-        driver-side noise pre-computation. Mirrors
-        :meth:`HunyuanVideoDiffusionStage._latent_shape`.
-
-        Channel count is read from ``model_config.latent_channels``
-        first; when the YAML leaves it ``None`` we fall back to
-        :attr:`HunyuanVideoDiffusionStage.DEFAULT_LATENT_CHANNELS`
-        (16, matching HunyuanVideo-1.0).
-        """
+        """Per-sample 5D latent shape ``(C, T_lat, H_lat, W_lat)`` for driver-side noise pre-computation."""
         height = int(sampling_spec.height)
         width = int(sampling_spec.width)
         num_frames = int(sampling_spec.num_frames)
@@ -142,13 +93,7 @@ class HunyuanVideoPipeline(Pipeline):
         *,
         strategy: Optional[StepStrategy] = None,
     ) -> "HunyuanVideoPipeline":
-        """Build the full pipeline from a config.
-
-        ``strategy`` is the SDE step strategy. Defaults to
-        :class:`DanceSDEStrategy`; callers running GRPO with a different
-        SDE family (Flow / CPS / DPM2) pass an explicit strategy built
-        from ``cfg.sampling.sde_strategy``.
-        """
+        """Build the full pipeline from a config."""
         bundle = HunyuanVideoBundle.from_config(config)
         text_embed = HunyuanVideoTextEmbedStage(
             bundle,
@@ -183,13 +128,7 @@ class HunyuanVideoPipeline(Pipeline):
         negatives: Optional[Texts] = None,
         guidance_scale: float = 1.0,
     ) -> HunyuanVideoConditions:
-        """Encode prompts (LLaMA + CLIP) into ``HunyuanVideoConditions``.
-
-        HunyuanVideo-1.0 uses guidance embedding (``guidance_embeds=True``)
-        instead of classifier-free guidance — there is NO negative branch,
-        so ``negatives`` / ``guidance_scale`` are accepted for signature
-        parity with the other families but unused here.
-        """
+        """Encode prompts (LLaMA + CLIP) into ``HunyuanVideoConditions``."""
         text_llama = self.text_embed.embed_llama(texts)
         pooled_clip = self.text_embed.embed_clip(texts)
         return HunyuanVideoConditions(
@@ -198,12 +137,7 @@ class HunyuanVideoPipeline(Pipeline):
         )
 
     def generate(self, sample: Sample) -> Sample:
-        """Run HunyuanVideo-1.0 T2V end-to-end, filling the frontier (pre-forked) gen Part.
-
-        Requires σ to be pinned onto the gen part's ``DiffusionSamplingParams.sigmas``
-        by the hosting engine before the call; see the σ ownership note in
-        ``unirl.models.types.pipeline``.
-        """
+        """Run HunyuanVideo-1.0 T2V end-to-end, filling the frontier (pre-forked) gen Part."""
         frontier = sample.parts[-1]
         params = frontier.sampling_params
         if not isinstance(params, DiffusionSamplingParams):

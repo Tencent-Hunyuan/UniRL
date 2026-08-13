@@ -1,17 +1,4 @@
-"""Build the VideoAlign reward model + Qwen2-VL processor.
-
-Inference-only counterpart to ``create_model_and_processor`` in
-``mmrl/recipes/rewards/videoalign/vendor/videoalign/train_reward.py``.
-Specifically:
-
-- Drops the ``trl.get_kbit_device_map`` / ``trl.get_quantization_config``
-  dependency — we never 4-/8-bit quantise a reward model at REFL time.
-- Drops the optimiser / loss / dataset side entirely.
-- Keeps the optional LoRA wrapping and the optional ``<|VQ_reward|>`` /
-  ``<|MQ_reward|>`` / ``<|TA_reward|>`` special-token registration, since
-  both are needed to construct a *load-able* parameter graph for the
-  published checkpoints.
-"""
+"""Build the VideoAlign reward model + Qwen2-VL processor."""
 
 from __future__ import annotations
 
@@ -32,13 +19,7 @@ def _find_target_linear_names(
     num_lora_modules: int = -1,
     lora_namespan_exclude: Optional[list] = None,
 ) -> list:
-    """Discover LoRA target modules by introspecting the model graph.
-
-    Mirrors the upstream selection rule: every ``nn.Linear`` / ``nn.Embedding``
-    whose qualified name doesn't contain any excluded namespace keyword.
-    ``num_lora_modules > 0`` truncates to the last N modules (the upstream
-    knob for cheaply LoRA-tuning only the top of the network).
-    """
+    """Discover LoRA target modules by introspecting the model graph."""
     lora_namespan_exclude = lora_namespan_exclude or []
     if isinstance(lora_namespan_exclude, str):
         lora_namespan_exclude = [lora_namespan_exclude]
@@ -62,20 +43,7 @@ def create_model_and_processor(
     training_args: TrainingConfig,
     cache_dir: Optional[str] = None,
 ) -> Tuple[torch.nn.Module, AutoProcessor, object]:
-    """Build the Qwen2-VL reward model + matching processor.
-
-    Args:
-        model_config: backbone configuration (matches the saved
-            ``model_config`` block in ``model_config.json``).
-        peft_lora_config: LoRA wiring (matches ``peft_lora_config``).
-        training_args: dtype / flash-attn knobs only; the dataset/optimiser
-            fields of :class:`TrainingConfig` are not used here.
-        cache_dir: optional HF cache directory.
-
-    Returns:
-        ``(model, processor, peft_config)`` — same tuple shape as the
-        upstream helper. ``peft_config`` is ``None`` when LoRA is disabled.
-    """
+    """Build the Qwen2-VL reward model + matching processor."""
     torch_dtype = (
         model_config.torch_dtype
         if model_config.torch_dtype in ["auto", None]

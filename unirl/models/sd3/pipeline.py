@@ -1,23 +1,4 @@
-"""SD3Pipeline — ``Sample → Sample`` end-to-end for SD3.
-
-Implements the new four-tier flow::
-
-    Texts ──text_embed──▶ SD3Conditions ──diffuse──▶ LatentSegment ──vae_decode──▶ Images
-
-Hydra constructs a pipeline via ``SD3Pipeline.from_config(SD3PipelineConfig)``
-(see ``config.py``); ``from_config`` loads the ``SD3Bundle`` then constructs
-the four stages with the precision policy from the config.
-
-σ schedule contract
--------------------
-The hosting engine (``TrainsideRolloutEngine`` / ``SGLangDiffusionRolloutEngine`` /
-``VLLMOmniRolloutEngine``) pins the σ schedule onto the gen part's
-``DiffusionSamplingParams.sigmas`` BEFORE calling ``generate(sample)``; this
-pipeline reads ``params.sigmas`` and uses it verbatim. The pipeline neither owns
-a σ builder nor reads model-specific scheduler config — both responsibilities
-live in :class:`unirl.sde.runtime.FlowMatchSchedulePolicy` which the engine
-loads once at startup.
-"""
+"""SD3Pipeline — ``Sample → Sample`` end-to-end for SD3."""
 
 from __future__ import annotations
 
@@ -40,20 +21,7 @@ from .vae import SD3VAEDecodeStage, SD3VAEEncodeStage
 
 
 class SD3Pipeline(Pipeline):
-    """SD3 generate pipeline: ``Sample → Sample``.
-
-    Consumes a request ``Sample`` whose frontier (last) Part is a pre-forked
-    diffusion gen shell carrying ``DiffusionSamplingParams`` (with ``sigmas``
-    pinned by the hosting engine). Reads the prompt via ``sample.conditioning()``
-    and fills the frontier Part:
-
-    - ``segment: LatentSegment`` — the denoising trajectory.
-    - ``primitives["image"]: Images`` — the decoded images.
-
-    ``Part.conditions`` carries the encoded conditions for trainer-side replay.
-    Sample generation uses the model's default CFG negative; direct callers can
-    pass explicit negatives through :meth:`build_conditions`.
-    """
+    """SD3 generate pipeline: ``Sample → Sample``."""
 
     def __init__(
         self,
@@ -89,8 +57,7 @@ class SD3Pipeline(Pipeline):
 
     @classmethod
     def latent_shape(cls, *, model_config: Any, sampling_spec: Any) -> tuple:
-        """Per-sample latent shape ``(C, H_lat, W_lat)`` for driver-side
-        noise pre-computation. SD3 / SD3.5: 16-channel z, /8 spatial."""
+        """Per-sample latent shape ``(C, H_lat, W_lat)`` for driver-side noise pre-computation."""
         height = int(sampling_spec.height)
         width = int(sampling_spec.width)
         return (16, height // 8, width // 8)
@@ -102,14 +69,7 @@ class SD3Pipeline(Pipeline):
         *,
         strategy: Optional[StepStrategy] = None,
     ) -> "SD3Pipeline":
-        """Build the full pipeline from a config.
-
-        ``strategy`` is the SDE step strategy. Defaults to
-        :class:`CPSSDEStrategy` (legacy SD3 default in
-        ``samplers/fsdp/sd3_sampler.py:139``); callers running GRPO with
-        Flow / Dance / DPM2 should pass an explicit strategy built from
-        ``cfg.sampling.sde_strategy``.
-        """
+        """Build the full pipeline from a config."""
         bundle = SD3Bundle.from_config(config)
         return cls(
             bundle=bundle,
@@ -128,13 +88,7 @@ class SD3Pipeline(Pipeline):
         negatives: Optional[Texts] = None,
         guidance_scale: float = 1.0,
     ) -> SD3Conditions:
-        """Encode prompts (+ optional CFG negatives) into ``SD3Conditions``.
-
-        Shared by :meth:`generate` and grad-sampling adaptations (e.g. the
-        experimental ReFL pipeline).
-        Applies SD3's empty-negative default (diffusers parity) when CFG is on and
-        no negative was supplied — see the rationale quoted in :meth:`generate`.
-        """
+        """Encode prompts (+ optional CFG negatives) into ``SD3Conditions``."""
         if negatives is not None and len(negatives.texts) != len(texts.texts):
             raise ValueError(
                 f"SD3Pipeline.build_conditions: negative_text length "
@@ -147,12 +101,7 @@ class SD3Pipeline(Pipeline):
         return SD3Conditions(text=text_cond, negative_text=negative_text_cond)
 
     def generate(self, sample: Sample) -> Sample:
-        """Run SD3 t2i end-to-end, filling the frontier (pre-forked) gen Part.
-
-        Requires σ to be pinned onto the gen part's ``DiffusionSamplingParams.sigmas``
-        by the hosting engine (e.g. ``TrainsideRolloutEngine._ensure_sample_sigmas``)
-        before the call; see the σ ownership note in ``unirl.models.types.pipeline``.
-        """
+        """Run SD3 t2i end-to-end, filling the frontier (pre-forked) gen Part."""
         frontier = sample.parts[-1]
         params = frontier.sampling_params
         if not isinstance(params, DiffusionSamplingParams):

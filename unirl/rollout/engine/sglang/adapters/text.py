@@ -1,12 +1,4 @@
-"""``TextLMAdapter`` — the per-shape base adapter for a packed-text generation Part.
-
-Holds the conversion logic once: chat-template encoding into per-prompt
-``/generate`` payloads (``build_inputs``) and the predecessor's
-``build_response`` packing fanned out per ``Part`` field
-(``build_response`` is the template; ``build_segment`` /
-``build_decoded`` / ``build_conditions`` each derive one field from
-``(req, prepared, raw)``). The VLM adapter overrides the steps that differ.
-"""
+"""``TextLMAdapter`` — the per-shape base adapter for a packed-text generation Part."""
 
 from __future__ import annotations
 
@@ -127,14 +119,7 @@ class TextLMAdapter(ModelAdapter):
         }
 
     def apply_chat_template(self, messages: List[Dict[str, Any]]) -> List[int]:
-        """Tokenize a chat conversation into ``input_ids`` via the chat template.
-
-        Only called in templated mode (``_has_chat_template``). ``messages`` is the
-        role-tagged conversation :func:`build_text_conversations` assembled (system
-        prefix + one message per turn). A failure raises: a set-but-broken template
-        (bad ``chat_template_kwargs``, jinja error) is a config bug — silently
-        switching the run's prompt format would corrupt training.
-        """
+        """Tokenize a chat conversation into ``input_ids`` via the chat template."""
         template_kwargs: Dict[str, Any] = {
             "add_generation_prompt": True,
             "tokenize": True,
@@ -151,14 +136,7 @@ class TextLMAdapter(ModelAdapter):
         return [int(t) for t in ids]
 
     def build_response(self, sample: Sample, prepared: PreparedInputs, raw: List[RawResult]) -> Sample:
-        """Fill the frontier gen ``Part`` from the seam's per-candidate results.
-
-        ``raw`` is in prompt-major order: candidate ``k`` of prompt ``i`` is at
-        index ``i * n + k`` (the seam's ordering contract) — the same group-by-
-        parent order the gen shell was forked in, so row ``j`` of the gen part
-        maps to ``raw[j]``. Each stage derives its field from ``(sample, prepared,
-        raw)`` independently in that shared order.
-        """
+        """Fill the frontier gen ``Part`` from the seam's per-candidate results."""
         gen_part = sample.parts[-1]
         n = int(prepared.resolved_n)
         n_prompts = len(prepared.prompt_token_ids)
@@ -190,32 +168,18 @@ class TextLMAdapter(ModelAdapter):
 
     @staticmethod
     def build_status(raw: List[RawResult]) -> torch.Tensor:
-        """Per-candidate terminal status (LIN-531) from the seam's ``finish_reason``:
-        ``stop`` → COMPLETED, ``length`` → TRUNCATED, ``abort`` → ABORTED, else PENDING.
-        A ``[n_candidates]`` long tensor (one ``SegmentStatus`` value per row)."""
+        """Per-candidate terminal status from the seam's ``finish_reason``, as a ``[n_candidates]`` long tensor."""
         return torch.tensor(
             [int(_FINISH_TO_STATUS.get(str(r.finish_reason), SegmentStatus.PENDING)) for r in raw],
             dtype=torch.long,
         )
 
     def build_decoded(self, sample: Sample, prepared: PreparedInputs, raw: List[RawResult]) -> Texts:
-        """Emit the RAW sampler text per candidate (verl-reference parity).
-
-        Reward grading scores the full decoded response. The predecessor's
-        think-stripping (``content or text``) silently dropped boxed answers
-        living inside think markup — Qwen3-Base emits it organically on math —
-        depressing MathBoxed rewards ~3x (observed: LIN-381 e2e #1/#2 flat at
-        ~0.035 vs the b182a511-lineage v1 references at 0.09-0.25).
-        """
+        """Emit the RAW sampler text per candidate (verl-reference parity)."""
         return Texts(texts=[r.text or "" for r in raw])
 
     def build_conditions(self, sample: Sample, prepared: PreparedInputs, raw: List[RawResult]) -> Dict[str, Any]:
-        """The replay conditions — the prompt ids the server saw, per sample.
-
-        Each prompt's ids are replicated across its ``n`` siblings (every
-        sibling was generated under the identical prompt). Overridden by the
-        VLM adapter to add the multimodal conditions.
-        """
+        """The replay conditions — the prompt ids the server saw, per sample."""
         per_sample, _ = self.replicate_per_sample(prepared)
         conditions: Dict[str, Any] = {}
         prompt_condition = pack_prompt_condition(per_sample, pad_token_id=self.pad_token_id())

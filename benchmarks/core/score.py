@@ -1,10 +1,4 @@
-"""Scoring: a minimal reward-service HTTP client + local text graders.
-
-Image/video rewards go through the ``unirl-reward-service`` ``POST /score``
-endpoint (see ``unirl-reward-service/reward_service/schemas.py``):
-``results[i][reward][sub_metric] -> float``; per-request failures land in
-``errors[i][reward]``. Text grading is local (math-verify / letter match).
-"""
+"""Scoring: a minimal reward-service HTTP client + local text graders."""
 
 from __future__ import annotations
 
@@ -38,10 +32,7 @@ class RewardServiceClient:
         chunk: int = 8,
         metadatas: Optional[Sequence[Optional[Dict]]] = None,
     ) -> Tuple[List[Optional[Dict[str, float]]], int]:
-        """Score (prompt, image path) pairs. Returns per-pair flat dicts keyed
-        ``"<reward>/<sub_metric>"`` (None when every reward errored) and the
-        total error count. ``metadatas`` (aligned with ``pairs``) rides along as
-        ``RewardRequest.metadata`` — the geneval scorers require it."""
+        """Score (prompt, image path) pairs."""
         rows: List[Optional[Dict[str, float]]] = []
         n_errors = 0
         for i in range(0, len(pairs), chunk):
@@ -86,8 +77,7 @@ _YES_SURFACE_FORMS = ("Yes", "yes", " Yes", " yes")
 
 
 def _geneval2_answer_forms(question: str, expected: str) -> Tuple[str, ...]:
-    """Expected-answer surface forms scored at the first token (GenEval2 Soft-TIFA convention):
-    counting atoms score the number word + its digit; every other atom expects 'Yes'."""
+    """Expected-answer surface forms scored at the first token (GenEval2 Soft-TIFA convention)."""
     expected = (expected or "").strip()
     if question.startswith("How many"):
         forms = [expected, expected.capitalize(), " " + expected, " " + expected.capitalize()]
@@ -121,15 +111,7 @@ def score_images_local_geneval2(
     aggregation: str = "gm",
     device: str = "cuda",
 ) -> Tuple[List[Optional[Dict[str, float]]], int]:
-    """Score (prompt, image) pairs with a self-contained transformers Qwen3-VL Soft-TIFA scorer.
-
-    Only needs ``torch`` + ``transformers`` + ``PIL`` (no reward service, no heavy ``unirl``
-    runtime): for each ``vqa_list`` atom it reads the full-vocab softmax at the first generated
-    token and sums the probability over the expected answer's surface forms, then aggregates atoms
-    by geometric mean. This is the scorer required to reproduce the DPPO paper numbers (the vLLM
-    reward service reads only top-k logprobs). Returns rows keyed ``geneval2/vqascore`` (same shape
-    as :meth:`RewardServiceClient.score_images`) and the count of prompts with no ``vqa_list``.
-    """
+    """Score (prompt, image) pairs with a self-contained transformers Qwen3-VL Soft-TIFA scorer."""
     import math
 
     import torch
@@ -201,10 +183,7 @@ _CANARY_REQUEST = {
 
 
 def check_geneval2_metadata(client: RewardServiceClient) -> None:
-    """SystemExit unless the service's geneval2 scorer consumes per-request
-    ``metadata.vqa_list``. A scorer without metadata support still answers —
-    with its degenerate single-question template — so a whole run would come
-    back with plausible-looking numbers that are not GenEval2 Soft-TIFA."""
+    """SystemExit unless the service's geneval2 scorer consumes per-request ``metadata.vqa_list``."""
     resp = client.session.post(f"{client.base_url}/score", json={"requests": [_CANARY_REQUEST]}, timeout=600)
     resp.raise_for_status()
     score = (resp.json()["results"][0].get("geneval2") or {}).get("vqascore")
@@ -223,9 +202,7 @@ _ANSWER_IS = re.compile(r"(?i)answer\s*(?:is)?\s*:?\s*\(?([A-D])\)?")
 
 
 def grade_math(answer: str, responses: List[str]) -> float:
-    """avg@k exact-math correctness via HuggingFace math-verify (same grader as
-    ``unirl.reward.local.mathverify``, including the ``\\boxed{}``-wrapped gold —
-    bare golds like ``\\left(3, \\frac{\\pi}{2}\\right)`` mis-parse otherwise)."""
+    """avg@k exact-math correctness via HuggingFace math-verify, with the gold wrapped so it parses."""
     from math_verify import parse, verify  # lazy: pip install math-verify
 
     gold = parse("\\boxed{" + str(answer).strip() + "}")

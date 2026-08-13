@@ -1,10 +1,4 @@
-"""Extract per-step wall-clock from a verl-omni console log.
-
-Primary: the trainer's own `timing_s/step` metric (printed per step by the
-console logger). Fallback: timestamp deltas between consecutive step lines.
-
-    python3 parse_verl_timing.py run.log --samples-per-step 768 --gpus 8 --skip 2
-"""
+"""Extract per-step wall-clock from a verl-omni console log."""
 
 import argparse
 import re

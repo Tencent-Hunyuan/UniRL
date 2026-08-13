@@ -1,27 +1,4 @@
-"""BagelChatTemplateStage — supervised prompts/conversations → :class:`BagelARConditions`.
-
-Bagel has no HF chat template: the vendored und flow wraps every utterance as a
-bare ``[<|im_start|>] + encode(text) + [<|im_end|>]`` chunk and ingests images
-ViT-only, one context update per item, in order (``InterleaveInferencer``,
-vendor/inferencer.py:242-260 — no role headers). This stage renders supervised
-rows into that exact convention as ordered prompt splits, so
-``BagelARStage``'s prefill/replay consume SFT prompts byte-identically to
-rollout prompts:
-
-- ``embed(Texts, images=None)`` — legacy single-turn (VLM) rows: per row
-  ``[vit?, text]``, the same layout ``BagelPipeline._generate_text`` builds.
-- ``embed_messages(conversations)`` — agent histories with interleaved
-  text/image content parts: one text split per text part (im_start/im_end
-  wrapped), one vit split per image part, walked in message order.
-- ``tokenize_agent_target(record)`` — the target convention the AR segment
-  uses: ``encode(final_text) + [<|im_end|>]`` (no leading ``<|im_start|>`` —
-  replay feeds it as the decode start token; recipes set ``append_eos: false``
-  because the tokenizer's own ``eos_token_id`` is ``<|endoftext|>``, not
-  ``<|im_end|>``).
-
-Kept flash-attn-free at import time (package rule): the vendored helpers are
-imported inside methods, and the bundle is only touched at call time.
-"""
+"""BagelChatTemplateStage — supervised prompts/conversations → :class:`BagelARConditions`."""
 
 from __future__ import annotations
 
@@ -105,15 +82,7 @@ class BagelChatTemplateStage:
         *,
         tools: Optional[Sequence[Optional[Sequence[Dict[str, Any]]]]] = None,
     ) -> BagelARConditions:
-        """Agent histories → ordered interleaved splits (text chunks + ViT images).
-
-        Every message renders in order: string content is one wrapped text
-        split; part-list content walks its parts — each text part one wrapped
-        split, each image part (a loaded PIL) one vit split. Roles carry no
-        tokens (Bagel's und flow has none), and the conversation is
-        authoritative: ``system_instruction`` applies to the legacy ``embed``
-        path only, so an agent manifest renders the same on every backbone.
-        """
+        """Agent histories → ordered interleaved splits (text chunks + ViT images)."""
         if not conversations:
             raise ValueError("BagelChatTemplateStage.embed_messages: empty conversation batch.")
         if tools is not None and any(t for t in tools):

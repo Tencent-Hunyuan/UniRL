@@ -1,47 +1,4 @@
-"""Multimodal input/output primitives.
-
-Per-sample types (``Text``, ``Image``, ``Video``, ``Audio``) are plain
-dataclasses used at the user-facing boundary — input construction and
-per-sample iteration in reward functions.
-
-Batch types (``Texts``, ``Images``, ``Videos``, ``Audios``) are
-``Batch`` SoA containers used in storage and transport. Round-trip
-helpers (``from_list`` / ``to_list``) bridge between the two forms.
-
-Tier in the four-tier pipeline:
-    Primitive → (encode/embed) → Condition → (diffuse/autoregress) → Segment → (decode) → Primitive
-
-Batching contract for varlen primitives (Videos, Audios)
---------------------------------------------------------
-A batched primitive whose tensor data is varlen along dim 0 (frames packed
-across all samples for ``Videos``; samples packed across all examples for
-``Audios``) MUST declare that tensor with ``FieldKind.PACKED`` — never
-``FieldKind.CONCAT``. ``CONCAT`` semantically means "dim 0 is the sample
-axis"; for packed-along-time/length data dim 0 is the packed sequence axis
-instead, and the framework needs ``_packed_cu_seqlens`` metadata to know
-how to ``concat`` / ``select`` / ``slice`` such instances per-sample.
-
-Per the ``Batch`` protocol contract (see
-:class:`unirl.distributed.tensor.batch.Batch`), ``_packed_cu_seqlens`` is a
-framework-managed hidden attribute:
-
-- Construct via :meth:`Batch.pack` (or a thin wrapper like ``from_list``
-  that delegates to ``pack``) with ``Sequence[Tensor]`` per packed field —
-  the framework computes and attaches the cu_seqlens.
-- Read via the inherited :attr:`Batch.cu_seqlens` property. Each batched
-  primitive may also expose a domain alias (``Videos.cu_frames`` /
-  ``Audios.cu_samples``) for readability at call sites — both point to
-  the same framework-managed tensor.
-- Never declare an explicit ``cu_*`` dataclass field. That breaks the
-  framework's auto-propagation: ``concat`` / ``select`` / ``slice``
-  rebuild ``_packed_cu_seqlens`` on the output instance, but they won't
-  rebuild a user-declared field. The two values drift, and per-sample
-  slicing becomes incorrect.
-
-These rules also apply to images. ``Images.packed_pixels`` flattens each CHW
-sample to one 1-D packed chunk; ``image_shapes`` retains each ``(C, H, W)``.
-Model-specific processors own any resize.
-"""
+"""Multimodal input/output primitives."""
 
 from __future__ import annotations
 
@@ -136,13 +93,7 @@ class Texts(Batch):
 
 @dataclass
 class Images(Batch):
-    """Image batch with LLM-style packed storage for arbitrary CHW layouts.
-
-    ``packed_pixels`` is one flat 1-D tensor containing every sample.
-    ``image_shapes[i]`` stores the corresponding ``(C, H, W)`` and inherited
-    ``cu_seqlens`` stores sample boundaries. Construct with :meth:`from_list`
-    or :meth:`from_dense`; use :meth:`to_dense` only at uniform model boundaries.
-    """
+    """Image batch with LLM-style packed storage for arbitrary CHW layouts."""
 
     packed_pixels: torch.Tensor = packed_field(default=None)
     image_shapes: torch.Tensor = concat_field(default=None)
@@ -230,33 +181,13 @@ class Images(Batch):
 
 @dataclass
 class Videos(Batch):
-    """Batch videos with ragged time dim, packed varlen along T.
-
-    ``frames`` is concatenated along T for all samples: ``[total_T, C, H, W]``.
-    Per-sample boundaries live on the framework-managed ``cu_seqlens``
-    (exposed by the inherited :attr:`Batch.cu_seqlens` property and the
-    domain alias :attr:`cu_frames`). Sample ``i``'s frames are
-    ``frames[cu_frames[i]:cu_frames[i+1]]``. ``cu_frames[B]`` equals
-    ``total_T``.
-
-    Construct via :meth:`from_list` (or :meth:`Batch.pack` directly),
-    not by passing pre-packed tensors to ``__init__`` — the constructor
-    path doesn't compute cu_seqlens. ``concat`` / ``select`` / ``slice``
-    operate per-sample and rebuild ``_packed_cu_seqlens`` on the output;
-    see module docstring for the protocol contract.
-    """
+    """Batch videos with ragged time dim, packed varlen along T."""
 
     frames: torch.Tensor = field(kind=FieldKind.PACKED, default=None)
 
     @property
     def cu_frames(self) -> Optional[torch.Tensor]:
-        """Per-sample cumulative frame offsets — alias for :attr:`cu_seqlens`.
-
-        Same shape and meaning as the old explicit ``cu_frames`` field;
-        kept as a property so call sites that read ``videos.cu_frames``
-        keep working. The underlying tensor is framework-managed (never
-        set by user code; rebuilt by ``concat`` / ``select`` / ``slice``).
-        """
+        """Per-sample cumulative frame offsets — alias for :attr:`cu_seqlens`."""
         return self.cu_seqlens
 
     @classmethod
@@ -296,17 +227,7 @@ class Videos(Batch):
 
 @dataclass
 class Audios(Batch):
-    """Batch audio with ragged length dim, packed varlen along L.
-
-    ``waveform`` is concatenated along L for all samples:
-    ``[total_L, C]`` (or ``[total_L]``). Per-sample boundaries live on
-    the framework-managed ``cu_seqlens`` (exposed by the inherited
-    :attr:`Batch.cu_seqlens` property and the domain alias
-    :attr:`cu_samples`).
-
-    Construct via :meth:`from_list` (or :meth:`Batch.pack` directly).
-    See module docstring for the varlen-primitive protocol contract.
-    """
+    """Batch audio with ragged length dim, packed varlen along L."""
 
     waveform: torch.Tensor = field(kind=FieldKind.PACKED, default=None)
 
@@ -345,14 +266,7 @@ PrimitiveValue = Union[Texts, Images, Videos, Audios, MediaRefs]
 
 
 def primitive_modality_key(prim: PrimitiveValue) -> str:
-    """Map a batched primitive to its modality slot key.
-
-    ``Texts -> "text"``, ``Images -> "image"``, ``Videos -> "video"``,
-    ``Audios -> "audio"``, ``MediaRefs -> "media"`` — the keying convention shared by
-    ``RewardRequest.primitives`` / ``generated`` and the slots
-    :meth:`Sample.conditioning` surfaces. Inverse of a backend's
-    ``preferred_input_kind``.
-    """
+    """Map a batched primitive to its modality slot key."""
     if isinstance(prim, Texts):
         return "text"
     if isinstance(prim, Images):

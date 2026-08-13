@@ -1,25 +1,4 @@
-"""Placement context manager for device allocation.
-
-The trainer creates a DevicePool, then opens placement scopes via
-``with placement(pool, ...)`` and calls ``pool.create_remote(cls)`` inside.
-The scope decides which devices and which worker slot each role lands on,
-so user code never threads ``device_ids`` / ``slot_id`` by hand.
-
-Modes:
-- ``shared_workers=True`` (default): every role in scope registers on the
-  same Worker process per device → time-multiplexed via offload (the
-  normal RL pattern).
-- ``shared_workers=False``: each ``create_remote`` in scope claims its own
-  slot → separate processes on the same physical GPU ("real colocate").
-
-Composition:
-- Sibling top-level scopes claim disjoint device slabs from the pool
-  (the "separate" layout).
-- Nested scopes carve a sub-slab of the parent's devices.
-
-The module-level ``_current`` matches ``unirl/ray/actor_config.py``
-style — the trainer is single-process, so a ContextVar buys nothing.
-"""
+"""Placement context manager for device allocation."""
 
 from __future__ import annotations
 
@@ -52,11 +31,7 @@ class Placement:
         self._next_isolated_slot = self._base_slot
 
     def assign(self) -> Tuple[List[int], int]:
-        """Return ``(device_ids, slot_id)`` for the next ``create_remote`` call.
-
-        Shared mode: every call returns the same slot. Isolated mode: slot
-        bumps per call so each role lands on its own Worker process.
-        """
+        """Return ``(device_ids, slot_id)`` for the next ``create_remote`` call."""
         if self.shared_workers:
             return list(self.devices), self._base_slot
         slot = self._next_isolated_slot
@@ -77,17 +52,7 @@ def placement(
     fraction: float = 1.0,
     shared_workers: bool = True,
 ) -> Iterator[Placement]:
-    """Scope ``DevicePool.create_remote`` calls to a device slab.
-
-    Args:
-        pool:            DevicePool that owns the workers.
-        fraction:        Ratio of the parent slab (or whole pool, for top-
-                         level scopes) consumed by this scope. Must yield an
-                         integer device count.
-        shared_workers:  Whether ``create_remote`` calls inside share a Worker
-                         process per device (``True``) or each get their own
-                         slot (``False``).
-    """
+    """Scope ``DevicePool.create_remote`` calls to a device slab."""
     global _current
     parent = _current
 
@@ -142,17 +107,7 @@ def placement(
 
 
 def remote(role_cls, **kwargs):
-    """Instantiate ``role_cls`` inside the active ``placement(...)`` block.
-
-    All ``**kwargs`` are forwarded to ``role_cls.__init__`` on the Worker.
-    Any kwarg whose value is a ``Handle`` is auto-substituted with a
-    serializable ``HandleRef``; the Worker resolves it to the local sibling
-    ``Remote`` instance before construction. Only works for siblings on the
-    same Worker (default same-worker colocate).
-
-    Raises if called outside any placement scope; for explicit out-of-scope
-    creation use ``pool.create_remote(role_cls, device_ids=...)`` directly.
-    """
+    """Instantiate ``role_cls`` inside the active ``placement(...)`` block."""
     scope = current_placement()
     if scope is None:
         raise RuntimeError("remote() must be called inside a placement(...) block")
@@ -161,10 +116,7 @@ def remote(role_cls, **kwargs):
 
 
 def _to_marker(value):
-    """Replace Handle values with serializable HandleRef markers.
-
-    Carries the source handle's parallel layout so dependent roles (e.g. weight
-    sync over a rollout sibling) can adopt compatible rank metadata."""
+    """Replace Handle values with serializable HandleRef markers."""
     from unirl.distributed.group.handle import Handle, HandleRef
 
     if isinstance(value, Handle):

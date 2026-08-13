@@ -1,12 +1,4 @@
-"""Qwen3_5ChatTemplateStage — text/image conversations → AR conditions.
-
-Applies the bundle processor's chat template (with
-``add_generation_prompt=True`` and ``enable_thinking``) so the AR stage
-starts from the canonical assistant-turn prefix. Mirrors
-:class:`unirl.models.qwen_vl.QwenVLChatTemplateStage`'s per-sample
-processor call (to extract ``pixel_values`` / ``image_grid_thw``) plus
-Qwen3's ``enable_thinking`` switch.
-"""
+"""Qwen3_5ChatTemplateStage — text/image conversations → AR conditions."""
 
 from __future__ import annotations
 
@@ -49,11 +41,7 @@ class Qwen3_5ChatTemplateStage:
         value: Qwen3_5ChatInput,
         images: Optional[List[Optional[Any]]] = None,
     ) -> Qwen3_5ARConditions:
-        """Render Sample-native turns or supervised text/image rows.
-
-        The rollout path carries images inside ``Turn`` objects. ``Texts`` plus
-        a separate image list remains the supervised single-turn seam.
-        """
+        """Render Sample-native turns or supervised text/image rows."""
         if isinstance(value, Texts):
             batch_size = len(value)
             if batch_size == 0:

@@ -1,25 +1,4 @@
-"""``fastvideo`` engine core — in-process FastVideo ``VideoGenerator`` rollout.
-
-Mirrors the ``TrainsideRolloutEngine`` / ``SGLangDiffusionRolloutEngine`` shells:
-``generate`` is ``@distributed(DP_SCATTER)``, pins σ on the frontier generation
-``Part``, optionally chunks that frontier by ``forward_batch_size``, and fills it
-with a ``LatentSegment`` (trajectory + native per-step log-probs) and decoded
-``Videos``.
-
-The FastVideo-driving logic (VideoGenerator boot, PR #1222 ``ForwardBatch.RLData``
-native-logprob path, transformer hot-swap, sleep/wake) is ported from the proven
-DiffusionRL FastVideo engine; only the typed boundary (``Sample``/``Part``/
-``LatentSegment``, σ SSOT) is new.
-
-Validated scope:
-  * Replay and native modes use the same resolved SDE window; native mode also
-    returns FastVideo's transition log-probs for ``old_logp_source=rollout``.
-  * x_T SSOT: FastVideo currently regenerates its own initial noise from
-    ``sp.seed`` rather than consuming the driver's NoiseRecipe x_T. Because that
-    seed also drives SDE noise, ``init_same_noise=True`` shares the whole random
-    stream, not only x_T; separate x_T/SDE streams are a follow-up.
-  * Local-mode colocate, single model_family (wan2.1) only for now.
-"""
+"""``fastvideo`` engine core — in-process FastVideo ``VideoGenerator`` rollout."""
 
 from __future__ import annotations
 
@@ -50,12 +29,7 @@ logger = logging.getLogger(__name__)
 
 
 def _resolve_sde_window(raw_indices: Any, num_steps: int) -> tuple[Optional[List[int]], List[int]]:
-    """Return the FastVideo wire value and canonical segment indices.
-
-    ``None`` keeps FastVideo's legacy "all steps are SDE" spelling. An explicit
-    empty iterable remains empty (the framework's deterministic forward-process
-    contract). The segment always gets the resolved concrete list.
-    """
+    """Return the FastVideo wire value and canonical segment indices."""
     if raw_indices is None:
         return None, list(range(int(num_steps)))
     selected = sorted({int(i) for i in raw_indices})
@@ -247,20 +221,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         return self._build_response(sample, params, raw)
 
     def _per_sample_seeds(self, sample: Sample, params: DiffusionSamplingParams) -> List[int]:
-        """Per-sample seeds so sibling samples of one prompt diverge.
-
-        Without this every sample of a prompt shared ``params.seed`` → identical
-        video → identical reward → zero GRPO advantage → zero loss/grad. We key
-        the seed the same way the driver keys x_T (``_derive_group_seed``):
-        per-sample ids when ``init_same_noise`` is false (siblings differ),
-        per-group ids when true (siblings share). Prefer the driver's
-        normalized ``NoiseRecipe`` keys (carry rollout id + same/diff policy);
-        fall back to frontier sample/group ids, then to the flat seed.
-        NOTE: FastVideo uses this one seed for x_T and per-step SDE noise. Thus
-        ``init_same_noise=True`` shares the entire stream across siblings rather
-        than only x_T. Full driver-authoritative x_T plus a sample-specific SDE
-        stream is a separate follow-up.
-        """
+        """Per-sample seeds so sibling samples of one prompt diverge."""
         gen = sample.frontier_gen_part(DiffusionSamplingParams)
         bs = int(gen.batch_size)
         base_seed = int(params.seed) if params.seed is not None else 0
@@ -279,10 +240,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         sigmas: torch.Tensor,
         seeds: List[int],
     ) -> Dict[str, Any]:
-        """PR #1222 native-logprob path via executor.execute_forward + RLData.
-
-        Returns dict(trajectory=[B,T+1,...], log_probs=[B,T], decoded=[B,...]).
-        """
+        """PR #1222 native-logprob path via executor.execute_forward + RLData."""
         from copy import deepcopy
 
         from fastvideo.configs.sample.base import SamplingParam
@@ -418,12 +376,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         )
 
     def _build_conditions(self, raw: Dict[str, Any]) -> Dict[str, Any]:
-        """Assemble the WAN21 ``conditions`` dict the trainer replays against.
-
-        Packs the captured FastVideo prompt embeddings into ``TextEmbedCondition``s
-        (``text`` + optional CFG ``negative_text``), padding variable token lengths
-        with zeros via ``TextEmbedCondition.concat`` (WAN's zeroed-pad convention).
-        """
+        """Assemble the WAN21 ``conditions`` dict the trainer replays against."""
         text_embeds: List[torch.Tensor] = raw.get("text_embeds") or []
         require(len(text_embeds) > 0, "fastvideo engine produced no text embeddings")
         text_masks: List[Optional[torch.Tensor]] = raw.get("text_masks") or [None] * len(text_embeds)
@@ -448,12 +401,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         return conditions
 
     def _build_decoded(self, raw: Dict[str, Any]) -> Videos:
-        """Pack FastVideo's decoded output [B, C, T, H, W] into a ``Videos``.
-
-        Mirrors WAN21VAEDecodeStage: permute each sample (C, T, H, W) →
-        (T, C, H, W) so Video.frames matches the canonical [T, C, H, W]
-        contract the reward path (video_pickscore) consumes.
-        """
+        """Pack FastVideo's decoded output [B, C, T, H, W] into a ``Videos``."""
         frames = raw["decoded"]
         require(
             torch.is_tensor(frames) and frames.dim() == 5,

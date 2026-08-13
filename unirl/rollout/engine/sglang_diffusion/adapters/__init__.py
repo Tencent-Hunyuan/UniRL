@@ -1,8 +1,4 @@
-"""Model adapters for the ``sglang_diffusion`` engine.
-
-Importing this package registers every concrete adapter (the ``@register_adapter``
-side-effects fire), so ``get_adapter(model_family)`` resolves after import.
-"""
+"""Model adapters for the ``sglang_diffusion`` engine."""
 
 from unirl.rollout.engine.sglang_diffusion.adapters.base import (
     ModelAdapter,

@@ -1,20 +1,4 @@
-"""HunyuanVideoTextEmbedStage -- dual-encoder text -> two TextEmbedConditions.
-
-HunyuanVideo-1.0 cross-attends to **two text streams**:
-
-- ``llama``  -- LlamaModel (transformers). The prompt is wrapped in a
-  LLaMA-style prompt template with a system header, tokenized with padding
-  to ``llama_max_length + crop_start``, encoded, and the template prefix
-  is stripped by slicing ``[:, crop_start:]``. Output is a configurable
-  hidden state (the canonical third-from-last layer by default; 3D:
-  ``[B, seq, 4096]``).
-- ``clip`` -- CLIPTextModel (transformers). Standard CLIP text encoding,
-  output is the pooled vector (2D: ``[B, 768]``).
-
-Implements two unary embed methods (``embed_llama`` / ``embed_clip``)
-rather than the strict :class:`EmbedStage` protocol -- the dual output
-doesn't fit ``embed(p) -> C``. The pipeline calls them in sequence.
-"""
+"""HunyuanVideoTextEmbedStage — LLaMA 3D ``[B, seq, 4096]`` and CLIP pooled 2D ``[B, 768]`` streams."""
 
 from __future__ import annotations
 
@@ -42,13 +26,7 @@ PROMPT_TEMPLATE = {
 
 
 class HunyuanVideoTextEmbedStage:
-    """Dual-encoder text -> two ``TextEmbedCondition`` instances.
-
-    Not a strict ``EmbedStage[Texts, TextEmbedCondition]`` because the
-    dual-stream output doesn't fit a unary ``embed(p) -> C`` shape.
-    Provides ``embed_llama`` / ``embed_clip`` instead; the pipeline
-    calls them sequentially.
-    """
+    """Dual-encoder text -> two ``TextEmbedCondition`` instances."""
 
     def __init__(
         self,
@@ -70,12 +48,7 @@ class HunyuanVideoTextEmbedStage:
             )
 
     def embed_llama(self, p: Texts) -> TextEmbedCondition:
-        """Encode prompts via the LLaMA encoder into a TextEmbedCondition.
-
-        Returns embeds of shape ``[B, llama_max_length, 4096]`` and
-        attention_mask of shape ``[B, llama_max_length]`` (after cropping
-        the prompt template prefix).
-        """
+        """Encode prompts via LLaMA — embeds ``[B, llama_max_length, 4096]``, mask ``[B, llama_max_length]``."""
         embeds, mask = self._encode_llama(list(p.texts))
         return TextEmbedCondition(embeds=embeds, attn_mask=mask, pooled=None)
 
@@ -127,12 +100,7 @@ class HunyuanVideoTextEmbedStage:
         return prompt_embeds.to(dtype=dtype), attention_mask
 
     def embed_clip(self, p: Texts) -> TextEmbedCondition:
-        """Encode prompts via CLIP into a TextEmbedCondition.
-
-        Returns embeds of shape ``[B, 768]`` (the pooled output).
-        ``attn_mask`` is ``None`` because the transformer reads the CLIP
-        output as ``pooled_projections`` (no sequence-level masking).
-        """
+        """Encode prompts via CLIP into a TextEmbedCondition — embeds are the pooled ``[B, 768]``."""
         embeds = self._encode_clip(list(p.texts))
         return TextEmbedCondition(embeds=embeds, attn_mask=None, pooled=None)
 

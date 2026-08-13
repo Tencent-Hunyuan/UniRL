@@ -14,13 +14,7 @@ def pack_prompt_condition(
     *,
     pad_token_id: int,
 ) -> Optional[TextTokenCondition]:
-    """Pack per-sample prompt token ids into a :class:`TextTokenCondition`.
-
-    Right-padded to the in-batch max with ``pad_token_id``; ``attention_mask``
-    zeros out the pad positions. This is what the AR replay consumes at train
-    time to teacher-force over ``prompt + response``. Returns ``None`` when no
-    sample carries prompt ids.
-    """
+    """Pack per-sample prompt token ids into a :class:`TextTokenCondition`."""
     if not any(per_sample_prompt_ids):
         return None
     max_plen = max(len(p) for p in per_sample_prompt_ids)

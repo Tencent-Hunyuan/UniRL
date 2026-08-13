@@ -1,28 +1,4 @@
-"""Trajectory → chat-conversation rendering for trainside encoders (pure).
-
-The trainside in-process AR encoders (``qwen3`` / ``qwen_vl`` chat-template stages)
-must build one chat conversation per frontier sample from the role-aware trajectory
-view :meth:`Sample.turns` (turn-major, frontier-aligned). These helpers transpose
-that into per-sample message lists.
-
-Unlike the sglang engine's equivalent (``rollout/engine/sglang/utils/conversations.py``,
-which de-expands the ``*n`` wire fan-out), the trainside embeds **every** frontier
-sample per-row — so there is NO de-expand here; one conversation per row.
-
-Pure (only :mod:`unirl.types`): no tokenizer, no processor, no engine.
-
-Two renders live here because both have several model consumers: string content
-(:func:`build_text_messages` — qwen3, qwen3_5) and inline-PIL parts
-(:func:`build_vision_messages` — qwen_vl, qwen3_5). They share two composition
-rules, :func:`system_prefix` (the config ``system_instruction`` is a default; an
-explicit ``system`` turn in the data wins) and :func:`group_consecutive_roles`,
-which the sglang wire render now imports instead of mirroring byte-identical
-private copies.
-
-A render with a single model consumer stays in that model's package (Qwen3-Omni's
-URI-media render lives in ``unirl.models.qwen3_omni.media``); it moves here when a
-second consumer actually exists, not before.
-"""
+"""Trajectory → chat-conversation rendering for trainside encoders (pure)."""
 
 from __future__ import annotations
 
@@ -35,20 +11,14 @@ Conversation = List[Dict[str, Any]]
 
 
 def system_prefix(system_instruction: Optional[str], roles: List[str]) -> Conversation:
-    """The config ``system_instruction`` as a leading message, unless the trajectory
-    already carries an explicit ``system`` turn (which wins)."""
+    """The config ``system_instruction`` as a leading message, unless the trajectory"""
     if system_instruction and "system" not in roles:
         return [{"role": "system", "content": system_instruction}]
     return []
 
 
 def group_consecutive_roles(roles: List[str]) -> List[Tuple[str, List[int]]]:
-    """Group consecutive turn indices that share a role → ``[(role, [idx…]), …]``.
-
-    Multi-input modalities ride as separate same-role turns (e.g. it2i is a text
-    ``user`` turn + an image ``user`` turn); a chat message holds one role, so
-    consecutive same-role turns fuse into one message.
-    """
+    """Group consecutive turn indices that share a role → ``[(role, [idx…]), …]``."""
     groups: List[Tuple[str, List[int]]] = []
     for j, role in enumerate(roles):
         if groups and groups[-1][0] == role:
@@ -62,12 +32,7 @@ def build_text_messages(
     turns: List[Turn],
     system_instruction: Optional[str] = None,
 ) -> List[Conversation]:
-    """One all-text chat conversation per frontier row (no de-expand).
-
-    Transposes :meth:`Sample.text_conditioning` (turn-major, frontier-aligned) into
-    one message list per frontier sample. Degenerates to a single ``user`` message
-    when no roles are set, so it is byte-identical on single-turn workloads.
-    """
+    """One all-text chat conversation per frontier row (no de-expand)."""
     if not turns:
         return []
     roles = [t.role for t in turns]
@@ -81,14 +46,7 @@ def build_vision_messages(
     turns: List[Turn],
     system_instruction: Optional[str] = None,
 ) -> List[Conversation]:
-    """One text+image chat conversation per frontier row (no de-expand).
-
-    Same transpose as :func:`build_text_messages`, but consecutive same-role turns
-    fuse into one message whose content is ``[image blocks…, text blocks…]`` —
-    image-before-text — with the PIL image inlined (``{"type":"image","image":pil}``),
-    matching ``QwenVLChatTemplateStage``'s processor input (the processor reads PILs
-    from the message content). One image per row (callers guard).
-    """
+    """One text+image chat conversation per frontier row (no de-expand)."""
     if not turns:
         return []
     roles = [t.role for t in turns]

@@ -1,20 +1,4 @@
-"""Force VAE decode to use non-cuDNN convolutions (LIN-365 diagnostic patch).
-
-Symptom: on cuda-compat-13 + driver 535, sglang's AutoencoderKLFlux2._decode
-crashes with ``munmap_chunk(): invalid pointer`` inside a Conv2d._conv_forward.
-The crash is one-worker-at-a-time and non-deterministic in worker ID, which
-points to a cuDNN/forward-compat layer interaction rather than bad input data.
-
-This patch disables cuDNN globally inside the rollout subprocess (and resets it
-back to True if anybody re-enables it). It is opt-in via the env var
-``UNIRL_DISABLE_CUDNN=1`` so we can A/B it cleanly. When the env var is set,
-``torch.backends.cudnn.enabled = False`` is asserted before EVERY
-``DecodingStage.forward`` call (cheap; just a flag toggle). Conv kernels then
-fall back to PyTorch's native CUDA implementation, which doesn't go through
-cuDNN's plan cache / allocator paths.
-
-When the env var is unset (default), this patch is a no-op.
-"""
+"""Force VAE decode to use non-cuDNN convolutions (opt-in diagnostic patch)."""
 
 from __future__ import annotations
 

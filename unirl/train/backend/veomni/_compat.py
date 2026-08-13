@@ -1,39 +1,4 @@
-"""Selective-import shim for the VeOmni distributed layer.
-
-This module is the ONLY place in unirl that imports ``veomni``. VeOmni's
-package roots have import-time behavior we must not run in unirl processes:
-
-* ``veomni/__init__.py`` executes ``_apply_patches()`` (global kernel/ops
-  monkey-patching) and eagerly imports the ops/kernel registry.
-* ``veomni/models/__init__.py`` eagerly registers the model zoo, whose
-  generated modeling files import transformers-5.9-only internals.
-
-The torch-native layer we actually consume (``veomni.distributed.*``,
-``veomni.arguments``) has no such coupling — ``veomni/distributed/__init__.py``
-and ``veomni/utils/__init__.py`` are empty.  So instead of importing through
-the package roots, we pre-seed ``sys.modules`` with *path stubs* for
-``veomni`` and ``veomni.models``: package-shaped module objects whose
-``__path__`` points at the installed tree but whose ``__init__`` code never
-runs.  Submodule imports (``veomni.distributed.parallel_state`` etc.) then
-resolve and execute normally.
-
-One wrinkle: ``veomni/distributed/torch_parallelize.py`` does a *name*
-import — ``from ..models import load_model_weights,
-rank0_load_and_broadcast_weights`` — so the ``veomni.models`` stub must
-already carry those attributes (sourced from ``veomni.models.module_utils``,
-which is itself clean: safetensors + stable ``transformers.utils`` APIs)
-before ``torch_parallelize`` is imported.  :func:`ensure_installed` runs
-both stub steps in that order; call it before importing any veomni symbol.
-
-The Qwen3-MoE and Qwen3.5-MoE bundles are the intentional model-layer
-consumers. :func:`ensure_qwen3_moe_installed` and
-:func:`ensure_qwen3_5_moe_installed` preserve the same selective-import
-discipline and register only the requested family, without executing
-``veomni.models.transformers.__init__`` and its full model-zoo imports.
-
-Zero veomni functions are replaced; this is selective importing, not
-behavior patching (the veomni dependency is exact-pinned in ``pyproject.toml``).
-"""
+"""Selective-import shim for the VeOmni distributed layer."""
 
 from __future__ import annotations
 
@@ -51,12 +16,7 @@ logger = logging.getLogger(__name__)
 
 
 def _stub_package(name: str, path: str) -> types.ModuleType:
-    """Insert a package-shaped stub into ``sys.modules`` (idempotent).
-
-    If ``name`` is already imported — real or stubbed — it is left alone:
-    a real import means its init side effects already ran and re-stubbing
-    would only desynchronize attribute state.
-    """
+    """Insert a package-shaped stub into ``sys.modules`` (idempotent)."""
     existing = sys.modules.get(name)
     if existing is not None:
         return existing
@@ -85,9 +45,7 @@ def _install_path_stubs() -> None:
 
 
 def _attach_models_names() -> None:
-    """Populate the ``veomni.models`` stub with the loader functions that
-    ``torch_parallelize`` name-imports from it (must run before that import).
-    """
+    """Populate the ``veomni.models`` stub with the loaders ``torch_parallelize`` name-imports; must run first."""
     models_mod = sys.modules["veomni.models"]
     if hasattr(models_mod, "load_model_weights"):
         return
@@ -98,16 +56,7 @@ def _attach_models_names() -> None:
 
 @functools.cache
 def ensure_installed() -> None:
-    """Install the ``sys.modules`` path stubs (cached, idempotent).
-
-    Runs *both* stub steps so that ``import veomni.distributed.*`` resolves
-    without executing veomni's package-root init. ``_attach_models_names``
-    must populate the ``veomni.models`` stub before anything imports
-    ``veomni.distributed.torch_parallelize`` (which name-imports those
-    attributes), so always run the pair together. Call this once before
-    importing any veomni symbol; keep those imports lazy (function-local),
-    since this module's importers load long before the stubs are installed.
-    """
+    """Install the ``sys.modules`` path stubs (cached, idempotent)."""
     _install_path_stubs()
     _attach_models_names()
     logger.info("veomni distributed layer installed via selective-import shim")
@@ -115,18 +64,7 @@ def ensure_installed() -> None:
 
 @functools.cache
 def ensure_qwen3_moe_installed() -> None:
-    """Register only VeOmni's Qwen3-MoE modeling implementation.
-
-    ``ensure_installed`` deliberately stubs ``veomni.models`` to avoid importing
-    the entire version-locked model zoo. ``build_foundation_model`` still needs
-    the requested family registered in ``MODELING_REGISTRY``, so stub the
-    intermediate ``transformers`` package as well and execute only
-    ``qwen3_moe/__init__.py``. Qwen3-MoE model construction consumes VeOmni's
-    complete ops registry anyway, so load it before installing the selective
-    attention patch. This ordering matters: installing the attention patch
-    first would leave an intentionally minimal ``veomni.ops`` path stub where
-    ``build_foundation_model`` expects ``apply_ops_config``.
-    """
+    """Register only VeOmni's Qwen3-MoE modeling implementation."""
     ensure_installed()
     pkg_dir = list(sys.modules["veomni"].__path__)[0]
     _stub_package(
@@ -141,13 +79,7 @@ def ensure_qwen3_moe_installed() -> None:
 
 @functools.cache
 def ensure_qwen3_5_moe_installed() -> None:
-    """Register only VeOmni's Qwen3.5-MoE modeling implementation.
-
-    VeOmni 0.1.11's full model-zoo import reaches transformer APIs removed in
-    the project's Transformers 5.6 runtime. Selectively importing the generated
-    Qwen3.5-MoE family keeps its EP plan and fused ops without executing those
-    unrelated model modules.
-    """
+    """Register only VeOmni's Qwen3.5-MoE modeling implementation."""
     ensure_installed()
     pkg_dir = list(sys.modules["veomni"].__path__)[0]
     _stub_package(
@@ -162,19 +94,7 @@ def ensure_qwen3_5_moe_installed() -> None:
 
 @functools.cache
 def ensure_attention_patch_installed() -> None:
-    """Register VeOmni's Ulysses SP attention into HF ``ALL_ATTENTION_FUNCTIONS``.
-
-    A model whose ``config._attn_implementation`` is
-    ``"veomni_flash_attention_2_with_sp"`` then routes attention through
-    VeOmni's Ulysses all-to-all wrapper (a no-op when ``ulysses_size == 1``).
-
-    Selective import, same discipline as :func:`ensure_installed`: we stub
-    ``veomni.ops`` and ``veomni.ops.kernels`` so their eager package inits never
-    run — ``veomni/ops/__init__.py`` imports liger / moe / cross-entropy kernels
-    (heavy, and absent under the ``--no-deps`` veomni install), none of which the
-    attention patch needs. ``veomni.ops.kernels.attention`` itself has clean deps
-    (transformers + ``veomni.distributed``). Cached / idempotent.
-    """
+    """Register VeOmni's Ulysses SP attention into HF ``ALL_ATTENTION_FUNCTIONS``."""
     ensure_installed()
     pkg_dir = list(sys.modules["veomni"].__path__)[0]
     _stub_package("veomni.ops", os.path.join(pkg_dir, "ops"))
@@ -186,15 +106,7 @@ def ensure_attention_patch_installed() -> None:
 
 
 def rank_world_local() -> Tuple[int, int, int]:
-    """Resolve ``(rank, world_size, local_rank)`` from the actor env.
-
-    Backends are constructed by ``Worker.add_remote`` *before*
-    ``Remote.setup()`` runs, so ctor kwargs carry no live rank info — but
-    DevicePool bakes ``RANK``/``WORLD_SIZE``/``MASTER_ADDR``/``MASTER_PORT``
-    into each worker's runtime env at spawn, and masks ``CUDA_VISIBLE_DEVICES``
-    to exactly one GPU (so the local device index is 0 unless ``LOCAL_RANK``
-    says otherwise).
-    """
+    """Resolve ``(rank, world_size, local_rank)`` from the actor env."""
     rank = int(os.environ.get("RANK", "0"))
     world = int(os.environ.get("WORLD_SIZE", "1"))
     local = int(os.environ.get("LOCAL_RANK", "0"))
@@ -202,15 +114,7 @@ def rank_world_local() -> Tuple[int, int, int]:
 
 
 def ensure_dist_initialized(local_rank: Optional[int] = None) -> None:
-    """Idempotently bring up the default process group.
-
-    UniRL itself never calls ``dist.init_process_group`` on the train side —
-    today torch's ``fully_shard`` lazily auto-inits it (no-arg ``env://``
-    rendezvous over the DevicePool-baked env).  VeOmni's
-    ``init_parallel_state`` builds device meshes *before* any ``fully_shard``
-    call, so the lazy path never fires for this backend — replicate the
-    exact same no-arg init explicitly.
-    """
+    """Idempotently bring up the default process group."""
     import torch
     import torch.distributed as dist
 

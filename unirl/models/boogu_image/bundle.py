@@ -1,33 +1,4 @@
-"""BooguImageBundle — concrete weights+params holder for Boogu-Image.
-
-Implements the empty :class:`Bundle` Protocol. Pure container of the modules
-Boogu-Image-0.1 ships with: 1× vendored ``BooguImageTransformer2DModel`` (the
-10.29B Lumina-2-lineage single/double-stream DiT), 1× ``AutoencoderKL`` (the
-16-channel FLUX.1 VAE), 1× Qwen3-VL instruction encoder (the checkpoint's
-``mllm/`` subfolder) + its ``Qwen3VLProcessor`` (``processor/`` subfolder).
-
-Diverges from :class:`unirl.models.z_image.ZImageBundle` /
-:class:`unirl.models.qwen_image.QwenImageBundle` in three ways:
-
-- **Non-standard checkpoint subfolders**: the encoder lives under ``mllm/``
-  (not ``text_encoder/``) and the tokenizer side is a full processor under
-  ``processor/`` (not ``tokenizer/``). There is no ``tokenizer`` attribute —
-  the processor owns tokenization + chat templating.
-- **lm_head strip**: the reference pipeline reuses the encoder checkpoint as
-  an optional prompt rewriter, so ``mllm/`` may hold a full
-  ``Qwen3VLForConditionalGeneration``. Mirroring ``pipeline_boogu.py:194-198``,
-  the bundle keeps only the inner ``.model`` (``Qwen3VLModel``) when an
-  ``lm_head`` is present — conditioning uses hidden states only.
-- **No scheduler object**: the upstream time-shifting scheduler class is not
-  vendored; its released static-v1 schedule is expressed through
-  ``BooguImagePipeline.build_schedule_policy()`` (bagel precedent — the σ
-  math lives in the policy, not a diffusers scheduler instance).
-
-No LoRA injection, FSDP wrap, adapter switching, autocast helpers, or
-weight-sync logic — those are lifecycle concerns owned outside the bundle.
-
-Use :meth:`BooguImageBundle.from_config` to load a checkpoint.
-"""
+"""BooguImageBundle — concrete weights+params holder for Boogu-Image."""
 
 from __future__ import annotations
 
@@ -49,13 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 def _swap_attention_processors_to_flash(transformer: nn.Module) -> int:
-    """Swap the pinned SDPA attention processors for their Flash2Varlen
-    twins (identical parameter names, so ``load_state_dict`` transfers the
-    double-stream QKV weights losslessly). Returns the swap count.
-
-    Meta-built modules are swapped structurally with no state transfer —
-    the post-shard checkpoint load fills the fresh processors.
-    """
+    """Swap the pinned SDPA attention processors for their Flash2Varlen twins; returns the swap count."""
     from .vendor.attention_processor import (
         BooguImageAttnProcessor,
         BooguImageAttnProcessorFlash2Varlen,
@@ -110,12 +75,7 @@ class BooguImageBundle(Bundle):
 
     @classmethod
     def from_config(cls, config: BooguImagePipelineConfig) -> "BooguImageBundle":
-        """Load all Boogu-Image components from a HuggingFace-layout checkpoint.
-
-        Honors per-component path overrides (``vae_ckpt_path`` /
-        ``text_encoder_ckpt_path``); both default to
-        ``pretrained_model_ckpt_path``.
-        """
+        """Load all Boogu-Image components from a HuggingFace-layout checkpoint."""
 
         import fcntl
 

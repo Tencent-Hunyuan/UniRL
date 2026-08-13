@@ -1,11 +1,4 @@
-"""FSDP-specific sharded-state helpers (torch-native FSDP2).
-
-The FSDP2-generic DCP state-dict helpers are re-exported from
-:mod:`unirl.train.backend.sharded_state` (so this module's public surface is
-unchanged); only what is specific to the torch-native ``fully_shard`` path lives
-here: gradient clipping (with the explicit global-norm fallback for the
-cpu_offload corner case) and the meta-skipping offload / onload.
-"""
+"""FSDP-specific sharded-state helpers (torch-native FSDP2)."""
 
 from __future__ import annotations
 
@@ -16,22 +9,7 @@ import torch
 from torch import Tensor, nn
 from torch.nn.parameter import Parameter
 
-from unirl.train.backend.sharded_state import (
-    StateDict,
-    _current_rank,
-    _maybe_dtensor_to_tensor,
-    gather_optimizer_state_dict,
-    gather_state_dict,
-    infer_device,
-    is_materialized,
-    load_model_state_dict,
-    load_optimizer_state_dict,
-    local_view,
-    lora_state_dict,
-    move_optimizer_state,
-    nft_state_dict,
-    trainable_params,
-)
+from unirl.train.backend.sharded_state import _maybe_dtensor_to_tensor
 
 logger = logging.getLogger(__name__)
 
@@ -40,13 +18,7 @@ def clip_grad_norm(
     params: List[Parameter],
     max_norm: float,
 ) -> Tensor:
-    """FSDP-safe gradient clipping.
-
-    Tries the standard ``torch.nn.utils.clip_grad_norm_`` first; falls
-    back to an explicit global-norm path for known FSDP corner cases
-    (mixed regular Tensor + DTensor, or CPU DTensor collectives missing
-    under cpu_offload).
-    """
+    """FSDP-safe gradient clipping."""
     try:
         result = torch.nn.utils.clip_grad_norm_(params, max_norm)
         return _maybe_dtensor_to_tensor(result)
@@ -66,21 +38,7 @@ def clip_grad_norm(
 
 
 def fsdp_offload(model: nn.Module) -> None:
-    """Move FSDP-wrapped params + grads to CPU, leaving meta tensors untouched.
-
-    The 80B meta-init path materializes only the trained decoder + heads (aux
-    vae / vit stay on meta via ``with_aux=()``); a plain ``model.cpu()`` would
-    raise ``Cannot copy out of meta tensor`` on those. ``_apply`` is what
-    ``.cpu()`` delegates to (handles FSDP DTensor shards); skipping meta leaves
-    the never-materialized aux alone. No-op difference for fully-materialized
-    models (SD3).
-
-    META-PROBE: logs exactly which params stay on meta so the "only frozen aux"
-    assumption is verified, not assumed. If a TRAINED / forward-needed module
-    (``model.layers.*`` / ``lm_head`` / ``patch_embed`` / ``time_embed`` / heads)
-    appears here, materialize missed it and this guard would silently mask the
-    bug (deferred meta error or silent-NaN at forward). Expected meta set: only
-    ``vae.*`` / ``vision_model.*`` (intentionally never materialized)."""
+    """Move FSDP-wrapped params + grads to CPU, leaving meta tensors untouched."""
     meta_names = [n for n, p in model.named_parameters() if p.is_meta]
     if meta_names:
         logger.warning(
@@ -97,10 +55,7 @@ def fsdp_offload(model: nn.Module) -> None:
 
 
 def fsdp_onload(model: nn.Module, device: torch.device) -> None:
-    """Move FSDP-wrapped params + grads back to device, leaving meta untouched.
-
-    Mirror of :func:`fsdp_offload` — never-materialized meta aux stays on meta
-    (moving it to a device would raise; it carries no data to move)."""
+    """Move FSDP-wrapped params + grads back to device, leaving meta untouched."""
     model._apply(lambda t: t if t.is_meta else t.to(device))
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -111,17 +66,7 @@ def _global_clip_for_sharded_grads(
     params: List[Parameter],
     max_grad_norm: float,
 ) -> Tensor:
-    """Explicit global-norm gradient clipping for FSDP DTensor grads.
-
-    Ported from the deleted FSDPPolicy._global_clip_for_sharded_grads.
-    Handles the FSDP corner case the standard clip_grad_norm_ path can't:
-    CPU DTensor collectives missing under cpu_offload. Every grad here is a
-    sharded DTensor: the root wrap claims all leftover params, and
-    ``fsdp_wrap`` fails fast on trainable params outside every group when
-    ``root_wrap`` is disabled. Reduce only over the DTensor shard dimension;
-    reducing over replicated mesh dimensions would count the same gradient
-    multiple times under HSDP / ``no_shard``.
-    """
+    """Explicit global-norm gradient clipping for FSDP DTensor grads."""
     import torch.distributed as dist
 
     grads: list[Tensor] = []
@@ -170,20 +115,7 @@ def _global_clip_for_sharded_grads(
 
 
 __all__ = [
-    "StateDict",
     "clip_grad_norm",
-    "gather_optimizer_state_dict",
-    "gather_state_dict",
-    "load_model_state_dict",
-    "load_optimizer_state_dict",
-    "move_optimizer_state",
-    "local_view",
-    "is_materialized",
-    "trainable_params",
-    "lora_state_dict",
-    "nft_state_dict",
     "fsdp_offload",
     "fsdp_onload",
-    "infer_device",
-    "_current_rank",
 ]

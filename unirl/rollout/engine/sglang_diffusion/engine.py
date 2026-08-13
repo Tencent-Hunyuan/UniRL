@@ -1,19 +1,4 @@
-"""``sglang_diffusion`` engine core — wiring + delegation only.
-
-A thin core over the backend seam: it names no concrete model (the adapter, picked
-from the registry by ``config.model_family``, owns the ``Sample`` → ``Sample``
-conversion) and no concrete backend (the seam owns the runtime). Weight sync is a
-:class:`WeightSync` component constructed over the seam; the offload lifecycle (a
-single flag) lives directly on the engine. The frozen ``base.py`` surface is
-implemented as thin forwards here — they must be real class attributes anyway
-(``Worker.call`` dispatches by name; ``@distributed`` binds the most-derived
-attribute) — which also absorbs the surface quirks (``track_prefix``) so the
-component keeps clean signatures.
-
-One-shot construction: after ``__init__`` returns, the generator is spawned and the
-engine is usable. ``generate`` / ``sleep`` / ``wake_up`` re-apply ``@distributed``
-(the decorator is not inherited — see ``base.py``).
-"""
+"""``sglang_diffusion`` engine core — wiring + delegation only."""
 
 from __future__ import annotations
 
@@ -152,11 +137,7 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
         return sample.replace_frontier(Part.concat(gen_chunks))
 
     def _ensure_sample_sigmas(self, sample: Sample) -> None:
-        """Pin the σ schedule onto the gen part's ``DiffusionSamplingParams.sigmas``.
-
-        σ is the single source of truth, computed from the model-owned schedule
-        policy and shared across the part's samples (one params object).
-        """
+        """Pin the σ schedule onto the gen part's ``DiffusionSamplingParams.sigmas``."""
         ensure_sample_sigmas(sample, self.schedule_policy)
 
     def _generate_batch(self, sample: Sample) -> Sample:
@@ -166,14 +147,7 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
         return self.adapter.build_response(sample, raw)
 
     def _resolve_initial_noise(self, sample: Sample) -> Optional[torch.Tensor]:
-        """Driver-authoritative x_T → init_same_noise fallback → None. Model-agnostic.
-
-        ``disable_driver_xt`` returns ``None`` before every recipe/fallback path.
-        Otherwise, the x_T noise key is derived from the lineage path (OD-2): the parent
-        (group) id under ``init_same_noise`` so siblings share x_T, else the
-        per-sample id. ``initial_latents`` (img2img) rides on the gen part's
-        ``LatentSegment`` shell; the regen shape on ``init_noise_latent_shape``.
-        """
+        """Driver-authoritative x_T → init_same_noise fallback → None. Model-agnostic."""
         gen = sample.frontier_gen_part(DiffusionSamplingParams)
         diffusion = gen.sampling_params
         if diffusion is not None and bool(getattr(diffusion, "disable_driver_xt", False)):

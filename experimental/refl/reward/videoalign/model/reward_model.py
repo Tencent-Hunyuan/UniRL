@@ -1,19 +1,4 @@
-"""Qwen2-VL reward model with a 3-dim (VQ, MQ, TA) regression head.
-
-Verbatim port of ``Qwen2VLRewardModelBT`` from
-``mmrl/recipes/rewards/videoalign/vendor/videoalign/trainer.py`` — the
-*only* class from that file we actually need at inference time. Training-
-specific machinery (``VideoVLMRewardTrainer``, ``PartialEmbeddingUpdateCallback``,
-``compute_multi_attr_accuracy``) lived in the same file but are not part of
-the inference contract and have been intentionally dropped to remove the
-``transformers.trainer`` private-symbol coupling that breaks on
-transformers>=5.
-
-The forward signature is preserved so the same checkpoint state_dict loads
-cleanly (no key remapping needed beyond the standard transformers>=5
-``base_model.model.model.language_model.*`` shim handled by
-:func:`experimental.refl.reward.videoalign.model.checkpoint.load_model_from_checkpoint`).
-"""
+"""Qwen2-VL reward model with a 3-dim (VQ, MQ, TA) regression head."""
 
 from __future__ import annotations
 
@@ -25,9 +10,7 @@ from transformers import Qwen2VLForConditionalGeneration
 
 
 def _cfg_get(config: Any, name: str) -> Any:
-    """Read a ``Qwen2VLConfig`` field from wherever 5.6 keeps it: media
-    token ids live on the top-level config, LM fields like ``hidden_size``
-    under the nested ``text_config``."""
+    """Read a ``Qwen2VLConfig`` field: media token ids sit on the top-level config, LM fields under ``text_config``."""
     if hasattr(config, name):
         val = getattr(config, name)
         if val is not None:
@@ -41,25 +24,7 @@ def _cfg_get(config: Any, name: str) -> Any:
 
 
 class Qwen2VLRewardModelBT(Qwen2VLForConditionalGeneration):
-    """Qwen2-VL backbone + ``nn.Linear`` reward head (Bradley-Terry / regression).
-
-    Differences vs ``Qwen2VLForConditionalGeneration``:
-
-    - Replaces the LM-head pathway with an ``rm_head: Linear(hidden, output_dim)``
-      whose output is pooled per-sample (last / mean / special-token).
-    - ``forward`` returns ``{"logits": Tensor[B, output_dim]}`` rather than a
-      ``CausalLMOutputWithPast``.
-
-    Output dim conventions used by VideoAlign checkpoints:
-
-    - ``output_dim=3`` + ``reward_token="last"``  → joint head; final-token
-      logits are the (VQ, MQ, TA) scalars directly.
-    - ``output_dim=3`` + ``reward_token="special"`` + 3 special-token IDs →
-      each special token contributes its own row of the 3×3 head; we
-      diagonal-extract to (VQ from <|VQ_reward|>, MQ from <|MQ_reward|>, …).
-    - ``output_dim=1``                            → single-attribute heads
-      (one ckpt per dimension, rarely used by the public release).
-    """
+    """Qwen2-VL backbone + linear reward head; ``forward`` returns ``{'logits': Tensor[B, output_dim]}``."""
 
     def __init__(
         self,

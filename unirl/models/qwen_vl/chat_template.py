@@ -37,13 +37,7 @@ class QwenVLChatTemplateStage:
         value: QwenVLChatInput,
         images: Optional[List[Optional[Any]]] = None,
     ) -> QwenVLARConditions:
-        """Render role-aware turns or supervised single-turn rows.
-
-        ``List[Turn]`` is the Sample-native rollout path; image content is already
-        carried by image Turns. ``Texts`` plus an optional PIL per row is the SFT
-        path. Both normalize to the same processor-message representation and
-        share all tokenization, truncation, padding, and condition packing below.
-        """
+        """Render role-aware turns or supervised single-turn rows."""
         if isinstance(value, Texts):
             batch_size = len(value)
             if batch_size == 0:
@@ -99,20 +93,7 @@ class QwenVLChatTemplateStage:
         *,
         tools: Optional[Sequence[Optional[Sequence[Dict[str, Any]]]]] = None,
     ) -> QwenVLARConditions:
-        """Render OpenAI-style histories (interleaved text/image parts) as AR conditions.
-
-        The agent-SFT seam: each conversation is a record's history without its
-        final target assistant turn; image parts carry loaded PILs (the track
-        builder resolves URIs worker-side). Any number of image parts, at any
-        position, is supported — the processor expands each into its
-        ``<|image_pad|>`` span and pixel grids in content order, the exact
-        layout ``QwenVLARStage.replay`` teacher-forces over.
-
-        Overlong prompts RAISE instead of truncating: cutting an image-bearing
-        prompt desyncs pixel grids from the remaining pad tokens, and cutting a
-        text prompt severs the prompt→target seam supervision depends on —
-        filter overlong histories during manifest preparation instead.
-        """
+        """Render OpenAI-style histories (interleaved text/image parts) as AR conditions."""
         if not conversations:
             raise ValueError("QwenVLChatTemplateStage.embed_messages: empty conversation batch.")
         if tools is None:
@@ -144,12 +125,7 @@ class QwenVLChatTemplateStage:
         return self._pack_conditions(per_sample_inputs, truncate=False)
 
     def _pack_conditions(self, per_sample_inputs: List[Any], *, truncate: bool) -> QwenVLARConditions:
-        """Right-pad per-sample processor outputs into batched AR conditions.
-
-        ``truncate=True`` keeps the rollout ``embed`` behavior (cap at
-        ``max_prompt_length``); ``truncate=False`` raises on overflow (the
-        supervised-messages contract).
-        """
+        """Right-pad per-sample processor outputs into batched AR conditions."""
         device = self.bundle.device
         dtype = self.bundle.dtype
         batch_size = len(per_sample_inputs)

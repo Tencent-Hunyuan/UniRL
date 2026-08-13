@@ -12,11 +12,7 @@ _TENSOR_VIDEO_SUFFIXES = frozenset({".pt", ".pth", ".npy", ".npz"})
 
 
 def load_video(uri: str, *, max_frames: Optional[int] = None) -> torch.Tensor:
-    """Load local video media as RGB ``[T, 3, H, W]`` float32 in ``[0, 1]``.
-
-    A frame cap samples across the full clip and keeps container decode memory
-    bounded, rather than truncating the clip to its first ``max_frames``.
-    """
+    """Load local video media as RGB ``[T, 3, H, W]`` float32 in ``[0, 1]``."""
     if uri.startswith(_REMOTE_URI_PREFIXES):
         raise NotImplementedError(
             f"Remote video URI {uri!r} is not supported; materialize it to local/shared storage first."

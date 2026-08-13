@@ -100,12 +100,7 @@ def estimate_norm(lmk, image_size=112, mode="arcface"):
 
 
 def norm_crop(img, landmark, image_size=112, mode="arcface"):
-    """Align an image into ArcFace canonical 112x112 using a similarity transform.
-
-    Differentiable in ``img`` — the only non-grad path is ``landmark``, which
-    comes from the no-grad SCRFD detector. This is what carries the REFL
-    gradient from cosine reward all the way back to the generated pixels.
-    """
+    """Align an image into ArcFace canonical 112x112 using a similarity transform."""
     M_homogeneous = estimate_norm(landmark, image_size, mode)
     C, H, W = img.shape
     img = img.unsqueeze(0)
@@ -395,11 +390,7 @@ class FaceAnalysis:
         return loss
 
     def pool_embedding_loss(self, id_embedding=None, gt_embedding=None, id_mask=None):
-        """Pool-style cosine similarity between gen frames and any ref frame.
-
-        Returns a scalar reward (per-call). The scorer calls this once per
-        sample and stacks the result into a per-sample reward tensor.
-        """
+        """Pool-style cosine similarity between gen frames and any ref frame."""
         id_emb_expanded = id_embedding.unsqueeze(2)
         gt_emb_expanded = gt_embedding.unsqueeze(1)
         gt_mask = torch.ones(gt_embedding.shape[0], gt_embedding.shape[1]).to(id_mask.device)

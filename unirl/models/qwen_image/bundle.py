@@ -1,27 +1,4 @@
-"""QwenImageBundle — concrete weights+params holder for Qwen-Image.
-
-Implements the empty :class:`Bundle` Protocol. Pure container of the
-modules Qwen-Image ships with: 1× ``QwenImageTransformer2DModel``, 1×
-``AutoencoderKLQwenImage``, 1× ``Qwen2_5_VLForConditionalGeneration``
-text encoder + ``Qwen2Tokenizer``, 1× ``FlowMatchEulerDiscreteScheduler``.
-
-Diverges from :class:`unirl.models.sd3.SD3Bundle` in two ways:
-
-- **Single text encoder** (vs SD3's CLIP1 + CLIP2 + T5 stack). Qwen-Image
-  uses a multimodal LLM (Qwen-2.5-VL) as a text encoder; the tokenizer
-  is the matching ``Qwen2Tokenizer``. Pooled vectors are not produced —
-  the receiving transformer reads token-level hidden states only.
-- **5D VAE latents** ``[B, C, T=1, H, W]``. Qwen-Image's VAE is the
-  video VAE (``AutoencoderKLQwenImage``) used with a single frame; the
-  decode/encode stages handle the temporal squeeze/expand at the
-  boundary.
-
-No LoRA injection, FSDP wrap, adapter switching, autocast helpers, or
-weight-sync logic — those are lifecycle concerns owned outside the
-bundle (``cfg.training.policies``).
-
-Use :meth:`QwenImageBundle.from_config` to load a checkpoint.
-"""
+"""QwenImageBundle — weights+params for Qwen-Image; the VAE is 5D, latents ``[B, C, T=1, H, W]``."""
 
 from __future__ import annotations
 
@@ -68,13 +45,7 @@ class QwenImageBundle(Bundle):
 
     @classmethod
     def from_config(cls, config: QwenImagePipelineConfig) -> "QwenImageBundle":
-        """Load all Qwen-Image components from a HuggingFace-layout checkpoint.
-
-        Honors per-component path overrides (``vae_ckpt_path`` /
-        ``text_encoder_ckpt_path``) so fine-tuning recipes can swap in
-        alternate VAE / text-encoder checkpoints without re-downloading
-        the transformer. Both default to ``pretrained_model_ckpt_path``.
-        """
+        """Load all Qwen-Image components from a HuggingFace-layout checkpoint."""
 
         import fcntl
 

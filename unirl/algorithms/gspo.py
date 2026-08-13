@@ -1,41 +1,4 @@
-"""Stage-driven ``GSPO`` (Group Sequence Policy Optimization) over a ``TextSegment``.
-
-Implements **GSPO**, introduced in Zheng et al. "Group Sequence Policy
-Optimization" (arXiv:2507.18071). GSPO is the sequence-level sibling of
-:class:`~unirl.algorithms.grpo.GRPO`: GRPO forms a **per-token** importance
-ratio and clips each token; GSPO forms **one ratio per sequence** from the
-length-normalized sequence log-ratio (paper Eq. 7-8)::
-
-    s_i = (1 / |y_i|) * Σ_t (new_logp_{i,t} - old_logp_{i,t})
-    ratio_i = exp(s_i)
-    loss = mean_i  max( -A_i * ratio_i,  -A_i * clip(ratio_i, 1-ε, 1+ε) )
-
-and applies the clipped surrogate at the sequence granularity. This removes the
-per-token ratio variance that destabilizes MoE RL (the paper's motivation), so it
-pairs naturally with the Qwen3-Omni thinker (a Qwen3-MoE decoder).
-
-This is a self-contained :class:`StageAlgorithm` mirroring the construction of
-:class:`~unirl.algorithms.grpo.GRPO` / :class:`~unirl.algorithms.cppo.CPPO` /
-:class:`~unirl.algorithms.drpo.DRPO` (same ``compute_loss_and_backward`` skeleton:
-empty-segment guards → ``stage.replay`` → frozen ``old_logp`` anchor →
-clip-range schedule → loss → ``backward`` → metric assembly). The teacher-forced
-forward and per-token log-prob recompute are owned by ``stage.replay(...)``; the
-algorithm only adds the sequence-level reduction. It reuses the shared
-``unirl.algorithms.base._grpo_clip_loss`` helper at sequence granularity so the
-ratio it forms is ``exp(s_new - s_old) = exp(s_i)``.
-
-Provenance / relation to other code
-------------------------------------
-This is an **independent UniRL implementation**, not a port of any external
-code. The per-token → per-sequence reduction uses a segment-sum over
-``segment.lengths`` (the framework's cu_seqlens), NOT a token-mask
-vectorization. Only the algorithm's mathematical definition (the equations
-above) is shared with other GSPO implementations; equations are not
-copyrightable and the paper is public. No third-party source was copied.
-
-GSPO's clip range is much tighter than GRPO's (the paper uses ε≈3e-4); set it
-in the recipe.
-"""
+"""Stage-driven ``GSPO`` (Group Sequence Policy Optimization) over a ``TextSegment``."""
 
 from __future__ import annotations
 
@@ -69,36 +32,7 @@ class GSPOConfig(BaseAlgorithmConfig):
 
 
 class GSPO(StageAlgorithm):
-    """Sequence-level GSPO over an AR ``TextSegment`` via ``ARStage.replay``.
-
-    Forms ONE importance ratio per sequence from the length-normalized sequence
-    log-ratio and runs the PPO clipped surrogate at sequence granularity. The
-    teacher-forced forward and per-token log-prob recompute is owned by
-    :meth:`ARStage.replay`; this class reduces the packed per-token log-probs
-    to one length-normalized value per sequence and feeds that through the
-    shared PPO clip math.
-
-    Args:
-        stage: The :class:`ARStage` whose ``replay`` produces packed-varlen
-            new log-probs aligned with ``segment.log_probs``.
-        clip_range: PPO clip range epsilon (sequence-level; much smaller than
-            GRPO's per-token range).
-        clip_schedule: ``"constant"``, ``"linear_decay"``, or
-            ``"cosine_decay"``.
-        clip_range_high: DAPO "clip-higher" upper epsilon; ``None`` ⇒ symmetric.
-        loss_agg_mode: accepted for recipe symmetry; GSPO is inherently
-            sequence-mean (one term per sequence), so it does not change the
-            reduction.
-        conditions_cls: Stage-typed conditions container with
-            ``from_dict(Mapping[str, Condition])``.
-        sampling_temperature: AR rollout temperature, applied as a
-            ``logits / T`` scaling inside :meth:`ARStage.replay` so replay's
-            log-softmax matches SGLang's sampling distribution
-            (``log_softmax(logits / T)``).
-        old_logp_source: ``"rollout"`` keeps the engine-emitted behavior
-            log-prob as the frozen denominator. ``"replay"`` recomputes that
-            denominator at pre-update train-side weights.
-    """
+    """Sequence-level GSPO over an AR ``TextSegment`` via ``ARStage.replay``."""
 
     supports_multi_update = True
     anchor_fields = ("log_probs", "rollout_log_probs")
@@ -228,13 +162,7 @@ class GSPO(StageAlgorithm):
         advantages: torch.Tensor,
         lengths: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Reduce packed per-token log-probs to one length-normalized value per
-        sequence via a vectorized segment-sum over cu_seqlens (no Python loop).
-
-        Returns ``(seq_new, seq_old, seq_adv)`` for sequences with length > 0.
-        ``seq_new`` stays differentiable (grad flows through replay); ``seq_old``
-        is frozen.
-        """
+        """Reduce packed per-token log-probs to one length-normalized value per sequence via a segment-sum."""
         device = new_logp.device
         lengths = lengths.to(device)
         num_seqs = int(lengths.shape[0])

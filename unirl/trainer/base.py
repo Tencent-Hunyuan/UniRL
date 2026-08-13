@@ -29,16 +29,7 @@ def prepare_input_sample(
     root_control: Optional[Dict[str, Any]] = None,
     require_single_input_part: bool = False,
 ) -> Sample:
-    """Prepare a data-source input tree for one rollout without rebuilding it.
-
-    The data-source boundary is an input-only :class:`Sample`: metadata lives on
-    its root and multimodal inputs are already chained as child Parts.  Trainers
-    preserve that structure, namespace *every* id so separate rollouts cannot
-    alias, optionally merge trainer-owned routing control onto the root, and then
-    append their own generation fork(s). ``require_single_input_part`` lets serial
-    runners reject trees they cannot yet return intact instead of silently dropping
-    descendants.
-    """
+    """Prepare a data-source input tree for one rollout without rebuilding it."""
     if not isinstance(inputs, Sample):
         raise TypeError(f"{caller}: expected Sample input, got {type(inputs).__name__}.")
     if not inputs.parts:
@@ -72,19 +63,7 @@ def prepare_input_sample(
 
 
 def build_sampling_dict(sampling_cfg: DictConfig) -> Dict[str, BaseSamplingParams]:
-    """Instantiate a Hydra ``sampling`` config into the modality-keyed runtime dict.
-
-    The trainer's ``sampling_params`` is a ``Dict[str, BaseSamplingParams]`` keyed
-    by modality (each modality's params ride on its gen Part at request build).
-    Two config shapes are accepted so the flat single-modality recipes need no rewrite:
-
-    - **Flat** (``sampling: {_target_: …DiffusionSamplingParams, …}``) — one
-      params object, wrapped under its modality key (``"ar"`` for
-      ``ARSamplingParams``, else ``"diffusion"``).
-    - **Composed** (``sampling: {ar: {_target_: …}, diffusion: {_target_: …}}``)
-      — each entry instantiated under its key. (Hydra does not recurse into a
-      ``_target_``-less mapping, so we instantiate per entry.)
-    """
+    """Instantiate a Hydra ``sampling`` config into the modality-keyed runtime dict."""
     if "_target_" in sampling_cfg:
         obj = instantiate(sampling_cfg)
         return {"ar" if isinstance(obj, ARSamplingParams) else "diffusion": obj}
@@ -105,19 +84,7 @@ def unwrap_replicated_int(value: object, *, name: str) -> int:
 
 
 def init_transfer_queue(cfg: DictConfig) -> Optional[dict]:
-    """Driver-side TransferQueue bootstrap for ``transport_kind=transfer_queue``.
-
-    Spins up the TransferQueue controller + storage backend from the ``cfg.transfer_queue``
-    block and returns the **actor** handoff to pass to ``DevicePool(tq_handoff=...)`` —
-    each Worker builds its own queue client from it (see ``build_transport``). The driver
-    also creates its own client and installs a driver ``TQTransport``: reward/advantage
-    materialization runs on the driver and hydrates TQ refs via
-    ``TQTensorHandle.local() -> TensorTransportRuntime.current()``. The TransferQueue is a
-    GLOBAL backend with no per-ref owning worker to RPC, so without a driver transport that
-    ``.local()`` would raise "no TensorTransport installed". ``install()`` binds the runtime
-    process-globally, keeping the controller/backend actors alive. Returns ``None`` for
-    non-tq backends (colocate/gpu).
-    """
+    """Driver-side TransferQueue bootstrap for ``transport_kind=transfer_queue``."""
     if cfg.get("transport_kind", "colocate_store") not in ("transfer_queue", "tq"):
         return None
     from unirl.distributed.tensor import TensorTransportRuntime
@@ -141,15 +108,7 @@ def init_transfer_queue(cfg: DictConfig) -> Optional[dict]:
 
 
 class BaseTrainer:
-    """Owns a DevicePool. Subclasses use ``placement(self.pool, ...)`` to
-    instantiate their ``Remote`` roles inside ``__init__`` / ``setup``.
-
-    Also owns the (rank-0/driver) Weights & Biases logger shared by every
-    trainer. Subclasses call :meth:`_init_wandb` once at the top of ``train``
-    (it always builds a logger — a no-op null-object when reporting is off),
-    then ``self.wandb_logger.log_rollout_step(...)`` / ``log_progress(...)``
-    after each ``train_step``, and :meth:`_finish_wandb` in a ``finally``.
-    """
+    """Owns a DevicePool. Subclasses use ``placement(self.pool, ...)`` to"""
 
     def __init__(
         self,
@@ -185,15 +144,7 @@ class BaseTrainer:
         self._memory_monitor = install_memory_monitoring(self)
 
     def _install_train_step_reset_hook(self) -> None:
-        """Wrap ``train_step`` so :meth:`_reset_transport_buffers` runs after each call.
-
-        Only installed for the transfer_queue backend; colocate/gpu_store keep their
-        ``train_step`` untouched (their reclaim is a no-op anyway). Every v2 trainer has
-        its own ``train`` loop but they all drive one ``train_step`` per rollout, so this
-        is the single seam that reclaims per-rollout TQ buffers without per-trainer edits.
-        The reset fires once ``train_step`` returns — rewards/advantages materialized, no
-        live ``TensorRef`` ref into the queue's RDMA buffers remaining.
-        """
+        """Wrap ``train_step`` so :meth:`_reset_transport_buffers` runs after each call."""
         if self.pool.transport_kind not in ("transfer_queue", "tq"):
             return
         inner = getattr(self, "train_step", None)
@@ -213,22 +164,7 @@ class BaseTrainer:
         self.pool.reset_transfer_queue_buffers()
 
     def _init_wandb(self, *, num_rollouts: Optional[int] = None, extra: Optional[Dict[str, Any]] = None) -> None:
-        """Build the (rank-0/driver) wandb logger from the optional ``logging`` block.
-
-        The single logger factory shared by every trainer. ALWAYS assigns
-        ``self.wandb_logger`` — a live run when ``report_to_wandb`` is on and a
-        ``project_name`` is set, otherwise a disabled null-object whose wandb
-        methods no-op (so trainers call ``self.wandb_logger.X(...)`` without
-        guards, while ``log_progress`` still prints). The whole ``train`` loop
-        runs on the driver, so ``rank=0``.
-
-        Reads (all under the ``logging`` block, all optional): ``report_to_wandb``,
-        ``project_name``, ``run_name``, ``entity`` (falls back to ``WANDB_ENTITY``),
-        ``tags`` (list or comma-separated string), ``logging_dir``, and the media
-        knobs ``log_media`` / ``media_max_items`` / ``media_log_interval``. Enabling
-        reporting inherently requires a successful wandb init (it raises on
-        failure) — there is no opt-out flag.
-        """
+        """Build the (rank-0/driver) wandb logger from the optional ``logging`` block."""
         from unirl.utils.wandb_logger import init_logger
 
         cfg = self.logging_cfg or {}
@@ -280,28 +216,7 @@ class BaseTrainer:
         *,
         rollout_id: int,
     ) -> None:
-        """Upload media previews (if due this rollout) then free decoded payloads.
-
-        Two jobs at the single pre-train chokepoint every trainer hits — and
-        both FINISH here, so no decoded payload (PIL images / raw video tensors)
-        ever rides into the ``train_track`` dispatch (each gen ``Part`` is
-        DP_SCATTER-serialized to the training workers right after this call):
-
-        1. **Media logging (driver-side).** When the logger wants media this
-           rollout (``UniRLWandBLogger.should_log_media``), draw the previews via
-           :meth:`_upload_media_previews` at the same ``rollout/step`` value
-           :meth:`UniRLWandBLogger.log_rollout_step` uses, so the panels align.
-        2. **Free the per-rollout payloads.** ``primitives`` (generated
-           Images/Videos/Texts/Audios) is consumed upstream by reward scoring and never
-           read by training (which uses only segment/conditions/advantages);
-           ``media_preview`` was just uploaded (or skipped off-cadence). Clearing
-           the primitive map, its metadata, and the preview before ``train_track``
-           releases the driver-held
-           TensorStore handles before the optimizer-step memory peak.
-
-        Call after scoring / advantages (and any decoded-reading debug dump),
-        immediately before dispatching to ``train_track``.
-        """
+        """Upload media previews (if due this rollout) then free decoded payloads."""
         wb = self.wandb_logger
         if wb is not None and wb.should_log_media(rollout_id):
             self._upload_media_previews(sample, rollout_id + 1, prefix="rollout", step_key="rollout/step")
@@ -312,20 +227,7 @@ class BaseTrainer:
             part.media_preview = None
 
     def _upload_media_previews(self, sample: Sample, step: int, *, prefix: str, step_key: str) -> None:
-        """Upload one preview grid per generated track of ``sample`` under ``prefix``.
-
-        Takes each gen ``Part``'s inbound ``media_preview`` or builds one from its
-        still-live ``primitives`` (``build_media_preview_for_part`` hydrates a
-        single DP shard), caps it to ``media_max_items``, and logs it on
-        ``step_key`` so the panel shares an axis with that caller's scalars.
-        Captions default to the frontier-aligned prompt texts
-        (``Sample.conditioning``); a scored Sample also carries its rewards.
-        Multi-track samples get one key per track
-        (``{prefix}/{ar,diffusion}/generated_media``).
-
-        Decides only WHAT to draw — cadence and payload lifetime stay with the
-        caller, since eval must not free primitives its later scorers still read.
-        """
+        """Upload one preview grid per generated track of ``sample`` under ``prefix``."""
         from unirl.types.media_preview import build_media_preview_for_part
         from unirl.types.primitives import Images, Texts
 
@@ -353,38 +255,14 @@ class BaseTrainer:
             wb.log_generated_media(step, preview, key=key, step_key=step_key)
 
     def _log_eval_media(self, sample: Sample, step: int, *, prefix: str = "eval") -> None:
-        """Upload the eval preview grid for one scored eval chunk.
-
-        Called with the FIRST chunk of an eval sweep, which is a fixed comparison
-        grid rather than a fresh draw: eval prompts are the head of the eval set
-        (``get_eval_samples`` is deterministic) and eval x_T is keyed on prompt
-        content and sibling ordinal (``make_prompt_seed_group_id``, independent of
-        rollout id and rank). Capping at ``media_max_items`` therefore yields the
-        SAME prompts at the SAME noise at every eval, so the panels are a
-        like-for-like A/B across training.
-
-        That is the full-trajectory invariant only at ``eval_eta <= 0`` (the
-        default): an SDE eval additionally draws per-step noise seeded from the
-        eval step's sample ids, so its panels differ by noise as well as policy
-        (``DiffusionTrainer.__init__`` warns).
-
-        The cap counts SAMPLES, not prompts: siblings are adjacent
-        (``Part.fork``), so with ``eval_samples_per_prompt=4`` a cap of 8 shows
-        two prompts four ways.
-        """
+        """Upload the eval preview grid for one scored eval chunk."""
         wb = self.wandb_logger
         if wb is None or not wb.should_log_eval_media():
             return
         self._upload_media_previews(sample, step, prefix=prefix, step_key="eval/step")
 
     def _wait_for_checkpoints(self, *, timeout: Optional[float] = None) -> None:
-        """Flush a pending backend checkpoint before worker teardown.
-
-        ``timeout`` bounds the underlying ``ray.get`` — passed on the exception
-        path so a worker wedged in an NCCL collective can't hang the flush
-        forever; ``None`` (the default, e.g. the final-save drain) waits
-        indefinitely.
-        """
+        """Flush a pending backend checkpoint before worker teardown."""
         backend = getattr(self, "backend", None)
         if backend is None:
             return
@@ -394,12 +272,7 @@ class BaseTrainer:
             backend.wait_for_checkpoint(_ray_get_timeout=timeout)
 
     def _cleanup_weight_sync(self, *, timeout: Optional[float] = None) -> None:
-        """Let transports remove run-scoped artifacts before workers are killed.
-
-        ``cleanup`` is a BROADCAST dispatch, so like the checkpoint flush it can
-        wedge on a stuck worker; ``timeout`` bounds its ``ray.get`` on the
-        exception path (``None`` waits indefinitely).
-        """
+        """Let transports remove run-scoped artifacts before workers are killed."""
         weight_sync = getattr(self, "weight_sync", None)
         cleanup = getattr(weight_sync, "cleanup", None)
         if not callable(cleanup):
@@ -434,17 +307,7 @@ class BaseTrainer:
         save_dir: Optional[str],
         save_mode: str = "auto",
     ) -> None:
-        """Save every ``save_interval`` rollouts (and on the last one).
-
-        ``save_interval <= 0`` disables saving. Writes the backend state under
-        ``<save_dir>/checkpoint-<step>/`` (``save_dir`` defaults to
-        ``./checkpoints``). The backend's ``checkpoint_format`` selects either
-        a legacy ``checkpoint.pt`` or reshardable DCP shards; ``save_mode="auto"``
-        keeps only LoRA keys when LoRA is active and writes full checkpoints
-        otherwise.
-        Paths resolve to absolute here, on the driver — the backend runs in
-        Ray workers whose CWD differs from the driver's.
-        """
+        """Save every ``save_interval`` rollouts (and on the last one)."""
         if save_interval <= 0:
             return
         step = rollout_id + 1
@@ -467,13 +330,7 @@ class BaseTrainer:
             self._wait_for_checkpoints()
 
     def maybe_load_checkpoint(self, load_dir: Optional[str], *, num_rollouts: Optional[int] = None) -> int:
-        """Restore training state from ``load_dir``; return the rollout step to resume from.
-
-        Returns 0 for a fresh run (``load_dir`` empty) or a checkpoint that
-        predates step recording. Restores model/optimizer/scheduler plus the
-        optimizer-step counter; the trainer loop continues from the returned
-        step. Resolved to an absolute path on the driver (worker CWDs differ).
-        """
+        """Restore training state from ``load_dir``; return the rollout step to resume from."""
         if not load_dir:
             return 0
         load_dir = os.path.abspath(load_dir)

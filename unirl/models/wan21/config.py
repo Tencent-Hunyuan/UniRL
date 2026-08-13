@@ -1,17 +1,4 @@
-"""Construction config for the new typed WAN 2.1 T2V / I2V pipeline.
-
-Mirrors :class:`unirl.models.sd3.config.SD3PipelineConfig` shape —
-weights+params only, no LoRA / FSDP / offload knobs. Those lifecycle
-concerns live outside the bundle (in ``training`` Policy stack).
-
-WAN 2.1 supports both T2V and I2V. The I2V path activates when the
-transformer checkpoint declares ``image_dim > 0`` — the bundle then
-loads a CLIP vision tower (``CLIPVisionModel`` + image processor) from
-``image_encoder_ckpt_path`` (or, when ``None``, the ``image_encoder/``
-subfolder under ``pretrained_model_ckpt_path``). Setting
-``image_encoder_ckpt_path`` against a ``image_dim == 0`` checkpoint is
-an error — there is no silent fallback.
-"""
+"""Construction config for the new typed WAN 2.1 T2V / I2V pipeline."""
 
 from __future__ import annotations
 
@@ -23,12 +10,7 @@ from unirl.config.validation import validate_precision_type
 
 @dataclass
 class WAN21PipelineConfig:
-    """Construction args for ``WAN21Pipeline.from_config``.
-
-    ``device`` may be runtime-injected by the actor after compose; the
-    other fields are set at compose time and read once during pipeline
-    construction.
-    """
+    """Construction args for ``WAN21Pipeline.from_config``."""
 
     pretrained_model_ckpt_path: str
     vae_ckpt_path: Optional[str] = None

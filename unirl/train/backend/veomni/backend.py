@@ -1,31 +1,4 @@
-"""VeOmniBackend — single-track training-state Remote on VeOmni FSDP2.
-
-Drop-in sibling of :class:`unirl.train.backend.fsdp.FSDPBackend`: both subclass
-:class:`~unirl.train.backend.base_backend.BaseFSDP2Backend`, which owns the
-training step, EMA swap, checkpoint envelope, and memory lifecycle. This leaf
-supplies only the constructor lifecycle and the five engine hooks, whose wrap /
-grad-clip / offload internals come from VeOmni's distributed layer via the
-:mod:`._compat` selective-import shim. Recipes select it purely by ``_target_``.
-
-Lifecycle differences vs FSDPBackend (all internal to construction):
-
-* The default process group is brought up *explicitly* (VeOmni builds its device
-  meshes before any ``fully_shard`` call, so torch's lazy auto-init never fires),
-  and ``init_parallel_state`` is invoked — one VeOmni-wrapped model per process.
-* The trainable module must arrive on the **meta** device (the bundle's
-  ``meta_init_transformer`` flag): VeOmni's parallelize materializes it via
-  ``to_empty`` and calls its (no-op-stamped) ``init_weights``; the real weights
-  load *after* sharding (``eager_ok=False``).
-* LoRA/NFT/mirror injection runs on the meta module — exactly the contract
-  ``unirl.train.deferred`` documents — and ``apply_deferred_ops`` drains the
-  post-materialize resets *after* the weight load.
-
-Checkpointing: ``save``/``load`` are inherited from the base; the optimizer-state
-hooks below gather the FULL optimizer state to rank 0 (and broadcast + reshard on
-load) — the same DCP path the torch-native FSDP backend uses. The folded
-``dp_shard x ulysses`` mesh is a plain 2D DeviceMesh that DCP redistributes across
-both dims (already exercised by the ``dcp`` checkpoint format on this mesh).
-"""
+"""VeOmniBackend — single-track training-state Remote on VeOmni FSDP2."""
 
 from __future__ import annotations
 
@@ -46,10 +19,10 @@ from unirl.train.backend.veomni.ep.checkpoint import (
     EP_CHECKPOINT_VERSION,
     gather_ep_model_state_dict,
     gather_ep_optimizer_state_dict,
-    has_ep_params,
     load_ep_model_state_dict,
     load_ep_optimizer_state_dict,
 )
+from unirl.train.backend.veomni.ep.placement import has_ep_params
 from unirl.train.backend.veomni.state import clip_grad_norm, veomni_offload, veomni_onload
 from unirl.train.backend.veomni.wrap import veomni_parallelize
 from unirl.train.configs import (
@@ -63,14 +36,7 @@ from unirl.utils.dtypes import parse_torch_dtype
 
 
 class VeOmniBackend(BaseFSDP2Backend):
-    """Single-track VeOmni-FSDP2 training backend.
-
-    One-shot construction: after ``__init__`` returns the backend is fully usable
-    (model wrapped, weights loaded, optimizer/scheduler/EMA built). ``device`` /
-    ``rank`` kwargs are accepted for signature parity with :class:`FSDPBackend`
-    but resolved from the actor env + process group — backends are constructed
-    before ``Remote.setup()`` delivers rank info.
-    """
+    """Single-track VeOmni-FSDP2 training backend."""
 
     def __init__(
         self,
@@ -185,11 +151,7 @@ class VeOmniBackend(BaseFSDP2Backend):
 
     @property
     def weight_sync_dtype(self) -> torch.dtype:
-        """FSDP compute dtype used on the rollout wire.
-
-        This remains independent of an optional fp32 master dtype so LoRA
-        extraction cannot send fp32 tensors to bf16/fp16-only receivers.
-        """
+        """FSDP compute dtype used on the rollout wire."""
         return self._weight_sync_dtype
 
     def _clip_grad_norm(self, max_grad_norm: float) -> torch.Tensor:

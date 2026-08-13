@@ -3,12 +3,16 @@
 > **Where it fits:** shared helpers used across the loop. Full map:
 > [`../README.md`](../README.md).
 
-`utils/` is a grab-bag — each module is a small helper documented by its own
-docstring (`timing.py`, `wandb_logger.py`, `hydra.py`, `media.py`, `misc.py`,
-`profiling.py`, …). Read the module you need directly. The one exception
+`utils/` is a grab-bag — each module is a small, self-contained helper
+(`timing.py`, `wandb_logger.py`, `hydra.py`, `media.py`, `misc.py`,
+`profiling.py`, …), named for what it does and carrying a one-line docstring.
+Read the module you need directly; it is short enough. The one exception
 documented here is **GPU memory monitoring**, because it spans two files
 (`memory_utils.py` + `memory_monitor.py`) and three subsystems (sampling on the
 workers, orchestration here, hooks in the trainer).
+
+The one non-obvious helper is `profiling.py`: `UNIRL_PROFILE` is a single switch
+whose *value* names the region to record.
 
 ---
 

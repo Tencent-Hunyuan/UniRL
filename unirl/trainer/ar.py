@@ -32,18 +32,7 @@ def ar_preflight(
     rollout_cfg: DictConfig,
     stack_cfg: DictConfig,
 ) -> Set[str]:
-    """Model-blind pre-flight shared by :class:`ARTrainer` and ``AsyncARTrainer``.
-
-    Runs on the driver before any model or rollout actor is created. Dispatches
-    the optional fail-fast contract check a model package declares as
-    ``unirl.models.<pkg>.validation.validate_training_contract`` (so the trainer
-    never imports a concrete model family), then returns the prompt-input
-    primitives the pipeline accepts: the decoded ``text``/``image``/``video``
-    contract plus whatever the pipeline class opts into via its
-    ``extra_input_primitives`` attribute (e.g. Omni's URI-backed ``media``
-    channel) — a miswired dataset then fails at request build instead of
-    silently dropping inputs.
-    """
+    """Model-blind pre-flight shared by :class:`ARTrainer` and ``AsyncARTrainer``."""
     target = str(pipeline_cfg.get("_target_", "") or "")
     parts = target.split(".")
     if target.startswith("unirl.models.") and len(parts) > 3:
@@ -66,19 +55,7 @@ def ar_preflight(
 
 
 class ARTrainer(BaseTrainer):
-    """Autoregressive (VLM / LLM) RL trainer: rollout + train colocated.
-
-    Sibling of :class:`~unirl.trainer.diffusion.DiffusionTrainer` for the
-    AR path. Structurally identical except ``_build_request_sample`` carries **no SDE step
-    scheduling** — that is diffusion-only (``DiffusionSamplingParams`` owns
-    ``scheduler`` / ``sde_indices`` / ``resolve_sde_indices``), and
-    ``ARSamplingParams`` has none of it. Keeping the AR trainer separate means
-    the AR path never touches diffusion code (no ``hasattr`` guard, no
-    ``dataclasses.replace`` of SDE fields).
-
-    Trainside colocate (the qwen_vl recipe): the training pipeline IS the
-    sampler, so ``sync_cfg`` is absent and ``weight_sync`` stays ``None``.
-    """
+    """Autoregressive (VLM / LLM) RL trainer: rollout + train colocated."""
 
     def __init__(
         self,
@@ -266,14 +243,7 @@ class ARTrainer(BaseTrainer):
         sync_weights: bool,
         restore_backend: bool = True,
     ) -> Iterator[None]:
-        """Run one anchored rollout phase and restore the requested steady state.
-
-        ``enable_fsdp_offload`` controls the trainer's *manual* placement dance;
-        it is independent from FSDP's ``CPUOffloadPolicy`` (``fsdp_cfg.cpu_offload``).
-        Callers doing a backward pass request ``restore_backend=True``. Eval and
-        pre-backward reward processing keep the backend offloaded so only the
-        vLLM subprocess owns GPU memory.
-        """
+        """Run one anchored rollout phase and restore the requested steady state."""
         original_error: Optional[BaseException] = None
         try:
             if sync_weights and self.weight_sync is not None:
@@ -319,12 +289,7 @@ class ARTrainer(BaseTrainer):
                     raise cleanup_error
 
     def _prepare_rollout(self, *, sync_weights: bool) -> bool:
-        """Wake/sync the SPMD rollout and optionally offload train state.
-
-        Returns whether the train state was offloaded and must be restored by
-        :meth:`_finish_rollout`. Anchored rollout uses
-        :meth:`_anchored_rollout_session` instead.
-        """
+        """Wake/sync the SPMD rollout and optionally offload train state."""
         do_offload = self._enable_fsdp_offload and self.weight_sync is not None
         do_sync = sync_weights and self.weight_sync is not None
         train_state_maybe_offloaded = False
@@ -375,16 +340,7 @@ class ARTrainer(BaseTrainer):
         *,
         sampling: Optional[Dict[str, BaseSamplingParams]] = None,
     ) -> Sample:
-        """Turn a data source batch into a request :class:`Sample`.
-
-        The data source's input-only Part tree is preserved while every id is
-        rollout-keyed (``r{rollout_id}:…``), then ``Part.fork`` fans out the AR
-        gen shell to the ``N``-sample GRPO group (siblings stay consecutive).
-        VLM image/video inputs are already chained by the data source.
-        AR params ride on the gen Part — no SDE schedule to resolve (that is the
-        diffusion trainer's job). ``sampling`` overrides the dict (``evaluate``
-        passes its own); ``None`` uses ``self.sampling_params``.
-        """
+        """Turn a data source batch into a request :class:`Sample`."""
         sp = sampling if sampling is not None else self.sampling_params
         request = prepare_input_sample(
             inputs,
@@ -402,12 +358,7 @@ class ARTrainer(BaseTrainer):
         sync_weights: bool = False,
         rollout_id: int = 0,
     ) -> Tuple[TrainStepResult, float]:
-        """One ``rollout → reward → advantage → optimizer step`` pass.
-
-        Returns ``(train_result, mean_reward)`` — the mean unnormalized
-        per-sample reward of the frontier gen Part (0.0 if none), for the log
-        line. ``rollout_id`` only keys the wandb panels (see :meth:`UniRLWandBLogger.log_rollout_step`).
-        """
+        """One ``rollout → reward → advantage → optimizer step`` pass."""
         t0 = time.perf_counter()
         anchored = self._rollout_anchor_device is not None
         if not anchored:
@@ -461,21 +412,7 @@ class ARTrainer(BaseTrainer):
         return result, mean_reward
 
     def evaluate(self, rollout_id: int) -> float:
-        """Periodic eval — ``avg@k`` accuracy on the eval prompt set.
-
-        Mirrors :meth:`train_step`'s rollout+reward path but skips
-        advantage/backward: iterate up to ``eval_num_prompts`` prompts from
-        ``run.eval_data_path`` in ``eval_batch_size``-sized batches, expand
-        each prompt to ``eval_samples_per_prompt`` siblings, generate at
-        ``eval_temperature``, score, and log the mean reward under both
-        ``eval/acc`` (= avg@k accuracy, since the MC reward is 0/1) and
-        ``eval/reward`` (shares the eval axis with the other trainers).
-        Returns it.
-
-        ``eval_num_prompts=-1`` (default) evaluates the full eval set;
-        ``eval_num_prompts=0`` yields no batches (explicit skip). See the
-        sentinel table on :meth:`~unirl.data.data_source.MultimodalRLDataSource.iter_eval_batches`.
-        """
+        """Periodic eval — ``avg@k`` accuracy on the eval prompt set."""
         import dataclasses
 
         eval_ar = dataclasses.replace(
@@ -567,12 +504,7 @@ class ARTrainer(BaseTrainer):
         return acc
 
     def _pad_eval_inputs(self, inputs: Sample) -> Sample:
-        """Append replicated prompt rows until rollout and reward DP can shard.
-
-        Evaluation still reports only the original rows; the replicas exist solely
-        to satisfy ``DP_SCATTER``. Their ids are rewritten because Sample lineage
-        requires distinct root ids within one request.
-        """
+        """Append replicated prompt rows until rollout and reward DP can shard."""
         n = inputs.batch_size
         if n == 0:
             return inputs
@@ -606,13 +538,7 @@ class ARTrainer(BaseTrainer):
         return Sample.concat([inputs, *padded])
 
     def _dump_rollout_samples(self, sample, rollout_id: int) -> None:
-        """Debug dump of the first N (prompt, output, reward) triples per rollout.
-
-        Off unless ``ROLLOUT_DUMP_DIR`` is set (driver-side env). Writes one
-        ``rollout_<id>.jsonl`` per rollout (``ROLLOUT_DUMP_N`` samples, default
-        4) so rollout-engine quality can be eyeballed without keeping the full
-        decoded batch alive. Must run BEFORE ``_drop_decoded``. Never raises.
-        """
+        """Debug dump of the first N (prompt, output, reward) triples per rollout."""
         import json
         import os
 
@@ -659,23 +585,7 @@ class ARTrainer(BaseTrainer):
         load_dir: Optional[str] = None,
         save_mode: str = "auto",
     ) -> None:
-        """Minimal training loop: ``num_rollouts`` iterations of ``train_step``.
-
-        ``weight_sync_interval``: sync the adapter into the engine every N
-        rollouts (fused into ``train_step``'s generate; no-op trainside).
-
-        ``save_interval``: write a checkpoint every N rollouts (and on the last
-        one); ``0`` disables it. ``save_dir`` is the output folder (defaults to
-        ``./checkpoints``); ``save_mode="auto"`` writes LoRA-only checkpoints
-        when LoRA is active and full checkpoints otherwise.
-        ``load_dir``: restore from a checkpoint directory and RESUME from its
-        saved step — ``num_rollouts`` is the TOTAL budget.
-
-        Evaluation follows ``self.eval_interval``. Multiple optimizer updates
-        per rollout are configured on the train stack with
-        ``num_updates_per_batch``; the stack partitions its shard into disjoint
-        updates while keeping the pre-update policy anchor fixed.
-        """
+        """Minimal training loop: ``num_rollouts`` iterations of ``train_step``."""
         interval = max(1, weight_sync_interval)
         start_rollout = self.maybe_load_checkpoint(load_dir, num_rollouts=num_rollouts)
         resumed = bool(load_dir)
@@ -714,12 +624,7 @@ class ARTrainer(BaseTrainer):
                 self._shutdown_runtime()
 
     def shutdown(self) -> None:
-        """Release every runtime resource this trainer owns. Idempotent.
-
-        Public entry point for callers outside the training loop — notably the
-        driver's signal handler, which can fire before ``train()`` is reached
-        or while its own ``finally`` is already running.
-        """
+        """Release every runtime resource this trainer owns. Idempotent."""
         self._shutdown_runtime()
 
     def _shutdown_runtime(self) -> None:

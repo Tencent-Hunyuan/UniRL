@@ -18,40 +18,14 @@ if TYPE_CHECKING:
 
 
 class VideoPickScoreScorer(PickScoreRewardScorer):
-    """PickScore applied to the first frame of each video.
-
-    Inherits model loading and CLIP scoring from ``PickScoreRewardScorer``;
-    the only addition is a pre-processing step that extracts the first frame
-    from each video tensor before scoring.
-
-    ``input_kind = "video"`` is required so that the reward pipeline routes
-    decoded video tensors into ``RewardRequest.videos`` (and sets
-    ``request.is_video = True``) — without it, the request would arrive with
-    only ``images`` populated and ``_extract_first_frame`` below would never
-    run, silently degrading to scoring the middle-frame PIL preview.
-    """
+    """PickScore applied to the first frame of each video."""
 
     canonical_model_name = "videopickscore"
     input_kind = "video"
 
     @staticmethod
     def _extract_first_frame(video: torch.Tensor) -> "Image.Image":
-        """Extract the first frame of a channel-first video tensor.
-
-        Contract: input is the per-sample slice produced by
-        ``extract_videos_from_output``, which iterates the leading batch
-        dim of ``RolloutSamples.decoded_videos``. ``decoded_videos`` is
-        always written by ``engine.decode_latents`` (channel-first
-        ``(B, C, T, H, W)``), so per-item layout is always
-        ``(C, T, H, W)``. Already-3D inputs are treated as a single
-        channel-first frame.
-
-        We deliberately do NOT try to disambiguate channel-first vs
-        frame-first by inspecting leading dims: small ``T`` (e.g. WAN T2V
-        with ``num_frames=3``) collapses the leading dims into the same
-        ``{1, 3, 4}`` set and would silently score the wrong axis under
-        the old heuristic.
-        """
+        """Extract the first frame of a channel-first video tensor."""
         if not isinstance(video, torch.Tensor):
             raise TypeError(f"Expected torch.Tensor, got {type(video).__name__}")
         v = video
@@ -107,15 +81,7 @@ class VideoPickScoreScorer(PickScoreRewardScorer):
 
 @dataclass
 class VideoPickScoreSpec(BaseRewardComponentSpec):
-    """Typed config for the VideoPickScore reward component.
-
-    Mirrors ``PickScoreSpec`` field-for-field — ``VideoPickScoreScorer``
-    inherits ``PickScoreRewardScorer.__init__``, which consumes exactly
-    ``device``, ``batch_size``, ``processor_id``, and ``model_id`` from
-    its config. A dedicated Spec (instead of reusing ``PickScoreSpec``)
-    keeps Hydra's structured-config registry one-Spec-per-name and lets
-    YAML reference this scorer as ``name: videopickscore``.
-    """
+    """Typed config for the VideoPickScore reward component."""
 
     batch_size: int = 8
     device: str = "auto"

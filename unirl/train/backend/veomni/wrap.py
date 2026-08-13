@@ -1,23 +1,4 @@
-"""VeOmni FSDP2 model wrapping for the VeOmni backend.
-
-Calls VeOmni's *inner* ``parallelize_model_fsdp2`` directly — the outer
-``build_parallelize_model`` would first upcast the model to fp32 master
-weights (``model.float()``), apply HF-API gradient checkpointing, and a
-vestigial TP path; bypassing it keeps bf16 master weights and the same
-memory/numerics regime as ``unirl.train.backend.fsdp.wrap.fsdp_wrap``
-(which force-casts to bf16), so the two backends are A/B-comparable.
-
-Differences vs the fsdp wrap (by VeOmni design, accepted for v1):
-* the model root IS ``fully_shard``-ed (root auto-no-reshard) — fine for
-  single-module trainables; composites (WAN22/HI3) are out of scope.
-* requires the model on the meta device (`init_device="meta"` is asserted
-  by VeOmni); materialization happens inside the call (``to_empty`` + the
-  model's ``init_weights``, which the bundle stamps to a no-op — real
-  weights load afterwards in ``backend.py``).
-
-Runs in the backend constructor after structural injection
-(``unirl.train.lora`` / ``unirl.train.ema``) and before the weight load.
-"""
+"""VeOmni FSDP2 model wrapping for the VeOmni backend."""
 
 from __future__ import annotations
 
@@ -42,19 +23,7 @@ def veomni_parallelize(
     activation_checkpointing: bool = False,
     use_torch_compile: bool = False,
 ) -> None:
-    """Parallelize ``model`` (on meta) in place via VeOmni FSDP2.
-
-    ``block_class_names`` feeds VeOmni's ``basic_modules`` (its per-module
-    ``fully_shard`` targets, unioned with the model's ``_no_split_modules``).
-
-    ``master_dtype`` (e.g. ``"fp32"``) keeps the sharded master weights + optimizer
-    states at that dtype while ``MixedPrecisionPolicy(param_dtype)`` still casts the
-    all-gathered compute copy to ``param_dtype`` (bf16) — the standard "fp32 master +
-    bf16 compute" recipe. Essential for full-finetune RL with tiny gradients (e.g.
-    DRPO/GRPO grad-norm ~1e-2): a bf16 master rounds those updates to zero. ``None``
-    (default) follows ``param_dtype`` for the master (the prior all-bf16 behavior;
-    fine for LoRA, where the trainable adapter update scale is large).
-    """
+    """Parallelize ``model`` (on meta) in place via VeOmni FSDP2."""
     from unirl.train.backend.veomni import _compat
 
     _compat.ensure_installed()
@@ -128,15 +97,7 @@ def veomni_parallelize(
 
 
 def _attach_extra_parallel_param_groups(model: nn.Module) -> None:
-    """Classify params into extra-parallel (EP) vs non-EP groups and cache them on
-    the model as ``_extra_parallel_param_groups`` (the contract the VeOmni
-    EP-aware grad-clip / optimizer helpers read).
-
-    A param belongs to extra-parallel ``para`` iff it is a DTensor whose device
-    mesh carries a ``{para}_fsdp`` dim — exactly VeOmni's own test in
-    ``veomni/optim/optimizer.py``. No-op (leaves no attribute) when no extra
-    parallel is enabled, so the non-EP clip path is preserved verbatim.
-    """
+    """Classify params into EP vs non-EP groups and cache them as ``_extra_parallel_param_groups`` on the model."""
     from unirl.train.backend.veomni import _compat
 
     _compat.ensure_installed()

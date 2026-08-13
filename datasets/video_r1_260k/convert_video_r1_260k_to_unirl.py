@@ -1,24 +1,4 @@
-"""Convert Video-R1-260k image/video multiple-choice rows to UniRL JSONL.
-
-Media paths are resolved under ``--data-root`` and stored as absolute
-``media_refs[].uri`` values. Unzip each source archive before conversion::
-
-    ROOT=/path/to/Video-R1-data
-    for d in CLEVRER STAR NeXT-QA PerceptionTest LLaVA-Video-178K \
-             Chart General Knowledge Math OCR Spatial; do
-      for z in "$ROOT/$d"/*_part*.zip; do [ -f "$z" ] && unzip -o -q "$z" -d "$ROOT/$d"; done
-    done
-
-Select ``image``, ``video``, or both with ``--modality``. Missing media is
-skipped unless ``--keep-missing`` is set. Example::
-
-    python datasets/video_r1_260k/convert_video_r1_260k_to_unirl.py \
-        --data-root /path/to/Video-R1-data \
-        --out-dir datasets/video_r1_260k_image \
-        --modality image \
-        --sources Chart,General,Knowledge,Math,OCR,Spatial \
-        --val-count 1000
-"""
+"""Convert Video-R1-260k image/video multiple-choice rows to UniRL JSONL."""
 
 from __future__ import annotations
 

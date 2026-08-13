@@ -1,9 +1,4 @@
-"""Async autoregressive RL over separate train and rollout GPU slabs.
-
-The trainer owns optimizer progress and publication cadence. The driver-side
-``RolloutManager`` owns bounded dispatch, grouping, filtering, and published
-rollout state.
-"""
+"""Async autoregressive RL over separate train and rollout GPU slabs."""
 
 import inspect
 import time
@@ -169,14 +164,7 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
             raise RuntimeError("AsyncARTrainer cannot offload its disjoint training slab during rollout")
 
     def _connect_separate(self, sync_cfg: DictConfig) -> None:
-        """One-time cross-slab handshake (NCCL branch of diffusion.py:191-208).
-
-        Rank 0 picks a rendezvous addr/port, is handed the rollout slab's Worker
-        actor handles, then ``connect`` fires each rollout worker's
-        ``init_weights_update_group`` non-blocking and joins the broadcast group
-        itself. Only ``NCCLWeightSync`` is supported here (always cross-slab
-        full-weight); a non-NCCL target is a config error.
-        """
+        """One-time cross-slab handshake (NCCL branch of diffusion.py:191-208)."""
         target = str(sync_cfg.get("_target_", ""))
         if not target.endswith("NCCLWeightSync"):
             raise ValueError(

@@ -1,23 +1,4 @@
-"""SD3 diffusion: typed params + per-step kernel + rollout-level stage.
-
-Three classes:
-
-- ``SD3DiffusionParams`` — typed request-shape knobs (steps / guidance /
-  size / seed / sde_indices / eta / init_same_noise / samples_per_prompt /
-  noise_group_ids / max_sequence_length).
-- ``SD3DiffusionStep`` — stateless per-step kernel. ``step`` /
-  ``step_with_logp`` take the model + conditions + strategy and run both
-  CFG noise prediction and the SDE transition (via
-  ``StepStrategy.denoise``). ``forward`` is a lower-level helper that
-  takes a precomputed ``noise_pred``.
-- ``SD3DiffusionStage`` — implements ``DiffusionStage[SD3Conditions]``.
-  Owns the SDE ``strategy`` and the loop bookkeeping; delegates the
-  per-step model+SDE work to the kernel. Also exposes ``replay`` for
-  single-step log-prob replay during training.
-
-CFG math copied from ``samplers/fsdp/sd3_sampler.py:158-207`` (do NOT
-import legacy code).
-"""
+"""SD3 diffusion: typed params + per-step kernel + rollout-level stage."""
 
 from __future__ import annotations
 
@@ -40,13 +21,7 @@ from .conditions import SD3Conditions
 
 
 class SD3DiffusionStep(DiffusionStep[SD3Bundle, SD3Conditions]):
-    """Per-step SD3 denoising kernel — stateless.
-
-    ``step`` / ``step_with_logp`` take the model + conditions + an SDE
-    ``strategy`` per call, run CFG noise prediction internally, then
-    apply the transition via ``strategy.denoise``. ``forward`` is the
-    lower-level escape hatch that takes a precomputed ``noise_pred``.
-    """
+    """Per-step SD3 denoising kernel — stateless."""
 
     def predict_noise(
         self,
@@ -57,14 +32,7 @@ class SD3DiffusionStep(DiffusionStep[SD3Bundle, SD3Conditions]):
         *,
         guidance_scale: float,
     ) -> torch.Tensor:
-        """Run SD3 transformer with CFG batched ``[uncond, cond]`` forward.
-
-        Reads ``conditions.text.embeds`` / ``.pooled`` for the conditional
-        branch. For ``guidance_scale > 1`` reads
-        ``conditions.negative_text.embeds`` / ``.pooled`` for the
-        unconditional branch; falls back to zero embeddings if
-        ``negative_text`` is ``None``.
-        """
+        """Run SD3 transformer with CFG batched ``[uncond, cond]`` forward."""
         if conditions.text is None:
             raise ValueError("SD3DiffusionStep.predict_noise: conditions.text is None")
         text = conditions.text
@@ -139,13 +107,7 @@ class SD3DiffusionStep(DiffusionStep[SD3Bundle, SD3Conditions]):
         eta: float = 1.0,
         step_index: int = 0,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """Run one SDE transition given a precomputed ``noise_pred``.
-
-        Returns ``(prev_sample, log_prob, prev_sample_mean)``.
-        ``prev_sample=None`` means sampling mode; otherwise log-prob
-        replay. ``log_prob`` and ``prev_sample_mean`` are ``None`` for
-        deterministic steps (``eta=0`` or DPM2-style ODE).
-        """
+        """Run one SDE transition given a precomputed ``noise_pred``."""
         return strategy.denoise(
             noise_pred=noise_pred,
             sample=sample,
@@ -172,10 +134,7 @@ class SD3DiffusionStep(DiffusionStep[SD3Bundle, SD3Conditions]):
         eta: float = 1.0,
         step_index: int = 0,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """Run model forward + SDE transition. End-to-end one diffusion step.
-
-        Returns ``(prev_sample, log_prob, prev_sample_mean)``.
-        """
+        """Run model forward + SDE transition. End-to-end one diffusion step."""
         noise_pred = self.predict_noise(model, sample, sigma, conditions, guidance_scale=guidance_scale)
         return self.forward(
             strategy=strategy,
@@ -204,11 +163,7 @@ class SD3DiffusionStep(DiffusionStep[SD3Bundle, SD3Conditions]):
         eta: float = 1.0,
         step_index: int = 0,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """Run model forward + SDE transition.
-
-        Returns ``(prev_sample, log_prob, prev_sample_mean)``. ``log_prob``
-        and ``prev_sample_mean`` are ``None`` for deterministic strategies.
-        """
+        """Run model forward + SDE transition."""
         return self.step(
             model,
             conditions,
@@ -225,29 +180,7 @@ class SD3DiffusionStep(DiffusionStep[SD3Bundle, SD3Conditions]):
 
 
 class SD3DiffusionStage(BatchedStepReplayMixin, DiffusionStage[SD3Conditions]):
-    """SD3 rollout-level diffusion stage.
-
-    Owns the SDE ``strategy`` (stateful strategies like ``DPM2Strategy``
-    require a stable instance across the loop), the bundle, the kernel,
-    and the precision policy. The kernel is stateless and is invoked
-    per-step with the strategy passed in.
-
-    ``diffuse(conditions, *, schedule, params)`` runs the full sampling
-    loop and returns a ``LatentSegment`` carrying the trajectory plus
-    per-SDE log probs (``sde_logp [N, S]`` + ``sde_indices [S]``).
-
-    ``replay(conditions, *, segment, params, step_indices=None)``
-    recomputes log-probs for the SDE transitions in a stored
-    ``LatentSegment``. Returns a :class:`ReplayResult` with ``log_probs``
-    of shape ``[B, S']`` aligned with ``segment.sde_logp`` (or a slice
-    when ``step_indices`` selects a subset) and ``prev_sample_means``
-    for KL-penalty consumption. Used by GRPO-style training.
-
-    ``_no_split_modules`` is the model-side fallback used by FSDPPolicy
-    when HF auto-discovery (`type(trainable_root).__mro__._no_split_modules`)
-    yields nothing — diffusers' ``SD3Transformer2DModel`` doesn't
-    follow the HF transformers convention, so we declare it here.
-    """
+    """SD3 rollout-level diffusion stage."""
 
     _no_split_modules: ClassVar[Tuple[str, ...]] = ("JointTransformerBlock",)
 
@@ -282,16 +215,7 @@ class SD3DiffusionStage(BatchedStepReplayMixin, DiffusionStage[SD3Conditions]):
         params: DiffusionSamplingParams,
         initial_latents: Optional[torch.Tensor] = None,
     ) -> LatentSegment:
-        """Run full SD3 sampling. Returns a ``LatentSegment``.
-
-        ``initial_latents`` (optional) — the per-sample x_T tensor resolved from
-        the request ``Sample``'s diffusion generation Part. When
-        provided, used verbatim and the internal ``generate_latents`` RNG
-        path is bypassed (driver owns reproducibility / group-sharing /
-        cross-rollout variation). When ``None``, the legacy internal path
-        runs with ``params.seed``-keyed Gaussian noise (used by tests and
-        by engines that don't pre-ship noise).
-        """
+        """Run full SD3 sampling. Returns a ``LatentSegment``."""
         from unirl.sde.noise import generate_latents
 
         if conditions.text is None or conditions.text.embeds is None:
@@ -401,19 +325,7 @@ class SD3DiffusionStage(BatchedStepReplayMixin, DiffusionStage[SD3Conditions]):
         params: DiffusionSamplingParams,
         step_indices: Optional[List[int]] = None,
     ) -> ReplayResult:
-        """Segment-based log-prob replay over the rollout's SDE transitions.
-
-        Loops the per-step replay primitive (``step.step_with_logp`` with
-        ``prev_sample`` set) over the segment's SDE indices (or the
-        ``step_indices`` subset, which must be a subset of
-        ``segment.sde_indices``). Returns a :class:`ReplayResult` with
-        ``log_probs`` shape ``[B, len(target)]`` (cast to
-        ``logprob_precision``) and ``prev_sample_means`` shape
-        ``[B, len(target), C, H, W]`` for KL penalty.
-
-        Caller is responsible for ``.train()`` mode + grad scope; this
-        method only manages the autocast scope.
-        """
+        """Log-prob replay: ``log_probs [B, len(target)]``, ``prev_sample_means [B, len(target), C, H, W]``."""
         if segment.sde_indices is None or segment.latents is None:
             raise ValueError("SD3DiffusionStage.replay: segment.sde_indices / latents missing")
         if segment.sigmas is None:
@@ -510,12 +422,7 @@ class SD3DiffusionStage(BatchedStepReplayMixin, DiffusionStage[SD3Conditions]):
         sigma: torch.Tensor,
         params: DiffusionSamplingParams,
     ) -> torch.Tensor:
-        """Single ``(xt, sigma)`` model forward — no scheduler iteration.
-
-        Delegates to ``SD3DiffusionStep.predict_noise`` (the same kernel
-        both ``diffuse`` and ``replay`` call internally), so CFG batching
-        + guidance scale handling stay identical to the sampling path.
-        """
+        """Single ``(xt, sigma)`` model forward — no scheduler iteration."""
         return self.step.predict_noise(
             self.model,
             sample,
@@ -525,12 +432,7 @@ class SD3DiffusionStage(BatchedStepReplayMixin, DiffusionStage[SD3Conditions]):
         )
 
     def trainable_module(self) -> "torch.nn.Module":
-        """Return the module the diffusion forward operates on.
-
-        For SD3, that's the bundle's transformer (``SD3Transformer2DModel``)
-        — the FSDP wrap target. Aux modules (VAE, text encoders) are
-        siblings on the bundle, never under the transformer.
-        """
+        """Return the module the diffusion forward operates on."""
         return self.model.transformer
 
 

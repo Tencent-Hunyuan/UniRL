@@ -8,25 +8,14 @@ LoraModuleSelection = Union[str, Tuple[str, ...]]
 
 @dataclass
 class FrozenAdapterSpec:
-    """A frozen, inference-only LoRA adapter loaded at build time.
-
-    ``name`` is the peft adapter name (algorithms address it by this name,
-    e.g. DiffusionOPD teachers); ``path`` is a local peft checkpoint dir or an
-    HF repo id (``org/repo`` / ``org/repo/subfolder``). Geometry (rank / alpha /
-    target_modules) comes from the checkpoint's own ``adapter_config.json``.
-    """
+    """A frozen, inference-only LoRA adapter loaded at build time."""
 
     name: str = ""
     path: str = ""
 
 
 def normalize_frozen_adapters(specs: Any) -> List[FrozenAdapterSpec]:
-    """Validate ``LoraConfig.frozen_adapters`` entries into typed specs.
-
-    Accepts ``None`` (→ ``[]``) or a sequence of ``FrozenAdapterSpec`` /
-    mappings / attribute objects carrying ``name`` + ``path``. Names must be
-    non-empty, unique, and must not shadow the trainable ``"default"`` adapter.
-    """
+    """Validate ``LoraConfig.frozen_adapters`` entries into typed specs."""
     if not specs:
         return []
     normalized: List[FrozenAdapterSpec] = []

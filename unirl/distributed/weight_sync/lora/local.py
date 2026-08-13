@@ -1,15 +1,4 @@
-"""Colocate LoRA weight-sync: push the trained adapter into a same-Worker sibling
-engine, in-process.
-
-Constructed inside the trainer's ``placement(...)`` block with the ``backend`` and
-``rollout`` siblings; they arrive as the LOCAL ``Remote`` instances (``HandleRef``
-resolved by ``Worker.add_remote``), so method calls run in-process on this Worker.
-The engine owns the Worker→Omni-subprocess transfer (serialize + ``collective_rpc``),
-so there is no separate ZMQ pump and no sender/receiver overlap to orchestrate.
-
-This deliberately does NOT reuse the full-weight handler family (``full/``): for
-LoRA the engine's in-process ``set_lora_from_tensors`` already owns the transfer.
-"""
+"""Colocate LoRA weight-sync: push the trained adapter into a same-Worker sibling engine, in-process."""
 
 from __future__ import annotations
 
@@ -23,12 +12,7 @@ logger = logging.getLogger(__name__)
 
 
 class LocalLoraWeightSync(LoraWeightSyncBase):
-    """Push one track's trained FSDP LoRA adapter into a co-located rollout engine.
-
-    ``rollout`` is the same-Worker sibling engine for the ``sync()`` push and is
-    REQUIRED. (Cross-process engines that are not siblings are handled by
-    :class:`~unirl.distributed.weight_sync.lora.remote.RemoteLoraWeightSync`.)
-    """
+    """Push one track's trained FSDP LoRA adapter into a co-located rollout engine."""
 
     def __init__(
         self,
@@ -51,13 +35,7 @@ class LocalLoraWeightSync(LoraWeightSyncBase):
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def sync(self) -> None:
-        """Extract LoRA from the local FSDP model and load it into the engine.
-
-        Runs on every Worker (``BROADCAST``); the extract is a train-mesh
-        collective that lines up because every rank runs together. The engine must
-        be awake (the caller wakes it before ``sync``); ``set_lora_from_tensors``
-        drops any existing adapter and loads the new one on every stage's workers.
-        """
+        """Extract LoRA from the local FSDP model and load it into the engine."""
         lora_tensors, peft_config = self._extract()
         self._rollout.set_lora_from_tensors(self._adapter_name, lora_tensors, peft_config=peft_config)
         rank = self.rank_info.rank if self.rank_info is not None else 0

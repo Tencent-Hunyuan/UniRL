@@ -1,19 +1,4 @@
-"""Shared sharded-weight loader for the FSDP and VeOmni backends.
-
-Both backends materialize a meta-built, FSDP2-sharded trainable module and
-broadcast real weights into it from rank 0.  The mechanics are identical — the
-only backend difference is *timing*: VeOmni's ``parallelize`` already
-``to_empty``-materializes the module before this runs, while FSDP's wrap leaves
-it on meta.  :func:`_load_state_dict_sharded`'s meta-gate absorbs that
-difference (it ``to_empty``s only if params are still on meta), so the same
-loader is correct on both.
-
-This module imports ``torch`` / ``safetensors`` at module level and MUST stay
-out of the ``veomni`` package's import graph — it is imported only from inside
-``backend.py`` — so the selective-import audit (``tests/test_compat_import.py``)
-and the torch-free package-import check (``tests/test_recipe_compose.py``) stay
-green.
-"""
+"""Shared sharded-weight loader for the FSDP and VeOmni backends."""
 
 from __future__ import annotations
 
@@ -48,22 +33,7 @@ def load_trainable_weights(
     with_aux: tuple[str, ...] = (),
     eager_ok: bool,
 ) -> None:
-    """Resolve a bundle's trainable-weight source and load it post-wrap.
-
-    Both backends call this immediately after wrapping the trainable module.
-    Dispatch order:
-
-    1. ``bundle._transformer_weights_path`` (meta-init "Pattern B"): load the
-       stashed safetensors dir into the wrapped module via :func:`load_sharded`
-       (its meta-gate ``to_empty``-materializes the still-meta FSDP module, then
-       broadcasts).
-    2. ``bundle.materialize(device, with_aux)`` (self-contained "Pattern A",
-       e.g. hunyuan_image3): the bundle materializes itself.
-    3. otherwise the bundle is eager — weights are already present. Tolerated
-       when ``eager_ok`` (FSDP's wrap shards in place, leaving them intact); an
-       error otherwise (VeOmni's ``parallelize`` already ``to_empty``'d the
-       module, so eager weights would have been clobbered).
-    """
+    """Resolve a bundle's trainable-weight source and load it post-wrap."""
     weights_path = getattr(bundle, "_transformer_weights_path", None)
     if weights_path is not None:
         load_sharded(model, weights_path, device=device, strict=False)
@@ -114,14 +84,7 @@ def load_sharded(
     device: torch.device,
     strict: bool = False,
 ) -> None:
-    """Materialize ``module`` from a (diffusers-layout) safetensors directory.
-
-    Rank 0 reads every ``*.safetensors`` shard under ``weights_dir``; the
-    weights are broadcast into the sharded module.  See
-    :func:`_load_state_dict_sharded` for the per-rank mechanics.  This is the
-    common path for single-module trainables whose weights live in a dedicated
-    directory (diffusion ``<ckpt>/transformer``, AR ``<ckpt>`` root).
-    """
+    """Materialize ``module`` from a (diffusers-layout) safetensors directory."""
     if hasattr(module, "_extra_parallel_param_groups"):
         if _module_has_meta_param(module):
             module.to_empty(device=device)
@@ -133,12 +96,7 @@ def load_sharded(
 
 
 def _ep_shard_dims_from_plan(module: nn.Module) -> Dict[str, int]:
-    """Resolve each EP parameter's pre-sliced axis from VeOmni's parallel plan.
-
-    VeOmni records the plan after wildcard resolution in ``_fqn2spec_info``.
-    The ``get_parallel_plan`` fallback keeps this usable with older releases
-    that expose only the original pattern map.
-    """
+    """Resolve each EP parameter's pre-sliced axis from VeOmni's parallel plan."""
     named_ep = dict(ep_named_parameters(module))
     if not named_ep:
         return {}
@@ -237,31 +195,7 @@ def _load_state_dict_ep_sliced(
     device: torch.device,
     strict: bool = False,
 ) -> None:
-    """Memory-optimal EP weight load: each rank reads ONLY its expert block.
-
-    The EP plan pre-slices each expert param along its declared ``Shard(dim)``
-    (dim 0 / the expert axis for Qwen3-MoE), so the DTensor's GLOBAL shape is
-    already ``[E/ep, …]``: the ``ep`` split is baked in per rank, NOT a DTensor
-    placement. The checkpoint stores the full ``[E, …]``. Instead of
-    materializing the full tensor on every rank (8x host
-    RAM) or broadcasting it from rank 0 (rank-0 full-RAM bottleneck), we
-    ``safetensors.get_slice`` the file (mmap, lazy) and index **only this ep
-    rank's contiguous ``[E/ep, …]`` byte range** — no rank ever holds the full
-    ``[E, …]`` and there is no cross-rank broadcast. ``distribute_tensor`` then
-    shards that block across the remaining ``ep_fsdp`` FSDP dim. Non-expert params
-    (global == checkpoint shape) are read whole (they are small: embed / norm /
-    lm_head) and distributed over their own mesh.
-
-    Strictly dominates the full-read and rank-0-broadcast variants on peak host
-    RAM (``E/ep`` vs full) and avoids broadcast traffic; the per-rank reads run in
-    parallel off the shared file (shared mmap page cache on one node).
-
-    Checkpoint formats: both VeOmni **stacked** (``experts.gate_up_proj`` /
-    ``down_proj``) and HF **original per-expert** (``experts.{e}.gate_proj`` /
-    ``up_proj`` / ``down_proj``) are accepted — the latter is reconstructed per
-    rank via :func:`build_local_fused_block` (VeOmni's converter mapping),
-    so real Qwen3-MoE HF checkpoints load directly with no offline merge.
-    """
+    """Memory-optimal EP weight load: each rank reads ONLY its expert block."""
     import glob
 
     from safetensors import safe_open
@@ -366,20 +300,7 @@ def _load_state_dict_sharded(
     device: torch.device,
     strict: bool = False,
 ) -> None:
-    """Allocate storage for any meta params, then broadcast-load ``state_dict``.
-
-    ``state_dict`` is the rank-0 full state dict (empty ``{}`` on other ranks).
-    Steps:
-
-    1. ``to_empty(device)`` any submodule still on meta — gated, so it is a
-       no-op when the wrap already materialized the module (VeOmni's
-       ``parallelize``) and the allocator that the FSDP-meta path needs when it
-       did not.
-    2. rank 0: apply checkpoint-key compatibility rewrites (Qwen MoE
-       per-expert -> packed parameters, LoRA ``base_layer`` hops).
-    3. ``set_model_state_dict(..., broadcast_from_rank0=True, strict=strict)``
-       — DTensor-aware; handles FSDP2 shards + plain params in one collective.
-    """
+    """Allocate storage for any meta params, then broadcast-load ``state_dict``."""
     from torch.distributed.checkpoint.state_dict import set_model_state_dict
 
     if _module_has_meta_param(module):
@@ -404,16 +325,12 @@ def _load_state_dict_sharded(
 
 
 def _module_has_meta_param(module: nn.Module) -> bool:
-    """True if any parameter of ``module`` (recursing into children) is on the
-    meta device.  Used to gate the per-shard ``to_empty`` call."""
+    """True if any parameter of ``module`` (recursing into children) is on the"""
     return any(p.is_meta for p in module.parameters(recurse=True))
 
 
 def _read_safetensors_dir(weights_dir: str) -> StateDict:
-    """Merge all ``*.safetensors`` shards in a directory.
-
-    Loading every shard makes the index json unnecessary and covers both
-    single-file and sharded checkpoints."""
+    """Merge all ``*.safetensors`` shards in a directory."""
     from safetensors.torch import load_file
 
     if not os.path.isdir(weights_dir):
@@ -510,12 +427,7 @@ def _qwen_moe_num_experts(model: nn.Module) -> int:
 
 
 def _pack_qwen_moe_expert_keys(state_dict: StateDict, model: nn.Module) -> StateDict:
-    """Convert a complete split Qwen-MoE checkpoint to packed model keys.
-
-    HF ``from_pretrained`` performs this rewrite through ``WeightConverter``;
-    meta-init bypasses that pipeline, so the generic sharded loader performs
-    the same conversion before ``set_model_state_dict``.
-    """
+    """Convert a complete split Qwen-MoE checkpoint to packed model keys."""
     config = getattr(model, "config", None)
     model_type = getattr(config, "model_type", None)
     if model_type not in _PACKED_QWEN_MOE_MODEL_TYPES:
@@ -585,14 +497,7 @@ def _pack_qwen_moe_expert_keys(state_dict: StateDict, model: nn.Module) -> State
 
 
 def _remap_hf_checkpoint_keys(state_dict: StateDict, model: nn.Module) -> StateDict:
-    """Rewrite stale HF checkpoint keys to the constructed model's naming.
-
-    ``from_pretrained`` renames checkpoint keys on load (e.g. transformers 5.x
-    moved a VLM's language model under ``model.language_model.*``); this
-    direct-safetensors path must replay the same ``WeightRenaming`` rules, or
-    ``strict=False`` silently drops every stale key and the module keeps its
-    uninitialized ``to_empty()`` values. No-op when the keys already match.
-    """
+    """Rewrite stale HF checkpoint keys to the constructed model's naming."""
     try:
         from accelerate import init_empty_weights
         from transformers import PreTrainedModel
@@ -653,12 +558,7 @@ def _remap_hf_checkpoint_keys(state_dict: StateDict, model: nn.Module) -> StateD
 
 
 def _assert_state_dict_covers_model(state_dict: StateDict, model: nn.Module) -> None:
-    """Raise if the checkpoint matches almost none of the model's parameters.
-
-    ``strict=False`` would silently drop them all and train on ``to_empty()``
-    garbage. Buffers and tied params are legitimately absent, hence the low
-    25% bar — this only trips on a wholesale key mismatch.
-    """
+    """Raise if the checkpoint matches almost none of the model's parameters."""
     params = {_canonical_param_name(n) for n, _ in getattr(model, "module", model).named_parameters()}
     matched = sum(k in params for k in state_dict)
     if params and matched < 0.25 * len(params):
@@ -671,13 +571,7 @@ def _assert_state_dict_covers_model(state_dict: StateDict, model: nn.Module) -> 
 
 
 def _remap_lora_base_keys(state_dict: StateDict, model: nn.Module) -> StateDict:
-    """Translate base-checkpoint keys for LoRA-injected modules.
-
-    ``peft.inject_adapter_in_model`` (via ``unirl.train.lora`` /
-    ``unirl.train.ema``) rewires target Linears in place, so their original
-    weight moves to ``<module>.base_layer.weight``.  The base checkpoint still
-    uses the original key — insert the ``base_layer`` hop where (and only
-    where) the model expects it."""
+    """Translate base-checkpoint keys for LoRA-injected modules."""
     model_keys = {_canonical_param_name(n) for n, _ in model.named_parameters()}
     model_keys.update(_canonical_param_name(n) for n, _ in model.named_buffers())
     remapped: StateDict = {}

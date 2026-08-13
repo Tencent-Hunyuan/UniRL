@@ -1,22 +1,4 @@
-"""t2i — text-to-image diffusion.
-
-Reads ``primitives["text"]: Texts`` plus ``stage_params["diffusion"]:
-dict``. Builds the unified-MM input tensors via
-``HunyuanImage3TextEmbedStage.embed_for_gen_image``, runs the diffusion
-stage in ``mode="gen_image"``, and decodes the final latent to pixels.
-
-``negative_text`` is rejected: the HI3 tokenizer never consumes
-negative-prompt text — CFG is derived from ``guidance_scale > 1.0`` and
-the unconditional branch is built internally from ``<cfg>`` tokens.
-
-The ``bot_task`` knob (``stage_params["bot_task"]``) is a chat-template
-flag: ``"think"`` / ``"recaption"`` / ``"think_recaption"`` insert static
-reasoning-mode markers, ``"image"`` inserts none. ``"image"`` alone is not
-vllm-omni's ``t2i_vanilla`` preset, which also pins ``sys_type`` and
-``sequence_template``; all three come from the root Part's ``control``.
-None of them starts an AR pass -- t2i is a single diffusion stage and the
-prefix lives in ``input_ids`` only (see vllm-omni ``prompt_utils.py:23-31``).
-"""
+"""t2i — text-to-image diffusion."""
 
 from __future__ import annotations
 

@@ -1,8 +1,4 @@
-"""RankInfo and Remote — logical worker base classes.
-
-RankInfo holds parallelism rank information (DP/TP/PP/SP/EP).
-Remote is the base class users inherit to define worker logic.
-"""
+"""RankInfo and Remote — logical worker base classes."""
 
 from __future__ import annotations
 
@@ -20,10 +16,7 @@ if TYPE_CHECKING:
 
 @dataclass
 class RankInfo:
-    """Parallelism rank information for a logical worker.
-
-    Set by RoleHandle when registering the remote on a Worker.
-    """
+    """Parallelism rank information for a logical worker."""
 
     rank: int = 0
     world_size: int = 1
@@ -62,17 +55,7 @@ class RankInfo:
 
 
 class Remote:
-    """Base class for logical workers. Users inherit this.
-
-    A Remote runs inside a Worker (physical Ray actor).
-    Multiple Remotes can share the same Worker (colocated).
-
-    Attributes set by Worker.add_remote():
-        transport: TensorTransport (owned by the Worker)
-        device:    GPU device string (e.g. "cuda:0")
-        rank_info: RankInfo for this worker group
-        dist_env:  Group-level dist env vars (MASTER_ADDR, MASTER_PORT, etc.)
-    """
+    """Base class for logical workers. Users inherit this."""
 
     def __init__(self) -> None:
         self.transport: Optional[TensorTransport] = None
@@ -91,10 +74,7 @@ class Remote:
         dist_env: Optional[Dict[str, str]] = None,
         get_sibling=None,
     ) -> None:
-        """Inject dependencies. Called by Worker.add_remote().
-
-        Writes dist_env to os.environ once for convenience (env:// init_method).
-        """
+        """Inject dependencies. Called by Worker.add_remote()."""
         self.transport = transport
         self.device = device
         self.rank_info = rank_info
@@ -110,12 +90,7 @@ class Remote:
         return self._get_sibling(name)
 
     def initialize(self, *args, **kwargs) -> None:
-        """User-facing init hook. Override to load models, create sub-PG, etc.
-
-        Called explicitly by user via wg.initialize(*args, **kwargs).
-        At this point self.transport, self.device, self.rank_info, self.dist_env
-        are all available, and dist_env is already in os.environ.
-        """
+        """User-facing init hook. Override to load models, create sub-PG, etc."""
         pass
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
@@ -125,35 +100,7 @@ class Remote:
         out_grads: tuple,
         in_grads: tuple,
     ) -> tuple:
-        """Framework backward RPC, dispatched with DP_SCATTER by _run_auto_backward.
-
-        dispatch_mode = DP_SCATTER is intentional and covers all currently supported
-        forward dispatch modes:
-
-          DP_SCATTER      forward → DP_SCATTER backward  (grad shards align with output shards)
-          DP_SCATTER_HEAD forward → DP_SCATTER backward  (all ranks must participate in backward,
-                                                          not just the DP head ranks)
-
-        !! IMPORTANT — adding a new forward dispatch_mode !!
-        If you add a new Dispatch variant, check resolve_backward_dispatch_mode() in
-        dispatch.py to decide whether DP_SCATTER backward is still correct, or
-        whether _auto_backward needs a new dispatch variant / a hard error.
-
-        Args:
-            call_id:   Matches the key in _grad_inputs/_grad_outputs.
-            out_grads: tuple[Optional[Tensor], ...] — external grad for each
-                       saved output tensor.  None means no gradient.
-                       Elements are split element-wise by pytree_chunk (tuple
-                       semantics), so each worker receives its own shard.
-            in_grads:  tuple[Optional[Tensor], ...] — existing accumulated grad
-                       for each saved input tensor (fan-out accumulation support).
-                       Assigned to tensor.grad before backward so PyTorch +=.
-
-        Returns:
-            tuple[Optional[Tensor], ...] — new .grad for each saved input tensor.
-            None at position i means input i has no gradient.
-            Elements are merged element-wise by pytree_cat across workers.
-        """
+        """Framework backward RPC, dispatched with DP_SCATTER by _run_auto_backward."""
         saved_out: List[torch.Tensor] = self._grad_outputs.pop(call_id, [])
         saved_in: List[torch.Tensor] = self._grad_inputs.pop(call_id, [])
 
@@ -174,12 +121,7 @@ class Remote:
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def _cleanup_all_grads(self) -> None:
-        """Discard ALL saved grad tensors on this worker.
-
-        Called on every remote in the context when the GradContext exits (whether
-        normally or via exception), ensuring no stale _grad_inputs/_grad_outputs
-        linger in worker memory across training steps.
-        """
+        """Discard ALL saved grad tensors on this worker."""
         self._grad_inputs.clear()
         self._grad_outputs.clear()
 
@@ -191,12 +133,7 @@ class Remote:
         empty_cache: bool = False,
         dump_snapshot_tag: Optional[str] = None,
     ) -> Dict[str, float]:
-        """Worker-side memory probe reached by the CUDA-less driver via BROADCAST.
-
-        Reads always happen BEFORE any reset so peaks survive; optional chores
-        (log line, empty_cache, peak reset, snapshot dump) are bundled so a
-        hand-off costs one RPC. See ``utils.memory_monitor`` for orchestration.
-        """
+        """Worker-side memory probe reached by the CUDA-less driver via BROADCAST."""
         if not torch.cuda.is_available():
             return {}
         from unirl.utils.memory_utils import (

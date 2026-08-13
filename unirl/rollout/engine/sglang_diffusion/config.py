@@ -1,16 +1,4 @@
-"""``sglang_diffusion`` engine config — wired by ``_target_``; the rollout actor
-constructs the engine via :meth:`SGLangDiffusionEngineConfig.make_engine`.
-
-Ported from the legacy ``SGLangEngineConfig`` minus all port/placement math: the
-engine reserves its own :class:`SGLangDiffusionPorts` at boot, so there is no
-``with_sglang_ports`` / ``_SGLANG_PORT_*`` here. ``port`` / ``scheduler_port`` survive
-only for remote mode (``local_mode=False``). ``model_family`` is validated against
-the live adapter registry rather than a hardcoded tuple.
-
-``server_intent`` (the successor of the legacy ``build_server_kwargs``) spells this
-config + the model config + the reserved ports as the SGLang ServerArgs intent
-dict; the backend filters it against the real ServerArgs fields and spawns.
-"""
+"""``sglang_diffusion`` engine config — wired by ``_target_``; the rollout actor"""
 
 from __future__ import annotations
 
@@ -27,16 +15,7 @@ from unirl.rollout.engine.ports import ReservedPorts
 
 @dataclass(frozen=True)
 class SGLangDiffusionPorts(ReservedPorts):
-    """The ports one local-mode ``DiffGenerator`` spawn consumes.
-
-    - ``server_port`` — HTTP/server bind (``ServerArgs.port``). Unbound in local
-      mode (``launch_http_server=False``), but injecting it keeps ServerArgs'
-      ``settle_port`` from wandering and mirrors remote mode.
-    - ``scheduler_port`` — the scheduler's zmq REP bind; the client connects here.
-    - ``master_port`` — ``ServerArgs.master_port``: the spawned workers' dist init
-      (``tcp://127.0.0.1:{master_port}``). Left unset, upstream self-settles to a
-      random scanned port; injecting a reserved one keeps colocated siblings apart.
-    """
+    """The ports one local-mode ``DiffGenerator`` spawn consumes."""
 
     server_port: int
     scheduler_port: int
@@ -124,17 +103,7 @@ class SGLangDiffusionEngineConfig(BaseEngineConfig):
         ports: Optional[SGLangDiffusionPorts],
         extra: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Spell this config (+ model config + reserved ports) as ServerArgs intent.
-
-        Unfiltered: the backend filters against the real ServerArgs fields and
-        spawns. Precedence (low → high): ``engine_kwargs`` escape-hatch < typed
-        cfg/model fields < adapter ``extra`` < the reserved ports. In local mode
-        the set supplies ``port`` / ``scheduler_port`` / ``master_port`` (all real
-        ServerArgs fields — ``master_port`` is the spawned workers' dist init,
-        which otherwise self-settles to a random scanned port); in remote mode
-        (``ports is None``) they come from ``host`` / ``port`` / ``scheduler_port``
-        on this config.
-        """
+        """Spell this config (+ model config + reserved ports) as ServerArgs intent."""
         intent: Dict[str, Any] = {}
 
         intent.update(self.engine_kwargs or {})

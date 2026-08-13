@@ -1,12 +1,4 @@
-"""Stage-driven ``GRPO`` over a ``TextSegment``.
-
-Implements :class:`StageAlgorithm` and shares the module-level
-``_grpo_clip_loss`` / ``_resolve_clip_range_from_schedule`` helpers (in
-:mod:`unirl.algorithms.base`) with :class:`FlowGRPO` so their loss
-math stays identical. The teacher-forced forward and per-token log-prob
-recompute are owned by ``stage.replay(...)``; the algorithm is ~20 lines of
-ratio-clip math.
-"""
+"""Stage-driven ``GRPO`` over a ``TextSegment``."""
 
 from __future__ import annotations
 
@@ -38,27 +30,7 @@ class GRPOConfig(BaseAlgorithmConfig):
 
 
 class GRPO(StageAlgorithm):
-    """GRPO over an AR ``TextSegment`` via ``ARStage.replay``.
-
-    The teacher-forced forward and per-token log-prob recompute is owned by
-    :meth:`ARStage.replay`; this class expands per-sample advantages to per-
-    token via ``cu_seqlens`` and runs the same PPO clip math.
-
-    Args:
-        stage: The :class:`ARStage` whose ``replay`` produces packed-varlen
-            new log-probs aligned with ``segment.log_probs``.
-        clip_range: PPO clip range epsilon.
-        clip_schedule: ``"constant"``, ``"linear_decay"``, or
-            ``"cosine_decay"``.
-        conditions_cls: Stage-typed conditions container with
-            ``from_dict(Mapping[str, Condition])``.
-        sampling_temperature: AR rollout temperature, applied as a
-            ``logits / T`` scaling inside :meth:`ARStage.replay` so
-            replay's log-softmax matches SGLang's sampling distribution
-            (``log_softmax(logits / T)``). Injected at construction time
-            from the rollout engine config; falls back to
-            :class:`ARSamplingParams` default when no engine is configured.
-    """
+    """GRPO over an AR ``TextSegment`` via ``ARStage.replay``."""
 
     supports_multi_update = True
 
@@ -160,14 +132,7 @@ class GRPO(StageAlgorithm):
         dtype: torch.dtype,
         device: torch.device,
     ) -> torch.Tensor:
-        """Expand per-sample ``advantages [B]`` to per-token ``[total_tokens]``.
-
-        Each sample's advantage is repeated across its ``lengths``-defined
-        token span so that token positions in segment ``k`` all see
-        ``advantages[k]``. ``lengths`` comes from
-        :attr:`Batch.lengths` on the segment (derived from the framework-
-        managed cu_seqlens).
-        """
+        """Expand per-sample ``advantages [B]`` to per-token ``[total_tokens]``."""
         bs = int(advantages.shape[0])
         if int(lengths.shape[0]) != bs:
             raise ValueError(f"GRPO advantage expansion: advantages batch={bs} != lengths={int(lengths.shape[0])}")

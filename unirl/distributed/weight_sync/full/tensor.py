@@ -1,23 +1,4 @@
-"""v2 full-weight tensor-payload sync (COLOCATE).
-
-Pushes the trained FSDP full base weights into a co-located vLLM-Omni rollout
-engine by serializing each bucket (SGLang ``FlattenedTensorBucket`` +
-``MultiprocessingSerializer``) and handing it to the local engine sibling's
-``update_weights_from_tensor`` — the engine owns the Worker→Omni-subprocess
-transfer (serialize already done; ``collective_rpc`` fans to the stage workers).
-
-Full-weight analogue of ``weight_sync/lora/local.py:LocalLoraWeightSync`` and the v2
-transport-mate of v1 ``distributed/weight_sync/tensor.py``. Colocate only:
-``backend`` and ``rollout`` arrive as LOCAL siblings (same Worker process). For
-ordinary TP=1 receivers, each train rank ships to its own co-located engine and
-the worker picks ``serialized_named_tensors[0]``. For SGLang rollout TP, every
-TP train rank exports CUDA IPC handles for its local GPU, then tp_rank=0 gathers
-the small serialized handle strings and forwards one payload per SRT scheduler.
-
-Scope: single-node colocate; a single-model engine, or one child of a
-``ComposedRolloutEngine`` (via ``track_prefix``). All model / sglang imports are
-deferred so the driver can import this module for ``remote(...)``.
-"""
+"""v2 full-weight tensor-payload sync (COLOCATE)."""
 
 from __future__ import annotations
 
@@ -57,19 +38,7 @@ class TensorWeightSync(FullWeightSync):
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def sync(self) -> None:
-        """Serialize each bucket and load it into the local engine.
-
-        Runs on every train rank (``BROADCAST``); the ``raw_state_dict`` walk
-        all-gathers each shard on every rank in lockstep.
-
-        Rollout TP: a SGLang engine with ``tp_size>1`` is hosted only by its
-        tp_rank==0 worker (the others are no-op shells). This weight-sync role
-        is colocated with the train backend on EVERY worker, so every TP rank
-        must still drive the ``_iter_buckets`` generator. Each TP rank serializes
-        a payload backed by its own local CUDA device; tp_rank=0 gathers those
-        serialized IPC handles and calls SGLang once with
-        ``serialized_named_tensors[tp_rank]`` for each scheduler subprocess.
-        """
+        """Serialize each bucket and load it into the local engine."""
         import torch
 
         ri = self.rank_info
@@ -194,11 +163,7 @@ class TensorWeightSync(FullWeightSync):
     def _serialize_payload_or_error(
         cls, grouped, flat_bucket_cls, serializer_cls
     ) -> tuple[Optional[str], Optional[str]]:
-        """Capture a rank-local serialization error so peers can fail together.
-
-        Every TP rank must reach the following ``all_gather_object``. Letting one
-        rank raise here would leave successful peers blocked in that collective.
-        """
+        """Capture a rank-local serialization error so peers can fail together."""
         try:
             return (
                 cls._serialize_payload(

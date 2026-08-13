@@ -1,26 +1,4 @@
-"""Construction config for the typed HunyuanVideo-1.0 pipeline.
-
-Sibling of :class:`unirl.models.hunyuan_video15.HunyuanVideo15PipelineConfig`.
-Carries weights+precision knobs only; LoRA injection, FSDP wrapping,
-gradient checkpointing, and offload control all live in
-``cfg.training.policies`` (``LoRAPolicy`` / ``FSDPPolicy``) -- the bundle
-is weights+params only.
-
-HunyuanVideo-1.0-specific vs 1.5:
-
-- No ``text_encoder_2_ckpt_path`` needed (CLIP is always co-located with
-  the main checkpoint under ``text_encoder_2/`` + ``tokenizer_2/``).
-- No ``byt5_*``, ``mllm_*``, ``vision_*`` fields (1.0 uses LLaMA + CLIP,
-  not Qwen2.5-VL + ByT5 + SigLIP).
-- ``llama_max_length`` / ``clip_max_length`` / ``crop_start`` shape the
-  text encoding (LLaMA prompt template crops the first ``crop_start``
-  tokens after encoding).
-- ``guidance_embeds=True`` on the transformer -- guidance scale is passed
-  as a tensor, NOT as CFG stacking.
-
-``shift`` defaults to 5.0 (the upstream HunyuanVideo default). Static
-shift only (``use_dynamic_shifting=False``).
-"""
+"""Construction config for the typed HunyuanVideo-1.0 pipeline."""
 
 from __future__ import annotations
 
@@ -32,12 +10,7 @@ from unirl.config.validation import validate_precision_type
 
 @dataclass
 class HunyuanVideoPipelineConfig:
-    """Construction args for ``HunyuanVideoPipeline.from_config``.
-
-    ``device`` may be runtime-injected by the actor after compose; the
-    other fields are set at compose time and read once during pipeline
-    construction.
-    """
+    """Construction args for ``HunyuanVideoPipeline.from_config``."""
 
     pretrained_model_ckpt_path: str
     vae_ckpt_path: Optional[str] = None

@@ -1,55 +1,4 @@
-"""Qwen-Image diffusion: typed params + per-step kernel + rollout-level stage.
-
-Three classes mirror :mod:`unirl.models.sd3.diffusion`:
-
-- :class:`QwenImageDiffusionParams` — typed request-shape knobs (steps /
-  guidance / size / seed / sde_indices / eta / init_same_noise /
-  samples_per_prompt / noise_group_ids /
-  ``distilled_guidance_scale``).
-- :class:`QwenImageDiffusionStep` — stateless per-step kernel. Wraps
-  :meth:`predict_noise` (which packs latents into the
-  ``[B, S, C*4]`` patch layout the Qwen-Image transformer expects,
-  builds ``img_shapes``, runs CFG with **norm correction**, then unpacks
-  the noise prediction back to ``[B, C, H, W]``) around
-  ``StepStrategy.denoise``. The protocol-matching ``forward`` /
-  ``step`` / ``step_with_logp`` ride on top.
-- :class:`QwenImageDiffusionStage` — implements
-  ``DiffusionStage[QwenImageConditions]``. Owns the SDE strategy and
-  loop bookkeeping; segment latents stay in spatial ``[B, C, H, W]``
-  shape so :class:`QwenImageVAEDecodeStage` can read them directly.
-
-CFG math
---------
-The Qwen-Image pipeline does **not** use the standard
-``uncond + scale * (cond - uncond)`` form; it applies the combined
-prediction, then rescales it to preserve the per-token L2 norm of the
-conditional prediction. This is what the legacy
-``models/qwen_image.py::forward_denoiser`` (PR #104 lines 506-511)
-does, and it ships as the official Qwen-Image inference recipe::
-
-    comb = neg + scale * (cond - neg)
-    cond_norm = ||cond||_{dim=-1, keepdim=True}
-    comb_norm = ||comb||_{dim=-1, keepdim=True}
-    noise_pred = comb * (cond_norm / comb_norm)
-
-The CFG batching is per-branch (two separate transformer forwards),
-not the SD3-style ``[uncond, cond]`` chunked forward, because Qwen-VL
-prompts have variable-length sequences with attention masks that
-don't match between branches.
-
-Latent packing
---------------
-The Qwen-Image transformer operates on patchified latents
-``[B, (H/2)*(W/2), C*4]`` (2×2 patches in the spatial plane). The
-SDE loop, segment storage, and noise generation all use the
-**unpacked** ``[B, C, H, W]`` shape; only :meth:`predict_noise`
-packs/unpacks at the transformer boundary. This keeps
-``LatentSegment.latents`` in the same ``[B, K, C, H, W]`` shape SD3
-and Wan use, so :class:`QwenImageVAEDecodeStage` follows the SD3 decode
-protocol without per-shape special-casing.
-
-Math mirrors PR #104's ``qwen_image_sampler.py`` / ``forward_denoiser``.
-"""
+"""Qwen-Image diffusion: typed params + per-step kernel + rollout-level stage."""
 
 from __future__ import annotations
 
@@ -72,11 +21,7 @@ from .conditions import QwenImageConditions
 
 
 def _pack_latents(latents: torch.Tensor) -> torch.Tensor:
-    """``[B, C, H, W]`` → ``[B, (H/2)*(W/2), C*4]``.
-
-    Reshapes the spatial grid into 2×2 patches and flattens. Mirrors
-    ``samplers/fsdp/qwen_image_sampler.py::_pack_latents``.
-    """
+    """``[B, C, H, W]`` → ``[B, (H/2)*(W/2), C*4]``."""
     if latents.ndim != 4:
         raise ValueError(f"_pack_latents: expected [B, C, H, W], got {tuple(latents.shape)}")
     batch_size, channels, height, width = latents.shape
@@ -88,10 +33,7 @@ def _pack_latents(latents: torch.Tensor) -> torch.Tensor:
 
 
 def _unpack_latents(latents: torch.Tensor, *, latent_h: int, latent_w: int) -> torch.Tensor:
-    """``[B, S, C*4]`` → ``[B, C, H, W]`` (inverse of :func:`_pack_latents`).
-
-    Requires ``S == (H/2)*(W/2)``; ``H = latent_h``, ``W = latent_w``.
-    """
+    """``[B, S, C*4]`` → ``[B, C, H, W]`` (inverse of :func:`_pack_latents`)."""
     if latents.ndim != 3:
         raise ValueError(f"_unpack_latents: expected [B, S, C*4], got {tuple(latents.shape)}")
     batch_size, seq, packed_channels = latents.shape
@@ -111,15 +53,7 @@ def _unpack_latents(latents: torch.Tensor, *, latent_h: int, latent_w: int) -> t
 
 
 class QwenImageDiffusionStep(DiffusionStep[QwenImageBundle, QwenImageConditions]):
-    """Per-step Qwen-Image denoising kernel — stateless.
-
-    Extends the :class:`DiffusionStep` protocol with Qwen-Image-specific
-    per-call kwargs (``latent_h`` / ``latent_w`` /
-    ``distilled_guidance_scale``) on :meth:`predict_noise`,
-    :meth:`step`, and :meth:`step_with_logp`. The protocol surface stays
-    structurally compatible because Python protocols are non-strict on
-    extra kwargs.
-    """
+    """Per-step Qwen-Image denoising kernel — stateless."""
 
     def predict_noise(
         self,
@@ -133,15 +67,7 @@ class QwenImageDiffusionStep(DiffusionStep[QwenImageBundle, QwenImageConditions]
         latent_w: int,
         distilled_guidance_scale: Optional[float] = None,
     ) -> torch.Tensor:
-        """Run the Qwen-Image transformer with combined-CFG + norm correction.
-
-        Packs ``sample`` ``[B, C, H, W]`` → ``[B, (H/2)*(W/2), C*4]``,
-        runs the transformer for the conditional branch (and, when
-        ``guidance_scale > 1`` and ``conditions.negative_text`` is set,
-        a second forward for the unconditional branch), applies the
-        norm-corrected CFG blend, then unpacks the result back to
-        ``[B, C, H, W]``.
-        """
+        """Run the Qwen-Image transformer with combined-CFG + norm correction."""
         if conditions.text is None:
             raise ValueError("QwenImageDiffusionStep.predict_noise: conditions.text is None")
         text = conditions.text
@@ -228,12 +154,7 @@ class QwenImageDiffusionStep(DiffusionStep[QwenImageBundle, QwenImageConditions]
         eta: float = 1.0,
         step_index: int = 0,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """Run one SDE transition given a precomputed ``noise_pred``.
-
-        Returns ``(prev_sample, log_prob, prev_sample_mean)``. Operates
-        on unpacked ``[B, C, H, W]`` tensors (the strategy is shape-
-        agnostic).
-        """
+        """Run one SDE transition given a precomputed ``noise_pred``."""
         return strategy.denoise(
             noise_pred=noise_pred,
             sample=sample,
@@ -307,11 +228,7 @@ class QwenImageDiffusionStep(DiffusionStep[QwenImageBundle, QwenImageConditions]
         latent_w: int = 0,
         distilled_guidance_scale: Optional[float] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """Run model forward + SDE transition.
-
-        Returns ``(prev_sample, log_prob, prev_sample_mean)``. ``log_prob``
-        and ``prev_sample_mean`` are ``None`` for deterministic strategies.
-        """
+        """Run model forward + SDE transition."""
         return self.step(
             model,
             conditions,
@@ -331,30 +248,7 @@ class QwenImageDiffusionStep(DiffusionStep[QwenImageBundle, QwenImageConditions]
 
 
 class QwenImageDiffusionStage(BatchedStepReplayMixin, DiffusionStage[QwenImageConditions]):
-    """Qwen-Image rollout-level diffusion stage.
-
-    Owns the SDE ``strategy`` (stateful strategies like ``DPM2Strategy``
-    require a stable instance across the loop), the bundle, the kernel,
-    and the precision policy. The kernel is stateless and is invoked
-    per-step with the strategy + the per-call ``latent_h`` / ``latent_w``
-    that pin the packed-latent geometry.
-
-    ``diffuse(conditions, *, schedule, params)`` runs the full sampling
-    loop and returns a ``LatentSegment`` carrying the trajectory plus
-    per-SDE log probs (``sde_logp [N, S]`` + ``sde_indices [S]``).
-
-    ``replay(conditions, *, segment, params, step_indices=None)``
-    recomputes log-probs for the SDE transitions in a stored
-    ``LatentSegment``. Returns a :class:`ReplayResult` with ``log_probs``
-    of shape ``[B, S']`` aligned with ``segment.sde_logp`` (or a slice
-    when ``step_indices`` selects a subset) and ``prev_sample_means``
-    for KL-penalty consumption. Used by GRPO-style training.
-
-    ``_no_split_modules`` is the model-side fallback used by FSDPPolicy
-    when HF auto-discovery yields nothing — diffusers'
-    ``QwenImageTransformer2DModel`` block class is
-    ``QwenImageTransformerBlock``.
-    """
+    """Qwen-Image rollout-level diffusion stage."""
 
     _no_split_modules: ClassVar[Tuple[str, ...]] = ("QwenImageTransformerBlock",)
 
@@ -395,17 +289,7 @@ class QwenImageDiffusionStage(BatchedStepReplayMixin, DiffusionStage[QwenImageCo
         params: DiffusionSamplingParams,
         initial_latents: Optional[torch.Tensor] = None,
     ) -> LatentSegment:
-        """Run full Qwen-Image sampling. Returns a ``LatentSegment``.
-
-        The SDE loop and the segment store stay in spatial ``[B, C, H, W]``
-        shape; :meth:`QwenImageDiffusionStep.predict_noise` packs /
-        unpacks at the transformer boundary so the VAE decode stage can
-        read ``segment.latents[:, -1]`` without per-shape handling.
-
-        ``initial_latents`` (optional) — x_T resolved from the request
-        ``Sample``'s diffusion generation Part; see
-        :class:`SD3DiffusionStage.diffuse` for the contract.
-        """
+        """Run full Qwen-Image sampling. Returns a ``LatentSegment``."""
         from unirl.sde.noise import generate_latents
 
         if conditions.text is None or conditions.text.embeds is None:
@@ -518,15 +402,7 @@ class QwenImageDiffusionStage(BatchedStepReplayMixin, DiffusionStage[QwenImageCo
         params: DiffusionSamplingParams,
         step_indices: Optional[List[int]] = None,
     ) -> ReplayResult:
-        """Segment-based log-prob replay over the rollout's SDE transitions.
-
-        Recovers ``latent_h`` / ``latent_w`` from the stored segment's
-        latent shape (``[B, K, C, H, W]``) so the kernel can rebuild the
-        packed-latent geometry per step.
-
-        Caller is responsible for ``.train()`` mode + grad scope; this
-        method only manages the autocast scope.
-        """
+        """Segment-based log-prob replay over the rollout's SDE transitions."""
         if segment.sde_indices is None or segment.latents is None:
             raise ValueError("QwenImageDiffusionStage.replay: segment.sde_indices / latents missing")
         if segment.sigmas is None:
@@ -640,13 +516,7 @@ class QwenImageDiffusionStage(BatchedStepReplayMixin, DiffusionStage[QwenImageCo
         sigma: torch.Tensor,
         params: DiffusionSamplingParams,
     ) -> torch.Tensor:
-        """Single ``(xt, sigma)`` model forward — no scheduler iteration.
-
-        Latent ``H × W`` are taken directly from ``sample.shape[-2:]`` (no
-        VAE round-trip). ``distilled_guidance_scale`` is read from
-        ``params`` when set (Qwen-Image checkpoints with
-        ``guidance_embeds=True`` use it; otherwise it's ignored).
-        """
+        """Single ``(xt, sigma)`` model forward — no scheduler iteration."""
         return self.step.predict_noise(
             self.model,
             sample,
@@ -659,13 +529,7 @@ class QwenImageDiffusionStage(BatchedStepReplayMixin, DiffusionStage[QwenImageCo
         )
 
     def trainable_module(self) -> "torch.nn.Module":
-        """Return the module the diffusion forward operates on.
-
-        For Qwen-Image, that's the bundle's transformer
-        (``QwenImageTransformer2DModel``) — the FSDP wrap target. Aux
-        modules (VAE, text encoder) are siblings on the bundle, never
-        under the transformer.
-        """
+        """Return the module the diffusion forward operates on."""
         return self.model.transformer
 
 

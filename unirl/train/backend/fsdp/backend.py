@@ -1,15 +1,4 @@
-"""FSDPBackend — single-track training-state Remote on torch-native FSDP2.
-
-Owns structural injection (LoRA / NFT / mirror EMA) and the torch-native
-``fully_shard`` wrap of the trainable module exposed by a :class:`Bundle`. All
-the ongoing training state (optimizer, scheduler, EMA, eval-EMA swap, checkpoint,
-onload/offload) lives in :class:`~unirl.train.backend.base_backend.BaseFSDP2Backend`;
-this leaf supplies only the constructor lifecycle and the five engine hooks
-(grad clip, optimizer-state gather/load, model on/offload).
-
-Does NOT hold a ``Stage`` or an algorithm — the algorithm sibling Remote owns
-the stage and runs forward/backward against the same shared bundle.
-"""
+"""FSDPBackend — single-track training-state Remote on torch-native FSDP2."""
 
 from __future__ import annotations
 
@@ -40,13 +29,7 @@ from unirl.utils.dtypes import parse_torch_dtype
 
 
 class FSDPBackend(BaseFSDP2Backend):
-    """Single-track FSDP training backend.
-
-    One-shot construction: after ``__init__`` returns the backend is fully usable
-    (model wrapped, optimizer/scheduler/EMA built). Caller is responsible for
-    passing ``device`` and ``rank`` — matches :class:`BaseRolloutEngine`
-    subclasses' contract.
-    """
+    """Single-track FSDP training backend."""
 
     def __init__(
         self,
@@ -118,12 +101,7 @@ class FSDPBackend(BaseFSDP2Backend):
 
     @property
     def weight_sync_dtype(self) -> torch.dtype:
-        """The dtype LoRA / full-weight sync ships in (FSDP compute ``param_dtype``).
-
-        Decoupled from the trainable params' own dtype: under ``master_dtype=fp32``
-        the LoRA params are fp32, but the rollout engine's vLLM punica kernel
-        requires bf16/fp16, so the sync casts to this at extraction.
-        """
+        """The dtype LoRA / full-weight sync ships in (FSDP compute ``param_dtype``)."""
         return self._weight_sync_dtype
 
     def _clip_grad_norm(self, max_grad_norm: float) -> torch.Tensor:

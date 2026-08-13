@@ -1,23 +1,4 @@
-"""WAN21Bundle — concrete weights+params holder for WAN 2.1 T2V / I2V.
-
-Implements the empty :class:`Bundle` Protocol. Pure container of the
-modules WAN 2.1 ships with: 1× transformer (``WanTransformer3DModel``),
-1× 3D VAE (``AutoencoderKLWan``), 1× UMT5/T5 text encoder + tokenizer.
-Optional I2V vision tower (``CLIPVisionModel`` + image processor) loaded
-only when ``transformer.config.image_dim > 0`` — see ``uses_clip_vision``.
-No LoRA injection, FSDP wrap, adapter switching, autocast helpers, or
-weight-sync logic — those are lifecycle concerns owned outside the
-bundle.
-
-No ``scheduler`` field here either: WAN sigma scheduling always goes
-through :func:`unirl.sde.runtime.get_sigma_schedule` with the
-config-side ``shift`` (matches legacy ``samplers/fsdp/wan_sampler.py``
-convention). Bundles for models that DO use a diffusers scheduler (SD3
-``retrieve_timesteps`` dynamic shift, HI3 ``set_timesteps``) carry a
-``scheduler`` field; WAN doesn't, so we don't.
-
-Use :meth:`WAN21Bundle.from_config` to load a HuggingFace checkpoint.
-"""
+"""WAN21Bundle — concrete weights+params holder for WAN 2.1 T2V / I2V."""
 
 from __future__ import annotations
 
@@ -35,9 +16,7 @@ from .config import WAN21PipelineConfig
 
 
 class WAN21Bundle(Bundle):
-    """WAN 2.1 T2V / I2V bundle: transformer + VAE + UMT5 text encoder
-    (+ optional CLIP vision tower for I2V).
-    """
+    """WAN 2.1 T2V / I2V bundle: transformer + VAE + UMT5 text encoder (+ optional CLIP vision tower for I2V)."""
 
     def __init__(
         self,
@@ -67,14 +46,7 @@ class WAN21Bundle(Bundle):
 
     @property
     def uses_clip_vision(self) -> bool:
-        """True iff the bundle loaded a CLIP vision tower (I2V path).
-
-        Pipelines / stages branch on this to decide whether to construct
-        a :class:`WAN21CLIPVisionEncodeStage` and emit an
-        ``ImageEmbedCondition``. T2V bundles set both
-        ``vision_encoder`` / ``image_processor`` to ``None`` and the
-        property is ``False``.
-        """
+        """True iff the bundle loaded a CLIP vision tower (I2V path)."""
         return self.vision_encoder is not None
 
     @classmethod

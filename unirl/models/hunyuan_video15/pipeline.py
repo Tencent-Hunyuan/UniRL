@@ -1,38 +1,4 @@
-"""HunyuanVideo15Pipeline — ``Sample → Sample`` end-to-end for HunyuanVideo-1.5.
-
-Implements the four-tier flow::
-
-    Texts ──text_embed (mllm + glyph, ×2 for CFG)──▶ HunyuanVideo15Conditions
-        ──diffuse──▶ LatentSegment (6D video) ──vae_decode──▶ Videos
-
-Hydra constructs a pipeline via
-``HunyuanVideo15Pipeline.from_config(HunyuanVideo15PipelineConfig)``;
-``from_config`` loads the :class:`HunyuanVideo15Bundle` then constructs
-the stages with the precision policy and the vision-placeholder shape
-constants from the config.
-
-σ schedule contract
--------------------
-The hosting engine (``TrainsideRolloutEngine`` / ``SGLangDiffusionRolloutEngine``
-/ ``VLLMOmniRolloutEngine``) pins the σ schedule onto the gen Part's
-``DiffusionSamplingParams.sigmas`` BEFORE calling ``generate(sample)``; this
-pipeline reads ``params.sigmas`` and uses it
-verbatim. HunyuanVideo-1.5 uses **static** flow-match shift (default
-5.0); the engine builds
-:meth:`FlowMatchSchedulePolicy.from_pretrained(path, shift=pipeline.shift)`
-and the checkpoint's ``scheduler_config.json`` carries
-``use_dynamic_shifting=False`` (unlike Qwen-Image / SD3.5), so the
-policy stays on the static branch.
-
-Negative prompts (CFG-on contract)
-----------------------------------
-HunyuanVideo-1.5's CFG is part of its inference contract — the upstream
-pipeline ALWAYS encodes a negative branch (defaulting to empty strings
-when not provided). This pipeline preserves this behavior: user-supplied
-negatives are deferred, and when ``guidance_scale > 1.0`` we synthesize
-``Texts(texts=[""] * batch_size)`` so the diffusion stage always has both
-``negative_text_mllm`` and ``negative_text_glyph`` populated.
-"""
+"""HunyuanVideo15Pipeline — ``Sample → Sample`` end-to-end for HunyuanVideo-1.5."""
 
 from __future__ import annotations
 
@@ -57,19 +23,7 @@ from .vae import HunyuanVideo15VAEDecodeStage
 
 
 class HunyuanVideo15Pipeline(Pipeline):
-    """HunyuanVideo-1.5 generate pipeline (T2V; I2V deferred): ``Sample → Sample``.
-
-    Consumes a request ``Sample`` whose frontier Part is a pre-forked diffusion gen
-    shell carrying ``DiffusionSamplingParams`` (with ``sigmas`` pinned by the
-    hosting engine). Reads the prompt via ``sample.conditioning()`` and fills the
-    frontier Part:
-
-    - ``segment: LatentSegment`` — the denoising trajectory.
-    - ``primitives["video"]: Videos`` — the decoded videos.
-
-    ``Part.conditions`` carries the encoded conditions for trainer-side replay (the train stack re-types them via ``conditions_cls.from_dict``). User-supplied negatives are
-    deferred; CFG uses a synthesized empty negative across the MLLM + Glyph encoders.
-    """
+    """HunyuanVideo-1.5 generate pipeline (T2V; I2V deferred): ``Sample → Sample``."""
 
     def __init__(
         self,
@@ -122,24 +76,7 @@ class HunyuanVideo15Pipeline(Pipeline):
 
     @classmethod
     def latent_shape(cls, *, model_config: Any, sampling_spec: Any) -> tuple:
-        """Per-sample 5D latent shape ``(C, T_lat, H_lat, W_lat)`` for
-        driver-side noise pre-computation. Mirrors
-        :meth:`HunyuanVideo15DiffusionStage._latent_shape`.
-
-        Channel count is read from ``model_config.latent_channels``
-        first; when the YAML leaves it ``None`` we fall back to
-        :attr:`HunyuanVideo15DiffusionStage.DEFAULT_LATENT_CHANNELS`
-        (32, matching ``hunyuanvideo-community/HunyuanVideo-1.5-Diffusers``).
-        The stage init then receives the same config value and cross-
-        checks against ``vae.config.latent_channels``; if the driver
-        allocates ``C_d`` channels but the stage resolves to ``C_s != C_d``,
-        ``diffuse(initial_latents=...)`` fails the shape check with a
-        clear error — there is no silent drift.
-
-        Spatial / temporal downsample factors are reused from the stage
-        class constants (16× spatial, 4× temporal on the canonical VAE).
-        ``T_lat = (num_frames - 1) // 4 + 1``.
-        """
+        """Per-sample 5D latent shape ``(C, T_lat, H_lat, W_lat)`` for driver-side noise pre-computation."""
         height = int(sampling_spec.height)
         width = int(sampling_spec.width)
         num_frames = int(sampling_spec.num_frames)
@@ -163,13 +100,7 @@ class HunyuanVideo15Pipeline(Pipeline):
         *,
         strategy: Optional[StepStrategy] = None,
     ) -> "HunyuanVideo15Pipeline":
-        """Build the full pipeline from a config.
-
-        ``strategy`` is the SDE step strategy. Defaults to
-        :class:`DanceSDEStrategy` (legacy HunyuanVideo-1.5 default); callers running
-        GRPO with a different SDE family (Flow / CPS / DPM2) pass an
-        explicit strategy built from ``cfg.sampling.sde_strategy``.
-        """
+        """Build the full pipeline from a config."""
         bundle = HunyuanVideo15Bundle.from_config(config)
         text_embed = HunyuanVideo15TextEmbedStage(
             bundle,
@@ -206,19 +137,7 @@ class HunyuanVideo15Pipeline(Pipeline):
         negatives: Optional[Texts] = None,
         guidance_scale: float = 1.0,
     ) -> HunyuanVideo15Conditions:
-        """Encode prompts (MLLM + Glyph, + optional CFG negatives) into ``HunyuanVideo15Conditions``.
-
-        CFG empty negative: when CFG is on (``guidance_scale > 1``) and
-        caller didn't supply a negative, default to ``[""] * B``. When
-        CFG is off, leave ``negatives=None`` so the negative branch is
-        skipped entirely — saves two text-encoder forwards (MLLM +
-        Glyph) per request. ``HunyuanVideo15DiffusionStep.predict_noise``
-        (diffusion.py:188) already gates the CFG branch on
-        ``guidance_scale > 1 and negative_text_mllm is not None``, so
-        passing None for both negative_text_* is the canonical CFG-off
-        signal. Either-both-or-both-None: the diffusion step (line 191-202)
-        raises if only one of mllm/glyph is set.
-        """
+        """Encode prompts (MLLM + Glyph, + optional CFG negatives) into ``HunyuanVideo15Conditions``."""
         if negatives is not None and len(negatives.texts) != len(texts.texts):
             raise ValueError(
                 f"HunyuanVideo15Pipeline.build_conditions: negative_text length "
@@ -244,12 +163,7 @@ class HunyuanVideo15Pipeline(Pipeline):
         )
 
     def generate(self, sample: Sample) -> Sample:
-        """Run HunyuanVideo-1.5 T2V end-to-end, filling the frontier (pre-forked) gen Part.
-
-        Requires σ to be pinned onto the gen part's ``DiffusionSamplingParams.sigmas``
-        by the hosting engine before the call; see the σ ownership note in
-        ``unirl.models.types.pipeline``.
-        """
+        """Run HunyuanVideo-1.5 T2V end-to-end, filling the frontier (pre-forked) gen Part."""
         frontier = sample.parts[-1]
         params = frontier.sampling_params
         if not isinstance(params, DiffusionSamplingParams):

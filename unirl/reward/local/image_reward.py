@@ -16,14 +16,7 @@ from .base import LocalRewardBackend
 
 
 class ImageRewardScorer(LocalRewardBackend):
-    """ImageReward human preference scorer (BLIP-based, ~300M).
-
-    ImageReward is trained on 137k human preference annotations and outputs
-    a scalar score reflecting overall human preference (text-image alignment,
-    aesthetics, composition, etc.).
-
-    Reference: https://github.com/THUDM/ImageReward
-    """
+    """ImageReward human preference scorer (BLIP-based, ~300M)."""
 
     canonical_model_name = "image_reward"
 
@@ -65,10 +58,7 @@ class ImageRewardScorer(LocalRewardBackend):
 
 @dataclass
 class ImageRewardSpec(BaseRewardComponentSpec):
-    """Typed config for the ImageReward (BLIP-based, ~300M) reward component.
-
-    ImageReward processes one image at a time, so no batch_size knob.
-    """
+    """Typed config for the ImageReward (BLIP-based, ~300M) reward component."""
 
     device: str = "auto"
     model_version: str = "ImageReward-v1.0"

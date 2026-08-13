@@ -1,45 +1,4 @@
-"""BooguImagePipeline — ``Sample → Sample`` end-to-end for Boogu-Image.
-
-Implements the four-tier flow::
-
-    Texts ──text_embed──▶ BooguImageConditions ──diffuse──▶ LatentSegment
-                                                                │
-                                                                ▼
-                                                            vae_decode
-                                                                │
-                                                                ▼
-                                                              Images
-
-Hydra constructs a pipeline via
-``BooguImagePipeline.from_config(BooguImagePipelineConfig)`` (see
-``config.py``); ``from_config`` loads the :class:`BooguImageBundle` then
-constructs the stages with the precision policy from the config.
-
-σ schedule contract
--------------------
-The hosting engine (``TrainsideRolloutEngine``) pins the σ schedule onto the
-gen Part's ``DiffusionSamplingParams.sigmas`` BEFORE calling
-``generate(sample)``; this pipeline reads ``params.sigmas`` verbatim. The released
-``Boogu-Image-0.1-Base`` scheduler config is a **static v1 time shift**
-(``do_shift: true, dynamic_time_shift: false, time_shift_version: "v1",
-seq_len: 4096``) whose sigma-space form is exactly the standard static shift
-``σ' = s·σ / (1 + (s−1)·σ)`` with ``s = e^{lin(seq_len)} = e^{1.15}``
-(verified to 1 fp32 ulp against the reference scheduler at N ∈ {12, 50}).
-:meth:`build_schedule_policy` pins that static posture from ``self.shift``
-— Boogu's ``scheduler_config.json`` uses custom field names that the base
-``FlowMatchSchedulePolicy.from_pretrained`` would silently ignore, so the
-config-pinned ``static_only`` posture (z_image / bagel precedent) is the
-safe wiring.
-
-CFG convention
---------------
-Boogu's guidance-off value is ``guidance_scale = 1.0`` (the combine is
-``pred + (g−1)·(pred − pred_neg)``), so :meth:`build_conditions` gates the
-auto-``""`` negative on ``guidance_scale > 1.0`` — a deliberate divergence
-from z_image's ``> 0.0`` gate. The empty negative ``""`` is re-encoded
-through the chat template, where it routes to the DROP system prompt (see
-``text_embed.py``).
-"""
+"""BooguImagePipeline — ``Sample → Sample`` end-to-end for Boogu-Image."""
 
 from __future__ import annotations
 
@@ -62,21 +21,7 @@ from .vae import BooguImageVAEDecodeStage
 
 
 class BooguImagePipeline(Pipeline):
-    """Boogu-Image generate pipeline: ``Sample → Sample``.
-
-    Consumes a request ``Sample`` whose frontier Part is a pre-forked diffusion
-    gen shell carrying ``DiffusionSamplingParams`` (with ``sigmas`` pinned by
-    the hosting engine). Reads the prompt via ``sample.conditioning()`` and
-    fills the frontier Part:
-
-    - ``segment: LatentSegment`` — the denoising trajectory.
-    - ``primitives["image"]: Images`` — the decoded images.
-
-    ``Part.conditions`` carries the encoded conditions for trainer-side replay
-    (the train stack re-types them via ``conditions_cls.from_dict``).
-    User-supplied negatives are deferred; CFG (``guidance_scale > 1.0``) uses a
-    synthesized empty negative routed to the DROP system prompt.
-    """
+    """Boogu-Image generate pipeline: ``Sample → Sample``."""
 
     def __init__(
         self,
@@ -114,10 +59,7 @@ class BooguImagePipeline(Pipeline):
 
     @classmethod
     def latent_shape(cls, *, model_config: Any, sampling_spec: Any) -> tuple:
-        """Per-sample latent shape ``(C, H_lat, W_lat)`` for driver-side
-        noise pre-computation. Boogu-Image: 16-channel FLUX ``AutoencoderKL``,
-        8× spatial downsample with the patchify-2×2 rounding
-        (``latent_h = 2 * (H // 16)``)."""
+        """Per-sample latent shape ``(C, H_lat, W_lat)`` for driver-side noise pre-computation."""
         height = int(sampling_spec.height)
         width = int(sampling_spec.width)
         vae_scale_factor = 8
@@ -132,12 +74,7 @@ class BooguImagePipeline(Pipeline):
         *,
         strategy: Optional[StepStrategy] = None,
     ) -> "BooguImagePipeline":
-        """Build the full pipeline from a config.
-
-        ``strategy`` is the SDE step strategy. Defaults to
-        :class:`FlowSDEStrategy`; callers running GRPO with a different SDE
-        family (Dance / CPS / DPM2) pass an explicit strategy.
-        """
+        """Build the full pipeline from a config."""
         bundle = BooguImageBundle.from_config(config)
         text_embed = BooguImageTextEmbedStage(bundle, max_sequence_length=config.max_sequence_length)
         step = BooguImageDiffusionStep()
@@ -160,20 +97,7 @@ class BooguImagePipeline(Pipeline):
         )
 
     def build_schedule_policy(self):
-        """Static-shift FlowMatch σ policy for the released Boogu-Image-0.1.
-
-        Boogu's released Base scheduler is static v1 with ``seq_len: 4096``:
-        μ = lin(4096) = 1.15 (the reference hardcodes the 256→0.5 / 4096→1.15
-        linear map), and v1's logistic t-shift equals the standard static
-        sigma shift with ``s = e^μ = 3.158192909689768``. Returning an
-        explicit ``static_only`` policy built from ``self.shift`` pins that
-        posture regardless of whether ``pretrained_path`` is an HF repo id or
-        a local mount — Boogu's ``scheduler_config.json`` uses custom field
-        names (``do_shift`` / ``dynamic_time_shift`` / ``time_shift_version``
-        / ``seq_len``) that the base policy's JSON loader would silently
-        ignore, which would otherwise produce a wrong-shift schedule without
-        an error. Mirrors ``ZImagePipeline.build_schedule_policy``.
-        """
+        """Static-shift FlowMatch σ policy for the released Boogu-Image-0.1."""
         from unirl.sde.runtime import FlowMatchSchedulePolicy
 
         return FlowMatchSchedulePolicy.static_only(float(self.shift))
@@ -185,15 +109,7 @@ class BooguImagePipeline(Pipeline):
         negatives: Optional[Texts] = None,
         guidance_scale: float = 1.0,
     ) -> BooguImageConditions:
-        """Encode prompts (+ optional CFG negatives) into ``BooguImageConditions``.
-
-        CFG empty negative: the reference ``encode_instruction`` defaults the
-        negative instruction to ``""`` when CFG is active
-        (pipeline_boogu.py:2491-2494); inside the embed stage the empty
-        string routes to the DROP system prompt (dataset logic). Boogu gates
-        CFG on ``guidance_scale > 1.0`` — 1.0 is guidance-off (unlike
-        z_image's ``> 0.0`` gate).
-        """
+        """Encode prompts (+ optional CFG negatives) into ``BooguImageConditions``."""
         if negatives is not None and len(negatives.texts) != len(texts.texts):
             raise ValueError(
                 f"BooguImagePipeline.build_conditions: negative_text length "
@@ -206,12 +122,7 @@ class BooguImagePipeline(Pipeline):
         return BooguImageConditions(text=text_cond, negative_text=negative_text_cond)
 
     def generate(self, sample: Sample) -> Sample:
-        """Run Boogu-Image t2i end-to-end, filling the frontier (pre-forked) gen Part.
-
-        Requires σ to be pinned onto the gen part's ``DiffusionSamplingParams.sigmas``
-        by the hosting engine before the call; see the σ ownership note in
-        ``unirl.models.types.pipeline``.
-        """
+        """Run Boogu-Image t2i end-to-end, filling the frontier (pre-forked) gen Part."""
         frontier = sample.parts[-1]
         params = frontier.sampling_params
         if not isinstance(params, DiffusionSamplingParams):

@@ -1,16 +1,4 @@
-"""T2AV composite reward — weighted blend of video + audio scorers.
-
-For LTX-2.3 text-to-audio-video, one generated Part carries both the decoded video
-(``request.generated["video"]``) and the jointly-generated audio
-(``request.generated["audio"]``, copied by the reward service from the Part's
-``primitives["audio"]`` entry). This composite runs several inner scorers over the
-SAME request and returns their weighted sum, exposing each as a component.
-
-Mirrors ``VideoRewardScorer``'s composite pattern: inner scorers are resolved
-from the built-in registry by name, so any registered scorer (e.g.
-``videopickscore`` for video quality, ``clap`` for audio-text alignment,
-``imagebind`` for audio-video alignment) can be blended.
-"""
+"""T2AV composite reward — weighted blend of video + audio scorers."""
 
 from __future__ import annotations
 
@@ -25,12 +13,7 @@ from .registry import resolve_builtin_reward_scorer_class, resolve_builtin_rewar
 
 
 class T2AVCompositeScorer(RewardBackend):
-    """Weighted blend of inner reward scorers for T2AV (video + audio).
-
-    ``input_kind = "video"``: the generated Part routes through the video path;
-    audio is the jointly generated modality. Each inner scorer
-    reads whichever modality it needs off the shared request.
-    """
+    """Weighted blend of inner reward scorers for T2AV (video + audio)."""
 
     input_kind = "video"
 
@@ -108,12 +91,7 @@ class T2AVCompositeScorer(RewardBackend):
 
 @dataclass
 class T2AVCompositeSpec(BaseRewardComponentSpec):
-    """Typed config for the T2AV composite reward.
-
-    ``weights`` maps inner scorer canonical names (e.g. ``videopickscore``,
-    ``clap``, ``imagebind``) to blend weights. Each named scorer is built from
-    its default Spec with ``device``/``batch_size`` propagated.
-    """
+    """Typed config for the T2AV composite reward."""
 
     batch_size: int = 8
     device: str = "auto"

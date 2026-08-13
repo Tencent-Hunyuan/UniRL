@@ -1,32 +1,4 @@
-"""t2ti — text → CoT text + image (the HunyuanImage3 think_recaption chain).
-
-Two phases in one request:
-
-1. **AR phase** (like t2t): generates ``<think>…</think><recaption>…
-   </recaption>`` chain-of-thought text under the ``en_think_recaption``
-   system prompt, stopping at the CoT end markers.
-2. **Diffusion phase** (like t2i): conditions on prompt + the truncated /
-   normalized CoT via ``embed_for_gen_image(cot_text=...)``, then
-   diffuses and VAE-decodes the image.
-
-Mirrors vllm-omni's two-stage serving chain (AR stage →
-``stage_input_processors/hunyuan_image3.py`` ar2diffusion bridge → DiT
-stage). Fidelity caveat: upstream forces ``</think> → <recaption>`` via
-stage-transition logits processing; this mode relies on natural sampling
-under the system prompt, so the model may occasionally skip the
-recaption block (the CoT then degrades to think-only or plain text —
-upstream's own no-marker fallback feeds it as a plain text section).
-
-Fills TWO generated Parts in one lineage: the AR Part carries the truncated +
-normalized CoT that actually conditioned the image (raw tokens stay in its
-``segment`` for replay), followed by the diffusion Part carrying the image.
-``samples_per_prompt`` on either sub-params is deliberately NOT honored:
-fan-out belongs to the engine adapter, as with the other HI3 modes.
-
-img_ratio auto-prediction (upstream lets the AR pass pick the aspect
-ratio) is out of scope — height/width come from the diffusion sampling
-params.
-"""
+"""t2ti — text → CoT text + image (the HunyuanImage3 think_recaption chain)."""
 
 from __future__ import annotations
 
@@ -47,12 +19,7 @@ if TYPE_CHECKING:
 
 
 def _truncate_at_cot_end(text: str) -> str:
-    """Cut the AR output at the first ``</recaption>`` (else ``</think>``).
-
-    Keeps the marker; drops the trailing ``<answer><boi>…`` tail that
-    must not leak into the diffusion prompt builder. Port of vllm-omni
-    ``stage_input_processors/hunyuan_image3.py:105-117``.
-    """
+    """Cut the AR output at the first ``</recaption>`` (else ``</think>``)."""
     for marker in ("</recaption>", "</think>"):
         idx = text.find(marker)
         if idx != -1:
@@ -61,13 +28,7 @@ def _truncate_at_cot_end(text: str) -> str:
 
 
 def _normalize_cot_text(cot: str) -> str:
-    """Re-add the opening CoT tag the AR trigger consumed.
-
-    AR generation may omit the leading ``<think>`` / ``<recaption>`` (it
-    was spliced as the generation trigger); the wrapper's section parsing
-    needs matched tag pairs. Port of vllm-omni
-    ``pipeline_hunyuan_image3.py:738-755``.
-    """
+    """Re-add the opening CoT tag the AR trigger consumed."""
     if not cot:
         return cot
     if "</think>" in cot and not cot.startswith("<think>"):
@@ -78,15 +39,7 @@ def _normalize_cot_text(cot: str) -> str:
 
 
 def _cot_stop_tokens(bundle, bot_task: str) -> List[int]:
-    """Stop tokens for the CoT AR pass with an explicit image size.
-
-    Mirrors vllm-omni ``prompt_utils.resolve_stop_token_ids`` (explicit-
-    size branch): think_recaption / recaption stop at ``</recaption>``;
-    ``think`` additionally needs ``</think>`` — prepended here since
-    ``_stop_tokens_for_bot_task``'s think-family list omits it. The
-    inherited ``</answer>`` / eos entries stay as runaway safety nets.
-    Empty on fake bundles (no tokenizer wrapper).
-    """
+    """Stop tokens for the CoT AR pass with an explicit image size."""
     stop_ids = _stop_tokens_for_bot_task(bundle, bot_task)
     if bot_task == "think":
         tkw = getattr(bundle.transformer, "_tkwrapper", None) or getattr(bundle.transformer, "_tokenizer", None)
