@@ -21,6 +21,8 @@ from vllm.lora.utils import get_adapter_absolute_path
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager, logger
 from vllm_omni.lora.request import LoRARequest as OmniLoRARequest
 
+from unirl.rollout.engine.vllm_omni.patches.compat_moe_workspace import patch_moe_workspace_pool
+
 
 class OmniTensorLoRARequest(OmniLoRARequest):
     peft_config: dict = field(default=None)
@@ -590,6 +592,7 @@ class VLLMOmniHijack:
         patch_sigmas_passthrough()
         patch_hi3_flow_alignment()
         patch_master_port_unstrip()
+        patch_moe_workspace_pool()
 
 
 __all__ = [
