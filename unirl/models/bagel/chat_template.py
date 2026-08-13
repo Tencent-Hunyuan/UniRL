@@ -110,9 +110,9 @@ class BagelChatTemplateStage:
         Every message renders in order: string content is one wrapped text
         split; part-list content walks its parts — each text part one wrapped
         split, each image part (a loaded PIL) one vit split. Roles carry no
-        tokens (Bagel's und flow has none); a configured ``system_instruction``
-        is prepended as a leading text split unless the conversation opens with
-        its own ``system`` message.
+        tokens (Bagel's und flow has none), and the conversation is
+        authoritative: ``system_instruction`` applies to the legacy ``embed``
+        path only, so an agent manifest renders the same on every backbone.
         """
         if not conversations:
             raise ValueError("BagelChatTemplateStage.embed_messages: empty conversation batch.")
@@ -124,8 +124,6 @@ class BagelChatTemplateStage:
         splits_per_sample: List[List[Dict[str, Any]]] = []
         for row, messages in enumerate(conversations):
             splits: List[Dict[str, Any]] = []
-            if self.system_instruction and not any(m.get("role") == "system" for m in messages):
-                splits.append(self._text_split(self.system_instruction))
             for turn, message in enumerate(messages):
                 if message.get("role") == "tool":
                     raise ValueError(

@@ -12,11 +12,16 @@ against the manifest's directory):
 
 - AR (LLM):   ``{"prompt": str, "response": str}``
 - AR (agent): ``{"messages": [..., {"role": "assistant", ...}], "tools": [...]}``.
-  A history message's ``content`` may also be an OpenAI-style part list —
-  ``[{"type": "text", "text": ...}, {"type": "image", "image": "img/3.png"}, ...]``
-  — for interleaved image/text trajectories (retrieved images mid-conversation).
-  Image parts carry local URIs; the target (final assistant) turn stays
-  text-only — supervision is text CE, never an image loss.
+  A history message's ``content`` may also be a part list — strictly
+  ``{"type": "text", "text": ...}`` / ``{"type": "image", "image": "img/3.png"}``,
+  unknown fields rejected rather than dropped, so this is UniRL's own schema
+  and not the wider OpenAI part shape — for interleaved image/text
+  trajectories (retrieved images mid-conversation). Image parts carry local
+  URIs. The target (final assistant) turn may NOT be a part list: images are
+  history-only, supervision is text CE, never an image loss. It may carry text
+  and/or ``tool_calls``, and the chat stage rendering it must emit the whole
+  target or raise — a backbone with no tool-call template rejects the record
+  rather than supervising its text alone.
 - AR (VLM):   ``{"prompt", "response", "media": [{"modality": "image",
   "role": "condition", "uri": "img/0.png"}]}``
 - AR (omni):  ``{"prompt", "response", "media": [{"modality": "audio",
@@ -216,7 +221,7 @@ def normalize_supervised_example(
             raise ValueError("Agent supervised example must end with the target assistant turn.")
         if isinstance(normalized_messages[-1].get("content"), list):
             raise ValueError(
-                "Agent supervised example target (final assistant) turn must be plain text — "
+                "Agent supervised example target (final assistant) turn may not be a content part list — "
                 "interleaved image parts are history-only (supervision is text CE, not an image loss)."
             )
         if not any(message["role"] == "user" for message in normalized_messages[:-1]):

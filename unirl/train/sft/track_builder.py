@@ -104,6 +104,24 @@ class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
     ``bundle.tokenizer`` on the raw response + EOS, matching the rollout
     convention that the stop token is the last supervised token.
 
+    Agent records (``{"messages": [...]}``) are dispatched on what the chat
+    stage declares it can render, so a new AR backbone implements only what it
+    supports — this is the whole contract, there is no base class:
+
+    - ``embed_messages(conversations, *, tools)`` (required for agent rows):
+      histories → the pipeline's AR conditions. The conversation is
+      authoritative; a stage's own ``system_instruction`` belongs to the legacy
+      ``embed`` path, so one manifest renders the same on every backbone.
+    - ``supports_message_images`` (flag, default false): image parts in message
+      content are rendered rather than dropped. The builder refuses to hand
+      image-bearing histories to a stage that does not declare it.
+    - ``tokenize_agent_target(record)`` (optional): the stage owns the target
+      convention when its prompt rendering is not the tokenizer's chat template
+      (Bagel's bare ``<|im_start|>`` wrap); otherwise the HF-template suffix
+      path applies. A stage that cannot render the WHOLE target — a backbone
+      with no tool-call template, say — raises here instead of supervising the
+      part of it that it happens to understand.
+
     Args:
         pipeline: trainer-injected sibling (``Qwen3Pipeline`` / ``QwenVLPipeline`` /
             any pipeline exposing a chat stage + tokenizer-carrying bundle).
