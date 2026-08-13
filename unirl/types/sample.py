@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from dataclasses import fields as dc_fields
-from typing import Any, Callable, Dict, List, Literal, Optional, Sequence
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Union
 
 import torch
 
@@ -45,6 +45,7 @@ from unirl.types.primitives import Images, PrimitiveValue, Texts, primitive_moda
 from unirl.types.sample_id import ancestor_id, child_id, parent_id
 from unirl.types.sampling import BaseSamplingParams
 from unirl.types.segments import Segment, TextSegment
+from unirl.types.tool_calls import ToolCalls
 from unirl.utils.shard_balance import lpt_shard_permutation, shard_token_spread
 
 logger = logging.getLogger(__name__)
@@ -66,10 +67,35 @@ class Turn:
     can be rendered into an LLM/VLM conversation. A plain return type (not a
     :class:`Batch`): ``content`` is already a batched primitive (one row per
     frontier sample).
+
+    Structured agent-trace channels (all optional; absent on plain chat turns):
+    ``tool_calls`` carries the assistant turn's structured calls (row-aligned,
+    from the part's ``"tool_calls"`` primitive); ``content`` is ``None`` only
+    for a calls-only assistant turn (OpenAI's null-content case). On a
+    ``tool``-role turn, ``tool_call_ids`` / ``tool_names`` pair each row's
+    result with the call that produced it (from ``Part.metadata[r]``).
     """
 
     role: str
-    content: Primitive
+    content: Optional[Primitive]
+    tool_calls: Optional["ToolCalls"] = None
+    tool_call_ids: Optional[List[Optional[str]]] = None
+    tool_names: Optional[List[Optional[str]]] = None
+
+    def __post_init__(self) -> None:
+        if self.role not in TURN_ROLES:
+            raise ValueError(f"Turn.role must be one of {TURN_ROLES}, got {self.role!r}.")
+        if self.content is None and self.tool_calls is None:
+            raise ValueError(f"Turn({self.role!r}) carries neither content nor tool_calls.")
+        if self.tool_calls is not None and self.role != "assistant":
+            raise ValueError(f"Turn.tool_calls is assistant-only; got role={self.role!r}.")
+        for name, value in (("tool_call_ids", self.tool_call_ids), ("tool_names", self.tool_names)):
+            if value is not None and self.role != "tool":
+                raise ValueError(f"Turn.{name} is tool-role-only; got role={self.role!r}.")
+        rows = [len(v) for v in (self.content, self.tool_calls) if v is not None]
+        rows += [len(v) for v in (self.tool_call_ids, self.tool_names) if v is not None]
+        if len(set(rows)) > 1:
+            raise ValueError(f"Turn({self.role!r}) channels disagree on batch size: {rows}.")
 
 
 @dataclass
@@ -143,7 +169,13 @@ class Part(Batch):
 
     @classmethod
     def concat(cls, items: Sequence["Part"]) -> "Part":
-        """Concat batch rows while requiring identical shared primitive metadata."""
+        """Concat batch rows while requiring identical shared primitive metadata.
+
+        ``metadata`` semantics: an empty list means "no per-row annotations", so
+        when some shards carry row-aligned metadata (e.g. ``observe`` tool-call
+        pairing) and others carry the empty default, the empty ones are padded
+        with ``{}`` rows — otherwise the generic list-concat rejects the mix.
+        """
         if items:
             expected = items[0].primitive_metadata
             mismatched = [i for i, item in enumerate(items[1:], start=1) if item.primitive_metadata != expected]
@@ -152,6 +184,11 @@ class Part(Batch):
                     "Part.concat: primitive_metadata must be identical across shards; "
                     f"mismatched item indices {mismatched}."
                 )
+            if any(item.metadata for item in items) and any(not item.metadata for item in items):
+                items = [
+                    item if item.metadata else _part_with_field(item, "metadata", [{} for _ in item.sample_ids])
+                    for item in items
+                ]
         return super().concat(items)
 
     @classmethod
@@ -186,7 +223,13 @@ class Part(Batch):
             role=role,
         )
 
-    def input_child(self, primitives: PrimitiveMap, *, role: Optional[str] = None) -> "Part":
+    def input_child(
+        self,
+        primitives: PrimitiveMap,
+        *,
+        role: Optional[str] = None,
+        metadata: Optional[List[Dict[str, Any]]] = None,
+    ) -> "Part":
         """A branch-1 *input* child carrying additional conditioning primitives.
 
         Multi-input multimodal (e.g. image+text → image) usually puts each
@@ -195,14 +238,19 @@ class Part(Batch):
         None because it generates nothing. Chaining keeps only the head a root,
         so the Sample stays valid and
         :meth:`Sample.conditioning` surfaces every input primitive in turn order
-        (root → …). See ``unirl/types/README.md``.
+        (root → …). See ``unirl/types/README.md``. ``metadata`` optionally
+        carries per-row annotations (e.g. ``tool_call_id`` pairing on an
+        observation) and must be row-aligned to the parent.
         """
         if not self.sample_ids:
             raise ValueError("Part.input_child: parent has no sample_ids")
+        if metadata is not None and len(metadata) != len(self.sample_ids):
+            raise ValueError(f"Part.input_child: metadata rows {len(metadata)} != parent batch {len(self.sample_ids)}.")
         return Part(
             sample_ids=[child_id(pid, 0) for pid in self.sample_ids],
             primitives=dict(primitives),
             role=role,
+            metadata=list(metadata) if metadata is not None else [],
         )
 
     @property
@@ -767,7 +815,14 @@ class Sample(Batch):
         )
         return type(self)(parts=[*self.parts, child], reward_compute_s=self.reward_compute_s)
 
-    def observe(self, observation: Primitive, *, role: str = "tool") -> "Sample":
+    def observe(
+        self,
+        observation: Primitive,
+        *,
+        role: str = "tool",
+        tool_call_id: Optional[Union[str, List[Optional[str]]]] = None,
+        tool_name: Optional[Union[str, List[Optional[str]]]] = None,
+    ) -> "Sample":
         """Append an observation as a branch-1, mask-0 *input* Part off the frontier.
 
         The world-response half of an agentic turn (``unirl/rollout/env/README.md``): the
@@ -780,11 +835,46 @@ class Sample(Batch):
         ``role`` tags the observation's conversation turn for role-aware rendering
         (:meth:`Part.resolved_role`), defaulting to ``"tool"`` — the agentic world-response is a
         tool result, so the chat template wraps it as a ``<tool_response>``. A non-tool world
-        (e.g. a user simulator) can pass ``role="user"``.
+        (e.g. a user simulator) can pass ``role="user"``. ``tool_call_id`` / ``tool_name``
+        optionally pair the result with the structured call that produced it (OpenAI
+        ``tool_call_id`` convention); they ride in ``Part.metadata`` and surface on the
+        turn's :attr:`Turn.tool_call_ids` / :attr:`Turn.tool_names`. Rows of a batched
+        frontier are independent trajectories with distinct call ids, so a bare string is
+        only accepted at batch 1 — batched observations must pass row-aligned lists.
         """
         if not self.parts:
             raise ValueError("Sample.observe: no parts to observe from (empty Sample)")
-        obs_part = self.parts[-1].input_child({primitive_modality_key(observation): observation}, role=role)
+        batch = len(self.parts[-1].sample_ids)
+
+        def _rows(value: Optional[Union[str, List[Optional[str]]]], label: str) -> Optional[List[Optional[str]]]:
+            if value is None:
+                return None
+            if isinstance(value, str):
+                if batch != 1:
+                    raise ValueError(
+                        f"Sample.observe: scalar {label} with frontier batch {batch}; rows are independent "
+                        "trajectories with distinct call ids — pass a row-aligned list."
+                    )
+                return [value]
+            if len(value) != batch:
+                raise ValueError(f"Sample.observe: {label} rows {len(value)} != frontier batch {batch}.")
+            return list(value)
+
+        ids = _rows(tool_call_id, "tool_call_id")
+        names = _rows(tool_name, "tool_name")
+        metadata: Optional[List[Dict[str, Any]]] = None
+        if ids is not None or names is not None:
+            metadata = []
+            for r in range(batch):
+                row: Dict[str, Any] = {}
+                if ids is not None and ids[r] is not None:
+                    row["tool_call_id"] = ids[r]
+                if names is not None and names[r] is not None:
+                    row["tool_name"] = names[r]
+                metadata.append(row)
+        obs_part = self.parts[-1].input_child(
+            {primitive_modality_key(observation): observation}, role=role, metadata=metadata
+        )
         return type(self)(parts=[*self.parts, obs_part], reward_compute_s=self.reward_compute_s)
 
     def propagate_rewards(self, op: Literal["mean", "max", "sum"] = "mean") -> "Sample":
@@ -838,7 +928,12 @@ class Sample(Batch):
         the frontier's samples, climbed one level per step via ``parent_id``; each
         level's rows are looked up by id (position-independent). Ancestors with
         no populated ``primitives`` are skipped; for a non-frontier part's turns
-        (replay), call this on ``parts[:i+1]``."""
+        (replay), call this on ``parts[:i+1]``.
+
+        Structured agent channels: a part's ``"tool_calls"`` primitive attaches to
+        its text Turn (or a content-``None`` Turn when the assistant made calls
+        without text); a ``tool``-role part's ``metadata[r]["tool_call_id"]``
+        surfaces as :attr:`Turn.tool_call_ids`."""
         if not self.parts:
             return []
         frontier = self.parts[-1]
@@ -856,12 +951,38 @@ class Sample(Batch):
                 raise ValueError(
                     f"Sample.turns: ancestor id {e.args[0]!r} not found in part {anc}; lineage chain is malformed."
                 ) from None
-            for key in reversed(PRIMITIVE_MODALITY_ORDER):
+            role = part.resolved_role()
+            rows_tensor = torch.tensor(rows, dtype=torch.long)
+            tool_calls = part.primitives.get("tool_calls")
+            selected_calls = tool_calls.select(rows_tensor) if tool_calls is not None else None
+            tool_call_ids: Optional[List[Optional[str]]] = None
+            tool_names: Optional[List[Optional[str]]] = None
+            if role == "tool" and len(part.metadata) == len(part.sample_ids):
+                ids = [(part.metadata[r] or {}).get("tool_call_id") for r in rows]
+                names = [(part.metadata[r] or {}).get("tool_name") for r in rows]
+                if any(i is not None for i in ids):
+                    tool_call_ids = ids
+                if any(n is not None for n in names):
+                    tool_names = names
+            part_turns: List[Turn] = []
+            for key in PRIMITIVE_MODALITY_ORDER:
                 primitive = part.primitives.get(key)
                 if primitive is None:
                     continue
-                content = primitive.select(torch.tensor(rows, dtype=torch.long))
-                out.append(Turn(role=part.resolved_role(), content=content))
+                content = primitive.select(rows_tensor)
+                part_turns.append(
+                    Turn(
+                        role=role,
+                        content=content,
+                        tool_calls=selected_calls if key == "text" else None,
+                        tool_call_ids=tool_call_ids,
+                        tool_names=tool_names,
+                    )
+                )
+            if selected_calls is not None and not any(t.tool_calls is not None for t in part_turns):
+                # Calls-only assistant part (OpenAI null-content): surface the calls anyway.
+                part_turns.append(Turn(role=role, content=None, tool_calls=selected_calls))
+            out.extend(reversed(part_turns))
             if part.is_root:
                 break
             active_ids = [parent_id(aid) for aid in active_ids]
@@ -874,8 +995,9 @@ class Sample(Batch):
         ancestor's raw primitives, row-aligned to the frontier's
         samples, in chronological order (root → frontier-parent). The role-stripped
         view of :meth:`turns` — the bare-primitive escape unified models consume
-        (replay: call on ``parts[:i+1]``)."""
-        return [t.content for t in self.turns()]
+        (replay: call on ``parts[:i+1]``). Calls-only turns (``content is None``)
+        carry no raw primitive and are skipped."""
+        return [t.content for t in self.turns() if t.content is not None]
 
     def prompt_media_refs(self) -> Optional[MediaRefs]:
         """Return typed URI prompt-media refs from the root input Part, if any.
@@ -915,8 +1037,16 @@ class Sample(Batch):
 
     def text_conditioning(self) -> List[Turn]:
         """LLM render: the trajectory as an all-text conversation. Fails loud on
-        any non-text turn — this consumer has no image channel."""
+        any non-text turn — this consumer has no image channel — and on
+        calls-only turns (the wire render carries tool calls inline in the
+        assistant text; structured-only turns come from manifest conversion and
+        belong to the messages render, ``build_text_messages``)."""
         ts = self.turns()
+        if any(t.content is None for t in ts):
+            raise ValueError(
+                "Sample.text_conditioning: trajectory has a calls-only turn (content=None); "
+                "the wire render requires inline-text tool calls."
+            )
         non_text = [primitive_modality_key(t.content) for t in ts if not isinstance(t.content, Texts)]
         if non_text:
             raise ValueError(f"Sample.text_conditioning: the LLM path requires all-text turns; got non-text {non_text}")
@@ -929,11 +1059,15 @@ class Sample(Batch):
         modality."""
         ts = self.turns()
         images = [t.content for t in ts if isinstance(t.content, Images)]
-        extra = [primitive_modality_key(t.content) for t in ts if not isinstance(t.content, (Texts, Images))]
+        extra = [
+            primitive_modality_key(t.content) if t.content is not None else "tool_calls-only"
+            for t in ts
+            if not isinstance(t.content, (Texts, Images))
+        ]
         if extra or not images:
             raise ValueError(
                 f"Sample.vision_conditioning: requires text+image turns only; got "
-                f"{[primitive_modality_key(t.content) for t in ts]}"
+                f"{[primitive_modality_key(t.content) if t.content is not None else 'tool_calls-only' for t in ts]}"
             )
         return ts, images
 

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 
+from unirl.types.agent_trace import system_instruction_wins
 from unirl.types.primitives import Images
 from unirl.types.sample import Turn
 
@@ -35,9 +36,11 @@ Conversation = List[Dict[str, Any]]
 
 
 def system_prefix(system_instruction: Optional[str], roles: List[str]) -> Conversation:
-    """The config ``system_instruction`` as a leading message, unless the trajectory
-    already carries an explicit ``system`` turn (which wins)."""
-    if system_instruction and "system" not in roles:
+    """The Turn-dialect form of the one system rule (see
+    :func:`unirl.types.agent_trace.system_instruction_wins`): the config
+    ``system_instruction`` leads unless the trajectory carries its own ``system``
+    turn."""
+    if system_instruction_wins(system_instruction, roles):
         return [{"role": "system", "content": system_instruction}]
     return []
 
@@ -67,14 +70,31 @@ def build_text_messages(
     Transposes :meth:`Sample.text_conditioning` (turn-major, frontier-aligned) into
     one message list per frontier sample. Degenerates to a single ``user`` message
     when no roles are set, so it is byte-identical on single-turn workloads.
+
+    Structured agent channels ride through when present: a turn's
+    :attr:`Turn.tool_calls` rows emit OpenAI-style ``tool_calls`` entries (dict
+    ``arguments`` — the HF template form), a calls-only turn emits
+    ``content: None``, and a tool turn emits ``tool_call_id`` / ``name``. Plain
+    chat turns emit exactly ``{"role", "content"}``.
     """
     if not turns:
         return []
     roles = [t.role for t in turns]
-    cols = [t.content.texts for t in turns]
+    cols = [t.content.texts if t.content is not None else None for t in turns]
     prefix = system_prefix(system_instruction, roles)
-    n_rows = len(turns[0].content)
-    return [prefix + [{"role": roles[j], "content": cols[j][row]} for j in range(len(turns))] for row in range(n_rows)]
+    n_rows = next(len(t.content if t.content is not None else t.tool_calls) for t in turns)
+
+    def _message(j: int, row: int) -> Dict[str, Any]:
+        message: Dict[str, Any] = {"role": roles[j], "content": cols[j][row] if cols[j] is not None else None}
+        calls = turns[j].tool_calls.rows[row] if turns[j].tool_calls is not None else []
+        if calls:
+            message["tool_calls"] = [call.to_message_entry() for call in calls]
+        for key, channel in (("tool_call_id", turns[j].tool_call_ids), ("name", turns[j].tool_names)):
+            if channel is not None and channel[row] is not None:
+                message[key] = channel[row]
+        return message
+
+    return [prefix + [_message(j, row) for j in range(len(turns))] for row in range(n_rows)]
 
 
 def build_vision_messages(
