@@ -1,15 +1,4 @@
-"""Shared bookkeeping for the bucketed-CUDA-IPC weight-sync path.
-
-Both the engine-side dispatch (``VLLMOmniRolloutEngine.update_weights_from_ipc``
-fan-out to per-stage workers via ``collective_rpc``) and the trainer-side
-IPC weight-sync handler need to agree on:
-
-- The ZMQ socket layout (one socket per ``(replica, stage, rank)`` tuple).
-- The fixed LoRA identifier used for the single adapter we hot-swap.
-
-Centralizing here keeps both sides in sync. No vllm-omni / vllm imports
-at module level — this is pure-Python so it's importable from any side.
-"""
+"""Shared bookkeeping for the bucketed-CUDA-IPC weight-sync path."""
 
 from __future__ import annotations
 
@@ -23,25 +12,13 @@ _DEFAULT_IPC_DIR: str = os.environ.get("DIFFRL_IPC_DIR", "/tmp")
 
 
 def zmq_handle(replica_rank: int, stage_id: int, local_rank: int, *, ipc_dir: str | None = None) -> str:
-    """Return the IPC socket path for one ``(replica, stage, rank)`` peer pair.
-
-    The receiver-side worker is identified by its ``local_rank`` within
-    the stage and the global ``replica_rank`` of the rollout actor. The
-    sender (trainer) computes the same path so they meet on the same
-    socket.
-    """
+    """Return the IPC socket path for one ``(replica, stage, rank)`` peer pair."""
     root = ipc_dir if ipc_dir is not None else _DEFAULT_IPC_DIR
     return f"ipc://{root}/diffrl-zmq-replica-{int(replica_rank)}-stage-{int(stage_id)}-rank-{int(local_rank)}.sock"
 
 
 def replica_rank_from_env() -> int:
-    """Read the rollout-actor replica rank from env (default 0).
-
-    Trainer-side and worker-side both consult this so the socket path
-    matches without an explicit kwarg every call. Trainers and rollout
-    actors should set ``DIFFRL_REPLICA_RANK`` consistently when there is
-    more than one rollout replica.
-    """
+    """Read the rollout-actor replica rank from env (default 0)."""
     return int(os.environ.get("DIFFRL_REPLICA_RANK", "0"))
 
 

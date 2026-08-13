@@ -1,39 +1,4 @@
-"""Supervised (SFT) datasets — target-carrying manifests with epoch semantics.
-
-The RL data layer (``datasets.py`` / ``data_source.py``) is prompt-first by
-design: rows carry prompts, rollout generates the targets. SFT rows carry the
-target itself, so they get their own dataset shaping here — sharing the media
-normalization machinery (:func:`unirl.data.datasets._normalize_media_refs`)
-but NOT the RL classes (per-algorithm dataset shaping; a shared stage-keyed
-dispatcher is the misrouting failure mode other frameworks hit).
-
-Manifest row shapes (JSONL, one object per line; relative media URIs resolve
-against the manifest's directory):
-
-- AR (LLM):   ``{"prompt": str, "response": str}``
-- AR (agent): ``{"messages": [..., {"role": "assistant", ...}], "tools": [...]}``
-- AR (VLM):   ``{"prompt", "response", "media": [{"modality": "image",
-  "role": "condition", "uri": "img/0.png"}]}``
-- AR (omni):  ``{"prompt", "response", "media": [{"modality": "audio",
-  "role": "prompt", "uri": "audio/0.wav"}]}`` — URI-backed prompt media
-  (image / audio / video) for chat stages that render it themselves; the
-  builder rejects ``role="condition"`` here rather than silently dropping it
-- Diffusion:  ``{"prompt": str, "media": [{"modality": "image",
-  "role": "target", "uri": "img/0.png"}]}`` (``caption`` accepted as an alias
-  for ``prompt``)
-- Video diffusion: ``{"prompt": str, "media": [{"modality": "video",
-  "role": "target", "uri": "video/0.mp4"}]}``
-
-Rows are OPAQUE records driver-side — media loading and tokenization happen on
-the training workers (``unirl/train/sft/track_builder.py`` track builders), so nothing heavy crosses
-the driver/Ray boundary.
-
-Epoch semantics: :class:`SupervisedDataSource` walks a per-epoch reshuffled
-order and exposes ``state_dict()`` / ``load_state_dict()`` with the exact
-``{epoch, position}`` cursor, checkpointed by the SFT trainer — mid-epoch
-resume replays neither skips nor duplicates (RL's infinite reshuffled stream
-has no such notion, which is why this is a separate class).
-"""
+"""Supervised (SFT) datasets — target-carrying manifests with epoch semantics."""
 
 from __future__ import annotations
 
@@ -115,14 +80,7 @@ def normalize_supervised_example(
     default_sample_id: str,
     base_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Normalize one raw manifest row into the supervised record shape.
-
-    Returns either a legacy ``{"sample_id", "prompt", ...}`` record or an
-    agent ``{"sample_id", "messages", ["tools"], ...}`` record. Agent rows
-    carry the target assistant turn as the final message; the worker-side
-    builder renders the preceding history as the prompt and supervises only
-    that final turn.
-    """
+    """Normalize one raw manifest row into the supervised record shape."""
     if not isinstance(item, dict):
         raise TypeError(f"Supervised example must be a dict, got {type(item).__name__}.")
     legacy = sorted(k for k in _LEGACY_EMBEDDING_FIELDS if k in item)
@@ -200,11 +158,7 @@ def normalize_supervised_example(
 
 
 class SupervisedDataset:
-    """File-backed supervised dataset: parsing + per-row normalization only.
-
-    Supports ``.jsonl`` (one object per line) and ``.json`` (list of objects).
-    Epoch ordering / batching belong to :class:`SupervisedDataSource`.
-    """
+    """File-backed supervised dataset: parsing + per-row normalization only."""
 
     def __init__(self, file_path: str) -> None:
         self.file_path = file_path
@@ -247,13 +201,7 @@ class SupervisedDataset:
 
 
 class SupervisedDataSource:
-    """Epoch-aware batch iterator over a supervised manifest (+ eval split).
-
-    ``get_samples`` walks a per-epoch shuffled order (``seed + epoch``-seeded,
-    so resume is exact) and wraps across epoch boundaries within one batch.
-    The ``{epoch, position}`` cursor rides ``state_dict()`` into the trainer's
-    checkpoint sidecar.
-    """
+    """Epoch-aware batch iterator over a supervised manifest (+ eval split)."""
 
     def __init__(
         self,
@@ -319,13 +267,7 @@ class SupervisedDataSource:
             )
 
     def iter_eval_batches(self, batch_size: int, *, eval_num_samples: int = -1) -> Iterator[List[Dict[str, Any]]]:
-        """Deterministic-order eval batches (manifest order, no shuffle).
-
-        ``eval_num_samples``: ``-1`` = full eval set, ``0`` = nothing,
-        ``N > 0`` = first N rows. The final partial batch is yielded as-is —
-        the trainer pads it to the DP width with ``_eval_pad`` rows the loss
-        masks out, so the full set is covered exactly.
-        """
+        """Deterministic-order eval batches (manifest order, no shuffle)."""
         pool = self.eval_dataset if self.eval_dataset is not None else self.dataset
         n = len(pool)
         limit = n if eval_num_samples < 0 else min(eval_num_samples, n)

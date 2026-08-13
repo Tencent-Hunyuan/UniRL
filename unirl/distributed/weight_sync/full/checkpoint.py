@@ -1,23 +1,4 @@
-"""v2 full-weight checkpoint-path sync (COLOCATE, single-node).
-
-Simplest full-weight transport: the train slab serializes the freshly-trained
-full base weights to a file on a shared/local path, and each co-located rollout
-engine loads it via ``update_weights_from_path``. Full-weight analogue of the
-LoRA / tensor / nccl / ipc handlers, used to bring up the FastVideo engine
-before the faster zero-copy transports are wired.
-
-Mirrors ``TensorWeightSync`` (colocate, ``rollout`` is a LOCAL sibling) but the
-handoff is a torch.save file instead of a serialized tensor bag:
-
-  rank0: ``_iter_full_tensors`` (FSDP all-gather; all ranks in lockstep) →
-         ``torch.save`` to ``{sync_dir}/weights_v{N}`` + ``.ready`` marker
-  every rank: wait for marker → ``self._rollout.update_weights_from_path(path)``
-
-The weight walk yields the bare trainable-module (transformer) keys, which is
-exactly what the FastVideo engine's ``transformer.load_state_dict`` expects — so
-no ``name_remap`` is needed for the default FastVideo case. All torch imports
-are deferred so the driver can import this module for ``remote(...)``.
-"""
+"""v2 full-weight checkpoint-path sync (COLOCATE, single-node)."""
 
 from __future__ import annotations
 
@@ -89,14 +70,7 @@ class CheckpointWeightSync(FullWeightSync):
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def sync(self) -> None:
-        """Publish the full weights to a file and load it into the local engine.
-
-        Runs on every train rank (``BROADCAST``). ``_iter_full_tensors`` all-gathers
-        each FSDP shard on every rank in lockstep, so all ranks must iterate; only
-        rank-0 keeps the materialized tensors and writes the file. The path is
-        deterministic from ``version`` (incremented in lockstep on every
-        rank), so all ranks agree on it without a broadcast.
-        """
+        """Publish the full weights to a file and load it into the local engine."""
         import torch
 
         version = self.version
@@ -135,13 +109,7 @@ class CheckpointWeightSync(FullWeightSync):
             torch.cuda.empty_cache()
 
     def _cleanup_old_versions(self, publishing_version: int) -> None:
-        """Keep only the version being published and the last good fallback.
-
-        Cleanup runs at the *next* sync, after the previous driver-level
-        BROADCAST completed and after rollout ``wake_up`` consumed its cached
-        checkpoint. Retaining ``publishing_version - 1`` keeps wake fail-closed
-        if the new publication/load fails partway through.
-        """
+        """Keep only the version being published and the last good fallback."""
         keep = {publishing_version, max(0, publishing_version - 1)}
         pattern = re.compile(r"^weights_v(\d+)\.pt(?:\..*)?$")
         try:

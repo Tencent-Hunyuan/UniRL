@@ -1,44 +1,4 @@
-"""DiffusionOPD — on-policy distillation for diffusion models (teacher-anchored).
-
-Implements "DiffusionOPD: A Unified Perspective of On-Policy Distillation in
-Diffusion Models" (arXiv 2605.15055). The student rolls out its own trajectory;
-a frozen teacher LoRA adapter replays that SAME trajectory to produce per-step
-transition means, and the loss is the closed-form Gaussian KL between the two
-transition distributions at shared variance:
-
-    KL = (mu_student - mu_teacher)^2 / (2 * sigma_t^2)
-
-``add_kl_coefficient`` picks ``sigma_t``: ``True`` uses the SDE transition std
-from ``stage.strategy.transition_std`` (the paper's SDE mode — requires a
-noised rollout, ``eta > 0``); ``False`` uses ``sigma_t = 1``, i.e. plain
-mean-matching ``0.5 * delta^2`` (the paper's ODE mode, its headline MOPD
-configuration). Both are one expression via :func:`_gaussian_kl_div` +
-:func:`_transition_sigma`.
-
-No reward model participates in the loss — rewards, if configured, are
-monitoring-only, and the algorithm declares ``requires_advantages = False``
-(the SFT contract). The trainer/stack host it unchanged.
-
-**Teachers are backend-owned.** Each teacher is a frozen LoRA adapter injected
-pre-FSDP-wrap by the train backend (``backend.lora_cfg.frozen_adapters``, see
-:func:`unirl.train.lora.inject_frozen_adapter`); the algorithm only routes the
-replay through it via :func:`unirl.train.lora.adapter_active`. Teacher deltas
-apply to the frozen base weights — sound because LoRA training never moves the
-base.
-
-**Teacher selection is data-driven.** The multi-domain data source stamps
-``metadata["domain"]`` on every prompt and yields single-domain batches; the
-trainer projects root metadata onto the train Part, and :meth:`prepare_part`
-reads it to pick the teacher whose ``name`` equals the batch's domain. No
-counters, so data order, resume fast-forward, and eval cannot desynchronize
-prompts from teachers.
-
-ODE-mode recipes note: ``stage.replay`` needs per-step log-probs to exist, so a
-deterministic rollout uses a vanishing-but-nonzero ``sampling.eta`` (e.g. 1e-6)
-with ``add_kl_coefficient=False``. Do NOT pair a near-zero ``eta`` with
-``add_kl_coefficient=True`` — ``sigma_t`` scales with ``eta`` and the KL
-divides by it.
-"""
+"""DiffusionOPD — on-policy distillation for diffusion models (teacher-anchored)."""
 
 from __future__ import annotations
 
@@ -63,29 +23,14 @@ DOMAIN_KEY = "domain"
 
 @dataclass
 class TeacherSpec:
-    """One distillation teacher.
-
-    ``name`` is simultaneously the frozen adapter name on the backend model,
-    the ``metadata["domain"]`` value the data source stamps, and the wandb
-    metric suffix — one name, one teacher, everywhere. ``guidance_scale``
-    overrides the student's CFG scale during the teacher replay (each teacher
-    was trained at its own scale); ``None`` keeps the student's.
-    """
+    """One distillation teacher."""
 
     name: str
     guidance_scale: Optional[float] = None
 
 
 class DiffusionOPD(StageAlgorithm):
-    """Teacher-anchored distillation loss over the student's own rollout.
-
-    :meth:`prepare_part` replays the rollout trajectory under the batch's
-    teacher adapter (``no_grad``, eval-mode window) and freezes the teacher
-    transition means on ``segment.sde_means`` — the same pre-declared CONCAT
-    field FlowDPPO anchors on, so micro-batch slicing keeps rows aligned.
-    :meth:`compute_loss_and_backward` replays the student with grad and reduces
-    the per-step Gaussian KL. ``advantages`` are ignored by contract.
-    """
+    """Teacher-anchored distillation loss over the student's own rollout."""
 
     requires_ema_rollout = False
     # Multi-update against the teacher anchor is unvalidated.
@@ -170,12 +115,7 @@ class DiffusionOPD(StageAlgorithm):
         return [int(i) for i in segment.sde_indices.tolist()]
 
     def prepare_part(self, part: Any) -> Any:
-        """Freeze the batch's teacher transition means on ``segment.sde_means``.
-
-        Runs once per rollout on the arranged worker shard, inside the stack's
-        eval-mode window (no dropout in the teacher forward). The teacher is
-        the one whose name equals the shard's uniform ``metadata["domain"]``.
-        """
+        """Freeze the batch's teacher transition means on ``segment.sde_means``."""
         target_steps = self._resolve_target_steps(part.segment)
         if not target_steps:
             return part
@@ -230,10 +170,7 @@ class DiffusionOPD(StageAlgorithm):
         training_progress: float,
         loss_scale: float,
     ) -> AlgorithmStepResult:
-        """Per-step Gaussian KL between student and frozen teacher means.
-
-        ``advantages`` is unused (``requires_advantages = False``).
-        """
+        """Per-step Gaussian KL between student and frozen teacher means."""
         target_steps = self._resolve_target_steps(segment)
         if not target_steps or segment.sde_means is None:
             return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)

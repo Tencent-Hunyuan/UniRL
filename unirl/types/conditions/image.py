@@ -1,11 +1,4 @@
-"""Image conditioning types.
-
-``ImageLatentCondition`` carries dense VAE latents (img2img, first-frame, etc.).
-``ImageEmbedCondition`` carries ViT-style patch embeddings (SigLIP / CLIP
-vision tower output, AR-emitted-image-token re-embeddings). Other roles
-(``ImageMaskedLatentCondition``, ``ImageTokenCondition``) remain deferred
-to first consumer.
-"""
+"""Image conditioning types."""
 
 from __future__ import annotations
 
@@ -35,18 +28,7 @@ class ImageLatentCondition(Condition):
 
 @dataclass
 class ImageEmbedCondition(Condition):
-    """Image conditioning carried as ViT-style patch embeddings.
-
-    First consumer is HunyuanImage 3.0 (SigLIP2 ViT for i2t/it2i comprehension,
-    plus AR-emitted image-vocab token re-embeddings on the diffusion side).
-    Same shape as ``TextEmbedCondition.embeds`` but tagged ``Modality.IMAGE``.
-
-    HunyuanImage3 stores ``embeds``, ``attn_mask``, and ``spatial_shapes`` as
-    per-sample lists because patch counts vary with native image geometry.
-    Fixed-grid encoders may use dense tensors for the first two fields. All
-    three remain CONCAT-aligned so DP slice/select never detach one sample's
-    spatial metadata from its embeddings.
-    """
+    """Image conditioning carried as ViT-style patch embeddings."""
 
     modality: ClassVar[Modality] = Modality.IMAGE
 

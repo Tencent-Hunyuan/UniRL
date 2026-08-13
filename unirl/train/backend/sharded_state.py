@@ -1,17 +1,4 @@
-"""FSDP2-generic sharded-state helpers shared by every train backend.
-
-These operate on any module whose params are ``DTensor``s over a device mesh —
-they are agnostic to *how* the module was sharded (torch-native ``fully_shard``
-or VeOmni's ``parallelize``), so both :class:`~unirl.train.backend.fsdp.FSDPBackend`
-and :class:`~unirl.train.backend.veomni.VeOmniBackend` consume them verbatim via
-their package ``state.py`` re-exports.  Engine-specific bits (grad clipping,
-offload/onload) live in the per-package ``state.py`` next to the backend.
-
-This module imports ``torch`` at module level and MUST stay out of the
-``veomni`` package's import graph — it is imported only from inside ``backend.py``
-(directly and via the package ``state.py`` re-export, itself reached only through
-``backend.py``).  Same discipline as ``sharded_load.py``.
-"""
+"""FSDP2-generic sharded-state helpers shared by every train backend."""
 
 from __future__ import annotations
 
@@ -60,16 +47,7 @@ def load_model_state_dict(
     strict: bool = True,
     broadcast_from_rank0: bool = True,
 ) -> None:
-    """Load a full state dict and reshard it into ``model``.
-
-    With ``broadcast_from_rank0=True`` (default), only rank 0 needs the full
-    state. Set it to ``False`` when every rank carries a deliberately different
-    full state, such as its own pre-sliced expert block under VeOmni EP.
-    ``strict=False`` loads a partial dict (adapter-only checkpoints, or the
-    backend's post-parallelize weight load where injected adapter params are
-    legitimately absent): keys absent from ``state_dict`` keep the model's
-    current weights.
-    """
+    """Load a full state dict and reshard it into ``model``."""
     from torch.distributed.checkpoint.state_dict import set_model_state_dict
 
     options = _build_state_dict_options(
@@ -85,13 +63,7 @@ def load_model_state_dict(
 
 
 def gather_optimizer_state_dict(model: nn.Module, optimizer: torch.optim.Optimizer) -> StateDict:
-    """Rank-0 DCP gather of optimizer state.  Full state on rank 0, empty on others.
-
-    All ranks must call this (the gather is a collective).  Values are full
-    (unsharded) CPU tensors keyed by parameter FQN — symmetric with
-    :func:`gather_state_dict`.  ``optimizer.state_dict()`` is NOT a substitute:
-    under FSDP2 its values are this rank's local DTensor shards.
-    """
+    """Rank-0 DCP gather of optimizer state.  Full state on rank 0, empty on others."""
     from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
 
     options = _build_state_dict_options(full_state_dict=True, cpu_offload=True)
@@ -106,16 +78,7 @@ def gather_optimizer_state_dict(model: nn.Module, optimizer: torch.optim.Optimiz
 
 
 def gather_lora_state_dict(model: nn.Module) -> StateDict:
-    """Gather every adapter's LoRA tensors, preserving the model state-dict key format.
-
-    Unlike :func:`gather_state_dict`, this never asks DCP for the full model
-    state. Each LoRA DTensor is materialized directly, so adapter-only
-    checkpoints avoid full-model CPU memory and wire traffic. CPU-offloaded
-    DTensor shards are moved to CUDA one tensor at a time before the collective,
-    because this stack initializes the train mesh with NCCL, not a CPU backend.
-    All ranks must call this because DTensor materialization is collective; only
-    rank 0 returns the gathered CPU tensors.
-    """
+    """Gather every adapter's LoRA tensors, preserving the model state-dict key format."""
     gathered: StateDict = {}
     for key, value in model.state_dict().items():
         if "lora_A" not in key and "lora_B" not in key:
@@ -139,13 +102,7 @@ def load_optimizer_state_dict(
     *,
     broadcast_from_rank0: bool = True,
 ) -> None:
-    """Load a full optimizer state dict and reshard it into ``optimizer``.
-
-    Pass the rank-0 dict from :func:`gather_optimizer_state_dict`; other ranks
-    pass ``{}`` when ``broadcast_from_rank0=True``. Set it to ``False`` when
-    every rank supplies an intentionally different full state (VeOmni EP
-    pre-slices expert moments before this call).
-    """
+    """Load a full optimizer state dict and reshard it into ``optimizer``."""
     from torch.distributed.checkpoint.state_dict import set_optimizer_state_dict
 
     options = _build_state_dict_options(
@@ -160,14 +117,7 @@ def load_optimizer_state_dict(
 
 
 def sharded_model_state_dict(model: nn.Module) -> StateDict:
-    """Per-rank sharded model state for DCP.
-
-    Unlike :func:`gather_state_dict`, this keeps each rank's local DTensor
-    shard (``full_state_dict=False``, no rank-0 gather, no cpu_offload) so
-    every rank writes only its own slice via ``dcp.save``. Never materializes
-    a full tensor on any single rank — the basis for checkpointing models too
-    large to gather (80B meta-init bundles).
-    """
+    """Per-rank sharded model state for DCP."""
     from torch.distributed.checkpoint.state_dict import get_model_state_dict
 
     options = _build_state_dict_options(full_state_dict=False)
@@ -178,8 +128,7 @@ def sharded_model_state_dict(model: nn.Module) -> StateDict:
 
 
 def sharded_optimizer_state_dict(model: nn.Module, optimizer: torch.optim.Optimizer) -> StateDict:
-    """Per-rank sharded optimizer state for DCP (symmetric with
-    :func:`sharded_model_state_dict`)."""
+    """Per-rank sharded optimizer state for DCP (symmetric with"""
     from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
 
     options = _build_state_dict_options(full_state_dict=False)
@@ -190,11 +139,7 @@ def sharded_optimizer_state_dict(model: nn.Module, optimizer: torch.optim.Optimi
 
 
 def load_sharded_model_state_dict(model: nn.Module, state_dict: StateDict, *, strict: bool = True) -> None:
-    """Load a per-rank sharded model state read by ``dcp.load`` in place.
-
-    ``strict=False`` loads adapter-only checkpoints: keys absent from
-    ``state_dict`` keep the model's current weights.
-    """
+    """Load a per-rank sharded model state read by ``dcp.load`` in place."""
     from torch.distributed.checkpoint.state_dict import set_model_state_dict
 
     options = _build_state_dict_options(full_state_dict=False, strict=strict)
@@ -218,14 +163,7 @@ def load_sharded_optimizer_state_dict(
 
 
 def drop_meta_entries(state_dict: StateDict) -> StateDict:
-    """Drop never-materialized (meta) entries from a sharded state dict.
-
-    Meta-init bundles (e.g. hi3 80B) keep frozen aux (vae / vit) on meta —
-    those tensors carry no data and DCP cannot read/write them. The trained
-    decoder + heads are materialized and remain. A plain ``.is_meta`` check on
-    the (possibly DTensor) value's local view is enough: a DTensor over meta
-    shards reports ``is_meta`` on its local tensor.
-    """
+    """Drop never-materialized (meta) entries from a sharded state dict."""
     kept: StateDict = {}
     for key, value in state_dict.items():
         local = getattr(value, "_local_tensor", value)
@@ -236,11 +174,7 @@ def drop_meta_entries(state_dict: StateDict) -> StateDict:
 
 
 def move_optimizer_state(optimizer: torch.optim.Optimizer, device: object) -> None:
-    """Move every tensor in the optimizer state to ``device`` (the on/offload loop).
-
-    ``device`` may be a ``torch.device`` or a string (``"cpu"`` for offload, the
-    live device for onload).  Non-tensor state (step counts, etc.) is left alone.
-    """
+    """Move every tensor in the optimizer state to ``device`` (the on/offload loop)."""
     for state in optimizer.state.values():
         for k, v in state.items():
             if isinstance(v, torch.Tensor):
@@ -251,11 +185,7 @@ def lora_state_dict(
     model: nn.Module,
     full_sd: Optional[StateDict] = None,
 ) -> StateDict:
-    """Adapter-only state for inference export.
-
-    All ranks must call this (the DCP gather is a collective).  Returns
-    the filtered dict on rank 0, empty dict on other ranks.
-    """
+    """Adapter-only state for inference export."""
     if full_sd is None:
         full_sd = gather_state_dict(model)
     if _current_rank() != 0:
@@ -268,11 +198,7 @@ def nft_state_dict(
     full_sd: Optional[StateDict] = None,
     shadow_adapter: str = "old",
 ) -> StateDict:
-    """Export the shadow ('old') adapter state for DiffusionNFT checkpoint.
-
-    All ranks must call this (the DCP gather is a collective).  Returns
-    the filtered dict on rank 0, empty dict on other ranks.
-    """
+    """Export the shadow ('old') adapter state for DiffusionNFT checkpoint."""
     if full_sd is None:
         full_sd = gather_state_dict(model)
     if _current_rank() != 0:
@@ -321,12 +247,7 @@ def _is_lora_key(key: str) -> bool:
 
 
 def _build_state_dict_options(**kwargs: object) -> object:
-    """Construct ``StateDictOptions`` degrading gracefully on older torch.
-
-    The fallback ladder drops the newest kwargs first (``strict``, then
-    ``broadcast_from_rank0``) so a torch whose ``StateDictOptions`` predates them
-    still constructs.  On supported torch the first rung wins (full fidelity).
-    """
+    """Construct ``StateDictOptions`` degrading gracefully on older torch."""
     from torch.distributed.checkpoint.state_dict import StateDictOptions
 
     candidates = [

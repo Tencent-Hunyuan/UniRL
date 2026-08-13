@@ -1,30 +1,4 @@
-"""Construction config for the typed HunyuanVideo-1.5 pipeline.
-
-Sibling of :class:`unirl.models.wan21.WAN21PipelineConfig`.
-Carries weights+precision knobs only; LoRA injection, FSDP wrapping,
-gradient checkpointing, and offload control all live in
-``cfg.training.policies`` (``LoRAPolicy`` / ``FSDPPolicy``) — the bundle
-is weights+params only.
-
-Three knobs are HunyuanVideo-1.5-specific (vs the SD3 / Qwen-Image /
-WAN21 sibling configs):
-
-- ``text_encoder_2_ckpt_path``: ByT5 glyph encoder lives in a separate
-  HuggingFace subfolder (``text_encoder_2`` / ``tokenizer_2``); recipes
-  that load Qwen-VL + ByT5 from the same checkpoint dir can leave this
-  ``None`` and the bundle falls back to ``pretrained_model_ckpt_path``.
-- ``image_encoder_ckpt_path``: SigLIP vision encoder for I2V (only used
-  when ``load_vision_encoder=True``).
-- ``mllm_*`` / ``byt5_max_length`` / ``vision_*``: shape parameters
-  copied verbatim from the upstream HunyuanVideo15 pipeline; tweaking
-  these without also retraining the transformer breaks the model.
-
-``shift`` defaults to 5.0 (the upstream HunyuanVideo-1.5 default; SD3
-uses 3.0). Unlike Qwen-Image, HunyuanVideo-1.5 uses **static** shift,
-not dynamic-mu — :class:`FlowMatchSchedulePolicy.from_pretrained` will
-read ``use_dynamic_shifting=False`` from the checkpoint's
-``scheduler_config.json`` and stick to the static branch.
-"""
+"""Construction config for the typed HunyuanVideo-1.5 pipeline."""
 
 from __future__ import annotations
 
@@ -36,12 +10,7 @@ from unirl.config.validation import validate_precision_type
 
 @dataclass
 class HunyuanVideo15PipelineConfig:
-    """Construction args for ``HunyuanVideo15Pipeline.from_config``.
-
-    ``device`` may be runtime-injected by the actor after compose; the
-    other fields are set at compose time and read once during pipeline
-    construction.
-    """
+    """Construction args for ``HunyuanVideo15Pipeline.from_config``."""
 
     pretrained_model_ckpt_path: str
     vae_ckpt_path: Optional[str] = None

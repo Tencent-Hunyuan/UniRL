@@ -1,22 +1,4 @@
-"""Monkey-patch ``DiffusionLoRAManager._load_adapter`` to accept in-memory
-LoRA tensors.
-
-vLLM-Omni's stock ``DiffusionLoRAManager._load_adapter`` only loads LoRA
-weights from a file path (calls ``LoRAModel.from_local_checkpoint``). For
-RL we need to push freshly-trained adapter tensors directly without going
-through disk. This module lifts the verl-omni hijack pattern verbatim:
-
-- ``OmniTensorLoRARequest`` extends ``vllm_omni.lora.request.LoRARequest``
-  with two extra fields (``peft_config`` dict + ``lora_tensors`` dict).
-- ``VLLMOmniHijack.hijack()`` replaces ``DiffusionLoRAManager._load_adapter``
-  with a version that branches on the request type: tensor requests go
-  through ``LoRAModel.from_lora_tensors``, file-path requests still hit
-  the original code path.
-
-Origin: ``verl-omni/verl_omni/utils/vllm_omni/utils.py``. Lifted as-is.
-Run ``VLLMOmniHijack.hijack()`` once per worker subprocess (typically
-from a worker-extension's ``__new__``).
-"""
+"""Monkey-patch ``DiffusionLoRAManager._load_adapter`` to accept in-memory LoRA tensors."""
 
 from __future__ import annotations
 
@@ -62,26 +44,7 @@ def _pid_alive(pid: int) -> bool:
 
 
 def install_fate_sharing(anchor_pid: int, *, arm_pdeathsig: bool) -> None:
-    """Bind this process's lifetime to the root of its spawn chain.
-
-    Without this the engine subprocess tree outlives the run. Measured on the
-    Qwen3-Omni anchored TP=4 topology: ``kill -TERM`` on the driver takes down
-    the driver, the Ray actors and ``StageEngineCoreProc``, but the four
-    ``Worker_TP*`` processes reparent to init and sit there holding ~7.3 GiB of
-    device memory each until reaped by hand.
-
-    Two complementary mechanisms:
-
-    - ``PR_SET_PDEATHSIG`` is armed only when the parent's main thread creates
-      the process. Linux binds it to the specific creator thread, so arming it
-      for children launched by short-lived stage-initialization threads would
-      kill healthy workers as soon as initialization finishes.
-    - A poll on the root anchor. vLLM's own ``death_pipe`` EOF monitor is the
-      intended backstop for the TP workers, but it only unblocks the worker's
-      message queues; a worker sitting in a CUDA or NCCL call never observes
-      it. Polling a pid and calling ``os._exit`` does not depend on the worker
-      being schedulable in Python at the moment its parent dies.
-    """
+    """Bind this process's lifetime to the root of its spawn chain."""
     if arm_pdeathsig:
         try:
             import ctypes
@@ -108,16 +71,7 @@ def install_fate_sharing(anchor_pid: int, *, arm_pdeathsig: bool) -> None:
 
 
 class _DiffrlPatchedTarget:
-    """Pickleable top-level wrapper that installs patches in the child first.
-
-    Must be a module-level class so spawn's pickler can serialise the wrapped
-    target across the process boundary. Nested functions / closures cannot be
-    pickled and would break spawn.
-
-    ``_anchor_pid`` is captured in the PARENT (``__init__`` runs there, at
-    ``Process(...)`` construction) and read back in the child, which is what
-    makes it a usable fate-sharing anchor.
-    """
+    """Pickleable top-level wrapper that installs patches in the child first."""
 
     def __init__(self, target):
         self._target = target
@@ -137,14 +91,7 @@ _WRAP_SENTINEL = "_diffrl_target_wrapped"
 
 
 def wrap_mp_process_for_children() -> None:
-    """Replace ``BaseProcess.__init__`` so spawned targets install patches first.
-
-    Patching ``mp.Process.__init__`` alone misses spawn-context Process classes
-    (vllm-omni's stage launcher uses ``get_mp_context().Process`` ==
-    ``SpawnProcess``, a sibling class, not a subclass). All context-specific
-    Process classes inherit from ``BaseProcess``, so patching the root catches
-    every context in one shot.
-    """
+    """Replace ``BaseProcess.__init__`` so spawned targets install patches first."""
     if getattr(_MpBaseProcess, _WRAP_SENTINEL, False):
         return
 
@@ -207,13 +154,7 @@ def patch_qwen3_omni_thinker_lora() -> None:
 
 
 def patch_dit_lora_loader() -> None:
-    """Patch ``DiffusionLoRAManager._load_adapter`` (DiT stage) to support in-memory tensors.
-
-    vLLM-Omni's stock loader only accepts on-disk adapters. We branch on the
-    request type: ``OmniTensorLoRARequest`` loads from in-memory tensors via
-    ``LoRAModel.from_lora_tensors``; everything else falls through to the
-    original on-disk loader via ``LoRAModel.from_local_checkpoint``.
-    """
+    """Patch ``DiffusionLoRAManager._load_adapter`` (DiT stage) to support in-memory tensors."""
 
     def hijack__load_adapter(self, lora_request: OmniTensorLoRARequest) -> tuple[LoRAModel, PEFTHelper]:
         if not self._expected_lora_modules:
@@ -283,13 +224,7 @@ def patch_dit_lora_loader() -> None:
 
 
 def patch_ar_lora_loader() -> None:
-    """Patch ``WorkerLoRAManager._load_adapter`` (AR stage) to support in-memory tensors.
-
-    Best-effort: vllm's worker_manager is only importable in worker subprocesses
-    that actually instantiate it. Returns just the ``LoRAModel`` (no peft_helper
-    tuple). Mirrors the DiT shim for in-memory tensors and falls through to the
-    original on-disk loader for plain ``LoRARequest``.
-    """
+    """Patch ``WorkerLoRAManager._load_adapter`` (AR stage) to support in-memory tensors."""
     try:
         from vllm.lora.worker_manager import WorkerLoRAManager
     except ImportError:
@@ -324,14 +259,7 @@ def patch_ar_lora_loader() -> None:
 
 
 def patch_ar_merged_lora_fused_tensor() -> None:
-    """Accept a single fused lora_b [q+k+v, rank] in MergedQKV set_lora.
-
-    HI3 trains LoRA on a fused qkv_proj; vLLM expects a list [lora_b_q, lora_b_k,
-    lora_b_v]. The checkpoint qkv_proj is GQA-interleaved, training loads it as-is,
-    so lora_b rows are interleaved. vLLM base is block [q;k;v] after _split_qkv_weight
-    — we mirror that reshape-split on lora_b. Falls back to plain split if the base
-    layer lacks head_size/total_num_kv_heads.
-    """
+    """Accept a single fused lora_b [q+k+v, rank] in MergedQKV set_lora."""
     try:
         import torch
         from vllm.lora.layers import column_parallel_linear as _cpl
@@ -385,20 +313,7 @@ def patch_ar_merged_lora_fused_tensor() -> None:
 
 
 def patch_fp32_skip() -> None:
-    """Patch ``vllm.lora.utils.from_layer`` to skip non-fp16/bf16 layers.
-
-    punica lora_shrink/expand kernels hard-assert inputs.dtype in [fp16, bf16].
-    Skip LoRA wrap for fp32 layers (e.g. HI3 MoE router gate) and for
-    non-fp16/bf16 dtypes (e.g. quantized) so the original layer.forward runs
-    unmodified. If you intentionally want LoRA on such a layer, choose one:
-
-      (a) cast the layer to bf16 in model code (lose precision)
-      (b) wrap with a pure-pytorch LoRA variant (no punica),
-          e.g. vllm_omni DiffusionBaseLinearLayerWithLoRA
-      (c) filter target_modules so it does not match this layer
-
-    Replaces pod-local file patch on ``vllm/lora/utils.py``.
-    """
+    """Patch ``vllm.lora.utils.from_layer`` to skip non-fp16/bf16 layers."""
     try:
         import torch as _torch
         import vllm.lora.utils as _lora_utils
@@ -445,17 +360,7 @@ def patch_fp32_skip() -> None:
 
 
 def patch_lora_request_passthrough() -> None:
-    """Forward ``lora_request`` through ``Omni.generate`` to ``engine.add_request``.
-
-    Required for HI3-Instruct t2i RL (``think_recaption`` mode) so that the AR
-    prelude stage in vllm-omni picks up the per-rollout LoRA adapter alongside
-    the DiT stage. Without this, ``VLLMOmniRolloutEngine.generate`` cannot pass
-    ``lora_request`` into the AR stage's request scheduler — the AR worker runs
-    the base model while DiT runs the LoRA-adapted model (half-adapted
-    trajectory => silent policy/rollout mismatch).
-
-    Replaces pod-local file patch on ``vllm_omni/entrypoints/omni.py``.
-    """
+    """Forward ``lora_request`` through ``Omni.generate`` to ``engine.add_request``."""
     try:
         from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
         from vllm_omni.entrypoints.omni import Omni
@@ -501,19 +406,7 @@ def patch_lora_request_passthrough() -> None:
 
 
 def patch_sigmas_passthrough() -> None:
-    """Monkey-patch HunyuanImage3Pipeline to forward custom sigmas to DiT scheduler.
-
-    Outer ``HunyuanImage3Pipeline.forward`` extracts sigmas from req and stashes
-    on the instance; inner ``HunyuanImage3Text2ImagePipeline.__call__`` picks up
-    via ``self.model`` (which references the outer instance) and injects as a
-    kwarg so ``scheduler.set_timesteps`` gets the correct schedule.
-
-    Without this, UniRL's FlowMatchSchedulePolicy.sigmas is never
-    forwarded to the DiT scheduler (rollout-train sigma mismatch
-    max abs diff ~0.158 => GRPO log-prob replay incorrect).
-
-    Replaces pod-local file patch on ``vllm_omni/diffusion/models/hunyuan_image3/pipeline_hunyuan_image3.py``.
-    """
+    """Monkey-patch HunyuanImage3Pipeline to forward custom sigmas to DiT scheduler."""
     try:
         from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import (
             HunyuanImage3Pipeline,
@@ -551,11 +444,7 @@ def patch_sigmas_passthrough() -> None:
 
 
 def patch_per_request_ar_seed() -> None:
-    """Stamp a fresh os.urandom seed onto every AR SamplingParams in add_request's
-    sampling_params_list. Without this, a GRPO group's N parallel requests all
-    re-seed from the same shared SamplingParams ref and collapse to byte-identical
-    AR tokens despite temperature > 0.
-    """
+    """Stamp a fresh os.urandom seed onto every AR SamplingParams in add_request's sampling_params_list."""
     try:
         import msgspec as _msgspec
         from vllm import SamplingParams as VLLMSamplingParams
@@ -584,31 +473,7 @@ def patch_per_request_ar_seed() -> None:
 
 
 def patch_master_port_unstrip() -> None:
-    """Keep ``master_port`` alive through ``AsyncOmniEngine._strip_single_engine_args``.
-
-    At the v0.20.0 pin the ``stage_configs_path`` route strips parent
-    ``EngineArgs`` fields (including ``master_port``) from the kwargs that
-    become ``base_engine_args`` for the per-stage YAML merge
-    (``async_omni_engine.py:1558``), and the post-resolution injection loop
-    only re-adds ``enable_sleep_mode`` / ``lora_path`` / ``lora_scale``.
-    Net effect: the engine-reserved per-replica master-port base NEVER
-    reaches ``OmniDiffusionConfig``, so every stage settles from the shared
-    ``(None or 30005) + random(0, 100)`` window with only the 37-stride
-    bind-check scan for collision avoidance (``diffusion/data.py:578``).
-    Eight colocated replicas race that window; fast-booting models (SD3.5)
-    happened to win, slow-booting ones (Qwen-Image, ~35s weight load) lose
-    the check-to-bind TOCTOU and die with ``DistNetworkError ... port:
-    30005, code: -98`` (LIN-382 qwen probe, 2026-06-07).
-
-    Re-attach the caller's ``master_port`` to the stripped dict so the
-    existing ``load_stage_configs_from_yaml`` ``base_engine_args`` merge
-    lands it per stage. Stage-YAML keys still win (none of ours define
-    ``master_port``); the settle scan stays as the TOCTOU fallback.
-
-    DELETE-WHEN: pin >= v0.21.0rc2 — #3803 honors the injected base
-    verbatim (mind the env ``MASTER_PORT`` precedence landmine documented
-    in ``docs/vllm-omni-v2-engine.md``).
-    """
+    """Keep ``master_port`` alive through ``AsyncOmniEngine._strip_single_engine_args``."""
     try:
         from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 
@@ -631,17 +496,7 @@ def patch_master_port_unstrip() -> None:
 
 
 def patch_hi3_flow_alignment() -> None:
-    """Port of bjf-frz/fix-hi3-flow (vllm-omni eed27812) to v0.20.0's older
-    KV-cache API: store full 4-D first-step KV, then scatter live image KV by
-    absolute position_ids on subsequent steps. Silent skip on non-v0.20.0.
-
-    Threads position_ids through a thread-local so we only need to patch
-    `_save_image_kv_caches`, `_update_image_kv_caches` and a tiny wrapper
-    around `HunyuanImage3DecoderLayer.forward` (no need to reimplement
-    `ImageKVCacheManager.__call__` for the sake of one line).
-
-    Delete this function once vllm-omni upstream lands the fix in our pinned version.
-    """
+    """Port of vllm-omni eed27812 to v0.20.0's older KV-cache API; silent skip on any other version."""
     try:
         from vllm_omni.diffusion.models.hunyuan_image3 import (
             hunyuan_image3_transformer as _trans,
@@ -719,19 +574,7 @@ def patch_hi3_flow_alignment() -> None:
 
 
 class VLLMOmniHijack:
-    """Monkey-patches vllm-omni internals to support in-memory LoRA tensors.
-
-    Two managers need patching for HI3 t2i:
-
-    - ``vllm_omni.diffusion.lora.manager.DiffusionLoRAManager._load_adapter``
-      drives the DiT stage and returns ``(LoRAModel, PEFTHelper)``.
-    - ``vllm.lora.worker_manager.WorkerLoRAManager._load_adapter`` drives the
-      AR stage and returns just ``LoRAModel``.
-
-    Both originally only accept on-disk adapters. We branch on the request
-    type and load from in-memory tensors when ``OmniTensorLoRARequest`` is
-    passed, otherwise fall through to the original loader.
-    """
+    """Monkey-patches vllm-omni internals to support in-memory LoRA tensors."""
 
     @staticmethod
     def hijack() -> None:

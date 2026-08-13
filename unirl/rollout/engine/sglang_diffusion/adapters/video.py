@@ -1,25 +1,4 @@
-"""Video-family adapters.
-
-Two output shapes live here:
-
-* ``VideoAdapter`` — proper video output. The latent trajectory is video-form
-  6-D ``[B, T+1, C, F, H, W]`` (an extra latent-frame axis vs the image path's
-  5-D ``[B, T+1, C, H, W]``) and the decoded media is packed into a ragged
-  :class:`~unirl.types.primitives.Videos` (``[total_T, C, H, W]``) instead of
-  being dropped. HunyuanVideo and WAN ride this base so their rollout output can
-  be consumed by the ``video_pickscore`` reward.
-
-* ``MochiAdapter`` — kept on the legacy image path (see note below) for
-  behavioral parity with the old ``sglang`` engine. Migrate it onto
-  ``VideoAdapter`` once it has a verified video reward baseline.
-
-PARITY NOTE (image-path video families): the legacy ``sglang`` engine treated
-every family — including the video ones — through the image path: it built an
-image-form ``LatentSegment`` (``make_image_segment``) and *dropped* 4-D decoded
-video with a warning (there was no video reward consumer yet). ``MochiAdapter``
-reproduces that exactly; families with a real video consumer move to
-``VideoAdapter``.
-"""
+"""Video-family adapters — 6-D ``[B, T+1, C, F, H, W]`` trajectory decoded to ragged ``[total_T, C, H, W]``."""
 
 from __future__ import annotations
 
@@ -39,14 +18,7 @@ from unirl.types.segments.latent import make_video_segment
 
 
 class VideoAdapter(ImageAdapter):
-    """Base for true video-output families (6-D latent trajectory → ``Videos``).
-
-    Reuses ``ImageAdapter``'s request side verbatim — ``build_sampling`` already
-    forwards ``num_frames`` and the SDE/rollout pins are modality-agnostic — and
-    overrides only the response-shape variation points: the segment is stamped
-    ``Modality.VIDEO`` and carries the 6-D ``[B, T+1, C, F, H, W]`` trajectory,
-    and the decoded media is packed as ``Videos`` rather than dropped.
-    """
+    """Base for true video families — ``Modality.VIDEO`` and a 6-D ``[B, T+1, C, F, H, W]`` trajectory."""
 
     segment_factory = staticmethod(make_video_segment)
 
@@ -59,14 +31,7 @@ class VideoAdapter(ImageAdapter):
         sde_indices: Optional[List[int]],
         emit_native_logprob: bool,
     ):
-        """Video-form trajectory: collect, gate the 6-D shape, assemble.
-
-        Video latents keep the extra frame axis throughout, so the trajectory is
-        rank 6 ``[B, T+1, C, F, H, W]`` (vs the image path's rank 5). The downstream
-        ``build_latent_segment`` is shape-agnostic past the T+1 invariant, so the
-        only difference from the image path is the rank gate + the video segment
-        factory.
-        """
+        """Video-form trajectory: collect, gate the 6-D shape, assemble."""
         traj = utils.collect_trajectory_latents(results)
         if traj.ndim != 6:
             raise ValueError(
@@ -100,15 +65,7 @@ class HunyuanVideoAdapter(VideoAdapter):
     """HunyuanVideo-1.0 T2V with video output and dual text conditions."""
 
     def build_condition(self, results: List[RawResult]) -> Dict[str, Any]:
-        """Keep HunyuanVideo's LLaMA and pooled-CLIP streams separate.
-
-        SGLang returns ``prompt_embeds`` as
-        ``[LLaMA [B, seq, 4096], CLIP [B, 1, 768]]``. The generic image adapter
-        fuses multi-encoder outputs along the token axis, which cannot combine
-        these different hidden sizes and does not match
-        :class:`HunyuanVideoConditions`. Pack the two streams under the exact
-        keys consumed by trainer-side replay instead.
-        """
+        """Keep HunyuanVideo's LLaMA and pooled-CLIP streams separate."""
         require(bool(results), "HunyuanVideo: cannot build conditions from empty results")
 
         llama_conditions: List[TextEmbedCondition] = []
@@ -168,26 +125,7 @@ class HunyuanVideoAdapter(VideoAdapter):
 
 @register_adapter("wan22")
 class Wan22T2VAdapter(VideoAdapter):
-    """WAN 2.2-A14B T2V — DUAL-EXPERT (high-noise / low-noise) MoE.
-
-    WAN 2.2-A14B runs two ``WanTransformer3DModel`` experts switched at a sigma
-    boundary (``boundary_ratio=0.875``): high-noise for ``sigma >= boundary``
-    (coarse structure, early steps), low-noise for ``sigma < boundary`` (detail).
-    The entire dual-expert mechanism lives ENGINE-SIDE in sglang and needs no
-    adapter work: ``composed_pipeline_base.load_modules`` auto-loads ``transformer_2``
-    when the checkpoint's ``model_index.json`` carries ``boundary_ratio`` + both
-    ``transformer``/``transformer_2`` (the A14B-Diffusers ckpt does), and the generic
-    ``DenoisingStage._select_and_manage_model`` routes per-step by the boundary
-    timestep (and applies ``guidance_scale_2`` to the low-noise branch). So the
-    UniRL side is byte-identical to WAN 2.1 — same UMT5 single-text fuse, same 6-D
-    video trajectory + ``video_pickscore`` consumer, same segment contract (no aux
-    audio). The trainside ``WAN22DiffusionStage`` replays with the SAME boundary
-    routing, so rollout↔replay stays aligned.
-
-    ``build_sampling`` additionally forwards ``guidance_scale_2`` so the engine's
-    low-noise CFG branch matches the trainside; it is omitted (engine falls back to
-    ``guidance_scale``) when unset, so a ``guidance_scale=1.0`` smoke is unaffected.
-    """
+    """WAN 2.2-A14B T2V — DUAL-EXPERT (high-noise / low-noise) MoE."""
 
     def build_sampling(self, sample: Sample, *, diffusion: Any) -> Dict[str, Any]:
         kwargs = super().build_sampling(sample, diffusion=diffusion)
@@ -199,14 +137,7 @@ class Wan22T2VAdapter(VideoAdapter):
 
 @register_adapter("wan21")
 class Wan21T2VAdapter(VideoAdapter):
-    """WAN 2.1 T2V — proper video output consumed by ``video_pickscore``.
-
-    The text/conditions path is the generic UMT5 fuse from ``ImageAdapter``
-    (single text encoder; no CFG negative branch when ``guidance_scale <= 1``);
-    only the video-output overrides on ``VideoAdapter`` apply. The sglang server
-    resolves the WAN pipeline from ``model_path`` (the ``Wan-AI/Wan2.1-T2V-1.3B``
-    -Diffusers checkpoint), so no extra ``boot_kwargs`` are needed.
-    """
+    """WAN 2.1 T2V — proper video output consumed by ``video_pickscore``."""
 
     pass
 
@@ -279,16 +210,7 @@ class Ltx2T2VAdapter(VideoAdapter):
         sde_indices: Optional[List[int]],
         emit_native_logprob: bool,
     ):
-        """LTX-2 latents are PACKED token sequences, not a spatial video grid.
-
-        WAN/HunyuanVideo carry a 6-D ``[B, T+1, C, F, H, W]`` trajectory, but LTX-2's
-        DiT operates on a patchified token sequence, so the rollout trajectory is
-        rank-4 ``[B, T+1, seq, dim]`` (e.g. ``[B, 11, 192, 128]``). ``VideoAdapter``'s
-        strict 6-D gate rejects it; ``build_latent_segment`` itself only needs the
-        ``T+1`` axis at dim 1 and is otherwise shape-agnostic, so accept the packed
-        trajectory directly (the trainside replays the identical packed latents, so
-        rollout↔replay stays aligned).
-        """
+        """LTX-2 latents are PACKED token sequences, not a spatial video grid."""
         traj = utils.collect_trajectory_latents(results)
         if traj.ndim < 3:
             raise ValueError(

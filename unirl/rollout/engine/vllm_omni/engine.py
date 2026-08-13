@@ -1,25 +1,4 @@
-"""``vllm_omni`` engine core — wiring + delegation only.
-
-A thin core over the backend seam: it names no concrete modality (the adapter,
-picked from the registry by ``config.modality``, owns the ``Sample`` →
-``Sample`` conversion and the per-modality topology knobs)
-and no concrete backend (the seam owns the runtime — boot, ports, env quirks,
-the per-stage ``collective_rpc`` fan-out). Weight sync is a :class:`WeightSync`
-component constructed over the seam; the offload lifecycle (a single flag)
-lives directly on the engine. The frozen ``base.py`` surface is implemented as
-thin forwards here — they must be real class attributes anyway (``Worker.call``
-dispatches by name; ``@distributed`` binds the most-derived attribute) — which
-also absorbs the surface quirks (``track_prefix``) so the component keeps
-clean signatures.
-
-One-shot construction: after ``__init__`` returns, the ``Omni`` orchestrator
-is spawned and the engine is usable. ``generate`` / ``sleep`` / ``wake_up``
-re-apply ``@distributed`` (the decorator is not inherited — see ``base.py``).
-``set_lora_from_tensors_copy`` additionally keeps v1's ``@distributed(BROADCAST)``
-— the documented exception to the "weight-sync entry points undecorated" rule:
-it is how the HI3 two-engine LoRA sync reaches engines anchored on disjoint
-worker partitions.
-"""
+"""``vllm_omni`` engine core — wiring + delegation only."""
 
 from __future__ import annotations
 
@@ -139,11 +118,7 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
         return self.adapter.build_response(sample, per_request)
 
     def _ensure_sample_sigmas(self, sample: Sample) -> None:
-        """Pin the σ schedule onto the diffusion gen Part's ``DiffusionSamplingParams.sigmas``.
-
-        σ is computed from the model-owned schedule policy and shared across the
-        Part's samples. Idempotent — a pre-pinned σ is left as-is.
-        """
+        """Pin the σ schedule onto the diffusion gen Part's ``DiffusionSamplingParams.sigmas``."""
         ensure_sample_sigmas(sample, self.schedule_policy)
 
     def _mark_consistently_offloaded(self) -> None:
@@ -262,9 +237,7 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
             self._shutdown_complete = True
 
     def tp_per_stage(self) -> Dict[int, int]:
-        """``{stage_id: tensor_parallel_size}`` per stage (parsed from the
-        stage YAML at boot). The IPC weight-sync handler needs this to skip
-        orphan train ranks that exceed a stage's TP size."""
+        """``{stage_id: tensor_parallel_size}`` per stage (parsed from the"""
         return self._backend.tp_per_stage()
 
     def update_weights_from_ipc(
@@ -372,12 +345,7 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
         *,
         peft_config: Optional[dict] = None,
     ) -> None:
-        """Byte-copy LoRA push for the HI3 two-engine trainer.
-
-        Decorated (v1 parity, the documented §dispatch exception):
-        ``RemoteLoraWeightSync(copy=True)`` reaches the disjoint-partition HI3
-        engines through this entry point.
-        """
+        """Byte-copy LoRA push for the HI3 two-engine trainer."""
         self._weight_sync.set_lora_from_tensors_copy(adapter_name, lora_tensors, peft_config=peft_config)
 
     def loaded_param_checksums(self, *, names: List[str]) -> dict:

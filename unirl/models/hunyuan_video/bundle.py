@@ -1,28 +1,4 @@
-"""HunyuanVideoBundle -- concrete weights+params holder for HunyuanVideo-1.0.
-
-Implements the empty :class:`Bundle` Protocol. Pure container of the
-modules HunyuanVideo-1.0 ships with:
-
-- 1x ``HunyuanVideoTransformer3DModel`` (MMDiT with ``guidance_embeds=True``,
-  ``in_channels=16`` -- no channel-dim packing)
-- 1x ``AutoencoderKLHunyuanVideo`` (3D VAE; spatial=8x, temporal=4x,
-  latent_channels=16, scaling_factor=0.476986)
-- 2x text encoders + tokenizers:
-    - ``LlamaModel`` + ``LlamaTokenizerFast`` (primary, 4096-dim hidden)
-    - ``CLIPTextModel`` + ``CLIPTokenizer`` (pooled, 768-dim)
-- 1x ``FlowMatchEulerDiscreteScheduler``
-
-Diverges from :class:`unirl.models.hunyuan_video15.HunyuanVideo15Bundle`
-mainly in the text-encoder pair (LLaMA + CLIP vs Qwen-VL + ByT5), the
-absence of a vision encoder (no I2V slot), and the transformer signature
-(no channel-dim packing, uses ``guidance`` kwarg instead of CFG).
-
-No LoRA injection, FSDP wrap, adapter switching, or weight-sync logic
--- those are lifecycle concerns owned outside the bundle
-(``cfg.training.policies``). The bundle exposes attributes by name so
-the diffusion stage and downstream FSDPPolicy can address them without
-indirection.
-"""
+"""HunyuanVideoBundle -- concrete weights+params holder for HunyuanVideo-1.0."""
 
 from __future__ import annotations
 
@@ -40,8 +16,7 @@ from .config import HunyuanVideoPipelineConfig
 
 
 class HunyuanVideoBundle(Bundle):
-    """HunyuanVideo-1.0 bundle: transformer + 3D VAE + dual text encoders +
-    scheduler."""
+    """HunyuanVideo-1.0 bundle: transformer + 3D VAE + dual text encoders + scheduler."""
 
     def __init__(
         self,

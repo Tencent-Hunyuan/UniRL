@@ -1,32 +1,4 @@
-"""Re-host the ``sglang-drl`` fork's ``Scheduler`` RL additions on stock upstream.
-
-Stock upstream ``Scheduler`` (``runtime/managers/scheduler.py``) dispatches ZMQ
-requests via ``self.request_handlers`` (keyed by ``type(req)``) and ships only
-the disk-weight + checksum handlers. The fork added nine RL request handlers
-(distributed weight sync, tensor weight sync, LoRA-from-tensors, encode-prompt,
-sleep/wake memory occupation, per-param weight detail) plus two private helpers,
-and gated ``_handle_generation`` / ``_handle_update_weights_from_disk`` behind
-sleep/dirty-module guards.
-
-This patch ports all of that WITHOUT editing sglang source:
-
-  * ``setattr`` the 9 handlers + 2 helpers onto ``Scheduler`` (bodies verbatim
-    from the fork diff). They call ``self.worker.<method>`` -- those worker
-    methods (``is_sleeping``, ``_dirty_modules``, ``set_lora_from_tensors``,
-    ``update_weights_from_tensor``, ...) are installed by ``patch_gpu_worker``.
-  * AROUND-wrap ``Scheduler.__init__`` so that AFTER the upstream ``__init__``
-    builds ``self.request_handlers`` we ``.update(...)`` it with the 9 fork
-    entries. The dict is keyed by the SAME request classes the UniRL
-    adapter sends: the 8 ``*ReqInput`` from ``_patches.io_struct`` and
-    ``SetLoraFromTensorsReq`` from ``_patches.lora_req`` (the single definition
-    sites), so ``type(req)`` dispatch matches.
-  * AROUND-wrap ``_handle_generation`` and ``_handle_update_weights_from_disk``
-    to PREPEND the fork's sleep/dirty guards, then delegate to the upstream
-    body with the original args/kwargs forwarded untouched (upstream
-    ``_handle_generation`` takes a keyword-only ``allow_dynamic_batching``).
-
-Idempotent via sentinel guards. Import-safe (sglang imported inside the fn).
-"""
+"""Re-host the ``sglang-drl`` fork's ``Scheduler`` RL additions on stock upstream."""
 
 from __future__ import annotations
 

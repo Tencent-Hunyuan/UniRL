@@ -1,25 +1,4 @@
-"""VideoCLIPDelta — an edit-delta CLIP reward for video-to-video.
-
-Plain PickScore on a content-anchored V2V output starts near its ceiling
-(~0.8): the edit caption mostly describes content the *source* video already
-shows, so an un-edited output already scores high and there is little headroom
-to train on. This scorer subtracts how much the edited frame still looks like
-the SOURCE condition frame, so the reward measures the *edit*, not the content
-that was free to begin with:
-
-    reward = pickscore(edited_first_frame, target_caption)
-             - lambda_source * cos(edited_first_frame, source_first_frame)
-
-- The first term (identical scaling to ``PickScoreRewardScorer``) keeps the
-  edit on-target for the caption.
-- The second term (CLIP image-image cosine to the source) is high when the
-  output barely changed, so an un-edited V2V output nets ~0 and the reward only
-  climbs as the model actually applies the requested edit.
-
-The source condition frame is available because ``RewardService`` copies the
-Sample's conditioning primitives (including the ``video`` condition) into the
-reward request and ``repeat_interleave``s them to per-sample alignment.
-"""
+"""VideoCLIPDelta — an edit-delta CLIP reward for video-to-video."""
 
 from __future__ import annotations
 
@@ -41,12 +20,7 @@ if TYPE_CHECKING:
 
 
 class VideoCLIPDeltaScorer(PickScoreRewardScorer):
-    """PickScore-to-target minus CLIP-similarity-to-source, on the first frame.
-
-    Inherits CLIP/PickScore model loading from ``PickScoreRewardScorer``; only
-    the reward computation differs (it also reads the source condition video
-    from ``request.primitives['video']``).
-    """
+    """PickScore-to-target minus CLIP-similarity-to-source, on the first frame."""
 
     canonical_model_name = "videoclipdelta"
     input_kind = "video"
@@ -59,11 +33,7 @@ class VideoCLIPDeltaScorer(PickScoreRewardScorer):
 
     @staticmethod
     def _sample_frames_pil(video: "Video", k: int) -> list["Image.Image"]:
-        """K evenly-spaced frames of a per-sample ``Video`` (frames ``[T, C, H, W]``).
-
-        Always returns exactly ``k`` frames (indices repeat when ``T < k``) so the
-        batch flattens to a fixed ``n * k`` layout for the per-video mean.
-        """
+        """K evenly-spaced frames of a per-sample ``Video`` (frames ``[T, C, H, W]``)."""
         frames = video.frames
         if frames is None or frames.ndim != 4:
             raise ValueError(
@@ -149,18 +119,7 @@ class VideoCLIPDeltaScorer(PickScoreRewardScorer):
 
 @dataclass
 class VideoCLIPDeltaSpec(BaseRewardComponentSpec):
-    """Typed config for the VideoCLIPDelta reward component.
-
-    Mirrors ``VideoPickScoreSpec`` plus the edit-delta knobs:
-
-    - ``lambda_source`` — weight on the "still looks like the source" penalty
-      (both terms share the PickScore scale, so this is scale-invariant). Higher
-      pushes the policy to change more from the condition video; lower keeps it
-      closer to the source.
-    - ``source_sim_floor`` — floor on the edited-vs-source CLIP cosine; diverging
-      past it earns no extra reward (caps the penalty / kills its runaway gradient).
-    - ``num_score_frames`` — number of evenly-spaced frames scored per clip.
-    """
+    """Typed config for the VideoCLIPDelta reward component."""
 
     batch_size: int = 8
     device: str = "auto"

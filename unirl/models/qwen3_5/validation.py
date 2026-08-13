@@ -62,12 +62,7 @@ def validate_training_contract(
     rollout_cfg: Any,
     stack_cfg: Any = None,
 ) -> None:
-    """Validate only the Qwen3.5 FSDP2/VeOmni + SGLang execution path.
-
-    The check runs on the driver before any model or rollout actor is created,
-    so prompt-policy and dependency mistakes fail before allocating GPUs.
-    Other model families are untouched.
-    """
+    """Validate only the Qwen3.5 FSDP2/VeOmni + SGLang execution path."""
     if not _is_qwen3_5_pipeline_config(pipeline_cfg):
         return
 

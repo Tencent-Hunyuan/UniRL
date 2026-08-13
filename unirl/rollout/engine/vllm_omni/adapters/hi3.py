@@ -1,31 +1,4 @@
-"""HunyuanImage-3 family: input/output sub-adapters + the six modality classes.
-
-The modality classes are thin binders — identity knobs + two constructor
-calls — and delegate the conversion verbs to their sub-adapters:
-
-- :class:`Hi3InputAdapter` builds the AR-bearing request side shared by
-  t2i / it2i / i2t / t2t / ar_recaption. ``build_inputs`` mirrors the
-  official vllm-omni end-to-end inference example
-  (``examples/offline_inference/hunyuan_image3/end2end.py``) — the canonical
-  reference for the per-prompt dict shape::
-
-      {"prompt_token_ids": ids, "prompt": raw_user_text,
-       "use_system_prompt": sys_type, "modalities": [...],
-       # image-conditioned: "multi_modal_data": {"image": pil},
-       "height": h, "width": w}
-
-- :class:`Hi3DitRecaptionInputAdapter` is the two-engine trainer's
-  standalone-DiT request side (externally-injected recaption).
-- :class:`Hi3TextOutputAdapter` fills the AR generation Part;
-  :class:`Hi3ImageOutputAdapter` fills the AR and diffusion Parts independently;
-  :class:`Hi3DitRecaptionOutputAdapter` fills one diffusion Part — the latter
-  two derive from the shared
-  :class:`~.dit.DitOutputAdapter` skeleton.
-
-The HI3 chat-template knowledge (``task_key`` / ``sys_type`` /
-``output_modalities``, mirroring upstream ``_TASK_PRESETS``) rides the
-:class:`Hi3InputAdapter` constructor — one row per modality binder.
-"""
+"""HunyuanImage-3 family: input/output sub-adapters + the six modality classes."""
 
 from __future__ import annotations
 
@@ -56,12 +29,7 @@ from unirl.types.sampling import ARSamplingParams, DiffusionSamplingParams
 
 
 def _trailing_gen_parts(sample: Sample, *params_types: type, caller: str) -> Tuple[Part, ...]:
-    """Validate and return the current generation-stage suffix.
-
-    HI3 has both one-stage ``[..., AR]`` / ``[..., Diffusion]`` requests and
-    two-stage ``[..., AR, Diffusion]`` requests. Matching from the whole
-    trajectory would select an earlier agent turn when either type repeats.
-    """
+    """Validate and return the current generation-stage suffix."""
     count = len(params_types)
     if len(sample.parts) < count:
         raise ValueError(f"{caller}: expected {count} trailing generation Parts, got {len(sample.parts)} total Parts")
@@ -88,13 +56,7 @@ def _build_prompt_entries(
     tokenize_fn: Optional[Callable[..., List[int]]],
     decorate: Callable[[Dict[str, Any], int], None],
 ) -> List[Dict[str, Any]]:
-    """Build the HI3 per-prompt dicts shared by the AR-bearing modalities.
-
-    Each entry carries the official ``end2end.py`` base fields
-    (``prompt_token_ids`` / ``prompt`` / ``use_system_prompt`` /
-    ``modalities``); the ``decorate`` callback then attaches the
-    modality-specific extras (``multi_modal_data``, ``height`` / ``width``).
-    """
+    """Build the HI3 per-prompt dicts shared by the AR-bearing modalities."""
     if tokenize_fn is None:
         raise RuntimeError("build_prompt_entries: tokenize_fn not provided (AR modalities need the driver tokenizer)")
     prompts: List[Dict[str, Any]] = []
@@ -112,19 +74,7 @@ def _build_prompt_entries(
 
 
 def hi3_fused_conditions(diff_outputs: List[OmniRawResult], *, modality: str) -> Dict[str, Any]:
-    """The HI3 DiT replay conditions — concat the ``fused_mm_capture`` dicts.
-
-    Reads ``custom_output["fused_mm_capture"]`` — written by
-    ``RLHunyuanImage3Pipeline`` after intercepting
-    ``prepare_inputs_for_generation``. For think_recaption mode different
-    prompts produce different AR output lengths → different ``L`` per
-    capture; right-pad shorter sequences to ``max_L`` (pad 0 for input_ids,
-    False for masks) so the dim-0 concat works. t2i scope: the it2i
-    ``cond_*`` fields stay unpopulated. ``rope_cache`` is deliberately NOT
-    shipped: the engine's rope tables use vllm-omni's own layout and are not
-    compatible with the HF-side replay forward — replay rebuilds rope
-    natively from ``gen_image_mask`` (see ``models/hunyuan_image3/diffusion.py``).
-    """
+    """The HI3 DiT replay conditions — concat the ``fused_mm_capture`` dicts."""
     captures = [(getattr(d, "custom_output", None) or {}).get("fused_mm_capture") for d in diff_outputs]
     if any(c is None for c in captures):
         raise RuntimeError(
@@ -190,18 +140,7 @@ def hi3_fused_conditions(diff_outputs: List[OmniRawResult], *, modality: str) ->
 
 
 def hi3_ar_fused_conditions(per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
-    """The AR Part replay conditions for the recaption producer.
-
-    ARGRPO.replay teacher-forces over prompt+response; it needs the prompt
-    token ids (``conditions['fused'].input_ids``). vLLM runs prompts
-    per-request with no batch padding, so each Stage-0 output's
-    ``prompt_token_ids`` is the sample's TRUE, un-padded prompt. Right-pad to
-    ``[B, max_len]`` and carry each sample's true length in the dedicated 1D
-    ``prompt_lengths`` [B] field (NOT ``attention_mask`` — that's typed 4D
-    and its concat does a 4D unpack). The teacher-forced replay slices
-    ``input_ids[b, :prompt_lengths[b]]``, so the right-pad never leaks.
-    Returns ``{}`` if no Stage-0 output carries prompt tokens.
-    """
+    """The AR Part replay conditions for the recaption producer."""
     rows: List[List[int]] = []
     for outputs in per_request:
         ids = None
@@ -226,32 +165,7 @@ def hi3_ar_fused_conditions(per_request: List[List[OmniRawResult]]) -> Dict[str,
 
 
 class Hi3InputAdapter:
-    """Request ``Sample`` → HI3 AR-bearing :class:`GenerateCall` (one, whole batch).
-
-    One class covers every AR-bearing HI3 modality; the constructor row says
-    what varies:
-
-    - ``task_key`` / ``sys_type`` / ``output_modalities`` — the chat-template
-      preset (upstream ``_TASK_PRESETS`` mirror).
-    - ``stages`` — ``("ar",)`` or ``("ar", "dit")``: whether a DiT sampling
-      stage rides along.
-    - ``image_input`` — the request carries ``primitives['image']``; the
-      entry gets ``multi_modal_data`` + the PIL's own dims (upstream reads
-      h/w off the prompt dict for the image-conditioned paths, matching
-      ``end2end.py:185-187``; i2t carries them for parity even without a DiT).
-    - ``carries_target_size`` — the entry gets the request's generation
-      ``height``/``width`` (t2i's target canvas; ar_recaption's recaption
-      prompt needs them although THIS engine never renders).
-    - ``bot_task_base`` — when set, ``task_config["bot_task"]``
-      think/recaption swaps the trigger tag (``f"{base}_{bot}"``). Kept
-      separate from ``modality`` (registry keys are family-namespaced; the
-      upstream task vocabulary is not). AR-only modalities leave it ``None``
-      — only the two-stage t2i/it2i templates have think/recaption/vanilla
-      variants.
-    - ``vanilla_task`` — t2i only: ``bot_task == "vanilla"`` pins BOTH the
-      task and the system preset (upstream pairs t2i_vanilla with
-      en_vanilla).
-    """
+    """Request ``Sample`` → HI3 AR-bearing :class:`GenerateCall` (one, whole batch)."""
 
     def __init__(
         self,
@@ -311,11 +225,7 @@ class Hi3InputAdapter:
         return sample.frontier_gen_part(ARSamplingParams), None
 
     def build_prompts(self, sample: Sample) -> List[Dict[str, Any]]:
-        """The HI3 chat-templated per-prompt entries (+ the image gates).
-
-        Request routing (the ``bot_task`` / ``sys_type`` controls) now rides
-        the input Part's ``control`` bag (see ``unirl/types/README.md``).
-        """
+        """The HI3 chat-templated per-prompt entries (+ the image gates)."""
         task, sys_type = self._resolve_task(sample.parts[0].control or {})
 
         if self.image_input:
@@ -397,10 +307,7 @@ class Hi3InputAdapter:
             entry["width"] = int(diff_params.width)
 
     def _ar_sampling(self, ar_params: Any) -> StageSampling:
-        """AR sampling intent (Stage 0). ``logprobs=1`` makes vLLM emit
-        per-token logp on the sampled token (read by ``build_ar_segment``).
-        ``ar_params`` is the request's ``ARSamplingParams`` — the engine keeps
-        no AR sampling defaults (NB the dataclass field is ``max_new_tokens``)."""
+        """AR sampling intent (Stage 0). ``logprobs=1`` makes vLLM emit"""
         return StageSampling(
             kind=STAGE_KIND_AR,
             kwargs=dict(
@@ -444,31 +351,7 @@ class Hi3InputAdapter:
 
 
 class Hi3DitRecaptionInputAdapter:
-    """Standalone HI3 DiT request side — eats an externally-injected recaption.
-
-    The two-engine trainer chains the AR-generated recaption per sample as a
-    ``cot_text`` input Part (``Texts``, aligned 1:1 with the prompt Part; see
-    :func:`cot_text_from_sample`). Each per-prompt dict carries
-    ``extra['ar_generated_text']`` — exactly the
-    key the upstream DiT ``forward`` reads as ``cot_text`` — plus
-    ``use_system_prompt`` so the DiT rebuilds the same system prefix the AR
-    used.
-
-    **One call per prompt, seeded here.** Per-image distinct seeds cannot
-    travel through the sampling params: vllm-omni requires one params object
-    per STAGE (not per prompt) and shares it across all prompts of a
-    ``generate()`` call — ``OmniDiffusionRequest.__post_init__`` assigns a
-    random seed only on the FIRST request and the mutated object poisons the
-    rest (byte-identical images → diffusion advantage 0). So ``build``
-    emits one single-prompt :class:`GenerateCall` per sample with its own
-    ``seed_from_sample_id`` seed and its own x_T recipe gid slice (a shared
-    full-batch gid list would make the worker's ``NoiseRecipe.for_batch(1)``
-    hand gids[0] to EVERY image).
-
-    Deliberately does NOT use the ``build_prompts`` / ``build_sampling``
-    pair: prompts and sampling are paired per single-prompt call (seed + gid
-    slice decided together), so a wholesale ``build`` keeps them co-located.
-    """
+    """Standalone HI3 DiT request side — eats an externally-injected recaption."""
 
     def __init__(self, modality: str, *, sys_type: str = "en_unified") -> None:
         self.modality = modality
@@ -526,13 +409,7 @@ class Hi3DitRecaptionInputAdapter:
 
 
 class Hi3TextOutputAdapter:
-    """Per-request AR results → the filled AR generation Part.
-
-    Same direct-Part three-hook shape as :class:`~.dit.DitOutputAdapter`:
-    segment, decoded primitive, and replay conditions are derived for the typed
-    AR shell and written only to that Part. ``build_decoded`` is deliberately
-    NOT best-effort — text is the product here, so broken extraction must raise.
-    """
+    """Per-request AR results → the filled AR generation Part."""
 
     def __init__(self, modality: str) -> None:
         self.modality = modality
@@ -774,13 +651,7 @@ class Hi3T2tAdapter(ModelAdapter):
 
 @register_adapter("hi3_ar_recaption")
 class Hi3ArRecaptionAdapter(ModelAdapter):
-    """Two-engine trainer's AR think/recaption producer.
-
-    Builds the same think/recaption prompt as ``t2i`` (``task_key``
-    ``t2i_think``) but is served by an AR-only stage. Needs composed
-    sampling: the recaption prompt carries the DiT generation dims, read off
-    the request's ``diffusion.height`` / ``diffusion.width``.
-    """
+    """Two-engine trainer's AR think/recaption producer."""
 
     stage_yaml = "hunyuan_image3_ar_recaption_rl.yaml"
     needs_sigmas = False

@@ -1,22 +1,4 @@
-"""PEBundle — composed weights container for Prompt Enhancement.
-
-Holds two child :class:`Bundle` instances side-by-side:
-
-- ``diffusion`` — a diffusion bundle (e.g. :class:`SD3Bundle`) that owns
-  the transformer + VAE + text encoders for image generation.
-- ``llm`` — an autoregressive LM bundle (e.g. :class:`Qwen3Bundle`) that
-  owns the causal-LM transformer + tokenizer for prompt rewriting.
-
-Pure container. No ``from_config`` constructor: PE is loaded via
-:class:`PEPipeline`, which constructs both child pipelines (each of
-which loads its own bundle via the child's ``Bundle.from_config``) and
-wires their bundles together. The composed bundle is always reachable
-as ``pe_pipeline.bundle.{diffusion,llm}``.
-
-Satisfies the :class:`Bundle` Protocol
-(:mod:`unirl.models.types.bundle`) trivially — the Protocol is
-empty by design.
-"""
+"""PEBundle — composed weights container for Prompt Enhancement."""
 
 from __future__ import annotations
 

@@ -52,13 +52,7 @@ class StepStrategy(ABC):
         sigma_max: float = 0.99,
         step_index: int = 0,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """Run one denoising transition. Returns ``(prev_sample, log_prob, prev_sample_mean)``.
-
-        ``prev_sample=None`` ⇒ sampling; otherwise log-prob replay. ``log_prob``
-        is ``None`` for ODE strategies and for SDE strategies with ``eta<1e-7``.
-        ``generator=None`` preserves the historical engine-local RNG behaviour;
-        callers may opt in with one generator or a sample-aligned generator list.
-        """
+        """Run one denoising transition. Returns ``(prev_sample, log_prob, prev_sample_mean)``."""
         input_dtype = sample.dtype
         noise_pred = noise_pred.float()
         sample = sample.float()
@@ -111,19 +105,7 @@ class StepStrategy(ABC):
 
 
 class SDEStrategy(StepStrategy, ABC):
-    """Base class for SDE log probability computation strategies.
-
-    Subclasses implement ``step_with_log_prob()`` which is the **single source
-    of truth** for the SDE transition math.  It handles both:
-
-    * **Sampling** (``prev_sample=None``): generates noise, returns new sample
-      with log probability evaluated on the (optionally dtype-quantised) result.
-    * **Training replay** (``prev_sample`` provided): computes log probability
-      of the given transition without generating noise.
-
-    This mirrors Flow-Factory's unified ``scheduler.step()`` pattern where
-    ``next_latents is None`` distinguishes the two modes.
-    """
+    """Base class for SDE log probability computation strategies."""
 
     @abstractmethod
     def compute_log_prob(
@@ -158,12 +140,7 @@ class SDEStrategy(StepStrategy, ABC):
         eta: float,
         sigma_max: float = 0.99,
     ) -> torch.Tensor:
-        """Per-step diffusion coefficient ``std_dev_t`` for this SDE.
-
-        Pure function of the schedule + ``eta`` (independent of the model
-        output), so it is the single source shared by :meth:`step` (drift /
-        noise scaling) and :meth:`transition_std` (KL / log-prob std).
-        """
+        """Per-step diffusion coefficient ``std_dev_t`` for this SDE."""
 
     def transition_std(
         self,
@@ -173,14 +150,7 @@ class SDEStrategy(StepStrategy, ABC):
         eta: float,
         sigma_max: float = 0.99,
     ) -> torch.Tensor:
-        """Std of the per-step transition Gaussian ``N(mean, std**2)``.
-
-        Equals the ``std_var`` returned by :meth:`step` and used in
-        :meth:`compute_log_prob`, and is the correct normalizer for the FlowDPPO
-        KL ``(delta_mean)**2 / (2 * std**2)``. Default (Flow / Dance):
-        ``std_dev_t * sqrt(-dt)``. CPS overrides it (its noise carries no
-        ``sqrt(-dt)`` factor).
-        """
+        """Std of the per-step transition Gaussian ``N(mean, std**2)``."""
         dt = sigma_next - sigma
         std_dev_t = self._std_dev_t(sigma=sigma, sigma_next=sigma_next, eta=eta, sigma_max=sigma_max)
         return std_dev_t * torch.sqrt(-dt)
@@ -194,11 +164,7 @@ class SDEStrategy(StepStrategy, ABC):
         eta: float,
         input_dtype: torch.dtype,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """SDE finalize: dtype round-trip on ``prev_sample`` then per-sample log_prob.
-
-        The dtype round-trip simulates trajectory storage precision so replay-time
-        log_prob matches sampling-time precision. Skipped for ``eta<1e-7``.
-        """
+        """SDE finalize: dtype round-trip on ``prev_sample`` then per-sample log_prob."""
         if eta < 1e-7:
             return prev_sample, None
         prev_sample = prev_sample.to(dtype=input_dtype).float()

@@ -1,12 +1,4 @@
-"""Config surface.
-
-Public entry points:
-  - ``PrecisionName`` / ``validate_precision_type`` + the ``validate_*``
-    cross-component checkers (``validation``): shared helpers used by config
-    dataclasses' ``__post_init__`` and driver-side validation.
-  - ``require`` (``require``): one-line precondition helper for ``__post_init__``
-    and cross-component validators.
-"""
+"""Config surface."""
 
 from __future__ import annotations
 

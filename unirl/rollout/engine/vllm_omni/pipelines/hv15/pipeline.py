@@ -1,27 +1,4 @@
-"""RL-aware HunyuanVideo-1.5 pipeline subclass.
-
-``forward`` follows the RL interception protocol (see
-``pipelines/_shared/interception.py``): **install** (once) → **arm** (every
-request) → run (upstream) → **harvest**. The interceptions, mapped to
-upstream's stages
-(``vllm_omni/diffusion/models/hunyuan_video/pipeline_hunyuan_video_1_5.py``):
-
-- SDE scheduler swap (behavior policy + dense-trajectory recorder) in place
-  of the upstream scheduler; installed regardless of eta — at eta=0 the SDE
-  math is dormant but the per-step ``prev_sample`` capture still fires
-  (``resp_to_samples`` requires ``segment.latents``).
-- A conditioning **tap** on ``encode_prompt``: captures the dual
-  text-encoder embeddings (Qwen2.5-VL MLLM + ByT5 glyph, 8 tensors) for the
-  trainer-side ``HunyuanVideo15Conditions`` reconstruction.
-- An initial-noise **injection** through the ``prepare_latents`` override
-  (driver-authored x_T slice or recipe row replaces upstream's RNG draw).
-- A σ-schedule **workaround**: upstream HV1.5 ignores
-  ``req.sampling_params.sigmas`` (see :meth:`_sigma_override`).
-
-This class is loaded inside vLLM-Omni's worker subprocess via
-``custom_pipeline_args.pipeline_class`` injected from
-``stage_configs/hunyuan_video15_t2v_rl.yaml``.
-"""
+"""RL-aware HunyuanVideo-1.5 pipeline subclass."""
 
 from __future__ import annotations
 
@@ -59,20 +36,13 @@ class RLHunyuanVideo15Pipeline(HunyuanVideo15Pipeline):
         self._pending_initial_noise: Optional[torch.Tensor] = None
 
     def _install_sde_scheduler(self) -> None:
-        """Swap in the trajectory-capturing SDE scheduler (from_config keeps
-        the upstream schedule parameters). Per-request eta rides ``_arm_sde``."""
+        """Swap in the trajectory-capturing SDE scheduler (from_config keeps the upstream schedule parameters)."""
         if isinstance(self.scheduler, FlowMatchSDEDiscreteScheduler):
             return
         self.scheduler = make_sde_scheduler(self._upstream_scheduler.config)
 
     def _install_conditioning_tap(self) -> None:
-        """Wrap ``encode_prompt`` to capture the dual text-encoder embeddings.
-
-        HunyuanVideo-1.5 returns 8 values from ``encode_prompt``:
-        ``(prompt_embeds, prompt_embeds_mask, prompt_embeds_2,
-        prompt_embeds_mask_2, negative_*, …)``. First-call-only per request
-        (the buffer is re-armed each ``forward``).
-        """
+        """Wrap ``encode_prompt`` to capture the dual text-encoder embeddings."""
         if self._conditioning_tap_installed:
             return
 
@@ -122,9 +92,7 @@ class RLHunyuanVideo15Pipeline(HunyuanVideo15Pipeline):
         self._captured_conditioning = None
 
     def prepare_latents(self, *args, **kwargs):  # type: ignore[override]
-        """Initial-noise injection point (consume-once; upstream signature:
-        ``(batch_size, height, width, num_frames, dtype, device, generator,
-        latents)`` — same dtype@4/device@5/latents@7 slots as SD3)."""
+        """Initial-noise injection point (consume-once); same dtype@4 / device@5 / latents@7 slots as SD3."""
         noise = self._pending_initial_noise
         if noise is not None:
             args, kwargs = inject_latents(args, kwargs, noise)
@@ -133,22 +101,7 @@ class RLHunyuanVideo15Pipeline(HunyuanVideo15Pipeline):
 
     @contextmanager
     def _sigma_override(self, req: OmniDiffusionRequest) -> Iterator[None]:
-        """WORKAROUND: make upstream pick up the engine's σ schedule.
-
-        Upstream HunyuanVideo15Pipeline hardcodes
-        ``sigmas = np.linspace(1.0, 0.0, num_steps + 1)[:-1]`` before its
-        single ``scheduler.set_timesteps(sigmas=sigmas, ...)`` call, ignoring
-        ``req.sampling_params.sigmas`` (every other vllm-omni model does
-        ``sigmas = req.sampling_params.sigmas or sigmas`` — see qwen_image,
-        sd3, flux*, z_image — HV1.5 is the outlier). Without this the worker
-        runs an unshifted linear σ schedule while the engine sent a shift=5.0
-        flow-match schedule, tripping ``sigma_verify`` (max-abs-diff ~0.38)
-        and aborting rollout.
-
-        Patches the scheduler's ``set_timesteps`` for the duration of ONE
-        ``forward`` and always restores — the closure must never leak across
-        requests. Delete once upstream honors the request sigmas.
-        """
+        """WORKAROUND: make upstream pick up the engine's σ schedule."""
         engine_sigmas = getattr(req.sampling_params, "sigmas", None)
         if engine_sigmas is None:
             yield

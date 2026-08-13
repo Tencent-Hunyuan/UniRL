@@ -1,21 +1,4 @@
-r"""Boxed-answer numeric-match reward scorer for math RL (competition-style).
-
-Sibling of :mod:`gsm8k_exact_match`. That scorer was authored for GSM8K's
-``#### <number>`` convention and falls back to "last number in the text" — both
-mismatch how Qwen3 (and datasets like DAPO-Math) actually emit answers: a
-``\boxed{...}`` at the end of the solution. This scorer:
-
-1. extracts the LAST ``\boxed{...}`` (balanced braces; tolerant of truncation),
-   taking the part after the last ``=`` when the box holds ``... = <answer>``;
-2. compares it to the ground truth NUMERICALLY via sympy (so ``34.0 == 34`` and
-   ``3/2 == 1.5``), with string- and float-equality fallbacks;
-3. falls back to ``#### <num>`` when no box is present, but deliberately NOT to
-   the last number in the text (a false-positive source on rambling / truncated
-   output); with no parseable boxed/#### answer the reward is 0.
-
-No new dependencies — uses sympy (already in the env). Used by the Qwen3-4B-Base
-DAPO-Math DRPO recipe (long boxed-answer generations).
-"""
+r"""Boxed-answer numeric-match reward scorer for math RL (competition-style)."""
 
 from __future__ import annotations
 
@@ -35,11 +18,7 @@ _HASH_ANSWER_PATTERN = re.compile(r"####\s*([-+]?\d[\d,]*\.?\d*)")
 
 
 def _last_boxed(text: str) -> Optional[str]:
-    r"""Return the content of the last ``\boxed{...}`` (balanced braces), or None.
-
-    Returns None if there is no ``\boxed`` or its braces never close (generation
-    truncated mid-box) — both correctly score as "no answer".
-    """
+    r"""Return the content of the last ``\boxed{...}`` (balanced braces), or None."""
     idx = text.rfind("\\boxed")
     if idx == -1:
         return None
@@ -58,13 +37,7 @@ def _last_boxed(text: str) -> Optional[str]:
 
 
 def _extract_prediction(text: str) -> str:
-    r"""Extract the model's final answer string.
-
-    Priority: last ``\boxed{...}`` (part after last ``=``) → ``#### <num>``.
-    Deliberately NO "last number in the text" fallback: the model reliably emits
-    ``\boxed{}``, and grabbing a trailing number from rambling / truncated text is
-    a false-positive source. No parseable answer → "" → reward 0.
-    """
+    r"""Extract the model's final answer string."""
     if not text:
         return ""
     boxed = _last_boxed(text)
@@ -92,12 +65,7 @@ def _normalize_latex(s: str) -> str:
 
 
 def _values_equal(pred: str, gt: str) -> bool:
-    """True if pred and gt denote the same number.
-
-    Exact rational comparison first (so 18+ digit integers don't collapse under
-    float rounding), then sympy for latex-ish forms, then a tolerant float as a
-    last resort.
-    """
+    """True if pred and gt denote the same number."""
     if not pred:
         return False
     if pred.strip() == gt.strip():
@@ -124,8 +92,7 @@ def _values_equal(pred: str, gt: str) -> bool:
 
 
 class MathBoxedRewardScorer(LocalRewardBackend):
-    r"""Numeric reward for ``\boxed{}``-style math answers (1.0 if the boxed value
-    equals the ground truth, else 0.0)."""
+    r"""Reward 1.0 when the boxed prediction matches the reference answer, else 0.0."""
 
     canonical_model_name = "math_boxed"
     input_kind = "text"

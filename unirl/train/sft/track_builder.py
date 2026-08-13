@@ -1,26 +1,4 @@
-"""Worker-side supervised Part builders for the SFT domain.
-
-In the RL loop the rollout engine is the data producer: it turns a request
-into a training ``Part`` (conditions + segment) that ``TrainStack.train_track``
-consumes. SFT swaps that producer for a dataset-backed one and keeps the whole
-consumer side (stack / algorithm / backend) unchanged — these classes are the
-swap, mirroring :class:`~unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine`'s
-shape (a ``Remote`` sibling holding the trainer-injected ``pipeline``, one
-``DP_SCATTER`` method, ``torch.no_grad()`` inside).
-
-Per-model logic stays in the model packages: prompts go through the bundle's
-own chat-template / text-embed stages, targets through the bundle's VAE encode
-stage — a supervised Part is indistinguishable from a rollout-built one to
-``ARStage.replay`` / ``predict_noise_at_step``. A new modality plugs in as
-(bundle stages) + (a Part builder here) + (a loss in ``unirl/algorithms``)
-only when its record→(conditions, segment) mapping or loss math is genuinely
-new — never as a per-model SFT file.
-
-Eval padding contract: the SFT trainer pads the final eval batch up to the DP
-width with ``{"_eval_pad": True}`` copies so ``DP_SCATTER`` divisibility holds
-without dropping tail samples; builders zero those rows' ``loss_mask`` and the
-losses count them as weight 0 — full-set eval stays exact.
-"""
+"""Worker-side supervised Part builders for the SFT domain."""
 
 from __future__ import annotations
 
@@ -96,25 +74,7 @@ class SupervisedTrackBuilder(Remote):
 
 
 class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
-    """Dataset records → AR ``Part`` (LLM + VLM), via the bundle's stages.
-
-    Prompt side: the pipeline's chat-template stage (``add_generation_prompt``
-    baked in, byte-identical to what rollout engines render — the SFT model is
-    trained on exactly the token sequence inference will see). Target side:
-    ``bundle.tokenizer`` on the raw response + EOS, matching the rollout
-    convention that the stop token is the last supervised token.
-
-    Args:
-        pipeline: trainer-injected sibling (``Qwen3Pipeline`` / ``QwenVLPipeline`` /
-            any pipeline exposing a chat stage + tokenizer-carrying bundle).
-        chat_stage_attr: chat/template stage attribute on the pipeline.
-        max_response_length: hard token cap per response (uncapped targets OOM'd
-            other frameworks); legacy responses are truncated with EOS kept,
-            while agent targets must be filtered before training.
-        append_eos: append ``tokenizer.eos_token_id`` to every response —
-            disable only for models whose template ends turns with a non-EOS
-            token that the dataset already includes.
-    """
+    """Dataset records → AR ``Part`` (LLM + VLM), via the bundle's stages."""
 
     def __init__(
         self,
@@ -288,24 +248,7 @@ class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
 
 
 class DiffusionSupervisedTrackBuilder(SupervisedTrackBuilder):
-    """Dataset records → diffusion ``Part`` with an x0-only segment.
-
-    Prompt side: the pipeline's own ``build_conditions`` (the exact conditions
-    ``diffuse``/``replay`` consume — CFG defaults included). Target side: the
-    bundle's VAE encode stage (``pipeline.<encode_stage_attr>``), whose
-    normalization is the strict inverse of the decode stage by construction.
-    The clean latent lands at ``segment.latents[:, -1]`` — the slot
-    :class:`~unirl.algorithms.FlowMatchSFT` (and DiffusionNFT) read.
-
-    Args:
-        height / width: target resolution; images are bicubic-resized. Must be
-            divisible by ``resolution_align`` (latent patching constraint).
-        encode_stage_attr: VAE encode stage attribute on the pipeline
-            (``vae_encode``; add one per the add-model-bundle skill if the
-            family lacks it).
-        guidance_scale: forwarded to ``build_conditions``; keep 1.0 — SFT runs
-            the pure conditional branch.
-    """
+    """Dataset records → diffusion ``Part`` with an x0-only segment."""
 
     def __init__(
         self,
@@ -396,12 +339,7 @@ class DiffusionSupervisedTrackBuilder(SupervisedTrackBuilder):
 
 
 class VideoDiffusionSupervisedTrackBuilder(SupervisedTrackBuilder):
-    """Dataset records → video-diffusion ``Part`` with a clean x0 latent.
-
-    Records must contain one ``(modality="video", role="target")`` media ref.
-    The builder owns manifest decoding and ``Part`` assembly; the configured
-    model stage owns frame shaping and VAE encoding.
-    """
+    """Dataset records → video-diffusion ``Part`` with a clean x0 latent."""
 
     def __init__(
         self,

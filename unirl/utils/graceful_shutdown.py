@@ -1,27 +1,4 @@
-"""Turn abrupt driver termination into an orderly teardown.
-
-A training driver that dies on an unhandled ``SIGTERM`` never runs its
-``finally`` blocks, so the rollout engine's subprocess tree is never asked to
-shut down. On the anchored vLLM-Omni topology that stranded four ``Worker_TP``
-processes holding ~7.3 GiB of device memory each until they were reaped by
-hand.
-
-The engine-side fate-sharing watchdog
-(:func:`unirl.rollout.engine.vllm_omni.patches.runtime.install_fate_sharing`)
-is the hard backstop for that. This module is the *graceful* half: it gives the
-driver a chance to shut the engine down properly — releasing KV cache, letting
-Ray actors exit cleanly, flushing loggers — instead of relying on the tree
-being force-killed.
-
-Three guarantees, in order of preference:
-
-1. A termination signal unwinds the main thread through the existing
-   ``finally`` blocks, so teardown runs the way it does on a clean exit.
-2. Teardown runs at most once, whichever path reaches it (normal return,
-   exception, signal, or ``atexit``).
-3. The process exits even if teardown wedges — a hard deadline and a
-   second-signal escape hatch both bypass Python entirely.
-"""
+"""Turn abrupt driver termination into an orderly teardown."""
 
 from __future__ import annotations
 
@@ -66,12 +43,7 @@ def _describe(pid: int) -> str:
 
 
 def descendants_of(root_pid: int) -> List[int]:
-    """Transitive children of ``root_pid``, deepest first.
-
-    Empty where procfs is unavailable: the callers treat descendant reaping as
-    a backstop, so degrading to "found nothing" is preferable to raising out of
-    a teardown path.
-    """
+    """Transitive children of ``root_pid``, deepest first."""
     children: Dict[int, List[int]] = {}
     try:
         entries = os.listdir("/proc")
@@ -96,12 +68,7 @@ def descendants_of(root_pid: int) -> List[int]:
 
 
 def terminate_descendants(root_pid: int, *, name_prefix: str, grace: float = 15.0) -> int:
-    """Reap surviving descendants whose name starts with ``name_prefix``.
-
-    Returns how many had to be signalled. The prefix keeps this narrow — a
-    process tree shutdown that also swept up, say, dataloader workers would be
-    a much bigger hammer than the problem needs.
-    """
+    """Reap surviving descendants whose name starts with ``name_prefix``."""
     stragglers = [pid for pid in descendants_of(root_pid) if _describe(pid).startswith(name_prefix)]
     if not stragglers:
         return 0
@@ -128,14 +95,7 @@ def terminate_descendants(root_pid: int, *, name_prefix: str, grace: float = 15.
 
 
 def run_with_timeout(fn: Callable[[], None], *, timeout: float, what: str) -> bool:
-    """Run a teardown step, giving up on it after ``timeout`` seconds.
-
-    Returns whether it finished. A teardown step that blocks forever is worse
-    than one that fails: the steps after it — killing the Ray actors, dropping
-    the placement groups — are the ones that actually free the GPUs. The call
-    is not cancelled, just abandoned on a daemon thread, so the caller can move
-    on to those.
-    """
+    """Run a teardown step, giving up on it after ``timeout`` seconds."""
     done = threading.Event()
 
     def runner() -> None:
@@ -155,22 +115,11 @@ def run_with_timeout(fn: Callable[[], None], *, timeout: float, what: str) -> bo
 
 
 class ShutdownRequested(BaseException):
-    """Raised in the main thread when a termination signal arrives.
-
-    Derives from ``BaseException`` rather than ``Exception`` on purpose: the
-    training loop is full of ``except Exception`` guards that would otherwise
-    swallow the request and carry on stepping.
-    """
+    """Raised in the main thread when a termination signal arrives."""
 
 
 class GracefulShutdown:
-    """Context manager that runs ``teardown`` on every exit path.
-
-    Usage::
-
-        with GracefulShutdown(trainer.shutdown, name="ar-train"):
-            trainer.train(...)
-    """
+    """Context manager that runs ``teardown`` on every exit path."""
 
     def __init__(
         self,
@@ -196,16 +145,7 @@ class GracefulShutdown:
         return self
 
     def claim_signals(self) -> None:
-        """Take ownership of the termination signals. Safe to call repeatedly.
-
-        Repeatable because we are not the only ones installing handlers:
-        ``ray.init()`` unconditionally overwrites SIGTERM with its own
-        ``sys.exit`` handler and then lets the core worker install absl's
-        failure-signal handler on top, which prints a stack trace and re-raises
-        with the default disposition. Whoever registers last wins, and the
-        default disposition kills the driver outright — no ``finally``, no
-        engine shutdown, GPUs still held.
-        """
+        """Take ownership of the termination signals. Safe to call repeatedly."""
         if threading.current_thread() is not threading.main_thread():
             return
         for sig in _SIGNALS:
@@ -222,13 +162,7 @@ class GracefulShutdown:
             logger.info("Claimed %s for graceful shutdown (was %r)", signal.Signals(sig).name, previous)
 
     def _reclaim_after_ray_init(self) -> None:
-        """Re-take the signals as soon as Ray finishes initialising.
-
-        Ray is auto-initialised lazily on first use, which here happens deep
-        inside device-pool construction — long after ``__enter__`` and well
-        before the training loop. Hooking ``ray.init`` is what makes the
-        handover ordering deterministic instead of a race we lose silently.
-        """
+        """Re-take the signals as soon as Ray finishes initialising."""
         try:
             import ray
         except ImportError:
@@ -274,13 +208,7 @@ class GracefulShutdown:
         raise ShutdownRequested(name)
 
     def _arm_hard_exit(self, exit_code: int) -> None:
-        """Bound teardown in wall-clock time, outside the interpreter's control.
-
-        A daemon timer thread is the only mechanism that still fires when the
-        main thread is stuck in a C call that never yields the GIL back to
-        Python — which is exactly what a hung collective or a blocking Ray RPC
-        looks like.
-        """
+        """Bound teardown in wall-clock time, outside the interpreter's control."""
         if self._timer is not None:
             return
         self._timer = threading.Timer(self._grace, lambda: os._exit(exit_code))

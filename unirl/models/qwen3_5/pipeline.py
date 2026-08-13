@@ -1,11 +1,4 @@
-"""Qwen3.5 AR pipeline: text (+ optional image) in, text out.
-
-Combines :class:`Qwen3_5ChatTemplateStage` (chat template + image preprocessing)
-with :class:`Qwen3_5ARStage` (per-token decode + chunked-logp replay). Mirrors
-:class:`unirl.models.qwen_vl.QwenVLPipeline`'s VL data path and
-:class:`unirl.models.qwen3.Qwen3Pipeline`'s ``system_instruction`` /
-``enable_thinking`` / precision knobs.
-"""
+"""Qwen3.5 AR pipeline: text (+ optional image) in, text out."""
 
 from __future__ import annotations
 
@@ -60,13 +53,7 @@ class Qwen3_5Pipeline(Pipeline):
         autocast_precision: str = "bf16",
         logprob_precision: str = "fp32",
     ) -> "Qwen3_5Pipeline":
-        """Wire chat-template + AR stages around an already-loaded bundle.
-
-        The v2 trainer loads the bundle once and injects it
-        (``remote_hydra(pipeline_cfg, bundle=...)``); ``from_config`` would
-        load a second copy. ``system_instruction`` and ``enable_thinking`` are
-        applied to the chat template here so they survive the bundle-injected path.
-        """
+        """Wire chat-template + AR stages around an already-loaded bundle."""
         chat_template = Qwen3_5ChatTemplateStage(
             bundle,
             system_instruction=system_instruction,

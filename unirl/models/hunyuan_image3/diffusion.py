@@ -1,35 +1,4 @@
-"""HunyuanImage3 diffusion: typed params + per-step kernel + rollout-level stage.
-
-Three classes:
-
-- ``HunyuanImage3DiffusionParams`` — typed request-shape knobs (steps /
-  guidance / size / seed / sde_indices / eta / init_same_noise /
-  samples_per_prompt / noise_group_ids / taylor_cache_*).
-- ``HunyuanImage3DiffusionStep`` — stateless per-step kernel. ``step`` /
-  ``step_with_logp`` take the model + conditions + strategy and run both
-  CFG noise prediction and the SDE transition (via
-  ``StepStrategy.denoise``). ``forward`` is a lower-level helper that
-  takes a precomputed ``noise_pred``.
-- ``HunyuanImage3DiffusionStage`` — implements
-  ``DiffusionStage[HunyuanImage3DiffusionConditions]``. Owns the SDE
-  ``strategy`` and the loop bookkeeping; delegates per-step model+SDE
-  work to the kernel. Also exposes ``replay`` for single-step log-prob
-  replay during training.
-
-``predict_noise`` drives the real upstream
-``HunyuanImage3ForCausalMM.forward(mode="gen_image")`` — the unified
-multimodal transformer where text + image tokens share one sequence.
-It reads the prepared multimodal tensors from
-``HunyuanImage3DiffusionConditions.fused`` (a
-``HunyuanImage3FusedMultimodalCondition`` carrying ``input_ids``,
-``attention_mask``, ``position_ids``, ``rope_cache``, plus the 5
-scatter-layout masks/indices), all built by
-:meth:`HunyuanImage3TextEmbedStage.embed_for_gen_image`. It calls
-``transformer.prepare_inputs_for_generation(...)`` followed by the
-forward with ``first_step=True, use_cache=False`` — KV-cache reuse
-across diffusion steps is intentionally out of scope and tracked as a
-follow-up.
-"""
+"""HunyuanImage3 diffusion: typed params + per-step kernel + rollout-level stage."""
 
 from __future__ import annotations
 
@@ -58,13 +27,7 @@ logger = logging.getLogger(__name__)
 
 
 class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage3DiffusionConditions]):
-    """Per-step HunyuanImage3 denoising kernel — stateless.
-
-    ``step`` / ``step_with_logp`` take the model + conditions + an SDE
-    ``strategy`` per call, run CFG noise prediction internally, then
-    apply the transition via ``strategy.denoise``. ``forward`` is the
-    lower-level escape hatch that takes a precomputed ``noise_pred``.
-    """
+    """Per-step HunyuanImage3 denoising kernel — stateless."""
 
     def predict_noise(
         self,
@@ -77,10 +40,7 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
         state: Optional[HunyuanImage3DiffusionState] = None,
         step_index: int = 0,
     ) -> torch.Tensor:
-        """
-        Run the unified MM transformer in ``mode="gen_image"`` and return
-        the CFG-combined noise prediction.
-        """
+        """Run the unified MM transformer in ``mode="gen_image"`` and return the CFG-combined noise prediction."""
         fused = conditions.fused
         if fused is None or fused.input_ids is None:
             raise ValueError(
@@ -286,18 +246,7 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
 
     @staticmethod
     def _build_kv_cache(transformer, conditions: HunyuanImage3DiffusionConditions):
-        """Build a ``HunyuanStaticCache`` sized for the full sequence.
-
-        Mirrors the upstream pattern at ``hunyuan.py:~2330``: for
-        ``mode="gen_image"``, ``max_cache_len = output.tokens.shape[1]``
-        (the full L), ``dynamic=False`` (no growth across diffusion
-        steps), batch_size = N (CFG-batched).
-
-        Returns ``None`` if the upstream module doesn't expose a
-        ``HunyuanStaticCache`` symbol — caller falls back to whatever
-        default the model uses (typically a ``DynamicCache``, which
-        also works but allocates more aggressively).
-        """
+        """Build a ``HunyuanStaticCache`` sized for the full sequence."""
         fused = conditions.fused
         if fused is None or fused.input_ids is None:
             return None
@@ -324,29 +273,7 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
         *,
         is_first: bool,
     ) -> None:
-        """Carry past_key_values + the gathered position/attention tensors
-        into ``state`` for the next diffusion step.
-
-        Mirrors upstream ``HunyuanImage3ForCausalMM._update_model_kwargs_for_generation``
-        (hunyuan.py:2438):
-
-        - On the **first** call (``is_first=True``), passes
-          ``tokenizer_output`` from the conditions so the upstream branches
-          into the gather-down path: it builds new ``position_ids`` of
-          shape ``[N, L']`` (just the timestep + image positions), and
-          ``index_select``-s the original ``[N, 1, L', L]``-shaped attention
-          mask down to those L' rows.
-
-        - On **subsequent** calls (``is_first=False``), omits
-          ``tokenizer_output`` so the upstream falls into the trivial
-          else-branch and just propagates ``position_ids`` / ``attention_mask``
-          / ``gen_timestep_scatter_index`` unchanged from ``state``.
-
-        Without ``tokenizer_output`` on the first call, the model would try
-        to mix step-1+'s ``inputs_embeds`` (length L') against full-length
-        rope tables (length L) and crash with a tensor-size mismatch in
-        ``apply_rotary_pos_emb``.
-        """
+        """Carry past_key_values + the gathered position/attention tensors"""
         fused = conditions.fused
         assert fused is not None
         _rope_info = [[] for _ in range(int(fused.input_ids.shape[0]))]
@@ -489,11 +416,7 @@ def _conditions_device_and_batch(
     *,
     guidance_scale: float,
 ) -> Tuple[torch.device, int]:
-    """Resolve ``(device, batch_size)`` from the conditions container.
-
-    Reads ``conditions.fused.input_ids`` (shape ``[N, L]`` with
-    ``N = B * cfg``).
-    """
+    """Resolve ``(device, batch_size)`` from the conditions container."""
     fused = conditions.fused
     if fused is None or fused.input_ids is None:
         raise ValueError(
@@ -514,17 +437,7 @@ def _conditions_device_and_batch(
 
 
 def _expand_cfg_for_forward(conditions: HunyuanImage3DiffusionConditions) -> HunyuanImage3DiffusionConditions:
-    """Re-stack the B-batched cond/uncond fused into the guided ``[cond; uncond]``
-    N=2B batch (and block-duplicate the shared cond-image payloads) so
-    ``predict_noise`` runs the CFG-combined (guided) forward.
-
-    ``modes/it2i.py`` stores the fused cond-only (``fused``) plus its uncond branch
-    (``fused_uncond``), both B-batched so they survive the B-sample track transport.
-    This reconstructs the exact batch the guided rollout sampled — cond first, uncond
-    second (matching ``predict_noise``'s ``pred[:N_half]``/``pred[N_half:]`` split and
-    upstream's block-repeat cfg layout). Applied IDENTICALLY on the sampling and
-    replay sides, so the guided velocity matches -> on-policy ratio=1 at cfg>1.
-    No-op when ``fused_uncond`` is None (unguided / cfg=1)."""
+    """Re-stack the B-batched cond/uncond fused into the guided ``[cond; uncond]``"""
     fused_uncond = conditions.fused_uncond
     if fused_uncond is None:
         return conditions
@@ -561,22 +474,7 @@ def _expand_cfg_for_forward(conditions: HunyuanImage3DiffusionConditions) -> Hun
 
 
 class HunyuanImage3DiffusionStage(DiffusionStage[HunyuanImage3DiffusionConditions]):
-    """HunyuanImage3 rollout-level diffusion stage.
-
-    Owns the SDE ``strategy``, bundle, kernel, and precision policy. The
-    kernel is stateless and is invoked per-step with the strategy passed
-    in.
-
-    ``diffuse(conditions, *, schedule, params)`` runs the full sampling
-    loop and returns a ``LatentSegment`` carrying the trajectory plus
-    per-SDE log probs (``sde_logp [N, S]`` + ``sde_indices [S]``).
-
-    ``replay(conditions, *, segment, params, step_indices=None)``
-    recomputes log-probs for the SDE transitions in a stored
-    ``LatentSegment``. Returns ``[B, S']`` aligned with
-    ``segment.sde_logp`` (or a slice when ``step_indices`` selects a
-    subset). Used by GRPO-style training.
-    """
+    """HunyuanImage3 rollout-level diffusion stage."""
 
     def __init__(
         self,
@@ -609,22 +507,7 @@ class HunyuanImage3DiffusionStage(DiffusionStage[HunyuanImage3DiffusionCondition
         params: DiffusionSamplingParams,
         sde_sample_keys: Optional[List[str]] = None,
     ) -> LatentSegment:
-        """Run full HunyuanImage3 DiT sampling. Returns a ``LatentSegment``.
-
-        Shape contract for the returned segment (with ``B`` = number of
-        prompts, ``T`` = ``params.num_inference_steps``,
-        ``C = self.latent_channels``,
-        ``H = params.height // self.vae_scale_factor``,
-        ``W = params.width  // self.vae_scale_factor``,
-        ``K`` = number of stored trajectory positions including the clean
-        latent at position ``T``):
-
-            latents      : [B, K, C, H, W]
-            sde_logp     : [B, S]    where S = len(params.sde_indices)
-            sde_indices  : [S]       long
-            indices      : [K]       long (positions of the stored snapshots)
-            sigmas       : [T+1]     float (the schedule)
-        """
+        """Run full HunyuanImage3 DiT sampling. Returns a ``LatentSegment``."""
         from unirl.sde.noise import generate_latents
 
         device, batch_size = _conditions_device_and_batch(conditions, guidance_scale=float(params.guidance_scale))
@@ -767,18 +650,7 @@ class HunyuanImage3DiffusionStage(DiffusionStage[HunyuanImage3DiffusionCondition
         params: DiffusionSamplingParams,
         step_indices: Optional[List[int]] = None,
     ) -> ReplayResult:
-        """Segment-based log-prob replay over the rollout's SDE transitions.
-
-        Mirrors ``SD3DiffusionStage.replay``: loop the per-step replay
-        primitive (``step.step_with_logp`` with ``prev_sample`` set) over
-        the segment's SDE indices (or the ``step_indices`` subset, which
-        must be a subset of ``segment.sde_indices``). Returns a
-        :class:`ReplayResult` with ``log_probs`` shape ``[B, len(target)]``
-        aligned with the corresponding slice of ``segment.sde_logp``
-        (cast to ``logprob_precision``) and ``prev_sample_means`` shape
-        ``[B, len(target), *latent_shape]`` carrying the SDE Gaussian
-        means μ_θ for KL-penalty consumption.
-        """
+        """Segment-based log-prob replay over the rollout's SDE transitions."""
         if segment.sde_indices is None or segment.latents is None:
             raise ValueError("HunyuanImage3DiffusionStage.replay: segment.sde_indices / latents missing")
         if segment.sigmas is None:
@@ -852,12 +724,7 @@ class HunyuanImage3DiffusionStage(DiffusionStage[HunyuanImage3DiffusionCondition
         sigma: torch.Tensor,
         params: DiffusionSamplingParams,
     ) -> torch.Tensor:
-        """Single ``(xt, sigma)`` model forward — no scheduler iteration.
-
-        Stateless mode (``state=None``, ``step_index=0``); HI3's stateful
-        cache is only meaningful inside an SDE trajectory, which DiffusionNFT-style
-        forward-process algorithms don't traverse.
-        """
+        """Single ``(xt, sigma)`` model forward — no scheduler iteration."""
         # Restack CFG branches to match diffuse() and replay().
         conditions = _expand_cfg_for_forward(conditions)
         return self.step.predict_noise(
@@ -869,13 +736,7 @@ class HunyuanImage3DiffusionStage(DiffusionStage[HunyuanImage3DiffusionCondition
         )
 
     def trainable_module(self) -> "torch.nn.Module":
-        """Return the module the diffusion forward operates on.
-
-        For HI3, that's the bare decoder (``HunyuanImage3Model``) — the
-        FSDP wrap target. The HF wrapper (``HunyuanImage3ForCausalMM``)
-        owns frozen VAE + ViT siblings that must NOT be FSDP-wrapped
-        (mixed dtypes; not in the diffusion forward path).
-        """
+        """Return the module the diffusion forward operates on."""
         return self.model.transformer.model
 
 

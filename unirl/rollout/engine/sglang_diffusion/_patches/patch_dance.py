@@ -1,21 +1,4 @@
-"""REPLACE ``SchedulerRLMixin.flow_sde_sampling`` to add the DanceGRPO objective.
-
-Stock upstream sglang supports only ``sde``/``cps``/``ode``; UniRL's
-primary objective for FLUX.2-Klein is ``dance`` (DanceGRPO). ``dance`` is
-FlowGRPO's SDE transition with a **constant** ``std_dev_t = eta`` (vs ``sde``'s
-sigma-dependent ``sqrt(sigma/(1-sigma)) * eta``); ``prev_sample_mean`` and the
-log-prob reduction are otherwise identical to the ``sde`` branch.
-
-This exactly matches UniRL's train-side authority
-``unirl/sde/kernels.py:DanceSDEStrategy`` (``.step`` / ``.compute_log_prob``)
-that ``logprob_source='replay'`` recomputes against -- keeping the rollout
-transition and the train-side log-prob consistent (iter-0 importance ratios ~1).
-Parity with that authority is verified by hand for now (no automated parity test yet).
-
-This is the ONLY REPLACE patch (all infra patches are additive). It re-vendors
-upstream ``flow_sde_sampling`` with one extra ``elif``, so it must be re-synced by
-hand against the pinned upstream source on any sglang bump.
-"""
+"""REPLACE ``SchedulerRLMixin.flow_sde_sampling`` to add the DanceGRPO objective."""
 
 from __future__ import annotations
 
@@ -48,11 +31,7 @@ def _flow_sde_sampling_with_dance(
     next_sigma: "torch.FloatTensor",
     generator: "torch.Generator",
 ) -> "torch.Tensor":
-    """Re-vendor of upstream ``SchedulerRLMixin.flow_sde_sampling`` + ``dance``.
-
-    Only the ``elif effective_sde_type == "dance"`` branch is new; everything
-    else is byte-for-byte upstream so sde/cps/ode behaviour is unchanged.
-    """
+    """Re-vendor of upstream ``SchedulerRLMixin.flow_sde_sampling`` + ``dance``."""
     rollout_session_data = self._get_rollout_session_data(batch)
     sde_type = batch.rollout_sde_type
     noise_level = float(batch.rollout_noise_level)

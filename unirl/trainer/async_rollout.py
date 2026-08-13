@@ -41,12 +41,7 @@ def boundary_launch_slots(
     batches_since_sync: int,
     weight_sync_interval: int,
 ) -> int:
-    """Generations admissible now, bounded by concurrency, remaining batches, and the sync window.
-
-    ``weight_sync_interval - batches_since_sync`` is how many more batches the published
-    snapshot may serve; admitting past it launches work the staleness filter is
-    guaranteed to discard at the next quiesce.
-    """
+    """Generations admissible now, bounded by concurrency, remaining batches, and the sync window."""
     freshness = weight_sync_interval - batches_since_sync
     allowed = min(freshness, min(num_rollouts, hard_boundary) - trained_batches)
     return max(0, min(max_inflight - inflight_count, allowed - inflight_count - ready_count))
@@ -115,16 +110,7 @@ def _rollout_id(sample: "Sample") -> int:
 
 
 class AsyncRolloutTrainerMixin:
-    """One async batch loop shared by ``AsyncARTrainer`` and ``AsyncDiffusionTrainer``.
-
-    The host trainer supplies the domain surface (``_build_request_sample``,
-    ``_drop_decoded``, ``_advantage_and_train``, checkpoint/wandb helpers, the
-    ``reward``/``backend``/``rollout``/``weight_sync`` remotes, and the
-    ``_max_inflight``/``_weight_sync_interval``/``_num_updates_per_batch``
-    knobs) plus the ``_async_wandb_extra`` / ``_boundary_evaluate`` hooks.
-    The mixin owns admission, boundary sync, and FIFO batch consumption;
-    ``RolloutManager`` alone owns the published rollout version.
-    """
+    """One async batch loop shared by ``AsyncARTrainer`` and ``AsyncDiffusionTrainer``."""
 
     def _async_wandb_extra(self) -> Dict[str, object]:
         """Trainer-specific keys merged into the wandb run config."""

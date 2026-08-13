@@ -1,24 +1,4 @@
-"""BagelFlowUniGRPO — FlowGRPO + velocity-MSE regularization (UniGRPO image side).
-
-UniGRPO replaces FlowGRPO's latent-KL penalty with an unweighted MSE on the
-predicted velocity field::
-
-    L_MSE(theta) = || v_theta(x_t, t, y) - v_ref(x_t, t, y) ||^2
-
-evaluated at the SDE-trained timesteps, where ``v_ref`` is the frozen pre-trained
-base reference: under LoRA the policy with adapters disabled, under full
-fine-tuning a frozen snapshot of the base weights swapped in for the v_ref
-forward. This pulls the RL-tuned vector field back toward the base across all
-noise levels, which mitigates reward hacking better than the timestep-weighted KL.
-
-Subclasses :class:`FlowGRPO`: the clipped surrogate is inherited; the MSE term
-adds its own backward into the same optimizer step. GRPO-Guard RatioNorm
-(per-SDE-step ratio normalization) is optional via ``ratio_norm=True``.
-
-Compute note: the MSE runs two extra velocity forwards per SDE step (``v_theta``
-with grad, ``v_ref`` with adapters off / base snapshot), separate from the
-inherited GRPO log-prob replay; fusing them is a follow-up.
-"""
+"""BagelFlowUniGRPO — FlowGRPO + velocity-MSE regularization (UniGRPO image side)."""
 
 from __future__ import annotations
 
@@ -42,18 +22,7 @@ from .flowgrpo import FlowGRPO
 
 @contextmanager
 def _disable_lora(module: Any) -> Iterator[bool]:
-    """Temporarily disable LoRA adapters so a forward runs the base model.
-
-    FSDPBackend injects LoRA via ``inject_adapter_in_model`` (not ``get_peft_model``),
-    so target modules are ``peft.tuners.lora.LoraLayer``s exposing
-    ``enable_adapters(bool)``. Walk the tree, flip every LoRA layer off for the
-    scope, restore on exit. Yields ``True`` when at least one LoRA layer was found
-    (so the forward really is the base = v_ref), ``False`` otherwise (no-op) so the
-    caller can refuse rather than use the policy as its own reference.
-
-    Self-contained here so the BAGEL UniGRPO task stays independent of any other
-    algorithm module.
-    """
+    """Temporarily disable LoRA adapters so a forward runs the base model."""
     try:
         from peft.tuners.lora import LoraLayer
     except Exception:
@@ -116,35 +85,12 @@ class BagelFlowUniGRPO(FlowGRPO):
         return any(isinstance(m, LoraLayer) for m in transformer.modules())
 
     def _snapshot_reference(self, transformer: Any) -> None:
-        """Deprecated shim — the v_ref base snapshot is now captured lazily inside
-        :meth:`_reference_weights` (at the swap site, so the shard state matches every
-        step). Kept as a no-op for any external caller; safe to remove once none remain.
-        """
+        """Deprecated no-op shim — the v_ref base snapshot is now captured lazily in :meth:`_reference_weights`."""
         return None
 
     @contextmanager
     def _reference_weights(self, transformer: Any) -> Iterator[None]:
-        """Swap the frozen base weights into the trainable params for a v_ref forward.
-
-        Full-FT analog of :func:`_disable_lora`. Swaps by **in-place copy of the local
-        shard**, NOT a ``.data`` pointer swap: under ``fully_shard`` the forward's
-        all-gather reads FSDP2's captured shard storage, so reassigning ``param.data`` is
-        silently ignored (verified on a 2-GPU repro — the swapped forward equalled the
-        live one), whereas ``local_view(p).copy_(...)`` writes that storage and IS honored.
-
-        On the FIRST call it captures the base snapshot (the pre-trained weights, before
-        the first optimizer step) **at this swap site** — the same shard state every
-        subsequent step sees, so the copy sizes always match (a pre-loop snapshot would be
-        sharded while the swap site, right after the v_theta forward, is unsharded → size
-        mismatch). Stored as bf16 (the forward computes in bf16; halves the ~3.5→1.75
-        GiB/GPU footprint) keyed by param id.
-
-        Per step: stash each live local shard, copy the base in (cast to the live fp32
-        master dtype), run the (no_grad) v_ref forward, then copy the trained weights back
-        before any backward — so v_theta's autograd graph (recomputed under activation
-        checkpointing at the post-loop backward) reads the trained weights. In-place
-        copy+restore is autograd-safe here (verified on a 2-GPU backward repro).
-        """
+        """Swap the frozen base weights into the trainable params for a v_ref forward."""
         from unirl.train.ema import local_view
 
         live = [p for p in transformer.parameters() if p.requires_grad]
@@ -174,16 +120,7 @@ class BagelFlowUniGRPO(FlowGRPO):
         conditions: Mapping[str, Condition],
         segment: "LatentSegment",
     ) -> None:
-        """Freeze the π_old anchor; under ``old_logp_source="replay"`` + RatioNorm refresh
-        μ_old (``sde_means``) alongside π_old (``sde_logp``) from ONE replay.
-
-        Base FlowGRPO recomputes only ``sde_logp`` from the pre-update replay. RatioNorm
-        also reads ``segment.sde_means`` as μ_old; leaving it at the rollout (pack-B,
-        bf16-packing) geometry while ``sde_logp`` is recomputed at the bs=1 replay geometry
-        makes Δμ ≠ 0 at update 0 → ratio ≠ 1. So do one replay and write BOTH. The train
-        stack calls this per 1-sample micro-slice (so a bs=1 replay suffices) and cats the
-        declared ``anchor_fields`` back. Other modes defer to FlowGRPO unchanged.
-        """
+        """Freeze the π_old anchor; with ``old_logp_source='replay'`` + RatioNorm also refresh μ_old in one replay."""
         if not (self.ratio_norm and self.old_logp_source == "replay"):
             super().prepare_segment(conditions=conditions, segment=segment)
             return
@@ -288,26 +225,7 @@ class BagelFlowUniGRPO(FlowGRPO):
         training_progress: float,
         loss_scale: float,
     ) -> AlgorithmStepResult:
-        """FlowGRPO clipped surrogate with GRPO-Guard RatioNorm.
-
-        The flow importance ratio is left-shifted (mean < 1) and step-inconsistent,
-        so plain clipping fails. RatioNorm normalizes the per-SDE-step log-ratio::
-
-            log r̂ = std_var · ( log r + mean(Δμ²) / (2·std_var²) )
-
-        where ``std_var = σ_t·√(-dt)`` is exactly FlowSDEStrategy's per-step SDE std,
-        ``Δμ = μ_old − μ_θ`` (``μ_old`` = rollout SDE mean ``segment.sde_means``;
-        ``μ_θ`` = replay mean), and ``mean(Δμ²)`` is over elements to match the
-        mean-reduced ``log r``. The additive term cancels the ``−‖Δμ‖²/(2σ²dt)`` bias
-        (mean → 0, i.e. ``r̂`` mean → 1); the ``σ_t√dt`` factor unifies variance
-        across steps. The clip then runs on ``r̂``. With ``grad_reweight`` each step's
-        loss is also scaled by the normalized ``1/|dt|`` (GRPO-Guard gradient
-        balancing). Mirrors :meth:`FlowGRPO.compute_loss_and_backward` otherwise.
-
-        Logs ``rn_raw_ratio_mean`` (the PRE-RatioNorm ratio): on an off-policy update
-        it should be < 1 while ``ratio_mean`` (post-RatioNorm) ≈ 1 — the smoke check
-        that RatioNorm is centering correctly. (On the on-policy update both ≈ 1.)
-        """
+        """FlowGRPO clipped surrogate with GRPO-Guard RatioNorm."""
         target_steps = self._resolve_target_steps(segment)
         if not target_steps:
             return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
@@ -384,11 +302,7 @@ class BagelFlowUniGRPO(FlowGRPO):
         dtype: Any,
         sigma_max: float = 0.99,
     ) -> torch.Tensor:
-        """Per-SDE-step ``std_var = σ_t·√(-dt)`` — byte-matches ``FlowSDEStrategy.step``.
-
-        ``σ_t = η·√(σ/(1-σ))`` (σ=1 clamped via ``sigma_max``), ``dt = σ_next − σ`` (<0).
-        Returns ``[1, len(target_steps)]`` so it broadcasts against the ``[1, S']`` ratios.
-        """
+        """Per-SDE-step ``std_var = σ_t·√(-dt)`` as ``[1, len(target_steps)]``, broadcasting against ``[1, S']``."""
         sig = sigmas.to(device=device, dtype=torch.float32)
         vals: List[torch.Tensor] = []
         for s in target_steps:

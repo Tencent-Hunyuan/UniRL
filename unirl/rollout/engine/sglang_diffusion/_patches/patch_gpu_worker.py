@@ -1,35 +1,4 @@
-"""Re-home the ``sglang-drl`` fork's ``GPUWorker`` RL additions onto stock upstream.
-
-The fork added, to ``runtime/managers/gpu_worker.py:GPUWorker``:
-  * ``__init__`` instance state for sleep/wake + distributed weight updates, and a
-    ``MemorySaverHandler`` (zero-copy GPU sleep/wake).
-  * ~14 net-new methods: ``is_sleeping``, ``_to_torch_dtype``,
-    ``init_weights_update_group`` / ``destroy_weights_update_group``,
-    ``update_weights_from_tensor`` / ``update_weights_from_distributed``,
-    ``encode_prompt``, ``get_weights_detail``, ``set_lora_from_tensors``,
-    ``_get_module_device`` / ``_move_unregistered_tensors`` / ``_move_modules``,
-    ``release_memory_occupation`` / ``resume_memory_occupation``.
-
-All method bodies are copied verbatim from the fork diff
-(``e9b570654..HEAD`` for ``gpu_worker.py``); they are only re-homed as
-``setattr`` (and an AROUND-wrapped ``__init__``) so UniRL can track
-upstream instead of carrying a hard fork. NO sglang source is edited.
-
-The fork called several names as gpu_worker module globals (``get_tp_rank``,
-``WeightsUpdater``, ``get_updatable_modules``, ``iter_materialized_weights``,
-``compute_weights_checksum``, ``LoRAPipeline``); since these patched functions
-live in this module, they import those names locally (import-safe, idempotent).
-
-Cross-patch dependencies (added by sibling patches, called here exactly as the
-fork does):
-  * ``WeightsUpdater.update_weights_from_named_tensors`` -- fork-only, added by
-    ``patch_weights_updater``. Used by ``update_weights_from_tensor`` /
-    ``update_weights_from_distributed``.
-  * ``LoRAPipeline.set_lora(..., lora_tensors=...)`` + the tensor-load path --
-    fork-only, added by ``patch_lora_pipeline``. Used by ``set_lora_from_tensors``.
-
-See the module-level RISKS docstring at the bottom for upstream gaps.
-"""
+"""Re-home the ``sglang-drl`` fork's ``GPUWorker`` RL additions onto stock upstream."""
 
 from __future__ import annotations
 
@@ -256,15 +225,7 @@ def _update_weights_from_distributed(
 
 
 def _encode_prompt(self, prompts: list[str]) -> dict:
-    """Encode text prompts into embeddings using the pipeline's text encoding stage.
-
-    Returns a dict mapping tensor names to torch.Tensor values:
-      - prompt_embeds: [B, seq, hidden] sequence embeddings (concatenated along
-        seq dim when multiple encoders produce 3-D output)
-      - pooled_prompt_embeds: [B, hidden] pooled embeddings (concatenated along
-        hidden dim when multiple 2-D outputs exist)
-      - encoder_attention_mask: [B, seq] attention mask for sequence encoders
-    """
+    """Encode prompts: ``prompt_embeds [B, seq, hidden]``, ``pooled [B, hidden]``, ``mask [B, seq]``."""
     from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
     logger = init_logger("sglang.multimodal_gen.runtime.managers.gpu_worker")
@@ -375,11 +336,7 @@ def _set_lora_from_tensors(
     strength: Union[float, List[float]] = 1.0,
     lora_alpha: Optional[float] = None,
 ):
-    """Set LoRA adapter from in-memory tensors.
-
-    ``lora_alpha`` (optional) is forwarded to the fork's ``set_lora`` as an
-    adapter-level alpha; ``None`` leaves the pipeline on its per-layer path.
-    """
+    """Set LoRA adapter from in-memory tensors."""
     from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline
     from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 
@@ -415,13 +372,7 @@ def _get_module_device(self, module: torch.nn.Module) -> str:
 
 
 def _move_unregistered_tensors(self, module: torch.nn.Module, device: str) -> None:
-    """
-    Move tensor attributes that are not covered by `module.to(device)`.
-
-    `module.to` handles parameters/buffers/submodules, but some models keep tensor
-    caches in plain Python attributes. We traverse `module.__dict__` and move tensor
-    leaves inside tensors / dict / list / tuple while keeping non-tensor objects.
-    """
+    """Move tensor attributes that are not covered by `module.to(device)`."""
     from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
     logger = init_logger("sglang.multimodal_gen.runtime.managers.gpu_worker")
@@ -455,14 +406,7 @@ def _move_unregistered_tensors(self, module: torch.nn.Module, device: str) -> No
 
 
 def _move_modules(self, names: list[str], device: str) -> bool:
-    """
-    Move selected modules to device.
-
-    This function has all-or-nothing semantics:
-    - Stop on first failure (missing module / device query / move / sanitize).
-    - Roll back modules already moved in this call.
-    - Raise RuntimeError to caller after rollback.
-    """
+    """Move selected modules to device."""
     from sglang.multimodal_gen.runtime.loader.weights_updater import (
         get_updatable_modules,
     )

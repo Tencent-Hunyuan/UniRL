@@ -1,32 +1,4 @@
-"""WAN 2.2 diffusion: dual-transformer per-step kernel + rollout-level stage.
-
-WAN 2.2 introduces sigma-boundary-based routing between two transformer
-copies:
-
-- ``sigma >= boundary_ratio`` → ``high_noise`` branch (coarse structure)
-- ``sigma <  boundary_ratio`` → ``low_noise`` branch (detail
-  refinement); optionally with its own ``guidance_scale_2``
-
-The routing is **per-step, per-sigma**, so it belongs in
-:class:`WAN22DiffusionStep` (the kernel), not in the stage loop. The
-stage layer is responsible for bookkeeping only and is otherwise
-identical to WAN 2.1.
-
-CFG batching follows the WAN 2.1 pattern (``[uncond, cond]`` along
-batch dim, ``chunk(2)``, interpolate). The transformer call goes
-through ``WAN22Bundle.transformer.forward(use_high_noise=..., ...)``
-(the :class:`WanDualTransformer` composite) so branch routing stays
-behind the stage abstraction. FSDPPolicy does not root-wrap the
-composite; it discovers and fully-shards the ``WanTransformerBlock``
-instances under both branches.
-
-The replay path uses the same per-step kernel with ``prev_sample`` set;
-this means each replay step also routes by sigma, mirroring how the
-rollout was produced.
-
-Math derived from ``models/wan22.py::forward_denoiser`` and
-``samplers/fsdp/wan22_sampler.py`` (do NOT import legacy code).
-"""
+"""WAN 2.2 diffusion: dual-transformer per-step kernel + rollout-level stage."""
 
 from __future__ import annotations
 
@@ -49,14 +21,7 @@ _WAN_TIMESTEP_SCALE: float = 1000.0
 
 
 class WAN22DiffusionStep(DiffusionStep[WAN22Bundle, WAN21Conditions]):
-    """Per-step WAN 2.2 denoising kernel — stateless, dual-transformer routing.
-
-    For each call, decides whether to route through the high- or
-    low-noise sub-transformer based on the current sigma vs the
-    bundle's ``boundary_ratio``. The low-noise branch optionally uses
-    a separate guidance scale (``guidance_scale_2``); when ``None``,
-    the same scale flows through both branches.
-    """
+    """Per-step WAN 2.2 denoising kernel — stateless, dual-transformer routing."""
 
     @staticmethod
     def _select_for_sigma(
@@ -66,31 +31,7 @@ class WAN22DiffusionStep(DiffusionStep[WAN22Bundle, WAN21Conditions]):
         *,
         boundary_ratio: float,
     ) -> Tuple[bool, float]:
-        """Decide which sub-transformer to use and which guidance to apply.
-
-        Returns ``(use_high_noise, active_guidance)``.
-
-        Boundary policy (matches ``models/wan22.py::_select_guidance_for_sigma``
-        in spirit, but only branches on ``sigma`` directly — WAN 2.2's
-        sigma schedule lives in ``[0, 1]`` and ``boundary_ratio`` is
-        defined in that same domain):
-
-        - ``sigma >= boundary_ratio`` → high_noise + ``guidance_scale``
-        - ``sigma <  boundary_ratio`` → low_noise + ``guidance_scale_2``
-          (falls back to ``guidance_scale`` when the per-stage scale
-          is ``None``)
-
-        Per-sample sigma policy: when ``sigma`` is a 1D tensor of per-
-        sample values, we read ``sigma[0]`` to pick the branch for the
-        whole batch. This is consistent with how both rollout and replay
-        invoke the kernel — every call site here passes a single
-        ``schedule[i]`` scalar (or broadcasts it), so all samples share
-        the same sigma in any one ``predict_noise`` call. If a future
-        consumer ever ships heterogeneous per-sample sigmas through this
-        step, this assumption must be revisited (it would require
-        per-sample routing — likely two forwards followed by per-sample
-        gather).
-        """
+        """Pick the sub-transformer and guidance for this step — reads ``sigma[0]`` against ``boundary_ratio``."""
         sigma_val = float(sigma.item()) if sigma.dim() == 0 else float(sigma.flatten()[0].item())
         if sigma_val >= boundary_ratio:
             return True, float(guidance_scale)
@@ -107,14 +48,7 @@ class WAN22DiffusionStep(DiffusionStep[WAN22Bundle, WAN21Conditions]):
         guidance_scale: float,
         guidance_scale_2: Optional[float] = None,
     ) -> torch.Tensor:
-        """Run dual-transformer noise prediction with optional CFG.
-
-        Routes by sigma against ``model.boundary_ratio`` then applies CFG
-        in the active branch. The call always goes through
-        ``model.transformer.forward`` (the :class:`WanDualTransformer`
-        composite) so sampling code depends on one stage-level routing
-        surface rather than reaching into high/low sub-transformers.
-        """
+        """Run dual-transformer noise prediction with optional CFG."""
         if conditions.text is None:
             raise ValueError("WAN22DiffusionStep.predict_noise: conditions.text is None")
         text = conditions.text
@@ -228,14 +162,7 @@ class WAN22DiffusionStep(DiffusionStep[WAN22Bundle, WAN21Conditions]):
         step_index: int = 0,
         guidance_scale_2: Optional[float] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """Run dual-transformer forward + SDE transition. End-to-end one step.
-
-        ``guidance_scale_2`` is the WAN 2.2 extension over the
-        Protocol's ``step`` signature (Protocol accepts ``**kwargs``-style
-        extension for model-specific knobs; here it's keyword-only with
-        a default of ``None`` so we stay backwards compatible with
-        callers that don't pass it).
-        """
+        """Run dual-transformer forward + SDE transition. End-to-end one step."""
         noise_pred = self.predict_noise(
             model,
             sample,
@@ -290,20 +217,7 @@ class WAN22DiffusionStep(DiffusionStep[WAN22Bundle, WAN21Conditions]):
 
 
 class WAN22DiffusionStage(DiffusionStage[WAN21Conditions]):
-    """WAN 2.2 T2V rollout-level diffusion stage with dual-transformer routing.
-
-    Owns the SDE ``strategy`` (stateful strategies require a stable
-    instance across the loop) + bundle + kernel + precision policy.
-    The kernel routes per-step between high- and low-noise transformers
-    based on the bundle's ``boundary_ratio``; the stage loop is
-    otherwise identical to WAN 2.1.
-
-    ``replay`` also routes per-sigma, mirroring the rollout exactly.
-
-    ``_no_split_modules`` provides the FSDPPolicy fallback for HF
-    auto-discovery; WanTransformerBlock is shared by both
-    sub-transformers in :class:`WanDualTransformer`.
-    """
+    """WAN 2.2 T2V rollout-level diffusion stage with dual-transformer routing."""
 
     _no_split_modules: ClassVar[Tuple[str, ...]] = ("WanTransformerBlock",)
 
@@ -351,12 +265,7 @@ class WAN22DiffusionStage(DiffusionStage[WAN21Conditions]):
         params: DiffusionSamplingParams,
         initial_latents: Optional[torch.Tensor] = None,
     ) -> LatentSegment:
-        """Run full WAN 2.2 T2V sampling. Returns a ``LatentSegment``.
-
-        ``initial_latents`` (optional) — x_T resolved from the request
-        ``Sample``'s diffusion generation Part; see
-        :class:`SD3DiffusionStage.diffuse` for the contract.
-        """
+        """Run full WAN 2.2 T2V sampling. Returns a ``LatentSegment``."""
         from unirl.sde.noise import generate_latents
 
         if conditions.text is None or conditions.text.embeds is None:
@@ -549,12 +458,7 @@ class WAN22DiffusionStage(DiffusionStage[WAN21Conditions]):
         sigma: torch.Tensor,
         params: DiffusionSamplingParams,
     ) -> torch.Tensor:
-        """Single ``(xt, sigma)`` model forward — no scheduler iteration.
-
-        Delegates to ``WAN22DiffusionStep.predict_noise``; routing between
-        high-noise / low-noise sub-transformers + ``guidance_scale_2``
-        handling are owned by the kernel.
-        """
+        """Single ``(xt, sigma)`` model forward — no scheduler iteration."""
         return self.step.predict_noise(
             self.model,
             sample,
@@ -565,42 +469,7 @@ class WAN22DiffusionStage(DiffusionStage[WAN21Conditions]):
         )
 
     def trainable_module(self) -> "torch.nn.Module":
-        """Return the composite :class:`WanDualTransformer` for FSDP wrapping.
-
-        **FSDP wrapping policy** (matches the v2 FSDP backend,
-        ``unirl/train/backend/fsdp.py``):
-        the block-wrap policy does NOT call ``fully_shard`` on the
-        composite root. It enumerates the ``WanTransformerBlock`` block
-        instances inside ``self.model`` and runs ``fully_shard(layer)``
-        on each individually (see ``fsdp_policy.py::_enumerate_block_instances``
-        + the ``"No root fully_shard"`` comment on the wrap loop).
-        Because ``WanDualTransformer`` is a plain ``nn.Module`` whose
-        ``named_modules()`` recurses into both ``high_noise.*`` and
-        ``low_noise.*``, the block discovery walks both sub-transformers
-        and shards every block in both. The composite root itself stays
-        unwrapped, exactly like SD3 / HI3.
-
-        **LoRA-on-composite assumption** (worth a GPU smoke):
-        LoRA injection (``unirl.train.lora``) calls
-        :func:`peft.inject_adapter_in_model` on whatever
-        ``trainable_module()`` returns, with a ``target_modules`` list of
-        suffix strings (e.g. ``["attn1.to_q", "attn1.to_k", ...]``).
-        peft walks ``named_modules()`` and matches by name suffix, so
-        for our composite both ``high_noise.transformer_blocks.*.attn1.to_q``
-        and ``low_noise.transformer_blocks.*.attn1.to_q`` should be
-        replaced with LoRA wrappers, yielding trainable LoRA params in
-        BOTH branches.
-
-        Legacy ``WAN22ModelBundle._add_lora_adapters`` did the injection
-        explicitly per sub-transformer to be safe; the code relies
-        on peft's standard recursive name matching instead. First-run
-        verification check (in GPU smoke):
-        ``[n for n, p in policy.model.named_parameters() if p.requires_grad]``
-        should list LoRA params under both ``high_noise.`` and
-        ``low_noise.`` prefixes; if it lists only one branch, fall back
-        to explicit per-sub-transformer injection or split the
-        ``trainable_module()`` API.
-        """
+        """Return the composite :class:`WanDualTransformer` for FSDP wrapping."""
         return self.model.transformer
 
 

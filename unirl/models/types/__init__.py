@@ -1,23 +1,4 @@
-"""Model type protocols and interfaces.
-
-Pipeline stages (each ``X → Y`` between tiers):
-
-- ``EncodeStage[P, C]`` — Primitive → Condition (e.g. VAE encode).
-- ``EmbedStage[P, C]`` — Primitive → Condition (e.g. text encoder).
-- ``ImageConditionedEmbedStage[P, ImageP, C]`` — Primitive + image → Condition.
-- ``DiffusionStage`` — Conditions → LatentSegment.
-- ``ARStage`` — Conditions → TextSegment.
-- ``DecodeStage[S, P]`` — Segment → Primitive (e.g. VAE decode).
-
-Step kernels (per-step math, tensor I/O):
-
-- ``DiffusionStep`` — single denoising transition.
-- ``ARStep`` — single-token transition (model forward + sample).
-
-All schedule / sampling parameters are passed at call time on the rollout-
-level stages (``diffuse(...)`` / ``autoregress(...)``) — Stages are stateless
-modulo the model they wrap.
-"""
+"""Model type protocols and interfaces."""
 
 from __future__ import annotations
 

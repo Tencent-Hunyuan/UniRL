@@ -1,15 +1,4 @@
-"""Shared validation helpers for component configs.
-
-Two flavors of validator live here:
-
-- **Per-field helpers** (e.g. :func:`validate_precision_type`) are called from
-  individual ``__post_init__`` bodies so every dataclass that owns the same
-  kind of field validates it the same way.
-- **Cross-component validators** (``validate_weight_sync_contract``,
-  ``validate_offload_contract``, ...) take the full ``cfg`` and enforce
-  rules that span multiple resolved sections. They run on the driver against
-  the composed ``cfg`` before Ray actors are created.
-"""
+"""Shared validation helpers for component configs."""
 
 from __future__ import annotations
 
@@ -42,13 +31,7 @@ _CANONICAL_BY_DTYPE = {
 
 
 def validate_precision_type(value: Any, *, field: str) -> str:
-    """Return the canonical precision alias (``bf16``/``fp16``/``fp32``).
-
-    Delegates alias expansion to ``parse_torch_dtype`` so all precision fields
-    accept the same inputs (``bf16``/``bfloat16``, ``fp16``/``float16``/``half``,
-    ``fp32``/``float32``/``float``) and raise the same ``ValueError`` on unknown
-    names. Caller supplies ``field`` for error-message attribution.
-    """
+    """Return the canonical precision alias (``bf16``/``fp16``/``fp32``)."""
     dtype = parse_torch_dtype(value, field_name=field)
     return _CANONICAL_BY_DTYPE[dtype].value
 
@@ -61,13 +44,7 @@ _IPC_SYNC_SUFFIXES = frozenset({"UpdateWeightFromIPC"})
 
 
 def is_direct_sampling(cfg: DictConfig) -> bool:
-    """Training-actor-sampling mode is derived from the selected engine.
-
-    ``rollout/engine: trainside`` → ``TrainsideRolloutEngine`` (the
-    in-process Pipeline adapter; see ``unirl/rollout/engine/trainside``)
-    is the only direct-sampling engine. All other engines (sglang, vllm-omni)
-    run dedicated rollout actors.
-    """
+    """Training-actor-sampling mode is derived from the selected engine."""
     target = str(cfg.rollout.engine.get("_target_") or "")
     return target.endswith(_DIRECT_SAMPLING_ENGINE_SUFFIXES)
 
@@ -87,12 +64,7 @@ def validate_dynamic_dotpaths(cfg: DictConfig) -> None:
 
 
 def validate_training_batch_geometry(cfg: DictConfig) -> None:
-    """Cross-section: training plan's global batch size must divide by DP sizes.
-
-    ``cfg.training.topology.dp_size`` is optional; ``null`` means "derive
-    from ``dist.get_world_size()`` at runtime" and is not checkable at cfg
-    time.
-    """
+    """Cross-section: training plan's global batch size must divide by DP sizes."""
     global_batch = int(cfg.training.plan.global_batch_size)
     raw_dp_size = cfg.training.topology.dp_size
     dp_replicate_size = int(cfg.training.topology.dp_replicate_size)
@@ -158,19 +130,7 @@ def validate_offload_contract(cfg: DictConfig) -> None:
 
 
 def validate_keep_local_contract(cfg: DictConfig) -> None:
-    """Keep-local data plane is direct-sampling-only and excludes TransferQueue.
-
-    ``cfg.training.execution.keep_local=True`` makes each train actor cache the
-    rollout it produced and train on it in place, so heavy tensors never reach the
-    driver. That requires producer==consumer (direct sampling), and is mutually
-    exclusive with TransferQueue — the other off-driver data plane.
-
-    It is byte-equivalent to the gathered path only when the rollout's prompt
-    groups divide evenly across the train actors (enforced below); otherwise the
-    per-actor partition — and hence the FSDP-averaged gradient — differs, so
-    keep-local would be a distinct training run rather than a transparent
-    optimization.
-    """
+    """Keep-local data plane is direct-sampling-only and excludes TransferQueue."""
     if not bool(cfg.training.execution.get("keep_local", False)):
         return
     require(
@@ -200,21 +160,7 @@ def validate_keep_local_contract(cfg: DictConfig) -> None:
 
 
 def validate_lora_target_modules(cfg: DictConfig) -> None:
-    """Materialize ``cfg.model.lora_target_modules`` from the bundle's class default.
-
-    When LoRA is requested but no explicit target list was supplied, resolve the
-    model class via ``cfg.model._target_`` and call its
-    ``default_lora_target_modules()`` classmethod. Mutates ``cfg.model`` in
-    place (the model config is registered ``mutable=True``) so PEFT (training
-    side) and SGLang ``ServerArgs.lora_target_modules`` (rollout side) see the
-    same list. Without this materializer, PEFT injects LoRA into a model-class
-    default subset while SGLang receives ``None`` and wraps every linear layer,
-    producing a wall of "LoRA adapter None does not contain the weights for layer ..."
-    warnings and silently disabling LoRA on unmatched layers.
-
-    Priority: explicit ``cfg.model.lora_target_modules`` > model class default
-    > ``None`` (warn).
-    """
+    """Materialize ``cfg.model.lora_target_modules`` from the bundle's class default."""
     if not bool(cfg.model.get("use_lora", False)):
         return
     if cfg.model.get("lora_target_modules") is not None:
@@ -277,18 +223,7 @@ def validate_lora_target_modules(cfg: DictConfig) -> None:
 
 
 def validate_multi_track_mini_batch_geometry(cfg: DictConfig) -> None:
-    """Multi-track mini-batching requires per-actor sample counts divisible by num_updates.
-
-    In a multi-track PE joint setup (ar + diffusion), the train actor splits the
-    generated Sample into ``num_updates_per_batch`` mini-batches along the AR
-    Part. The AR Part's per-actor batch size is
-    ``P * N / actor_count`` and must divide evenly by ``num_updates_per_batch``;
-    otherwise the lineage-aware split cannot produce equal-sized chunks.
-
-    Skips validation when:
-    - ``num_updates_per_batch <= 1`` (no splitting)
-    - ``cfg.training.tracks`` is absent or has <= 1 track (single-track mode)
-    """
+    """Multi-track mini-batching requires per-actor sample counts divisible by num_updates."""
     num_updates = int(cfg.training.plan.get("num_updates_per_batch", 1))
     if num_updates <= 1:
         return

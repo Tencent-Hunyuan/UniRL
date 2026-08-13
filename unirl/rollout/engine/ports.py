@@ -1,21 +1,4 @@
-"""Typed, self-reserving TCP port sets for out-of-process inference engines.
-
-A :class:`ReservedPorts` subclass declares one ``int`` field per port its
-engine subprocess needs — declaration order is reservation order. The engine
-reserves its own set at the last responsible moment (in its ctor, on its own
-node, right before the spawn) via :meth:`ReservedPorts.reserve`; tests inject
-fixed instances instead. This replaces per-engine ``base + rank * stride``
-port math: bind-to-zero de-synchronizes colocated engines (each draws
-different ephemeral ports from the node's kernel), with no builder-side
-machinery.
-
-Reservation is a *hint*, not a contract: the sockets are closed immediately
-after binding (the subprocess must be able to bind them itself), so the usual
-bind-to-zero TOCTOU gap applies — the same trade-off ``sglang``'s
-``find_free_port`` already accepts, and SGLang's ``settle_port`` self-heals
-the rare loss. Port *ranges* (vllm_omni-style stride scans) are a different
-reservation primitive and out of scope here.
-"""
+"""Typed, self-reserving TCP port sets for out-of-process inference engines."""
 
 from __future__ import annotations
 
@@ -27,19 +10,7 @@ from typing import Sequence
 
 @dataclass(frozen=True)
 class ReservedPorts:
-    """Base for an engine-owned set of distinct TCP ports reserved together.
-
-    Subclass as a frozen dataclass with one ``int`` field per port::
-
-        @dataclass(frozen=True)
-        class MyEnginePorts(ReservedPorts):
-            http_port: int
-            nccl_port: int
-
-    Every field must be a port — validation rejects anything else loudly so
-    the contract can't drift into a grab-bag payload. Don't subclass a
-    subclass (field inheritance order would silently reorder reservation).
-    """
+    """Base for an engine-owned set of distinct TCP ports reserved together."""
 
     def __post_init__(self) -> None:
         fields = dataclasses.fields(self)
@@ -66,12 +37,7 @@ class ReservedPorts:
 
     @classmethod
     def reserve(cls) -> "ReservedPorts":
-        """Reserve one free port per field on this node, right now.
-
-        Binds all ephemeral ports simultaneously (so they're guaranteed
-        distinct), reads them, then closes the sockets immediately so the
-        engine's own bind succeeds.
-        """
+        """Reserve one free port per field on this node, right now."""
         socks = []
         try:
             for _ in dataclasses.fields(cls):

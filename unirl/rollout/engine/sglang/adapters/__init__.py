@@ -1,9 +1,4 @@
-"""The adapter package — registry + the two registered families.
-
-Importing this package populates the registry (the ``text`` / ``vlm`` imports
-fire the ``@register_adapter`` side-effects); ``config.__post_init__`` validates
-``model_family`` against :func:`registered_adapters`.
-"""
+"""The adapter package — registry + the two registered families."""
 
 from unirl.rollout.engine.sglang.adapters.base import (
     MMEncoding,

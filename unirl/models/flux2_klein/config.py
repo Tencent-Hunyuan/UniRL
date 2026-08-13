@@ -1,21 +1,4 @@
-"""Construction config for the typed FLUX.2-klein-9B pipeline.
-
-Sibling of :class:`unirl.models.sd3.SD3PipelineConfig` and
-:class:`unirl.models.qwen_image.QwenImagePipelineConfig`.
-Carries weights+precision knobs only; LoRA injection, FSDP wrapping,
-gradient checkpointing, and offload control all live in
-``cfg.training.policies`` (``LoRAPolicy`` / ``FSDPPolicy``) — the
-bundle is weights+params only.
-
-Klein uses the official FLUX.2 empirical-μ shifting (a function of packed
-image-seq-len + number of inference steps). The pipeline's
-``build_schedule_policy()`` returns a ``Flux2KleinSchedulePolicy`` whose
-:meth:`compute_mu` override supplies that empirical μ; the shared
-dynamic-shift application in
-:meth:`unirl.sde.runtime.FlowMatchSchedulePolicy.compute_sigma` does the rest. The
-static ``shift`` field is only consulted by the static-shift fallback,
-which Klein does not use (``use_dynamic_shifting=True``).
-"""
+"""Construction config for the typed FLUX.2-klein-9B pipeline."""
 
 from __future__ import annotations
 
@@ -27,12 +10,7 @@ from unirl.config.validation import validate_precision_type
 
 @dataclass
 class Flux2KleinPipelineConfig:
-    """Construction args for ``Flux2KleinPipeline.from_config``.
-
-    ``device`` may be runtime-injected by the actor after compose; the
-    other fields are set at compose time and read once during pipeline
-    construction.
-    """
+    """Construction args for ``Flux2KleinPipeline.from_config``."""
 
     pretrained_model_ckpt_path: str
     vae_ckpt_path: Optional[str] = None
@@ -67,20 +45,7 @@ class Flux2KleinPipelineConfig:
         validate_precision_type(self.model_precision, field="Flux2KleinPipelineConfig.model_precision")
 
     def build_schedule_policy(self):
-        """Build the Klein-specific schedule policy without a Pipeline instance.
-
-        Delegates to the same helper used by
-        :meth:`Flux2KleinPipeline.build_schedule_policy` so engines that hold
-        a config but never instantiate a Pipeline (SGLang / vLLM-Omni run the
-        model in a subprocess) can still get the empirical-μ schedule.
-
-        ``Flux2KleinSchedulePolicy(use_dynamic_shifting=True)`` overrides
-        :meth:`FlowMatchSchedulePolicy.compute_mu` with the FLUX.2
-        empirical formula; everything else (base grid, exponential time
-        shift, terminal zero) is the shared dynamic-shift path. The
-        static ``shift`` field is the documented static-fallback only
-        and is unused when dynamic shifting is active.
-        """
+        """Build the Klein-specific schedule policy without a Pipeline instance."""
         from unirl.models.flux2_klein.schedule import build_flux2_klein_schedule_policy
 
         return build_flux2_klein_schedule_policy(self.shift)

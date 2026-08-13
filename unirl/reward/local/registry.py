@@ -1,13 +1,4 @@
-"""Built-in reward scorer / spec registry.
-
-Two parallel maps keyed by ``model_name``:
-
-- ``_BUILTIN_SCORERS`` — model_name → scorer class. Used by composite scorers
-  (e.g. ``VideoRewardScorer``) that need to instantiate an inner frame scorer.
-- ``_BUILTIN_SPECS`` — model_name → spec dataclass. Same composite case needs
-  to materialize a default inner Spec to feed the scorer's
-  ``__init__(*, config, base_device)`` entry point.
-"""
+"""Built-in reward scorer / spec registry."""
 
 from __future__ import annotations
 

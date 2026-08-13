@@ -35,13 +35,7 @@ class QwenVLChatTemplateStage:
         value: QwenVLChatInput,
         images: Optional[List[Optional[Any]]] = None,
     ) -> QwenVLARConditions:
-        """Render role-aware turns or supervised single-turn rows.
-
-        ``List[Turn]`` is the Sample-native rollout path; image content is already
-        carried by image Turns. ``Texts`` plus an optional PIL per row is the SFT
-        path. Both normalize to the same processor-message representation and
-        share all tokenization, truncation, padding, and condition packing below.
-        """
+        """Render role-aware turns or supervised single-turn rows."""
         if isinstance(value, Texts):
             batch_size = len(value)
             if batch_size == 0:

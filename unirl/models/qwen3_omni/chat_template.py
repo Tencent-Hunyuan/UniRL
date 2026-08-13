@@ -70,13 +70,7 @@ class Qwen3OmniChatTemplateStage:
         value: Qwen3OmniChatInput,
         videos: Optional[List[Optional[Any]]] = None,
     ) -> Qwen3OmniARConditions:
-        """Render Sample-native turns or supervised text/video rows.
-
-        ``List[Turn]`` is the rollout path and retains the complete role-aware
-        trajectory. ``Texts`` plus optional videos is the supervised path. Both
-        normalize to the same processor-message representation so rollout and
-        replay share the exact encoding stored on the generated Part.
-        """
+        """Render Sample-native turns or supervised text/video rows."""
         if isinstance(value, Texts):
             batch_size = len(value)
             if batch_size == 0:

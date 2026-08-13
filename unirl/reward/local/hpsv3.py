@@ -16,14 +16,7 @@ from .base import LocalRewardBackend
 
 
 class HPSv3RewardScorer(LocalRewardBackend):
-    """HPSv3 image-text alignment reward (Qwen2-VL-7B based).
-
-    HPSv3 is a 7B VLM reward model that outputs [mu, sigma] per image.
-    We use mu (index 0) as the final score. The model accepts PIL Images
-    directly via its internal fetch_image(), so no disk I/O is needed.
-
-    Reference: https://github.com/MizzenAI/HPSv3
-    """
+    """HPSv3 image-text alignment reward (Qwen2-VL-7B based)."""
 
     canonical_model_name = "hpsv3"
 
@@ -72,10 +65,7 @@ class HPSv3RewardScorer(LocalRewardBackend):
 
 @dataclass
 class HPSv3Spec(BaseRewardComponentSpec):
-    """Typed config for the HPSv3 reward component.
-
-    HPSv3RewardInferencer self-loads its checkpoint, so no path knobs.
-    """
+    """Typed config for the HPSv3 reward component."""
 
     batch_size: int = 8
     device: str = "auto"

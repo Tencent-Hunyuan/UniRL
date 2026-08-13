@@ -1,41 +1,4 @@
-"""Stage-driven DiffusionNFT (Negative Fine-Tuning): forward-process diffusion RL.
-
-DiffusionNFT trains the policy across the diffusion noise spectrum without
-running an SDE rollout: each micro-step iterates over a set of
-timesteps :math:`\\{t_1, \\dots, t_K\\}` and, at every :math:`t_k`,
-
-1. constructs ``xt = (1 - t_k) * x0 + t_k * noise`` (flow-matching
-   forward diffusion of the rollout's clean final latent);
-2. asks the trainable adapter (``"default"``) for a noise prediction
-   :math:`new_pred` and the EMA-tracked frozen adapter (``"old"``) for
-   a reference prediction :math:`old_pred`;
-3. blends them into a dual positive / negative pair, reconstructs
-   :math:`x_0` from each, and weights the two MSE terms by a
-   reward-derived scalar :math:`r \\in [0, 1]`.
-
-Sweeping K timesteps per micro-step (with the gradient scaled by
-``loss_scale / K``) ensures the policy is updated across every noise
-level the rollout actually visited; a single random ``t`` would leave
-each rollout's update concentrated on one slice of the schedule.
-
-Timestep set source:
-
-* ``train_timestep_mode='all'`` — read directly from ``segment.sigmas``
-  (the rollout's sampled schedule), drop the terminal zero (training
-  on ``t=0`` collapses ``xt`` to ``x0`` and yields no signal), then
-  apply ``training_timestep_fraction`` as a slice;
-* ``train_timestep_mode='random'`` — synthesize ``B`` random scalars
-  in ``(0, training_timestep_fraction]``.
-
-In both modes each iteration broadcasts one scalar ``t`` to the whole
-batch.
-
-The dual-adapter mechanics (install / EMA / switch) live in the EMA
-policy owned by the FSDP backend. The algorithm receives the policy
-via constructor injection (``nft_lora_policy=...``, resolved off
-``backend.ema`` by the v2 trainer) and calls its ``use_shadow()``
-context manager to obtain :math:`old_pred`.
-"""
+"""Stage-driven DiffusionNFT (Negative Fine-Tuning): forward-process diffusion RL on reward ``r ∈ [0, 1]``."""
 
 from __future__ import annotations
 
@@ -55,12 +18,7 @@ from .base import AlgorithmStepResult, BaseAlgorithmConfig, StageAlgorithm
 
 @dataclass
 class DiffusionNFTConfig(BaseAlgorithmConfig):
-    """Per-call DiffusionNFT loss hyperparameters.
-
-    Only the configuration surface exercised by current recipes is
-    accepted; unsupported values fail fast in :meth:`DiffusionNFT.__init__`
-    rather than silently behaving differently.
-    """
+    """Per-call DiffusionNFT loss hyperparameters."""
 
     beta: float = 1.0
     adv_clip_max: float = 5.0
@@ -74,31 +32,7 @@ class DiffusionNFTConfig(BaseAlgorithmConfig):
 
 
 class DiffusionNFT(StageAlgorithm):
-    """Forward-process DiffusionNFT over a diffusion ``LatentSegment``.
-
-    DiffusionNFT is off-policy: the rollout uses EMA-smoothed weights to produce
-    high-quality trajectories, and the dual-adapter loss trains against
-    them (``requires_ema_rollout = True``).
-
-    Args:
-        stage: A :class:`DiffusionStage` exposing
-            :meth:`predict_noise_at_step(conditions, *, sample, sigma, params)`.
-            All DiffusionNFT-supported recipes today target SD3 (``SD3DiffusionStage``);
-            the API works model-agnostically across the six NEW stages.
-        params: Per-call params object the stage's predictor consumes
-            (e.g. ``SD3DiffusionParams``). Held as algorithm state so the
-            dispatcher doesn't need to know it. Read fields:
-            ``guidance_scale`` (always), and any model-specific extras
-            that ``predict_noise_at_step`` forwards.
-        config: :class:`DiffusionNFTConfig` — loss hyperparameters.
-        nft_lora_policy: The :class:`NFTLoRAPolicy` instance owning the
-            ``default`` / ``old`` adapter pair. Injected by
-            ``train_actor`` at algorithm-construction time (the
-            algorithm cannot walk to it from ``stage`` alone — the chain
-            goes outward from stage, not inward to policies).
-        conditions_cls: Optional stage-typed conditions container with
-            a ``from_dict(Mapping[str, Condition])`` classmethod.
-    """
+    """Forward-process DiffusionNFT over a diffusion ``LatentSegment``."""
 
     requires_ema_rollout: bool = True
 
@@ -270,10 +204,7 @@ class DiffusionNFT(StageAlgorithm):
         B: int,
         compute_dtype: torch.dtype,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """Single-timestep DiffusionNFT loss. ``t_scalar`` is a 0-dim tensor that
-        is broadcast to the whole batch — every sample sees the same
-        noise level in this iteration of the outer K-loop.
-        """
+        """Single-timestep DiffusionNFT loss."""
         device = x0.device
         t_batch = t_scalar.detach().to(device=device, dtype=compute_dtype).expand(B)
         t_exp = t_batch.view(B, *([1] * (x0.ndim - 1)))
@@ -347,14 +278,7 @@ class DiffusionNFT(StageAlgorithm):
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        """Resolve the K scalar timesteps for the outer K-iteration loop.
-
-        ``mode='all'`` reads the rollout's actual sampled schedule from
-        ``segment.sigmas`` (dropping the terminal zero, then applying
-        ``training_timestep_fraction`` as a slice). ``mode='random'``
-        draws ``B`` fresh uniforms in ``(0, training_timestep_fraction]``.
-        Either output is optionally shuffled before the caller iterates.
-        """
+        """Resolve the K scalar timesteps for the outer K-iteration loop."""
         mode = self.config.train_timestep_mode
         frac = float(self.config.training_timestep_fraction)
         if mode == "all":
@@ -394,10 +318,7 @@ class DiffusionNFT(StageAlgorithm):
 
     @staticmethod
     def _compute_dtype(x0: torch.Tensor) -> torch.dtype:
-        """fp32 for the timestep tensor — the forward-diffusion arithmetic
-        loses too much precision in bf16 when ``t`` is close to either
-        endpoint.
-        """
+        """fp32 timestep tensor — forward-diffusion arithmetic loses too much precision in bf16 near the endpoints."""
         del x0
         return torch.float32
 
@@ -406,9 +327,7 @@ def _typed_conditions(
     conditions: Mapping[str, Condition],
     conditions_cls: Optional[Type[Any]],
 ) -> Any:
-    """Wrap the conditions dict into the stage's typed container, or pass
-    through unchanged if no container class is given (e.g. unit tests).
-    """
+    """Wrap the conditions dict into the stage's typed container, or pass through when no class is given."""
     if conditions_cls is None:
         return conditions
     return conditions_cls.from_dict(dict(conditions))

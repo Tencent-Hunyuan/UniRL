@@ -134,10 +134,6 @@ class OCRRewardScorer(LocalRewardBackend):
 
 @dataclass
 class OCRSpec(BaseRewardComponentSpec):
-    """Typed config for the OCR (PaddleOCR) reward component.
-
-    OCR is forced to CPU by paddleocr's runtime and processes one image at a
-    time, so neither ``device`` nor ``batch_size`` appear here.
-    """
+    """Typed config for the OCR (PaddleOCR) reward component."""
 
     lang: str = "en"

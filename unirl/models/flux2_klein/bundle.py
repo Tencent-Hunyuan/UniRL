@@ -1,37 +1,4 @@
-"""Flux2KleinBundle — concrete weights+params holder for FLUX.2-klein-9B.
-
-Implements the empty :class:`Bundle` Protocol. Pure container of the
-modules FLUX.2-klein-9B ships with:
-
-- 1× ``Flux2Transformer2DModel`` (9B params, joint_attention_dim=15360)
-- 1× ``AutoencoderKLFlux2`` (32 latent channels, BN-normalized
-  patchified latents)
-- 1× Qwen3 text encoder (``AutoModelForCausalLM`` →
-  ``Qwen3ForCausalLM``) + ``Qwen2TokenizerFast``
-- 1× ``FlowMatchEulerDiscreteScheduler`` (empirical-mu schedule)
-
-Diverges from :class:`unirl.models.sd3.SD3Bundle` and
-:class:`unirl.models.qwen_image.QwenImageBundle` in two ways:
-
-- **Klein-specific guidance-embedder materialization**. Older
-  ``diffusers`` builds construct ``time_guidance_embed.guidance_embedder``
-  on the transformer even when ``transformer/config.json`` sets
-  ``guidance_embeds: false`` (Klein has no guidance distillation).
-  ``from_pretrained`` then leaves those tensors on the ``meta`` device,
-  which crashes the first forward with ``NotImplementedError`` from
-  the FSDP all-gather. We zero-init any leftover ``meta`` tensors here
-  so the bundle is fully materialized before the FSDP wrap.
-- **Qwen3 text encoder via ``AutoModelForCausalLM``** (vs Qwen-Image's
-  ``Qwen2_5_VLForConditionalGeneration``). Klein uses the language-only
-  Qwen3 LLM as the text encoder; the chat-template + intermediate-layer
-  concatenation lives in :class:`Flux2KleinTextEmbedStage`.
-
-No LoRA injection, FSDP wrap, adapter switching, autocast helpers, or
-weight-sync logic — those are lifecycle concerns owned outside the
-bundle (``cfg.training.policies``).
-
-Use :meth:`Flux2KleinBundle.from_config` to load a checkpoint.
-"""
+"""Flux2KleinBundle — concrete weights+params holder for FLUX.2-klein-9B."""
 
 from __future__ import annotations
 
@@ -53,18 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 def _materialize_meta_tensors(module: nn.Module) -> List[str]:
-    """Replace any remaining ``meta``-device parameters/buffers in
-    ``module`` with zero-initialized real tensors on CPU.
-
-    Used to recover from a ``from_pretrained`` call that left some
-    submodules un-loaded because their weights are absent from the
-    checkpoint (e.g. FLUX.2-klein-9B's
-    ``time_guidance_embed.guidance_embedder`` when running against an
-    older ``diffusers`` build that always constructs the module even
-    though ``transformer/config.json`` sets ``guidance_embeds: false``).
-
-    Returns the qualified names of every tensor that was materialized.
-    """
+    """Replace any remaining ``meta``-device parameters/buffers in"""
     materialized: List[str] = []
 
     def _resolve_parent(root: nn.Module, qualified_name: str) -> Tuple[nn.Module, str]:
@@ -99,17 +55,7 @@ def _materialize_meta_tensors(module: nn.Module) -> List[str]:
 
 
 def _stamp_zero_checkpoint_absent_params(transformer: nn.Module, weights_dir: str) -> None:
-    """Zero-init (post-load, deferred) transformer params the checkpoint omits.
-
-    Klein's ``time_guidance_embed.guidance_embedder`` (built by older diffusers
-    even when ``guidance_embeds=false``) is absent from the checkpoint. On the
-    eager path :func:`_materialize_meta_tensors` zero-inits it. Under meta-init
-    the backend's ``to_empty`` materializes every param to garbage and the
-    ``strict=False`` load fills only those present in the checkpoint, so the
-    absent ones must be zeroed *after* the load — stamped as a deferred op
-    (drained by ``apply_deferred_ops`` once weights are loaded). Names are
-    captured pre-LoRA, but the absent params (guidance embedder) are never LoRA
-    targets, so their names are stable through injection."""
+    """Zero-init (post-load, deferred) transformer params the checkpoint omits."""
     from safetensors import safe_open
 
     from unirl.train.deferred import _stamp
@@ -177,13 +123,7 @@ class Flux2KleinBundle(Bundle):
 
     @classmethod
     def from_config(cls, config: Flux2KleinPipelineConfig) -> "Flux2KleinBundle":
-        """Load all FLUX.2-klein-9B components from a HuggingFace-layout checkpoint.
-
-        Honors per-component path overrides (``vae_ckpt_path`` /
-        ``text_encoder_ckpt_path``) so fine-tuning recipes can swap in
-        alternate VAE / text-encoder checkpoints without re-downloading
-        the 9B transformer.
-        """
+        """Load all FLUX.2-klein-9B components from a HuggingFace-layout checkpoint."""
         from diffusers import AutoencoderKLFlux2, Flux2Transformer2DModel
         from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
         from transformers import AutoModelForCausalLM, AutoTokenizer

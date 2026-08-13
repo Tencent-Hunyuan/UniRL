@@ -1,30 +1,4 @@
-"""``NoiseRecipe`` — the normalized, engine-agnostic x_T recipe.
-
-Every diffusion model gets a driver-authoritative initial latent (x_T) from the
-SAME four-element recipe — ``(noise_group_ids, base_seed, latent_shape,
-initial_latents)`` — regardless of which carrier holds it (the request
-:class:`~unirl.types.sample.Sample`'s gen frontier Part, or a worker-side engine
-request whose recipe rode in via ``extra_args``). The recipe is the lightweight
-payload the driver ships (per-sample id strings + seed; NO noise tensor on the
-wire); each engine reconstructs a ``NoiseRecipe`` from its own carrier and
-calls :meth:`resolve`.
-
-Resolution precedence (one place, all engines):
-  1. ``initial_latents`` present  → use it verbatim. This carries genuine latent
-     DATA (img2img / i2v first-frame), which cannot be regenerated from a seed
-     and so must be shipped as a tensor.
-  2. ``noise_group_ids`` + ``latent_shape`` present → regenerate the
-     byte-identical x_T via :func:`unirl.sde.noise.regen_initial_noise`
-     (CPU-fp32 canonical). Same recipe → same x_T on any engine.
-  3. otherwise → ``None`` (engine draws its own; e.g. ``DISABLE_DRIVER_XT``).
-
-There is no separate "seed-only / shape-unknown" path: a model whose latent
-shape is only known mid-rollout (e.g. HI3's DiT grid depends on the AR stage)
-simply constructs its ``NoiseRecipe`` LATER — at the engine point where the
-shape resolves — filling ``latent_shape`` then. So "shape known at request time"
-vs "shape resolved in-worker" is just *when the recipe is built*, not two
-different resolution code paths.
-"""
+"""``NoiseRecipe`` — the normalized, engine-agnostic x_T recipe."""
 
 from __future__ import annotations
 
@@ -44,18 +18,7 @@ class NoiseRecipe:
     initial_latents: Optional[torch.Tensor] = None
 
     def for_batch(self, batch_size: int, *, latent_shape: Optional[Tuple[int, ...]] = None) -> "NoiseRecipe":
-        """Specialize this (per-sample) recipe to a concrete ``batch_size``-row
-        engine call, returning a NEW recipe.
-
-        - Aligns the per-sample ``noise_group_ids`` to the batch: slice when we
-          have enough, else cycle. (No-op when they already match.)
-        - Optionally fills ``latent_shape`` — for engines whose shape is only
-          known mid-rollout (e.g. HI3's DiT grid, resolved post-AR): build the
-          recipe with ``latent_shape=None`` and pass the resolved shape here.
-
-        Pure transform (``dataclasses.replace``); call ``.resolve()`` on the
-        result to get the tensor.
-        """
+        """Specialize this (per-sample) recipe to a concrete ``batch_size``-row engine call, returning a NEW recipe."""
         gids = self.noise_group_ids
         if gids and len(gids) != batch_size:
             gids = gids[:batch_size] if len(gids) >= batch_size else [gids[i % len(gids)] for i in range(batch_size)]
@@ -73,17 +36,7 @@ class NoiseRecipe:
         salt: str = "",
         latent_shape: Optional[Tuple[int, ...]] = None,
     ) -> Optional[torch.Tensor]:
-        """Produce x_T, or ``None`` to defer to the engine's own RNG.
-
-        Pure resolution — Path 1 (``initial_latents`` tensor) / Path 2
-        (``noise_group_ids`` + ``latent_shape`` → CPU-fp32 regen) / None. Batch
-        alignment + late shape are a separate concern; see :meth:`for_batch`.
-
-        ``salt`` forks an INDEPENDENT but reproducible sibling stream: group ids
-        are salted (different seed → not a prefix-alias of the base stream) and
-        any Path-1 ``initial_latents`` is bypassed. Pass ``latent_shape`` to
-        override the recipe's own (e.g. LTX-2's audio latent alongside video).
-        """
+        """Produce x_T, or ``None`` to defer to the engine's own RNG."""
         if not salt and self.initial_latents is not None:
             return self.initial_latents
         gids = [f"{g}::{salt}" for g in self.noise_group_ids] if salt else self.noise_group_ids
@@ -102,16 +55,7 @@ class NoiseRecipe:
 
     @classmethod
     def from_sample(cls, sample) -> "NoiseRecipe":
-        """Build a recipe from a request ``Sample`` (its gen frontier part).
-
-        Sample-shaped builder. The x_T key is derived
-        from the lineage path (OD-2): the parent (group) id under
-        ``init_same_noise`` so siblings share x_T, else the per-sample id —
-        matching the engines' ``_resolve_initial_noise``. ``initial_latents``
-        (img2img / i2v first-frame) rides on the gen part's ``segment``; the regen
-        shape on ``DiffusionSamplingParams.init_noise_latent_shape``. Duck-typed on
-        the part's attributes so it doesn't import Sample/Part.
-        """
+        """Build a recipe from a request ``Sample`` (its gen frontier part)."""
         gen = sample.parts[-1]
         diffusion = gen.sampling_params
         if bool(getattr(diffusion, "disable_driver_xt", False)):

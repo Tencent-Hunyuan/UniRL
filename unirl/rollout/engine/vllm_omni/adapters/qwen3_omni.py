@@ -37,12 +37,7 @@ def _compress_qwen3_omni_prompt_ids(
     audio_eos_token_id: int,
     use_audio_in_video: bool,
 ) -> List[int]:
-    """Undo HF multimodal expansion before vLLM processes the raw media.
-
-    This mirrors vLLM's
-    ``Qwen3OmniMoeThinkerMultiModalProcessor._get_raw_input_ids``. Replay
-    keeps the original expanded IDs; only the IDs sent to vLLM are compressed.
-    """
+    """Undo HF multimodal expansion before vLLM processes the raw media."""
     result = list(token_ids)
     if use_audio_in_video:
         while True:

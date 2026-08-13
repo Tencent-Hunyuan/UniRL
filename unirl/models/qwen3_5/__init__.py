@@ -1,11 +1,4 @@
-"""Qwen3.5 VL (dense + MoE, hybrid Gated Delta Net attention) AR model package.
-
-AR-only VL pipeline: text (+ images) in, text out. Supports GRPO training via
-``Qwen3_5ARStage.autoregress`` + ``Qwen3_5ARStage.replay``.
-
-Importing this package re-exports its bundle / pipeline / config classes;
-recipes wire them by ``_target_`` dotpath.
-"""
+"""Qwen3.5 VL (dense + MoE, hybrid Gated Delta Net attention) AR model package."""
 
 from unirl.models.qwen3_5.ar import (
     Qwen3_5ARParams,

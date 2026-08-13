@@ -1,15 +1,5 @@
 #!/usr/bin/env python
-"""UniRL v2 HunyuanImage3 training entry point (Hydra-native).
-
-Thin wrapper around :class:`unirl.trainer.unified_model.UnifiedModelTrainer`. The trainer
-owns the placement scope, sibling Remote wiring, and the ``train_step → train``
-loop; this module just maps the loaded Hydra config blocks to constructor
-kwargs.
-
-Pairs with ``examples/unified_model/hi3_vllmomni.yaml``::
-
-    python -m unirl.train_unified_model --config-name unified_model/hi3_vllmomni
-"""
+"""UniRL v2 HunyuanImage3 training entry point (Hydra-native)."""
 
 from __future__ import annotations
 

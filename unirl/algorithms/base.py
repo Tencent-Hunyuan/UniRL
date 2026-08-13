@@ -1,11 +1,4 @@
-"""Stage-driven algorithm base class.
-
-The training-side contract for ``models`` pipelines: an algorithm
-holds a stage (``DiffusionStage[C]`` or ``ARStage[C]``) and computes loss
-over ``(conditions, segment, advantages)``. All model dispatch, CFG batching,
-SDE math, autocast, and per-step iteration are owned by ``stage.replay(...)``;
-the algorithm is pure ratio-clip math against the segment's stored log-probs.
-"""
+"""Stage-driven algorithm base class."""
 
 from __future__ import annotations
 
@@ -28,12 +21,7 @@ def typed_conditions(
     conditions: Mapping[str, "Condition"],
     conditions_cls: Optional[Type[Any]],
 ) -> Any:
-    """Reconstruct the stage's typed conditions container from the dict shape.
-
-    When ``conditions_cls`` is ``None`` (e.g. unit tests against a fake stage
-    that accepts the dict directly), the dict is forwarded verbatim. Otherwise
-    ``conditions_cls.from_dict(...)`` is invoked.
-    """
+    """Reconstruct the stage's typed conditions container from the dict shape."""
     if conditions_cls is None:
         return conditions
     return conditions_cls.from_dict(dict(conditions))
@@ -46,14 +34,7 @@ def gather_sde_field(
     *,
     field_name: str = "field",
 ) -> torch.Tensor:
-    """Gather slices from a segment's SDE-aligned tensor by step index.
-
-    Maps ``target_steps`` to positions in ``sde_indices`` via
-    ``torch.searchsorted`` (O(S' log S)) and returns
-    ``tensor[:, positions, ...]``.
-
-    Used by GRPO (for ``sde_logp``) and FlowDPPO (for ``sde_logp`` + ``sde_means``).
-    """
+    """Gather slices from a segment's SDE-aligned tensor by step index."""
     if tensor is None or sde_indices is None:
         raise ValueError(
             f"gather_sde_field: {field_name} or sde_indices is None "
@@ -74,20 +55,7 @@ def gather_sde_field(
 
 
 def rollout_replay_logp_absdiff(new_logp: torch.Tensor, old_logp: torch.Tensor) -> Dict[str, float]:
-    """Per-token |Δlogp| between rollout and replay — AR train-rollout drift gauge.
-
-    ``old_logp`` is the rollout-time log-prob (SGLang / trainside autoregress)
-    and ``new_logp`` is the teacher-forced replay at the current weights. On a
-    single on-policy update the two differ only by the rollout-vs-replay *engine*
-    gap (a temperature/logprob misconfig, a broken SGLang weight sync, or bf16
-    KV-cache-vs-full-forward drift). ``mean|Δlogp|`` reports that gap directly and
-    symmetrically — more legible than the exp-biased ``ratio_mean``. AR-only: the
-    diffusion algorithms self-record or recompute ``old_logp`` with the same
-    model, so their gap is ~0 by construction and they do not emit this metric.
-
-    Assumes non-empty inputs, mirroring ``_grpo_clip_loss`` — the AR callers
-    early-return on a zero-token segment before this runs.
-    """
+    """Per-token |Δlogp| between rollout and replay — AR train-rollout drift gauge."""
     with torch.no_grad():
         absdiff = (new_logp - old_logp).abs()
     return {
@@ -97,26 +65,7 @@ def rollout_replay_logp_absdiff(new_logp: torch.Tensor, old_logp: torch.Tensor) 
 
 
 def rollout_replay_k3(new_logp: torch.Tensor, old_logp: torch.Tensor) -> Dict[str, float]:
-    """Per-token K3 KL estimator between rollout and replay log-probs.
-
-    K3 is Schulman's low-variance, always-non-negative KL estimator
-    (http://joschu.net/blog/kl-approx.html)::
-
-        log_r = log_p - log_q
-        k3    = exp(log_r) - log_r - 1   (== (r - 1) - log(r),  r = p/q)
-
-    Here ``p`` is the teacher-forced replay distribution (``new_logp``, trainside)
-    and ``q`` is the rollout distribution (``old_logp``, autoregress / SGLang), so
-    ``log_r = new_logp - old_logp`` — the same signed log-ratio ``_grpo_clip_loss``
-    forms. Unlike the symmetric ``|Δlogp|`` and the exp-biased ``ratio_mean``, k3
-    is the calibrated per-token KL(q‖p) surrogate; on an on-policy first update it
-    is ~0 and it grows the moment rollout and replay disagree (a temperature
-    misconfig, a broken weight sync, or a multimodal position-encoding mismatch).
-    Mean / max / p90 / p99 let online and offline k3 distributions compare directly.
-
-    Assumes non-empty inputs, mirroring :func:`rollout_replay_logp_absdiff` — AR
-    callers early-return on a zero-token segment before this runs.
-    """
+    """Per-token K3 KL estimator between rollout and replay log-probs."""
     with torch.no_grad():
         log_r = (new_logp.float() - old_logp.float()).clamp(min=-20.0, max=20.0)
         k3 = torch.expm1(log_r) - log_r
@@ -148,16 +97,7 @@ def _grpo_clip_loss(
     clip_range: float,
     clip_range_high: Optional[float] = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    """PPO-style clipped objective. Element-wise; reduction is the caller's job.
-
-    ``clip_range`` is the lower clip ε⁻ (ratio floor ``1-clip_range``).
-    ``clip_range_high`` (DAPO "clip-higher") is the upper ε⁺ (ratio ceil
-    ``1+clip_range_high``); ``None`` ⇒ symmetric (= ``clip_range``), the prior
-    behaviour, so ``FlowGRPO`` is unaffected.
-
-    Returns ``(loss_per_element, ratio_metrics_dict)``. The metrics tensors are
-    detached scalars suitable for logging.
-    """
+    """PPO-style clipped objective. Element-wise; reduction is the caller's job."""
     high = clip_range if clip_range_high is None else clip_range_high
     log_diff = new_logp - old_logp
     ratio = torch.exp(log_diff)
@@ -186,13 +126,7 @@ def _grpo_clip_loss(
 
 
 def _gaussian_kl_div(p: torch.Tensor, q: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
-    """Per-element Gaussian KL between means at shared variance: ``(p-q)^2 / (2 sigma^2)``.
-
-    For ``N(p, sigma^2)`` and ``N(q, sigma^2)``,
-    ``KL(N(p,...) || N(q,...)) = (p - q)^2 / (2 sigma^2)``. Caller reduces over the
-    spatial dims. Shared by FlowDPPO's KL-ADV mask and the FlowGRPO / FlowDPPO
-    reference-policy ``beta`` penalty.
-    """
+    """Per-element Gaussian KL between means at shared variance: ``(p-q)^2 / (2 sigma^2)``."""
     return (p - q) ** 2 / (2 * sigma**2)
 
 
@@ -205,12 +139,7 @@ def _transition_sigma(
     device: torch.device,
     add_coefficient: bool = True,
 ) -> torch.Tensor:
-    """Per-step SDE transition std ``sigma_t`` for KL normalization, shape ``[1, S', 1, 1, 1]``.
-
-    Delegates to ``stage.strategy.transition_std`` so the normalizer matches each
-    strategy (Flow/Dance: ``std_dev_t*sqrt(-dt)``; CPS: ``std_dev_t``).
-    ``add_coefficient=False`` returns ones (unnormalized squared mean-shift).
-    """
+    """Per-step SDE transition std ``sigma_t`` for KL normalization, shape ``[1, S', 1, 1, 1]``."""
     if not add_coefficient:
         return torch.ones(1, len(target_steps), 1, 1, 1, device=device)
     if segment.sigmas is None:
@@ -233,13 +162,7 @@ def _reference_replay_means(
     params: Any,
     target_steps: List[int],
 ) -> torch.Tensor:
-    """Replay the reference policy (LoRA adapter disabled) → detached ``prev_sample_means``.
-
-    π_ref is the frozen base model; disabling the adapter on the shared trainable model
-    yields it (Flow-GRPO eq.5 / Flow-DPPO eq.17, matching the reference flow_grpo code).
-    Runs under ``torch.no_grad`` and returns means aligned step-for-step with the policy
-    replay over ``target_steps``.
-    """
+    """Replay the reference policy (LoRA adapter disabled) → detached ``prev_sample_means``."""
     from unirl.train.lora import adapters_disabled
 
     with torch.no_grad(), adapters_disabled(ref_model):
@@ -257,26 +180,14 @@ def _reference_kl_loss(
     ref_means: torch.Tensor,
     sigma_t: torch.Tensor,
 ) -> torch.Tensor:
-    """Mean Gaussian KL(pi_theta || pi_ref) over per-step means, for the ``beta`` penalty.
-
-    ``kl = (new_means - ref_means)^2 / (2 sigma_t^2)`` reduced over spatial dims to
-    ``[B, S']`` then meaned to a scalar. Gradient flows through ``new_means`` only
-    (``ref_means`` is detached upstream).
-    """
+    """Mean Gaussian KL(pi_theta || pi_ref) over ``[B, S']`` per-step means; grad flows through ``new_means`` only."""
     kl_per_elem = _gaussian_kl_div(new_means, ref_means, sigma_t)
     kl_per_sample = kl_per_elem.mean(dim=tuple(range(2, kl_per_elem.ndim)))
     return kl_per_sample.mean()
 
 
 def _resolve_reference_model(backend: Any, *, beta: float, algo: str) -> Any:
-    """Resolve the trainable model for the adapter-disabled reference replay, or None.
-
-    ``beta`` must be ``>= 0`` (a negative value raises). When ``beta > 0`` the ``beta``
-    KL term needs the base model to define π_ref, so a ``backend`` sibling (injected by
-    the v2 trainer when the algorithm declares ``requires_backend=True``) carrying a
-    LoRA adapter is required; this raises with an actionable message otherwise. When
-    ``beta == 0`` the term is off and this returns ``None`` (no reference replay runs).
-    """
+    """Resolve the trainable model for the adapter-disabled reference replay, or None."""
     if float(beta) < 0.0:
         raise ValueError(f"{algo}: beta must be >= 0; got {beta!r}.")
     if float(beta) == 0.0:
@@ -298,12 +209,7 @@ def _resolve_reference_model(backend: Any, *, beta: float, algo: str) -> Any:
 
 
 def _require_replay_anchor_for_batched_replay(stage: Any, old_logp_source: str, *, algo: str) -> None:
-    """Reject ``batch_replay_steps`` paired with a rollout-sourced π_old anchor.
-
-    Call from every diffusion algorithm that drives ``stage.replay`` against an
-    anchor — today ``FlowGRPO`` (with its ``BagelFlowUniGRPO`` subclass) and
-    ``FlowDPPO``. Rationale: :mod:`unirl.models.types.batched_replay`.
-    """
+    """Reject ``batch_replay_steps`` paired with a rollout-sourced π_old anchor."""
     if not getattr(stage, "batch_replay_steps", False):
         return
     if old_logp_source != "replay":
@@ -318,11 +224,7 @@ def _require_replay_anchor_for_batched_replay(stage: Any, old_logp_source: str, 
 
 @dataclass(frozen=True)
 class AlgorithmStepResult:
-    """Result of one micro-step under the stage-driven contract.
-
-    ``num_steps_or_tokens`` is the diffusion step count for diffusion
-    algorithms or the trained-token count for AR algorithms.
-    """
+    """Result of one micro-step under the stage-driven contract."""
 
     loss: float
     metrics: Mapping[str, Any]
@@ -331,52 +233,11 @@ class AlgorithmStepResult:
 
 
 class BaseAlgorithmConfig(ABC):
-    """Marker base for all algorithm config dataclasses.
-
-    Used as the type annotation / base class for the per-stage algorithm
-    config dataclasses.
-    """
+    """Marker base for all algorithm config dataclasses."""
 
 
 class StageAlgorithm(Remote, ABC):
-    """Pure (conditions, segment, advantages) → loss; holds its stage.
-
-    Targets the four-tier pipeline contract (``models``). The algorithm
-    holds a reference to a
-    :class:`unirl.models.types.diffusion.DiffusionStage` or
-    :class:`unirl.models.types.ar.ARStage` and dispatches all
-    model forward / SDE / CFG work into ``stage.replay(...)``. It does not
-    know its slot key in the dispatcher; slot routing lives on the train stack.
-
-    Class attributes:
-        requires_ema_rollout: Whether the algorithm requires EMA weights
-            during rollout sampling. On-policy algorithms (GRPO) MUST
-            sample with the same weights used in training replay so the
-            importance ratio equals 1 on the first step (default False).
-            Off-policy / forward-process algorithms (DiffusionNFT) override to
-            True so the rollout uses EMA-smoothed weights for higher-
-            quality trajectories.
-        supports_multi_update: Whether the algorithm is correct under
-            ``num_updates_per_batch > 1`` (the train stack splitting one
-            rollout into N optimizer steps over disjoint mini-batches).
-            True only when the PPO ``old_logp`` anchor stays frozen across all
-            N steps: ``FlowGRPO`` / ``FlowDPPO`` capture
-            ``segment.sde_logp`` once in :meth:`prepare_segment`; ``GRPO`` /
-            ``DRPO`` keep the rollout log-prob as the anchor for all N steps
-            (verl ``bypass_mode`` parity — the ratio then also carries the
-            rollout-vs-train engine gap), and ``DRPO`` under
-            ``old_logp_source='replay'`` instead freezes a train-side anchor in
-            :meth:`prepare_segment`. Anchor-free algorithms may also opt in when
-            disjoint updates are semantically ordinary SGD; SFT does so, although
-            its current trainer deliberately exposes one update per outer step.
-            Default False — e.g. DiffusionNFT's multi-update path is unvalidated.
-            ``TrainStack`` raises when a False algorithm is paired with
-            ``num_updates_per_batch > 1``.
-        requires_advantages: Whether ``TrainStack`` must receive a populated
-            ``Part.advantages`` field. Supervised algorithms set this to False.
-        loss_weighting: ``"sample"`` for equal per-sample weighting or ``"token"``
-            for exact global valid-token weighting across micros and data ranks.
-    """
+    """Pure (conditions, segment, advantages) → loss; holds its stage."""
 
     requires_ema_rollout: bool = False
     supports_multi_update: bool = False
@@ -386,20 +247,7 @@ class StageAlgorithm(Remote, ABC):
     anchor_fields: Tuple[str, ...] = ()
 
     def recomputes_anchor(self) -> bool:
-        """Whether the anchor must be recomputed at the EXACT ``(mini, micro)``
-        batch geometry training uses — not merely whether a replay happens.
-
-        True ⇒ :meth:`prepare_segment` replays the anchor AND bf16 batch-shape
-        sensitivity matters, so the train stack drives it per micro-slice over
-        those exact slices; the old/new forwards then match bit-for-bit
-        (on-policy ratio = 1; FlowDPPO on-policy KL = 0). FlowDPPO is always True
-        (``sde_means`` exist only via replay); ``FlowGRPO`` is True only
-        under ``old_logp_source='replay'``. False (default) ⇒ one full-segment
-        call suffices: the anchor is either the engine's own emission (no
-        replay), or a replay where coarse geometry is acceptable (ratio ≈ 1) —
-        e.g. ``DRPO`` replay mode, whose production path is rollout-anchored,
-        so the bf16 geometry term sits below the rollout-vs-train engine gap.
-        """
+        """Whether the anchor must be recomputed at the exact ``(mini, micro)`` geometry training uses."""
         return False
 
     def prepare_segment(
@@ -408,38 +256,11 @@ class StageAlgorithm(Remote, ABC):
         conditions: Mapping[str, "Condition"],
         segment: "Segment",
     ) -> None:
-        """Optional pre-step hook called once before the multi-update loop.
-
-        Default no-op. Algorithms with no π_old anchor to freeze (e.g. DiffusionNFT, SFT)
-        can ignore the hook entirely.
-
-        Algorithms that establish a frozen anchor override this. The canonical
-        use case is :class:`FlowGRPO` / :class:`FlowDPPO`, which here
-        set ``segment.sde_logp`` according to ``old_logp_source``: ``"rollout"``
-        keeps the rollout engine's best-effort emission (raising if it emitted
-        nothing); ``"replay"`` recomputes via a ``torch.no_grad``
-        ``stage.replay`` and overwrites it. Because this hook fires ONCE per
-        the filled ``Sample`` — before the trainer's ``num_updates_per_batch`` train
-        loop — the anchor is frozen at pre-update weights across all N updates,
-        matching the on-policy ratio semantics of PPO-style algorithms.
-
-        Args:
-            conditions: ``Part.conditions`` — stage-typed conditions
-                are reconstructed inside the algorithm if needed.
-            segment: ``Part.segment`` for this algorithm's
-                slot. Implementations may mutate field defaults that were
-                left ``None`` by the rollout (lazy initialization); they
-                must NOT mutate fields that the rollout already populated.
-        """
+        """Optional pre-step hook called once before the multi-update loop."""
         return None
 
     def prepare_part(self, part: "Part") -> "Part":
-        """Optional post-anchor hook over the complete arranged worker shard.
-
-        Runs after per-micro anchor fields have been reassembled and before any
-        optimizer update. PPO uses it to derive GAE from frozen critic values;
-        other algorithms keep the part unchanged.
-        """
+        """Optional post-anchor hook over the complete arranged worker shard."""
         return part
 
     @abstractmethod
@@ -452,22 +273,7 @@ class StageAlgorithm(Remote, ABC):
         training_progress: float,
         loss_scale: float,
     ) -> AlgorithmStepResult:
-        """Compute loss for one micro-batch and call ``.backward()``.
-
-        Args:
-            conditions: ``Part.conditions`` — stage-typed conditions
-                are reconstructed inside the algorithm if needed.
-            segment: ``Part.segment`` — diffusion algorithms
-                read ``segment.sde_logp`` / ``segment.sde_indices`` /
-                ``segment.sigmas``; AR algorithms read ``segment.log_probs`` /
-                ``segment.cu_seqlens``.
-            advantages: per-sample advantage signal ``[B]``, or ``None`` for an
-                algorithm declaring ``requires_advantages=False``.
-            training_progress: training progress in ``[0, 1]`` for
-                clip-range or other schedules.
-            loss_scale: gradient accumulation factor (typically
-                ``1 / num_micro_batches``).
-        """
+        """Loss for one micro-batch, then ``.backward()``; ``advantages [B]``, ``training_progress`` in ``[0, 1]``."""
         ...
 
 

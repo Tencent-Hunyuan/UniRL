@@ -43,8 +43,15 @@ repos:
 
   - repo: local
     hooks:
-      # Static guard that every recipe `_target_` still resolves to a real symbol,
-      # so a rename can't leave a dead Hydra path to fail only at launch time.
+      # Static guard that every recipe `_target_` still resolves to a real symbol.
+      # A rename (`unirl.algorithms.ar_grpo.ARGRPO` -> `...grpo.GRPO`) breaks Hydra
+      # `instantiate` only at *runtime*, and this repo's CI is lint-only, so a stale
+      # dotted path would otherwise merge silently. Resolves module file + attribute
+      # purely via `ast`, importing nothing (no torch/vllm/sglang needed).
+      # Only ~0.2s is parsing; the rest is filesystem latency, which dominates on a
+      # network checkout. So the tree is walked once to index every module (rather
+      # than ~10k per-target stat probes) and files are read through a thread pool —
+      # on CephFS that takes the hook from ~5m30s to ~26s.
       # A dead path can only appear via a recipe edit or a Python rename/removal, so
       # those extensions gate the (always full-tree) scan; `--all-files` CI is unaffected.
       - id: check-recipe-targets
@@ -53,11 +60,41 @@ repos:
         language: python
         pass_filenames: false
         files: \.(ya?ml|py)$
-      # Experimental-tier boundaries: core never imports experimental,
-      # packages never import each other, requirements stay additive-only.
+      # Experimental-tier boundaries, three rules, all pure `ast` + text:
+      #   1. Core never imports experimental — `unirl/` must not reference the
+      #      `experimental` namespace; the dependency arrow points one way.
+      #   2. Experimental packages never import each other. `experimental/<a>` may
+      #      import `unirl` and its own package only, in any spelling: absolute,
+      #      `from experimental import <b>`, bare `import experimental`, or a
+      #      relative import climbing past the package root. Top-level
+      #      `experimental/*.py` is not a shared space and may not import the tier.
+      #   3. Recipe requirements stay additive-only. Reward and actor share one
+      #      Python process, so an `experimental/**/requirements*.txt` cannot
+      #      version-"isolate" anything: any requirement whose normalized name the
+      #      locked core stack already governs (`[project.dependencies]`, any
+      #      optional-dependency extra, or a `[tool.uv]` override pin) would mutate
+      #      that stack on install and is rejected — as are pip option/include lines
+      #      and URL requirements the name parser cannot vet.
       - id: check-experimental-boundaries
         name: experimental-tier boundaries hold
         entry: python lint/check_experimental_boundaries.py
         language: python
         pass_filenames: false
         always_run: true
+      # Every docstring is one physical line, within the ruff line-length. Detail that
+      # doesn't fit — what stock upstream does wrong and what breaks on a version bump,
+      # numerical/bit-identity constraints, implementer contracts — belongs in the
+      # nearest README.md, where it is diffed and maintained, not in a module header
+      # that silently rots. There is deliberately no allowlist. Prose can only enter
+      # via a .py edit, so that extension gates the (always full-tree) scan;
+      # `--all-files` CI is unaffected.
+      # Runtime-only facts are the exception and are expected to stay in the code:
+      # a tensor shape, dtype, value range or unit goes in the one line itself as
+      # ``[B, C, H, W]``, or as a trailing `# [B, C, H, W]`. This hook only reads
+      # docstrings via the AST, so trailing annotations are outside its scope.
+      - id: check-docstring-lines
+        name: docstrings are one line
+        entry: python lint/check_docstring_lines.py
+        language: python
+        pass_filenames: false
+        files: \.py$

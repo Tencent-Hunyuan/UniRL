@@ -1,19 +1,4 @@
-"""Bucketed weight transfer via ZMQ + IPC (or shared memory fallback).
-
-Lifted from upstream ``verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py``
-with two adjustments to drop verl-internal dependencies:
-
-- Replace ``verl.utils.device.{get_device_id,get_device_name,get_torch_device}``
-  with plain ``torch.cuda`` calls. The original abstraction layer existed to
-  support NPU/CPU backends; we run CUDA-only here.
-- Inline ``ensure_async_iterator`` (was ``verl.workers.rollout.utils``).
-
-Same algorithm verified by verl-omni in production: one pre-allocated
-fixed-size buffer (default 2 GB) shared via CUDA IPC, tensors copied
-into the buffer in sender-side chunks, per-bucket metadata sent over a
-ZMQ REQ/REP socket. Receiver reconstructs tensor views into the shared
-buffer and hands each bucket to a callback.
-"""
+"""Bucketed weight transfer via ZMQ + IPC (or shared memory fallback)."""
 
 from __future__ import annotations
 
@@ -43,12 +28,7 @@ class TensorMetadata(TypedDict):
 
 # From https://github.com/vllm-project/vllm/blob/main/examples/offline_inference/rlhf_utils.py
 def rebuild_ipc(handle: tuple[Callable, tuple], device_id: int | None = None) -> torch.Tensor:
-    """Rebuild a CUDA tensor from an IPC handle, optionally rewriting the device id.
-
-    The trainer and worker may have different ``CUDA_VISIBLE_DEVICES``, so
-    the same logical tensor lives at a different ``cuda:i`` on each side.
-    Pass the receiver-side ``device_id`` to swap the encoded id out.
-    """
+    """Rebuild a CUDA tensor from an IPC handle, optionally rewriting the device id."""
     func, args = handle
     list_args = list(args)
     if device_id is not None:
@@ -92,16 +72,7 @@ def _zmq_call(operation: str, func: Callable, *args):
 
 
 class BucketedWeightSender:
-    """Send model weights via bucketed IPC transfer over ZMQ.
-
-    Packs weight tensors into a fixed-size communication buffer and sends them
-    in buckets to the receiver. Supports CUDA IPC and shared memory fallback.
-
-    Args:
-        zmq_handle: ZMQ IPC socket path (e.g., "ipc:///tmp/diffrl-zmq-...sock")
-        bucket_size_mb: Communication buffer size in MB
-        use_shm: Use shared memory instead of CUDA IPC (for NPU compatibility)
-    """
+    """Send model weights via bucketed IPC transfer over ZMQ."""
 
     def __init__(
         self,
@@ -120,11 +91,7 @@ class BucketedWeightSender:
         self.shm = None
 
     async def async_send_weights(self, weights) -> None:
-        """Send weights to the receiver. Accepts a sync generator or async iterator.
-
-        Args:
-            weights: Generator or async iterator yielding (name, tensor) pairs
-        """
+        """Send weights to the receiver. Accepts a sync generator or async iterator."""
         try:
             self._init_socket()
             self._init_buffer()
@@ -226,16 +193,7 @@ class BucketedWeightSender:
 
 
 class BucketedWeightReceiver:
-    """Receive model weights via bucketed IPC transfer over ZMQ.
-
-    Receives weight tensors from BucketedWeightSender and passes each
-    bucket to a callback for processing (e.g., loading into the model).
-
-    Args:
-        zmq_handle: ZMQ IPC socket path (must match sender)
-        device: Target device for received tensors
-        use_shm: Use shared memory instead of CUDA IPC
-    """
+    """Receive model weights via bucketed IPC transfer over ZMQ."""
 
     def __init__(
         self,
@@ -254,13 +212,7 @@ class BucketedWeightReceiver:
         self._completed = False
 
     def receive_weights(self, on_bucket_received: Callable[[list], None]) -> None:
-        """Receive weights from sender and process each bucket via callback.
-
-        Args:
-            on_bucket_received: Callback called per bucket with a list of
-                ``(name, tensor)`` tuples. Tensors are views into the shared
-                buffer; consume immediately (next bucket overwrites).
-        """
+        """Receive weights from sender and process each bucket via callback."""
         try:
             self._init_socket()
             self._init_buffer()

@@ -1,11 +1,4 @@
-"""
-Cross-module data types for unirl.
-
-This package provides shared dataclasses and validation helpers used by:
-- rollout control-plane
-- ray actors
-- samplers and losses
-"""
+"""Cross-module data types for unirl."""
 
 from __future__ import annotations
 

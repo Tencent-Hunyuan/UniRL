@@ -20,19 +20,7 @@ def build_omni_messages(
     turns: List[Turn],
     system_instruction: Optional[str] = None,
 ) -> List[Conversation]:
-    """Render the trajectory as Qwen3-Omni chat conversations, one per frontier row.
-
-    Qwen3-Omni's prompt-media contract: media rides as URI-backed ``MediaRefs`` and
-    each ref becomes a ``{"type": modality, modality: uri}`` content part (the
-    serving side decodes the file), with at most one prompt input per modality per
-    row. Decoded frame/waveform primitives are rejected so tensors cannot bypass the
-    URI contract.
-
-    Both parity sides call this: the HF trainside chat stage and the vLLM-Omni
-    rollout adapter, so replay and rollout compose the same messages. The transpose
-    rules it builds on (:func:`system_prefix`, :func:`group_consecutive_roles`) are
-    shared with the text/vision renders.
-    """
+    """Render the trajectory as Qwen3-Omni chat conversations, one per frontier row."""
     if not turns:
         return []
     unsupported = [type(turn.content).__name__ for turn in turns if not isinstance(turn.content, (Texts, MediaRefs))]
@@ -117,12 +105,7 @@ def extract_audio_from_video_pyav(path: str, target_sr: int = 16000) -> Optional
 
 
 def load_qwen3_audio(path: str, target_sr: int) -> Optional[Tuple[np.ndarray, int]]:
-    """Return UniRL's canonical waveform plus its explicit sampling rate.
-
-    The waveform is decoded once through the already-aligned PyAV path. HF
-    consumes the array while vLLM consumes ``(array, sample_rate)``; vLLM then
-    skips resampling because the declared rate equals its processor target.
-    """
+    """Return UniRL's canonical waveform plus its explicit sampling rate."""
     waveform = load_audio_pyav(path, target_sr)
     if waveform is None:
         return None
@@ -155,13 +138,7 @@ def omni_processor_media_kwargs(
     video_fps: float,
     video_max_pixels: Optional[int],
 ) -> Dict[str, Any]:
-    """Build modality-scoped processor kwargs shared by HF and vLLM.
-
-    Image and video resize limits must use separate nested kwargs: a flat
-    ``size`` value is accepted by the HF processor but is ambiguous when one
-    request contains both modalities. The returned mapping can be passed
-    directly to HF's processor or forwarded as vLLM ``mm_processor_kwargs``.
-    """
+    """Build modality-scoped processor kwargs shared by HF and vLLM."""
     kwargs: Dict[str, Any] = {}
     if has_image and image_max_pixels is not None:
         kwargs["images_kwargs"] = {

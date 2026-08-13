@@ -1,6 +1,4 @@
-"""
-unirl Utilities - Miscellaneous utility functions.
-"""
+"""unirl Utilities - Miscellaneous utility functions."""
 
 import gc
 import importlib
@@ -16,18 +14,7 @@ logger = logging.getLogger(__name__)
 
 
 def load_function(path: str) -> Any:
-    """
-    Dynamically load a class or function from a module path.
-
-    Args:
-        path: Full path to the class/function, e.g., "unirl.algorithms.flowgrpo.FlowGRPO"
-
-    Returns:
-        The loaded class or function
-
-    Example:
-        >>> algo_cls = load_function("unirl.algorithms.flowgrpo.FlowGRPO")
-    """
+    """Dynamically load a class or function from a module path."""
     if path is None or path == "":
         raise ValueError("Path cannot be None or empty")
 
@@ -51,22 +38,7 @@ def load_function(path: str) -> Any:
 
 
 def set_seed(seed: Optional[int]) -> None:
-    """
-    Set random seed for reproducibility.
-
-    Args:
-        seed: Random seed value. ``None`` means "draw a fresh seed from OS
-            entropy" — this run is internally deterministic (random.seed /
-            np.random.seed / torch.manual_seed all share the same drawn int)
-            but not reproducible across re-runs.
-
-    Note:
-        ``CUBLAS_WORKSPACE_CONFIG`` is set via ``setdefault`` as a
-        belt-and-suspenders measure, but the real guarantee must come
-        from setting it in the process environment BEFORE Python imports
-        torch (e.g., via Ray ``runtime_env={"env_vars": ...}``). Once
-        cuBLAS has initialized, changing this env var has no effect.
-    """
+    """Set random seed for reproducibility."""
     if seed is None:
         seed = int.from_bytes(os.urandom(8), "big") & 0x7FFFFFFF
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
@@ -86,14 +58,7 @@ def configure_logger(
     format_str: str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     log_file: Optional[str] = None,
 ) -> None:
-    """
-    Configure logging for the training run.
-
-    Args:
-        level: Logging level
-        format_str: Log format string
-        log_file: Optional file path to write logs
-    """
+    """Configure logging for the training run."""
     handlers = [logging.StreamHandler()]
 
     if log_file:
@@ -119,17 +84,7 @@ def clear_memory() -> None:
 
 
 def flatten_dict(d: dict, parent_key: str = "", sep: str = "/") -> dict:
-    """
-    Flatten a nested dictionary.
-
-    Args:
-        d: Dictionary to flatten
-        parent_key: Parent key prefix
-        sep: Separator between keys
-
-    Returns:
-        Flattened dictionary
-    """
+    """Flatten a nested dictionary."""
     items = []
     for k, v in d.items():
         new_key = f"{parent_key}{sep}{k}" if parent_key else k

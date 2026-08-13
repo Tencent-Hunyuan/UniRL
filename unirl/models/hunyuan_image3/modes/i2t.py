@@ -1,18 +1,4 @@
-"""i2t — image-to-text autoregressive generation.
-
-Reads ``primitives["text"]: Texts`` (the prompt) and
-``primitives["image"]: Images`` (the image to caption / answer about),
-plus ``stage_params["ar"]: dict`` (optional). Builds chat-templated
-``input_ids`` with embedded ``<img>`` markers via the chat-template
-wrapper, then runs ``HunyuanImage3ARStage.autoregress`` against the
-backbone in ``mode="gen_text"`` -- the unified MM forward scatters
-ViT patch embeddings into the prompt's ``<img>`` slots via
-``instantiate_vit_image_tokens``.
-
-Conditions on the response carry the chat-templated ``input_ids`` plus
-the ``cond_vit_*`` / ``vit_kwargs`` tensors that drove the ViT-tokens
-scatter.
-"""
+"""i2t — image-to-text autoregressive generation."""
 
 from __future__ import annotations
 

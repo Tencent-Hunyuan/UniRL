@@ -1,50 +1,4 @@
-"""RL-aware HunyuanImage3 pipeline subclass.
-
-``forward`` follows the RL interception protocol (see
-``pipelines/_shared/interception.py``): **install** (once) → **arm** (every
-request) → run (upstream) → **harvest**. The interceptions, mapped to
-upstream's stages
-(``vllm_omni/diffusion/models/hunyuan_image3/pipeline_hunyuan_image3.py:300``):
-
-- SDE scheduler swap (behavior policy + dense-trajectory recorder), built
-  with explicit HI3 kwargs and routed through the inner pipeline's
-  ``set_scheduler`` hook (``hunyuan_image3_transformer.py:2547-2548``, which
-  calls ``register_modules`` so the diffusers component graph stays
-  consistent). Installed regardless of eta — ``resp_to_samples`` requires
-  ``segment.latents`` and only this scheduler captures the trajectory.
-- A conditioning **tap** on the transformer's
-  ``prepare_inputs_for_generation``: captures the fused multimodal tensors
-  (``input_ids`` / ``attention_mask`` / ``position_ids`` /
-  ``gen_image_mask`` / ``gen_timestep_scatter_index``) on the **first**
-  per-request call — subsequent steps under KV-cache reuse pass the
-  gathered-down ``L'`` slice which is not what training-side replay needs.
-  ``custom_pos_emb`` is deliberately NOT captured: the engine builds its rope
-  with vllm-omni's own ``build_2d_rope`` n_elem convention ([.., 64] tables),
-  which is not layout-compatible with the HF-side replay forward's
-  ``apply_rotary_pos_emb`` ([.., 128]); replay rebuilds rope natively from
-  ``gen_image_mask`` instead. Read back driver-side as ``conditions["fused"]``
-  for ``HunyuanImage3DiffusionConditions.from_dict``.
-- An initial-noise **injection** wrapping the inner pipeline's
-  ``prepare_latents``: HI3's DiT latent shape is AR-dynamic (only known once
-  upstream resolves ``image_size`` post-AR), so the driver ships a RECIPE
-  (seed + per-sample gids), not a tensor; the injector fills the resolved
-  shape and regenerates byte-identical x_T via ``NoiseRecipe``.
-
-``trajectory_timesteps`` carries the **true [0, 1] sigma schedule** (what
-replay indexes as ``segment.sigmas``); the 1000-scale per-step timesteps are
-dropped (regenerable). Exports ride ``trajectory_*`` + ``custom_output``
-only — plain runtime attrs on ``DiffusionOutput`` are filtered during the
-worker→parent IPC.
-
-Everything else — system-prompt resolution, AR-bridged
-``ar_generated_text``, it2i conditioning via ``batch_cond_image_info``,
-generator/seed/CFG, the denoise loop itself — is handled by upstream's
-``forward`` at ``pipeline_hunyuan_image3.py:1262-1347``.
-
-This class is loaded inside vLLM-Omni's worker subprocess via
-``custom_pipeline_args.pipeline_class`` injected from our static stage
-configs (``stage_configs/hunyuan_image3_t2i_rl.yaml`` and ``..._it2i_rl.yaml``).
-"""
+"""RL-aware HunyuanImage3 pipeline — ``trajectory_timesteps`` carries the true ``[0, 1]`` sigma schedule."""
 
 from __future__ import annotations
 
@@ -79,15 +33,7 @@ class RLHunyuanImage3Pipeline(HunyuanImage3Pipeline):
         self._initial_noise_injector_installed: bool = False
 
     def _install_sde_scheduler(self) -> None:
-        """Swap in the trajectory-capturing SDE scheduler.
-
-        First call materializes ``self._pipeline`` via upstream's
-        ``pipeline`` property (``pipeline_hunyuan_image3.py:429-443``), which
-        sets ``self.scheduler`` to the upstream Euler scheduler — stash it,
-        then swap through the inner pipeline's ``set_scheduler`` hook.
-        Explicit HI3 kwargs (no ``from_config`` — the inner pipeline owns the
-        flow_shift); per-request eta rides ``_arm_sde``.
-        """
+        """Swap in the trajectory-capturing SDE scheduler."""
         _ = self.pipeline
 
         if self._upstream_scheduler is None:
@@ -111,23 +57,7 @@ class RLHunyuanImage3Pipeline(HunyuanImage3Pipeline):
             self._pipeline.set_scheduler(sde)
 
     def _install_conditioning_tap(self) -> None:
-        """Wrap ``transformer.prepare_inputs_for_generation`` to capture the
-        fused multimodal conditioning.
-
-        First-call-only per request: the tap writes ``_captured_conditioning``
-        only while it's ``None`` (re-armed each ``forward``) — the first call
-        carries the full sequence length ``L``; the gathered-down ``L'``
-        calls that follow under KV-cache reuse are ignored.
-
-        The inner ``HunyuanImage3Text2ImagePipeline`` holds the MoE backbone
-        on ``.model`` (upstream ``hunyuan_image3_transformer.py:2797``
-        dispatches ``self.model.prepare_inputs_for_generation(...)``).
-        Despite the diffusers convention of ``pipeline.transformer``, the t2i
-        pipeline class doesn't expose that alias — only the outer vllm-omni
-        wrapper aliases ``self.transformer = self.model``, a different
-        object. Field map matches our own per-step kernel
-        (``models/hunyuan_image3/diffusion.py:212-231``).
-        """
+        """Wrap ``transformer.prepare_inputs_for_generation`` to capture the fused multimodal conditioning."""
         if self._conditioning_tap_installed:
             return
 
@@ -154,26 +84,7 @@ class RLHunyuanImage3Pipeline(HunyuanImage3Pipeline):
         self._conditioning_tap_installed = True
 
     def _install_initial_noise_injector(self) -> None:
-        """Wrap the inner pipeline's ``prepare_latents`` to inject the
-        driver-authored x_T recipe.
-
-        HI3's DiT latent shape is AR-dynamic — only known when upstream calls
-        ``prepare_latents`` with the resolved ``image_size`` /
-        ``latent_channel`` — so the driver cannot ship a materialized x_T
-        tensor; it ships only a RECIPE (seed + per-sample gids) via
-        ``sampling_params.extra_args``. The injector recomputes the
-        per-sample latent shape exactly as upstream does (mirrors
-        ``hunyuan_image3_transformer.py:2489`` — ``latent_scale_factor``
-        applied to ``image_size``), regenerates byte-identical noise via
-        ``NoiseRecipe.for_batch(...).resolve(...)`` (CPU-fp32 → device), and
-        feeds it as ``latents`` so upstream skips its RNG draw. No recipe
-        armed → pass-through.
-
-        Note: ``prepare_latents`` lives on the INNER t2i pipeline
-        (``hunyuan_image3_transformer.py:2489``), NOT on
-        ``self._pipeline.model`` (the MoE backbone, which holds
-        ``prepare_inputs_for_generation``).
-        """
+        """Wrap the inner pipeline's ``prepare_latents`` to inject the driver-authored x_T recipe."""
         if self._initial_noise_injector_installed:
             return
         _ = self.pipeline
@@ -219,8 +130,7 @@ class RLHunyuanImage3Pipeline(HunyuanImage3Pipeline):
         self.scheduler.arm(eta=eta, sde_indices=extra.get("sde_indices"))
 
     def _arm_initial_noise(self, req: OmniDiffusionRequest) -> None:
-        """This request's x_T RECIPE (seed + per-sample gids; no shape —
-        AR-dynamic, the injector fills it once upstream reveals it)."""
+        """This request's x_T RECIPE (seed + per-sample gids, no shape — AR-dynamic; the injector fills it later)."""
         extra = getattr(req.sampling_params, "extra_args", None) or {}
         gids = extra.get("init_noise_group_ids")
         self._pending_initial_noise_recipe = (

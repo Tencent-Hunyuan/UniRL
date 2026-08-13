@@ -1,16 +1,4 @@
-"""Distributed coordination helpers (lazy re-exports).
-
-Contract:
-
-- ``distributed/`` owns distributed coordination semantics and sync protocols
-- it may depend on the active transport/runtime boundary when needed
-- it must not own Ray actors, group construction, placement, or business workflow
-
-Re-exports are lazy via ``__getattr__`` so that importing a leaf module
-(e.g. ``unirl.distributed.tensor.transport``) does NOT eagerly
-pull in ``weight_sync`` → ``rollout/engine`` → ``types/sample``,
-which would close the loop back on a mid-init ``types/conditions/base``.
-"""
+"""Distributed coordination helpers (lazy re-exports)."""
 
 from __future__ import annotations
 

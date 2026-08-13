@@ -1,29 +1,4 @@
-"""SFTTrainer — driver orchestrator for supervised finetuning.
-
-The supervised sibling of :class:`~unirl.trainer.ar.ARTrainer` /
-:class:`~unirl.trainer.diffusion.DiffusionTrainer`: same consumer side
-(``bundle → pipeline → backend → algorithm → stack`` siblings on one
-placement), but the data producer is a dataset-backed ``SupervisedTrackBuilder``
-instead of a rollout engine — no reward service, no advantages, no weight
-sync, no sampling params. Each step::
-
-    records = data_source.get_samples(batch_size)       # driver-side rows
-    part    = track_builder.build(records)              # worker-side encode → Part
-    result  = stack.train_track(part, ...)               # the SAME stack RL uses
-
-The algorithm (``unirl.algorithms.SFT`` / ``FlowMatchSFT``) declares
-``requires_advantages=False``; everything else about the stack — micro
-planning, grad accumulation, the token-weighted global loss normalization,
-EMA, checkpointing through the backend — is shared with the RL trainers, so
-SFT inherits every stack/backend improvement for free (and doubles as the
-cheapest end-to-end regression exercise of that machinery).
-
-Supervised-only concerns owned here: epoch semantics with an exact
-``{epoch, position}`` resume cursor (saved beside each checkpoint), and
-full-validation-set eval loss through ``stack.eval_track`` — the final partial
-eval batch is padded to the DP width with ``_eval_pad`` rows the loss masks
-out, so no tail sample is dropped and no padded row is counted.
-"""
+"""SFTTrainer — driver orchestrator for supervised finetuning."""
 
 from __future__ import annotations
 
@@ -129,12 +104,7 @@ class SFTTrainer(BaseTrainer):
         return eval_loss
 
     def _pad_to_dp(self, records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Pad a partial eval batch up to a DP multiple with zero-weight rows.
-
-        DP_SCATTER needs divisibility; dropping the tail would silently shrink
-        the eval set. Padded rows are duplicates flagged ``_eval_pad`` — the
-        track builders zero their loss weight, so coverage stays exact.
-        """
+        """Pad a partial eval batch up to a DP multiple with zero-weight rows."""
         records = list(records)
         pad_source = records[-1] if records else None
         while len(records) % self.dp_size:
@@ -145,8 +115,7 @@ class SFTTrainer(BaseTrainer):
         return records
 
     def _save_data_state(self, step: int, num_steps: int, *, save_interval: int, save_dir: Optional[str]) -> None:
-        """Write the dataset cursor beside the checkpoint this step produced
-        (same cadence/path arithmetic as :meth:`BaseTrainer.maybe_save_checkpoint`)."""
+        """Write the dataset cursor beside the checkpoint this step produced, on the same cadence."""
         if save_interval <= 0:
             return
         step_1 = step + 1
@@ -188,13 +157,7 @@ class SFTTrainer(BaseTrainer):
         load_dir: Optional[str] = None,
         save_mode: str = "auto",
     ) -> None:
-        """``num_steps`` optimizer steps of ``records → build → train_track``.
-
-        ``num_steps`` is the TOTAL budget (resume continues toward it); one
-        step consumes ``batch_size`` samples, so N epochs ≈
-        ``N * len(dataset) / batch_size`` steps (``train/epoch`` tracks the
-        exact position).
-        """
+        """``num_steps`` optimizer steps of ``records → build → train_track``."""
         start_step = self.maybe_load_checkpoint(load_dir, num_rollouts=num_steps)
         self._load_data_state(load_dir, start_step)
         self._init_wandb(num_rollouts=num_steps)

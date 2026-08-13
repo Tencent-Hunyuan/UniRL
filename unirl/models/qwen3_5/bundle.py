@@ -1,16 +1,4 @@
-"""Qwen3_5Bundle — concrete weights+processor+tokenizer holder for Qwen3.5 VL.
-
-Mirror of :class:`unirl.models.qwen_vl.QwenVLBundle` (vision tower freeze,
-meta-init, AutoProcessor) but branches on ``model_type``:
-
-* ``qwen3_5``      -> ``Qwen3_5ForConditionalGeneration``      (dense)
-* ``qwen3_5_moe``  -> ``Qwen3_5MoeForConditionalGeneration``   (MoE)
-
-Also applies the ``fast_pos_embed_interpolate`` device-fix patch (borrowed
-from verl) on the vision tower, which is needed when
-``meta_init_transformer=True`` + FSDP2 cpu_offload would otherwise leave
-``self.pos_embed`` on CPU while ``grid_thw`` is on GPU.
-"""
+"""Qwen3_5Bundle — concrete weights+processor+tokenizer holder for Qwen3.5 VL."""
 
 from __future__ import annotations
 
@@ -31,15 +19,7 @@ logger = logging.getLogger(__name__)
 
 
 def _patch_fast_pos_embed_interpolate(visual_module: nn.Module) -> None:
-    """Bind verl's ``fast_pos_embed_interpolate`` onto the vision tower.
-
-    The upstream implementation reads ``self.pos_embed.weight.device`` for
-    the output device; under FSDP2 cpu_offload ``self.pos_embed`` is still
-    on CPU after materialization while the caller passes a CUDA ``grid_thw``,
-    producing a device-mismatch crash. verl's fix takes the device from
-    ``grid_thw`` instead. We bind the function as a method so ``self`` is
-    the vision module.
-    """
+    """Bind verl's ``fast_pos_embed_interpolate`` onto the vision tower."""
     import types
 
     def fast_pos_embed_interpolate(self, grid_thw):  # noqa: D401

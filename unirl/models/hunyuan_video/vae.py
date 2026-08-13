@@ -1,20 +1,4 @@
-"""HunyuanVideoVAEDecodeStage -- LatentSegment -> Videos via 3D VAE decode.
-
-Implements ``DecodeStage[LatentSegment, Videos]``. Reads the final
-stored position from ``LatentSegment.latents[:, -1]`` (the clean
-latent at ``T``, which :class:`HunyuanVideoDiffusionStage` always
-stores) as a 5D channel-first tensor ``[B, C, T_lat, H_lat, W_lat]``,
-runs VAE decode in fp32 (bf16 unsupported by most VAE implementations),
-normalizes pixels from ``[-1, 1]`` to ``[0, 1]``, then packs each
-sample into a ``Video`` (``[T, C, H, W]`` frames layout) and emits a
-varlen ``Videos`` primitive.
-
-HunyuanVideo-1.0 VAE config:
-- spatial_compression_ratio: 8
-- temporal_compression_ratio: 4
-- latent_channels: 16
-- scaling_factor: 0.476986
-"""
+"""HunyuanVideoVAEDecodeStage — 5D ``[B, C, T_lat, H_lat, W_lat]`` to varlen ``Videos`` (``[T, C, H, W]`` frames)."""
 
 from __future__ import annotations
 
@@ -36,14 +20,7 @@ class HunyuanVideoVAEDecodeStage(DecodeStage[LatentSegment, Videos]):
         self.bundle = bundle
 
     def decode(self, s: LatentSegment, *, grad: bool = False, activation_checkpoint: bool = False) -> Videos:
-        """Decode the final-step latents in *s* into a packed ``Videos`` payload.
-
-        ``grad=False`` (default) keeps the rollout path under ``torch.no_grad()``.
-        ``grad=True`` (ReFL direct-reward backprop) runs the decode WITH grad so it
-        flows from the reward through the frozen VAE into ``clean``; the VAE has no
-        trainable params, so only ``clean``'s graph is extended. ``activation_checkpoint``
-        (grad only) recomputes the decode in backward to trade compute for memory.
-        """
+        """Decode the final-step latents in *s* into a packed ``Videos`` payload."""
         if s.latents is None:
             raise ValueError("HunyuanVideoVAEDecodeStage.decode: segment.latents is None")
         if s.latents.ndim != 6:

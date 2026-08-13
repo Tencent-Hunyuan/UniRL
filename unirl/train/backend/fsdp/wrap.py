@@ -1,9 +1,4 @@
-"""FSDP2 model wrapping.
-
-:func:`fsdp_wrap` applies per-block ``fully_shard`` to the trainable module.
-No handle is returned — the DTensors ARE the handle.  Ported from
-``FSDPPolicy._wrap_model``.
-"""
+"""FSDP2 model wrapping."""
 
 from __future__ import annotations
 
@@ -34,12 +29,7 @@ def _clone_checkpoint_kwarg(value: Any) -> Any:
 
 
 def _checkpoint_with_kwarg_snapshots(function: Any, *args: Any, **kwargs: Any) -> Any:
-    """Checkpoint mutable kwargs from a frozen call-time mapping snapshot.
-
-    The outer clone isolates the saved checkpoint frame from later caller
-    mutation; ``run`` clones that frozen mapping again so neither the original
-    forward nor recompute can mutate the replay source.
-    """
+    """Checkpoint mutable kwargs from a frozen call-time mapping snapshot."""
     from torch.utils import checkpoint as torch_checkpoint
 
     checkpoint_kwargs = {key: _clone_checkpoint_kwarg(value) for key, value in kwargs.items()}
@@ -68,23 +58,7 @@ def fsdp_wrap(
     master_dtype: Optional[str] = None,
     root_wrap: bool = True,
 ) -> None:
-    """Apply FSDP2 wrapping to the model.  No handle returned — DTensors
-    ARE the handle.  Ported from FSDPPolicy._wrap_model.
-
-    If ``block_class_names`` is supplied, it takes precedence and
-    ``stage`` is ignored for discovery.  Otherwise we fall back to
-    ``_discover_block_classes(model, stage)`` (model __mro__ then stage
-    source chain).
-
-    ``root_wrap`` (default ON) adds a root ``fully_shard(model)`` after the
-    per-block wrap so the leftover params (embed / final norm / lm_head)
-    are sharded + mp_policy'd instead of staying plain replicated tensors.
-    The root group deliberately does NOT inherit ``reshard_after_forward``:
-    FSDP2's auto policy keeps the root's params materialized after forward,
-    which stages rely on for direct post-forward submodule calls (e.g. the
-    chunked ``lm_head`` in Qwen3 replay). See ``FSDPConfig.root_wrap`` for
-    when to disable it.
-    """
+    """Apply FSDP2 wrapping to the model.  No handle returned — DTensors"""
     from torch.distributed.fsdp import (
         CPUOffloadPolicy,
         FSDPModule,

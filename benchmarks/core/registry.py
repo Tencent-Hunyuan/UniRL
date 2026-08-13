@@ -1,9 +1,4 @@
-"""Benchmark registry: one :class:`BenchmarkSpec` per benchmark.
-
-Adding a benchmark = drop its prompt data (or a fetch script) under
-``benchmarks/<modality>/<name>/`` and register one spec here. All runner logic
-lives in ``run.py`` / ``core/``; per-benchmark folders hold README + data only.
-"""
+"""Benchmark registry: one :class:`BenchmarkSpec` per benchmark."""
 
 from __future__ import annotations
 
@@ -63,9 +58,7 @@ def load_prompts(spec: BenchmarkSpec) -> List[str]:
 
 
 def load_metadata(spec: BenchmarkSpec) -> List[Dict]:
-    """Full jsonl records aligned with :func:`load_prompts` order (first record wins
-    per unique prompt). The reward-service geneval scorers read these as
-    ``RewardRequest.metadata`` (``vqa_list`` / ``tag``+``include``)."""
+    """Full jsonl records aligned with :func:`load_prompts` order (first record wins per unique prompt)."""
     records: Dict[str, Dict] = {}
     for line in spec.data_path().read_text().splitlines():
         if line.strip():

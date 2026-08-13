@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""Convert gijs/dcase2025-audio-qa parquet shards to UniRL audio MCQA JSONL.
-
-The source dataset embeds WAV bytes in parquet. This converter extracts each
-clip once, normalizes four-way answers to A/B/C/D, and maps the labeled source
-``test`` split to UniRL validation. The unlabeled source ``eval`` split is not
-emitted.
-"""
+"""Convert gijs/dcase2025-audio-qa parquet shards to UniRL audio MCQA JSONL."""
 
 from __future__ import annotations
 

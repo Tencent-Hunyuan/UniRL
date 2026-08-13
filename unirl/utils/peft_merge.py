@@ -12,13 +12,7 @@ _PACKED_QWEN_MOE_MODEL_TYPES = frozenset({"qwen3_moe", "qwen3_5_moe"})
 
 
 def lora_targets_ep_experts(model: torch.nn.Module) -> bool:
-    """Whether PEFT injected LoRA tensors into fused EP expert modules.
-
-    Attention/shared-expert LoRA remains compatible with EP because those
-    tensors use the normal FSDP mesh. LoRA inside ``.experts.`` would itself
-    need an outer EP gather and per-expert conversion, which neither the LoRA
-    nor merged-full receiver formats can represent safely.
-    """
+    """Whether PEFT injected LoRA tensors into fused EP expert modules."""
     if not getattr(model, "_extra_parallel_param_groups", None):
         return False
     return any(".experts." in name and (".lora_A." in name or ".lora_B." in name) for name in model.state_dict())
@@ -29,12 +23,7 @@ def _strip_peft_prefix(name: str) -> str:
 
 
 def _to_full_tensor(tensor: torch.Tensor, dtype: torch.dtype | None = None) -> torch.Tensor:
-    """Materialize DTensor parameters into regular tensors on CUDA.
-
-    ``dtype`` (optional) casts floating tensors BEFORE the DTensor
-    redistribute, so the all-gather moves wire-width bytes (e.g. bf16)
-    instead of master-width (fp32). ``None`` keeps the tensor's own dtype.
-    """
+    """Materialize DTensor parameters into regular tensors on CUDA."""
     tensor = tensor.cuda()
     if dtype is not None and tensor.is_floating_point() and tensor.dtype != dtype:
         tensor = tensor.to(dtype)
@@ -51,18 +40,7 @@ def _iter_rollout_tensors(
     unpack_qwen_moe: bool = False,
     moe_intermediate: int | None = None,
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    """Yield rollout-compatible full tensors, streaming packed MoE experts.
-
-    Transformers 5 stores supported Qwen MoE experts as packed 3D parameters,
-    while SGLang 0.5.x live reload accepts the original per-expert checkpoint
-    keys. Slice before materializing a DTensor so each collective gathers one
-    expert projection instead of the complete packed expert table.
-
-    ``moe_intermediate`` (when the model config provides it) pins the expected
-    packed layout — ``gate_up_proj [E, 2*I, H]`` / ``down_proj [E, H, I]`` — so
-    a Transformers layout change fails loudly instead of exporting silently
-    transposed expert weights.
-    """
+    """Yield rollout-compatible full tensors, streaming packed MoE experts."""
     if unpack_qwen_moe and tensor.ndim == 3 and name.endswith(".mlp.experts.gate_up_proj"):
         if tensor.shape[1] % 2 != 0 or (moe_intermediate is not None and tensor.shape[1] != 2 * moe_intermediate):
             expected = f"2 * moe_intermediate_size = {2 * moe_intermediate}" if moe_intermediate else "even"
@@ -109,13 +87,7 @@ def _prepare_qwen_moe_dtensor(
     tensor: torch.Tensor,
     dtype: torch.dtype | None,
 ) -> tuple[torch.Tensor, torch.dtype | None]:
-    """Make expert selection safe for an FSDP2 ``Shard(0)`` packed tensor.
-
-    DTensor's ``select`` must replicate an input sharded on the selected expert
-    dimension. Redistribute that shard to the packed tensor's last dimension
-    once instead; selecting an expert then stays sharded and only the emitted
-    2D projection is all-gathered by :func:`_to_full_tensor`.
-    """
+    """Make expert selection safe for an FSDP2 ``Shard(0)`` packed tensor."""
     if not isinstance(tensor, DTensor):
         return tensor, dtype
 
@@ -138,12 +110,7 @@ def _unpack_qwen_moe(model: torch.nn.Module) -> bool:
 
 
 def _moe_intermediate_size(model: torch.nn.Module) -> int | None:
-    """Resolve ``moe_intermediate_size`` from text-only or multimodal configs.
-
-    Returns ``None`` when the config does not expose it — the packed-layout
-    shape check in :func:`_iter_rollout_tensors` then degrades to the
-    even-split invariant only.
-    """
+    """Resolve ``moe_intermediate_size`` from text-only or multimodal configs."""
     config = getattr(model, "config", None)
     for owner in (config, getattr(config, "text_config", None)):
         value = getattr(owner, "moe_intermediate_size", None)
@@ -157,15 +124,7 @@ def merged_state_dict(
     adapter_name: str = "default",
     dtype: torch.dtype | None = None,
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    """Yield ``(name, tensor)`` pairs with LoRA deltas folded into base weights.
-
-    ``lm_head.weight`` is skipped when ``tie_word_embeddings=True``: SGLang
-    aliases it to ``model.embed_tokens.weight`` and rejects an explicit update.
-
-    ``dtype`` (optional) is the wire dtype: yielded tensors are cast to it.
-    The LoRA fold itself always runs at master width — only its output is
-    cast — so the merge numerics are unchanged by the wire dtype.
-    """
+    """Yield ``(name, tensor)`` pairs with LoRA deltas folded into base weights."""
     skip_lm_head = bool(getattr(getattr(model, "config", None), "tie_word_embeddings", False))
     unpack_qwen_moe = _unpack_qwen_moe(model)
     moe_intermediate = _moe_intermediate_size(model) if unpack_qwen_moe else None
@@ -278,11 +237,7 @@ def raw_state_dict(
     adapter_name: str = "default",
     dtype: torch.dtype | None = None,
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    """Yield base and LoRA weights separately, matching rollout-engine naming.
-
-    ``dtype`` (optional) is the wire dtype: floating tensors are cast to it
-    shard-side in :func:`_to_full_tensor`, before the DTensor all-gather.
-    """
+    """Yield base and LoRA weights separately, matching rollout-engine naming."""
     unpack_qwen_moe = _unpack_qwen_moe(model)
     moe_intermediate = _moe_intermediate_size(model) if unpack_qwen_moe else None
     skip_lm_head = bool(getattr(getattr(model, "config", None), "tie_word_embeddings", False))
@@ -358,24 +313,7 @@ def extract_lora_tensors(
     adapter_name: str = "default",
     dtype: torch.dtype | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Extract LoRA tensors in canonical wire format.
-
-    Canonical format: ``<pipeline_prefix><module>.lora_A.weight`` and
-    ``<pipeline_prefix><module>.lora_B.weight`` — PEFT envelope
-    (``base_model.model.``) and per-adapter name stripped; pipeline prefix
-    retained.  Downstream receivers convert to their engine-specific format:
-    :func:`adapt_lora_for_vllm` re-adds the envelope for vllm-omni;
-    :func:`adapt_lora_for_sglang` strips the prefix and injects ``.alpha``
-    for SGLang.
-
-    ``dtype`` (optional) is the wire dtype: floating LoRA tensors are cast to it
-    shard-side in :func:`_to_full_tensor`, BEFORE the DTensor all-gather. This is
-    load-bearing under ``master_dtype=fp32`` (the reward-collapse fix): the
-    trainable LoRA params live in fp32, but the rollout engine's vLLM punica
-    kernel hard-asserts bf16/fp16 — so the caller passes the FSDP compute dtype
-    (``backend.weight_sync_dtype``) and the all-gather also moves half the bytes.
-    ``None`` keeps each tensor's own dtype (the prior all-bf16-master behavior).
-    """
+    """Extract LoRA tensors in canonical wire format."""
     result: dict[str, torch.Tensor] = {}
     prefix = str(param_prefix or "")
     for raw_name, param in model.state_dict().items():
@@ -408,16 +346,7 @@ def extract_lora_tensors(
 
 
 def adapt_lora_for_vllm(tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    """Wrap canonical-format LoRA keys in the vllm-omni PEFT envelope.
-
-    Canonical → vllm-omni format::
-
-        <pipeline_prefix><module>.lora_A.weight
-        → base_model.model.<pipeline_prefix><module>.lora_A.weight
-
-    This is the receiver-side adapter for
-    :class:`~unirl.rollout.engine.vllm_omni.engine.VLLMOmniRolloutEngine`.
-    """
+    """Wrap canonical-format LoRA keys in the vllm-omni PEFT envelope."""
     return {f"{_PEFT_PREFIX}{k}": v for k, v in tensors.items()}
 
 
@@ -427,30 +356,7 @@ def adapt_lora_for_sglang(
     pipeline_prefix: str = "",
     peft_config: dict | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Convert canonical-format LoRA tensors to SGLang's native key format.
-
-    Canonical → SGLang native::
-
-        <pipeline_prefix><module>.lora_A.weight
-        → <module>.lora_A.weight
-        + <module>.alpha            ← injected from peft_config["lora_alpha"]
-
-    SGLang's ``_apply_lora_to_layers`` keys its ``lora_layers`` dict by
-    ``named_modules()`` of ``self.modules["transformer"]`` — i.e. starting
-    *inside* the transformer — so layer keys are bare module names without
-    any pipeline prefix.  The ``.alpha`` key is required so SGLang computes
-    ``scale = lora_alpha / r`` correctly; without it SGLang falls back to
-    ``inferred_alpha = inferred_rank`` → scale = 1.0 (wrong for alpha ≠ rank).
-
-    Args:
-        tensors: Canonical-format output of :func:`extract_lora_tensors`.
-        pipeline_prefix: The pipeline-level prefix to strip, e.g.
-            ``"transformer."`` for SD3/WAN/HV15/Qwen or ``"model."`` for
-            HunyuanImage3.  Read from
-            ``model_config.weight_sync_param_name_prefix`` at the call site.
-        peft_config: PEFT config dict; provides ``lora_alpha`` for injecting
-            ``.alpha`` keys.
-    """
+    """Convert canonical-format LoRA tensors to SGLang's native key format."""
     prefix = str(pipeline_prefix or "")
     result: dict[str, torch.Tensor] = {}
     for key, tensor in tensors.items():

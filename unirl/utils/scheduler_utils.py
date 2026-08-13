@@ -12,12 +12,7 @@ Strategy = Literal["all", "progressive", "random", "decay", "exp_decay"]
 
 @dataclass
 class SchedulerConfig:
-    """Typed view of the indices-scheduler options consumed by ``create_indices_scheduler``.
-
-    Mirrors the keys the factory reads. ``timestep_fraction`` uses ``Any`` because
-    it accepts either a scalar or a 2-element ``[start, end]`` list — OmegaConf
-    structured configs do not support Python ``Union`` directly.
-    """
+    """Typed view of the indices-scheduler options consumed by ``create_indices_scheduler``."""
 
     timestep_strategy: str = "all"
     timestep_fraction: Any = 1.0

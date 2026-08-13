@@ -1,25 +1,4 @@
-"""Driver-side ``Sample`` → ``Sample`` conversion: the adapter ABC + registry.
-
-A thin top ABC (registry + knobs + the two conversion verbs). Concrete
-modality adapters live in family files (``hi3`` / ``sd3`` / ``hv15``) and are
-**binders**: each constructs an ``input_adapter`` and an ``output_adapter``
-in ``__init__`` and delegates ``build_inputs`` / ``build_response`` to them.
-The universal single-stage DiT skeletons live in ``dit.py``; family-specific
-sub-adapters carry the family prefix and live in the family file. Adapters
-self-register by ``modality`` key — the same axis v1 branched on inline —
-and are selected once at engine construction via :func:`get_adapter`.
-
-Pure: never imports vllm-omni — adapters consume the seam's ``OmniRawResult``
-protocol and emit :class:`GenerateCall` intent; tokenization reaches the
-runtime through the injected ``tokenize_fn`` (the seam's ``tokenize_prompt``
-verb). The adapter is bound to the engine config + model config at
-construction so its conversion methods don't thread them.
-
-The per-modality topology knobs (which stage YAML, env/boot quirks, LoRA
-transport) are class attributes here — lifted from v1 ``engine.py``'s
-``_HI3_MODALITIES`` / ``_DIT_BEARING_MODALITIES`` / ``_HI3_MULTI_GPU_MODALITIES``
-frozensets so the engine never branches on a modality string.
-"""
+"""Driver-side ``Sample`` → ``Sample`` conversion: the adapter ABC + registry."""
 
 from __future__ import annotations
 
@@ -62,13 +41,7 @@ def registered_adapters() -> Tuple[str, ...]:
 
 
 class ModelAdapter(ABC):
-    """Thin ABC: registry key + topology knobs + the two conversion seams.
-
-    The conversion *logic* lives on the input/output sub-adapters the
-    concrete binders construct; this ABC declares the boilerplate every
-    adapter shares (boot intent, schedule policy, validation) and the two
-    abstract methods the engine drives.
-    """
+    """Thin ABC: registry key + topology knobs + the two conversion seams."""
 
     modality: str = ""
 
@@ -97,23 +70,12 @@ class ModelAdapter(ABC):
 
     @staticmethod
     def resolve_sde_label(strategy: Any) -> Optional[str]:
-        """Deliberately ``None``: vllm-omni rides raw ``eta`` + ``sde_indices``
-        through ``extra_args`` (the worker pipeline applies SDE on those
-        steps), unlike sglang_diffusion's kernel-label selection. This hook
-        exists so a future kernel-label path has its seam; do not "complete"
-        it — that would break v1 parity.
-        """
+        """Deliberately ``None``: vllm-omni rides raw ``eta`` + ``sde_indices`` via ``extra_args``; do not complete."""
         del strategy
         return None
 
     def boot_kwargs(self) -> Dict[str, Any]:
-        """Model-specific boot intent beyond the generic config spelling.
-
-        The generic pieces (model_path, enable_sleep_mode, timeouts, the
-        ``omni_extra`` escape hatch, ports) are the config's job; this conveys
-        only what the modality knows: which stage YAML, the driver-tokenizer
-        need, the CVD quirk, and the ``Omni(mode=...)`` kwarg.
-        """
+        """Model-specific boot intent beyond the generic config spelling."""
         require(bool(self.stage_yaml), f"{type(self).__name__} must set stage_yaml")
         kwargs: Dict[str, Any] = {
             "stage_yaml": self.stage_yaml,
@@ -151,11 +113,7 @@ class ModelAdapter(ABC):
 
     @abstractmethod
     def build_inputs(self, sample: Sample) -> List[GenerateCall]:
-        """Translate a request ``Sample`` into the seam's generate calls.
-
-        Normally one call carrying the whole batch; ``dit_recaption`` returns
-        N seeded single-prompt calls.
-        """
+        """Translate a request ``Sample`` into the seam's generate calls."""
 
     @abstractmethod
     def build_response(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Sample:

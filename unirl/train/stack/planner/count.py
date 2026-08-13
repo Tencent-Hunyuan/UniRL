@@ -1,10 +1,4 @@
-"""Fixed-count micro-batching — the default planner.
-
-Uniform-shape latents (diffusion) make a sample COUNT a good proxy for compute, so
-micros are contiguous equal-count slices and the per-rank micro count is identical
-across DP ranks — no NCCL micro-count parity collective is needed. This is the
-historical ``TrainStack`` behaviour; recipes get it by omitting ``micro_planner``.
-"""
+"""Fixed-count micro-batching — the default planner."""
 
 from __future__ import annotations
 
@@ -14,13 +8,7 @@ from unirl.types.sample import Part
 
 
 def _count_plan(*, total: int, num_updates: int, micro_batch_size: int) -> Plan:
-    """Fixed-count plan: contiguous equal updates, each split into ``micro_batch_size`` micros.
-
-    The diffusion / FlowGRPO "batched" schedule, and the fallback for the LLM path
-    when a segment exposes no per-sample lengths. No collective: every DP rank
-    produces the same update/micro counts because the per-rank batch is evenly
-    sharded.
-    """
+    """Fixed-count plan: contiguous equal updates, each split into ``micro_batch_size`` micros."""
     plan: Plan = []
     for u_start, u_end in _update_ranges(total_size=total, num_updates=num_updates):
         plan.append(
@@ -33,14 +21,7 @@ def _count_plan(*, total: int, num_updates: int, micro_batch_size: int) -> Plan:
 
 
 class CountPlanner:
-    """Fixed-count micro-batches: every micro holds ``micro_batch_size`` samples.
-
-    The original ``TrainStack`` behaviour. Uniform-shape latents (diffusion) make a
-    sample COUNT a good proxy for compute, so micros are contiguous equal-count
-    slices and the per-rank micro count is identical across DP ranks — no NCCL
-    micro-count parity collective is needed. Never reorders the track; imposes no
-    algorithm precondition.
-    """
+    """Fixed-count micro-batches: every micro holds ``micro_batch_size`` samples."""
 
     def arrange(self, part: Part, *, num_updates: int, micro_batch_size: int) -> tuple[Part, Plan]:
         return part, _count_plan(

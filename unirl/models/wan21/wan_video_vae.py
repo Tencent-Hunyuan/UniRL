@@ -17,11 +17,7 @@ CACHE_T = 2
 
 
 class Conv3dActGradOnlyFunction(torch.autograd.Function):
-    """Conv3d that only computes input gradient, not weight gradient.
-
-    For frozen VAE: weights never update, so no need to save activations
-    for weight grad computation. Saves significant GPU memory.
-    """
+    """Conv3d that only computes input gradient, not weight gradient."""
 
     @staticmethod
     def forward(ctx, input, weight, bias, stride, padding, dilation, groups):
@@ -600,10 +596,7 @@ class VideoVAE_(nn.Module):
 
 
 def _replace_conv_with_act_grad_only(model):
-    """Replace Conv layers with act-grad-only versions (post-construction).
-
-    Avoids global monkey-patching of nn.Conv2d / CausalConv3d.
-    """
+    """Replace Conv layers with act-grad-only versions (post-construction)."""
     for name, module in model.named_modules():
         if isinstance(module, CausalConv3d) and not isinstance(module, CausalConv3dActGradOnly):
             parent_name, child_name = name.rsplit(".", 1) if "." in name else ("", name)
@@ -660,10 +653,7 @@ def _get_task_range(total, world_size, rank):
 
 
 class _SimpleConfig:
-    """Minimal config object for diffusers pipeline compatibility.
-
-    WanPipeline.__init__ reads vae.config.scale_factor_temporal/spatial.
-    """
+    """Minimal config object for diffusers pipeline compatibility."""
 
     def __init__(self, **kwargs):
         for k, v in kwargs.items():
@@ -671,14 +661,7 @@ class _SimpleConfig:
 
 
 class _DeterministicLatentDist:
-    """Drop-in replacement for diffusers' ``DiagonalGaussianDistribution``.
-
-    UniRL's I2V image-condition encode stage calls
-    ``vae.encode(x).latent_dist.mode()`` (see ``image_encode.py:100``)
-    to get the deterministic mode of the encoded Gaussian. ROLL's
-    ``VideoVAE_.encode`` only returns the (already-normalized) mean
-    directly, so ``mode()`` and ``sample()`` here are identical.
-    """
+    """Drop-in replacement for diffusers' ``DiagonalGaussianDistribution``."""
 
     def __init__(self, latent: torch.Tensor) -> None:
         self._latent = latent
@@ -698,14 +681,7 @@ class _EncoderOutput:
 
 
 class WanVideoVAE(nn.Module):
-    """Wan Video VAE with training optimizations.
-
-    Wraps VideoVAE_ with:
-    - Built-in latent normalization (mean/std)
-    - Tiled encode/decode for large resolutions
-    - Tiled parallel decode across SP ranks
-    - Optional act-grad-only conv optimization
-    """
+    """Wan Video VAE with training optimizations."""
 
     def __init__(self, z_dim=16, use_nested_grad_checkpoint=True, use_act_grad_only_conv=True):
         super().__init__()
@@ -775,12 +751,7 @@ class WanVideoVAE(nn.Module):
 
     @property
     def dtype(self) -> torch.dtype:
-        """Parameter dtype, matching the diffusers ``vae.dtype`` convention.
-
-        UniRL's ``image_encode.py:94`` reads ``vae.dtype`` to cast the
-        VAE input. Expose it as a property over the first parameter so it
-        stays in sync if the module is later ``.to(dtype=...)``-cast.
-        """
+        """Parameter dtype, matching the diffusers ``vae.dtype`` convention."""
         return next(self.parameters()).dtype
 
     def single_encode(self, video, device):
@@ -793,24 +764,7 @@ class WanVideoVAE(nn.Module):
         return video.clamp_(-1, 1)
 
     def encode(self, videos, device=None, tiled=False, tile_size=(34, 34), tile_stride=(18, 16)):
-        """Encode videos to latent space.
-
-        Two calling conventions are supported (so this class can drop into
-        both UniRL's batched-encode path and diffusers' single-tensor
-        ``vae.encode(x).latent_dist.mode()`` contract used by the I2V
-        image-condition encode stage):
-
-        1. **Batched / list**: ``videos`` is a list of ``(C, T, H, W)``
-           tensors or a 5D ``(B, C, T, H, W)`` tensor, ``device`` must be
-           passed; returns a stacked ``(B, z_dim, T_lat, H_lat, W_lat)``
-           latent tensor directly.
-        2. **Diffusers-compatible**: ``videos`` is a 5D
-           ``(B, C, T, H, W)`` tensor, ``device`` is omitted; returns an
-           ``_EncoderOutput`` whose ``.latent_dist.mode()`` /
-           ``.latent_dist.sample()`` both return the (deterministic)
-           normalized latent. The VAE is non-stochastic in this port
-           , so ``mode()`` and ``sample()`` agree.
-        """
+        """Encode ``(B, C, T, H, W)`` videos (or a list of ``(C, T, H, W)``) to ``(B, z_dim, T_lat, H_lat, W_lat)``."""
         if device is None and isinstance(videos, torch.Tensor) and videos.dim() == 5:
             target_device = videos.device
             latents = self._encode_batched(videos, target_device, tiled, tile_size, tile_stride)
@@ -836,14 +790,7 @@ class WanVideoVAE(nn.Module):
         return torch.stack(hidden_states)
 
     def decode(self, hidden_states, device=None, tiled=True, sp_group=None, tile_size=(34, 34), tile_stride=(18, 16)):
-        """Decode latents to video.
-
-        ``device`` defaults to the latent's own device (so callers
-        upstream of UniRL's decode stage can ``vae.decode(z)`` without
-        threading the device through). ``tiled=True`` is the default
-        because uniform-tile + per-tile checkpointing is the only path
-        that survives BPTT memory pressure at 480×832×81f resolution.
-        """
+        """Decode latents to video."""
         if device is None:
             device = hidden_states.device
         if tiled:
@@ -924,11 +871,7 @@ class WanVideoVAE(nn.Module):
         return values.clamp_(-1, 1)
 
     def tiled_parallel_decode(self, hidden_states, device, tile_size, tile_stride, sp_group):
-        """Tiled decode with SP parallelism — each rank decodes a subset of tiles.
-
-        Args:
-            sp_group: torch.distributed ProcessGroup for sequence parallelism.
-        """
+        """Tiled decode with SP parallelism — each rank decodes a subset of tiles."""
         B, _, T, H, W = hidden_states.shape
         size_h, size_w = tile_size
         stride_h, stride_w = tile_stride
@@ -1051,12 +994,7 @@ class WanVideoVAE(nn.Module):
 
     @classmethod
     def load_from_diffusers(cls, pretrained_path, **kwargs):
-        """Load WanVideoVAE from HuggingFace diffusers format.
-
-        Args:
-            pretrained_path: Path to model directory containing vae/ subfolder,
-                             or direct path to vae directory.
-        """
+        """Load WanVideoVAE from HuggingFace diffusers format."""
         vae_dir = pretrained_path
         if os.path.isdir(os.path.join(pretrained_path, "vae")):
             vae_dir = os.path.join(pretrained_path, "vae")
@@ -1077,12 +1015,7 @@ class WanVideoVAE(nn.Module):
 
 
 def convert_diffusers_state_dict(hf_sd: dict) -> OrderedDict:
-    """Convert HuggingFace AutoencoderKLWan state dict to WanVideoVAE format.
-
-    The two models have identical architecture (194 params, same shapes) but
-    different key naming. This function handles the mapping including the
-    mid_block reorder: HF [attn, res0, res1] → ROLL [res0, attn, res1].
-    """
+    """Convert HuggingFace AutoencoderKLWan state dict to WanVideoVAE format."""
     new_sd = OrderedDict()
 
     resblock_map = {
@@ -1181,23 +1114,7 @@ def _convert_decoder_key(key: str, rb_map: dict) -> str:
 
 
 def _convert_upblock_key(key: str, rb_map: dict) -> str:
-    """Convert decoder up_blocks flat key to ROLL upsamples flat index.
-
-    HF decoder structure (Wan 2.1 VideoVAE_):
-    - up_blocks.0: 3 resnets + 1 upsampler → upsamples indices 0,1,2,3
-    - up_blocks.1: 3 resnets + 1 upsampler → upsamples indices 4,5,6,7
-    - up_blocks.2: 3 resnets + 1 upsampler → upsamples indices 8,9,10,11
-    - up_blocks.3: 3 resnets (no upsampler) → upsamples indices 12,13,14
-
-    ROLL's Decoder3d has 15 sequential upsamples:
-    - indices 0-2: ResBlocks (up_blocks.0.resnets.0-2)
-    - index 3: Resample (up_blocks.0.upsamplers.0)
-    - indices 4-6: ResBlocks (up_blocks.1.resnets.0-2)
-    - index 7: Resample (up_blocks.1.upsamplers.0)
-    - indices 8-10: ResBlocks (up_blocks.2.resnets.0-2)
-    - index 11: Resample (up_blocks.2.upsamplers.0)
-    - indices 12-14: ResBlocks (up_blocks.3.resnets.0-2)
-    """
+    """Convert decoder up_blocks flat key to ROLL upsamples flat index."""
     dot = key.index(".")
     block_idx = int(key[:dot])
     rest = key[dot + 1 :]

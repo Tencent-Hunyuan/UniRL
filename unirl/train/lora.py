@@ -1,16 +1,4 @@
-"""Plain LoRA adapter injection.
-
-Build-time structural mutation only: :func:`inject_lora` installs a single
-peft adapter on the trainable stage and stamps the post-materialize reset via
-``unirl.train.deferred``; :func:`inject_frozen_adapter` installs an additional
-frozen, inference-only adapter (e.g. a distillation teacher) with weights
-loaded from a peft checkpoint.  No Shadow, no EMA — the dual-adapter NFT
-variant lives in ``unirl.train.ema``.
-
-Adapter routing helpers (:func:`adapter_active`, ``_activate``,
-``_set_adapter_requires_grad``) live here so every touch of peft's per-layer
-activation state goes through one module.
-"""
+"""Plain LoRA adapter injection."""
 
 from __future__ import annotations
 
@@ -180,22 +168,7 @@ def adapter_names(model: nn.Module) -> set:
 
 @contextmanager
 def adapter_active(model: nn.Module, name: str, *, trainable: str = "default") -> Iterator[None]:
-    """Temporarily route every LoraLayer through the frozen adapter ``name``.
-
-    peft's per-layer ``set_adapter`` couples activation with ``requires_grad``
-    (active -> True, others -> False), which is wrong for a frozen adapter and
-    breaks the trainable adapter under FSDP2 with ``reshard_after_forward=False``
-    (see :func:`unirl.train.ema._activate_keep_grad` — same failure mode). Both
-    enter and exit therefore re-assert the canonical split: ``trainable`` stays
-    grad-enabled, ``name`` stays frozen. Layers that do not carry ``name``
-    (a narrower teacher ``target_modules`` set) fall through to their base
-    weights — exactly the frozen policy those layers represent.
-
-    Exit restores ``trainable`` as the active adapter (the resting state of the
-    plain-LoRA path), not a captured snapshot: activation in this stack always
-    flows through ``_activate``-style whole-model writes, so the resting state
-    is canonical, and hard-restoring it is self-healing.
-    """
+    """Temporarily route every LoraLayer through the frozen adapter ``name``."""
     if name == trainable:
         raise ValueError(f"adapter_active: {name!r} is the trainable adapter; only frozen adapters can be routed.")
     _activate(model, name)
@@ -210,11 +183,7 @@ def adapter_active(model: nn.Module, name: str, *, trainable: str = "default") -
 
 
 def _resolve_adapter_checkpoint(path: str) -> tuple:
-    """Resolve a peft adapter checkpoint to local ``(config_path, weight_path)``.
-
-    Accepts a local directory, an HF repo id (``org/repo``), or an HF repo id
-    with a subfolder (``org/repo/sub/dir``).
-    """
+    """Resolve a peft adapter checkpoint to local ``(config_path, weight_path)``."""
     if os.path.isdir(path):
         config_path = os.path.join(path, "adapter_config.json")
         weight_path = os.path.join(path, "adapter_model.safetensors")
@@ -253,19 +222,7 @@ def inject_frozen_adapter(
     path: str,
     trainable_adapter: str = "default",
 ) -> None:
-    """Inject a frozen, inference-only LoRA adapter with weights from ``path``.
-
-    The adapter's geometry (rank / alpha / target_modules / bias) comes from its
-    own ``adapter_config.json`` — a teacher checkpoint defines its shape, the
-    recipe only names it. Dropout is forced to 0: a frozen policy must be
-    deterministic. After injection the trainable adapter is re-activated and its
-    ``requires_grad`` re-asserted (peft's injection flips it as a side effect).
-
-    Requires an eagerly materialized module: weights are loaded here, pre-wrap,
-    so FSDP shards them with everything else and checkpoints stay symmetric.
-    Meta-init bundles would need a deferred distribute-and-copy — unsupported
-    until a bundle actually needs it.
-    """
+    """Inject a frozen, inference-only LoRA adapter with weights from ``path``."""
     from peft import LoraConfig, inject_adapter_in_model, set_peft_model_state_dict
     from peft.tuners.lora import LoraLayer
 
@@ -362,13 +319,7 @@ def inject_frozen_adapter(
 
 @contextmanager
 def adapters_disabled(model: nn.Module) -> Iterator[None]:
-    """Temporarily route every PEFT LoRA layer through its frozen base weights.
-
-    This mirrors PEFT's adapter-disabling behavior without changing
-    ``requires_grad``. The beta KL reference replay wraps this in ``no_grad`` so
-    the shared FSDP model can act as pi_ref while preserving the trainable adapter
-    state.
-    """
+    """Temporarily route every PEFT LoRA layer through its frozen base weights."""
     from peft.tuners.lora import LoraLayer
 
     layers = [m for m in model.modules() if isinstance(m, LoraLayer)]

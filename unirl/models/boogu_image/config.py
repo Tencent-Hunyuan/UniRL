@@ -1,24 +1,4 @@
-"""Construction config for the typed Boogu-Image pipeline.
-
-Sibling of :class:`unirl.models.z_image.ZImagePipelineConfig` and
-:class:`unirl.models.qwen_image.QwenImagePipelineConfig`. Carries
-weights+precision knobs only; LoRA injection, FSDP wrapping, gradient
-checkpointing, and offload control all live in the training backend config —
-the bundle is weights+params only.
-
-``shift`` lives here so the hosting engine can build the
-:class:`FlowMatchSchedulePolicy` at startup. The released
-``Boogu-Image-0.1-Base`` scheduler config is a **static** v1 time shift
-(``do_shift: true, dynamic_time_shift: false, time_shift_version: "v1",
-seq_len: 4096``). Boogu's v1 logistic time shift over ``t`` is algebraically
-identical to the standard static sigma shift
-``σ' = s·σ / (1 + (s−1)·σ)`` with ``s = e^μ`` and
-``μ = lin(seq_len)`` where ``lin`` maps 256→0.5, 4096→1.15 — so the released
-checkpoint's schedule is exactly UniRL's static shift with
-``s = e^1.15 = 3.158192909689768`` (verified to 1 fp32 ulp against the
-reference scheduler). :meth:`BooguImagePipeline.build_schedule_policy` pins
-the static posture from this value.
-"""
+"""Construction config for the typed Boogu-Image pipeline."""
 
 from __future__ import annotations
 
@@ -34,12 +14,7 @@ _ATTENTION_BACKENDS = ("sdpa", "flash2_varlen")
 
 @dataclass
 class BooguImagePipelineConfig:
-    """Construction args for ``BooguImagePipeline.from_config``.
-
-    ``device`` may be runtime-injected by the actor after compose; the
-    other fields are set at compose time and read once during pipeline
-    construction.
-    """
+    """Construction args for ``BooguImagePipeline.from_config``."""
 
     pretrained_model_ckpt_path: str
     vae_ckpt_path: Optional[str] = None

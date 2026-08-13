@@ -1,11 +1,4 @@
-"""Trainside (in-process) rollout engine adapter.
-
-Wraps a materialized ``models`` :class:`Pipeline` plus the trainable
-stage, and exposes them as a :class:`BaseRolloutEngine`.  Used in
-direct-sampling mode where the training model IS the sampler (on-policy
-RL) and rollout runs in the same Python process as training — so no
-worker subprocess and no weight sync are needed.
-"""
+"""Trainside (in-process) rollout engine adapter."""
 
 from __future__ import annotations
 
@@ -26,29 +19,7 @@ Stage = Union[DiffusionStage, ARStage]
 
 
 class TrainsideRolloutEngine(BaseRolloutEngine):
-    """In-process rollout engine: the train actor's Pipeline IS the sampler.
-
-    Args:
-        pipeline: A materialized ``models`` pipeline whose
-            ``generate(sample)`` fills the request ``Sample``'s gen Parts.
-        stage: Optional pre-resolved trainable stage whose
-            ``trainable_module()`` is the FSDP-wrapped model (the v1 train
-            actor passes one). Takes precedence over ``stage_attrs``.
-        stage_attrs: Stage attribute(s) to read off ``pipeline`` and
-            eval-scope around ``generate``. A list so composed pipelines can
-            drive more than one trainable module (e.g. PE's
-            ``["diffusion", "ar"]``); defaults to ``("diffusion",)`` for the
-            common single-diffusion engine.
-        forward_batch_size: Optional intra-call chunk size for the
-            ``pipeline.generate`` forward path. When set and the gen frontier
-            exceeds this, ``generate`` slices the frontier Part via
-            :meth:`Part.slice`, runs ``pipeline.generate`` per chunk, and
-            concatenates the filled gen parts via :meth:`Part.concat`. Bounds
-            stage peak memory (e.g. SD3 VAE decode) when there is no external
-            inference runtime to chunk for us. **Single gen Part only** — chunking
-            a multi-stage lineage would re-run the interior stage(s) per chunk and
-            drop their output; ``generate`` rejects that combination.
-    """
+    """In-process rollout engine: the train actor's Pipeline IS the sampler."""
 
     _component_name = "trainside"
 
@@ -137,11 +108,7 @@ class TrainsideRolloutEngine(BaseRolloutEngine):
                 m.train(mode)
 
     def _ensure_sample_sigmas(self, sample: Sample) -> None:
-        """Pin the σ schedule onto the gen part's ``DiffusionSamplingParams.sigmas``.
-
-        Shared across the part's samples (one params object). Only reached when a
-        diffusion stage is present (``schedule_policy is not None``).
-        """
+        """Pin the σ schedule onto the gen part's ``DiffusionSamplingParams.sigmas``."""
         ensure_sample_sigmas(sample, self.schedule_policy)
 
     def shutdown(self) -> None:

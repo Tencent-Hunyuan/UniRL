@@ -1,43 +1,4 @@
-"""DPPO (AR): Divergence-based Proximal Policy Optimization for token-level RL.
-
-Implements **DPPO**, the method of Qi et al. "Rethinking the Trust Region in LLM
-Reinforcement Learning" (arXiv:2602.04879), for autoregressive (token-level,
-discrete) policies. DPPO is the **foundational** trust region that both shipped
-team algorithms extend: :class:`~unirl.algorithms.cppo.CPPO` makes its threshold
-position-weighted and cumulative (the **hard-mask** sibling), and
-:class:`~unirl.algorithms.drpo.DRPO` smooths it into an advantage-weighted
-quadratic regularizer (the **smooth-mask** sibling).
-
-DPPO keeps GRPO's token-level ratio-advantage surrogate but replaces PPO's ratio
-clipping with a **uniform per-token Binary-TV mask** (paper §3): the trust region
-is ``|pi(y_t|s_t) - mu(y_t|s_t)| <= delta`` on the absolute probability shift of
-the sampled token, which is better behaved than the importance ratio for a
-long-tailed vocabulary (a rare token gives a huge ratio after a tiny probability
-change). The threshold ``delta`` is the same for every token — unlike CPPO's
-position-weighted, cumulative threshold — so the keep decision is purely
-token-local (no prefix sums).
-
-Per sampled token (``t`` is the token position within its sequence)::
-
-    D_t = |pi(y_t|s_t) - mu(y_t|s_t)|                  (Binary-TV per-token divergence)
-    r_t = pi(y_t|s_t) / mu(y_t|s_t)                    (importance ratio)
-    keep token t  iff  A_t * (r_t - 1) <= 0   OR   D_t <= delta
-    L = E[ sum_t keep_t * (-A_t * r_t) ]
-
-The first clause always keeps updates that move ``pi`` back toward ``mu`` (i.e.
-``A_t(r_t - 1) <= 0``); the threshold only restricts updates that move ``pi``
-*farther* from ``mu``. This is exactly CPPO's keep rule (Eq. 10) with the
-effective threshold collapsed to the constant ``delta`` (``w_min = 1`` and no
-prefix budget), so DPPO is the natural reduction of CPPO.
-
-``mu`` is the rollout-policy token probability: ``old_logp`` is the SGLang rollout
-log-prob frozen on the segment (``old_logp_source='rollout'``), exactly the
-behavior policy DPPO's trust region anchors on — the same rollout-anchored
-``old_logp`` semantics as :class:`GRPO` / :class:`DRPO` / :class:`CPPO`.
-
-(AR-only by design; DPPO targets discrete token-level policies. The diffusion/flow
-analogue is :class:`~unirl.algorithms.flowdppo.FlowDPPO`.)
-"""
+"""DPPO (AR): Divergence-based Proximal Policy Optimization for token-level RL."""
 
 from __future__ import annotations
 
@@ -61,28 +22,7 @@ from .grpo import GRPO
 
 @dataclass
 class DPPOConfig(BaseAlgorithmConfig):
-    """Config for :class:`DPPO` (the paper's uniform Binary-TV trust region).
-
-    Attributes:
-        stage_attr: Which stage slot to bind to (``"ar"``).
-        conditions_cls: Dotted path to the stage-typed conditions class.
-        dppo_delta: Token-level Binary-TV threshold ``delta`` (paper §4 /
-            CPPO Table 3: 0.15 for dense models). This is the uniform per-token
-            trust-region scale — the same value for every token (CPPO's
-            ``cppo_delta`` with the position weight and prefix budget removed).
-        loss_agg_mode: ``"token-mean"`` or ``"seq-mean-token-sum-norm"``
-            (per-seq token-SUM / horizon, then mean over sequences).
-        horizon: Fixed length normalizer for ``seq-mean-token-sum-norm``
-            (= max response length).
-        sampling_temperature: Rollout sampling temperature; replay rescales
-            logits by it so ``log_softmax(logits / T)`` matches the sampling
-            distribution. MUST equal ``sampling.temperature``. Falls back to the
-            :class:`ARSamplingParams` default when None.
-        old_logp_source: ``"rollout"`` (default, the canonical DPPO mode) anchors
-            the ratio and the Binary-TV divergence ``mu`` on the rollout engine's
-            emitted logprobs for ALL ``num_updates_per_batch`` steps; ``"replay"``
-            freezes a train-side ``pi_old`` in :meth:`prepare_segment` instead.
-    """
+    """Config for :class:`DPPO` (the paper's uniform Binary-TV trust region)."""
 
     stage_attr: str = "ar"
     conditions_cls: str = ""
@@ -101,24 +41,7 @@ def _dppo_mask(
     ratio: torch.Tensor,
     delta: float,
 ) -> torch.Tensor:
-    """DPPO uniform Binary-TV keep-mask over packed-varlen ``[total_tokens]``.
-
-    Built entirely under ``torch.no_grad`` by the caller — the mask is a
-    trust-region gate, not part of the differentiable loss. Unlike CPPO, the
-    decision is purely token-local (uniform threshold, no prefix sums), so there
-    is no per-sequence loop: every token is kept iff its update moves ``pi`` back
-    toward ``mu`` OR its absolute probability shift stays within ``delta``.
-
-    Args:
-        new_logp: New-policy (pi) log-probs at current weights. ``[total_tokens]``.
-        old_logp: Rollout-policy (mu) log-probs, frozen. ``[total_tokens]``.
-        advantages: Per-token advantages (expanded from per-sample). ``[total_tokens]``.
-        ratio: ``exp(new_logp - old_logp)``, the importance ratio. ``[total_tokens]``.
-        delta: Uniform token-level Binary-TV threshold (paper §3).
-
-    Returns:
-        ``keep`` mask ``[total_tokens]`` (float 0/1), detached.
-    """
+    """DPPO uniform Binary-TV keep-mask over packed-varlen ``[total_tokens]``."""
     prob = torch.exp(new_logp.float())
     old_prob = torch.exp(old_logp.float())
     D_t = (prob - old_prob).abs()  # Binary-TV divergence D_t
@@ -136,26 +59,7 @@ def _dppo_loss(
     advantages: torch.Tensor,
     delta: float,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    """DPPO per-token loss (paper §3; uniform Binary-TV hard mask).
-
-    Operates on packed-varlen ``[total_tokens]`` tensors. Per kept token::
-
-        L_t = -A_t * r_t        (ratio-advantage surrogate)
-
-    with ``r_t = pi/mu`` kept differentiable (no ``.detach()``) so the gradient
-    flows through the ratio, matching :func:`~unirl.algorithms.cppo._cppo_loss`
-    and :func:`~unirl.algorithms.drpo._drpo_loss`. The DPPO mask zeroes the loss
-    on tokens whose absolute probability shift exceeds the uniform threshold.
-
-    Args:
-        new_logp: New-policy (pi) log-probs at current weights. ``[total_tokens]``.
-        old_logp: Rollout-policy (mu) log-probs, frozen. ``[total_tokens]``.
-        advantages: Per-token advantages (expanded from per-sample).
-        delta: Uniform token-level Binary-TV threshold (paper §3).
-
-    Returns:
-        ``(loss_per_element, metrics_dict)``. Reduction is the caller's job.
-    """
+    """DPPO per-token loss over packed-varlen ``[total_tokens]`` (paper §3; uniform Binary-TV hard mask)."""
     log_diff = torch.clamp(new_logp - old_logp, min=-20.0, max=20.0)
     ratio = torch.exp(log_diff)
     adv = advantages.detach()
@@ -180,32 +84,7 @@ def _dppo_loss(
 
 
 class DPPO(StageAlgorithm):
-    """DPPO for AR token-level policies — the foundational Binary-TV trust region.
-
-    DPPO (Divergence-based Proximal Policy Optimization) keeps GRPO's token-level
-    ratio-advantage surrogate but replaces PPO's ratio clipping with a **uniform
-    per-token Binary-TV mask** (paper §3). Per kept token::
-
-        L_t = -A_t * r_t ,    keep_t = (A_t (r_t - 1) <= 0) OR (|pi - mu| <= delta)
-
-    This is the trust region that :class:`CPPO` makes position-weighted /
-    cumulative and that :class:`DRPO` smooths into a quadratic regularizer.
-
-    Args:
-        pipeline: The trainer-injected pipeline; the stage is resolved from it via
-            ``getattr(pipeline, stage_attr)``.
-        stage: Pre-resolved stage (tests); ``pipeline`` is the production path.
-        stage_attr: Which pipeline attribute holds the AR stage (``"ar"``).
-        dppo_delta: Uniform token-level Binary-TV threshold ``delta`` (0.15 dense;
-            paper §4 / CPPO Table 3).
-        loss_agg_mode: ``"token-mean"`` or ``"seq-mean-token-sum-norm"``.
-        horizon: Fixed length normalizer for ``seq-mean-token-sum-norm``.
-        sampling_temperature: Rollout sampling temperature, passed to
-            ``stage.replay`` so its log-softmax matches the sampling distribution.
-            MUST equal ``sampling.temperature``.
-        old_logp_source: ``"rollout"`` (default) or ``"replay"``.
-        conditions_cls: Stage-typed conditions container.
-    """
+    """DPPO for AR token-level policies — the foundational Binary-TV trust region."""
 
     supports_multi_update = True
 
@@ -249,16 +128,7 @@ class DPPO(StageAlgorithm):
         conditions: Mapping[str, Condition],
         segment: "TextSegment",
     ) -> None:
-        """Freeze the ``pi_old`` / ``mu`` anchor (``segment.log_probs``) before the
-        ``num_updates_per_batch`` loop, per ``old_logp_source``.
-
-        - ``"rollout"`` (default): keep the rollout engine's emitted
-          ``segment.log_probs`` as the anchor for ALL N updates (the behavior
-          policy DPPO anchors on; verl bypass-mode parity).
-        - ``"replay"``: recompute ``pi_old`` via a ``torch.no_grad``
-          ``stage.replay`` at the **pre-update** weights and **overwrite**
-          ``segment.log_probs``. Mirrors :meth:`CPPO.prepare_segment` replay mode.
-        """
+        """Freeze the ``pi_old`` / ``mu`` anchor before the ``num_updates_per_batch`` loop, per ``old_logp_source``."""
         if self.old_logp_source != "replay":
             return
         if segment.tokens is None or segment.log_probs is None or int(segment.tokens.shape[0]) == 0:

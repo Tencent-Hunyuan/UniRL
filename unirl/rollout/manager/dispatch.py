@@ -23,15 +23,7 @@ class _PendingUnit:
 
 
 class RolloutPool:
-    """Background dispatch thread keeping every launcher filled up to its capacity.
-
-    Launches run outside the pool lock (localization can be slow); tasks mid-launch are
-    tracked as per-launcher reservations so pause/drain/counts stay exact. Capacity frees
-    when a launch reports ready; resolving results (and surviving a failure there) is the
-    caller's job — the manager poisons itself on a failed resolve, so a replacement
-    launched meanwhile is bounded waste on an already-fatal path. A launch or probe
-    failure poisons the pool.
-    """
+    """Background dispatch thread keeping every launcher filled up to its capacity."""
 
     _PROBE_INTERVAL_S = 0.01
 

@@ -24,11 +24,7 @@ _SPARSE_PACKED_ATTN = ("flash_attention_2", "flash_attention_3", "flash_attentio
 
 @functools.lru_cache(maxsize=None)
 def _warn_packed_disabled(attn_impl: str) -> None:
-    """One-time warning (per distinct backend) when packed replay is skipped.
-
-    Fires when packing WOULD apply (B > 1) but the attention backend is not a
-    sparse-block kernel, so replay uses the slower padded path instead.
-    """
+    """One-time warning (per distinct backend) when packed replay is skipped."""
     logger.warning(
         "packed-varlen replay disabled: attn_implementation=%r is not a "
         "sparse-block kernel; using the padded replay path. Qwen2.5-VL has no "
@@ -40,16 +36,7 @@ def _warn_packed_disabled(attn_impl: str) -> None:
 
 
 def _packed_replay_supported(attn_impl: Optional[str]) -> bool:
-    """Feature-detect the packed varlen replay prerequisites (review #43).
-
-    1. A FlashAttention sparse-block backend (Qwen2.5-VL has no flex_attention);
-       on plain sdpa packed attention is full O((sum L)^2) and can regress, so
-       require a flash backend (checked first; warns once on fallback).
-    2. transformers building a block-causal mask from restarting position_ids
-       (masking_utils.find_packed_sequence_indices, transformers >= 4.53); on
-       older versions the forward would silently attend ACROSS sequence
-       boundaries (wrong logps, no error), so fall back to the dense path.
-    """
+    """Feature-detect the packed varlen replay prerequisites (review #43)."""
     if attn_impl not in _SPARSE_PACKED_ATTN:
         _warn_packed_disabled(str(attn_impl))
         return False
@@ -131,14 +118,7 @@ def _vision_rope_positions(
     image_grid_thw: Optional[torch.Tensor],
     attention_mask: torch.Tensor,
 ) -> torch.Tensor:
-    """Call Qwen2.5-VL ``get_rope_index`` across transformers versions → ``[3, bs, seq]``.
-
-    transformers >= 5.x made ``mm_token_type_ids`` (text=0 / image=1 / video=2) a
-    REQUIRED positional arg of ``get_rope_index``; <= 4.57 has no such parameter.
-    Build it from the config token ids and pass it only when the installed
-    signature accepts it, so both version lines work (mirrors transformers' own
-    ``ProcessorMixin.create_mm_token_type_ids``).
-    """
+    """Call Qwen2.5-VL ``get_rope_index`` across transformers versions → ``[3, bs, seq]``."""
     get_rope_index = transformer.model.get_rope_index
     kwargs = {"image_grid_thw": image_grid_thw, "attention_mask": attention_mask}
     if "mm_token_type_ids" in inspect.signature(get_rope_index).parameters:
@@ -274,9 +254,7 @@ class QwenVLARStage(ARStage[QwenVLARConditions]):
         segment: TextSegment,
         temperature: float = 1.0,
     ) -> torch.Tensor:
-        """Branch: prefer :meth:`packed_replay` (packed-varlen, B > 1), else
-        :meth:`padding_replay` (dense padded default). Returns packed varlen
-        ``[total_tokens]`` aligned with ``segment.log_probs``."""
+        """Prefer :meth:`packed_replay` (B > 1), else :meth:`padding_replay`; returns varlen ``[total_tokens]``."""
         attn_impl = getattr(getattr(self.model.transformer, "config", None), "_attn_implementation", None)
         if _packed_replay_supported(attn_impl):
             packed = self.packed_replay(conditions, segment=segment, temperature=temperature)
@@ -390,23 +368,7 @@ class QwenVLARStage(ARStage[QwenVLARConditions]):
         segment: TextSegment,
         temperature: float = 1.0,
     ) -> Optional[torch.Tensor]:
-        """Packed-varlen replay for VL (M-RoPE) — verl remove_padding parity.
-
-        Concatenate every sample's ``prompt + response`` into one zero-padded
-        stream, with per-stream 4-D position ids ``[text_arange; get_rope_index
-        (t,h,w)]``. The text row restarts at 0 per stream; under a FlashAttention
-        backend transformers derives per-sequence ``cu_seqlens`` from that restarting
-        row (varlen FA — no cross-sequence attention, verl remove_padding parity).
-        sdpa/eager would instead build an explicit packed block-causal mask from the
-        same row (also correct), but the gate routes those to the dense path for
-        speed; Qwen2.5-VL has no flex_attention support, so a flash backend is the
-        reachable packed path. Per-stream M-RoPE positions equal the standalone
-        layout (validated bit-exact on transformers 4.57; the packed VL path needs a
-        flash backend and re-validation on the 5.x stack — see PR notes / #54), so
-        logp semantics match :meth:`padding_replay`.
-        Returns ``None`` (→ padding fallback) when packing does not apply: single
-        sample, or missing prompt / lengths / cu_seqlens.
-        """
+        """Packed-varlen replay for VL (M-RoPE) — verl remove_padding parity."""
         if conditions.prompt is None or conditions.prompt.input_ids is None or conditions.prompt.attention_mask is None:
             return None
         if segment.tokens is None or segment.cu_seqlens is None or segment.lengths is None:

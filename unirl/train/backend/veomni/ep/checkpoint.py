@@ -1,19 +1,4 @@
-"""EP-aware full-state checkpoint helpers for the VeOmni backend.
-
-VeOmni pre-slices fused expert parameters before DTensor sharding: each EP
-rank owns a DTensor whose *global* shape is ``[E / ep, ...]``. The EP axis is
-therefore invisible to DCP's normal full-state gather/load. These helpers add
-that missing outer dimension for single-file ``torch`` checkpoints:
-
-* save: replicate each local ``[E / ep, ...]`` block over ``ep_fsdp``, gather
-  the blocks over ``ep``, and replace DCP's rank-0 expert entry with
-  ``[E, ...]``;
-* load: slice the saved ``[E, ...]`` tensor for this EP rank, then let DCP
-  shard that local block over ``ep_fsdp`` without a rank-0 broadcast.
-
-The same transformation is applied to parameter-shaped optimizer state
-(``exp_avg`` / ``exp_avg_sq``), so Adam resumes exactly with the model.
-"""
+"""EP-aware full-state checkpoint helpers for the VeOmni backend."""
 
 from __future__ import annotations
 

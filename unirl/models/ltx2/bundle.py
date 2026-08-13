@@ -1,11 +1,4 @@
-"""LTX2Bundle — weights holder for LTX-2 / LTX-2.3 video diffusion.
-
-Loads the LTX2 transformer, video VAE, text encoder (Gemma3), connectors,
-scheduler, and optionally audio VAE + vocoder for LTX-2.3.
-
-No LoRA injection, FSDP wrap, or weight-sync logic — those are lifecycle
-concerns owned outside the bundle.
-"""
+"""LTX2Bundle — weights holder for LTX-2 / LTX-2.3 video diffusion."""
 
 from __future__ import annotations
 
@@ -21,9 +14,7 @@ from .config import LTX2PipelineConfig
 
 
 class LTX2Bundle(Bundle):
-    """LTX-2/2.3 bundle: transformer + video VAE + text encoder + scheduler
-    (+ optional audio VAE + vocoder for T2AV).
-    """
+    """LTX-2/2.3 bundle: transformer + video VAE + text encoder + scheduler (+ audio VAE + vocoder for T2AV)."""
 
     def __init__(
         self,

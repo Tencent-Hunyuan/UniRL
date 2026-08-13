@@ -1,23 +1,4 @@
-"""Qwen3MoeBundle — VeOmni-patched Qwen3-MoE causal LM + tokenizer.
-
-Unlike :class:`unirl.models.qwen3.Qwen3Bundle` (HF ``AutoModelForCausalLM``,
-EP-incapable), this builds the model through ``veomni.build_foundation_model``
-so it carries:
-
-* ``get_parallel_plan`` — ``Shard(0)`` on the stacked expert weights
-  (``mlp.experts.gate_up_proj`` / ``down_proj``), which
-  ``VeOmniBackend`` (``fsdp_cfg.ep_size>1``) shards across the EP submesh; and
-* a fused MoE op (``moe_implementation="fused_triton"``) whose forward runs the
-  all-to-all dispatch / grouped-GEMM / all-to-all combine EP path.
-
-Meta-init only (``VeOmniBackend`` materializes via ``to_empty`` + loads the
-stacked safetensors after sharding). The backend's shared
-``recover_rope_inv_freq`` step restores non-persistent RoPE buffers after
-materialization and weight load.
-
-The dense Qwen3 ``Qwen3ARStage`` / ``Qwen3ARConditions`` are reused verbatim —
-the replay forward only needs ``.model`` (decoder) + ``.lm_head``.
-"""
+"""Qwen3MoeBundle — VeOmni-patched Qwen3-MoE causal LM + tokenizer."""
 
 from __future__ import annotations
 
@@ -51,13 +32,7 @@ class Qwen3MoeBundle(Bundle):
         self.pretrained_path = pretrained_path
 
     def prepare_for_expert_parallel(self) -> None:
-        """Backend hook when ``ep_size > 1``.
-
-        VeOmni's ``build_foundation_model(..., moe_implementation=fused_triton)``
-        already installs fused stacked experts and ``get_parallel_plan``, so
-        unlike HI3 there is nothing to swap on meta — this is intentionally a
-        no-op that satisfies :meth:`VeOmniBackend`'s EP-ready contract.
-        """
+        """Backend hook when ``ep_size > 1``."""
         if not callable(getattr(self.transformer, "get_parallel_plan", None)):
             raise ValueError(
                 "Qwen3MoeBundle.prepare_for_expert_parallel: transformer lacks "
@@ -78,24 +53,7 @@ class Qwen3MoeBundle(Bundle):
         trust_remote_code: bool = True,
         tokenizer: Any = None,
     ) -> "Qwen3MoeBundle":
-        """Build the VeOmni Qwen3-MoE transformer (on meta) + tokenizer.
-
-        Two call styles:
-        * recipe (hydra): ``from_config(config=Qwen3PipelineConfig(...))`` — reads
-          ``pretrained_model_ckpt_path`` / ``tokenizer_ckpt_path`` / ``model_precision``
-          / ``attn_implementation`` off the config; ``moe_implementation`` falls back
-          to ``"fused_triton"`` when the config does not carry it;
-        * direct: ``from_config(pretrained_model_ckpt_path=..., tokenizer=...)``.
-
-        ``pretrained_model_ckpt_path`` is a local dir with ``config.json`` and
-        ``*.safetensors``. Both layouts load directly (no offline merge): VeOmni
-        **stacked** (``experts.gate_up_proj`` / ``down_proj``) and HF **original
-        per-expert** (``experts.N.gate_proj`` / ``up_proj`` / ``down_proj``) — the
-        EP-aware loader (``unirl.train.backend.sharded_load``) reconstructs each
-        rank's fused expert block from the per-expert keys when needed. This
-        VeOmni-only bundle requires ``meta_init_transformer=true`` and fails
-        clearly instead of silently ignoring that config contract.
-        """
+        """Build the VeOmni Qwen3-MoE transformer (on meta) + tokenizer."""
         if config is not None:
             pretrained_model_ckpt_path = config.pretrained_model_ckpt_path
             tokenizer_ckpt_path = getattr(config, "tokenizer_ckpt_path", None)

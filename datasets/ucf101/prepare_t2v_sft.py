@@ -1,23 +1,4 @@
-"""Build UniRL target-video SFT manifests from an extracted UCF-101 tree.
-
-Expected input layout::
-
-    datasets/ucf101/raw/UCF-101/
-      Archery/v_Archery_g01_c01.avi
-      BasketballDunk/v_BasketballDunk_g01_c01.avi
-      ...
-
-The default class list is the 18-class sports/action subset used by the
-WAN2.1 full-finetuning recipe. The split is deterministic and class-stratified.
-
-Example:
-
-  python datasets/ucf101/prepare_t2v_sft.py \
-      --data-root datasets/ucf101/raw/UCF-101 \
-      --out-dir datasets/ucf101/processed
-
-See ``datasets/ucf101/README.md`` for download and training instructions.
-"""
+"""Build UniRL target-video SFT manifests from an extracted UCF-101 tree."""
 
 from __future__ import annotations
 

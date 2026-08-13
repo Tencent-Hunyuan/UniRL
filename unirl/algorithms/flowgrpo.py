@@ -1,12 +1,4 @@
-"""Stage-driven ``FlowGRPO`` over a ``LatentSegment``.
-
-Implements :class:`StageAlgorithm` and shares the module-level
-``_grpo_clip_loss`` / ``_resolve_clip_range_from_schedule`` helpers (in
-:mod:`unirl.algorithms.base`) with :class:`GRPO` so their loss math
-stays identical. CFG batching, predict_noise, SDE math, autocast, and per-step
-iteration are owned by ``stage.replay(...)``; the algorithm is ~20 lines of
-ratio-clip math.
-"""
+"""Stage-driven ``FlowGRPO`` over a ``LatentSegment``."""
 
 from __future__ import annotations
 
@@ -48,41 +40,7 @@ class FlowGRPOConfig(BaseAlgorithmConfig):
 
 
 class FlowGRPO(StageAlgorithm):
-    """GRPO over a diffusion ``LatentSegment`` via ``DiffusionStage.replay``.
-
-    The whole forward path (CFG batching, noise prediction, SDE math, autocast,
-    per-step iteration) is owned by :meth:`DiffusionStage.replay`; this class
-    is pure ratio-clip math against ``segment.sde_logp``.
-
-    Args:
-        stage: The :class:`DiffusionStage` whose ``replay`` produces new
-            log-probs aligned with ``segment.sde_logp[:, slot_for_steps]``.
-        params: The per-call params object the stage's ``replay`` consumes
-            (e.g. ``SD3DiffusionParams``). Held as algorithm state so the
-            dispatcher doesn't need to know it.
-        clip_range: PPO clip range epsilon.
-        clip_schedule: ``"constant"``, ``"linear_decay"``, or
-            ``"cosine_decay"`` — applied via ``training_progress``.
-        old_logp_source: ``"rollout"`` (default) trusts the rollout engine's
-            emitted ``segment.sde_logp``; ``"replay"`` recomputes it via
-            ``stage.replay`` at pre-update weights. See :meth:`prepare_segment`.
-        beta: Reference-policy KL coefficient (Flow-GRPO eq.5). ``> 0`` adds
-            ``beta * KL(pi_theta || pi_ref)`` to the clipped loss, where ``pi_ref``
-            is the base model with its LoRA adapter disabled (a per-update no_grad
-            reference replay). ``0`` (default) disables the term and skips that
-            replay. Requires a LoRA recipe + the injected ``backend``.
-            The KL is normalized by the full per-step transition std
-            (``std_dev_t*sqrt(-dt)`` for Flow/Dance) — the exact Gaussian KL.
-            The reference flow_grpo code divides by ``std_dev_t**2`` only, so at
-            equal ``beta`` this term is ~``1/|dt|`` stronger (≈10x at 10 sampling
-            steps): don't port ``beta`` values 1:1 from flow_grpo configs.
-        backend: FSDP backend sibling (injected by the v2 trainer). Only used when
-            ``beta > 0`` to reach the trainable model for the adapter-disabled
-            reference replay.
-        conditions_cls: Stage-typed conditions container with a
-            ``from_dict(Mapping[str, Condition])`` classmethod. ``None``
-            forwards the dict verbatim (unit-test path).
-    """
+    """GRPO over a diffusion ``LatentSegment`` via ``DiffusionStage.replay``."""
 
     supports_multi_update = True
     requires_backend = True
@@ -130,20 +88,7 @@ class FlowGRPO(StageAlgorithm):
         conditions: Mapping[str, "Condition"],
         segment: "LatentSegment",
     ) -> None:
-        """Establish the frozen π_old anchor (``segment.sde_logp``) before the
-        ``num_updates_per_batch`` loop. The source is chosen by ``old_logp_source``:
-
-        - ``"rollout"`` (default): trust the rollout engine's emitted
-          ``segment.sde_logp``. Raises if the engine emitted nothing
-          (``sde_logp is None``) — pin a rollout build that emits per-step
-          log-probs, or set ``old_logp_source='replay'``.
-        - ``"replay"``: recompute via a ``torch.no_grad``
-          :meth:`DiffusionStage.replay` at the **pre-update** weights and
-          **overwrite** ``sde_logp`` (ignoring any engine value). Frozen for
-          all N micro-updates that follow.
-
-        No-op if the segment has no SDE-gated steps to train on.
-        """
+        """Establish the frozen π_old anchor (``segment.sde_logp``) before the ``num_updates_per_batch`` loop."""
         if segment.sde_indices is None:
             return
         target_steps = self._resolve_target_steps(segment)
@@ -245,12 +190,7 @@ class FlowGRPO(StageAlgorithm):
         )
 
     def _resolve_target_steps(self, segment: "LatentSegment") -> List[int]:
-        """All SDE-recorded step indices on the segment.
-
-        Subclasses can override to apply skip-last / skip-initial filtering or
-        to honor a training-indices schedule; the default trains every step
-        the rollout recorded.
-        """
+        """All SDE-recorded step indices on the segment."""
         if segment.sde_indices is None:
             return []
         return [int(i) for i in segment.sde_indices.tolist()]

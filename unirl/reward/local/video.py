@@ -149,11 +149,7 @@ class VideoRewardScorer(RewardBackend):
 
 @dataclass
 class VideoSpec(BaseRewardComponentSpec):
-    """Typed config for the Video reward component.
-
-    Wraps an inner frame-level scorer (selected by ``inner_model_name``) and
-    blends frame-level alignment with temporal consistency.
-    """
+    """Typed config for the Video reward component."""
 
     batch_size: int = 8
     device: str = "auto"

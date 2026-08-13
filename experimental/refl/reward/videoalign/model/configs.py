@@ -1,28 +1,4 @@
-"""Dataclass configs for the VideoAlign reward model.
-
-Inference-only subset of the originals at
-``mmrl/recipes/rewards/videoalign/vendor/videoalign/utils.py``. We keep the
-exact field names + default values that appear in checkpoints'
-``model_config.json``, so ``ModelConfig(**dict_from_json)`` /
-``PEFTLoraConfig(**dict_from_json)`` continue to round-trip every public
-VideoAlign release. Training-only fields (``vision_lr``, ``merger_lr``,
-``conduct_eval``, ``logging_epochs`` …) live on :class:`TrainingConfig` and
-are accepted-but-ignored by the inference path — they only end up here
-because ``model_config.json`` was written by the trainer.
-
-Why we DON'T inherit from ``transformers.TrainingArguments``
------------------------------------------------------------
-The mmrl vendor's ``TrainingConfig`` extends ``TrainingArguments`` which
-runs an ``__post_init__`` validating distributed launch fields
-(``local_rank``, ``deepspeed`` …). At reward *inference* time the call site
-is ``TrainingConfig(load_from_pretrained=..., bf16=..., output_dir="")`` and
-the only fields we actually read downstream are ``bf16`` / ``fp16`` /
-``gradient_checkpointing`` / ``disable_flash_attn2``. So we re-declare a
-plain ``@dataclass`` with just those fields plus a generous ``**kwargs``
-catch-all (``__init__`` ignores unknown keys via ``__init_subclass__`` —
-no, simpler: we filter in the loader). That keeps load-time light and
-removes the transformers private-symbol coupling entirely.
-"""
+"""Dataclass configs for the VideoAlign reward model."""
 
 from __future__ import annotations
 
@@ -32,14 +8,7 @@ from typing import List, Literal, Optional
 
 @dataclass
 class TrainingConfig:
-    """Inference-relevant slice of the trainer's :class:`TrainingArguments`.
-
-    Only ``bf16`` / ``fp16`` / ``gradient_checkpointing`` /
-    ``disable_flash_attn2`` are actually consumed by the inference path
-    (see :func:`experimental.refl.reward.videoalign.model.factory.create_model_and_processor`).
-    The other fields are kept so ``TrainingConfig(**model_config_json["training_args"])``
-    still works when someone wants to introspect the saved config.
-    """
+    """Inference-relevant slice of the trainer's :class:`TrainingArguments`."""
 
     output_dir: str = ""
     bf16: bool = False
@@ -65,14 +34,7 @@ class TrainingConfig:
 
 @dataclass
 class PEFTLoraConfig:
-    """LoRA wiring for the reward model.
-
-    For inference we typically want ``lora_enable=True`` only if the
-    checkpoint was saved as a LoRA split (``adapter_model.safetensors`` +
-    ``non_lora_state_dict.pth``) — :func:`load_model_from_checkpoint`
-    auto-detects which branch to take. The other fields drive the LoRA
-    target-module discovery inside :func:`create_model_and_processor`.
-    """
+    """LoRA wiring for the reward model."""
 
     lora_enable: bool = False
     vision_lora: bool = False
@@ -95,11 +57,7 @@ class PEFTLoraConfig:
 
 @dataclass
 class ModelConfig:
-    """Backbone + reward-head configuration.
-
-    Read from ``model_config.json::model_config``. Most fields just pass
-    through to :meth:`Qwen2VLRewardModelBT.from_pretrained`.
-    """
+    """Backbone + reward-head configuration."""
 
     model_name_or_path: Optional[str] = None
     model_revision: str = "main"
