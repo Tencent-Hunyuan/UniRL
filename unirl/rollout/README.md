@@ -45,13 +45,18 @@ wrong objective.
   AR and diffusion Parts.
 - **The engines.** `trainside` (in-process — the train actor's pipeline *is* the
   sampler), `sglang_diffusion` (dedicated diffusion), `sglang` (dedicated AR), `vllm_omni`
-  (dedicated; HI3 / SD3 / HunyuanVideo), `fastvideo` (dedicated accelerated video
+  (dedicated; BAGEL / HI3 / SD3 / HunyuanVideo), `fastvideo` (dedicated accelerated video
   sampling), and `composed` (chains an AR child + a
   diffusion child for prompt enhancement) are the six single-turn engines.
   `agentic` wraps one of them with an environment to produce multi-turn
-  trajectories. Each diffusion engine consumes the Part's pinned sigmas verbatim,
-  while initial-noise construction is engine-specific. `forward_batch_size` bounds
-  peak memory by slicing the Sample and concatenating the results.
+  trajectories. Each diffusion engine consumes the Part's pinned sigmas verbatim
+  and reads the same driver-authored `NoiseRecipe` (`../types/noise_recipe.py`),
+  but realizes it differently: `trainside`, `sglang_diffusion` and `vllm_omni`
+  resolve the recipe to an `x_T` tensor, so those three start a rollout from
+  bit-identical noise; `fastvideo` cannot accept a tensor and instead derives
+  per-sample seeds from the recipe's noise-group ids, so its noise matches only
+  in grouping, not bit-for-bit. `forward_batch_size` bounds peak memory by
+  slicing the Sample and concatenating the results.
 - **Deployment modes:** *direct sampling* — the trainside engine, no `sync:`, the
   ratio is 1 on the first update; *separate* — a dedicated engine on its own GPUs
   plus a `sync:` block; *colocate* — a dedicated engine sharing GPUs with train,
