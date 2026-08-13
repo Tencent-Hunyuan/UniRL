@@ -153,7 +153,7 @@ def create_direct_app(
             # misconfiguration must not pay a full model load (possibly onto the
             # exact GPU the protocol protects) just to be told no.
             raise ValueError(
-                f"--boot-offloaded requires scorer {scorer_name!r} to support offload (needed for lifecycle='per_call')"
+                f"--boot-offloaded requires scorer {scorer_name!r} to support offload (needed for gpu_residency='per_call')"
             )
         logger.info("direct scorer loading name=%s params=%s", scorer_name, params)
         scorer = await asyncio.to_thread(scorer_cls, **params)
