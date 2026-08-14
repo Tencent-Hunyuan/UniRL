@@ -25,10 +25,9 @@ def resolve_worker_max_concurrency(cfg: DictConfig) -> int:
     configured = cfg.get("worker_max_concurrency")
     if configured is not None:
         return int(configured)
-    per_worker_inflight = cfg.get("per_worker_inflight")
-    if per_worker_inflight is not None:
-        return int(per_worker_inflight) + 2
-    return 1
+
+    per_worker_inflight = int(cfg.get("per_worker_inflight", 1))
+    return per_worker_inflight + 2
 
 
 def prepare_input_sample(

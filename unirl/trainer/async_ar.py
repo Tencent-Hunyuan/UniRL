@@ -107,8 +107,12 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
         self._max_staleness = (
             self._weight_sync_interval - 1 if buffer_max_staleness is None else int(buffer_max_staleness)
         )
-        if self._max_staleness < 0:
-            raise ValueError(f"buffer_max_staleness must be >= 0, got {self._max_staleness}")
+        min_staleness = self._weight_sync_interval - 1
+        if self._max_staleness < min_staleness:
+            raise ValueError(
+                "buffer_max_staleness must be >= weight_sync_interval - 1; "
+                f"got {self._max_staleness} < {min_staleness}"
+            )
         if self._num_updates_per_batch < 1:
             raise ValueError(f"num_updates_per_batch must be >= 1, got {self._num_updates_per_batch}")
         self._train_version = 0
@@ -119,10 +123,8 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
                 f"train_fraction={train_fraction} yields {self._train_devices} train "
                 f"devices of {self.num_devices}; must leave a non-empty rollout slab."
             )
-        # Require rollout batches to divide evenly across train and rollout slabs.
-        self._rollout_devices = self.num_devices - self._train_devices
-        prompts = self.batch_size
-        total = prompts * total_samples_per_prompt(self.sampling_params)
+        # Require rollout batches to divide evenly across the train slab.
+        total = self.batch_size * total_samples_per_prompt(self.sampling_params)
         if total % self._train_devices != 0:
             raise ValueError(
                 f"batch_size * samples_per_prompt = {total} is not divisible by the train "
