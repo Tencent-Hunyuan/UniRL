@@ -10,7 +10,6 @@ from omegaconf import DictConfig
 
 from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
-from unirl.models.qwen3_5.validation import validate_qwen3_5_training_contract
 from unirl.rollout.manager import validate_worker_inflight
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.ar import ARTrainer, ar_preflight
