@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import inspect
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Optional, Sequence
 
@@ -48,7 +50,8 @@ class Cosmos3JointStage:
             safety_checker=None,
             enable_safety_checker=False,
         )
-        self._token_cache: dict[tuple[Any, ...], list[int]] = {}
+        self._token_cache: OrderedDict[tuple[Any, ...], list[int]] = OrderedDict()
+        self._token_cache_max = 256
 
     @property
     def device(self) -> torch.device:
@@ -87,7 +90,11 @@ class Cosmos3JointStage:
                 action_mode=action_mode,
                 action_view_point=self.config.action_view_point if action_mode else None,
             )
+            if len(self._token_cache) >= self._token_cache_max:
+                self._token_cache.popitem(last=False)
             self._token_cache[key] = ids
+        else:
+            self._token_cache.move_to_end(key)
         return ids
 
     def flow_shift(self, height: int, width: int) -> float:
@@ -157,6 +164,7 @@ class Cosmos3JointStage:
             condition_frame_indexes=condition_frames,
             vision_fps=fps,
             device=x0.device,
+            compute_dtype=self.bundle.dtype,
             **action_kwargs,
         )
         timestep = float(sigma.item()) * float(self.pipe.scheduler.config.num_train_timesteps)
@@ -174,7 +182,7 @@ class Cosmos3JointStage:
                 device=x0.device,
             )
 
-        preds_vision, _preds_sound, preds_action = self.bundle.transformer(**kwargs)
+        preds_vision, _preds_sound, preds_action = self._forward_transformer(kwargs)
         if not preds_vision:
             raise RuntimeError("Cosmos3JointStage: transformer returned no vision prediction.")
         vision_pred = preds_vision[0]
@@ -214,9 +222,37 @@ class Cosmos3JointStage:
             sigma=sigma,
         )
 
+    def _forward_transformer(self, kwargs: dict[str, Any]) -> tuple[Any, Any, Any]:
+        """Call the packed forward as a 3-tuple on both 0.39 and later diffusers.
+
+        0.39 always returns ``(vision, sound, action)``. Later revisions default
+        to ``return_dict=True`` (a ``Cosmos3OmniTransformerOutput``), which
+        would unpack into the field names rather than the prediction lists.
+        """
+        call_kwargs = dict(kwargs)
+        if "return_dict" in inspect.signature(self.bundle.transformer.forward).parameters:
+            call_kwargs["return_dict"] = False
+        output = self.bundle.transformer(**call_kwargs)
+        if isinstance(output, (tuple, list)) and len(output) >= 3:
+            return output[0], output[1], output[2]
+        sample = getattr(output, "sample", None)
+        sound = getattr(output, "sound", None)
+        action = getattr(output, "action", None)
+        if sample is None:
+            raise RuntimeError(
+                "Cosmos3JointStage: transformer output is neither a 3-tuple nor a "
+                f"Cosmos3OmniTransformerOutput, got {type(output).__name__}."
+            )
+        return sample, sound, action
+
 
 class Cosmos3Pipeline(Pipeline):
-    """SFT pipeline exposing Cosmos3's packed joint stage."""
+    """SFT pipeline exposing Cosmos3's packed joint stage.
+
+    ``generate`` is intentionally unimplemented: this integration is
+    train-loss only. ``evaluate_loss`` is noised velocity MSE and is not a
+    sample-quality gate (use a later denoise path for PSNR/SSIM).
+    """
 
     def __init__(self, *, bundle: Cosmos3Bundle) -> None:
         super().__init__()
@@ -224,7 +260,10 @@ class Cosmos3Pipeline(Pipeline):
         self.joint = Cosmos3JointStage(bundle)
 
     def generate(self, sample: Sample) -> Sample:
-        raise NotImplementedError("Cosmos3Pipeline currently supports supervised packed-stage training only.")
+        raise NotImplementedError(
+            "Cosmos3Pipeline currently supports supervised packed-stage training only. "
+            "SFT eval/loss is velocity MSE, not a sampling-quality metric."
+        )
 
 
 __all__ = ["Cosmos3JointPrediction", "Cosmos3JointStage", "Cosmos3Pipeline"]

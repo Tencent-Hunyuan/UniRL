@@ -27,15 +27,18 @@ import torch
 
 
 def resolution_tier(height: int, width: int) -> str:
-    """Map a sample to the official short-edge Cosmos resolution tier."""
+    """Map a sample to the official short-edge Cosmos resolution tier.
+
+    Official shift table is 256/480/720. Short edges above the 720p bin
+    (including 704/768/1080 canvases) stay on the 720 tier rather than an
+    unmapped key that would silently fall back to the checkpoint scheduler.
+    """
     short_edge = min(int(height), int(width))
     if short_edge <= 256:
         return "256"
     if short_edge <= 640:
         return "480"
-    if short_edge <= 960:
-        return "720"
-    return "768"
+    return "720"
 
 
 def sample_train_sigma(
@@ -119,6 +122,7 @@ def pack_joint_sequence(
     action_condition_frame_indexes: Sequence[int] = (),
     action_domain_id: Optional[torch.Tensor] = None,
     action_fps: Optional[float] = None,
+    compute_dtype: Optional[torch.dtype] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Assemble ``Cosmos3OmniTransformer.forward`` kwargs for ONE sample.
 
@@ -159,7 +163,7 @@ def pack_joint_sequence(
         mrope_segments.append(action_seg["action_mrope_ids"])
         sequence_length += action_seg["action_len"]
 
-    model_dtype = pipe.transformer.dtype
+    model_dtype = compute_dtype if compute_dtype is not None else pipe.transformer.dtype
     kwargs: Dict[str, Any] = {
         "input_ids": text_seg["input_ids"],
         "text_indexes": text_seg["text_indexes"],

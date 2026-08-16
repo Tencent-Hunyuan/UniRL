@@ -10,7 +10,8 @@
 #
 # Env:
 #   PRETRAINED_MODEL  diffusers-layout nvidia/Cosmos3-Nano checkpoint
-#                     (needs the `cosmos3` install extra: diffusers>=0.39)
+#                     (needs the `cosmos3` install extra: diffusers>=0.39).
+#                     Eval/loss is velocity MSE, not a sampling-quality gate.
 #   SFT_DATA          train manifest (defaults to the prep output below)
 #   SFT_EVAL_DATA     eval manifest (held-out episodes from the same prep)
 #
