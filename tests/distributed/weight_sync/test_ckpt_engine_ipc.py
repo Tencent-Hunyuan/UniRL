@@ -17,7 +17,9 @@ class _FakeBackend:
 
 
 def _make_sync(*, cfg: SimpleNamespace, tp_size: int = 1, rank_info: RankInfo | None = None) -> CkptEngineIPCWeightSync:
-    rollout = SimpleNamespace(cfg=cfg, _tp_size=tp_size, _backend=SimpleNamespace(requires_main_thread_ipc_receiver=False))
+    rollout = SimpleNamespace(
+        cfg=cfg, _tp_size=tp_size, _backend=SimpleNamespace(requires_main_thread_ipc_receiver=False)
+    )
     sync = CkptEngineIPCWeightSync(backend=_FakeBackend(), rollout=rollout, timeout_s=5)
     sync.rank_info = rank_info
     return sync
@@ -59,7 +61,9 @@ def test_reject_rankinfo_tp_mismatch() -> None:
 
 
 def test_accepts_matching_http_layout() -> None:
-    sync = _make_sync(cfg=SimpleNamespace(dp_size=1, engine_kwargs={}), tp_size=8, rank_info=RankInfo(tp_size=8, tp_rank=0))
+    sync = _make_sync(
+        cfg=SimpleNamespace(dp_size=1, engine_kwargs={}), tp_size=8, rank_info=RankInfo(tp_size=8, tp_rank=0)
+    )
     sync._validate_topology(8)
 
 

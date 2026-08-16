@@ -1,21 +1,4 @@
-"""Weight transfer via ZMQ + CUDA IPC using the ``checkpoint_engine`` protocol.
-
-This sender is compatible with SGLang's ``update_weights_from_ipc`` path, which
-delegates to ``checkpoint_engine.worker.update_weights_from_ipc``. The protocol
-differs from verl's ``BucketedWeightSender`` in several ways (see plan):
-
-- **Single reusable buffer**: REQ/REP waits for each receiver before reuse
-- **Metadata as ``list[dict]``**: NOT ``dict[str, dict]`` with ``is_last``
-- **Termination**: two ``None`` signals (release + post_hook), not ``is_last``
-- **No per-tensor IPC handle**: all tensors must fit in the bucket buffer
-- **Per-GPU sender**: normally one local buffer and one REQ socket per train rank
-
-The sender creates one or more REQ sockets, allocates one reusable bucket
-buffer on the trainer's GPU, and sends the same IPC handle + bucket
-metadata to its receiver. Each TP rank's scheduler subprocess creates a REP
-socket, rebuilds the buffer view via IPC, and calls ``model.load_weights()``
-(which does TP sharding internally).
-"""
+"""Checkpoint-engine ZMQ + CUDA IPC sender compatible with SGLang ``update_weights_from_ipc``."""
 
 from __future__ import annotations
 
@@ -29,17 +12,7 @@ from torch.multiprocessing.reductions import reduce_tensor
 
 
 class CkptEngineWeightSender:
-    """Send model weights via the checkpoint_engine ZMQ + CUDA IPC protocol.
-
-    Creates one REQ socket per supplied handle, allocates a reusable bucket,
-    and sends its IPC handle + bucket metadata to the receiver. In UniRL each
-    TP train rank supplies only its colocated rollout GPU, so transfer memory
-    and PCIe traffic are distributed instead of concentrated on TP rank zero.
-
-    Args:
-        zmq_handles: Dict mapping device UUID to ZMQ socket path.
-        bucket_size_mb: Communication buffer size in MB.
-    """
+    """Send full weights over one REQ socket per colocated SGLang scheduler."""
 
     def __init__(
         self,
@@ -60,15 +33,7 @@ class CkptEngineWeightSender:
         self._abort_sent = False
 
     def prepare(self) -> None:
-        """Allocate/export the CUDA buffer before receivers start.
-
-        Socket creation is deliberately NOT done here: pyzmq sockets are not
-        thread-safe, and the NativeBackend path runs ``send_weights`` on a
-        daemon thread while ``prepare`` runs on the engine-owning thread.
-        Sockets are created lazily at the top of :meth:`send_weights` so each
-        socket's full lifecycle (create/bind/send/recv/close) is confined to
-        the one thread that sends.
-        """
+        """Allocate the CUDA IPC buffer; sockets are created later on the sender thread."""
         self._allocate_buffer()
 
     def send_weights(
@@ -76,11 +41,7 @@ class CkptEngineWeightSender:
         weights: Iterator[Tuple[str, "object"]],
         consensus: Callable[[Optional[BaseException], str], None] | None = None,
     ) -> None:
-        """Send weights to all TP rank receivers.
-
-        Args:
-            weights: Generator yielding (name, tensor) pairs.
-        """
+        """Send ``(name, tensor)`` pairs to every supplied receiver."""
         weight = None
         try:
             if self.buffer is None:

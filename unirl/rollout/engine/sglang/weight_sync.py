@@ -85,12 +85,7 @@ class WeightSync:
         zmq_handles: Dict[str, str],
         flush_cache: bool = True,
     ) -> None:
-        """Push full weights via ZMQ + CUDA IPC (checkpoint_engine protocol).
-
-        The backend fans ``zmq_handles`` to all scheduler subprocesses; each
-        creates a REP socket and receives weights from the trainer's REQ socket.
-        Zero extra GPU memory on the receiver (tensor views into shared buffer).
-        """
+        """Push full weights via ZMQ + CUDA IPC (checkpoint-engine protocol)."""
         if not zmq_handles:
             raise ValueError("zmq_handles must be non-empty for IPC update")
         self._backend.update_from_ipc(zmq_handles=dict(zmq_handles), flush_cache=flush_cache)

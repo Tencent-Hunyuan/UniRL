@@ -1,24 +1,4 @@
-"""Full-weight IPC sync for SGLang via the ``checkpoint_engine`` protocol.
-
-Colocate-only: the trainer and SGLang engine share the same node. Uses
-``checkpoint_engine.worker.update_weights_from_ipc`` (ZMQ REQ/REP + CUDA IPC
-shared buffer) for zero-copy weight transfer — the receiver reconstructs
-tensor **views** into the shared buffer and calls ``model.load_weights()``
-in-place, so no extra GPU memory is allocated on the rollout side.
-
-This is the SGLang analogue of :class:`~unirl.distributed.weight_sync.full.ipc.IPCWeightSync`
-(which is vLLM-Omni only). The protocols differ fundamentally — see
-:class:`~unirl.distributed.weight_sync.transfer.ckpt_engine_transfer.CkptEngineWeightSender`.
-
-Thread discipline:
-    - **NativeBackend**: ``engine.update_weights_from_ipc()`` calls
-      ``loop.run_until_complete()`` which MUST run on the engine's thread.
-      So the receiver runs in the **main thread** and the sender in a
-      **daemon thread** (inverted from IPCWeightSync).
-    - **HTTPBackend**: ``update_from_ipc`` is a blocking HTTP POST (thread-safe).
-      The receiver runs in a **daemon thread** and the sender in the
-      **main thread** (same as IPCWeightSync).
-"""
+"""Colocate SGLang full-weight sync via checkpoint-engine ZMQ + CUDA IPC."""
 
 from __future__ import annotations
 
@@ -34,16 +14,7 @@ logger = logging.getLogger(__name__)
 
 
 class CkptEngineIPCWeightSync(FullWeightSync):
-    """Colocate full-weight sync for SGLang via checkpoint_engine IPC.
-
-    Uses SGLang's ``update_weights_from_ipc`` API (ZMQ + CUDA IPC shared buffer)
-    for zero-copy weight transfer. Every trainer rank allocates one reusable
-    bucket on its GPU, shares it via CUDA IPC, and sends bucket metadata over
-    ZMQ. Each SGLang
-    scheduler subprocess (one per TP rank) creates a REP socket, reconstructs
-    tensor views into the shared buffer, and calls ``load_weights`` (which
-    handles TP sharding internally).
-    """
+    """Colocate full-weight sync for SGLang via checkpoint-engine IPC."""
 
     def __init__(
         self,
@@ -76,13 +47,7 @@ class CkptEngineIPCWeightSync(FullWeightSync):
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def sync(self) -> None:
-        """Push full weights to the SGLang engine via checkpoint_engine IPC.
-
-        Runs on every train rank (BROADCAST); the ``_iter_full_tensors`` walk
-        all-gathers each FSDP shard in lockstep. Every TP rank sends through a
-        buffer allocated on its own GPU to the colocated SGLang scheduler. The
-        TP-zero rank additionally starts the engine-side receiver fan-out.
-        """
+        """Push full weights to every colocated SGLang TP scheduler."""
         ri = self.rank_info
         rank = ri.rank if ri is not None else 0
         is_tp_zero = ri is None or ri.tp_rank == 0
@@ -286,12 +251,7 @@ class CkptEngineIPCWeightSync(FullWeightSync):
         return uuid if uuid.startswith("GPU-") else f"GPU-{uuid}"
 
     def _build_zmq_handles(self, tp_size: int) -> Dict[str, str]:
-        """Build the ``{device_uuid: zmq_socket_path}`` dict for all TP ranks.
-
-        Distributed workers exchange their current CUDA UUID and hostname, so
-        cluster-global DevicePool IDs are never mistaken for node-local GPU
-        ordinals.
-        """
+        """Build ``{device_uuid: zmq_socket_path}`` for this TP group."""
         import socket
 
         import torch.distributed as dist

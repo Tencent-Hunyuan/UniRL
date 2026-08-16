@@ -493,13 +493,7 @@ class NativeBackend:
         zmq_handles: Dict[str, str],
         flush_cache: bool = True,
     ) -> None:
-        """Update weights via ZMQ + CUDA IPC (checkpoint_engine protocol).
-
-        Calls SGLang's public ``Engine.update_weights_from_ipc``, which fans
-        the ``zmq_handles`` dict to all scheduler subprocesses. Each scheduler
-        looks up its GPU UUID, creates a REP socket, and receives weights from
-        the trainer's REQ socket. Blocks until all TP workers finish loading.
-        """
+        """Update weights via SGLang ``update_weights_from_ipc`` (ZMQ + CUDA IPC)."""
         self._require_alive("update_from_ipc")
         result = self._engine.update_weights_from_ipc(
             zmq_handles=zmq_handles,
