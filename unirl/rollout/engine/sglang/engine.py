@@ -132,6 +132,7 @@ class SGLangRolloutEngine(BaseRolloutEngine):
             self._backend = NativeBackend.boot(
                 intent,
                 concurrency=concurrency,
+                cuda_visible_devices=self._tp_visible_devices,
             )
         else:
             bind_host = str(engine_kwargs.get("host") or config.host or "0.0.0.0")
@@ -374,13 +375,14 @@ class SGLangRolloutEngine(BaseRolloutEngine):
         track_prefix: str = "",
     ) -> None:
         """Update weights via ZMQ + CUDA IPC (checkpoint_engine protocol)."""
-        del track_prefix
+        del track_prefix  # single-engine; ComposedRolloutEngine demuxes first
         if not self._is_tp_zero:
             return
         self._weight_sync.update_weights_from_ipc(
             zmq_handles=zmq_handles,
             flush_cache=flush_cache,
         )
+        self._version += 1
 
 
 __all__ = ["SGLangRolloutEngine"]

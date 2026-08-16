@@ -129,7 +129,8 @@ class CkptEngineWeightSender:
                         "offset": offset,
                     }
                 )
-                self.buffer[offset : offset + weight_nbytes].copy_(weight.view(-1).view(torch.uint8), non_blocking=True)
+                payload = weight.detach().contiguous().view(-1).view(torch.uint8)
+                self.buffer[offset : offset + weight_nbytes].copy_(payload, non_blocking=True)
                 offset += weight_nbytes
                 weight = None
 

@@ -92,25 +92,29 @@ class CkptEngineIPCWeightSync(FullWeightSync):
         zmq_handles = self._build_zmq_handles(tp_size)
         sender, local_uuid, tp_rank = self._prepare_local_sender(zmq_handles, tp_size)
 
-        if not is_tp_zero:
-            self._run_sender(sender)
-            logger.debug(
-                "[CkptEngine-IPC] rank %s: pushed weights from local TP GPU %s (tp_rank=%s/%s)",
-                rank,
-                local_uuid,
-                tp_rank,
-                ri.tp_size if ri else 1,
-            )
-            return
-
-        logger.info(
-            "[CkptEngine-IPC] rank %s: pushing full weights to %d TP rank(s) via checkpoint_engine IPC",
-            rank,
-            tp_size,
-        )
-        self._run_exchange(sender, zmq_handles)
+        error: Optional[BaseException] = None
+        try:
+            if not is_tp_zero:
+                self._run_sender(sender)
+                logger.debug(
+                    "[CkptEngine-IPC] rank %s: pushed weights from local TP GPU %s (tp_rank=%s/%s)",
+                    rank,
+                    local_uuid,
+                    tp_rank,
+                    ri.tp_size if ri else 1,
+                )
+            else:
+                logger.info(
+                    "[CkptEngine-IPC] rank %s: pushing full weights to %d TP rank(s) via checkpoint_engine IPC",
+                    rank,
+                    tp_size,
+                )
+                self._run_exchange(sender, zmq_handles)
+                logger.info("[CkptEngine-IPC] rank %s: full weight sync completed", rank)
+        except BaseException as exc:
+            error = exc
+        self._sender_consensus(error, "complete")
         self.weight_version += 1
-        logger.info("[CkptEngine-IPC] rank %s: full weight sync completed", rank)
 
     def _validate_topology(self, tp_size: int) -> None:
         """Reject SGLang layouts that the checkpoint-engine route cannot map."""
@@ -126,9 +130,12 @@ class CkptEngineIPCWeightSync(FullWeightSync):
                 f"the colocated rollout tp_size={tp_size}."
             )
         cfg = getattr(self._rollout, "cfg", None)
-        if int(getattr(cfg, "dp_size", None) or 1) != 1:
-            raise NotImplementedError("CkptEngineIPCWeightSync does not support SGLang server-level dp_size>1")
         engine_kwargs = dict(getattr(cfg, "engine_kwargs", None) or {})
+        server_dp = getattr(cfg, "dp_size", None)
+        if server_dp is None:
+            server_dp = engine_kwargs.get("dp_size")
+        if int(server_dp or 1) != 1:
+            raise NotImplementedError("CkptEngineIPCWeightSync does not support SGLang server-level dp_size>1")
         if any(key.startswith("speculative") for key in engine_kwargs):
             raise NotImplementedError("CkptEngineIPCWeightSync does not support SGLang speculative decoding workers")
 
@@ -136,12 +143,15 @@ class CkptEngineIPCWeightSync(FullWeightSync):
         """Select this TP rank's colocated endpoint and allocate its sender."""
         ri = self.rank_info
         tp_rank = int(ri.tp_rank) if ri is not None else 0
-        try:
-            local_uuid, local_path = list(zmq_handles.items())[tp_rank]
-        except IndexError as exc:
-            raise RuntimeError(
-                f"CkptEngineIPCWeightSync: tp_rank={tp_rank} has no IPC handle in a tp_size={tp_size} rollout group"
-            ) from exc
+        local_uuid = self._get_current_gpu_uuid()
+        local_path = zmq_handles.get(local_uuid)
+        if local_path is None:
+            try:
+                local_uuid, local_path = list(zmq_handles.items())[tp_rank]
+            except IndexError as exc:
+                raise RuntimeError(
+                    f"CkptEngineIPCWeightSync: tp_rank={tp_rank} has no IPC handle in a tp_size={tp_size} rollout group"
+                ) from exc
         return self._prepare_sender({local_uuid: local_path}), local_uuid, tp_rank
 
     def _run_exchange(self, sender, zmq_handles: Dict[str, str]) -> None:
@@ -155,6 +165,7 @@ class CkptEngineIPCWeightSync(FullWeightSync):
                 self._rollout.update_weights_from_ipc(
                     zmq_handles=zmq_handles,
                     flush_cache=self._flush_cache,
+                    track_prefix=self._track_prefix,
                 )
             except Exception as exc:
                 recv_error["exc"] = exc
