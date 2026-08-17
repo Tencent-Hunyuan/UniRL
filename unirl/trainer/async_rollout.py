@@ -144,10 +144,6 @@ class AsyncRolloutTrainerMixin:
         """Run the trainer's evaluation at a synced, empty rollout boundary."""
         raise NotImplementedError
 
-    def _refill_before_score(self) -> bool:
-        """Whether this trainer may launch replacement work before scoring."""
-        return False
-
     def _score_completed(self, rollout_id: int, completed: "Sample") -> "Sample":
         for attempt in range(2):
             try:
