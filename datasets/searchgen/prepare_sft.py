@@ -41,7 +41,14 @@ def _read_jsonl(path: str) -> Iterable[Dict[str, Any]]:
 
 def _full_trace(trace: Dict[str, Any]) -> bool:
     av = trace.get("artifact_availability") or {}
-    return all(av.get(k) for k in ("s1_analysis", "s1d1_search_results", "s2_reference_selection", "s3_refined_prompt"))
+    required = (
+        "s1_analysis",
+        "s1d1_search_results",
+        "s2_reference_selection",
+        "s3_refined_prompt",
+        "s4_generation_manifest",
+    )
+    return all(av.get(k) for k in required)
 
 
 class CandidateIndex:
@@ -82,8 +89,15 @@ def build_trace_conversation(
     queries = [q for q in trace.get("s1d1_search_queries", []) if q.get("query_id")]
     if not queries:
         return None
-    selections = [s for s in trace.get("s2_reference_selection", []) if s.get("entry_id") and s.get("query_id")]
+    # "Reference Image N" numbering follows s4 ordered_references (see README.md);
+    # any unresolved or reordered entry would shift it, so drop the trace whole.
+    selections = (trace.get("s4_generation_manifest") or {}).get("ordered_references") or []
     if not selections:
+        return None
+    if any(
+        not s.get("query_id") or not s.get("entry_id") or s.get("unresolved_reason") or s.get("index") != i
+        for i, s in enumerate(selections)
+    ):
         return None
 
     selected_by_query: Dict[str, set] = defaultdict(set)

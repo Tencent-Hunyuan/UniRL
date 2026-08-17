@@ -108,13 +108,20 @@ Each trace yields three records — `s1_analysis`, `s2_selection`, `s3_refine`.
 - **Image-only candidates.** The candidate SQL filters `search_type = 'image'` and
   `download_status = 'downloaded'`. Web/HTML results have no pixels to interleave, and including
   them silently produced text-only "candidate" turns.
+- **Reference numbering comes from `s4_generation_manifest.ordered_references`.** That list is
+  the numbering space the release actually cites: `s3_refined_prompt.selected_reference_indices`
+  matches its `used_in_refinement` positions on every checkable trace, whereas
+  `s2_reference_selection` rows may lack `query_id`/`entry_id` (unresolved placeholders and
+  partially-resolved rows), and `query_index` is not a reliable recovery key — it disagrees with
+  the s1d1 slot's `query_id` on ~13% of rows. Filtering s2 rows and renumbering the survivors
+  silently shifted the `Reference Image N` citations on ~2.6% of rendered traces.
 - **Selections are re-indexed against OUR presentation.** The release does not preserve the
-  original candidate ordering the reasoner saw, but it does preserve the selected entry
-  *identity*. Candidates are presented as `Image <global position>` and kept references as
-  `Reference Image <selection order>`; the s2 target welds the two numbering spaces explicitly
-  (`Selected Image 3 as Reference Image 1`) so the s3 target's `Reference Image N` citations
-  stay resolvable. A trace whose selection cannot be located among its shown candidates is
-  dropped rather than renumbered.
+  original candidate ordering the reasoner saw, but it does preserve the reference *identity*.
+  Candidates are presented as `Image <global position>` and kept references as
+  `Reference Image <ordered_references position>`; the s2 target welds the two numbering spaces
+  explicitly (`Selected Image 3 as Reference Image 1`) so the s3 target's `Reference Image N`
+  citations stay resolvable. A trace with an unresolved or reordered reference entry, or whose
+  reference cannot be located among its shown candidates, is dropped rather than renumbered.
 - **448 px long side (~256 vision tokens/image).** A 3–5 query trace with 3–4 candidates each
   then fits `max_prompt_length: 8192`. Overlong histories **raise** at the chat-template stage —
   truncating would desync the vision spans — so re-cook with fewer/smaller candidates instead.
@@ -131,5 +138,7 @@ bash examples/run_experiment_single_node.sh sft/qwen_vl_agent_sft
 ```
 
 Swap `sft/qwen_vl_agent_sft` for `sft/bagel_agent_sft` to train the BAGEL und/AR experts on the
-same manifests. Bagel has no tool template: manifests carrying `tools`, `role="tool"` turns, or
-tool-call targets are rejected by `BagelChatTemplateStage` rather than rendered as bare text.
+same manifests. Neither backbone has a tool template: manifests carrying `tools`, `role="tool"`
+turns, or tool-call targets are rejected by `BagelChatTemplateStage` and
+`QwenVLChatTemplateStage` rather than rendered lossily (the stock Qwen2.5-VL chat template
+references neither `tools` nor `tool_calls`, so they would otherwise vanish silently).
