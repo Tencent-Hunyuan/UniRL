@@ -37,16 +37,21 @@ class _VideoSFTPipeline(Protocol):
     ) -> EncodeStage[Videos, ImageLatentCondition]: ...
 
 
+def _require_local_uri(uri: str, *, context: str) -> str:
+    """Reject remote media URIs — builders only read local/shared paths."""
+    if uri.startswith(("http://", "https://", "s3://", "gs://")):
+        raise NotImplementedError(
+            f"{context}: remote media URIs are not supported yet ({uri!r}); "
+            "download to local/shared storage and reference the path."
+        )
+    return uri
+
+
 def _load_pil_image(uri: str):
     """Load one local image as RGB PIL (worker-side; driver never touches pixels)."""
     from PIL import Image as PILImage
 
-    if uri.startswith(("http://", "https://", "s3://", "gs://")):
-        raise NotImplementedError(
-            f"SupervisedTrackBuilder: remote media URIs are not supported yet ({uri!r}); "
-            "download to local/shared storage and reference the path."
-        )
-    return PILImage.open(uri).convert("RGB")
+    return PILImage.open(_require_local_uri(uri, context="SupervisedTrackBuilder")).convert("RGB")
 
 
 def _media_uris(record: Record, *, role: str, modality: Optional[str] = None) -> List[str]:

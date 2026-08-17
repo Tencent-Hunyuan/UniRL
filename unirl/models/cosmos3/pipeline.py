@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import inspect
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Optional, Sequence
@@ -19,7 +18,6 @@ from .packing import (
     pack_joint_sequence,
     pad_action_chunk,
     resolution_tier,
-    sample_train_sigma,
 )
 
 
@@ -112,24 +110,17 @@ class Cosmos3JointStage:
         input_ids: Sequence[int],
         x0: torch.Tensor,
         fps: float,
-        flow_shift: float,
+        sigma: torch.Tensor,
         actions: Optional[torch.Tensor],
         generator: Optional[torch.Generator],
     ) -> Cosmos3JointPrediction:
-        """Noise one sample, run one packed transformer forward, and align targets."""
+        """Noise one sample at ``sigma`` (fp32 scalar in (0,1)), run one packed forward, align targets."""
         cfg = self.config
         if x0.ndim != 4:
             raise ValueError(f"Cosmos3JointStage: x0 must be [C,T,H,W], got {tuple(x0.shape)}")
         x0 = x0.unsqueeze(0).float()
         condition_frames = [0] if (cfg.condition_on_first_frame and x0.shape[2] > 1) else []
-        sigma = sample_train_sigma(
-            time_dist=cfg.time_dist,
-            logitnormal_mean=cfg.logitnormal_mean,
-            logitnormal_std=cfg.logitnormal_std,
-            shift=flow_shift,
-            generator=generator,
-            device=x0.device,
-        )
+        sigma = sigma.to(device=x0.device, dtype=torch.float32).reshape(())
         x_t, vision_target = noise_vision_latents(x0, sigma, condition_frames, generator)
 
         action_kwargs: dict[str, Any] = {}
@@ -167,18 +158,21 @@ class Cosmos3JointStage:
             compute_dtype=self.bundle.dtype,
             **action_kwargs,
         )
-        timestep = float(sigma.item()) * float(self.pipe.scheduler.config.num_train_timesteps)
+        # Inference conditions on int64-truncated scheduler timesteps (set_timesteps
+        # casts every branch via .astype(np.int64); the pipeline fills torch.full with
+        # t.item()); mirror that exactly instead of the fractional sigma*T.
+        timestep = int(float(sigma.item()) * float(self.pipe.scheduler.config.num_train_timesteps))
         kwargs["vision_timesteps"] = torch.full(
             (meta["num_noisy_vision_tokens"],),
             timestep,
-            dtype=torch.float32,
+            dtype=torch.int64,
             device=x0.device,
         )
         if actions is not None:
             kwargs["action_timesteps"] = torch.full(
                 (meta["num_noisy_action_tokens"],),
                 timestep,
-                dtype=torch.float32,
+                dtype=torch.int64,
                 device=x0.device,
             )
 
@@ -188,7 +182,9 @@ class Cosmos3JointStage:
                 f"{tuple(x_t.shape)} cond_frames={condition_frames}). "
                 "condition_on_first_frame with a single latent frame leaves an empty GEMM."
             )
-        preds_vision, _preds_sound, preds_action = self._forward_transformer(kwargs)
+        # diffusers-0.39 Cosmos3OmniTransformer.forward has no return_dict and always
+        # returns the (vision, sound, action) prediction lists.
+        preds_vision, _preds_sound, preds_action = self.bundle.transformer(**kwargs)
         if not preds_vision:
             raise RuntimeError("Cosmos3JointStage: transformer returned no vision prediction.")
         vision_pred = preds_vision[0]
@@ -227,24 +223,6 @@ class Cosmos3JointStage:
             action_target=action_target,
             sigma=sigma,
         )
-
-    def _forward_transformer(self, kwargs: dict[str, Any]) -> tuple[Any, Any, Any]:
-        """Call the packed forward as a prediction 3-tuple across supported diffusers versions."""
-        call_kwargs = dict(kwargs)
-        if "return_dict" in inspect.signature(self.bundle.transformer.forward).parameters:
-            call_kwargs["return_dict"] = False
-        output = self.bundle.transformer(**call_kwargs)
-        if isinstance(output, (tuple, list)) and len(output) >= 3:
-            return output[0], output[1], output[2]
-        sample = getattr(output, "sample", None)
-        sound = getattr(output, "sound", None)
-        action = getattr(output, "action", None)
-        if sample is None:
-            raise RuntimeError(
-                "Cosmos3JointStage: transformer output is neither a 3-tuple nor a "
-                f"Cosmos3OmniTransformerOutput, got {type(output).__name__}."
-            )
-        return sample, sound, action
 
 
 class Cosmos3Pipeline(Pipeline):

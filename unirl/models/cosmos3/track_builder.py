@@ -1,4 +1,4 @@
-"""Worker-side Cosmos3 video and action supervised track builder."""
+"""Worker-side Cosmos3 video/action supervised track builder (why per-model: README.md)."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import torch
 
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.models.cosmos3.conditions import Cosmos3SFTCondition
-from unirl.train.sft.track_builder import SupervisedTrackBuilder
+from unirl.train.sft.track_builder import SupervisedTrackBuilder, _media_uris, _require_local_uri
 from unirl.types.sample import Part
 from unirl.types.segments.latent import make_video_segment
 
@@ -16,22 +16,14 @@ Record = Dict[str, Any]
 
 
 def _media_uri(record: Record, *, modality: str, role: str) -> str:
-    matches: List[str] = []
-    for ref in record.get("media_refs", []) or []:
-        ref_modality = getattr(ref, "modality", None) if not isinstance(ref, dict) else ref.get("modality")
-        ref_role = getattr(ref, "role", None) if not isinstance(ref, dict) else ref.get("role")
-        ref_uri = getattr(ref, "uri", None) if not isinstance(ref, dict) else ref.get("uri")
-        if ref_modality == modality and ref_role == role and ref_uri:
-            matches.append(str(ref_uri))
+    """The record's single ``modality``/``role`` media URI (local path required)."""
+    matches = _media_uris(record, role=role, modality=modality)
     if len(matches) != 1:
         raise ValueError(
             f"Cosmos3SupervisedTrackBuilder: sample {record.get('sample_id')!r} needs exactly one "
             f"{modality!r}/{role!r} media ref; found {len(matches)}."
         )
-    uri = matches[0]
-    if uri.startswith(("http://", "https://", "s3://", "gs://")):
-        raise NotImplementedError(f"Cosmos3 SFT requires a local/shared tensor path, got {uri!r}.")
-    return uri
+    return _require_local_uri(matches[0], context="Cosmos3SupervisedTrackBuilder")
 
 
 class Cosmos3SupervisedTrackBuilder(SupervisedTrackBuilder):

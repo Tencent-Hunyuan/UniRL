@@ -3,22 +3,19 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 
 import torch
 
 from unirl.models.cosmos3.config import Cosmos3SFTConfig
 from unirl.models.types.bundle import Bundle
+from unirl.models.types.meta_init import build_meta_init_transformer
 from unirl.utils.dtypes import parse_torch_dtype
 
 logger = logging.getLogger(__name__)
 
-# Full-name patterns of the understanding (AR/text) parameter set inside
-# Cosmos3OmniTransformer. Everything else — add_{q,k,v}_proj / to_add_out,
-# mlp_moe_gen.*, *_moe_gen norms, proj_in/proj_out, time_embedder, and the
-# action/audio modality heads — is the generation stream and stays trainable.
-# NB ``to_out`` must not swallow ``to_add_out`` and ``norm.`` must not swallow
-# ``norm_moe_gen.`` — hence the trailing ``\.`` anchors.
+# Understanding (AR/text) parameter set; trailing ``\.`` anchors are load-bearing (README # Gotchas).
 _UND_PARAM_PATTERNS = (
     r"^embed_tokens\.",
     r"^lm_head\.",
@@ -45,18 +42,6 @@ def _import_diffusers_classes():
             "Cosmos3OmniPipeline first shipped in 0.39.0)."
         ) from exc
     return Cosmos3OmniTransformer, AutoencoderKLWan, UniPCMultistepScheduler, Cosmos3OmniPipeline
-
-
-class _CastOutput(torch.nn.Module):
-    """Parameter-free wrapper casting a module's output dtype."""
-
-    def __init__(self, inner: torch.nn.Module, dtype: torch.dtype) -> None:
-        super().__init__()
-        self.inner = inner
-        self._dtype = dtype
-
-    def forward(self, *args, **kwargs):
-        return self.inner(*args, **kwargs).to(self._dtype)
 
 
 def _patch_rotary_emb_contiguous(rotary_emb: torch.nn.Module) -> None:
@@ -241,21 +226,23 @@ class Cosmos3Bundle(Bundle):
         Cosmos3OmniTransformer, AutoencoderKLWan, UniPCMultistepScheduler, _ = _import_diffusers_classes()
         path = config.pretrained_model_ckpt_path
         device = torch.device(config.device)
-        model_dtype = parse_torch_dtype(config.model_precision, field_name="model_precision")
         master_dtype = parse_torch_dtype(config.master_precision, field_name="master_precision")
         vae_dtype = parse_torch_dtype(config.vae_precision, field_name="vae_precision")
 
-        # Uniform fp32 storage gives the optimizer a stable master while FSDP's
-        # mixed-precision policy all-gathers bf16 compute copies. Upcasting only
-        # trainable params in the recipe would mix bf16/fp32 inside every MoT
-        # layer because the understanding stream is frozen, which FSDP2 rejects.
-        transformer = Cosmos3OmniTransformer.from_pretrained(
-            path,
-            subfolder="transformer",
-            torch_dtype=master_dtype,
-        )
-        transformer = transformer.to(device=device, dtype=master_dtype)
-        transformer.time_proj = _CastOutput(transformer.time_proj, model_dtype)
+        # Uniform master-dtype storage (fp32 storage + bf16 FSDP compute: README # Gotchas).
+        meta_init_state = None
+        if config.meta_init_transformer:
+            transformer_config = Cosmos3OmniTransformer.load_config(path, subfolder="transformer")
+            transformer, meta_init_state = build_meta_init_transformer(
+                lambda: Cosmos3OmniTransformer.from_config(transformer_config), dtype=master_dtype
+            )
+        else:
+            transformer = Cosmos3OmniTransformer.from_pretrained(
+                path,
+                subfolder="transformer",
+                torch_dtype=master_dtype,
+            )
+            transformer = transformer.to(device=device, dtype=master_dtype)
         if _needs_h20_cu128_workaround():
             logger.warning(
                 "Cosmos3Bundle: enabling H20 torch-2.10/cu128 cuBLAS workarounds; "
@@ -289,13 +276,17 @@ class Cosmos3Bundle(Bundle):
         if _needs_h20_cu128_workaround():
             _patch_frozen_dtensor_linears(transformer)
 
-        return cls(
+        bundle = cls(
             transformer=transformer,
             vae=vae,
             text_tokenizer=text_tokenizer,
             scheduler=scheduler,
             config=config,
         )
+        if config.meta_init_transformer:
+            bundle._transformer_weights_path = os.path.join(path, "transformer")
+            bundle._meta_init_state = meta_init_state
+        return bundle
 
     @property
     def flow_shift(self) -> float:

@@ -57,6 +57,7 @@ bundle:
     # compatibility recipe in fp32. Newer CUDA stacks may override both dtypes.
     model_precision: fp32
     master_precision: fp32
+    meta_init_transformer: true
     vae_precision: fp32
     freeze_understanding: true
     time_dist: logitnormal
@@ -102,6 +103,9 @@ backend:
 algorithm:
   _target_: unirl.algorithms.cosmos3_sft.Cosmos3JointFlowMatchSFT
   stage_attr: joint
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.cosmos3.conditions.Cosmos3SFTCondition
   eval_seed: 42
 
 stack:

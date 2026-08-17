@@ -17,27 +17,6 @@ def resolution_tier(height: int, width: int) -> str:
     return "720"
 
 
-def sample_train_sigma(
-    *,
-    time_dist: str,
-    logitnormal_mean: float,
-    logitnormal_std: float,
-    shift: float,
-    generator: Optional[torch.Generator],
-    device: torch.device,
-) -> torch.Tensor:
-    """Draw one training sigma in (0, 1) and apply the scheduler's shift warp."""
-    if time_dist == "uniform":
-        base = torch.rand((), generator=generator, device=device, dtype=torch.float32)
-    elif time_dist == "logitnormal":
-        z = torch.randn((), generator=generator, device=device, dtype=torch.float32)
-        base = torch.sigmoid(z * logitnormal_std + logitnormal_mean)
-    else:
-        raise ValueError(f"Unknown time_dist={time_dist!r}; expected 'logitnormal' or 'uniform'.")
-    sigma = shift * base / (1.0 + (shift - 1.0) * base)
-    return sigma.clamp(1e-4, 1.0 - 1e-4)
-
-
 def noise_vision_latents(
     x0: torch.Tensor,
     sigma: torch.Tensor,
@@ -162,5 +141,4 @@ __all__ = [
     "pack_joint_sequence",
     "pad_action_chunk",
     "resolution_tier",
-    "sample_train_sigma",
 ]

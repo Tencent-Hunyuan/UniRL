@@ -13,7 +13,7 @@ from unirl.types.conditions import Condition, Modality
 
 @dataclass
 class Cosmos3SFTCondition(Condition):
-    """Per-sample text and optional action inputs accompanying a clean video latent."""
+    """Per-sample packed text tokens + optional action targets beside a clean video latent (README.md)."""
 
     modality: ClassVar[Modality] = Modality.MULTIMODAL
 

@@ -2,18 +2,20 @@
 
 from __future__ import annotations
 
-import hashlib
 import math
-from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Type
 
 import torch
 import torch.nn.functional as F
 
-from unirl.models.cosmos3.conditions import Cosmos3SFTCondition
 from unirl.types.conditions import Condition
 from unirl.types.segments.latent import LatentSegment
 
 from .base import AlgorithmStepResult, StageAlgorithm
+from .sft import draw_shifted_sigma, sample_eval_seed
+
+# Cosmos3SFTConfig.time_dist -> draw_shifted_sigma timestep_sampling names.
+_TIME_DIST_TO_SAMPLING = {"logitnormal": "logit_normal", "uniform": "uniform"}
 
 
 class Cosmos3JointFlowMatchSFT(StageAlgorithm):
@@ -29,12 +31,14 @@ class Cosmos3JointFlowMatchSFT(StageAlgorithm):
         stage: Any = None,
         pipeline: Any = None,
         stage_attr: str = "joint",
+        conditions_cls: Optional[Type[Any]] = None,
         eval_seed: int = 42,
     ) -> None:
         super().__init__()
         if stage is None and pipeline is None:
             raise ValueError("Cosmos3JointFlowMatchSFT: either `stage` or `pipeline` must be provided.")
         self.stage = stage if stage is not None else getattr(pipeline, stage_attr)
+        self.conditions_cls = conditions_cls
         self.eval_seed = int(eval_seed)
 
     def compute_loss_and_backward(
@@ -98,10 +102,12 @@ class Cosmos3JointFlowMatchSFT(StageAlgorithm):
         sample_ids: Optional[Sequence[str]],
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
         condition = conditions.get("cosmos3")
-        if not isinstance(condition, Cosmos3SFTCondition):
+        if condition is None:
+            raise TypeError("Cosmos3JointFlowMatchSFT requires a conditions['cosmos3'] slot.")
+        if self.conditions_cls is not None and not isinstance(condition, self.conditions_cls):
             raise TypeError(
-                "Cosmos3JointFlowMatchSFT requires conditions['cosmos3'] to be "
-                f"Cosmos3SFTCondition, got {type(condition).__name__ if condition is not None else 'None'}."
+                f"Cosmos3JointFlowMatchSFT requires conditions['cosmos3'] to be "
+                f"{self.conditions_cls.__name__}, got {type(condition).__name__}."
             )
         if condition.input_ids is None or condition.cu_seqlens is None:
             raise ValueError("Cosmos3JointFlowMatchSFT: packed input_ids are missing.")
@@ -127,17 +133,33 @@ class Cosmos3JointFlowMatchSFT(StageAlgorithm):
         vision_rows: list[torch.Tensor] = []
         action_rows: list[torch.Tensor] = []
         sigma_rows: list[torch.Tensor] = []
-        cu = condition.cu_seqlens
         cfg = self.stage.config
+        sampling = _TIME_DIST_TO_SAMPLING.get(cfg.time_dist)
+        if sampling is None:
+            raise ValueError(f"Unknown time_dist={cfg.time_dist!r}; expected 'logitnormal' or 'uniform'.")
+        # One .item() sync per field, not per sample.
+        cu = condition.cu_seqlens.tolist()
+        fps_rows = condition.fps.tolist()
+        shift_rows = condition.flow_shifts.tolist()
         for i in range(batch):
-            start, end = int(cu[i].item()), int(cu[i + 1].item())
+            start, end = int(cu[i]), int(cu[i + 1])
             input_ids = condition.input_ids[start:end].tolist()
             generator = self._eval_generator(x0.device, sample_ids, i) if sample_ids is not None else None
+            sigma = draw_shifted_sigma(
+                1,
+                timestep_sampling=sampling,
+                logit_mean=cfg.logitnormal_mean,
+                logit_std=cfg.logitnormal_std,
+                shift=float(shift_rows[i]),
+                sigma_min=1e-4,
+                device=x0.device,
+                generator=generator,
+            )
             prediction = self.stage.predict_velocity(
                 input_ids=input_ids,
                 x0=x0[i],
-                fps=float(condition.fps[i].item()),
-                flow_shift=float(condition.flow_shifts[i].item()),
+                fps=float(fps_rows[i]),
+                sigma=sigma,
                 actions=condition.actions[i] if condition.actions is not None else None,
                 generator=generator,
             )
@@ -184,10 +206,8 @@ class Cosmos3JointFlowMatchSFT(StageAlgorithm):
         row: int,
     ) -> torch.Generator:
         key = str(sample_ids[row]) if sample_ids is not None and row < len(sample_ids) else str(row)
-        digest = hashlib.sha256(f"{self.eval_seed}:{key}".encode()).digest()
-        seed = int.from_bytes(digest[:8], "little") & 0x7FFF_FFFF_FFFF_FFFF
         generator = torch.Generator(device=device)
-        generator.manual_seed(seed)
+        generator.manual_seed(sample_eval_seed(self.eval_seed, key))
         return generator
 
 

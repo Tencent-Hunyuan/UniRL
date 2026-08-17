@@ -1,9 +1,10 @@
-"""Prepare LeRobot-v3 DROID windows as self-contained Cosmos3 SFT samples."""
+"""Prepare LeRobot-v3 ``lerobot/droid_100`` into Cosmos3 SFT debug samples (layout: unirl/models/cosmos3/README.md)."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from fractions import Fraction
 from typing import Dict, Iterator, List, Optional, Tuple
@@ -54,6 +55,11 @@ def load_meta(root: str) -> Tuple[dict, Dict[int, str], "object"]:
     return info, tasks, episodes
 
 
+def _is_missing(value) -> bool:
+    """True for absent metadata cells: None or float NaN (pandas missing marker)."""
+    return value is None or (isinstance(value, float) and math.isnan(value))
+
+
 def _episode_video_source(episode_row, camera: str) -> Tuple[int, int, float, float]:
     """(chunk_index, file_index, from_ts, to_ts) for one episode's camera stream."""
     prefix = f"videos/{camera}/"
@@ -61,7 +67,7 @@ def _episode_video_source(episode_row, camera: str) -> Tuple[int, int, float, fl
 
     def _get(*names, default=None):
         for name in names:
-            if name in row and row[name] is not None:
+            if name in row and not _is_missing(row[name]):
                 return row[name]
         return default
 
@@ -79,7 +85,7 @@ def decode_episode_frames(
     episode_row,
     num_frames_needed: int,
 ) -> np.ndarray:
-    """Decode one camera episode into uint8 ``[L,H,W,3]`` frames."""
+    """Decode one episode's ``[from_timestamp, to_timestamp)`` span for ``camera`` -> uint8 [L, H, W, 3]."""
     av = _require("av")
     chunk, file, from_ts, to_ts = _episode_video_source(episode_row, camera)
     template = info.get("video_path", "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4")
@@ -96,10 +102,12 @@ def decode_episode_frames(
         container.seek(int(seek_ts / float(stream.time_base or Fraction(1, 90000))), stream=stream, any_frame=False)
         eps = 1e-4
         for frame in container.decode(stream):
-            t = float(frame.pts * (stream.time_base or Fraction(1, 90000))) if frame.pts is not None else None
-            if t is not None and t < from_ts - eps:
+            if frame.pts is None:
+                continue  # unplaceable after the early seek; keeping it would shift frame<->action pairing
+            t = float(frame.pts * (stream.time_base or Fraction(1, 90000)))
+            if t < from_ts - eps:
                 continue
-            if to_ts is not None and t is not None and t >= to_ts - eps:
+            if to_ts is not None and t >= to_ts - eps:
                 break
             frames.append(frame.to_ndarray(format="rgb24"))
             if len(frames) >= num_frames_needed:
@@ -124,8 +132,9 @@ def iter_episode_rows(dataset_root: str, info: dict, episodes) -> Iterator[Tuple
     for _, row in episodes.iterrows():
         row = row.to_dict()
         ep_idx = int(row["episode_index"])
-        chunk = int(row.get("data/chunk_index", row.get("chunk_index", 0)) or 0)
-        file = int(row.get("data/file_index", row.get("file_index", 0)) or 0)
+        chunk_raw = next((row[k] for k in ("data/chunk_index", "chunk_index") if not _is_missing(row.get(k))), 0)
+        file_raw = next((row[k] for k in ("data/file_index", "file_index") if not _is_missing(row.get(k))), 0)
+        chunk, file = int(chunk_raw), int(file_raw)
         key = (chunk, file)
         if key not in data_files:
             rel = template.format(chunk_index=chunk, file_index=file, episode_chunk=chunk, episode_index=file)
@@ -178,12 +187,14 @@ def main() -> None:
         sums = actions.sum(0) if sums is None else sums + actions.sum(0)
         sq_sums = (actions**2).sum(0) if sq_sums is None else sq_sums + (actions**2).sum(0)
         count += actions.shape[0]
+    if sums is None or count == 0:
+        raise SystemExit(
+            f"no train episodes left after holding out --eval-episodes={args.eval_episodes} "
+            f"of {len(episode_indexes)} episodes; lower --eval-episodes."
+        )
     mean = sums / count
+    # Uniform z-normalization (gripper caveat: unirl/models/cosmos3/README.md).
     std = np.sqrt(np.maximum(sq_sums / count - mean**2, 1e-8))
-    # NOTE: every action channel is z-normalized uniformly here, including the
-    # near-binary gripper column. Fine for a debug BC run, but for faithful
-    # Policy-DROID reproduction the gripper should be left unnormalized (or
-    # min-max'd) rather than z-scored like the continuous cartesian dims.
     action_dim = int(len(mean))
     stats = {
         "mean": mean.tolist(),
@@ -205,6 +216,8 @@ def main() -> None:
 
     # Pass 2: window extraction.
     manifests = {"train": [], "eval": []}
+    skip_errors = (OSError, RuntimeError, _require("av").error.FFmpegError)
+    skipped_episodes = 0
     for ep_idx, row, steps in iter_episode_rows(dataset_root, info, episodes):
         split = "eval" if ep_idx in eval_set else "train"
         budget = args.max_eval_windows if split == "eval" else args.max_windows
@@ -223,7 +236,8 @@ def main() -> None:
         max_frame = max(starts) + args.num_frames
         try:
             clip_all = decode_episode_frames(dataset_root, info, args.camera, row, max_frame)
-        except Exception as exc:
+        except skip_errors as exc:  # missing/undecodable video only; code defects propagate
+            skipped_episodes += 1
             print(f"[skip] episode {ep_idx}: {exc}")
             continue
         for start in starts:
@@ -262,6 +276,8 @@ def main() -> None:
         if len(manifests["train"]) >= args.max_windows and len(manifests["eval"]) >= args.max_eval_windows:
             break
 
+    if skipped_episodes:
+        print(f"WARNING: skipped {skipped_episodes} episode(s) with missing/undecodable video.")
     for split, name in (("train", "manifest.jsonl"), ("eval", "eval_manifest.jsonl")):
         with open(os.path.join(args.root, name), "w") as fh:
             for record in manifests[split]:

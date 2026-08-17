@@ -1,4 +1,4 @@
-"""Cosmos3 omnimodal world-model SFT support."""
+"""Cosmos3 (NVIDIA omnimodal world model) SFT support; diffusers>=0.39 imports stay lazy (README.md)."""
 
 from unirl.models.cosmos3.bundle import Cosmos3Bundle
 from unirl.models.cosmos3.conditions import Cosmos3SFTCondition
