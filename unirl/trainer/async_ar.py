@@ -109,8 +109,7 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
         min_staleness = self._weight_sync_interval - 1
         if self._max_staleness < min_staleness:
             raise ValueError(
-                "buffer_max_staleness must be >= weight_sync_interval - 1; "
-                f"got {self._max_staleness} < {min_staleness}"
+                f"buffer_max_staleness must be >= weight_sync_interval - 1; got {self._max_staleness} < {min_staleness}"
             )
         if self._num_updates_per_batch < 1:
             raise ValueError(f"num_updates_per_batch must be >= 1, got {self._num_updates_per_batch}")
