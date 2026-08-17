@@ -109,12 +109,15 @@ Each trace yields three records — `s1_analysis`, `s2_selection`, `s3_refine`.
   `download_status = 'downloaded'`. Web/HTML results have no pixels to interleave, and including
   them silently produced text-only "candidate" turns.
 - **Reference numbering comes from `s4_generation_manifest.ordered_references`.** That list is
-  the numbering space the release actually cites: `s3_refined_prompt.selected_reference_indices`
-  matches its `used_in_refinement` positions on every checkable trace, whereas
-  `s2_reference_selection` rows may lack `query_id`/`entry_id` (unresolved placeholders and
-  partially-resolved rows), and `query_index` is not a reliable recovery key — it disagrees with
-  the s1d1 slot's `query_id` on ~13% of rows. Filtering s2 rows and renumbering the survivors
-  silently shifted the `Reference Image N` citations on ~2.6% of rendered traces.
+  the numbering space the release actually cites: on all 50,808 traces passing the converter's
+  resolvedness guard, `s3_refined_prompt.selected_reference_indices` is exactly
+  `1..len(ordered_references)`, and `used_in_refinement` — where set at all (it is unset on
+  ~25% of those traces) — marks exactly those positions. `s2_reference_selection` rows are not
+  usable for numbering: they may lack `query_id`/`entry_id` (unresolved placeholders and
+  partially-resolved rows), and their `query_index` indexes the **image-search-query
+  subsequence**, not the raw mixed web+image query list, so naive mixed-list indexing disagrees
+  on ~13% of rows. Filtering s2 rows and renumbering the survivors silently shifted the
+  `Reference Image N` citations on ~2.6% of rendered traces.
 - **Selections are re-indexed against OUR presentation.** The release does not preserve the
   original candidate ordering the reasoner saw, but it does preserve the reference *identity*.
   Candidates are presented as `Image <global position>` and kept references as
