@@ -239,6 +239,7 @@ class PendingHandleCall:
         *,
         targets: Optional[List[Any]] = None,
         collect_fn: Optional[Callable] = None,
+        leases: Optional[List[Any]] = None,
     ) -> None:
         self._handle = handle
         self._method_name = method_name
@@ -246,6 +247,7 @@ class PendingHandleCall:
         self._worker_local = worker_local
         self._targets = targets
         self._collect_fn = collect_fn
+        self._leases = leases
         self._consumed = False
         self._value: Any = None
 
@@ -266,12 +268,17 @@ class PendingHandleCall:
         collect_fn = self._collect_fn
         if collect_fn is None:
             _, _, collect_fn, _ = handle._method_configs[self._method_name]
-        self._value = handle._resolve_call(
-            collect_fn,
-            self._refs,
-            worker_local=self._worker_local,
-            targets=self._targets,
-        )
+        try:
+            self._value = handle._resolve_call(
+                collect_fn,
+                self._refs,
+                worker_local=self._worker_local,
+                targets=self._targets,
+            )
+        finally:
+            # Localized worker handles own the destination TensorStore entries.
+            # Keep them alive until the remote call has consumed its arguments.
+            self._leases = None
         self._consumed = True
         return self._value
 
@@ -315,6 +322,7 @@ class Slot:
             worker_local,
             targets=[worker],
             collect_fn=lambda _, results: results[0],
+            leases=shards,
         )
 
     def call(self, method_name: str, *args, **kwargs) -> Any:
@@ -537,7 +545,7 @@ class Handle:
                 call_id = f"{method_name}_{next(self._grad_call_counter)}"
                 input_metas = collect_leaves(args, TensorRef) + collect_leaves(tuple(kwargs.values()), TensorRef)
 
-            refs, worker_local = self._launch_call(
+            refs, worker_local, leases = self._launch_call(
                 method_name,
                 dispatch_mode,
                 dispatch_fn,
@@ -547,12 +555,15 @@ class Handle:
                 grad_mode=ctx is not None,
                 call_id=call_id,
             )
-            collected = self._resolve_call(
-                collect_fn,
-                refs,
-                worker_local=worker_local,
-                ray_get_timeout=ray_get_timeout,
-            )
+            try:
+                collected = self._resolve_call(
+                    collect_fn,
+                    refs,
+                    worker_local=worker_local,
+                    ray_get_timeout=ray_get_timeout,
+                )
+            finally:
+                leases.clear()
 
             if ctx is not None:
                 output_metas = collect_leaves(collected, TensorRef)
@@ -583,8 +594,8 @@ class Handle:
         *,
         grad_mode: bool,
         call_id: Optional[str],
-    ) -> Tuple[List, bool]:
-        """Launch a distributed call; returns ``(refs, worker_local)``."""
+    ) -> Tuple[List, bool, List]:
+        """Launch a distributed call and retain localized argument leases."""
         batch_size = infer_batch_size(args, kwargs)
         if (
             dispatch_mode in (Dispatch.DP_SCATTER, Dispatch.DP_SCATTER_HEAD)
@@ -598,7 +609,7 @@ class Handle:
         worker_local = issubclass(transport_cls, WorkerLocalTransport)
         shards = transport_cls.localize(shards, self.pool, self.device_ids, self.worker_ids)
         refs = execute_fn(method_name, shards, grad_mode=grad_mode, call_id=call_id)
-        return refs, worker_local
+        return refs, worker_local, shards
 
     def _resolve_call(
         self,
@@ -624,7 +635,7 @@ class Handle:
                 f"{method_name!r} is not a @distributed method of {_owning_class(self.role_cls).__name__}"
             ) from None
 
-        refs, worker_local = self._launch_call(
+        refs, worker_local, leases = self._launch_call(
             method_name,
             dispatch_mode,
             dispatch_fn,
@@ -634,7 +645,7 @@ class Handle:
             grad_mode=False,
             call_id=None,
         )
-        return PendingHandleCall(self, method_name, refs, worker_local)
+        return PendingHandleCall(self, method_name, refs, worker_local, leases=leases)
 
     def _execute_all(self, method_name: str, shards: List, grad_mode: bool = False, call_id=None) -> List:
         """Send RPC to all Workers."""
