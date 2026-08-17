@@ -253,5 +253,9 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
     def _async_wandb_extra(self) -> Dict[str, object]:
         return {"adv_normalization_scope": self.adv_normalization_scope}
 
+    def _refill_before_score(self) -> bool:
+        """Overlap AR generation with reward scoring and training."""
+        return True
+
     def _boundary_evaluate(self, rollout_id: int, *, initial: bool) -> None:
         self.evaluate(rollout_id=-1 if initial else rollout_id)

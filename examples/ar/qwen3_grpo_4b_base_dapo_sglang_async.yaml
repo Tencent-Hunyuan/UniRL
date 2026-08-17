@@ -26,7 +26,7 @@ num_rollouts: 800
 # train-bound, lower for generation-bound workloads (mind DIVISIBILITY above).
 train_fraction: 0.5
 
-max_inflight: 1          # concurrent generations
+max_inflight: 1          # concurrent generation calls
 weight_sync_interval: 1  # trained batches per publication; also configures the output-version lag filter
 
 # AIME eval every 10 rollouts + a pre-train baseline (rollout -1).

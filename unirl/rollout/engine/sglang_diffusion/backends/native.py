@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import dataclasses
 import logging
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -99,15 +98,10 @@ class SGLangBackend:
         *,
         local_mode: bool,
     ) -> "SGLangBackend":
-        """Filter intent against ServerArgs, build the generator, return the backend."""
+        """Resolve ServerArgs and model PipelineConfig intent, then build the generator."""
         rt = _import_sglang_runtime()
-        allowed = {f.name for f in dataclasses.fields(rt["ServerArgs"])}
-        server_kwargs = {k: v for k, v in server_intent.items() if k in allowed}
-
-        disable_autocast = server_kwargs.get("disable_autocast")
-        server_args = rt["ServerArgs"].from_kwargs(**server_kwargs)
-        if disable_autocast is not None:
-            server_args.disable_autocast = disable_autocast
+        # from_dict keeps PipelineConfig keys; filtering to ServerArgs fields drops them.
+        server_args = rt["ServerArgs"].from_dict(dict(server_intent))
 
         generator = rt["DiffGenerator"].from_pretrained(
             server_args=server_args,

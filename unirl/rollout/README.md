@@ -62,7 +62,10 @@ wrong objective.
   siblings, and applies the configured filter. Async batch trainers own training
   progress and publication cadence; the manager owns the published rollout version
   and preserves completed generations as FIFO batch chunks. `AgenticTrainer` collects
-  one complete barrier batch per step.
+  one complete barrier batch per step. Async AR refills the same manager immediately
+  after collection, so its existing progress thread overlaps the next generation
+  with scoring and training. Publication and durable boundaries still quiesce that
+  single manager before proceeding.
 
 **Extending it:** a new single-turn engine adds `engine/<name>/config.py` (a
 `BaseEngineConfig` whose `make_engine(**deps)` lazily imports and builds it) and
