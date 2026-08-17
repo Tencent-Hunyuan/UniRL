@@ -31,10 +31,13 @@ supports. There is no base class and no `isinstance` check:
 
 - **A stage that cannot render the WHOLE target must raise, not render part of
   it.** Manifests may carry tool-call targets — `unirl/utils/prepare_sft_agent.py`
-  supervises them by design — so a backbone with no tool-call template
-  (`BagelChatTemplateStage`) rejects the record instead of quietly tokenizing
-  only its text. Silently supervising the understood fraction makes the same
-  normalized record mean different things on different backbones.
+  supervises them by design — so a backbone with no tool-call template rejects
+  the record instead of quietly tokenizing only its text. `BagelChatTemplateStage`
+  has no tool rendering at all; `QwenVLChatTemplateStage` rejects too, because the
+  stock Qwen2.5-VL chat template references neither `tools` nor `tool_calls` and
+  the generic HF suffix path would drop them byte-invisibly. Silently supervising
+  the understood fraction makes the same normalized record mean different things
+  on different backbones.
 - **The conversation is authoritative for the system prompt.** `embed_messages`
   never injects a stage's configured `system_instruction`; that belongs to the
   legacy `embed` path. Both backbones behave the same way, so one

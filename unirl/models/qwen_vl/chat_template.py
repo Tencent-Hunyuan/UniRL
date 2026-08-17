@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Sequence, Union
 import torch
 
 from unirl.config.require import require
+from unirl.data.sft import tokenize_agent_target
 from unirl.models.types.conversations import build_vision_messages
 from unirl.types.conditions import TextTokenCondition
 from unirl.types.primitives import Images, Texts
@@ -96,16 +97,28 @@ class QwenVLChatTemplateStage:
         """Render OpenAI-style histories (interleaved text/image parts) as AR conditions."""
         if not conversations:
             raise ValueError("QwenVLChatTemplateStage.embed_messages: empty conversation batch.")
-        if tools is None:
-            tools = [None] * len(conversations)
-        if len(tools) != len(conversations):
+        if tools is not None and any(t for t in tools):
             raise ValueError(
-                "QwenVLChatTemplateStage.embed_messages: tools and conversations batch sizes differ "
-                f"({len(tools)} != {len(conversations)})."
+                "QwenVLChatTemplateStage.embed_messages: the Qwen2.5-VL chat template has no tool "
+                "rendering, so tool schemas would silently vanish from the prompt; agent records "
+                "with tools are unsupported on this backbone."
             )
         processor = self.bundle.processor
         per_sample_inputs = []
-        for messages, sample_tools in zip(conversations, tools):
+        for row, messages in enumerate(conversations):
+            for turn, message in enumerate(messages):
+                if message.get("role") == "tool":
+                    raise ValueError(
+                        f"QwenVLChatTemplateStage.embed_messages: conversation {row} message {turn} has "
+                        "role='tool' — the Qwen2.5-VL chat template has no tool template and would render "
+                        "it as a bare ChatML block the model never saw in training."
+                    )
+                if message.get("tool_calls"):
+                    raise ValueError(
+                        f"QwenVLChatTemplateStage.embed_messages: conversation {row} message {turn} carries "
+                        "tool_calls — the Qwen2.5-VL chat template has no tool-call rendering, so they "
+                        "would silently vanish from the prompt."
+                    )
             # transformers 4.5x ProcessorMixin iterates every message's content as a
             # part list (string content TypeErrors); 5.x normalizes internally. Wrap
             # strings as single text parts — byte-identical under the chat template.
@@ -115,7 +128,6 @@ class QwenVLChatTemplateStage:
             ]
             inputs = processor.apply_chat_template(
                 normalized,
-                tools=sample_tools,
                 add_generation_prompt=True,
                 tokenize=True,
                 return_dict=True,
@@ -123,6 +135,17 @@ class QwenVLChatTemplateStage:
             )
             per_sample_inputs.append(inputs)
         return self._pack_conditions(per_sample_inputs, truncate=False)
+
+    def tokenize_agent_target(self, record: Dict[str, Any]) -> List[int]:
+        """Reject tool-call targets the template cannot render, then HF-suffix-tokenize the final turn."""
+        target = record["messages"][-1]
+        if target.get("tool_calls"):
+            raise ValueError(
+                f"QwenVLChatTemplateStage.tokenize_agent_target: record {record.get('sample_id')!r} target "
+                "turn carries tool_calls — the Qwen2.5-VL chat template has no tool-call rendering, so only "
+                "its text would be supervised. Filter tool-call targets out of Qwen-VL manifests."
+            )
+        return tokenize_agent_target(record, tokenizer=self.bundle.tokenizer, enable_thinking=False)
 
     def _pack_conditions(self, per_sample_inputs: List[Any], *, truncate: bool) -> QwenVLARConditions:
         """Right-pad per-sample processor outputs into batched AR conditions."""
