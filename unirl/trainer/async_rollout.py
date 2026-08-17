@@ -136,6 +136,10 @@ class AsyncRolloutTrainerMixin:
         """Trainer-specific keys merged into the wandb run config."""
         return {}
 
+    def _refill_before_score(self) -> bool:
+        """Whether replacement rollout work may start before reward scoring."""
+        return False
+
     def _boundary_evaluate(self, rollout_id: int, *, initial: bool) -> None:
         """Run the trainer's evaluation at a synced, empty rollout boundary."""
         raise NotImplementedError
@@ -275,6 +279,36 @@ class AsyncRolloutTrainerMixin:
         carried = manager.quiesce(current_version=self._train_version)
         if require_empty and (carried or not manager.empty):
             raise RuntimeError("eval/checkpoint boundary requires an empty RolloutManager")
+        if not require_empty:
+            # A publication must not split one training batch across behavior
+            # policy versions. Partially generated trajectories cannot cross a
+            # publication at all, so finish their whole carry window. Otherwise
+            # finish only the pristine prefix needed to align the ready buffer.
+            started = any(
+                any(part.output_version is not None for part in sample.gen_parts())
+                or (sample.parts and sample.parts[-1].harness_status == "suspended")
+                for sample in carried
+            )
+            if started:
+                manager.finish(carried, current_version=self._train_version)
+                carried = []
+            _, ready_count = manager.counts
+            units_to_finish = (-ready_count) % self.batch_size
+            if units_to_finish:
+                if len(carried) < units_to_finish:
+                    raise RuntimeError(
+                        "cannot batch-align rollout carry before weight publication: "
+                        f"ready={ready_count}, carried={len(carried)}, batch_size={self.batch_size}"
+                    )
+                finishing = carried[:units_to_finish]
+                carried = carried[units_to_finish:]
+                manager.finish(finishing, current_version=self._train_version)
+            inflight_count, ready_count = manager.counts
+            if inflight_count or ready_count % self.batch_size:
+                raise RuntimeError(
+                    "rollout carry remained unaligned after completing the publication prefix: "
+                    f"inflight={inflight_count}, ready={ready_count}, batch_size={self.batch_size}"
+                )
         if needs_publish:
             manager.sync_weights(self.weight_sync, output_version=self._train_version)
         if carried:
@@ -311,9 +345,12 @@ class AsyncRolloutTrainerMixin:
             require_single_rollout_id=getattr(self, "_require_single_generation", False),
         )
 
+        scored = None
+        if not self._refill_before_score():
+            scored = self._score_completed(rollout_id, completed)
+
         # Consuming a batch releases capacity immediately. Refill before reward
-        # and training so rollout generation overlaps both, as in the original
-        # unit_continuous controller.
+        # for AR and before training for trainers that require reap-time scoring.
         inflight_count, ready_count = manager.counts
         units = boundary_launch_units(
             outstanding_units=inflight_count + ready_count,
@@ -327,7 +364,8 @@ class AsyncRolloutTrainerMixin:
         )
         self._submit_prompt_units(units)
 
-        scored = self._score_completed(rollout_id, completed)
+        if scored is None:
+            scored = self._score_completed(rollout_id, completed)
 
         return scored, output_version
 

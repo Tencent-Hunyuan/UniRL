@@ -94,6 +94,25 @@ class RolloutPool:
             self._completed.clear()
             return completed
 
+    def run_to_completion(self, tasks: List["Sample"]) -> List[_PendingUnit]:
+        """Run an isolated task prefix to completion while the pool is otherwise idle."""
+        with self._condition:
+            self._raise_if_unavailable()
+            if self._queue or self._running or self._completed or any(self._reserved):
+                raise RuntimeError("run_to_completion requires an idle RolloutPool")
+            for task in tasks:
+                self._queue.append((self._next_sequence, task))
+                self._next_sequence += 1
+            self._paused = False
+            self._condition.notify_all()
+            while (self._queue or self._running or any(self._reserved)) and self._failure is None:
+                self._condition.wait()
+            self._raise_if_failed()
+            self._paused = True
+            completed = list(self._completed)
+            self._completed.clear()
+            return completed
+
     @property
     def live(self) -> bool:
         with self._condition:
