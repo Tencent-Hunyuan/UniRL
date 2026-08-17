@@ -109,21 +109,7 @@ def _to_device(d: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
 
 @contextmanager
 def inference_dispatch_scope(model: Any) -> Iterator[None]:
-    """Force the MoT into ``eval()`` for the duration of a packed-INFERENCE call.
-
-    Every navit module routes ``forward_train`` vs ``forward_inference`` on
-    ``self.training``, so the packed-inference call shape (the
-    ``forward_cache_update_*`` prefills) dies with ``TypeError: forward_train() got an
-    unexpected keyword argument 'packed_query_sequence'`` when the module is in train
-    mode. And it IS: ``TrainStack.train_track`` puts the model in train mode before
-    the optimizer step, so the vllm_omni deferred-context REBUILD — which runs inside
-    ``replay`` — has to force eval itself, exactly as :func:`forward_flow` already
-    does for the velocity call.
-
-    Unlike ``forward_flow`` this restores the previous mode unconditionally: the
-    rebuild runs under ``no_grad``, so no activation-checkpointing recompute can land
-    back inside this scope during a later ``backward()``.
-    """
+    """Temporarily force packed-inference dispatch through ``eval()``."""
     lm = model.language_model
     was_training = lm.training
     if was_training:
@@ -135,41 +121,19 @@ def inference_dispatch_scope(model: Any) -> Iterator[None]:
             lm.train()
 
 
-# ---------------------------------------------------------------------------
-# Image-input context prefill (shared by rollout + replay)
-# ---------------------------------------------------------------------------
-
-#: Canonical BAGEL input-image transform geometry, ``(max_size, min_size, stride)``.
-#: Sizes follow the official inference setup (flow_grpo: vae 512/256, vit 490/112).
-#: NB: the ViT resize STRIDE must equal the SigLIP patch size (14) — ``patchify``
-#: asserts ``h % patch_size == 0``, so a stride that is not a multiple of 14 makes
-#: non-square image inputs crash. flow_grpo's stride 7 (half a patch) is that bug.
-BAGEL_VAE_TRANSFORM_GEOMETRY = (512, 256, 8)
-BAGEL_VIT_TRANSFORM_GEOMETRY = (490, 112, 14)
+BAGEL_VAE_TRANSFORM_GEOMETRY = (512, 256, 8)  # (max_size, min_size, stride)
+BAGEL_VIT_TRANSFORM_GEOMETRY = (490, 112, 14)  # Stride matches the SigLIP patch size.
 
 
 def build_image_transforms() -> Tuple[Any, Any]:
-    """The ``(vae_transform, vit_transform)`` pair every BAGEL image path must use.
-
-    ONE definition for both sides of the RL loop: :class:`BagelBundle` builds the
-    trainer's pair from here, and the vllm_omni worker pipeline builds its own from
-    here too. Were these to drift apart, rollout and replay would prefill differently
-    resized source images — the exact failure :func:`update_context_image` exists to
-    prevent.
-    """
+    """Build the shared ``(vae_transform, vit_transform)`` pair."""
     from .vendor.data.transforms import ImageTransform
 
     return ImageTransform(*BAGEL_VAE_TRANSFORM_GEOMETRY), ImageTransform(*BAGEL_VIT_TRANSFORM_GEOMETRY)
 
 
 def resize_input_image(bundle: Any, image: Any) -> Any:
-    """Canonical input-image preproc (inferencer.py:249): rgb → aspect-preserving
-    stride-8 resize.
-
-    Every image-input task funnels through this before the VAE/ViT branches so the
-    chain has one home — and so the trainside rollout and the vllm_omni replay feed
-    :func:`update_context_image` byte-identical pixels.
-    """
+    """Convert to RGB and apply the canonical aspect-preserving VAE resize."""
     from .vendor.data.data_utils import pil_img2rgb
 
     return bundle.vae_transform.resize_transform(pil_img2rgb(image))
@@ -233,15 +197,7 @@ def update_context_image(
     vit: bool,
     differentiable: bool = False,
 ) -> Dict[str, Any]:
-    """Prefill one input image into a KV context (VAE and/or ViT branch).
-
-    Mirrors the vendored ``InterleaveInferencer.update_context_image``
-    (vendor/inferencer.py:62-96) with explicit device pinning: the vendored
-    ``prepare_vae_images`` / ``prepare_vit_images`` build their tensors on CPU and
-    the bundle's VAE carries no accelerate hooks, so ``padded_images`` (and the
-    packed index tensors) must be moved before the cache update. ``image`` is
-    already :func:`resize_input_image`-ed. Caller owns no_grad + autocast.
-    """
+    """Prefill a resized image into the VAE and/or ViT KV branches."""
     bagel = bundle.model
     device = torch.device(bundle.device)
     if vae:
