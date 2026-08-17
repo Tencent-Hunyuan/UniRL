@@ -1,8 +1,8 @@
 # SDE runtime
 
 > **Where it fits:** cross-cutting — shared by *rollout* and train-side *replay*
-> for the σ schedule and stochastic transition density. Deterministic solver
-> choice can remain engine-specific.
+> for the σ schedule, start noise, and stochastic transition density. The
+> deterministic solver is a model-config-owned contract, not an engine choice.
 > Full map: [`../README.md`](../README.md).
 
 <div align="center">
@@ -11,8 +11,8 @@
 
 *One `strategy.denoise()` per step. **Sampling** vs **replay** is the
 `prev_sample` argument; the rollout's selected indices use an SDE kernel, while
-engine adapters may route the remaining deterministic indices through a
-stateful ODE solver such as UniPC.*
+the remaining deterministic indices run the model config's declared solver
+(UniPC for WAN via FastVideo) or the trainside `eta=0` Euler collapse.*
 
 ## What it is
 
@@ -25,9 +25,14 @@ the deterministic **initial-noise (`x_T`) recipe**.
 
 The policy-gradient ratio is only meaningful when train-side replay scores each
 stored stochastic transition with the same σ, model conditioning, and SDE
-density used during rollout. Cross-engine output parity additionally requires
-the same start noise and deterministic solver; adapters may deliberately choose
-different deterministic solvers, so that stronger parity is not implied here.
+density used during rollout — so the σ schedule, the start noise `x_T`, and the
+SDE transition math stay bit-identical across every engine, non-negotiably.
+The deterministic non-SDE solver shapes which trajectory gets sampled but never
+enters the ratio; it is declared by the model config
+(`WAN21PipelineConfig.unipc_*`), and an adapter either implements it, verifying
+the checkpoint scheduler agrees (FastVideo), or still runs the `eta=0` Euler
+collapse (trainside, SGLang, vLLM-Omni) — a tracked divergence, not an
+adapter's private choice.
 
 ## How it works
 
@@ -39,9 +44,11 @@ different deterministic solvers, so that stronger parity is not implied here.
   match SGLang).
 - **SDE indices own the policy-gradient density.** Selected `sde_indices` get a
   stochastic transition with a real per-step Gaussian log-prob (→
-  `LatentSegment.sde_logp`). Trainside loops can collapse the same SDE kernel to
-  Euler with `eta=0`; adapters that need inference-scheduler parity can instead
-  route non-SDE indices through `UniPCStrategy`. UniPC keeps model-output
+  `LatentSegment.sde_logp`). Trainside loops collapse the same SDE kernel to
+  Euler with `eta=0`; the FastVideo adapter instead implements the model
+  config's declared UniPC solver on non-SDE indices, verifying the checkpoint
+  scheduler against the spec (`rollout/engine/fastvideo/README.md`). UniPC
+  keeps model-output
   history across consecutive ODE steps and clears it after an intervening SDE
   jump before warming up from first order again.
 - **The σ schedule** comes from `FlowMatchSchedulePolicy` (`runtime.py`), loaded
@@ -73,7 +80,9 @@ MixGRPO keeps `FlowSDEStrategy` and adds a `WindowScheduler` under
   GRPO/FlowDPPO have no ratio. Eval-only, and stateful (needs `init_schedule`/`reset`).
 - **`UniPCStrategy` is deterministic and stateful** — it also returns
   `log_prob=None`, requires `init_schedule`, and only reuses history across
-  consecutive ODE indices. An SDE jump must reset its history.
+  consecutive ODE indices. An SDE jump must reset its history. Its `UniPCSpec`
+  comes from the model config, never from the engine; adapters verify the
+  checkpoint scheduler matches before stepping.
 - **σ silently arrives as float64** — `torch.linspace` (the static-σ branch) defaults
   to float64, so without `denoise`'s `.float()` cast the transition computes in float64
   while SGLang uses float32; the `1/(2σ²)` term amplifies the gap into the replayed

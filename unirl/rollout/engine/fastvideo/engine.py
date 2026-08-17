@@ -23,6 +23,7 @@ from unirl.rollout.engine.fastvideo._unipc import (
 from unirl.rollout.engine.fastvideo.config import FastVideoEngineConfig, FastVideoPorts
 from unirl.sde.noise import _derive_group_seed
 from unirl.sde.runtime import FlowMatchSchedulePolicy, ensure_sample_sigmas
+from unirl.sde.unipc import UniPCSpec
 from unirl.types.conditions import TextEmbedCondition
 from unirl.types.noise_recipe import NoiseRecipe
 from unirl.types.primitives import Texts, Video, Videos
@@ -33,15 +34,15 @@ from unirl.types.segments.latent import make_video_segment
 logger = logging.getLogger(__name__)
 
 
-def _resolve_sde_window(raw_indices: Any, num_steps: int) -> tuple[Optional[List[int]], List[int]]:
-    """Return the FastVideo wire value and canonical segment indices."""
+def _resolve_sde_window(raw_indices: Any, num_steps: int) -> List[int]:
+    """Return the canonical SDE segment indices for a request (``None`` spells all-steps SDE)."""
     if raw_indices is None:
-        return None, list(range(int(num_steps)))
+        return list(range(int(num_steps)))
     selected = sorted({int(i) for i in raw_indices})
     bad = [i for i in selected if i < 0 or i >= int(num_steps)]
     if bad:
         raise ValueError(f"FastVideo SDE indices out of range for num_steps={num_steps}: {bad}")
-    return selected, selected
+    return selected
 
 
 class FastVideoRolloutEngine(BaseRolloutEngine):
@@ -86,6 +87,17 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
             os.getenv("FASTVIDEO_WAN_SCHEDULER", "unipc").strip().lower() == "unipc",
             "FastVideo canonical rollout requires FASTVIDEO_WAN_SCHEDULER=unipc; "
             "Euler fallback would change the deterministic trajectory.",
+        )
+        require(
+            hasattr(model_config, "unipc_solver_order"),
+            "FastVideo canonical UniPC requires the model config to own the solver spec "
+            "(unipc_solver_order / unipc_solver_type / unipc_lower_order_final)",
+        )
+        # Model-owned solver SSOT; workers verify the checkpoint scheduler against it.
+        self._unipc_spec = UniPCSpec(
+            solver_order=model_config.unipc_solver_order,
+            solver_type=model_config.unipc_solver_type,
+            lower_order_final=model_config.unipc_lower_order_final,
         )
         patch_fastvideo_unipc()
         self._build_generator()
@@ -141,6 +153,12 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         }
         fv_kwargs.update(ekw)
         self._fastvideo_args = FastVideoArgs.from_kwargs(**fv_kwargs)
+        backend = str(getattr(self._fastvideo_args, "distributed_executor_backend", "mp"))
+        require(
+            backend == "mp",
+            f"FastVideo canonical UniPC patches only reach 'mp' executor workers; got "
+            f"distributed_executor_backend={backend!r} (Ray actors would run unpatched)",
+        )
         max_port_attempts = 5
         for attempt in range(1, max_port_attempts + 1):
             try:
@@ -270,13 +288,14 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         # these indices to the selected SDE kernel and every other index to
         # canonical UniPC. ``None`` keeps the legacy all-SDE spelling; an
         # explicit empty list makes the full path deterministic.
-        _, resolved_sde_indices = _resolve_sde_window(
+        resolved_sde_indices = _resolve_sde_window(
             getattr(params, "sde_indices", None),
             int(params.num_inference_steps),
         )
         step_plan = FastVideoUniPCPlan(
             sde_type=str(getattr(self.strategy, "canonical_name", "flow")),
             sde_indices=tuple(resolved_sde_indices),
+            spec=self._unipc_spec,
         )
 
         all_log_probs: List[torch.Tensor] = []
@@ -435,7 +454,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         T = int(traj.shape[1]) - 1
         indices = torch.arange(traj.shape[1], dtype=torch.long, device=device)
 
-        _, sde_set = _resolve_sde_window(getattr(params, "sde_indices", None), T)
+        sde_set = _resolve_sde_window(getattr(params, "sde_indices", None), T)
         sde_indices = torch.tensor(sde_set, dtype=torch.long, device=device) if sde_set else None
 
         sde_logp = None
