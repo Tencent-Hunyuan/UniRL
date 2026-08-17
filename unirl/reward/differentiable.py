@@ -1,24 +1,4 @@
-"""Differentiable scoring through a managed child (segmented autograd).
-
-The autograd graph cannot cross a process boundary, so the chain rule is
-relayed instead (mmrl's pattern): the child runs the reward forward under
-grad and RETAINS its subgraph keyed by ``call_id``; :class:`_ManagedScore`
-wraps the two RPCs as ONE node in the parent's graph —
-
-    forward : ship image tensors as CUDA-IPC handles -> child scores, keeps graph
-    backward: ship dL/dr (plain floats)              -> child backwards its
-              segment, returns dL/dimage as IPC handles -> spliced in here
-
-Requirements (enforced by the child, surfaced as exceptions here): the
-negotiated ``cuda_ipc`` data plane (``transport: cuda_ipc`` in the managed
-process config), a ``supports_grad`` scorer, uniform image shapes, and the
-child resident for the whole forward+backward window — that pair is the
-indivisible per_call unit.
-
-Failure semantics are deliberately harsher than scalar scoring: any error
-raises. A gradient has no NaN-soft-fail; training must stop rather than
-step on a half-differentiable reward.
-"""
+"""Differentiable scoring through a managed child (segmented autograd)."""
 
 from __future__ import annotations
 
@@ -107,10 +87,5 @@ def score_differentiable(
     images: torch.Tensor,
     prompts: list[str],
 ) -> torch.Tensor:
-    """Score ``images`` [B,C,H,W] through the managed child with grad attached.
-
-    Returns a (B,) float tensor whose backward relays dL/dr to the child and
-    splices dL/dimage back into the caller's graph. Call under the caller's
-    grad context; the reward model's weights stay frozen child-side.
-    """
+    """Score ``images`` [B,C,H,W] through the managed child with grad attached."""
     return _ManagedScore.apply(images, backend, prompts)

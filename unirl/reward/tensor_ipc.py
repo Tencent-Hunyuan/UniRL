@@ -1,24 +1,4 @@
-"""CUDA-IPC tensor codec for the managed data plane (parent side).
-
-Wire format (version 1): base64(pickle((rebuild_fn, args))) exactly as
-produced by ``torch.multiprocessing.reductions.reduce_tensor`` — the same
-mechanism torch itself uses to share CUDA tensors between processes. The
-handle is a few dozen bytes; the storage never moves. Constraints enforced
-by the handshake, not here: both processes on the same physical device,
-IPC-compatible torch builds, tensors from the regular cudaMalloc pool
-(expandable_segments and cumem/VMM regions are not exportable).
-
-Lifetime: the PRODUCER must keep the source tensor alive until the consumer
-is done with it — the parent retains request tensors until the response
-arrives, the child retains gradient tensors until the parent acks (next
-request or explicit release). Consumers should ``.clone()`` if they need
-the data past that window.
-
-A byte-identical twin of this module lives on the child side
-(``reward_service/tensor_ipc.py``): the two ends of the wire share no Python
-package, so the codec is duplicated rather than imported across the
-environment boundary. Keep both copies in sync.
-"""
+"""CUDA-IPC tensor codec for the managed data plane (parent side)."""
 
 from __future__ import annotations
 

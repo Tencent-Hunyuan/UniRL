@@ -268,14 +268,7 @@ class ManagedScorerProcessBackend(RemoteRewardBackend):
         raise TimeoutError(f"reward child did not become ready within {cfg.process.startup_timeout}s; log={log_path}")
 
     def _negotiate_transport(self) -> None:
-        """Negotiate the data plane with the ready child (dual-plane design).
-
-        cuda_ipc is same-device, torch-version- and allocator-gated; the child
-        applies the checks and its answer is authoritative. "auto" degrades to
-        http silently; an explicit "cuda_ipc" request that cannot be honored is
-        a configuration error and fails startup — differentiable scoring has no
-        b64 fallback.
-        """
+        """Negotiate the data plane with the ready child (dual-plane design)."""
         self._transport = "http"
         requested = getattr(self.spec.process, "transport", "auto")
         if requested == "http":
@@ -314,15 +307,7 @@ class ManagedScorerProcessBackend(RemoteRewardBackend):
         prompts,
         records=None,
     ):
-        """ReFL entry: satisfy the DifferentiableReward capability across the
-        process boundary (segmented backward over the cuda_ipc data plane).
-
-        ``media_tensor`` is a grad-carrying image batch [B, C, H, W] in [0, 1];
-        the returned [B] reward tensor carries a grad_fn whose backward relays
-        dL/dr to the child and splices dL/dimage back into the caller's graph.
-        Requires transport=cuda_ipc and a supports_grad scorer; video tensors
-        are not wired yet (image rewards only).
-        """
+        """ReFL entry: DifferentiableReward across the process boundary (segmented backward over cuda_ipc)."""
         import torch
 
         from unirl.reward.differentiable import score_differentiable
