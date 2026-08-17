@@ -53,7 +53,9 @@ bundle:
   config:
     _target_: unirl.models.cosmos3.config.Cosmos3SFTConfig
     pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,nvidia/Cosmos3-Nano}
-    model_precision: bf16
+    # torch 2.10/cu128 on H20 rejects bf16 cublasGemmEx; keep this validated
+    # compatibility recipe in fp32. Newer CUDA stacks may override both dtypes.
+    model_precision: fp32
     master_precision: fp32
     vae_precision: fp32
     freeze_understanding: true
@@ -76,9 +78,9 @@ backend:
   trainable_attr: transformer
   fsdp_cfg:
     _target_: unirl.train.configs.FSDPConfig
-    param_dtype: bf16
+    param_dtype: fp32
     cpu_offload: false
-    mixed_precision: true
+    mixed_precision: false
     fsdp_mode: full
     reshard_after_forward: true
     activation_checkpointing: true

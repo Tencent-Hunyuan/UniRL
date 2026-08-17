@@ -50,6 +50,14 @@ def load_function(path: str) -> Any:
     return cls
 
 
+def _needs_h20_cu128_workaround() -> bool:
+    if not torch.cuda.is_available() or torch.version.cuda != "12.8":
+        return False
+    if not torch.__version__.startswith("2.10.0"):
+        return False
+    return "H20" in torch.cuda.get_device_name(torch.cuda.current_device()).upper()
+
+
 def set_seed(seed: Optional[int]) -> None:
     """
     Set random seed for reproducibility.
@@ -60,25 +68,28 @@ def set_seed(seed: Optional[int]) -> None:
             np.random.seed / torch.manual_seed all share the same drawn int)
             but not reproducible across re-runs.
 
-    Note:
-        ``CUBLAS_WORKSPACE_CONFIG`` is set via ``setdefault`` as a
-        belt-and-suspenders measure, but the real guarantee must come
-        from setting it in the process environment BEFORE Python imports
-        torch (e.g., via Ray ``runtime_env={"env_vars": ...}``). Once
-        cuBLAS has initialized, changing this env var has no effect.
+    The H20 torch-2.10/cu128 compatibility path disables deterministic cuBLAS:
+    that runtime returns ``CUBLAS_STATUS_INVALID_VALUE`` for otherwise valid
+    GEMMs when ``CUBLAS_WORKSPACE_CONFIG`` is enabled.
     """
     if seed is None:
         seed = int.from_bytes(os.urandom(8), "big") & 0x7FFFFFFF
-    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    h20_cu128 = _needs_h20_cu128_workaround()
+    if h20_cu128:
+        os.environ.pop("CUBLAS_WORKSPACE_CONFIG", None)
+    else:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-    # warn_only lets non-deterministic ops fall back gracefully instead of hard-failing.
-    torch.use_deterministic_algorithms(True, warn_only=True)
+        torch.backends.cudnn.deterministic = not h20_cu128
+        torch.backends.cudnn.benchmark = h20_cu128
+        if h20_cu128:
+            # SDPA MATH uses the same broken strided-batched GEMM path.
+            torch.backends.cuda.enable_math_sdp(False)
+    torch.use_deterministic_algorithms(not h20_cu128, warn_only=not h20_cu128)
 
 
 def configure_logger(

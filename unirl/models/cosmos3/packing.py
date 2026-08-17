@@ -167,7 +167,7 @@ def pack_joint_sequence(
     kwargs: Dict[str, Any] = {
         "input_ids": text_seg["input_ids"],
         "text_indexes": text_seg["text_indexes"],
-        "position_ids": torch.cat(mrope_segments, dim=1),
+        "position_ids": torch.cat(mrope_segments, dim=1).contiguous(),
         "und_len": text_seg["und_len"],
         "sequence_length": sequence_length,
         "vision_tokens": [vision_tokens.to(dtype=model_dtype)],

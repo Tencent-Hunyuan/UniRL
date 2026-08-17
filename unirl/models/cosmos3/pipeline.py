@@ -182,6 +182,12 @@ class Cosmos3JointStage:
                 device=x0.device,
             )
 
+        if meta["num_noisy_vision_tokens"] <= 0:
+            raise RuntimeError(
+                "Cosmos3JointStage: no noisy vision tokens (latent T="
+                f"{tuple(x_t.shape)} cond_frames={condition_frames}). "
+                "condition_on_first_frame with a single latent frame leaves an empty GEMM."
+            )
         preds_vision, _preds_sound, preds_action = self._forward_transformer(kwargs)
         if not preds_vision:
             raise RuntimeError("Cosmos3JointStage: transformer returned no vision prediction.")

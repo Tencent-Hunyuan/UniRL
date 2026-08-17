@@ -76,6 +76,200 @@ class _CastOutput(torch.nn.Module):
         return self.inner(*args, **kwargs).to(self._dtype)
 
 
+def _patch_rotary_emb_contiguous(rotary_emb: torch.nn.Module) -> None:
+    """Avoid 0-stride ``cublasSgemmStridedBatched`` in Cosmos3 mRoPE.
+
+    Upstream ``Cosmos3VLTextRotaryEmbedding`` does ``inv_freq.expand(3, B, -1, 1)
+    @ position_ids`` with a broadcast (stride 0) batch dim. On torch 2.10 +
+    cu128 that GEMM returns ``CUBLAS_STATUS_INVALID_VALUE``. The math is
+    ``freqs[axis,b,n,f] = inv_freq[f] * pos[axis,b,n]`` — a broadcast multiply
+    is exact and does not go through strided-batched GEMM. Also materialize a
+    DTensor ``inv_freq`` if FSDP ever wraps the buffer.
+    """
+    if getattr(rotary_emb, "_unirl_contiguous_rope", False):
+        return
+
+    def forward(position_ids: torch.Tensor, device: torch.device, dtype: torch.dtype):
+        if position_ids.ndim == 2:
+            position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
+        inv_freq = rotary_emb.inv_freq
+        if hasattr(inv_freq, "full_tensor"):
+            inv_freq = inv_freq.full_tensor()
+        inv_freq = inv_freq.detach().float().contiguous().to(device)
+        position_ids = position_ids.float().contiguous().to(device)
+        freqs = position_ids.unsqueeze(-1) * inv_freq
+        freqs = rotary_emb.apply_interleaved_mrope(freqs, rotary_emb.rope_axes_dim)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        return emb.cos().to(dtype=dtype), emb.sin().to(dtype=dtype)
+
+    rotary_emb.forward = forward
+    rotary_emb._unirl_contiguous_rope = True
+    logger.info("Cosmos3Bundle: patched rotary_emb to contiguous broadcast mRoPE")
+
+
+def _needs_h20_cu128_workaround() -> bool:
+    """Whether this process is on the H20 stack with broken batched cuBLAS."""
+    if not torch.cuda.is_available() or torch.version.cuda != "12.8":
+        return False
+    if not torch.__version__.startswith("2.10.0"):
+        return False
+    return "H20" in torch.cuda.get_device_name(torch.cuda.current_device()).upper()
+
+
+def _patch_frozen_dtensor_linears(transformer: torch.nn.Module) -> None:
+    """Materialize frozen FSDP2 DTensors before ``F.linear``.
+
+    Cosmos3 freezes the und stream (``to_q`` / ``to_k`` / …). FSDP2 still
+    shards those weights (``to_q`` local 512×4096 on 8 ranks) but often
+    skips the compute all-gather for ``requires_grad=False``. Linear then
+    launches a full-shape bf16 GEMM against the shard and ``cublasGemmEx``
+    returns ``INVALID_VALUE``. Trainable linears keep the normal FSDP path
+    so grads stay attached to the DTensor.
+    """
+    patched = 0
+    for module in transformer.modules():
+        if not isinstance(module, torch.nn.Linear):
+            continue
+        if module.weight.requires_grad:
+            continue
+        if getattr(module, "_unirl_frozen_full_tensor", False):
+            continue
+
+        def make_forward(mod: torch.nn.Linear):
+            def forward(x: torch.Tensor):
+                w = mod.weight
+                if hasattr(w, "full_tensor"):
+                    w = w.full_tensor()
+                b = mod.bias
+                if b is not None and hasattr(b, "full_tensor"):
+                    b = b.full_tensor()
+                # H20 + torch 2.10/cu128: every bf16 cublasGemmEx is INVALID,
+                # including a contiguous 64x4096 @ 4096x4096. fp32 sgemm is fine.
+                return torch.nn.functional.linear(
+                    x.float(),
+                    w.float(),
+                    None if b is None else b.float(),
+                ).to(dtype=x.dtype)
+
+            return forward
+
+        module.forward = make_forward(module)
+        module._unirl_frozen_full_tensor = True
+        patched += 1
+    if patched:
+        logger.info(
+            "Cosmos3Bundle: patched %d Linear(s) to full_tensor() when frozen+DTensor",
+            patched,
+        )
+
+
+def _mm_2d(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """``(..., K) @ (K, N) + (N,)`` via a single 2-D GEMM.
+
+    H20 + torch 2.10/cu128 rejects ``cublasSgemmStridedBatched`` (``torch.bmm``,
+    3-D ``matmul``, SDPA MATH). Plain ``cublasSgemm`` is fine.
+    """
+    out_shape = x.shape[:-1] + (weight.shape[1],)
+    y = x.reshape(-1, x.shape[-1]) @ weight
+    return (y + bias).reshape(out_shape)
+
+
+def _patch_h20_strided_gemm(transformer: torch.nn.Module) -> None:
+    """Bypass broken ``cublasSgemmStridedBatched`` on H20 + cu128.
+
+    Isolated on the smoke nodes (torch 2.10.0+cu128, driver 12.9):
+
+    * ``F.linear`` / 2-D ``mm`` — OK
+    * ``torch.bmm`` / 3-D ``matmul`` / batched ``einsum`` — ``INVALID_VALUE``
+    * SDPA default / Efficient / Flash(bf16) — OK
+    * SDPA MATH — ``INVALID_VALUE`` (it is implemented as strided-batched GEMM)
+
+    Cosmos3 hits both bad paths: ``DomainAwareLinear`` uses ``bmm`` with ``M=1``,
+    and RoPE-broadcast Q/K can make native SDPA fall back to MATH.
+    """
+    import diffusers.models.transformers.transformer_cosmos3 as cosmos3_mod
+
+    cls = cosmos3_mod.DomainAwareLinear
+    if not getattr(cls, "_unirl_safe_bmm", False):
+
+        def forward(self, x: torch.Tensor, domain_id: torch.Tensor) -> torch.Tensor:
+            if domain_id.ndim == 0:
+                domain_id = domain_id.unsqueeze(0)
+            domain_id = domain_id.to(device=x.device, dtype=torch.long).reshape(-1)
+            if x.shape[0] != domain_id.shape[0]:
+                raise ValueError(
+                    "Cosmos3 action domain_id batch size must match action tokens: "
+                    f"tokens={x.shape[0]}, domain_id={domain_id.shape[0]}."
+                )
+            if torch.any((domain_id < 0) | (domain_id >= self.num_domains)):
+                raise ValueError(
+                    f"Cosmos3 action domain_id must be in [0, {self.num_domains}), got {domain_id.tolist()}."
+                )
+            weight = self.fc(domain_id).view(domain_id.shape[0], self.input_size, self.output_size)
+            bias = self.bias(domain_id).view(domain_id.shape[0], self.output_size)
+            if x.ndim not in (2, 3):
+                raise ValueError(f"Cosmos3 DomainAwareLinear expected rank-2 or rank-3 input, got {tuple(x.shape)}.")
+            if int(domain_id.min()) == int(domain_id.max()):
+                return _mm_2d(x, weight[0], bias[0])
+            return torch.stack(
+                [_mm_2d(x[i], weight[i], bias[i]) for i in range(x.shape[0])],
+                dim=0,
+            )
+
+        cls.forward = forward
+        cls._unirl_safe_bmm = True
+        logger.info("Cosmos3Bundle: patched DomainAwareLinear to 2-D GEMM (H20 cuBLAS)")
+
+    orig = cosmos3_mod.dispatch_attention_fn
+    if not getattr(orig, "_unirl_no_math_sdpa", False):
+        try:
+            from torch.nn.attention import SDPBackend, sdpa_kernel
+        except ImportError:  # pragma: no cover
+            sdpa_kernel = None
+            SDPBackend = None
+
+        def wrapped(query, key, value, *args, **kwargs):
+            q = query.contiguous()
+            k = key.contiguous()
+            v = value.contiguous()
+            # Cosmos3 is GQA (32 q heads, 8 kv). Efficient/Flash fused kernels
+            # require equal num_heads; the MATH fallback is strided-batched
+            # GEMM and INVALID on H20+cu128. Repeat kv heads before dispatch.
+            q_heads = q.shape[-2]
+            kv_heads = k.shape[-2]
+            if q_heads != kv_heads:
+                if q_heads % kv_heads != 0:
+                    raise ValueError(f"Cosmos3 GQA: q heads {q_heads} not divisible by kv heads {kv_heads}")
+                nrep = q_heads // kv_heads
+                k = k.repeat_interleave(nrep, dim=-2).contiguous()
+                v = v.repeat_interleave(nrep, dim=-2).contiguous()
+                kwargs = dict(kwargs)
+                kwargs["enable_gqa"] = False
+            if sdpa_kernel is None:
+                return orig(q, k, v, *args, **kwargs)
+            if q.dtype == torch.float32:
+                backends = SDPBackend.EFFICIENT_ATTENTION
+            else:
+                backends = [
+                    SDPBackend.FLASH_ATTENTION,
+                    SDPBackend.CUDNN_ATTENTION,
+                    SDPBackend.EFFICIENT_ATTENTION,
+                ]
+            with sdpa_kernel(backends):
+                return orig(q, k, v, *args, **kwargs)
+
+        wrapped._unirl_no_math_sdpa = True
+        cosmos3_mod.dispatch_attention_fn = wrapped
+        logger.info("Cosmos3Bundle: patched attention dispatch to contiguous non-MATH SDPA")
+
+    if torch.cuda.is_available():
+        torch.backends.cuda.enable_math_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(True)
+        torch.backends.cuda.enable_flash_sdp(True)
+        if hasattr(torch.backends.cuda, "enable_cudnn_sdp"):
+            torch.backends.cuda.enable_cudnn_sdp(True)
+
+
 class Cosmos3Bundle(Bundle):
     """Weights for Cosmos3 SFT: MoT transformer (trainable), WanVAE + tokenizer
     + scheduler (frozen helpers)."""
@@ -111,6 +305,13 @@ class Cosmos3Bundle(Bundle):
         )
         transformer = transformer.to(device=device, dtype=master_dtype)
         transformer.time_proj = _CastOutput(transformer.time_proj, model_dtype)
+        if _needs_h20_cu128_workaround():
+            logger.warning(
+                "Cosmos3Bundle: enabling H20 torch-2.10/cu128 cuBLAS workarounds; "
+                "upgrade the runtime to remove this compatibility path"
+            )
+            _patch_rotary_emb_contiguous(transformer.rotary_emb)
+            _patch_h20_strided_gemm(transformer)
         vae = AutoencoderKLWan.from_pretrained(path, subfolder="vae", torch_dtype=vae_dtype).to(device)
         vae.requires_grad_(False)
         vae.eval()
@@ -133,6 +334,9 @@ class Cosmos3Bundle(Bundle):
                 frozen / 1e9,
                 trainable / 1e9,
             )
+
+        if _needs_h20_cu128_workaround():
+            _patch_frozen_dtensor_linears(transformer)
 
         return cls(
             transformer=transformer,
