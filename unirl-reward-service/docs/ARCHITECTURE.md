@@ -299,6 +299,25 @@ Request `0` asked for `clip + hpsv2`; `clip` failed → only `hpsv2` has a score
 - A client can safely pack unrelated rewards into the same batch — **they will not drag each other down**.
 - A client must **read both `results[i]` and `errors[i]`** — looking only at `results` would silently miss a failed reward.
 
+### 4.4 Rank-affine direct scorer server
+
+`reward_service.direct_server` is a lighter deployment for one managed image
+scorer. It does not create a nested Ray runtime: the parent UniRL reward worker
+launches it with an explicit Python interpreter and an inherited listening socket.
+The server:
+
+- owns exactly one registered scorer;
+- accepts image/image-edit histories only in the initial protocol;
+- serializes scoring and lifecycle transitions;
+- echoes request/sample/group/policy/scorer identity;
+- caches idempotency keys for safe retries;
+- rejects non-finite outputs;
+- exposes `GET /health` plus explicit `onload`, `offload`, `drain`, and
+  `shutdown` lifecycle operations.
+
+The full gateway remains the multi-reward, multi-replica deployment. The direct
+server is a rank-local process/environment boundary, not a replacement for it.
+
 ---
 
 ## 5. Extension Points
@@ -418,6 +437,8 @@ For **vLLM-style scorers** (`unified_reward` / `geneval2` / `wise`), the `dtype 
 ```
 reward_service/
 ├── server.py            # HTTP gateway — /score /health /rewards
+├── direct_server.py     # one managed scorer — /score + lifecycle
+├── wire.py              # shared image/video wire decoding
 ├── __main__.py          # CLI entry — argparse + uvicorn.run
 ├── config.py            # YAML → ServiceCfg / RewardModelCfg
 ├── schemas.py           # Pydantic HTTP schemas

@@ -175,7 +175,7 @@ reward:
         editreward: 1.0
       batch_size: 8
       timeout: 300.0
-      sub_metric_reduce: mean
+      sub_metric_reduce: first
       aggregation_method: weighted_sum
 
 algorithm:
