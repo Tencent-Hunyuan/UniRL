@@ -9,7 +9,8 @@ import torch
 
 from unirl.models.types.diffusion import DiffusionStage, DiffusionStep
 from unirl.models.types.replay_result import ReplayResult
-from unirl.sde.kernels import StepStrategy
+from unirl.sde.kernels import GeneratorLike, StepStrategy
+from unirl.sde.noise import make_denoise_step_generators
 from unirl.types.sampling import DiffusionSamplingParams, compute_trajectory_positions
 from unirl.types.segments.latent import LatentSegment, make_video_segment
 from unirl.utils.dtypes import parse_torch_dtype
@@ -87,6 +88,7 @@ class HunyuanVideoDiffusionStep(DiffusionStep[HunyuanVideoBundle, HunyuanVideoCo
         sigma: torch.Tensor,
         sigma_next: torch.Tensor,
         prev_sample: Optional[torch.Tensor] = None,
+        generator: GeneratorLike = None,
         sigma_max: float = 0.99,
         eta: float = 1.0,
         step_index: int = 0,
@@ -99,6 +101,7 @@ class HunyuanVideoDiffusionStep(DiffusionStep[HunyuanVideoBundle, HunyuanVideoCo
             sigma_next=sigma_next,
             eta=eta,
             prev_sample=prev_sample,
+            generator=generator,
             sigma_max=sigma_max,
             step_index=step_index,
         )
@@ -114,6 +117,7 @@ class HunyuanVideoDiffusionStep(DiffusionStep[HunyuanVideoBundle, HunyuanVideoCo
         sigma_next: torch.Tensor,
         guidance_scale: float,
         prev_sample: Optional[torch.Tensor] = None,
+        generator: GeneratorLike = None,
         sigma_max: float = 0.99,
         eta: float = 1.0,
         step_index: int = 0,
@@ -133,6 +137,7 @@ class HunyuanVideoDiffusionStep(DiffusionStep[HunyuanVideoBundle, HunyuanVideoCo
             sigma=sigma,
             sigma_next=sigma_next,
             prev_sample=prev_sample,
+            generator=generator,
             sigma_max=sigma_max,
             eta=eta,
             step_index=step_index,
@@ -149,6 +154,7 @@ class HunyuanVideoDiffusionStep(DiffusionStep[HunyuanVideoBundle, HunyuanVideoCo
         sigma_next: torch.Tensor,
         guidance_scale: float,
         prev_sample: Optional[torch.Tensor] = None,
+        generator: GeneratorLike = None,
         sigma_max: float = 0.99,
         eta: float = 1.0,
         step_index: int = 0,
@@ -163,6 +169,7 @@ class HunyuanVideoDiffusionStep(DiffusionStep[HunyuanVideoBundle, HunyuanVideoCo
             sigma_next=sigma_next,
             guidance_scale=guidance_scale,
             prev_sample=prev_sample,
+            generator=generator,
             sigma_max=sigma_max,
             eta=eta,
             step_index=step_index,
@@ -236,6 +243,8 @@ class HunyuanVideoDiffusionStage(DiffusionStage[HunyuanVideoConditions]):
         schedule: torch.Tensor,
         params: DiffusionSamplingParams,
         initial_latents: Optional[torch.Tensor] = None,
+        denoise_seed_keys: Optional[List[str]] = None,
+        denoise_base_seed: int = 0,
     ) -> LatentSegment:
         """Run full HunyuanVideo-1.0 T2V sampling."""
         from unirl.sde.noise import generate_latents
@@ -303,6 +312,15 @@ class HunyuanVideoDiffusionStage(DiffusionStage[HunyuanVideoConditions]):
             sigma = schedule[i].to(device)
             sigma_next = schedule[i + 1].to(device)
             step_eta = float(params.eta) if i in sde_set else 0.0
+            step_generators = (
+                make_denoise_step_generators(
+                    base_seed=int(denoise_base_seed),
+                    step_index=i,
+                    sample_ids=denoise_seed_keys,
+                )
+                if step_eta > 0.0 and denoise_seed_keys is not None
+                else None
+            )
 
             with torch.no_grad(), autocast_ctx:
                 new_latents, log_prob, _ = self.step.step_with_logp(
@@ -314,6 +332,7 @@ class HunyuanVideoDiffusionStage(DiffusionStage[HunyuanVideoConditions]):
                     sigma_next=sigma_next,
                     guidance_scale=float(params.guidance_scale),
                     eta=step_eta,
+                    generator=step_generators,
                     sigma_max=sigma_max,
                     step_index=i,
                 )

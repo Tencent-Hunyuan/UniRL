@@ -71,7 +71,7 @@ The current trainer surface is:
 | `DiffusionTrainer` | one diffusion `Part` → one `TrainStack` | Reference diffusion loop; supports trainside or dedicated rollout, optional separate reward GPUs, FSDP offload, and DiffusionNFT's EMA-adapter rollout. |
 | `ARTrainer` | one AR `Part` → one `TrainStack` | Text or multimodal AR rollout with group/global advantage normalization and optional token-balanced DP shards. |
 | `SFTTrainer` | dataset records → one standalone training `Part` | Reuses the RL TrainStack without rollout, reward, or advantages; owns exact epoch/cursor resume and full-set evaluation. |
-| `AsyncARTrainer` | FIFO AR generation batch → one `TrainStack` | Separate train/rollout slabs with resident generation, batch-denominated `weight_sync_interval` publication over an optimizer-update clock, and manager quiescence before weight sync, eval, or checkpoint. |
+| `AsyncARTrainer` | FIFO AR generation batch → one `TrainStack` | Separate train/rollout slabs with resident generation and optimizer-update versioning. The trainer refills immediately after collection so the manager's existing dispatch thread overlaps the next generation with scoring and training, then quiesces before weight sync, eval, or checkpoint. |
 | `AsyncDiffusionTrainer` | FIFO diffusion generation batch → one `TrainStack` | The same update-versioned manager loop for DiT. Requires `max_inflight=1` and resolves and scores each intact batch before launching its replacement, so cross-slab transfer never queues behind fresh generation. |
 | `PETrainer` | `ar` + `diffusion` Parts → two `TrainStack`s | Composed prompt-rewrite/image rollout; image rewards propagate to AR rewrites. `freeze_llm=true` trains and checkpoints diffusion only. |
 | `UnifiedModelTrainer` | whole `Sample` → one `UnifiedModelTrainStack` | AR and image losses accumulate into shared-backbone optimizer steps while prompt-tree lineage remains intact during DP scatter. |
@@ -80,6 +80,10 @@ The current trainer surface is:
 All async variants use the driver-local `RolloutManager`. Batch trainers provide
 one slab-wide launcher and keep completed batches intact; the agentic trainer
 provides one launcher per engine slot and lets the manager assemble root groups.
+`weight_sync_interval` counts consumed rollout batches between publications;
+`stack.num_updates_per_batch` counts optimizer updates within each batch. They
+are independent; `(weight_sync_interval - 1) * num_updates_per_batch` is the
+maximum accepted update-version lag.
 Async batch trainers own optimizer progress, publication cadence, hard boundaries,
 scoring order, and training policy directly. The manager owns published rollout
 state and applies its configured filter against the trainer-supplied current

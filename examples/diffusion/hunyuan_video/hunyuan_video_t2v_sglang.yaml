@@ -69,6 +69,7 @@ backend:
   fsdp_cfg:
     _target_: unirl.train.configs.FSDPConfig
     param_dtype: bf16
+    master_dtype: fp32
     cpu_offload: false
     mixed_precision: true
     fsdp_mode: full
@@ -119,6 +120,10 @@ rollout:
     num_gpus: 1
     tp_size: 1
     local_mode: true
+    engine_kwargs:
+      # Hunyuan guidance is PipelineConfig.embedded_cfg_scale, not request guidance_scale.
+      embedded_cfg_scale: ${sampling.guidance_scale}
+      flow_shift: ${model_config.shift}
   model_config: ${model_config}
   strategy: ${strategy}
 
