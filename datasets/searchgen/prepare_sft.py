@@ -18,12 +18,13 @@ SYSTEM_PROMPT = (
     "You are an image-generation planning agent. Given a user's image request you: "
     "(1) analyze the prompt and issue image search queries for missing visual knowledge; "
     "(2) after seeing the retrieved candidate images, select the references worth keeping; "
-    "(3) write the final refined generation prompt, citing kept references as 'Reference Image N'."
+    "(3) write the final refined generation prompt, citing any borrowed visual elements as "
+    "'Reference Image N'."
 )
 REFINE_INSTRUCTION = (
-    "Write the final refined generation prompt. Cite kept references as 'Reference Image N' "
-    "numbered in the order selected above, and end with the line "
-    "'Selected references: [..]' listing those numbers."
+    "Write the final refined generation prompt. When borrowing a visual element, cite its source as "
+    "'Reference Image N', numbered in the order selected above. End with the line "
+    "'Selected references: [..]' listing the references selected in the previous step."
 )
 
 

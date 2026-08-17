@@ -113,6 +113,11 @@ class QwenVLChatTemplateStage:
                         "role='tool' — the Qwen2.5-VL chat template has no tool template and would render "
                         "it as a bare ChatML block the model never saw in training."
                     )
+                if message.get("content") is None:
+                    raise ValueError(
+                        f"QwenVLChatTemplateStage.embed_messages: conversation {row} message {turn} has "
+                        "content=null — the Qwen2.5-VL chat template iterates content parts and cannot render it."
+                    )
                 if message.get("tool_calls"):
                     raise ValueError(
                         f"QwenVLChatTemplateStage.embed_messages: conversation {row} message {turn} carries "
