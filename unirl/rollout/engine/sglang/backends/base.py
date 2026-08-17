@@ -1,25 +1,4 @@
-"""The backend seam contract — the ``Backend`` protocol + the wire types.
-
-Every ``sglang`` collaborator reaches the SGLang SRT runtime through this
-protocol; the real implementations live beside it (``http.py`` — SRT server
-subprocess + sync HTTP; ``native.py`` — in-process Engine). This module owns only small CPU-only helpers, so it is trivially CPU-importable.
-
-**No RL types cross this seam.** ``generate`` takes ready-to-POST ``/generate``
-payload dicts (one per prompt) and returns ``list[RawResult]`` (a structural view
-of one parsed ``/generate`` candidate); the adapters do the
-``Sample``↔wire translation. The impl absorbs its transport
-asymmetries (thread fan-out, retries, SGLang's dict-vs-list response shape for
-``n``) behind these signatures.
-
-Deliberate divergences from the ``sglang_diffusion`` seam:
-
-- No ``target_modules`` on the update verbs — the diffusion-side default
-  ``["transformer"]`` doesn't match LLM module naming; omitting the field lets
-  the SRT server accept all incoming weights correctly.
-- No ``weights_checksum`` — the checksum/verify path is vLLM-Omni-only.
-- ``flush_cache`` is a first-class verb so the engine can orchestrate
-  flush-before-sleep as a visible line.
-"""
+"""The backend seam contract — the ``Backend`` protocol + the wire types."""
 
 from __future__ import annotations
 
@@ -42,14 +21,7 @@ def _filter_server_args_or_raise(
     allowed: set[str],
     backend_name: str,
 ) -> Dict[str, Any]:
-    """Filter ``server_intent`` against real SGLang ``ServerArgs`` fields.
-
-    Escape-hatch keys may still drop, but first-class UniRL config fields
-    recorded under ``_REQUIRED_SERVER_ARGS_METADATA_KEY`` must survive the
-    installed runtime's ``ServerArgs`` filter. Those fields are correctness or
-    memory-lifecycle knobs, so silently dropping them would make the recipe say
-    one thing while SGLang runs another.
-    """
+    """Filter ``server_intent`` against real SGLang ``ServerArgs`` fields."""
     raw_required = server_intent.get(_REQUIRED_SERVER_ARGS_METADATA_KEY, ())
     if isinstance(raw_required, str):
         required = [raw_required]
@@ -70,12 +42,7 @@ def _normalize_cuda_visible_devices(
     *,
     tp_size: int,
 ) -> Optional[List[str]]:
-    """Validate explicit scheduler CUDA tokens without interpreting them.
-
-    Ray may expose numeric ordinals, GPU UUIDs, or MIG UUIDs. They are opaque
-    tokens here; only cardinality and comma/empty ambiguity are rejected.
-    ``None`` means preserve the Worker's existing CUDA visibility.
-    """
+    """Validate explicit scheduler CUDA tokens without interpreting them."""
     if cuda_visible_devices is None:
         return None
     tokens = [str(token).strip() for token in cuda_visible_devices]
@@ -94,18 +61,7 @@ def _normalize_cuda_visible_devices(
 
 
 class RawResult(Protocol):
-    """Structural view of one parsed SRT ``/generate`` candidate — the wire
-    fields this engine consumes. The HTTP impl deserializes responses into this
-    shape (``n>1`` returns a list of candidates per prompt; the impl flattens
-    them prompt-major: candidate ``k`` of prompt ``i`` at index ``i*n + k``);
-    test fakes stand in structurally.
-
-    Population: ``text`` and ``finish_reason`` are always set. ``token_ids`` /
-    ``logprobs`` both come from the ``meta_info['output_token_logprobs']``
-    items — the runtime's only source of generated token ids (there is no
-    separate ``output_token_ids`` field) — so they are length-aligned by
-    construction, and both empty when the request didn't ask for logprobs.
-    """
+    """Structural view of one parsed SRT ``/generate`` candidate — the wire fields this engine consumes."""
 
     text: str
     token_ids: List[int]

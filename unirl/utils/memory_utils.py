@@ -1,27 +1,4 @@
-"""GPU memory observation utilities (verl-parity toolkit).
-
-Four tools, semantics aligned with verl's ``verl/utils/memory_utils.py`` so
-their monitoring playbook (wandb ``perf/max_memory_*`` curves, stage-tagged
-``[mem]`` log lines, allocator snapshots) applies to UniRL unchanged:
-
-* :func:`get_memory_info`      — one dict of allocator + device-level readings.
-* :func:`log_memory_usage`     — the readings as a single stage-tagged log line.
-* :func:`aggressive_empty_cache` — looped ``gc.collect + empty_cache`` until a
-  round frees less than ``min_freed_gb``.
-* :class:`MemorySnapshotSampler` — ``torch.cuda.memory._record_memory_history``
-  recorder + ``_dump_snapshot`` dumper (open dumps with
-  https://pytorch.org/memory_viz).
-
-Everything here reads the CURRENT process only. UniRL trainers run on a
-CUDA-less Ray driver, so these functions are useful on workers — the driver
-reaches them through ``Remote.get_memory_stats`` (a BROADCAST RPC probe).
-Orchestration (when to probe, per-step aggregation, wandb keys) lives in
-``unirl/utils/memory_monitor.py``.
-
-``misc.clear_memory()`` remains the one-shot cleanup helper; use
-:func:`aggressive_empty_cache` when you want the verl-style "loop until dry"
-behaviour with freed-bytes accounting.
-"""
+"""GPU memory observation utilities (verl-parity toolkit)."""
 
 from __future__ import annotations
 
@@ -76,18 +53,7 @@ def _cpu_rss_gb() -> Optional[float]:
 
 
 def get_memory_info(device: Optional[int] = None) -> Dict[str, float]:
-    """Current-process memory readings in GB. Empty dict without CUDA.
-
-    Allocator-level (this process only): ``allocated_gb`` / ``reserved_gb`` /
-    ``cached_gb`` (= reserved - allocated) / ``max_allocated_gb`` /
-    ``max_reserved_gb`` (peaks since the last ``reset_peak_memory_stats``).
-
-    Device-level (every process on the GPU, e.g. a colocated SGLang server this
-    process's allocator cannot see): ``total_gb`` / ``device_used_gb`` from
-    ``torch.cuda.mem_get_info``.
-
-    Plus ``cpu_rss_gb`` for this process when psutil is available.
-    """
+    """Current-process memory readings in GB. Empty dict without CUDA."""
     if not torch.cuda.is_available():
         return {}
     dev = torch.cuda.current_device() if device is None else device
@@ -144,16 +110,7 @@ def aggressive_empty_cache(
     max_rounds: int = 10,
     min_freed_gb: float = 1.0,
 ) -> Dict[str, float]:
-    """Loop ``gc.collect + torch.cuda.empty_cache`` until a round frees < ``min_freed_gb``.
-
-    verl semantics: the first round returns the allocator's big cached blocks,
-    later rounds catch tensors that only die once reference cycles are
-    collected. Stops early when a round stops paying. Never called by the
-    monitoring path by default — behaviour-neutral unless explicitly invoked
-    (e.g. via ``logging.memory.empty_cache_at``).
-
-    Returns ``{"freed_reserved_gb", "freed_allocated_gb", "rounds"}``.
-    """
+    """Loop ``gc.collect + torch.cuda.empty_cache`` until a round frees < ``min_freed_gb``."""
     if not torch.cuda.is_available():
         return {"freed_reserved_gb": 0.0, "freed_allocated_gb": 0.0, "rounds": 0.0}
     start_reserved = torch.cuda.memory_reserved() / _GB
@@ -178,11 +135,7 @@ def aggressive_empty_cache(
 
 
 def _top_frame(frames: Optional[list]) -> str:
-    """The innermost non-torch-internal call frame as ``file:line:func``.
-
-    Attributes an allocation to the user code that requested it, skipping
-    torch's own allocator frames (which are the same for every allocation).
-    """
+    """The innermost non-torch-internal call frame as ``file:line:func``."""
     if not frames:
         return "<no stack captured>"
     for fr in frames:
@@ -194,18 +147,7 @@ def _top_frame(frames: Optional[list]) -> str:
 
 
 def summarize_snapshot(snapshot, top: int = 15) -> str:
-    """Rank the call sites holding live GPU memory — a text report, no GUI.
-
-    ``snapshot`` is either a loaded torch snapshot dict
-    (``torch.cuda.memory._snapshot()``) or a path to a ``.pickle`` dump. The
-    pickle is plain dicts/lists, so this reads it **without torch or CUDA** —
-    an agent can analyse a dump on any machine.
-
-    Groups every still-live block (``state == "active_allocated"``) by its
-    allocating ``file:line`` and sorts by total bytes. For a leak, diff two
-    dumps (e.g. ``memsnap_step2`` vs ``memsnap_step8``): the site whose GB grew
-    is the leak. A single dump already shows the biggest holders.
-    """
+    """Rank the call sites holding live GPU memory — a text report, no GUI."""
     if isinstance(snapshot, (str, Path)):
         import pickle
 
@@ -241,13 +183,7 @@ def summarize_snapshot(snapshot, top: int = 15) -> str:
 
 
 class MemorySnapshotSampler:
-    """Record per-allocation history and dump it as memory_viz-openable pickles.
-
-    Must live in the process whose allocations you want to see (a Ray worker,
-    not the driver). Recording hooks every allocation — measurable overhead and
-    dumps of up to hundreds of MB — so it is env-gated off by default and
-    normally limited to rank 0.
-    """
+    """Record per-allocation history and dump it as memory_viz-openable pickles."""
 
     def __init__(self, out_dir: str, max_entries: int = 100_000, rank: int = 0) -> None:
         self.out_dir = Path(out_dir)
@@ -269,13 +205,7 @@ class MemorySnapshotSampler:
             logger.warning("memory: failed to start snapshot recording", exc_info=True)
 
     def dump(self, tag: str) -> Optional[str]:
-        """Dump history to ``<out_dir>/memsnap_<tag>_rank<r>.pickle``; return the
-        ranked :func:`summarize_snapshot` report string (None on failure).
-
-        Runs on the worker; the report is RETURNED (not logged here) so the driver
-        can surface it inline — a worker-side ``logging`` call would only reach the
-        Ray worker log files, not the training console.
-        """
+        """Dump history to ``<out_dir>/memsnap_<tag>_rank<r>.pickle``; return the report string, None on failure."""
         if not self._recording:
             return None
         try:
@@ -303,12 +233,7 @@ class MemorySnapshotSampler:
 
     @classmethod
     def maybe_from_env(cls, rank: int = 0) -> Optional["MemorySnapshotSampler"]:
-        """Build + start a sampler when ``UNIRL_MEMSNAP`` is truthy for this rank.
-
-        Env knobs (same family as ``UNIRL_PROFILE_*``): ``UNIRL_MEMSNAP``,
-        ``UNIRL_MEMSNAP_DIR`` (default ``outputs/memsnap``),
-        ``UNIRL_MEMSNAP_MAX_ENTRIES``, ``UNIRL_MEMSNAP_RANKS`` (default ``0``).
-        """
+        """Build + start a sampler when ``UNIRL_MEMSNAP`` is truthy for this rank."""
         if not _truthy(os.environ.get("UNIRL_MEMSNAP")):
             return None
         if not _rank_enabled(rank):

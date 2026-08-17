@@ -229,12 +229,7 @@ class Cosmos3JointStage:
         )
 
     def _forward_transformer(self, kwargs: dict[str, Any]) -> tuple[Any, Any, Any]:
-        """Call the packed forward as a 3-tuple on both 0.39 and later diffusers.
-
-        0.39 always returns ``(vision, sound, action)``. Later revisions default
-        to ``return_dict=True`` (a ``Cosmos3OmniTransformerOutput``), which
-        would unpack into the field names rather than the prediction lists.
-        """
+        """Call the packed forward as a prediction 3-tuple across supported diffusers versions."""
         call_kwargs = dict(kwargs)
         if "return_dict" in inspect.signature(self.bundle.transformer.forward).parameters:
             call_kwargs["return_dict"] = False
@@ -253,12 +248,7 @@ class Cosmos3JointStage:
 
 
 class Cosmos3Pipeline(Pipeline):
-    """SFT pipeline exposing Cosmos3's packed joint stage.
-
-    ``generate`` is intentionally unimplemented: this integration is
-    train-loss only. ``evaluate_loss`` is noised velocity MSE and is not a
-    sample-quality gate (use a later denoise path for PSNR/SSIM).
-    """
+    """SFT-only pipeline exposing Cosmos3's packed joint stage."""
 
     def __init__(self, *, bundle: Cosmos3Bundle) -> None:
         super().__init__()

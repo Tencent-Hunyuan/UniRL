@@ -1,33 +1,4 @@
-"""HunyuanImage3Bundle — concrete weights+params holder for HunyuanImage 3.0.
-
-Implements the empty :class:`Bundle` Protocol. Pure container of the
-modules HunyuanImage3 ships with: 1× shared MoE transformer
-(``HunyuanImage3ForCausalMM`` from the upstream ``hunyuan_image_3``
-package), 1× SigLIP2 ViT vision tower, 1× 3D-VAE, 1× tokenizer,
-1× scheduler. No LoRA injection, FSDP wrap, adapter switching, autocast
-helpers, or weight-sync logic — those are lifecycle concerns owned
-outside the bundle.
-
-The shared backbone is a single ``nn.Module`` that operates in either
-``mode="gen_text"`` (autoregressive) or ``mode="gen_image"`` (DiT
-denoise) depending on the call site. The AR and Diffusion stages both
-call into ``self.transformer`` directly with different ``mode=`` kwargs.
-
-MoE expert parallelism is intentionally not exposed here — initial
-integration runs at EP=1 (full backbone replicated). Add EP wiring when
-the training stack grows EP support.
-
-Use :meth:`HunyuanImage3Bundle.from_config` to load a small / single-
-device HuggingFace checkpoint via ``trust_remote_code=True`` (the
-upstream package ships the modeling code in the checkpoint repo). For
-the real 80B ``tencent/HunyuanImage-3.0`` weights this path will OOM —
-the training stack constructs the bundle manually with
-``device_map="auto"``.
-
-Chat-template input prep (tokenizer wrapper + rope helpers) lives on
-``HunyuanImage3TextEmbedStage`` (``embed_for_ar`` / ``embed_for_gen_image``),
-not here.
-"""
+"""HunyuanImage3Bundle — concrete weights+params holder for HunyuanImage 3.0."""
 
 from __future__ import annotations
 
@@ -84,30 +55,11 @@ class HunyuanImage3Bundle(Bundle):
         return self._vit
 
     def trainable_module(self) -> nn.Module:
-        """The sharded trainable subtree the backend wraps: the bare decoder
-        (``HunyuanImage3Model`` at ``transformer.model``).
-
-        Its diffusion heads + frozen VAE/ViT are wrapper-level *siblings* that
-        stay OUTSIDE the FSDP/VeOmni wrap — loaded by :meth:`materialize`, kept
-        off the optimizer/checkpoint, and (under ``with_aux=()``) left on meta.
-        Handing the backend this single module (not the composite wrapper) is
-        what lets HI3 run under VeOmni. All LoRA adapters (``qkv_proj``/
-        ``o_proj``) live in the decoder, so optimizer / EMA / checkpoint /
-        weight-sync scope is the decoder — which also makes the ``"model."``
-        sync prefix in ``config.py`` resolve correctly (the wrapper handoff
-        double-prefixed it)."""
+        """The sharded trainable subtree the backend wraps: the bare decoder"""
         return self.transformer.model
 
     def prepare_for_expert_parallel(self) -> None:
-        """Make the decoder expert-parallel-ready (backend hook; called only when
-        ``ep_size > 1``, on the meta model, before ``veomni_parallelize``).
-
-        Swaps each decoder layer's ``HunyuanMoE`` (nn.ModuleList experts) for a
-        ``FusedHunyuanMoE`` (fused ``[E,2I,H]`` experts via veomni grouped GEMM +
-        all_to_all) and attaches ``get_parallel_plan`` so VeOmni's EP can
-        ``Shard(0)`` the fused tensors. Flags :meth:`materialize` to fuse the
-        per-expert checkpoint keys and take the EP-sharded load path. Driven
-        solely by ``backend.fsdp_cfg.ep_size`` — there is no separate config flag."""
+        """Make the decoder expert-parallel-ready (backend hook; called only when"""
         from unirl.train.backend.veomni.ep.models.hi3 import replace_hunyuan_moe_with_fused
 
         n_swapped = replace_hunyuan_moe_with_fused(self.transformer.model)
@@ -116,19 +68,7 @@ class HunyuanImage3Bundle(Bundle):
 
     @classmethod
     def from_config(cls, config: HunyuanImage3PipelineConfig) -> "HunyuanImage3Bundle":
-        """Load all HunyuanImage3 components from a HuggingFace checkpoint.
-
-        Loads ``HunyuanImage3ForCausalMM`` via
-        ``AutoModelForCausalLM.from_pretrained(..., trust_remote_code=True)``
-        — the ckpt's ``auto_map`` resolves the wrapper class that owns
-        ``vae`` and ``vision_model``. (``AutoModel`` would land on the
-        backbone-only ``HunyuanImage3Model``, which has neither.)
-
-        ``.to(device)`` is unconditional here, which only works for small
-        checkpoints. The 80B ``tencent/HunyuanImage-3.0`` weights need
-        ``device_map="auto"`` — for that path, callers construct the
-        bundle directly via ``__init__``.
-        """
+        """Load all HunyuanImage3 components from a HuggingFace checkpoint."""
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         from .compat import apply_hi3_transformers5_compat
@@ -209,15 +149,7 @@ class HunyuanImage3Bundle(Bundle):
         cls,
         config: HunyuanImage3PipelineConfig,
     ) -> "HunyuanImage3Bundle":
-        """Build the bundle with the full ``HunyuanImage3ForCausalMM`` on
-        meta-device. Returns immediately without any per-rank weight load.
-
-        Used for the 80B path. Every parameter (decoder, lm_head, heads,
-        vae, vit) stays on meta until :meth:`materialize` runs — that
-        single call covers the FSDP-wrapped decoder via DCP plus all
-        wrapper-level non-FSDP children, with vae / vit opt-in via
-        ``with_aux``.
-        """
+        """Build the bundle with the full ``HunyuanImage3ForCausalMM`` on"""
         from accelerate import init_empty_weights
         from transformers import (
             AutoConfig,
@@ -296,30 +228,13 @@ class HunyuanImage3Bundle(Bundle):
         device: torch.device,
         with_aux: Sequence[str] = (),
     ) -> None:
-        """Single-call materialization for the meta-init path.
-
-        Allocates per-rank storage on ``device`` for everything in the
-        materialization set + loads HF weights via DCP's
-        ``set_model_state_dict`` — which transparently handles DTensor
-        (the FSDP-wrapped decoder) and plain tensors (heads, opt-in
-        vae/vit) in one collective. The materialization set is:
-
-        - ``transformer.model`` (FSDP-wrapped decoder, always)
-        - All wrapper-level diffusion heads listed in
-          :attr:`_DECODER_HEAD_ATTRS` (always; tiny, required for replay)
-        - ``transformer.vae`` if ``"vae" in with_aux``
-        - ``transformer.vision_model`` if ``"vit" in with_aux``
-
-        Idempotent: modules already materialized (full-load path or repeat
-        call) skip the per-shard ``to_empty`` step.
-
-        Pre-condition: phase 2 (FSDPPolicy construction → ``fully_shard``)
-        has already run. Bundle's caller is responsible for the wrap order.
-        """
+        """Single-call materialization for the meta-init path."""
         from torch.distributed.checkpoint.state_dict import (
             StateDictOptions,
             set_model_state_dict,
         )
+
+        from unirl.train.backend.sharded_state import _canonical_param_name
 
         aux_set = tuple(with_aux)
         for name in aux_set:
@@ -371,7 +286,12 @@ class HunyuanImage3Bundle(Bundle):
                 sd = fuse_expert_state_dict(sd)
 
             # Remap LoRA base_layer keys before loading to avoid skipped parameters.
-            expected_names = {name for name, _ in self.transformer.named_parameters(remove_duplicate=False)}
+            # Canonical names: ``set_model_state_dict`` below matches against
+            # ``state_dict()`` keys, which never carry the AC-wrapper segment
+            # that ``named_parameters()`` exposes.
+            expected_names = {
+                _canonical_param_name(name) for name, _ in self.transformer.named_parameters(remove_duplicate=False)
+            }
             rename_map = {}
             for name in expected_names:
                 if not name.endswith((".base_layer.weight", ".base_layer.bias")):
@@ -468,8 +388,7 @@ class HunyuanImage3Bundle(Bundle):
 
 
 def _module_has_meta_param(module: nn.Module) -> bool:
-    """True if any parameter of ``module`` (recursing into children) is on
-    the meta device. Used to gate per-shard ``to_empty`` calls."""
+    """True if any parameter of ``module`` (recursing into children) is on"""
     for p in module.parameters(recurse=True):
         if p.is_meta:
             return True
@@ -490,16 +409,7 @@ def _collect_filtered_state_dict(
     *,
     prefixes: Sequence[str],
 ) -> Dict[str, torch.Tensor]:
-    """Stream the HF safetensors checkpoint, returning all keys whose
-    top-level prefix matches one of ``prefixes`` (matched as
-    ``prefix + "."``). Keys are returned at the wrapper-level namespace
-    (no stripping) so they match against ``HunyuanImage3ForCausalMM``'s
-    parameter names directly.
-
-    Reads ``model.safetensors.index.json`` to find which shard files
-    contain matching keys, then opens only those shards. Falls back to
-    the single-file ``model.safetensors`` layout when no index is present.
-    """
+    """Stream the HF safetensors checkpoint, returning all keys whose"""
     import json
 
     from safetensors.torch import safe_open

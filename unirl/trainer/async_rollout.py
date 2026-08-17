@@ -40,16 +40,18 @@ def boundary_launch_slots(
     hard_boundary: int,
     batches_since_sync: int,
     weight_sync_interval: int,
+    leased_count: int = 0,
 ) -> int:
-    """Generations admissible now, bounded by concurrency, remaining batches, and the sync window.
-
-    ``weight_sync_interval - batches_since_sync`` is how many more batches the published
-    snapshot may serve; admitting past it launches work the staleness filter is
-    guaranteed to discard at the next quiesce.
-    """
+    """Generations admissible now, bounded by concurrency, remaining batches, and the sync window."""
     freshness = weight_sync_interval - batches_since_sync
     allowed = min(freshness, min(num_rollouts, hard_boundary) - trained_batches)
-    return max(0, min(max_inflight - inflight_count, allowed - inflight_count - ready_count))
+    return max(
+        0,
+        min(
+            max_inflight - inflight_count,
+            allowed - inflight_count - ready_count - leased_count,
+        ),
+    )
 
 
 def rollout_version_metrics(
@@ -115,16 +117,7 @@ def _rollout_id(sample: "Sample") -> int:
 
 
 class AsyncRolloutTrainerMixin:
-    """One async batch loop shared by ``AsyncARTrainer`` and ``AsyncDiffusionTrainer``.
-
-    The host trainer supplies the domain surface (``_build_request_sample``,
-    ``_drop_decoded``, ``_advantage_and_train``, checkpoint/wandb helpers, the
-    ``reward``/``backend``/``rollout``/``weight_sync`` remotes, and the
-    ``_max_inflight``/``_weight_sync_interval``/``_num_updates_per_batch``
-    knobs) plus the ``_async_wandb_extra`` / ``_boundary_evaluate`` hooks.
-    The mixin owns admission, boundary sync, and FIFO batch consumption;
-    ``RolloutManager`` alone owns the published rollout version.
-    """
+    """One async batch loop shared by ``AsyncARTrainer`` and ``AsyncDiffusionTrainer``."""
 
     def _async_wandb_extra(self) -> Dict[str, object]:
         """Trainer-specific keys merged into the wandb run config."""
@@ -133,6 +126,10 @@ class AsyncRolloutTrainerMixin:
     def _boundary_evaluate(self, rollout_id: int, *, initial: bool) -> None:
         """Run the trainer's evaluation at a synced, empty rollout boundary."""
         raise NotImplementedError
+
+    def _refill_before_score(self) -> bool:
+        """Whether this trainer may launch replacement work before scoring."""
+        return False
 
     def _build_async_sample(self, gen_id: int) -> "Sample":
         """Consume one data batch and build the request Sample for ``gen_id``."""
@@ -284,20 +281,25 @@ class AsyncRolloutTrainerMixin:
 
         groups = manager.collect(self.batch_size, current_version=self._train_version)
         completed, gen_id, output_version = combine_rollout_chunks(groups)
-        scored = self._score_completed(gen_id, completed)
+        scored = None
+        if not self._refill_before_score():
+            scored = self._score_completed(gen_id, completed)
 
         inflight_count, ready_count = manager.counts
         slots = boundary_launch_slots(
             inflight_count=inflight_count,
-            ready_count=ready_count + 1,
+            ready_count=ready_count,
             max_inflight=self._max_inflight,
             trained_batches=rollout_id,
             num_rollouts=num_rollouts,
             hard_boundary=hard_boundary,
             batches_since_sync=self._batches_since_sync,
             weight_sync_interval=self._weight_sync_interval,
+            leased_count=1,
         )
         self._submit_generations(slots)
+        if scored is None:
+            scored = self._score_completed(gen_id, completed)
         return scored, output_version
 
     def _submit_generations(self, count: int) -> None:

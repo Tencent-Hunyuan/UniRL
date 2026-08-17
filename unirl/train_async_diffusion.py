@@ -1,24 +1,5 @@
 #!/usr/bin/env python
-"""UniRL async diffusion training entry point (Hydra-native).
-
-Sibling of ``train_diffusion.py`` that drives
-:class:`unirl.trainer.async_diffusion.AsyncDiffusionTrainer` — the disaggregated,
-async variant of the diffusion path (training and rollout on DISJOINT GPU slabs,
-generation overlapped with training, reward scored synchronously at reap time
-rather than overlapped, weights pushed via cross-slab weight sync). The synchronous
-diffusion trainer is unchanged.
-
-Launch (single node):
-  BAGEL_PATH=/path/to/BAGEL-7B-MoT \
-  python -m unirl.train_async_diffusion \
-    --config-name=diffusion/bagel/bagel_vllmomni_async num_devices=8
-
-Extra config knobs vs the synchronous separate recipe:
-  * ``max_inflight`` — must be ``1``; other values fail during trainer initialization.
-  * ``weight_sync_interval`` — trained batches between publications; also derives
-    the default output-version lag filter.
-``layout`` is forced to ``separate`` (async needs disjoint train/rollout slabs).
-"""
+"""UniRL async diffusion training entry point (Hydra-native)."""
 
 from __future__ import annotations
 
@@ -47,6 +28,12 @@ def main(cfg: DictConfig) -> None:
         layout="separate",
         train_fraction=cfg.get("train_fraction", 0.5),
         reward_fraction=cfg.get("reward_fraction", 0.0),
+        # Forwarded so the trainer can reject it — async scores at reap time outside
+        # _reward_phase(), and dropping the key here would silently ignore the policy.
+        offload_train_during_reward=cfg.get("offload_train_during_reward", False),
+        # Async default False (sync entry defaults True): the dedicated rollout
+        # slab stays resident; evaluate() also passes sleep_after=False here.
+        rollout_sleep_after_generate=cfg.get("rollout_sleep_after_generate", False),
         adv_use_global_std=cfg.get("adv_use_global_std", False),
         eval_interval=cfg.get("eval_interval", 0),
         eval_num_prompts=cfg.get("eval_num_prompts", 64),

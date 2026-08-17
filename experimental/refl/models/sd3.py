@@ -1,17 +1,4 @@
-"""SD3 image ReFL adaptation — the second family on the BPTT contract.
-
-Ported from the legacy core path (``unirl/trainer/refl.py`` +
-``unirl/train/refl/policy.py`` + ``unirl/models/draft.py``, removed in this
-change): the same DRaFT-K direct reward backprop, expressed through the
-``experimental.refl`` contract so ``pipeline_target`` is the only thing a
-config swaps between WAN video and SD3 image ReFL.
-
-Deliberate non-support: CFG under BPTT (``guidance_scale > 1``). The core
-``SD3DiffusionStep`` batches both CFG branches through one forward, which
-under grad would add a ``(1 - g) * d(uncond)/dθ`` term; the legacy path
-always trained at ``guidance_scale == 1`` and so does this port — a wrong
-config fails loudly.
-"""
+"""SD3 image ReFL adaptation — the second family on the BPTT contract."""
 
 from __future__ import annotations
 
@@ -34,12 +21,7 @@ MAX_TORCH_SEED = (1 << 63) - 1
 
 
 class Sd3ReflDiffusionStage(SD3DiffusionStage):
-    """SD3 diffusion stage + REFL BPTT sampling override.
-
-    Reuses the mainline single-forward ``SD3DiffusionStep.predict_noise``
-    (no CFG at ``guidance_scale == 1``); adds the grad-window loop with
-    optional per-step KL against the LoRA-disabled reference.
-    """
+    """SD3 diffusion stage + REFL BPTT sampling override."""
 
     def generate_latents(
         self,
@@ -63,13 +45,7 @@ class Sd3ReflDiffusionStage(SD3DiffusionStage):
         params: DiffusionSamplingParams,
         initial_latents: Optional[torch.Tensor] = None,
     ) -> DiffuseWithGradResult:
-        """Differentiable SD3 sampling for REFL-style BPTT training.
-
-        Same knobs as the WAN stages (``params.sampler_kwargs``:
-        ``mid_timestep`` / ``final_timestep``; KL switched by the actor via
-        ``kl_weight``). Returns the live-grad ``z_final`` + per-sample
-        ``kl_loss`` ``[B]``.
-        """
+        """Differentiable SD3 sampling for REFL-style BPTT training."""
         if float(params.guidance_scale) > 1.0:
             raise ValueError(
                 "Sd3ReflDiffusionStage.diffuse_with_grad: CFG under BPTT is not supported "
@@ -185,12 +161,7 @@ class Sd3ReflDiffusionStage(SD3DiffusionStage):
 
 
 class Sd3ReflVAEDecodeStage(SD3VAEDecodeStage):
-    """SD3 VAE decode + the BPTT entry point.
-
-    Reuses the mainline grad decode path (fp32 VAE + activation
-    checkpoint); returns pixels in ``[0, 1]`` — the range the core
-    differentiable image scorers (PickScore et al.) expect.
-    """
+    """SD3 VAE decode + the BPTT entry point."""
 
     def decode_with_grad(self, z_final: torch.Tensor) -> torch.Tensor:
         if z_final.ndim != 4:

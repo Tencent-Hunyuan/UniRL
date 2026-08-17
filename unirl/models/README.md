@@ -84,3 +84,23 @@ it is the authoritative bundle / pipeline / stage / conditions contract.
   it's `None`; never build the σ tensor inside `generate`.
 - **CFG empty-negative differs per model** (SD3 `""`, Qwen-Image `" "`) — use the
   model's canonical upstream value or the rollout/replay ratio drifts off 1.0.
+
+
+## Conversation composition
+
+`unirl/models/types/conversations.py` holds the transpose helpers with more than
+one model consumer: `build_text_messages` (qwen3, qwen3_5),
+`build_vision_messages` (qwen_vl, qwen3_5), and the two composition rules both
+use — `system_prefix` and `group_consecutive_roles`. The sglang wire render
+imports those two rather than keeping private copies, so the rules have one
+definition.
+
+- **One system rule:** the config `system_instruction` is a default; an explicit
+  `system` turn in the data wins. A path that wants "data is the sole source of
+  truth" leaves `system_instruction` unset in the recipe — not a code branch.
+- **A render with one model consumer stays in that model's package** and imports
+  the shared rules (Qwen3-Omni's URI-media render lives in
+  `unirl/models/qwen3_omni/media.py`, next to the media contract it enforces). It
+  moves into the shared layer when a second consumer actually exists.
+- Model chat stages own *encoding* — chat template, processor, Bagel splits —
+  never the composition rules.

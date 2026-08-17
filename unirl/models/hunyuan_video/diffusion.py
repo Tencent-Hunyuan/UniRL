@@ -1,45 +1,4 @@
-"""HunyuanVideo-1.0 diffusion: per-step kernel + rollout-level stage.
-
-Two classes mirror :mod:`unirl.models.hunyuan_video15.diffusion`:
-
-- :class:`HunyuanVideoDiffusionStep` -- stateless per-step kernel.
-  :meth:`predict_noise` passes latents directly (no channel-dim packing),
-  builds a ``guidance`` tensor (because ``guidance_embeds=True``), and
-  forwards through the transformer; the protocol-matching ``forward`` /
-  ``step`` / ``step_with_logp`` ride on top.
-- :class:`HunyuanVideoDiffusionStage` -- implements
-  ``DiffusionStage[HunyuanVideoConditions]``. Owns the SDE strategy,
-  loop bookkeeping, latent shape derivation.
-
-Per-request sampling knobs are read from
-:class:`unirl.types.sampling.DiffusionSamplingParams`
-
-Latent geometry
----------------
-Video latents are 5D: ``[B, C, T_lat, H_lat, W_lat]`` where
-- ``T_lat = (num_frames - 1) // temporal_compression_ratio + 1``
-- ``H_lat = height // spatial_compression_ratio``
-- ``W_lat = width // spatial_compression_ratio``
-
-The VAE downsamples 8x spatially and 4x temporally on the HunyuanVideo-1.0
-checkpoint. ``latent_channels=16``.
-
-No channel-dim packing
-----------------------
-Unlike HunyuanVideo-1.5 (``in_channels = 2*C+1``), HunyuanVideo-1.0 has
-``in_channels=16`` -- latents are passed directly without any packing.
-
-Guidance embedding (no CFG)
----------------------------
-The transformer has ``guidance_embeds=True``, which means the guidance
-scale is passed as a tensor ``[B]`` via the ``guidance`` kwarg. There is
-NO classifier-free guidance (no cond/uncond stacking).
-
-Timestep
---------
-The transformer takes ``timestep = sigma * 1000`` (sigma in [0, 1] ->
-timestep in [0, 1000]); ``TIMESTEP_SCALE`` is exposed on the step kernel.
-"""
+"""HunyuanVideo-1.0 diffusion — 5D latents ``[B, C, T_lat, H_lat, W_lat]``; ``timestep = sigma * 1000``."""
 
 from __future__ import annotations
 
@@ -50,7 +9,8 @@ import torch
 
 from unirl.models.types.diffusion import DiffusionStage, DiffusionStep
 from unirl.models.types.replay_result import ReplayResult
-from unirl.sde.kernels import StepStrategy
+from unirl.sde.kernels import GeneratorLike, StepStrategy
+from unirl.sde.noise import make_denoise_step_generators
 from unirl.types.sampling import DiffusionSamplingParams, compute_trajectory_positions
 from unirl.types.segments.latent import LatentSegment, make_video_segment
 from unirl.utils.dtypes import parse_torch_dtype
@@ -60,13 +20,7 @@ from .conditions import HunyuanVideoConditions
 
 
 class HunyuanVideoDiffusionStep(DiffusionStep[HunyuanVideoBundle, HunyuanVideoConditions]):
-    """Per-step HunyuanVideo-1.0 denoising kernel -- stateless.
-
-    Extends the :class:`DiffusionStep` protocol with HunyuanVideo-1.0-
-    specific per-call kwargs on :meth:`predict_noise`, :meth:`step`, and
-    :meth:`step_with_logp`. The protocol surface stays structurally
-    compatible because Python protocols are non-strict on extra kwargs.
-    """
+    """Per-step HunyuanVideo-1.0 denoising kernel -- stateless."""
 
     TIMESTEP_SCALE: ClassVar[float] = 1000.0
 
@@ -79,13 +33,7 @@ class HunyuanVideoDiffusionStep(DiffusionStep[HunyuanVideoBundle, HunyuanVideoCo
         *,
         guidance_scale: float,
     ) -> torch.Tensor:
-        """Run the transformer forward. No channel-dim packing, no CFG.
-
-        HunyuanVideo-1.0 uses guidance embedding (``guidance_embeds=True``),
-        so ``guidance_scale`` is passed as a ``[B]`` tensor via the
-        ``guidance`` kwarg. Returns noise prediction of the same shape as
-        ``sample`` (``[B, C, T_lat, H_lat, W_lat]``).
-        """
+        """Transformer forward on ``sample [B, C, T_lat, H_lat, W_lat]``; guidance rides a ``[B]`` tensor, no CFG."""
         text_llama = conditions.text_llama
         pooled_clip = conditions.pooled_clip
         if text_llama is None or text_llama.embeds is None:
@@ -140,6 +88,7 @@ class HunyuanVideoDiffusionStep(DiffusionStep[HunyuanVideoBundle, HunyuanVideoCo
         sigma: torch.Tensor,
         sigma_next: torch.Tensor,
         prev_sample: Optional[torch.Tensor] = None,
+        generator: GeneratorLike = None,
         sigma_max: float = 0.99,
         eta: float = 1.0,
         step_index: int = 0,
@@ -152,6 +101,7 @@ class HunyuanVideoDiffusionStep(DiffusionStep[HunyuanVideoBundle, HunyuanVideoCo
             sigma_next=sigma_next,
             eta=eta,
             prev_sample=prev_sample,
+            generator=generator,
             sigma_max=sigma_max,
             step_index=step_index,
         )
@@ -167,6 +117,7 @@ class HunyuanVideoDiffusionStep(DiffusionStep[HunyuanVideoBundle, HunyuanVideoCo
         sigma_next: torch.Tensor,
         guidance_scale: float,
         prev_sample: Optional[torch.Tensor] = None,
+        generator: GeneratorLike = None,
         sigma_max: float = 0.99,
         eta: float = 1.0,
         step_index: int = 0,
@@ -186,6 +137,7 @@ class HunyuanVideoDiffusionStep(DiffusionStep[HunyuanVideoBundle, HunyuanVideoCo
             sigma=sigma,
             sigma_next=sigma_next,
             prev_sample=prev_sample,
+            generator=generator,
             sigma_max=sigma_max,
             eta=eta,
             step_index=step_index,
@@ -202,15 +154,12 @@ class HunyuanVideoDiffusionStep(DiffusionStep[HunyuanVideoBundle, HunyuanVideoCo
         sigma_next: torch.Tensor,
         guidance_scale: float,
         prev_sample: Optional[torch.Tensor] = None,
+        generator: GeneratorLike = None,
         sigma_max: float = 0.99,
         eta: float = 1.0,
         step_index: int = 0,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """Run model forward + SDE transition.
-
-        Returns ``(prev_sample, log_prob, prev_sample_mean)``. ``log_prob``
-        and ``prev_sample_mean`` are ``None`` for deterministic strategies.
-        """
+        """Run model forward + SDE transition."""
         return self.step(
             model,
             conditions,
@@ -220,6 +169,7 @@ class HunyuanVideoDiffusionStep(DiffusionStep[HunyuanVideoBundle, HunyuanVideoCo
             sigma_next=sigma_next,
             guidance_scale=guidance_scale,
             prev_sample=prev_sample,
+            generator=generator,
             sigma_max=sigma_max,
             eta=eta,
             step_index=step_index,
@@ -227,28 +177,7 @@ class HunyuanVideoDiffusionStep(DiffusionStep[HunyuanVideoBundle, HunyuanVideoCo
 
 
 class HunyuanVideoDiffusionStage(DiffusionStage[HunyuanVideoConditions]):
-    """HunyuanVideo-1.0 rollout-level diffusion stage.
-
-    Owns the SDE ``strategy`` (stateful strategies like ``DPM2Strategy``
-    require a stable instance across the loop), the bundle, the kernel,
-    and the precision policy.
-
-    ``diffuse(conditions, *, schedule, params)`` runs the full sampling
-    loop and returns a ``LatentSegment`` carrying the 6D trajectory
-    ``[B, K, C, T_lat, H_lat, W_lat]`` plus per-SDE log probs
-    (``sde_logp [N, S]`` + ``sde_indices [S]``).
-
-    ``replay(conditions, *, segment, params, step_indices=None)``
-    recomputes log-probs for the SDE transitions in a stored
-    ``LatentSegment``. Returns a :class:`ReplayResult` with ``log_probs``
-    of shape ``[B, S']`` aligned with ``segment.sde_logp`` (or a slice
-    when ``step_indices`` selects a subset) and ``prev_sample_means``
-    for KL-penalty consumption.
-
-    ``_no_split_modules`` is the model-side fallback used by FSDPPolicy
-    when HF auto-discovery yields nothing -- HunyuanVideo-1.0's
-    transformer block class is ``HunyuanVideoTransformerBlock``.
-    """
+    """HunyuanVideo-1.0 rollout-level diffusion stage."""
 
     _no_split_modules: ClassVar[Tuple[str, ...]] = ("HunyuanVideoTransformerBlock",)
 
@@ -314,14 +243,10 @@ class HunyuanVideoDiffusionStage(DiffusionStage[HunyuanVideoConditions]):
         schedule: torch.Tensor,
         params: DiffusionSamplingParams,
         initial_latents: Optional[torch.Tensor] = None,
+        denoise_seed_keys: Optional[List[str]] = None,
+        denoise_base_seed: int = 0,
     ) -> LatentSegment:
-        """Run full HunyuanVideo-1.0 T2V sampling. Returns a ``LatentSegment``
-        with 6D trajectory storage and ``modality=VIDEO``.
-
-        ``initial_latents`` (optional) -- x_T resolved from the request
-        ``Sample``'s diffusion generation Part; see
-        :class:`SD3DiffusionStage.diffuse` for the contract.
-        """
+        """Run full HunyuanVideo-1.0 T2V sampling."""
         from unirl.sde.noise import generate_latents
 
         if conditions.text_llama is None or conditions.text_llama.embeds is None:
@@ -387,6 +312,15 @@ class HunyuanVideoDiffusionStage(DiffusionStage[HunyuanVideoConditions]):
             sigma = schedule[i].to(device)
             sigma_next = schedule[i + 1].to(device)
             step_eta = float(params.eta) if i in sde_set else 0.0
+            step_generators = (
+                make_denoise_step_generators(
+                    base_seed=int(denoise_base_seed),
+                    step_index=i,
+                    sample_ids=denoise_seed_keys,
+                )
+                if step_eta > 0.0 and denoise_seed_keys is not None
+                else None
+            )
 
             with torch.no_grad(), autocast_ctx:
                 new_latents, log_prob, _ = self.step.step_with_logp(
@@ -398,6 +332,7 @@ class HunyuanVideoDiffusionStage(DiffusionStage[HunyuanVideoConditions]):
                     sigma_next=sigma_next,
                     guidance_scale=float(params.guidance_scale),
                     eta=step_eta,
+                    generator=step_generators,
                     sigma_max=sigma_max,
                     step_index=i,
                 )
@@ -433,11 +368,7 @@ class HunyuanVideoDiffusionStage(DiffusionStage[HunyuanVideoConditions]):
         params: DiffusionSamplingParams,
         step_indices: Optional[List[int]] = None,
     ) -> ReplayResult:
-        """Segment-based log-prob replay over the rollout's SDE transitions.
-
-        Caller is responsible for ``.train()`` mode + grad scope; this
-        method only manages the autocast scope.
-        """
+        """Segment-based log-prob replay over the rollout's SDE transitions."""
         if segment.sde_indices is None or segment.latents is None:
             raise ValueError("HunyuanVideoDiffusionStage.replay: segment.sde_indices / latents missing")
         if segment.sigmas is None:

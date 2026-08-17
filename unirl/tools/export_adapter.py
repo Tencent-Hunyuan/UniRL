@@ -1,16 +1,4 @@
-"""Export a UniRL LoRA checkpoint to a PEFT adapter folder.
-
-``FSDPBackend.save(..., mode="adapter")`` writes a UniRL resume checkpoint:
-LoRA weights plus optimizer/scheduler/trainer state. This tool extracts just
-one adapter and writes the standard PEFT serving artifact:
-
-* ``adapter_model.safetensors``
-* ``adapter_config.json``
-
-It also works on ``save_mode=full`` checkpoints by filtering the LoRA keys out
-of the full policy state dict, and reads either checkpoint flavor —
-the legacy single-file ``checkpoint.pt`` or a sharded ``dcp`` directory.
-"""
+"""Export a UniRL LoRA checkpoint to a PEFT adapter folder."""
 
 from __future__ import annotations
 
@@ -23,6 +11,20 @@ import torch
 from safetensors.torch import save_file
 
 from unirl.tools._checkpoint import load_training_checkpoint
+
+_HELP = """Export a UniRL LoRA checkpoint to a PEFT adapter folder.
+
+``FSDPBackend.save(..., mode="adapter")`` writes a UniRL resume checkpoint:
+LoRA weights plus optimizer/scheduler/trainer state. This tool extracts just
+one adapter and writes the standard PEFT serving artifact:
+
+* ``adapter_model.safetensors``
+* ``adapter_config.json``
+
+It also works on ``save_mode=full`` checkpoints by filtering the LoRA keys out
+of the full policy state dict, and reads either checkpoint flavor —
+the legacy single-file ``checkpoint.pt`` or a sharded ``dcp`` directory.
+"""
 
 PEFT_PREFIX = "base_model.model."
 ModuleSelection = Union[str, List[str]]
@@ -154,7 +156,7 @@ def _optional_modules(value: object) -> Optional[ModuleSelection]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(description=_HELP, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--checkpoint", required=True, help="checkpoint-<step> dir, or the checkpoint.pt itself")
     parser.add_argument("--base", required=True, help="HF repo id / local path of the base model")
     parser.add_argument("--output", required=True, help="output folder for the PEFT adapter")

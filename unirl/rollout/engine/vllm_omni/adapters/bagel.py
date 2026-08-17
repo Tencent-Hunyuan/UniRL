@@ -1,38 +1,4 @@
-"""BAGEL-7B-MoT family: input/output sub-adapters + the ``bagel_t2i`` modality class.
-
-Single diffusion stage (the BAGEL single-stage topology, where the DiT worker
-owns its own LLM/ViT/VAE/tokenizer), TP=1, no AR prelude. BAGEL forces two
-deviations from the shared DiT skeleton — everything else is reused:
-
-- **σ off-by-one.** BAGEL's ``generate_image`` builds its σ schedule internally
-  from ``num_timesteps`` and loops ``num_timesteps - 1`` steps (``linspace(1, 0,
-  num_timesteps)`` then drop the terminal). To run the trainside ``T`` steps the
-  worker must receive ``num_inference_steps = T + 1``. The engine pins
-  the diffusion Part's sigmas for ``T`` steps (``T + 1`` σ points) via this adapter's
-  static-shift :meth:`schedule_policy`; BAGEL's internal schedule then equals it
-  (BAGEL hardwires ``timestep_shift = 3.0`` — the trainside shift — and the σ
-  formula is identical), and the response-side ``verify_engine_used_sigmas``
-  asserts the match. NB: BAGEL ignores ``sampling_params.sigmas`` (it does NOT
-  call ``set_timesteps(sigmas=...)`` like SD3/Qwen), so the schedule is steered
-  purely through ``num_inference_steps`` + the fixed shift.
-
-- **CFG via ``extra_args``, NOT ``guidance_scale``.** Upstream ``forward`` reads
-  ``cfg_text_scale`` / ``cfg_img_scale`` / ``cfg_interval`` / ``cfg_renorm_*`` off
-  ``extra_args`` and **defaults them to 4.0 / 1.5 / (0.4,1.0) — CFG ON — when
-  absent**. The trainside recipes run cfg=1 (single-forward), so the adapter
-  ALWAYS sends the BagelDiffusionParams CFG knobs explicitly; a missing key would
-  silently arm CFG@4.0 and diverge from the trainside oracle.
-
-- **Conditions = PROMPTS, not embeds.** BAGEL conditioning is opaque KV-cache
-  contexts built through the (frozen) und/text path — not a dense tensor, and not
-  transportable across the worker→driver IPC boundary. So the output adapter
-  ships the prompts (+ per-sample image shape) as a deferred
-  :class:`~unirl.models.bagel.conditions.BagelDiffusionConditions`; the trainer
-  rebuilds the KV contexts on its own bundle at replay time (the und path being
-  frozen, the rebuilt contexts are identical regardless of the gen-LoRA state).
-  This is the load-bearing difference from SD3 / Qwen-Image, which ship dense
-  text embeds captured by an ``encode_prompt`` tap.
-"""
+"""BAGEL-7B-MoT family: input/output sub-adapters + the ``bagel_t2i`` modality class."""
 
 from __future__ import annotations
 
@@ -76,28 +42,14 @@ class BagelInputAdapter(DitInputAdapter):
         return spp
 
     def _is_packable_t2i(self, sample: Sample) -> bool:
-        """Collapse spp samples into one ``num_outputs_per_prompt=spp`` request.
-
-        Mirrors ``RLBagelPipeline._is_batchable_t2i``: packed ``generate_image``
-        is cfg=1 t2i only. CFG>1 keeps the sample-level layout.
-        """
+        """Collapse spp samples into one ``num_outputs_per_prompt=spp`` request."""
         if self._spp(sample) <= 1:
             return False
         diff_params = sample.frontier_gen_part(DiffusionSamplingParams).sampling_params
         return float(diff_params.cfg_text_scale) <= 1.0 and float(diff_params.cfg_img_scale) <= 1.0
 
     def build_prompts(self, sample: Sample) -> List[Any]:
-        """Plain ``{"prompt": text}`` dicts (no ``modalities`` → image path).
-
-        BAGEL's ``forward`` routes to text-only output only when
-        ``modalities`` contains ``"text"``; an absent/empty ``modalities`` runs
-        the text2img diffusion path we want. No ``negative_prompt`` key is added
-        — the trainside oracle runs cfg=1 (the negative text branch is unused at
-        cfg_text_scale=1.0), and the CFG scales ride ``extra_args`` instead.
-
-        When packable, each prompt's spp samples collapse to ONE request
-        (``num_outputs_per_prompt=spp``). Otherwise keep one request per sample.
-        """
+        """Plain ``{"prompt": text}`` dicts (no ``modalities`` → image path)."""
         if sample.has_image_input():
             raise ValueError(f"modality={self.modality!r} does not accept image conditioning")
         spp = self._spp(sample)
@@ -129,12 +81,7 @@ class BagelInputAdapter(DitInputAdapter):
         return [{"prompt": text} for text in prompt_texts]
 
     def build_sampling(self, sample: Sample) -> List[StageSampling]:
-        """One diffusion-stage intent with the BAGEL-specific kwargs.
-
-        ``num_inference_steps`` is sent as ``T + 1`` (BAGEL loops
-        ``num_timesteps - 1``); CFG knobs + SDE step set + trajectory precision
-        ride ``extra_args``; the driver-authoritative x_T recipe is packed in.
-        """
+        """One diffusion-stage intent with the BAGEL-specific kwargs."""
         spp = self._spp(sample)
         grouped_texts, grouped_spp = _grouped_texts_from_sample(
             sample,
@@ -200,8 +147,7 @@ class BagelOutputAdapter(DitOutputAdapter):
     """Response side: one image generation Part with prompt-carrying conditions."""
 
     def build_segment(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Any:
-        """The DiT trajectory segment (asserts the σ echo). No AR sweep (BAGEL
-        single-stage has no Stage-0 completions)."""
+        """The DiT trajectory segment (asserts the σ echo)."""
         diff_outputs, _, _ = collect_dit_outputs(
             per_request, final_output_type=self.final_output_type, stage_id=self.stage_id, modality=self.modality
         )
@@ -216,13 +162,7 @@ class BagelOutputAdapter(DitOutputAdapter):
         return pils_to_images(pil_images)
 
     def build_conditions(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
-        """Ship the PROMPTS (deferred conditions) for trainer-side KV rebuild.
-
-        BAGEL KV contexts can't cross the IPC boundary, so instead of capturing
-        embeds we carry the prompt text + per-sample image shape. The trainer's
-        :class:`BagelDiffusionStage` rebuilds the three KV contexts on its own
-        bundle at replay (the und/text path is frozen → identical contexts).
-        """
+        """Ship the PROMPTS (deferred conditions) for trainer-side KV rebuild."""
         del per_request
         turns = sample.text_conditioning()
         if len(turns) != 1:
@@ -258,14 +198,7 @@ class BagelT2iAdapter(ModelAdapter):
         self.output_adapter = BagelOutputAdapter(self.modality)
 
     def schedule_policy(self) -> FlowMatchSchedulePolicy:
-        """Static-shift FlowMatch σ policy (BAGEL uses no dynamic shifting).
-
-        Mirrors the trainside ``BagelPipeline.build_schedule_policy`` — a plain
-        static-shift policy from ``model_config.shift`` — rather than the base
-        ``from_pretrained`` path (the BAGEL checkpoint ships no
-        ``scheduler_config.json``). The shift MUST equal BAGEL's hardwired
-        ``timestep_shift`` (3.0) for the worker schedule to echo back equal.
-        """
+        """Static-shift FlowMatch σ policy (BAGEL uses no dynamic shifting)."""
         shift = float(getattr(self.model_config, "shift", 3.0))
         return FlowMatchSchedulePolicy.static_only(shift)
 

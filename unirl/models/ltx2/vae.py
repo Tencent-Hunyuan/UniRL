@@ -13,11 +13,7 @@ if TYPE_CHECKING:
 
 
 class LTX2VAEDecodeStage:
-    """Decode latents → video frames via the LTX2 3D-VAE.
-
-    The LTX2 VAE uses 32x spatial and 8x temporal compression with 128
-    latent channels. Latents are in shape (B, C, T_lat, H_lat, W_lat).
-    """
+    """Decode denormalized video latents into varlen-packed ``Videos`` with frames in ``[0, 1]``."""
 
     def __init__(self, bundle: "LTX2Bundle") -> None:
         self.vae = bundle.vae
@@ -26,15 +22,7 @@ class LTX2VAEDecodeStage:
 
     @torch.no_grad()
     def decode(self, latents: torch.Tensor) -> Videos:
-        """Decode (already-denormalized) video latents → packed ``Videos``.
-
-        Args:
-            latents: (B, C, T_lat, H_lat, W_lat) in VAE latent space,
-                ALREADY denormalized by the pipeline (``_denormalize_latents``).
-
-        Returns:
-            ``Videos`` (varlen-packed) with per-frame values in ``[0, 1]``.
-        """
+        """Decode (already-denormalized) video latents → packed ``Videos``."""
         vae = self.vae
         latents_f32 = latents.to(torch.float32)
 
@@ -51,11 +39,7 @@ class LTX2VAEDecodeStage:
 
 
 class LTX2VAEEncodeStage:
-    """Encode video frames → latents for I2V conditioning.
-
-    Used to encode the first frame (source image) into latent space
-    for image-to-video conditioning.
-    """
+    """Encode frames ``(B, C, T, H, W)`` or ``(B, C, H, W)`` in ``[0, 1]`` into latents."""
 
     def __init__(self, bundle: "LTX2Bundle") -> None:
         self.vae = bundle.vae
@@ -64,14 +48,7 @@ class LTX2VAEEncodeStage:
 
     @torch.no_grad()
     def encode(self, frames: torch.Tensor) -> torch.Tensor:
-        """Encode frames → latents.
-
-        Args:
-            frames: (B, C, T, H, W) or (B, C, H, W) pixel values in [0, 1].
-
-        Returns:
-            Latents (B, C_lat, T_lat, H_lat, W_lat).
-        """
+        """Encode frames → latents."""
         if frames.dim() == 4:
             frames = frames.unsqueeze(2)
         frames = frames.to(dtype=self.vae.dtype)
@@ -80,14 +57,7 @@ class LTX2VAEEncodeStage:
 
 
 class LTX2AudioDecodeStage:
-    """Decode packed audio latents → waveform via audio VAE + vocoder (LTX-2.3).
-
-    Mirrors diffusers ``LTX2Pipeline`` audio decode (and Flow-Factory's
-    ``decode_latents`` audio branch): the operation order is
-    **denormalize → unpack → audio_vae.decode → vocoder** — note that unlike
-    video, audio is denormalized while still PACKED ``[B, S, D]`` and only then
-    unpacked to the spectrogram layout ``[B, C, L, M]``.
-    """
+    """Decode packed audio latents ``[B, S, D]`` — denormalized while packed, then unpacked to ``[B, C, L, M]``."""
 
     def __init__(self, bundle: "LTX2Bundle") -> None:
         if bundle.audio_vae is None or bundle.vocoder is None:
@@ -100,32 +70,19 @@ class LTX2AudioDecodeStage:
     def _denormalize_audio_latents(
         latents: torch.Tensor, latents_mean: torch.Tensor, latents_std: torch.Tensor
     ) -> torch.Tensor:
-        """Inverse of the audio VAE normalization, on the packed ``[B, S, D]``
-        latent (verbatim from diffusers ``_denormalize_audio_latents``)."""
+        """Inverse of the audio VAE normalization, on the packed ``[B, S, D]`` latent (verbatim from diffusers)."""
         latents_mean = latents_mean.to(latents.device, latents.dtype)
         latents_std = latents_std.to(latents.device, latents.dtype)
         return latents * latents_std + latents_mean
 
     @staticmethod
     def _unpack_audio_latents(latents: torch.Tensor, latent_length: int, num_mel_bins: int) -> torch.Tensor:
-        """Packed ``[B, L, C*M]`` → spectrogram ``[B, C, L, M]`` (verbatim from
-        diffusers ``_unpack_audio_latents``, default no-patch path: implicit
-        ``patch_size = M``, ``patch_size_t = 1``)."""
+        """Packed ``[B, L, C*M]`` to spectrogram ``[B, C, L, M]`` — diffusers ``_unpack_audio_latents``, verbatim."""
         return latents.unflatten(2, (-1, num_mel_bins)).transpose(1, 2)
 
     @torch.no_grad()
     def decode(self, audio_latents: torch.Tensor, *, audio_latent_length: int) -> torch.Tensor:
-        """Decode packed audio latents → waveform.
-
-        Args:
-            audio_latents: Packed audio latents ``[B, S, D]`` (the clean
-                final-step audio from the diffusion stage's ``aux_latents``).
-            audio_latent_length: Number of audio LATENT frames ``L`` (so the
-                unpack can recover ``[B, C, L, M]``).
-
-        Returns:
-            Waveform tensor from the vocoder.
-        """
+        """Decode packed audio latents → waveform."""
         mel_bins = int(getattr(self.audio_vae.config, "mel_bins", 64))
         mel_compression = int(getattr(self.audio_vae, "mel_compression_ratio", 4))
         latent_mel_bins = mel_bins // mel_compression

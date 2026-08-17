@@ -1,10 +1,4 @@
-"""GSM8K-style numeric exact-match reward scorer for text-RL QA tasks.
-
-Sibling of :mod:`mc_exact_match` (which is letter-only A-D). Here the answer is
-a number: extraction prefers the GSM8K ``#### <answer>`` marker, then falls back
-to the last numeric value in the text; the prediction is string-compared to the
-ground-truth answer (commas stripped). Used by the AR DRPO Qwen3 recipe.
-"""
+"""GSM8K-style numeric exact-match reward scorer for text-RL QA tasks."""
 
 from __future__ import annotations
 
@@ -22,10 +16,7 @@ _NUMERIC_PATTERN = re.compile(r"[-+]?\d*\.?\d+")
 
 
 def _extract_answer(text: str) -> str:
-    """Extract the predicted numeric answer.
-
-    Priority: ``#### <number>`` marker → last numeric value in the text.
-    """
+    """Extract the predicted numeric answer."""
     if not text:
         return ""
     hash_match = _HASH_ANSWER_PATTERN.search(text)
@@ -38,8 +29,7 @@ def _extract_answer(text: str) -> str:
 
 
 class GSM8KExactMatchRewardScorer(LocalRewardBackend):
-    """Numeric exact-match reward for GSM8K-style QA (1.0 if the extracted
-    answer equals the ground truth, else 0.0)."""
+    """Numeric exact-match reward for GSM8K-style QA (1.0 if the extracted answer equals the ground truth, else 0.0)."""
 
     canonical_model_name = "gsm8k_exact_match"
     input_kind = "text"

@@ -1,14 +1,4 @@
-"""Cosmos3 SFT configuration.
-
-One plain dataclass consumed by :class:`~unirl.models.cosmos3.bundle.Cosmos3Bundle`
-and the packed Cosmos3 pipeline. Recipes reference it by
-``_target_: unirl.models.cosmos3.config.Cosmos3SFTConfig`` — no registration.
-
-Cosmos3-Nano is a 16B Mixture-of-Transformers: a causal "understanding" (und)
-text stream and a bidirectional "generation" (gen) stream share each
-``Cosmos3VLTextMoTDecoderLayer`` with disjoint parameter sets. SFT here trains
-the gen stream (velocity prediction) and freezes the und stream by default.
-"""
+"""Cosmos3 omnimodal SFT configuration."""
 
 from __future__ import annotations
 

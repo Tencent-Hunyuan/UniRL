@@ -1,38 +1,4 @@
-"""Flux2KleinPipeline — ``Sample → Sample`` end-to-end for FLUX.2-klein-9B.
-
-Implements the typed four-tier flow::
-
-    Texts ──text_embed──▶ Flux2KleinConditions ──diffuse──▶ LatentSegment
-                                                              │
-                                                              ▼
-                                                         vae_decode
-                                                              │
-                                                              ▼
-                                                            Images
-
-Hydra constructs a pipeline via
-``Flux2KleinPipeline.from_config(Flux2KleinPipelineConfig)`` (see
-``config.py``); ``from_config`` loads the :class:`Flux2KleinBundle`
-then constructs the four stages with the precision policy from the
-config.
-
-σ schedule contract
--------------------
-The hosting engine (``TrainsideRolloutEngine`` / ``SGLangDiffusionRolloutEngine``
-/ ``VLLMOmniRolloutEngine``) pins the σ schedule onto the gen Part's
-``DiffusionSamplingParams.sigmas`` BEFORE calling ``generate(sample)``; this
-pipeline reads ``params.sigmas`` and uses it
-verbatim.
-
-FLUX.2-klein-specific override: μ depends on both ``image_seq_len`` AND
-``num_inference_steps`` (the linear-interp
-:func:`calculate_dynamic_mu` used by SD3 / Qwen-Image only depends on
-``image_seq_len``). :meth:`build_schedule_policy` returns a custom
-:class:`Flux2KleinSchedulePolicy` that overrides only
-:meth:`FlowMatchSchedulePolicy.compute_mu` (the μ value); the shared
-:meth:`FlowMatchSchedulePolicy.compute_sigma` builds the schedule for all
-models, Klein included.
-"""
+"""Flux2KleinPipeline — ``Sample → Sample`` end-to-end for FLUX.2-klein-9B."""
 
 from __future__ import annotations
 
@@ -59,21 +25,7 @@ from .vae import Flux2KleinVAEDecodeStage, Flux2KleinVAEEncodeStage
 
 
 class Flux2KleinPipeline(Pipeline):
-    """FLUX.2-klein-9B generate pipeline (t2i / image-edit): ``Sample → Sample``.
-
-    Consumes a request ``Sample`` whose frontier Part is a pre-forked diffusion gen
-    shell carrying ``DiffusionSamplingParams`` (with ``sigmas`` pinned by the
-    hosting engine). Reads the prompt — and, for image-edit, the chained source
-    image — via ``sample.conditioning()`` and fills the frontier Part:
-
-    - ``segment: LatentSegment`` (patchified spatial shape
-      ``[B, K, 128, H_pat, W_pat]``).
-    - ``primitives["image"]: Images`` — the decoded images.
-
-    ``Part.conditions`` carries the encoded conditions for trainer-side replay (the train stack re-types them via ``conditions_cls.from_dict``). User-supplied negatives are
-    deferred; the canonical Klein recipe runs at ``guidance_scale=1.0`` with no
-    negative branch, so CFG synthesizes an empty negative only when guidance > 1.
-    """
+    """FLUX.2-klein-9B generate pipeline (t2i / image-edit): ``Sample → Sample``."""
 
     def __init__(
         self,
@@ -118,32 +70,12 @@ class Flux2KleinPipeline(Pipeline):
         self.shift = shift
 
     def build_schedule_policy(self):
-        """Build the Klein-specific schedule policy.
-
-        FLUX.2-klein-9B was trained with an empirical-μ schedule that
-        depends on **both** the packed image_seq_len AND the number of
-        inference steps. The standard :class:`FlowMatchSchedulePolicy`
-        only encodes the image_seq_len → μ mapping linearly
-        (``calculate_dynamic_mu``), so we return a Klein-specific subclass
-        that overrides :meth:`compute_mu` with the empirical formula. The
-        σ application (base grid + diffusers time-shift) is the shared
-        dynamic-shift path. ``time_shift_type`` must match the checkpoint's
-        ``scheduler_config.json`` (FLUX.2 uses ``"exponential"``).
-        """
+        """Build the Klein-specific schedule policy."""
         return build_flux2_klein_schedule_policy(self.shift)
 
     @classmethod
     def latent_shape(cls, *, model_config: Any, sampling_spec: Any) -> tuple:
-        """Per-sample patchified latent shape ``(C_pack=128, H_pat, W_pat)``
-        for driver-side noise pre-computation.
-
-        FLUX.2-klein-9B: 32-channel post-VAE latents (``AutoencoderKLFlux2``),
-        2×2 channel-packed for the transformer input (128 = 32 × 4),
-        post-VAE spatial 8× downsample plus the patchify factor of 2.
-        ``Flux2KleinDiffusionStage`` operates directly on the patchified
-        shape ``[B, 128, H_pix/16, W_pix/16]``; the driver-shipped
-        initial-noise tensor must match this geometry.
-        """
+        """Per-sample patchified latent shape ``(C_pack=128, H_pat, W_pat)``"""
         height = int(sampling_spec.height)
         width = int(sampling_spec.width)
         downsample = 8 * 2
@@ -162,14 +94,7 @@ class Flux2KleinPipeline(Pipeline):
         *,
         strategy: Optional[StepStrategy] = None,
     ) -> "Flux2KleinPipeline":
-        """Build the full pipeline from a config.
-
-        ``strategy`` defaults to :class:`DanceSDEStrategy` — the
-        canonical Klein training-script setting
-        (``main_flux_bundle/reproduce_scripts/train_grpo_flux2_klein9b_sglang_multinode.sh``
-        sets ``SDE_TYPE=dance``). Callers running an alternate SDE
-        family pass an explicit strategy.
-        """
+        """Build the full pipeline from a config."""
         bundle = Flux2KleinBundle.from_config(config)
         text_embed = Flux2KleinTextEmbedStage(
             bundle,
@@ -202,19 +127,7 @@ class Flux2KleinPipeline(Pipeline):
         negatives: Optional[Texts] = None,
         guidance_scale: float = 1.0,
     ) -> Flux2KleinConditions:
-        """Encode prompts (+ optional CFG negatives) into ``Flux2KleinConditions``.
-
-        CFG empty negative: Klein's canonical training-script setting is
-        ``guidance_scale=1.0`` (the script literally hardcodes it; see
-        ``main_flux_bundle/reproduce_scripts/train_grpo_flux2_klein9b_sglang_multinode.sh``).
-        When CFG is OFF, no negative branch is needed and we leave
-        ``negative_text=None`` so the transformer runs only the
-        conditional forward. When a downstream user opts in to
-        ``guidance_scale > 1`` without supplying ``negative_text``,
-        default to an empty string (the Qwen3 chat-template tokenizer
-        is robust to ``""``: no chat-template prefix is stripped, so
-        the resulting embedding is well-defined).
-        """
+        """Encode prompts (+ optional CFG negatives) into ``Flux2KleinConditions``."""
         if negatives is not None and len(negatives.texts) != len(texts.texts):
             raise ValueError(
                 f"Flux2KleinPipeline.build_conditions: negative_text length "
@@ -227,12 +140,7 @@ class Flux2KleinPipeline(Pipeline):
         return Flux2KleinConditions(text=text_cond, negative_text=negative_text_cond)
 
     def generate(self, sample: Sample) -> Sample:
-        """Run FLUX.2-klein-9B t2i/edit end-to-end, filling the frontier (pre-forked) gen Part.
-
-        Requires σ to be pinned onto the gen part's ``DiffusionSamplingParams.sigmas``
-        by the hosting engine before the call; see the σ ownership note in
-        ``unirl.models.types.pipeline``.
-        """
+        """Run FLUX.2-klein-9B t2i/edit end-to-end, filling the frontier (pre-forked) gen Part."""
         frontier = sample.parts[-1]
         sampling = frontier.sampling_params
         if sampling is None:

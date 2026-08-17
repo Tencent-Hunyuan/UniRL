@@ -1,44 +1,38 @@
 # @package _global_
-# Qwen3-8B LoRA SFT on multi-turn tool-calling trajectories.
+# Validation run: Qwen3-8B LoRA SFT on alpaca-cleaned (~20k rows, ~3 epochs).
 #
-# Prepare:
-#   python -m unirl.utils.prepare_sft_agent \
-#     --out-dir datasets/sft_agent_toolcall_12k
-#
-# Launch (1x8):
-#   ENTRY=train_sft bash examples/run_experiment_single_node.sh \
-#     sft/validation/qwen3_agent_sft_lora
+# Launch (1×8):
+#   ENTRY=train_sft bash examples/run_experiment_single_node.sh sft/qwen3_sft_lora
 
 num_devices: 8
 batch_size: 64
-num_steps: 600
-eval_interval: 20
+num_steps: 1000
+eval_interval: 50
 eval_batch_size: 16
-eval_num_samples: 64
-save_interval: 20
-save_dir: ${oc.env:SFT_SAVE_DIR,checkpoints/sft_qwen3_agent}
+eval_num_samples: -1
+save_interval: 200
+save_dir: ${oc.env:SFT_SAVE_DIR,checkpoints/sft_qwen3}
 save_mode: auto
 
 logging:
   report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,true}}
-  project_name: ${oc.env:WANDB_PROJECT,unirl-agent-sft}
-  run_name: ${oc.env:WANDB_RUN_NAME,qwen3-8b-lora-toolcall}
+  project_name: ${oc.env:WANDB_PROJECT,unirl-sft-validation}
+  run_name: ${oc.env:WANDB_RUN_NAME,qwen3-8b-lora-alpaca}
   entity: ${oc.env:WANDB_ENTITY,null}
-  tags: [sft, agent, tool-call, qwen3, llm, lora]
+  tags: [sft, qwen3, llm, lora, validation]
 
 bundle:
   _target_: unirl.models.qwen3.bundle.Qwen3Bundle.from_config
   config:
     _target_: unirl.models.qwen3.config.Qwen3PipelineConfig
     pretrained_model_ckpt_path: ${oc.env:QWEN3_PATH,Qwen/Qwen3-8B}
-    model_precision: bf16
+    model_precision: fp32
     use_gradient_checkpointing: true
     attn_implementation: flex_attention
 
 pipeline:
   _target_: unirl.models.qwen3.pipeline.Qwen3Pipeline.from_bundle
-  enable_thinking: true
-  max_prompt_length: 8192
+  enable_thinking: false
   autocast_precision: bf16
   logprob_precision: fp32
 
@@ -53,8 +47,7 @@ backend:
     mixed_precision: true
     fsdp_mode: full
     reshard_after_forward: true
-    activation_checkpointing: false
-    master_dtype: fp32
+    activation_checkpointing: true
     use_torch_compile: false
   optimizer_cfg:
     _target_: unirl.train.backend.base.OptimizerConfig
@@ -91,15 +84,15 @@ algorithm:
 
 stack:
   _target_: unirl.train.stack.TrainStack
-  micro_batch_size: 1
+  micro_batch_size: 2
   max_grad_norm: 1.0
 
 track_builder:
   _target_: unirl.train.sft.track_builder.ARSupervisedTrackBuilder
-  max_response_length: 1024
+  max_response_length: 2048
 
 data_source:
   _target_: unirl.data.sft.SupervisedDataSource
-  manifest_path: ${oc.env:SFT_DATA,datasets/sft_agent_toolcall_12k/train.jsonl}
-  eval_manifest_path: ${oc.env:SFT_EVAL_DATA,datasets/sft_agent_toolcall_12k/val.jsonl}
+  manifest_path: ${oc.env:SFT_DATA}
+  eval_manifest_path: ${oc.env:SFT_EVAL_DATA,${oc.env:SFT_DATA}}
   seed: 42

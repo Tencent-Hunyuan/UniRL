@@ -1,17 +1,4 @@
-r"""LLM-as-judge reward scorer (LIN-519).
-
-Grades a free-form prediction against a reference answer by asking an
-OpenAI-compatible chat endpoint whether they are equivalent, then parsing a
-correct/incorrect verdict into ``1.0`` / ``0.0``. The text-reward path for
-deep-research / open-ended QA where a symbolic verifier (math-verify) does not
-apply.
-
-The judge is hosted OUT-OF-BAND (a separate SGLang / vLLM OpenAI server, or any
-OpenAI-compatible API); this scorer only POSTs to it, so no weight sync / GPU
-placement is involved. ``base_device`` is ignored (HTTP, no local model). The
-endpoint / model / key come from the recipe :class:`LLMJudgeSpec`, overridable at
-load time by ``$JUDGE_URL`` / ``$JUDGE_MODEL`` / ``$JUDGE_API_KEY``.
-"""
+r"""LLM-as-judge reward scorer."""
 
 from __future__ import annotations
 
@@ -48,8 +35,7 @@ _CORRECT_RE = re.compile(r"\b(?:correct|equivalent|yes)\b")
 
 
 def _parse_verdict(content: str) -> float:
-    """Parse a judge reply into 1.0 (equivalent) / 0.0 (not), robust to the
-    "incorrect"⊃"correct" substring trap and to "not correct" / "wrong" phrasings."""
+    """Parse a judge reply into 1.0 / 0.0, robust to the 'incorrect' contains 'correct' substring trap."""
     c = (content or "").strip().lower()
     if _INCORRECT_RE.search(c):
         return 0.0
@@ -59,8 +45,7 @@ def _parse_verdict(content: str) -> float:
 
 
 class LLMJudgeRewardScorer(LocalRewardBackend):
-    """Reward = 1.0 if an LLM judge deems the prediction equivalent to the
-    reference answer, else 0.0. POSTs to an OpenAI-compatible chat endpoint."""
+    """Reward 1.0 when an LLM judge deems the prediction equivalent to the reference answer, else 0.0."""
 
     canonical_model_name = "llm_judge"
     input_kind = "text"
@@ -124,9 +109,7 @@ class LLMJudgeRewardScorer(LocalRewardBackend):
 
 @dataclass
 class LLMJudgeSpec(BaseRewardComponentSpec):
-    """Config for the LLM-as-judge scorer. ``endpoint`` / ``model`` / ``api_key``
-    are overridable at load time by ``$JUDGE_URL`` / ``$JUDGE_MODEL`` /
-    ``$JUDGE_API_KEY`` (keep secrets out of the recipe)."""
+    """Config for the LLM-as-judge scorer."""
 
     endpoint: str = ""
     model: str = ""

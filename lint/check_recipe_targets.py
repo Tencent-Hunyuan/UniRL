@@ -1,22 +1,5 @@
 #!/usr/bin/env python3
-"""Static guard: every ``_target_`` in a recipe must resolve to a real symbol.
-
-Renames (e.g. ``unirl.algorithms.ar_grpo.ARGRPO`` -> ``unirl.algorithms.grpo.GRPO``)
-break Hydra ``instantiate`` only at *runtime*, and this repo's CI is lint-only, so a
-stale dotted path can merge silently. This check parses every recipe ``_target_:``
-pointing into one of the ``PACKAGES`` trees and confirms the module file and the
-attribute exist — purely via ``ast``, importing nothing (no torch/vllm/sglang needed).
-
-Only ~0.2s of the runtime is parsing; the rest is filesystem latency, which dominates
-when the checkout lives on a network filesystem. So the tree is walked once to index
-every module (rather than probing candidate paths per target, which costs ~10k stat
-calls) and file contents are read through a thread pool. On CephFS that takes the
-hook from ~5m30s to ~26s.
-
-Run by the ``check-recipe-targets`` pre-commit hook (so it rides the existing
-``pre-commit run --all-files`` lint CI). Exits non-zero, listing each unresolved
-target, when any path is dead.
-"""
+"""Static guard: every ``_target_`` in a recipe must resolve to a real symbol."""
 
 from __future__ import annotations
 
@@ -91,12 +74,7 @@ def _top_level_names(source: str, path: Path) -> frozenset[str] | None:
 
 
 def _split_module(dotted: str, modules: dict[str, Path]) -> tuple[Path, str] | None:
-    """Longest module prefix of ``dotted`` that exists, with the attribute after it.
-
-    Walks the standard Python split: try module = all-but-last part, attr = last;
-    if that module does not exist, fold trailing parts back into the attribute chain
-    until one does. None when no prefix names a module at all.
-    """
+    """Longest module prefix of ``dotted`` that exists, with the attribute after it."""
     parts = dotted.split(".")
     for split in range(len(parts) - 1, 0, -1):
         module_file = modules.get(".".join(parts[:split]))

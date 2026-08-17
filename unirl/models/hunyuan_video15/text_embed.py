@@ -1,29 +1,4 @@
-"""HunyuanVideo15TextEmbedStage — dual-encoder text → two TextEmbedConditions.
-
-HunyuanVideo-1.5 cross-attends to **two parallel text streams**:
-
-- ``mllm``  — Qwen2.5-VL multimodal LLM. The prompt is wrapped in a
-  chat template, tokenized with padding to ``mllm_max_length +
-  mllm_crop_start``, encoded, and the chat-template prefix is stripped
-  by slicing ``[:, mllm_crop_start:]``. The encoder output picked up is
-  the ``(skip_layers + 1)``-th-from-last hidden state (NOT the final
-  hidden state) — matches the upstream pipeline.
-- ``glyph`` — ByT5 byte-level T5 encoder, intended for legible text
-  inside videos. The prompt is regex-scanned for quoted snippets
-  (``"..."`` and curly quotes); each unique snippet becomes a
-  ``Text "..."`` token chunk that the encoder consumes. When no quoted
-  text is present, the stage emits a zero placeholder of shape
-  ``[1, byt5_max_length, d_model]`` so the downstream concat shape
-  stays uniform across prompts.
-
-Implements two unary embed methods (``embed_mllm`` / ``embed_glyph``)
-rather than the strict :class:`EmbedStage` protocol — the dual output
-doesn't fit ``embed(p) -> C``. The pipeline calls them in pairs for the
-positive and negative branches.
-
-Math copied at the spec level from the original HunyuanVideo-1.5
-text-encoder wrapper (PR #101). Spec sync is via review / test.
-"""
+"""HunyuanVideo15TextEmbedStage — mllm (skip_layers+1 from last) + ByT5; null ByT5 is a zero placeholder."""
 
 from __future__ import annotations
 
@@ -50,12 +25,7 @@ _GLYPH_PATTERN = re.compile(r"\"(.*?)\"|“(.*?)”")
 
 
 def _extract_glyph_texts(prompt: str) -> Optional[str]:
-    """Extract quoted glyph snippets and reformat to ``Text "...". `` form.
-
-    Mirrors ``pipeline_hunyuan_video1_5.extract_glyph_texts``. Returns
-    ``None`` when no quoted glyph text is present so callers can
-    substitute a zero embedding tensor.
-    """
+    """Extract quoted glyph snippets and reformat to ``Text "...". `` form."""
     matches = _GLYPH_PATTERN.findall(prompt)
     result = [m[0] or m[1] for m in matches]
     result = list(dict.fromkeys(result)) if len(result) > 1 else result
@@ -76,14 +46,7 @@ def _format_chat_template(prompts: List[str], system_message: str) -> List[List[
 
 
 class HunyuanVideo15TextEmbedStage:
-    """Dual-encoder text → two ``TextEmbedCondition`` instances.
-
-    Not a strict ``EmbedStage[Texts, TextEmbedCondition]`` because the
-    dual-stream output doesn't fit a unary ``embed(p) -> C`` shape.
-    Provides ``embed_mllm`` / ``embed_glyph`` instead; the pipeline
-    calls them in pairs for positive and (when CFG is on) negative
-    branches.
-    """
+    """Dual-encoder text → two ``TextEmbedCondition`` instances."""
 
     def __init__(
         self,

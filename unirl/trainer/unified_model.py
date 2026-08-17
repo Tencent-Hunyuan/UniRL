@@ -1,53 +1,4 @@
-"""UniRL v2 HunyuanImage3 unified-backbone trainer.
-
-One shared HunyuanImage3 backbone (a single MoE transformer that operates in
-``mode="gen_text"`` for AR and ``mode="gen_image"`` for DiT) trained jointly by
-two algorithms — ``GRPO`` over the AR ``TextSegment`` and ``FlowGRPO``
-over the DiT ``LatentSegment`` — both backward-accumulating into ONE LoRA
-adapter with a single optimizer step (see :class:`UnifiedModelTrainStack`).
-
-Two-engine design (mirrors :class:`~unirl.models.pe.pipeline.PEPipeline`'s
-two-level fan-out but with the backbone shared). PE composes two in-process
-child pipelines (SD3 + Qwen3, two LoRAs); HI3 instead drives TWO standalone
-vLLM-Omni engine Remotes that share ONE backbone / ONE LoRA:
-
-- ``ar_rollout`` (modality ``hi3_ar_recaption``, GPUs 0-3): original prompt → ``N``
-  think/recaption texts (group-by-prompt → AR GRPO).
-- ``dit_rollout`` (modality ``hi3_dit_recaption``, GPUs 4-7): each recaption → ``M``
-  images of distinct noise (group-by-recaption → FlowGRPO).
-
-The trainer assembles the lineage itself (pre-forks ``[input, ar_shell,
-image_shell]`` then re-roots a flat 1:1 sub-request per engine and fills the
-shells, exactly like ``ComposedRolloutEngine.generate``) because the two engines
-are independent Remotes, not a composed pipeline. Reward routing then matches
-:class:`~unirl.trainer.pe.PETrainer`: score the image Part, credit-assign
-the mean image reward up to the AR Part, per-Part GRPO advantages, then ONE
-:class:`UnifiedModelTrainStack` step (ar.loss + image.loss → one optimizer step on the
-single shared LoRA).
-
-GPU partition: each engine is ONE multi-GPU actor anchored on a distinct worker
-via ``pool.create_remote(device_ids=[0])`` / ``[4]`` (NOT plain ``remote()``,
-which would bind it to the whole fraction=1.0 scope and collide both engines'
-device-env in one process). Each engine clears ``CUDA_VISIBLE_DEVICES`` for its
-multi-GPU HI3 modality (see ``engine._HI3_MULTI_GPU_MODALITIES``) and its stage
-YAML's ``runtime.devices`` pins AR→0-3 / DiT→4-7 — disjoint physical cards. The
-boot-smoke anchor was unsafe only because nothing time-shared the cards; here
-the colocate dance (base offloaded during rollout, engines asleep during train)
-makes anchoring correct — see ``train_step`` and ``_wire_engine``.
-
-One ``train_step``::
-
-    wake ar+dit; [sync → both]; sample = run_rollout(sample)  # → [input, ar, image]
-    sleep ar+dit
-    reward.score_and_attach(sample)              # only the frontier image Part is scorable
-    sample.propagate_rewards("mean")             # image reward → ar Part
-    part.compute_advantages() per Part           # ar groups by prompt, image by recaption
-    unified_model_stack.train_track(sample)      # tree-shard lineage → 2 backward → 1 step
-
-Pairs with ``examples/unified_model/hi3_vllmomni.yaml`` and ``unirl/train_unified_model.py``.
-Deferred (same as the reference trainers): multi-epoch replay, checkpoint /
-eval cadence, structured logging.
-"""
+"""UniRL v2 HunyuanImage3 unified-backbone trainer."""
 
 from __future__ import annotations
 
@@ -78,23 +29,7 @@ logger = logging.getLogger(__name__)
 
 
 def deep_hydrate(obj: Any) -> Any:
-    """Materialize every ``TensorRef`` leaf in ``obj`` to a real tensor, in place.
-
-    The anchored single-actor engines return each track as ONE transport handle
-    (a single ref spanning all samples), but the train side is num_devices-way DP and
-    slices each track into per-rank shards — a single ref can't be intra-handle
-    sliced. Hydrating on the driver fixes the mismatch (the DP dispatch then
-    re-shards real tensors), but the driver has no ``TensorTransportRuntime``
-    installed, so the runtime-backed ``TensorTransport.hydrate`` is
-    unavailable here. ``hydrate`` instead pulls each leaf through
-    its ref's ``.materialize(backend=None)`` (a plain ``ray.get`` from the owning worker's store),
-    which works from the driver — we walk the nested Batch/dict/list/TUPLE
-    structure and apply it to every ``TensorRef``.
-
-    NB: this walks tuples too (rebuilding them), unlike ``_collect_leaves``.
-    HI3's trainside rope is now a stacked ``[B, 2, L, D]`` CONCAT tensor;
-    the tuple case remains supported for other nested transport payloads.
-    """
+    """Materialize every ``TensorRef`` leaf in ``obj`` to a real tensor, in place."""
     if isinstance(obj, TensorRef):
         return hydrate(obj)
     if isinstance(obj, Batch):
@@ -249,18 +184,7 @@ class UnifiedModelTrainer(BaseTrainer):
                 )
 
     def _wire_engine(self, cfg: DictConfig, *, anchor_device: int) -> Any:
-        """Build ONE multi-GPU vLLM-Omni engine actor anchored on one worker.
-
-        ``device_ids=[anchor_device]`` pins the actor to a SINGLE worker (one
-        process), not the whole placement scope — the engine is one TP-parallel
-        Omni server, not a per-device DP replica. Inside the Omni subprocess the
-        engine clears ``CUDA_VISIBLE_DEVICES`` and its stage YAML's
-        ``runtime.devices`` spreads the TP group across its physical cards; using
-        a distinct anchor per engine keeps the two engines' device-env setup in
-        separate processes so they pin to disjoint cards (see the call site).
-        The standalone HI3 engines take no ``pipeline`` (they boot their own
-        Omni), so nothing sibling-handle-resolved is forwarded.
-        """
+        """Build ONE multi-GPU vLLM-Omni engine actor anchored on one worker."""
         parsed = parse_hydra_cfg(cfg)
         role_cls = parsed.pop("role_cls")
         return self.pool.create_remote(role_cls, device_ids=[anchor_device], init_kwargs=parsed)
@@ -272,17 +196,7 @@ class UnifiedModelTrainer(BaseTrainer):
         *,
         sampling: Optional[Dict[str, BaseSamplingParams]] = None,
     ) -> Sample:
-        """Turn a data-source batch of ``P`` prompts into the unified request ``Sample``.
-
-        Namespaces the data source's single text input Part, then pre-forks
-        the unified lineage shells ``[input, ar_shell(P*N), image_shell(P*N*M)]``
-        (located by sampling-params type); ``run_rollout`` drives the two engines
-        and fills these shells. ``rollout_id`` keys the
-        diffusion SDE-step schedule (``scheduler`` nulled so only the concrete
-        ``sde_indices`` ride) and salts the root ids. The AR sub-block has no SDE
-        machinery and is left untouched. ``sampling`` optionally supplies the
-        evaluation sampling parameters.
-        """
+        """Turn a data-source batch of ``P`` prompts into the unified request ``Sample``."""
         base = sampling if sampling is not None else self.sampling_params
         diff_params = base.get("diffusion")
         ar_params = base.get("ar")
@@ -304,19 +218,7 @@ class UnifiedModelTrainer(BaseTrainer):
         )
 
     def run_rollout(self, sample: Sample) -> Sample:
-        """DP rollout: scatter the ``P`` prompt-trees of the request ``Sample``
-        across the ``dp`` engine replicas (one (AR, DiT) pair per node), run each
-        on its replica, then ``Sample.concat`` the per-replica filled Samples.
-        ``dp<=1`` or ``P<=1`` falls back to the single-replica path.
-
-        v1 runs the replicas SEQUENTIALLY — this validates placement + the
-        scatter/concat correctness; issuing the per-replica ``generate()`` as Ray
-        futures for true concurrent throughput is the follow-up (handoff §8).
-
-        HI3 trainside carries rope_cache as a stacked per-sample CONCAT tensor,
-        so DP concat preserves row alignment. The vLLM-Omni response deliberately
-        omits its engine-layout rope and replay rebuilds an HF-native rope instead.
-        """
+        """DP rollout: scatter the ``P`` prompt-trees of the request ``Sample``"""
         valid_layout = (
             len(sample.parts) == 3
             and sample.parts[0].is_root
@@ -348,24 +250,7 @@ class UnifiedModelTrainer(BaseTrainer):
         return Sample.concat(shards)
 
     def _run_rollout_one(self, ar_engine: Any, dit_engine: Any, sample: Sample) -> Sample:
-        """One (AR, DiT) engine pair: fill the unified ``[input, ar, image]`` lineage.
-
-        Drives the given ``ar_engine`` / ``dit_engine`` pair for this replica's
-        prompt-trees::
-
-            P prompts ──AR engine──▶ P*N recaptions  (root "ar", groups by prompt)
-                      ──DiT engine─▶ P*N*M images     ("image", groups by recaption)
-
-        Each engine runs FLAT (re-rooted, 1:1) — the vLLM-Omni adapters require the
-        input primitive 1:1 with the gen samples — so the AR engine sees ``P*N``
-        pre-expanded prompts and the DiT engine sees ``P*N*M`` (the original prompt
-        plus the recaption chained as a ``cot_text`` input Part via
-        :meth:`Part.input_child`). Their per-sample outputs are mapped back, by row
-        order, onto the unified lineage shells (:meth:`Part.fill`) — both sides are
-        group-by-parent in the same order, so the rows line up. Each image's
-        ``r{rollout_id}:d{k}`` root makes its x_T per-rollout-VARYING (the engine
-        derives the noise key from the gen Part ids).
-        """
+        """One (AR, DiT) engine pair: fill the unified ``[input, ar, image]`` lineage."""
         input_part = sample.parts[0]
         ar_shell = sample.gen_part(ARSamplingParams)
         image_shell = sample.gen_part(DiffusionSamplingParams)
@@ -442,12 +327,7 @@ class UnifiedModelTrainer(BaseTrainer):
         sync_weights: bool = False,
         rollout_id: int = 0,
     ) -> Tuple[Dict[str, TrainStepResult], float]:
-        """One ``rollout → reward → credit-assign → advantage → step`` pass.
-
-        Returns ``(per_track_results, mean_reward)`` — ``mean_reward`` is the
-        mean unnormalized image reward (for the log line). ``rollout_id`` keys
-        the wandb panels (see :meth:`UniRLWandBLogger.log_rollout_step`).
-        """
+        """One ``rollout → reward → credit-assign → advantage → step`` pass."""
         t0 = time.perf_counter()
         if self._single_engine:
             sample = self.run_rollout(sample)
@@ -521,17 +401,7 @@ class UnifiedModelTrainer(BaseTrainer):
         return results, mean_reward
 
     def _dump_rollout(self, rollout_id: int, sample: Any) -> None:
-        """Best-effort intrusive dump of one rollout to ``self.dump_dir``.
-
-        Writes ``rollout_<id>/`` with:
-
-        - ``samples.jsonl`` — one line per sample: original prompt, AR output
-          text (the ``<think>``/``<recaption>`` that conditions DiT in
-          think_recaption mode), image reward, sample/parent ids.
-        - ``img_<k>.png`` — the decoded DiT image for sample ``k``.
-
-        Wrapped so a dump failure never aborts training — observation only.
-        """
+        """Best-effort intrusive dump of one rollout to ``self.dump_dir``."""
         try:
             out_dir = os.path.join(self.dump_dir, f"rollout_{rollout_id}")
             os.makedirs(out_dir, exist_ok=True)
@@ -593,30 +463,7 @@ class UnifiedModelTrainer(BaseTrainer):
             logger.warning("[HI3-DUMP] rollout %d dump failed (non-fatal): %s", rollout_id, exc)
 
     def evaluate(self, step: int) -> float:
-        """Periodic eval on the eval set (no training); returns the mean image reward.
-
-        Mirrors :meth:`train_step`'s rollout+reward path but skips
-        credit-assign/advantage/backward: run the ``P→P*N→P*N*M`` fan-out through
-        :meth:`run_rollout` (works on both the single-engine trainside and the
-        two-engine HI3 path) at the deterministic best-quality setting (CFG at
-        ``eval_cfg_text_scale``, ``eta=eval_eta``) and score ONLY the image
-        track — the training reward plus the ``eval_rewards`` suites (see
-        :mod:`unirl.trainer.eval_suites`). Logs one ``eval/*`` row; returns
-        ``eval/reward``.
-
-        The two-engine path syncs the live adapter into the engines once per
-        eval (EXTRACT with the base onloaded → wake → PUSH → sleep, mirroring
-        :meth:`train_step`'s ordering) — train_step syncs BEFORE its generate,
-        so without this the engines would eval one update stale, and a
-        restored-checkpoint baseline eval would see fresh engine weights.
-        Pushed weights persist across sleep/wake cycles (as train_step relies
-        on), so the passes below just wake/sleep around each chunk's rollout.
-        Unlike train_step, eval never onloads the base after the extract: there
-        is no backward, so the FSDP state stays offloaded (the steady state)
-        throughout. The single-engine trainside path needs none of it (the
-        rollout shares the live FSDP modules; ``_enable_fsdp_offload`` is
-        forced False).
-        """
+        """Periodic eval on the eval set (no training); returns the mean image reward."""
         base_diffusion = self.sampling_params.get("diffusion")
         replace_kwargs = dict(eta=self.eval_eta)
         if "cfg_text_scale" in {f.name for f in dataclasses.fields(base_diffusion)}:
@@ -662,13 +509,7 @@ class UnifiedModelTrainer(BaseTrainer):
         eval_sp: Dict[str, BaseSamplingParams],
         step: int,
     ) -> Dict[str, float]:
-        """One generate→score sweep over one eval set; returns each scorer's mean.
-
-        Chunked by ``self.batch_size`` (the un-expanded P-prompt req DP-splits,
-        so the chunk must be dp-divisible; ``batch_size`` is what training
-        runs). A ragged tail (``num_prompts`` not a multiple of ``batch_size``)
-        is floored off.
-        """
+        """One generate→score sweep over one eval set; returns each scorer's mean."""
         all_inputs = data_source.get_eval_samples(num_prompts)
         n_prompts = all_inputs.batch_size
         chunk = max(1, self.batch_size)
@@ -707,15 +548,7 @@ class UnifiedModelTrainer(BaseTrainer):
         load_dir: Optional[str] = None,
         save_mode: str = "auto",
     ) -> None:
-        """Minimal training loop: ``num_rollouts`` iterations of ``train_step``.
-
-        ``save_interval``: write a checkpoint every N rollouts (and on the last
-        one); ``0`` disables it. ``save_dir`` defaults to ``./checkpoints``;
-        ``save_mode="auto"`` writes LoRA-only checkpoints when LoRA is active
-        and full checkpoints otherwise. ``load_dir``: restore from a checkpoint
-        directory and RESUME from its saved step — ``num_rollouts`` is the TOTAL
-        budget.
-        """
+        """Minimal training loop: ``num_rollouts`` iterations of ``train_step``."""
         interval = max(1, weight_sync_interval)
         start_rollout = self.maybe_load_checkpoint(load_dir, num_rollouts=num_rollouts)
         resumed = bool(load_dir)

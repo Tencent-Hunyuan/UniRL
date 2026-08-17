@@ -1,10 +1,4 @@
-"""CalculatorTool — a safe arithmetic tool (LIN-492).
-
-The first concrete :class:`~unirl.rollout.env.tools.base.Tool`: evaluates an arithmetic
-expression with no infrastructure (no sandbox, no network). Evaluation is a hand-rolled AST walk
-over a numeric whitelist — never :func:`eval` — so a hallucinated ``__import__(...)``, name, or
-attribute access is rejected rather than executed.
-"""
+"""CalculatorTool — a safe arithmetic tool."""
 
 from __future__ import annotations
 

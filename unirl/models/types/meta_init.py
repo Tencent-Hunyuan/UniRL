@@ -1,14 +1,4 @@
-"""Meta-init support for bundles feeding :class:`VeOmniBackend`.
-
-Materializing a meta-built transformer with ``to_empty()`` clobbers every
-init-computed tensor the checkpoint doesn't carry — non-persistent buffers
-(diffusers ``PatchEmbed.pos_embed``, rope ``freqs``) and plain ``__dict__``
-tensors (Qwen-Image rope). :func:`build_meta_init_transformer` builds under
-``init_empty_weights(include_buffers=False)`` (parameters on meta, those tensors
-real on CPU) and captures them; callers stash the capture on
-``bundle._meta_init_state`` for ``load_trainable_weights`` to restore after the
-weight load.
-"""
+"""Meta-init support for bundles feeding :class:`VeOmniBackend`."""
 
 from __future__ import annotations
 
@@ -22,14 +12,7 @@ logger = logging.getLogger(__name__)
 
 
 def capture_init_state(model: nn.Module) -> dict:
-    """Capture ``model``'s init-computed non-persistent state as a picklable dict.
-
-    Returns ``{"buffers": {fqn: cpu_tensor}, "attrs": {(mod, attr): cpu_tensor}}``
-    — non-persistent buffers plus plain ``__dict__`` tensors, cloned to CPU so the
-    capture survives transport (Ray pickling, a rebuilt module). Raises
-    ``ValueError`` if any tensor is still on meta (model built under
-    ``torch.device("meta")`` instead of ``init_empty_weights(include_buffers=False)``).
-    """
+    """Capture ``model``'s init-computed non-persistent state as a picklable dict."""
     persistent = set(model.state_dict().keys())
     buffers = {name: buf.detach().cpu().clone() for name, buf in model.named_buffers() if name not in persistent}
     attrs = {}
@@ -51,24 +34,74 @@ def capture_init_state(model: nn.Module) -> dict:
     return {"buffers": buffers, "attrs": attrs}
 
 
-def restore_init_state(model: nn.Module, captured: Optional[dict]) -> int:
-    """Copy a :func:`capture_init_state` snapshot back onto a materialized module.
+def _canonical_named_modules(model: nn.Module) -> dict[str, nn.Module]:
+    """Index modules by names from before activation-checkpoint wrapping."""
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
 
-    Buffers are ``copy_``-ed into the live buffers (dtype/device cast); plain attrs
-    are re-attached as CPU tensors (forwards ``.to(device)`` them on use). Idempotent;
-    ``captured=None`` -> no-op. Returns the number of tensors restored.
-    """
+    def unwrap(module: nn.Module) -> nn.Module:
+        seen = set()
+        while id(module) not in seen:
+            seen.add(id(module))
+            if isinstance(module, CheckpointWrapper):
+                module = module._checkpoint_wrapped_module
+                continue
+            get_base_layer = getattr(module, "get_base_layer", None)
+            if callable(get_base_layer):
+                base_layer = get_base_layer()
+                if isinstance(base_layer, nn.Module) and base_layer is not module:
+                    module = base_layer
+                    continue
+            break
+        return module
+
+    modules: dict[str, nn.Module] = {}
+    visited = set()
+
+    def visit(module: nn.Module, name: str) -> None:
+        module = unwrap(module)
+        if id(module) in visited:
+            return
+        visited.add(id(module))
+        modules[name] = module
+        for child_name, child in module.named_children():
+            child_fqn = f"{name}.{child_name}" if name else child_name
+            visit(child, child_fqn)
+
+    visit(model, "")
+    return modules
+
+
+def restore_init_state(model: nn.Module, captured: Optional[dict]) -> int:
+    """Copy a :func:`capture_init_state` snapshot back onto a materialized module."""
     if not captured:
         return 0
     buffers = captured.get("buffers", {})
     attrs = captured.get("attrs", {})
-    modules = dict(model.named_modules())
+    modules = _canonical_named_modules(model)
+    buffer_targets = []
+    attr_targets = []
+    missing = []
     for fqn, value in buffers.items():
         mod_name, _, buf_name = fqn.rpartition(".")
-        owner = modules.get(mod_name) if mod_name else model
+        owner = modules.get(mod_name)
         if owner is None or not hasattr(owner, buf_name):
+            missing.append(fqn)
             continue
         live = getattr(owner, buf_name)
+        buffer_targets.append((fqn, live, value))
+    for (mod_name, attr), value in attrs.items():
+        owner = modules.get(mod_name)
+        if owner is None or attr not in vars(owner):
+            missing.append(f"{mod_name}.{attr}" if mod_name else attr)
+            continue
+        attr_targets.append((owner, attr, value))
+    if missing:
+        raise RuntimeError(
+            "restore_init_state: could not resolve captured tensor owner(s) after model wrapping; "
+            f"missing {len(missing)} entry(s): {missing[:8]}"
+        )
+
+    for fqn, live, value in buffer_targets:
         tgt = live.to_local() if hasattr(live, "to_local") else live
         src = value.to(device=tgt.device, dtype=tgt.dtype)
         if tuple(tgt.shape) != tuple(src.shape):
@@ -77,33 +110,16 @@ def restore_init_state(model: nn.Module, captured: Optional[dict]) -> int:
                 f"does not match live local shape {tuple(tgt.shape)}."
             )
         tgt.copy_(src)
-    for (mod_name, attr), value in attrs.items():
-        owner = modules.get(mod_name)
-        if owner is not None:
-            owner.__dict__[attr] = value
-    n = len(buffers) + len(attrs)
+    for owner, attr, value in attr_targets:
+        owner.__dict__[attr] = value
+    n = len(buffer_targets) + len(attr_targets)
     if n:
         logger.info("restore_init_state: recovered %d non-persistent buffer(s) + plain attr(s)", n)
     return n
 
 
 def recover_rope_inv_freq(model: nn.Module) -> int:
-    """Guaranteed post-materialize RoPE ``inv_freq`` recovery (idempotent).
-
-    ``meta`` init + ``to_empty()`` zero the non-persistent RoPE ``inv_freq`` (not in
-    the checkpoint). The capture/stamp/restore recovery is unreliable under FSDP2
-    (empty capture, module renaming, or DTensor buffers), leaving ``inv_freq == 0``
-    -> RoPE becomes the identity (cos=1, sin=0 at every position) -> a position-blind
-    model -> teacher-forced (replay) logprobs are systematically wrong -> the
-    rollout/replay ratio collapses (~0.11) -> a PPO/GRPO trainer clips ~every token
-    and reward cannot move.
-
-    Robust to module renaming (found by ``inv_freq`` presence, not FQN); recomputes
-    from each rotary module's ``config`` (or the model ``config``): explicit
-    scaled variants use transformers' matching ``ROPE_INIT_FUNCTIONS`` entry,
-    while default Qwen RoPE keeps the rollout-verified theta formula. Writes
-    into the LOCAL shard and fails on unsupported scaling or shape drift.
-    """
+    """Guaranteed post-materialize RoPE ``inv_freq`` recovery (idempotent)."""
     device = None
     for p in model.parameters():
         loc = p.to_local() if hasattr(p, "to_local") else p
@@ -160,13 +176,7 @@ def recover_rope_inv_freq(model: nn.Module) -> int:
 
 
 def finalize_meta_init(transformer: nn.Module, *, dtype: torch.dtype) -> nn.Module:
-    """Apply the shared post-build contract for a meta transformer.
-
-    The dtype cast is metadata-only on meta parameters, so ``to_empty`` later
-    allocates the requested master dtype directly. VeOmni calls
-    ``init_weights`` after materialization; replace it with a no-op because the
-    real checkpoint is loaded immediately afterwards.
-    """
+    """Apply the shared post-build contract for a meta transformer."""
     if not any(param.is_meta for param in transformer.parameters()):
         raise ValueError("finalize_meta_init requires a transformer with meta parameters.")
     transformer = transformer.to(dtype)
@@ -179,18 +189,7 @@ def build_meta_init_transformer(
     *,
     dtype: torch.dtype,
 ) -> Tuple[nn.Module, dict]:
-    """Build ``factory()`` on meta, capturing init-computed non-persistent state.
-
-    Builds under ``init_empty_weights(include_buffers=False)`` (parameters on
-    meta, buffers / ``__dict__`` tensors real on CPU), captures that state before
-    the dtype cast, then finalizes: the cast is metadata-only on meta (``to_empty``
-    later materializes in ``dtype``) and ``init_weights`` is stamped to a no-op so
-    VeOmni's ``parallelize`` does not re-initialize after ``to_empty``.
-
-    Returns ``(transformer, captured)``. **Stash** ``captured`` on the bundle as
-    ``bundle._meta_init_state``; ``load_trainable_weights`` restores it after the
-    sharded weight load. Model-specific quirks stay in the bundle.
-    """
+    """Build ``factory()`` on meta, capturing init-computed non-persistent state."""
     from accelerate import init_empty_weights
 
     with init_empty_weights(include_buffers=False):

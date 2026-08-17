@@ -1,15 +1,4 @@
-"""Driver-side ``Sample`` → ``Sample`` conversion: the adapter ABC + registry.
-
-A thin top ABC (registry + boilerplate with sensible defaults) over a per-output-
-shape base adapter (:mod:`image`) that holds the conversion logic as overridable
-methods. Concrete adapters override only what differs and self-register by
-``model_family`` key. Selected once at engine construction via :func:`get_adapter`.
-
-Pure: never imports SGLang — adapters consume the seam's ``RawResult`` protocol
-(a structural view of ``GenerationResult``), not the runtime. The adapter is
-bound to the engine config + model config at construction so its conversion
-methods don't thread them.
-"""
+"""Driver-side ``Sample`` → ``Sample`` conversion: the adapter ABC + registry."""
 
 from __future__ import annotations
 
@@ -52,13 +41,7 @@ def registered_adapters() -> Tuple[str, ...]:
 
 
 class ModelAdapter(ABC):
-    """Thin ABC: registry key + boilerplate defaults + the two conversion seams.
-
-    The conversion *logic* lives on the per-shape base adapter (``ImageAdapter``);
-    this ABC only declares the boilerplate every adapter shares (SDE-label resolution,
-    schedule policy, LoRA spec, server-boot extras, validation) and the two abstract
-    methods the engine drives.
-    """
+    """Thin ABC: registry key + boilerplate defaults + the two conversion seams."""
 
     model_family: str = ""
 
@@ -70,12 +53,7 @@ class ModelAdapter(ABC):
 
     @staticmethod
     def resolve_sde_label(strategy: Any) -> Optional[str]:
-        """Map the SDE strategy to SGLang's ``rollout_sde_type`` kernel label.
-
-        ``None`` when no strategy (ODE/eval/NFT — the SDE branch of
-        ``build_inputs`` is then skipped). The SGLang fork must register a kernel
-        under the returned string whose update math matches UniRL's bit-for-bit.
-        """
+        """Map the SDE strategy to SGLang's ``rollout_sde_type`` kernel label."""
         if strategy is None:
             return None
         canonical = type(strategy).canonical_name.strip().lower()
@@ -93,17 +71,11 @@ class ModelAdapter(ABC):
         )
 
     def boot_kwargs(self) -> Dict[str, Any]:
-        """Extra SGLang ServerArgs intent a model needs beyond the generic set.
-
-        The generic server kwargs (model_path, parallelism, LoRA hints) are
-        derived in ``config.server_intent``; override this only when a model
-        needs an additional ServerArgs knob.
-        """
+        """Extra SGLang ServerArgs intent a model needs beyond the generic set."""
         return {}
 
     def schedule_policy(self) -> Any:
-        """The σ schedule policy. Default reads ``model_config.shift`` (+ optional
-        dynamic-shift hints); Klein-style models override with a factory."""
+        """The σ schedule policy."""
         from unirl.sde.runtime import FlowMatchSchedulePolicy
 
         mc = self.model_config

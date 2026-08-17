@@ -62,7 +62,10 @@ wrong objective.
   siblings, and applies the configured filter. Async batch trainers own training
   progress and publication cadence; the manager owns the published rollout version
   and preserves completed generations as FIFO batch chunks. `AgenticTrainer` collects
-  one complete barrier batch per step.
+  one complete barrier batch per step. Async AR refills the same manager immediately
+  after collection, so its existing progress thread overlaps the next generation
+  with scoring and training. Publication and durable boundaries still quiesce that
+  single manager before proceeding.
 
 **Extending it:** a new single-turn engine adds `engine/<name>/config.py` (a
 `BaseEngineConfig` whose `make_engine(**deps)` lazily imports and builds it) and
@@ -89,6 +92,9 @@ implements its weight-receive method and a matching `sync:` handler in
   `output_version`; immutable buffered groups keep their original provenance and
   remain subject to the configured filter. Eval/checkpoint admission still requires
   an empty manager. Launch and scoring order remains trainer policy.
+- **A resolve/route failure poisons the `RolloutManager`** — samples may already be
+  lost, so every later call (including `empty` / `counts`) re-raises the original
+  error rather than reporting clean state; only `close()` stays safe.
 - **Reward/advantage methods are not engine code** — `Part.compute_advantages` and
   `Sample.propagate_rewards` are called by the trainer after scoring. An engine
   fills generation fields such as `segment`, `conditions`, `primitive`, and

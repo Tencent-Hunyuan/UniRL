@@ -1,9 +1,4 @@
-"""Pure helpers the adapter's conversion methods call.
-
-No engine state, no runtime, no I/O — everything here unit-tests with canned
-data. The conversion *logic* lives on the base adapter (:mod:`..adapters.text`);
-these are the generic mechanics it leans on.
-"""
+"""Pure helpers the adapter's conversion methods call."""
 
 from unirl.rollout.engine.sglang.utils.conditions import pack_prompt_condition
 from unirl.rollout.engine.sglang.utils.conversations import (

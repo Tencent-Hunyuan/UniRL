@@ -13,12 +13,7 @@ from unirl.types.conditions import Condition, Modality
 
 @dataclass
 class Cosmos3SFTCondition(Condition):
-    """Per-sample text/action inputs that accompany a clean video latent.
-
-    Token IDs are packed because Cosmos3 prompts are variable length. The clean
-    video targets live in the track's ``LatentSegment``; optional action targets
-    stay here because the base segment has only one latent stream.
-    """
+    """Per-sample text and optional action inputs accompanying a clean video latent."""
 
     modality: ClassVar[Modality] = Modality.MULTIMODAL
 

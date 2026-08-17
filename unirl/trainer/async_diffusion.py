@@ -1,9 +1,4 @@
-"""Async diffusion RL over separate train and rollout GPU slabs.
-
-The trainer owns optimizer progress and publication cadence. The driver-side
-``RolloutManager`` owns dispatch, grouping, filtering, and published rollout
-state. A completed batch is scored before its replacement is submitted.
-"""
+"""Async diffusion RL over separate train and rollout GPU slabs."""
 
 from __future__ import annotations
 
@@ -38,6 +33,13 @@ class AsyncDiffusionTrainer(AsyncRolloutTrainerMixin, DiffusionTrainer):
                 "AsyncDiffusionTrainer requires max_inflight=1: multiple queued generations "
                 "block the reap-time cross-slab transfer on the rollout workers; "
                 f"got {max_inflight}."
+            )
+        if bool(diffusion_kwargs.get("offload_train_during_reward", False)):
+            raise ValueError(
+                "AsyncDiffusionTrainer does not support offload_train_during_reward: async scoring "
+                "runs at reap time outside _reward_phase(), so the option would be silently ignored "
+                "and a reward sharing the train slab could still OOM. Remove the option or use the "
+                "synchronous trainer."
             )
         super().__init__(**diffusion_kwargs)
 

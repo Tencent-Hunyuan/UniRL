@@ -1,17 +1,4 @@
-"""``sglang`` engine config — wired by ``_target_`` (like every engine config).
-
-No port math: the engine reserves its own :class:`SGLangPorts` at boot, so
-there is no ``find_free_port`` here and the ``port`` field is accepted but
-ignored (kept for recipe-shape stability). ``model_family`` selects the adapter
-and defaults from the ``image_token`` VLM switch, so text/VLM recipes need no
-extra key.
-
-``server_intent`` (the successor of the hand-maintained ServerArgs allowlist)
-spells this config + the reserved ports as the SGLang ServerArgs intent dict;
-the backend filters it against the real ServerArgs fields and spawns.
-Explicit first-class correctness flags are marked as required so the backend
-fails closed when the installed SGLang ``ServerArgs`` cannot accept them.
-"""
+"""``sglang`` engine config — wired by ``_target_`` (like every engine config)."""
 
 from __future__ import annotations
 
@@ -67,19 +54,7 @@ def _reserve_safe_server_port() -> socket.socket:
 
 @dataclass(frozen=True)
 class SGLangPorts(ReservedPorts):
-    """The ports one SRT server spawn consumes.
-
-    - ``server_port`` — the HTTP bind (``ServerArgs.port``). Some SGLang
-      runtimes derive gRPC as ``port + 30000``, so reservation keeps this
-      <= 35535.
-    - ``nccl_port`` — ``ServerArgs.nccl_port``: colocate runs N engines per
-      node, each initializing its own torch.distributed env. SGLang left with
-      ``nccl_port=None`` calls get_free_port() at model-init time, so instances
-      that finish loading together race onto the *same* port → EADDRINUSE.
-      Reserving it here (de-synchronized across workers, like ``server_port``)
-      hands SGLang an explicit port so it never re-picks at the synchronized
-      post-load moment.
-    """
+    """The ports one SRT server spawn consumes."""
 
     server_port: int
     nccl_port: int
@@ -131,7 +106,6 @@ class SGLangEngineConfig(BaseEngineConfig):
     enable_expert_parallel: Optional[bool] = None
 
     host: Optional[str] = None
-    port: Optional[int] = None
 
     backend: str = "http"
 
@@ -244,18 +218,7 @@ class SGLangEngineConfig(BaseEngineConfig):
         extra: Optional[Dict[str, Any]] = None,
         runtime_overrides: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Spell this config (+ the reserved ports) as ServerArgs intent.
-
-        Unfiltered: the backend filters against the real ServerArgs fields and
-        spawns. Non-ServerArgs escape-hatch keys still drop harmlessly there,
-        but explicitly requested first-class correctness flags are recorded so
-        the backend can fail closed if the installed runtime cannot accept them.
-        Precedence (low → high): ``engine_kwargs`` escape-hatch < typed cfg
-        fields < adapter ``extra`` < runtime overrides < the reserved ports. The
-        trailing ``setdefault``s supply the predecessor's defaults (bind-all
-        host so the server accepts cross-node connections; mem_fraction 0.88)
-        without shadowing an escape-hatch override.
-        """
+        """Spell this config (+ the reserved ports) as ServerArgs intent."""
         intent: Dict[str, Any] = {}
 
         intent.update(self.engine_kwargs or {})

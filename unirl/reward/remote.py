@@ -1,23 +1,4 @@
-"""Remote reward backend: an HTTP client for the RewardService server.
-
-Bridges the UniRL reward interface (flat images + prompts) with the
-RewardService wire format (history turns + required_rewards). One client
-handles *all* requested reward models in a single HTTP round trip because the
-server multiplexes them via ``required_rewards``.
-
-Configured as the backend on :class:`~unirl.reward.service.RewardService`::
-
-    reward:
-      _target_: unirl.reward.service.RewardService
-      backend:
-        _target_: unirl.reward.remote.RemoteRewardBackend
-        base_device: cpu
-        config:
-          _target_: unirl.reward.remote.RemoteRewardSpec
-          base_url: http://reward-server:8080
-          required_rewards: [hpsv2, clip]
-          reward_weights: {hpsv2: 0.6, clip: 0.4}
-"""
+"""Remote reward backend: an HTTP client for the RewardService server."""
 
 from __future__ import annotations
 
@@ -41,12 +22,7 @@ logger = logging.getLogger(__name__)
 
 
 def _pil_from_tensor(tensor: torch.Tensor) -> Image.Image:
-    """Convert a CHW float or uint8 tensor to a PIL RGB image.
-
-    Float tensors are clamped to ``[0, 1]`` (the producer-side contract on
-    ``RolloutSamples.decoded_images``); ``to_pil_image`` then handles the
-    uint8 conversion. Always moves to CPU before conversion.
-    """
+    """Convert a CHW float or uint8 tensor to a PIL RGB image."""
     from torchvision.transforms.functional import to_pil_image
 
     tensor = tensor.detach().cpu()
@@ -78,11 +54,7 @@ def _encode_video_b64(
     video: torch.Tensor,
     fps: int = 8,
 ) -> str:
-    """Encode a video tensor ``(C, T, H, W)`` to a base64 mp4 string.
-
-    Uses ``diffusers.utils.export_to_video`` for frame encoding, then reads
-    the bytes and base64-encodes them for HTTP transmission.
-    """
+    """Encode a video tensor ``(C, T, H, W)`` to a base64 mp4 string."""
     import tempfile
 
     from diffusers.utils import export_to_video
@@ -122,21 +94,7 @@ def _encode_video_b64(
 
 
 class RemoteRewardBackend(RewardBackend):
-    """HTTP client backend for the remote RewardService ``POST /score`` endpoint.
-
-    Converts UniRL's ``RewardRequest`` (flat images + prompts) into
-    the RewardService wire format (list of per-sample history-turn requests),
-    calls the service, and converts the nested response back into a flat
-    ``RewardResponse``.
-
-    One instance handles all ``required_rewards`` in a single HTTP call,
-    because the RewardService server multiplexes multiple reward models
-    via the ``required_rewards`` field per request.
-
-    Constructed by ``_target_`` with a :class:`RemoteRewardSpec` config;
-    ``base_device`` is accepted for backend-interface uniformity but ignored
-    (the backend is HTTP-only).
-    """
+    """HTTP client backend for the remote RewardService ``POST /score`` endpoint."""
 
     _REDUCE_STRATEGIES = {"first", "mean", "max"}
     _AGGREGATION_METHODS = {"weighted_sum", "mean", "min", "max"}
@@ -167,23 +125,7 @@ class RemoteRewardBackend(RewardBackend):
         self._session.trust_env = False
 
     def compute_rewards(self, request: RewardRequest) -> RewardResponse:
-        """Convert a UniRL request, call the remote service, and
-        convert the response back.
-
-        Video requests are rejected explicitly: this executor only knows the
-        image-history wire format, and silently falling through would yield
-        all-zero rewards that corrupt downstream advantage computation.
-
-        By default (``raise_on_failure=True``) HTTP errors and malformed
-        responses are propagated as exceptions so that corrupted zero-rewards
-        never silently enter the training loop.  Set ``raise_on_failure=False``
-        for a degraded mode that returns zeroed rewards on failure.
-
-        Returns:
-            A ``RewardResponse`` with ``rewards`` (one float per sample —
-            the weighted aggregation of all required_rewards), and
-            ``component_rewards`` keyed by reward name.
-        """
+        """Convert a UniRL request, call the remote service, and"""
         start = time.time()
         if request.is_video:
             return self._compute_video_rewards(request, start)
@@ -205,12 +147,7 @@ class RemoteRewardBackend(RewardBackend):
             )
 
     def is_available(self) -> bool:
-        """Ping ``/health``; ``True`` iff the server is reachable.
-
-        On the first successful ping also runs roster validation
-        (see ``_validate_required_rewards_once``); transport errors and
-        non-200 still return ``False``.
-        """
+        """Ping ``/health``; ``True`` iff the server is reachable."""
         try:
             resp = self._session.get(
                 f"{self.base_url}/health",
@@ -224,13 +161,7 @@ class RemoteRewardBackend(RewardBackend):
         return True
 
     def _validate_required_rewards_once(self, health_resp: http_requests.Response) -> None:
-        """One-shot: ``raise ValueError`` if any required reward is not in the
-        ``/health`` roster (catches component-name typos at startup, not at
-        first ``/score`` call); log the full roster at INFO on success.
-
-        Expected ``/health`` body shape:
-        ``{"status": "ok", "rewards": {<name>: [<readiness>, ...], ...}}``.
-        """
+        """One-shot: ``raise ValueError`` if any required reward is not in the"""
         if self._remote_rewards_validated:
             return
 
@@ -268,22 +199,7 @@ class RemoteRewardBackend(RewardBackend):
         self._session.close()
 
     def _build_score_payload(self, request: RewardRequest) -> Dict[str, Any]:
-        """Convert a UniRL ``RewardRequest`` into the RewardService
-        ``ScoreRequest`` JSON payload.
-
-        Each sample ``(images[i], prompts[i])`` becomes one entry in the
-        wire-format ``requests`` list, with
-        ``history = [{"text": prompt, "image_b64": ...}]`` and
-        ``required_rewards`` set to ``self.required_rewards``.
-
-        When the request carries condition images in ``primitives["image"]``
-        (e.g. image-editing pipelines), a two-turn history is built:
-            history[0] = {"text": prompt, "image_b64": condition_image}
-            history[1] = {"text": prompt, "image_b64": generated_image}
-        This matches the EditReward scorer's input convention.
-
-        Per-sample metadata from ``request.metadata`` is forwarded when present.
-        """
+        """Convert a UniRL ``RewardRequest`` into the RewardService"""
         images = request.images or []
         prompts = request.prompts
         metadata_list = request.metadata
@@ -326,10 +242,7 @@ class RemoteRewardBackend(RewardBackend):
         return {"requests": wire_requests}
 
     def _get_condition_images(self, request: RewardRequest) -> Optional[List[Union[Image.Image, torch.Tensor]]]:
-        """Extract per-sample condition images from request primitives.
-
-        Returns None if no condition images are present (pure T2I case).
-        """
+        """Extract per-sample condition images from request primitives."""
         prim_image = request.primitives.get("image")
         if prim_image is None:
             return None
@@ -360,18 +273,7 @@ class RemoteRewardBackend(RewardBackend):
             )
 
     def _build_video_score_payload(self, request: RewardRequest) -> Dict[str, Any]:
-        """Convert a video ``RewardRequest`` into the RewardService ``ScoreRequest``
-        JSON payload.
-
-        Mirrors :meth:`_build_score_payload`: each sample ``(videos[i],
-        prompts[i])`` becomes one wire request whose single history turn carries
-        ``{"text": prompt, "video_b64": ...}``. The server's ``HistoryTurn``
-        schema requires a history list — a flat ``{"video_b64", "prompt"}`` body
-        is rejected with HTTP 422 — so video and image payloads share the same
-        history-turn shape.
-
-        Per-sample metadata from ``request.metadata`` is forwarded when present.
-        """
+        """Convert a video ``RewardRequest`` into the RewardService ``ScoreRequest``"""
         videos = request.videos or []
         prompts = request.prompts
         metadata_list = request.metadata
@@ -394,11 +296,7 @@ class RemoteRewardBackend(RewardBackend):
         return {"requests": wire_requests}
 
     def _post_score(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """POST to ``/score`` with retry logic.
-
-        Raises ``RuntimeError`` chained from the last underlying exception
-        if all retries are exhausted.
-        """
+        """POST to ``/score`` with retry logic."""
         url = f"{self.base_url}/score"
         last_exc: Optional[BaseException] = None
 
@@ -434,18 +332,7 @@ class RemoteRewardBackend(RewardBackend):
         batch_size: int,
         compute_time: float,
     ) -> RewardResponse:
-        """Convert the RewardService ``ScoreResponse`` JSON into a UniRL
-        ``RewardResponse``.
-
-        For each sample *i*:
-
-        1. Extract ``results[i][reward_name] → {sub_metric: float}``.
-        2. Reduce sub-metrics to one float per reward via
-           ``_reduce_sub_metrics``.
-        3. Store per-reward scores in ``component_rewards``.
-        4. Aggregate across rewards → ``rewards[i]`` using
-           ``self.aggregation_method``.
-        """
+        """Convert the RewardService ``ScoreResponse`` JSON into a UniRL"""
         results: List[Dict[str, Dict[str, float]]] = raw.get("results", [])
         errors_list: List[Dict[str, str]] = raw.get("errors", [])
 
@@ -508,14 +395,7 @@ class RemoteRewardBackend(RewardBackend):
         )
 
     def _aggregate_scores(self, scores: List[float], weights: List[float]) -> float:
-        """Aggregate per-reward scores for one sample.
-
-        Strategies:
-            ``"weighted_sum"``: ``Σ(score_k * w_k) / Σ(w_k)``.
-            ``"mean"``: arithmetic mean (ignores weights).
-            ``"min"``: minimum score across rewards.
-            ``"max"``: maximum score across rewards.
-        """
+        """Aggregate per-reward scores for one sample."""
         if not scores:
             return 0.0
         if self.aggregation_method == "weighted_sum":
@@ -529,14 +409,7 @@ class RemoteRewardBackend(RewardBackend):
 
     @staticmethod
     def _first_non_finite(sub_metrics: Dict[str, float]) -> Optional[Tuple[str, Any]]:
-        """Return the first ``(name, value)`` whose value is not a finite number.
-
-        Catches ``None`` (a server-side NaN that serialized to JSON ``null``),
-        ``NaN`` / ``inf`` floats, booleans, and non-numeric junk. Returns
-        ``None`` when every value is a finite number. Used to convert an
-        unusable reward into a sample failure before it reaches advantage
-        computation.
-        """
+        """Return the first ``(name, value)`` whose value is not a finite number."""
         for name, value in sub_metrics.items():
             if (
                 value is None
@@ -548,14 +421,7 @@ class RemoteRewardBackend(RewardBackend):
         return None
 
     def _reduce_sub_metrics(self, sub_metrics: Dict[str, float]) -> float:
-        """Collapse a reward's sub-metric dict into a single float.
-
-        Strategies:
-            ``"first"``: value of the first sub-metric
-                (stable iteration order in Python 3.7+).
-            ``"mean"``: arithmetic mean of all sub-metric values.
-            ``"max"``: maximum sub-metric value.
-        """
+        """Collapse a reward's sub-metric dict into a single float."""
         if not sub_metrics:
             return 0.0
         values = list(sub_metrics.values())
@@ -568,11 +434,7 @@ class RemoteRewardBackend(RewardBackend):
 
 @dataclass
 class RemoteRewardSpec(BaseRewardComponentSpec):
-    """Typed config for the remote RewardService backend.
-
-    Registered as a polymorphic ``reward/component``; one instance multiplexes
-    all ``required_rewards`` in a single HTTP round-trip to ``base_url``.
-    """
+    """Typed config for the remote RewardService backend."""
 
     base_url: str = ""
     required_rewards: Tuple[str, ...] = ()

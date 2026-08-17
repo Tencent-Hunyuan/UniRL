@@ -1,12 +1,4 @@
-"""``fastvideo`` engine config — wired by Hydra ``_target_``; the rollout actor
-constructs the engine via :meth:`FastVideoEngineConfig.make_engine`.
-
-Mirrors :class:`SGLangDiffusionEngineConfig` but trimmed to what the in-process
-FastVideo ``VideoGenerator`` needs for a colocate diffusion rollout. Port math
-is delegated to :class:`FastVideoPorts` (engine-reserved at boot, like SGLang),
-so concurrent colocated engines never collide on the worker dist-init port (the
-``EADDRINUSE`` failure mode of fixed ``base + rank*stride`` ports).
-"""
+"""``fastvideo`` engine config — wired by Hydra ``_target_``; the rollout actor"""
 
 from __future__ import annotations
 
@@ -23,13 +15,7 @@ from unirl.rollout.engine.ports import ReservedPorts
 
 @dataclass(frozen=True)
 class FastVideoPorts(ReservedPorts):
-    """Dist-init port the local-mode FastVideo worker subprocess consumes.
-
-    FastVideo's ``MultiprocExecutor`` brings up a ``TCPStore`` on
-    ``master_port``; left unset it self-settles to a scanned port, which races
-    when several colocated engines wake concurrently. Reserving one keeps the
-    siblings apart (bind-to-zero hint; see ``ReservedPorts``).
-    """
+    """Dist-init port the local-mode FastVideo worker subprocess consumes."""
 
     master_port: int
 

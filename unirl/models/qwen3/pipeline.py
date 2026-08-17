@@ -1,25 +1,4 @@
-"""Qwen3Pipeline — ``Sample → Sample`` end-to-end for Qwen3.
-
-Implements the AR-only two-tier flow::
-
-    Texts ──chat_template──▶ Qwen3ARConditions ──autoregress──▶ TextSegment
-                                                                      │
-                                                                      ▼
-                                                              tokenizer.decode
-                                                                      │
-                                                                      ▼
-                                                                    Texts
-
-Hydra constructs a pipeline via
-``Qwen3Pipeline.from_config(Qwen3PipelineConfig)`` (see ``config.py``);
-``from_config`` loads the :class:`Qwen3Bundle` then constructs the two
-stages.
-
-No σ schedule
--------------
-Qwen3 is a pure causal LM with no diffusion side; ``generate()`` reads no σ
-schedule — the hosting engine's σ-pinning is a no-op for AR-only pipelines.
-"""
+"""Qwen3Pipeline — ``Sample → Sample`` end-to-end for Qwen3."""
 
 from __future__ import annotations
 
@@ -38,22 +17,7 @@ from .config import Qwen3PipelineConfig
 
 
 class Qwen3Pipeline(Pipeline):
-    """Qwen3 AR generate pipeline: ``Sample → Sample``.
-
-    Consumes a request ``Sample`` whose frontier (last) Part is a pre-forked AR
-    gen shell carrying ``ARSamplingParams``. Reads the full role-tagged trajectory
-    via ``sample.text_conditioning()`` (one message per turn; an optional
-    ``{"system_instruction": str}`` override rides on the input Part's
-    ``control["chat"]``) and fills the frontier Part:
-
-    - ``segment: TextSegment`` — the generated tokens + full-softmax log-probs.
-    - ``primitive: Texts`` — detokenized response strings.
-
-    ``Part.conditions`` carries the encoded prompt conditions; trainer-side replay
-    teacher-forces over those *stored* ids (it re-types them via
-    ``conditions_cls.from_dict``), so the encode here is the single source of truth
-    and the importance ratio stays consistent.
-    """
+    """Qwen3 AR generate pipeline: ``Sample → Sample``."""
 
     def __init__(
         self,
@@ -84,14 +48,7 @@ class Qwen3Pipeline(Pipeline):
         enable_thinking: bool = False,
         max_prompt_length: int = 4096,
     ) -> "Qwen3Pipeline":
-        """Wire chat-template + AR stages around an already-loaded bundle.
-
-        The v2 trainer loads the bundle once and injects it
-        (``remote_hydra(pipeline_cfg, bundle=...)``); ``from_config`` would load a
-        second copy. ``system_instruction`` (e.g. ``/no_think``) and
-        ``enable_thinking`` are applied to the chat template here so they are
-        not lost on the bundle-injected path.
-        """
+        """Wire chat-template + AR stages around an already-loaded bundle."""
         chat_template = Qwen3ChatTemplateStage(
             bundle,
             system_instruction=system_instruction,
@@ -129,12 +86,7 @@ class Qwen3Pipeline(Pipeline):
         return cls(bundle=bundle, chat_template=chat_template, ar=ar)
 
     def _conditions_for(self, turns: List[Turn], control: Optional[Dict[str, Any]] = None) -> Qwen3ARConditions:
-        """Chat-template + tokenize the trajectory ``turns`` → :class:`Qwen3ARConditions`.
-
-        The rollout encode path: production replay teacher-forces over the *stored*
-        conditions this produces (not a re-encode). An optional per-request
-        ``system_instruction`` override rides on the input Part's ``control["chat"]``.
-        """
+        """Chat-template + tokenize the trajectory ``turns`` → :class:`Qwen3ARConditions`."""
         chat_overrides: Dict[str, Any] = dict((control or {}).get("chat") or {})
         if "system_instruction" in chat_overrides:
             chat_stage = Qwen3ChatTemplateStage(

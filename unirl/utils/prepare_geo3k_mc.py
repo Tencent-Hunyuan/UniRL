@@ -1,4 +1,12 @@
-"""Build the local geo3k_mc dataset that the ``qwen_vl_grpo_geo3k_mc_*`` recipes train on.
+"""Build the local geo3k_mc dataset that the ``qwen_vl_grpo_geo3k_mc_*`` recipes train on."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+
+_HELP = """Build the local geo3k_mc dataset that the ``qwen_vl_grpo_geo3k_mc_*`` recipes train on.
 
 The multimodal RL data loader (``unirl/data/data_source.py`` + ``unirl/data/datasets.py``)
 reads a **local** jsonl of records::
@@ -33,12 +41,6 @@ Usage:
 The HF id / split names below are sensible defaults; override with the flags if your
 source differs. The extractor is schema-tolerant (problem/question, ground_truth/answer).
 """
-
-from __future__ import annotations
-
-import argparse
-import json
-import os
 
 _LETTERS = ["A", "B", "C", "D", "E", "F", "G", "H"]
 PROMPT_PREFIX = "Look at the geometry diagram. "
@@ -108,7 +110,7 @@ def _convert(hf_id: str, split: str, out_path: str, images_dir: str) -> int:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(description=_HELP, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out-dir", default="data/geo3k_mc", help="output directory for the jsonl files + images/")
     ap.add_argument("--hf", default="xyliu6/geometry3k", help="HF id for the native multiple-choice Geometry3K")
     ap.add_argument("--train-split", default="train")

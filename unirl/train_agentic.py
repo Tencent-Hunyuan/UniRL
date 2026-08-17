@@ -1,16 +1,5 @@
 #!/usr/bin/env python
-"""Service-scored barrier agentic training entry point.
-
-The rollout manager collects complete groups of variable-depth trajectories. The
-trainer then scores terminal ``<answer>`` values, computes group-normalized GRPO
-advantages, and performs one synchronous update.
-
-Launch (per node, SPMD; rank 0 owns the driver):
-  QWEN3_INSTRUCT_PATH=/path/to/Qwen3-4B-Instruct DATA_PATH=data/asearcher/train.jsonl \
-  SERPER_KEY_ID=... JINA_API_KEYS=... JUDGE_URL=... JUDGE_MODEL=... \
-  python -m unirl.train_agentic --config-name=deep_research/deep_research_search_judge
-
-"""
+"""Service-scored barrier agentic training entry point."""
 
 from __future__ import annotations
 

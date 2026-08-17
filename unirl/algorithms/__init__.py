@@ -1,7 +1,4 @@
-"""unirl stage-driven algorithms.
-
-Public surface for the ``models`` training contract.
-"""
+"""unirl stage-driven algorithms."""
 
 from __future__ import annotations
 

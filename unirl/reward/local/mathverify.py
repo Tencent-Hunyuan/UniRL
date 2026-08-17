@@ -1,19 +1,4 @@
-r"""math-verify reward scorer — the paper's grader (HuggingFace Math-Verify).
-
-The AdaSPO/DRPO paper grades competition-math answers with the ``math-verify``
-library (Appendix D). Unlike :class:`MathBoxedRewardScorer` (a custom ``\boxed``
-regex + sympy matcher that REQUIRES a ``\boxed{}`` / ``####`` and scores 0
-otherwise), math-verify also extracts a final answer from free-form text — e.g. a
-base model that reasons to the correct answer without wrapping it in ``\boxed{}``
-— and handles richer symbolic equivalence. So it does NOT under-count
-correct-but-unboxed generations, which is common for Qwen3-*-Base + thinking and
-otherwise artificially depresses the reward / inflates zero-advantage groups.
-
-Reward = 1.0 if ``math_verify.verify(parse(ground_truth), parse(response))`` else
-0.0. Requires the ``math-verify`` package (``pip install math-verify``; pulls
-``latex2sympy2-extended``) in the node venv. The import is lazy (only the workers
-that actually score need the dependency).
-"""
+r"""math-verify reward scorer — the paper's grader (HuggingFace Math-Verify)."""
 
 from __future__ import annotations
 

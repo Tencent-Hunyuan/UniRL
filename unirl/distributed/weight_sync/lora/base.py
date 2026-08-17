@@ -1,20 +1,4 @@
-"""Shared base for the v2 LoRA weight-sync handlers.
-
-Both handlers read the trained adapter off the FSDP model identically (a
-train-mesh collective) and verify it the same way; they differ only in how the
-adapter reaches the engine:
-
-- :class:`~unirl.distributed.weight_sync.lora.local.LocalLoraWeightSync` —
-  same-Worker sibling, in-process push.
-- :class:`~unirl.distributed.weight_sync.lora.remote.RemoteLoraWeightSync`
-  — cross-process Ray push to non-sibling engines (separate slabs / HI3).
-
-This base owns the transport-agnostic pieces — adapter extraction and the
-post-load checksum compare — so subclasses implement only ``sync()`` (the push)
-plus any connection setup. All model / vLLM-touching imports are deferred into
-the methods so the driver can reference a class for ``remote(...)`` without
-eagerly pulling torch-heavy or vLLM-only deps.
-"""
+"""Shared base for the v2 LoRA weight-sync handlers."""
 
 from __future__ import annotations
 
@@ -27,20 +11,7 @@ logger = logging.getLogger(__name__)
 
 
 def _extract_canonical_lora(backend: Any, *, param_prefix: str, adapter_name: str):
-    """Extract canonical-format LoRA tensors + the PEFT config from the backend.
-
-    ``extract_lora_tensors`` redistributes each FSDP ``DTensor`` shard to a full
-    tensor — a collective across the train process group — so the caller MUST run
-    this on every train rank in lockstep (``BROADCAST``).
-
-    The weight-sync dtype is the backend's FSDP compute dtype
-    (``backend.weight_sync_dtype``, i.e. ``param_dtype``), NOT the trainable
-    params' own dtype: under ``master_dtype=fp32`` (the reward-collapse fix) the
-    LoRA params are fp32, but the rollout engine's vLLM punica kernel requires
-    bf16/fp16 — so cast at the all-gather. Falls back to ``None`` (keep dtype) for
-    backends predating ``weight_sync_dtype`` (e.g. an all-bf16-master setup where
-    no cast is needed).
-    """
+    """Extract canonical-format LoRA tensors + the PEFT config from the backend."""
     from unirl.distributed.weight_sync.payload import _peft_config_dict
     from unirl.utils.peft_merge import extract_lora_tensors
 
@@ -54,22 +25,7 @@ def _extract_canonical_lora(backend: Any, *, param_prefix: str, adapter_name: st
 
 
 class LoraWeightSyncBase(Remote):
-    """Base for LoRA weight-sync handlers — extraction + verify; subclasses push.
-
-    ``param_prefix`` is the pipeline prefix prepended to the canonical keys (e.g.
-    ``"transformer."``; stripped engine-side by ``adapt_lora_for_sglang``).
-    ``adapter_name`` selects which PEFT adapter to ship; ``None`` (default) defers
-    to ``backend.rollout_adapter_name`` (the EMA shadow ``"old"`` for DiffusionNFT,
-    else ``"default"``), so an off-policy engine receives the EMA adapter.
-    ``track_prefix`` (e.g. ``"ar"`` / ``"diffusion"``) further prefixes the keys so
-    a :class:`~unirl.rollout.engine.composed.engine.ComposedRolloutEngine`
-    can demux the update to one child; empty for a single-model trainer. ``verify``
-    is a post-load checksum read-back, vLLM-Omni-only (the engine must expose
-    ``loaded_lora_checksums``); ignored for SGLang.
-
-    Subclasses add their own transport state (the sibling engine, or the cross-slab
-    target handles) and implement ``sync()``.
-    """
+    """Base for LoRA weight-sync handlers — extraction + verify; subclasses push."""
 
     def __init__(
         self,
@@ -95,11 +51,7 @@ class LoraWeightSyncBase(Remote):
         self._track_prefix = str(track_prefix or "")
 
     def _extract(self):
-        """Extract the canonical adapter (+ ``track_prefix``) and PEFT config.
-
-        A train-mesh collective (see :func:`_extract_canonical_lora`) — run on
-        every train rank in lockstep.
-        """
+        """Extract the canonical adapter (+ ``track_prefix``) and PEFT config."""
         lora_tensors, peft_config = _extract_canonical_lora(
             self._backend, param_prefix=self._param_prefix, adapter_name=self._adapter_name
         )
@@ -109,12 +61,7 @@ class LoraWeightSyncBase(Remote):
 
     @staticmethod
     def _expected_checksums(lora_tensors: Dict[str, Any], peft_config: Dict):
-        """Trainer-side expected ``(lora_A, lora_B)`` hash multisets.
-
-        ``lora_B`` is scaled by ``alpha/r`` to match the worker's post-``optimize``
-        read-back. Returns sorted lists (multisets) compared against the engine's
-        ``loaded_lora_checksums`` in :meth:`_assert_loaded`.
-        """
+        """Trainer-side expected ``(lora_A, lora_B)`` hash multisets."""
         from unirl.distributed.weight_sync.transfer.checksum import (
             compute_lora_checksums_post_optimize,
         )
@@ -133,16 +80,7 @@ class LoraWeightSyncBase(Remote):
         topology: Dict,
         label: str,
     ) -> None:
-        """Assert one engine's loaded LoRA matches the expected multisets.
-
-        The engine keys by vLLM-internal layer name + field (``lora_a`` /
-        ``lora_b``), so a direct dict compare is impossible; instead compare the
-        *multiset* of ``lora_A`` hashes and the multiset of ``lora_B`` hashes. With
-        distinct per-layer weights (always true after a training step) multiset
-        equality is a strong bit-equality proof and also catches a wrong
-        ``param_prefix`` (which yields wrong / zero loaded layers). ``loaded`` is a
-        ``{stage_id: [per_rank {layer: {field: hex}}]}`` map.
-        """
+        """Assert one engine's loaded LoRA matches the expected multisets."""
         if not exp_a or not exp_b:
             raise RuntimeError(
                 f"[LoRA-SYNC] verify FAILED on {label}: expected checksum sets must be non-empty "

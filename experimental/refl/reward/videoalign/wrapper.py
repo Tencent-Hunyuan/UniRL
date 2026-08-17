@@ -1,26 +1,4 @@
-"""Differentiable forward over a loaded VideoAlign reward model.
-
-Self-contained re-implementation — does NOT touch ``sys.path`` . The Qwen2-VL reward
-backbone, its prompt template and the checkpoint loader all live under
-:mod:`experimental.refl.reward.videoalign.model`.
-
-Public API
-----------
-``VideoRewardWrapper(checkpoint_dir, device, ...) -> .forward_scores(...)``
-
-The ``forward_scores`` signature is preserved verbatim from the mmrl
-wrapper so the same callsite — ``self.model.forward_scores(per_sample_videos,
-prompts, use_norm=...)`` — keeps returning ``{"VQ": Tensor[B], "MQ":
-Tensor[B], "TA": Tensor[B], "Overall": Tensor[B]}`` with autograd-live
-graphs when the input videos have ``grad_fn`` set.
-
-Gradient flow
--------------
-The Qwen2-VL vision encoder is fully differentiable w.r.t. its pixel input
-through the *fast* (tensor-native) image processor, which transformers 5.6
-loads by default — the slow PIL-based variant routes through ``numpy`` and
-silently cuts the graph.
-"""
+"""Differentiable forward over a loaded VideoAlign reward model."""
 
 from __future__ import annotations
 
@@ -47,12 +25,7 @@ logger = logging.getLogger(__name__)
 
 
 def _load_configs_from_json(config_path: str):
-    """Parse ``model_config.json`` into the four typed configs.
-
-    Drops trainer-only fields that may carry absolute filesystem paths
-    (they would break on a different machine and are never read at
-    inference).
-    """
+    """Parse ``model_config.json`` into the four typed configs."""
     with open(config_path, "r", encoding="utf-8") as f:
         config_dict = json.load(f)
 
@@ -69,19 +42,7 @@ def _load_configs_from_json(config_path: str):
 
 
 class VideoRewardWrapper:
-    """Frozen VideoAlign reward model with a differentiable forward.
-
-    Constructor responsibilities:
-
-    1. Parse ``model_config.json`` into typed configs.
-    2. Build the Qwen2-VL reward model + processor via
-       :func:`create_model_and_processor`.
-    3. Load weights from ``checkpoint-K`` via
-       :func:`load_model_from_checkpoint`.
-    4. Move to the requested device + dtype, ``eval()`` + freeze
-       parameters (RL gradients flow *through* the activations, not into
-       the reward weights).
-    """
+    """Frozen VideoAlign reward model with a differentiable forward."""
 
     def __init__(
         self,
@@ -191,10 +152,7 @@ class VideoRewardWrapper:
         video_tensors: List[torch.Tensor],
         prompts: List[str],
     ):
-        """Build a Qwen2-VL processor batch from ``[T,C,H,W]`` videos + prompts.
-
-        Auto-transposes ``[C,T,H,W]`` callers when ``C==3``.
-        """
+        """Build a Qwen2-VL processor batch from ``[T,C,H,W]`` videos + prompts."""
         chat_data = [
             [
                 {
@@ -258,18 +216,7 @@ class VideoRewardWrapper:
         prompts: List[str],
         use_norm: Optional[bool] = None,
     ) -> Dict[str, torch.Tensor]:
-        """Differentiable scoring → per-sample (VQ, MQ, TA, Overall) scalars.
-
-        Args:
-            video_tensors: list of ``(T, C, H, W)`` tensors, pixels in
-                ``[-1, 1]``. May carry ``grad_fn`` (REFL path).
-            prompts: per-sample user prompt text.
-            use_norm: override ``self.use_norm`` for this call.
-
-        Returns:
-            ``{"VQ": Tensor[B], "MQ": Tensor[B], "TA": Tensor[B], "Overall": Tensor[B]}``.
-            Gradients flow back into ``video_tensors`` when they require grad.
-        """
+        """Score a list of ``(T, C, H, W)`` video tensors; returns per-dimension ``Tensor[B]`` scores."""
         if len(video_tensors) != len(prompts):
             raise ValueError("video_tensors and prompts must have the same batch size.")
         use_norm = self.use_norm if use_norm is None else use_norm

@@ -1,4 +1,13 @@
-"""Build a local VLM SFT manifest (image + prompt → response) from an HF dataset.
+"""Build a local VLM SFT manifest (image + prompt → response) from an HF dataset."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import random
+
+_HELP = """Build a local VLM SFT manifest (image + prompt → response) from an HF dataset.
 
 Converts a LLaVA-style visual-instruct dataset into the supervised manifest
 layout (``unirl/data/sft.py``)::
@@ -17,13 +26,6 @@ Usage:
 
 Set HF_ENDPOINT for a mirror.
 """
-
-from __future__ import annotations
-
-import argparse
-import json
-import os
-import random
 
 
 def _content_text(content) -> str:
@@ -51,7 +53,7 @@ def _first_round(messages) -> tuple:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=_HELP)
     parser.add_argument("--dataset", default="HuggingFaceH4/llava-instruct-mix-vsft")
     parser.add_argument("--split", default="train")
     parser.add_argument("--out-dir", required=True)

@@ -1,8 +1,4 @@
-"""VideoAlign reward scorer — self-contained, no fastvideo dependency.
-
-Implements the Qwen2-VL-based VideoAlign reward model from DanceGRPO.
-All inference logic is inlined to avoid external `fastvideo` imports.
-"""
+"""VideoAlign reward scorer — self-contained, no fastvideo dependency."""
 
 from __future__ import annotations
 
@@ -30,11 +26,7 @@ logger = logging.getLogger(__name__)
 
 
 def _as_tensor(x):
-    """Coerce a vision-tower output to a tensor.
-
-    Older transformers return the visual embeds tensor directly; newer
-    versions wrap them in a model-output object (e.g. ``BaseModelOutputWithPooling``).
-    """
+    """Coerce a vision-tower output to a tensor."""
     if isinstance(x, torch.Tensor):
         return x
     for attr in ("last_hidden_state", "image_embeds", "video_embeds", "pooler_output"):
@@ -62,11 +54,7 @@ _SIMPLE_PROMPT = (
 
 
 def _build_prompt(prompt: str, dimension, template_type: str) -> str:
-    """Build an eval prompt, safely inserting the user-supplied text prompt.
-
-    Uses ``str.replace`` for the user prompt so that literal curly braces
-    (e.g. ``{foo}``) in the prompt text do not crash ``str.format()``.
-    """
+    """Build an eval prompt, safely inserting the user-supplied text prompt."""
     if template_type == "detailed_special":
         return _DETAILED_PROMPT_WITH_SPECIAL_TOKEN.replace("{text_prompt}", prompt)
     if isinstance(dimension, list) and len(dimension) > 1:
@@ -123,11 +111,7 @@ def _resize_video_to_view(
     target_size: int,
     factor: int = IMAGE_FACTOR,
 ) -> torch.Tensor:
-    """Resize the input video so its frames match target_size on the shortest edge.
-
-    The view_grid is ``(n_frames, grid_t)`` — only the frames in the first
-    temporal position of each row are resized, the others are discarded.
-    """
+    """Resize the input video so its frames match target_size on the shortest edge."""
     from torchvision.transforms.v2 import functional as F
 
     _, total_frames, h, w = video.shape
@@ -148,8 +132,7 @@ def _resize_video_to_view(
 
 
 def _reshape_by_grid(video: torch.Tensor, view_grid: Tuple[int, int]) -> torch.Tensor:
-    """Reshape into (grid_t * H, grid_h * W) by slicing frames from the
-    first temporal position of each row."""
+    """Reshape into (grid_t * H, grid_h * W) by slicing frames from the"""
     total_frames, h, w = video.shape[1:]
     n_frames, grid_t = view_grid
 
@@ -185,10 +168,7 @@ def _get_rope_index_modified(
 def _process_vision_info(
     conversations: List[List[Dict[str, Any]]],
 ) -> Tuple[List[Any], List[Any]]:
-    """Extract image/video data and build pixel/video lists for Qwen-VL.
-
-    Returns ``(images_list, videos_list)`` compatible with the Qwen2-VL processor.
-    """
+    """Extract image/video data and build pixel/video lists for Qwen-VL."""
     from qwen_vl_utils import process_vision_info
 
     return process_vision_info(conversations)
@@ -262,10 +242,7 @@ class _MLP(nn.Module):
 
 
 class _VideoAlignModel(nn.Module):
-    """VideoAlign model: Qwen2-VL backbone + three reward MLP heads.
-
-    Each head outputs a scalar per sample — the reward dimension scores.
-    """
+    """VideoAlign model: Qwen2-VL backbone + three reward MLP heads."""
 
     def __init__(
         self,
@@ -323,8 +300,7 @@ class _VideoAlignModel(nn.Module):
 
 
 def _get_last_hidden_state(outputs, model: nn.Module) -> torch.Tensor:
-    """Extract last_hidden_state from model outputs, handling Qwen2-VL's
-    composable architecture where the LM is at ``model.model``."""
+    """Extract last_hidden_state from model outputs, handling Qwen2-VL's"""
     if hasattr(outputs, "hidden_states") and outputs.hidden_states:
         return outputs.hidden_states[-1]
     if hasattr(outputs, "last_hidden_state"):
@@ -339,12 +315,7 @@ def _pool_visual_tokens(
     video_grid_thw: torch.Tensor,
     use_special_tokens: bool = False,
 ) -> torch.Tensor:
-    """Mean-pool the visual token positions from the last hidden state.
-
-    Only tokens after the text prefix (``attention_mask == 1``) are averaged.
-    When ``use_special_tokens`` is set, the last three hidden positions are
-    used as special reward tokens instead of mean pooling.
-    """
+    """Mean-pool the visual token positions from the last hidden state."""
     if use_special_tokens:
         pooled = last_hidden_state[:, -3:, :]
     else:
@@ -355,12 +326,7 @@ def _pool_visual_tokens(
 
 
 def _load_checkpoint(inference_obj, checkpoint_dir: str, device: torch.device, dtype: torch.dtype) -> None:
-    """Load a VideoAlign checkpoint into an existing _VideoAlignInference object.
-
-    Handles the key remapping needed for Qwen2-VL's composable model
-    architecture (transformers >= 4.49 moved vision / language_model
-    into sub-modules).
-    """
+    """Load a VideoAlign checkpoint into an existing _VideoAlignInference object."""
     from safetensors.torch import load_file
 
     state_dicts = []
@@ -403,11 +369,7 @@ def _load_checkpoint(inference_obj, checkpoint_dir: str, device: torch.device, d
 
 
 class _VideoAlignInference:
-    """Self-contained VideoAlign inference (no fastvideo dependency).
-
-    Builds the Qwen2-VL backbone, MLP heads, loads the checkpoint, and
-    provides a ``reward()`` method that returns per-dimension scores.
-    """
+    """Self-contained VideoAlign inference (no fastvideo dependency)."""
 
     def __init__(self, checkpoint_dir: str, device: str = "cuda", dtype: torch.dtype = torch.bfloat16) -> None:
         self.device = device
@@ -495,10 +457,10 @@ class _VideoAlignInference:
         max_pixels = self._max_pixels if max_pixels is None else max_pixels
 
         chat_data = []
-        for prompt in prompts:
+        for idx, prompt in enumerate(prompts):
             vid_info: Dict[str, Any] = {
                 "type": "video",
-                "video": video_paths,
+                "video": video_paths[idx],
                 "max_pixels": max_pixels,
                 "sample_type": self._sample_type,
             }
@@ -633,12 +595,7 @@ class VideoAlignRewardScorer(LocalRewardBackend):
 
 
 def _export_tensor_video(video: torch.Tensor, path: str) -> None:
-    """Write a decoded video tensor to mp4.
-
-    Accepts the tensor in either [T, C, H, W] (canonical ``Video.frames``) or
-    [C, T, H, W] (the layout produced by ``RewardRequest.videos``) and converts
-    to [T, H, W, C] for export.
-    """
+    """Write a decoded video tensor to mp4."""
     from diffusers.utils import export_to_video
 
     video = video.detach().cpu()

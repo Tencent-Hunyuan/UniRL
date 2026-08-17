@@ -1,4 +1,14 @@
-"""Build the local arxivqa_mc dataset that the ``bagel_grpo_arxivqa_mc_*`` recipe trains on.
+"""Build the local arxivqa_mc dataset that the ``bagel_grpo_arxivqa_mc_*`` recipe trains on."""
+
+from __future__ import annotations
+
+import argparse
+import io
+import json
+import os
+import re
+
+_HELP = """Build the local arxivqa_mc dataset that the ``bagel_grpo_arxivqa_mc_*`` recipe trains on.
 
 Same on-disk layout as :mod:`unirl.utils.prepare_geo3k_mc` (so the multimodal RL data
 loader ``unirl/data/data_source.py`` + ``unirl/data/datasets.py`` consumes it unchanged):
@@ -45,24 +55,12 @@ your source differs. Needs ``pyarrow`` + ``huggingface_hub`` + ``pillow``:
 pip install pyarrow huggingface_hub pillow
 """
 
-from __future__ import annotations
-
-import argparse
-import io
-import json
-import os
-import re
-
 LETTERS = {"A", "B", "C", "D"}
 IMAGE_TOKEN = re.compile(r"^\s*<image>\s*\n?")
 
 
 def to_pil(cell):
-    """A PIL image from a Vero ``image`` cell.
-
-    Parquet stores the HF Image feature as ``{bytes, path}`` (what ``.as_py()`` yields);
-    also tolerant of raw ``bytes`` or a 1-element list, for robustness.
-    """
+    """A PIL image from a Vero ``image`` cell."""
     from PIL import Image
 
     if cell is None:
@@ -166,7 +164,7 @@ def convert_split(rows, split: str, out_dir: str, fname: str, max_edge: int, con
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(description=_HELP, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out-dir", default="data/arxivqa_mc", help="output dir for the jsonl files + images/")
     ap.add_argument("--repo", default="zlab-princeton/Vero-600k", help="HF dataset id")
     ap.add_argument("--config", default="chart_ocr-arxivqa_formatted", help="Vero config (subdirectory) to convert")

@@ -1,10 +1,4 @@
-"""Resolve Sample-native AR sampling parameters for SGLang.
-
-Typed ``ARSamplingParams`` on the generated frontier take precedence over
-engine defaults. Request-level controls such as stop sequences and the system
-instruction come from the root ``Part``. The helper also translates UniRL's
-canonical ``top_k=0`` into SGLang's ``-1`` sentinel.
-"""
+"""Resolve Sample-native AR sampling parameters for SGLang."""
 
 from __future__ import annotations
 
@@ -16,11 +10,7 @@ from unirl.types.sample import Sample
 
 @dataclass(frozen=True)
 class ResolvedSampling:
-    """One ``generate`` call's resolved sampling, ready for the wire.
-
-    ``block`` is the SRT ``sampling_params`` sub-dict (``n`` included);
-    ``system_instruction`` feeds the chat template, not the wire.
-    """
+    """One ``generate`` call's resolved sampling, ready for the wire."""
 
     n: int
     return_logprob: bool
@@ -29,28 +19,7 @@ class ResolvedSampling:
 
 
 def resolve_sampling(config: Any, sample: Sample) -> ResolvedSampling:
-    """Resolve the SRT sampling block for one request ``Sample``.
-
-    Sources: the frontier gen ``Part``'s ``ARSamplingParams`` (temperature /
-    top_p / top_k / max_new_tokens) > the input ``Part``'s ``control['ar']`` bag
-    (stop / system_instruction / return_logprob) > engine-config defaults.
-
-    - ``n`` (the per-prompt fan-out the backend must generate) is the **last-fork
-      branch** ``len(gen) // len(parts[-2])`` (children per frontier parent), so the
-      backend fills the pre-forked gen shell exactly — this subsumes the old
-      ``samples_pre_expanded`` two-mode logic (the fork *is* the expansion in the
-      Sample model). For a multi-turn Sample the frontier parent is a later turn,
-      not the root ``parts[0]``; the two coincide for a single-stage request.
-    - ``temperature`` / ``top_p`` / ``max_new_tokens``: typed AR params, else
-      the config defaults.
-    - ``top_k``: typed AR params, else the config default. The value must still
-      be sent so SGLang does not fall back to a model-specific generation-config
-      limit. The trainer/config ``top_k=0`` (HF convention) maps to SGLang's
-      ``-1`` (disabled); positive values pass through.
-    - ``return_logprob`` (default True), ``system_instruction``, and the
-      ``stop`` / ``stop_token_ids`` / ``skip_special_tokens`` passthroughs
-      come from the root Part's ``control['ar']`` mapping.
-    """
+    """Resolve the SRT sampling block for one request ``Sample``."""
     input_part, gen_part = sample.parts[0], sample.parts[-1]
     ar = gen_part.sampling_params
     control_ar: Dict[str, Any] = dict(input_part.control.get("ar") or {})

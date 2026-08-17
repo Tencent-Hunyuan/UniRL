@@ -1,16 +1,4 @@
-"""FlowDPPO: KL-divergence-based masking for diffusion RL.
-
-Implements :class:`FlowDPPO` — a :class:`StageAlgorithm` that replaces
-PPO-style ratio clipping with a KL-ADV masking criterion. Uses
-``prev_sample_means`` from replay to compute Gaussian KL between old and
-new policy, then masks updates where KL is high AND the ratio direction is
-aligned with advantage (i.e. overly aggressive policy updates).
-
-The KL-ADV mask math lives in the module-level ``_flowdppo_kl_adv_loss`` (built on
-the shared ``_gaussian_kl_div`` in :mod:`unirl.algorithms.base`); the class wires it
-into the stage-driven training contract and adds the optional ``beta`` reference-policy
-KL penalty (Flow-DPPO eq.17).
-"""
+"""FlowDPPO: KL-divergence-based masking for diffusion RL."""
 
 from __future__ import annotations
 
@@ -60,28 +48,7 @@ def _flowdppo_kl_adv_loss(
     sigma_t: torch.Tensor,
     kl_mask_threshold: float,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    """FlowDPPO KL-ADV masking loss.
-
-    Instead of PPO's ratio clipping, this function:
-    1. Computes per-sample KL between new and old policy means
-    2. Creates a KL mask (keep if KL < threshold)
-    3. Among high-KL samples, masks out those where the ratio direction is
-       aligned with advantage (overly aggressive updates that push the policy
-       too far in the reward-improving direction)
-
-    Args:
-        new_logp: New policy log-probs at current weights. ``[B, S']``.
-        old_logp: Old policy log-probs frozen at pre-update weights. ``[B, S']``.
-        new_means: New policy prev_sample_means. ``[B, S', *latent_shape]``.
-        old_means: Old policy prev_sample_means. ``[B, S', *latent_shape]``.
-        advantages: Per-element advantages (broadcast). ``[B, S']``.
-        sigma_t: Per-step noise scale for KL normalization. Broadcastable
-            to ``new_means`` shape (typically ``[1, S', 1, 1, 1]``).
-        kl_mask_threshold: KL threshold below which updates pass freely.
-
-    Returns:
-        ``(loss_per_element, metrics_dict)``. Reduction is the caller's job.
-    """
+    """FlowDPPO KL-ADV masking loss; log-probs and advantages ``[B, S']``, means ``[B, S', *latent_shape]``."""
     log_diff = new_logp - old_logp
     ratio = torch.exp(log_diff)
     adv = advantages.detach()
@@ -124,52 +91,7 @@ def _flowdppo_kl_adv_loss(
 
 
 class FlowDPPO(StageAlgorithm):
-    """FlowDPPO: KL-divergence-based masking for diffusion RL.
-
-    Replaces PPO's ratio clipping (``FlowGRPO``) with a KL-ADV masking
-    criterion:
-
-    1. Computes KL(current || old) from ``prev_sample_means`` (the Gaussian
-       mean of the SDE transition) at each replayed step.
-    2. Creates a two-stage mask:
-       - **KL mask**: updates with KL < ``kl_mask_threshold`` pass freely.
-       - **ADV mask**: among high-KL updates, masks out those whose ratio
-         direction is aligned with advantage (overly aggressive moves).
-    3. Loss = ``(-advantage * ratio) * keep_mask``
-
-    This allows aggressive policy updates when KL is small (unlike PPO which
-    clips uniformly), and only constrains updates that both diverge far from
-    the old policy AND push too aggressively in the reward-improving direction.
-
-    Args:
-        stage: The :class:`DiffusionStage` whose ``replay`` produces new
-            log-probs and prev_sample_means.
-        params: Per-call params (e.g. ``SD3DiffusionParams``).
-        kl_mask_threshold: KL divergence threshold for masking. Updates
-            with per-sample KL below this pass without masking.
-        add_kl_coefficient: If True, normalize the KL-ADV **masking** score by
-            ``sigma_t = std_dev_t * sqrt(-dt)`` (flow-matching noise scale). If False,
-            use unnormalized squared error. Governs only the masking gate; the ``beta``
-            term below is always normalized.
-        beta: Reference-policy KL coefficient (Flow-DPPO eq.17). ``> 0`` adds
-            ``beta * KL(pi_theta || pi_ref)`` to the loss, where ``pi_ref`` is the
-            base model with its LoRA adapter disabled (a per-update no_grad reference
-            replay). Always the variance-normalized Gaussian KL — independent of
-            ``add_kl_coefficient``, matching FlowGRPO. ``0`` (default) disables the term
-            and skips that replay; the ``beta`` penalty is separate from the
-            ``kl_mask_threshold`` KL-to-old masking gate. Requires a LoRA recipe + the
-            injected ``backend``. See ``FlowGRPO``'s ``beta`` note on the
-            normalization-scale difference vs the reference flow_grpo code
-            (don't port ``beta`` values 1:1).
-        old_logp_source: ``"rollout"`` (default) trusts the rollout engine's
-            emitted ``segment.sde_logp``; ``"replay"`` uses the replayed
-            log-probs. ``sde_means`` is always replayed regardless. See
-            :meth:`prepare_segment`.
-        backend: FSDP backend sibling (injected by the v2 trainer). Only used when
-            ``beta > 0`` to reach the trainable model for the adapter-disabled
-            reference replay.
-        conditions_cls: Stage-typed conditions container.
-    """
+    """FlowDPPO: KL-divergence-based masking for diffusion RL."""
 
     supports_multi_update = True
     requires_backend = True
@@ -216,22 +138,7 @@ class FlowDPPO(StageAlgorithm):
         conditions: Mapping[str, "Condition"],
         segment: "LatentSegment",
     ) -> None:
-        """Establish the frozen π_old anchor (``segment.sde_logp``) and means
-        (``segment.sde_means``) at pre-update weights, before the
-        ``num_updates_per_batch`` loop.
-
-        ``stage.replay`` always runs under ``torch.no_grad`` — FlowDPPO needs the
-        old policy's ``prev_sample_means`` for the KL term — so ``sde_means``
-        is always written from this pre-update replay. The log-prob anchor is
-        chosen by ``old_logp_source``:
-
-        - ``"rollout"`` (default): keep the rollout engine's emitted
-          ``sde_logp``; raises if it is ``None`` (pin an emitting rollout
-          build, or set ``old_logp_source='replay'``).
-        - ``"replay"``: use the replayed log-probs, overwriting any engine value.
-
-        No-op if the segment has no SDE-gated steps to train on.
-        """
+        """Freeze the π_old anchor and means at pre-update weights, before the ``num_updates_per_batch`` loop."""
         if segment.sde_indices is None:
             return
         target_steps = self._resolve_target_steps(segment)
@@ -358,10 +265,7 @@ class FlowDPPO(StageAlgorithm):
         target_steps: List[int],
         device: torch.device,
     ) -> torch.Tensor:
-        """Per-step KL-normalization sigma_t for the KL-ADV mask, via the shared
-        :func:`~unirl.algorithms.base._transition_sigma`. ``add_kl_coefficient=False``
-        returns ones (unnormalized MSE). Shape ``[1, S', 1, 1, 1]``.
-        """
+        """Per-step KL-normalization sigma_t ``[1, S', 1, 1, 1]``; ones when ``add_kl_coefficient=False``."""
         return _transition_sigma(
             self.stage,
             segment=segment,

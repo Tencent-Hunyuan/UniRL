@@ -1,11 +1,4 @@
-"""LTX2 pipeline — T2V / I2V / T2AV dispatch.
-
-Composes text embedding, diffusion, and VAE decode stages into a complete
-rollout pipeline. Mode is determined by the request primitives:
-- T2V: text only → video generation
-- I2V: text + image → image-conditioned video generation
-- T2AV: text → video + audio joint generation (LTX-2.3)
-"""
+"""LTX2 pipeline — T2V / I2V / T2AV dispatch."""
 
 from __future__ import annotations
 
@@ -113,28 +106,12 @@ class LTX2Pipeline(Pipeline):
         )
 
     def build_schedule_policy(self):
-        """Build the LTX-2 schedule policy (constant-μ exponential shift).
-
-        The hosting engine (``TrainsideRolloutEngine``) calls this at startup
-        to pin the gen Part's ``DiffusionSamplingParams.sigmas`` before ``generate``.
-        LTX-2 uses dynamic-shifting
-        with μ ≡ ``max_shift`` (2.05) — NOT the static ``shift=1.0`` the engine
-        would otherwise fall back to (which under-resolves the trajectory and
-        yields blurry frames). See ``schedule.py`` for the diffusers alignment.
-        """
+        """Build the LTX-2 schedule policy (constant-μ exponential shift)."""
         return build_ltx2_schedule_policy(self.shift)
 
     @classmethod
     def latent_shape(cls, *, model_config: Any, sampling_spec: Any) -> Tuple[int, ...]:
-        """Per-sample 5D latent shape ``(C, T_lat, H_lat, W_lat)`` for the
-        driver-side x_T recipe (``LatentShapeProvider`` contract).
-
-        LTX-2 3D-VAE: 32x spatial, 8x temporal, 128 latent channels. The
-        temporal axis is causal, so ``T_lat = (num_frames - 1) // 8 + 1``.
-        Noise is generated UNPACKED (5D) here; the pipeline packs it into the
-        transformer's ``(B, seq, C)`` token layout in ``generate``. Mirrors
-        diffusers' ``LTX2Pipeline.prepare_latents``.
-        """
+        """Per-sample 5D latent shape ``(C, T_lat, H_lat, W_lat)`` for the driver-side x_T recipe."""
         height = int(sampling_spec.height)
         width = int(sampling_spec.width)
         num_frames = int(sampling_spec.num_frames)
@@ -150,18 +127,13 @@ class LTX2Pipeline(Pipeline):
         return (_LTX2_LATENT_CHANNELS, latent_t, latent_h, latent_w)
 
     def _patch_sizes(self) -> Tuple[int, int]:
-        """``(patch_size, patch_size_t)`` read off the transformer config
-        (defaults 1/1 — LTX-2 patchifies in the proj_in linear, not by reshape).
-        """
+        """``(patch_size, patch_size_t)`` off the transformer config — LTX-2 patchifies in proj_in, not by reshape."""
         cfg = self.bundle.transformer.config
         return int(getattr(cfg, "patch_size", 1)), int(getattr(cfg, "patch_size_t", 1))
 
     @staticmethod
     def _pack_latents(latents: torch.Tensor, patch_size: int, patch_size_t: int) -> torch.Tensor:
-        """5D ``(B, C, F, H, W)`` → packed ``(B, seq, C·p_t·p·p)``.
-
-        Verbatim from diffusers ``LTX2Pipeline._pack_latents``.
-        """
+        """5D ``(B, C, F, H, W)`` → packed ``(B, seq, C·p_t·p·p)``."""
         batch_size, num_channels, num_frames, height, width = latents.shape
         post_f = num_frames // patch_size_t
         post_h = height // patch_size
@@ -174,23 +146,14 @@ class LTX2Pipeline(Pipeline):
     def _unpack_latents(
         latents: torch.Tensor, num_frames: int, height: int, width: int, patch_size: int, patch_size_t: int
     ) -> torch.Tensor:
-        """Packed ``(B, seq, D)`` → 5D ``(B, C, F, H, W)`` — inverse of pack.
-
-        Verbatim from diffusers ``LTX2Pipeline._unpack_latents``.
-        """
+        """Packed ``(B, seq, D)`` → 5D ``(B, C, F, H, W)`` — inverse of pack."""
         batch_size = latents.size(0)
         latents = latents.reshape(batch_size, num_frames, height, width, -1, patch_size_t, patch_size, patch_size)
         latents = latents.permute(0, 4, 1, 5, 2, 6, 3, 7).flatten(6, 7).flatten(4, 5).flatten(2, 3)
         return latents
 
     def _denormalize_latents(self, latents: torch.Tensor) -> torch.Tensor:
-        """Channel-wise denormalize a 5D latent by the VAE's ``latents_mean/std``
-        and ``scaling_factor`` before decode (diffusers ``_denormalize_latents``).
-
-        Inverse of the VAE's normalization. (Pure x_T noise is fed RAW to the
-        transformer — see ``generate`` — so there is no forward ``_normalize``
-        on the rollout path; only the produced latents are denormalized here.)
-        """
+        """Channel-wise denormalize a 5D latent by the VAE's ``latents_mean/std`` and ``scaling_factor`` pre-decode."""
         vae = self.bundle.vae
         mean = vae.latents_mean.view(1, -1, 1, 1, 1).to(latents.device, latents.dtype)
         std = vae.latents_std.view(1, -1, 1, 1, 1).to(latents.device, latents.dtype)
@@ -203,15 +166,7 @@ class LTX2Pipeline(Pipeline):
         negatives: Optional[Texts] = None,
         guidance_scale: float = 1.0,
     ) -> LTX2Conditions:
-        """Encode prompts and optional CFG negatives into ``LTX2Conditions``.
-
-        CFG empty-negative: LTX-2's diffusers pipeline defaults negative_prompt to
-        ``""`` when guidance is on, so the model sees its trained unconditional
-        embedding. Without this, predict_noise would skip the CFG branch entirely
-        (negative_text is None) and guidance_scale would be a silent no-op.
-        The Sample path intentionally carries no negative prompt; direct callers
-        such as ReFL can supply one through this public builder.
-        """
+        """Encode prompts and optional CFG negatives into ``LTX2Conditions``."""
         if negatives is not None and len(negatives.texts) != len(texts.texts):
             raise ValueError(
                 f"LTX2Pipeline.build_conditions: negative_text length "
@@ -223,13 +178,7 @@ class LTX2Pipeline(Pipeline):
         return LTX2Conditions.from_dict(embed_result)
 
     def generate(self, sample: Sample) -> Sample:
-        """Run LTX-2 T2V end-to-end, filling the frontier (pre-forked) gen Part.
-
-        Requires σ to be pinned onto the gen part's ``DiffusionSamplingParams.sigmas``
-        by the hosting engine (a fallback ``get_sigma_schedule`` is computed if not,
-        for parity with the prior req path); see the σ ownership note in
-        ``unirl.models.types.pipeline``.
-        """
+        """Run LTX-2 T2V end-to-end, filling the frontier (pre-forked) gen Part."""
         frontier = sample.parts[-1]
         params = frontier.sampling_params
         if params is None:

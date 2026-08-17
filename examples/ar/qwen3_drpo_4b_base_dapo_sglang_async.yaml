@@ -23,7 +23,7 @@ num_rollouts: 800
 
 # Train slab share (rollout gets the rest). 0.5 -> equal split.
 train_fraction: 0.5
-max_inflight: 1          # concurrent generations
+max_inflight: 1          # concurrent generation calls
 weight_sync_interval: 1  # trained batches per publication; also configures the output-version lag filter
 
 eval_interval: 10

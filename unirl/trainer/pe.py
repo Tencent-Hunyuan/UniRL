@@ -1,22 +1,4 @@
-"""UniRL v2 PE (Prompt Enhancement) joint trainer.
-
-Two :class:`~unirl.train.stack.TrainStack` siblings — one for the
-diffusion model, one for the AR LLM — colocated on the whole pool, sharing the
-composed :class:`~unirl.models.pe.pipeline.PEPipeline` as a *trainside*
-rollout (the rollout reads the live FSDP modules, so no weight sync).
-
-One ``train_step``::
-
-    rollout.generate(sample)         → 3-part Sample [input, ar, diffusion]
-    reward.score_and_attach(sample)  → score the frontier (image) Part only
-    sample.propagate_rewards("mean") → credit-assign image reward up to "ar"
-    part.compute_advantages()        → per-Part GRPO (ar by prompt, diff by rewrite)
-    {name}.stack.train_track(part)   → route each Part to its own model
-
-Mirrors :class:`~unirl.trainer.diffusion.DiffusionTrainer` but wires two
-of everything and a composed rollout. Deferred (same as the reference trainer):
-multi-epoch replay, checkpoint / eval cadence, structured logging.
-"""
+"""UniRL v2 PE (Prompt Enhancement) joint trainer."""
 
 from __future__ import annotations
 
@@ -50,14 +32,7 @@ TRACK_NAMES: Tuple[str, ...] = ("ar", "diffusion")
 
 @dataclass
 class _Side:
-    """The sibling Remotes that make up one track.
-
-    ``bundle`` + ``pipeline`` are always built (the pipeline is the rollout
-    sampler). The training trio (``backend`` / ``algorithm`` / ``stack``) is
-    ``None`` for a frozen, rollout-only side (``freeze_llm=True`` skips them on
-    the AR side — see :meth:`PETrainer._wire_rollout_only_side`); a trained side
-    populates all five.
-    """
+    """The sibling Remotes that make up one track."""
 
     bundle: Any
     pipeline: Any
@@ -67,21 +42,7 @@ class _Side:
 
 
 class PETrainer(BaseTrainer):
-    """PE joint trainer: two TrainStack siblings + composed trainside rollout.
-
-    ``freeze_llm=True`` switches the AR side to a frozen, rollout-only rewriter:
-    the LLM still generates the N prompt rewrites each rollout (the composed
-    :class:`PEPipeline` samples its live module under ``torch.no_grad``), but it
-    has no backend / algorithm / stack and never trains — only the diffusion
-    track updates. Use it to learn diffusion against a fixed prompt-enhancer.
-
-    ``diffusion_group_scope`` selects the diffusion track's GRPO grouping (the
-    advantage baseline): ``"rewrite"`` (default) compares the M images of one
-    rewrite; ``"prompt"`` compares all N*M images of one original prompt across
-    every rewrite, so diffusion learns to render well for the original intent
-    regardless of how the (frozen) rewriter phrased it. The objective recipe
-    pairs ``freeze_llm=True`` with ``diffusion_group_scope="prompt"``.
-    """
+    """PE joint trainer: two TrainStack siblings + composed trainside rollout."""
 
     def __init__(
         self,
@@ -170,11 +131,7 @@ class PETrainer(BaseTrainer):
                     self.ar_sync = remote_hydra(sync_cfg.ar, backend=self.ar.backend, rollout=self.rollout)
 
     def _wire_side(self, cfg: DictConfig) -> _Side:
-        """Build one track's bundle → pipeline → backend → algorithm → stack.
-
-        Identical to ``DiffusionTrainer``'s single-side chain; called twice
-        (diffusion + ar) inside the shared placement block.
-        """
+        """Build one track's bundle → pipeline → backend → algorithm → stack."""
         bundle = remote_hydra(cfg.bundle)
         pipeline = remote_hydra(cfg.pipeline, bundle=bundle)
         backend = remote_hydra(cfg.backend, bundle=bundle)
@@ -183,17 +140,7 @@ class PETrainer(BaseTrainer):
         return _Side(bundle=bundle, pipeline=pipeline, backend=backend, algorithm=algorithm, stack=stack)
 
     def _wire_rollout_only_side(self, cfg: DictConfig) -> _Side:
-        """Build a frozen, rollout-only side: bundle + pipeline, NO training trio.
-
-        Used for the AR side under ``freeze_llm=True``. The bundle materializes
-        the model on its device at load time (e.g. ``Qwen3Bundle.from_config``
-        does ``.to(device)``), and the composed :class:`PEPipeline` samples this
-        pipeline's stage under ``torch.no_grad`` via the trainside engine's
-        eval-scope — so the LLM rewrites prompts but never trains. ``backend`` /
-        ``algorithm`` / ``stack`` stay ``None``; the recipe's AR training blocks
-        (if present) are intentionally ignored. The model is frozen by absence
-        of an optimizer — no LoRA/FSDP train state is built for it.
-        """
+        """Build a frozen, rollout-only side: bundle + pipeline, NO training trio."""
         bundle = remote_hydra(cfg.bundle)
         pipeline = remote_hydra(cfg.pipeline, bundle=bundle)
         return _Side(bundle=bundle, pipeline=pipeline)
@@ -205,22 +152,7 @@ class PETrainer(BaseTrainer):
         *,
         sampling: Optional[Dict[str, BaseSamplingParams]] = None,
     ) -> Sample:
-        """Turn a data-source batch of ``P`` prompts into the composed request ``Sample``.
-
-        Namespaces the data source's single text input Part, then pre-forks
-        the two gen shells the composed engine expects — ``[input, ar_shell(P*N),
-        diff_shell(P*N*M)]``, located by sampling-params type. The two forks encode
-        ``ar.samples_per_prompt`` rewrites and ``diffusion.samples_per_prompt``
-        images per rewrite.
-
-        ``rollout_id`` keys the diffusion SDE-step schedule (resolved off the
-        diffusion sub-block, ``scheduler`` nulled so only the concrete
-        ``sde_indices`` ride) and salts the root ids so the diffusion x_T varies
-        per rollout — the engine derives the noise key from the gen Part ids. The
-        AR sub-block has no SDE machinery and is left untouched.
-        ``sampling`` overrides the modality-keyed sampling dictionary for
-        evaluation; ``None`` uses the training parameters.
-        """
+        """Turn a data-source batch of ``P`` prompts into the composed request ``Sample``."""
         base = sampling if sampling is not None else self.sampling_params
         diff_params = base.get("diffusion")
         ar_params = base.get("ar")
@@ -246,16 +178,7 @@ class PETrainer(BaseTrainer):
         sync_weights: bool = False,
         rollout_id: int = 0,
     ) -> Tuple[Dict[str, TrainStepResult], float]:
-        """One ``rollout → reward → credit-assign → advantage → step`` pass.
-
-        Returns ``(per_track_results, mean_reward)``. ``mean_reward`` is the
-        mean unnormalized image reward (for the log line).
-
-        ``sync_weights`` pushes each track's freshly-trained adapter into the
-        engine between ``wake_up`` and ``generate`` — no-op trainside (the
-        rollout shares the live FSDP modules, so the bridges are ``None``).
-        ``rollout_id`` only keys the wandb panels (see :meth:`UniRLWandBLogger.log_rollout_step`).
-        """
+        """One ``rollout → reward → credit-assign → advantage → step`` pass."""
         t0 = time.perf_counter()
         self.rollout.wake_up()
         if sync_weights and self.diffusion_sync is not None:
@@ -310,19 +233,7 @@ class PETrainer(BaseTrainer):
         return results, mean_reward
 
     def evaluate(self, step: int) -> float:
-        """Periodic eval on the eval set (no training); returns the mean image reward.
-
-        Mirrors :meth:`train_step`'s rollout+reward path but skips
-        credit-assign/advantage/backward: pull ``eval_num_prompts`` eval prompts
-        (``run.eval_data_path``), generate the composed ``P→P*N*M`` fan-out with
-        the diffusion sub-block forced onto the deterministic best-quality setting
-        (CFG at ``eval_cfg_text_scale``, ``eta=eval_eta``), and score ONLY the
-        image ("diffusion") track. The training reward plus every shared-set
-        ``eval_rewards`` suite scores the SAME generated images; each own-set
-        suite then gets its own generation pass over its own prompts. All means
-        land in one ``eval/*`` row (``eval/reward`` + ``eval/<suite>``); returns
-        ``eval/reward``.
-        """
+        """Periodic eval on the eval set (no training); returns the mean image reward."""
         base_diffusion = self.sampling_params.get("diffusion")
         replace_kwargs = dict(eta=self.eval_eta)
         if "cfg_text_scale" in {f.name for f in dataclasses.fields(base_diffusion)}:
@@ -365,13 +276,7 @@ class PETrainer(BaseTrainer):
         eval_sp: Dict[str, BaseSamplingParams],
         step: int,
     ) -> Dict[str, float]:
-        """One generate→score sweep over one eval set; returns each scorer's mean.
-
-        Chunked by ``self.batch_size`` — the rollout DP-splits the un-expanded
-        P-prompt req, so the chunk must be divisible by the engine dp; ``batch_size``
-        is what training already runs, so it is divisible. A ragged tail
-        (``num_prompts`` not a multiple of ``batch_size``) is floored off.
-        """
+        """One generate→score sweep over one eval set; returns each scorer's mean."""
         all_inputs = data_source.get_eval_samples(num_prompts)
         n_prompts = all_inputs.batch_size
         chunk = max(1, self.batch_size)
@@ -392,13 +297,7 @@ class PETrainer(BaseTrainer):
         return {name: sums[name] / max(1, counts[name]) for name, _ in scorers}
 
     def _ckpt_sides(self):
-        """The trained sides to checkpoint: diffusion always; ar only when it trains.
-
-        A frozen LLM (``freeze_llm=True``) has no AR backend and never trains, so
-        only the diffusion adapter is persisted. Otherwise BOTH LoRA adapters are
-        saved — eval reward depends on the AR rewriter AND the diffusion renderer,
-        so a resumed checkpoint must restore both for the A/B consistency check.
-        """
+        """The trained sides to checkpoint: diffusion always; ar only when it trains."""
         sides = [("diffusion", self.diffusion)]
         if not self._freeze_llm and self.ar.backend is not None:
             sides.append(("ar", self.ar))
@@ -421,15 +320,7 @@ class PETrainer(BaseTrainer):
         save_dir: Optional[str],
         save_mode: str = "auto",
     ) -> None:
-        """Save every ``save_interval`` rollouts (and on the last one), one subdir
-        per trained side. ``save_interval <= 0`` disables saving.
-
-        PE has no single ``self.backend`` (it owns ``self.diffusion.backend`` +
-        ``self.ar.backend``), so this overrides the BaseTrainer single-backend
-        version: each side writes ``<save_dir>/checkpoint-<step>/<side>/`` and the
-        driver-owned ``trainer_state.json`` (wandb run id + step axis) sits beside
-        them, mirroring the base method's semantics.
-        """
+        """Save every ``save_interval`` rollouts (and on the last one), one subdir per trained side."""
         if save_interval <= 0:
             return
         step = rollout_id + 1
@@ -449,13 +340,7 @@ class PETrainer(BaseTrainer):
             self._wait_for_checkpoints()
 
     def maybe_load_checkpoint(self, load_dir: Optional[str], *, num_rollouts: Optional[int] = None) -> int:
-        """Restore both trained sides from ``load_dir``; return the resume step.
-
-        Returns 0 for a fresh run (``load_dir`` empty). Each trained side loads
-        from its subdir; both advance in lockstep so either side's returned step
-        is the resume point. Restores the driver-side ``_resume_state`` (wandb run
-        id / step axis) so a resume appends to the same wandb run.
-        """
+        """Restore both trained sides from ``load_dir``; return the resume step."""
         if not load_dir:
             return 0
         load_dir = os.path.abspath(load_dir)
@@ -489,18 +374,7 @@ class PETrainer(BaseTrainer):
         load_dir: Optional[str] = None,
         save_mode: str = "auto",
     ) -> None:
-        """Minimal training loop: ``num_rollouts`` iterations of ``train_step``.
-
-        ``weight_sync_interval``: push each track's adapter into the engine
-        every N rollouts (fused into ``train_step``'s generate; no-op trainside).
-
-        ``save_interval``: write a checkpoint every N rollouts (and on the last
-        one), one subdir per trained side; ``0`` disables it. ``save_dir`` is the
-        output folder (defaults to ``./checkpoints``); ``save_mode="auto"`` writes
-        LoRA-only checkpoints when LoRA is active. ``load_dir``: restore from a
-        checkpoint directory and RESUME from its saved step — ``num_rollouts`` is
-        the TOTAL budget.
-        """
+        """Minimal training loop: ``num_rollouts`` iterations of ``train_step``."""
         interval = max(1, weight_sync_interval)
         start_rollout = self.maybe_load_checkpoint(load_dir, num_rollouts=num_rollouts)
         resumed = bool(load_dir)

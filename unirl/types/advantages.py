@@ -1,10 +1,4 @@
-"""Advantage computation helpers for generated parts.
-
-GRPO-style group normalization lives on :meth:`Part.compute_advantages` in
-:mod:`unirl.types.sample`. :func:`finite_mean_std` is the shared finite-only
-population mean/std used by that path and agentic trainers. GAE and other
-per-step estimators also live here as pure tensor utilities.
-"""
+"""Advantage computation helpers for generated parts."""
 
 from __future__ import annotations
 
@@ -14,12 +8,7 @@ import torch
 
 
 def finite_mean_std(values: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Population mean/std over finite entries of ``values``.
-
-    Non-finite values are ignored. Empty finite set → ``(0, 1)``; a single finite
-    value → std ``1`` so ``(x - mean) / (std + eps)`` collapses to advantage 0
-    (GRPO singleton / all-equal-after-filter degenerate case).
-    """
+    """Population mean/std over finite entries of ``values``."""
     finite = values[torch.isfinite(values)]
     if finite.numel() == 0:
         return values.new_zeros(()), values.new_ones(())
@@ -36,33 +25,7 @@ def compute_gae_advantages(
     gae_lambda: float = 0.95,
     mask: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Compute GAE advantages and returns from step rewards and value predictions.
-
-    For each step ``t`` (backward in time):
-
-        δ_t = r_t + γ V_{t+1} - V_t
-        A_t = δ_t + (γλ) δ_{t+1} + (γλ)² δ_{t+2} + ...
-
-    After the last valid step, ``V_{T}`` bootstraps with zero (episodic terminal).
-
-    Args:
-        rewards: Step rewards ``[T]`` or ``[B, T]``.
-        values: Critic predictions ``V_t``, same shape as ``rewards``.
-        gamma: Discount factor γ.
-        gae_lambda: GAE smoothing λ.
-        mask: Optional validity mask (1 = include, 0 = padding / ignore).
-            When provided, GAE does not carry across zero-mask positions.
-
-    Returns:
-        ``(advantages, returns)`` with the same shape as ``rewards``.
-        ``returns = advantages + values`` (standard GAE-return convention).
-
-    Raises:
-        ValueError: On shape mismatch or invalid hyperparameters.
-
-    Reference: Schulman et al., "High-Dimensional Continuous Control Using
-    Generalized Advantage Estimation" (2016).
-    """
+    """Compute GAE advantages and returns from step rewards and value predictions."""
     if rewards.shape != values.shape:
         raise ValueError(
             f"compute_gae_advantages: rewards shape {tuple(rewards.shape)} != values shape {tuple(values.shape)}"

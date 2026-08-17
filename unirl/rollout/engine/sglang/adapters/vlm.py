@@ -1,13 +1,4 @@
-"""``VLMAdapter`` — the narrowest VLM overrides on the text base.
-
-Differs from :class:`TextLMAdapter` in exactly the steps the modality forces:
-``build_inputs`` processor-encodes each ``(prompt, image)`` pair (the
-chat-templated TEXT with a single placeholder + base64 ``image_data`` go to SRT,
-which re-expands it server-side; the processor's EXPANDED ids become the replay
-prompt), and ``build_conditions`` adds the per-sample ``pixel_values`` /
-``image_grid_thw`` so the replay teacher-forces over the IDENTICAL multimodal
-input — the importance ratio stays consistent.
-"""
+"""``VLMAdapter`` — the narrowest VLM overrides on the text base."""
 
 from __future__ import annotations
 
@@ -73,19 +64,7 @@ class VLMAdapter(TextLMAdapter):
         )
 
     def encode_mm(self, messages: List[Dict[str, Any]], images: List[Any]) -> MMEncoding:
-        """Processor-encode one conversation + its image(s) into the native layout.
-
-        ``messages`` is the fused chat conversation :func:`build_vision_conversations`
-        assembled (image placeholder before text in the user message); ``images``
-        are its PILs in placeholder order. Returns a fully-populated
-        :class:`MMEncoding`: ``input_ids`` already has the placeholder expanded to
-        the per-image vision-token count — the SAME encoding the trainside replay
-        teacher-forces over (``input_ids`` + ``pixel_values``), so rollout and
-        replay are token-for-token identical.
-
-        One image per request (``image_data`` / ``MMEncoding.image`` carry a single
-        PIL); multi-image conversations are out of scope.
-        """
+        """Processor-encode one conversation + its image(s) into the native layout."""
         require(
             len(images) == 1,
             f"{type(self).__name__}.encode_mm: expected exactly one image per request, "
@@ -118,13 +97,7 @@ class VLMAdapter(TextLMAdapter):
         )
 
     def build_conditions(self, sample: Sample, prepared: PreparedInputs, raw: List[RawResult]) -> Dict[str, Any]:
-        """Add per-sample ``pixel_values`` / ``image_grid_thw`` to the base.
-
-        Replicated from the prompt-level processor encoding so each sibling
-        sample carries the image condition its rollout was generated under
-        (per-sample lists with FieldKind.CONCAT semantics — they survive the
-        DP split/merge and reach the replay aligned with ``prompt``).
-        """
+        """Add per-sample ``pixel_values`` / ``image_grid_thw`` to the base."""
         conditions = super().build_conditions(sample, prepared, raw)
         if prepared.mm:
             _, prompt_index = self.replicate_per_sample(prepared)

@@ -1,18 +1,4 @@
-"""t2t — text-to-text autoregressive generation.
-
-Reads ``primitives["text"]: Texts`` and ``stage_params["ar"]: dict``
-(optional). Builds the chat-templated input tensors via
-``HunyuanImage3TextEmbedStage.embed_for_ar(...)`` (mode="gen_text"),
-then runs ``HunyuanImage3ARStage.autoregress`` against the backbone in
-``mode="gen_text"`` and detokenizes the resulting ``TextSegment`` back
-into a ``Texts`` primitive on the response.
-
-The bot_task knob (``"auto"`` / ``"image"`` / ``"think"`` /
-``"recaption"`` / ``"think_recaption"`` / ``"img_ratio"``) drives both
-chat-template splicing (in ``embed_for_ar``) and stop-token selection
-(via ``_stop_tokens_for_bot_task``). Stop-token sets mirror upstream
-``pipeline_hunyuan_image3.py:627-632``.
-"""
+"""t2t — text-to-text autoregressive generation."""
 
 from __future__ import annotations
 
@@ -121,14 +107,7 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
 def _resolve_system_prompt(
     bundle, bot_task: str, use_system_prompt: Optional[str], system_prompt: Optional[str]
 ) -> Optional[str]:
-    """Mirror upstream ``get_system_prompt(sys_type, bot_task, system_prompt)``.
-
-    Reads ``use_system_prompt`` from the request (or falls back to the
-    bundle's gen_config default). ``custom`` -> use explicit
-    ``system_prompt`` arg. ``dynamic`` -> per-bot_task preset.
-    Named presets (``en_vanilla`` / ``en_recaption`` / ``en_think_recaption``)
-    -> static lookup. ``None`` -> no system prompt.
-    """
+    """Mirror upstream ``get_system_prompt(sys_type, bot_task, system_prompt)``."""
     import importlib
     import sys
 
@@ -149,13 +128,7 @@ def _resolve_system_prompt(
 
 
 def _stop_tokens_for_bot_task(bundle, bot_task: str) -> List[int]:
-    """Mirror upstream's stop-token dict at
-    ``vllm-omni/.../pipeline_hunyuan_image3.py:627-632``.
-
-    Falls back to an empty list when the bundle has no usable tokenizer
-    wrapper (e.g. fake-bundle unit tests). Callers may seed
-    ``ar_params.stop_token_ids`` to override.
-    """
+    """Mirror upstream's stop-token dict at ``vllm-omni/.../pipeline_hunyuan_image3.py:627-632``."""
     transformer = bundle.transformer
     tkw = getattr(transformer, "_tkwrapper", None) or getattr(transformer, "_tokenizer", None)
     if tkw is None:

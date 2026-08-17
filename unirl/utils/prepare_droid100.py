@@ -1,22 +1,4 @@
-"""Prepare a small LeRobot-v3 robot dataset (default ``lerobot/droid_100``) into
-self-contained Cosmos3 SFT debug samples.
-
-Emits, under ``--root``::
-
-    frames/<sample_id>.pt    uint8 [T, 3, H, W]      (decoded once here; training
-                                                      never touches AV1/mp4)
-    actions/<sample_id>.pt   float32 [T-1, D_raw]    (z-normalized action chunk)
-    manifest.jsonl           one record per training window
-    eval_manifest.jsonl      held-out episodes
-    stats.json               action mean/std used for normalization
-
-Window convention matches Cosmos3 policy mode: a chunk of ``T-1`` action
-transitions pairs with ``T`` frames. The default output canvas (H=192, W=320)
-is exactly the Cosmos3 action resolution-tier-256 bin with ratio 5:3, so
-training-time encoding and tier-based action inference see the same canvas.
-
-Only stdlib + torch + pandas/pyarrow + huggingface_hub + av are required.
-"""
+"""Prepare LeRobot-v3 DROID windows as self-contained Cosmos3 SFT samples."""
 
 from __future__ import annotations
 
@@ -97,11 +79,7 @@ def decode_episode_frames(
     episode_row,
     num_frames_needed: int,
 ) -> np.ndarray:
-    """Decode one episode's frames for ``camera`` -> uint8 [L, H, W, 3].
-
-    LeRobot v3 concatenates episodes into per-chunk mp4 files; the episode's
-    span is ``[from_timestamp, to_timestamp)`` within that file.
-    """
+    """Decode one camera episode into uint8 ``[L,H,W,3]`` frames."""
     av = _require("av")
     chunk, file, from_ts, to_ts = _episode_video_source(episode_row, camera)
     template = info.get("video_path", "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4")

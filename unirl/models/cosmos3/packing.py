@@ -1,23 +1,4 @@
-"""Joint-sequence packing + flow-matching noising for Cosmos3 SFT.
-
-Training mirrors ``Cosmos3OmniPipeline.__call__`` steps 2-5 bit-for-bit by
-calling the pipeline's own helpers (``tokenize_prompt``,
-``_prepare_text_segment``, ``_prepare_vision_segment``,
-``_prepare_action_segment``, ``_encode_video``), then replaces the denoising
-loop with a single noised forward:
-
-    sigma ~ p(t), flow-shift-warped exactly like ``set_timesteps``
-    x_t   = (1 - sigma) * x0 + sigma * eps      # noisy frames only; condition
-                                                # frames stay clean x0 and get
-                                                # no timestep embedding
-    v*    = eps - x0                            # UniPC ``flow_prediction``
-                                                # convention: x0_pred =
-                                                # sample - sigma * v
-    loss  = MSE over noisy tokens
-
-The transformer consumes ONE packed sequence per call (no batch dim); a
-training micro-batch is one sample, with gradient accumulation across samples.
-"""
+"""Joint-sequence packing and flow-matching noising for Cosmos3 SFT."""
 
 from __future__ import annotations
 
@@ -27,12 +8,7 @@ import torch
 
 
 def resolution_tier(height: int, width: int) -> str:
-    """Map a sample to the official short-edge Cosmos resolution tier.
-
-    Official shift table is 256/480/720. Short edges above the 720p bin
-    (including 704/768/1080 canvases) stay on the 720 tier rather than an
-    unmapped key that would silently fall back to the checkpoint scheduler.
-    """
+    """Map a sample to the official 256, 480, or 720 short-edge resolution tier."""
     short_edge = min(int(height), int(width))
     if short_edge <= 256:
         return "256"
@@ -50,8 +26,7 @@ def sample_train_sigma(
     generator: Optional[torch.Generator],
     device: torch.device,
 ) -> torch.Tensor:
-    """Draw one training sigma in (0, 1), then apply the same shift warp
-    ``set_timesteps`` uses: ``sigma' = shift*s / (1 + (shift-1)*s)``."""
+    """Draw one training sigma in (0, 1) and apply the scheduler's shift warp."""
     if time_dist == "uniform":
         base = torch.rand((), generator=generator, device=device, dtype=torch.float32)
     elif time_dist == "logitnormal":
@@ -69,11 +44,7 @@ def noise_vision_latents(
     condition_frame_indexes: Sequence[int],
     generator: Optional[torch.Generator],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Flow-matching interpolation for vision latents ``[1, C, T_lat, H, W]``.
-
-    Returns ``(x_t, velocity_target)``; conditioned latent frames carry clean
-    ``x0`` in ``x_t`` (their velocity-target slots are never read by the loss).
-    """
+    """Interpolate vision latents ``[1,C,T,H,W]`` while preserving conditioned frames."""
     noise = torch.randn(x0.shape, generator=generator, device=x0.device, dtype=x0.dtype)
     x_t = (1.0 - sigma) * x0 + sigma * noise
     for frame_idx in condition_frame_indexes:
@@ -82,8 +53,7 @@ def noise_vision_latents(
 
 
 def pad_action_chunk(actions: torch.Tensor, action_dim: int) -> torch.Tensor:
-    """Zero-pad a raw action chunk ``[T, D_raw]`` up to the model's
-    ``action_dim`` (the checkpoint convention: padded dims are exactly zero)."""
+    """Zero-pad a raw action chunk ``[T,D_raw]`` to the model action width."""
     if actions.ndim != 2:
         raise ValueError(f"action chunk must be [T, D], got {tuple(actions.shape)}")
     if actions.shape[1] > action_dim:
@@ -100,9 +70,7 @@ def noise_action_latents(
     raw_action_dim: int,
     generator: Optional[torch.Generator],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Flow-matching interpolation for a fully-noisy action chunk ``[T, action_dim]``
-    (policy-mode BC: no clean action conditioning). Channels >= ``raw_action_dim``
-    are pinned to zero in both the sample and the target, matching inference."""
+    """Interpolate a fully noisy action chunk ``[T,D]`` while keeping padded channels zero."""
     noise = torch.randn(x0_padded.shape, generator=generator, device=x0_padded.device, dtype=x0_padded.dtype)
     noise[:, raw_action_dim:] = 0
     x_t = (1.0 - sigma) * x0_padded + sigma * noise
@@ -124,17 +92,7 @@ def pack_joint_sequence(
     action_fps: Optional[float] = None,
     compute_dtype: Optional[torch.dtype] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """Assemble ``Cosmos3OmniTransformer.forward`` kwargs for ONE sample.
-
-    Mirrors the conditional-pass assembly in ``Cosmos3OmniPipeline.__call__``
-    (text segment -> vision segment -> optional action segment -> position_ids
-    concat). ``pipe`` only needs the pipeline's segment helpers plus
-    ``transformer.config`` / ``vae.config`` — a duck-typed stand-in works in
-    tests.
-
-    Returns ``(kwargs, meta)``: ``kwargs`` lacks only the per-call
-    ``vision_timesteps`` / ``action_timesteps`` tensors (sized via ``meta``).
-    """
+    """Assemble one sample's packed ``Cosmos3OmniTransformer.forward`` arguments."""
     text_seg = pipe._prepare_text_segment(list(input_ids), device=device)
     vision_seg = pipe._prepare_vision_segment(
         input_vision_tokens=vision_tokens,

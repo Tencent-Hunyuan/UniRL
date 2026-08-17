@@ -1,11 +1,4 @@
-"""RL-aware BAGEL-7B-MoT pipeline subclass.
-
-``forward`` follows the RL interception protocol (install → arm → run → harvest):
-install the trajectory-capturing SDE scheduler + noise tap + fp32 RoPE/RMSNorm
-patches, arm per-request x_T/SDE, delegate to upstream, then harvest the trajectory.
-Conditioning is NOT tapped — the driver ships prompts and the trainer rebuilds the
-(frozen) KV contexts at replay. Loaded in vLLM-Omni's worker via custom_pipeline_args.
-"""
+"""RL-aware BAGEL-7B-MoT pipeline subclass."""
 
 from __future__ import annotations
 
@@ -46,8 +39,7 @@ class RLBagelPipeline(BagelPipeline):
         self._trajectory_dtype: torch.dtype = torch.float32
 
     def _install_sde_scheduler(self) -> None:
-        """Point ``self.scheduler`` at the trajectory-capturing SDE scheduler — always
-        installed (even eta=0) since replay needs the captured trajectory; kwargs empty."""
+        """Point ``self.scheduler`` at the trajectory-capturing SDE scheduler — always installed, even at eta=0."""
         if self._sde_scheduler_installed:
             return
         self.scheduler = self._sde_scheduler
@@ -55,8 +47,7 @@ class RLBagelPipeline(BagelPipeline):
         self._sde_scheduler_installed = True
 
     def _install_rope_fp32(self) -> None:
-        """Force the rotary cos/sin into fp32 to bit-match trainside — the worker rotary
-        runs under autocast(bf16) with no guard, so its cos/sin diverge every step."""
+        """Force the rotary cos/sin to fp32 to bit-match trainside — the worker rotary runs under unguarded autocast."""
         if self._rope_fp32_patched:
             return
         try:
@@ -95,8 +86,7 @@ class RLBagelPipeline(BagelPipeline):
         self._rope_fp32_patched = True
 
     def _install_rmsnorm_fp32(self) -> None:
-        """Make every worker RMSNorm bit-match the trainside ``Qwen2RMSNorm`` — vLLM
-        rounds the fp32 q/k-norm to bf16 before the multiply, a LoRA-growing velocity gap."""
+        """Make every worker RMSNorm bit-match trainside ``Qwen2RMSNorm`` — vLLM rounds the fp32 q/k-norm to bf16."""
         if self._rmsnorm_fp32_patched:
             return
         try:
@@ -131,8 +121,7 @@ class RLBagelPipeline(BagelPipeline):
         self._rmsnorm_fp32_patched = True
 
     def _install_noise_tap(self) -> None:
-        """Wrap ``bagel.prepare_vae_latent`` to swap the driver-authored x_T (consume-once)
-        in for upstream's RNG-drawn ``packed_init_noises``, leaving other inputs untouched."""
+        """Wrap ``bagel.prepare_vae_latent`` to swap the driver-authored x_T in for upstream's RNG-drawn noises."""
         if self._noise_tap_installed:
             return
 
@@ -173,11 +162,7 @@ class RLBagelPipeline(BagelPipeline):
 
     @staticmethod
     def _replicate_prompt_kv(kwargs: Dict[str, Any], spp: int, merge_kv_caches: Any) -> Dict[str, Any]:
-        """Clone the single prompt KV cache into ``spp`` views (one per packed image).
-
-        ``prepare_vae_latent`` already opened ``spp`` image slots; each slot indexes
-        its own KV span, so the shared prompt cache must be repeated to match.
-        """
+        """Clone the single prompt KV cache into ``spp`` views (one per packed image)."""
         past = kwargs.get("past_key_values")
         if past is None:
             return kwargs
@@ -186,18 +171,7 @@ class RLBagelPipeline(BagelPipeline):
         return out
 
     def _install_generate_image_tap(self) -> None:
-        """Wrap ``bagel.generate_image`` once for the grouped (spp>1) path.
-
-        Two jobs when ``_pending_spp > 1``:
-
-        1. **Before** the call — replicate prompt KV ``spp``× so it lines up with
-           the ``spp`` image blocks the noise tap already expanded.
-        2. **After** the call — stash all ``spp`` unpacked latents. Upstream
-           ``forward`` only VAE-decodes ``latents[0]``; ``_forward_batched``
-           decodes the rest from this stash.
-
-        ``spp == 1`` is a pure passthrough.
-        """
+        """Wrap ``bagel.generate_image`` once for the grouped (spp>1) path."""
         if self._generate_image_tap_installed:
             return
 
@@ -242,17 +216,11 @@ class RLBagelPipeline(BagelPipeline):
         self._pending_initial_noise = resolve_request_noise(req, caller="RLBagelPipeline._arm_initial_noise")
 
     def _harvest_trajectory(self, out: DiffusionOutput) -> None:
-        """Overwrite upstream's trajectory capture with the SDE scheduler's — sets
-        latents/timesteps/log_probs + sparse sde_step_indices (the build_image_segment wire)."""
+        """Overwrite upstream's trajectory capture with the SDE scheduler's — the ``build_image_segment`` wire."""
         drain_trajectory_into(out, self._sde_scheduler)
 
     def _is_batchable_t2i(self, req: OmniDiffusionRequest) -> bool:
-        """Packed DiT batching: pure text→image at cfg=1 only.
-
-        Reject i2i / text-output modalities (upstream routing) and CFG>1 (needs
-        unreplicated cfg_* branches). Missing CFG keys are NOT 1.0 — upstream
-        defaults absent keys to CFG-ON (4.0 / 1.5).
-        """
+        """Packed DiT batching: pure text→image at cfg=1 only."""
         fp = req.prompts[0] if getattr(req, "prompts", None) else None
         if isinstance(fp, dict):
             modalities = fp.get("modalities") or []
@@ -292,11 +260,7 @@ class RLBagelPipeline(BagelPipeline):
         return out
 
     def _forward_batched(self, req: OmniDiffusionRequest, spp: int, **kwargs) -> DiffusionOutput:
-        """Pack ``spp`` same-prompt images into ONE ``generate_image``.
-
-        Prompt KV is built once and replicated spp×; noise tap packs spp image
-        blocks + driver x_T. Reuse upstream's decode of latents[0]; decode the rest.
-        """
+        """Pack ``spp`` same-prompt images into ONE ``generate_image``."""
         self._install_generate_image_tap()
         ds = int(self.bagel.latent_downsample)
         per = (int(req.sampling_params.height) // ds) * (int(req.sampling_params.width) // ds)

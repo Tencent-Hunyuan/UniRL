@@ -1,40 +1,4 @@
-"""Token-budget packed micro-batching (verl ``ppo_max_token_len_per_gpu`` parity).
-
-Varlen LLM sequences differ wildly in length, so a fixed sample COUNT is a poor proxy
-for compute. The pipeline::
-
-    lengths -> sort longest-first -> greedily fill micros up to the token budget (FFD)
-            -> the filled micros, concatenated, ARE the new sample order (sort-then-slice)
-            -> so each micro is a contiguous (start, end) range; the driver only slices.
-
-**A micro's cost is the number of token-slots the forward materializes for it**, and the
-budget is the max slots per micro. That separates *cost* (one tiny function per forward
-layout — :func:`dense`, :func:`varlen_sum`) from *placement* (one shared bin-packer,
-:func:`first_fit_decreasing`, plus the parity fixup :func:`balance_into_k`). Adding a
-layout is a new cost function, not a new packer. ``cost_model`` on
-:class:`TokenBudgetPlanner` selects the cost:
-
-- ``'dense'`` (:func:`dense`): ``(max_prompt + max_resp) * count`` — rectangular replay
-  that pads the prompt and response blocks SEPARATELY to their in-micro maxes. Packing on
-  this (not on max *total* length) is what stops anti-correlated rows — long-prompt/
-  short-resp paired with the reverse — from blowing up both pads at once. ``prompt == 0``
-  degenerates it to the single-block ``max_resp * count``.
-- ``'sum'`` (:func:`varlen_sum`): sum of real tokens — packed varlen replay (= verl token
-  accounting). No live replay consumes this yet (staged for perf/02).
-
-Invariants that hold across the kernels:
-
-- **Clamp at construction** (:func:`_sample`): ``resp >= 1``, ``prompt >= 0``, so
-  ``total >= 1`` — a zero-cost sample would let a micro pack unboundedly many sequences.
-- **Cost is recomputed per candidate**, not tracked incrementally: pure, and free at
-  per-rank shard sizes (tens–low-hundreds, once per rollout, off the GPU path). Do not
-  reintroduce incremental bin state — it invites staleness bugs for no real speedup.
-- **Parity** (:func:`balance_into_k`): FSDP runs collectives per micro, so every DP rank
-  must execute the same micro count per optimizer step or the process group deadlocks.
-  When a rank's budget-driven count differs from the global max it re-packs into exactly
-  ``k`` micros. This only regroups samples — it never changes the per-update gradient,
-  which is sample-share-weighted and grouping-invariant — so it reuses the injected cost.
-"""
+"""Token-budget packed micro-batching (verl ``ppo_max_token_len_per_gpu`` parity)."""
 
 from __future__ import annotations
 
@@ -161,11 +125,7 @@ def _log_packing_efficiency(micros: List[List[Sample]], *, cost: Cost, budget: i
 def _arrange_packed(
     samples: List[Sample], *, num_updates: int, token_budget: int, cost_model: str
 ) -> Tuple[List[int], Plan]:
-    """Pack ``samples`` into ``(perm, plan)`` — a sort-then-slice permutation plus the
-    contiguous range plan over it. Each update packs independently and is re-balanced to a
-    common micro count across DP ranks; concatenating the micros in order IS ``perm``, and
-    each micro's size IS a contiguous range, so the driver only ever slices.
-    """
+    """Pack ``samples`` into ``(perm, plan)`` — a sort-then-slice permutation plus the contiguous range plan over it."""
     cost: Cost = varlen_sum if cost_model == "sum" else dense
     perm: List[int] = []
     plan: Plan = []
@@ -189,13 +149,7 @@ def _arrange_packed(
 
 
 class TokenBudgetPlanner:
-    """Token-budget packed micro-batches (verl ``ppo_max_token_len_per_gpu``).
-
-    Length-sorts and bin-packs each update's samples under ``token_budget``, then reorders
-    the track once so the packed micros are contiguous ranges (sort-then-slice). Falls back
-    to fixed-count micros when the segment exposes no per-sample lengths. ``cost_model``
-    (``'dense'`` | ``'sum'``) selects the cost — see the module docstring.
-    """
+    """Token-budget packed micro-batches (verl ``ppo_max_token_len_per_gpu``)."""
 
     def __init__(self, *, token_budget: int, cost_model: str = "dense") -> None:
         self.token_budget = _positive_int(name=f"{type(self).__name__}.token_budget", value=token_budget)
@@ -222,11 +176,7 @@ class TokenBudgetPlanner:
         return part.select(perm), plan
 
     def validate(self, algorithm: StageAlgorithm) -> None:
-        """Require a grouping-invariant loss-weighting contract.
-
-        Global-token weighting scales each micro by its valid-token share, while
-        sequence-mean losses are scaled by sample share.
-        """
+        """Require a grouping-invariant loss-weighting contract."""
         if getattr(algorithm, "loss_weighting", "sample") == "token":
             return
         mode = getattr(algorithm, "loss_agg_mode", None)

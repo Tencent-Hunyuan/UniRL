@@ -1,18 +1,4 @@
-"""LTX-2 / LTX-2.3 model package for UniRL.
-
-Supports:
-- T2V: text-to-video (LTX-2 and LTX-2.3)
-- I2V: image-to-video with first-frame conditioning
-- T2AV: text-to-audio-video joint generation (LTX-2.3 only)
-
-HuggingFace models:
-- LTX-2: Lightricks/LTX-Video-2
-- LTX-2.3: Lightricks/LTX-Video-2.3
-
-Architecture: ~2.4B parameter video DiT with Gemma3 text encoding,
-3D VAE (32x spatial, 8x temporal compression, 128 latent channels),
-flow matching scheduler, and unified video+audio attention (LTX-2.3).
-"""
+"""LTX-2 / LTX-2.3 model package for UniRL."""
 
 from unirl.models.ltx2.bundle import LTX2Bundle
 from unirl.models.ltx2.conditions import LTX2Conditions

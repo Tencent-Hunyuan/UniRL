@@ -1,60 +1,4 @@
-"""Inject the driver-authoritative rollout IO fields the fork added to sglang.
-
-UniRL is the single source of truth for the denoising schedule, the
-initial latent ``x_T``, and per-sample SDE noise grouping. To express that over
-``DiffGenerator.generate(sampling_params_kwargs=...)`` the rollout engine
-(``rollout/engine/sglang/request.py``) ships four extra keys inside
-``sampling_params_kwargs``:
-
-* ``sigmas`` -- driver-pinned σ schedule (GRPO σ-consistency; train-side replay
-  recomputes log-probs against the *same* σ, so any drift breaks iter-0 ratios).
-* ``timesteps`` -- optional explicit timestep override forwarded to
-  ``scheduler.set_timesteps`` (caller owns the unit mapping).
-* ``initial_noise`` -- driver-authoritative ``x_T`` (UniRL ``NoiseRecipe``),
-  landed on ``Req.latents`` so ``LatentPreparationStage`` consumes it verbatim.
-* ``denoise_seeds`` -- per-sample SDE determinism keys (same-group samples
-  share noise; distinct groups are per-sample unique).
-
-Stock upstream lacks all four on ``SamplingParams`` and never copies them onto
-``Req``; ``Req.denoise_seeds`` does not exist upstream at all. The fork
-(``sglang-drl`` @ ``e9b570654..HEAD``) carries them in source:
-
-* ``sigmas`` / ``timesteps`` are real ``SamplingParams`` dataclass fields and are
-  copied onto ``Req`` in ``prepare_request`` (``entrypoints/utils.py``).
-* ``initial_noise`` / ``denoise_seeds`` are popped from ``sampling_params_kwargs``
-  in the fork's ``diffusion_generator.generate`` and assigned **after**
-  ``prepare_request`` as ``req.latents`` / ``req.denoise_seeds``.
-
-We cannot edit sglang source, and upstream ``DiffGenerator.generate`` does NOT
-pop these (it forwards the whole kwargs dict into
-``SamplingParams.from_user_sampling_params_args`` and then runs
-``dataclasses.replace`` per prompt). So this patch RE-HOMES the fork's split
-behaviour into two upstream chokepoints that the UniRL path always hits:
-
-1. **Field injection on ``SamplingParams`` (+ every subclass).** Make all four
-   acceptable construction kwargs with the fork's defaults/types, registered as
-   genuine dataclass fields so they survive ``dataclasses.replace`` (upstream
-   ``generate`` rebuilds the params per prompt -- a non-field attribute would be
-   silently dropped) and ``dataclasses.fields`` / ``asdict``. Because every
-   ``SamplingParams`` subclass is itself ``@dataclass`` (its own ``__init__`` /
-   ``__dataclass_fields__``; a subclass ``__init__`` does NOT call
-   ``super().__init__``), the injection is applied to the whole live subclass
-   tree, and re-applied lazily at the construction chokepoint so model-specific
-   subclasses imported after install are still covered.
-
-2. **AROUND-wrap ``prepare_request``** to copy all four off the (fully merged /
-   adjusted) ``sampling_params`` onto the returned ``Req`` -- consolidating the
-   fork's ``prepare_request`` (sigmas/timesteps) and ``diffusion_generator``
-   (initial_noise->latents, denoise_seeds) assignments into the one site that
-   is common to upstream's ``generate`` / OpenAI / HTTP entrypoints.
-
-Plus a one-field injection on ``Req`` for ``denoise_seeds`` (the only one of
-the four missing from upstream ``Req``; ``latents`` / ``sigmas`` / ``timesteps``
-already exist), so the assignment lands as a first-class ``Req`` attribute rather
-than being delegated onto ``sampling_params`` by ``Req.__setattr__``.
-
-Idempotent; setattr / field-injection / AROUND-wrap only -- no sglang source edits.
-"""
+"""Inject the driver-authoritative rollout IO fields the fork added to sglang."""
 
 from __future__ import annotations
 
@@ -86,10 +30,7 @@ _REQ_FIELD = "denoise_seeds"
 
 
 def patch_sampling_io() -> None:
-    """Inject rollout IO fields onto SamplingParams/Req and copy them in prepare_request.
-
-    Import-safe (all sglang imports are local) and idempotent.
-    """
+    """Inject rollout IO fields onto SamplingParams/Req and copy them in prepare_request."""
     import sglang.multimodal_gen.configs.sample.sampling_params as sp_mod
     import sglang.multimodal_gen.runtime.entrypoints.utils as utils_mod
     import sglang.multimodal_gen.runtime.pipelines_core.schedule_batch as sb_mod
@@ -117,17 +58,7 @@ def patch_sampling_io() -> None:
 
 
 def _install_json_safe_tensor_guard(sp_mod) -> None:
-    """Make ``sampling_params._json_safe`` tolerate ``torch.Tensor`` values.
-
-    Injecting ``initial_noise`` (and ``timesteps``) as ``SamplingParams`` fields
-    means ``_set_output_file_name`` -> ``json.dumps(_json_safe(asdict(self)))``
-    now meets a Tensor, which upstream ``_json_safe`` passes through unchanged ->
-    ``TypeError: Object of type Tensor is not JSON serializable``. That dump only
-    feeds a deterministic output-filename hash (and rollout uses
-    ``save_output=False``), so replacing Tensors with a shape/dtype placeholder is
-    harmless. Recurses with the patched function so Tensors nested in dict/list
-    are covered; scalars / Enum / callables delegate to the original. Idempotent.
-    """
+    """Make ``sampling_params._json_safe`` tolerate ``torch.Tensor`` values."""
     import torch
 
     orig = getattr(sp_mod, "_json_safe", None)
@@ -153,30 +84,7 @@ _CONDITION_IMAGE_PATH_SENTINEL = "<unirl:condition_image>"
 
 
 def _wrap_validate_with_pipeline_config(SamplingParams) -> None:
-    """AROUND-wrap ``_validate_with_pipeline_config`` to let ``condition_image``
-    satisfy the I2I ``image_path`` requirement.
-
-    Edit-Plus ships the source-image PIL via the ``condition_image`` field (a
-    Req dataclass field, populated by ``_wrap_prepare_request``), NOT via
-    ``image_path`` (a file-path string). Upstream's validation raises
-    ``ValueError`` for I2I task types when ``image_path is None`` — this would
-    crash the first ``generate()`` before the PIL reaches ``InputValidationStage``
-    (which checks ``batch.condition_image is not None`` BEFORE ``image_path``,
-    so the PIL path is correct once validation passes).
-
-    Instead of re-implementing upstream's checks (which would silently skip
-    any validation a future sglang adds to this method), the wrap runs the
-    FULL original validation with ``image_path`` temporarily stubbed to a
-    sentinel string. Upstream 0.5.12.post1 only None-checks ``image_path``
-    here, so the sentinel (a) satisfies ``requires_image_input()`` — the
-    intended bypass — and (b) keeps the ``accepts_image_input()`` reject path
-    live: a T2I-only task type given a ``condition_image`` now fails
-    validation instead of silently ignoring the image. The sentinel is
-    restored in ``finally`` and never escapes the call.
-
-    When ``condition_image`` is None (T2I) or ``image_path`` is genuinely set,
-    the original validation runs untouched. Idempotent.
-    """
+    """AROUND-wrap ``_validate_with_pipeline_config`` so ``condition_image`` satisfies the I2I ``image_path`` need."""
     orig = SamplingParams.__dict__.get("_validate_with_pipeline_config")
     if orig is None:
         return  # pragma: no cover - upstream method missing
@@ -201,31 +109,7 @@ _GEN_SENTINEL = "_unirl_diff_gen_index"
 
 
 def _wrap_diff_generator_generate() -> None:
-    """AROUND-wrap ``DiffGenerator.generate`` to index ``condition_image``
-    per prompt.
-
-    Upstream's per-prompt loop (diffusion_generator.py:209-221) indexes
-    ``image_path`` via ``_resolve_image_paths_per_prompt`` but NOT
-    ``condition_image`` -- every per-prompt ``dataclasses.replace`` carries
-    the whole list, and ``InputValidationStage.preprocess_condition_image``
-    (input_validation.py:117) then uses ``batch.condition_image[-1]`` as the
-    source image. Every prompt in a multi-prompt batch ends up conditioned
-    on the LAST source image.
-
-    This wrap stashes the list in thread-local state at the start of
-    ``generate``; ``_wrap_prepare_request`` (called once per prompt, in
-    prompt order, in the same thread) consumes one element per call.
-    Single-prompt path (list len 1 or scalar PIL) is a passthrough.
-
-    Safety: ``generate`` is synchronous in ``local_mode=True`` (the only
-    mode UniRL uses) and calls ``prepare_request`` sequentially in the same
-    thread, so the thread-local counter is correct. Concurrent ``generate``
-    calls in different threads each get their own thread-local slot.
-
-    Idempotent. No-op when ``DiffGenerator`` is unavailable in this
-    interpreter (e.g. a CPU-only unit-test process importing only the
-    rollout math).
-    """
+    """AROUND-wrap ``DiffGenerator.generate`` to index ``condition_image`` per prompt."""
     try:
         from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import (
             DiffGenerator,
@@ -262,25 +146,7 @@ _IVL_SENTINEL = "_unirl_ivl_cond_img"
 
 
 def _wrap_input_validation_condition_image() -> None:
-    """AROUND-wrap ``InputValidationStage.forward`` to invoke
-    ``preprocess_condition_image`` when ``condition_image`` is set but
-    ``image_path`` is None.
-
-    Upstream's forward (input_validation.py:380-412) only calls
-    ``preprocess_condition_image`` (which sets ``batch.vae_image_sizes`` via
-    ``config.preprocess_vae_image``) inside the ``if batch.image_path is not
-    None`` branch. Edit-Plus ships the source image as a PIL via
-    ``condition_image`` with ``image_path=None``, so that branch is skipped
-    and ``vae_image_sizes`` stays None → ``_prepare_edit_cond_kwargs`` raises
-    ``TypeError: 'NoneType' object is not iterable``.
-
-    This wrap detects the PIL-only path and calls
-    ``preprocess_condition_image`` after upstream forward returns, using the
-    PIL's own width/height as the condition-image size (mirroring what
-    upstream would have done inside the image_path branch). No-op when
-    ``condition_image`` is None (T2I) or when ``image_path`` is set (upstream
-    already handled it). Idempotent.
-    """
+    """AROUND-wrap ``InputValidationStage.forward`` to preprocess ``condition_image`` when ``image_path`` is None."""
     try:
         import sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation as ivl_mod
     except ImportError:
@@ -343,27 +209,13 @@ def _iter_subclasses(cls):
 
 
 def _install_sampling_params_fields(SamplingParams) -> None:
-    """Register the four fields on SamplingParams and every live subclass.
-
-    Each ``@dataclass`` subclass owns its ``__init__`` and ``__dataclass_fields__``
-    (a subclass ``__init__`` does NOT chain to ``super().__init__``), so to make
-    the new kwargs constructible on the concrete class actually used we register +
-    wrap ``__init__`` on every class in the tree. Idempotent.
-    """
+    """Register the four fields on SamplingParams and every live subclass."""
     for cls in _iter_subclasses(SamplingParams):
         _register_and_wrap_init(cls)
 
 
 def _register_and_wrap_init(cls) -> None:
-    """Add the four fields to ``cls`` and wrap its ``__init__`` to accept them.
-
-    Registration (``__dataclass_fields__`` + class-level default) makes the field
-    visible to ``dataclasses.fields`` / ``replace`` / ``asdict``. The ``__init__``
-    wrapper strips the four keys before the (kwarg-strict) generated ``__init__``
-    runs, then re-applies them via ``object.__setattr__`` so construction --
-    including the ``dataclasses.replace`` call inside upstream ``generate`` --
-    accepts and round-trips them.
-    """
+    """Add the four fields to ``cls`` and wrap its ``__init__`` to accept them."""
     own_fields = cls.__dict__.get("__dataclass_fields__")
     if own_fields is None:
         own_fields = dict(getattr(cls, "__dataclass_fields__", {}))
@@ -392,13 +244,7 @@ def _register_and_wrap_init(cls) -> None:
 
 
 def _wrap_from_user_sampling_params_args(SamplingParams) -> None:
-    """AROUND-wrap the staticmethod that constructs the user SamplingParams.
-
-    The model-specific subclass is imported by the registry *inside* this method
-    (before it constructs the params), so re-running the field injection here --
-    cheap and idempotent -- guarantees the concrete subclass is wrapped even when
-    it was not imported at hijack time.
-    """
+    """AROUND-wrap the staticmethod that constructs the user SamplingParams."""
     orig = SamplingParams.__dict__.get("from_user_sampling_params_args")
     if orig is None:
         raise AttributeError("SamplingParams.from_user_sampling_params_args missing upstream")
@@ -415,15 +261,7 @@ def _wrap_from_user_sampling_params_args(SamplingParams) -> None:
 
 
 def _install_req_denoise_seeds(sb_mod) -> None:
-    """Add ``denoise_seeds`` as a first-class field on upstream ``Req``.
-
-    Upstream ``Req`` lacks it (``latents`` / ``sigmas`` / ``timesteps`` already
-    exist). Without this, ``req.denoise_seeds = ...`` would be delegated by
-    ``Req.__setattr__`` onto ``sampling_params`` (which gets ``dataclasses.replace``
-    -d), rather than living on ``Req`` like the fork's ``Req.denoise_seeds``.
-    ``Req.__init__`` iterates ``__dataclass_fields__`` for defaults, so a registered
-    field gets a ``None`` default automatically.
-    """
+    """Add ``denoise_seeds`` as a first-class field on upstream ``Req``."""
     Req = sb_mod.Req
     own_fields = Req.__dict__.get("__dataclass_fields__")
     if own_fields is None:  # pragma: no cover - Req is a dataclass, always present
@@ -438,15 +276,7 @@ def _install_req_denoise_seeds(sb_mod) -> None:
 
 
 def _wrap_prepare_request(utils_mod, SamplingParams) -> None:
-    """AROUND-wrap ``prepare_request`` to copy the four IO fields onto the Req.
-
-    Mirrors the fork: ``sigmas`` / ``timesteps`` (coerced to a float32 tensor) per
-    ``entrypoints/utils.py``; ``initial_noise`` -> ``req.latents`` and
-    ``denoise_seeds`` per ``diffusion_generator.generate``. Copying happens AFTER
-    the original builds + validates the Req -- nothing in upstream
-    ``prepare_request`` reads these fields, so post-hoc assignment is behaviour
-    equivalent and keeps the wrapper a thin pass-through.
-    """
+    """AROUND-wrap ``prepare_request`` to copy the four IO fields onto the Req."""
     orig = utils_mod.prepare_request
     if getattr(orig, _PREP_SENTINEL, False):
         return

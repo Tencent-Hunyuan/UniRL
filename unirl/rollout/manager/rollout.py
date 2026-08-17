@@ -18,12 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 class RolloutManager:
-    """Driver-side rollout scheduling: bounded dispatch, sibling-group assembly, root-atomic filtering, published version.
-
-    A failure while resolving or routing completed work poisons the manager: samples may
-    already be lost, so every later call (including ``empty``/``counts``) re-raises the
-    original error instead of reporting clean state; only ``close()`` remains safe.
-    """
+    """Driver-side rollout scheduling: bounded dispatch, sibling grouping, root-atomic filtering, published version."""
 
     def __init__(
         self,

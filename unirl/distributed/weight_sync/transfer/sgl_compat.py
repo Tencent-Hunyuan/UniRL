@@ -1,24 +1,5 @@
 # Copyright 2023-2024 SGLang Team; SPDX-License-Identifier: Apache-2.0
-"""Vendored sglang weight-sync utilities (CUDA-only) for the vLLM-Omni flow.
-
-Vendored verbatim (minus NPU/MUSA branches and the ``pybase64`` dependency)
-from sglang 0.5.10.post1:
-
-- ``sglang/srt/utils/patch_torch.py``        -> ``monkey_patch_torch_reductions``
-- ``sglang/srt/weight_sync/tensor_bucket.py`` -> ``FlattenedTensorBucket``
-- ``sglang/srt/utils/common.py``              -> ``MultiprocessingSerializer`` / ``SafeUnpickler``
-
-Why vendored: the vLLM-Omni engine env intentionally does not install sglang
-(the engines are mutually-exclusive uv extras with conflicting torch pins), but
-CUDA-IPC pickles reference their reduction functions *by module path*, so the
-trainer and the engine worker must import the very same module. Keeping the
-implementation under unirl makes that path engine-agnostic.
-
-Compatibility note: ``monkey_patch_torch_reductions`` rewrites the *module
-attributes* ``reductions.reduce_tensor`` / ``reductions.rebuild_cuda_tensor``,
-so pickles produced by unpatched stock reducers still deserialize correctly on
-a patched process (``_device_from_maybe_uuid`` passes plain ints through).
-"""
+"""Vendored sglang weight-sync utilities (CUDA-only) for the vLLM-Omni flow."""
 
 from __future__ import annotations
 
@@ -93,10 +74,7 @@ class FlattenedTensorMetadata:
 
 
 class FlattenedTensorBucket:
-    """
-    A bucket that flattens multiple tensors into a single tensor for efficient processing
-    while preserving all metadata needed for reconstruction.
-    """
+    """A bucket flattening many tensors into one, preserving the metadata needed for reconstruction."""
 
     supports_multi_dtypes = True
 
@@ -106,13 +84,7 @@ class FlattenedTensorBucket:
         flattened_tensor: torch.Tensor = None,
         metadata: List[FlattenedTensorMetadata] = None,
     ):
-        """
-        Initialize a tensor bucket from a list of named tensors OR from pre-flattened data.
-        Args:
-            named_tensors: List of (name, tensor) tuples (for creating new bucket)
-            flattened_tensor: Pre-flattened tensor (for reconstruction)
-            metadata: Pre-computed metadata (for reconstruction)
-        """
+        """Initialize a tensor bucket from a list of named tensors OR from pre-flattened data."""
         if named_tensors is not None:
             self.metadata: List[FlattenedTensorMetadata] = [None] * len(named_tensors)
             self.flattened_tensor: torch.Tensor = None
@@ -155,10 +127,7 @@ class FlattenedTensorBucket:
         return self.metadata
 
     def reconstruct_tensors(self) -> List[Tuple[str, torch.Tensor]]:
-        """
-        Reconstruct original tensors from flattened tensor with optimized performance.
-        Uses memory-efficient operations to minimize allocations and copies.
-        """
+        """Reconstruct original tensors from flattened tensor with optimized performance."""
         reconstructed = [None] * len(self.metadata)
 
         for i, meta in enumerate(self.metadata):
@@ -172,16 +141,7 @@ class FlattenedTensorBucket:
 class MultiprocessingSerializer:
     @staticmethod
     def serialize(obj, output_str: bool = False):
-        """
-        Serialize a Python object using ForkingPickler.
-
-        Args:
-            obj: The object to serialize.
-            output_str (bool): If True, return a base64-encoded string instead of raw bytes.
-
-        Returns:
-            bytes or str: The serialized object.
-        """
+        """Serialize a Python object using ForkingPickler."""
         buf = io.BytesIO()
         ForkingPickler(buf).dump(obj)
         buf.seek(0)
@@ -194,15 +154,7 @@ class MultiprocessingSerializer:
 
     @staticmethod
     def deserialize(data):
-        """
-        Deserialize a previously serialized object.
-
-        Args:
-            data (bytes or str): The serialized data, optionally base64-encoded.
-
-        Returns:
-            The deserialized Python object.
-        """
+        """Deserialize a previously serialized object."""
         if isinstance(data, str):
             data = base64.b64decode(data, validate=True)
 

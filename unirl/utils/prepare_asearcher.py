@@ -1,16 +1,4 @@
-"""Prepare ASearcher deep-research training data as jsonl (LIN-519).
-
-Writes one jsonl line per example in the schema ``MultimodalRLDataSource`` expects —
-``{"prompt": <question>, "metadata": {"answer": <reference>}}`` (the data source reads
-the per-row ``metadata`` dict verbatim; a top-level ``answer`` is NOT lifted). The
-trainer then reads ``metadata["answer"]`` as the gold for the LLM-judge reward. Sibling
-of ``prepare_dapo_math.py``.
-
-  # download from HF (inclusionAI/ASearcher-train-data) and convert:
-  python -m unirl.utils.prepare_asearcher --out-dir data/asearcher
-  # or convert a local jsonl (tolerant of field names):
-  python -m unirl.utils.prepare_asearcher --source path/to/asearcher.jsonl --out-dir data/asearcher
-"""
+"""Prepare ASearcher deep-research training data as jsonl."""
 
 from __future__ import annotations
 

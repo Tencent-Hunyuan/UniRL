@@ -9,16 +9,7 @@ from unirl.types.conditions import TextTokenCondition
 
 @dataclass
 class QwenVLARConditions(Batch):
-    """Conditions for Qwen2.5-VL autoregressive generation.
-
-    pixel_values and image_grid_thw are stored as per-sample lists
-    (FieldKind.CONCAT).  Each list element is one sample's tensor, so
-    the list length equals batch_size and the Batched framework
-    automatically extends / slices / selects it alongside prompt.
-    This ensures correct handling when multiple rollout workers'
-    conditions are concatenated — SHARED fields would silently drop
-    all but the first worker's image data.
-    """
+    """Conditions for Qwen2.5-VL autoregressive generation."""
 
     prompt: Optional[TextTokenCondition] = field(kind=FieldKind.CONCAT, default=None)
     pixel_values: Optional[List[Any]] = field(kind=FieldKind.CONCAT, default=None)

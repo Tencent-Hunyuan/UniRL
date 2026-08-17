@@ -1,17 +1,4 @@
-"""ToolAgentHarness — the environment-driven multi-turn agent loop (LIN-492/531).
-
-The task-semantics half of what ``AgenticRolloutEngine._run_one`` used to
-inline (and the successor of the deleted ``AgentLoop`` prototype): each
-turn forks a one-sample continuation, the ``"policy"`` engine fills it, and
-the ENVIRONMENT decides what happens next — it parses the model's output
-(e.g. a tool call), returns an observation that re-enters the chain as a
-mask-0 input Part, and signals ``done``. The loop holds no other control
-decision; queueing, concurrency, buffers, and abort belong to the hosting
-runtime.
-
-Suspension is checked at the top of each turn, so an in-flight turn always
-finishes naturally before the partial trace is returned.
-"""
+"""ToolAgentHarness — the environment-driven multi-turn agent loop (LIN-492/531)."""
 
 from __future__ import annotations
 
@@ -28,13 +15,7 @@ logger = logging.getLogger(__name__)
 
 
 class ToolAgentHarness:
-    """``generate -> env.step -> observe`` until ``done`` / ``max_turns``, on the ``"policy"`` engine.
-
-    ``env`` must be re-entrant (one shared instance serves concurrent
-    trajectories on their own threads); ``sampling`` is only READ each turn
-    (``fork`` builds a fresh gen Part per call), so sharing this harness
-    across worker threads is safe as long as ``env.step`` is.
-    """
+    """``generate -> env.step -> observe`` until ``done`` / ``max_turns``, on the ``"policy"`` engine."""
 
     ENGINE = "policy"
 

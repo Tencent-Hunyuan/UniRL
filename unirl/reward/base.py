@@ -1,10 +1,4 @@
-"""Base abstractions for reward backends.
-
-A reward is one backend — either a local in-process scorer (CPU check or
-small-GPU model) or the remote RewardService HTTP client. Both implement
-:class:`RewardBackend`; :class:`unirl.reward.service.RewardService`
-holds exactly one of them.
-"""
+"""Base abstractions for reward backends."""
 
 from __future__ import annotations
 
@@ -18,12 +12,7 @@ if TYPE_CHECKING:
 
 
 class RewardBackend(ABC):
-    """Turn a :class:`RewardRequest` into a :class:`RewardResponse`.
-
-    Implemented by local scorers (:class:`LocalRewardBackend`,
-    :class:`VideoRewardScorer`) and the remote client
-    (:class:`RemoteRewardBackend`).
-    """
+    """Turn a :class:`RewardRequest` into a :class:`RewardResponse`."""
 
     input_kind = "image"
 
@@ -67,17 +56,7 @@ class RewardBackend(ABC):
 
 @runtime_checkable
 class DifferentiableReward(Protocol):
-    """Optional capability: in-process ``nn.Module`` rewards that return a
-    grad-carrying score tensor for ReFL (direct differentiable-reward backprop).
-
-    Deliberately NOT part of :class:`RewardBackend` — remote/HTTP and scalar-only
-    backends can never satisfy it (autograd can't cross a process or a wire). A
-    scorer that wraps a differentiable model (pickscore / clip / hps / aesthetic /
-    image_reward) declares the capability simply by defining
-    ``compute_rewards_differentiable``; the reward role detects it via
-    ``isinstance(backend, DifferentiableReward)``. Mirrors the optional-capability
-    ``LatentShapeProvider`` Protocol in ``unirl.models.types.pipeline``.
-    """
+    """Optional capability: in-process ``nn.Module`` rewards returning a grad-carrying score tensor for ReFL."""
 
     def compute_rewards_differentiable(
         self,
@@ -85,25 +64,12 @@ class DifferentiableReward(Protocol):
         prompts: List[str],
         records: Optional[List[dict[str, object]]] = None,
     ) -> "torch.Tensor":
-        """Score grad-carrying image ``[B,C,H,W]`` or video ``[B,C,T,H,W]`` media.
-
-        Returns a ``[B]`` reward tensor with ``grad_fn`` intact. ``records`` may
-        carry per-sample metadata such as ``ref_video_path`` for recipe-local
-        video rewards.
-        """
+        """Score grad-carrying image ``[B,C,H,W]`` or video ``[B,C,T,H,W]`` media."""
         ...
 
 
 class BaseRewardComponentSpec(ABC):
-    """Marker base for every reward backend spec.
-
-    Each backend defines a concrete ``<Name>Spec`` ``@dataclass`` inheriting
-    from this base. Kept as a plain ``ABC`` (not a ``@dataclass``) so each
-    subclass owns its own field set.
-
-    The Spec is pure data; the recipe nests it under the backend's ``config:``
-    block and the backend's ``__init__`` takes ``config=<Spec>``.
-    """
+    """Marker base for every reward backend spec."""
 
 
 __all__ = [

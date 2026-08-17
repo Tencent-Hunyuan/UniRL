@@ -1,20 +1,4 @@
-"""ZImageConditions — typed conditions container for Z-Image diffusion.
-
-Concrete instantiation of the ``DiffusionStage[C]`` type parameter.
-Mirrors :class:`unirl.models.sd3.SD3Conditions` /
-:class:`unirl.models.qwen_image.QwenImageConditions`: text + optional
-negative_text, both as :class:`TextEmbedCondition` instances. Z-Image
-does not emit a ``pooled`` text vector, so ``TextEmbedCondition.pooled``
-is always ``None``; the ``attn_mask`` field carries the per-prompt valid
-token mask used to rebuild the variable-length caption list the
-single-stream transformer consumes.
-
-The CFG negative branch is split into a sibling ``negative_text`` field
-(rather than nested under ``text.negative``) so the schema is honest
-about which slots travel on the wire — a reader of
-``Part.conditions`` sees ``"text"`` and
-``"negative_text"`` as two equal-status entries.
-"""
+"""ZImageConditions — typed conditions container for Z-Image diffusion."""
 
 from __future__ import annotations
 
@@ -34,12 +18,7 @@ class ZImageConditions(Batch):
 
     @classmethod
     def from_dict(cls, d: Dict[str, Condition]) -> "ZImageConditions":
-        """Build from the generic ``Conditions`` dict shape.
-
-        Validates that the ``"text"`` slot is present and is a
-        ``TextEmbedCondition``. The ``"negative_text"`` slot is optional;
-        when absent the result has ``negative_text=None`` (CFG-off).
-        """
+        """Build from the generic ``Conditions`` dict shape."""
         text = d.get("text")
         if not isinstance(text, TextEmbedCondition):
             raise TypeError(
@@ -56,12 +35,7 @@ class ZImageConditions(Batch):
         return cls(text=text, negative_text=negative_text)
 
     def to_dict(self) -> Dict[str, Condition]:
-        """Convert back to the generic ``Conditions`` dict shape for
-        packing into ``Part.conditions``.
-
-        Emits ``"negative_text"`` only when ``negative_text is not None``
-        so the dict shape stays minimal for CFG-off rollouts.
-        """
+        """Convert back to the generic ``Conditions`` dict shape for packing into ``Part.conditions``."""
         if self.text is None:
             raise ValueError("ZImageConditions.to_dict: text field is None")
         out: Dict[str, Condition] = {"text": self.text}

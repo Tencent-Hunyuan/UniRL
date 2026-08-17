@@ -1,15 +1,4 @@
-"""Prepare a local OpenAI-style agent SFT manifest.
-
-The default source is the Apache-2.0
-``pyromind/agentic-tool-call-dataset-12k`` short split. Each trajectory is
-expanded into one example per assistant turn so tool calls and post-tool final
-answers are both supervised. The split is trajectory-level to keep turns from
-the same conversation out of both train and validation.
-
-Usage:
-  python -m unirl.utils.prepare_sft_agent \
-    --out-dir datasets/sft_agent_toolcall_12k
-"""
+"""Prepare a local OpenAI-style agent SFT manifest."""
 
 from __future__ import annotations
 
@@ -21,6 +10,19 @@ import shutil
 from typing import Any, Dict, Iterable, List, Sequence
 
 from unirl.data.sft import normalize_supervised_example, tokenize_agent_target
+
+_HELP = """Prepare a local OpenAI-style agent SFT manifest.
+
+The default source is the Apache-2.0
+``pyromind/agentic-tool-call-dataset-12k`` short split. Each trajectory is
+expanded into one example per assistant turn so tool calls and post-tool final
+answers are both supervised. The split is trajectory-level to keep turns from
+the same conversation out of both train and validation.
+
+Usage:
+  python -m unirl.utils.prepare_sft_agent \
+    --out-dir datasets/sft_agent_toolcall_12k
+"""
 
 
 def _read_jsonl(path: str) -> List[Dict[str, Any]]:
@@ -118,7 +120,7 @@ def _filter_overlong_targets(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=_HELP)
     parser.add_argument("--dataset", default="pyromind/agentic-tool-call-dataset-12k")
     parser.add_argument("--filename", default="agent_short_10k.jsonl")
     parser.add_argument("--out-dir", required=True)

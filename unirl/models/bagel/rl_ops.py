@@ -1,64 +1,4 @@
-"""Navit-forward adapter over the PRISTINE official Bagel modeling.
-
-The official ``ByteDance-Seed/Bagel`` ``_forward_flow`` is the velocity predictor
-the RL path needs, but it (a) consumes a *packed* (navit) sequence + three KV-cache
-contexts rather than a dense ``predict_noise(sample, sigma)`` and (b) carries an
-upstream ``@torch.no_grad``. This module is the **thin adapter** that bridges those
-two facts to UniRL's shared diffusion runtime — and nothing more:
-
-- :func:`forward_flow`           grad-capable velocity via the pristine
-                                 ``Bagel._forward_flow`` (bypasses ``@torch.no_grad``
-                                 through ``functools.wraps``' ``__wrapped__``).
-- :func:`disable_inference_cache` turns off TaylorSeer (per-step determinism for replay).
-
-AR (text-out) adapters — same philosophy, for ``BagelARStage``:
-
-- :func:`init_und_context` / :func:`prefill_text_split` / :func:`prefill_vit_split`
-  build a fresh KV context from RAW prompt material (pre-tokenized ids / a
-  vit-transformed image tensor) via the pristine ``forward_cache_update_text`` /
-  ``forward_cache_update_vit`` reached through ``__wrapped__`` — grad-capable
-  under ``enable_grad`` (AR replay trains the und path, so the prompt prefill
-  must carry gradients), grad-free under rollout's ``no_grad``. One code path
-  for rollout and replay ⇒ prefix K/V parity by construction.
-- :func:`decode_text`            bs=1 per-token decode mirroring the vendored
-                                 ``generate_text`` (bagel.py:929-1001) index
-                                 bookkeeping, but emitting per-token FULL-softmax
-                                 log-probs via the caller's sampling kernel
-                                 (upstream returns token ids only).
-- :func:`score_response`         one-shot teacher-forced replay scoring: query
-                                 ``[bos] + response[:-1]`` attends causally to the
-                                 prefilled context + itself (the same
-                                 ``forward_inference(mode="und", is_causal=True)``
-                                 call shape as the vendored text prefill), row j
-                                 predicting ``response[j]`` — exactly the per-token
-                                 rollout semantics, in one grad-capable pass.
-- :func:`require_inference_dispatch` guards the eval()+grads replay regime (the
-  navit decoder layers dispatch ``forward_train``/``forward_inference`` on
-  ``self.training``; ``.train()`` mode would mis-route the packed kwargs).
-
-Everything else the RL loop needs is UniRL's, NOT a flow_grpo port:
-
-- the SDE transition + log-prob  → :class:`unirl.sde.kernels.FlowSDEStrategy`
-- which steps run SDE            → :meth:`DiffusionSamplingParams.resolve_sde_indices`
-                                   (``unirl.utils.scheduler_utils.AllSDEScheduler``)
-- the σ / timestep schedule      → :class:`unirl.sde.runtime.FlowMatchSchedulePolicy`
-- the initial noise x_T          → :class:`unirl.types.noise_recipe.NoiseRecipe`
-
-so :class:`unirl.models.bagel.diffusion.BagelDiffusionStage` reads exactly like
-``SD3DiffusionStage`` (central schedule + sde_indices + kernel + noise), with this
-adapter supplying only the model-specific velocity call. ``vendor/`` stays
-byte-pristine; an upstream bump is a re-vendor + import-rewrite with this file
-untouched.
-
-Gradients
----------
-``Bagel._forward_flow`` carries ``@torch.no_grad`` upstream. :func:`forward_flow`
-reaches the undecorated function via ``functools.wraps``' ``__wrapped__`` so replay
-can backprop while the vendored file stays unedited (verified on torch 2.11: the
-decorated form blocks grad even under ``enable_grad``; ``__wrapped__`` restores it).
-Under an outer ``torch.no_grad()`` (e.g. rollout) it stays grad-free, so the same
-function serves rollout, the ratio test, and training.
-"""
+"""Navit-forward adapter over the PRISTINE official Bagel modeling."""
 
 from __future__ import annotations
 
@@ -85,14 +25,7 @@ __all__ = [
 
 
 def disable_inference_cache(model: Any) -> None:
-    """Turn off the TaylorSeer cache for the RL path (per-step determinism).
-
-    The pristine ``_forward_flow`` reads ``self.language_model.model.enable_taylorseer``;
-    the official ``generate_image`` sets it, but the RL loop calls ``_forward_flow``
-    directly so we set the flag here (the cache would break per-step determinism →
-    replay would not be bit-exact). Best-effort; ignored if the attribute path is
-    absent (e.g. a fake model in unit tests).
-    """
+    """Turn off the TaylorSeer cache for the RL path (per-step determinism)."""
     try:
         model.language_model.model.enable_taylorseer = False
     except AttributeError:
@@ -100,12 +33,7 @@ def disable_inference_cache(model: Any) -> None:
 
 
 def _raw(fn: Callable) -> Callable:
-    """Undecorated form of a vendored ``@torch.no_grad`` method (via ``__wrapped__``).
-
-    Bare ``@torch.no_grad`` applies ``functools.wraps`` so ``__wrapped__`` holds
-    the original function (verified on torch 2.11/2.12); the fallback returns the
-    function unchanged (e.g. undecorated fakes in unit tests).
-    """
+    """Undecorated form of a vendored ``@torch.no_grad`` method (via ``__wrapped__``)."""
     return getattr(fn, "__wrapped__", fn)
 
 
@@ -115,28 +43,7 @@ def _raw_forward_flow(model: Any):
 
 
 def forward_flow(model: Any, **kwargs: Any) -> Any:
-    """Velocity prediction via the pristine vendored ``Bagel._forward_flow``.
-
-    Bypasses upstream's ``@torch.no_grad`` (via ``__wrapped__``) so gradients flow
-    during replay; under an outer ``torch.no_grad()`` it is still grad-free. The
-    TaylorSeer cache kwargs (``model_pred_*``) are left at their ``None`` defaults —
-    the RL path disables that cache (see :func:`disable_inference_cache`).
-
-    ``model._forward_flow`` already does the CFG combine internally (gen / cfg_text /
-    cfg_img contexts + ``cfg_text_scale`` / ``cfg_img_scale`` / ``cfg_renorm_*``), so
-    the returned velocity is the CFG-combined ``v_t`` the SDE kernel consumes.
-
-    Training-mode contract: the vendored decoder layer dispatches train vs inference
-    on ``self.training``, and ``_forward_flow`` goes through the ``forward_inference``
-    (packed-query) signature, so the language model MUST be in ``eval()`` here. The two
-    stages share one MoT instance within a single optimizer step (AR teacher-force sets
-    train(); this diffusion replay needs eval()), so we cannot rely on the inherited
-    mode. Force eval; under grad (replay) KEEP it eval so activation-checkpointing's
-    recompute in the LATER ``.backward()`` still takes ``forward_inference`` (reverting
-    to a stray train() would dispatch the packed-query kwargs into ``forward_train`` →
-    "unexpected keyword argument 'packed_query_sequence'"). Restore only when no
-    backward follows (rollout / no_grad).
-    """
+    """Velocity prediction via the pristine vendored ``Bagel._forward_flow``."""
     lm = model.language_model
     was_training = lm.training
     grad_enabled = torch.is_grad_enabled()
@@ -150,14 +57,7 @@ def forward_flow(model: Any, **kwargs: Any) -> Any:
 
 
 def require_inference_dispatch(model: Any) -> None:
-    """Raise unless the MoT is in eval() mode (the navit forward-dispatch contract).
-
-    Every navit module routes ``forward_train`` vs ``forward_inference`` on
-    ``self.training`` and ``Qwen2Model.forward_inference`` invokes decoder layers
-    via ``__call__`` — so ``.train()`` mode mis-routes the packed inference kwargs
-    into ``forward_train``. Replay runs in eval() with grads enabled, the same
-    regime as ``BagelDiffusionStage.replay``.
-    """
+    """Raise unless the MoT is in eval() mode (the navit forward-dispatch contract)."""
     lm = getattr(model, "language_model", None)
     if lm is not None and getattr(lm, "training", False):
         raise RuntimeError(
@@ -168,13 +68,7 @@ def require_inference_dispatch(model: Any) -> None:
 
 
 def init_und_context(model: Any) -> Dict[str, Any]:
-    """Fresh empty KV context ``{kv_lens, ropes, past_key_values}`` (navit bs=1).
-
-    Mirrors ``InterleaveInferencer.init_gen_context``. ``NaiveCache`` is resolved
-    from the model's own modeling module (hi3 ``sys.modules`` trick) so this
-    module never imports the vendored modeling (flash-attn) itself; fake models
-    must export a ``NaiveCache`` from their module (see bagel_ar_cpu_check.py).
-    """
+    """Fresh empty KV context ``{kv_lens, ropes, past_key_values}`` (navit bs=1)."""
     lm_model = model.language_model.model
     num_layers = int(model.config.llm_config.num_hidden_layers)
     cache_cls = getattr(sys.modules[type(lm_model).__module__], "NaiveCache", None)
@@ -187,13 +81,7 @@ def init_und_context(model: Any) -> Dict[str, Any]:
 
 
 def _pack_text_ids(text_ids: torch.Tensor, *, kv_len: int, rope_start: int) -> Dict[str, torch.Tensor]:
-    """``prepare_prompts``' packed-input bookkeeping for ONE pre-tokenized split.
-
-    Byte-equivalent to the vendored ``Bagel.prepare_prompts`` (bagel.py:232-264)
-    at bs=1, minus the tokenize+wrap step — ``text_ids`` are the final ids
-    INCLUDING the ``bos/eos`` (``<|im_start|>``/``<|im_end|>``) wrap, so replay is
-    tokenizer-independent and byte-aligned with rollout.
-    """
+    """``prepare_prompts``' packed-input bookkeeping for ONE pre-tokenized split."""
     n = int(text_ids.numel())
     return {
         "text_token_lens": torch.tensor([n], dtype=torch.int),
@@ -213,12 +101,7 @@ def _to_device(d: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
 def prefill_text_split(
     model: Any, ctx: Dict[str, Any], *, text_ids: torch.Tensor, device: torch.device
 ) -> Dict[str, Any]:
-    """Prefill one text split into the context; returns the advanced context.
-
-    Runs the pristine ``forward_cache_update_text`` via ``__wrapped__`` so the
-    same call is grad-capable under ``enable_grad`` (replay) and grad-free under
-    ``no_grad`` (rollout).
-    """
+    """Prefill one text split into the context; returns the advanced context."""
     kv_len, rope = int(ctx["kv_lens"][0]), int(ctx["ropes"][0])
     gi = _to_device(_pack_text_ids(text_ids, kv_len=kv_len, rope_start=rope), device)
     past = _raw(type(model).forward_cache_update_text)(model, ctx["past_key_values"], **gi)
@@ -234,15 +117,7 @@ def prefill_vit_split(
     new_token_ids: Dict[str, int],
     device: torch.device,
 ) -> Dict[str, Any]:
-    """Prefill one ViT image split into the context; returns the advanced context.
-
-    ``image_tensor`` is the ALREADY ``vit_transform``-ed ``[3, H, W]`` tensor (the
-    conditions store the final transform output so rollout and replay consume
-    byte-identical pixels); the pristine ``prepare_vit_images`` packer is reused
-    verbatim with an identity transform. The cache update runs ``is_causal=False``
-    inside — the non-causal image block within the causal stream, exactly as at
-    rollout.
-    """
+    """Prefill one ViT image split into the context; returns the advanced context."""
     gi, newlens, new_rope = model.prepare_vit_images(
         curr_kvlens=ctx["kv_lens"],
         curr_rope=ctx["ropes"],
@@ -265,20 +140,7 @@ def decode_text(
     stop_ids: List[int],
     device: torch.device,
 ) -> Tuple[List[int], List[float]]:
-    """bs=1 per-token decode over a prefilled context, emitting token+logp pairs.
-
-    Reimplements the vendored ``generate_text`` loop (bagel.py:929-1001) — which
-    returns token ids only — with the per-step ``sample_fn(logits [1, vocab]) →
-    (token_id, full-softmax log-prob)`` kernel. Index bookkeeping is the bs=1
-    collapse of the vendored multi-sample form: contiguous kv indexes
-    ``arange(kv_len)``, query index ``[kv_len]``, position/kv_len advance by one
-    per token. The returned token list INCLUDES the stop token (TextSegment
-    convention); ``start_token_id`` (``new_token_ids['bos_token_id']``, as in the
-    vendored ``prepare_start_tokens``) is the loop *input*, never recorded.
-
-    Mutates ``ctx['past_key_values']`` in place (``update_past_key_values=True``)
-    — callers prefill a fresh context per sample. Caller owns no_grad + autocast.
-    """
+    """bs=1 per-token decode over a prefilled context; ``sample_fn`` sees ``logits [1, vocab]`` per step."""
     require_inference_dispatch(model)
     disable_inference_cache(model)
     lm = model.language_model
@@ -332,21 +194,7 @@ def score_response(
     logprob_chunk: int = 1024,
     device: torch.device,
 ) -> torch.Tensor:
-    """One-shot teacher-forced per-token log-probs of ``response_ids`` — grad-capable.
-
-    Query ``[start] + response[:-1]`` (length n) attends causally to the prefilled
-    context + itself (``is_causal=True``, ``update_past_key_values=False`` — the
-    same ``forward_inference(mode="und")`` call shape as the vendored text
-    prefill); flash-attn's bottom-right causal alignment makes row ``j`` attend to
-    ``prefix + query[0..j]``, so row ``j`` predicts ``response[j]`` — exactly the
-    per-token rollout semantics.
-
-    Log-probs are the FULL softmax of ``lm_head(h).float() / T`` (gather −
-    logsumexp), matching the rollout kernel's pre-truncation convention; the
-    lm_head runs chunked (never materializing ``[n, vocab]`` whole) with per-chunk
-    gradient checkpointing when grads are enabled. Returns fp32 ``[n]``. Caller
-    owns the grad scope (eval() + ``enable_grad`` for replay) and autocast.
-    """
+    """Teacher-forced per-token log-probs of ``response_ids``, chunked lm_head, grad-capable; returns fp32 ``[n]``."""
     require_inference_dispatch(model)
     disable_inference_cache(model)
     lm = model.language_model
@@ -402,17 +250,7 @@ def score_response_with_prompt(
     logprob_chunk: int = 1024,
     device: torch.device,
 ) -> torch.Tensor:
-    """Inference-mode replay scorer: ONE grad ``forward_inference`` over ``[prompt + start +
-    response[:-1]]`` attending to a (no_grad, frozen) image context ``ctx``.
-
-    The caller prefills ONLY the image split into ``ctx`` under ``no_grad`` (frozen
-    image understanding, ``is_causal=False`` as at rollout); the prompt text rides
-    INSIDE this single grad forward, so the und path trains through prompt+response.
-    Staying on ``forward_inference`` keeps the kernel matched to the rollout
-    (``old_logp`` ratio ≈ 1), and a SINGLE grad forward keeps FSDP backward sound
-    (no grad across two forwards). The last ``n`` query rows predict ``response[j]``;
-    full-softmax ``log_softmax(lm_head(h)/T)`` gathered on the response tokens.
-    """
+    """Inference-mode replay scorer: one grad ``forward_inference`` attending to a frozen no_grad image context."""
     require_inference_dispatch(model)
     disable_inference_cache(model)
     lm = model.language_model
@@ -469,16 +307,7 @@ def pack_und_forward_inputs(
     device: torch.device,
     vit_transform: Callable[[Any], Any] = lambda x: x,
 ) -> Dict[str, Any]:
-    """Train-mode packing: one und sample ``[ViT image | prompt | response_input]`` for
-    the MoT TRAINING forward (``forward_train`` layout) with a nested attention mask.
-
-    Attention is ``full`` over the image block and ``causal`` over the text (built
-    per-sample via ``prepare_attention_mask_per_sample``); the image block shares
-    its rope position then prompt+response increment, matching the rollout KV build.
-    ``ce_loss_indexes`` marks the response-input positions whose logits predict the
-    response tokens. ``image`` is the already-``vit_transform``-ed tensor stored on
-    the conditions, so ``vit_transform`` defaults to identity.
-    """
+    """Train-mode packing: one und sample ``[ViT image | prompt | response_input]`` with a nested attention mask."""
     from .vendor.data.data_utils import prepare_attention_mask_per_sample
 
     text_ids: List[int] = []
@@ -547,14 +376,7 @@ def pack_und_forward_inputs(
 
 
 def und_replay_logits(model: Any, packed: Dict[str, Any]) -> torch.Tensor:
-    """Train-mode grad-carrying und TRAINING forward; returns response-position logits ``[R, V]``.
-
-    Mirrors ``Bagel.forward``'s understanding path (text embed + ViT embed → packed
-    sequence → ``language_model`` MoT ``forward_train``) but returns ``lm_head``
-    logits at the ce-loss (response) positions. The caller must have the language
-    model in ``train()`` mode (so the navit dispatch routes ``forward_train``) and
-    ``freeze_und=False``.
-    """
+    """Train-mode grad-carrying und TRAINING forward; returns response-position logits ``[R, V]``."""
     lm = model.language_model
     packed_text_embedding = lm.model.embed_tokens(packed["packed_text_ids"])
     packed_sequence = packed_text_embedding.new_zeros((packed["seqlen"], model.hidden_size))

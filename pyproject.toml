@@ -71,6 +71,7 @@ sglang = [
   # [tilelang] extra is already satisfied transitively. Pin to the version
   # verified on-pod with sglang 0.5.12.post1 / torch 2.11.0+cu130.
   "flash-linear-attention[conv1d]==0.5.1 ; sys_platform == 'linux'",
+  "av>=14.2,<19 ; sys_platform == 'linux'",
 ]
 # CUDA 12.9 stack: vllm 0.20.0 PyPI wheels are compiled against CUDA 12.9.
 vllm = [

@@ -1,9 +1,4 @@
-"""Async autoregressive RL over separate train and rollout GPU slabs.
-
-The trainer owns optimizer progress and publication cadence. The driver-side
-``RolloutManager`` owns bounded dispatch, grouping, filtering, and published
-rollout state.
-"""
+"""Async autoregressive RL over separate train and rollout GPU slabs."""
 
 import inspect
 import time
@@ -15,9 +10,8 @@ from omegaconf import DictConfig
 
 from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
-from unirl.models.qwen3_5.validation import validate_qwen3_5_training_contract
 from unirl.train.stack import TrainStepResult
-from unirl.trainer.ar import ARTrainer
+from unirl.trainer.ar import ARTrainer, ar_preflight
 from unirl.trainer.async_rollout import AsyncRolloutTrainerMixin, training_version_metrics
 from unirl.trainer.base import BaseTrainer, build_sampling_dict
 from unirl.types.sample import Sample
@@ -72,7 +66,7 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
         max_inflight: int = 1,
         weight_sync_interval: int = 1,
     ) -> None:
-        validate_qwen3_5_training_contract(
+        self._allowed_input_primitives = ar_preflight(
             pipeline_cfg=pipeline_cfg,
             backend_cfg=backend_cfg,
             rollout_cfg=rollout_cfg,
@@ -170,14 +164,7 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
             raise RuntimeError("AsyncARTrainer cannot offload its disjoint training slab during rollout")
 
     def _connect_separate(self, sync_cfg: DictConfig) -> None:
-        """One-time cross-slab handshake (NCCL branch of diffusion.py:191-208).
-
-        Rank 0 picks a rendezvous addr/port, is handed the rollout slab's Worker
-        actor handles, then ``connect`` fires each rollout worker's
-        ``init_weights_update_group`` non-blocking and joins the broadcast group
-        itself. Only ``NCCLWeightSync`` is supported here (always cross-slab
-        full-weight); a non-NCCL target is a config error.
-        """
+        """One-time cross-slab handshake (NCCL branch of diffusion.py:191-208)."""
         target = str(sync_cfg.get("_target_", ""))
         if not target.endswith("NCCLWeightSync"):
             raise ValueError(
@@ -265,6 +252,10 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
 
     def _async_wandb_extra(self) -> Dict[str, object]:
         return {"adv_normalization_scope": self.adv_normalization_scope}
+
+    def _refill_before_score(self) -> bool:
+        """Overlap AR generation with reward scoring and training."""
+        return True
 
     def _boundary_evaluate(self, rollout_id: int, *, initial: bool) -> None:
         self.evaluate(rollout_id=-1 if initial else rollout_id)

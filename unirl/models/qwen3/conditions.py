@@ -1,21 +1,4 @@
-"""Qwen3ARConditions — typed conditions container for the Qwen3 AR stage.
-
-Concrete instantiation of the ``ARStage[C]`` type parameter. Mirrors
-:class:`unirl.models.qwen_image.QwenImageConditions` in shape:
-a single typed slot (``prompt``) carrying a :class:`TextTokenCondition`
-with the chat-template-built ``input_ids`` + ``attention_mask``.
-
-The ``TextTokenCondition`` (declared in
-:mod:`unirl.types.conditions.text`) is the canonical
-pre-encoder-text condition for unified-vocab models — Qwen3's transformer
-owns its own embedding table and consumes ``input_ids`` directly, so this
-is the right wire format. The chat-template stage produces it; the AR
-stage's ``autoregress`` / ``replay`` read it.
-
-Pairs ``from_dict`` / ``to_dict`` for round-tripping between the typed
-form (used inside the pipeline at stage call sites) and the generic
-generic ``Dict[str, Condition]`` shape on a ``Part``.
-"""
+"""Qwen3ARConditions — typed conditions container for the Qwen3 AR stage."""
 
 from __future__ import annotations
 
@@ -34,11 +17,7 @@ class Qwen3ARConditions(Batch):
 
     @classmethod
     def from_dict(cls, d: Dict[str, Condition]) -> "Qwen3ARConditions":
-        """Build from the generic ``Conditions`` dict shape.
-
-        Validates that the ``"prompt"`` slot is present and is a
-        ``TextTokenCondition``.
-        """
+        """Build from the generic ``Conditions`` dict shape."""
         prompt = d.get("prompt")
         if not isinstance(prompt, TextTokenCondition):
             raise TypeError(
@@ -49,9 +28,7 @@ class Qwen3ARConditions(Batch):
         return cls(prompt=prompt)
 
     def to_dict(self) -> Dict[str, Condition]:
-        """Convert back to the generic ``Conditions`` dict shape for
-        packing into ``Part.conditions``.
-        """
+        """Convert back to the generic ``Conditions`` dict shape for packing into ``Part.conditions``."""
         if self.prompt is None:
             raise ValueError("Qwen3ARConditions.to_dict: prompt field is None")
         return {"prompt": self.prompt}

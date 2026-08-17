@@ -1,22 +1,4 @@
-"""GradContext — controller-side autograd for RPC call chains.
-
-enable_grad() tracks forward RPC calls and automatically issues backward
-RPCs in reverse order when the context exits, propagating gradients through
-the chain of worker computations.
-
-Usage::
-
-    with enable_grad():
-        gen    = actor.generate_samples(batch)
-        reward = reward_role.score(gen)
-        _      = actor.forward_backward_loss(reward)
-
-    actor.step()
-
-The framework issues _auto_backward RPCs automatically on __exit__.
-Gradients are accumulated worker-side using PyTorch's native .grad += mechanism,
-supporting fan-out (same TensorRef used as input to multiple RPCs).
-"""
+"""GradContext — controller-side autograd for RPC call chains."""
 
 from __future__ import annotations
 
@@ -44,13 +26,7 @@ def current_grad_context() -> Optional["GradContext"]:
 
 @dataclass
 class RPCBackwardNode:
-    """Records a single forward RPC call for later backward dispatch.
-
-    input_metas and output_metas are ordered lists — index i corresponds to
-    _grad_inputs[call_id][i] and _grad_outputs[call_id][i] on the worker side.
-    Both sides use the same depth-first sorted-key traversal via
-    collect_leaves(x, TensorRef) / collect_leaves(x, Tensor) to guarantee alignment.
-    """
+    """Records a single forward RPC call for later backward dispatch."""
 
     role_proxy: "Handle"
     call_id: str  # key prefix for worker _grad_inputs/_grad_outputs
@@ -118,13 +94,7 @@ def _run_backward(ctx: GradContext) -> None:
 
 
 def _run_auto_backward(node: RPCBackwardNode) -> None:
-    """Call _auto_backward proxy on workers using node's dispatch_mode.
-
-    out_grads and in_grads are tuples of Optional[TensorRef].  pytree_chunk
-    recurses into tuple elements, so each TensorRef is chunked by dp_size
-    giving worker_i its own grad shard.  pytree_cat does the inverse on
-    return values.  No manual per-worker dispatch needed.
-    """
+    """Call _auto_backward proxy on workers using node's dispatch_mode."""
     out_grads = tuple(tm.grad for tm in node.output_metas)
     in_grads = tuple(tm.grad for tm in node.input_metas)
 
@@ -137,12 +107,7 @@ def _run_auto_backward(node: RPCBackwardNode) -> None:
 
 
 def _cleanup_all(ctx: GradContext) -> None:
-    """Tell every role proxy involved in this context to clear all saved grad tensors.
-
-    Calls _cleanup_all_grads() on each unique role proxy once (BROADCAST RPC),
-    so every worker clears its _grad_inputs and _grad_outputs dicts entirely.
-    Called both after successful backward and on forward exception.
-    """
+    """Tell every role proxy involved in this context to clear all saved grad tensors."""
     seen_proxies: set = set()
     for node in ctx.nodes:
         proxy = node.role_proxy

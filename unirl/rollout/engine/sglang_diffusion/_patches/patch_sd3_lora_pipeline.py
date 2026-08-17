@@ -1,41 +1,4 @@
-"""Make SD3's rollout pipeline LoRA-capable on stock upstream sglang (LIN-365).
-
-The sglang LoRA control path (``GPUWorker.set_lora`` and the migration's
-``set_lora_from_tensors``) gates on ``isinstance(self.pipeline, LoRAPipeline)`` --
-a model is "LoRA-enabled" only when its pipeline CLASS inherits the
-``LoRAPipeline`` mixin. The fork (``sglang-drl``) declares
-``class StableDiffusion3Pipeline(LoRAPipeline, ComposedPipelineBase)``; stock
-upstream's is ``class StableDiffusion3Pipeline(ComposedPipelineBase)`` -- LoRA was
-never added to SD3 upstream. So on upstream the separate-adapter weight-sync path
-(``LocalLoraWeightSync`` -> ``set_lora_from_tensors``, used by
-``conf/sd3_sglang_rollout_colocate.yaml``) fails the first sync with
-``ValueError: set_lora_from_tensors failed: Lora is not enabled`` -- even though
-``server_args.lora_target_modules`` is correctly populated, the pipeline simply
-isn't a ``LoRAPipeline`` so the worker rejects the request
-(``gpu_worker.py: if not isinstance(self.pipeline, LoRAPipeline): return
-OutputBatch(error="Lora is not enabled")``).
-
-Re-host the fork's declaration at runtime: inject ``LoRAPipeline`` into
-``StableDiffusion3Pipeline.__bases__``. ``LoRAPipeline`` subclasses
-``ComposedPipelineBase``, so the solid instance layout is unchanged and the
-``__bases__`` reassignment is permitted; the resulting bases
-``(LoRAPipeline, ComposedPipelineBase)`` are exactly the fork's. SD3 defines no
-``__init__`` of its own (only ``create_pipeline_stages``), so instantiation now
-runs ``LoRAPipeline.__init__`` (``super().__init__`` builds the stages first, then
-LoRA setup reads ``server_args``). The AROUND-wrapped ``LoRAPipeline.__init__``
-from ``patch_lora_tensors`` then eagerly wraps the LoRA layers in ``online`` mode
-(no startup ``lora_path``), so the in-memory adapter has targets before the first
-``set_lora_from_tensors``.
-
-The merged-LoRA recipe ``sd3_sglang_full_tensor`` runs the engine with
-``use_lora=false``, so ``lora_merge_mode`` stays null and the online prewrap is
-skipped -- the pipeline is a ``LoRAPipeline`` holding no LoRA layers, which is the
-fork's behaviour too (SD3 was always a ``LoRAPipeline`` regardless of sync mode),
-so that path is unaffected.
-
-Idempotent; ``__bases__`` injection + an ABCMeta-cache-invalidating
-``LoRAPipeline.register`` (see the note in the body) -- no sglang source edits.
-"""
+"""Make SD3's rollout pipeline LoRA-capable on stock upstream sglang."""
 
 from __future__ import annotations
 

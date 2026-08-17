@@ -1,11 +1,4 @@
-"""Worker-side Cosmos3 video/action supervised track builder.
-
-Lives in the model package (not ``unirl/train/sft/``) because its record →
-(conditions, segment) mapping is inherently Cosmos3-specific: it packs
-:class:`Cosmos3SFTCondition` through the joint stage's own tokenize/encode
-helpers. The generic builders in ``unirl/train/sft/track_builder.py`` stay
-model-agnostic; per-model logic stays here, per that package's contract.
-"""
+"""Worker-side Cosmos3 video and action supervised track builder."""
 
 from __future__ import annotations
 

@@ -1,38 +1,4 @@
-"""ZImagePipeline — ``Sample → Sample`` end-to-end for Z-Image.
-
-Implements the four-tier flow::
-
-    Texts ──text_embed──▶ ZImageConditions ──diffuse──▶ LatentSegment
-                                                            │
-                                                            ▼
-                                                        vae_decode
-                                                            │
-                                                            ▼
-                                                          Images
-
-Hydra constructs a pipeline via
-``ZImagePipeline.from_config(ZImagePipelineConfig)`` (see ``config.py``);
-``from_config`` loads the :class:`ZImageBundle` then constructs the four
-stages with the precision policy from the config.
-
-σ schedule contract
--------------------
-The hosting engine (``TrainsideRolloutEngine``) pins the σ schedule onto the gen
-Part's ``DiffusionSamplingParams.sigmas`` BEFORE calling ``generate(sample)``;
-this pipeline reads ``params.sigmas`` and uses it
-verbatim. Both Z-Image variants' ``scheduler/scheduler_config.json`` declare
-``use_dynamic_shifting: false`` (the diffusers ``ZImagePipeline`` computes a
-Flux-style ``mu`` but ``FlowMatchEulerDiscreteScheduler`` discards it on the
-static branch), so this pipeline is **static-shift** (unlike Qwen-Image /
-Flux.2-Klein, which are dynamic-shift). The shift value differs by variant —
-base ``Z-Image`` uses ``6.0``, ``Z-Image-Turbo`` uses ``3.0``;
-:meth:`build_schedule_policy` pins that posture via
-``FlowMatchSchedulePolicy.static_only(self.shift)``.
-
-Base vs Turbo is purely a config difference (same architecture): base runs
-with CFG (``guidance_scale > 0`` + a negative prompt), Turbo runs CFG-free
-(``guidance_scale = 0``). The recipe sets the variant-specific values.
-"""
+"""ZImagePipeline — ``Sample → Sample`` end-to-end for Z-Image."""
 
 from __future__ import annotations
 
@@ -55,19 +21,7 @@ from .vae import ZImageVAEDecodeStage
 
 
 class ZImagePipeline(Pipeline):
-    """Z-Image generate pipeline: ``Sample → Sample``.
-
-    Consumes a request ``Sample`` whose frontier Part is a pre-forked diffusion gen
-    shell carrying ``DiffusionSamplingParams`` (with ``sigmas`` pinned by the
-    hosting engine). Reads the prompt via ``sample.conditioning()`` and fills the
-    frontier Part:
-
-    - ``segment: LatentSegment`` — the denoising trajectory.
-    - ``primitives["image"]: Images`` — the decoded images.
-
-    ``Part.conditions`` carries the encoded conditions for trainer-side replay (the train stack re-types them via ``conditions_cls.from_dict``). User-supplied negatives are
-    deferred; CFG uses a synthesized empty negative.
-    """
+    """Z-Image generate pipeline: ``Sample → Sample``."""
 
     def __init__(
         self,
@@ -107,10 +61,7 @@ class ZImagePipeline(Pipeline):
 
     @classmethod
     def latent_shape(cls, *, model_config: Any, sampling_spec: Any) -> tuple:
-        """Per-sample latent shape ``(C, H_lat, W_lat)`` for driver-side
-        noise pre-computation. Z-Image: 16-channel ``AutoencoderKL``, 8×
-        spatial downsample with the patchify-2×2 rounding
-        (``latent_h = 2 * (H // 16)``)."""
+        """Per-sample latent shape ``(C, H_lat, W_lat)`` for driver-side noise pre-computation."""
         height = int(sampling_spec.height)
         width = int(sampling_spec.width)
         vae_scale_factor = 8
@@ -125,12 +76,7 @@ class ZImagePipeline(Pipeline):
         *,
         strategy: Optional[StepStrategy] = None,
     ) -> "ZImagePipeline":
-        """Build the full pipeline from a config.
-
-        ``strategy`` is the SDE step strategy. Defaults to
-        :class:`FlowSDEStrategy`; callers running GRPO with a different SDE
-        family (Dance / CPS / DPM2) pass an explicit strategy.
-        """
+        """Build the full pipeline from a config."""
         bundle = ZImageBundle.from_config(config)
         text_embed = ZImageTextEmbedStage(bundle, max_sequence_length=config.max_sequence_length)
         step = ZImageDiffusionStep()
@@ -153,19 +99,7 @@ class ZImagePipeline(Pipeline):
         )
 
     def build_schedule_policy(self):
-        """Static-shift FlowMatch σ policy (Z-Image uses no dynamic shift).
-
-        Both Z-Image variants' ``scheduler/scheduler_config.json`` declare
-        ``use_dynamic_shifting: false`` (base ``shift: 6.0``, Turbo
-        ``shift: 3.0``): the upstream diffusers ``ZImagePipeline`` still
-        computes a Flux-style ``mu``, but ``FlowMatchEulerDiscreteScheduler``
-        ignores it on the static branch and applies
-        ``shift·t / (1 + (shift-1)·t)``. Returning an explicit ``static_only``
-        policy built from ``self.shift`` pins that posture regardless of whether
-        ``pretrained_path`` is an HF repo id or a local mount (so a checkpoint
-        shipping a stray dynamic ``scheduler_config.json`` can't silently flip
-        σ and drift the GRPO ratio). Mirrors ``BagelPipeline.build_schedule_policy``.
-        """
+        """Static-shift FlowMatch σ policy (Z-Image uses no dynamic shift)."""
         from unirl.sde.runtime import FlowMatchSchedulePolicy
 
         return FlowMatchSchedulePolicy.static_only(float(self.shift))
@@ -177,15 +111,7 @@ class ZImagePipeline(Pipeline):
         negatives: Optional[Texts] = None,
         guidance_scale: float = 1.0,
     ) -> ZImageConditions:
-        """Encode prompts (+ optional CFG negatives) into ``ZImageConditions``.
-
-        CFG empty negative: Z-Image upstream (diffusers ``ZImagePipeline``
-        ``encode_prompt``) defaults to ``""`` (empty string) when CFG is
-        enabled and no negative is passed. Z-Image gates CFG on
-        ``guidance_scale > 0`` (Turbo runs with 0 → CFG off). The Qwen3
-        chat template tokenizes ``""`` cleanly, so no ``" "`` workaround is
-        needed (unlike Qwen-Image).
-        """
+        """Encode prompts (+ optional CFG negatives) into ``ZImageConditions``."""
         if negatives is not None and len(negatives.texts) != len(texts.texts):
             raise ValueError(
                 f"ZImagePipeline.build_conditions: negative_text length "
@@ -198,12 +124,7 @@ class ZImagePipeline(Pipeline):
         return ZImageConditions(text=text_cond, negative_text=negative_text_cond)
 
     def generate(self, sample: Sample) -> Sample:
-        """Run Z-Image t2i end-to-end, filling the frontier (pre-forked) gen Part.
-
-        Requires σ to be pinned onto the gen part's ``DiffusionSamplingParams.sigmas``
-        by the hosting engine before the call; see the σ ownership note in
-        ``unirl.models.types.pipeline``.
-        """
+        """Run Z-Image t2i end-to-end, filling the frontier (pre-forked) gen Part."""
         frontier = sample.parts[-1]
         params = frontier.sampling_params
         if not isinstance(params, DiffusionSamplingParams):

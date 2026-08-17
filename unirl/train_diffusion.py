@@ -1,15 +1,5 @@
 #!/usr/bin/env python
-"""UniRL diffusion training entry point (Hydra-native).
-
-Thin wrapper around :class:`unirl.trainer.diffusion.DiffusionTrainer`.
-The trainer owns the placement scope, sibling Remote wiring, and the
-``train_step → train`` loop; this module just maps the loaded Hydra
-config blocks to constructor kwargs.
-
-Pairs with ``examples/diffusion/sd3/sd3_trainside.yaml`` (default) and
-``examples/diffusion/sd3/sd3_vllmomni.yaml``. Switch with
-``--config-name diffusion/sd3/sd3_vllmomni`` on the CLI.
-"""
+"""UniRL diffusion training entry point (Hydra-native)."""
 
 from __future__ import annotations
 
@@ -56,6 +46,8 @@ def main(cfg: DictConfig) -> None:
         train_fraction=cfg.get("train_fraction", 0.5),
         reward_fraction=cfg.get("reward_fraction", 0.0),
         enable_fsdp_offload=cfg.get("enable_fsdp_offload", False),
+        offload_train_during_reward=cfg.get("offload_train_during_reward", False),
+        rollout_sleep_after_generate=cfg.get("rollout_sleep_after_generate", True),
         adv_use_global_std=cfg.get("adv_use_global_std", False),
         accumulate_rollouts=cfg.get("accumulate_rollouts", 1),
         eval_interval=cfg.get("eval_interval", 0),

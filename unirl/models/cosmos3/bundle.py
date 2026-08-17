@@ -1,13 +1,4 @@
-"""Cosmos3Bundle — plain weight holder for Cosmos3 SFT.
-
-Loads the diffusers-layout checkpoint (``transformer/``, ``vae/``,
-``text_tokenizer/``, ``scheduler/``) and applies the freeze policy. FSDP
-wrapping, optimizer, and checkpointing are owned by the backend
-(:class:`unirl.train.backend.fsdp.FSDPBackend` over ``trainable_attr="transformer"``).
-
-Requires diffusers >= 0.39 (first release with ``Cosmos3OmniTransformer`` /
-``Cosmos3OmniPipeline``).
-"""
+"""Cosmos3 SFT checkpoint bundle and freeze policy."""
 
 from __future__ import annotations
 
@@ -40,8 +31,7 @@ _UND_PARAM_RE = re.compile("|".join(f"(?:{p})" for p in _UND_PARAM_PATTERNS))
 
 
 def is_understanding_param(name: str) -> bool:
-    """True if ``name`` (a ``named_parameters`` key of Cosmos3OmniTransformer)
-    belongs to the frozen-by-default understanding stream."""
+    """Return whether a Cosmos3 transformer parameter belongs to the understanding stream."""
     return _UND_PARAM_RE.match(name) is not None
 
 
@@ -58,14 +48,7 @@ def _import_diffusers_classes():
 
 
 class _CastOutput(torch.nn.Module):
-    """Parameter-free wrapper casting a module's output dtype.
-
-    Cosmos3's ``forward`` feeds ``time_proj`` sinusoids (always fp32 — diffusers'
-    ``get_timestep_embedding`` calls ``.float()`` internally) straight into
-    ``time_embedder`` and relies on that embedder staying fp32. Under FSDP mixed
-    precision the embedder is all-gathered as bf16 for compute, so restore the
-    standard diffusers convention (cast the projection before the linear).
-    """
+    """Parameter-free wrapper casting a module's output dtype."""
 
     def __init__(self, inner: torch.nn.Module, dtype: torch.dtype) -> None:
         super().__init__()
@@ -77,15 +60,7 @@ class _CastOutput(torch.nn.Module):
 
 
 def _patch_rotary_emb_contiguous(rotary_emb: torch.nn.Module) -> None:
-    """Avoid 0-stride ``cublasSgemmStridedBatched`` in Cosmos3 mRoPE.
-
-    Upstream ``Cosmos3VLTextRotaryEmbedding`` does ``inv_freq.expand(3, B, -1, 1)
-    @ position_ids`` with a broadcast (stride 0) batch dim. On torch 2.10 +
-    cu128 that GEMM returns ``CUBLAS_STATUS_INVALID_VALUE``. The math is
-    ``freqs[axis,b,n,f] = inv_freq[f] * pos[axis,b,n]`` — a broadcast multiply
-    is exact and does not go through strided-batched GEMM. Also materialize a
-    DTensor ``inv_freq`` if FSDP ever wraps the buffer.
-    """
+    """Replace Cosmos3's zero-stride mRoPE batched GEMM with an equivalent broadcast multiply."""
     if getattr(rotary_emb, "_unirl_contiguous_rope", False):
         return
 
@@ -117,15 +92,7 @@ def _needs_h20_cu128_workaround() -> bool:
 
 
 def _patch_frozen_dtensor_linears(transformer: torch.nn.Module) -> None:
-    """Materialize frozen FSDP2 DTensors before ``F.linear``.
-
-    Cosmos3 freezes the und stream (``to_q`` / ``to_k`` / …). FSDP2 still
-    shards those weights (``to_q`` local 512×4096 on 8 ranks) but often
-    skips the compute all-gather for ``requires_grad=False``. Linear then
-    launches a full-shape bf16 GEMM against the shard and ``cublasGemmEx``
-    returns ``INVALID_VALUE``. Trainable linears keep the normal FSDP path
-    so grads stay attached to the DTensor.
-    """
+    """Materialize frozen FSDP2 DTensors before fp32 ``F.linear`` on the affected H20 runtime."""
     patched = 0
     for module in transformer.modules():
         if not isinstance(module, torch.nn.Linear):
@@ -164,29 +131,14 @@ def _patch_frozen_dtensor_linears(transformer: torch.nn.Module) -> None:
 
 
 def _mm_2d(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
-    """``(..., K) @ (K, N) + (N,)`` via a single 2-D GEMM.
-
-    H20 + torch 2.10/cu128 rejects ``cublasSgemmStridedBatched`` (``torch.bmm``,
-    3-D ``matmul``, SDPA MATH). Plain ``cublasSgemm`` is fine.
-    """
+    """Compute ``(..., K) @ (K, N) + (N,)`` through one 2-D GEMM."""
     out_shape = x.shape[:-1] + (weight.shape[1],)
     y = x.reshape(-1, x.shape[-1]) @ weight
     return (y + bias).reshape(out_shape)
 
 
 def _patch_h20_strided_gemm(transformer: torch.nn.Module) -> None:
-    """Bypass broken ``cublasSgemmStridedBatched`` on H20 + cu128.
-
-    Isolated on the smoke nodes (torch 2.10.0+cu128, driver 12.9):
-
-    * ``F.linear`` / 2-D ``mm`` — OK
-    * ``torch.bmm`` / 3-D ``matmul`` / batched ``einsum`` — ``INVALID_VALUE``
-    * SDPA default / Efficient / Flash(bf16) — OK
-    * SDPA MATH — ``INVALID_VALUE`` (it is implemented as strided-batched GEMM)
-
-    Cosmos3 hits both bad paths: ``DomainAwareLinear`` uses ``bmm`` with ``M=1``,
-    and RoPE-broadcast Q/K can make native SDPA fall back to MATH.
-    """
+    """Bypass broken strided-batched cuBLAS paths on H20 with torch 2.10/cu128."""
     import diffusers.models.transformers.transformer_cosmos3 as cosmos3_mod
 
     cls = cosmos3_mod.DomainAwareLinear
@@ -271,8 +223,7 @@ def _patch_h20_strided_gemm(transformer: torch.nn.Module) -> None:
 
 
 class Cosmos3Bundle(Bundle):
-    """Weights for Cosmos3 SFT: MoT transformer (trainable), WanVAE + tokenizer
-    + scheduler (frozen helpers)."""
+    """Weights and frozen helpers for Cosmos3 SFT."""
 
     def __init__(self, *, transformer, vae, text_tokenizer, scheduler, config: Cosmos3SFTConfig) -> None:
         super().__init__()

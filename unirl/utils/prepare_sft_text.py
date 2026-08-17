@@ -1,4 +1,13 @@
-"""Build a local LLM SFT manifest (``{"prompt", "response"}`` jsonl) from an HF dataset.
+"""Build a local LLM SFT manifest (``{"prompt", "response"}`` jsonl) from an HF dataset."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import random
+
+_HELP = """Build a local LLM SFT manifest (``{"prompt", "response"}`` jsonl) from an HF dataset.
 
 The supervised data layer (``unirl/data/sft.py``) reads local jsonl manifests,
 not HF dataset ids. This tool converts an instruction dataset into that layout:
@@ -19,16 +28,9 @@ Usage:
 Set HF_ENDPOINT for a mirror; --max-samples caps rows for smoke runs.
 """
 
-from __future__ import annotations
-
-import argparse
-import json
-import os
-import random
-
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=_HELP)
     parser.add_argument("--dataset", default="yahma/alpaca-cleaned")
     parser.add_argument("--split", default="train")
     parser.add_argument("--prompt-key", default="instruction")

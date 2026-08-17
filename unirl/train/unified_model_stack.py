@@ -1,35 +1,4 @@
-"""Unified-backbone multi-algorithm train stack (HunyuanImage3).
-
-Wraps ONE :class:`FSDPBackend` (a single shared transformer + optimizer +
-scheduler + EMA) and TWO :class:`StageAlgorithm` siblings — an ``ar`` algorithm
-over the ``TextSegment`` and an ``image`` algorithm over the ``LatentSegment`` —
-into a single training driver.  Both algorithms run forward/backward against the
-*same* shared backbone (HunyuanImage3 operates in ``mode="gen_text"`` for AR and
-``mode="gen_image"`` for DiT on one set of weights), so their gradients
-accumulate into one LoRA adapter and a single optimizer step applies both.
-
-Mirrors :class:`unirl.train.stack.TrainStack` but for the unified-backbone
-two-algorithm case.  Sequencing per :meth:`train` call::
-
-    prepare_segment(ar); prepare_segment(image)              # once: freeze both π_old anchors
-    for u in range(num_updates_per_batch):                   # PPO-style mini-batches
-        backend.zero_grad()
-        for name in ("ar", "image"):
-            for (start, end) in micro_slices(mini_batch_u):
-                algorithm[name].compute_loss_and_backward(loss_scale=1/N, ...)  # grads accumulate
-        backend.optimizer_step(max_grad_norm=...)            # ONE step per mini-batch
-    on_rollout_end()
-    return {name: TrainStepResult, ...}                      # reduced across updates
-
-``num_updates_per_batch`` (default 1) splits each rollout shard into that many
-disjoint mini-batches and runs one optimizer step per mini-batch, with each track's
-π_old anchor frozen once across all of them — so the 2nd+ step is off-policy and the
-clip / ratio trust region actually engages (the UniGRPO / FlowGRPO PPO schedule).
-Mirrors :class:`~unirl.train.stack.TrainStack` but for the two-algorithm backbone.
-
-This is the multi-stage train stack — several stage algorithms share one
-optimizer step, in contrast to the single-stage ``TrainStack``.
-"""
+"""Unified-backbone multi-algorithm train stack (HunyuanImage3)."""
 
 from __future__ import annotations
 
@@ -56,17 +25,7 @@ logger = logging.getLogger(__name__)
 
 
 class UnifiedModelTrainStack(Remote):
-    """Single-backbone, multi-algorithm train stack.
-
-    Holds one shared :class:`FSDPBackend` plus explicit AR and image
-    :class:`StageAlgorithm` siblings. Each algorithm trains its own Part but
-    backward-accumulates into the same
-    shared transformer; one optimizer step applies all algorithms' gradients.
-
-    Created as a sibling ``Remote`` inside a placement block; takes handles to
-    its ``FSDPBackend`` and ``StageAlgorithm`` siblings via sibling-handle
-    auto-resolve (same pattern as :class:`TrainStack`).
-    """
+    """Single-backbone, multi-algorithm train stack."""
 
     def __init__(
         self,
@@ -102,13 +61,7 @@ class UnifiedModelTrainStack(Remote):
                     )
 
     def _optimizer_step_slices(self, total: int) -> List[List[Tuple[int, int]]]:
-        """Per-optimizer-step lists of absolute ``(start, end)`` micro-batch slices.
-
-        One inner list per ``num_updates_per_batch`` mini-batch (one optimizer step),
-        each split into ``micro_batch_size`` micro-batches. Shared by
-        :meth:`prepare_segment` (to freeze the anchor at the exact geometry) and the
-        train loop. Mirrors :meth:`unirl.train.stack.TrainStack._optimizer_step_slices`.
-        """
+        """Per-optimizer-step lists of absolute ``(start, end)`` micro-batch slices."""
         steps: List[List[Tuple[int, int]]] = []
         for mini_start, mini_end in _update_ranges(total_size=total, num_updates=self.num_updates_per_batch):
             steps.append(
@@ -122,17 +75,7 @@ class UnifiedModelTrainStack(Remote):
         return steps
 
     def prepare_segment(self, algorithm: StageAlgorithm, part: Part) -> None:
-        """Freeze one algorithm's π_old anchor once, before the multi-update loop.
-
-        No-op if ``segment`` is None or the algorithm has no ``prepare_segment``. If
-        the algorithm recomputes its anchor at train geometry (``recomputes_anchor()``
-        — e.g. FlowGRPO under ``old_logp_source='replay'``), the declared
-        ``anchor_fields`` are recomputed at the SAME (mini, micro) slices training will
-        use, so the on-policy ratio is exactly 1 (mirrors
-        :meth:`TrainStack.prepare_segment`). Rollout-anchored algorithms (the BAGEL
-        UniGRPO recipe: AR GRPO + image ``old_logp_source='rollout'``) take the
-        one-shot path — the anchor is the rollout emission, geometry-independent.
-        """
+        """Freeze one algorithm's π_old anchor once, before the multi-update loop."""
         if part.segment is None:
             return
         prepare = getattr(algorithm, "prepare_segment", None)
@@ -170,15 +113,7 @@ class UnifiedModelTrainStack(Remote):
         *,
         training_progress: float,
     ) -> tuple[TrainStepResult, bool]:
-        """Backward one algorithm's Part over the given absolute ``micro_slices``
-        (no zero_grad / no optimizer step).
-
-        Returns ``(per_algorithm_result, has_backward)``. ``zero_grad`` and the shared
-        ``optimizer_step`` are owned by :meth:`_train_one_step` so both algorithms
-        accumulate into one step. ``micro_slices`` are absolute ranges into
-        ``part`` for ONE optimizer step (one ``num_updates_per_batch``
-        mini-batch), produced by :meth:`_optimizer_step_slices`.
-        """
+        """Backward one algorithm's Part over the given absolute ``micro_slices``"""
         if part.advantages is None:
             raise ValueError(
                 f"UnifiedModelTrainStack.train: {type(algorithm).__name__} Part has advantages=None; "
@@ -229,9 +164,7 @@ class UnifiedModelTrainStack(Remote):
         image_slices: List[Tuple[int, int]],
         training_progress: float,
     ) -> Dict[str, TrainStepResult]:
-        """One optimizer step: zero_grad → backward BOTH Parts over their mini-batch
-        slices → shared optimizer_step → stamp grad_norm / lr onto each stage result.
-        """
+        """One optimizer step: zero_grad → backward BOTH Parts over their mini-batch"""
         self.fsdp_backend.zero_grad()
         ar_result, ar_backward = self._backward_part(
             self.ar_algorithm, ar_part, ar_slices, training_progress=training_progress
@@ -286,34 +219,16 @@ class UnifiedModelTrainStack(Remote):
         *,
         training_progress: float,
     ) -> Dict[str, TrainStepResult]:
-        """Driver-callable: prepare → backward(ar) + backward(image) → ONE step.
-
-        Takes the whole ``[input, ar, image]`` lineage so DP_SCATTER shards it by
-        whole prompt-tree (``Sample.chunk`` → tree-shard), landing both stages on
-        this worker with a CONSISTENT prompt set. Passing the two Parts separately
-        was wrong at dp>1: ``infer_batch_size`` takes the first arg (``ar``=P*N), so
-        the P*N*M image Part trips ``pytree_chunk``'s batch-mismatch branch and gets
-        REPLICATED to every rank. ``prepare_segment`` (image only) populates
-        ``segment.sde_logp``; the two ``compute_loss_and_backward`` calls accumulate
-        gradients into the shared backbone's single LoRA adapter; one
-        ``optimizer_step`` applies them; per-shard results merge back on collect.
-        ``prepare_segment`` freezes each Part's π_old anchor ONCE; then the
-        shard is split into ``num_updates_per_batch`` disjoint mini-batches and one
-        optimizer step runs per mini-batch (each: backward ar + image over its
-        mini-batch → one shared step). The 2nd+ step is off-policy, so the clip /
-        ratio trust region engages; ``num_updates_per_batch=1`` is the prior
-        single-step behavior. Per-track results are reduced across the updates;
-        per-shard results merge back via ``pytree_cat`` on collect.
-        """
+        """Driver-callable: prepare → backward(ar) + backward(image) → ONE step."""
         ar_part = sample.gen_part(ARSamplingParams)
         image_part = sample.gen_part(DiffusionSamplingParams)
         device = self.fsdp_backend._device
         ar_part = ar_part.to_device(device)
         image_part = image_part.to_device(device)
 
-        from unirl.utils.profiling import profile_scope
+        from unirl.utils.profiling import profile_mode
 
-        scope = profile_scope()
+        scope = profile_mode()
         if scope == "one-update" and not getattr(self, "_warned_one_update", False):
             self._warned_one_update = True
             logger.warning(

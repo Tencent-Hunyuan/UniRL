@@ -1,15 +1,4 @@
-"""Qwen3.5 AR stage: typed params + per-token kernel + rollout-level stage.
-
-Combines:
-* Qwen3's chunked ``_replay_aware_forward`` (no full-logits materialization)
-  adapted for Qwen3.5's ``transformer.model`` + ``transformer.lm_head`` layout
-  and multimodal conditioning (pixel_values / image_grid_thw).
-* Qwen-VL's M-RoPE ``_vision_rope_positions`` and per-sample pixel_values
-  merge.
-* ``_SPARSE_PACKED_ATTN = ()`` — Qwen3.5's hybrid attention (3 GDN + 1 full
-  per 4 layers) cannot use a per-layer sparse-block gate, so packed replay
-  is disabled and every replay goes through ``padding_replay``.
-"""
+"""Qwen3.5 AR stage: typed params + per-token kernel + rollout-level stage."""
 
 from __future__ import annotations
 
@@ -58,15 +47,7 @@ def _replay_aware_forward(
     autocast_dtype: Optional[torch.dtype] = None,
     **kw: Any,
 ) -> Any:
-    """Dual-mode ``forward`` installed on the Qwen3.5 ForConditionalGeneration.
-
-    Without ``response_tokens``: delegate to the stock class forward (decode /
-    generate). With it: run ``self.model(...)`` (vision + language_model) and
-    return the padded ``[B, T_max]`` FP32 per-token log-probs via a chunked
-    ``x[tok] - logsumexp(x)`` over ``self.lm_head`` — the full
-    ``[B, L, vocab]`` logits are never materialized. Running inside
-    ``forward`` keeps replay valid under FSDP2 root wrap.
-    """
+    """Dual-mode ``forward``: padded ``[B, T_max]`` fp32 log-probs, chunked so ``[B, L, vocab]`` never materializes."""
     if response_tokens is None:
         for klass in type(self).__mro__:
             f = klass.__dict__.get("forward")
@@ -195,20 +176,7 @@ def _vision_rope_positions(
     attention_mask: torch.Tensor,
     mm_token_type_ids: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Call Qwen3.5 ``get_rope_index`` → ``[3, bs, seq]`` (t, h, w).
-
-    HF Qwen3.5 makes ``mm_token_type_ids`` a required positional arg, while
-    VeOmni's patched Qwen3.5 omits it. Dispatch by the inspected signature; for
-    the HF path, build it from config token ids when absent (text=0, image=1).
-
-    ``mm_token_type_ids`` should be built from the **prompt** portion only —
-    response tokens must be text (0). Building it from ``input_ids`` directly
-    is unsafe when ``input_ids`` contains sampled response tokens that happen
-    to equal a multimodal placeholder, which would create phantom vision
-    groups and exhaust the ``grid_thw`` iterator inside
-    ``get_rope_index`` (cf. ms-swift's collator, which builds it per-sample on
-    the prompt before batching).
-    """
+    """Call Qwen3.5 ``get_rope_index`` → ``[3, bs, seq]`` (t, h, w)."""
     get_rope_index = transformer.model.get_rope_index
     cfg = transformer.config
     if mm_token_type_ids is None:
@@ -237,11 +205,7 @@ def _build_mm_token_type_ids(
     transformer: Any,
     input_ids: torch.Tensor,
 ) -> torch.Tensor:
-    """Build ``mm_token_type_ids`` from token ids (text=0 / image=1).
-
-    Qwen3.5 requires this on every multimodal forward where ``position_ids`` is
-    None (decode loop) so ``compute_3d_position_ids`` can run.
-    """
+    """Build ``mm_token_type_ids`` from token ids (text=0 / image=1)."""
     cfg = transformer.config
     mm = torch.zeros_like(input_ids)
     image_token_id = getattr(cfg, "image_token_id", None)
@@ -251,15 +215,7 @@ def _build_mm_token_type_ids(
 
 
 def _dense_flash_attention_kwargs(input_ids: torch.Tensor) -> Dict[str, Any]:
-    """Flash-attention sequence metadata for dense ``[B, L]`` replay tensors.
-
-    VeOmni's patched Qwen3.5/Qwen3.5-MoE decoder layers require precomputed
-    ``cu_seq_lens_q`` for the hybrid linear-attention kernels. UniRL's
-    Qwen3.5 replay path is intentionally dense padded rather than packed, so
-    the correct boundaries are the dense row boundaries ``0, L, 2L, ...``
-    matching the physical ``[B, L, H]`` tensors passed into the model. Padding
-    semantics remain controlled by ``attention_mask``.
-    """
+    """Flash-attention sequence metadata for dense ``[B, L]`` replay tensors."""
     if input_ids.dim() != 2:
         raise ValueError(f"_dense_flash_attention_kwargs expects [B, L] input_ids, got {tuple(input_ids.shape)}")
     batch_size, seq_len = int(input_ids.shape[0]), int(input_ids.shape[1])
@@ -452,12 +408,7 @@ class Qwen3_5ARStage(ARStage[Qwen3_5ARConditions]):
         segment: TextSegment,
         temperature: float = 1.0,
     ) -> torch.Tensor:
-        """Replay per-token log-probs over a stored rollout segment.
-
-        Qwen3.5 uses padding_replay only (hybrid GDN attention disables the
-        packed-varlen gate). Returns packed varlen ``[total_tokens]`` aligned
-        with ``segment.log_probs``.
-        """
+        """Replay per-token log-probs; returns packed varlen ``[total_tokens]``."""
         return self.padding_replay(conditions, segment=segment, temperature=temperature)
 
     def padding_replay(

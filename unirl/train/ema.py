@@ -1,20 +1,4 @@
-"""EMA feature: shadow structure injection + runtime shadow updates.
-
-Owns the whole story of "a shadow copy of the trainable weights":
-
-* :func:`inject_nft` — dual LoRA adapters (trainable ``default`` + frozen
-  ``old`` shadow) for NFT-style adapter EMA; build-time, returns a
-  :class:`Shadow`.
-* :func:`inject_mirror` — full-model ``shadow_*`` parameters for full-weight
-  EMA; build-time, returns a :class:`Shadow`.
-* :class:`Shadow` — how to access (live, shadow) parameter pairs, regardless
-  of whether shadows are peft adapters or mirror parameters.
-* :class:`EMA` — the runtime updater: when to update (timing) and how fast
-  (``make_decay_fn``), plus swap-in/swap-out for rollout/export.
-
-Injection runs in the backend constructor while the model may still be on
-meta device; post-materialize work is stamped via ``unirl.train.deferred``.
-"""
+"""EMA feature: shadow structure injection + runtime shadow updates."""
 
 from __future__ import annotations
 
@@ -44,13 +28,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class Shadow:
-    """How to access (live, shadow) parameter pairs on the model tree.
-
-    Returned by :func:`inject_nft` / :func:`inject_mirror`.  Consumed by
-    :class:`EMA`.  The closures capture the model reference and the
-    specifics of how shadows are stored.  EMA calls these without knowing
-    whether shadows are peft adapters or mirror parameters.
-    """
+    """How to access (live, shadow) parameter pairs on the model tree."""
 
     iter_pairs: Callable[[], Iterator[Tuple[Tensor, Tensor]]]
     swap_in: Callable[[], None]
@@ -59,11 +37,7 @@ class Shadow:
 
 @dataclass
 class EMA:
-    """Per-step shadow updater.  The only runtime class.
-
-    Stateless — shadow values live on the model tree.  EMA just knows
-    when to update (timing) and how fast (decay_fn).
-    """
+    """Per-step shadow updater.  The only runtime class."""
 
     shadow: Shadow
     decay_fn: Callable[[int], float]
@@ -98,8 +72,7 @@ class EMA:
             self.shadow.swap_out()
 
     def apply_shadow(self) -> None:
-        """RPC-friendly swap-in (no context manager). Must be paired with
-        :meth:`restore_shadow`."""
+        """RPC-friendly swap-in (no context manager). Must be paired with"""
         self.shadow.swap_in()
 
     def restore_shadow(self) -> None:
@@ -246,17 +219,7 @@ def _adapter_pairs(
 
 
 def _activate_keep_grad(model: nn.Module, active: str, *, trainable: str, frozen: str) -> None:
-    """Switch the active adapter, then RESTORE the canonical requires_grad split.
-
-    peft's ``set_adapter`` couples the active adapter with ``requires_grad``
-    (active -> True, all others -> False). DiffusionNFT swaps to the frozen
-    ``old`` adapter for off-policy rollout, which flips the trainable ``default``
-    adapter to ``requires_grad=False``. Under FSDP2 with ``reshard_after_forward
-    =False`` the rollout's all-gather then caches the unsharded ``default`` param
-    grad-less, and the later training forward yields a loss with no ``grad_fn``
-    ("element 0 ... does not require grad"). Re-asserting the split keeps the
-    trainable adapter grad-enabled no matter which adapter is active, so the
-    cached compute param is always gathered with ``requires_grad=True``."""
+    """Switch the active adapter, then RESTORE the canonical requires_grad split."""
     _activate(model, active)
     _set_adapter_requires_grad(model, trainable, True)
     _set_adapter_requires_grad(model, frozen, False)

@@ -1,34 +1,4 @@
-"""Flux2KleinVAEDecodeStage — LatentSegment → Images via VAE decode.
-
-Implements ``DecodeStage[LatentSegment, Images]``. The Klein diffusion
-stage stores **patchified** latents ``[B, K, 128, H_pat, W_pat]``
-(128 = 32 × 4 packed channels in the post-VAE / 2×2 patchified grid),
-so the decode pipeline runs the FLUX.2-klein VAE chain in reverse:
-
-1. Read the final stored position from ``LatentSegment.latents[:, -1]``
-   (``Flux2KleinDiffusionStage`` always stores position ``T`` —
-   the clean latent ``x_0``).
-2. **Denormalize** patchified latents via the VAE's ``BatchNorm`` head
-   running stats (``vae.bn.running_mean`` / ``running_var`` +
-   ``vae.config.batch_norm_eps``). Klein's VAE was trained with a
-   final BN layer at the encoder side, so sampling-time latents are
-   normalized; we have to invert that before decoding. See
-   :func:`flux2_klein_utils.denormalize_patchified_latents`.
-3. **Unpatchify** ``[B, 128, H_pat, W_pat] → [B, 32, 2*H_pat, 2*W_pat]``
-   (the inverse of the 2×2 channel-pack the VAE encoder applies).
-4. **Decode** via ``AutoencoderKLFlux2.decode`` in fp32.
-5. **Normalize** pixels from ``[-1, 1]`` to ``[0, 1]`` and clamp.
-
-No ``Flux2KleinVAEEncodeStage`` here — the Klein training script is
-t2i only (no img2img / SDEdit). Add when image conditioning lands.
-
-Math mirrors the Klein branch of
-``main_flux_bundle/unirl/models/flux2.py::decode_latents`` and
-the sampling-side BN denormalize in
-``main_flux_bundle/unirl/samplers/fsdp/flux2_sampler.py``. The
-new-design path does NOT import legacy code; spec sync is via review
-and tests.
-"""
+"""Flux2KleinVAEDecodeStage — LatentSegment → Images via VAE decode."""
 
 from __future__ import annotations
 
@@ -58,19 +28,7 @@ class Flux2KleinVAEDecodeStage(DecodeStage[LatentSegment, Images]):
         self.bundle = bundle
 
     def decode(self, s: LatentSegment, *, grad: bool = False, activation_checkpoint: bool = False) -> Images:
-        """Decode the final-step patchified latents in *s* into pixel images.
-
-        Reads ``s.latents[:, -1]`` (``[B, 128, H_pat, W_pat]`` — the
-        clean patchified latent ``x_0`` at position ``T``), runs the
-        Klein VAE chain (BN denormalize → unpatchify → decode), and
-        normalizes pixels to ``[0, 1]``.
-
-        ``grad=False`` (default) keeps the rollout path under ``torch.no_grad()``.
-        ``grad=True`` (ReFL direct-reward backprop) runs the decode WITH grad so it
-        flows from the reward through the frozen VAE into ``clean``; the VAE has no
-        trainable params, so only ``clean``'s graph is extended. ``activation_checkpoint``
-        (grad only) recomputes the decode in backward to trade compute for memory.
-        """
+        """Decode the final-step patchified latents in *s* into pixel images."""
         if self.bundle.vae is None:
             raise RuntimeError(
                 "Flux2KleinVAEDecodeStage.decode: no VAE loaded "
@@ -110,23 +68,7 @@ class Flux2KleinVAEDecodeStage(DecodeStage[LatentSegment, Images]):
 
 
 class Flux2KleinVAEEncodeStage:
-    """Encode a source/reference image into packed condition tokens + ids.
-
-    Image-edit conditioning path (mirrors diffusers
-    ``Flux2KleinPipeline.prepare_image_latents`` + ``_prepare_image_ids``):
-
-    1. pixels ``[B, 3, H, W]`` in ``[0, 1]`` → ``[-1, 1]`` (VAE input convention).
-    2. ``vae.encode(x).latent_dist.mode()`` (deterministic — matches diffusers'
-       ``retrieve_latents(sample_mode="argmax")`` so rollout/replay don't drift).
-    3. patchify ``[B, 32, H/8, W/8] → [B, 128, H/16, W/16]``.
-    4. BN-normalize the patchified latents (the Klein VAE's BatchNorm head).
-    5. pack ``[B, 128, h, w] → [B, h*w, 128]`` condition tokens.
-    6. build 4-axis RoPE ids ``[B, h*w, 4]`` with a time offset (T=``scale``)
-       so the transformer distinguishes condition tokens from noise tokens
-       (whose latent ids use T=0..; see ``prepare_latent_ids``).
-
-    Returns ``(image_tokens [B, N, 128], image_ids [B, N, 4])``.
-    """
+    """Encode a source/reference image into packed condition tokens + ids."""
 
     REFERENCE_TIME_SCALE: int = 10
 

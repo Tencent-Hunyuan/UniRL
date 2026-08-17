@@ -1,13 +1,4 @@
-"""Assemble ``Sample`` Part pieces (segment / decoded / conditions) from raw results.
-
-Pure: operates on already-fetched wire data (SGLang ``GenerationResult`` objects)
-and ``unirl.types`` — no SGLang import, no engine state. The model-specific
-variation (e.g. Klein's packed-trajectory unpack, image vs video decoded) is an
-overridable adapter method; these are the generic mechanics those methods call.
-
-Ported from the old engine's ``response.py`` helpers, minus the model-family
-branches (those move to adapter overrides).
-"""
+"""Assemble ``Sample`` Part pieces (segment / decoded / conditions) from raw results."""
 
 from __future__ import annotations
 
@@ -41,12 +32,7 @@ def collect_trajectory_latents(results: Sequence[RawResult]) -> torch.Tensor:
 
 
 def collect_aux_trajectory_latents(results: Sequence[RawResult]) -> Optional[torch.Tensor]:
-    """Concat per-result AUXILIARY trajectory latents (LTX-2 audio) on the batch dim.
-
-    Returns ``None`` when no result carries one (non-LTX-2 families); requires all
-    results to agree (present or absent) so a partial set never silently mis-aligns
-    the per-sample audio the trainside replay cross-attends to.
-    """
+    """Concat per-result AUXILIARY trajectory latents (LTX-2 audio) on the batch dim."""
     auxes = [getattr(r, "aux_trajectory_latents", None) for r in results]
     present = [a is not None for a in auxes]
     if not any(present):
@@ -63,17 +49,7 @@ def validate_packed_trajectory(
     downsample: int,
     require_divisible: bool = False,
 ) -> Tuple[int, int, int, int, int, int]:
-    """Validate a packed ``[B, T, S, C]`` denoising trajectory; return its dims.
-
-    Packed-token families (FLUX.2-Klein, Qwen-Image) receive the SGLang trajectory
-    as 4-D ``[B, T, S, C_packed]`` (``S`` patch tokens). Checks ``S`` against the patch
-    grid ``(height // downsample, width // downsample)`` and returns
-    ``(B, T, S, C_packed, h_pat, w_pat)`` so the caller can flatten and apply its own
-    model-specific unpack + reshape. The caller handles the 5-D image-form passthrough;
-    this raises if ``traj`` is not the expected 4-D packed rank. ``family`` only feeds
-    error messages; ``require_divisible`` rejects H/W not divisible by ``downsample``
-    (Klein) vs. silently flooring (Qwen).
-    """
+    """Validate a packed ``[B, T, S, C]`` denoising trajectory; return its dims."""
     require(
         traj.ndim == 4,
         f"{family}: packed trajectory must be 4-D [B, T, S, C]; got rank {traj.ndim}, shape {tuple(traj.shape)}.",
@@ -109,14 +85,7 @@ def derive_timestep_alignment(
     expected_sigmas: torch.Tensor,
     results: Sequence[RawResult],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Validate the T+1 trajectory shape and verify SGLang used the σ we sent.
-
-    ``expected_sigmas`` is the schedule the engine pinned on the gen Part's ``sigmas``
-    and forwarded to SGLang; SGLang echoes it back per result via
-    ``trajectory_timesteps``. :func:`verify_engine_used_sigmas` asserts elementwise
-    equality (fatal on drift) so rollout and trainer-side replay use numerically
-    identical σ schedules.
-    """
+    """Validate the T+1 trajectory shape and verify SGLang used the σ we sent."""
     traj_len = int(trajectories_tensor.shape[1])
     expected_len = int(expected_sigmas.shape[0])
     require(
@@ -149,17 +118,7 @@ def build_latent_segment(
     segment_factory: Callable[..., LatentSegment] = make_image_segment,
     aux_trajectory: Optional[torch.Tensor] = None,
 ) -> LatentSegment:
-    """Pack an (already-unpacked) trajectory tensor into one batched ``LatentSegment``.
-
-    ``segment_factory`` selects the modality (default image); a video adapter
-    passes ``make_video_segment``. The caller owns the model-specific unpack of
-    ``trajectories_tensor`` (e.g. Klein); this function is shape-agnostic past
-    the T+1 invariant.
-
-    ``aux_trajectory`` (LTX-2 audio, ``[B, T+1, ...]``) — when present it is stored
-    as ``segment.aux_latents`` and column-trimmed in lockstep with the video latents
-    so ``aux_latents_at(step)`` and ``latents_at(step)`` index the same sparse steps.
-    """
+    """Pack an (already-unpacked) trajectory tensor into one batched ``LatentSegment``."""
     sigmas, step_indices = derive_timestep_alignment(
         trajectories_tensor=trajectories_tensor,
         expected_sigmas=expected_sigmas,
@@ -219,15 +178,7 @@ def _native_sde_logp(
     num_steps: int,
     sde_indices: Optional[List[int]],
 ) -> Optional[torch.Tensor]:
-    """Best-effort extract of SGLang's native ``trajectory_log_probs`` into ``[B, S]``.
-
-    Returns ``None`` when any result lacks per-step log-probs and lets the
-    trainer decide: replay (``algorithm.old_logp_source='replay'``) recomputes;
-    native raises trainer-side with an actionable message. The engine stays
-    silent — it can't know the intent, and for an intentional replay run a
-    missing emission is expected, not warning-worthy. Shape drift, by contrast,
-    is a hard error.
-    """
+    """Best-effort extract of SGLang's native ``trajectory_log_probs`` into ``[B, S]``."""
     per_result: List[Optional[torch.Tensor]] = [
         result.trajectory_log_probs.detach().cpu() if result.trajectory_log_probs is not None else None
         for result in results
@@ -256,16 +207,7 @@ def pack_decoded_images(
     *,
     squeeze_single_frame_4d: bool = True,
 ) -> Optional[Images]:
-    """Pack per-result decoded ``samples`` into an ``Images`` batch.
-
-    Image-output adapters may opt into squeezing a singleton temporal axis
-    ``[C, T=1, H, W]`` back to ``[C, H, W]``. Video-family adapters that still
-    run through the legacy image path should disable this so a true single-frame
-    video is dropped like any other 4-D video sample. Multi-frame 4-D samples are
-    dropped with a warning either way (no Videos packing on the image track).
-    Each decoded image is packed independently, so mixed spatial resolutions are
-    preserved safely.
-    """
+    """Pack per-result decoded ``samples`` into an ``Images`` batch."""
     per_sample_tensors: List[torch.Tensor] = []
     skipped_video = False
     for result in results:
@@ -293,19 +235,7 @@ def pack_decoded_images(
 
 
 def stack_decoded_videos(results: Sequence[RawResult]) -> Optional[Videos]:
-    """Pack per-result decoded video ``samples`` into a ragged ``Videos`` batch.
-
-    The video counterpart of :func:`pack_decoded_images`. ``decode_sample``
-    returns canonical channels-first video ``[C, T, H, W]`` (see
-    :func:`unirl.rollout.engine.sglang_diffusion.utils.tensors.normalize_media`);
-    the :class:`~unirl.types.primitives.Video` primitive — and the video reward
-    consumer (``video_pickscore``, which permutes ``frames[T,C,H,W] → [C,T,H,W]``)
-    — want frame-major ``[T, C, H, W]``, so we permute before packing.
-    ``Videos.from_list`` concatenates along T and lets the Batch framework
-    compute the per-sample ``cu_frames`` offsets. Each result carries exactly
-    one decoded sample (mirrors :func:`pack_decoded_images`'s one-per-result
-    contract). Returns ``None`` when no recognizable video was produced.
-    """
+    """Pack per-result decoded video ``samples`` into a ragged ``Videos`` batch."""
     videos: List[Video] = []
     for result in results:
         canonical = decode_sample(result.samples)
@@ -324,15 +254,7 @@ def stack_decoded_videos(results: Sequence[RawResult]) -> Optional[Videos]:
 
 
 def _cat_padded_rows(tensors: List[torch.Tensor]) -> torch.Tensor:
-    """dim-0 concat tolerating per-result seq-len (dim-1) differences.
-
-    Variable-length text encoders (Qwen-VL) pad each server request to its own
-    batch max, so chunked generates ship different seq lens per result.
-    Right-pad dim 1 with zeros to the cross-result max — exactly the server's
-    own zero-pad convention, and the parallel attention mask (padded the same
-    way) keeps real-vs-pad explicit. Fixed-length encoders (SD3's CLIP/T5)
-    always agree on dim 1 and concat unchanged.
-    """
+    """dim-0 concat tolerating per-result seq-len (dim-1) differences."""
     if len(tensors) == 1:
         return tensors[0]
     lens = {int(t.shape[1]) for t in tensors}
@@ -355,21 +277,7 @@ def _aligned_mask(
     *,
     allow_pad: bool = False,
 ) -> Optional[torch.Tensor]:
-    """Fuse + mount an attention mask only when it aligns with the fused embeds.
-
-    The engine emits the model's embeds-aligned ``prompt_embeds_mask`` (the mask the
-    server's DiT itself attended under). Mount it only when its token axis (dim 1)
-    matches the fused embeds: Qwen-Image's single-encoder mask matches and flows to
-    replay; SD3's per-encoder mask fuses longer than the merged embeds, so it is
-    dropped (SD3's ``predict_noise`` ignores the mask — dropping a mismatched mask
-    is the safe, correct result and avoids padding the embeds up to a spurious
-    length, the historic ~68x LoRA-gradient dilution).
-
-    For Qwen-Image-Edit-Plus the text encoder emits prompt_embeds that include
-    image-placeholder tokens (longer than the text-only attention mask). The
-    extra positions are all valid (image tokens the DiT attends to), so pad the
-    mask with ones up to the embeds seq-len instead of dropping it.
-    """
+    """Fuse + mount an attention mask only when it aligns with the fused embeds."""
     if not mask_list or embeds_cat is None:
         return None
     mask_cat = _cat_padded_rows(mask_list)
@@ -401,14 +309,7 @@ def fuse_text_conditions(
     *,
     allow_mask_pad: bool = False,
 ) -> Tuple[Optional[TextEmbedCondition], Optional[TextEmbedCondition]]:
-    """Fuse per-result encoder outputs into ``text`` + optional ``negative_text``.
-
-    Returns ``(text_cond, neg_text_cond)``; either may be ``None`` when the
-    corresponding source field was missing across all results (e.g. no CFG → no
-    negative branch). Concat is dim-0 across results; token-axis (dim-1)
-    differences between results are zero-padded to the max
-    (:func:`_cat_padded_rows`) with the attention masks padded in lockstep.
-    """
+    """Fuse per-result encoder outputs into ``text`` + optional ``negative_text``."""
     prompt_embeds_list: List[torch.Tensor] = []
     pooled_list: List[torch.Tensor] = []
     mask_list: List[torch.Tensor] = []

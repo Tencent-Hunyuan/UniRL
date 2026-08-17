@@ -1,51 +1,4 @@
-"""RL-aware Qwen-Image pipeline subclass.
-
-``forward`` follows the RL interception protocol (see
-``pipelines/_shared/interception.py``): **install** (once) → **arm** (every
-request) → run (upstream) → **harvest**. The interceptions, mapped to
-upstream's stages (``vllm_omni/diffusion/models/qwen_image/pipeline_qwen_image.py``):
-
-- SDE scheduler swap (the behavior policy + dense-trajectory recorder) in
-  place of the upstream ``FlowMatchEulerDiscreteScheduler``, installed
-  regardless of eta (at eta=0 it degenerates to pure Euler ODE). Upstream's
-  ``prepare_timesteps`` reads the dynamic-shift μ constants
-  (``base_image_seq_len`` / ``max_shift`` / …) off ``self.scheduler.config``
-  and calls ``set_timesteps(sigmas=..., mu=mu)`` — both survive the swap:
-  ``from_config`` preserves the config keys and our scheduler accepts ``mu``
-  while treating externally pinned σ as final values.
-- A conditioning **tap** on ``encode_prompt`` capturing
-  ``(prompt_embeds, prompt_embeds_mask)`` for the trainer-side
-  ``QwenImageConditions.text``. Upstream calls ``encode_prompt`` once for
-  the positive prompt and a second time only under ``do_true_cfg``
-  (``_prepare_generation_context``) — the tap routes call 1 to the positive
-  slot and call 2 to the negative slot.
-- An initial-noise **injection** through the ``prepare_latents`` override —
-  the driver-authored x_T (batch slice or recipe) replaces upstream's RNG
-  draw. Unlike SD3, the injected tensor must be **packed** first: upstream's
-  ``latents is not None`` early-return hands the tensor straight to the
-  denoise loop, which runs in the transformer's patchified
-  ``[B, S, C*4]`` layout.
-
-Packed-latent boundary
-----------------------
-The whole upstream denoise loop — and therefore every latent our SDE
-scheduler records — lives in packed ``[B, S, C*4]`` space, while the
-driver/trainer contract (``LatentSegment.latents``, the x_T recipe, the
-trainside ``models/qwen_image/diffusion.py`` replay) is the spatial
-``[B, C, H, W]`` shape. This subclass owns both crossings: it packs the
-driver's x_T before injection and unpacks the harvested trajectory back to
-``[B, T+1, C, H, W]`` (upstream's ``_unpack_latents`` emits a 5D
-``[B, C, 1, H, W]`` video-VAE shape; the singleton frame dim is squeezed).
-
-Everything else — prompt encoding (Qwen2.5-VL chat template + 34-token
-prefix strip), latent prep, the dynamic-shift timestep build, the diffusion
-loop (norm-corrected true CFG when armed), VAE decode — is handled by
-upstream's ``forward``.
-
-This class is loaded inside vLLM-Omni's worker subprocess via
-``custom_pipeline_args.pipeline_class`` injected from
-``stage_configs/qwen_image_t2i_rl.yaml``.
-"""
+"""RL-aware Qwen-Image pipeline subclass."""
 
 from __future__ import annotations
 
@@ -85,25 +38,13 @@ class RLQwenImagePipeline(QwenImagePipeline):
         self._harvest_hw: Optional[Tuple[int, int]] = None
 
     def _install_sde_scheduler(self) -> None:
-        """Swap in the trajectory-capturing SDE scheduler (the from_config
-        path keeps the dynamic-shift config keys ``prepare_timesteps`` reads
-        for μ). Always installed, even for eta=0 flows (NFT) — per-request
-        eta rides ``_arm_sde``."""
+        """Swap in the trajectory-capturing SDE scheduler via ``from_config``; always installed, even at eta=0."""
         if isinstance(self.scheduler, FlowMatchSDEDiscreteScheduler):
             return
         self.scheduler = make_sde_scheduler(self._upstream_scheduler.config)
 
     def _install_conditioning_tap(self) -> None:
-        """Wrap ``encode_prompt`` to capture the text conditioning.
-
-        Upstream returns ``(prompt_embeds, prompt_embeds_mask)`` — the
-        Qwen2.5-VL last hidden states after the chat-template prefix strip
-        plus the matching attention mask (variable-length per prompt; no
-        pooled vector exists for Qwen-Image). Call routing per request:
-        the first call fills the positive slot, the second (fired by
-        upstream only under ``do_true_cfg``) the negative slot; later calls
-        are observed but not recorded.
-        """
+        """Wrap ``encode_prompt`` to capture the text conditioning."""
         if self._conditioning_tap_installed:
             return
 
@@ -133,9 +74,7 @@ class RLQwenImagePipeline(QwenImagePipeline):
         self.scheduler.arm(eta=eta, sde_indices=extra.get("sde_indices"))
 
     def _arm_initial_noise(self, req: OmniDiffusionRequest) -> None:
-        """This request's driver-authored x_T (batch slice or recipe row),
-        still in the spatial ``[1, C, H, W]`` shape — packing happens at the
-        injection point where upstream's grid geometry is in hand."""
+        """This request's driver-authored x_T, still spatial ``[1, C, H, W]``; packing happens at injection."""
         self._pending_initial_noise = resolve_request_noise(req, caller="RLQwenImagePipeline._arm_initial_noise")
 
     def _arm_conditioning_tap(self) -> None:
@@ -145,12 +84,7 @@ class RLQwenImagePipeline(QwenImagePipeline):
     # run-phase interception — upstream-called name, cannot be renamed
 
     def prepare_latents(self, *args, **kwargs):  # type: ignore[override]
-        """Initial-noise injection point: bypass upstream RNG when the driver
-        supplied an x_T. Upstream's ``latents is not None`` early-return
-        skips both the RNG draw and the packing, so the driver's spatial
-        ``[B, C, H, W]`` noise is packed here first (the denoise loop runs
-        in the transformer's ``[B, S, C*4]`` patch layout). Consume-once.
-        """
+        """Initial-noise injection: the driver's ``[B, C, H, W]`` x_T is packed to ``[B, S, C*4]``. Consume-once."""
         noise = self._pending_initial_noise
         if noise is not None:
             self._pending_initial_noise = None
@@ -158,13 +92,7 @@ class RLQwenImagePipeline(QwenImagePipeline):
         return super().prepare_latents(*args, **kwargs)
 
     def _pack_pending_noise(self, noise: torch.Tensor, args: tuple) -> torch.Tensor:
-        """Spatial ``[B, C, h, w]`` x_T → packed ``[B, S, C*4]``, validated
-        against the call site's grid geometry. Upstream calls
-        ``prepare_latents(batch_size, num_channels_latents, height, width,
-        dtype, device, generator, latents)`` with all args positional and
-        pixel-space H/W; the latent grid is ``2 * (px // (vae_sf * 2))``
-        per side (the divisible-by-2 packing constraint).
-        """
+        """Spatial ``[B, C, h, w]`` x_T → packed ``[B, S, C*4]``, validated against the call site's grid geometry."""
         if len(args) < 4:
             raise RuntimeError(
                 "RLQwenImagePipeline._pack_pending_noise: expected upstream's "
@@ -191,14 +119,7 @@ class RLQwenImagePipeline(QwenImagePipeline):
             out.trajectory_latents = self._unpack_trajectory(out.trajectory_latents)
 
     def _unpack_trajectory(self, packed: torch.Tensor) -> torch.Tensor:
-        """Packed ``[B, T+1, S, C*4]`` trajectory → spatial
-        ``[B, T+1, C, H, W]`` (the trainer's ``LatentSegment`` shape).
-
-        Upstream's ``_unpack_latents`` takes pixel H/W and returns the 5D
-        video-VAE shape ``[N, C, 1, h, w]``; the singleton frame dim is
-        squeezed out to match the trainside spatial convention
-        (``models/qwen_image/diffusion.py`` keeps ``[B, K, C, H, W]``).
-        """
+        """Packed ``[B, T+1, S, C*4]`` trajectory to spatial ``[B, T+1, C, H, W]``, the ``LatentSegment`` shape."""
         if self._harvest_hw is None:
             raise RuntimeError(
                 "RLQwenImagePipeline._unpack_trajectory: no stashed H/W — forward() did not run before harvest."

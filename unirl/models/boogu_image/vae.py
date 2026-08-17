@@ -1,24 +1,4 @@
-"""BooguImageVAEDecodeStage — LatentSegment → Images via VAE decode.
-
-Implements ``DecodeStage[LatentSegment, Images]``. Reads the final stored
-position from ``LatentSegment.latents[:, -1]`` (``BooguImageDiffusionStage``
-always stores position ``T``, the clean latent), runs the ``AutoencoderKL``
-decode in fp32, and normalizes the output from ``[-1, 1]`` to ``[0, 1]``
-before wrapping in ``Images``.
-
-Boogu-Image uses the FLUX.1 16-channel ``AutoencoderKL`` with both
-``scaling_factor`` (0.3611) and ``shift_factor`` (0.1159) — identical VAE
-family to z_image/SD3. The latent un-normalization mirrors the reference
-``processing`` tail (pipeline_boogu.py:3681-3686):
-``x = latent / scaling_factor + shift_factor``.
-
-Documented divergence from the reference: no bilinear resize of the decoded
-image back to the pre-floor request size (pipeline_boogu.py:2939) — recipes
-must use ``height``/``width`` ≡ 0 (mod 16), which makes the resize a no-op.
-
-No ``BooguImageVAEEncodeStage`` here — Base is text-to-image only; the
-encoder path lands with the Edit (TI2I) variant.
-"""
+"""BooguImageVAEDecodeStage — LatentSegment → Images via VAE decode."""
 
 from __future__ import annotations
 
@@ -40,19 +20,7 @@ class BooguImageVAEDecodeStage(DecodeStage[LatentSegment, Images]):
         self.bundle = bundle
 
     def decode(self, s: LatentSegment, *, grad: bool = False, activation_checkpoint: bool = False) -> Images:
-        """Decode the final-step latents in *s* into pixel images.
-
-        Reads ``s.latents[:, -1]`` (the final stored position, which is
-        ``T`` — the clean latent ``x_0`` in spatial shape ``[B, C, H, W]``).
-        VAE forward runs in fp32 (the FLUX.1 VAE declares ``force_upcast``);
-        output is clamped to ``[0, 1]`` before being wrapped in ``Images``.
-
-        ``grad=False`` (default) keeps the rollout path under ``torch.no_grad()``.
-        ``grad=True`` (ReFL direct-reward backprop) runs the decode WITH grad so it
-        flows from the reward through the frozen VAE into ``clean``; the VAE has no
-        trainable params, so only ``clean``'s graph is extended. ``activation_checkpoint``
-        (grad only) recomputes the decode in backward to trade compute for memory.
-        """
+        """Decode the final-step latents in *s* into pixel images."""
         if self.bundle.vae is None:
             raise RuntimeError(
                 "BooguImageVAEDecodeStage.decode: no VAE loaded (load_vae=False). "

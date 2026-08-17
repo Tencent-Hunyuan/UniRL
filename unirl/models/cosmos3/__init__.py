@@ -1,8 +1,4 @@
-"""Cosmos3 (NVIDIA omnimodal world model) SFT support.
-
-CPU-importable package top: the diffusers>=0.39 runtime imports live inside
-``Cosmos3Bundle.from_config`` / ``Cosmos3JointStage.__init__`` bodies.
-"""
+"""Cosmos3 omnimodal world-model SFT support."""
 
 from unirl.models.cosmos3.bundle import Cosmos3Bundle
 from unirl.models.cosmos3.conditions import Cosmos3SFTCondition

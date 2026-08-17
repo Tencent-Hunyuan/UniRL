@@ -1,22 +1,4 @@
-"""In-process monkey-patch installer for stock-upstream sglang diffusion (LIN-365).
-
-Mirrors ``unirl/rollout/engine/vllm_omni/vllm_patches.py``: a
-spawn-propagating hijack that re-hosts the ``sglang-drl`` fork's RL additions on
-top of stock upstream sglang, so UniRL can track upstream instead of
-carrying a hard fork.
-
-Why direct setattr/REPLACE (not sglang's HookRegistry): the diffusion
-scheduler/worker runs under forced spawn
-(``diffusion_generator.py: mp.set_start_method("spawn", force=True)``) and the
-diffusion path never calls srt ``load_plugins()``, so the official
-``HookRegistry`` is not wired in. A parent-only patch would silently no-op in
-the worker; ``wrap_mp_process_for_children`` propagates the install into every
-spawn child instead.
-
-Install once when the native backend boots -- BEFORE importing
-``DiffGenerator`` (which forces spawn at import) and before ``from_pretrained``
-spawns the scheduler. Idempotent; safe to call from both parent and child.
-"""
+"""In-process monkey-patch installer for stock-upstream sglang diffusion."""
 
 from __future__ import annotations
 
@@ -27,11 +9,7 @@ logger = logging.getLogger(__name__)
 
 
 class _DiffrlPatchedTarget:
-    """Pickleable wrapper that installs sglang patches in a spawn child first.
-
-    Must be module-level so spawn's pickler can serialise the wrapped target
-    across the process boundary (closures cannot be pickled).
-    """
+    """Pickleable wrapper that installs sglang patches in a spawn child first."""
 
     def __init__(self, target):
         self._target = target
@@ -68,12 +46,7 @@ _WRAP_SENTINEL = "_unirl_sglang_target_wrapped"
 
 
 def wrap_mp_process_for_children() -> None:
-    """Replace ``BaseProcess.__init__`` so spawned targets install patches first.
-
-    All mp-context Process classes (incl. the ``SpawnProcess`` the diffusion
-    scheduler uses) inherit from ``BaseProcess``, so patching the root catches
-    every context in one shot. Idempotent via ``_WRAP_SENTINEL``.
-    """
+    """Replace ``BaseProcess.__init__`` so spawned targets install patches first."""
     if getattr(_MpBaseProcess, _WRAP_SENTINEL, False):
         return
 
@@ -106,12 +79,7 @@ def wrap_mp_process_for_children() -> None:
 
 
 def _safe_apply(patch_fn) -> None:
-    """Apply one patch; log-and-skip if its upstream target is unavailable.
-
-    Patches are import-safe and idempotent, so a target missing in a given
-    interpreter (e.g. a CPU-only unit-test process importing only the rollout
-    math) must not abort the remaining patches.
-    """
+    """Apply one patch; log-and-skip if its upstream target is unavailable."""
     try:
         patch_fn()
     except Exception as exc:  # pragma: no cover - environment dependent

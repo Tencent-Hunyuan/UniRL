@@ -1,39 +1,4 @@
-"""BagelDiffusionConditions — per-sample KV-cache contexts for the Bagel stage.
-
-Bagel differs from SD3 / HunyuanImage3: its conditioning is not a dense encoded
-tensor but a set of prebuilt KV-cache contexts produced by running the prompt
-through the und path. The trainside (A1) diffusion stage delegates sampling /
-replay to the vendored ``generate_image`` / ``_forward_flow``, which consume these
-contexts directly, so this container holds them as opaque, **per-sample**, in-process
-values (trainside only — they are not transported across worker pools).
-
-Three contexts mirror flow_grpo's inferencer, one entry per sample (Bagel is
-``bs=1`` per ``_forward_flow`` call, so a batch is a *list* of per-sample
-contexts, not a stacked tensor):
-
-- ``gen_contexts[i]``      : prompt context (conditional branch) — required
-- ``cfg_text_contexts[i]`` : unconditional context (text-CFG branch)
-- ``cfg_img_contexts[i]``  : image-CFG context
-- ``image_shapes[i]``      : (H, W) for sample i
-
-These are ``concat_field`` lists so :meth:`Part.slice` / ``concat`` /
-``select`` (which the train stack drives per micro-batch) re-index them per sample
-exactly like SD3's tensor conditions — the framework's list-field machinery
-(``_slice_value`` / ``_concat_value``) handles arbitrary objects (each opaque
-context is one list element).
-
-``Condition`` subclass so it is a valid ``Part.conditions`` dict value;
-``to_dict`` emits it under a single ``"bagel"`` key, ``from_dict`` reads it back.
-
-Replay approximation (frozen contexts): the contexts are prefilled under
-``no_grad`` at rollout and reused verbatim by ``replay``. For T2I this is exact
-w.r.t. training — the text prefill routes through the frozen und experts. For
-it2i (editing) the input-image VAE prefill routes through the GEN experts
-(``mode="gen"``, vendor bagel.py:528-534) — the LoRA-trained surface — so the
-stored contexts carry no gradient and go stale across optimizer updates. Ratio
-consistency still holds because old and new log-probs replay against the SAME
-stored contexts; this matches the standard frozen-context treatment.
-"""
+"""BagelDiffusionConditions — per-sample KV-cache contexts for the Bagel stage."""
 
 from __future__ import annotations
 
@@ -47,29 +12,7 @@ from unirl.types.conditions.base import Condition, Modality
 
 @dataclass
 class BagelARConditions(Condition):
-    """Per-sample RAW prompt material for the Bagel AR (text-out) stage.
-
-    Unlike :class:`BagelDiffusionConditions` (opaque prefilled KV contexts —
-    valid because the diffusion path trains only the gen experts while the
-    prompt prefill rides the frozen und path), the AR stage trains the und path
-    itself: replay needs gradients THROUGH the prompt prefill, so an opaque
-    no-grad cache cannot be the source of truth. Both ``autoregress`` and
-    ``replay`` re-derive the context from the same stored splits via the same
-    ``rl_ops`` prefill functions — prefix K/V parity by construction.
-
-    ``prompt_splits[i]`` is the ordered list of split descriptors for sample i:
-
-    - ``{"kind": "text", "ids": LongTensor[k]}`` — final token ids INCLUDING the
-      ``bos``/``eos`` (``<|im_start|>``/``<|im_end|>``) wrap that the vendored
-      ``prepare_prompts`` applies, so replay is tokenizer-independent.
-    - ``{"kind": "vit", "image": FloatTensor[3, H, W]}`` — the ``vit_transform``
-      output (final preprocessed pixels), ingested ViT-only (understanding path).
-
-    Covers t2t ``[text]``, i2t ``[vit]``, it2t ``[vit, text]`` and arbitrary
-    future interleaves. ``concat_field`` lists so ``Part.slice`` /
-    ``concat`` / ``select`` re-index per sample, exactly like the diffusion
-    conditions.
-    """
+    """Per-sample RAW prompt material for the Bagel AR (text-out) stage."""
 
     modality: ClassVar[Modality] = Modality.TEXT
 
@@ -123,11 +66,7 @@ class BagelDiffusionConditions(Condition):
         return len(self.gen_contexts) or len(self.prompts)
 
     def has_contexts(self) -> bool:
-        """True when opaque KV contexts are present (trainside / colocate path).
-
-        False for the deferred-prompt (vllm_omni) path, where the stage must
-        rebuild the KV contexts from :attr:`prompts` on its own bundle.
-        """
+        """True when opaque KV contexts are present (trainside / colocate path)."""
         return bool(self.gen_contexts) and self.gen_contexts[0] is not None
 
     @classmethod
@@ -140,11 +79,7 @@ class BagelDiffusionConditions(Condition):
         cfg_img_context: Optional[Any] = None,
         prompt: Optional[str] = None,
     ) -> "BagelDiffusionConditions":
-        """Build a single-sample conditions (1-element lists).
-
-        The pipeline calls this per prompt, then concatenates the per-sample
-        instances into the batched track conditions.
-        """
+        """Build a single-sample conditions (1-element lists)."""
         if gen_context is None:
             raise ValueError("BagelDiffusionConditions.for_sample: gen_context is required.")
         if image_shape is None or len(image_shape) != 2:
@@ -160,13 +95,7 @@ class BagelDiffusionConditions(Condition):
         )
 
     def single(self) -> Tuple[Any, Any, Any, Tuple[int, int]]:
-        """Return ``(gen, cfg_text, cfg_img, image_shape)`` for a 1-sample batch.
-
-        The diffusion stage runs one prompt per ``_forward_flow`` call (navit
-        ``bs=1``), so it consumes conditions one sample at a time (the train stack
-        slices to ``micro_batch_size=1``). CFG contexts fall back to ``gen`` when
-        absent (CFG-off). Raises if the batch isn't exactly one sample.
-        """
+        """Return ``(gen, cfg_text, cfg_img, image_shape)`` for a 1-sample batch."""
         require(
             self.batch_size == 1,
             f"BagelDiffusionConditions.single: expected exactly 1 sample (navit bs=1; "
@@ -186,12 +115,7 @@ class BagelDiffusionConditions(Condition):
         return gen, cfg_text, cfg_img, image_shape
 
     def single_prompt(self) -> Tuple[str, Tuple[int, int]]:
-        """Return ``(prompt, image_shape)`` for a 1-sample deferred-prompt batch.
-
-        Used by the vllm_omni path: the stage rebuilds the three KV contexts from
-        this prompt on its own bundle. Raises if the batch isn't exactly one
-        sample or no prompt is present.
-        """
+        """Return ``(prompt, image_shape)`` for a 1-sample deferred-prompt batch."""
         require(
             self.batch_size == 1,
             f"BagelDiffusionConditions.single_prompt: expected exactly 1 sample "
@@ -207,12 +131,7 @@ class BagelDiffusionConditions(Condition):
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "BagelDiffusionConditions":
-        """Read the conditions back from a ``Part.conditions`` dict.
-
-        Accepts the canonical ``{"bagel": <BagelDiffusionConditions>}`` shape that
-        :meth:`to_dict` emits (already an instance, possibly sliced by the train
-        stack). Raises otherwise.
-        """
+        """Read the conditions back from a ``Part.conditions`` dict."""
         bagel = d.get("bagel")
         if isinstance(bagel, cls):
             return bagel
@@ -222,11 +141,7 @@ class BagelDiffusionConditions(Condition):
         )
 
     def to_dict(self) -> Dict[str, Any]:
-        """Emit as a single ``"bagel"`` entry for ``Part.conditions``.
-
-        The whole container is one ``Condition`` dict value; the train stack's
-        ``slice`` / ``concat`` re-index its per-sample lists alongside the segment.
-        """
+        """Emit as a single ``"bagel"`` entry for ``Part.conditions``."""
         return {"bagel": self}
 
 

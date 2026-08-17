@@ -1,10 +1,4 @@
-"""Deferred-ops bookkeeping for build-time structural injection.
-
-Injection functions (``inject_lora`` / ``inject_nft`` / ``inject_mirror``)
-mutate the nn.Module tree while it may still be on meta device and stamp
-``model._deferred_ops`` with post-materialize work.  A single call to
-:func:`apply_deferred_ops` drains them all — feature-agnostic.
-"""
+"""Deferred-ops bookkeeping for build-time structural injection."""
 
 from __future__ import annotations
 

@@ -1,5 +1,6 @@
 accelerate>=0.30
 aiohttp>=3.9
+av>=14.2,<19
 diffusers>=0.37.0
 easyocr>=1.7
 hydra-core>=1.3

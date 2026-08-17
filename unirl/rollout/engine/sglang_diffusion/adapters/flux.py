@@ -1,12 +1,4 @@
-"""FLUX-family image adapters: plain FLUX + FLUX.2-Klein.
-
-``FluxAdapter`` is the default image path (5-D passthrough). ``Flux2KleinAdapter``
-overrides ``build_segment`` (Klein emits packed ``[B, T, H*W, C]`` tokens, unpacked
-to image form before assembly) and the schedule policy, and serves BOTH t2i and
-text+image→image off one checkpoint — branching on ``Sample.has_image_input()``,
-like the trainside ``Flux2KleinPipeline``. The ti2i deltas are in ``build_prompts`` /
-``build_condition`` and no-op for t2i.
-"""
+"""FLUX-family image adapters: plain FLUX + FLUX.2-Klein."""
 
 from __future__ import annotations
 
@@ -51,14 +43,7 @@ class Flux2KleinAdapter(ImageAdapter):
         return self.model_config.build_schedule_policy()
 
     def build_prompts(self, sample: Sample) -> Dict[str, Any]:
-        """T2I payload, plus the source image when the request carries one.
-
-        Without an image, the inherited T2I payload verbatim. With one, resize
-        at this model boundary to the requested generation geometry, then send
-        the PIL through the ``condition_image`` sampling kwarg
-        (``patch_sampling_io`` indexes it per prompt). Upstream VAE-encodes it
-        into ``image_latent`` + ``condition_image_latent_ids``.
-        """
+        """T2I payload, plus the source image when the request carries one."""
         if not sample.has_image_input():
             return super().build_prompts(sample)
 
@@ -88,13 +73,7 @@ class Flux2KleinAdapter(ImageAdapter):
         return out
 
     def build_condition(self, results: List[RawResult]) -> Dict[str, Any]:
-        """Inherited text conditions, plus the ti2i source-image slots.
-
-        Emits ``image_latent`` (packed ``[B, N, 128]`` tokens) and ``image_latent_ids``
-        (4-axis RoPE ids ``[B, N, 4]``); ``predict_noise`` needs both. The ids are
-        captured, not recomputed — ``N`` alone does not give the ``h_pat × w_pat`` grid
-        and FLUX.2 never sets ``vae_image_sizes``. Both ``None`` for pure T2I.
-        """
+        """Inherited text conditions, plus the ti2i source-image slots."""
         cond_dict = super().build_condition(results)
         tokens = self._concat_condition_field(results, "image_latent")
         if tokens is None:
@@ -106,11 +85,7 @@ class Flux2KleinAdapter(ImageAdapter):
         return cond_dict
 
     def _concat_condition_field(self, results: List[RawResult], name: str) -> Optional[torch.Tensor]:
-        """Concat a per-result single-tensor conditions field over dim 0.
-
-        ``patch_conditions`` ships each field as a one-element list holding that
-        result's ``[1, N, ...]`` slice. ``None`` when no result carries it (T2I).
-        """
+        """Concat a per-result single-tensor conditions field over dim 0."""
         tensors: List[torch.Tensor] = []
         for r in results:
             value = getattr(r, name, None)
@@ -139,12 +114,7 @@ class Flux2KleinAdapter(ImageAdapter):
         sde_indices: Optional[List[int]],
         emit_native_logprob: bool,
     ):
-        """Collect, unpack Klein's packed ``[B, T, H*W, C]`` to image form, assemble.
-
-        5-D arrivals (image-form) skip the unpack. Condition tokens never enter the
-        recorded trajectory (SGLang keeps them in a separate ``latent_model_input``),
-        so this is identical for t2i and ti2i.
-        """
+        """Collect, unpack Klein's packed ``[B, T, H*W, C]`` to image form, assemble."""
         diffusion = sample.frontier_gen_part(DiffusionSamplingParams).sampling_params
         traj = utils.collect_trajectory_latents(results)
         if traj.ndim != 5:

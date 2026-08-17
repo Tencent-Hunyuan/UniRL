@@ -17,7 +17,7 @@ entrypoint's built-in `config_name` — a safe place to start.
 |---|---|---|---|
 | [`diffusion/`](diffusion/) | `python -m unirl.train_diffusion` | `diffusion/sd3/sd3_trainside` | `sd3`, `qwen_image`, `flux2_klein`, `wan21`, `wan22`, `hunyuan_video`, `hunyuan_video15` |
 | [`ar/`](ar/) | `python -m unirl.train_ar` | `ar/qwen_vl_grpo_geo3k_mc_4x8`, `ar/qwen3_drpo_4b_base_dapo_sglang` | `qwen_vl` (vision-language), `qwen3` (text-only) |
-| [`sft/`](sft/) | `python -m unirl.train_sft` | `sft/qwen3_sft` | `qwen3`, `qwen_vl`, `bagel`, `sd3`, `cosmos3` |
+| [`sft/`](sft/) | `python -m unirl.train_sft` | `sft/qwen3_sft` | `qwen3`, `qwen_vl`, `bagel`, `sd3`, `cosmos3`, `wan21` |
 | [`pe/`](pe/) | `python -m unirl.train_pe` | `pe/pe_trainside_pickscore` | `pe` (Qwen3 rewriter + SD3, PickScore/WISE reward) |
 | [`unified_model/`](unified_model/) | `python -m unirl.train_unified_model` | `unified_model/hi3_vllmomni` | `hi3` (HunyuanImage3, unified AR + diffusion) |
 
@@ -42,7 +42,7 @@ python -m unirl.train_diffusion --config-name=diffusion/sd3/sd3_trainside --cfg 
 # 1. Single node
 bash examples/run_experiment_single_node.sh diffusion/sd3/sd3_trainside
 ENTRY=train_ar bash examples/run_experiment_single_node.sh ar/qwen_vl_grpo_geo3k_mc_4x8
-ENTRY=train_sft bash examples/run_experiment_single_node.sh sft/validation/qwen3_agent_sft_lora
+ENTRY=train_sft bash examples/run_experiment_single_node.sh sft/qwen3_agent_sft_lora
 ENTRY=train_pe  bash examples/run_experiment_single_node.sh pe/pe_trainside_pickscore
 ENTRY=train_agentic bash examples/run_experiment_single_node.sh deep_research/deep_research_search_judge
 
@@ -65,6 +65,22 @@ To save and resume checkpoints and export them to Hugging Face, append the
 yet supported) — the full
 train → resume → export → upload lifecycle is in
 [Checkpointing](../unirl/trainer/README.md#checkpointing).
+
+## WAN2.1 UCF-101 full-transformer SFT
+
+[`sft/wan21_t2v_ucf101_full`](sft/wan21_t2v_ucf101_full.yaml) performs full
+WAN2.1 transformer finetuning from caption/target-video manifests on an
+18-class UCF-101 sports/action subset.
+
+See [`datasets/ucf101/README.md`](../datasets/ucf101/README.md) for the exact
+download location, expected directory layout, cooking command, manifest
+format, and training command.
+
+The UCF-101 run used 2,367 training videos and 128 held-out videos, 17 frames at
+256x448, global batch 8, learning rate `2e-6`, and 300 optimizer steps on one
+8xH20 node. Deterministic held-out eval loss improved from `0.21981` at
+initialization to a best `0.16230` at step 260 (-26.2%), finishing at `0.16264`
+at step 300.
 
 ## Reading a recipe name
 

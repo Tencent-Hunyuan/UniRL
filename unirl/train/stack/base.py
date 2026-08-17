@@ -1,42 +1,4 @@
-"""Family-agnostic single-stage train stack.
-
-:class:`TrainStack` wraps one :class:`FSDPBackend` (training state: model +
-optimizer + scheduler + EMA) and one :class:`StageAlgorithm` (loss + backward
-against the bundle's trainable module) into a single-stage training driver. One
-stack = one training track.
-
-It owns the entire family-agnostic pipeline — device alignment, the π_old anchor
-freeze, the per-update micro-accumulation loop, EMA, metrics — and defers exactly
-ONE decision to an injected :class:`~unirl.train.stack.planner.MicroPlanner`
-(composition, not inheritance): how each update's samples are grouped into
-micro-batches. :class:`~unirl.train.stack.planner.CountPlanner` (the default)
-groups by fixed count; :class:`~unirl.train.stack.planner.TokenBudgetPlanner`
-packs by token budget. Swapping the strategy is a recipe-level ``micro_planner``
-block, no subclass.
-
-Sequencing per :meth:`train_track` call (one rollout)::
-
-    track, plans = micro_planner.arrange(track)  # reorder (if packing) + plan
-    prepare_segment(track, plans)                # once: freeze the π_old anchor
-    for micros in plans:                         # num_updates_per_batch updates
-        _run_update(track, micros=micros)        # one optimizer step each
-    on_rollout_end()                             # once: EMA / rollout boundary
-
-**Sort-then-slice.** Variable-length packing wants to group samples of similar
-length, which would normally force arbitrary index lists threaded through the
-whole pipeline. Instead the planner *reorders the track once up front* (length-sort
-within each update, see :meth:`~unirl.train.stack.planner.TokenBudgetPlanner.arrange`)
-so every micro is again a **contiguous** ``(start, end)`` range — exactly the
-count-based geometry. The stack therefore only ever slices, and the anchor
-reassembly is a plain ordered ``cat``; all packing-specific logic lives in the
-planner (a no-op for :class:`~unirl.train.stack.planner.CountPlanner`).
-
-``num_updates_per_batch`` partitions the rollout batch into that many disjoint
-updates and runs one optimizer step per update — the FlowGRPO / DanceGRPO
-schedule. Because ``prepare_segment`` captures the pre-update policy once, every
-update shares the same PPO anchor; this is only correct for algorithms with
-``supports_multi_update`` (the ctor enforces it). Defaults to 1.
-"""
+"""Family-agnostic single-stage train stack."""
 
 from __future__ import annotations
 
@@ -76,13 +38,7 @@ class TrainStepResult:
 
 
 def _aggregate_update_results(results: List["TrainStepResult"]) -> "TrainStepResult":
-    """Collapse one rollout's per-update results into a single summary.
-
-    Scalars are averaged across the N optimizer steps (``lr`` is the last,
-    post-step value), ``micros`` are concatenated, and algorithm metrics are
-    averaged via :func:`aggregate_numeric_metrics`. Downstream logging then treats
-    the whole rollout as one point, exactly as in the single-update path.
-    """
+    """Collapse one rollout's per-update results into a single summary."""
     if len(results) == 1:
         return results[0]
     n = len(results)
@@ -100,19 +56,7 @@ def _aggregate_update_results(results: List["TrainStepResult"]) -> "TrainStepRes
 
 
 def _align_track_to_model(part: Part, *, device: torch.device) -> None:
-    """Move a track's training inputs onto the model's device — SGLang returns them
-    on CPU via Ray IPC. Uses :meth:`Batch.to_device` (recursive; carries
-    framework-managed ``_packed_cu_seqlens`` and tensors nested in tuples/dicts) on
-    the segment + conditions only, so heavy ``decoded`` / ``media_preview`` payloads
-    stay off the GPU. dtype is left to the model, which casts what it feeds the
-    network (see SD3DiffusionStep.predict_noise).
-
-    Condition values are moved via ``_move_value`` (the same recursive mover
-    ``Batch.to_device`` uses) rather than assuming each value is a ``Batch``: most
-    are (e.g. ``TextTokenCondition``), but multimodal stages also carry raw
-    per-sample ``FieldKind.CONCAT`` lists of tensors (Qwen2.5-VL's ``pixel_values``
-    / ``image_grid_thw``), which have no ``.to_device`` of their own — ``_move_value``
-    handles Batch / tensor / list / dict / None uniformly."""
+    """Move a track's training inputs onto the model's device — SGLang returns them"""
     if part.segment is not None:
         part.segment = part.segment.to_device(device)
     part.conditions = {k: _move_value(v, device) for k, v in part.conditions.items()}
@@ -121,18 +65,7 @@ def _align_track_to_model(part: Part, *, device: torch.device) -> None:
 
 
 class TrainStack(Remote):
-    """Single-stage stage-driven train stack — family-agnostic.
-
-    One stage only — no track-name dict, no optional-track semantics, no multi-track
-    on_rollout_end fan-out. The ONLY family-varying decision — micro-batch grouping —
-    is delegated to an injected ``micro_planner`` (count-based vs token-budget);
-    everything else is shared. Defaults to
-    :class:`~unirl.train.stack.planner.CountPlanner` (the historical diffusion
-    behaviour), so the 60+ count-based configs need no ``micro_planner`` block.
-
-    Created as a sibling ``Remote`` inside a placement block; takes handles to its
-    FSDPBackend and StageAlgorithm siblings via sibling-handle auto-resolve.
-    """
+    """Single-stage stage-driven train stack — family-agnostic."""
 
     def __init__(
         self,
@@ -167,25 +100,7 @@ class TrainStack(Remote):
         self.micro_planner.validate(algorithm)
 
     def prepare_segment(self, part: Part, *, plans: Plan) -> None:
-        """Freeze the π_old anchor once, before the ``num_updates_per_batch`` loop.
-
-        No-op if ``segment`` is None. If the algorithm does NOT replay the anchor
-        (``recomputes_anchor() == False`` — e.g. rollout GRPO), the anchor is the
-        rollout engine's own emission, so one full-segment call suffices. If it DOES
-        replay (replay GRPO; FlowDPPO always, for ``sde_means``), the recomputed
-        ``anchor_fields`` are computed at the SAME micro geometry training will use —
-        the contiguous ranges in ``plans`` (already aligned with the reordered track
-        from :meth:`~unirl.train.stack.planner.MicroPlanner.arrange`) — so the
-        old/new forwards match bf16-element-for-element on those fields. Concretely,
-        the on-policy PPO ratio is exactly 1 only where ``sde_logp`` is replayed
-        (replay GRPO, or FlowDPPO under ``old_logp_source='replay'``), and the
-        on-policy KL is exactly 0 wherever ``sde_means`` is replayed (FlowDPPO
-        always). A single micro degenerates to one full-segment call; only the
-        algorithm's declared ``anchor_fields`` are re-sliced and reassembled (no
-        hardcoded field names). Because every micro is a contiguous range covering
-        the shard in order, the per-micro field chunks reassemble with a plain
-        ordered ``cat``.
-        """
+        """Freeze the π_old anchor once, before the ``num_updates_per_batch`` loop."""
         if part.segment is None:
             return
         algorithm = self.algorithm
@@ -222,16 +137,7 @@ class TrainStack(Remote):
         loss_weight: float = 1.0,
         prior_backward: bool = False,
     ) -> TrainStepResult:
-        """Run the micro ranges of a single update; step unless mid-window.
-
-        ``micros`` is one update's worth of ``(start, end)`` ranges produced by
-        :meth:`~unirl.train.stack.planner.MicroPlanner.arrange` so the forward
-        geometry matches the π_old anchor frozen by :meth:`prepare_segment`.
-
-        The keyword flags are :meth:`_run_window`'s internal mechanics
-        (``prior_backward``: whether an earlier part of the window backwarded);
-        the defaults are the plain one-step-per-call contract.
-        """
+        """Run the micro ranges of a single update; step unless mid-window."""
         if part.advantages is None and getattr(self.algorithm, "requires_advantages", True):
             raise ValueError(
                 f"{type(self).__name__}._run_update: part.advantages is None; "
@@ -334,22 +240,7 @@ class TrainStack(Remote):
         self.fsdp_backend.on_rollout_end()
 
     def _resolve_loss_scales(self, part: Part, *, micros: UpdatePlan) -> Tuple[List[float], Optional[float]]:
-        """Per-micro ``loss_scale`` factors for one optimizer step.
-
-        ``algorithm.loss_weighting`` selects the convention (see
-        :class:`~unirl.algorithms.StageAlgorithm`):
-
-        - ``"sample"``: micro's share of the update's samples. Sums to 1 per
-          rank; FSDP's DP-mean gradient reduction then yields the rank-mean of
-          shard means (exact global sample-mean, since DP_SCATTER shards are
-          equal-sized). Returns ``(scales, None)``.
-        - ``"token"``: ``micro_tokens * dp_world / global_tokens`` where
-          ``global_tokens`` is the valid-token count of the WHOLE optimizer
-          step, all-reduced across the training group. The ``* dp_world``
-          cancels FSDP's gradient averaging, so the update gradient equals the
-          full-batch token-mean regardless of micro packing or DP layout.
-          Returns ``(scales, global_tokens)``.
-        """
+        """Per-micro ``loss_scale`` factors for one optimizer step."""
         weighting = str(getattr(self.algorithm, "loss_weighting", "sample"))
         if weighting == "sample":
             update_total = sum(end - start for start, end in micros)
@@ -398,26 +289,12 @@ class TrainStack(Remote):
         return self.fsdp_backend.gradient_average_world_size()
 
     def _all_reduce_sums(self, values: List[float]) -> List[float]:
-        """SUM scalars over the backend's FSDP mesh (no-op single-rank).
-
-        Every rank must call this the same number of times per step — callers keep
-        the collective count rank-symmetric (micro plans are; DP_SCATTER shards are
-        equal-sized).
-        """
+        """SUM scalars over the backend's FSDP mesh (no-op single-rank)."""
         return self.fsdp_backend.all_reduce_loss_sums(values)
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
     def eval_track(self, part: Part) -> Dict[str, float]:
-        """Weighted forward-only loss over this shard; returns GLOBAL metrics.
-
-        Drives ``algorithm.evaluate_loss(conditions=..., segment=...) ->
-        (loss_sum, weight)`` micro-by-micro under ``torch.no_grad()`` with the
-        trainable module in eval mode (dropout off — the same loss the train
-        path optimizes, never a second implementation). Per-rank sums are
-        SUM-all-reduced, so every rank returns the identical global weighted
-        mean and the driver's collected dict is exact regardless of which
-        rank's value survives the merge.
-        """
+        """Weighted forward-only loss over this shard; returns GLOBAL metrics."""
         eval_fn = getattr(self.algorithm, "evaluate_loss", None)
         if not callable(eval_fn):
             raise TypeError(
@@ -458,28 +335,7 @@ class TrainStack(Remote):
         *,
         training_progress: float,
     ) -> TrainStepResult:
-        """Driver-callable: arrange → prepare → run updates → on_rollout_end.
-
-        One call = ONE optimizer step. A bare ``Part`` is the plain path; a
-        TUPLE of Parts is a gradient-accumulation window (the MOPD task cycle):
-        every part is prepared and backwarded at ``1/len(parts)`` on the same
-        never-stepped weights, and the single step sees the mean gradient of
-        the whole window. The window lives inside this one call, so a
-        checkpoint between calls can never split it. Tuple, not list — the
-        DP_SCATTER dispatcher recurses tuples element-wise (each part is
-        row-sharded), while lists are row-sliced as data.
-
-        Combines the steps so worker-side mutations (``segment.sde_logp`` populated
-        by ``prepare_segment``) flow into the subsequent update(s) without
-        round-tripping through the driver. Dispatched ``DP_SCATTER`` so each DP
-        worker receives its shard of every part; per-shard loss/grad_norm/metrics
-        merge back via ``pytree_merge``.
-
-        ``arrange`` reorders each shard (if packing) and builds the contiguous
-        plan; ``prepare_segment`` freezes the π_old anchor at that geometry;
-        ``num_updates_per_batch`` optimizer steps (single-part calls only) run
-        over disjoint updates; ``on_rollout_end`` runs once.
-        """
+        """Driver-callable: arrange → prepare → run updates → on_rollout_end."""
         window = parts if isinstance(parts, tuple) else (parts,)
         if not window:
             raise ValueError(f"{type(self).__name__}.train_track: empty accumulation window.")
@@ -499,9 +355,9 @@ class TrainStack(Remote):
                     micro_batch_size=self.micro_batch_size,
                 )
             )
-        from unirl.utils.profiling import profile_scope
+        from unirl.utils.profiling import profile_mode
 
-        profiler = self._train_step_profiler() if profile_scope() == "train" else None
+        profiler = self._train_step_profiler() if profile_mode() == "train" else None
         with profiler.record("train_track") if profiler is not None else nullcontext():
             if len(arranged) == 1:
                 part, plans = arranged[0]
@@ -515,12 +371,7 @@ class TrainStack(Remote):
         return result
 
     def _prepare_for_training(self, part: Part, *, plans: Plan) -> Part:
-        """Freeze this part's anchor in eval mode, then return the model to train mode.
-
-        Eval mode keeps train-time stochasticity (notably dropout) out of the
-        anchor forward; the gradient-bearing replay needs train mode so HF
-        gradient checkpointing, which is gated on ``self.training``, engages.
-        """
+        """Freeze this part's anchor in eval mode, then return the model to train mode."""
         self.fsdp_backend.model.eval()
         self.prepare_segment(part, plans=plans)
         part = self.algorithm.prepare_part(part)
@@ -528,20 +379,7 @@ class TrainStack(Remote):
         return part
 
     def _run_window(self, arranged: List[Tuple[Part, Plan]], *, training_progress: float) -> TrainStepResult:
-        """One optimizer step over an accumulation window of single-update parts.
-
-        Zero once, then per part: prepare its anchor and immediately backward its
-        micros at ``1/len(arranged)``. Preparing each part right before its own
-        backward keeps any per-part state the algorithm sets in ``prepare_part``
-        (DiffusionOPD's active teacher, which names the per-domain loss metric)
-        valid for that part's loss. Gradients are identical either way — no step
-        happens inside the window, so every part sees the same weights.
-
-        The (ZeRO-2) gradient sync is deferred to the final part's last micro and
-        the step runs once. The merged result reports the window-mean loss, the
-        stepping call's grad_norm, and the union of per-part metrics — per-domain
-        keys land side by side in one point.
-        """
+        """One optimizer step over an accumulation window of single-update parts."""
         m = len(arranged)
         self.fsdp_backend.zero_grad()
         results: List[TrainStepResult] = []
@@ -580,21 +418,10 @@ class TrainStack(Remote):
         plans: Plan,
         training_progress: float,
     ) -> TrainStepResult:
-        """Run ``num_updates_per_batch`` optimizer steps over disjoint updates.
+        """Run ``num_updates_per_batch`` optimizer steps over disjoint updates."""
+        from unirl.utils.profiling import maybe_profile_update, profile_mode
 
-        The update/micro grouping comes from
-        :meth:`~unirl.train.stack.planner.MicroPlanner.arrange` — the same source
-        :meth:`prepare_segment` froze the π_old anchor at — so every update's
-        ``new_logp`` is computed at exactly the anchor's geometry. ``prepare_segment``
-        must already have frozen the anchor so all updates train against the same
-        pre-update policy. With a single optimizer step the result passes through
-        unchanged; otherwise the per-update results are reduced into one summary and
-        each update's own metrics are attached on ``per_update`` (see
-        :func:`_aggregate_update_results`).
-        """
-        from unirl.utils.profiling import maybe_profile_update, profile_scope
-
-        scope_update = profile_scope() == "one-update"
+        scope_update = profile_mode() == "one-update"
         results = []
         for micros in plans:
             cm = (
