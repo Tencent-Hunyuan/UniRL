@@ -1,0 +1,283 @@
+# @package _global_
+# BAGEL-7B-MoT image-EDIT GRPO — vLLM-Omni + managed EditReward DP8.
+#
+# The vllm_omni-rollout sibling of examples/diffusion/bagel/bagel_editreward.yaml:
+# identical model / precision / algorithm / data / reward, but generation runs in
+# eight colocated vLLM-Omni worker subprocesses (one per GPU, TP=1 → DP=8) instead
+# of the in-process TrainsideRolloutEngine, and the freshly-trained LoRA is pushed
+# into them each rollout. Train and one environment-isolated EditReward child per
+# rank remain resident; rollout residency is an explicit memory-policy choice.
+#
+# What it2i adds over bagel_vllmomni.yaml (all handled in unirl/{models,rollout}/bagel):
+#   - modality bagel_it2i — the adapter ships each sample's SOURCE image on the
+#     request (multi_modal_data["image"]) AND mirrors it onto the deferred
+#     conditions (input_images), because the trainer rebuilds the KV contexts at
+#     replay and must prefill the same source image the worker did.
+#   - RLBagelPipeline builds the three it2i KV contexts inside the worker with the
+#     vendored ImageTransform pair and injects them through vLLM-Omni's KV channel,
+#     so upstream's own img2img prefill never runs. That prefill would (a) override
+#     the output canvas with the resized SOURCE dims — breaking the driver-authored
+#     x_T shape — and (b) squash the source to a fixed 980x980 SigLIP square (~4x the
+#     ViT tokens, aspect ratio dropped) instead of the aspect-preserving navit
+#     transform the trainer replays with. A conditioning mismatch is NOT something
+#     replay can absorb: the reward would be earned under one conditioning while the
+#     gradient is taken under another, and no importance ratio corrects that.
+#   - bundle.enable_vit: true — the und ViT tower, needed on the TRAINER to rebuild
+#     the contexts at replay (the worker always builds its own).
+#   - packed rollout is off for it2i (upstream's grouped generate_image is cfg=1 t2i
+#     only), so every GRPO sibling is its own worker request.
+#
+# Deploy (one rank-affine child per train worker; no extra Ray GPU slot):
+#   export BAGEL_PATH=/path/to/BAGEL-7B-MoT
+#   export EDITREWARD_PYTHON=/path/to/editreward/venv/bin/python
+#   export EDITREWARD_CHECKPOINT=/path/to/EditReward-checkpoint
+#   export EDITREWARD_BASE_MODEL=/path/to/MiMo-VL-base
+#   export EDITREWARD_SERVICE_ROOT=$PWD/unirl-reward-service
+#   bash examples/run_experiment_single_node.sh diffusion/bagel/bagel_it2i_vllmomni
+#
+# Compose check (CPU):  python -m unirl.train_diffusion \
+#   --config-name diffusion/bagel/bagel_it2i_vllmomni --cfg job --resolve
+# Smoke first — it2i colocate is the tightest memory shape in the family (7B MoT +
+# ViT on the trainer AND a full BAGEL in each worker, plus source-image KV):
+#   override batch_size=8 num_rollouts=2 eval_interval=2 sampling.samples_per_prompt=2
+
+num_devices: 8
+batch_size: 8                  # prompts/rollout (x samples_per_prompt = images/rollout)
+adv_use_global_std: false      # per-group GRPO normalization
+num_rollouts: 10000            # intentionally large; stop manually
+
+# Periodic eval on the eval set (deterministic: eval_eta=0), logged under eval/*.
+# Eval prompts are chunked (eval_chunk_prompts) to stay within the it2i driver-memory
+# budget. Same values as the trainside editreward run.
+eval_interval: 25
+eval_num_prompts: 16
+eval_samples_per_prompt: 4
+eval_chunk_prompts: 8
+eval_eta: 0.0
+
+transport_kind: colocate_store
+workers_per_device: 1
+
+# LoRA weight-sync cadence (loop concern, read by DiffusionTrainer.train). Every N
+# rollouts the loop pushes the freshly-trained adapter into the vLLM-Omni engine.
+# 1 = on-policy; >1 lags rollout weights (off-policy drift).
+weight_sync_interval: 1
+# Safe default. Set false only after measuring the full training peak for the
+# exact model, reward, sampling geometry, and accelerator.
+enable_fsdp_offload: false
+offload_train_during_reward: false
+rollout_sleep_after_generate: true
+
+# NB: no `task_config.task: it2i` here. On the trainside recipe that pin is what
+# makes a source-image-less dataset fail loudly; on this path the modality does it —
+# BagelIt2iAdapter.validate_request rejects a Sample without image conditioning.
+
+logging:
+  report_to_wandb: true
+  project_name: ${oc.env:WANDB_PROJECT,bagel-editreward}
+  run_name: bagel_it2i_vllmomni_lora
+  # entity: set via the WANDB_ENTITY env var (wandb picks it up automatically)
+  tags: [bagel, it2i, edit, editreward, lora, vllmomni, fp32master]
+  log_media: true              # logs the source|edited side-by-side preview for it2i
+  media_max_items: 8
+  media_log_interval: 5
+
+bundle:
+  _target_: unirl.models.bagel.bundle.BagelBundle.from_config
+  config:
+    _target_: unirl.models.bagel.config.BagelPipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:BAGEL_PATH,ByteDance-Seed/BAGEL-7B-MoT}
+    model_precision: bf16
+    autocast_precision: bf16
+    trajectory_precision: fp32   # keep diffuse<->replay bit-exact; do NOT lower
+    logprob_precision: fp32
+    shift: 3.0
+    use_lora: true               # read by the engine's WeightSync (uses_lora)
+    enable_vit: true             # EDIT: the und ViT the replay context rebuild needs
+
+pipeline:
+  _target_: unirl.models.bagel.pipeline.BagelPipeline
+  autocast_precision: bf16
+  trajectory_precision: fp32
+  logprob_precision: fp32
+  shift: 3.0
+  strategy:
+    _target_: unirl.sde.kernels.FlowSDEStrategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["Qwen2MoTDecoderLayer"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16                  # COMPUTE dtype (FSDP all-gather + forward/backward)
+    master_dtype: fp32                 # load-bearing: fp32 LoRA master + Adam (reward-collapse fix)
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true     # 7B + multi-step replay: required
+    ac_wrap_order: inside              # recompute re-enters FSDP hooks; the order this recipe's smoke validated
+    use_torch_compile: false
+    root_wrap: false                   # vendored BAGEL calls embed_tokens/lm_head outside a root forward
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 1.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 1.0e-4
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 100000
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 64                           # must be <= the stage YAML's max_lora_rank (64)
+    alpha: 128
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    target_modules:                    # = BAGEL_MOE_GEN_LORA_TARGETS (gen experts only; und/ViT frozen)
+      - self_attn.q_proj_moe_gen
+      - self_attn.k_proj_moe_gen
+      - self_attn.v_proj_moe_gen
+      - self_attn.o_proj_moe_gen
+      - mlp_moe_gen.gate_proj
+      - mlp_moe_gen.up_proj
+      - mlp_moe_gen.down_proj
+
+rollout:
+  _target_: unirl.rollout.engine.vllm_omni.engine.VLLMOmniRolloutEngine
+  # model_config carries the σ-schedule ``shift`` (read by the adapter's
+  # schedule_policy) and ``use_lora`` (read by WeightSync); point it at the bundle's
+  # config so train + rollout share one source.
+  model_config: ${bundle.config}
+  config:
+    _target_: unirl.rollout.engine.vllm_omni.config.VLLMOmniEngineConfig
+    # Required; same checkpoint the bundle loads.
+    model_path: ${oc.env:BAGEL_PATH,ByteDance-Seed/BAGEL-7B-MoT}
+    # BAGEL single-stage editing modality (registers BagelIt2iAdapter + boots
+    # stage_configs/bagel_t2i_rl.yaml — one YAML serves both image-out modalities —
+    # with RLBagelPipeline).
+    modality: bagel_it2i
+    # Required for colocate: the trainer calls sleep()/wake_up() around the train
+    # phase, a no-op unless CuMemAllocator is enabled at vLLM-Omni init time.
+    enable_sleep_mode: true
+
+# One managed EditReward child per reward rank. The child uses an explicit Python
+# environment, inherits exactly that rank's GPU, and receives bounded source/edit
+# image batches over loopback HTTP.
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.managed_process.ManagedScorerProcessBackend
+    base_device: cpu
+    config:
+      _target_: unirl.reward.managed_process.ManagedScorerProcessSpec
+      process:
+        _target_: unirl.reward.managed_process.ManagedProcessConfig
+        python_executable: ${oc.env:EDITREWARD_PYTHON,/root/venvs/editreward/bin/python}
+        service_root: ${oc.env:EDITREWARD_SERVICE_ROOT,unirl-reward-service}
+        startup_timeout: 1200
+        shutdown_timeout: 30
+        log_dir: ${oc.env:EDITREWARD_CHILD_LOG_DIR,/tmp/unirl-reward}
+        offline: true
+      scorer:
+        _target_: unirl.reward.managed_process.ManagedScorerConfig
+        name: editreward
+        history_kind: image_edit
+        version: "1"
+        params:
+          checkpoint_path: ${oc.env:EDITREWARD_CHECKPOINT,TIGER-Lab/EditReward-MiMo-VL-7B-SFT-2508}
+          model_name_or_path: ${oc.env:EDITREWARD_BASE_MODEL,XiaomiMiMo/MiMo-VL-7B-SFT-2508}
+          config_path: config/EditReward-MiMo-VL-7B-SFT-2508.yaml
+          device: cuda
+          dtype: bfloat16
+          rm_head_type: ranknet_multi_head
+      client:
+        _target_: unirl.reward.remote.RemoteRewardSpec
+        base_url: managed://rank-affine
+        required_rewards: [editreward]
+        reward_weights: {editreward: 1.0}
+        batch_size: 8
+        request_batch_size: 8
+        timeout: 600.0
+        # EditReward's first column is reward; the second is log uncertainty, so do not average them.
+        sub_metric_reduce: first
+        aggregation_method: weighted_sum
+        input_kind: image
+      gpu_residency: resident
+
+algorithm:
+  _target_: unirl.algorithms.flowgrpo.FlowGRPO
+  stage_attr: diffusion
+  clip_range: 5.0e-3
+  clip_schedule: constant
+  # replay, NOT rollout (which the t2i vllmomni recipe can afford). The worker now
+  # conditions on the SAME source pixels and token geometry as the trainer, but it
+  # still builds the KV context with vLLM's ViT / VAE / MoT kernels while replay uses
+  # the vendored ones — so the emitted rollout log-probs carry a systematic offset.
+  # Anchoring pi_old in the trainer's own forward keeps the ratio well-defined
+  # (== 1 on update 1) instead of starting off it.
+  old_logp_source: replay
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.bagel.conditions.BagelDiffusionConditions
+  params: ${sampling}
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1                  # navit bs=1; BagelDiffusionConditions.single asserts it
+  max_grad_norm: 1.0
+  num_updates_per_batch: 2             # 2 optimizer updates/rollout (disjoint mini-batches)
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      # Editing instruction + SOURCE image (role: condition -> the request's input image).
+      data_path: ${oc.env:EDIT_DATA_PATH,datasets/image_edit/train.jsonl}
+      eval_data_path: ${oc.env:EDIT_EVAL_DATA_PATH,datasets/image_edit/test.jsonl}
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+# BAGEL edit sampling (BagelDiffusionParams). Dual-CFG: cfg_text amplifies the
+# INSTRUCTION, cfg_img amplifies the SOURCE (cfg_img active only when cfg_text_scale>1).
+sampling:
+  _target_: unirl.models.bagel.diffusion.BagelDiffusionParams
+  num_inference_steps: 14              # STEPS (σ schedule = steps+1 = 15 points); the adapter sends +1 to the worker
+  guidance_scale: 1.0
+  cfg_text_scale: 1                    # 1 = No-CFG single forward (validated). >1 = +1 forward/step -> more memory
+  cfg_img_scale: 1.0                   # source<->diversity knob; only active when cfg_text_scale>1
+  cfg_interval: [0.4, 1.0]             # CFG schedule; only active when cfg_text_scale>1
+  cfg_renorm_min: 0.0
+  cfg_renorm_type: text_channel        # CFG renorm; only active when cfg_text_scale>1
+  eta: 1.0                             # SDE noise scale (per-step stochasticity = GRPO exploration)
+  samples_per_prompt: 8                # GRPO group size; it2i sends one worker request per sample
+  height: 512                          # the OUTPUT canvas. Fixed square: the driver's x_T recipe carries ONE
+  width: 512                           # shape for the whole request, and the worker honors it via kv_metadata
+  seed: 42
+  init_same_noise: true                # siblings share x_T; in-group diversity comes from the SDE noise (eta>0)
+  trajectory_precision: fp32           # forwarded to the worker scheduler's SDE log-prob storage round-trip
+  scheduler:
+    _target_: unirl.utils.scheduler_utils.WindowScheduler
+    num_timesteps: 7                   # SDE window drawn from the first half of the 14 inference steps
+    config:
+      _target_: unirl.utils.scheduler_utils.WindowConfig
+      strategy: random
+      window_size: 3                   # a random contiguous 3-step SDE window per rollout
+
+# LoRA weight sync → vLLM-Omni rollout. Instantiated as a LocalLoraWeightSync
+# (sibling of backend + rollout). The train loop drives cadence via
+# weight_sync_interval (top of file): every N rollouts it calls sync() to push the
+# freshly-trained LoRA (set_lora_from_tensors) into the engine just before generate.
+sync:
+  _target_: unirl.distributed.weight_sync.lora.LocalLoraWeightSync
+  verify: true                         # checksum read-back asserts the synced LoRA landed; catches a wrong prefix
+  # Mirrors BagelPipelineConfig.weight_sync_param_name_prefix; must match the
+  # engine-side LoRA key naming (the trainable module is model.language_model).
+  param_prefix: "language_model."
+  adapter_name: default

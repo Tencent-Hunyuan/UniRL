@@ -1,0 +1,140 @@
+# @package _global_
+# SFT — BAGEL-7B-MoT und/AR experts on interleaved image/text agent trajectories
+# (SearchGen), LoRA on the und experts.
+#
+# Same agent manifests as qwen_vl_agent_sft — the per-model delta lives in the
+# bagel package: BagelChatTemplateStage renders each history into Bagel's native
+# ordered splits (bare <|im_start|>-wrapped text chunks + ViT-only image splits,
+# no role tokens), and BagelARStage's train-mode replay packs those splits
+# interleaved (image blocks full-attn at one rope position, text causal) —
+# the vendored forward_train layout.
+#
+# append_eos: false is REQUIRED here: the target convention is
+# encode(text) + <|im_end|> (appended by BagelChatTemplateStage.tokenize_agent_target);
+# the tokenizer's own eos_token_id is <|endoftext|>, which is NOT the und stop token.
+#
+# Env:
+#   BAGEL_PATH      HF id or local ckpt (default ByteDance-Seed/BAGEL-7B-MoT)
+#   SFT_DATA        train manifest (searchgen prepare_sft train.jsonl)
+#   SFT_EVAL_DATA   eval manifest (defaults to SFT_DATA — supply a real split!)
+#
+# Download/cook guide: datasets/searchgen/README.md (manifests shared with qwen_vl_agent_sft).
+#
+# Launch:
+#   ENTRY=train_sft SFT_DATA=datasets/searchgen/processed/train.jsonl \
+#   SFT_EVAL_DATA=datasets/searchgen/processed/val.jsonl \
+#   bash examples/run_experiment_single_node.sh sft/bagel_agent_sft
+
+num_devices: 8
+batch_size: 16
+num_steps: 300
+eval_interval: 20
+eval_batch_size: 8
+eval_num_samples: 64
+save_interval: 0
+save_mode: auto
+transport_kind: colocate_store
+workers_per_device: 1
+
+logging:
+  report_to_wandb: false
+  project_name: unirl-sft
+  run_name: bagel_agent_sft
+  entity: null
+  tags: [sft, agent, bagel, unified-model, interleaved]
+
+bundle:
+  _target_: unirl.models.bagel.bundle.BagelBundle.from_config
+  config:
+    _target_: unirl.models.bagel.config.BagelPipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:BAGEL_PATH,ByteDance-Seed/BAGEL-7B-MoT}
+    model_precision: bf16
+    shift: 3.0
+    enable_vit: true                 # image-input task: the und ViT tower must load
+    use_lora: true
+    lora_target_modules:             # = BAGEL_UND_LORA_TARGETS (und experts only)
+      - self_attn.q_proj
+      - self_attn.k_proj
+      - self_attn.v_proj
+      - self_attn.o_proj
+      - mlp.gate_proj
+      - mlp.up_proj
+      - mlp.down_proj
+
+pipeline:
+  _target_: unirl.models.bagel.pipeline.BagelPipeline
+  autocast_precision: bf16
+  trajectory_precision: fp32
+  logprob_precision: fp32
+  shift: 3.0
+  max_prompt_length: 24576
+  replay_mode: train                 # full-grad und replay (interleaved packed forward_train)
+  strategy:
+    _target_: unirl.sde.kernels.FlowSDEStrategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["Qwen2MoTDecoderLayer"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    master_dtype: fp32               # fp32 LoRA master + Adam states, bf16 compute
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true
+    use_torch_compile: false
+    root_wrap: false                 # vendored bagel calls embed_tokens/lm_head outside a root forward
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 1.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 1.0e-4
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: ${num_steps}
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 64
+    alpha: 128
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    target_modules:                  # = BAGEL_UND_LORA_TARGETS (und experts only)
+      - self_attn.q_proj
+      - self_attn.k_proj
+      - self_attn.v_proj
+      - self_attn.o_proj
+      - mlp.gate_proj
+      - mlp.up_proj
+      - mlp.down_proj
+
+algorithm:
+  _target_: unirl.algorithms.sft.SFT
+  stage_attr: ar
+  loss_agg_mode: token-mean
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.bagel.conditions.BagelARConditions
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1                # navit bs=1 packed forward
+  max_grad_norm: 1.0
+
+track_builder:
+  _target_: unirl.train.sft.track_builder.ARSupervisedTrackBuilder
+  max_response_length: 2048
+  append_eos: false                  # <|im_end|> is appended by the bagel target convention
+
+data_source:
+  _target_: unirl.data.sft.SupervisedDataSource
+  manifest_path: ${oc.env:SFT_DATA}
+  eval_manifest_path: ${oc.env:SFT_EVAL_DATA,${oc.env:SFT_DATA}}
+  seed: 42

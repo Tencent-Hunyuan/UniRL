@@ -1,7 +1,9 @@
-"""Adapter registry — importing this package registers all 10 modalities."""
+"""Adapter registry — importing this package registers all 12 modalities."""
 
 from unirl.rollout.engine.vllm_omni.adapters.bagel import (
+    BagelAdapter,
     BagelInputAdapter,
+    BagelIt2iAdapter,
     BagelOutputAdapter,
     BagelT2iAdapter,
 )
@@ -46,7 +48,9 @@ from unirl.rollout.engine.vllm_omni.adapters.sd3 import Sd3InputAdapter, Sd3Outp
 __all__ = [
     "DitInputAdapter",
     "DitOutputAdapter",
+    "BagelAdapter",
     "BagelInputAdapter",
+    "BagelIt2iAdapter",
     "BagelOutputAdapter",
     "BagelT2iAdapter",
     "Hi3ArRecaptionAdapter",
