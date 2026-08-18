@@ -17,7 +17,7 @@ from unirl.distributed.tensor.batch import _move_value
 from unirl.train.backend.fsdp import FSDPBackend
 from unirl.train.stack.planner import CountPlanner, MicroPlanner, Plan, UpdatePlan, _positive_int
 from unirl.types.sample import Part
-from unirl.utils.misc import aggregate_numeric_metrics
+from unirl.utils.metrics import aggregate_numeric_metrics
 
 logger = logging.getLogger(__name__)
 

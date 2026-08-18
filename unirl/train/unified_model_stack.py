@@ -19,7 +19,7 @@ from unirl.train.stack.base import _aggregate_update_results
 from unirl.train.stack.planner.types import _positive_int, _update_ranges
 from unirl.types.sample import Part, Sample
 from unirl.types.sampling import ARSamplingParams, DiffusionSamplingParams
-from unirl.utils.misc import aggregate_numeric_metrics
+from unirl.utils.metrics import aggregate_numeric_metrics
 
 logger = logging.getLogger(__name__)
 

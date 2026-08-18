@@ -18,7 +18,7 @@ that format so the recipe is reproducible without any private cache:
   - eval  : AIME 2024 + AIME 2025 (the paper's avg@16 benchmark), concatenated.
 
 Usage:
-  python -m unirl.utils.prepare_dapo_math --out-dir data/dapo_math
+  python datasets/dapo_math/prepare_dapo_math.py --out-dir data/dapo_math
   # → data/dapo_math/train.jsonl  (+ aime_eval.jsonl)
 
   DATA_PATH=data/dapo_math/train.jsonl EVAL_DATA_PATH=data/dapo_math/aime_eval.jsonl \

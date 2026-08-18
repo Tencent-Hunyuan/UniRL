@@ -30,7 +30,7 @@ supports. There is no base class and no `isinstance` check:
 ## Gotchas
 
 - **A stage that cannot render the WHOLE target must raise, not render part of
-  it.** Manifests may carry tool-call targets — `unirl/utils/prepare_sft_agent.py`
+  it.** Manifests may carry tool-call targets — `datasets/sft_manifests/prepare_sft_agent.py`
   supervises them by design — so a backbone with no tool-call template rejects
   the record instead of quietly tokenizing only its text. `BagelChatTemplateStage`
   has no tool rendering at all; `QwenVLChatTemplateStage` rejects too, because the
