@@ -1,0 +1,124 @@
+# @package _global_
+# SFT — Cosmos3-Nano policy-mode action behavior cloning on droid_100
+# (full finetune, gen stream).
+#
+# The Cosmos3-Nano-Policy objective: clean observation at latent frame 0,
+# jointly noise future video and the full action chunk with ONE sigma, and
+# regress both velocity targets (vision/action MSE balanced 1:1 via 10/10
+# weights). 17 frames pair with a 16-step action chunk (chunk_size + 1).
+# Same numeric conventions as the videopred recipe: fp32 storage + bf16 FSDP
+# compute, frozen und stream, logit-normal sigma through the official
+# short-edge shift tiers (256→3, 480→5, 720→10).
+#
+# droid_100 is DEBUG-scale: its collapsed 7-D action differs from the canonical
+# 10-D droid_lerobot layout (9D EE pose + 1D gripper), so the pretrained action
+# head semantics are not preserved — fine for exercising the pipeline, not for
+# faithful Policy-DROID reproduction.
+#
+# Env:
+#   PRETRAINED_MODEL  diffusers-layout nvidia/Cosmos3-Nano checkpoint
+#                     (needs the `cosmos3` install extra: diffusers>=0.39).
+#                     Eval/loss is velocity MSE, not a sampling-quality gate.
+#   SFT_DATA          train manifest (defaults to the prep output below)
+#   SFT_EVAL_DATA     eval manifest (held-out episodes from the same prep)
+#
+# Data prep (LeRobot droid_100; 192x320 is exactly the tier-256 action canvas):
+#   python -m unirl.utils.prepare_droid100 --root datasets/droid100_debug
+#
+# Launch:
+#   ENTRY=train_sft PRETRAINED_MODEL=/path/to/Cosmos3-Nano \
+#   bash examples/run_experiment_single_node.sh sft/cosmos3_droid100_action_bc
+
+num_devices: 8
+batch_size: 8
+num_steps: 300
+eval_interval: 100
+eval_batch_size: 8
+eval_num_samples: 8
+save_interval: 100
+save_mode: auto
+save_dir: ${oc.env:SAVE_DIR,outputs/cosmos3_droid100_action_bc}
+transport_kind: colocate_store
+workers_per_device: 1
+
+logging:
+  report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,false}}
+  project_name: ${oc.env:WANDB_PROJECT,unirl-sft}
+  run_name: ${oc.env:WANDB_RUN_NAME,cosmos3_droid100_action_bc}
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: [cosmos3, sft, action-bc, policy-mode, droid100]
+
+bundle:
+  _target_: unirl.models.cosmos3.bundle.Cosmos3Bundle.from_config
+  config:
+    _target_: unirl.models.cosmos3.config.Cosmos3SFTConfig
+    pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,nvidia/Cosmos3-Nano}
+    # torch 2.10/cu128 on H20 rejects bf16 cublasGemmEx; keep this validated
+    # compatibility recipe in fp32. Newer CUDA stacks may override both dtypes.
+    model_precision: fp32
+    master_precision: fp32
+    meta_init_transformer: true
+    vae_precision: fp32
+    freeze_understanding: true
+    time_dist: logitnormal
+    fps: 15.0
+    condition_on_first_frame: true
+    vision_loss_weight: 10.0
+    action_domain_name: droid_lerobot
+    action_chunk_size: 16
+    raw_action_dim: 7
+    action_loss_weight: 10.0
+    action_view_point: third_person_view
+
+pipeline:
+  _target_: unirl.models.cosmos3.pipeline.Cosmos3Pipeline
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: [Cosmos3VLTextMoTDecoderLayer]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: fp32
+    cpu_offload: false
+    mixed_precision: false
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 1.0e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 10
+    total_steps: ${num_steps}
+  lora_cfg: null
+
+algorithm:
+  _target_: unirl.algorithms.cosmos3_sft.Cosmos3JointFlowMatchSFT
+  stage_attr: joint
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.cosmos3.conditions.Cosmos3SFTCondition
+  eval_seed: 42
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+
+track_builder:
+  _target_: unirl.models.cosmos3.track_builder.Cosmos3SupervisedTrackBuilder
+  train_action: true
+
+data_source:
+  _target_: unirl.data.sft.SupervisedDataSource
+  manifest_path: ${oc.env:SFT_DATA,datasets/droid100_debug/manifest.jsonl}
+  eval_manifest_path: ${oc.env:SFT_EVAL_DATA,datasets/droid100_debug/eval_manifest.jsonl}
+  seed: 42

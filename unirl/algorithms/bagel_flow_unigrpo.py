@@ -165,7 +165,6 @@ class BagelFlowUniGRPO(FlowGRPO):
         typed_conds = typed_conditions(conditions, self.conditions_cls)
         device = next(self.stage.model.transformer.parameters()).device
         schedule = segment.sigmas.to(device)
-        forward_kwargs = self.stage.build_forward_kwargs(typed_conds, params=self.params, device=device)
         transformer = self.stage.model.transformer
         full_ft_ref = not self._has_lora(transformer)
         # Compute reference velocities before retaining trainable graphs to reduce peak memory.
@@ -182,17 +181,27 @@ class BagelFlowUniGRPO(FlowGRPO):
                         "stage.model.transformer. Train with a lora_cfg or full fine-tuning, "
                         "or set mse_weight=0."
                     )
+                # Rebuild reference conditioning only after policy weights are disabled.
+                ref_forward_kwargs = self.stage.build_forward_kwargs(
+                    typed_conds,
+                    params=self.params,
+                    device=device,
+                    force_rebuild=bool(typed_conds.input_images),
+                )
                 v_refs = [
                     self.stage.predict_velocity_at(
-                        forward_kwargs,
+                        ref_forward_kwargs,
                         sample=segment.latents_at(s)[0].to(device),
                         sigma=schedule[s],
                         params=self.params,
                     ).detach()
                     for s in target_steps
                 ]
+                del ref_forward_kwargs
         if full_ft_ref and torch.cuda.is_available():
             torch.cuda.empty_cache()
+        # Build policy contexts after freeing the reference contexts.
+        forward_kwargs = self.stage.build_forward_kwargs(typed_conds, params=self.params, device=device)
 
         mse_terms: List[torch.Tensor] = []
         for step_idx, v_ref in zip(target_steps, v_refs):

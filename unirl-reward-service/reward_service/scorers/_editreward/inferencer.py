@@ -6,29 +6,29 @@ Uses the vendored configs, model, prompts, and vision_process modules.
 
 from __future__ import annotations
 
+import importlib
 import os
 from collections.abc import Mapping
 from pathlib import Path
 
 import torch
-import safetensors
 
-from reward_service.scorers._editreward.vision_process import process_vision_info
-from reward_service.scorers._editreward.prompts import (
-    INSTRUCTION_EDIT_FOLLOWING,
-    INSTRUCTION_EDIT_QUALITY,
-    INSTRUCTION_EDIT_OVERALL,
-    INSTRUCTION_EDIT_OVERALL_DETAILED,
-    PROMPT_WITH_SPECIAL_TOKEN,
-    PROMPT_WITHOUT_SPECIAL_TOKEN,
-)
 from reward_service.scorers._editreward.configs import (
+    DataConfig,
     ModelConfig,
     PEFTLoraConfig,
     TrainingConfig,
-    DataConfig,
     parse_args_with_yaml,
 )
+from reward_service.scorers._editreward.prompts import (
+    INSTRUCTION_EDIT_FOLLOWING,
+    INSTRUCTION_EDIT_OVERALL,
+    INSTRUCTION_EDIT_OVERALL_DETAILED,
+    INSTRUCTION_EDIT_QUALITY,
+    PROMPT_WITH_SPECIAL_TOKEN,
+    PROMPT_WITHOUT_SPECIAL_TOKEN,
+)
+from reward_service.scorers._editreward.vision_process import process_vision_info
 
 _MODEL_CONFIG_PATH = Path(__file__).parent / "config"
 _DEFAULT_CONFIG_FILENAME = "EditReward-Qwen2.5-7B-VL.yaml"
@@ -47,15 +47,13 @@ def _resolve_config_path(config_path):
         if candidate.is_file():
             return str(candidate)
 
-    raise FileNotFoundError(
-        f"Config not found: {config_path}. "
-        f"Checked {[str(path) for path in candidate_paths]}"
-    )
+    raise FileNotFoundError(f"Config not found: {config_path}. Checked {[str(path) for path in candidate_paths]}")
 
 
 def _create_model_and_processor(model_config, peft_lora_config, training_args, differentiable=False):
     """Create model and processor for inference (no LoRA, no quantization)."""
     from transformers import AutoProcessor
+
     from reward_service.scorers._editreward.model import Qwen2_5_VLRewardModelBT_MultiHead
 
     torch_dtype = (
@@ -64,20 +62,16 @@ def _create_model_and_processor(model_config, peft_lora_config, training_args, d
         else getattr(torch, model_config.torch_dtype)
     )
 
-    processor = AutoProcessor.from_pretrained(
-        model_config.model_name_or_path, padding_side="right"
-    )
+    processor = AutoProcessor.from_pretrained(model_config.model_name_or_path, padding_side="right")
 
     special_token_ids = None
     if model_config.use_special_tokens:
         special_tokens = ["<|Reward|>"]
-        processor.tokenizer.add_special_tokens(
-            {"additional_special_tokens": special_tokens}
-        )
+        processor.tokenizer.add_special_tokens({"additional_special_tokens": special_tokens})
         special_token_ids = processor.tokenizer.convert_tokens_to_ids(special_tokens)
 
     try:
-        import flash_attn
+        importlib.import_module("flash_attn")
         attn_impl = "flash_attention_2"
     except ImportError:
         attn_impl = "sdpa"
@@ -125,6 +119,8 @@ class EditRewardInferencer:
         self,
         config_path=None,
         checkpoint_path=None,
+        model_name_or_path=None,
+        dtype=None,
         device="cuda",
         differentiable=False,
         reward_dim="dim1",
@@ -132,15 +128,29 @@ class EditRewardInferencer:
     ):
         config_path = _resolve_config_path(config_path)
 
-        (data_config, training_args, model_config, peft_lora_config), config_path = (
-            parse_args_with_yaml(
-                (DataConfig, TrainingConfig, ModelConfig, PEFTLoraConfig),
-                config_path,
-                is_train=False,
-            )
+        (data_config, training_args, model_config, peft_lora_config), config_path = parse_args_with_yaml(
+            (DataConfig, TrainingConfig, ModelConfig, PEFTLoraConfig),
+            config_path,
+            is_train=False,
         )
+        if model_name_or_path:
+            model_config.model_name_or_path = str(model_name_or_path)
+        if dtype:
+            dtype_name = {
+                "bf16": "bfloat16",
+                "fp16": "float16",
+                "fp32": "float32",
+            }.get(str(dtype), str(dtype))
+            allowed_dtypes = {"auto", "bfloat16", "float16", "float32"}
+            if dtype_name not in allowed_dtypes:
+                raise ValueError(f"Unsupported EditReward dtype {dtype!r}; expected one of {sorted(allowed_dtypes)}")
+            model_config.torch_dtype = dtype_name
+            if dtype_name != "auto":
+                training_args.bf16 = dtype_name == "bfloat16"
+                training_args.fp16 = dtype_name == "float16"
+        model_config.rm_head_type = str(rm_head_type)
         output_root = training_args.output_dir or "/tmp/editreward_output"
-        training_args.output_dir = os.path.join(output_root, config_path.split("/")[-1].split(".")[0])
+        training_args.output_dir = os.path.join(output_root, Path(config_path).stem)
 
         model, processor, _ = _create_model_and_processor(
             model_config=model_config,
@@ -152,7 +162,7 @@ class EditRewardInferencer:
         self.device = device
         self.use_special_tokens = model_config.use_special_tokens
         self.reward_dim = reward_dim
-        self.rm_head_type = rm_head_type
+        self.rm_head_type = model_config.rm_head_type
 
         # Load checkpoint
         full_ckpt = os.path.join(checkpoint_path, "model.pth")
@@ -162,6 +172,7 @@ class EditRewardInferencer:
             state_dict = torch.load(full_ckpt, map_location="cpu")
         elif os.path.exists(full_ckpt_safetensors):
             import safetensors.torch
+
             state_dict = safetensors.torch.load_file(full_ckpt_safetensors, device="cpu")
         else:
             raise ValueError(f"Checkpoint not found at {checkpoint_path}")
@@ -232,9 +243,7 @@ class EditRewardInferencer:
             messages = _build_messages(prompts, image_src, image_paths, reward_dim)
             image_inputs, _ = process_vision_info(messages)
             batch = self.processor(
-                text=self.processor.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True
-                ),
+                text=self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True),
                 images=image_inputs,
                 padding=True,
                 return_tensors="pt",
@@ -243,7 +252,11 @@ class EditRewardInferencer:
             batch = self._prepare_inputs(batch)
             return batch, image_inputs
 
-        if self.rm_head_type == "ranknet_multi_head":
+        if self.rm_head_type in {
+            "ranknet_multi_head",
+            "ranknet_multi_head_regression",
+            "ranknet_share_head",
+        }:
             batch_dim1, image_inputs_1 = _build_batch(prompts, image_src, image_paths, reward_dim="dim1")
             batch_dim2, image_inputs_2 = _build_batch(prompts, image_src, image_paths, reward_dim="dim2")
             return {
@@ -267,5 +280,5 @@ class EditRewardInferencer:
 
     def reward(self, prompts, image_src, image_paths):
         batch = self.prepare_batch(image_src, image_paths, prompts)
-        rewards = self.model(return_dict=True, **batch)["logits"]
-        return rewards
+        output = self.model(return_dict=True, **batch)
+        return output["logits"] if isinstance(output, Mapping) else output

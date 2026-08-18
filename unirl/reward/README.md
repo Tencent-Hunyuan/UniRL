@@ -56,9 +56,50 @@ never mutates the input Sample — it returns a fresh one. Per call it:
 
 A backend is just `compute_rewards(request) -> RewardResponse`. Local scorers
 (`local/`) subclass `LocalRewardBackend` and implement `_compute_model_rewards`;
-the remote backend (`remote.py`) sends one `POST /score` per scoring call, packing
-the whole batch and multiplexing every requested reward in one round trip, and
-derives success from the response.
+the remote backend (`remote.py`) sends one or more bounded `POST /score` calls,
+multiplexes every requested reward in each item, and derives success from the
+merged response.
+
+### Managed image scorers
+
+`ManagedScorerProcessBackend` is the environment-isolated, rank-affine middle
+ground between local and externally deployed rewards. Each reward worker launches
+one scorer child with an explicit Python executable; the child inherits that
+worker's single visible GPU and serves only its local prompt-tree shard over
+loopback HTTP. The initial capability is deliberately limited to image and
+image-edit histories.
+
+Its config separates process ownership, scorer construction, and remote-client
+semantics:
+
+```yaml
+backend:
+  _target_: unirl.reward.managed_process.ManagedScorerProcessBackend
+  base_device: cpu
+  config:
+    _target_: unirl.reward.managed_process.ManagedScorerProcessSpec
+    process:
+      _target_: unirl.reward.managed_process.ManagedProcessConfig
+      python_executable: /venvs/reward/bin/python
+      service_root: /workspace/UniRL/unirl-reward-service
+    scorer:
+      _target_: unirl.reward.managed_process.ManagedScorerConfig
+      name: editreward
+      history_kind: image_edit
+      params: {device: cuda, checkpoint_path: /models/EditReward}
+    client:
+      _target_: unirl.reward.remote.RemoteRewardSpec
+      base_url: managed://rank-affine
+      required_rewards: [editreward]
+      input_kind: image
+      request_batch_size: 8
+    gpu_residency: resident
+```
+
+`request_batch_size` bounds transport/scorer calls independently from the DP
+shard size. Identity echo is required for managed children. The parent manages
+GPU residency through the child's `onload`, `offload`, and `shutdown` endpoints;
+`drain` remains available for explicit synchronization.
 
 **Extending it:** a new local scorer is usually a file in `local/` subclassing
 `LocalRewardBackend` (set `canonical_model_name`, implement `_load_model` +

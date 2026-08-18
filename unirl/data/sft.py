@@ -8,7 +8,7 @@ import os
 import random
 from typing import Any, Dict, Iterator, List, Optional
 
-from unirl.data.datasets import _LEGACY_EMBEDDING_FIELDS, _normalize_media_refs
+from unirl.data.datasets import _LEGACY_EMBEDDING_FIELDS, _normalize_media_refs, _resolve_media_uri
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +74,51 @@ def tokenize_agent_target(
     return target_ids
 
 
+def _normalize_message_content(content: Any, *, turn: int, base_dir: Optional[str]) -> Any:
+    """Validate one agent message's ``content``: string, null, or a text/image part list."""
+    if content is None or isinstance(content, str):
+        return content
+    if not isinstance(content, list) or not content:
+        raise TypeError(
+            f"Agent message {turn} 'content' must be a string, null, or a non-empty list of "
+            f"text/image parts, got {type(content).__name__}."
+        )
+    parts: List[Dict[str, Any]] = []
+    for j, part in enumerate(content):
+        if not isinstance(part, dict):
+            raise TypeError(f"Agent message {turn} content[{j}] must be a dict, got {type(part).__name__}.")
+        kind = part.get("type")
+        if kind not in {"text", "image"}:
+            raise ValueError(f"Agent message {turn} content[{j}] has unsupported part type {kind!r}.")
+        # Both kinds carry their value under a field named after the type, so this is the whole contract.
+        extra = sorted(set(part) - {"type", kind})
+        if extra:
+            raise ValueError(
+                f"Agent message {turn} content[{j}] has unsupported field(s) {extra} — a {kind!r} part "
+                f"carries only 'type' and {kind!r}. Accepting and dropping them would train on a record "
+                "the manifest does not describe."
+            )
+        if kind == "text":
+            text = part.get("text")
+            if not isinstance(text, str) or not text:
+                raise ValueError(f"Agent message {turn} content[{j}] text part needs a non-empty 'text' string.")
+            parts.append({"type": "text", "text": text})
+        else:
+            uri = part.get("image")
+            if not isinstance(uri, str) or not uri.strip():
+                raise ValueError(f"Agent message {turn} content[{j}] image part needs a non-empty 'image' URI.")
+            parts.append({"type": "image", "image": _resolve_media_uri(uri.strip(), base_dir=base_dir)})
+    return parts
+
+
+def message_content_image_uris(message: Dict[str, Any]) -> List[str]:
+    """URIs of a normalized agent message's image parts (empty for string content)."""
+    content = message.get("content")
+    if not isinstance(content, list):
+        return []
+    return [part["image"] for part in content if isinstance(part, dict) and part.get("type") == "image"]
+
+
 def normalize_supervised_example(
     item: Dict[str, Any],
     *,
@@ -105,19 +150,23 @@ def normalize_supervised_example(
             role = message.get("role")
             if role not in {"system", "user", "assistant", "tool"}:
                 raise ValueError(f"Agent message {turn} has unsupported role {role!r}.")
-            content = message.get("content")
+            content = _normalize_message_content(message.get("content"), turn=turn, base_dir=base_dir)
             tool_calls = message.get("tool_calls")
-            if content is not None and not isinstance(content, str):
-                raise TypeError(
-                    f"Agent message {turn} 'content' must be a string or null, got {type(content).__name__}."
-                )
             if tool_calls is not None and (role != "assistant" or not isinstance(tool_calls, list)):
                 raise TypeError(f"Agent message {turn} 'tool_calls' must be a list on an assistant turn.")
             if role == "assistant" and not content and not tool_calls:
                 raise ValueError(f"Agent assistant message {turn} has neither content nor tool_calls.")
-            normalized_messages.append(dict(message))
+            normalized = dict(message)
+            if "content" in normalized:
+                normalized["content"] = content
+            normalized_messages.append(normalized)
         if normalized_messages[-1]["role"] != "assistant":
             raise ValueError("Agent supervised example must end with the target assistant turn.")
+        if isinstance(normalized_messages[-1].get("content"), list):
+            raise ValueError(
+                "Agent supervised example target (final assistant) turn may not be a content part list — "
+                "interleaved image parts are history-only (supervision is text CE, not an image loss)."
+            )
         if not any(message["role"] == "user" for message in normalized_messages[:-1]):
             raise ValueError("Agent supervised example has no user turn before the target assistant turn.")
         record["messages"] = normalized_messages
@@ -278,6 +327,7 @@ class SupervisedDataSource:
 __all__ = [
     "SupervisedDataSource",
     "SupervisedDataset",
+    "message_content_image_uris",
     "normalize_supervised_example",
     "tokenize_agent_target",
 ]

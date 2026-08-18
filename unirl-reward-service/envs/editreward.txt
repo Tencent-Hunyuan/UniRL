@@ -13,6 +13,9 @@
 pyarrow<19
 datasets
 pillow
+fastapi
+uvicorn
+pydantic
 openai
 megfile
 sentencepiece

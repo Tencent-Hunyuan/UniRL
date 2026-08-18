@@ -17,7 +17,7 @@ entrypoint's built-in `config_name` — a safe place to start.
 |---|---|---|---|
 | [`diffusion/`](diffusion/) | `python -m unirl.train_diffusion` | `diffusion/sd3/sd3_trainside` | `sd3`, `qwen_image`, `flux2_klein`, `wan21`, `wan22`, `hunyuan_video`, `hunyuan_video15` |
 | [`ar/`](ar/) | `python -m unirl.train_ar` | `ar/qwen_vl_grpo_geo3k_mc_4x8`, `ar/qwen3_drpo_4b_base_dapo_sglang` | `qwen_vl` (vision-language), `qwen3` (text-only) |
-| [`sft/`](sft/) | `python -m unirl.train_sft` | `sft/qwen3_sft` | `qwen3`, `qwen_vl`, `bagel`, `sd3`, `wan21` |
+| [`sft/`](sft/) | `python -m unirl.train_sft` | `sft/qwen3_sft` | `qwen3`, `qwen_vl`, `bagel`, `sd3`, `cosmos3`, `wan21` |
 | [`pe/`](pe/) | `python -m unirl.train_pe` | `pe/pe_trainside_pickscore` | `pe` (Qwen3 rewriter + SD3, PickScore/WISE reward) |
 | [`unified_model/`](unified_model/) | `python -m unirl.train_unified_model` | `unified_model/hi3_vllmomni` | `hi3` (HunyuanImage3, unified AR + diffusion) |
 
