@@ -158,7 +158,7 @@ rollout:
 # during scoring and the judge's wake footprint (17GB weights + KV pool +
 # engine overhead ≈ 27GB at util 0.3) OOMs in wake_up. Working alternatives:
 # a non-EMA recipe with offload_train_during_reward=true (see
-# bagel_it2i_managed_editscore_smoke.yaml), a smaller judge, or the separate
+# bagel_it2i_managed_editscore.yaml), a smaller judge, or the separate
 # layout. Kept as the H200-class recipe and as documentation of the limit.
 reward:
   _target_: unirl.reward.service.RewardService
