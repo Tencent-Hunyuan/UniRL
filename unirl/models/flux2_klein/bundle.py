@@ -58,7 +58,7 @@ def _stamp_zero_checkpoint_absent_params(transformer: nn.Module, weights_dir: st
     """Zero-init (post-load, deferred) transformer params the checkpoint omits."""
     from safetensors import safe_open
 
-    from unirl.models.types.post_materialize import defer_after_materialize
+    from unirl.models.types.post_materialize import canonical_param_name, defer_after_materialize
 
     ckpt_keys: set = set()
     if os.path.isdir(weights_dir):
@@ -70,14 +70,12 @@ def _stamp_zero_checkpoint_absent_params(transformer: nn.Module, weights_dir: st
         return
 
     def _zero_absent(model: nn.Module) -> None:
-        from unirl.train.backend.sharded_state import _canonical_param_name
-
         zeroed: List[str] = []
         with torch.no_grad():
             for name, param in model.named_parameters():
                 # The deferred op runs post-wrap: activation checkpointing
                 # interposes wrapper segments the captured names never had.
-                if _canonical_param_name(name) in absent:
+                if canonical_param_name(name) in absent:
                     param.zero_()
                     zeroed.append(name)
         if len(zeroed) != len(absent):

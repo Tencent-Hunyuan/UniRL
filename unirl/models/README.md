@@ -91,6 +91,13 @@ it is the authoritative bundle / pipeline / stage / conditions contract.
   `apply_deferred_ops` after the weight load. The pair describes
   model-construction state, not training policy, which is why it lives under
   `models/types/` and not under `train/`.
+- **Name-keyed matching around materialization compares canonical names.**
+  Deferred ops (and `materialize()`) run post-wrap, and `checkpoint_wrapper`
+  (activation checkpointing) interposes a `_checkpoint_wrapped_module.` segment
+  in `named_parameters()` names while `state_dict()` keys stay canonical (the
+  wrapper's state-dict hooks strip it). Any match between module params and
+  checkpoint keys goes through `canonical_param_name`, exported beside the
+  deferred-op pair in `types/post_materialize.py`.
 
 
 ## Conversation composition
