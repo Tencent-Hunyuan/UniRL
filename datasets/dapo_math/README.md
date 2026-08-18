@@ -25,6 +25,9 @@ for a mirror. The extractor handles the common verl RL schema (`prompt` chat lis
 
 ## Cook
 
+Needs the converter dependencies (`pip install -e '.[dataset-prep]'`, see
+[`../README.md`](../README.md#install)).
+
 ```bash
 python datasets/dapo_math/prepare_dapo_math.py --out-dir data/dapo_math
 ```

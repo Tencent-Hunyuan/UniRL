@@ -20,13 +20,11 @@ the nested structs), pulled through `huggingface_hub`.
 Only `reward_type == "multiple_choice"` rows whose gold is a single A–D letter are kept
 (~12k train, no subsampling). Vero's own held-out `val` split is used, so there is no leakage.
 
-Needs `pyarrow`, `huggingface_hub`, and `pillow`:
-
-```bash
-pip install pyarrow huggingface_hub pillow
-```
-
 ## Cook
+
+Needs the converter dependencies (`pip install -e '.[dataset-prep]'`, see
+[`../README.md`](../README.md#install)) — this one reads the parquet shards through `pyarrow`
+rather than `datasets`.
 
 ```bash
 python datasets/arxivqa_mc/prepare_arxivqa_mc.py --out-dir data/arxivqa_mc

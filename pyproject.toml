@@ -112,6 +112,20 @@ dev = [
   "ruff>=0.6",
   "pre-commit>=3.6",
 ]
+# Offline converters under datasets/ (see datasets/README.md). None of this is
+# imported by unirl/, which is why it is not a base dependency: you install it in
+# a checkout to cook a dataset, then train without it. Reading a Hub dataset needs
+# `datasets`; arxivqa_mc reads Vero's parquet shards through pyarrow directly
+# (deliberately not via `datasets`, to keep the nested structs unreshaped); the
+# LeRobot droid100 prep reads parquet metadata with pandas and decodes video with
+# av. The av bound matches the sglang/vllm extras so installing both cannot
+# conflict.
+dataset-prep = [
+  "datasets>=2.14",
+  "pandas>=2",
+  "pyarrow>=14",
+  "av>=14.2,<19",
+]
 
 [tool.uv]
 conflicts = [

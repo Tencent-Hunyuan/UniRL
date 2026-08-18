@@ -21,6 +21,9 @@ letter). Downloaded automatically through `datasets.load_dataset` into your HF c
 
 ## Cook
 
+Needs the converter dependencies (`pip install -e '.[dataset-prep]'`, see
+[`../README.md`](../README.md#install)).
+
 ```bash
 python datasets/geo3k_mc/prepare_geo3k_mc.py --out-dir data/geo3k_mc
 ```

@@ -22,6 +22,9 @@ question from `question` / `prompt` / `query`, answer from `answer` / `gt` /
 
 ## Cook
 
+Needs the converter dependencies (`pip install -e '.[dataset-prep]'`, see
+[`../README.md`](../README.md#install)) unless you pass `--source` and skip the download.
+
 ```bash
 python datasets/asearcher/prepare_asearcher.py --out-dir data/asearcher
 ```

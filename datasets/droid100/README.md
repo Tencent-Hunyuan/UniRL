@@ -20,9 +20,12 @@ single-arm episodes in LeRobot v3 format. Downloaded automatically through
 `huggingface_hub.snapshot_download`; pass `--hf-local-dir` to reuse an existing snapshot and
 `--repo` to point at another LeRobot-v3 dataset.
 
-Video decoding needs PyAV (`pip install av`).
-
 ## Cook
+
+Needs the converter dependencies (`pip install -e '.[dataset-prep]'`, see
+[`../README.md`](../README.md#install)) — this one reads LeRobot's parquet metadata with
+`pandas` and decodes video with `av`. Both are required lazily, so a missing one exits with
+the package to install rather than a traceback.
 
 ```bash
 python datasets/droid100/prepare_droid100.py --root datasets/droid100_debug

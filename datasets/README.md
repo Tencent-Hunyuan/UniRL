@@ -15,6 +15,19 @@ package.
 | Runtime data source / reader / manifest contract | `unirl/data/` |
 | Downloaded snapshots and generated manifests | local only — never committed |
 
+## Install
+
+The converters need a few libraries the framework itself does not (`datasets`, `pandas`,
+`pyarrow`, `av`). They live in one extra, so cook with:
+
+```bash
+pip install -e '.[dataset-prep]'
+```
+
+Installing `unirl` at all is only strictly required for the converters that import it
+(`sft_manifests/prepare_sft_agent.py`, `searchgen/prepare_sft.py`), but the extra is the
+simplest way to get the rest. Training does not need it.
+
 ## Adding a dataset
 
 Create `datasets/<name>/` with the converter and a `README.md` covering: the upstream source

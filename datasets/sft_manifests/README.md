@@ -23,6 +23,10 @@ Sources are downloaded automatically into your HF cache; set `HF_ENDPOINT` for a
 
 ## Cook
 
+Needs the converter dependencies (`pip install -e '.[dataset-prep]'`, see
+[`../README.md`](../README.md#install)) — all four read the Hub through `datasets`, and
+`prepare_sft_agent.py` additionally imports `unirl`.
+
 ```bash
 python datasets/sft_manifests/prepare_sft_text.py --out-dir data/sft_alpaca
 python datasets/sft_manifests/prepare_sft_vlm.py  --out-dir data/sft_vlm --max-samples 4000
