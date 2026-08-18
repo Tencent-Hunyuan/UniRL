@@ -81,9 +81,23 @@ train-backend adapter), not in generic infrastructure. In particular:
 - `utils/` is only for stable, domain-agnostic leaves. A function used by one
   model, dataset, backend, or algorithm stays with that owner.
 
-These already-clean directions are checked by
-[`lint/check_core_dependencies.py`](../lint/check_core_dependencies.py). Known
-larger exceptions are migration work, not conventions to copy.
+The already-clean directions are locked by
+[`lint/check_core_dependencies.py`](../lint/check_core_dependencies.py)
+(TYPE_CHECKING-only imports exempt): `types/`, `config/`, `utils/`, `sde/`,
+`data/`, and `models/types/` never import the loop tier or concrete models;
+`models/` never imports algorithms, data, rewards, rollout, or trainers;
+`algorithms/` sees model contracts, never concrete model families; `train/`
+sees model contracts and `algorithms/base`, never concrete algorithms;
+`distributed/` never imports algorithms, data, models, rewards, rollout, or
+trainers.
+
+Directions the tree does not yet satisfy are left unlocked rather than hidden
+behind allowlists. The open debt, named so it is not copied as precedent:
+`models/` (`hunyuan_image3`, `qwen3_5`, `qwen3_moe`) and
+`distributed/weight_sync/` reach into `train/backend/veomni` (EP fusing /
+`_compat`), `models/cosmos3` subclasses the train-side SFT track builder, and
+`algorithms/` flips `train/lora` adapters. That is migration work, not a
+convention to copy.
 
 ## Where new code goes
 
@@ -91,7 +105,7 @@ larger exceptions are migration work, not conventions to copy.
 |---|---|
 | Model forward/replay, timestep, scheduler, packing, model-only preprocessing | `models/<family>/` |
 | Generic dataset reading, batching, runtime normalization | `data/` |
-| One-off dataset download/conversion CLI | `datasets/<dataset>/convert_*.py` |
+| One-off dataset download/conversion CLI | [`datasets/<dataset>/`](../datasets/README.md), repo root beside `unirl/` |
 | Loss, ratio/clip, advantage policy for one RL method | `algorithms/` |
 | Engine lifecycle or model↔engine wire translation | `rollout/engine/<backend>/` and its `adapters/` |
 | Score construction and scorer-specific loading | `reward/` |
