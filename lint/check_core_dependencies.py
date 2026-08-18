@@ -150,7 +150,7 @@ def main() -> int:
             if module == "unirl":
                 errors.append(
                     f"{path.relative_to(ROOT)}:{lineno}: {owner} imports the bare 'unirl' namespace, "
-                    "which reaches every sibling the process has loaded; import the specific submodule"
+                    "which reaches every loaded sibling; use `from ... import ...` or alias a dotted import with `as`"
                 )
                 continue
             if any(_matches(module, prefix) for prefix in allowed):
