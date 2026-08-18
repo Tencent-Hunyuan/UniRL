@@ -12,7 +12,7 @@ import torch
 from torch import Tensor, nn
 from torch.nn.parameter import Parameter
 
-from unirl.distributed.tensor.local import local_view
+from unirl.distributed.local import local_view
 from unirl.models.types.post_materialize import defer_after_materialize
 from unirl.train.configs import EmaFullConfig, EmaLoraConfig
 from unirl.train.lora import (

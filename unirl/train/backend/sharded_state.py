@@ -9,7 +9,7 @@ import torch
 from torch import nn
 from torch.nn.parameter import Parameter
 
-from unirl.distributed.tensor.local import local_view
+from unirl.distributed.local import local_view
 
 logger = logging.getLogger(__name__)
 
@@ -168,7 +168,7 @@ def drop_meta_entries(state_dict: StateDict) -> StateDict:
     """Drop never-materialized (meta) entries from a sharded state dict."""
     kept: StateDict = {}
     for key, value in state_dict.items():
-        local = getattr(value, "_local_tensor", value)
+        local = local_view(value) if isinstance(value, torch.Tensor) else value
         if isinstance(local, torch.Tensor) and local.is_meta:
             continue
         kept[key] = value
@@ -307,7 +307,6 @@ __all__ = [
     "move_optimizer_state",
     "lora_state_dict",
     "nft_state_dict",
-    "local_view",
     "is_materialized",
     "trainable_params",
     "infer_device",
