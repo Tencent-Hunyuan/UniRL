@@ -90,7 +90,10 @@ def _owner(path: Path) -> str | None:
 
 def _is_type_checking(test: ast.expr) -> bool:
     return (isinstance(test, ast.Name) and test.id == "TYPE_CHECKING") or (
-        isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING"
+        isinstance(test, ast.Attribute)
+        and isinstance(test.value, ast.Name)
+        and test.value.id == "typing"
+        and test.attr == "TYPE_CHECKING"
     )
 
 
@@ -118,7 +121,7 @@ def _imports(path: Path):
             stack.extend(node.orelse)
         elif isinstance(node, ast.Import):
             for alias in node.names:
-                yield node.lineno, alias.name
+                yield node.lineno, "unirl" if alias.asname is None and alias.name.startswith("unirl.") else alias.name
         elif isinstance(node, ast.ImportFrom):
             module = _resolve_import(path, node)
             if not module:
