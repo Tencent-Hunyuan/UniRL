@@ -76,23 +76,16 @@ local/
 *.pkl
 *.log
 
-# Datasets: keep committed prompt sets and converter code, ignore local-only data
-datasets/*
-!datasets/pickscore
-!datasets/ocr
-!datasets/geneval
-!datasets/geneval2
-!datasets/video_r1_260k
-!datasets/daily_omni_av
-!datasets/dcase2025_audio_qa
-!datasets/ucf101
-!datasets/searchgen
-# Dataset guides/converters are tracked; generated outputs stay local-only
+# Datasets: converter code, guides, and committed prompt sets are tracked by
+# default. Downloaded snapshots and generated outputs stay local-only. Adding a
+# new datasets/<name>/ must not require an allowlist entry here.
+datasets/**/raw/
+datasets/**/processed/
 datasets/video_r1_260k/**/*.jsonl
 datasets/daily_omni_av/**/*.jsonl
-datasets/ucf101/raw/
-datasets/ucf101/processed/
-datasets/searchgen/processed/
+
+# Default --out-dir of the datasets/ converters
+/data/
 
 # Large model artifacts (defense-in-depth)
 models/**/*.bin

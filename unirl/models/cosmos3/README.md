@@ -77,7 +77,7 @@ finetuning, but the head no longer matches the base checkpoint's pretrained acti
 semantics. Policy mode noises the full action chunk (no clean action conditioning);
 channels ≥ `raw_action_dim` are pinned to zero in sample and target, matching inference.
 
-## Data prep (`python -m unirl.utils.prepare_droid100`)
+## Data prep (`python datasets/droid100/prepare_droid100.py`)
 
 Emits, under `--root` (default `datasets/droid100_debug`):
 

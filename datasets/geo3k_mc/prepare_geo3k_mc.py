@@ -31,7 +31,7 @@ metadata fields are informational. The diagram rides on ``media_refs`` (not inli
 the ``<image>`` placeholder is stripped from the prompt text.
 
 Usage:
-  python -m unirl.utils.prepare_geo3k_mc --out-dir data/geo3k_mc
+  python datasets/geo3k_mc/prepare_geo3k_mc.py --out-dir data/geo3k_mc
   # -> data/geo3k_mc/{train.jsonl, val.jsonl, test.jsonl} + data/geo3k_mc/images/
 
   QWEN_VL_PATH=Qwen/Qwen2.5-VL-7B-Instruct \

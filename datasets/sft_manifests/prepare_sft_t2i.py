@@ -20,7 +20,7 @@ plus an ``images/`` subdir next to the jsonl. Default source is
 finetune set); any dataset with ``image`` + ``text``/``caption`` columns works.
 
 Usage:
-  python -m unirl.utils.prepare_sft_t2i --out-dir data/sft_t2i
+  python datasets/sft_manifests/prepare_sft_t2i.py --out-dir data/sft_t2i
   # -> data/sft_t2i/{train.jsonl, val.jsonl} + data/sft_t2i/images/
 
 Set HF_ENDPOINT for a mirror.

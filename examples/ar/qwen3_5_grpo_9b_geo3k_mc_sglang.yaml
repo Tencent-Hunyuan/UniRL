@@ -6,7 +6,7 @@
 # end-to-end on 1 GPU. Override QWEN3_5_PATH for real training.
 #
 # Data prep (one-time):
-#   python -m unirl.utils.prepare_geo3k_mc --out-dir data/geo3k_mc
+#   python datasets/geo3k_mc/prepare_geo3k_mc.py --out-dir data/geo3k_mc
 #
 # Smoke (1 GPU, 1 rollout, tiny model):
 #   python -m unirl.train_ar --config-name=ar/qwen3_5_grpo_9b_geo3k_mc_sglang num_devices=1 num_rollouts=1

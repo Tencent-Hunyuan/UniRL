@@ -20,7 +20,7 @@ answers are both supervised. The split is trajectory-level to keep turns from
 the same conversation out of both train and validation.
 
 Usage:
-  python -m unirl.utils.prepare_sft_agent \
+  python datasets/sft_manifests/prepare_sft_agent.py \
     --out-dir datasets/sft_agent_toolcall_12k
 """
 
