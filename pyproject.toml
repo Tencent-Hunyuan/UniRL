@@ -91,6 +91,11 @@ train = [
 infer = [
   "accelerate>=0.30",
 ]
+# Native Hopper E4M3 rollout path. Kept optional because Transformer Engine
+# wheels/extensions must match the task image's CUDA/PyTorch stack.
+fp8 = [
+  "transformer-engine[pytorch] ; sys_platform == 'linux'",
+]
 eval = [
   "torchvision>=0.16",
   "easyocr>=1.7",

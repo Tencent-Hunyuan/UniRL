@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple, Type
 
 import torch
 
+from unirl.train.lora import adapters_disabled
 from unirl.types.conditions import Condition
 from unirl.types.segments.latent import LatentSegment
 from unirl.utils.misc import aggregate_numeric_metrics
@@ -74,11 +75,8 @@ class DiffusionNFT(StageAlgorithm):
             raise ValueError(
                 f"DiffusionNFT: training_timestep_fraction must lie in (0, 1]; got {training_timestep_fraction!r}."
             )
-        if float(kl_coef) > 0:
-            raise ValueError(
-                "DiffusionNFT: kl_coef > 0 not supported (KL penalty against base "
-                "model not implemented in this revision)."
-            )
+        if float(kl_coef) < 0:
+            raise ValueError(f"DiffusionNFT: kl_coef must be >= 0; got {kl_coef!r}.")
         if not (0.0 < float(beta)):
             raise ValueError(f"DiffusionNFT: beta must be > 0; got {beta!r}.")
         if not (0.0 < float(adv_clip_max)):
@@ -94,6 +92,9 @@ class DiffusionNFT(StageAlgorithm):
         self.stage = stage
         self.params = params
         self.nft_lora_policy = nft_lora_policy
+        self.reference_model = getattr(backend, "model", None) if backend is not None else None
+        if float(kl_coef) > 0 and self.reference_model is None:
+            raise TypeError("DiffusionNFT: kl_coef > 0 requires backend.model for the adapter-disabled reference.")
         self.conditions_cls = conditions_cls
         self.config = DiffusionNFTConfig(
             beta=float(beta),
@@ -226,6 +227,16 @@ class DiffusionNFT(StageAlgorithm):
                 params=self.params,
             )
         old_pred = old_pred.detach()
+        ref_pred = None
+        if self.config.kl_coef > 0:
+            with torch.no_grad(), adapters_disabled(self.reference_model):
+                ref_pred = self.stage.predict_noise_at_step(
+                    conditions,
+                    sample=xt,
+                    sigma=t_batch,
+                    params=self.params,
+                )
+            ref_pred = ref_pred.detach()
 
         beta = float(self.config.beta)
         positive_pred = beta * new_pred + (1.0 - beta) * old_pred
@@ -257,6 +268,12 @@ class DiffusionNFT(StageAlgorithm):
 
         policy_loss = (r * pos_loss / beta + (1.0 - r) * neg_loss / beta).mean()
         total = policy_loss * float(self.config.adv_clip_max)
+        kl_loss = new_pred.new_zeros(())
+        old_kl = new_pred.new_zeros(())
+        if ref_pred is not None:
+            kl_loss = ((new_pred - ref_pred) ** 2).mean()
+            old_kl = ((old_pred - ref_pred) ** 2).mean()
+            total = total + float(self.config.kl_coef) * kl_loss
 
         metrics = {
             "policy_loss": float(policy_loss.detach().item()),
@@ -266,6 +283,8 @@ class DiffusionNFT(StageAlgorithm):
             "advantage_mean": float(adv.mean().detach().item()),
             "advantage_std": float(adv.std().detach().item()) if B > 1 else 0.0,
             "prediction_deviation": float(((new_pred - old_pred) ** 2).mean().detach().item()),
+            "kl_loss": float(kl_loss.detach().item()),
+            "old_kl": float(old_kl.detach().item()),
             "x0_norm": float((x0**2).mean().detach().item()),
             "t_value": float(t_scalar.detach().item()),
         }

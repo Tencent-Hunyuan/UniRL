@@ -1,0 +1,231 @@
+# @package _global_
+# H20 adaptation of Sol-RL: 128 FP8 scouts -> top8/bottom8 -> 16 BF16
+# regenerations -> DiffusionNFT.  The paper-parity 96/24 and naive BF16 arms
+# are produced with explicit Hydra overrides (documented in
+# train_scripts/sol_rl_h20/README.md) so every arm shares this recipe.
+
+num_devices: 32
+devices_per_node: 8
+batch_size: 48
+num_rollouts: 100
+
+layout: separate
+train_fraction: 0.25       # 8 H20
+reward_fraction: 0.25      # 8 H20
+rollout_sleep_after_generate: false
+weight_sync_interval: 1
+
+adv_use_global_std: true
+accumulate_rollouts: 1
+
+contrastive_rollout:
+  mode: scout_regen
+  top_k: 8
+  bottom_k: 8
+  prompt_chunk_size: 16
+  trace_dir: ${oc.env:SOLRL_TRACE_DIR,null}
+  trace_interval: 1
+
+bundle:
+  _target_: unirl.models.sd3.bundle.SD3Bundle.from_config
+  config:
+    _target_: unirl.models.sd3.config.SD3PipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,stabilityai/stable-diffusion-3.5-large}
+    model_precision: bf16
+    vae_dtype: bf16
+    text_encoder_dtype: bf16
+    shift: 3.0
+    load_vae: false
+
+pipeline:
+  _target_: unirl.models.sd3.pipeline.SD3Pipeline
+  shift: 3.0
+  autocast_precision: bf16
+  trajectory_precision: bf16
+  logprob_precision: fp32
+  strategy:
+    _target_: unirl.sde.kernels.DPM2Strategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["JointTransformerBlock"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: false
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 3.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 1.0e-4
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 10000
+  ema_lora_cfg:
+    _target_: unirl.train.configs.EmaLoraConfig
+    rank: 32
+    alpha: 64
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    shadow_adapter: old
+    ema_decay: 0.001
+    ema_decay_type: warmup
+    ema_flat_steps: 0
+    ema_uprate: 0.001
+    ema_uphold: 0.5
+    timing: rollout_end
+    target_modules:
+      - attn.add_k_proj
+      - attn.add_q_proj
+      - attn.add_v_proj
+      - attn.to_add_out
+      - attn.to_k
+      - attn.to_out.0
+      - attn.to_q
+      - attn.to_v
+
+rollout:
+  _target_: unirl.rollout.engine.native_sd3.engine.NativeSD3RolloutEngine
+  model_config: ${bundle.config}
+  strategy: ${pipeline.strategy}
+  config:
+    _target_: unirl.rollout.engine.native_sd3.config.NativeSD3EngineConfig
+    # 1024px SD3.5-L activations are large; start conservatively and profile
+    # upward on the actual H20 SKU rather than assuming a 128-row DiT forward fits.
+    forward_batch_size: 8
+    fp8_enabled: true
+    fp8_recipe: current
+    fp8_min_dim: 1024
+    fp8_dim_multiple: 16
+    bf16_prefix_steps: 0
+    bf16_suffix_steps: 0
+    compile_model: true
+    compile_mode: max-autotune-no-cudagraphs
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.local.hpsv2.HPSv2RewardScorer
+    base_device: cuda
+    config:
+      _target_: unirl.reward.local.hpsv2.HPSv2Spec
+      batch_size: 32
+      device: auto
+      open_clip_path: ${oc.env:HPSV2_OPEN_CLIP,./hps_ckpt/open_clip_pytorch_model.bin}
+      checkpoint_path: ${oc.env:HPSV2_CHECKPOINT,./hps_ckpt/HPS_v2.1_compressed.pt}
+
+algorithm:
+  _target_: unirl.algorithms.diffusionnft.DiffusionNFT
+  stage_attr: diffusion
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.sd3.conditions.SD3Conditions
+  params: ${sampling}
+  beta: 1.0
+  adv_clip_max: 5.0
+  adv_mode: raw
+  use_adaptive_weight: true
+  train_timestep_mode: all
+  shuffle_train_timesteps: true
+  apply_time_shift_in_loss: false
+  training_timestep_fraction: 0.6
+  kl_coef: 1.0e-4
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 4
+  max_grad_norm: 0.002
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: datasets/pickscore/train.txt
+      eval_data_path: datasets/pickscore/test.txt
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+# High-fidelity BF16 trajectory used by DiffusionNFT.
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  num_inference_steps: 10
+  guidance_scale: 1.0
+  height: 1024
+  width: 1024
+  eta: 0.0
+  samples_per_prompt: 16
+  seed: 42
+  init_same_noise: false
+  autocast_precision: bf16
+  trajectory_precision: bf16
+  logprob_precision: fp32
+  rollout_precision: bf16
+  scheduler:
+    _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+    num_timesteps: ${..num_inference_steps}
+    num_sde_steps: 0
+
+# Ranking-only candidate pool. Images are resized before reward transport;
+# initial latents and rewards are retained only until top/bottom selection.
+scout_sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  num_inference_steps: 6
+  guidance_scale: 1.0
+  height: 1024
+  width: 1024
+  eta: 0.0
+  samples_per_prompt: 128
+  seed: 42
+  init_same_noise: false
+  autocast_precision: bf16
+  trajectory_precision: bf16
+  logprob_precision: fp32
+  rollout_precision: fp8
+  reward_image_size: 224
+  scheduler:
+    _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+    num_timesteps: ${..num_inference_steps}
+    num_sde_steps: 0
+
+sync:
+  _target_: unirl.distributed.weight_sync.full.nccl.NCCLWeightSync
+  lora_merged: true
+  group_name: weight_sync
+  bucket_size_mb: 512
+  flush_cache: true
+  name_remap: {"*": "transformer.*"}
+
+eval_interval: 10
+eval_num_prompts: 2048
+eval_samples_per_prompt: 1
+eval_chunk_prompts: 16
+eval_eta: 0.0
+eval_sampling:
+  num_inference_steps: 40
+  height: 1024
+  width: 1024
+  guidance_scale: 1.0
+  rollout_precision: bf16
+  reward_image_size: null
+
+logging:
+  report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,true}}
+  project_name: ${oc.env:WANDB_PROJECT,unirl-solrl-h20}
+  run_name: ${oc.env:WANDB_RUN_NAME,sd35l-solrl-fp8-128x16}
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: ["sd3.5-large", "sol-rl", "fp8", "h20", "diffusionnft"]
+  log_media: true
+  media_max_items: 8
+  media_log_interval: 1
