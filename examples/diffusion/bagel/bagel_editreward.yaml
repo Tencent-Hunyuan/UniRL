@@ -95,6 +95,7 @@ backend:
     fsdp_mode: full
     reshard_after_forward: true
     activation_checkpointing: true     # 7B + multi-step replay + dual-CFG forwards: required
+    ac_wrap_order: inside              # the composition the it2i differentiable-replay smoke validated (see unirl/models/bagel/README.md)
     use_torch_compile: false
     root_wrap: false                   # vendored BAGEL calls embed_tokens/lm_head outside a root forward
   optimizer_cfg:
