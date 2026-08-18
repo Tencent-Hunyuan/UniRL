@@ -17,12 +17,10 @@ def _workspace_pool_key(ubatch_id: int) -> str:
 
 @contextmanager
 def _workspace_memory_pool(allocator: Any, ubatch_id: int) -> Iterator[None]:
-    """Create one replaceable pool per ubatch while keeping one sleep tag.
-
-    The pool dictionary key is ubatch-specific so DBO slots do not replace one
-    another. Allocation callbacks still receive ``MOE_WORKSPACE_TAG`` so sleep
-    and tagged wake treat every slot as one logical resource.
-    """
+    """Create one replaceable pool per ubatch while keeping one sleep tag."""
+    # The dictionary key is ubatch-specific so DBO slots do not replace one
+    # another. Allocation callbacks still receive MOE_WORKSPACE_TAG so sleep
+    # and tagged wake treat every slot as one logical resource.
     pool_key = _workspace_pool_key(ubatch_id)
     with allocator.use_memory_pool(tag=pool_key):
         pool_key_tag = allocator.current_tag
