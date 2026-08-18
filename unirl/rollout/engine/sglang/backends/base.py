@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import base64
+import io
+import pickle
 from typing import (
     Any,
     Dict,
@@ -13,6 +16,13 @@ from typing import (
 )
 
 _REQUIRED_SERVER_ARGS_METADATA_KEY = "_unirl_required_server_args"
+
+
+def _serialize_lora_tensors(lora_tensors: Dict[str, Any]) -> str:
+    """Serialize CPU LoRA tensors as a base64 pickle for SGLang's SafeUnpickler — see ../../README.md."""
+    buf = io.BytesIO()
+    pickle.dump(lora_tensors, buf)
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
 def _filter_server_args_or_raise(

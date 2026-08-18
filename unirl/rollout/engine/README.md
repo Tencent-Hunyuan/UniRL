@@ -61,3 +61,12 @@ handler in `../../distributed/weight_sync`.
 - **An engine that will serve as an agentic inner must make `generate` safe for
   concurrent callers** — the agentic coordinator drives one trajectory per drain
   thread.
+- **Never hand SGLang a `MultiprocessingSerializer` LoRA payload.** Stock upstream
+  serializes with `ForkingPickler`, whose `resource_sharer` file descriptors are
+  one-shot: with rollout TP>1 the scheduler subprocesses race for the same handle and
+  the adapter load fails or lands on one worker only. `sglang/backends/base.py`
+  serializes the CPU tensors as a base64 pickle instead — inlined bytes need no
+  descriptor passing. The payload is then the adapter itself (tens of MB for a rank-16
+  adapter on a 30B model, ~1.33x from base64) on every sync, deliberately, for all
+  `tp_size`; revisit only with a measurement, and re-check on a SGLang bump that the
+  `SafeUnpickler` allowlist still admits `torch.storage`.

@@ -11,7 +11,7 @@ import threading
 import time
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Sequence, TypeVar
 
-from unirl.rollout.engine.sglang.backends.base import _filter_server_args_or_raise
+from unirl.rollout.engine.sglang.backends.base import _filter_server_args_or_raise, _serialize_lora_tensors
 from unirl.rollout.engine.sglang.backends.http import parse_generate_response
 
 logger = logging.getLogger(__name__)
@@ -47,12 +47,10 @@ def _import_sglang_engine() -> Dict[str, Any]:
         UpdateWeightsFromTensorReqInput,
     )
     from sglang.srt.server_args import ServerArgs
-    from sglang.srt.utils import MultiprocessingSerializer
 
     return {
         "Engine": Engine,
         "ServerArgs": ServerArgs,
-        "MultiprocessingSerializer": MultiprocessingSerializer,
         "UpdateWeightsFromTensorReqInput": UpdateWeightsFromTensorReqInput,
         "LoadLoRAAdapterFromTensorsReqInput": LoadLoRAAdapterFromTensorsReqInput,
     }
@@ -466,7 +464,7 @@ class NativeBackend:
     ) -> None:
         """Serialize the LoRA tensor bag and hot-load it on the Engine."""
         self._require_alive("set_lora")
-        serialized = self._rt["MultiprocessingSerializer"].serialize(lora_tensors, output_str=True)
+        serialized = _serialize_lora_tensors(lora_tensors)
         obj = self._rt["LoadLoRAAdapterFromTensorsReqInput"](
             lora_name=str(lora_name),
             config_dict=dict(config_dict or {}),

@@ -19,6 +19,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 from unirl.rollout.engine.sglang.backends.base import (
     _filter_server_args_or_raise,
     _normalize_cuda_visible_devices,
+    _serialize_lora_tensors,
 )
 
 logger = logging.getLogger(__name__)
@@ -117,12 +118,10 @@ def _import_sglang_runtime() -> Dict[str, Any]:
         UpdateWeightsFromTensorReqInput,
     )
     from sglang.srt.server_args import ServerArgs
-    from sglang.srt.utils import MultiprocessingSerializer
 
     return {
         "launch_server": launch_server,
         "ServerArgs": ServerArgs,
-        "MultiprocessingSerializer": MultiprocessingSerializer,
         "UpdateWeightsFromTensorReqInput": UpdateWeightsFromTensorReqInput,
         "UpdateWeightsFromDistributedReqInput": UpdateWeightsFromDistributedReqInput,
         "InitWeightsUpdateGroupReqInput": InitWeightsUpdateGroupReqInput,
@@ -548,7 +547,7 @@ class HTTPBackend:
         config_dict: Optional[dict] = None,
     ) -> None:
         """Serialize the LoRA tensor bag and hot-load it on the SRT server."""
-        serialized = self._rt["MultiprocessingSerializer"].serialize(lora_tensors, output_str=True)
+        serialized = _serialize_lora_tensors(lora_tensors)
         self._post_struct(
             "/load_lora_adapter_from_tensors",
             self._rt["LoadLoRAAdapterFromTensorsReqInput"](
