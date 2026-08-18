@@ -52,4 +52,5 @@ under your dataset folder, or write it to the repo-root `data/` that the convert
 | [`sft_manifests/`](sft_manifests/README.md) | Generic text / VLM / T2I / agent SFT manifest builders |
 | [`ucf101/`](ucf101/README.md) | UCF101 T2V SFT |
 | [`video_r1_260k/`](video_r1_260k/README.md) | Video-R1-260k video reasoning |
-| `geneval/`, `image_edit/`, `ocr/`, `pickscore/` | Committed prompt sets (no download step) |
+| [`image_edit/`](image_edit/README.md) | Instruction-guided image-editing prompts for EditReward RL (committed jsonl) |
+| `geneval/`, `geneval2/`, `ocr/`, `pickscore/` | Committed prompt sets, no converter in-tree |
