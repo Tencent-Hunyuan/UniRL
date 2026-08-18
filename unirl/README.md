@@ -49,7 +49,7 @@ As source, the package falls into four groups:
 | `sde/` | SDE step kernels, σ schedule/shift, initial-noise generation (the `NoiseRecipe` contract lives in `types/`) |
 | [`types/`](types/README.md) | Shared typed contracts: `Sample` / `Part`, primitives, conditions, segments, rewards, sampling; includes the request/response migration guide |
 | `data/` | Data source and dataset readers |
-| `utils/` | Logging, dtype, media, timing, checkpoint, and misc helpers |
+| [`utils/`](utils/README.md) | Domain-agnostic leaves with several owners: logging, dtype, media/video, metric aggregation, profiling, memory monitoring |
 
 ## Deployment modes
 
