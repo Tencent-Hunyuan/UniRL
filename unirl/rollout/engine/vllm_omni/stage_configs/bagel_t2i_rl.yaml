@@ -1,8 +1,13 @@
-# Single-stage BAGEL-7B-MoT text-to-image config for RL rollout.
+# Single-stage BAGEL-7B-MoT image-out config for RL rollout.
 #
 # BAGEL is the single-stage topology where the DiT worker owns a full
 # Qwen2-MoT LLM + ViT + VAE + tokenizer and handles text2img end-to-end (no
-# separate AR/Thinker prelude — think mode is off for the T2I GRPO path).
+# separate AR/Thinker prelude — think mode is off for the GRPO path).
+#
+# Shared by BOTH image-out modalities — ``bagel_t2i`` and ``bagel_it2i``
+# (editing). The custom worker pipeline owns the ViT and editing prefill; the
+# source image travels on the request (``multi_modal_data["image"]``), not in this
+# config, so the two modalities need no stage-level difference.
 #
 # Diff vs upstream's bagel_single_stage deploy yaml:
 #   - custom_pipeline_args installs our RLBagelPipeline subclass. Unlike SD3/Qwen
@@ -62,7 +67,7 @@ stage_args:
       # Without ``enable_lora``, ``add_lora`` still registers the adapter (so
       # checksum probes pass) but no Linear consults it and the forward silently
       # runs base weights. ``max_lora_rank`` must be >= the recipe's LoRA rank
-      # (64 in bagel_trainside_lora); vllm's default of 16 silently rejects larger.
+      # (64 in the BAGEL LoRA recipes); vLLM's default of 16 rejects larger ranks.
       enable_lora: true
       max_lora_rank: 64
       parallel_config:

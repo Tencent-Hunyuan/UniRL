@@ -7,7 +7,7 @@ from typing import List
 
 from unirl.distributed.tensor.batch import Batch, concat_field
 
-SUPPORTED_MEDIA_MODALITIES = frozenset({"image", "audio", "video"})
+SUPPORTED_MEDIA_MODALITIES = frozenset({"image", "audio", "video", "action"})
 SUPPORTED_MEDIA_ROLES = frozenset({"prompt", "condition", "target"})
 
 

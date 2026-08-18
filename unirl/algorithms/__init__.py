@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from .bagel_flow_unigrpo import BagelFlowUniGRPO
 from .base import AlgorithmStepResult, StageAlgorithm
+from .cosmos3_sft import Cosmos3JointFlowMatchSFT
 from .cppo import CPPO, CPPOConfig
 from .diffusionnft import DiffusionNFT, DiffusionNFTConfig
 from .diffusionopd import DiffusionOPD, TeacherSpec
@@ -27,6 +28,7 @@ __all__ = [
     "PPOConfig",
     "CPPO",
     "CPPOConfig",
+    "Cosmos3JointFlowMatchSFT",
     "DPPO",
     "DPPOConfig",
     "DRPO",

@@ -3,13 +3,18 @@
 > **Where it fits:** shared helpers used across the loop. Full map:
 > [`../README.md`](../README.md).
 
-`utils/` is a grab-bag — each module is a small, self-contained helper
-(`timing.py`, `wandb_logger.py`, `hydra.py`, `media.py`, `misc.py`,
-`profiling.py`, …), named for what it does and carrying a one-line docstring.
-Read the module you need directly; it is short enough. The one exception
-documented here is **GPU memory monitoring**, because it spans two files
-(`memory_utils.py` + `memory_monitor.py`) and three subsystems (sampling on the
-workers, orchestration here, hooks in the trainer).
+`utils/` holds narrowly named, domain-agnostic supporting mechanisms. It is not
+the default home for every reusable function: dataset conversion lives under
+`datasets/<dataset>/`, config resolution under `config/`, trainer composition
+under `trainer/`. A helper belongs here only when its semantics are stable and
+it has several independent owners across the tree.
+
+Each module (`dtypes.py`, `media.py`, `metrics.py`, `video.py`,
+`wandb_logger.py`, `profiling.py`, …) is named for what it does and carries a
+one-line docstring — read the one you need directly; it is short enough. The one
+cross-module feature documented here is **GPU memory monitoring**, because it
+spans two files (`memory_utils.py` + `memory_monitor.py`) and three subsystems
+(sampling on the workers, orchestration here, hooks in the trainer).
 
 The one non-obvious helper is `profiling.py`: `UNIRL_PROFILE` is a single switch
 whose *value* names the region to record.

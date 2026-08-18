@@ -1,12 +1,13 @@
 # @package _global_
 # DanceGRPO WAN 2.1 T2V with the FastVideo rollout engine, colocate, v2 trainer, 1x8.
 #
-# This is wan21_t2v_dancegrpo.yaml with ONLY the rollout swapped from the
+# This is derived from wan21_t2v_dancegrpo.yaml with rollout moved from the
 # in-process trainside engine to the dedicated FastVideo VideoGenerator engine
-# (+ the weight-sync block a dedicated engine requires). Everything else — 720p/
-# 5-frame video shape, UMT5, video_pickscore reward, LoRA targets, DanceGRPO
-# Dance SDE kernel, replay log-prob, sampling schedule — is unchanged from the
-# official recipe.
+# (+ the weight-sync block a dedicated engine requires). The 720p/5-frame shape,
+# UMT5, video_pickscore reward, LoRA targets, Dance SDE kernel, replay log-prob,
+# sigma schedule, and SDE-index window remain aligned with the official recipe.
+# The deterministic non-SDE tail intentionally uses UniPC instead of the
+# trainside recipe's eta=0 Euler steps, so generated trajectories can differ.
 #
 # Two structural deltas the swap forces:
 #   1. A dedicated engine needs `model_config` + `strategy` injected, so the
@@ -37,9 +38,9 @@ model_config:
   _target_: unirl.models.wan21.config.WAN21PipelineConfig
   pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,Wan-AI/Wan2.1-T2V-1.3B-Diffusers}
   model_precision: bf16
-  # Match wan21_t2v_dancegrpo.yaml exactly. The FastVideo engine now sets its
-  # pipeline flow_shift from this value and pre-images custom sigmas before
-  # FastVideo reapplies the shift, so rollout and trainer both consume shift=5.
+  # Match wan21_t2v_dancegrpo.yaml exactly. FlowMatchSchedulePolicy applies this
+  # shift once; the FastVideo adapter consumes the resulting canonical sigmas
+  # verbatim instead of reapplying its scheduler-local flow_shift.
   shift: 5.0
   max_sequence_length: 512
   # FastVideo owns video decoding; the trainer-side pipeline only replays the

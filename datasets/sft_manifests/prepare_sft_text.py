@@ -19,7 +19,7 @@ not HF dataset ids. This tool converts an instruction dataset into that layout:
     (``--val-fraction``, deterministic tail split after a seeded shuffle).
 
 Usage:
-  python -m unirl.utils.prepare_sft_text --out-dir data/sft_alpaca
+  python datasets/sft_manifests/prepare_sft_text.py --out-dir data/sft_alpaca
   # -> data/sft_alpaca/{train.jsonl, val.jsonl}
 
   SFT_DATA=data/sft_alpaca/train.jsonl SFT_EVAL_DATA=data/sft_alpaca/val.jsonl \

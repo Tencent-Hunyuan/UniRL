@@ -28,8 +28,17 @@ def pack_initial_noise_extra_args(
             )
         extra_args["initial_noise_batch"] = initial_latents
     elif diff_params.init_noise_latent_shape:
-        share = bool(getattr(diff_params, "init_same_noise", False))
-        keys = gen_part.group_ids if share else list(gen_part.sample_ids)
+        explicit_keys = list(getattr(gen_part, "init_noise_group_ids", []) or [])
+        if explicit_keys:
+            if len(explicit_keys) != n_samples:
+                raise RuntimeError(
+                    f"{caller}: init_noise_group_ids count {len(explicit_keys)} "
+                    f"!= diffusion sample count {n_samples} after sharding."
+                )
+            keys = explicit_keys
+        else:
+            share = bool(getattr(diff_params, "init_same_noise", False))
+            keys = gen_part.group_ids if share else list(gen_part.sample_ids)
         extra_args["init_noise_group_ids"] = [str(k) for k in keys]
         extra_args["init_noise_latent_shape"] = [int(x) for x in diff_params.init_noise_latent_shape]
         extra_args["init_noise_seed"] = int(diff_params.seed) if getattr(diff_params, "seed", None) is not None else 0

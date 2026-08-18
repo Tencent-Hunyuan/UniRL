@@ -14,7 +14,7 @@ from omegaconf import DictConfig
 from unirl.distributed.group.placement import placement
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer
-from unirl.utils.hydra import remote_hydra
+from unirl.trainer.hydra import remote_hydra
 
 logger = logging.getLogger(__name__)
 

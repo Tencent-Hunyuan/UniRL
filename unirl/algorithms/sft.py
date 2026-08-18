@@ -257,19 +257,16 @@ class FlowMatchSFT(StageAlgorithm):
         return x0.float()
 
     def _draw_sigma(self, batch: int, device: torch.device, generator: Optional[torch.Generator]) -> torch.Tensor:
-        if self.timestep_sampling == "logit_normal":
-            z = torch.randn(batch, device=device, dtype=torch.float32, generator=generator)
-            u = torch.sigmoid(z * self.logit_std + self.logit_mean)
-        else:
-            u = torch.rand(batch, device=device, dtype=torch.float32, generator=generator)
-        s = self.timestep_shift
-        sigma = (s * u) / (1.0 + (s - 1.0) * u)
-        return sigma.clamp(min=self.sigma_min, max=1.0 - self.sigma_min)
-
-    def _sample_eval_seed(self, key: str) -> int:
-        """Stable int64 seed from ``eval_seed`` + a per-sample key (id)."""
-        digest = hashlib.sha256(f"{self.eval_seed}:{key}".encode()).digest()
-        return int.from_bytes(digest[:8], "little") & 0x7FFF_FFFF_FFFF_FFFF
+        return draw_shifted_sigma(
+            batch,
+            timestep_sampling=self.timestep_sampling,
+            logit_mean=self.logit_mean,
+            logit_std=self.logit_std,
+            shift=self.timestep_shift,
+            sigma_min=self.sigma_min,
+            device=device,
+            generator=generator,
+        )
 
     def _eval_draws(self, x0: torch.Tensor, sample_ids: Optional[Sequence[str]]) -> Tuple[torch.Tensor, torch.Tensor]:
         """Per-sample deterministic ``(σ, ε)`` for eval, keyed on sample id so noising is batch-independent."""
@@ -280,7 +277,7 @@ class FlowMatchSFT(StageAlgorithm):
         for i in range(batch):
             key = str(sample_ids[i]) if sample_ids is not None and i < len(sample_ids) else str(i)
             generator = torch.Generator(device=device)
-            generator.manual_seed(self._sample_eval_seed(key))
+            generator.manual_seed(sample_eval_seed(self.eval_seed, key))
             sigmas.append(self._draw_sigma(1, device, generator))
             noises.append(torch.randn(x0[i].shape, device=device, dtype=torch.float32, generator=generator))
         return torch.cat(sigmas, dim=0), torch.stack(noises, dim=0)
@@ -325,4 +322,35 @@ def flow_shift_sigma(u: torch.Tensor, shift: float) -> torch.Tensor:
     return (shift * u) / (1.0 + (shift - 1.0) * u)
 
 
-__all__ = ["SFT", "FlowMatchSFT", "flow_shift_sigma"]
+def draw_shifted_sigma(
+    batch: int,
+    *,
+    timestep_sampling: str,
+    logit_mean: float,
+    logit_std: float,
+    shift: float,
+    sigma_min: float,
+    device: torch.device,
+    generator: Optional[torch.Generator],
+) -> torch.Tensor:
+    """Draw ``[batch]`` fp32 training sigmas: base draw -> ``flow_shift_sigma`` warp -> clamp."""
+    if timestep_sampling == "logit_normal":
+        z = torch.randn(batch, device=device, dtype=torch.float32, generator=generator)
+        u = torch.sigmoid(z * logit_std + logit_mean)
+    elif timestep_sampling == "uniform":
+        u = torch.rand(batch, device=device, dtype=torch.float32, generator=generator)
+    else:
+        raise ValueError(
+            f"draw_shifted_sigma: timestep_sampling must be 'uniform' or 'logit_normal'; got {timestep_sampling!r}."
+        )
+    sigma = flow_shift_sigma(u, shift)
+    return sigma.clamp(min=sigma_min, max=1.0 - sigma_min)
+
+
+def sample_eval_seed(eval_seed: int, key: str) -> int:
+    """Stable int64 eval seed from ``eval_seed`` + per-sample key; shared so eval draws compare across algorithms."""
+    digest = hashlib.sha256(f"{eval_seed}:{key}".encode()).digest()
+    return int.from_bytes(digest[:8], "little") & 0x7FFF_FFFF_FFFF_FFFF
+
+
+__all__ = ["SFT", "FlowMatchSFT", "draw_shifted_sigma", "flow_shift_sigma", "sample_eval_seed"]

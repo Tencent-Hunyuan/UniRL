@@ -7,7 +7,7 @@
 # point at a real Qwen3.5 checkpoint (e.g. /efs/.../Qwen3.5-9B) for training.
 #
 # Data prep (one-time):
-#   python -m unirl.utils.prepare_dapo_math --out-dir data/dapo_math
+#   python datasets/dapo_math/prepare_dapo_math.py --out-dir data/dapo_math
 #   → data/dapo_math/{train.jsonl, aime_eval.jsonl}
 #
 # Smoke (1 GPU, 1 rollout, tiny model):

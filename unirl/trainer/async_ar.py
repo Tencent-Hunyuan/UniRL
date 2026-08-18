@@ -14,9 +14,9 @@ from unirl.train.stack import TrainStepResult
 from unirl.trainer.ar import ARTrainer, ar_preflight
 from unirl.trainer.async_rollout import AsyncRolloutTrainerMixin, training_version_metrics
 from unirl.trainer.base import BaseTrainer, build_sampling_dict
+from unirl.trainer.hydra import parse_hydra_cfg, remote_hydra
 from unirl.types.sample import Sample
 from unirl.types.sampling import BaseSamplingParams, total_samples_per_prompt
-from unirl.utils.hydra import parse_hydra_cfg, remote_hydra
 
 
 def _rollout_dp_size_from_parsed_config(rollout_parsed: dict, *, world_size: int) -> int:
@@ -252,6 +252,10 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
 
     def _async_wandb_extra(self) -> Dict[str, object]:
         return {"adv_normalization_scope": self.adv_normalization_scope}
+
+    def _refill_before_score(self) -> bool:
+        """Overlap AR generation with reward scoring and training."""
+        return True
 
     def _boundary_evaluate(self, rollout_id: int, *, initial: bool) -> None:
         self.evaluate(rollout_id=-1 if initial else rollout_id)

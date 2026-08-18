@@ -17,12 +17,12 @@ from unirl.distributed.tensor import hydrate
 from unirl.rollout.manager import RolloutManager
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample, unwrap_replicated_int
+from unirl.trainer.hydra import parse_hydra_cfg, remote_hydra
 from unirl.types.advantages import finite_mean_std
 from unirl.types.primitives import Texts
 from unirl.types.sample import Part, Sample, _part_with_field
 from unirl.types.sampling import BaseSamplingParams, total_samples_per_prompt
 from unirl.utils.graceful_shutdown import run_with_timeout
-from unirl.utils.hydra import parse_hydra_cfg, remote_hydra
 
 logger = logging.getLogger(__name__)
 

@@ -34,6 +34,9 @@ setup(
             "wandb>=0.16,<0.20",
             "aiohttp>=3.9",
         ],
+        "cosmos3": [
+            "diffusers>=0.39",
+        ],
         "infer": [
             "accelerate>=0.30",
         ],

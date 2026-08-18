@@ -10,7 +10,7 @@
 # (set_lora_from_tensors -> /load_lora_adapter_from_tensors, {name}_v{N}).
 #
 # Data prep + paths: same as qwen_vl_grpo_geo3k_mc_4x8.yaml — build the local
-# jsonl once with `python -m unirl.utils.prepare_geo3k_mc --out-dir data/geo3k_mc`,
+# jsonl once with `python datasets/geo3k_mc/prepare_geo3k_mc.py --out-dir data/geo3k_mc`,
 # then set DATA_PATH=data/geo3k_mc/train.jsonl (QWEN_VL_PATH defaults to the HF id).
 
 num_devices: 32
@@ -148,7 +148,7 @@ data_source:
   _target_: unirl.data.data_source.MultimodalRLDataSource
   args:
     run:
-      data_path: ${oc.env:DATA_PATH}            # local jsonl; build with unirl/utils/prepare_geo3k_mc.py
+      data_path: ${oc.env:DATA_PATH}            # local jsonl; build with datasets/geo3k_mc/prepare_geo3k_mc.py
       eval_data_path: ${oc.env:EVAL_DATA_PATH,${oc.env:DATA_PATH}}
       seed: 42
     algorithm:

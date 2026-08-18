@@ -3,7 +3,7 @@
 #
 # Prerequisites (operational — set on the pod):
 #   - QWEN3_INSTRUCT_PATH : local Qwen3-Instruct checkpoint dir
-#   - DATA_PATH           : ASearcher jsonl (python -m unirl.utils.prepare_asearcher --out-dir data/asearcher)
+#   - DATA_PATH           : ASearcher jsonl (python datasets/asearcher/prepare_asearcher.py --out-dir data/asearcher)
 #   - SERPER_KEY_ID       : Serper web-search API key (search tool)
 #   - JINA_API_KEYS       : Jina reader key (visit tool)
 #   - JUDGE_URL/JUDGE_MODEL: an OpenAI-compatible judge endpoint (e.g. a separate

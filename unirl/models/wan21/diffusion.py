@@ -17,11 +17,11 @@ from unirl.utils.dtypes import parse_torch_dtype
 from .bundle import WAN21Bundle
 from .conditions import WAN21Conditions
 
-_WAN_TIMESTEP_SCALE: float = 1000.0
-
 
 class WAN21DiffusionStep(DiffusionStep[WAN21Bundle, WAN21Conditions]):
     """Per-step WAN 2.1 denoising kernel — stateless."""
+
+    TIMESTEP_SCALE: ClassVar[float] = 1000.0  # sigma [0, 1] -> WAN timestep [0, 1000]
 
     def predict_noise(
         self,
@@ -41,7 +41,7 @@ class WAN21DiffusionStep(DiffusionStep[WAN21Bundle, WAN21Conditions]):
             raise ValueError("WAN21DiffusionStep.predict_noise: conditions.text.embeds is None")
 
         batch_size = int(sample.shape[0])
-        timestep = sigma * _WAN_TIMESTEP_SCALE
+        timestep = sigma * self.TIMESTEP_SCALE
         if timestep.dim() == 0:
             timestep = timestep.expand(batch_size)
         elif int(timestep.shape[0]) != batch_size:

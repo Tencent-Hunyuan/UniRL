@@ -27,6 +27,11 @@ class WAN21PipelineConfig:
 
     shift: float = 5.0
 
+    # UniPC deterministic-solver contract for dedicated engines; must match the checkpoint scheduler.
+    unipc_solver_order: int = 2
+    unipc_solver_type: str = "bh2"
+    unipc_lower_order_final: bool = True
+
     max_sequence_length: int = 512
 
     weight_sync_param_name_prefix: str = "transformer."

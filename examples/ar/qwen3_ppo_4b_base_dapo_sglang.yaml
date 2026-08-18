@@ -2,7 +2,7 @@
 # PPO + GAE on Qwen3-4B-Base / DAPO-Math with colocated SGLang rollout.
 #
 # Prepare data:
-#   python -m unirl.utils.prepare_dapo_math --out-dir data/dapo_math
+#   python datasets/dapo_math/prepare_dapo_math.py --out-dir data/dapo_math
 #
 # Run:
 #   DATA_PATH=data/dapo_math/train.jsonl \

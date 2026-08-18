@@ -10,7 +10,7 @@ import torch
 
 from unirl.types.conditions import Condition
 from unirl.types.segments.latent import LatentSegment
-from unirl.utils.misc import aggregate_numeric_metrics
+from unirl.utils.metrics import aggregate_numeric_metrics
 from unirl.utils.scheduler_utils import normalize_timestep_fraction
 
 from .base import AlgorithmStepResult, BaseAlgorithmConfig, StageAlgorithm
