@@ -20,13 +20,13 @@ UPWARD = (
     "unirl.trainer",
 )
 
-# Each owner lists forbidden namespace prefixes. A rule may allow narrower
-# leaves, such as algorithms/train depending on model Protocols but not a
-# concrete model family.
+# owner -> (forbidden prefixes, allowed sub-prefixes carved back out of forbidden).
 RULES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    "config": (UPWARD, ()),
     "data": (UPWARD, ("unirl.data",)),
-    "types": (UPWARD, ("unirl.types",)),
-    "sde": (UPWARD, ("unirl.sde",)),
+    "sde": (UPWARD, ()),
+    "types": (UPWARD, ()),
+    "utils": (UPWARD, ()),
     "model contracts": (UPWARD, ("unirl.models.types",)),
     "models": (
         (
@@ -36,7 +36,7 @@ RULES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "unirl.rollout",
             "unirl.trainer",
         ),
-        ("unirl.models",),
+        (),
     ),
     "algorithms": (
         (
@@ -46,11 +46,11 @@ RULES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "unirl.rollout",
             "unirl.trainer",
         ),
-        ("unirl.algorithms", "unirl.models.types"),
+        ("unirl.models.types",),
     ),
     "train": (
-        ("unirl.models", "unirl.reward", "unirl.rollout", "unirl.trainer"),
-        ("unirl.models.types", "unirl.train"),
+        ("unirl.algorithms", "unirl.models", "unirl.reward", "unirl.rollout", "unirl.trainer"),
+        ("unirl.algorithms.base", "unirl.models.types"),
     ),
     "distributed": (
         (
@@ -61,7 +61,7 @@ RULES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "unirl.rollout",
             "unirl.trainer",
         ),
-        ("unirl.distributed",),
+        (),
     ),
     "reward": (
         (
@@ -72,22 +72,26 @@ RULES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "unirl.train",
             "unirl.trainer",
         ),
-        ("unirl.reward",),
+        (),
     ),
     "rollout": (
         ("unirl.algorithms", "unirl.data", "unirl.reward", "unirl.train", "unirl.trainer"),
-        ("unirl.rollout",),
+        (),
     ),
 }
 
 
 def _owner(path: Path) -> str | None:
     parts = path.relative_to(UNIRL).parts
-    if len(parts) >= 2 and parts[:2] == ("models", "types"):
+    if parts[:2] == ("models", "types"):
         return "model contracts"
-    if not parts:
-        return None
     return parts[0] if parts[0] in RULES else None
+
+
+def _is_type_checking(test: ast.expr) -> bool:
+    return (isinstance(test, ast.Name) and test.id == "TYPE_CHECKING") or (
+        isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING"
+    )
 
 
 def _resolve_import(path: Path, node: ast.ImportFrom) -> str | None:
@@ -102,20 +106,28 @@ def _resolve_import(path: Path, node: ast.ImportFrom) -> str | None:
 
 
 def _imports(path: Path):
-    """Yield ``(lineno, dotted)`` per imported name; ``from x import y`` yields ``x.y``."""
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
+    """Yield ``(lineno, dotted)`` per runtime-imported name, skipping TYPE_CHECKING blocks."""
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    except (OSError, SyntaxError):
+        return
+    stack: list[ast.AST] = [tree]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, ast.If) and _is_type_checking(node.test):
+            stack.extend(node.orelse)
+        elif isinstance(node, ast.Import):
             for alias in node.names:
                 yield node.lineno, alias.name
         elif isinstance(node, ast.ImportFrom):
             module = _resolve_import(path, node)
             if not module:
                 continue
-            # `from unirl import trainer` binds `unirl.trainer`; a symbol import only
-            # lengthens the path, which prefix matching already tolerates.
+            # A symbol import only lengthens the dotted path, which prefix matching tolerates.
             for alias in node.names:
                 yield node.lineno, module if alias.name == "*" else f"{module}.{alias.name}"
+        else:
+            stack.extend(ast.iter_child_nodes(node))
 
 
 def _matches(module: str, prefix: str) -> bool:
@@ -132,6 +144,12 @@ def main() -> int:
             continue
         forbidden, allowed = RULES[owner]
         for lineno, module in _imports(path):
+            if module == "unirl":
+                errors.append(
+                    f"{path.relative_to(ROOT)}:{lineno}: {owner} imports the bare 'unirl' namespace, "
+                    "which reaches every sibling the process has loaded; import the specific submodule"
+                )
+                continue
             if any(_matches(module, prefix) for prefix in allowed):
                 continue
             if any(_matches(module, prefix) for prefix in forbidden):
