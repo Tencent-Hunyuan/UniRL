@@ -69,6 +69,10 @@ class AgenticTrainer(BaseTrainer):
         stop: Optional[List[str]] = None,
         per_worker_inflight: int = 8,
     ) -> None:
+        worker_max_concurrency = resolve_worker_max_concurrency(
+            cfg,
+            per_worker_inflight=per_worker_inflight,
+        )
         self._validate_config(
             cfg=cfg,
             batch_size=batch_size,
@@ -77,8 +81,13 @@ class AgenticTrainer(BaseTrainer):
             algorithm_cfg=algorithm_cfg,
             sync_cfg=sync_cfg,
             per_worker_inflight=per_worker_inflight,
+            worker_max_concurrency=worker_max_concurrency,
         )
-        super().__init__(cfg=cfg, logging_cfg=logging_cfg)
+        super().__init__(
+            cfg=cfg,
+            logging_cfg=logging_cfg,
+            per_worker_inflight=per_worker_inflight,
+        )
 
         try:
             self.batch_size = int(batch_size)
@@ -97,12 +106,7 @@ class AgenticTrainer(BaseTrainer):
                 self.stack = remote_hydra(stack_cfg, fsdp_backend=self.backend, algorithm=self.algorithm)
                 self._build_colocated_rollout(rollout_cfg, sync_cfg)
 
-            indices = [
-                index
-                for index, rank_info in enumerate(self.rollout.rank_infos)
-                if rank_info.tp_rank == 0 and rank_info.pp_rank == 0
-            ]
-            slots = [self.rollout.slot(index) for index in indices]
+            slots = self.rollout.engine_slots
             launchers = [lambda sample, slot=slot: slot.launch("generate", sample) for slot in slots]
             self._rollout_manager = RolloutManager(
                 self.rollout,
@@ -128,13 +132,13 @@ class AgenticTrainer(BaseTrainer):
         algorithm_cfg: DictConfig,
         sync_cfg: Optional[DictConfig],
         per_worker_inflight: int,
+        worker_max_concurrency: int,
     ) -> None:
         if int(batch_size) <= 0:
             raise ValueError(f"batch_size must be positive; got {batch_size}")
-        # Mirrors BaseTrainer resolution; checked here before runtime construction.
         validate_worker_inflight(
             per_worker_inflight,
-            worker_max_concurrency=resolve_worker_max_concurrency(cfg),
+            worker_max_concurrency=worker_max_concurrency,
             engine_concurrency=None,
         )
         if sync_cfg is None:

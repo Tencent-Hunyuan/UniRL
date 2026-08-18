@@ -56,7 +56,7 @@ class AsyncDiffusionTrainer(AsyncRolloutTrainerMixin, DiffusionTrainer):
         engine_cfg = diffusion_kwargs["rollout_cfg"].get("config", {})
         self._per_worker_inflight = validate_worker_inflight(
             per_worker_inflight,
-            worker_max_concurrency=self.pool.worker_max_concurrency,
+            worker_max_concurrency=self.pool.max_worker_concurrency,
             engine_concurrency=engine_cfg.get("concurrency"),
         )
         self._max_inflight_units = self._max_inflight * self.batch_size

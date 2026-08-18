@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 from collections import deque
 from dataclasses import dataclass
@@ -9,6 +10,10 @@ from typing import TYPE_CHECKING, Any, Callable, Deque, List, Optional, Sequence
 
 if TYPE_CHECKING:
     from unirl.types.sample import Sample
+
+logger = logging.getLogger(__name__)
+
+_WORKER_CONTROL_CONCURRENCY = 2
 
 
 Launch = Callable[["Sample"], Any]
@@ -135,6 +140,15 @@ class RolloutPool:
             self._queue.clear()
             self._condition.notify_all()
         self._thread.join()
+        with self._condition:
+            pending = [*self._running, *self._completed]
+            self._running.clear()
+            self._completed.clear()
+        for unit in pending:
+            try:
+                unit.pending.wait()
+            except Exception:
+                logger.debug("RolloutPool.close: pending call failed during lease drain", exc_info=True)
 
     def _has_remote_work(self) -> bool:
         return bool(self._queue or self._running or any(self._reserved))
@@ -237,6 +251,11 @@ class RolloutPool:
             self._condition.notify_all()
 
 
+def required_worker_concurrency(per_worker_inflight: int) -> int:
+    """Return actor concurrency that leaves room for rollout control calls."""
+    return int(per_worker_inflight) + _WORKER_CONTROL_CONCURRENCY
+
+
 def validate_worker_inflight(
     per_worker_inflight: int,
     *,
@@ -248,13 +267,14 @@ def validate_worker_inflight(
     if per_worker_inflight <= 0:
         raise ValueError(f"per_worker_inflight must be positive; got {per_worker_inflight}")
 
-    # Reserve two actor threads for control calls such as set_stopping, sleep,
-    # and weight synchronization while rollout calls occupy their own slots.
+    # Reserve control-call threads for set_stopping, sleep, and weight sync
+    # while rollout calls occupy their own slots.
     worker_max_concurrency = int(worker_max_concurrency)
-    required_concurrency = per_worker_inflight + 2
+    required_concurrency = required_worker_concurrency(per_worker_inflight)
     if worker_max_concurrency < required_concurrency:
         raise ValueError(
-            f"worker_max_concurrency ({worker_max_concurrency}) must be >= per_worker_inflight + 2 "
+            f"worker_max_concurrency ({worker_max_concurrency}) must be >= per_worker_inflight "
+            f"+ {_WORKER_CONTROL_CONCURRENCY} "
             f"({required_concurrency}) so rollout calls cannot starve control calls"
         )
 
@@ -265,4 +285,4 @@ def validate_worker_inflight(
     return per_worker_inflight
 
 
-__all__ = ["RolloutPool", "validate_worker_inflight"]
+__all__ = ["RolloutPool", "required_worker_concurrency", "validate_worker_inflight"]

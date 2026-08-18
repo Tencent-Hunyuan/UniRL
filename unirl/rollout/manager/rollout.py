@@ -149,7 +149,7 @@ class RolloutManager:
     def counts(self) -> tuple[int, int]:
         self._raise_if_failed()
         inflight_count, completed_count = self._pool.counts
-        return inflight_count, completed_count + len(self._complete)
+        return inflight_count, completed_count + self._complete.group_count
 
     @property
     def empty(self) -> bool:

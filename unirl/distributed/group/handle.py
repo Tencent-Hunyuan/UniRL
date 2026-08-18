@@ -258,7 +258,10 @@ class PendingHandleCall:
 
     def wait(self) -> None:
         """Block until every worker finishes, without collecting; re-raises worker errors."""
-        ray.get(self._refs)
+        try:
+            ray.get(self._refs)
+        finally:
+            self._release_leases()
 
     def result(self) -> Any:
         """Block if needed, then rebind + collect: the method's collected return value."""
@@ -276,11 +279,13 @@ class PendingHandleCall:
                 targets=self._targets,
             )
         finally:
-            # Localized worker handles own the destination TensorStore entries.
-            # Keep them alive until the remote call has consumed its arguments.
-            self._leases = None
+            self._release_leases()
         self._consumed = True
         return self._value
+
+    def _release_leases(self) -> None:
+        """Release handles owning destination TensorStore entries after RPC consumption."""
+        self._leases = None
 
 
 class Slot:

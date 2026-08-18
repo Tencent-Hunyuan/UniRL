@@ -36,7 +36,6 @@ def boundary_launch_units(
     max_inflight_units: int,
     batch_size: int,
     trained_batches: int,
-    num_rollouts: int,
     hard_boundary: int,
     batches_since_sync: int,
     max_staleness_batches: int,
@@ -53,7 +52,7 @@ def boundary_launch_units(
     # Keep enough horizon for cross-publication carry when the configured lag
     # budget permits it; unlike a sync boundary, eval/save/final remain hard.
     freshness_batches = max(0, max_staleness_batches - batches_since_sync + 1)
-    remaining_batches = max(0, min(num_rollouts, hard_boundary) - trained_batches)
+    remaining_batches = max(0, hard_boundary - trained_batches)
     allowed_units = min(freshness_batches, remaining_batches) * batch_size
     return max(0, min(max_inflight_units - outstanding_units, allowed_units - outstanding_units))
 
@@ -132,6 +131,8 @@ def _rollout_id(sample: "Sample") -> int:
 class AsyncRolloutTrainerMixin:
     """One async batch loop shared by ``AsyncARTrainer`` and ``AsyncDiffusionTrainer``."""
 
+    _require_single_generation = False
+
     def _async_wandb_extra(self) -> Dict[str, object]:
         """Trainer-specific keys merged into the wandb run config."""
         return {}
@@ -145,16 +146,9 @@ class AsyncRolloutTrainerMixin:
         raise NotImplementedError
 
     def _score_completed(self, rollout_id: int, completed: "Sample") -> "Sample":
-        for attempt in range(2):
-            try:
-                scored = self.reward.score_and_attach(completed)
-                self._drop_decoded(scored, rollout_id=rollout_id)
-                return scored
-            except Exception:
-                if attempt:
-                    raise
-                logger.warning("reward scoring failed for rollout %d; retrying the same completed batch", rollout_id)
-        raise AssertionError("unreachable")
+        scored = self.reward.score_and_attach(completed)
+        self._drop_decoded(scored, rollout_id=rollout_id)
+        return scored
 
     def _train_async_loop(
         self,
@@ -174,8 +168,7 @@ class AsyncRolloutTrainerMixin:
         self._batches_since_sync = 0
         for _ in range(start_rollout):
             self.data_source.get_samples(self.batch_size)
-        max_staleness = getattr(self, "_max_staleness", self._weight_sync_interval - 1)
-        staleness_budget = max_staleness * self._num_updates_per_batch
+        staleness_budget = self._max_staleness * self._num_updates_per_batch
         self._init_wandb(
             num_rollouts=num_rollouts,
             extra={
@@ -183,7 +176,7 @@ class AsyncRolloutTrainerMixin:
                 "max_inflight_units": self._max_inflight_units,
                 "per_worker_inflight": self._per_worker_inflight,
                 "weight_sync_interval": self._weight_sync_interval,
-                "max_staleness": max_staleness,
+                "max_staleness": self._max_staleness,
                 "staleness_budget": staleness_budget,
                 "num_updates_per_batch": self._num_updates_per_batch,
                 **self._async_wandb_extra(),
@@ -217,7 +210,6 @@ class AsyncRolloutTrainerMixin:
                 )
                 sample, output_version = self._next_rollout_batch(
                     rollout_id,
-                    num_rollouts=num_rollouts,
                     hard_boundary=hard_boundary,
                 )
                 training_progress = rollout_id / max(1, num_rollouts - 1)
@@ -277,12 +269,11 @@ class AsyncRolloutTrainerMixin:
             raise RuntimeError("eval/checkpoint boundary requires an empty RolloutManager")
         if not require_empty:
             # A publication must not split one training batch across behavior
-            # policy versions. Partially generated trajectories cannot cross a
-            # publication at all, so finish their whole carry window. Otherwise
-            # finish only the pristine prefix needed to align the ready buffer.
+            # policy versions. Finish partially generated carry in full, or
+            # only the pristine prefix needed to align the ready buffer.
             started = any(
                 any(part.output_version is not None for part in sample.gen_parts())
-                or (sample.parts and sample.parts[-1].harness_status == "suspended")
+                or sample.parts[-1].harness_status == "suspended"
                 for sample in carried
             )
             if started:
@@ -305,8 +296,7 @@ class AsyncRolloutTrainerMixin:
                     "rollout carry remained unaligned after completing the publication prefix: "
                     f"inflight={inflight_count}, ready={ready_count}, batch_size={self.batch_size}"
                 )
-        if needs_publish:
-            manager.sync_weights(self.weight_sync, output_version=self._train_version)
+        manager.sync_weights(self.weight_sync, output_version=self._train_version)
         if carried:
             manager.submit(carried)
         self._batches_since_sync = 0
@@ -315,30 +305,22 @@ class AsyncRolloutTrainerMixin:
         self,
         rollout_id: int,
         *,
-        num_rollouts: int,
         hard_boundary: int,
     ) -> Tuple["Sample", int]:
-        manager = self._rollout_manager
-        inflight_count, ready_count = manager.counts
-        units = boundary_launch_units(
-            outstanding_units=inflight_count + ready_count,
-            max_inflight_units=self._max_inflight_units,
-            batch_size=self.batch_size,
+        self._admit_prompt_units(
             trained_batches=rollout_id,
-            num_rollouts=num_rollouts,
             hard_boundary=hard_boundary,
             batches_since_sync=self._batches_since_sync,
-            max_staleness_batches=self._max_staleness,
         )
-        self._submit_prompt_units(units)
 
+        manager = self._rollout_manager
         groups = manager.collect(
             self.batch_size,
             current_version=self._train_version,
         )
         completed, output_version = combine_rollout_units(
             groups,
-            require_single_rollout_id=getattr(self, "_require_single_generation", False),
+            require_single_rollout_id=self._require_single_generation,
         )
 
         scored = None
@@ -347,23 +329,35 @@ class AsyncRolloutTrainerMixin:
 
         # Consuming a batch releases capacity immediately. Refill before reward
         # for AR and before training for trainers that require reap-time scoring.
-        inflight_count, ready_count = manager.counts
-        units = boundary_launch_units(
-            outstanding_units=inflight_count + ready_count,
-            max_inflight_units=self._max_inflight_units,
-            batch_size=self.batch_size,
+        self._admit_prompt_units(
             trained_batches=rollout_id + 1,
-            num_rollouts=num_rollouts,
             hard_boundary=hard_boundary,
             batches_since_sync=self._batches_since_sync + 1,
-            max_staleness_batches=self._max_staleness,
         )
-        self._submit_prompt_units(units)
 
         if scored is None:
             scored = self._score_completed(rollout_id, completed)
 
         return scored, output_version
+
+    def _admit_prompt_units(
+        self,
+        *,
+        trained_batches: int,
+        hard_boundary: int,
+        batches_since_sync: int,
+    ) -> None:
+        inflight_count, ready_count = self._rollout_manager.counts
+        units = boundary_launch_units(
+            outstanding_units=inflight_count + ready_count,
+            max_inflight_units=self._max_inflight_units,
+            batch_size=self.batch_size,
+            trained_batches=trained_batches,
+            hard_boundary=hard_boundary,
+            batches_since_sync=batches_since_sync,
+            max_staleness_batches=self._max_staleness,
+        )
+        self._submit_prompt_units(units)
 
     def _submit_prompt_units(self, count: int) -> None:
         batch_count, remainder = divmod(int(count), self.batch_size)
