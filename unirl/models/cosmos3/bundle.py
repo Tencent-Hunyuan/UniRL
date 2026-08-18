@@ -231,7 +231,13 @@ class Cosmos3Bundle(Bundle):
 
         # Uniform master-dtype storage (fp32 storage + bf16 FSDP compute: README # Gotchas).
         meta_init_state = None
+        transformer_weights_root = path
         if config.meta_init_transformer:
+            if not os.path.isdir(path):
+                # sharded_load reads local *.safetensors only; resolve Hub IDs (wan21 VAE precedent).
+                from huggingface_hub import snapshot_download
+
+                transformer_weights_root = snapshot_download(repo_id=path, allow_patterns=["transformer/*"])
             transformer_config = Cosmos3OmniTransformer.load_config(path, subfolder="transformer")
             transformer, meta_init_state = build_meta_init_transformer(
                 lambda: Cosmos3OmniTransformer.from_config(transformer_config), dtype=master_dtype
@@ -284,7 +290,7 @@ class Cosmos3Bundle(Bundle):
             config=config,
         )
         if config.meta_init_transformer:
-            bundle._transformer_weights_path = os.path.join(path, "transformer")
+            bundle._transformer_weights_path = os.path.join(transformer_weights_root, "transformer")
             bundle._meta_init_state = meta_init_state
         return bundle
 

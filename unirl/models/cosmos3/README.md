@@ -50,13 +50,19 @@ short-edge tier table 256/480/720 → 3/5/10; short edges above the 720p bin sta
   pin it via `training.fsdp.fp32_module_names: [time_embedder]` (its own FSDP group with
   an fp32 gather/reduce policy) — without the pin, bf16 all-gather fails loudly on the
   fp32-sinusoid × bf16-linear matmul rather than silently coarsening the timestep signal.
-- **Timestep conditioning is int64-truncated**, exactly like inference:
-  `UniPCMultistepScheduler.set_timesteps` casts every branch to `np.int64` and the
-  pipeline fills `torch.full` from `t.item()`, so training conditions on
-  `int(sigma * num_train_timesteps)` as int64 — never the fractional float.
+- **Timestep conditioning stays continuous fp32** (`sigma * num_train_timesteps`, no
+  rounding), matching NVIDIA's official training (`cosmos-framework`
+  `omni_mot_model.py`: `timesteps = sigmas * max_timestep`, fp32). diffusers-0.39
+  *inference* truncates its scheduler grid to `np.int64` (`set_timesteps` casts every
+  branch; the pipeline fills `t.item()`) — a ≤1-unit quirk the pretrained model
+  tolerates. Do not "align" training to it: training σ are logit-normal draws that
+  never land on the inference grid anyway, so flooring only quantizes the signal and
+  biases the σ↔conditioning map by an average of −0.5 timestep units.
 - **`meta_init_transformer: true`** (both recipes) builds the 16B transformer on the meta
   device and lets the backend load sharded weights after wrapping — the eager path would
-  put the full ~64 GB fp32 model on every rank before sharding.
+  put the full ~64 GB fp32 model on every rank before sharding. The sharded loader reads
+  local `*.safetensors` only, so a Hub-ID checkpoint path is resolved to a local
+  snapshot (`snapshot_download(allow_patterns=["transformer/*"])`) before wrapping.
 - WanVAE was trained with amp off; encode/decode run in the VAE's own dtype
   (`vae_precision`, fp32) and it stays a small eager module.
 

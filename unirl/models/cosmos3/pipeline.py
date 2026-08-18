@@ -158,21 +158,19 @@ class Cosmos3JointStage:
             compute_dtype=self.bundle.dtype,
             **action_kwargs,
         )
-        # Inference conditions on int64-truncated scheduler timesteps (set_timesteps
-        # casts every branch via .astype(np.int64); the pipeline fills torch.full with
-        # t.item()); mirror that exactly instead of the fractional sigma*T.
-        timestep = int(float(sigma.item()) * float(self.pipe.scheduler.config.num_train_timesteps))
+        # Continuous fp32 sigma*T like official Cosmos training; README: timestep conditioning.
+        timestep = float(sigma.item()) * float(self.pipe.scheduler.config.num_train_timesteps)
         kwargs["vision_timesteps"] = torch.full(
             (meta["num_noisy_vision_tokens"],),
             timestep,
-            dtype=torch.int64,
+            dtype=torch.float32,
             device=x0.device,
         )
         if actions is not None:
             kwargs["action_timesteps"] = torch.full(
                 (meta["num_noisy_action_tokens"],),
                 timestep,
-                dtype=torch.int64,
+                dtype=torch.float32,
                 device=x0.device,
             )
 
