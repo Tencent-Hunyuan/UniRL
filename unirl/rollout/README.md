@@ -45,13 +45,18 @@ wrong objective.
   AR and diffusion Parts.
 - **The engines.** `trainside` (in-process — the train actor's pipeline *is* the
   sampler), `sglang_diffusion` (dedicated diffusion), `sglang` (dedicated AR), `vllm_omni`
-  (dedicated; HI3 / SD3 / HunyuanVideo), and `composed` (chains an AR child + a
-  diffusion child for prompt enhancement) are the five single-turn engines.
+  (dedicated; BAGEL / HI3 / SD3 / HunyuanVideo), `fastvideo` (dedicated accelerated video
+  sampling), and `composed` (chains an AR child + a
+  diffusion child for prompt enhancement) are the six single-turn engines.
   `agentic` wraps one of them with an environment to produce multi-turn
-  trajectories. Each diffusion engine consumes the Part's pinned sigmas verbatim,
-  and dedicated engines regenerate `x_T` from the recipe, so two engines start a
-  rollout from the same noise. `forward_batch_size` bounds peak memory by slicing
-  the Sample and concatenating the results.
+  trajectories. Each diffusion engine consumes the Part's pinned sigmas verbatim
+  and reads the same driver-authored `NoiseRecipe` (`../types/noise_recipe.py`),
+  but realizes it differently: `trainside`, `sglang_diffusion` and `vllm_omni`
+  resolve the recipe to an `x_T` tensor, so those three start a rollout from
+  bit-identical noise; `fastvideo` cannot accept a tensor and instead derives
+  per-sample seeds from the recipe's noise-group ids, so its noise matches only
+  in grouping, not bit-for-bit. `forward_batch_size` bounds peak memory by
+  slicing the Sample and concatenating the results.
 - **Deployment modes:** *direct sampling* — the trainside engine, no `sync:`, the
   ratio is 1 on the first update; *separate* — a dedicated engine on its own GPUs
   plus a `sync:` block; *colocate* — a dedicated engine sharing GPUs with train,
@@ -75,6 +80,36 @@ concurrent callers if it should serve as an agentic inner, else serialized
 internally — and dispatch `generate` with `DP_SCATTER`). A dedicated engine also
 implements its weight-receive method and a matching `sync:` handler in
 `../distributed/weight_sync`.
+
+## Engine anatomy, and adding a model to an existing engine
+
+Engine dirs use two layouts. The compact engines (`trainside`, `fastvideo`,
+`composed`, `agentic`) contain `config.py` + `engine.py`. Server-backed engines
+(`sglang`, `sglang_diffusion`, `vllm_omni`) also carry `adapters/`
+(per-family/modality wire-format translation), `backends/` (server process
+management), `utils/`, `weight_sync.py`, and a
+runtime-patch dir for the pinned upstream (`sglang_diffusion/_patches/`,
+`vllm_omni/patches/`). `vllm_omni` additionally carries worker-subprocess code
+(`pipelines/`, `worker/`) and stage boot configs (`stage_configs/`).
+
+Model onboarding is per-engine, and the adapter file is usually **not** the whole
+change surface:
+
+- **`sglang` (AR/VLM):** onboarding is normally config-only: text models use the
+  `text` adapter, while `image_token` selects `vlm`. Add and register a new adapter
+  only for a genuinely new wire shape, extending `TextLMAdapter` or `VLMAdapter`
+  and importing it in `adapters/__init__.py`.
+- **`sglang_diffusion`:** add `adapters/<family>.py` extending `ImageAdapter` or
+  `VideoAdapter`, register it by `model_family`, and import it in
+  `adapters/__init__.py`. New condition fields that cross the wire also need an
+  entry in `_COND_FIELDS` and either `_POS_MAP` / `_NEG_MAP` or an explicit copy
+  branch in `_copy_conditions`; add `_patches/hijack.py` wiring only when the
+  model needs a new upstream patch.
+- **`vllm_omni`:** add an `adapters/<family>.py` binder (keyed by modality),
+  register it, import it in `adapters/__init__.py`, and add the appropriate boot
+  YAML under `stage_configs/`. DiT families additionally need a worker-side
+  `pipelines/<model>/pipeline.py`; if the AR/DiT worker needs new behavior, add a
+  `worker/` extension or `patches/compat_<model>.py`.
 
 ## Gotchas
 
