@@ -180,8 +180,7 @@ class Cosmos3JointStage:
                 f"{tuple(x_t.shape)} cond_frames={condition_frames}). "
                 "condition_on_first_frame with a single latent frame leaves an empty GEMM."
             )
-        # diffusers-0.39 Cosmos3OmniTransformer.forward has no return_dict and always
-        # returns the (vision, sound, action) prediction lists.
+        # diffusers-0.39 forward: bare (vision, sound, action) lists, no return_dict (README # Gotchas).
         preds_vision, _preds_sound, preds_action = self.bundle.transformer(**kwargs)
         if not preds_vision:
             raise RuntimeError("Cosmos3JointStage: transformer returned no vision prediction.")

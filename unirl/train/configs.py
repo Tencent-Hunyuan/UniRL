@@ -98,9 +98,6 @@ class FSDPConfig:
     defer_grad_sync: bool = False
     forward_prefetch: bool = False
     master_dtype: Optional[str] = None
-    # Submodule leaf names exempted from the bf16 compute policy (fp32 gather/reduce),
-    # for models whose inference pins them fp32 (diffusers _keep_in_fp32_modules).
-    fp32_module_names: Tuple[str, ...] = ()
     # Disable root sharding when stages call submodules outside the root forward.
     root_wrap: bool = True
     checkpoint_format: str = "torch"

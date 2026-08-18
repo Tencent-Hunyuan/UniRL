@@ -75,7 +75,6 @@ class FSDPBackend(BaseFSDP2Backend):
             use_torch_compile=fsdp_cfg.use_torch_compile,
             master_dtype=getattr(fsdp_cfg, "master_dtype", None),
             root_wrap=getattr(fsdp_cfg, "root_wrap", True),
-            fp32_module_names=tuple(getattr(fsdp_cfg, "fp32_module_names", ()) or ()),
         )
 
         load_trainable_weights(

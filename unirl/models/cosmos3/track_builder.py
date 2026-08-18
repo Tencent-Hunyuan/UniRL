@@ -34,6 +34,15 @@ class Cosmos3SupervisedTrackBuilder(SupervisedTrackBuilder):
         self.pipeline = pipeline
         self.stage = pipeline.joint
         self.train_action = bool(train_action)
+        if self.train_action:
+            tf_config = self.stage.bundle.transformer.config
+            if not getattr(tf_config, "action_gen", False) or getattr(tf_config, "action_dim", None) is None:
+                raise ValueError(
+                    "train_action=true but the Cosmos3 checkpoint has no action heads "
+                    f"(action_gen={getattr(tf_config, 'action_gen', None)!r}, "
+                    f"action_dim={getattr(tf_config, 'action_dim', None)!r}); point "
+                    "pretrained_model_ckpt_path at an action-capable Cosmos3 variant or set train_action: false."
+                )
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
     def build(self, records: List[Record]) -> Part:

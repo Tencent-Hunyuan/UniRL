@@ -46,10 +46,11 @@ short-edge tier table 256/480/720 → 3/5/10; short edges above the 720p bin sta
   fp32 storage + bf16 mixed compute (the official Cosmos recipe shape).
 - **`time_embedder` must stay fp32 in compute**, matching stock diffusers
   (`_keep_in_fp32_modules = ["time_embedder"]`; the forward casts only *after* the
-  embedder). Full-fp32 recipes satisfy this trivially; a bf16 mixed-precision recipe must
-  pin it via `training.fsdp.fp32_module_names: [time_embedder]` (its own FSDP group with
-  an fp32 gather/reduce policy) — without the pin, bf16 all-gather fails loudly on the
-  fp32-sinusoid × bf16-linear matmul rather than silently coarsening the timestep signal.
+  embedder). The shipped full-fp32 recipes satisfy this trivially. A future bf16
+  mixed-precision recipe must land an fp32 exemption for it (e.g. its own FSDP group with
+  an fp32 gather/reduce policy) together with that recipe — without one, the bf16
+  all-gather fails loudly on the fp32-sinusoid × bf16-linear matmul rather than silently
+  coarsening the timestep signal.
 - **Timestep conditioning stays continuous fp32** (`sigma * num_train_timesteps`, no
   rounding), matching NVIDIA's official training (`cosmos-framework`
   `omni_mot_model.py`: `timesteps = sigmas * max_timestep`, fp32). diffusers-0.39
@@ -109,6 +110,15 @@ inference see the same canvas. Manifest media entries use `role="target"` with
 - diffusers>=0.39 is required (first release with `Cosmos3OmniTransformer` /
   `Cosmos3OmniPipeline`); its `forward` returns the bare `(vision, sound, action)` tuple
   and has no `return_dict`.
+- The H20 workaround patches in `bundle.py` install frozen diffusers-0.39 copies of
+  `DomainAwareLinear.forward`, `dispatch_attention_fn`, and the rotary `forward`. Because
+  the pin is an open `diffusers>=0.39`, each patch first fingerprints the upstream
+  parameter list via `_require_signature` and fails closed on drift — otherwise a newer
+  diffusers would be silently overridden by the stale copy. Re-verify the frozen bodies
+  against the installed diffusers before extending the fingerprints on a version bump.
+- The H20 SDPA wrapper repeats kv heads before dispatch: Cosmos3 attention is GQA
+  (32 q / 8 kv heads), the fused Flash/Efficient kernels require equal head counts, and
+  the MATH fallback is exactly the strided-batched GEMM that is broken on H20+cu128.
 - Eval loss is noised velocity MSE at a per-sample deterministic (σ, ε) draw
   (`unirl.algorithms.sft.sample_eval_seed`) — comparable across runs, but not a
   sample-quality gate (use a later denoise path for PSNR/SSIM).

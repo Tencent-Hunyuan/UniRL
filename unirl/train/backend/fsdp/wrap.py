@@ -57,7 +57,6 @@ def fsdp_wrap(
     use_torch_compile: bool = False,
     master_dtype: Optional[str] = None,
     root_wrap: bool = True,
-    fp32_module_names: Tuple[str, ...] = (),
 ) -> None:
     """Apply FSDP2 wrapping to the model.  No handle returned — DTensors"""
     from torch.distributed.fsdp import (
@@ -110,29 +109,6 @@ def fsdp_wrap(
         if p.dtype != dst:
             p.data = p.data.to(dst)
             casts += 1
-
-    if fp32_module_names:
-        # Exempt named submodules from the bf16 compute policy (fp32 gather + fp32 grad
-        # reduce), mirroring diffusers' _keep_in_fp32_modules at inference. Sharded first
-        # so the block/root wraps below leave their params alone.
-        require(
-            mixed_precision,
-            "fsdp_wrap: fp32_module_names is only meaningful with mixed_precision=True.",
-        )
-        fp32_kwargs = dict(fsdp_kwargs)
-        fp32_kwargs["mp_policy"] = MixedPrecisionPolicy(param_dtype=torch.float32, reduce_dtype=torch.float32)
-        wanted = {str(n) for n in fp32_module_names}
-        matched = set()
-        for name, module in model.named_modules():
-            leaf = name.rsplit(".", 1)[-1]
-            if name and leaf in wanted:
-                fully_shard(module, **fp32_kwargs)
-                matched.add(leaf)
-        require(
-            matched == wanted,
-            f"fsdp_wrap: fp32_module_names {sorted(wanted - matched)} matched no submodule of "
-            f"{type(model).__name__}; a typo here would silently train that module in bf16.",
-        )
 
     if activation_checkpointing:
         from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (

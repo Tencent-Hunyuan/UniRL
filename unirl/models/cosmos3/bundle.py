@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 import re
+from typing import Any, Tuple
 
 import torch
 
@@ -44,10 +46,27 @@ def _import_diffusers_classes():
     return Cosmos3OmniTransformer, AutoencoderKLWan, UniPCMultistepScheduler, Cosmos3OmniPipeline
 
 
+def _require_signature(fn: Any, expected: Tuple[str, ...], what: str) -> None:
+    """Fingerprint a patched diffusers callable so upstream drift fails at patch time (README # Gotchas)."""
+    actual = tuple(inspect.signature(fn).parameters)
+    if actual != expected:
+        raise RuntimeError(
+            f"Cosmos3 {what} drifted from the diffusers-0.39 surface the frozen patch copies: "
+            f"expected parameters {expected}, got {actual}. Re-verify the patch against the "
+            "installed diffusers before bumping the pin."
+        )
+
+
 def _patch_rotary_emb_contiguous(rotary_emb: torch.nn.Module) -> None:
     """Replace Cosmos3's zero-stride mRoPE batched GEMM with an equivalent broadcast multiply."""
     if getattr(rotary_emb, "_unirl_contiguous_rope", False):
         return
+    _require_signature(
+        type(rotary_emb).forward, ("self", "position_ids", "device", "dtype"), f"{type(rotary_emb).__name__}.forward"
+    )
+    for attr in ("inv_freq", "apply_interleaved_mrope", "rope_axes_dim"):
+        if not hasattr(rotary_emb, attr):
+            raise RuntimeError(f"Cosmos3 rotary patch relies on rotary_emb.{attr}, missing on installed diffusers.")
 
     def forward(position_ids: torch.Tensor, device: torch.device, dtype: torch.dtype):
         if position_ids.ndim == 2:
@@ -95,8 +114,7 @@ def _patch_frozen_dtensor_linears(transformer: torch.nn.Module) -> None:
                 b = mod.bias
                 if b is not None and hasattr(b, "full_tensor"):
                     b = b.full_tensor()
-                # H20 + torch 2.10/cu128: every bf16 cublasGemmEx is INVALID,
-                # including a contiguous 64x4096 @ 4096x4096. fp32 sgemm is fine.
+                # H20+cu128 rejects every bf16 cublasGemmEx; fp32 sgemm works (README # Precision & loading).
                 return torch.nn.functional.linear(
                     x.float(),
                     w.float(),
@@ -128,6 +146,7 @@ def _patch_h20_strided_gemm(transformer: torch.nn.Module) -> None:
 
     cls = cosmos3_mod.DomainAwareLinear
     if not getattr(cls, "_unirl_safe_bmm", False):
+        _require_signature(cls.forward, ("self", "x", "domain_id"), "DomainAwareLinear.forward")
 
         def forward(self, x: torch.Tensor, domain_id: torch.Tensor) -> torch.Tensor:
             if domain_id.ndim == 0:
@@ -159,6 +178,23 @@ def _patch_h20_strided_gemm(transformer: torch.nn.Module) -> None:
 
     orig = cosmos3_mod.dispatch_attention_fn
     if not getattr(orig, "_unirl_no_math_sdpa", False):
+        _require_signature(
+            orig,
+            (
+                "query",
+                "key",
+                "value",
+                "attn_mask",
+                "dropout_p",
+                "is_causal",
+                "scale",
+                "enable_gqa",
+                "attention_kwargs",
+                "backend",
+                "parallel_config",
+            ),
+            "dispatch_attention_fn",
+        )
         try:
             from torch.nn.attention import SDPBackend, sdpa_kernel
         except ImportError:  # pragma: no cover
@@ -169,9 +205,7 @@ def _patch_h20_strided_gemm(transformer: torch.nn.Module) -> None:
             q = query.contiguous()
             k = key.contiguous()
             v = value.contiguous()
-            # Cosmos3 is GQA (32 q heads, 8 kv). Efficient/Flash fused kernels
-            # require equal num_heads; the MATH fallback is strided-batched
-            # GEMM and INVALID on H20+cu128. Repeat kv heads before dispatch.
+            # Repeat kv heads: fused kernels need equal q/kv head counts here (README # Gotchas).
             q_heads = q.shape[-2]
             kv_heads = k.shape[-2]
             if q_heads != kv_heads:

@@ -89,7 +89,7 @@ def decode_episode_frames(
     av = _require("av")
     chunk, file, from_ts, to_ts = _episode_video_source(episode_row, camera)
     template = info.get("video_path", "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4")
-    rel = template.format(video_key=camera, chunk_index=chunk, file_index=file, episode_chunk=chunk, episode_index=file)
+    rel = template.format(video_key=camera, chunk_index=chunk, file_index=file)
     path = os.path.join(dataset_root, rel)
     if not os.path.exists(path):
         raise FileNotFoundError(f"video file not found: {path} (template={template!r})")
@@ -137,7 +137,7 @@ def iter_episode_rows(dataset_root: str, info: dict, episodes) -> Iterator[Tuple
         chunk, file = int(chunk_raw), int(file_raw)
         key = (chunk, file)
         if key not in data_files:
-            rel = template.format(chunk_index=chunk, file_index=file, episode_chunk=chunk, episode_index=file)
+            rel = template.format(chunk_index=chunk, file_index=file)
             data_files[key] = pd.read_parquet(os.path.join(dataset_root, rel))
         df = data_files[key]
         yield ep_idx, row, df[df["episode_index"] == ep_idx].sort_values("frame_index")
