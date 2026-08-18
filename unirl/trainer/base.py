@@ -29,7 +29,7 @@ def resolve_worker_max_concurrency(
     """Resolve actor concurrency, deriving it from rollout lanes when omitted."""
     configured = cfg.get("worker_max_concurrency")
     if configured is not None:
-        return int(configured)
+        return configured
 
     effective_inflight = per_worker_inflight
     if effective_inflight is None:
@@ -48,10 +48,10 @@ def resolve_worker_concurrency_by_device(
     layout = cfg.get("layout")
     if layout is not None and str(layout) != "separate":
         return None
-    train_fraction = float(cfg.get("train_fraction", 0.5))
-    num_devices = int(cfg.num_devices)
+    train_fraction = cfg.get("train_fraction", 0.5)
+    num_devices = cfg.num_devices
     train_devices_float = train_fraction * num_devices
-    train_devices = int(round(train_devices_float))
+    train_devices = round(train_devices_float)
     if abs(train_devices_float - train_devices) > 1e-9 or not 0 < train_devices < num_devices:
         return None
     return [1] * train_devices + [rollout_concurrency] * (num_devices - train_devices)

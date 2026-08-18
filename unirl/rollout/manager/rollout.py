@@ -109,7 +109,6 @@ class RolloutManager:
     def finish(self, tasks: List["Sample"], *, current_version: int) -> None:
         """Run an isolated carried prefix to terminal completion without admitting other work."""
         self._ensure_open()
-        current_version = int(current_version)
         if current_version < 0:
             raise ValueError(f"current_version must be non-negative; got {current_version}")
         if not tasks:

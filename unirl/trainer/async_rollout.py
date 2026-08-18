@@ -110,7 +110,7 @@ def combine_rollout_units(
         raise RuntimeError("rollout batch is missing output_version provenance")
     if len(versions) != 1:
         raise RuntimeError(f"rollout batch has mixed output versions: {sorted(versions)}")
-    output_version = int(next(iter(versions)))
+    output_version = next(iter(versions))
     if len(chunks) == 1:
         return chunks[0], output_version
 
@@ -360,7 +360,7 @@ class AsyncRolloutTrainerMixin:
         self._submit_prompt_units(units)
 
     def _submit_prompt_units(self, count: int) -> None:
-        batch_count, remainder = divmod(int(count), self.batch_size)
+        batch_count, remainder = divmod(count, self.batch_size)
         if remainder:
             raise RuntimeError(
                 f"prompt-unit admission must submit whole batches of {self.batch_size}; got {count} units"

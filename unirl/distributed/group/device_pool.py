@@ -45,9 +45,9 @@ class DevicePool:
         self.tq_handoff = tq_handoff
 
         if isinstance(worker_max_concurrency, int):
-            per_device_concurrency = [max(1, int(worker_max_concurrency))] * num_devices
+            per_device_concurrency = [max(1, worker_max_concurrency)] * num_devices
         else:
-            per_device_concurrency = [max(1, int(value)) for value in worker_max_concurrency]
+            per_device_concurrency = [max(1, value) for value in worker_max_concurrency]
             if len(per_device_concurrency) != num_devices:
                 raise ValueError(
                     "worker_max_concurrency must provide one value per device: "
