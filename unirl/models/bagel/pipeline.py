@@ -22,6 +22,7 @@ from unirl.types.segments.text import TextSegment
 
 from . import rl_ops
 from .ar import BagelARStage
+from .chat_template import BagelChatTemplateStage
 from .conditions import BagelARConditions, BagelDiffusionConditions
 from .diffusion import BagelDiffusionParams, BagelDiffusionStage
 from .vae import BagelVAEDecodeStage, BagelVAEEncodeStage, bagel_latent_shape
@@ -60,6 +61,7 @@ class BagelPipeline(Pipeline):
         logprob_precision: str = "fp32",
         shift: float = 3.0,
         replay_mode: str = "train",
+        max_prompt_length: int = 8192,
         cache_t2i_contexts: Optional[bool] = None,
         context_cache_size: Optional[int] = None,
     ) -> None:
@@ -76,6 +78,7 @@ class BagelPipeline(Pipeline):
         self.diffusion = diffusion
         self.vae_decode = vae_decode if vae_decode is not None else BagelVAEDecodeStage(bundle)
         self.vae_encode = BagelVAEEncodeStage(bundle)
+        self.chat_template = BagelChatTemplateStage(bundle, max_prompt_length=max_prompt_length)
         self.ar = BagelARStage(
             model=bundle,
             autocast_precision=autocast_precision,

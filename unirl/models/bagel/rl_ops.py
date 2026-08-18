@@ -6,7 +6,7 @@ import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -447,58 +447,66 @@ def pack_und_forward_inputs(
     model: Any,
     *,
     new_token_ids: Dict[str, Any],
-    prompt_ids: List[int],
-    image: Optional[Any],
+    splits: List[Dict[str, Any]],
     response_input: torch.Tensor,
     device: torch.device,
     vit_transform: Callable[[Any], Any] = lambda x: x,
 ) -> Dict[str, Any]:
-    """Train-mode packing: one und sample ``[ViT image | prompt | response_input]`` with a nested attention mask."""
+    """Train-mode packing: one und sample ``[*ordered splits | response_input]`` with a nested attention mask."""
     from .vendor.data.data_utils import prepare_attention_mask_per_sample
 
     text_ids: List[int] = []
     text_indexes: List[int] = []
     position_ids: List[int] = []
-    vit_tokens = None
-    vit_position_ids = None
+    vit_tokens_parts: List[torch.Tensor] = []
+    vit_position_ids_parts: List[torch.Tensor] = []
     vit_token_indexes: List[int] = []
-    vit_token_seqlens: Optional[torch.Tensor] = None
+    vit_seqlens_parts: List[torch.Tensor] = []
     split_lens: List[int] = []
     attn_modes: List[str] = []
     pos = 0
     rope = 0
 
-    if image is not None:
-        vit_input, _, _ = model.prepare_vit_images(
-            curr_kvlens=[0],
-            curr_rope=[0],
-            images=[image],
-            transforms=vit_transform,
-            new_token_ids=new_token_ids,
-        )
-        img_block_len = int(vit_input["packed_seqlens"][0].item())
-        text_ids.extend(int(t) for t in vit_input["packed_text_ids"].tolist())
-        text_indexes.extend(int(t) for t in vit_input["packed_text_indexes"].tolist())
-        position_ids.extend(int(p) for p in vit_input["packed_position_ids"].tolist())
-        vit_token_indexes.extend(int(t) for t in vit_input["packed_vit_token_indexes"].tolist())
-        vit_tokens = vit_input["packed_vit_tokens"].to(device=device, dtype=model.dtype)
-        vit_position_ids = vit_input["packed_vit_position_ids"].to(device)
-        vit_token_seqlens = vit_input["vit_token_seqlens"].to(device)
-        pos = img_block_len
-        rope = 1
-        split_lens.append(img_block_len)
-        attn_modes.append("full")
+    def _append_text_block(ids: List[int]) -> None:
+        nonlocal pos, rope
+        for tid in ids:
+            text_ids.append(int(tid))
+            text_indexes.append(pos)
+            position_ids.append(rope)
+            pos += 1
+            rope += 1
+        split_lens.append(len(ids))
+        attn_modes.append("causal")
 
-    text_block = list(prompt_ids) + [int(t) for t in response_input.tolist()]
-    resp_start = pos + len(prompt_ids)
-    for tid in text_block:
-        text_ids.append(int(tid))
-        text_indexes.append(pos)
-        position_ids.append(rope)
-        pos += 1
-        rope += 1
-    split_lens.append(len(text_block))
-    attn_modes.append("causal")
+    for sp in splits:
+        kind = sp.get("kind")
+        if kind == "vit":
+            vit_input, _, _ = model.prepare_vit_images(
+                curr_kvlens=[0],
+                curr_rope=[rope],
+                images=[sp["image"]],
+                transforms=vit_transform,
+                new_token_ids=new_token_ids,
+            )
+            img_block_len = int(vit_input["packed_seqlens"][0].item())
+            text_ids.extend(int(t) for t in vit_input["packed_text_ids"].tolist())
+            text_indexes.extend(pos + int(t) for t in vit_input["packed_text_indexes"].tolist())
+            position_ids.extend(int(p) for p in vit_input["packed_position_ids"].tolist())
+            vit_token_indexes.extend(pos + int(t) for t in vit_input["packed_vit_token_indexes"].tolist())
+            vit_tokens_parts.append(vit_input["packed_vit_tokens"])
+            vit_position_ids_parts.append(vit_input["packed_vit_position_ids"])
+            vit_seqlens_parts.append(vit_input["vit_token_seqlens"])
+            pos += img_block_len
+            rope += 1
+            split_lens.append(img_block_len)
+            attn_modes.append("full")
+        elif kind == "text":
+            _append_text_block([int(t) for t in sp["ids"].tolist()])
+        else:
+            raise ValueError(f"pack_und_forward_inputs: unknown split kind {kind!r}; expected 'text' or 'vit'.")
+
+    resp_start = pos
+    _append_text_block([int(t) for t in response_input.tolist()])
     ce_loss_indexes = list(range(resp_start, resp_start + int(response_input.shape[0])))
 
     seqlen = pos
@@ -511,12 +519,16 @@ def pack_und_forward_inputs(
         "packed_text_indexes": torch.tensor(text_indexes, dtype=torch.long, device=device),
         "packed_position_ids": torch.tensor(position_ids, dtype=torch.long, device=device),
         "nested_attention_masks": [nested_mask],
-        "packed_vit_tokens": vit_tokens,
-        "packed_vit_position_ids": vit_position_ids,
+        "packed_vit_tokens": (
+            torch.cat(vit_tokens_parts, dim=0).to(device=device, dtype=model.dtype) if vit_tokens_parts else None
+        ),
+        "packed_vit_position_ids": (
+            torch.cat(vit_position_ids_parts, dim=0).to(device) if vit_position_ids_parts else None
+        ),
         "packed_vit_token_indexes": (
             torch.tensor(vit_token_indexes, dtype=torch.long, device=device) if vit_token_indexes else None
         ),
-        "vit_token_seqlens": vit_token_seqlens,
+        "vit_token_seqlens": (torch.cat(vit_seqlens_parts, dim=0).to(device) if vit_seqlens_parts else None),
         "ce_loss_indexes": torch.tensor(ce_loss_indexes, dtype=torch.long, device=device),
     }
 

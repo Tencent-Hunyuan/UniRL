@@ -86,11 +86,13 @@ datasets/*
 !datasets/daily_omni_av
 !datasets/dcase2025_audio_qa
 !datasets/ucf101
+!datasets/searchgen
 # Dataset guides/converters are tracked; generated outputs stay local-only
 datasets/video_r1_260k/**/*.jsonl
 datasets/daily_omni_av/**/*.jsonl
 datasets/ucf101/raw/
 datasets/ucf101/processed/
+datasets/searchgen/processed/
 
 # Large model artifacts (defense-in-depth)
 models/**/*.bin

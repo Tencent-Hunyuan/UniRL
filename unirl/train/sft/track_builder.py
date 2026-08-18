@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple
 
 import torch
 
-from unirl.data.sft import tokenize_agent_target
+from unirl.data.sft import message_content_image_uris, tokenize_agent_target
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
 from unirl.models.types.codec import EncodeStage
@@ -74,7 +74,7 @@ class SupervisedTrackBuilder(Remote):
 
 
 class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
-    """Dataset records → AR ``Part`` (LLM + VLM), via the bundle's stages."""
+    """Dataset records → AR ``Part`` (LLM / VLM / agent); the agent chat-stage contract is in ``README.md``."""
 
     def __init__(
         self,
@@ -132,13 +132,15 @@ class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
             if not all(agent_flags):
                 raise ValueError("ARSupervisedTrackBuilder: a batch may not mix prompt/response and agent records.")
             if any(r.get("media_refs") for r in records):
-                raise ValueError("ARSupervisedTrackBuilder: agent messages currently support text-only records.")
+                raise ValueError(
+                    "ARSupervisedTrackBuilder: agent records carry images inside message content parts, not media_refs."
+                )
             embed_messages = getattr(self._chat_stage, "embed_messages", None)
             if not callable(embed_messages):
                 raise ValueError(
                     "ARSupervisedTrackBuilder: this pipeline's chat stage does not support OpenAI-style messages."
                 )
-            histories = [r["messages"][:-1] for r in records]
+            histories = [self._load_history_images(r) for r in records]
             tools = [r.get("tools") for r in records]
             return embed_messages(histories, tools=tools)
 
@@ -180,6 +182,31 @@ class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
         if all(img is None for img in images):
             images = None  # type: ignore[assignment]
         return self._chat_stage.embed(texts, images)
+
+    def _load_history_images(self, record: Record) -> List[Dict[str, Any]]:
+        """One record's prompt history with image-part URIs replaced by loaded PILs."""
+        history = record["messages"][:-1]
+        if not any(message_content_image_uris(m) for m in history):
+            return history
+        if not getattr(self._chat_stage, "supports_message_images", False):
+            raise ValueError(
+                f"ARSupervisedTrackBuilder: record {record.get('sample_id')!r} carries image parts in its "
+                "message history, but this pipeline's chat stage does not declare supports_message_images."
+            )
+        loaded: List[Dict[str, Any]] = []
+        for message in history:
+            content = message.get("content")
+            if not isinstance(content, list):
+                loaded.append(message)
+                continue
+            parts = [
+                {"type": "image", "image": _load_pil_image(part["image"])}
+                if isinstance(part, dict) and part.get("type") == "image"
+                else part
+                for part in content
+            ]
+            loaded.append({**message, "content": parts})
+        return loaded
 
     def _tokenize_responses(self, records: Sequence[Record]) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         device = getattr(self.pipeline.bundle, "device", torch.device("cpu"))
@@ -240,6 +267,9 @@ class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
 
     def _tokenize_agent_target(self, record: Record) -> List[int]:
         """Render one final assistant turn and return only its supervised suffix."""
+        stage_tokenize = getattr(self._chat_stage, "tokenize_agent_target", None)
+        if callable(stage_tokenize):
+            return [int(t) for t in stage_tokenize(record)]
         return tokenize_agent_target(
             record,
             tokenizer=self._tokenizer,
