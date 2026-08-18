@@ -59,6 +59,7 @@ class BagelDiffusionConditions(Condition):
     cfg_text_contexts: List[Any] = concat_field(default_factory=list)
     cfg_img_contexts: List[Any] = concat_field(default_factory=list)
     prompts: List[Any] = concat_field(default_factory=list)
+    input_images: List[Any] = concat_field(default_factory=list)  # Raw it2i PILs retained for context rebuilds.
     image_shapes: List[Tuple[int, int]] = concat_field(default_factory=list)
 
     @property
@@ -114,8 +115,8 @@ class BagelDiffusionConditions(Condition):
         image_shape = tuple(self.image_shapes[0])
         return gen, cfg_text, cfg_img, image_shape
 
-    def single_prompt(self) -> Tuple[str, Tuple[int, int]]:
-        """Return ``(prompt, image_shape)`` for a 1-sample deferred-prompt batch."""
+    def single_prompt(self) -> Tuple[str, Optional[Any], Tuple[int, int]]:
+        """Return ``(prompt, input_image, image_shape)`` for a 1-sample deferred batch."""
         require(
             self.batch_size == 1,
             f"BagelDiffusionConditions.single_prompt: expected exactly 1 sample "
@@ -127,7 +128,8 @@ class BagelDiffusionConditions(Condition):
             "adapter must ship prompts for the deferred-rebuild path.",
         )
         image_shape = tuple(self.image_shapes[0])
-        return str(self.prompts[0]), image_shape
+        input_image = self.input_images[0] if self.input_images else None
+        return str(self.prompts[0]), input_image, image_shape
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "BagelDiffusionConditions":

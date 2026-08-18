@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
@@ -172,33 +173,82 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
             return torch.autocast("cuda", self.autocast_dtype)
         return nullcontext()
 
-    def _build_contexts_from_prompt(self, prompt: str) -> Tuple[Any, Any, Any]:
-        """Rebuild the three KV contexts (gen / cfg_text / cfg_img) from a prompt."""
-        from copy import deepcopy
+    def _build_contexts_from_prompt(
+        self,
+        prompt: str,
+        image: Optional[Any] = None,
+        *,
+        differentiable: bool = False,
+    ) -> Tuple[Any, Any, Any]:
+        """Rebuild the three KV contexts from raw prompt and optional source image."""
+        if image is not None and getattr(self.model.model, "vit_model", None) is None:
+            raise ValueError(
+                "BagelDiffusionStage: the conditions carry an it2i source image but the bundle "
+                "was built without the und ViT; set BagelPipelineConfig.enable_vit=true."
+            )
 
         inf = self.model.inferencer
         device = torch.device(self.model.device)
         clean_prompt = str(prompt).removeprefix("<|im_start|>").removesuffix("<|im_end|>")
         gen = inf.init_gen_context()
         cfg_img = deepcopy(gen)
-        mot = self.model.transformer
-        was_training = mot.training
-        mot.eval()
-        try:
-            with torch.no_grad(), self._autocast_ctx(device):
-                cfg_text = deepcopy(gen)
+        # Preserve inference dispatch while rebuilding frozen or differentiable it2i contexts.
+        grad_context = torch.enable_grad if differentiable else torch.no_grad
+        with (
+            rl_ops.inference_dispatch_scope(self.model.model),
+            grad_context(),
+            self._autocast_ctx(device),
+        ):
+            if image is not None:
+                resized = rl_ops.resize_input_image(self.model, image)
+                gen = rl_ops.update_context_image(
+                    self.model,
+                    resized,
+                    gen,
+                    vae=True,
+                    vit=True,
+                    differentiable=differentiable,
+                )
+            cfg_text = rl_ops.clone_context(gen) if differentiable else deepcopy(gen)
+            if differentiable:
+                gen = rl_ops.update_context_text(self.model, clean_prompt, gen, differentiable=True)
+                cfg_img = rl_ops.update_context_text(self.model, clean_prompt, cfg_img, differentiable=True)
+            else:
                 gen = inf.update_context_text(clean_prompt, gen)
                 cfg_img = inf.update_context_text(clean_prompt, cfg_img)
-        finally:
-            mot.train(was_training)
         return gen, cfg_text, cfg_img
 
-    def _resolve_single(self, conditions: BagelDiffusionConditions) -> Tuple[Any, Any, Any, Tuple[int, int]]:
+    def _resolve_single(
+        self,
+        conditions: BagelDiffusionConditions,
+        *,
+        differentiable: bool = False,
+        force_rebuild: bool = False,
+    ) -> Tuple[Any, Any, Any, Tuple[int, int]]:
         """Return ``(gen, cfg_text, cfg_img, image_shape)`` for a 1-sample batch."""
-        if conditions.has_contexts():
+        if force_rebuild:
+            require(
+                bool(conditions.input_images),
+                "_resolve_single(force_rebuild=True) requires image-conditioned "
+                "raw material; prompt-only stored contexts (t2i/t2ti) cannot be "
+                "reproduced from the bare prompt.",
+            )
+        if differentiable and conditions.input_images:
+            prompt, input_image, image_shape = conditions.single_prompt()
+            gen, cfg_text, cfg_img = self._build_contexts_from_prompt(
+                prompt,
+                input_image,
+                differentiable=True,
+            )
+            return gen, cfg_text, cfg_img, image_shape
+        if conditions.has_contexts() and not force_rebuild:
             return conditions.single()
-        prompt, image_shape = conditions.single_prompt()
-        gen, cfg_text, cfg_img = self._build_contexts_from_prompt(prompt)
+        prompt, input_image, image_shape = conditions.single_prompt()
+        gen, cfg_text, cfg_img = self._build_contexts_from_prompt(
+            prompt,
+            input_image,
+            differentiable=differentiable,
+        )
         return gen, cfg_text, cfg_img, image_shape
 
     def _build_generation_inputs(
@@ -382,7 +432,10 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         schedule = segment.sigmas.to(device)
         sigma_max = schedule[1] if int(schedule.shape[0]) > 1 else schedule[0]
 
-        gen, cfg_text, cfg_img, image_shape = self._resolve_single(conditions)
+        gen, cfg_text, cfg_img, image_shape = self._resolve_single(
+            conditions,
+            differentiable=torch.is_grad_enabled(),
+        )
         gi, gi_cfg_text, gi_cfg_img = self._build_generation_inputs(gen, cfg_text, cfg_img, image_shape, device=device)
         forward_kwargs = self._forward_kwargs(gen, cfg_text, cfg_img, gi, gi_cfg_text, gi_cfg_img, params)
 
@@ -426,9 +479,14 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         *,
         params: BagelDiffusionParams,
         device: torch.device,
+        force_rebuild: bool = False,
     ) -> Dict[str, Any]:
         """Rebuild the KV contexts → the step-invariant ``_forward_flow`` kwargs."""
-        gen, cfg_text, cfg_img, image_shape = self._resolve_single(conditions)
+        gen, cfg_text, cfg_img, image_shape = self._resolve_single(
+            conditions,
+            differentiable=torch.is_grad_enabled(),
+            force_rebuild=force_rebuild,
+        )
         gi, gi_cfg_text, gi_cfg_img = self._build_generation_inputs(gen, cfg_text, cfg_img, image_shape, device=device)
         return self._forward_kwargs(gen, cfg_text, cfg_img, gi, gi_cfg_text, gi_cfg_img, params)
 
