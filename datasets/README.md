@@ -47,8 +47,12 @@ install the package first. The dependency only ever points that way — `unirl/`
 anything under `datasets/`.
 
 Converter code and READMEs are tracked by default; no `.gitignore` allowlist entry is needed
-for a new folder. Downloaded and generated data is ignored: keep it in `raw/` or `processed/`
-under your dataset folder, or write it to the repo-root `data/` that the converters default to.
+for a new folder. Everything else under `datasets/` is ignored, so downloaded and generated
+data cannot be committed by accident wherever a converter's `--out-dir` lands — including
+straight into `datasets/<name>/`, which a few of the guides here still do. `raw/` and
+`processed/` are the conventional homes for it, and the repo-root `data/` the converters
+default to is ignored too. Committing a prompt set next to a converter is the one case that
+needs a `.gitignore` line, which keeps that decision explicit.
 
 ## Contents
 
