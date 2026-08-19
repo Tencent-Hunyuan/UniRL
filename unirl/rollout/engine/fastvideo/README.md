@@ -27,17 +27,29 @@ doctrine), then update the fingerprints together with the patch.
 
 - **σ SSOT.** The engine sends `FlowMatchSchedulePolicy`'s already-shifted
   canonical σ verbatim (no shift pre-image). The patched `set_timesteps`
-  rejects any schedule transform on external sigmas, appends the terminal
-  zero, and keeps **float32** model timesteps
-  (`σ · WAN21DiffusionStep.TIMESTEP_SCALE`) — stock stores `int64`, which
-  truncates conditioning (`833` vs `833.333…`, the drift #248 tracked).
+  rejects any schedule transform on external sigmas, requires strictly
+  decreasing σ (duplicate adjacent float32 values alias into one
+  `index_for_timestep` slot, skipping one transition and double-stepping
+  another with an `h=0` NaN), appends the terminal zero, and keeps **float32**
+  model timesteps (`σ · WAN21DiffusionStep.TIMESTEP_SCALE`) — stock stores
+  `int64`, which truncates conditioning (`833` vs `833.333…`, the drift #248
+  tracked).
 - **Solver SSOT.** `WAN21PipelineConfig.unipc_*` declares the deterministic
-  solver. The engine embeds it as a `UniPCSpec` inside the per-request
-  `FastVideoUniPCPlan`, carried through the fork's str-typed `RLData.sde_type`
-  with `sde_step_indices=None` so every index reaches the patched helper. The
-  worker builds `UniPCStrategy` from the plan only after verifying the
-  checkpoint scheduler config matches the spec, and resets multistep history
-  across SDE jumps.
+  solver. At init the engine verifies it against the checkpoint's
+  `scheduler/scheduler_config.json`, resolving either a local diffusers-layout
+  directory or a Hugging Face model repo — fail closed on a mismatch, a
+  missing/unreadable file, a non-UniPC `_class_name`, or a non-empty
+  `disable_corrector` (no config knob) — and requires an injected SDE strategy
+  whose `canonical_name` the plan supports. The spec travels as a `UniPCSpec`
+  inside the per-request `FastVideoUniPCPlan`, carried through the fork's
+  str-typed `RLData.sde_type` with `sde_step_indices=None` so every index
+  reaches the patched helper. The worker validates the live scheduler contract
+  (`flow_prediction`, `predict_x0`, no thresholding / nested `solver_p`),
+  builds `UniPCStrategy` from the plan spec, and resets multistep history
+  across SDE jumps. Checkpoint verification cannot live in the worker: the
+  fork's `WanPipeline.initialize_pipeline` discards the checkpoint-loaded
+  scheduler and rebuilds `FlowUniPCMultistepScheduler` from constructor
+  defaults, so the live scheduler never reflects `scheduler_config.json`.
 - **Dispatch.** Plan indices → the fork's Dance/Flow SDE helper (real
   log-probs); every other index → `strategy.denoise(...)`, whose placeholder
   zero log-prob column `_build_segment` slices off before building
@@ -56,6 +68,11 @@ doctrine), then update the fingerprints together with the patch.
 - **`FASTVIDEO_WAN_SCHEDULER` must stay `unipc`** (the fork default). Other
   values make the WAN pipeline build a scheduler the patches do not target, so
   the engine rejects them at init.
+- **`sde_indices: null` means opposite things across engines.** This engine
+  resolves `None` to *all-steps SDE*; trainside WAN21
+  (`unirl/models/wan21/diffusion.py`) reads the same `None` as *no SDE*
+  (`eta=0` everywhere, no log-probs). Set `sde_indices` explicitly in the
+  recipe for engine-portable behavior.
 - **`RLData.collect_kl` with `kl_reward > 0` is unsupported** on this path:
   the fork's KL block needs `prev_latents_mean`/`std_dev_t` from every step,
   and UniPC columns return `None` for both → `ValueError`. UniRL never enables
