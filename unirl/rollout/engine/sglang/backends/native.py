@@ -47,10 +47,12 @@ def _import_sglang_engine() -> Dict[str, Any]:
         UpdateWeightsFromTensorReqInput,
     )
     from sglang.srt.server_args import ServerArgs
+    from sglang.srt.utils import MultiprocessingSerializer
 
     return {
         "Engine": Engine,
         "ServerArgs": ServerArgs,
+        "MultiprocessingSerializer": MultiprocessingSerializer,
         "UpdateWeightsFromTensorReqInput": UpdateWeightsFromTensorReqInput,
         "LoadLoRAAdapterFromTensorsReqInput": LoadLoRAAdapterFromTensorsReqInput,
     }
@@ -464,7 +466,11 @@ class NativeBackend:
     ) -> None:
         """Serialize the LoRA tensor bag and hot-load it on the Engine."""
         self._require_alive("set_lora")
-        serialized = _serialize_lora_tensors(lora_tensors)
+        serialized = _serialize_lora_tensors(
+            lora_tensors,
+            tp_size=1,
+            multiprocessing_serializer=self._rt["MultiprocessingSerializer"],
+        )
         obj = self._rt["LoadLoRAAdapterFromTensorsReqInput"](
             lora_name=str(lora_name),
             config_dict=dict(config_dict or {}),
