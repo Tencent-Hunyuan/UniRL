@@ -153,6 +153,8 @@ reward:
   _target_: unirl.reward.service.RewardService
   # keep = score the partial text of truncated (length-capped) traces instead of
   # forcing 0, matching verl's dapo reward manager with overlong_buffer disabled.
+  # Caveat: math-verify parses the last expression anywhere in the kept text, so
+  # a trace truncated mid-derivation can score 1.0 off an intermediate value.
   truncated_reward: keep
   backend:
     _target_: unirl.reward.local.mathverify.MathVerifyRewardScorer

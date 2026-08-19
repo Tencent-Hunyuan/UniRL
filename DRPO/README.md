@@ -161,7 +161,7 @@ Unlike FlowGRPO/FlowDPPO, `DRPO` does **not** freeze a train-side `old_logp` in
 | Large `rollout_replay_logp_absdiff_mean` | train/rollout mismatch, weight sync, tokenization/chat-template mismatch |
 | No gradient on many tokens | `segment.loss_mask`; zero advantages from all-correct/all-wrong groups |
 | `drpo_penalty_mean` very large | `drpo_epsilon` too small for the model's off-policy gap |
-| Completion misses the boxed answer | chat template `/no_think` + `enable_thinking: false` (Qwen3 overruns on `<think>`) |
+| Completion never reaches a final answer | truncation at `sampling.max_new_tokens` (Qwen3 overruns on `<think>`) — an unboxed answer is *not* the problem, `math-verify` reads free-form text. Disabling thinking departs from the paper setup and must flip `enable_thinking` in **both** the pipeline and rollout chat templates or the prompts diverge |
 | SGLang serves stale weights | `LocalLoraWeightSync`, adapter name `default`, rollout wake/sleep logs |
 
 Metric source: `ratio_mean`, `ratio_max`, `approx_kl`, `drpo_penalty_mean`,
