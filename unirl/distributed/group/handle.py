@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass
 from itertools import count
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple, Type
@@ -250,6 +251,7 @@ class PendingHandleCall:
         self._leases = leases
         self._consumed = False
         self._value: Any = None
+        self._discard_futures: Optional[List[Any]] = None
 
     def ready(self) -> bool:
         """True once every worker's ref is resolved (non-blocking probe)."""
@@ -262,6 +264,41 @@ class PendingHandleCall:
             return
         self.result()
         self._value = None
+
+    def discard_on_completion(self) -> None:
+        """Retain leases and discard outputs when all worker refs finish."""
+        if self._consumed:
+            self._value = None
+            return
+        if self._discard_futures is not None:
+            return
+        try:
+            futures = [ref.future() for ref in self._refs]
+        except Exception:
+            threading.Thread(
+                target=self._discard_result,
+                name="pending-handle-discard",
+                daemon=True,
+            ).start()
+            return
+        if not futures:
+            self._discard_result()
+            return
+
+        remaining = len(futures)
+        lock = threading.Lock()
+
+        def on_done(_) -> None:
+            nonlocal remaining
+            with lock:
+                remaining -= 1
+                complete = remaining == 0
+            if complete:
+                self._discard_result()
+
+        self._discard_futures = futures
+        for future in futures:
+            future.add_done_callback(on_done)
 
     def result(self) -> Any:
         """Block if needed, then rebind + collect: the method's collected return value."""
@@ -286,6 +323,14 @@ class PendingHandleCall:
     def _release_leases(self) -> None:
         """Release handles owning destination TensorStore entries after RPC consumption."""
         self._leases = None
+
+    def _discard_result(self) -> None:
+        try:
+            self.wait()
+        except Exception:
+            logger.debug("PendingHandleCall: discarded call failed during completion", exc_info=True)
+        finally:
+            self._discard_futures = None
 
 
 class Slot:

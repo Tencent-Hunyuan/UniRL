@@ -5,6 +5,8 @@ from omegaconf import OmegaConf
 
 from unirl.distributed.group.handle import PendingHandleCall
 from unirl.rollout.manager.dispatch import RolloutPool
+from unirl.trainer import agentic as agentic_module
+from unirl.trainer.agentic import AgenticTrainer
 from unirl.trainer.base import resolve_worker_concurrency_by_device, resolve_worker_max_concurrency
 from unirl.trainer.diffusion import _validate_diffusion_dp_geometry
 
@@ -35,6 +37,39 @@ def test_environment_concurrency_is_coerced_at_config_boundary(monkeypatch: pyte
 
     assert resolved == 3
     assert isinstance(resolved, int)
+
+
+def test_agentic_constructor_coerces_inflight_at_its_boundary(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Resolved(Exception):
+        pass
+
+    captured = None
+
+    def capture(_, *, per_worker_inflight):
+        nonlocal captured
+        captured = per_worker_inflight
+        raise Resolved
+
+    monkeypatch.setattr(agentic_module, "resolve_worker_max_concurrency", capture)
+    with pytest.raises(Resolved):
+        AgenticTrainer(
+            cfg=OmegaConf.create({"num_devices": 1}),
+            batch_size=1,
+            bundle_cfg=None,
+            pipeline_cfg=None,
+            backend_cfg=None,
+            rollout_cfg=None,
+            reward_cfg=None,
+            algorithm_cfg=None,
+            stack_cfg=None,
+            data_source_cfg=None,
+            sampling_cfg=None,
+            sync_cfg=None,
+            per_worker_inflight="4",
+        )
+
+    assert captured == 4
+    assert isinstance(captured, int)
 
 
 def test_prompt_local_diffusion_rollout_skips_only_rollout_dp_divisibility() -> None:
@@ -104,22 +139,51 @@ def test_pending_wait_resolves_outputs_before_discarding() -> None:
 
 
 def test_close_does_not_block_on_partially_launched_rpc() -> None:
-    remote_done = threading.Event()
     launched = threading.Event()
     launch_failed = threading.Event()
-    drained = threading.Event()
 
-    class DeferredPending:
-        def ready(self) -> bool:
-            return remote_done.is_set()
+    class DeferredFuture:
+        def __init__(self) -> None:
+            self.callback = None
 
-        def wait(self) -> None:
-            assert remote_done.wait(timeout=1)
-            drained.set()
+        def add_done_callback(self, callback) -> None:
+            self.callback = callback
+
+        def finish(self) -> None:
+            assert self.callback is not None
+            self.callback(self)
+
+    class DeferredRef:
+        def __init__(self, future) -> None:
+            self._future = future
+
+        def future(self):
+            return self._future
+
+    class ResolvingHandle:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def _resolve_call(self, collect_fn, refs, *, worker_local, targets):
+            self.calls += 1
+            return collect_fn(self, ["payload"])
+
+    future = DeferredFuture()
+    handle = ResolvingHandle()
+    lease = object()
+    pending = PendingHandleCall(
+        handle,
+        "generate",
+        [DeferredRef(future)],
+        True,
+        targets=["worker"],
+        collect_fn=lambda _, results: results[0],
+        leases=[lease],
+    )
 
     def launch_ok(_):
         launched.set()
-        return DeferredPending()
+        return pending
 
     def launch_error(_):
         launch_failed.set()
@@ -130,13 +194,15 @@ def test_close_does_not_block_on_partially_launched_rpc() -> None:
     assert launched.wait(timeout=1)
     assert launch_failed.wait(timeout=1)
 
-    close_returned = threading.Event()
-    close_thread = threading.Thread(target=lambda: (pool.close(), close_returned.set()), daemon=True)
-    close_thread.start()
-    try:
-        assert close_returned.wait(timeout=1)
-    finally:
-        remote_done.set()
-        close_thread.join(timeout=1)
+    pool.close()
 
-    assert drained.wait(timeout=1)
+    assert handle.calls == 0
+    assert pending._leases == [lease]
+    assert not any(thread.name == "rollout-pool-drain" for thread in threading.enumerate())
+
+    future.finish()
+
+    assert handle.calls == 1
+    assert pending._consumed
+    assert pending._leases is None
+    assert pending._value is None

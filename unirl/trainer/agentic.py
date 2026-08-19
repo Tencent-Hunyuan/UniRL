@@ -69,6 +69,7 @@ class AgenticTrainer(BaseTrainer):
         stop: Optional[List[str]] = None,
         per_worker_inflight: int = 8,
     ) -> None:
+        per_worker_inflight = int(per_worker_inflight)
         worker_max_concurrency = resolve_worker_max_concurrency(
             cfg,
             per_worker_inflight=per_worker_inflight,
@@ -95,7 +96,7 @@ class AgenticTrainer(BaseTrainer):
             self.sampling_params: Dict[str, BaseSamplingParams] = build_sampling_dict(sampling_cfg)
             self._group_size = total_samples_per_prompt(self.sampling_params)
             self._stop = list(stop) if stop else ["</tool_call>"]
-            self._per_worker_inflight = int(per_worker_inflight)
+            self._per_worker_inflight = per_worker_inflight
 
             with placement(self.pool, fraction=1.0, shared_workers=True):
                 self.bundle = remote_hydra(bundle_cfg)

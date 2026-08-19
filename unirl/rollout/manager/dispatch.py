@@ -2,17 +2,13 @@
 
 from __future__ import annotations
 
-import logging
 import threading
-import time
 from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Deque, List, Optional, Sequence
 
 if TYPE_CHECKING:
     from unirl.types.sample import Sample
-
-logger = logging.getLogger(__name__)
 
 _WORKER_CONTROL_CONCURRENCY = 2
 
@@ -145,36 +141,8 @@ class RolloutPool:
             pending = [*self._running, *self._completed]
             self._running.clear()
             self._completed.clear()
-        if pending:
-            threading.Thread(
-                target=self._drain_pending,
-                args=(pending,),
-                name="rollout-pool-drain",
-                daemon=True,
-            ).start()
-
-    @staticmethod
-    def _drain_pending(pending: List[_PendingUnit]) -> None:
-        """Retain leases and discard outputs as abandoned RPCs complete."""
-        remaining = list(pending)
-        while remaining:
-            next_remaining = []
-            for unit in remaining:
-                try:
-                    ready = unit.pending.ready()
-                except Exception:
-                    next_remaining.append(unit)
-                    continue
-                if not ready:
-                    next_remaining.append(unit)
-                    continue
-                try:
-                    unit.pending.wait()
-                except Exception:
-                    logger.debug("RolloutPool.close: pending call failed during lease drain", exc_info=True)
-            remaining = next_remaining
-            if remaining:
-                time.sleep(RolloutPool._PROBE_INTERVAL_S)
+        for unit in pending:
+            unit.pending.discard_on_completion()
 
     def _has_remote_work(self) -> bool:
         return bool(self._queue or self._running or any(self._reserved))
