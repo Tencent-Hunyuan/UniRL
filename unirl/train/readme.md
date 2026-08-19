@@ -72,6 +72,17 @@ in `backend/base.py`; a multi-update-capable algorithm sets
   away (the policy drifts into a degenerate reward-hack). An fp32-loaded model gets an
   fp32 master for free; a bf16 load needs `master_dtype: fp32` set explicitly. The
   ctor never warns.
+- **The EP fused-expert layout registry is keyed by `config.model_type`, never by
+  parameter-name suffix** (`backend/veomni/ep/experts.py`). HunyuanImage3's fused
+  params end in `.experts.down_proj` too, but its `gate_and_up` halves are stored
+  swapped relative to Qwen3-MoE's `gate_up`, so a suffix match would silently hand
+  one model's packing semantics to another — today that only fails closed because
+  HI3's *other* suffix happens not to match. A layout module under `ep/models/`
+  supplies `is_fused_expert_param(name)` and `iter_hf_expert_tensors(name, stacked)`;
+  register it in `_LAYOUTS` to enable full-weight sync for that family. Consumers
+  outside `train/` take the transform from `backend.fused_expert_expander()` —
+  `distributed/weight_sync/` must not import the layout (the core-dependency guard
+  rejects it).
 - **Advantages are not computed here** — `train` raises if
   `part.advantages is None`; the trainer must call `compute_advantages` on the
   full shard first.
