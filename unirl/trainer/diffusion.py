@@ -17,8 +17,8 @@ from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample
 from unirl.trainer.eval_suites import EvalRewardSuite, build_eval_suites
 from unirl.trainer.hydra import parse_hydra_cfg, remote_hydra
-from unirl.types.primitives import Texts
-from unirl.types.sample import Sample
+from unirl.types.primitives import Texts, primitive_modality_key
+from unirl.types.sample import Part, Sample
 from unirl.types.sampling import BaseSamplingParams, total_samples_per_prompt
 from unirl.utils.wandb_metrics import pooled_window_reward_metrics
 
@@ -40,22 +40,96 @@ def _run_cleanup_steps(steps: List[Tuple[str, Callable[[], None]]]) -> None:
         raise first_error
 
 
+def _flatten_reward_rows(sample: Sample) -> Sample:
+    """Build a one-root-per-generated-row view for reward DP dispatch.
+
+    ``Sample.slice`` deliberately keeps each prompt tree intact. That is the
+    right contract for rollout generation, but a ``P``-prompt/``N``-sample
+    response otherwise has only ``P`` dispatch units at reward time. Re-rooting
+    the already-generated frontier gives RewardService ``P*N`` independent
+    trees without copying media tensors, so RM-DP can assign rows rather than
+    whole GRPO groups. The original lineage remains authoritative for advantage
+    grouping and training; only rewards are copied back from this view.
+    """
+    if not sample.parts:
+        raise ValueError("_flatten_reward_rows: Sample has no parts")
+    frontier = sample.parts[-1]
+    if frontier.rewards is not None:
+        raise RuntimeError("_flatten_reward_rows: frontier already has rewards")
+    if frontier.sampling_params is None:
+        raise ValueError("_flatten_reward_rows: frontier is not a generated Part")
+    if not frontier.primitives:
+        raise ValueError("_flatten_reward_rows: frontier has no generated primitives")
+
+    # Match RewardService._build_reward_request exactly: the nearest ancestor
+    # wins when a trajectory contains multiple primitives of one modality.
+    conditioning = {}
+    for primitive in sample.conditioning():
+        conditioning[primitive_modality_key(primitive)] = primitive
+
+    row_ids = [f"reward-row:{i}" for i in range(frontier.batch_size)]
+    root = Part.input(
+        row_ids,
+        primitives=conditioning,
+        metadata=sample.root_metadata(-1),
+    )
+    return (
+        Sample.request(root)
+        .fork(1, sampling_params=frontier.sampling_params)
+        .with_filled_frontier(
+            primitives=frontier.primitives,
+            primitive_metadata=frontier.primitive_metadata,
+        )
+    )
+
+
+def _restore_reward_rows(sample: Sample, scored_rows: Sample) -> Sample:
+    """Attach row-scattered reward results to the original prompt lineage."""
+    original = sample.parts[-1]
+    if len(scored_rows.parts) != 2:
+        raise RuntimeError(
+            f"_restore_reward_rows: expected a flat two-Part scoring view, got {len(scored_rows.parts)} parts"
+        )
+    scored = scored_rows.parts[-1]
+    if scored.batch_size != original.batch_size:
+        raise RuntimeError(
+            f"_restore_reward_rows: scored {scored.batch_size} rows for an original frontier of "
+            f"{original.batch_size}"
+        )
+    expected_ids = [f"reward-row:{i}/0" for i in range(original.batch_size)]
+    if list(scored.sample_ids) != expected_ids:
+        raise RuntimeError("_restore_reward_rows: RewardService changed row ordering or sample ids")
+    if scored.rewards is None:
+        raise RuntimeError("_restore_reward_rows: RewardService returned no rewards")
+
+    restored = dataclasses.replace(
+        original,
+        rewards=scored.rewards,
+        component_rewards=scored.component_rewards,
+    )
+    return sample.replace_frontier(restored)
+
+
 def _validate_prompt_tree_dp_geometry(
     *,
     batch_size: int,
+    samples_per_prompt: int,
     rollout_dp_size: Optional[int],
     reward_dp_size: int,
     context: str,
 ) -> None:
-    roles = [("reward", reward_dp_size)]
-    if rollout_dp_size is not None:
-        roles.insert(0, ("rollout", rollout_dp_size))
-    for role, dp_size in roles:
-        if batch_size % dp_size:
-            raise ValueError(
-                f"{context}: {role} dp_size={dp_size} must divide batch_size={batch_size} "
-                "root prompt trees; DP_SCATTER preserves each prompt's whole subtree."
-            )
+    if rollout_dp_size is not None and batch_size % rollout_dp_size:
+        raise ValueError(
+            f"{context}: rollout dp_size={rollout_dp_size} must divide batch_size={batch_size} "
+            "root prompt trees; rollout DP_SCATTER preserves each prompt's whole subtree."
+        )
+    generated_batch = batch_size * samples_per_prompt
+    if generated_batch % reward_dp_size:
+        raise ValueError(
+            f"{context}: reward dp_size={reward_dp_size} must divide "
+            f"batch_size({batch_size}) * samples_per_prompt({samples_per_prompt}) = "
+            f"{generated_batch} independently scored rows."
+        )
 
 
 def _validate_diffusion_dp_geometry(
@@ -83,6 +157,7 @@ def _validate_diffusion_dp_geometry(
 
     _validate_prompt_tree_dp_geometry(
         batch_size=batch_size,
+        samples_per_prompt=samples_per_prompt,
         rollout_dp_size=rollout_dp_size if require_rollout_dp_divisibility else None,
         reward_dp_size=reward_dp_size,
         context="training",
@@ -272,6 +347,10 @@ class DiffusionTrainer(BaseTrainer):
         self._task_config: Dict[str, Any] = dict(task_config) if task_config else {}
         self._rollout_is_trainside = False
         self._uses_ema = False
+        sync_target = str(sync_cfg.get("_target_", "")) if sync_cfg is not None else ""
+        self._staged_weight_sync = sync_target.endswith(
+            ("LocalLoraWeightSync", "RemoteLoraWeightSync")
+        )
 
         self.data_source = instantiate(data_source_cfg)
         self._data_source_cfg = data_source_cfg
@@ -633,14 +712,29 @@ class DiffusionTrainer(BaseTrainer):
         # Swap EMA weights only for trainside rollout; remote engines receive
         # them through weight sync.
         should_swap_ema = self._uses_ema and self._rollout_is_trainside
+        staged_sync = (
+            sync_weights
+            and self.weight_sync is not None
+            and should_offload_train
+            and self._staged_weight_sync
+        )
         train_offload_attempted = False
         ema_apply_attempted = False
         generation_succeeded = False
         try:
+            if staged_sync:
+                # FSDP extraction needs the trainer resident. Cache the adapter
+                # on CPU, then release trainer weights before waking rollout.
+                self.weight_sync.extract()
+                train_offload_attempted = True
+                self.backend.offload()
             self.rollout.wake_up()
             if sync_weights and self.weight_sync is not None:
-                self.weight_sync.sync()
-            if should_offload_train:
+                if staged_sync:
+                    self.weight_sync.push()
+                else:
+                    self.weight_sync.sync()
+            if should_offload_train and not staged_sync:
                 train_offload_attempted = True
                 self.backend.offload()
             if should_swap_ema:
@@ -681,12 +775,18 @@ class DiffusionTrainer(BaseTrainer):
         sync_weights: bool = False,
         rollout_id: int = 0,
     ) -> Tuple[Sample, float]:
-        """One ``rollout → reward → advantage`` pass; training happens per window."""
+        """One ``rollout → reward → advantage`` pass; training happens per window.
+
+        Colocated LoRA engines split publication around trainer offload:
+        extract while FSDP is resident, then wake rollout and push the cached
+        CPU adapter after trainer memory has been released.
+        """
         sample = self._generate_for_training(sample, sync_weights=sync_weights)
         # With no reward configured, ``part.rewards`` stays None and the block below no-ops.
         if self.reward is not None:
             with self._reward_phase():
-                sample = self.reward.score_and_attach(sample)
+                scored_rows = self.reward.score_and_attach(_flatten_reward_rows(sample))
+                sample = _restore_reward_rows(sample, scored_rows)
 
         part = sample.parts[-1]
         mean_reward = 0.0
@@ -732,9 +832,11 @@ class DiffusionTrainer(BaseTrainer):
         final_id = window_ids[-1]
         training_progress = final_id / max(1, num_rollouts - 1)
         parts = tuple(sample.parts[-1] for sample in samples)
+        _track_t0 = time.perf_counter()
         result = self.stack.train_track(
             parts if len(parts) > 1 else parts[0], training_progress=float(training_progress)
         )
+        logger.info("lifecycle rollout %d: stack.train_track %.1fs", final_id, time.perf_counter() - _track_t0)
         # Reward stats must cover the whole window: with per-domain scorers each
         # rollout is NaN outside its own domain, so the final sample alone would
         # leave every other domain's curve empty. The pooled keys override the
@@ -862,6 +964,7 @@ class DiffusionTrainer(BaseTrainer):
             sub = all_inputs.slice(start, min(start + chunk, n_prompts))
             _validate_prompt_tree_dp_geometry(
                 batch_size=int(sub.batch_size),
+                samples_per_prompt=total_samples_per_prompt(eval_sp),
                 rollout_dp_size=int(self.rollout.dp_size),
                 reward_dp_size=int(self.reward.dp_size),
                 context=f"evaluation chunk [{start}:{start + sub.batch_size}]",
@@ -878,7 +981,8 @@ class DiffusionTrainer(BaseTrainer):
             first_scored: Optional[Sample] = None
             with self._reward_phase():
                 for name, reward in scorers:
-                    scored = reward.score_and_attach(generated)
+                    scored_rows = reward.score_and_attach(_flatten_reward_rows(generated))
+                    scored = _restore_reward_rows(generated, scored_rows)
                     if first_scored is None:
                         first_scored = scored
                     rewards = scored.parts[-1].rewards

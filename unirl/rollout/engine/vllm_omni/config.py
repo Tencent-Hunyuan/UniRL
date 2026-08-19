@@ -30,6 +30,8 @@ class VLLMOmniEngineConfig(BaseEngineConfig):
     modality: str = "hi3_t2i"
 
     enable_sleep_mode: bool = True
+    replica_size: int = 1
+    tp_size: int = 1
 
     stage_yaml_override: Optional[str] = None
 
@@ -44,6 +46,15 @@ class VLLMOmniEngineConfig(BaseEngineConfig):
 
     def __post_init__(self) -> None:
         self.modality = str(self.modality or "").strip().lower()
+        self.replica_size = int(self.replica_size)
+        self.tp_size = int(self.tp_size)
+        require(self.replica_size > 0, f"VLLMOmniEngineConfig.replica_size must be > 0; got {self.replica_size}")
+        require(self.tp_size > 0, f"VLLMOmniEngineConfig.tp_size must be > 0; got {self.tp_size}")
+        require(
+            self.replica_size == self.tp_size,
+            "VLLMOmniEngineConfig.replica_size and tp_size must match for grouped engines; "
+            f"got replica_size={self.replica_size}, tp_size={self.tp_size}",
+        )
         from unirl.rollout.engine.vllm_omni.adapters import registered_adapters
 
         valid = registered_adapters()
