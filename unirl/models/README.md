@@ -84,6 +84,20 @@ it is the authoritative bundle / pipeline / stage / conditions contract.
   it's `None`; never build the σ tensor inside `generate`.
 - **CFG empty-negative differs per model** (SD3 `""`, Qwen-Image `" "`) — use the
   model's canonical upstream value or the rollout/replay ratio drifts off 1.0.
+- **Work that needs real storage goes through `types/post_materialize.py`.** A
+  bundle or a structural injector (LoRA / NFT / mirror) may run while the module
+  is still on the meta device, where writing a tensor is a no-op. Register such
+  work with `defer_after_materialize`; the train backend drains it with
+  `apply_deferred_ops` after the weight load. The pair describes
+  model-construction state, not training policy, which is why it lives under
+  `models/types/` and not under `train/`.
+- **Name-keyed matching around materialization compares canonical names.**
+  Deferred ops (and `materialize()`) run post-wrap, and `checkpoint_wrapper`
+  (activation checkpointing) interposes a `_checkpoint_wrapped_module.` segment
+  in `named_parameters()` names while `state_dict()` keys stay canonical (the
+  wrapper's state-dict hooks strip it). Any match between module params and
+  checkpoint keys goes through `canonical_param_name`, exported beside the
+  deferred-op pair in `types/post_materialize.py`.
 
 
 ## Conversation composition

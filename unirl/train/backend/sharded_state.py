@@ -6,23 +6,14 @@ import logging
 from typing import Dict, Iterator, Optional
 
 import torch
-from torch import Tensor, nn
+from torch import nn
 from torch.nn.parameter import Parameter
+
+from unirl.distributed.local import local_view
 
 logger = logging.getLogger(__name__)
 
 StateDict = Dict[str, object]
-
-# ``checkpoint_wrapper`` (activation checkpointing) interposes this segment in
-# ``named_parameters()`` names while ``state_dict()`` stays canonical (the
-# wrapper's state-dict hooks strip it), so any name-keyed match between module
-# params and checkpoint keys must compare canonical names.
-_AC_WRAP_SEGMENT = "_checkpoint_wrapped_module."
-
-
-def _canonical_param_name(name: str) -> str:
-    """Strip activation-checkpoint wrapper segments from a parameter name."""
-    return name.replace(_AC_WRAP_SEGMENT, "")
 
 
 def gather_state_dict(model: nn.Module) -> StateDict:
@@ -166,7 +157,7 @@ def drop_meta_entries(state_dict: StateDict) -> StateDict:
     """Drop never-materialized (meta) entries from a sharded state dict."""
     kept: StateDict = {}
     for key, value in state_dict.items():
-        local = getattr(value, "_local_tensor", value)
+        local = local_view(value) if isinstance(value, torch.Tensor) else value
         if isinstance(local, torch.Tensor) and local.is_meta:
             continue
         kept[key] = value
@@ -205,13 +196,6 @@ def nft_state_dict(
         return {}
     token = f".{shadow_adapter}."
     return {k: v for k, v in full_sd.items() if ("lora_A" in k or "lora_B" in k) and token in k}
-
-
-def local_view(tensor: Tensor) -> Tensor:
-    """DTensor -> local shard.  Identity for non-DTensors."""
-    if hasattr(tensor, "_local_tensor"):
-        return tensor._local_tensor
-    return tensor
 
 
 def is_materialized(model: nn.Module) -> bool:
@@ -312,7 +296,6 @@ __all__ = [
     "move_optimizer_state",
     "lora_state_dict",
     "nft_state_dict",
-    "local_view",
     "is_materialized",
     "trainable_params",
     "infer_device",

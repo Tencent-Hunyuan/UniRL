@@ -9,7 +9,8 @@ import random
 import shutil
 from typing import Any, Dict, Iterable, List, Sequence
 
-from unirl.data.sft import normalize_supervised_example, tokenize_agent_target
+from unirl.data.sft import normalize_supervised_example
+from unirl.models.types.conversations import tokenize_agent_target
 
 _HELP = """Prepare a local OpenAI-style agent SFT manifest.
 

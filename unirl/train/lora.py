@@ -12,7 +12,7 @@ from typing import Iterator, Optional, Sequence, Union
 
 from torch import nn
 
-from unirl.train.deferred import _stamp
+from unirl.models.types.post_materialize import defer_after_materialize
 
 logger = logging.getLogger(__name__)
 
@@ -120,7 +120,7 @@ def inject_lora(
             n_trainable,
         )
 
-    _stamp(model, partial(_reset_adapter, name=adapter_name))
+    defer_after_materialize(model, partial(_reset_adapter, name=adapter_name))
 
 
 def _reset_adapter(model: nn.Module, *, name: str) -> None:

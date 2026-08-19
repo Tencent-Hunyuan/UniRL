@@ -5,8 +5,7 @@ from typing import Any, Dict, List, Optional, Sequence, Union
 import torch
 
 from unirl.config.require import require
-from unirl.data.sft import tokenize_agent_target
-from unirl.models.types.conversations import build_vision_messages
+from unirl.models.types.conversations import build_vision_messages, tokenize_agent_target
 from unirl.types.conditions import TextTokenCondition
 from unirl.types.primitives import Images, Texts
 from unirl.types.sample import Turn

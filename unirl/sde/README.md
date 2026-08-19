@@ -18,8 +18,9 @@ the remaining deterministic indices run the model config's declared solver
 
 `unirl.sde` owns shared per-step diffusion math: the stochastic **kernels**
 replayed during training (Flow / Dance / CPS), deterministic solvers (DPM2 /
-UniPC), the FlowMatch **σ schedule** policy (with a per-model μ override), and
-the deterministic **initial-noise (`x_T`) recipe**.
+UniPC), the FlowMatch **σ schedule** policy (with a per-model μ override), the
+**SDE-index schedule** that picks which steps are stochastic, and the
+deterministic **initial-noise (`x_T`) recipe**.
 
 ## Why it exists
 
@@ -42,9 +43,11 @@ adapter's private choice.
   means *replay* (score the given transition, no noise drawn). Those two modes
   share the exact transition code. The math runs in fp32 (σ forced to fp32 to
   match SGLang).
-- **SDE indices own the policy-gradient density.** Selected `sde_indices` get a
-  stochastic transition with a real per-step Gaussian log-prob (→
-  `LatentSegment.sde_logp`). Trainside loops collapse the same SDE kernel to
+- **SDE indices own the policy-gradient density.** The selection is a
+  `TimestepScheduler` (`index_schedule.py`) wired under `sampling.scheduler`, which
+  `DiffusionSamplingParams.resolve_sde_indices` asks once per rollout id. Selected
+  `sde_indices` get a stochastic transition with a real per-step Gaussian log-prob
+  (→ `LatentSegment.sde_logp`). Trainside loops collapse the same SDE kernel to
   Euler with `eta=0`; the FastVideo adapter instead implements the model
   config's declared UniPC solver on non-SDE indices, verifying the checkpoint
   scheduler against the spec (`rollout/engine/fastvideo/README.md`). UniPC
@@ -68,8 +71,8 @@ adapter's private choice.
 **Extending it:** a new kernel subclasses `SDEStrategy` (or `StepStrategy` for a
 deterministic ODE solver), wired under `pipeline.strategy` or an engine adapter. A
 per-model σ override subclasses `FlowMatchSchedulePolicy` and overrides only
-`compute_mu`. A new SDE-index schedule is *not* here — it's a `TimestepScheduler`
-in `utils/scheduler_utils.py`, wired under `sampling.scheduler`. DanceGRPO/MixGRPO
+`compute_mu`. A new SDE-index schedule subclasses `TimestepScheduler`
+(`index_schedule.py`), wired under `sampling.scheduler`. DanceGRPO/MixGRPO
 add no kernel: DanceGRPO swaps in `DanceSDEStrategy` under `pipeline.strategy`,
 MixGRPO keeps `FlowSDEStrategy` and adds a `WindowScheduler` under
 `sampling.scheduler`.

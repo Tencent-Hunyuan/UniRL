@@ -8,10 +8,11 @@ from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple
 
 import torch
 
-from unirl.data.sft import message_content_image_uris, tokenize_agent_target
+from unirl.data.sft import message_content_image_uris
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
 from unirl.models.types.codec import EncodeStage
+from unirl.models.types.conversations import tokenize_agent_target
 from unirl.types.conditions import ImageLatentCondition
 from unirl.types.media import MediaRef, MediaRefs
 from unirl.types.primitives import Images, Texts, Video, Videos

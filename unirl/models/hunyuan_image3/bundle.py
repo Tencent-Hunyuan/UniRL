@@ -234,7 +234,7 @@ class HunyuanImage3Bundle(Bundle):
             set_model_state_dict,
         )
 
-        from unirl.train.backend.sharded_state import _canonical_param_name
+        from unirl.models.types.post_materialize import canonical_param_name
 
         aux_set = tuple(with_aux)
         for name in aux_set:
@@ -290,7 +290,7 @@ class HunyuanImage3Bundle(Bundle):
             # ``state_dict()`` keys, which never carry the AC-wrapper segment
             # that ``named_parameters()`` exposes.
             expected_names = {
-                _canonical_param_name(name) for name, _ in self.transformer.named_parameters(remove_duplicate=False)
+                canonical_param_name(name) for name, _ in self.transformer.named_parameters(remove_duplicate=False)
             }
             rename_map = {}
             for name in expected_names:
