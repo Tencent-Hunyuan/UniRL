@@ -18,6 +18,8 @@ from unirl.types.sample import Sample
 class AsyncDiffusionTrainer(AsyncRolloutTrainerMixin, DiffusionTrainer):
     """Disaggregated async diffusion trainer (two slabs, resident engine, cross-slab sync)."""
 
+    _prompt_local_rollout = True
+
     def __init__(
         self,
         *,
@@ -44,7 +46,10 @@ class AsyncDiffusionTrainer(AsyncRolloutTrainerMixin, DiffusionTrainer):
                 "and a reward sharing the train slab could still OOM. Remove the option or use the "
                 "synchronous trainer."
             )
-        super().__init__(**diffusion_kwargs)
+        super().__init__(
+            per_worker_inflight=per_worker_inflight,
+            **diffusion_kwargs,
+        )
 
         if self.weight_sync is None:
             raise ValueError(

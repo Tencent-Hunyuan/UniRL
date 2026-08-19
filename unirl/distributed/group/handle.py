@@ -257,11 +257,11 @@ class PendingHandleCall:
         return len(done) == len(self._refs)
 
     def wait(self) -> None:
-        """Block until every worker finishes, without collecting; re-raises worker errors."""
-        try:
-            ray.get(self._refs)
-        finally:
-            self._release_leases()
+        """Block until completion and safely discard the collected return value."""
+        if self._consumed:
+            return
+        self.result()
+        self._value = None
 
     def result(self) -> Any:
         """Block if needed, then rebind + collect: the method's collected return value."""

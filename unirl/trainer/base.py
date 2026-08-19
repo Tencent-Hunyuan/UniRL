@@ -29,11 +29,12 @@ def resolve_worker_max_concurrency(
     """Resolve actor concurrency, deriving it from rollout lanes when omitted."""
     configured = cfg.get("worker_max_concurrency")
     if configured is not None:
-        return configured
+        return int(configured)
 
     effective_inflight = per_worker_inflight
     if effective_inflight is None:
-        effective_inflight = cfg.get("per_worker_inflight")
+        configured_inflight = cfg.get("per_worker_inflight")
+        effective_inflight = None if configured_inflight is None else int(configured_inflight)
     return 1 if effective_inflight is None else required_worker_concurrency(effective_inflight)
 
 
@@ -41,15 +42,12 @@ def resolve_worker_concurrency_by_device(
     cfg: DictConfig,
     *,
     rollout_concurrency: int,
+    train_fraction: Optional[float],
 ) -> Optional[List[int]]:
     """Keep a separate-layout train slab serial when rollout concurrency is derived."""
-    if cfg.get("worker_max_concurrency") is not None or cfg.get("per_worker_inflight") is None:
+    if cfg.get("worker_max_concurrency") is not None or train_fraction is None:
         return None
-    layout = cfg.get("layout")
-    if layout is not None and str(layout) != "separate":
-        return None
-    train_fraction = cfg.get("train_fraction", 0.5)
-    num_devices = cfg.num_devices
+    num_devices = int(cfg.num_devices)
     train_devices_float = train_fraction * num_devices
     train_devices = round(train_devices_float)
     if abs(train_devices_float - train_devices) > 1e-9 or not 0 < train_devices < num_devices:
@@ -153,19 +151,17 @@ class BaseTrainer:
         cfg: DictConfig,
         logging_cfg: Optional[DictConfig] = None,
         per_worker_inflight: Optional[int] = None,
+        separate_train_fraction: Optional[float] = None,
     ) -> None:
         self.num_devices = cfg.num_devices
         resolved_concurrency = resolve_worker_max_concurrency(
             cfg,
             per_worker_inflight=per_worker_inflight,
         )
-        per_device_concurrency = (
-            resolve_worker_concurrency_by_device(
-                cfg,
-                rollout_concurrency=resolved_concurrency,
-            )
-            if per_worker_inflight is None
-            else None
+        per_device_concurrency = resolve_worker_concurrency_by_device(
+            cfg,
+            rollout_concurrency=resolved_concurrency,
+            train_fraction=separate_train_fraction,
         )
         self.pool = DevicePool(
             num_devices=cfg.num_devices,

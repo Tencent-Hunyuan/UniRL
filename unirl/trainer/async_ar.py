@@ -61,7 +61,13 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
             stack_cfg=stack_cfg,
         )
         # Skips ARTrainer.__init__: it opens the colocate placement block we replace with two slabs.
-        BaseTrainer.__init__(self, cfg=cfg, logging_cfg=logging_cfg)
+        BaseTrainer.__init__(
+            self,
+            cfg=cfg,
+            logging_cfg=logging_cfg,
+            per_worker_inflight=per_worker_inflight,
+            separate_train_fraction=float(train_fraction),
+        )
 
         self.batch_size = batch_size
         self.adv_normalization_scope = adv_normalization_scope
