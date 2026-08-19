@@ -74,6 +74,7 @@ class VLLMOmniEngineConfig(BaseEngineConfig):
         del model_config
         extra = dict(extra or {})
         mode = extra.pop("mode", None)
+        adapter_omni_kwargs = dict(extra.pop("omni_kwargs", {}) or {})
 
         intent: Dict[str, Any] = {
             "model_path": str(self.model_path),
@@ -91,6 +92,7 @@ class VLLMOmniEngineConfig(BaseEngineConfig):
         )
         if mode is not None:
             omni_kwargs["mode"] = mode
+        omni_kwargs.update(adapter_omni_kwargs)
         omni_kwargs.update(self.omni_extra or {})
         intent["omni_kwargs"] = omni_kwargs
         return intent

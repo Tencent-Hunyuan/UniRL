@@ -93,8 +93,7 @@ def _restore_reward_rows(sample: Sample, scored_rows: Sample) -> Sample:
     scored = scored_rows.parts[-1]
     if scored.batch_size != original.batch_size:
         raise RuntimeError(
-            f"_restore_reward_rows: scored {scored.batch_size} rows for an original frontier of "
-            f"{original.batch_size}"
+            f"_restore_reward_rows: scored {scored.batch_size} rows for an original frontier of {original.batch_size}"
         )
     expected_ids = [f"reward-row:{i}/0" for i in range(original.batch_size)]
     if list(scored.sample_ids) != expected_ids:
@@ -348,9 +347,7 @@ class DiffusionTrainer(BaseTrainer):
         self._rollout_is_trainside = False
         self._uses_ema = False
         sync_target = str(sync_cfg.get("_target_", "")) if sync_cfg is not None else ""
-        self._staged_weight_sync = sync_target.endswith(
-            ("LocalLoraWeightSync", "RemoteLoraWeightSync")
-        )
+        self._staged_weight_sync = sync_target.endswith(("LocalLoraWeightSync", "RemoteLoraWeightSync"))
 
         self.data_source = instantiate(data_source_cfg)
         self._data_source_cfg = data_source_cfg
@@ -713,10 +710,7 @@ class DiffusionTrainer(BaseTrainer):
         # them through weight sync.
         should_swap_ema = self._uses_ema and self._rollout_is_trainside
         staged_sync = (
-            sync_weights
-            and self.weight_sync is not None
-            and should_offload_train
-            and self._staged_weight_sync
+            sync_weights and self.weight_sync is not None and should_offload_train and self._staged_weight_sync
         )
         train_offload_attempted = False
         ema_apply_attempted = False
