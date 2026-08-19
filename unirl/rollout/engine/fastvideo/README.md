@@ -36,7 +36,8 @@ doctrine), then update the fingerprints together with the patch.
   tracked).
 - **Solver SSOT.** `WAN21PipelineConfig.unipc_*` declares the deterministic
   solver. At init the engine verifies it against the checkpoint's
-  `scheduler/scheduler_config.json` — fail closed on a mismatch, a
+  `scheduler/scheduler_config.json`, resolving either a local diffusers-layout
+  directory or a Hugging Face model repo — fail closed on a mismatch, a
   missing/unreadable file, a non-UniPC `_class_name`, or a non-empty
   `disable_corrector` (no config knob) — and requires an injected SDE strategy
   whose `canonical_name` the plan supports. The spec travels as a `UniPCSpec`

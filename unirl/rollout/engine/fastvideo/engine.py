@@ -37,15 +37,33 @@ logger = logging.getLogger(__name__)
 
 def _verify_checkpoint_unipc_spec(ckpt_path: str, spec: UniPCSpec) -> None:
     """Fail closed unless the checkpoint's scheduler_config.json declares the model-owned UniPC solver spec."""
-    path = Path(ckpt_path) / "scheduler" / "scheduler_config.json"
+    checkpoint = Path(ckpt_path).expanduser()
+    if checkpoint.is_dir():
+        path = checkpoint / "scheduler" / "scheduler_config.json"
+    else:
+        try:
+            from huggingface_hub import hf_hub_download
+
+            path = Path(
+                hf_hub_download(
+                    repo_id=ckpt_path,
+                    filename="scheduler/scheduler_config.json",
+                )
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "FastVideo canonical UniPC cannot resolve "
+                f"{ckpt_path!r}/scheduler/scheduler_config.json as either a local "
+                "diffusers-layout checkpoint or a Hugging Face model repo."
+            ) from exc
     try:
         with path.open("r", encoding="utf-8") as f:
             declared_cfg = json.load(f)
     except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeError(
             f"FastVideo canonical UniPC cannot verify model_config.unipc_* without {path}; "
-            "point pretrained_model_ckpt_path at a local diffusers-layout checkpoint "
-            "(pre-download HF repos first)."
+            "use a diffusers-layout local checkpoint or Hugging Face model repo containing "
+            "scheduler/scheduler_config.json."
         ) from exc
     class_name = str(declared_cfg.get("_class_name", ""))
     if "UniPC" not in class_name:
