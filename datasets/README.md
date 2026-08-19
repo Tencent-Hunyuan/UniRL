@@ -24,6 +24,11 @@ The converters need a few libraries the framework itself does not (`datasets`, `
 pip install -e '.[dataset-prep]'
 ```
 
+That covers every converter here except [`droid100/`](droid100/README.md), which also needs
+**torch** (it resizes clips and writes `.pt` tensors). The extra deliberately does not carry
+torch: torch enters through exactly one engine extra, which is what lets each engine pin its
+own CUDA stack. Any engine extra supplies it, or `pip install torch` for CPU-only prep.
+
 Installing `unirl` at all is only strictly required for the converters that import it
 (`sft_manifests/prepare_sft_agent.py`, `searchgen/prepare_sft.py`), but the extra is the
 simplest way to get the rest. Training does not need it.
