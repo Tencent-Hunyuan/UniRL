@@ -24,9 +24,7 @@ class T2AVCompositeScorer(RewardBackend):
         # switch off expensive modalities without retaining their model or
         # allowing a failed/NaN scorer to poison the composite.
         self.weights: Dict[str, float] = {
-            str(name): float(weight)
-            for name, weight in dict(config.weights or {}).items()
-            if float(weight) != 0.0
+            str(name): float(weight) for name, weight in dict(config.weights or {}).items() if float(weight) != 0.0
         }
         if not self.weights:
             raise ValueError("T2AVCompositeScorer requires at least one non-zero weight.")

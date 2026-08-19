@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from typing import Optional
 
 import torch
@@ -262,14 +261,15 @@ class BucketedIPCReceiveMixin:
         rank = int(getattr(self, "rank", getattr(self, "local_rank", 0)))
         if not isinstance(lora_tensors, dict):
             raise TypeError(
-                f"{type(self).__name__}: deserialised lora_tensors expected dict, got "
-                f"{type(lora_tensors).__name__}"
+                f"{type(self).__name__}: deserialised lora_tensors expected dict, got {type(lora_tensors).__name__}"
             )
         peft_config = dict(peft_config or {})
         pipeline = getattr(getattr(self, "model_runner", None), "pipeline", None)
         transformer = getattr(pipeline, "transformer", None)
-        if transformer is not None and hasattr(transformer, "blocks") and not hasattr(
-            transformer, "transformer_blocks"
+        if (
+            transformer is not None
+            and hasattr(transformer, "blocks")
+            and not hasattr(transformer, "transformer_blocks")
         ):
             remapped = {}
             renamed = 0

@@ -6,11 +6,6 @@ from contextlib import nullcontext
 from typing import Any, Optional
 
 import torch
-
-from unirl.sde.kernels import CPSSDEStrategy
-from unirl.sde.noise import make_denoise_step_generators
-from unirl.types.noise_recipe import NoiseRecipe
-from unirl.types.sampling import compute_trajectory_positions
 from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
 from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as h3_module
 from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
@@ -18,6 +13,11 @@ from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
     minimax_h3_patchify_video_latent,
 )
 from vllm_omni.diffusion.registry import _apply_sequence_parallel_if_enabled
+
+from unirl.sde.kernels import CPSSDEStrategy
+from unirl.sde.noise import make_denoise_step_generators
+from unirl.types.noise_recipe import NoiseRecipe
+from unirl.types.sampling import compute_trajectory_positions
 
 
 class MiniMaxH3RLPipeline(MiniMaxH3Pipeline):
@@ -55,15 +55,11 @@ class MiniMaxH3RLPipeline(MiniMaxH3Pipeline):
         start = request_index * outputs_per_prompt
         end = start + outputs_per_prompt
         if gids and (start < 0 or end > len(gids)):
-            raise IndexError(
-                f"MiniMax-H3 x_T recipe slice [{start}:{end}) exceeds {len(gids)} group ids"
-            )
+            raise IndexError(f"MiniMax-H3 x_T recipe slice [{start}:{end}) exceeds {len(gids)} group ids")
         return NoiseRecipe(
             noise_group_ids=[str(gid) for gid in gids[start:end]],
             base_seed=int(extra.get("init_noise_seed", 0)),
-            latent_shape=tuple(extra["init_noise_latent_shape"])
-            if extra.get("init_noise_latent_shape")
-            else None,
+            latent_shape=tuple(extra["init_noise_latent_shape"]) if extra.get("init_noise_latent_shape") else None,
         )
 
     def _initial_noise(

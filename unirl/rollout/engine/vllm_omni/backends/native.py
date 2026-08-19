@@ -116,15 +116,7 @@ class VLLMOmniBackend:
 
     @classmethod
     def boot(cls, intent: Dict[str, Any]) -> "VLLMOmniBackend":
-        """Spell the intent into ``Omni`` ctor kwargs and spawn.
-
-        ``intent`` is the dict from ``config.server_intent`` (adapter boot
-        extras + the reserved port base already overlaid). The stage YAML is
-        passed PRISTINE — ``enable_sleep_mode`` / ``master_port`` ride the
-        runtime's own ctor-kwarg override channel (see
-        :func:`_assemble_omni_kwargs`), so there is no YAML rewrite and no
-        temp file. See the module docstring for the load-bearing boot order.
-        """
+        """Spell the intent into ``Omni`` ctor kwargs and spawn."""
         visible_devices = intent.get("cuda_visible_devices")
         if visible_devices is not None:
             os.environ["CUDA_VISIBLE_DEVICES"] = str(visible_devices)
@@ -555,16 +547,7 @@ class VLLMOmniBackend:
         lora_tensors: Dict[str, Any],
         peft_config: Optional[dict],
     ) -> None:
-        """File-backed LoRA push (one local ``torch.save``) — grouped-worker-safe.
-
-        Dynamic LoRA installation wraps hundreds of layers; coupling that work
-        to the executor's all-rank status gather can strand fast ranks in an
-        NCCL collective while another rank is still mutating its module tree.
-        Per-rank ready markers replace that collective. A local payload file
-        avoids both the one-shot
-        fd limitation of :meth:`set_lora_handle` and broadcasting H3's ~400 MB
-        base64 payload through the control queue.
-        """
+        """File-backed LoRA push (one local ``torch.save``) — grouped-worker-safe."""
         import os
         import time
         import uuid
