@@ -69,15 +69,10 @@ class LocalLoraWeightSync(LoraWeightSyncBase):
         if not getattr(self._rollout, "_is_replica_head", True):
             return
 
-        setter = (
-            self._rollout.set_lora_from_tensors_copy
-            if self._copy
-            else self._rollout.set_lora_from_tensors
-        )
+        setter = self._rollout.set_lora_from_tensors_copy if self._copy else self._rollout.set_lora_from_tensors
         setter(self._adapter_name, lora_tensors, peft_config=peft_config)
         logger.info(
-            "[LoRA-SYNC] rank %s: pushed %d LoRA tensors to rollout via %s "
-            "(adapter=%s, track=%s)",
+            "[LoRA-SYNC] rank %s: pushed %d LoRA tensors to rollout via %s (adapter=%s, track=%s)",
             rank,
             len(lora_tensors),
             "copy" if self._copy else "handle",

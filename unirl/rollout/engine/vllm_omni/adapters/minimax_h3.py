@@ -187,11 +187,43 @@ class MiniMaxH3OutputAdapter:
 class MiniMaxH3T2VAAdapter(ModelAdapter):
     """MiniMax-H3 t2va, one HSDP4+UP4 engine per external DP replica."""
 
-    stage_yaml = "minimax_h3_t2va_rl.yaml"
     needs_driver_tokenizer = False
     # The grouped engine broadcasts one adapter to four subprocesses. Byte-copy
     # avoids reusing a one-shot CUDA IPC file descriptor on ranks 2..4.
     lora_copy_transport = True
+
+    def boot_kwargs(self) -> dict[str, Any]:
+        """Use the current vLLM-Omni direct diffusion-stage configuration."""
+        world_size = int(self.cfg.replica_size)
+        return {
+            "use_stage_yaml": False,
+            "needs_driver_tokenizer": False,
+            "clear_cuda_visible": False,
+            "omni_kwargs": {
+                "model_class_name": "MiniMaxH3Pipeline",
+                "task_type": "t2va",
+                "trust_remote_code": True,
+                "num_gpus": world_size,
+                "max_num_seqs": 1,
+                "diffusion_batch_size": 1,
+                "distributed_executor_backend": "mp",
+                "enforce_eager": True,
+                "sequence_parallel_size": world_size,
+                "ulysses_degree": world_size,
+                "ring_degree": 1,
+                "text_encoder_tp_size": world_size,
+                "vae_patch_parallel_size": world_size,
+                "vae_parallel_mode": "tile",
+                "vae_use_tiling": True,
+                "use_hsdp": True,
+                "hsdp_shard_size": world_size,
+                "hsdp_replicate_size": 1,
+                "custom_pipeline_args": {
+                    "pipeline_class": ("unirl.rollout.engine.vllm_omni.pipelines.minimax_h3.MiniMaxH3RLPipeline"),
+                },
+                "worker_extension_cls": ("unirl.rollout.engine.vllm_omni.worker.dit_extension.DiTWeightSyncExtension"),
+            },
+        }
 
     def __init__(self, config: Any, model_config: Any, *, strategy: Any = None, tokenize_fn: Any = None) -> None:
         super().__init__(config, model_config, strategy=strategy, tokenize_fn=tokenize_fn)
