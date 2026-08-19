@@ -1,0 +1,14 @@
+# @package _global_
+# Primary target: node-local shard8 x four replicated nodes.
+
+defaults:
+  - minimax_h3_t2va_vllmomni_32c_8x8
+  - _self_
+
+logging:
+  run_name: h3-8p8s-vllmomni-hsdp8x4-rmdp32
+  tags: [minimax-h3, vllm-omni, 8p8s, hsdp8x4, rm-dp32]
+
+backend:
+  fsdp_cfg:
+    fsdp_mode: hybrid

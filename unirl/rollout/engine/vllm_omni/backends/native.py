@@ -116,7 +116,21 @@ class VLLMOmniBackend:
 
     @classmethod
     def boot(cls, intent: Dict[str, Any]) -> "VLLMOmniBackend":
-        """Spell the intent into ``Omni`` ctor kwargs and spawn."""
+        """Spell the intent into ``Omni`` ctor kwargs and spawn.
+
+        ``intent`` is the dict from ``config.server_intent`` (adapter boot
+        extras + the reserved port base already overlaid). The stage YAML is
+        passed PRISTINE — ``enable_sleep_mode`` / ``master_port`` ride the
+        runtime's own ctor-kwarg override channel (see
+        :func:`_assemble_omni_kwargs`), so there is no YAML rewrite and no
+        temp file. See the module docstring for the load-bearing boot order.
+        """
+        visible_devices = intent.get("cuda_visible_devices")
+        if visible_devices is not None:
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(visible_devices)
+        elif intent.get("clear_cuda_visible"):
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+
         from unirl.rollout.engine.vllm_omni.patches import install as install_patches
 
         install_patches()
@@ -129,9 +143,6 @@ class VLLMOmniBackend:
             pass
 
         rt = _import_omni_runtime()
-
-        if intent.get("clear_cuda_visible"):
-            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
 
         import fcntl
 
@@ -544,9 +555,19 @@ class VLLMOmniBackend:
         lora_tensors: Dict[str, Any],
         peft_config: Optional[dict],
     ) -> None:
-        """Byte-copy LoRA push (``torch.save`` + base64) — TP>1-broadcast-safe."""
-        import base64
-        import io
+        """File-backed LoRA push (one local ``torch.save``) — grouped-worker-safe.
+
+        Dynamic LoRA installation wraps hundreds of layers; coupling that work
+        to the executor's all-rank status gather can strand fast ranks in an
+        NCCL collective while another rank is still mutating its module tree.
+        Per-rank ready markers replace that collective. A local payload file
+        avoids both the one-shot
+        fd limitation of :meth:`set_lora_handle` and broadcasting H3's ~400 MB
+        base64 payload through the control queue.
+        """
+        import os
+        import time
+        import uuid
 
         import torch
 
@@ -558,27 +579,73 @@ class VLLMOmniBackend:
 
         omni = self._require_omni()
         lora_tensors = self._wrap_peft_envelope(lora_tensors)
-        self._remove_existing_lora(int(DIFFRL_LORA_INT_ID))
 
         cpu_tensors = {
             name: t.detach().to("cpu") if isinstance(t, torch.Tensor) else t for name, t in lora_tensors.items()
         }
-        buf = io.BytesIO()
-        torch.save(cpu_tensors, buf)
-        serialized = base64.b64encode(buf.getvalue()).decode("ascii")
-
+        timeout_s = float(os.environ.get("DIFFRL_LORA_RPC_TIMEOUT_S", "1800"))
         for sid in self._stage_ids():
-            omni.engine.collective_rpc(
-                method="set_lora_from_tensor_dict_copy",
-                args=(
-                    str(adapter_name) or DIFFRL_LORA_NAME,
-                    int(DIFFRL_LORA_INT_ID),
-                    DIFFRL_LORA_PATH,
-                    dict(peft_config or {}),
-                    serialized,
-                ),
-                stage_ids=[int(sid)],
-            )
+            worker_count = self._worker_count_for_stage(sid)
+            ready_token = uuid.uuid4().hex
+            payload_path = f"/tmp/diffrl_lora_payload_{ready_token}.pt"
+            torch.save(cpu_tensors, payload_path)
+            markers = [f"/tmp/diffrl_lora_ready_{ready_token}_{rank}" for rank in range(worker_count)]
+            try:
+                result = omni.engine.collective_rpc(
+                    method="set_lora_from_tensor_file",
+                    timeout=timeout_s,
+                    args=(
+                        str(adapter_name) or DIFFRL_LORA_NAME,
+                        int(DIFFRL_LORA_INT_ID),
+                        DIFFRL_LORA_PATH,
+                        dict(peft_config or {}),
+                        payload_path,
+                        ready_token,
+                    ),
+                    kwargs={
+                        "_diffrl_unique_reply_rank": 0,
+                        "_diffrl_exec_all_ranks": True,
+                    },
+                    stage_ids=[int(sid)],
+                )
+                self._raise_for_control_rpc_error(result, method="set_lora_from_tensor_file")
+                deadline = time.monotonic() + timeout_s
+                while not all(os.path.exists(marker) for marker in markers):
+                    if time.monotonic() >= deadline:
+                        missing = [rank for rank, marker in enumerate(markers) if not os.path.exists(marker)]
+                        raise TimeoutError(f"LoRA installation timed out on stage {sid}, ranks {missing}")
+                    time.sleep(1.0)
+            finally:
+                for marker in markers:
+                    try:
+                        os.unlink(marker)
+                    except FileNotFoundError:
+                        pass
+                try:
+                    os.unlink(payload_path)
+                except FileNotFoundError:
+                    pass
+
+    def _worker_count_for_stage(self, stage_id: int) -> int:
+        """Return physical diffusion-worker count from the resolved stage config."""
+        omni = self._require_omni()
+        for entry in omni.stage_configs:
+            if int(_cfg_get(entry, "stage_id", -1)) != int(stage_id):
+                continue
+            devices = _cfg_get(_cfg_get(entry, "runtime", {}), "devices")
+            if isinstance(devices, str):
+                count = len([item for item in devices.split(",") if item.strip()])
+                if count:
+                    return count
+            if isinstance(devices, (list, tuple)) and devices:
+                return len(devices)
+        return max(1, int(self._tp_per_stage.get(int(stage_id), 1)))
+
+    @staticmethod
+    def _raise_for_control_rpc_error(result: Any, *, method: str) -> None:
+        for item in result if isinstance(result, list) else [result]:
+            if isinstance(item, dict) and item.get("supported") is False:
+                raise RuntimeError(f"{method} failed: {item.get('error', 'unknown error')}")
 
     @staticmethod
     def _wrap_peft_envelope(lora_tensors: Dict[str, Any]) -> Dict[str, Any]:

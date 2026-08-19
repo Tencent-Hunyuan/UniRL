@@ -196,8 +196,23 @@ def patch_dit_lora_loader() -> None:
             list(lora_model.loras.keys()),
         )
 
-        for lora in lora_model.loras.values():
-            lora.optimize()
+        import torch
+
+        previous_threads = torch.get_num_threads()
+        logger.debug(
+            "Optimizing %d LoRA modules with one CPU thread (previously %d)",
+            len(lora_model.loras),
+            previous_threads,
+        )
+        # Four SP workers otherwise each fan this simple CPU scaling loop out
+        # over the host's full OpenMP pool. On H3's 300-module adapter that
+        # oversubscription leaves half the workers stuck indefinitely.
+        torch.set_num_threads(1)
+        try:
+            for lora in lora_model.loras.values():
+                lora.optimize()
+        finally:
+            torch.set_num_threads(previous_threads)
 
         return lora_model, peft_helper
 

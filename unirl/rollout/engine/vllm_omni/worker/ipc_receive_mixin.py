@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Optional
 
 import torch
@@ -200,18 +201,116 @@ class BucketedIPCReceiveMixin:
         lora_path: str,
         peft_config: dict,
         lora_tensors_serialized: str,
+        ready_token: Optional[str] = None,
     ) -> bool:
         """Byte-copy variant of :meth:`set_lora_from_tensor_dict` for HI3."""
         import base64
         import io
 
+        rank = int(getattr(self, "rank", getattr(self, "local_rank", 0)))
+        logger.debug(
+            "[LoRA-COPY] rank=%d payload_chars=%d decode_begin",
+            rank,
+            len(lora_tensors_serialized),
+        )
         raw = base64.b64decode(lora_tensors_serialized)
+        logger.debug("[LoRA-COPY] rank=%d payload_bytes=%d torch_load_begin", rank, len(raw))
         lora_tensors = torch.load(io.BytesIO(raw), map_location="cpu")
+        logger.debug("[LoRA-COPY] rank=%d tensors=%d torch_load_complete", rank, len(lora_tensors))
+        return self._diffrl_install_lora_tensors(
+            lora_name,
+            lora_int_id,
+            lora_path,
+            peft_config,
+            lora_tensors,
+            ready_token=ready_token,
+        )
+
+    def set_lora_from_tensor_file(
+        self,
+        lora_name: str,
+        lora_int_id: int,
+        lora_path: str,
+        peft_config: dict,
+        payload_path: str,
+        ready_token: Optional[str] = None,
+    ) -> bool:
+        """Load a large adapter from a controller-written local payload file."""
+        rank = int(getattr(self, "rank", getattr(self, "local_rank", 0)))
+        logger.debug("[LoRA-FILE] rank=%d torch_load_begin path=%s", rank, payload_path)
+        lora_tensors = torch.load(payload_path, map_location="cpu")
+        logger.debug("[LoRA-FILE] rank=%d tensors=%d torch_load_complete", rank, len(lora_tensors))
+        return self._diffrl_install_lora_tensors(
+            lora_name,
+            lora_int_id,
+            lora_path,
+            peft_config,
+            lora_tensors,
+            ready_token=ready_token,
+        )
+
+    def _diffrl_install_lora_tensors(
+        self,
+        lora_name: str,
+        lora_int_id: int,
+        lora_path: str,
+        peft_config: dict,
+        lora_tensors,
+        *,
+        ready_token: Optional[str],
+    ) -> bool:
+        rank = int(getattr(self, "rank", getattr(self, "local_rank", 0)))
         if not isinstance(lora_tensors, dict):
             raise TypeError(
-                f"{type(self).__name__}.set_lora_from_tensor_dict_copy: "
-                f"deserialised lora_tensors expected dict, got "
+                f"{type(self).__name__}: deserialised lora_tensors expected dict, got "
                 f"{type(lora_tensors).__name__}"
+            )
+        peft_config = dict(peft_config or {})
+        pipeline = getattr(getattr(self, "model_runner", None), "pipeline", None)
+        transformer = getattr(pipeline, "transformer", None)
+        if transformer is not None and hasattr(transformer, "blocks") and not hasattr(
+            transformer, "transformer_blocks"
+        ):
+            remapped = {}
+            renamed = 0
+            for name, tensor in lora_tensors.items():
+                mapped = name.replace("transformer.transformer_blocks.", "transformer.blocks.")
+                mapped = mapped.replace(".attn.to_out.0.", ".attn.out_proj.")
+                mapped = mapped.replace(".ff.net.2.", ".mlp.fc2.")
+                if ".ff.net.0.proj." in mapped:
+                    gate_name = mapped.replace(".ff.net.0.proj.", ".mlp.gate_proj.")
+                    up_name = mapped.replace(".ff.net.0.proj.", ".mlp.up_proj.")
+                    if ".lora_B." in mapped:
+                        if not torch.is_tensor(tensor) or tensor.shape[0] % 2:
+                            raise ValueError(
+                                f"MiniMax-H3 fused FFN LoRA-B must split evenly, got "
+                                f"{getattr(tensor, 'shape', None)} for {name}"
+                            )
+                        gate, up = tensor.chunk(2, dim=0)
+                        remapped[gate_name] = gate.contiguous()
+                        remapped[up_name] = up.contiguous()
+                    else:
+                        remapped[gate_name] = tensor.clone() if torch.is_tensor(tensor) else tensor
+                        remapped[up_name] = tensor.clone() if torch.is_tensor(tensor) else tensor
+                    renamed += 2
+                    continue
+                renamed += int(mapped != name)
+                remapped[mapped] = tensor
+            lora_tensors = remapped
+            target_modules = peft_config.get("target_modules")
+            if isinstance(target_modules, str):
+                target_modules = target_modules.replace("^transformer_blocks", "^blocks")
+                target_modules = target_modules.replace(r"attn\.to_out\.0", r"attn\.out_proj")
+                target_modules = target_modules.replace(
+                    r"ff\.net\.0\.proj",
+                    r"(?:mlp\.gate_proj|mlp\.up_proj)",
+                )
+                target_modules = target_modules.replace(r"ff\.net\.2", r"mlp\.fc2")
+                peft_config["target_modules"] = target_modules
+            logger.info(
+                "[LoRA-REMAP] rank=%d trainer=transformer_blocks rollout=blocks renamed=%d",
+                rank,
+                renamed,
             )
         from unirl.rollout.engine.vllm_omni.patches.runtime import (
             OmniTensorLoRARequest,
@@ -221,10 +320,27 @@ class BucketedIPCReceiveMixin:
             lora_name=str(lora_name),
             lora_int_id=int(lora_int_id),
             lora_path=str(lora_path),
-            peft_config=dict(peft_config or {}),
+            peft_config=peft_config,
             lora_tensors=lora_tensors,
         )
-        return self.add_lora(request)
+        # Keep replacement and installation in the same worker RPC. The
+        # controller intentionally does not run a separate all-rank remove,
+        # which would reintroduce a status collective around dynamic wrapping.
+        self.remove_lora(int(lora_int_id))
+        logger.debug("[LoRA-INSTALL] rank=%d add_lora_begin", rank)
+        added = bool(self.add_lora(request))
+        logger.debug("[LoRA-INSTALL] rank=%d add_lora_complete added=%s", rank, added)
+        if not added:
+            raise RuntimeError(f"failed to install LoRA adapter {lora_int_id} on rank {getattr(self, 'rank', '?')}")
+        wrapped = len(getattr(getattr(self, "lora_manager", None), "_lora_modules", {}))
+        if wrapped <= 0:
+            raise RuntimeError(f"LoRA adapter {lora_int_id} wrapped zero rollout layers on rank {rank}")
+        logger.info("[LoRA-INSTALL] rank=%d wrapped_layers=%d", rank, wrapped)
+        if ready_token:
+            marker = f"/tmp/diffrl_lora_ready_{ready_token}_{rank}"
+            with open(marker, "w", encoding="utf-8") as handle:
+                handle.write("ready\n")
+        return True
 
     def _diffrl_describe_params(
         self,

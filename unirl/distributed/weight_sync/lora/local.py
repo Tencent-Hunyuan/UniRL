@@ -23,6 +23,7 @@ class LocalLoraWeightSync(LoraWeightSyncBase):
         adapter_name: Optional[str] = None,
         verify: bool = False,
         track_prefix: str = "",
+        copy: bool = False,
     ) -> None:
         super().__init__(
             backend=backend,
@@ -32,11 +33,22 @@ class LocalLoraWeightSync(LoraWeightSyncBase):
             track_prefix=track_prefix,
         )
         self._rollout = rollout
+        self._copy = bool(copy)
+        self._cached = None
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
-    def sync(self) -> None:
-        """Extract LoRA from the local FSDP model and load it into the engine."""
-        lora_tensors, peft_config = self._extract()
+    def extract(self) -> None:
+        """Extract LoRA while the trainer is resident and cache it on CPU."""
+        self._cached = self._extract()
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def push(self) -> None:
+        """Load the cached LoRA after trainer offload and rollout wake-up."""
+        if self._cached is None:
+            raise RuntimeError("LocalLoraWeightSync.push: call extract() (or sync()) first")
+        lora_tensors, peft_config = self._cached
+        self._cached = None
+
         ri = self.rank_info
         rank = ri.rank if ri is not None else 0
         if ri is not None and ri.tp_rank != 0:  # extract on every rank, push only from the TP leader
@@ -51,16 +63,35 @@ class LocalLoraWeightSync(LoraWeightSyncBase):
             )
             return
 
-        self._rollout.set_lora_from_tensors(self._adapter_name, lora_tensors, peft_config=peft_config)
+        # A grouped vLLM-Omni replica has one controller Remote plus TP/SP
+        # follower Remotes. The controller broadcasts the adapter to all of its
+        # subprocesses; followers deliberately have no backend of their own.
+        if not getattr(self._rollout, "_is_replica_head", True):
+            return
+
+        setter = (
+            self._rollout.set_lora_from_tensors_copy
+            if self._copy
+            else self._rollout.set_lora_from_tensors
+        )
+        setter(self._adapter_name, lora_tensors, peft_config=peft_config)
         logger.info(
-            "[LoRA-SYNC] rank %s: pushed %d LoRA tensors to rollout (adapter=%s, track=%s)",
+            "[LoRA-SYNC] rank %s: pushed %d LoRA tensors to rollout via %s "
+            "(adapter=%s, track=%s)",
             rank,
             len(lora_tensors),
+            "copy" if self._copy else "handle",
             self._adapter_name,
             self._track_prefix or "<single>",
         )
         if self._verify:
             self._verify_loaded(lora_tensors, peft_config)
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def sync(self) -> None:
+        """Extract and push in one call when trainer and rollout can coexist."""
+        self.extract()
+        self.push()
 
     def _verify_loaded(self, lora_tensors, peft_config) -> None:
         """Assert the sibling engine's loaded LoRA matches what we just pushed."""

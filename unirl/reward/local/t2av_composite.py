@@ -19,9 +19,17 @@ class T2AVCompositeScorer(RewardBackend):
 
     def __init__(self, *, config: "T2AVCompositeSpec", base_device: str) -> None:
         super().__init__(model_name="t2av_composite", batch_size=config.batch_size)
-        self.weights: Dict[str, float] = dict(config.weights or {})
+        # A zero-weight component must be operationally disabled, not merely
+        # multiplied by zero after loading and inference. This lets recipes
+        # switch off expensive modalities without retaining their model or
+        # allowing a failed/NaN scorer to poison the composite.
+        self.weights: Dict[str, float] = {
+            str(name): float(weight)
+            for name, weight in dict(config.weights or {}).items()
+            if float(weight) != 0.0
+        }
         if not self.weights:
-            raise ValueError("T2AVCompositeScorer requires a non-empty `weights` dict (scorer_name -> weight).")
+            raise ValueError("T2AVCompositeScorer requires at least one non-zero weight.")
 
         self._scorers: Dict[str, RewardBackend] = {}
         for name in self.weights:
