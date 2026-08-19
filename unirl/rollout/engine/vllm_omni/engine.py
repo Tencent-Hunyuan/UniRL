@@ -281,9 +281,7 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
             self._shutdown_complete = True
 
     def tp_per_stage(self) -> Dict[int, int]:
-        """``{stage_id: tensor_parallel_size}`` per stage (parsed from the
-        stage YAML at boot). The IPC weight-sync handler needs this to skip
-        orphan train ranks that exceed a stage's TP size."""
+        """Return ``{stage_id: tensor_parallel_size}`` for weight synchronization."""
         if not self._is_replica_head:
             return {}
         return self._backend.tp_per_stage()

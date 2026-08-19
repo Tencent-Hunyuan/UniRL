@@ -41,16 +41,7 @@ def _run_cleanup_steps(steps: List[Tuple[str, Callable[[], None]]]) -> None:
 
 
 def _flatten_reward_rows(sample: Sample) -> Sample:
-    """Build a one-root-per-generated-row view for reward DP dispatch.
-
-    ``Sample.slice`` deliberately keeps each prompt tree intact. That is the
-    right contract for rollout generation, but a ``P``-prompt/``N``-sample
-    response otherwise has only ``P`` dispatch units at reward time. Re-rooting
-    the already-generated frontier gives RewardService ``P*N`` independent
-    trees without copying media tensors, so RM-DP can assign rows rather than
-    whole GRPO groups. The original lineage remains authoritative for advantage
-    grouping and training; only rewards are copied back from this view.
-    """
+    """Build a one-root-per-generated-row view for reward DP dispatch."""
     if not sample.parts:
         raise ValueError("_flatten_reward_rows: Sample has no parts")
     frontier = sample.parts[-1]
@@ -769,12 +760,7 @@ class DiffusionTrainer(BaseTrainer):
         sync_weights: bool = False,
         rollout_id: int = 0,
     ) -> Tuple[Sample, float]:
-        """One ``rollout → reward → advantage`` pass; training happens per window.
-
-        Colocated LoRA engines split publication around trainer offload:
-        extract while FSDP is resident, then wake rollout and push the cached
-        CPU adapter after trainer memory has been released.
-        """
+        """One ``rollout → reward → advantage`` pass; training happens per window."""
         sample = self._generate_for_training(sample, sync_weights=sync_weights)
         # With no reward configured, ``part.rewards`` stays None and the block below no-ops.
         if self.reward is not None:
