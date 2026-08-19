@@ -7,7 +7,7 @@ from typing import Callable, List, NamedTuple, Optional, Tuple
 
 import torch
 
-from unirl.algorithms import StageAlgorithm
+from unirl.algorithms.base import StageAlgorithm
 from unirl.train.stack.planner.count import _count_plan
 from unirl.train.stack.planner.types import Plan, UpdatePlan, _positive_int, _update_ranges
 from unirl.types.sample import Part

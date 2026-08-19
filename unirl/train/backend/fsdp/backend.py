@@ -7,6 +7,7 @@ from typing import Optional, Tuple
 import torch
 
 from unirl.models.types.bundle import Bundle
+from unirl.models.types.post_materialize import apply_deferred_ops
 from unirl.train.backend.base import LrSchedulerConfig, OptimizerConfig, resolve_trainable_module
 from unirl.train.backend.base_backend import BaseFSDP2Backend
 from unirl.train.backend.fsdp.state import clip_grad_norm, fsdp_offload, fsdp_onload
@@ -24,7 +25,6 @@ from unirl.train.configs import (
     FSDPConfig,
     LoraConfig,
 )
-from unirl.train.deferred import apply_deferred_ops
 from unirl.utils.dtypes import parse_torch_dtype
 
 

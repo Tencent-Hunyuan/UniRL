@@ -13,10 +13,10 @@ from omegaconf import DictConfig
 from unirl.distributed.group.placement import placement
 from unirl.distributed.tensor.grad_context import enable_grad
 from unirl.trainer.base import BaseTrainer, build_sampling_dict
+from unirl.trainer.hydra import remote_hydra
 from unirl.types.primitives import Images, Texts
 from unirl.types.sample import Sample
 from unirl.types.sampling import DiffusionSamplingParams, total_samples_per_prompt
-from unirl.utils.hydra import remote_hydra
 
 logger = logging.getLogger(__name__)
 

@@ -21,7 +21,7 @@ flattened to the FIRST user→assistant round (the supervised source is
 single-turn v1). Any dataset with the same ``messages``/``images`` schema works.
 
 Usage:
-  python -m unirl.utils.prepare_sft_vlm --out-dir data/sft_vlm --max-samples 4000
+  python datasets/sft_manifests/prepare_sft_vlm.py --out-dir data/sft_vlm --max-samples 4000
   # -> data/sft_vlm/{train.jsonl, val.jsonl} + data/sft_vlm/images/
 
 Set HF_ENDPOINT for a mirror.

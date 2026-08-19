@@ -147,7 +147,7 @@ share — paper Fig. 7), and the AR-only `rollout_replay_logp_absdiff_mean` are 
 
 ```bash
 # one-time: build the local jsonl from the raw DAPO-Math + AIME datasets
-python -m unirl.utils.prepare_dapo_math --out-dir data/dapo_math
+python datasets/dapo_math/prepare_dapo_math.py --out-dir data/dapo_math
 
 DATA_PATH=data/dapo_math/train.jsonl EVAL_DATA_PATH=data/dapo_math/aime_eval.jsonl \
 python -m unirl.train_ar --config-name=ar/qwen3_cppo_30b_a3b_base_dapo_sglang num_devices=128

@@ -87,7 +87,7 @@ class BagelFlowUniGRPO(FlowGRPO):
     @contextmanager
     def _reference_weights(self, transformer: Any) -> Iterator[None]:
         """Swap the frozen base weights into the trainable params for a v_ref forward."""
-        from unirl.train.ema import local_view
+        from unirl.distributed.local import local_view
 
         live = [p for p in transformer.parameters() if p.requires_grad]
         if not live:

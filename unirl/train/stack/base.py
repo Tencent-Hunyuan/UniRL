@@ -10,14 +10,14 @@ from typing import Dict, List, Mapping, Optional, Tuple, Union
 
 import torch
 
-from unirl.algorithms import AlgorithmStepResult, StageAlgorithm
+from unirl.algorithms.base import AlgorithmStepResult, StageAlgorithm
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
 from unirl.distributed.tensor.batch import _move_value
 from unirl.train.backend.fsdp import FSDPBackend
 from unirl.train.stack.planner import CountPlanner, MicroPlanner, Plan, UpdatePlan, _positive_int
 from unirl.types.sample import Part
-from unirl.utils.misc import aggregate_numeric_metrics
+from unirl.utils.metrics import aggregate_numeric_metrics
 
 logger = logging.getLogger(__name__)
 

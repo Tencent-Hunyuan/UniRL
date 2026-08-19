@@ -14,7 +14,7 @@
 #     groups, while the base model yields mixed right/wrong groups → real gradient).
 #
 # Data prep (one-time) — build the local jsonl from the raw DAPO-Math-17k dataset:
-#   python -m unirl.utils.prepare_dapo_math --out-dir data/dapo_math
+#   python datasets/dapo_math/prepare_dapo_math.py --out-dir data/dapo_math
 #   → data/dapo_math/{train.jsonl, aime_eval.jsonl}
 #
 # Run (32 GPU). The model defaults to the HF id `Qwen/Qwen3-4B-Base`; set QWEN3_PATH
@@ -229,7 +229,7 @@ data_source:
   _target_: unirl.data.data_source.MultimodalRLDataSource
   args:
     run:
-      data_path: ${oc.env:DATA_PATH} # local jsonl; build with unirl/utils/prepare_dapo_math.py
+      data_path: ${oc.env:DATA_PATH} # local jsonl; build with datasets/dapo_math/prepare_dapo_math.py
       eval_data_path: ${oc.env:EVAL_DATA_PATH,${oc.env:DATA_PATH}}
       seed: 42
     algorithm:

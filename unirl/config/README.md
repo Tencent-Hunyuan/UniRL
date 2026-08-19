@@ -36,7 +36,7 @@ interpolations. There is no ConfigStore and no registration step.
 
 Instantiation is a **driver-routes / worker-materializes** split:
 
-- `parse_hydra_cfg` (`../utils/hydra.py`) resolves only the *top-level* `_target_`
+- `parse_hydra_cfg` (`../trainer/hydra.py`) resolves only the *top-level* `_target_`
   on the driver and passes nested blocks through as plain dicts.
 - `Worker._resolve_init_kwargs` (`../distributed/group/worker.py`) walks the tree on
   the worker and builds each nested `_target_` with `get_method(_target_)(**children)`

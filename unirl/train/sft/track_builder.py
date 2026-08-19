@@ -8,10 +8,11 @@ from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple
 
 import torch
 
-from unirl.data.sft import message_content_image_uris, tokenize_agent_target
+from unirl.data.sft import message_content_image_uris
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
 from unirl.models.types.codec import EncodeStage
+from unirl.models.types.conversations import tokenize_agent_target
 from unirl.types.conditions import ImageLatentCondition
 from unirl.types.media import MediaRef, MediaRefs
 from unirl.types.primitives import Images, Texts, Video, Videos
@@ -37,16 +38,21 @@ class _VideoSFTPipeline(Protocol):
     ) -> EncodeStage[Videos, ImageLatentCondition]: ...
 
 
+def _require_local_uri(uri: str, *, context: str) -> str:
+    """Reject remote media URIs — builders only read local/shared paths."""
+    if uri.startswith(("http://", "https://", "s3://", "gs://")):
+        raise NotImplementedError(
+            f"{context}: remote media URIs are not supported yet ({uri!r}); "
+            "download to local/shared storage and reference the path."
+        )
+    return uri
+
+
 def _load_pil_image(uri: str):
     """Load one local image as RGB PIL (worker-side; driver never touches pixels)."""
     from PIL import Image as PILImage
 
-    if uri.startswith(("http://", "https://", "s3://", "gs://")):
-        raise NotImplementedError(
-            f"SupervisedTrackBuilder: remote media URIs are not supported yet ({uri!r}); "
-            "download to local/shared storage and reference the path."
-        )
-    return PILImage.open(uri).convert("RGB")
+    return PILImage.open(_require_local_uri(uri, context="SupervisedTrackBuilder")).convert("RGB")
 
 
 def _media_uris(record: Record, *, role: str, modality: Optional[str] = None) -> List[str]:

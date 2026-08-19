@@ -741,7 +741,7 @@ def aggregate_stage_results(results: List[Any]) -> Dict[str, float]:
     """Average :class:`TrackMiniBatchResult` metrics across the per-actor list."""
     if not results:
         return {}
-    from unirl.utils.misc import aggregate_numeric_metrics
+    from unirl.utils.metrics import aggregate_numeric_metrics
 
     per_actor_dicts: List[Dict[str, Any]] = []
     for r in results:

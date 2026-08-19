@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import List, Protocol, Tuple, runtime_checkable
 
-from unirl.algorithms import StageAlgorithm
+from unirl.algorithms.base import StageAlgorithm
 from unirl.types.sample import Part
 
 Range = Tuple[int, int]
