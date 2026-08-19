@@ -194,6 +194,10 @@ class MiniMaxH3T2VAAdapter(ModelAdapter):
 
     def boot_kwargs(self) -> dict[str, Any]:
         """Use the current vLLM-Omni direct diffusion-stage configuration."""
+        require(
+            not self.cfg.stage_yaml_override,
+            "minimax_h3_t2va uses current direct stage arguments; stage_yaml_override is not supported",
+        )
         world_size = int(self.cfg.replica_size)
         return {
             "use_stage_yaml": False,
@@ -202,12 +206,16 @@ class MiniMaxH3T2VAAdapter(ModelAdapter):
             "omni_kwargs": {
                 "model_class_name": "MiniMaxH3Pipeline",
                 "task_type": "t2va",
-                "trust_remote_code": True,
                 "num_gpus": world_size,
                 "max_num_seqs": 1,
                 "diffusion_batch_size": 1,
                 "distributed_executor_backend": "mp",
                 "enforce_eager": True,
+                "pipeline_parallel_size": 1,
+                "data_parallel_size": 1,
+                "tensor_parallel_size": 1,
+                "cfg_parallel_size": 1,
+                "allgather_degree": 1,
                 "sequence_parallel_size": world_size,
                 "ulysses_degree": world_size,
                 "ring_degree": 1,
@@ -238,6 +246,11 @@ class MiniMaxH3T2VAAdapter(ModelAdapter):
         require(self.model_config is not None, "MiniMaxH3T2VAAdapter requires model_config")
         require(hasattr(self.model_config, "video_shift"), "MiniMaxH3T2VAAdapter requires model_config.video_shift")
         require(hasattr(self.model_config, "audio_shift"), "MiniMaxH3T2VAAdapter requires model_config.audio_shift")
+        require(
+            int(self.cfg.replica_size) == 4 and int(self.cfg.tp_size) == 4,
+            "MiniMaxH3T2VAAdapter currently qualifies only replica_size=tp_size=4; "
+            f"got replica_size={self.cfg.replica_size}, tp_size={self.cfg.tp_size}",
+        )
 
     def schedule_policy(self) -> FlowMatchSchedulePolicy:
         return FlowMatchSchedulePolicy.static_only(float(self.model_config.video_shift))
