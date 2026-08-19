@@ -30,6 +30,14 @@ class MiniMaxH3RLPipeline(MiniMaxH3Pipeline):
         # hooks. Install them here before HSDP wraps the transformer; otherwise
         # Ulysses all-to-all receives a full sequence from every rank.
         _apply_sequence_parallel_if_enabled(self, self.od_config)
+        # The custom-pipeline loader also bypasses registry VAE setup.
+        vae_parallel_size = int(self.od_config.parallel_config.vae_patch_parallel_size)
+        self.video_vae.use_slicing = bool(self.od_config.vae_use_slicing)
+        self.video_vae.use_tiling = bool(self.od_config.vae_use_tiling or vae_parallel_size > 1)
+        self.video_vae.set_parallel_size(
+            vae_parallel_size,
+            mode=self.od_config.parallel_config.vae_parallel_mode,
+        )
         self._rl_strategy = CPSSDEStrategy()
         self._rl_recipe: Optional[NoiseRecipe] = None
         self._rl_eta = 0.0
