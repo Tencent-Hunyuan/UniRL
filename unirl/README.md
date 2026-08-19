@@ -28,10 +28,10 @@ As source, the package falls into four groups:
 - **Training loop** (`rollout/`, `reward/`, `algorithms/`, `train/`) — the four
   pluggable components of one rollout, plus what they share: `models/`
   (per-model bundles), `sde/` (step kernels / σ schedule), and `data/` (sources).
-- **Foundation** (`distributed/`, `config/`, `types/`, `utils/`) — the
-  cross-cutting infrastructure every layer rests on: the Ray
-  worker/dispatch/transport runtime, config build-and-validate, the shared typed
-  contracts, and helpers.
+- **Foundation** (`distributed/`, `config/`, `types/`) — the cross-cutting
+  runtime and contracts every layer rests on: Ray worker/dispatch/transport,
+  config validation, and shared typed data. `utils/` contains small supporting
+  mechanisms; it is not an ownership layer or a default destination for code.
 
 ## Module Map
 
@@ -49,7 +49,74 @@ As source, the package falls into four groups:
 | `sde/` | SDE step kernels, σ schedule/shift, initial-noise generation (the `NoiseRecipe` contract lives in `types/`) |
 | [`types/`](types/README.md) | Shared typed contracts: `Sample` / `Part`, primitives, conditions, segments, rewards, sampling; includes the request/response migration guide |
 | `data/` | Data source and dataset readers |
-| `utils/` | Logging, dtype, media, timing, checkpoint, and misc helpers |
+| [`utils/`](utils/README.md) | Domain-agnostic leaves with several owners: logging, dtype, media/video, metric aggregation, profiling, memory monitoring |
+
+## Ownership and dependency direction
+
+The source tree is not one rigid linear stack: rollout adapters may translate
+concrete model wire formats, and `train/` consumes algorithm and model
+contracts. The stable direction is nevertheless simple:
+
+```text
+entrypoints / trainer                  compose and orchestrate
+          ↓
+rollout · reward · algorithms · train  own loop policy
+          ↓
+models · data · sde                    own domain policy and transformations
+          ↓
+types · config · distributed           own stable contracts and mechanisms
+```
+
+Imports should point downward. Integration code that must understand both a
+backend and a model belongs at that integration seam (normally a rollout or
+train-backend adapter), not in generic infrastructure. In particular:
+
+- concrete model packages do not import trainers, algorithms, rewards, or
+  rollout engines;
+- algorithms depend on stage/type contracts, not concrete model families;
+- data sources do not depend on trainers, models, or training backends;
+- distributed mechanisms do not depend on concrete models;
+- trainers may compose everything, but model-specific semantics stay behind a
+  model-owned contract or hook;
+- `utils/` is only for stable, domain-agnostic leaves. A function used by one
+  model, dataset, backend, or algorithm stays with that owner.
+
+The already-clean directions are locked by
+[`lint/check_core_dependencies.py`](../lint/check_core_dependencies.py)
+(TYPE_CHECKING-only imports exempt): `types/`, `config/`, `utils/`, `sde/`,
+`data/`, and `models/types/` never import the loop tier or concrete models;
+`models/` never imports algorithms, data, rewards, rollout, or trainers;
+`algorithms/` sees model contracts, never concrete model families; `train/`
+sees model contracts and `algorithms/base`, never concrete algorithms;
+`distributed/` never imports algorithms, data, models, rewards, rollout, or
+trainers.
+
+Directions the tree does not yet satisfy are left unlocked rather than hidden
+behind allowlists. The open debt, named so it is not copied as precedent:
+`models/` (`hunyuan_image3`, `qwen3_5`, `qwen3_moe`) and
+`distributed/weight_sync/` reach into `train/backend/veomni` (EP fusing /
+`_compat`), `models/cosmos3` subclasses the train-side SFT track builder, and
+`algorithms/` flips `train/lora` adapters. That is migration work, not a
+convention to copy.
+
+## Where new code goes
+
+| Feature | Owner |
+|---|---|
+| Model forward/replay, timestep, scheduler, packing, model-only preprocessing | `models/<family>/` |
+| Generic dataset reading, batching, runtime normalization | `data/` |
+| One-off dataset download/conversion CLI | [`datasets/<dataset>/`](../datasets/README.md), repo root beside `unirl/` |
+| Loss, ratio/clip, advantage policy for one RL method | `algorithms/` |
+| Engine lifecycle or model↔engine wire translation | `rollout/engine/<backend>/` and its `adapters/` |
+| Score construction and scorer-specific loading | `reward/` |
+| Optimizer, sharding, EMA/LoRA lifecycle | `train/` |
+| Cross-component sequencing, placement, retries, checkpoints | `trainer/` |
+| Communication, tensor transport, device placement | `distributed/` |
+| Stable domain-agnostic leaf helper with multiple owners | a narrowly named module under `utils/` |
+
+Prefer a small amount of policy duplication over a shared base class that makes
+one model change touch several unrelated modules. Share mechanisms; keep model,
+algorithm, reward, and backend policy local.
 
 ## Deployment modes
 

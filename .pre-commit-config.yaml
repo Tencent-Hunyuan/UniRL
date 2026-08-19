@@ -98,3 +98,16 @@ repos:
         language: python
         pass_filenames: false
         files: \.py$
+      # Lock the dependency directions that are already clean. The checker is
+      # deliberately narrower than a full layer DAG: rollout/model integration
+      # seams and known staged-migration debt are not hidden behind allowlists
+      # (unirl/README.md "Ownership and dependency direction" names that debt).
+      # TYPE_CHECKING-only imports are skipped: they carry no runtime coupling.
+      # A violation can only enter via a .py edit, so that extension gates the
+      # (always full-tree) scan; `--all-files` CI is unaffected.
+      - id: check-core-dependencies
+        name: core dependency directions hold
+        entry: python lint/check_core_dependencies.py
+        language: python
+        pass_filenames: false
+        files: \.py$

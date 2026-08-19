@@ -9,7 +9,8 @@ import random
 import shutil
 from typing import Any, Dict, Iterable, List, Sequence
 
-from unirl.data.sft import normalize_supervised_example, tokenize_agent_target
+from unirl.data.sft import normalize_supervised_example
+from unirl.models.types.conversations import tokenize_agent_target
 
 _HELP = """Prepare a local OpenAI-style agent SFT manifest.
 
@@ -20,8 +21,8 @@ answers are both supervised. The split is trajectory-level to keep turns from
 the same conversation out of both train and validation.
 
 Usage:
-  python -m unirl.utils.prepare_sft_agent \
-    --out-dir datasets/sft_agent_toolcall_12k
+  python datasets/sft_manifests/prepare_sft_agent.py \
+    --out-dir data/sft_agent_toolcall_12k
 """
 
 

@@ -10,7 +10,7 @@ from typing import Dict, List, Mapping, Tuple
 
 import torch
 
-from unirl.algorithms import AlgorithmStepResult, StageAlgorithm
+from unirl.algorithms.base import AlgorithmStepResult, StageAlgorithm
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
 from unirl.train.backend.fsdp import FSDPBackend
@@ -19,7 +19,7 @@ from unirl.train.stack.base import _aggregate_update_results
 from unirl.train.stack.planner.types import _positive_int, _update_ranges
 from unirl.types.sample import Part, Sample
 from unirl.types.sampling import ARSamplingParams, DiffusionSamplingParams
-from unirl.utils.misc import aggregate_numeric_metrics
+from unirl.utils.metrics import aggregate_numeric_metrics
 
 logger = logging.getLogger(__name__)
 

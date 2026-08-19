@@ -10,7 +10,7 @@ import re
 
 _HELP = """Build the local arxivqa_mc dataset that the ``bagel_grpo_arxivqa_mc_*`` recipe trains on.
 
-Same on-disk layout as :mod:`unirl.utils.prepare_geo3k_mc` (so the multimodal RL data
+Same on-disk layout as ``datasets/geo3k_mc/prepare_geo3k_mc.py`` (so the multimodal RL data
 loader ``unirl/data/data_source.py`` + ``unirl/data/datasets.py`` consumes it unchanged):
 a **local** jsonl of records::
 
@@ -43,7 +43,7 @@ preamble + the answer-with-a-letter instruction. Images are downscaled to ``--ma
 (BAGEL's ViT ceiling, 980) preserving aspect ratio.
 
 Usage:
-  python -m unirl.utils.prepare_arxivqa_mc --out-dir data/arxivqa_mc
+  python datasets/arxivqa_mc/prepare_arxivqa_mc.py --out-dir data/arxivqa_mc
   # -> data/arxivqa_mc/{train.jsonl, val.jsonl} + data/arxivqa_mc/images/
 
   BAGEL_PATH=/root/BAGEL-7B-MoT \\

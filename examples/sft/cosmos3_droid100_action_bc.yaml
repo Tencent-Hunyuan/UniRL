@@ -23,7 +23,7 @@
 #   SFT_EVAL_DATA     eval manifest (held-out episodes from the same prep)
 #
 # Data prep (LeRobot droid_100; 192x320 is exactly the tier-256 action canvas):
-#   python -m unirl.utils.prepare_droid100 --root datasets/droid100_debug
+#   python datasets/droid100/prepare_droid100.py --root datasets/droid100_debug
 #
 # Launch:
 #   ENTRY=train_sft PRETRAINED_MODEL=/path/to/Cosmos3-Nano \

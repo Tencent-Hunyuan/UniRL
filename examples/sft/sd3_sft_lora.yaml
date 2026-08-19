@@ -14,7 +14,7 @@
 #   SFT_EVAL_DATA     eval manifest (defaults to SFT_DATA — supply a real split!)
 #
 # Data prep (HF naruto-blip-captions):
-#   python -m unirl.utils.prepare_sft_t2i --out-dir data/sft_t2i
+#   python datasets/sft_manifests/prepare_sft_t2i.py --out-dir data/sft_t2i
 #
 # Launch:
 #   ENTRY=train_sft SFT_DATA=data/sft_t2i/train.jsonl SFT_EVAL_DATA=data/sft_t2i/val.jsonl \

@@ -76,23 +76,32 @@ local/
 *.pkl
 *.log
 
-# Datasets: keep committed prompt sets and converter code, ignore local-only data
-datasets/*
-!datasets/pickscore
-!datasets/ocr
-!datasets/geneval
-!datasets/geneval2
-!datasets/video_r1_260k
-!datasets/daily_omni_av
-!datasets/dcase2025_audio_qa
-!datasets/ucf101
-!datasets/searchgen
-# Dataset guides/converters are tracked; generated outputs stay local-only
-datasets/video_r1_260k/**/*.jsonl
-datasets/daily_omni_av/**/*.jsonl
-datasets/ucf101/raw/
-datasets/ucf101/processed/
-datasets/searchgen/processed/
+# Datasets: converter code, guides, and committed prompt sets are tracked;
+# everything else under datasets/ is downloaded or generated and stays local.
+# Keyed on file type rather than on dataset name, so adding a new
+# datasets/<name>/ needs no entry here, and a converter whose --out-dir points
+# inside datasets/ (several guides cook that way) cannot leak a cooked dataset
+# into the tree.
+datasets/**
+!datasets/**/
+!datasets/**/*.py
+!datasets/**/*.md
+
+# Committed prompt sets: small versioned inputs, not generated data. Committing
+# data is the one case that should need an explicit decision here.
+!datasets/geneval/*.jsonl
+!datasets/geneval2/synthetic/*.jsonl
+!datasets/image_edit/*.jsonl
+!datasets/ocr/*.txt
+!datasets/pickscore/*.txt
+
+# Downloaded snapshots and cooked outputs, whatever they happen to contain --
+# last, so the code re-includes above do not reach inside them.
+datasets/**/raw/
+datasets/**/processed/
+
+# Default --out-dir of the datasets/ converters
+/data/
 
 # Large model artifacts (defense-in-depth)
 models/**/*.bin

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import logging
 from enum import Enum
 from typing import Any
@@ -13,6 +14,30 @@ from unirl.config.require import require
 from unirl.utils.dtypes import parse_torch_dtype
 
 logger = logging.getLogger(__name__)
+
+
+def load_function(path: str) -> Any:
+    """Dynamically load a class or function from a module path."""
+    if path is None or path == "":
+        raise ValueError("Path cannot be None or empty")
+
+    parts = path.rsplit(".", 1)
+    if len(parts) != 2:
+        raise ValueError(f"Invalid path format: {path}. Expected 'module.path.ClassName'")
+
+    module_path, class_name = parts
+
+    try:
+        module = importlib.import_module(module_path)
+    except ImportError as e:
+        raise ImportError(f"Could not import module '{module_path}': {e}")
+
+    try:
+        cls = getattr(module, class_name)
+    except AttributeError:
+        raise AttributeError(f"Module '{module_path}' has no attribute '{class_name}'")
+
+    return cls
 
 
 class PrecisionName(str, Enum):
@@ -51,8 +76,6 @@ def is_direct_sampling(cfg: DictConfig) -> bool:
 
 def validate_dynamic_dotpaths(cfg: DictConfig) -> None:
     """Fail-fast import of every dynamic dotpath the driver will later resolve."""
-    from unirl.utils.misc import load_function
-
     dotpath = str(cfg.run.data_source_dotpath or "").strip()
     require(
         bool(dotpath), f"cfg.run.data_source_dotpath must be a non-empty dotpath; got {cfg.run.data_source_dotpath!r}"
@@ -171,8 +194,6 @@ def validate_lora_target_modules(cfg: DictConfig) -> None:
         return
 
     try:
-        from unirl.utils.misc import load_function
-
         model_cls = load_function(target_dotpath)
     except (ImportError, AttributeError, KeyError, ValueError) as exc:
         logger.debug(
