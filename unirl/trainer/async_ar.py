@@ -109,7 +109,7 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
 
         self._max_inflight = max(1, int(max_inflight))
         self._per_worker_inflight = per_worker_inflight
-        self._max_inflight_units = self._max_inflight * self.batch_size
+        self._max_inflight_prompts = self._max_inflight * self.batch_size
         self._weight_sync_interval = int(weight_sync_interval)
         self._num_updates_per_batch = int(stack_cfg.get("num_updates_per_batch", 1))
         if self._weight_sync_interval < 1:

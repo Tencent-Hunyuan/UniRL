@@ -38,7 +38,7 @@ class AsyncDiffusionTrainer(AsyncRolloutTrainerMixin, DiffusionTrainer):
         if max_inflight != 1:
             raise ValueError(
                 "AsyncDiffusionTrainer requires max_inflight=1: queued generations can block "
-                "reap-time cross-slab transfer, and dynamically completed prompt units must "
+                "reap-time cross-slab transfer, and dynamically completed prompts must "
                 "retain one rollout_id and one SDE schedule per training batch; "
                 f"got {max_inflight}."
             )
@@ -74,7 +74,7 @@ class AsyncDiffusionTrainer(AsyncRolloutTrainerMixin, DiffusionTrainer):
         self._max_inflight = max_inflight
         self._require_single_generation = True
         self._per_worker_inflight = per_worker_inflight
-        self._max_inflight_units = self._max_inflight * self.batch_size
+        self._max_inflight_prompts = self._max_inflight * self.batch_size
         self._weight_sync_interval = int(weight_sync_interval)
         self._max_staleness = self._weight_sync_interval - 1
         self._num_updates_per_batch = int(diffusion_kwargs["stack_cfg"].get("num_updates_per_batch", 1))

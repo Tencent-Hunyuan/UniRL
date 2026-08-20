@@ -66,31 +66,39 @@ def next_hard_boundary(
     return boundary
 
 
-def boundary_launch_units(
+def boundary_launch_prompts(
     *,
-    outstanding_units: int,
-    max_inflight_units: int,
+    outstanding_prompts: int,
+    max_inflight_prompts: int,
     batch_size: int,
     trained_batches: int,
     hard_boundary: int,
     batches_since_sync: int,
     max_staleness_batches: int,
 ) -> int:
-    """Prompt units admissible within capacity, staleness, and hard boundaries."""
-    if max_inflight_units % batch_size:
-        raise ValueError(f"max_inflight_units ({max_inflight_units}) must be divisible by batch_size ({batch_size})")
-    if outstanding_units % batch_size:
-        raise RuntimeError(
-            f"prompt-unit outstanding count must stay batch-aligned to {batch_size}; got {outstanding_units}"
+    """Prompts admissible within capacity, staleness, and hard boundaries."""
+    if max_inflight_prompts % batch_size:
+        raise ValueError(
+            f"max_inflight_prompts ({max_inflight_prompts}) must be divisible by batch_size ({batch_size})"
         )
-    # A newly launched unit uses the currently published weights. It may be
+    if outstanding_prompts % batch_size:
+        raise RuntimeError(
+            f"outstanding prompt count must stay batch-aligned to {batch_size}; got {outstanding_prompts}"
+        )
+    # A newly launched prompt uses the currently published weights. It may be
     # consumed now (lag=batches_since_sync), then one batch later, and so on.
     # Keep enough horizon for cross-publication carry when the configured lag
     # budget permits it; unlike a sync boundary, eval/save/final remain hard.
     freshness_batches = max(0, max_staleness_batches - batches_since_sync + 1)
     remaining_batches = max(0, hard_boundary - trained_batches)
-    allowed_units = min(freshness_batches, remaining_batches) * batch_size
-    return max(0, min(max_inflight_units - outstanding_units, allowed_units - outstanding_units))
+    allowed_prompts = min(freshness_batches, remaining_batches) * batch_size
+    return max(
+        0,
+        min(
+            max_inflight_prompts - outstanding_prompts,
+            allowed_prompts - outstanding_prompts,
+        ),
+    )
 
 
 def rollout_version_metrics(
@@ -125,7 +133,7 @@ def training_version_metrics(
     }
 
 
-def combine_rollout_units(
+def combine_rollout_prompts(
     groups: List[List["Sample"]],
     *,
     require_single_rollout_id: bool = False,
@@ -209,7 +217,7 @@ class AsyncRolloutTrainerMixin:
             num_rollouts=num_rollouts,
             extra={
                 "max_inflight": self._max_inflight,
-                "max_inflight_units": self._max_inflight_units,
+                "max_inflight_prompts": self._max_inflight_prompts,
                 "per_worker_inflight": self._per_worker_inflight,
                 "weight_sync_interval": self._weight_sync_interval,
                 "max_staleness": self._max_staleness,
@@ -299,7 +307,7 @@ class AsyncRolloutTrainerMixin:
 
         # Quiesce engine work before weight publication, but keep completed
         # groups in the manager. The lag filter decides whether buffered work
-        # remains trainable after publication, matching continuous-unit carry.
+        # remains trainable after publication, matching continuous prompt carry.
         carried = manager.quiesce(current_version=self._train_version)
         if require_empty and (carried or not manager.empty):
             raise RuntimeError("eval/checkpoint boundary requires an empty RolloutManager")
@@ -316,15 +324,15 @@ class AsyncRolloutTrainerMixin:
                 manager.finish(carried, current_version=self._train_version)
                 carried = []
             _, ready_count = manager.counts
-            units_to_finish = (-ready_count) % self.batch_size
-            if units_to_finish:
-                if len(carried) < units_to_finish:
+            prompts_to_finish = (-ready_count) % self.batch_size
+            if prompts_to_finish:
+                if len(carried) < prompts_to_finish:
                     raise RuntimeError(
                         "cannot batch-align rollout carry before weight publication: "
                         f"ready={ready_count}, carried={len(carried)}, batch_size={self.batch_size}"
                     )
-                finishing = carried[:units_to_finish]
-                carried = carried[units_to_finish:]
+                finishing = carried[:prompts_to_finish]
+                carried = carried[prompts_to_finish:]
                 manager.finish(finishing, current_version=self._train_version)
             inflight_count, ready_count = manager.counts
             if inflight_count or ready_count % self.batch_size:
@@ -343,7 +351,7 @@ class AsyncRolloutTrainerMixin:
         *,
         hard_boundary: int,
     ) -> Tuple["Sample", int]:
-        self._admit_prompt_units(
+        self._admit_prompts(
             trained_batches=rollout_id,
             hard_boundary=hard_boundary,
             batches_since_sync=self._batches_since_sync,
@@ -354,7 +362,7 @@ class AsyncRolloutTrainerMixin:
             self.batch_size,
             current_version=self._train_version,
         )
-        completed, output_version = combine_rollout_units(
+        completed, output_version = combine_rollout_prompts(
             groups,
             require_single_rollout_id=self._require_single_generation,
         )
@@ -365,7 +373,7 @@ class AsyncRolloutTrainerMixin:
 
         # Consuming a batch releases capacity immediately. Refill before reward
         # for AR and before training for trainers that require reap-time scoring.
-        self._admit_prompt_units(
+        self._admit_prompts(
             trained_batches=rollout_id + 1,
             hard_boundary=hard_boundary,
             batches_since_sync=self._batches_since_sync + 1,
@@ -376,7 +384,7 @@ class AsyncRolloutTrainerMixin:
 
         return scored, output_version
 
-    def _admit_prompt_units(
+    def _admit_prompts(
         self,
         *,
         trained_batches: int,
@@ -384,39 +392,37 @@ class AsyncRolloutTrainerMixin:
         batches_since_sync: int,
     ) -> None:
         inflight_count, ready_count = self._rollout_manager.counts
-        units = boundary_launch_units(
-            outstanding_units=inflight_count + ready_count,
-            max_inflight_units=self._max_inflight_units,
+        prompts = boundary_launch_prompts(
+            outstanding_prompts=inflight_count + ready_count,
+            max_inflight_prompts=self._max_inflight_prompts,
             batch_size=self.batch_size,
             trained_batches=trained_batches,
             hard_boundary=hard_boundary,
             batches_since_sync=batches_since_sync,
             max_staleness_batches=self._max_staleness,
         )
-        self._submit_prompt_units(units)
+        self._submit_prompts(prompts)
 
-    def _submit_prompt_units(self, count: int) -> None:
+    def _submit_prompts(self, count: int) -> None:
         batch_count, remainder = divmod(count, self.batch_size)
         if remainder:
-            raise RuntimeError(
-                f"prompt-unit admission must submit whole batches of {self.batch_size}; got {count} units"
-            )
+            raise RuntimeError(f"prompt admission must submit whole batches of {self.batch_size}; got {count} prompts")
         for _ in range(batch_count):
             request = self._build_request_sample(
                 self.data_source.get_samples(self.batch_size),
                 self._next_generation_id,
             )
             self._next_generation_id += 1
-            units = request.split()
-            if len(units) != self.batch_size:
-                raise RuntimeError(f"request batch split into {len(units)} prompt units; expected {self.batch_size}")
-            self._rollout_manager.submit(units)
+            prompts = request.split()
+            if len(prompts) != self.batch_size:
+                raise RuntimeError(f"request batch split into {len(prompts)} prompts; expected {self.batch_size}")
+            self._rollout_manager.submit(prompts)
 
 
 __all__ = [
     "AsyncRolloutTrainerMixin",
-    "boundary_launch_units",
-    "combine_rollout_units",
+    "boundary_launch_prompts",
+    "combine_rollout_prompts",
     "next_hard_boundary",
     "resolve_separate_worker_concurrency",
     "rollout_version_metrics",
