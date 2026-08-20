@@ -8,9 +8,12 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 
 from unirl.distributed.tensor import hydrate
-from unirl.rollout.manager import validate_worker_inflight
 from unirl.train.stack import TrainStepResult
-from unirl.trainer.async_rollout import AsyncRolloutTrainerMixin, training_version_metrics
+from unirl.trainer.async_rollout import (
+    AsyncRolloutTrainerMixin,
+    resolve_separate_worker_concurrency,
+    training_version_metrics,
+)
 from unirl.trainer.diffusion import DiffusionTrainer
 from unirl.types.sample import Sample
 
@@ -46,8 +49,20 @@ class AsyncDiffusionTrainer(AsyncRolloutTrainerMixin, DiffusionTrainer):
                 "and a reward sharing the train slab could still OOM. Remove the option or use the "
                 "synchronous trainer."
             )
-        super().__init__(
+        per_worker_inflight = int(per_worker_inflight)
+        cfg = diffusion_kwargs["cfg"]
+        train_fraction = float(diffusion_kwargs.get("train_fraction", 0.5))
+        configured_concurrency = cfg.get("worker_max_concurrency")
+        configured_concurrency = None if configured_concurrency is None else int(configured_concurrency)
+        _, worker_concurrency = resolve_separate_worker_concurrency(
+            num_devices=int(cfg.num_devices),
+            train_fraction=train_fraction,
             per_worker_inflight=per_worker_inflight,
+            configured_concurrency=configured_concurrency,
+            engine_concurrency=diffusion_kwargs["rollout_cfg"].get("config", {}).get("concurrency"),
+        )
+        super().__init__(
+            worker_max_concurrency=worker_concurrency,
             **diffusion_kwargs,
         )
 
@@ -58,12 +73,6 @@ class AsyncDiffusionTrainer(AsyncRolloutTrainerMixin, DiffusionTrainer):
 
         self._max_inflight = max_inflight
         self._require_single_generation = True
-        engine_cfg = diffusion_kwargs["rollout_cfg"].get("config", {})
-        validate_worker_inflight(
-            per_worker_inflight,
-            worker_max_concurrency=self.pool.max_worker_concurrency,
-            engine_concurrency=engine_cfg.get("concurrency"),
-        )
         self._per_worker_inflight = per_worker_inflight
         self._max_inflight_units = self._max_inflight * self.batch_size
         self._weight_sync_interval = int(weight_sync_interval)

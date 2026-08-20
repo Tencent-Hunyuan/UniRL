@@ -4,13 +4,12 @@ import logging
 import os
 import sys
 from dataclasses import replace
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional, Sequence
 
 from hydra.utils import instantiate
 from omegaconf import DictConfig
 
 from unirl.distributed.group.device_pool import DevicePool
-from unirl.rollout.manager import required_worker_concurrency
 from unirl.types.primitives import Texts
 from unirl.types.sample import Sample
 from unirl.types.sampling import ARSamplingParams, BaseSamplingParams, total_samples_per_prompt
@@ -19,40 +18,6 @@ logger = logging.getLogger(__name__)
 
 # Bound exception-path flushes so wedged workers cannot mask the primary error.
 _TEARDOWN_FLUSH_TIMEOUT_S = float(os.environ.get("UNIRL_TEARDOWN_FLUSH_TIMEOUT_S", "120"))
-
-
-def resolve_worker_max_concurrency(
-    cfg: DictConfig,
-    *,
-    per_worker_inflight: Optional[int] = None,
-) -> int:
-    """Resolve actor concurrency, deriving it from rollout lanes when omitted."""
-    configured = cfg.get("worker_max_concurrency")
-    if configured is not None:
-        return int(configured)
-
-    effective_inflight = per_worker_inflight
-    if effective_inflight is None:
-        configured_inflight = cfg.get("per_worker_inflight")
-        effective_inflight = None if configured_inflight is None else int(configured_inflight)
-    return 1 if effective_inflight is None else required_worker_concurrency(effective_inflight)
-
-
-def resolve_worker_concurrency_by_device(
-    cfg: DictConfig,
-    *,
-    rollout_concurrency: int,
-    train_fraction: Optional[float],
-) -> Optional[List[int]]:
-    """Keep a separate-layout train slab serial when rollout concurrency is derived."""
-    if cfg.get("worker_max_concurrency") is not None or train_fraction is None:
-        return None
-    num_devices = int(cfg.num_devices)
-    train_devices_float = train_fraction * num_devices
-    train_devices = round(train_devices_float)
-    if abs(train_devices_float - train_devices) > 1e-9 or not 0 < train_devices < num_devices:
-        return None
-    return [1] * train_devices + [rollout_concurrency] * (num_devices - train_devices)
 
 
 def prepare_input_sample(
@@ -150,26 +115,19 @@ class BaseTrainer:
         *,
         cfg: DictConfig,
         logging_cfg: Optional[DictConfig] = None,
-        per_worker_inflight: Optional[int] = None,
-        separate_train_fraction: Optional[float] = None,
+        worker_max_concurrency: Optional[int | Sequence[int]] = None,
     ) -> None:
         self.num_devices = cfg.num_devices
-        resolved_concurrency = resolve_worker_max_concurrency(
-            cfg,
-            per_worker_inflight=per_worker_inflight,
-        )
-        per_device_concurrency = resolve_worker_concurrency_by_device(
-            cfg,
-            rollout_concurrency=resolved_concurrency,
-            train_fraction=separate_train_fraction,
-        )
+        if worker_max_concurrency is None:
+            configured_concurrency = cfg.get("worker_max_concurrency")
+            worker_max_concurrency = 1 if configured_concurrency is None else int(configured_concurrency)
         self.pool = DevicePool(
             num_devices=cfg.num_devices,
             devices_per_node=int(cfg.get("devices_per_node", 8)),
             workers_per_device=int(cfg.get("workers_per_device", 1)),
             transport_kind=cfg.get("transport_kind", "colocate_store"),
             tq_handoff=init_transfer_queue(cfg),
-            worker_max_concurrency=(resolved_concurrency if per_device_concurrency is None else per_device_concurrency),
+            worker_max_concurrency=worker_max_concurrency,
         )
         self.pool.setup()
 

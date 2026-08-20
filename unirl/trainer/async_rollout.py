@@ -6,7 +6,12 @@ import logging
 import time
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
-from unirl.rollout.manager import RolloutManager, keep_within_lag
+from unirl.rollout.manager import (
+    RolloutManager,
+    keep_within_lag,
+    required_worker_concurrency,
+    validate_worker_inflight,
+)
 from unirl.trainer.base import unwrap_replicated_int
 from unirl.types.sampling import total_samples_per_prompt
 
@@ -14,6 +19,37 @@ if TYPE_CHECKING:
     from unirl.types.sample import Sample
 
 logger = logging.getLogger(__name__)
+
+
+def resolve_separate_worker_concurrency(
+    *,
+    num_devices: int,
+    train_fraction: float,
+    per_worker_inflight: int,
+    configured_concurrency: Optional[int],
+    engine_concurrency: Optional[int],
+) -> Tuple[int, int | List[int]]:
+    """Resolve serial train workers and concurrent rollout workers before pool setup."""
+    train_devices = round(train_fraction * num_devices)
+    if train_devices <= 0 or train_devices >= num_devices:
+        raise ValueError(
+            f"train_fraction={train_fraction} yields {train_devices} train devices "
+            f"of {num_devices}; must leave a non-empty rollout slab."
+        )
+    rollout_concurrency = (
+        required_worker_concurrency(per_worker_inflight) if configured_concurrency is None else configured_concurrency
+    )
+    validate_worker_inflight(
+        per_worker_inflight,
+        worker_max_concurrency=rollout_concurrency,
+        engine_concurrency=engine_concurrency,
+    )
+    worker_concurrency = (
+        [1] * train_devices + [rollout_concurrency] * (num_devices - train_devices)
+        if configured_concurrency is None
+        else rollout_concurrency
+    )
+    return train_devices, worker_concurrency
 
 
 def next_hard_boundary(
@@ -382,6 +418,7 @@ __all__ = [
     "boundary_launch_units",
     "combine_rollout_units",
     "next_hard_boundary",
+    "resolve_separate_worker_concurrency",
     "rollout_version_metrics",
     "training_version_metrics",
 ]

@@ -228,7 +228,7 @@ class DiffusionTrainer(BaseTrainer):
         logging_cfg: Optional[DictConfig] = None,
         layout: str = "colocate",
         train_fraction: float = 0.5,
-        per_worker_inflight: Optional[int] = None,
+        worker_max_concurrency: Optional[int | Sequence[int]] = None,
         reward_fraction: float = 0.0,
         enable_fsdp_offload: bool = False,
         offload_train_during_reward: bool = False,
@@ -247,8 +247,7 @@ class DiffusionTrainer(BaseTrainer):
         super().__init__(
             cfg=cfg,
             logging_cfg=logging_cfg,
-            per_worker_inflight=per_worker_inflight,
-            separate_train_fraction=float(train_fraction) if layout == "separate" else None,
+            worker_max_concurrency=worker_max_concurrency,
         )
         reject_retired_eval_keys(cfg)
         self.batch_size = batch_size

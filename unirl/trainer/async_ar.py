@@ -10,10 +10,13 @@ from omegaconf import DictConfig
 
 from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
-from unirl.rollout.manager import validate_worker_inflight
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.ar import ARTrainer, ar_preflight
-from unirl.trainer.async_rollout import AsyncRolloutTrainerMixin, training_version_metrics
+from unirl.trainer.async_rollout import (
+    AsyncRolloutTrainerMixin,
+    resolve_separate_worker_concurrency,
+    training_version_metrics,
+)
 from unirl.trainer.base import BaseTrainer, build_sampling_dict
 from unirl.trainer.hydra import parse_hydra_cfg, remote_hydra
 from unirl.types.sample import Sample
@@ -60,13 +63,23 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
             rollout_cfg=rollout_cfg,
             stack_cfg=stack_cfg,
         )
+        per_worker_inflight = int(per_worker_inflight)
+        self._train_fraction = float(train_fraction)
+        configured_concurrency = cfg.get("worker_max_concurrency")
+        configured_concurrency = None if configured_concurrency is None else int(configured_concurrency)
+        self._train_devices, worker_concurrency = resolve_separate_worker_concurrency(
+            num_devices=int(cfg.num_devices),
+            train_fraction=self._train_fraction,
+            per_worker_inflight=per_worker_inflight,
+            configured_concurrency=configured_concurrency,
+            engine_concurrency=rollout_cfg.get("config", {}).get("concurrency"),
+        )
         # Skips ARTrainer.__init__: it opens the colocate placement block we replace with two slabs.
         BaseTrainer.__init__(
             self,
             cfg=cfg,
             logging_cfg=logging_cfg,
-            per_worker_inflight=per_worker_inflight,
-            separate_train_fraction=float(train_fraction),
+            worker_max_concurrency=worker_concurrency,
         )
 
         self.batch_size = batch_size
@@ -94,14 +107,7 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
             )
         self._rollout_anchor_device = None
 
-        self._train_fraction = float(train_fraction)
         self._max_inflight = max(1, int(max_inflight))
-        engine_cfg = rollout_cfg.get("config", {})
-        validate_worker_inflight(
-            per_worker_inflight,
-            worker_max_concurrency=self.pool.max_worker_concurrency,
-            engine_concurrency=engine_cfg.get("concurrency"),
-        )
         self._per_worker_inflight = per_worker_inflight
         self._max_inflight_units = self._max_inflight * self.batch_size
         self._weight_sync_interval = int(weight_sync_interval)
@@ -120,12 +126,6 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
             raise ValueError(f"num_updates_per_batch must be >= 1, got {self._num_updates_per_batch}")
         self._train_version = 0
         self._batches_since_sync = 0
-        self._train_devices = int(round(self.num_devices * self._train_fraction))
-        if self._train_devices <= 0 or self._train_devices >= self.num_devices:
-            raise ValueError(
-                f"train_fraction={train_fraction} yields {self._train_devices} train "
-                f"devices of {self.num_devices}; must leave a non-empty rollout slab."
-            )
         # Require rollout batches to divide evenly across the train slab.
         total = self.batch_size * total_samples_per_prompt(self.sampling_params)
         if total % self._train_devices != 0:

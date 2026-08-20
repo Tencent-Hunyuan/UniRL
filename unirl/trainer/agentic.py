@@ -14,13 +14,12 @@ from omegaconf import DictConfig
 
 from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
-from unirl.rollout.manager import RolloutManager, validate_worker_inflight
+from unirl.rollout.manager import RolloutManager, required_worker_concurrency, validate_worker_inflight
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import (
     BaseTrainer,
     build_sampling_dict,
     prepare_input_sample,
-    resolve_worker_max_concurrency,
     unwrap_replicated_int,
 )
 from unirl.trainer.hydra import parse_hydra_cfg, remote_hydra
@@ -70,9 +69,11 @@ class AgenticTrainer(BaseTrainer):
         per_worker_inflight: int = 8,
     ) -> None:
         per_worker_inflight = int(per_worker_inflight)
-        worker_max_concurrency = resolve_worker_max_concurrency(
-            cfg,
-            per_worker_inflight=per_worker_inflight,
+        configured_concurrency = cfg.get("worker_max_concurrency")
+        worker_max_concurrency = (
+            required_worker_concurrency(per_worker_inflight)
+            if configured_concurrency is None
+            else int(configured_concurrency)
         )
         self._validate_config(
             cfg=cfg,
@@ -87,7 +88,7 @@ class AgenticTrainer(BaseTrainer):
         super().__init__(
             cfg=cfg,
             logging_cfg=logging_cfg,
-            per_worker_inflight=per_worker_inflight,
+            worker_max_concurrency=worker_max_concurrency,
         )
 
         try:
