@@ -39,6 +39,7 @@ def resolve_separate_worker_concurrency(
     rollout_concurrency = (
         required_worker_concurrency(per_worker_inflight) if configured_concurrency is None else configured_concurrency
     )
+    engine_concurrency = None if engine_concurrency is None else int(engine_concurrency)
     validate_worker_inflight(
         per_worker_inflight,
         worker_max_concurrency=rollout_concurrency,

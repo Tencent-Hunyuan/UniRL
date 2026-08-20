@@ -24,7 +24,7 @@ num_rollouts: 800
 # train-bound, lower for generation-bound workloads (mind DIVISIBILITY above).
 train_fraction: 0.5
 
-max_inflight: 2          # concurrent generations
+max_inflight: 2          # globally admitted batch-equivalents
 per_worker_inflight: 14  # concurrent prompt trees per rollout worker
 weight_sync_interval: 1  # trained batches per publication; also configures the output-version lag filter
 buffer_max_staleness: 2  # maximum allowed rollout-version lag
