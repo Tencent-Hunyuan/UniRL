@@ -173,7 +173,7 @@ sampling:
   init_same_noise: false               # per-sample x_T; diverse GRPO groups
   trajectory_precision: fp32           # forwarded to the worker scheduler's SDE log-prob storage round-trip
   scheduler:
-    _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+    _target_: unirl.sde.index_schedule.AllSDEScheduler
     num_timesteps: ${..num_inference_steps}
     timestep_fraction: [0.0, 0.5]
     num_sde_steps: 2

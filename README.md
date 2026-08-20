@@ -11,6 +11,11 @@
 [![Documentation](https://img.shields.io/badge/docs-unirl--project.github.io-blue)](https://unirl-project.github.io/unirl/)
 [![WeChat](https://img.shields.io/badge/WeChat-微信群-07C160?logo=wechat&logoColor=white)](https://unirl-project.github.io/unirl/community/wechat-qr.jpg)
 
+<br>
+<a href="https://trendshift.io/repositories/48953" target="_blank" rel="noopener noreferrer">
+  <img src="https://trendshift.io/api/badge/trendshift/repositories/48953/daily?language=Python" alt="UniRL ranked #16 Python Repository of the Day on Trendshift" width="250" height="55">
+</a>
+
 </div>
 
 ## News 🚀

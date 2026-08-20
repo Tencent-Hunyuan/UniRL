@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unirl.algorithms import StageAlgorithm
+from unirl.algorithms.base import StageAlgorithm
 from unirl.train.stack.planner.types import Plan, _build_micro_batch_slices, _update_ranges
 from unirl.types.sample import Part
 

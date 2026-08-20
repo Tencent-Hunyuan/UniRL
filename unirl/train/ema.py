@@ -12,8 +12,9 @@ import torch
 from torch import Tensor, nn
 from torch.nn.parameter import Parameter
 
+from unirl.distributed.local import local_view
+from unirl.models.types.post_materialize import defer_after_materialize
 from unirl.train.configs import EmaFullConfig, EmaLoraConfig
-from unirl.train.deferred import _stamp
 from unirl.train.lora import (
     ModuleSelection,
     _activate,
@@ -142,9 +143,9 @@ def inject_nft(
             n_trainable,
         )
 
-    _stamp(model, partial(_reset_adapter, name=default))
-    _stamp(model, partial(_reset_adapter, name=shadow))
-    _stamp(model, partial(_copy_adapter, src=default, dst=shadow))
+    defer_after_materialize(model, partial(_reset_adapter, name=default))
+    defer_after_materialize(model, partial(_reset_adapter, name=shadow))
+    defer_after_materialize(model, partial(_copy_adapter, src=default, dst=shadow))
 
     return Shadow(
         iter_pairs=lambda: _adapter_pairs(model, default, shadow),
@@ -173,7 +174,7 @@ def inject_mirror(
     if _current_rank() == 0:
         logger.info("inject_mirror: registered %d shadow parameters (prefix=%r)", len(pairs), prefix)
 
-    _stamp(model, partial(_copy_mirror, pairs=pairs))
+    defer_after_materialize(model, partial(_copy_mirror, pairs=pairs))
 
     return Shadow(
         iter_pairs=lambda: ((getattr(m, a), getattr(m, s)) for m, a, s in pairs),
@@ -235,13 +236,6 @@ def _swap_mirror(pairs: List[Tuple[nn.Module, str, str]]) -> None:
         live = getattr(mod, live_attr)
         shd = getattr(mod, shadow_attr)
         live.data, shd.data = shd.data, live.data
-
-
-def local_view(tensor: Tensor) -> Tensor:
-    """DTensor -> local shard.  Identity for non-DTensors."""
-    if hasattr(tensor, "_local_tensor"):
-        return tensor._local_tensor
-    return tensor
 
 
 def _parent_and_attr(model: nn.Module, fqn: str) -> Tuple[nn.Module, str]:
