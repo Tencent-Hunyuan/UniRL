@@ -2,11 +2,44 @@
 
 from __future__ import annotations
 
+import os
 from typing import Tuple
 
 import torch
 import torch.distributed as dist
 from torch import nn
+
+
+def _verify_rank_local_block(block: torch.Tensor, mesh) -> None:
+    """Fail when a DTensor mesh does not hold the same logical local block."""
+    if os.environ.get("UNIRL_VERIFY_EP_LOCAL_BLOCKS", "0").strip().lower() not in ("1", "true", "yes"):
+        return
+    if not dist.is_initialized() or mesh.size() <= 1:
+        return
+
+    import hashlib
+
+    data = block.detach().contiguous().cpu()
+    digest = hashlib.sha256()
+    digest.update(str(data.dtype).encode())
+    digest.update(str(tuple(data.shape)).encode())
+    digest.update(data.view(torch.uint8).flatten().numpy().tobytes())
+    local = {
+        "rank": dist.get_rank(),
+        "checksum": digest.hexdigest()[:16],
+        "shape": tuple(block.shape),
+        "dtype": str(block.dtype),
+    }
+    for group in mesh.get_all_groups():
+        gathered = [None] * dist.get_world_size(group)
+        dist.all_gather_object(gathered, local, group=group)
+        checksums = {item["checksum"] for item in gathered}
+        if len(checksums) != 1:
+            raise RuntimeError(
+                "EP placement: ranks in one DTensor mesh must provide the same "
+                "logical EP-local block before FSDP sharding; "
+                f"got {gathered}."
+            )
 
 
 def has_ep_params(model: nn.Module) -> bool:
@@ -64,7 +97,7 @@ def gather_stacked_expert_block(
 
 
 def assign_local_block(param: torch.Tensor, block: torch.Tensor) -> None:
-    """Copy a full local EP block into a plain tensor or its DTensor shard."""
+    """Copy a full EP-local block already replicated across its FSDP mesh."""
     try:
         from torch.distributed.tensor import DTensor, distribute_tensor
     except ImportError:  # pragma: no cover - older torch
@@ -72,7 +105,11 @@ def assign_local_block(param: torch.Tensor, block: torch.Tensor) -> None:
 
     with torch.no_grad():
         if isinstance(param, DTensor):
-            sharded = distribute_tensor(block, param.device_mesh, param.placements)
+            # Every rank in param.device_mesh must hold the same logical block;
+            # each EP rank has a separate FSDP mesh. Avoid a redundant source-rank
+            # scatter and shard the already-local block in place.
+            _verify_rank_local_block(block, param.device_mesh)
+            sharded = distribute_tensor(block, param.device_mesh, param.placements, src_data_rank=None)
             param.to_local().copy_(sharded.to_local())
         else:
             param.copy_(block)
