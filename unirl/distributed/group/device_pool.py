@@ -62,10 +62,29 @@ class DevicePool:
         self._worker_id_to_slot: Dict[str, int] = {}
         self._device_to_workers: Dict[int, List] = {}  # device_id → [slot0, slot1, ...]
         self._worker_by_id: Dict[str, Any] = {}  # worker_id → handle
+        self._poison_reason: Optional[str] = None
 
     @property
     def num_gpus(self) -> int:
         return self.num_devices
+
+    def mark_poisoned(self, *, rank: int, role_name: str, method_name: str, error: BaseException) -> None:
+        """Poison the pool with the first rank-local failure context."""
+        if self._poison_reason is not None:
+            return
+        error_text = str(error)
+        error_summary = error_text.splitlines()[0] if error_text else "<no message>"
+        self._poison_reason = (
+            f"rank={rank}, role={role_name!r}, method={method_name!r}, error={type(error).__name__}: {error_summary}"
+        )
+        logger.error("DevicePool poisoned: %s", self._poison_reason)
+
+    def assert_usable(self) -> None:
+        """Reject distributed RPCs after any rank-local actor task failure."""
+        if self._poison_reason is not None:
+            raise RuntimeError(
+                f"DevicePool is poisoned; refusing to issue another distributed RPC ({self._poison_reason})"
+            )
 
     @property
     def transport_cls(self) -> type:
@@ -281,6 +300,8 @@ class DevicePool:
         slot_id: Optional[int] = None,
     ) -> Handle:
         """Create a Handle for role_cls on this pool."""
+        self.assert_usable()
+
         from unirl.distributed.group.placement import current_placement
 
         if device_ids is None:
