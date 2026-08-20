@@ -255,7 +255,7 @@ def validate_worker_inflight(
     *,
     worker_max_concurrency: int,
     engine_concurrency: Optional[int],
-) -> int:
+) -> None:
     """Validate per-worker rollout concurrency against actor and engine capacity."""
     if per_worker_inflight <= 0:
         raise ValueError(f"per_worker_inflight must be positive; got {per_worker_inflight}")
@@ -274,7 +274,6 @@ def validate_worker_inflight(
         raise ValueError(
             f"per_worker_inflight ({per_worker_inflight}) exceeds engine concurrency ({engine_concurrency})"
         )
-    return per_worker_inflight
 
 
 __all__ = ["RolloutPool", "required_worker_concurrency", "validate_worker_inflight"]

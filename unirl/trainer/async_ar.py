@@ -97,11 +97,12 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
         self._train_fraction = float(train_fraction)
         self._max_inflight = max(1, int(max_inflight))
         engine_cfg = rollout_cfg.get("config", {})
-        self._per_worker_inflight = validate_worker_inflight(
+        validate_worker_inflight(
             per_worker_inflight,
             worker_max_concurrency=self.pool.max_worker_concurrency,
             engine_concurrency=engine_cfg.get("concurrency"),
         )
+        self._per_worker_inflight = per_worker_inflight
         self._max_inflight_units = self._max_inflight * self.batch_size
         self._weight_sync_interval = int(weight_sync_interval)
         self._num_updates_per_batch = int(stack_cfg.get("num_updates_per_batch", 1))
