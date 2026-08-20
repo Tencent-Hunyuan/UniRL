@@ -74,6 +74,7 @@ class BagelPipeline(Pipeline):
                 autocast_precision=autocast_precision,
                 trajectory_precision=trajectory_precision,
                 logprob_precision=logprob_precision,
+                replay_step_pack_size=_cfg_get(getattr(bundle, "config", None), "replay_step_pack_size", 1),
             )
         self.diffusion = diffusion
         self.vae_decode = vae_decode if vae_decode is not None else BagelVAEDecodeStage(bundle)

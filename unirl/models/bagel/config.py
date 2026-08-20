@@ -57,6 +57,7 @@ class BagelPipelineConfig:
 
     cache_t2i_contexts: bool = True
     context_cache_size: int = 32
+    replay_step_pack_size: int = 1
 
     def __post_init__(self) -> None:
         validate_precision_type(self.model_precision, field="BagelPipelineConfig.model_precision")

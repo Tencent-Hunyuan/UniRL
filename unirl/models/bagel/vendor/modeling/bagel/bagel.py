@@ -797,7 +797,10 @@ class Bagel(PreTrainedModel):
         packed_sequence = packed_text_embedding.new_zeros((sum(packed_seqlens), self.hidden_size))
         packed_sequence[packed_text_indexes] = packed_text_embedding
 
-        assert timestep.unique().shape[0] == 1
+        if timestep.ndim != 1 or timestep.shape[0] != x_t.shape[0]:
+            raise ValueError(
+                f"timestep must contain one value per latent token, got {tuple(timestep.shape)} for {x_t.shape[0]}"
+            )
         packed_pos_embed = self.latent_pos_embed(packed_vae_position_ids)
         packed_timestep_embeds = self.time_embedder(timestep)
         x_t = self.vae2llm(x_t) + packed_timestep_embeds + packed_pos_embed

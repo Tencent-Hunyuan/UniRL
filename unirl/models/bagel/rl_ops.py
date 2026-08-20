@@ -24,6 +24,7 @@ __all__ = [
     "prefill_text_split",
     "prefill_vit_split",
     "require_inference_dispatch",
+    "repeat_context",
     "resize_input_image",
     "score_response",
     "score_response_with_prompt",
@@ -159,6 +160,23 @@ def clone_context(ctx: Dict[str, Any]) -> Dict[str, Any]:
         "kv_lens": list(ctx["kv_lens"]),
         "ropes": list(ctx["ropes"]),
         "past_key_values": cloned_cache,
+    }
+
+
+def repeat_context(ctx: Dict[str, Any], repeats: int) -> Dict[str, Any]:
+    """Repeat a packed KV context along its varlen sequence axis."""
+    if repeats == 1:
+        return ctx
+    cache = ctx["past_key_values"]
+    repeated_cache = type(cache)(cache.num_layers)
+    for layer_idx in range(cache.num_layers):
+        key, value = cache.key_cache[layer_idx], cache.value_cache[layer_idx]
+        repeated_cache.key_cache[layer_idx] = None if key is None else torch.cat([key] * repeats, dim=0)
+        repeated_cache.value_cache[layer_idx] = None if value is None else torch.cat([value] * repeats, dim=0)
+    return {
+        "kv_lens": list(ctx["kv_lens"]) * repeats,
+        "ropes": list(ctx["ropes"]) * repeats,
+        "past_key_values": repeated_cache,
     }
 
 
