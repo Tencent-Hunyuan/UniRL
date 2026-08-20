@@ -160,7 +160,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         autocast_precision: str = "bf16",
         trajectory_precision: str = "fp32",
         logprob_precision: str = "fp32",
-        replay_step_pack_size: int = 1,
+        batch_replay_steps: bool = False,
     ) -> None:
         self.model = model
         self.step = step if step is not None else BagelDiffusionStep()
@@ -168,8 +168,8 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         self.autocast_dtype = parse_torch_dtype(autocast_precision, field_name="autocast_precision")
         self.trajectory_dtype = parse_torch_dtype(trajectory_precision, field_name="trajectory_precision")
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="logprob_precision")
-        self.replay_step_pack_size = int(replay_step_pack_size)
-        require(self.replay_step_pack_size >= 1, "replay_step_pack_size must be >= 1")
+        # This Bagel-specific opt-in intentionally retains rollout-sourced anchors.
+        self._batch_replay_steps = bool(batch_replay_steps)
 
     def _autocast_ctx(self, device: torch.device):
         if device.type == "cuda" and self.autocast_dtype in (torch.float16, torch.bfloat16):
@@ -443,60 +443,50 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
             conditions,
             differentiable=torch.is_grad_enabled(),
         )
-        if self.replay_step_pack_size > 1:
+        if self._batch_replay_steps and len(target) > 1:
             require(
                 float(params.cfg_text_scale) == 1.0 and float(params.cfg_img_scale) == 1.0,
                 "Bagel packed replay only supports the FlowGRPO no-CFG path",
             )
-            log_prob_chunks: List[torch.Tensor] = []
-            prev_mean_chunks: List[torch.Tensor] = []
+            repeats = len(target)
+            packed_gen = rl_ops.repeat_context(gen, repeats)
+            gi, gi_cfg_text, gi_cfg_img = self._build_generation_inputs(
+                packed_gen, cfg_text, cfg_img, image_shape, device=device
+            )
+            forward_kwargs = self._forward_kwargs(
+                packed_gen, cfg_text, cfg_img, gi, gi_cfg_text, gi_cfg_img, params
+            )
+            x_t = torch.stack([segment.latents_at(i)[0].to(device) for i in target])
+            prev_sample = torch.stack([segment.latents_at(i + 1)[0].to(device) for i in target])
+            t_cur = torch.stack([schedule[i] for i in target])
+            t_next = torch.stack([schedule[i + 1] for i in target])
+            timestep = t_cur[:, None].expand(repeats, x_t.shape[1]).reshape(-1)
+
             with self._autocast_ctx(device):
-                for start in range(0, len(target), self.replay_step_pack_size):
-                    chunk = target[start : start + self.replay_step_pack_size]
-                    repeats = len(chunk)
-                    packed_gen = rl_ops.repeat_context(gen, repeats)
-                    gi, gi_cfg_text, gi_cfg_img = self._build_generation_inputs(
-                        packed_gen, cfg_text, cfg_img, image_shape, device=device
-                    )
-                    forward_kwargs = self._forward_kwargs(
-                        packed_gen, cfg_text, cfg_img, gi, gi_cfg_text, gi_cfg_img, params
-                    )
-
-                    x_t = torch.stack([segment.latents_at(i)[0].to(device) for i in chunk])
-                    prev_sample = torch.stack([segment.latents_at(i + 1)[0].to(device) for i in chunk])
-                    t_cur = torch.stack([schedule[i] for i in chunk])
-                    t_next = torch.stack([schedule[i + 1] for i in chunk])
-                    seq = int(x_t.shape[1])
-                    timestep = t_cur[:, None].expand(repeats, seq).reshape(-1)
-
-                    rl_ops.disable_inference_cache(bagel)
-                    v_t = rl_ops.forward_flow(
-                        bagel,
-                        x_t=x_t.flatten(0, 1),
-                        timestep=timestep,
-                        cfg_text_scale=1.0,
-                        cfg_img_scale=1.0,
-                        **forward_kwargs,
-                    ).view_as(x_t)
-                    _, log_prob, prev_mean = self.strategy.denoise(
-                        noise_pred=v_t,
-                        sample=x_t,
-                        sigma=t_cur,
-                        sigma_next=t_next,
-                        eta=float(params.eta),
-                        prev_sample=prev_sample,
-                        sigma_max=float(sigma_max),
-                    )
-                    if log_prob is None or prev_mean is None:
-                        raise RuntimeError("Bagel packed replay requires a stochastic FlowGRPO SDE strategy")
-                    log_prob_chunks.append(log_prob.reshape(-1))
-                    prev_mean_chunks.append(prev_mean)
+                rl_ops.disable_inference_cache(bagel)
+                v_t = rl_ops.forward_flow(
+                    bagel,
+                    x_t=x_t.flatten(0, 1),
+                    timestep=timestep,
+                    cfg_text_scale=1.0,
+                    cfg_img_scale=1.0,
+                    **forward_kwargs,
+                ).view_as(x_t)
+                _, log_prob, prev_mean = self.strategy.denoise(
+                    noise_pred=v_t,
+                    sample=x_t,
+                    sigma=t_cur,
+                    sigma_next=t_next,
+                    eta=float(params.eta),
+                    prev_sample=prev_sample,
+                    sigma_max=float(sigma_max),
+                )
+            if log_prob is None or prev_mean is None:
+                raise RuntimeError("Bagel packed replay requires a stochastic FlowGRPO SDE strategy")
 
             return ReplayResult(
-                log_probs=torch.cat(log_prob_chunks).unsqueeze(0).to(dtype=self.logprob_dtype),
-                prev_sample_means=torch.cat(prev_mean_chunks)
-                .unsqueeze(0)
-                .to(dtype=self.trajectory_dtype),
+                log_probs=log_prob.reshape(1, -1).to(dtype=self.logprob_dtype),
+                prev_sample_means=prev_mean.unsqueeze(0).to(dtype=self.trajectory_dtype),
             )
 
         gi, gi_cfg_text, gi_cfg_img = self._build_generation_inputs(gen, cfg_text, cfg_img, image_shape, device=device)

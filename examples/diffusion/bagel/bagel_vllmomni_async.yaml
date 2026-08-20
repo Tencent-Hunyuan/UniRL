@@ -43,10 +43,10 @@ bundle:
     model_precision: bf16
     shift: 3.0
     use_lora: true              # read by the engine's WeightSync (uses_lora)
-    replay_step_pack_size: 2
 
 pipeline:
   _target_: unirl.models.bagel.pipeline.BagelPipeline
+  batch_replay_steps: true
   autocast_precision: bf16
   trajectory_precision: fp32
   logprob_precision: fp32

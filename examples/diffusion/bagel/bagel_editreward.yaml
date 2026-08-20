@@ -72,10 +72,10 @@ bundle:
     shift: 3.0
     use_lora: true
     enable_vit: true             # EDIT: load the SigLIP ViT/und path for source-image conditioning
-    replay_step_pack_size: 3
 
 pipeline:
   _target_: unirl.models.bagel.pipeline.BagelPipeline
+  batch_replay_steps: true
   autocast_precision: bf16
   trajectory_precision: fp32
   logprob_precision: fp32
