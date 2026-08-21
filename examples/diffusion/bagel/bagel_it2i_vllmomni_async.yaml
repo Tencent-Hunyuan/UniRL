@@ -18,6 +18,9 @@ defaults:
   - _self_
 
 num_devices: 9
+# WARNING: with devices_per_node=8, this requests STRICT_PACK groups of 8+1
+# GPUs and therefore needs capacity on at least two nodes (unless one node has
+# 9 GPUs available).
 layout: separate
 train_fraction: 0.4444444444444444
 reward_fraction: 0.1111111111111111

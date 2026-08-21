@@ -69,12 +69,6 @@ def _build_runtime_env(requirements_path: str) -> dict[str, Any]:
         if line.startswith("#"):
             continue
         packages.append(line)
-    # An empty requirements file means "the base env already has every dep"
-    # (broken-runtime_env images pre-install into base). Return no runtime_env
-    # so the actor inherits the raylet's interpreter directly instead of Ray
-    # building a virtualenv that this image's pip cannot populate.
-    if not packages and not pip_install_options:
-        return {}
     pip_cfg: dict[str, Any] = {"packages": packages, "pip_check": False}
     if pip_install_options:
         pip_cfg["pip_install_options"] = pip_install_options

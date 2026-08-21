@@ -16,7 +16,6 @@ from unirl.trainer.async_rollout import (
 )
 from unirl.trainer.diffusion import DiffusionTrainer
 from unirl.types.sample import Sample
-from unirl.types.sampling import total_samples_per_prompt
 
 
 class AsyncDiffusionTrainer(AsyncRolloutTrainerMixin, DiffusionTrainer):
@@ -32,11 +31,10 @@ class AsyncDiffusionTrainer(AsyncRolloutTrainerMixin, DiffusionTrainer):
         weight_sync_interval: int = 1,
         buffer_max_staleness: Optional[int] = None,
         async_reward: bool = False,
-        driver_local_reward: bool = False,
-        reward_batch_prompts: int = 0,
+        reward_client_on_driver: bool = False,
         **diffusion_kwargs: Any,
     ) -> None:
-        self._reward_single_lane = bool(driver_local_reward)
+        self._reward_client_on_driver = bool(reward_client_on_driver)
         layout = diffusion_kwargs.setdefault("layout", "separate")
         if layout != "separate":
             raise ValueError(f"AsyncDiffusionTrainer requires layout='separate', got {layout!r}.")
@@ -92,21 +90,12 @@ class AsyncDiffusionTrainer(AsyncRolloutTrainerMixin, DiffusionTrainer):
         min_staleness = self._weight_sync_interval - 1
         if self._max_staleness < min_staleness:
             raise ValueError(
-                f"buffer_max_staleness must be >= weight_sync_interval - 1; "
-                f"got {self._max_staleness} < {min_staleness}"
+                f"buffer_max_staleness must be >= weight_sync_interval - 1; got {self._max_staleness} < {min_staleness}"
             )
         if self._num_updates_per_batch < 1:
             raise ValueError(f"num_updates_per_batch must be >= 1, got {self._num_updates_per_batch}")
         self._train_version = 0
         self._batches_since_sync = 0
-
-        self._reward_batch_prompts = int(reward_batch_prompts)
-        if self._reward_batch_prompts > 0:
-            self._async_reward = False
-            rows = self._reward_batch_prompts * total_samples_per_prompt(self.sampling_params)
-            set_request_batch_size = getattr(self.reward, "set_request_batch_size", None)
-            if callable(set_request_batch_size):
-                set_request_batch_size(rows)
 
     def _advantage_and_train(
         self,
@@ -172,6 +161,7 @@ class AsyncDiffusionTrainer(AsyncRolloutTrainerMixin, DiffusionTrainer):
         return {
             "train_fraction": self._train_fraction,
             "async_reward": self._async_reward,
+            "reward_client_on_driver": self._reward_client_on_driver,
         }
 
     def _boundary_evaluate(self, rollout_id: int, *, initial: bool) -> None:

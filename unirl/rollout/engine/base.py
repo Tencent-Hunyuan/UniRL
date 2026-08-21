@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
 
@@ -69,19 +68,26 @@ class BaseRolloutEngine(Remote, ABC):
     def generate(self, sample: Sample) -> Sample:
         """Synchronously fill and return one request ``Sample``; each concrete contract owns its dispatch mode."""
 
-    def generate_on_slot(self, sample: Sample) -> Sample:
+    def generate_on_slot(self, sample: Sample, *, export_outputs_to_cpu: bool = False) -> Sample:
         """Undecorated per-engine entry point for driver-side lane dispatch.
 
-        Opt-in (``UNIRL_LANE_CPU_MAP=1``): move generated CUDA tensors to CPU so
-        driver-local or cross-slab reward consumers can resolve them through the
-        global object store.
+        When ``export_outputs_to_cpu`` is true, move generated CUDA tensors to
+        CPU so a reward client on the driver can resolve them through the global
+        object store.
         """
         result = self.generate(sample)
-        if os.environ.get("UNIRL_LANE_CPU_MAP") != "1":
+        if not export_outputs_to_cpu:
             return result
-        from unirl.distributed.tensor.ref import map_tree
+        from unirl.distributed.tensor.ref import TensorRef, map_tree
 
-        return map_tree(result, lambda value: value.cpu() if isinstance(value, torch.Tensor) and value.is_cuda else value)
+        def export_to_cpu(value):
+            if isinstance(value, TensorRef):
+                return value.transform(lambda tensor: tensor.cpu() if tensor.is_cuda else tensor)
+            if isinstance(value, torch.Tensor) and value.is_cuda:
+                return value.cpu()
+            return value
+
+        return map_tree(result, export_to_cpu)
 
     def abort(self, ids: Optional[List[str]] = None) -> List[Sample]:
         """Best-effort cancel of in-flight generation; return any partials. Default no-op."""

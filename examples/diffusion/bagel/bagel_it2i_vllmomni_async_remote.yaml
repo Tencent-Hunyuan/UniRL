@@ -1,48 +1,39 @@
 # @package _global_
-# Async streaming BAGEL it2i with EditReward served REMOTELY over HTTP (a
-# separate node), instead of the local managed child in bagel_it2i_vllmomni_async.
+# Async BAGEL it2i with EditReward served remotely over HTTP instead of using
+# the managed scorer child inherited from bagel_it2i_vllmomni_async.
 #
-#   lane generate -> immediate RewardService HTTP /score (REMOTE) -> scored queue
-#   -> collect batch_size complete prompt groups -> train.
+# Each completed prompt group starts its own asynchronous /score request:
+#   lane generate -> release lane + start remote score -> scored queue
+#   -> collect batch_size scored prompt groups -> train.
 #
-# Geometry: num_devices=8 -> 4 train + 4 rollout (no local reward card; the
-# scorer lives on its own node). reward_fraction=0 puts the RewardService on the
-# train slab, but RemoteRewardBackend is HTTP-only so it holds no GPU.
+# Geometry: num_devices=8 -> 4 train + 4 rollout. The scorer model lives on a
+# separate node, while the thin HTTP reward client runs on the driver and uses
+# no GPU worker or reward slab.
 #
-# The launcher MUST strip the inherited managed-child keys so RemoteRewardSpec
-# instantiates cleanly:
-#   ~reward.backend.config.process ~reward.backend.config.scorer \
-#   ~reward.backend.config.client  ~reward.backend.config.lifecycle
-#
-# Deploy: reward node runs configs/editreward_service.yaml; train node exports
+# Deploy: the reward node runs configs/editreward_service.yaml; the train node:
 #   REWARD_SERVICE_URL=http://<reward_node_ip>:8080
 #   python -m unirl.train_async_diffusion \
-#     --config-name diffusion/bagel/bagel_it2i_vllmomni_async_remote <the 4 ~ deletes>
+#     --config-name diffusion/bagel/bagel_it2i_vllmomni_async_remote
 
 defaults:
   - bagel_it2i_vllmomni_async
   - _self_
 
-# All 8 training-node GPUs are train+rollout (4+4). The reward MODEL runs on a
-# SEPARATE node (RemoteRewardBackend, HTTP); AsyncDiffusionTrainer runs the thin
-# HTTP client on the DRIVER (DriverLocalReward), so the reward holds NO GPU here
-# and does not join any slab. train dp=4 divides batch_size*spp; rollout dp=4
-# divides batch_size=8.
+# All 8 local GPUs are train+rollout (4+4); no local reward card is allocated.
 num_devices: 8
 train_fraction: 0.5
 reward_fraction: 0.0
-driver_local_reward: true
+reward_client_on_driver: true
 
-# Publish weights every trained batch, but independently allow rollouts up to 2
-# published-batches stale (decoupled from weight_sync_interval, mirrors AR).
+# Inherited async_reward=true sends each completed prompt group immediately.
+# Weight publication cadence and admissible rollout lag remain independent.
 weight_sync_interval: 1
 buffer_max_staleness: 2
 
-# Reward micro-batching: gather 8 completed prompt groups (8 * samples_per_prompt
-# images) and send them as ONE /score POST, instead of per-lane streaming.
-reward_batch_prompts: 8
-
-reward:
+# Define a complete replacement tree so inherited ManagedScorerProcessSpec keys
+# cannot merge into the remote backend configuration.
+remote_reward:
+  _target_: unirl.reward.service.RewardService
   backend:
     _target_: unirl.reward.remote.RemoteRewardBackend
     base_device: cpu
@@ -52,10 +43,13 @@ reward:
       required_rewards: [editreward]
       reward_weights: {editreward: 1.0}
       batch_size: 8
+      request_batch_size: 8
       timeout: 300.0
       sub_metric_reduce: first
       aggregation_method: weighted_sum
       input_kind: image
+
+reward: ${remote_reward}
 
 logging:
   run_name: bagel_it2i_async_remote_editreward

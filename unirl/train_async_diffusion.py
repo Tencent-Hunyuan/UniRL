@@ -49,8 +49,7 @@ def main(cfg: DictConfig) -> None:
         weight_sync_interval=int(cfg.get("weight_sync_interval", 1)),
         buffer_max_staleness=cfg.get("buffer_max_staleness"),
         async_reward=bool(cfg.get("async_reward", False)),
-        driver_local_reward=bool(cfg.get("driver_local_reward", False)),
-        reward_batch_prompts=int(cfg.get("reward_batch_prompts", 0)),
+        reward_client_on_driver=bool(cfg.get("reward_client_on_driver", False)),
     )
     trainer.train(
         num_rollouts=cfg.get("num_rollouts", 100),

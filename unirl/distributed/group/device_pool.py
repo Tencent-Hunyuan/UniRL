@@ -109,6 +109,15 @@ class DevicePool:
     def _create_placement_groups(self) -> None:
         """Create one STRICT_PACK PlacementGroup per requested node slice."""
         extra_cpu = 1 if self.transport_kind in ("gpu_store", "gpu") else 0
+        if self.num_devices % self.devices_per_node:
+            logger.warning(
+                "num_devices=%d is not divisible by devices_per_node=%d; creating a partial final "
+                "STRICT_PACK placement group with %d GPU(s). The cluster must have sufficient "
+                "capacity, including a node able to place that final group.",
+                self.num_devices,
+                self.devices_per_node,
+                self.num_devices % self.devices_per_node,
+            )
         pgs = []
         remaining = self.num_devices
         while remaining > 0:

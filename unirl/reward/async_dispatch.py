@@ -10,7 +10,7 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 
-class _DriverCall:
+class _DriverFutureCall:
     """Future-like call matching the ``ready()``/``result()`` surface the
     async manager expects from a ``Handle`` ``launch_nowait`` result."""
 
@@ -24,7 +24,7 @@ class _DriverCall:
         return self._future.result()
 
 
-class DriverLocalReward:
+class DriverRewardClient:
     """Run a remote-HTTP reward client on the driver — no GPU worker, no slab.
 
     UniRL places every ``Remote`` role on a GPU worker, but a remote reward does
@@ -38,8 +38,8 @@ class DriverLocalReward:
     the driver.
     """
 
-    # Handle-compatible layout: a driver-local reward is a single scorer, so the
-    # trainer's dp-geometry checks see dp_size=1 (batch % 1 == 0 always).
+    # Handle-compatible layout: the driver reward client represents one scorer,
+    # so trainer DP-geometry checks see dp_size=1 (batch % 1 == 0 always).
     dp_size = 1
     world_size = 1
 
@@ -51,25 +51,19 @@ class DriverLocalReward:
         # Materialize every TensorRef leaf on the driver (module-level hydrate()
         # only resolves a bare TensorRef, not one nested in the Sample tree).
         # Each span round-trips through its bound worker / plasma object_ref
-        # (the lane CPU-map keeps generated media globally readable).
+        # (the launcher's explicit CPU export keeps generated media readable).
         from unirl.distributed.tensor.ref import TensorRef, map_tree
 
         resolved = map_tree(sample, lambda o: o.materialize(backend=None) if isinstance(o, TensorRef) else o)
         return self._service.score_and_attach(resolved)
 
-    def launch_nowait(self, method_name: str, *args: Any, **kwargs: Any) -> _DriverCall:
+    def launch_nowait(self, method_name: str, *args: Any, **kwargs: Any) -> _DriverFutureCall:
         if method_name != "score_and_attach":
-            raise AttributeError(f"DriverLocalReward only serves score_and_attach, got {method_name!r}")
-        return _DriverCall(self._pool.submit(self._score, *args, **kwargs))
+            raise AttributeError(f"DriverRewardClient only serves score_and_attach, got {method_name!r}")
+        return _DriverFutureCall(self._pool.submit(self._score, *args, **kwargs))
 
     def score_and_attach(self, sample: Any) -> Any:
         return self._score(sample)
-
-    def set_request_batch_size(self, n: int) -> None:
-        """Chunk each HTTP /score call to ``n`` sample rows (backend-side)."""
-        backend = getattr(self._service, "backend", None)
-        if backend is not None and hasattr(backend, "request_batch_size"):
-            backend.request_batch_size = int(n)
 
     def is_available(self) -> bool:
         return self._service.is_available()
@@ -81,28 +75,26 @@ class DriverLocalReward:
         pass
 
     def shutdown(self) -> None:
-        self._pool.shutdown(wait=False)
+        # Every submitted score must finish before its backend/session is disposed.
+        self._pool.shutdown(wait=True, cancel_futures=False)
         dispose = getattr(self._service, "dispose", None)
         if callable(dispose):
             dispose()
 
 
-class AsyncRewardCall:
+class ChainedRewardCall:
     """Future-like rollout call that releases its lane before reward completes.
 
-    ``capacity_ready`` becomes true as soon as generation finishes. At that
-    transition the generated prompt group is immediately submitted to
-    ``RewardService`` and the rollout lane can be refilled. ``ready`` becomes true
-    only when reward finishes, so completed groups enter the manager queue in
-    reward-completion order.
+    ``is_capacity_released`` becomes true as soon as generation finishes. At
+    that transition the generated prompt group is submitted to ``RewardService``
+    and the rollout lane can be refilled. ``ready`` becomes true only when reward
+    finishes, so completed groups enter the manager queue in reward-completion
+    order.
     """
 
-    def __init__(self, rollout_call: Any, reward: Any, *, max_attempts: int = 2) -> None:
-        if max_attempts < 1:
-            raise ValueError(f"max_attempts must be >= 1, got {max_attempts}")
+    def __init__(self, rollout_call: Any, reward: Any) -> None:
         self._rollout_call = rollout_call
         self._reward = reward
-        self._max_attempts = int(max_attempts)
         self._sample: Optional[Any] = None
         self._reward_call: Optional[Any] = None
         self._lock = threading.Lock()
@@ -126,13 +118,13 @@ class AsyncRewardCall:
             self._reward_call = self._reward.launch_nowait("score_and_attach", sample)
             return True
 
-    def capacity_ready(self) -> bool:
+    def is_capacity_released(self) -> bool:
         """Release rollout capacity and start reward once generation completes."""
         return self._start_if_ready(block=False)
 
     def ready(self) -> bool:
         """True only when the scored Sample can enter the completed queue."""
-        if not self.capacity_ready():
+        if not self.is_capacity_released():
             return False
         if self._reward_call is None:
             return True
@@ -145,33 +137,19 @@ class AsyncRewardCall:
                 raise RuntimeError("async reward call has neither a reward future nor a passthrough Sample")
             return self._sample
 
-        for attempt in range(self._max_attempts):
-            try:
-                return self._reward_call.result()
-            except Exception:
-                if attempt + 1 >= self._max_attempts:
-                    raise
-                logger.warning("per-prompt reward scoring failed; retrying the same generated group")
-                if self._sample is None:
-                    raise RuntimeError("cannot retry async reward without the generated Sample")
-                self._reward_call = self._reward.launch_nowait("score_and_attach", self._sample)
-        raise AssertionError("unreachable")
+        return self._reward_call.result()
 
     def discard_on_completion(self) -> None:
-        """Drain the chained calls in the background and release their outputs."""
-
-        def discard() -> None:
-            try:
-                self.result()
-            except Exception:
-                logger.debug("discarded async reward chain failed during shutdown", exc_info=True)
-
-        threading.Thread(target=discard, name="async-reward-discard", daemon=True).start()
+        """Drain the chain before its reward client is shut down."""
+        try:
+            self.result()
+        except Exception:
+            logger.debug("discarded chained reward call failed during shutdown", exc_info=True)
 
 
-def chain_reward(rollout_call: Any, reward: Any, *, max_attempts: int = 2) -> AsyncRewardCall:
+def chain_reward(rollout_call: Any, reward: Any) -> ChainedRewardCall:
     """Return a future that starts reward as soon as ``rollout_call`` completes."""
-    return AsyncRewardCall(rollout_call, reward, max_attempts=max_attempts)
+    return ChainedRewardCall(rollout_call, reward)
 
 
-__all__ = ["AsyncRewardCall", "DriverLocalReward", "chain_reward"]
+__all__ = ["ChainedRewardCall", "DriverRewardClient", "chain_reward"]

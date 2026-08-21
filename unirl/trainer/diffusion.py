@@ -210,10 +210,9 @@ class DiffusionTrainer(BaseTrainer):
 
     _prompt_local_rollout = False
 
-    # When reward rides the train slab, score it over the whole slab (best for
-    # a batch-at-once local reward). Async per-lane subclasses flip this so a
-    # single completed group (batch=1) scores at dp_size=1. See _build_train_side.
-    _reward_single_lane: bool = False
+    # Async per-prompt subclasses may place an HTTP reward client on the driver
+    # instead of allocating a GPU worker for the client. See _build_train_side.
+    _reward_client_on_driver: bool = False
 
     def __init__(
         self,
@@ -472,16 +471,12 @@ class DiffusionTrainer(BaseTrainer):
         self.pipeline = remote_hydra(pipeline_cfg, bundle=self.bundle)
         self.backend = remote_hydra(backend_cfg, bundle=self.bundle)
         if reward_cfg is not None:
-            if self._reward_single_lane:
-                # Per-lane async + remote-HTTP reward: run the reward client on
-                # the DRIVER (no GPU worker, no slab) so every training-node GPU
-                # stays train+rollout. Scoring one completed group at a time
-                # (batch=1) can't DP_SCATTER over the train slab anyway, and an
-                # HTTP reward gains nothing from DP. The scorer model lives on
-                # its own node; only a thin HTTP client sits on the driver.
-                from unirl.reward.async_dispatch import DriverLocalReward
+            if self._reward_client_on_driver:
+                # The remote scorer model lives outside this pool. Keep only its
+                # thin HTTP client on the driver, with no GPU worker or slab.
+                from unirl.reward.async_dispatch import DriverRewardClient
 
-                self.reward = DriverLocalReward(instantiate(reward_cfg))
+                self.reward = DriverRewardClient(instantiate(reward_cfg))
             else:
                 self.reward = remote_hydra(reward_cfg)
             self._wire_eval_suites()
