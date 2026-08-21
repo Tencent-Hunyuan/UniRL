@@ -69,12 +69,7 @@ class BaseRolloutEngine(Remote, ABC):
         """Synchronously fill and return one request ``Sample``; each concrete contract owns its dispatch mode."""
 
     def generate_on_slot(self, sample: Sample, *, export_outputs_to_cpu: bool = False) -> Sample:
-        """Undecorated per-engine entry point for driver-side lane dispatch.
-
-        When ``export_outputs_to_cpu`` is true, move generated CUDA tensors to
-        CPU so a reward client on the driver can resolve them through the global
-        object store.
-        """
+        """Generate on one engine slot and optionally export outputs to CPU."""
         result = self.generate(sample)
         if not export_outputs_to_cpu:
             return result

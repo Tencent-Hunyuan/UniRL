@@ -11,8 +11,7 @@ logger = logging.getLogger(__name__)
 
 
 class _DriverFutureCall:
-    """Future-like call matching the ``ready()``/``result()`` surface the
-    async manager expects from a ``Handle`` ``launch_nowait`` result."""
+    """Adapt a concurrent future to the async manager's call interface."""
 
     def __init__(self, future: "Future") -> None:
         self._future = future
@@ -25,18 +24,7 @@ class _DriverFutureCall:
 
 
 class DriverRewardClient:
-    """Run a remote-HTTP reward client on the driver — no GPU worker, no slab.
-
-    UniRL places every ``Remote`` role on a GPU worker, but a remote reward does
-    no GPU work: it just POSTs the generated media to a scorer on another node.
-    Hosting the client on the driver keeps the training node's GPUs entirely
-    train+rollout. Exposes the ``launch_nowait`` / ``.ready()`` / ``.result()``
-    surface the async per-lane manager uses, backed by a small thread pool so
-    scoring overlaps rollout and training. ``score_and_attach`` runs the
-    undecorated ``RewardService`` body (``@distributed`` only dispatches through
-    a ``Handle``); the sample is hydrated first so CPU plasma tensors resolve on
-    the driver.
-    """
+    """Run a remote HTTP reward client on the driver without a GPU worker."""
 
     # Handle-compatible layout: the driver reward client represents one scorer,
     # so trainer DP-geometry checks see dp_size=1 (batch % 1 == 0 always).
@@ -83,14 +71,7 @@ class DriverRewardClient:
 
 
 class ChainedRewardCall:
-    """Future-like rollout call that releases its lane before reward completes.
-
-    ``is_capacity_released`` becomes true as soon as generation finishes. At
-    that transition the generated prompt group is submitted to ``RewardService``
-    and the rollout lane can be refilled. ``ready`` becomes true only when reward
-    finishes, so completed groups enter the manager queue in reward-completion
-    order.
-    """
+    """Release a rollout lane after generation while chained reward work continues."""
 
     def __init__(self, rollout_call: Any, reward: Any) -> None:
         self._rollout_call = rollout_call

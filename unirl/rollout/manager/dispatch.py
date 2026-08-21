@@ -25,12 +25,7 @@ class _PendingUnit:
 
 
 class RolloutPool:
-    """Background dispatch thread keeping every launcher filled up to its capacity.
-
-    A pending call may expose ``is_capacity_released()`` to release its launcher
-    before its final ``ready()`` result. This lets generation lanes refill while
-    chained reward work remains in flight.
-    """
+    """Keep launchers filled while tracking capacity-released pending calls."""
 
     _PROBE_INTERVAL_S = 0.01
 
