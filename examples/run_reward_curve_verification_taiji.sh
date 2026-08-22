@@ -7,11 +7,14 @@
 # Model and dataset paths must be pod-local; never point them at Ceph.
 #
 # Profiles:
-#   sd3-trainside    1x8, .venv,        diffusion/sd3/sd3_trainside
-#   sd3-vllm-omni   1x8, .venv,        diffusion/sd3/sd3_vllmomni
-#   pe               1x8, .venv,        pe/pe_trainside_pickscore
-#   ar-drpo          4x8, .venv-sglang, ar/qwen3_drpo_4b_base_dapo_sglang
-#   qwen-omni        1x8, .venv,        ar/qwen3_omni_video_r1_gspo_lora_vllm_omni_1x8
+#   sd3-trainside             1x8, .venv,        diffusion/sd3/sd3_trainside
+#   sd3-vllm-omni             1x8, .venv,        diffusion/sd3/sd3_vllmomni
+#   pe                        1x8, .venv,        pe/pe_trainside_pickscore
+#   ar-drpo                   4x8, .venv-sglang, ar/qwen3_drpo_4b_base_dapo_sglang
+#   qwen-omni                 1x8, .venv,        ar/qwen3_omni_video_r1_gspo_lora_vllm_omni_1x8
+#   agentic-alfworld          1x8, .venv-sglang, alfworld/alfworld_grpo
+#   agentic-alfworld-partial  1x8, .venv-sglang, alfworld/alfworld_grpo_partial
+#   agentic-alfworld-async    1x8, .venv-sglang, alfworld/alfworld_grpo_async
 #
 # Example:
 #   tmux new-session -d -s unirl-sd3 \
@@ -51,7 +54,7 @@ export REPORT_TO_WANDB=true
 : "${WANDB_API_KEY:?WANDB_API_KEY must be exported or stored in ${WANDB_ENV_FILE}}"
 
 if [ "$#" -lt 1 ]; then
-    echo "Usage: $0 <sd3-trainside|sd3-vllm-omni|pe|ar-drpo|qwen-omni> [hydra overrides...]" >&2
+    echo "Usage: $0 <sd3-trainside|sd3-vllm-omni|pe|ar-drpo|qwen-omni|agentic-alfworld[-partial|-async]> [hydra overrides...]" >&2
     exit 2
 fi
 
@@ -89,6 +92,76 @@ require_torch_flavor() {
     fi
 }
 
+# CUDA 13 toolkit + forward-compat setup that every SGLang profile needs so the
+# TVM-FFI JIT can link. Reads VENV_DIR; exports CUDA_HOME/CUDACXX/PATH and the
+# runtime/compat directories the multinode launcher shims before Ray starts.
+setup_sglang_cuda() {
+    CUDA_TOOLKIT_DIR="${CUDA_TOOLKIT_DIR:-}"
+    if [ -z "${CUDA_TOOLKIT_DIR}" ]; then
+        for candidate in \
+            "${VENV_DIR}"/lib/python*/site-packages/nvidia/cu13; do
+            if [ -x "${candidate}/bin/nvcc" ]; then
+                CUDA_TOOLKIT_DIR="${candidate}"
+                break
+            fi
+        done
+    fi
+    if [ -z "${CUDA_TOOLKIT_DIR}" ] || [ ! -x "${CUDA_TOOLKIT_DIR}/bin/nvcc" ]; then
+        echo "CUDA 13.0 toolkit is missing from ${VENV_DIR}; install the pinned nvidia CUDA compiler wheels." >&2
+        exit 2
+    fi
+    export CUDA_HOME="${CUDA_TOOLKIT_DIR}"
+    export CUDA_PATH="${CUDA_TOOLKIT_DIR}"
+    export CUDACXX="${CUDA_TOOLKIT_DIR}/bin/nvcc"
+    export NVCC="${CUDACXX}"
+    export PATH="${CUDA_TOOLKIT_DIR}/bin:${PATH}"
+    CUDA_RUNTIME_LIB_DIR=""
+    for candidate in "${CUDA_TOOLKIT_DIR}/lib64" "${CUDA_TOOLKIT_DIR}/lib"; do
+        if compgen -G "${candidate}/libcudart.so*" >/dev/null; then
+            CUDA_RUNTIME_LIB_DIR="${candidate}"
+            break
+        fi
+    done
+    if [ -z "${CUDA_RUNTIME_LIB_DIR}" ]; then
+        echo "CUDA 13 runtime libraries are missing from ${CUDA_TOOLKIT_DIR}." >&2
+        exit 2
+    fi
+    # NVIDIA's pip toolkit has lib/libcudart.so.13 but no conventional
+    # lib64/libcudart.so linker name. The multinode launcher creates this
+    # small per-node shim before Ray starts, so SGLang TVM-FFI JIT links.
+    export CUDA_RUNTIME_LIB_DIR
+    export CUDA_RUNTIME_LINK_DIR="${CUDA_RUNTIME_LINK_DIR:-/tmp/unirl-cuda-runtime-${UID}}"
+    CUDA_COMPAT_DIR="${CUDA_COMPAT_DIR:-}"
+    if [ -z "${CUDA_COMPAT_DIR}" ]; then
+        for candidate in \
+            "${REPO_ROOT}"/.cuda-compat-13/usr/local/cuda-13.*/compat \
+            /usr/local/cuda-13.*/compat; do
+            if [ -d "${candidate}" ]; then
+                CUDA_COMPAT_DIR="${candidate}"
+                break
+            fi
+        done
+    fi
+    if [ -z "${CUDA_COMPAT_DIR}" ] || [ ! -d "${CUDA_COMPAT_DIR}" ]; then
+        echo "CUDA 13 forward-compat libraries are missing; set CUDA_COMPAT_DIR." >&2
+        exit 2
+    fi
+    export CUDA_COMPAT_DIR
+    export LD_LIBRARY_PATH="${CUDA_COMPAT_DIR}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+}
+
+# ALFWorld agentic profiles (LIN-693 baseline): same recipe, three rollout
+# drives — barrier, colocate-partial, disaggregated-async.
+setup_agentic_alfworld() {
+    VENV_DIR="${VENV_DIR:-${REPO_ROOT}/.venv-sglang}"
+    setup_sglang_cuda
+    export QWEN3_INSTRUCT_PATH="${QWEN3_INSTRUCT_PATH:-${REPO_ROOT}/models/local/Qwen3-4B-Instruct}"
+    export DATA_PATH="${DATA_PATH:-${REPO_ROOT}/data/alfworld/train.jsonl}"
+    export ALFWORLD_CONFIG="${ALFWORLD_CONFIG:-}"
+    require_file "${QWEN3_INSTRUCT_PATH}/config.json"
+    require_file "${DATA_PATH}"
+}
+
 SINGLE_NODE=1
 case "${PROFILE}" in
     sd3-trainside)
@@ -123,58 +196,7 @@ case "${PROFILE}" in
         ENTRY=train_ar
         EXPERIMENT=ar/qwen3_drpo_4b_base_dapo_sglang
         VENV_DIR="${VENV_DIR:-${REPO_ROOT}/.venv-sglang}"
-        CUDA_TOOLKIT_DIR="${CUDA_TOOLKIT_DIR:-}"
-        if [ -z "${CUDA_TOOLKIT_DIR}" ]; then
-            for candidate in \
-                "${VENV_DIR}"/lib/python*/site-packages/nvidia/cu13; do
-                if [ -x "${candidate}/bin/nvcc" ]; then
-                    CUDA_TOOLKIT_DIR="${candidate}"
-                    break
-                fi
-            done
-        fi
-        if [ -z "${CUDA_TOOLKIT_DIR}" ] || [ ! -x "${CUDA_TOOLKIT_DIR}/bin/nvcc" ]; then
-            echo "CUDA 13.0 toolkit is missing from ${VENV_DIR}; install the pinned nvidia CUDA compiler wheels." >&2
-            exit 2
-        fi
-        export CUDA_HOME="${CUDA_TOOLKIT_DIR}"
-        export CUDA_PATH="${CUDA_TOOLKIT_DIR}"
-        export CUDACXX="${CUDA_TOOLKIT_DIR}/bin/nvcc"
-        export NVCC="${CUDACXX}"
-        export PATH="${CUDA_TOOLKIT_DIR}/bin:${PATH}"
-        CUDA_RUNTIME_LIB_DIR=""
-        for candidate in "${CUDA_TOOLKIT_DIR}/lib64" "${CUDA_TOOLKIT_DIR}/lib"; do
-            if compgen -G "${candidate}/libcudart.so*" >/dev/null; then
-                CUDA_RUNTIME_LIB_DIR="${candidate}"
-                break
-            fi
-        done
-        if [ -z "${CUDA_RUNTIME_LIB_DIR}" ]; then
-            echo "CUDA 13 runtime libraries are missing from ${CUDA_TOOLKIT_DIR}." >&2
-            exit 2
-        fi
-        # NVIDIA's pip toolkit has lib/libcudart.so.13 but no conventional
-        # lib64/libcudart.so linker name. The multinode launcher creates this
-        # small per-node shim before Ray starts, so SGLang TVM-FFI JIT links.
-        export CUDA_RUNTIME_LIB_DIR
-        export CUDA_RUNTIME_LINK_DIR="${CUDA_RUNTIME_LINK_DIR:-/tmp/unirl-cuda-runtime-${UID}}"
-        CUDA_COMPAT_DIR="${CUDA_COMPAT_DIR:-}"
-        if [ -z "${CUDA_COMPAT_DIR}" ]; then
-            for candidate in \
-                "${REPO_ROOT}"/.cuda-compat-13/usr/local/cuda-13.*/compat \
-                /usr/local/cuda-13.*/compat; do
-                if [ -d "${candidate}" ]; then
-                    CUDA_COMPAT_DIR="${candidate}"
-                    break
-                fi
-            done
-        fi
-        if [ -z "${CUDA_COMPAT_DIR}" ] || [ ! -d "${CUDA_COMPAT_DIR}" ]; then
-            echo "CUDA 13 forward-compat libraries are missing; set CUDA_COMPAT_DIR." >&2
-            exit 2
-        fi
-        export CUDA_COMPAT_DIR
-        export LD_LIBRARY_PATH="${CUDA_COMPAT_DIR}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+        setup_sglang_cuda
         export QWEN3_PATH="${QWEN3_PATH:-${REPO_ROOT}/models/local/Qwen3-4B-Base}"
         export DATA_PATH="${DATA_PATH:-${REPO_ROOT}/data/dapo_math/train.jsonl}"
         export EVAL_DATA_PATH="${EVAL_DATA_PATH:-${REPO_ROOT}/data/dapo_math/aime_eval.jsonl}"
@@ -194,6 +216,21 @@ case "${PROFILE}" in
         require_file "${DATA_PATH}"
         require_file "${EVAL_DATA_PATH}"
         ;;
+    agentic-alfworld)
+        ENTRY=train_agentic_env
+        EXPERIMENT=alfworld/alfworld_grpo
+        setup_agentic_alfworld
+        ;;
+    agentic-alfworld-partial)
+        ENTRY=train_agentic_env_partial
+        EXPERIMENT=alfworld/alfworld_grpo_partial
+        setup_agentic_alfworld
+        ;;
+    agentic-alfworld-async)
+        ENTRY=train_agentic_env_async
+        EXPERIMENT=alfworld/alfworld_grpo_async
+        setup_agentic_alfworld
+        ;;
     *)
         echo "Unknown verification profile: ${PROFILE}" >&2
         exit 2
@@ -208,7 +245,8 @@ fi
 export VENV_DIR
 export PATH="${VENV_DIR}/bin:${PATH}"
 
-if [ "${PROFILE}" = "ar-drpo" ]; then
+case "${PROFILE}" in ar-drpo|agentic-alfworld*) SGLANG_PROFILE=1 ;; *) SGLANG_PROFILE=0 ;; esac
+if [ "${SGLANG_PROFILE}" = "1" ]; then
     require_torch_flavor "2.11.0+cu130"
     require_dist_version "sglang" "0.5.12.post1"
     require_dist_version "nvidia-cuda-nvcc" "13.0.88"
