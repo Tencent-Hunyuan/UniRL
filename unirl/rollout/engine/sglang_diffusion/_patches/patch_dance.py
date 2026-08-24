@@ -37,6 +37,9 @@ def _flow_sde_sampling_with_dance(
     noise_level = float(batch.rollout_noise_level)
     log_prob_no_const = batch.rollout_log_prob_no_const
     debug_mode = bool(getattr(batch, "rollout_debug_mode", False))
+    dtype_roundtrip = bool(getattr(batch, "rollout_dtype_roundtrip", False))
+    # Match the dtype emitted to the next denoising step.
+    emitted_dtype = model_output.dtype
 
     if not log_prob_no_const and sde_type != "ode":
         assert noise_level > 0, "True log-probability computation requires a non-zero noise level."
@@ -134,6 +137,15 @@ def _flow_sde_sampling_with_dance(
 
     else:
         raise ValueError(f"Unsupported sde_type: {sde_type}")
+
+    if dtype_roundtrip:
+        prev_sample = prev_sample.to(dtype=emitted_dtype)
+        if effective_sde_type == "ode":
+            prev_sample_mean = prev_sample
+        elif tuple(prev_sample.shape) != tuple(full_variance_noise.shape):
+            raise RuntimeError("rollout_dtype_roundtrip requires an unsharded SGLang diffusion rollout")
+        else:
+            log_prob_no_const_val = -((prev_sample.float() - prev_sample_mean) ** 2)
 
     reduce_dims = list(range(1, len(log_prob_no_const_val.shape)))
     local_elem_count = log_prob_no_const_val.new_full(

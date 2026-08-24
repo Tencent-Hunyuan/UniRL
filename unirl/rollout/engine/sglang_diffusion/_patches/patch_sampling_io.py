@@ -17,6 +17,7 @@ _SP_INJECT_FIELDS = {
     "initial_noise": (None, "torch.Tensor | None"),
     "initial_audio_noise": (None, "torch.Tensor | None"),
     "denoise_seeds": (None, "list[str] | None"),
+    "rollout_dtype_roundtrip": (False, "bool"),
     "max_sequence_length": (None, "int | None"),
     "return_prompt_embeds": (False, "bool"),
     "return_negative_prompt_embeds": (False, "bool"),

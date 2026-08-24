@@ -64,6 +64,12 @@ class MochiAdapter(ImageAdapter):
 class HunyuanVideoAdapter(VideoAdapter):
     """HunyuanVideo-1.0 T2V with video output and dual text conditions."""
 
+    def build_sampling(self, sample: Sample, *, diffusion: Any) -> Dict[str, Any]:
+        """Score the emitted transition, matching trainside."""
+        kwargs = super().build_sampling(sample, diffusion=diffusion)
+        kwargs["rollout_dtype_roundtrip"] = True
+        return kwargs
+
     def build_condition(self, results: List[RawResult]) -> Dict[str, Any]:
         """Keep HunyuanVideo's LLaMA and pooled-CLIP streams separate."""
         require(bool(results), "HunyuanVideo: cannot build conditions from empty results")
