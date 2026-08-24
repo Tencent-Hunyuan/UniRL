@@ -77,6 +77,11 @@ class AsyncDiffusionTrainer(AsyncRolloutTrainerMixin, DiffusionTrainer):
 
         self._max_inflight = max_inflight
         self._async_reward = bool(async_reward)
+        if self._async_reward and not self._reward_client_on_driver:
+            raise ValueError(
+                "async_reward=true currently requires reward_client_on_driver=true "
+                "(only the driver reward client serves launch_nowait)"
+            )
         self._require_single_generation = True
         self._per_worker_inflight = per_worker_inflight
         self._max_inflight_prompts = self._max_inflight * self.batch_size

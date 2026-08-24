@@ -26,8 +26,7 @@ class _DriverFutureCall:
 class DriverRewardClient:
     """Run a remote HTTP reward client on the driver without a GPU worker."""
 
-    # Handle-compatible layout: the driver reward client represents one scorer,
-    # so trainer DP-geometry checks see dp_size=1 (batch % 1 == 0 always).
+    # Handle-compatible shim: one scorer, so trainer DP-geometry sees dp_size=1.
     dp_size = 1
     world_size = 1
 
@@ -36,10 +35,7 @@ class DriverRewardClient:
         self._pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="driver-reward")
 
     def _score(self, sample: Any) -> Any:
-        # Materialize every TensorRef leaf on the driver (module-level hydrate()
-        # only resolves a bare TensorRef, not one nested in the Sample tree).
-        # Each span round-trips through its bound worker / plasma object_ref
-        # (the launcher's explicit CPU export keeps generated media readable).
+        # Materialize every nested TensorRef leaf on the driver before scoring.
         from unirl.distributed.tensor.ref import TensorRef, map_tree
 
         resolved = map_tree(sample, lambda o: o.materialize(backend=None) if isinstance(o, TensorRef) else o)
@@ -76,7 +72,6 @@ class ChainedRewardCall:
     def __init__(self, rollout_call: Any, reward: Any) -> None:
         self._rollout_call = rollout_call
         self._reward = reward
-        self._sample: Optional[Any] = None
         self._reward_call: Optional[Any] = None
         self._lock = threading.Lock()
 
@@ -87,15 +82,6 @@ class ChainedRewardCall:
             if not block and not self._rollout_call.ready():
                 return False
             sample = self._rollout_call.result()
-            parts = getattr(sample, "parts", None)
-            status = parts[-1].harness_status if parts else None
-            if status == "suspended":
-                # Agentic quiesce owns partial-trajectory carry. Async batch
-                # trainers do not normally produce this state, but preserving it
-                # keeps the wrapper compatible with RolloutManager's contract.
-                self._sample = sample
-                return True
-            self._sample = sample
             self._reward_call = self._reward.launch_nowait("score_and_attach", sample)
             return True
 
@@ -107,17 +93,10 @@ class ChainedRewardCall:
         """True only when the scored Sample can enter the completed queue."""
         if not self.is_capacity_released():
             return False
-        if self._reward_call is None:
-            return True
         return self._reward_call.ready()
 
     def result(self) -> Any:
         self._start_if_ready(block=True)
-        if self._reward_call is None:
-            if self._sample is None:
-                raise RuntimeError("async reward call has neither a reward future nor a passthrough Sample")
-            return self._sample
-
         return self._reward_call.result()
 
     def discard_on_completion(self) -> None:
