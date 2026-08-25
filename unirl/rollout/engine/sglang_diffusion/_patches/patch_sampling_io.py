@@ -109,7 +109,7 @@ _GEN_SENTINEL = "_unirl_diff_gen_index"
 
 
 def _is_per_prompt_condition_image(ci) -> bool:
-    """Whether ``condition_image`` is per-prompt: nesting, not length (1 prompt, N refs = length-1 list)."""
+    """Whether ``condition_image`` is per-prompt: nested for multi-ref, or flat with more than one prompt."""
     if not isinstance(ci, list) or not ci:
         return False
     if all(isinstance(entry, list) for entry in ci):

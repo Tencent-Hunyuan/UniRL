@@ -34,7 +34,10 @@ def _load_condition_images(media_refs: List[Any]) -> Optional[List[Images]]:
             for r in (refs or [])
             if getattr(r, "modality", None) == "image" and getattr(r, "role", None) == "condition"
         ]
-        references = [Image(pixels=TF.to_tensor(PIL.Image.open(r.uri).convert("RGB"))) for r in selected]
+        references = []
+        for ref in selected:
+            with PIL.Image.open(ref.uri) as pil:
+                references.append(Image(pixels=TF.to_tensor(pil.convert("RGB"))))
         images_per_prompt.append(references)
         any_loaded = any_loaded or bool(references)
 
