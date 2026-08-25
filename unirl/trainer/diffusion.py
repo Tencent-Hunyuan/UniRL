@@ -43,11 +43,14 @@ def _run_cleanup_steps(steps: List[Tuple[str, Callable[[], None]]]) -> None:
 def _validate_prompt_tree_dp_geometry(
     *,
     batch_size: int,
-    rollout_dp_size: int,
+    rollout_dp_size: Optional[int],
     reward_dp_size: int,
     context: str,
 ) -> None:
-    for role, dp_size in (("rollout", rollout_dp_size), ("reward", reward_dp_size)):
+    roles = [("reward", reward_dp_size)]
+    if rollout_dp_size is not None:
+        roles.insert(0, ("rollout", rollout_dp_size))
+    for role, dp_size in roles:
         if batch_size % dp_size:
             raise ValueError(
                 f"{context}: {role} dp_size={dp_size} must divide batch_size={batch_size} "
@@ -63,6 +66,7 @@ def _validate_diffusion_dp_geometry(
     rollout_dp_size: int,
     reward_dp_size: int,
     train_dp_size: int,
+    require_rollout_dp_divisibility: bool = True,
 ) -> None:
     """Validate prompt-tree dispatch separately from generated-sample training."""
     values = {
@@ -79,7 +83,7 @@ def _validate_diffusion_dp_geometry(
 
     _validate_prompt_tree_dp_geometry(
         batch_size=batch_size,
-        rollout_dp_size=rollout_dp_size,
+        rollout_dp_size=rollout_dp_size if require_rollout_dp_divisibility else None,
         reward_dp_size=reward_dp_size,
         context="training",
     )
@@ -204,6 +208,8 @@ def _resolve_overrides(overrides: Any, field_names: Set[str]) -> Dict[str, Any]:
 class DiffusionTrainer(BaseTrainer):
     """Reference trainer: train + rollout colocated on the whole pool."""
 
+    _prompt_local_rollout = False
+
     def __init__(
         self,
         *,
@@ -222,6 +228,7 @@ class DiffusionTrainer(BaseTrainer):
         logging_cfg: Optional[DictConfig] = None,
         layout: str = "colocate",
         train_fraction: float = 0.5,
+        worker_max_concurrency: Optional[int | Sequence[int]] = None,
         reward_fraction: float = 0.0,
         enable_fsdp_offload: bool = False,
         offload_train_during_reward: bool = False,
@@ -237,7 +244,11 @@ class DiffusionTrainer(BaseTrainer):
         eval_rewards_cfg: Optional[Any] = None,
         task_config: Optional[Dict[str, Any]] = None,
     ) -> None:
-        super().__init__(cfg=cfg, logging_cfg=logging_cfg)
+        super().__init__(
+            cfg=cfg,
+            logging_cfg=logging_cfg,
+            worker_max_concurrency=worker_max_concurrency,
+        )
         reject_retired_eval_keys(cfg)
         self.batch_size = batch_size
         self._layout = str(layout)
@@ -376,6 +387,7 @@ class DiffusionTrainer(BaseTrainer):
             rollout_dp_size=int(self.rollout.dp_size),
             reward_dp_size=int(self.reward.dp_size) if self.reward is not None else 1,
             train_dp_size=int(self.stack.dp_size),
+            require_rollout_dp_divisibility=not self._prompt_local_rollout,
         )
 
     def _validate_reward_config(self) -> None:

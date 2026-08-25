@@ -198,9 +198,9 @@ sampling:
   trajectory_precision: fp32
   logprob_precision: fp32
   scheduler:
-    _target_: unirl.utils.scheduler_utils.WindowScheduler
+    _target_: unirl.sde.index_schedule.WindowScheduler
     num_timesteps: 7                   # SDE window drawn from the first half of the 14 inference steps
     config:
-      _target_: unirl.utils.scheduler_utils.WindowConfig
+      _target_: unirl.sde.index_schedule.WindowConfig
       strategy: random
       window_size: 3                   # a random contiguous 3-step SDE window per rollout

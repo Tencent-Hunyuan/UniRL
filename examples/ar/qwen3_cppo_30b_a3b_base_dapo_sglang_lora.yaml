@@ -1,0 +1,198 @@
+# @package _global_
+#
+# Single-node (8 x H20) Qwen3-30B-A3B CPPO LoRA-sync recipe using
+# the SGLang HTTP backend with TP=8 / EP=8 rollout.
+#
+# This trains a rank-16 LoRA adapter and sends only that adapter to SGLang's
+# versioned LoRA pool every rollout.  It is therefore intentionally configured
+# with LocalLoraWeightSync, rather than a full-weight sync implementation.
+#
+# Run:
+#   VENV_DIR=/path/to/venv \
+#   QWEN3_PATH=/path/to/Qwen3-30B-A3B-Base \
+#   DATA_PATH=/path/to/dapo_math/train.jsonl \
+#   EVAL_DATA_PATH=/path/to/dapo_math/aime_eval.jsonl \
+#   ENTRY=train_ar bash examples/run_experiment_single_node.sh \
+#     ar/qwen3_cppo_30b_a3b_base_dapo_sglang_lora
+
+# This machine has eight H20s.  Keep the global rollout batch divisible by the
+# FSDP world size; 8 prompts x 16 samples gives 16 trajectories per rank.
+num_devices: 8
+batch_size: 8
+num_rollouts: 800
+weight_sync_interval: 1
+eval_interval: 10
+eval_num_prompts: 16
+eval_batch_size: 8
+eval_samples_per_prompt: 8
+
+# Park the FSDP state on CPU while the colocated SGLang server generates.
+enable_fsdp_offload: true
+
+# CPPO's group-relative, mean-centered advantage from the reference recipe.
+adv_normalization_scope: group
+normalize_adv_by_std: false
+
+logging:
+  # Avoid making a W&B login a prerequisite for the local launch.  Set this to
+  # true (and provide WANDB_ENTITY) when experiment tracking is wanted.
+  report_to_wandb: false
+  project_name: unirl-cppo
+  run_name: cppo_qwen3-30b-a3b-base_dapo_sglang_lora
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: [cppo, qwen3, 30b-a3b-base, dapo, sglang, lora, single-node]
+
+bundle:
+  _target_: unirl.models.qwen3.bundle.Qwen3Bundle.from_config
+  config:
+    _target_: unirl.models.qwen3.config.Qwen3PipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:QWEN3_PATH,Qwen/Qwen3-30B-A3B-Base}
+    # The frozen base stays bf16.  FSDP keeps the small trainable LoRA masters
+    # in fp32 (fsdp_cfg.master_dtype below).
+    model_precision: bf16
+    use_gradient_checkpointing: true
+
+pipeline:
+  _target_: unirl.models.qwen3.pipeline.Qwen3Pipeline.from_bundle
+  enable_thinking: true
+  autocast_precision: bf16
+  logprob_precision: fp32
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  # Qwen3-30B-A3B is MoE, so use its MoE decoder block rather than the dense
+  # Qwen3DecoderLayer wrapper.
+  block_class_names: ["Qwen3MoeDecoderLayer"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    # Keep the LoRA optimizer/master state in fp32 while the frozen model and
+    # forward/backward compute remain bf16.
+    master_dtype: fp32
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true
+    use_torch_compile: false
+    forward_prefetch: false
+    defer_grad_sync: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    # LoRA needs a materially larger LR than the 1e-6 full-FT reference.
+    learning_rate: 1.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 3200 # 800 rollouts x 4 updates per rollout
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 16
+    alpha: 32
+    dropout: 0.0
+    bias: none
+    task_type: CAUSAL_LM
+    target_modules: [q_proj, k_proj, v_proj, o_proj]
+
+rollout:
+  _target_: unirl.rollout.engine.sglang.engine.SGLangRolloutEngine
+  config:
+    _target_: unirl.rollout.engine.sglang.config.SGLangEngineConfig
+    backend: http
+    pretrained_model_ckpt_path: ${oc.env:QWEN3_PATH,Qwen/Qwen3-30B-A3B-Base}
+    # One SGLang server across this node's eight GPUs; SGLang distributes MoE
+    # experts inside the same group.  Rollout TP is HTTP-backend only.
+    tp_size: 8
+    ep_size: 8
+    max_new_tokens: 4096
+    temperature: 1.0
+    top_p: 1.0
+    concurrency: 64
+    samples_pre_expanded: true
+    # The trainer calls sleep/wake around every colocated rollout.  LoRA sync
+    # does not republish the frozen base weights, so preserve them on CPU while
+    # torch-memory-saver releases their GPU backing.
+    enable_memory_saver: true
+    enable_weights_cpu_backup: true
+    skip_server_warmup: false
+    chat_template_kwargs:
+      enable_thinking: true
+    engine_kwargs:
+      # Value used for the reported LoRA run; retune when changing the model,
+      # the TP layout, or the FSDP offload settings above.
+      mem_fraction_static: 0.5
+      attention_backend: triton
+      disable_cuda_graph: false
+      # Graph capture only has to cover this recipe's rollout concurrency; the
+      # SGLang default captures far larger batches and wastes the headroom.
+      cuda_graph_max_bs: 64
+      # SGLang LoRA-pool settings.  LocalLoraWeightSync uploads a new versioned
+      # adapter after each rollout; old versions are evicted by this LRU pool.
+      enable_lora: true
+      max_lora_rank: 16
+      lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
+      max_loaded_loras: 8
+
+# Adapter-only colocated sync.  The engine receives canonical PEFT tensors via
+# set_lora_from_tensors and tags subsequent generation requests with the newest
+# versioned adapter nickname.
+sync:
+  _target_: unirl.distributed.weight_sync.lora.LocalLoraWeightSync
+  param_prefix: ""
+  adapter_name: default
+  verify: false # The SGLang engine exposes no checksum read-back API.
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  # Retain partial-text grading when a response reaches the 4k limit.
+  truncated_reward: keep
+  backend:
+    _target_: unirl.reward.local.mathverify.MathVerifyRewardScorer
+    base_device: cpu
+    config:
+      _target_: unirl.reward.local.mathverify.MathVerifySpec
+
+algorithm:
+  _target_: unirl.algorithms.cppo.CPPO
+  stage_attr: ar
+  cppo_delta: 0.20
+  cppo_w_min: 0.8
+  cppo_delta_b: 0.02
+  loss_agg_mode: seq-mean-token-sum-norm
+  horizon: 4096
+  # Must equal sampling.temperature so replay uses the rollout behavior policy.
+  sampling_temperature: 1.0
+  old_logp_source: rollout
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.qwen3.conditions.Qwen3ARConditions
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 4
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: ${oc.env:DATA_PATH}
+      eval_data_path: ${oc.env:EVAL_DATA_PATH,${oc.env:DATA_PATH}}
+      seed: 42
+    algorithm:
+      prompts_per_rollout: 8
+
+sampling:
+  _target_: unirl.types.sampling.ARSamplingParams
+  samples_per_prompt: 16
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 0
+  max_new_tokens: 4096

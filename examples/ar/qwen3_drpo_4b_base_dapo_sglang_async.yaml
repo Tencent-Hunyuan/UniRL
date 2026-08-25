@@ -13,9 +13,9 @@
 #   EVAL_DATA_PATH=/root/unirl/data/dapo_math/aime_eval.jsonl \
 #   python -m unirl.train_async_ar --config-name=ar/qwen3_drpo_4b_base_dapo_sglang_async num_devices=8
 #
-# DIVISIBILITY (DP_SCATTER): batch_size * samples_per_prompt (512) must be
-# divisible by BOTH slabs. num_devices=8 / train_fraction=0.5 -> 4/4, 512%4==0.
-# num_devices=32 -> 16/16, 512%16==0. train_fraction*num_devices must be integer.
+# DIVISIBILITY: batch_size * samples_per_prompt must divide evenly over the
+# train slab. Prompt-unit rollout dispatch has no rollout-DP divisibility
+# requirement. train_fraction*num_devices must still be an integer.
 
 num_devices: 32
 batch_size: 64 # prompts_per_rollout
@@ -23,8 +23,10 @@ num_rollouts: 800
 
 # Train slab share (rollout gets the rest). 0.5 -> equal split.
 train_fraction: 0.5
-max_inflight: 1          # concurrent generation calls
+max_inflight: 2          # globally admitted batch-equivalents
+per_worker_inflight: 14  # concurrent prompt trees per rollout worker
 weight_sync_interval: 1  # trained batches per publication; also configures the output-version lag filter
+buffer_max_staleness: 2  # maximum allowed rollout-version lag
 
 eval_interval: 10
 adv_normalization_scope: group

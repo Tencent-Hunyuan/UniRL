@@ -199,7 +199,7 @@ sampling:
   seed: 42
   init_same_noise: false
   scheduler:
-    _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+    _target_: unirl.sde.index_schedule.AllSDEScheduler
     num_timesteps: ${..num_inference_steps}
     # feat-branch v1 vllm_omni separate recipe: SDE candidate pool = first 60%
     # of the schedule (steps 0..8 at T=16), then 8 of those are drawn as the

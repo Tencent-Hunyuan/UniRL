@@ -19,6 +19,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 from unirl.rollout.engine.sglang.backends.base import (
     _filter_server_args_or_raise,
     _normalize_cuda_visible_devices,
+    _serialize_lora_tensors,
 )
 
 logger = logging.getLogger(__name__)
@@ -209,11 +210,13 @@ class HTTPBackend:
         base_url: str,
         *,
         concurrency: int,
+        tp_size: int,
         runtime: Dict[str, Any],
     ) -> None:
         self._server_process: Optional[multiprocessing.Process] = server_process
         self._base_url = base_url
         self._concurrency = int(concurrency)
+        self._tp_size = int(tp_size)
         self._rt = runtime
         self._sem = threading.Semaphore(int(concurrency))
         self._logged_first_response = False
@@ -296,7 +299,7 @@ class HTTPBackend:
             getattr(server_args, "nccl_port", None),
             getattr(server_args, "host", None),
         )
-        return cls(process, base_url, concurrency=concurrency, runtime=rt)
+        return cls(process, base_url, concurrency=concurrency, tp_size=tp_size, runtime=rt)
 
     def generate(self, requests: List[Dict[str, Any]]) -> List[_HTTPRawResult]:
         """POST the per-prompt payloads concurrently; flatten prompt-major."""
@@ -548,7 +551,11 @@ class HTTPBackend:
         config_dict: Optional[dict] = None,
     ) -> None:
         """Serialize the LoRA tensor bag and hot-load it on the SRT server."""
-        serialized = self._rt["MultiprocessingSerializer"].serialize(lora_tensors, output_str=True)
+        serialized = _serialize_lora_tensors(
+            lora_tensors,
+            tp_size=self._tp_size,
+            multiprocessing_serializer=self._rt["MultiprocessingSerializer"],
+        )
         self._post_struct(
             "/load_lora_adapter_from_tensors",
             self._rt["LoadLoRAAdapterFromTensorsReqInput"](

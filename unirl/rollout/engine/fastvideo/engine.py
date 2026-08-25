@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import logging
 import os
 import sys
@@ -34,8 +35,63 @@ from unirl.types.segments.latent import make_video_segment
 logger = logging.getLogger(__name__)
 
 
+def _verify_checkpoint_unipc_spec(ckpt_path: str, spec: UniPCSpec) -> None:
+    """Fail closed unless the checkpoint's scheduler_config.json declares the model-owned UniPC solver spec."""
+    checkpoint = Path(ckpt_path).expanduser()
+    if checkpoint.is_dir():
+        path = checkpoint / "scheduler" / "scheduler_config.json"
+    else:
+        try:
+            from huggingface_hub import hf_hub_download
+
+            path = Path(
+                hf_hub_download(
+                    repo_id=ckpt_path,
+                    filename="scheduler/scheduler_config.json",
+                )
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "FastVideo canonical UniPC cannot resolve "
+                f"{ckpt_path!r}/scheduler/scheduler_config.json as either a local "
+                "diffusers-layout checkpoint or a Hugging Face model repo."
+            ) from exc
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            declared_cfg = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"FastVideo canonical UniPC cannot verify model_config.unipc_* without {path}; "
+            "use a diffusers-layout local checkpoint or Hugging Face model repo containing "
+            "scheduler/scheduler_config.json."
+        ) from exc
+    class_name = str(declared_cfg.get("_class_name", ""))
+    if "UniPC" not in class_name:
+        raise RuntimeError(
+            f"Checkpoint scheduler {path} declares _class_name={class_name!r}; the canonical "
+            "FastVideo path requires the checkpoint's native solver to be a UniPC scheduler."
+        )
+    defaults = UniPCSpec()
+    declared = UniPCSpec(
+        solver_order=declared_cfg.get("solver_order", defaults.solver_order),
+        solver_type=declared_cfg.get("solver_type", defaults.solver_type),
+        lower_order_final=declared_cfg.get("lower_order_final", defaults.lower_order_final),
+        disable_corrector=tuple(declared_cfg.get("disable_corrector") or ()),
+    )
+    if declared != spec:
+        hint = (
+            "; the checkpoint's non-empty disable_corrector has no model-config knob"
+            if declared.disable_corrector != spec.disable_corrector
+            else ""
+        )
+        raise RuntimeError(
+            f"Checkpoint scheduler {path} declares {declared}, but model_config.unipc_* spells "
+            f"{spec}; align model_config.unipc_* with the checkpoint scheduler{hint}."
+        )
+
+
 def _resolve_sde_window(raw_indices: Any, num_steps: int) -> List[int]:
-    """Return the canonical SDE segment indices for a request (``None`` spells all-steps SDE)."""
+    """Return sorted SDE step indices; ``None`` → all-steps SDE here but no-SDE trainside (README Gotchas)."""
     if raw_indices is None:
         return list(range(int(num_steps)))
     selected = sorted({int(i) for i in raw_indices})
@@ -93,12 +149,21 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
             "FastVideo canonical UniPC requires the model config to own the solver spec "
             "(unipc_solver_order / unipc_solver_type / unipc_lower_order_final)",
         )
-        # Model-owned solver SSOT; workers verify the checkpoint scheduler against it.
+        # Model-owned solver SSOT, verified against the checkpoint scheduler config below (README: Solver SSOT).
         self._unipc_spec = UniPCSpec(
             solver_order=model_config.unipc_solver_order,
             solver_type=model_config.unipc_solver_type,
             lower_order_final=model_config.unipc_lower_order_final,
         )
+        require(
+            strategy is not None and getattr(strategy, "canonical_name", None) is not None,
+            "FastVideoRolloutEngine requires an injected SDE strategy with a canonical_name; "
+            "set the rollout node's `strategy:` in the recipe (a separate injection from pipeline.strategy)",
+        )
+        self._sde_type = str(strategy.canonical_name)
+        # Probe plan so unsupported kernels (cps/dpm2) fail at init, not per request.
+        FastVideoUniPCPlan(sde_type=self._sde_type, sde_indices=(), spec=self._unipc_spec)
+        _verify_checkpoint_unipc_spec(model_config.pretrained_model_ckpt_path, self._unipc_spec)
         patch_fastvideo_unipc()
         self._build_generator()
 
@@ -279,21 +344,16 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         sp.return_frames = False
         sp.return_trajectory_latents = False
         sp.return_trajectory_decoded = False
-        # Canonical σ are already fully shifted by FlowMatchSchedulePolicy.
-        # FastVideo's adapter patch consumes them verbatim and appends the
-        # terminal zero; no engine-specific shift pre-image is allowed.
+        # Canonical σ verbatim — already shifted; no engine-side transform (README: σ SSOT).
         sp.sigmas = [float(x) for x in sigmas.detach().cpu().to(torch.float32).tolist()[:-1]]
 
-        # Resolve the trainer's exploration window once. The worker dispatches
-        # these indices to the selected SDE kernel and every other index to
-        # canonical UniPC. ``None`` keeps the legacy all-SDE spelling; an
-        # explicit empty list makes the full path deterministic.
+        # ``None`` → all-steps SDE; an explicit empty list → fully deterministic (README Gotchas).
         resolved_sde_indices = _resolve_sde_window(
             getattr(params, "sde_indices", None),
             int(params.num_inference_steps),
         )
         step_plan = FastVideoUniPCPlan(
-            sde_type=str(getattr(self.strategy, "canonical_name", "flow")),
+            sde_type=self._sde_type,
             sde_indices=tuple(resolved_sde_indices),
             spec=self._unipc_spec,
         )
@@ -328,9 +388,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
                     collect_log_probs=bool(self.cfg.native_logprob),
                     store_trajectory=True,
                     keep_trajectory_on_cpu=True,
-                    # Force FastVideo's RL branch through its helper on every
-                    # index. FastVideoUniPCPlan then dispatches selected indices
-                    # to SDE and all remaining indices to canonical UniPC.
+                    # sde_step_indices=None routes every index through the patched helper (README: Solver SSOT).
                     sde_step_indices=None,
                     sde_type=step_plan,
                 ),

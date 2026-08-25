@@ -175,7 +175,7 @@ sampling:
   seed: 42
   init_same_noise: false
   scheduler:
-    _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+    _target_: unirl.sde.index_schedule.AllSDEScheduler
     num_timesteps: ${..num_inference_steps}
     # Candidate pool = first half of the 10-step schedule ([0, 5)); draw four
     # stochastic/trainable steps from those five candidates. This also bounds
