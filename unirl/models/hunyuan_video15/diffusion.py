@@ -79,7 +79,12 @@ class HunyuanVideo15DiffusionStep(DiffusionStep[HunyuanVideo15Bundle, HunyuanVid
             timestep = sigma.expand(batch_size)
         else:
             timestep = sigma
-        timestep = timestep.to(device=device, dtype=dtype) * self.TIMESTEP_SCALE
+        # Diffusers/vLLM form the scheduler timestep in fp32 and only then cast
+        # it to the transformer dtype.  Casting sigma to bf16 first can move a
+        # shifted 10-step schedule by four timestep units (for example,
+        # 0.978260875 becomes 976 instead of 980), sending trainside and
+        # separate-engine rollouts through different transformer forwards.
+        timestep = (timestep.to(device=device, dtype=torch.float32) * self.TIMESTEP_SCALE).to(dtype=dtype)
 
         latent_model_input = torch.cat([sample_cast, cond_latents, cond_mask], dim=1)
 
