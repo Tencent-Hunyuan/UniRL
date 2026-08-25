@@ -62,9 +62,7 @@ def _clone_segment(segment: LatentSegment) -> LatentSegment:
     return LatentSegment(
         latents=segment.latents.detach().clone().requires_grad_(True),
         aux_latents=(
-            segment.aux_latents.detach().clone().requires_grad_(True)
-            if segment.aux_latents is not None
-            else None
+            segment.aux_latents.detach().clone().requires_grad_(True) if segment.aux_latents is not None else None
         ),
         sigmas=segment.sigmas.clone(),
         indices=segment.indices.clone(),
@@ -403,9 +401,7 @@ def test_ltx2_grouped_replay_matches_serial_video_audio_backward(
     conditions = LTX2Conditions(
         text=text,
         negative_text=(
-            TextEmbedCondition(embeds=-text.embeds, attn_mask=text.attn_mask)
-            if guidance_scale > 1.0
-            else None
+            TextEmbedCondition(embeds=-text.embeds, attn_mask=text.attn_mask) if guidance_scale > 1.0 else None
         ),
     )
 
