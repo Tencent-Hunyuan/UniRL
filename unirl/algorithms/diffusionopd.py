@@ -201,6 +201,7 @@ class DiffusionOPD(StageAlgorithm):
             eta=float(getattr(self.params, "eta", 1.0)),
             device=student_means.device,
             add_coefficient=self.add_kl_coefficient,
+            sample_ndim=student_means.ndim,
         )
         kl_per_elem = _gaussian_kl_div(student_f32, teacher_f32, sigma_t)
         kl_per_sample_step = kl_per_elem.mean(dim=tuple(range(2, kl_per_elem.ndim)))  # [B, S']

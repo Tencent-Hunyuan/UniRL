@@ -44,6 +44,7 @@ class HunyuanVideo15Pipeline(Pipeline):
         vision_num_semantic_tokens: int = 729,
         vision_states_dim: int = 1152,
         latent_channels: Optional[int] = None,
+        replay_step_batch_size: int = 1,
     ) -> None:
         super().__init__()
         self.bundle = bundle
@@ -69,6 +70,7 @@ class HunyuanVideo15Pipeline(Pipeline):
                 vision_num_semantic_tokens=vision_num_semantic_tokens,
                 vision_states_dim=vision_states_dim,
                 latent_channels=latent_channels,
+                replay_step_batch_size=replay_step_batch_size,
             )
         self.diffusion = diffusion
         self.vae_decode = vae_decode if vae_decode is not None else HunyuanVideo15VAEDecodeStage(bundle)
@@ -120,6 +122,7 @@ class HunyuanVideo15Pipeline(Pipeline):
             vision_num_semantic_tokens=config.vision_num_semantic_tokens,
             vision_states_dim=config.vision_states_dim,
             latent_channels=config.latent_channels,
+            replay_step_batch_size=config.replay_step_batch_size,
         )
         vae_decode = HunyuanVideo15VAEDecodeStage(bundle)
         return cls(

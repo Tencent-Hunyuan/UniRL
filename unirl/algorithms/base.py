@@ -138,10 +138,14 @@ def _transition_sigma(
     eta: float,
     device: torch.device,
     add_coefficient: bool = True,
+    sample_ndim: int = 5,
 ) -> torch.Tensor:
-    """Per-step SDE transition std ``sigma_t`` for KL normalization, shape ``[1, S', 1, 1, 1]``."""
+    """Per-step SDE transition std, broadcastable to ``[B, S', ...]`` means."""
+    if int(sample_ndim) < 2:
+        raise ValueError(f"_transition_sigma sample_ndim must be >= 2, got {sample_ndim}")
+    output_shape = (1, len(target_steps), *([1] * (int(sample_ndim) - 2)))
     if not add_coefficient:
-        return torch.ones(1, len(target_steps), 1, 1, 1, device=device)
+        return torch.ones(output_shape, device=device)
     if segment.sigmas is None:
         raise ValueError("_transition_sigma requires segment.sigmas (add_coefficient=True).")
     sigmas = segment.sigmas.to(device=device, dtype=torch.float32)
@@ -150,7 +154,7 @@ def _transition_sigma(
     s_next = sigmas[idx + 1]
     sigma_max = sigmas[1] if int(sigmas.shape[0]) > 1 else torch.tensor(0.99, device=device, dtype=sigmas.dtype)
     sigma_t = stage.strategy.transition_std(sigma=s, sigma_next=s_next, eta=float(eta), sigma_max=sigma_max)
-    return sigma_t.reshape(1, -1, 1, 1, 1)
+    return sigma_t.reshape(output_shape)
 
 
 def _reference_replay_means(

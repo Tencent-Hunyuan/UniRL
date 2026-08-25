@@ -63,6 +63,23 @@ and raises if it's `None` — it doesn't compute σ at generate time. Diffusion
 pipelines also implement `latent_shape()` so the trainer can author the
 byte-identical `x_T` recipe.
 
+### Grouped diffusion replay
+
+`BatchedStepReplayMixin` can replay multiple same-shape SDE timesteps as one
+step-major model batch (`[K * B, ...]`). Video stages expose
+`replay_step_batch_size` (`1` disables grouping); values above one bound the
+number of timesteps per forward. Conditions are concatenated in the same
+step-major order, while log-probs and transition means are restored to `[B, S]`
+order before the algorithm computes its loss.
+
+Grouped replay is a dense-batch optimization, not variable-length packing. It
+only runs for stateless `SDEStrategy` implementations and retains the serial
+fallback for other solvers. Because changing forward batch geometry is not
+bit-identical to rollout, the algorithm guard requires
+`old_logp_source: replay` whenever grouping is enabled. WAN 2.2 additionally
+splits chunks at its high/low-noise expert boundary; LTX-2 groups aligned video
+and audio trajectories together.
+
 **Extending it:** a new model is a new `unirl/models/<model>/` with
 `config.py` / `bundle.py` / `diffusion.py`|`ar.py` / `conditions.py` / `pipeline.py`
 mirroring an existing one — there is no registry, models are selected purely by

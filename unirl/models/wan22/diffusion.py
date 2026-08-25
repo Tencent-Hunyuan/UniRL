@@ -7,10 +7,11 @@ from typing import Any, ClassVar, Dict, List, Optional, Set, Tuple
 
 import torch
 
+from unirl.models.types.batched_replay import BatchedStepReplayMixin
 from unirl.models.types.diffusion import DiffusionStage, DiffusionStep
 from unirl.models.types.replay_result import ReplayResult
 from unirl.models.wan21.conditions import WAN21Conditions
-from unirl.sde.kernels import StepStrategy
+from unirl.sde.kernels import SDEStrategy, StepStrategy
 from unirl.types.sampling import DiffusionSamplingParams, compute_trajectory_positions
 from unirl.types.segments.latent import LatentSegment, make_video_segment
 from unirl.utils.dtypes import parse_torch_dtype
@@ -216,7 +217,7 @@ class WAN22DiffusionStep(DiffusionStep[WAN22Bundle, WAN21Conditions]):
         )
 
 
-class WAN22DiffusionStage(DiffusionStage[WAN21Conditions]):
+class WAN22DiffusionStage(BatchedStepReplayMixin, DiffusionStage[WAN21Conditions]):
     """WAN 2.2 T2V rollout-level diffusion stage with dual-transformer routing."""
 
     _no_split_modules: ClassVar[Tuple[str, ...]] = ("WanTransformerBlock",)
@@ -234,6 +235,7 @@ class WAN22DiffusionStage(DiffusionStage[WAN21Conditions]):
         autocast_precision: str = "bf16",
         trajectory_precision: str = "fp16",
         logprob_precision: str = "fp32",
+        replay_step_batch_size: int = 1,
     ) -> None:
         self.model = model
         self.step = step
@@ -241,6 +243,12 @@ class WAN22DiffusionStage(DiffusionStage[WAN21Conditions]):
         self.autocast_dtype = parse_torch_dtype(autocast_precision, field_name="autocast_precision")
         self.trajectory_dtype = parse_torch_dtype(trajectory_precision, field_name="trajectory_precision")
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="logprob_precision")
+        self.replay_step_batch_size = int(replay_step_batch_size)
+        if self.replay_step_batch_size < 1:
+            raise ValueError(
+                f"WAN22DiffusionStage.replay_step_batch_size must be >= 1, got {self.replay_step_batch_size}"
+            )
+        self.batch_replay_steps = self.replay_step_batch_size > 1
         self.vae_scale_factor = self._SPATIAL_DOWNSAMPLE
         self.temporal_scale_factor = self._TEMPORAL_DOWNSAMPLE
         self.latent_channels = int(getattr(getattr(model.vae, "config", None), "z_dim", self._DEFAULT_LATENT_CHANNELS))
@@ -414,6 +422,18 @@ class WAN22DiffusionStage(DiffusionStage[WAN21Conditions]):
             params.guidance_scale_2 if params.guidance_scale_2 is not None else self.model.guidance_scale_2
         )
 
+        if self.batch_replay_steps and len(target) > 1 and isinstance(self.strategy, SDEStrategy):
+            with autocast_ctx:
+                return self._replay_batched_steps(
+                    conditions,
+                    segment=segment,
+                    params=params,
+                    target=target,
+                    sigmas=sigmas,
+                    sigma_max=sigma_max,
+                    device=device,
+                )
+
         log_probs: List[torch.Tensor] = []
         prev_sample_means: List[torch.Tensor] = []
         with autocast_ctx:
@@ -449,6 +469,44 @@ class WAN22DiffusionStage(DiffusionStage[WAN21Conditions]):
         log_probs_t = torch.stack(log_probs, dim=1).to(dtype=self.logprob_dtype)
         means_t = torch.stack(prev_sample_means, dim=1).to(dtype=self.trajectory_dtype) if prev_sample_means else None
         return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
+
+    @staticmethod
+    def _tile_conditions(conditions: WAN21Conditions, repeats: int) -> WAN21Conditions:
+        """Repeat T2V/I2V conditions in step-major order for grouped replay."""
+        return WAN21Conditions.concat([conditions] * repeats)
+
+    def _batched_step_kwargs(self, segment: LatentSegment, params: DiffusionSamplingParams) -> Dict[str, Any]:
+        """Supply the low-noise expert's guidance scale."""
+        del segment
+        guidance_scale_2 = (
+            params.guidance_scale_2 if params.guidance_scale_2 is not None else self.model.guidance_scale_2
+        )
+        return {"guidance_scale_2": guidance_scale_2}
+
+    def _batched_replay_target_chunks(
+        self,
+        *,
+        target: List[int],
+        sigmas: torch.Tensor,
+        params: DiffusionSamplingParams,
+    ) -> List[List[int]]:
+        """Bound chunks without mixing WAN 2.2's high- and low-noise experts."""
+        del params
+        limit = int(self.replay_step_batch_size)
+        routed_runs: List[List[int]] = []
+        current: List[int] = []
+        current_high_noise: Optional[bool] = None
+        for step_idx in target:
+            high_noise = float(sigmas[step_idx].item()) >= float(self.model.boundary_ratio)
+            if current and high_noise != current_high_noise:
+                routed_runs.append(current)
+                current = []
+            if not current:
+                current_high_noise = high_noise
+            current.append(step_idx)
+        if current:
+            routed_runs.append(current)
+        return [run[start : start + limit] for run in routed_runs for start in range(0, len(run), limit)]
 
     def predict_noise_at_step(
         self,

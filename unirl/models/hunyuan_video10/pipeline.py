@@ -42,6 +42,7 @@ class HunyuanVideo10Pipeline(Pipeline):
         clip_max_length: int = 77,
         hidden_state_skip_layer: int = 2,
         latent_channels: Optional[int] = None,
+        replay_step_batch_size: int = 1,
     ) -> None:
         self.bundle = bundle
         self.text_embed = (
@@ -64,6 +65,7 @@ class HunyuanVideo10Pipeline(Pipeline):
                 trajectory_precision=trajectory_precision,
                 logprob_precision=logprob_precision,
                 latent_channels=latent_channels,
+                replay_step_batch_size=replay_step_batch_size,
             )
         self.diffusion = diffusion
         self.vae_decode = vae_decode if vae_decode is not None else HunyuanVideo10VAEDecodeStage(bundle)
@@ -113,6 +115,7 @@ class HunyuanVideo10Pipeline(Pipeline):
             trajectory_precision=config.trajectory_precision,
             logprob_precision=config.logprob_precision,
             latent_channels=config.latent_channels,
+            replay_step_batch_size=config.replay_step_batch_size,
         )
         vae_decode = HunyuanVideo10VAEDecodeStage(bundle)
         return cls(
