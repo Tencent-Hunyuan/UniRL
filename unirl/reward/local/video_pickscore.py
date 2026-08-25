@@ -69,6 +69,7 @@ class VideoPickScoreScorer(PickScoreRewardScorer):
             request = RewardRequest(
                 primitives=dict(request.primitives),
                 generated={"image": Images.from_dense(frame_pixels)},
+                image_references=list(request.image_references),
                 prompt_ids=request.prompt_ids,
                 sample_ids=request.sample_ids,
                 group_ids=request.group_ids,

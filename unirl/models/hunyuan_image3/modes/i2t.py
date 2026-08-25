@@ -32,11 +32,13 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
             f"prompt from sample.conditioning()[0] must be Texts, "
             f"got {type(texts).__name__ if texts is not None else 'None'}"
         )
-    images = next((c for c in conditioning[1:] if isinstance(c, Images)), None)
-    if not isinstance(images, Images):
+    image_inputs = [c for c in conditioning[1:] if isinstance(c, Images)]
+    if len(image_inputs) != 1:
         raise TypeError(
-            "HunyuanImage3Pipeline.generate (i2t): expected a chained Images input in sample.conditioning(), found none"
+            "HunyuanImage3Pipeline.generate (i2t): expected exactly one chained Images input in "
+            f"sample.conditioning(), got {len(image_inputs)}"
         )
+    images = image_inputs[0]
 
     model_cfg: Dict[str, Any] = dict((sample.parts[0].control or {}).get("ar") or {})
     ar_params = HunyuanImage3ARParams(

@@ -145,7 +145,12 @@ class WAN22Pipeline(Pipeline):
                 f"WAN22Pipeline.generate: expected a Texts prompt from sample.conditioning()[0], "
                 f"got {type(texts).__name__ if texts is not None else 'None'}"
             )
-        images_prim = next((c for c in conditioning[1:] if isinstance(c, Images)), None)
+        image_inputs = [c for c in conditioning[1:] if isinstance(c, Images)]
+        if len(image_inputs) > 1:
+            raise ValueError(
+                f"WAN22Pipeline.generate: expected at most one Images conditioning primitive, got {len(image_inputs)}"
+            )
+        images_prim = image_inputs[0] if image_inputs else None
 
         primary_g = float(params.guidance_scale)
         low_g = float(params.guidance_scale_2) if params.guidance_scale_2 is not None else primary_g

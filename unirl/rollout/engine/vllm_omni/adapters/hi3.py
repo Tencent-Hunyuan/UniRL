@@ -230,6 +230,8 @@ class Hi3InputAdapter:
 
         if self.image_input:
             turns, images = sample.vision_conditioning()
+            if len(images) != 1:
+                raise ValueError(f"{self.modality}: expected exactly one Images conditioning batch, got {len(images)}")
             texts = next(t.content for t in turns if isinstance(t.content, Texts))
             pil_images = images[0].to_pils()
         else:
