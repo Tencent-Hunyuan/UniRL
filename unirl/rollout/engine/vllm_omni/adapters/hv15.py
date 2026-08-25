@@ -35,6 +35,9 @@ class Hv15InputAdapter(DitInputAdapter):
     def build_sampling(self, sample: Sample) -> List[StageSampling]:
         sampling = super().build_sampling(sample)
         sampling[0].kwargs["num_frames"] = _num_frames(sample)
+        frontier = sample.frontier_gen_part(DiffusionSamplingParams)
+        extra_args = sampling[0].kwargs.setdefault("extra_args", {})
+        extra_args["denoise_seeds"] = [str(sample_id) for sample_id in frontier.sample_ids]
         return sampling
 
 
