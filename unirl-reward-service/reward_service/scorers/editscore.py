@@ -21,9 +21,10 @@ Package quirks this wrapper absorbs:
   during construction — required whenever the scorer shares a GPU with
   training (trainside) instead of owning the whole card.
 * ``evaluate()`` is per-item (two generate calls per pass: semantic
-  consistency + perceptual quality), so a batch of N items is 2*N*num_pass
-  sequential vLLM calls. Fine for latency-focused trainside DP; batching
-  across items via ``batch_inference`` is a follow-up.
+  consistency + perceptual quality), so a batch of N items would be
+  2*N*num_pass sequential vLLM calls. ``score()`` mirrors its retry and
+  parsing semantics while batching each attempt through ``batch_inference``;
+  rows that still fail fall back to upstream ``evaluate()`` individually.
 """
 
 from __future__ import annotations
@@ -69,8 +70,8 @@ class EditScoreScorer(BaseScorer):
         temperature: float = 0.7,
         seed: int = 42,
         tensor_parallel_size: int = 1,
-        max_model_len: int = 1536,
-        max_num_batched_tokens: int = 1536,
+        max_model_len: int = 8192,
+        max_num_batched_tokens: int = 8192,
         max_num_seqs: int = 32,
         gpu_memory_utilization: float | None = None,
         enable_sleep_mode: bool = False,
@@ -87,8 +88,7 @@ class EditScoreScorer(BaseScorer):
             unknown = set(report_sub_metrics) - set(self.sub_metric_names)
             if unknown:
                 raise ValueError(
-                    f"unknown report_sub_metrics {sorted(unknown)}; "
-                    f"available: {list(self.sub_metric_names)}"
+                    f"unknown report_sub_metrics {sorted(unknown)}; available: {list(self.sub_metric_names)}"
                 )
             # Narrow what score() emits — e.g. ["overall"] gives RL a single
             # scalar instead of averaging four correlated sub-metrics.
@@ -108,7 +108,13 @@ class EditScoreScorer(BaseScorer):
             # scores. Repeat images are guaranteed here (each evaluate() sends
             # the edited image in both the SC and PQ requests), so the cache
             # must be off whenever the engine can sleep.
-            inject.setdefault("mm_processor_cache_gb", 0)
+            inject["mm_processor_cache_gb"] = 0
+            # Prefix-cache metadata has the same frontend/engine lifetime
+            # mismatch across sleep. Other UniRL vLLM sleep-mode recipes
+            # disable it for this reason; override the package's hardcoded
+            # enable_prefix_caching=True rather than letting a caller opt back
+            # into a cache that cannot survive this lifecycle safely.
+            inject["enable_prefix_caching"] = False
 
         backbone_mod = None
         original_llm = None
@@ -173,9 +179,7 @@ class EditScoreScorer(BaseScorer):
         for i, item in enumerate(items):
             try:
                 if len(item.history) < 2:
-                    raise ValueError(
-                        f"EditScore requires 2 history turns (source + edited), got {len(item.history)}"
-                    )
+                    raise ValueError(f"EditScore requires 2 history turns (source + edited), got {len(item.history)}")
                 prompt, source_image = item.history[0]
                 _, edited_image = item.history[1]
                 if source_image is None or edited_image is None:
@@ -188,78 +192,142 @@ class EditScoreScorer(BaseScorer):
         if rows:
             try:
                 scored = self._score_rows_batched(rows) if self._batched else None
-            except Exception:
+            except Exception as exc:
+                if self._is_oom_error(exc):
+                    raise
                 logger.exception("EditScore batched scoring failed; falling back to per-item")
                 scored = None
+            fallback_rows = []
             if scored is not None:
-                for (i, _, _, _), out in zip(rows, scored):
-                    results[i] = out
+                for row, out in zip(rows, scored):
+                    i = row[0]
+                    if out is None:
+                        fallback_rows.append(row)
+                    else:
+                        results[i] = out
             else:
-                for i, prompt, src, edited in rows:
-                    try:
-                        out = self.es.evaluate([src, edited], prompt)
-                        results[i] = {k: float(out[k]) for k in self.sub_metric_names}
-                    except Exception:
-                        logger.exception("EditScore failed to score item %d", i)
-                        results[i] = {k: float("nan") for k in self.sub_metric_names}
+                fallback_rows = rows
+            for i, prompt, src, edited in fallback_rows:
+                try:
+                    out = self.es.evaluate([src, edited], prompt)
+                    results[i] = {k: float(out[k]) for k in self.sub_metric_names}
+                except Exception as exc:
+                    if self._is_oom_error(exc):
+                        raise
+                    logger.exception("EditScore failed to score item %d", i)
+                    results[i] = {k: float("nan") for k in self.sub_metric_names}
         return [r if r is not None else {k: float("nan") for k in self.sub_metric_names} for r in results]
 
-    def _score_rows_batched(self, rows) -> list[dict[str, float]]:
+    @staticmethod
+    def _is_oom_error(exc: BaseException) -> bool:
+        # Keep torch optional at module import time like the other scorer
+        # dependencies; it is present in every environment that can construct
+        # EditScore.
+        import torch
+
+        return isinstance(exc, torch.cuda.OutOfMemoryError)
+
+    def _score_rows_batched(
+        self,
+        rows: list[tuple[int, str, Image.Image, Image.Image]],
+    ) -> list[dict[str, float] | None]:
         """Batched twin of ``EditScore.evaluate``.
 
         The package scores one item at a time (two ``generate`` calls per
         pass), so a rollout's batch is 2*N*num_pass sequential engine round
         trips. Here all SC prompts and all PQ prompts of a pass go through
         ``batch_inference`` as two batched calls and vLLM schedules them
-        concurrently. Parsing, the per-request seed (``seed + pass``), the
-        min-over-heads scaling and the sqrt(SC*PQ) overall compose exactly as
-        in ``evaluate``; items whose output still fails the tolerant parse
-        get the give-up parse, and only then NaN.
+        concurrently. Like ``evaluate``, a parse failure retries generation
+        twice before the third attempt enables the tolerant give-up parser.
+        Parsing, the per-request seed (``seed + pass``), the min-over-heads
+        scaling and the sqrt(SC*PQ) overall compose exactly as upstream.
+        Persistent per-row failures return ``None`` so ``score()`` can retry
+        them through upstream ``evaluate()`` without discarding good rows.
         """
         import numpy as np
         from editscore.utils import mllm_output_to_dict
 
         es = self.es
         scale = self._score_range / 10
-        sc_msgs = [es.model.prepare_input([src, ed], es.SC_prompt.replace("<instruction>", p)) for _, p, src, ed in rows]
+        sc_msgs = [
+            es.model.prepare_input([src, ed], es.SC_prompt.replace("<instruction>", p)) for _, p, src, ed in rows
+        ]
         pq_msgs = [es.model.prepare_input(ed, es.PQ_prompt) for _, _, _, ed in rows]
 
+        refusal = "I'm sorry, but I can't assist with that request."
         per_pass: list[list[dict[str, float] | None]] = []
-        for i in range(self._num_pass):
-            sc_texts = es.model.batch_inference(sc_msgs, seed=self._seed + i)
-            pq_texts = es.model.batch_inference(pq_msgs, seed=self._seed + i)
-            pass_outs: list[dict[str, float] | None] = []
-            for (_, prompt, _, _), sc_text, pq_text in zip(rows, sc_texts, pq_texts):
-                out = None
-                try:
-                    sc = mllm_output_to_dict(sc_text, give_up_parsing=False, text_prompt=prompt, score_range=self._score_range)
-                    pq = mllm_output_to_dict(pq_text, give_up_parsing=False, text_prompt=prompt, score_range=self._score_range)
-                    if sc is False:
-                        sc = mllm_output_to_dict(sc_text, give_up_parsing=True, text_prompt=prompt, score_range=self._score_range)
-                    if pq is False:
-                        pq = mllm_output_to_dict(pq_text, give_up_parsing=True, text_prompt=prompt, score_range=self._score_range)
-                    if isinstance(sc, dict) and isinstance(pq, dict):
+        for pass_index in range(self._num_pass):
+            pass_outs: list[dict[str, float] | None] = [None] * len(rows)
+            pending = list(range(len(rows)))
+            for attempt in range(3):
+                if not pending:
+                    break
+                sc_texts = es.model.batch_inference(
+                    [sc_msgs[idx] for idx in pending],
+                    seed=self._seed + pass_index,
+                )
+                pq_texts = es.model.batch_inference(
+                    [pq_msgs[idx] for idx in pending],
+                    seed=self._seed + pass_index,
+                )
+                if len(sc_texts) != len(pending) or len(pq_texts) != len(pending):
+                    raise RuntimeError(
+                        "EditScore batch_inference returned an unexpected number of outputs: "
+                        f"pending={len(pending)} SC={len(sc_texts)} PQ={len(pq_texts)}"
+                    )
+
+                retry: list[int] = []
+                for row_index, sc_text, pq_text in zip(pending, sc_texts, pq_texts):
+                    prompt = rows[row_index][1]
+                    give_up = attempt == 2 or sc_text == refusal or pq_text == refusal
+                    try:
+                        sc = mllm_output_to_dict(
+                            sc_text,
+                            give_up_parsing=give_up,
+                            text_prompt=prompt,
+                            score_range=self._score_range,
+                        )
+                        pq = mllm_output_to_dict(
+                            pq_text,
+                            give_up_parsing=give_up,
+                            text_prompt=prompt,
+                            score_range=self._score_range,
+                        )
+                        if sc == "rate_limit_exceeded" or pq == "rate_limit_exceeded":
+                            raise RuntimeError("EditScore rate_limit_exceeded")
+                        if not isinstance(sc, dict) or not isinstance(pq, dict):
+                            retry.append(row_index)
+                            continue
                         sc_score = min(sc["score"]) / scale
                         pq_score = min(pq["score"]) / scale
-                        out = {
+                        pass_outs[row_index] = {
                             "prompt_following": sc["score"][0] / scale,
                             "consistency": sc["score"][1] / scale,
                             "perceptual_quality": pq_score,
                             "overall": float(np.sqrt(sc_score * pq_score)),
                         }
-                except Exception:
-                    logger.exception("EditScore batched parse failed for one item")
-                pass_outs.append(out)
+                    except Exception as exc:
+                        if self._is_oom_error(exc):
+                            raise
+                        if attempt < 2:
+                            retry.append(row_index)
+                        else:
+                            logger.exception(
+                                "EditScore batched parse failed after retries for item %d",
+                                rows[row_index][0],
+                            )
+                pending = retry
             per_pass.append(pass_outs)
 
-        merged: list[dict[str, float]] = []
+        merged: list[dict[str, float] | None] = []
         for idx in range(len(rows)):
-            outs = [p[idx] for p in per_pass if p[idx] is not None]
-            if outs:
-                full = {k: float(np.mean([o[k] for o in outs])) for k in outs[0]}
+            outs = [p[idx] for p in per_pass]
+            if all(out is not None for out in outs):
+                valid_outs = [out for out in outs if out is not None]
+                full = {k: float(np.mean([out[k] for out in valid_outs])) for k in valid_outs[0]}
                 merged.append({k: full[k] for k in self.sub_metric_names})
             else:
-                merged.append({k: float("nan") for k in self.sub_metric_names})
+                merged.append(None)
         return merged
 
     def _engine(self):

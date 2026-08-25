@@ -215,6 +215,32 @@ rewards:
       dtype: bfloat16
       rm_head_type: ranknet_multi_head
 
+  # ─────────────── EditScore (image-editing VLM judge) ───────────────
+  # EditScore evaluates the source image, edited image, and instruction via
+  # a Qwen3-VL/Qwen2.5-VL backbone. The official checkpoint is a LoRA; the
+  # scorer merges it into the base model once and reuses cache_dir thereafter.
+  # Commented out because a standalone vLLM judge owns another full GPU. The
+  # managed training recipes instead launch one rank-affine child per trainer.
+  #
+  # - name: editscore
+  #   scorer: editscore
+  #   runtime_env: envs/editscore.txt
+  #   num_replicas: 1
+  #   num_gpus: 1
+  #   num_cpus: 4
+  #   max_concurrency: 1
+  #   params:
+  #     model_name_or_path: Qwen/Qwen3-VL-8B-Instruct
+  #     backbone: qwen3vl_vllm
+  #     lora_path: EditScore/EditScore-Qwen3-VL-8B-Instruct
+  #     cache_dir: /shared/path/EditScore-Qwen3-VL-8B-merged
+  #     score_range: 25
+  #     num_pass: 1
+  #     max_model_len: 8192
+  #     max_num_batched_tokens: 8192
+  #     gpu_memory_utilization: 0.85
+  #     report_sub_metrics: [overall]
+
   # ─────────────── GenEval (compositional) — DISABLED ───────────────
   # Classic GenEval: Mask2Former (mmdet) object detection + CLIP color
   # classification, scoring object count / color / position constraints

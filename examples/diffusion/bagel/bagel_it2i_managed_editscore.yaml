@@ -1,12 +1,12 @@
 # @package _global_
-# BAGEL-7B-MoT image-EDIT GRPO — vLLM-Omni + managed EditReward DP8.
+# BAGEL-7B-MoT image-EDIT GRPO — vLLM-Omni + managed EditScore DP8.
 #
-# The vllm_omni-rollout sibling of examples/diffusion/bagel/bagel_editreward.yaml:
-# identical model / precision / algorithm / data / reward, but generation runs in
-# eight colocated vLLM-Omni worker subprocesses (one per GPU, TP=1 → DP=8) instead
-# of the in-process TrainsideRolloutEngine, and the freshly-trained LoRA is pushed
-# into them each rollout. Train and one environment-isolated EditReward child per
-# rank remain resident; rollout residency is an explicit memory-policy choice.
+# The managed-EditScore sibling of examples/diffusion/bagel/bagel_it2i_vllmomni.yaml:
+# generation runs in eight colocated vLLM-Omni worker subprocesses (one per GPU,
+# TP=1 → DP=8), while one environment-isolated EditScore child per rank hosts a
+# full Qwen3-VL vLLM judge. The rollout engine and judge both use sleep mode;
+# trainer parameters leave the GPU during reward so only the judge is resident
+# while scoring.
 #
 # What it2i adds over bagel_vllmomni.yaml (all handled in unirl/{models,rollout}/bagel):
 #   - modality bagel_it2i — the adapter ships each sample's SOURCE image on the
@@ -32,11 +32,12 @@
 #   export EDITSCORE_PYTHON=/path/to/judge/venv/bin/python   # venv with vllm + editscore
 #   export EDITSCORE_BASE_MODEL=/path/to/Qwen3-VL-8B-Instruct
 #   export EDITSCORE_LORA=/path/to/EditScore-Qwen3-VL-8B-Instruct
+#   export EDITSCORE_MERGED_CACHE=/shared/path/EditScore-Qwen3-VL-8B-merged
 #   export EDITSCORE_SERVICE_ROOT=$PWD/unirl-reward-service
-#   bash examples/run_experiment_single_node.sh diffusion/bagel/bagel_it2i_vllmomni
+#   bash examples/run_experiment_single_node.sh diffusion/bagel/bagel_it2i_managed_editscore
 #
 # Compose check (CPU):  python -m unirl.train_diffusion \
-#   --config-name diffusion/bagel/bagel_it2i_vllmomni --cfg job --resolve
+#   --config-name diffusion/bagel/bagel_it2i_managed_editscore --cfg job --resolve
 # Smoke first — it2i colocate is the tightest memory shape in the family (7B MoT +
 # ViT on the trainer AND a full BAGEL in each worker, plus source-image KV):
 #   override batch_size=8 num_rollouts=2 eval_interval=2 sampling.samples_per_prompt=2
@@ -77,7 +78,7 @@ rollout_sleep_after_generate: true
 logging:
   report_to_wandb: true
   project_name: ${oc.env:WANDB_PROJECT,bagel-editscore}
-  run_name: bagel_it2i_vllmomni_lora
+  run_name: bagel_it2i_managed_editscore_lora
   # entity: set via the WANDB_ENTITY env var (wandb picks it up automatically)
   tags: [bagel, it2i, edit, editscore, lora, vllmomni, fp32master]
   log_media: true              # logs the source|edited side-by-side preview for it2i
@@ -197,7 +198,7 @@ reward:
           lora_path: ${oc.env:EDITSCORE_LORA,EditScore/EditScore-Qwen3-VL-8B-Instruct}
           # cache_dir: point EDITSCORE_MERGED_CACHE at shared storage so the one-time
           # LoRA-merge artifact (~17GB for 8B) is reused across hosts.
-          cache_dir: ${oc.env:EDITSCORE_MERGED_CACHE,null}
+          cache_dir: ${oc.decode:${oc.env:EDITSCORE_MERGED_CACHE,null}}
           score_range: 25
           num_pass: 1
           max_model_len: 8192
@@ -213,7 +214,9 @@ reward:
         batch_size: 8
         request_batch_size: 8
         timeout: 600.0
-        sub_metric_reduce: mean
+        # Only `overall` is emitted; keep first so broadening report_sub_metrics
+        # later cannot silently average correlated EditScore dimensions.
+        sub_metric_reduce: first
         aggregation_method: weighted_sum
         input_kind: image
       gpu_residency: per_call

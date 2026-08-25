@@ -2,7 +2,7 @@
 # editing, served by a vLLM engine inside the managed child's own venv.
 #
 # Install the EditScore package from GitHub:
-#   editscore @ git+https://github.com/TIGER-AI-Lab/EditScore.git
+#   editscore @ git+https://github.com/VectorSpaceLab/EditScore.git
 # The scorer imports `EditScore` from it; no model code is vendored here.
 #
 # The judge is a LoRA on a base VLM. Both are resolved from the recipe
@@ -14,6 +14,7 @@
 # letting pip resolve them independently (a cu130 torch against a CUDA 12.9
 # driver fails at engine start).
 
+editscore @ git+https://github.com/VectorSpaceLab/EditScore.git@4609c5d2ebb62fdebf665d3c924686d896ef1f74
 vllm
 transformers
 torch
