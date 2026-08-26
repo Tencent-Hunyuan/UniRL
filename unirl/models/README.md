@@ -84,10 +84,6 @@ it is the authoritative bundle / pipeline / stage / conditions contract.
   it's `None`; never build the σ tensor inside `generate`.
 - **CFG empty-negative differs per model** (SD3 `""`, Qwen-Image `" "`) — use the
   model's canonical upstream value or the rollout/replay ratio drifts off 1.0.
-- **HunyuanVideo-1.5 prompt-template whitespace is tokenizer state.** Keep
-  `PROMPT_TEMPLATE_SYSTEM_MESSAGE` byte-identical to upstream because
-  `mllm_crop_start=108` is tied to that exact prefix length; collapsing its
-  indentation drops user-prompt tokens.
 - **Work that needs real storage goes through `types/post_materialize.py`.** A
   bundle or a structural injector (LoRA / NFT / mirror) may run while the module
   is still on the meta device, where writing a tensor is a no-op. Register such

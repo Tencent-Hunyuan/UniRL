@@ -191,14 +191,7 @@ class HunyuanVideo15Pipeline(Pipeline):
 
         initial_latents = NoiseRecipe.from_sample(sample).resolve()
 
-        latent_seg = self.diffusion.diffuse(
-            hv_conds,
-            schedule=schedule,
-            params=params,
-            initial_latents=initial_latents,
-            denoise_seed_keys=list(frontier.sample_ids) if initial_latents is not None else None,
-            denoise_base_seed=int(params.seed) if params.seed is not None else 0,
-        )
+        latent_seg = self.diffusion.diffuse(hv_conds, schedule=schedule, params=params, initial_latents=initial_latents)
         videos = self.vae_decode.decode(latent_seg)
 
         filled = frontier.fill(segment=latent_seg, primitives={"video": videos}, conditions=hv_conds.to_dict())

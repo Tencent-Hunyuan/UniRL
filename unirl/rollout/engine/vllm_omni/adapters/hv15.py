@@ -11,10 +11,9 @@ from unirl.rollout.engine.vllm_omni.adapters.dit import DitInputAdapter, DitOutp
 from unirl.rollout.engine.vllm_omni.backends import GenerateCall, OmniRawResult, StageSampling
 from unirl.rollout.engine.vllm_omni.utils import (
     collect_dit_outputs,
-    pick_stage_output,
+    grouped_pils_to_videos,
 )
 from unirl.types.conditions.text import TextEmbedCondition
-from unirl.types.primitives import Video, Videos
 from unirl.types.sample import Sample
 from unirl.types.sampling import DiffusionSamplingParams
 
@@ -36,9 +35,6 @@ class Hv15InputAdapter(DitInputAdapter):
     def build_sampling(self, sample: Sample) -> List[StageSampling]:
         sampling = super().build_sampling(sample)
         sampling[0].kwargs["num_frames"] = _num_frames(sample)
-        frontier = sample.frontier_gen_part(DiffusionSamplingParams)
-        extra_args = sampling[0].kwargs.setdefault("extra_args", {})
-        extra_args["denoise_seeds"] = [str(sample_id) for sample_id in frontier.sample_ids]
         return sampling
 
 
@@ -56,21 +52,12 @@ class Hv15VideoOutputAdapter(DitOutputAdapter):
         "YAML."
     )
 
-    def build_decoded(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Videos:
-        """Build float32 ``[T,C,H,W]`` videos directly from raw ``[-1,1]`` VAE output."""
+    def build_decoded(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Any:
         del sample
-        items: List[Video] = []
-        for outputs in per_request:
-            diff_out = pick_stage_output(outputs, final_output_type=self.final_output_type, stage_id=self.stage_id)
-            if diff_out is None:
-                raise RuntimeError(f"build_response: no video output for modality={self.modality}")
-            decoded = (getattr(diff_out, "custom_output", None) or {}).get("rl_decoded_video")
-            if not torch.is_tensor(decoded) or decoded.ndim != 5 or int(decoded.shape[0]) != 1:
-                shape = None if not torch.is_tensor(decoded) else tuple(decoded.shape)
-                raise RuntimeError(f"build_response: expected raw VAE video [1,C,T,H,W], got {shape}")
-            frames = ((decoded[0].to(torch.float32) + 1.0) / 2.0).clamp(0.0, 1.0)
-            items.append(Video(frames=frames.permute(1, 0, 2, 3).contiguous()))
-        return Videos.from_list(items)
+        _, frame_groups, _ = collect_dit_outputs(
+            per_request, final_output_type=self.final_output_type, stage_id=self.stage_id, modality=self.modality
+        )
+        return grouped_pils_to_videos(frame_groups)
 
     def build_conditions(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
         """Unpack the per-request HV1.5 dual-stream text conditions."""
@@ -125,12 +112,6 @@ class Hv15T2vAdapter(ModelAdapter):
 
     stage_yaml = "hunyuan_video15_t2v_rl.yaml"
     needs_driver_tokenizer = False
-
-    def boot_kwargs(self) -> Dict[str, Any]:
-        """Pin the vLLM diffusion kernel to the trainer's SDPA path."""
-        kwargs = super().boot_kwargs()
-        kwargs["diffusion_attention_backend"] = "TORCH_SDPA"
-        return kwargs
 
     def __init__(self, config: Any, model_config: Any, *, strategy: Any = None, tokenize_fn: Any = None) -> None:
         super().__init__(config, model_config, strategy=strategy, tokenize_fn=tokenize_fn)

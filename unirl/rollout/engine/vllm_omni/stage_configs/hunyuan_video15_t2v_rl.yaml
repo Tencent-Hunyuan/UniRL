@@ -31,9 +31,6 @@ stage_args:
       cache_backend: null
       cache_config: null
       enable_cache_dit_summary: false
-      # Match the trainer's PyTorch SDPA forward path. FlashAttention drift in
-      # the rollout mean is amplified by the narrow SDE transition variance.
-      attention_backend: TORCH_SDPA
       # Required for vLLM to wrap DiT Linear modules in LoRA-aware variants.
       # Without ``enable_lora``, ``add_lora`` still registers the adapter in
       # ``DiffusionLoRAManager._registered_adapters`` (so checksum probes
