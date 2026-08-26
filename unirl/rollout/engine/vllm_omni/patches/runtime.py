@@ -481,6 +481,117 @@ def patch_hv15_qk_rmsnorm() -> None:
     HunyuanVideo15Attention.__init__ = _patched_init
 
 
+def _diffusers_hv15_rotary_embedding(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    image_rotary_emb: tuple[torch.Tensor, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply HunyuanVideo-1.5 RoPE with Diffusers' fp32 frequency arithmetic."""
+    from diffusers.models.embeddings import apply_rotary_emb
+
+    cos, sin = image_rotary_emb
+    cos = cos.repeat_interleave(2, dim=-1)
+    sin = sin.repeat_interleave(2, dim=-1)
+    freqs = (cos, sin)
+    return (
+        apply_rotary_emb(query, freqs, sequence_dim=1),
+        apply_rotary_emb(key, freqs, sequence_dim=1),
+    )
+
+
+def patch_hv15_rotary_embedding() -> None:
+    """Match Diffusers' HunyuanVideo-1.5 RoPE instead of casting frequencies to bf16 for the fused kernel."""
+    import inspect
+
+    import torch.nn.functional as F
+    from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+    from vllm_omni.diffusion.models.hunyuan_video.hunyuan_video_15_transformer import (
+        HunyuanVideo15Attention,
+    )
+
+    original_forward = HunyuanVideo15Attention.forward
+    if getattr(original_forward, "_diffrl_hv15_rotary_embedding", False):
+        return
+
+    expected_parameters = (
+        "self",
+        "hidden_states",
+        "encoder_hidden_states",
+        "attention_mask",
+        "image_rotary_emb",
+    )
+    if tuple(inspect.signature(original_forward).parameters) != expected_parameters:
+        return
+
+    def _patched_forward(
+        self,
+        hidden_states,
+        encoder_hidden_states=None,
+        attention_mask=None,
+        image_rotary_emb=None,
+    ):
+        qkv, _ = self.to_qkv(hidden_states)
+        q_size = self.to_qkv.num_heads * self.head_dim
+        kv_size = self.to_qkv.num_kv_heads * self.head_dim
+        query, key, value = qkv.split([q_size, kv_size, kv_size], dim=-1)
+
+        query = query.unflatten(-1, (self.to_qkv.num_heads, -1))
+        key = key.unflatten(-1, (self.to_qkv.num_kv_heads, -1))
+        value = value.unflatten(-1, (self.to_qkv.num_kv_heads, -1))
+
+        query = self.norm_q(query)
+        key = self.norm_k(key)
+
+        if image_rotary_emb is not None:
+            query, key = _diffusers_hv15_rotary_embedding(query, key, image_rotary_emb)
+
+        if encoder_hidden_states is not None:
+            encoder_qkv, _ = self.add_kv_proj(encoder_hidden_states)
+            add_q_size = self.add_kv_proj.num_heads * self.head_dim
+            add_kv_size = self.add_kv_proj.num_kv_heads * self.head_dim
+            encoder_query, encoder_key, encoder_value = encoder_qkv.split(
+                [add_q_size, add_kv_size, add_kv_size],
+                dim=-1,
+            )
+
+            encoder_query = encoder_query.unflatten(-1, (self.add_kv_proj.num_heads, -1))
+            encoder_key = encoder_key.unflatten(-1, (self.add_kv_proj.num_kv_heads, -1))
+            encoder_value = encoder_value.unflatten(-1, (self.add_kv_proj.num_kv_heads, -1))
+
+            encoder_query = self.norm_added_q(encoder_query)
+            encoder_key = self.norm_added_k(encoder_key)
+
+            query = torch.cat([query, encoder_query], dim=1)
+            key = torch.cat([key, encoder_key], dim=1)
+            value = torch.cat([value, encoder_value], dim=1)
+
+        attn_metadata = None
+        if attention_mask is not None:
+            seq_len = query.shape[1]
+            attention_mask = F.pad(attention_mask, (seq_len - attention_mask.shape[1], 0), value=True)
+            attention_mask = attention_mask.bool()
+            attn_metadata = AttentionMetadata(attn_mask=attention_mask)
+
+        hidden_states = self.attn(query, key, value, attn_metadata)
+        hidden_states = hidden_states.flatten(2, 3)
+        hidden_states = hidden_states.to(query.dtype)
+
+        if encoder_hidden_states is not None:
+            hidden_states, encoder_hidden_states = hidden_states.split_with_sizes(
+                [hidden_states.shape[1] - encoder_hidden_states.shape[1], encoder_hidden_states.shape[1]],
+                dim=1,
+            )
+            hidden_states = self.to_out[0](hidden_states)
+            encoder_hidden_states = self.to_add_out(encoder_hidden_states)
+            return hidden_states, encoder_hidden_states
+
+        hidden_states = self.to_out[0](hidden_states)
+        return hidden_states
+
+    _patched_forward._diffrl_hv15_rotary_embedding = True
+    HunyuanVideo15Attention.forward = _patched_forward
+
+
 def patch_lora_request_passthrough() -> None:
     """Forward ``lora_request`` through ``Omni.generate`` to ``engine.add_request``."""
     try:
@@ -709,6 +820,7 @@ class VLLMOmniHijack:
         patch_ar_merged_lora_fused_tensor()
         patch_fp32_skip()
         patch_hv15_qk_rmsnorm()
+        patch_hv15_rotary_embedding()
         patch_lora_request_passthrough()
         patch_per_request_ar_seed()
         patch_sigmas_passthrough()
@@ -721,6 +833,7 @@ __all__ = [
     "OmniTensorLoRARequest",
     "VLLMOmniHijack",
     "patch_hv15_qk_rmsnorm",
+    "patch_hv15_rotary_embedding",
     "patch_hi3_flow_alignment",
     "patch_per_request_ar_seed",
     "patch_sigmas_passthrough",
