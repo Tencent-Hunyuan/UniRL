@@ -92,3 +92,7 @@ known-invalid adapter.
 - **The pinned diffusion selector ignores `engine_args.attention_backend`.** A
   model adapter that needs a fixed kernel must export
   `DIFFUSION_ATTENTION_BACKEND` through its boot intent before `Omni()` spawns.
+- **HV1.5 reward video must use `custom_output["rl_decoded_video"]`.** The
+  ordinary serving result round-trips the float32 VAE output through 8-bit PIL;
+  the rollout adapter instead applies the trainside `[-1, 1]` to `[0, 1]`
+  normalization directly so PickScore sees the same pixels.

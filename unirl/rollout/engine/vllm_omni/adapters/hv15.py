@@ -11,9 +11,10 @@ from unirl.rollout.engine.vllm_omni.adapters.dit import DitInputAdapter, DitOutp
 from unirl.rollout.engine.vllm_omni.backends import GenerateCall, OmniRawResult, StageSampling
 from unirl.rollout.engine.vllm_omni.utils import (
     collect_dit_outputs,
-    grouped_pils_to_videos,
+    pick_stage_output,
 )
 from unirl.types.conditions.text import TextEmbedCondition
+from unirl.types.primitives import Video, Videos
 from unirl.types.sample import Sample
 from unirl.types.sampling import DiffusionSamplingParams
 
@@ -55,12 +56,21 @@ class Hv15VideoOutputAdapter(DitOutputAdapter):
         "YAML."
     )
 
-    def build_decoded(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Any:
+    def build_decoded(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Videos:
+        """Build float32 ``[T,C,H,W]`` videos directly from raw ``[-1,1]`` VAE output."""
         del sample
-        _, frame_groups, _ = collect_dit_outputs(
-            per_request, final_output_type=self.final_output_type, stage_id=self.stage_id, modality=self.modality
-        )
-        return grouped_pils_to_videos(frame_groups)
+        items: List[Video] = []
+        for outputs in per_request:
+            diff_out = pick_stage_output(outputs, final_output_type=self.final_output_type, stage_id=self.stage_id)
+            if diff_out is None:
+                raise RuntimeError(f"build_response: no video output for modality={self.modality}")
+            decoded = (getattr(diff_out, "custom_output", None) or {}).get("rl_decoded_video")
+            if not torch.is_tensor(decoded) or decoded.ndim != 5 or int(decoded.shape[0]) != 1:
+                shape = None if not torch.is_tensor(decoded) else tuple(decoded.shape)
+                raise RuntimeError(f"build_response: expected raw VAE video [1,C,T,H,W], got {shape}")
+            frames = ((decoded[0].to(torch.float32) + 1.0) / 2.0).clamp(0.0, 1.0)
+            items.append(Video(frames=frames.permute(1, 0, 2, 3).contiguous()))
+        return Videos.from_list(items)
 
     def build_conditions(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
         """Unpack the per-request HV1.5 dual-stream text conditions."""
