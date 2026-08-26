@@ -697,6 +697,13 @@ class DiffusionTrainer(BaseTrainer):
         should_offload_train = (
             self._enable_fsdp_offload and self._layout != "separate" and not self._rollout_is_trainside
         )
+        # offload() ends in an empty_cache, so only a run that keeps the train
+        # state resident needs a separate release before a colocated external
+        # rollout claims physical pages. EMA algorithms are exactly that case:
+        # _validate_residency_config forbids them from offloading here.
+        should_release_cache = (
+            not should_offload_train and self._layout != "separate" and not self._rollout_is_trainside
+        )
         # Swap EMA weights only for trainside rollout; remote engines receive
         # them through weight sync.
         should_swap_ema = self._uses_ema and self._rollout_is_trainside
@@ -713,6 +720,8 @@ class DiffusionTrainer(BaseTrainer):
                 self.weight_sync.extract()
                 train_offload_attempted = True
                 self.backend.offload()
+            if should_release_cache:
+                self.backend.release_cached_memory()
             self.rollout.wake_up()
             if sync_weights and self.weight_sync is not None:
                 if staged_sync:

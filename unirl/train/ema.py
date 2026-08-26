@@ -20,8 +20,8 @@ from unirl.train.lora import (
     _activate,
     _reset_adapter,
     _set_adapter_requires_grad,
-    normalize_module_selection,
     normalize_optional_module_selection,
+    resolve_target_modules_pattern,
 )
 
 logger = logging.getLogger(__name__)
@@ -106,6 +106,7 @@ def inject_nft(
     rank: int,
     alpha: int,
     target_modules: ModuleSelection,
+    module_prefix: str = "",
     exclude_modules: Optional[ModuleSelection] = None,
     default: str = "default",
     shadow: str = "old",
@@ -116,11 +117,19 @@ def inject_nft(
     """Inject dual LoRA adapters for NFT-style EMA.  Returns Shadow."""
     from peft import LoraConfig, inject_adapter_in_model
 
+    # Same subtree scoping as inject_lora: bare suffixes match every subtree that
+    # happens to share them, and for a rollout served by a separate engine that
+    # silently trains adapters the engine has no slot for.
+    peft_target_modules, _ = resolve_target_modules_pattern(
+        target_modules=target_modules,
+        module_prefix=module_prefix,
+    )
+
     peft_cfg = LoraConfig(
         r=int(rank),
         lora_alpha=int(alpha),
         lora_dropout=float(dropout),
-        target_modules=normalize_module_selection(target_modules),
+        target_modules=peft_target_modules,
         exclude_modules=normalize_optional_module_selection(exclude_modules),
         bias=str(bias),
         task_type=str(task_type),

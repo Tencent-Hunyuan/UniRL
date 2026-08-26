@@ -154,6 +154,7 @@ class BaseFSDP2Backend(Remote):
                 rank=ema_lora_cfg.rank,
                 alpha=ema_lora_cfg.alpha,
                 target_modules=ema_lora_cfg.target_modules,
+                module_prefix=ema_lora_cfg.module_prefix,
                 exclude_modules=ema_lora_cfg.exclude_modules,
                 default=ema_lora_cfg.default_adapter,
                 shadow=ema_lora_cfg.shadow_adapter,
@@ -563,6 +564,21 @@ class BaseFSDP2Backend(Remote):
         self._offload_model()
         move_optimizer_state(self.optimizer, "cpu")
         torch.cuda.empty_cache()
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def release_cached_memory(self) -> None:
+        """Hand the caching allocator's free blocks back to the driver.
+
+        A colocated external rollout allocates *physical* pages when it wakes,
+        so blocks that PyTorch has freed but still reserves starve it just as
+        surely as live tensors would. :meth:`offload` already ends in an
+        ``empty_cache``; this is the same release for the runs that keep the
+        train state resident, where the reserve otherwise grows with the first
+        optimizer step's state and never comes back.
+        """
+        from unirl.utils.memory_utils import aggressive_empty_cache
+
+        aggressive_empty_cache()
 
     @staticmethod
     def _find_loss_reduction_mesh(model: nn.Module) -> Optional["DeviceMesh"]:

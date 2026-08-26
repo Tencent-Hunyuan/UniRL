@@ -59,6 +59,7 @@ class EmaLoraConfig:
     alpha: int = 16
     target_modules: Any = ("q_proj", "k_proj", "v_proj", "o_proj")
     exclude_modules: Any = None
+    module_prefix: str = ""
     dropout: float = 0.0
     bias: str = "none"
     task_type: str = "FEATURE_EXTRACTION"
