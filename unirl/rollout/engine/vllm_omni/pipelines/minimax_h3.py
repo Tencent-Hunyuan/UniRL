@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
 from contextlib import nullcontext
 from typing import Any, Optional
 
@@ -20,10 +22,125 @@ from unirl.types.noise_recipe import NoiseRecipe
 from unirl.types.sampling import compute_trajectory_positions
 
 
+def _h3_profile_local_ip() -> str:
+    try:
+        out = subprocess.run(["hostname", "-i"], capture_output=True, text=True, timeout=5).stdout
+        parts = out.split()
+        if parts:
+            return parts[-1]
+    except Exception:
+        pass
+    try:
+        import socket
+
+        return socket.gethostbyname(socket.gethostname())
+    except Exception:
+        return ""
+
+
+class _RolloutProfile:
+    """Env-gated rollout profiling with chrome trace and CUDA memory history."""
+
+    # Enabled only on selected hosts/GPUs. Memory history starts before model
+    # loading so snapshots can attribute resident weight allocations.
+
+    def __init__(self, out_dir: str, host_ip: str, gpu_id: int, max_requests: int) -> None:
+        self.out_dir = out_dir
+        self.host_ip = host_ip
+        self.gpu_id = gpu_id
+        self.max_requests = max_requests
+        self.requests_done = 0
+        self.memory_history_on = False
+        os.makedirs(out_dir, exist_ok=True)
+
+    @staticmethod
+    def from_env() -> Optional["_RolloutProfile"]:
+        out_dir = os.environ.get("H3_ROLLOUT_PROFILE_DIR") or ""
+        if not out_dir:
+            return None
+        first = (os.environ.get("CUDA_VISIBLE_DEVICES") or "").split(",")[0].strip()
+        if not first.isdigit():
+            return None
+        gpu_id = int(first)
+        if gpu_id >= int(os.environ.get("H3_ROLLOUT_PROFILE_MAX_GPU", "4")):
+            return None
+        host_ip = _h3_profile_local_ip()
+        want_host = os.environ.get("H3_ROLLOUT_PROFILE_HOST") or ""
+        if want_host and want_host != host_ip:
+            return None
+        max_requests = int(os.environ.get("H3_ROLLOUT_PROFILE_REQUESTS", "1"))
+        return _RolloutProfile(out_dir, host_ip, gpu_id, max_requests)
+
+    def enable_memory_history(self) -> None:
+        try:
+            torch.cuda.memory._record_memory_history(
+                enabled="all",
+                context="all",
+                stacks="python",
+                max_entries=400000,
+                clear_history=True,
+            )
+            self.memory_history_on = True
+        except Exception as exc:  # pragma: no cover - diagnostics only
+            print(f"[h3-profile] memory history enable failed on {self.tag()}: {exc}", flush=True)
+
+    def tag(self) -> str:
+        # The engine's worker processes share one multi-GPU CUDA_VISIBLE_DEVICES,
+        # so the env-derived gpu_id collides across workers; disambiguate with
+        # the worker's pid and its actually-selected device.
+        try:
+            dev = torch.cuda.current_device()
+        except Exception:
+            dev = self.gpu_id
+        return f"{self.host_ip}_pid{os.getpid()}_dev{dev}"
+
+    def active(self) -> bool:
+        return self.requests_done < self.max_requests
+
+    def request_profiler(self) -> Any:
+        return torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+            record_shapes=False,
+            profile_memory=False,
+            with_stack=False,
+            on_trace_ready=self._export_trace,
+        )
+
+    def _export_trace(self, prof: Any) -> None:
+        path = os.path.join(self.out_dir, f"trace_{self.tag()}_req{self.requests_done}.json")
+        try:
+            prof.export_chrome_trace(path)
+            subprocess.Popen(["gzip", "-f", path])
+            print(f"[h3-profile] trace exported: {path}.gz", flush=True)
+        except Exception as exc:  # pragma: no cover - diagnostics only
+            print(f"[h3-profile] trace export failed on {self.tag()}: {exc}", flush=True)
+
+    def finish_request(self) -> None:
+        self.requests_done += 1
+        if self.requests_done >= self.max_requests and self.memory_history_on:
+            path = os.path.join(self.out_dir, f"memsnap_{self.tag()}.pickle")
+            try:
+                torch.cuda.memory._dump_snapshot(path)
+                print(f"[h3-profile] memory snapshot dumped: {path}", flush=True)
+            except Exception as exc:  # pragma: no cover - diagnostics only
+                print(f"[h3-profile] memory snapshot failed on {self.tag()}: {exc}", flush=True)
+            finally:
+                try:
+                    torch.cuda.memory._record_memory_history(enabled=None)
+                except Exception:
+                    pass
+                self.memory_history_on = False
+
+
 class MiniMaxH3RLPipeline(MiniMaxH3Pipeline):
     """Upstream H3 execution plus deterministic CPS-SDE and sparse replay state."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
+        # Memory history must start before super().__init__ loads weights so
+        # the snapshot pickle can attribute the resident weight allocations.
+        self._h3_profile = _RolloutProfile.from_env()
+        if self._h3_profile is not None:
+            self._h3_profile.enable_memory_history()
         super().__init__(*args, **kwargs)
         # vLLM-Omni's custom-pipeline loader constructs the class directly,
         # bypassing registry.initialize_model(), which normally installs _sp_plan
@@ -40,6 +157,7 @@ class MiniMaxH3RLPipeline(MiniMaxH3Pipeline):
         )
         self._rl_strategy = CPSSDEStrategy()
         self._rl_recipe: Optional[NoiseRecipe] = None
+        self._rl_sde_sample_key = "0"
         self._rl_eta = 0.0
         self._rl_sde_indices: list[int] = []
         self._rl_video_states: list[torch.Tensor] = []
@@ -48,12 +166,15 @@ class MiniMaxH3RLPipeline(MiniMaxH3Pipeline):
         self._rl_video_sigmas: Optional[torch.Tensor] = None
         self._rl_audio_sigmas: Optional[torch.Tensor] = None
         self._rl_text_embeddings: Optional[torch.Tensor] = None
+        self._rl_log_probs: list[torch.Tensor] = []
+        self._rl_video_means: list[torch.Tensor] = []
+        self._rl_capture_transition_means = False
+        self._rl_audio_joint_sde = True
 
     @staticmethod
-    def _recipe_for_request(request: Any) -> NoiseRecipe:
+    def _request_span(request: Any) -> tuple[dict[str, Any], int, int]:
         sampling = request.sampling_params
         extra = getattr(sampling, "extra_args", None) or {}
-        gids = list(extra.get("init_noise_group_ids") or [])
         rid = str(getattr(request, "request_id", "") or "")
         try:
             request_index = int(rid.split("_", 1)[0])
@@ -62,6 +183,12 @@ class MiniMaxH3RLPipeline(MiniMaxH3Pipeline):
         outputs_per_prompt = int(getattr(sampling, "num_outputs_per_prompt", 1) or 1)
         start = request_index * outputs_per_prompt
         end = start + outputs_per_prompt
+        return extra, start, end
+
+    @classmethod
+    def _recipe_for_request(cls, request: Any) -> NoiseRecipe:
+        extra, start, end = cls._request_span(request)
+        gids = list(extra.get("init_noise_group_ids") or [])
         if gids and (start < 0 or end > len(gids)):
             raise IndexError(f"MiniMax-H3 x_T recipe slice [{start}:{end}) exceeds {len(gids)} group ids")
         return NoiseRecipe(
@@ -69,6 +196,20 @@ class MiniMaxH3RLPipeline(MiniMaxH3Pipeline):
             base_seed=int(extra.get("init_noise_seed", 0)),
             latent_shape=tuple(extra["init_noise_latent_shape"]) if extra.get("init_noise_latent_shape") else None,
         )
+
+    @classmethod
+    def _sde_sample_key_for_request(cls, request: Any) -> str:
+        extra, start, end = cls._request_span(request)
+        sample_ids = list(extra.get("sde_sample_ids") or [])
+        if start < 0 or end > len(sample_ids):
+            raise RuntimeError(
+                "MiniMax-H3 training request is missing stable per-sibling SDE identities: "
+                f"slice=[{start}:{end}) available={len(sample_ids)}"
+            )
+        selected = [str(sample_id) for sample_id in sample_ids[start:end]]
+        if len(selected) != 1 or not selected[0]:
+            raise RuntimeError(f"MiniMax-H3 requires exactly one non-empty SDE sample id, got {selected!r}")
+        return selected[0]
 
     def _initial_noise(
         self,
@@ -124,10 +265,10 @@ class MiniMaxH3RLPipeline(MiniMaxH3Pipeline):
             return
         self._rl_trajectory_indices.append(int(index))
         self._rl_video_states.append(
-            video_rows[positive.update_mask_dev].detach().to(device="cpu", dtype=torch.float16)
+            video_rows[positive.update_mask_dev].detach().to(device="cpu", dtype=torch.float32)
         )
         self._rl_audio_states.append(
-            audio_rows[positive.audio_update_mask_dev].detach().to(device="cpu", dtype=torch.float16)
+            audio_rows[positive.audio_update_mask_dev].detach().to(device="cpu", dtype=torch.float32)
         )
 
     def _cps_step(
@@ -140,8 +281,8 @@ class MiniMaxH3RLPipeline(MiniMaxH3Pipeline):
         eta: float,
         generator: list[torch.Generator],
         step_index: int,
-    ) -> torch.Tensor:
-        updated, _, _ = self._rl_strategy.denoise(
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        updated, log_prob, mean = self._rl_strategy.denoise(
             noise_pred=(-velocity).unsqueeze(0),
             sample=sample.unsqueeze(0),
             sigma=torch.tensor(float(sigma), device=sample.device),
@@ -150,7 +291,7 @@ class MiniMaxH3RLPipeline(MiniMaxH3Pipeline):
             generator=generator,
             step_index=int(step_index),
         )
-        return updated[0]
+        return updated[0], log_prob, (mean[0] if mean is not None else None)
 
     def _rl_denoise_loop(
         self,
@@ -224,6 +365,8 @@ class MiniMaxH3RLPipeline(MiniMaxH3Pipeline):
         self._rl_video_states = []
         self._rl_audio_states = []
         self._rl_trajectory_indices = []
+        self._rl_log_probs = []
+        self._rl_video_means = []
         self._rl_video_sigmas = torch.as_tensor(sigmas_video, dtype=torch.float32)
         self._rl_audio_sigmas = torch.as_tensor(sigmas_audio, dtype=torch.float32)
         self._capture_state(
@@ -234,7 +377,7 @@ class MiniMaxH3RLPipeline(MiniMaxH3Pipeline):
             positive=positive,
         )
 
-        sample_id = self._rl_recipe.noise_group_ids[0] if self._rl_recipe and self._rl_recipe.noise_group_ids else "0"
+        sample_id = self._rl_sde_sample_key
 
         try:
             for step_index in range(num_steps):
@@ -263,7 +406,7 @@ class MiniMaxH3RLPipeline(MiniMaxH3Pipeline):
 
                     step_eta = self._rl_eta if step_index in sde_indices else 0.0
                     video_rows = video_rows.clone()
-                    video_rows[update] = self._cps_step(
+                    next_video, video_log_prob, video_mean = self._cps_step(
                         video_rows[update],
                         video_velocity,
                         sigma=video_sigma,
@@ -276,13 +419,15 @@ class MiniMaxH3RLPipeline(MiniMaxH3Pipeline):
                         ),
                         step_index=step_index,
                     )
+                    video_rows[update] = next_video
                     audio_rows = audio_rows.clone()
-                    audio_rows[audio_update] = self._cps_step(
+                    audio_eta = step_eta if self._rl_audio_joint_sde else 0.0
+                    next_audio, audio_log_prob, _ = self._cps_step(
                         audio_rows[audio_update],
                         audio_velocity,
                         sigma=audio_sigma,
                         sigma_next=float(sigmas_audio[step_index + 1]),
-                        eta=step_eta,
+                        eta=audio_eta,
                         generator=make_denoise_step_generators(
                             base_seed=int(self._rl_recipe.base_seed if self._rl_recipe else 0),
                             step_index=step_index,
@@ -290,6 +435,27 @@ class MiniMaxH3RLPipeline(MiniMaxH3Pipeline):
                         ),
                         step_index=step_index,
                     )
+                    audio_rows[audio_update] = next_audio
+                    if step_index in sde_indices:
+                        if video_log_prob is None:
+                            raise RuntimeError(f"MiniMax-H3 CPS step {step_index} produced no video rollout log-prob")
+                        if self._rl_audio_joint_sde and audio_log_prob is None:
+                            raise RuntimeError(f"MiniMax-H3 CPS step {step_index} produced no audio rollout log-prob")
+                        if self._rl_capture_transition_means:
+                            if video_mean is None:
+                                raise RuntimeError(
+                                    f"MiniMax-H3 CPS step {step_index} produced no rollout transition mean"
+                                )
+                            self._rl_video_means.append(video_mean.detach().to(device="cpu", dtype=torch.float32))
+                        policy_log_prob = video_log_prob
+                        if self._rl_audio_joint_sde:
+                            assert audio_log_prob is not None
+                            video_numel = int(video_velocity.numel())
+                            audio_numel = int(audio_velocity.numel())
+                            policy_log_prob = (video_log_prob * video_numel + audio_log_prob * audio_numel) / (
+                                video_numel + audio_numel
+                            )
+                        self._rl_log_probs.append(policy_log_prob.detach().to(device="cpu", dtype=torch.float32))
                     if video_anchor is not None:
                         video_rows[~update] = video_anchor
                     if audio_anchor is not None:
@@ -309,6 +475,16 @@ class MiniMaxH3RLPipeline(MiniMaxH3Pipeline):
 
     @torch.inference_mode()
     def forward(self, request: Any) -> Any:
+        profile = self._h3_profile
+        if profile is not None and profile.active():
+            with profile.request_profiler():
+                try:
+                    return self._forward_impl(request)
+                finally:
+                    profile.finish_request()
+        return self._forward_impl(request)
+
+    def _forward_impl(self, request: Any) -> Any:
         if len(request.prompts) != 1:
             raise ValueError("MiniMaxH3RLPipeline requires one prompt per worker request")
         sampling = request.sampling_params
@@ -316,37 +492,63 @@ class MiniMaxH3RLPipeline(MiniMaxH3Pipeline):
         self._rl_recipe = self._recipe_for_request(request)
         self._rl_eta = float(getattr(sampling, "eta", 0.0) or 0.0)
         self._rl_sde_indices = [int(index) for index in extra.get("sde_indices", [])]
+        # x_T may be shared by group, but policy exploration remains unique per
+        # sibling and reproducible across retries/resume.
+        self._rl_sde_sample_key = self._sde_sample_key_for_request(request) if self._rl_sde_indices else "0"
+        self._rl_audio_joint_sde = bool(extra.get("audio_joint_sde", True))
+        self._rl_capture_transition_means = bool(extra.get("capture_transition_means", False))
         self._rl_text_embeddings = None
 
         original_loop = h3_module.minimax_h3_denoise_loop
         h3_module.minimax_h3_denoise_loop = self._rl_denoise_loop
         try:
             output = super().forward(request)
-            if not self._rl_video_states or self._rl_text_embeddings is None:
-                raise RuntimeError("MiniMax-H3 worker produced no replay trajectory or text embeddings")
-
             video, audio = output.output
-            middle = int(video.shape[2]) // 2
-            reward_frame = video[:, :, middle : middle + 1].detach().to("cpu")
+            reward_num_frames = min(
+                max(1, int(extra.get("reward_num_frames", 9))),
+                int(video.shape[2]),
+            )
+            reward_indices = (
+                torch.linspace(0, int(video.shape[2]) - 1, steps=reward_num_frames, device=video.device).round().long()
+            )
+            reward_video = video.index_select(2, reward_indices).detach().to("cpu")
+            reward_audio = audio[0].transpose(0, 1).contiguous().detach().to(device="cpu", dtype=torch.float32)
             # Current vLLM-Omni serializes only declared DiffusionOutput fields.
             # Its trajectory fields explicitly accept dictionaries, so keep the
             # joint H3 replay payload there rather than on a runtime-only
             # ``custom_output`` attribute that gets dropped at the stage wire.
-            output.trajectory_latents = {
-                "video": torch.stack(self._rl_video_states, dim=0).unsqueeze(0),
-                "audio": torch.stack(self._rl_audio_states, dim=0).unsqueeze(0),
-                "indices": torch.as_tensor(self._rl_trajectory_indices, dtype=torch.long),
-                "text_embeddings": self._rl_text_embeddings.unsqueeze(0),
-                "reward_frame": reward_frame.clamp(0, 1).mul(255).round().to(torch.uint8),
+            payload = {
+                "reward_video": reward_video.clamp(0, 1).mul(255).round().to(torch.uint8),
+                "reward_audio": reward_audio,
             }
-            output.trajectory_timesteps = {
-                "video": self._rl_video_sigmas,
-                "audio": self._rl_audio_sigmas,
-                "sde_indices": torch.as_tensor(self._rl_sde_indices, dtype=torch.long),
-            }
-            output.trajectory_log_probs = None
-            # Avoid sending the full decoded 124-frame video/audio through Omni IPC.
-            output.output = (reward_frame, audio[..., :1].detach().to("cpu"))
+            if self._rl_sde_indices:
+                if not self._rl_video_states or self._rl_text_embeddings is None:
+                    raise RuntimeError("MiniMax-H3 worker produced no replay trajectory or text embeddings")
+                payload.update(
+                    video=torch.stack(self._rl_video_states, dim=0).unsqueeze(0),
+                    audio=torch.stack(self._rl_audio_states, dim=0).unsqueeze(0),
+                    indices=torch.as_tensor(self._rl_trajectory_indices, dtype=torch.long),
+                    text_embeddings=self._rl_text_embeddings.unsqueeze(0),
+                )
+                if self._rl_capture_transition_means:
+                    if len(self._rl_video_means) != len(self._rl_sde_indices):
+                        raise RuntimeError(
+                            "MiniMax-H3 worker transition-mean count mismatch: "
+                            f"means={len(self._rl_video_means)} sde_indices={len(self._rl_sde_indices)}"
+                        )
+                    payload["video_means"] = torch.stack(self._rl_video_means, dim=0).unsqueeze(0)
+                output.trajectory_timesteps = {
+                    "video": self._rl_video_sigmas,
+                    "audio": self._rl_audio_sigmas,
+                    "sde_indices": torch.as_tensor(self._rl_sde_indices, dtype=torch.long),
+                }
+            else:
+                output.trajectory_timesteps = None
+            output.trajectory_latents = payload
+            output.trajectory_log_probs = torch.stack(self._rl_log_probs, dim=1) if self._rl_log_probs else None
+            # Keep the wire payload bounded while preserving temporal and audio
+            # signals for multi-frame/video-audio reward models.
+            output.output = (reward_video, audio[..., :1].detach().to("cpu"))
             return output
         finally:
             h3_module.minimax_h3_denoise_loop = original_loop
