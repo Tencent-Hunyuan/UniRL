@@ -24,6 +24,19 @@ from unirl.models.bagel.vendor.modeling.cache_utils.taylorseer import cache_init
 from tqdm import tqdm
 
 
+def _sequence_lengths(lengths) -> List[int]:
+    if isinstance(lengths, torch.Tensor):
+        return [int(length) for length in lengths.tolist()]
+    return [int(length) for length in lengths]
+
+
+def _apply_by_sequence(module, packed_tensor, lengths):
+    lengths = _sequence_lengths(lengths)
+    if len(lengths) <= 1:
+        return module(packed_tensor)
+    return torch.cat([module(chunk) for chunk in packed_tensor.split(lengths, dim=0)], dim=0)
+
+
 class BagelConfig(PretrainedConfig):
     def __init__(
         self,
@@ -801,9 +814,23 @@ class Bagel(PreTrainedModel):
             raise ValueError(
                 f"timestep must contain one value per latent token, got {tuple(timestep.shape)} for {x_t.shape[0]}"
             )
-        packed_pos_embed = self.latent_pos_embed(packed_vae_position_ids)
-        packed_timestep_embeds = self.time_embedder(timestep)
-        x_t = self.vae2llm(x_t) + packed_timestep_embeds + packed_pos_embed
+        query_lengths = _sequence_lengths(packed_seqlens)
+        latent_lengths = [length - 2 for length in query_lengths]
+        packed_pos_embed = _apply_by_sequence(
+            self.latent_pos_embed,
+            packed_vae_position_ids,
+            latent_lengths,
+        )
+        packed_timestep_embeds = _apply_by_sequence(
+            self.time_embedder,
+            timestep,
+            latent_lengths,
+        )
+        x_t = (
+            _apply_by_sequence(self.vae2llm, x_t, latent_lengths)
+            + packed_timestep_embeds
+            + packed_pos_embed
+        )
         if x_t.dtype != packed_sequence.dtype:
             x_t = x_t.to(packed_sequence.dtype)
         packed_sequence[packed_vae_token_indexes] = x_t
@@ -832,7 +859,11 @@ class Bagel(PreTrainedModel):
             is_causal=False,
             **extra_inputs,
         )
-        v_t = self.llm2vae(output.packed_query_sequence)
+        v_t = _apply_by_sequence(
+            self.llm2vae,
+            output.packed_query_sequence,
+            query_lengths,
+        )
         v_t = v_t[packed_vae_token_indexes]
 
         if cfg_text_scale > 1.0:
@@ -851,7 +882,11 @@ class Bagel(PreTrainedModel):
                 is_causal=False,
                 **extra_inputs,
             )
-            cfg_text_v_t = self.llm2vae(cfg_text_output.packed_query_sequence)
+            cfg_text_v_t = _apply_by_sequence(
+                self.llm2vae,
+                cfg_text_output.packed_query_sequence,
+                query_lengths,
+            )
             cfg_text_v_t = cfg_text_v_t[packed_vae_token_indexes]
 
         if cfg_img_scale > 1.0:
@@ -870,7 +905,11 @@ class Bagel(PreTrainedModel):
                 is_causal=False,
                 **extra_inputs,
             )
-            cfg_img_v_t = self.llm2vae(cfg_img_output.packed_query_sequence)
+            cfg_img_v_t = _apply_by_sequence(
+                self.llm2vae,
+                cfg_img_output.packed_query_sequence,
+                query_lengths,
+            )
             cfg_img_v_t = cfg_img_v_t[packed_vae_token_indexes]
 
         if cfg_text_scale > 1.0:

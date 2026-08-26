@@ -453,9 +453,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
             gi, gi_cfg_text, gi_cfg_img = self._build_generation_inputs(
                 packed_gen, cfg_text, cfg_img, image_shape, device=device
             )
-            forward_kwargs = self._forward_kwargs(
-                packed_gen, cfg_text, cfg_img, gi, gi_cfg_text, gi_cfg_img, params
-            )
+            forward_kwargs = self._forward_kwargs(packed_gen, cfg_text, cfg_img, gi, gi_cfg_text, gi_cfg_img, params)
             x_t = torch.stack([segment.latents_at(i)[0].to(device) for i in target])
             prev_sample = torch.stack([segment.latents_at(i + 1)[0].to(device) for i in target])
             t_cur = torch.stack([schedule[i] for i in target])
