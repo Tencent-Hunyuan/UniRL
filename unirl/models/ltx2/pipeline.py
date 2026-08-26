@@ -234,8 +234,8 @@ class LTX2Pipeline(Pipeline):
             initial_latents=initial_latents,
             initial_audio_latents=initial_audio_latents,
             sde_indices=sde_indices,
-            denoise_seed_keys=[str(sample_id) for sample_id in sample.sample_ids],
-            denoise_base_seed=int(params.seed) if params.seed is not None else 0,
+            denoise_seed_keys=video_recipe.denoise_seed_keys or None,
+            denoise_base_seed=video_recipe.base_seed,
         )
 
         _, latent_t, latent_h, latent_w = self.latent_shape(model_config=self.config, sampling_spec=params)

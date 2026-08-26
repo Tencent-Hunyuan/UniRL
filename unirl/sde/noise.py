@@ -12,17 +12,20 @@ MAX_TORCH_SEED = (1 << 63) - 1
 PROMPT_SEED_PREFIX = "prompt:"
 
 
-def make_prompt_seed_group_id(prompt: str, sample_ordinal: int = 0) -> str:
-    """Encode prompt content and a sibling-sample ordinal into an eval noise group id."""
+def make_prompt_seed_group_id(
+    prompt: str,
+    sample_ordinal: int = 0,
+    *,
+    prompt_id: Optional[str] = None,
+) -> str:
+    """Encode stable prompt identity and sibling ordinal into an eval noise group id."""
     ordinal = int(sample_ordinal)
     if ordinal < 0:
         raise ValueError(f"sample_ordinal must be non-negative, got {ordinal}")
-    payload = json.dumps(
-        {"prompt": str(prompt), "sample": ordinal},
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
+    fields = {"prompt": str(prompt), "sample": ordinal}
+    if prompt_id is not None:
+        fields["prompt_id"] = str(prompt_id)
+    payload = json.dumps(fields, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return f"{PROMPT_SEED_PREFIX}{payload}"
 
 
@@ -32,6 +35,7 @@ def _derive_group_seed(base_seed: int, group_id: str) -> int:
     if gid.startswith(PROMPT_SEED_PREFIX):
         payload = gid[len(PROMPT_SEED_PREFIX) :]
         sample_ordinal = 0
+        prompt_id = None
         try:
             decoded = json.loads(payload)
         except json.JSONDecodeError:
@@ -40,19 +44,22 @@ def _derive_group_seed(base_seed: int, group_id: str) -> int:
             if not isinstance(decoded, dict) or not isinstance(decoded.get("prompt"), str):
                 raise ValueError(f"invalid prompt-seed group id: {gid!r}")
             prompt = decoded["prompt"]
+            prompt_id = decoded.get("prompt_id")
             sample_ordinal = int(decoded.get("sample", 0))
             if sample_ordinal < 0:
                 raise ValueError(f"invalid prompt-seed sample ordinal: {sample_ordinal}")
-        digest = hashlib.sha256(prompt.encode("utf-8")).digest()
+        seed_key = prompt if prompt_id is None else f"{prompt}\0{prompt_id}"
+        digest = hashlib.sha256(seed_key.encode("utf-8")).digest()
         return (int(base_seed) + int.from_bytes(digest[:4], "big") + sample_ordinal) % (2**31)
     payload = f"{int(base_seed)}::{gid}".encode("utf-8")
     digest = hashlib.blake2b(payload, digest_size=8).digest()
     return int.from_bytes(digest, byteorder="big", signed=False) % (MAX_TORCH_SEED + 1)
 
 
-def derive_denoise_step_seed(base_seed: int, step_index: int, sample_id: str) -> int:
+def derive_denoise_step_seed(base_seed: int, step_index: int, sample_id: str, *, salt: str = "") -> int:
     """Derive the cross-engine per-sample, per-step SDE-noise seed."""
-    payload = (f"{int(base_seed)}::step::{int(step_index)}::sample::{str(sample_id)}").encode("utf-8")
+    seed_key = f"{sample_id}::{salt}" if salt else str(sample_id)
+    payload = (f"{int(base_seed)}::step::{int(step_index)}::sample::{seed_key}").encode("utf-8")
     digest = hashlib.blake2b(payload, digest_size=8).digest()
     return int.from_bytes(digest, byteorder="big", signed=False) % MAX_TORCH_SEED
 
@@ -62,8 +69,9 @@ def make_denoise_step_generators(
     base_seed: int,
     step_index: int,
     sample_ids: List[str],
+    salt: str = "",
 ) -> List[torch.Generator]:
-    """Build deterministic CPU generators for one SDE transition."""
+    """Build deterministic CPU generators for one SDE transition and namespace."""
     generators: List[torch.Generator] = []
     for sample_id in sample_ids:
         generator = torch.Generator(device="cpu")
@@ -72,6 +80,7 @@ def make_denoise_step_generators(
                 base_seed=int(base_seed),
                 step_index=int(step_index),
                 sample_id=str(sample_id),
+                salt=salt,
             )
         )
         generators.append(generator)

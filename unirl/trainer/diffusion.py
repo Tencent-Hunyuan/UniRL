@@ -561,6 +561,7 @@ class DiffusionTrainer(BaseTrainer):
     ) -> Sample:
         """Turn a data source batch into a request :class:`Sample`."""
         sp = sampling if sampling is not None else self.sampling_params
+        eval_prompt_ids = list(inputs.parts[0].sample_ids) if sampling is not None else []
         noise_latent_shape = self._eval_noise_latent_shape if sampling is not None else self._noise_latent_shape
         diffusion = sp.get("diffusion")
         sde_indices = diffusion.resolve_sde_indices(rollout_id)
@@ -577,7 +578,7 @@ class DiffusionTrainer(BaseTrainer):
         samples_per_prompt = total_samples_per_prompt(sp)
         request = request.fork(samples_per_prompt, sampling_params=diffusion)
 
-        if sampling is not None and noise_latent_shape is not None:
+        if sampling is not None:
             from unirl.sde.noise import make_prompt_seed_group_id
 
             texts = next((value for value in request.conditioning() if isinstance(value, Texts)), None)
@@ -588,10 +589,18 @@ class DiffusionTrainer(BaseTrainer):
                     f"sample count {len(request.parts[-1].sample_ids)}."
                 )
             noise_group_ids = [
-                make_prompt_seed_group_id(text, sample_ordinal=index % samples_per_prompt)
+                make_prompt_seed_group_id(
+                    text,
+                    sample_ordinal=index % samples_per_prompt,
+                    prompt_id=eval_prompt_ids[index // samples_per_prompt],
+                )
                 for index, text in enumerate(texts.texts)
             ]
-            frontier = dataclasses.replace(request.parts[-1], init_noise_group_ids=noise_group_ids)
+            frontier = dataclasses.replace(
+                request.parts[-1],
+                init_noise_group_ids=noise_group_ids if noise_latent_shape is not None else [],
+                denoise_seed_keys=noise_group_ids,
+            )
             request = request.with_parts([*request.parts[:-1], frontier])
         return request
 

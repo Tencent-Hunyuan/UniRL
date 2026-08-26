@@ -201,23 +201,38 @@ def _patch_sde_logprob_bridge() -> None:
 
         def _run_denoising_step(self, ctx, step, batch, server_args):
             sched = getattr(ctx, "scheduler", None)
-            gen = None
+            audio_sched = getattr(ctx, "audio_scheduler", None)
+            video_gen = None
+            audio_gen = None
             denoise_seeds = getattr(batch, "denoise_seeds", None)
             if getattr(batch, "rollout", False) and denoise_seeds is not None:
                 base_seed = _resolve_base_seed(batch)
                 if base_seed is not None:
-                    gen = _make_step_generators(
+                    video_gen = _make_step_generators(
                         base_seed, int(step.step_index), ctx.latents.device, list(denoise_seeds)
+                    )
+                    audio_gen = _make_step_generators(
+                        base_seed,
+                        int(step.step_index),
+                        ctx.latents.device,
+                        list(denoise_seeds),
+                        salt="audio",
                     )
             if sched is not None:
                 sched._unirl_rollout_batch = batch
-                sched._unirl_rollout_generator = gen
+                sched._unirl_rollout_generator = video_gen
+            if audio_sched is not None:
+                audio_sched._unirl_rollout_batch = batch
+                audio_sched._unirl_rollout_generator = audio_gen
             try:
                 return orig_stage_step(self, ctx, step, batch, server_args)
             finally:
                 if sched is not None:
                     sched._unirl_rollout_batch = None
                     sched._unirl_rollout_generator = None
+                if audio_sched is not None:
+                    audio_sched._unirl_rollout_batch = None
+                    audio_sched._unirl_rollout_generator = None
 
         _run_denoising_step._unirl_ltx2_rollout_sde = True  # type: ignore[attr-defined]
         LTX2DenoisingStage._run_denoising_step = _run_denoising_step
