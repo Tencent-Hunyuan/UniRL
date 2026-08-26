@@ -184,7 +184,7 @@ class LTX2DiffusionStage(BatchedStepReplayMixin, DiffusionStage[LTX2Conditions])
         trajectory_precision: str = "fp16",
         logprob_precision: str = "fp32",
         audio_joint_sde: bool = True,
-        replay_step_batch_size: int = 1,
+        batch_replay_steps: bool = False,
     ) -> None:
         self.bundle = bundle
         self.step_kernel = LTX2DiffusionStep()
@@ -194,12 +194,7 @@ class LTX2DiffusionStage(BatchedStepReplayMixin, DiffusionStage[LTX2Conditions])
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="logprob_precision")
         self.audio_joint_sde = bool(audio_joint_sde)
         self._audio_in_policy = self.audio_joint_sde and bool(getattr(bundle, "has_audio", False))
-        self.replay_step_batch_size = int(replay_step_batch_size)
-        if self.replay_step_batch_size < 1:
-            raise ValueError(
-                f"LTX2DiffusionStage.replay_step_batch_size must be >= 1, got {self.replay_step_batch_size}"
-            )
-        self.batch_replay_steps = self.replay_step_batch_size > 1
+        self.batch_replay_steps = bool(batch_replay_steps)
 
     def trainable_module(self) -> torch.nn.Module:
         """The trainable transformer (for FSDP wrapping)."""
@@ -478,7 +473,7 @@ class LTX2DiffusionStage(BatchedStepReplayMixin, DiffusionStage[LTX2Conditions])
         """Repeat video/audio text conditions in step-major order for grouped replay."""
         return LTX2Conditions.concat([conditions] * repeats)
 
-    def _replay_batched_step_chunk(
+    def _replay_batched_steps(
         self,
         conditions: LTX2Conditions,
         *,
@@ -489,12 +484,12 @@ class LTX2DiffusionStage(BatchedStepReplayMixin, DiffusionStage[LTX2Conditions])
         sigma_max: torch.Tensor,
         device: torch.device,
     ) -> ReplayResult:
-        """Replay one LTX-2 chunk with aligned video and audio trajectories."""
+        """Replay all LTX-2 targets with aligned video and audio trajectories."""
         if segment.aux_latents is None:
             raise ValueError("LTX2 grouped replay requires segment.aux_latents")
         S = len(target)
         if S < 1:
-            raise ValueError("LTX2 grouped replay received an empty target chunk")
+            raise ValueError("LTX2 grouped replay received no targets")
 
         sample_all = torch.cat(
             [segment.latents_at(i).to(device=device, dtype=self.trajectory_dtype) for i in target],

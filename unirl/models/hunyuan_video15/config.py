@@ -25,7 +25,8 @@ class HunyuanVideo15PipelineConfig:
     autocast_precision: str = "bf16"
     trajectory_precision: str = "fp16"
     logprob_precision: str = "fp32"
-    replay_step_batch_size: int = 1
+    batch_replay_steps: bool = False
+    allow_batched_rollout_anchor: bool = False
 
     shift: float = 5.0
 
@@ -51,11 +52,6 @@ class HunyuanVideo15PipelineConfig:
 
     def __post_init__(self) -> None:
         validate_precision_type(self.model_precision, field="HunyuanVideo15PipelineConfig.model_precision")
-        self.replay_step_batch_size = int(self.replay_step_batch_size)
-        if self.replay_step_batch_size < 1:
-            raise ValueError(
-                f"HunyuanVideo15PipelineConfig.replay_step_batch_size must be >= 1, got {self.replay_step_batch_size}"
-            )
 
 
 __all__ = ["HunyuanVideo15PipelineConfig"]

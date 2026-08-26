@@ -168,7 +168,7 @@ def _params(*, guidance_scale: float = 1.0, num_frames: int = 5) -> DiffusionSam
 
 
 def _assert_grouped_matches_serial(
-    stage_factory: Callable[[int], object],
+    stage_factory: Callable[[bool], object],
     conditions,
     *,
     segment: LatentSegment,
@@ -177,8 +177,8 @@ def _assert_grouped_matches_serial(
 ) -> None:
     serial_segment = segment
     grouped_segment = _clone_segment(segment)
-    serial = stage_factory(1)
-    grouped = stage_factory(2)
+    serial = stage_factory(False)
+    grouped = stage_factory(True)
 
     serial_result = serial.replay(conditions, segment=serial_segment, params=params, step_indices=target)
     grouped_result = grouped.replay(conditions, segment=grouped_segment, params=params, step_indices=target)
@@ -207,7 +207,7 @@ def test_dense_video_grouped_replay_matches_serial_forward_and_backward(family: 
             pooled_clip=TextEmbedCondition(embeds=torch.ones(BATCH, 8)),
         )
 
-        def stage_factory(size: int):
+        def stage_factory(grouped: bool):
             bundle = SimpleNamespace(
                 transformer=_VideoTransformer(),
                 vae=SimpleNamespace(config=SimpleNamespace(latent_channels=CHANNELS)),
@@ -217,13 +217,13 @@ def test_dense_video_grouped_replay_matches_serial_forward_and_backward(family: 
                 model=bundle,
                 step=HunyuanVideo10DiffusionStep(),
                 strategy=FlowSDEStrategy(),
-                replay_step_batch_size=size,
+                batch_replay_steps=grouped,
             )
 
     elif family == "hunyuan_video15":
         conditions = HunyuanVideo15Conditions(text_mllm=text, text_glyph=text)
 
-        def stage_factory(size: int):
+        def stage_factory(grouped: bool):
             bundle = SimpleNamespace(
                 transformer=_VideoTransformer(),
                 vae=SimpleNamespace(config=SimpleNamespace(latent_channels=CHANNELS)),
@@ -233,7 +233,7 @@ def test_dense_video_grouped_replay_matches_serial_forward_and_backward(family: 
                 model=bundle,
                 step=HunyuanVideo15DiffusionStep(),
                 strategy=FlowSDEStrategy(),
-                replay_step_batch_size=size,
+                batch_replay_steps=grouped,
                 vision_num_semantic_tokens=4,
                 vision_states_dim=8,
             )
@@ -245,7 +245,7 @@ def test_dense_video_grouped_replay_matches_serial_forward_and_backward(family: 
             image_embed=ImageEmbedCondition(embeds=torch.ones(BATCH, 3, 8)),
         )
 
-        def stage_factory(size: int):
+        def stage_factory(grouped: bool):
             bundle = SimpleNamespace(
                 transformer=_VideoTransformer(),
                 vae=SimpleNamespace(config=SimpleNamespace(z_dim=CHANNELS)),
@@ -255,7 +255,7 @@ def test_dense_video_grouped_replay_matches_serial_forward_and_backward(family: 
                 model=bundle,
                 step=WAN21DiffusionStep(),
                 strategy=FlowSDEStrategy(),
-                replay_step_batch_size=size,
+                batch_replay_steps=grouped,
             )
 
     _assert_grouped_matches_serial(
@@ -267,7 +267,7 @@ def test_dense_video_grouped_replay_matches_serial_forward_and_backward(family: 
     )
 
 
-def test_existing_mixin_user_without_integer_limit_keeps_single_chunk_fast_path() -> None:
+def test_existing_mixin_batches_all_targets_in_one_forward() -> None:
     stage = _GenericBatchedStage()
     segment = _segment((CHANNELS, 2, 2, 2), sde_indices=(0, 1, 2))
     result = stage._replay_batched_steps(
@@ -287,7 +287,7 @@ def test_wan21_grouped_replay_preserves_cfg_batch_order() -> None:
     text = _text()
     conditions = WAN21Conditions(text=text, negative_text=TextEmbedCondition(embeds=-text.embeds))
 
-    def stage_factory(size: int):
+    def stage_factory(grouped: bool):
         bundle = SimpleNamespace(
             transformer=_VideoTransformer(),
             vae=SimpleNamespace(config=SimpleNamespace(z_dim=CHANNELS)),
@@ -297,7 +297,7 @@ def test_wan21_grouped_replay_preserves_cfg_batch_order() -> None:
             model=bundle,
             step=WAN21DiffusionStep(),
             strategy=FlowSDEStrategy(),
-            replay_step_batch_size=size,
+            batch_replay_steps=grouped,
         )
 
     _assert_grouped_matches_serial(
@@ -318,7 +318,7 @@ def test_hunyuan_video15_grouped_replay_preserves_cfg_batch_order() -> None:
         negative_text_glyph=TextEmbedCondition(embeds=-text.embeds, attn_mask=text.attn_mask),
     )
 
-    def stage_factory(size: int):
+    def stage_factory(grouped: bool):
         bundle = SimpleNamespace(
             transformer=_VideoTransformer(),
             vae=SimpleNamespace(config=SimpleNamespace(latent_channels=CHANNELS)),
@@ -328,7 +328,7 @@ def test_hunyuan_video15_grouped_replay_preserves_cfg_batch_order() -> None:
             model=bundle,
             step=HunyuanVideo15DiffusionStep(),
             strategy=FlowSDEStrategy(),
-            replay_step_batch_size=size,
+            batch_replay_steps=grouped,
             vision_num_semantic_tokens=4,
             vision_states_dim=8,
         )
@@ -346,7 +346,7 @@ def test_wan22_splits_grouped_replay_at_expert_boundary() -> None:
     conditions = WAN21Conditions(text=_text())
     route_sigmas = torch.tensor([0.9, 0.7, 0.4, 0.2, 0.1], dtype=torch.float32)
 
-    def stage_factory(size: int):
+    def stage_factory(grouped: bool):
         bundle = SimpleNamespace(
             transformer=_DualTransformer(),
             vae=SimpleNamespace(config=SimpleNamespace(z_dim=CHANNELS)),
@@ -358,7 +358,7 @@ def test_wan22_splits_grouped_replay_at_expert_boundary() -> None:
             model=bundle,
             step=WAN22DiffusionStep(),
             strategy=FlowSDEStrategy(),
-            replay_step_batch_size=size,
+            batch_replay_steps=grouped,
         )
 
     segment = LatentSegment(
@@ -371,8 +371,8 @@ def test_wan22_splits_grouped_replay_at_expert_boundary() -> None:
     )
     serial_segment = segment
     grouped_segment = _clone_segment(segment)
-    serial = stage_factory(1)
-    grouped = stage_factory(3)
+    serial = stage_factory(False)
+    grouped = stage_factory(True)
     target = [0, 1, 2, 3]
     params = DiffusionSamplingParams(num_inference_steps=4, guidance_scale=1.0, eta=0.7)
     serial_result = serial.replay(conditions, segment=serial_segment, params=params, step_indices=target)
@@ -405,13 +405,13 @@ def test_ltx2_grouped_replay_matches_serial_video_audio_backward(
         ),
     )
 
-    def stage_factory(size: int):
+    def stage_factory(grouped: bool):
         bundle = SimpleNamespace(transformer=_LTXTransformer(), has_audio=True)
         return LTX2DiffusionStage(
             bundle,
             strategy=FlowSDEStrategy(),
             audio_joint_sde=audio_joint_sde,
-            replay_step_batch_size=size,
+            batch_replay_steps=grouped,
         )
 
     _assert_grouped_matches_serial(
@@ -421,30 +421,6 @@ def test_ltx2_grouped_replay_matches_serial_video_audio_backward(
         params=_params(guidance_scale=guidance_scale, num_frames=9),
         target=[2, 0],
     )
-
-
-@pytest.mark.parametrize(
-    "stage_factory",
-    [
-        lambda: WAN21DiffusionStage(
-            model=SimpleNamespace(
-                transformer=_VideoTransformer(),
-                vae=SimpleNamespace(config=SimpleNamespace(z_dim=CHANNELS)),
-            ),
-            step=WAN21DiffusionStep(),
-            strategy=FlowSDEStrategy(),
-            replay_step_batch_size=0,
-        ),
-        lambda: LTX2DiffusionStage(
-            SimpleNamespace(transformer=_LTXTransformer(), has_audio=False),
-            strategy=FlowSDEStrategy(),
-            replay_step_batch_size=0,
-        ),
-    ],
-)
-def test_video_replay_step_batch_size_must_be_positive(stage_factory: Callable[[], object]) -> None:
-    with pytest.raises(ValueError, match="replay_step_batch_size must be >= 1"):
-        stage_factory()
 
 
 @pytest.mark.parametrize(
@@ -476,3 +452,5 @@ def test_grouped_video_replay_requires_replay_anchor() -> None:
     with pytest.raises(ValueError, match="old_logp_source='replay'"):
         _require_replay_anchor_for_batched_replay(stage, "rollout", algo="FlowGRPO")
     _require_replay_anchor_for_batched_replay(stage, "replay", algo="FlowGRPO")
+    experimental = SimpleNamespace(batch_replay_steps=True, allow_batched_rollout_anchor=True)
+    _require_replay_anchor_for_batched_replay(experimental, "rollout", algo="FlowGRPO")

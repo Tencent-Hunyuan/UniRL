@@ -200,7 +200,7 @@ class WAN21DiffusionStage(BatchedStepReplayMixin, DiffusionStage[WAN21Conditions
         autocast_precision: str = "bf16",
         trajectory_precision: str = "fp16",
         logprob_precision: str = "fp32",
-        replay_step_batch_size: int = 1,
+        batch_replay_steps: bool = False,
     ) -> None:
         self.model = model
         self.step = step
@@ -208,12 +208,7 @@ class WAN21DiffusionStage(BatchedStepReplayMixin, DiffusionStage[WAN21Conditions
         self.autocast_dtype = parse_torch_dtype(autocast_precision, field_name="autocast_precision")
         self.trajectory_dtype = parse_torch_dtype(trajectory_precision, field_name="trajectory_precision")
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="logprob_precision")
-        self.replay_step_batch_size = int(replay_step_batch_size)
-        if self.replay_step_batch_size < 1:
-            raise ValueError(
-                f"WAN21DiffusionStage.replay_step_batch_size must be >= 1, got {self.replay_step_batch_size}"
-            )
-        self.batch_replay_steps = self.replay_step_batch_size > 1
+        self.batch_replay_steps = bool(batch_replay_steps)
         self.vae_scale_factor = self._SPATIAL_DOWNSAMPLE
         self.temporal_scale_factor = self._TEMPORAL_DOWNSAMPLE
         self.latent_channels = int(getattr(getattr(model.vae, "config", None), "z_dim", self._DEFAULT_LATENT_CHANNELS))

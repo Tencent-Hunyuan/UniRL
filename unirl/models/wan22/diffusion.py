@@ -235,7 +235,7 @@ class WAN22DiffusionStage(BatchedStepReplayMixin, DiffusionStage[WAN21Conditions
         autocast_precision: str = "bf16",
         trajectory_precision: str = "fp16",
         logprob_precision: str = "fp32",
-        replay_step_batch_size: int = 1,
+        batch_replay_steps: bool = False,
     ) -> None:
         self.model = model
         self.step = step
@@ -243,12 +243,7 @@ class WAN22DiffusionStage(BatchedStepReplayMixin, DiffusionStage[WAN21Conditions
         self.autocast_dtype = parse_torch_dtype(autocast_precision, field_name="autocast_precision")
         self.trajectory_dtype = parse_torch_dtype(trajectory_precision, field_name="trajectory_precision")
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="logprob_precision")
-        self.replay_step_batch_size = int(replay_step_batch_size)
-        if self.replay_step_batch_size < 1:
-            raise ValueError(
-                f"WAN22DiffusionStage.replay_step_batch_size must be >= 1, got {self.replay_step_batch_size}"
-            )
-        self.batch_replay_steps = self.replay_step_batch_size > 1
+        self.batch_replay_steps = bool(batch_replay_steps)
         self.vae_scale_factor = self._SPATIAL_DOWNSAMPLE
         self.temporal_scale_factor = self._TEMPORAL_DOWNSAMPLE
         self.latent_channels = int(getattr(getattr(model.vae, "config", None), "z_dim", self._DEFAULT_LATENT_CHANNELS))
@@ -483,16 +478,18 @@ class WAN22DiffusionStage(BatchedStepReplayMixin, DiffusionStage[WAN21Conditions
         )
         return {"guidance_scale_2": guidance_scale_2}
 
-    def _batched_replay_target_chunks(
+    def _replay_batched_steps(
         self,
+        conditions: WAN21Conditions,
         *,
+        segment: LatentSegment,
+        params: DiffusionSamplingParams,
         target: List[int],
         sigmas: torch.Tensor,
-        params: DiffusionSamplingParams,
-    ) -> List[List[int]]:
-        """Bound chunks without mixing WAN 2.2's high- and low-noise experts."""
-        del params
-        limit = int(self.replay_step_batch_size)
+        sigma_max: torch.Tensor,
+        device: torch.device,
+    ) -> ReplayResult:
+        """Replay all targets, splitting only at WAN 2.2 expert boundaries."""
         routed_runs: List[List[int]] = []
         current: List[int] = []
         current_high_noise: Optional[bool] = None
@@ -506,7 +503,31 @@ class WAN22DiffusionStage(BatchedStepReplayMixin, DiffusionStage[WAN21Conditions
             current.append(step_idx)
         if current:
             routed_runs.append(current)
-        return [run[start : start + limit] for run in routed_runs for start in range(0, len(run), limit)]
+
+        replay_group = super()._replay_batched_steps
+        results = [
+            replay_group(
+                conditions,
+                segment=segment,
+                params=params,
+                target=run,
+                sigmas=sigmas,
+                sigma_max=sigma_max,
+                device=device,
+            )
+            for run in routed_runs
+        ]
+        if len(results) == 1:
+            return results[0]
+        log_probs = torch.cat([result.log_probs for result in results], dim=1)
+        means = [result.prev_sample_means for result in results]
+        if any(mean is None for mean in means):
+            if not all(mean is None for mean in means):
+                raise RuntimeError("WAN22 grouped replay returned means for only some expert groups")
+            prev_sample_means = None
+        else:
+            prev_sample_means = torch.cat([mean for mean in means if mean is not None], dim=1)
+        return ReplayResult(log_probs=log_probs, prev_sample_means=prev_sample_means)
 
     def predict_noise_at_step(
         self,

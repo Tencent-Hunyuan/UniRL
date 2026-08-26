@@ -198,7 +198,8 @@ class HunyuanVideo10DiffusionStage(BatchedStepReplayMixin, DiffusionStage[Hunyua
         spatial_compression_ratio: Optional[int] = None,
         temporal_compression_ratio: Optional[int] = None,
         latent_channels: Optional[int] = None,
-        replay_step_batch_size: int = 1,
+        batch_replay_steps: bool = False,
+        allow_batched_rollout_anchor: bool = False,
     ) -> None:
         self.model = model
         self.step = step
@@ -206,12 +207,8 @@ class HunyuanVideo10DiffusionStage(BatchedStepReplayMixin, DiffusionStage[Hunyua
         self.autocast_dtype = parse_torch_dtype(autocast_precision, field_name="autocast_precision")
         self.trajectory_dtype = parse_torch_dtype(trajectory_precision, field_name="trajectory_precision")
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="logprob_precision")
-        self.replay_step_batch_size = int(replay_step_batch_size)
-        if self.replay_step_batch_size < 1:
-            raise ValueError(
-                f"HunyuanVideo10DiffusionStage.replay_step_batch_size must be >= 1, got {self.replay_step_batch_size}"
-            )
-        self.batch_replay_steps = self.replay_step_batch_size > 1
+        self.batch_replay_steps = bool(batch_replay_steps)
+        self.allow_batched_rollout_anchor = bool(allow_batched_rollout_anchor)
 
         vae = model.vae
         if spatial_compression_ratio is None:

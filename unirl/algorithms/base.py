@@ -216,13 +216,15 @@ def _require_replay_anchor_for_batched_replay(stage: Any, old_logp_source: str, 
     """Reject ``batch_replay_steps`` paired with a rollout-sourced π_old anchor."""
     if not getattr(stage, "batch_replay_steps", False):
         return
-    if old_logp_source != "replay":
+    allow_rollout_anchor = bool(getattr(stage, "allow_batched_rollout_anchor", False))
+    if old_logp_source != "replay" and not allow_rollout_anchor:
         raise ValueError(
             f"{algo}: pipeline.batch_replay_steps=True requires old_logp_source='replay', "
             f"got {old_logp_source!r}. The batched replay path is numerically equivalent to "
             f"the serial one but not bit-identical to the rollout forward, so a "
             f"rollout-sourced anchor puts the PPO ratio outside clip_range. Set "
-            f"old_logp_source='replay', or disable pipeline.batch_replay_steps."
+            f"old_logp_source='replay', disable pipeline.batch_replay_steps, or explicitly "
+            f"opt into the experimental rollout-anchor path."
         )
 
 
