@@ -85,3 +85,6 @@ known-invalid adapter.
 - **Every patch needs a DELETE-WHEN row.** Without one it is permanent by default.
 - **`patch_hi3_flow_alignment` self-skips on newer pins** — it is dead code, not a
   live patch, once the pin moves past v0.20.0.
+- **The pinned diffusion selector ignores `engine_args.attention_backend`.** A
+  model adapter that needs a fixed kernel must export
+  `DIFFUSION_ATTENTION_BACKEND` through its boot intent before `Omni()` spawns.
