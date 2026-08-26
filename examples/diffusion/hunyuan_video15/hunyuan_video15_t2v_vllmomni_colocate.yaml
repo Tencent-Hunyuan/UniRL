@@ -16,11 +16,9 @@
 #   - rollout enable_sleep_mode false -> true: colocate time-shares the GPU, so
 #     the engine must sleep (release GPU memory) while the trainer runs and wake
 #     to generate.
-#   - sync NCCLWeightSync -> TensorWeightSync: fold the trained LoRA into the
-#     bf16 transformer weights before each colocated update. This follows the
-#     validated HunyuanVideo alignment path: rollout and trainer both execute
-#     ordinary transformer linears instead of comparing vLLM's online-LoRA
-#     kernel with PEFT's train-side LoRA forward.
+#   - sync NCCLWeightSync -> LocalLoraWeightSync: update the co-located adapter
+#     in-process while preserving PEFT's separate base + low-rank arithmetic.
+#     Folding each update into bf16 base weights changes the rollout forward.
 #   - algorithm.old_logp_source: rollout — preserve the sampler's emitted
 #     trajectory density as the frozen policy anchor. Replaying the anchor on
 #     the trainer pins the first ratio to one and hides rollout/replay drift.
@@ -145,10 +143,9 @@ reward:
 algorithm:
   _target_: unirl.algorithms.flowgrpo.FlowGRPO
   stage_attr: diffusion
-  # Keep the actual rollout policy as π_old. With merged full-weight sync the
-  # rollout and replay forwards use ordinary transformer weights, and a
-  # non-unit first-update ratio remains an explicit alignment signal instead
-  # of being hidden by a trainer-recomputed anchor.
+  # Keep the actual rollout policy as π_old. A non-unit first-update ratio
+  # remains an explicit alignment signal instead of being hidden by a
+  # trainer-recomputed anchor.
   old_logp_source: rollout
   clip_range: 1.0e-4
   clip_schedule: constant
@@ -206,13 +203,10 @@ sampling:
     timestep_fraction: [0.0, 0.6]
     num_sde_steps: 8
 
-# LoRA → merged full-weight sync → colocated vLLM-Omni rollout. TensorWeightSync
-# uses UniRL's in-tree tensor serializer for vLLM-Omni, so this path has no
-# SGLang runtime dependency. Folding the adapter removes the online-LoRA
-# inference kernel from the numerical comparison with train-side PEFT replay.
+# Keep LoRA updates separate from the bf16 base weights so vLLM-Omni executes
+# the same base + adapter ordering as PEFT replay.
 sync:
-  _target_: unirl.distributed.weight_sync.full.tensor.TensorWeightSync
-  lora_merged: true
-  bucket_size_mb: 512
-  flush_cache: true
-  name_remap: {"*": "transformer.*"}
+  _target_: unirl.distributed.weight_sync.lora.local.LocalLoraWeightSync
+  verify: true
+  param_prefix: "transformer."
+  adapter_name: default

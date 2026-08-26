@@ -481,6 +481,72 @@ def patch_hv15_qk_rmsnorm() -> None:
     HunyuanVideo15Attention.__init__ = _patched_init
 
 
+def patch_hv15_sdpa_attention_mask() -> None:
+    """Keep the Diffusers HV1.5 boolean SDPA mask instead of dropping an all-true mask."""
+    try:
+        from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
+        from vllm_omni.diffusion.models.hunyuan_video.hunyuan_video_15_transformer import (
+            HunyuanVideo15Attention,
+        )
+    except (ImportError, AttributeError):
+        return
+
+    original_init = HunyuanVideo15Attention.__init__
+    if getattr(original_init, "_diffrl_hv15_sdpa_attention_mask", False):
+        return
+
+    def _patched_init(self, *args, _orig=original_init, **kwargs):
+        _orig(self, *args, **kwargs)
+
+        for implementation in (self.attn.attention, self.attn.sdpa_fallback):
+            if not isinstance(implementation, SDPAImpl):
+                continue
+            original_forward = implementation._forward_impl
+            if getattr(original_forward, "_diffrl_hv15_sdpa_attention_mask", False):
+                continue
+
+            def _patched_forward(
+                layer,
+                query,
+                key,
+                value,
+                attn_metadata=None,
+                mask_mode="broadcast_k",
+                _orig_forward=original_forward,
+            ):
+                attention_mask = None if attn_metadata is None else attn_metadata.attn_mask
+                if (
+                    attention_mask is None
+                    or attention_mask.ndim != 2
+                    or query.shape[1] != key.shape[1]
+                    or attention_mask.shape != (query.shape[0], key.shape[1])
+                ):
+                    return _orig_forward(query, key, value, attn_metadata, mask_mode)
+
+                batch_size, sequence_length = attention_mask.shape
+                attention_mask = attention_mask.bool().view(batch_size, 1, 1, sequence_length)
+                attention_mask = attention_mask.repeat(1, 1, sequence_length, 1)
+                attention_mask = (attention_mask & attention_mask.transpose(2, 3)).bool()
+
+                query, key, value = (tensor.permute(0, 2, 1, 3) for tensor in (query, key, value))
+                output = torch.nn.functional.scaled_dot_product_attention(
+                    query,
+                    key,
+                    value,
+                    attn_mask=attention_mask,
+                    dropout_p=0.0,
+                    is_causal=layer.causal,
+                    scale=layer.softmax_scale,
+                )
+                return output.permute(0, 2, 1, 3)
+
+            _patched_forward._diffrl_hv15_sdpa_attention_mask = True
+            implementation._forward_impl = MethodType(_patched_forward, implementation)
+
+    _patched_init._diffrl_hv15_sdpa_attention_mask = True
+    HunyuanVideo15Attention.__init__ = _patched_init
+
+
 def _diffusers_hv15_rotary_embedding(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -820,6 +886,7 @@ class VLLMOmniHijack:
         patch_ar_merged_lora_fused_tensor()
         patch_fp32_skip()
         patch_hv15_qk_rmsnorm()
+        patch_hv15_sdpa_attention_mask()
         patch_hv15_rotary_embedding()
         patch_lora_request_passthrough()
         patch_per_request_ar_seed()
@@ -833,6 +900,7 @@ __all__ = [
     "OmniTensorLoRARequest",
     "VLLMOmniHijack",
     "patch_hv15_qk_rmsnorm",
+    "patch_hv15_sdpa_attention_mask",
     "patch_hv15_rotary_embedding",
     "patch_hi3_flow_alignment",
     "patch_per_request_ar_seed",
