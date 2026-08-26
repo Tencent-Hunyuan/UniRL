@@ -25,6 +25,7 @@
 num_devices: 8
 batch_size: 8
 num_rollouts: 10000
+adv_use_global_std: true
 
 logging:
   report_to_wandb: true
@@ -119,7 +120,7 @@ backend:
     root_wrap: false
   optimizer_cfg:
     _target_: unirl.train.backend.base.OptimizerConfig
-    learning_rate: 1.0e-4
+    learning_rate: 3.0e-4
     adam_beta1: 0.9
     adam_beta2: 0.999
     # MEASURED, NOT THE USUAL DEFAULT. Adam's step is lr*m/(sqrt(v)+eps), which
@@ -178,12 +179,13 @@ reward:
   _target_: unirl.reward.service.RewardService
   backend:
     _target_: unirl.reward.local.t2av_composite.T2AVCompositeScorer
-    base_device: cuda
+    base_device: cpu
     config:
       _target_: unirl.reward.local.t2av_composite.T2AVCompositeSpec
-      device: auto
+      device: cpu
       batch_size: 2
-      # videopickscore scores the FIRST FRAME only (image-text alignment), and
+      frame_selection: middle
+      # videopickscore scores the middle frame (image-text alignment), and
       # clap scores generated-audio-vs-text. Neither measures motion or A/V
       # sync; the only real sync scorer is imagebind, which is CC-BY-NC-SA and
       # therefore opt-in. Revisit these weights before trusting a long run.
@@ -210,7 +212,7 @@ stack:
   _target_: unirl.train.stack.TrainStack
   micro_batch_size: 1
   max_grad_norm: 1.0
-  num_updates_per_batch: 1
+  num_updates_per_batch: 2
 
 data_source:
   _target_: unirl.data.data_source.MultimodalRLDataSource
@@ -263,22 +265,12 @@ sampling:
   # record SDE log-probs, so only these are replayed and trained on -- the
   # standard flow-GRPO timestep-subset lever. Raise only if the rank has room.
   # LTX-2 gets away without this because its sequence is ~10x shorter.
-  sde_indices: [0, 3, 6, 9]
-  # THE GROUP SIZE IS THE ADVANTAGE ESTIMATOR. GRPO normalises within a group,
-  # so for a group of 2 the advantage `(r - mean)/std` is ALWAYS exactly +-1 --
-  # algebraically, for any two rewards. All magnitude is discarded and the
-  # update sees only which sibling scored higher. Measured here: the policy-
-  # attributable reward spread at eta 0.2 is ~0.012 against a within-rollout
-  # reward std of ~0.020, so with two draws that sign is close to a coin flip.
-  # Three arms x ~80 steps at group 2 produced slopes indistinguishable from
-  # zero (t = +0.45, -2.22, -0.03) with every reward-side defect already fixed.
-  #
-  # 8 costs 4x the rollout of 2 (~55 min/step vs ~15 on 1x8 H20) and 2x of 4.
-  # That is the price of an advantage that carries magnitude; do not trade it
-  # back for step count.
-  samples_per_prompt: 8
+  sde_indices: [0, 3, 6]
+  # Four samples retain reward magnitude while keeping a rollout practical on
+  # one 8xH20 node. Batch-wide std avoids independently amplifying noisy groups.
+  samples_per_prompt: 4
   seed: 42
-  init_same_noise: false
+  init_same_noise: true
   autocast_precision: bf16
   trajectory_precision: fp16
   logprob_precision: fp32
