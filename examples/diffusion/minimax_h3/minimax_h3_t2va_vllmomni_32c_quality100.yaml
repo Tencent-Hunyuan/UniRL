@@ -1,0 +1,105 @@
+# @package _global_
+# 100-step quality recipe: 8 prompts x 8 samples, 24-step CPS rollout,
+# three replay transitions, and fixed held-out evaluation every 10 steps.
+
+defaults:
+  - minimax_h3_t2va_vllmomni_32c_8x8_hsdp8x4
+  - _self_
+
+num_rollouts: 100
+save_interval: 10
+save_mode: auto
+save_dir: ${oc.env:H3_SAVE_DIR,checkpoints/minimax-h3-quality100}
+adv_use_global_std: true
+
+bundle:
+  config:
+    trajectory_precision: fp32
+
+eval_interval: 10
+eval_num_prompts: 16
+eval_samples_per_prompt: 4
+eval_chunk_prompts: 8
+eval_eta: 0.0
+eval_sampling:
+  num_inference_steps: 24
+  height: 256
+  width: 448
+  num_frames: 107
+  sampler_kwargs:
+    aspect_ratio: "16:9"
+    allow_nonstandard_canvas: true
+
+data_source:
+  args:
+    run:
+      data_path: ${oc.env:H3_PROMPT_FILE,examples/diffusion/minimax_h3/smoke_prompts.txt}
+      eval_data_path: ${oc.env:H3_EVAL_PROMPT_FILE,examples/diffusion/minimax_h3/smoke_prompts.txt}
+      seed: 42
+      shuffle: true
+
+backend:
+  optimizer_cfg:
+    learning_rate: 1.0e-5
+
+algorithm:
+  old_logp_source: rollout
+  max_rollout_replay_logp_absdiff: 1.0e-3
+
+rollout:
+  config:
+    omni_extra:
+      pipeline_parallel_size: 1
+      data_parallel_size: 1
+      tensor_parallel_size: 1
+      cfg_parallel_size: 1
+      allgather_degree: 1
+      sequence_parallel_size: 4
+      ulysses_degree: 4
+      ring_degree: 1
+      text_encoder_tp_size: 4
+      # 256x448 produces fewer than four decode tiles; VAE4 would leave an
+      # empty rank. Keep VAE decode local so this benchmark isolates DiT UP.
+      vae_patch_parallel_size: 1
+      vae_parallel_mode: tile
+      use_hsdp: true
+      hsdp_shard_size: 4
+      hsdp_replicate_size: 1
+
+reward:
+  backend:
+    config:
+      batch_size: 2
+      frame_selection: uniform
+      num_score_frames: 9
+      weights:
+        videopickscore: 0.5
+        clap: 0.5
+
+sampling:
+  num_inference_steps: 24
+  height: 256
+  width: 448
+  num_frames: 107
+  eta: 0.8
+  sde_indices: null
+  scheduler:
+    _target_: unirl.sde.index_schedule.AllSDEScheduler
+    num_timesteps: 24
+    timestep_fraction: [0.0, 0.4166666667]
+    num_sde_steps: 3
+    seed: 42
+  samples_per_prompt: 8
+  trajectory_precision: fp32
+  sampler_kwargs:
+    aspect_ratio: "16:9"
+    allow_nonstandard_canvas: true
+    reward_num_frames: 9
+
+logging:
+  report_to_wandb: true
+  log_media: true
+  media_log_interval: 10
+  media_max_items: 2
+  run_name: h3-quality100-hsdp4-up4-8p8s
+  tags: [minimax-h3, quality, flowgrpo, hsdp4, up4, 24-step, global-std]

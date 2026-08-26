@@ -725,7 +725,14 @@ class DiffusionTrainer(BaseTrainer):
             if should_swap_ema:
                 ema_apply_attempted = True
                 self.backend.apply_eval_ema()
+            generate_t0 = time.perf_counter()
             result = self.rollout.generate(sample)
+            logger.info("lifecycle rollout.generate %.3fs", time.perf_counter() - generate_t0)
+            if sync_weights and self.weight_sync is not None and self._staged_weight_sync:
+                # add_lora() registers CPU-side logical weights; the physical
+                # Punica buffers are populated only when generate activates the
+                # request. Verify them while rollout is still awake.
+                self.weight_sync.verify_active()
             generation_succeeded = True
             return result
         finally:
@@ -1011,8 +1018,23 @@ class DiffusionTrainer(BaseTrainer):
                     f"save_interval={save_interval} is not a multiple of accumulate_rollouts={acc}: "
                     "checkpoints are written between windows, so this cadence would never fire."
                 )
-        for _ in range(start_rollout):
+        data_start_batch = int(getattr(self.data_source, "start_batch", 0) or 0)
+        if load_dir and data_start_batch > start_rollout:
+            raise ValueError(
+                f"data_source.start_batch={data_start_batch} is ahead of checkpoint rollout "
+                f"{start_rollout}; use one continuation cursor instead of skipping data twice"
+            )
+        remaining_data_advance = max(0, start_rollout - data_start_batch)
+        for _ in range(remaining_data_advance):
             self.data_source.get_samples(self.batch_size)
+        if remaining_data_advance:
+            logger.info(
+                "Advanced training data source by %d additional batches after checkpoint load "
+                "(checkpoint=%d, data_source.start_batch=%d)",
+                remaining_data_advance,
+                start_rollout,
+                data_start_batch,
+            )
         self._init_wandb(num_rollouts=num_rollouts)
         try:
             if self.eval_interval > 0:

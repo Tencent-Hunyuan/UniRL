@@ -222,6 +222,9 @@ class MultimodalRLDataSource:
         self.eval_data_path = args.run.eval_data_path
         self.seed = args.run.seed
         self.shuffle = bool(getattr(args.run, "shuffle", True))
+        self.start_batch = int(getattr(args.run, "start_batch", 0))
+        if self.start_batch < 0:
+            raise ValueError(f"MultimodalRLDataSource start_batch must be non-negative, got {self.start_batch}")
         self.prompts_per_rollout = int(args.algorithm.prompts_per_rollout)
         self.drop_last = True
 
@@ -316,6 +319,14 @@ class MultimodalRLDataSource:
         )
 
         self._iter = iter(self._dataloader)
+        for _ in range(self.start_batch):
+            try:
+                next(self._iter)
+            except StopIteration:
+                self._iter = iter(self._dataloader)
+                next(self._iter)
+        if self.start_batch:
+            logger.info("Advanced training data source by %d batches for checkpoint continuation", self.start_batch)
 
     def _collate_text(self, batch: List[Dict[str, Any]]) -> Sample:
         """Collate function for text prompt dataset."""
