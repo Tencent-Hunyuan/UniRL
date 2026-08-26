@@ -7,6 +7,7 @@ import os
 import signal
 import threading
 import time
+from functools import wraps
 from multiprocessing.process import BaseProcess as _MpBaseProcess
 from types import MethodType
 
@@ -447,6 +448,36 @@ def _diffusers_hv15_rmsnorm(norm, hidden_states: torch.Tensor) -> torch.Tensor:
     return hidden_states * weight
 
 
+def patch_hv15_autocast_forward() -> None:
+    """Match the trainer's autocast boundary around each HunyuanVideo-1.5 transformer forward."""
+    try:
+        from vllm_omni.diffusion.models.hunyuan_video.hunyuan_video_15_transformer import (
+            HunyuanVideo15Transformer3DModel,
+        )
+    except (ImportError, AttributeError):
+        return
+
+    original_forward = HunyuanVideo15Transformer3DModel.forward
+    if getattr(original_forward, "_diffrl_hv15_autocast_forward", False):
+        return
+
+    @wraps(original_forward)
+    def _patched_forward(self, *args, **kwargs):
+        hidden_states = kwargs.get("hidden_states")
+        if hidden_states is None and args:
+            hidden_states = args[0]
+        dtype = self.transformer_blocks[0].norm1.linear.weight.dtype
+        if not torch.is_tensor(hidden_states) or hidden_states.device.type != "cuda":
+            return original_forward(self, *args, **kwargs)
+        if dtype not in (torch.float16, torch.bfloat16):
+            return original_forward(self, *args, **kwargs)
+        with torch.autocast("cuda", dtype=dtype):
+            return original_forward(self, *args, **kwargs)
+
+    _patched_forward._diffrl_hv15_autocast_forward = True
+    HunyuanVideo15Transformer3DModel.forward = _patched_forward
+
+
 def patch_hv15_qk_rmsnorm() -> None:
     """Match Diffusers' HunyuanVideo-1.5 Q/K RMSNorm instead of the pinned fused vLLM-C kernel."""
     try:
@@ -885,6 +916,7 @@ class VLLMOmniHijack:
         patch_ar_lora_loader()
         patch_ar_merged_lora_fused_tensor()
         patch_fp32_skip()
+        patch_hv15_autocast_forward()
         patch_hv15_qk_rmsnorm()
         patch_hv15_sdpa_attention_mask()
         patch_hv15_rotary_embedding()
@@ -899,6 +931,7 @@ class VLLMOmniHijack:
 __all__ = [
     "OmniTensorLoRARequest",
     "VLLMOmniHijack",
+    "patch_hv15_autocast_forward",
     "patch_hv15_qk_rmsnorm",
     "patch_hv15_sdpa_attention_mask",
     "patch_hv15_rotary_embedding",
