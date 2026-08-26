@@ -35,6 +35,7 @@ class LocalLoraWeightSync(LoraWeightSyncBase):
         self._rollout = rollout
         self._copy = bool(copy)
         self._cached = None
+        self._verify_payload = None
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def extract(self) -> None:
@@ -80,7 +81,8 @@ class LocalLoraWeightSync(LoraWeightSyncBase):
             self._track_prefix or "<single>",
         )
         if self._verify:
-            self._verify_loaded(lora_tensors, peft_config)
+            self._verify_payload = (lora_tensors, peft_config)
+            self._verify_loaded(lora_tensors, peft_config, require_active=False)
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def sync(self) -> None:
@@ -88,13 +90,23 @@ class LocalLoraWeightSync(LoraWeightSyncBase):
         self.extract()
         self.push()
 
-    def _verify_loaded(self, lora_tensors, peft_config) -> None:
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def verify_active(self) -> None:
+        """Verify Punica buffers after generate activates the adapter."""
+        if not self._verify or not getattr(self._rollout, "_is_replica_head", True):
+            return
+        if self._verify_payload is None:
+            raise RuntimeError("LocalLoraWeightSync.verify_active: no pushed LoRA payload is available")
+        self._verify_loaded(*self._verify_payload, require_active=True)
+
+    def _verify_loaded(self, lora_tensors, peft_config, *, require_active: bool) -> None:
         """Assert the sibling engine's loaded LoRA matches what we just pushed."""
         from unirl.distributed.weight_sync.transfer.ipc_dispatch import (
             DIFFRL_LORA_INT_ID,
         )
 
         exp_a, exp_b = self._expected_checksums(lora_tensors, peft_config)
+        expected_named = self._expected_named_checksums(lora_tensors, peft_config)
         topology = self._rollout.tp_per_stage()
         loaded = self._rollout.loaded_lora_checksums(adapter_id=int(DIFFRL_LORA_INT_ID))
         rank = self.rank_info.rank if self.rank_info is not None else 0
@@ -104,10 +116,13 @@ class LocalLoraWeightSync(LoraWeightSyncBase):
             loaded,
             topology=topology,
             label=f"train-rank {rank} rollout",
+            expected_named=expected_named,
+            require_active=require_active,
         )
         logger.info(
-            "[LoRA-SYNC] rank %s: verify OK (%d lora_A / %d lora_B layers match)",
+            "[LoRA-SYNC] rank %s: %s verify OK (%d lora_A / %d lora_B layers match)",
             rank,
+            "active-buffer" if require_active else "registered",
             len(exp_a),
             len(exp_b),
         )

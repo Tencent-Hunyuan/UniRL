@@ -17,6 +17,10 @@ from unirl.distributed.weight_sync.transfer.ipc_dispatch import (
     replica_rank_from_env,
     zmq_handle,
 )
+from unirl.distributed.weight_sync.transfer.minimax_h3_lora import (
+    remap_minimax_h3_lora,
+    validate_minimax_h3_lora_coverage,
+)
 from unirl.rollout.engine.vllm_omni.patches.runtime import (
     OmniTensorLoRARequest,
     VLLMOmniHijack,
@@ -271,42 +275,11 @@ class BucketedIPCReceiveMixin:
             and hasattr(transformer, "blocks")
             and not hasattr(transformer, "transformer_blocks")
         ):
-            remapped = {}
-            renamed = 0
-            for name, tensor in lora_tensors.items():
-                mapped = name.replace("transformer.transformer_blocks.", "transformer.blocks.")
-                mapped = mapped.replace(".attn.to_out.0.", ".attn.out_proj.")
-                mapped = mapped.replace(".ff.net.2.", ".mlp.fc2.")
-                if ".ff.net.0.proj." in mapped:
-                    gate_name = mapped.replace(".ff.net.0.proj.", ".mlp.gate_proj.")
-                    up_name = mapped.replace(".ff.net.0.proj.", ".mlp.up_proj.")
-                    if ".lora_B." in mapped:
-                        if not torch.is_tensor(tensor) or tensor.shape[0] % 2:
-                            raise ValueError(
-                                f"MiniMax-H3 fused FFN LoRA-B must split evenly, got "
-                                f"{getattr(tensor, 'shape', None)} for {name}"
-                            )
-                        gate, up = tensor.chunk(2, dim=0)
-                        remapped[gate_name] = gate.contiguous()
-                        remapped[up_name] = up.contiguous()
-                    else:
-                        remapped[gate_name] = tensor.clone() if torch.is_tensor(tensor) else tensor
-                        remapped[up_name] = tensor.clone() if torch.is_tensor(tensor) else tensor
-                    renamed += 2
-                    continue
-                renamed += int(mapped != name)
-                remapped[mapped] = tensor
-            lora_tensors = remapped
-            target_modules = peft_config.get("target_modules")
-            if isinstance(target_modules, str):
-                target_modules = target_modules.replace("^transformer_blocks", "^blocks")
-                target_modules = target_modules.replace(r"attn\.to_out\.0", r"attn\.out_proj")
-                target_modules = target_modules.replace(
-                    r"ff\.net\.0\.proj",
-                    r"(?:mlp\.gate_proj|mlp\.up_proj)",
-                )
-                target_modules = target_modules.replace(r"ff\.net\.2", r"mlp\.fc2")
-                peft_config["target_modules"] = target_modules
+            lora_tensors, peft_config, renamed = remap_minimax_h3_lora(lora_tensors, peft_config)
+            validate_minimax_h3_lora_coverage(
+                lora_tensors,
+                block_count=len(transformer.blocks),
+            )
             logger.info(
                 "[LoRA-REMAP] rank=%d trainer=transformer_blocks rollout=blocks renamed=%d",
                 rank,
@@ -438,18 +411,19 @@ class BucketedIPCReceiveMixin:
         self,
         adapter_id: int,
         names: Optional[list] = None,
-    ) -> dict:
+        gather_all_ranks: bool = False,
+    ) -> object:
         """Full-byte SHA-256 of the worker's loaded LoRA adapter tensors."""
         from unirl.distributed.weight_sync.transfer.checksum import (
             fingerprint_tensor,
         )
 
-        manager = getattr(self, "lora_manager", None) or getattr(
+        manager_owner = getattr(self, "lora_manager", None) or getattr(
             getattr(self, "model_runner", None), "lora_manager", None
         )
-        if manager is None:
+        if manager_owner is None:
             return {}
-        manager = getattr(manager, "_adapter_manager", manager)
+        manager = getattr(manager_owner, "_adapter_manager", manager_owner)
         registered = getattr(manager, "_registered_adapters", None)
         if registered is None:
             return {}
@@ -471,7 +445,94 @@ class BucketedIPCReceiveMixin:
                         if isinstance(sub, torch.Tensor):
                             per_field[f"{field}.{i}"] = fingerprint_tensor(sub)
             out[layer_name] = per_field
+
+        # Also fingerprint the active GPU buffers that Punica reads during
+        # forward. Registered LoRAModel tensors can be correct while packed
+        # physical layers are reset, mis-sliced, or bound to the wrong logical
+        # submodule.
+        lora_modules = getattr(manager, "_lora_modules", None) or getattr(manager_owner, "_lora_modules", {})
+        packed_sublayers = getattr(manager, "_get_packed_sublayer_suffixes", None)
+        get_lora_weights = getattr(manager, "_get_lora_weights", None)
+        active_adapter_id = getattr(manager, "_active_adapter_id", None)
+        if active_adapter_id is not None and int(active_adapter_id) == int(adapter_id) and callable(get_lora_weights):
+            for physical_name, physical_layer in lora_modules.items():
+                a_stacked = getattr(physical_layer, "lora_a_stacked", ())
+                b_stacked = getattr(physical_layer, "lora_b_stacked", ())
+                n_slices = int(getattr(physical_layer, "n_slices", len(a_stacked)))
+                if not isinstance(a_stacked, (list, tuple)) or not isinstance(b_stacked, (list, tuple)):
+                    continue
+                if len(a_stacked) != n_slices or len(b_stacked) != n_slices:
+                    continue
+                prefix, _, packed_suffix = str(physical_name).rpartition(".")
+                sub_suffixes = (
+                    packed_sublayers(packed_suffix, n_slices) if n_slices > 1 and callable(packed_sublayers) else None
+                )
+                logical_names = (
+                    [f"{prefix}.{suffix}" if prefix else suffix for suffix in sub_suffixes]
+                    if sub_suffixes
+                    else [str(physical_name)]
+                )
+                if len(logical_names) != n_slices:
+                    continue
+
+                expected_layers = [get_lora_weights(lora_model, logical_name) for logical_name in logical_names]
+                if any(
+                    not isinstance(getattr(layer, "lora_a", None), torch.Tensor)
+                    or not isinstance(getattr(layer, "lora_b", None), torch.Tensor)
+                    for layer in expected_layers
+                ):
+                    continue
+                active_scale = float(getattr(manager, "_adapter_scales", {}).get(int(adapter_id), 1.0))
+                expected_a_arg = [layer.lora_a for layer in expected_layers]
+                expected_b_arg = [layer.lora_b * active_scale for layer in expected_layers]
+                if n_slices == 1:
+                    expected_a_arg = expected_a_arg[0]
+                    expected_b_arg = expected_b_arg[0]
+                if int(getattr(physical_layer, "tp_size", 1)) > 1:
+                    expected_a_arg = physical_layer.slice_lora_a(expected_a_arg)
+                    expected_b_arg = physical_layer.slice_lora_b(expected_b_arg)
+                expected_a_slices = expected_a_arg if isinstance(expected_a_arg, list) else [expected_a_arg]
+                expected_b_slices = expected_b_arg if isinstance(expected_b_arg, list) else [expected_b_arg]
+                if len(expected_a_slices) != n_slices or len(expected_b_slices) != n_slices:
+                    continue
+
+                for slice_index, logical_name in enumerate(logical_names):
+                    if target is not None and logical_name not in target:
+                        continue
+                    expected_a = expected_a_slices[slice_index]
+                    expected_b = expected_b_slices[slice_index]
+                    if not isinstance(expected_a, torch.Tensor) or not isinstance(expected_b, torch.Tensor):
+                        continue
+                    active_a = a_stacked[slice_index][
+                        0,
+                        0,
+                        : expected_a.shape[0],
+                        : expected_a.shape[1],
+                    ]
+                    active_b = b_stacked[slice_index][
+                        0,
+                        0,
+                        : expected_b.shape[0],
+                        : expected_b.shape[1],
+                    ]
+                    fields = out.setdefault(logical_name, {})
+                    fields["active_expected_lora_a"] = fingerprint_tensor(expected_a)
+                    fields["active_expected_lora_b"] = fingerprint_tensor(expected_b)
+                    fields["active_lora_a"] = fingerprint_tensor(active_a)
+                    fields["active_lora_b"] = fingerprint_tensor(active_b)
+        if gather_all_ranks:
+            import torch.distributed as dist
+
+            if dist.is_initialized():
+                gathered: list[object] = [None] * dist.get_world_size()
+                dist.all_gather_object(gathered, out)
+                return gathered
+            return [out]
         return out
 
 
-__all__ = ["BucketedIPCReceiveMixin"]
+__all__ = [
+    "BucketedIPCReceiveMixin",
+    "remap_minimax_h3_lora",
+    "validate_minimax_h3_lora_coverage",
+]

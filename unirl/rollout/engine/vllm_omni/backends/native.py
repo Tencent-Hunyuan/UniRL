@@ -673,8 +673,9 @@ class VLLMOmniBackend:
         for sid in self._stage_ids():
             results = omni.engine.collective_rpc(
                 method="_diffrl_loaded_lora_checksums",
-                args=(int(adapter_id), list(names) if names else None),
+                args=(int(adapter_id), list(names) if names else None, True),
                 stage_ids=[int(sid)],
+                unique_reply_rank=0,
             )
             out[int(sid)] = results[0] if isinstance(results, list) and results else results
         return out
