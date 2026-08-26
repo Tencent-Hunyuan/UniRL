@@ -584,14 +584,15 @@ class MiniMaxH3Transformer3DModel(ModelMixin, ConfigMixin, AttentionMixin, PeftA
                 f"{list(token_tags.shape)} and {list(timestep_indices.shape)} for seq_len={sequence_length}."
             )
 
-        rotary_emb = self.rope(position_ids)
-
         # 1. Project each modality and scatter the rows into the packed sequence buffer. The checkpoint is
         # mixed-precision (the two patch projections are float32 while `context_embedder` and the block stack are
         # bfloat16 — see `_keep_in_fp32_modules`), so every input is aligned with its projection's parameter dtype,
-        # mirroring the reference's explicit casts. The text stream sets the dtype of the packed sequence.
-        video_embeds = self.proj_in(hidden_states.to(self.proj_in.weight.dtype))
-        audio_embeds = self.audio_proj_in(audio_hidden_states.to(self.audio_proj_in.weight.dtype))
+        # mirroring the reference's explicit casts. Global CUDA autocast would otherwise run these FP32 Linear
+        # modules in BF16 despite their parameter storage dtype.
+        with torch.autocast(device_type=hidden_states.device.type, enabled=False):
+            rotary_emb = self.rope(position_ids)
+            video_embeds = self.proj_in(hidden_states.to(self.proj_in.weight.dtype))
+            audio_embeds = self.audio_proj_in(audio_hidden_states.to(self.audio_proj_in.weight.dtype))
         text_embeds = self.context_embedder(encoder_hidden_states.to(self.context_embedder.weight.dtype))
         text_embeds = self.token_refiner(text_embeds)
 
@@ -603,8 +604,9 @@ class MiniMaxH3Transformer3DModel(ModelMixin, ConfigMixin, AttentionMixin, PeftA
         # 2. One timestep embedding per distinct noise level. `temb` is shared by all AdaLN projections, which are
         # bfloat16 in the checkpoint while `time_embedder` is float32, so it stays at the time embedder's precision:
         # each AdaLN module applies its own activation to it and casts to its projection's dtype afterwards.
-        temb = self.time_proj(timestep)
-        temb = self.time_embedder(temb.to(self.time_embedder.linear_1.weight.dtype))
+        with torch.autocast(device_type=hidden_states.device.type, enabled=False):
+            temb = self.time_proj(timestep)
+            temb = self.time_embedder(temb.to(self.time_embedder.linear_1.weight.dtype))
 
         # 3. Row -> AdaLN table row. `clamp(min=0)` mirrors the reference, where padding rows carry the tag `-1`; the
         # clamp keeps the `-1` from indexing backwards (padding rows never reach the outputs, which are selected by
@@ -632,8 +634,9 @@ class MiniMaxH3Transformer3DModel(ModelMixin, ConfigMixin, AttentionMixin, PeftA
         # `_keep_in_fp32_modules`, so they stay float32 while the block stack runs in the requested `torch_dtype`;
         # align the activation with their parameter dtype.
         hidden_states = self.norm_out(hidden_states, temb, timestep_indices).to(self.proj_out.weight.dtype)
-        video_output = self.proj_out(hidden_states).index_select(1, video_indices)
-        audio_output = self.audio_proj_out(hidden_states).index_select(1, audio_indices)
+        with torch.autocast(device_type=hidden_states.device.type, enabled=False):
+            video_output = self.proj_out(hidden_states).index_select(1, video_indices)
+            audio_output = self.audio_proj_out(hidden_states).index_select(1, audio_indices)
 
         if not return_dict:
             return (video_output, audio_output)

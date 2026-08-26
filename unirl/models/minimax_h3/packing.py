@@ -73,7 +73,14 @@ class MiniMaxH3Geometry:
         )
 
     @classmethod
-    def resolve(cls, *, height: int, width: int, num_frames: int) -> "MiniMaxH3Geometry":
+    def resolve(
+        cls,
+        *,
+        height: int,
+        width: int,
+        num_frames: int,
+        allow_nonstandard_canvas: bool = False,
+    ) -> "MiniMaxH3Geometry":
         """Validate a requested ``(height, width, num_frames)`` against H3."""
         h, w = int(height), int(width)
         multiple = MINIMAX_H3_CANVAS_MULTIPLE
@@ -123,7 +130,13 @@ class MiniMaxH3Geometry:
     @classmethod
     def from_params(cls, params) -> "MiniMaxH3Geometry":
         """Resolve from a ``DiffusionSamplingParams``-shaped object."""
-        return cls.resolve(height=int(params.height), width=int(params.width), num_frames=int(params.num_frames))
+        sampler_kwargs = dict(getattr(params, "sampler_kwargs", {}) or {})
+        return cls.resolve(
+            height=int(params.height),
+            width=int(params.width),
+            num_frames=int(params.num_frames),
+            allow_nonstandard_canvas=bool(sampler_kwargs.get("allow_nonstandard_canvas", False)),
+        )
 
 
 def build_t2va_layout(geometry: MiniMaxH3Geometry, num_text_tokens: int) -> MiniMaxH3PackedSequence:
