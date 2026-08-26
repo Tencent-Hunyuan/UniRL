@@ -43,6 +43,7 @@ from unirl.utils.dtypes import parse_torch_dtype
 
 from .bundle import MiniMaxH3Bundle
 from .conditions import MiniMaxH3Conditions
+from .config import MINIMAX_H3_AUDIO_LATENT_CHANNELS
 from .packing import MiniMaxH3Geometry, build_t2va_layout, row_timestep_plan
 
 
@@ -65,6 +66,36 @@ def _combine_modality_logp(
     """
     total = n_video + n_audio
     return (video_logp * n_video + audio_logp * n_audio) / total
+
+
+def pack_dual_streams(video_rows: torch.Tensor, audio_rows: torch.Tensor) -> torch.Tensor:
+    """Flatten ``[B, V, Cv]`` + ``[B, A, Ca]`` into one ``[B, V*Cv + A*Ca]`` tensor.
+
+    Forward-process algorithms noise a single latent tensor and take one MSE over
+    it, so audio only reaches the objective by riding along with video -- and it
+    has to, because the reward scores their agreement.
+    """
+    batch = video_rows.shape[0]
+    return torch.cat([video_rows.reshape(batch, -1), audio_rows.reshape(batch, -1)], dim=1)
+
+
+def unpack_dual_streams(
+    packed: torch.Tensor,
+    geometry: MiniMaxH3Geometry,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Inverse of :func:`pack_dual_streams`, using ``geometry`` for the split."""
+    batch = packed.shape[0]
+    split = geometry.num_video_rows * geometry.video_token_dim
+    expected = split + geometry.num_audio_rows * MINIMAX_H3_AUDIO_LATENT_CHANNELS
+    require(
+        int(packed.shape[1]) == expected,
+        f"unpack_dual_streams: packed width {int(packed.shape[1])} != {expected} implied by geometry "
+        f"({geometry.num_video_rows} video rows x {geometry.video_token_dim} + {geometry.num_audio_rows} audio rows "
+        f"x {MINIMAX_H3_AUDIO_LATENT_CHANNELS}). The packed latent and the resolved geometry disagree.",
+    )
+    video_rows = packed[:, :split].reshape(batch, geometry.num_video_rows, geometry.video_token_dim)
+    audio_rows = packed[:, split:].reshape(batch, geometry.num_audio_rows, MINIMAX_H3_AUDIO_LATENT_CHANNELS)
+    return video_rows, audio_rows
 
 
 class MiniMaxH3DiffusionStep(DiffusionStep[MiniMaxH3Bundle, MiniMaxH3Conditions]):
@@ -211,6 +242,9 @@ class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
         sde_sorted = sorted(sde_indices) if sde_indices is not None else list(range(num_steps))
         sde_set = set(sde_sorted)
         needed = set(compute_trajectory_positions(sde_sorted, num_steps))
+        # An SDE recipe gets the terminal position for free as the `i+1` of its
+        # last index; `sde_indices=[]` does not, and stacks an empty list. (sd3)
+        needed.add(num_steps)
 
         stored_pairs: List[Tuple[int, torch.Tensor]] = []
         stored_audio: List[torch.Tensor] = []
@@ -382,8 +416,62 @@ class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
             prev_sample_means=torch.stack(means, dim=1) if means else None,
         )
 
+    def nft_clean_latents(self, segment: LatentSegment) -> torch.Tensor:
+        """The clean ``x0`` a forward-process algorithm should train on.
+
+        Overrides the caller's default of ``segment.latents[:, -1]``, which is
+        the video half only.
+        """
+        require(
+            segment.latents is not None and segment.aux_latents is not None,
+            "MiniMaxH3DiffusionStage.nft_clean_latents: segment.latents / aux_latents missing -- the rollout must "
+            "store the terminal position of both streams.",
+        )
+        return pack_dual_streams(segment.latents[:, -1], segment.aux_latents[:, -1])
+
+    def predict_noise_at_step(
+        self,
+        conditions: MiniMaxH3Conditions,
+        *,
+        sample: torch.Tensor,
+        sigma: torch.Tensor,
+        params: DiffusionSamplingParams,
+    ) -> torch.Tensor:
+        """One packed forward at an arbitrary ``(xt, sigma)`` -- no SDE iteration.
+
+        ``sample`` and the return value are both packed by
+        :func:`pack_dual_streams`, so the caller never sees the two streams.
+
+        Both streams take the same sigma. The video/audio shift split describes
+        the reverse schedule that ``generate`` walks, and a forward-process
+        objective jumps to a noise level instead of walking it, so there is no
+        second grid to be on.
+        """
+        require(
+            int(sample.shape[0]) == 1,
+            f"MiniMaxH3DiffusionStage.predict_noise_at_step: batch-1 only (got {int(sample.shape[0])}). The packed "
+            f"sequence carries unbatched per-row metadata, so callers chunk instead: set stack.micro_batch_size=1 "
+            f"and rollout.forward_batch_size=1. Same discipline as generate().",
+        )
+        geometry = MiniMaxH3Geometry.from_params(params)
+        video_sample, audio_sample = unpack_dual_streams(sample, geometry)
+        layout = build_t2va_layout(geometry, int(conditions.text.embeds.shape[1]))
+        shared_sigma = sigma.detach().reshape(-1)[0]
+        with self._autocast():
+            video_pred, audio_pred = self.step.predict_noise(
+                conditions,
+                video_sample=video_sample.to(dtype=self.trajectory_dtype),
+                audio_sample=audio_sample.to(dtype=self.trajectory_dtype),
+                video_sigma=shared_sigma,
+                audio_sigma=shared_sigma,
+                layout=layout,
+            )
+        return pack_dual_streams(video_pred, audio_pred)
+
 
 __all__ = [
     "MiniMaxH3DiffusionStage",
     "MiniMaxH3DiffusionStep",
+    "pack_dual_streams",
+    "unpack_dual_streams",
 ]
