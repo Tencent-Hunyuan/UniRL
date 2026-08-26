@@ -37,8 +37,21 @@ class LocalLoraWeightSync(LoraWeightSyncBase):
     def sync(self) -> None:
         """Extract LoRA from the local FSDP model and load it into the engine."""
         lora_tensors, peft_config = self._extract()
+        ri = self.rank_info
+        rank = ri.rank if ri is not None else 0
+        if ri is not None and ri.tp_rank != 0:  # extract on every rank, push only from the TP leader
+            logger.debug(
+                "[LoRA-SYNC] rank %s: extracted %d LoRA tensors, no push (tp=%s/%s, adapter=%s, track=%s)",
+                rank,
+                len(lora_tensors),
+                ri.tp_rank,
+                ri.tp_size,
+                self._adapter_name,
+                self._track_prefix or "<single>",
+            )
+            return
+
         self._rollout.set_lora_from_tensors(self._adapter_name, lora_tensors, peft_config=peft_config)
-        rank = self.rank_info.rank if self.rank_info is not None else 0
         logger.info(
             "[LoRA-SYNC] rank %s: pushed %d LoRA tensors to rollout (adapter=%s, track=%s)",
             rank,

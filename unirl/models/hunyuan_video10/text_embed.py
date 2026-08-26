@@ -1,4 +1,4 @@
-"""HunyuanVideoTextEmbedStage — LLaMA 3D ``[B, seq, 4096]`` and CLIP pooled 2D ``[B, 768]`` streams."""
+"""HunyuanVideo10TextEmbedStage — LLaMA 3D ``[B, seq, 4096]`` and CLIP pooled 2D ``[B, 768]`` streams."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import torch
 from unirl.types.conditions import TextEmbedCondition
 from unirl.types.primitives import Texts
 
-from .bundle import HunyuanVideoBundle
+from .bundle import HunyuanVideo10Bundle
 
 PROMPT_TEMPLATE = {
     "template": (
@@ -25,12 +25,12 @@ PROMPT_TEMPLATE = {
 }
 
 
-class HunyuanVideoTextEmbedStage:
+class HunyuanVideo10TextEmbedStage:
     """Dual-encoder text -> two ``TextEmbedCondition`` instances."""
 
     def __init__(
         self,
-        bundle: HunyuanVideoBundle,
+        bundle: HunyuanVideo10Bundle,
         *,
         llama_max_length: int = 256,
         clip_max_length: int = 77,
@@ -44,7 +44,7 @@ class HunyuanVideoTextEmbedStage:
         self.hidden_state_skip_layer = int(hidden_state_skip_layer)
         if self.hidden_state_skip_layer < 0:
             raise ValueError(
-                f"HunyuanVideoTextEmbedStage.hidden_state_skip_layer must be >= 0, got {self.hidden_state_skip_layer}"
+                f"HunyuanVideo10TextEmbedStage.hidden_state_skip_layer must be >= 0, got {self.hidden_state_skip_layer}"
             )
 
     def embed_llama(self, p: Texts) -> TextEmbedCondition:
@@ -87,7 +87,7 @@ class HunyuanVideoTextEmbedStage:
         if hidden_states is None or selected_from_end > len(hidden_states):
             available = 0 if hidden_states is None else len(hidden_states)
             raise ValueError(
-                "HunyuanVideoTextEmbedStage.hidden_state_skip_layer selects a "
+                "HunyuanVideo10TextEmbedStage.hidden_state_skip_layer selects a "
                 f"nonexistent state: skip={self.hidden_state_skip_layer}, "
                 f"encoder returned {available} hidden states"
             )
@@ -132,6 +132,6 @@ class HunyuanVideoTextEmbedStage:
 
 
 __all__ = [
-    "HunyuanVideoTextEmbedStage",
+    "HunyuanVideo10TextEmbedStage",
     "PROMPT_TEMPLATE",
 ]

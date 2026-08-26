@@ -14,9 +14,14 @@ from omegaconf import DictConfig
 
 from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
-from unirl.rollout.manager import RolloutManager
+from unirl.rollout.manager import RolloutManager, required_worker_concurrency, validate_worker_inflight
 from unirl.train.stack import TrainStepResult
-from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample, unwrap_replicated_int
+from unirl.trainer.base import (
+    BaseTrainer,
+    build_sampling_dict,
+    prepare_input_sample,
+    unwrap_replicated_int,
+)
 from unirl.trainer.hydra import parse_hydra_cfg, remote_hydra
 from unirl.types.advantages import finite_mean_std
 from unirl.types.primitives import Texts
@@ -63,6 +68,13 @@ class AgenticTrainer(BaseTrainer):
         stop: Optional[List[str]] = None,
         per_worker_inflight: int = 8,
     ) -> None:
+        per_worker_inflight = int(per_worker_inflight)
+        configured_concurrency = cfg.get("worker_max_concurrency")
+        worker_max_concurrency = (
+            required_worker_concurrency(per_worker_inflight)
+            if configured_concurrency is None
+            else int(configured_concurrency)
+        )
         self._validate_config(
             cfg=cfg,
             batch_size=batch_size,
@@ -71,8 +83,13 @@ class AgenticTrainer(BaseTrainer):
             algorithm_cfg=algorithm_cfg,
             sync_cfg=sync_cfg,
             per_worker_inflight=per_worker_inflight,
+            worker_max_concurrency=worker_max_concurrency,
         )
-        super().__init__(cfg=cfg, logging_cfg=logging_cfg)
+        super().__init__(
+            cfg=cfg,
+            logging_cfg=logging_cfg,
+            worker_max_concurrency=worker_max_concurrency,
+        )
 
         try:
             self.batch_size = int(batch_size)
@@ -80,7 +97,7 @@ class AgenticTrainer(BaseTrainer):
             self.sampling_params: Dict[str, BaseSamplingParams] = build_sampling_dict(sampling_cfg)
             self._group_size = total_samples_per_prompt(self.sampling_params)
             self._stop = list(stop) if stop else ["</tool_call>"]
-            self._per_worker_inflight = int(per_worker_inflight)
+            self._per_worker_inflight = per_worker_inflight
 
             with placement(self.pool, fraction=1.0, shared_workers=True):
                 self.bundle = remote_hydra(bundle_cfg)
@@ -91,12 +108,7 @@ class AgenticTrainer(BaseTrainer):
                 self.stack = remote_hydra(stack_cfg, fsdp_backend=self.backend, algorithm=self.algorithm)
                 self._build_colocated_rollout(rollout_cfg, sync_cfg)
 
-            indices = [
-                index
-                for index, rank_info in enumerate(self.rollout.rank_infos)
-                if rank_info.tp_rank == 0 and rank_info.pp_rank == 0
-            ]
-            slots = [self.rollout.slot(index) for index in indices]
+            slots = self.rollout.engine_slots
             launchers = [lambda sample, slot=slot: slot.launch("generate", sample) for slot in slots]
             self._rollout_manager = RolloutManager(
                 self.rollout,
@@ -122,22 +134,15 @@ class AgenticTrainer(BaseTrainer):
         algorithm_cfg: DictConfig,
         sync_cfg: Optional[DictConfig],
         per_worker_inflight: int,
+        worker_max_concurrency: int,
     ) -> None:
         if int(batch_size) <= 0:
             raise ValueError(f"batch_size must be positive; got {batch_size}")
-        if int(per_worker_inflight) <= 0:
-            raise ValueError(f"per_worker_inflight must be positive; got {per_worker_inflight}")
-        # Mirrors the DevicePool default in BaseTrainer; checked here so a bad combination
-        # fails before any expensive runtime construction.
-        worker_max_concurrency = int(cfg.get("worker_max_concurrency", 1))
-        required_concurrency = int(per_worker_inflight) + 2
-        if worker_max_concurrency < required_concurrency:
-            raise ValueError(
-                f"worker_max_concurrency ({worker_max_concurrency}) must be >= per_worker_inflight + 2 "
-                f"({required_concurrency}) so control calls (set_stopping/sleep/weight sync) are not "
-                "starved by trajectory slots; raise worker_max_concurrency in the recipe or lower "
-                "per_worker_inflight"
-            )
+        validate_worker_inflight(
+            per_worker_inflight,
+            worker_max_concurrency=worker_max_concurrency,
+            engine_concurrency=None,
+        )
         if sync_cfg is None:
             raise ValueError("AgenticTrainer requires colocated TensorWeightSync")
         sync_target = str(sync_cfg.get("_target_", ""))

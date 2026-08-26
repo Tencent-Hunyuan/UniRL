@@ -1,4 +1,4 @@
-"""HunyuanVideoBundle -- concrete weights+params holder for HunyuanVideo-1.0."""
+"""HunyuanVideo10Bundle -- concrete weights+params holder for HunyuanVideo-1.0."""
 
 from __future__ import annotations
 
@@ -12,10 +12,10 @@ from unirl.models.types.bundle import Bundle
 from unirl.models.types.meta_init import build_meta_init_transformer
 from unirl.utils.dtypes import parse_torch_dtype
 
-from .config import HunyuanVideoPipelineConfig
+from .config import HunyuanVideo10PipelineConfig
 
 
-class HunyuanVideoBundle(Bundle):
+class HunyuanVideo10Bundle(Bundle):
     """HunyuanVideo-1.0 bundle: transformer + 3D VAE + dual text encoders + scheduler."""
 
     def __init__(
@@ -44,7 +44,7 @@ class HunyuanVideoBundle(Bundle):
         self.pretrained_path = pretrained_path
 
     @classmethod
-    def from_config(cls, config: HunyuanVideoPipelineConfig) -> "HunyuanVideoBundle":
+    def from_config(cls, config: HunyuanVideo10PipelineConfig) -> "HunyuanVideo10Bundle":
         """Load all HunyuanVideo-1.0 components from a checkpoint."""
         from diffusers import AutoencoderKLHunyuanVideo, HunyuanVideoTransformer3DModel
         from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
@@ -122,4 +122,4 @@ class HunyuanVideoBundle(Bundle):
         return bundle
 
 
-__all__ = ["HunyuanVideoBundle"]
+__all__ = ["HunyuanVideo10Bundle"]

@@ -9,6 +9,7 @@ import threading
 import time
 from multiprocessing.process import BaseProcess as _MpBaseProcess
 
+import torch
 from msgspec import field
 
 try:
@@ -16,6 +17,7 @@ try:
 except ImportError:
     from vllm.lora.models import LoRAModel  # type: ignore[no-redef]
 
+from vllm.lora.lora_weights import LoRALayerWeights, PackedLoRALayerWeights
 from vllm.lora.peft_helper import PEFTHelper
 from vllm.lora.utils import get_adapter_absolute_path
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager, logger
@@ -225,6 +227,98 @@ def patch_dit_lora_loader() -> None:
     setattr(DiffusionLoRAManager, "_load_adapter", hijack__load_adapter)
 
 
+def _deinterleave_fused_qkv_lora_b(lora_b, output_sizes, base_layer):
+    """Split HI3's GQA-interleaved fused QKV LoRA-B into ``[q, k, v]`` slices."""
+    if len(output_sizes) != 3:
+        return None
+    head_size = getattr(base_layer, "head_size", None)
+    num_kv_heads = getattr(base_layer, "total_num_kv_heads", None)
+    if not isinstance(head_size, int) or head_size <= 0:
+        return None
+    if not isinstance(num_kv_heads, int) or num_kv_heads <= 0:
+        return None
+    q_size, k_size, v_size = output_sizes
+    if k_size <= 0 or v_size != k_size:
+        return None
+    groups = q_size // k_size
+    if groups * k_size != q_size or k_size != num_kv_heads * head_size:
+        return None
+    rank = lora_b.shape[1]
+    try:
+        lora_b_r = lora_b.reshape(num_kv_heads, groups + 2, head_size, rank)
+    except RuntimeError:
+        return None
+    q_b, k_b, v_b = torch.split(lora_b_r, (groups, 1, 1), dim=1)
+    return [q_b.reshape(-1, rank), k_b.reshape(-1, rank), v_b.reshape(-1, rank)]
+
+
+def patch_dit_hi3_lora_weights() -> None:
+    """Resolve and safely repack HI3 DiT LoRA weights."""
+    try:
+        from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import (
+            HunyuanImage3Pipeline,
+        )
+    except (ImportError, AttributeError):
+        return
+
+    original = DiffusionLoRAManager._get_lora_weights
+    if getattr(original, "_diffrl_hi3_lora_weights", False):
+        return
+
+    def wrapped(self, lora_model, full_module_name, _orig=original):
+        weights = _orig(self, lora_model, full_module_name)
+        if not isinstance(getattr(self, "pipeline", None), HunyuanImage3Pipeline):
+            return weights
+
+        prefix = "transformer.layers."
+        if weights is None and full_module_name.startswith(prefix):
+            alias = "model.layers." + full_module_name[len(prefix) :]
+            weights = lora_model.get_lora(alias)
+
+        if weights is None or not full_module_name.endswith(".qkv_proj"):
+            return weights
+        if isinstance(weights, PackedLoRALayerWeights):
+            return weights
+
+        def fail(reason: str) -> None:
+            raise RuntimeError(
+                f"Refusing to install HI3 fused-qkv LoRA for {full_module_name}: {reason}. "
+                "Applying the interleaved tensor would route attention deltas to the wrong output rows."
+            )
+
+        if not isinstance(weights, LoRALayerWeights):
+            fail(f"expected LoRALayerWeights, got {type(weights).__name__}")
+        lora_b = weights.lora_b
+        if not isinstance(lora_b, torch.Tensor) or lora_b.ndim != 2:
+            fail("lora_b is not a 2-D tensor")
+
+        lora_modules = getattr(self, "_lora_modules", None) or {}
+        base_layer = getattr(lora_modules.get(full_module_name), "base_layer", None)
+        output_sizes = [int(size) for size in (getattr(base_layer, "output_sizes", ()) or ())]
+        if not output_sizes or int(lora_b.shape[0]) != sum(output_sizes):
+            fail("base layer exposes no output_sizes matching lora_b's rows")
+
+        slices = _deinterleave_fused_qkv_lora_b(lora_b, output_sizes, base_layer)
+        if slices is None:
+            fail("GQA layout is unrecognised (check head_size/total_num_kv_heads)")
+
+        scaling = float(getattr(weights, "scaling", 1.0))
+        if scaling != 1.0:
+            slices = [part * scaling for part in slices]
+
+        return PackedLoRALayerWeights(
+            module_name=weights.module_name,
+            rank=weights.rank,
+            lora_alphas=[weights.lora_alpha] * 3,
+            lora_a=[weights.lora_a] * 3,
+            lora_b=slices,
+            scaling=[1.0, 1.0, 1.0],
+        )
+
+    wrapped._diffrl_hi3_lora_weights = True
+    DiffusionLoRAManager._get_lora_weights = wrapped
+
+
 def patch_ar_lora_loader() -> None:
     """Patch ``WorkerLoRAManager._load_adapter`` (AR stage) to support in-memory tensors."""
     try:
@@ -263,36 +357,16 @@ def patch_ar_lora_loader() -> None:
 def patch_ar_merged_lora_fused_tensor() -> None:
     """Accept a single fused lora_b [q+k+v, rank] in MergedQKV set_lora."""
     try:
-        import torch
         from vllm.lora.layers import column_parallel_linear as _cpl
     except (ImportError, AttributeError):
         return
-
-    def _deinterleave_gqa(lora_b, output_sizes, base_layer):
-        if len(output_sizes) != 3:
-            return None
-        head_size = getattr(base_layer, "head_size", None)
-        num_kv_heads = getattr(base_layer, "total_num_kv_heads", None)
-        if head_size is None or num_kv_heads is None:
-            return None
-        q_size, k_size, _v = output_sizes
-        groups = q_size // k_size
-        if groups * k_size != q_size or k_size != num_kv_heads * head_size:
-            return None
-        rank = lora_b.shape[1]
-        try:
-            lora_b_r = lora_b.reshape(num_kv_heads, groups + 2, head_size, rank)
-        except RuntimeError:
-            return None
-        q_b, k_b, v_b = torch.split(lora_b_r, (groups, 1, 1), dim=1)
-        return [q_b.reshape(-1, rank), k_b.reshape(-1, rank), v_b.reshape(-1, rank)]
 
     def _make(orig):
         def _set_lora(self, index, lora_a, lora_b, *args, _orig=orig, **kwargs):
             if isinstance(lora_b, torch.Tensor):
                 output_sizes = list(getattr(self.base_layer, "output_sizes", []) or [])
                 if output_sizes and int(lora_b.shape[0]) == sum(output_sizes):
-                    slices = _deinterleave_gqa(lora_b, output_sizes, self.base_layer)
+                    slices = _deinterleave_fused_qkv_lora_b(lora_b, output_sizes, self.base_layer)
                     lora_b = slices if slices is not None else list(torch.split(lora_b, output_sizes, dim=0))
                     if isinstance(lora_a, torch.Tensor):
                         lora_a = [lora_a] * self.n_slices
@@ -584,6 +658,7 @@ class VLLMOmniHijack:
 
         patch_qwen3_omni_thinker_lora()
         patch_dit_lora_loader()
+        patch_dit_hi3_lora_weights()
         patch_ar_lora_loader()
         patch_ar_merged_lora_fused_tensor()
         patch_fp32_skip()

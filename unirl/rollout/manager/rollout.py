@@ -106,6 +106,21 @@ class RolloutManager:
             self._poison(exc)
             raise
 
+    def finish(self, tasks: List["Sample"], *, current_version: int) -> None:
+        """Run an isolated carried prefix to terminal completion without admitting other work."""
+        self._ensure_open()
+        if current_version < 0:
+            raise ValueError(f"current_version must be non-negative; got {current_version}")
+        if not tasks:
+            return
+        try:
+            completed = self._resolve(self._pool.run_to_completion(list(tasks)))
+            self._route(completed, allow_suspended=False)
+            self._filter_complete(current_version)
+        except BaseException as exc:
+            self._poison(exc)
+            raise
+
     def sync_weights(self, weight_sync: object, *, output_version: int) -> int:
         self._ensure_open()
         next_version = int(output_version)
@@ -133,7 +148,7 @@ class RolloutManager:
     def counts(self) -> tuple[int, int]:
         self._raise_if_failed()
         inflight_count, completed_count = self._pool.counts
-        return inflight_count, completed_count + len(self._complete)
+        return inflight_count, completed_count + self._complete.group_count
 
     @property
     def empty(self) -> bool:

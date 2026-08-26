@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass
 from itertools import count
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple, Type
@@ -239,6 +240,7 @@ class PendingHandleCall:
         *,
         targets: Optional[List[Any]] = None,
         collect_fn: Optional[Callable] = None,
+        leases: Optional[List[Any]] = None,
     ) -> None:
         self._handle = handle
         self._method_name = method_name
@@ -246,8 +248,10 @@ class PendingHandleCall:
         self._worker_local = worker_local
         self._targets = targets
         self._collect_fn = collect_fn
+        self._leases = leases
         self._consumed = False
         self._value: Any = None
+        self._discard_futures: Optional[List[Any]] = None
 
     def ready(self) -> bool:
         """True once every worker's ref is resolved (non-blocking probe)."""
@@ -255,8 +259,46 @@ class PendingHandleCall:
         return len(done) == len(self._refs)
 
     def wait(self) -> None:
-        """Block until every worker finishes, without collecting; re-raises worker errors."""
-        ray.get(self._refs)
+        """Block until completion and safely discard the collected return value."""
+        if self._consumed:
+            return
+        self.result()
+        self._value = None
+
+    def discard_on_completion(self) -> None:
+        """Retain leases and discard outputs when all worker refs finish."""
+        if self._consumed:
+            self._value = None
+            return
+        if self._discard_futures is not None:
+            return
+        try:
+            futures = [ref.future() for ref in self._refs]
+        except Exception:
+            threading.Thread(
+                target=self._discard_result,
+                name="pending-handle-discard",
+                daemon=True,
+            ).start()
+            return
+        if not futures:
+            self._discard_result()
+            return
+
+        remaining = len(futures)
+        lock = threading.Lock()
+
+        def on_done(_) -> None:
+            nonlocal remaining
+            with lock:
+                remaining -= 1
+                complete = remaining == 0
+            if complete:
+                self._discard_result()
+
+        self._discard_futures = futures
+        for future in futures:
+            future.add_done_callback(on_done)
 
     def result(self) -> Any:
         """Block if needed, then rebind + collect: the method's collected return value."""
@@ -266,14 +308,29 @@ class PendingHandleCall:
         collect_fn = self._collect_fn
         if collect_fn is None:
             _, _, collect_fn, _ = handle._method_configs[self._method_name]
-        self._value = handle._resolve_call(
-            collect_fn,
-            self._refs,
-            worker_local=self._worker_local,
-            targets=self._targets,
-        )
+        try:
+            self._value = handle._resolve_call(
+                collect_fn,
+                self._refs,
+                worker_local=self._worker_local,
+                targets=self._targets,
+            )
+        finally:
+            self._release_leases()
         self._consumed = True
         return self._value
+
+    def _release_leases(self) -> None:
+        """Release handles owning destination TensorStore entries after RPC consumption."""
+        self._leases = None
+
+    def _discard_result(self) -> None:
+        try:
+            self.wait()
+        except Exception:
+            logger.debug("PendingHandleCall: discarded call failed during completion", exc_info=True)
+        finally:
+            self._discard_futures = None
 
 
 class Slot:
@@ -315,6 +372,7 @@ class Slot:
             worker_local,
             targets=[worker],
             collect_fn=lambda _, results: results[0],
+            leases=shards,
         )
 
     def call(self, method_name: str, *args, **kwargs) -> Any:
@@ -456,6 +514,22 @@ class Handle:
         return Slot(self, index)
 
     @property
+    def engine_slots(self) -> List[Slot]:
+        """Slots that host addressable rollout-engine heads, one per DP replica."""
+        if self.sp_size > 1:
+            raise RuntimeError(
+                f"slot-local rollout dispatch does not support sequence-parallel engines; got sp_size={self.sp_size}"
+            )
+        slots = [
+            self.slot(index)
+            for index, info in enumerate(self.rank_infos)
+            if info.tp_rank == 0 and info.pp_rank == 0 and info.sp_rank == 0
+        ]
+        if len(slots) != self.dp_size:
+            raise RuntimeError(f"expected {self.dp_size} rollout engine slots, found {len(slots)}")
+        return slots
+
+    @property
     def ep_size(self) -> int:
         """Expert-parallel degree requested for rollout-side engines."""
         return self.rank_infos[0].ep_size if self.rank_infos else 1
@@ -483,7 +557,7 @@ class Handle:
             config = getattr(method, DISTRIBUTED_CONFIG_ATTR, None)
             if config is None:
                 continue
-            if name == "slot":
+            if name in {"slot", "engine_slots"}:
                 raise TypeError(f"distributed method {name!r} collides with the Handle API")
 
             fns = DISPATCH_MODE_REGISTRY[config["dispatch_mode"]]
@@ -521,7 +595,7 @@ class Handle:
                 call_id = f"{method_name}_{next(self._grad_call_counter)}"
                 input_metas = collect_leaves(args, TensorRef) + collect_leaves(tuple(kwargs.values()), TensorRef)
 
-            refs, worker_local = self._launch_call(
+            refs, worker_local, leases = self._launch_call(
                 method_name,
                 dispatch_mode,
                 dispatch_fn,
@@ -531,12 +605,15 @@ class Handle:
                 grad_mode=ctx is not None,
                 call_id=call_id,
             )
-            collected = self._resolve_call(
-                collect_fn,
-                refs,
-                worker_local=worker_local,
-                ray_get_timeout=ray_get_timeout,
-            )
+            try:
+                collected = self._resolve_call(
+                    collect_fn,
+                    refs,
+                    worker_local=worker_local,
+                    ray_get_timeout=ray_get_timeout,
+                )
+            finally:
+                leases.clear()
 
             if ctx is not None:
                 output_metas = collect_leaves(collected, TensorRef)
@@ -567,8 +644,8 @@ class Handle:
         *,
         grad_mode: bool,
         call_id: Optional[str],
-    ) -> Tuple[List, bool]:
-        """Launch a distributed call; returns ``(refs, worker_local)``."""
+    ) -> Tuple[List, bool, List]:
+        """Launch a distributed call and retain localized argument leases."""
         batch_size = infer_batch_size(args, kwargs)
         if (
             dispatch_mode in (Dispatch.DP_SCATTER, Dispatch.DP_SCATTER_HEAD)
@@ -582,7 +659,7 @@ class Handle:
         worker_local = issubclass(transport_cls, WorkerLocalTransport)
         shards = transport_cls.localize(shards, self.pool, self.device_ids, self.worker_ids)
         refs = execute_fn(method_name, shards, grad_mode=grad_mode, call_id=call_id)
-        return refs, worker_local
+        return refs, worker_local, shards
 
     def _resolve_call(
         self,
@@ -608,7 +685,7 @@ class Handle:
                 f"{method_name!r} is not a @distributed method of {_owning_class(self.role_cls).__name__}"
             ) from None
 
-        refs, worker_local = self._launch_call(
+        refs, worker_local, leases = self._launch_call(
             method_name,
             dispatch_mode,
             dispatch_fn,
@@ -618,7 +695,7 @@ class Handle:
             grad_mode=False,
             call_id=None,
         )
-        return PendingHandleCall(self, method_name, refs, worker_local)
+        return PendingHandleCall(self, method_name, refs, worker_local, leases=leases)
 
     def _execute_all(self, method_name: str, shards: List, grad_mode: bool = False, call_id=None) -> List:
         """Send RPC to all Workers."""

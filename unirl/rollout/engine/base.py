@@ -68,6 +68,10 @@ class BaseRolloutEngine(Remote, ABC):
     def generate(self, sample: Sample) -> Sample:
         """Synchronously fill and return one request ``Sample``; each concrete contract owns its dispatch mode."""
 
+    def generate_on_slot(self, sample: Sample) -> Sample:
+        """Undecorated per-engine entry point for driver-side lane dispatch."""
+        return self.generate(sample)
+
     def abort(self, ids: Optional[List[str]] = None) -> List[Sample]:
         """Best-effort cancel of in-flight generation; return any partials. Default no-op."""
         del ids

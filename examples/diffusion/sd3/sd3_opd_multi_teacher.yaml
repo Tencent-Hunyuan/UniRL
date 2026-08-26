@@ -234,7 +234,7 @@ sampling:
   trajectory_precision: fp16
   logprob_precision: fp32
   scheduler:
-    _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+    _target_: unirl.sde.index_schedule.AllSDEScheduler
     num_timesteps: ${..num_inference_steps}
     # OPD distills (nearly) ALL steps, unlike GRPO's sparse SDE gating.
     # Paper: timestep_fraction=0.99 -> 9/10 steps trained.

@@ -3,28 +3,11 @@
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Type, Union
+from typing import List, Literal, Optional, Set, Tuple, Union
 
 import numpy as np
 
 Strategy = Literal["all", "progressive", "random", "decay", "exp_decay"]
-
-
-@dataclass
-class SchedulerConfig:
-    """Typed view of the indices-scheduler options consumed by ``create_indices_scheduler``."""
-
-    timestep_strategy: str = "all"
-    timestep_fraction: Any = 1.0
-    num_sde_steps: Optional[int] = None
-    window_strategy: str = "progressive"
-    window_size: int = 4
-    iters_per_window: int = 25
-    window_init_timestep: int = 0
-    overlap_size: int = 0
-    roll_back: bool = False
-    max_iters_per_window: Optional[int] = None
-    min_iters_per_window: Optional[int] = None
 
 
 @dataclass
@@ -161,50 +144,3 @@ class WindowScheduler(TimestepScheduler):
         max_start = max(0, self.num_timesteps - self.config.window_size)
         cur_timestep = int(rng.integers(0, max_start + 1))
         return set(range(cur_timestep, cur_timestep + self.config.window_size))
-
-
-SCHEDULER_REGISTRY: Dict[str, Type[TimestepScheduler]] = {
-    "all": AllSDEScheduler,
-    "window": WindowScheduler,
-}
-
-
-def create_indices_scheduler(
-    *,
-    scheduler_config: Union[SchedulerConfig, Dict[str, Any]],
-    num_timesteps: int,
-) -> TimestepScheduler:
-    """Create an index scheduler from a ``SchedulerConfig`` (or legacy dict)."""
-
-    if isinstance(scheduler_config, dict):
-
-        def _read(name: str, default: Any) -> Any:
-            return scheduler_config.get(name, default)
-
-    else:
-
-        def _read(name: str, default: Any) -> Any:
-            return getattr(scheduler_config, name, default)
-
-    scheduler_type = str(_read("timestep_strategy", "all"))
-    if scheduler_type == "all":
-        return AllSDEScheduler(
-            num_timesteps=int(num_timesteps),
-            timestep_fraction=_read("timestep_fraction", 1.0),
-            num_sde_steps=_read("num_sde_steps", None),
-        )
-    if scheduler_type == "window":
-        return WindowScheduler(
-            int(num_timesteps),
-            WindowConfig(
-                strategy=_read("window_strategy", "progressive"),
-                window_size=int(_read("window_size", 4)),
-                iters_per_window=int(_read("iters_per_window", 25)),
-                init_timestep=int(_read("window_init_timestep", 0)),
-                overlap_size=int(_read("overlap_size", 0)),
-                roll_back=bool(_read("roll_back", False)),
-                max_iters_per_window=_read("max_iters_per_window", None),
-                min_iters_per_window=_read("min_iters_per_window", None),
-            ),
-        )
-    raise ValueError(f"Unknown scheduler_type: {scheduler_type}. Available: {list(SCHEDULER_REGISTRY.keys())}")

@@ -120,6 +120,12 @@ dev = [
 # LeRobot droid100 prep reads parquet metadata with pandas and decodes video with
 # av. The av bound matches the sglang/vllm extras so installing both cannot
 # conflict.
+#
+# torch is deliberately NOT here even though droid100 imports it (clip resize +
+# .pt writes): adding it would put a second torch declaration outside the engine
+# extras, and pinning exactly one is what lets each engine carry its own CUDA
+# stack. droid100 is the only converter that needs it; datasets/droid100/README.md
+# says so, and every other converter runs in a bare dataset-prep venv.
 dataset-prep = [
   "datasets>=2.14",
   "pandas>=2",

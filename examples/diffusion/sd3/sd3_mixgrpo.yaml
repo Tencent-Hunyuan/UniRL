@@ -133,10 +133,10 @@ sampling:
   # SDE-recorded steps advances with the rollout id; rolls back to the start
   # once it sweeps the schedule.
   scheduler:
-    _target_: unirl.utils.scheduler_utils.WindowScheduler
+    _target_: unirl.sde.index_schedule.WindowScheduler
     num_timesteps: ${..num_inference_steps}
     config:
-      _target_: unirl.utils.scheduler_utils.WindowConfig
+      _target_: unirl.sde.index_schedule.WindowConfig
       strategy: progressive
       window_size: 4
       iters_per_window: 25

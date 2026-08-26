@@ -10,6 +10,8 @@ from typing import TYPE_CHECKING, Any, Callable, Deque, List, Optional, Sequence
 if TYPE_CHECKING:
     from unirl.types.sample import Sample
 
+_WORKER_CONTROL_CONCURRENCY = 2
+
 
 Launch = Callable[["Sample"], Any]
 
@@ -94,6 +96,25 @@ class RolloutPool:
             self._completed.clear()
             return completed
 
+    def run_to_completion(self, tasks: List["Sample"]) -> List[_PendingUnit]:
+        """Run an isolated task prefix to completion while the pool is otherwise idle."""
+        with self._condition:
+            self._raise_if_unavailable()
+            if self._queue or self._running or self._completed or any(self._reserved):
+                raise RuntimeError("run_to_completion requires an idle RolloutPool")
+            for task in tasks:
+                self._queue.append((self._next_sequence, task))
+                self._next_sequence += 1
+            self._paused = False
+            self._condition.notify_all()
+            while (self._queue or self._running or any(self._reserved)) and self._failure is None:
+                self._condition.wait()
+            self._raise_if_failed()
+            self._paused = True
+            completed = list(self._completed)
+            self._completed.clear()
+            return completed
+
     @property
     def live(self) -> bool:
         with self._condition:
@@ -116,6 +137,12 @@ class RolloutPool:
             self._queue.clear()
             self._condition.notify_all()
         self._thread.join()
+        with self._condition:
+            pending = [*self._running, *self._completed]
+            self._running.clear()
+            self._completed.clear()
+        for unit in pending:
+            unit.pending.discard_on_completion()
 
     def _has_remote_work(self) -> bool:
         return bool(self._queue or self._running or any(self._reserved))
@@ -134,7 +161,7 @@ class RolloutPool:
             with self._condition:
                 if self._failure is not None:
                     return
-                if self._closed and not self._running and not any(self._reserved):
+                if self._closed:
                     return
                 plan = self._plan_launches()
                 running = list(self._running)
@@ -218,4 +245,35 @@ class RolloutPool:
             self._condition.notify_all()
 
 
-__all__ = ["RolloutPool"]
+def required_worker_concurrency(per_worker_inflight: int) -> int:
+    """Return actor concurrency that leaves room for rollout control calls."""
+    return per_worker_inflight + _WORKER_CONTROL_CONCURRENCY
+
+
+def validate_worker_inflight(
+    per_worker_inflight: int,
+    *,
+    worker_max_concurrency: int,
+    engine_concurrency: Optional[int],
+) -> None:
+    """Validate per-worker rollout concurrency against actor and engine capacity."""
+    if per_worker_inflight <= 0:
+        raise ValueError(f"per_worker_inflight must be positive; got {per_worker_inflight}")
+
+    # Reserve control-call threads for set_stopping, sleep, and weight sync
+    # while rollout calls occupy their own slots.
+    required_concurrency = required_worker_concurrency(per_worker_inflight)
+    if worker_max_concurrency < required_concurrency:
+        raise ValueError(
+            f"worker_max_concurrency ({worker_max_concurrency}) must be >= per_worker_inflight "
+            f"+ {_WORKER_CONTROL_CONCURRENCY} "
+            f"({required_concurrency}) so rollout calls cannot starve control calls"
+        )
+
+    if engine_concurrency is not None and per_worker_inflight > engine_concurrency:
+        raise ValueError(
+            f"per_worker_inflight ({per_worker_inflight}) exceeds engine concurrency ({engine_concurrency})"
+        )
+
+
+__all__ = ["RolloutPool", "required_worker_concurrency", "validate_worker_inflight"]
