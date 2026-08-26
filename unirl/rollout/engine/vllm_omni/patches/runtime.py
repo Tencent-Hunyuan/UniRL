@@ -7,7 +7,6 @@ import os
 import signal
 import threading
 import time
-from dataclasses import replace as dataclass_replace
 from multiprocessing.process import BaseProcess as _MpBaseProcess
 from types import MethodType
 
@@ -437,23 +436,19 @@ def patch_fp32_skip() -> None:
             _mod.from_layer = _patched_from_layer
 
 
-def _diffusers_hv15_attention_mask(
-    attention_mask: torch.Tensor,
-    query_length: int,
-    key_length: int,
-) -> torch.Tensor:
-    """Expand a HunyuanVideo-1.5 key mask to Diffusers' symmetric [B, 1, Q, K] layout."""
-    if attention_mask.ndim != 2 or query_length != key_length or attention_mask.shape[1] != key_length:
-        return attention_mask
+def _diffusers_hv15_rmsnorm(norm, hidden_states: torch.Tensor) -> torch.Tensor:
+    """Run the exact Diffusers RMSNorm ordering on a vLLM RMSNorm module."""
+    variance = hidden_states.to(torch.float32).pow(2).mean(-1, keepdim=True)
+    hidden_states = hidden_states * torch.rsqrt(variance + norm.variance_epsilon)
 
-    batch_size = attention_mask.shape[0]
-    mask = attention_mask.bool().view(batch_size, 1, 1, key_length)
-    mask = mask.repeat(1, 1, query_length, 1)
-    return (mask & mask.transpose(2, 3)).bool()
+    weight = norm.weight
+    if weight.dtype in (torch.float16, torch.bfloat16):
+        hidden_states = hidden_states.to(weight.dtype)
+    return hidden_states * weight
 
 
-def patch_hv15_sdpa_attention_mask() -> None:
-    """Match Diffusers' HunyuanVideo-1.5 SDPA mask layout when sequence parallelism is inactive."""
+def patch_hv15_qk_rmsnorm() -> None:
+    """Match Diffusers' HunyuanVideo-1.5 Q/K RMSNorm instead of the pinned fused vLLM-C kernel."""
     try:
         from vllm_omni.diffusion.models.hunyuan_video.hunyuan_video_15_transformer import (
             HunyuanVideo15Attention,
@@ -462,42 +457,27 @@ def patch_hv15_sdpa_attention_mask() -> None:
         return
 
     original_init = HunyuanVideo15Attention.__init__
-    if getattr(original_init, "_diffrl_hv15_sdpa_mask", False):
+    if getattr(original_init, "_diffrl_hv15_qk_rmsnorm", False):
         return
 
     def _patched_init(self, *args, _orig=original_init, **kwargs):
         _orig(self, *args, **kwargs)
 
-        attention_layer = self.attn
-        original_forward = attention_layer.forward
+        for name in ("norm_q", "norm_k", "norm_added_q", "norm_added_k"):
+            norm = getattr(self, name, None)
+            if norm is None or getattr(norm.forward, "_diffrl_hv15_qk_rmsnorm", False):
+                continue
+            original_forward = norm.forward
 
-        def _patched_forward(
-            layer,
-            query,
-            key,
-            value,
-            attn_metadata=None,
-            _orig_forward=original_forward,
-        ):
-            if attn_metadata is not None and attn_metadata.attn_mask is not None:
-                strategy = layer._get_active_parallel_strategy()
-                implementation = layer.sdpa_fallback if query.dtype == torch.float32 else layer.attention
-                if type(strategy).__name__ == "NoParallelAttention" and type(implementation).__module__.endswith(
-                    ".sdpa"
-                ):
-                    attention_mask = _diffusers_hv15_attention_mask(
-                        attn_metadata.attn_mask,
-                        query.shape[1],
-                        key.shape[1],
-                    )
-                    if attention_mask is not attn_metadata.attn_mask:
-                        attn_metadata = dataclass_replace(attn_metadata, attn_mask=attention_mask)
-            return _orig_forward(query, key, value, attn_metadata)
+            def _patched_forward(layer, hidden_states, residual=None, _orig_forward=original_forward):
+                if residual is not None:
+                    return _orig_forward(hidden_states, residual)
+                return _diffusers_hv15_rmsnorm(layer, hidden_states)
 
-        _patched_forward._diffrl_hv15_sdpa_mask = True
-        attention_layer.forward = MethodType(_patched_forward, attention_layer)
+            _patched_forward._diffrl_hv15_qk_rmsnorm = True
+            norm.forward = MethodType(_patched_forward, norm)
 
-    _patched_init._diffrl_hv15_sdpa_mask = True
+    _patched_init._diffrl_hv15_qk_rmsnorm = True
     HunyuanVideo15Attention.__init__ = _patched_init
 
 
@@ -728,7 +708,7 @@ class VLLMOmniHijack:
         patch_ar_lora_loader()
         patch_ar_merged_lora_fused_tensor()
         patch_fp32_skip()
-        patch_hv15_sdpa_attention_mask()
+        patch_hv15_qk_rmsnorm()
         patch_lora_request_passthrough()
         patch_per_request_ar_seed()
         patch_sigmas_passthrough()
@@ -740,7 +720,7 @@ class VLLMOmniHijack:
 __all__ = [
     "OmniTensorLoRARequest",
     "VLLMOmniHijack",
-    "patch_hv15_sdpa_attention_mask",
+    "patch_hv15_qk_rmsnorm",
     "patch_hi3_flow_alignment",
     "patch_per_request_ar_seed",
     "patch_sigmas_passthrough",
