@@ -86,6 +86,10 @@ class MiniMaxH3InputAdapter(DitInputAdapter):
             audio_flow_shift=self.audio_shift,
             audio_joint_sde=self.audio_joint_sde,
             capture_transition_means=bool(sampler_kwargs.get("capture_transition_means", False)),
+            # Only forward-process recipes need this: with SDE steps the pipeline
+            # already infers that it is recording for an algorithm, and eval must
+            # keep inferring the opposite from the same empty schedule.
+            record_trajectory=bool(sampler_kwargs.get("record_trajectory", False)),
         )
         kwargs["extra_args"] = extra
         return sampling
@@ -183,8 +187,14 @@ class MiniMaxH3OutputAdapter:
                     primitive_metadata={"audio": {"sample_rate": MINIMAX_H3_AUDIO_SAMPLE_RATE}},
                 )
             )
-        if any(log_prob is None for log_prob in rollout_log_probs):
+        # A forward-process rollout (DiffusionNFT) records no SDE transitions, so
+        # it legitimately carries no old-policy log-probs; only a GRPO-style
+        # rollout must have them.
+        forward_process = not list(schedules[0].get("sde_indices", []))
+        if not forward_process and any(log_prob is None for log_prob in rollout_log_probs):
             raise RuntimeError("MiniMax-H3 training rollout emitted no old-policy log-probs")
+        if forward_process and any(log_prob is not None for log_prob in rollout_log_probs):
+            raise RuntimeError("MiniMax-H3 forward-process rollout emitted log-probs for a schedule with no SDE steps")
         transition_means_present = [payload.get("video_means") is not None for payload in payloads]
         if any(transition_means_present) != all(transition_means_present):
             raise RuntimeError("MiniMax-H3 rollout emitted transition means for only some outputs")
@@ -231,7 +241,7 @@ class MiniMaxH3OutputAdapter:
                         f"MiniMax-H3 output {output_index} invalid {field_name} trajectory: "
                         f"shape={getattr(tensor, 'shape', None)} dtype={getattr(tensor, 'dtype', None)}"
                     )
-            if (
+            if not forward_process and (
                 not torch.is_tensor(log_prob)
                 or log_prob.dtype != torch.float32
                 or not torch.isfinite(log_prob).all()
@@ -270,7 +280,7 @@ class MiniMaxH3OutputAdapter:
                 for payload in payloads
             ]
         )
-        sde_logp = torch.cat(rollout_log_probs, dim=0).to(torch.float32)
+        sde_logp = None if forward_process else torch.cat(rollout_log_probs, dim=0).to(torch.float32)
         sde_means = (
             torch.cat([payload["video_means"] for payload in payloads], dim=0)
             if all(transition_means_present)
@@ -279,7 +289,7 @@ class MiniMaxH3OutputAdapter:
 
         sigmas = schedules[0].get("video")
         indices = expected_indices
-        sde_indices = expected_sde_indices
+        sde_indices = None if forward_process else expected_sde_indices
 
         segment = make_video_segment(
             latents=latents,

@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import subprocess
 from contextlib import nullcontext
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 import torch
 from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
@@ -20,6 +20,18 @@ from unirl.sde.kernels import CPSSDEStrategy
 from unirl.sde.noise import make_denoise_step_generators
 from unirl.types.noise_recipe import NoiseRecipe
 from unirl.types.sampling import compute_trajectory_positions
+
+
+def trajectory_positions_with_terminal(sde_indices: Iterable[int], num_steps: int) -> set[int]:
+    """Trajectory positions to capture, always including the terminal one.
+
+    A forward-process rollout (DiffusionNFT: no SDE indices) trains on the clean
+    terminal latent and nothing else, so without this the capture set would be
+    empty. Sparse GRPO replay does not need the terminal position for its
+    transitions but decode does, so it is cheaper to always keep it than to make
+    each caller remember.
+    """
+    return set(compute_trajectory_positions(set(sde_indices), num_steps)) | {int(num_steps)}
 
 
 def _h3_profile_local_ip() -> str:
@@ -361,7 +373,7 @@ class MiniMaxH3RLPipeline(MiniMaxH3Pipeline):
         sde_indices = sorted({int(index) for index in self._rl_sde_indices})
         if any(index < 0 or index >= num_steps for index in sde_indices):
             raise ValueError(f"MiniMax-H3 sde_indices out of range for {num_steps} steps: {sde_indices}")
-        needed = set(compute_trajectory_positions(set(sde_indices), num_steps))
+        needed = trajectory_positions_with_terminal(sde_indices, num_steps)
         self._rl_video_states = []
         self._rl_audio_states = []
         self._rl_trajectory_indices = []
@@ -497,6 +509,12 @@ class MiniMaxH3RLPipeline(MiniMaxH3Pipeline):
         self._rl_sde_sample_key = self._sde_sample_key_for_request(request) if self._rl_sde_indices else "0"
         self._rl_audio_joint_sde = bool(extra.get("audio_joint_sde", True))
         self._rl_capture_transition_means = bool(extra.get("capture_transition_means", False))
+        # A non-empty sde_indices used to be a sufficient test for "this rollout
+        # feeds an algorithm", because every training objective walked an SDE.
+        # A forward-process objective does not, and neither does evaluation, so
+        # the two are indistinguishable by schedule alone and the request has to
+        # say which it is.
+        self._rl_record_trajectory = bool(self._rl_sde_indices) or bool(extra.get("record_trajectory", False))
         self._rl_text_embeddings = None
 
         original_loop = h3_module.minimax_h3_denoise_loop
@@ -521,7 +539,7 @@ class MiniMaxH3RLPipeline(MiniMaxH3Pipeline):
                 "reward_video": reward_video.clamp(0, 1).mul(255).round().to(torch.uint8),
                 "reward_audio": reward_audio,
             }
-            if self._rl_sde_indices:
+            if self._rl_record_trajectory:
                 if not self._rl_video_states or self._rl_text_embeddings is None:
                     raise RuntimeError("MiniMax-H3 worker produced no replay trajectory or text embeddings")
                 payload.update(
