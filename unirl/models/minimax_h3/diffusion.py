@@ -26,6 +26,7 @@ on its own ``(sigma, sigma_next)``.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import ClassVar, List, Optional, Tuple
 
 import torch
@@ -166,7 +167,10 @@ class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
     ) -> None:
         self.bundle = bundle
         self.step = MiniMaxH3DiffusionStep(bundle)
-        self.strategy = strategy
+        self.video_strategy = strategy
+        self.audio_strategy = deepcopy(strategy)
+        # StageAlgorithm's shared transition helpers read this conventional slot.
+        self.strategy = self.video_strategy
         self.audio_shift = float(audio_shift)
         self.audio_joint_sde = bool(audio_joint_sde)
         self.trajectory_dtype = parse_torch_dtype(trajectory_precision, field_name="trajectory_precision")
@@ -224,6 +228,10 @@ class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
             f"{params.num_inference_steps}. UniRL counts model evaluations, so N steps require N+1 sigma points; "
             f"the vendored MiniMaxH3Scheduler counts those grid points and therefore uses set_timesteps(N+1).",
         )
+        self.video_strategy.init_schedule(sigmas)
+        self.audio_strategy.init_schedule(audio_sigmas)
+        video_sigma_max = float(sigmas[1].item()) if sigmas.numel() > 1 else 0.99
+        audio_sigma_max = float(audio_sigmas[1].item()) if audio_sigmas.numel() > 1 else 0.99
 
         device = self.bundle.device
         x = initial_latents.to(device=device, dtype=self.trajectory_dtype)
@@ -278,24 +286,26 @@ class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
                 layout=layout,
             )
 
-            x_next, log_prob, _ = self.strategy.denoise(
+            x_next, log_prob, _ = self.video_strategy.denoise(
                 noise_pred=video_pred,
                 sample=x,
                 sigma=sigmas[step_idx],
                 sigma_next=sigmas[step_idx + 1],
                 eta=step_eta,
                 generator=step_generators,
+                sigma_max=video_sigma_max,
                 step_index=step_idx,
             )
             # Audio steps its OWN grid -- the divergence from LTX-2.3.
             audio_eta = step_eta if audio_in_policy else 0.0
-            a_next, audio_log_prob, _ = self.strategy.denoise(
+            a_next, audio_log_prob, _ = self.audio_strategy.denoise(
                 noise_pred=audio_pred,
                 sample=a,
                 sigma=audio_sigmas[step_idx],
                 sigma_next=audio_sigmas[step_idx + 1],
                 eta=audio_eta,
                 generator=audio_step_generators,
+                sigma_max=audio_sigma_max,
                 step_index=step_idx,
             )
             x = x_next.to(dtype=self.trajectory_dtype)
@@ -361,6 +371,10 @@ class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
         conditions = conditions.trim_text_padding()
         sigmas = segment.sigmas.to(self.bundle.device)
         audio_sigmas = self.audio_schedule(sigmas)
+        self.video_strategy.init_schedule(sigmas)
+        self.audio_strategy.init_schedule(audio_sigmas)
+        video_sigma_max = float(sigmas[1].item()) if sigmas.numel() > 1 else 0.99
+        audio_sigma_max = float(audio_sigmas[1].item()) if audio_sigmas.numel() > 1 else 0.99
         num_text_tokens = int(conditions.text.embeds.shape[1])
         layout = build_t2va_layout(geometry, num_text_tokens)
 
@@ -383,23 +397,25 @@ class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
                 audio_sigma=audio_sigmas[step_idx],
                 layout=layout,
             )
-            _, log_prob, mean = self.strategy.denoise(
+            _, log_prob, mean = self.video_strategy.denoise(
                 noise_pred=video_pred,
                 sample=x,
                 sigma=sigmas[step_idx],
                 sigma_next=sigmas[step_idx + 1],
                 eta=float(params.eta),
                 prev_sample=prev_x,
+                sigma_max=video_sigma_max,
                 step_index=step_idx,
             )
             if self.audio_joint_sde:
-                _, audio_log_prob, _ = self.strategy.denoise(
+                _, audio_log_prob, _ = self.audio_strategy.denoise(
                     noise_pred=audio_pred,
                     sample=a,
                     sigma=audio_sigmas[step_idx],
                     sigma_next=audio_sigmas[step_idx + 1],
                     eta=float(params.eta),
                     prev_sample=prev_a,
+                    sigma_max=audio_sigma_max,
                     step_index=step_idx,
                 )
                 if audio_log_prob is not None:
