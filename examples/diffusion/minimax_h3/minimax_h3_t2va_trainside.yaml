@@ -9,7 +9,7 @@
 #      guidance_scale below is inert — the stage never reads it.
 #   2. TWO SCHEDULES. Video shift=12, audio shift=3. Only the VIDEO grid is
 #      pinned onto the Part; the audio grid is derived in-stage from the same
-#      static formula (verified bit-identical to the reference scheduler).
+#      static formula. N UniRL steps match N+1 vendored-scheduler grid points.
 #   3. MIXED-DTYPE WEIGHTS. `_keep_in_fp32_modules` (patch projections, timestep
 #      MLP, output heads, rope) stays fp32 while the block stack is bf16. That
 #      is why `root_wrap: false` below is load-bearing — see the backend block.
@@ -101,6 +101,7 @@ backend:
   fsdp_cfg:
     _target_: unirl.train.configs.FSDPConfig
     param_dtype: bf16
+    master_dtype: fp32
     cpu_offload: false
     mixed_precision: true
     # Keep the fp32 timestep embedding intact until each block explicitly casts
@@ -229,6 +230,7 @@ data_source:
 
 sampling:
   _target_: unirl.types.sampling.DiffusionSamplingParams
+  # UniRL counts model evaluations; 10 maps to 11 grid points in the vendored scheduler.
   num_inference_steps: 10
   # Inert: the checkpoint is guidance-distilled. Kept at 1.0 so nothing reads
   # it as an instruction to run a second branch.

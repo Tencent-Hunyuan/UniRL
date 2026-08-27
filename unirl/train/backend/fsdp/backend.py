@@ -91,6 +91,7 @@ class FSDPBackend(BaseFSDP2Backend):
             activation_checkpointing=fsdp_cfg.activation_checkpointing,
             use_torch_compile=fsdp_cfg.use_torch_compile,
             master_dtype=getattr(fsdp_cfg, "master_dtype", None),
+            master_params=tuple(shd for _, shd in shadow.iter_pairs()) if shadow is not None else (),
             root_wrap=getattr(fsdp_cfg, "root_wrap", True),
         )
 

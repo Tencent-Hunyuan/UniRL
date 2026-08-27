@@ -2,7 +2,7 @@
 # MiniMax-H3 t2va (text -> video + stereo audio) DiffusionNFT — trainside FSDP.
 #
 # Against the sibling `minimax_h3_t2va_trainside.yaml` (Flow-GRPO, 768x768):
-# a forward-process objective, 256x384, all 10 timesteps trained, and a reward
+# a forward-process objective, 256x384, all 10 transitions trained, and a reward
 # that scores audio/video agreement rather than a single frame.
 #
 # Launch (1 node x 8 GPUs):
@@ -68,6 +68,7 @@ backend:
   fsdp_cfg:
     _target_: unirl.train.configs.FSDPConfig
     param_dtype: bf16
+    master_dtype: fp32
     cpu_offload: false
     mixed_precision: true
     # Keep the fp32 timestep embedding intact until each block explicitly casts
@@ -157,7 +158,7 @@ algorithm:
   adv_clip_max: 5.0
   adv_mode: raw
   use_adaptive_weight: true
-  # Read the rollout's own 10-step schedule and train on all of it; Flow-GRPO
+  # Read the rollout's own 10-transition schedule and train on all of it; Flow-GRPO
   # could only afford 4 because replay builds one graph across every step.
   train_timestep_mode: all
   shuffle_train_timesteps: true
@@ -185,6 +186,7 @@ data_source:
 
 sampling:
   _target_: unirl.types.sampling.DiffusionSamplingParams
+  # UniRL counts model evaluations; 10 maps to 11 grid points in the vendored scheduler.
   num_inference_steps: 10
   # Inert: the checkpoint is guidance-distilled.
   guidance_scale: 1.0

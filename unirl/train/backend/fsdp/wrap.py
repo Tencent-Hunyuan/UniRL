@@ -34,6 +34,7 @@ def fsdp_wrap(
     activation_checkpointing: bool = False,
     use_torch_compile: bool = False,
     master_dtype: Optional[str] = None,
+    master_params: Tuple[torch.Tensor, ...] = (),
     root_wrap: bool = True,
 ) -> None:
     """Apply FSDP2 wrapping to the model.  No handle returned — DTensors
@@ -87,11 +88,12 @@ def fsdp_wrap(
     block_instances = _enumerate_block_instances(model, block_class_names)
 
     casts = 0
-    # Keep trainable masters at master_dtype; bf16 pre-casting can erase small optimizer steps.
+    master_param_ids = {id(p) for p in master_params}
+    # Keep trainable and EMA shadow masters at master_dtype.
     for p in model.parameters():
         if isinstance(p, DTensor) or not p.dtype.is_floating_point:
             continue  # already-wrapped params and ints never cast
-        if trainable_dtype is not None and p.requires_grad:
+        if trainable_dtype is not None and (p.requires_grad or id(p) in master_param_ids):
             dst = trainable_dtype
         elif not mixed_precision:
             dst = target_dtype
