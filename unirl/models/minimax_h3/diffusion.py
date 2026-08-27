@@ -178,10 +178,10 @@ class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
     def audio_schedule(self, video_schedule: torch.Tensor) -> torch.Tensor:
         """The audio sigma grid, derived from the video one.
 
-        MiniMax-H3's grids are both plain rectified flow -- ``linspace(1, 0, N)``
-        put through ``shift*t / (1 + (shift-1)*t)`` -- which is precisely
-        ``get_sigma_schedule``'s static branch. Deriving audio here rather than
-        pinning a second schedule onto the generation Part keeps
+        MiniMax-H3's grids are both plain rectified flow. For ``N`` UniRL
+        transitions, ``get_sigma_schedule`` builds ``N + 1`` points, matching
+        the vendored scheduler called with ``set_timesteps(N + 1)``. Deriving
+        audio here rather than pinning a second schedule onto the generation Part keeps
         ``LatentSegment.sigmas`` and ``DiffusionSamplingParams`` untouched: the
         audio grid is a pure function of ``(num_steps, audio_shift)``, so there
         is nothing for a rollout engine to disagree with.
@@ -212,6 +212,7 @@ class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
             f"unbatched per-row metadata, so callers chunk instead: set rollout.forward_batch_size=1 and "
             f"stack.micro_batch_size=1. Mirrors the bagel navit recipe.",
         )
+        conditions = conditions.trim_text_padding()
         num_text_tokens = int(conditions.text.embeds.shape[1])
         layout = build_t2va_layout(geometry, num_text_tokens)
         audio_sigmas = self.audio_schedule(sigmas)
@@ -220,8 +221,8 @@ class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
         require(
             num_steps == int(params.num_inference_steps),
             f"MiniMaxH3DiffusionStage: schedule holds {num_steps} transitions but params.num_inference_steps="
-            f"{params.num_inference_steps}. MiniMax-H3 counts the terminal sigma inside its step count; UniRL's "
-            f"get_sigma_schedule(n) returns n+1 grid points for n transitions. Pin one convention in the recipe.",
+            f"{params.num_inference_steps}. UniRL counts model evaluations, so N steps require N+1 sigma points; "
+            f"the vendored MiniMaxH3Scheduler counts those grid points and therefore uses set_timesteps(N+1).",
         )
 
         device = self.bundle.device
@@ -259,6 +260,15 @@ class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
                 if step_eta > 0.0 and denoise_seed_keys is not None
                 else None
             )
+            audio_step_generators = (
+                make_denoise_step_generators(
+                    base_seed=int(denoise_base_seed),
+                    step_index=step_idx,
+                    sample_ids=[f"{key}::audio" for key in denoise_seed_keys],
+                )
+                if step_eta > 0.0 and audio_in_policy and denoise_seed_keys is not None
+                else None
+            )
             video_pred, audio_pred = self.step.predict_noise(
                 conditions,
                 video_sample=x,
@@ -285,6 +295,7 @@ class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
                 sigma=audio_sigmas[step_idx],
                 sigma_next=audio_sigmas[step_idx + 1],
                 eta=audio_eta,
+                generator=audio_step_generators,
                 step_index=step_idx,
             )
             x = x_next.to(dtype=self.trajectory_dtype)
@@ -348,6 +359,7 @@ class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
         if geometry is None:
             geometry = MiniMaxH3Geometry.from_params(params)
 
+        conditions = conditions.trim_text_padding()
         sigmas = segment.sigmas.to(self.bundle.device)
         audio_sigmas = self.audio_schedule(sigmas)
         num_text_tokens = int(conditions.text.embeds.shape[1])
@@ -440,6 +452,7 @@ class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
             f"sequence carries unbatched per-row metadata, so callers chunk instead: set stack.micro_batch_size=1 "
             f"and rollout.forward_batch_size=1. Same discipline as generate().",
         )
+        conditions = conditions.trim_text_padding()
         geometry = MiniMaxH3Geometry.from_params(params)
         video_sample, audio_sample = unpack_dual_streams(sample, geometry)
         layout = build_t2va_layout(geometry, int(conditions.text.embeds.shape[1]))

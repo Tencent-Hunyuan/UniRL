@@ -82,12 +82,13 @@ class MiniMaxH3Pipeline(Pipeline):
     def build_schedule_policy(self) -> FlowMatchSchedulePolicy:
         """The VIDEO sigma policy the hosting engine pins onto the Part.
 
-        MiniMax-H3's grid is ``linspace(1, 0, N)`` put through
-        ``shift*t / (1 + (shift-1)*t)`` -- exactly UniRL's *static* branch, so no
-        bespoke policy subclass is needed (contrast LTX-2, which needed one for
-        its constant-mu dynamic shift). The audio grid is the same function at
-        ``audio_shift`` and is derived inside the diffusion stage rather than
-        pinned, so there is only ever one schedule on the wire.
+        For ``N`` UniRL denoising transitions, the grid is
+        ``linspace(1, 0, N + 1)`` put through
+        ``shift*t / (1 + (shift-1)*t)``. This equals the vendored
+        ``MiniMaxH3Scheduler.set_timesteps(N + 1)`` grid: that scheduler counts
+        sigma points, while UniRL's ``num_inference_steps`` counts model
+        evaluations. The audio grid uses the same mapping at ``audio_shift``
+        and is derived inside the diffusion stage rather than pinned.
         """
         return FlowMatchSchedulePolicy.static_only(shift=float(self.config.video_shift))
 

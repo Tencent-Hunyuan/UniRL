@@ -112,7 +112,11 @@ class MiniMaxH3TextEmbedStage:
             f"geometry must be identical across the batch (LatentSegment stores latents in a CONCAT field), so a "
             f"mixed-length batch cannot be packed. Pad or group prompts by token length upstream.",
         )
-        return TextEmbedCondition(embeds=torch.cat(embeds, dim=0))
+        text_embeds = torch.cat(embeds, dim=0)
+        return TextEmbedCondition(
+            embeds=text_embeds,
+            attn_mask=torch.ones(text_embeds.shape[:2], dtype=torch.bool, device=text_embeds.device),
+        )
 
 
 __all__ = ["MiniMaxH3TextEmbedStage"]
