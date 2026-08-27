@@ -319,7 +319,6 @@ class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
             sde_logp=torch.stack(sde_logp_list, dim=1) if sde_logp_list else None,
             sde_indices=(torch.tensor(sde_sorted, dtype=torch.long, device=device) if sde_sorted else None),
             aux_latents=torch.stack(stored_audio, dim=1),
-            initial_latents=initial_latents.detach().clone(),
         )
 
     def replay(
