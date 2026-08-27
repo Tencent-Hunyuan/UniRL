@@ -35,7 +35,6 @@ bundle:
     # fp32 by checkpoint contract; the audio VAE emits ~20 dB too quiet in bf16.
     vae_dtype: fp32
     audio_vae_dtype: fp32
-    autocast_precision: bf16
     trajectory_precision: fp16
     logprob_precision: fp32
     # Reverse-schedule shifts, so rollout-only: a forward-process objective jumps
@@ -71,12 +70,16 @@ backend:
     param_dtype: bf16
     cpu_offload: false
     mixed_precision: true
+    # Keep the fp32 timestep embedding intact until each block explicitly casts
+    # the post-SiLU value to its bf16 AdaLN projection.
+    cast_forward_inputs: false
     fsdp_mode: full
     reshard_after_forward: true
     activation_checkpointing: true
     use_torch_compile: false
-    # LOAD-BEARING. Keeps the fp32-pinned leftovers (proj_in, audio_proj_in,
-    # time_embedder, proj_out, audio_proj_out, rope) outside every fully_shard
+    # LOAD-BEARING alongside cast_forward_inputs=false. Keeps the fp32-pinned
+    # leftovers (proj_in, audio_proj_in, time_embedder, proj_out,
+    # audio_proj_out, rope) outside every fully_shard
     # group, so no bf16 compute copy is all-gathered for them. True runs the
     # timestep MLP in bf16, where t = 1 - sigma near 1.0 has ~0.008 spacing.
     root_wrap: false

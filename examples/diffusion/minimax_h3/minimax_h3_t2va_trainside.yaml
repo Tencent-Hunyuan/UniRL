@@ -47,7 +47,6 @@ bundle:
     # the reference reports bf16 output ~20 dB too quiet.
     vae_dtype: fp32
     audio_vae_dtype: fp32
-    autocast_precision: bf16
     trajectory_precision: fp16
     logprob_precision: fp32
     video_shift: 12.0
@@ -104,12 +103,16 @@ backend:
     param_dtype: bf16
     cpu_offload: false
     mixed_precision: true
+    # Keep the fp32 timestep embedding intact until each block explicitly casts
+    # the post-SiLU value to its bf16 AdaLN projection.
+    cast_forward_inputs: false
     fsdp_mode: full
     reshard_after_forward: true
     activation_checkpointing: true
     use_torch_compile: false
-    # LOAD-BEARING. With root_wrap false the fp32-pinned leftovers (proj_in,
-    # audio_proj_in, time_embedder, proj_out, audio_proj_out, rope) sit outside
+    # LOAD-BEARING alongside cast_forward_inputs=false. With root_wrap false,
+    # the fp32-pinned leftovers (proj_in, audio_proj_in, time_embedder,
+    # proj_out, audio_proj_out, rope) sit outside
     # every fully_shard group, so MixedPrecisionPolicy never all-gathers a bf16
     # compute copy of them and they keep the precision the checkpoint stores.
     # Under LoRA they are frozen, so the stray-trainable-param guard passes.

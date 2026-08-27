@@ -27,6 +27,7 @@ def fsdp_wrap(
     param_dtype: str = "bf16",
     cpu_offload: bool = False,
     mixed_precision: bool = True,
+    cast_forward_inputs: bool = True,
     fsdp_mode: str = "full",
     reshard_after_forward: bool = True,
     forward_prefetch: bool = False,
@@ -72,6 +73,7 @@ def fsdp_wrap(
         fsdp_kwargs["mp_policy"] = MixedPrecisionPolicy(
             param_dtype=target_dtype,
             reduce_dtype=torch.float32,
+            cast_forward_inputs=bool(cast_forward_inputs),
         )
     if cpu_offload:
         fsdp_kwargs["offload_policy"] = CPUOffloadPolicy()
@@ -153,13 +155,14 @@ def fsdp_wrap(
     if _current_rank() == 0:
         logger.info(
             "fsdp_wrap: wrapped %d block(s) of class %r "
-            "(%s, cpu_offload=%s, mixed_precision=%s, reshard=%s, prefetch=%s, "
+            "(%s, cpu_offload=%s, mixed_precision=%s, cast_forward_inputs=%s, reshard=%s, prefetch=%s, "
             "ac=%s, compile=%s, dtype_casts=%d, master_dtype=%s, root_wrap=%s)",
             len(block_instances),
             tuple(block_class_names),
             fsdp_mode,
             cpu_offload,
             mixed_precision,
+            cast_forward_inputs,
             reshard_after_forward,
             forward_prefetch,
             activation_checkpointing,

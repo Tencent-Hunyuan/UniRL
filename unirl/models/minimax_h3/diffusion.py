@@ -26,7 +26,6 @@ on its own ``(sigma, sigma_next)``.
 
 from __future__ import annotations
 
-from contextlib import nullcontext
 from typing import ClassVar, List, Optional, Tuple
 
 import torch
@@ -162,7 +161,6 @@ class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
         *,
         audio_shift: float,
         audio_joint_sde: bool = True,
-        autocast_precision: str = "bf16",
         trajectory_precision: str = "fp16",
         logprob_precision: str = "fp32",
     ) -> None:
@@ -171,7 +169,6 @@ class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
         self.strategy = strategy
         self.audio_shift = float(audio_shift)
         self.audio_joint_sde = bool(audio_joint_sde)
-        self.autocast_dtype = parse_torch_dtype(autocast_precision, field_name="autocast_precision")
         self.trajectory_dtype = parse_torch_dtype(trajectory_precision, field_name="trajectory_precision")
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="logprob_precision")
 
@@ -194,14 +191,6 @@ class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
             shift=self.audio_shift,
             device=video_schedule.device,
         ).to(dtype=video_schedule.dtype)
-
-    def _autocast(self):
-        # Gated on the dtype, not on the device: ``Remote.setup`` rebinds
-        # ``bundle.device`` to a plain string, so ``.type`` is not available
-        # here. Same shape as every other diffusion stage in the repo.
-        if self.autocast_dtype == torch.float32:
-            return nullcontext()
-        return torch.autocast("cuda", dtype=self.autocast_dtype)
 
     def generate(
         self,
@@ -254,63 +243,62 @@ class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
             stored_audio.append(a.detach().clone())
 
         audio_in_policy = self.audio_joint_sde
-        with self._autocast():
-            for step_idx in range(num_steps):
-                step_eta = float(params.eta) if step_idx in sde_set else 0.0
-                # Per-STEP generators: the seed tuple is (base_seed, step_index,
-                # sample_id), so this must be rebuilt inside the loop. Hoisting
-                # it out would make each step draw from a running stream instead
-                # of its own seed, and rollout/replay would stop agreeing across
-                # engines. Mirrors ltx2.
-                step_generators = (
-                    make_denoise_step_generators(
-                        base_seed=int(denoise_base_seed),
-                        step_index=step_idx,
-                        sample_ids=[str(key) for key in denoise_seed_keys],
+        for step_idx in range(num_steps):
+            step_eta = float(params.eta) if step_idx in sde_set else 0.0
+            # Per-STEP generators: the seed tuple is (base_seed, step_index,
+            # sample_id), so this must be rebuilt inside the loop. Hoisting
+            # it out would make each step draw from a running stream instead
+            # of its own seed, and rollout/replay would stop agreeing across
+            # engines. Mirrors ltx2.
+            step_generators = (
+                make_denoise_step_generators(
+                    base_seed=int(denoise_base_seed),
+                    step_index=step_idx,
+                    sample_ids=[str(key) for key in denoise_seed_keys],
+                )
+                if step_eta > 0.0 and denoise_seed_keys is not None
+                else None
+            )
+            video_pred, audio_pred = self.step.predict_noise(
+                conditions,
+                video_sample=x,
+                audio_sample=a,
+                video_sigma=sigmas[step_idx],
+                audio_sigma=audio_sigmas[step_idx],
+                layout=layout,
+            )
+
+            x_next, log_prob, _ = self.strategy.denoise(
+                noise_pred=video_pred,
+                sample=x,
+                sigma=sigmas[step_idx],
+                sigma_next=sigmas[step_idx + 1],
+                eta=step_eta,
+                generator=step_generators,
+                step_index=step_idx,
+            )
+            # Audio steps its OWN grid -- the divergence from LTX-2.3.
+            audio_eta = step_eta if audio_in_policy else 0.0
+            a_next, audio_log_prob, _ = self.strategy.denoise(
+                noise_pred=audio_pred,
+                sample=a,
+                sigma=audio_sigmas[step_idx],
+                sigma_next=audio_sigmas[step_idx + 1],
+                eta=audio_eta,
+                step_index=step_idx,
+            )
+            x = x_next.to(dtype=self.trajectory_dtype)
+            a = a_next.to(dtype=self.trajectory_dtype)
+
+            if (step_idx + 1) in needed:
+                stored_pairs.append((step_idx + 1, x.detach().clone()))
+                stored_audio.append(a.detach().clone())
+            if log_prob is not None:
+                if audio_in_policy and audio_log_prob is not None:
+                    log_prob = _combine_modality_logp(
+                        log_prob, audio_log_prob, n_video=x[0].numel(), n_audio=a[0].numel()
                     )
-                    if step_eta > 0.0 and denoise_seed_keys is not None
-                    else None
-                )
-                video_pred, audio_pred = self.step.predict_noise(
-                    conditions,
-                    video_sample=x,
-                    audio_sample=a,
-                    video_sigma=sigmas[step_idx],
-                    audio_sigma=audio_sigmas[step_idx],
-                    layout=layout,
-                )
-
-                x_next, log_prob, _ = self.strategy.denoise(
-                    noise_pred=video_pred,
-                    sample=x,
-                    sigma=sigmas[step_idx],
-                    sigma_next=sigmas[step_idx + 1],
-                    eta=step_eta,
-                    generator=step_generators,
-                    step_index=step_idx,
-                )
-                # Audio steps its OWN grid -- the divergence from LTX-2.3.
-                audio_eta = step_eta if audio_in_policy else 0.0
-                a_next, audio_log_prob, _ = self.strategy.denoise(
-                    noise_pred=audio_pred,
-                    sample=a,
-                    sigma=audio_sigmas[step_idx],
-                    sigma_next=audio_sigmas[step_idx + 1],
-                    eta=audio_eta,
-                    step_index=step_idx,
-                )
-                x = x_next.to(dtype=self.trajectory_dtype)
-                a = a_next.to(dtype=self.trajectory_dtype)
-
-                if (step_idx + 1) in needed:
-                    stored_pairs.append((step_idx + 1, x.detach().clone()))
-                    stored_audio.append(a.detach().clone())
-                if log_prob is not None:
-                    if audio_in_policy and audio_log_prob is not None:
-                        log_prob = _combine_modality_logp(
-                            log_prob, audio_log_prob, n_video=x[0].numel(), n_audio=a[0].numel()
-                        )
-                    sde_logp_list.append(log_prob.to(dtype=self.logprob_dtype))
+                sde_logp_list.append(log_prob.to(dtype=self.logprob_dtype))
 
         positions = [p for p, _ in stored_pairs]
         return make_video_segment(
@@ -370,46 +358,45 @@ class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
 
         log_probs: List[torch.Tensor] = []
         means: List[torch.Tensor] = []
-        with self._autocast():
-            for step_idx in targets:
-                x = segment.latents_at(step_idx).to(self.bundle.device)
-                a = segment.aux_latents_at(step_idx).to(self.bundle.device)
-                prev_x = segment.latents_at(step_idx + 1).to(self.bundle.device)
-                prev_a = segment.aux_latents_at(step_idx + 1).to(self.bundle.device)
+        for step_idx in targets:
+            x = segment.latents_at(step_idx).to(self.bundle.device)
+            a = segment.aux_latents_at(step_idx).to(self.bundle.device)
+            prev_x = segment.latents_at(step_idx + 1).to(self.bundle.device)
+            prev_a = segment.aux_latents_at(step_idx + 1).to(self.bundle.device)
 
-                video_pred, audio_pred = self.step.predict_noise(
-                    conditions,
-                    video_sample=x,
-                    audio_sample=a,
-                    video_sigma=sigmas[step_idx],
-                    audio_sigma=audio_sigmas[step_idx],
-                    layout=layout,
-                )
-                _, log_prob, mean = self.strategy.denoise(
-                    noise_pred=video_pred,
-                    sample=x,
-                    sigma=sigmas[step_idx],
-                    sigma_next=sigmas[step_idx + 1],
+            video_pred, audio_pred = self.step.predict_noise(
+                conditions,
+                video_sample=x,
+                audio_sample=a,
+                video_sigma=sigmas[step_idx],
+                audio_sigma=audio_sigmas[step_idx],
+                layout=layout,
+            )
+            _, log_prob, mean = self.strategy.denoise(
+                noise_pred=video_pred,
+                sample=x,
+                sigma=sigmas[step_idx],
+                sigma_next=sigmas[step_idx + 1],
+                eta=float(params.eta),
+                prev_sample=prev_x,
+                step_index=step_idx,
+            )
+            if self.audio_joint_sde:
+                _, audio_log_prob, _ = self.strategy.denoise(
+                    noise_pred=audio_pred,
+                    sample=a,
+                    sigma=audio_sigmas[step_idx],
+                    sigma_next=audio_sigmas[step_idx + 1],
                     eta=float(params.eta),
-                    prev_sample=prev_x,
+                    prev_sample=prev_a,
                     step_index=step_idx,
                 )
-                if self.audio_joint_sde:
-                    _, audio_log_prob, _ = self.strategy.denoise(
-                        noise_pred=audio_pred,
-                        sample=a,
-                        sigma=audio_sigmas[step_idx],
-                        sigma_next=audio_sigmas[step_idx + 1],
-                        eta=float(params.eta),
-                        prev_sample=prev_a,
-                        step_index=step_idx,
+                if audio_log_prob is not None:
+                    log_prob = _combine_modality_logp(
+                        log_prob, audio_log_prob, n_video=x[0].numel(), n_audio=a[0].numel()
                     )
-                    if audio_log_prob is not None:
-                        log_prob = _combine_modality_logp(
-                            log_prob, audio_log_prob, n_video=x[0].numel(), n_audio=a[0].numel()
-                        )
-                log_probs.append(log_prob.to(dtype=self.logprob_dtype))
-                means.append(mean)
+            log_probs.append(log_prob.to(dtype=self.logprob_dtype))
+            means.append(mean)
 
         return ReplayResult(
             log_probs=torch.stack(log_probs, dim=1),
@@ -457,15 +444,14 @@ class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
         video_sample, audio_sample = unpack_dual_streams(sample, geometry)
         layout = build_t2va_layout(geometry, int(conditions.text.embeds.shape[1]))
         shared_sigma = sigma.detach().reshape(-1)[0]
-        with self._autocast():
-            video_pred, audio_pred = self.step.predict_noise(
-                conditions,
-                video_sample=video_sample.to(dtype=self.trajectory_dtype),
-                audio_sample=audio_sample.to(dtype=self.trajectory_dtype),
-                video_sigma=shared_sigma,
-                audio_sigma=shared_sigma,
-                layout=layout,
-            )
+        video_pred, audio_pred = self.step.predict_noise(
+            conditions,
+            video_sample=video_sample.to(dtype=self.trajectory_dtype),
+            audio_sample=audio_sample.to(dtype=self.trajectory_dtype),
+            video_sigma=shared_sigma,
+            audio_sigma=shared_sigma,
+            layout=layout,
+        )
         return pack_dual_streams(video_pred, audio_pred)
 
 

@@ -71,7 +71,6 @@ class MiniMaxH3Pipeline(Pipeline):
                 strategy,
                 audio_shift=config.audio_shift,
                 audio_joint_sde=config.audio_joint_sde,
-                autocast_precision=config.autocast_precision,
                 trajectory_precision=config.trajectory_precision,
                 logprob_precision=config.logprob_precision,
             ),

@@ -56,7 +56,6 @@ class MiniMaxH3PipelineConfig:
     device: Any = None
 
     # Stage-level precision / numerical policy.
-    autocast_precision: str = "bf16"
     trajectory_precision: str = "fp16"
     logprob_precision: str = "fp32"
 
