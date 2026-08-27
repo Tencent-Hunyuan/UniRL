@@ -181,6 +181,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         )
 
         self._version = 0
+        self._weight_update_calls = 0
         self._generate_lock = threading.Lock()
         self._shutdown_lock = threading.Lock()
         self._shutdown_requested = False
@@ -620,7 +621,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
             require(self._generator is not None, "fastvideo engine is offloaded/not initialized")
             self._generator.update_transformer_weights_from_path(checkpoint_path)
             self._last_weights_path = checkpoint_path
-            self._version += 1
+            self._weight_update_calls += 1
             logger.info("fastvideo transformer weights updated from %s", checkpoint_path)
 
 
