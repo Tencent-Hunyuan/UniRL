@@ -52,7 +52,6 @@ bundle:
     logprob_precision: fp32
     video_shift: 12.0
     audio_shift: 3.0
-    text_encoder_hidden_layer: 50
     audio_joint_sde: true
     # The Qwen3-VL conditioner is 32B (~64 GB bf16) — larger than the trainable
     # DiT's per-rank shard. Parking it on CPU is what makes 8x80GB fit. Prompts

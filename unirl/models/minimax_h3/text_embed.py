@@ -42,7 +42,6 @@ class MiniMaxH3TextEmbedStage:
         self.text_encoder = bundle.text_encoder
         self.processor = bundle.processor
         self.tokenizer = bundle.tokenizer
-        self.hidden_layer = bundle.text_encoder_hidden_layer
         self.dtype = bundle.dtype
         self.device = bundle.device
 
@@ -79,9 +78,9 @@ class MiniMaxH3TextEmbedStage:
 
         num_layers = len(self._decoder.layers)
         require(
-            num_layers >= MINIMAX_H3_TEXT_ENCODER_LAYER,
+            num_layers > MINIMAX_H3_TEXT_ENCODER_LAYER,
             f"MiniMaxH3TextEmbedStage: MiniMax-H3 conditions on hidden_states[{MINIMAX_H3_TEXT_ENCODER_LAYER}] of "
-            f"its Qwen3-VL conditioner, which needs at least {MINIMAX_H3_TEXT_ENCODER_LAYER} decoder layers, but "
+            f"its Qwen3-VL conditioner, which needs more than {MINIMAX_H3_TEXT_ENCODER_LAYER} decoder layers, but "
             f"the loaded conditioner has {num_layers}.",
         )
 
@@ -103,7 +102,7 @@ class MiniMaxH3TextEmbedStage:
                 use_cache=False,
                 output_hidden_states=True,
             )
-            embeds.append(outputs.hidden_states[self.hidden_layer].to(device=self.device, dtype=self.dtype))
+            embeds.append(outputs.hidden_states[MINIMAX_H3_TEXT_ENCODER_LAYER].to(device=self.device, dtype=self.dtype))
 
         lengths = {int(e.shape[1]) for e in embeds}
         require(

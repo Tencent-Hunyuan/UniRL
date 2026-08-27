@@ -43,7 +43,6 @@ class MiniMaxH3Bundle(Bundle):
         dtype: torch.dtype,
         device: torch.device,
         pretrained_path: str,
-        text_encoder_hidden_layer: int,
         max_sequence_length: int,
     ) -> None:
         super().__init__()
@@ -59,7 +58,6 @@ class MiniMaxH3Bundle(Bundle):
         # (``.type``) off it -- pass it straight to ``.to()`` / ``device=``.
         self.device = device
         self.pretrained_path = pretrained_path
-        self.text_encoder_hidden_layer = text_encoder_hidden_layer
         self.max_sequence_length = max_sequence_length
 
     @classmethod
@@ -151,7 +149,6 @@ class MiniMaxH3Bundle(Bundle):
             dtype=dtype,
             device=device,
             pretrained_path=path,
-            text_encoder_hidden_layer=int(config.text_encoder_hidden_layer),
             max_sequence_length=int(config.max_sequence_length),
         )
         if config.meta_init_transformer:

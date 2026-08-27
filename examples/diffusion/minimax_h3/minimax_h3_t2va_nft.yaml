@@ -41,7 +41,6 @@ bundle:
     # to a noise level instead of walking either grid.
     video_shift: 12.0
     audio_shift: 3.0
-    text_encoder_hidden_layer: 50
     audio_joint_sde: true
     # The Qwen3-VL conditioner is 32B, larger than the trainable DiT's per-rank
     # shard, and parking it on CPU is what makes 8x96GB fit.

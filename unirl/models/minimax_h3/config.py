@@ -67,8 +67,8 @@ class MiniMaxH3PipelineConfig:
 
     # MiniMax-H3 conditions on the UNNORMALIZED hidden state its Qwen3-VL
     # conditioner produces after its 50th decoder layer, i.e.
-    # ``hidden_states[50]`` -- not ``last_hidden_state``.
-    text_encoder_hidden_layer: int = 50
+    # ``hidden_states[50]`` -- not ``last_hidden_state``. This is fixed by the
+    # checkpoint and therefore is not exposed as a config option.
     max_sequence_length: int = 512
 
     # When True (default) video AND audio form a single joint SDE policy: audio
