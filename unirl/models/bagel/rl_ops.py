@@ -10,7 +10,6 @@ from typing import Any, Callable, Dict, List, Tuple
 
 import torch
 import torch.nn.functional as F
-from torch.nn.attention.flex_attention import create_block_mask
 from torch.utils.checkpoint import checkpoint
 
 __all__ = [
@@ -460,6 +459,13 @@ def _build_und_attention_mask(
 
         return [prepare_attention_mask_per_sample(split_lens, attn_modes, device=device)]
     if backend == "flex":
+        try:
+            from torch.nn.attention.flex_attention import create_block_mask
+        except ImportError as exc:
+            raise RuntimeError(
+                "pack_und_forward_inputs: attention_backend='flex' requires PyTorch >= 2.5 "
+                "with torch.nn.attention.flex_attention."
+            ) from exc
         from .vendor.data.data_utils import create_sparse_mask
 
         seqlen = sum(sample_lens)
@@ -543,10 +549,9 @@ def pack_und_forward_inputs(
     ce_loss_indexes = list(range(resp_start, resp_start + int(response_input.shape[0])))
 
     seqlen = pos
-    sample_lens = [seqlen]
     attention_mask = _build_und_attention_mask(
         model,
-        sample_lens=sample_lens,
+        sample_lens=[seqlen],
         split_lens=split_lens,
         attn_modes=attn_modes,
         device=device,
@@ -555,7 +560,7 @@ def pack_und_forward_inputs(
 
     return {
         "seqlen": seqlen,
-        "sample_lens": sample_lens,
+        "sample_lens": [seqlen],
         "packed_text_ids": torch.tensor(text_ids, dtype=torch.long, device=device),
         "packed_text_indexes": torch.tensor(text_indexes, dtype=torch.long, device=device),
         "packed_position_ids": torch.tensor(position_ids, dtype=torch.long, device=device),
