@@ -33,8 +33,10 @@ from .vendor import (
     MINIMAX_H3_CANVAS_MULTIPLE,
     MINIMAX_H3_FPS,
     MINIMAX_H3_MAX_ASPECT_RATIO,
+    MINIMAX_H3_MAX_DURATION,
     MINIMAX_H3_MAX_PIXELS,
     MINIMAX_H3_MIN_ASPECT_RATIO,
+    MINIMAX_H3_MIN_DURATION,
     MINIMAX_H3_SHORT_EDGE,
     MINIMAX_H3_TEXT_TAG,
     MiniMaxH3PackedSequence,
@@ -112,7 +114,8 @@ class MiniMaxH3Geometry:
         per chunk and drops 3 trailing latent frames, so only ``17n + 5`` counts
         round-trip -- but this raises with the nearest legal value rather than
         re-resolving, since training at a geometry the recipe does not state is
-        undetectable later.
+        undetectable later. The aligned duration must also stay within H3's
+        supported 5--15 second range.
         """
         h, w = int(height), int(width)
         multiple = MINIMAX_H3_CANVAS_MULTIPLE
@@ -136,6 +139,13 @@ class MiniMaxH3Geometry:
             )
         canvas_height, canvas_width = h, w
         aligned = align_num_frames(int(num_frames))
+        duration_seconds = aligned / MINIMAX_H3_FPS
+        if not MINIMAX_H3_MIN_DURATION <= duration_seconds <= MINIMAX_H3_MAX_DURATION:
+            raise ValueError(
+                f"MiniMaxH3Geometry: num_frames={num_frames} aligns to {aligned} frames "
+                f"({duration_seconds:.2f}s at {MINIMAX_H3_FPS} fps), outside H3's supported "
+                f"{MINIMAX_H3_MIN_DURATION:g}-{MINIMAX_H3_MAX_DURATION:g}s range."
+            )
         if aligned != int(num_frames):
             raise ValueError(
                 f"MiniMaxH3Geometry: num_frames={num_frames} does not round-trip through the video VAE, which maps "
