@@ -96,6 +96,22 @@ def make_decay_fn(cfg: EmaLoraConfig | EmaFullConfig) -> Callable[[int], float]:
     if decay_type == "linear":
         return lambda t: float(min(t * uprate, uphold))
     if decay_type == "warmup":
+        if flat_steps > 0 and _current_rank() == 0:
+            # Decay 0 sends EMA._run down its hard-copy branch, so the shadow is
+            # a bitwise copy of the trainable adapter for this whole window. A
+            # forward-process algorithm builds its positive/negative pair as
+            # `old +/- beta*(new - old)`, which collapses to a single point when
+            # the two are equal: the contrast contributes nothing and beta drops
+            # out of the gradient. Worth saying out loud, because the run still
+            # trains -- on an advantage-weighted regression, not on the
+            # objective the recipe names.
+            logger.warning(
+                "EMA warmup: decay is 0 for the first %d refreshes, so the shadow is a hard copy of the "
+                "trainable adapter and any negative-aware contrast built from the pair is inert until then "
+                "(beta has no effect on the update either). Set ema_flat_steps=0 for a trailing reference "
+                "from the first refresh.",
+                flat_steps,
+            )
         return lambda t: 0.0 if t < flat_steps else float(min((t - flat_steps) * uprate, uphold))
     return lambda t: ema_decay
 
