@@ -30,7 +30,8 @@ bundle:
   _target_: unirl.models.minimax_h3.bundle.MiniMaxH3Bundle.from_config
   config:
     _target_: unirl.models.minimax_h3.config.MiniMaxH3PipelineConfig
-    pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,MiniMaxAI/MiniMax-H3}
+    # Required local snapshot: meta-init's sharded loader does not accept HF repo IDs.
+    pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL}
     model_precision: bf16
     # fp32 by checkpoint contract; the audio VAE emits ~20 dB too quiet in bf16.
     vae_dtype: fp32

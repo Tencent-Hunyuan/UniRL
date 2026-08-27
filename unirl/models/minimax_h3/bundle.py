@@ -68,6 +68,12 @@ class MiniMaxH3Bundle(Bundle):
         from transformers import AutoProcessor, AutoTokenizer, Qwen3VLForConditionalGeneration
 
         path = config.pretrained_model_ckpt_path
+        transformer_weights_path = os.path.join(path, "transformer")
+        if config.meta_init_transformer and not os.path.isdir(transformer_weights_path):
+            raise ValueError(
+                "MiniMaxH3Bundle: meta-init requires pretrained_model_ckpt_path to be a local snapshot root "
+                f"containing transformer/*.safetensors; got {path!r}. Set PRETRAINED_MODEL to a downloaded snapshot."
+            )
         vae_path = config.vae_ckpt_path or path
         te_path = config.text_encoder_ckpt_path or path
 
@@ -151,7 +157,7 @@ class MiniMaxH3Bundle(Bundle):
         if config.meta_init_transformer:
             # Diffusers layout: the backend's sharded loader reads the
             # safetensors under <ckpt>/transformer after `to_empty`.
-            bundle._transformer_weights_path = os.path.join(path, "transformer")
+            bundle._transformer_weights_path = transformer_weights_path
             bundle._meta_init_state = meta_init_state
         return bundle
 
