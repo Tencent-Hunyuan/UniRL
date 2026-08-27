@@ -169,14 +169,14 @@ def _pin_fp32(transformer: nn.Module, keep_in_fp32: Sequence[str]) -> int:
     stores it.
     """
     patterns = tuple(keep_in_fp32)
-    pinned = 0
+    matched = 0
     for name, tensor in list(transformer.named_parameters()) + list(transformer.named_buffers()):
-        if tensor.dtype == torch.float32 or not tensor.dtype.is_floating_point:
+        if not tensor.dtype.is_floating_point or not any(pattern in name for pattern in patterns):
             continue
-        if any(pattern in name for pattern in patterns):
+        matched += 1
+        if tensor.dtype != torch.float32:
             tensor.data = tensor.data.to(torch.float32)
-            pinned += 1
-    return pinned
+    return matched
 
 
 def finalize_meta_init(
@@ -205,7 +205,11 @@ def finalize_meta_init(
         raise ValueError("finalize_meta_init requires a transformer with meta parameters.")
     transformer = transformer.to(dtype)
     if keep_in_fp32:
-        _pin_fp32(transformer, keep_in_fp32)
+        pinned = _pin_fp32(transformer, keep_in_fp32)
+        if pinned == 0:
+            raise ValueError(
+                f"finalize_meta_init: keep_in_fp32={tuple(keep_in_fp32)!r} matched no floating parameters or buffers"
+            )
     transformer.init_weights = lambda: None
     return transformer
 
