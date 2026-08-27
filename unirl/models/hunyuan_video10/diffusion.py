@@ -15,21 +15,21 @@ from unirl.types.sampling import DiffusionSamplingParams, compute_trajectory_pos
 from unirl.types.segments.latent import LatentSegment, make_video_segment
 from unirl.utils.dtypes import parse_torch_dtype
 
-from .bundle import HunyuanVideoBundle
-from .conditions import HunyuanVideoConditions
+from .bundle import HunyuanVideo10Bundle
+from .conditions import HunyuanVideo10Conditions
 
 
-class HunyuanVideoDiffusionStep(DiffusionStep[HunyuanVideoBundle, HunyuanVideoConditions]):
+class HunyuanVideo10DiffusionStep(DiffusionStep[HunyuanVideo10Bundle, HunyuanVideo10Conditions]):
     """Per-step HunyuanVideo-1.0 denoising kernel -- stateless."""
 
     TIMESTEP_SCALE: ClassVar[float] = 1000.0
 
     def predict_noise(
         self,
-        model: HunyuanVideoBundle,
+        model: HunyuanVideo10Bundle,
         sample: torch.Tensor,
         sigma: torch.Tensor,
-        conditions: HunyuanVideoConditions,
+        conditions: HunyuanVideo10Conditions,
         *,
         guidance_scale: float,
     ) -> torch.Tensor:
@@ -37,9 +37,9 @@ class HunyuanVideoDiffusionStep(DiffusionStep[HunyuanVideoBundle, HunyuanVideoCo
         text_llama = conditions.text_llama
         pooled_clip = conditions.pooled_clip
         if text_llama is None or text_llama.embeds is None:
-            raise ValueError("HunyuanVideoDiffusionStep.predict_noise: conditions.text_llama must carry embeds.")
+            raise ValueError("HunyuanVideo10DiffusionStep.predict_noise: conditions.text_llama must carry embeds.")
         if pooled_clip is None or pooled_clip.embeds is None:
-            raise ValueError("HunyuanVideoDiffusionStep.predict_noise: conditions.pooled_clip must carry embeds.")
+            raise ValueError("HunyuanVideo10DiffusionStep.predict_noise: conditions.pooled_clip must carry embeds.")
 
         prompt_embeds = text_llama.embeds
         attention_mask = text_llama.attn_mask
@@ -47,7 +47,7 @@ class HunyuanVideoDiffusionStep(DiffusionStep[HunyuanVideoBundle, HunyuanVideoCo
 
         if sample.ndim != 5:
             raise ValueError(
-                f"HunyuanVideoDiffusionStep.predict_noise: expected 5D sample "
+                f"HunyuanVideo10DiffusionStep.predict_noise: expected 5D sample "
                 f"[B, C, T, H, W], got {tuple(sample.shape)}"
             )
         batch_size = sample.shape[0]
@@ -108,8 +108,8 @@ class HunyuanVideoDiffusionStep(DiffusionStep[HunyuanVideoBundle, HunyuanVideoCo
 
     def step(
         self,
-        model: HunyuanVideoBundle,
-        conditions: HunyuanVideoConditions,
+        model: HunyuanVideo10Bundle,
+        conditions: HunyuanVideo10Conditions,
         *,
         strategy: StepStrategy,
         sample: torch.Tensor,
@@ -145,8 +145,8 @@ class HunyuanVideoDiffusionStep(DiffusionStep[HunyuanVideoBundle, HunyuanVideoCo
 
     def step_with_logp(
         self,
-        model: HunyuanVideoBundle,
-        conditions: HunyuanVideoConditions,
+        model: HunyuanVideo10Bundle,
+        conditions: HunyuanVideo10Conditions,
         *,
         strategy: StepStrategy,
         sample: torch.Tensor,
@@ -176,7 +176,7 @@ class HunyuanVideoDiffusionStep(DiffusionStep[HunyuanVideoBundle, HunyuanVideoCo
         )
 
 
-class HunyuanVideoDiffusionStage(DiffusionStage[HunyuanVideoConditions]):
+class HunyuanVideo10DiffusionStage(DiffusionStage[HunyuanVideo10Conditions]):
     """HunyuanVideo-1.0 rollout-level diffusion stage."""
 
     _no_split_modules: ClassVar[Tuple[str, ...]] = ("HunyuanVideoTransformerBlock",)
@@ -188,8 +188,8 @@ class HunyuanVideoDiffusionStage(DiffusionStage[HunyuanVideoConditions]):
     def __init__(
         self,
         *,
-        model: HunyuanVideoBundle,
-        step: HunyuanVideoDiffusionStep,
+        model: HunyuanVideo10Bundle,
+        step: HunyuanVideo10DiffusionStep,
         strategy: StepStrategy,
         autocast_precision: str = "bf16",
         trajectory_precision: str = "fp16",
@@ -238,7 +238,7 @@ class HunyuanVideoDiffusionStage(DiffusionStage[HunyuanVideoConditions]):
 
     def diffuse(
         self,
-        conditions: HunyuanVideoConditions,
+        conditions: HunyuanVideo10Conditions,
         *,
         schedule: torch.Tensor,
         params: DiffusionSamplingParams,
@@ -250,13 +250,15 @@ class HunyuanVideoDiffusionStage(DiffusionStage[HunyuanVideoConditions]):
         from unirl.sde.noise import generate_latents
 
         if conditions.text_llama is None or conditions.text_llama.embeds is None:
-            raise ValueError("HunyuanVideoDiffusionStage.diffuse: conditions.text_llama.embeds is None")
+            raise ValueError("HunyuanVideo10DiffusionStage.diffuse: conditions.text_llama.embeds is None")
         prompt_embeds = conditions.text_llama.embeds
         device = prompt_embeds.device
         batch_size = int(prompt_embeds.shape[0])
         T = int(params.num_inference_steps)
         if int(schedule.shape[0]) != T + 1:
-            raise ValueError(f"HunyuanVideoDiffusionStage.diffuse: schedule length {schedule.shape[0]} != T+1={T + 1}")
+            raise ValueError(
+                f"HunyuanVideo10DiffusionStage.diffuse: schedule length {schedule.shape[0]} != T+1={T + 1}"
+            )
         schedule = schedule.to(device)
         self.strategy.init_schedule(schedule)
 
@@ -267,12 +269,12 @@ class HunyuanVideoDiffusionStage(DiffusionStage[HunyuanVideoConditions]):
         if initial_latents is not None:
             if int(initial_latents.shape[0]) != batch_size:
                 raise ValueError(
-                    f"HunyuanVideoDiffusionStage.diffuse: initial_latents.shape[0]="
+                    f"HunyuanVideo10DiffusionStage.diffuse: initial_latents.shape[0]="
                     f"{int(initial_latents.shape[0])} != batch_size={batch_size}."
                 )
             if tuple(initial_latents.shape[1:]) != expected_latent_shape:
                 raise ValueError(
-                    f"HunyuanVideoDiffusionStage.diffuse: initial_latents.shape[1:]="
+                    f"HunyuanVideo10DiffusionStage.diffuse: initial_latents.shape[1:]="
                     f"{tuple(initial_latents.shape[1:])} != expected {expected_latent_shape} "
                     f"for num_frames={int(params.num_frames)}, "
                     f"height={int(params.height)}, width={int(params.width)}."
@@ -362,7 +364,7 @@ class HunyuanVideoDiffusionStage(DiffusionStage[HunyuanVideoConditions]):
 
     def replay(
         self,
-        conditions: HunyuanVideoConditions,
+        conditions: HunyuanVideo10Conditions,
         *,
         segment: LatentSegment,
         params: DiffusionSamplingParams,
@@ -370,12 +372,12 @@ class HunyuanVideoDiffusionStage(DiffusionStage[HunyuanVideoConditions]):
     ) -> ReplayResult:
         """Segment-based log-prob replay over the rollout's SDE transitions."""
         if segment.sde_indices is None or segment.latents is None:
-            raise ValueError("HunyuanVideoDiffusionStage.replay: segment.sde_indices / latents missing")
+            raise ValueError("HunyuanVideo10DiffusionStage.replay: segment.sde_indices / latents missing")
         if segment.sigmas is None:
-            raise ValueError("HunyuanVideoDiffusionStage.replay: segment.sigmas missing")
+            raise ValueError("HunyuanVideo10DiffusionStage.replay: segment.sigmas missing")
         if segment.latents.ndim != 6:
             raise ValueError(
-                f"HunyuanVideoDiffusionStage.replay: expected latents "
+                f"HunyuanVideo10DiffusionStage.replay: expected latents "
                 f"[B, K, C, T_lat, H_lat, W_lat], got {tuple(segment.latents.shape)}"
             )
 
@@ -388,7 +390,7 @@ class HunyuanVideoDiffusionStage(DiffusionStage[HunyuanVideoConditions]):
         bad = [i for i in target if i not in sde_set]
         if bad:
             raise ValueError(
-                f"HunyuanVideoDiffusionStage.replay: step_indices {bad} not in segment.sde_indices={sorted(sde_set)}"
+                f"HunyuanVideo10DiffusionStage.replay: step_indices {bad} not in segment.sde_indices={sorted(sde_set)}"
             )
 
         device = segment.latents.device
@@ -424,7 +426,7 @@ class HunyuanVideoDiffusionStage(DiffusionStage[HunyuanVideoConditions]):
                 )
                 if log_prob is None:
                     raise RuntimeError(
-                        f"HunyuanVideoDiffusionStage.replay: strategy returned "
+                        f"HunyuanVideo10DiffusionStage.replay: strategy returned "
                         f"None log-prob at step_index={step_idx} (deterministic mode); "
                         f"replay requires a stochastic SDE strategy."
                     )
@@ -438,7 +440,7 @@ class HunyuanVideoDiffusionStage(DiffusionStage[HunyuanVideoConditions]):
 
     def predict_noise_at_step(
         self,
-        conditions: HunyuanVideoConditions,
+        conditions: HunyuanVideo10Conditions,
         *,
         sample: torch.Tensor,
         sigma: torch.Tensor,
@@ -459,6 +461,6 @@ class HunyuanVideoDiffusionStage(DiffusionStage[HunyuanVideoConditions]):
 
 
 __all__ = [
-    "HunyuanVideoDiffusionStage",
-    "HunyuanVideoDiffusionStep",
+    "HunyuanVideo10DiffusionStage",
+    "HunyuanVideo10DiffusionStep",
 ]

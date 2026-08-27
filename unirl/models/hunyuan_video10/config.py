@@ -9,8 +9,8 @@ from unirl.config.validation import validate_precision_type
 
 
 @dataclass
-class HunyuanVideoPipelineConfig:
-    """Construction args for ``HunyuanVideoPipeline.from_config``."""
+class HunyuanVideo10PipelineConfig:
+    """Construction args for ``HunyuanVideo10Pipeline.from_config``."""
 
     pretrained_model_ckpt_path: str
     vae_ckpt_path: Optional[str] = None
@@ -43,12 +43,12 @@ class HunyuanVideoPipelineConfig:
     lora_target_modules: Optional[List[str]] = None
 
     def __post_init__(self) -> None:
-        validate_precision_type(self.model_precision, field="HunyuanVideoPipelineConfig.model_precision")
+        validate_precision_type(self.model_precision, field="HunyuanVideo10PipelineConfig.model_precision")
         self.hidden_state_skip_layer = int(self.hidden_state_skip_layer)
         if self.hidden_state_skip_layer < 0:
             raise ValueError(
-                f"HunyuanVideoPipelineConfig.hidden_state_skip_layer must be >= 0, got {self.hidden_state_skip_layer}"
+                f"HunyuanVideo10PipelineConfig.hidden_state_skip_layer must be >= 0, got {self.hidden_state_skip_layer}"
             )
 
 
-__all__ = ["HunyuanVideoPipelineConfig"]
+__all__ = ["HunyuanVideo10PipelineConfig"]

@@ -1,4 +1,4 @@
-"""HunyuanVideoVAEDecodeStage — 5D ``[B, C, T_lat, H_lat, W_lat]`` to varlen ``Videos`` (``[T, C, H, W]`` frames)."""
+"""HunyuanVideo10VAEDecodeStage — 5D ``[B, C, T_lat, H_lat, W_lat]`` to varlen ``Videos`` (``[T, C, H, W]`` frames)."""
 
 from __future__ import annotations
 
@@ -10,28 +10,28 @@ from unirl.models.types.codec import DecodeStage
 from unirl.types.primitives import Video, Videos
 from unirl.types.segments import LatentSegment
 
-from .bundle import HunyuanVideoBundle
+from .bundle import HunyuanVideo10Bundle
 
 
-class HunyuanVideoVAEDecodeStage(DecodeStage[LatentSegment, Videos]):
+class HunyuanVideo10VAEDecodeStage(DecodeStage[LatentSegment, Videos]):
     """HunyuanVideo-1.0 3D VAE decode stage."""
 
-    def __init__(self, bundle: HunyuanVideoBundle) -> None:
+    def __init__(self, bundle: HunyuanVideo10Bundle) -> None:
         self.bundle = bundle
 
     def decode(self, s: LatentSegment, *, grad: bool = False, activation_checkpoint: bool = False) -> Videos:
         """Decode the final-step latents in *s* into a packed ``Videos`` payload."""
         if s.latents is None:
-            raise ValueError("HunyuanVideoVAEDecodeStage.decode: segment.latents is None")
+            raise ValueError("HunyuanVideo10VAEDecodeStage.decode: segment.latents is None")
         if s.latents.ndim != 6:
             raise ValueError(
-                f"HunyuanVideoVAEDecodeStage.decode: expected latents shape "
+                f"HunyuanVideo10VAEDecodeStage.decode: expected latents shape "
                 f"[N, K, C, T_lat, H_lat, W_lat], got {tuple(s.latents.shape)}"
             )
         clean = s.latents[:, -1]
         if clean.ndim != 5:
             raise ValueError(
-                f"HunyuanVideoVAEDecodeStage.decode: expected 5D clean latents "
+                f"HunyuanVideo10VAEDecodeStage.decode: expected 5D clean latents "
                 f"[B, C, T_lat, H_lat, W_lat], got {tuple(clean.shape)}"
             )
 
@@ -56,4 +56,4 @@ class HunyuanVideoVAEDecodeStage(DecodeStage[LatentSegment, Videos]):
         return Videos.from_list(videos)
 
 
-__all__ = ["HunyuanVideoVAEDecodeStage"]
+__all__ = ["HunyuanVideo10VAEDecodeStage"]

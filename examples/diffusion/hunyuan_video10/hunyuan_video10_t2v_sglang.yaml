@@ -1,7 +1,7 @@
 # @package _global_
 # HunyuanVideo-1.0 T2V GRPO — SGLang rollout with LoRA-merged weight sync.
 #
-# This is the SGLang counterpart of ``hunyuan_video_t2v_trainside``. Its
+# This is the SGLang counterpart of ``hunyuan_video10_t2v_trainside``. Its
 # optimization defaults match the validated 1x8 H20 run: LoRA r64, alpha=256,
 # skip-layer=2, 10 denoising steps, and four SDE steps. Both recipes generate
 # standard landscape 720p video (1280x720x5).
@@ -10,7 +10,7 @@
 # merged transformer. This avoids the known online-SGLang-LoRA delta mismatch.
 #
 # Launch (1 node x 8 GPUs):
-#   bash examples/run_experiment_single_node.sh diffusion/hunyuan_video/hunyuan_video_t2v_sglang
+#   bash examples/run_experiment_single_node.sh diffusion/hunyuan_video10/hunyuan_video10_t2v_sglang
 
 num_devices: 8
 batch_size: 8
@@ -20,16 +20,16 @@ num_rollouts: 1000
 logging:
   report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,true}}
   project_name: ${oc.env:WANDB_PROJECT,unirl-grpo-t2v}
-  run_name: ${oc.env:WANDB_RUN_NAME,hunyuan_video_t2v_sglang}
+  run_name: ${oc.env:WANDB_RUN_NAME,hunyuan_video10_t2v_sglang}
   entity: ${oc.env:WANDB_ENTITY,null}
-  tags: [hunyuan_video, t2v, grpo, sglang, loramerge, lora-r64, v2]
+  tags: [hunyuan_video10, t2v, grpo, sglang, loramerge, lora-r64, v2]
   log_media: false
   media_max_items: 8
   media_log_interval: 1
 
 # Shared by the trainside replay pipeline and the SGLang rollout engine.
 model_config:
-  _target_: unirl.models.hunyuan_video.config.HunyuanVideoPipelineConfig
+  _target_: unirl.models.hunyuan_video10.config.HunyuanVideo10PipelineConfig
   pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,hunyuanvideo-community/HunyuanVideo}
   model_precision: bf16
   vae_use_tiling: true
@@ -45,11 +45,11 @@ strategy:
   _target_: unirl.sde.kernels.FlowSDEStrategy
 
 bundle:
-  _target_: unirl.models.hunyuan_video.bundle.HunyuanVideoBundle.from_config
+  _target_: unirl.models.hunyuan_video10.bundle.HunyuanVideo10Bundle.from_config
   config: ${model_config}
 
 pipeline:
-  _target_: unirl.models.hunyuan_video.pipeline.HunyuanVideoPipeline
+  _target_: unirl.models.hunyuan_video10.pipeline.HunyuanVideo10Pipeline
   shift: ${model_config.shift}
   hidden_state_skip_layer: ${model_config.hidden_state_skip_layer}
   autocast_precision: ${model_config.autocast_precision}
@@ -113,7 +113,7 @@ rollout:
   _target_: unirl.rollout.engine.sglang_diffusion.engine.SGLangDiffusionRolloutEngine
   config:
     _target_: unirl.rollout.engine.sglang_diffusion.config.SGLangDiffusionEngineConfig
-    model_family: hunyuan_video
+    model_family: hunyuan_video10
     populate_conditions: true
     init_same_noise: ${sampling.init_same_noise}
     forward_batch_size: 1
@@ -148,7 +148,7 @@ algorithm:
   old_logp_source: rollout
   conditions_cls:
     _target_: hydra.utils.get_class
-    path: unirl.models.hunyuan_video.conditions.HunyuanVideoConditions
+    path: unirl.models.hunyuan_video10.conditions.HunyuanVideo10Conditions
   params: ${sampling}
 
 stack:
