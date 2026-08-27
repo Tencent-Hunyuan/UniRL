@@ -1,45 +1,4 @@
-"""Z-Image diffusion: per-step kernel + rollout-level stage.
-
-Two classes mirror :mod:`unirl.models.sd3.diffusion`:
-
-- :class:`ZImageDiffusionStep` — stateless per-step kernel. Wraps
-  :meth:`predict_noise` (which adapts the single-stream
-  ``ZImageTransformer2DModel``'s list-based forward to the framework's
-  batched ``[B, C, H, W]`` SDE math) around ``StepStrategy.denoise``. The
-  protocol-matching ``forward`` / ``step`` / ``step_with_logp`` ride on
-  top.
-- :class:`ZImageDiffusionStage` — implements
-  ``DiffusionStage[ZImageConditions]``. Owns the SDE strategy and loop
-  bookkeeping; segment latents stay in spatial ``[B, C, H, W]`` shape so
-  :class:`ZImageVAEDecodeStage` can read them directly.
-
-Transformer adapter
--------------------
-Z-Image's S3-DiT consumes **lists**: a list of per-sample latents
-``[C, F=1, H, W]`` and a list of per-sample caption embeddings
-``[t_i, D]`` (variable length). It returns a list of per-sample velocity
-predictions ``[C, F=1, H, W]``. :meth:`predict_noise`:
-
-1. lifts the batched latent ``[B, C, H, W]`` → list of ``[C, 1, H, W]``;
-2. rebuilds the per-prompt caption list from the padded
-   ``conditions.text.embeds`` + ``attn_mask``;
-3. passes ``t = 1 - sigma`` as the timestep (the diffusers reference
-   feeds ``(1000 - sigma*1000)/1000``);
-4. **negates** the model output (the reference does ``noise_pred =
-   -model_out`` before the scheduler step) so the result is the
-   FlowMatch velocity ``FlowSDEStrategy`` expects;
-5. stacks the list back to ``[B, C, H, W]``.
-
-CFG math
---------
-Z-Image's CFG is ``pred = pos + scale * (pos - neg)`` (gated on
-``guidance_scale > 0``), batched as a single ``[pos; neg]`` forward.
-Z-Image-Turbo is distilled to run **without** CFG (``guidance_scale = 0``),
-which is the RL-friendly setting; the CFG branch supports the undistilled
-base model.
-
-Math mirrors diffusers ``ZImagePipeline.__call__`` denoising loop.
-"""
+"""Z-Image diffusion: per-step kernel + rollout-level stage."""
 
 from __future__ import annotations
 
@@ -62,12 +21,7 @@ from .conditions import ZImageConditions
 
 
 def _caption_list(text, dtype: torch.dtype, device: torch.device) -> List[torch.Tensor]:
-    """Rebuild the per-prompt variable-length caption list from a padded
-    ``TextEmbedCondition`` (``embeds [B, T, D]`` + ``attn_mask [B, T]``).
-
-    Dedicated-engine replay can hand conditions back on CPU; pin both the
-    embeds and mask to the transformer's device before splitting.
-    """
+    """Rebuild the per-prompt varlen caption list from padded ``embeds [B, T, D]`` + ``attn_mask [B, T]``."""
     if text is None or text.embeds is None:
         raise ValueError("ZImage predict_noise: conditions text/embeds is None")
     embeds = text.embeds.to(device=device, dtype=dtype)
@@ -91,9 +45,7 @@ class ZImageDiffusionStep(DiffusionStep[ZImageBundle, ZImageConditions]):
         *,
         guidance_scale: float,
     ) -> torch.Tensor:
-        """Run the single-stream Z-Image transformer and return the
-        FlowMatch velocity ``[B, C, H, W]`` (negated model output, with CFG
-        applied when ``guidance_scale > 0`` and a negative is present)."""
+        """Run the single-stream Z-Image transformer and return the FlowMatch velocity ``[B, C, H, W]`` (negated)."""
         if conditions.text is None:
             raise ValueError("ZImageDiffusionStep.predict_noise: conditions.text is None")
 
@@ -206,11 +158,7 @@ class ZImageDiffusionStep(DiffusionStep[ZImageBundle, ZImageConditions]):
         eta: float = 1.0,
         step_index: int = 0,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """Run model forward + SDE transition.
-
-        Returns ``(prev_sample, log_prob, prev_sample_mean)``. ``log_prob``
-        and ``prev_sample_mean`` are ``None`` for deterministic strategies.
-        """
+        """Run model forward + SDE transition."""
         return self.step(
             model,
             conditions,
@@ -227,20 +175,7 @@ class ZImageDiffusionStep(DiffusionStep[ZImageBundle, ZImageConditions]):
 
 
 class ZImageDiffusionStage(BatchedStepReplayMixin, DiffusionStage[ZImageConditions]):
-    """Z-Image rollout-level diffusion stage.
-
-    Owns the SDE ``strategy`` (stateful strategies like ``DPM2Strategy``
-    require a stable instance across the loop), the bundle, the kernel, and
-    the precision policy. The kernel is stateless and invoked per-step.
-
-    Segment latents stay in spatial ``[B, C, H, W]`` shape (Z-Image's VAE
-    is the standard 2D ``AutoencoderKL``), so :class:`ZImageVAEDecodeStage`
-    reads ``segment.latents[:, -1]`` without per-shape handling.
-
-    ``_no_split_modules`` is the model-side fallback used by FSDPPolicy when
-    HF auto-discovery yields nothing — diffusers'
-    ``ZImageTransformer2DModel`` block class is ``ZImageTransformerBlock``.
-    """
+    """Z-Image rollout-level diffusion stage."""
 
     _no_split_modules: ClassVar[Tuple[str, ...]] = ("ZImageTransformerBlock",)
 
@@ -279,12 +214,7 @@ class ZImageDiffusionStage(BatchedStepReplayMixin, DiffusionStage[ZImageConditio
         params: DiffusionSamplingParams,
         initial_latents: Optional[torch.Tensor] = None,
     ) -> LatentSegment:
-        """Run full Z-Image sampling. Returns a ``LatentSegment``.
-
-        ``initial_latents`` (optional) — x_T resolved from the request
-        ``Sample``'s diffusion generation Part; see
-        :class:`SD3DiffusionStage.diffuse` for the contract.
-        """
+        """Run full Z-Image sampling. Returns a ``LatentSegment``."""
         from unirl.sde.noise import generate_latents
 
         if conditions.text is None or conditions.text.embeds is None:
@@ -395,11 +325,7 @@ class ZImageDiffusionStage(BatchedStepReplayMixin, DiffusionStage[ZImageConditio
         params: DiffusionSamplingParams,
         step_indices: Optional[List[int]] = None,
     ) -> ReplayResult:
-        """Segment-based log-prob replay over the rollout's SDE transitions.
-
-        Caller is responsible for ``.train()`` mode + grad scope; this method
-        only manages the autocast scope.
-        """
+        """Segment-based log-prob replay over the rollout's SDE transitions."""
         if segment.sde_indices is None or segment.latents is None:
             raise ValueError("ZImageDiffusionStage.replay: segment.sde_indices / latents missing")
         if segment.sigmas is None:
@@ -496,11 +422,7 @@ class ZImageDiffusionStage(BatchedStepReplayMixin, DiffusionStage[ZImageConditio
         sigma: torch.Tensor,
         params: DiffusionSamplingParams,
     ) -> torch.Tensor:
-        """Single ``(xt, sigma)`` model forward — no scheduler iteration.
-
-        Delegates to ``ZImageDiffusionStep.predict_noise`` so CFG batching
-        and guidance handling stay identical to the sampling path.
-        """
+        """Single ``(xt, sigma)`` model forward — no scheduler iteration."""
         return self.step.predict_noise(
             self.model,
             sample,
@@ -510,8 +432,7 @@ class ZImageDiffusionStage(BatchedStepReplayMixin, DiffusionStage[ZImageConditio
         )
 
     def trainable_module(self) -> "torch.nn.Module":
-        """Return the module the diffusion forward operates on — the
-        bundle's ``ZImageTransformer2DModel`` (the FSDP wrap target)."""
+        """The module the diffusion forward operates on — ``ZImageTransformer2DModel``, the FSDP wrap target."""
         return self.model.transformer
 
 

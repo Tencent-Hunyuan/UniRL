@@ -17,26 +17,7 @@ if TYPE_CHECKING:
 
 
 class MiniMaxH3TextEmbedStage:
-    """Encode prompts into the conditioning MiniMax-H3 was trained on.
-
-    Three things differ from an ordinary text-encoder stage, and all three are
-    checkpoint contracts rather than preferences:
-
-    * The conditioning is ``hidden_states[50]`` of the Qwen3-VL conditioner --
-      an intermediate, **unnormalized** hidden state, not ``last_hidden_state``.
-      The final layer is post-norm and is not what H3 consumes.
-    * There is no chat template. The prompt is tokenized raw with
-      ``add_special_tokens=False``.
-    * The call goes to ``text_encoder.model``, the decoder submodule, not to
-      ``text_encoder``. H3 never uses the language-model head, and skipping it
-      avoids a vocabulary-wide projection over every token.
-
-    ``text_encoder`` is 32B and the recipe parks it on CPU
-    (``aux_components_on_cpu``), so every input tensor is built on the
-    ENCODER's device and only the resulting hidden state moves to the train
-    device. Building inputs on ``bundle.device`` instead would hand CUDA ids to
-    a CPU module.
-    """
+    """Encode prompts into the conditioning MiniMax-H3 was trained on."""
 
     def __init__(self, bundle: "MiniMaxH3Bundle") -> None:
         self.text_encoder = bundle.text_encoder
@@ -51,25 +32,13 @@ class MiniMaxH3TextEmbedStage:
 
     @property
     def _decoder(self):
-        """The decoder stack that owns ``.layers``.
-
-        transformers 5.x nests Qwen3-VL as ``model.{visual,language_model}``,
-        so the text layers are at ``model.language_model.layers``; older layouts
-        put them directly on ``model``. Resolve rather than assume -- the
-        attribute is only used to bound-check ``hidden_layer``.
-        """
+        """The decoder stack that owns ``.layers``."""
         model = self.text_encoder.model
         return getattr(model, "language_model", model)
 
     @torch.no_grad()
     def embed(self, texts: Texts) -> TextEmbedCondition:
-        """Encode one batch of prompts into a ``TextEmbedCondition``.
-
-        t2va is text-only, so every row of the packed text block carries the
-        text tag and the caller can derive the token count from the embedding
-        length. (``fl2va`` interleaves a keyframe vision block whose rows are
-        tagged VIDEO -- that arrives with keyframes, not before.)
-        """
+        """Encode one batch of prompts into a ``TextEmbedCondition``."""
         # ``Texts.texts`` is the raw list[str]; ``Texts.to_list()`` returns
         # list[Text] dataclass wrappers, which the tokenizer rejects. Same
         # accessor ltx2 and wan21 use.

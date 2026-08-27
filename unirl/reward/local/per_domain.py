@@ -1,27 +1,4 @@
-"""Per-domain reward dispatch: route each item to its domain's inner scorer.
-
-Multi-domain training (e.g. DiffusionOPD's per-teacher datasets) needs a
-different scorer per prompt domain — OCR reads quoted target text, GenEval
-wants ``include``/``exclude`` specs, PickScore is generic — and a scorer must
-never see items outside its domain. :class:`PerDomainRewardScorer` groups the
-request rows by ``metadata["domain"]`` (the tag ``MultiDomainRLDataSource``
-stamps), scores each group with the mapped inner backend, and scatters the
-results back in place.
-
-The inner scorers arrive fully constructed (Hydra recursively instantiates
-each ``_target_`` in ``PerDomainSpec.scorers``), so any :class:`RewardBackend`
-works — local or :class:`unirl.reward.remote.RemoteRewardBackend` — without
-this file knowing registry names.
-
-Monitoring conventions: per-domain scores surface as
-``component_rewards["<domain>"]`` with ``NaN`` on rows outside the domain, so
-wandb draws one curve per domain that only ticks on its own iterations.
-
-Failure conventions: rows with a missing/unmapped domain are reported as
-per-item failures (the reward service decides whether that is fatal); an inner
-scorer that *raises* propagates — this combinator never swallows a traceback
-into a per-item error string.
-"""
+"""Per-domain reward dispatch: route each item to its domain's inner scorer."""
 
 from __future__ import annotations
 
@@ -39,13 +16,7 @@ DOMAIN_KEY = "domain"
 
 
 def _select_rows(value: Any, indices: torch.Tensor) -> Any:
-    """Re-index one request field along the batch dim.
-
-    Every primitive container is a :class:`Batch` (``Texts`` / ``Images`` /
-    ``Videos`` / ``Audios``), so ``Batch.select`` handles CONCAT and packed
-    varlen fields uniformly. Anything else is refused loudly — a silently
-    unsliced field would misalign rows inside the inner scorer.
-    """
+    """Re-index one request field along the batch dim."""
     if value is None:
         return None
     if isinstance(value, Batch):
@@ -164,29 +135,7 @@ class PerDomainRewardScorer(RewardBackend):
 
 @dataclass
 class PerDomainSpec(BaseRewardComponentSpec):
-    """Typed config for :class:`PerDomainRewardScorer`.
-
-    ``scorers`` maps a domain tag (the value the data source writes to
-    ``metadata["domain"]``) to a fully built :class:`RewardBackend`; in yaml
-    each entry carries its own ``_target_`` and Hydra instantiates it
-    recursively before this spec is constructed. Example::
-
-        config:
-          _target_: unirl.reward.local.per_domain.PerDomainSpec
-          scorers:
-            pickscore:
-              _target_: unirl.reward.local.pickscore.PickScoreRewardScorer
-              base_device: cuda
-              config: {_target_: unirl.reward.local.pickscore.PickScoreSpec}
-            geneval:
-              _target_: unirl.reward.remote.RemoteRewardBackend
-              base_device: cpu
-              config:
-                _target_: unirl.reward.remote.RemoteRewardSpec
-                base_url: ${oc.env:REWARD_SERVICE_URL}
-                required_rewards: [geneval]
-                reward_weights: {geneval: 1.0}
-    """
+    """Typed config for :class:`PerDomainRewardScorer`."""
 
     batch_size: int = 8
     device: str = "auto"

@@ -1,26 +1,4 @@
-"""WAN21Conditions — typed conditions container for WAN 2.1 T2V / I2V.
-
-Concrete instantiation of the ``DiffusionStage[C]`` type parameter. WAN
-2.1 consumes a text-conditioning slot with an explicit CFG negative
-branch, plus an optional ``image_latent`` slot carrying the
-mask+first-frame VAE latents for I2V (20-channel payload produced by
-``WAN21ImageLatentEncodeStage``).
-
-The CFG negative branch is split into a sibling ``negative_text`` field
-(rather than nested under ``text.negative``) so the schema is honest
-about which slots travel on the wire — a reader of
-``Part.conditions`` sees ``"text"`` and ``"negative_text"`` as
-two equal-status entries. This matches the SD3 convention exactly.
-
-WAN uses UMT5 (single encoder) so ``TextEmbedCondition.pooled`` is
-unused (always ``None``); ``TextEmbedCondition.attn_mask`` is also
-unused at the diffusion stage because ``WAN21TextEmbedStage`` already
-zeros out padded positions before storing ``embeds``.
-
-Pairs ``from_dict`` / ``to_dict`` for round-tripping between the typed
-form (used inside the pipeline at stage call sites) and the generic
-generic ``Dict[str, Condition]`` shape on a ``Part``.
-"""
+"""WAN21Conditions — typed conditions container for WAN 2.1 T2V / I2V."""
 
 from __future__ import annotations
 
@@ -47,12 +25,7 @@ class WAN21Conditions(Batch):
 
     @classmethod
     def from_dict(cls, d: Dict[str, Condition]) -> "WAN21Conditions":
-        """Build from the generic ``Conditions`` dict shape.
-
-        Validates that the ``"text"`` slot is present and is a
-        ``TextEmbedCondition``. The ``"negative_text"``,
-        ``"image_latent"`` and ``"image_embed"`` slots are optional.
-        """
+        """Build from the generic ``Conditions`` dict shape."""
         text = d.get("text")
         if not isinstance(text, TextEmbedCondition):
             raise TypeError(
@@ -85,12 +58,7 @@ class WAN21Conditions(Batch):
         )
 
     def to_dict(self) -> Dict[str, Condition]:
-        """Convert back to the generic ``Conditions`` dict shape for
-        packing into ``Part.conditions``.
-
-        Emits optional slots only when non-``None`` so the dict stays
-        minimal for T2V / CFG-off rollouts.
-        """
+        """Convert back to the generic ``Conditions`` dict shape for packing into ``Part.conditions``."""
         if self.text is None:
             raise ValueError("WAN21Conditions.to_dict: text field is None")
         out: Dict[str, Condition] = {"text": self.text}

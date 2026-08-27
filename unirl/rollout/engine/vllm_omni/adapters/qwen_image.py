@@ -1,26 +1,4 @@
-"""Qwen-Image family: input/output sub-adapters + the ``qwen_image_t2i`` modality class.
-
-Single diffusion stage, TP=1, no AR prelude (the Qwen2.5-VL text encoder is
-co-resident in the diffusion worker). Two family quirks force overrides on
-both conversion sides — everything else is the shared DiT skeleton:
-
-- **CFG semantics.** Qwen-Image's CFG knob is ``true_cfg_scale`` (two-pass,
-  norm-corrected), not the embedded ``guidance_scale``, and upstream's
-  ``forward`` defaults it via ``sp.true_cfg_scale or 4.0`` while
-  ``_extract_prompts`` treats an EMPTY-STRING negative prompt as present
-  (only an all-``None`` list disarms CFG). The shared skeleton's
-  ``negative_prompt: ""`` dicts would therefore silently arm CFG@4.0. The
-  input adapter maps the typed ``guidance_scale`` onto ``true_cfg_scale``
-  explicitly and emits the ``negative_prompt`` key only when CFG is armed
-  (> 1.0) — the trainside oracle recipes run guidance 1.0 = CFG off.
-- **Variable-length text conditioning.** Qwen2.5-VL embeds are
-  variable-length after the 34-token chat-template prefix strip and each
-  request is encoded alone (``runtime.max_inflight: 1``), so per-request
-  capture lengths differ — the output adapter ragged-pads to the batch max
-  before the dim-0 concat (the attention mask keeps the padding numerically
-  inert; the trainer's ``predict_noise`` consumes it as
-  ``encoder_hidden_states_mask``). No pooled vector exists for Qwen-Image.
-"""
+"""Qwen-Image family: input/output sub-adapters + the ``qwen_image_t2i`` modality class."""
 
 from __future__ import annotations
 
@@ -43,8 +21,7 @@ from unirl.types.sampling import DiffusionSamplingParams
 
 
 def _ragged_pad_cat(pairs: Sequence[Tuple[torch.Tensor, torch.Tensor]]) -> TextEmbedCondition:
-    """Per-request ``(embeds [b, L_i, D], mask [b, L_i])`` pairs → one
-    ``TextEmbedCondition`` right-padded to the batch-max ``L``."""
+    """Per-request ``(embeds, mask)`` pairs into one ``TextEmbedCondition`` right-padded to the batch-max ``L``."""
     max_len = max(int(e.shape[1]) for e, _ in pairs)
     embeds: List[torch.Tensor] = []
     masks: List[torch.Tensor] = []
@@ -59,25 +36,14 @@ def _ragged_pad_cat(pairs: Sequence[Tuple[torch.Tensor, torch.Tensor]]) -> TextE
 
 
 class QwenImageInputAdapter(DitInputAdapter):
-    """SD3-style request side with the Qwen CFG mapping.
-
-    Carries the model config so ``max_sequence_length`` can be pinned to the
-    trainer's text-embed budget (512) when the request doesn't set one —
-    upstream would otherwise default to 1024 and the conditioning would
-    diverge from the trainside oracle.
-    """
+    """SD3-style request side with the Qwen CFG mapping."""
 
     def __init__(self, modality: str, *, model_config: Any = None) -> None:
         super().__init__(modality)
         self.model_config = model_config
 
     def build_prompts(self, sample: Sample) -> List[Any]:
-        """``{"prompt"}`` dicts; ``negative_prompt`` ONLY when CFG is armed.
-
-        Upstream ``_extract_prompts`` disarms CFG only when EVERY dict lacks
-        the key (``""`` counts as present), so the shared skeleton's
-        unconditional ``negative_prompt: ""`` cannot be reused here.
-        """
+        """``{"prompt"}`` dicts; ``negative_prompt`` ONLY when CFG is armed."""
         # text-only consumer: text_conditioning() fails loud if an image turn is present.
         texts = sample.text_conditioning()[0].content
         diff_params = sample.frontier_gen_part(DiffusionSamplingParams).sampling_params
@@ -99,14 +65,7 @@ class QwenImageInputAdapter(DitInputAdapter):
 
 
 class QwenImageGroupedInputAdapter(QwenImageInputAdapter):
-    """Qwen-Image request builder using vLLM-Omni's native multi-output prompt shape.
-
-    Unlike SD3 where the conditioning tap fires BEFORE upstream's internal
-    embed repeat, Qwen-Image's ``encode_prompt`` accepts ``num_images_per_prompt``
-    and repeats embeddings internally before returning them. The tap therefore
-    captures ALREADY-repeated embeddings — the output adapter needs no
-    ``repeat_interleave``.
-    """
+    """Qwen-Image request builder using vLLM-Omni's native multi-output prompt shape."""
 
     def build_prompts(self, sample: Sample) -> List[Any]:
         grouped_texts, _ = _grouped_texts_from_sample(
@@ -141,14 +100,7 @@ class QwenImageOutputAdapter(DitOutputAdapter):
     )
 
     def build_conditions(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
-        """Ragged-pad-concat the per-request Qwen ``text_capture`` dicts.
-
-        Written by ``RLQwenImagePipeline`` after intercepting
-        ``encode_prompt``. Keys align with ``QwenImageConditions``:
-        ``text`` always; ``negative_text`` only when the negative encode
-        fired (CFG armed) — and then it must have fired for every request
-        of the call (sampling params are uniform across a generate call).
-        """
+        """Ragged-pad-concat the per-request Qwen ``text_capture`` dicts."""
         diff_outputs, _, _ = collect_dit_outputs(
             per_request, final_output_type=self.final_output_type, stage_id=self.stage_id, modality=self.modality
         )

@@ -1,23 +1,4 @@
-"""``sglang`` engine core — wiring + delegation only.
-
-A thin core over the backend seam: it names no concrete model (the adapter,
-picked from the registry by ``config.model_family``, owns the
-``Sample`` → ``Sample`` conversion) and no concrete transport (the seam
-owns the SRT runtime — server subprocess + HTTP, or the in-process Engine,
-picked by ``config.backend``). Weight sync is a :class:`WeightSync` component
-constructed over the seam; the offload lifecycle (the two staged flags) lives
-directly on the engine. The frozen ``synchronous.py`` surface is implemented as thin
-forwards here — they must be real class attributes anyway (``Worker.call``
-dispatches by name; ``@distributed`` binds the most-derived attribute) — which
-also absorbs the surface quirks (``track_prefix``) so the component keeps clean
-signatures.
-
-One-shot construction: after ``__init__`` returns, the SRT server is spawned and
-healthy and the engine is usable. ``generate`` / ``sleep`` / ``wake_up``
-re-apply ``@distributed`` (the decorator is not inherited — see ``synchronous.py``).
-No environment mutation happens here — the spawn-scoped env the SRT
-subprocesses need is quarantined in the backends' ``boot``.
-"""
+"""``sglang`` engine core — wiring + delegation only."""
 
 from __future__ import annotations
 
@@ -28,18 +9,18 @@ import torch
 
 from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, distributed
+from unirl.rollout.engine.base import BaseRolloutEngine
 from unirl.rollout.engine.sglang.adapters import get_adapter
 from unirl.rollout.engine.sglang.backends import HTTPBackend, NativeBackend
 from unirl.rollout.engine.sglang.config import SGLangEngineConfig, SGLangPorts
 from unirl.rollout.engine.sglang.utils import resolve_sampling
 from unirl.rollout.engine.sglang.weight_sync import WeightSync
-from unirl.rollout.engine.synchronous import SyncRolloutEngine
 from unirl.types.sample import Sample
 
 logger = logging.getLogger(__name__)
 
 
-class SGLangRolloutEngine(SyncRolloutEngine):
+class SGLangRolloutEngine(BaseRolloutEngine):
     """LLM/VLM rollout engine backed by a SGLang SRT server (v2 layout)."""
 
     _component_name = "sglang"
@@ -58,7 +39,6 @@ class SGLangRolloutEngine(SyncRolloutEngine):
         tp_rank: int = 0,
         tp_size: int = 1,
         tp_visible_devices: Optional[List[str]] = None,
-        tp_device_ids: Optional[List[int]] = None,
         pp_rank: int = 0,
         pp_size: int = 1,
         ep_rank: int = 0,
@@ -87,15 +67,10 @@ class SGLangRolloutEngine(SyncRolloutEngine):
         self._pp_size = int(pp_size)
         self._ep_rank = int(ep_rank)
         self._ep_size = int(ep_size)
-        if tp_visible_devices is not None and tp_device_ids is not None:
-            raise ValueError("set only one of tp_visible_devices or tp_device_ids")
         if tp_visible_devices is not None:
             self._tp_visible_devices = [str(token) for token in tp_visible_devices]
-        elif tp_device_ids is not None:
-            self._tp_visible_devices = [str(device_id) for device_id in tp_device_ids]
         else:
             self._tp_visible_devices = None
-        self._tp_device_ids = list(tp_device_ids) if tp_device_ids is not None else None
         self._is_tp_zero = self._tp_rank == 0
 
         if not self._is_tp_zero:
@@ -196,12 +171,7 @@ class SGLangRolloutEngine(SyncRolloutEngine):
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
     def generate(self, sample: Sample) -> Sample:
-        """Generate one whole Sample synchronously through the backend seam.
-
-        Only tp_rank==0 hosts a SGLang server; other TP ranks in the group are
-        no-op shells. The DP_SCATTER collect keeps only tp_rank==0 pipeline-tail
-        results, so returning None here is defensive and gets filtered out.
-        """
+        """Generate one whole Sample synchronously through the backend seam."""
         if not self._is_tp_zero:
             return None
         prepared = self._prepare_generation(sample)
@@ -209,8 +179,7 @@ class SGLangRolloutEngine(SyncRolloutEngine):
         return self._finish_generation(sample, prepared, raw)
 
     def abort(self, ids: Optional[List[str]] = None) -> List[Sample]:
-        """Abort in-flight generation (best-effort). Partials surface via the
-        pending ``generate`` returns, so this returns ``[]``."""
+        """Abort in-flight generation (best-effort). Partials surface via the"""
         del ids
         if self._is_tp_zero:
             self._backend.abort(abort_all=True)
@@ -226,16 +195,7 @@ class SGLangRolloutEngine(SyncRolloutEngine):
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def sleep(self, tags: Optional[List[str]] = None) -> None:
-        """Release GPU memory (offload).
-
-        Flushes the cache first; sglang's release only fully frees the KV
-        pool when the scheduler has no pending references.
-
-        ``tags`` selects which sglang SRT memory regions to release (e.g.
-        ``["weights"]``). ``None`` releases everything. Called again while
-        offloaded (post-sync re-offload), it releases the weights that
-        ``onload_weights`` restored — or no-ops if they never were.
-        """
+        """Release GPU memory (offload)."""
         if not self._is_tp_zero:
             return
         release_tags = None if tags is None or len(tags) == 0 else list(tags)
@@ -253,12 +213,7 @@ class SGLangRolloutEngine(SyncRolloutEngine):
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def wake_up(self, tags: Optional[List[str]] = None) -> None:
-        """Resume GPU memory.
-
-        Can be called multiple times with different tag subsets for a staged
-        resume — e.g. ``wake_up(tags=["weights"])`` to allow weight sync, then
-        ``wake_up(tags=["kv_cache", "cuda_graph"])`` before generation.
-        """
+        """Resume GPU memory."""
         if not self._is_tp_zero:
             return
         full_wake = tags is None or len(tags) == 0
@@ -318,12 +273,7 @@ class SGLangRolloutEngine(SyncRolloutEngine):
         flush_cache: bool = True,
         track_prefix: str = "",
     ) -> None:
-        """Update weights from serialized tensors via the seam.
-
-        ``target_modules`` is intentionally NOT forwarded — the diffusion-side
-        default ``["transformer"]`` doesn't match LLM module naming. Omitting
-        the field lets the SRT server accept all incoming weights correctly.
-        """
+        """Update weights from serialized tensors via the seam."""
         del target_modules, track_prefix
         if not self._is_tp_zero:
             return
@@ -368,11 +318,7 @@ class SGLangRolloutEngine(SyncRolloutEngine):
         flush_cache: bool = True,
         track_prefix: str = "",
     ) -> None:
-        """Receive weights via NCCL broadcast from training actors.
-
-        ``target_modules`` is intentionally NOT forwarded (see
-        :meth:`update_weights_from_tensor` for rationale).
-        """
+        """Receive weights via NCCL broadcast from training actors."""
         del target_modules, track_prefix
         if not self._is_tp_zero:
             return

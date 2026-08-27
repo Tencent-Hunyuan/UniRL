@@ -1,4 +1,15 @@
-"""Export a UniRL training checkpoint to a Hugging Face ``save_pretrained`` folder.
+"""Export a UniRL training checkpoint to a Hugging Face ``save_pretrained`` folder."""
+
+from __future__ import annotations
+
+import argparse
+from typing import Dict, Optional
+
+import torch
+
+from unirl.tools._checkpoint import load_training_checkpoint
+
+_HELP = """Export a UniRL training checkpoint to a Hugging Face ``save_pretrained`` folder.
 
 Accepts either flavor ``FSDPBackend.save`` writes: the legacy single-file
 ``checkpoint.pt`` or a sharded ``dcp`` directory (reassembled offline on load).
@@ -36,15 +47,6 @@ Loading the SD3 result back into a pipeline:
     pipe = StableDiffusion3Pipeline.from_pretrained(base, transformer=transformer)
 """
 
-from __future__ import annotations
-
-import argparse
-from typing import Dict, Optional
-
-import torch
-
-from unirl.tools._checkpoint import load_training_checkpoint
-
 DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
 
 
@@ -68,11 +70,7 @@ def merge_lora_state_dict(
     adapter: str = "default",
     alpha: Optional[float] = None,
 ) -> Dict[str, torch.Tensor]:
-    """``save_mode=full`` checkpoint → HF-named dict with the LoRA delta folded in.
-
-    No-op (copy) for checkpoints without LoRA keys (full-finetune recipes).
-    Other adapters' keys (e.g. the NFT shadow ``old``) are dropped.
-    """
+    """``save_mode=full`` checkpoint → HF-named dict with the LoRA delta folded in."""
     if not any(".lora_A." in k for k in state_dict):
         return dict(state_dict)
     alpha = _require_alpha(alpha)
@@ -142,7 +140,7 @@ def overlay_partial_state_dict(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(description=_HELP, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--checkpoint", required=True, help="checkpoint-<step> dir, or the checkpoint.pt itself")
     parser.add_argument("--base", required=True, help="HF repo id / local snapshot of the BASE model")
     parser.add_argument("--output", required=True, help="output folder for save_pretrained")

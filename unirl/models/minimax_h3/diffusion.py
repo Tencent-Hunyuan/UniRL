@@ -1,28 +1,4 @@
-"""MiniMax-H3 diffusion step + stage.
-
-Two things here are unlike every other diffusion package in this repo, and both
-are checkpoint contracts:
-
-**The velocity is data-ward.** MiniMax-H3's transformer predicts ``v`` such that
-``x0 = x_t + sigma * v``; diffusers -- and therefore UniRL's ``FlowSDEStrategy``
--- assume ``x0 = x_t - sigma * v``. Writing H3's Euler update as its own
-reference does, ``x_next = r*x_t + (1-r)*x0`` with ``r = sigma_next/sigma``::
-
-    x_next = r*x_t + (1-r)*(x_t + sigma*v) = x_t + (sigma - sigma_next)*v
-           = x_t - dt*v                                  (dt = sigma_next - sigma)
-           = x_t + dt*(-v)
-
-which is exactly ``FlowSDEStrategy`` at ``eta=0``, whose ``prev_sample_mean``
-collapses to ``sample + noise_pred*dt``. So negating the transformer output ONCE,
-in ``predict_noise``, makes the entire existing SDE / log-prob / replay stack
-apply unchanged. Get the sign wrong and nothing crashes -- the policy just
-optimises in reverse.
-
-**The two modalities run different schedules.** Video uses ``shift=12``, audio
-``shift=3``. LTX-2.3, the only other joint audio+video RL model here, shares one
-grid between its streams; H3 does not, so the stage carries both and steps each
-on its own ``(sigma, sigma_next)``.
-"""
+"""MiniMax-H3 diffusion step + stage."""
 
 from __future__ import annotations
 
@@ -53,28 +29,13 @@ def _combine_modality_logp(
     n_video: int,
     n_audio: int,
 ) -> torch.Tensor:
-    """Element-weighted mean of the per-step video/audio log-probs.
-
-    Both streams are stepped by the same stateless strategy and each returns a
-    per-sample log-prob already meaned over its own latent dims, so weighting by
-    element count reproduces the mean a single SDE over the concatenated
-    ``[video|audio]`` latent would produce. That the two sit at DIFFERENT noise
-    levels does not change this: they are independent Gaussians, and the joint
-    log-prob of independent factors is the sum -- the weighting just restores
-    the per-element scale the video-only path had. Mirrors LTX-2's
-    ``_combine_modality_logp``.
-    """
+    """Element-weighted mean of the per-step video/audio log-probs."""
     total = n_video + n_audio
     return (video_logp * n_video + audio_logp * n_audio) / total
 
 
 def pack_dual_streams(video_rows: torch.Tensor, audio_rows: torch.Tensor) -> torch.Tensor:
-    """Flatten ``[B, V, Cv]`` + ``[B, A, Ca]`` into one ``[B, V*Cv + A*Ca]`` tensor.
-
-    Forward-process algorithms noise a single latent tensor and take one MSE over
-    it, so audio only reaches the objective by riding along with video -- and it
-    has to, because the reward scores their agreement.
-    """
+    """Flatten ``[B, V, Cv]`` + ``[B, A, Ca]`` into one ``[B, V*Cv + A*Ca]`` tensor."""
     batch = video_rows.shape[0]
     return torch.cat([video_rows.reshape(batch, -1), audio_rows.reshape(batch, -1)], dim=1)
 
@@ -99,13 +60,7 @@ def unpack_dual_streams(
 
 
 class MiniMaxH3DiffusionStep(DiffusionStep[MiniMaxH3Bundle, MiniMaxH3Conditions]):
-    """Per-step MiniMax-H3 denoising kernel -- stateless.
-
-    One transformer forward per step, covering every row of the packed sequence
-    at once and returning both modalities' velocities. There is no CFG batching
-    here on purpose: the checkpoint is guidance-distilled, so there is no
-    unconditional branch to run and ``guidance_scale`` has no meaning.
-    """
+    """Per-step MiniMax-H3 denoising kernel -- stateless."""
 
     def __init__(self, bundle: MiniMaxH3Bundle) -> None:
         self.bundle = bundle
@@ -120,11 +75,7 @@ class MiniMaxH3DiffusionStep(DiffusionStep[MiniMaxH3Bundle, MiniMaxH3Conditions]
         audio_sigma: torch.Tensor,
         layout,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """One forward -> ``(video_velocity, audio_velocity)``, sign-corrected.
-
-        Latents stay ``[B=1, rows, C]`` throughout, which lands directly on the
-        transformer's batch dim -- no ``[None]`` / ``[0]`` reshaping.
-        """
+        """One forward -> ``(video_velocity, audio_velocity)``, sign-corrected."""
         unique_timesteps, timestep_indices = row_timestep_plan(layout, video_sigma=video_sigma, audio_sigma=audio_sigma)
         device = video_sample.device
         video_velocity, audio_velocity = self.bundle.transformer(
@@ -147,11 +98,7 @@ class MiniMaxH3DiffusionStep(DiffusionStep[MiniMaxH3Bundle, MiniMaxH3Conditions]
 
 
 class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
-    """Rollout-level MiniMax-H3 stage: conditions -> ``LatentSegment``.
-
-    Video latents live in ``LatentSegment.latents``; the co-denoised audio
-    stream lives in ``aux_latents``, the slot LTX-2 introduced for exactly this.
-    """
+    """Rollout-level MiniMax-H3 stage: conditions -> ``LatentSegment``."""
 
     _no_split_modules: ClassVar[List[str]] = ["MiniMaxH3TransformerBlock"]
 
@@ -180,16 +127,7 @@ class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
         return self.bundle.transformer
 
     def audio_schedule(self, video_schedule: torch.Tensor) -> torch.Tensor:
-        """The audio sigma grid, derived from the video one.
-
-        MiniMax-H3's grids are both plain rectified flow. For ``N`` UniRL
-        transitions, ``get_sigma_schedule`` builds ``N + 1`` points, matching
-        the vendored scheduler called with ``set_timesteps(N + 1)``. Deriving
-        audio here rather than pinning a second schedule onto the generation Part keeps
-        ``LatentSegment.sigmas`` and ``DiffusionSamplingParams`` untouched: the
-        audio grid is a pure function of ``(num_steps, audio_shift)``, so there
-        is nothing for a rollout engine to disagree with.
-        """
+        """The audio sigma grid, derived from the video one."""
         return get_sigma_schedule(
             num_steps=int(video_schedule.shape[0]) - 1,
             shift=self.audio_shift,
@@ -340,15 +278,7 @@ class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
         geometry: Optional[MiniMaxH3Geometry] = None,
         step_indices: Optional[List[int]] = None,
     ) -> ReplayResult:
-        """Recompute log-probs for the stored transitions (training path).
-
-        Same loop as :meth:`generate` with ``prev_sample`` supplied, so
-        ``strategy.denoise`` evaluates the stored transition instead of drawing
-        fresh noise. The audio state at each step is read back from
-        ``aux_latents``: the transformer sees both streams in one packed
-        sequence, so the video velocity depends on the audio state and replay
-        cannot reconstruct it from the video trajectory alone.
-        """
+        """Recompute log-probs for the stored transitions (training path)."""
         require(
             segment.sde_indices is not None and segment.latents is not None and segment.sigmas is not None,
             "MiniMaxH3DiffusionStage.replay: segment.sde_indices / latents / sigmas missing",
@@ -431,11 +361,7 @@ class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
         )
 
     def nft_clean_latents(self, segment: LatentSegment) -> torch.Tensor:
-        """The clean ``x0`` a forward-process algorithm should train on.
-
-        Overrides the caller's default of ``segment.latents[:, -1]``, which is
-        the video half only.
-        """
+        """The clean ``x0`` a forward-process algorithm should train on."""
         require(
             segment.latents is not None and segment.aux_latents is not None,
             "MiniMaxH3DiffusionStage.nft_clean_latents: segment.latents / aux_latents missing -- the rollout must "
@@ -451,16 +377,7 @@ class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
         sigma: torch.Tensor,
         params: DiffusionSamplingParams,
     ) -> torch.Tensor:
-        """One packed forward at an arbitrary ``(xt, sigma)`` -- no SDE iteration.
-
-        ``sample`` and the return value are both packed by
-        :func:`pack_dual_streams`, so the caller never sees the two streams.
-
-        Both streams take the same sigma. The video/audio shift split describes
-        the reverse schedule that ``generate`` walks, and a forward-process
-        objective jumps to a noise level instead of walking it, so there is no
-        second grid to be on.
-        """
+        """One packed forward at an arbitrary ``(xt, sigma)`` -- no SDE iteration."""
         require(
             int(sample.shape[0]) == 1,
             f"MiniMaxH3DiffusionStage.predict_noise_at_step: batch-1 only (got {int(sample.shape[0])}). The packed "

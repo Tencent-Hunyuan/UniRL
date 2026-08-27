@@ -1,20 +1,4 @@
-"""ZImageVAEDecodeStage — LatentSegment → Images via VAE decode.
-
-Implements ``DecodeStage[LatentSegment, Images]``. Reads the final stored
-position from ``LatentSegment.latents[:, -1]`` (``ZImageDiffusionStage``
-always stores position ``T``, the clean latent), runs the
-``AutoencoderKL`` decode in fp32, and normalizes the output from
-``[-1, 1]`` to ``[0, 1]`` before wrapping in ``Images``.
-
-Z-Image uses the flux-style 16-channel ``AutoencoderKL`` with both
-``scaling_factor`` and ``shift_factor`` — identical to SD3. The latent
-un-normalization mirrors the diffusers ``ZImagePipeline`` decode path:
-``x = latent / scaling_factor + shift_factor``.
-
-No ``ZImageVAEEncodeStage`` here — the reference pipeline supports only
-text-to-image; the encoder is unused. Add when img2img / SDEdit /
-ControlNet lands.
-"""
+"""ZImageVAEDecodeStage — LatentSegment → Images via VAE decode."""
 
 from __future__ import annotations
 
@@ -36,19 +20,7 @@ class ZImageVAEDecodeStage(DecodeStage[LatentSegment, Images]):
         self.bundle = bundle
 
     def decode(self, s: LatentSegment, *, grad: bool = False, activation_checkpoint: bool = False) -> Images:
-        """Decode the final-step latents in *s* into pixel images.
-
-        Reads ``s.latents[:, -1]`` (the final stored position, which is
-        ``T`` — the clean latent ``x_0`` in spatial shape
-        ``[B, C, H, W]``). VAE forward runs in fp32; output is clamped to
-        ``[0, 1]`` before being wrapped in ``Images``.
-
-        ``grad=False`` (default) keeps the rollout path under ``torch.no_grad()``.
-        ``grad=True`` (ReFL direct-reward backprop) runs the decode WITH grad so it
-        flows from the reward through the frozen VAE into ``clean``; the VAE has no
-        trainable params, so only ``clean``'s graph is extended. ``activation_checkpoint``
-        (grad only) recomputes the decode in backward to trade compute for memory.
-        """
+        """Decode the final-step latents in *s* into pixel images."""
         if self.bundle.vae is None:
             raise RuntimeError(
                 "ZImageVAEDecodeStage.decode: no VAE loaded (load_vae=False). "

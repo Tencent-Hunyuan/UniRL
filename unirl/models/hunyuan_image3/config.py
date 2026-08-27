@@ -1,35 +1,18 @@
-"""Construction config for the new typed HunyuanImage 3.0 pipeline.
-
-Mirrors :class:`unirl.models.sd3.config.SD3PipelineConfig` minus
-SD3-specific knobs and plus HunyuanImage3-specific ones. The bundle is
-weights+params only; LoRA / FSDP wrap / autocast / weight sync live
-outside (in the training and rollout actors).
-"""
+"""Construction config for the new typed HunyuanImage 3.0 pipeline."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional, Tuple
+from typing import Any, Tuple
 
 from unirl.config.validation import validate_precision_type
 
 
 @dataclass
 class HunyuanImage3PipelineConfig:
-    """Construction args for ``HunyuanImage3Pipeline.from_config``.
-
-    The HunyuanImage3 backbone is a single shared MoE transformer that
-    operates in either ``mode="gen_text"`` (AR) or ``mode="gen_image"`` (DiT)
-    on the same weights. The bundle owns one transformer + one SigLIP2 ViT
-    + one 3D-VAE + one tokenizer + one scheduler.
-
-    ``device`` may be runtime-injected by the actor after compose; the
-    other fields are set at compose time and read once during pipeline
-    construction.
-    """
+    """Construction args for ``HunyuanImage3Pipeline.from_config``."""
 
     pretrained_model_ckpt_path: str
-    vit_ckpt_path: Optional[str] = None
     vae_dtype: Any = None
     text_encoder_dtype: Any = None
     model_precision: Any = "bf16"

@@ -1,45 +1,4 @@
-"""Use driver-provided σ as-is in FlowMatch ``set_timesteps`` (gap, LIN-365).
-
-UniRL pins the SDE σ schedule (GRPO σ-consistency: the *same* schedule must
-drive rollout and replay) and ships it via ``SamplingParams.sigmas`` ->
-``batch.sigmas`` -> ``TimestepPreparationStage`` ->
-``scheduler.set_timesteps(sigmas=...)``. But upstream's
-``FlowMatchEulerDiscreteScheduler.set_timesteps`` ALWAYS applies a shift to
-provided sigmas, double-shifting the driver's already-final schedule
-(``sigma_verify`` then fails -- "Worker did NOT use the σ we sent"). There are
-three schedule-mutation code paths inside set_timesteps and we neutralize all:
-
-1. **Static resolution shift** (used by SD3 etc., ``shift!=1``):
-   ``sigmas = shift*σ/(1+(shift-1)*σ)``. This is the identity at ``shift==1``
-   (``1*σ/(1+0*σ) == σ``), so we run the stock method with ``_shift``
-   temporarily set to ``1.0``.
-
-2. **Dynamic mu shift** (used by FLUX-family / Klein,
-   ``use_dynamic_shifting=True``): ``sigmas = time_shift(mu, 1.0, sigmas)``.
-   Neutralized by binding ``time_shift`` to identity for the delegated call
-   (instance attribute shadows the class method; ``del`` restores), exactly like
-   the terminal-stretch path below. This is correct for BOTH
-   ``time_shift_type="exponential"`` and ``"linear"``; the older ``mu = 0.0``
-   trick was the identity only for the exponential form and would zero the whole
-   schedule under ``linear``. The driver already baked μ into the sigmas.
-
-3. **Terminal stretch** (used by Qwen-Image, ``shift_terminal: 0.02``;
-   SD3/Flux ship ``null``): ``stretch_shift_to_terminal`` rescales the whole
-   schedule to terminate at ``shift_terminal`` -- gated only on the config
-   value, NOT on external sigmas, so it would mutate the driver's final σ just
-   like the two shift paths. Neutralized by temporarily binding the instance
-   method to identity for the delegated call (instance attribute shadows the
-   class method; ``del`` restores).
-
-The driver applied its own model-specific schedule transforms (Klein
-empirical-mu shift, Qwen-Image terminal stretch -- ``FlowMatchSchedulePolicy``
-``shift_terminal``) to the sigmas before shipping them, so the worker MUST NOT
-re-apply any of them; this neutralization is how we keep GRPO's σ-consistency
-contract.
-
-Robust to upstream changes elsewhere in ``set_timesteps`` (karras/beta)
-because we still delegate to ``orig``.
-"""
+"""Use driver-provided σ as-is in FlowMatch ``set_timesteps``."""
 
 from __future__ import annotations
 

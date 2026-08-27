@@ -1,12 +1,4 @@
-"""WAN21ImageLatentEncodeStage — packed Images → mask+VAE latent payload.
-
-Mirrors diffusers ``pipelines/wan/pipeline_wan_i2v.py:423-481`` for the
-``expand_timesteps=False`` path (WAN 2.1 I2V + WAN 2.2 14B I2V). Encode
-uses ``vae.encode(x).latent_dist.mode()`` (deterministic) so rollout /
-replay produce bitwise-equal image latents — sampling here would drift
-the GRPO logp ratio. Per-channel normalization is the strict inverse of
-``wan21/vae.py:78-87`` (decode = ``latent * std + mean``).
-"""
+"""WAN21ImageLatentEncodeStage — packed Images → mask+VAE latent payload."""
 
 from __future__ import annotations
 
@@ -25,11 +17,7 @@ _TEMPORAL_DOWNSAMPLE: int = 4
 
 @runtime_checkable
 class _VAEBundle(Protocol):
-    """Structural Protocol for bundles that own a 3D VAE.
-
-    Both :class:`WAN21Bundle` and :class:`WAN22Bundle` satisfy this
-    structurally; this stage is shared across both pipelines.
-    """
+    """Structural Protocol for bundles that own a 3D VAE."""
 
     vae: Any
     device: torch.device

@@ -1,22 +1,24 @@
-"""RL-aware BAGEL-7B-MoT pipeline subclass.
-
-``forward`` follows the RL interception protocol (install → arm → run → harvest):
-install the trajectory-capturing SDE scheduler + noise tap + fp32 RoPE/RMSNorm
-patches, arm per-request x_T/SDE, delegate to upstream, then harvest the trajectory.
-Conditioning is NOT tapped — the driver ships prompts and the trainer rebuilds the
-(frozen) KV contexts at replay. Loaded in vLLM-Omni's worker via custom_pipeline_args.
-"""
+"""RL-aware BAGEL-7B-MoT pipeline subclass."""
 
 from __future__ import annotations
 
+import copy
 import logging
-from typing import Any, Dict, Optional
+from types import SimpleNamespace
+from typing import Any, Dict, Optional, Tuple
 
+import PIL.Image
 import torch
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.models.bagel.bagel_transformer import NaiveCache
 from vllm_omni.diffusion.models.bagel.pipeline_bagel import BagelPipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
+from unirl.models.bagel.rl_ops import (
+    build_image_transforms,
+    resize_input_image,
+    update_context_image,
+)
 from unirl.rollout.engine.vllm_omni.pipelines._shared.interception import (
     drain_trajectory_into,
     resolve_request_noise,
@@ -44,10 +46,11 @@ class RLBagelPipeline(BagelPipeline):
         self._pending_spp: int = 1
         self._pending_batched_latents: Optional[list] = None
         self._trajectory_dtype: torch.dtype = torch.float32
+        self._vae_transform: Optional[Any] = None
+        self._vit_transform: Optional[Any] = None
 
     def _install_sde_scheduler(self) -> None:
-        """Point ``self.scheduler`` at the trajectory-capturing SDE scheduler — always
-        installed (even eta=0) since replay needs the captured trajectory; kwargs empty."""
+        """Point ``self.scheduler`` at the trajectory-capturing SDE scheduler — always installed, even at eta=0."""
         if self._sde_scheduler_installed:
             return
         self.scheduler = self._sde_scheduler
@@ -55,8 +58,7 @@ class RLBagelPipeline(BagelPipeline):
         self._sde_scheduler_installed = True
 
     def _install_rope_fp32(self) -> None:
-        """Force the rotary cos/sin into fp32 to bit-match trainside — the worker rotary
-        runs under autocast(bf16) with no guard, so its cos/sin diverge every step."""
+        """Force the rotary cos/sin to fp32 to bit-match trainside — the worker rotary runs under unguarded autocast."""
         if self._rope_fp32_patched:
             return
         try:
@@ -95,8 +97,7 @@ class RLBagelPipeline(BagelPipeline):
         self._rope_fp32_patched = True
 
     def _install_rmsnorm_fp32(self) -> None:
-        """Make every worker RMSNorm bit-match the trainside ``Qwen2RMSNorm`` — vLLM
-        rounds the fp32 q/k-norm to bf16 before the multiply, a LoRA-growing velocity gap."""
+        """Make every worker RMSNorm bit-match trainside ``Qwen2RMSNorm`` — vLLM rounds the fp32 q/k-norm to bf16."""
         if self._rmsnorm_fp32_patched:
             return
         try:
@@ -131,8 +132,7 @@ class RLBagelPipeline(BagelPipeline):
         self._rmsnorm_fp32_patched = True
 
     def _install_noise_tap(self) -> None:
-        """Wrap ``bagel.prepare_vae_latent`` to swap the driver-authored x_T (consume-once)
-        in for upstream's RNG-drawn ``packed_init_noises``, leaving other inputs untouched."""
+        """Wrap ``bagel.prepare_vae_latent`` to swap the driver-authored x_T in for upstream's RNG-drawn noises."""
         if self._noise_tap_installed:
             return
 
@@ -173,11 +173,7 @@ class RLBagelPipeline(BagelPipeline):
 
     @staticmethod
     def _replicate_prompt_kv(kwargs: Dict[str, Any], spp: int, merge_kv_caches: Any) -> Dict[str, Any]:
-        """Clone the single prompt KV cache into ``spp`` views (one per packed image).
-
-        ``prepare_vae_latent`` already opened ``spp`` image slots; each slot indexes
-        its own KV span, so the shared prompt cache must be repeated to match.
-        """
+        """Clone the single prompt KV cache into ``spp`` views (one per packed image)."""
         past = kwargs.get("past_key_values")
         if past is None:
             return kwargs
@@ -186,18 +182,7 @@ class RLBagelPipeline(BagelPipeline):
         return out
 
     def _install_generate_image_tap(self) -> None:
-        """Wrap ``bagel.generate_image`` once for the grouped (spp>1) path.
-
-        Two jobs when ``_pending_spp > 1``:
-
-        1. **Before** the call — replicate prompt KV ``spp``× so it lines up with
-           the ``spp`` image blocks the noise tap already expanded.
-        2. **After** the call — stash all ``spp`` unpacked latents. Upstream
-           ``forward`` only VAE-decodes ``latents[0]``; ``_forward_batched``
-           decodes the rest from this stash.
-
-        ``spp == 1`` is a pure passthrough.
-        """
+        """Wrap ``bagel.generate_image`` once for the grouped (spp>1) path."""
         if self._generate_image_tap_installed:
             return
 
@@ -216,6 +201,103 @@ class RLBagelPipeline(BagelPipeline):
 
         self.bagel.generate_image = generate_image_grouped  # type: ignore[assignment]
         self._generate_image_tap_installed = True
+
+    def _bundle_view(self) -> SimpleNamespace:
+        """Return a ``BagelBundle``-shaped worker view for shared image prefill."""
+        if self._vae_transform is None:
+            self._vae_transform, self._vit_transform = build_image_transforms()
+        return SimpleNamespace(
+            model=self.bagel,
+            vae=self.vae,
+            vae_transform=self._vae_transform,
+            vit_transform=self._vit_transform,
+            new_token_ids=self.new_token_ids,
+            device=self.device,
+        )
+
+    @staticmethod
+    def _prompt_text(req: OmniDiffusionRequest) -> str:
+        """The request's prompt string (upstream's own extraction, pipeline_bagel:327)."""
+        prompt = req.prompts[0]
+        return prompt if isinstance(prompt, str) else (prompt.get("prompt") or "")
+
+    @staticmethod
+    def _source_image(req: OmniDiffusionRequest) -> Optional[PIL.Image.Image]:
+        """The it2i source PIL off the prompt dict; ``None`` on the t2i path."""
+        prompt = req.prompts[0] if getattr(req, "prompts", None) else None
+        if not isinstance(prompt, dict):
+            return None
+        image = (prompt.get("multi_modal_data") or {}).get("image")
+        if image is None:
+            return None
+        if not isinstance(image, PIL.Image.Image):
+            raise TypeError(
+                "RLBagelPipeline: multi_modal_data['image'] must be ONE PIL image "
+                f"(BagelInputAdapter ships one per sample); got {type(image).__name__}."
+            )
+        return image
+
+    def _prefill_text(self, ctx: Dict[str, Any], prompt: str) -> Dict[str, Any]:
+        """Advance a KV context with the upstream text-prefill path."""
+        clean = str(prompt).removeprefix("<|im_start|>").removesuffix("<|im_end|>")
+        gi, kv_lens, ropes = self.bagel.prepare_prompts(
+            curr_kvlens=ctx["kv_lens"],
+            curr_rope=ctx["ropes"],
+            prompts=[clean],
+            tokenizer=self.tokenizer,
+            new_token_ids=self.new_token_ids,
+        )
+        gi = {k: (v.to(self.device) if torch.is_tensor(v) else v) for k, v in gi.items()}
+        past = self.bagel.forward_cache_update_text(ctx["past_key_values"], **gi)
+        return {"kv_lens": kv_lens, "ropes": ropes, "past_key_values": past}
+
+    def _build_it2i_contexts(
+        self, image: PIL.Image.Image, prompt: str
+    ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+        """Build the gen, drop-text, and drop-image KV contexts for editing."""
+        bundle = self._bundle_view()
+        gen = {
+            "kv_lens": [0],
+            "ropes": [0],
+            "past_key_values": NaiveCache(self.bagel.config.llm_config.num_hidden_layers),
+        }
+        cfg_img = copy.deepcopy(gen)
+        autocast = torch.autocast(
+            device_type=self.device.type,
+            enabled=self.device.type != "cpu",
+            dtype=self.od_config.dtype,
+        )
+        with torch.no_grad(), autocast:
+            resized = resize_input_image(bundle, image)
+            gen = update_context_image(bundle, resized, gen, vae=True, vit=True)
+            cfg_text = copy.deepcopy(gen)  # snapshot before the prompt text
+            gen = self._prefill_text(gen, prompt)
+            cfg_img = self._prefill_text(cfg_img, prompt)
+        return gen, cfg_text, cfg_img
+
+    def _inject_it2i_contexts(self, req: OmniDiffusionRequest, image: PIL.Image.Image) -> None:
+        """Inject it2i KV contexts and requested canvas metadata into a copied request."""
+        sp = req.sampling_params
+        if sp.height is None or sp.width is None:
+            raise ValueError(
+                "RLBagelPipeline it2i: sampling_params must carry height/width (the "
+                "output canvas the driver's x_T recipe was authored for)."
+            )
+        image_shape = (int(sp.height), int(sp.width))
+        gen, cfg_text, cfg_img = self._build_it2i_contexts(image, self._prompt_text(req))
+
+        sp = copy.copy(sp)
+        sp.past_key_values = gen["past_key_values"]
+        sp.kv_metadata = {"ropes": gen["ropes"], "image_shape": image_shape}
+        sp.cfg_text_past_key_values = cfg_text["past_key_values"]
+        sp.cfg_text_kv_metadata = {"ropes": cfg_text["ropes"]}
+        sp.cfg_img_past_key_values = cfg_img["past_key_values"]
+        sp.cfg_img_kv_metadata = {"ropes": cfg_img["ropes"]}
+        req.sampling_params = sp
+
+    # ------------------------------------------------------------------ #
+    # arm — every request (stale-leak guards)
+    # ------------------------------------------------------------------ #
 
     def _arm_sde(self, req: OmniDiffusionRequest, image_token_sizes: Optional[list] = None) -> None:
         """This request's SDE strength + sparse step gate + σ_max + storage dtype."""
@@ -242,17 +324,11 @@ class RLBagelPipeline(BagelPipeline):
         self._pending_initial_noise = resolve_request_noise(req, caller="RLBagelPipeline._arm_initial_noise")
 
     def _harvest_trajectory(self, out: DiffusionOutput) -> None:
-        """Overwrite upstream's trajectory capture with the SDE scheduler's — sets
-        latents/timesteps/log_probs + sparse sde_step_indices (the build_image_segment wire)."""
+        """Overwrite upstream's trajectory capture with the SDE scheduler's — the ``build_image_segment`` wire."""
         drain_trajectory_into(out, self._sde_scheduler)
 
     def _is_batchable_t2i(self, req: OmniDiffusionRequest) -> bool:
-        """Packed DiT batching: pure text→image at cfg=1 only.
-
-        Reject i2i / text-output modalities (upstream routing) and CFG>1 (needs
-        unreplicated cfg_* branches). Missing CFG keys are NOT 1.0 — upstream
-        defaults absent keys to CFG-ON (4.0 / 1.5).
-        """
+        """Packed DiT batching: pure text→image at cfg=1 only."""
         fp = req.prompts[0] if getattr(req, "prompts", None) else None
         if isinstance(fp, dict):
             modalities = fp.get("modalities") or []
@@ -283,6 +359,12 @@ class RLBagelPipeline(BagelPipeline):
                 )
             return self._forward_batched(req, spp, **kwargs)
 
+        # it2i: build the conditioning ourselves (trainside-identical) and inject it,
+        # so upstream's own img2img prefill never runs. No-op for t2i.
+        image = self._source_image(req)
+        if image is not None:
+            self._inject_it2i_contexts(req, image)
+
         self._arm_sde(req)
         self._arm_initial_noise(req)
 
@@ -292,11 +374,7 @@ class RLBagelPipeline(BagelPipeline):
         return out
 
     def _forward_batched(self, req: OmniDiffusionRequest, spp: int, **kwargs) -> DiffusionOutput:
-        """Pack ``spp`` same-prompt images into ONE ``generate_image``.
-
-        Prompt KV is built once and replicated spp×; noise tap packs spp image
-        blocks + driver x_T. Reuse upstream's decode of latents[0]; decode the rest.
-        """
+        """Pack ``spp`` same-prompt images into ONE ``generate_image``."""
         self._install_generate_image_tap()
         ds = int(self.bagel.latent_downsample)
         per = (int(req.sampling_params.height) // ds) * (int(req.sampling_params.width) // ds)

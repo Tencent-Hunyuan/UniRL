@@ -1,22 +1,4 @@
-"""Driver-side ``Sample`` → ``Sample`` conversion: the adapter ABC + registry.
-
-A thin top ABC (registry + boilerplate) over the per-shape base adapter
-(:mod:`text` — both registered families fill a packed-text generation Part) that
-holds the conversion logic as overridable methods. The VLM adapter overrides only
-the steps that differ and self-registers by ``model_family`` key. Selected once
-at engine construction via :func:`get_adapter`.
-
-Pure: never imports SGLang — adapters consume the seam's ``RawResult`` protocol,
-not the runtime. The tokenizer/processor are *injected* by the engine (loading
-them is I/O the engine owns; tests pass stubs), so ``build_inputs`` /
-``build_response`` stay exercisable with canned data.
-
-``build_inputs`` returns a :class:`PreparedInputs` rather than a bare payload
-list: the response side needs encode-time artifacts (the prompt token ids the
-server saw; the VLM processor encodings), so the engine threads the prepared
-object through to ``build_response`` instead of the adapter keeping per-call
-state.
-"""
+"""Driver-side ``Sample`` → ``Sample`` conversion: the adapter ABC + registry."""
 
 from __future__ import annotations
 
@@ -62,18 +44,7 @@ def registered_adapters() -> Tuple[str, ...]:
 
 @dataclass
 class MMEncoding:
-    """One VLM sample's multimodal input for the SRT rollout.
-
-    - ``image`` (PIL): base64'd into the ``/generate`` ``image_data`` so the
-      server actually attends the image.
-    - ``text``: the chat-templated string with a SINGLE image placeholder —
-      sent to SRT, whose processor re-expands it. (Sending the pre-expanded
-      ``input_ids`` + ``image_data`` instead makes SRT return 500.)
-    - ``input_ids``: the processor's EXPANDED id sequence — stored as the replay
-      prompt so rollout and replay teacher-force over the identical token stream.
-    - ``pixel_values`` / ``image_grid_thw``: attached to the response conditions
-      so the replay teacher-forces over the IDENTICAL multimodal input.
-    """
+    """One VLM sample's multimodal input for the SRT rollout."""
 
     image: Any = None
     text: Optional[str] = None
@@ -84,14 +55,7 @@ class MMEncoding:
 
 @dataclass
 class PreparedInputs:
-    """One ``generate`` call's prepared driver-side state.
-
-    ``wire`` holds the ready-to-POST per-prompt ``/generate`` payloads (the
-    engine stamps ``lora_path`` onto them when an adapter is active — the
-    adapter stays unaware of weight sync). ``prompt_token_ids`` is what the
-    server saw per prompt, replicated per sibling into the response's prompt
-    condition. ``mm`` carries the VLM encodings (``None`` for text).
-    """
+    """One ``generate`` call's prepared driver-side state."""
 
     wire: List[Dict[str, Any]] = field(default_factory=list)
     prompt_token_ids: List[List[int]] = field(default_factory=list)
@@ -100,12 +64,7 @@ class PreparedInputs:
 
 
 class ModelAdapter(ABC):
-    """Thin ABC: registry key + boilerplate defaults + the two conversion seams.
-
-    The conversion *logic* lives on the per-shape base adapter
-    (:class:`~.text.TextLMAdapter`); this ABC only declares the boilerplate
-    every adapter shares and the two abstract methods the engine drives.
-    """
+    """Thin ABC: registry key + boilerplate defaults + the two conversion seams."""
 
     model_family: str = ""
 
@@ -124,12 +83,7 @@ class ModelAdapter(ABC):
         self.validate()
 
     def boot_kwargs(self) -> Dict[str, Any]:
-        """Extra SGLang ServerArgs intent a model needs beyond the generic set.
-
-        The generic server kwargs are derived in ``config.server_intent``;
-        recipes own the multimodal/LoRA/attention knobs via ``engine_kwargs``
-        (parity with the predecessor — nothing is auto-added here).
-        """
+        """Extra SGLang ServerArgs intent a model needs beyond the generic set."""
         return {}
 
     def validate(self) -> None:

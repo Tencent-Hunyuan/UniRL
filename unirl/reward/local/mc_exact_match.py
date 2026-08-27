@@ -22,11 +22,7 @@ _STANDALONE_LETTER = re.compile(r"\b([A-D])\b")
 
 
 def _normalize_answer(answer: str) -> str:
-    """Normalize answer to A/B/C/D letter.
-
-    Handles: "A"/"B"/"C"/"D" → "A"/"B"/"C"/"D"
-                 "1"/"2"/"3"/"4" → "A"/"B"/"C"/"D"
-    """
+    """Normalize answer to A/B/C/D letter."""
     a = answer.strip().upper()
     if len(a) == 1 and a in "1234":
         return chr(ord("A") + ord(a) - ord("1"))

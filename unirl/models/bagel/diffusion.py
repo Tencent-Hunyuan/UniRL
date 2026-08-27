@@ -1,43 +1,9 @@
-"""Bagel diffusion: typed params + per-step kernel + rollout-level stage.
-
-Bagel (BAGEL-7B-MoT) is a unified MoT flow-matching T2I model. Unlike SD3 /
-HunyuanImage3 it does not expose a dense ``predict_noise(sample, sigma)``: its
-forward (``_forward_flow``) consumes a *packed* (navit) sequence plus three KV-cache
-contexts (gen / cfg_text / cfg_img) and returns the CFG-combined velocity ``v_t``.
-
-This stage reads **exactly like** :class:`unirl.models.sd3.diffusion.SD3DiffusionStage`
-— it rides UniRL's shared diffusion runtime and only swaps in Bagel's velocity call:
-
-- **σ / timestep schedule** comes from ``params.sigmas`` (pinned by the engine from the pipeline's
-  ``build_schedule_policy``), passed in as ``schedule`` — NOT computed here.
-- **which steps run SDE** comes from ``params.sde_indices`` (the driver resolved it
-  via :meth:`DiffusionSamplingParams.resolve_sde_indices` → the recipe's indices
-  scheduler, ``unirl.utils.scheduler_utils.AllSDEScheduler``) — NOT drawn here.
-- **the SDE transition + log-prob** is :class:`unirl.sde.kernels.FlowSDEStrategy`
-  (``strategy.denoise``) — NOT a flow_grpo port.
-- **the initial noise x_T** is the driver-authored :class:`NoiseRecipe` value passed
-  as ``initial_latents`` — NOT drawn here.
-
-The only Bagel-specific machinery left is the navit adapter: building the three
-packed KV contexts (``_build_generation_inputs`` / ``_forward_kwargs``), the per-step
-CFG gate (``_gated_cfg_scales``), and the velocity call (``rl_ops.forward_flow`` over
-the pristine ``_forward_flow``, grad-capable via ``__wrapped__``). Bagel runs navit
-``bs=1`` so packed latents are ``[seq, C]`` (no batch dim); the kernel call adds a
-unit batch dim so ``FlowSDEStrategy``'s per-sample log-prob reduction matches.
-
-The on-policy invariant: under identical weights, replay's ``new_logp`` matches the
-rollout's emitted ``old_logp`` so the PPO ratio ``exp(new-old) ≈ 1`` — exactly as for
-SD3, because rollout and replay use the SAME ``FlowSDEStrategy`` over the same stored
-fp32 trajectory.
-
-This module deliberately avoids importing the vendored modeling (and its hard
-``flash_attn`` dependency) at module load — it reaches the model methods through the
-bundle instance at call time — so ``BagelDiffusionParams`` stays CPU-importable.
-"""
+"""Bagel diffusion: typed params + per-step kernel + rollout-level stage."""
 
 from __future__ import annotations
 
 from contextlib import nullcontext
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
@@ -62,25 +28,7 @@ CFG_RENORM_TYPES = ("global", "channel", "text_channel")
 
 @dataclass
 class BagelDiffusionParams(DiffusionSamplingParams):
-    """Bagel diffusion knobs — one object for BOTH the trainer and the stage.
-
-    Subclasses :class:`DiffusionSamplingParams` so a single ``sampling`` config
-    object satisfies the two consumers that share it: the ``DiffusionTrainer``
-    reads inherited fields (``samples_per_prompt`` for the GRPO group fan-out,
-    ``height`` / ``width`` / ``seed`` / ``num_inference_steps`` / ``eta`` /
-    ``init_same_noise`` / ``scheduler`` / ``sde_indices``), while
-    :class:`BagelDiffusionStage` reads the Bagel-specific CFG knobs added here.
-
-    Each Bagel ``_forward_flow`` row remains a packed ``bs=1`` sequence. The
-    Sample lineage materializes every generated row, while capable rollout
-    engines group prompts and use native ``num_outputs_per_prompt`` fan-out.
-
-    The SDE machinery is now **all inherited / central**: ``eta`` is the SDE noise
-    scale (flow_grpo's ``noise_level``); ``scheduler`` (the recipe's
-    :class:`~unirl.utils.scheduler_utils.AllSDEScheduler`) picks the SDE steps via
-    :meth:`resolve_sde_indices`; the σ schedule rides on ``params.sigmas``. No
-    Bagel-specific window / schedule fields remain.
-    """
+    """Bagel diffusion knobs — one object for BOTH the trainer and the stage."""
 
     num_inference_steps: int = 14
     guidance_scale: float = 1.0
@@ -111,14 +59,7 @@ _to_device = rl_ops._to_device
 
 
 class BagelDiffusionStep:
-    """Per-step Bagel kernel — stateless navit adapter over the shared SDE strategy.
-
-    Splits the step into the two Bagel-specific halves SD3 also has:
-    :meth:`predict_velocity` (the navit ``_forward_flow`` call, with CFG done inside
-    the model) and :meth:`denoise` (the shared :class:`StepStrategy.denoise`, with a
-    unit batch dim added so the packed ``[seq, C]`` latent gets a per-sample log-prob).
-    :meth:`step_with_logp` runs both, mirroring ``SD3DiffusionStep.step_with_logp``.
-    """
+    """Per-step Bagel kernel — stateless navit adapter over the shared SDE strategy."""
 
     def predict_velocity(
         self,
@@ -130,12 +71,7 @@ class BagelDiffusionStep:
         cfg_img_scale: float,
         forward_kwargs: Dict[str, Any],
     ) -> torch.Tensor:
-        """CFG-combined velocity ``v_t`` for packed ``x_t`` ``[seq, C]`` at time ``t_cur``.
-
-        ``_forward_flow`` takes a per-token ``timestep`` ``[seq]`` (all equal to the
-        scalar ``t_cur``) and does the CFG combine internally (gen / cfg_text /
-        cfg_img contexts in ``forward_kwargs`` + the gated scales).
-        """
+        """CFG-combined velocity ``v_t`` for packed ``x_t`` ``[seq, C]`` at time ``t_cur``."""
         rl_ops.disable_inference_cache(bagel)
         seq = int(x_t.shape[0])
         timestep = torch.full((seq,), float(t_cur), device=x_t.device)
@@ -160,17 +96,7 @@ class BagelDiffusionStep:
         eta: float,
         prev_sample: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """One SDE transition via the shared ``strategy.denoise`` over packed latents.
-
-        Packed Bagel latents are ``[seq, C]`` (navit ``bs=1``, no batch dim), but
-        ``FlowSDEStrategy`` reduces the per-element log-prob over dims ``>=1`` to get
-        ONE scalar per sample (it assumes a leading batch dim). So we add a unit
-        batch dim (``[1, seq, C]``) for the call and squeeze it back: the log-prob is
-        then the mean over all ``seq*C`` elements — identical to flow_grpo's
-        ``log_prob.mean()``. Returns ``(prev_sample, log_prob, prev_sample_mean)``;
-        ``log_prob`` / ``prev_sample_mean`` are ``None`` for deterministic
-        (``eta < 1e-7``) steps.
-        """
+        """One SDE transition over packed ``[seq, C]`` latents — a unit batch dim is added and squeezed back."""
         prev, log_prob, prev_mean = strategy.denoise(
             noise_pred=v_t.unsqueeze(0),
             sample=x_t.unsqueeze(0),
@@ -201,12 +127,7 @@ class BagelDiffusionStep:
         cfg_img_scale: float,
         forward_kwargs: Dict[str, Any],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """Run ``predict_velocity`` then ``denoise`` for one step.
-
-        ``prev_sample=None`` ⇒ sampling (draws a fresh next sample); ``prev_sample``
-        set ⇒ replay (log-prob of the stored transition). Returns
-        ``(prev_sample, log_prob, prev_sample_mean)``.
-        """
+        """Run ``predict_velocity`` then ``denoise`` for one step."""
         v_t = self.predict_velocity(
             bagel,
             x_t=x_t,
@@ -228,20 +149,7 @@ class BagelDiffusionStep:
 
 
 class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
-    """Bagel rollout-level diffusion stage (trainside A1) — central-runtime, SD3-shaped.
-
-    Owns the bundle, the per-step navit kernel, the SDE ``strategy``, and the
-    precision policy. ``diffuse`` runs the full sampling loop over the engine-pinned
-    ``schedule`` (``params.sigmas``), recording SDE log-probs at ``params.sde_indices``;
-    ``replay`` recomputes those log-probs for GRPO. Reuses
-    ``unirl.algorithms.flowgrpo.FlowGRPO`` unchanged.
-
-    Implements the ``DiffusionStage`` protocol (``diffuse`` / ``replay`` /
-    ``predict_noise_at_step``) so the trainside engine's ``isinstance(stage,
-    DiffusionStage)`` check passes → it builds the σ-schedule policy from
-    :meth:`BagelPipeline.build_schedule_policy` and pins ``params.sigmas`` via
-    ``ensure_sample_sigmas`` before ``generate`` (same path as SD3 / Wan / Qwen-Image).
-    """
+    """Bagel rollout-level diffusion stage (trainside A1) — central-runtime, SD3-shaped."""
 
     def __init__(
         self,
@@ -265,51 +173,82 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
             return torch.autocast("cuda", self.autocast_dtype)
         return nullcontext()
 
-    def _build_contexts_from_prompt(self, prompt: str) -> Tuple[Any, Any, Any]:
-        """Rebuild the three KV contexts (gen / cfg_text / cfg_img) from a prompt.
-
-        The vllm_omni rollout path ships only the prompt text (KV caches can't
-        cross the worker→driver IPC boundary), so replay rebuilds the contexts
-        here on the trainer's own bundle. Mirrors
-        ``BagelPipeline._build_contexts`` (think=False, no image): ``cfg_text`` is
-        the init snapshot taken BEFORE the prompt text (unconditional); ``gen``
-        and ``cfg_img`` both ingest the prompt. The und/text path is frozen, so
-        the rebuilt contexts equal those the rollout worker used.
-        """
-        from copy import deepcopy
+    def _build_contexts_from_prompt(
+        self,
+        prompt: str,
+        image: Optional[Any] = None,
+        *,
+        differentiable: bool = False,
+    ) -> Tuple[Any, Any, Any]:
+        """Rebuild the three KV contexts from raw prompt and optional source image."""
+        if image is not None and getattr(self.model.model, "vit_model", None) is None:
+            raise ValueError(
+                "BagelDiffusionStage: the conditions carry an it2i source image but the bundle "
+                "was built without the und ViT; set BagelPipelineConfig.enable_vit=true."
+            )
 
         inf = self.model.inferencer
         device = torch.device(self.model.device)
         clean_prompt = str(prompt).removeprefix("<|im_start|>").removesuffix("<|im_end|>")
         gen = inf.init_gen_context()
         cfg_img = deepcopy(gen)
-        mot = self.model.transformer
-        was_training = mot.training
-        mot.eval()
-        try:
-            with torch.no_grad(), self._autocast_ctx(device):
-                cfg_text = deepcopy(gen)
+        # Preserve inference dispatch while rebuilding frozen or differentiable it2i contexts.
+        grad_context = torch.enable_grad if differentiable else torch.no_grad
+        with (
+            rl_ops.inference_dispatch_scope(self.model.model),
+            grad_context(),
+            self._autocast_ctx(device),
+        ):
+            if image is not None:
+                resized = rl_ops.resize_input_image(self.model, image)
+                gen = rl_ops.update_context_image(
+                    self.model,
+                    resized,
+                    gen,
+                    vae=True,
+                    vit=True,
+                    differentiable=differentiable,
+                )
+            cfg_text = rl_ops.clone_context(gen) if differentiable else deepcopy(gen)
+            if differentiable:
+                gen = rl_ops.update_context_text(self.model, clean_prompt, gen, differentiable=True)
+                cfg_img = rl_ops.update_context_text(self.model, clean_prompt, cfg_img, differentiable=True)
+            else:
                 gen = inf.update_context_text(clean_prompt, gen)
                 cfg_img = inf.update_context_text(clean_prompt, cfg_img)
-        finally:
-            mot.train(was_training)
         return gen, cfg_text, cfg_img
 
-    def _resolve_single(self, conditions: BagelDiffusionConditions) -> Tuple[Any, Any, Any, Tuple[int, int]]:
-        """Return ``(gen, cfg_text, cfg_img, image_shape)`` for a 1-sample batch.
-
-        Two sources, transparently:
-
-        - **opaque contexts present** (trainside / colocate): return them directly
-          via :meth:`BagelDiffusionConditions.single`.
-        - **deferred prompts only** (vllm_omni cross-process): rebuild the KV
-          contexts from the shipped prompt on this bundle (the und path is frozen
-          → identical contexts), then return them.
-        """
-        if conditions.has_contexts():
+    def _resolve_single(
+        self,
+        conditions: BagelDiffusionConditions,
+        *,
+        differentiable: bool = False,
+        force_rebuild: bool = False,
+    ) -> Tuple[Any, Any, Any, Tuple[int, int]]:
+        """Return ``(gen, cfg_text, cfg_img, image_shape)`` for a 1-sample batch."""
+        if force_rebuild:
+            require(
+                bool(conditions.input_images),
+                "_resolve_single(force_rebuild=True) requires image-conditioned "
+                "raw material; prompt-only stored contexts (t2i/t2ti) cannot be "
+                "reproduced from the bare prompt.",
+            )
+        if differentiable and conditions.input_images:
+            prompt, input_image, image_shape = conditions.single_prompt()
+            gen, cfg_text, cfg_img = self._build_contexts_from_prompt(
+                prompt,
+                input_image,
+                differentiable=True,
+            )
+            return gen, cfg_text, cfg_img, image_shape
+        if conditions.has_contexts() and not force_rebuild:
             return conditions.single()
-        prompt, image_shape = conditions.single_prompt()
-        gen, cfg_text, cfg_img = self._build_contexts_from_prompt(prompt)
+        prompt, input_image, image_shape = conditions.single_prompt()
+        gen, cfg_text, cfg_img = self._build_contexts_from_prompt(
+            prompt,
+            input_image,
+            differentiable=differentiable,
+        )
         return gen, cfg_text, cfg_img, image_shape
 
     def _build_generation_inputs(
@@ -321,14 +260,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         *,
         device: torch.device,
     ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
-        """Reconstruct the packed gen / cfg_text / cfg_img inputs from the contexts.
-
-        Deterministic given (context kv_lens / ropes, image_shape) — the same packed
-        index tensors ``_forward_flow`` consumes. ``gi["packed_init_noises"]`` is the
-        vendored default x_T draw; ``diffuse`` overrides it with the driver-authored
-        :class:`NoiseRecipe` value (``initial_latents``) when present and otherwise
-        uses it as the fallback (tests / no driver recipe).
-        """
+        """Reconstruct the packed gen / cfg_text / cfg_img inputs from the contexts."""
         bagel = self.model.model
         gi = bagel.prepare_vae_latent(
             curr_kvlens=gen["kv_lens"],
@@ -354,12 +286,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         gi_cfg_img: Dict[str, Any],
         params: BagelDiffusionParams,
     ) -> Dict[str, Any]:
-        """Static (step-invariant) kwargs for ``_forward_flow``.
-
-        Everything except ``x_t`` / ``timestep`` / the per-step CFG scales. The three
-        ``past_key_values`` come from the conditions' contexts; the packed index
-        tensors come from the (device-pinned) generation inputs.
-        """
+        """Static (step-invariant) kwargs for ``_forward_flow``."""
         return dict(
             packed_vae_token_indexes=gi["packed_vae_token_indexes"],
             packed_vae_position_ids=gi["packed_vae_position_ids"],
@@ -402,23 +329,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         params: BagelDiffusionParams,
         initial_latents: Optional[torch.Tensor] = None,
     ) -> LatentSegment:
-        """Run Bagel sampling over the engine-pinned ``schedule``; return a segment.
-
-        Mirrors ``SD3DiffusionStage.diffuse``: loops ``T = len(schedule) - 1`` steps,
-        records an SDE log-prob (``eta`` noise) at every ``i in params.sde_indices``
-        and runs deterministic Euler (``eta = 0``) elsewhere. ``initial_latents`` is
-        the driver-authored x_T (:class:`NoiseRecipe`); when ``None`` the vendored
-        ``prepare_vae_latent`` draw is used (tests / no driver recipe).
-
-        The returned ``LatentSegment`` (``S = len(sde_indices)``, ``seq`` = packed
-        image tokens, ``C`` = packed latent channels):
-
-            latents      : [1, K, seq, C]   stored trajectory frames (window + final)
-            sde_logp     : [1, S]           old per-step log-probs
-            sde_indices  : [S]              SDE step indices
-            indices      : [K]              stored frame step indices
-            sigmas       : [T+1]            the full schedule
-        """
+        """Run Bagel sampling over the pinned schedule; ``latents [1, K, seq, C]``, ``sde_logp [1, S]`` (navit bs=1)."""
         bagel = self.model.model
         device = torch.device(self.model.device)
         schedule = schedule.to(device)
@@ -504,16 +415,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         params: BagelDiffusionParams,
         step_indices: Optional[List[int]] = None,
     ) -> ReplayResult:
-        """Recompute per-step log-probs over the SDE window (mirrors SD3 replay).
-
-        Loops ``step.step_with_logp`` (``prev_sample`` = the stored next frame) over
-        ``segment.sde_indices`` (or the ``step_indices`` subset). Returns a
-        :class:`ReplayResult` with ``log_probs [1, S']`` aligned with
-        ``segment.sde_logp`` plus ``prev_sample_means [1, S', seq, C]`` for KL.
-
-        Caller owns ``.train()`` mode + grad scope; this method manages only the
-        autocast scope (mirrors ``SD3DiffusionStage.replay``).
-        """
+        """Recompute log-probs over the SDE window: ``log_probs [1, S']``, ``prev_sample_means [1, S', seq, C]``."""
         if segment.sde_indices is None or segment.latents is None or segment.sigmas is None:
             raise ValueError("BagelDiffusionStage.replay: segment.sde_indices / latents / sigmas missing")
 
@@ -530,7 +432,10 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         schedule = segment.sigmas.to(device)
         sigma_max = schedule[1] if int(schedule.shape[0]) > 1 else schedule[0]
 
-        gen, cfg_text, cfg_img, image_shape = self._resolve_single(conditions)
+        gen, cfg_text, cfg_img, image_shape = self._resolve_single(
+            conditions,
+            differentiable=torch.is_grad_enabled(),
+        )
         gi, gi_cfg_text, gi_cfg_img = self._build_generation_inputs(gen, cfg_text, cfg_img, image_shape, device=device)
         forward_kwargs = self._forward_kwargs(gen, cfg_text, cfg_img, gi, gi_cfg_text, gi_cfg_img, params)
 
@@ -574,17 +479,14 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         *,
         params: BagelDiffusionParams,
         device: torch.device,
+        force_rebuild: bool = False,
     ) -> Dict[str, Any]:
-        """Rebuild the KV contexts → the step-invariant ``_forward_flow`` kwargs.
-
-        The expensive part (resolving the per-sample gen / cfg contexts and packing
-        the generation inputs) is done ONCE; a caller scoring several steps against
-        the same conditioning then reuses the result via :meth:`predict_velocity_at`
-        (no per-step rebuild). Used by
-        :class:`~unirl.algorithms.bagel_flow_unigrpo.BagelFlowUniGRPO`'s velocity-MSE
-        loop, which evaluates ``v_theta`` / ``v_ref`` across the SDE window.
-        """
-        gen, cfg_text, cfg_img, image_shape = self._resolve_single(conditions)
+        """Rebuild the KV contexts → the step-invariant ``_forward_flow`` kwargs."""
+        gen, cfg_text, cfg_img, image_shape = self._resolve_single(
+            conditions,
+            differentiable=torch.is_grad_enabled(),
+            force_rebuild=force_rebuild,
+        )
         gi, gi_cfg_text, gi_cfg_img = self._build_generation_inputs(gen, cfg_text, cfg_img, image_shape, device=device)
         return self._forward_kwargs(gen, cfg_text, cfg_img, gi, gi_cfg_text, gi_cfg_img, params)
 
@@ -596,14 +498,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         sigma: torch.Tensor,
         params: BagelDiffusionParams,
     ) -> torch.Tensor:
-        """Single ``(x_t, sigma)`` CFG velocity reusing prebuilt ``forward_kwargs``.
-
-        Pairs with :meth:`build_forward_kwargs` so a caller scoring multiple steps
-        against one conditioning pays the context prefill once. ``sample`` is packed
-        ``[seq, C]`` (or ``[1, seq, C]``; the unit batch dim is squeezed). Grad flows
-        through the velocity forward (gen experts) only — the contexts inside
-        ``forward_kwargs`` are detached constants built under ``no_grad``.
-        """
+        """Single ``(x_t, sigma)`` CFG velocity reusing prebuilt ``forward_kwargs``."""
         bagel = self.model.model
         device = torch.device(self.model.device)
         t_val = float(sigma.item()) if isinstance(sigma, torch.Tensor) else float(sigma)
@@ -629,26 +524,13 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         sigma: torch.Tensor,
         params: BagelDiffusionParams,
     ) -> torch.Tensor:
-        """Single ``(x_t, sigma)`` velocity forward — no scheduler iteration.
-
-        Completes the ``DiffusionStage`` protocol (used by forward-process algorithms
-        like DiffusionNFT). Rebuilds the contexts (:meth:`build_forward_kwargs`) then
-        runs the same navit ``_forward_flow`` call (:meth:`predict_velocity_at`) that
-        ``diffuse`` / ``replay`` use, so CFG handling is identical. ``sample`` is packed
-        ``[seq, C]`` (or ``[1, seq, C]``). Callers that score multiple steps (e.g. the
-        velocity-MSE loop) should instead build the kwargs once via
-        :meth:`build_forward_kwargs` and loop :meth:`predict_velocity_at`.
-        """
+        """Single ``(x_t, sigma)`` velocity forward — no scheduler iteration."""
         device = torch.device(self.model.device)
         forward_kwargs = self.build_forward_kwargs(conditions, params=params, device=device)
         return self.predict_velocity_at(forward_kwargs, sample=sample, sigma=sigma, params=params)
 
     def trainable_module(self) -> "torch.nn.Module":
-        """The MoT transformer (``bundle.transformer`` == ``model.language_model``).
-
-        This is the FSDP wrap target / LoRA injection root — the same module the
-        vendored ``_forward_flow`` runs on, so sharding it shards the gen forward.
-        """
+        """The MoT transformer (``bundle.transformer`` == ``model.language_model``)."""
         return self.model.transformer
 
 

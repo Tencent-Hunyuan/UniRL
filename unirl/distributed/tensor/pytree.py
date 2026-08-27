@@ -1,20 +1,4 @@
-"""Pytree-aware batch-axis ops over a same-structured tree.
-
-``pytree_chunk`` shards one same-structured tree into ``N`` per-rank trees;
-``pytree_cat`` merges ``N`` same-structured trees back into one (the inverse
-pair). Both recurse over the same node types (``Tensor`` / ``ndarray`` /
-``list`` / ``tuple`` / ``dict`` / ``Batch`` / ``TensorRef``) and operate
-along axis 0.
-
-``infer_batch_size`` is the companion that derives the ``batch_size`` argument
-``pytree_chunk`` splits along: it walks an ``args`` / ``kwargs`` payload and
-returns the first batch-axis size found (``Broadcast``-wrapped values opt out).
-
-These are the wire-layer walkers used by DP dispatch and gradient propagation.
-The per-field walkers inside ``Batch`` (``_concat_value``, ``_slice_value``, …)
-are a separate, field-kind-aware layer that ``pytree_cat`` delegates to when
-it encounters a ``Batch`` node.
-"""
+"""Pytree-aware batch-axis ops over a same-structured tree."""
 
 from __future__ import annotations
 
@@ -30,25 +14,7 @@ from unirl.distributed.utils import Broadcast
 
 
 def _value_batch_size(value) -> Optional[int]:
-    """First batch-axis size found in ``value``, or ``None``.
-
-    Node classification mirrors :func:`pytree_chunk`'s split contract, so the
-    inferred size lines up with what actually gets chunked:
-
-      - ``Broadcast`` → skipped (never contributes a size)
-      - ``Tensor`` / ``ndarray`` / ``TensorHandle`` / ``TensorRef`` →
-        ``shape[0]`` (0-dim scalars contribute nothing)
-      - ``list`` → ``len`` (per-sample batch)
-      - ``Batch`` → its own ``batch_size`` (concat-field aligned)
-      - ``tuple`` / ``dict`` → structural; recurse and take the first hit
-      - anything else (int / float / str / None) → skipped (broadcast)
-
-    Following ``Batch._infer_batch_size``, the *first* size found wins (not the
-    largest): per-rollout metadata whose leading dim differs from the real
-    batch is replicated by :func:`pytree_chunk` anyway, but a field whose
-    leading dim coincides with the batch must be wrapped in :class:`Broadcast`
-    to opt out of splitting.
-    """
+    """First batch-axis size found in ``value``, or ``None``."""
     if isinstance(value, Broadcast):
         return None
     if isinstance(value, (torch.Tensor, np.ndarray, GPUTensorHandle, TensorRef)):
@@ -72,14 +38,7 @@ def _value_batch_size(value) -> Optional[int]:
 
 
 def infer_batch_size(args: tuple, kwargs: dict) -> Optional[int]:
-    """Canonical batch size for DP chunking, inferred from a call payload.
-
-    Walks ``args`` then ``kwargs`` and returns the first batch-axis size found
-    (see :func:`_value_batch_size` for the per-node rules, which match
-    :func:`pytree_chunk`'s split contract). Returns ``None`` for a pure
-    broadcast call — no batched field — in which case the dispatch layer
-    replicates the whole payload to every worker instead of splitting it.
-    """
+    """Canonical batch size for DP chunking, inferred from a call payload."""
     for v in args:
         bs = _value_batch_size(v)
         if bs is not None:
@@ -92,24 +51,7 @@ def infer_batch_size(args: tuple, kwargs: dict) -> Optional[int]:
 
 
 def pytree_chunk(value, dp_size: int, batch_size: int) -> list:
-    """Recursively split a value into ``dp_size`` shards along axis 0.
-
-    Inverse of :func:`pytree_cat` on the equal-chunk case.
-
-    Rules:
-      - ``Broadcast(x)`` → ``[x] * dp_size``  (explicit opt-out of splitting)
-      - ``Tensor`` → chunk along dim 0 (must be divisible)
-      - ``ndarray`` → split along axis 0 (must be divisible)
-      - ``TensorRef`` → row-chunked as a ``Batch`` (via its overridden ``slice``)
-      - ``list`` → slice into equal parts (must be divisible)
-      - ``tuple`` → recurse element-wise, reassemble per-shard tuples
-      - ``dict`` → recurse into values, reassemble per-shard dicts
-      - ``Batch`` → split each field, reassemble per-shard ``Batch`` objects
-      - other (int / float / str / None) → ``[value] * dp_size``  (broadcast)
-
-    To prevent a value inside a tuple/dict/Batch from being split, wrap it
-    in ``Broadcast(x)``.
-    """
+    """Recursively split a value into ``dp_size`` shards along axis 0."""
     if isinstance(value, Broadcast):
         return [value.value] * dp_size
 
@@ -157,21 +99,7 @@ def pytree_chunk(value, dp_size: int, batch_size: int) -> list:
 
 
 def pytree_cat(results: list) -> Any:
-    """Recursively merge same-structure results along axis 0.
-
-    Inverse of :func:`pytree_chunk` on the merge side.
-
-    Rules:
-      - ``Tensor`` → ``torch.cat`` along dim 0
-      - ``TensorRef`` → merge all refs into one ``TensorRef``
-      - ``ndarray`` → ``np.concatenate`` along axis 0
-      - ``list`` → flatten (concatenate lists)
-      - ``tuple`` → recurse element-wise (record-style), return tuple
-      - ``dict`` → recurse per-key, return dict
-      - ``Batch`` → delegate to ``type(first).concat(results)``
-      - ``None`` → ``None``
-      - scalar (int / float / str / ...) → take first (all should match)
-    """
+    """Recursively merge same-structure results along axis 0."""
     if not results:
         return None
 

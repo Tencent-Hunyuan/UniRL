@@ -1,33 +1,4 @@
-"""Supervised (SFT) datasets — target-carrying manifests with epoch semantics.
-
-The RL data layer (``datasets.py`` / ``data_source.py``) is prompt-first by
-design: rows carry prompts, rollout generates the targets. SFT rows carry the
-target itself, so they get their own dataset shaping here — sharing the media
-normalization machinery (:func:`unirl.data.datasets._normalize_media_refs`)
-but NOT the RL classes (per-algorithm dataset shaping; a shared stage-keyed
-dispatcher is the misrouting failure mode other frameworks hit).
-
-Manifest row shapes (JSONL, one object per line; relative media URIs resolve
-against the manifest's directory):
-
-- AR (LLM):   ``{"prompt": str, "response": str}``
-- AR (agent): ``{"messages": [..., {"role": "assistant", ...}], "tools": [...]}``
-- AR (VLM):   ``{"prompt", "response", "media": [{"modality": "image",
-  "role": "condition", "uri": "img/0.png"}]}``
-- Diffusion:  ``{"prompt": str, "media": [{"modality": "image",
-  "role": "target", "uri": "img/0.png"}]}`` (``caption`` accepted as an alias
-  for ``prompt``)
-
-Rows are OPAQUE records driver-side — media loading and tokenization happen on
-the training workers (``unirl/train/sft/track_builder.py`` track builders), so nothing heavy crosses
-the driver/Ray boundary.
-
-Epoch semantics: :class:`SupervisedDataSource` walks a per-epoch reshuffled
-order and exposes ``state_dict()`` / ``load_state_dict()`` with the exact
-``{epoch, position}`` cursor, checkpointed by the SFT trainer — mid-epoch
-resume replays neither skips nor duplicates (RL's infinite reshuffled stream
-has no such notion, which is why this is a separate class).
-"""
+"""Supervised (SFT) datasets — target-carrying manifests with epoch semantics."""
 
 from __future__ import annotations
 
@@ -37,7 +8,7 @@ import os
 import random
 from typing import Any, Dict, Iterator, List, Optional
 
-from unirl.data.datasets import _LEGACY_EMBEDDING_FIELDS, _normalize_media_refs
+from unirl.data.datasets import _LEGACY_EMBEDDING_FIELDS, _normalize_media_refs, _resolve_media_uri
 
 logger = logging.getLogger(__name__)
 
@@ -56,51 +27,49 @@ _SUPERVISED_EXCLUDED_KEYS = {
 }
 
 
-def tokenize_agent_target(
-    record: Dict[str, Any],
-    *,
-    tokenizer: Any,
-    enable_thinking: bool,
-) -> List[int]:
-    """Render an agent record and return only its final assistant-turn tokens."""
-    messages = record["messages"]
-    history = messages[:-1]
-    tools = record.get("tools")
-
-    def apply_template(turns: List[Dict[str, Any]], *, add_generation_prompt: bool) -> List[int]:
-        rendered = tokenizer.apply_chat_template(
-            turns,
-            tools=tools,
-            add_generation_prompt=add_generation_prompt,
-            enable_thinking=enable_thinking,
-            tokenize=True,
-            return_dict=False,
-            truncation=False,
+def _normalize_message_content(content: Any, *, turn: int, base_dir: Optional[str]) -> Any:
+    """Validate one agent message's ``content``: string, null, or a text/image part list."""
+    if content is None or isinstance(content, str):
+        return content
+    if not isinstance(content, list) or not content:
+        raise TypeError(
+            f"Agent message {turn} 'content' must be a string, null, or a non-empty list of "
+            f"text/image parts, got {type(content).__name__}."
         )
-        if isinstance(rendered, dict):
-            rendered = rendered["input_ids"]
-        if hasattr(rendered, "tolist"):
-            rendered = rendered.tolist()
-        if rendered and isinstance(rendered[0], list):
-            rendered = rendered[0]
-        return [int(token_id) for token_id in rendered]
+    parts: List[Dict[str, Any]] = []
+    for j, part in enumerate(content):
+        if not isinstance(part, dict):
+            raise TypeError(f"Agent message {turn} content[{j}] must be a dict, got {type(part).__name__}.")
+        kind = part.get("type")
+        if kind not in {"text", "image"}:
+            raise ValueError(f"Agent message {turn} content[{j}] has unsupported part type {kind!r}.")
+        # Both kinds carry their value under a field named after the type, so this is the whole contract.
+        extra = sorted(set(part) - {"type", kind})
+        if extra:
+            raise ValueError(
+                f"Agent message {turn} content[{j}] has unsupported field(s) {extra} — a {kind!r} part "
+                f"carries only 'type' and {kind!r}. Accepting and dropping them would train on a record "
+                "the manifest does not describe."
+            )
+        if kind == "text":
+            text = part.get("text")
+            if not isinstance(text, str) or not text:
+                raise ValueError(f"Agent message {turn} content[{j}] text part needs a non-empty 'text' string.")
+            parts.append({"type": "text", "text": text})
+        else:
+            uri = part.get("image")
+            if not isinstance(uri, str) or not uri.strip():
+                raise ValueError(f"Agent message {turn} content[{j}] image part needs a non-empty 'image' URI.")
+            parts.append({"type": "image", "image": _resolve_media_uri(uri.strip(), base_dir=base_dir)})
+    return parts
 
-    prompt_ids = apply_template(history, add_generation_prompt=True)
-    full_ids = apply_template(messages, add_generation_prompt=False)
-    if full_ids[: len(prompt_ids)] != prompt_ids:
-        raise ValueError(
-            "Agent target is not a suffix of its rendered history. "
-            "Ensure enable_thinking matches the dataset's assistant reasoning format."
-        )
 
-    target_ids = full_ids[len(prompt_ids) :]
-    eos_id = tokenizer.eos_token_id
-    if isinstance(eos_id, (list, tuple)):
-        eos_id = eos_id[0] if eos_id else None
-    if eos_id is not None and eos_id in target_ids:
-        last_eos = len(target_ids) - 1 - target_ids[::-1].index(eos_id)
-        target_ids = target_ids[: last_eos + 1]
-    return target_ids
+def message_content_image_uris(message: Dict[str, Any]) -> List[str]:
+    """URIs of a normalized agent message's image parts (empty for string content)."""
+    content = message.get("content")
+    if not isinstance(content, list):
+        return []
+    return [part["image"] for part in content if isinstance(part, dict) and part.get("type") == "image"]
 
 
 def normalize_supervised_example(
@@ -109,14 +78,7 @@ def normalize_supervised_example(
     default_sample_id: str,
     base_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Normalize one raw manifest row into the supervised record shape.
-
-    Returns either a legacy ``{"sample_id", "prompt", ...}`` record or an
-    agent ``{"sample_id", "messages", ["tools"], ...}`` record. Agent rows
-    carry the target assistant turn as the final message; the worker-side
-    builder renders the preceding history as the prompt and supervises only
-    that final turn.
-    """
+    """Normalize one raw manifest row into the supervised record shape."""
     if not isinstance(item, dict):
         raise TypeError(f"Supervised example must be a dict, got {type(item).__name__}.")
     legacy = sorted(k for k in _LEGACY_EMBEDDING_FIELDS if k in item)
@@ -141,19 +103,23 @@ def normalize_supervised_example(
             role = message.get("role")
             if role not in {"system", "user", "assistant", "tool"}:
                 raise ValueError(f"Agent message {turn} has unsupported role {role!r}.")
-            content = message.get("content")
+            content = _normalize_message_content(message.get("content"), turn=turn, base_dir=base_dir)
             tool_calls = message.get("tool_calls")
-            if content is not None and not isinstance(content, str):
-                raise TypeError(
-                    f"Agent message {turn} 'content' must be a string or null, got {type(content).__name__}."
-                )
             if tool_calls is not None and (role != "assistant" or not isinstance(tool_calls, list)):
                 raise TypeError(f"Agent message {turn} 'tool_calls' must be a list on an assistant turn.")
             if role == "assistant" and not content and not tool_calls:
                 raise ValueError(f"Agent assistant message {turn} has neither content nor tool_calls.")
-            normalized_messages.append(dict(message))
+            normalized = dict(message)
+            if "content" in normalized:
+                normalized["content"] = content
+            normalized_messages.append(normalized)
         if normalized_messages[-1]["role"] != "assistant":
             raise ValueError("Agent supervised example must end with the target assistant turn.")
+        if isinstance(normalized_messages[-1].get("content"), list):
+            raise ValueError(
+                "Agent supervised example target (final assistant) turn may not be a content part list — "
+                "interleaved image parts are history-only (supervision is text CE, not an image loss)."
+            )
         if not any(message["role"] == "user" for message in normalized_messages[:-1]):
             raise ValueError("Agent supervised example has no user turn before the target assistant turn.")
         record["messages"] = normalized_messages
@@ -194,11 +160,7 @@ def normalize_supervised_example(
 
 
 class SupervisedDataset:
-    """File-backed supervised dataset: parsing + per-row normalization only.
-
-    Supports ``.jsonl`` (one object per line) and ``.json`` (list of objects).
-    Epoch ordering / batching belong to :class:`SupervisedDataSource`.
-    """
+    """File-backed supervised dataset: parsing + per-row normalization only."""
 
     def __init__(self, file_path: str) -> None:
         self.file_path = file_path
@@ -241,13 +203,7 @@ class SupervisedDataset:
 
 
 class SupervisedDataSource:
-    """Epoch-aware batch iterator over a supervised manifest (+ eval split).
-
-    ``get_samples`` walks a per-epoch shuffled order (``seed + epoch``-seeded,
-    so resume is exact) and wraps across epoch boundaries within one batch.
-    The ``{epoch, position}`` cursor rides ``state_dict()`` into the trainer's
-    checkpoint sidecar.
-    """
+    """Epoch-aware batch iterator over a supervised manifest (+ eval split)."""
 
     def __init__(
         self,
@@ -313,13 +269,7 @@ class SupervisedDataSource:
             )
 
     def iter_eval_batches(self, batch_size: int, *, eval_num_samples: int = -1) -> Iterator[List[Dict[str, Any]]]:
-        """Deterministic-order eval batches (manifest order, no shuffle).
-
-        ``eval_num_samples``: ``-1`` = full eval set, ``0`` = nothing,
-        ``N > 0`` = first N rows. The final partial batch is yielded as-is —
-        the trainer pads it to the DP width with ``_eval_pad`` rows the loss
-        masks out, so the full set is covered exactly.
-        """
+        """Deterministic-order eval batches (manifest order, no shuffle)."""
         pool = self.eval_dataset if self.eval_dataset is not None else self.dataset
         n = len(pool)
         limit = n if eval_num_samples < 0 else min(eval_num_samples, n)
@@ -330,6 +280,6 @@ class SupervisedDataSource:
 __all__ = [
     "SupervisedDataSource",
     "SupervisedDataset",
+    "message_content_image_uris",
     "normalize_supervised_example",
-    "tokenize_agent_target",
 ]

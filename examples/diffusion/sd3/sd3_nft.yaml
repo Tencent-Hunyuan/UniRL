@@ -150,7 +150,7 @@ sampling:
   seed: 42
   init_same_noise: false
   scheduler:
-    _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+    _target_: unirl.sde.index_schedule.AllSDEScheduler
     num_timesteps: ${..num_inference_steps}
     num_sde_steps: 0            # DiffusionNFT forward-process: no SDE steps recorded
 

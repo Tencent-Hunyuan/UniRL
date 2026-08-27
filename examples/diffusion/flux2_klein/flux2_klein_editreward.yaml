@@ -122,7 +122,7 @@ reward:
         editreward: 1.0
       batch_size: 8
       timeout: 300.0
-      sub_metric_reduce: mean
+      sub_metric_reduce: first
       aggregation_method: weighted_sum
 
 algorithm:
@@ -163,7 +163,7 @@ sampling:
   seed: 42
   init_same_noise: true
   scheduler:
-    _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+    _target_: unirl.sde.index_schedule.AllSDEScheduler
     num_timesteps: ${..num_inference_steps}
     num_sde_steps: 3
     timestep_fraction: [0, 0.5]

@@ -18,23 +18,7 @@ if TYPE_CHECKING:
 
 
 class VideoPickScoreScorer(PickScoreRewardScorer):
-    """PickScore applied to ONE frame of each video (``frame_selection``).
-
-    Inherits model loading and CLIP scoring from ``PickScoreRewardScorer``;
-    the only addition is a pre-processing step that extracts a single frame
-    from each video tensor before scoring.
-
-    Because the score rests on one frame, WHICH frame is a real modelling
-    choice, not a detail: a clip that opens on a fade or a reveal has a nearly
-    blank frame 0, and that blankness becomes the reward. Default stays
-    ``"first"`` so no existing recipe changes.
-
-    ``input_kind = "video"`` is required so that the reward pipeline routes
-    decoded video tensors into ``RewardRequest.videos`` (and sets
-    ``request.is_video = True``) — without it, the request would arrive with
-    only ``images`` populated and ``_extract_frame`` below would never
-    run, silently degrading to scoring the middle-frame PIL preview.
-    """
+    """PickScore applied to ONE frame of each video (``frame_selection``)."""
 
     canonical_model_name = "videopickscore"
     input_kind = "video"
@@ -51,29 +35,7 @@ class VideoPickScoreScorer(PickScoreRewardScorer):
 
     @staticmethod
     def _extract_frame(video: torch.Tensor, which: str = "first") -> "Image.Image":
-        """Extract one frame of a channel-first video tensor.
-
-        ``which='first'`` is the historical behaviour and the default.
-        ``which='middle'`` takes ``T // 2`` instead: a clip that opens on a
-        reveal (or a fade) makes frame 0 nearly blank, and since this scorer
-        sees ONE frame that blankness lands directly in the reward. Measured on
-        a MiniMax-H3 rollout whose frame 0 had std 0.015, scoring frame 0 cost
-        -0.0815 against mid-clip -- several times the entire policy signal.
-
-        Contract: input is the per-sample slice produced by
-        ``extract_videos_from_output``, which iterates the leading batch
-        dim of ``RolloutSamples.decoded_videos``. ``decoded_videos`` is
-        always written by ``engine.decode_latents`` (channel-first
-        ``(B, C, T, H, W)``), so per-item layout is always
-        ``(C, T, H, W)``. Already-3D inputs are treated as a single
-        channel-first frame.
-
-        We deliberately do NOT try to disambiguate channel-first vs
-        frame-first by inspecting leading dims: small ``T`` (e.g. WAN T2V
-        with ``num_frames=3``) collapses the leading dims into the same
-        ``{1, 3, 4}`` set and would silently score the wrong axis under
-        the old heuristic.
-        """
+        """Extract one frame of a channel-first video tensor."""
         if not isinstance(video, torch.Tensor):
             raise TypeError(f"Expected torch.Tensor, got {type(video).__name__}")
         v = video
@@ -130,16 +92,7 @@ class VideoPickScoreScorer(PickScoreRewardScorer):
 
 @dataclass
 class VideoPickScoreSpec(BaseRewardComponentSpec):
-    """Typed config for the VideoPickScore reward component.
-
-    Mirrors ``PickScoreSpec`` plus ``frame_selection``.
-    ``PickScoreRewardScorer.__init__`` consumes exactly ``device``,
-    ``batch_size``, ``processor_id`` and ``model_id``, so
-    ``VideoPickScoreScorer`` overrides ``__init__`` to pick up the extra
-    field. A dedicated Spec (instead of reusing ``PickScoreSpec``)
-    keeps Hydra's structured-config registry one-Spec-per-name and lets
-    YAML reference this scorer as ``name: videopickscore``.
-    """
+    """Typed config for the VideoPickScore reward component."""
 
     batch_size: int = 8
     device: str = "auto"

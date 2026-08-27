@@ -1,10 +1,4 @@
-"""MediaPreview — per-rollout wandb-agnostic media payload.
-
-Carries PIL images and raw 4D video tensors keyed to per-sample prompts /
-rewards for wandb logging. Lives in its own module so the type survives
-independently of the legacy ``RolloutSamples`` container (which used to
-own it). Consumed via ``Part.media_preview``.
-"""
+"""MediaPreview — per-rollout wandb-agnostic media payload."""
 
 from __future__ import annotations
 
@@ -22,35 +16,7 @@ if TYPE_CHECKING:
 
 @dataclass
 class MediaPreview(Batch):
-    """Per-rollout wandb media preview payload that stays wandb-agnostic.
-
-    ``images`` carries PIL images (one per sample; image models or
-    middle-frame extraction for video models that want still previews).
-    ``videos`` carries raw 4D ``(C, T, H, W)`` CPU tensors with values in
-    ``[0, 1]`` — NOT pre-built ``wandb.Video`` objects. The wandb-side
-    encoding (mp4 / fps / caption) is owned by
-    :func:`unirl.utils.wandb_logger.UniRLWandBLogger.log_generated_media`
-    so this dataclass + the ``utils/media.py`` helpers carry zero wandb
-    dependency.
-
-    Declaring the four parallel lists as ``concat_field`` lets
-    ``Batch.concat`` auto-merge per-shard previews (lists extended) and
-    ``Batch.slice(0, n)`` naturally cap the payload size.
-
-    Three valid states (enforced in ``__post_init__``):
-
-    - **image-only**: ``images`` populated, ``videos`` empty
-    - **video-only**: ``videos`` populated, ``images`` empty
-    - **image+video**: both populated; both must agree on per-sample
-      length and the parallel ``prompts`` / ``rewards`` lists.
-
-    Whichever side is non-empty defines the canonical batch size; every
-    non-empty parallel list must agree with that size. ``__len__`` and
-    ``batch_size`` mirror this — without the override, the default
-    ``Batch.batch_size`` anchors on the first concat field
-    (``images``), which would silently leave ``videos`` un-sliced when
-    ``len(videos) > 0`` and ``len(images) == 0``.
-    """
+    """Per-rollout wandb media preview payload that stays wandb-agnostic."""
 
     images: List[Any] = concat_field(default_factory=list)
     videos: List[Any] = concat_field(default_factory=list)
@@ -87,18 +53,7 @@ class MediaPreview(Batch):
 
 
 def _ref_aligned_prefix_len(decoded: Any, min_items: int) -> int:
-    """Smallest sample count >= ``min_items`` landing on a TensorRef ref boundary.
-
-    ``decoded`` reaches the driver dehydrated: its packed tensor leaf
-    (``Images.packed_pixels`` / ``Videos.frames``) is a ``TensorRef`` whose refs
-    partition the batch by DP shard, and ``TensorRef`` only supports ref-boundary
-    slicing. The cheapest preview prefix is the first shard boundary covering
-    ``min_items`` samples, so media logging hydrates one shard instead of the full
-    decoded batch. Ref sizes count packed pixels for ``Images`` and frames for
-    ``Videos``, so both are mapped back to sample indices via the driver-side
-    ``cu_seqlens``. Returns the full batch size when the leaf is already a real
-    tensor (nothing to save) or a boundary cannot be mapped.
-    """
+    """Smallest sample count >= ``min_items`` landing on a TensorRef ref boundary."""
     from unirl.distributed.tensor import TensorRef
 
     total = len(decoded)
@@ -141,30 +96,7 @@ def build_media_preview_for_part(
     prompts: Optional[List[str]] = None,
     input_image: Optional[Images] = None,
 ) -> Optional[MediaPreview]:
-    """Build a wandb-bound :class:`MediaPreview` from one gen Part's decoded media.
-
-    ``prompts`` is a per-sample caption list aligned 1:1 with this Part's samples
-    (the original prompt texts); ``None`` yields empty captions. ``input_image``
-    is the it2i source image (the chained image input Part's packed ``Images``),
-    paired beside the output as an edit preview when present.
-
-    Two parallel modality paths:
-
-    - **Image path** (``isinstance(part.primitives["image"], Images)``): hydrates
-      packed storage, reconstructs per-sample 3D ``[C, H, W]`` tensors via
-      ``Images.to_list()``, and converts each to PIL via
-      ``tensor_frame_to_pil`` (the wandb boundary). Slices to the first 3
-      channels first — drops alpha / model-specific 4th channel so wandb gets
-      RGB.
-    - **Video path** (``isinstance(part.primitives["video"], Videos)``): reads
-      per-sample 4D ``[C, T, H, W]`` CPU ``float32`` tensors via
-      ``Videos.to_list()`` + ``permute(1, 0, 2, 3)``; keeps them raw,
-      NOT pre-built ``wandb.Video`` (encoding is owned by
-      ``UniRLWandBLogger.log_generated_media``).
-
-    Returns ``None`` when the Part's primitive map contains neither ``Images``
-    nor ``Videos`` (e.g. a text Part) or when nothing is selected.
-    """
+    """Build a wandb-bound :class:`MediaPreview` from one gen Part's decoded media."""
     decoded = part.primitives.get("image")
     if decoded is None:
         decoded = part.primitives.get("video")

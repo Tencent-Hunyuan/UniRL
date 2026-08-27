@@ -1,11 +1,4 @@
-"""HunyuanVideo-1.5 family: input/output sub-adapters + the ``t2v`` modality class.
-
-Single diffusion stage, TP=1, no AR prelude. The request side derives from
-the shared :class:`~.dit.DitInputAdapter` adding the video-only
-``num_frames`` knob; the response side derives from
-:class:`~.dit.DitOutputAdapter` packing per-prompt PIL frame groupings into
-``Videos`` and the dual-stream HV1.5 text conditions.
-"""
+"""HunyuanVideo-1.5 family: input/output sub-adapters + the ``t2v`` modality class."""
 
 from __future__ import annotations
 
@@ -30,12 +23,7 @@ def _num_frames(sample: Sample) -> int:
 
 
 class Hv15InputAdapter(DitInputAdapter):
-    """SD3-style request side + the video-only ``num_frames`` knob.
-
-    ``num_frames`` rides both the per-prompt dict (read by
-    ``RLHunyuanVideo15Pipeline.forward``) and the diffusion kwargs — one
-    ``super()``-extend override per side.
-    """
+    """SD3-style request side + the video-only ``num_frames`` knob."""
 
     def build_prompts(self, sample: Sample) -> List[Any]:
         prompts = super().build_prompts(sample)
@@ -72,15 +60,7 @@ class Hv15VideoOutputAdapter(DitOutputAdapter):
         return grouped_pils_to_videos(frame_groups)
 
     def build_conditions(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
-        """Unpack the per-request HV1.5 dual-stream text conditions.
-
-        Written by ``RLHunyuanVideo15Pipeline`` after intercepting
-        ``encode_prompt`` — 8 tensors from the dual text encoder (Qwen2.5-VL
-        MLLM + ByT5 glyph), mapped to ``text_mllm`` / ``text_glyph``
-        (+ negatives). Returns the conditions *dict* (keys aligned with
-        ``HunyuanVideo15Conditions.from_dict``), NOT the typed wrapper — the
-        trainer runs ``from_dict(part.conditions)`` itself.
-        """
+        """Unpack the per-request HV1.5 dual-stream text conditions."""
         del sample
         diff_outputs, _, _ = collect_dit_outputs(
             per_request, final_output_type=self.final_output_type, stage_id=self.stage_id, modality=self.modality

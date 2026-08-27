@@ -21,15 +21,7 @@ from .vendor import (
 
 
 class MiniMaxH3Bundle(Bundle):
-    """Loaded MiniMax-H3 components.
-
-    No scheduler is held. MiniMax-H3's two rectified-flow grids are plain
-    ``shift*t / (1 + (shift-1)*t)``. For ``N`` model evaluations, UniRL builds
-    ``N + 1`` sigma points, matching the vendored ``MiniMaxH3Scheduler`` called
-    with ``N + 1`` because its argument counts grid points. Sigma is therefore
-    pinned onto the generation Part by the hosting engine like every other
-    model here, and a scheduler instance would be a second source of truth.
-    """
+    """Loaded MiniMax-H3 components."""
 
     def __init__(
         self,

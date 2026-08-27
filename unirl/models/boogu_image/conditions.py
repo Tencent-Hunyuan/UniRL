@@ -1,18 +1,4 @@
-"""BooguImageConditions — typed conditions container for Boogu-Image diffusion.
-
-Concrete instantiation of the ``DiffusionStage[C]`` type parameter.
-Mirrors :class:`unirl.models.z_image.ZImageConditions`: text + optional
-negative_text, both as :class:`TextEmbedCondition` instances. Boogu-Image
-does not emit a ``pooled`` text vector, so ``TextEmbedCondition.pooled`` is
-always ``None``; the ``attn_mask`` field carries the right-padded
-chat-template token mask that the transformer's variable-length attention
-consumes directly (no unpad/repack — see ``BooguImageTextEmbedStage``).
-
-The CFG negative branch is a sibling ``negative_text`` field so the schema
-is honest about which slots travel on the wire — a reader of
-``Part.conditions`` sees ``"text"`` and ``"negative_text"`` as two
-equal-status entries.
-"""
+"""BooguImageConditions — typed conditions container for Boogu-Image diffusion."""
 
 from __future__ import annotations
 
@@ -32,12 +18,7 @@ class BooguImageConditions(Batch):
 
     @classmethod
     def from_dict(cls, d: Dict[str, Condition]) -> "BooguImageConditions":
-        """Build from the generic ``Conditions`` dict shape.
-
-        Validates that the ``"text"`` slot is present and is a
-        ``TextEmbedCondition``. The ``"negative_text"`` slot is optional;
-        when absent the result has ``negative_text=None`` (CFG-off).
-        """
+        """Build from the generic ``Conditions`` dict shape."""
         text = d.get("text")
         if not isinstance(text, TextEmbedCondition):
             raise TypeError(
@@ -54,12 +35,7 @@ class BooguImageConditions(Batch):
         return cls(text=text, negative_text=negative_text)
 
     def to_dict(self) -> Dict[str, Condition]:
-        """Convert back to the generic ``Conditions`` dict shape for
-        packing into ``Part.conditions``.
-
-        Emits ``"negative_text"`` only when ``negative_text is not None``
-        so the dict shape stays minimal for CFG-off rollouts.
-        """
+        """Convert back to the generic ``Conditions`` dict shape for packing into ``Part.conditions``."""
         if self.text is None:
             raise ValueError("BooguImageConditions.to_dict: text field is None")
         out: Dict[str, Condition] = {"text": self.text}

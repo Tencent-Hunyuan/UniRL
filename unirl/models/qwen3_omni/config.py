@@ -35,6 +35,7 @@ class Qwen3OmniPipelineConfig:
 
     max_prompt_length: int = 4096
 
+    image_max_pixels: Optional[int] = None
     video_fps: float = 1.0
     video_max_frames: Optional[int] = None
     video_max_pixels: Optional[int] = None
@@ -47,6 +48,8 @@ class Qwen3OmniPipelineConfig:
 
     def __post_init__(self) -> None:
         validate_precision_type(self.model_precision, field="Qwen3OmniPipelineConfig.model_precision")
+        if self.image_max_pixels is not None and int(self.image_max_pixels) < 1:
+            raise ValueError(f"Qwen3OmniPipelineConfig.image_max_pixels must be >= 1, got {self.image_max_pixels!r}")
         if float(self.video_fps) <= 0.0:
             raise ValueError(f"Qwen3OmniPipelineConfig.video_fps must be > 0, got {self.video_fps!r}")
         if self.video_max_frames is not None and int(self.video_max_frames) < 1:

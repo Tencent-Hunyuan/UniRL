@@ -1,9 +1,4 @@
-"""
-Dataset implementations for GRPO training.
-
-The default user-facing data input contract is prompt-first:
-- Text prompts plus optional metadata (TextPromptDataset)
-"""
+"""Dataset implementations for GRPO training."""
 
 import json
 import logging
@@ -41,10 +36,7 @@ _MEDIA_REF_FIELDS = {"modality", "role", "uri"}
 
 
 def _normalize_media_refs(raw_media: Any, *, base_dir: Optional[str] = None) -> List[MediaRef]:
-    """Normalize a manifest ``media`` list into typed media references.
-
-    Relative URIs are resolved against *base_dir* when provided.
-    """
+    """Normalize a manifest ``media`` list into typed media references."""
     if raw_media is None:
         return []
     if not isinstance(raw_media, list):
@@ -83,14 +75,7 @@ def normalize_prompt_example(
     default_prompt_id: Optional[str] = None,
     base_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Normalize one raw dataset entry into prompt/metadata form.
-
-    Args:
-        item: Raw dataset entry dict.
-        default_prompt_id: Fallback prompt ID if none is present in the item.
-        base_dir: Base directory for resolving relative media URIs. Typically
-            the parent directory of the dataset file.
-    """
+    """Normalize one raw dataset entry into prompt/metadata form."""
     if not isinstance(item, dict):
         raise TypeError(f"Prompt example must be a dict, got {type(item).__name__}.")
 
@@ -121,14 +106,7 @@ def normalize_prompt_example(
 
 
 def _resolve_media_uri(raw_path: str, *, base_dir: Optional[str] = None) -> str:
-    """Resolve a media path to an absolute URI.
-
-    - Absolute paths and HTTP(S) URLs are returned as-is.
-    - Relative paths are joined with *base_dir* (if provided) to produce an
-      absolute filesystem path.
-    - ``s3://`` / ``gs://`` pass through here but are rejected when constructing
-      :class:`MediaRef` until a materialize step exists.
-    """
+    """Resolve a media path to an absolute URI."""
     if raw_path.startswith(("http://", "https://", "s3://", "gs://")):
         return raw_path
     if os.path.isabs(raw_path):
@@ -139,38 +117,14 @@ def _resolve_media_uri(raw_path: str, *, base_dir: Optional[str] = None) -> str:
 
 
 class PromptExampleDataset(Dataset):
-    """
-    Dataset that can expose prompt/metadata examples without loading training tensors.
-
-    This is the framework-level interface used by evaluation prompt selection.
-    """
+    """Dataset that can expose prompt/metadata examples without loading training tensors."""
 
     def get_prompt_example(self, idx: int) -> Dict[str, Any]:
         raise NotImplementedError("Subclasses must implement get_prompt_example().")
 
 
 class TextPromptDataset(PromptExampleDataset):
-    """
-    File-backed dataset for text prompt examples.
-
-    This class owns file parsing and per-row normalization only. Runtime
-    concerns such as epoch ordering, batching, and drop-last policy belong in
-    the data source / sampler layer.
-
-    Supports:
-    - JSON file with list of strings
-    - JSON file with list of dicts containing 'prompt' or 'caption'
-    - JSONL file with one JSON object per line (JSON Lines format)
-    - TXT file with one prompt per line
-
-    Example JSON formats:
-        ["prompt 1", "prompt 2", ...]
-        [{"prompt": "prompt 1"}, {"prompt": "prompt 2"}, ...]
-
-    Example JSONL format:
-        {"prompt": "prompt 1"}
-        {"prompt": "prompt 2"}
-    """
+    """File-backed dataset for text prompt examples."""
 
     def __init__(
         self,
@@ -179,16 +133,7 @@ class TextPromptDataset(PromptExampleDataset):
         seed: Optional[int] = None,
         shuffle: bool = False,
     ):
-        """
-        Initialize text prompt dataset.
-
-        Args:
-            file_path: Path to JSON or TXT file containing prompts
-            prompt_key: Key for prompt in JSON dicts
-            seed: Random seed for optional standalone load-time shuffling
-            shuffle: Whether to shuffle prompts on load. Training data sources
-                should normally leave this disabled and shuffle via samplers.
-        """
+        """Initialize text prompt dataset."""
         self.file_path = file_path
         self.prompt_key = prompt_key
         self.samples: List[Dict[str, Any]] = []

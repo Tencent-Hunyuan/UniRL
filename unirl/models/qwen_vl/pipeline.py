@@ -15,21 +15,7 @@ from .config import QwenVLPipelineConfig
 
 
 class QwenVLPipeline(Pipeline):
-    """Qwen-VL AR (understanding) generate pipeline: ``Sample → Sample``.
-
-    Consumes a request ``Sample`` whose frontier (last) Part is a pre-forked AR gen
-    shell carrying ``ARSamplingParams``. Reads the full role-tagged trajectory — text
-    turns plus the chained image turn(s) — via ``sample.vision_conditioning()`` (one
-    fused message per role; an optional ``{"system_instruction": str}`` override rides
-    on the input Part's ``control["chat"]``) and fills the frontier Part:
-
-    - ``segment: TextSegment`` — the generated tokens + full-softmax log-probs.
-    - ``primitive: Texts`` — detokenized response strings.
-
-    ``Part.conditions`` carries the encoded prompt conditions; trainer-side replay
-    teacher-forces over those *stored* ids (re-typed via ``conditions_cls.from_dict``),
-    so the encode here is the single source of truth for the importance ratio.
-    """
+    """Qwen-VL AR (understanding) generate pipeline: ``Sample → Sample``."""
 
     def __init__(
         self,
@@ -51,17 +37,7 @@ class QwenVLPipeline(Pipeline):
         max_prompt_length: int = 4096,
         pad_to_max_length: bool = False,
     ) -> "QwenVLPipeline":
-        """Wire chat-template + AR stages around an already-loaded bundle.
-
-        The v2 trainer loads the bundle once and injects it
-        (``remote_hydra(pipeline_cfg, bundle=...)``); routing pipeline
-        construction through ``from_config`` instead would load a second copy
-        of the model. This factory shares the single bundle.
-
-        ``pad_to_max_length`` fixes the prompt sequence length to
-        ``max_prompt_length`` so DP rollout shards stay concat-compatible at
-        merge time (see :class:`QwenVLChatTemplateStage`).
-        """
+        """Wire chat-template + AR stages around an already-loaded bundle."""
         chat_template = QwenVLChatTemplateStage(
             bundle,
             max_prompt_length=max_prompt_length,
@@ -82,13 +58,7 @@ class QwenVLPipeline(Pipeline):
         turns: List[Turn],
         control: Optional[Dict[str, Any]] = None,
     ) -> QwenVLARConditions:
-        """Chat-template + tokenize the trajectory ``turns`` (text + image turns) →
-        :class:`QwenVLARConditions`.
-
-        The rollout encode path: production replay teacher-forces over the *stored*
-        conditions this produces (not a re-encode). An optional per-request
-        ``system_instruction`` override rides on the input Part's ``control["chat"]``.
-        """
+        """Chat-template + tokenize the trajectory ``turns`` (text + image turns) → :class:`QwenVLARConditions`."""
         chat_overrides: Dict[str, Any] = dict((control or {}).get("chat") or {})
         if "system_instruction" in chat_overrides:
             chat_stage = QwenVLChatTemplateStage(

@@ -1,36 +1,4 @@
-"""Supervised finetuning losses — the anchor-free algorithms the base class anticipates.
-
-Two :class:`StageAlgorithm` siblings of GRPO / FlowGRPO / DiffusionNFT, sharing
-their stage surface so RL and SFT run the SAME model forwards (no parity drift):
-
-- :class:`SFT` — autoregressive masked cross-entropy over a dataset-built
-  ``TextSegment`` via ``ARStage.replay`` (the teacher-forced per-token-logp
-  kernel GRPO already uses; structural prompt masking, chunked lm_head,
-  packed-varlen — all inherited). CE is just ``-logp`` at ``temperature=1.0``.
-- :class:`FlowMatchSFT` — diffusion flow-matching velocity MSE over a
-  dataset-built x0-only ``LatentSegment`` via ``predict_noise_at_step`` (the
-  single-``(x_t, σ)`` forward DiffusionNFT already uses). The forward-noising
-  recipe ``x_t = (1-σ)·x0 + σ·ε`` and the velocity convention
-  ``target = ε - x0`` (⇔ ``x0_hat = x_t - σ·pred``) match DiffusionNFT and
-  ``FlowSDEStrategy`` exactly.
-
-Neither reads ``advantages`` / ``old_logp`` / SDE trajectories — both declare
-``requires_advantages = False`` and leave :meth:`prepare_segment` as the no-op
-the base docstring promises for anchor-free algorithms. Both are driven by the
-regular :class:`~unirl.train.stack.TrainStack`; tracks come from a
-``SupervisedTrackBuilder`` (``unirl/train/sft/track_builder.py``) instead of a
-rollout engine.
-
-Loss-normalization contract (the cross-framework lesson): token-level CE must
-be normalized by the GLOBAL valid-token count of one optimizer step — across
-micro-batches and DP ranks — or gradients silently depend on packing and DP
-layout. :class:`SFT` therefore declares ``loss_weighting = "token"`` under
-``loss_agg_mode="token-mean"`` and returns a micro-token-MEAN loss; the stack
-supplies ``loss_scale = micro_tokens · dp_world / global_tokens`` so
-``(loss · loss_scale).backward()`` accumulates the exact full-batch token-mean
-gradient. Seq-mean agg modes weigh each sequence equally instead
-(``loss_weighting = "sample"``; equal DP shards make rank-mean exact).
-"""
+"""Supervised finetuning losses — the anchor-free algorithms the base class anticipates."""
 
 from __future__ import annotations
 
@@ -50,31 +18,7 @@ _LOSS_AGG_MODES = ("token-mean", "seq-mean-token-mean", "seq-mean-token-sum-norm
 
 
 class SFT(StageAlgorithm):
-    """Masked next-token cross-entropy over an AR ``TextSegment``.
-
-    ``segment.tokens`` are the GROUND-TRUTH response tokens (dataset targets,
-    EOS included — the same layout rollout engines emit, so ``ARStage.replay``
-    is reused verbatim); ``segment.loss_mask`` optionally down-weights tokens
-    (1 = train, 0 = ignore). ``segment.log_probs`` may be ``None`` — SFT has no
-    behavior policy.
-
-    Args:
-        stage / pipeline / stage_attr: standard stage resolution (the trainer
-            injects ``pipeline``; the stage is ``getattr(pipeline, stage_attr)``).
-        loss_agg_mode: ``"token-mean"`` (default — global token-mean via the
-            stack's ``loss_weighting='token'`` contract), ``"seq-mean-token-mean"``
-            (each sequence weighs equally), or ``"seq-mean-token-sum-norm"``
-            (Dr.GRPO-style per-seq sum / ``horizon``). The seq-mean modes are
-            what :class:`~unirl.train.stack.TokenBudgetPlanner` packing requires.
-        horizon: normalizer for ``seq-mean-token-sum-norm``.
-        conditions_cls: stage-typed conditions container with ``from_dict``.
-
-    Deliberately NOT exposed: ``temperature`` (pinned 1.0 — the ``logits/T``
-    rescale exists only to match a sampling engine's distribution; inheriting a
-    rollout temperature would silently rescale CE), clip ranges, old-logp
-    sources, schedules — those are rollout-anchoring semantics with no meaning
-    under supervision.
-    """
+    """Masked next-token cross-entropy over an AR ``TextSegment``."""
 
     supports_multi_update = True
     requires_advantages = False
@@ -141,14 +85,7 @@ class SFT(StageAlgorithm):
         segment: "TextSegment",
         sample_ids: Optional[Sequence[str]] = None,
     ) -> Tuple[float, float]:
-        """Forward-only ``(objective_sum, objective_weight)`` for validation.
-
-        ``token-mean`` returns raw CE and valid-token count. Sequence-mean modes
-        return the sum of their per-sequence objectives and the number of valid
-        sequences. The caller can therefore aggregate the exact training
-        objective across micros, DP ranks, and eval batches. ``sample_ids`` is
-        unused here (CE is deterministic) — accepted for a uniform signature.
-        """
+        """Forward-only ``(objective_sum, objective_weight)`` for validation."""
         del sample_ids
         if segment is None or segment.tokens is None or segment.tokens.shape[0] == 0:
             return 0.0, 0.0
@@ -160,10 +97,7 @@ class SFT(StageAlgorithm):
         conditions: Mapping[str, Condition],
         segment: "TextSegment",
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """One teacher-forced forward → (aggregated loss, reduction stats).
-
-        ``temperature=1.0`` — plain CE, never a sampling-matched rescale.
-        """
+        """One teacher-forced forward → (aggregated loss, reduction stats)."""
         typed_conds = typed_conditions(conditions, self.conditions_cls)
         new_logp = self.stage.replay(typed_conds, segment=segment, temperature=1.0)
         nll = -new_logp
@@ -211,36 +145,7 @@ class SFT(StageAlgorithm):
 
 
 class FlowMatchSFT(StageAlgorithm):
-    """Flow-matching velocity MSE over a dataset x0-only ``LatentSegment``.
-
-    Per micro-step, for each sample: draw ``σ`` from the configured
-    distribution, noise ``x_t = (1-σ)·x0 + σ·ε``, forward once via
-    ``stage.predict_noise_at_step`` and regress the predicted velocity onto
-    ``ε - x0`` in fp32. ``segment.latents[:, -1]`` is the clean VAE-encoded
-    target latent (the same slot DiffusionNFT reads).
-
-    Timestep sampling (the train/inference-schedule parity knob):
-        ``timestep_sampling="logit_normal"`` draws ``u = sigmoid(N(logit_mean,
-        logit_std))`` (Esser et al. 2024 — the SD3 paper's weighting);
-        ``"uniform"`` draws ``u ~ U(0,1)``. Either is then warped through the
-        model's inference time-shift ``σ = s·u / (1 + (s-1)·u)`` — set
-        ``timestep_shift`` to the family's inference shift (SD3/Bagel 3.0,
-        WAN 5.0, Flux 1.0) so training visits the noise band inference actually
-        uses; an unshifted draw under-trains it (the kohya/diffusers-issue
-        class of silent quality loss).
-
-    Args:
-        params: per-call params the stage's predictor consumes (recipes bind
-            ``${sampling}``); only ``guidance_scale`` is read here — keep it
-            1.0 so SFT runs the pure conditional branch.
-        timestep_shift: inference-schedule shift to warp draws through
-            (default 1.0 = no warp; set per family).
-        eval_seed: seed for the DETERMINISTIC eval draw — validation re-noises
-            the same (sample, σ, ε) every time, so the eval loss is comparable
-            across steps instead of a fresh MC estimate (the training loss only
-            oscillates; a fixed-noise val loss is the signal that shows
-            learning).
-    """
+    """Flow-matching velocity MSE over a dataset x0-only ``LatentSegment``."""
 
     supports_multi_update = True
     requires_advantages = False
@@ -321,16 +226,7 @@ class FlowMatchSFT(StageAlgorithm):
         segment: LatentSegment,
         sample_ids: Optional[Sequence[str]] = None,
     ) -> Tuple[float, float]:
-        """Forward-only ``(mse_sum, sample_count)`` at a FIXED (σ, ε) draw.
-
-        The (σ, ε) draw is pinned PER SAMPLE (seeded from ``eval_seed`` + the
-        sample's own id), not per batch: a single batch-level seed would tie a
-        sample's noising to its position in the batch, so the eval loss would
-        shift if the eval batch size, order, or DP sharding changed. Per-sample
-        seeding makes the number comparable across steps AND invariant to
-        batching (random-σ losses only oscillate). ``segment.loss_mask``
-        (``[B]``) excludes padded eval rows.
-        """
+        """Forward-only ``(mse_sum, sample_count)`` at a FIXED (σ, ε) draw."""
         x0 = self._clean_latents(segment)
         if x0 is None:
             return 0.0, 0.0
@@ -361,28 +257,19 @@ class FlowMatchSFT(StageAlgorithm):
         return x0.float()
 
     def _draw_sigma(self, batch: int, device: torch.device, generator: Optional[torch.Generator]) -> torch.Tensor:
-        if self.timestep_sampling == "logit_normal":
-            z = torch.randn(batch, device=device, dtype=torch.float32, generator=generator)
-            u = torch.sigmoid(z * self.logit_std + self.logit_mean)
-        else:
-            u = torch.rand(batch, device=device, dtype=torch.float32, generator=generator)
-        s = self.timestep_shift
-        sigma = (s * u) / (1.0 + (s - 1.0) * u)
-        return sigma.clamp(min=self.sigma_min, max=1.0 - self.sigma_min)
-
-    def _sample_eval_seed(self, key: str) -> int:
-        """Stable int64 seed from ``eval_seed`` + a per-sample key (id).
-
-        ``hashlib`` (not Python's salted ``hash``) so the seed is identical
-        across processes / ranks / runs — the whole point of a comparable eval.
-        """
-        digest = hashlib.sha256(f"{self.eval_seed}:{key}".encode()).digest()
-        return int.from_bytes(digest[:8], "little") & 0x7FFF_FFFF_FFFF_FFFF
+        return draw_shifted_sigma(
+            batch,
+            timestep_sampling=self.timestep_sampling,
+            logit_mean=self.logit_mean,
+            logit_std=self.logit_std,
+            shift=self.timestep_shift,
+            sigma_min=self.sigma_min,
+            device=device,
+            generator=generator,
+        )
 
     def _eval_draws(self, x0: torch.Tensor, sample_ids: Optional[Sequence[str]]) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Per-sample deterministic ``(σ, ε)`` for eval — one seeded generator
-        per sample keyed on its id, so a sample's noising is independent of the
-        batch it lands in. Falls back to the row index when ids are absent."""
+        """Per-sample deterministic ``(σ, ε)`` for eval, keyed on sample id so noising is batch-independent."""
         batch = x0.shape[0]
         device = x0.device
         sigmas: list[torch.Tensor] = []
@@ -390,7 +277,7 @@ class FlowMatchSFT(StageAlgorithm):
         for i in range(batch):
             key = str(sample_ids[i]) if sample_ids is not None and i < len(sample_ids) else str(i)
             generator = torch.Generator(device=device)
-            generator.manual_seed(self._sample_eval_seed(key))
+            generator.manual_seed(sample_eval_seed(self.eval_seed, key))
             sigmas.append(self._draw_sigma(1, device, generator))
             noises.append(torch.randn(x0[i].shape, device=device, dtype=torch.float32, generator=generator))
         return torch.cat(sigmas, dim=0), torch.stack(noises, dim=0)
@@ -435,4 +322,35 @@ def flow_shift_sigma(u: torch.Tensor, shift: float) -> torch.Tensor:
     return (shift * u) / (1.0 + (shift - 1.0) * u)
 
 
-__all__ = ["SFT", "FlowMatchSFT", "flow_shift_sigma"]
+def draw_shifted_sigma(
+    batch: int,
+    *,
+    timestep_sampling: str,
+    logit_mean: float,
+    logit_std: float,
+    shift: float,
+    sigma_min: float,
+    device: torch.device,
+    generator: Optional[torch.Generator],
+) -> torch.Tensor:
+    """Draw ``[batch]`` fp32 training sigmas: base draw -> ``flow_shift_sigma`` warp -> clamp."""
+    if timestep_sampling == "logit_normal":
+        z = torch.randn(batch, device=device, dtype=torch.float32, generator=generator)
+        u = torch.sigmoid(z * logit_std + logit_mean)
+    elif timestep_sampling == "uniform":
+        u = torch.rand(batch, device=device, dtype=torch.float32, generator=generator)
+    else:
+        raise ValueError(
+            f"draw_shifted_sigma: timestep_sampling must be 'uniform' or 'logit_normal'; got {timestep_sampling!r}."
+        )
+    sigma = flow_shift_sigma(u, shift)
+    return sigma.clamp(min=sigma_min, max=1.0 - sigma_min)
+
+
+def sample_eval_seed(eval_seed: int, key: str) -> int:
+    """Stable int64 eval seed from ``eval_seed`` + per-sample key; shared so eval draws compare across algorithms."""
+    digest = hashlib.sha256(f"{eval_seed}:{key}".encode()).digest()
+    return int.from_bytes(digest[:8], "little") & 0x7FFF_FFFF_FFFF_FFFF
+
+
+__all__ = ["SFT", "FlowMatchSFT", "draw_shifted_sigma", "flow_shift_sigma", "sample_eval_seed"]

@@ -1,31 +1,4 @@
-"""DRPO (AR): Divergence Regularized Policy Optimization for token-level RL.
-
-Implements **DRPO**, the proposed method of the AdaSPO paper "Rethinking the
-Divergence Regularization in LLM Reinforcement Learning", for autoregressive
-(token-level, discrete) policies. DRPO is introduced in the paper's
-**§3 (Methodology)** and is the headline method evaluated in **§4 / Figure 3**.
-
-Derivation (paper §3): DRPO takes DPPO's Binary-TV trust region
-(§2.4, Eq 6-7: ``|π(a|s) − μ(a|s)| ≤ δ``), rewrites it as a **token-adaptive
-ratio bound** ``|r_t − 1| ≤ δ / μ(a_t|s_t)``, and applies the SPO construction
-(§2.3, Eq 5: the advantage-weighted χ² / ℓ²₂ regularizer). Substituting the
-token-adaptive ``ε_t = ε / μ`` into SPO yields the per-token loss::
-
-    L_t = −A_t · r_t  +  |A_t| · μ(a_t|s_t) · (r_t − 1)² / (2 · ε)
-
-with ``r_t = π(a_t|s_t) / μ(a_t|s_t)`` the importance ratio and ``μ`` the
-rollout-policy token probability. The induced **gradient weight** (paper Table 1;
-gradient in Eq 9) is the *smooth*, advantage-aware
-``1 − sign(Â_t(r_t−1)) · |π−μ| / δ`` — a continuous trust region that attenuates
-diverging updates and provides a corrective signal beyond the boundary, unlike
-DPPO's hard 0/1 mask (§2.4) or SPO's fixed ratio bound (§2.3).
-
-This is exactly verl's ``spo_adaptive_eps`` policy loss
-(``actor.policy_loss.loss_mode``) — the loss the reference DRPO recipe selects.
-``ε`` is the "regularization threshold" set to 12.5 in the paper (§4).
-
-(AR-only by design; a diffusion DRPO sibling can be added in its own PR.)
-"""
+"""DRPO (AR): Divergence Regularized Policy Optimization for token-level RL."""
 
 from __future__ import annotations
 
@@ -49,24 +22,7 @@ from .grpo import GRPO
 
 @dataclass
 class DRPOConfig(BaseAlgorithmConfig):
-    """Config for :class:`DRPO` (the paper's DRPO method, §3).
-
-    Attributes:
-        stage_attr: Which stage slot to bind to (``"ar"``).
-        conditions_cls: Dotted path to the stage-typed conditions class.
-        drpo_epsilon: Regularization threshold ``ε`` of the token-adaptive SPO
-            quadratic. Paper §4: "For SPO and DRPO, we set the regularization
-            threshold to 12.5." Larger ``ε`` ⇒ weaker regularization; the
-            per-token trust region is ``ε_t = ε / μ`` (§3).
-        loss_agg_mode: ``"token-mean"`` or ``"seq-mean-token-sum-norm"``
-            (per-seq token-SUM / horizon, then mean over sequences).
-        horizon: Fixed length normalizer for ``seq-mean-token-sum-norm``
-            (= max response length).
-        sampling_temperature: Rollout sampling temperature; replay rescales
-            logits by it so ``log_softmax(logits / T)`` matches the sampling
-            distribution. MUST equal ``sampling.temperature``. Falls back to the
-            :class:`ARSamplingParams` default when None.
-    """
+    """Config for :class:`DRPO` (the paper's DRPO method, §3)."""
 
     stage_attr: str = "ar"
     conditions_cls: str = ""
@@ -86,32 +42,7 @@ def _drpo_loss(
     epsilon: float,
     mu_weighted: bool = True,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    """DRPO per-token loss (paper §3; gradient = Eq 9, weight = Table 1).
-
-    Operates on packed-varlen ``[total_tokens]`` tensors (the natural setting for
-    DRPO, which targets discrete token-level policies). Per token::
-
-        L_t = −A_t · r_t  +  |A_t| · μ · (r_t − 1)² / (2 · ε)
-
-    where ``r_t = π/μ`` is the importance ratio, ``μ = exp(old_logp)`` is the
-    rollout-policy token probability, and ``ε`` is the regularization threshold
-    (12.5, §4). The first term is the importance-weighted policy gradient; the
-    second is SPO's advantage-weighted quadratic regularizer (§2.3, Eq 5) carrying
-    the Binary-TV's token-adaptive ``ε_t = ε / μ`` (§3). ``r_t`` is kept
-    differentiable (no ``.detach()``, no TIS truncation), so the smooth Table-1
-    gradient weight ``1 − sign(Â_t(r_t−1)) · |π−μ| / δ`` arises via autograd.
-
-    Mirrors verl ``compute_policy_loss_spo_adaptive_eps`` exactly.
-
-    Args:
-        new_logp: New-policy log-probs at current weights. ``[total_tokens]``.
-        old_logp: Rollout-policy (μ) log-probs, frozen. ``[total_tokens]``.
-        advantages: Per-token advantages (expanded from per-sample).
-        epsilon: Regularization threshold ``ε`` (12.5).
-
-    Returns:
-        ``(loss_per_element, metrics_dict)``. Reduction is the caller's job.
-    """
+    """DRPO per-token loss over packed-varlen ``[total_tokens]`` (paper §3; gradient Eq 9, weight Table 1)."""
     log_diff = torch.clamp(new_logp - old_logp, min=-20.0, max=20.0)
     ratio = torch.exp(log_diff)
     adv = advantages.detach()
@@ -138,29 +69,7 @@ def _drpo_loss(
 
 
 class DRPO(StageAlgorithm):
-    """DRPO for AR token-level policies — the paper's proposed method (§3).
-
-    DRPO (Divergence Regularized Policy Optimization) replaces DPPO's hard
-    Binary-TV mask (§2.4) with a **smooth, advantage-weighted, token-adaptive
-    quadratic regularizer** — SPO's construction (§2.3) applied to the Binary-TV
-    token-adaptive ratio bound ``|r−1| ≤ δ/μ``. Per-token loss (§3; gradient
-    Eq 9; gradient weight Table 1)::
-
-        L_t = −A_t · r_t  +  |A_t| · μ · (r_t − 1)² / (2 · ε)
-
-    Args:
-        pipeline: The trainer-injected pipeline; the stage is resolved from it via
-            ``getattr(pipeline, stage_attr)``. v2-only — there is no v1 ``stage=``
-            path.
-        stage_attr: Which pipeline attribute holds the AR stage (``"ar"``).
-        drpo_epsilon: Regularization threshold ``ε`` (12.5; paper §4).
-        loss_agg_mode: ``"token-mean"`` or ``"seq-mean-token-sum-norm"``.
-        horizon: Fixed length normalizer for ``seq-mean-token-sum-norm``.
-        sampling_temperature: Rollout sampling temperature, passed to
-            ``stage.replay`` so its log-softmax matches the sampling distribution.
-            MUST equal ``sampling.temperature``.
-        conditions_cls: Stage-typed conditions container.
-    """
+    """DRPO for AR token-level policies — the paper's proposed method (§3)."""
 
     def __init__(
         self,
@@ -200,25 +109,7 @@ class DRPO(StageAlgorithm):
         conditions: Mapping[str, Condition],
         segment: "TextSegment",
     ) -> None:
-        """Freeze the π_old anchor (``segment.log_probs``) before the
-        ``num_updates_per_batch`` loop, per ``old_logp_source``.
-
-        - ``"rollout"`` (default): keep the rollout engine's emitted
-          ``segment.log_probs`` as the anchor for ALL N updates (verl
-          bypass-mode parity; the ratio also carries the rollout-vs-train
-          engine gap).
-        - ``"replay"``: recompute π_old via a ``torch.no_grad`` ``stage.replay``
-          at the **pre-update** weights and **overwrite** ``segment.log_probs``.
-          This hook fires once before the N mini-batch optimizer steps, so the
-          ratio denominator is the frozen train-side π_old for ALL N updates:
-          mini-batch 1 has ratio≈1 (same weights) and later mini-batches measure
-          policy drift — no rollout-vs-train engine-gap contamination. Mirrors
-          :meth:`FlowGRPO.prepare_segment` replay mode. Caveat: the anchor
-          is replayed in one full-segment pass while training replays per
-          micro-batch, and low-precision forwards are batch-shape sensitive —
-          so mb1's ratio is close to, not exactly, 1 (exactness would need the
-          ``recomputes_anchor``/``anchor_fields`` per-slice machinery).
-        """
+        """Freeze the π_old anchor (``segment.log_probs``) before the ``num_updates_per_batch`` loop."""
         if self.old_logp_source != "replay":
             return
         if segment.tokens is None or segment.log_probs is None or int(segment.tokens.shape[0]) == 0:

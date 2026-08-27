@@ -1,12 +1,4 @@
-"""CLAP audio-text alignment reward — LAION CLAP via HuggingFace transformers.
-
-Scores cosine similarity between generated audio and the text prompt. Used for
-LTX-2.3 T2AV where the reward service injects the jointly-generated audio
-waveform into ``request.generated["audio"]`` (a side-channel alongside the
-video in ``request.generated["video"]``). Mirrors Flow-Factory's CLAP reward.
-
-Zero extra dependencies — ``transformers.ClapModel`` is already in the dep tree.
-"""
+"""CLAP audio-text alignment reward — LAION CLAP via HuggingFace transformers."""
 
 from __future__ import annotations
 
@@ -24,13 +16,7 @@ from .base import LocalRewardBackend
 
 
 class CLAPRewardScorer(LocalRewardBackend):
-    """Audio-text alignment reward using LAION CLAP.
-
-    ``input_kind = "video"``: the primary decoded media is the video (so the
-    generated Part routes through the video path), and the audio arrives as a parallel
-    side-channel (``request.generated["audio"]`` + ``request.audio_sample_rate``)
-    modality from the same Part's ``primitives["audio"]`` entry.
-    """
+    """Audio-text alignment reward using LAION CLAP."""
 
     canonical_model_name = "clap"
     input_kind = "video"
@@ -55,12 +41,7 @@ class CLAPRewardScorer(LocalRewardBackend):
         self.processor = ClapProcessor.from_pretrained(model_id)
 
     def _preprocess_audio(self, audio_list: List[torch.Tensor], src_sample_rate: int) -> List["torch.Tensor"]:
-        """Downmix to mono and resample each waveform to CLAP's 48 kHz.
-
-        Accepts per-sample tensors shaped ``[L]``, ``[C, L]``, or ``[L, C]``
-        (the ``Audios`` primitive packs along the leading L axis, so ``to_list``
-        yields ``[L]`` / ``[L, C]``). Returns mono numpy float32 arrays ``[L']``.
-        """
+        """Downmix and resample each ``[L]`` / ``[C, L]`` / ``[L, C]`` waveform to CLAP's 48 kHz mono ``[L']``."""
         import numpy as np
         import torchaudio.functional as AF
 

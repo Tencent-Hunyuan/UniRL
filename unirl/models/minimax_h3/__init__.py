@@ -1,9 +1,4 @@
-"""MiniMax-H3 -- 33B omni-modal joint video + stereo audio diffusion.
-
-Currently covers the ``t2va`` (text -> video+audio) task of the FL2VA
-checkpoint. ``fl2va`` (keyframe conditioning) shares these weights and needs
-only conditioning rows; ``ref2va`` is a separate checkpoint and is not here.
-"""
+"""MiniMax-H3 -- 33B omni-modal joint video + stereo audio diffusion."""
 
 from .bundle import MiniMaxH3Bundle
 from .conditions import MiniMaxH3Conditions

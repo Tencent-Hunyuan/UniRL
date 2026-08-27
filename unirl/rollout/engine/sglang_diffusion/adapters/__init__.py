@@ -1,8 +1,4 @@
-"""Model adapters for the ``sglang_diffusion`` engine.
-
-Importing this package registers every concrete adapter (the ``@register_adapter``
-side-effects fire), so ``get_adapter(model_family)`` resolves after import.
-"""
+"""Model adapters for the ``sglang_diffusion`` engine."""
 
 from unirl.rollout.engine.sglang_diffusion.adapters.base import (
     ModelAdapter,
@@ -21,7 +17,7 @@ from unirl.rollout.engine.sglang_diffusion.adapters.qwen_image_edit_plus import 
 )
 from unirl.rollout.engine.sglang_diffusion.adapters.sd3 import SD3Adapter
 from unirl.rollout.engine.sglang_diffusion.adapters.video import (
-    HunyuanVideoAdapter,
+    HunyuanVideo10Adapter,
     Ltx2T2VAdapter,
     MochiAdapter,
     VideoAdapter,
@@ -46,6 +42,6 @@ __all__ = [
     "Wan21T2VAdapter",
     "Ltx2T2VAdapter",
     "MochiAdapter",
-    "HunyuanVideoAdapter",
+    "HunyuanVideo10Adapter",
     "ZImageAdapter",
 ]

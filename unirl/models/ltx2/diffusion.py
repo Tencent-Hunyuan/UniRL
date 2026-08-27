@@ -1,20 +1,4 @@
-"""LTX2 diffusion: per-step kernel + rollout-level stage.
-
-Two classes:
-- ``LTX2DiffusionStep`` — stateless per-step kernel.
-- ``LTX2DiffusionStage`` — implements ``DiffusionStage[LTX2Conditions]``.
-
-LTX2-specific deviations from other models:
-- Unified video+audio latent space: video and audio are concatenated on the
-  sequence dimension before the transformer, split after.
-- Video uses SDE (stochastic, log_prob for RL gradients).
-- Audio uses ODE (deterministic, no gradients) — trained jointly but not
-  directly optimized by the RL signal.
-- The transformer takes ``hidden_states`` (patchified latents) +
-  ``encoder_hidden_states`` (text embeddings) + ``encoder_attention_mask``.
-- Timestep is scaled by 1000 (flow matching convention).
-- RoPE is computed internally by the transformer from spatial/temporal shapes.
-"""
+"""LTX2 diffusion: per-step kernel + rollout-level stage."""
 
 from __future__ import annotations
 
@@ -68,26 +52,19 @@ _LTX2_AUDIO_LATENT_CHANNELS: int = 8
 
 
 def _audio_num_frames(num_pixel_frames: int, fps: float) -> int:
-    """Number of audio LATENT frames for a clip, matching diffusers:
-    ``round(duration_s * sampling_rate / hop_length / temporal_compression)``.
-    """
+    """Number of audio LATENT frames for a clip, matching the diffusers formula."""
     duration_s = float(num_pixel_frames) / float(fps)
     per_s = _LTX2_AUDIO_SAMPLING_RATE / _LTX2_AUDIO_HOP_LENGTH / float(_LTX2_AUDIO_TEMPORAL_COMPRESSION)
     return max(1, int(round(duration_s * per_s)))
 
 
 def _audio_packed_feature_dim() -> int:
-    """Packed audio feature dim: ``latent_channels * (mel_bins // mel_compress)``
-    (== ``transformer.config.audio_in_channels`` = 128 for LTX-2)."""
+    """Packed audio feature dim ``latent_channels * (mel_bins // mel_compress)`` (128 for LTX-2)."""
     return _LTX2_AUDIO_LATENT_CHANNELS * (_LTX2_AUDIO_MEL_BINS // _LTX2_AUDIO_MEL_COMPRESSION)
 
 
 def audio_latent_shape(params: DiffusionSamplingParams) -> Tuple[int, int]:
-    """Per-sample PACKED audio-latent shape ``(audio_t, 128)`` — the geometry the
-    LTX-2 audio stream is allocated with. Exposed so the pipeline can resolve a
-    matching audio x_T from the video NoiseRecipe
-    (``recipe.resolve(salt="audio", latent_shape=…)``).
-    """
+    """Per-sample PACKED audio-latent shape ``(audio_t, 128)`` — the LTX-2 audio stream's allocation geometry."""
     audio_t = _audio_num_frames(int(params.num_frames), _LTX2_FRAME_RATE)
     return (audio_t, _audio_packed_feature_dim())
 
@@ -98,24 +75,13 @@ def _combine_modality_logp(
     n_video: int,
     n_audio: int,
 ) -> torch.Tensor:
-    """Element-weighted mean of the per-step video/audio log-probs.
-
-    Video and audio are stepped by the SAME stateless strategy, each returning a
-    per-sample log-prob already meaned over its own latent dims. Weighting by the
-    element counts reproduces the mean a single SDE over the concatenated
-    ``[video|audio]`` latent would produce, so the joint log-prob keeps the same
-    scale as the video-only path. Mirrors Flow-Factory ``combine_modality_log_prob``.
-    """
+    """Element-weighted mean of the per-step video/audio log-probs."""
     total = n_video + n_audio
     return (video_logp * n_video + audio_logp * n_audio) / total
 
 
 class LTX2DiffusionStep(DiffusionStep[LTX2Bundle, LTX2Conditions]):
-    """Per-step LTX2 denoising kernel — stateless.
-
-    Handles the video-only forward (SDE path for RL). Audio is handled
-    separately via ODE in the stage.
-    """
+    """Per-step LTX2 denoising kernel — stateless."""
 
     def predict_noise(
         self,
@@ -131,26 +97,7 @@ class LTX2DiffusionStep(DiffusionStep[LTX2Bundle, LTX2Conditions]):
         audio_sample: torch.Tensor,
         audio_num_frames: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Run the LTX2 audiovisual transformer with optional CFG, returning
-        BOTH the video and audio velocity predictions.
-
-        LTX-2 co-denoises video + audio: the video forward depends on the
-        current audio state via the per-layer audio→video cross-attention
-        residual (``isolate_modalities=False``). So we feed the real audio
-        latent every step and return both predictions; the stage ODE-steps the
-        audio and SDE-steps the video.
-
-        Args:
-            sample: Patchified video latents (B, seq_v, C_v).
-            audio_sample: Packed audio latents (B, seq_a, C_a=128).
-            sigma: Current noise level (B,).
-            latent_num_frames / latent_height / latent_width: Video LATENT grid
-                dims (post-VAE-compression) for video RoPE coords.
-            audio_num_frames: Audio LATENT frame count for audio RoPE coords.
-
-        Returns:
-            ``(video_velocity [B, seq_v, C_v], audio_velocity [B, seq_a, C_a])``.
-        """
+        """LTX2 AV transformer with optional CFG: ``(video [B, seq_v, C_v], audio [B, seq_a, C_a])`` velocities."""
         transformer = model.transformer
         timestep = (sigma * _LTX2_TIMESTEP_SCALE).to(sample.device)
 
@@ -223,11 +170,7 @@ class LTX2DiffusionStep(DiffusionStep[LTX2Bundle, LTX2Conditions]):
 
 
 class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
-    """LTX2 diffusion stage — owns the denoising loop and replay.
-
-    FSDP wrapping hint: the transformer's block class is
-    ``LTX2VideoTransformerBlock``.
-    """
+    """LTX2 diffusion stage — owns the denoising loop and replay."""
 
     _no_split_modules: ClassVar[List[str]] = ["LTX2VideoTransformerBlock"]
 
@@ -256,12 +199,7 @@ class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
 
     @staticmethod
     def _latent_geometry(params: DiffusionSamplingParams) -> tuple[int, int, int]:
-        """Video LATENT grid ``(T_lat, H_lat, W_lat)`` from pixel-space params.
-
-        Mirrors ``LTX2Pipeline.latent_shape``: 32x spatial, 8x temporal (causal,
-        so ``T_lat = (num_frames - 1) // 8 + 1``). The transformer needs these
-        to build video RoPE coords inside ``predict_noise``.
-        """
+        """Video LATENT grid ``(T_lat, H_lat, W_lat)`` from pixel-space params."""
         latent_t = (int(params.num_frames) - 1) // LTX2_TEMPORAL_COMPRESSION + 1
         latent_h = int(params.height) // LTX2_SPATIAL_COMPRESSION
         latent_w = int(params.width) // LTX2_SPATIAL_COMPRESSION
@@ -279,24 +217,7 @@ class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
         denoise_seed_keys: Optional[List[str]] = None,
         denoise_base_seed: int = 0,
     ) -> LatentSegment:
-        """Run the full denoising loop, collecting trajectory for RL.
-
-        Args:
-            conditions: Text/image conditioning.
-            params: Sampling parameters (guidance_scale, eta, etc.).
-            sigmas: Sigma schedule (T+1,) from high → 0.
-            initial_latents: Starting noise (B, seq, C) or (B, C, T, H, W).
-            initial_audio_latents: Driver-authoritative audio x_T (B, audio_t,
-                128) resolved by the pipeline from the same NoiseRecipe as video.
-                ``None`` falls back to a bare randn (non-pipeline/test callers).
-            sde_indices: Which steps to use SDE (stochastic) for RL.
-            denoise_seed_keys: Stable per-sample keys used to derive the same
-                per-step SDE noise as SGLang.
-            denoise_base_seed: Base seed paired with ``denoise_seed_keys``.
-
-        Returns:
-            LatentSegment with trajectory and log-probs at SDE steps.
-        """
+        """Run the full denoising loop, collecting trajectory for RL."""
         guidance_scale = float(params.guidance_scale)
         eta = float(params.eta)
         latent_t, latent_h, latent_w = self._latent_geometry(params)
@@ -428,16 +349,7 @@ class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
         params: DiffusionSamplingParams,
         step_indices: Optional[List[int]] = None,
     ) -> ReplayResult:
-        """Segment-based log-prob replay over the rollout's SDE transitions.
-
-        For each target SDE step ``k`` we re-run the model at the stored
-        ``sample = latents_at(k)`` and evaluate the log-prob of the stored
-        transition to ``prev_sample = latents_at(k+1)`` (no fresh noise —
-        ``strategy.denoise`` with ``prev_sample`` set is replay mode). Used by
-        FlowGRPO for both the frozen π_old anchor and the trainable new_logp.
-        Returns ``log_probs`` ``[B, len(target)]`` and ``prev_sample_means``
-        for the KL penalty. Mirrors WAN21.
-        """
+        """Log-prob replay over SDE transitions; returns ``log_probs [B, len(target)]`` plus means for the KL term."""
         if segment.sde_indices is None or segment.latents is None or segment.sigmas is None:
             raise ValueError("LTX2DiffusionStage.replay: segment.sde_indices / latents / sigmas missing")
         if segment.aux_latents is None:

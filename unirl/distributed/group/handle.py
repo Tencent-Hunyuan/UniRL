@@ -1,33 +1,9 @@
-"""Handle — controller-side SPMD handle for a group of logical workers.
-
-Handle owns a set of device slots (by device_ids), registers a Remote
-on each Worker, and binds @distributed-decorated methods as handle functions.
-
-Cross-GPU TensorHandle transfer is handled automatically: when a shard contains
-TensorHandle from a foreign worker, _ensure_local() triggers NCCL send/recv
-before execution. Users never call NCCL directly.
-
-Usage:
-    pool = DevicePool(num_gpus=8)
-    pool.setup()
-
-    # Basic
-    handle = pool.create_remote(DiffusionRemote, device_ids=[0,1,2,3])
-    handle.initialize(model_path="/models/sd", tp_size=2)
-
-    # With constructor args
-    handle = pool.create_remote(ScalerRemote, device_ids=[0,1,2,3], init_kwargs={"scale": 3.0})
-
-    # Separated: tensor transfer is automatic
-    actor = pool.create_remote(ActorRemote, device_ids=[0,1,2,3])
-    reward = pool.create_remote(RewardRemote, device_ids=[4,5,6,7])
-    samples = actor.rollout(prompts=prompts)
-    rewards = reward.score(samples)  # auto NCCL from gpu 0-3 to gpu 4-7
-"""
+"""Handle — controller-side SPMD handle for a group of logical workers."""
 
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass
 from itertools import count
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple, Type
@@ -62,15 +38,7 @@ _role_name_counter: Dict[str, int] = {}
 
 
 def _owning_class(role_cls) -> Type[Remote]:
-    """Return the class for Handle method-binding and role naming.
-
-    ``role_cls`` may be a class (normal case), a bound classmethod
-    factory (e.g. ``SD3Bundle.from_config``), or a plain function.
-    For classmethods we use the owning class so ``_bind_methods`` finds
-    its ``@distributed`` methods and ``_make_role_name`` produces a
-    meaningful base name. For everything else, fall back to ``role_cls``
-    itself.
-    """
+    """Return the class for Handle method-binding and role naming."""
     import inspect
 
     if inspect.ismethod(role_cls) and isinstance(role_cls.__self__, type):
@@ -79,10 +47,7 @@ def _owning_class(role_cls) -> Type[Remote]:
 
 
 def _make_role_name(role_cls) -> str:
-    """Generate a unique role_name from the worker class name.
-
-    Always appends counter suffix for deterministic names.
-    """
+    """Generate a unique role_name from the worker class name."""
     base = _owning_class(role_cls).__name__
     count = _role_name_counter.get(base, 0)
     _role_name_counter[base] = count + 1
@@ -103,16 +68,7 @@ def _cfg_get(cfg: Any, key: str, default: int) -> int:
 
 
 def _is_sglang_rollout_role(role_cls: Type[Remote]) -> bool:
-    """True if ``role_cls`` opts into per-rank rollout-TP kwargs.
-
-    SGLangRolloutEngine sets ``_accepts_rollout_tp_kwargs = True`` so Handle
-    injects ``tp_rank``/``tp_size``/``tp_visible_devices``/``pp_rank``/``ep_size``
-    into its ``__init__``. Other roles (weight sync, reward, algorithms) do NOT
-    set this flag — they share the rollout Handle's layout via ``HandleRef``
-    but their ``__init__`` doesn't accept these kwargs, so injecting would
-    raise ``TypeError``. A class-attribute flag (vs a string name check) survives
-    rename and subclassing without silently dropping the injection.
-    """
+    """True if ``role_cls`` opts into per-rank rollout-TP kwargs."""
     cls = _owning_class(role_cls)
     return getattr(cls, "_accepts_rollout_tp_kwargs", False) is True
 
@@ -122,14 +78,7 @@ def _parallel_shape_from_init_kwargs(
     world_size: int,
     role_cls: Type[Remote],
 ) -> Tuple[int, int, int, int]:
-    """Resolve ``(sp, tp, pp, ep)`` layout hints for this handle.
-
-    ``sp_size`` keeps the existing VeOmni/Ulysses inheritance behavior. Rollout
-    TP/PP/EP is only read from ``SGLangRolloutEngine`` config (or inherited from
-    a sibling ``HandleRef`` such as ``rollout=...`` on weight sync roles) so
-    diffusion engines with their own ``tp_size`` config do not accidentally adopt
-    the AR rollout layout.
-    """
+    """Resolve ``(sp, tp, pp, ep)`` layout hints for this handle."""
     if not init_kwargs:
         return 1, 1, 1, 1
 
@@ -177,13 +126,7 @@ def _build_rank_infos(
     pp_size: int = 1,
     ep_size: int = 1,
 ) -> List[RankInfo]:
-    """Build contiguous rank layout.
-
-    The default ``tp=pp=sp=1`` reproduces the flat one-rank-per-DP layout.
-    Ulysses SP keeps its historical contiguous ``(dp, sp)`` layout. Rollout TP
-    uses ``(dp, pp, tp)`` with TP rank fastest so one SGLang engine owns a
-    contiguous ``tp_size`` block of workers.
-    """
+    """Build contiguous rank layout."""
     if sp_size > 1:
         dp_size = world_size // sp_size
         return [
@@ -223,17 +166,7 @@ def _build_tp_visible_device_map(
     node_ips: Sequence[str],
     cuda_visible_devices: Sequence[str],
 ) -> Dict[int, List[str]]:
-    """Map each TP worker index to its node-local Ray CUDA token list.
-
-    ``DevicePool.device_ids`` are cluster-global placement indices. They are
-    not CUDA ordinals on nodes after the first one, and Ray may expose UUID or
-    MIG tokens instead of integers. Querying each Worker is therefore the only
-    reliable source of the scheduler visibility list.
-
-    TP groups must be node-local because one SGLang engine spawns all of its TP
-    scheduler processes from the ``tp_rank==0`` Worker. Invalid topology fails
-    before any role is constructed or GPU process is started.
-    """
+    """Map each TP worker index to its node-local Ray CUDA token list."""
     size = len(rank_infos)
     if len(node_ips) != size or len(cuda_visible_devices) != size:
         raise ValueError(
@@ -286,23 +219,7 @@ def _build_tp_visible_device_map(
 
 @dataclass(frozen=True)
 class HandleRef:
-    """Serializable marker for a Handle.
-
-    When a ``Handle`` is passed as a kwarg to ``remote(...)``, the framework
-    substitutes a ``HandleRef`` so the Worker can resolve it to the local
-    ``Remote`` instance with this ``role_name`` (looked up in
-    ``Worker._roles``) before constructing the new role.
-
-    Only resolves on the same Worker as the referenced role — i.e. when the
-    sibling lives on the same device slab and slot.
-
-    ``sp_size`` carries the referenced handle's Ulysses degree so a dependent
-    role (e.g. the train stack, which takes ``fsdp_backend=<SP backend>``)
-    inherits the SAME (dp, sp) rank layout. Without this, the dependent stays
-    flat (sp=1) and its ``DP_SCATTER`` splits a batch across all ``world_size``
-    ranks — feeding the two ranks of an SP pair *different* shards, which
-    desyncs the model's Ulysses all-to-all (mismatched shapes -> NCCL hang).
-    """
+    """Serializable marker for a Handle."""
 
     role_name: str
     sp_size: int = 1
@@ -312,23 +229,29 @@ class HandleRef:
 
 
 class PendingHandleCall:
-    """Future-like result of :meth:`Handle.launch_nowait`: launched, not yet collected.
+    """Future-like result of :meth:`Handle.launch_nowait`: launched, not yet collected."""
 
-    ``ready()`` probes without blocking; ``wait()`` blocks without collecting;
-    ``result()`` blocks if needed, then runs the resolution phase of
-    ``handle_fn`` and returns the method's collected value. The resolution
-    phase runs at most once — rebind registers GC finalizers on the result refs — so
-    a successful ``result()`` caches its value and later calls return it; a
-    ``result()`` that raised may be retried.
-    """
-
-    def __init__(self, handle: "Handle", method_name: str, refs: List[Any], worker_local: bool) -> None:
+    def __init__(
+        self,
+        handle: "Handle",
+        method_name: str,
+        refs: List[Any],
+        worker_local: bool,
+        *,
+        targets: Optional[List[Any]] = None,
+        collect_fn: Optional[Callable] = None,
+        leases: Optional[List[Any]] = None,
+    ) -> None:
         self._handle = handle
         self._method_name = method_name
         self._refs = refs
         self._worker_local = worker_local
+        self._targets = targets
+        self._collect_fn = collect_fn
+        self._leases = leases
         self._consumed = False
         self._value: Any = None
+        self._discard_futures: Optional[List[Any]] = None
 
     def ready(self) -> bool:
         """True once every worker's ref is resolved (non-blocking probe)."""
@@ -336,33 +259,128 @@ class PendingHandleCall:
         return len(done) == len(self._refs)
 
     def wait(self) -> None:
-        """Block until every worker finishes, without collecting; re-raises worker errors."""
-        ray.get(self._refs)
+        """Block until completion and safely discard the collected return value."""
+        if self._consumed:
+            return
+        self.result()
+        self._value = None
+
+    def discard_on_completion(self) -> None:
+        """Retain leases and discard outputs when all worker refs finish."""
+        if self._consumed:
+            self._value = None
+            return
+        if self._discard_futures is not None:
+            return
+        try:
+            futures = [ref.future() for ref in self._refs]
+        except Exception:
+            threading.Thread(
+                target=self._discard_result,
+                name="pending-handle-discard",
+                daemon=True,
+            ).start()
+            return
+        if not futures:
+            self._discard_result()
+            return
+
+        remaining = len(futures)
+        lock = threading.Lock()
+
+        def on_done(_) -> None:
+            nonlocal remaining
+            with lock:
+                remaining -= 1
+                complete = remaining == 0
+            if complete:
+                self._discard_result()
+
+        self._discard_futures = futures
+        for future in futures:
+            future.add_done_callback(on_done)
 
     def result(self) -> Any:
         """Block if needed, then rebind + collect: the method's collected return value."""
         if self._consumed:
             return self._value
         handle = self._handle
-        _, _, collect_fn, _ = handle._method_configs[self._method_name]
-        self._value = handle._resolve_call(collect_fn, self._refs, worker_local=self._worker_local)
+        collect_fn = self._collect_fn
+        if collect_fn is None:
+            _, _, collect_fn, _ = handle._method_configs[self._method_name]
+        try:
+            self._value = handle._resolve_call(
+                collect_fn,
+                self._refs,
+                worker_local=self._worker_local,
+                targets=self._targets,
+            )
+        finally:
+            self._release_leases()
         self._consumed = True
         return self._value
 
+    def _release_leases(self) -> None:
+        """Release handles owning destination TensorStore entries after RPC consumption."""
+        self._leases = None
+
+    def _discard_result(self) -> None:
+        try:
+            self.wait()
+        except Exception:
+            logger.debug("PendingHandleCall: discarded call failed during completion", exc_info=True)
+        finally:
+            self._discard_futures = None
+
+
+class Slot:
+    """Driver-side handle to one worker in a :class:`Handle`."""
+
+    def __init__(self, handle: "Handle", index: int) -> None:
+        self._handle = handle
+        self._index = int(index)
+
+    @property
+    def index(self) -> int:
+        return self._index
+
+    def launch(self, method_name: str, *args, **kwargs) -> PendingHandleCall:
+        """Launch an undecorated role method on this worker."""
+        handle = self._handle
+        if method_name in handle._method_configs:
+            raise AttributeError(f"{method_name!r} is distributed; call it on the Handle")
+        if not hasattr(_owning_class(handle.role_cls), method_name):
+            raise AttributeError(f"{method_name!r} is not a method of {_owning_class(handle.role_cls).__name__}")
+        if current_grad_context() is not None:
+            raise RuntimeError(f"Slot call {method_name!r} is not valid inside a GradContext")
+
+        transport_cls = handle.pool.transport_cls
+        worker_local = issubclass(transport_cls, WorkerLocalTransport)
+        shards = transport_cls.localize(
+            [(args, kwargs)],
+            handle.pool,
+            [handle.device_ids[self._index]],
+            [handle.worker_ids[self._index]],
+        )
+        worker = handle.workers[self._index]
+        s_args, s_kwargs = shards[0]
+        ref = worker.call.remote(handle.role_name, method_name, s_args, s_kwargs, False, None)
+        return PendingHandleCall(
+            handle,
+            method_name,
+            [ref],
+            worker_local,
+            targets=[worker],
+            collect_fn=lambda _, results: results[0],
+            leases=shards,
+        )
+
+    def call(self, method_name: str, *args, **kwargs) -> Any:
+        return self.launch(method_name, *args, **kwargs).result()
+
 
 class Handle:
-    """Controller-side SPMD handle.
-
-    Creates logical workers on Workers and binds @distributed methods.
-
-    Args:
-        role_cls:      Remote subclass to register.
-        pool:          DevicePool managing Workers.
-        device_ids:    Explicit GPU indices. If None, auto-allocate via n_gpus.
-        n_gpus:        Number of GPUs to auto-allocate (used when device_ids=None).
-        role_name:     Optional role name. If None, auto-generated from class name.
-        init_kwargs:   Dict of kwargs forwarded to role_cls.__init__.
-    """
+    """Controller-side SPMD handle."""
 
     def __init__(
         self,
@@ -477,10 +495,7 @@ class Handle:
 
     @property
     def sp_size(self) -> int:
-        """Ulysses sequence-parallel degree of this handle's rank layout (1 = flat).
-
-        Read by ``_to_marker`` when this handle is passed as a sibling so the
-        dependent role inherits the same (dp, sp) layout (see ``HandleRef``)."""
+        """Ulysses sequence-parallel degree of this handle's rank layout (1 = flat)."""
         return self.rank_infos[0].sp_size if self.rank_infos else 1
 
     @property
@@ -493,6 +508,27 @@ class Handle:
         """Pipeline-parallel degree of this handle's rank layout."""
         return self.rank_infos[0].pp_size if self.rank_infos else 1
 
+    def slot(self, index: int) -> Slot:
+        if index < 0 or index >= self.world_size:
+            raise IndexError(f"slot index {index} outside [0, {self.world_size})")
+        return Slot(self, index)
+
+    @property
+    def engine_slots(self) -> List[Slot]:
+        """Slots that host addressable rollout-engine heads, one per DP replica."""
+        if self.sp_size > 1:
+            raise RuntimeError(
+                f"slot-local rollout dispatch does not support sequence-parallel engines; got sp_size={self.sp_size}"
+            )
+        slots = [
+            self.slot(index)
+            for index, info in enumerate(self.rank_infos)
+            if info.tp_rank == 0 and info.pp_rank == 0 and info.sp_rank == 0
+        ]
+        if len(slots) != self.dp_size:
+            raise RuntimeError(f"expected {self.dp_size} rollout engine slots, found {len(slots)}")
+        return slots
+
     @property
     def ep_size(self) -> int:
         """Expert-parallel degree requested for rollout-side engines."""
@@ -500,20 +536,11 @@ class Handle:
 
     @property
     def tp_zero_workers(self) -> List[Any]:
-        """Worker actor handles that host a SGLang engine (tp_rank==0).
-
-        With rollout TP, one SGLang engine per TP group is hosted by its
-        tp_rank==0 worker; the others are no-op shells. Weight sync targets and
-        server-actor discovery must use this filtered list. ``tp_size==1``
-        returns every worker (identical to ``self.workers``)."""
+        """Worker actor handles that host a SGLang engine (tp_rank==0)."""
         return [w for w, ri in zip(self.workers, self.rank_infos) if ri.tp_rank == 0]
 
     def initialize(self, *args, **kwargs) -> None:
-        """Call role.initialize(*args, **kwargs) on all workers.
-
-        Releases the reserved port first so init_process_group can bind it,
-        then reads back (possibly modified) rank_infos.
-        """
+        """Call role.initialize(*args, **kwargs) on all workers."""
         ray.get(self.workers[0]._release_port.remote(self._group_port))
 
         ray.get([w.call.remote(self.role_name, "initialize", args, kwargs) for w in self.workers])
@@ -521,13 +548,7 @@ class Handle:
         self.rank_infos = ray.get([w.get_rank_info.remote(self.role_name) for w in self.workers])
 
     def _bind_methods(self, role_cls) -> None:
-        """Scan role_cls for @distributed methods and create handle functions.
-
-        For classmethod ``role_cls`` (e.g. ``SD3Bundle.from_config``)
-        we scan the owning class instead — the constructed instance is
-        of that class, so its ``@distributed`` methods are the ones
-        callers will dispatch through this Handle.
-        """
+        """Scan role_cls for @distributed methods and create handle functions."""
         role_cls = _owning_class(role_cls)
         for name in dir(role_cls):
             method = getattr(role_cls, name, None)
@@ -536,6 +557,8 @@ class Handle:
             config = getattr(method, DISTRIBUTED_CONFIG_ATTR, None)
             if config is None:
                 continue
+            if name in {"slot", "engine_slots"}:
+                raise TypeError(f"distributed method {name!r} collides with the Handle API")
 
             fns = DISPATCH_MODE_REGISTRY[config["dispatch_mode"]]
             dispatch_fn = fns["dispatch_fn"]
@@ -558,17 +581,7 @@ class Handle:
         collect_fn: Callable,
         execute_fn: Callable,
     ) -> Callable:
-        """Create handle method: dispatch → localize → execute → collect → rebind.
-
-        When a GradContext is active, wraps the call to record input/output
-        TensorMetas and append an RPCBackwardNode for later auto-backward.
-        grad_mode and call_id are passed as dedicated parameters to Worker.call
-        (not via kwargs) so dispatch internals remain unaware of grad state.
-
-        Both this blocking form and :meth:`launch_nowait` +
-        :meth:`PendingHandleCall.result` are thin sequencing over the shared
-        :meth:`_launch_call` / :meth:`_resolve_call` phases.
-        """
+        """Create handle method: dispatch → localize → execute → collect → rebind."""
 
         def handle_fn(*args, **kwargs):
             ray_get_timeout = kwargs.pop("_ray_get_timeout", None)
@@ -582,7 +595,7 @@ class Handle:
                 call_id = f"{method_name}_{next(self._grad_call_counter)}"
                 input_metas = collect_leaves(args, TensorRef) + collect_leaves(tuple(kwargs.values()), TensorRef)
 
-            refs, worker_local = self._launch_call(
+            refs, worker_local, leases = self._launch_call(
                 method_name,
                 dispatch_mode,
                 dispatch_fn,
@@ -592,12 +605,15 @@ class Handle:
                 grad_mode=ctx is not None,
                 call_id=call_id,
             )
-            collected = self._resolve_call(
-                collect_fn,
-                refs,
-                worker_local=worker_local,
-                ray_get_timeout=ray_get_timeout,
-            )
+            try:
+                collected = self._resolve_call(
+                    collect_fn,
+                    refs,
+                    worker_local=worker_local,
+                    ray_get_timeout=ray_get_timeout,
+                )
+            finally:
+                leases.clear()
 
             if ctx is not None:
                 output_metas = collect_leaves(collected, TensorRef)
@@ -628,12 +644,8 @@ class Handle:
         *,
         grad_mode: bool,
         call_id: Optional[str],
-    ) -> Tuple[List, bool]:
-        """Launch a distributed call; returns ``(refs, worker_local)``.
-
-        Runs dispatch → localize → execute for both the blocking
-        ``handle_fn`` and the non-blocking :meth:`launch_nowait`.
-        """
+    ) -> Tuple[List, bool, List]:
+        """Launch a distributed call and retain localized argument leases."""
         batch_size = infer_batch_size(args, kwargs)
         if (
             dispatch_mode in (Dispatch.DP_SCATTER, Dispatch.DP_SCATTER_HEAD)
@@ -647,7 +659,7 @@ class Handle:
         worker_local = issubclass(transport_cls, WorkerLocalTransport)
         shards = transport_cls.localize(shards, self.pool, self.device_ids, self.worker_ids)
         refs = execute_fn(method_name, shards, grad_mode=grad_mode, call_id=call_id)
-        return refs, worker_local
+        return refs, worker_local, shards
 
     def _resolve_call(
         self,
@@ -656,25 +668,16 @@ class Handle:
         *,
         worker_local: bool,
         ray_get_timeout: Optional[float] = None,
+        targets: Optional[List[Any]] = None,
     ):
-        """Resolve a launched call into its collected method return value.
-
-        Runs ray.get → rebind → collect for both the blocking
-        ``handle_fn`` and :meth:`PendingHandleCall.result`.
-        """
+        """Resolve a launched call into its collected method return value."""
         results = ray.get(refs, timeout=ray_get_timeout)
-        results = [self._rebind_tree(r, self.workers[i], worker_local=worker_local) for i, r in enumerate(results)]
+        workers = self.workers if targets is None else targets
+        results = [self._rebind_tree(r, workers[i], worker_local=worker_local) for i, r in enumerate(results)]
         return collect_fn(self, results)
 
     def launch_nowait(self, method_name: str, *args, **kwargs) -> PendingHandleCall:
-        """Launch a @distributed method without blocking: the launch phase of
-        ``handle_fn``, stopping before ``ray.get``.
-
-        Always ``grad_mode=False`` / ``call_id=None`` (a pending call is never
-        valid under a GradContext, so the ``_grad_call_counter`` single-thread
-        assumption is untouched). ``result()`` on the returned
-        :class:`PendingHandleCall` runs the resolution phase.
-        """
+        """Launch a @distributed method without blocking: the launch phase of"""
         try:
             dispatch_mode, dispatch_fn, _, execute_fn = self._method_configs[method_name]
         except KeyError:
@@ -682,7 +685,7 @@ class Handle:
                 f"{method_name!r} is not a @distributed method of {_owning_class(self.role_cls).__name__}"
             ) from None
 
-        refs, worker_local = self._launch_call(
+        refs, worker_local, leases = self._launch_call(
             method_name,
             dispatch_mode,
             dispatch_fn,
@@ -692,7 +695,7 @@ class Handle:
             grad_mode=False,
             call_id=None,
         )
-        return PendingHandleCall(self, method_name, refs, worker_local)
+        return PendingHandleCall(self, method_name, refs, worker_local, leases=leases)
 
     def _execute_all(self, method_name: str, shards: List, grad_mode: bool = False, call_id=None) -> List:
         """Send RPC to all Workers."""
@@ -708,15 +711,7 @@ class Handle:
         ]
 
     def _rebind_tree(self, obj, worker_handle, *, worker_local: bool = True):
-        """Rebind every ref leaf onto ``worker_handle`` and wrap bare handles in TensorRef.
-
-        For worker-local backends, ``rebind`` attaches the worker actor handle and
-        registers the decref GC finalizer. For GLOBAL backends the refs resolve
-        anywhere and lifecycle is queue-managed, so no rebind/GC is done (and the
-        refs need not be TensorHandle). Only the per-leaf rebind policy lives here;
-        the tree recursion (Batch/tuple/list/dict, cu_seqlens preserved) is delegated
-        to the shared :func:`map_tree`.
-        """
+        """Rebind every ref leaf onto ``worker_handle`` and wrap bare handles in TensorRef."""
 
         def rebind_leaf(o):
             if isinstance(o, GPUTensorHandle):

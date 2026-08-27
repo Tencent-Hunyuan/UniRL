@@ -15,27 +15,25 @@ entrypoint's built-in `config_name` — a safe place to start.
 
 | Domain | Entrypoint | Default recipe (start here) | Models |
 |---|---|---|---|
-| [`diffusion/`](diffusion/) | `python -m unirl.train_diffusion` | `diffusion/sd3/sd3_trainside` | `sd3`, `qwen_image`, `flux2_klein`, `wan21`, `wan22`, `hunyuan_video`, `hunyuan_video15` |
+| [`diffusion/`](diffusion/) | `python -m unirl.train_diffusion` | `diffusion/sd3/sd3_trainside` | `sd3`, `qwen_image`, `flux2_klein`, `wan21`, `wan22`, `hunyuan_video10`, `hunyuan_video15` |
 | [`ar/`](ar/) | `python -m unirl.train_ar` | `ar/qwen_vl_grpo_geo3k_mc_4x8`, `ar/qwen3_drpo_4b_base_dapo_sglang` | `qwen_vl` (vision-language), `qwen3` (text-only) |
-| [`sft/`](sft/) | `python -m unirl.train_sft` | `sft/qwen3_sft` | `qwen3`, `qwen_vl`, `bagel`, `sd3` |
+| [`sft/`](sft/) | `python -m unirl.train_sft` | `sft/qwen3_sft` | `qwen3`, `qwen_vl`, `bagel`, `sd3`, `cosmos3`, `wan21` |
 | [`pe/`](pe/) | `python -m unirl.train_pe` | `pe/pe_trainside_pickscore` | `pe` (Qwen3 rewriter + SD3, PickScore/WISE reward) |
 | [`unified_model/`](unified_model/) | `python -m unirl.train_unified_model` | `unified_model/hi3_vllmomni` | `hi3` (HunyuanImage3, unified AR + diffusion) |
 
-Agentic workflows use separate entrypoints for their reward source and execution topology.
-The entrypoint names the capability; the recipe names the task:
+Agentic training has one service-scored, colocated barrier workflow:
 
-| Reward source | Barrier | Colocated partial rollout | Disaggregated async |
-|---|---|---|---|
-| Environment return (e.g. [`alfworld/`](alfworld/)) | `python -m unirl.train_agentic_env` | `python -m unirl.train_agentic_env_partial` | `python -m unirl.train_agentic_env_async` |
-| Graded answer (e.g. [`deep_research/`](deep_research/)) | `python -m unirl.train_agentic` | `python -m unirl.train_agentic_partial` | `python -m unirl.train_agentic_async` |
+| Workflow | Entrypoint | Recipe |
+|---|---|---|
+| Multi-turn tool use with a graded terminal answer | `python -m unirl.train_agentic` | [`deep_research/deep_research_search_judge`](deep_research/deep_research_search_judge.yaml) |
 
 ## Running a recipe
 
 The bash launchers live in this directory. The first argument is the
 domain-qualified recipe name (passed to Hydra as `--config-name`); any extra args
 are forwarded verbatim as Hydra overrides. `ENTRY` selects a non-diffusion
-entrypoint (`train_ar`, `train_sft`, `train_pe`, `train_unified_model`, or an
-agentic entrypoint); the default is `train_diffusion`.
+entrypoint (`train_ar`, `train_sft`, `train_pe`, `train_unified_model`, or
+`train_agentic`); the default is `train_diffusion`.
 
 ```bash
 # 0. Compose-check first — verifies the config composes and every ${oc.env:...} resolves
@@ -44,7 +42,7 @@ python -m unirl.train_diffusion --config-name=diffusion/sd3/sd3_trainside --cfg 
 # 1. Single node
 bash examples/run_experiment_single_node.sh diffusion/sd3/sd3_trainside
 ENTRY=train_ar bash examples/run_experiment_single_node.sh ar/qwen_vl_grpo_geo3k_mc_4x8
-ENTRY=train_sft bash examples/run_experiment_single_node.sh sft/validation/qwen3_agent_sft_lora
+ENTRY=train_sft bash examples/run_experiment_single_node.sh sft/qwen3_agent_sft_lora
 ENTRY=train_pe  bash examples/run_experiment_single_node.sh pe/pe_trainside_pickscore
 ENTRY=train_agentic bash examples/run_experiment_single_node.sh deep_research/deep_research_search_judge
 
@@ -63,10 +61,26 @@ start it on the head node with `bash examples/mooncake_master.sh start` before l
 
 To save and resume checkpoints and export them to Hugging Face, append the
 `+save_interval` / `+save_dir` / `+load_dir` overrides
-(diffusion/ar/sft/pe/unified
-trainers; the hi3 meta-init recipe is not yet supported) — the full
+(diffusion/ar/sft/pe/unified/agentic trainers; the hi3 meta-init recipe is not
+yet supported) — the full
 train → resume → export → upload lifecycle is in
 [Checkpointing](../unirl/trainer/README.md#checkpointing).
+
+## WAN2.1 UCF-101 full-transformer SFT
+
+[`sft/wan21_t2v_ucf101_full`](sft/wan21_t2v_ucf101_full.yaml) performs full
+WAN2.1 transformer finetuning from caption/target-video manifests on an
+18-class UCF-101 sports/action subset.
+
+See [`datasets/ucf101/README.md`](../datasets/ucf101/README.md) for the exact
+download location, expected directory layout, cooking command, manifest
+format, and training command.
+
+The UCF-101 run used 2,367 training videos and 128 held-out videos, 17 frames at
+256x448, global batch 8, learning rate `2e-6`, and 300 optimizer steps on one
+8xH20 node. Deterministic held-out eval loss improved from `0.21981` at
+initialization to a best `0.16230` at step 260 (-26.2%), finishing at `0.16264`
+at step 300.
 
 ## Reading a recipe name
 
@@ -81,7 +95,7 @@ related recipes sort together.
 
 | Segment | Position | Values (examples) | Omit when |
 |---|---|---|---|
-| `model` | required, first | `sd3`, `qwen_image`, `flux2_klein`, `wan21`, `wan22`, `hunyuan_video`, `hunyuan_video15`, `qwen_vl`, `qwen3`, `hi3` | never |
+| `model` | required, first | `sd3`, `qwen_image`, `flux2_klein`, `wan21`, `wan22`, `hunyuan_video10`, `hunyuan_video15`, `qwen_vl`, `qwen3`, `hi3` | never |
 | `task` | after model | `t2v`, `i2v` | text-to-image (the implicit default) |
 | `size` | after task | `4b`, `14b` | only one size in the family |
 | `algorithm` | middle | `dancegrpo`, `mixgrpo`, `nft`, `flowdppo`, `grpo`, `drpo` | plain FlowGRPO (diffusion default); GRPO (AR default) |
@@ -97,6 +111,7 @@ Worked examples:
 | `sd3_nft_sglang` | SD3 · DiffusionNFT · SGLang engine |
 | `qwen_image_dancegrpo` | Qwen-Image · DanceGRPO |
 | `wan22_t2v_14b_dancegrpo` | WAN 2.2 · text-to-video · 14B · DanceGRPO |
+| `hunyuan_video10_t2v_trainside` | HunyuanVideo-1.0 · text-to-video · trainside engine |
 | `hunyuan_video15_t2v_dancegrpo_trainside` | HunyuanVideo-1.5 · text-to-video · DanceGRPO · trainside engine |
 | `sd3_vllmomni_full_nccl_separate` | SD3 · vLLM-Omni engine · full-weight · NCCL sync · separate slabs |
 | `qwen_vl_grpo_geo3k_mc_4x8` | Qwen-VL · GRPO · geo3k multiple-choice · 4 nodes × 8 GPUs |

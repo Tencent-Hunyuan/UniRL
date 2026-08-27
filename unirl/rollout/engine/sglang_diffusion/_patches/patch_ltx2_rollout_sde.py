@@ -1,35 +1,4 @@
-"""Make LTX-2's custom AV denoising/decoding stages RL-rollout-complete.
-
-LTX-2 overrides the shared sglang stages (``LTX2SigmaPreparationStage``,
-``LTX2DenoisingStage``, ``LTX2AVDecodingStage``) for its audiovisual pipeline, and
-each override drops a piece of the rollout contract the base stages provide. This
-patch restores the missing pieces so the LTX-2 rollout matches what the
-trainside replays (and the GRPO ratio stays ~1):
-
-  (0) Prompt-mask alignment — drop the connector's all-valid mask so SGLang
-      follows the same no-op semantics as replay and stays on its native
-      attention backend (``_patch_all_valid_prompt_mask``).
-  (1) RoPE precision alignment — SGLang applies LTX-2 RoPE in bf16, while the
-      diffusers replay explicitly upcasts the rotary multiply to fp32; use the
-      diffusers arithmetic in SGLang as well (``_patch_rope_precision_alignment``).
-  (2) RL scheduler — replace LTX-2's diffusers scheduler with SGLang's
-      rollout-aware flow-match scheduler (``_patch_scheduler``).
-  (3) σ-schedule alignment — ``LTX2SigmaPreparationStage`` recomputes ``batch.sigmas``
-      from its own schedule, clobbering the driver-pinned ``req.sigmas``; keep the
-      pinned schedule in rollout (``_patch_sigma_alignment``).
-  (4) AV-decode output carry — ``LTX2AVDecodingStage`` builds its ``OutputBatch``
-      without the ``rollout_trajectory_data`` / text-embed conditions / co-denoised
-      audio trajectory the base ``DecodingStage`` + ``patch_conditions`` provide;
-      pass all three through (``_patch_av_decode_carry``).
-  (5) SDE log-prob bridge — ``LTX2DenoisingStage._run_denoising_step`` advances
-      the video latents without passing ``batch``/``generator``, so the RL flow-match
-      scheduler silently takes the plain ODE branch (no log-prob capture, "Generator
-      must be provided"); stash them on the scheduler and inject them into
-      ``step()`` (``_patch_sde_logprob_bridge``).
-
-All wraps are idempotent (sentinel-guarded), import SGLang locally, and are
-applied through the hijack ``_safe_apply`` list.
-"""
+"""Make LTX-2's custom AV denoising/decoding stages RL-rollout-complete."""
 
 from __future__ import annotations
 
@@ -47,15 +16,7 @@ def patch_ltx2_rollout_sde() -> None:
 
 
 def _patch_all_valid_prompt_mask() -> None:
-    """Turn LTX's post-connector all-valid prompt mask into ``None``.
-
-    LTX-2.0 replaces padded text positions with learned connector registers, so
-    its connector returns an all-ones mask. Passing that no-op tensor makes
-    SGLang fall back from its native attention backend to PyTorch SDPA; on the
-    pinned CUDA-forward-compat stack that fallback also crashes at first
-    denoising step. ``None`` is mathematically identical for an all-valid mask
-    and is already the native LTX-2.3 behavior.
-    """
+    """Turn LTX's post-connector all-valid prompt mask into ``None``."""
     import torch
     from sglang.multimodal_gen.runtime.pipelines_core.stages.ltx_2_denoising import (
         LTX2DenoisingStage,
@@ -76,18 +37,7 @@ def _patch_all_valid_prompt_mask() -> None:
 
 
 def _patch_rope_precision_alignment() -> None:
-    """Use diffusers' fp32 LTX-2 rotary multiply in the SGLang DiT.
-
-    SGLang's LTX-2 implementation performs both split and interleaved RoPE in
-    the bf16 activation dtype (and its split path may dispatch to a bf16 Triton
-    kernel). Diffusers explicitly upcasts the rotary multiply to fp32 and casts
-    the result back. Replaying an unchanged SGLang policy with the diffusers DiT
-    therefore produces a systematic model-output/log-prob bias.
-
-    Patch the rollout implementation, rather than changing the canonical
-    diffusers trainside implementation, so both engines use the same fp32
-    arithmetic without an environment flag or a global diffusers monkey patch.
-    """
+    """Use diffusers' fp32 LTX-2 rotary multiply in the SGLang DiT."""
     import sglang.multimodal_gen.runtime.models.dits.ltx_2 as module
     import torch
 
@@ -155,15 +105,7 @@ def _patch_scheduler() -> None:
 
 
 def _patch_sigma_alignment() -> None:
-    """Keep the driver-pinned σ schedule in rollout.
-
-    ``LTX2SigmaPreparationStage`` OVERWRITES ``batch.sigmas`` with its own
-    ``build_official_ltx2_sigmas`` (a linear-then-shifted schedule), clobbering the
-    driver-pinned ``req.sigmas`` the trainside uses. So sglang rolled out on
-    [1.0, 0.9, 0.8, …] while the driver pinned [1.0, 0.958, 0.910, …] →
-    ``verify_engine_used_sigmas`` fails and the curves diverge. In ROLLOUT, honor the
-    already-set sigmas (mirrors the base ``TimestepPreparationStage``).
-    """
+    """Keep the driver-pinned σ schedule in rollout."""
     from sglang.multimodal_gen.runtime.pipelines.ltx_2_pipeline import (
         LTX2SigmaPreparationStage,
     )
@@ -185,25 +127,7 @@ def _patch_sigma_alignment() -> None:
 
 
 def _patch_av_decode_carry() -> None:
-    """Carry the rollout trajectory, audio trajectory, and text conditions onto
-    ``LTX2AVDecodingStage``'s OutputBatch (the base ``DecodingStage`` includes them).
-
-    Three fields the unirl adapter reads off the result never reach it for LTX-2,
-    because ``LTX2AVDecodingStage`` overrides ``forward`` and builds a bare OutputBatch:
-
-    * ``rollout_trajectory_data`` — base ``DecodingStage`` sets it from ``batch``;
-      ``RawResult.trajectory_latents`` reads ``…dit_trajectory.latents`` off it
-      ("SGLang result missing trajectory_latents" without this).
-    * text-embed conditions — ``patch_conditions`` wraps only the BASE
-      ``DecodingStage.forward``; mirror that copy here ("missing prompt_embeds").
-    * co-denoised AUDIO trajectory — LTX-2's video DiT cross-attends to an audio
-      latent, and the trainside replay (``LTX2DiffusionStage.replay``) needs the SAME
-      per-step audio (``segment.aux_latents``) or it raises "aux_latents (audio
-      trajectory) missing" and the curve diverges. The denoising stage stacks it onto
-      ``batch.trajectory_audio_latents`` ([B_out, T+1, …]); ride it inside
-      ``dit_trajectory`` (set post-hoc — not a declared field) so the existing
-      per-output concat/slice + RawResult plumbing carry it alongside the video.
-    """
+    """Carry the rollout trajectory, audio trajectory, and text conditions onto the LTX-2 AV OutputBatch."""
     from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding_av import (
         LTX2AVDecodingStage,
     )
@@ -259,21 +183,7 @@ def _patch_audio_trajectory_alignment() -> None:
 
 
 def _patch_sde_logprob_bridge() -> None:
-    """Feed ``batch`` + per-step SDE generators into the RL flow-match ``step()``.
-
-    ``LTX2DenoisingStage._run_denoising_step`` advances the video latents with
-    ``scheduler.step(..., return_dict=False)`` — WITHOUT ``batch``. The RL scheduler
-    runs ``flow_sde_sampling`` (the per-step log-prob capture) only ``if batch is not
-    None and batch.rollout``, so LTX-2's batch-less call silently takes the plain ODE
-    branch → nothing is appended → ``collect_rollout_log_probs`` stacks an empty list.
-    The base ``DenoisingStage`` passes ``batch``, so SD3 / WAN / HunyuanVideo capture
-    fine; only LTX-2's override misses it. Bridge it without re-vendoring the large
-    ``_run_denoising_step``: stash the rollout ``batch`` + SDE generators on the
-    scheduler around the step, then inject them into ``step()`` when absent. Only the
-    VIDEO scheduler is bridged — for T2V the audio scheduler keeps the plain step.
-    ``patch_denoising`` builds the per-sample generators for the base path; LTX-2
-    bypasses it, so reuse the same derivation (else ``generator=None``).
-    """
+    """Feed ``batch`` + per-step SDE generators into the RL flow-match ``step()``."""
     from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
         FlowMatchEulerDiscreteScheduler,
     )

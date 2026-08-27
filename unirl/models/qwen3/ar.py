@@ -1,19 +1,4 @@
-"""Qwen3 AR stage: typed params + per-token kernel + rollout-level stage.
-
-Three classes:
-
-- ``Qwen3ARParams`` — typed request-shape knobs (max_tokens / temperature
-  / top_p / top_k / stop_token_ids).
-- ``Qwen3ARStep`` — per-token sampling kernel (reads logits, returns
-  ``(token_id, log_prob)``). Verbatim mechanics from
-  :class:`unirl.models.hunyuan_image3.ar.HunyuanImage3ARStep`.
-- ``Qwen3ARStage`` — implements ``ARStage[Qwen3ARConditions]``. Drives
-  HF :class:`AutoModelForCausalLM` through a per-token loop with KV
-  cache, packs the results into a varlen :class:`TextSegment` with
-  per-step full-softmax log-probs. ``replay`` recomputes per-token
-  log-probs from stored rollout tokens via a single teacher-forced
-  forward — the GRPO/PPO substitution point.
-"""
+"""Qwen3 AR stage: typed params + per-token kernel + rollout-level stage."""
 
 from __future__ import annotations
 
@@ -45,11 +30,7 @@ _SPARSE_PACKED_ATTN = ("flex_attention", "flash_attention_2", "flash_attention_3
 
 @functools.lru_cache(maxsize=None)
 def _warn_packed_disabled(attn_impl: str) -> None:
-    """One-time warning (per distinct backend) when packed replay is skipped.
-
-    Fires when packing WOULD apply (B > 1) but the attention backend is not a
-    sparse-block kernel, so replay uses the slower padded path instead.
-    """
+    """One-time warning (per distinct backend) when packed replay is skipped."""
     logger.warning(
         "packed-varlen replay disabled: attn_implementation=%r is not a "
         "sparse-block kernel; using the padded replay path. Set "
@@ -60,16 +41,7 @@ def _warn_packed_disabled(attn_impl: str) -> None:
 
 
 def _packed_replay_supported(attn_impl: Optional[str]) -> bool:
-    """Feature-detect the packed varlen replay prerequisites (review #43).
-
-    1. A sparse-block attention backend (flex_attention or flash_attention_2);
-       on plain sdpa packed attention is full O((sum L)^2) and can regress, so
-       require a sparse backend (checked first; warns once on fallback).
-    2. transformers building a block-causal mask from restarting position_ids
-       (masking_utils.find_packed_sequence_indices, transformers >= 4.53); on
-       older versions the forward would silently attend ACROSS sequence
-       boundaries (wrong logps, no error), so fall back to the dense path.
-    """
+    """Feature-detect the packed varlen replay prerequisites (review #43)."""
     if attn_impl not in _SPARSE_PACKED_ATTN:
         _warn_packed_disabled(str(attn_impl))
         return False
@@ -91,16 +63,7 @@ def _replay_aware_forward(
     return_values: bool = False,
     **kw: Any,
 ) -> Any:
-    """Dual-mode ``forward`` installed on the Qwen3 CausalLM instance.
-
-    Without ``response_tokens``: delegate to the stock class forward (decode /
-    generate). With it: run the decoder body only and return the padded
-    ``[B, T_max]`` FP32 per-token log-probs via a chunked
-    ``x[tok] - logsumexp(x)`` over ``lm_head`` — the full ``[B, L, vocab]``
-    logits are never materialized. Running inside ``forward`` keeps replay
-    valid under FSDP2 root wrap: the root pre-forward gathers the leftover
-    embed/norm/lm_head group and does not reshard it after forward.
-    """
+    """Dual-mode ``forward``: padded ``[B, T_max]`` fp32 log-probs, chunked so ``[B, L, vocab]`` never materializes."""
     if response_tokens is None:
         for klass in type(self).__mro__:
             f = klass.__dict__.get("forward")
@@ -219,11 +182,7 @@ def _finalize_replay_output(
 
 @dataclass
 class Qwen3ARParams:
-    """Per-request AR-mode knobs for Qwen3.
-
-    ``stop_token_ids`` is unioned with ``tokenizer.eos_token_id`` inside
-    the stage so callers don't need to repeat the EOS id.
-    """
+    """Per-request AR-mode knobs for Qwen3."""
 
     max_tokens: int = 512
     temperature: float = 0.7
@@ -233,14 +192,7 @@ class Qwen3ARParams:
 
 
 class Qwen3ARStep(ARStep):
-    """Per-token sampling kernel.
-
-    Implements the ``ARStep`` Protocol: given logits over the vocabulary
-    at the current position, sample the next token and return its
-    elementwise log-probability under the *temperature-scaled* full
-    softmax (computed before top-k/top-p truncation), so it matches the
-    replay-time ``log_softmax(logits / T)`` without filter masking.
-    """
+    """Per-token sampling kernel."""
 
     def __init__(
         self,
@@ -288,13 +240,7 @@ class Qwen3ARStep(ARStep):
 
 
 class Qwen3ARStage(ARStage[Qwen3ARConditions]):
-    """Rollout-level AR stage for Qwen3.
-
-    Drives :class:`AutoModelForCausalLM` through
-    ``prepare_inputs_for_generation`` + per-token forward with KV cache,
-    samples via :class:`Qwen3ARStep`, and packs per-sample
-    ``(tokens, log_probs)`` into a varlen :class:`TextSegment`.
-    """
+    """Rollout-level AR stage for Qwen3."""
 
     def __init__(
         self,
@@ -311,13 +257,7 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
             transformer.forward = MethodType(_replay_aware_forward, transformer)
 
     def trainable_module(self) -> "torch.nn.Module":
-        """Return the HF causal LM module — the FSDP/LoRA wrap target.
-
-        Required by the Policy-chain contract (LoRAPolicy / FSDPPolicy
-        call ``source.trainable_module()`` to find the module they wrap).
-        The Qwen3Bundle composes a transformer + tokenizer; the
-        transformer is the only trainable component.
-        """
+        """Return the HF causal LM module — the FSDP/LoRA wrap target."""
         return self.model.transformer
 
     def autoregress(
@@ -415,13 +355,7 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
         temperature: float = 1.0,
         return_values: bool = False,
     ) -> Union[torch.Tensor, ReplayResult]:
-        """Per-token log-prob replay over a stored rollout segment.
-
-        Branch: prefer :meth:`packed_replay` (packed-varlen, zero padding, B > 1)
-        and fall back to :meth:`padding_replay` (the dense ``[B, P_max + T_max]``
-        padded path) when packing does not apply. Returns packed varlen log-probs,
-        or a :class:`ReplayResult` with aligned critic values when requested.
-        """
+        """Per-token log-prob replay; falls back to the dense ``[B, P_max + T_max]`` :meth:`padding_replay`."""
         _require_value_head_for_replay(self.model.transformer, return_values)
         attn_impl = getattr(getattr(self.model.transformer, "config", None), "_attn_implementation", None)
         if _packed_replay_supported(attn_impl):
@@ -448,19 +382,7 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
         temperature: float = 1.0,
         return_values: bool = False,
     ) -> Optional[Union[torch.Tensor, ReplayResult]]:
-        """Packed-varlen replay (B > 1): zero padding anywhere.
-
-        Concatenate every sample's REAL prompt tokens + its flat response tokens
-        into ONE row; position_ids restart at 0 per sequence, and with
-        ``attention_mask=None`` transformers' masking_utils detects the packed
-        layout from the restarting positions and builds the block-causal mask
-        (verl remove_padding equivalence). Per-sequence RoPE positions equal the
-        standalone layout, so logp semantics match :meth:`padding_replay`.
-        Returns ``None`` (→ padding fallback) when packing does not apply or
-        would not pay: single sample, no per-sample lengths, no packed-mask
-        support (:func:`_packed_replay_supported`), or no sparse-block attention
-        kernel in use (only flex_attention / flash_attention_2 make packed a win).
-        """
+        """Packed-varlen replay (B > 1): zero padding anywhere."""
         if conditions.prompt is None or conditions.prompt.input_ids is None or conditions.prompt.attention_mask is None:
             return None
         if segment.tokens is None or segment.cu_seqlens is None or segment.lengths is None:
@@ -533,13 +455,7 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
         temperature: float = 1.0,
         return_values: bool = False,
     ) -> Union[torch.Tensor, ReplayResult]:
-        """Dense ``[B, P_max + T_max]`` padded replay — the default / fallback path.
-
-        One teacher-forced forward over padded ``prompt + response``; gather
-        log-probs at the predicting positions per response token; return packed
-        varlen ``[total_tokens]``. ``temperature`` divides logits before
-        ``log_softmax`` to match SGLang's sampler (``1.0`` is a no-op).
-        """
+        """Dense ``[B, P_max + T_max]`` padded replay — the default / fallback path."""
         if conditions.prompt is None or conditions.prompt.input_ids is None:
             raise ValueError("Qwen3ARStage.replay: conditions.prompt.input_ids is None")
         if conditions.prompt.attention_mask is None:

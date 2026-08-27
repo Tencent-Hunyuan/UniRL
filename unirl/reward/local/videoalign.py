@@ -1,8 +1,4 @@
-"""VideoAlign reward scorer — self-contained, no fastvideo dependency.
-
-Implements the Qwen2-VL-based VideoAlign reward model from DanceGRPO.
-All inference logic is inlined to avoid external `fastvideo` imports.
-"""
+"""VideoAlign reward scorer — self-contained, no fastvideo dependency."""
 
 from __future__ import annotations
 
@@ -31,11 +27,7 @@ logger = logging.getLogger(__name__)
 
 
 def _as_tensor(x):
-    """Coerce a vision-tower output to a tensor.
-
-    Older transformers return the visual embeds tensor directly; newer
-    versions wrap them in a model-output object (e.g. ``BaseModelOutputWithPooling``).
-    """
+    """Coerce a vision-tower output to a tensor."""
     if isinstance(x, torch.Tensor):
         return x
     for attr in ("last_hidden_state", "image_embeds", "video_embeds", "pooler_output"):
@@ -63,11 +55,7 @@ _SIMPLE_PROMPT = (
 
 
 def _build_prompt(prompt: str, dimension, template_type: str) -> str:
-    """Build an eval prompt, safely inserting the user-supplied text prompt.
-
-    Uses ``str.replace`` for the user prompt so that literal curly braces
-    (e.g. ``{foo}``) in the prompt text do not crash ``str.format()``.
-    """
+    """Build an eval prompt, safely inserting the user-supplied text prompt."""
     if template_type == "detailed_special":
         return _DETAILED_PROMPT_WITH_SPECIAL_TOKEN.replace("{text_prompt}", prompt)
     if isinstance(dimension, list) and len(dimension) > 1:
@@ -124,11 +112,7 @@ def _resize_video_to_view(
     target_size: int,
     factor: int = IMAGE_FACTOR,
 ) -> torch.Tensor:
-    """Resize the input video so its frames match target_size on the shortest edge.
-
-    The view_grid is ``(n_frames, grid_t)`` — only the frames in the first
-    temporal position of each row are resized, the others are discarded.
-    """
+    """Resize the input video so its frames match target_size on the shortest edge."""
     from torchvision.transforms.v2 import functional as F
 
     _, total_frames, h, w = video.shape
@@ -149,8 +133,7 @@ def _resize_video_to_view(
 
 
 def _reshape_by_grid(video: torch.Tensor, view_grid: Tuple[int, int]) -> torch.Tensor:
-    """Reshape into (grid_t * H, grid_h * W) by slicing frames from the
-    first temporal position of each row."""
+    """Reshape into (grid_t * H, grid_h * W) by slicing frames from the"""
     total_frames, h, w = video.shape[1:]
     n_frames, grid_t = view_grid
 
@@ -186,10 +169,7 @@ def _get_rope_index_modified(
 def _process_vision_info(
     conversations: List[List[Dict[str, Any]]],
 ) -> Tuple[List[Any], List[Any]]:
-    """Extract image/video data and build pixel/video lists for Qwen-VL.
-
-    Returns ``(images_list, videos_list)`` compatible with the Qwen2-VL processor.
-    """
+    """Extract image/video data and build pixel/video lists for Qwen-VL."""
     from qwen_vl_utils import process_vision_info
 
     return process_vision_info(conversations)
@@ -708,12 +688,7 @@ class VideoAlignRewardScorer(LocalRewardBackend):
 
 
 def _export_tensor_video(video: torch.Tensor, path: str) -> None:
-    """Write a decoded video tensor to mp4.
-
-    Accepts the tensor in either [T, C, H, W] (canonical ``Video.frames``) or
-    [C, T, H, W] (the layout produced by ``RewardRequest.videos``) and converts
-    to [T, H, W, C] for export.
-    """
+    """Write a decoded video tensor to mp4."""
     from diffusers.utils import export_to_video
 
     video = video.detach().cpu()

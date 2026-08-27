@@ -1,55 +1,4 @@
-"""Field-metadata-driven batch container with automatic concat/select/slice.
-
-Annotate dataclass fields with one of the field-kind constructors and the
-``Batch`` base class provides generic implementations of concat, select,
-slice, to_device, and clone that dispatch on the field kind and value type.
-
-Field kinds:
-  - ``concat_field()`` — per-sample, batch-aligned; concatenated along dim 0.
-  - ``packed_field()`` — per-sample variable-length data packed along dim 0.
-    Per-sample sizes (``cu_seqlens``) are framework-managed metadata, hidden
-    on the instance; the user constructs via ``Cls.pack(field=[t0, t1, t2])``
-    passing per-sample tensor lists.
-  - ``shared_field()`` — identical across samples; first value taken on concat.
-  - ``max_field()`` / ``min_field()`` / ``sum_field()`` / ``mean_field()`` —
-    scalar or same-shape-across-instances; reduced across instances on concat
-    using the named reduction. Like ``shared_field`` these are not batch-
-    aligned and pass through ``select`` / ``slice`` untouched.
-
-Supported value types for concat fields:
-  - ``torch.Tensor`` with batch dim at axis 0
-  - ``list`` or ``tuple`` with ``len == batch_size``
-  - ``dict`` containing tensors / lists / nested dicts (recursive)
-  - Nested ``Batch`` instances
-  - ``None`` (optional fields)
-
-Example::
-
-    @dataclass
-    class MyBatch(Batch):
-        data: torch.Tensor = concat_field()
-        labels: List[str] = concat_field(default_factory=list)
-        schedule: torch.Tensor = shared_field()
-        config: str = shared_field(default="default")
-        wall_clock: float = max_field(default=0.0)
-
-Packed-varlen example (``cu_seqlens`` is implicit, never declared)::
-
-    @dataclass
-    class MyPackedBatch(Batch):
-        tokens: Optional[torch.Tensor] = packed_field(default=None)     # [total]
-        log_probs: Optional[torch.Tensor] = packed_field(default=None)  # [total]
-        sample_indices: Optional[torch.Tensor] = concat_field(default=None)  # [N]
-
-    seg = MyPackedBatch.pack(
-        tokens=[t0, t1, t2],            # framework packs and tracks cu_seqlens
-        log_probs=[lp0, lp1, lp2],      # same per-sample sizes as tokens
-        sample_indices=torch.arange(3),
-    )
-    seg.cu_seqlens   # [N+1] cumulative offsets, framework-managed
-    seg.lengths      # [N] per-sample sizes (derived)
-    seg.slice(0, 2)  # auto-slices both data and cu_seqlens
-"""
+"""Field-metadata-driven batch container with automatic concat/select/slice."""
 
 from __future__ import annotations
 
@@ -94,20 +43,7 @@ _DC_FIELD_PARAMS = frozenset(_inspect.signature(_dc_field).parameters)
 
 
 def field(**kwargs: Any) -> Any:
-    """Generic field constructor with open metadata.
-
-    Kwargs matching ``dataclasses.field`` parameters (``default``,
-    ``default_factory``, ``init``, ``repr``, ``compare``, ``hash``,
-    ``metadata``, ``kw_only``) pass through to the underlying call.
-    Any other kwarg becomes an entry in the field's ``metadata`` dict.
-
-    Consumers (``Batch``, ``TensorTransport``, …) read the metadata keys
-    they recognize. Adding a new behavior axis is just a new kwarg + a
-    consumer that reads its key — no proliferation of ``*_field`` helpers.
-
-    This shadows ``dataclasses.field`` in this module's namespace; callers
-    that want the stdlib version should import it as ``dc_field``.
-    """
+    """Generic field constructor with open metadata."""
     metadata = dict(kwargs.pop("metadata", None) or {})
     dc_kwargs: Dict[str, Any] = {}
     for k, v in kwargs.items():
@@ -126,24 +62,7 @@ def concat_field(**kwargs: Any) -> Any:
 
 
 def packed_field(**kwargs: Any) -> Any:
-    """Declare a per-sample variable-length field packed along dim 0.
-
-    The field's stored value is a packed ``torch.Tensor`` of shape
-    ``[total, ...]`` where ``total = sum(per_sample_sizes)``. The framework
-    auto-derives and tracks the cumulative offsets (``cu_seqlens``) as
-    hidden instance state on the ``Batch`` container — the user neither
-    declares a sibling cu_seqlens field nor sets one explicitly.
-
-    User-facing construction is via :meth:`Batch.pack`: pass a
-    ``Sequence[Tensor]`` of per-sample tensors and it packs them while computing
-    cu_seqlens. The regular dataclass constructor is reserved for already-packed
-    internal values whose cu_seqlens are attached by framework operations.
-    Multiple packed fields must agree on per-sample sizes.
-
-    See :class:`Batch` for the auto-pack / propagation contract and
-    :attr:`Batch.cu_seqlens` / :attr:`Batch.lengths` for read access
-    to the metadata.
-    """
+    """Declare a per-sample variable-length field packed along dim 0."""
     metadata = dict(kwargs.pop("metadata", None) or {})
     metadata[_FIELD_KIND_KEY] = FieldKind.PACKED
     return _dc_field(metadata=metadata, **kwargs)
@@ -397,12 +316,7 @@ def _clone_value(value: Any) -> Any:
 
 
 def _concat_cu_seqlens(cus: List[Optional[torch.Tensor]]) -> Optional[torch.Tensor]:
-    """Merge per-shard cu_seqlens with offset shift.
-
-    Shard 0 is taken as-is. Each subsequent shard contributes ``cu[1:] +
-    running_total`` (drop its leading 0, shift by the running total). The
-    result is a single ``[sum_N + 1]`` cu_seqlens tensor.
-    """
+    """Merge per-shard cu_seqlens with offset shift."""
     non_none = [c for c in cus if c is not None]
     if not non_none:
         return None
@@ -415,11 +329,7 @@ def _concat_cu_seqlens(cus: List[Optional[torch.Tensor]]) -> Optional[torch.Tens
 
 
 def _slice_cu_seqlens(cu: torch.Tensor, start: int, end: int) -> torch.Tensor:
-    """Slice cu_seqlens for samples ``[start, end)`` and re-zero.
-
-    Returns a ``[end - start + 1]`` tensor whose first entry is 0.
-    Empty range (start == end) returns ``[0]``.
-    """
+    """Slice cu_seqlens for samples ``[start, end)`` and re-zero."""
     sliced = cu[start : end + 1]
     if sliced.numel() == 0:
         return torch.zeros(1, dtype=cu.dtype, device=cu.device)
@@ -427,11 +337,7 @@ def _slice_cu_seqlens(cu: torch.Tensor, start: int, end: int) -> torch.Tensor:
 
 
 def _select_cu_seqlens(cu: torch.Tensor, indices: List[int]) -> torch.Tensor:
-    """Rebuild cu_seqlens from selected sample sizes.
-
-    Result starts at 0 and accumulates ``cu[i+1] - cu[i]`` for each
-    requested index.
-    """
+    """Rebuild cu_seqlens from selected sample sizes."""
     sizes = [int(cu[i + 1].item() - cu[i].item()) for i in indices]
     cu_list = [0]
     for s in sizes:
@@ -531,24 +437,7 @@ def _repeat_interleave_cu_seqlens(cu: torch.Tensor, n: int) -> torch.Tensor:
 
 
 class Batch:
-    """Mixin / base for ``@dataclass`` containers with concat/shared fields.
-
-    Subclasses must be ``@dataclass``es whose fields are annotated with
-    ``concat_field()``, ``packed_field()``, ``shared_field()``, or one of
-    the reduction-kind constructors.  Fields without annotation are treated
-    as shared.
-
-    ``batch_size`` is inferred from the first non-None concat field, or
-    from ``len(_packed_cu_seqlens) - 1`` if the dataclass uses packed
-    fields.
-
-    Packed fields use a framework-managed ``cu_seqlens`` metadata stored
-    as a hidden instance attribute.  User code constructs instances with
-    packed fields via :meth:`pack` (passing per-sample tensor lists);
-    ``concat`` / ``slice`` / ``select`` propagate cu_seqlens through ops.
-    Read access is via the :attr:`cu_seqlens` and :attr:`lengths`
-    properties; there is no setter and no constructor argument.
-    """
+    """Mixin / base for ``@dataclass`` containers with concat/shared fields."""
 
     _packed_cu_seqlens: Optional[torch.Tensor] = None
 
@@ -563,10 +452,7 @@ class Batch:
 
     @property
     def cu_seqlens(self) -> Optional[torch.Tensor]:
-        """Framework-managed cumulative offsets ``[N+1]`` for packed fields.
-
-        ``None`` when the instance has no populated packed fields.
-        """
+        """Framework-managed cumulative offsets ``[N+1]`` for packed fields."""
         return self._packed_cu_seqlens
 
     @property
@@ -592,23 +478,7 @@ class Batch:
 
     @classmethod
     def pack(cls: Type[T], **kwargs: Any) -> T:
-        """Construct ``cls``, packing per-sample tensor lists for ``packed_field``s.
-
-        The user-facing canonical constructor for instances with packed fields.
-        For each ``packed_field`` whose kwarg value is a ``Sequence[Tensor]``,
-        ``torch.cat`` along dim 0 to produce the packed tensor and record per-
-        sample sizes. All populated packed fields must agree on per-sample
-        sizes (else raise). Then build the instance via ``cls(**packed_kwargs)``
-        and attach ``_packed_cu_seqlens`` derived from the recorded sizes.
-
-        Non-``packed_field`` kwargs pass through unchanged. ``None`` is a
-        valid value for any packed field — that field stays empty and
-        contributes no sizes.
-
-        Already-packed tensors are rejected with a clear error directing the
-        caller to the regular ``cls(...)`` constructor (intended for tests
-        and adapter code).
-        """
+        """Construct ``cls``, packing per-sample tensor lists for ``packed_field``s."""
         sizes: Optional[List[int]] = None
         packed_kwargs: Dict[str, Any] = dict(kwargs)
         for f in dc_fields(cls):  # type: ignore[arg-type]
@@ -695,14 +565,7 @@ class Batch:
         return type(self).concat([self, *others])
 
     def chunk(self: T, n: int) -> List[T]:
-        """Split into ``n`` equal contiguous shards along the batch dimension.
-
-        Inverse of :meth:`concat`. Requires ``batch_size`` to be divisible by
-        ``n``. Each shard is produced via :meth:`slice`, so field-kind
-        semantics (CONCAT sliced, PACKED sliced via cu_seqlens, SHARED /
-        reduction fields passed through untouched) and ``cu_seqlens``
-        propagation are handled correctly.
-        """
+        """Split into ``n`` equal contiguous shards along the batch dimension."""
         if n <= 0:
             raise ValueError(f"chunk: n must be positive, got {n}")
         bs = self.batch_size
@@ -761,22 +624,7 @@ class Batch:
         return instance
 
     def repeat_interleave(self: T, n: int) -> T:
-        """Replicate each sample ``n`` times along the batch dimension (group-by-parent).
-
-        For each ``CONCAT`` field, applies ``torch.repeat_interleave(t, n,
-        dim=0)`` to tensors and equivalent list-replication to lists/dicts.
-        Recurses into nested ``Batch`` values. ``SHARED`` and reduction-kind
-        fields are untouched (their semantics are batch-shared metadata, which
-        stays identical across replicated samples).
-
-        For ``PACKED`` fields, each per-sample chunk is duplicated ``n`` times
-        along dim 0 in group-by-parent order (parent-0 children contiguous,
-        then parent-1, …) and ``cu_seqlens`` is rebuilt to reflect the
-        expanded chunk count. Mirrors the ``select`` / ``slice`` walker
-        pattern.
-
-        ``n == 1`` clones; ``n == 0`` returns an empty container.
-        """
+        """Replicate each sample ``n`` times along the batch dimension (group-by-parent)."""
         if n < 0:
             raise ValueError(f"repeat_interleave: n must be non-negative, got {n}")
         if n == 1:
@@ -823,34 +671,14 @@ class Batch:
         return instance
 
     def map(self: T, fn: Callable[[Any], Any]) -> T:
-        """Rebuild a same-type instance by applying ``fn`` to each field value.
-
-        A structure-preserving map: ``fn`` transforms each field's value (the
-        caller drives any recursion into nested containers), and the rebuilt
-        instance carries over framework-managed instance metadata
-        (``_packed_cu_seqlens``) that the dataclass constructor never sees.
-
-        Use for representation-only leaf transforms that do not change the
-        batch dimension or per-sample lengths (e.g. swapping tensors for remote
-        handles). For batch-dimension changes use :meth:`slice` / :meth:`chunk`
-        / :meth:`select` instead, which recompute ``cu_seqlens``.
-        """
+        """Rebuild a same-type instance by applying ``fn`` to each field value."""
         instance = type(self)(**{f.name: fn(getattr(self, f.name)) for f in dc_fields(self)})
         if self._packed_cu_seqlens is not None:
             object.__setattr__(instance, "_packed_cu_seqlens", self._packed_cu_seqlens)
         return instance
 
     def _rebuild(self: T, field_values: Dict[str, Any]) -> T:
-        """Reconstruct from precomputed field values, preserving hidden state.
-
-        The precomputed-values sibling of :meth:`map` (which takes a per-field
-        ``fn``). For the generic transport-layer tree-walkers that rebuild a
-        ``Batch`` from already-transformed field values — TensorRef<->Tensor
-        swaps and ref rerouting, representation-only changes that don't alter the
-        batch dimension or per-sample lengths — so the framework-managed
-        ``_packed_cu_seqlens`` carries over unchanged. Without this carry, those
-        walkers silently drop it (the plain constructor never sees it).
-        """
+        """Reconstruct from precomputed field values, preserving hidden state."""
         instance = type(self)(**field_values)
         if self._packed_cu_seqlens is not None:
             object.__setattr__(instance, "_packed_cu_seqlens", self._packed_cu_seqlens)

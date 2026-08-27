@@ -1,20 +1,4 @@
-"""REFLTrainer — recipe driver for WAN REFL/BPTT (video reward backprop).
-
-Two roles, always — a :class:`experimental.refl.roles.ReflActorRole` (FSDP WAN +
-grad BPTT sampling + optimizer) and a frozen differentiable video reward
-(:class:`unirl.reward.service.RewardService`), colocated on the same worker
-slab so decoded video never leaves the GPU. Each step runs, under the
-distributed ``enable_grad()`` context::
-
-    gen = actor.generate_samples(texts, images, params)   # grad through BPTT window + VAE
-    rew = reward.score_differentiable(gen.decoded, prompts, records)
-    actor.forward_backward_loss(rewards=rew, kl_loss=gen.kl_loss)
-    # ctx exit → grads route reward → decode → DiT LoRA params
-    actor.step(max_grad_norm)
-
-No advantages / replay / ratio / rollout-engine / weight-sync — REFL is not a
-PG-RL loop. Success signal: the reward curve rises.
-"""
+"""REFLTrainer — recipe driver for WAN REFL/BPTT (video reward backprop)."""
 
 from __future__ import annotations
 
@@ -29,10 +13,10 @@ from omegaconf import DictConfig
 from unirl.distributed.group.placement import placement
 from unirl.distributed.tensor.grad_context import enable_grad
 from unirl.trainer.base import BaseTrainer, build_sampling_dict
+from unirl.trainer.hydra import remote_hydra
 from unirl.types.primitives import Images, Texts
 from unirl.types.sample import Sample
 from unirl.types.sampling import DiffusionSamplingParams, total_samples_per_prompt
-from unirl.utils.hydra import remote_hydra
 
 logger = logging.getLogger(__name__)
 

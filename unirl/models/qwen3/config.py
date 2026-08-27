@@ -1,18 +1,4 @@
-"""Construction config for the typed Qwen3 AR pipeline.
-
-Sibling of :class:`unirl.models.qwen_image.QwenImagePipelineConfig`
-and :class:`unirl.models.hunyuan_image3.HunyuanImage3PipelineConfig`.
-Carries weights+precision knobs only; LoRA injection, FSDP wrapping,
-gradient checkpointing, and offload control all live in
-``cfg.training.policies`` (``LoRAPolicy`` / ``FSDPPolicy``) — the bundle
-is weights+params only.
-
-Qwen3 is a pure causal LM (no diffusion / VAE / scheduler), so there is
-no ``shift`` / ``vae_dtype`` / ``text_encoder_*`` / ``dynamic_shift_*``
-field — the hosting engine's :func:`ensure_sample_sigmas` is a no-op for
-AR-only pipelines because :class:`Qwen3Pipeline.generate` never reads
-diffusion ``sampling_params.sigmas``.
-"""
+"""Construction config for the typed Qwen3 AR pipeline."""
 
 from __future__ import annotations
 
@@ -24,12 +10,7 @@ from unirl.config.validation import validate_precision_type
 
 @dataclass
 class Qwen3PipelineConfig:
-    """Construction args for ``Qwen3Pipeline.from_config``.
-
-    ``device`` may be runtime-injected by the actor after compose; the
-    other fields are set at compose time and read once during pipeline
-    construction.
-    """
+    """Construction args for ``Qwen3Pipeline.from_config``."""
 
     pretrained_model_ckpt_path: str
     tokenizer_ckpt_path: Optional[str] = None
@@ -47,8 +28,6 @@ class Qwen3PipelineConfig:
     weight_sync_param_name_prefix: str = "transformer."
 
     meta_init_transformer: bool = False
-
-    lora_materialization: str = "merged_dense"
 
     use_lora: bool = False
     lora_target_modules: Optional[List[str]] = None

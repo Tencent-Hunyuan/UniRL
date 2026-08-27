@@ -1,29 +1,4 @@
-"""Bagel AR (text-out) stage: typed params + per-token kernel + rollout-level stage.
-
-Serves t2t / i2t / it2t — the conditions' ordered prompt splits decide what the
-context contains; the stage is split-agnostic. Three classes:
-
-- ``BagelARParams`` — request-shape knobs beyond ``ARSamplingParams``
-  (extra ``stop_token_ids``; mirrors ``Qwen3ARParams``).
-- ``BagelARStep`` — per-token sampling kernel (full-softmax log-prob captured
-  BEFORE top-k/top-p truncation, matching replay's untempered convention;
-  verbatim ``Qwen3ARStep`` mechanics).
-- ``BagelARStage`` — implements ``ARStage[BagelARConditions]``. Per sample
-  (navit bs=1): prefill the KV context from the RAW prompt splits via the
-  ``rl_ops`` adapters, then per-token decode (``rl_ops.decode_text``) for
-  rollout, or one teacher-forced grad-capable pass (``rl_ops.score_response``)
-  for replay. Rollout and replay derive the context from the SAME stored splits
-  through the SAME prefill code → prefix K/V parity by construction.
-
-Replay regime: eval() mode with grads enabled (the navit modules dispatch
-``forward_train``/``forward_inference`` on ``self.training``) — identical to
-``BagelDiffusionStage.replay``. The caller owns the grad scope; the stage owns
-only the autocast scope.
-
-This module deliberately avoids importing the vendored modeling (and its hard
-``flash_attn`` dependency) at module load — it reaches the model through the
-bundle instance at call time — so ``import unirl.models.bagel`` stays CPU-clean.
-"""
+"""Bagel AR (text-out) stage: typed params + per-token kernel + rollout-level stage."""
 
 from __future__ import annotations
 
@@ -50,25 +25,13 @@ if TYPE_CHECKING:
 
 @dataclass
 class BagelARParams:
-    """Per-request AR-mode knobs for Bagel.
-
-    ``stop_token_ids`` is unioned with ``new_token_ids['eos_token_id']``
-    (``<|im_end|>``) inside the stage so callers don't repeat the EOS id; the
-    sampling shape (temperature / top_p / top_k / max_new_tokens) rides the
-    shared :class:`ARSamplingParams`.
-    """
+    """Per-request AR-mode knobs for Bagel."""
 
     stop_token_ids: List[int] = dc_field(default_factory=list)
 
 
 class BagelARStep(ARStep):
-    """Per-token sampling kernel (``Qwen3ARStep`` mechanics).
-
-    Given logits over the vocabulary at the current position, sample the next
-    token and return its log-probability under the *temperature-scaled* full
-    softmax computed BEFORE top-k/top-p truncation, so it matches replay's
-    ``log_softmax(logits / T)`` without filter masking.
-    """
+    """Per-token sampling kernel (``Qwen3ARStep`` mechanics)."""
 
     def __init__(self, *, temperature: float = 1.0, top_p: float = 1.0, top_k: int = 0) -> None:
         self.temperature = float(temperature)
@@ -109,13 +72,7 @@ class BagelARStep(ARStep):
 
 
 class BagelARStage(ARStage[BagelARConditions]):
-    """Rollout-level AR stage for Bagel (t2t / i2t / it2t).
-
-    Drives the MoT und path through the ``rl_ops`` navit adapters: per-sample
-    context prefill from raw splits, per-token decode with KV cache (rollout),
-    one-shot teacher-forced scoring (replay). Packs per-sample ``(tokens,
-    log_probs)`` into a varlen :class:`TextSegment`.
-    """
+    """Rollout-level AR stage for Bagel (t2t / i2t / it2t)."""
 
     def __init__(
         self,
@@ -140,8 +97,7 @@ class BagelARStage(ARStage[BagelARConditions]):
         )
 
     def trainable_module(self) -> "torch.nn.Module":
-        """The MoT transformer (``bundle.transformer``) — same root the diffusion
-        stage exposes, so LoRA/FSDP injection is visible to both stages."""
+        """The MoT transformer — the same root the diffusion stage exposes, so LoRA/FSDP is visible to both stages."""
         return self.model.transformer
 
     def _autocast_ctx(self, device: torch.device):
@@ -150,12 +106,7 @@ class BagelARStage(ARStage[BagelARConditions]):
         return nullcontext()
 
     def _prefill(self, splits: List[Dict[str, Any]], *, device: torch.device) -> Dict[str, Any]:
-        """Build a fresh KV context from ordered raw splits (rollout AND replay).
-
-        Grad behavior follows the ambient mode: under the rollout ``no_grad`` the
-        prefill is grad-free; under replay's ``enable_grad`` it carries gradients
-        (the und path is the trained surface — see ``BagelARConditions``).
-        """
+        """Build a fresh KV context from ordered raw splits (rollout AND replay)."""
         bagel = self.model.model
         ctx = rl_ops.init_und_context(bagel)
         for sp in splits:
@@ -224,20 +175,18 @@ class BagelARStage(ARStage[BagelARConditions]):
         )
 
     @staticmethod
-    def _split_image_and_prompt_ids(splits: List[Dict[str, Any]]) -> Tuple[Optional[Any], List[int]]:
-        """From a sample's ordered splits, pull the (single) ViT image tensor and the
-        concatenated prompt token ids (already ``[bos]+enc+[eos]`` wrapped)."""
-        image: Optional[Any] = None
-        prompt_ids: List[int] = []
-        for sp in splits:
-            kind = sp.get("kind")
-            if kind == "vit":
-                image = sp["image"]
-            elif kind == "text":
-                prompt_ids.extend(int(t) for t in sp["ids"].tolist())
-            else:
-                raise ValueError(f"BagelARStage.replay: unknown split kind {kind!r}.")
-        return image, prompt_ids
+    def _split_context_and_trailing_text(
+        splits: List[Dict[str, Any]],
+    ) -> Tuple[List[Dict[str, Any]], List[int]]:
+        """Ordered splits → (context splits, concatenated trailing-text ids)."""
+        cut = len(splits)
+        while cut > 0 and splits[cut - 1].get("kind") == "text":
+            cut -= 1
+        for sp in splits[:cut]:
+            if sp.get("kind") not in ("text", "vit"):
+                raise ValueError(f"BagelARStage.replay: unknown split kind {sp.get('kind')!r}.")
+        trailing_ids = [int(t) for sp in splits[cut:] for t in sp["ids"].tolist()]
+        return splits[:cut], trailing_ids
 
     def replay(
         self,
@@ -246,19 +195,7 @@ class BagelARStage(ARStage[BagelARConditions]):
         segment: TextSegment,
         temperature: float = 1.0,
     ) -> torch.Tensor:
-        """Per-token grad-capable log-prob replay (``new_logp``) over a stored segment.
-
-        Dispatches on ``self.replay_mode``: ``"train"`` (one grad
-        ``forward_train`` per sample, image+text trained, nested mask) or
-        ``"inference"`` (no_grad frozen-image prefill + one grad
-        ``forward_inference`` over ``[prompt+response]``, kernel-matched to rollout).
-        Returns packed varlen ``[total_tokens]`` aligned with ``segment.log_probs``.
-        Each mode sets the language-model train/eval mode it needs and does NOT
-        restore it: the navit dispatch (and activation-checkpoint recompute in
-        backward) reads ``self.training``, so the mode must persist through the
-        caller's ``backward()``; the rollout engine re-sets eval() around every
-        ``generate``. Empty-response samples contribute zero tokens.
-        """
+        """Grad-capable log-prob replay, packed varlen ``[total_tokens]`` aligned with ``segment.log_probs``."""
         if segment.tokens is None or segment.cu_seqlens is None or segment.lengths is None:
             raise ValueError(
                 "BagelARStage.replay: segment requires tokens with framework-managed "
@@ -309,10 +246,7 @@ class BagelARStage(ARStage[BagelARConditions]):
         temperature: float,
         device: torch.device,
     ) -> List[torch.Tensor]:
-        """Train-mode replay: one grad ``forward_train`` per sample over ``[image | prompt |
-        response_input]`` with the image-full/text-causal nested mask. Trains the und
-        path including the image. forward_train ≠ rollout's forward_inference, so the
-        on-policy ratio carries a ~1e-2 kernel gap (see the recipe note)."""
+        """Train-mode replay: one grad ``forward_train`` per sample over the ordered prompt splits + response."""
         bagel = self.model.model
         new_token_ids = self.model.new_token_ids
         temp = float(temperature) if float(temperature) > 0.0 else 1.0
@@ -324,15 +258,13 @@ class BagelARStage(ARStage[BagelARConditions]):
                 if n == 0:
                     continue
                 response = segment.tokens[cu[i] : cu[i] + n].to(device=device, dtype=torch.long)
-                image, prompt_ids = self._split_image_and_prompt_ids(splits)
                 response_input = torch.cat(
                     [torch.tensor([start_id], device=device, dtype=torch.long), response[:-1]], dim=0
                 )
                 packed = rl_ops.pack_und_forward_inputs(
                     bagel,
                     new_token_ids=new_token_ids,
-                    prompt_ids=prompt_ids,
-                    image=image,
+                    splits=splits,
                     response_input=response_input,
                     device=device,
                 )
@@ -352,9 +284,7 @@ class BagelARStage(ARStage[BagelARConditions]):
         temperature: float,
         device: torch.device,
     ) -> List[torch.Tensor]:
-        """Inference-mode replay: image prefilled under no_grad (frozen), then one grad
-        ``forward_inference`` over ``[prompt+response]``. Kernel-matched to rollout
-        (ratio ~1), FSDP-safe (single grad forward), image not trained."""
+        """Inference-mode replay: context prefilled under no_grad, then one grad ``forward_inference`` over the tail."""
         bagel = self.model.model
         bagel.language_model.eval()
         rl_ops.require_inference_dispatch(bagel)
@@ -365,18 +295,14 @@ class BagelARStage(ARStage[BagelARConditions]):
                 if n == 0:
                     continue
                 response = segment.tokens[cu[i] : cu[i] + n]
-                image, prompt_ids = self._split_image_and_prompt_ids(splits)
+                context_splits, trailing_ids = self._split_context_and_trailing_text(splits)
                 with torch.no_grad():
-                    ctx = rl_ops.init_und_context(bagel)
-                    if image is not None:
-                        ctx = rl_ops.prefill_vit_split(
-                            bagel, ctx, image_tensor=image, new_token_ids=self.model.new_token_ids, device=device
-                        )
+                    ctx = self._prefill(context_splits, device=device)
                 parts.append(
                     rl_ops.score_response_with_prompt(
                         bagel,
                         ctx,
-                        prompt_ids=torch.tensor(prompt_ids, dtype=torch.long, device=device),
+                        prompt_ids=torch.tensor(trailing_ids, dtype=torch.long, device=device),
                         response_ids=response,
                         start_token_id=start_id,
                         temperature=float(temperature),

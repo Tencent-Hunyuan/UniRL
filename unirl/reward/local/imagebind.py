@@ -1,17 +1,4 @@
-"""Audio-video / audio-text semantic alignment reward using Meta ImageBind.
-
-Mirrors Flow-Factory's ImageBind reward. Used for LTX-2.3 T2AV where the reward
-service injects the jointly-generated audio into ``request.generated["audio"]``
-alongside the video in ``request.generated["video"]``.
-
-IMPORTANT: ImageBind is licensed under CC-BY-NC-SA 4.0 (NonCommercial). The
-package is NOT a base dependency — it is imported lazily inside ``_load_model``
-so the scorer only pulls it in when a recipe explicitly selects ``imagebind``.
-Install with::
-
-    pip install git+https://github.com/facebookresearch/ImageBind.git
-    pip install git+https://github.com/facebookresearch/pytorchvideo.git
-"""
+"""Audio-video / audio-text semantic alignment reward using Meta ImageBind."""
 
 from __future__ import annotations
 
@@ -54,19 +41,7 @@ _IB_VISION_STD = (0.26862954, 0.26130258, 0.27577711)
 
 
 class ImageBindRewardScorer(LocalRewardBackend):
-    """Audio-video / audio-text alignment reward using Meta ImageBind.
-
-    Modes (``mode`` on the Spec):
-        - "audio_video" (default): cos_sim(audio, video)
-        - "text_audio":            cos_sim(text, audio)
-        - "text_video":            cos_sim(text, video)
-        - "all":                   weighted sum of all three
-
-    ``input_kind = "video"``: video is the primary decoded media; audio arrives
-    as the parallel side-channel (``request.generated["audio"]``).
-
-    IMPORTANT: ImageBind is CC-BY-NC-SA 4.0 (NonCommercial).
-    """
+    """Audio-video / audio-text alignment reward using Meta ImageBind."""
 
     canonical_model_name = "imagebind"
     input_kind = "video"

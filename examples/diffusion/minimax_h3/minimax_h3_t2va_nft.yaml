@@ -205,6 +205,6 @@ sampling:
     # num_sde_steps: 0 IS the forward-process switch, with eta: 0.0 above — it
     # makes resolve_sde_indices return [], read as "pure ODE, record no
     # log-probs", and makes the stage store only the terminal clean latent.
-    _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+    _target_: unirl.sde.index_schedule.AllSDEScheduler
     num_timesteps: ${..num_inference_steps}
     num_sde_steps: 0

@@ -1,21 +1,4 @@
-"""it2i — image-edit (text + cond image conditioning, image output).
-
-Reads ``primitives["text"]: Texts`` + ``primitives["image"]: Images``
-(the source image to edit) and
-``stage_params["diffusion"]: dict``.
-Encodes the source image via the upstream
-``HunyuanImage3VitEncodeStage.encode_for_cond_vit`` (image_processor)
-and the model's own ``_encode_cond_image`` for VAE latents, builds the
-chat-templated unified-MM tensors with cond-image markers, then runs
-the diffusion stage and VAE-decodes the output.
-
-The unified-MM forward consumes the cond_* tensors on the first
-diffusion step to scatter VAE latents and ViT features at their pinned
-slots in ``inputs_embeds`` (mirroring upstream
-``HunyuanImage3ForCausalMM.forward(mode="gen_image")`` at
-``hunyuan.py:1991-2017``); subsequent steps reuse the cached K/V at
-those slots via the ``HunyuanStaticCache``.
-"""
+"""it2i — image-edit (text + cond image conditioning, image output)."""
 
 from __future__ import annotations
 
@@ -68,11 +51,7 @@ def _encode_cond_images(
     batch_cond_images,
     generators: Optional[List[torch.Generator]],
 ):
-    """Encode every source image with the matching per-sample VAE RNG.
-
-    Always return list-backed per-sample payloads so DP concat never mixes
-    dense tensors from uniform local shards with ragged lists from mixed ones.
-    """
+    """Encode every source image with the matching per-sample VAE RNG."""
 
     def _as_sample_batches(value):
         return list(value.split(1, dim=0)) if isinstance(value, torch.Tensor) else list(value)

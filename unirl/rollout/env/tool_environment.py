@@ -1,17 +1,4 @@
-"""ToolEnvironment — the first concrete agent-loop :class:`Environment` (LIN-492).
-
-Turns the policy's ``<tool_call>{...}</tool_call>`` into a tool execution and feeds the result
-back as the next turn's observation, ending the episode when the model stops calling tools (it
-gave a final answer) or ``max_turns`` is hit. See ``unirl/rollout/env/README.md`` and the
-real-world references it mirrors (relax ``DeepeyesEnv``, slime ``Geo3kEnv``): the loop stays
-mechanical; the *decision* — parse → execute → done — lives here.
-
-**Contract with the engine's (separately built) multi-turn conditioning.** The observation is the
-**raw** tool-result text (a :class:`Texts` primitive, no ``<tool_response>`` markup). The engine
-adapter maps an observation Part to a ``{"role": "tool", "content": ...}`` chat message and the
-tokenizer's chat template adds the ``<tool_response>`` wrapper — so we never double-wrap. Tool
-schemas for the prompt come from :meth:`ToolEnvironment.tool_schemas`.
-"""
+"""ToolEnvironment — the first concrete agent-loop :class:`Environment`."""
 
 from __future__ import annotations
 
@@ -22,8 +9,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from uuid import uuid4
 
 from unirl.rollout.env.tools.base import StatefulTool, Tool
-from unirl.types.primitives import Texts
-from unirl.types.sample import Primitive, Sample, _part_with_field
+from unirl.types.primitives import PrimitiveValue, Texts
+from unirl.types.sample import Sample, _part_with_field
 
 logger = logging.getLogger(__name__)
 
@@ -32,11 +19,7 @@ _TOOL_CALL_OPEN_RE = re.compile(r"<tool_call>\s*(\{)", re.DOTALL)
 
 
 def _balanced_json(text: str, start: int) -> Optional[str]:
-    """Extract a brace-balanced JSON object beginning at ``start`` (the index of its ``{``).
-
-    String-aware so braces inside quotes don't unbalance it — recovers a tool call whose closing
-    ``</tool_call>`` was eaten by a ``stop`` string during generation.
-    """
+    """Extract a brace-balanced JSON object beginning at ``start`` (the index of its ``{``)."""
     depth = 0
     in_string = False
     escaped = False
@@ -61,12 +44,7 @@ def _balanced_json(text: str, start: int) -> Optional[str]:
 
 
 def parse_tool_call(text: str) -> Optional[Dict[str, Any]]:
-    """Parse the last ``<tool_call>{...}</tool_call>`` in ``text`` into ``{"name", "arguments"}``.
-
-    Returns ``None`` when there is no parseable tool call — the environment reads that as a final
-    answer (the trajectory is done). Tolerant of a stop-trimmed closing tag (balanced-brace
-    fallback) and of ``arguments`` arriving as a JSON-encoded string.
-    """
+    """Parse the last ``<tool_call>{...}</tool_call>`` in ``text`` into ``{"name", "arguments"}``."""
     raw_json: Optional[str] = None
     matches = list(_TOOL_CALL_RE.finditer(text))
     if matches:
@@ -102,13 +80,7 @@ def parse_tool_call(text: str) -> Optional[Dict[str, Any]]:
 
 
 class ToolEnvironment:
-    """Agentic :class:`Environment`: parse tool calls, run tools, observe results, stop on a final answer.
-
-    Driven by :class:`~unirl.rollout.harness.tool_agent.ToolAgentHarness` over a frontier of one-or-more samples
-    (the GRPO group / continuations). :meth:`step` parses each frontier sample's text, executes any
-    tool call, and returns a row-aligned observation. The batch's ``done`` is True once **no** sample
-    emits a tool call (all gave a final answer) or ``max_turns`` is reached.
-    """
+    """Agentic :class:`Environment`: parse tool calls, run tools, observe results, stop on a final answer."""
 
     def __init__(self, tools: Sequence[Tool], max_turns: int = 6) -> None:
         if not tools:
@@ -126,19 +98,7 @@ class ToolEnvironment:
         return [tool.json_schema() for tool in self._tools.values()]
 
     def reset(self, request: Sample) -> Sample:
-        """Per-episode setup.
-
-        Stateless tools: the request is returned **unchanged** (re-entrant, LIN-522 — the turn
-        count is derived from the sample in :meth:`step`, not held on the instance, so one env
-        instance serves many concurrent trajectories on a worker).
-
-        Stateful tools (LIN-533): mint a per-trajectory ``session_id`` (``uuid4``) for each
-        :class:`~unirl.rollout.env.tools.base.StatefulTool`, call ``session_start`` (cheap — the
-        handle opens lazily in :meth:`step`), and stamp the ids into the root Part's *control* bag
-        under ``"tool_sessions"`` so :meth:`step`/:meth:`close` recover them position-independently
-        across the fork/observe chain. ``uuid4`` avoids collisions between the ``n`` GRPO siblings
-        that share a root ``sample_id``.
-        """
+        """Per-episode setup."""
         if not self._stateful_tools:
             return request
         root = request.parts[0]
@@ -152,17 +112,8 @@ class ToolEnvironment:
         control["tool_sessions"] = sessions
         return Sample.request(_part_with_field(root, "control", control))
 
-    def step(self, sample: Sample) -> Tuple[Optional[Primitive], bool, dict]:
-        """Consume the frontier action; return ``(observation, done, info)``.
-
-        Reads ``sample.parts[-1].primitives['text'].texts`` (one text per frontier sample), executes any tool
-        call per row, and returns a row-aligned :class:`Texts` observation. ``done`` once no row
-        called a tool, or at ``max_turns``.
-
-        Stateless / re-entrant: the turn number is derived from the sample
-        (``len(sample.gen_parts())`` — one gen Part per turn so far), not a mutable
-        instance counter, so concurrent trajectories sharing one env don't clobber it.
-        """
+    def step(self, sample: Sample) -> Tuple[Optional[PrimitiveValue], bool, dict]:
+        """Consume the frontier action; return ``(observation, done, info)``."""
         turn = len(sample.gen_parts())
         frontier = sample.parts[-1].primitives.get("text")
         if not isinstance(frontier, Texts):
@@ -189,11 +140,7 @@ class ToolEnvironment:
         return observation, False, info
 
     def _run(self, call: Dict[str, Any], sessions: Dict[str, str]) -> str:
-        """Dispatch one parsed call to its tool; surface any failure to the model as text.
-
-        Stateful tools (LIN-533) go through ``execute_session`` with the ``session_id`` recovered
-        from the root control bag; stateless tools keep the pure ``execute`` path.
-        """
+        """Dispatch one parsed call to its tool; surface any failure to the model as text."""
         name = call["name"]
         tool = self._tools.get(name)
         if tool is None:
@@ -210,13 +157,7 @@ class ToolEnvironment:
             return f"Error: {exc}"
 
     def close(self, sample: Sample) -> None:
-        """Guaranteed teardown (LIN-533): end every open tool session for this trajectory.
-
-        The harness calls this from ``ToolAgentHarness.run``'s ``finally`` on every path — success,
-        crash, and suspension — on the trajectory's own drain thread. Swallows per-session errors
-        so teardown can never destabilize the drain. A no-op for stateless tools /
-        sessionless trajectories.
-        """
+        """Guaranteed teardown: end every open tool session for this trajectory."""
         if not self._stateful_tools:
             return
         sessions = (sample.parts[0].control or {}).get("tool_sessions", {}) if sample.parts else {}

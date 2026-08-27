@@ -80,16 +80,7 @@ class MiniMaxH3Pipeline(Pipeline):
         )
 
     def build_schedule_policy(self) -> FlowMatchSchedulePolicy:
-        """The VIDEO sigma policy the hosting engine pins onto the Part.
-
-        For ``N`` UniRL denoising transitions, the grid is
-        ``linspace(1, 0, N + 1)`` put through
-        ``shift*t / (1 + (shift-1)*t)``. This equals the vendored
-        ``MiniMaxH3Scheduler.set_timesteps(N + 1)`` grid: that scheduler counts
-        sigma points, while UniRL's ``num_inference_steps`` counts model
-        evaluations. The audio grid uses the same mapping at ``audio_shift``
-        and is derived inside the diffusion stage rather than pinned.
-        """
+        """The VIDEO sigma policy the hosting engine pins onto the Part."""
         return FlowMatchSchedulePolicy.static_only(shift=float(self.config.video_shift))
 
     @property
@@ -101,22 +92,13 @@ class MiniMaxH3Pipeline(Pipeline):
 
     @classmethod
     def latent_shape(cls, *, model_config: Any, sampling_spec: Any) -> Tuple[int, ...]:
-        """Per-sample UNPACKED video latent shape for the driver x_T recipe.
-
-        Noise is authored 5D here and patchified into the transformer's row
-        layout in :meth:`generate`, mirroring LTX-2.
-        """
+        """Per-sample UNPACKED video latent shape for the driver x_T recipe."""
         del model_config  # geometry is fully determined by the request
         return MiniMaxH3Geometry.from_params(sampling_spec).latent_shape
 
     @staticmethod
     def audio_latent_shape(geometry: MiniMaxH3Geometry) -> Tuple[int, ...]:
-        """Per-sample audio x_T shape ``(rows, latent_channels)``.
-
-        ``num_audio_rows`` already folds in the STEREO count (audio occupies two
-        channel-major row blocks); the trailing dim is the audio VAE's latent
-        width, which is what ``audio_proj_in`` consumes.
-        """
+        """Per-sample audio x_T shape ``(rows, latent_channels)``."""
         return (geometry.num_audio_rows, MINIMAX_H3_AUDIO_LATENT_CHANNELS)
 
     def generate(self, sample: Sample) -> Sample:

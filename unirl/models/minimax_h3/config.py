@@ -1,18 +1,4 @@
-"""Construction config for the MiniMax-H3 t2va (text -> video+audio) pipeline.
-
-MiniMax-H3 is a 33B dense omni-modal transformer that denoises video and stereo
-audio jointly in ONE packed sequence. Three properties drive most of this file
-and are checkpoint contracts, not knobs:
-
-* **Guidance is distilled into the weights** -- no CFG, no negative prompt, one
-  transformer forward per step. ``guidance_scale`` is unused.
-* **Two schedules, one per modality**: video ``shift=12.0``, audio ``shift=3.0``.
-  Both are plain rectified-flow grids, so UniRL's *static* schedule branch
-  reproduces them exactly (see ``pipeline.build_schedule_policy``).
-* **The checkpoint is mixed-dtype**: patch projections, timestep MLP and output
-  heads are fp32 while the block stack is bf16. See ``meta_init_transformer``
-  below and the recipe's ``root_wrap: false``.
-"""
+"""Construction config for the MiniMax-H3 t2va (text -> video+audio) pipeline."""
 
 from __future__ import annotations
 

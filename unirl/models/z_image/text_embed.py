@@ -1,27 +1,4 @@
-"""ZImageTextEmbedStage — Qwen3 chat-template text → TextEmbedCondition.
-
-Implements ``EmbedStage[Texts, TextEmbedCondition]``. Mirrors the
-diffusers ``ZImagePipeline._encode_prompt`` byte-for-byte at the spec
-level:
-
-- **Single causal-LM encoder** (``Qwen3Model``). Each prompt is wrapped in
-  a chat template (``add_generation_prompt=True``, ``enable_thinking=True``)
-  before tokenizing.
-- **Second-to-last hidden layer**. Z-Image conditions on
-  ``encoder_out.hidden_states[-2]`` (not the final layer), per the
-  reference pipeline.
-- **No fixed-prefix strip** (unlike Qwen-Image). Every non-pad token of
-  the chat-templated prompt participates in conditioning.
-- **Variable-length token output**. After dropping pad positions each
-  prompt has a different residual length; the stage pads to the batch-max
-  with zero embeddings and emits a parallel ``attn_mask`` so the single-
-  stream transformer can rebuild the per-prompt caption list (the
-  transformer itself runs variable-length attention over the list).
-
-No ``pooled`` vector is produced — Z-Image's transformer accepts
-token-level hidden states only. ``TextEmbedCondition.pooled`` is left as
-``None``.
-"""
+"""ZImageTextEmbedStage — Qwen3 chat-template text → TextEmbedCondition."""
 
 from __future__ import annotations
 

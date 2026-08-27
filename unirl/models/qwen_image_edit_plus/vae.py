@@ -1,17 +1,4 @@
-"""QwenImageEditPlus VAE stages — source-image encoder + (reused) decoder.
-
-``QwenImageEditPlusVAEEncodeStage`` is the one genuinely new stage: it
-turns source ``Images`` into a :class:`QwenImageEditPlusLatentCondition`
-carrying one VAE-encoded spatial latent ``[16, H_i/8, W_i/8]`` per sample. The diffusion
-step (:class:`QwenImageEditPlusDiffusionStep`) packs both the noise latent
-and this image latent with the same 2×2 channel-pack before concatenating
-along the token dimension — mirrors ``vde_editplus.py:232`` and the
-FLUX.2-Klein image-edit pattern (``flux2_klein/vae.py:86-158``).
-
-The decode side reuses :class:`unirl.models.qwen_image.QwenImageVAEDecodeStage`
-unchanged (same VAE, same 5D un-normalization math) — re-exported here so
-the Edit-Plus package is self-contained.
-"""
+"""QwenImageEditPlus VAE stages — source-image encoder + (reused) decoder."""
 
 from __future__ import annotations
 
@@ -32,12 +19,7 @@ _VAE_SIZE_ALIGN = 32  # upstream rounds to 32-pixel multiples
 
 
 def _vae_size_for_aspect(width: int, height: int) -> tuple[int, int]:
-    """Aspect-preserving resize target matching upstream ``VAE_IMAGE_SIZE``.
-
-    Returns ``(vae_width, vae_height)`` aligned to ``_VAE_SIZE_ALIGN`` with
-    total area ≈ ``_VAE_IMAGE_AREA``. Mirrors
-    ``sglang.multimodal_gen.utils.calculate_dimensions``.
-    """
+    """Aspect-preserving resize target matching upstream ``VAE_IMAGE_SIZE``."""
     ratio = float(width) / float(height)
     vae_width = math.sqrt(_VAE_IMAGE_AREA * ratio)
     vae_height = vae_width / ratio
@@ -47,55 +29,14 @@ def _vae_size_for_aspect(width: int, height: int) -> tuple[int, int]:
 
 
 class QwenImageEditPlusVAEEncodeStage(EncodeStage[Images, QwenImageEditPlusLatentCondition]):
-    """Encode a source image into a VAE-latent condition for token concat.
-
-    Pipeline:
-
-    1. Resize source pixels to the upstream ``VAE_IMAGE_SIZE`` grid
-       (≈1024², aspect-preserving, 32-aligned). The data source loads
-       condition images at native resolution (arbitrary H×W), but
-       upstream ``QwenImageEditPlusPipelineConfig.calculate_condition_image_size``
-       resizes to ``1024*1024`` total area for VAE encoding — the
-       trainsite MUST match so the emitted ``image_latent`` shape is
-       byte-identical to the sglang/vllm_omni rollout engines (the
-       recipe YAMLs promise fixed-seed parity). The generation grid
-       (e.g. 384²) is the *output* canvas size, NOT the source-image
-       VAE size; using it here was a parity-breaking bug.
-    2. ``[0, 1] → [-1, 1]`` (VAE input convention).
-    3. Lift to 5D ``[B, 3, 1, H, W]`` (Qwen-Image VAE is a video VAE —
-       ``_encode`` unpacks ``_, _, num_frame, height, width = x.shape``;
-       a 4D input crashes).
-    4. ``vae.encode(x).latent_dist.mode()`` — deterministic (matches
-       diffusers' ``retrieve_latents(sample_mode="argmax")`` so
-       rollout/replay don't drift). Mirrors ``flux2_klein/vae.py:141``.
-    5. Per-channel normalize: ``(latents - latents_mean) / latents_std``
-       (mirrors upstream ``QwenImageEditPlusPipeline._encode_vae_image``
-       at ``pipeline_qwen_image_edit_plus.py:489-499``; the decode side
-       in :class:`QwenImageVAEDecodeStage` applies the inverse, so
-       skipping this would put rollout/trainsite image latents on a
-       different scale than the transformer was trained on).
-    6. Return one spatial latent ``[16, H_i/8, W_i/8]`` per sample wrapped in
-       :class:`QwenImageEditPlusLatentCondition`. **Do NOT** ``_pack_latents`` here —
-       the diffusion step packs both noise and image latents together so
-       they share the same 2×2 pack logic; the condition carries the
-       spatial latent (mirrors ``Flux2KleinConditions.image_latent``).
-    """
+    """Encode a source image into a VAE-latent condition for token concat."""
 
     def __init__(self, bundle: QwenImageEditPlusBundle) -> None:
         self.bundle = bundle
 
     @torch.no_grad()
     def encode(self, images: Images) -> QwenImageEditPlusLatentCondition:
-        """Encode source pixels into a ragged latent condition.
-
-        Args:
-            images: source images with one native ``[3, H_i, W_i]`` tensor per
-                sample in ``[0, 1]``.
-
-        Returns:
-            :class:`QwenImageEditPlusLatentCondition` with one
-            ``[16, H_vae_i/8, W_vae_i/8]`` tensor per sample.
-        """
+        """Encode source pixels into a ragged latent condition."""
         if self.bundle.vae is None:
             raise RuntimeError(
                 "QwenImageEditPlusVAEEncodeStage.encode: no VAE loaded "

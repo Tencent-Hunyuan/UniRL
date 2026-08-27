@@ -1,15 +1,4 @@
-"""SD3Bundle — concrete weights+params holder for SD3.
-
-Implements the empty :class:`Bundle` Protocol. Pure container of the
-modules SD3 ships with: 1× transformer, 1× VAE, 3× text encoders +
-tokenizers (CLIP1, CLIP2, T5), 1× scheduler. No LoRA injection, FSDP
-wrap, adapter switching, autocast helpers, or weight‑sync logic — those
-are lifecycle concerns owned outside the bundle.
-
-Use :meth:`SD3Bundle.from_config` to load a HuggingFace checkpoint.
-:meth:`SD3Bundle.no_split_modules` exposes the FSDP wrap‑policy hint
-that future training backends will read directly off the bundle.
-"""
+"""SD3Bundle — concrete weights+params holder for SD3."""
 
 from __future__ import annotations
 

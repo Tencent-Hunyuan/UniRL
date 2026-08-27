@@ -1,26 +1,4 @@
-"""HunyuanVideo15VAEDecodeStage — LatentSegment → Videos via 3D VAE decode.
-
-Implements ``DecodeStage[LatentSegment, Videos]``. Reads the final
-stored position from ``LatentSegment.latents[:, -1]`` (the clean
-latent at ``T``, which :class:`HunyuanVideo15DiffusionStage` always
-stores) as a 5D channel-first tensor ``[B, C, T_lat, H_lat, W_lat]``,
-runs VAE decode in fp32 (bf16 unsupported by most VAE implementations),
-normalizes pixels from ``[-1, 1]`` to ``[0, 1]``, then packs each
-sample into a ``Video`` (``[T, C, H, W]`` frames layout) and emits a
-varlen ``Videos`` primitive.
-
-No ``HunyuanVideo15VAEEncodeStage`` here — v1 is text-to-video only;
-encode is only needed for I2V (first-frame conditioning), which is
-deferred along with the SigLIP vision stage.
-
-Diverges from :class:`unirl.models.wan21.WAN21VAEDecodeStage`
-only in the un-normalization branch: HunyuanVideo-1.5's VAE config
-ships with a scalar ``scaling_factor`` only (no per-channel
-``latents_mean`` / ``latents_std``), so we always take the scalar path.
-
-Math derived from the original HunyuanVideo-1.5 VAE decode path
-(PR #101). This module is self-contained.
-"""
+"""HunyuanVideo15VAEDecodeStage — 5D ``[B, C, T_lat, H_lat, W_lat]`` to varlen ``Videos``, pixels ``[0, 1]``."""
 
 from __future__ import annotations
 
@@ -42,14 +20,7 @@ class HunyuanVideo15VAEDecodeStage(DecodeStage[LatentSegment, Videos]):
         self.bundle = bundle
 
     def decode(self, s: LatentSegment, *, grad: bool = False, activation_checkpoint: bool = False) -> Videos:
-        """Decode the final-step latents in *s* into a packed ``Videos`` payload.
-
-        ``grad=False`` (default) keeps the rollout path under ``torch.no_grad()``.
-        ``grad=True`` (ReFL direct-reward backprop) runs the decode WITH grad so it
-        flows from the reward through the frozen VAE into ``clean``; the VAE has no
-        trainable params, so only ``clean``'s graph is extended. ``activation_checkpoint``
-        (grad only) recomputes the decode in backward to trade compute for memory.
-        """
+        """Decode the final-step latents in *s* into a packed ``Videos`` payload."""
         if self.bundle.vae is None:
             raise RuntimeError(
                 "HunyuanVideo15VAEDecodeStage.decode: no VAE loaded "

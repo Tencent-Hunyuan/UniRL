@@ -1,21 +1,4 @@
-"""Base class for v2 full-(base-)weight sync handlers.
-
-Counterpart to ``weight_sync/lora.py`` (LoRA-only). A ``FullWeightSync``
-lives on the TRAIN slab as a sibling ``Remote`` of the FSDP backend (and, in
-shared-process colocate, of the rollout engine) and pushes the freshly-trained
-*full* weights into the rollout engine(s).
-
-Subclasses pick a transport:
-  - ``nccl.NCCLWeightSync``   — separate slabs (cross-node capable).
-  - ``tensor.TensorWeightSync`` — colocate (serialized-tensor handoff).
-  - ``ipc.IPCWeightSync``     — colocate (bucketed CUDA-IPC over ZMQ).
-
-The base provides the transport-agnostic weight walk: full-tensor
-materialization (FSDP shard → replicated, a train-mesh collective) and
-size-bounded bucketing. All model / torch-heavy imports are deferred into the
-methods so the driver can import this module to reference the class for
-``remote(...)`` without eagerly pulling torch.
-"""
+"""Base class for v2 full-(base-)weight sync handlers."""
 
 from __future__ import annotations
 
@@ -60,39 +43,7 @@ def _apply_name_remap(name: str, name_remap: Dict[str, Optional[str]]) -> Option
 
 
 class FullWeightSync(Remote):
-    """Base for full-weight sync Remotes.
-
-    Subclasses implement ``sync()`` (push current weights) plus whatever
-    one-time connection setup their transport needs. ``backend`` is the FSDP
-    backend sibling whose ``.model`` is the weight source.
-
-    ``lora_merged`` selects what gets pushed: ``False`` (default) syncs the raw
-    base weights (meaningful for full fine-tuning); ``True`` folds the trained
-    LoRA deltas into the base weights and pushes the merged full model
-    (meaningful for a LoRA run served without a separate adapter).
-
-    ``adapter_name`` names which PEFT adapter's delta is folded/pushed. ``None``
-    (default) defers to the backend's ``rollout_adapter_name`` — the EMA shadow
-    (``"old"``) for DiffusionNFT, which is what carries the EMA-smoothed weights
-    into a SEPARATE rollout engine where the in-process ``apply_eval_ema`` swap
-    cannot reach; ``"default"`` otherwise. A non-default adapter REQUIRES
-    ``lora_merged=True``: a full-weight receiver loads merged base weights and
-    does not apply a separately-shipped delta, so the shadow must be folded in
-    before the push (the ctor fails closed otherwise).
-
-    ``track_prefix`` routes the push to one child of a ``ComposedRolloutEngine``
-    (e.g. ``"ar"`` / ``"diffusion"``); empty (default) targets a single-model
-    engine. Each transport forwards it to the rollout so the receiver demuxes.
-
-    ``wire_dtype`` (e.g. ``"bf16"``) casts floating tensors to the rollout
-    engine's dtype in the weight walk — shard-side, BEFORE the FSDP
-    all-gather — so the gather, the bucket sizing, and every transport move
-    wire-width bytes. Set it in the ``sync:`` block whenever the training
-    masters are wider than the engine (``model_precision: fp32`` →
-    ``wire_dtype: bf16``). Receivers ``copy_``-cast on load, so this is a
-    bandwidth/memory policy, not a correctness one; ``None`` (default) ships
-    tensors as-is.
-    """
+    """Base for full-weight sync Remotes."""
 
     def __init__(
         self,
@@ -162,35 +113,7 @@ class FullWeightSync(Remote):
         self._wire_dtype = parse_torch_dtype(wire_dtype, field_name="wire_dtype", allow_none=True)
 
     def _iter_full_tensors(self) -> Iterator[Tuple[str, "object"]]:
-        """Yield ``(name, full_tensor)`` one at a time (lazy → bounded memory).
-
-        Both walks apply ``_to_full_tensor`` (redistribute each FSDP ``DTensor``
-        shard to Replicate → a collective over the train mesh), so this MUST run
-        on every train rank in lockstep; each yields a full (unsharded) CUDA
-        tensor per param, in a deterministic order.
-
-        ``lora_merged`` selects the walk:
-          - ``True``  → ``merged_state_dict`` folds LoRA deltas into the base
-            weights and yields the trained module's own keys (LoRA already
-            absorbed, ``.base_layer.`` flattened away).
-          - ``False`` → ``raw_state_dict`` base weights, skipping
-            ``.lora_A``/``.lora_B``.
-
-        ``adapter_name`` (resolved in the ctor from ``backend.rollout_adapter_name``
-        when not given) names which adapter's delta the walk reads — DiffusionNFT
-        points it at the EMA ``"old"`` shadow so the rollout engine receives the
-        EMA-smoothed weights.
-
-        Each emitted name is then rewritten by ``name_remap`` (see
-        ``_apply_name_remap``): a ``None`` rule drops the param (e.g. a frozen
-        tower not in the receiver), and the ``"*"`` catch-all nests the trained
-        submodule's bare keys under the receiver's namespace (e.g.
-        ``transformer.``). It is orthogonal to LoRA-merging.
-
-        ``wire_dtype`` (if set) is applied inside the walk, so the cast
-        happens shard-side before the redistribute and every consumer
-        (``_iter_buckets`` sizing included) sees wire-width tensors.
-        """
+        """Yield ``(name, full_tensor)`` one at a time (lazy → bounded memory)."""
         from unirl.utils.peft_merge import merged_state_dict, raw_state_dict
 
         remap = self._name_remap
@@ -217,21 +140,7 @@ class FullWeightSync(Remote):
                 yield out, tensor
 
     def _iter_full_tensors_ep(self) -> Iterator[Tuple[str, "object"]]:
-        """EP-aware weight walk: emit HF per-expert tensors from the EP-sharded model.
-
-        For each fused expert param (``...experts.gate_up_proj`` / ``down_proj``):
-        materialize this rank's ``[E/ep, …]`` block (``_to_full_tensor`` replicates
-        over ``ep_fsdp``), **all-gather across the ``ep`` group** to reconstruct the
-        full ``[E, …]`` stack, then split it back into HF per-expert tensors
-        (``experts.{e}.gate_proj`` = ``gate_up[e][:I]``, ``up_proj`` = ``[I:2I]``,
-        ``down_proj`` = ``down[e]``) — the reverse of the load converter, the layout
-        SGLang's Qwen3-MoE ``expert_params_mapping`` consumes. Non-expert params
-        use the normal raw/LoRA-merged walk, including PEFT name normalization.
-
-        Runs on every train rank in lockstep (the all-gather is collective). Each
-        rank ends up with the full per-expert set and pushes it to its co-located
-        engine, exactly like the dense BROADCAST sync.
-        """
+        """EP-aware weight walk: emit HF per-expert tensors from the EP-sharded model."""
         from unirl.train.backend.veomni import _compat
         from unirl.train.backend.veomni.ep.models.qwen3_moe import (
             fused_expert_kind,
@@ -285,12 +194,7 @@ class FullWeightSync(Remote):
             del stacked
 
     def _iter_buckets(self) -> Iterator[Tuple[List[Tuple[str, "object"]], bool]]:
-        """Yield ``(bucket, is_last)`` where ``bucket`` is a list of
-        ``(name, tensor)`` up to ``bucket_size_mb``.
-
-        ``is_last`` is True only for the final bucket — used to drive
-        ``flush_cache`` on the receiver.
-        """
+        """Yield ``(bucket, is_last)`` where ``bucket`` is a list of"""
         bucket: List[Tuple[str, object]] = []
         nbytes = 0
         for name, tensor in self._iter_full_tensors():

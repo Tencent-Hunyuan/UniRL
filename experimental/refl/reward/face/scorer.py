@@ -29,11 +29,7 @@ def _load_ref_video_frames(
     height_div: int = 16,
     width_div: int = 16,
 ) -> torch.Tensor:
-    """Load a reference video as ``(C, T, H, W)`` float32 in ``[-1, 1]``.
-
-    Frame-for-frame preprocessing so the reference-side stays aligned with the
-    reference-loader used to train the REFL data pipeline.
-    """
+    """Load a reference video as ``(C, T, H, W)`` float32 in ``[-1, 1]``."""
     import imageio
     import PIL.Image
     import torchvision.transforms.functional as TF
@@ -108,20 +104,7 @@ class FaceRewardScorer(LocalRewardBackend):
         *,
         with_grad: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Extract per-frame face embeddings.
-
-        Args:
-            video: ``(C, T, H, W)`` float in ``[-1, 1]``.
-            with_grad: When True, the ArcFace forward is kept inside autograd
-                (used for the GENERATED video on the BPTT path); when False,
-                the whole computation runs under ``torch.no_grad`` (used for
-                the REFERENCE video, which never receives gradient).
-
-        Returns:
-            embeddings: ``(1, T, 512)`` on ``self.device``. Differentiable in
-                ``video`` when ``with_grad=True``.
-            mask:       ``(1, T)`` on ``self.device`` (1 = face found).
-        """
+        """Per-frame face embeddings from ``(C, T, H, W)`` in ``[-1, 1]``: ``(1, T, 512)`` + mask ``(1, T)``."""
         fa = self.model
         fa.detection_model.torch_model.to(self.device)
         fa.arcface_model.torch_model.to(self.device)
@@ -249,24 +232,7 @@ class FaceRewardScorer(LocalRewardBackend):
 
 @dataclass
 class FaceRewardSpec(BaseRewardComponentSpec):
-    """Typed config for :class:`FaceRewardScorer`.
-
-    Args:
-        model_path: Directory containing ONNX model files
-            (scrfd_10g_bnkps.onnx, 2d106det.onnx, glintr100.onnx). Passed
-            straight to :class:`FaceAnalysis` as its model root.
-        device: "auto" / "cuda" / "cuda:N" — resolved against ``base_device``.
-        batch_size: kept for parity with sibling specs; the scorer iterates
-            per-sample internally because each sample needs its own ref video.
-        image_size: ArcFace alignment size, must be a multiple of 112 or 128.
-        ref_max_frames: Frame cap for ref-video decoding (default 81, matches
-            the REFL training-time cap).
-        ref_max_pixels: Pixel cap for ref-video decoding (default 480*480 —
-            keeps SCRFD's short-side input near its trained resolution).
-        differentiable: Keep autograd on the generated ArcFace forward (default
-            True — required for REFL). Set False to score under no_grad for
-            the historical GRPO/replay path.
-    """
+    """Typed config for :class:`FaceRewardScorer`."""
 
     model_path: str = ""
     device: str = "auto"

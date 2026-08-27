@@ -1,28 +1,4 @@
-"""Weight sync — the canonical sync ops + LoRA lifecycle, owned by one component.
-
-``WeightSync`` is a plain object the engine constructs over the seam: it takes
-the backend explicitly and owns all sync/LoRA state (``_lora_version`` /
-``_lora_loaded`` / ``_active_adapter``). Method names mirror the frozen
-``synchronous.py`` surface minus ``track_prefix`` (the engine's forwards absorb that,
-along with the per-worker ``Worker.call`` dispatch concern), so a grep for a
-trainer-side entry point lands here.
-
-The transports declared are exactly what the predecessor supports: tensor-bag,
-NCCL (init/transfer/destroy), and LoRA-from-tensors. Two deliberate divergences
-from the ``sglang_diffusion`` component:
-
-- ``target_modules`` is NOT accepted or forwarded — the diffusion-side default
-  ``["transformer"]`` doesn't match LLM module naming; omitting the field lets
-  the SRT server accept all incoming weights correctly.
-- LoRA keys go to the wire RAW (HF-native ``model.layers.*``) — there is no
-  ``adapt_lora_for_sglang`` prefix-strip; the SRT LLM LoRA loader consumes the
-  PEFT layout directly.
-
-The "weights released" event: the engine's ``sleep()`` calls
-:meth:`mark_weights_released` after releasing weights, so ``lora_dirty`` flips
-and the next sync re-pushes; :attr:`active_adapter` stops tagging requests until
-then (otherwise SRT would reference a freed adapter).
-"""
+"""Weight sync — the canonical sync ops + LoRA lifecycle, owned by one component."""
 
 from __future__ import annotations
 
@@ -110,19 +86,7 @@ class WeightSync:
         *,
         peft_config: Optional[dict] = None,
     ) -> None:
-        """Push a LoRA adapter from in-memory tensors.
-
-        Rotates to a fresh VERSIONED name (``<name>_v<N>``) each sync — the
-        rotation is REQUIRED, not just defensive: upstream sglang hard-rejects
-        a duplicate ``lora_name`` (``lora_manager`` raises "already loaded" →
-        HTTP 400), so a fresh name is the only way to re-push at all. On the
-        legacy fork the failure modes were softer but worse — an explicit
-        /unload of the live adapter can stall for minutes under colocate, and
-        reusing the name can serve STALE weights, so the rollout policy never
-        actually updates (reward stays flat while the FSDP model trains).
-        Generation points at the latest version via :attr:`active_adapter`;
-        stale versions evict via SRT's LRU (``max_loaded_loras``).
-        """
+        """Push a LoRA adapter from in-memory tensors."""
         nickname = self._next_lora_nickname(adapter_name)
         self._backend.set_lora(
             lora_name=nickname,
@@ -148,11 +112,7 @@ class WeightSync:
 
     @property
     def active_adapter(self) -> Optional[str]:
-        """The adapter name generation should tag requests with (None = base).
-
-        Only set once an adapter has been pushed and not since invalidated by a
-        weight release; otherwise SRT serves the base model.
-        """
+        """The adapter name generation should tag requests with (None = base)."""
         return self._active_adapter if self._lora_loaded else None
 
     @property

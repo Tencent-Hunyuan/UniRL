@@ -1,16 +1,4 @@
-"""Condition base class and Modality enum.
-
-A ``Condition`` is the modality-tagged, encoded input that an architecture's
-diffusion / AR stage consumes. The base contributes only ``Batch``
-round-trip semantics and the ``modality`` ClassVar used by generic dispatch
-(e.g. ``LatentSegment.as_condition`` for promotion). Concrete subclasses
-(``TextEmbedCondition``, ``ImageLatentCondition``, …) declare their payload
-tensors and set the modality.
-
-Encoder versioning, attention masks, position IDs, CFG branches — all
-model-specific, all live on subclasses (or on the typed model-conditions
-container, e.g. ``SD3Conditions``).
-"""
+"""Condition base class and Modality enum."""
 
 from __future__ import annotations
 
@@ -31,12 +19,7 @@ class Modality(str, Enum):
 
 @dataclass
 class Condition(Batch):
-    """Marker base for conditioning inputs.
-
-    Subclasses declare their payload tensors and set the ``modality``
-    ClassVar. The base contributes only ``Batch`` round-trip
-    semantics and the modality discriminator.
-    """
+    """Marker base for conditioning inputs."""
 
     modality: ClassVar[Modality]
 

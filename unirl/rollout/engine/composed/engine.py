@@ -1,24 +1,4 @@
-"""ComposedRolloutEngine — two-child engine orchestrating PE serial flow.
-
-Holds an ``ar`` child and a ``diffusion`` child. ``generate(sample)`` runs
-them sequentially:
-
-1. AR child rewrites each of P prompts into N PE candidates  → ``[P*N]`` ar Part
-2. Diffusion child generates M images per PE                  → ``[P*N*M]`` diffusion Part
-3. Returns the filled 3-part ``[input, ar, diffusion]`` ``Sample`` — lineage is
-   positional (parent = preceding part) and the path ids chain
-   prompt → PE → image.
-
-The request ``Sample`` is pre-forked ``[input, ar_shell, diffusion_shell]``
-(the caller forks; carrying BOTH the AR and diffusion sampling params, which a
-single Part's one ``sampling_params`` slot cannot). Each child config carries
-its own ``_target_``; ``__init__`` builds the child engine via
-``config.<child>.make_engine(...)``.
-
-Weight sync uses prefix-based tensor routing: the training side prepends
-the child component name to tensor keys; this engine demuxes by prefix and
-forwards each subset to the matching child with the prefix stripped.
-"""
+"""ComposedRolloutEngine — two-child engine orchestrating PE serial flow."""
 
 from __future__ import annotations
 
@@ -31,8 +11,8 @@ import torch
 from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.models.pe.instruction import postprocess_pe_texts
+from unirl.rollout.engine.base import BaseRolloutEngine
 from unirl.rollout.engine.composed.config import ComposedRolloutEngineConfig
-from unirl.rollout.engine.synchronous import SyncRolloutEngine
 from unirl.types.primitives import Texts
 from unirl.types.sample import Part, Sample
 from unirl.types.sampling import ARSamplingParams, DiffusionSamplingParams
@@ -50,7 +30,7 @@ def _cleanup_constructed_child(name: str, child: Any) -> None:
         logger.warning("Child %r cleanup after construction failure raised: %s", name, exc)
 
 
-class ComposedRolloutEngine(SyncRolloutEngine):
+class ComposedRolloutEngine(BaseRolloutEngine):
     """Two-child rollout engine for prompt-enhancement (PE) serial flow."""
 
     _component_name = "composed"
@@ -79,8 +59,8 @@ class ComposedRolloutEngine(SyncRolloutEngine):
         ar = config.ar.make_engine(strategy=None, **deps)
         try:
             require(
-                isinstance(ar, SyncRolloutEngine),
-                f"ComposedRolloutEngine ar child must be a SyncRolloutEngine; got {type(ar).__name__}",
+                isinstance(ar, BaseRolloutEngine),
+                f"ComposedRolloutEngine ar child must be a BaseRolloutEngine; got {type(ar).__name__}",
             )
         except BaseException:
             _cleanup_constructed_child("ar", ar)
@@ -93,8 +73,8 @@ class ComposedRolloutEngine(SyncRolloutEngine):
             raise
         try:
             require(
-                isinstance(diffusion, SyncRolloutEngine),
-                f"ComposedRolloutEngine diffusion child must be a SyncRolloutEngine; got {type(diffusion).__name__}",
+                isinstance(diffusion, BaseRolloutEngine),
+                f"ComposedRolloutEngine diffusion child must be a BaseRolloutEngine; got {type(diffusion).__name__}",
             )
         except BaseException:
             _cleanup_constructed_child("diffusion", diffusion)
@@ -104,7 +84,7 @@ class ComposedRolloutEngine(SyncRolloutEngine):
         self._ar = ar
         self._diffusion = diffusion
 
-        self._child_by_name: Dict[str, SyncRolloutEngine] = {
+        self._child_by_name: Dict[str, BaseRolloutEngine] = {
             "ar": self._ar,
             "diffusion": self._diffusion,
         }
@@ -185,14 +165,7 @@ class ComposedRolloutEngine(SyncRolloutEngine):
             return self._generate_core(sample)
 
     def _generate_core(self, sample: Sample) -> Sample:
-        """Run the PE serial flow for a whole ``Sample`` → filled 3-part output.
-
-        Composed's children share wake/sleep state, so the shard is processed as ONE
-        atomic unit, giving a single AR→diffusion wake/sleep transition.
-        ``sample`` is the pre-forked request ``[input, ar_shell, diffusion_shell]`` for
-        P prompts: the AR shell carries ``ARSamplingParams`` (branch N), the diffusion
-        shell ``DiffusionSamplingParams`` (branch M, σ / x_T recipe).
-        """
+        """Run the PE serial flow for a whole ``Sample`` → filled 3-part output."""
         input_part, ar_shell, diffusion_shell = self._unpack_request(sample)
 
         P = len(input_part.sample_ids)
@@ -270,9 +243,7 @@ class ComposedRolloutEngine(SyncRolloutEngine):
         return Sample(parts=[input_part, ar_part, diffusion_part])
 
     def abort(self, ids: Optional[List[str]] = None) -> List[Sample]:
-        """Abort in-flight generation on both children. Partials surface via the
-        pending ``generate`` returns, so this returns ``[]``. Composed-level ids
-        don't map onto child id-spaces (PE prompts are re-rooted), so abort-all."""
+        """Abort in-flight generation on both children. Partials surface via the"""
         del ids
         for child in self._child_by_name.values():
             child.abort()
@@ -287,10 +258,7 @@ class ComposedRolloutEngine(SyncRolloutEngine):
             child.resume()
 
     def _unpack_request(self, sample: Sample) -> tuple:
-        """Resolve the pre-forked ``[input, ar_shell, diffusion_shell]`` request.
-
-        The serial PE flow currently accepts exactly one input Part. Reject extra
-        inputs explicitly instead of dropping them from the returned lineage."""
+        """Resolve the pre-forked ``[input, ar_shell, diffusion_shell]`` request."""
         require(
             bool(sample.parts) and sample.parts[0].is_root,
             "ComposedRolloutEngine.generate: requires a root input Part at parts[0]",
@@ -312,8 +280,7 @@ class ComposedRolloutEngine(SyncRolloutEngine):
         return input_part, ar_shell, diffusion_shell
 
     def _ar_control(self, control: Dict[str, Any]) -> Dict[str, Any]:
-        """The AR child input Part's ``control``: parent's "chat" + "ar" subsets
-        with pe_instruction injected on both."""
+        """The AR child input Part's ``control``: parent's "chat" + "ar" subsets"""
         ar_control: Dict[str, Any] = {key: dict(control[key]) for key in ("chat", "ar") if key in control}
         if self.cfg.pe_instruction:
             for key in ("ar", "chat"):
@@ -321,10 +288,7 @@ class ComposedRolloutEngine(SyncRolloutEngine):
         return ar_control
 
     def _extract_pe(self, pe_texts: Texts, text_primitive: Texts, samples_per_prompt: int) -> Texts:
-        """Optional marker-based PE extraction: keep only the substring after the
-        marker so the diffusion child sees the rewritten prompt instead of the
-        LLM's reasoning preamble. Off-format outputs fall back to the original
-        user prompt to keep diffusion from collapsing to blank text."""
+        """Optional marker-based PE extraction: keep only the substring after the"""
         if not self.cfg.pe_marker:
             return pe_texts
         cleaned_texts, stats = postprocess_pe_texts(
@@ -358,7 +322,7 @@ class ComposedRolloutEngine(SyncRolloutEngine):
                 result[child_name] = subset
         return result
 
-    def _children_for_track_prefix(self, track_prefix: str) -> List[SyncRolloutEngine]:
+    def _children_for_track_prefix(self, track_prefix: str) -> List[BaseRolloutEngine]:
         """Resolve the tensor-payload track routing hint to child engines."""
         if not track_prefix:
             return list(self._child_by_name.values())
@@ -379,12 +343,7 @@ class ComposedRolloutEngine(SyncRolloutEngine):
         replica_rank: Optional[int] = None,
         track_prefix: str = "",
     ) -> None:
-        """Route a bucketed-IPC weight push to one child via ``track_prefix``.
-
-        Only a vLLM-Omni child implements the IPC receiver (an SGLang child
-        raises). ``replica_rank`` is a vLLM-Omni-specific socket discriminator,
-        not part of the base IPC contract, so it is not propagated here.
-        """
+        """Route a bucketed-IPC weight push to one child via ``track_prefix``."""
         if not track_prefix:
             raise ValueError(
                 "ComposedRolloutEngine.update_weights_from_ipc requires track_prefix "

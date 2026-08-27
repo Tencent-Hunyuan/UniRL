@@ -1,16 +1,4 @@
-"""SearchTool — batched web search via Serper or SerpApi (LIN-519, hardened).
-
-A concrete :class:`~unirl.rollout.env.tools.base.Tool` for the deep-research
-agent: given an array of query strings it returns the top web results per query
-as text. Two providers, selected by ``$SEARCH_PROVIDER`` (or the constructor):
-
-- ``serper``  (default): Serper — ``POST serper.dev`` with an ``X-API-KEY`` header.
-- ``serpapi``          : SerpApi — ``GET serpapi.com`` with an ``api_key`` param.
-
-Both read the API key from ``$SERPER_KEY_ID``. ``execute`` is synchronous and
-thread-safe (it holds no state) so it runs cleanly under
-concurrent trajectory threads (:meth:`ToolEnvironment.step`).
-"""
+"""SearchTool — batched web search via Serper or SerpApi."""
 
 from __future__ import annotations
 
@@ -27,9 +15,7 @@ _SERPAPI_URL = "https://serpapi.com/search"
 
 
 class SearchTool(Tool):
-    """Google web search via Serper or SerpApi. Accepts one or more queries;
-    returns the top results per query as text. Requires ``$SERPER_KEY_ID``;
-    ``$SEARCH_PROVIDER=serpapi`` switches from Serper to SerpApi."""
+    """Google web search via Serper or SerpApi."""
 
     name = "search"
 

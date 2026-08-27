@@ -84,6 +84,7 @@ backend:
     fsdp_mode: full
     reshard_after_forward: true
     activation_checkpointing: true
+    ac_wrap_order: outside            # keep FSDP gather/cast outside HI3's dtype-sensitive AC region
     use_torch_compile: false
     # trainable_attr resolves to the HF wrapper that carries frozen mixed-dtype
     # VAE / ViT sibling sub-models; a root fully_shard would shard them too.
@@ -232,7 +233,7 @@ sampling:
     scheduler:
       # Sparse SDE (mirrors sd3_vllmomni / sd3_dancegrpo): record SDE log-probs at
       # only a few steps, ODE elsewhere -> lower-variance GRPO gradient. null = all-SDE.
-      _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+      _target_: unirl.sde.index_schedule.AllSDEScheduler
       num_timesteps: ${..num_inference_steps}
       num_sde_steps: 3               # sparse subset (sd3.5 uses 3)
       timestep_fraction: [0, 0.5]    # SDE steps drawn from the first-half high-σ steps

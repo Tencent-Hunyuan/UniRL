@@ -24,7 +24,6 @@ eval_interval: 20
 eval_num_prompts: 16
 eval_samples_per_prompt: 4
 eval_chunk_prompts: 8
-eval_cfg_text_scale: 1.0
 eval_eta: 0.7
 save_interval: 20
 save_dir: ${oc.env:SAVE_DIR,checkpoints/ltx2_t2v_trainside}
@@ -172,7 +171,7 @@ sampling:
   trajectory_precision: fp32
   logprob_precision: fp32
   scheduler:
-    _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+    _target_: unirl.sde.index_schedule.AllSDEScheduler
     num_timesteps: ${..num_inference_steps}
     num_sde_steps: 5
     timestep_fraction: [0, 0.5]

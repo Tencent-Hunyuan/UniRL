@@ -1,22 +1,4 @@
-"""Qwen3Bundle — concrete weights+tokenizer holder for a Qwen3 causal LM.
-
-Implements the empty :class:`Bundle` Protocol
-(:mod:`unirl.models.types.bundle`). Pure container of:
-
-- ``transformer`` — HuggingFace :class:`AutoModelForCausalLM` loaded with
-  ``trust_remote_code=True`` (required for Qwen3's custom modeling code).
-- ``tokenizer`` — matching HuggingFace :class:`AutoTokenizer`. ``pad_token``
-  is set to ``eos_token`` when absent (decoder-only models commonly skip
-  defining a pad token; the chat-template stage right-pads in-batch and
-  needs a valid pad id).
-
-No VAE / text encoder / scheduler — Qwen3 is a pure causal LM with no
-diffusion side. Lifecycle concerns (LoRA injection, FSDP wrapping,
-adapter switching, autocast helpers, weight-sync logic) live outside the
-bundle in ``cfg.training.policies`` per the new design.
-
-Use :meth:`Qwen3Bundle.from_config` to load a checkpoint.
-"""
+"""Qwen3Bundle — concrete weights+tokenizer holder for a Qwen3 causal LM."""
 
 from __future__ import annotations
 
@@ -38,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 def _stamp_value_head_reset(transformer: nn.Module) -> None:
     """Zero checkpoint-absent value-head params after meta materialization."""
-    from unirl.train.deferred import _stamp
+    from unirl.models.types.post_materialize import defer_after_materialize
 
     def _reset(model: nn.Module) -> None:
         reset: list[str] = []
@@ -51,7 +33,7 @@ def _stamp_value_head_reset(transformer: nn.Module) -> None:
             raise RuntimeError("Qwen3 meta-init: value_head parameters disappeared before post-load reset")
         logger.info("Qwen3 meta-init: zero-initialized checkpoint-absent value head: %s", reset)
 
-    _stamp(transformer, _reset)
+    defer_after_materialize(transformer, _reset)
 
 
 class Qwen3Bundle(Bundle):

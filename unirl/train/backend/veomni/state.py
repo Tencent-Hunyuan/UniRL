@@ -1,15 +1,4 @@
-"""VeOmni-specific sharded-state helpers.
-
-The FSDP2-generic DCP state-dict helpers are re-exported from
-:mod:`unirl.train.backend.sharded_state` (they operate on any module whose
-params are DTensors, so they are identical across backends); only the
-veomni-delegating bits live here — grad clipping and offload/onload, which under
-EP (Phase 2) are the variants that understand VeOmni's extra-parallel placements.
-
-Reached only through ``veomni/backend.py`` (itself behind the package's lazy
-``__getattr__``), so the module-level ``sharded_state`` import — which pulls
-torch — never runs on the torch-free config-compose path.
-"""
+"""VeOmni-specific sharded-state helpers."""
 
 from __future__ import annotations
 
@@ -18,25 +7,13 @@ import logging
 import torch
 from torch import Tensor, nn
 
-from unirl.train.backend.sharded_state import (
-    StateDict,
-    _maybe_dtensor_to_tensor,
-    gather_state_dict,
-    load_model_state_dict,
-    move_optimizer_state,
-    trainable_params,
-)
+from unirl.train.backend.sharded_state import _maybe_dtensor_to_tensor
 
 logger = logging.getLogger(__name__)
 
 
 def clip_grad_norm(model: nn.Module, max_norm: float) -> Tensor:
-    """Gradient clipping via VeOmni's FSDP2 clip (EP-aware under Phase 2).
-
-    Takes the *model* (not a param list) — VeOmni's clip dispatches on
-    model attributes (``_extra_parallel_param_groups``, CPU-offload flags)
-    that a bare param list cannot carry.
-    """
+    """Gradient clipping via VeOmni's FSDP2 clip (EP-aware under Phase 2)."""
     from unirl.train.backend.veomni import _compat
 
     _compat.ensure_installed()
@@ -47,11 +24,7 @@ def clip_grad_norm(model: nn.Module, max_norm: float) -> Tensor:
 
 
 def veomni_offload(model: nn.Module) -> None:
-    """Move the parallelized model to CPU via VeOmni (reshards the root first).
-
-    VeOmni's offload calls ``model.cpu()``, which cannot handle meta tensors —
-    v1 supports fully-materialized trainables only (the qwen-image pilot is;
-    aux components like VAE live on the bundle, outside this module)."""
+    """Move the parallelized model to CPU via VeOmni (reshards the root first)."""
     meta_names = [n for n, p in model.named_parameters() if p.is_meta]
     if meta_names:
         raise RuntimeError(
@@ -82,12 +55,7 @@ def veomni_onload(model: nn.Module, device: torch.device) -> None:
 
 
 __all__ = [
-    "StateDict",
     "clip_grad_norm",
-    "gather_state_dict",
-    "load_model_state_dict",
-    "move_optimizer_state",
-    "trainable_params",
     "veomni_offload",
     "veomni_onload",
 ]

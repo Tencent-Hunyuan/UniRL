@@ -14,17 +14,7 @@ from unirl.types.conditions import TextEmbedCondition
 
 @dataclass
 class MiniMaxH3Conditions(Batch):
-    """Conditions passed to the MiniMax-H3 diffusion stage.
-
-    Deliberately one slot. MiniMax-H3's checkpoint is guidance-distilled: there
-    is no CFG, no unconditional pass and no negative prompt, so -- unlike every
-    other video model in this repo -- there is no ``negative_text`` twin here.
-    A recipe that sets ``guidance_scale`` is not doing anything; the stage
-    ignores it rather than silently batching a second forward.
-
-    Slots:
-        text: Qwen3-VL hidden states from layer 50, unnormalized.
-    """
+    """Conditions passed to the MiniMax-H3 diffusion stage."""
 
     text: Optional[TextEmbedCondition] = concat_field(default=None)
 

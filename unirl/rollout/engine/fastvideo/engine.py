@@ -1,29 +1,9 @@
-"""``fastvideo`` engine core — in-process FastVideo ``VideoGenerator`` rollout.
-
-Mirrors the ``TrainsideRolloutEngine`` / ``SGLangDiffusionRolloutEngine`` shells:
-``generate`` is ``@distributed(DP_SCATTER)``, pins σ on the frontier generation
-``Part``, optionally chunks that frontier by ``forward_batch_size``, and fills it
-with a ``LatentSegment`` (trajectory + native per-step log-probs) and decoded
-``Videos``.
-
-The FastVideo-driving logic (VideoGenerator boot, PR #1222 ``ForwardBatch.RLData``
-native-logprob path, transformer hot-swap, sleep/wake) is ported from the proven
-DiffusionRL FastVideo engine; only the typed boundary (``Sample``/``Part``/
-``LatentSegment``, σ SSOT) is new.
-
-Validated scope:
-  * Replay and native modes use the same resolved SDE window; native mode also
-    returns FastVideo's transition log-probs for ``old_logp_source=rollout``.
-  * x_T SSOT: FastVideo currently regenerates its own initial noise from
-    ``sp.seed`` rather than consuming the driver's NoiseRecipe x_T. Because that
-    seed also drives SDE noise, ``init_same_noise=True`` shares the whole random
-    stream, not only x_T; separate x_T/SDE streams are a follow-up.
-  * Local-mode colocate, single model_family (wan2.1) only for now.
-"""
+"""``fastvideo`` engine core — in-process FastVideo ``VideoGenerator`` rollout."""
 
 from __future__ import annotations
 
 import importlib
+import json
 import logging
 import os
 import sys
@@ -35,10 +15,16 @@ import torch
 
 from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, distributed
+from unirl.rollout.engine.base import BaseRolloutEngine
+from unirl.rollout.engine.fastvideo._unipc import (
+    FastVideoUniPCPlan,
+    patch_fastvideo_unipc,
+    verify_fastvideo_used_sigmas,
+)
 from unirl.rollout.engine.fastvideo.config import FastVideoEngineConfig, FastVideoPorts
-from unirl.rollout.engine.synchronous import SyncRolloutEngine
 from unirl.sde.noise import _derive_group_seed
 from unirl.sde.runtime import FlowMatchSchedulePolicy, ensure_sample_sigmas
+from unirl.sde.unipc import UniPCSpec
 from unirl.types.conditions import TextEmbedCondition
 from unirl.types.noise_recipe import NoiseRecipe
 from unirl.types.primitives import Texts, Video, Videos
@@ -49,23 +35,73 @@ from unirl.types.segments.latent import make_video_segment
 logger = logging.getLogger(__name__)
 
 
-def _resolve_sde_window(raw_indices: Any, num_steps: int) -> tuple[Optional[List[int]], List[int]]:
-    """Return the FastVideo wire value and canonical segment indices.
+def _verify_checkpoint_unipc_spec(ckpt_path: str, spec: UniPCSpec) -> None:
+    """Fail closed unless the checkpoint's scheduler_config.json declares the model-owned UniPC solver spec."""
+    checkpoint = Path(ckpt_path).expanduser()
+    if checkpoint.is_dir():
+        path = checkpoint / "scheduler" / "scheduler_config.json"
+    else:
+        try:
+            from huggingface_hub import hf_hub_download
 
-    ``None`` keeps FastVideo's legacy "all steps are SDE" spelling. An explicit
-    empty iterable remains empty (the framework's deterministic forward-process
-    contract). The segment always gets the resolved concrete list.
-    """
+            path = Path(
+                hf_hub_download(
+                    repo_id=ckpt_path,
+                    filename="scheduler/scheduler_config.json",
+                )
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "FastVideo canonical UniPC cannot resolve "
+                f"{ckpt_path!r}/scheduler/scheduler_config.json as either a local "
+                "diffusers-layout checkpoint or a Hugging Face model repo."
+            ) from exc
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            declared_cfg = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"FastVideo canonical UniPC cannot verify model_config.unipc_* without {path}; "
+            "use a diffusers-layout local checkpoint or Hugging Face model repo containing "
+            "scheduler/scheduler_config.json."
+        ) from exc
+    class_name = str(declared_cfg.get("_class_name", ""))
+    if "UniPC" not in class_name:
+        raise RuntimeError(
+            f"Checkpoint scheduler {path} declares _class_name={class_name!r}; the canonical "
+            "FastVideo path requires the checkpoint's native solver to be a UniPC scheduler."
+        )
+    defaults = UniPCSpec()
+    declared = UniPCSpec(
+        solver_order=declared_cfg.get("solver_order", defaults.solver_order),
+        solver_type=declared_cfg.get("solver_type", defaults.solver_type),
+        lower_order_final=declared_cfg.get("lower_order_final", defaults.lower_order_final),
+        disable_corrector=tuple(declared_cfg.get("disable_corrector") or ()),
+    )
+    if declared != spec:
+        hint = (
+            "; the checkpoint's non-empty disable_corrector has no model-config knob"
+            if declared.disable_corrector != spec.disable_corrector
+            else ""
+        )
+        raise RuntimeError(
+            f"Checkpoint scheduler {path} declares {declared}, but model_config.unipc_* spells "
+            f"{spec}; align model_config.unipc_* with the checkpoint scheduler{hint}."
+        )
+
+
+def _resolve_sde_window(raw_indices: Any, num_steps: int) -> List[int]:
+    """Return sorted SDE step indices; ``None`` → all-steps SDE here but no-SDE trainside (README Gotchas)."""
     if raw_indices is None:
-        return None, list(range(int(num_steps)))
+        return list(range(int(num_steps)))
     selected = sorted({int(i) for i in raw_indices})
     bad = [i for i in selected if i < 0 or i >= int(num_steps)]
     if bad:
         raise ValueError(f"FastVideo SDE indices out of range for num_steps={num_steps}: {bad}")
-    return selected, selected
+    return selected
 
 
-class FastVideoRolloutEngine(SyncRolloutEngine):
+class FastVideoRolloutEngine(BaseRolloutEngine):
     """Rollout engine backed by FastVideo ``VideoGenerator`` (RL fork, PR #1222)."""
 
     _component_name = "fastvideo"
@@ -103,6 +139,32 @@ class FastVideoRolloutEngine(SyncRolloutEngine):
         self._ports = ports
 
         self._ensure_fastvideo_importable()
+        require(
+            os.getenv("FASTVIDEO_WAN_SCHEDULER", "unipc").strip().lower() == "unipc",
+            "FastVideo canonical rollout requires FASTVIDEO_WAN_SCHEDULER=unipc; "
+            "Euler fallback would change the deterministic trajectory.",
+        )
+        require(
+            hasattr(model_config, "unipc_solver_order"),
+            "FastVideo canonical UniPC requires the model config to own the solver spec "
+            "(unipc_solver_order / unipc_solver_type / unipc_lower_order_final)",
+        )
+        # Model-owned solver SSOT, verified against the checkpoint scheduler config below (README: Solver SSOT).
+        self._unipc_spec = UniPCSpec(
+            solver_order=model_config.unipc_solver_order,
+            solver_type=model_config.unipc_solver_type,
+            lower_order_final=model_config.unipc_lower_order_final,
+        )
+        require(
+            strategy is not None and getattr(strategy, "canonical_name", None) is not None,
+            "FastVideoRolloutEngine requires an injected SDE strategy with a canonical_name; "
+            "set the rollout node's `strategy:` in the recipe (a separate injection from pipeline.strategy)",
+        )
+        self._sde_type = str(strategy.canonical_name)
+        # Probe plan so unsupported kernels (cps/dpm2) fail at init, not per request.
+        FastVideoUniPCPlan(sde_type=self._sde_type, sde_indices=(), spec=self._unipc_spec)
+        _verify_checkpoint_unipc_spec(model_config.pretrained_model_ckpt_path, self._unipc_spec)
+        patch_fastvideo_unipc()
         self._build_generator()
 
         self.schedule_policy = FlowMatchSchedulePolicy.from_pretrained(
@@ -156,15 +218,12 @@ class FastVideoRolloutEngine(SyncRolloutEngine):
         }
         fv_kwargs.update(ekw)
         self._fastvideo_args = FastVideoArgs.from_kwargs(**fv_kwargs)
-        target_shift = float(self.model_config.shift)
-        pc = self._fastvideo_args.pipeline_config
-        if getattr(pc, "flow_shift", None) != target_shift:
-            logger.info(
-                "fastvideo engine: pipeline_config.flow_shift %s -> %s (model_config.shift)",
-                getattr(pc, "flow_shift", None),
-                target_shift,
-            )
-            pc.flow_shift = target_shift
+        backend = str(getattr(self._fastvideo_args, "distributed_executor_backend", "mp"))
+        require(
+            backend == "mp",
+            f"FastVideo canonical UniPC patches only reach 'mp' executor workers; got "
+            f"distributed_executor_backend={backend!r} (Ray actors would run unpatched)",
+        )
         max_port_attempts = 5
         for attempt in range(1, max_port_attempts + 1):
             try:
@@ -247,20 +306,7 @@ class FastVideoRolloutEngine(SyncRolloutEngine):
         return self._build_response(sample, params, raw)
 
     def _per_sample_seeds(self, sample: Sample, params: DiffusionSamplingParams) -> List[int]:
-        """Per-sample seeds so sibling samples of one prompt diverge.
-
-        Without this every sample of a prompt shared ``params.seed`` → identical
-        video → identical reward → zero GRPO advantage → zero loss/grad. We key
-        the seed the same way the driver keys x_T (``_derive_group_seed``):
-        per-sample ids when ``init_same_noise`` is false (siblings differ),
-        per-group ids when true (siblings share). Prefer the driver's
-        normalized ``NoiseRecipe`` keys (carry rollout id + same/diff policy);
-        fall back to frontier sample/group ids, then to the flat seed.
-        NOTE: FastVideo uses this one seed for x_T and per-step SDE noise. Thus
-        ``init_same_noise=True`` shares the entire stream across siblings rather
-        than only x_T. Full driver-authoritative x_T plus a sample-specific SDE
-        stream is a separate follow-up.
-        """
+        """Per-sample seeds so sibling samples of one prompt diverge."""
         gen = sample.frontier_gen_part(DiffusionSamplingParams)
         bs = int(gen.batch_size)
         base_seed = int(params.seed) if params.seed is not None else 0
@@ -279,10 +325,7 @@ class FastVideoRolloutEngine(SyncRolloutEngine):
         sigmas: torch.Tensor,
         seeds: List[int],
     ) -> Dict[str, Any]:
-        """PR #1222 native-logprob path via executor.execute_forward + RLData.
-
-        Returns dict(trajectory=[B,T+1,...], log_probs=[B,T], decoded=[B,...]).
-        """
+        """PR #1222 native-logprob path via executor.execute_forward + RLData."""
         from copy import deepcopy
 
         from fastvideo.configs.sample.base import SamplingParam
@@ -301,14 +344,18 @@ class FastVideoRolloutEngine(SyncRolloutEngine):
         sp.return_frames = False
         sp.return_trajectory_latents = False
         sp.return_trajectory_decoded = False
-        _f = float(getattr(self._fastvideo_args.pipeline_config, "flow_shift", self.model_config.shift))
-        _s = sigmas.detach().cpu().double()
-        _g = _s / (_f - _s * (_f - 1.0))
-        sp.sigmas = [float(x) for x in _g.tolist()[:-1]]
+        # Canonical σ verbatim — already shifted; no engine-side transform (README: σ SSOT).
+        sp.sigmas = [float(x) for x in sigmas.detach().cpu().to(torch.float32).tolist()[:-1]]
 
-        sde_step_indices, _ = _resolve_sde_window(
+        # ``None`` → all-steps SDE; an explicit empty list → fully deterministic (README Gotchas).
+        resolved_sde_indices = _resolve_sde_window(
             getattr(params, "sde_indices", None),
             int(params.num_inference_steps),
+        )
+        step_plan = FastVideoUniPCPlan(
+            sde_type=self._sde_type,
+            sde_indices=tuple(resolved_sde_indices),
+            spec=self._unipc_spec,
         )
 
         all_log_probs: List[torch.Tensor] = []
@@ -323,7 +370,7 @@ class FastVideoRolloutEngine(SyncRolloutEngine):
             len(seeds) == len(prompts),
             f"fastvideo engine expects one seed per prompt; got {len(seeds)} vs {len(prompts)}",
         )
-        for prompt, seed in zip(prompts, seeds):
+        for sample_index, (prompt, seed) in enumerate(zip(prompts, seeds)):
             one = deepcopy(sp)
             one.prompt = prompt
             one.seed = int(seed)
@@ -341,12 +388,18 @@ class FastVideoRolloutEngine(SyncRolloutEngine):
                     collect_log_probs=bool(self.cfg.native_logprob),
                     store_trajectory=True,
                     keep_trajectory_on_cpu=True,
-                    sde_step_indices=sde_step_indices,
-                    sde_type=str(getattr(self.strategy, "canonical_name", "flow")),
+                    # sde_step_indices=None routes every index through the patched helper (README: Solver SSOT).
+                    sde_step_indices=None,
+                    sde_type=step_plan,
                 ),
             )
             out = self._generator.executor.execute_forward(batch, self._fastvideo_args)
             rl = out.rl_data
+            verify_fastvideo_used_sigmas(
+                getattr(rl, "trajectory_timesteps", None) if rl is not None else None,
+                expected=sigmas,
+                sample_index=sample_index,
+            )
             traj = rl.trajectory_latents if rl is not None else None
             if traj is None:
                 traj = out.trajectory_latents
@@ -383,7 +436,7 @@ class FastVideoRolloutEngine(SyncRolloutEngine):
                 ntm = nm[0] if isinstance(nm, (list, tuple)) and len(nm) > 0 and torch.is_tensor(nm[0]) else None
                 all_neg_masks.append(ntm.detach().cpu() if ntm is not None else None)
 
-            if self.cfg.native_logprob and sde_step_indices != []:
+            if self.cfg.native_logprob and resolved_sde_indices:
                 lp = rl.log_probs if rl is not None else None
                 require(torch.is_tensor(lp), "FastVideo native rollout returned no log_probs")
                 all_log_probs.append(lp.detach().cpu())
@@ -418,12 +471,7 @@ class FastVideoRolloutEngine(SyncRolloutEngine):
         )
 
     def _build_conditions(self, raw: Dict[str, Any]) -> Dict[str, Any]:
-        """Assemble the WAN21 ``conditions`` dict the trainer replays against.
-
-        Packs the captured FastVideo prompt embeddings into ``TextEmbedCondition``s
-        (``text`` + optional CFG ``negative_text``), padding variable token lengths
-        with zeros via ``TextEmbedCondition.concat`` (WAN's zeroed-pad convention).
-        """
+        """Assemble the WAN21 ``conditions`` dict the trainer replays against."""
         text_embeds: List[torch.Tensor] = raw.get("text_embeds") or []
         require(len(text_embeds) > 0, "fastvideo engine produced no text embeddings")
         text_masks: List[Optional[torch.Tensor]] = raw.get("text_masks") or [None] * len(text_embeds)
@@ -448,12 +496,7 @@ class FastVideoRolloutEngine(SyncRolloutEngine):
         return conditions
 
     def _build_decoded(self, raw: Dict[str, Any]) -> Videos:
-        """Pack FastVideo's decoded output [B, C, T, H, W] into a ``Videos``.
-
-        Mirrors WAN21VAEDecodeStage: permute each sample (C, T, H, W) →
-        (T, C, H, W) so Video.frames matches the canonical [T, C, H, W]
-        contract the reward path (video_pickscore) consumes.
-        """
+        """Pack FastVideo's decoded output [B, C, T, H, W] into a ``Videos``."""
         frames = raw["decoded"]
         require(
             torch.is_tensor(frames) and frames.dim() == 5,
@@ -469,7 +512,7 @@ class FastVideoRolloutEngine(SyncRolloutEngine):
         T = int(traj.shape[1]) - 1
         indices = torch.arange(traj.shape[1], dtype=torch.long, device=device)
 
-        _, sde_set = _resolve_sde_window(getattr(params, "sde_indices", None), T)
+        sde_set = _resolve_sde_window(getattr(params, "sde_indices", None), T)
         sde_indices = torch.tensor(sde_set, dtype=torch.long, device=device) if sde_set else None
 
         sde_logp = None

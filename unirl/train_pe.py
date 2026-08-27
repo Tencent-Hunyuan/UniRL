@@ -1,13 +1,5 @@
 #!/usr/bin/env python
-"""UniRL v2 PE (Prompt Enhancement) joint training entry point.
-
-Thin Hydra wrapper around :class:`unirl.trainer.pe.PETrainer`. The
-trainer owns the placement scope, wires the two sibling stacks (diffusion +
-ar), composes the PEPipeline, and runs the ``train_step → train`` loop; this
-module just maps the loaded Hydra config blocks to constructor kwargs.
-
-Pairs with ``examples/pe/pe_trainside_pickscore.yaml``.
-"""
+"""UniRL v2 PE (Prompt Enhancement) joint training entry point."""
 
 from __future__ import annotations
 

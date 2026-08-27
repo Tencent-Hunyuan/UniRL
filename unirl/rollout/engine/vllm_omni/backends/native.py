@@ -1,41 +1,11 @@
-"""The native ``Backend`` impl — the in-process ``Omni`` orchestrator.
-
-The ONLY module that imports the vllm-omni runtime or does I/O — boot included.
-Because every runtime import is lazy (inside :meth:`VLLMOmniBackend.boot` and the
-verbs), the module imports on CPU and the rest of the package is exercisable
-without a GPU.
-
-Boot sequence (load-bearing order — see each step's note):
-
-1. ``patches.install()`` — vllm/vllm-omni monkey-patches, including the
-   ``mp.Process`` wrap that re-installs them inside every spawn child.
-2. ``mp.set_start_method("spawn", force=True)`` — before any Omni mp object
-   exists (fork-context SemLocks can't cross into spawn workers).
-3. ``CUDA_VISIBLE_DEVICES`` pop when the adapter's boot intent asks for it
-   (HI3 multi-GPU stages; the documented last-resort env override — vllm-omni
-   reads CVD for per-stage device pinning and has no arg for it).
-4. ``Omni(...)`` with the PRISTINE packaged stage YAML + ctor kwargs —
-   ``enable_sleep_mode`` / ``master_port`` ride the runtime's own override
-   channel (the ``base_engine_args`` merge + the dedicated sleep-mode
-   injection in ``AsyncOmniEngine._resolve_stage_configs``), so no YAML
-   rewrite, no temp file. Then the driver-side ``AutoTokenizer`` when the
-   modality needs it; ``tp_per_stage`` reads back from the runtime's own
-   merged ``omni.stage_configs``.
-
-This replaces v1's ``base + rank*200 + idx*50`` port math and ``RANK``-env
-fallback with one reserved master-port base riding ``Omni(master_port=...)``;
-each stage settles its own port from that base (pinned v0.20.0:
-``base + random(0, 100)`` then a +37 bind-check scan; ≥ v0.21.0rc2: honored
-verbatim, scan only on collision — and note env ``MASTER_PORT`` then takes
-precedence over the kwarg).
-"""
+"""The native ``Backend`` impl — the in-process ``Omni`` orchestrator."""
 
 from __future__ import annotations
 
 import logging
 import os
 from pprint import pformat
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from unirl.rollout.engine.vllm_omni.backends.base import (
     STAGE_KIND_AR,
@@ -71,13 +41,7 @@ def _import_omni_runtime() -> Dict[str, Any]:
 
 
 def _resolve_stage_yaml(name: str, source: str) -> str:
-    """Return the absolute path of the stage-config YAML asset.
-
-    Local YAMLs ship in ``stage_configs/`` next to this package. Upstream
-    YAMLs (the AR-only modalities) are looked up under
-    ``<vllm_omni_project>/vllm_omni/model_executor/stage_configs/`` — the
-    upstream loader requires an absolute path and raises on bare names.
-    """
+    """Return the absolute path of the stage-config YAML asset."""
     if source == "local":
         here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         path = os.path.join(here, "stage_configs", name)
@@ -107,15 +71,7 @@ def _cfg_get(cfg: Any, key: str, default: Any = None) -> Any:
 
 
 def _tp_from_stage_configs(stage_configs: Sequence[Any]) -> Dict[int, int]:
-    """Extract ``{stage_id: tensor_parallel_size}`` from the runtime's configs.
-
-    Reads ``omni.stage_configs`` post-boot — the runtime's own merged
-    (OmegaConf) per-stage configs, so this is the authoritative parse rather
-    than a re-read of the YAML asset. LLM stages store
-    ``engine_args.tensor_parallel_size``; diffusion stages store
-    ``engine_args.parallel_config.tensor_parallel_size``. Falls back to 1
-    when neither key is present.
-    """
+    """Extract ``{stage_id: tensor_parallel_size}`` from the runtime's configs."""
     tp_map: Dict[int, int] = {}
     for entry in stage_configs:
         sid = int(_cfg_get(entry, "stage_id", len(tp_map)))
@@ -128,26 +84,7 @@ def _tp_from_stage_configs(stage_configs: Sequence[Any]) -> Dict[int, int]:
 
 
 def _assemble_omni_kwargs(intent: Dict[str, Any]) -> Dict[str, Any]:
-    """Spell the boot intent into ``Omni`` ctor kwargs.
-
-    ``intent["omni_kwargs"]`` arrives pre-layered by ``config.server_intent``
-    (timeouts < adapter ``mode`` < the ``omni_extra`` escape hatch). The
-    dedicated keys go ON TOP — the escape hatch must not override ports or
-    the sleep gate:
-
-    - ``enable_sleep_mode=True`` (only when the intent asks): vllm-omni's
-      ``AsyncOmniEngine._resolve_stage_configs`` injects it into every stage
-      whose YAML doesn't define it (none of ours do), gating the
-      ``CuMemAllocator`` pool ``worker.sleep()`` needs. The runtime first
-      logs a spurious "top-level engine args are ignored: enable_sleep_mode"
-      warning (the strip filter sees a vllm ``EngineArgs`` field) — the
-      dedicated injection block applies it regardless; verified at the
-      v0.20.0 pin and upstream main.
-    - ``master_port`` (only when ports were reserved): merged into every
-      stage's ``engine_args`` via the loader's ``base_engine_args`` channel;
-      each stage settles its own port from this base (see
-      :class:`VLLMOmniPorts`).
-    """
+    """Spell the boot intent into ``Omni`` ctor kwargs."""
     omni_kwargs = dict(intent.get("omni_kwargs") or {})
     if intent.get("enable_sleep_mode"):
         omni_kwargs["enable_sleep_mode"] = True
@@ -175,15 +112,7 @@ class VLLMOmniBackend:
 
     @classmethod
     def boot(cls, intent: Dict[str, Any]) -> "VLLMOmniBackend":
-        """Spell the intent into ``Omni`` ctor kwargs and spawn.
-
-        ``intent`` is the dict from ``config.server_intent`` (adapter boot
-        extras + the reserved port base already overlaid). The stage YAML is
-        passed PRISTINE — ``enable_sleep_mode`` / ``master_port`` ride the
-        runtime's own ctor-kwarg override channel (see
-        :func:`_assemble_omni_kwargs`), so there is no YAML rewrite and no
-        temp file. See the module docstring for the load-bearing boot order.
-        """
+        """Spell the intent into ``Omni`` ctor kwargs and spawn."""
         from unirl.rollout.engine.vllm_omni.patches import install as install_patches
 
         install_patches()
@@ -289,15 +218,7 @@ class VLLMOmniBackend:
         attach_lora: bool = False,
         ar_lora_passthrough: bool = False,
     ) -> List[List[OmniRawResult]]:
-        """Run each call through ``Omni.generate`` and group per request.
-
-        ``attach_lora`` activates the pre-loaded adapter: an ``OmniLoRARequest``
-        is patched onto every diffusion-stage params object (the DiT worker
-        resets the active adapter to ``None`` per forward without it), and —
-        when ``ar_lora_passthrough`` (HI3 AR-prelude modalities; requires the
-        ``lora_request`` passthrough patch) — also passed as a top-level
-        ``Omni.generate`` kwarg for the AR stage's input processor.
-        """
+        """Run each call through ``Omni.generate`` and group per request."""
         omni = self._require_omni()
         groups: List[List[OmniRawResult]] = []
         for call in calls:
@@ -335,12 +256,7 @@ class VLLMOmniBackend:
         )
 
     def tokenize_prompt(self, text: str, *, task: str, sys_type: str) -> List[int]:
-        """HI3 prompt tokens via vllm-omni's ``build_prompt_tokens``.
-
-        Tokenizes segment-by-segment to match HF ``apply_chat_template``
-        byte-for-byte; needs the driver-side tokenizer the boot intent
-        requested (``needs_driver_tokenizer``).
-        """
+        """HI3 prompt tokens via vllm-omni's ``build_prompt_tokens``."""
         if self._tokenizer is None:
             raise RuntimeError(
                 "VLLMOmniBackend.tokenize_prompt: no driver tokenizer loaded "
@@ -361,17 +277,68 @@ class VLLMOmniBackend:
     def _stage_ids(self) -> List[int]:
         return list(range(self.num_stages()))
 
+    @staticmethod
+    def _require_ack_success(action: str, stage_id: int, task_id: str, acks: object) -> None:
+        # Worker handlers catch their own exceptions and answer
+        # ``OmniACK(status="ERROR")`` instead of raising, so a discarded return
+        # value turns a failed sleep/wake into a silent partial transition — the
+        # exact state the engine's transition latch exists to refuse.
+        success_count = 0
+
+        def ack_field(ack: object, name: str, default: object = None) -> object:
+            return ack.get(name, default) if isinstance(ack, Mapping) else getattr(ack, name, default)
+
+        def ack_error(ack: object) -> object:
+            return ack_field(ack, "error_msg", ack_field(ack, "error"))
+
+        def validate_result(result: object) -> None:
+            nonlocal success_count
+            if result is None:
+                # Non-reporting worker ranks legitimately return None; at least
+                # one explicit rank-0 SUCCESS ACK is still required below.
+                return
+            if isinstance(result, (list, tuple)):
+                for item in result:
+                    validate_result(item)
+                return
+
+            status = ack_field(result, "status")
+            if status is None:
+                raise RuntimeError(f"vllm-omni {action} returned no ACK status for stage {stage_id}: result={result!r}")
+            if status != "SUCCESS":
+                raise RuntimeError(
+                    f"vllm-omni {action} failed on stage {stage_id}: worker rank "
+                    f"{ack_field(result, 'rank', '?')} answered status={status!r} "
+                    f"error={ack_error(result)!r}"
+                )
+            ack_stage_id = ack_field(result, "stage_id")
+            ack_task_id = ack_field(result, "task_id")
+            if ack_stage_id is None or int(ack_stage_id) != stage_id:
+                raise RuntimeError(f"vllm-omni {action} ACK stage mismatch: expected {stage_id}, got {ack_stage_id!r}")
+            if ack_task_id is None or str(ack_task_id) != task_id:
+                raise RuntimeError(
+                    f"vllm-omni {action} ACK task mismatch on stage {stage_id}: "
+                    f"expected {task_id!r}, got {ack_task_id!r}"
+                )
+            success_count += 1
+
+        validate_result(acks)
+        if success_count == 0:
+            raise RuntimeError(f"vllm-omni {action} returned no successful ACK for stage {stage_id}")
+
     def sleep_task(self) -> None:
-        """Fan ``handle_sleep_task`` to every stage's workers (level 2)."""
+        """Fan ``handle_sleep_task`` to every stage's workers (level 1)."""
         import uuid
 
         omni = self._require_omni()
         for sid in self._stage_ids():
-            omni.engine.collective_rpc(
+            task_id = str(uuid.uuid4())
+            acks = omni.engine.collective_rpc(
                 method="handle_sleep_task",
-                args=(self._rt["OmniSleepTask"](level=1, task_id=str(uuid.uuid4())),),
+                args=(self._rt["OmniSleepTask"](level=1, task_id=task_id),),
                 stage_ids=[int(sid)],
             )
+            self._require_ack_success("sleep", int(sid), task_id, acks)
 
     def wake_task(self) -> None:
         """Fan ``handle_wake_task`` to every stage's workers + sync CUDA."""
@@ -381,11 +348,13 @@ class VLLMOmniBackend:
 
         omni = self._require_omni()
         for sid in self._stage_ids():
-            omni.engine.collective_rpc(
+            task_id = str(uuid.uuid4())
+            acks = omni.engine.collective_rpc(
                 method="handle_wake_task",
-                args=(self._rt["OmniWakeTask"](tags=None, task_id=str(uuid.uuid4())),),
+                args=(self._rt["OmniWakeTask"](tags=None, task_id=task_id),),
                 stage_ids=[int(sid)],
             )
+            self._require_ack_success("wake", int(sid), task_id, acks)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
 
@@ -413,12 +382,7 @@ class VLLMOmniBackend:
         use_shm: bool,
         replica_rank: Optional[int],
     ) -> None:
-        """Fan a bucketed CUDA-IPC state-dict update out to per-stage workers.
-
-        ``replica_rank`` (optional) overrides the worker-side
-        ``replica_rank_from_env()`` so colocated engines on one node use
-        distinct ZMQ socket paths; ``None`` preserves the env-based behavior.
-        """
+        """Fan a bucketed CUDA-IPC state-dict update out to per-stage workers."""
         omni = self._require_omni()
         kwargs = {
             "peft_config": peft_config,
@@ -507,11 +471,7 @@ class VLLMOmniBackend:
         load_format: Optional[str],
         flush_cache: bool,
     ) -> None:
-        """Fan a SGLang-shape tensor payload to per-stage workers.
-
-        Pure dispatcher: each worker receives the full list and picks
-        ``[self.local_rank]`` in its receive-side handler.
-        """
+        """Fan a SGLang-shape tensor payload to per-stage workers."""
         omni = self._require_omni()
         kwargs = {
             "serialized_named_tensors": list(serialized_named_tensors),
@@ -534,16 +494,7 @@ class VLLMOmniBackend:
         lora_tensors: Dict[str, Any],
         peft_config: Optional[dict],
     ) -> None:
-        """Zero-copy LoRA push via ``MultiprocessingSerializer`` shm handles.
-
-        Per-stage re-serialisation *with cloned tensors*: under the
-        ``file_system`` sharing strategy each tensor's storage gets a named
-        ``/dev/shm`` file that's unlinked once the consuming workers refcount
-        it to zero — re-serialising the same storage hands the next stage a
-        stale handle. Single-consumer-per-stage only (the ``file_descriptor``
-        one-shot fd pops after the FIRST consumer; TP>1 stages need
-        :meth:`set_lora_copy`).
-        """
+        """Zero-copy LoRA push via ``MultiprocessingSerializer`` shm handles."""
         import torch
 
         from unirl.distributed.weight_sync.transfer.ipc_dispatch import (
@@ -584,14 +535,7 @@ class VLLMOmniBackend:
         lora_tensors: Dict[str, Any],
         peft_config: Optional[dict],
     ) -> None:
-        """Byte-copy LoRA push (``torch.save`` + base64) — TP>1-broadcast-safe.
-
-        A single ``collective_rpc`` broadcasts the same blob to every TP worker
-        of a stage; ``torch.save`` bytes have no shared resource, so each
-        worker ``torch.load``\\ s its own copy and the fan-out is unbounded
-        (unlike the one-shot fd handle in :meth:`set_lora_handle`). LoRA is
-        tiny, so copying per rank is free.
-        """
+        """Byte-copy LoRA push (``torch.save`` + base64) — TP>1-broadcast-safe."""
         import base64
         import io
 
@@ -629,12 +573,7 @@ class VLLMOmniBackend:
 
     @staticmethod
     def _wrap_peft_envelope(lora_tensors: Dict[str, Any]) -> Dict[str, Any]:
-        """Wrap canonical wire keys in the PEFT envelope vllm-omni expects.
-
-        Senders ship ``<pipeline_prefix><module>.lora_A.weight``; vllm-omni's
-        ``PEFTHelper`` expects ``base_model.model.<...>``. Idempotent check on
-        the first key.
-        """
+        """Wrap canonical wire keys in the PEFT envelope vllm-omni expects."""
         from unirl.utils.peft_merge import adapt_lora_for_vllm
 
         first_key = next(iter(lora_tensors), "")
@@ -643,12 +582,7 @@ class VLLMOmniBackend:
         return lora_tensors
 
     def _remove_existing_lora(self, adapter_id: int) -> None:
-        """Drop the existing adapter on every stage before re-adding.
-
-        Matches the receive-side ``_diffrl_load_bucket`` ordering.
-        ``remove_lora`` raises when the id isn't loaded; fine on the first
-        call — subsequent failures still flow up via the add below.
-        """
+        """Drop the existing adapter on every stage before re-adding."""
         omni = self._require_omni()
         for sid in self._stage_ids():
             try:
@@ -661,10 +595,7 @@ class VLLMOmniBackend:
                 pass
 
     def param_checksums(self, *, names: List[str]) -> dict:
-        """Fan ``_diffrl_loaded_param_checksums`` across stages and ranks.
-
-        Returns ``{stage_id: [rank0_dict, rank1_dict, ...]}``.
-        """
+        """Fan ``_diffrl_loaded_param_checksums`` across stages and ranks."""
         omni = self._require_omni()
         out: dict = {}
         for sid in self._stage_ids():
@@ -691,16 +622,7 @@ class VLLMOmniBackend:
 
 
 def _group_by_request(flat_outputs: Sequence[Any], n: int) -> List[List[Any]]:
-    """Group ``Omni.generate``'s flat output list into per-request lists.
-
-    ``Omni._run_generation`` builds ``request_ids = [f"{i}_{uuid4()}" for i in
-    range(B)]`` (one per prompt); each request contributes one output per
-    final stage (2 for t2i/it2i after the Stage-0 ``final_output`` flip, 1
-    otherwise). The mapping back to request index is the ``i_`` prefix; if the
-    orchestrator's ordering invariant changes upstream, the per-group counts
-    won't match downstream expectations and the adapter raises — better than
-    silently misaligning.
-    """
+    """Group ``Omni.generate``'s flat output list into per-request lists."""
     grouped: List[List[Any]] = [[] for _ in range(n)]
     for out in flat_outputs:
         rid = getattr(out, "request_id", "") or ""

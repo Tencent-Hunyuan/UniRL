@@ -1,17 +1,4 @@
-"""Evaluate one checkpoint across benchmarks. Run from the repo root:
-
-    python -m benchmarks.run --list
-    python -m benchmarks.run -b image/geneval2 -b image/preference \\
-        --ckpt stabilityai/stable-diffusion-3.5-medium --lora <unirl-ckpt-or-peft-dir> \\
-        --reward-url http://<reward-host>:8080
-    python -m benchmarks.run -b text/aime24 --endpoint http://127.0.0.1:30000
-    python -m benchmarks.run --report
-
-Stages: ``generate`` needs a GPU (t2i) or a serving endpoint (text); ``score``
-needs the reward service (t2i) and is CPU-only for text. Results land in
-``<out>/<ckpt-tag>/<benchmark>/`` (images/ or completions.jsonl, scores.jsonl,
-summary.json); ``--report`` renders every summary under ``--out`` as markdown.
-"""
+"""Evaluate one checkpoint across benchmarks. Run from the repo root:"""
 
 from __future__ import annotations
 
@@ -30,6 +17,21 @@ from benchmarks.core.score import (
     check_geneval2_metadata,
     score_images_local_geneval2,
 )
+
+_HELP = """Evaluate one checkpoint across benchmarks. Run from the repo root:
+
+    python -m benchmarks.run --list
+    python -m benchmarks.run -b image/geneval2 -b image/preference \\
+        --ckpt stabilityai/stable-diffusion-3.5-medium --lora <unirl-ckpt-or-peft-dir> \\
+        --reward-url http://<reward-host>:8080
+    python -m benchmarks.run -b text/aime24 --endpoint http://127.0.0.1:30000
+    python -m benchmarks.run --report
+
+Stages: ``generate`` needs a GPU (t2i) or a serving endpoint (text); ``score``
+needs the reward service (t2i) and is CPU-only for text. Results land in
+``<out>/<ckpt-tag>/<benchmark>/`` (images/ or completions.jsonl, scores.jsonl,
+summary.json); ``--report`` renders every summary under ``--out`` as markdown.
+"""
 
 
 def _parse_sim_even_batches(value: str) -> tuple[int, int]:
@@ -71,7 +73,7 @@ def _sim_even_metrics(
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(description=_HELP, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
         "-b", "--benchmark", action="append", default=[], help="benchmark name; repeatable (see --list)"
     )

@@ -71,6 +71,7 @@ sglang = [
   # [tilelang] extra is already satisfied transitively. Pin to the version
   # verified on-pod with sglang 0.5.12.post1 / torch 2.11.0+cu130.
   "flash-linear-attention[conv1d]==0.5.1 ; sys_platform == 'linux'",
+  "av>=14.2,<19 ; sys_platform == 'linux'",
 ]
 # CUDA 12.9 stack: vllm 0.20.0 PyPI wheels are compiled against CUDA 12.9.
 vllm = [
@@ -86,6 +87,9 @@ train = [
   "aiohttp>=3.9",
   # MathVerifyRewardScorer (unirl/reward/local/mathverify.py) — the paper's grader.
   "math-verify>=0.6",
+]
+cosmos3 = [
+  "diffusers>=0.39",
 ]
 infer = [
   "accelerate>=0.30",
@@ -107,6 +111,26 @@ dev = [
   "pytest-cov>=4.1",
   "ruff>=0.6",
   "pre-commit>=3.6",
+]
+# Offline converters under datasets/ (see datasets/README.md). None of this is
+# imported by unirl/, which is why it is not a base dependency: you install it in
+# a checkout to cook a dataset, then train without it. Reading a Hub dataset needs
+# `datasets`; arxivqa_mc reads Vero's parquet shards through pyarrow directly
+# (deliberately not via `datasets`, to keep the nested structs unreshaped); the
+# LeRobot droid100 prep reads parquet metadata with pandas and decodes video with
+# av. The av bound matches the sglang/vllm extras so installing both cannot
+# conflict.
+#
+# torch is deliberately NOT here even though droid100 imports it (clip resize +
+# .pt writes): adding it would put a second torch declaration outside the engine
+# extras, and pinning exactly one is what lets each engine carry its own CUDA
+# stack. droid100 is the only converter that needs it; datasets/droid100/README.md
+# says so, and every other converter runs in a bare dataset-prep venv.
+dataset-prep = [
+  "datasets>=2.14",
+  "pandas>=2",
+  "pyarrow>=14",
+  "av>=14.2,<19",
 ]
 
 [tool.uv]

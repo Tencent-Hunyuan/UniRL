@@ -1,51 +1,4 @@
-"""Shared SDE runtime entrypoints.
-
-Three layers, all owned by this module:
-
-1. **Pure math** — :func:`get_sigma_schedule` for the FlowMatch σ schedule.
-   Static branch implemented here (diffusers' static path has issue #13243);
-   dynamic branch delegates to diffusers (its dynamic path is bug-free).
-   The dynamic μ is chosen by :meth:`FlowMatchSchedulePolicy.compute_mu` —
-   the **single per-model override point**. Its default delegates to
-   :func:`calculate_dynamic_mu` (linear in image_seq_len); FLUX.2-klein
-   overrides it with an empirical μ that also depends on num_inference_steps.
-
-2. **Schedule policy** — :class:`FlowMatchSchedulePolicy` is the model-owned
-   schedule data (loaded once, constant per actor) the σ computation needs:
-   shift, the 5 dynamic-shift knobs, vae_scale_factor and patch_size.
-   (NB: "static" elsewhere in this module names the no-μ *shift branch*, a
-   different axis from this once-loaded config.) :meth:`from_pretrained` reads
-   the three diffusers-standard JSONs (``scheduler/scheduler_config.json``,
-   ``transformer/config.json``, ``vae/config.json``) under a model
-   checkpoint directory and assembles a policy. The loader is **pure I/O
-   on small JSONs** — no model weights, no Bundle, no Pipeline. Available
-   main-side regardless of whether the actor loaded a full Bundle, which
-   is what lets sglang / vllm-omni engines compute σ without holding the
-   model in memory.
-
-3. **Glue** — :func:`ensure_sample_sigmas` validates a Sample and pins the gen Part's
-   ``policy.compute_sigma(...)`` σ onto the gen Part's ``DiffusionSamplingParams.sigmas`` (every rollout
-   engine calls it at the top of its ``generate``).
-
-Naming convention (a symbol's name tells you its layer):
-
-- ``FlowMatchSchedulePolicy.compute_*`` are **methods** — model-aware
-  behavior that reads the policy's own fields (``compute_mu`` → the
-  per-model μ; ``compute_sigma`` → the full per-request σ).
-- free ``get_sigma_schedule`` / ``calculate_dynamic_mu`` are **stateless
-  math primitives** — fully-resolved scalars in, no policy state.
-- ``ensure_sample_sigmas`` is **Sample glue** — it locates the diffusion gen Part.
-
-Ownership map (kept explicit so reading the code doesn't require
-following six getattr chains)::
-
-    Policy        owned by  MODEL CHECKPOINT (scheduler/transformer/vae JSONs)
-    Params (T,H,W) owned by REQUEST (the gen Part's DiffusionSamplingParams)
-    σ computation owned by THIS MODULE (pure function)
-    σ flow        carried by the gen Part's sigmas (set by engine, read by
-                  pipeline / worker / replay; verified end-to-end by
-                  unirl.rollout.engine.sigma_verify)
-"""
+"""Shared SDE runtime entrypoints."""
 
 from __future__ import annotations
 
@@ -70,26 +23,7 @@ def get_sigma_schedule(
     time_shift_type: str = "exponential",
     shift_terminal: Optional[float] = None,
 ) -> torch.Tensor:
-    """Compute the FlowMatch σ schedule of length ``num_steps + 1``.
-
-    ``mu`` is the static↔dynamic **mode switch**:
-
-    - ``mu is None`` → **static**: SD3-paper shift applied once,
-      ``t' = shift·t / (1 + (shift-1)·t)``. Computed here instead of
-      delegated because diffusers' ``use_dynamic_shifting=False`` path
-      double-applies the shift (#13243). ``time_shift_type`` is unused.
-    - ``mu is not None`` → **dynamic**: delegate to diffusers, passing the
-      ``linspace(1, 1/T)`` base grid every real FlowMatch pipeline uses
-      (omitting ``sigmas=`` degenerates diffusers' small-σ tail to
-      ``≈ 1/num_train_timesteps``). ``shift`` is unused.
-
-    ``shift_terminal`` (dynamic branch only; Qwen-Image ships ``0.02``,
-    SD3/Flux ship ``null``): forwarded into the diffusers scheduler, whose
-    ``set_timesteps`` applies the canonical ``stretch_shift_to_terminal``
-    after the mu shift — exactly the official inference order. No current
-    static-shift model uses it, so the static branch fails fast rather than
-    growing an untested hand-rolled stretch.
-    """
+    """Compute the FlowMatch σ schedule of length ``num_steps + 1``."""
     if mu is None:
         if shift_terminal is not None:
             raise ValueError(
@@ -123,14 +57,7 @@ def calculate_dynamic_mu(
     base_shift: float = 0.5,
     max_shift: float = 1.15,
 ) -> float:
-    """Linear interpolation of dynamic-shift μ from image sequence length.
-
-    Mirrors diffusers' ``calculate_shift`` used by SD3 / Flux pipelines.
-    This is the **default** μ formula: :meth:`FlowMatchSchedulePolicy.compute_mu`
-    calls it, and a model subclass overrides ``compute_mu`` when its μ differs
-    (e.g. FLUX.2-klein's empirical μ). Feed the result into
-    :func:`get_sigma_schedule` via ``mu=...``.
-    """
+    """Linear interpolation of dynamic-shift μ from image sequence length."""
     m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
     b = base_shift - m * base_seq_len
     return image_seq_len * m + b
@@ -146,13 +73,7 @@ def _read_json(path: Path) -> Optional[dict]:
 
 
 def _vae_scale_factor_from_block_out_channels(block_out_channels: Any) -> Optional[int]:
-    """Derive ``vae_scale_factor`` from ``block_out_channels`` length.
-
-    Mirrors diffusers' convention
-    (``2 ** (len(vae.config.block_out_channels) - 1)``, see
-    ``pipeline_stable_diffusion_3.py:219`` and ``pipeline_flux.py:209``).
-    Returns ``None`` for malformed inputs.
-    """
+    """Derive ``vae_scale_factor`` from ``block_out_channels`` length."""
     try:
         n = len(block_out_channels)
         if n < 1:
@@ -163,24 +84,7 @@ def _vae_scale_factor_from_block_out_channels(block_out_channels: Any) -> Option
 
 
 def _normalize_patch_size(value: Any, default: int) -> int:
-    """Coerce a raw ``patch_size`` config value to a single spatial int.
-
-    Some video transformers declare ``patch_size`` as a 3D
-    ``[t_patch, h_patch, w_patch]`` list (e.g. diffusers'
-    ``WanTransformer3DModel`` ships ``[1, 2, 2]``); the
-    dynamic-shifting math here only consumes the spatial patch
-    (``image_seq_len = (H // ... // patch_size) * (W // ... // patch_size)``,
-    which assumes ``h_patch == w_patch``). Scalar inputs pass through
-    unchanged; list/tuple inputs take the last element (the W patch),
-    matching the canonical ``h == w`` convention. ``None`` falls back to
-    ``default``.
-
-    Without this normalization a checkpoint with list-valued
-    ``patch_size`` would raise ``TypeError: int() argument must be a
-    string, a bytes-like object or a real number, not 'list'`` at
-    :meth:`FlowMatchSchedulePolicy.from_pretrained` time — even for
-    static-only policies that never read the field at sample time.
-    """
+    """Coerce ``patch_size`` to one spatial int — 3D configs ship ``[t_patch, h_patch, w_patch]``."""
     if value is None:
         return int(default)
     if isinstance(value, (list, tuple)):
@@ -191,14 +95,7 @@ def _normalize_patch_size(value: Any, default: int) -> int:
 
 
 def _normalize_shift_terminal(value: Any) -> Optional[float]:
-    """Coerce a raw ``shift_terminal`` config value to ``Optional[float]``.
-
-    ``scheduler_config.json`` ships JSON ``null`` for models without the
-    terminal stretch (SD3/Flux) and a float for those with it (Qwen-Image:
-    ``0.02``). Diffusers gates the stretch on truthiness, so ``0``/``0.0``
-    means disabled — normalize falsy to ``None`` to keep one disabled
-    spelling throughout the policy.
-    """
+    """Coerce a raw ``shift_terminal`` config value to ``Optional[float]``."""
     if not value:
         return None
     return float(value)
@@ -206,40 +103,7 @@ def _normalize_shift_terminal(value: Any) -> Optional[float]:
 
 @dataclass
 class FlowMatchSchedulePolicy:
-    """The model-owned σ schedule policy. Loaded once per actor.
-
-    Built either from a pretrained checkpoint directory
-    (:meth:`from_pretrained`) or from explicit fields
-    (:meth:`static_only`). It is **lightweight and pickleable** —
-    pass-by-value across Ray IPC, no Bundle / model weights required to
-    construct it; its only behavior is the σ math
-    (:meth:`compute_mu` / :meth:`compute_sigma`).
-
-    Field semantics
-    ---------------
-    ``shift``: static FlowMatch time-shift. Per-model defaults: SD3=3.0,
-    Flux=1.0, Wan=5.0, HunyuanVideo=1.0, HunyuanImage3=3.0. Always wins
-    over ``scheduler_config.shift`` (user-configured override).
-
-    ``use_dynamic_shifting``, ``base_shift``, ``max_shift``,
-    ``base_image_seq_len``, ``max_image_seq_len``, ``time_shift_type``:
-    dynamic-shift block. Sourced from
-    ``<pretrained>/scheduler/scheduler_config.json``. When
-    ``use_dynamic_shifting=True``, :meth:`compute_sigma` derives μ from
-    image_seq_len (via :meth:`compute_mu`) and delegates to diffusers'
-    dynamic branch; otherwise these fields are ignored.
-
-    ``shift_terminal``: terminal-stretch target (Qwen-Image: ``0.02``;
-    SD3/Flux: ``null``). Also sourced from ``scheduler_config.json``;
-    applied by diffusers after the dynamic shift. ``None`` disables it —
-    byte-identical schedules for every model that doesn't declare it.
-
-    ``vae_scale_factor``, ``patch_size``: latent-grid divisors used in
-    image_seq_len = ``(H // vae_scale_factor // patch_size) * (W // ...)``.
-    Sourced from ``<pretrained>/vae/config.json`` and
-    ``<pretrained>/transformer/config.json``. Only used in dynamic
-    branch.
-    """
+    """The model-owned σ schedule policy. Loaded once per actor."""
 
     shift: float = 3.0
     use_dynamic_shifting: bool = False
@@ -253,16 +117,7 @@ class FlowMatchSchedulePolicy:
     patch_size: int = 2
 
     def compute_mu(self, image_seq_len: int, num_inference_steps: int) -> float:
-        """Dynamic-shift μ for this policy — the single per-model override point.
-
-        Default delegates to :func:`calculate_dynamic_mu` (linear in
-        ``image_seq_len``; ``num_inference_steps`` is unused in the base
-        formula). Override in a model-specific subclass whose μ differs —
-        e.g. FLUX.2-klein's empirical μ depends on **both** ``image_seq_len``
-        and ``num_inference_steps`` (see ``Flux2KleinSchedulePolicy``). Only
-        the μ value is model-specific; the schedule application (base grid +
-        diffusers time-shift) stays shared in :meth:`compute_sigma`.
-        """
+        """Dynamic-shift μ for this policy — the single per-model override point."""
         return calculate_dynamic_mu(
             image_seq_len,
             base_seq_len=self.base_image_seq_len,
@@ -279,17 +134,7 @@ class FlowMatchSchedulePolicy:
         width: int,
         device: Optional[torch.device] = None,
     ) -> torch.Tensor:
-        """Apply this policy to a request's ``(T, H, W)`` → σ tensor ``[T+1]``.
-
-        - static (``use_dynamic_shifting=False``): uses ``shift`` only.
-        - dynamic: derive ``image_seq_len`` from ``(H, W)`` via
-          ``vae_scale_factor`` / ``patch_size``, take μ from
-          :meth:`compute_mu` (the per-model override point), then apply the
-          diffusers dynamic shift.
-
-        The stateless math beyond this point lives in the free functions
-        :func:`get_sigma_schedule` / :func:`calculate_dynamic_mu`.
-        """
+        """Apply this policy to a request's ``(T, H, W)`` → σ tensor ``[T+1]``."""
         if not self.use_dynamic_shifting:
             return get_sigma_schedule(num_inference_steps, self.shift, device, shift_terminal=self.shift_terminal)
         latent_h = int(height) // int(self.vae_scale_factor)
@@ -307,8 +152,7 @@ class FlowMatchSchedulePolicy:
 
     @classmethod
     def static_only(cls, shift: float) -> "FlowMatchSchedulePolicy":
-        """Build a static-shift-only policy. Use when no pretrained dir is
-        available (tests, ad-hoc smoke runs)."""
+        """Build a static-shift-only policy."""
         return cls(shift=float(shift), use_dynamic_shifting=False)
 
     @classmethod
@@ -318,15 +162,7 @@ class FlowMatchSchedulePolicy:
         overrides: Optional[Dict[str, Any]],
         path: Any,
     ) -> "FlowMatchSchedulePolicy":
-        """Construct a dynamic-shift policy from an explicit overrides dict.
-
-        Helper for :meth:`from_pretrained` when ``require_dynamic=True``
-        and the pretrained checkpoint isn't locally readable (e.g. HF
-        repo ID like ``Qwen/Qwen-Image``). The model's Pipeline is
-        responsible for passing its canonical dynamic-shift fields in
-        ``overrides``; if it didn't, raise loudly so the σ contract
-        bug surfaces at engine init instead of at first rollout.
-        """
+        """Construct a dynamic-shift policy from an explicit overrides dict."""
         if not overrides:
             raise RuntimeError(
                 f"FlowMatchSchedulePolicy.from_pretrained: caller declared "
@@ -364,42 +200,7 @@ class FlowMatchSchedulePolicy:
         require_dynamic: bool = False,
         dynamic_overrides: Optional[Dict[str, Any]] = None,
     ) -> "FlowMatchSchedulePolicy":
-        """Build a policy by reading the diffusers-standard JSON layout.
-
-        Tries three files under ``path``::
-
-            <path>/scheduler/scheduler_config.json   → dynamic-shift fields
-            <path>/transformer/config.json           → patch_size
-            <path>/vae/config.json                   → vae_scale_factor
-
-        Missing files / missing keys fall back to dataclass defaults;
-        the scheduler JSON specifically gets a ``logger.warning`` (it
-        carries the dynamic-shift block, so silent fallback there
-        would be a real bug for dynamic-shift models). The ``shift``
-        arg always wins over any ``scheduler_config.shift`` (some
-        checkpoints ship with stale shift values).
-
-        Path resolution
-        ---------------
-        - ``path is None`` → :meth:`static_only` (explicit opt-in).
-        - ``path`` doesn't exist locally:
-            - If ``require_dynamic=False`` (default): fall back to
-              :meth:`static_only` with a debug log. **Correct for
-              static-shift HF repo IDs** like
-              ``stabilityai/stable-diffusion-3.5-medium``.
-            - If ``require_dynamic=True``: caller has declared this
-              model NEEDS dynamic shifting (e.g. Qwen-Image). Use
-              ``dynamic_overrides`` if provided; otherwise RAISE so the
-              error surfaces at engine init instead of silently shipping
-              wrong σ schedules.
-        - ``path`` is an existing local directory → read JSONs.
-
-        ``require_dynamic`` + ``dynamic_overrides`` were added to fix the
-        silent fallback-to-static for HF-repo-ID checkpoints whose model
-        config declared dynamic shifting (the 2026-05-18 review's Phase
-        I.4). Each Pipeline's ``build_schedule_policy()`` knows its own
-        dynamic-shift posture and passes the right hints.
-        """
+        """Build a policy by reading the diffusers-standard JSON layout."""
         root = Path(path) if path is not None else None
         if root is None or not root.exists():
             if require_dynamic:
@@ -445,18 +246,7 @@ class FlowMatchSchedulePolicy:
 
 
 def ensure_sample_sigmas(sample: Any, policy: FlowMatchSchedulePolicy) -> None:
-    """Compute and pin σ onto a Sample's diffusion generation parameters.
-
-    AR-only Samples are a no-op. A diffusion Sample must carry
-    ``DiffusionSamplingParams`` with ``num_inference_steps`` / ``height`` /
-    ``width``.
-
-    All three keys are **required** —  silent ``height=1024`` /
-    ``width=1024`` defaults would mis-derive μ for dynamic-shift models
-    when the request actually rendered at a different resolution
-    (e.g. WAN T2V at 480×832). The driver always sets all three at request
-    construction; absence means a wiring bug.
-    """
+    """Compute and pin σ onto a Sample's diffusion generation parameters."""
     from unirl.types.sampling import DiffusionSamplingParams
 
     if not sample.parts or not isinstance(sample.parts[-1].sampling_params, DiffusionSamplingParams):

@@ -34,7 +34,9 @@ Ask yourself: "Would a senior engineer say this is overcomplicated?" If yes, sim
 
 When editing existing code:
 - Don't "improve" adjacent code, comments, or formatting.
-- In first-party Python files, keep only essential, concise one-line comments; inline annotations are fine for non-obvious shapes, units, or invariants.
+- In first-party Python files, keep only essential, concise one-line comments. Facts knowable only at runtime — tensor shapes, dtypes, value ranges, units — are expected to be written down: put them in the one-line docstring as ``[B, C, H, W]``, or as a trailing `# [B, C, H, W]` on the field or statement they describe. Do not restate what the signature already says.
+- Every docstring — module, class, and function — is at most one line, within the ruff `line-length`. No `Args:`/`Returns:` blocks, no design narration, no examples. Enforced by the `check-docstring-lines` hook; there is no allowlist.
+- To record a genuine constraint — what stock upstream does wrong and what breaks on a version bump, a numerical or bit-identity requirement, an implementer contract — put it in the nearest `README.md` (add a `## Gotchas` bullet, or create the README following the sibling template) and have the one-line docstring point at it. Do not move the prose into a `#` comment block instead; that is the same rot with different syntax. This is about prose — multi-sentence rationale, history, design narration. It does not apply to a single trailing annotation of a shape, dtype, unit, or range, which belongs at the site, not in a README.
 - Don't refactor things that aren't broken.
 - Match existing style, even if you'd do it differently.
 - If you notice unrelated dead code, mention it - don't delete it.

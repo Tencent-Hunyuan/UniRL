@@ -20,7 +20,7 @@ is a trainable unit of a model pipeline — `DiffusionStage` / `ARStage`, see
 As source, the package falls into four groups:
 
 - **Entrypoints** (`train_diffusion.py`, `train_ar.py`, `train_pe.py`,
-  `train_unified_model.py`, plus the `train_agentic*.py` multi-turn variants)
+  `train_unified_model.py`, plus `train_agentic.py` for multi-turn training)
   — each composes and validates a Hydra recipe, then hands off to its trainer.
 - **Orchestration** (`trainer/`) — the per-domain `<Domain>Trainer` owns GPU
   placement, builds the rollout and train workers, and runs the
@@ -28,28 +28,95 @@ As source, the package falls into four groups:
 - **Training loop** (`rollout/`, `reward/`, `algorithms/`, `train/`) — the four
   pluggable components of one rollout, plus what they share: `models/`
   (per-model bundles), `sde/` (step kernels / σ schedule), and `data/` (sources).
-- **Foundation** (`distributed/`, `config/`, `types/`, `utils/`) — the
-  cross-cutting infrastructure every layer rests on: the Ray
-  worker/dispatch/transport runtime, config build-and-validate, the shared typed
-  contracts, and helpers.
+- **Foundation** (`distributed/`, `config/`, `types/`) — the cross-cutting
+  runtime and contracts every layer rests on: Ray worker/dispatch/transport,
+  config validation, and shared typed data. `utils/` contains small supporting
+  mechanisms; it is not an ownership layer or a default destination for code.
 
 ## Module Map
 
 | Path | Responsibility |
 |---|---|
-| `train_*.py` | Hydra entrypoints for diffusion, AR, prompt enhancement, unified models, and synchronous/partial/asynchronous agentic workflows |
-| `trainer/` | Training lifecycle (`base.py` plus domain and agentic trainers): owns placement, builds workers, and runs the rollout→reward→advantage→train loop |
+| `train_*.py` | Hydra entrypoints for diffusion, AR, prompt enhancement, unified models, and service-scored barrier agentic training |
+| `trainer/` | Training lifecycle (`base.py` plus domain trainers and `AgenticTrainer`): owns placement, builds workers, and runs the rollout→reward→advantage→train loop |
 | `config/` | `require` + `validate_*` cross-component validators over the flat Hydra recipe (instantiation itself is `_target_`-driven, not in this module) |
 | `distributed/` | Ray worker base (`Remote`) + placement/dispatch (`group/`), tensor transport (`tensor/`), and weight sync (`weight_sync/`) |
-| `rollout/` | Rollout engine contracts and implementations (`engine/`: trainside, sglang, sglang_diffusion, vllm_omni, composed) |
+| `rollout/` | Rollout engine contracts and implementations (`engine/`: trainside, sglang, sglang_diffusion, vllm_omni, fastvideo, composed, agentic) |
 | `train/` | Train stack: `TrainStack`, FSDP backend, LoRA/DiffusionNFT/mirror injection, EMA shadow, optimizer/lr |
 | `algorithms/` | Per-track loss algorithms (GRPO, DiffusionNFT, FlowDPPO, DRPO) |
 | `models/` | Per-model bundles, pipelines, stages, conditions; text/vision/vae helpers |
 | `reward/` | `RewardService` holding one backend — local scorers or the remote HTTP client |
-| `sde/` | SDE step kernels, σ schedule/shift, initial-noise generation (the `NoiseRecipe` contract lives in `types/`) |
+| `sde/` | SDE step kernels, σ schedule/shift, SDE-index schedule, initial-noise generation (the `NoiseRecipe` contract lives in `types/`) |
 | [`types/`](types/README.md) | Shared typed contracts: `Sample` / `Part`, primitives, conditions, segments, rewards, sampling; includes the request/response migration guide |
 | `data/` | Data source and dataset readers |
-| `utils/` | Logging, dtype, media, timing, checkpoint, and misc helpers |
+| [`utils/`](utils/README.md) | Domain-agnostic leaves with several owners: logging, dtype, media/video, metric aggregation, profiling, memory monitoring |
+
+## Ownership and dependency direction
+
+The source tree is not one rigid linear stack: rollout adapters may translate
+concrete model wire formats, and `train/` consumes algorithm and model
+contracts. The stable direction is nevertheless simple:
+
+```text
+entrypoints / trainer                  compose and orchestrate
+          ↓
+rollout · reward · algorithms · train  own loop policy
+          ↓
+models · data · sde                    own domain policy and transformations
+          ↓
+types · config · distributed           own stable contracts and mechanisms
+```
+
+Imports should point downward. Integration code that must understand both a
+backend and a model belongs at that integration seam (normally a rollout or
+train-backend adapter), not in generic infrastructure. In particular:
+
+- concrete model packages do not import trainers, algorithms, rewards, or
+  rollout engines;
+- algorithms depend on stage/type contracts, not concrete model families;
+- data sources do not depend on trainers, models, or training backends;
+- distributed mechanisms do not depend on concrete models;
+- trainers may compose everything, but model-specific semantics stay behind a
+  model-owned contract or hook;
+- `utils/` is only for stable, domain-agnostic leaves. A function used by one
+  model, dataset, backend, or algorithm stays with that owner.
+
+The already-clean directions are locked by
+[`lint/check_core_dependencies.py`](../lint/check_core_dependencies.py)
+(TYPE_CHECKING-only imports exempt): `types/`, `config/`, `utils/`, `sde/`,
+`data/`, and `models/types/` never import the loop tier or concrete models;
+`models/` never imports algorithms, data, rewards, rollout, or trainers;
+`algorithms/` sees model contracts, never concrete model families; `train/`
+sees model contracts and `algorithms/base`, never concrete algorithms;
+`distributed/` never imports algorithms, data, models, rewards, rollout, or
+trainers.
+
+Directions the tree does not yet satisfy are left unlocked rather than hidden
+behind allowlists. The open debt, named so it is not copied as precedent:
+`models/` (`hunyuan_image3`, `qwen3_5`, `qwen3_moe`) and
+`distributed/weight_sync/` reach into `train/backend/veomni` (EP fusing /
+`_compat`), `models/cosmos3` subclasses the train-side SFT track builder, and
+`algorithms/` flips `train/lora` adapters. That is migration work, not a
+convention to copy.
+
+## Where new code goes
+
+| Feature | Owner |
+|---|---|
+| Model forward/replay, timestep, scheduler, packing, model-only preprocessing | `models/<family>/` |
+| Generic dataset reading, batching, runtime normalization | `data/` |
+| One-off dataset download/conversion CLI | [`datasets/<dataset>/`](../datasets/README.md), repo root beside `unirl/` |
+| Loss, ratio/clip, advantage policy for one RL method | `algorithms/` |
+| Engine lifecycle or model↔engine wire translation | `rollout/engine/<backend>/` and its `adapters/` |
+| Score construction and scorer-specific loading | `reward/` |
+| Optimizer, sharding, EMA/LoRA lifecycle | `train/` |
+| Cross-component sequencing, placement, retries, checkpoints | `trainer/` |
+| Communication, tensor transport, device placement | `distributed/` |
+| Stable domain-agnostic leaf helper with multiple owners | a narrowly named module under `utils/` |
+
+Prefer a small amount of policy duplication over a shared base class that makes
+one model change touch several unrelated modules. Share mechanisms; keep model,
+algorithm, reward, and backend policy local.
 
 ## Deployment modes
 
@@ -82,10 +149,11 @@ flows through them like this:
 7. Each train worker owns a model `Bundle`, an `FSDPBackend`, and one loss algorithm.
 8. Dedicated-rollout modes (separate / colocate) sync trainer weights back to the rollout workers.
 
-Agentic workflows extend step 3 into a trajectory: the coordinator repeatedly
-invokes a single-turn engine, executes tool or environment actions between turns,
-and returns `list[Sample]`. The agentic trainers then assemble the trainable turns
-before applying the same reward, advantage, and train-stack contracts.
+The agentic workflow extends step 3 into trajectories: a driver-side manager
+dispatches one task per remote engine slot while each engine executes model and
+environment turns. `AgenticTrainer` waits for complete sibling groups, scores
+their terminal answers through `RewardService`, and assigns each trajectory's
+group-normalized advantage to all of its generated turns before training.
 
 ## Deeper Module Docs
 
@@ -93,7 +161,7 @@ before applying the same reward, advantage, and train-stack contracts.
 - `types/README.md`: the `Sample` / `Part` contract and migration from the retired request/response API.
 - `config/README.md`: flat-recipe config — `require`/precision validators, `_target_` instantiation, cross-component contracts.
 - `rollout/README.md`: rollout modes, engines, and the `Sample` / `Part` generation flow.
-- `rollout/env/README.md`: agentic environments, tools, trajectories, and partial-resume behavior.
+- `rollout/env/README.md`: agentic environments, tools, trajectories, and manager quiescence behavior.
 - `train/readme.md`: train stack, FSDP backend, injection, EMA shadow.
 - `algorithms/README.md`: per-track loss algorithms.
 - `reward/README.md`: reward backends and custom scorers.

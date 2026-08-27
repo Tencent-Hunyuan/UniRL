@@ -1,20 +1,4 @@
-"""Shared bucketed-IPC receive mixin for HI3 worker-extension classes.
-
-Both the AR and the DiT stage extensions need the same ``update_weights_from_ipc``
-implementation: open a per-rank ``BucketedWeightReceiver`` on the shared ZMQ
-socket, then forward each bucket to ``self.load_weights`` (or to
-``self.add_lora`` in the LoRA-sync case).
-
-Factor it into a mixin so the AR extension can compose it with
-``HI3ARWorkerExtension`` (the existing tokenizer-compat target) and the
-DiT extension can compose it with vllm-omni's ``CustomPipelineWorkerExtension``.
-
-The worker ``self`` provides:
-- ``self.device`` (cuda device of this worker)
-- ``self.local_rank`` (rank within the stage's TP/PP group)
-- ``self.load_weights(weights)`` (per-bucket loader)
-- ``self.add_lora(req)`` / ``self.remove_lora(int_id)`` (LoRA ops)
-"""
+"""Shared bucketed-IPC receive mixin for HI3 worker-extension classes."""
 
 from __future__ import annotations
 
@@ -42,8 +26,7 @@ logger = logging.getLogger(__name__)
 
 
 class BucketedIPCReceiveMixin:
-    """Adds ``update_weights_from_ipc`` (and the LoRA hijack install) to a
-    vllm-omni worker via multiple inheritance."""
+    """Adds ``update_weights_from_ipc`` (and the LoRA hijack install) to a vllm-omni worker via multiple inheritance."""
 
     def __new__(cls, **kwargs):
         VLLMOmniHijack.hijack()
@@ -62,17 +45,7 @@ class BucketedIPCReceiveMixin:
         stage_id: int = 0,
         replica_rank: Optional[int] = None,
     ) -> None:
-        """Receive a state dict over the per-rank ZMQ socket.
-
-        Trainer-side counterpart is
-        ``distributed.weight_sync.full.ipc.IPCWeightSync``.
-
-        ``replica_rank`` defaults to ``replica_rank_from_env()`` (v1 behavior);
-        the v2 colocated handler passes its train-rank explicitly so colocated
-        engines on one node don't collide on the same ZMQ socket path (the Omni
-        subprocess spawns before any per-Worker env can be injected, so env is
-        not a reliable per-replica discriminator there).
-        """
+        """Receive a state dict over the per-rank ZMQ socket."""
         if peft_config and base_sync_done:
             try:
                 self.remove_lora(DIFFRL_LORA_INT_ID)
@@ -133,14 +106,7 @@ class BucketedIPCReceiveMixin:
             self._diffrl_load_weights(weights)
 
     def _diffrl_load_weights(self, weights: list[tuple[str, torch.Tensor]]) -> None:
-        """Forward weights to whichever loader the underlying worker exposes.
-
-        - DiT worker (``DiffusionWorker`` base of ``CustomPipelineWorkerExtension``)
-          has ``self.load_weights`` directly — delegates to the pipeline.
-        - AR worker (``GPUARWorker``) has no ``load_weights`` on the worker;
-          the model sits at ``self.model_runner.model`` and exposes its own
-          ``load_weights``.
-        """
+        """Forward weights to whichever loader the underlying worker exposes."""
         loader = getattr(self, "load_weights", None)
         if callable(loader):
             loader(weights)
@@ -166,18 +132,7 @@ class BucketedIPCReceiveMixin:
         load_format: Optional[str] = None,
         flush_cache: bool = True,
     ) -> None:
-        """Receive a SGLang-shape one-bag payload and load it.
-
-        Picks ``serialized_named_tensors[self.local_rank]``, deserializes via
-        sglang's ``MultiprocessingSerializer`` + ``FlattenedTensorBucket``,
-        then forwards the reconstructed ``[(name, tensor), ...]`` to
-        ``self.load_weights``. Sender is
-        :class:`unirl.distributed.weight_sync.full.tensor.TensorWeightSync`.
-
-        Runtime dep: sglang must be installed in the worker subprocess for the
-        ``FlattenedTensorBucket`` dataclass to round-trip the pickle. The pod
-        venv that runs the rollout actor and the worker shares this dep.
-        """
+        """Receive a SGLang-shape one-bag payload and load it."""
         del target_modules, flush_cache  # accepted for SGLang-shape parity
         from unirl.distributed.weight_sync.transfer.sgl_compat import (
             FlattenedTensorBucket,
@@ -214,25 +169,7 @@ class BucketedIPCReceiveMixin:
         peft_config: dict,
         lora_tensors_serialized: str,
     ) -> bool:
-        """Reconstruct an ``OmniTensorLoRARequest`` from primitive args
-        and forward to ``self.add_lora``.
-
-        Why not pass the request object directly via ``collective_rpc``:
-
-        - vllm's wire encoder (msgspec) doesn't recognise our Struct
-          subclass ``OmniTensorLoRARequest`` and decodes it positionally
-          as a list, so the worker sees ``[<fields>]`` instead of an
-          object with ``.lora_int_id``.
-        - The inner ``lora_tensors`` dict values (``torch.Tensor``) also
-          can't survive the msgpack wire — tensors come back as plain
-          Python lists, and ``LoRAModel.from_lora_tensors`` then trips
-          ``'list' object has no attribute 'to'``.
-
-        So the engine ships LoRA tensors via SGLang's
-        ``MultiprocessingSerializer`` (same path B.2 uses); the worker
-        deserialises into a real ``dict[str, torch.Tensor]`` and rebuilds
-        the request locally.
-        """
+        """Reconstruct an ``OmniTensorLoRARequest`` from primitive args and forward to ``self.add_lora``."""
         from unirl.distributed.weight_sync.transfer.sgl_compat import (
             MultiprocessingSerializer,
         )
@@ -264,24 +201,7 @@ class BucketedIPCReceiveMixin:
         peft_config: dict,
         lora_tensors_serialized: str,
     ) -> bool:
-        """Byte-copy variant of :meth:`set_lora_from_tensor_dict` for HI3.
-
-        # DELETE-WHEN: the vLLM-Omni LoRA handle transport is TP>1-broadcast-safe
-        #   — then ``set_lora_from_tensor_dict`` serves every stage and this
-        #   byte-copy mate (+ engine-side ``set_lora_from_tensors_copy``) is dead.
-
-        :meth:`set_lora_from_tensor_dict` ships a zero-copy
-        ``MultiprocessingSerializer`` handle, whose one-shot ``file_descriptor``
-        ``resource_sharer`` pops after the first consumer — fine for the SD3
-        per-worker DP path (TP=1, single consumer) but it makes ranks 2..N of a
-        TP>1 stage raise ``KeyError`` / ``EOFError`` when a single
-        ``collective_rpc`` broadcasts the same handle to every worker. The HI3
-        AR / DiT stages are TP>1, so the driver pushes via
-        ``set_lora_from_tensors_copy``, which sends the LoRA as a *data copy*
-        (``torch.save`` bytes, base64-wrapped). Each worker ``torch.load``s its
-        own independent tensors, so the fan-out is unbounded. LoRA is tiny (tens
-        of MB), so copying per rank is free.
-        """
+        """Byte-copy variant of :meth:`set_lora_from_tensor_dict` for HI3."""
         import base64
         import io
 
@@ -310,11 +230,7 @@ class BucketedIPCReceiveMixin:
         self,
         names: Optional[list] = None,
     ) -> dict:
-        """Return ``{name: (shape_tuple, dtype_str)}`` for the worker's loaded model.
-
-        Used by the E2E test to build synthetic state-dicts that match real
-        parameter shapes (so ``load_weights`` actually mutates them).
-        """
+        """Return ``{name: (shape_tuple, dtype_str)}`` for the worker's loaded model."""
         runner = getattr(self, "model_runner", None)
         if runner is None:
             return {}
@@ -339,15 +255,7 @@ class BucketedIPCReceiveMixin:
         self,
         names: Optional[list] = None,
     ) -> dict:
-        """Return ``{name: short_sha256_hex}`` for the worker's loaded model.
-
-        Used to assert that a given weight-sync transport actually mutated
-        worker-side parameters. Cheap when ``names`` is provided (skips the
-        rest); expensive when ``None``.
-
-        Pulls parameters from ``self.model_runner.pipeline`` (DiT) or
-        ``self.model_runner.model`` (AR) depending on which attribute exists.
-        """
+        """Return ``{name: short_sha256_hex}`` for the worker's loaded model."""
         import hashlib
 
         runner = getattr(self, "model_runner", None)
@@ -385,20 +293,7 @@ class BucketedIPCReceiveMixin:
         self,
         names: Optional[list] = None,
     ) -> dict:
-        """Full-byte SHA-256 of the worker's loaded parameters.
-
-        Called *after* ``load_weights`` returns to verify the bytes that
-        landed match what the trainer intended. Trainer-side counterpart
-        is :func:`unirl.distributed.weight_sync.transfer.checksum.compute_param_checksums`.
-
-        TP note: this rank's hash is over the rank's *local* tensor.
-        For TP-flat params (layer norms, scalars) every rank holds the
-        same full tensor, so per-rank hashes equal the trainer's
-        full-tensor hash. For TP-sharded params each rank holds a slice
-        and per-rank hashes differ from the trainer's full hash;
-        verification of those needs an external all-gather (currently
-        deferred — the smoke test only targets TP-flat names).
-        """
+        """Full-byte SHA-256 of the worker's loaded parameters."""
         from unirl.distributed.weight_sync.transfer.checksum import (
             fingerprint_tensor,
         )
@@ -428,29 +323,7 @@ class BucketedIPCReceiveMixin:
         adapter_id: int,
         names: Optional[list] = None,
     ) -> dict:
-        """Full-byte SHA-256 of the worker's loaded LoRA adapter tensors.
-
-        Walks the inner ``LoRAModelManager._registered_adapters[adapter_id].loras``
-        and hashes ``lora_a`` / ``lora_b`` / ``bias`` / ``embeddings_tensor``
-        when present. Packed modules store their ``lora_a`` / ``lora_b`` as a
-        list of sub-tensors (one per fused projection), which are hashed
-        per-shard as ``<field>.<i>``. ``lora.optimize()`` has already run by
-        this point — ``lora_b`` is post-scaling — so the trainer must apply the
-        matching ``alpha / r`` scaling before hashing for equality. The
-        helper :func:`weight_sync.checksum.compute_lora_checksums_post_optimize`
-        does that.
-
-        Returns ``{loaded_layer_name: {field: hex, ...}}``. The layer
-        name is whatever the manager stores (typically the post-rename
-        name PEFTHelper produces, e.g. ``q_proj``, not the trainer's
-        ``base_model.model.q_proj``); the smoke test strips the
-        ``base_model.model.`` prefix before comparing.
-
-        Worker layouts (DiT vs. AR) put the lora_manager in different
-        spots; we probe both. Returns ``{}`` if the adapter id isn't
-        registered on this rank — caller should treat that as a
-        mismatch, not a silent skip.
-        """
+        """Full-byte SHA-256 of the worker's loaded LoRA adapter tensors."""
         from unirl.distributed.weight_sync.transfer.checksum import (
             fingerprint_tensor,
         )

@@ -1,41 +1,4 @@
-"""Qwen-Image-Edit-Plus family: image-edit modality (text+image → image).
-
-Sibling of :mod:`unirl.rollout.engine.sglang_diffusion.adapters.qwen_image`
-(the T2I modality) with two image-edit deltas:
-
-- **Request side.** Edit-Plus requires a packed image batch in an aligned
-  image-conditioning Part
-  (fail-fast if absent — Edit-Plus is edit-only). The adapter extracts PILs
-  via :meth:`Images.to_pils` and injects each into the sampling kwargs under
-  ``condition_image`` — a SamplingParams field injected by
-  :mod:`._patches.patch_sampling_io` and copied onto ``Req.condition_image``
-  in ``prepare_request``. SGLang's ``InputValidationStage`` checks
-  ``batch.condition_image is not None`` BEFORE ``image_path``
-  (input_validation.py:108), so the pre-populated PIL bypasses the file-path
-  load entirely. Upstream's ``ImageVAEEncodingStage`` then VAE-encodes the
-  source image and sets ``batch.image_latent`` (the packed
-  ``[B, S_img, C*4]`` token-concat latent).
-- **Response side.** The Edit-Plus-specific ``image_latent`` condition (the
-  VAE-encoded source-image latent, needed by the trainer-side replay's
-  token-concat in :meth:`QwenImageEditPlusDiffusionStep.predict_noise`) is
-  captured by :mod:`._patches.patch_conditions` (which extends the IPC-
-  survival machinery built for text embeds to also carry ``image_latent`` +
-  ``image_latent_sizes`` off the batch). This adapter unpacks the packed
-  latent to spatial ``[16, H_img, W_img]`` per sample and emits a
-  :class:`QwenImageEditPlusLatentCondition` alongside the inherited ``text`` /
-  ``negative_text`` conditions.
-
-Everything else (packed-trajectory unpack in ``build_segment``, CFG
-semantics, LoRA wiring, weight sync) is inherited from the T2I adapter —
-same checkpoint family, same text encoder, same noise-only trajectory (the
-denoise loop concats ``batch.image_latent`` into a separate
-``latent_model_input``, never back into ``latents``).
-
-Upstream SGLang 0.5.12.post1 ships ``QwenImageEditPlusPipeline`` natively
-(auto-selected via ``model_index.json`` ``_class_name``), so no pipeline
-subclass is needed — unlike the vllm_omni path which subclasses
-``RLQwenImageEditPlusPipeline``.
-"""
+"""Qwen-Image-Edit-Plus family: image-edit modality (text+image → image)."""
 
 from __future__ import annotations
 
@@ -57,31 +20,12 @@ _VAE_SCALE_FACTOR = 8
 
 @register_adapter("qwen_image_edit_plus")
 class QwenImageEditPlusAdapter(QwenImageAdapter):
-    """Qwen-Image-Edit-Plus — text+image → image edit (single diffusion stage).
-
-    Overrides only ``build_prompts`` (source-image ingestion) and
-    ``build_condition`` (image_latent capture + unpack). The packed-trajectory
-    unpack in :meth:`build_segment` is inherited unchanged — the Edit-Plus
-    denoise loop records a noise-only trajectory (the image_latent concat lives
-    in a separate ``latent_model_input`` per step, never written back to
-    ``latents``), so the T2I unpack is correct.
-    """
+    """Qwen-Image-Edit-Plus — text+image → image edit (single diffusion stage)."""
 
     pad_mask_to_embeds = True
 
     def build_prompts(self, sample: Sample) -> Dict[str, Any]:
-        """Inject source-image PIL via ``condition_image`` sampling kwarg.
-
-        Edit-Plus **requires** a source image per prompt (fail-fast if absent).
-        The PIL is handed to SGLang verbatim — ``InputValidationStage``
-        resizes it to condition_size + vae_size, ``ImageVAEEncodingStage``
-        VAE-encodes it and sets ``batch.image_latent``. The driver never
-        replicates VAE preprocessing.
-
-        The K-expanded prompt collapse (``deexpand_prompts_from_groups``) is
-        inherited from :meth:`ImageAdapter.build_prompts`; we only add the
-        ``condition_image`` key alongside ``prompt``.
-        """
+        """Inject source-image PIL via ``condition_image`` sampling kwarg."""
         turns, image_batches = sample.vision_conditioning()
         text_turns = [turn.content for turn in turns if isinstance(turn.content, Texts)]
         if len(text_turns) != 1 or len(image_batches) != 1:
@@ -104,29 +48,13 @@ class QwenImageEditPlusAdapter(QwenImageAdapter):
         return out
 
     def build_condition(self, results: List[RawResult]) -> Dict[str, Any]:
-        """T2I text-capture conditions + Edit-Plus ``image_latent``.
-
-        Calls ``super().build_condition`` for the ``text`` / ``negative_text``
-        slots, then collects the per-result ``image_latent`` (packed
-        ``[1, S_img, C*4]``) + ``image_latent_sizes`` (the ``[(vae_width,
-        vae_height)]`` pixel pair), unpacks each to spatial
-        ``[1, 16, H_img, W_img]``, and preserves the per-sample tensors as a
-        :class:`QwenImageEditPlusLatentCondition`.
-        """
+        """T2I text-capture conditions + Edit-Plus ``image_latent``."""
         cond_dict = super().build_condition(results)
         cond_dict["image_latent"] = QwenImageEditPlusLatentCondition(latents=self._collect_image_latents(results))
         return cond_dict
 
     def _collect_image_latents(self, results: List[RawResult]) -> List[torch.Tensor]:
-        """Collect per-result image latents without forcing a shared grid.
-
-        Each result's ``image_latent`` is the packed source-image latent
-        ``[1, S_img, C*4]`` (one-element list injected by ``patch_conditions``).
-        The paired ``image_latent_sizes`` carries ``[(vae_width, vae_height)]``
-        (pixel W, H after upstream's ``calculate_vae_image_size`` resize to
-        ~1024²). The latent grid is ``vae_height // vae_scale_factor`` ×
-        ``vae_width // vae_scale_factor``.
-        """
+        """Collect per-result image latents without forcing a shared grid."""
         from unirl.models.qwen_image.diffusion import _unpack_latents
 
         tensors: List[torch.Tensor] = []

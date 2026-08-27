@@ -1,40 +1,4 @@
-"""WAN 2.1 diffusion: typed params + per-step kernel + rollout-level stage.
-
-Three classes:
-
-- ``WAN21DiffusionParams`` — typed request-shape knobs (steps / guidance /
-  height / width / num_frames / seed / sde_indices / eta /
-  init_same_noise / samples_per_prompt / noise_group_ids).
-- ``WAN21DiffusionStep`` — stateless per-step kernel. ``step`` /
-  ``step_with_logp`` take the model + conditions + strategy and run both
-  CFG noise prediction and the SDE transition (via
-  ``StepStrategy.denoise``). ``forward`` is a lower-level helper that
-  takes a precomputed ``noise_pred``.
-- ``WAN21DiffusionStage`` — implements ``DiffusionStage[WAN21Conditions]``.
-  Owns the SDE ``strategy`` and the loop bookkeeping; delegates the
-  per-step model+SDE work to the kernel. Also exposes ``replay`` for
-  single-step log-prob replay during training.
-
-CFG math derived from ``samplers/fsdp/wan_sampler.py`` and
-``models/wan21.py::forward_denoiser`` (do NOT import legacy code).
-
-WAN-specific deviations from SD3 v2:
-
-- Hidden state is 5D ``[B, C, T_lat, H_lat, W_lat]`` (3D VAE temporal
-  dim), not 4D. Latent shape is computed from ``num_frames`` /
-  ``height`` / ``width`` with ``temporal_downsample=4`` /
-  ``spatial_downsample=8``.
-- ``WanTransformer3DModel`` takes ``encoder_hidden_states`` directly
-  (no ``pooled_projections``).
-- ``timestep`` is a 1D ``[B]`` tensor scaled by 1000 (matches WAN's
-  training-time timestep convention).
-- I2V channel concat: when ``conditions.image_latent`` is set the 20-
-  channel mask+image payload is prepended on the channel axis before
-  the transformer call (``in_channels`` jumps from 16 to 36).
-- I2V CLIP-vision: when ``conditions.image_embed`` is set the patch
-  embeddings are forwarded as ``encoder_hidden_states_image`` (batch-
-  doubled to match the CFG ``[uncond, cond]`` stack).
-"""
+"""WAN 2.1 diffusion: typed params + per-step kernel + rollout-level stage."""
 
 from __future__ import annotations
 
@@ -53,17 +17,11 @@ from unirl.utils.dtypes import parse_torch_dtype
 from .bundle import WAN21Bundle
 from .conditions import WAN21Conditions
 
-_WAN_TIMESTEP_SCALE: float = 1000.0
-
 
 class WAN21DiffusionStep(DiffusionStep[WAN21Bundle, WAN21Conditions]):
-    """Per-step WAN 2.1 denoising kernel — stateless.
+    """Per-step WAN 2.1 denoising kernel — stateless."""
 
-    ``step`` / ``step_with_logp`` take the model + conditions + an SDE
-    ``strategy`` per call, run CFG noise prediction internally, then
-    apply the transition via ``strategy.denoise``. ``forward`` is the
-    lower-level escape hatch that takes a precomputed ``noise_pred``.
-    """
+    TIMESTEP_SCALE: ClassVar[float] = 1000.0  # sigma [0, 1] -> WAN timestep [0, 1000]
 
     def predict_noise(
         self,
@@ -74,13 +32,7 @@ class WAN21DiffusionStep(DiffusionStep[WAN21Bundle, WAN21Conditions]):
         *,
         guidance_scale: float,
     ) -> torch.Tensor:
-        """Run WAN transformer with CFG batched ``[uncond, cond]`` forward.
-
-        Reads ``conditions.text.embeds`` for the conditional branch. For
-        ``guidance_scale > 1`` reads ``conditions.negative_text.embeds``
-        for the unconditional branch; falls back to zero embeddings when
-        ``negative_text`` is ``None``.
-        """
+        """Run WAN transformer with CFG batched ``[uncond, cond]`` forward."""
         if conditions.text is None:
             raise ValueError("WAN21DiffusionStep.predict_noise: conditions.text is None")
         text = conditions.text
@@ -89,7 +41,7 @@ class WAN21DiffusionStep(DiffusionStep[WAN21Bundle, WAN21Conditions]):
             raise ValueError("WAN21DiffusionStep.predict_noise: conditions.text.embeds is None")
 
         batch_size = int(sample.shape[0])
-        timestep = sigma * _WAN_TIMESTEP_SCALE
+        timestep = sigma * self.TIMESTEP_SCALE
         if timestep.dim() == 0:
             timestep = timestep.expand(batch_size)
         elif int(timestep.shape[0]) != batch_size:
@@ -157,13 +109,7 @@ class WAN21DiffusionStep(DiffusionStep[WAN21Bundle, WAN21Conditions]):
         eta: float = 1.0,
         step_index: int = 0,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """Run one SDE transition given a precomputed ``noise_pred``.
-
-        Returns ``(prev_sample, log_prob, prev_sample_mean)``.
-        ``prev_sample=None`` means sampling mode; otherwise log-prob
-        replay. ``log_prob`` and ``prev_sample_mean`` are ``None`` for
-        deterministic steps (``eta=0`` or DPM2-style ODE).
-        """
+        """Run one SDE transition given a precomputed ``noise_pred``."""
         return strategy.denoise(
             noise_pred=noise_pred,
             sample=sample,
@@ -190,10 +136,7 @@ class WAN21DiffusionStep(DiffusionStep[WAN21Bundle, WAN21Conditions]):
         eta: float = 1.0,
         step_index: int = 0,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """Run model forward + SDE transition. End-to-end one diffusion step.
-
-        Returns ``(prev_sample, log_prob, prev_sample_mean)``.
-        """
+        """Run model forward + SDE transition. End-to-end one diffusion step."""
         noise_pred = self.predict_noise(model, sample, sigma, conditions, guidance_scale=guidance_scale)
         return self.forward(
             strategy=strategy,
@@ -222,11 +165,7 @@ class WAN21DiffusionStep(DiffusionStep[WAN21Bundle, WAN21Conditions]):
         eta: float = 1.0,
         step_index: int = 0,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """Run model forward + SDE transition.
-
-        Returns ``(prev_sample, log_prob, prev_sample_mean)``. ``log_prob``
-        and ``prev_sample_mean`` are ``None`` for deterministic strategies.
-        """
+        """Run model forward + SDE transition."""
         return self.step(
             model,
             conditions,
@@ -243,27 +182,7 @@ class WAN21DiffusionStep(DiffusionStep[WAN21Bundle, WAN21Conditions]):
 
 
 class WAN21DiffusionStage(DiffusionStage[WAN21Conditions]):
-    """WAN 2.1 T2V rollout-level diffusion stage.
-
-    Owns the SDE ``strategy`` (stateful strategies require a stable
-    instance across the loop), the bundle, the kernel, and the precision
-    policy. The kernel is stateless and is invoked per-step with the
-    strategy passed in.
-
-    ``diffuse(conditions, *, schedule, params)`` runs the full sampling
-    loop and returns a ``LatentSegment`` carrying the trajectory plus
-    per-SDE log probs (``sde_logp [N, S]`` + ``sde_indices [S]``).
-
-    ``replay(conditions, *, segment, params, step_indices=None)``
-    recomputes log-probs for the SDE transitions in a stored
-    ``LatentSegment``. Returns a :class:`ReplayResult` for GRPO-style
-    training (log_probs + per-step Gaussian mean μ_θ).
-
-    ``_no_split_modules`` is the model-side fallback used by FSDPPolicy
-    when HF auto-discovery yields nothing — diffusers'
-    ``WanTransformer3DModel`` doesn't follow the HF transformers
-    convention, so we declare it here.
-    """
+    """WAN 2.1 T2V rollout-level diffusion stage."""
 
     _no_split_modules: ClassVar[Tuple[str, ...]] = ("WanTransformerBlock",)
 
@@ -292,13 +211,7 @@ class WAN21DiffusionStage(DiffusionStage[WAN21Conditions]):
         self.latent_channels = int(getattr(getattr(model.vae, "config", None), "z_dim", self._DEFAULT_LATENT_CHANNELS))
 
     def _latent_shape(self, *, num_frames: int, height: int, width: int) -> Tuple[int, int, int, int]:
-        """Return ``(C, T_lat, H_lat, W_lat)``.
-
-        Pixel-space ``num_frames`` collapses to ``(num_frames - 1) //
-        temporal_downsample + 1`` latent frames — matches WAN's reference
-        implementation and the legacy sampler at
-        ``samplers/fsdp/wan_sampler.py``.
-        """
+        """Return ``(C, T_lat, H_lat, W_lat)``."""
         if (int(num_frames) - 1) % self._TEMPORAL_DOWNSAMPLE != 0:
             raise ValueError(
                 f"WAN VAE temporal_downsample={self._TEMPORAL_DOWNSAMPLE} requires "
@@ -318,13 +231,7 @@ class WAN21DiffusionStage(DiffusionStage[WAN21Conditions]):
         params: DiffusionSamplingParams,
         initial_latents: Optional[torch.Tensor] = None,
     ) -> LatentSegment:
-        """Run full WAN 2.1 T2V sampling. Returns a ``LatentSegment``.
-
-        ``initial_latents`` (optional) — x_T resolved from the request
-        ``Sample``'s diffusion generation Part. When provided,
-        used verbatim and the internal ``generate_latents`` RNG path is
-        bypassed. See :class:`SD3DiffusionStage.diffuse` for the contract.
-        """
+        """Run full WAN 2.1 T2V sampling. Returns a ``LatentSegment``."""
         from unirl.sde.noise import generate_latents
 
         if conditions.text is None or conditions.text.embeds is None:
@@ -437,19 +344,7 @@ class WAN21DiffusionStage(DiffusionStage[WAN21Conditions]):
         params: DiffusionSamplingParams,
         step_indices: Optional[List[int]] = None,
     ) -> ReplayResult:
-        """Segment-based log-prob replay over the rollout's SDE transitions.
-
-        Loops the per-step replay primitive (``step.step_with_logp`` with
-        ``prev_sample`` set) over the segment's SDE indices (or the
-        ``step_indices`` subset, which must be a subset of
-        ``segment.sde_indices``). Returns a :class:`ReplayResult` with
-        ``log_probs`` shape ``[B, len(target)]`` (cast to
-        ``logprob_precision``) and ``prev_sample_means`` shape
-        ``[B, len(target), C, T_lat, H_lat, W_lat]`` for KL penalty.
-
-        Caller is responsible for ``.train()`` mode + grad scope; this
-        method only manages the autocast scope.
-        """
+        """Log-prob replay: ``log_probs [B, len(target)]``, means ``[B, len(target), C, T_lat, H_lat, W_lat]``."""
         if segment.sde_indices is None or segment.latents is None:
             raise ValueError("WAN21DiffusionStage.replay: segment.sde_indices / latents missing")
         if segment.sigmas is None:
@@ -519,10 +414,7 @@ class WAN21DiffusionStage(DiffusionStage[WAN21Conditions]):
         sigma: torch.Tensor,
         params: DiffusionSamplingParams,
     ) -> torch.Tensor:
-        """Single ``(xt, sigma)`` model forward — no scheduler iteration.
-
-        Delegates to ``WAN21DiffusionStep.predict_noise``.
-        """
+        """Single ``(xt, sigma)`` model forward — no scheduler iteration."""
         return self.step.predict_noise(
             self.model,
             sample,
@@ -532,13 +424,7 @@ class WAN21DiffusionStage(DiffusionStage[WAN21Conditions]):
         )
 
     def trainable_module(self) -> "torch.nn.Module":
-        """Return the module the diffusion forward operates on.
-
-        For WAN 2.1, that's the bundle's transformer
-        (``WanTransformer3DModel``) — the FSDP wrap target. Aux modules
-        (VAE, text encoder) are siblings on the bundle, never under the
-        transformer.
-        """
+        """Return the module the diffusion forward operates on."""
         return self.model.transformer
 
 

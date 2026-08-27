@@ -55,18 +55,7 @@ class MiniMaxH3VideoDecodeStage:
 
 
 class MiniMaxH3AudioDecodeStage:
-    """Packed audio rows -> stereo ``Audios``.
-
-    MiniMax-H3 carries stereo as two channel-major blocks of audio rows, and the
-    audio VAE itself is MONO -- the two channels ride through it as two batch
-    items. The decoded result is therefore ``[1, 2, L]`` channel-first, which is
-    NOT what ``Audios`` wants: ``Batch.pack`` treats dim 0 as the varlen length
-    axis, so a ``[2, L]`` waveform would be silently read as a two-sample batch.
-    This stage transposes to length-first ``[L, 2]``.
-
-    (LTX-2's audio stage instead mean-downmixes to mono ``[L]``; that is a
-    lossy shortcut this model cannot take -- H3's whole audio pitch is stereo.)
-    """
+    """Packed audio rows -> stereo ``Audios``."""
 
     def __init__(self, bundle: "MiniMaxH3Bundle") -> None:
         self.audio_vae = bundle.audio_vae

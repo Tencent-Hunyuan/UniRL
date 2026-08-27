@@ -1,21 +1,4 @@
-"""Construction config for the typed Qwen-Image-Edit-Plus pipeline.
-
-Mirrors :class:`unirl.models.qwen_image.QwenImagePipelineConfig` field-for-
-field. The Edit-Plus checkpoint ships the same ``transformer/``, ``vae/``,
-``text_encoder/``, ``tokenizer/``, ``scheduler/`` subfolders as base
-Qwen-Image; only ``transformer/config.json`` differs (``in_channels=64``
-vs ``16`` for the wider input projection that absorbs the source-image
-latent concat). The bundle reads ``in_channels`` automatically, so no new
-field is needed here.
-
-Condition-image conditioning: ``use_condition_image_prompt`` (default True)
-feeds the source image into the Qwen2.5-VL text encoder — the correct
-Edit-Plus behavior (mirrors upstream ``encode_prompt(image=...)`` and the
-SGLang rollout path). Set it False for Edit **text-only** encoding: same
-edit chat template / drop-64, empty image prefix (upstream
-``_get_qwen_prompt_embeds(..., image=None)``). This is **not** a switch to
-base Qwen-Image's text-only stage (different system prompt / drop-34).
-"""
+"""Construction config for the typed Qwen-Image-Edit-Plus pipeline."""
 
 from __future__ import annotations
 
@@ -28,14 +11,7 @@ from unirl.models.qwen_image.config import _qwen_image_dynamic_overrides
 
 @dataclass
 class QwenImageEditPlusPipelineConfig:
-    """Construction args for :meth:`QwenImageEditPlusPipeline.from_config`.
-
-    Field-for-field compatible with
-    :class:`unirl.models.qwen_image.QwenImagePipelineConfig` — the Edit-Plus
-    bundle inherits :meth:`QwenImageBundle.from_config` unchanged, so every
-    knob (paths, precision, LoRA hints, meta-init, dynamic-shift) carries
-    the same meaning.
-    """
+    """Construction args for :meth:`QwenImageEditPlusPipeline.from_config`."""
 
     pretrained_model_ckpt_path: str
     vae_ckpt_path: Optional[str] = None

@@ -1,19 +1,4 @@
-"""Construction config for the typed Qwen-Image pipeline.
-
-Sibling of :class:`unirl.models.sd3.SD3PipelineConfig`. Carries
-weights+precision knobs only; LoRA injection, FSDP wrapping, gradient
-checkpointing, and offload control all live in ``cfg.training.policies``
-(``LoRAPolicy`` / ``FSDPPolicy``) — the bundle is weights+params only.
-
-``shift`` lives here so the hosting engine can build the
-:class:`FlowMatchSchedulePolicy` at startup. Qwen-Image's
-``scheduler/scheduler_config.json`` ships with
-``use_dynamic_shifting: True`` + ``base_shift / max_shift /
-base_image_seq_len / max_image_seq_len``, so
-:meth:`FlowMatchSchedulePolicy.from_pretrained` picks up the dynamic
-branch automatically. The ``shift`` argument is only used as a fallback
-when no pretrained dir is available (tests / ad-hoc smoke).
-"""
+"""Construction config for the typed Qwen-Image pipeline."""
 
 from __future__ import annotations
 
@@ -24,20 +9,7 @@ from unirl.config.validation import validate_precision_type
 
 
 def _qwen_image_dynamic_overrides() -> Dict[str, Any]:
-    """Canonical dynamic-shift params for Qwen-Image.
-
-    Mirrors ``Qwen/Qwen-Image``'s ``scheduler/scheduler_config.json``
-    (max_shift 0.9, max_image_seq_len 8192, shift_terminal 0.02 — NOT the
-    Flux-flavored ``calculate_shift`` defaults this dict previously carried).
-    Used by vllm_omni / sglang engines that read
-    ``model_config.dynamic_shift_overrides`` when constructing
-    :class:`FlowMatchSchedulePolicy` for an HF-repo-id path where
-    ``scheduler/scheduler_config.json`` can't be read directly; a local
-    checkpoint dir reads the real JSON and must produce the same values.
-
-    Trainside engine reads these via ``QwenImagePipeline.build_schedule_policy``.
-    Keep the two paths in sync if anything here changes.
-    """
+    """Canonical dynamic-shift params for Qwen-Image."""
     return {
         "base_shift": 0.5,
         "max_shift": 0.9,
@@ -52,12 +24,7 @@ def _qwen_image_dynamic_overrides() -> Dict[str, Any]:
 
 @dataclass
 class QwenImagePipelineConfig:
-    """Construction args for ``QwenImagePipeline.from_config``.
-
-    ``device`` may be runtime-injected by the actor after compose; the
-    other fields are set at compose time and read once during pipeline
-    construction.
-    """
+    """Construction args for ``QwenImagePipeline.from_config``."""
 
     pretrained_model_ckpt_path: str
     vae_ckpt_path: Optional[str] = None
