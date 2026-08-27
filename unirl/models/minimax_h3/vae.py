@@ -10,20 +10,13 @@ from unirl.types.primitives import Audio, Audios, Video, Videos
 
 from .config import MINIMAX_H3_LATENT_CHANNELS, MINIMAX_H3_PATCH_SIZE
 from .packing import MiniMaxH3Geometry
-from .vendor import (
-    MINIMAX_H3_AUDIO_LATENTS_PER_SECOND,
-    unpack_audio_tokens,
-    unpatchify_video_tokens,
-)
+from .vendor import unpack_audio_tokens, unpatchify_video_tokens
 
 if TYPE_CHECKING:
     from .bundle import MiniMaxH3Bundle
 
-# The audio VAE hops 800 samples at 32 kHz -- i.e. the 40 latents/s the packing
-# module pins the rotary clock to. Derived rather than hardcoded so the two
-# constants cannot drift apart.
-MINIMAX_H3_AUDIO_HOP = 800
-MINIMAX_H3_AUDIO_SAMPLE_RATE = MINIMAX_H3_AUDIO_LATENTS_PER_SECOND * MINIMAX_H3_AUDIO_HOP
+# Fallback when an audio VAE component is unavailable, matching Diffusers.
+MINIMAX_H3_AUDIO_SAMPLE_RATE = 32_000
 
 # The video VAE's pixel convention: ImageNet-normalized RGB over a [0, 1] base.
 _PIXEL_MEAN = (0.485, 0.456, 0.406)

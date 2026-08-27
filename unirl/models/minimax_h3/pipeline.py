@@ -92,6 +92,13 @@ class MiniMaxH3Pipeline(Pipeline):
         """
         return FlowMatchSchedulePolicy.static_only(shift=float(self.config.video_shift))
 
+    @property
+    def audio_sampling_rate(self) -> int:
+        """Read the generated-audio sampling rate from the loaded VAE config."""
+        if getattr(self.bundle, "audio_vae", None) is not None:
+            return int(self.bundle.audio_vae.config.sampling_rate)
+        return MINIMAX_H3_AUDIO_SAMPLE_RATE
+
     @classmethod
     def latent_shape(cls, *, model_config: Any, sampling_spec: Any) -> Tuple[int, ...]:
         """Per-sample UNPACKED video latent shape for the driver x_T recipe.
@@ -175,7 +182,7 @@ class MiniMaxH3Pipeline(Pipeline):
         filled = gen.fill(
             segment=segment,
             primitives={"video": videos, "audio": audios},
-            primitive_metadata={"audio": {"sample_rate": MINIMAX_H3_AUDIO_SAMPLE_RATE}},
+            primitive_metadata={"audio": {"sample_rate": self.audio_sampling_rate}},
             conditions=conditions.to_dict(),
         )
         # `Part.fill` returns a PART; the engine does `chunk.parts[-1]` on what
