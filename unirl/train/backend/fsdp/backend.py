@@ -84,7 +84,7 @@ class FSDPBackend(BaseFSDP2Backend):
             param_dtype=fsdp_cfg.param_dtype,
             cpu_offload=fsdp_cfg.cpu_offload,
             mixed_precision=fsdp_cfg.mixed_precision,
-            cast_forward_inputs=getattr(fsdp_cfg, "cast_forward_inputs", True),
+            cast_forward_inputs=fsdp_cfg.cast_forward_inputs,
             fsdp_mode=fsdp_cfg.fsdp_mode,
             reshard_after_forward=fsdp_cfg.reshard_after_forward,
             forward_prefetch=fsdp_cfg.forward_prefetch,
