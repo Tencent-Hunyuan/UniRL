@@ -1,17 +1,10 @@
 # @package _global_
 # MiniMax-H3 t2va (text -> video + stereo audio) Flow-GRPO — trainside FSDP.
 #
-# 33B dense omni-modal transformer denoising video and stereo audio jointly in one
-# packed sequence. Reward rises at this canvas, +0.00234/step over two seeds.
-#
-# WARNING: NO TERM IN THIS REWARD RELATES THE PROMPT TO THE VIDEO. `imagebind`
-# reduces to cos(audio_emb, video_emb) because its `mode` is unreachable through
-# T2AVCompositeScorer, and `clap` never sees a pixel. `minimax_h3_t2va_nft.yaml`
-# on this reward decoded to luma 2.0/255 at rollout 100 while imagebind sat at its
-# maximum, so a rising number is not evidence of better video. Look at frames.
-#
-# For 768x768, restore height/width and pin `sde_indices: [0, 3, 6, 9]`; ten
-# steps do not fit there.
+# Reward rises at this canvas, +0.00234/step over two seeds. WARNING: nothing in
+# this reward relates the prompt to the video, and the NFT sibling on it decoded
+# to luma 2/255 while imagebind peaked — check frames before trusting the number.
+# For 768x768, restore height/width and pin `sde_indices: [0, 3, 6, 9]`.
 #
 # Launch (1 node x 8 GPUs):
 #   bash examples/run_experiment_multinode_taiji.sh diffusion/minimax_h3/minimax_h3_t2va_trainside
@@ -37,7 +30,7 @@ bundle:
     _target_: unirl.models.minimax_h3.config.MiniMaxH3PipelineConfig
     pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,MiniMaxAI/MiniMax-H3}
     model_precision: bf16
-    # fp32 by checkpoint contract; the audio VAE emits ~20 dB too quiet in bf16.
+    # The audio VAE emits ~20 dB too quiet in bf16.
     vae_dtype: fp32
     audio_vae_dtype: fp32
     autocast_precision: bf16
@@ -46,9 +39,7 @@ bundle:
     video_shift: 12.0
     audio_shift: 3.0
     text_encoder_hidden_layer: 50
-    # Puts audio transitions in the policy, so clap can reach the audio stream.
     audio_joint_sde: true
-    # The 32B conditioner outweighs the trainable DiT's per-rank shard.
     aux_components_on_cpu: true
     vae_components_on_cpu: false
     meta_init_transformer: true
@@ -68,26 +59,21 @@ backend:
     _target_: unirl.train.configs.FSDPConfig
     param_dtype: bf16
     cpu_offload: false
-    # No `master_dtype`, so fsdp_wrap's cast loop skips every param and the
-    # trainable LoRA adapters stay bf16; `fp32` there is untried at this canvas.
     mixed_precision: true
     fsdp_mode: full
     reshard_after_forward: true
     activation_checkpointing: true
     use_torch_compile: false
-    # LOAD-BEARING, and an FSDPConfig field rather than an FSDPBackend one. Keeps
-    # the fp32-pinned modules out of every fully_shard group: H3 conditions on
-    # t = 1 - sigma, and bf16 near 1.0 has ~0.008 spacing, so running the timestep
-    # MLP in bf16 costs ~40% relative error on sigma at the low-noise end.
+    # Keeps the fp32-pinned modules unsharded: H3 conditions on t = 1 - sigma, and
+    # a bf16 timestep MLP costs ~40% relative error on sigma near t=1.
     root_wrap: false
   optimizer_cfg:
     _target_: unirl.train.backend.base.OptimizerConfig
     learning_rate: 1.0e-4
     adam_beta1: 0.9
     adam_beta2: 0.999
-    # The log-prob is a mean over ~354k latent elements, so grad_norm sits at 3e-5
-    # and the per-coordinate gradient falls below the usual 1e-8 where eps would
-    # dominate Adam's denominator. Do not "fix" the small grad_norm.
+    # grad_norm is 3e-5 because the log-prob averages ~354k latent elements; at a
+    # larger eps Adam degrades toward SGD. Do not "fix" the small grad_norm.
     adam_epsilon: 1.0e-12
     weight_decay: 0.0
   scheduler_cfg:
@@ -102,9 +88,8 @@ backend:
     dropout: 0.0
     bias: none
     task_type: FEATURE_EXTRACTION
-    # LOAD-BEARING alongside root_wrap. These suffixes also occur in
-    # `token_refiner.refiner_blocks.*`, outside block_class_names, so an unscoped
-    # list injects LoRA params that no collective would DP-sync.
+    # These suffixes recur in `token_refiner.refiner_blocks.*`, outside
+    # block_class_names, where injected LoRA params get no DP gradient sync.
     module_prefix: transformer_blocks
     target_modules:
       - attn.to_q
@@ -129,18 +114,14 @@ reward:
       device: auto
       batch_size: 2
       frame_selection: middle
-      # LICENCE: ImageBind is CC-BY-NC-SA, so this recipe is NonCommercial.
+      # ImageBind is CC-BY-NC-SA, so this recipe is NonCommercial.
       weights:
         imagebind: 1.0
         clap: 1.0
-      # `mode: all` (reachable once UniRL#404 lands) adds the text terms this
-      # objective lacks; unset here because changing the reward would leave the
-      # header's numbers describing a configuration no longer in the file.
 
 algorithm:
   _target_: unirl.algorithms.flowgrpo.FlowGRPO
   stage_attr: diffusion
-  # Inert at num_updates_per_batch=1: both sides of the ratio share weights.
   clip_range: 5.0e-3
   clip_schedule: constant
   old_logp_source: replay
@@ -169,18 +150,16 @@ sampling:
   _target_: unirl.types.sampling.DiffusionSamplingParams
   num_inference_steps: 10
   guidance_scale: 1.0
-  # No `sde_indices` key, deliberately: omitting it trains every step. replay()
-  # builds one autograd graph across them, ~2.2 GB per step at 3966 rows against
-  # ~12 GB at 768x768, where ten exceed 100 GB/rank and OOM after a paid rollout.
+  # Omitted deliberately, which trains all 10 steps: replay builds one autograd
+  # graph over them, ~2.2 GB per step here against ~12 GB at 768x768 where ten
+  # exceed 100 GB/rank and OOM after a paid rollout.
   height: 256
   width: 384
-  # 17n+5 pixel frames map to 5n+2 latent, and the 5 s minimum at 24 fps makes 124
-  # the smallest legal count — frames cannot be traded for row budget.
+  # 17n+5 pixel frames map to 5n+2 latent, so the 5 s minimum makes 124 the
+  # smallest legal count; frames cannot be traded for row budget.
   num_frames: 124
-  # Safe only under CPS, and the sweep locating this peak was run at 768x768.
   eta: 0.7
-  # The group size IS the advantage estimator. Keep total samples near 128: 512
-  # per step exhausted a 2.2 TB host during reward scoring.
+  # Keep total samples near 128: 512 per step exhausted a 2.2 TB host in scoring.
   samples_per_prompt: 16
   seed: 42
   init_same_noise: false
