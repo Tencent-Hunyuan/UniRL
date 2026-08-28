@@ -1,0 +1,281 @@
+# @package _global_
+# MiniMax-H3 t2va (text -> video + stereo audio) Flow-GRPO — trainside FSDP.
+#
+# MiniMax-H3 is a 33B dense omni-modal transformer that denoises video and
+# stereo audio jointly in ONE packed sequence. Three properties drive this
+# recipe and are checkpoint contracts, not tuning knobs:
+#
+#   1. GUIDANCE IS DISTILLED. No CFG, no negative prompt, one forward per step.
+#      guidance_scale below is inert — the stage never reads it.
+#   2. TWO SCHEDULES. Video shift=12, audio shift=3. Only the VIDEO grid is
+#      pinned onto the Part; the audio grid is derived in-stage from the same
+#      static formula. N UniRL steps match N+1 vendored-scheduler grid points.
+#   3. MIXED-DTYPE WEIGHTS. `_keep_in_fp32_modules` (patch projections, timestep
+#      MLP, output heads, rope) stays fp32 while the block stack is bf16. That
+#      is why `root_wrap: false` below is load-bearing — see the backend block.
+#
+# GEOMETRY IS NOT FREE. H3 was released for a 768px SHORT EDGE only, both axes
+# a multiple of 32, and 5–15s at 24fps. 768x768 / 124 frames (~5.17s) is the
+# FLOOR — roughly 22k packed rows. The pipeline raises on anything else rather
+# than silently re-resolving. There is no cheap low-res setting for this model.
+#
+# Launch (1 node x 8 GPUs):
+#   bash examples/run_experiment_multinode_taiji.sh diffusion/minimax_h3/minimax_h3_t2va_trainside
+
+num_devices: 8
+batch_size: 8
+num_rollouts: 10000
+adv_use_global_std: true
+
+logging:
+  report_to_wandb: true
+  project_name: ${oc.env:WANDB_PROJECT,unirl-minimax-h3-t2va}
+  run_name: null
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: [minimax-h3, t2va, flowgrpo, trainside, audio, stereo]
+  log_media: true
+  media_max_items: 2
+  media_log_interval: 1000
+
+bundle:
+  _target_: unirl.models.minimax_h3.bundle.MiniMaxH3Bundle.from_config
+  config:
+    _target_: unirl.models.minimax_h3.config.MiniMaxH3PipelineConfig
+    # Required local snapshot: meta-init's sharded loader does not accept HF repo IDs.
+    pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL}
+    model_precision: bf16
+    # Both VAEs are fp32 by checkpoint contract. The AUDIO VAE especially:
+    # the reference reports bf16 output ~20 dB too quiet.
+    vae_dtype: fp32
+    audio_vae_dtype: fp32
+    trajectory_precision: fp16
+    logprob_precision: fp32
+    video_shift: 12.0
+    audio_shift: 3.0
+    audio_joint_sde: true
+    # The Qwen3-VL conditioner is 32B (~64 GB bf16) — larger than the trainable
+    # DiT's per-rank shard. Parking it on CPU is what makes 8x80GB fit. Prompts
+    # are embedded once per rollout (measured: 0.8s on CPU), so the transfer
+    # cost is negligible against a 22k-row denoising loop.
+    aux_components_on_cpu: true
+    # The VAEs stay on the train device. They are only ~10 GB fp32 together
+    # against a 7.75 GB/rank DiT shard, and decoding 124 frames of 768x768 on
+    # CPU takes MINUTES per sample — it would dominate a rollout that spends
+    # ~2 minutes denoising.
+    vae_components_on_cpu: false
+    # 33B eager-loads ~66 GB per rank. Meta-init defers materialization until
+    # after sharding; the bundle hands the fp32 pin list through so the
+    # mixed-dtype layout survives `to_empty`.
+    meta_init_transformer: true
+
+pipeline:
+  _target_: unirl.models.minimax_h3.pipeline.MiniMaxH3Pipeline.from_bundle
+  config: ${bundle.config}
+  strategy:
+    # CPS, not the usual FlowSDE. MEASURED, and the difference is large enough
+    # that FlowSDE is simply not usable on this checkpoint at any interesting
+    # eta. A flow denoiser expects a specific noise level at each sigma -- that
+    # is what the schedule IS. FlowSDE adds its exploration noise ON TOP of that
+    # level, handing the next step a state noisier than anything the model was
+    # trained on; H3 is guidance-distilled, so it has the least capacity of any
+    # model class to spend steps cleaning that up, and the residue lands in the
+    # output as speckle. CPS instead reallocates WITHIN the budget --
+    # det^2 + std^2 == sigma_next^2 exactly -- so every state stays on-schedule.
+    #
+    # K=4 per eta, one shared x_T, scored with the real videopickscore:
+    #     kernel   eta   quality  explore  latent std  video
+    #     CPS      0.7   0.8776   0.0162   1.001       clean
+    #     FlowSDE  0.2   0.8748   0.0039   1.028       clean   <- the old default
+    #     FlowSDE  0.7   0.7282   0.0195   1.228       SPECKLE
+    #
+    # Note the trap in that last row: FlowSDE at 0.7 has the HIGHEST reward
+    # spread in the sweep and the WORST video. That spread is speckle variance,
+    # not scene diversity. Never tune eta on in-group reward std alone -- it
+    # selects exactly the setting that destroys the sample. Look at frames.
+    _target_: unirl.sde.kernels.CPSSDEStrategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["MiniMaxH3TransformerBlock"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    master_dtype: fp32
+    cpu_offload: false
+    mixed_precision: true
+    # Keep the fp32 timestep embedding intact until each block explicitly casts
+    # the post-SiLU value to its bf16 AdaLN projection.
+    cast_forward_inputs: false
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true
+    use_torch_compile: false
+    # LOAD-BEARING alongside cast_forward_inputs=false. With root_wrap false,
+    # the fp32-pinned leftovers (proj_in, audio_proj_in, time_embedder,
+    # proj_out, audio_proj_out, rope) sit outside
+    # every fully_shard group, so MixedPrecisionPolicy never all-gathers a bf16
+    # compute copy of them and they keep the precision the checkpoint stores.
+    # Under LoRA they are frozen, so the stray-trainable-param guard passes.
+    # Flipping this to true silently runs the timestep MLP in bf16 — and since
+    # H3 conditions on t = 1 - sigma, bf16 near 1.0 has ~0.008 spacing, i.e.
+    # ~40% relative error on sigma at the low-noise end.
+    # NOTE: this is an FSDPConfig field, NOT an FSDPBackend one.
+    root_wrap: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 3.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    # MEASURED, NOT THE USUAL DEFAULT. Adam's step is lr*m/(sqrt(v)+eps), which
+    # is scale-invariant only while sqrt(v) >> eps. This adapter has 166,297,600
+    # trainable params and a grad_norm of ~5e-5, i.e. a PER-COORDINATE gradient
+    # of ~3.9e-9 -- BELOW the usual 1e-8. Epsilon then dominates the denominator
+    # and the update shrinks in proportion to the gradient, degrading Adam
+    # toward SGD. Measured: ||B|| after 2 rollouts was 0.194 under CPS vs 0.707
+    # under FlowSDE, a 3.6x handicap that is an artefact of eps, not of the
+    # kernel. At 1e-8 even the FlowSDE runs were getting only ~60% of a full
+    # step. 1e-12 puts eps ~4 orders below sqrt(v) so it is negligible again,
+    # while staying far above fp32 underflow (v ~ 1.5e-17).
+    adam_epsilon: 1.0e-12
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 10000
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 32
+    alpha: 64
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    # LOAD-BEARING alongside root_wrap=false. The suffixes below also occur in
+    # `token_refiner.refiner_blocks.*` (MiniMaxH3TokenRefinerBlock — a plain
+    # pre-norm block over the text stream, NOT in block_class_names), so an
+    # unscoped target list injects 24 LoRA params that sit outside every
+    # fully_shard group and whose grads no collective would DP-sync. fsdp_wrap
+    # rejects exactly that. module_prefix scopes the suffixes to the 50-layer
+    # denoising stack, which is what this recipe means to adapt.
+    module_prefix: transformer_blocks
+    # Attention + FFN only. Deliberately NOT the fp32-pinned projections
+    # (proj_in / proj_out / time_embedder) and NOT adaln_proj: adapting a module
+    # the wrap keeps in fp32 outside every FSDP group would put a trainable
+    # param outside all groups, with the same un-synced-grad failure.
+    target_modules:
+      - attn.to_q
+      - attn.to_k
+      - attn.to_v
+      - attn.to_out.0
+      - ff.net.0.proj
+      - ff.net.2
+
+rollout:
+  _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
+  stage_attrs: [diffusion]
+  # Batch-1: the packed sequence carries UNBATCHED per-row metadata
+  # (position_ids / token_tags / timestep_indices), so the engine chunks to one
+  # sample per generate() call. Same discipline as the bagel navit recipe.
+  forward_batch_size: 1
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.local.t2av_composite.T2AVCompositeScorer
+    base_device: cpu
+    config:
+      _target_: unirl.reward.local.t2av_composite.T2AVCompositeSpec
+      device: cpu
+      batch_size: 2
+      frame_selection: middle
+      # videopickscore scores the middle frame (image-text alignment), and
+      # clap scores generated-audio-vs-text. Neither measures motion or A/V
+      # sync; the only real sync scorer is imagebind, which is CC-BY-NC-SA and
+      # therefore opt-in. Revisit these weights before trusting a long run.
+      weights:
+        videopickscore: 0.5
+        clap: 0.5
+
+algorithm:
+  _target_: unirl.algorithms.flowgrpo.FlowGRPO
+  stage_attr: diffusion
+  clip_range: 5.0e-3
+  clip_schedule: constant
+  # Both sides of the PPO ratio come from stage.replay at pre-update weights,
+  # so any residual precision asymmetry between the rollout and replay paths
+  # cancels instead of biasing the ratio. Matters more here than usual: this is
+  # the repo's first mixed-dtype checkpoint.
+  old_logp_source: replay
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.minimax_h3.conditions.MiniMaxH3Conditions
+  params: ${sampling}
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 2
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: datasets/pickscore/train.txt
+      eval_data_path: datasets/pickscore/test.txt
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  # UniRL counts model evaluations; 10 maps to 11 grid points in the vendored scheduler.
+  num_inference_steps: 10
+  # Inert: the checkpoint is guidance-distilled. Kept at 1.0 so nothing reads
+  # it as an instruction to run a second branch.
+  guidance_scale: 1.0
+  # The ONLY legal 1:1 canvas. 124 frames = 5.17s (the VAE maps 17n+5 pixel
+  # frames to 5n+2 latent frames, so 124 -> 37 latent frames).
+  height: 768
+  width: 768
+  num_frames: 124
+  # 0.7 IS ONLY SAFE UNDER CPS. Under the old FlowSDE kernel this same value
+  # produced speckle (quality 0.7282, latent std 1.228 against a correct ~1.01)
+  # and the recipe was pinned at 0.2 because of it. CPS keeps every state on the
+  # noise schedule, so eta becomes a bounded knob on [0,1] -- see the strategy
+  # block above for the kernel comparison and the numbers behind this.
+  #
+  # Measured under CPS, K=4 per eta sharing one x_T, real videopickscore:
+  #     eta    quality   explore   latent std
+  #     0.20   0.9018    0.0061    1.012
+  #     0.40   0.8960    0.0124    0.995
+  #     0.70   0.8776    0.0162    1.001     <- chosen: peak exploration
+  #     0.90   0.8928    0.0136    0.990        past the peak
+  #
+  # Exploration PEAKS at 0.7 and falls at 0.9: there the deterministic component
+  # is only 0.155*sigma_next, so each SDE step nearly discards the trajectory and
+  # restarts from fresh noise, and the denoiser pulls every sample back to its
+  # dominant mode. Over-randomising converges rather than diverges.
+  #
+  # With K=4 the std estimate is itself noisy -- 0.0136 vs 0.0162 is within
+  # sampling error, so do not treat the peak LOCATION as exact. The quality
+  # column is the reliable half.
+  eta: 0.7
+  # MEASURED CONSTRAINT, not a preference. replay() builds ONE autograd graph
+  # across every replayed step, and at ~22k packed rows each step retains
+  # ~12 GB of activation-checkpoint boundaries (50 layers x 21982 x 5376 bf16).
+  # Replaying all 10 steps needs >100 GB/rank and OOMs an H20 (95 GB) during
+  # compute_loss_and_backward, AFTER a ~10-minute rollout. Only these indices
+  # record SDE log-probs, so only these are replayed and trained on -- the
+  # standard flow-GRPO timestep-subset lever. Raise only if the rank has room.
+  # LTX-2 gets away without this because its sequence is ~10x shorter.
+  sde_indices: [0, 3, 6]
+  # Four samples retain reward magnitude while keeping a rollout practical on
+  # one 8xH20 node. Batch-wide std avoids independently amplifying noisy groups.
+  samples_per_prompt: 4
+  seed: 42
+  init_same_noise: true
+  autocast_precision: bf16
+  trajectory_precision: fp16
+  logprob_precision: fp32

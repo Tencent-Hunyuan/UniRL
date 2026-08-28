@@ -30,7 +30,9 @@ class T2AVCompositeScorer(RewardBackend):
             inner_spec = inner_spec_cls()
             import dataclasses
 
-            overrides = {f: getattr(config, f) for f in ("device", "batch_size") if hasattr(inner_spec, f)}
+            # Propagate only fields BOTH the composite and the inner spec declare.
+            shared = ("device", "batch_size", "frame_selection")
+            overrides = {f: getattr(config, f) for f in shared if hasattr(inner_spec, f) and hasattr(config, f)}
             if overrides:
                 inner_spec = dataclasses.replace(inner_spec, **overrides)
             self._scorers[name] = inner_cls(config=inner_spec, base_device=base_device)
@@ -95,4 +97,8 @@ class T2AVCompositeSpec(BaseRewardComponentSpec):
 
     batch_size: int = 8
     device: str = "auto"
+    # Forwarded to inner scorers that declare it (videopickscore). "first"
+    # keeps the historical behaviour; "middle" avoids scoring a blank opening
+    # frame on clips that fade or reveal in.
+    frame_selection: str = "first"
     weights: Dict[str, float] = field(default_factory=lambda: {"videopickscore": 0.5, "clap": 0.5})
