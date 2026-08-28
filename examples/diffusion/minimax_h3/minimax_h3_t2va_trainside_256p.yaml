@@ -245,6 +245,10 @@ reward:
       weights:
         imagebind: 1.0
         clap: 1.0
+      # `mode: all` (reachable once UniRL#404 lands) adds the text_audio and
+      # text_video terms this objective has none of; deliberately unset, because
+      # changing the reward would leave the header's two-seed numbers describing a
+      # configuration that is no longer in this file.
 
 algorithm:
   _target_: unirl.algorithms.flowgrpo.FlowGRPO
