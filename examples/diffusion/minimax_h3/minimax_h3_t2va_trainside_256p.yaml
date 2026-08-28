@@ -14,17 +14,33 @@
 #      why `root_wrap: false` is load-bearing.
 #
 # WHY THIS FILE EXISTS. The sibling `minimax_h3_t2va_trainside.yaml` produces a
-# flat reward curve. This is the same algorithm on a 256x384 canvas, and its
-# reward climbs: +0.00234/step pooled over two independent seeds (t=+6.67,
-# p<0.0001, seeds agreeing at p=0.598) across 45 rollouts each. The canvas is
-# what pays for the other three changes — 3966 packed rows instead of ~22k means
-# every SDE step is replayable and the group can be 16 wide.
+# flat reward curve; this configuration climbs, at +0.00234/step pooled over two
+# independent seeds (t=+6.67, p<0.0001, seeds agreeing at p=0.598) across 45
+# rollouts each.
+#
+# WHAT WAS MEASURED IS THE BUNDLE, NOT THE CANVAS. Four knobs differ from the
+# sibling and no experiment separates them:
+#
+#     canvas  768x768            -> 256x384
+#     reward  videopickscore+clap -> imagebind+clap
+#     SDE     [0,3,6] of 10      -> all 10
+#     group   4                  -> 16
+#
+# The canvas is what makes the other three affordable — 3966 packed rows instead
+# of ~22k — so it is causally upstream of them, which is not the same as being
+# the operative change. Canvas and reward in particular are perfectly collinear
+# across every run anyone has done: nobody has run 768 with imagebind+clap, or
+# 256x384 with videopickscore. One 768 run with this reward would de-confound it.
 #
 # THREE THINGS THAT NUMBER DOES NOT SAY, all easy to over-read:
-#   1. The RATE is not linear. It decelerates inside the window — first half
-#      +0.00427, second half +0.00047, difference p=0.007 on the disjoint halves.
-#      Project from the level reached and re-measure; do not extrapolate. Past
-#      rollout 45 only one seed exists and nothing is established either way.
+#   1. The RATE is not linear, and not monotonic either. Within 1-45 it
+#      decelerates — first half +0.00427, second half +0.00047, p=0.007 on the
+#      disjoint halves, and that plateau is present on each seed separately
+#      (23-45: +0.00041 and +0.00054). But seed 42 then RESUMES: rollouts 35-69
+#      fit +0.00243 and its last quarter +0.00478, so the plateau is a trough,
+#      not a ceiling. Seed 42 alone past 45; whether seed 1337 also resumes is a
+#      registered open question. Do not extrapolate the early slope or the
+#      trough — project from the level reached and re-measure.
 #   2. THE PLATEAU IS NOT SATURATION, and its cause is unknown. The sibling
 #      `minimax_h3_t2va_nft.yaml` reaches 0.461 on this same reward and prompt
 #      set and is still climbing, so ~0.29 is far from the achievable ceiling
