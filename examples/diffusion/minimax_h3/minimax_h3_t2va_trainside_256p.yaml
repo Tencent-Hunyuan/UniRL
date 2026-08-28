@@ -33,7 +33,9 @@
 #      independently of it — DiffusionNFT needs no log-prob and every NFT recipe
 #      here runs eta 0.0, while Flow-GRPO's loss is built on SDE log-probs and
 #      is degenerate at 0. Read the gap as NFT outperforming Flow-GRPO on this
-#      task, nothing finer. Isolating eta means 0.7 against 0.3-0.5 here.
+#      task, nothing finer. Isolating eta means varying it within Flow-GRPO, and
+#      0.25 is the value to try: it is what all three hunyuan_video15 recipes
+#      and wan21_t2v_videoalign use, so 0.7 is not a settled default for video.
 #   3. VIDEO QUALITY IS UNVERIFIED. Reward is imagebind+clap; neither scores
 #      artifacts, and rollouts at eta 0.7 on this canvas show chromatic fringing
 #      and speckle from step 0 onward. A rising reward here is not evidence of
@@ -262,7 +264,9 @@ sampling:
   height: 256
   width: 384
   # The VAE maps 17n+5 pixel frames to 5n+2 latent, so 124 gives 37 latent
-  # frames (5.17s at 24 fps; H3 supports 5-15s).
+  # frames (5.17s at 24 fps; H3 supports 5-15s). 124 is the FLOOR, not a choice:
+  # legal counts are 17n+5 and the 5s minimum puts the smallest legal value here,
+  # so frames cannot be traded for packed-row budget the way resolution can.
   num_frames: 124
   # 0.7 IS ONLY SAFE UNDER CPS. Measured under CPS at 768x768, K=4 per eta
   # sharing one x_T, real videopickscore:
