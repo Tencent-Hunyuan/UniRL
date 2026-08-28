@@ -30,7 +30,15 @@
 # of ~22k — so it is causally upstream of them, which is not the same as being
 # the operative change. Canvas and reward in particular are perfectly collinear
 # across every run anyone has done: nobody has run 768 with imagebind+clap, or
-# 256x384 with videopickscore. One 768 run with this reward would de-confound it.
+# 256x384 with videopickscore.
+#
+# ON 8x80GB THE CANVAS CANNOT BE VARIED ALONE. Each replayed step retains ~12 GB
+# at 22k rows, so 10 steps at 768 needs >100 GB/rank (see the sibling's
+# `sde_indices` note) — any 768 arm therefore changes the step count too, by
+# construction. The separable axis is the reward, at the cheap canvas:
+# 256x384 with `videopickscore` 1.0 / `clap` 0.0 against this file. If the
+# video-only reward also learns here, the canvas was decisive; if it does not,
+# the reward was. Same 25 GB, same group, same 10 steps.
 #
 # THREE THINGS THAT NUMBER DOES NOT SAY, all easy to over-read:
 #   1. The RATE is not linear, and not monotonic either. Within 1-45 it
