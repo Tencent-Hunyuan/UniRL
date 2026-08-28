@@ -122,7 +122,9 @@ class DiffusionNFT(StageAlgorithm):
                 "the last trajectory position); got None. Forward-process "
                 "rollout must populate the dense latents path."
             )
-        x0 = segment.latents[:, -1]
+        # MiniMax-H3 overrides this to pack its audio stream in alongside video.
+        clean_latents = getattr(self.stage, "nft_clean_latents", None)
+        x0 = clean_latents(segment) if callable(clean_latents) else segment.latents[:, -1]
         if x0.numel() == 0:
             return AlgorithmStepResult(
                 loss=0.0,

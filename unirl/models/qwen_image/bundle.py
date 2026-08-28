@@ -27,7 +27,7 @@ class QwenImageBundle(Bundle):
         transformer: nn.Module,
         vae: Optional[nn.Module],
         text_encoder: Optional[nn.Module],
-        tokenizer: Any,
+        tokenizer: Optional[Any],
         scheduler: Any,
         dtype: torch.dtype,
         device: torch.device,
@@ -104,6 +104,7 @@ class QwenImageBundle(Bundle):
             vae.requires_grad_(False)
 
         text_encoder = None
+        tokenizer = None
         if config.load_text_encoder:
             text_encoder = (
                 Qwen2_5_VLForConditionalGeneration.from_pretrained(
@@ -113,8 +114,7 @@ class QwenImageBundle(Bundle):
                 .eval()
             )
             text_encoder.requires_grad_(False)
-
-        tokenizer = Qwen2Tokenizer.from_pretrained(text_encoder_path, subfolder="tokenizer")
+            tokenizer = Qwen2Tokenizer.from_pretrained(text_encoder_path, subfolder="tokenizer")
 
         scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(path, subfolder="scheduler")
 

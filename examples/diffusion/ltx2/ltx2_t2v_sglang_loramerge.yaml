@@ -7,7 +7,7 @@
 # it into the base and pushes the merged FULL weights via TensorWeightSync
 # (lora_merged=true) through the fused-shard-aware updater. sglang serves a plain
 # (full) transformer (model_config.use_lora=false). Mirrors
-# hunyuan_video_t2v_sglang_loramerge on the LTX-2 ~19B AV DiT + video_pickscore.
+# hunyuan_video10_t2v_sglang on the LTX-2 ~19B AV DiT + video_pickscore.
 #
 #   bash examples/run_experiment_single_node.sh diffusion/ltx2/ltx2_t2v_sglang_loramerge
 

@@ -1,0 +1,210 @@
+# @package _global_
+# MiniMax-H3 t2va (text -> video + stereo audio) DiffusionNFT — trainside FSDP.
+#
+# Against the sibling `minimax_h3_t2va_trainside.yaml` (Flow-GRPO, 768x768):
+# a forward-process objective, 256x384, all 10 transitions trained, and a reward
+# that scores audio/video agreement rather than a single frame.
+#
+# Launch (1 node x 8 GPUs):
+#   bash examples/run_experiment_multinode_taiji.sh diffusion/minimax_h3/minimax_h3_t2va_nft
+
+num_devices: 8
+# 512 samples/step OOMs a 2.2 TB host during reward scoring, so prompts give
+# rather than group size. This and its product with samples_per_prompt must both
+# divide num_devices, making 8 the floor here.
+batch_size: 8
+adv_use_global_std: true
+num_rollouts: 1000
+
+logging:
+  report_to_wandb: true
+  project_name: ${oc.env:WANDB_PROJECT,unirl-minimax-h3-t2va}
+  run_name: ${oc.env:WANDB_RUN_NAME,minimax_h3_t2va_nft}
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: [minimax-h3, t2va, diffusionnft, trainside, audio, stereo]
+  log_media: true
+  media_max_items: 2
+  media_log_interval: 100
+
+bundle:
+  _target_: unirl.models.minimax_h3.bundle.MiniMaxH3Bundle.from_config
+  config:
+    _target_: unirl.models.minimax_h3.config.MiniMaxH3PipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL}
+    model_precision: bf16
+    # fp32 by checkpoint contract; the audio VAE emits ~20 dB too quiet in bf16.
+    vae_dtype: fp32
+    audio_vae_dtype: fp32
+    trajectory_precision: fp16
+    logprob_precision: fp32
+    # Reverse-schedule shifts, so rollout-only: a forward-process objective jumps
+    # to a noise level instead of walking either grid.
+    video_shift: 12.0
+    audio_shift: 3.0
+    audio_joint_sde: true
+    # The Qwen3-VL conditioner is 32B, larger than the trainable DiT's per-rank
+    # shard, and parking it on CPU is what makes 8x96GB fit.
+    aux_components_on_cpu: true
+    vae_components_on_cpu: false
+    meta_init_transformer: true
+
+pipeline:
+  _target_: unirl.models.minimax_h3.pipeline.MiniMaxH3Pipeline.from_bundle
+  config: ${bundle.config}
+  strategy:
+    # Inert at eta=0; kept as CPS so raising eta for a diagnostic lands on the
+    # kernel the GRPO recipe measured as safe.
+    _target_: unirl.sde.kernels.CPSSDEStrategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  # The refiner's `attn.to_q` / `ff.net.*` share suffixes with the denoising
+  # stack, so wrapping it too keeps its adapters inside a fully_shard group —
+  # otherwise their grads never DP-sync and `fsdp_wrap` rejects them. That is
+  # what lets the target list below stay unscoped, which EmaLoraConfig requires.
+  block_class_names: ["MiniMaxH3TransformerBlock", "MiniMaxH3TokenRefinerBlock"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    master_dtype: fp32
+    cpu_offload: false
+    mixed_precision: true
+    # Keep the fp32 timestep embedding intact until each block explicitly casts
+    # the post-SiLU value to its bf16 AdaLN projection.
+    cast_forward_inputs: false
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true
+    use_torch_compile: false
+    # LOAD-BEARING alongside cast_forward_inputs=false. Keeps the fp32-pinned
+    # leftovers (proj_in, audio_proj_in, time_embedder, proj_out,
+    # audio_proj_out, rope) outside every fully_shard
+    # group, so no bf16 compute copy is all-gathered for them. True runs the
+    # timestep MLP in bf16, where t = 1 - sigma near 1.0 has ~0.008 spacing.
+    root_wrap: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    # The Flow-GRPO recipe's 1e-12 answers a measured grad_norm of ~5e-5 under
+    # that objective. This one measures 0.04..0.21, so 1e-8 is negligible again.
+    learning_rate: 3.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 1.0e-4
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 1000
+  # "default" trains; "old" is the frozen reference the loss blends against and
+  # the rollout samples under.
+  ema_lora_cfg:
+    _target_: unirl.train.configs.EmaLoraConfig
+    rank: 64
+    alpha: 128
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    shadow_adapter: old
+    # Decay is exactly 0 below ema_flat_steps, so the shadow is a hard copy for
+    # the first 75 refreshes.
+    ema_decay_type: warmup
+    ema_flat_steps: 75
+    ema_uprate: 0.0075
+    ema_uphold: 0.999
+    timing: rollout_end
+    target_modules:
+      - attn.to_q
+      - attn.to_k
+      - attn.to_v
+      - attn.to_out.0
+      - ff.net.0.proj
+      - ff.net.2
+
+rollout:
+  _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
+  stage_attrs: [diffusion]
+  # The packed sequence carries unbatched per-row metadata, so the engine chunks
+  # to one sample per generate() call. Same discipline as the bagel navit recipe.
+  forward_batch_size: 1
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.local.t2av_composite.T2AVCompositeScorer
+    base_device: cuda
+    config:
+      _target_: unirl.reward.local.t2av_composite.T2AVCompositeSpec
+      device: auto
+      batch_size: 2
+      # Summed raw, not renormalised. The imagebind package loads its checkpoint
+      # from a RELATIVE ./.checkpoints/imagebind_huge.pth.
+      #
+      # LICENCE: ImageBind is CC-BY-NC-SA. This recipe is NonCommercial.
+      weights:
+        clap: 1.0
+        imagebind: 1.0
+
+algorithm:
+  _target_: unirl.algorithms.diffusionnft.DiffusionNFT
+  stage_attr: diffusion
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.minimax_h3.conditions.MiniMaxH3Conditions
+  params: ${sampling}
+  beta: 0.1
+  adv_clip_max: 5.0
+  adv_mode: raw
+  use_adaptive_weight: true
+  # Read the rollout's own 10-transition schedule and train on all of it; Flow-GRPO
+  # could only afford 4 because replay builds one graph across every step.
+  train_timestep_mode: all
+  shuffle_train_timesteps: true
+  apply_time_shift_in_loss: false
+  training_timestep_fraction: 1.0
+  # A reference-model KL term would cost a third forward per timestep and is not
+  # implemented; the algorithm rejects kl_coef > 0.
+  kl_coef: 0.0
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 1
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: datasets/pickscore/train.txt
+      eval_data_path: datasets/pickscore/test.txt
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  # UniRL counts model evaluations; 10 maps to 11 grid points in the vendored scheduler.
+  num_inference_steps: 10
+  # Inert: the checkpoint is guidance-distilled.
+  guidance_scale: 1.0
+  height: 256
+  width: 384
+  # The VAE maps 17n+5 pixel frames to 5n+2 latent, and `align_num_frames` snaps
+  # to that, so state the aligned value: 124 gives 37 latent frames.
+  num_frames: 124
+  eta: 0.0
+  samples_per_prompt: 16
+  seed: 42
+  init_same_noise: false
+  autocast_precision: bf16
+  trajectory_precision: fp16
+  logprob_precision: fp32
+  scheduler:
+    # num_sde_steps: 0 IS the forward-process switch, with eta: 0.0 above — it
+    # makes resolve_sde_indices return [], read as "pure ODE, record no
+    # log-probs", and makes the stage store only the terminal clean latent.
+    _target_: unirl.sde.index_schedule.AllSDEScheduler
+    num_timesteps: ${..num_inference_steps}
+    num_sde_steps: 0

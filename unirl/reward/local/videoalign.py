@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import os
+import re
 import tempfile
 import time
 from dataclasses import dataclass
@@ -221,160 +222,233 @@ def _build_vl_inputs(
     return inputs
 
 
-class _MLP(nn.Module):
-    """Lightweight MLP head on top of vision-language hidden states."""
+def _video_reward_model_class():
+    """Build the official Qwen2-VL reward-model class lazily."""
+    from transformers import Qwen2VLForConditionalGeneration
 
-    def __init__(self, in_dim: int, out_dim: int, hidden: int = 1024, dropout: float = 0.2):
-        super().__init__()
-        self.in_dim = in_dim
-        self.out_dim = out_dim
+    class VideoRewardModel(Qwen2VLForConditionalGeneration):
+        def __init__(
+            self,
+            config,
+            *,
+            output_dim: int = 1,
+            reward_token: str = "special",
+            special_token_ids: Optional[List[int]] = None,
+        ) -> None:
+            super().__init__(config)
+            hidden_size = getattr(config, "hidden_size", None) or config.text_config.hidden_size
+            self.output_dim = int(output_dim)
+            self.reward_token = str(reward_token)
+            self.special_token_ids = tuple(int(token_id) for token_id in (special_token_ids or ()))
+            if self.special_token_ids:
+                self.reward_token = "special"
+            self.rm_head = nn.Linear(hidden_size, self.output_dim, bias=False)
 
-        self.layers = nn.Sequential(
-            nn.Linear(in_dim, hidden),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, out_dim),
+        def forward(
+            self,
+            input_ids: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            position_ids: Optional[torch.Tensor] = None,
+            past_key_values=None,
+            inputs_embeds: Optional[torch.Tensor] = None,
+            labels: Optional[torch.Tensor] = None,
+            use_cache: Optional[bool] = None,
+            pixel_values: Optional[torch.Tensor] = None,
+            pixel_values_videos: Optional[torch.Tensor] = None,
+            image_grid_thw: Optional[torch.Tensor] = None,
+            video_grid_thw: Optional[torch.Tensor] = None,
+            rope_deltas: Optional[torch.Tensor] = None,
+            mm_token_type_ids: Optional[torch.Tensor] = None,
+            **kwargs,
+        ) -> Dict[str, torch.Tensor]:
+            del labels
+            kwargs.pop("return_dict", None)
+            kwargs.pop("logits_to_keep", None)
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=use_cache,
+                pixel_values=pixel_values,
+                pixel_values_videos=pixel_values_videos,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                rope_deltas=rope_deltas,
+                mm_token_type_ids=mm_token_type_ids,
+                **kwargs,
+            )
+            token_rewards = self.rm_head(outputs.last_hidden_state)  # [B, L, output_dim]
+            batch_size = int(token_rewards.shape[0])
+
+            if self.reward_token == "special":
+                if input_ids is None or len(self.special_token_ids) != 3:
+                    raise ValueError("VideoAlign special-token pooling requires input_ids and three reward token ids.")
+                special_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+                for token_id in self.special_token_ids:
+                    special_mask |= input_ids == token_id
+                counts = special_mask.sum(dim=1)
+                if not bool((counts == 3).all()):
+                    raise ValueError(
+                        f"VideoAlign expected three reward tokens per sample, got counts={counts.tolist()}."
+                    )
+                logits = token_rewards[special_mask].view(batch_size, 3, self.output_dim)
+                if self.output_dim == 3:
+                    logits = logits.diagonal(dim1=1, dim2=2)
+                return {"logits": logits.reshape(batch_size, -1)}
+
+            if attention_mask is None:
+                attention_mask = token_rewards.new_ones(token_rewards.shape[:2], dtype=torch.long)
+            if self.reward_token == "last":
+                last = attention_mask.sum(dim=1).sub(1).clamp(min=0)
+                return {"logits": token_rewards[torch.arange(batch_size, device=token_rewards.device), last]}
+            if self.reward_token == "mean":
+                mask = attention_mask.unsqueeze(-1).to(token_rewards.dtype)
+                return {"logits": (token_rewards * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)}
+            raise ValueError(f"Unsupported VideoAlign reward_token={self.reward_token!r}.")
+
+    return VideoRewardModel
+
+
+def _lora_target_modules(model: nn.Module, config: dict) -> List[str]:
+    """Match the official VideoAlign LoRA target selection."""
+    excluded = list(config.get("lora_namespan_exclude") or ())
+    if not config.get("vision_lora", False):
+        excluded.append("visual")
+    excluded.extend(("lm_head", "rm_head", "embed_tokens"))
+    targets = [
+        name
+        for name, module in model.named_modules()
+        if isinstance(module, (nn.Linear, nn.Embedding)) and not any(part in name for part in excluded)
+    ]
+    limit = int(config.get("num_lora_modules", -1))
+    return targets[-limit:] if limit > 0 else targets
+
+
+def _checkpoint_sort_key(path: str) -> int:
+    """Extract the numeric checkpoint step for latest-checkpoint selection."""
+    match = re.search(r"checkpoint-(\d+)", path)
+    return int(match.group(1)) if match else -1
+
+
+def _read_checkpoint(checkpoint_dir: str) -> Tuple[Dict[str, torch.Tensor], bool]:
+    """Read the latest official full or split VideoAlign checkpoint."""
+    candidates = [checkpoint_dir] if os.path.basename(checkpoint_dir).startswith("checkpoint-") else []
+    candidates.extend(glob.glob(os.path.join(checkpoint_dir, "checkpoint-*")))
+    candidates = sorted({path for path in candidates if os.path.isdir(path)}, key=_checkpoint_sort_key, reverse=True)
+    if not candidates:
+        candidates = [checkpoint_dir]
+
+    checkpoint_path = candidates[0]
+    full_path = os.path.join(checkpoint_path, "model.pth")
+    if os.path.isfile(full_path):
+        state = torch.load(full_path, map_location="cpu", weights_only=True)
+        if not isinstance(state, dict):
+            raise TypeError(f"VideoAlign checkpoint {full_path!r} is not a state dict.")
+        return state, True
+
+    from safetensors.torch import load_file
+
+    state: Dict[str, torch.Tensor] = {}
+    adapter_path = os.path.join(checkpoint_path, "adapter_model.safetensors")
+    non_lora_path = os.path.join(checkpoint_path, "non_lora_state_dict.pth")
+    missing_files = [path for path in (adapter_path, non_lora_path) if not os.path.isfile(path)]
+    if missing_files:
+        raise FileNotFoundError(
+            f"VideoAlign found no model.pth and the split checkpoint is incomplete; missing {missing_files}."
         )
-        self.key = "mlp_head"
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.layers(x)
-
-
-class _VideoAlignModel(nn.Module):
-    """VideoAlign model: Qwen2-VL backbone + three reward MLP heads."""
-
-    def __init__(
-        self,
-        base_model: nn.Module,
-        in_dim: int,
-        reg_dim: int = 1024,
-        drop_rate: float = 0.2,
-        use_special_tokens: bool = False,
-    ):
-        super().__init__()
-        self.model = base_model
-        self.use_special_tokens = use_special_tokens
-        self.VQ_head = _MLP(in_dim, 1)
-        self.MQ_head = _MLP(in_dim, 1)
-        self.TA_head = _MLP(in_dim, 1)
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        video_grid_thw: torch.Tensor,
-        pixel_values_videos: torch.Tensor,
-        position_ids: torch.Tensor,
-        rope_deltas: Optional[torch.Tensor] = None,
-    ) -> Dict[str, torch.Tensor]:
-        batch_size = len(video_grid_thw)
-        video_grid_thw_list = [video_grid_thw[i] for i in range(batch_size)]
-
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            pixel_values_videos=pixel_values_videos,
-            video_grid_thw=video_grid_thw_list,
-            position_ids=position_ids,
-            rope_deltas=rope_deltas,
-            output_hidden_states=True,
-        )
-
-        last_hidden_state = _get_last_hidden_state(outputs, self.model)
-
-        pooled = _pool_visual_tokens(
-            last_hidden_state=last_hidden_state,
-            attention_mask=attention_mask,
-            video_grid_thw=video_grid_thw,
-            use_special_tokens=self.use_special_tokens,
-        )
-
-        vq = self.VQ_head(pooled)
-        mq = self.MQ_head(pooled)
-        ta = self.TA_head(pooled)
-        return {
-            "logits": torch.cat([vq, mq, ta], dim=-1),
-            "last_hidden_state": last_hidden_state,
-        }
+    state.update(load_file(adapter_path))
+    non_lora = torch.load(non_lora_path, map_location="cpu", weights_only=True)
+    if not isinstance(non_lora, dict):
+        raise TypeError(f"VideoAlign checkpoint {non_lora_path!r} is not a state dict.")
+    state.update(non_lora)
+    return state, False
 
 
-def _get_last_hidden_state(outputs, model: nn.Module) -> torch.Tensor:
-    """Extract last_hidden_state from model outputs, handling Qwen2-VL's"""
-    if hasattr(outputs, "hidden_states") and outputs.hidden_states:
-        return outputs.hidden_states[-1]
-    if hasattr(outputs, "last_hidden_state"):
-        return outputs.last_hidden_state
-    raise ValueError("Cannot extract last_hidden_state from model outputs")
+def _legacy_qwen2vl_key(key: str) -> str:
+    """Map Transformers 4.45 Qwen2-VL keys to the 5.6 composable layout."""
+    prefix = "base_model.model." if key.startswith("base_model.model.") else ""
+    suffix = key[len(prefix) :]
+    replacements = (
+        ("visual.", "model.visual."),
+        ("model.embed_tokens.", "model.language_model.embed_tokens."),
+        ("model.layers.", "model.language_model.layers."),
+        ("model.norm.", "model.language_model.norm."),
+    )
+    for old, new in replacements:
+        if suffix.startswith(old):
+            suffix = new + suffix[len(old) :]
+            break
+    return prefix + suffix
 
 
-def _pool_visual_tokens(
-    *,
-    last_hidden_state: torch.Tensor,
-    attention_mask: torch.Tensor,
-    video_grid_thw: torch.Tensor,
-    use_special_tokens: bool = False,
-) -> torch.Tensor:
-    """Mean-pool the visual token positions from the last hidden state."""
-    if use_special_tokens:
-        pooled = last_hidden_state[:, -3:, :]
+def _destination_key(key: str, model_keys: set[str]) -> Optional[str]:
+    """Resolve checkpoint wrapper and adapter-name differences."""
+    key = re.sub(r"\.(lora_[AB]|lora_embedding_[AB])\.weight$", r".\1.default.weight", key)
+    converted = _legacy_qwen2vl_key(key)
+    candidates = [converted]
+    prefix = "base_model.model."
+    if converted.startswith(prefix):
+        candidates.append(converted[len(prefix) :])
     else:
-        mask = attention_mask.unsqueeze(-1).to(last_hidden_state.dtype)
-        pooled = (last_hidden_state * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
-        pooled = pooled.unsqueeze(1)
-    return pooled
+        candidates.append(prefix + converted)
+    return next((candidate for candidate in candidates if candidate in model_keys), None)
 
 
 def _load_checkpoint(inference_obj, checkpoint_dir: str, device: torch.device, dtype: torch.dtype) -> None:
-    """Load a VideoAlign checkpoint into an existing _VideoAlignInference object."""
-    from safetensors.torch import load_file
-
-    state_dicts = []
-    for pattern in ("*.safetensors", "adapter_*.safetensors"):
-        for fpath in sorted(glob.glob(os.path.join(checkpoint_dir, pattern))):
-            state_dicts.append(load_file(fpath))
-
-    full_state = {}
-    for sd in state_dicts:
-        full_state.update(sd)
-
+    """Load official VideoReward weights into the matching rm_head/PEFT model."""
+    full_state, is_full = _read_checkpoint(checkpoint_dir)
     model_state = inference_obj.model.state_dict()
-    filtered_state = full_state.copy()
+    model_keys = set(model_state)
+    filtered_state = {}
+    unmatched_keys = []
+    for key, value in full_state.items():
+        destination = _destination_key(key, model_keys)
+        if destination is not None:
+            filtered_state[destination] = value
+        else:
+            unmatched_keys.append(key)
 
-    flat_model_keys = list(model_state.keys())
-    flat_filtered_keys = list(filtered_state.keys())
+    unmatched_source = len(unmatched_keys)
+    critical = [key for key in model_keys if key.endswith(("rm_head.weight", "embed_tokens.weight"))]
+    missing_critical = [key for key in critical if key not in filtered_state]
+    lora_keys = [key for key in model_keys if ".lora_" in key]
+    missing_lora = [key for key in lora_keys if key not in filtered_state]
+    if unmatched_source or missing_critical or missing_lora:
+        raise RuntimeError(
+            f"VideoAlign checkpoint is incompatible: {unmatched_source} source tensors unmatched, "
+            f"missing {len(missing_critical)} critical and "
+            f"{len(missing_lora)}/{len(lora_keys)} LoRA tensors after key conversion. "
+            f"Examples: {(unmatched_keys + missing_critical + missing_lora)[:5]}"
+        )
 
-    if any("model.language_model" in k for k in flat_model_keys):
-        keys_to_remap = [k for k in flat_filtered_keys if k.startswith("model.layers.")]
-        for old_key in keys_to_remap:
-            new_key = "model.language_model." + old_key[len("model.") :]
-            if new_key in flat_model_keys:
-                filtered_state[new_key] = filtered_state.pop(old_key)
-
-    if any("model.visual" in k for k in flat_model_keys):
-        keys_to_remap = [k for k in flat_filtered_keys if k.startswith("visual.")]
-        for old_key in keys_to_remap:
-            new_key = "model." + old_key
-            if new_key in flat_model_keys:
-                filtered_state[new_key] = filtered_state.pop(old_key)
-
-    matched = sum(1 for k in filtered_state if k in model_state)
-    skipped = len(filtered_state) - matched
-    if skipped:
-        print(f"[VideoAlign] Checkpoint key remap: {matched} matched, {skipped} skipped", flush=True)
-
-    inference_obj.model.load_state_dict(filtered_state, strict=False)
+    incompatible = inference_obj.model.load_state_dict(filtered_state, strict=False)
+    if is_full:
+        parameter_keys = set(dict(inference_obj.model.named_parameters()))
+        missing_parameters = [key for key in incompatible.missing_keys if key in parameter_keys]
+        if missing_parameters:
+            raise RuntimeError(
+                f"VideoAlign full checkpoint left {len(missing_parameters)} model parameters unloaded; "
+                f"examples: {missing_parameters[:5]}"
+            )
+    logger.info(
+        "Loaded VideoAlign checkpoint: %d/%d tensors matched (%d unmatched source tensors)",
+        len(filtered_state),
+        len(model_state),
+        unmatched_source,
+    )
     inference_obj.model.to(device=device, dtype=dtype)
     inference_obj.model.eval()
 
 
 class _VideoAlignInference:
-    """Self-contained VideoAlign inference (no fastvideo dependency)."""
+    """Self-contained inference for the official Qwen2-VL VideoReward model."""
 
     def __init__(self, checkpoint_dir: str, device: str = "cuda", dtype: torch.dtype = torch.bfloat16) -> None:
         self.device = device
         self.dtype = dtype
-        self.model: Optional[_VideoAlignModel] = None
+        self.model: Optional[nn.Module] = None
         self.processor = None
         self._inference_cfg: Optional[dict] = None
 
@@ -389,14 +463,20 @@ class _VideoAlignInference:
 
     def _load(self, checkpoint_dir: str) -> None:
         """Load model, config, processor, and checkpoint weights."""
-        from transformers import AutoConfig, AutoModelForTextToVideo, AutoProcessor
+        from transformers import AutoProcessor
 
-        config_path = os.path.join(checkpoint_dir, "model_config.json")
+        config_root = (
+            os.path.dirname(checkpoint_dir.rstrip("/"))
+            if os.path.basename(checkpoint_dir.rstrip("/")).startswith("checkpoint-")
+            else checkpoint_dir
+        )
+        config_path = os.path.join(config_root, "model_config.json")
         with open(config_path) as f:
             cfg = json.load(f)
 
         data_cfg = cfg["data_config"]
         model_cfg = cfg["model_config"]
+        peft_cfg = cfg.get("peft_lora_config", {})
         self._inference_cfg = cfg.get("inference_config")
 
         self._fps = data_cfg.get("fps", 2.0)
@@ -408,36 +488,47 @@ class _VideoAlignInference:
 
         qwen_path = os.environ.get("VIDEOALIGN_QWEN_CKPT", "")
         if not qwen_path:
-            _sibling = os.path.join(os.path.dirname(checkpoint_dir.rstrip("/")), "Qwen2-VL-2B-Instruct")
-            qwen_path = _sibling if os.path.isdir(_sibling) else "./Qwen2-VL-2B-Instruct"
+            _sibling = os.path.join(os.path.dirname(config_root.rstrip("/")), "Qwen2-VL-2B-Instruct")
+            qwen_path = (
+                _sibling
+                if os.path.isdir(_sibling)
+                else model_cfg.get("model_name_or_path", "Qwen/Qwen2-VL-2B-Instruct")
+            )
         self.processor = AutoProcessor.from_pretrained(qwen_path, padding_side="right")
 
         special_token_ids = None
         if model_cfg.get("use_special_tokens", False):
-            special_tokens_dict = {"additional_special_tokens": ["<|VQ_reward|>", "<|MQ_reward|>", "<|TA_reward|>"]}
-            num_added = self.processor.tokenizer.add_special_tokens(special_tokens_dict)
-            if num_added > 0:
-                special_token_ids = [
-                    self.processor.tokenizer.convert_tokens_to_ids(tok)
-                    for tok in ["<|VQ_reward|>", "<|MQ_reward|>", "<|TA_reward|>"]
-                ]
-                print(f"[VideoAlign] Added {num_added} special reward tokens; ids={special_token_ids}", flush=True)
+            special_tokens = ["<|VQ_reward|>", "<|MQ_reward|>", "<|TA_reward|>"]
+            self.processor.tokenizer.add_special_tokens({"additional_special_tokens": special_tokens})
+            special_token_ids = self.processor.tokenizer.convert_tokens_to_ids(special_tokens)
 
-        qwen_config = AutoConfig.from_pretrained(qwen_path)
-        qwen_model = AutoModelForTextToVideo.from_config(qwen_config)
-
-        has_special = model_cfg.get("use_special_tokens", False)
-        in_dim = qwen_config.hidden_size
-        if special_token_ids is not None:
-            qwen_model.resize_token_embeddings(len(self.processor.tokenizer))
-
-        self.model = _VideoAlignModel(
-            base_model=qwen_model,
-            in_dim=in_dim,
-            reg_dim=model_cfg.get("reg_dim", 1024),
-            drop_rate=model_cfg.get("drop_rate", 0.2),
-            use_special_tokens=has_special,
+        model_cls = _video_reward_model_class()
+        self.model = model_cls.from_pretrained(
+            qwen_path,
+            output_dim=int(model_cfg.get("output_dim", 1)),
+            reward_token=str(model_cfg.get("reward_token", "special")),
+            special_token_ids=special_token_ids,
+            dtype=self.dtype,
         )
+        if special_token_ids is not None:
+            self.model.resize_token_embeddings(len(self.processor.tokenizer))
+        self.model.config.pad_token_id = self.processor.tokenizer.pad_token_id
+
+        if peft_cfg.get("lora_enable", False):
+            from peft import LoraConfig, get_peft_model
+
+            target_modules = _lora_target_modules(self.model, peft_cfg)
+            lora_config = LoraConfig(
+                target_modules=target_modules,
+                r=int(peft_cfg.get("lora_r", 16)),
+                lora_alpha=int(peft_cfg.get("lora_alpha", 32)),
+                lora_dropout=float(peft_cfg.get("lora_dropout", 0.0)),
+                task_type=str(peft_cfg.get("lora_task_type", "CAUSAL_LM")),
+                use_rslora=bool(peft_cfg.get("use_rslora", False)),
+                bias="none",
+                modules_to_save=peft_cfg.get("lora_modules_to_save"),
+            )
+            self.model = get_peft_model(self.model, lora_config)
 
         _load_checkpoint(self, checkpoint_dir, torch.device(self.device), self.dtype)
 
@@ -456,11 +547,13 @@ class _VideoAlignInference:
         num_frames = self._num_frames if num_frames is None else num_frames
         max_pixels = self._max_pixels if max_pixels is None else max_pixels
 
+        if len(video_paths) != len(prompts):
+            raise ValueError(f"VideoAlign got {len(video_paths)} videos for {len(prompts)} prompts.")
         chat_data = []
-        for idx, prompt in enumerate(prompts):
+        for video_path, prompt in zip(video_paths, prompts):
             vid_info: Dict[str, Any] = {
                 "type": "video",
-                "video": video_paths[idx],
+                "video": video_path if video_path.startswith("file://") else f"file://{video_path}",
                 "max_pixels": max_pixels,
                 "sample_type": self._sample_type,
             }
@@ -471,11 +564,11 @@ class _VideoAlignInference:
             text = _build_prompt(prompt, self._eval_dim, self._prompt_template_type)
             chat_data.append([{"role": "user", "content": [vid_info, {"type": "text", "text": text}]}])
 
-        _, video_inputs = _process_vision_info(chat_data)
+        image_inputs, video_inputs = _process_vision_info(chat_data)
 
         batch = self.processor(
             text=self.processor.apply_chat_template(chat_data, tokenize=False, add_generation_prompt=True),
-            images=None,
+            images=image_inputs,
             videos=video_inputs,
             padding=True,
             return_tensors="pt",

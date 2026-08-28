@@ -15,7 +15,7 @@ entrypoint's built-in `config_name` — a safe place to start.
 
 | Domain | Entrypoint | Default recipe (start here) | Models |
 |---|---|---|---|
-| [`diffusion/`](diffusion/) | `python -m unirl.train_diffusion` | `diffusion/sd3/sd3_trainside` | `sd3`, `qwen_image`, `flux2_klein`, `wan21`, `wan22`, `hunyuan_video`, `hunyuan_video15` |
+| [`diffusion/`](diffusion/) | `python -m unirl.train_diffusion` | `diffusion/sd3/sd3_trainside` | `sd3`, `qwen_image`, `flux2_klein`, `wan21`, `wan22`, `hunyuan_video10`, `hunyuan_video15` |
 | [`ar/`](ar/) | `python -m unirl.train_ar` | `ar/qwen_vl_grpo_geo3k_mc_4x8`, `ar/qwen3_drpo_4b_base_dapo_sglang` | `qwen_vl` (vision-language), `qwen3` (text-only) |
 | [`sft/`](sft/) | `python -m unirl.train_sft` | `sft/qwen3_sft` | `qwen3`, `qwen_vl`, `bagel`, `sd3`, `cosmos3`, `wan21` |
 | [`pe/`](pe/) | `python -m unirl.train_pe` | `pe/pe_trainside_pickscore` | `pe` (Qwen3 rewriter + SD3, PickScore/WISE reward) |
@@ -95,7 +95,7 @@ related recipes sort together.
 
 | Segment | Position | Values (examples) | Omit when |
 |---|---|---|---|
-| `model` | required, first | `sd3`, `qwen_image`, `flux2_klein`, `wan21`, `wan22`, `hunyuan_video`, `hunyuan_video15`, `qwen_vl`, `qwen3`, `hi3` | never |
+| `model` | required, first | `sd3`, `qwen_image`, `flux2_klein`, `wan21`, `wan22`, `hunyuan_video10`, `hunyuan_video15`, `qwen_vl`, `qwen3`, `hi3` | never |
 | `task` | after model | `t2v`, `i2v` | text-to-image (the implicit default) |
 | `size` | after task | `4b`, `14b` | only one size in the family |
 | `algorithm` | middle | `dancegrpo`, `mixgrpo`, `nft`, `flowdppo`, `grpo`, `drpo` | plain FlowGRPO (diffusion default); GRPO (AR default) |
@@ -111,6 +111,7 @@ Worked examples:
 | `sd3_nft_sglang` | SD3 · DiffusionNFT · SGLang engine |
 | `qwen_image_dancegrpo` | Qwen-Image · DanceGRPO |
 | `wan22_t2v_14b_dancegrpo` | WAN 2.2 · text-to-video · 14B · DanceGRPO |
+| `hunyuan_video10_t2v_trainside` | HunyuanVideo-1.0 · text-to-video · trainside engine |
 | `hunyuan_video15_t2v_dancegrpo_trainside` | HunyuanVideo-1.5 · text-to-video · DanceGRPO · trainside engine |
 | `sd3_vllmomni_full_nccl_separate` | SD3 · vLLM-Omni engine · full-weight · NCCL sync · separate slabs |
 | `qwen_vl_grpo_geo3k_mc_4x8` | Qwen-VL · GRPO · geo3k multiple-choice · 4 nodes × 8 GPUs |

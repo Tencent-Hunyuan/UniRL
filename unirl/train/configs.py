@@ -84,6 +84,8 @@ class FSDPConfig:
     param_dtype: str = "bf16"
     cpu_offload: bool = False
     mixed_precision: bool = True
+    # Match FSDP2's default: cast floating block inputs to param_dtype.
+    cast_forward_inputs: bool = True
     # Shard degree: full = the whole world, hybrid = one node (replicate across nodes), no_shard = nobody (DDP — every rank keeps the full model).
     fsdp_mode: str = "full"
     reshard_after_forward: bool = True

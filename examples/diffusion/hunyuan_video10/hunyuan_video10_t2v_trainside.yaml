@@ -11,7 +11,7 @@
 # Layout: 1 node × 8 GPUs, all colocated; no weight sync section.
 #
 # Launch (1 node x 8 GPUs):
-#   bash examples/run_experiment_single_node.sh diffusion/hunyuan_video/hunyuan_video_t2v_trainside
+#   bash examples/run_experiment_single_node.sh diffusion/hunyuan_video10/hunyuan_video10_t2v_trainside
 
 num_devices: 8
 batch_size: 8                # prompts_per_rollout for the validated 1x8-GPU run
@@ -20,14 +20,14 @@ adv_use_global_std: true    # advantage: divide by ONE batch-wide std (v1 parity
 logging:
   report_to_wandb: true
   project_name: ${oc.env:WANDB_PROJECT,unirl-grpo-t2v}
-  run_name: hunyuan_video_t2v_trainside
+  run_name: hunyuan_video10_t2v_trainside
   entity: ${oc.env:WANDB_ENTITY,null}
-  tags: [hunyuan_video, t2v, grpo, trainside, lora-r64, v2]
+  tags: [hunyuan_video10, t2v, grpo, trainside, lora-r64, v2]
 
 bundle:
-  _target_: unirl.models.hunyuan_video.bundle.HunyuanVideoBundle.from_config
+  _target_: unirl.models.hunyuan_video10.bundle.HunyuanVideo10Bundle.from_config
   config:
-    _target_: unirl.models.hunyuan_video.config.HunyuanVideoPipelineConfig
+    _target_: unirl.models.hunyuan_video10.config.HunyuanVideo10PipelineConfig
     pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,hunyuanvideo-community/HunyuanVideo}
     model_precision: bf16
     vae_use_tiling: true
@@ -35,7 +35,7 @@ bundle:
     hidden_state_skip_layer: 2
 
 pipeline:
-  _target_: unirl.models.hunyuan_video.pipeline.HunyuanVideoPipeline
+  _target_: unirl.models.hunyuan_video10.pipeline.HunyuanVideo10Pipeline
   shift: 5.0
   hidden_state_skip_layer: ${bundle.config.hidden_state_skip_layer}
   autocast_precision: bf16
@@ -132,7 +132,7 @@ algorithm:
   clip_schedule: constant
   conditions_cls:
     _target_: hydra.utils.get_class
-    path: unirl.models.hunyuan_video.conditions.HunyuanVideoConditions
+    path: unirl.models.hunyuan_video10.conditions.HunyuanVideo10Conditions
   params: ${sampling}
 
 stack:
