@@ -259,12 +259,6 @@ class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
                     )
                 sde_logp_list.append(log_prob.to(dtype=self.logprob_dtype))
 
-        # Decode/NFT always need the clean terminal video/audio latent, even
-        # when sparse GRPO replay stores only earlier SDE boundaries.
-        if not stored_pairs or stored_pairs[-1][0] != num_steps:
-            stored_pairs.append((num_steps, x.detach().clone()))
-            stored_audio.append(a.detach().clone())
-
         positions = [p for p, _ in stored_pairs]
         return make_video_segment(
             latents=torch.stack([t for _, t in stored_pairs], dim=1),
