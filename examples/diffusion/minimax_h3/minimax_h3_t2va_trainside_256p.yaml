@@ -27,10 +27,13 @@
 #      rollout 45 only one seed exists and nothing is established either way.
 #   2. THE PLATEAU IS NOT SATURATION, and its cause is unknown. The sibling
 #      `minimax_h3_t2va_nft.yaml` reaches 0.461 on this same reward and prompt
-#      set and is still climbing, so ~0.29 is nowhere near the achievable
-#      ceiling. The untested suspect is `eta: 0.7`: stochastic rollouts score
-#      lower on imagebind than that recipe's deterministic eta 0.0 ones, which
-#      would cap this regime rather than the reward. Headroom is being left.
+#      set and is still climbing, so ~0.29 is far from the achievable ceiling
+#      and this recipe leaves real headroom. That gap does not isolate a cause:
+#      the two recipes differ in objective, and eta cannot be varied
+#      independently of it — DiffusionNFT needs no log-prob and every NFT recipe
+#      here runs eta 0.0, while Flow-GRPO's loss is built on SDE log-probs and
+#      is degenerate at 0. Read the gap as NFT outperforming Flow-GRPO on this
+#      task, nothing finer. Isolating eta means 0.7 against 0.3-0.5 here.
 #   3. VIDEO QUALITY IS UNVERIFIED. Reward is imagebind+clap; neither scores
 #      artifacts, and rollouts at eta 0.7 on this canvas show chromatic fringing
 #      and speckle from step 0 onward. A rising reward here is not evidence of
