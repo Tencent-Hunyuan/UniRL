@@ -1,0 +1,281 @@
+# @package _global_
+# MiniMax-H3 t2va (text -> video + stereo audio) Flow-GRPO — trainside FSDP.
+#
+# MiniMax-H3 is a 33B dense omni-modal transformer that denoises video and
+# stereo audio jointly in ONE packed sequence. Three checkpoint contracts, not
+# tuning knobs:
+#
+#   1. GUIDANCE IS DISTILLED. No CFG, one forward per step; guidance_scale below
+#      is inert.
+#   2. TWO SCHEDULES. Video shift=12, audio shift=3. Only the VIDEO grid is
+#      pinned onto the Part; the audio grid is derived in-stage.
+#   3. MIXED-DTYPE WEIGHTS. The fp32-pinned modules (patch projections, timestep
+#      MLP, output heads, rope) stay fp32 while the block stack is bf16, which is
+#      why `root_wrap: false` is load-bearing.
+#
+# WHY THIS FILE EXISTS. The sibling `minimax_h3_t2va_trainside.yaml` produces a
+# flat reward curve. This is the same algorithm on a 256x384 canvas, and its
+# reward climbs: +0.00234/step pooled over two independent seeds (t=+6.67,
+# p<0.0001, seeds agreeing at p=0.598) across 45 rollouts each. The canvas is
+# what pays for the other three changes — 3966 packed rows instead of ~22k means
+# every SDE step is replayable and the group can be 16 wide.
+#
+# TWO THINGS THAT NUMBER DOES NOT SAY, both easy to over-read:
+#   1. The RATE is not linear. It decelerates measurably inside the window
+#      (first half +0.00427, second half +0.00047, difference p=0.007), which is
+#      what a bounded reward has to do. Project from the level reached, and
+#      re-measure the slope, rather than extrapolating.
+#   2. VIDEO QUALITY IS UNVERIFIED. Reward is imagebind+clap; neither scores
+#      artifacts, and rollouts at eta 0.7 on this canvas show chromatic fringing
+#      and speckle from step 0 onward. A rising reward here is not evidence of
+#      better-looking video. Inspect logged media before trusting a long run.
+#
+# For the released 768x768 canvas, set height/width back and re-pin
+# `sde_indices: [0, 3, 6, 9]`; expect the flat curve the sibling recipe gets.
+#
+# Launch (1 node x 8 GPUs):
+#   bash examples/run_experiment_multinode_taiji.sh diffusion/minimax_h3/minimax_h3_t2va_trainside_256p
+
+num_devices: 8
+batch_size: 8
+# Divide by the batch-wide std rather than each group's own. A group that
+# happens to draw a narrow reward spread otherwise has its advantages inflated
+# by a near-zero denominator.
+adv_use_global_std: true
+num_rollouts: 1000
+
+logging:
+  report_to_wandb: true
+  project_name: ${oc.env:WANDB_PROJECT,unirl-minimax-h3-t2va}
+  run_name: ${oc.env:WANDB_RUN_NAME,minimax_h3_t2va_flowgrpo}
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: [minimax-h3, t2va, flowgrpo, trainside, audio, stereo]
+  log_media: true
+  media_max_items: 2
+  media_log_interval: 100
+
+bundle:
+  _target_: unirl.models.minimax_h3.bundle.MiniMaxH3Bundle.from_config
+  config:
+    _target_: unirl.models.minimax_h3.config.MiniMaxH3PipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,MiniMaxAI/MiniMax-H3}
+    model_precision: bf16
+    # fp32 by checkpoint contract; the audio VAE emits ~20 dB too quiet in bf16.
+    vae_dtype: fp32
+    audio_vae_dtype: fp32
+    autocast_precision: bf16
+    trajectory_precision: fp16
+    logprob_precision: fp32
+    video_shift: 12.0
+    audio_shift: 3.0
+    text_encoder_hidden_layer: 50
+    # Puts audio transitions in the policy, so clap can reach the audio stream at
+    # all. What it CAN reach is bounded — see the reward block.
+    audio_joint_sde: true
+    # The Qwen3-VL conditioner is 32B, larger than the trainable DiT's per-rank
+    # shard, and parking it on CPU is what makes 8x96GB fit.
+    aux_components_on_cpu: true
+    # The VAEs stay on the train device: ~10 GB fp32 together, and CPU decoding
+    # of 124 frames takes minutes per sample.
+    vae_components_on_cpu: false
+    # 33B eager-loads ~66 GB per rank; meta-init defers materialization until
+    # after sharding.
+    meta_init_transformer: true
+
+pipeline:
+  _target_: unirl.models.minimax_h3.pipeline.MiniMaxH3Pipeline.from_bundle
+  config: ${bundle.config}
+  strategy:
+    # CPS, not FlowSDE. FlowSDE adds exploration noise ON TOP of the level the
+    # schedule specifies, handing the next step a state noisier than anything the
+    # model saw in training; CPS reallocates WITHIN the budget
+    # (det^2 + std^2 == sigma_next^2) so every state stays on-schedule.
+    #
+    # K=4 per eta, one shared x_T, real videopickscore, at 768x768:
+    #     kernel   eta   quality  explore  latent std  video
+    #     CPS      0.7   0.8776   0.0162   1.001       clean
+    #     FlowSDE  0.2   0.8748   0.0039   1.028       clean   <- the old default
+    #     FlowSDE  0.7   0.7282   0.0195   1.228       SPECKLE
+    #
+    # The last row is the trap: highest reward spread in the sweep, worst video.
+    # That spread is speckle variance, not scene diversity.
+    _target_: unirl.sde.kernels.CPSSDEStrategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["MiniMaxH3TransformerBlock"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true
+    use_torch_compile: false
+    # LOAD-BEARING. Keeps the fp32-pinned leftovers (proj_in, audio_proj_in,
+    # time_embedder, proj_out, audio_proj_out, rope) outside every fully_shard
+    # group, so MixedPrecisionPolicy never all-gathers a bf16 compute copy of
+    # them. True runs the timestep MLP in bf16, and since H3 conditions on
+    # t = 1 - sigma, bf16 near 1.0 has ~0.008 spacing — ~40% relative error on
+    # sigma at the low-noise end.
+    # NOTE: an FSDPConfig field, NOT an FSDPBackend one.
+    root_wrap: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 1.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    # MEASURED, AND STILL LOAD-BEARING AT THIS CANVAS. grad_norm is 3e-5 here,
+    # against ~5e-5 at 768x768 with four steps -- the shorter sequence did not
+    # change it, because the per-sample log-prob is a MEAN over ~354k latent
+    # elements, so the policy gradient is attenuated by element count no matter
+    # how long the sequence is. That puts the per-coordinate gradient far below
+    # the usual 1e-8, where eps would dominate Adam's denominator and degrade it
+    # toward SGD. At 1e-12 eps sits ~3 orders below sqrt(v), so Adam rescales the
+    # tiny gradient away as designed. Do not "fix" the small grad_norm.
+    adam_epsilon: 1.0e-12
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 1000
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 32
+    alpha: 64
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    # LOAD-BEARING alongside root_wrap=false. These suffixes also occur in
+    # `token_refiner.refiner_blocks.*`, which is not in block_class_names, so an
+    # unscoped list injects LoRA params that sit outside every fully_shard group
+    # and whose grads no collective would DP-sync — `fsdp_wrap` rejects exactly
+    # that. The prefix scopes them to the 50-layer denoising stack.
+    module_prefix: transformer_blocks
+    # Attention + FFN only. Deliberately NOT the fp32-pinned projections or
+    # adaln_proj: adapting a module the wrap keeps outside every FSDP group has
+    # the same un-synced-grad failure.
+    target_modules:
+      - attn.to_q
+      - attn.to_k
+      - attn.to_v
+      - attn.to_out.0
+      - ff.net.0.proj
+      - ff.net.2
+
+rollout:
+  _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
+  stage_attrs: [diffusion]
+  # The packed sequence carries unbatched per-row metadata, so the engine chunks
+  # to one sample per generate() call. Same discipline as the bagel navit recipe.
+  forward_batch_size: 1
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.local.t2av_composite.T2AVCompositeScorer
+    base_device: cuda
+    config:
+      _target_: unirl.reward.local.t2av_composite.T2AVCompositeSpec
+      device: auto
+      batch_size: 2
+      # Inert while videopickscore is unweighted, since it is the only inner
+      # scorer declaring the field, and kept so re-adding it cannot go back to
+      # scoring a blank opening frame.
+      frame_selection: middle
+      # imagebind, not videopickscore, which scores the FIRST FRAME only and so
+      # is close to constant in what this optimises.
+      #
+      # Read clap's weight with the log-prob combination in mind: the two streams
+      # are weighted by ELEMENT count, and audio holds 3.7% of the elements here
+      # (0.64% at 768x768, since audio elements are set by duration while video
+      # scales with area), so clap steers audio far more weakly than 1.0 suggests.
+      #
+      # LICENCE: ImageBind is CC-BY-NC-SA. This recipe is NonCommercial.
+      weights:
+        imagebind: 1.0
+        clap: 1.0
+
+algorithm:
+  _target_: unirl.algorithms.flowgrpo.FlowGRPO
+  stage_attr: diffusion
+  # INERT as configured, and measured so: with num_updates_per_batch=1 and
+  # old_logp_source=replay, both sides of the ratio are computed at the same
+  # weights, so ratio is exactly 1 and clip_fraction exactly 0. The objective is
+  # then a plain policy gradient with a GRPO baseline -- correct, just one update
+  # per rollout. This value only starts mattering if num_updates_per_batch rises,
+  # which is also the cheapest way to get more out of a ~30-minute rollout.
+  clip_range: 5.0e-3
+  clip_schedule: constant
+  # Both sides of the ratio come from stage.replay at pre-update weights, so any
+  # residual precision asymmetry between the rollout and replay paths cancels
+  # instead of biasing the ratio. Matters more here than usual: this is the
+  # repo's first mixed-dtype checkpoint.
+  old_logp_source: replay
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.minimax_h3.conditions.MiniMaxH3Conditions
+  params: ${sampling}
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 1
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: datasets/pickscore/train.txt
+      eval_data_path: datasets/pickscore/test.txt
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  num_inference_steps: 10
+  # Inert: the checkpoint is guidance-distilled.
+  guidance_scale: 1.0
+  # NO `sde_indices` KEY, and that is the point. Omitting it makes
+  # resolve_sde_indices fall back to every step, so all 10 record log-probs and
+  # all 10 are replayed and trained.
+  #
+  # It used to be pinned to [0, 3, 6, 9] because replay() builds ONE autograd
+  # graph across every replayed step, costing ~12 GB per step at 768x768's
+  # ~21.7k rows — over 100 GB for ten, which OOMs a 95 GB H20 AFTER a paid
+  # rollout. At 3966 rows that is ~2.2 GB per step and ~22 GB for all ten. The
+  # canvas below is what buys the other 2.5x of trained timesteps.
+  height: 256
+  width: 384
+  # The VAE maps 17n+5 pixel frames to 5n+2 latent, so 124 gives 37 latent
+  # frames (5.17s at 24 fps; H3 supports 5-15s).
+  num_frames: 124
+  # 0.7 IS ONLY SAFE UNDER CPS. Measured under CPS at 768x768, K=4 per eta
+  # sharing one x_T, real videopickscore:
+  #     eta    quality   explore   latent std
+  #     0.20   0.9018    0.0061    1.012
+  #     0.40   0.8960    0.0124    0.995
+  #     0.70   0.8776    0.0162    1.001     <- chosen: peak exploration
+  #     0.90   0.8928    0.0136    0.990        past the peak
+  #
+  # Exploration falls again at 0.9, where the deterministic component is only
+  # 0.155*sigma_next and each step nearly restarts from fresh noise. K=4 makes
+  # the peak LOCATION noisy, and the sweep was run at 768x768 — re-measure
+  # before trusting it here.
+  eta: 0.7
+  # The group size IS the advantage estimator: GRPO normalises within a group,
+  # so at group 2 the advantage is algebraically always +-1 and carries no
+  # magnitude. Three arms x ~80 steps at group 2 gave slopes indistinguishable
+  # from zero. 16 is affordable at this canvas; keep total samples at or below
+  # ~128, since 512 per step exhausted a 2.2 TB host during reward scoring.
+  samples_per_prompt: 16
+  seed: 42
+  init_same_noise: false
+  autocast_precision: bf16
+  trajectory_precision: fp16
+  logprob_precision: fp32

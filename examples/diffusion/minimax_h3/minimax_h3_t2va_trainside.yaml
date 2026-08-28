@@ -14,10 +14,19 @@
 #      MLP, output heads, rope) stays fp32 while the block stack is bf16. That
 #      is why `root_wrap: false` below is load-bearing — see the backend block.
 #
-# GEOMETRY IS NOT FREE. H3 was released for a 768px SHORT EDGE only, both axes
-# a multiple of 32, and 5–15s at 24fps. 768x768 / 124 frames (~5.17s) is the
-# FLOOR — roughly 22k packed rows. The pipeline raises on anything else rather
-# than silently re-resolving. There is no cheap low-res setting for this model.
+# GEOMETRY. Both axes a multiple of 32, aspect ratio within 1:4..4:1, area under
+# the 768x1344 cap, and 5–15s at 24fps: that is the whole of what the pipeline
+# enforces. There is NO 768px short-edge floor — an earlier version of this
+# comment claimed one, inferred from an aspect-ratio helper's default rather than
+# from the checkpoint, and the resolver never enforced it as a floor.
+#
+# That matters because 768x768 is ~22k packed rows, and at that width only 3 of
+# the 10 SDE steps fit in replay (see `sde_indices` below). No run at 768 has
+# yet produced a rising reward curve: four arms went flat at group 8 with 4 of
+# 10 steps trained, and this file asks for less of both. The sibling
+# `minimax_h3_t2va_trainside_256p.yaml` is the same algorithm at 256x384, where
+# all 10 steps replay and the reward climbs on two seeds. Prefer it unless you
+# specifically need the released canvas.
 #
 # Launch (1 node x 8 GPUs):
 #   bash examples/run_experiment_multinode_taiji.sh diffusion/minimax_h3/minimax_h3_t2va_trainside
