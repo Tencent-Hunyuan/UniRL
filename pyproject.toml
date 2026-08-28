@@ -73,10 +73,13 @@ sglang = [
   "flash-linear-attention[conv1d]==0.5.1 ; sys_platform == 'linux'",
   "av>=14.2,<19 ; sys_platform == 'linux'",
 ]
-# CUDA 12.9 stack: vllm 0.20.0 PyPI wheels are compiled against CUDA 12.9.
+# CUDA 12.9 stack. vLLM-Omni 0.22 is the first stable release with the
+# SenseNova-U1 pixel-head pipeline used by the U1.5 rollout recipe. Select the
+# release's explicit +cu129 wheels: the plain PyPI wheel links CUDA 13 even
+# when resolution also selects torch+cu129.
 vllm = [
-  "vllm==0.20.0 ; sys_platform == 'linux'",
-  "vllm-omni==0.20.0 ; sys_platform == 'linux'",
+  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.22.0/vllm-0.22.0%2Bcu129-cp38-abi3-manylinux_2_28_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "vllm-omni==0.22.0 ; sys_platform == 'linux'",
   "torch==2.11.0+cu129 ; sys_platform == 'linux'",
   "torchvision==0.26.0+cu129 ; sys_platform == 'linux'",
   "torchaudio==2.11.0+cu129 ; sys_platform == 'linux'",
@@ -165,13 +168,9 @@ environments = [
   "sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 
-# vllm's PyPI wheel is manylinux_2_35 and its GitHub +cu129 wheel manylinux_2_31;
-# the fleet pods are glibc 2.28, so vllm must build from sdist on-pod. Its
-# build-requires omits numpy (CMake configure fails), and the build-env torch
-# must match the runtime +cu129 flavor or the compiled kernels link CUDA 13 libs.
-# First build is slow (or export VLLM_USE_PRECOMPILED=1); uv caches it per pod.
-# (Plain-string pin instead of match-runtime: bump together with the torch
-# anchor in the vllm extra above.)
+# Source-build fallback: vLLM's build-requires omits numpy, and the build-env
+# torch must match the runtime +cu129 flavor. The v0.22 direct wheels above are
+# manylinux_2_28 and normally avoid this path on the supported fleet arches.
 [tool.uv.extra-build-dependencies]
 vllm = [
   "numpy",
@@ -209,7 +208,11 @@ target-version = "py312"
 # upstream model code carries
 # semantically-meaningful trailing whitespace (VideoAlign prompt templates) that
 # must not be auto-stripped.
-extend-exclude = ["unirl-reward-service", "unirl/models/bagel/vendor"]
+extend-exclude = [
+  "unirl-reward-service",
+  "unirl/models/bagel/vendor",
+  "unirl/models/sensenova_u1/vendor",
+]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I"]

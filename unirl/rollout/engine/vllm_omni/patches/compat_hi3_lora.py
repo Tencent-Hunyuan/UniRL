@@ -6,7 +6,7 @@ _INSTALLED = False
 
 
 def install() -> None:
-    """Patch ``get_moe_expert_mapping`` everywhere it's used, unwrapping HI3's 2-tuple to vllm 0.20's flat list."""
+    """Patch ``get_moe_expert_mapping`` everywhere it is used, unwrapping HI3's 2-tuple result."""
     global _INSTALLED
     if _INSTALLED:
         return

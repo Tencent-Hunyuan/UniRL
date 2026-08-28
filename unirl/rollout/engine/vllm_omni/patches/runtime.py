@@ -136,7 +136,7 @@ def wrap_mp_process_for_children() -> None:
 
 
 def patch_qwen3_omni_thinker_lora() -> None:
-    """Backport Qwen3-Omni Thinker LoRA support to vLLM-Omni 0.20."""
+    """Install only the Qwen3-Omni compatibility pieces absent upstream."""
     module_name = "vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker"
     if importlib.util.find_spec(module_name) is None:
         return
@@ -152,8 +152,12 @@ def patch_qwen3_omni_thinker_lora() -> None:
         patch_qwen3_omni_thinker_class,
     )
 
+    has_native_thinker_support = bool(getattr(Qwen3OmniMoeThinkerForConditionalGeneration, "supports_lora", False))
     patch_qwen3_omni_thinker_class(Qwen3OmniMoeThinkerForConditionalGeneration)
-    patch_qwen3_omni_audio_video_mrope(Qwen3OmniMoeThinkerForConditionalGeneration)
+    if not has_native_thinker_support:
+        # The 0.22 Thinker already computes interleaved audio/video positions.
+        # Applying the old token-shift correction again moves delimiters twice.
+        patch_qwen3_omni_audio_video_mrope(Qwen3OmniMoeThinkerForConditionalGeneration)
     patch_qwen3_omni_audio_truncation(Qwen3OmniMoeThinkerMultiModalProcessor)
 
 
@@ -580,9 +584,11 @@ def patch_hi3_flow_alignment() -> None:
     except (ImportError, AttributeError):
         return
 
-    _ImageKVCacheManager = _trans.ImageKVCacheManager
-    _DecoderLayer = _trans.HunyuanImage3DecoderLayer
+    _ImageKVCacheManager = getattr(_trans, "ImageKVCacheManager", None)
+    _DecoderLayer = getattr(_trans, "HunyuanImage3DecoderLayer", None)
 
+    if _ImageKVCacheManager is None or _DecoderLayer is None:
+        return
     if not hasattr(_ImageKVCacheManager, "_save_image_kv_caches"):
         return
 

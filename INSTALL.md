@@ -4,7 +4,7 @@ UniRL ships two mutually exclusive inference engines (`vllm` and `sglang`) — i
 
 | Engine | CUDA | glibc |
 |---|---|---|
-| **vllm-omni** | 12.9 | ≥ 2.28 |
+| **vllm-omni** | 12.9 | ≥ 2.31 |
 | **sglang** | 13.0 | ≥ 2.34 |
 
 ## vllm-omni
@@ -14,6 +14,11 @@ uv venv --python 3.12 --seed .venv && source .venv/bin/activate
 export VLLM_USE_PRECOMPILED=1   # else 30+ min CUDA build
 uv pip install -e ".[vllm,train,infer]"
 ```
+
+The vLLM 0.22 CUDA wheel itself is `manylinux_2_28`, but its required
+`llguidance` wheel is `manylinux_2_31`. On a glibc 2.28 image, use a newer
+runtime/container or build `llguidance` from source with Rust; otherwise the
+resolver falls back to an unsupported or stalled source build.
 
 ## sglang
 

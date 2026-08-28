@@ -142,13 +142,37 @@ def build_image_segment(
     )
     head_custom = getattr(head, "custom_output", None) or {}
     sde_step_indices_raw = head_custom.get("sde_step_indices")
+    trajectory_indices_raw = head_custom.get("trajectory_indices")
 
     indices: Optional[torch.Tensor] = None
     sde_indices: Optional[torch.Tensor] = None
+    if traj_latents is not None:
+        stored_steps = int(traj_latents.shape[1])
+        if trajectory_indices_raw is None:
+            indices = torch.arange(stored_steps, dtype=torch.long)
+        else:
+            indices = torch.as_tensor([int(i) for i in trajectory_indices_raw], dtype=torch.long)
+            if int(indices.numel()) != stored_steps:
+                raise RuntimeError(
+                    "build_image_segment: trajectory_indices has "
+                    f"{int(indices.numel())} entries but trajectory_latents stores {stored_steps} steps."
+                )
+            if indices.numel() and (
+                not bool(torch.all(indices[1:] > indices[:-1]))
+                or int(indices[0]) < 0
+                or (torch.is_tensor(seg_sigmas) and int(indices[-1]) >= int(seg_sigmas.numel()))
+            ):
+                raise RuntimeError(
+                    "build_image_segment: trajectory_indices must be strictly increasing and within the sigma schedule; "
+                    f"got {indices.tolist()}."
+                )
+            for output in diff_outputs[1:]:
+                other = (getattr(output, "custom_output", None) or {}).get("trajectory_indices")
+                if other is None or [int(i) for i in other] != indices.tolist():
+                    raise RuntimeError("build_image_segment: trajectory_indices differ across engine requests.")
+
     K = int(traj_log_probs.shape[1]) if traj_log_probs is not None else 0
     if K > 0:
-        T_plus_1 = int(traj_latents.shape[1]) if traj_latents is not None else K + 1
-        indices = torch.arange(T_plus_1, dtype=torch.long)
         if sde_step_indices_raw is not None:
             sde_indices = torch.as_tensor([int(i) for i in sde_step_indices_raw], dtype=torch.long)
             if int(sde_indices.numel()) != K:
@@ -170,8 +194,6 @@ def build_image_segment(
             sde_indices = torch.arange(K, dtype=torch.long)
     elif traj_latents is not None:
         traj_log_probs = None
-        T_plus_1 = int(traj_latents.shape[1])
-        indices = torch.arange(T_plus_1, dtype=torch.long)
         sde_indices = None
 
     return make_image_segment(

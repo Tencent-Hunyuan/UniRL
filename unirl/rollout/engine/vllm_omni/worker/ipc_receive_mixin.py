@@ -107,11 +107,19 @@ class BucketedIPCReceiveMixin:
 
     def _diffrl_load_weights(self, weights: list[tuple[str, torch.Tensor]]) -> None:
         """Forward weights to whichever loader the underlying worker exposes."""
+        runner = getattr(self, "model_runner", None)
+        if runner is not None:
+            for attr in ("pipeline", "model"):
+                obj = getattr(runner, attr, None)
+                validator = getattr(obj, "validate_weight_sync_names", None) if obj is not None else None
+                if callable(validator):
+                    validator(weights)
+                    break
+
         loader = getattr(self, "load_weights", None)
         if callable(loader):
             loader(weights)
             return
-        runner = getattr(self, "model_runner", None)
         if runner is None:
             raise RuntimeError(f"{type(self).__name__}: no `load_weights` and no `model_runner`.")
         for attr in ("model", "pipeline"):

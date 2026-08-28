@@ -90,6 +90,7 @@ dimension; all listed models are supported (✅).
 | Prompt-Enhancer | LLM + diffusion | Text → Text → Image | ✅ |
 | HunyuanImage3 | Unified AR + diffusion | Text → Image | ✅ |
 | Bagel | Unified AR + diffusion | Text / Text + Image → Image | ✅ |
+| SenseNova-U1.5 | Unified MoT pixel flow | Text → Image | ✅ |
 
 </div>
 

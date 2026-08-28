@@ -1,4 +1,4 @@
-"""Adapter registry — importing this package registers all 12 modalities."""
+"""Adapter registry — importing this package registers all rollout modalities."""
 
 from unirl.rollout.engine.vllm_omni.adapters.bagel import (
     BagelAdapter,
@@ -44,6 +44,11 @@ from unirl.rollout.engine.vllm_omni.adapters.qwen_image import (
     QwenImageT2iAdapter,
 )
 from unirl.rollout.engine.vllm_omni.adapters.sd3 import Sd3InputAdapter, Sd3OutputAdapter, Sd3T2iAdapter
+from unirl.rollout.engine.vllm_omni.adapters.sensenova_u1 import (
+    SenseNovaU1InputAdapter,
+    SenseNovaU1OutputAdapter,
+    SenseNovaU1T2IAdapter,
+)
 
 __all__ = [
     "DitInputAdapter",
@@ -75,6 +80,9 @@ __all__ = [
     "QwenImageInputAdapter",
     "QwenImageOutputAdapter",
     "QwenImageT2iAdapter",
+    "SenseNovaU1InputAdapter",
+    "SenseNovaU1OutputAdapter",
+    "SenseNovaU1T2IAdapter",
     "Sd3InputAdapter",
     "Sd3OutputAdapter",
     "Sd3T2iAdapter",

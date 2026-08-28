@@ -224,8 +224,8 @@ else
     require_torch_flavor "2.11.0+cu129"
 fi
 if [ "${PROFILE}" = "sd3-vllm-omni" ] || [ "${PROFILE}" = "qwen-omni" ]; then
-    require_dist_version "vllm" "0.20.0"
-    require_dist_version "vllm-omni" "0.20.0"
+    require_dist_version "vllm" "0.22.0+cu129"
+    require_dist_version "vllm-omni" "0.22.0"
 fi
 
 WANDB_OVERRIDES=(
