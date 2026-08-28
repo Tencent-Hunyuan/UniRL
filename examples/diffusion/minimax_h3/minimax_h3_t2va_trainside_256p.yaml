@@ -20,12 +20,18 @@
 # what pays for the other three changes — 3966 packed rows instead of ~22k means
 # every SDE step is replayable and the group can be 16 wide.
 #
-# TWO THINGS THAT NUMBER DOES NOT SAY, both easy to over-read:
-#   1. The RATE is not linear. It decelerates measurably inside the window
-#      (first half +0.00427, second half +0.00047, difference p=0.007), which is
-#      what a bounded reward has to do. Project from the level reached, and
-#      re-measure the slope, rather than extrapolating.
-#   2. VIDEO QUALITY IS UNVERIFIED. Reward is imagebind+clap; neither scores
+# THREE THINGS THAT NUMBER DOES NOT SAY, all easy to over-read:
+#   1. The RATE is not linear. It decelerates inside the window — first half
+#      +0.00427, second half +0.00047, difference p=0.007 on the disjoint halves.
+#      Project from the level reached and re-measure; do not extrapolate. Past
+#      rollout 45 only one seed exists and nothing is established either way.
+#   2. THE PLATEAU IS NOT SATURATION, and its cause is unknown. The sibling
+#      `minimax_h3_t2va_nft.yaml` reaches 0.461 on this same reward and prompt
+#      set and is still climbing, so ~0.29 is nowhere near the achievable
+#      ceiling. The untested suspect is `eta: 0.7`: stochastic rollouts score
+#      lower on imagebind than that recipe's deterministic eta 0.0 ones, which
+#      would cap this regime rather than the reward. Headroom is being left.
+#   3. VIDEO QUALITY IS UNVERIFIED. Reward is imagebind+clap; neither scores
 #      artifacts, and rollouts at eta 0.7 on this canvas show chromatic fringing
 #      and speckle from step 0 onward. A rising reward here is not evidence of
 #      better-looking video. Inspect logged media before trusting a long run.
