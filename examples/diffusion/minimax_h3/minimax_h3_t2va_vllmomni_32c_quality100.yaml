@@ -28,7 +28,6 @@ eval_sampling:
   num_frames: 107
   sampler_kwargs:
     aspect_ratio: "16:9"
-    allow_nonstandard_canvas: true
 
 data_source:
   args:
@@ -93,7 +92,6 @@ sampling:
   trajectory_precision: fp32
   sampler_kwargs:
     aspect_ratio: "16:9"
-    allow_nonstandard_canvas: true
     reward_num_frames: 9
 
 logging:

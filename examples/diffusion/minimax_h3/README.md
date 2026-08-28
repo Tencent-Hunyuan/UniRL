@@ -93,13 +93,12 @@ the vLLM-Omni rollout, the 32-GPU geometry and the topology overrides.
 
 ## Geometry constraint
 
-H3 was released for a 768-pixel short edge with both axes a multiple of 32, and
-`MiniMaxH3Geometry.resolve` enforces that by default. Lower-resolution runs must
-opt in explicitly with `sampler_kwargs.allow_nonstandard_canvas: true`, which
-still requires both axes to be multiples of 32 with a short edge ≥ 256 and an
-area within the released bound. Anything outside the released distribution is an
-unqualified setting — treat generated-quality regressions there as expected
-until re-qualified.
+The reference canvas resolver starts from a 768-pixel short edge, but that is a
+default rather than a model floor. `MiniMaxH3Geometry.resolve` enforces the
+structural constraints: both axes must be multiples of 32, the aspect ratio must
+stay within 1:4–4:1, the area must not exceed 768×1344, and the duration and
+frame count must round-trip through the VAE. Lower-resolution runs remain
+quality-sensitive and should be qualified independently.
 
 ## Known limitations
 
