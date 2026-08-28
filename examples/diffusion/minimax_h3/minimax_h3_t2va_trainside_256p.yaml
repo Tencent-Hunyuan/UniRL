@@ -60,13 +60,22 @@
 #      task, nothing finer. Isolating eta means varying it within Flow-GRPO, and
 #      0.25 is the value to try: it is what all three hunyuan_video15 recipes
 #      and wan21_t2v_videoalign use, so 0.7 is not a settled default for video.
-#   3. VIDEO QUALITY IS UNVERIFIED, and no reward reweighting fixes it. imagebind
-#      sees 10 of the 124 frames as 5 adjacent pairs, three 224px crops each —
-#      good coverage next to videopickscore's single frame — but it scores
-#      embedding ALIGNMENT, not quality, so artifacts that leave the clip
-#      recognisable cost nothing at any coverage. clap never sees a pixel.
-#      Rollouts here show chromatic fringing and speckle from step 0 onward, so
-#      a rising reward is not evidence of better video. Look at frames.
+#   3. NOTHING IN THIS REWARD CONNECTS THE PROMPT TO THE VIDEO, and no reweighting
+#      of these two components fixes it. `ImageBindSpec.mode` defaults to
+#      "audio_video", and T2AVCompositeScorer builds inner specs with
+#      `inner_spec_cls()` while propagating only device/batch_size/
+#      frame_selection — `mode` is unreachable from a recipe. So imagebind here is
+#      exactly cos(audio_emb, video_emb): no text_audio, no text_video. clap sees
+#      the text but never a pixel. The objective therefore rewards the two
+#      generated streams agreeing WITH EACH OTHER, and a degenerate pair of
+#      contentless streams has nothing to violate.
+#
+#      THIS IS NOT HYPOTHETICAL. The sibling `minimax_h3_t2va_nft.yaml`, same
+#      reward and canvas, decodes to luma 2.0/255 with 99.4% of pixels below 16
+#      and audio RMS down 9-28x at its rollout 100 — while imagebind sat at its
+#      maximum, 0.158 -> 0.316. Rollouts here also show chromatic fringing and
+#      speckle from step 0. A rising reward on this objective is not evidence of
+#      better video. Look at frames before believing any number above.
 #
 # For the released 768x768 canvas, set height/width back and re-pin
 # `sde_indices: [0, 3, 6, 9]`; expect the flat curve the sibling recipe gets.
