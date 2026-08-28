@@ -36,10 +36,13 @@
 #      task, nothing finer. Isolating eta means varying it within Flow-GRPO, and
 #      0.25 is the value to try: it is what all three hunyuan_video15 recipes
 #      and wan21_t2v_videoalign use, so 0.7 is not a settled default for video.
-#   3. VIDEO QUALITY IS UNVERIFIED. Reward is imagebind+clap; neither scores
-#      artifacts, and rollouts at eta 0.7 on this canvas show chromatic fringing
-#      and speckle from step 0 onward. A rising reward here is not evidence of
-#      better-looking video. Inspect logged media before trusting a long run.
+#   3. VIDEO QUALITY IS UNVERIFIED, and no reward reweighting fixes it. imagebind
+#      sees 10 of the 124 frames as 5 adjacent pairs, three 224px crops each —
+#      good coverage next to videopickscore's single frame — but it scores
+#      embedding ALIGNMENT, not quality, so artifacts that leave the clip
+#      recognisable cost nothing at any coverage. clap never sees a pixel.
+#      Rollouts here show chromatic fringing and speckle from step 0 onward, so
+#      a rising reward is not evidence of better video. Look at frames.
 #
 # For the released 768x768 canvas, set height/width back and re-pin
 # `sde_indices: [0, 3, 6, 9]`; expect the flat curve the sibling recipe gets.
