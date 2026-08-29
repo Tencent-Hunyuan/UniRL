@@ -4,15 +4,14 @@ UniRL ships two mutually exclusive inference engines (`vllm` and `sglang`) — i
 
 | Engine | CUDA | glibc |
 |---|---|---|
-| **vllm-omni** | 12.9 | ≥ 2.28 |
+| **vllm-omni** | 13.0 | ≥ 2.28 |
 | **sglang** | 13.0 | ≥ 2.34 |
 
 ## vllm-omni
 
 ```bash
 uv venv --python 3.12 --seed .venv && source .venv/bin/activate
-export VLLM_USE_PRECOMPILED=1   # else 30+ min CUDA build
-uv pip install -e ".[vllm,train,infer]"
+uv pip install -e ".[vllm,train,infer]" --prerelease=allow
 ```
 
 ## sglang
@@ -26,7 +25,7 @@ uv pip install -e ".[sglang,train,infer]" --prerelease=allow
 
 | Extra | Adds | Use when |
 |---|---|---|
-| `vllm` | `vllm`, `vllm-omni`, torch +cu129 stack, PyAV | Running any vllm-omni-based example |
+| `vllm` | `vllm`, `vllm-omni`, torch +cu130 stack, PyAV | Running any vllm-omni-based example |
 | `sglang` | `sglang[diffusion]`, `flash-attn-4`, torch +cu130 stack, PyAV | Running VLM/LLM examples or `sd3_sglang_*` |
 | `train` | `wandb`, `aiohttp` | Training runs (almost always wanted) |
 | `infer` | `accelerate` | HunyuanImage3 and similar models |
@@ -41,7 +40,7 @@ bare venv works for every converter except `datasets/droid100/`, which needs tor
 For development tools (lint and tests):
 
 ```bash
-uv pip install -e ".[vllm,train,infer,eval,dev]"
+uv pip install -e ".[vllm,train,infer,eval,dev]" --prerelease=allow
 # or, for the sglang engine:
 uv pip install -e ".[sglang,train,infer,eval,dev]" --prerelease=allow
 ```

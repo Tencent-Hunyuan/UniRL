@@ -436,59 +436,6 @@ def patch_fp32_skip() -> None:
             _mod.from_layer = _patched_from_layer
 
 
-def patch_hv15_refiner_qkv_weight_loader() -> None:
-    """Load the HV1.5 token refiner's unfused Q/K/V projections directly."""
-    try:
-        from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-        from vllm_omni.diffusion.models.hunyuan_video.hunyuan_video_15_transformer import (
-            HunyuanVideo15Transformer3DModel,
-        )
-    except (ImportError, AttributeError):
-        return
-
-    original_load_weights = HunyuanVideo15Transformer3DModel.load_weights
-    if getattr(original_load_weights, "_diffrl_hv15_refiner_qkv_weight_loader", False):
-        return
-
-    stacked_params_mapping = (
-        (".to_qkv", ".to_q"),
-        (".to_qkv", ".to_k"),
-        (".to_qkv", ".to_v"),
-        (".add_kv_proj", ".add_q_proj"),
-        (".add_kv_proj", ".add_k_proj"),
-        (".add_kv_proj", ".add_v_proj"),
-    )
-
-    @wraps(original_load_weights)
-    def _patched_load_weights(self, weights):
-        params_dict = dict(self.named_parameters())
-        directly_loaded: set[str] = set()
-
-        def _remaining_weights():
-            for name, loaded_weight in weights:
-                packed_name = next(
-                    (
-                        name.replace(weight_name, param_name)
-                        for param_name, weight_name in stacked_params_mapping
-                        if f"{weight_name}." in name
-                    ),
-                    None,
-                )
-                if packed_name is not None and packed_name not in params_dict and name in params_dict:
-                    param = params_dict[name]
-                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                    weight_loader(param, loaded_weight)
-                    directly_loaded.add(name)
-                    continue
-                yield name, loaded_weight
-
-        loaded = original_load_weights(self, _remaining_weights())
-        return set(loaded or ()) | directly_loaded
-
-    _patched_load_weights._diffrl_hv15_refiner_qkv_weight_loader = True
-    HunyuanVideo15Transformer3DModel.load_weights = _patched_load_weights
-
-
 def patch_hv15_packed_lora_mapping() -> None:
     """Expose HV1.5's packed QKV mapping to the diffusion LoRA manager."""
     try:
@@ -871,7 +818,6 @@ class VLLMOmniHijack:
         patch_ar_lora_loader()
         patch_ar_merged_lora_fused_tensor()
         patch_fp32_skip()
-        patch_hv15_refiner_qkv_weight_loader()
         patch_hv15_packed_lora_mapping()
         patch_hv15_refiner_torch_linear_lora()
         patch_lora_request_passthrough()
@@ -886,7 +832,6 @@ __all__ = [
     "OmniTensorLoRARequest",
     "VLLMOmniHijack",
     "patch_hv15_packed_lora_mapping",
-    "patch_hv15_refiner_qkv_weight_loader",
     "patch_hv15_refiner_torch_linear_lora",
     "patch_hi3_flow_alignment",
     "patch_per_request_ar_seed",
