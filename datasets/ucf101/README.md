@@ -12,7 +12,7 @@ Raw videos and generated manifests are local artifacts and must not be
 committed. The repository `.gitignore` excludes `raw/` and `processed/`.
 
 Install UniRL using one of the supported environments in
-[`INSTALL.md`](../../INSTALL.md). For example, a supported vLLM/CUDA 13.0
+[`INSTALL.md`](../../INSTALL.md). For example, a supported vLLM/CUDA 12.9
 training environment can be installed with:
 
 ```bash

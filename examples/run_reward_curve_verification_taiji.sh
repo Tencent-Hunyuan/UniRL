@@ -221,10 +221,10 @@ if [ "${PROFILE}" = "ar-drpo" ]; then
         exit 2
     fi
 else
-    require_torch_flavor "2.13.0+cu130"
+    require_torch_flavor "2.13.0+cu129"
 fi
 if [ "${PROFILE}" = "sd3-vllm-omni" ] || [ "${PROFILE}" = "qwen-omni" ]; then
-    require_dist_version "vllm" "0.27.0"
+    require_dist_version "vllm" "0.27.0+cu129"
     require_dist_version "vllm-omni" "0.27.0rc1"
 fi
 

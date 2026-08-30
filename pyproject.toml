@@ -73,13 +73,14 @@ sglang = [
   "flash-linear-attention[conv1d]==0.5.1 ; sys_platform == 'linux'",
   "av>=14.2,<19 ; sys_platform == 'linux'",
 ]
-# CUDA 13.0 stack: vLLM-Omni 0.27.0rc1 is rebased on vLLM 0.27.0 / torch 2.13.
+# CUDA 12.9 stack: use vLLM's release-provided cu129 wheel on the H20 fleet's 535 driver.
 vllm = [
-  "vllm==0.27.0 ; sys_platform == 'linux'",
+  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.27.0/vllm-0.27.0%2Bcu129-cp38-abi3-manylinux_2_28_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
   "vllm-omni==0.27.0rc1 ; sys_platform == 'linux'",
-  "torch==2.13.0+cu130 ; sys_platform == 'linux'",
-  "torchvision==0.28.0+cu130 ; sys_platform == 'linux'",
-  "torchaudio==2.11.0+cu130 ; sys_platform == 'linux'",
+  "torch==2.13.0+cu129 ; sys_platform == 'linux'",
+  "torchvision==0.28.0+cu129 ; sys_platform == 'linux'",
+  "torchaudio==2.11.0+cu129 ; sys_platform == 'linux'",
+  "torchcodec==0.16.0+cu129 ; sys_platform == 'linux'",
   "av>=14.2,<19 ; sys_platform == 'linux'",
 ]
 train = [
