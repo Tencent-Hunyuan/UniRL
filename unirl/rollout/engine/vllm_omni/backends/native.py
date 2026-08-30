@@ -113,6 +113,9 @@ class VLLMOmniBackend:
     @classmethod
     def boot(cls, intent: Dict[str, Any]) -> "VLLMOmniBackend":
         """Spell the intent into ``Omni`` ctor kwargs and spawn."""
+        if attention_backend := intent.get("diffusion_attention_backend"):
+            os.environ["DIFFUSION_ATTENTION_BACKEND"] = str(attention_backend)
+
         from unirl.rollout.engine.vllm_omni.patches import install as install_patches
 
         install_patches()

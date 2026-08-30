@@ -42,6 +42,8 @@ All in `runtime.py` unless noted.
 | `patch_dit_lora_loader` / `patch_ar_lora_loader` | Stock `DiffusionLoRAManager._load_adapter` loads only from a file path; RL pushes freshly-trained adapter tensors without a disk round-trip (`OmniTensorLoRARequest`). Lifted verbatim from verl-omni | vllm-omni's LoRA managers accept tensor-bag requests natively |
 | `patch_dit_hi3_lora_weights` | Resolves HI3 DiT `transformer.layers.*` wrappers against PEFT `model.layers.*` keys and converts GQA-interleaved fused-QKV LoRA-B rows to vLLM's packed `[q, k, v]` slices | [vllm-omni #6411](https://github.com/vllm-project/vllm-omni/issues/6411) is fixed and the pinned release includes it |
 | `patch_fp32_skip` | Punica kernels hard-assert dtype; HI3's MoE router gate is fp32, so non-fp16/bf16 layers must be skipped for LoRA wrapping | vllm's `from_layer` skips unsupported dtypes itself |
+| `patch_hv15_packed_lora_mapping` | HV1.5 exposes `packed_modules_mapping`, while the diffusion LoRA manager only reads a model-level `stacked_params_mapping`. Consequently all six logical Q/K/V targets per main block are loaded but neither packed projection is wrapped or activated. Translate the model's packed relationship into the attribute consumed by the manager | vllm-omni's LoRA manager reads HV1.5's `packed_modules_mapping` directly |
+| `patch_hv15_refiner_torch_linear_lora` | Pinned vllm-omni's diffusion LoRA manager replaces only vLLM linear classes. HV1.5 deliberately keeps the two token-refiner blocks as Diffusers `nn.Linear` layers, so their 12 configured LoRA targets are loaded and checksum-verified but never applied to the rollout policy. Wrap just those ordinary linears with the same BF16 base-plus-adapter arithmetic and fail if any configured refiner target is missing | vllm-omni applies diffusion LoRA to HV1.5's ordinary token-refiner linears and verifies active-layer coverage |
 | `patch_lora_request_passthrough` | `Omni.generate` never forwards `lora_request`, needed by the HI3 AR-prelude stage. Verified still absent at upstream main (~v0.22.0rc1); `AsyncOmniEngine.add_request` has accepted the kwarg all along, so a small upstream PR forwarding it would retire this | vllm-omni upstreams the kwarg (then the `ar_lora_passthrough` gate drops too) |
 | `patch_per_request_ar_seed` | One `SamplingParams` is shared across requests, so a GRPO group's N requests collapse to identical tokens | vllm-omni stops sharing one `SamplingParams` |
 | `patch_qwen3_omni_thinker_lora` | Backport of vllm-omni #3915: expose the Thinker LoRA interface, select `thinker_config` during model init, accept the current M-RoPE signature | pin vllm-omni ≥ 0.22 |
@@ -82,3 +84,6 @@ known-invalid adapter.
 - **Every patch needs a DELETE-WHEN row.** Without one it is permanent by default.
 - **`patch_hi3_flow_alignment` self-skips on newer pins** — it is dead code, not a
   live patch, once the pin moves past v0.20.0.
+- **The pinned diffusion selector ignores `engine_args.attention_backend`.** A
+  model adapter that needs a fixed kernel must export
+  `DIFFUSION_ATTENTION_BACKEND` through its boot intent before `Omni()` spawns.

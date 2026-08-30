@@ -11,8 +11,7 @@ UniRL ships two mutually exclusive inference engines (`vllm` and `sglang`) — i
 
 ```bash
 uv venv --python 3.12 --seed .venv && source .venv/bin/activate
-export VLLM_USE_PRECOMPILED=1   # else 30+ min CUDA build
-uv pip install -e ".[vllm,train,infer]"
+uv pip install -e ".[vllm,train,infer]" --prerelease=allow
 ```
 
 ## sglang
@@ -41,7 +40,7 @@ bare venv works for every converter except `datasets/droid100/`, which needs tor
 For development tools (lint and tests):
 
 ```bash
-uv pip install -e ".[vllm,train,infer,eval,dev]"
+uv pip install -e ".[vllm,train,infer,eval,dev]" --prerelease=allow
 # or, for the sglang engine:
 uv pip install -e ".[sglang,train,infer,eval,dev]" --prerelease=allow
 ```

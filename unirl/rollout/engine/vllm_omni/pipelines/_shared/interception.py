@@ -91,6 +91,30 @@ def resolve_request_noise(req: Any, *, caller: str) -> Optional[torch.Tensor]:
     ).resolve()
 
 
+def resolve_request_denoise_seeds(req: Any, *, caller: str) -> Optional[list[str]]:
+    """Slice this request's per-sample SDE-noise keys from the driver batch."""
+    extra = getattr(req.sampling_params, "extra_args", None) or {}
+    denoise_seeds = extra.get("denoise_seeds")
+    if denoise_seeds is None:
+        return None
+
+    rid = str(getattr(req, "request_id", "") or "")
+    try:
+        idx = int(rid.split("_", 1)[0])
+    except ValueError:
+        raise RuntimeError(
+            f"{caller}: cannot parse batch index from request_id={rid!r}. Expected Omni's ``f'{{i}}_{{uuid}}'`` shape."
+        )
+
+    spp = int(getattr(req.sampling_params, "num_outputs_per_prompt", 1) or 1)
+    start, end = _grouped_span(idx, spp)
+    if start < 0 or end > len(denoise_seeds):
+        raise IndexError(
+            f"{caller}: grouped slice [{start}:{end}) out of bounds for denoise_seeds len={len(denoise_seeds)}."
+        )
+    return [str(seed) for seed in denoise_seeds[start:end]]
+
+
 def inject_latents(
     args: Tuple[Any, ...],
     kwargs: Dict[str, Any],
@@ -126,6 +150,7 @@ __all__ = [
     "_grouped_span",
     "inject_latents",
     "make_sde_scheduler",
+    "resolve_request_denoise_seeds",
     "resolve_request_noise",
     "stamp_custom_output",
 ]

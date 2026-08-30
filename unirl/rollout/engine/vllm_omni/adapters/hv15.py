@@ -35,6 +35,9 @@ class Hv15InputAdapter(DitInputAdapter):
     def build_sampling(self, sample: Sample) -> List[StageSampling]:
         sampling = super().build_sampling(sample)
         sampling[0].kwargs["num_frames"] = _num_frames(sample)
+        frontier = sample.frontier_gen_part(DiffusionSamplingParams)
+        extra_args = sampling[0].kwargs.setdefault("extra_args", {})
+        extra_args["denoise_seeds"] = [str(sample_id) for sample_id in frontier.sample_ids]
         return sampling
 
 
@@ -112,6 +115,12 @@ class Hv15T2vAdapter(ModelAdapter):
 
     stage_yaml = "hunyuan_video15_t2v_rl.yaml"
     needs_driver_tokenizer = False
+
+    def boot_kwargs(self) -> Dict[str, Any]:
+        """Pin the vLLM diffusion kernel to the trainer's SDPA path."""
+        kwargs = super().boot_kwargs()
+        kwargs["diffusion_attention_backend"] = "TORCH_SDPA"
+        return kwargs
 
     def __init__(self, config: Any, model_config: Any, *, strategy: Any = None, tokenize_fn: Any = None) -> None:
         super().__init__(config, model_config, strategy=strategy, tokenize_fn=tokenize_fn)
