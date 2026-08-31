@@ -56,6 +56,7 @@ it is not inferred from `sampling_params.samples_per_prompt`.
 | `sigmas` | `DiffusionSamplingParams.sigmas` on the diffusion generation part |
 | `metadata` | Root input `Part.metadata`; use `Sample.root_metadata(part_index)` to align it with descendants |
 | `init_noise_group_ids` | Derived from generated `sample_ids` / `group_ids` by `NoiseRecipe.from_sample(...)`; deterministic eval may override them on the gen `Part` |
+| `denoise_seed_keys` | Per-sample SDE-noise identities derived by `NoiseRecipe.from_sample(...)`; deterministic eval may override them independently from x_T sharing |
 | `init_noise_latent_shape` | `DiffusionSamplingParams.init_noise_latent_shape` |
 
 ### `RolloutResp` and `RolloutTrack`

@@ -8,6 +8,7 @@ from unirl.config.require import require
 from unirl.rollout.engine.sglang_diffusion import utils
 from unirl.rollout.engine.sglang_diffusion.adapters.base import ModelAdapter
 from unirl.rollout.engine.sglang_diffusion.backends import RawResult
+from unirl.types.noise_recipe import NoiseRecipe
 from unirl.types.primitives import Texts, primitive_modality_key
 from unirl.types.sample import Sample
 from unirl.types.sampling import DiffusionSamplingParams, is_forward_process
@@ -85,11 +86,11 @@ class ImageAdapter(ModelAdapter):
             if float(diffusion.guidance_scale) > 1.0 and neg_prompt is not None:
                 kwargs["return_negative_prompt_embeds"] = True
 
-        # Key per-step SDE noise by sample ID to preserve within-group exploration.
+        noise_recipe = NoiseRecipe.from_sample(sample)
         if initial_noise is not None:
             kwargs["initial_noise"] = initial_noise
-            if gen_part.sample_ids:
-                kwargs["denoise_seeds"] = [str(sid) for sid in gen_part.sample_ids]
+        if noise_recipe.denoise_seed_keys:
+            kwargs["denoise_seeds"] = noise_recipe.denoise_seed_keys
 
         # RawResult must use dit_trajectory; trajectory_latents omits x_T and is not output-sliced.
         kwargs["rollout"] = True

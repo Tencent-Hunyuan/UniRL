@@ -165,15 +165,16 @@ class HunyuanVideo10Pipeline(Pipeline):
         hv_conds = self.build_conditions(texts)
         schedule = params.sigmas.to(self.bundle.device)
 
-        initial_latents = NoiseRecipe.from_sample(sample).resolve()
+        noise_recipe = NoiseRecipe.from_sample(sample)
+        initial_latents = noise_recipe.resolve()
 
         latent_seg = self.diffusion.diffuse(
             hv_conds,
             schedule=schedule,
             params=params,
             initial_latents=initial_latents,
-            denoise_seed_keys=frontier.sample_ids if initial_latents is not None else None,
-            denoise_base_seed=int(params.seed) if params.seed is not None else 0,
+            denoise_seed_keys=noise_recipe.denoise_seed_keys or None,
+            denoise_base_seed=noise_recipe.base_seed,
         )
         videos = self.vae_decode.decode(latent_seg)
 

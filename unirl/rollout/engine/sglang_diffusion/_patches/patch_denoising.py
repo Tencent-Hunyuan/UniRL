@@ -15,6 +15,8 @@ def _make_step_generators(
     step_index: int,
     device: torch.device,
     denoise_seeds: list[str],
+    *,
+    salt: str = "",
 ) -> list[torch.Generator]:
     """Per-sample deterministic CPU generators for one SDE step."""
     del device
@@ -22,6 +24,7 @@ def _make_step_generators(
         base_seed=int(base_seed),
         step_index=int(step_index),
         sample_ids=[str(seed_key) for seed_key in denoise_seeds],
+        salt=salt,
     )
 
 

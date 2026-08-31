@@ -75,6 +75,7 @@ class Part(Batch):
     output_version: Optional[int] = shared_field(default=None)
     harness_status: Optional[str] = shared_field(default=None)
     init_noise_group_ids: List[str] = concat_field(default_factory=list)
+    denoise_seed_keys: List[str] = concat_field(default_factory=list)
 
     def __post_init__(self) -> None:
         expected_batch = len(self.sample_ids)
@@ -109,6 +110,11 @@ class Part(Batch):
             raise ValueError(
                 "Part.init_noise_group_ids must be empty or aligned with sample_ids; "
                 f"got {len(self.init_noise_group_ids)} keys for {expected_batch} samples."
+            )
+        if self.denoise_seed_keys and len(self.denoise_seed_keys) != expected_batch:
+            raise ValueError(
+                "Part.denoise_seed_keys must be empty or aligned with sample_ids; "
+                f"got {len(self.denoise_seed_keys)} keys for {expected_batch} samples."
             )
 
     @classmethod
