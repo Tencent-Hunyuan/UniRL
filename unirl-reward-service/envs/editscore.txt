@@ -1,0 +1,35 @@
+# EditScore scorer — Qwen3-VL / Qwen2.5-VL judge for instruction-guided image
+# editing, served by a vLLM engine inside the managed child's own venv.
+#
+# Install the EditScore package from GitHub:
+#   editscore @ git+https://github.com/VectorSpaceLab/EditScore.git
+# The scorer imports `EditScore` from it; no model code is vendored here.
+#
+# The judge is a LoRA on a base VLM. Both are resolved from the recipe
+# (EDITSCORE_BASE_MODEL / EDITSCORE_LORA); the scorer merges them once and
+# caches the merged checkpoint under EDITSCORE_MERGED_CACHE.
+#
+# NOTE: this scorer runs vLLM in its own venv, so its torch build must match
+# the driver's CUDA runtime — install torch and vllm together rather than
+# letting pip resolve them independently (a cu130 torch against a CUDA 12.9
+# driver fails at engine start).
+
+editscore @ git+https://github.com/VectorSpaceLab/EditScore.git@4609c5d2ebb62fdebf665d3c924686d896ef1f74
+vllm
+transformers
+torch
+torchvision
+accelerate
+peft
+safetensors
+huggingface_hub
+qwen-vl-utils
+pillow
+numpy
+einops
+fastapi
+uvicorn
+pydantic
+requests
+tqdm
+PyYAML
