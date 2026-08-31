@@ -34,8 +34,10 @@ class BatchedStepReplayMixin:
         sigma_max: torch.Tensor,
         device: torch.device,
     ) -> ReplayResult:
-        """Replay ``target`` steps in one step-major batch; log-probs ``[B, S]``, slot ``s`` is ``target[s]``."""
+        """Replay all target steps in one step-major batch; output slot ``s`` is ``target[s]``."""
         S = len(target)
+        if S < 1:
+            raise ValueError(f"{type(self).__name__} received no batched replay targets")
         sample_all = torch.cat([segment.latents_at(i).to(device) for i in target], dim=0)
         prev_all = torch.cat([segment.latents_at(i + 1).to(device) for i in target], dim=0)
         B = sample_all.shape[0] // S

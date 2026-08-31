@@ -90,6 +90,7 @@ class LTX2Pipeline(Pipeline):
             trajectory_precision=config.trajectory_precision,
             logprob_precision=config.logprob_precision,
             audio_joint_sde=config.audio_joint_sde,
+            batch_replay_steps=config.batch_replay_steps,
         )
         vae_decode = LTX2VAEDecodeStage(bundle)
         vae_encode = LTX2VAEEncodeStage(bundle)
