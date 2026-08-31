@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional
 
+from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
 
 logger = logging.getLogger(__name__)
@@ -25,7 +26,7 @@ def _extract_canonical_lora(backend: Any, *, param_prefix: str, adapter_name: st
 
 
 class LoraWeightSyncBase(Remote):
-    """Base for LoRA weight-sync handlers — extraction + verify; subclasses push."""
+    """Base for LoRA weight-sync handlers — extraction, the dispatch triple and verify; subclasses push."""
 
     def __init__(
         self,
@@ -38,6 +39,7 @@ class LoraWeightSyncBase(Remote):
     ) -> None:
         super().__init__()
         self._backend = backend
+        self._cached = None
         from unirl.utils.peft_merge import lora_targets_ep_experts
 
         if lora_targets_ep_experts(backend.model):
@@ -49,6 +51,30 @@ class LoraWeightSyncBase(Remote):
         self._adapter_name = str(adapter_name) if adapter_name is not None else str(backend.rollout_adapter_name)
         self._verify = bool(verify)
         self._track_prefix = str(track_prefix or "")
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def extract(self) -> None:
+        """Gather the trained LoRA adapter and cache it on the pushing rank (returns nothing)."""
+        self._extract_to_cache()
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def push(self) -> None:
+        """Ship the adapter cached by :meth:`extract` to the rollout engine(s)."""
+        self._push_from_cache()
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def sync(self) -> None:
+        """:meth:`extract` + :meth:`push` in one dispatch — for the no-dance case."""
+        self._extract_to_cache()
+        self._push_from_cache()
+
+    def _extract_to_cache(self) -> None:
+        """Collective gather on every rank; the pushing rank caches ``(tensors, peft_config)``."""
+        raise NotImplementedError
+
+    def _push_from_cache(self) -> None:
+        """Push the cached adapter and clear the cache; a no-op off the pushing rank."""
+        raise NotImplementedError
 
     def _extract(self):
         """Extract the canonical adapter (+ ``track_prefix``) and PEFT config."""

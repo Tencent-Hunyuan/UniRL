@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.weight_sync.lora.base import LoraWeightSyncBase
 
 logger = logging.getLogger(__name__)
@@ -33,9 +32,8 @@ class LocalLoraWeightSync(LoraWeightSyncBase):
         )
         self._rollout = rollout
 
-    @distributed(dispatch_mode=Dispatch.BROADCAST)
-    def sync(self) -> None:
-        """Extract LoRA from the local FSDP model and load it into the engine."""
+    def _extract_to_cache(self) -> None:
+        """Collective gather on every rank; the TP leader caches ``(tensors, peft_config)``."""
         lora_tensors, peft_config = self._extract()
         ri = self.rank_info
         rank = ri.rank if ri is not None else 0
@@ -50,6 +48,18 @@ class LocalLoraWeightSync(LoraWeightSyncBase):
                 self._track_prefix or "<single>",
             )
             return
+        self._cached = (lora_tensors, peft_config)
+
+    def _push_from_cache(self) -> None:
+        """The TP leader loads the cached adapter into the sibling engine, then clears the cache."""
+        ri = self.rank_info
+        rank = ri.rank if ri is not None else 0
+        if ri is not None and ri.tp_rank != 0:
+            return
+        if self._cached is None:
+            raise RuntimeError("LocalLoraWeightSync.push: call extract() (or sync()) first")
+        lora_tensors, peft_config = self._cached
+        self._cached = None
 
         self._rollout.set_lora_from_tensors(self._adapter_name, lora_tensors, peft_config=peft_config)
         logger.info(

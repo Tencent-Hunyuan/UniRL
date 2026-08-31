@@ -33,28 +33,11 @@ class RemoteLoraWeightSync(LoraWeightSyncBase):
         )
         self._copy = bool(copy)
         self._targets: List[tuple] = []
-        self._cached = None
 
     @distributed(dispatch_mode=Dispatch.BROADCAST, execute_mode=Execute.RANK_ZERO)
     def set_rollout_targets(self, targets: List[tuple]) -> None:
         """Rank 0 caches the rollout engines' ``(role_name, worker_handles)`` pairs."""
         self._targets = [(str(role), list(workers)) for role, workers in targets]
-
-    @distributed(dispatch_mode=Dispatch.BROADCAST)
-    def extract(self) -> None:
-        """Gather the trained LoRA adapter and cache it on rank 0 (returns nothing)."""
-        self._extract_to_cache()
-
-    @distributed(dispatch_mode=Dispatch.BROADCAST)
-    def push(self) -> None:
-        """Ship the adapter cached by :meth:`extract` to every rollout engine."""
-        self._push_from_cache()
-
-    @distributed(dispatch_mode=Dispatch.BROADCAST)
-    def sync(self) -> None:
-        """:meth:`extract` + :meth:`push` in one dispatch — for the no-dance case."""
-        self._extract_to_cache()
-        self._push_from_cache()
 
     def _extract_to_cache(self) -> None:
         """Collective gather on every rank; rank 0 caches ``(tensors, peft_config)``."""
