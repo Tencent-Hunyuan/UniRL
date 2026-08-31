@@ -1,9 +1,6 @@
-# Vendored at its last upstream revision; vllm-omni deleted stage_configs/ in #3172,
-# and runtime.max_batch_size has moved to engine_args.max_num_seqs below.
-#
-# Stage config for HunyuanImage-3.0 Text-to-Text (T2T / pure text generation).
-# Single LLM stage: AR model reads text prompt only, generates text output.
-# Sampling params aligned with official generation_config.json.
+# Vendored at its last upstream revision, since vllm-omni deleted stage_configs/ in #3172.
+# HunyuanImage-3.0 text-to-text: one AR stage reads a prompt and emits text.
+# Sampling params match the official generation_config.json.
 
 stage_args:
   - stage_id: 0

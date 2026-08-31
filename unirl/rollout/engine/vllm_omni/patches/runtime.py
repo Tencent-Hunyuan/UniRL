@@ -532,8 +532,7 @@ class VLLMOmniHijack:
     def hijack() -> None:
         wrap_mp_process_for_children()
 
-        # StageDiffusionProc never loads vllm_omni.general_plugins; spawn children
-        # only get the formatter flush because wrap_mp re-runs this bundle.
+        # StageDiffusionProc never loads vllm_omni.general_plugins, so spawn children get the flush only via wrap_mp.
         from unirl.rollout.engine.vllm_omni.plugin import register_capture_flush
 
         register_capture_flush()

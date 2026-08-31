@@ -362,12 +362,7 @@ class HunyuanImage3Bundle(Bundle):
                 if p.is_meta:
                     _bl_bad += 1
                     continue
-                # FSDP2 CPUOffloadPolicy can leave a DTensor reporting the
-                # compute device while its visible tensor/storage devices are
-                # temporarily split. Accessing ``p.data`` then raises before
-                # FSDP construction can finish. The state-dict load above is
-                # authoritative; defer this diagnostic-only finite check for
-                # exactly that transitional storage error.
+                # FSDP2's CPU offload splits DTensor storage mid-construction; the state-dict load already checked them.
                 try:
                     is_finite = bool(p.data.isfinite().all())
                 except RuntimeError as exc:
