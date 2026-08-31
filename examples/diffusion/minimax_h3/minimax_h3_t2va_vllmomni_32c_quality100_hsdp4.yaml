@@ -1,0 +1,16 @@
+# @package _global_
+# Topology comparison: keep HSDP4/text-encoder-TP4/VAE1, disable Ulysses.
+
+defaults:
+  - minimax_h3_t2va_vllmomni_32c_quality100
+  - _self_
+
+rollout:
+  config:
+    omni_extra:
+      sequence_parallel_size: 1
+      ulysses_degree: 1
+
+logging:
+  run_name: h3-quality100-hsdp4-no-up-8p8s
+  tags: [minimax-h3, quality, flowgrpo, hsdp4, no-up, 24-step, global-std]

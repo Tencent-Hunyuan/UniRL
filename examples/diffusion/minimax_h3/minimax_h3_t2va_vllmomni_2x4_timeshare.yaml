@@ -1,0 +1,54 @@
+# @package _global_
+# H3 baseline with FSDP8 training, 2 x HSDP4+UP4 rollout, and reward DP8.
+
+defaults:
+  - minimax_h3_t2va_trainside
+  - _self_
+
+num_devices: 8
+devices_per_node: 8
+batch_size: 8
+num_rollouts: 1
+transport: colocate_store
+layout: colocate
+reward_fraction: 0.0
+enable_fsdp_offload: true
+offload_train_during_reward: true
+eval_interval: 0
+
+logging:
+  report_to_wandb: false
+  log_media: false
+  run_name: h3-fsdp8-vllmomni-2x4-rmdp8
+
+rollout:
+  _target_: unirl.rollout.engine.vllm_omni.engine.VLLMOmniRolloutEngine
+  model_config: ${bundle.config}
+  config:
+    _target_: unirl.rollout.engine.vllm_omni.config.VLLMOmniEngineConfig
+    model_path: ${bundle.config.pretrained_model_ckpt_path}
+    modality: minimax_h3_t2va
+    enable_sleep_mode: true
+    # The four-rank HSDP4+UP4 group lives in the adapter's stage YAML
+    # (minimax_h3_t2va_rl.yaml); omni_extra overrides it per variant.
+
+reward:
+  backend:
+    config:
+      batch_size: 8
+      frame_selection: middle
+      weights:
+        videopickscore: 1.0
+        clap: 0.0
+
+data_source:
+  args:
+    run:
+      data_path: ${oc.env:H3_PROMPT_FILE,examples/diffusion/minimax_h3/smoke_prompts.txt}
+      eval_data_path: ${oc.env:H3_PROMPT_FILE,examples/diffusion/minimax_h3/smoke_prompts.txt}
+
+sampling:
+  # Measured peak with one replay transition is already 92,188 MiB on a
+  # 97,871-MiB H20. Keep the default runnable until replay can backward one
+  # timestep at a time instead of retaining all selected steps in one graph.
+  sde_indices: [6]

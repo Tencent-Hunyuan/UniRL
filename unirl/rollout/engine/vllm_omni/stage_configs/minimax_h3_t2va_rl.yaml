@@ -12,8 +12,8 @@
 #   - text_encoder_tp_size shards the Qwen3-VL text encoder across the group
 #     rather than leaving it resident on rank 0.
 #
-# Sized for replica_size = tp_size = 4, which is what MiniMaxH3T2VAAdapter
-# qualifies; the recipe's tp_size names the group, not a TP degree.
+# These are defaults for a four-GPU replica; a recipe's omni_extra overrides any
+# of them, which is how the tp2_up2 / tp4 / hsdp4 comparison variants differ.
 
 stage_args:
   - stage_id: 0

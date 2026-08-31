@@ -1,0 +1,24 @@
+# @package _global_
+# Four-GPU rollout replica: DiT TP2 × Ulysses2, text encoder TP4.
+
+defaults:
+  - minimax_h3_t2va_vllmomni_32c_quality100
+  - _self_
+
+rollout:
+  config:
+    omni_extra:
+      tensor_parallel_size: 2
+      sequence_parallel_size: 2
+      ulysses_degree: 2
+      ring_degree: 1
+      text_encoder_tp_size: 4
+      vae_patch_parallel_size: 1
+      vae_parallel_mode: tile
+      use_hsdp: false
+      hsdp_shard_size: -1
+      hsdp_replicate_size: 1
+
+logging:
+  run_name: h3-quality100-tp2-up2
+  tags: [minimax-h3, quality, flowgrpo, tp2, up2, text-tp4]
