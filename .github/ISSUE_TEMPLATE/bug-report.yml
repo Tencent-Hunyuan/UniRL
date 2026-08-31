@@ -1,0 +1,106 @@
+# Adapted from verl-project/verl-omni (originally Hugging Face transformers).
+name: Bug report
+description: Crash, wrong result, hang, or install failure
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Search existing issues first — duplicates are closed.
+
+        For install and recipe questions that are not a bug, use a blank issue or the WeChat group, and link back here if it later turns into a real defect.
+
+        Paste the output of this snippet from the venv you actually used (`vllm` or `sglang` extra, not system Python):
+
+        ```bash
+        git rev-parse HEAD
+        python -c "import sys, platform; print(sys.version); print(platform.platform())"
+        python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'no cuda')"
+        python -c "import importlib.metadata as m
+        for pkg in ('unirl', 'vllm', 'vllm-omni', 'sglang', 'torch'):
+            try:
+                print(pkg, m.version(pkg))
+            except m.PackageNotFoundError:
+                print(pkg, 'not installed')"
+        ```
+
+  - type: textarea
+    id: system-info
+    attributes:
+      label: System info
+      description: Paste the command output here. Do not leave the snippet un-run.
+      placeholder: UniRL SHA, Python, torch/CUDA, GPU name, package versions
+    validations:
+      required: true
+
+  - type: dropdown
+    id: engine
+    attributes:
+      label: Rollout / inference engine
+      options:
+        - vLLM-Omni
+        - SGLang
+        - Train-side only
+        - Install / docs / CI (no engine)
+        - Other / mixed
+    validations:
+      required: true
+
+  - type: dropdown
+    id: domain
+    attributes:
+      label: Domain
+      options:
+        - diffusion (train_diffusion)
+        - diffusion async (train_async_diffusion)
+        - ar (train_ar)
+        - ar async (train_async_ar)
+        - sft (train_sft)
+        - pe (train_pe)
+        - unified_model (train_unified_model)
+        - agentic (train_agentic, examples/deep_research)
+        - reward service
+        - docs / install / CI
+        - other
+    validations:
+      required: true
+
+  - type: input
+    id: recipe
+    attributes:
+      label: Recipe / config-name
+      description: Hydra `--config-name`, or "N/A".
+      placeholder: diffusion/sd3/sd3_trainside
+
+  - type: checkboxes
+    id: information-scripts
+    attributes:
+      label: How you ran it
+      options:
+        - label: Official example in `examples/` (unmodified recipe)
+        - label: Modified recipe or my own script
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: |
+        Exact commands, Hydra overrides, GPU count, and the traceback or hang symptom.
+        Use fenced code blocks — do not paste screenshots of logs.
+      placeholder: |
+        ```bash
+        python -m unirl.train_diffusion --config-name=... --cfg job --resolve
+        bash examples/run_experiment_single_node.sh ...
+        ```
+
+        Traceback:
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected-behavior
+    attributes:
+      label: Expected behavior
+      description: What should have happened instead.
+    validations:
+      required: true

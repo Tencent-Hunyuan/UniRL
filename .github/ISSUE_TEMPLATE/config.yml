@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Documentation
+    url: https://unirl-project.github.io/unirl/
+    about: Installation, recipes, and architecture docs.
+  - name: WeChat group
+    url: https://unirl-project.github.io/unirl/community/wechat-qr.jpg
+    about: Community chat. Please still file bugs and feature requests as GitHub issues so they stay searchable.
