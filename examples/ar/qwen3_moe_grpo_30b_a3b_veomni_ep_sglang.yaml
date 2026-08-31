@@ -119,6 +119,8 @@ rollout:
     chat_template_kwargs:
       enable_thinking: true
     engine_kwargs:
+      # Colocate MoE at tp_size=1: slightly more KV than the 4B dense preset
+      # (0.4 vs 0.3); other knobs match. See unirl/rollout/README.md (SGLang AR knobs).
       mem_fraction_static: 0.4
       skip_server_warmup: true
       attention_backend: triton

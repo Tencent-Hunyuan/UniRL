@@ -106,6 +106,8 @@ rollout:
     chat_template_kwargs:
       enable_thinking: true
     engine_kwargs:
+      # Colocate MoE: tighter KV than the 4B dense preset (0.15 vs 0.3) and
+      # cuda_graph_max_bs=64. See unirl/rollout/README.md (SGLang AR knobs).
       mem_fraction_static: 0.15
       attention_backend: triton
       disable_cuda_graph: false

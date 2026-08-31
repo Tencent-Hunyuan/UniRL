@@ -103,6 +103,7 @@ rollout:
     chat_template_kwargs:
       enable_thinking: false
     engine_kwargs:
+      # Colocate full-FT preset — see unirl/rollout/README.md (SGLang AR knobs).
       mem_fraction_static: 0.3
       skip_server_warmup: true
       attention_backend: triton

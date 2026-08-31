@@ -97,6 +97,9 @@ rollout:
     chat_template_kwargs:
       enable_thinking: true
     engine_kwargs:
+      # Colocate, but a larger KV/graph budget than the 4B full-FT preset
+      # (0.5 / cuda_graph_max_bs 128 vs 0.3 / 16). Retune if the FSDP all-gather OOMs.
+      # See unirl/rollout/README.md (SGLang AR knobs).
       mem_fraction_static: 0.5
       skip_server_warmup: true
       attention_backend: triton
