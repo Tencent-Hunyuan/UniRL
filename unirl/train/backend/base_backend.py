@@ -6,7 +6,7 @@ import logging
 import math
 import os
 from concurrent.futures import Future
-from typing import TYPE_CHECKING, Dict, List, Literal, Optional
+from typing import TYPE_CHECKING, Callable, Dict, Iterator, List, Literal, Optional
 
 import torch
 import torch.distributed as dist
@@ -673,6 +673,10 @@ class BaseFSDP2Backend(Remote):
     def _torch_checkpoint_metadata(self) -> Dict[str, object]:
         """Backend-specific metadata added to a single-file checkpoint."""
         return {}
+
+    def fused_expert_expander(self) -> Optional[Callable[[Iterator], Iterator]]:
+        """Transform re-emitting sharded fused experts per expert, or None when this backend shards none."""
+        return None
 
     def _gather_optimizer_state(self) -> StateDict:
         """Rank-0 optimizer state for the checkpoint (collective for DCP backends)."""

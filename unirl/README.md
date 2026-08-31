@@ -88,16 +88,15 @@ The already-clean directions are locked by
 `models/` never imports algorithms, data, rewards, rollout, or trainers;
 `algorithms/` sees model contracts, never concrete model families; `train/`
 sees model contracts and `algorithms/base`, never concrete algorithms;
-`distributed/` never imports algorithms, data, models, rewards, rollout, or
-trainers.
+`distributed/` never imports algorithms, data, models, rewards, rollout, the
+train stack, or trainers.
 
 Directions the tree does not yet satisfy are left unlocked rather than hidden
 behind allowlists. The open debt, named so it is not copied as precedent:
-`models/` (`hunyuan_image3`, `qwen3_5`, `qwen3_moe`) and
-`distributed/weight_sync/` reach into `train/backend/veomni` (EP fusing /
-`_compat`), `models/cosmos3` subclasses the train-side SFT track builder, and
-`algorithms/` flips `train/lora` adapters. That is migration work, not a
-convention to copy.
+`models/` (`hunyuan_image3`, `qwen3_5`, `qwen3_moe`) reaches into
+`train/backend/veomni` (EP fusing / `_compat`), `models/cosmos3` subclasses the
+train-side SFT track builder, and `algorithms/` flips `train/lora` adapters.
+That is migration work, not a convention to copy.
 
 ## Where new code goes
 

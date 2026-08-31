@@ -23,6 +23,7 @@ from unirl.train.backend.veomni.ep.checkpoint import (
     load_ep_model_state_dict,
     load_ep_optimizer_state_dict,
 )
+from unirl.train.backend.veomni.ep.experts import resolve_expert_expander
 from unirl.train.backend.veomni.ep.placement import has_ep_params
 from unirl.train.backend.veomni.state import clip_grad_norm, veomni_offload, veomni_onload
 from unirl.train.backend.veomni.wrap import veomni_parallelize
@@ -175,6 +176,10 @@ class VeOmniBackend(BaseFSDP2Backend):
             "ep_checkpoint_version": EP_CHECKPOINT_VERSION,
             "ep_size": self._ep_size,
         }
+
+    def fused_expert_expander(self):
+        """Resolve the EP fused expert layout this model's rollout weights must be expanded through."""
+        return resolve_expert_expander(self.model)
 
     def _gather_optimizer_state(self) -> StateDict:
         if has_ep_params(self.model):
