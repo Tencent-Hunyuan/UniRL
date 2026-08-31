@@ -1,0 +1,78 @@
+# Single-stage MiniMax-H3 text-to-video+audio config for RL rollout.
+#
+# Diff vs the HunyuanVideo-1.5 stage config:
+#   - The four ranks run Ulysses sequence parallel over one replica of the
+#     weights, not tensor parallel: H3 is a 33B dense DiT denoising a packed
+#     video+audio sequence, so splitting the sequence beats splitting the
+#     matmuls. tensor_parallel_size therefore stays 1 while
+#     sequence_parallel_size / ulysses_degree take the group size.
+#   - HSDP shards those same four ranks so no rank holds the full 33B.
+#   - The VAE decodes two modalities; tile-parallel decode over all four ranks
+#     keeps the video decode off one rank's memory.
+#   - text_encoder_tp_size shards the Qwen3-VL text encoder across the group
+#     rather than leaving it resident on rank 0.
+#
+# Sized for replica_size = tp_size = 4, which is what MiniMaxH3T2VAAdapter
+# qualifies; the recipe's tp_size names the group, not a TP degree.
+
+stage_args:
+  - stage_id: 0
+    stage_type: diffusion
+    runtime:
+      process: true
+      devices: "0,1,2,3"
+    engine_args:
+      model_stage: diffusion
+      model_class_name: MiniMaxH3Pipeline
+      task_type: t2va
+      # H3 is non-batching upstream, so the engine requires this.
+      max_num_seqs: 1
+      enforce_eager: true
+      distributed_executor_backend: "mp"
+      vae_use_slicing: false
+      vae_use_tiling: true
+      cache_backend: null
+      cache_config: null
+      enable_cache_dit_summary: false
+      # Required for vLLM to wrap DiT Linear modules in LoRA-aware variants.
+      # Without ``enable_lora``, ``add_lora`` still registers the adapter in
+      # ``DiffusionLoRAManager._registered_adapters`` (so checksum probes
+      # pass), but no Linear consults it and the forward silently runs base
+      # weights. ``max_lora_rank`` must be >= the recipe's LoRAPolicy rank;
+      # the vllm.config.lora default of 16 silently rejects larger adapters
+      # at add time.
+      enable_lora: true
+      max_lora_rank: 64
+      parallel_config:
+        pipeline_parallel_size: 1
+        data_parallel_size: 1
+        tensor_parallel_size: 1
+        enable_expert_parallel: false
+        sequence_parallel_size: 4
+        ulysses_degree: 4
+        ring_degree: 1
+        allgather_degree: 1
+        cfg_parallel_size: 1
+        vae_patch_parallel_size: 4
+        vae_parallel_mode: tile
+        text_encoder_tp_size: 4
+        use_hsdp: true
+        hsdp_shard_size: 4
+        hsdp_replicate_size: 1
+      # unirl-specific: install MiniMaxH3RLPipeline so SDE-mode rollouts get a
+      # swappable scheduler, per-step trajectory capture over both modalities,
+      # and the packing metadata the trainside forward needs to replay a step.
+      custom_pipeline_args:
+        pipeline_class: unirl.rollout.engine.vllm_omni.pipelines.minimax_h3.pipeline.MiniMaxH3RLPipeline
+      # unirl-specific: install the weight-sync extension so the DiT worker
+      # exposes update_weights_from_ipc (bucketed CUDA-IPC) and the LoRA
+      # transport entry points.
+      worker_extension_cls: unirl.rollout.engine.vllm_omni.worker.dit_extension.DiTWeightSyncExtension
+    final_output: true
+    final_output_type: video
+
+runtime:
+  enabled: true
+  defaults:
+    window_size: -1
+    max_inflight: 1
