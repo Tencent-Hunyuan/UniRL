@@ -209,7 +209,11 @@ target-version = "py312"
 # upstream model code carries
 # semantically-meaningful trailing whitespace (VideoAlign prompt templates) that
 # must not be auto-stripped.
-extend-exclude = ["unirl-reward-service", "unirl/models/bagel/vendor"]
+extend-exclude = [
+  "unirl-reward-service",
+  "unirl/models/bagel/vendor",
+  "unirl/models/sensenova_u1/vendor",
+]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I"]
