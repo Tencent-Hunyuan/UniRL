@@ -22,6 +22,7 @@ from vllm.lora.utils import get_adapter_absolute_path
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager, logger
 from vllm_omni.lora.request import LoRARequest as OmniLoRARequest
 
+from unirl.rollout.engine.vllm_omni.patches.compat_minimax_h3_lora import patch_minimax_h3_packed_lora_mapping
 from unirl.rollout.engine.vllm_omni.patches.compat_moe_workspace import patch_moe_workspace_pool
 
 
@@ -547,6 +548,7 @@ class VLLMOmniHijack:
 
         patch_dit_lora_loader()
         patch_dit_hi3_lora_weights()
+        patch_minimax_h3_packed_lora_mapping()
         patch_ar_lora_loader()
         patch_ar_merged_lora_fused_tensor()
         patch_fp32_skip()
