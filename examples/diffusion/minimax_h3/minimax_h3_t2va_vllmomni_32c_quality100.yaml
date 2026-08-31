@@ -88,7 +88,6 @@ sampling:
     num_timesteps: 24
     timestep_fraction: [0.0, 0.4166666667]
     num_sde_steps: 3
-    seed: 42
   samples_per_prompt: 8
   trajectory_precision: fp32
   sampler_kwargs:
