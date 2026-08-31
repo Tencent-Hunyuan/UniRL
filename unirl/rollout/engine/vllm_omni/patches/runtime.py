@@ -196,8 +196,16 @@ def patch_dit_lora_loader() -> None:
             list(lora_model.loras.keys()),
         )
 
-        for lora in lora_model.loras.values():
-            lora.optimize()
+        # Each SP worker otherwise fans this CPU scaling loop over the host's whole
+        # OpenMP pool; on a 300-module adapter the oversubscription wedges siblings
+        # indefinitely, and the caller sees a control RPC that never returns.
+        previous_threads = torch.get_num_threads()
+        torch.set_num_threads(1)
+        try:
+            for lora in lora_model.loras.values():
+                lora.optimize()
+        finally:
+            torch.set_num_threads(previous_threads)
 
         return lora_model, peft_helper
 
