@@ -152,6 +152,7 @@ class SGLangRolloutEngine(BaseRolloutEngine):
         )
 
         self._version = 0
+        self._weight_update_calls = 0
 
     def _prepare_generation(self, sample: Sample) -> Any:
         require(
@@ -282,7 +283,7 @@ class SGLangRolloutEngine(BaseRolloutEngine):
             load_format=load_format,
             flush_cache=flush_cache,
         )
-        self._version += 1
+        self._weight_update_calls += 1
 
     def init_weights_update_group(
         self,
@@ -329,7 +330,7 @@ class SGLangRolloutEngine(BaseRolloutEngine):
             group_name=group_name,
             flush_cache=flush_cache,
         )
-        self._version += 1
+        self._weight_update_calls += 1
 
     def destroy_weights_update_group(
         self,
