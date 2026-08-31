@@ -10,7 +10,7 @@ import torch.nn as nn
 from packaging.version import Version
 
 from unirl.models.types.bundle import Bundle
-from unirl.models.types.meta_init import build_meta_init_transformer, capture_init_state
+from unirl.models.types.meta_init import build_meta_init_transformer, capture_init_state, resolve_meta_init_weights
 from unirl.utils.dtypes import parse_torch_dtype
 
 from .config import Qwen3_5PipelineConfig
@@ -139,6 +139,8 @@ class Qwen3_5Bundle(Bundle):
             device = torch.device(device)
 
         dtype = parse_torch_dtype(config.model_precision, field_name="model_precision")
+        if config.meta_init_transformer:
+            transformer_weights_path = resolve_meta_init_weights(path)
 
         hf_config = AutoConfig.from_pretrained(path, trust_remote_code=bool(config.trust_remote_code))
         model_type = hf_config.model_type
@@ -246,7 +248,7 @@ class Qwen3_5Bundle(Bundle):
             pretrained_path=path,
         )
         if config.meta_init_transformer:
-            bundle._transformer_weights_path = path
+            bundle._transformer_weights_path = transformer_weights_path
             bundle._meta_init_state = meta_init_state
         return bundle
 

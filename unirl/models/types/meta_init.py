@@ -2,13 +2,38 @@
 
 from __future__ import annotations
 
+import glob
 import logging
+import os
 from typing import Callable, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
 
 logger = logging.getLogger(__name__)
+
+
+def resolve_meta_init_weights(checkpoint_path: str, *, component: Optional[str] = None) -> str:
+    """Resolve and validate the local safetensors directory for a meta-init bundle."""
+    snapshot_path = checkpoint_path
+    expected = os.path.join(component, "*.safetensors") if component else "*.safetensors"
+    if not os.path.isdir(snapshot_path):
+        from huggingface_hub import snapshot_download
+
+        try:
+            snapshot_path = snapshot_download(
+                repo_id=checkpoint_path,
+                allow_patterns=[expected],
+            )
+        except Exception as exc:
+            raise ValueError(
+                f"Meta-init checkpoint {checkpoint_path!r} could not be resolved; expected {expected!r}."
+            ) from exc
+
+    weights_path = os.path.join(snapshot_path, component) if component else snapshot_path
+    if not os.path.isdir(weights_path) or not glob.glob(os.path.join(weights_path, "*.safetensors")):
+        raise ValueError(f"Meta-init checkpoint {checkpoint_path!r} does not contain expected {expected!r}.")
+    return weights_path
 
 
 def capture_init_state(model: nn.Module) -> dict:
@@ -172,6 +197,7 @@ def build_meta_init_transformer(
 
 
 __all__ = [
+    "resolve_meta_init_weights",
     "capture_init_state",
     "restore_init_state",
     "recover_rope_inv_freq",

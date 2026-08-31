@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 
 from unirl.models.types.bundle import Bundle
-from unirl.models.types.meta_init import build_meta_init_transformer
+from unirl.models.types.meta_init import build_meta_init_transformer, resolve_meta_init_weights
 from unirl.models.types.value_head import ValueHead
 from unirl.utils.dtypes import parse_torch_dtype
 
@@ -70,6 +70,7 @@ class Qwen3Bundle(Bundle):
         dtype = parse_torch_dtype(config.model_precision, field_name="model_precision")
 
         if config.meta_init_transformer:
+            transformer_weights_path = resolve_meta_init_weights(path)
             # Restore non-persistent RoPE buffers after meta initialization.
             from transformers import AutoConfig
 
@@ -121,7 +122,7 @@ class Qwen3Bundle(Bundle):
             pretrained_path=path,
         )
         if config.meta_init_transformer:
-            bundle._transformer_weights_path = path
+            bundle._transformer_weights_path = transformer_weights_path
             bundle._meta_init_state = meta_init_state
         return bundle
 

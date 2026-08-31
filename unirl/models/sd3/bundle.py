@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import logging
-import os
 from typing import Any, Optional
 
 import torch
 import torch.nn as nn
 
 from unirl.models.types.bundle import Bundle
-from unirl.models.types.meta_init import build_meta_init_transformer
+from unirl.models.types.meta_init import build_meta_init_transformer, resolve_meta_init_weights
 from unirl.utils.dtypes import parse_torch_dtype
 
 from .config import SD3PipelineConfig
@@ -76,6 +75,7 @@ class SD3Bundle(Bundle):
 
         meta_init_state = None
         if config.meta_init_transformer:
+            transformer_weights_path = resolve_meta_init_weights(path, component="transformer")
             transformer_config = SD3Transformer2DModel.load_config(path, subfolder="transformer")
             transformer, meta_init_state = build_meta_init_transformer(
                 lambda: SD3Transformer2DModel.from_config(transformer_config), dtype=dtype
@@ -128,7 +128,7 @@ class SD3Bundle(Bundle):
             pretrained_path=path,
         )
         if config.meta_init_transformer:
-            bundle._transformer_weights_path = os.path.join(path, "transformer")
+            bundle._transformer_weights_path = transformer_weights_path
             bundle._meta_init_state = meta_init_state
         return bundle
 

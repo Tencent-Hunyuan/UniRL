@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 
 from unirl.models.types.bundle import Bundle
-from unirl.models.types.meta_init import build_meta_init_transformer
+from unirl.models.types.meta_init import build_meta_init_transformer, resolve_meta_init_weights
 from unirl.utils.dtypes import parse_torch_dtype
 
 from .config import Flux2KleinPipelineConfig
@@ -142,12 +142,13 @@ class Flux2KleinBundle(Bundle):
 
         meta_init_state = None
         if config.meta_init_transformer:
+            transformer_weights_path = resolve_meta_init_weights(path, component="transformer")
             # Zero-init checkpoint-absent guidance parameters after meta materialization.
             transformer_config = Flux2Transformer2DModel.load_config(path, subfolder="transformer")
             transformer, meta_init_state = build_meta_init_transformer(
                 lambda: Flux2Transformer2DModel.from_config(transformer_config), dtype=dtype
             )
-            _stamp_zero_checkpoint_absent_params(transformer, os.path.join(path, "transformer"))
+            _stamp_zero_checkpoint_absent_params(transformer, transformer_weights_path)
         else:
             transformer = Flux2Transformer2DModel.from_pretrained(
                 path,
@@ -194,7 +195,7 @@ class Flux2KleinBundle(Bundle):
             pretrained_path=path,
         )
         if config.meta_init_transformer:
-            bundle._transformer_weights_path = os.path.join(path, "transformer")
+            bundle._transformer_weights_path = transformer_weights_path
             bundle._meta_init_state = meta_init_state
         return bundle
 
