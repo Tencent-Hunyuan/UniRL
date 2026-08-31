@@ -78,6 +78,7 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
             self._backend,
             uses_lora=bool(getattr(model_config, "use_lora", False)),
             lora_copy_transport=self.adapter.lora_copy_transport,
+            lora_file_transport=self.adapter.lora_file_transport,
         )
 
     def _tokenize_prompt(self, text: str, *, task: str, sys_type: str) -> List[int]:
@@ -347,6 +348,17 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
     ) -> None:
         """Byte-copy LoRA push for the HI3 two-engine trainer."""
         self._weight_sync.set_lora_from_tensors_copy(adapter_name, lora_tensors, peft_config=peft_config)
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def set_lora_from_tensors_file(
+        self,
+        adapter_name: str,
+        lora_tensors: Dict[str, torch.Tensor],
+        *,
+        peft_config: Optional[dict] = None,
+    ) -> None:
+        """File-backed LoRA push for adapters too large to inline in a control message."""
+        self._weight_sync.set_lora_from_tensors_file(adapter_name, lora_tensors, peft_config=peft_config)
 
     def loaded_param_checksums(self, *, names: List[str]) -> dict:
         return self._weight_sync.loaded_param_checksums(names=names)

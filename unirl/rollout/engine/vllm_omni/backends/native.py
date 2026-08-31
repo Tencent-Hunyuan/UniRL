@@ -582,6 +582,57 @@ class VLLMOmniBackend:
                 stage_ids=[int(sid)],
             )
 
+    def set_lora_file(
+        self,
+        *,
+        adapter_name: str,
+        lora_tensors: Dict[str, Any],
+        peft_config: Optional[dict],
+    ) -> None:
+        """File-backed LoRA push — the payload never rides in the control message."""
+        import tempfile
+
+        import torch
+
+        from unirl.distributed.weight_sync.transfer.ipc_dispatch import (
+            DIFFRL_LORA_INT_ID,
+            DIFFRL_LORA_NAME,
+            DIFFRL_LORA_PATH,
+        )
+
+        omni = self._require_omni()
+        lora_tensors = self._wrap_peft_envelope(lora_tensors)
+        self._remove_existing_lora(int(DIFFRL_LORA_INT_ID))
+
+        cpu_tensors = {
+            name: t.detach().to("cpu") if isinstance(t, torch.Tensor) else t for name, t in lora_tensors.items()
+        }
+        # Workers read this path directly, so it must outlive the RPC; the engine and its
+        # stage processes are same-host, which is what makes a plain temp file enough.
+        directory = os.environ.get("DIFFRL_LORA_SPOOL_DIR") or tempfile.gettempdir()
+        os.makedirs(directory, exist_ok=True)
+        handle, path = tempfile.mkstemp(prefix="diffrl_lora_", suffix=".pt", dir=directory)
+        os.close(handle)
+        try:
+            torch.save(cpu_tensors, path)
+            for sid in self._stage_ids():
+                omni.engine.collective_rpc(
+                    method="set_lora_from_tensor_file",
+                    args=(
+                        str(adapter_name) or DIFFRL_LORA_NAME,
+                        int(DIFFRL_LORA_INT_ID),
+                        DIFFRL_LORA_PATH,
+                        dict(peft_config or {}),
+                        path,
+                    ),
+                    stage_ids=[int(sid)],
+                )
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
     @staticmethod
     def _wrap_peft_envelope(lora_tensors: Dict[str, Any]) -> Dict[str, Any]:
         """Wrap canonical wire keys in the PEFT envelope vllm-omni expects."""

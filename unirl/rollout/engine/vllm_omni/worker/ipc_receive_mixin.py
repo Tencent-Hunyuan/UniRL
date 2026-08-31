@@ -226,6 +226,35 @@ class BucketedIPCReceiveMixin:
         )
         return self.add_lora(request)
 
+    def set_lora_from_tensor_file(
+        self,
+        lora_name: str,
+        lora_int_id: int,
+        lora_path: str,
+        peft_config: dict,
+        tensor_file: str,
+    ) -> bool:
+        """File-backed variant of :meth:`set_lora_from_tensor_dict_copy` for large adapters."""
+        lora_tensors = torch.load(str(tensor_file), map_location="cpu", weights_only=True)
+        if not isinstance(lora_tensors, dict):
+            raise TypeError(
+                f"{type(self).__name__}.set_lora_from_tensor_file: "
+                f"deserialised lora_tensors expected dict, got "
+                f"{type(lora_tensors).__name__}"
+            )
+        from unirl.rollout.engine.vllm_omni.patches.runtime import (
+            OmniTensorLoRARequest,
+        )
+
+        request = OmniTensorLoRARequest(
+            lora_name=str(lora_name),
+            lora_int_id=int(lora_int_id),
+            lora_path=str(lora_path),
+            peft_config=dict(peft_config or {}),
+            lora_tensors=lora_tensors,
+        )
+        return self.add_lora(request)
+
     def _diffrl_describe_params(
         self,
         names: Optional[list] = None,

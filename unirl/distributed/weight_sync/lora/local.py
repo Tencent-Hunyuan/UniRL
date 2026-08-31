@@ -9,6 +9,14 @@ from unirl.distributed.weight_sync.lora.base import LoraWeightSyncBase
 
 logger = logging.getLogger(__name__)
 
+# "handle" ships shm handles, "copy" inlines the bytes in the control RPC, and "file"
+# spools them to disk — the last is for adapters too large to inline.
+_TRANSPORT_SETTERS = {
+    "handle": "set_lora_from_tensors",
+    "copy": "set_lora_from_tensors_copy",
+    "file": "set_lora_from_tensors_file",
+}
+
 
 class LocalLoraWeightSync(LoraWeightSyncBase):
     """Push one track's trained FSDP LoRA adapter into a co-located rollout engine."""
@@ -22,6 +30,7 @@ class LocalLoraWeightSync(LoraWeightSyncBase):
         adapter_name: Optional[str] = None,
         verify: bool = False,
         track_prefix: str = "",
+        transport: str = "handle",
     ) -> None:
         super().__init__(
             backend=backend,
@@ -31,6 +40,11 @@ class LocalLoraWeightSync(LoraWeightSyncBase):
             track_prefix=track_prefix,
         )
         self._rollout = rollout
+        if transport not in _TRANSPORT_SETTERS:
+            raise ValueError(
+                f"LocalLoraWeightSync: transport must be one of {sorted(_TRANSPORT_SETTERS)}, got {transport!r}"
+            )
+        self._transport = str(transport)
 
     def _extract_to_cache(self) -> None:
         """Collective gather on every rank; the TP leader caches ``(tensors, peft_config)``."""
@@ -61,11 +75,13 @@ class LocalLoraWeightSync(LoraWeightSyncBase):
         lora_tensors, peft_config = self._cached
         self._cached = None
 
-        self._rollout.set_lora_from_tensors(self._adapter_name, lora_tensors, peft_config=peft_config)
+        setter = getattr(self._rollout, _TRANSPORT_SETTERS[self._transport])
+        setter(self._adapter_name, lora_tensors, peft_config=peft_config)
         logger.info(
-            "[LoRA-SYNC] rank %s: pushed %d LoRA tensors to rollout (adapter=%s, track=%s)",
+            "[LoRA-SYNC] rank %s: pushed %d LoRA tensors to rollout via %s (adapter=%s, track=%s)",
             rank,
             len(lora_tensors),
+            self._transport,
             self._adapter_name,
             self._track_prefix or "<single>",
         )
