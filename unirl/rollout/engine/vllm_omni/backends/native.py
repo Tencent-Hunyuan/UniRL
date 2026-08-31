@@ -117,6 +117,11 @@ class VLLMOmniBackend:
     @classmethod
     def boot(cls, intent: Dict[str, Any]) -> "VLLMOmniBackend":
         """Spell the intent into ``Omni`` ctor kwargs and spawn."""
+        # vllm's platform layer snapshots the visible-device set on first import, so this has to
+        # precede every import below that reaches vllm — patch installation included.
+        if intent.get("clear_cuda_visible"):
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+
         from unirl.rollout.engine.vllm_omni.patches import install as install_patches
 
         install_patches()
@@ -129,9 +134,6 @@ class VLLMOmniBackend:
             pass
 
         rt = _import_omni_runtime()
-
-        if intent.get("clear_cuda_visible"):
-            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
 
         import fcntl
 
