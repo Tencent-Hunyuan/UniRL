@@ -123,7 +123,13 @@ class GSPO(StageAlgorithm):
             else _resolve_clip_range_from_schedule(self.clip_range_high, self.clip_schedule, training_progress)
         )
 
-        seq_new, seq_old, seq_adv = self._reduce_to_sequences(new_logp, old_logp, advantages, segment.lengths)
+        seq_new, seq_old, seq_adv = self._reduce_to_sequences(
+            new_logp,
+            old_logp,
+            advantages,
+            segment.lengths,
+            loss_mask=segment.loss_mask,
+        )
         if seq_new.numel() == 0:
             return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
 
@@ -161,6 +167,8 @@ class GSPO(StageAlgorithm):
         old_logp: torch.Tensor,
         advantages: torch.Tensor,
         lengths: torch.Tensor,
+        *,
+        loss_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Reduce packed per-token log-probs to one length-normalized value per sequence via a segment-sum."""
         device = new_logp.device
@@ -169,8 +177,18 @@ class GSPO(StageAlgorithm):
         if int(advantages.shape[0]) != num_seqs:
             raise ValueError(f"GSPO: advantages batch={int(advantages.shape[0])} != sequences={num_seqs}")
 
+        if loss_mask is not None:
+            mask = loss_mask.to(dtype=new_logp.dtype, device=device)
+            new_logp = new_logp * mask
+            old_logp = old_logp * mask
+
         seg_ids = torch.repeat_interleave(torch.arange(num_seqs, device=device), lengths)
-        denom = lengths.to(new_logp.dtype).clamp(min=1)
+
+        if loss_mask is not None:
+            denom = new_logp.new_zeros(num_seqs).index_add(0, seg_ids, mask).clamp(min=1)
+        else:
+            denom = lengths.to(new_logp.dtype).clamp(min=1)
+
         seq_new = new_logp.new_zeros(num_seqs).index_add(0, seg_ids, new_logp) / denom
         seq_old = old_logp.new_zeros(num_seqs).index_add(0, seg_ids, old_logp) / denom
         seq_adv = advantages.detach().to(dtype=new_logp.dtype, device=device)

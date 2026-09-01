@@ -101,6 +101,10 @@ class GRPO(StageAlgorithm):
             clip_range_high=clip_high,
         )
 
+        if segment.loss_mask is not None:
+            mask = segment.loss_mask.to(dtype=loss_per_elem.dtype, device=loss_per_elem.device)
+            loss_per_elem = loss_per_elem * mask
+
         if self.loss_agg_mode in ("seq-mean-token-sum-norm", "seq-mean-token-mean") and segment.lengths is not None:
             parts = torch.split(loss_per_elem, segment.lengths.tolist())
             if self.loss_agg_mode == "seq-mean-token-sum-norm":
