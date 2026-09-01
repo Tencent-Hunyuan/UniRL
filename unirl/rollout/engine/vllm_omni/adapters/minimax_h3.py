@@ -307,6 +307,11 @@ class MiniMaxH3T2VAAdapter(ModelAdapter):
             hasattr(self.model_config, "audio_joint_sde"),
             "MiniMaxH3T2VAAdapter requires model_config.audio_joint_sde",
         )
+        require(
+            int(self.cfg.replica_size) == 4 and int(self.cfg.tp_size) == 4,
+            "MiniMaxH3T2VAAdapter currently qualifies only replica_size=tp_size=4; "
+            f"got replica_size={self.cfg.replica_size}, tp_size={self.cfg.tp_size}",
+        )
         # The pipeline reads the audio branch off rank 0 of the sequence-parallel group, so a
         # ring-parallel split would leave it reading a partial sequence.
         require(

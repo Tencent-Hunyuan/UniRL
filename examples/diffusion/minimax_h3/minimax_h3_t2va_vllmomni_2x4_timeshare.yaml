@@ -29,6 +29,10 @@ rollout:
     model_path: ${bundle.config.pretrained_model_ckpt_path}
     modality: minimax_h3_t2va
     enable_sleep_mode: true
+    # 8 GPUs / 4 per replica = the 2 replicas this recipe is named for. The
+    # group handle reads tp_size here to size the rank group.
+    replica_size: 4
+    tp_size: 4
     # The four-rank HSDP4+UP4 group lives in the adapter's stage YAML
     # (minimax_h3_t2va_rl.yaml); omni_extra overrides it per variant.
 
