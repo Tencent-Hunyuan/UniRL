@@ -65,6 +65,7 @@ class MiniMaxH3RLPipeline(MiniMaxH3Pipeline):
         self._rl_log_probs: list[torch.Tensor] = []
         self._rl_video_means: list[torch.Tensor] = []
         self._rl_capture_transition_means = False
+        self._rl_capture_terminal_latents = False
         self._rl_audio_joint_sde = True
 
     @staticmethod
@@ -266,6 +267,10 @@ class MiniMaxH3RLPipeline(MiniMaxH3Pipeline):
         if any(index < 0 or index >= num_steps for index in sde_indices):
             raise ValueError(f"MiniMax-H3 sde_indices out of range for {num_steps} steps: {sde_indices}")
         needed = set(compute_trajectory_positions(set(sde_indices), num_steps))
+        if self._rl_capture_terminal_latents:
+            # A forward-process objective records no transition, so the line above asks
+            # for nothing; it trains on the terminal x0 of both streams instead.
+            needed.add(num_steps)
         self._rl_video_states = []
         self._rl_audio_states = []
         self._rl_trajectory_indices = []
@@ -403,6 +408,7 @@ class MiniMaxH3RLPipeline(MiniMaxH3Pipeline):
         self._rl_sde_sample_key = self._sde_sample_key_for_request(request) if self._rl_sde_indices else "0"
         self._rl_audio_joint_sde = bool(extra.get("audio_joint_sde", True))
         self._rl_capture_transition_means = bool(extra.get("capture_transition_means", False))
+        self._rl_capture_terminal_latents = bool(extra.get("capture_terminal_latents", False))
         self._rl_text_embeddings = None
         return extra
 
@@ -423,12 +429,12 @@ class MiniMaxH3RLPipeline(MiniMaxH3Pipeline):
         }
 
     def _replay_bundle(self, extra: dict[str, Any]) -> dict[str, Any]:
-        """The sparse trajectory the trainside forward replays, empty when no step was stochastic."""
+        """The sparse trajectory the trainside forward replays, or the terminal x0 alone under a forward-process objective."""
         del extra
-        if not self._rl_sde_indices:
+        if not self._rl_video_states:
             return {}
-        if not self._rl_video_states or self._rl_text_embeddings is None:
-            raise RuntimeError("MiniMax-H3 worker produced no replay trajectory or text embeddings")
+        if self._rl_text_embeddings is None:
+            raise RuntimeError("MiniMax-H3 worker produced a replay trajectory but no text embeddings")
         bundle: dict[str, Any] = {
             "video": torch.stack(self._rl_video_states, dim=0).unsqueeze(0),
             "audio": torch.stack(self._rl_audio_states, dim=0).unsqueeze(0),

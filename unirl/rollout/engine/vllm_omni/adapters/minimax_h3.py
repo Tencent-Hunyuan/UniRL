@@ -89,6 +89,9 @@ class MiniMaxH3InputAdapter(DitInputAdapter):
             audio_flow_shift=self.audio_shift,
             audio_joint_sde=self.audio_joint_sde,
             capture_transition_means=bool(sampler_kwargs.get("capture_transition_means", False)),
+            # A terminal x0 is ~270 MB per sample at 768px, so a forward-process
+            # recipe asks for it rather than every rollout paying to ship one.
+            capture_terminal_latents=bool(sampler_kwargs.get("capture_terminal_latents", False)),
         )
         kwargs["extra_args"] = extra
         return sampling
@@ -149,7 +152,9 @@ class MiniMaxH3OutputAdapter:
             if capture.get("reward_video") is None or capture.get("reward_audio") is None:
                 raise RuntimeError(f"MiniMax-H3 rollout output {index} is missing reward video/audio")
 
-        replay_fields = ("video", "audio", "indices", "text_embeddings", "log_probs")
+        # log_probs is absent by design under a forward-process objective, which trains
+        # on the terminal x0 and never asks for a transition density.
+        replay_fields = ("video", "audio", "indices", "text_embeddings")
         replay_ready = [all(capture.get(key) is not None for key in replay_fields) for capture in captures]
         if any(replay_ready) != all(replay_ready):
             raise RuntimeError("MiniMax-H3 rollout mixed replay and evaluation-only outputs")
@@ -168,6 +173,10 @@ class MiniMaxH3OutputAdapter:
         if any(transition_means_present) != all(transition_means_present):
             raise RuntimeError("MiniMax-H3 rollout emitted transition means for only some outputs")
 
+        log_probs_present = [capture.get("log_probs") is not None for capture in captures]
+        if any(log_probs_present) != all(log_probs_present):
+            raise RuntimeError("MiniMax-H3 rollout emitted rollout log-probs for only some outputs")
+
         params = frontier.sampling_params
         expected_video_sigmas = params.sigmas
         expected_audio_sigmas = get_sigma_schedule(
@@ -177,6 +186,13 @@ class MiniMaxH3OutputAdapter:
         )
         expected_indices = torch.as_tensor(captures[0]["indices"], dtype=torch.long)
         expected_sde_indices = torch.as_tensor(captures[0].get("sde_indices", []), dtype=torch.long)
+        # Only a pure-ODE rollout may omit them; a stochastic step that lost its density
+        # would otherwise reach the ratio silently.
+        if int(expected_sde_indices.numel()) and not all(log_probs_present):
+            raise RuntimeError(
+                f"MiniMax-H3 rollout has {int(expected_sde_indices.numel())} stochastic step(s) "
+                "but returned no rollout log-probs"
+            )
         for output_index, capture in enumerate(captures):
             verify_engine_used_sigmas(
                 capture.get("video_sigmas"),
@@ -208,17 +224,18 @@ class MiniMaxH3OutputAdapter:
                         f"MiniMax-H3 output {output_index} invalid {field_name} trajectory: "
                         f"shape={getattr(tensor, 'shape', None)} dtype={getattr(tensor, 'dtype', None)}"
                     )
-            log_prob = capture["log_probs"]
-            if (
-                not torch.is_tensor(log_prob)
-                or log_prob.dtype != torch.float32
-                or not torch.isfinite(log_prob).all()
-                or int(log_prob.shape[1]) != int(expected_sde_indices.numel())
-            ):
-                raise RuntimeError(
-                    f"MiniMax-H3 output {output_index} invalid rollout log-prob: "
-                    f"shape={getattr(log_prob, 'shape', None)} dtype={getattr(log_prob, 'dtype', None)}"
-                )
+            if log_probs_present[output_index]:
+                log_prob = capture["log_probs"]
+                if (
+                    not torch.is_tensor(log_prob)
+                    or log_prob.dtype != torch.float32
+                    or not torch.isfinite(log_prob).all()
+                    or int(log_prob.shape[1]) != int(expected_sde_indices.numel())
+                ):
+                    raise RuntimeError(
+                        f"MiniMax-H3 output {output_index} invalid rollout log-prob: "
+                        f"shape={getattr(log_prob, 'shape', None)} dtype={getattr(log_prob, 'dtype', None)}"
+                    )
             if transition_means_present[output_index]:
                 transition_means = capture["video_means"]
                 if (
@@ -248,7 +265,11 @@ class MiniMaxH3OutputAdapter:
                 for capture in captures
             ]
         )
-        sde_logp = torch.cat([capture["log_probs"] for capture in captures], dim=0).to(torch.float32)
+        sde_logp = (
+            torch.cat([capture["log_probs"] for capture in captures], dim=0).to(torch.float32)
+            if all(log_probs_present)
+            else None
+        )
         sde_means = (
             torch.cat([capture["video_means"] for capture in captures], dim=0)
             if all(transition_means_present)

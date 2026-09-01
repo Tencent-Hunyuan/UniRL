@@ -1,0 +1,59 @@
+# @package _global_
+# MiniMax-H3 t2va DiffusionNFT — vLLM-Omni rollout, colocate.
+#
+# The trainside sibling minimax_h3_t2va_nft with its engine swapped and nothing
+# else moved: same 256x384 geometry, same forward-process objective, same
+# clap+imagebind reward, same EMA shadow, same optimizer. Anything that differs
+# in a reward curve between the two is the engine.
+#
+# Launch (1 node x 8 GPUs):
+#   bash examples/run_experiment_single_node.sh diffusion/minimax_h3/minimax_h3_t2va_nft_vllmomni
+
+defaults:
+  - minimax_h3_t2va_nft_base
+  - _self_
+
+bundle:
+  config:
+    # Engine-side only (VLLMOmniRolloutEngine reads it as uses_lora); the
+    # trainer's adapters still come from backend.ema_lora_cfg.
+    use_lora: true
+
+rollout:
+  _target_: unirl.rollout.engine.vllm_omni.engine.VLLMOmniRolloutEngine
+  model_config: ${bundle.config}
+  config:
+    _target_: unirl.rollout.engine.vllm_omni.config.VLLMOmniEngineConfig
+    model_path: ${bundle.config.pretrained_model_ckpt_path}
+    modality: minimax_h3_t2va
+    # Colocate time-shares all 8 GPUs, so the engine releases its memory while
+    # the trainer runs and restores it to generate.
+    enable_sleep_mode: true
+    # 8 GPUs / 4 per replica = 2 replicas. The group handle reads tp_size to
+    # size the rank group.
+    replica_size: 4
+    tp_size: 4
+
+# adapter_name is deliberately absent: it falls back to
+# backend.rollout_adapter_name — "old", from ema_lora_cfg.shadow_adapter — which
+# is the EMA shadow DiffusionNFT samples under. Naming an adapter here would
+# silently roll out the trained weights instead.
+sync:
+  _target_: unirl.distributed.weight_sync.lora.LocalLoraWeightSync
+  param_prefix: "transformer."
+  # The 166M-parameter adapter is too large to base64 into a control message, and
+  # the engine's four sequence-parallel subprocesses each read the spooled file.
+  transport: file
+  verify: false
+
+sampling:
+  sampler_kwargs:
+    # eta=0 and num_sde_steps=0 mean no transition is recorded, so the engine
+    # would return decoded media and no latent at all; the forward-process loss
+    # needs the terminal x0 of the video and audio streams.
+    capture_terminal_latents: true
+
+logging:
+  report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,true}}
+  run_name: ${oc.env:WANDB_RUN_NAME,minimax_h3_t2va_nft_vllmomni}
+  tags: [minimax-h3, t2va, diffusionnft, vllm-omni, colocate, audio, stereo]
