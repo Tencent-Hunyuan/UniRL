@@ -33,6 +33,7 @@ from unirl.train.configs import EmaFullConfig, EmaLoraConfig, FSDPConfig, LoraCo
 from unirl.train.ema import EMA, Shadow, inject_mirror, inject_nft, make_decay_fn
 from unirl.train.lora import inject_frozen_adapter, inject_lora, resolve_target_modules_pattern
 from unirl.train.optim import build_lr_scheduler, build_optimizer
+from unirl.utils.memory_utils import aggressive_empty_cache
 
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
@@ -563,6 +564,14 @@ class BaseFSDP2Backend(Remote):
         self._offload_model()
         move_optimizer_state(self.optimizer, "cpu")
         torch.cuda.empty_cache()
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def release_cache(self) -> Dict[str, float]:
+        """Return this rank's cached-but-unused blocks to the driver, keeping every tensor put."""
+        # The backward leaves autograd graphs in reference cycles, so the blocks
+        # behind them only come back once gc has run — hence the collect loop
+        # rather than a bare empty_cache.
+        return aggressive_empty_cache()
 
     @staticmethod
     def _find_loss_reduction_mesh(model: nn.Module) -> Optional["DeviceMesh"]:

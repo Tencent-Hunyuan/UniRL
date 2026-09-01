@@ -616,6 +616,21 @@ class DiffusionTrainer(BaseTrainer):
         self.rollout.sleep()
         self.backend.onload()
 
+    @staticmethod
+    def _log_released_cache(per_rank: Any) -> None:
+        """Report the pre-wake release; the stingiest rank is the one a wake OOMs on."""
+        freed = [
+            float(result.get("freed_reserved_gb", 0.0)) for result in (per_rank or []) if isinstance(result, Mapping)
+        ]
+        if not freed:
+            return
+        logger.info(
+            "pre-wake cache release: returned %.2f-%.2f GB across %d rank(s)",
+            min(freed),
+            max(freed),
+            len(freed),
+        )
+
     def _generate_with_residency(
         self,
         sample: Sample,
@@ -630,6 +645,10 @@ class DiffusionTrainer(BaseTrainer):
         should_offload_train = (
             self._enable_fsdp_offload and self._layout != "separate" and not self._rollout_is_trainside
         )
+        # offload() would hand back the blocks each train rank still caches from
+        # the last backward, which a colocated engine's wake needs as physical
+        # pages, but it runs after that wake — so rollout 2 OOMs without this.
+        should_release_cache = self._layout != "separate" and not self._rollout_is_trainside
         # Swap EMA weights only for trainside rollout; remote engines receive
         # them through weight sync.
         should_swap_ema = self._uses_ema and self._rollout_is_trainside
@@ -637,6 +656,8 @@ class DiffusionTrainer(BaseTrainer):
         ema_apply_attempted = False
         generation_succeeded = False
         try:
+            if should_release_cache:
+                self._log_released_cache(self.backend.release_cache())
             self.rollout.wake_up()
             if sync_weights and self.weight_sync is not None:
                 self.weight_sync.sync()
