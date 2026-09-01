@@ -85,6 +85,9 @@ class MiniMaxH3InputAdapter(DitInputAdapter):
         extra.update(
             task="t2va",
             aspect_ratio=_resolve_aspect_ratio(params),
+            # The engine derives its canvas from the ratio name and this edge, so
+            # without it every recipe would be served at H3's released 768.
+            short_edge=min(int(params.height), int(params.width)),
             flow_shift=self.video_shift,
             audio_flow_shift=self.audio_shift,
             audio_joint_sde=self.audio_joint_sde,

@@ -47,6 +47,11 @@ sync:
   verify: false
 
 sampling:
+  # The base's 256x384 is 3:2, and the engine derives its canvas from one of H3's
+  # official ratio names — this is 4:3, the nearest, and 288 is the short edge
+  # that lands it on a 32-pixel grid without moving the width.
+  height: 288
+  width: 384
   sampler_kwargs:
     # eta=0 and num_sde_steps=0 mean no transition is recorded, so the engine
     # would return decoded media and no latent at all; the forward-process loss
