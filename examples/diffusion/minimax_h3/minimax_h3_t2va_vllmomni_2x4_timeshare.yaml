@@ -2,7 +2,7 @@
 # H3 baseline with FSDP8 training, 2 x HSDP4+UP4 rollout, and reward DP8.
 
 defaults:
-  - minimax_h3_t2va_trainside
+  - minimax_h3_t2va_base
   - _self_
 
 num_devices: 8

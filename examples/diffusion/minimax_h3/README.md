@@ -84,12 +84,17 @@ minimax_h3_t2va_vllmomni_32c_quality100_tp2_up2
   -> minimax_h3_t2va_vllmomni_32c_8x8_hsdp8x4
   -> minimax_h3_t2va_vllmomni_32c_8x8
   -> minimax_h3_t2va_vllmomni_2x4_timeshare
-  -> minimax_h3_t2va_trainside
+  -> minimax_h3_t2va_base
+
+minimax_h3_t2va_trainside
+  -> minimax_h3_t2va_base
 ```
 
-`minimax_h3_t2va_trainside` is the in-process baseline; the `32c_*` layers add
-the vLLM-Omni rollout, the 32-GPU geometry and the topology overrides.
-`_tp4` and `_hsdp4` variants exist for topology comparison.
+`minimax_h3_t2va_base` holds the model, algorithm, reward and data setup and
+names no rollout engine, so each leaf picks one: `minimax_h3_t2va_trainside` is
+the in-process baseline, and the `32c_*` layers add the vLLM-Omni rollout, the
+32-GPU geometry and the topology overrides. `_tp4` and `_hsdp4` variants exist
+for topology comparison.
 
 ## Geometry constraint
 
