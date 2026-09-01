@@ -22,8 +22,9 @@ dependencies = [
   "diffusers>=0.38.0",  # LTX-2 needs 0.38: transformer.forward gained sigma/audio_sigma/isolate_modalities/use_cross_timestep, connector gained padding_side, calculate_shift now pins image_seq_len to max_image_seq_len. (>=0.37 was already required for Qwen-Image RoPE text-len-from-mask; 0.38 verified to keep that + every other model API unchanged.)
   "hydra-core>=1.3",
   "omegaconf>=2.3",
-  # Match the engine stacks' 5.6.x baseline; BAGEL vendor smoke passed on 5.6.0.
-  "transformers>=5.6,<5.7",
+  # Wide enough to admit both engine forks — sglang hard-pins 5.6.0 while the
+  # vllm extra narrows itself to 5.12.1, so raising this floor unsolves sglang.
+  "transformers>=5.6,<5.13",
   "huggingface-hub>=0.34",
   # Vendored Boogu-Image DiT (unirl/models/boogu_image/vendor/) imports einops
   # in transformer_boogu.py / attention_processor.py / rope.py. Pure-python,
@@ -82,8 +83,12 @@ sglang = [
 # +cu129 pin would resolve anyway, linking a CUDA-12 torch under a CUDA-13 vllm.
 # Prerelease, so installs need --prerelease=allow, plus sglang's compat layer.
 vllm = [
-  "vllm==0.27.0 ; sys_platform == 'linux'",
-  "vllm-omni==0.27.0rc1 ; sys_platform == 'linux'",
+  "vllm==0.28.0 ; sys_platform == 'linux'",
+  "vllm-omni==0.28.0rc1 ; sys_platform == 'linux'",
+  # vllm-omni 0.28 needs >=5.10.1,<5.15 (5.10.0 is yanked, 5.15 has a known
+  # construction regression); exact because there is no uv.lock to hold it, and
+  # 5.12.1 is what sglang 0.5.15+ pins, so unifying later is a bump not a port.
+  "transformers==5.12.1 ; sys_platform == 'linux'",
   "torch==2.13.0+cu130 ; sys_platform == 'linux'",
   "torchvision==0.28.0+cu130 ; sys_platform == 'linux'",
   # torchaudio 2.11.0+cu130 is ABI-built against torch 2.11; there is no
@@ -152,7 +157,8 @@ index-strategy = "unsafe-best-match"
 # sglang 0.5.12.post1 pins transformers==5.6.0 but leaves its `kernels`
 # integration unpinned; kernels >=0.15 changed LayerRepository's signature and
 # breaks transformers 5.6.0 at import time. Hold it to transformers' own
-# declared bound.
+# declared bound. Scoped to that fork in practice: nothing the vllm extra
+# resolves requires kernels, so this does not cap its transformers at <5.13.
 #
 # transformers 5.6.0 accepts tokenizers<=0.23.0, but tokenizers 0.23.0(rc)
 # dropped the `cls` kwarg from RobertaProcessing.__new__, so deserializing a
