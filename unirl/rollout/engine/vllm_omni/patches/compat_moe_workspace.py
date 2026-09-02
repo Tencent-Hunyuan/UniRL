@@ -60,7 +60,9 @@ def _patch_workspace_manager_class(
             current_workspace = manager._current_workspaces[workspace_id]
             current_size = manager._workspace_size_bytes(current_workspace)
             workspace_locked = manager.is_locked()
-        except AttributeError:
+        except (AttributeError, IndexError):
+            # An out-of-range slot means an unconfigured lane, which vLLM itself
+            # reports with a precise error once it reaches its own bounds check.
             return original_ensure_workspace_size(manager, required_bytes)
         if current_size >= required_bytes:
             return original_ensure_workspace_size(manager, required_bytes)
