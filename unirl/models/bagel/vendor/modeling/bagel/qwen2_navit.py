@@ -233,6 +233,36 @@ def pad_sequence(tensor, pad_size):
     return torch.cat([tensor, pad_tensor], dim=1)
 
 
+def _sequence_lengths(query_lens) -> List[int]:
+    if isinstance(query_lens, torch.Tensor):
+        return [int(length) for length in query_lens.tolist()]
+    return [int(length) for length in query_lens]
+
+
+def _apply_by_sequence(module, packed_tensor, query_lens):
+    lengths = _sequence_lengths(query_lens)
+    if len(lengths) <= 1:
+        return module(packed_tensor)
+    return torch.cat([module(chunk) for chunk in packed_tensor.split(lengths, dim=0)], dim=0)
+
+
+def _apply_selected_by_sequence(module, packed_tensor, selected_indexes, query_lens):
+    lengths = _sequence_lengths(query_lens)
+    if len(lengths) <= 1:
+        return module(packed_tensor[selected_indexes])
+
+    outputs = []
+    offset = 0
+    for length in lengths:
+        end = offset + length
+        mask = (selected_indexes >= offset) & (selected_indexes < end)
+        indexes = selected_indexes[mask]
+        if indexes.numel() > 0:
+            outputs.append(module(packed_tensor[indexes]))
+        offset = end
+    return torch.cat(outputs, dim=0)
+
+
 class PackedAttention(Qwen2Attention):
     def __init__(self, config, layer_idx: Optional[int] = None):
         super().__init__(config, layer_idx)
@@ -523,17 +553,26 @@ class PackedAttentionMoT(Qwen2Attention):
             packed_key_states = packed_query_sequence.new_zeros((packed_query_sequence.shape[0], self.num_key_value_heads * self.head_dim))
             packed_value_states = packed_query_sequence.new_zeros((packed_query_sequence.shape[0], self.num_key_value_heads * self.head_dim))
 
-            packed_text_query_sequence = packed_query_sequence[packed_text_indexes]
-            packed_vae_query_sequence = packed_query_sequence[packed_vae_token_indexes]
+            packed_query_states[packed_text_indexes] = _apply_selected_by_sequence(
+                self.q_proj, packed_query_sequence, packed_text_indexes, query_lens
+            )
+            packed_query_states[packed_vae_token_indexes] = _apply_selected_by_sequence(
+                self.q_proj_moe_gen, packed_query_sequence, packed_vae_token_indexes, query_lens
+            )
 
-            packed_query_states[packed_text_indexes] = self.q_proj(packed_text_query_sequence)
-            packed_query_states[packed_vae_token_indexes] = self.q_proj_moe_gen(packed_vae_query_sequence)
+            packed_key_states[packed_text_indexes] = _apply_selected_by_sequence(
+                self.k_proj, packed_query_sequence, packed_text_indexes, query_lens
+            )
+            packed_key_states[packed_vae_token_indexes] = _apply_selected_by_sequence(
+                self.k_proj_moe_gen, packed_query_sequence, packed_vae_token_indexes, query_lens
+            )
 
-            packed_key_states[packed_text_indexes] = self.k_proj(packed_text_query_sequence)
-            packed_key_states[packed_vae_token_indexes] = self.k_proj_moe_gen(packed_vae_query_sequence)
-
-            packed_value_states[packed_text_indexes] = self.v_proj(packed_text_query_sequence)
-            packed_value_states[packed_vae_token_indexes] = self.v_proj_moe_gen(packed_vae_query_sequence)
+            packed_value_states[packed_text_indexes] = _apply_selected_by_sequence(
+                self.v_proj, packed_query_sequence, packed_text_indexes, query_lens
+            )
+            packed_value_states[packed_vae_token_indexes] = _apply_selected_by_sequence(
+                self.v_proj_moe_gen, packed_query_sequence, packed_vae_token_indexes, query_lens
+            )
 
             packed_query_states = packed_query_states.view(-1, self.num_heads, self.head_dim)
             packed_key_states = packed_key_states.view(-1, self.num_key_value_heads, self.head_dim)
@@ -599,8 +638,12 @@ class PackedAttentionMoT(Qwen2Attention):
             # path is already functional, and the gen input_layernorm/MLP already use this
             # zeros_like pattern; this mirrors flow_grpo's identical fix. Math is unchanged.
             packed_attn_output_ = torch.zeros_like(packed_attn_output)
-            packed_attn_output_[packed_text_indexes] = self.o_proj(packed_attn_output[packed_text_indexes])
-            packed_attn_output_[packed_vae_token_indexes] = self.o_proj_moe_gen(packed_attn_output[packed_vae_token_indexes])
+            packed_attn_output_[packed_text_indexes] = _apply_selected_by_sequence(
+                self.o_proj, packed_attn_output, packed_text_indexes, query_lens
+            )
+            packed_attn_output_[packed_vae_token_indexes] = _apply_selected_by_sequence(
+                self.o_proj_moe_gen, packed_attn_output, packed_vae_token_indexes, query_lens
+            )
             packed_attn_output = packed_attn_output_
 
         if update_past_key_values:
@@ -819,14 +862,21 @@ class Qwen2MoTDecoderLayer(nn.Module):
                 packed_query_sequence = self.post_attention_layernorm(packed_query_sequence)
                 packed_query_sequence = self.mlp(packed_query_sequence)
             elif mode == "gen":
-                packed_text_query_sequence = packed_query_sequence[packed_text_indexes]
-                packed_vae_query_sequence = packed_query_sequence[packed_vae_token_indexes]
-                packed_text_query_sequence = self.post_attention_layernorm(packed_text_query_sequence).to(torch.bfloat16)
-                packed_vae_query_sequence = self.post_attention_layernorm_moe_gen(packed_vae_query_sequence).to(torch.bfloat16)
-
                 packed_query_sequence_ = torch.zeros_like(packed_query_sequence).to(torch.bfloat16)
-                packed_query_sequence_[packed_text_indexes] = self.mlp(packed_text_query_sequence)
-                packed_query_sequence_[packed_vae_token_indexes] = self.mlp_moe_gen(packed_vae_query_sequence)
+                packed_query_sequence_[packed_text_indexes] = _apply_selected_by_sequence(
+                    lambda values: self.mlp(self.post_attention_layernorm(values).to(torch.bfloat16)),
+                    packed_query_sequence,
+                    packed_text_indexes,
+                    query_lens,
+                )
+                packed_query_sequence_[packed_vae_token_indexes] = _apply_selected_by_sequence(
+                    lambda values: self.mlp_moe_gen(
+                        self.post_attention_layernorm_moe_gen(values).to(torch.bfloat16)
+                    ),
+                    packed_query_sequence,
+                    packed_vae_token_indexes,
+                    query_lens,
+                )
                 packed_query_sequence = packed_query_sequence_
 
             packed_query_sequence = residual + packed_query_sequence
