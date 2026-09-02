@@ -9,11 +9,12 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple, Type
 import torch
 
 from unirl.sde.index_schedule import normalize_timestep_fraction
+from unirl.train.lora import adapters_disabled
 from unirl.types.conditions import Condition
 from unirl.types.segments.latent import LatentSegment
 from unirl.utils.metrics import aggregate_numeric_metrics
 
-from .base import AlgorithmStepResult, BaseAlgorithmConfig, StageAlgorithm
+from .base import AlgorithmStepResult, BaseAlgorithmConfig, StageAlgorithm, _resolve_reference_model
 
 
 @dataclass
@@ -74,11 +75,11 @@ class DiffusionNFT(StageAlgorithm):
             raise ValueError(
                 f"DiffusionNFT: training_timestep_fraction must lie in (0, 1]; got {training_timestep_fraction!r}."
             )
-        if float(kl_coef) > 0:
-            raise ValueError(
-                "DiffusionNFT: kl_coef > 0 not supported (KL penalty against base "
-                "model not implemented in this revision)."
-            )
+        if float(kl_coef) < 0:
+            raise ValueError(f"DiffusionNFT: kl_coef must be >= 0; got {kl_coef!r}.")
+        # The reference is the LoRA-disabled base policy, not the EMA shadow: the
+        # shadow tracks the policy, so it cannot anchor drift away from it.
+        self._ref_model = _resolve_reference_model(backend, beta=float(kl_coef), algo="DiffusionNFT")
         if not (0.0 < float(beta)):
             raise ValueError(f"DiffusionNFT: beta must be > 0; got {beta!r}.")
         if not (0.0 < float(adv_clip_max)):
@@ -260,6 +261,10 @@ class DiffusionNFT(StageAlgorithm):
         policy_loss = (r * pos_loss / beta + (1.0 - r) * neg_loss / beta).mean()
         total = policy_loss * float(self.config.adv_clip_max)
 
+        kl_loss = self._reference_kl(conditions, xt=xt, t_batch=t_batch, new_pred=new_pred)
+        if kl_loss is not None:
+            total = total + float(self.config.kl_coef) * kl_loss
+
         metrics = {
             "policy_loss": float(policy_loss.detach().item()),
             "pos_loss_mean": float(pos_loss.mean().detach().item()),
@@ -271,7 +276,40 @@ class DiffusionNFT(StageAlgorithm):
             "x0_norm": float((x0**2).mean().detach().item()),
             "t_value": float(t_scalar.detach().item()),
         }
+        if kl_loss is not None:
+            metrics["ref_kl_loss"] = float(kl_loss.detach().item())
         return total, metrics
+
+    def _reference_kl(
+        self,
+        conditions: Any,
+        *,
+        xt: torch.Tensor,
+        t_batch: torch.Tensor,
+        new_pred: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """Penalty pulling the policy back toward the LoRA-disabled base model.
+
+        Costs a third forward per timestep, on top of the trainable and shadow
+        ones. There is no cheaper reference available: the shadow follows the
+        policy by construction, so anchoring to it would not bound drift.
+
+        The two predictions are the means of Gaussians that share a variance at
+        this timestep, so their KL reduces to the squared difference between
+        them up to a constant factor. Measuring it on the prediction rather than
+        on the reconstructed ``x0`` keeps the penalty independent of ``t``, which
+        the ``xt - t * pred`` reconstruction is not.
+        """
+        if self._ref_model is None:
+            return None
+        with torch.no_grad(), adapters_disabled(self._ref_model):
+            ref_pred = self.stage.predict_noise_at_step(
+                conditions,
+                sample=xt,
+                sigma=t_batch,
+                params=self.params,
+            )
+        return ((new_pred - ref_pred.detach()) ** 2).mean()
 
     def _resolve_timesteps(
         self,
