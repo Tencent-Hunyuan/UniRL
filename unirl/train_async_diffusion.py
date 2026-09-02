@@ -47,6 +47,9 @@ def main(cfg: DictConfig) -> None:
         max_inflight=int(cfg.get("max_inflight", 1)),
         per_worker_inflight=int(cfg.get("per_worker_inflight", 1)),
         weight_sync_interval=int(cfg.get("weight_sync_interval", 1)),
+        buffer_max_staleness=cfg.get("buffer_max_staleness"),
+        async_reward=bool(cfg.get("async_reward", False)),
+        reward_client_on_driver=bool(cfg.get("reward_client_on_driver", False)),
     )
     trainer.train(
         num_rollouts=cfg.get("num_rollouts", 100),

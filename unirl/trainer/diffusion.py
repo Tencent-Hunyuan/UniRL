@@ -210,6 +210,10 @@ class DiffusionTrainer(BaseTrainer):
 
     _prompt_local_rollout = False
 
+    # Async per-prompt subclasses may place an HTTP reward client on the driver
+    # instead of allocating a GPU worker for the client. See _build_train_side.
+    _reward_client_on_driver: bool = False
+
     def __init__(
         self,
         *,
@@ -467,7 +471,14 @@ class DiffusionTrainer(BaseTrainer):
         self.pipeline = remote_hydra(pipeline_cfg, bundle=self.bundle)
         self.backend = remote_hydra(backend_cfg, bundle=self.bundle)
         if reward_cfg is not None:
-            self.reward = remote_hydra(reward_cfg)
+            if self._reward_client_on_driver:
+                # The remote scorer model lives outside this pool. Keep only its
+                # thin HTTP client on the driver, with no GPU worker or slab.
+                from unirl.reward.async_dispatch import DriverRewardClient
+
+                self.reward = DriverRewardClient(instantiate(reward_cfg))
+            else:
+                self.reward = remote_hydra(reward_cfg)
             self._wire_eval_suites()
         algo_cls = get_class(str(algorithm_cfg.get("_target_", "")))
         self._uses_ema = getattr(algo_cls, "requires_ema_rollout", False)
