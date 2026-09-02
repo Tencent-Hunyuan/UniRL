@@ -147,8 +147,14 @@ class VLLMOmniBackend:
         except Exception:  # noqa: BLE001 - belt and braces; never block a boot
             pass
 
-        yaml_path = _resolve_stage_yaml(str(intent["stage_yaml"]))
+        # H3 boots from direct diffusion-stage arguments rather than a stage
+        # YAML, so its adapter clears this flag and never supplies "stage_yaml".
+        # Reading that key unconditionally is what breaks such an adapter.
+        use_stage_yaml = bool(intent.get("use_stage_yaml", True))
+        yaml_path = _resolve_stage_yaml(str(intent["stage_yaml"])) if use_stage_yaml else None
         omni_kwargs = _assemble_omni_kwargs(intent)
+        if yaml_path is not None:
+            omni_kwargs["stage_configs_path"] = yaml_path
         ports = intent.get("ports")
         boot_master_port = int(ports.master_port) if ports is not None else None
         logger.info(
@@ -171,9 +177,10 @@ class VLLMOmniBackend:
                 if lock_file is not None:
                     fcntl.flock(lock_file, fcntl.LOCK_EX)
                 with _master_port_env(boot_master_port):
+                    # stage_configs_path rides in omni_kwargs only when this
+                    # adapter actually uses a stage YAML.
                     omni = rt["Omni"](
                         model=str(intent["model_path"]),
-                        stage_configs_path=yaml_path,
                         **omni_kwargs,
                     )
             finally:
@@ -585,10 +592,6 @@ class VLLMOmniBackend:
                         payload_path,
                         ready_token,
                     ),
-                    kwargs={
-                        "_diffrl_unique_reply_rank": 0,
-                        "_diffrl_exec_all_ranks": True,
-                    },
                     stage_ids=[int(sid)],
                 )
                 self._raise_for_control_rpc_error(result, method="set_lora_from_tensor_file")
