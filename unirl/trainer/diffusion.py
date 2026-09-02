@@ -102,6 +102,62 @@ def _validate_diffusion_dp_geometry(
         )
 
 
+def _validate_static_trainside_dp_geometry(
+    *,
+    num_devices: int,
+    layout: str,
+    reward_fraction: float,
+    batch_size: int,
+    samples_per_prompt: int,
+    num_updates_per_batch: int,
+    backend_cfg: DictConfig,
+    rollout_cfg: DictConfig,
+    reward_cfg: Optional[DictConfig],
+) -> None:
+    """Reject statically-known trainside DP geometry before constructing heavy model roles."""
+    rollout_target = str(rollout_cfg.get("_target_", ""))
+    if not rollout_target.endswith(".TrainsideRolloutEngine") or layout == "separate":
+        return
+
+    shared_devices_f = (1.0 - reward_fraction) * num_devices
+    shared_devices = int(round(shared_devices_f))
+    if abs(shared_devices_f - shared_devices) > 1e-9:
+        raise ValueError(
+            f"Static trainside geometry: reward_fraction={reward_fraction} of num_devices={num_devices} "
+            f"leaves {shared_devices_f} shared train/rollout devices, not an integer."
+        )
+
+    fsdp_cfg = backend_cfg.get("fsdp_cfg", {})
+    sp_size = int(fsdp_cfg.get("sp_size", 1) or 1)
+    if shared_devices % sp_size:
+        raise ValueError(
+            f"Static trainside geometry: {shared_devices} shared devices are not divisible by sp_size={sp_size}."
+        )
+    shared_dp_size = shared_devices // sp_size
+
+    if reward_cfg is None:
+        reward_dp_size = 1
+    elif reward_fraction > 0.0:
+        reward_devices_f = reward_fraction * num_devices
+        reward_dp_size = int(round(reward_devices_f))
+        if abs(reward_devices_f - reward_dp_size) > 1e-9:
+            raise ValueError(
+                f"Static trainside geometry: reward_fraction={reward_fraction} of num_devices={num_devices} "
+                f"requests {reward_devices_f} reward devices, not an integer."
+            )
+    else:
+        reward_dp_size = shared_devices
+
+    _validate_diffusion_dp_geometry(
+        batch_size=batch_size,
+        samples_per_prompt=samples_per_prompt,
+        num_updates_per_batch=num_updates_per_batch,
+        rollout_dp_size=shared_dp_size,
+        reward_dp_size=reward_dp_size,
+        train_dp_size=shared_dp_size,
+    )
+
+
 # Per-field eval knobs the overlay replaced (or dropped), and what to write instead.
 _RETIRED_EVAL_KEYS = {
     "eval_cfg_text_scale": "eval_sampling: {guidance_scale: X}   (BAGEL family: cfg_text_scale)",
@@ -343,6 +399,18 @@ class DiffusionTrainer(BaseTrainer):
                 "has no `reward:` block — drop reward_fraction or configure a reward."
             )
         self._reward_is_separate = reward_separate
+
+        _validate_static_trainside_dp_geometry(
+            num_devices=int(self.num_devices),
+            layout=self._layout,
+            reward_fraction=reward_fraction,
+            batch_size=int(batch_size),
+            samples_per_prompt=total_samples_per_prompt(self.sampling_params),
+            num_updates_per_batch=int(stack_cfg.get("num_updates_per_batch", 1)),
+            backend_cfg=backend_cfg,
+            rollout_cfg=rollout_cfg,
+            reward_cfg=reward_cfg,
+        )
 
         train_cfgs = dict(
             bundle_cfg=bundle_cfg,

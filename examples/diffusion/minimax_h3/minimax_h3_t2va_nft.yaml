@@ -138,6 +138,7 @@ reward:
       _target_: unirl.reward.local.t2av_composite.T2AVCompositeSpec
       device: auto
       batch_size: 2
+      clap_model_id: ${oc.env:CLAP_MODEL_ID,laion/larger_clap_general}
       # Summed raw, not renormalised. The imagebind package loads its checkpoint
       # from a RELATIVE ./.checkpoints/imagebind_huge.pth.
       #

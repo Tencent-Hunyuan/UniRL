@@ -86,8 +86,10 @@ class FSDPConfig:
     mixed_precision: bool = True
     # Match FSDP2's default: cast floating block inputs to param_dtype.
     cast_forward_inputs: bool = True
-    # Shard degree: full = the whole world, hybrid = one node (replicate across nodes), no_shard = nobody (DDP — every rank keeps the full model).
+    # Shard degree: full = the whole world, hybrid = hsdp_shard_size ranks
+    # (replicate across groups), no_shard = nobody (DDP — every rank keeps the full model).
     fsdp_mode: str = "full"
+    hsdp_shard_size: int = 8
     reshard_after_forward: bool = True
     activation_checkpointing: bool = False
     # AC/FSDP composition order. "outside" (default) keeps FSDP's gather/cast

@@ -51,6 +51,7 @@ def fsdp_wrap(
     mixed_precision: bool = True,
     cast_forward_inputs: bool = True,
     fsdp_mode: str = "full",
+    hsdp_shard_size: int = 8,
     reshard_after_forward: bool = True,
     forward_prefetch: bool = False,
     activation_checkpointing: bool = False,
@@ -90,7 +91,7 @@ def fsdp_wrap(
     if cpu_offload:
         fsdp_kwargs["offload_policy"] = CPUOffloadPolicy()
 
-    mesh = _create_device_mesh(fsdp_mode)
+    mesh = _create_device_mesh(fsdp_mode, hsdp_shard_size=hsdp_shard_size)
     if mesh is not None:
         fsdp_kwargs["mesh"] = mesh
 
@@ -173,6 +174,8 @@ def fsdp_wrap(
                 "DP-synced and replicas drift. Enable training.fsdp.root_wrap or freeze them.",
             )
 
+    _validate_hsdp_mesh(model, fsdp_mode=fsdp_mode, hsdp_shard_size=hsdp_shard_size)
+
     if forward_prefetch:
         if not isinstance(model, FSDPModule):
             raise ValueError(
@@ -239,20 +242,31 @@ def _enumerate_block_instances(
     return tuple(m for _, m in model.named_modules() if type(m).__name__ in names)
 
 
-# Parameter shard degree: full = world default, hybrid = 8 ranks, no_shard = 1 rank (DDP).
-_SHARD_DEGREE: Dict[str, Optional[int]] = {"full": None, "hybrid": 8, "no_shard": 1}
+_FSDP_MODES = ("full", "hybrid", "no_shard")
 
 
-def _create_device_mesh(fsdp_mode: str) -> Optional[object]:
+def _create_device_mesh(fsdp_mode: str, *, hsdp_shard_size: int = 8) -> Optional[object]:
     mode = str(fsdp_mode).strip().lower()
     require(
-        mode in _SHARD_DEGREE,
-        f"training.fsdp.fsdp_mode={fsdp_mode!r} is not one of {sorted(_SHARD_DEGREE)}; "
+        mode in _FSDP_MODES,
+        f"training.fsdp.fsdp_mode={fsdp_mode!r} is not one of {list(_FSDP_MODES)}; "
         "an unrecognized mode would silently fall back to full sharding.",
     )
-    shard_size = _SHARD_DEGREE[mode]
-    if shard_size is None:
+    if mode == "full":
         return None
+
+    if mode == "hybrid":
+        require(
+            isinstance(hsdp_shard_size, int) and not isinstance(hsdp_shard_size, bool),
+            f"training.fsdp.hsdp_shard_size must be an integer >= 2, got {hsdp_shard_size!r}.",
+        )
+        require(
+            hsdp_shard_size >= 2,
+            f"training.fsdp.hsdp_shard_size must be >= 2, got {hsdp_shard_size}.",
+        )
+        shard_size = hsdp_shard_size
+    else:
+        shard_size = 1
 
     import torch.distributed as dist
 
@@ -260,10 +274,20 @@ def _create_device_mesh(fsdp_mode: str) -> Optional[object]:
         return None
 
     world_size = dist.get_world_size()
-    # A world that the shard degree cannot split (including single-rank
-    # ``no_shard``) already matches the default 1D mesh.
-    if world_size <= shard_size or world_size % shard_size != 0:
+    if mode == "no_shard" and world_size == 1:
         return None
+    if mode == "hybrid":
+        require(
+            world_size > shard_size,
+            f"training.fsdp.fsdp_mode='hybrid' requires world_size > hsdp_shard_size "
+            f"to form at least two replica groups, got world_size={world_size}, "
+            f"hsdp_shard_size={shard_size}. Use fsdp_mode='full' for one shard group.",
+        )
+        require(
+            world_size % shard_size == 0,
+            f"training.fsdp.fsdp_mode='hybrid' requires world_size divisible by "
+            f"hsdp_shard_size, got world_size={world_size}, hsdp_shard_size={shard_size}.",
+        )
 
     from torch.distributed.device_mesh import init_device_mesh
 
@@ -275,6 +299,43 @@ def _create_device_mesh(fsdp_mode: str) -> Optional[object]:
     )
     logger.info("fsdp_wrap: %s mesh dp_replicate=%d x dp_shard=%d", mode, replicate_size, shard_size)
     return mesh
+
+
+def _validate_hsdp_mesh(model: nn.Module, *, fsdp_mode: str, hsdp_shard_size: int) -> None:
+    """Fail fast unless every FSDP DTensor uses the requested two-dimensional HSDP mesh."""
+    if str(fsdp_mode).strip().lower() != "hybrid":
+        return
+
+    import torch.distributed as dist
+    from torch.distributed.tensor import DTensor
+
+    if not (dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1):
+        return
+
+    expected_shape = (dist.get_world_size() // hsdp_shard_size, hsdp_shard_size)
+    expected_names = ("dp_replicate", "dp_shard")
+    checked = 0
+    mismatches = []
+    for name, param in model.named_parameters():
+        if not isinstance(param, DTensor):
+            continue
+        checked += 1
+        mesh = param.device_mesh
+        shape = tuple(int(size) for size in mesh.shape)
+        names = tuple(mesh.mesh_dim_names or ())
+        if shape != expected_shape or names != expected_names:
+            mismatches.append((name, shape, names))
+            if len(mismatches) == 3:
+                break
+
+    require(checked > 0, "fsdp_wrap: hybrid mode produced no DTensor parameters; HSDP was not installed.")
+    require(
+        not mismatches,
+        f"fsdp_wrap: hybrid mode requested mesh {expected_names}={expected_shape}, "
+        f"but found mismatched DTensor meshes: {mismatches}.",
+    )
+    if _current_rank() == 0:
+        logger.info("fsdp_wrap: validated HSDP mesh dp_replicate=%d x dp_shard=%d", *expected_shape)
 
 
 def _current_rank() -> int:

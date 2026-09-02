@@ -36,6 +36,7 @@ class MiniMaxH3Bundle(Bundle):
         device: torch.device,
         pretrained_path: str,
         max_sequence_length: int,
+        text_encoder_onload_for_embed: bool,
     ) -> None:
         super().__init__()
         self.transformer = transformer
@@ -51,6 +52,7 @@ class MiniMaxH3Bundle(Bundle):
         self.device = device
         self.pretrained_path = pretrained_path
         self.max_sequence_length = max_sequence_length
+        self.text_encoder_onload_for_embed = bool(text_encoder_onload_for_embed)
 
     @classmethod
     def from_config(cls, config: MiniMaxH3PipelineConfig) -> "MiniMaxH3Bundle":
@@ -142,6 +144,7 @@ class MiniMaxH3Bundle(Bundle):
             device=device,
             pretrained_path=path,
             max_sequence_length=int(config.max_sequence_length),
+            text_encoder_onload_for_embed=config.text_encoder_onload_for_embed,
         )
         if config.meta_init_transformer:
             # Diffusers layout: the backend's sharded loader reads the

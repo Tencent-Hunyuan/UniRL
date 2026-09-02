@@ -90,6 +90,15 @@ in `backend/base.py`; a multi-update-capable algorithm sets
   skips backward (an all-empty micro) while earlier ones ran, `TrainStack.train`
   raises instead of silently stepping on never-synced grads (which would also
   leak the stale accumulation into the next step's reduce-scatter).
+- **`fsdp_mode: hybrid` makes the HSDP shard group explicit** —
+  `hsdp_shard_size` is the number of contiguous ranks that shard parameters;
+  the remaining `world_size / hsdp_shard_size` dimension holds replicated
+  model copies and synchronizes their gradients. Set it to `devices_per_node`
+  for the usual intra-node FSDP + inter-node replication layout (for example,
+  world 16 with shard 8 gives a `(2, 8)` mesh). Larger groups such as shard 32
+  are supported when the world is a larger divisible multiple. Hybrid fails
+  fast when the shard size does not divide the world or leaves only one replica
+  group; use `full` for that one-group case.
 - **`fsdp_mode: no_shard` trades memory for the all-gather** — a `(world, 1)` mesh
   leaves the full model on every rank, so no parameter bytes cross ranks and only
   gradients are all-reduced (DDP). It pays off where the re-gathered bytes dwarf the

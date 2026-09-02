@@ -96,6 +96,7 @@ backend:
     cpu_offload: false
     mixed_precision: true
     fsdp_mode: hybrid           # HSDP: shard within node (8) x replicate across nodes (2)
+    hsdp_shard_size: 8
     # Safe with the AR path because rl_ops.decode_text runs a FIXED max_new
     # forwards (no early EOS break) → every rank issues an identical number of
     # all-gathers (lockstep), so resharding does not deadlock. This is also the

@@ -33,6 +33,11 @@ class T2AVCompositeScorer(RewardBackend):
             # Propagate only fields BOTH the composite and the inner spec declare.
             shared = ("device", "batch_size", "frame_selection")
             overrides = {f: getattr(config, f) for f in shared if hasattr(inner_spec, f) and hasattr(config, f)}
+            if name == "videopickscore":
+                overrides["processor_id"] = config.videopickscore_processor_id
+                overrides["model_id"] = config.videopickscore_model_id
+            elif name == "clap":
+                overrides["model_id"] = config.clap_model_id
             if overrides:
                 inner_spec = dataclasses.replace(inner_spec, **overrides)
             self._scorers[name] = inner_cls(config=inner_spec, base_device=base_device)
@@ -101,4 +106,9 @@ class T2AVCompositeSpec(BaseRewardComponentSpec):
     # keeps the historical behaviour; "middle" avoids scoring a blank opening
     # frame on clips that fade or reveal in.
     frame_selection: str = "first"
+    # Per-scorer identifiers allow offline paths without conflating the
+    # PickScore and CLAP model_id fields.
+    videopickscore_processor_id: str = "laion/CLIP-ViT-H-14-laion2B-s32B-b79K"
+    videopickscore_model_id: str = "yuvalkirstain/PickScore_v1"
+    clap_model_id: str = "laion/larger_clap_general"
     weights: Dict[str, float] = field(default_factory=lambda: {"videopickscore": 0.5, "clap": 0.5})

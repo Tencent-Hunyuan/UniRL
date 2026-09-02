@@ -189,6 +189,9 @@ reward:
       device: cpu
       batch_size: 2
       frame_selection: middle
+      videopickscore_processor_id: ${oc.env:PICKSCORE_PROCESSOR_ID,laion/CLIP-ViT-H-14-laion2B-s32B-b79K}
+      videopickscore_model_id: ${oc.env:PICKSCORE_MODEL_ID,yuvalkirstain/PickScore_v1}
+      clap_model_id: ${oc.env:CLAP_MODEL_ID,laion/larger_clap_general}
       # videopickscore scores the middle frame (image-text alignment), and
       # clap scores generated-audio-vs-text. Neither measures motion or A/V
       # sync; the only real sync scorer is imagebind, which is CC-BY-NC-SA and
