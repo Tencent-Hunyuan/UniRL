@@ -63,9 +63,9 @@ matching receiver on the engine side (`../../rollout/engine/`).
 ## Gotchas
 
 - **`sync()` is a train-mesh collective** — the FSDP→full materialization runs on
-  *every* train rank; never gate it behind `if rank == 0`. Only the push is rank-0 —
-  and with a TP>1 rollout engine the push owner is each group's `tp_rank == 0`, not
-  global rank 0, because that is the rank hosting the server.
+  *every* train rank; never gate it behind `if rank == 0`. The rollout receiver owns
+  routing after materialization: SGLang TP performs the push only on each group's
+  `tp_rank == 0`, not global rank 0.
 - **`transfer_queue` is not weight sync** — that's the rollout→trainer data plane
   for bulky rollout outputs (segments, conditions, decoded media); weight sync is
   trainer→rollout. Don't conflate them.
