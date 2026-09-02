@@ -1,14 +1,15 @@
 """Shared helpers for scorer implementations.
 
-Keeps torch dtype mapping, weights path resolution, turn-splitting, and
-data-URL image encoding in one place so individual scorers stay focused
-on their model wiring.
+Keeps torch dtype mapping, weights path resolution, turn-splitting,
+video materialisation, and data-URL image encoding in one place so
+individual scorers stay focused on their model wiring.
 """
 
 from __future__ import annotations
 
 import base64
 import io
+import tempfile
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -50,6 +51,45 @@ def split_last_turn(items: list["ScoreItem"]) -> tuple[list[str], list["Image.Im
         texts.append(text)
         images.append(image)
     return texts, images
+
+
+def materialize_video(source: bytes | str, owned_tempfiles: list[str], *, prefix: str) -> str:
+    """Return a filesystem path for a video source.
+
+    Video decoders used by scorers (decord, torchvision, cv2) only accept
+    on-disk paths, while the gateway may hand over either a path (from
+    ``video_path``) or raw bytes (from ``video_b64``).
+
+    Args:
+        source: A ``str`` path, passed through unchanged (zero-copy on
+            shared filesystems), or raw video ``bytes``.
+        owned_tempfiles: Accumulator the caller must unlink; any tempfile
+            created here is appended to it. Cleanup is the caller's job so
+            a failure mid-batch can still release every spilled file.
+        prefix: Tempfile name prefix, so stray files are traceable to the
+            scorer that made them.
+
+    Returns:
+        A path readable by video decoders.
+
+    Raises:
+        TypeError: If ``source`` is neither ``bytes`` nor ``str``.
+    """
+    if isinstance(source, str):
+        return source
+    if isinstance(source, (bytes, bytearray)):
+        video_file = tempfile.NamedTemporaryFile(prefix=prefix, suffix=".mp4", delete=False)
+        # Record before writing: the file already exists on disk at this
+        # point, so a failing write (ENOSPC) would otherwise strand it
+        # where the caller's cleanup loop can never see it.
+        owned_tempfiles.append(video_file.name)
+        try:
+            video_file.write(bytes(source))
+            video_file.flush()
+        finally:
+            video_file.close()
+        return video_file.name
+    raise TypeError(f"video source must be bytes or str (path), got {type(source).__name__}")
 
 
 def image_to_data_url(image: "Image.Image", format: str = "JPEG", quality: int = 95) -> str:

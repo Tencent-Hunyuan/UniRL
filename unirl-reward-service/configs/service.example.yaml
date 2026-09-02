@@ -103,6 +103,28 @@ rewards:
       # KV footprint. Raise only after confirming GPU headroom.
       max_batch_size: 4
 
+  # Video HPSv3: scores every frame with HPSv3 and averages the top 30%,
+  # reproducing Flash-GRPO's videohpsv3 reward for WAN2.1 T2V. Needs a video
+  # (video_b64 / video_path) on the request; disabled by default like the other
+  # T2V rewards. Shares envs/hpsv3.txt with the image scorer above, so Ray
+  # reuses one cached venv. Costs one Qwen2-VL-7B forward per frame (~5.2k per
+  # 64-clip rollout at frame_stride 1), so raise server.score_timeout_s well
+  # above its 120 s default before enabling — on timeout the Ray task keeps
+  # running and its GPU time is discarded.
+  # - name: videohpsv3
+  #   scorer: videohpsv3
+  #   runtime_env: envs/hpsv3.txt
+  #   num_replicas: 1
+  #   num_gpus: 1
+  #   num_cpus: 4
+  #   max_concurrency: 1
+  #   params:
+  #     weights_path: /path/to/RewardModel/HPSv3
+  #     config_path: null
+  #     max_batch_size: 4       # frames per forward; 8 OOMs a 95GB H20
+  #     frame_stride: 1         # 1 = exact upstream semantics; 8 = 1/8 the cost
+  #     top_ratio: 0.3          # upstream Flash-GRPO value
+
   # ─────────────── vLLM-based scorers ───────────────
   #
   # All fields below (dtype / enforce_eager / swap_space / quantization /

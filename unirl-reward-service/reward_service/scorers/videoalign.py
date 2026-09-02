@@ -20,20 +20,22 @@ Input contract:
   is ignored — VideoReward consumes the video tokens only.
 
 Bytes-input handling: each call writes incoming ``bytes`` to a
-``tempfile.NamedTemporaryFile`` whose path is fed to decord/torchvision,
-because the upstream readers only accept on-disk paths. Path inputs
-are passed straight through (zero-copy on shared filesystems).
+``tempfile.NamedTemporaryFile`` (via
+:func:`reward_service.scorers._common.materialize_video`) whose path is
+fed to decord/torchvision, because the upstream readers only accept
+on-disk paths. Path inputs are passed straight through (zero-copy on
+shared filesystems).
 """
 
 from __future__ import annotations
 
 import contextlib
 import os
-import tempfile
 
 import torch
 
 from reward_service.logging_utils import get_logger
+from reward_service.scorers._common import materialize_video
 from reward_service.scorers.base import BaseScorer, ScoreItem
 from reward_service.scorers.registry import register
 
@@ -143,7 +145,9 @@ class VideoAlignScorer(BaseScorer):
                     )
                 source = item.videos[-1]
                 prompts.append(item.history[-1][0])
-                video_paths.append(self._materialize_video(source, owned_tempfiles))
+                video_paths.append(
+                    materialize_video(source, owned_tempfiles, prefix="videoalign_")
+                )
 
             rewards = self._inferencer.reward(
                 video_paths=video_paths,
@@ -167,31 +171,6 @@ class VideoAlignScorer(BaseScorer):
             }
             for r in rewards
         ]
-
-    @staticmethod
-    def _materialize_video(source, owned_tempfiles: list[str]) -> str:
-        """Return a filesystem path for ``source``.
-
-        ``str`` is passed through; ``bytes`` is spilled to a
-        NamedTemporaryFile whose path is appended to ``owned_tempfiles``
-        for cleanup by the caller.
-        """
-        if isinstance(source, str):
-            return source
-        if isinstance(source, (bytes, bytearray)):
-            tf = tempfile.NamedTemporaryFile(
-                prefix="videoalign_", suffix=".mp4", delete=False
-            )
-            try:
-                tf.write(bytes(source))
-                tf.flush()
-            finally:
-                tf.close()
-            owned_tempfiles.append(tf.name)
-            return tf.name
-        raise TypeError(
-            f"video source must be bytes or str (path), got {type(source).__name__}"
-        )
 
 
 register("videoalign", VideoAlignScorer)
