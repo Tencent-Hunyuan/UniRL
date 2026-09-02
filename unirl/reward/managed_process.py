@@ -35,6 +35,11 @@ class ManagedProcessConfig:
     log_dir: str = "/tmp"
     offline: bool = True
     allow_multiple_visible_devices: bool = False
+    #: Data plane for tensor payloads. HTTP is the control plane regardless.
+    #: "auto": negotiate cuda_ipc via /handshake, fall back to http silently.
+    #: "cuda_ipc": require the negotiation to succeed (fail startup otherwise) —
+    #: differentiable scoring needs this. "http": never negotiate (b64 only).
+    transport: str = "auto"
 
 
 @dataclass
@@ -127,6 +132,7 @@ class ManagedScorerProcessBackend(RemoteRewardBackend):
             # scorers honoring UNIRL_SCORER_BOOT_OFFLOADED, never touches it)
             # BEFORE _start_child sees it ready; a parent-side offload here
             # would reopen the bootstrap window it is meant to close.
+            self._negotiate_transport()
         except Exception:
             self._stop_child()
             raise
@@ -260,6 +266,78 @@ class ManagedScorerProcessBackend(RemoteRewardBackend):
             session.close()
         self._stop_child()
         raise TimeoutError(f"reward child did not become ready within {cfg.process.startup_timeout}s; log={log_path}")
+
+    def _negotiate_transport(self) -> None:
+        """Negotiate the data plane with the ready child (dual-plane design)."""
+        self._transport = "http"
+        requested = getattr(self.spec.process, "transport", "auto")
+        if requested == "http":
+            return
+        try:
+            from unirl.reward.tensor_ipc import ipc_fingerprint
+
+            response = self._session.post(
+                f"{self.base_url}/handshake",
+                json={
+                    "fingerprint": {k: str(v) for k, v in ipc_fingerprint().items()},
+                    "proposed_transport": "cuda_ipc",
+                },
+                timeout=15.0,
+            )
+            response.raise_for_status()
+            body = response.json()
+            accepted = body.get("accepted_transport", "http")
+            reason = body.get("reason", "")
+        except Exception as exc:
+            if requested == "cuda_ipc":
+                raise RuntimeError(f"cuda_ipc transport was required but the handshake failed: {exc!r}") from exc
+            logger.info("cuda_ipc handshake unavailable, staying on http: %r", exc)
+            return
+        if accepted == "cuda_ipc":
+            self._transport = "cuda_ipc"
+            logger.info("managed data plane: cuda_ipc (%s)", reason or "negotiated")
+        elif requested == "cuda_ipc":
+            raise RuntimeError(f"cuda_ipc transport was required but the child declined: {reason}")
+        else:
+            logger.info("managed data plane: http (%s)", reason or "declined")
+
+    def compute_rewards_differentiable(
+        self,
+        media_tensor,
+        prompts,
+        records=None,
+    ):
+        """ReFL entry: DifferentiableReward across the process boundary (segmented backward over cuda_ipc)."""
+        import torch
+
+        from unirl.reward.differentiable import score_differentiable
+
+        if not torch.is_tensor(media_tensor) or media_tensor.dim() != 4:
+            raise ValueError(
+                "managed differentiable scoring expects an image batch [B, C, H, W]; "
+                f"got {getattr(media_tensor, 'shape', type(media_tensor))}"
+            )
+        if self.spec.gpu_residency == "per_call":
+            # The forward+backward pair is indivisible: a per_call offload
+            # between the two RPCs releases the child's retained subgraph, so
+            # every backward would 409. Reject the combination at the entry
+            # instead of failing on the first score deep inside training.
+            raise RuntimeError(
+                "differentiable scoring requires gpu_residency='resident'; "
+                "per_call offloads between the forward and backward RPCs and "
+                "drops the retained child-side graph"
+            )
+        prompts = list(prompts)
+        if media_tensor.shape[0] == 0:
+            raise ValueError("differentiable scoring got an empty image batch")
+        if len(prompts) != media_tensor.shape[0]:
+            # Fewer prompts than images would silently score (and backprop
+            # through) only a prefix of the batch.
+            raise ValueError(
+                f"differentiable scoring got {len(prompts)} prompts for a batch "
+                f"of {media_tensor.shape[0]} images; counts must match"
+            )
+        return score_differentiable(self, media_tensor, prompts)
 
     def _post_lifecycle(self, action: str, *, timeout: float = 30.0, tolerate_failure: bool = False) -> bool:
         try:
