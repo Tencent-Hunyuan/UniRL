@@ -443,6 +443,46 @@ def score_response_with_prompt(
     return torch.cat(parts, dim=0)
 
 
+def _build_und_attention_mask(
+    model: Any,
+    *,
+    sample_lens: List[int],
+    split_lens: List[int],
+    attn_modes: List[str],
+    device: torch.device,
+    attention_backend: str,
+) -> Any:
+    """Build the train-replay mask while preserving identical visibility rules."""
+    backend = str(attention_backend).strip().lower()
+    if backend == "sdpa":
+        from .vendor.data.data_utils import prepare_attention_mask_per_sample
+
+        return [prepare_attention_mask_per_sample(split_lens, attn_modes, device=device)]
+    if backend == "flex":
+        try:
+            from torch.nn.attention.flex_attention import create_block_mask
+        except ImportError as exc:
+            raise RuntimeError(
+                "pack_und_forward_inputs: attention_backend='flex' requires PyTorch >= 2.5 "
+                "with torch.nn.attention.flex_attention."
+            ) from exc
+        from .vendor.data.data_utils import create_sparse_mask
+
+        seqlen = sum(sample_lens)
+        mask_mod = create_sparse_mask(sample_lens, split_lens, attn_modes, device)
+        return create_block_mask(
+            mask_mod,
+            B=1,
+            H=model.num_heads,
+            Q_LEN=seqlen,
+            KV_LEN=seqlen,
+            device=device,
+            BLOCK_SIZE=128,
+            _compile=True,
+        )
+    raise ValueError(f"pack_und_forward_inputs: attention_backend must be 'sdpa' or 'flex'; got {attention_backend!r}.")
+
+
 def pack_und_forward_inputs(
     model: Any,
     *,
@@ -450,11 +490,10 @@ def pack_und_forward_inputs(
     splits: List[Dict[str, Any]],
     response_input: torch.Tensor,
     device: torch.device,
+    attention_backend: str = "sdpa",
     vit_transform: Callable[[Any], Any] = lambda x: x,
 ) -> Dict[str, Any]:
-    """Train-mode packing: one und sample ``[*ordered splits | response_input]`` with a nested attention mask."""
-    from .vendor.data.data_utils import prepare_attention_mask_per_sample
-
+    """Pack one und sample and build either the baseline dense mask or Flex BlockMask."""
     text_ids: List[int] = []
     text_indexes: List[int] = []
     position_ids: List[int] = []
@@ -510,7 +549,14 @@ def pack_und_forward_inputs(
     ce_loss_indexes = list(range(resp_start, resp_start + int(response_input.shape[0])))
 
     seqlen = pos
-    nested_mask = prepare_attention_mask_per_sample(split_lens, attn_modes, device=device)
+    attention_mask = _build_und_attention_mask(
+        model,
+        sample_lens=[seqlen],
+        split_lens=split_lens,
+        attn_modes=attn_modes,
+        device=device,
+        attention_backend=attention_backend,
+    )
 
     return {
         "seqlen": seqlen,
@@ -518,7 +564,9 @@ def pack_und_forward_inputs(
         "packed_text_ids": torch.tensor(text_ids, dtype=torch.long, device=device),
         "packed_text_indexes": torch.tensor(text_indexes, dtype=torch.long, device=device),
         "packed_position_ids": torch.tensor(position_ids, dtype=torch.long, device=device),
-        "nested_attention_masks": [nested_mask],
+        # The vendored Navit attention dispatches List[Tensor] to SDPA and
+        # BlockMask to FlexAttention; retain the key for compatibility.
+        "nested_attention_masks": attention_mask,
         "packed_vit_tokens": (
             torch.cat(vit_tokens_parts, dim=0).to(device=device, dtype=model.dtype) if vit_tokens_parts else None
         ),
