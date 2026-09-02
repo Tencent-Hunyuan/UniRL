@@ -104,7 +104,9 @@ class FSDPConfig:
     root_wrap: bool = True
     checkpoint_format: str = "torch"
     checkpoint_async: bool = False
+    # Ulysses degree. When dynamic_sp is set, this is the ceiling and the per-microbatch degree is chosen at runtime.
     sp_size: int = 1
+    dynamic_sp: bool = False
     ep_size: int = 1
 
 
