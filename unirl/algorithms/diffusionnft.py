@@ -120,6 +120,14 @@ class DiffusionNFT(StageAlgorithm):
         training_progress: float,
         loss_scale: float,
     ) -> AlgorithmStepResult:
+        if segment is None:
+            raise ValueError(
+                "DiffusionNFT received no latent segment: the rollout returned "
+                "decoded media only. An engine that decides what to record from "
+                "the SDE schedule cannot recognise a forward-process rollout, "
+                "whose schedule is empty like an evaluation pass -- the recipe "
+                "has to ask for the trajectory explicitly."
+            )
         if segment.latents is None:
             raise ValueError(
                 "DiffusionNFT requires segment.latents (clean final latent at "
