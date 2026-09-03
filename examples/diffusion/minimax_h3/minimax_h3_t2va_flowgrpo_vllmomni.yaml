@@ -136,14 +136,10 @@ rollout:
     model_path: ${bundle.config.pretrained_model_ckpt_path}
     modality: minimax_h3_t2va
     enable_sleep_mode: true
-    # 2, not 4, and this is what lets height stay at #403's 256. The video VAE
-    # decodes in tiles spread over the sp ranks as range(rank, num_tiles, sp_size),
-    # and split_tiles returns one tile for any edge <= its 256 tile_size: 256x384
-    # is 1x2 tiles, so ranks 2 and 3 raise "Found empty tasks on sp rank". Needing
-    # num_tiles >= sp_size means tp 4 has no height-256 canvas under 768 wide.
-    # replica_size must equal tp_size, so this is four replicas of two.
-    replica_size: 2
-    tp_size: 2
+    # Both 4 because MiniMaxH3T2VAAdapter.validate requires it. That requirement is
+    # what forces sampling.height off #403's 256 — see the note there.
+    replica_size: 4
+    tp_size: 4
 
 # ENGINE: in-process there is nothing to ship, so #403 has no sync block at all.
 # adapter_name is deliberately absent: it falls back to backend.rollout_adapter_name,
@@ -206,7 +202,14 @@ sampling:
   # sde_indices omitted deliberately, which trains all 10 steps: replay builds one
   # autograd graph over them, ~2.2 GB per step here against ~12 GB at 768x768 where
   # ten exceed 100 GB/rank and OOM after a paid rollout.
-  height: 256
+  # ENGINE, and the one number that cannot match #403's 256. The video VAE decodes
+  # in tiles dealt to the sp ranks as range(rank, num_tiles, sp_size), and
+  # split_tiles returns a single tile for any edge <= its 256 tile_size — so 256x384
+  # is 1x2 tiles and ranks 2 and 3 die on "Found empty tasks on sp rank". num_tiles
+  # >= sp_size needs both edges over 256, and tp_size is pinned at 4 by the
+  # adapter's own validate(), so 288 is the smallest legal height. Trainside has no
+  # sequence parallelism and therefore no such floor.
+  height: 288
   width: 384
   # 17n+5 pixel frames map to 5n+2 latent, so the 5 s minimum makes 124 the
   # smallest legal count; frames cannot be traded for row budget.
