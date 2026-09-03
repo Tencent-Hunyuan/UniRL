@@ -83,12 +83,15 @@ class FastVideoEngineConfig(BaseEngineConfig):
     engine_kwargs: Optional[Dict[str, Any]] = dc_field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        from unirl.rollout.engine.fastvideo.adapters import registered_adapters
+
         if self.engine_kwargs is None:
             self.engine_kwargs = {}
         self.model_family = str(self.model_family or "").strip().lower()
         require(
-            self.model_family in {"wan2.1", "wan21"},
-            f"FastVideoEngineConfig.model_family currently supports only 'wan2.1'; got {self.model_family!r}",
+            self.model_family in registered_adapters(),
+            f"FastVideoEngineConfig.model_family={self.model_family!r} is not registered; "
+            f"available: {list(registered_adapters())}",
         )
         require(self.num_gpus >= 1, f"num_gpus must be >= 1; got {self.num_gpus!r}")
         require(
