@@ -678,9 +678,23 @@ class VLLMOmniBackend:
                 method="_diffrl_loaded_lora_checksums",
                 args=(int(adapter_id), list(names) if names else None, True),
                 stage_ids=[int(sid)],
-                unique_reply_rank=0,
             )
-            out[int(sid)] = results[0] if isinstance(results, list) and results else results
+            per_stage = results[0] if isinstance(results, list) and results else results
+            # The caller compares every TP rank's shard separately, so a reply
+            # that carries only aggregated status cannot verify anything. Stock
+            # vllm-omni routes worker RPCs through a status-collecting path that
+            # discards per-rank return values; distinguishing that here keeps the
+            # failure actionable instead of surfacing as "no loaded LoRA layers".
+            if not isinstance(per_stage, (list, tuple)) or not any(
+                isinstance(entry, dict) and entry for entry in per_stage
+            ):
+                raise RuntimeError(
+                    f"stage {int(sid)} returned no per-rank LoRA readback "
+                    f"(got {type(per_stage).__name__}). LoRA checksum verification needs an engine "
+                    "that forwards per-rank RPC replies (vllm-project/vllm-omni#6351); "
+                    "set sync.verify=false to run without it."
+                )
+            out[int(sid)] = per_stage
         return out
 
 
