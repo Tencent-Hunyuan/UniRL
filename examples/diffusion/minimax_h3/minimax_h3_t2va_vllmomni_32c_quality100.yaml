@@ -25,7 +25,7 @@ eval_sampling:
   num_inference_steps: 24
   height: 256
   width: 448
-  num_frames: 107
+  num_frames: 124
   sampler_kwargs:
     aspect_ratio: "16:9"
 
@@ -79,7 +79,10 @@ sampling:
   num_inference_steps: 24
   height: 256
   width: 448
-  num_frames: 107
+  # Shortest duration H3 supports: the VAE takes `17n + 5` pixel frames and
+  # 124/24fps = 5.17s clears the 5s floor, where 107 (4.46s) does not. The
+  # trainside recipes use the same count.
+  num_frames: 124
   eta: 0.8
   sde_indices: null
   scheduler:
