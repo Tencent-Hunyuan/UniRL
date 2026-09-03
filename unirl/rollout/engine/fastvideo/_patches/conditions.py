@@ -22,7 +22,7 @@ def _cpu_value(value: Any) -> Any:
     if is_dataclass(value) and not isinstance(value, type):
         result = copy(value)
         for field in fields(value):
-            setattr(result, field.name, _cpu_value(getattr(value, field.name)))
+            object.__setattr__(result, field.name, _cpu_value(getattr(value, field.name)))
         return result
     return value
 
@@ -51,7 +51,7 @@ class _ForwardResultPipe:
                 "negative_attention_mask", _cpu_value(getattr(output_batch, "negative_attention_mask", None))
             )
             self._owner.worker._unirl_last_forward_batch = None
-        self._connection.send(payload)
+        self._connection.send(_cpu_value(payload))
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._connection, name)

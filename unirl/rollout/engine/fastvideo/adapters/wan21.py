@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import os
 from copy import deepcopy
 from typing import Any, Dict, List, Optional
 
 import torch
 
 from unirl.config.require import require
+from unirl.rollout.engine.fastvideo._patches.unipc import FastVideoUniPCPlan
 from unirl.rollout.engine.fastvideo.adapters.base import FastVideoModelAdapter, register_adapter
 from unirl.rollout.engine.sigma_verify import verify_engine_used_sigmas
 from unirl.types.conditions import TextEmbedCondition
@@ -20,18 +22,37 @@ from unirl.types.segments.latent import make_video_segment
 class Wan21FastVideoAdapter(FastVideoModelAdapter):
     """Isolate every Wan schedule/shape/condition assumption from the engine."""
 
+    engine_name = "fastvideo/wan2.1"
+
     def validate(self) -> None:
         super().validate()
         require(hasattr(self.model_config, "shift"), "Wan2.1 FastVideo adapter requires model_config.shift")
+        strategy_name = str(getattr(self.strategy, "canonical_name", "")).strip().lower()
+        require(
+            strategy_name in {"flow", "dance"},
+            f"Wan2.1 FastVideo adapter requires a Flow or Dance SDE strategy; got {strategy_name!r}",
+        )
+        require(
+            os.getenv("FASTVIDEO_WAN_SCHEDULER", "unipc").strip().lower() == "unipc",
+            "Wan2.1 FastVideo rollout requires FASTVIDEO_WAN_SCHEDULER=unipc",
+        )
 
     def align_runtime_args(self, fastvideo_args: Any) -> None:
         target_shift = float(self.model_config.shift)
         pipeline_config = fastvideo_args.pipeline_config
         pipeline_config.flow_shift = target_shift
-        # Consumed by the request-local transformer wrapper in patch_denoising.
-        fastvideo_args._unirl_timestep_dtype = "long"
+        fastvideo_args._unirl_timestep_dtype = None
         fastvideo_args._unirl_cfg_combine_dtype = "float32"
         fastvideo_args._unirl_custom_sigmas_dtype = "float32"
+
+    @staticmethod
+    def _resolve_sde_indices(raw_indices: Any, num_steps: int) -> List[int]:
+        if raw_indices is None:
+            return list(range(int(num_steps)))
+        selected = sorted({int(index) for index in raw_indices})
+        invalid = [index for index in selected if index < 0 or index >= int(num_steps)]
+        require(not invalid, f"FastVideo SDE indices out of range for num_steps={num_steps}: {invalid}")
+        return selected
 
     def build_forward_batch(
         self,
@@ -57,25 +78,24 @@ class Wan21FastVideoAdapter(FastVideoModelAdapter):
         sampling.num_videos_per_prompt = 1
         sampling.save_video = False
         sampling.return_frames = False
-        sampling.return_trajectory_latents = True
+        # RLData already keeps the trajectory on CPU; avoid a second GPU copy.
+        sampling.return_trajectory_latents = False
         sampling.return_trajectory_decoded = False
 
-        # FastVideo's scheduler re-applies flow_shift to custom sigmas. Supply
-        # the Wan FlowMatch inverse so the actual worker schedule equals the
-        # already-shifted UniRL schedule; verify_engine_used_sigmas checks the
-        # round trip on every result.
-        flow_shift = float(fastvideo_args.pipeline_config.flow_shift)
-        schedule = sigmas.detach().cpu().double()
-        denominator = flow_shift - schedule * (flow_shift - 1.0)
-        require(bool(torch.all(denominator != 0)), "Wan2.1 FastVideo sigma pre-image has a zero denominator")
-        preimage = schedule / denominator
-        # Keep the public ForwardBatch contract as a list. The Wan-scoped
-        # timestep patch converts it after FastVideo input validation and
-        # immediately before the upstream scheduler call.
-        sampling.sigmas = preimage.tolist()[:-1]
+        # The scheduler patch consumes UniRL's already-shifted schedule verbatim.
+        schedule = sigmas.detach().cpu().to(torch.float32)
+        require(schedule.ndim == 1 and schedule.numel() >= 2, "FastVideo requires a T+1 sigma schedule")
+        require(float(schedule[-1]) == 0.0, "FastVideo canonical sigma schedule must end at zero")
+        sampling.sigmas = schedule.tolist()[:-1]
 
-        raw_indices = getattr(params, "sde_indices", None)
-        sde_indices = [int(index) for index in raw_indices] if raw_indices else None
+        sde_indices = self._resolve_sde_indices(
+            getattr(params, "sde_indices", None),
+            int(params.num_inference_steps),
+        )
+        step_plan = FastVideoUniPCPlan(
+            sde_type=str(self.strategy.canonical_name),
+            sde_indices=tuple(sde_indices),
+        )
         latent_frames = (sampling.num_frames - 1) // 4 + 1
         n_tokens = latent_frames * (sampling.height // 8) * (sampling.width // 8)
         sampling_dict = shallow_asdict(deepcopy(sampling))
@@ -90,8 +110,10 @@ class Wan21FastVideoAdapter(FastVideoModelAdapter):
                 collect_log_probs=bool(self.cfg.native_logprob),
                 store_trajectory=True,
                 keep_trajectory_on_cpu=True,
-                sde_step_indices=sde_indices,
-                sde_type=str(getattr(self.strategy, "canonical_name", "flow")),
+                # Invoke FastVideo's helper on every transition. The plan sends
+                # selected steps to SDE and the remainder to canonical UniPC.
+                sde_step_indices=None,
+                sde_type=step_plan,
             ),
         )
 
@@ -182,19 +204,17 @@ class Wan21FastVideoAdapter(FastVideoModelAdapter):
             actual = sample["actual_timesteps"]
             if torch.is_tensor(actual) and actual.numel() + 1 == expected_sigmas.numel():
                 actual = torch.cat([actual.reshape(-1), actual.new_zeros(1)])
-            verify_engine_used_sigmas(actual, expected=expected_sigmas, engine_name="fastvideo/wan2.1")
+            verify_engine_used_sigmas(actual, expected=expected_sigmas, engine_name=self.engine_name)
 
         trajectory = torch.cat([sample["trajectory"] for sample in samples], dim=0)
         decoded = torch.cat([sample["decoded"] for sample in samples], dim=0)
         transitions = int(trajectory.shape[1]) - 1
-        sde_steps = sorted(int(index) for index in (getattr(params, "sde_indices", None) or []))
-        if not sde_steps:
-            sde_steps = list(range(transitions))
-        sde_indices = torch.tensor(sde_steps, dtype=torch.long)
+        sde_steps = self._resolve_sde_indices(getattr(params, "sde_indices", None), transitions)
+        sde_indices = torch.tensor(sde_steps, dtype=torch.long) if sde_steps else None
 
         log_prob_parts = [sample["log_probs"] for sample in samples]
         sde_logp = None
-        if all(torch.is_tensor(part) for part in log_prob_parts):
+        if sde_steps and all(torch.is_tensor(part) for part in log_prob_parts):
             log_probs = torch.cat(log_prob_parts, dim=0)
             if log_probs.shape[1] == transitions and len(sde_steps) < transitions:
                 log_probs = log_probs[:, sde_steps]

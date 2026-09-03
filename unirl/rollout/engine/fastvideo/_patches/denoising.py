@@ -19,6 +19,7 @@ class _TransitionContext:
     collect_kl: bool
     timestep_dtype: str | None
     generator: Any
+    unipc_plan: Any = None
 
 
 _CONTEXT: ContextVar[_TransitionContext | None] = ContextVar("unirl_fastvideo_transition", default=None)
@@ -133,12 +134,22 @@ def patch_denoising() -> None:
 
     @wraps(original_forward)
     def forward(self, batch, fastvideo_args):
+        if bool(getattr(fastvideo_args, "dit_cpu_offload", False)) and torch.cuda.is_available():
+            torch.cuda.empty_cache()
         rl_data = batch.rl_data if batch.rl_data is not None and batch.rl_data.enabled else None
         if rl_data is None:
             return original_forward(self, batch, fastvideo_args)
 
+        from unirl.rollout.engine.fastvideo._patches.unipc import (
+            _PLAN_CONTEXT,
+            FastVideoUniPCPlan,
+        )
+
         raw_indices = getattr(rl_data, "sde_step_indices", None)
         indices = None if raw_indices is None else frozenset(int(index) for index in raw_indices)
+        raw_sde_type = getattr(rl_data, "sde_type", "dance")
+        unipc_plan = raw_sde_type if isinstance(raw_sde_type, FastVideoUniPCPlan) else None
+        resolved_sde_type = unipc_plan.sde_type if unipc_plan is not None else str(raw_sde_type)
         collect_log_probs = bool(rl_data.collect_log_probs)
         guidance_scale = batch.guidance_scale
         guidance_scale_2 = getattr(batch, "guidance_scale_2", None)
@@ -153,13 +164,15 @@ def patch_denoising() -> None:
         token = _CONTEXT.set(
             _TransitionContext(
                 eta=float(batch.eta),
-                sde_type=str(getattr(rl_data, "sde_type", "dance")),
+                sde_type=resolved_sde_type,
                 sde_step_indices=indices,
                 collect_kl=bool(getattr(rl_data, "collect_kl", False)),
                 timestep_dtype=getattr(fastvideo_args, "_unirl_timestep_dtype", None),
                 generator=batch.generator,
+                unipc_plan=unipc_plan,
             )
         )
+        plan_token = _PLAN_CONTEXT.set(unipc_plan)
         try:
             result = original_forward(self, batch, fastvideo_args)
             if not collect_log_probs and result.rl_data is not None:
@@ -170,6 +183,7 @@ def patch_denoising() -> None:
             batch.guidance_scale = guidance_scale
             if guidance_scale_2 is not None:
                 batch.guidance_scale_2 = guidance_scale_2
+            _PLAN_CONTEXT.reset(plan_token)
             _CONTEXT.reset(token)
 
     setattr(forward, "_unirl_fastvideo_denoising", True)

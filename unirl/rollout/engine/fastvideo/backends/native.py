@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+import gc
+import os
+import time
 from typing import Any, Callable, Dict
+
+import torch
 
 
 def _import_fastvideo_runtime() -> Dict[str, Any]:
@@ -78,6 +83,14 @@ class FastVideoBackend:
         if self._generator is not None:
             self._generator.shutdown()
             self._generator = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+            grace_s = float(os.getenv("UNIRL_FASTVIDEO_CUDA_RELEASE_GRACE_S", "30"))
+            if grace_s < 0:
+                raise ValueError("UNIRL_FASTVIDEO_CUDA_RELEASE_GRACE_S must be non-negative")
+            time.sleep(grace_s)
 
     def wake(self, *, reserve_port: Callable[[], int], max_port_attempts: int = 5) -> None:
         if self._generator is not None:

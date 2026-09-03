@@ -23,6 +23,7 @@ def _load_patch_module(name: str):
 
 _conditions = _load_patch_module("conditions")
 _denoising = _load_patch_module("denoising")
+_weights = _load_patch_module("weights")
 _ForwardResultPipe = _conditions._ForwardResultPipe
 _CONTEXT = _denoising._CONTEXT
 _TransitionContext = _denoising._TransitionContext
@@ -214,6 +215,35 @@ def test_timestep_patch_scopes_numpy_sigmas_to_forward_call() -> None:
             sys.modules.pop(module_name, None)
         else:
             sys.modules[module_name] = previous
+
+
+def test_dual_transformer_weight_update_routes_both_experts() -> None:
+    high_noise = torch.nn.Linear(2, 2)
+    low_noise = torch.nn.Linear(2, 2)
+    worker = types.SimpleNamespace(
+        pipeline=types.SimpleNamespace(
+            modules={
+                "transformer": high_noise,
+                "transformer_2": low_noise,
+            }
+        ),
+        device=torch.device("cpu"),
+    )
+    state_dict = {
+        "high_noise.weight": torch.full_like(high_noise.weight, 1.0),
+        "high_noise.bias": torch.full_like(high_noise.bias, 2.0),
+        "low_noise.weight": torch.full_like(low_noise.weight, 3.0),
+        "low_noise.bias": torch.full_like(low_noise.bias, 4.0),
+    }
+
+    result = _weights._worker_update_transformer_weights(worker, state_dict)
+
+    assert result["status"] == "transformer_weights_updated"
+    assert len(result["modules"]) == 2
+    assert torch.equal(high_noise.weight, state_dict["high_noise.weight"])
+    assert torch.equal(high_noise.bias, state_dict["high_noise.bias"])
+    assert torch.equal(low_noise.weight, state_dict["low_noise.weight"])
+    assert torch.equal(low_noise.bias, state_dict["low_noise.bias"])
 
 
 def test_multiproc_executor_retries_address_collision() -> None:

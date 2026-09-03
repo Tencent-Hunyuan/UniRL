@@ -29,7 +29,9 @@ class FastVideoHijack:
             from unirl.rollout.engine.fastvideo._patches.contracts import patch_contracts
             from unirl.rollout.engine.fastvideo._patches.denoising import patch_denoising
             from unirl.rollout.engine.fastvideo._patches.multiproc import patch_multiproc
+            from unirl.rollout.engine.fastvideo._patches.offload import patch_offload
             from unirl.rollout.engine.fastvideo._patches.timesteps import patch_timesteps
+            from unirl.rollout.engine.fastvideo._patches.unipc import patch_unipc
             from unirl.rollout.engine.fastvideo._patches.weights import patch_weights
 
             # Contract first: later patches and worker serialization refer to
@@ -38,7 +40,9 @@ class FastVideoHijack:
             patch_contracts()
             patch_timesteps()
             patch_denoising()
+            patch_unipc()
             patch_conditions()
+            patch_offload()
             patch_weights()
             patch_multiproc()
 

@@ -7,10 +7,13 @@ from .runtime import (
     ensure_req_sigmas,
     get_sigma_schedule,
 )
+from .unipc import UniPCSpec, UniPCStrategy
 
 __all__ = [
     "StepStrategy",
     "DPM2Strategy",
+    "UniPCStrategy",
+    "UniPCSpec",
     "FlowMatchSchedulePolicy",
     "ensure_req_sigmas",
     "get_sigma_schedule",

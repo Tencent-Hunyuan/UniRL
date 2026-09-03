@@ -1,0 +1,62 @@
+# @package _global_
+# WAN 2.2 A14B DanceGRPO with a dedicated FastVideo rollout engine.
+
+defaults:
+  - wan22_t2v_14b_dancegrpo
+  - _self_
+
+weight_sync_interval: 1
+
+model_config:
+  _target_: unirl.models.wan22.config.WAN22PipelineConfig
+  pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,Wan-AI/Wan2.2-T2V-A14B-Diffusers}
+  model_precision: bf16
+  shift: 5.0
+  max_sequence_length: 512
+  boundary_ratio: 0.875
+  num_train_timesteps: 1000
+  # FastVideo owns decoding for a separate rollout, so avoid a second VAE.
+  load_vae: false
+
+strategy:
+  _target_: unirl.sde.kernels.DanceSDEStrategy
+
+bundle:
+  config: ${model_config}
+
+pipeline:
+  strategy: ${strategy}
+
+rollout:
+  _target_: unirl.rollout.engine.fastvideo.engine.FastVideoRolloutEngine
+  config:
+    _target_: unirl.rollout.engine.fastvideo.config.FastVideoEngineConfig
+    model_family: wan2.2
+    native_logprob: false
+    init_same_noise: ${sampling.init_same_noise}
+    num_gpus: 1
+    tp_size: 1
+    sp_size: 1
+    local_mode: true
+    forward_batch_size: 1
+    fastvideo_path: ${oc.env:FASTVIDEO_PATH,null}
+    engine_kwargs:
+      # Keep both experts on CPU and prefetch only active layers onto the H20.
+      dit_layerwise_offload: true
+      text_encoder_cpu_offload: true
+      vae_cpu_offload: true
+  model_config: ${model_config}
+  strategy: ${strategy}
+
+algorithm:
+  old_logp_source: replay
+
+sync:
+  _target_: unirl.distributed.weight_sync.full.checkpoint.CheckpointWeightSync
+  lora_merged: true
+  sync_dir: ${oc.env:WEIGHT_SYNC_DIR,/tmp/unirl_fastvideo_weight_sync_wan22}
+  flush_cache: true
+
+logging:
+  run_name: ${oc.env:WANDB_RUN_NAME,wan22_t2v_14b_dancegrpo_fastvideo}
+  tags: ["wan22", "t2v", "dancegrpo", "grpo", "video", "pickscore", "fastvideo", "dual-transformer", "v2"]

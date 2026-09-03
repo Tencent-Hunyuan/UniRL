@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
+from typing import Any
 
 
 def patch_contracts() -> None:
@@ -26,7 +27,7 @@ def patch_contracts() -> None:
         """Stock FastVideo RLData plus UniRL's resolved transition contract."""
 
         sde_step_indices: list[int] | None = None
-        sde_type: str = "dance"
+        sde_type: Any = "dance"
 
     UniRLFastVideoRLData.__name__ = "RLData"
     UniRLFastVideoRLData.__qualname__ = "ForwardBatch.RLData"

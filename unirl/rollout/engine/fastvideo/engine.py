@@ -16,7 +16,7 @@ Validated scope:
   * x_T SSOT: FastVideo currently regenerates its own initial noise from
     ``sp.seed`` rather than consuming the driver's NoiseRecipe x_T; wiring the
     shared x_T into FastVideo byte-for-byte is a follow-up.
-  * Local-mode colocate, single model_family (wan2.1) only for now.
+  * Local-mode colocate for Wan2.1 and Wan2.2 A14B T2V.
 """
 
 from __future__ import annotations
@@ -58,10 +58,21 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         rank: Optional[int] = None,
         model_config: Optional[Any] = None,
         ports: Optional[FastVideoPorts] = None,
+        stage_attrs: Optional[List[str]] = None,
+        forward_batch_size: Optional[int] = None,
     ) -> None:
         require(
             isinstance(config, FastVideoEngineConfig),
             f"FastVideoRolloutEngine requires FastVideoEngineConfig; got {type(config).__name__}",
+        )
+        # Derived trainside recipes may retain these rollout-shell fields.
+        require(
+            stage_attrs is None or stage_attrs == ["diffusion"],
+            f"FastVideoRolloutEngine only accepts the inherited diffusion stage; got {stage_attrs!r}",
+        )
+        require(
+            forward_batch_size is None or int(forward_batch_size) == int(config.forward_batch_size),
+            "Inherited rollout.forward_batch_size must match rollout.config.forward_batch_size",
         )
         require(
             model_config is not None and bool(model_config.pretrained_model_ckpt_path),
@@ -96,9 +107,6 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
             self._ports.master_port,
         )
 
-    # ------------------------------------------------------------------ #
-    # FastVideo import + VideoGenerator boot (ported from DiffusionRL)
-    # ------------------------------------------------------------------ #
     def _ensure_fastvideo_importable(self) -> None:
         try:
             importlib.import_module("fastvideo")
@@ -139,9 +147,6 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         self._ports = FastVideoPorts.reserve()
         return int(self._ports.master_port)
 
-    # ------------------------------------------------------------------ #
-    # Generation
-    # ------------------------------------------------------------------ #
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
     def generate(self, req: RolloutReq) -> RolloutResp:
         require(
@@ -220,9 +225,6 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
                 torch.cuda.empty_cache()
         return outputs
 
-    # ------------------------------------------------------------------ #
-    # Lifecycle
-    # ------------------------------------------------------------------ #
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def sleep(self) -> None:
         if self._is_offloaded:
@@ -240,16 +242,22 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
             return
         require(self._backend is not None, "FastVideo backend is not initialized")
         self._backend.wake(reserve_port=self._reserve_master_port)
-        self._is_offloaded = False
         # ``from_fastvideo_args`` reloads the PRETRAINED transformer from
         # ``model_path``; without this the engine would sample under pretrained
         # weights on every wake that isn't immediately followed by a weight sync
         # (i.e. any ``weight_sync_interval > 1`` step). Re-apply the last synced
         # checkpoint so wake is weight-preserving, matching the other engines'
         # sleep/wake contract (sglang resume_memory keeps weights resident).
-        if self._last_weights_path is not None:
-            self._backend.update_weights_from_path(self._last_weights_path)
-            logger.info("fastvideo wake_up: re-applied synced weights from %s", self._last_weights_path)
+        try:
+            if self._last_weights_path is not None:
+                self._backend.update_weights_from_path(self._last_weights_path)
+                logger.info("fastvideo wake_up: re-applied synced weights from %s", self._last_weights_path)
+        except Exception:
+            # Never expose a rebuilt backend that still holds pretrained weights.
+            self._backend.sleep()
+            self._is_offloaded = True
+            raise
+        self._is_offloaded = False
 
     @property
     def is_offloaded(self) -> bool:
@@ -264,10 +272,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
             self._backend.shutdown()
             self._backend = None
 
-    # ------------------------------------------------------------------ #
-    # Weight sync — checkpoint_path (full-param hot-swap). Reached per worker
-    # via the local sibling call from CheckpointWeightSync (not @distributed).
-    # ------------------------------------------------------------------ #
+    # Called locally by CheckpointWeightSync; intentionally not distributed.
     def update_weights_from_path(self, checkpoint_path: str, *, track_prefix: str = "") -> None:
         del track_prefix
         require(bool(checkpoint_path), "update_weights_from_path requires a non-empty path")

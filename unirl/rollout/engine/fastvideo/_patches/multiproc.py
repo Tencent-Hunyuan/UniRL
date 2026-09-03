@@ -6,6 +6,7 @@ import contextlib
 import faulthandler
 import logging
 import signal
+from functools import wraps
 from typing import Any, Callable
 
 _MAX_PORT_ATTEMPTS = 5
@@ -112,6 +113,23 @@ def patch_multiproc() -> None:
     if not getattr(current_init, "_unirl_fastvideo_port_retry", False):
         _ORIGINAL_INIT_EXECUTOR = current_init
         MultiprocExecutor._init_executor = _patched_init_executor
+
+    current_shutdown = MultiprocExecutor.shutdown
+    if not getattr(current_shutdown, "_unirl_fastvideo_join", False):
+
+        @wraps(current_shutdown)
+        def shutdown(self):
+            processes = [worker.proc for worker in list(getattr(self, "workers", ()))]
+            result = current_shutdown(self)
+            for process in processes:
+                process.join(timeout=30.0)
+                if process.is_alive():
+                    process.kill()
+                    process.join(timeout=5.0)
+            return result
+
+        setattr(shutdown, "_unirl_fastvideo_join", True)
+        MultiprocExecutor.shutdown = shutdown
 
 
 __all__ = ["patch_multiproc"]

@@ -82,6 +82,7 @@ def verify_fastvideo_compatibility() -> None:
     )
 
     from fastvideo.entrypoints.video_generator import VideoGenerator
+    from fastvideo.models.schedulers.scheduling_flow_unipc_multistep import FlowUniPCMultistepScheduler
     from fastvideo.pipelines.pipeline_batch_info import ForwardBatch
     from fastvideo.pipelines.stages import denoising
     from fastvideo.worker.multiproc_executor import MultiprocExecutor, WorkerMultiprocProc
@@ -94,6 +95,11 @@ def verify_fastvideo_compatibility() -> None:
         f"incompatible FastVideo RLData fields: {sorted(rl_fields)}",
     )
 
+    _require_parameters(
+        FlowUniPCMultistepScheduler.set_timesteps,
+        symbol="FlowUniPCMultistepScheduler.set_timesteps",
+        names={"self", "num_inference_steps", "device", "sigmas"},
+    )
     _require_parameters(
         denoising.sde_step_with_logprob,
         symbol="denoising.sde_step_with_logprob",
@@ -133,6 +139,7 @@ def verify_fastvideo_capabilities() -> None:
     """Assert every correctness-critical UniRL capability is installed."""
 
     from fastvideo.entrypoints.video_generator import VideoGenerator
+    from fastvideo.models.schedulers.scheduling_flow_unipc_multistep import FlowUniPCMultistepScheduler
     from fastvideo.pipelines.pipeline_batch_info import ForwardBatch
     from fastvideo.pipelines.stages import denoising
     from fastvideo.pipelines.stages.timestep_preparation import TimestepPreparationStage
@@ -142,6 +149,14 @@ def verify_fastvideo_capabilities() -> None:
     _require(
         {"sde_step_indices", "sde_type"} <= rl_fields,
         f"FastVideo RLData patch incomplete: fields are {sorted(rl_fields)}",
+    )
+    _require(
+        bool(getattr(FlowUniPCMultistepScheduler.set_timesteps, "_unirl_canonical_sigmas", False)),
+        "FastVideo canonical sigma schedule patch was not installed",
+    )
+    _require(
+        bool(getattr(denoising.sde_step_with_logprob, "_unirl_unipc_dispatch", False)),
+        "FastVideo canonical UniPC dispatch patch was not installed",
     )
     _require(
         bool(getattr(denoising.sde_step_with_logprob, "_unirl_fastvideo_sde", False)),
