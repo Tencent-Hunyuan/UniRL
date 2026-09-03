@@ -126,7 +126,7 @@ backend:
       - ff.net.0.proj
       - ff.net.2
 
-# ENGINE: two four-rank replicas, sleeping between rollouts so the trainer gets
+# ENGINE: four two-rank replicas, sleeping between rollouts so the trainer gets
 # the memory back.
 rollout:
   _target_: unirl.rollout.engine.vllm_omni.engine.VLLMOmniRolloutEngine
@@ -136,8 +136,14 @@ rollout:
     model_path: ${bundle.config.pretrained_model_ckpt_path}
     modality: minimax_h3_t2va
     enable_sleep_mode: true
-    replica_size: 4
-    tp_size: 4
+    # 2, not 4, and this is what lets height stay at #403's 256. The video VAE
+    # decodes in tiles spread over the sp ranks as range(rank, num_tiles, sp_size),
+    # and split_tiles returns one tile for any edge <= its 256 tile_size: 256x384
+    # is 1x2 tiles, so ranks 2 and 3 raise "Found empty tasks on sp rank". Needing
+    # num_tiles >= sp_size means tp 4 has no height-256 canvas under 768 wide.
+    # replica_size must equal tp_size, so this is four replicas of two.
+    replica_size: 2
+    tp_size: 2
 
 # ENGINE: in-process there is nothing to ship, so #403 has no sync block at all.
 # adapter_name is deliberately absent: it falls back to backend.rollout_adapter_name,
