@@ -50,6 +50,7 @@ class ImageBindRewardScorer(LocalRewardBackend):
     def __init__(self, *, config: "ImageBindSpec", base_device: str) -> None:
         self._mode = str(config.mode or self.DEFAULT_MODE)
         self._weights = dict(config.weights or {"audio_video": 0.5, "text_audio": 0.25, "text_video": 0.25})
+        self._model_path = str(config.model_path).strip() if config.model_path else None
         super().__init__(
             device=resolve_device(config.device, base_device),
             batch_size=config.batch_size,
@@ -62,7 +63,13 @@ class ImageBindRewardScorer(LocalRewardBackend):
         except ImportError as e:
             raise ImportError(_IMAGEBIND_INSTALL_MSG) from e
 
-        self.model = imagebind_model.imagebind_huge(pretrained=True).to(self.device).eval()
+        if self._model_path:
+            checkpoint = torch.load(self._model_path, map_location="cpu", weights_only=True)
+            self.model = imagebind_model.imagebind_huge(pretrained=False)
+            self.model.load_state_dict(checkpoint)
+        else:
+            self.model = imagebind_model.imagebind_huge(pretrained=True)
+        self.model = self.model.to(self.device).eval()
 
     def _preprocess_audio_to_melspec(self, audio_list: List[torch.Tensor], src_sample_rate: int) -> torch.Tensor:
         import torch.nn.functional as Fn
@@ -241,5 +248,6 @@ class ImageBindSpec(BaseRewardComponentSpec):
 
     batch_size: int = 8
     device: str = "auto"
+    model_path: Optional[str] = None
     mode: str = "audio_video"
     weights: Optional[Dict[str, float]] = field(default=None)

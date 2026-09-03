@@ -1,0 +1,47 @@
+# @package _global_
+# Target 32-GPU collocate geometry:
+#   8 root prompts x 8 samples = 64 rows
+#   rollout DP8 x 4 GPUs, resident reward DP32 (2 rows/rank),
+#   trainer world32 (2 rows/rank, micro_batch_size=1).
+# This is the two-step/one-transition gate recipe; the long-run recipe can
+# raise num_inference_steps and sde_indices only after lifecycle gates pass.
+
+defaults:
+  - minimax_h3_t2va_vllmomni_2x4_timeshare
+  - _self_
+
+num_devices: 32
+batch_size: 8
+num_rollouts: 2
+
+bundle:
+  config:
+    use_lora: true
+
+sync:
+  _target_: unirl.distributed.weight_sync.lora.LocalLoraWeightSync
+  param_prefix: "transformer."
+  adapter_name: default
+  # The H3 engine has four sequence-parallel subprocesses per controller.
+  copy: true
+  verify: false
+
+logging:
+  report_to_wandb: true
+  log_media: true
+  media_max_items: 2
+
+reward:
+  backend:
+    config:
+      batch_size: 2
+
+stack:
+  micro_batch_size: 1
+  num_updates_per_batch: 1
+
+sampling:
+  num_inference_steps: 2
+  # One replay transition for the first 8x8 memory/backward gate.
+  sde_indices: [0]
+  samples_per_prompt: 8

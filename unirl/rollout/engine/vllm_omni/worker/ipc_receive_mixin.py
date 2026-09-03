@@ -17,6 +17,10 @@ from unirl.distributed.weight_sync.transfer.ipc_dispatch import (
     replica_rank_from_env,
     zmq_handle,
 )
+from unirl.distributed.weight_sync.transfer.minimax_h3_lora import (
+    remap_minimax_h3_lora,
+    validate_minimax_h3_lora_coverage,
+)
 from unirl.rollout.engine.vllm_omni.patches.runtime import (
     OmniTensorLoRARequest,
     VLLMOmniHijack,
@@ -200,18 +204,86 @@ class BucketedIPCReceiveMixin:
         lora_path: str,
         peft_config: dict,
         lora_tensors_serialized: str,
+        ready_token: Optional[str] = None,
     ) -> bool:
         """Byte-copy variant of :meth:`set_lora_from_tensor_dict` for HI3."""
         import base64
         import io
 
+        rank = int(getattr(self, "rank", getattr(self, "local_rank", 0)))
+        logger.debug(
+            "[LoRA-COPY] rank=%d payload_chars=%d decode_begin",
+            rank,
+            len(lora_tensors_serialized),
+        )
         raw = base64.b64decode(lora_tensors_serialized)
+        logger.debug("[LoRA-COPY] rank=%d payload_bytes=%d torch_load_begin", rank, len(raw))
         lora_tensors = torch.load(io.BytesIO(raw), map_location="cpu")
+        logger.debug("[LoRA-COPY] rank=%d tensors=%d torch_load_complete", rank, len(lora_tensors))
+        return self._diffrl_install_lora_tensors(
+            lora_name,
+            lora_int_id,
+            lora_path,
+            peft_config,
+            lora_tensors,
+            ready_token=ready_token,
+        )
+
+    def set_lora_from_tensor_file(
+        self,
+        lora_name: str,
+        lora_int_id: int,
+        lora_path: str,
+        peft_config: dict,
+        payload_path: str,
+        ready_token: Optional[str] = None,
+    ) -> bool:
+        """Load a large adapter from a controller-written local payload file."""
+        rank = int(getattr(self, "rank", getattr(self, "local_rank", 0)))
+        logger.debug("[LoRA-FILE] rank=%d torch_load_begin path=%s", rank, payload_path)
+        lora_tensors = torch.load(payload_path, map_location="cpu")
+        logger.debug("[LoRA-FILE] rank=%d tensors=%d torch_load_complete", rank, len(lora_tensors))
+        return self._diffrl_install_lora_tensors(
+            lora_name,
+            lora_int_id,
+            lora_path,
+            peft_config,
+            lora_tensors,
+            ready_token=ready_token,
+        )
+
+    def _diffrl_install_lora_tensors(
+        self,
+        lora_name: str,
+        lora_int_id: int,
+        lora_path: str,
+        peft_config: dict,
+        lora_tensors,
+        *,
+        ready_token: Optional[str],
+    ) -> bool:
+        rank = int(getattr(self, "rank", getattr(self, "local_rank", 0)))
         if not isinstance(lora_tensors, dict):
             raise TypeError(
-                f"{type(self).__name__}.set_lora_from_tensor_dict_copy: "
-                f"deserialised lora_tensors expected dict, got "
-                f"{type(lora_tensors).__name__}"
+                f"{type(self).__name__}: deserialised lora_tensors expected dict, got {type(lora_tensors).__name__}"
+            )
+        peft_config = dict(peft_config or {})
+        pipeline = getattr(getattr(self, "model_runner", None), "pipeline", None)
+        transformer = getattr(pipeline, "transformer", None)
+        if (
+            transformer is not None
+            and hasattr(transformer, "blocks")
+            and not hasattr(transformer, "transformer_blocks")
+        ):
+            lora_tensors, peft_config, renamed = remap_minimax_h3_lora(lora_tensors, peft_config)
+            validate_minimax_h3_lora_coverage(
+                lora_tensors,
+                block_count=len(transformer.blocks),
+            )
+            logger.info(
+                "[LoRA-REMAP] rank=%d trainer=transformer_blocks rollout=blocks renamed=%d",
+                rank,
+                renamed,
             )
         from unirl.rollout.engine.vllm_omni.patches.runtime import (
             OmniTensorLoRARequest,
@@ -221,10 +293,27 @@ class BucketedIPCReceiveMixin:
             lora_name=str(lora_name),
             lora_int_id=int(lora_int_id),
             lora_path=str(lora_path),
-            peft_config=dict(peft_config or {}),
+            peft_config=peft_config,
             lora_tensors=lora_tensors,
         )
-        return self.add_lora(request)
+        # Keep replacement and installation in the same worker RPC. The
+        # controller intentionally does not run a separate all-rank remove,
+        # which would reintroduce a status collective around dynamic wrapping.
+        self.remove_lora(int(lora_int_id))
+        logger.debug("[LoRA-INSTALL] rank=%d add_lora_begin", rank)
+        added = bool(self.add_lora(request))
+        logger.debug("[LoRA-INSTALL] rank=%d add_lora_complete added=%s", rank, added)
+        if not added:
+            raise RuntimeError(f"failed to install LoRA adapter {lora_int_id} on rank {getattr(self, 'rank', '?')}")
+        wrapped = len(getattr(getattr(self, "lora_manager", None), "_lora_modules", {}))
+        if wrapped <= 0:
+            raise RuntimeError(f"LoRA adapter {lora_int_id} wrapped zero rollout layers on rank {rank}")
+        logger.info("[LoRA-INSTALL] rank=%d wrapped_layers=%d", rank, wrapped)
+        if ready_token:
+            marker = f"/tmp/diffrl_lora_ready_{ready_token}_{rank}"
+            with open(marker, "w", encoding="utf-8") as handle:
+                handle.write("ready\n")
+        return True
 
     def _diffrl_describe_params(
         self,
@@ -322,18 +411,19 @@ class BucketedIPCReceiveMixin:
         self,
         adapter_id: int,
         names: Optional[list] = None,
-    ) -> dict:
+        gather_all_ranks: bool = False,
+    ) -> object:
         """Full-byte SHA-256 of the worker's loaded LoRA adapter tensors."""
         from unirl.distributed.weight_sync.transfer.checksum import (
             fingerprint_tensor,
         )
 
-        manager = getattr(self, "lora_manager", None) or getattr(
+        manager_owner = getattr(self, "lora_manager", None) or getattr(
             getattr(self, "model_runner", None), "lora_manager", None
         )
-        if manager is None:
+        if manager_owner is None:
             return {}
-        manager = getattr(manager, "_adapter_manager", manager)
+        manager = getattr(manager_owner, "_adapter_manager", manager_owner)
         registered = getattr(manager, "_registered_adapters", None)
         if registered is None:
             return {}
@@ -355,7 +445,94 @@ class BucketedIPCReceiveMixin:
                         if isinstance(sub, torch.Tensor):
                             per_field[f"{field}.{i}"] = fingerprint_tensor(sub)
             out[layer_name] = per_field
+
+        # Also fingerprint the active GPU buffers that Punica reads during
+        # forward. Registered LoRAModel tensors can be correct while packed
+        # physical layers are reset, mis-sliced, or bound to the wrong logical
+        # submodule.
+        lora_modules = getattr(manager, "_lora_modules", None) or getattr(manager_owner, "_lora_modules", {})
+        packed_sublayers = getattr(manager, "_get_packed_sublayer_suffixes", None)
+        get_lora_weights = getattr(manager, "_get_lora_weights", None)
+        active_adapter_id = getattr(manager, "_active_adapter_id", None)
+        if active_adapter_id is not None and int(active_adapter_id) == int(adapter_id) and callable(get_lora_weights):
+            for physical_name, physical_layer in lora_modules.items():
+                a_stacked = getattr(physical_layer, "lora_a_stacked", ())
+                b_stacked = getattr(physical_layer, "lora_b_stacked", ())
+                n_slices = int(getattr(physical_layer, "n_slices", len(a_stacked)))
+                if not isinstance(a_stacked, (list, tuple)) or not isinstance(b_stacked, (list, tuple)):
+                    continue
+                if len(a_stacked) != n_slices or len(b_stacked) != n_slices:
+                    continue
+                prefix, _, packed_suffix = str(physical_name).rpartition(".")
+                sub_suffixes = (
+                    packed_sublayers(packed_suffix, n_slices) if n_slices > 1 and callable(packed_sublayers) else None
+                )
+                logical_names = (
+                    [f"{prefix}.{suffix}" if prefix else suffix for suffix in sub_suffixes]
+                    if sub_suffixes
+                    else [str(physical_name)]
+                )
+                if len(logical_names) != n_slices:
+                    continue
+
+                expected_layers = [get_lora_weights(lora_model, logical_name) for logical_name in logical_names]
+                if any(
+                    not isinstance(getattr(layer, "lora_a", None), torch.Tensor)
+                    or not isinstance(getattr(layer, "lora_b", None), torch.Tensor)
+                    for layer in expected_layers
+                ):
+                    continue
+                active_scale = float(getattr(manager, "_adapter_scales", {}).get(int(adapter_id), 1.0))
+                expected_a_arg = [layer.lora_a for layer in expected_layers]
+                expected_b_arg = [layer.lora_b * active_scale for layer in expected_layers]
+                if n_slices == 1:
+                    expected_a_arg = expected_a_arg[0]
+                    expected_b_arg = expected_b_arg[0]
+                if int(getattr(physical_layer, "tp_size", 1)) > 1:
+                    expected_a_arg = physical_layer.slice_lora_a(expected_a_arg)
+                    expected_b_arg = physical_layer.slice_lora_b(expected_b_arg)
+                expected_a_slices = expected_a_arg if isinstance(expected_a_arg, list) else [expected_a_arg]
+                expected_b_slices = expected_b_arg if isinstance(expected_b_arg, list) else [expected_b_arg]
+                if len(expected_a_slices) != n_slices or len(expected_b_slices) != n_slices:
+                    continue
+
+                for slice_index, logical_name in enumerate(logical_names):
+                    if target is not None and logical_name not in target:
+                        continue
+                    expected_a = expected_a_slices[slice_index]
+                    expected_b = expected_b_slices[slice_index]
+                    if not isinstance(expected_a, torch.Tensor) or not isinstance(expected_b, torch.Tensor):
+                        continue
+                    active_a = a_stacked[slice_index][
+                        0,
+                        0,
+                        : expected_a.shape[0],
+                        : expected_a.shape[1],
+                    ]
+                    active_b = b_stacked[slice_index][
+                        0,
+                        0,
+                        : expected_b.shape[0],
+                        : expected_b.shape[1],
+                    ]
+                    fields = out.setdefault(logical_name, {})
+                    fields["active_expected_lora_a"] = fingerprint_tensor(expected_a)
+                    fields["active_expected_lora_b"] = fingerprint_tensor(expected_b)
+                    fields["active_lora_a"] = fingerprint_tensor(active_a)
+                    fields["active_lora_b"] = fingerprint_tensor(active_b)
+        if gather_all_ranks:
+            import torch.distributed as dist
+
+            if dist.is_initialized():
+                gathered: list[object] = [None] * dist.get_world_size()
+                dist.all_gather_object(gathered, out)
+                return gathered
+            return [out]
         return out
 
 
-__all__ = ["BucketedIPCReceiveMixin"]
+__all__ = [
+    "BucketedIPCReceiveMixin",
+    "remap_minimax_h3_lora",
+    "validate_minimax_h3_lora_coverage",
+]

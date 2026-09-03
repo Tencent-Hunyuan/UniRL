@@ -34,6 +34,7 @@ class RemoteLoraWeightSync(LoraWeightSyncBase):
         self._copy = bool(copy)
         self._targets: List[tuple] = []
         self._cached = None
+        self._verify_payload = None
 
     @distributed(dispatch_mode=Dispatch.BROADCAST, execute_mode=Execute.RANK_ZERO)
     def set_rollout_targets(self, targets: List[tuple]) -> None:
@@ -93,9 +94,19 @@ class RemoteLoraWeightSync(LoraWeightSyncBase):
             self._track_prefix or "<single>",
         )
         if self._verify:
-            self._verify_loaded(lora_tensors, peft_config)
+            self._verify_payload = (lora_tensors, peft_config)
+            self._verify_loaded(lora_tensors, peft_config, require_active=False)
 
-    def _verify_loaded(self, lora_tensors, peft_config) -> None:
+    @distributed(dispatch_mode=Dispatch.BROADCAST, execute_mode=Execute.RANK_ZERO)
+    def verify_active(self) -> None:
+        """Verify Punica buffers after generate activates every target."""
+        if not self._verify:
+            return
+        if self._verify_payload is None:
+            raise RuntimeError("RemoteLoraWeightSync.verify_active: no pushed LoRA payload is available")
+        self._verify_loaded(*self._verify_payload, require_active=True)
+
+    def _verify_loaded(self, lora_tensors, peft_config, *, require_active: bool) -> None:
         """Assert each rollout engine's loaded LoRA matches what we just pushed."""
         import ray
 
@@ -104,6 +115,7 @@ class RemoteLoraWeightSync(LoraWeightSyncBase):
         )
 
         exp_a, exp_b = self._expected_checksums(lora_tensors, peft_config)
+        expected_named = self._expected_named_checksums(lora_tensors, peft_config)
         pending = [
             (
                 role,
@@ -121,9 +133,12 @@ class RemoteLoraWeightSync(LoraWeightSyncBase):
                 loaded,
                 topology=topology,
                 label=f"engine {role!r}",
+                expected_named=expected_named,
+                require_active=require_active,
             )
         logger.info(
-            "[LoRA-SYNC] rank 0: verify OK across %d engine(s) (%d lora_A / %d lora_B layers match)",
+            "[LoRA-SYNC] rank 0: %s verify OK across %d engine(s) (%d lora_A / %d lora_B layers match)",
+            "active-buffer" if require_active else "registered",
             len(self._targets),
             len(exp_a),
             len(exp_b),

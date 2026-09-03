@@ -117,6 +117,12 @@ class VLLMOmniBackend:
     @classmethod
     def boot(cls, intent: Dict[str, Any]) -> "VLLMOmniBackend":
         """Spell the intent into ``Omni`` ctor kwargs and spawn."""
+        visible_devices = intent.get("cuda_visible_devices")
+        if visible_devices is not None:
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(visible_devices)
+        elif intent.get("clear_cuda_visible"):
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+
         from unirl.rollout.engine.vllm_omni.patches import install as install_patches
 
         install_patches()
@@ -130,9 +136,6 @@ class VLLMOmniBackend:
 
         rt = _import_omni_runtime()
 
-        if intent.get("clear_cuda_visible"):
-            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
-
         import fcntl
 
         # Release the trainer CUDA cache before spawning the engine process.
@@ -144,8 +147,14 @@ class VLLMOmniBackend:
         except Exception:  # noqa: BLE001 - belt and braces; never block a boot
             pass
 
-        yaml_path = _resolve_stage_yaml(str(intent["stage_yaml"]))
+        # H3 boots from direct diffusion-stage arguments rather than a stage
+        # YAML, so its adapter clears this flag and never supplies "stage_yaml".
+        # Reading that key unconditionally is what breaks such an adapter.
+        use_stage_yaml = bool(intent.get("use_stage_yaml", True))
+        yaml_path = _resolve_stage_yaml(str(intent["stage_yaml"])) if use_stage_yaml else None
         omni_kwargs = _assemble_omni_kwargs(intent)
+        if yaml_path is not None:
+            omni_kwargs["stage_configs_path"] = yaml_path
         ports = intent.get("ports")
         boot_master_port = int(ports.master_port) if ports is not None else None
         logger.info(
@@ -168,9 +177,10 @@ class VLLMOmniBackend:
                 if lock_file is not None:
                     fcntl.flock(lock_file, fcntl.LOCK_EX)
                 with _master_port_env(boot_master_port):
+                    # stage_configs_path rides in omni_kwargs only when this
+                    # adapter actually uses a stage YAML.
                     omni = rt["Omni"](
                         model=str(intent["model_path"]),
-                        stage_configs_path=yaml_path,
                         **omni_kwargs,
                     )
             finally:
@@ -544,9 +554,10 @@ class VLLMOmniBackend:
         lora_tensors: Dict[str, Any],
         peft_config: Optional[dict],
     ) -> None:
-        """Byte-copy LoRA push (``torch.save`` + base64) — TP>1-broadcast-safe."""
-        import base64
-        import io
+        """File-backed LoRA push (one local ``torch.save``) — grouped-worker-safe."""
+        import os
+        import time
+        import uuid
 
         import torch
 
@@ -558,27 +569,69 @@ class VLLMOmniBackend:
 
         omni = self._require_omni()
         lora_tensors = self._wrap_peft_envelope(lora_tensors)
-        self._remove_existing_lora(int(DIFFRL_LORA_INT_ID))
 
         cpu_tensors = {
             name: t.detach().to("cpu") if isinstance(t, torch.Tensor) else t for name, t in lora_tensors.items()
         }
-        buf = io.BytesIO()
-        torch.save(cpu_tensors, buf)
-        serialized = base64.b64encode(buf.getvalue()).decode("ascii")
-
+        timeout_s = float(os.environ.get("DIFFRL_LORA_RPC_TIMEOUT_S", "1800"))
         for sid in self._stage_ids():
-            omni.engine.collective_rpc(
-                method="set_lora_from_tensor_dict_copy",
-                args=(
-                    str(adapter_name) or DIFFRL_LORA_NAME,
-                    int(DIFFRL_LORA_INT_ID),
-                    DIFFRL_LORA_PATH,
-                    dict(peft_config or {}),
-                    serialized,
-                ),
-                stage_ids=[int(sid)],
-            )
+            worker_count = self._worker_count_for_stage(sid)
+            ready_token = uuid.uuid4().hex
+            payload_path = f"/tmp/diffrl_lora_payload_{ready_token}.pt"
+            torch.save(cpu_tensors, payload_path)
+            markers = [f"/tmp/diffrl_lora_ready_{ready_token}_{rank}" for rank in range(worker_count)]
+            try:
+                result = omni.engine.collective_rpc(
+                    method="set_lora_from_tensor_file",
+                    timeout=timeout_s,
+                    args=(
+                        str(adapter_name) or DIFFRL_LORA_NAME,
+                        int(DIFFRL_LORA_INT_ID),
+                        DIFFRL_LORA_PATH,
+                        dict(peft_config or {}),
+                        payload_path,
+                        ready_token,
+                    ),
+                    stage_ids=[int(sid)],
+                )
+                self._raise_for_control_rpc_error(result, method="set_lora_from_tensor_file")
+                deadline = time.monotonic() + timeout_s
+                while not all(os.path.exists(marker) for marker in markers):
+                    if time.monotonic() >= deadline:
+                        missing = [rank for rank, marker in enumerate(markers) if not os.path.exists(marker)]
+                        raise TimeoutError(f"LoRA installation timed out on stage {sid}, ranks {missing}")
+                    time.sleep(1.0)
+            finally:
+                for marker in markers:
+                    try:
+                        os.unlink(marker)
+                    except FileNotFoundError:
+                        pass
+                try:
+                    os.unlink(payload_path)
+                except FileNotFoundError:
+                    pass
+
+    def _worker_count_for_stage(self, stage_id: int) -> int:
+        """Return physical diffusion-worker count from the resolved stage config."""
+        omni = self._require_omni()
+        for entry in omni.stage_configs:
+            if int(_cfg_get(entry, "stage_id", -1)) != int(stage_id):
+                continue
+            devices = _cfg_get(_cfg_get(entry, "runtime", {}), "devices")
+            if isinstance(devices, str):
+                count = len([item for item in devices.split(",") if item.strip()])
+                if count:
+                    return count
+            if isinstance(devices, (list, tuple)) and devices:
+                return len(devices)
+        return max(1, int(self._tp_per_stage.get(int(stage_id), 1)))
+
+    @staticmethod
+    def _raise_for_control_rpc_error(result: Any, *, method: str) -> None:
+        for item in result if isinstance(result, list) else [result]:
+            if isinstance(item, dict) and item.get("supported") is False:
+                raise RuntimeError(f"{method} failed: {item.get('error', 'unknown error')}")
 
     @staticmethod
     def _wrap_peft_envelope(lora_tensors: Dict[str, Any]) -> Dict[str, Any]:
@@ -623,10 +676,25 @@ class VLLMOmniBackend:
         for sid in self._stage_ids():
             results = omni.engine.collective_rpc(
                 method="_diffrl_loaded_lora_checksums",
-                args=(int(adapter_id), list(names) if names else None),
+                args=(int(adapter_id), list(names) if names else None, True),
                 stage_ids=[int(sid)],
             )
-            out[int(sid)] = results[0] if isinstance(results, list) and results else results
+            per_stage = results[0] if isinstance(results, list) and results else results
+            # The caller compares every TP rank's shard separately, so a reply
+            # that carries only aggregated status cannot verify anything. Stock
+            # vllm-omni routes worker RPCs through a status-collecting path that
+            # discards per-rank return values; distinguishing that here keeps the
+            # failure actionable instead of surfacing as "no loaded LoRA layers".
+            if not isinstance(per_stage, (list, tuple)) or not any(
+                isinstance(entry, dict) and entry for entry in per_stage
+            ):
+                raise RuntimeError(
+                    f"stage {int(sid)} returned no per-rank LoRA readback "
+                    f"(got {type(per_stage).__name__}). LoRA checksum verification needs an engine "
+                    "that forwards per-rank RPC replies (vllm-project/vllm-omni#6351); "
+                    "set sync.verify=false to run without it."
+                )
+            out[int(sid)] = per_stage
         return out
 
 
