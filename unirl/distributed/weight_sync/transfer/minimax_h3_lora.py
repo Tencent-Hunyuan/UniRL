@@ -41,7 +41,12 @@ def remap_minimax_h3_lora(
     mapped_config = dict(peft_config or {})
     target_modules = mapped_config.get("target_modules")
     if isinstance(target_modules, str):
-        target_modules = target_modules.replace("^transformer_blocks", "^blocks")
+        # The engine matches this pattern against names qualified by the
+        # pipeline component that owns the layer ("transformer.blocks.0.attn.to_q"),
+        # which is the same namespace the remapped tensor keys above use. A
+        # component-relative anchor silently matches nothing and the adapter
+        # then loads over zero layers.
+        target_modules = target_modules.replace("^transformer_blocks", r"^transformer\.blocks")
         target_modules = target_modules.replace(r"attn\.to_out\.0", r"attn\.out_proj")
         target_modules = target_modules.replace(
             r"ff\.net\.0\.proj",
