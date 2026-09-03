@@ -567,15 +567,12 @@ class BaseFSDP2Backend(Remote):
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def release_cached_memory(self) -> None:
-        """Hand the caching allocator's free blocks back to the driver.
-
-        A colocated external rollout allocates *physical* pages when it wakes,
-        so blocks that PyTorch has freed but still reserves starve it just as
-        surely as live tensors would. :meth:`offload` already ends in an
-        ``empty_cache``; this is the same release for the runs that keep the
-        train state resident, where the reserve otherwise grows with the first
-        optimizer step's state and never comes back.
-        """
+        """Hand the caching allocator's free blocks back to the driver."""
+        # A colocated external rollout allocates physical pages when it wakes, so
+        # blocks PyTorch has freed but still reserves starve it just as surely as
+        # live tensors do. offload() already ends in an empty_cache; this is the
+        # same release for runs that keep the train state resident, where the
+        # reserve otherwise grows with the first optimizer step and never returns.
         from unirl.utils.memory_utils import aggressive_empty_cache
 
         aggressive_empty_cache()

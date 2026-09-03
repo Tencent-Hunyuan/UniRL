@@ -60,14 +60,12 @@ bundle:
     # fp32 by checkpoint contract; the audio VAE emits ~20 dB too quiet in bf16.
     vae_dtype: fp32
     audio_vae_dtype: fp32
-    autocast_precision: bf16
     trajectory_precision: fp32
     logprob_precision: fp32
     # Reverse-schedule shifts, so rollout-only: a forward-process objective jumps
     # to a noise level instead of walking either grid.
     video_shift: 12.0
     audio_shift: 3.0
-    text_encoder_hidden_layer: 50
     audio_joint_sde: true
     aux_components_on_cpu: true
     vae_components_on_cpu: false
@@ -125,12 +123,15 @@ backend:
     bias: none
     task_type: FEATURE_EXTRACTION
     shadow_adapter: old
-    # Decay is exactly 0 below ema_flat_steps, so the shadow is a hard copy for
-    # the first 75 refreshes.
-    ema_decay_type: warmup
-    ema_flat_steps: 75
-    ema_uprate: 0.0075
-    ema_uphold: 0.999
+    # Decay is exactly 0 below ema_flat_steps, which makes the shadow a hard
+    # copy of the trainable adapter: the two predictions coincide, the
+    # contrastive term is identically zero, and NFT silently degenerates into
+    # advantage-weighted regression. A 30-rollout run under warmup/75 logged
+    # prediction_deviation exactly 0.0 for its whole length. Start decaying
+    # immediately so the objective is the one this recipe claims to run.
+    ema_decay_type: constant
+    ema_decay: 0.9
+    ema_flat_steps: 0
     timing: rollout_end
     # LOAD-BEARING, exactly as in the Flow-GRPO recipes. The suffixes below also
     # occur in `token_refiner.refiner_blocks.*`, and an unscoped list adapts
@@ -199,15 +200,17 @@ reward:
       clap_model_id: ${oc.env:H3_CLAP_MODEL,laion/larger_clap_general}
       imagebind_model_path: ${oc.env:H3_IMAGEBIND_CKPT,.checkpoints/imagebind_huge.pth}
       imagebind_mode: audio_video
-      # Summed raw, not renormalised. A single-frame image-text score cannot see
-      # the audio the reward is supposed to hold together, so videopickscore is
-      # off here and A/V agreement carries the signal.
+      # Summed raw, not renormalised. ImageBind in audio_video mode scores the
+      # generation against itself, so A/V agreement alone is climbable by
+      # degrading both streams together: a 112-rollout run on clap+imagebind
+      # only rose 0.250 -> 0.371 while the video visibly collapsed. Keep a
+      # visual term in the sum even though it cannot see the audio.
       #
       # LICENCE: ImageBind is CC-BY-NC-SA. This recipe is NonCommercial.
       weights:
-        videopickscore: 0.0
-        clap: 1.0
-        imagebind: 1.0
+        videopickscore: 1.0
+        clap: 0.5
+        imagebind: 0.5
 
 algorithm:
   _target_: unirl.algorithms.diffusionnft.DiffusionNFT
@@ -256,7 +259,9 @@ sampling:
   guidance_scale: 1.0
   height: 256
   width: 448
-  num_frames: 107
+  # Shortest duration H3 supports: 124/24fps = 5.17s clears the 5s floor, where
+  # 107 (4.46s) does not. Matches the trainside NFT recipe.
+  num_frames: 124
   # 0.0 with num_sde_steps: 0 below IS the forward-process switch.
   eta: 0.0
   sde_indices: null
@@ -279,7 +284,6 @@ sampling:
     num_sde_steps: 0
   sampler_kwargs:
     aspect_ratio: "16:9"
-    allow_nonstandard_canvas: true
     reward_num_frames: 9
     # LOAD-BEARING for any forward-process recipe. The rollout emits a replay
     # payload when it has SDE steps to record; with none it cannot tell this
@@ -296,7 +300,6 @@ eval_sampling:
   num_inference_steps: 10
   height: 256
   width: 448
-  num_frames: 107
+  num_frames: 124
   sampler_kwargs:
     aspect_ratio: "16:9"
-    allow_nonstandard_canvas: true

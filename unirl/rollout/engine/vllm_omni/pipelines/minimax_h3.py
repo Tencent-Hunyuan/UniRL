@@ -23,14 +23,12 @@ from unirl.types.sampling import compute_trajectory_positions
 
 
 def trajectory_positions_with_terminal(sde_indices: Iterable[int], num_steps: int) -> set[int]:
-    """Trajectory positions to capture, always including the terminal one.
-
-    A forward-process rollout (DiffusionNFT: no SDE indices) trains on the clean
-    terminal latent and nothing else, so without this the capture set would be
-    empty. Sparse GRPO replay does not need the terminal position for its
-    transitions but decode does, so it is cheaper to always keep it than to make
-    each caller remember.
-    """
+    """Trajectory positions to capture, always including the terminal one."""
+    # A forward-process rollout (DiffusionNFT: no SDE indices) trains on the
+    # clean terminal latent and nothing else, so the capture set would otherwise
+    # be empty. Sparse GRPO replay does not need the terminal position for its
+    # transitions but decode does, so always keeping it is cheaper than making
+    # each caller remember.
     return set(compute_trajectory_positions(set(sde_indices), num_steps)) | {int(num_steps)}
 
 
