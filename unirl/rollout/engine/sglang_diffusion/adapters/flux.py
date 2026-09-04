@@ -13,7 +13,7 @@ from unirl.rollout.engine.sglang_diffusion.adapters.base import register_adapter
 from unirl.rollout.engine.sglang_diffusion.adapters.image import ImageAdapter
 from unirl.rollout.engine.sglang_diffusion.backends import RawResult
 from unirl.types.conditions.image import ImageLatentCondition
-from unirl.types.primitives import Texts
+from unirl.types.primitives import Texts, as_image_sets
 from unirl.types.sample import Sample
 from unirl.types.sampling import DiffusionSamplingParams
 
@@ -43,36 +43,43 @@ class Flux2KleinAdapter(ImageAdapter):
         return self.model_config.build_schedule_policy()
 
     def build_prompts(self, sample: Sample) -> Dict[str, Any]:
-        """T2I payload, plus a ``condition_image`` per ``Images`` slot; one stays flat, 2+ nest per prompt."""
+        """T2I payload plus ordered reference rows; one image stays flat, 2+ nest per prompt."""
         if not sample.has_image_input():
             return super().build_prompts(sample)
 
         turns, image_batches = sample.vision_conditioning()
         text_turns = [turn.content for turn in turns if isinstance(turn.content, Texts)]
-        if len(text_turns) != 1 or not image_batches:
+        if len(text_turns) != 1 or len(image_batches) != 1:
             raise ValueError(
-                f"{self.model_family!r} ti2i needs exactly 1 text turn and at least 1 image turn; "
+                f"{self.model_family!r} ti2i needs exactly 1 text turn and 1 image turn; "
                 f"got {len(text_turns)} text, {len(image_batches)} image."
             )
         gen_part = sample.frontier_gen_part(DiffusionSamplingParams)
         prompts = list(text_turns[0].texts)
         unique_prompts, k = utils.deexpand_prompts_from_groups(prompts, list(gen_part.group_ids))
-        per_slot = []
-        for slot in image_batches:
-            pil_images = slot.to_pils()
-            unique_pils = utils.first_per_group(pil_images, list(gen_part.group_ids)) if k > 1 else pil_images
-            per_slot.append(
-                resize_condition_pils(
-                    unique_pils,
-                    height=int(gen_part.sampling_params.height),
-                    width=int(gen_part.sampling_params.width),
-                )
+        image_sets = as_image_sets(image_batches[0])
+        unique_sets = utils.first_per_group(image_sets.rows, list(gen_part.group_ids)) if k > 1 else image_sets.rows
+        counts = sorted({len(image_set) for image_set in unique_sets})
+        if not counts or counts == [0]:
+            raise ValueError(f"{self.model_family!r} ti2i requires at least one reference per prompt")
+        if len(counts) != 1:
+            raise ValueError(
+                f"{self.model_family!r} ti2i requires uniform reference counts for dense replay; "
+                f"got {counts}. Bucket prompts by image count."
             )
-        if len(per_slot) == 1:
-            unique_pils = per_slot[0]
-            condition_image: Any = unique_pils if len(unique_pils) > 1 else unique_pils[0]
+        reference_rows = [
+            resize_condition_pils(
+                image_set.to_pils(),
+                height=int(gen_part.sampling_params.height),
+                width=int(gen_part.sampling_params.width),
+            )
+            for image_set in unique_sets
+        ]
+        if counts[0] == 1:
+            flat = [row[0] for row in reference_rows]
+            condition_image: Any = flat if len(flat) > 1 else flat[0]
         else:
-            condition_image = [list(references) for references in zip(*per_slot)]
+            condition_image = reference_rows
         out: Dict[str, Any] = {
             "prompt": unique_prompts if len(unique_prompts) > 1 else unique_prompts[0],
             "condition_image": condition_image,

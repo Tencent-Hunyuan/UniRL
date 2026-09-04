@@ -8,7 +8,7 @@ from typing import Any, Optional, Tuple
 from unirl.models.types.pipeline import Pipeline
 from unirl.sde.kernels import DanceSDEStrategy, StepStrategy
 from unirl.types.noise_recipe import NoiseRecipe
-from unirl.types.primitives import Images, Texts
+from unirl.types.primitives import Images, ImageSets, Texts, as_image_sets
 from unirl.types.sample import Sample
 
 from .bundle import Flux2KleinBundle
@@ -159,7 +159,10 @@ class Flux2KleinPipeline(Pipeline):
                 f"Flux2KleinPipeline.generate: expected a Texts prompt from sample.conditioning()[0], "
                 f"got {type(texts).__name__ if texts is not None else 'None'}"
             )
-        references = [c for c in conditioning[1:] if isinstance(c, Images)]
+        image_inputs = [c for c in conditioning[1:] if isinstance(c, (Images, ImageSets))]
+        if len(image_inputs) > 1:
+            raise ValueError(f"Flux2KleinPipeline.generate: expected at most one image turn, got {len(image_inputs)}")
+        references = as_image_sets(image_inputs[0]) if image_inputs else None
 
         allowed = {f.name for f in _dc.fields(Flux2KleinDiffusionParams)}
         params_dict = {k: getattr(sampling, k) for k in allowed if hasattr(sampling, k)}
@@ -169,13 +172,11 @@ class Flux2KleinPipeline(Pipeline):
             params = _dc.replace(params, noise_group_ids=list(frontier.group_ids))
 
         klein_conds = self.build_conditions(texts, guidance_scale=float(params.guidance_scale))
-        if references:
-            for slot, reference in enumerate(references):
-                if len(reference) != len(texts.texts):
-                    raise ValueError(
-                        f"Flux2KleinPipeline.generate: reference slot {slot} image count "
-                        f"{len(reference)} != text count {len(texts.texts)}"
-                    )
+        if references is not None:
+            if len(references) != len(texts.texts):
+                raise ValueError(
+                    f"Flux2KleinPipeline.generate: image-set batch {len(references)} != text count {len(texts.texts)}"
+                )
             image_tokens, image_ids = self.vae_encode.encode(
                 references,
                 height=int(params.height),
