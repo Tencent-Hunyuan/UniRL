@@ -25,7 +25,7 @@ from unirl.rollout.engine.vllm_omni.utils import (
 from unirl.rollout.engine.vllm_omni.utils.noise import pack_initial_noise_extra_args
 from unirl.rollout.engine.vllm_omni.utils.sigmas import sigmas_list_from_diffusion
 from unirl.sde.runtime import FlowMatchSchedulePolicy
-from unirl.types.primitives import Images, Texts
+from unirl.types.primitives import Images, ImageSets, Texts, require_single_images
 from unirl.types.sample import Sample
 from unirl.types.sampling import DiffusionSamplingParams
 
@@ -47,11 +47,12 @@ def _conditioning_rows(
     if len(prompt_rows) != n_samples:
         raise RuntimeError(f"{caller}: prompt count {len(prompt_rows)} != diffusion sample count {n_samples}")
 
-    image_batches = [value for value in conditioning if isinstance(value, Images)]
+    image_batches = [value for value in conditioning if isinstance(value, (Images, ImageSets))]
     if image_input:
         if len(image_batches) != 1:
-            raise ValueError(f"{caller}: expected exactly one Images conditioning batch, got {len(image_batches)}")
-        image_rows = [image.to_pil() for image in image_batches[0].to_list()]
+            raise ValueError(f"{caller}: expected exactly one image conditioning batch, got {len(image_batches)}")
+        images = require_single_images(image_batches[0], context=caller)
+        image_rows = [image.to_pil() for image in images.to_list()]
         if len(image_rows) != n_samples:
             raise RuntimeError(f"{caller}: image count {len(image_rows)} != diffusion sample count {n_samples}")
     else:

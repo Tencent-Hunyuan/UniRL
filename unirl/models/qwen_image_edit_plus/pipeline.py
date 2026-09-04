@@ -8,7 +8,7 @@ from unirl.models.qwen_image.vae import QwenImageVAEDecodeStage
 from unirl.models.types.pipeline import Pipeline
 from unirl.sde.kernels import FlowSDEStrategy, StepStrategy
 from unirl.types.noise_recipe import NoiseRecipe
-from unirl.types.primitives import Images, Texts
+from unirl.types.primitives import Images, ImageSets, Texts, require_single_images
 from unirl.types.sample import Sample
 from unirl.types.sampling import DiffusionSamplingParams
 
@@ -179,7 +179,7 @@ class QwenImageEditPlusPipeline(Pipeline):
 
         conditioning = sample.conditioning()
         text_inputs = [value for value in conditioning if isinstance(value, Texts)]
-        image_inputs = [value for value in conditioning if isinstance(value, Images)]
+        image_inputs = [value for value in conditioning if isinstance(value, (Images, ImageSets))]
         if len(text_inputs) != 1:
             raise TypeError(
                 "QwenImageEditPlusPipeline.generate: expected exactly one Texts conditioning "
@@ -187,10 +187,14 @@ class QwenImageEditPlusPipeline(Pipeline):
             )
         if len(image_inputs) != 1:
             raise TypeError(
-                "QwenImageEditPlusPipeline.generate: expected exactly one Images conditioning "
+                "QwenImageEditPlusPipeline.generate: expected exactly one image conditioning "
                 f"primitive (Edit-Plus is edit-only), got {len(image_inputs)}"
             )
-        texts, images = text_inputs[0], image_inputs[0]
+        texts = text_inputs[0]
+        images = require_single_images(
+            image_inputs[0],
+            context="QwenImageEditPlusPipeline.generate",
+        )
         if len(images) != len(texts.texts):
             raise ValueError(
                 f"QwenImageEditPlusPipeline.generate: image batch {len(images)} != text batch {len(texts.texts)}"
