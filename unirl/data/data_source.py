@@ -4,14 +4,14 @@ import logging
 import os
 from collections import Counter
 from functools import partial
-from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
 import torch
 from torch.utils.data import DataLoader
 
 from unirl.types.media import MediaRef, MediaRefs
-from unirl.types.primitives import Image, Images, PrimitiveValue, Texts, Videos
-from unirl.types.sample import Part, Sample
+from unirl.types.primitives import Image, ImageSet, ImageSets, Texts, Videos
+from unirl.types.sample import Part, PrimitiveMap, Sample
 from unirl.utils.video import load_video
 
 from .datasets import PromptExampleDataset, TextPromptDataset, normalize_prompt_example
@@ -19,14 +19,14 @@ from .datasets import PromptExampleDataset, TextPromptDataset, normalize_prompt_
 logger = logging.getLogger(__name__)
 
 
-def _load_condition_images(media_refs: List[Any]) -> Optional[List[Images]]:
-    """Load ``(image, condition)`` refs into one ``Images`` per slot; ragged batches rejected (the transpose zips)."""
+def _load_condition_images(media_refs: List[Any]) -> Optional[ImageSets]:
+    """Load ordered ``(image, condition)`` refs into one row-aligned image-set batch."""
     if not media_refs or not any(media_refs):
         return None
     import PIL.Image
     import torchvision.transforms.functional as TF
 
-    images_per_prompt: List[List[Image]] = []
+    rows: List[ImageSet] = []
     any_loaded = False
     for refs in media_refs:
         selected = [
@@ -35,28 +35,17 @@ def _load_condition_images(media_refs: List[Any]) -> Optional[List[Images]]:
             if getattr(r, "modality", None) == "image" and getattr(r, "role", None) == "condition"
         ]
         references = []
+        metadata = []
         for ref in selected:
             with PIL.Image.open(ref.uri) as pil:
                 references.append(Image(pixels=TF.to_tensor(pil.convert("RGB"))))
-        images_per_prompt.append(references)
+            metadata.append({"modality": ref.modality, "role": ref.role, "uri": ref.uri})
+        rows.append(ImageSet.from_list(references, metadata=metadata))
         any_loaded = any_loaded or bool(references)
 
     if not any_loaded:
         return None
-    missing = [index for index, references in enumerate(images_per_prompt) if not references]
-    if missing:
-        raise ValueError(
-            f"Condition-image batch is incomplete: {len(missing)}/{len(images_per_prompt)} "
-            f"prompts are missing an image (e.g. prompt index {missing[0]})."
-        )
-    counts = sorted({len(references) for references in images_per_prompt})
-    if len(counts) > 1:
-        raise ValueError(
-            f"Condition-image batch is ragged: prompts carry {counts} reference images. "
-            f"Every prompt in a batch must carry the same number — bucket the dataset by "
-            f"reference count so each batch is uniform."
-        )
-    return [Images.from_list(list(slot)) for slot in zip(*images_per_prompt)]
+    return ImageSets(rows=rows)
 
 
 def _load_condition_videos(media_refs: List[Any]) -> Optional[List[Any]]:
@@ -186,12 +175,12 @@ def _reject_unsupported_media_refs(batch: Dict[str, Any], *, context: str) -> No
 
 
 def _input_sample(
-    primitives: Dict[str, Union[PrimitiveValue, List[PrimitiveValue]]],
+    primitives: PrimitiveMap,
     *,
     sample_ids: List[str],
     metadata: Optional[List[Optional[Dict[str, Any]]]] = None,
 ) -> Sample:
-    """Build the data-source request as a text-rooted Part chain; a list value chains one Part per element."""
+    """Build the data-source request as a text-rooted input Part chain."""
     if len(set(sample_ids)) != len(sample_ids):
         duplicates = sorted(sample_id for sample_id, count in Counter(sample_ids).items() if count > 1)
         raise ValueError(f"Data-source input requires unique root sample_ids; duplicates: {duplicates[:3]}")
@@ -208,12 +197,11 @@ def _input_sample(
     parts = [root]
     parent = root
     for key in ("image", "video", "media"):
-        value = primitives.get(key)
-        if value is None:
+        primitive = primitives.get(key)
+        if primitive is None:
             continue
-        for primitive in value if isinstance(value, list) else [value]:
-            parent = parent.input_child({key: primitive})
-            parts.append(parent)
+        parent = parent.input_child({key: primitive})
+        parts.append(parent)
     return Sample.request(*parts)
 
 

@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from typing import Sequence, Union
 
 import torch
 
 from unirl.models.types.codec import DecodeStage
-from unirl.types.primitives import Images
+from unirl.types.primitives import ImagePrimitive, Images, ImageSets
 from unirl.types.segments import LatentSegment
 
 from .bundle import Flux2KleinBundle
@@ -79,12 +78,15 @@ class Flux2KleinVAEEncodeStage:
     @torch.no_grad()
     def encode(
         self,
-        images: Union[Images, Sequence[Images]],
+        images: ImagePrimitive,
         *,
         height: int,
         width: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        references = [images] if isinstance(images, Images) else list(images)
+        if isinstance(images, ImageSets):
+            references = images.to_slots(context="Flux2KleinVAEEncodeStage.encode")
+        else:
+            references = [images]
         if not references:
             raise ValueError("Flux2KleinVAEEncodeStage.encode: no reference images given")
         encoded = [
