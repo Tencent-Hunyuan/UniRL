@@ -28,7 +28,14 @@ from unirl.types.advantages import (
 from unirl.types.conditions import Condition
 from unirl.types.media import MediaRefs
 from unirl.types.media_preview import MediaPreview
-from unirl.types.primitives import Images, PrimitiveValue, Texts, primitive_modality_key
+from unirl.types.primitives import (
+    ImagePrimitive,
+    Images,
+    ImageSets,
+    PrimitiveValue,
+    Texts,
+    primitive_modality_key,
+)
 from unirl.types.sample_id import ancestor_id, child_id, parent_id
 from unirl.types.sampling import BaseSamplingParams
 from unirl.types.segments import Segment, TextSegment
@@ -716,11 +723,11 @@ class Sample(Batch):
             raise ValueError(f"Sample.text_conditioning: the LLM path requires all-text turns; got non-text {non_text}")
         return ts
 
-    def vision_conditioning(self) -> tuple[List[Turn], List[Images]]:
+    def vision_conditioning(self) -> tuple[List[Turn], List[ImagePrimitive]]:
         """VLM render: the trajectory as a text+image conversation. Returns the"""
         ts = self.turns()
-        images = [t.content for t in ts if isinstance(t.content, Images)]
-        extra = [primitive_modality_key(t.content) for t in ts if not isinstance(t.content, (Texts, Images))]
+        images = [t.content for t in ts if isinstance(t.content, (Images, ImageSets))]
+        extra = [primitive_modality_key(t.content) for t in ts if not isinstance(t.content, (Texts, Images, ImageSets))]
         if extra or not images:
             raise ValueError(
                 f"Sample.vision_conditioning: requires text+image turns only; got "

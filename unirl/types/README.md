@@ -49,7 +49,7 @@ it is not inferred from `sampling_params.samples_per_prompt`.
 | --- | --- |
 | `sample_ids` | Root input `Part.sample_ids` |
 | `group_ids` | Derived from lineage with `Part.group_ids` or `Sample.root_group_ids(part_index)`; it is no longer stored independently |
-| `primitives` | Input `Part.primitives`, keyed by canonical modality (`text`, `image`, `video`, `audio`, or sparse URI container `media`) |
+| `primitives` | Input `Part.primitives`, keyed by canonical modality (`text`, `image`, `video`, `audio`, or sparse URI container `media`); `image` accepts legacy one-image-per-row `Images` or ordered ragged `ImageSets` |
 | `request_conditions` | No single request-level replacement. Keep raw inputs on ancestor `Part.primitives`; the generated part stores the encoded replay inputs in `Part.conditions`. Precomputed diffusion `initial_latents` belong on the generated `LatentSegment.initial_latents` |
 | `sampling_params` | One typed `Part.sampling_params` per generated stage. Composed rollouts use one fork per stage |
 | `stage_config` | Root input `Part.control` |
@@ -174,9 +174,29 @@ Use `Sample.prompt_media_refs()` to read that channel. Do **not** look for
 prompt video/audio/image URIs under `primitives["video"|"image"|"audio"]`.
 
 Those decoded modality keys remain the contract for **condition** media
-(diffusion / V2V / image-edit): loaded `Images` / `Videos` tensors with
-`role="condition"`.
+(diffusion / V2V / image-edit): loaded `ImageSets` / `Videos` tensors with
+`role="condition"`. `ImageSets` holds one ordered, possibly empty image set per
+Part row; `Images` remains the legacy singleton-row and generated-output type.
 
 `build_omni_messages` (`unirl/models/qwen3_omni/media.py`) accepts `MediaRefs`
-prompt media only; waveform `Audios` and decoded frame `Videos` / `Images` are
-rejected for Omni prompts.
+prompt media only; waveform `Audios` and decoded frame `Videos` / `Images` /
+`ImageSets` are rejected for Omni prompts.
+
+## Ordered image sets
+
+`ImageSet` is one logical row's ordered image attachments and preserves
+per-image metadata. `ImageSets` is the batch-aligned primitive:
+
+```python
+ImageSets.from_rows([
+    ImageSet.from_list([source, style]),
+    ImageSet.from_list([source_only]),
+])
+```
+
+`ImageSets` is the preferred Part-level condition-image primitive; `ImageSet`
+is its row value, while legacy singleton-row `Images` remains accepted during
+migration. Candidate generations remain separate rows created by `fork` and
+are not image set members. Single-image consumers call
+`require_single_images(...)`; dense multi-reference consumers call
+`to_slots(...)` and therefore still require image-count bucketing.
