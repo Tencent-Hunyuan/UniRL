@@ -9,7 +9,7 @@ import torch
 
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
-from unirl.types.primitives import Images, PrimitiveValue, primitive_modality_key
+from unirl.types.primitives import Images, ImageSets, PrimitiveValue, primitive_modality_key
 from unirl.types.reward import RewardRequest, RewardResponse
 from unirl.types.sample import Sample, _part_with_field
 from unirl.types.sampling import ARSamplingParams
@@ -26,7 +26,9 @@ def _build_reward_request(sample: Sample, preferred_input_kind: str) -> RewardRe
     primitives: Dict[str, PrimitiveValue] = {}
     for turn in turns:
         primitives[primitive_modality_key(turn.content)] = turn.content
-    image_references = [turn.content for turn in turns if turn.role == "user" and isinstance(turn.content, Images)]
+    image_references = [
+        turn.content for turn in turns if turn.role == "user" and isinstance(turn.content, (Images, ImageSets))
+    ]
 
     if preferred_input_kind not in frontier.primitives:
         raise ValueError(

@@ -10,7 +10,7 @@ import torch
 from unirl.config.require import require
 from unirl.types.conditions import ImageEmbedCondition
 from unirl.types.noise_recipe import NoiseRecipe
-from unirl.types.primitives import Images, Texts
+from unirl.types.primitives import Images, ImageSets, Texts, require_single_images
 from unirl.types.sample import Part, Sample
 from unirl.types.sampling import DiffusionSamplingParams
 
@@ -105,13 +105,13 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
         f"must be Texts, "
         f"got {type(texts).__name__ if texts is not None else 'None'}",
     )
-    image_inputs = [c for c in conditioning[1:] if isinstance(c, Images)]
+    image_inputs = [c for c in conditioning[1:] if isinstance(c, (Images, ImageSets))]
     require(
         len(image_inputs) == 1,
-        "HunyuanImage3Pipeline.generate (it2i): expected exactly one chained Images input in "
+        "HunyuanImage3Pipeline.generate (it2i): expected exactly one chained image input in "
         f"sample.conditioning(), got {len(image_inputs)}",
     )
-    images = image_inputs[0]
+    images = require_single_images(image_inputs[0], context="HunyuanImage3Pipeline.generate (it2i)")
 
     require(
         int(params.samples_per_prompt) <= 2,

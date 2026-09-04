@@ -8,7 +8,7 @@ import torch
 
 from unirl.models.types.ar import ARSamplingParams
 from unirl.types.conditions import ImageEmbedCondition
-from unirl.types.primitives import Images, Texts
+from unirl.types.primitives import Images, ImageSets, Texts, require_single_images
 from unirl.types.sample import Sample
 
 from ..ar import HunyuanImage3ARParams
@@ -32,13 +32,13 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
             f"prompt from sample.conditioning()[0] must be Texts, "
             f"got {type(texts).__name__ if texts is not None else 'None'}"
         )
-    image_inputs = [c for c in conditioning[1:] if isinstance(c, Images)]
+    image_inputs = [c for c in conditioning[1:] if isinstance(c, (Images, ImageSets))]
     if len(image_inputs) != 1:
         raise TypeError(
-            "HunyuanImage3Pipeline.generate (i2t): expected exactly one chained Images input in "
+            "HunyuanImage3Pipeline.generate (i2t): expected exactly one chained image input in "
             f"sample.conditioning(), got {len(image_inputs)}"
         )
-    images = image_inputs[0]
+    images = require_single_images(image_inputs[0], context="HunyuanImage3Pipeline.generate (i2t)")
 
     model_cfg: Dict[str, Any] = dict((sample.parts[0].control or {}).get("ar") or {})
     ar_params = HunyuanImage3ARParams(
