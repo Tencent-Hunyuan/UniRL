@@ -79,7 +79,9 @@ class DiffusionNFT(StageAlgorithm):
             raise ValueError(f"DiffusionNFT: kl_coef must be >= 0; got {kl_coef!r}.")
         # The reference is the LoRA-disabled base policy, not the EMA shadow: the
         # shadow tracks the policy, so it cannot anchor drift away from it.
-        self._ref_model = _resolve_reference_model(backend, beta=float(kl_coef), algo="DiffusionNFT")
+        self._ref_model = _resolve_reference_model(
+            backend, beta=float(kl_coef), algo="DiffusionNFT", coef_name="kl_coef"
+        )
         if not (0.0 < float(beta)):
             raise ValueError(f"DiffusionNFT: beta must be > 0; got {beta!r}.")
         if not (0.0 < float(adv_clip_max)):
@@ -288,18 +290,7 @@ class DiffusionNFT(StageAlgorithm):
         t_batch: torch.Tensor,
         new_pred: torch.Tensor,
     ) -> Optional[torch.Tensor]:
-        """Penalty pulling the policy back toward the LoRA-disabled base model.
-
-        Costs a third forward per timestep, on top of the trainable and shadow
-        ones. There is no cheaper reference available: the shadow follows the
-        policy by construction, so anchoring to it would not bound drift.
-
-        The two predictions are the means of Gaussians that share a variance at
-        this timestep, so their KL reduces to the squared difference between
-        them up to a constant factor. Measuring it on the prediction rather than
-        on the reconstructed ``x0`` keeps the penalty independent of ``t``, which
-        the ``xt - t * pred`` reconstruction is not.
-        """
+        """Squared-difference penalty pulling the policy toward the LoRA-disabled base model."""
         if self._ref_model is None:
             return None
         with torch.no_grad(), adapters_disabled(self._ref_model):

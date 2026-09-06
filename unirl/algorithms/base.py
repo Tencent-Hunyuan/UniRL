@@ -186,24 +186,24 @@ def _reference_kl_loss(
     return kl_per_sample.mean()
 
 
-def _resolve_reference_model(backend: Any, *, beta: float, algo: str) -> Any:
+def _resolve_reference_model(backend: Any, *, beta: float, algo: str, coef_name: str = "beta") -> Any:
     """Resolve the trainable model for the adapter-disabled reference replay, or None."""
     if float(beta) < 0.0:
-        raise ValueError(f"{algo}: beta must be >= 0; got {beta!r}.")
+        raise ValueError(f"{algo}: {coef_name} must be >= 0; got {beta!r}.")
     if float(beta) == 0.0:
         return None
     model = getattr(backend, "model", None) if backend is not None else None
     if model is None:
         raise ValueError(
-            f"{algo}: beta>0 needs the trainable model to define the reference policy, but "
+            f"{algo}: {coef_name}>0 needs the trainable model to define the reference policy, but "
             f"no `backend` was injected. The v2 DiffusionTrainer injects it when the "
-            f"algorithm declares requires_backend=True."
+            f"algorithm declares requires_backend=True or requires_ema_rollout=True."
         )
     if not any("lora_" in name for name, _ in model.named_parameters()):
         raise ValueError(
-            f"{algo}: beta>0 computes KL against the LoRA-disabled base model (reference "
+            f"{algo}: {coef_name}>0 computes KL against the LoRA-disabled base model (reference "
             f"policy), which requires a LoRA adapter, but the trainable model has none. Use "
-            f"a LoRA recipe, or set beta=0."
+            f"a LoRA recipe, or set {coef_name}=0."
         )
     return model
 
