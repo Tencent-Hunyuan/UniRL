@@ -139,6 +139,13 @@ class Backend(Protocol):
         lora_tensors: Dict[str, Any],
         peft_config: Optional[dict],
     ) -> None: ...
+    def set_lora_file(
+        self,
+        *,
+        adapter_name: str,
+        lora_tensors: Dict[str, Any],
+        peft_config: Optional[dict],
+    ) -> None: ...
     def param_checksums(self, *, names: List[str]) -> dict: ...
     def lora_checksums(self, *, adapter_id: int, names: Optional[List[str]]) -> dict: ...
 

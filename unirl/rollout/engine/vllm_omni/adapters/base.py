@@ -52,6 +52,7 @@ class ModelAdapter(ABC):
     ar_lora_passthrough: bool = False
     clear_cuda_visible: bool = False
     lora_copy_transport: bool = False
+    lora_file_transport: bool = False
 
     def __init__(
         self,

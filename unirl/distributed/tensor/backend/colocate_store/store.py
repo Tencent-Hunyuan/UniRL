@@ -105,7 +105,8 @@ class TensorStore:
             port=int(os.environ["MASTER_PORT"]),
             world_size=global_world_size,
             is_master=(global_rank == 0),
-            timeout=timedelta(seconds=30),
+            # 30s is not enough for all 32 ranks to arrive on a 4-node pod.
+            timeout=timedelta(seconds=120),
         )
         self._global_pg = dist.ProcessGroupNCCL(store, global_rank, global_world_size)
         self._global_pg.eager_connect_single_device(torch.device(self.device))

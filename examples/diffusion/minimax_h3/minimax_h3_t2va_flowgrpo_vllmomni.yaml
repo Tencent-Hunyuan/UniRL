@@ -1,0 +1,229 @@
+# @package _global_
+# The measured H3 t2va Flow-GRPO recipe (celve/unirl#403) with vLLM-Omni generating.
+#
+# Self-contained on purpose, mirroring #403's own file rather than inheriting
+# minimax_h3_t2va_base: the base carries reward weights and FSDP dtypes that a
+# child can only overwrite, never drop, and `weights` is iterated to build
+# scorers — so a zeroed entry still loads a model and scores every sample.
+#
+# Everything below is #403's value. What the engine swap forces is marked ENGINE:
+# the rollout block, the weight-sync block, use_lora, the colocate keys, and an
+# aspect-ratio label. Nothing else moves, so a flat reward here implicates the
+# engine rather than the configuration.
+#
+# WARNING inherited with the reward: imagebind is cos(audio, video) and clap never
+# sees a pixel, so nothing here relates the prompt to the video. #403 reports the
+# NFT sibling on this reward decoding to luma 2/255 while imagebind rose. Check
+# frames before trusting a rising curve.
+#
+# Launch (1 node x 8 GPUs):
+#   bash examples/run_experiment_single_node.sh diffusion/minimax_h3/minimax_h3_t2va_flowgrpo_vllmomni
+
+num_devices: 8
+batch_size: 8
+adv_use_global_std: true
+num_rollouts: 1000
+
+# ENGINE: the engine is a separate process time-sharing these eight ranks.
+devices_per_node: 8
+layout: colocate
+transport: colocate_store
+reward_fraction: 0.0
+enable_fsdp_offload: true
+offload_train_during_reward: true
+eval_interval: 0
+
+logging:
+  report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,true}}
+  project_name: ${oc.env:WANDB_PROJECT,unirl-minimax-h3-t2va}
+  run_name: ${oc.env:WANDB_RUN_NAME,minimax_h3_t2va_flowgrpo_vllmomni}
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: [minimax-h3, t2va, flowgrpo, vllm-omni, colocate, audio, stereo]
+  log_media: true
+  media_max_items: 2
+  media_log_interval: 100
+
+bundle:
+  _target_: unirl.models.minimax_h3.bundle.MiniMaxH3Bundle.from_config
+  config:
+    _target_: unirl.models.minimax_h3.config.MiniMaxH3PipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,MiniMaxAI/MiniMax-H3}
+    model_precision: bf16
+    # The audio VAE emits ~20 dB too quiet in bf16.
+    vae_dtype: fp32
+    audio_vae_dtype: fp32
+    trajectory_precision: fp16
+    logprob_precision: fp32
+    video_shift: 12.0
+    audio_shift: 3.0
+    audio_joint_sde: true
+    aux_components_on_cpu: true
+    vae_components_on_cpu: false
+    meta_init_transformer: true
+    # ENGINE: read by VLLMOmniRolloutEngine as `uses_lora`; the trainer's adapters
+    # come from backend.lora_cfg either way.
+    use_lora: true
+    # #403 also sets text_encoder_hidden_layer: 50 and autocast_precision: bf16.
+    # Neither is a field on MiniMaxH3PipelineConfig, which is a plain dataclass, and
+    # layer 50 is hardcoded ("not exposed as a config option"), so both are dropped
+    # rather than carried as unknown kwargs.
+
+pipeline:
+  _target_: unirl.models.minimax_h3.pipeline.MiniMaxH3Pipeline.from_bundle
+  config: ${bundle.config}
+  strategy:
+    # FlowSDE adds noise on top of the schedule and speckles at eta 0.7.
+    _target_: unirl.sde.kernels.CPSSDEStrategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["MiniMaxH3TransformerBlock"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true
+    use_torch_compile: false
+    # Keeps the fp32-pinned modules unsharded: H3 conditions on t = 1 - sigma, and
+    # a bf16 timestep MLP costs ~40% relative error on sigma near t=1.
+    root_wrap: false
+    # master_dtype and cast_forward_inputs are deliberately absent, as in #403:
+    # their defaults (None, True) leave the trainable LoRA at bf16, which is what
+    # was measured. Setting master_dtype: fp32 is a real change, not a tidy-up.
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 1.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    # grad_norm is 3e-5 because the log-prob averages ~354k latent elements; at a
+    # larger eps Adam degrades toward SGD. Do not "fix" the small grad_norm.
+    adam_epsilon: 1.0e-12
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 1000
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 32
+    alpha: 64
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    # These suffixes recur in `token_refiner.refiner_blocks.*`, outside
+    # block_class_names, where injected LoRA params get no DP gradient sync.
+    module_prefix: transformer_blocks
+    target_modules:
+      - attn.to_q
+      - attn.to_k
+      - attn.to_v
+      - attn.to_out.0
+      - ff.net.0.proj
+      - ff.net.2
+
+# ENGINE: four two-rank replicas, sleeping between rollouts so the trainer gets
+# the memory back.
+rollout:
+  _target_: unirl.rollout.engine.vllm_omni.engine.VLLMOmniRolloutEngine
+  model_config: ${bundle.config}
+  config:
+    _target_: unirl.rollout.engine.vllm_omni.config.VLLMOmniEngineConfig
+    model_path: ${bundle.config.pretrained_model_ckpt_path}
+    modality: minimax_h3_t2va
+    enable_sleep_mode: true
+    # Both 4 because MiniMaxH3T2VAAdapter.validate requires it. That requirement is
+    # what forces sampling.height off #403's 256 — see the note there.
+    replica_size: 4
+    tp_size: 4
+
+# ENGINE: in-process there is nothing to ship, so #403 has no sync block at all.
+# adapter_name is deliberately absent: it falls back to backend.rollout_adapter_name,
+# which is the adapter the trainer is actually updating.
+sync:
+  _target_: unirl.distributed.weight_sync.lora.LocalLoraWeightSync
+  param_prefix: "transformer."
+  transport: file
+  verify: false
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.local.t2av_composite.T2AVCompositeScorer
+    base_device: cuda
+    config:
+      _target_: unirl.reward.local.t2av_composite.T2AVCompositeSpec
+      device: auto
+      batch_size: 2
+      frame_selection: middle
+      # ImageBind is CC-BY-NC-SA, so this recipe is NonCommercial.
+      weights:
+        imagebind: 1.0
+        clap: 1.0
+
+algorithm:
+  _target_: unirl.algorithms.flowgrpo.FlowGRPO
+  stage_attr: diffusion
+  clip_range: 5.0e-3
+  clip_schedule: constant
+  # Back to #403's value now that the engine-parity question is answered: ratio
+  # held 0.9999-1.0000 over 20 rollouts anchored on the engine. This makes it
+  # tautological again, which is the cost of matching what was measured.
+  old_logp_source: replay
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.minimax_h3.conditions.MiniMaxH3Conditions
+  params: ${sampling}
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 1
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: ${oc.env:H3_PROMPT_FILE,datasets/pickscore/train.txt}
+      eval_data_path: ${oc.env:H3_PROMPT_FILE,datasets/pickscore/test.txt}
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  num_inference_steps: 10
+  guidance_scale: 1.0
+  # sde_indices omitted deliberately, which trains all 10 steps: replay builds one
+  # autograd graph over them, ~2.2 GB per step here against ~12 GB at 768x768 where
+  # ten exceed 100 GB/rank and OOM after a paid rollout.
+  # ENGINE, and the one number that cannot match #403's 256. The video VAE decodes
+  # in tiles dealt to the sp ranks as range(rank, num_tiles, sp_size), and
+  # split_tiles returns a single tile for any edge <= its 256 tile_size — so 256x384
+  # is 1x2 tiles and ranks 2 and 3 die on "Found empty tasks on sp rank". num_tiles
+  # >= sp_size needs both edges over 256, and tp_size is pinned at 4 by the
+  # adapter's own validate(), so 288 is the smallest legal height. Trainside has no
+  # sequence parallelism and therefore no such floor.
+  height: 288
+  width: 384
+  # 17n+5 pixel frames map to 5n+2 latent, so the 5 s minimum makes 124 the
+  # smallest legal count; frames cannot be traded for row budget.
+  num_frames: 124
+  eta: 0.7
+  # Keep total samples near 128: 512 per step exhausted a 2.2 TB host in scoring.
+  samples_per_prompt: 16
+  seed: 42
+  init_same_noise: false
+  autocast_precision: bf16
+  trajectory_precision: fp16
+  logprob_precision: fp32
+  sampler_kwargs:
+    # ENGINE: 384x256 is 3:2, which H3 does not name, and the adapter derives the
+    # name from the dimensions unless overridden. The label only gates the request
+    # — the canvas comes from height/width, which the engine takes verbatim.
+    aspect_ratio: "4:3"

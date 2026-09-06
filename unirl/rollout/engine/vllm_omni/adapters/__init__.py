@@ -1,4 +1,4 @@
-"""Adapter registry — importing this package registers all 12 modalities."""
+"""Adapter registry — importing this package registers all 13 modalities."""
 
 from unirl.rollout.engine.vllm_omni.adapters.bagel import (
     BagelAdapter,
@@ -32,6 +32,11 @@ from unirl.rollout.engine.vllm_omni.adapters.hv15 import (
     Hv15InputAdapter,
     Hv15T2vAdapter,
     Hv15VideoOutputAdapter,
+)
+from unirl.rollout.engine.vllm_omni.adapters.minimax_h3 import (
+    MiniMaxH3InputAdapter,
+    MiniMaxH3OutputAdapter,
+    MiniMaxH3T2VAAdapter,
 )
 from unirl.rollout.engine.vllm_omni.adapters.qwen3_omni import (
     Qwen3OmniThinkerAdapter,
@@ -68,6 +73,9 @@ __all__ = [
     "Hv15InputAdapter",
     "Hv15T2vAdapter",
     "Hv15VideoOutputAdapter",
+    "MiniMaxH3InputAdapter",
+    "MiniMaxH3OutputAdapter",
+    "MiniMaxH3T2VAAdapter",
     "ModelAdapter",
     "QwenImageGroupedInputAdapter",
     "Qwen3OmniThinkerAdapter",

@@ -22,6 +22,8 @@ from vllm.lora.utils import get_adapter_absolute_path
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager, logger
 from vllm_omni.lora.request import LoRARequest as OmniLoRARequest
 
+from unirl.rollout.engine.vllm_omni.patches.compat_minimax_h3_canvas import patch_minimax_h3_canvas_short_edge
+from unirl.rollout.engine.vllm_omni.patches.compat_minimax_h3_lora import patch_minimax_h3_packed_lora_mapping
 from unirl.rollout.engine.vllm_omni.patches.compat_moe_workspace import patch_moe_workspace_pool
 
 
@@ -196,8 +198,16 @@ def patch_dit_lora_loader() -> None:
             list(lora_model.loras.keys()),
         )
 
-        for lora in lora_model.loras.values():
-            lora.optimize()
+        # Each SP worker otherwise fans this CPU scaling loop over the host's whole
+        # OpenMP pool; on a 300-module adapter the oversubscription wedges siblings
+        # indefinitely, and the caller sees a control RPC that never returns.
+        previous_threads = torch.get_num_threads()
+        torch.set_num_threads(1)
+        try:
+            for lora in lora_model.loras.values():
+                lora.optimize()
+        finally:
+            torch.set_num_threads(previous_threads)
 
         return lora_model, peft_helper
 
@@ -539,6 +549,8 @@ class VLLMOmniHijack:
 
         patch_dit_lora_loader()
         patch_dit_hi3_lora_weights()
+        patch_minimax_h3_packed_lora_mapping()
+        patch_minimax_h3_canvas_short_edge()
         patch_ar_lora_loader()
         patch_ar_merged_lora_fused_tensor()
         patch_fp32_skip()

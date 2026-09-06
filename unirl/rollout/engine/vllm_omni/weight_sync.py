@@ -21,10 +21,12 @@ class WeightSync:
         *,
         uses_lora: bool,
         lora_copy_transport: bool,
+        lora_file_transport: bool = False,
     ) -> None:
         self._backend = backend
         self._uses_lora = bool(uses_lora)
         self._lora_copy_transport = bool(lora_copy_transport)
+        self._lora_file_transport = bool(lora_file_transport)
         self._lora_loaded = False
         self._weights_released = False
         self._last_lora_name: Optional[str] = None
@@ -141,6 +143,19 @@ class WeightSync:
         self._lora_loaded = True
         self._weights_released = False
 
+    def set_lora_from_tensors_file(
+        self,
+        adapter_name: str,
+        lora_tensors: Dict[str, torch.Tensor],
+        *,
+        peft_config: Optional[dict] = None,
+    ) -> None:
+        """Hot-swap the adapter via the file-backed transport, for adapters too large to inline."""
+        self._cache_lora(adapter_name, lora_tensors, peft_config)
+        self._backend.set_lora_file(adapter_name=adapter_name, lora_tensors=lora_tensors, peft_config=peft_config)
+        self._lora_loaded = True
+        self._weights_released = False
+
     def _cache_lora(self, adapter_name: str, lora_tensors: Dict[str, Any], peft_config: Optional[dict]) -> None:
         """Clone the adapter state so a sleep/wake cycle can re-push it."""
         self._last_lora_name = adapter_name
@@ -151,6 +166,16 @@ class WeightSync:
         else:
             self._last_lora_tensors = lora_tensors
         self._last_peft_config = dict(peft_config or {})
+
+    def _push_cached_lora(self) -> None:
+        """Re-push the cached adapter over whichever transport the adapter selected."""
+        if self._lora_file_transport:
+            push = self.set_lora_from_tensors_file
+        elif self._lora_copy_transport:
+            push = self.set_lora_from_tensors_copy
+        else:
+            push = self.set_lora_from_tensors
+        push(self._last_lora_name, self._last_lora_tensors, peft_config=self._last_peft_config)
 
     def loaded_param_checksums(self, *, names: List[str]) -> dict:
         return self._backend.param_checksums(names=list(names))
@@ -172,18 +197,7 @@ class WeightSync:
             self._last_lora_name,
         )
         try:
-            if self._lora_copy_transport:
-                self.set_lora_from_tensors_copy(
-                    self._last_lora_name,
-                    self._last_lora_tensors,
-                    peft_config=self._last_peft_config,
-                )
-            else:
-                self.set_lora_from_tensors(
-                    self._last_lora_name,
-                    self._last_lora_tensors,
-                    peft_config=self._last_peft_config,
-                )
+            self._push_cached_lora()
         except Exception as exc:
             self._lora_loaded = False
             raise RuntimeError(

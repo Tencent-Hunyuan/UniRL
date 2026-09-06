@@ -25,6 +25,8 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
     """Rollout engine backed by vllm-omni's ``Omni`` orchestrator (v2 layout)."""
 
     _component_name = "vllm_omni"
+    # Opts into the group handle's per-rank TP kwargs below.
+    _accepts_rollout_tp_kwargs = True
 
     def __init__(
         self,
@@ -35,7 +37,15 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
         rank: Optional[int] = None,
         model_config: Any = None,
         ports: Optional[VLLMOmniPorts] = None,
+        tp_rank: int = 0,
+        tp_size: int = 1,
+        tp_visible_devices: Optional[List[str]] = None,
+        pp_rank: int = 0,
+        pp_size: int = 1,
+        ep_rank: int = 0,
+        ep_size: int = 1,
     ) -> None:
+        del pp_rank, pp_size, ep_rank, ep_size
         self.cfg = config
         self._version = 0
         self._generate_lock = threading.Lock()
@@ -51,12 +61,25 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
         # engine partially awake/asleep. Normalize through sleep before another
         # wake; generate refuses until residency is consistent again.
         self._transition_failed = False
+        replica_size = int(config.replica_size)
+        # One engine spans the whole replica, so only its head owns a backend;
+        # the other ranks exist to hold their GPU and answer the same RPCs.
+        self._is_replica_head = int(tp_rank) == 0
         logger.info(
-            "VLLM-Omni engine config (complete typed config): %s; model_config_available=%s model_config=%s",
+            "VLLM-Omni engine config (complete typed config): %s; replica_head=%s; "
+            "model_config_available=%s model_config=%s",
             config,
+            self._is_replica_head,
             model_config is not None,
             model_config,
         )
+
+        self.adapter = None
+        self.schedule_policy = None
+        self._backend = None
+        self._weight_sync = None
+        if not self._is_replica_head:
+            return
 
         self.adapter = get_adapter(config.modality)(
             config, model_config, strategy=strategy, tokenize_fn=self._tokenize_prompt
@@ -72,12 +95,20 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
             ports=ports,
             extra=self.adapter.boot_kwargs(),
         )
+        if replica_size > 1:
+            require(
+                int(tp_size) == replica_size and tp_visible_devices is not None,
+                f"grouped vLLM-Omni engine requires {replica_size} visible devices; "
+                f"got tp_size={tp_size}, tp_visible_devices={tp_visible_devices}",
+            )
+            intent["cuda_visible_devices"] = ",".join(str(token) for token in tp_visible_devices)
         self._backend = VLLMOmniBackend.boot(intent)
 
         self._weight_sync = WeightSync(
             self._backend,
             uses_lora=bool(getattr(model_config, "use_lora", False)),
             lora_copy_transport=self.adapter.lora_copy_transport,
+            lora_file_transport=self.adapter.lora_file_transport,
         )
 
     def _tokenize_prompt(self, text: str, *, task: str, sys_type: str) -> List[int]:
@@ -90,6 +121,8 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
         return self._generate_locked(sample)
 
     def _generate_locked(self, sample: Sample) -> Sample:
+        if not self._is_replica_head:
+            return sample
         with self._generate_lock:
             if self._shutdown_requested:
                 raise RuntimeError("VLLMOmniRolloutEngine.generate called after shutdown")
@@ -132,6 +165,9 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
         """Fan ``handle_sleep_task`` to every stage's workers (level 1)."""
         if self._is_offloaded and not self._transition_failed:
             return
+        if not self._is_replica_head:
+            self._is_offloaded = True
+            return
         try:
             self._backend.sleep_task()
         except Exception:
@@ -146,6 +182,10 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def wake_up(self) -> None:
         """Fan ``handle_wake_task`` to every stage's workers + restore LoRA."""
+        if not self._is_replica_head:
+            self._is_offloaded = False
+            self._transition_failed = False
+            return
         if self._transition_failed:
             # Recover an unknown partial stage state to one known boundary
             # before attempting another wake. If this retry fails, retain the
@@ -206,10 +246,16 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
         return self._is_offloaded
 
     def health_check(self) -> bool:
+        if not self._is_replica_head:
+            return True
         return self._backend.ping()
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def shutdown(self) -> None:
+        if not self._is_replica_head:
+            self._shutdown_requested = True
+            self._shutdown_complete = True
+            return
         shutdown_lock = getattr(self, "_shutdown_lock", None)
         if shutdown_lock is None:
             backend = getattr(self, "_backend", None)
@@ -238,6 +284,8 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
 
     def tp_per_stage(self) -> Dict[int, int]:
         """``{stage_id: tensor_parallel_size}`` per stage (parsed from the"""
+        if not self._is_replica_head:
+            return {}
         return self._backend.tp_per_stage()
 
     def update_weights_from_ipc(
@@ -347,6 +395,17 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
     ) -> None:
         """Byte-copy LoRA push for the HI3 two-engine trainer."""
         self._weight_sync.set_lora_from_tensors_copy(adapter_name, lora_tensors, peft_config=peft_config)
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def set_lora_from_tensors_file(
+        self,
+        adapter_name: str,
+        lora_tensors: Dict[str, torch.Tensor],
+        *,
+        peft_config: Optional[dict] = None,
+    ) -> None:
+        """File-backed LoRA push for adapters too large to inline in a control message."""
+        self._weight_sync.set_lora_from_tensors_file(adapter_name, lora_tensors, peft_config=peft_config)
 
     def loaded_param_checksums(self, *, names: List[str]) -> dict:
         return self._weight_sync.loaded_param_checksums(names=names)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from dataclasses import field as dc_field
 from typing import Any, Dict, List, Mapping, Optional, Type
@@ -24,8 +25,11 @@ from .base import (
     _resolve_reference_model,
     _transition_sigma,
     gather_sde_field,
+    rollout_replay_logp_absdiff,
     typed_conditions,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -36,6 +40,8 @@ class FlowGRPOConfig(BaseAlgorithmConfig):
     clip_schedule: str = "constant"
     beta: float = 0.0
     old_logp_source: str = "rollout"
+    max_rollout_replay_logp_absdiff: Optional[float] = None
+    rollout_replay_parity_action: str = "raise"
     params: Any = dc_field(default=None)
 
 
@@ -60,6 +66,8 @@ class FlowGRPO(StageAlgorithm):
         clip_schedule: str = "constant",
         beta: float = 0.0,
         old_logp_source: str = "rollout",
+        max_rollout_replay_logp_absdiff: Optional[float] = None,
+        rollout_replay_parity_action: str = "raise",
         backend: Any = None,
         conditions_cls: Optional[Type[Any]] = None,
     ) -> None:
@@ -79,8 +87,55 @@ class FlowGRPO(StageAlgorithm):
             self.old_logp_source in ("rollout", "replay"),
             f"FlowGRPO: old_logp_source must be 'rollout' or 'replay'; got {old_logp_source!r}",
         )
+        self.max_rollout_replay_logp_absdiff = (
+            None if max_rollout_replay_logp_absdiff is None else float(max_rollout_replay_logp_absdiff)
+        )
+        require(
+            self.max_rollout_replay_logp_absdiff is None or self.max_rollout_replay_logp_absdiff >= 0,
+            f"FlowGRPO: max_rollout_replay_logp_absdiff must be non-negative; got {max_rollout_replay_logp_absdiff!r}",
+        )
+        self.rollout_replay_parity_action = str(rollout_replay_parity_action).strip().lower()
+        require(
+            self.rollout_replay_parity_action in ("raise", "warn"),
+            f"FlowGRPO: rollout_replay_parity_action must be 'raise' or 'warn'; got {rollout_replay_parity_action!r}",
+        )
         _require_replay_anchor_for_batched_replay(self.stage, self.old_logp_source, algo="FlowGRPO")
         self.conditions_cls = conditions_cls
+
+    @staticmethod
+    def _parity_metrics(
+        new_logp: torch.Tensor,
+        old_logp: torch.Tensor,
+        target_steps: List[int],
+    ) -> Dict[str, float]:
+        """Rollout-vs-replay |Δlogp|, overall and per denoising step."""
+        metrics = rollout_replay_logp_absdiff(new_logp, old_logp)
+        for column, step_index in enumerate(target_steps):
+            step = rollout_replay_logp_absdiff(new_logp[:, column], old_logp[:, column])
+            metrics[f"rollout_replay_logp_absdiff_step_{step_index}_mean"] = step["rollout_replay_logp_absdiff_mean"]
+            metrics[f"rollout_replay_logp_absdiff_step_{step_index}_max"] = step["rollout_replay_logp_absdiff_max"]
+        return metrics
+
+    def _enforce_parity(self, drift_metrics: Dict[str, float], target_steps: List[int]) -> None:
+        """Trip the configured gate when replay's log-probs diverge from the rollout's."""
+        threshold = self.max_rollout_replay_logp_absdiff
+        observed = drift_metrics["rollout_replay_logp_absdiff_max"]
+        if threshold is None or observed <= threshold:
+            return
+        per_step = ", ".join(
+            f"{step}:{drift_metrics[f'rollout_replay_logp_absdiff_step_{step}_mean']:.6g}"
+            f"/{drift_metrics[f'rollout_replay_logp_absdiff_step_{step}_max']:.6g}"
+            for step in target_steps
+        )
+        message = (
+            f"FlowGRPO rollout/replay log-prob parity exceeded {threshold:.6g}: "
+            f"max={observed:.6g} mean={drift_metrics['rollout_replay_logp_absdiff_mean']:.6g}; "
+            f"per-step mean/max [{per_step}]"
+        )
+        if self.rollout_replay_parity_action == "warn":
+            logger.warning(message)
+            return
+        raise RuntimeError(message)
 
     def prepare_segment(
         self,
@@ -136,6 +191,9 @@ class FlowGRPO(StageAlgorithm):
             dtype=new_logp.dtype, device=new_logp.device
         )
 
+        drift_metrics = self._parity_metrics(new_logp, old_logp, target_steps)
+        self._enforce_parity(drift_metrics, target_steps)
+
         clip_range = _resolve_clip_range_from_schedule(self.clip_range, self.clip_schedule, training_progress)
         adv_b = advantages.detach().to(dtype=new_logp.dtype, device=new_logp.device).reshape(-1, 1).expand_as(new_logp)
 
@@ -150,6 +208,7 @@ class FlowGRPO(StageAlgorithm):
         metrics: Dict[str, Any] = {
             "policy_loss": float(policy_loss.detach().item()),
             "clip_range": float(clip_range),
+            **drift_metrics,
             **{k: float(v.item()) for k, v in ratio_metrics.items()},
         }
 
