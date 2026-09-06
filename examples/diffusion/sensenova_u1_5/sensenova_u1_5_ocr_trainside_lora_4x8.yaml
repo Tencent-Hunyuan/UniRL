@@ -127,7 +127,7 @@ data_source:
   _target_: unirl.data.data_source.MultimodalRLDataSource
   args:
     run:
-      data_path: datasets/ocr/short_text_train.txt
+      data_path: datasets/ocr/train.txt
       eval_data_path: datasets/ocr/test.txt
       seed: 42
     algorithm:
