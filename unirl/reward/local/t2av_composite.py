@@ -31,7 +31,7 @@ class T2AVCompositeScorer(RewardBackend):
             import dataclasses
 
             # Propagate only fields BOTH the composite and the inner spec declare.
-            shared = ("device", "batch_size", "frame_selection")
+            shared = ("device", "batch_size", "frame_selection", "mode")
             overrides = {f: getattr(config, f) for f in shared if hasattr(inner_spec, f) and hasattr(config, f)}
             if overrides:
                 inner_spec = dataclasses.replace(inner_spec, **overrides)
@@ -101,4 +101,9 @@ class T2AVCompositeSpec(BaseRewardComponentSpec):
     # keeps the historical behaviour; "middle" avoids scoring a blank opening
     # frame on clips that fade or reveal in.
     frame_selection: str = "first"
+    # Forwarded to inner scorers that declare it (imagebind only). Defaults to
+    # ImageBindSpec's own default so existing recipes are unaffected; set "all"
+    # to include the text terms, without which nothing scored here relates the
+    # prompt to the video.
+    mode: str = "audio_video"
     weights: Dict[str, float] = field(default_factory=lambda: {"videopickscore": 0.5, "clap": 0.5})
