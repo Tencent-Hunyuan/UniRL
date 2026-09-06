@@ -128,7 +128,7 @@ data_source:
   args:
     run:
       data_path: datasets/ocr/short_text_train.txt
-      eval_data_path: datasets/ocr/short_text_test.txt
+      eval_data_path: datasets/ocr/test.txt
       seed: 42
     algorithm:
       prompts_per_rollout: ${batch_size}
