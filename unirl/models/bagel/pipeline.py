@@ -136,11 +136,13 @@ class BagelPipeline(Pipeline):
 
     def _extract_input_images(self, conditioning: List[Any], task: str, *, n_prompts: Optional[int]) -> List[Any]:
         """Validated per-sample input PILs for image-input tasks (it2i / i2t / it2t)."""
-        images_prim = next((c for c in conditioning if isinstance(c, Images)), None)
-        if not isinstance(images_prim, Images):
+        image_inputs = [c for c in conditioning if isinstance(c, Images)]
+        if len(image_inputs) != 1:
             raise TypeError(
-                f"BagelPipeline.generate ({task}): expected an Images input in sample.conditioning(), found none"
+                f"BagelPipeline.generate ({task}): expected exactly one Images input in "
+                f"sample.conditioning(), got {len(image_inputs)}"
             )
+        images_prim = image_inputs[0]
         if getattr(self.bundle.model, "vit_model", None) is None:
             raise ValueError(
                 f"BagelPipeline.generate ({task}): the bundle was built without the und ViT; "
