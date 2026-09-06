@@ -101,18 +101,30 @@ class GRPO(StageAlgorithm):
             clip_range_high=clip_high,
         )
 
+        mask: Optional[torch.Tensor] = None
         if segment.loss_mask is not None:
             mask = segment.loss_mask.to(dtype=loss_per_elem.dtype, device=loss_per_elem.device)
             loss_per_elem = loss_per_elem * mask
 
-        if self.loss_agg_mode in ("seq-mean-token-sum-norm", "seq-mean-token-mean") and segment.lengths is not None:
+        if self.loss_agg_mode in ("seq-mean-token-sum-norm", "seq-mean-token-mean"):
             parts = torch.split(loss_per_elem, segment.lengths.tolist())
-            if self.loss_agg_mode == "seq-mean-token-sum-norm":
-                loss = torch.stack([p.sum() for p in parts]).mean() / float(self.horizon)
-            else:  # seq-mean-token-mean — guard 0-length responses (mean of empty = NaN)
-                loss = torch.stack([p.mean() if p.numel() else p.new_zeros(()) for p in parts]).mean()
-        else:
+            if mask is None:
+                if self.loss_agg_mode == "seq-mean-token-sum-norm":
+                    loss = torch.stack([p.sum() for p in parts]).mean() / float(self.horizon)
+                else:
+                    loss = torch.stack([p.mean() if p.numel() else p.new_zeros(()) for p in parts]).mean()
+            else:
+                mask_parts = torch.split(mask, segment.lengths.tolist())
+                valid_parts = [(p, float(m.sum().item())) for p, m in zip(parts, mask_parts) if bool(m.any())]
+                if self.loss_agg_mode == "seq-mean-token-sum-norm":
+                    per_seq = [p.sum() / float(self.horizon) for p, _ in valid_parts]
+                else:
+                    per_seq = [p.sum() / weight for p, weight in valid_parts]
+                loss = torch.stack(per_seq).mean() if per_seq else loss_per_elem.sum() * 0.0
+        elif mask is None:
             loss = loss_per_elem.mean()
+        else:
+            loss = loss_per_elem.sum() / mask.sum().clamp(min=1)
         (loss * loss_scale).backward()
 
         metrics: Dict[str, Any] = {

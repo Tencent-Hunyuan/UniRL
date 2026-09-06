@@ -177,23 +177,22 @@ class GSPO(StageAlgorithm):
         if int(advantages.shape[0]) != num_seqs:
             raise ValueError(f"GSPO: advantages batch={int(advantages.shape[0])} != sequences={num_seqs}")
 
+        seg_ids = torch.repeat_interleave(torch.arange(num_seqs, device=device), lengths)
         if loss_mask is not None:
             mask = loss_mask.to(dtype=new_logp.dtype, device=device)
             new_logp = new_logp * mask
             old_logp = old_logp * mask
-
-        seg_ids = torch.repeat_interleave(torch.arange(num_seqs, device=device), lengths)
-
-        if loss_mask is not None:
-            denom = new_logp.new_zeros(num_seqs).index_add(0, seg_ids, mask).clamp(min=1)
+            denom = new_logp.new_zeros(num_seqs).index_add(0, seg_ids, mask)
+            valid = denom > 0
         else:
-            denom = lengths.to(new_logp.dtype).clamp(min=1)
+            denom = lengths.to(new_logp.dtype)
+            valid = lengths > 0
 
+        denom = denom.clamp(min=1)
         seq_new = new_logp.new_zeros(num_seqs).index_add(0, seg_ids, new_logp) / denom
         seq_old = old_logp.new_zeros(num_seqs).index_add(0, seg_ids, old_logp) / denom
         seq_adv = advantages.detach().to(dtype=new_logp.dtype, device=device)
 
-        valid = lengths > 0
         if bool(valid.all()):
             return seq_new, seq_old, seq_adv
         return seq_new[valid], seq_old[valid], seq_adv[valid]
