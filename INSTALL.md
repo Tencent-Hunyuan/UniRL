@@ -51,7 +51,7 @@ can survive.
 | `sglang` | `sglang[diffusion]`, `flash-attn-4`, torch +cu130 stack, PyAV | Running VLM/LLM examples or `sd3_sglang_*` |
 | `train` | `wandb`, `aiohttp` | Training runs (almost always wanted) |
 | `infer` | `accelerate` | HunyuanImage3 and similar models |
-| `eval` | `torchvision`, `easyocr` | OCR-based reward components |
+| `eval` | `torchvision`, `paddlepaddle`, `paddleocr`, `python-Levenshtein` | OCR-based reward components |
 | `dev` | `pytest`, `ruff`, `pre-commit` | Local development |
 | `dataset-prep` | `datasets`, `pandas`, `pyarrow`, PyAV | Cooking a dataset with a converter under [`datasets/`](datasets/README.md) |
 

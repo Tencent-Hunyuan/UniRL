@@ -104,7 +104,9 @@ infer = [
 ]
 eval = [
   "torchvision>=0.16",
-  "easyocr>=1.7",
+  "paddlepaddle==3.2.2",
+  "paddleocr==3.5.0",
+  "python-Levenshtein>=0.27",
 ]
 # VeOmni's torch-native distributed layer (FSDP2/EP parallelize), consumed
 # exclusively through unirl.train.backend.veomni._compat — a selective import

@@ -1,0 +1,165 @@
+# @package _global_
+# SenseNova-U1.5 OCR FlowGRPO with trainside rollout and LoRA on 4x8 GPUs.
+#
+# Install the OCR dependencies with ``pip install -e '.[eval]'``. This
+# low-resolution recipe is intended to make reward-curve validation affordable;
+# use the full-resolution SenseNova recipe for final-quality generation.
+
+num_devices: 32
+batch_size: 32
+adv_use_global_std: true
+num_rollouts: 300
+
+eval_interval: 5
+eval_num_prompts: 32
+eval_samples_per_prompt: 1
+eval_chunk_prompts: 32
+eval_eta: 0.0
+
+save_interval: 20
+save_dir: ${oc.env:SAVE_DIR,checkpoints/sensenova_u1_5_ocr_trainside_lora_4x8}
+
+logging:
+  report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,false}}
+  project_name: ${oc.env:WANDB_PROJECT,unirl-sensenova}
+  run_name: ${oc.env:WANDB_RUN_NAME,sensenova_u1_5_ocr_trainside_lora_4x8}
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: [sensenova-u1.5, pixel-flow, flowgrpo, ocr, paddleocr, levenshtein, lora, trainside, 4x8]
+  log_media: true
+  media_log_interval: 10
+  media_max_items: 4
+
+bundle:
+  _target_: unirl.models.sensenova_u1.bundle.SenseNovaU1Bundle.from_config
+  config:
+    _target_: unirl.models.sensenova_u1.config.SenseNovaU1PipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:SENSENOVA_U1_PATH,sensenova/SenseNova-U1.5-8B-MoT-SFT}
+    model_precision: fp32
+    autocast_precision: bf16
+    trajectory_precision: bf16
+    logprob_precision: fp32
+    timestep_shift: 3.0
+    attention_backend: sdpa
+    full_finetune_generation: false
+
+pipeline:
+  _target_: unirl.models.sensenova_u1.pipeline.SenseNovaU1Pipeline
+  shift: ${bundle.config.timestep_shift}
+  autocast_precision: ${bundle.config.autocast_precision}
+  trajectory_precision: ${bundle.config.trajectory_precision}
+  logprob_precision: ${bundle.config.logprob_precision}
+  strategy:
+    _target_: unirl.sde.kernels.FlowSDEStrategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["Qwen3DecoderLayer", "NEOVisionModel"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    master_dtype: fp32
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true
+    use_torch_compile: false
+    root_wrap: true
+    checkpoint_format: dcp
+    checkpoint_async: true
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 3.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: ${num_rollouts}
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 64
+    alpha: 128
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    # A regex is intentional: bare gate_proj/up_proj/down_proj suffixes would
+    # also inject adapters into the frozen understanding branch.
+    target_modules: '^model\.language_model\.model\.layers\.\d+\.(?:self_attn\.(?:q_proj_mot_gen|k_proj_mot_gen|v_proj_mot_gen|o_proj_mot_gen)|mlp_mot_gen\.(?:gate_proj|up_proj|down_proj))$'
+
+rollout:
+  _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
+  stage_attrs: [diffusion]
+  forward_batch_size: 1
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.local.ocr.OCRRewardScorer
+    base_device: cpu
+    config:
+      _target_: unirl.reward.local.ocr.OCRSpec
+      lang: en
+
+algorithm:
+  _target_: unirl.algorithms.flowgrpo.FlowGRPO
+  stage_attr: diffusion
+  clip_range: 1.0e-4
+  clip_schedule: constant
+  beta: 0.0
+  old_logp_source: rollout
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.sensenova_u1.conditions.SenseNovaU1Conditions
+  params: ${sampling}
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 2
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: datasets/ocr/train.txt
+      eval_data_path: datasets/ocr/test.txt
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.models.sensenova_u1.diffusion.SenseNovaU1DiffusionParams
+  num_inference_steps: 6
+  guidance_scale: 4.0
+  cfg_norm: global
+  cfg_interval: [0.0, 1.0]
+  t_eps: 0.02
+  height: 320
+  width: 320
+  eta: 0.7
+  samples_per_prompt: 6
+  seed: 42
+  init_same_noise: false
+  scheduler:
+    _target_: unirl.sde.index_schedule.AllSDEScheduler
+    num_timesteps: ${..num_inference_steps}
+    num_sde_steps: 3
+    timestep_fraction: [0.0, 0.7]
+
+eval_sampling:
+  num_inference_steps: 6
+  guidance_scale: 4.0
+  cfg_norm: global
+  height: 320
+  width: 320
+  eta: 0.0
+  # DiffusionSamplingParams keeps a legacy alias. Set both so replacing a
+  # training value of six really produces one deterministic eval sample.
+  samples_per_prompt: 1
+  num_samples_per_prompt: 1

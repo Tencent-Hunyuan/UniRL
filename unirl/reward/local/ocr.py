@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import time
+from collections import Counter
 from dataclasses import dataclass
 from typing import List
 
@@ -11,7 +14,7 @@ from PIL import Image
 from tqdm import tqdm
 
 from unirl.reward.base import BaseRewardComponentSpec
-from unirl.types.reward import RewardRequest
+from unirl.types.reward import RewardRequest, RewardResponse
 
 from .base import LocalRewardBackend
 
@@ -28,17 +31,18 @@ class OCRRewardScorer(LocalRewardBackend):
         super().__init__(lang=config.lang)
 
     def _load_model(self) -> None:
+        self._levenshtein_distance = None
+        try:
+            from Levenshtein import distance as levenshtein_distance
+        except ImportError:
+            logger.info("python-Levenshtein is unavailable; using the pure-Python OCR edit-distance fallback.")
+        else:
+            self._levenshtein_distance = levenshtein_distance
+
         try:
             from paddleocr import PaddleOCR
         except ImportError:
             raise ImportError("paddleocr is required for OCR reward. Install with: pip install paddleocr")
-
-        try:
-            from Levenshtein import distance as levenshtein_distance
-        except ImportError:
-            raise ImportError(
-                "python-Levenshtein is required for OCR reward. Install with: pip install python-Levenshtein"
-            )
 
         import paddle
 
@@ -49,19 +53,39 @@ class OCRRewardScorer(LocalRewardBackend):
             use_textline_orientation=False,
             lang=self.model_kwargs.get("lang", "en"),
         )
-        self._levenshtein_distance = levenshtein_distance
         self.model = "ocr"
 
+    def compute_rewards(self, request: RewardRequest) -> RewardResponse:
+        """Score OCR once and expose order-sensitive diagnostics for every sample."""
+        if not self._is_loaded:
+            raise RuntimeError(
+                f"{type(self).__name__}.compute_rewards called before _load_model "
+                f"completed (model_name={self.model_name!r}, batch_size={request.batch_size})."
+            )
+        start = time.time()
+        rewards, component_rewards = self._compute_rewards_and_components(request)
+        return RewardResponse(
+            rewards=rewards,
+            component_rewards=component_rewards,
+            successes=[True] * len(rewards),
+            errors=[None] * len(rewards),
+            compute_time=time.time() - start,
+        )
+
     def _compute_model_rewards(self, request: RewardRequest) -> List[float]:
+        rewards, _ = self._compute_rewards_and_components(request)
+        return rewards
+
+    def _compute_rewards_and_components(self, request: RewardRequest) -> tuple[List[float], dict[str, List[float]]]:
         import numpy as np
 
         images = request.images
+        if images is None:
+            raise ValueError("OCR reward requires generated images")
+
         prompts: List[str] = []
         for idx, raw_prompt in enumerate(request.prompts):
-            parts = raw_prompt.split('"')
-            if len(parts) < 3:
-                raise ValueError(f"OCR reward prompt at index {idx} must contain quoted target text.")
-            target_text = parts[1].replace(" ", "").lower()
+            target_text = self._extract_target_text(raw_prompt)
             if not target_text:
                 raise ValueError(f"OCR reward prompt at index {idx} has empty quoted target text.")
             prompts.append(target_text)
@@ -70,6 +94,12 @@ class OCRRewardScorer(LocalRewardBackend):
             raise ValueError("Images and prompts must have the same length")
 
         rewards: List[float] = []
+        component_rewards: dict[str, List[float]] = {
+            "edit_similarity": [],
+            "substring_match": [],
+            "exact_match": [],
+            "counter_iou": [],
+        }
         rank = int(os.environ.get("RANK", 0))
         progress = tqdm(
             zip(images, prompts),
@@ -77,32 +107,32 @@ class OCRRewardScorer(LocalRewardBackend):
             disable=(rank != 0),
             total=len(prompts),
         )
-        for sample_idx, (img, prompt) in enumerate(progress):
+        for sample_idx, (img, target) in enumerate(progress):
             if isinstance(img, Image.Image):
                 img = np.array(img)
 
             try:
                 result = self._run_ocr(img)
-                recognized_text = self._extract_recognized_text(result)
-
-                recognized_text = recognized_text.replace(" ", "").lower()
-                if prompt in recognized_text:
-                    dist = 0
-                else:
-                    dist = self._levenshtein_distance(recognized_text, prompt)
-                if dist > len(prompt):
-                    dist = len(prompt)
+                prediction = self._normalize_text(self._extract_recognized_text(result))
+                metrics = self._score_text(prediction, target)
             except Exception:
                 logger.warning(
-                    "OCR reward scoring failed for sample %d; assigning worst-case distance.",
+                    "OCR reward scoring failed for sample %d; assigning zero reward.",
                     sample_idx,
                     exc_info=True,
                 )
-                dist = len(prompt)
+                metrics = {
+                    "edit_similarity": 0.0,
+                    "substring_match": 0.0,
+                    "exact_match": 0.0,
+                    "counter_iou": 0.0,
+                }
 
-            rewards.append(1 - dist / len(prompt))
+            rewards.append(metrics["edit_similarity"])
+            for name, value in metrics.items():
+                component_rewards[name].append(value)
 
-        return rewards
+        return rewards, component_rewards
 
     def _run_ocr(self, img):
         predict_fn = getattr(self._ocr_reader, "predict", None)
@@ -130,6 +160,58 @@ class OCRRewardScorer(LocalRewardBackend):
                         if isinstance(text, str) and text:
                             texts.append(text)
         return "".join(texts)
+
+    @classmethod
+    def _extract_target_text(cls, prompt: str) -> str:
+        match = re.search(r'["“”]([^"“”]+)["“”]', str(prompt))
+        if match is None:
+            raise ValueError("OCR reward prompt must contain quoted target text.")
+        return cls._normalize_text(match.group(1))
+
+    @staticmethod
+    def _normalize_text(text: str) -> str:
+        return "".join(re.findall(r"\w", str(text).casefold(), flags=re.UNICODE))
+
+    @staticmethod
+    def _python_levenshtein_distance(left: str, right: str) -> int:
+        """Dependency-free Levenshtein fallback for the short OCR target strings."""
+        if len(left) < len(right):
+            left, right = right, left
+        previous = list(range(len(right) + 1))
+        for row, left_char in enumerate(left, start=1):
+            current = [row]
+            for col, right_char in enumerate(right, start=1):
+                current.append(
+                    min(
+                        current[-1] + 1,
+                        previous[col] + 1,
+                        previous[col - 1] + (left_char != right_char),
+                    )
+                )
+            previous = current
+        return previous[-1]
+
+    def _score_text(self, prediction: str, target: str) -> dict[str, float]:
+        substring_match = float(bool(target) and target in prediction)
+        exact_match = float(prediction == target)
+        if substring_match:
+            edit_similarity = 1.0
+        else:
+            distance_fn = self._levenshtein_distance or self._python_levenshtein_distance
+            distance = min(int(distance_fn(prediction, target)), len(target))
+            edit_similarity = 1.0 - distance / len(target)
+        return {
+            "edit_similarity": float(edit_similarity),
+            "substring_match": substring_match,
+            "exact_match": exact_match,
+            "counter_iou": self._counter_iou(prediction, target),
+        }
+
+    @staticmethod
+    def _counter_iou(prediction: str, target: str) -> float:
+        pred, gold = Counter(prediction), Counter(target)
+        union = sum((pred | gold).values())
+        return float(sum((pred & gold).values()) / union) if union else 1.0
 
 
 @dataclass

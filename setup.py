@@ -42,7 +42,9 @@ setup(
         ],
         "eval": [
             "torchvision>=0.16",
-            "easyocr>=1.7",
+            "paddlepaddle==3.2.2",
+            "paddleocr==3.5.0",
+            "python-Levenshtein>=0.27",
         ],
         "dev": [
             "pytest>=7.4",
