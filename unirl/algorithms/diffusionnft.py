@@ -264,9 +264,9 @@ class DiffusionNFT(StageAlgorithm):
         policy_loss = (r * pos_loss / beta + (1.0 - r) * neg_loss / beta).mean()
         total = policy_loss * float(self.config.adv_clip_max)
 
-        kl_loss = self._reference_kl(conditions, xt=xt, t_batch=t_batch, new_pred=new_pred)
-        if kl_loss is not None:
-            total = total + float(self.config.kl_coef) * kl_loss
+        ref_deviation = self._reference_deviation(conditions, xt=xt, t_batch=t_batch, new_pred=new_pred)
+        if ref_deviation is not None:
+            total = total + float(self.config.kl_coef) * ref_deviation
 
         metrics = {
             "policy_loss": float(policy_loss.detach().item()),
@@ -279,12 +279,12 @@ class DiffusionNFT(StageAlgorithm):
             "x0_norm": float((x0**2).mean().detach().item()),
             "t_value": float(t_scalar.detach().item()),
         }
-        if kl_loss is not None:
-            metrics["ref_kl_loss"] = float(kl_loss.detach().item())
+        if ref_deviation is not None:
+            metrics["ref_prediction_deviation"] = float(ref_deviation.detach().item())
             metrics["kl_coef"] = float(self.config.kl_coef)
         return total, metrics
 
-    def _reference_kl(
+    def _reference_deviation(
         self,
         conditions: Any,
         *,

@@ -102,11 +102,14 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   `kl_coef > 0` run settles at a lower proxy reward than a `kl_coef = 0` one; budget steps for that
   rather than reading the trade off the timing alone. `kl_coef=0` returns a `None` reference before
   any of that, so it stays bit-identical to a build without the term.
-- **`ref_kl_loss` is the raw mean-difference², not the σ-normalized KL** — DiffusionNFT trains on a
-  freshly noised `xt` rather than the rollout trajectory, so it has no `stage.replay` step indices
-  and no `segment.sigmas` to normalize by, and takes `((new_pred - ref_pred)**2).mean()` on the
-  velocity prediction instead. That is the `add_kl_coefficient=false` variant minus the `/2`, so the
-  number is **not** comparable to FlowGRPO/FlowDPPO's `kl_ref_mean`, which carries
+- **`ref_prediction_deviation` is the raw mean-difference², not the σ-normalized KL** — the metric
+  is named for what it measures rather than for `kl_coef`, which weighs it: the penalty is
+  `((new_pred - ref_pred)**2).mean()`, the same formula as the neighbouring `prediction_deviation`
+  with the anchor swapped from the EMA shadow to the LoRA-disabled base, so the two share a scale
+  and can be read side by side as drift-from-shadow against drift-from-base. DiffusionNFT trains on
+  a freshly noised `xt` rather than the rollout trajectory, so it has no `stage.replay` step indices
+  and no `segment.sigmas` to normalize by. That leaves the `add_kl_coefficient=false` variant minus
+  the `/2`, so the number is **not** comparable to FlowGRPO/FlowDPPO's `kl_ref_mean`, which carries
   `_gaussian_kl_div`'s `/(2σ²)`. Measuring on the prediction rather than the reconstructed `x0`
   drops the `t²` Jacobian of `xt - t*pred`, spreading pressure uniformly over trained timesteps
   instead of `t²`-weighting it — the magnitude still moves with `t` (training lower timesteps raises
