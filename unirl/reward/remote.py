@@ -320,13 +320,17 @@ class RemoteRewardBackend(RewardBackend):
 
     def _get_condition_images(self, request: RewardRequest) -> Optional[List[Union[Image.Image, torch.Tensor]]]:
         """Extract per-sample condition images from request primitives."""
-        prim_image = request.primitives.get("image")
+        use_ordered_reference = bool(request.image_references)
+        prim_image = request.image_references[0] if use_ordered_reference else request.primitives.get("image")
         if prim_image is None:
             return None
-        from unirl.types.primitives import Images
+        from unirl.types.primitives import Images, ImageSets
 
+        source = "request.image_references[0]" if use_ordered_reference else "request.primitives['image']"
+        if isinstance(prim_image, ImageSets):
+            prim_image = prim_image.primary_images(context=source)
         if not isinstance(prim_image, Images):
-            raise TypeError(f"request.primitives['image'] must be Images, got {type(prim_image).__name__}")
+            raise TypeError(f"{source} must be Images or ImageSets, got {type(prim_image).__name__}")
         from unirl.utils.media import tensor_frame_to_pil
 
         return [tensor_frame_to_pil(image.pixels) for image in prim_image.to_list()]

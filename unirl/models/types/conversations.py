@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 
-from unirl.types.primitives import Images
+from unirl.types.primitives import Images, ImageSets
 from unirl.types.sample import Turn
 
 Conversation = List[Dict[str, Any]]
@@ -50,8 +50,13 @@ def build_vision_messages(
     if not turns:
         return []
     roles = [t.role for t in turns]
-    is_image = [isinstance(t.content, Images) for t in turns]
-    cols = [t.content.to_pils() if im else t.content.texts for t, im in zip(turns, is_image)]
+    is_image = [isinstance(t.content, (Images, ImageSets)) for t in turns]
+    cols = [
+        ([[image] for image in t.content.to_pils()] if isinstance(t.content, Images) else t.content.to_pil_rows())
+        if im
+        else t.content.texts
+        for t, im in zip(turns, is_image)
+    ]
     role_groups = group_consecutive_roles(roles)
     prefix = system_prefix(system_instruction, roles)
     n_rows = len(turns[0].content)
@@ -64,7 +69,7 @@ def build_vision_messages(
             text_blocks: List[Dict[str, Any]] = []
             for j in idxs:
                 if is_image[j]:
-                    image_blocks.append({"type": "image", "image": cols[j][row]})
+                    image_blocks.extend({"type": "image", "image": image} for image in cols[j][row])
                 else:
                     text_blocks.append({"type": "text", "text": cols[j][row]})
             messages.append({"role": role, "content": image_blocks + text_blocks})

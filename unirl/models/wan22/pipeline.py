@@ -13,7 +13,7 @@ from unirl.models.wan21.text_embed import WAN21TextEmbedStage
 from unirl.models.wan21.vae import WAN21VAEDecodeStage
 from unirl.sde.kernels import DanceSDEStrategy, StepStrategy
 from unirl.types.noise_recipe import NoiseRecipe
-from unirl.types.primitives import Images, Texts
+from unirl.types.primitives import Images, ImageSets, Texts, require_single_images
 from unirl.types.sample import Sample
 from unirl.types.sampling import DiffusionSamplingParams
 
@@ -145,7 +145,12 @@ class WAN22Pipeline(Pipeline):
                 f"WAN22Pipeline.generate: expected a Texts prompt from sample.conditioning()[0], "
                 f"got {type(texts).__name__ if texts is not None else 'None'}"
             )
-        images_prim = next((c for c in conditioning[1:] if isinstance(c, Images)), None)
+        image_inputs = [c for c in conditioning[1:] if isinstance(c, (Images, ImageSets))]
+        if len(image_inputs) > 1:
+            raise ValueError(
+                f"WAN22Pipeline.generate: expected at most one image conditioning primitive, got {len(image_inputs)}"
+            )
+        images_prim = require_single_images(image_inputs[0], context="WAN22Pipeline.generate") if image_inputs else None
 
         primary_g = float(params.guidance_scale)
         low_g = float(params.guidance_scale_2) if params.guidance_scale_2 is not None else primary_g
