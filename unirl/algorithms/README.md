@@ -97,8 +97,11 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   shadow tracks the policy by construction, so anchoring to it would bound no drift. The reference
   is a third `predict_noise_at_step` per trained timestep, on top of the trainable and shadow ones;
   it runs under `no_grad` and needs no backward (~+24% train phase rather than +50%), and under
-  `train_timestep_mode: all` it is paid once per timestep in the K-loop. `kl_coef=0` returns a
-  `None` reference before any of that, so it stays bit-identical to a build without the term.
+  `train_timestep_mode: all` it is paid once per timestep in the K-loop. That wall-clock number is
+  not the whole cost — the penalty competes with the reward gradient, so at equal step count a
+  `kl_coef > 0` run settles at a lower proxy reward than a `kl_coef = 0` one; budget steps for that
+  rather than reading the trade off the timing alone. `kl_coef=0` returns a `None` reference before
+  any of that, so it stays bit-identical to a build without the term.
 - **`ref_kl_loss` is the raw mean-difference², not the σ-normalized KL** — DiffusionNFT trains on a
   freshly noised `xt` rather than the rollout trajectory, so it has no `stage.replay` step indices
   and no `segment.sigmas` to normalize by, and takes `((new_pred - ref_pred)**2).mean()` on the

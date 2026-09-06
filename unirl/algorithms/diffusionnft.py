@@ -77,11 +77,6 @@ class DiffusionNFT(StageAlgorithm):
             )
         if float(kl_coef) < 0:
             raise ValueError(f"DiffusionNFT: kl_coef must be >= 0; got {kl_coef!r}.")
-        # The reference is the LoRA-disabled base policy, not the EMA shadow: the
-        # shadow tracks the policy, so it cannot anchor drift away from it.
-        self._ref_model = _resolve_reference_model(
-            backend, beta=float(kl_coef), algo="DiffusionNFT", coef_name="kl_coef"
-        )
         if not (0.0 < float(beta)):
             raise ValueError(f"DiffusionNFT: beta must be > 0; got {beta!r}.")
         if not (0.0 < float(adv_clip_max)):
@@ -98,6 +93,12 @@ class DiffusionNFT(StageAlgorithm):
         self.params = params
         self.nft_lora_policy = nft_lora_policy
         self.conditions_cls = conditions_cls
+        # The reference is the LoRA-disabled base policy, not the EMA shadow: the
+        # shadow tracks the policy, so it cannot anchor drift away from it. Resolved
+        # after the scalar checks — it walks `named_parameters()` to find the adapter.
+        self._ref_model = _resolve_reference_model(
+            backend, beta=float(kl_coef), algo="DiffusionNFT", coef_name="kl_coef"
+        )
         self.config = DiffusionNFTConfig(
             beta=float(beta),
             adv_clip_max=float(adv_clip_max),
@@ -280,6 +281,7 @@ class DiffusionNFT(StageAlgorithm):
         }
         if kl_loss is not None:
             metrics["ref_kl_loss"] = float(kl_loss.detach().item())
+            metrics["kl_coef"] = float(self.config.kl_coef)
         return total, metrics
 
     def _reference_kl(
