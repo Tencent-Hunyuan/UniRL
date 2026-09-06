@@ -93,3 +93,26 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   distribution; when unset it silently falls back to the `ARSamplingParams` default,
   *not* the engine's actual temperature, biasing every ratio with no raise. Watch
   `rollout_replay_logp_absdiff_mean` — it should be ~0 on an on-policy step.
+- **DiffusionNFT's `kl_coef > 0` anchors to the LoRA-disabled base, not the EMA shadow** — the
+  shadow tracks the policy by construction, so anchoring to it would bound no drift. The reference
+  is a third `predict_noise_at_step` per trained timestep, on top of the trainable and shadow ones;
+  it runs under `no_grad` and needs no backward (~+24% train phase rather than +50%), and under
+  `train_timestep_mode: all` it is paid once per timestep in the K-loop. That wall-clock number is
+  not the whole cost — the penalty competes with the reward gradient, so at equal step count a
+  `kl_coef > 0` run settles at a lower proxy reward than a `kl_coef = 0` one; budget steps for that
+  rather than reading the trade off the timing alone. `kl_coef=0` returns a `None` reference before
+  any of that, so it stays bit-identical to a build without the term.
+- **`ref_prediction_deviation` is the raw mean-difference², not the σ-normalized KL** — the metric
+  is named for what it measures rather than for `kl_coef`, which weighs it: the penalty is
+  `((new_pred - ref_pred)**2).mean()`, the same formula as the neighbouring `prediction_deviation`
+  with the anchor swapped from the EMA shadow to the LoRA-disabled base, so the two share a scale
+  and can be read side by side as drift-from-shadow against drift-from-base. DiffusionNFT trains on
+  a freshly noised `xt` rather than the rollout trajectory, so it has no `stage.replay` step indices
+  and no `segment.sigmas` to normalize by. That leaves the `add_kl_coefficient=false` variant minus
+  the `/2`, so the number is **not** comparable to FlowGRPO/FlowDPPO's `kl_ref_mean`, which carries
+  `_gaussian_kl_div`'s `/(2σ²)`. Measuring on the prediction rather than the reconstructed `x0`
+  drops the `t²` Jacobian of `xt - t*pred`, spreading pressure uniformly over trained timesteps
+  instead of `t²`-weighting it — the magnitude still moves with `t` (training lower timesteps raises
+  it several-fold). Also note `kl_coef` weighs a policy term already scaled by `adv_clip_max`, so
+  the effective relative strength is `kl_coef / adv_clip_max` and re-tuning the clip re-tunes the
+  penalty.
