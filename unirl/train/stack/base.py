@@ -22,6 +22,16 @@ from unirl.utils.metrics import aggregate_numeric_metrics
 logger = logging.getLogger(__name__)
 
 
+def _shuf(part, sd, cnt):  # shuffled copy of part
+    n = int(part.batch_size)
+    if n <= 1:
+        return part
+    g = torch.Generator()
+    g.manual_seed((int(sd) + int(cnt)) & 0xFFFFFFFF)
+    perm = torch.randperm(n, generator=g)
+    return part.select(perm)
+
+
 @dataclass(frozen=True)
 class TrainStepResult:
     """Result of one ``train_track`` call, possibly spanning multiple optimizer updates."""
@@ -76,6 +86,8 @@ class TrainStack(Remote):
         max_grad_norm: float,
         num_updates_per_batch: int = 1,
         micro_planner: Optional[MicroPlanner] = None,
+        shuffle_updates: bool = False,
+        shuffle_seed: Optional[int] = None,
     ) -> None:
         super().__init__()
         cls = type(self).__name__
@@ -98,6 +110,9 @@ class TrainStack(Remote):
         self.max_grad_norm = float(max_grad_norm)
         self.micro_planner: MicroPlanner = micro_planner if micro_planner is not None else CountPlanner()
         self.micro_planner.validate(algorithm)
+        self.shuf = bool(shuffle_updates)
+        self.shuf_sd = int(shuffle_seed) if shuffle_seed is not None else 0
+        self._shuf_c = 0
 
     def prepare_segment(self, part: Part, *, plans: Plan) -> None:
         """Freeze the π_old anchor once, before the ``num_updates_per_batch`` loop."""
@@ -348,6 +363,9 @@ class TrainStack(Remote):
         arranged = []
         for part in window:
             self._align_track_inputs(part)
+            if self.shuf and self.num_updates_per_batch > 1:
+                part = _shuf(part, self.shuf_sd, self._shuf_c)
+                self._shuf_c += 1
             arranged.append(
                 self.micro_planner.arrange(
                     part,

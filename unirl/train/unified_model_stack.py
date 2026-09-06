@@ -24,6 +24,16 @@ from unirl.utils.metrics import aggregate_numeric_metrics
 logger = logging.getLogger(__name__)
 
 
+def _shuf(part, sd, cnt):  # shuffled copy
+    n = int(part.batch_size)
+    if n <= 1:
+        return part
+    g = torch.Generator()
+    g.manual_seed((int(sd) + int(cnt)) & 0xFFFFFFFF)
+    perm = torch.randperm(n, generator=g)
+    return part.select(perm)
+
+
 class UnifiedModelTrainStack(Remote):
     """Single-backbone, multi-algorithm train stack."""
 
@@ -36,6 +46,8 @@ class UnifiedModelTrainStack(Remote):
         micro_batch_size: int,
         max_grad_norm: float,
         num_updates_per_batch: int = 1,
+        shuffle_updates: bool = False,
+        shuffle_seed: int | None = None,
     ) -> None:
         super().__init__()
         if int(micro_batch_size) < 1:
@@ -59,6 +71,9 @@ class UnifiedModelTrainStack(Remote):
                         f"algorithm ({type(algo).__name__}) sets supports_multi_update=False. Set "
                         f"num_updates_per_batch=1."
                     )
+        self.shuf = bool(shuffle_updates)
+        self.shuf_sd = int(shuffle_seed) if shuffle_seed is not None else 0
+        self._shuf_c = 0
 
     def _optimizer_step_slices(self, total: int) -> List[List[Tuple[int, int]]]:
         """Per-optimizer-step lists of absolute ``(start, end)`` micro-batch slices."""
@@ -225,6 +240,10 @@ class UnifiedModelTrainStack(Remote):
         device = self.fsdp_backend._device
         ar_part = ar_part.to_device(device)
         image_part = image_part.to_device(device)
+        if self.shuf and self.num_updates_per_batch > 1:
+            ar_part = _shuf(ar_part, self.shuf_sd, self._shuf_c)
+            image_part = _shuf(image_part, self.shuf_sd, self._shuf_c)
+            self._shuf_c += 1
 
         from unirl.utils.profiling import profile_mode
 
