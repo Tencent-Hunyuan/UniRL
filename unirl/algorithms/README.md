@@ -117,23 +117,23 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   drops the `t²` Jacobian of `xt - t*pred`, spreading pressure uniformly over trained timesteps
   instead of `t²`-weighting it — the magnitude still moves with `t` (training lower timesteps raises
   it several-fold).
-- **`adv_sat_std` is how many advantage σ map to `r = 0` or `1`** — write `C` for the value and
+- **`adv_std_saturate` is how many advantage σ map to `r = 0` or `1`** — write `C` for the value and
   `q = clamp(adv, ±C)/C ∈ [-1, 1]` so `r = 0.5 + q/2`. Then `total` splits exactly into
   `(C/2)·mean(pos_loss + neg_loss)/β` plus `(C/2)·mean(q · (pos_loss − neg_loss))/β`. Both halves
-  carry the same `C/2`, so `total = policy_loss * adv_sat_std` is a **pure gain**: it cancels the
+  carry the same `C/2`, so `total = policy_loss * adv_std_saturate` is a **pure gain**: it cancels the
   `1/C` inside `q` and leaves the objective's shape untouched, and the learning rate absorbs it. The
   `/β` is a gain as well — the raw NFT gradient scales linearly in `β` (grad-norm/β is constant over
   `β = 0.05 … 1.0`), so dividing by it makes the step β-independent. Raising `C` shrinks `E|q|`
   (0.63 at `C=1` versus 0.16 at `C=5`) and the signal-to-symmetric ratio falls to 0.29x across that
   range. It is a first-class RL knob, not a safety clip.
-- **`adv_sat_std: 5.0` de-contrasts ~3.4x against the paper's parameterization** — DiffusionNFT
+- **`adv_std_saturate: 5.0` de-contrasts ~3.4x against the paper's parameterization** — DiffusionNFT
   (arXiv:2509.16117, Alg. 1) uses `r = 0.5 + 0.5·clip(r_norm / Z_c, -1, 1)` with `Z_c` "some
   normalizing factor, which could take the form of a global reward std", and its loss carries **no**
   outer scale. UniRL's advantages already arrive std-normalized (`Part.compute_advantages(normalize=
-  True)` ⇒ `(reward − group_mean)/(group_std + eps)`), so `adv_sat_std` divides a z-score by another
+  True)` ⇒ `(reward − group_mean)/(group_std + eps)`), so `adv_std_saturate` divides a z-score by another
   5 and `r` spans only `[0.066, 0.966]` rather than saturating at 0 and 1. Consequence when porting
-  coefficients: the policy term carries an overall `adv_sat_std/β` gain that the upstream objective
-  does not — 50x at the H3 recipe's `β=0.1`, `adv_sat_std=5` — so `ref_deviation_coef` is **not** on
+  coefficients: the policy term carries an overall `adv_std_saturate/β` gain that the upstream objective
+  does not — 50x at the H3 recipe's `β=0.1`, `adv_std_saturate=5` — so `ref_deviation_coef` is **not** on
   the same scale as verl-omni's `ref_kl_coef`. Check that factor before copying a value across.
   (verl-omni documents its own knob as a "prediction-space reference MSE regularizer", the same
   reading of the quantity this file takes above.)

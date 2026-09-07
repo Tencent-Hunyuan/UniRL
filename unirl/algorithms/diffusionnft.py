@@ -22,7 +22,7 @@ class DiffusionNFTConfig(BaseAlgorithmConfig):
     """Per-call DiffusionNFT loss hyperparameters."""
 
     beta: float = 1.0
-    adv_sat_std: float = 5.0
+    adv_std_saturate: float = 5.0
     adv_mode: str = "raw"
     use_adaptive_weight: bool = True
     train_timestep_mode: str = "all"
@@ -47,7 +47,7 @@ class DiffusionNFT(StageAlgorithm):
         nft_lora_policy: Any = None,
         backend: Any = None,
         beta: float = 1.0,
-        adv_sat_std: float = 5.0,
+        adv_std_saturate: float = 5.0,
         adv_mode: str = "raw",
         use_adaptive_weight: bool = True,
         train_timestep_mode: str = "all",
@@ -79,8 +79,8 @@ class DiffusionNFT(StageAlgorithm):
             raise ValueError(f"DiffusionNFT: ref_deviation_coef must be finite and >= 0; got {ref_deviation_coef!r}.")
         if not (0.0 < float(beta)):
             raise ValueError(f"DiffusionNFT: beta must be > 0; got {beta!r}.")
-        if not (0.0 < float(adv_sat_std)):
-            raise ValueError(f"DiffusionNFT: adv_sat_std must be > 0; got {adv_sat_std!r}.")
+        if not (0.0 < float(adv_std_saturate)):
+            raise ValueError(f"DiffusionNFT: adv_std_saturate must be > 0; got {adv_std_saturate!r}.")
 
         if not callable(getattr(nft_lora_policy, "use_shadow", None)):
             raise TypeError(
@@ -101,7 +101,7 @@ class DiffusionNFT(StageAlgorithm):
         )
         self.config = DiffusionNFTConfig(
             beta=float(beta),
-            adv_sat_std=float(adv_sat_std),
+            adv_std_saturate=float(adv_std_saturate),
             adv_mode=str(adv_mode),
             use_adaptive_weight=bool(use_adaptive_weight),
             train_timestep_mode=str(train_timestep_mode),
@@ -158,7 +158,7 @@ class DiffusionNFT(StageAlgorithm):
 
         typed_conds = _typed_conditions(conditions, self.conditions_cls)
         adv = advantages.detach().to(dtype=compute_dtype, device=device)
-        sat = float(self.config.adv_sat_std)
+        sat = float(self.config.adv_std_saturate)
         adv_sat = torch.clamp(adv, -sat, sat)
         r = (adv_sat / sat) / 2.0 + 0.5
         r = torch.clamp(r, 0.0, 1.0)
@@ -263,7 +263,7 @@ class DiffusionNFT(StageAlgorithm):
             neg_loss = ((x0_neg - x0_for_mse) ** 2).mean(dim=reduce_dims)
 
         policy_loss = (r * pos_loss / beta + (1.0 - r) * neg_loss / beta).mean()
-        total = policy_loss * float(self.config.adv_sat_std)
+        total = policy_loss * float(self.config.adv_std_saturate)
 
         ref_deviation = self._reference_deviation(conditions, xt=xt, t_batch=t_batch, new_pred=new_pred)
         if ref_deviation is not None:

@@ -154,7 +154,7 @@ algorithm:
     path: unirl.models.minimax_h3.conditions.MiniMaxH3Conditions
   params: ${sampling}
   beta: 0.1
-  adv_sat_std: 5.0
+  adv_std_saturate: 5.0
   adv_mode: raw
   use_adaptive_weight: true
   # Read the rollout's own 10-transition schedule and train on all of it; Flow-GRPO
