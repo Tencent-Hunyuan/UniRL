@@ -33,8 +33,8 @@ def _validate_safetensors(weights_path: str, checkpoint_path: str, expected: str
             ):
                 raise TypeError("weight_map must be a non-empty string mapping")
             referenced = {os.path.basename(name) for name in weight_map.values()}
-        except (OSError, KeyError, TypeError, AttributeError, json.JSONDecodeError) as exc:
-            raise ValueError(f"Meta-init checkpoint has an invalid safetensors index: {index_path!r}.") from exc
+        except (OSError, KeyError, TypeError, AttributeError, ValueError):
+            continue
         if referenced <= shards:
             return
         if referenced & shards:
@@ -47,15 +47,14 @@ def _validate_safetensors(weights_path: str, checkpoint_path: str, expected: str
             return
         numbered.setdefault((match.group(1), int(match.group(3))), set()).add(int(match.group(2)))
 
-    if any(present in (set(range(total)), set(range(1, total + 1))) for (_, total), present in numbered.items()):
+    if any(present == set(range(1, total + 1)) for (_, total), present in numbered.items()):
         return
     if incomplete_index is not None:
         missing = sorted(incomplete_index - shards)
         raise ValueError(f"Meta-init checkpoint {checkpoint_path!r} is incomplete; missing shard(s): {missing[:8]}.")
     if numbered:
         (_, total), present = max(numbered.items(), key=lambda item: len(item[1]))
-        base = 0 if 0 in present else 1
-        missing = sorted(set(range(base, base + total)) - present)
+        missing = sorted(set(range(1, total + 1)) - present)
         raise ValueError(
             f"Meta-init checkpoint {checkpoint_path!r} is incomplete; missing numbered shard(s): {missing[:8]}."
         )
