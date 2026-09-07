@@ -13,6 +13,7 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.bagel.bagel_transformer import NaiveCache
 from vllm_omni.diffusion.models.bagel.pipeline_bagel import BagelPipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 from unirl.models.bagel.rl_ops import (
     build_image_transforms,
@@ -21,7 +22,10 @@ from unirl.models.bagel.rl_ops import (
 )
 from unirl.rollout.engine.vllm_omni.pipelines._shared.interception import (
     drain_trajectory_into,
+    finalize_output,
     resolve_request_noise,
+    set_payload,
+    single_request,
 )
 from unirl.rollout.engine.vllm_omni.pipelines.bagel.bagel_flow_match_sde_scheduler import (
     BagelFlowSDEScheduler,
@@ -187,7 +191,8 @@ class RLBagelPipeline(BagelPipeline):
             return
 
         original_generate_image = self.bagel.generate_image
-        merge_kv_caches = type(self.bagel)._merge_naive_caches
+        # vllm-omni 0.27 moved _merge_naive_caches onto the cache as NaiveCache.merge.
+        merge_kv_caches = NaiveCache.merge
         pipeline = self
 
         def generate_image_grouped(*args: Any, **kwargs: Any) -> Any:
@@ -328,7 +333,7 @@ class RLBagelPipeline(BagelPipeline):
         drain_trajectory_into(out, self._sde_scheduler)
 
     def _is_batchable_t2i(self, req: OmniDiffusionRequest) -> bool:
-        """Packed DiT batching: pure text→image at cfg=1 only."""
+        """Packed DiT batching: pure text→image at cfg=1 only. Expects the unwrapped request."""
         fp = req.prompts[0] if getattr(req, "prompts", None) else None
         if isinstance(fp, dict):
             modalities = fp.get("modalities") or []
@@ -341,15 +346,17 @@ class RLBagelPipeline(BagelPipeline):
             return False
         return extra["cfg_text_scale"] <= 1.0 and extra["cfg_img_scale"] <= 1.0
 
-    def forward(self, req: OmniDiffusionRequest, **kwargs) -> DiffusionOutput:
+    def forward(self, req: DiffusionRequestBatch, **kwargs) -> DiffusionOutput:
+        """Single-request batch in, single output out — see ``single_request``."""
+        one = single_request(req, caller="RLBagelPipeline.forward")
         self._install_sde_scheduler()
         self._install_noise_tap()
         self._install_rope_fp32()
         self._install_rmsnorm_fp32()
 
-        spp = getattr(req.sampling_params, "num_outputs_per_prompt", 1)
+        spp = getattr(one.sampling_params, "num_outputs_per_prompt", 1)
         if spp > 1:
-            if not self._is_batchable_t2i(req):
+            if not self._is_batchable_t2i(one):
                 raise RuntimeError(
                     f"RLBagelPipeline: num_outputs_per_prompt={spp} requires pure t2i "
                     f"with cfg_text_scale<=1 and cfg_img_scale<=1 present in "
@@ -361,49 +368,49 @@ class RLBagelPipeline(BagelPipeline):
 
         # it2i: build the conditioning ourselves (trainside-identical) and inject it,
         # so upstream's own img2img prefill never runs. No-op for t2i.
-        image = self._source_image(req)
+        image = self._source_image(one)
         if image is not None:
-            self._inject_it2i_contexts(req, image)
+            self._inject_it2i_contexts(one, image)
 
-        self._arm_sde(req)
-        self._arm_initial_noise(req)
+        self._arm_sde(one)
+        self._arm_initial_noise(one)
 
         out = super().forward(req, **kwargs)
 
         self._harvest_trajectory(out)
+        finalize_output(out)
         return out
 
-    def _forward_batched(self, req: OmniDiffusionRequest, spp: int, **kwargs) -> DiffusionOutput:
+    def _forward_batched(self, req: DiffusionRequestBatch, spp: int, **kwargs) -> DiffusionOutput:
         """Pack ``spp`` same-prompt images into ONE ``generate_image``."""
+        one = single_request(req, caller="RLBagelPipeline._forward_batched")
         self._install_generate_image_tap()
         ds = int(self.bagel.latent_downsample)
-        per = (int(req.sampling_params.height) // ds) * (int(req.sampling_params.width) // ds)
-        self._arm_sde(req, image_token_sizes=[per] * spp)
-        self._arm_initial_noise(req)
+        per = (int(one.sampling_params.height) // ds) * (int(one.sampling_params.width) // ds)
+        self._arm_sde(one, image_token_sizes=[per] * spp)
+        self._arm_initial_noise(one)
         self._pending_spp = spp
         self._pending_batched_latents = None
         try:
             out = super().forward(req, **kwargs)
             self._harvest_trajectory(out)
+            finalize_output(out)
             lats = self._pending_batched_latents
             if not lats or len(lats) != spp:
                 raise RuntimeError(
                     f"RLBagelPipeline batched forward: generate_image tap captured "
                     f"{0 if not lats else len(lats)} latents, expected spp={spp}."
                 )
-            first = None
             raw = out.output
-            if isinstance(raw, dict):
-                first = (raw.get("payload") or {}).get("image")
-            elif isinstance(raw, (list, tuple)) and raw:
-                first = raw[0]
-            image_shape = (int(req.sampling_params.height), int(req.sampling_params.width))
+            first = raw[0] if isinstance(raw, (list, tuple)) and raw else raw
+            image_shape = (int(one.sampling_params.height), int(one.sampling_params.width))
             if first is not None:
-                out.output = [first] + [
+                images = [first] + [
                     self._decode_image_from_latent(self.bagel, self.vae, lat, image_shape) for lat in lats[1:]
                 ]
             else:
-                out.output = [self._decode_image_from_latent(self.bagel, self.vae, lat, image_shape) for lat in lats]
+                images = [self._decode_image_from_latent(self.bagel, self.vae, lat, image_shape) for lat in lats]
+            set_payload(out, images)
         finally:
             self._pending_spp = 1
             self._pending_batched_latents = None

@@ -19,8 +19,8 @@
 # to nccl_broadcast cleared the hang. See feat-branch commit 0ec7774 +
 # notes for details.
 #
-# Launch (2 nodes x 8 GPUs, taiji SPMD):
-#   bash examples/run_experiment_multinode_taiji.sh diffusion/hunyuan_video15/hunyuan_video15_t2v_vllmomni_nccl_separate
+# Launch (2 nodes x 8 GPUs, SPMD):
+#   bash examples/run_experiment_multinode.sh diffusion/hunyuan_video15/hunyuan_video15_t2v_vllmomni_nccl_separate
 
 num_devices: 16                    # 2 nodes × 8 GPUs
 batch_size: 16                     # prompts_per_rollout

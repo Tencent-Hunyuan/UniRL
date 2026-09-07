@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 
 from unirl.models.types.bundle import Bundle
-from unirl.models.types.meta_init import build_meta_init_transformer
+from unirl.models.types.meta_init import build_meta_init_transformer, resolve_meta_init_weights
 from unirl.utils.dtypes import parse_torch_dtype
 
 from .config import QwenVLPipelineConfig
@@ -52,6 +52,7 @@ class QwenVLBundle(Bundle):
 
         meta_init_state = None
         if config.meta_init_transformer:
+            transformer_weights_path = resolve_meta_init_weights(path)
             # Restore non-persistent RoPE buffers after meta initialization.
             from transformers import AutoConfig
 
@@ -100,7 +101,7 @@ class QwenVLBundle(Bundle):
             pretrained_path=path,
         )
         if config.meta_init_transformer:
-            bundle._transformer_weights_path = path
+            bundle._transformer_weights_path = transformer_weights_path
             bundle._meta_init_state = meta_init_state
         return bundle
 

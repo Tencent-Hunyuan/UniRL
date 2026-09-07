@@ -5,8 +5,8 @@
 # MoE + VL combined: Qwen3_5MoeDecoderLayer blocks + the VLM adapter.
 # Install the VeOmni extra: uv pip install -e ".[sglang,train,infer,veomni]"
 #
-# Meta-init sharded loading requires a LOCAL checkpoint directory. For smoke,
-# download tiny-random/qwen3.5-moe locally and point QWEN3_5_MOE_PATH at it.
+# QWEN3_5_MOE_PATH accepts a Hub ID or local checkpoint; meta-init resolves and
+# validates Hub shards in the local cache before loading.
 #
 # Smoke (1 GPU, 1 rollout, tiny model):
 #   QWEN3_5_MOE_PATH=/path/to/local/qwen3.5-moe-tiny \

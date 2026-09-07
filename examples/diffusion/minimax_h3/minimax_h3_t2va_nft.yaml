@@ -154,7 +154,7 @@ algorithm:
     path: unirl.models.minimax_h3.conditions.MiniMaxH3Conditions
   params: ${sampling}
   beta: 0.1
-  adv_clip_max: 5.0
+  adv_std_saturate: 5.0
   adv_mode: raw
   use_adaptive_weight: true
   # Read the rollout's own 10-transition schedule and train on all of it; Flow-GRPO
@@ -163,9 +163,9 @@ algorithm:
   shuffle_train_timesteps: true
   apply_time_shift_in_loss: false
   training_timestep_fraction: 1.0
-  # A reference-model KL term would cost a third forward per timestep and is not
-  # implemented; the algorithm rejects kl_coef > 0.
-  kl_coef: 0.0
+  # ref_deviation_coef > 0 anchors the policy to the LoRA-disabled base with a third no_grad
+  # forward per trained timestep; see unirl/algorithms/README.md. Default off.
+  ref_deviation_coef: 0.0
 
 stack:
   _target_: unirl.train.stack.TrainStack

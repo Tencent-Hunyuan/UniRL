@@ -6,7 +6,7 @@
 #       Trainer recomputes the π_old anchor via stage.replay at update time
 #       (the engine's best-effort native log-probs, if any, are ignored).
 #
-#   2x8:  bash examples/run_experiment_multinode_taiji.sh diffusion/sd3/sd3_sglang_replay_colocate
+#   2x8:  bash examples/run_experiment_multinode.sh diffusion/sd3/sd3_sglang_replay_colocate
 
 num_devices: 16               # 2 nodes x 8 GPUs; launcher auto-overrides via NUM_NODES*GPUS_PER_NODE
 batch_size: 96                # prompts_per_rollout, matches v1 reference 2x8 baseline
