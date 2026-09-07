@@ -62,8 +62,8 @@ short-edge tier table 256/480/720 → 3/5/10; short edges above the 720p bin sta
 - **`meta_init_transformer: true`** (both recipes) builds the 16B transformer on the meta
   device and lets the backend load sharded weights after wrapping — the eager path would
   put the full ~64 GB fp32 model on every rank before sharding. The sharded loader reads
-  local `*.safetensors` only, so a Hub-ID checkpoint path is resolved to a local
-  snapshot (`snapshot_download(allow_patterns=["transformer/*"])`) before wrapping.
+  local `*.safetensors` only, so the shared meta-init resolver downloads a Hub checkpoint's
+  transformer shards, validates their completeness, and pins later loads to the same revision.
 - WanVAE was trained with amp off; encode/decode run in the VAE's own dtype
   (`vae_precision`, fp32) and it stays a small eager module.
 

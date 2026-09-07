@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 
 from unirl.models.types.bundle import Bundle
-from unirl.models.types.meta_init import build_meta_init_transformer, resolve_meta_init_weights
+from unirl.models.types.meta_init import MetaInitCheckpoint, build_meta_init_transformer, resolve_meta_init_weights
 from unirl.models.types.value_head import ValueHead
 from unirl.utils.dtypes import parse_torch_dtype
 
@@ -69,12 +69,17 @@ class Qwen3Bundle(Bundle):
 
         dtype = parse_torch_dtype(config.model_precision, field_name="model_precision")
 
+        checkpoint = MetaInitCheckpoint(path)
         if config.meta_init_transformer:
-            transformer_weights_path = resolve_meta_init_weights(path)
+            checkpoint = resolve_meta_init_weights(path)
             # Restore non-persistent RoPE buffers after meta initialization.
             from transformers import AutoConfig
 
-            hf_config = AutoConfig.from_pretrained(path, trust_remote_code=bool(config.trust_remote_code))
+            hf_config = AutoConfig.from_pretrained(
+                path,
+                trust_remote_code=bool(config.trust_remote_code),
+                revision=checkpoint.revision,
+            )
             transformer, meta_init_state = build_meta_init_transformer(
                 lambda: AutoModelForCausalLM.from_config(hf_config, trust_remote_code=bool(config.trust_remote_code)),
                 dtype=dtype,
@@ -103,6 +108,7 @@ class Qwen3Bundle(Bundle):
         tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_path,
             trust_remote_code=bool(config.trust_remote_code),
+            revision=checkpoint.revision_for(tokenizer_path),
         )
         if tokenizer.pad_token is None and tokenizer.eos_token is not None:
             tokenizer.pad_token = tokenizer.eos_token
@@ -122,7 +128,7 @@ class Qwen3Bundle(Bundle):
             pretrained_path=path,
         )
         if config.meta_init_transformer:
-            bundle._transformer_weights_path = transformer_weights_path
+            checkpoint.stash_on(bundle)
             bundle._meta_init_state = meta_init_state
         return bundle
 

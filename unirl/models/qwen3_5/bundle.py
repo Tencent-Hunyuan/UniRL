@@ -10,7 +10,12 @@ import torch.nn as nn
 from packaging.version import Version
 
 from unirl.models.types.bundle import Bundle
-from unirl.models.types.meta_init import build_meta_init_transformer, capture_init_state, resolve_meta_init_weights
+from unirl.models.types.meta_init import (
+    MetaInitCheckpoint,
+    build_meta_init_transformer,
+    capture_init_state,
+    resolve_meta_init_weights,
+)
 from unirl.utils.dtypes import parse_torch_dtype
 
 from .config import Qwen3_5PipelineConfig
@@ -139,10 +144,15 @@ class Qwen3_5Bundle(Bundle):
             device = torch.device(device)
 
         dtype = parse_torch_dtype(config.model_precision, field_name="model_precision")
+        checkpoint = MetaInitCheckpoint(path)
         if config.meta_init_transformer:
-            transformer_weights_path = resolve_meta_init_weights(path)
+            checkpoint = resolve_meta_init_weights(path)
 
-        hf_config = AutoConfig.from_pretrained(path, trust_remote_code=bool(config.trust_remote_code))
+        hf_config = AutoConfig.from_pretrained(
+            path,
+            trust_remote_code=bool(config.trust_remote_code),
+            revision=checkpoint.revision,
+        )
         model_type = hf_config.model_type
         ModelCls = _model_class_for(model_type)
 
@@ -234,6 +244,7 @@ class Qwen3_5Bundle(Bundle):
             trust_remote_code=bool(config.trust_remote_code),
             min_pixels=config.min_pixels,
             max_pixels=config.max_pixels,
+            revision=checkpoint.revision,
         )
         tokenizer = processor.tokenizer
         if tokenizer.pad_token is None and tokenizer.eos_token is not None:
@@ -248,7 +259,7 @@ class Qwen3_5Bundle(Bundle):
             pretrained_path=path,
         )
         if config.meta_init_transformer:
-            bundle._transformer_weights_path = transformer_weights_path
+            checkpoint.stash_on(bundle)
             bundle._meta_init_state = meta_init_state
         return bundle
 

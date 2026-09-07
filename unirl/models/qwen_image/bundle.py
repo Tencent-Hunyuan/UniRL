@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 
 from unirl.models.types.bundle import Bundle
-from unirl.models.types.meta_init import build_meta_init_transformer, resolve_meta_init_weights
+from unirl.models.types.meta_init import MetaInitCheckpoint, build_meta_init_transformer, resolve_meta_init_weights
 from unirl.utils.dtypes import parse_torch_dtype
 
 from .config import QwenImagePipelineConfig
@@ -84,9 +84,12 @@ class QwenImageBundle(Bundle):
         te_dtype = parse_torch_dtype(te_raw, field_name="text_encoder_dtype")
 
         meta_init_state = None
+        checkpoint = MetaInitCheckpoint(path)
         if config.meta_init_transformer:
-            transformer_weights_path = resolve_meta_init_weights(path, component="transformer")
-            transformer_config = QwenImageTransformer2DModel.load_config(path, subfolder="transformer")
+            checkpoint = resolve_meta_init_weights(path, component="transformer")
+            transformer_config = QwenImageTransformer2DModel.load_config(
+                path, subfolder="transformer", revision=checkpoint.revision
+            )
             transformer, meta_init_state = build_meta_init_transformer(
                 lambda: QwenImageTransformer2DModel.from_config(transformer_config), dtype=dtype
             )
@@ -98,7 +101,12 @@ class QwenImageBundle(Bundle):
         vae = None
         if config.load_vae:
             vae = (
-                AutoencoderKLQwenImage.from_pretrained(vae_path, subfolder="vae", torch_dtype=vae_dtype)
+                AutoencoderKLQwenImage.from_pretrained(
+                    vae_path,
+                    subfolder="vae",
+                    torch_dtype=vae_dtype,
+                    revision=checkpoint.revision_for(vae_path),
+                )
                 .to(device)
                 .eval()
             )
@@ -109,15 +117,24 @@ class QwenImageBundle(Bundle):
         if config.load_text_encoder:
             text_encoder = (
                 Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                    text_encoder_path, subfolder="text_encoder", torch_dtype=te_dtype
+                    text_encoder_path,
+                    subfolder="text_encoder",
+                    torch_dtype=te_dtype,
+                    revision=checkpoint.revision_for(text_encoder_path),
                 )
                 .to(device)
                 .eval()
             )
             text_encoder.requires_grad_(False)
-            tokenizer = Qwen2Tokenizer.from_pretrained(text_encoder_path, subfolder="tokenizer")
+            tokenizer = Qwen2Tokenizer.from_pretrained(
+                text_encoder_path,
+                subfolder="tokenizer",
+                revision=checkpoint.revision_for(text_encoder_path),
+            )
 
-        scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(path, subfolder="scheduler")
+        scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+            path, subfolder="scheduler", revision=checkpoint.revision
+        )
 
         bundle = cls(
             transformer=transformer,
@@ -130,7 +147,7 @@ class QwenImageBundle(Bundle):
             pretrained_path=path,
         )
         if config.meta_init_transformer:
-            bundle._transformer_weights_path = transformer_weights_path
+            checkpoint.stash_on(bundle)
             bundle._meta_init_state = meta_init_state
         return bundle
 

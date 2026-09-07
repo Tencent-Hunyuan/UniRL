@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 
 from unirl.models.types.bundle import Bundle
-from unirl.models.types.meta_init import build_meta_init_transformer, resolve_meta_init_weights
+from unirl.models.types.meta_init import MetaInitCheckpoint, build_meta_init_transformer, resolve_meta_init_weights
 from unirl.utils.dtypes import parse_torch_dtype
 
 from .config import WAN21PipelineConfig
@@ -79,10 +79,13 @@ class WAN21Bundle(Bundle):
         te_dtype = parse_torch_dtype(te_raw, field_name="text_encoder_dtype")
 
         meta_init_state = None
+        checkpoint = MetaInitCheckpoint(path)
         if config.meta_init_transformer:
-            transformer_weights_path = resolve_meta_init_weights(path, component="transformer")
+            checkpoint = resolve_meta_init_weights(path, component="transformer")
             # Preserve WanRotaryPosEmbed buffers across meta initialization.
-            transformer_config = WanTransformer3DModel.load_config(path, subfolder="transformer")
+            transformer_config = WanTransformer3DModel.load_config(
+                path, subfolder="transformer", revision=checkpoint.revision
+            )
             transformer, meta_init_state = build_meta_init_transformer(
                 lambda: WanTransformer3DModel.from_config(transformer_config), dtype=dtype
             )
@@ -98,7 +101,11 @@ class WAN21Bundle(Bundle):
             if not os.path.isdir(vae_src):
                 from huggingface_hub import snapshot_download
 
-                vae_src = snapshot_download(repo_id=vae_src, allow_patterns=["vae/*"])
+                vae_src = snapshot_download(
+                    repo_id=vae_src,
+                    allow_patterns=["vae/*"],
+                    revision=checkpoint.revision_for(vae_src),
+                )
 
             vae = (
                 WanVideoVAE.load_from_diffusers(
@@ -112,11 +119,20 @@ class WAN21Bundle(Bundle):
             vae.requires_grad_(False)
 
         text_encoder = (
-            UMT5EncoderModel.from_pretrained(te_path, subfolder="text_encoder", torch_dtype=te_dtype).to(device).eval()
+            UMT5EncoderModel.from_pretrained(
+                te_path,
+                subfolder="text_encoder",
+                torch_dtype=te_dtype,
+                revision=checkpoint.revision_for(te_path),
+            )
+            .to(device)
+            .eval()
         )
         text_encoder.requires_grad_(False)
 
-        tokenizer = AutoTokenizer.from_pretrained(te_path, subfolder="tokenizer")
+        tokenizer = AutoTokenizer.from_pretrained(
+            te_path, subfolder="tokenizer", revision=checkpoint.revision_for(te_path)
+        )
 
         image_dim = int(getattr(transformer.config, "image_dim", 0) or 0)
         vision_encoder: Optional[nn.Module] = None
@@ -132,10 +148,21 @@ class WAN21Bundle(Bundle):
                 ) from e
             ie_path = config.image_encoder_ckpt_path or path
             vision_encoder = (
-                CLIPVisionModel.from_pretrained(ie_path, subfolder="image_encoder", torch_dtype=dtype).to(device).eval()
+                CLIPVisionModel.from_pretrained(
+                    ie_path,
+                    subfolder="image_encoder",
+                    torch_dtype=dtype,
+                    revision=checkpoint.revision_for(ie_path),
+                )
+                .to(device)
+                .eval()
             )
             vision_encoder.requires_grad_(False)
-            image_processor = CLIPImageProcessor.from_pretrained(ie_path, subfolder="image_processor")
+            image_processor = CLIPImageProcessor.from_pretrained(
+                ie_path,
+                subfolder="image_processor",
+                revision=checkpoint.revision_for(ie_path),
+            )
         elif config.image_encoder_ckpt_path is not None:
             raise ValueError(
                 "WAN21Bundle.from_config: image_encoder_ckpt_path="
@@ -158,7 +185,7 @@ class WAN21Bundle(Bundle):
             image_processor=image_processor,
         )
         if config.meta_init_transformer:
-            bundle._transformer_weights_path = transformer_weights_path
+            checkpoint.stash_on(bundle)
             bundle._meta_init_state = meta_init_state
         return bundle
 

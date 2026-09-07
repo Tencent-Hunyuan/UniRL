@@ -207,9 +207,8 @@ class FlowMatchSchedulePolicy:
                 return cls._dynamic_from_overrides(shift, dynamic_overrides, path)
             if root is not None:
                 logger.debug(
-                    "FlowMatchSchedulePolicy.from_pretrained: %s does not exist "
-                    "locally (likely an HF repo ID — bundle.from_pretrained will "
-                    "resolve it). Falling back to static_only(shift=%s).",
+                    "FlowMatchSchedulePolicy.from_pretrained: %s does not exist locally; "
+                    "falling back to static_only(shift=%s).",
                     root,
                     shift,
                 )

@@ -8,13 +8,12 @@
 # no-op (== the SP/FSDP-only path).
 #
 # PREREQUISITES:
-#   1. A LOCAL checkpoint dir. Both layouts load directly (no offline merge): HF
-#      original per-expert (experts.N.gate_proj/up_proj/down_proj) AND VeOmni stacked
-#      (experts.gate_up_proj/down_proj). The EP-aware loader
+#   1. A Hub ID or local checkpoint in either supported layout: HF original per-expert
+#      (experts.N.gate_proj/up_proj/down_proj) or VeOmni stacked
+#      (experts.gate_up_proj/down_proj). Meta-init resolves Hub shards into the local
+#      cache before the EP-aware loader
 #      (unirl.train.backend.sharded_load._load_state_dict_ep_sliced) reconstructs each
-#      rank's fused expert block from the per-expert keys on the fly. Point
-#      QWEN3_MOE_PATH at a local download of Qwen/Qwen3-30B-A3B (HF repo IDs are not
-#      fetched here — sharded_load reads *.safetensors from a local dir).
+#      rank's fused expert block from the per-expert keys on the fly.
 #   2. EP-aware weight sync — IMPLEMENTED. TensorWeightSync (via FullWeightSync.
 #      _iter_full_tensors_ep) all-gathers the EP-sharded experts over the ep group and
 #      reverse-converts stacked->HF per-expert names for SGLang's expert_params_mapping

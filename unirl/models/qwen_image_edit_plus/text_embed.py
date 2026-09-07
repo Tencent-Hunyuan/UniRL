@@ -55,14 +55,17 @@ class QwenImageEditPlusTextEmbedStage(ImageConditionedEmbedStage[Texts, Images, 
             )
         self.bundle = bundle
         self.max_sequence_length = int(max_sequence_length)
-        self.processor = self._load_processor(processor_path or bundle.pretrained_path)
+        self.processor = self._load_processor(
+            processor_path or bundle.pretrained_path,
+            revision=None if processor_path else getattr(bundle, "_checkpoint_revision", None),
+        )
 
     @staticmethod
-    def _load_processor(path: str):
+    def _load_processor(path: str, *, revision: Optional[str] = None):
         """Load Qwen2VLProcessor from the checkpoint ``processor/`` subfolder."""
         from transformers import Qwen2VLProcessor
 
-        return Qwen2VLProcessor.from_pretrained(path, subfolder="processor")
+        return Qwen2VLProcessor.from_pretrained(path, subfolder="processor", revision=revision)
 
     def embed(self, p: Texts, images: Optional[Images] = None) -> TextEmbedCondition:
         """Encode prompts; optionally condition on source images."""

@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 
 from unirl.models.types.bundle import Bundle
-from unirl.models.types.meta_init import build_meta_init_transformer, resolve_meta_init_weights
+from unirl.models.types.meta_init import MetaInitCheckpoint, build_meta_init_transformer, resolve_meta_init_weights
 from unirl.utils.dtypes import parse_torch_dtype
 
 from .config import SD3PipelineConfig
@@ -74,9 +74,12 @@ class SD3Bundle(Bundle):
         te_dtype = parse_torch_dtype(te_raw, field_name="text_encoder_dtype")
 
         meta_init_state = None
+        checkpoint = MetaInitCheckpoint(path)
         if config.meta_init_transformer:
-            transformer_weights_path = resolve_meta_init_weights(path, component="transformer")
-            transformer_config = SD3Transformer2DModel.load_config(path, subfolder="transformer")
+            checkpoint = resolve_meta_init_weights(path, component="transformer")
+            transformer_config = SD3Transformer2DModel.load_config(
+                path, subfolder="transformer", revision=checkpoint.revision
+            )
             transformer, meta_init_state = build_meta_init_transformer(
                 lambda: SD3Transformer2DModel.from_config(transformer_config), dtype=dtype
             )
@@ -87,31 +90,56 @@ class SD3Bundle(Bundle):
 
         vae = None
         if config.load_vae:
-            vae = AutoencoderKL.from_pretrained(path, subfolder="vae", torch_dtype=vae_dtype).to(device).eval()
+            vae = (
+                AutoencoderKL.from_pretrained(
+                    path, subfolder="vae", torch_dtype=vae_dtype, revision=checkpoint.revision
+                )
+                .to(device)
+                .eval()
+            )
             vae.requires_grad_(False)
 
         text_encoder = (
-            CLIPTextModelWithProjection.from_pretrained(path, subfolder="text_encoder", torch_dtype=te_dtype)
+            CLIPTextModelWithProjection.from_pretrained(
+                path,
+                subfolder="text_encoder",
+                torch_dtype=te_dtype,
+                revision=checkpoint.revision,
+            )
             .to(device)
             .eval()
         )
         text_encoder.requires_grad_(False)
         text_encoder_2 = (
-            CLIPTextModelWithProjection.from_pretrained(path, subfolder="text_encoder_2", torch_dtype=te_dtype)
+            CLIPTextModelWithProjection.from_pretrained(
+                path,
+                subfolder="text_encoder_2",
+                torch_dtype=te_dtype,
+                revision=checkpoint.revision,
+            )
             .to(device)
             .eval()
         )
         text_encoder_2.requires_grad_(False)
         text_encoder_3 = (
-            T5EncoderModel.from_pretrained(path, subfolder="text_encoder_3", torch_dtype=te_dtype).to(device).eval()
+            T5EncoderModel.from_pretrained(
+                path,
+                subfolder="text_encoder_3",
+                torch_dtype=te_dtype,
+                revision=checkpoint.revision,
+            )
+            .to(device)
+            .eval()
         )
         text_encoder_3.requires_grad_(False)
 
-        tokenizer = CLIPTokenizer.from_pretrained(path, subfolder="tokenizer")
-        tokenizer_2 = CLIPTokenizer.from_pretrained(path, subfolder="tokenizer_2")
-        tokenizer_3 = T5TokenizerFast.from_pretrained(path, subfolder="tokenizer_3")
+        tokenizer = CLIPTokenizer.from_pretrained(path, subfolder="tokenizer", revision=checkpoint.revision)
+        tokenizer_2 = CLIPTokenizer.from_pretrained(path, subfolder="tokenizer_2", revision=checkpoint.revision)
+        tokenizer_3 = T5TokenizerFast.from_pretrained(path, subfolder="tokenizer_3", revision=checkpoint.revision)
 
-        scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(path, subfolder="scheduler")
+        scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+            path, subfolder="scheduler", revision=checkpoint.revision
+        )
 
         bundle = cls(
             transformer=transformer,
@@ -128,7 +156,7 @@ class SD3Bundle(Bundle):
             pretrained_path=path,
         )
         if config.meta_init_transformer:
-            bundle._transformer_weights_path = transformer_weights_path
+            checkpoint.stash_on(bundle)
             bundle._meta_init_state = meta_init_state
         return bundle
 

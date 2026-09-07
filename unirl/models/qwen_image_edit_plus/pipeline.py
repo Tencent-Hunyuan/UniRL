@@ -75,7 +75,7 @@ class QwenImageEditPlusPipeline(Pipeline):
         from unirl.sde.runtime import FlowMatchSchedulePolicy
 
         return FlowMatchSchedulePolicy.from_pretrained(
-            getattr(self.bundle, "pretrained_path", None),
+            getattr(self.bundle, "_resolved_checkpoint_path", self.bundle.pretrained_path),
             shift=float(self.shift),
             require_dynamic=True,
             dynamic_overrides=_qwen_image_dynamic_overrides(),
