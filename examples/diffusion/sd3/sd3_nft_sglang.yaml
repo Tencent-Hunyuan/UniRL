@@ -131,7 +131,7 @@ algorithm:
     path: unirl.models.sd3.conditions.SD3Conditions
   params: ${sampling}
   beta: 1.0
-  adv_clip_max: 5.0
+  adv_sat_std: 5.0
   adv_mode: raw
   use_adaptive_weight: true
   train_timestep_mode: all

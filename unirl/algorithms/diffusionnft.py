@@ -22,7 +22,7 @@ class DiffusionNFTConfig(BaseAlgorithmConfig):
     """Per-call DiffusionNFT loss hyperparameters."""
 
     beta: float = 1.0
-    adv_clip_max: float = 5.0
+    adv_sat_std: float = 5.0
     adv_mode: str = "raw"
     use_adaptive_weight: bool = True
     train_timestep_mode: str = "all"
@@ -47,7 +47,8 @@ class DiffusionNFT(StageAlgorithm):
         nft_lora_policy: Any = None,
         backend: Any = None,
         beta: float = 1.0,
-        adv_clip_max: float = 5.0,
+        adv_sat_std: float = 5.0,
+        adv_clip_max: Optional[float] = None,
         adv_mode: str = "raw",
         use_adaptive_weight: bool = True,
         train_timestep_mode: str = "all",
@@ -79,8 +80,13 @@ class DiffusionNFT(StageAlgorithm):
             raise ValueError(f"DiffusionNFT: ref_deviation_coef must be finite and >= 0; got {ref_deviation_coef!r}.")
         if not (0.0 < float(beta)):
             raise ValueError(f"DiffusionNFT: beta must be > 0; got {beta!r}.")
-        if not (0.0 < float(adv_clip_max)):
-            raise ValueError(f"DiffusionNFT: adv_clip_max must be > 0; got {adv_clip_max!r}.")
+        if adv_clip_max is not None:
+            raise ValueError(
+                f"DiffusionNFT: adv_clip_max was renamed to adv_sat_std; got {adv_clip_max!r}. "
+                f"It is how many advantage σ map to r=0 or 1, not a safety clip — see algorithms/README.md."
+            )
+        if not (0.0 < float(adv_sat_std)):
+            raise ValueError(f"DiffusionNFT: adv_sat_std must be > 0; got {adv_sat_std!r}.")
 
         if not callable(getattr(nft_lora_policy, "use_shadow", None)):
             raise TypeError(
@@ -101,7 +107,7 @@ class DiffusionNFT(StageAlgorithm):
         )
         self.config = DiffusionNFTConfig(
             beta=float(beta),
-            adv_clip_max=float(adv_clip_max),
+            adv_sat_std=float(adv_sat_std),
             adv_mode=str(adv_mode),
             use_adaptive_weight=bool(use_adaptive_weight),
             train_timestep_mode=str(train_timestep_mode),
@@ -158,8 +164,9 @@ class DiffusionNFT(StageAlgorithm):
 
         typed_conds = _typed_conditions(conditions, self.conditions_cls)
         adv = advantages.detach().to(dtype=compute_dtype, device=device)
-        adv_clipped = torch.clamp(adv, -self.config.adv_clip_max, self.config.adv_clip_max)
-        r = (adv_clipped / self.config.adv_clip_max) / 2.0 + 0.5
+        sat = float(self.config.adv_sat_std)
+        adv_sat = torch.clamp(adv, -sat, sat)
+        r = (adv_sat / sat) / 2.0 + 0.5
         r = torch.clamp(r, 0.0, 1.0)
 
         per_iter_metrics: List[Dict[str, float]] = []
@@ -262,7 +269,7 @@ class DiffusionNFT(StageAlgorithm):
             neg_loss = ((x0_neg - x0_for_mse) ** 2).mean(dim=reduce_dims)
 
         policy_loss = (r * pos_loss / beta + (1.0 - r) * neg_loss / beta).mean()
-        total = policy_loss * float(self.config.adv_clip_max)
+        total = policy_loss * float(self.config.adv_sat_std)
 
         ref_deviation = self._reference_deviation(conditions, xt=xt, t_batch=t_batch, new_pred=new_pred)
         if ref_deviation is not None:
