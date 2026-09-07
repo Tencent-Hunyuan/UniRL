@@ -64,6 +64,9 @@ in `backend/base.py`; a multi-update-capable algorithm sets
   divide the per-worker batch** — otherwise the ctor or `_build_mini_batch_slices`
   raises (a ragged mini-batch would silently drop samples and desync grad-accum
   across DP ranks).
+- **Multi-update membership is contiguous by default.** Set `shuffle_updates: true`
+  on the stack to shuffle the full per-worker batch before it is partitioned into
+  optimizer updates; `shuffle_seed` makes that per-rollout ordering reproducible.
 - **`optimizer_step` silently *skips* (does not crash) on a non-finite grad norm**
   and zeroes grads — a flat loss curve with a logged warning means grads went
   non-finite.

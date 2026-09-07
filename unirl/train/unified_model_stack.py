@@ -14,24 +14,14 @@ from unirl.algorithms.base import AlgorithmStepResult, StageAlgorithm
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
 from unirl.train.backend.fsdp import FSDPBackend
-from unirl.train.stack import TrainStepResult, _build_micro_batch_slices
+from unirl.train.stack import TrainStepResult
 from unirl.train.stack.base import _aggregate_update_results
-from unirl.train.stack.planner.types import _positive_int, _update_ranges
+from unirl.train.stack.planner import CountPlanner, Plan, UpdatePlanner, _positive_int
 from unirl.types.sample import Part, Sample
 from unirl.types.sampling import ARSamplingParams, DiffusionSamplingParams
 from unirl.utils.metrics import aggregate_numeric_metrics
 
 logger = logging.getLogger(__name__)
-
-
-def _shuf(part, sd, cnt):  # shuffled copy
-    n = int(part.batch_size)
-    if n <= 1:
-        return part
-    g = torch.Generator()
-    g.manual_seed((int(sd) + int(cnt)) & 0xFFFFFFFF)
-    perm = torch.randperm(n, generator=g)
-    return part.select(perm)
 
 
 class UnifiedModelTrainStack(Remote):
@@ -71,25 +61,15 @@ class UnifiedModelTrainStack(Remote):
                         f"algorithm ({type(algo).__name__}) sets supports_multi_update=False. Set "
                         f"num_updates_per_batch=1."
                     )
-        self.shuf = bool(shuffle_updates)
-        self.shuf_sd = int(shuffle_seed) if shuffle_seed is not None else 0
-        self._shuf_c = 0
+        self.update_planner = UpdatePlanner(
+            CountPlanner(),
+            shuffle_updates=shuffle_updates,
+            shuffle_seed=shuffle_seed,
+        )
+        self.update_planner.validate(self.ar_algorithm)
+        self.update_planner.validate(self.image_algorithm)
 
-    def _optimizer_step_slices(self, total: int) -> List[List[Tuple[int, int]]]:
-        """Per-optimizer-step lists of absolute ``(start, end)`` micro-batch slices."""
-        steps: List[List[Tuple[int, int]]] = []
-        for mini_start, mini_end in _update_ranges(total_size=total, num_updates=self.num_updates_per_batch):
-            steps.append(
-                [
-                    (mini_start + ms, mini_start + me)
-                    for ms, me in _build_micro_batch_slices(
-                        total_size=mini_end - mini_start, micro_batch_size=self.micro_batch_size
-                    )
-                ]
-            )
-        return steps
-
-    def prepare_segment(self, algorithm: StageAlgorithm, part: Part) -> None:
+    def prepare_segment(self, algorithm: StageAlgorithm, part: Part, *, plans: Plan) -> None:
         """Freeze one algorithm's π_old anchor once, before the multi-update loop."""
         if part.segment is None:
             return
@@ -100,7 +80,7 @@ class UnifiedModelTrainStack(Remote):
         if recomputes is None or not recomputes():
             prepare(conditions=part.conditions, segment=part.segment)
             return
-        micro_slices = [sl for step in self._optimizer_step_slices(int(part.batch_size)) for sl in step]
+        micro_slices = [micro_slice for update in plans for micro_slice in update]
         if len(micro_slices) == 1:
             prepare(conditions=part.conditions, segment=part.segment)
             return
@@ -240,10 +220,11 @@ class UnifiedModelTrainStack(Remote):
         device = self.fsdp_backend._device
         ar_part = ar_part.to_device(device)
         image_part = image_part.to_device(device)
-        if self.shuf and self.num_updates_per_batch > 1:
-            ar_part = _shuf(ar_part, self.shuf_sd, self._shuf_c)
-            image_part = _shuf(image_part, self.shuf_sd, self._shuf_c)
-            self._shuf_c += 1
+        (ar_part, ar_steps), (image_part, image_steps) = self.update_planner.arrange_many(
+            (ar_part, image_part),
+            num_updates=self.num_updates_per_batch,
+            micro_batch_size=self.micro_batch_size,
+        )
 
         from unirl.utils.profiling import profile_mode
 
@@ -256,11 +237,9 @@ class UnifiedModelTrainStack(Remote):
             )
         profiler = self._train_step_profiler() if scope == "train" else None
         with profiler.record("train_track") if profiler is not None else nullcontext():
-            self.prepare_segment(self.ar_algorithm, ar_part)
-            self.prepare_segment(self.image_algorithm, image_part)
+            self.prepare_segment(self.ar_algorithm, ar_part, plans=ar_steps)
+            self.prepare_segment(self.image_algorithm, image_part, plans=image_steps)
 
-            ar_steps = self._optimizer_step_slices(int(ar_part.batch_size))
-            image_steps = self._optimizer_step_slices(int(image_part.batch_size))
             per_update: List[Dict[str, TrainStepResult]] = []
             for u in range(self.num_updates_per_batch):
                 per_update.append(

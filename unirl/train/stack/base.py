@@ -15,21 +15,11 @@ from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
 from unirl.distributed.tensor.batch import _move_value
 from unirl.train.backend.fsdp import FSDPBackend
-from unirl.train.stack.planner import CountPlanner, MicroPlanner, Plan, UpdatePlan, _positive_int
+from unirl.train.stack.planner import CountPlanner, MicroPlanner, Plan, UpdatePlan, UpdatePlanner, _positive_int
 from unirl.types.sample import Part
 from unirl.utils.metrics import aggregate_numeric_metrics
 
 logger = logging.getLogger(__name__)
-
-
-def _shuf(part, sd, cnt):  # shuffled copy of part
-    n = int(part.batch_size)
-    if n <= 1:
-        return part
-    g = torch.Generator()
-    g.manual_seed((int(sd) + int(cnt)) & 0xFFFFFFFF)
-    perm = torch.randperm(n, generator=g)
-    return part.select(perm)
 
 
 @dataclass(frozen=True)
@@ -109,10 +99,12 @@ class TrainStack(Remote):
         self.micro_batch_size = int(micro_batch_size)
         self.max_grad_norm = float(max_grad_norm)
         self.micro_planner: MicroPlanner = micro_planner if micro_planner is not None else CountPlanner()
-        self.micro_planner.validate(algorithm)
-        self.shuf = bool(shuffle_updates)
-        self.shuf_sd = int(shuffle_seed) if shuffle_seed is not None else 0
-        self._shuf_c = 0
+        self.update_planner = UpdatePlanner(
+            self.micro_planner,
+            shuffle_updates=shuffle_updates,
+            shuffle_seed=shuffle_seed,
+        )
+        self.update_planner.validate(algorithm)
 
     def prepare_segment(self, part: Part, *, plans: Plan) -> None:
         """Freeze the π_old anchor once, before the ``num_updates_per_batch`` loop."""
@@ -363,11 +355,8 @@ class TrainStack(Remote):
         arranged = []
         for part in window:
             self._align_track_inputs(part)
-            if self.shuf and self.num_updates_per_batch > 1:
-                part = _shuf(part, self.shuf_sd, self._shuf_c)
-                self._shuf_c += 1
             arranged.append(
-                self.micro_planner.arrange(
+                self.update_planner.arrange(
                     part,
                     num_updates=self.num_updates_per_batch,
                     micro_batch_size=self.micro_batch_size,

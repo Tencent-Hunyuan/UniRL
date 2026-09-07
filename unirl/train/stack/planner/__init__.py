@@ -10,6 +10,7 @@ from unirl.train.stack.planner.types import (
     _build_micro_batch_slices,
     _positive_int,
 )
+from unirl.train.stack.planner.update import UpdatePlanner
 
 __all__ = [
     "CountPlanner",
@@ -17,6 +18,7 @@ __all__ = [
     "Plan",
     "Range",
     "TokenBudgetPlanner",
+    "UpdatePlanner",
     "UpdatePlan",
     "_build_micro_batch_slices",
     "_count_plan",
