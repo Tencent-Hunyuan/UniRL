@@ -15,7 +15,7 @@ from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
 from unirl.train.backend.fsdp import FSDPBackend
 from unirl.train.stack import TrainStepResult
-from unirl.train.stack.base import _aggregate_update_results
+from unirl.train.stack.base import _aggregate_update_results, _release_reordered_track_inputs
 from unirl.train.stack.planner import CountPlanner, Plan, UpdatePlanner, _positive_int
 from unirl.types.sample import Part, Sample
 from unirl.types.sampling import ARSamplingParams, DiffusionSamplingParams
@@ -216,17 +216,22 @@ class UnifiedModelTrainStack(Remote):
         rollout_id: int | None = None,
     ) -> Dict[str, TrainStepResult]:
         """Driver-callable: prepare → backward(ar) + backward(image) → ONE step."""
-        ar_part = sample.gen_part(ARSamplingParams)
-        image_part = sample.gen_part(DiffusionSamplingParams)
-        device = self.fsdp_backend._device
-        ar_part = ar_part.to_device(device)
-        image_part = image_part.to_device(device)
+        input_ar_part = sample.gen_part(ARSamplingParams)
+        input_image_part = sample.gen_part(DiffusionSamplingParams)
         (ar_part, ar_steps), (image_part, image_steps) = self.update_planner.arrange_many(
-            (ar_part, image_part),
+            (input_ar_part, input_image_part),
             num_updates=self.num_updates_per_batch,
             micro_batch_size=self.micro_batch_size,
             shuffle_step=rollout_id,
         )
+        if ar_part is not input_ar_part:
+            _release_reordered_track_inputs(input_ar_part)
+        if image_part is not input_image_part:
+            _release_reordered_track_inputs(input_image_part)
+        del sample
+        device = self.fsdp_backend._device
+        ar_part = ar_part.to_device(device)
+        image_part = image_part.to_device(device)
 
         from unirl.utils.profiling import profile_mode
 

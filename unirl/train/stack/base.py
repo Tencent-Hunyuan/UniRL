@@ -64,6 +64,13 @@ def _align_track_to_model(part: Part, *, device: torch.device) -> None:
         part.advantages = part.advantages.to(device=device)
 
 
+def _release_reordered_track_inputs(part: Part) -> None:
+    """Drop device-heavy fields after a planner has produced an independent reordered Part."""
+    part.segment = None
+    part.conditions = {}
+    part.advantages = None
+
+
 class TrainStack(Remote):
     """Single-stage stage-driven train stack — family-agnostic."""
 
@@ -354,16 +361,18 @@ class TrainStack(Remote):
                 "optimizer steps inside the window would re-step on partial gradients."
             )
         arranged = []
-        for part in window:
-            self._align_track_inputs(part)
-            arranged.append(
-                self.update_planner.arrange(
-                    part,
-                    num_updates=self.num_updates_per_batch,
-                    micro_batch_size=self.micro_batch_size,
-                    shuffle_step=rollout_id,
-                )
+        for input_part in window:
+            part, plans = self.update_planner.arrange(
+                input_part,
+                num_updates=self.num_updates_per_batch,
+                micro_batch_size=self.micro_batch_size,
+                shuffle_step=rollout_id,
             )
+            if part is not input_part:
+                _release_reordered_track_inputs(input_part)
+            self._align_track_inputs(part)
+            arranged.append((part, plans))
+        del input_part, parts, window
         from unirl.utils.profiling import profile_mode
 
         profiler = self._train_step_profiler() if profile_mode() == "train" else None

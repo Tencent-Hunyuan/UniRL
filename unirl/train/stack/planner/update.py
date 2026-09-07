@@ -93,7 +93,7 @@ class UpdatePlanner:
                     f"of the smallest size ({coarse_size}); got {sizes}."
                 )
             fanout = size // coarse_size
-            if fanout > 1:
+            if part is not coarse:
                 cls._validate_lineage_expansion(coarse, part, fanout=fanout)
             offsets = torch.arange(fanout)
             permutations.append((coarse_permutation[:, None] * fanout + offsets).reshape(-1))
