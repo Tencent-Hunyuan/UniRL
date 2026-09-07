@@ -117,19 +117,27 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   drops the `t²` Jacobian of `xt - t*pred`, spreading pressure uniformly over trained timesteps
   instead of `t²`-weighting it — the magnitude still moves with `t` (training lower timesteps raises
   it several-fold).
-- **`ref_deviation_coef / adv_clip_max` is a base-anchor-to-shadow-anchor ratio, not an accident** —
-  `total = adv_clip_max * policy_loss` reads like a stray scale but is a normalization: `r` carries a
-  `1/C` (`r = clamp(adv, ±C)/(2C) + 0.5`), and the multiply cancels it. `total` then splits exactly
-  into `mean(adv/2 · (pos_loss − neg_loss)/β)`, which is **independent** of `adv_clip_max`, plus
-  `(C/2)·mean(pos_loss + neg_loss)/β`, which is not — so retuning the clip does not move the
-  advantage-driven RL signal. What it moves is that symmetric term, whose gradient w.r.t. `new_pred`
-  is exactly `4t²β²(new_pred − old_pred)`: a quadratic pull toward the EMA shadow (exact at
-  `use_adaptive_weight: false`; the adaptive weights skew it only slightly, measured cosine 0.9967).
-  `adv_clip_max` is therefore two knobs welded together — the advantage magnitude at which a sample
-  counts as fully good or fully bad, and the strength of an implicit trust region around the shadow.
-  `ref_deviation_coef` is the same shape of pull toward the frozen base, which is what makes the
-  ratio meaningful: raising `adv_clip_max` tightens the policy to its own EMA relative to the base,
-  it does not weaken the reward signal.
+- **`adv_clip_max` is the optimality-probability contrast, not a safety clamp** — write
+  `q = clamp(adv, ±C)/C ∈ [-1, 1]` so `r = 0.5 + q/2`. Then `total` splits exactly into
+  `(C/2)·mean(pos_loss + neg_loss)/β` plus `(C/2)·mean(q · (pos_loss − neg_loss))/β`. Both halves
+  carry the same `C/2`, so `total = policy_loss * adv_clip_max` is a **pure gain**: it cancels the
+  `1/C` inside `q` and leaves the objective's shape untouched, and the learning rate absorbs it. The
+  `/β` is a gain as well — the raw NFT gradient scales linearly in `β` (grad-norm/β is constant over
+  `β = 0.05 … 1.0`), so dividing by it makes the step β-independent. What `adv_clip_max` actually
+  sets is how many advantage σ map to full optimality, i.e. the reinforcement signal's weight against
+  the flow-matching term: `E|q|` is 0.63 at `C=1` versus 0.16 at `C=5`, and the signal-to-symmetric
+  ratio falls to 0.29x across that range. It is a first-class RL knob, not a guard rail.
+- **`adv_clip_max: 5.0` de-contrasts ~3.4x against the paper's parameterization** — DiffusionNFT
+  (arXiv:2509.16117, Alg. 1) uses `r = 0.5 + 0.5·clip(r_norm / Z_c, -1, 1)` with `Z_c` "some
+  normalizing factor, which could take the form of a global reward std", and its loss carries **no**
+  outer scale. UniRL's advantages already arrive std-normalized (`Part.compute_advantages(normalize=
+  True)` ⇒ `(reward − group_mean)/(group_std + eps)`), so `adv_clip_max` divides a z-score by another
+  5 and `r` spans only `[0.066, 0.966]` rather than saturating at 0 and 1. Consequence when porting
+  coefficients: the policy term carries an overall `adv_clip_max/β` gain that the upstream objective
+  does not — 50x at the H3 recipe's `β=0.1`, `adv_clip_max=5` — so `ref_deviation_coef` is **not** on
+  the same scale as verl-omni's `ref_kl_coef`. Check that factor before copying a value across.
+  (verl-omni documents its own knob as a "prediction-space reference MSE regularizer", the same
+  reading of the quantity this file takes above.)
 - **The reference penalty is uninformative while the adapter delta is sub-ULP** — both operands come
   straight out of a bf16 forward, and standard LoRA init (`B=0`) starts the delta at exactly zero.
   Below roughly 2 bf16 ULP (RMS delta ≲ 0.01 against O(1) predictions) the difference is mostly
