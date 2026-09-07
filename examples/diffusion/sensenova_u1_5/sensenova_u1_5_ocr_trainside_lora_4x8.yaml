@@ -73,7 +73,7 @@ backend:
     learning_rate: 3.0e-4
     adam_beta1: 0.9
     adam_beta2: 0.95
-    adam_epsilon: 1.0e-8
+    adam_epsilon: 1.0e-15
     weight_decay: 0.0
   scheduler_cfg:
     _target_: unirl.train.backend.base.LrSchedulerConfig
@@ -120,7 +120,7 @@ algorithm:
 stack:
   _target_: unirl.train.stack.TrainStack
   micro_batch_size: 1
-  max_grad_norm: 1.0
+  max_grad_norm: 0.003
   num_updates_per_batch: 2
 
 data_source:
