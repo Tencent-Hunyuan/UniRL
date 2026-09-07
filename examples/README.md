@@ -46,8 +46,8 @@ ENTRY=train_sft bash examples/run_experiment_single_node.sh sft/qwen3_agent_sft_
 ENTRY=train_pe  bash examples/run_experiment_single_node.sh pe/pe_trainside_pickscore
 ENTRY=train_agentic bash examples/run_experiment_single_node.sh deep_research/deep_research_search_judge
 
-# 2. Multi-node (taiji)
-bash examples/run_experiment_multinode_taiji.sh diffusion/sd3/sd3_sglang_rollout_colocate
+# 2. Multi-node
+bash examples/run_experiment_multinode.sh diffusion/sd3/sd3_sglang_rollout_colocate
 
 # 3. Or invoke an entrypoint directly, without the launchers
 python -m unirl.train_diffusion --config-name=diffusion/sd3/sd3_trainside num_devices=8

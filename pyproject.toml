@@ -40,6 +40,11 @@ dependencies = [
   "tensordict>=0.5",
 ]
 
+# Parent/inline engines load this. Multi-stage StageDiffusionProc does not —
+# VLLMOmniHijack.hijack() reinstalls the same hook in spawn children.
+[project.entry-points."vllm_omni.general_plugins"]
+unirl_capture_flush = "unirl.rollout.engine.vllm_omni.plugin:register_capture_flush"
+
 [project.optional-dependencies]
 # sglang pinned to the upstream release the UniRL sglang patch package
 # (unirl/rollout/engine/sglang_diffusion/_patches/, LIN-365) is verified against
@@ -73,13 +78,16 @@ sglang = [
   "flash-linear-attention[conv1d]==0.5.1 ; sys_platform == 'linux'",
   "av>=14.2,<19 ; sys_platform == 'linux'",
 ]
-# CUDA 12.9 stack: vllm 0.20.0 PyPI wheels are compiled against CUDA 12.9.
+# CUDA 13: vllm >=0.26 wants a bare `torch==2.13.0` whose wheel is cu130, and a
+# +cu129 pin would resolve anyway, linking a CUDA-12 torch under a CUDA-13 vllm.
+# Prerelease, so installs need --prerelease=allow, plus sglang's compat layer.
 vllm = [
-  "vllm==0.20.0 ; sys_platform == 'linux'",
-  "vllm-omni==0.20.0 ; sys_platform == 'linux'",
-  "torch==2.11.0+cu129 ; sys_platform == 'linux'",
-  "torchvision==0.26.0+cu129 ; sys_platform == 'linux'",
-  "torchaudio==2.11.0+cu129 ; sys_platform == 'linux'",
+  "vllm==0.27.0 ; sys_platform == 'linux'",
+  "vllm-omni==0.27.0rc1 ; sys_platform == 'linux'",
+  "torch==2.13.0+cu130 ; sys_platform == 'linux'",
+  "torchvision==0.28.0+cu130 ; sys_platform == 'linux'",
+  # torchaudio 2.11.0+cu130 is ABI-built against torch 2.11; there is no
+  # torchaudio >=2.12 on the cu130 index, so this extra does not pin it.
   "av>=14.2,<19 ; sys_platform == 'linux'",
 ]
 train = [
@@ -165,25 +173,17 @@ environments = [
   "sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 
-# vllm's PyPI wheel is manylinux_2_35 and its GitHub +cu129 wheel manylinux_2_31;
-# the fleet pods are glibc 2.28, so vllm must build from sdist on-pod. Its
-# build-requires omits numpy (CMake configure fails), and the build-env torch
-# must match the runtime +cu129 flavor or the compiled kernels link CUDA 13 libs.
-# First build is slow (or export VLLM_USE_PRECOMPILED=1); uv caches it per pod.
-# (Plain-string pin instead of match-runtime: bump together with the torch
-# anchor in the vllm extra above.)
+# Only fires if resolution falls back to the sdist: build-requires omits numpy,
+# and the build-env torch must match the runtime flavor.
 [tool.uv.extra-build-dependencies]
 vllm = [
   "numpy",
-  "torch==2.11.0+cu129",
+  "torch==2.13.0+cu130",
 ]
 
 # Non-explicit and ahead of the implicit PyPI default: participates in
 # resolution for ALL packages, including the engines' transitive torch pins.
-[[tool.uv.index]]
-name = "torch-cu129"
-url = "https://download.pytorch.org/whl/cu129"
-
+# Both extras are cu13, so a cu129 index here would mix flavors in unpinned deps.
 [[tool.uv.index]]
 name = "torch-cu130"
 url = "https://download.pytorch.org/whl/cu130"
