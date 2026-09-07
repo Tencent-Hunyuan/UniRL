@@ -15,10 +15,14 @@ hydra-core>=1.3
 # Optional Geneval/OpenMMLab stack (mmcv/mmdet) is intentionally excluded.
 # Install it separately only when needed:
 #   docs/geneval_mmcv_setup.md
+#
+# The OCR reward's PaddlePaddle runtime is also excluded: paddlepaddle is a ~180 MB
+# second deep-learning framework, and only unirl.reward.local.ocr needs it. It stays in
+# the `eval` extra, so install it explicitly when running OCR-based rewards:
+#   pip install -e ".[eval]"
+# python-Levenshtein is kept below because it is ~45 KB and pure tooling.
 numpy>=1.24,<3
 omegaconf>=2.3
-paddleocr==3.5.0
-paddlepaddle==3.2.2
 peft>=0.14.0
 Pillow>=10
 psutil>=5.9

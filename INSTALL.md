@@ -59,6 +59,11 @@ can survive.
 bare venv works for every converter except `datasets/droid100/`, which needs torch as well
 (any engine extra supplies it; a plain `uv pip install torch` is enough for CPU-only prep).
 
+`eval` pulls PaddlePaddle (~180 MB), a second deep-learning framework needed only to run
+the PP-OCRv5 detection and recognition models behind
+[`unirl.reward.local.ocr`](unirl/reward/local/ocr.py). It is deliberately kept out of
+`requirements.txt` for that reason, so install it explicitly when you need OCR rewards.
+
 For development tools (lint and tests):
 
 ```bash
