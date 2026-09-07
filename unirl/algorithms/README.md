@@ -125,7 +125,7 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   `/β` is a gain as well — the raw NFT gradient scales linearly in `β` (grad-norm/β is constant over
   `β = 0.05 … 1.0`), so dividing by it makes the step β-independent. Raising `C` shrinks `E|q|`
   (0.63 at `C=1` versus 0.16 at `C=5`) and the signal-to-symmetric ratio falls to 0.29x across that
-  range. It is a first-class RL knob, not a safety clip; the old name `adv_clip_max` hid that.
+  range. It is a first-class RL knob, not a safety clip.
 - **`adv_sat_std: 5.0` de-contrasts ~3.4x against the paper's parameterization** — DiffusionNFT
   (arXiv:2509.16117, Alg. 1) uses `r = 0.5 + 0.5·clip(r_norm / Z_c, -1, 1)` with `Z_c` "some
   normalizing factor, which could take the form of a global reward std", and its loss carries **no**

@@ -48,7 +48,6 @@ class DiffusionNFT(StageAlgorithm):
         backend: Any = None,
         beta: float = 1.0,
         adv_sat_std: float = 5.0,
-        adv_clip_max: Optional[float] = None,
         adv_mode: str = "raw",
         use_adaptive_weight: bool = True,
         train_timestep_mode: str = "all",
@@ -80,11 +79,6 @@ class DiffusionNFT(StageAlgorithm):
             raise ValueError(f"DiffusionNFT: ref_deviation_coef must be finite and >= 0; got {ref_deviation_coef!r}.")
         if not (0.0 < float(beta)):
             raise ValueError(f"DiffusionNFT: beta must be > 0; got {beta!r}.")
-        if adv_clip_max is not None:
-            raise ValueError(
-                f"DiffusionNFT: adv_clip_max was renamed to adv_sat_std; got {adv_clip_max!r}. "
-                f"It is how many advantage σ map to r=0 or 1, not a safety clip — see algorithms/README.md."
-            )
         if not (0.0 < float(adv_sat_std)):
             raise ValueError(f"DiffusionNFT: adv_sat_std must be > 0; got {adv_sat_std!r}.")
 
