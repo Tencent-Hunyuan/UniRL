@@ -78,10 +78,8 @@ class DiffusionNFT(StageAlgorithm):
             )
         if kl_coef is not None:
             raise ValueError(
-                f"DiffusionNFT: kl_coef was renamed to ref_deviation_coef; got kl_coef={kl_coef!r}. "
-                f"The penalty is a squared difference against the LoRA-disabled base, not a KL — it "
-                f"carries neither the /2 nor the /sigma^2 that FlowGRPO's beta does, so the two are "
-                f"not on a common scale. Rename the key in your recipe."
+                f"DiffusionNFT: kl_coef was renamed to ref_deviation_coef; got {kl_coef!r}. "
+                f"It is a squared difference against the base, not a KL — see algorithms/README.md."
             )
         if not math.isfinite(float(ref_deviation_coef)) or float(ref_deviation_coef) < 0:
             raise ValueError(f"DiffusionNFT: ref_deviation_coef must be finite and >= 0; got {ref_deviation_coef!r}.")
