@@ -21,6 +21,16 @@
 # understanding path stays frozen. 320x320 / 6 denoising steps are fixed so the recipe
 # isolates optimization from resolution and sampling compute.
 
+#
+# CAVEAT -- the reward scores OCR text only, nothing else in the image. With beta=0 there is
+# no anchor to the base policy, so over 100 rollouts the model learns to blank the scene and
+# render high-contrast text on it: on the fixed eval prompts the dark-pixel fraction goes
+# 0.451 -> 0.926, edge density -60%, colour entropy -54%. The OCR numbers are real (counter-IoU
+# rises independently), but generic image quality is not measured and does degrade.
+# A KL anchor prevents it at a real cost: beta=0.01 holds dark-pixel at -12% / entropy at -3%
+# but caps eval edit similarity at 0.527 instead of 0.854. Pick per use case, and consider an
+# early checkpoint or an added image-quality reward term if both matter.
+
 num_devices: 32
 batch_size: 32
 adv_use_global_std: true
