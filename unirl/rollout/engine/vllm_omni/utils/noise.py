@@ -16,6 +16,9 @@ def pack_initial_noise_extra_args(
 ) -> None:
     """Pack the per-sample x_T — a ``[B, C, H, W]`` ``initial_noise_batch`` tensor or a recipe — into ``extra_args``."""
     n_samples = len(gen_part.sample_ids)
+    # Keep SDE exploration reproducible across retries/resume. Engine request
+    # IDs contain a fresh UUID and are unsuitable as policy-noise identities.
+    extra_args["sde_sample_ids"] = [str(sample_id) for sample_id in gen_part.sample_ids]
     if bool(getattr(diff_params, "disable_driver_xt", False)):
         return
     seg = gen_part.segment

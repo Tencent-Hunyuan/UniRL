@@ -20,8 +20,8 @@ from unirl.train.lora import (
     _activate,
     _reset_adapter,
     _set_adapter_requires_grad,
-    normalize_module_selection,
     normalize_optional_module_selection,
+    resolve_target_modules_pattern,
 )
 
 logger = logging.getLogger(__name__)
@@ -96,6 +96,22 @@ def make_decay_fn(cfg: EmaLoraConfig | EmaFullConfig) -> Callable[[int], float]:
     if decay_type == "linear":
         return lambda t: float(min(t * uprate, uphold))
     if decay_type == "warmup":
+        if flat_steps > 0 and _current_rank() == 0:
+            # Decay 0 sends EMA._run down its hard-copy branch, so the shadow is
+            # a bitwise copy of the trainable adapter for this whole window. A
+            # forward-process algorithm builds its positive/negative pair as
+            # `old +/- beta*(new - old)`, which collapses to a single point when
+            # the two are equal: the contrast contributes nothing and beta drops
+            # out of the gradient. Worth saying out loud, because the run still
+            # trains -- on an advantage-weighted regression, not on the
+            # objective the recipe names.
+            logger.warning(
+                "EMA warmup: decay is 0 for the first %d refreshes, so the shadow is a hard copy of the "
+                "trainable adapter and any negative-aware contrast built from the pair is inert until then "
+                "(beta has no effect on the update either). Set ema_flat_steps=0 for a trailing reference "
+                "from the first refresh.",
+                flat_steps,
+            )
         return lambda t: 0.0 if t < flat_steps else float(min((t - flat_steps) * uprate, uphold))
     return lambda t: ema_decay
 
@@ -106,6 +122,7 @@ def inject_nft(
     rank: int,
     alpha: int,
     target_modules: ModuleSelection,
+    module_prefix: str = "",
     exclude_modules: Optional[ModuleSelection] = None,
     default: str = "default",
     shadow: str = "old",
@@ -116,11 +133,19 @@ def inject_nft(
     """Inject dual LoRA adapters for NFT-style EMA.  Returns Shadow."""
     from peft import LoraConfig, inject_adapter_in_model
 
+    # Same subtree scoping as inject_lora: bare suffixes match every subtree that
+    # happens to share them, and for a rollout served by a separate engine that
+    # silently trains adapters the engine has no slot for.
+    peft_target_modules, _ = resolve_target_modules_pattern(
+        target_modules=target_modules,
+        module_prefix=module_prefix,
+    )
+
     peft_cfg = LoraConfig(
         r=int(rank),
         lora_alpha=int(alpha),
         lora_dropout=float(dropout),
-        target_modules=normalize_module_selection(target_modules),
+        target_modules=peft_target_modules,
         exclude_modules=normalize_optional_module_selection(exclude_modules),
         bias=str(bias),
         task_type=str(task_type),

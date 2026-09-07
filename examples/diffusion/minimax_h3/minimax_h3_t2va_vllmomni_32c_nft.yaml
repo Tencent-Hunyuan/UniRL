@@ -1,0 +1,305 @@
+# @package _global_
+# MiniMax-H3 t2va DiffusionNFT on the vLLM-Omni rollout backend, 32 GPUs.
+#
+# The sibling `minimax_h3_t2va_nft.yaml` runs the same objective against the
+# trainside engine on one node. This recipe keeps the objective and swaps in the
+# collocated 32-GPU serving stack the Flow-GRPO recipes use (8 rollout replicas
+# x TP2xUP2, resident reward, FSDP32 trainer).
+#
+# Standalone on purpose, NOT layered on the Flow-GRPO chain: those recipes set
+# `old_logp_source` / `clip_range` / `max_rollout_replay_logp_absdiff`, and Hydra
+# would merge those keys into this `algorithm` block and hand DiffusionNFT
+# constructor arguments it does not accept.
+#
+# Launch (4 nodes x 8 GPUs):
+#   bash examples/run_experiment_multinode_taiji.sh diffusion/minimax_h3/minimax_h3_t2va_vllmomni_32c_nft
+
+num_devices: 32
+devices_per_node: 8
+# 8 prompts x 16 samples = 128 rows, 4 rows/rank. Both the prompt count and the
+# row total must divide the world, which puts the floor at 8 prompts here.
+batch_size: 8
+num_rollouts: 200
+transport: colocate_store
+layout: colocate
+reward_fraction: 0.0
+# BOTH offload policies are off, and neither is a tuning choice: the trainer
+# rejects either one combined with a requires_ema_rollout algorithm on a
+# colocated external rollout, because offloading train weights has not been
+# validated against the backend's EMA shadow state.
+#
+# Affordable because this run is LoRA: the frozen bf16 base is 66 GB sharded 32
+# ways (~2.1 GB/rank) and the trainable adapter, its EMA shadow, and the Adam
+# state add well under a GB. A resident trainer of that size fits beside both a
+# TP2 rollout rank and the CLAP + ImageBind pair.
+enable_fsdp_offload: false
+offload_train_during_reward: false
+adv_use_global_std: true
+save_interval: 20
+save_mode: auto
+load_dir: ${oc.env:H3_LOAD_DIR,null}
+save_dir: ${oc.env:H3_SAVE_DIR,checkpoints/minimax-h3-nft-vllmomni32}
+eval_interval: 20
+
+logging:
+  report_to_wandb: true
+  project_name: ${oc.env:WANDB_PROJECT,unirl-minimax-h3-t2va}
+  run_name: ${oc.env:WANDB_RUN_NAME,h3-nft-vllmomni32}
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: [minimax-h3, t2va, diffusionnft, vllm-omni, forward-process, ema-lora, clap, imagebind]
+  log_media: true
+  media_max_items: 2
+  media_log_interval: 20
+
+bundle:
+  _target_: unirl.models.minimax_h3.bundle.MiniMaxH3Bundle.from_config
+  config:
+    _target_: unirl.models.minimax_h3.config.MiniMaxH3PipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,MiniMaxAI/MiniMax-H3}
+    model_precision: bf16
+    # fp32 by checkpoint contract; the audio VAE emits ~20 dB too quiet in bf16.
+    vae_dtype: fp32
+    audio_vae_dtype: fp32
+    trajectory_precision: fp32
+    logprob_precision: fp32
+    # Reverse-schedule shifts, so rollout-only: a forward-process objective jumps
+    # to a noise level instead of walking either grid.
+    video_shift: 12.0
+    audio_shift: 3.0
+    audio_joint_sde: true
+    aux_components_on_cpu: true
+    vae_components_on_cpu: false
+    meta_init_transformer: true
+    use_lora: true
+
+pipeline:
+  _target_: unirl.models.minimax_h3.pipeline.MiniMaxH3Pipeline.from_bundle
+  config: ${bundle.config}
+  strategy:
+    # Inert at eta=0; kept as CPS so raising eta for a diagnostic lands on the
+    # kernel the Flow-GRPO recipes measured as safe on this checkpoint.
+    _target_: unirl.sde.kernels.CPSSDEStrategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["MiniMaxH3TransformerBlock"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    master_dtype: fp32
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true
+    use_torch_compile: false
+    # LOAD-BEARING. Keeps the fp32-pinned leftovers (proj_in, audio_proj_in,
+    # time_embedder, proj_out, audio_proj_out, rope) outside every fully_shard
+    # group, so no bf16 compute copy is all-gathered for them. True runs the
+    # timestep MLP in bf16, where t = 1 - sigma near 1.0 has ~0.008 spacing.
+    root_wrap: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 3.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    # The Flow-GRPO recipes' 1e-12 answers a measured grad_norm of ~5e-5 under
+    # that objective. This one measures 0.04..0.21, so 1e-8 is negligible again.
+    adam_epsilon: 1.0e-8
+    weight_decay: 1.0e-4
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: ${num_rollouts}
+  # "default" trains; "old" is the frozen reference the loss blends against and
+  # the rollout samples under. Replaces lora_cfg -- DiffusionNFT needs the pair.
+  ema_lora_cfg:
+    _target_: unirl.train.configs.EmaLoraConfig
+    rank: 64
+    alpha: 128
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    shadow_adapter: old
+    # Decay is exactly 0 below ema_flat_steps, which makes the shadow a hard
+    # copy of the trainable adapter: the two predictions coincide, the
+    # contrastive term is identically zero, and NFT silently degenerates into
+    # advantage-weighted regression. A 30-rollout run under warmup/75 logged
+    # prediction_deviation exactly 0.0 for its whole length. Start decaying
+    # immediately so the objective is the one this recipe claims to run.
+    ema_decay_type: constant
+    ema_decay: 0.9
+    ema_flat_steps: 0
+    timing: rollout_end
+    # LOAD-BEARING, exactly as in the Flow-GRPO recipes. The suffixes below also
+    # occur in `token_refiner.refiner_blocks.*`, and an unscoped list adapts
+    # those too: 364 modules where the serving engine has slots for the 350 of
+    # the denoising stack, so weight sync rejects the payload. Scoping also keeps
+    # every trainable param inside a fully_shard group, which is what lets
+    # block_class_names stay at the denoising block alone.
+    module_prefix: transformer_blocks
+    target_modules:
+      - attn.to_q
+      - attn.to_k
+      - attn.to_v
+      - attn.to_out.0
+      - ff.net.0.proj
+      - ff.net.2
+
+sync:
+  _target_: unirl.distributed.weight_sync.lora.LocalLoraWeightSync
+  param_prefix: "transformer."
+  # null, NOT "default": the sync then reads backend.rollout_adapter_name, which
+  # an EMA backend reports as the shadow adapter. DiffusionNFT is off-policy and
+  # samples under the EMA weights, so pinning "default" here would serve the
+  # trainable adapter and silently turn the objective on-policy.
+  adapter_name: null
+  # The H3 engine has four sequence-parallel subprocesses per controller.
+  copy: true
+  verify: false
+
+rollout:
+  _target_: unirl.rollout.engine.vllm_omni.engine.VLLMOmniRolloutEngine
+  model_config: ${bundle.config}
+  config:
+    _target_: unirl.rollout.engine.vllm_omni.config.VLLMOmniEngineConfig
+    model_path: ${bundle.config.pretrained_model_ckpt_path}
+    modality: minimax_h3_t2va
+    enable_sleep_mode: true
+    replica_size: 4
+    tp_size: 4
+    omni_extra:
+      pipeline_parallel_size: 1
+      data_parallel_size: 1
+      tensor_parallel_size: 2
+      cfg_parallel_size: 1
+      allgather_degree: 1
+      sequence_parallel_size: 2
+      ulysses_degree: 2
+      ring_degree: 1
+      text_encoder_tp_size: 4
+      # 256x448 produces fewer than four decode tiles; VAE4 would leave an
+      # empty rank.
+      vae_patch_parallel_size: 1
+      vae_parallel_mode: tile
+      use_hsdp: false
+      hsdp_shard_size: -1
+      hsdp_replicate_size: 1
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.local.t2av_composite.T2AVCompositeScorer
+    base_device: cuda
+    config:
+      _target_: unirl.reward.local.t2av_composite.T2AVCompositeSpec
+      device: auto
+      batch_size: 2
+      clap_model_id: ${oc.env:H3_CLAP_MODEL,laion/larger_clap_general}
+      imagebind_model_path: ${oc.env:H3_IMAGEBIND_CKPT,.checkpoints/imagebind_huge.pth}
+      imagebind_mode: audio_video
+      # Summed raw, not renormalised. ImageBind in audio_video mode scores the
+      # generation against itself, so A/V agreement alone is climbable by
+      # degrading both streams together: a 112-rollout run on clap+imagebind
+      # only rose 0.250 -> 0.371 while the video visibly collapsed. Keep a
+      # visual term in the sum even though it cannot see the audio.
+      #
+      # LICENCE: ImageBind is CC-BY-NC-SA. This recipe is NonCommercial.
+      weights:
+        videopickscore: 1.0
+        clap: 0.5
+        imagebind: 0.5
+
+algorithm:
+  _target_: unirl.algorithms.diffusionnft.DiffusionNFT
+  stage_attr: diffusion
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.minimax_h3.conditions.MiniMaxH3Conditions
+  params: ${sampling}
+  beta: 0.1
+  adv_std_saturate: 5.0
+  adv_mode: raw
+  use_adaptive_weight: true
+  # Read the rollout's own 10-step schedule and train on all of it. Affordable
+  # here and not under Flow-GRPO because each timestep is its own forward and
+  # backward scaled by 1/K, where replay builds one graph across every step.
+  train_timestep_mode: all
+  shuffle_train_timesteps: true
+  apply_time_shift_in_loss: false
+  training_timestep_fraction: 1.0
+  # ref_deviation_coef > 0 anchors the policy to the LoRA-disabled base with a third no_grad
+  # forward per trained timestep; see unirl/algorithms/README.md. Default off.
+  ref_deviation_coef: 0.0
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 1
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: ${oc.env:H3_PROMPT_FILE,examples/diffusion/minimax_h3/smoke_prompts.txt}
+      eval_data_path: ${oc.env:H3_EVAL_PROMPT_FILE,examples/diffusion/minimax_h3/smoke_prompts.txt}
+      seed: 42
+      shuffle: true
+      start_batch: ${oc.decode:${oc.env:H3_START_BATCH,0}}
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  num_inference_steps: 10
+  # Inert: the checkpoint is guidance-distilled.
+  guidance_scale: 1.0
+  height: 256
+  width: 448
+  # Shortest duration H3 supports: 124/24fps = 5.17s clears the 5s floor, where
+  # 107 (4.46s) does not. Matches the trainside NFT recipe.
+  num_frames: 124
+  # 0.0 with num_sde_steps: 0 below IS the forward-process switch.
+  eta: 0.0
+  sde_indices: null
+  samples_per_prompt: 16
+  seed: 42
+  # LOAD-BEARING under eta=0. A deterministic ODE rollout maps x_T to exactly
+  # one sample, so sharing x_T across a group would make all 16 siblings
+  # identical, the group reward std zero, and every advantage zero. Fresh noise
+  # per sibling is what leaves this objective anything to contrast.
+  init_same_noise: false
+  autocast_precision: bf16
+  trajectory_precision: fp32
+  logprob_precision: fp32
+  scheduler:
+    # num_sde_steps: 0 makes resolve_sde_indices return [], read downstream as
+    # "pure ODE, record no log-probs", which leaves the rollout storing only the
+    # terminal clean latent -- exactly the x0 this objective trains on.
+    _target_: unirl.sde.index_schedule.AllSDEScheduler
+    num_timesteps: ${..num_inference_steps}
+    num_sde_steps: 0
+  sampler_kwargs:
+    aspect_ratio: "16:9"
+    reward_num_frames: 9
+    # LOAD-BEARING for any forward-process recipe. The rollout emits a replay
+    # payload when it has SDE steps to record; with none it cannot tell this
+    # objective's rollout from an evaluation pass, and without the payload the
+    # algorithm receives a segment of None. `eval_sampling` deliberately leaves
+    # this unset so evaluation keeps returning media only.
+    record_trajectory: true
+
+eval_num_prompts: 16
+eval_samples_per_prompt: 4
+eval_chunk_prompts: 8
+eval_eta: 0.0
+eval_sampling:
+  num_inference_steps: 10
+  height: 256
+  width: 448
+  num_frames: 124
+  sampler_kwargs:
+    aspect_ratio: "16:9"
