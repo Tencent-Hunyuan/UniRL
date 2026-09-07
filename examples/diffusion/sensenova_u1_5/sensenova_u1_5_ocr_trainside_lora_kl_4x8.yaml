@@ -6,15 +6,23 @@
 # use the full-resolution SenseNova recipe for final-quality generation.
 
 #
-# CAVEAT -- the reward scores OCR text only, nothing else in the image. With beta=0 there is
-# no anchor to the base policy, so over 100 rollouts the model learns to blank the scene and
-# render high-contrast text on it: on the fixed eval prompts the dark-pixel fraction goes
-# 0.451 -> 0.926, edge density -60%, colour entropy -54%. The OCR numbers are real (counter-IoU
-# rises independently), but generic image quality is not measured and does degrade.
-# A KL anchor prevents it at a real cost: see sensenova_u1_5_ocr_trainside_lora_kl_4x8.yaml,
-# which is this recipe with beta=0.01. It holds dark-pixel at -12% / entropy at -3% but caps
-# eval edit similarity at 0.527 instead of 0.854. Pick per use case, and consider an early
-# checkpoint or an added image-quality reward term if both matter.
+# This is the content-preserving operating point of the OCR recipe. It is identical to
+# sensenova_u1_5_ocr_trainside_lora_4x8.yaml except for beta=0.01, which anchors the policy
+# to the LoRA-disabled base model.
+#
+# Why it exists: the reward scores OCR text and nothing else, so at beta=0 the model learns
+# to blank the scene and render high-contrast text on it. Measured on the fixed eval prompts
+# over 100 rollouts at beta=0: dark-pixel fraction 0.451 -> 0.926, edge density -60%, colour
+# entropy -54%. At beta=0.01 those become -12%, -24% and -3% -- scenes stay intact.
+#
+# The cost is real. Over the same 100 rollouts eval edit similarity reaches 0.527 here
+# against 0.854 at beta=0, and exact_match 0.188 against 0.531. That is still +78% over the
+# base policy, so this is a usable point, just a different one: pick this recipe when generic
+# image quality matters, the beta=0 one when OCR accuracy is the only target.
+#
+# beta>0 requires LoRA -- the reference policy is the adapter-disabled model, so the full
+# fine-tune recipe raises if you set it. beta=0.001 is untested; these two points bracket the
+# trade-off but do not locate its knee.
 
 num_devices: 32
 batch_size: 32
@@ -28,14 +36,14 @@ eval_chunk_prompts: 32
 eval_eta: 0.0
 
 save_interval: 20
-save_dir: ${oc.env:SAVE_DIR,checkpoints/sensenova_u1_5_ocr_trainside_lora_4x8}
+save_dir: ${oc.env:SAVE_DIR,checkpoints/sensenova_u1_5_ocr_trainside_lora_kl_4x8}
 
 logging:
   report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,false}}
   project_name: ${oc.env:WANDB_PROJECT,unirl-sensenova}
-  run_name: ${oc.env:WANDB_RUN_NAME,sensenova_u1_5_ocr_trainside_lora_4x8}
+  run_name: ${oc.env:WANDB_RUN_NAME,sensenova_u1_5_ocr_trainside_lora_kl_4x8}
   entity: ${oc.env:WANDB_ENTITY,null}
-  tags: [sensenova-u1.5, pixel-flow, flowgrpo, ocr, paddleocr, levenshtein, lora, trainside, 4x8]
+  tags: [sensenova-u1.5, pixel-flow, flowgrpo, ocr, paddleocr, levenshtein, lora, trainside, kl-beta0.01, 4x8]
   log_media: true
   media_log_interval: 10
   media_max_items: 4
@@ -121,7 +129,7 @@ algorithm:
   stage_attr: diffusion
   clip_range: 1.0e-4
   clip_schedule: constant
-  beta: 0.0
+  beta: 0.01
   old_logp_source: rollout
   conditions_cls:
     _target_: hydra.utils.get_class
