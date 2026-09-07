@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 
 from unirl.models.types.bundle import Bundle
-from unirl.models.types.meta_init import MetaInitCheckpoint, build_meta_init_transformer, resolve_meta_init_weights
+from unirl.models.types.meta_init import build_meta_init_transformer, resolve_meta_init_weights
 from unirl.utils.dtypes import parse_torch_dtype
 
 from .config import HunyuanVideo10PipelineConfig
@@ -69,12 +69,9 @@ class HunyuanVideo10Bundle(Bundle):
         te_dtype = parse_torch_dtype(te_raw, field_name="text_encoder_dtype")
 
         meta_init_state = None
-        checkpoint = MetaInitCheckpoint(path)
         if config.meta_init_transformer:
-            checkpoint = resolve_meta_init_weights(path, component="transformer")
-            transformer_config = HunyuanVideoTransformer3DModel.load_config(
-                path, subfolder="transformer", revision=checkpoint.revision
-            )
+            transformer_weights_path = resolve_meta_init_weights(path, component="transformer")
+            transformer_config = HunyuanVideoTransformer3DModel.load_config(path, subfolder="transformer")
             transformer, meta_init_state = build_meta_init_transformer(
                 lambda: HunyuanVideoTransformer3DModel.from_config(transformer_config), dtype=dtype
             )
@@ -85,12 +82,7 @@ class HunyuanVideo10Bundle(Bundle):
             transformer = transformer.to(device=device, dtype=dtype)
 
         vae = (
-            AutoencoderKLHunyuanVideo.from_pretrained(
-                vae_path,
-                subfolder="vae",
-                torch_dtype=vae_dtype,
-                revision=checkpoint.revision_for(vae_path),
-            )
+            AutoencoderKLHunyuanVideo.from_pretrained(vae_path, subfolder="vae", torch_dtype=vae_dtype)
             .to(device)
             .eval()
         )
@@ -99,38 +91,18 @@ class HunyuanVideo10Bundle(Bundle):
         vae.requires_grad_(False)
 
         text_encoder = (
-            LlamaModel.from_pretrained(
-                te_path,
-                subfolder="text_encoder",
-                torch_dtype=te_dtype,
-                revision=checkpoint.revision_for(te_path),
-            )
-            .to(device)
-            .eval()
+            LlamaModel.from_pretrained(te_path, subfolder="text_encoder", torch_dtype=te_dtype).to(device).eval()
         )
         text_encoder.requires_grad_(False)
-        tokenizer = LlamaTokenizerFast.from_pretrained(
-            te_path, subfolder="tokenizer", revision=checkpoint.revision_for(te_path)
-        )
+        tokenizer = LlamaTokenizerFast.from_pretrained(te_path, subfolder="tokenizer")
 
         text_encoder_2 = (
-            CLIPTextModel.from_pretrained(
-                te_path,
-                subfolder="text_encoder_2",
-                torch_dtype=te_dtype,
-                revision=checkpoint.revision_for(te_path),
-            )
-            .to(device)
-            .eval()
+            CLIPTextModel.from_pretrained(te_path, subfolder="text_encoder_2", torch_dtype=te_dtype).to(device).eval()
         )
         text_encoder_2.requires_grad_(False)
-        tokenizer_2 = CLIPTokenizer.from_pretrained(
-            te_path, subfolder="tokenizer_2", revision=checkpoint.revision_for(te_path)
-        )
+        tokenizer_2 = CLIPTokenizer.from_pretrained(te_path, subfolder="tokenizer_2")
 
-        scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-            path, subfolder="scheduler", revision=checkpoint.revision
-        )
+        scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(path, subfolder="scheduler")
 
         bundle = cls(
             transformer=transformer,
@@ -145,7 +117,7 @@ class HunyuanVideo10Bundle(Bundle):
             pretrained_path=path,
         )
         if config.meta_init_transformer:
-            checkpoint.stash_on(bundle)
+            bundle._transformer_weights_path = transformer_weights_path
             bundle._meta_init_state = meta_init_state
         return bundle
 

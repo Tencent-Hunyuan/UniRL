@@ -58,7 +58,7 @@ class PEPipeline(Pipeline):
         from unirl.sde.runtime import FlowMatchSchedulePolicy
 
         return FlowMatchSchedulePolicy.from_pretrained(
-            getattr(diff.bundle, "_resolved_checkpoint_path", diff.bundle.pretrained_path),
+            getattr(diff.bundle, "pretrained_path", None),
             shift=float(diff.shift),
         )
 

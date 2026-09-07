@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 
 from unirl.models.types.bundle import Bundle
-from unirl.models.types.meta_init import MetaInitCheckpoint, build_meta_init_transformer, resolve_meta_init_weights
+from unirl.models.types.meta_init import build_meta_init_transformer, resolve_meta_init_weights
 from unirl.utils.dtypes import parse_torch_dtype
 
 from .config import QwenVLPipelineConfig
@@ -51,17 +51,12 @@ class QwenVLBundle(Bundle):
             load_kwargs["attn_implementation"] = str(config.attn_implementation)
 
         meta_init_state = None
-        checkpoint = MetaInitCheckpoint(path)
         if config.meta_init_transformer:
-            checkpoint = resolve_meta_init_weights(path)
+            transformer_weights_path = resolve_meta_init_weights(path)
             # Restore non-persistent RoPE buffers after meta initialization.
             from transformers import AutoConfig
 
-            hf_config = AutoConfig.from_pretrained(
-                path,
-                trust_remote_code=bool(config.trust_remote_code),
-                revision=checkpoint.revision,
-            )
+            hf_config = AutoConfig.from_pretrained(path, trust_remote_code=bool(config.trust_remote_code))
             transformer, meta_init_state = build_meta_init_transformer(
                 lambda: Qwen2_5_VLForConditionalGeneration(hf_config), dtype=dtype
             )
@@ -91,7 +86,6 @@ class QwenVLBundle(Bundle):
             trust_remote_code=bool(config.trust_remote_code),
             min_pixels=config.min_pixels,
             max_pixels=config.max_pixels,
-            revision=checkpoint.revision,
         )
 
         tokenizer = processor.tokenizer
@@ -107,7 +101,7 @@ class QwenVLBundle(Bundle):
             pretrained_path=path,
         )
         if config.meta_init_transformer:
-            checkpoint.stash_on(bundle)
+            bundle._transformer_weights_path = transformer_weights_path
             bundle._meta_init_state = meta_init_state
         return bundle
 

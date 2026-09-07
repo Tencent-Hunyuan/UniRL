@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 
 from unirl.models.types.bundle import Bundle
-from unirl.models.types.meta_init import MetaInitCheckpoint, build_meta_init_transformer, resolve_meta_init_weights
+from unirl.models.types.meta_init import build_meta_init_transformer, resolve_meta_init_weights
 from unirl.utils.dtypes import parse_torch_dtype
 
 from .config import Flux2KleinPipelineConfig
@@ -141,17 +141,14 @@ class Flux2KleinBundle(Bundle):
         te_dtype = parse_torch_dtype(te_raw, field_name="text_encoder_dtype")
 
         meta_init_state = None
-        checkpoint = MetaInitCheckpoint(path)
         if config.meta_init_transformer:
-            checkpoint = resolve_meta_init_weights(path, component="transformer")
+            transformer_weights_path = resolve_meta_init_weights(path, component="transformer")
             # Zero-init checkpoint-absent guidance parameters after meta materialization.
-            transformer_config = Flux2Transformer2DModel.load_config(
-                path, subfolder="transformer", revision=checkpoint.revision
-            )
+            transformer_config = Flux2Transformer2DModel.load_config(path, subfolder="transformer")
             transformer, meta_init_state = build_meta_init_transformer(
                 lambda: Flux2Transformer2DModel.from_config(transformer_config), dtype=dtype
             )
-            _stamp_zero_checkpoint_absent_params(transformer, checkpoint.weights_path)
+            _stamp_zero_checkpoint_absent_params(transformer, transformer_weights_path)
         else:
             transformer = Flux2Transformer2DModel.from_pretrained(
                 path,
@@ -171,41 +168,21 @@ class Flux2KleinBundle(Bundle):
 
         vae = None
         if config.load_vae:
-            vae = (
-                AutoencoderKLFlux2.from_pretrained(
-                    vae_path,
-                    subfolder="vae",
-                    torch_dtype=vae_dtype,
-                    revision=checkpoint.revision_for(vae_path),
-                )
-                .to(device)
-                .eval()
-            )
+            vae = AutoencoderKLFlux2.from_pretrained(vae_path, subfolder="vae", torch_dtype=vae_dtype).to(device).eval()
             vae.requires_grad_(False)
 
-        tokenizer = AutoTokenizer.from_pretrained(
-            text_encoder_path,
-            subfolder="tokenizer",
-            revision=checkpoint.revision_for(text_encoder_path),
-        )
+        tokenizer = AutoTokenizer.from_pretrained(text_encoder_path, subfolder="tokenizer")
         if getattr(tokenizer, "pad_token", None) is None:
             tokenizer.pad_token = tokenizer.eos_token
 
         text_encoder = (
-            AutoModelForCausalLM.from_pretrained(
-                text_encoder_path,
-                subfolder="text_encoder",
-                torch_dtype=te_dtype,
-                revision=checkpoint.revision_for(text_encoder_path),
-            )
+            AutoModelForCausalLM.from_pretrained(text_encoder_path, subfolder="text_encoder", torch_dtype=te_dtype)
             .to(device)
             .eval()
         )
         text_encoder.requires_grad_(False)
 
-        scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-            path, subfolder="scheduler", revision=checkpoint.revision
-        )
+        scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(path, subfolder="scheduler")
 
         bundle = cls(
             transformer=transformer,
@@ -218,7 +195,7 @@ class Flux2KleinBundle(Bundle):
             pretrained_path=path,
         )
         if config.meta_init_transformer:
-            checkpoint.stash_on(bundle)
+            bundle._transformer_weights_path = transformer_weights_path
             bundle._meta_init_state = meta_init_state
         return bundle
 

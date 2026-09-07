@@ -8,7 +8,7 @@ import torch
 from torch import nn
 
 from unirl.models.types.bundle import Bundle
-from unirl.models.types.meta_init import MetaInitCheckpoint, build_meta_init_transformer, resolve_meta_init_weights
+from unirl.models.types.meta_init import build_meta_init_transformer, resolve_meta_init_weights
 from unirl.utils.dtypes import parse_torch_dtype
 
 from .config import MiniMaxH3PipelineConfig
@@ -87,12 +87,9 @@ class MiniMaxH3Bundle(Bundle):
         # honours that natively; the meta path has to be told, hence the
         # explicit `keep_in_fp32` hand-off below.
         meta_init_state = None
-        checkpoint = MetaInitCheckpoint(path)
         if config.meta_init_transformer:
-            checkpoint = resolve_meta_init_weights(path, component="transformer")
-            transformer_config = MiniMaxH3Transformer3DModel.load_config(
-                path, subfolder="transformer", revision=checkpoint.revision
-            )
+            transformer_weights_path = resolve_meta_init_weights(path, component="transformer")
+            transformer_config = MiniMaxH3Transformer3DModel.load_config(path, subfolder="transformer")
             transformer, meta_init_state = build_meta_init_transformer(
                 lambda: MiniMaxH3Transformer3DModel.from_config(transformer_config),
                 dtype=dtype,
@@ -104,22 +101,14 @@ class MiniMaxH3Bundle(Bundle):
             ).to(device)
 
         # Video VAE (frozen, fp32).
-        vae = AutoencoderKLMiniMaxH3.from_pretrained(
-            vae_path,
-            subfolder="vae",
-            torch_dtype=vae_dtype,
-            revision=checkpoint.revision_for(vae_path),
-        )
+        vae = AutoencoderKLMiniMaxH3.from_pretrained(vae_path, subfolder="vae", torch_dtype=vae_dtype)
         vae = vae.to(vae_device).eval()
         vae.requires_grad_(False)
 
         # Audio VAE (frozen, fp32). Do NOT let a global bf16 cast reach this:
         # the reference reports bf16 output roughly 20 dB too quiet.
         audio_vae = AutoencoderKLMiniMaxH3Audio.from_pretrained(
-            vae_path,
-            subfolder="audio_vae",
-            torch_dtype=audio_vae_dtype,
-            revision=checkpoint.revision_for(vae_path),
+            vae_path, subfolder="audio_vae", torch_dtype=audio_vae_dtype
         )
         audio_vae = audio_vae.to(vae_device).eval()
         audio_vae.requires_grad_(False)
@@ -128,20 +117,13 @@ class MiniMaxH3Bundle(Bundle):
         # state from it, so it must be loaded as the full LM, not a truncated
         # encoder.
         text_encoder = Qwen3VLForConditionalGeneration.from_pretrained(
-            te_path,
-            subfolder="text_encoder",
-            torch_dtype=te_dtype,
-            revision=checkpoint.revision_for(te_path),
+            te_path, subfolder="text_encoder", torch_dtype=te_dtype
         )
         text_encoder = text_encoder.to(aux_device).eval()
         text_encoder.requires_grad_(False)
 
-        processor = AutoProcessor.from_pretrained(
-            te_path, subfolder="processor", revision=checkpoint.revision_for(te_path)
-        )
-        tokenizer = AutoTokenizer.from_pretrained(
-            te_path, subfolder="tokenizer", revision=checkpoint.revision_for(te_path)
-        )
+        processor = AutoProcessor.from_pretrained(te_path, subfolder="processor")
+        tokenizer = AutoTokenizer.from_pretrained(te_path, subfolder="tokenizer")
 
         bundle = cls(
             transformer=transformer,
@@ -158,7 +140,7 @@ class MiniMaxH3Bundle(Bundle):
         if config.meta_init_transformer:
             # Diffusers layout: the backend's sharded loader reads the
             # safetensors under <ckpt>/transformer after `to_empty`.
-            checkpoint.stash_on(bundle)
+            bundle._transformer_weights_path = transformer_weights_path
             bundle._meta_init_state = meta_init_state
         return bundle
 

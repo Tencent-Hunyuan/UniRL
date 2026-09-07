@@ -69,7 +69,7 @@ class Qwen3MoeBundle(Bundle):
                 "Qwen3MoeBundle requires meta_init_transformer=true: VeOmniBackend "
                 "materializes and loads this EP model only after parallelization."
             )
-        checkpoint = resolve_meta_init_weights(pretrained_model_ckpt_path)
+        transformer_weights_path = resolve_meta_init_weights(pretrained_model_ckpt_path)
 
         from unirl.train.backend.veomni import _compat
 
@@ -92,7 +92,6 @@ class Qwen3MoeBundle(Bundle):
         )
         transformer = build_foundation_model(
             config_path=pretrained_model_ckpt_path,
-            config_kwargs={"trust_remote_code": trust_remote_code, "revision": checkpoint.revision},
             weights_path=None,
             torch_dtype=dtype_name,
             init_device="meta",
@@ -104,11 +103,7 @@ class Qwen3MoeBundle(Bundle):
             from transformers import AutoTokenizer
 
             tok_path = tokenizer_ckpt_path or pretrained_model_ckpt_path
-            tokenizer = AutoTokenizer.from_pretrained(
-                tok_path,
-                trust_remote_code=trust_remote_code,
-                revision=checkpoint.revision_for(tok_path),
-            )
+            tokenizer = AutoTokenizer.from_pretrained(tok_path, trust_remote_code=trust_remote_code)
             if tokenizer.pad_token is None and tokenizer.eos_token is not None:
                 tokenizer.pad_token = tokenizer.eos_token
 
@@ -119,7 +114,7 @@ class Qwen3MoeBundle(Bundle):
             device=device,
             pretrained_path=pretrained_model_ckpt_path,
         )
-        checkpoint.stash_on(bundle)
+        bundle._transformer_weights_path = transformer_weights_path
         return bundle
 
 

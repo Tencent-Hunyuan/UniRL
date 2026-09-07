@@ -11,7 +11,7 @@ import torch
 
 from unirl.models.cosmos3.config import Cosmos3SFTConfig
 from unirl.models.types.bundle import Bundle
-from unirl.models.types.meta_init import MetaInitCheckpoint, build_meta_init_transformer, resolve_meta_init_weights
+from unirl.models.types.meta_init import build_meta_init_transformer, resolve_meta_init_weights
 from unirl.utils.dtypes import parse_torch_dtype
 
 logger = logging.getLogger(__name__)
@@ -264,12 +264,9 @@ class Cosmos3Bundle(Bundle):
 
         # Uniform master-dtype storage (fp32 storage + bf16 FSDP compute: README # Gotchas).
         meta_init_state = None
-        checkpoint = MetaInitCheckpoint(path)
         if config.meta_init_transformer:
-            checkpoint = resolve_meta_init_weights(path, component="transformer")
-            transformer_config = Cosmos3OmniTransformer.load_config(
-                path, subfolder="transformer", revision=checkpoint.revision
-            )
+            transformer_weights_path = resolve_meta_init_weights(path, component="transformer")
+            transformer_config = Cosmos3OmniTransformer.load_config(path, subfolder="transformer")
             transformer, meta_init_state = build_meta_init_transformer(
                 lambda: Cosmos3OmniTransformer.from_config(transformer_config), dtype=master_dtype
             )
@@ -287,16 +284,14 @@ class Cosmos3Bundle(Bundle):
             )
             _patch_rotary_emb_contiguous(transformer.rotary_emb)
             _patch_h20_strided_gemm(transformer)
-        vae = AutoencoderKLWan.from_pretrained(
-            path, subfolder="vae", torch_dtype=vae_dtype, revision=checkpoint.revision
-        ).to(device)
+        vae = AutoencoderKLWan.from_pretrained(path, subfolder="vae", torch_dtype=vae_dtype).to(device)
         vae.requires_grad_(False)
         vae.eval()
 
         from transformers import AutoTokenizer
 
-        text_tokenizer = AutoTokenizer.from_pretrained(path, subfolder="text_tokenizer", revision=checkpoint.revision)
-        scheduler = UniPCMultistepScheduler.from_pretrained(path, subfolder="scheduler", revision=checkpoint.revision)
+        text_tokenizer = AutoTokenizer.from_pretrained(path, subfolder="text_tokenizer")
+        scheduler = UniPCMultistepScheduler.from_pretrained(path, subfolder="scheduler")
 
         if config.freeze_understanding:
             frozen = trainable = 0
@@ -323,7 +318,7 @@ class Cosmos3Bundle(Bundle):
             config=config,
         )
         if config.meta_init_transformer:
-            checkpoint.stash_on(bundle)
+            bundle._transformer_weights_path = transformer_weights_path
             bundle._meta_init_state = meta_init_state
         return bundle
 

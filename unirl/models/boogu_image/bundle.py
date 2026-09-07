@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 
 from unirl.models.types.bundle import Bundle
-from unirl.models.types.meta_init import MetaInitCheckpoint, build_meta_init_transformer, resolve_meta_init_weights
+from unirl.models.types.meta_init import build_meta_init_transformer, resolve_meta_init_weights
 from unirl.utils.dtypes import parse_torch_dtype
 
 from .config import BooguImagePipelineConfig
@@ -113,12 +113,9 @@ class BooguImageBundle(Bundle):
         te_dtype = parse_torch_dtype(te_raw, field_name="text_encoder_dtype")
 
         meta_init_state = None
-        checkpoint = MetaInitCheckpoint(path)
         if config.meta_init_transformer:
-            checkpoint = resolve_meta_init_weights(path, component="transformer")
-            transformer_config = BooguImageTransformer2DModel.load_config(
-                path, subfolder="transformer", revision=checkpoint.revision
-            )
+            transformer_weights_path = resolve_meta_init_weights(path, component="transformer")
+            transformer_config = BooguImageTransformer2DModel.load_config(path, subfolder="transformer")
             transformer, meta_init_state = build_meta_init_transformer(
                 lambda: BooguImageTransformer2DModel.from_config(transformer_config), dtype=dtype
             )
@@ -140,37 +137,21 @@ class BooguImageBundle(Bundle):
 
         vae = None
         if config.load_vae:
-            vae = (
-                AutoencoderKL.from_pretrained(
-                    vae_path,
-                    subfolder="vae",
-                    torch_dtype=vae_dtype,
-                    revision=checkpoint.revision_for(vae_path),
-                )
-                .to(device)
-                .eval()
-            )
+            vae = AutoencoderKL.from_pretrained(vae_path, subfolder="vae", torch_dtype=vae_dtype).to(device).eval()
             vae.requires_grad_(False)
 
         text_encoder = None
         processor = None
         if config.load_text_encoder:
             wrapper = Qwen3VLForConditionalGeneration.from_pretrained(
-                text_encoder_path,
-                subfolder="mllm",
-                torch_dtype=te_dtype,
-                revision=checkpoint.revision_for(text_encoder_path),
+                text_encoder_path, subfolder="mllm", torch_dtype=te_dtype
             )
             text_encoder = wrapper.model if hasattr(wrapper, "lm_head") else wrapper
             del wrapper
             text_encoder = text_encoder.to(device).eval()
             text_encoder.requires_grad_(False)
 
-            processor = AutoProcessor.from_pretrained(
-                text_encoder_path,
-                subfolder="processor",
-                revision=checkpoint.revision_for(text_encoder_path),
-            )
+            processor = AutoProcessor.from_pretrained(text_encoder_path, subfolder="processor")
 
         bundle = cls(
             transformer=transformer,
@@ -182,7 +163,7 @@ class BooguImageBundle(Bundle):
             pretrained_path=path,
         )
         if config.meta_init_transformer:
-            checkpoint.stash_on(bundle)
+            bundle._transformer_weights_path = transformer_weights_path
             bundle._meta_init_state = meta_init_state
         return bundle
 

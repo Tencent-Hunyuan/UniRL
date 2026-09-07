@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 
 from unirl.models.types.bundle import Bundle
-from unirl.models.types.meta_init import MetaInitCheckpoint, build_meta_init_transformer, resolve_meta_init_weights
+from unirl.models.types.meta_init import build_meta_init_transformer, resolve_meta_init_weights
 from unirl.utils.dtypes import parse_torch_dtype
 
 from .config import HunyuanVideo15PipelineConfig
@@ -76,12 +76,9 @@ class HunyuanVideo15Bundle(Bundle):
         te_dtype = parse_torch_dtype(te_raw, field_name="text_encoder_dtype")
 
         meta_init_state = None
-        checkpoint = MetaInitCheckpoint(path)
         if config.meta_init_transformer:
-            checkpoint = resolve_meta_init_weights(path, component="transformer")
-            transformer_config = HunyuanVideo15Transformer3DModel.load_config(
-                path, subfolder="transformer", revision=checkpoint.revision
-            )
+            transformer_weights_path = resolve_meta_init_weights(path, component="transformer")
+            transformer_config = HunyuanVideo15Transformer3DModel.load_config(path, subfolder="transformer")
             transformer, meta_init_state = build_meta_init_transformer(
                 lambda: HunyuanVideo15Transformer3DModel.from_config(transformer_config), dtype=dtype
             )
@@ -100,46 +97,25 @@ class HunyuanVideo15Bundle(Bundle):
         vae: Optional[nn.Module] = None
         if config.load_vae:
             vae = (
-                AutoencoderKLHunyuanVideo15.from_pretrained(
-                    vae_path,
-                    subfolder="vae",
-                    torch_dtype=vae_dtype,
-                    revision=checkpoint.revision_for(vae_path),
-                )
+                AutoencoderKLHunyuanVideo15.from_pretrained(vae_path, subfolder="vae", torch_dtype=vae_dtype)
                 .to(device)
                 .eval()
             )
             vae.requires_grad_(False)
 
         text_encoder = (
-            Qwen2_5_VLTextModel.from_pretrained(
-                te1_path,
-                subfolder="text_encoder",
-                torch_dtype=te_dtype,
-                revision=checkpoint.revision_for(te1_path),
-            )
+            Qwen2_5_VLTextModel.from_pretrained(te1_path, subfolder="text_encoder", torch_dtype=te_dtype)
             .to(device)
             .eval()
         )
         text_encoder.requires_grad_(False)
-        tokenizer = Qwen2Tokenizer.from_pretrained(
-            te1_path, subfolder="tokenizer", revision=checkpoint.revision_for(te1_path)
-        )
+        tokenizer = Qwen2Tokenizer.from_pretrained(te1_path, subfolder="tokenizer")
 
         text_encoder_2 = (
-            T5EncoderModel.from_pretrained(
-                te2_path,
-                subfolder="text_encoder_2",
-                torch_dtype=te_dtype,
-                revision=checkpoint.revision_for(te2_path),
-            )
-            .to(device)
-            .eval()
+            T5EncoderModel.from_pretrained(te2_path, subfolder="text_encoder_2", torch_dtype=te_dtype).to(device).eval()
         )
         text_encoder_2.requires_grad_(False)
-        tokenizer_2 = ByT5Tokenizer.from_pretrained(
-            te2_path, subfolder="tokenizer_2", revision=checkpoint.revision_for(te2_path)
-        )
+        tokenizer_2 = ByT5Tokenizer.from_pretrained(te2_path, subfolder="tokenizer_2")
 
         vision_encoder: Optional[nn.Module] = None
         image_processor: Optional[Any] = None
@@ -147,25 +123,14 @@ class HunyuanVideo15Bundle(Bundle):
             from transformers import SiglipImageProcessor, SiglipVisionModel
 
             vision_encoder = (
-                SiglipVisionModel.from_pretrained(
-                    vis_path,
-                    subfolder="image_encoder",
-                    torch_dtype=dtype,
-                    revision=checkpoint.revision_for(vis_path),
-                )
+                SiglipVisionModel.from_pretrained(vis_path, subfolder="image_encoder", torch_dtype=dtype)
                 .to(device)
                 .eval()
             )
             vision_encoder.requires_grad_(False)
-            image_processor = SiglipImageProcessor.from_pretrained(
-                vis_path,
-                subfolder="feature_extractor",
-                revision=checkpoint.revision_for(vis_path),
-            )
+            image_processor = SiglipImageProcessor.from_pretrained(vis_path, subfolder="feature_extractor")
 
-        scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-            path, subfolder="scheduler", revision=checkpoint.revision
-        )
+        scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(path, subfolder="scheduler")
 
         bundle = cls(
             transformer=transformer,
@@ -182,7 +147,7 @@ class HunyuanVideo15Bundle(Bundle):
             pretrained_path=path,
         )
         if config.meta_init_transformer:
-            checkpoint.stash_on(bundle)
+            bundle._transformer_weights_path = transformer_weights_path
             bundle._meta_init_state = meta_init_state
         return bundle
 
