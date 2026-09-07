@@ -55,7 +55,6 @@ class DiffusionNFT(StageAlgorithm):
         apply_time_shift_in_loss: bool = False,
         training_timestep_fraction: float = 0.99,
         ref_deviation_coef: float = 0.0,
-        kl_coef: Optional[float] = None,
         conditions_cls: Optional[Type[Any]] = None,
     ) -> None:
         if stage is None and pipeline is not None:
@@ -75,11 +74,6 @@ class DiffusionNFT(StageAlgorithm):
         if not (0.0 < float(training_timestep_fraction) <= 1.0):
             raise ValueError(
                 f"DiffusionNFT: training_timestep_fraction must lie in (0, 1]; got {training_timestep_fraction!r}."
-            )
-        if kl_coef is not None:
-            raise ValueError(
-                f"DiffusionNFT: kl_coef was renamed to ref_deviation_coef; got {kl_coef!r}. "
-                f"It is a squared difference against the base, not a KL — see algorithms/README.md."
             )
         if not math.isfinite(float(ref_deviation_coef)) or float(ref_deviation_coef) < 0:
             raise ValueError(f"DiffusionNFT: ref_deviation_coef must be finite and >= 0; got {ref_deviation_coef!r}.")
