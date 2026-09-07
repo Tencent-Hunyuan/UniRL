@@ -138,7 +138,7 @@ algorithm:
   shuffle_train_timesteps: true
   apply_time_shift_in_loss: false
   training_timestep_fraction: 0.99
-  kl_coef: 0.0
+  ref_deviation_coef: 0.0
 
 stack:
   _target_: unirl.train.stack.TrainStack

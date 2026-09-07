@@ -29,7 +29,7 @@ class DiffusionNFTConfig(BaseAlgorithmConfig):
     shuffle_train_timesteps: bool = True
     apply_time_shift_in_loss: bool = False
     training_timestep_fraction: float = 0.99
-    kl_coef: float = 0.0
+    ref_deviation_coef: float = 0.0
 
 
 class DiffusionNFT(StageAlgorithm):
@@ -54,7 +54,8 @@ class DiffusionNFT(StageAlgorithm):
         shuffle_train_timesteps: bool = True,
         apply_time_shift_in_loss: bool = False,
         training_timestep_fraction: float = 0.99,
-        kl_coef: float = 0.0,
+        ref_deviation_coef: float = 0.0,
+        kl_coef: Optional[float] = None,
         conditions_cls: Optional[Type[Any]] = None,
     ) -> None:
         if stage is None and pipeline is not None:
@@ -75,8 +76,15 @@ class DiffusionNFT(StageAlgorithm):
             raise ValueError(
                 f"DiffusionNFT: training_timestep_fraction must lie in (0, 1]; got {training_timestep_fraction!r}."
             )
-        if not math.isfinite(float(kl_coef)) or float(kl_coef) < 0:
-            raise ValueError(f"DiffusionNFT: kl_coef must be finite and >= 0; got {kl_coef!r}.")
+        if kl_coef is not None:
+            raise ValueError(
+                f"DiffusionNFT: kl_coef was renamed to ref_deviation_coef; got kl_coef={kl_coef!r}. "
+                f"The penalty is a squared difference against the LoRA-disabled base, not a KL — it "
+                f"carries neither the /2 nor the /sigma^2 that FlowGRPO's beta does, so the two are "
+                f"not on a common scale. Rename the key in your recipe."
+            )
+        if not math.isfinite(float(ref_deviation_coef)) or float(ref_deviation_coef) < 0:
+            raise ValueError(f"DiffusionNFT: ref_deviation_coef must be finite and >= 0; got {ref_deviation_coef!r}.")
         if not (0.0 < float(beta)):
             raise ValueError(f"DiffusionNFT: beta must be > 0; got {beta!r}.")
         if not (0.0 < float(adv_clip_max)):
@@ -97,7 +105,7 @@ class DiffusionNFT(StageAlgorithm):
         # shadow tracks the policy, so it cannot anchor drift away from it. Resolved
         # after the scalar checks — it walks `named_parameters()` to find the adapter.
         self._ref_model = _resolve_reference_model(
-            backend, beta=float(kl_coef), algo="DiffusionNFT", coef_name="kl_coef"
+            backend, beta=float(ref_deviation_coef), algo="DiffusionNFT", coef_name="ref_deviation_coef"
         )
         self.config = DiffusionNFTConfig(
             beta=float(beta),
@@ -108,7 +116,7 @@ class DiffusionNFT(StageAlgorithm):
             shuffle_train_timesteps=bool(shuffle_train_timesteps),
             apply_time_shift_in_loss=bool(apply_time_shift_in_loss),
             training_timestep_fraction=float(training_timestep_fraction),
-            kl_coef=float(kl_coef),
+            ref_deviation_coef=float(ref_deviation_coef),
         )
 
     def compute_loss_and_backward(
@@ -266,7 +274,7 @@ class DiffusionNFT(StageAlgorithm):
 
         ref_deviation = self._reference_deviation(conditions, xt=xt, t_batch=t_batch, new_pred=new_pred)
         if ref_deviation is not None:
-            total = total + float(self.config.kl_coef) * ref_deviation
+            total = total + float(self.config.ref_deviation_coef) * ref_deviation
 
         metrics = {
             "policy_loss": float(policy_loss.detach().item()),
@@ -281,7 +289,7 @@ class DiffusionNFT(StageAlgorithm):
         }
         if ref_deviation is not None:
             metrics["ref_prediction_deviation"] = float(ref_deviation.detach().item())
-            metrics["kl_coef"] = float(self.config.kl_coef)
+            metrics["ref_deviation_coef"] = float(self.config.ref_deviation_coef)
         return total, metrics
 
     def _reference_deviation(
