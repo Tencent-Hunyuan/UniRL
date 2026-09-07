@@ -171,6 +171,7 @@ stack:
   # per-worker batch = samples_per_prompt(16) * prompts_per_rollout(16) /
   # train_gpus(8) = 32; 32 % 2 == 0 → mini-batch 16 (matches v1).
   num_updates_per_batch: 2
+  shuffle_updates: true
 
 data_source:
   _target_: unirl.data.data_source.MultimodalRLDataSource
