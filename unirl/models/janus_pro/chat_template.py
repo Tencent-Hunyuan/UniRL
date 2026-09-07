@@ -40,6 +40,12 @@ class JanusProChatTemplateStage:
         self.user_role = str(user_role)
         self.assistant_role = str(assistant_role)
         self.image_placeholder = str(image_placeholder)
+        processor_placeholder = getattr(bundle.processor, "image_tag", None)
+        if processor_placeholder is None or self.image_placeholder != str(processor_placeholder):
+            raise ValueError(
+                "JanusProChatTemplateStage.image_placeholder must match the checkpoint processor's image_tag; "
+                f"got {self.image_placeholder!r}, expected {processor_placeholder!r}."
+            )
         self.system_instruction = system_instruction
         self.max_prompt_length = int(max_prompt_length)
 
@@ -76,6 +82,15 @@ class JanusProChatTemplateStage:
                 )
 
         batched = processor.batchify(prepares).to(self.bundle.device, dtype=self.bundle.dtype)
+        expected_image_tokens = len(images) * int(processor.num_image_tokens)
+        seq_tokens = int(batched.images_seq_mask.sum().item())
+        emb_tokens = int(batched.images_emb_mask.sum().item())
+        if seq_tokens != expected_image_tokens or emb_tokens != expected_image_tokens:
+            raise RuntimeError(
+                "JanusProChatTemplateStage failed to encode every conditioning image: "
+                f"expected {expected_image_tokens} image tokens, got sequence_mask={seq_tokens}, "
+                f"embedding_mask={emb_tokens}."
+            )
         if batched.input_ids.shape[1] > self.max_prompt_length:
             raise ValueError(
                 "JanusProChatTemplateStage.embed: prompt length "

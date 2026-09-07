@@ -7,7 +7,7 @@
 # and is intentionally not wired here.
 #
 # Data: build once with
-#   python -m unirl.utils.prepare_geo3k_mc --out-dir data/geo3k_mc
+#   python datasets/geo3k_mc/prepare_geo3k_mc.py --out-dir data/geo3k_mc
 # then set DATA_PATH=data/geo3k_mc/train.jsonl. Each jsonl row must carry the
 # image media reference plus metadata.answer for MCExactMatchRewardScorer.
 #

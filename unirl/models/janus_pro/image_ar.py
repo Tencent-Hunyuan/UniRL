@@ -38,12 +38,7 @@ class JanusProImageARSamplingParams(ARSamplingParams):
 
     @property
     def emits_fixed_length(self) -> bool:
-        """One token per grid cell — ``max_new_tokens`` is the image size, not a cap.
-
-        ``_resolve_image_grid`` already rejects any value that is not exactly
-        ``(width / patch_size) * (height / patch_size)``, so every sequence is
-        this long and reaching it never indicates truncation.
-        """
+        """Return true because image generation emits exactly one token per VQ grid cell."""
         return True
 
 
@@ -58,6 +53,10 @@ def _resolve_image_grid(params: ARSamplingParams) -> Tuple[int, int, int, int]:
         raise ValueError(
             "JanusProImageARSamplingParams requires positive width, height, and patch_size; "
             f"got width={width}, height={height}, patch_size={patch_size}."
+        )
+    if patch_size != 16:
+        raise ValueError(
+            f"Janus-Pro's vendored VQ decoder has a fixed 16x spatial factor; patch_size must be 16, got {patch_size}."
         )
     if width % patch_size != 0 or height % patch_size != 0:
         raise ValueError(
@@ -229,6 +228,7 @@ class JanusProImageARStage(ARStage[JanusProImageARConditions]):
         return TextSegment.pack(
             tokens=[generated_tokens[i] for i in range(batch_size)],
             log_probs=[generated_logps[i] for i in range(batch_size)],
+            rollout_log_probs=[generated_logps[i] for i in range(batch_size)],
         )
 
     def replay(
@@ -341,7 +341,7 @@ class JanusProImageARStage(ARStage[JanusProImageARConditions]):
                 shape=[batch_size, 8, grid_h, grid_w],
             )
         pixels = ((decoded.float() + 1.0) / 2.0).clamp(0.0, 1.0)
-        return Images(pixels=pixels)
+        return Images.from_dense(pixels)
 
 
 __all__ = [

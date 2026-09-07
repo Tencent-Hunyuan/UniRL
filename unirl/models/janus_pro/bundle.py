@@ -15,6 +15,8 @@ logger = logging.getLogger(__name__)
 
 
 class JanusProBundle(Bundle):
+    requires_unwrapped_trainable_root = True
+
     def __init__(
         self,
         *,
@@ -79,6 +81,26 @@ class JanusProBundle(Bundle):
                 "if the checkpoint genuinely needs newer modeling code."
             )
         model.eval()
+
+        # Janus stages call the replicated embedding/norm/head children directly,
+        # so only decoder blocks may be trainable and FSDP-sharded. LoRA injection
+        # happens later in the backend and creates fresh trainable adapter params.
+        model.language_model.requires_grad_(False)
+        if config.use_lora:
+            logger.info("Froze Janus-Pro language-model base weights before LoRA injection.")
+        else:
+            decoder_blocks = [
+                module for module in model.language_model.modules() if type(module).__name__ == "LlamaDecoderLayer"
+            ]
+            if not decoder_blocks:
+                raise RuntimeError("JanusProBundle full fine-tuning found no LlamaDecoderLayer modules.")
+            for module in decoder_blocks:
+                module.requires_grad_(True)
+            logger.info(
+                "Enabled Janus-Pro decoder-block full fine-tuning (%d blocks); "
+                "embedding, final norm, and LM head remain frozen and replicated.",
+                len(decoder_blocks),
+            )
 
         if config.freeze_vision_tower and hasattr(model, "vision_model"):
             model.vision_model.requires_grad_(False)

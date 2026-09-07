@@ -17,22 +17,7 @@ from .image_prompt import JanusProImagePromptStage
 
 
 class JanusProPipeline(Pipeline):
-    """Janus-Pro generate pipeline: ``Sample -> Sample``.
-
-    Two tasks share one bundle, picked by ``parts[0].control["task"]`` or
-    inferred from whether an ancestor Part carries an ``Images`` primitive:
-
-    - ``i2t`` — Text+Image -> Text through the understanding tower. Reads one
-      ``Texts`` and one ``Images`` turn off the trajectory and fills the
-      frontier Part with a ``TextSegment`` plus ``primitives["text"]``.
-    - ``t2i`` — Text -> Image as autoregressive image tokens (Janus-Pro's image
-      path is AR, not diffusion). Fills the frontier Part with the image-token
-      ``TextSegment`` plus the decoded ``primitives["image"]``.
-
-    Either way ``Part.conditions`` carries the encoded prompt, and trainer-side
-    replay teacher-forces over those stored ids, so this encode is the single
-    source of truth for the importance ratio.
-    """
+    """Janus-Pro I2T/T2I generation pipeline mapping ``Sample`` to ``Sample``."""
 
     def __init__(
         self,
@@ -120,11 +105,7 @@ class JanusProPipeline(Pipeline):
 
     @staticmethod
     def _resolve_task(sample: Sample) -> str:
-        """Explicit ``parts[0].control["task"]`` wins, else infer from the inputs.
-
-        Janus-Pro's two paths are told apart by the presence of an input image:
-        understanding consumes one, AR image generation does not.
-        """
+        """Resolve an explicit root task or infer I2T from image conditioning."""
         task = (sample.parts[0].control or {}).get("task")
         if task is None:
             return "i2t" if sample.has_image_input() else "t2i"
@@ -140,12 +121,7 @@ class JanusProPipeline(Pipeline):
 
     @staticmethod
     def _single(turns, kind, task: str):
-        """The one primitive of ``kind`` on the trajectory.
-
-        Janus-Pro's chat template renders exactly one user turn, so a multi-turn
-        trajectory has no faithful encoding here — fail rather than silently
-        dropping turns.
-        """
+        """Return the sole trajectory primitive of ``kind`` or fail."""
         found = [t.content for t in turns if isinstance(t.content, kind)]
         if len(found) != 1:
             raise ValueError(
@@ -178,21 +154,21 @@ class JanusProPipeline(Pipeline):
 
         conds: JanusProARConditions = chat_stage.embed(texts, images=images_prim.to_pils())
 
-        # Normalize the gen shell's params through JanusProARParams (stop_token_id
-        # reset, types coerced), mirroring qwen_vl.
+        # Normalize numeric types while preserving the caller's explicit stop token.
         ar = frontier.sampling_params
         params = JanusProARParams(
             max_tokens=ar.max_new_tokens,
             temperature=ar.temperature,
             top_p=ar.top_p,
             top_k=ar.top_k,
+            stop_token_ids=[] if ar.stop_token_id is None else [int(ar.stop_token_id)],
         )
         sampling_params = ARSamplingParams(
             max_new_tokens=int(params.max_tokens),
             temperature=float(params.temperature),
             top_p=float(params.top_p),
             top_k=int(params.top_k),
-            stop_token_id=None,
+            stop_token_id=None if ar.stop_token_id is None else int(ar.stop_token_id),
         )
 
         segment = self.ar.autoregress(conds, sampling_params=sampling_params, params=params)

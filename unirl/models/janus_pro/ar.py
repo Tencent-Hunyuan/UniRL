@@ -76,12 +76,7 @@ def _position_ids_from_attention_mask(attention_mask: torch.Tensor) -> torch.Ten
 
 
 def _language_body(transformer: torch.nn.Module) -> torch.nn.Module:
-    """The bare decoder under a ``LlamaForCausalLM``-style head.
-
-    Both AR stages read ``last_hidden_state`` and apply their own head
-    (``lm_head`` for text, ``gen_head`` for image tokens), so neither wants the
-    wrapper's fused full-sequence logits.
-    """
+    """Return the bare decoder under a ``LlamaForCausalLM``-style head."""
     body = getattr(transformer, "model", None)
     if body is None:
         body = getattr(getattr(transformer, "module", None), "model", None)
@@ -112,13 +107,7 @@ def _left_repack_token_condition(
     device: torch.device,
     where: str = "Janus-Pro AR",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Move a prompt onto ``device`` and left-align it via ``left_pad_prompt``.
-
-    ``TextTokenCondition.concat`` right-pads shards to the global max, so a
-    batch that arrives from a merged rollout carries a left-pad run (the Janus
-    processor's own batchify) followed by a right-pad run. Both AR stages need
-    every row's last real token in the final column.
-    """
+    """Move a prompt onto ``device`` and repack it with real tokens right-aligned."""
     if prompt.input_ids is None or prompt.attention_mask is None:
         raise ValueError(f"{where} requires prompt.input_ids and prompt.attention_mask.")
 
@@ -142,12 +131,7 @@ def _left_repack_prompt(
     pad_id: int,
     device: torch.device,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """``_left_repack_token_condition`` plus the image-placeholder mask.
-
-    ``images_seq_mask`` indexes prompt positions, so it has to travel through
-    the same permutation as ``input_ids`` or ``prepare_inputs_embeds`` scatters
-    the image embeddings into the wrong slots.
-    """
+    """Right-align prompt tokens and their image-placeholder mask together."""
     repacked_ids, repacked_mask = _left_repack_token_condition(prompt, pad_id=pad_id, device=device)
 
     attention_mask = prompt.attention_mask.to(device=device, dtype=torch.long)
@@ -301,6 +285,7 @@ class JanusProARStage(ARStage[JanusProARConditions]):
         return TextSegment.pack(
             tokens=[generated_tokens[b, :n] for b, n in enumerate(lens)],
             log_probs=[generated_logps[b, :n] for b, n in enumerate(lens)],
+            rollout_log_probs=[generated_logps[b, :n] for b, n in enumerate(lens)],
         )
 
     def replay(

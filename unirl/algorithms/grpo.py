@@ -17,6 +17,7 @@ from .base import (
     StageAlgorithm,
     _grpo_clip_loss,
     _resolve_clip_range_from_schedule,
+    rollout_replay_k3,
     rollout_replay_logp_absdiff,
     typed_conditions,
 )
@@ -32,30 +33,7 @@ class GRPOConfig(BaseAlgorithmConfig):
 
 
 class GRPO(StageAlgorithm):
-    """GRPO over an AR ``TextSegment`` via ``ARStage.replay``.
-
-    The teacher-forced forward and per-token log-prob recompute is owned by
-    :meth:`ARStage.replay`; this class expands per-sample advantages to per-
-    token via ``cu_seqlens`` and runs the same PPO clip math.
-
-    Args:
-        stage: The :class:`ARStage` whose ``replay`` produces packed-varlen
-            new log-probs aligned with ``segment.log_probs``.
-        clip_range: PPO clip range epsilon.
-        clip_schedule: ``"constant"``, ``"linear_decay"``, or
-            ``"cosine_decay"``.
-        conditions_cls: Stage-typed conditions container with
-            ``from_dict(Mapping[str, Condition])``.
-        old_logp_source: ``"rollout"`` (default) trusts the rollout engine's
-            emitted ``segment.log_probs``; ``"replay"`` recomputes it via
-            ``stage.replay`` at pre-update weights. See :meth:`prepare_segment`.
-        sampling_temperature: AR rollout temperature, applied as a
-            ``logits / T`` scaling inside :meth:`ARStage.replay` so
-            replay's log-softmax matches SGLang's sampling distribution
-            (``log_softmax(logits / T)``). Injected at construction time
-            from the rollout engine config; falls back to
-            :class:`ARSamplingParams` default when no engine is configured.
-    """
+    """GRPO over an AR ``TextSegment`` via ``ARStage.replay``."""
 
     # old_logp is frozen on the segment and does NOT change across mini-batch
     # updates, so reusing it across num_updates_per_batch>1 keeps the ratio
@@ -115,24 +93,7 @@ class GRPO(StageAlgorithm):
         conditions: Mapping[str, Condition],
         segment: "TextSegment",
     ) -> None:
-        """Freeze the π_old anchor (``segment.log_probs``) before the
-        ``num_updates_per_batch`` loop, per ``old_logp_source``.
-
-        - ``"rollout"`` (default): keep the rollout engine's emitted
-          ``segment.log_probs`` as the anchor for ALL N updates (verl
-          bypass-mode parity; the ratio then also carries the rollout-vs-train
-          engine gap).
-        - ``"replay"``: recompute π_old via a ``torch.no_grad`` ``stage.replay``
-          at the **pre-update** weights and **overwrite** ``segment.log_probs``.
-          For stages whose rollout decode is numerically far enough from
-          teacher-forced replay that a nominally on-policy ratio lands outside
-          a narrow clip range — cached bf16 decode vs full-sequence attention,
-          amplified by CFG on AR image tokens — this removes the engine gap
-          from the ratio. :meth:`recomputes_anchor` is True in this mode, so
-          the train stack drives the hook per micro-slice at exactly the
-          geometry training will replay at, making mini-batch 1's ratio 1
-          rather than approximately 1.
-        """
+        """Freeze the selected rollout- or replay-sourced old-policy anchor."""
         if self.old_logp_source != "replay":
             return
         if segment.tokens is None or int(segment.tokens.shape[0]) == 0:
@@ -212,10 +173,14 @@ class GRPO(StageAlgorithm):
             loss = loss_per_elem.sum() / mask.sum().clamp(min=1)
         (loss * loss_scale).backward()
 
+        rollout_logp = (segment.rollout_log_probs if segment.rollout_log_probs is not None else segment.log_probs).to(
+            dtype=new_logp.dtype, device=new_logp.device
+        )
         metrics: Dict[str, Any] = {
             "policy_loss": float(loss.detach().item()),
             "clip_range": float(clip_range),
-            **rollout_replay_logp_absdiff(new_logp, old_logp),
+            **rollout_replay_logp_absdiff(new_logp, rollout_logp),
+            **rollout_replay_k3(new_logp, rollout_logp),
             **{k: float(v.item()) for k, v in ratio_metrics.items()},
         }
         return AlgorithmStepResult(

@@ -80,13 +80,7 @@ def _require_tensor(d: Dict[str, Any], key: str) -> torch.Tensor:
 
 @dataclass
 class JanusProARConditions(Batch):
-    """Conditions for Janus-Pro multimodal understanding.
-
-    The official processor already pads image slots to a rectangular
-    ``[B, N, ...]`` layout, so the image tensors can travel as ordinary
-    CONCAT fields. ``images_seq_mask`` marks the image placeholder tokens in the
-    prompt, and ``images_emb_mask`` marks valid image embeddings.
-    """
+    """Batched prompt, pixels, and image masks for Janus-Pro understanding."""
 
     prompt: Optional[TextTokenCondition] = field(kind=FieldKind.CONCAT, default=None)
     pixel_values: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)

@@ -15,7 +15,7 @@ batch_size: 8
 num_rollouts: 1000
 weight_sync_interval: 1       # ignored trainside (no `sync` block)
 
-adv_normalization_scope: global
+adv_normalization_scope: group
 
 logging:
   report_to_wandb: false
@@ -96,7 +96,9 @@ reward:
   _target_: unirl.reward.service.RewardService
   backend:
     _target_: unirl.reward.local.pickscore.PickScoreRewardScorer
-    base_device: cuda
+    # Concurrent CLIP host-to-device loads deadlock when all eight colocated
+    # reward actors initialize on CUDA; CPU is slower but deterministic.
+    base_device: cpu
     config:
       _target_: unirl.reward.local.pickscore.PickScoreSpec
       batch_size: 4

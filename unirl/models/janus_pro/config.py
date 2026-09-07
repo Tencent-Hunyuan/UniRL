@@ -48,6 +48,20 @@ class JanusProPipelineConfig:
 
     def __post_init__(self) -> None:
         validate_precision_type(self.model_precision, field="JanusProPipelineConfig.model_precision")
+        unsupported_unfrozen = [
+            name
+            for name, frozen in (
+                ("freeze_vision_tower", self.freeze_vision_tower),
+                ("freeze_aligner", self.freeze_aligner),
+                ("freeze_generation_tower", self.freeze_generation_tower),
+            )
+            if not frozen
+        ]
+        if unsupported_unfrozen:
+            raise ValueError(
+                "Janus-Pro training currently optimizes only language-model decoder blocks; "
+                f"{', '.join(unsupported_unfrozen)} must remain true."
+            )
         if self.lora_target_modules is None:
             self.lora_target_modules = list(JANUS_PRO_LORA_TARGETS)
 

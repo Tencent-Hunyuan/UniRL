@@ -213,6 +213,9 @@ include = [
   "unirl.*",
 ]
 
+[tool.setuptools.package-data]
+"unirl.models.janus_pro.vendor" = ["LICENSE-CODE", "VENDOR_COMMIT.txt"]
+
 [tool.ruff]
 line-length = 120
 target-version = "py312"

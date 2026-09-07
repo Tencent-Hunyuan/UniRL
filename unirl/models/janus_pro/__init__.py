@@ -1,9 +1,4 @@
-"""Janus-Pro multimodal understanding and AR image-generation model package.
-
-The Text+Image -> Text path trains Janus-Pro as a VLM. The Text -> Image path
-trains Janus-Pro's autoregressive image-token generator; it is not a diffusion
-stage, but it still exposes packed token log-probs through ``TextSegment``.
-"""
+"""Janus-Pro multimodal understanding and autoregressive image-generation package."""
 
 from .ar import JanusProARParams, JanusProARStage, JanusProARStep
 from .bundle import JanusProBundle

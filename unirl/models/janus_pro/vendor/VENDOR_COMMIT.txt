@@ -12,10 +12,11 @@ Mechanical changes (see vendor/__init__.py):
   - dataclass mutable-default compatibility patch in models/modeling_vlm.py
   - empty all_tied_weights_keys compatibility mapping in models/modeling_vlm.py
   - grad-safety clone before image-placeholder embedding replacement in models/modeling_vlm.py
+  - drop process-global registrations for nested generic config names; MultiModalityConfig constructs them directly
 
 To re-vendor a newer upstream:
   1. git -C Janus fetch && git -C Janus checkout <new_commit>
   2. recopy janus/{models,utils} plus LICENSE-CODE into this vendor/ tree
   3. re-apply the import-root rewrites and local attrdict import rewrites
-  4. re-apply the modeling_vlm transformers-5.x compatibility patches
+  4. re-apply the modeling_vlm transformers-5.x compatibility and registration patches
   5. bump this file; re-run Janus-Pro import, config compose, and a training smoke
