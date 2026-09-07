@@ -11,6 +11,7 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.sd3.pipeline_sd3 import StableDiffusion3Pipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 from unirl.rollout.engine.vllm_omni.pipelines._shared.flow_match_sde_scheduler import (
     FlowMatchSDEDiscreteScheduler,
@@ -18,15 +19,20 @@ from unirl.rollout.engine.vllm_omni.pipelines._shared.flow_match_sde_scheduler i
 from unirl.rollout.engine.vllm_omni.pipelines._shared.interception import (
     detach_cpu,
     drain_trajectory_into,
+    finalize_output,
     inject_latents,
     make_sde_scheduler,
     resolve_request_noise,
-    stamp_custom_output,
+    single_request,
+    stamp_capture,
 )
 
 
 class RLStableDiffusion3Pipeline(StableDiffusion3Pipeline):
     """SD3.5 pipeline with the RL interception protocol installed."""
+
+    # Upstream opts into request batching; RL rollout does not — see ``single_request``.
+    supports_request_batch = False
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         super().__init__(od_config=od_config, prefix=prefix)
@@ -133,11 +139,12 @@ class RLStableDiffusion3Pipeline(StableDiffusion3Pipeline):
 
     def prepare_latents(self, *args, **kwargs):  # type: ignore[override]
         """Initial-noise injection point: bypass upstream RNG when the driver supplied an x_T."""
+        upstream = super().prepare_latents
         noise = self._pending_initial_noise
         if noise is not None:
-            args, kwargs = inject_latents(args, kwargs, noise)
+            args, kwargs = inject_latents(upstream, args, kwargs, noise)
             self._pending_initial_noise = None
-        return super().prepare_latents(*args, **kwargs)
+        return upstream(*args, **kwargs)
 
     def _harvest_trajectory(self, out: DiffusionOutput) -> None:
         if isinstance(self.scheduler, FlowMatchSDEDiscreteScheduler):
@@ -145,22 +152,26 @@ class RLStableDiffusion3Pipeline(StableDiffusion3Pipeline):
 
     def _harvest_conditioning(self, out: DiffusionOutput) -> None:
         if self._captured_conditioning is not None:
-            stamp_custom_output(out, "text_capture", self._captured_conditioning)
+            stamp_capture(out, "text_capture", self._captured_conditioning)
 
-    def forward(self, req: OmniDiffusionRequest, **kwargs) -> DiffusionOutput:
+    def forward(self, req: DiffusionRequestBatch, **kwargs) -> list[DiffusionOutput]:
+        """Single-request batch in, one-element list out."""
+        one = single_request(req, caller="RLStableDiffusion3Pipeline.forward")
         self._install_sde_scheduler()
         self._install_conditioning_tap()
         self._install_t5_truncation_workaround()
 
-        self._arm_sde(req)
-        self._arm_initial_noise(req)
+        self._arm_sde(one)
+        self._arm_initial_noise(one)
         self._arm_conditioning_tap()
 
-        out = super().forward(req, **kwargs)
+        outs = super().forward(req, **kwargs)
 
+        out = outs[0]
         self._harvest_trajectory(out)
         self._harvest_conditioning(out)
-        return out
+        finalize_output(out)
+        return outs
 
 
 __all__ = ["RLStableDiffusion3Pipeline"]

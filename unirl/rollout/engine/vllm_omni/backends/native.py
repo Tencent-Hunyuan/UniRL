@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+from contextlib import contextmanager
 from pprint import pformat
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
@@ -40,25 +41,13 @@ def _import_omni_runtime() -> Dict[str, Any]:
     }
 
 
-def _resolve_stage_yaml(name: str, source: str) -> str:
-    """Return the absolute path of the stage-config YAML asset."""
-    if source == "local":
-        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        path = os.path.join(here, "stage_configs", name)
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"_resolve_stage_yaml: local YAML not found at {path}")
-        return path
-    if source == "upstream":
-        import vllm_omni  # runtime import — sanctioned here only
-
-        project_root = os.path.dirname(os.path.dirname(os.path.abspath(vllm_omni.__file__)))
-        path = os.path.join(project_root, "vllm_omni", "model_executor", "stage_configs", name)
-        if not os.path.exists(path):
-            raise FileNotFoundError(
-                f"_resolve_stage_yaml: upstream YAML {name!r} not found at {path}. vllm-omni may have moved the file."
-            )
-        return path
-    raise ValueError(f"_resolve_stage_yaml: unknown source {source!r} (expected 'local' or 'upstream')")
+def _resolve_stage_yaml(name: str) -> str:
+    """Return the absolute path of the local stage-config YAML asset."""
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(here, "stage_configs", name)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"_resolve_stage_yaml: YAML not found at {path}")
+    return path
 
 
 def _cfg_get(cfg: Any, key: str, default: Any = None) -> Any:
@@ -88,10 +77,25 @@ def _assemble_omni_kwargs(intent: Dict[str, Any]) -> Dict[str, Any]:
     omni_kwargs = dict(intent.get("omni_kwargs") or {})
     if intent.get("enable_sleep_mode"):
         omni_kwargs["enable_sleep_mode"] = True
-    ports = intent.get("ports")
-    if ports is not None:
-        omni_kwargs["master_port"] = int(ports.master_port)
     return omni_kwargs
+
+
+@contextmanager
+def _master_port_env(port: Optional[int]):
+    """Pin ``MASTER_PORT`` to the reserved engine port for the duration of ``Omni()``."""
+    if port is None:
+        yield
+        return
+    saved = os.environ.get("MASTER_PORT")
+    os.environ["MASTER_PORT"] = str(int(port))
+    logger.info("VLLM-Omni boot: MASTER_PORT=%s (was %s) for engine construction", port, saved)
+    try:
+        yield
+    finally:
+        if saved is None:
+            os.environ.pop("MASTER_PORT", None)
+        else:
+            os.environ["MASTER_PORT"] = saved
 
 
 class VLLMOmniBackend:
@@ -140,8 +144,10 @@ class VLLMOmniBackend:
         except Exception:  # noqa: BLE001 - belt and braces; never block a boot
             pass
 
-        yaml_path = _resolve_stage_yaml(str(intent["stage_yaml"]), str(intent.get("stage_yaml_source", "local")))
+        yaml_path = _resolve_stage_yaml(str(intent["stage_yaml"]))
         omni_kwargs = _assemble_omni_kwargs(intent)
+        ports = intent.get("ports")
+        boot_master_port = int(ports.master_port) if ports is not None else None
         logger.info(
             "VLLM-Omni boot intent (before engine startup):\n%s",
             pformat(
@@ -149,6 +155,7 @@ class VLLMOmniBackend:
                     **intent,
                     "stage_yaml_path": yaml_path,
                     "assembled_omni_kwargs": omni_kwargs,
+                    "boot_master_port": boot_master_port,
                 },
                 sort_dicts=True,
             ),
@@ -160,11 +167,12 @@ class VLLMOmniBackend:
             try:
                 if lock_file is not None:
                     fcntl.flock(lock_file, fcntl.LOCK_EX)
-                omni = rt["Omni"](
-                    model=str(intent["model_path"]),
-                    stage_configs_path=yaml_path,
-                    **omni_kwargs,
-                )
+                with _master_port_env(boot_master_port):
+                    omni = rt["Omni"](
+                        model=str(intent["model_path"]),
+                        stage_configs_path=yaml_path,
+                        **omni_kwargs,
+                    )
             finally:
                 if lock_file is not None:
                     fcntl.flock(lock_file, fcntl.LOCK_UN)
@@ -266,7 +274,8 @@ class VLLMOmniBackend:
             build_prompt_tokens,
         )
 
-        return build_prompt_tokens(text, self._tokenizer, task=task, sys_type=sys_type)
+        # vllm-omni 0.27 returns a PromptTokensResult here, not a bare id list.
+        return list(build_prompt_tokens(text, self._tokenizer, task=task, sys_type=sys_type).token_ids)
 
     def num_stages(self) -> int:
         return int(self._require_omni().engine.num_stages)

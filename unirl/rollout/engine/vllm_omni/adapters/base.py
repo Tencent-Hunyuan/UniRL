@@ -46,7 +46,6 @@ class ModelAdapter(ABC):
     modality: str = ""
 
     stage_yaml: str = ""
-    stage_yaml_source: str = "local"
     omni_mode: Optional[str] = None
     needs_sigmas: bool = True
     needs_driver_tokenizer: bool = True
@@ -79,7 +78,6 @@ class ModelAdapter(ABC):
         require(bool(self.stage_yaml), f"{type(self).__name__} must set stage_yaml")
         kwargs: Dict[str, Any] = {
             "stage_yaml": self.stage_yaml,
-            "stage_yaml_source": self.stage_yaml_source,
             "needs_driver_tokenizer": bool(self.needs_driver_tokenizer),
             "clear_cuda_visible": bool(self.clear_cuda_visible),
         }
