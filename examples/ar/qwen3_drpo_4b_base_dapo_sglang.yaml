@@ -140,6 +140,7 @@ rollout:
       # FSDP trainer. Without it, rollout logprobs drift from replay and
       # SGLang 0.5.12.post1 also tries to JIT an incompatible activation kernel.
       rl_on_policy_target: fsdp
+      # Colocate full-FT preset — see unirl/rollout/README.md (SGLang AR knobs).
       # FULL fine-tuning: lower the SRT KV reservation to give FSDP headroom for
       # the per-rollout full-weight all-gather. No LoRA pool — full dense weights
       # pushed via TensorWeightSync. CUDA graph ON for decode speed, but capped at

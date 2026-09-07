@@ -131,6 +131,7 @@ rollout:
     chat_template_kwargs:
       enable_thinking: true
     engine_kwargs:
+      # Colocate full-FT preset — see unirl/rollout/README.md (SGLang AR knobs).
       # FULL fine-tuning: lower the SRT KV reservation to give FSDP headroom for
       # the per-rollout full-weight all-gather. No LoRA pool — full dense weights
       # pushed via TensorWeightSync. CUDA graph ON for decode speed, but capped at

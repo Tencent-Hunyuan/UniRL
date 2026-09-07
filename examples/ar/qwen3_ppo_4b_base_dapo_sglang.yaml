@@ -86,7 +86,16 @@ rollout:
     chat_template_kwargs:
       enable_thinking: true
     engine_kwargs:
+      # SGLang's FSDP on-policy mode is part of the rollout/replay contract,
+      # not merely a performance switch. It selects deterministic PyTorch
+      # sampling/log-softmax and native activations/layernorms that match the
+      # FSDP trainer. Without it, rollout logprobs drift from replay and
+      # SGLang 0.5.12.post1 also tries to JIT an incompatible activation kernel.
       rl_on_policy_target: fsdp
+      # Colocate full-FT preset (unirl/rollout/README.md): lower the SRT KV
+      # reservation so FSDP can all-gather full dense weights. enable_lora must
+      # stay false for TensorWeightSync. CUDA graph ON, cuda_graph_max_bs=16
+      # (SGLang default 256 would balloon server memory + compete with the push).
       mem_fraction_static: 0.3
       skip_server_warmup: true
       attention_backend: triton

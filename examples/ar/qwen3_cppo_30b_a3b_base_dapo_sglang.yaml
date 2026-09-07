@@ -113,6 +113,9 @@ rollout:
     chat_template_kwargs:
       enable_thinking: true
     engine_kwargs:
+      # Colocate full-FT preset (same KV/graph knobs as the 4B dense recipes;
+      # tp_size=8 is the MoE fit, not an engine_kwargs change).
+      # See unirl/rollout/README.md (SGLang AR knobs).
       mem_fraction_static: 0.3
       skip_server_warmup: true
       attention_backend: triton

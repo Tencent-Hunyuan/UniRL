@@ -111,6 +111,38 @@ change surface:
   `pipelines/<model>/pipeline.py`; if the AR/DiT worker needs new behavior, add a
   `worker/` extension or `patches/compat_<model>.py`.
 
+## SGLang AR knobs
+
+Qwen3 AR recipes (`examples/ar/qwen3_*_sglang*.yaml`) share one **colocate
+full-FT** `engine_kwargs` preset. Async/separate and larger-model recipes keep
+the same keys and change the memory numbers. Typed `SGLangEngineConfig` fields
+overlay `engine_kwargs`; reserved ports always win. Keys that are not live
+SGLang `ServerArgs` fields warn at boot (or raise if
+`UNIRL_SGLANG_STRICT_SERVER_ARGS=1`) — see [`engine/README.md`](engine/README.md).
+
+**Colocate full-FT preset** (FSDP train shard time-shares the GPU; TensorWeightSync):
+
+| Knob | Preset | Why |
+|---|---|---|
+| `mem_fraction_static` | `0.3` | Lower SRT KV reservation so FSDP can all-gather full dense weights. `server_intent()` defaults to `0.88` if omitted — too high for colocate. |
+| `enable_lora` | `false` | TensorWeightSync pushes full dense weights; a LoRA pool would be the wrong receive path. |
+| `cuda_graph_max_bs` | `16` | CUDA graph stays on (`disable_cuda_graph: false`); SGLang's default `256` captures buffers that fight the weight push. |
+| `skip_server_warmup` | `true` | Skip SRT warmup on every colocated boot/wake. |
+| `attention_backend` | `triton` | Matches the in-tree 4B full-FT recipes. |
+
+**Async / separate** (`*_sglang_async.yaml`): the engine owns the GPU (no colocated
+FSDP shard). Raise `mem_fraction_static` to `0.8` and leave the other preset keys
+as-is; keep headroom for NCCL weight-receive buffers. Sync is `NCCLWeightSync`.
+
+**LoRA colocate** (`*_sglang_lora.yaml`): `enable_lora: true` plus the SGLang LoRA
+pool knobs. This is the exception to the full-FT `enable_lora: false` receive path
+(`LocalLoraWeightSync` instead of TensorWeightSync). Memory numbers are recipe-specific.
+
+**Reserved ports:** `SGLangPorts.reserve()` binds HTTP `port` and `nccl_port` on
+the engine's node. Server port is capped at 35535 because SGLang derives
+`grpc_port = port + 30000`. Do not set `port` / `nccl_port` in `engine_kwargs` —
+the reserved sockets overwrite them.
+
 ## Gotchas
 
 - **Never recompute σ inside an engine** — the generated Part's pinned sigmas are

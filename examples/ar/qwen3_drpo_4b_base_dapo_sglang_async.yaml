@@ -100,8 +100,9 @@ rollout:
       enable_thinking: true
     engine_kwargs:
       # Disaggregated: the engine owns the GPU (no colocated FSDP shard), so it
-      # can reserve more KV than the colocate recipe's 0.3. Leave headroom for
-      # the NCCL weight-receive buffers during the broadcast.
+      # can reserve more KV than the colocate full-FT preset's 0.3. Leave
+      # headroom for the NCCL weight-receive buffers during the broadcast.
+      # Other knobs match the colocate preset — see unirl/rollout/README.md.
       mem_fraction_static: 0.8
       skip_server_warmup: true
       attention_backend: triton

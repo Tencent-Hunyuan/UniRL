@@ -124,8 +124,10 @@ rollout:
     chat_template_kwargs:
       enable_thinking: true
     engine_kwargs:
-      # Value used for the reported LoRA run; retune when changing the model,
-      # the TP layout, or the FSDP offload settings above.
+      # LoRA exception to the colocate full-FT preset (enable_lora: true + pool
+      # knobs; LocalLoraWeightSync). Value used for the reported LoRA run; retune
+      # when changing the model, the TP layout, or the FSDP offload settings.
+      # See unirl/rollout/README.md (SGLang AR knobs).
       mem_fraction_static: 0.5
       attention_backend: triton
       disable_cuda_graph: false
