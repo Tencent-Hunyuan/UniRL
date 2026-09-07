@@ -70,6 +70,9 @@ outputs/
 logs/
 local/
 !unirl/reward/local/
+
+# Reward-model weight cache (ImageBind resolves .checkpoints/ relative to cwd)
+.checkpoints/
 **/rollout_data/
 **/buffer_stats/
 *.out
