@@ -398,7 +398,11 @@ class ARTrainer(BaseTrainer):
         if anchored:
             self._ensure_anchored_backend_loaded()
         try:
-            result = self.stack.train_track(train_part, training_progress=float(training_progress))
+            result = self.stack.train_track(
+                train_part,
+                training_progress=float(training_progress),
+                rollout_id=rollout_id,
+            )
         finally:
             if anchored:
                 self._ensure_anchored_backend_offloaded()

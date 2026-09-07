@@ -66,7 +66,8 @@ in `backend/base.py`; a multi-update-capable algorithm sets
   across DP ranks).
 - **Multi-update membership is contiguous by default.** Set `shuffle_updates: true`
   on the stack to shuffle the full per-worker batch before it is partitioned into
-  optimizer updates; `shuffle_seed` makes that per-rollout ordering reproducible.
+  optimizer updates; `shuffle_seed` is combined with the rollout id so the
+  per-rollout ordering is reproducible across checkpoint resume.
 - **`optimizer_step` silently *skips* (does not crash) on a non-finite grad norm**
   and zeroes grads — a flat loss curve with a logged warning means grads went
   non-finite.

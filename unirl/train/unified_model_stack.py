@@ -213,6 +213,7 @@ class UnifiedModelTrainStack(Remote):
         sample: Sample,
         *,
         training_progress: float,
+        rollout_id: int | None = None,
     ) -> Dict[str, TrainStepResult]:
         """Driver-callable: prepare → backward(ar) + backward(image) → ONE step."""
         ar_part = sample.gen_part(ARSamplingParams)
@@ -224,6 +225,7 @@ class UnifiedModelTrainStack(Remote):
             (ar_part, image_part),
             num_updates=self.num_updates_per_batch,
             micro_batch_size=self.micro_batch_size,
+            shuffle_step=rollout_id,
         )
 
         from unirl.utils.profiling import profile_mode

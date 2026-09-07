@@ -733,7 +733,9 @@ class DiffusionTrainer(BaseTrainer):
         training_progress = final_id / max(1, num_rollouts - 1)
         parts = tuple(sample.parts[-1] for sample in samples)
         result = self.stack.train_track(
-            parts if len(parts) > 1 else parts[0], training_progress=float(training_progress)
+            parts if len(parts) > 1 else parts[0],
+            training_progress=float(training_progress),
+            rollout_id=final_id,
         )
         # Reward stats must cover the whole window: with per-domain scorers each
         # rollout is NaN outside its own domain, so the final sample alone would

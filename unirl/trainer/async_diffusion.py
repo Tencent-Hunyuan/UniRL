@@ -106,7 +106,11 @@ class AsyncDiffusionTrainer(AsyncRolloutTrainerMixin, DiffusionTrainer):
             mean_reward = float(part.rewards.to(torch.float32).mean().item())
         part = part.compute_advantages(normalize=True, use_global_std=self._adv_use_global_std)
         sample = sample.replace_frontier(part)
-        result = self.stack.train_track(sample.parts[-1], training_progress=float(training_progress))
+        result = self.stack.train_track(
+            sample.parts[-1],
+            training_progress=float(training_progress),
+            rollout_id=rollout_id,
+        )
         self._train_version += result.optimizer_updates
         self._batches_since_sync += 1
         if extra_metrics is not None:

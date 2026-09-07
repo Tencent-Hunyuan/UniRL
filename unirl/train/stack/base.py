@@ -341,6 +341,7 @@ class TrainStack(Remote):
         parts: Union[Part, Tuple[Part, ...]],
         *,
         training_progress: float,
+        rollout_id: Optional[int] = None,
     ) -> TrainStepResult:
         """Driver-callable: arrange → prepare → run updates → on_rollout_end."""
         window = parts if isinstance(parts, tuple) else (parts,)
@@ -360,6 +361,7 @@ class TrainStack(Remote):
                     part,
                     num_updates=self.num_updates_per_batch,
                     micro_batch_size=self.micro_batch_size,
+                    shuffle_step=rollout_id,
                 )
             )
         from unirl.utils.profiling import profile_mode
