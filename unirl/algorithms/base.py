@@ -188,9 +188,10 @@ def _reference_kl_loss(
 
 def _resolve_reference_model(backend: Any, *, beta: float, algo: str, coef_name: str = "beta") -> Any:
     """Resolve the trainable model for the adapter-disabled reference replay, or None."""
-    if float(beta) < 0.0:
-        raise ValueError(f"{algo}: {coef_name} must be >= 0; got {beta!r}.")
-    if float(beta) == 0.0:
+    coef = float(beta)
+    if not math.isfinite(coef) or coef < 0.0:
+        raise ValueError(f"{algo}: {coef_name} must be finite and >= 0; got {beta!r}.")
+    if coef == 0.0:
         return None
     model = getattr(backend, "model", None) if backend is not None else None
     if model is None:
@@ -201,7 +202,7 @@ def _resolve_reference_model(backend: Any, *, beta: float, algo: str, coef_name:
         )
     if not any("lora_" in name for name, _ in model.named_parameters()):
         raise ValueError(
-            f"{algo}: {coef_name}>0 computes KL against the LoRA-disabled base model (reference "
+            f"{algo}: {coef_name}>0 anchors the policy to the LoRA-disabled base model (reference "
             f"policy), which requires a LoRA adapter, but the trainable model has none. Use "
             f"a LoRA recipe, or set {coef_name}=0."
         )

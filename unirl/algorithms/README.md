@@ -108,11 +108,24 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   with the anchor swapped from the EMA shadow to the LoRA-disabled base, so the two share a scale
   and can be read side by side as drift-from-shadow against drift-from-base. DiffusionNFT trains on
   a freshly noised `xt` rather than the rollout trajectory, so it has no `stage.replay` step indices
-  and no `segment.sigmas` to normalize by. That leaves the `add_kl_coefficient=false` variant minus
-  the `/2`, so the number is **not** comparable to FlowGRPO/FlowDPPO's `kl_ref_mean`, which carries
+  to hand `_transition_sigma`. `segment.sigmas` is present (`train_timestep_mode: all` requires it)
+  and so is `t_batch`, so a time weight is available if one is ever wanted; what is absent is the SDE
+  transition std itself, because every NFT recipe runs `eta: 0.0` and that std vanishes with `eta` —
+  the same trap the DiffusionOPD bullet above raises on. That leaves the `add_kl_coefficient=false`
+  variant minus the `/2`, so the number is **not** comparable to FlowGRPO/FlowDPPO's `kl_ref_mean`, which carries
   `_gaussian_kl_div`'s `/(2σ²)`. Measuring on the prediction rather than the reconstructed `x0`
   drops the `t²` Jacobian of `xt - t*pred`, spreading pressure uniformly over trained timesteps
   instead of `t²`-weighting it — the magnitude still moves with `t` (training lower timesteps raises
   it several-fold). Also note `kl_coef` weighs a policy term already scaled by `adv_clip_max`, so
   the effective relative strength is `kl_coef / adv_clip_max` and re-tuning the clip re-tunes the
   penalty.
+- **The reference penalty is uninformative while the adapter delta is sub-ULP** — both operands come
+  straight out of a bf16 forward, and standard LoRA init (`B=0`) starts the delta at exactly zero.
+  Below roughly 2 bf16 ULP (RMS delta ≲ 0.01 against O(1) predictions) the difference is mostly
+  quantization noise: measured gradient-direction cosine against the fp32 answer is 0.52 at RMS
+  1e-3 and 0.97 at 1e-2. At the deviations these runs actually reach (0.008 → 0.057, i.e. 23 → 61
+  ULP) bf16 costs nothing measurable — 1.00x error, cosine 0.9999 — so the term is sound once the
+  adapter has moved, and merely inert before that. Upcasting inside the penalty does not change
+  this: the operands are already rounded when the forward returns them. DiffusionOPD's
+  `fp32 before squaring` is not the same situation — it upcasts scheduler-computed
+  `prev_sample_means`, not raw network output.

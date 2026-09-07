@@ -163,8 +163,8 @@ algorithm:
   shuffle_train_timesteps: true
   apply_time_shift_in_loss: false
   training_timestep_fraction: 1.0
-  # A reference-model KL term would cost a third forward per timestep and is not
-  # implemented; the algorithm rejects kl_coef > 0.
+  # kl_coef > 0 anchors the policy to the LoRA-disabled base with a third no_grad
+  # forward per trained timestep; see unirl/algorithms/README.md. Default off.
   kl_coef: 0.0
 
 stack:

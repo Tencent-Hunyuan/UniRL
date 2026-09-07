@@ -75,8 +75,8 @@ class DiffusionNFT(StageAlgorithm):
             raise ValueError(
                 f"DiffusionNFT: training_timestep_fraction must lie in (0, 1]; got {training_timestep_fraction!r}."
             )
-        if float(kl_coef) < 0:
-            raise ValueError(f"DiffusionNFT: kl_coef must be >= 0; got {kl_coef!r}.")
+        if not math.isfinite(float(kl_coef)) or float(kl_coef) < 0:
+            raise ValueError(f"DiffusionNFT: kl_coef must be finite and >= 0; got {kl_coef!r}.")
         if not (0.0 < float(beta)):
             raise ValueError(f"DiffusionNFT: beta must be > 0; got {beta!r}.")
         if not (0.0 < float(adv_clip_max)):
