@@ -43,6 +43,17 @@ _SDE_STEP_PARAMS = (
     "sde_type",
 )
 _COLLECTIVE_RPC_PARAMS = ("self", "method", "timeout", "args", "kwargs")
+_LOAD_STATE_DICT_PARAMS = (
+    "model",
+    "full_sd_iterator",
+    "device",
+    "param_dtype",
+    "strict",
+    "cpu_offload",
+    "param_names_mapping",
+    "training_mode",
+)
+_LOAD_MODULE_PARAMS = ("module_name", "component_model_path", "transformers_or_diffusers", "fastvideo_args")
 _RL_DATA_FIELDS = frozenset(
     {
         "enabled",
@@ -123,6 +134,26 @@ def _verify_weight_surface() -> None:
         _require_attr(offload, "LayerwiseOffloadHook", "LayerwiseOffloadHook"),
         "mutate_params_scope",
         "LayerwiseOffloadHook.mutate_params_scope",
+    )
+
+
+def _verify_offload_surface() -> None:
+    """Fail closed unless the loader seams the offload patch wraps keep their patched-for signatures."""
+    fsdp_load = _import_fastvideo_module("fastvideo.models.loader.fsdp_load", "fsdp_load")
+    state_load = _require_attr(
+        fsdp_load, "load_model_from_full_model_state_dict", "load_model_from_full_model_state_dict"
+    )
+    # The patch reads ``cpu_offload`` out of **kwargs; a positional call would silently no-op.
+    _require_signature(state_load, _LOAD_STATE_DICT_PARAMS, "load_model_from_full_model_state_dict")
+    loader = _import_fastvideo_module("fastvideo.models.loader.component_loader", "PipelineComponentLoader")
+    _require_signature(
+        _require_attr(
+            _require_attr(loader, "PipelineComponentLoader", "PipelineComponentLoader"),
+            "load_module",
+            "PipelineComponentLoader.load_module",
+        ),
+        _LOAD_MODULE_PARAMS,
+        "PipelineComponentLoader.load_module",
     )
 
 
@@ -405,8 +436,10 @@ def _patch_worker_runtime() -> None:
     _require_float_wan_timesteps()
     _patch_scheduler_set_timesteps()
     _patch_denoising_step()
+    from unirl.rollout.engine.fastvideo._offload import patch_offload
     from unirl.rollout.engine.fastvideo._weights import patch_weights
 
+    patch_offload()
     patch_weights()
 
 
@@ -436,6 +469,7 @@ def patch_fastvideo_unipc() -> None:
     """Install idempotent parent, worker-entrypoint, and runtime patches after fingerprinting the fork surface."""
     _verify_rl_data_surface()
     _verify_weight_surface()
+    _verify_offload_surface()
     _patch_worker_runtime()
     _patch_worker_entrypoint()
 
