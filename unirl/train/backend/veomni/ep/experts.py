@@ -33,20 +33,9 @@ _EXPERT_EXPORT_LAYOUTS_BY_MODEL_TYPE: dict[str, ExpertExportLayout] = {
 }
 
 
-def resolve_expert_weight_export_transform(
-    model: nn.Module,
-    *,
-    expected_ep_size: int,
-) -> ExpertWeightExportTransform | None:
+def resolve_expert_weight_export_transform(model: nn.Module) -> ExpertWeightExportTransform | None:
     """Resolve the transform exporting this model's EP-sharded expert weights."""
-    expects_ep = expected_ep_size > 1
-    model_has_ep = has_ep_params(model)
-    if expects_ep != model_has_ep:
-        raise RuntimeError(
-            f"EP weight export: inconsistent EP configuration: backend ep_size={expected_ep_size}, "
-            f"model_has_ep_params={model_has_ep}."
-        )
-    if not expects_ep:
+    if not has_ep_params(model):
         return None
 
     model_type = getattr(getattr(model, "config", None), "model_type", None)
@@ -72,15 +61,12 @@ def resolve_expert_weight_export_transform(
     from veomni.distributed.parallel_state import get_parallel_state
 
     ps = get_parallel_state()
-    ep_size = int(ps.ep_size) if getattr(ps, "ep_enabled", False) else 1
-    if ep_size != expected_ep_size:
-        raise RuntimeError(
-            f"EP weight export: backend ep_size={expected_ep_size} does not match parallel-state ep_size={ep_size}."
-        )
+    if not getattr(ps, "ep_enabled", False):
+        raise RuntimeError("EP weight export: the model has EP-sharded parameters, but EP state is disabled.")
     return partial(
         _iter_exported_expert_weights,
         layout=layout,
-        ep_size=ep_size,
+        ep_size=int(ps.ep_size),
         ep_group=ps.ep_group,
     )
 

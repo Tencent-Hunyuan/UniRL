@@ -120,6 +120,12 @@ class VeOmniBackend(BaseFSDP2Backend):
             activation_checkpointing=fsdp_cfg.activation_checkpointing,
             use_torch_compile=fsdp_cfg.use_torch_compile,
         )
+        model_has_ep = has_ep_params(model)
+        if (self._ep_size > 1) != model_has_ep:
+            raise RuntimeError(
+                f"VeOmniBackend: inconsistent EP placement: ep_size={self._ep_size}, "
+                f"model_has_ep_params={model_has_ep}."
+            )
 
         # Install Ulysses hooks after VeOmni parallelization.
         from unirl.train.backend.veomni.sp import apply_sequence_parallelism
@@ -182,7 +188,7 @@ class VeOmniBackend(BaseFSDP2Backend):
 
     def expert_weight_export_transform(self) -> Optional[ExpertWeightExportTransform]:
         """Resolve the transform exporting this model's EP-sharded expert weights."""
-        return resolve_expert_weight_export_transform(self.model, expected_ep_size=self._ep_size)
+        return resolve_expert_weight_export_transform(self.model)
 
     def _gather_optimizer_state(self) -> StateDict:
         if has_ep_params(self.model):
