@@ -8,7 +8,12 @@ import torch
 
 from unirl.models.types.bundle import Bundle
 from unirl.models.types.post_materialize import apply_deferred_ops
-from unirl.train.backend.base import LrSchedulerConfig, OptimizerConfig, resolve_trainable_module
+from unirl.train.backend.base import (
+    ExpertWeightExportTransform,
+    LrSchedulerConfig,
+    OptimizerConfig,
+    resolve_trainable_module,
+)
 from unirl.train.backend.base_backend import BaseFSDP2Backend
 from unirl.train.backend.sharded_load import load_trainable_weights
 from unirl.train.backend.sharded_state import (
@@ -23,10 +28,7 @@ from unirl.train.backend.veomni.ep.checkpoint import (
     load_ep_model_state_dict,
     load_ep_optimizer_state_dict,
 )
-from unirl.train.backend.veomni.ep.experts import (
-    ExpertWeightExportTransform,
-    resolve_expert_weight_export_transform,
-)
+from unirl.train.backend.veomni.ep.experts import resolve_expert_weight_export_transform
 from unirl.train.backend.veomni.ep.placement import has_ep_params
 from unirl.train.backend.veomni.state import clip_grad_norm, veomni_offload, veomni_onload
 from unirl.train.backend.veomni.wrap import veomni_parallelize
@@ -188,7 +190,7 @@ class VeOmniBackend(BaseFSDP2Backend):
 
     def expert_weight_export_transform(self) -> Optional[ExpertWeightExportTransform]:
         """Resolve the transform exporting this model's EP-sharded expert weights."""
-        return resolve_expert_weight_export_transform(self.model)
+        return resolve_expert_weight_export_transform(self.model) if self._ep_size > 1 else None
 
     def _gather_optimizer_state(self) -> StateDict:
         if has_ep_params(self.model):

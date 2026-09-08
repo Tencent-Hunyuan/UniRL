@@ -2,22 +2,19 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from functools import partial
 from typing import Protocol
 
 import torch
 from torch import nn
 
+from unirl.train.backend.base import ExpertWeightExportTransform, NamedTensorIterator
 from unirl.train.backend.veomni.ep.models import qwen3_moe
 from unirl.train.backend.veomni.ep.placement import (
     ep_named_parameters,
     gather_stacked_expert_block,
-    has_ep_params,
 )
-
-NamedTensorIterator = Iterator[tuple[str, torch.Tensor]]
-ExpertWeightExportTransform = Callable[[NamedTensorIterator], NamedTensorIterator]
 
 
 class ExpertExportLayout(Protocol):
@@ -33,11 +30,8 @@ _EXPERT_EXPORT_LAYOUTS_BY_MODEL_TYPE: dict[str, ExpertExportLayout] = {
 }
 
 
-def resolve_expert_weight_export_transform(model: nn.Module) -> ExpertWeightExportTransform | None:
+def resolve_expert_weight_export_transform(model: nn.Module) -> ExpertWeightExportTransform:
     """Resolve the transform exporting this model's EP-sharded expert weights."""
-    if not has_ep_params(model):
-        return None
-
     model_type = getattr(getattr(model, "config", None), "model_type", None)
     layout = _EXPERT_EXPORT_LAYOUTS_BY_MODEL_TYPE.get(model_type)
     if layout is None:
@@ -90,7 +84,4 @@ def _iter_exported_expert_weights(
         del stacked
 
 
-__all__ = [
-    "ExpertWeightExportTransform",
-    "resolve_expert_weight_export_transform",
-]
+__all__ = ["resolve_expert_weight_export_transform"]

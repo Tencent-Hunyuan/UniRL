@@ -6,7 +6,7 @@ import logging
 import math
 import os
 from concurrent.futures import Future
-from typing import TYPE_CHECKING, Callable, Dict, Iterator, List, Literal, Optional
+from typing import TYPE_CHECKING, Dict, List, Literal, Optional
 
 import torch
 import torch.distributed as dist
@@ -14,7 +14,7 @@ from torch import nn
 
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
-from unirl.train.backend.base import LrSchedulerConfig, OptimizerConfig
+from unirl.train.backend.base import ExpertWeightExportTransform, LrSchedulerConfig, OptimizerConfig
 from unirl.train.backend.sharded_state import (
     StateDict,
     _current_rank,
@@ -33,9 +33,6 @@ from unirl.train.configs import EmaFullConfig, EmaLoraConfig, FSDPConfig, LoraCo
 from unirl.train.ema import EMA, Shadow, inject_mirror, inject_nft, make_decay_fn
 from unirl.train.lora import inject_frozen_adapter, inject_lora, resolve_target_modules_pattern
 from unirl.train.optim import build_lr_scheduler, build_optimizer
-
-NamedTensorIterator = Iterator[tuple[str, torch.Tensor]]
-ExpertWeightExportTransform = Callable[[NamedTensorIterator], NamedTensorIterator]
 
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
