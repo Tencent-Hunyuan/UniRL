@@ -153,7 +153,9 @@ We are actively expanding model and algorithm coverage. Near-term directions:
 - Extend the team-proposed algorithms (Flow-DPPO, DRPO) to more model families.
 - Broaden reward backends and rollout-engine coverage across domains.
 
-Want a model or algorithm prioritized? [Open an issue](https://github.com/Tencent-Hunyuan/UniRL/issues) to discuss.
+Want a model or algorithm prioritized? Open a
+[feature request](https://github.com/Tencent-Hunyuan/UniRL/issues/new?template=feature-request.yml)
+to discuss.
 
 ## Contributing 🤝
 
@@ -161,8 +163,11 @@ Contributions and questions are welcome. Before opening a pull request, read the
 repository conventions in [`AGENTS.md`](AGENTS.md), run the
 [pre-PR checks](examples/README.md#adding-or-editing-a-recipe) for the files you
 touched, and fill in the [pull request template](.github/pull_request_template.md).
-For questions, bug reports, and feature requests,
-[open an issue](https://github.com/Tencent-Hunyuan/UniRL/issues).
+Use the issue forms for a
+[bug report](https://github.com/Tencent-Hunyuan/UniRL/issues/new?template=bug-report.yml)
+or
+[feature request](https://github.com/Tencent-Hunyuan/UniRL/issues/new?template=feature-request.yml).
+WeChat is fine for chat; bugs still belong on GitHub so they stay searchable.
 
 ## Acknowledgement 🙏
 

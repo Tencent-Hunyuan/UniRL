@@ -33,6 +33,9 @@ class VideoPickScoreScorer(PickScoreRewardScorer):
                 f"VideoPickScoreSpec.frame_selection must be 'first' or 'middle'; got {self.frame_selection!r}"
             )
 
+    def covers_prompt_video(self) -> bool:
+        return True
+
     @staticmethod
     def _extract_frame(video: torch.Tensor, which: str = "first") -> "Image.Image":
         """Extract one frame of a channel-first video tensor."""
