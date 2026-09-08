@@ -64,8 +64,8 @@ class FullWeightSync(Remote):
         self._bucket_bytes = int(bucket_size_mb) * 1024 * 1024
         self._flush_cache = bool(flush_cache)
         self._lora_merged = bool(lora_merged)
-        self._expand_experts = backend.fused_expert_expander()
-        if self._expand_experts is not None and hasattr(self._backend.model, "peft_config"):
+        self._expert_weight_transform = backend.expert_weight_export_transform()
+        if self._expert_weight_transform is not None and hasattr(self._backend.model, "peft_config"):
             from unirl.utils.peft_merge import lora_targets_ep_experts
 
             if lora_targets_ep_experts(self._backend.model):
@@ -110,8 +110,8 @@ class FullWeightSync(Remote):
                 )
                 if not name.endswith((".lora_A", ".lora_B"))
             )
-        if self._expand_experts is not None:
-            stream = self._expand_experts(stream)
+        if self._expert_weight_transform is not None:
+            stream = self._expert_weight_transform(stream)
 
         remap = self._name_remap
         for name, tensor in stream:

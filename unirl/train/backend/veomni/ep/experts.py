@@ -1,10 +1,10 @@
-"""Resolve an EP model's fused expert layout into a tensor-stream transform (contract: unirl/train/readme.md)."""
+"""Resolve an EP model's fused expert layout into a weight-export transform."""
 
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from functools import partial
-from types import ModuleType
 
 import torch
 from torch import nn
@@ -16,56 +16,105 @@ from unirl.train.backend.veomni.ep.placement import (
     has_ep_params,
 )
 
-TensorStream = Iterator[tuple[str, torch.Tensor]]
-
-# model_type -> the ep/models module describing the fused expert tensors VeOmni builds for it.
-_LAYOUTS: dict[str, ModuleType] = {"qwen3_moe": qwen3_moe, "qwen3_5_moe": qwen3_moe}
+NamedTensorIterator = Iterator[tuple[str, torch.Tensor]]
+ExpertWeightExportTransform = Callable[[NamedTensorIterator], NamedTensorIterator]
 
 
-def resolve_expert_expander(model: nn.Module) -> Callable[[TensorStream], TensorStream] | None:
-    """Return the transform re-emitting this model's fused experts per expert, or None when it shards none."""
+@dataclass(frozen=True)
+class ExpertExportLayout:
+    """Operations required to export one model family's fused expert weights."""
+
+    is_fused_weight: Callable[[str], bool]
+    iter_hf_weights: Callable[[str, torch.Tensor], NamedTensorIterator]
+
+
+_QWEN3_MOE_EXPORT_LAYOUT = ExpertExportLayout(
+    is_fused_weight=qwen3_moe.is_fused_expert_param,
+    iter_hf_weights=qwen3_moe.iter_hf_expert_tensors,
+)
+_EXPERT_EXPORT_LAYOUTS_BY_MODEL_TYPE = {
+    "qwen3_moe": _QWEN3_MOE_EXPORT_LAYOUT,
+    "qwen3_5_moe": _QWEN3_MOE_EXPORT_LAYOUT,
+}
+
+
+def resolve_expert_weight_export_transform(
+    model: nn.Module,
+    *,
+    expected_ep_size: int,
+) -> ExpertWeightExportTransform | None:
+    """Resolve the transform exporting this model's EP-sharded expert weights."""
     if not has_ep_params(model):
+        if expected_ep_size > 1:
+            raise RuntimeError(
+                f"EP weight export: backend configured ep_size={expected_ep_size}, "
+                "but the model has no EP-sharded parameters."
+            )
         return None
 
     model_type = getattr(getattr(model, "config", None), "model_type", None)
-    layout = _LAYOUTS.get(model_type)
+    layout = _EXPERT_EXPORT_LAYOUTS_BY_MODEL_TYPE.get(model_type)
     if layout is None:
         raise ValueError(
             f"EP experts: no fused expert layout is registered for model_type={model_type!r} "
-            f"(known: {sorted(_LAYOUTS)}). Register one under ep/models/ or sync this model's "
+            f"(known: {sorted(_EXPERT_EXPORT_LAYOUTS_BY_MODEL_TYPE)}). "
+            "Register one under ep/models/ or sync this model's "
             "adapter instead of its full weights."
         )
 
-    unsupported = [name for name, _ in ep_named_parameters(model) if not layout.is_fused_expert_param(name)]
+    unsupported = [name for name, _ in ep_named_parameters(model) if not layout.is_fused_weight(name)]
     if unsupported:
         raise ValueError(
             f"EP experts: the {model_type!r} layout does not describe {len(unsupported)} "
             f"EP-sharded parameter(s): {unsupported[:4]}."
         )
-    return partial(_expand_experts, layout=layout)
+    if expected_ep_size <= 1:
+        raise RuntimeError(
+            f"EP weight export: the model has EP-sharded parameters, but backend ep_size={expected_ep_size}."
+        )
 
-
-def _expand_experts(stream: TensorStream, *, layout: ModuleType) -> TensorStream:
-    """All-gather each rank's fused expert block over the EP group, then split it into per-expert tensors."""
     from unirl.train.backend.veomni import _compat
 
     _compat.ensure_installed()
     from veomni.distributed.parallel_state import get_parallel_state
 
     ps = get_parallel_state()
-    ep_size = int(ps.ep_size) if getattr(ps, "ep_enabled", False) else 1
-    ep_group = ps.ep_group if ep_size > 1 else None
+    if not getattr(ps, "ep_enabled", False):
+        raise RuntimeError("EP weight export: the model has EP-sharded parameters, but EP state is disabled.")
+    ep_size = int(ps.ep_size)
+    if ep_size != expected_ep_size:
+        raise RuntimeError(
+            f"EP weight export: backend ep_size={expected_ep_size} does not match parallel-state ep_size={ep_size}."
+        )
+    return partial(
+        _iter_exported_expert_weights,
+        layout=layout,
+        ep_size=ep_size,
+        ep_group=ps.ep_group,
+    )
+
+
+def _iter_exported_expert_weights(
+    stream: NamedTensorIterator,
+    *,
+    layout: ExpertExportLayout,
+    ep_size: int,
+    ep_group,
+) -> NamedTensorIterator:
+    """All-gather fused expert blocks and emit per-expert Hugging Face weights."""
 
     for name, tensor in stream:
-        if not layout.is_fused_expert_param(name):
+        if not layout.is_fused_weight(name):
             yield name, tensor
             continue
-        stacked = tensor  # ep_size == 1: this rank already holds the full [E, ...] stack
-        if ep_size > 1:
-            stacked = gather_stacked_expert_block(tensor, ep_size=ep_size, ep_group=ep_group)
-            del tensor
-        yield from layout.iter_hf_expert_tensors(name, stacked)
+        stacked = gather_stacked_expert_block(tensor, ep_size=ep_size, ep_group=ep_group)
+        del tensor
+        yield from layout.iter_hf_weights(name, stacked)
         del stacked
 
 
-__all__ = ["TensorStream", "resolve_expert_expander"]
+__all__ = [
+    "ExpertWeightExportTransform",
+    "NamedTensorIterator",
+    "resolve_expert_weight_export_transform",
+]

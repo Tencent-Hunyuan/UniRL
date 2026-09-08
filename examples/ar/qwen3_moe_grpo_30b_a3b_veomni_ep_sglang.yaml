@@ -14,12 +14,12 @@
 #      cache before the EP-aware loader
 #      (unirl.train.backend.sharded_load._load_state_dict_ep_sliced) reconstructs each
 #      rank's fused expert block from the per-expert keys on the fly.
-#   2. EP-aware weight sync — IMPLEMENTED. TensorWeightSync (via FullWeightSync.
-#      _iter_full_tensors_ep) all-gathers the EP-sharded experts over the ep group and
-#      reverse-converts stacked->HF per-expert names for SGLang's expert_params_mapping
-#      (verified bit-exact). BUT TensorWeightSync is TP=1, so rollout.tp_size MUST be 1
-#      here. A real 30B-A3B rollout needs TP>1 → a TP-aware sync (per-TP payloads, or
-#      NCCLWeightSync). <-- remaining external/infra work.
+#   2. EP-aware weight sync — IMPLEMENTED. TensorWeightSync uses the backend's
+#      expert_weight_export_transform() to all-gather EP-sharded experts over the ep
+#      group and reverse-convert stacked->HF per-expert names for SGLang's
+#      expert_params_mapping (verified bit-exact). BUT TensorWeightSync is TP=1, so
+#      rollout.tp_size MUST be 1 here. A real 30B-A3B rollout needs TP>1 → a TP-aware
+#      sync (per-TP payloads, or NCCLWeightSync). <-- remaining external/infra work.
 #
 # Run (8 GPU):
 #   QWEN3_MOE_PATH=/path/to/qwen3-30b-a3b-stacked DATA_PATH=data/dapo_math/train.jsonl \

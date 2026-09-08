@@ -34,6 +34,9 @@ from unirl.train.ema import EMA, Shadow, inject_mirror, inject_nft, make_decay_f
 from unirl.train.lora import inject_frozen_adapter, inject_lora, resolve_target_modules_pattern
 from unirl.train.optim import build_lr_scheduler, build_optimizer
 
+NamedTensorIterator = Iterator[tuple[str, torch.Tensor]]
+ExpertWeightExportTransform = Callable[[NamedTensorIterator], NamedTensorIterator]
+
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
 
@@ -674,8 +677,8 @@ class BaseFSDP2Backend(Remote):
         """Backend-specific metadata added to a single-file checkpoint."""
         return {}
 
-    def fused_expert_expander(self) -> Optional[Callable[[Iterator], Iterator]]:
-        """Transform re-emitting sharded fused experts per expert, or None when this backend shards none."""
+    def expert_weight_export_transform(self) -> Optional[ExpertWeightExportTransform]:
+        """Return this backend's expert-weight export transform, if one is required."""
         return None
 
     def _gather_optimizer_state(self) -> StateDict:
