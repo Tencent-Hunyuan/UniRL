@@ -23,11 +23,8 @@
 #     hv15's stage config sets enable_lora/max_lora_rank=64 so the adapter
 #     actually applies. This avoids the CUDA-IPC path's SGLang dependency,
 #     which the vllm-omni-only venv (two-venv image) does not provide.
-#   - algorithm.old_logp_source: replay — the separate-ENGINE anchor (the
-#     vllm-omni engine is a separate process even when colocated; without replay
-#     the cross-process rollout<->replay logp gap dilutes the first-epoch ratio
-#     -> flat reward). Every other vllm-omni v2 engine recipe sets this; the
-#     separate recipe predates the fix and omits it.
+#   - algorithm.old_logp_source: rollout — use the sampler-emitted density as
+#     the frozen policy anchor.
 #
 # Boot note: colocate 1x8 lands all 8 hv15 engine replicas on ONE node — the
 # worst-case parallel-boot memcg burst (each loads ~30GB DiT + Qwen2.5-VL TE +
@@ -78,6 +75,7 @@ backend:
   fsdp_cfg:
     _target_: unirl.train.configs.FSDPConfig
     param_dtype: bf16
+    master_dtype: fp32
     cpu_offload: false
     mixed_precision: true
     fsdp_mode: full
@@ -148,11 +146,8 @@ reward:
 algorithm:
   _target_: unirl.algorithms.flowgrpo.FlowGRPO
   stage_attr: diffusion
-  # Separate-ENGINE anchor: the vllm-omni engine is a separate process even when
-  # colocated, so old_logp must be trainer-side replay (not the engine's rollout
-  # logp). Omitting it bakes the cross-process logp gap into the first-epoch
-  # ratio -> diluted GRPO signal / flat reward. (Matches qwen_image_*_vllmomni_v2.)
-  old_logp_source: replay
+  # Keep the sampler-emitted density as the actual old policy.
+  old_logp_source: rollout
   clip_range: 1.0e-4
   clip_schedule: constant
   conditions_cls:

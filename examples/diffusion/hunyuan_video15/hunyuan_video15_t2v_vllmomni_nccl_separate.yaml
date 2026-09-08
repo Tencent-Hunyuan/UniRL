@@ -63,6 +63,9 @@ backend:
   fsdp_cfg:
     _target_: unirl.train.configs.FSDPConfig
     param_dtype: bf16
+    # Same LoRA optimizer contract as trainside/colocate: a bf16 load keeps a
+    # bf16 master unless this is set, and ~1e-6 AdamW steps round away.
+    master_dtype: fp32
     cpu_offload: false
     mixed_precision: true
     fsdp_mode: full
@@ -135,12 +138,11 @@ algorithm:
   stage_attr: diffusion
   clip_range: 1.0e-4
   clip_schedule: constant
-  # Separate-slab rollout (vllm-omni) computes log_probs via a different code
-  # path than the train-side replay (merged-weight forward vs LoRA-adapter
-  # forward, different scheduler impl). This causes ~1e-4 numerical drift in
-  # old_logp that trips the tight clip_range and wastes gradient signal.
-  # "replay" recomputes old_logp at pre-update weights on the train replica,
-  # ensuring the π_old anchor uses the exact same code path as new_logp.
+  # Keep trainer-side replay. This recipe pushes merged full weights
+  # (sync.use_merged: true), so sampler logp is a vLLM merged-weight forward
+  # while train new_logp is FSDP LoRA-adapter. That remaining path gap still
+  # sits near clip_range (1e-4). Colocate can use old_logp_source: rollout
+  # because both sides apply the same online adapter; this recipe cannot.
   old_logp_source: replay
   conditions_cls:
     _target_: hydra.utils.get_class
