@@ -14,6 +14,13 @@ Copied from the official DeepSeek-AI/Janus repository at the commit pinned in
 - ``models/modeling_vlm.py`` clones token embeddings before replacing image
   placeholder rows, avoiding an inplace write into a grad-carrying tensor during
   RL replay/backward.
+- ``models/modeling_vlm.py`` drops the five nested generic-config
+  ``AutoConfig.register`` calls (``vision`` / ``aligner`` / ``gen_vision`` /
+  ``gen_aligner`` / ``gen_head``); ``MultiModalityConfig.__init__`` constructs
+  those sub-configs directly. The three registrations the loader relies on
+  stay: ``multi_modality`` on ``AutoConfig`` and ``AutoModelForCausalLM``
+  (``modeling_vlm.py``), and ``VLMImageProcessor`` on ``AutoImageProcessor``
+  (``image_processing_vlm.py``).
 
 Keep Janus-Pro RL logic outside this subtree; an upstream bump should be a
 re-vendor plus the mechanical rewrites above.

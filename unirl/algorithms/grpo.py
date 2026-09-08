@@ -43,7 +43,10 @@ class GRPO(StageAlgorithm):
     # rollout-vs-train engine gap on later mini-batches (accepted for parity).
     # Under 'replay' prepare_segment overwrites it with a train-side anchor.
     supports_multi_update = True
-    anchor_fields = ("log_probs",)
+    # ``rollout_log_probs`` rides along so the rollout_replay_* / k3_* gauges
+    # keep comparing against the engine's emission after ``replay`` overwrites
+    # ``log_probs`` (mirrors GSPO); the stack writes both back per micro.
+    anchor_fields = ("log_probs", "rollout_log_probs")
 
     def recomputes_anchor(self) -> bool:
         # Only ``replay`` re-derives log_probs; ``rollout`` keeps the engine's emission.
@@ -94,9 +97,16 @@ class GRPO(StageAlgorithm):
         segment: "TextSegment",
     ) -> None:
         """Freeze the selected rollout- or replay-sourced old-policy anchor."""
-        if self.old_logp_source != "replay":
+        if segment.tokens is None or segment.log_probs is None or int(segment.tokens.shape[0]) == 0:
             return
-        if segment.tokens is None or int(segment.tokens.shape[0]) == 0:
+        # Snapshot the engine's emission before anything can overwrite it. Most
+        # AR producers (qwen3 / qwen_vl trainside, the SGLang text adapter) pack
+        # only ``log_probs``; without this, ``replay`` would leave the
+        # rollout-vs-replay metrics comparing new_logp against the train-side
+        # anchor (~0 on the first update) instead of the rollout value.
+        if segment.rollout_log_probs is None:
+            segment.rollout_log_probs = segment.log_probs.detach().cpu().clone()
+        if self.old_logp_source != "replay":
             return
         typed_conds = typed_conditions(conditions, self.conditions_cls)
         with torch.no_grad():

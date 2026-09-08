@@ -90,6 +90,9 @@ backend:
 rollout:
   _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
   stage_attrs: [image_ar]
+  # Keep at 1. With forward_batch_size > 1 every colocated bundle actor died
+  # during construction on 8x H20 (ActorUnavailableError: Socket closed, no
+  # Python traceback); 1 is the only value validated over 280+ rollouts.
   forward_batch_size: 1
 
 reward:

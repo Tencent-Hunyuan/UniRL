@@ -2,9 +2,10 @@
 # GRPO Janus-Pro on Geometry3K-MC (Text+Image -> Text) — train_ar,
 # TRAINSIDE colocate + LoRA on the language model.
 #
-# This recipe only uses Janus-Pro's multimodal-understanding path. Janus-Pro's
-# image generation path is autoregressive image-token generation, not diffusion,
-# and is intentionally not wired here.
+# This recipe trains only Janus-Pro's multimodal-understanding path
+# (`pipeline.ar`). The pipeline also builds the Text -> Image stage
+# (`pipeline.image_ar`, autoregressive image tokens, not diffusion); that path
+# is exercised by the sibling recipe ar/janus_pro_grpo_t2i_lora.yaml.
 #
 # Data: build once with
 #   python datasets/geo3k_mc/prepare_geo3k_mc.py --out-dir data/geo3k_mc
@@ -96,6 +97,9 @@ backend:
 rollout:
   _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
   stage_attrs: [ar]
+  # Keep at 1. With forward_batch_size > 1 every colocated bundle actor died
+  # during construction on 8x H20 (ActorUnavailableError: Socket closed, no
+  # Python traceback); 1 is the only value validated over 280+ rollouts.
   forward_batch_size: 1
 
 reward:

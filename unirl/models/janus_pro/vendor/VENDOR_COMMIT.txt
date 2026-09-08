@@ -12,7 +12,10 @@ Mechanical changes (see vendor/__init__.py):
   - dataclass mutable-default compatibility patch in models/modeling_vlm.py
   - empty all_tied_weights_keys compatibility mapping in models/modeling_vlm.py
   - grad-safety clone before image-placeholder embedding replacement in models/modeling_vlm.py
-  - drop process-global registrations for nested generic config names; MultiModalityConfig constructs them directly
+  - drop the 5 nested generic-config AutoConfig registrations (vision/aligner/gen_vision/gen_aligner/gen_head);
+    MultiModalityConfig constructs them directly. The 3 loader registrations stay: multi_modality on
+    AutoConfig + AutoModelForCausalLM (modeling_vlm.py), VLMImageProcessor on AutoImageProcessor
+    (image_processing_vlm.py)
 
 To re-vendor a newer upstream:
   1. git -C Janus fetch && git -C Janus checkout <new_commit>
