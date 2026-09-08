@@ -166,6 +166,7 @@ class FlowGRPO(StageAlgorithm):
                 eta=float(self.params.eta),
                 device=new_logp.device,
                 add_coefficient=True,
+                sample_ndim=new_means.ndim,
             )
             ref_means = _reference_replay_means(
                 self.stage,
