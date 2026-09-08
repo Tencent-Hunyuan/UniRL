@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import time
+import unicodedata
 from collections import Counter
 from dataclasses import dataclass
 from typing import List
@@ -63,20 +64,22 @@ class OCRRewardScorer(LocalRewardBackend):
                 f"completed (model_name={self.model_name!r}, batch_size={request.batch_size})."
             )
         start = time.time()
-        rewards, component_rewards = self._compute_rewards_and_components(request)
+        rewards, component_rewards, successes, errors = self._compute_rewards_and_components(request)
         return RewardResponse(
             rewards=rewards,
             component_rewards=component_rewards,
-            successes=[True] * len(rewards),
-            errors=[None] * len(rewards),
+            successes=successes,
+            errors=errors,
             compute_time=time.time() - start,
         )
 
     def _compute_model_rewards(self, request: RewardRequest) -> List[float]:
-        rewards, _ = self._compute_rewards_and_components(request)
+        rewards, _, _, _ = self._compute_rewards_and_components(request)
         return rewards
 
-    def _compute_rewards_and_components(self, request: RewardRequest) -> tuple[List[float], dict[str, List[float]]]:
+    def _compute_rewards_and_components(
+        self, request: RewardRequest
+    ) -> tuple[List[float], dict[str, List[float]], List[bool], List[str | None]]:
         import numpy as np
 
         images = request.images
@@ -100,6 +103,8 @@ class OCRRewardScorer(LocalRewardBackend):
             "exact_match": [],
             "counter_iou": [],
         }
+        successes: List[bool] = []
+        errors: List[str | None] = []
         rank = int(os.environ.get("RANK", 0))
         progress = tqdm(
             zip(images, prompts),
@@ -115,7 +120,9 @@ class OCRRewardScorer(LocalRewardBackend):
                 result = self._run_ocr(img)
                 prediction = self._normalize_text(self._extract_recognized_text(result))
                 metrics = self._score_text(prediction, target)
-            except Exception:
+                success = True
+                error = None
+            except Exception as exc:
                 logger.warning(
                     "OCR reward scoring failed for sample %d; assigning zero reward.",
                     sample_idx,
@@ -127,12 +134,16 @@ class OCRRewardScorer(LocalRewardBackend):
                     "exact_match": 0.0,
                     "counter_iou": 0.0,
                 }
+                success = False
+                error = f"{type(exc).__name__}: {exc}"
 
             rewards.append(metrics["edit_similarity"])
             for name, value in metrics.items():
                 component_rewards[name].append(value)
+            successes.append(success)
+            errors.append(error)
 
-        return rewards, component_rewards
+        return rewards, component_rewards, successes, errors
 
     def _run_ocr(self, img):
         predict_fn = getattr(self._ocr_reader, "predict", None)
@@ -170,7 +181,8 @@ class OCRRewardScorer(LocalRewardBackend):
 
     @staticmethod
     def _normalize_text(text: str) -> str:
-        return "".join(re.findall(r"\w", str(text).casefold(), flags=re.UNICODE))
+        normalized = unicodedata.normalize("NFC", str(text).casefold())
+        return "".join(char for char in normalized if not char.isspace())
 
     @staticmethod
     def _python_levenshtein_distance(left: str, right: str) -> int:

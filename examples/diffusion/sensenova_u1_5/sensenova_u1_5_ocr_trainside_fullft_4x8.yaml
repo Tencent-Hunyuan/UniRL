@@ -120,9 +120,6 @@ reward:
     config:
       _target_: unirl.reward.local.ocr.OCRSpec
       lang: en
-      metric: levenshtein
-      engine: paddleocr
-      tesseract_psm: 11
 
 algorithm:
   _target_: unirl.algorithms.flowgrpo.FlowGRPO
