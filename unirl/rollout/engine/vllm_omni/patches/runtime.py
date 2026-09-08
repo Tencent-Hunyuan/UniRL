@@ -541,7 +541,10 @@ def patch_hv15_refiner_torch_linear_lora() -> None:
         newly_wrapped = 0
         for module_name, module in matched.items():
             full_module_name = f"transformer.{module_name}"
-            if isinstance(module, _HV15TorchLinearWithLoRA):
+            already_wrapped = isinstance(module, _HV15TorchLinearWithLoRA) or (
+                callable(getattr(module, "set_lora", None)) and hasattr(module, "base_layer")
+            )
+            if already_wrapped:
                 self._lora_modules[full_module_name] = module
                 registered += 1
                 continue
@@ -556,7 +559,7 @@ def patch_hv15_refiner_torch_linear_lora() -> None:
         if registered != expected:
             raise RuntimeError(
                 "HV1.5 token-refiner LoRA coverage is incomplete: "
-                f"registered {registered}/{expected} ordinary linear targets"
+                f"registered {registered}/{expected} token-refiner LoRA targets"
             )
         if newly_wrapped:
             logger.info(
