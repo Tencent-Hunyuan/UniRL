@@ -42,6 +42,7 @@ _SDE_STEP_PARAMS = (
     "eta",
     "sde_type",
 )
+_COLLECTIVE_RPC_PARAMS = ("self", "method", "timeout", "args", "kwargs")
 _RL_DATA_FIELDS = frozenset(
     {
         "enabled",
@@ -97,6 +98,32 @@ def _verify_rl_data_surface() -> None:
             f"FastVideo ForwardBatch.RLData lacks fields {missing} required by the UniPC "
             f"integration (pinned surface: {_PINNED_FORK})"
         )
+
+
+def _verify_weight_surface() -> None:
+    """Fail closed unless the worker/executor/generator seams the weight patch installs onto still exist."""
+    worker = _require_attr(_import_fastvideo_module("fastvideo.worker.gpu_worker", "Worker"), "Worker", "Worker")
+    _require_attr(worker, "execute_forward", "Worker.execute_forward")
+    executor = _require_attr(
+        _import_fastvideo_module("fastvideo.worker.multiproc_executor", "MultiprocExecutor"),
+        "MultiprocExecutor",
+        "MultiprocExecutor",
+    )
+    _require_signature(
+        _require_attr(executor, "collective_rpc", "MultiprocExecutor.collective_rpc"),
+        _COLLECTIVE_RPC_PARAMS,
+        "MultiprocExecutor.collective_rpc",
+    )
+    hooks = _import_fastvideo_module("fastvideo.hooks.hooks", "ModuleHookManager")
+    manager = _require_attr(hooks, "ModuleHookManager", "ModuleHookManager")
+    for name in ("get_from", "get_forward_hook"):
+        _require_attr(manager, name, f"ModuleHookManager.{name}")
+    offload = _import_fastvideo_module("fastvideo.hooks.layerwise_offload", "LayerwiseOffloadHook")
+    _require_attr(
+        _require_attr(offload, "LayerwiseOffloadHook", "LayerwiseOffloadHook"),
+        "mutate_params_scope",
+        "LayerwiseOffloadHook.mutate_params_scope",
+    )
 
 
 def _require_float_wan_timesteps() -> None:
@@ -378,6 +405,9 @@ def _patch_worker_runtime() -> None:
     _require_float_wan_timesteps()
     _patch_scheduler_set_timesteps()
     _patch_denoising_step()
+    from unirl.rollout.engine.fastvideo._weights import patch_weights
+
+    patch_weights()
 
 
 def _worker_main_with_unipc(*args, **kwargs):
@@ -405,6 +435,7 @@ def _patch_worker_entrypoint() -> None:
 def patch_fastvideo_unipc() -> None:
     """Install idempotent parent, worker-entrypoint, and runtime patches after fingerprinting the fork surface."""
     _verify_rl_data_surface()
+    _verify_weight_surface()
     _patch_worker_runtime()
     _patch_worker_entrypoint()
 
