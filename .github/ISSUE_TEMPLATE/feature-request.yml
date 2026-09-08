@@ -1,0 +1,53 @@
+# Adapted from verl-project/verl-omni (originally Hugging Face transformers).
+name: Feature request
+description: Model, algorithm, engine, or docs support you want UniRL to add
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Search [existing issues](https://github.com/Tencent-Hunyuan/UniRL/issues) first.
+        A request that already has a recipe or a tracking issue will be closed as a duplicate.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Model support
+        - Algorithm
+        - Rollout engine (vLLM-Omni / SGLang / train-side)
+        - Reward / judge
+        - Distributed / weight sync
+        - Hardware
+        - Docs / recipes
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: feature-request
+    attributes:
+      label: Feature request
+      description: |
+        What should UniRL do? Link the paper, model card, or reference implementation if they exist.
+    validations:
+      required: true
+
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivation
+      description: |
+        What is blocked today? If this is related to another GitHub issue, link it.
+    validations:
+      required: true
+
+  - type: textarea
+    id: contribution
+    attributes:
+      label: Your contribution
+      description: |
+        Can you send a PR? Before opening one, read [`AGENTS.md`](https://github.com/Tencent-Hunyuan/UniRL/blob/main/AGENTS.md) and the [recipe checks](https://github.com/Tencent-Hunyuan/UniRL/blob/main/examples/README.md#adding-or-editing-a-recipe).
+    validations:
+      required: true
