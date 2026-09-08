@@ -40,10 +40,10 @@
 /unirl/train/                           @CjhHa1 @celve @haonan3
 /unirl/train/backend/                   @celve @zzhuoxin1508 @CjhHa1
 /unirl/train/stack/                     @leviking98z-rgb @haonan3
-/unirl/train/sft/                       @haonan3 @xshrz
+/unirl/train/sft/                       @haonan3 @celve
 /unirl/train/unified_model_stack.py     @Ideny42 @zzhuoxin1508
 /unirl/trainer/                         @celve @Ideny42 @CjhHa1
-/unirl/train_sft.py                     @haonan3 @xshrz
+/unirl/train_sft.py                     @haonan3 @celve
 /unirl/train_pe.py                      @Jayce-Ping @Ideny42
 /unirl/train_unified_model.py           @Ideny42 @zzhuoxin1508
 
@@ -55,13 +55,13 @@
 /unirl/models/                          @celve @CjhHa1 @haonan3
 /unirl/models/bagel/                    @celve @Ideny42 @heguangxin
 /unirl/models/ltx2/                     @KemingWu @leviking98z-rgb
-/unirl/models/z_image/                  @xshrz @celve
-/unirl/models/wan22_v2v/                @xshrz @celve
+/unirl/models/z_image/                  @CjhHa1 @celve
+/unirl/models/wan22_v2v/                @CjhHa1 @celve
 /unirl/models/pe/                       @Jayce-Ping @celve
 /unirl/models/qwen3/                    @celve @haonan3
 /unirl/models/qwen_vl/                  @haonan3 @celve
 /unirl/models/qwen3_omni/               @CjhHa1 @zzhuoxin1508
-/unirl/models/qwen_image_edit_plus/     @CjhHa1 @xshrz
+/unirl/models/qwen_image_edit_plus/     @CjhHa1 @celve
 
 # --- reward ----------------------------------------------------------------
 /unirl/reward/                          @KemingWu @Zcchill @haonan3
@@ -72,7 +72,7 @@
 /unirl/config/                          @celve @haonan3
 /unirl/utils/                           @zzhuoxin1508 @haonan3
 /unirl/tools/                           @CjhHa1 @zzhuoxin1508
-/unirl/data/                            @haonan3 @xshrz
+/unirl/data/                            @haonan3 @celve
 
 # --- data and benchmarks ---------------------------------------------------
 /datasets/                              @KemingWu @haonan3
@@ -80,7 +80,7 @@
 
 # --- recipes ---------------------------------------------------------------
 /examples/                              @celve @leviking98z-rgb @haonan3
-/examples/sft/                          @haonan3 @xshrz
+/examples/sft/                          @haonan3 @celve
 /examples/pe/                           @Jayce-Ping @celve
 /examples/unified_model/                @zzhuoxin1508 @Ideny42
 
