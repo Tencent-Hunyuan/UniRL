@@ -46,6 +46,7 @@ _SDE_STEP_PARAMS = (
 )
 _STOCK_SDE_STEP_PARAMS = _SDE_STEP_PARAMS[:-2]
 _COLLECTIVE_RPC_PARAMS = ("self", "method", "timeout", "args", "kwargs")
+_EXECUTE_FORWARD_PARAMS = ("self", "forward_batch", "fastvideo_args")
 _LOAD_STATE_DICT_PARAMS = (
     "model",
     "full_sd_iterator",
@@ -161,6 +162,20 @@ def _verify_weight_surface() -> None:
         "mutate_params_scope",
         "LayerwiseOffloadHook.mutate_params_scope",
     )
+    # The response patch owns these seams; upstream's execute_forward rebuilds a bare
+    # ForwardBatch that drops rl_data, the trajectory, and the prompt embeddings.
+    _require_signature(
+        _require_attr(executor, "execute_forward", "MultiprocExecutor.execute_forward"),
+        _EXECUTE_FORWARD_PARAMS,
+        "MultiprocExecutor.execute_forward",
+    )
+    worker_proc = _require_attr(
+        _import_fastvideo_module("fastvideo.worker.multiproc_executor", "WorkerMultiprocProc"),
+        "WorkerMultiprocProc",
+        "WorkerMultiprocProc",
+    )
+    _require_attr(worker_proc, "__init__", "WorkerMultiprocProc.__init__")
+    _require_attr(worker, "execute_forward", "Worker.execute_forward")
 
 
 def _verify_offload_surface() -> None:
@@ -461,6 +476,7 @@ def _patch_denoising_step() -> None:
 def _patch_worker_runtime() -> None:
     _require_float_wan_timesteps()
     _verify_stock_surface()
+    from unirl.rollout.engine.fastvideo._conditions import patch_conditions
     from unirl.rollout.engine.fastvideo._contracts import patch_contracts, patch_transition
     from unirl.rollout.engine.fastvideo._offload import patch_offload
     from unirl.rollout.engine.fastvideo._weights import patch_weights
@@ -472,6 +488,7 @@ def _patch_worker_runtime() -> None:
     _verify_rl_data_surface()
     _patch_scheduler_set_timesteps()
     _patch_denoising_step()
+    patch_conditions()
     patch_offload()
     patch_weights()
 
