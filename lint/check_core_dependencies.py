@@ -59,6 +59,7 @@ RULES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "unirl.models",
             "unirl.reward",
             "unirl.rollout",
+            "unirl.train",
             "unirl.trainer",
         ),
         (),

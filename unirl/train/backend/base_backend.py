@@ -14,7 +14,7 @@ from torch import nn
 
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
-from unirl.train.backend.base import LrSchedulerConfig, OptimizerConfig
+from unirl.train.backend.base import ExpertWeightExportTransform, LrSchedulerConfig, OptimizerConfig
 from unirl.train.backend.sharded_state import (
     StateDict,
     _current_rank,
@@ -673,6 +673,10 @@ class BaseFSDP2Backend(Remote):
     def _torch_checkpoint_metadata(self) -> Dict[str, object]:
         """Backend-specific metadata added to a single-file checkpoint."""
         return {}
+
+    def expert_weight_export_transform(self) -> Optional[ExpertWeightExportTransform]:
+        """Return this backend's expert-weight export transform, if one is required."""
+        return None
 
     def _gather_optimizer_state(self) -> StateDict:
         """Rank-0 optimizer state for the checkpoint (collective for DCP backends)."""

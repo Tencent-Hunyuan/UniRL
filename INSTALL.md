@@ -4,15 +4,19 @@ UniRL ships two mutually exclusive inference engines (`vllm` and `sglang`) — i
 
 | Engine | CUDA | glibc |
 |---|---|---|
-| **vllm-omni** | 12.9 | ≥ 2.28 |
+| **vllm-omni** | 13.0 | ≥ 2.28 |
 | **sglang** | 13.0 | ≥ 2.34 |
+
+Both engines are CUDA 13 now. On the driver-535 fleet that means NVIDIA's
+`cuda-compat-13-0` forward-compat layer has to be on `LD_LIBRARY_PATH`; the
+launchers find it under `.cuda-compat-13/` or `/usr/local/cuda-13.*/`, or take an
+explicit `CUDA_COMPAT_DIR`.
 
 ## vllm-omni
 
 ```bash
 uv venv --python 3.12 --seed .venv && source .venv/bin/activate
-export VLLM_USE_PRECOMPILED=1   # else 30+ min CUDA build
-uv pip install -e ".[vllm,train,infer]"
+uv pip install -e ".[vllm,train,infer]" --prerelease=allow
 ```
 
 ## sglang
@@ -22,11 +26,28 @@ uv venv --python 3.12 --seed .venv-sglang && source .venv-sglang/bin/activate
 uv pip install -e ".[sglang,train,infer]" --prerelease=allow
 ```
 
+This extra reaches `causal-conv1d` through `flash-linear-attention[conv1d]`,
+which has no wheel and compiles a CUDA extension. Torch refuses to build one
+against a different CUDA major than its own, so a CUDA 12 `nvcc` on `PATH` fails
+the install with a version-mismatch `RuntimeError`. Install the CUDA 13 compiler
+wheels first and point `CUDA_HOME` at them — the same toolkit SGLang's runtime
+JIT uses:
+
+```bash
+uv pip install "nvidia-cuda-nvcc==13.0.*" "nvidia-cuda-crt==13.0.*" \
+    "nvidia-nvvm==13.0.*" "nvidia-cuda-cccl==13.0.*" "nvidia-cuda-runtime==13.0.*"
+export CUDA_HOME="$VIRTUAL_ENV"/lib/python3.12/site-packages/nvidia/cu13
+export PATH="$CUDA_HOME/bin:$PATH"
+```
+
+The compile is memory-hungry; set `MAX_JOBS` to something a machine with 15 GB
+can survive.
+
 ## Extras
 
 | Extra | Adds | Use when |
 |---|---|---|
-| `vllm` | `vllm`, `vllm-omni`, torch +cu129 stack, PyAV | Running any vllm-omni-based example |
+| `vllm` | `vllm`, `vllm-omni`, torch +cu130 stack, PyAV | Running any vllm-omni-based example |
 | `sglang` | `sglang[diffusion]`, `flash-attn-4`, torch +cu130 stack, PyAV | Running VLM/LLM examples or `sd3_sglang_*` |
 | `train` | `wandb`, `aiohttp` | Training runs (almost always wanted) |
 | `infer` | `accelerate` | HunyuanImage3 and similar models |

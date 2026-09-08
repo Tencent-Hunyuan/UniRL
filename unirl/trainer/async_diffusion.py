@@ -9,7 +9,11 @@ import torch
 
 from unirl.distributed.tensor import hydrate
 from unirl.train.stack import TrainStepResult
-from unirl.trainer.async_rollout import AsyncRolloutTrainerMixin, training_version_metrics
+from unirl.trainer.async_rollout import (
+    AsyncRolloutTrainerMixin,
+    resolve_separate_worker_concurrency,
+    training_version_metrics,
+)
 from unirl.trainer.diffusion import DiffusionTrainer
 from unirl.types.sample import Sample
 
@@ -17,10 +21,13 @@ from unirl.types.sample import Sample
 class AsyncDiffusionTrainer(AsyncRolloutTrainerMixin, DiffusionTrainer):
     """Disaggregated async diffusion trainer (two slabs, resident engine, cross-slab sync)."""
 
+    _prompt_local_rollout = True
+
     def __init__(
         self,
         *,
         max_inflight: int = 1,
+        per_worker_inflight: int = 1,
         weight_sync_interval: int = 1,
         **diffusion_kwargs: Any,
     ) -> None:
@@ -30,8 +37,9 @@ class AsyncDiffusionTrainer(AsyncRolloutTrainerMixin, DiffusionTrainer):
         max_inflight = int(max_inflight)
         if max_inflight != 1:
             raise ValueError(
-                "AsyncDiffusionTrainer requires max_inflight=1: multiple queued generations "
-                "block the reap-time cross-slab transfer on the rollout workers; "
+                "AsyncDiffusionTrainer requires max_inflight=1: queued generations can block "
+                "reap-time cross-slab transfer, and dynamically completed prompts must "
+                "retain one rollout_id and one SDE schedule per training batch; "
                 f"got {max_inflight}."
             )
         if bool(diffusion_kwargs.get("offload_train_during_reward", False)):
@@ -41,7 +49,22 @@ class AsyncDiffusionTrainer(AsyncRolloutTrainerMixin, DiffusionTrainer):
                 "and a reward sharing the train slab could still OOM. Remove the option or use the "
                 "synchronous trainer."
             )
-        super().__init__(**diffusion_kwargs)
+        per_worker_inflight = int(per_worker_inflight)
+        cfg = diffusion_kwargs["cfg"]
+        train_fraction = float(diffusion_kwargs.get("train_fraction", 0.5))
+        configured_concurrency = cfg.get("worker_max_concurrency")
+        configured_concurrency = None if configured_concurrency is None else int(configured_concurrency)
+        _, worker_concurrency = resolve_separate_worker_concurrency(
+            num_devices=int(cfg.num_devices),
+            train_fraction=train_fraction,
+            per_worker_inflight=per_worker_inflight,
+            configured_concurrency=configured_concurrency,
+            engine_concurrency=diffusion_kwargs["rollout_cfg"].get("config", {}).get("concurrency"),
+        )
+        super().__init__(
+            worker_max_concurrency=worker_concurrency,
+            **diffusion_kwargs,
+        )
 
         if self.weight_sync is None:
             raise ValueError(
@@ -49,7 +72,11 @@ class AsyncDiffusionTrainer(AsyncRolloutTrainerMixin, DiffusionTrainer):
             )
 
         self._max_inflight = max_inflight
+        self._require_single_generation = True
+        self._per_worker_inflight = per_worker_inflight
+        self._max_inflight_prompts = self._max_inflight * self.batch_size
         self._weight_sync_interval = int(weight_sync_interval)
+        self._max_staleness = self._weight_sync_interval - 1
         self._num_updates_per_batch = int(diffusion_kwargs["stack_cfg"].get("num_updates_per_batch", 1))
         if self._weight_sync_interval < 1:
             raise ValueError(f"weight_sync_interval must be >= 1, got {self._weight_sync_interval}")

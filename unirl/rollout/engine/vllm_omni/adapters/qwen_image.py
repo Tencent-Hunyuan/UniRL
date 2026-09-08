@@ -14,6 +14,7 @@ from unirl.rollout.engine.vllm_omni.adapters.dit import (
     _negative_prompt_from_params,
 )
 from unirl.rollout.engine.vllm_omni.backends import GenerateCall, OmniRawResult, StageSampling
+from unirl.rollout.engine.vllm_omni.pipelines._shared.interception import read_captures
 from unirl.rollout.engine.vllm_omni.utils import collect_dit_outputs
 from unirl.types.conditions.text import TextEmbedCondition
 from unirl.types.sample import Sample
@@ -93,7 +94,7 @@ class QwenImageOutputAdapter(DitOutputAdapter):
 
     _MISSING_CAPTURE_MSG = (
         "build_response: Qwen-Image rollout returned no 'text_capture' on "
-        "DiffusionOutput.custom_output. Check that RLQwenImagePipeline's "
+        "the output envelope's unirl metadata. Check that RLQwenImagePipeline's "
         "encode_prompt tap ran in every DiT worker — the subclass swap may "
         "not have taken effect (verify custom_pipeline_args.pipeline_class "
         "in the stage YAML)."
@@ -105,7 +106,7 @@ class QwenImageOutputAdapter(DitOutputAdapter):
             per_request, final_output_type=self.final_output_type, stage_id=self.stage_id, modality=self.modality
         )
 
-        captures = [(getattr(d, "custom_output", None) or {}).get("text_capture") for d in diff_outputs]
+        captures = [read_captures(d).get("text_capture") for d in diff_outputs]
         if any(c is None for c in captures):
             raise RuntimeError(self._MISSING_CAPTURE_MSG)
 

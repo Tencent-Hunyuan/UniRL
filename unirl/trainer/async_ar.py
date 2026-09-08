@@ -12,26 +12,15 @@ from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.ar import ARTrainer, ar_preflight
-from unirl.trainer.async_rollout import AsyncRolloutTrainerMixin, training_version_metrics
+from unirl.trainer.async_rollout import (
+    AsyncRolloutTrainerMixin,
+    resolve_separate_worker_concurrency,
+    training_version_metrics,
+)
 from unirl.trainer.base import BaseTrainer, build_sampling_dict
 from unirl.trainer.hydra import parse_hydra_cfg, remote_hydra
 from unirl.types.sample import Sample
 from unirl.types.sampling import BaseSamplingParams, total_samples_per_prompt
-
-
-def _rollout_dp_size_from_parsed_config(rollout_parsed: dict, *, world_size: int) -> int:
-    """Compute the rollout Handle's DP width before constructing GPU roles."""
-    from unirl.distributed.group.handle import _parallel_shape_from_init_kwargs
-
-    role_cls = rollout_parsed["role_cls"]
-    init_kwargs = {key: value for key, value in rollout_parsed.items() if key != "role_cls"}
-    sp_size, tp_size, pp_size, _ = _parallel_shape_from_init_kwargs(
-        init_kwargs,
-        world_size,
-        role_cls,
-    )
-    non_dp_width = sp_size if sp_size > 1 else tp_size * pp_size
-    return world_size // non_dp_width
 
 
 class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
@@ -64,7 +53,9 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
         eval_temperature: float = 1.0,
         train_fraction: float = 0.5,
         max_inflight: int = 1,
+        per_worker_inflight: int = 1,
         weight_sync_interval: int = 1,
+        buffer_max_staleness: Optional[int] = None,
     ) -> None:
         self._allowed_input_primitives = ar_preflight(
             pipeline_cfg=pipeline_cfg,
@@ -72,8 +63,24 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
             rollout_cfg=rollout_cfg,
             stack_cfg=stack_cfg,
         )
+        per_worker_inflight = int(per_worker_inflight)
+        self._train_fraction = float(train_fraction)
+        configured_concurrency = cfg.get("worker_max_concurrency")
+        configured_concurrency = None if configured_concurrency is None else int(configured_concurrency)
+        self._train_devices, worker_concurrency = resolve_separate_worker_concurrency(
+            num_devices=int(cfg.num_devices),
+            train_fraction=self._train_fraction,
+            per_worker_inflight=per_worker_inflight,
+            configured_concurrency=configured_concurrency,
+            engine_concurrency=rollout_cfg.get("config", {}).get("concurrency"),
+        )
         # Skips ARTrainer.__init__: it opens the colocate placement block we replace with two slabs.
-        BaseTrainer.__init__(self, cfg=cfg, logging_cfg=logging_cfg)
+        BaseTrainer.__init__(
+            self,
+            cfg=cfg,
+            logging_cfg=logging_cfg,
+            worker_max_concurrency=worker_concurrency,
+        )
 
         self.batch_size = batch_size
         self.adv_normalization_scope = adv_normalization_scope
@@ -100,42 +107,32 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
             )
         self._rollout_anchor_device = None
 
-        self._train_fraction = float(train_fraction)
         self._max_inflight = max(1, int(max_inflight))
+        self._per_worker_inflight = per_worker_inflight
+        self._max_inflight_prompts = self._max_inflight * self.batch_size
         self._weight_sync_interval = int(weight_sync_interval)
         self._num_updates_per_batch = int(stack_cfg.get("num_updates_per_batch", 1))
         if self._weight_sync_interval < 1:
             raise ValueError(f"weight_sync_interval must be >= 1, got {self._weight_sync_interval}")
+        self._max_staleness = (
+            self._weight_sync_interval - 1 if buffer_max_staleness is None else int(buffer_max_staleness)
+        )
+        min_staleness = self._weight_sync_interval - 1
+        if self._max_staleness < min_staleness:
+            raise ValueError(
+                f"buffer_max_staleness must be >= weight_sync_interval - 1; got {self._max_staleness} < {min_staleness}"
+            )
         if self._num_updates_per_batch < 1:
             raise ValueError(f"num_updates_per_batch must be >= 1, got {self._num_updates_per_batch}")
         self._train_version = 0
         self._batches_since_sync = 0
-        self._train_devices = int(round(self.num_devices * self._train_fraction))
-        if self._train_devices <= 0 or self._train_devices >= self.num_devices:
-            raise ValueError(
-                f"train_fraction={train_fraction} yields {self._train_devices} train "
-                f"devices of {self.num_devices}; must leave a non-empty rollout slab."
-            )
-        # Require rollout batches to divide evenly across train and rollout slabs.
-        self._rollout_devices = self.num_devices - self._train_devices
-        prompts = self.batch_size
-        total = prompts * total_samples_per_prompt(self.sampling_params)
+        # Require rollout batches to divide evenly across the train slab.
+        total = self.batch_size * total_samples_per_prompt(self.sampling_params)
         if total % self._train_devices != 0:
             raise ValueError(
                 f"batch_size * samples_per_prompt = {total} is not divisible by the train "
                 f"slab size {self._train_devices}; adjust batch_size / samples_per_prompt / train_fraction."
             )
-        rollout_dp_size = _rollout_dp_size_from_parsed_config(
-            rollout_parsed,
-            world_size=self._rollout_devices,
-        )
-        if prompts % rollout_dp_size != 0:
-            raise ValueError(
-                f"batch_size = {prompts} prompts is not divisible by the rollout DP size "
-                f"{rollout_dp_size} ({self._rollout_devices} rollout GPUs; each prompt-tree "
-                "DP-scatters whole); adjust batch_size / train_fraction / rollout TP."
-            )
-
         with placement(self.pool, fraction=self._train_fraction, shared_workers=True):
             self.bundle = remote_hydra(bundle_cfg)
             self.pipeline = remote_hydra(pipeline_cfg, bundle=self.bundle)

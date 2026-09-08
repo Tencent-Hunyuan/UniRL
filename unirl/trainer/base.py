@@ -4,7 +4,7 @@ import logging
 import os
 import sys
 from dataclasses import replace
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Sequence
 
 from hydra.utils import instantiate
 from omegaconf import DictConfig
@@ -115,15 +115,19 @@ class BaseTrainer:
         *,
         cfg: DictConfig,
         logging_cfg: Optional[DictConfig] = None,
+        worker_max_concurrency: Optional[int | Sequence[int]] = None,
     ) -> None:
         self.num_devices = cfg.num_devices
+        if worker_max_concurrency is None:
+            configured_concurrency = cfg.get("worker_max_concurrency")
+            worker_max_concurrency = 1 if configured_concurrency is None else int(configured_concurrency)
         self.pool = DevicePool(
             num_devices=cfg.num_devices,
             devices_per_node=int(cfg.get("devices_per_node", 8)),
             workers_per_device=int(cfg.get("workers_per_device", 1)),
             transport_kind=cfg.get("transport_kind", "colocate_store"),
             tq_handoff=init_transfer_queue(cfg),
-            worker_max_concurrency=int(cfg.get("worker_max_concurrency", 1)),
+            worker_max_concurrency=worker_max_concurrency,
         )
         self.pool.setup()
 

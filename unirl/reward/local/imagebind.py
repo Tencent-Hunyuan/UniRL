@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import math
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 import torch
@@ -39,21 +40,39 @@ _IB_VISION_SIZE = 224
 _IB_VISION_MEAN = (0.48145466, 0.4578275, 0.40821073)
 _IB_VISION_STD = (0.26862954, 0.26130258, 0.27577711)
 
+_IMAGEBIND_MODES = ("audio_video", "text_audio", "text_video", "all")
+_IMAGEBIND_DEFAULT_WEIGHTS = {"audio_video": 0.5, "text_audio": 0.25, "text_video": 0.25}
+
 
 class ImageBindRewardScorer(LocalRewardBackend):
     """Audio-video / audio-text alignment reward using Meta ImageBind."""
 
     canonical_model_name = "imagebind"
     input_kind = "video"
-    DEFAULT_MODE = "audio_video"
 
     def __init__(self, *, config: "ImageBindSpec", base_device: str) -> None:
-        self._mode = str(config.mode or self.DEFAULT_MODE)
-        self._weights = dict(config.weights or {"audio_video": 0.5, "text_audio": 0.25, "text_video": 0.25})
+        self._mode = config.mode
+        if self._mode not in _IMAGEBIND_MODES:
+            raise ValueError(f"ImageBindSpec.mode must be one of {_IMAGEBIND_MODES}; got {config.mode!r}.")
+        self._weights = dict(config.weights or _IMAGEBIND_DEFAULT_WEIGHTS)
+        if self._mode == "all":
+            if set(self._weights) != set(_IMAGEBIND_DEFAULT_WEIGHTS):
+                raise ValueError(
+                    f"ImageBindSpec.weights must contain exactly {sorted(_IMAGEBIND_DEFAULT_WEIGHTS)} "
+                    f"for mode='all'; got {sorted(self._weights)}."
+                )
+            if any(
+                not isinstance(weight, (int, float)) or not math.isfinite(weight) for weight in self._weights.values()
+            ):
+                raise ValueError("ImageBindSpec.weights values must be finite numbers.")
+            self._weights = {name: float(weight) for name, weight in self._weights.items()}
         super().__init__(
             device=resolve_device(config.device, base_device),
             batch_size=config.batch_size,
         )
+
+    def covers_prompt_video(self) -> bool:
+        return self._mode == "text_video" or (self._mode == "all" and self._weights["text_video"] > 0.0)
 
     def _load_model(self) -> None:
         warnings.warn(_IMAGEBIND_LICENSE_WARNING, stacklevel=2)
@@ -226,13 +245,11 @@ class ImageBindRewardScorer(LocalRewardBackend):
             return cos(embeddings[ModalityType.TEXT], embeddings[ModalityType.AUDIO])
         if self._mode == "text_video":
             return cos(embeddings[ModalityType.TEXT], embeddings[ModalityType.VISION])
-        if self._mode == "all":
-            w = self._weights
-            av = cos(embeddings[ModalityType.AUDIO], embeddings[ModalityType.VISION])
-            ta = cos(embeddings[ModalityType.TEXT], embeddings[ModalityType.AUDIO])
-            tv = cos(embeddings[ModalityType.TEXT], embeddings[ModalityType.VISION])
-            return w["audio_video"] * av + w["text_audio"] * ta + w["text_video"] * tv
-        raise ValueError(f"Unknown ImageBind mode {self._mode!r}; expected audio_video|text_audio|text_video|all.")
+        w = self._weights
+        av = cos(embeddings[ModalityType.AUDIO], embeddings[ModalityType.VISION])
+        ta = cos(embeddings[ModalityType.TEXT], embeddings[ModalityType.AUDIO])
+        tv = cos(embeddings[ModalityType.TEXT], embeddings[ModalityType.VISION])
+        return w["audio_video"] * av + w["text_audio"] * ta + w["text_video"] * tv
 
 
 @dataclass
@@ -242,4 +259,4 @@ class ImageBindSpec(BaseRewardComponentSpec):
     batch_size: int = 8
     device: str = "auto"
     mode: str = "audio_video"
-    weights: Optional[Dict[str, float]] = field(default=None)
+    weights: Optional[Dict[str, float]] = None

@@ -49,6 +49,7 @@ def fsdp_wrap(
     param_dtype: str = "bf16",
     cpu_offload: bool = False,
     mixed_precision: bool = True,
+    cast_forward_inputs: bool = True,
     fsdp_mode: str = "full",
     reshard_after_forward: bool = True,
     forward_prefetch: bool = False,
@@ -56,6 +57,7 @@ def fsdp_wrap(
     ac_wrap_order: str = "outside",
     use_torch_compile: bool = False,
     master_dtype: Optional[str] = None,
+    master_params: Tuple[torch.Tensor, ...] = (),
     root_wrap: bool = True,
 ) -> None:
     """Apply FSDP2 wrapping to the model.  No handle returned — DTensors"""
@@ -83,6 +85,7 @@ def fsdp_wrap(
         fsdp_kwargs["mp_policy"] = MixedPrecisionPolicy(
             param_dtype=target_dtype,
             reduce_dtype=torch.float32,
+            cast_forward_inputs=bool(cast_forward_inputs),
         )
     if cpu_offload:
         fsdp_kwargs["offload_policy"] = CPUOffloadPolicy()
@@ -96,11 +99,12 @@ def fsdp_wrap(
     block_instances = _enumerate_block_instances(model, block_class_names)
 
     casts = 0
-    # Keep trainable masters at master_dtype; bf16 pre-casting can erase small optimizer steps.
+    master_param_ids = {id(p) for p in master_params}
+    # Keep trainable and EMA shadow masters at master_dtype.
     for p in model.parameters():
         if isinstance(p, DTensor) or not p.dtype.is_floating_point:
             continue  # already-wrapped params and ints never cast
-        if trainable_dtype is not None and p.requires_grad:
+        if trainable_dtype is not None and (p.requires_grad or id(p) in master_param_ids):
             dst = trainable_dtype
         elif not mixed_precision:
             dst = target_dtype
@@ -187,13 +191,14 @@ def fsdp_wrap(
     if _current_rank() == 0:
         logger.info(
             "fsdp_wrap: wrapped %d block(s) of class %r "
-            "(%s, cpu_offload=%s, mixed_precision=%s, reshard=%s, prefetch=%s, "
+            "(%s, cpu_offload=%s, mixed_precision=%s, cast_forward_inputs=%s, reshard=%s, prefetch=%s, "
             "ac=%s, compile=%s, dtype_casts=%d, master_dtype=%s, root_wrap=%s)",
             len(block_instances),
             tuple(block_class_names),
             fsdp_mode,
             cpu_offload,
             mixed_precision,
+            cast_forward_inputs,
             reshard_after_forward,
             forward_prefetch,
             activation_checkpointing,

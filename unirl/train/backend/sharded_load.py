@@ -337,8 +337,7 @@ def _read_safetensors_dir(weights_dir: str) -> StateDict:
     if not os.path.isdir(weights_dir):
         raise FileNotFoundError(
             f"sharded_load: transformer weights dir not found: {weights_dir!r}. "
-            "HF repo IDs are not supported here — point the recipe's checkpoint "
-            "path at a local download."
+            "Expected a local directory resolved by the bundle's meta-init checkpoint resolver."
         )
     shards = sorted(glob.glob(os.path.join(weights_dir, "*.safetensors")))
     if not shards:

@@ -496,7 +496,6 @@ class Qwen3OmniThinkerAdapter(ModelAdapter):
     """Qwen3-Omni Thinker — text/video → AR text (single stage, TP>1, LoRA)."""
 
     stage_yaml = "qwen3_omni_thinker_only_rl_1x4.yaml"
-    stage_yaml_source = "local"
     omni_mode = None
     needs_sigmas = False
     needs_driver_tokenizer = False

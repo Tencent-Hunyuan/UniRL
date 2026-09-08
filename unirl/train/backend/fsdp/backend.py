@@ -67,6 +67,7 @@ class FSDPBackend(BaseFSDP2Backend):
             param_dtype=fsdp_cfg.param_dtype,
             cpu_offload=fsdp_cfg.cpu_offload,
             mixed_precision=fsdp_cfg.mixed_precision,
+            cast_forward_inputs=fsdp_cfg.cast_forward_inputs,
             fsdp_mode=fsdp_cfg.fsdp_mode,
             reshard_after_forward=fsdp_cfg.reshard_after_forward,
             forward_prefetch=fsdp_cfg.forward_prefetch,
@@ -74,6 +75,7 @@ class FSDPBackend(BaseFSDP2Backend):
             ac_wrap_order=getattr(fsdp_cfg, "ac_wrap_order", "outside"),
             use_torch_compile=fsdp_cfg.use_torch_compile,
             master_dtype=getattr(fsdp_cfg, "master_dtype", None),
+            master_params=tuple(shd for _, shd in shadow.iter_pairs()) if shadow is not None else (),
             root_wrap=getattr(fsdp_cfg, "root_wrap", True),
         )
 

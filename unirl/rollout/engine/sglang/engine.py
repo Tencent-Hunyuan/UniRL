@@ -39,7 +39,6 @@ class SGLangRolloutEngine(BaseRolloutEngine):
         tp_rank: int = 0,
         tp_size: int = 1,
         tp_visible_devices: Optional[List[str]] = None,
-        tp_device_ids: Optional[List[int]] = None,
         pp_rank: int = 0,
         pp_size: int = 1,
         ep_rank: int = 0,
@@ -68,15 +67,10 @@ class SGLangRolloutEngine(BaseRolloutEngine):
         self._pp_size = int(pp_size)
         self._ep_rank = int(ep_rank)
         self._ep_size = int(ep_size)
-        if tp_visible_devices is not None and tp_device_ids is not None:
-            raise ValueError("set only one of tp_visible_devices or tp_device_ids")
         if tp_visible_devices is not None:
             self._tp_visible_devices = [str(token) for token in tp_visible_devices]
-        elif tp_device_ids is not None:
-            self._tp_visible_devices = [str(device_id) for device_id in tp_device_ids]
         else:
             self._tp_visible_devices = None
-        self._tp_device_ids = list(tp_device_ids) if tp_device_ids is not None else None
         self._is_tp_zero = self._tp_rank == 0
 
         if not self._is_tp_zero:
