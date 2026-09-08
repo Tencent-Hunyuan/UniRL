@@ -3,7 +3,7 @@
 #
 # Against the sibling `minimax_h3_t2va_trainside.yaml` (Flow-GRPO, 768x768):
 # a forward-process objective, 256x384, all 10 transitions trained, and a reward
-# that scores audio/video agreement rather than a single frame.
+# that scores audio/video agreement plus prompt alignment rather than one frame.
 #
 # Launch (1 node x 8 GPUs):
 #   bash examples/run_experiment_multinode_taiji.sh diffusion/minimax_h3/minimax_h3_t2va_nft
@@ -133,11 +133,8 @@ reward:
   _target_: unirl.reward.service.RewardService
   backend:
     _target_: unirl.reward.local.t2av_composite.T2AVCompositeScorer
-    base_device: cuda
     config:
       _target_: unirl.reward.local.t2av_composite.T2AVCompositeSpec
-      device: auto
-      batch_size: 2
       # Summed raw, not renormalised. The imagebind package loads its checkpoint
       # from a RELATIVE ./.checkpoints/imagebind_huge.pth.
       #
@@ -145,6 +142,29 @@ reward:
       weights:
         clap: 1.0
         imagebind: 1.0
+      scorers:
+        clap:
+          _target_: unirl.reward.local.clap.CLAPRewardScorer
+          base_device: cuda
+          config:
+            _target_: unirl.reward.local.clap.CLAPSpec
+            batch_size: 2
+            device: auto
+        imagebind:
+          _target_: unirl.reward.local.imagebind.ImageBindRewardScorer
+          base_device: cuda
+          config:
+            _target_: unirl.reward.local.imagebind.ImageBindSpec
+            batch_size: 2
+            device: auto
+            # Include prompt-video alignment; audio_video alone rewards the
+            # measured black/silent collapse.
+            mode: all
+            # Keep ImageBind's default mix explicit so the objective is visible.
+            weights:
+              audio_video: 0.5
+              text_audio: 0.25
+              text_video: 0.25
 
 algorithm:
   _target_: unirl.algorithms.diffusionnft.DiffusionNFT
