@@ -13,7 +13,6 @@ from typing import Any, Optional, Tuple
 import numpy as np
 import torch
 
-from unirl.models.wan21.diffusion import WAN21DiffusionStep
 from unirl.rollout.engine.sigma_verify import verify_engine_used_sigmas
 from unirl.sde.unipc import UniPCSpec, UniPCStrategy
 
@@ -109,16 +108,12 @@ def _require_float_wan_timesteps() -> None:
         )
 
 
-def _wan_timestep_scale(scheduler: Any) -> float:
-    """Return the model-owned scale after validating the worker scheduler contract."""
-    expected = float(WAN21DiffusionStep.TIMESTEP_SCALE)
+def _scheduler_timestep_scale(scheduler: Any) -> float:
+    """Return the live scheduler's own timestep scale, which ``index_for_timestep`` matches against."""
     actual = getattr(scheduler.config, "num_train_timesteps", None)
-    if actual != expected:
-        raise RuntimeError(
-            "FastVideo scheduler num_train_timesteps does not match the WAN21 model "
-            f"timestep scale: scheduler={actual!r}, model={expected:g}"
-        )
-    return expected
+    if not isinstance(actual, (int, float)) or not float(actual) > 0.0:
+        raise RuntimeError(f"FastVideo scheduler has no usable num_train_timesteps: {actual!r}")
+    return float(actual)
 
 
 @dataclass(frozen=True)
@@ -128,6 +123,7 @@ class FastVideoUniPCPlan:
     sde_type: str
     sde_indices: Tuple[int, ...]
     spec: UniPCSpec = field(default_factory=UniPCSpec)
+    timestep_scale: float = 0.0
 
     def __post_init__(self) -> None:
         canonical = str(self.sde_type).strip().lower()
@@ -138,8 +134,14 @@ class FastVideoUniPCPlan:
             raise ValueError(f"FastVideo UniPC requires sorted unique non-negative SDE indices; got {indices}")
         if not isinstance(self.spec, UniPCSpec):
             raise ValueError(f"FastVideo UniPC plan requires a UniPCSpec; got {type(self.spec).__name__}")
+        scale = float(self.timestep_scale)
+        if not scale > 0.0:
+            raise ValueError(
+                f"FastVideo UniPC requires the model-owned positive timestep_scale; got {self.timestep_scale!r}"
+            )
         object.__setattr__(self, "sde_type", canonical)
         object.__setattr__(self, "sde_indices", indices)
+        object.__setattr__(self, "timestep_scale", scale)
 
 
 def _strategy_from_plan(scheduler: Any, plan: FastVideoUniPCPlan) -> UniPCStrategy:
@@ -193,6 +195,7 @@ def _patch_scheduler_set_timesteps() -> None:
                 use_kerras_sigma=use_kerras_sigma,
             )
             self._unirl_canonical_schedule = False
+            self._unirl_timestep_scale = None
             self._unirl_unipc_strategy = None
             self._unirl_device_sigmas = None
             return
@@ -224,7 +227,7 @@ def _patch_scheduler_set_timesteps() -> None:
         if str(getattr(self.config, "final_sigmas_type", "zero")) != "zero":
             raise ValueError("FastVideo canonical UniPC requires final_sigmas_type='zero'")
 
-        timestep_scale = _wan_timestep_scale(self)
+        timestep_scale = _scheduler_timestep_scale(self)
         terminal = np.zeros(1, dtype=np.float32)
         schedule = np.concatenate([external, terminal])
         self.sigmas = torch.from_numpy(schedule).cpu()
@@ -242,6 +245,7 @@ def _patch_scheduler_set_timesteps() -> None:
         # The strategy is built lazily at the first UniPC-dispatched denoising
         # call, from the request plan's model-owned spec (README: dispatch).
         self._unirl_canonical_schedule = True
+        self._unirl_timestep_scale = timestep_scale
         self._unirl_unipc_strategy = None
         self._unirl_device_sigmas = None
 
@@ -329,6 +333,12 @@ def _patch_denoising_step() -> None:
             if not bool(getattr(scheduler, "_unirl_canonical_schedule", False)):
                 raise RuntimeError(
                     "FastVideo worker did not install the canonical UniPC schedule patch before denoising"
+                )
+            if float(getattr(scheduler, "_unirl_timestep_scale", 0.0)) != float(sde_type.timestep_scale):
+                raise RuntimeError(
+                    "FastVideo scheduler was pinned with a different model timestep scale than this request's "
+                    f"plan: scheduler={getattr(scheduler, '_unirl_timestep_scale', None)!r}, "
+                    f"plan={sde_type.timestep_scale!r}"
                 )
             strategy = _strategy_from_plan(scheduler, sde_type)
             strategy.init_schedule(scheduler.sigmas)

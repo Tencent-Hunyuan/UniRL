@@ -90,6 +90,17 @@ def _verify_checkpoint_unipc_spec(ckpt_path: str, spec: UniPCSpec) -> None:
         )
 
 
+def _model_timestep_scale(model_family: str) -> float:
+    """Return the declared WAN step-kernel timestep scale for ``model_family``."""
+    if model_family in {"wan2.2", "wan22"}:
+        from unirl.models.wan22.diffusion import WAN22DiffusionStep
+
+        return float(WAN22DiffusionStep.TIMESTEP_SCALE)
+    from unirl.models.wan21.diffusion import WAN21DiffusionStep
+
+    return float(WAN21DiffusionStep.TIMESTEP_SCALE)
+
+
 def _resolve_sde_window(raw_indices: Any, num_steps: int) -> List[int]:
     """Return sorted SDE step indices; ``None`` → all-steps SDE here but no-SDE trainside (README Gotchas)."""
     if raw_indices is None:
@@ -161,8 +172,14 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
             "set the rollout node's `strategy:` in the recipe (a separate injection from pipeline.strategy)",
         )
         self._sde_type = str(strategy.canonical_name)
+        self._timestep_scale = _model_timestep_scale(config.model_family)
         # Probe plan so unsupported kernels (cps/dpm2) fail at init, not per request.
-        FastVideoUniPCPlan(sde_type=self._sde_type, sde_indices=(), spec=self._unipc_spec)
+        FastVideoUniPCPlan(
+            sde_type=self._sde_type,
+            sde_indices=(),
+            spec=self._unipc_spec,
+            timestep_scale=self._timestep_scale,
+        )
         _verify_checkpoint_unipc_spec(model_config.pretrained_model_ckpt_path, self._unipc_spec)
         patch_fastvideo_unipc()
         self._build_generator()
@@ -356,6 +373,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
             sde_type=self._sde_type,
             sde_indices=tuple(resolved_sde_indices),
             spec=self._unipc_spec,
+            timestep_scale=self._timestep_scale,
         )
 
         all_log_probs: List[torch.Tensor] = []
