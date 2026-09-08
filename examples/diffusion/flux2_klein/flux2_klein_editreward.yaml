@@ -19,7 +19,7 @@
 #     export REWARD_SERVICE_URL=http://<node1_ip>:8080
 #     export NUM_NODES=1
 #     export GPUS_PER_NODE=8
-#     bash examples/run_experiment_multinode_taiji.sh diffusion/flux2_klein/flux2_klein_editreward
+#     bash examples/run_experiment_multinode.sh diffusion/flux2_klein/flux2_klein_editreward
 
 num_devices: 8
 batch_size: 48                # prompts_per_rollout (48 x 16 samples = 768 global)

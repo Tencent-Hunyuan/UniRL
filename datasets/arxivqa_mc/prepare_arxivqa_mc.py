@@ -48,7 +48,7 @@ Usage:
 
   BAGEL_PATH=/root/BAGEL-7B-MoT \\
   DATA_PATH=data/arxivqa_mc/train.jsonl EVAL_DATA_PATH=data/arxivqa_mc/val.jsonl \\
-  ENTRY=train_ar bash examples/run_experiment_multinode_taiji.sh ar/bagel_grpo_arxivqa_mc_2x8_lora
+  ENTRY=train_ar bash examples/run_experiment_multinode.sh ar/bagel_grpo_arxivqa_mc_2x8_lora
 
 The repo / config / split names below are sensible defaults; override with the flags if
 your source differs. Needs ``pyarrow`` + ``huggingface_hub`` + ``pillow``:

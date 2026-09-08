@@ -9,7 +9,7 @@
 #   - worker_extension_cls installs DiTWeightSyncExtension (same as SD3,
 #     reused for HV1.5 DiT backbone).
 #   - Dual-text-encoder condition fields (Qwen2.5-VL MLLM + ByT5 glyph)
-#     are captured by the pipeline subclass and routed via custom_output dict
+#     are captured by the pipeline subclass and routed via the output envelope
 #     for the response handler to unpack into HunyuanVideo15Conditions.
 #
 # Sized for HunyuanVideo-1.5 on TP=1. Single-GPU rollout matches the trainer's
@@ -21,9 +21,10 @@ stage_args:
     runtime:
       process: true
       devices: "0"
-      max_batch_size: 4
     engine_args:
       model_stage: diffusion
+      # HV1.5 is non-batching upstream, so the engine requires this.
+      max_num_seqs: 1
       enforce_eager: true
       distributed_executor_backend: "mp"
       vae_use_slicing: false

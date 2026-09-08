@@ -4,7 +4,7 @@
 #   - rollout engine target points at SGLangDiffusionRolloutEngine via v2 builder
 #   - LoRA reuses the existing sglang weight-sync bridge (set_lora_from_tensors)
 #
-#   2x8:  bash examples/run_experiment_multinode_taiji.sh diffusion/sd3/sd3_sglang_rollout_colocate
+#   2x8:  bash examples/run_experiment_multinode.sh diffusion/sd3/sd3_sglang_rollout_colocate
 
 num_devices: 16               # 2 nodes x 8 GPUs; launcher auto-overrides via NUM_NODES*GPUS_PER_NODE
 batch_size: 96                # prompts_per_rollout, matches v1 reference 2x8 baseline
