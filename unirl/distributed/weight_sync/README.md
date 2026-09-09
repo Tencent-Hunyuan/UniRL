@@ -6,17 +6,17 @@
 > Full map: [`../../README.md`](../../README.md).
 
 <div align="center">
-  <img src="../../../assets/weight-sync-new.png" alt="UniRL weight sync: every train rank all-gathers the FSDP shards into full tensors, then one of five handlers — a cell of the LoRA/full by colocate/separate grid — pushes them into the rollout engine" width="100%">
+  <img src="../../../assets/weight-sync-new.png" alt="UniRL weight sync: every train rank all-gathers the FSDP shards into full tensors, then a topology-specific handler pushes them into the rollout engine" width="100%">
 </div>
 
-*Every `sync()` is the same two phases — **gather** the weights (an all-gather, so it runs on **every train rank**) then **push** into the engine — and the five handlers fill a **[ what × where ]** grid: LoRA vs full × colocate vs separate.*
+*Every `sync()` is the same two phases — **gather** the weights (an all-gather, so it runs on **every train rank**) then **push** into the engine — and the six handlers select by weight kind, placement, engine, and transport.*
 
 ## What it is
 
 `unirl.distributed.weight_sync` delivers freshly-trained weights from the train
 slab into the dedicated rollout engine(s). It is the dashed back-edge of the
 training loop, and it exists **only** when rollout runs on a dedicated engine
-(SGLang / vLLM-Omni, in `separate` or `colocate` layouts); direct sampling (the
+(direct vLLM / SGLang / vLLM-Omni, in `separate` or `colocate` layouts); direct sampling (the
 trainside engine) needs no sync because it samples the live training weights
 in-process.
 
@@ -48,6 +48,14 @@ materialization.
   (separate slabs, cross-node capable), `TensorWeightSync` (colocate serialized
   handoff), `IPCWeightSync` (colocate CUDA-IPC over ZMQ). Colocate handlers take the
   engine as a same-Worker sibling; separate/NCCL need a one-time driver handshake.
+- **Direct-vLLM full weights need a topology-specific path.**
+  `FSDPVLLMFullWeightSync` is the target for an FSDP actor feeding a
+  vLLM TP engine. It is not interchangeable with `TensorWeightSync`: every vLLM
+  TP worker receives the same full tensor and its model loader performs the TP
+  shard. All actor ranks enter each FSDP materialization; only global rank 0
+  holds one CPU bucket and writes it to disk. Publication is accepted only after
+  every worker returns consumed-name, loaded-model coverage, and
+  committed-version receipts.
 - **Routing.** `param_prefix` prepends the model's canonical key prefix;
   `track_prefix` further prefixes so a `ComposedRolloutEngine` can demux the update
   to one child (PE registers one handler per track).
@@ -66,6 +74,24 @@ matching receiver on the engine side (`../../rollout/engine/`).
   *every* train rank; never gate it behind `if rank == 0`. Only the push is rank-0 —
   and with a TP>1 rollout engine the push owner is each group's `tp_rank == 0`, not
   global rank 0, because that is the rank hosting the server.
+- **FSDP rank is not vLLM TP rank.** Do not derive vLLM payload fan-out from the
+  train mesh or reuse a payload with `rank % len(payloads)`. The dedicated path
+  must assert TP cardinality, reject missing/unexpected/duplicate tensor names,
+  and require all TP workers to report one committed model version before it
+  publishes a successful receipt.
+- **Staging must remain bucket-bounded.** A 30B BF16 model cannot be accumulated
+  as a complete CPU copy on every FSDP rank. The direct-vLLM path keeps host RAM
+  to one materialized bucket on rank 0, while the staging filesystem holds the
+  complete publication (roughly 60 GiB for 30B BF16, plus serialization
+  overhead) until push. Before materialization it checks `psutil` available
+  memory and filesystem free space; optional `host_memory_budget_mb` and
+  `staging_disk_budget_mb` make stricter limits explicit.
+- **A bucket is a versioned transaction.** Its header carries protocol,
+  `sync_id`, bucket index/count, `model_version`, a metadata fingerprint, and
+  every tensor's name/shape/dtype/numel/SHA-256. Payload cardinality must equal
+  rollout TP exactly; modulo reuse is forbidden. The final model version is
+  committed on every TP worker before prefix-cache reset, and generation resumes
+  only after both operations are confirmed.
 - **`transfer_queue` is not weight sync** — that's the rollout→trainer data plane
   for bulky rollout outputs (segments, conditions, decoded media); weight sync is
   trainer→rollout. Don't conflate them.

@@ -31,6 +31,8 @@ def monkey_patch_torch_reductions():
 
 def _reduce_tensor_modified(*args, **kwargs):
     output_fn, output_args = reductions._reduce_tensor_original(*args, **kwargs)
+    if len(output_args) <= _REDUCE_TENSOR_ARG_DEVICE_INDEX:
+        return output_fn, output_args
     output_args = _modify_tuple(output_args, _REDUCE_TENSOR_ARG_DEVICE_INDEX, _device_to_uuid)
     return output_fn, output_args
 

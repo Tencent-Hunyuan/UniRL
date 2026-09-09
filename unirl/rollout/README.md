@@ -19,8 +19,8 @@ model/environment turns for one trajectory. It does not compute reward or loss.
 
 ## Why it exists
 
-The rollout can come from two unrelated codebases — the in-process training
-`Pipeline`, or the SGLang fork sampling in its own subprocess. For on-policy RL they
+The rollout can come from unrelated codebases — the in-process training
+`Pipeline`, direct vLLM in a spawned subprocess, or a dedicated server engine. For on-policy RL they
 must walk a *numerically identical* trajectory, because the trainer replays the
 rollout to recompute log-probs and any drift silently pushes the GRPO ratio off 1.0.
 So this module is a **verification boundary**, not just a backend-hiding shim: it
@@ -44,10 +44,11 @@ wrong objective.
   media. Single-stage flows fill one generated Part; composed PE fills its chained
   AR and diffusion Parts.
 - **The engines.** `trainside` (in-process — the train actor's pipeline *is* the
-  sampler), `sglang_diffusion` (dedicated diffusion), `sglang` (dedicated AR), `vllm_omni`
+  sampler), `vllm` (direct text-only vLLM in a spawned runtime),
+  `sglang_diffusion` (dedicated diffusion), `sglang` (dedicated AR), `vllm_omni`
   (dedicated; BAGEL / HI3 / SD3 / HunyuanVideo), `fastvideo` (dedicated accelerated video
   sampling), and `composed` (chains an AR child + a
-  diffusion child for prompt enhancement) are the six single-turn engines.
+  diffusion child for prompt enhancement) are the seven single-turn engines.
   `agentic` wraps one of them with an environment to produce multi-turn
   trajectories. Each diffusion engine consumes the Part's pinned sigmas verbatim
   and reads the same driver-authored `NoiseRecipe` (`../types/noise_recipe.py`),
@@ -60,7 +61,9 @@ wrong objective.
 - **Deployment modes:** *direct sampling* — the trainside engine, no `sync:`, the
   ratio is 1 on the first update; *separate* — a dedicated engine on its own GPUs
   plus a `sync:` block; *colocate* — a dedicated engine sharing GPUs with train,
-  plus offload/onload and `sync:`.
+  plus offload/onload and `sync:`. The `vllm` package name means direct use of
+  upstream vLLM, not direct sampling: its spawned runtime is a dedicated engine
+  and therefore needs weight sync after an optimizer update.
 - **Driver-side scheduling.** One `manager.RolloutManager` serves batch and
   agentic trainers. Its progress thread dispatches bounded work and observes
   readiness; trainer-thread collection resolves results, assembles agentic
@@ -91,10 +94,17 @@ management), `utils/`, `weight_sync.py`, and a
 runtime-patch dir for the pinned upstream (`sglang_diffusion/_patches/`,
 `vllm_omni/patches/`). `vllm_omni` additionally carries worker-subprocess code
 (`pipelines/`, `worker/`) and stage boot configs (`stage_configs/`).
+Direct `vllm` is a smaller server-backed layout: `engine.py` owns the spawned
+runtime in `runtime.py`, uses the text adapter, and exposes tensor weight loading.
 
 Model onboarding is per-engine, and the adapter file is usually **not** the whole
 change surface:
 
+- **`vllm` (direct text AR):** configure `VLLMEngineConfig`, including an explicit
+  trust decision and the same prompt truncation contract as the actor. A
+  post-update FSDP actor requires the dedicated
+  `FSDPVLLMFullWeightSync`; generic serialized sync must not infer vLLM TP shards
+  from FSDP ranks.
 - **`sglang` (AR/VLM):** onboarding is normally config-only: text models use the
   `text` adapter, while `image_token` selects `vlm`. Add and register a new adapter
   only for a genuinely new wire shape, extending `TextLMAdapter` or `VLMAdapter`
@@ -120,6 +130,16 @@ change surface:
   exception: its undecorated method is reached through one `Handle.slot(...)`.
 - **Direct sampling forbids a `sync:` block; dedicated requires one.** The trainside
   engine also can't live on a `layout: separate` slab — `_build_rollout` raises.
+- **Direct vLLM is dedicated, despite its name.** For FSDP → vLLM TP, each TP
+  worker must receive the same full tensor and let the vLLM loader shard it.
+  A sync receipt must prove every TP rank consumed the complete name set and
+  committed the same model version. `trust_remote_code` defaults to false;
+  experiments that enable it must pin and review the model revision.
+- **A direct-vLLM timeout poisons the connection.** Every command carries a
+  monotonic request id and command echo. Timeout, EOF, or protocol mismatch
+  transitions the pipe from `IDLE`/`INFLIGHT` to `BROKEN`, terminates the child,
+  and forbids reuse; startup, generation, weight update, health, and shutdown
+  have separate timeout budgets.
 - **Quiesce before weight sync / eval / checkpoint on async paths** —
   `RolloutManager.quiesce()` pauses dispatch, drains batch work, and cooperatively
   suspends agentic trajectories at turn boundaries. `sync_weights()` rejects queued

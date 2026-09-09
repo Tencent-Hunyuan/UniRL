@@ -648,15 +648,20 @@ class UniRLWandBLogger:
                     parts += f"±{ratio_std:.4f}"
             if clip_fraction is not None:
                 parts += f" clip={clip_fraction:.2f}"
-            train_absdiff_mean = _metric(metrics, "rollout_replay_logp_absdiff_mean")
-            train_absdiff_max = _metric(metrics, "rollout_replay_logp_absdiff_max")
-            train_k3_max = _metric(metrics, "rollout_replay_k3_max")
-            if train_absdiff_mean is not None:
-                parts += f" train|Δlogp|mean={train_absdiff_mean:.8e}"
-            if train_absdiff_max is not None:
-                parts += f" train|Δlogp|max={train_absdiff_max:.8e}"
-            if train_k3_max is not None:
-                parts += f" train_k3_max={train_k3_max:.8e}"
+            token_count = _metric(metrics, "token_count")
+            torch_equal = _metric(metrics, "torch_equal_fp32")
+            mismatch_count = _metric(metrics, "mismatch_count")
+            max_absdiff = _metric(metrics, "max_absdiff_fp32")
+            k3_max = _metric(metrics, "k3_max")
+            if torch_equal is not None:
+                parts += (
+                    " parity["
+                    f"tokens={int(token_count or 0)} "
+                    f"equal={bool(torch_equal)} "
+                    f"mismatch={int(mismatch_count or 0)} "
+                    f"max_absdiff_fp32={max_absdiff!r} "
+                    f"k3_max={k3_max!r}]"
+                )
             return parts
 
         if isinstance(results, dict):

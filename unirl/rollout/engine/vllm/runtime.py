@@ -7,6 +7,54 @@ import traceback
 from multiprocessing.connection import Connection
 from typing import Any, Dict, List
 
+_PROTOCOL_VERSION = 1
+
+
+class _ProtocolError(RuntimeError):
+    pass
+
+
+def _recv_request(connection: Connection, *, last_request_id: int) -> Dict[str, Any]:
+    message = connection.recv()
+    if not isinstance(message, dict):
+        raise _ProtocolError(f"request must be a mapping, got {type(message).__name__}")
+    if message.get("protocol_version") != _PROTOCOL_VERSION:
+        raise _ProtocolError(
+            f"request protocol_version={message.get('protocol_version')!r}, expected {_PROTOCOL_VERSION}"
+        )
+    request_id = message.get("request_id")
+    if type(request_id) is not int or request_id != last_request_id + 1:
+        raise _ProtocolError(f"request_id={request_id!r}, expected the next monotonic id {last_request_id + 1}")
+    command = message.get("command")
+    if not isinstance(command, str) or not command:
+        raise _ProtocolError(f"request has invalid command={command!r}")
+    return message
+
+
+def _send_response(
+    connection: Connection,
+    request: Dict[str, Any],
+    *,
+    ok: bool,
+    result: Any,
+    error: BaseException | None = None,
+) -> None:
+    response = {
+        "protocol_version": _PROTOCOL_VERSION,
+        "request_id": request["request_id"],
+        "command": request["command"],
+        "ok": bool(ok),
+        "result": result,
+    }
+    if error is not None:
+        response.update(
+            {
+                "error": f"{type(error).__name__}: {error}",
+                "traceback": traceback.format_exc(),
+            }
+        )
+    connection.send(response)
+
 
 def _sampling_params(payload: Dict[str, Any], *, return_logprob: bool):
     from vllm import SamplingParams
@@ -55,7 +103,12 @@ def engine_process_main(
     visible_devices: List[str],
 ) -> None:
     """Own the vLLM interpreter and serve synchronous control messages."""
+    startup_request: Dict[str, Any] | None = None
     try:
+        startup_request = _recv_request(connection, last_request_id=0)
+        if startup_request["command"] != "startup":
+            raise _ProtocolError(f"first direct-vLLM command must be 'startup', got {startup_request['command']!r}")
+
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(visible_devices)
         os.environ["UNIRL_ROLLOUT_DP_RANK"] = str(int(config.get("rollout_rank", 0)))
         os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
@@ -64,7 +117,10 @@ def engine_process_main(
 
         engine_kwargs = dict(config.get("engine_kwargs") or {})
         engine_kwargs.setdefault("dtype", "bfloat16")
-        engine_kwargs.setdefault("trust_remote_code", True)
+        engine_kwargs["trust_remote_code"] = bool(config.get("trust_remote_code", False))
+        if config.get("model_revision"):
+            engine_kwargs.setdefault("revision", str(config["model_revision"]))
+            engine_kwargs.setdefault("tokenizer_revision", str(config["model_revision"]))
         engine_kwargs.setdefault("distributed_executor_backend", "mp")
         engine_kwargs.setdefault("enable_sleep_mode", True)
         engine_kwargs.setdefault("enforce_eager", True)
@@ -81,28 +137,46 @@ def engine_process_main(
             tensor_parallel_size=int(config["tp_size"]),
             **engine_kwargs,
         )
+        plugin_manifest = None
+        if os.environ.get("UNIRL_PARITY_ENABLE") == "1":
+            from unirl_train_inference_parity_vllm import runtime_manifest
+
+            plugin_manifest = runtime_manifest()
+            if not plugin_manifest:
+                raise RuntimeError("UNIRL parity was enabled but the vLLM plugin did not install a runtime manifest")
         print(
             "[unirl.vllm.runtime] "
             f"rollout_dp_rank={os.environ['UNIRL_ROLLOUT_DP_RANK']} "
             f"visible_devices={visible_devices}",
             flush=True,
         )
-        connection.send({"ok": True, "event": "ready"})
-    except BaseException as error:
-        connection.send(
-            {
-                "ok": False,
-                "error": f"{type(error).__name__}: {error}",
-                "traceback": traceback.format_exc(),
-            }
+        _send_response(
+            connection,
+            startup_request,
+            ok=True,
+            result={"event": "ready", "plugin_manifest": plugin_manifest},
         )
+    except BaseException as error:
+        if startup_request is not None:
+            try:
+                _send_response(connection, startup_request, ok=False, result=None, error=error)
+            except (EOFError, BrokenPipeError, OSError):
+                pass
         connection.close()
         return
 
+    last_request_id = int(startup_request["request_id"])
     try:
         while True:
-            message = connection.recv()
+            try:
+                message = _recv_request(connection, last_request_id=last_request_id)
+            except EOFError:
+                break
+            except _ProtocolError:
+                break
+            last_request_id = int(message["request_id"])
             command = message.get("command")
+            worker_receipts: Any = []
             try:
                 if command == "generate":
                     payloads = list(message["payloads"])
@@ -128,30 +202,76 @@ def engine_process_main(
                 elif command == "health":
                     result = True
                 elif command == "update_weights":
-                    result = llm.collective_rpc(
+                    header = message.get("header")
+                    payloads = list(message.get("payloads") or message.get("serialized_named_tensors") or ())
+                    tp_world_size = int(message.get("tp_world_size") or len(payloads))
+                    worker_receipts = llm.collective_rpc(
                         "unirl_update_weights_from_tensor",
                         kwargs={
-                            "serialized_named_tensors": message["serialized_named_tensors"],
+                            "serialized_named_tensors": payloads,
+                            "payloads": payloads,
+                            "header": header,
+                            "tp_world_size": tp_world_size,
                             "load_format": message.get("load_format"),
                         },
                     )
-                    if message.get("flush_cache", True):
+                    if header is not None:
+                        from unirl.distributed.weight_sync.transfer.fsdp_vllm_protocol import (
+                            validate_worker_receipts,
+                        )
+
+                        validate_worker_receipts(
+                            header,
+                            worker_receipts,
+                            fanout=tp_world_size,
+                        )
+                    is_last = header is None or bool(header.get("is_last"))
+                    commit_receipts = []
+                    if is_last and header is not None:
+                        commit_receipts = llm.collective_rpc(
+                            "unirl_commit_weight_version",
+                            kwargs={
+                                "sync_id": str(header["sync_id"]),
+                                "model_version": int(header["model_version"]),
+                            },
+                        )
+                    result = {
+                        "status": "committed" if is_last else "staged",
+                        "worker_receipts": worker_receipts,
+                        "commit_receipts": commit_receipts,
+                        "committed": is_last,
+                    }
+                    if header is not None:
+                        from unirl.distributed.weight_sync.transfer.fsdp_vllm_protocol import (
+                            validate_receipts,
+                        )
+
+                        validate_receipts(header, result, fanout=tp_world_size)
+                    prefix_cache_reset = False
+                    if is_last and message.get("flush_cache", True):
                         llm.reset_prefix_cache(reset_running_requests=True)
+                        prefix_cache_reset = True
+                    result["prefix_cache_reset"] = prefix_cache_reset
                 elif command == "shutdown":
-                    connection.send({"ok": True, "result": None})
-                    break
+                    result = None
                 else:
                     raise ValueError(f"unknown direct-vLLM command {command!r}")
             except BaseException as error:
-                connection.send(
+                result = (
                     {
-                        "ok": False,
-                        "error": f"{type(error).__name__}: {error}",
-                        "traceback": traceback.format_exc(),
+                        "status": "aborted",
+                        "worker_receipts": worker_receipts,
                     }
+                    if command == "update_weights"
+                    else None
                 )
+                _send_response(connection, message, ok=False, result=result, error=error)
+                if command == "update_weights":
+                    break
             else:
-                connection.send({"ok": True, "result": result})
+                _send_response(connection, message, ok=True, result=result)
+                if command == "shutdown":
+                    break
     finally:
         try:
             del llm

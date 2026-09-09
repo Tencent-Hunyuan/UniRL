@@ -12,8 +12,8 @@ the async trainers program against.*
 
 The engine ABCs, the driver-side async wrappers, and the two cross-engine helpers
 (`ports.py`, `sigma_verify.py`). The per-backend engines live in the subpackages:
-`trainside`, `sglang`, `sglang_diffusion`, `vllm_omni`, `fastvideo`, `composed`,
-and the `agentic` coordinator.
+`trainside`, direct text-only `vllm`, `sglang`, `sglang_diffusion`, `vllm_omni`,
+`fastvideo`, `composed`, and the `agentic` coordinator.
 
 ## Why it exists
 
@@ -27,7 +27,9 @@ down: what a worker-side engine must implement, and what the driver may assume.
 - **Worker side** (`synchronous.py`). `BaseRolloutEngine` is the broad ABC
   including coordinator engines; `SyncRolloutEngine` is the `Sample` → `Sample`
   refinement the per-backend subpackages implement. Engines complete construction
-  in `__init__` — there is no separate initialize step.
+  in `__init__` — there is no separate initialize step. Direct `vllm` owns a
+  clean spawned interpreter in `vllm/runtime.py`; only TP rank zero owns its
+  control pipe and child process.
 - **Driver side** (`asynchronous.py`). Single-threaded, lock-free, ray-free;
   non-blocking dispatch is `Handle.launch_nowait`. Mechanisms are policy-free —
   `VersionedBuffer` (payload-agnostic freshness/staleness) and `InflightPool`
@@ -53,6 +55,17 @@ handler in `../../distributed/weight_sync`.
 
 - **`__init__.py` must import nothing.** The driver-side `asynchronous` module has
   to stay ray/torch-free to import, so consumers import the halves directly.
+- **Direct vLLM uses a dedicated sync.** Its spawned process does not see
+  an FSDP optimizer update automatically. FSDP ranks are not vLLM TP ranks:
+  `FSDPVLLMFullWeightSync` must broadcast each full tensor to all TP workers,
+  rely on the vLLM loader for sharding, and collect consumed-name/model-version
+  receipts before generation resumes.
+- **The direct-vLLM pipe is transactional, not retryable.** Requests and
+  responses echo a monotonic id plus command. Timeout, EOF, stale response, or
+  protocol mismatch closes the pipe, kills the child, and leaves the engine
+  `BROKEN`; an `update_weights` error therefore cannot fall through to another
+  request against a partially updated process. Configure command-specific
+  startup/generate/update/health/shutdown timeouts.
 - **Port reservation is a hint, not a contract** — the sockets are closed
   immediately after binding so the subprocess can bind them itself, which leaves
   the usual bind-to-zero TOCTOU gap. Accepted deliberately.

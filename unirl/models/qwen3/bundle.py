@@ -60,7 +60,12 @@ class Qwen3Bundle(Bundle):
     def from_config(cls, config: Qwen3PipelineConfig) -> "Qwen3Bundle":
         """Load the Qwen3 transformer + tokenizer from a HuggingFace-layout checkpoint."""
         for module_name in config.external_libs or ():
-            importlib.import_module(str(module_name))
+            module = importlib.import_module(str(module_name))
+            installer = getattr(module, "install", None)
+            if installer is not None:
+                if not callable(installer):
+                    raise TypeError(f"Qwen3 external library {module_name!r} exposes a non-callable install")
+                installer()
 
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -77,7 +82,11 @@ class Qwen3Bundle(Bundle):
             # Restore non-persistent RoPE buffers after meta initialization.
             from transformers import AutoConfig
 
-            hf_config = AutoConfig.from_pretrained(path, trust_remote_code=bool(config.trust_remote_code))
+            hf_config = AutoConfig.from_pretrained(
+                path,
+                revision=config.model_revision,
+                trust_remote_code=bool(config.trust_remote_code),
+            )
             model_kwargs = {}
             if getattr(config, "attn_implementation", None):
                 model_kwargs["attn_implementation"] = str(config.attn_implementation)
@@ -95,6 +104,7 @@ class Qwen3Bundle(Bundle):
                 load_kwargs["attn_implementation"] = str(config.attn_implementation)
             transformer = AutoModelForCausalLM.from_pretrained(
                 path,
+                revision=config.model_revision,
                 torch_dtype=dtype,
                 trust_remote_code=bool(config.trust_remote_code),
                 **load_kwargs,
@@ -112,6 +122,7 @@ class Qwen3Bundle(Bundle):
 
         tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_path,
+            revision=config.model_revision,
             trust_remote_code=bool(config.trust_remote_code),
         )
         if tokenizer.pad_token is None and tokenizer.eos_token is not None:

@@ -6,6 +6,7 @@ import logging
 import multiprocessing
 import os
 import threading
+from enum import Enum
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
@@ -21,6 +22,21 @@ from unirl.rollout.engine.vllm.runtime import engine_process_main
 from unirl.types.sample import Sample
 
 logger = logging.getLogger(__name__)
+
+_PROTOCOL_VERSION = 1
+_PROCESS_STOP_GRACE_S = 5.0
+
+
+class VLLMConnectionState(str, Enum):
+    """Driver-side state of the single synchronous runtime connection."""
+
+    IDLE = "IDLE"
+    INFLIGHT = "INFLIGHT"
+    BROKEN = "BROKEN"
+
+
+class _ProtocolError(RuntimeError):
+    pass
 
 
 def _resolve_visible_devices(
@@ -79,6 +95,10 @@ class VLLMRolloutEngine(BaseRolloutEngine):
             isinstance(config, VLLMEngineConfig),
             f"VLLMRolloutEngine requires VLLMEngineConfig; got {type(config).__name__}",
         )
+        require(
+            int(tp_size) == int(config.tp_size),
+            f"direct vLLM injected tp_size={tp_size} does not match config.tp_size={config.tp_size}",
+        )
         require(pp_size == 1 and pp_rank == 0, "direct vLLM rollout currently supports PP=1")
         require(ep_size == 1 and ep_rank == 0, "direct vLLM rollout currently supports EP=1")
 
@@ -94,6 +114,9 @@ class VLLMRolloutEngine(BaseRolloutEngine):
         self._lock = threading.Lock()
         self._process = None
         self._connection = None
+        self._connection_state = VLLMConnectionState.IDLE
+        self._next_request_id = 1
+        self._startup_manifest = None
         self.adapter = None
 
         if not self._is_tp_zero:
@@ -112,7 +135,8 @@ class VLLMRolloutEngine(BaseRolloutEngine):
 
         tokenizer = AutoTokenizer.from_pretrained(
             config.pretrained_model_ckpt_path,
-            trust_remote_code=True,
+            revision=config.model_revision,
+            trust_remote_code=bool(config.trust_remote_code),
         )
         self.adapter = TextLMAdapter(config, tokenizer=tokenizer)
 
@@ -125,8 +149,10 @@ class VLLMRolloutEngine(BaseRolloutEngine):
                 "connection": child,
                 "config": {
                     "pretrained_model_ckpt_path": config.pretrained_model_ckpt_path,
+                    "model_revision": config.model_revision,
                     "tp_size": self._tp_size,
                     "rollout_rank": rollout_rank,
+                    "trust_remote_code": bool(config.trust_remote_code),
                     "engine_kwargs": dict(config.engine_kwargs or {}),
                 },
                 "visible_devices": visible,
@@ -134,11 +160,17 @@ class VLLMRolloutEngine(BaseRolloutEngine):
             name=f"unirl-vllm-tp{self._tp_size}",
             daemon=False,
         )
-        self._process.start()
-        child.close()
-        ready = self._recv(timeout_s=self.cfg.request_timeout_s)
-        if ready.get("event") != "ready":
-            raise RuntimeError(f"direct vLLM returned invalid startup event: {ready!r}")
+        try:
+            self._process.start()
+            child.close()
+            ready = self._request("startup")
+            if not isinstance(ready, dict) or ready.get("event") != "ready":
+                raise _ProtocolError(f"direct vLLM returned invalid startup result: {ready!r}")
+            self._startup_manifest = ready.get("plugin_manifest")
+        except BaseException:
+            child.close()
+            self._break_connection()
+            raise
         logger.info(
             "Direct vLLM ready: rank=%s tp=%d devices=%s model=%s",
             rank,
@@ -151,6 +183,17 @@ class VLLMRolloutEngine(BaseRolloutEngine):
     def weight_payload_fanout(self) -> int:
         return self._tp_size
 
+    @property
+    def connection_state(self) -> VLLMConnectionState:
+        with self._lock:
+            return self._connection_state
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def parity_runtime_manifest(self) -> Optional[Dict[str, Any]]:
+        if not self._is_tp_zero:
+            return None
+        return None if self._startup_manifest is None else dict(self._startup_manifest)
+
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
     def generate(self, sample: Sample) -> Sample:
         if not self._is_tp_zero:
@@ -158,6 +201,7 @@ class VLLMRolloutEngine(BaseRolloutEngine):
         require(not self._is_offloaded, "VLLMRolloutEngine.generate called while sleeping")
         sampling = resolve_sampling(self.cfg, sample)
         prepared = self.adapter.build_inputs(sample, sampling=sampling)
+        self._truncate_prepared_prompts(prepared)
         if self.cfg.ignore_eos:
             for payload in prepared.wire:
                 payload["sampling_params"]["ignore_eos"] = True
@@ -213,22 +257,64 @@ class VLLMRolloutEngine(BaseRolloutEngine):
     def update_weights_from_tensor(
         self,
         *,
-        serialized_named_tensors: List[str],
+        serialized_named_tensors: Optional[List[str]] = None,
+        payloads: Optional[List[str]] = None,
+        header: Optional[Dict[str, Any]] = None,
+        tp_world_size: Optional[int] = None,
         target_modules: Optional[List[str]] = None,
         load_format: Optional[str] = None,
         flush_cache: bool = True,
         track_prefix: str = "",
-    ) -> None:
+    ) -> Dict[str, Any]:
         del target_modules, track_prefix
         if not self._is_tp_zero:
-            return
-        self._request(
+            return {}
+        wire_payloads = list(payloads if payloads is not None else serialized_named_tensors or ())
+        if payloads is not None and serialized_named_tensors is not None:
+            if list(payloads) != list(serialized_named_tensors):
+                raise ValueError("direct vLLM received conflicting payload aliases")
+        expected_tp = self._tp_size if tp_world_size is None else int(tp_world_size)
+        if expected_tp != self._tp_size:
+            raise ValueError(f"weight update TP world {expected_tp} != rollout TP {self._tp_size}")
+        if len(wire_payloads) != self._tp_size:
+            raise ValueError(f"weight payload count {len(wire_payloads)} != rollout TP {self._tp_size}")
+        if header is not None:
+            from unirl.distributed.weight_sync.transfer.fsdp_vllm_protocol import (
+                validate_bucket_header,
+            )
+
+            validate_bucket_header(header, payload_count=len(wire_payloads), tp_world_size=self._tp_size)
+        receipt = self._request(
             "update_weights",
-            serialized_named_tensors=list(serialized_named_tensors),
+            serialized_named_tensors=wire_payloads,
+            payloads=wire_payloads,
+            header=header,
+            tp_world_size=self._tp_size,
             load_format=load_format,
             flush_cache=bool(flush_cache),
         )
-        self._version += 1
+        expected_status = "committed" if header is None or bool(header.get("is_last")) else "staged"
+        if receipt.get("status") != expected_status:
+            raise _ProtocolError(f"weight update status={receipt.get('status')!r}, expected {expected_status!r}")
+        try:
+            worker_receipts = receipt.get("worker_receipts")
+            if not isinstance(worker_receipts, list) or len(worker_receipts) != self._tp_size:
+                raise _ProtocolError(
+                    f"weight update worker receipt count must equal TP={self._tp_size}; got {worker_receipts!r}"
+                )
+            if header is not None:
+                from unirl.distributed.weight_sync.transfer.fsdp_vllm_protocol import (
+                    validate_receipts,
+                )
+
+                validate_receipts(header, receipt, fanout=self._tp_size)
+        except BaseException:
+            self._break_connection()
+            raise
+        if expected_status == "committed":
+            committed_version = int(header["model_version"]) if header is not None else self._version + 1
+            self._version = committed_version
+        return receipt
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def shutdown(self) -> None:
@@ -237,36 +323,196 @@ class VLLMRolloutEngine(BaseRolloutEngine):
         process = self._process
         try:
             if process.is_alive():
-                self._request("shutdown")
-                process.join(timeout=60)
+                if self.connection_state is VLLMConnectionState.IDLE:
+                    self._request("shutdown")
+                process.join(timeout=self.cfg.timeout_for("shutdown"))
         finally:
-            if process.is_alive():
-                process.terminate()
-                process.join(timeout=10)
-            if self._connection is not None:
-                self._connection.close()
-            self._process = None
-            self._connection = None
+            with self._lock:
+                self._dispose_runtime_locked()
 
-    def _request(self, command: str, **payload):
+    def _truncate_prepared_prompts(self, prepared: Any) -> None:
+        require(
+            len(prepared.wire) == len(prepared.prompt_token_ids),
+            "direct vLLM adapter returned mismatched payload and prompt-token counts",
+        )
+        max_prompt_length = int(self.cfg.max_prompt_length)
+        for index, (payload, prompt_token_ids) in enumerate(zip(prepared.wire, prepared.prompt_token_ids, strict=True)):
+            truncated = [int(token) for token in prompt_token_ids[-max_prompt_length:]]
+            payload["input_ids"] = truncated
+            prepared.prompt_token_ids[index] = truncated
+
+    def _request(self, command: str, *, timeout_s: Optional[float] = None, **payload):
         with self._lock:
             connection = self._require_connection()
-            connection.send({"command": command, **payload})
-            return self._recv(timeout_s=self.cfg.request_timeout_s).get("result")
+            if self._connection_state is not VLLMConnectionState.IDLE:
+                raise RuntimeError(
+                    f"direct vLLM connection is {self._connection_state.value}; cannot start command {command!r}"
+                )
+            reserved = {"protocol_version", "request_id", "command"}.intersection(payload)
+            if reserved:
+                raise ValueError(f"direct vLLM payload uses reserved protocol fields: {sorted(reserved)}")
+            request_id = self._next_request_id
+            self._next_request_id += 1
+            self._connection_state = VLLMConnectionState.INFLIGHT
+            request = {
+                **payload,
+                "protocol_version": _PROTOCOL_VERSION,
+                "request_id": request_id,
+                "command": command,
+            }
+            try:
+                connection.send(request)
+                response = self._recv(
+                    timeout_s=self.cfg.timeout_for(command) if timeout_s is None else timeout_s,
+                    expected_request_id=request_id,
+                    expected_command=command,
+                )
+                result = response["result"]
+                if not response["ok"]:
+                    if command == "update_weights":
+                        self._validate_update_result(result, expected_status="aborted")
+                    if command in {"sleep", "wake_up", "update_weights"}:
+                        self._mark_broken_locked()
+                    else:
+                        self._connection_state = VLLMConnectionState.IDLE
+                    raise RuntimeError(
+                        f"direct vLLM {command} request {request_id} failed: "
+                        f"{response.get('error')}\n{response.get('traceback', '')}"
+                    )
+                self._validate_command_result(command, result)
+            except BaseException as error:
+                if self._connection_state is VLLMConnectionState.INFLIGHT:
+                    self._mark_broken_locked()
+                if isinstance(error, (TimeoutError, EOFError, BrokenPipeError, OSError, _ProtocolError)):
+                    raise type(error)(
+                        f"direct vLLM {command} request {request_id} broke the connection: {error}"
+                    ) from error
+                raise
+            self._connection_state = VLLMConnectionState.IDLE
+            return result
 
-    def _recv(self, *, timeout_s: float) -> Dict[str, Any]:
+    def _recv(
+        self,
+        *,
+        timeout_s: float,
+        expected_request_id: Optional[int] = None,
+        expected_command: Optional[str] = None,
+    ) -> Dict[str, Any]:
         connection = self._require_connection()
         if not connection.poll(timeout_s):
             raise TimeoutError(f"direct vLLM did not respond within {timeout_s:.0f}s")
-        message = connection.recv()
-        if not message.get("ok"):
-            raise RuntimeError(f"direct vLLM failed: {message.get('error')}\n{message.get('traceback', '')}")
+        try:
+            message = connection.recv()
+        except EOFError as error:
+            raise EOFError("direct vLLM closed the response pipe") from error
+        if not isinstance(message, dict):
+            raise _ProtocolError(f"response must be a mapping, got {type(message).__name__}")
+        if message.get("protocol_version") != _PROTOCOL_VERSION:
+            raise _ProtocolError(
+                f"response protocol_version={message.get('protocol_version')!r}, expected {_PROTOCOL_VERSION}"
+            )
+        request_id = message.get("request_id")
+        if type(request_id) is not int or request_id < 1:
+            raise _ProtocolError(f"response has invalid request_id={request_id!r}")
+        command = message.get("command")
+        if not isinstance(command, str) or not command:
+            raise _ProtocolError(f"response has invalid command={command!r}")
+        if expected_request_id is not None and request_id != expected_request_id:
+            raise _ProtocolError(f"response request_id={request_id}, expected {expected_request_id}")
+        if expected_command is not None and command != expected_command:
+            raise _ProtocolError(f"response command={command!r}, expected {expected_command!r}")
+        if type(message.get("ok")) is not bool:
+            raise _ProtocolError(f"response has invalid ok={message.get('ok')!r}")
+        if "result" not in message:
+            raise _ProtocolError("response omitted result")
         return message
 
+    @staticmethod
+    def _validate_update_result(result: Any, *, expected_status: str) -> None:
+        if not isinstance(result, dict):
+            raise _ProtocolError(f"update result must be a mapping, got {type(result).__name__}")
+        if result.get("status") != expected_status:
+            raise _ProtocolError(f"update result status={result.get('status')!r}, expected {expected_status!r}")
+        if "worker_receipts" not in result:
+            raise _ProtocolError("update result omitted worker_receipts")
+
+    def _validate_command_result(self, command: str, result: Any) -> None:
+        if command == "startup":
+            if not isinstance(result, dict) or result.get("event") != "ready":
+                raise _ProtocolError(f"startup result must be a ready event, got {result!r}")
+        elif command == "generate":
+            if not isinstance(result, list):
+                raise _ProtocolError(f"generate result must be a list, got {type(result).__name__}")
+        elif command == "update_weights":
+            if not isinstance(result, dict) or result.get("status") not in {
+                "staged",
+                "committed",
+            }:
+                raise _ProtocolError("update result status must be 'staged' or 'committed'")
+            if "worker_receipts" not in result:
+                raise _ProtocolError("update result omitted worker_receipts")
+        elif command == "health":
+            if type(result) is not bool:
+                raise _ProtocolError(f"health result must be bool, got {type(result).__name__}")
+        elif command in {"sleep", "wake_up", "shutdown"} and result is not None:
+            raise _ProtocolError(f"{command} result must be None, got {result!r}")
+
     def _require_connection(self):
+        if self._connection_state is VLLMConnectionState.BROKEN:
+            raise RuntimeError("direct vLLM runtime connection is broken and cannot be reused")
         if self._connection is None:
             raise RuntimeError("direct vLLM runtime is not available on this rank")
         return self._connection
 
+    def _break_connection(self) -> None:
+        with self._lock:
+            self._mark_broken_locked()
 
-__all__ = ["VLLMRolloutEngine"]
+    def _mark_broken_locked(self) -> None:
+        self._connection_state = VLLMConnectionState.BROKEN
+        self._dispose_runtime_locked()
+
+    def _dispose_runtime_locked(self) -> None:
+        connection, self._connection = self._connection, None
+        if connection is not None:
+            try:
+                connection.close()
+            except OSError:
+                pass
+
+        process, self._process = self._process, None
+        if process is None:
+            return
+        try:
+            alive = process.is_alive()
+        except (AssertionError, OSError, ValueError):
+            alive = False
+        if alive:
+            try:
+                process.terminate()
+            except (OSError, ValueError):
+                pass
+            try:
+                process.join(timeout=_PROCESS_STOP_GRACE_S)
+            except (AssertionError, OSError, ValueError):
+                pass
+            try:
+                alive = process.is_alive()
+            except (AssertionError, OSError, ValueError):
+                alive = False
+            if alive:
+                try:
+                    process.kill()
+                except (AttributeError, OSError, ValueError):
+                    pass
+                try:
+                    process.join(timeout=_PROCESS_STOP_GRACE_S)
+                except (AssertionError, OSError, ValueError):
+                    pass
+        try:
+            process.close()
+        except (AttributeError, OSError, ValueError):
+            pass
+
+
+__all__ = ["VLLMConnectionState", "VLLMRolloutEngine"]

@@ -301,6 +301,10 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
         """Return the HF causal LM module — the FSDP/LoRA wrap target."""
         return self.model.transformer
 
+    def exact_context(self):
+        """Scope replay, parity gate, loss, backward, and checkpoint recomputation."""
+        return _exact_actor_context(self.model.transformer)
+
     def autoregress(
         self,
         conditions: Qwen3ARConditions,
