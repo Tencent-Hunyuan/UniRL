@@ -13,7 +13,7 @@ from unirl.rollout.engine.base import BaseRolloutEngine
 from unirl.rollout.engine.sglang.adapters import get_adapter
 from unirl.rollout.engine.sglang.backends import HTTPBackend, NativeBackend
 from unirl.rollout.engine.sglang.config import SGLangEngineConfig, SGLangPorts
-from unirl.rollout.engine.sglang.utils import resolve_sampling
+from unirl.rollout.engine.sglang.utils import deterministic_inference_enabled, resolve_sampling
 from unirl.rollout.engine.sglang.weight_sync import WeightSync
 from unirl.types.sample import Sample
 
@@ -107,6 +107,13 @@ class SGLangRolloutEngine(BaseRolloutEngine):
             self._tp_size,
             self._tp_visible_devices,
         )
+
+        if deterministic_inference_enabled(engine_kwargs):
+            logger.warning(
+                "SGLangRolloutEngine: deterministic inference is on (rl_on_policy_target=%s) — every sample "
+                "is sent as its own seeded n=1 request, not one n>1 request per prompt",
+                engine_kwargs.get("rl_on_policy_target"),
+            )
 
         if ports is None:
             ports = SGLangPorts.reserve()
