@@ -88,12 +88,11 @@ class RLHunyuanVideo15Pipeline(HunyuanVideo15Pipeline):
             req,
             caller="RLHunyuanVideo15Pipeline._arm_sde",
         )
-        base_seed = getattr(req.sampling_params, "seed", None)
         self.scheduler.arm(
             eta=eta,
             sde_indices=extra.get("sde_indices"),
             denoise_seeds=denoise_seeds,
-            denoise_base_seed=int(base_seed) if base_seed is not None else 0,
+            denoise_base_seed=int(extra.get("denoise_base_seed", 0)),
         )
 
     def _arm_initial_noise(self, req: OmniDiffusionRequest) -> None:

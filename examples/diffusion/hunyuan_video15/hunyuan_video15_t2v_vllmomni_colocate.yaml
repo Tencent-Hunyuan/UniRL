@@ -23,8 +23,6 @@
 #     hv15's stage config sets enable_lora/max_lora_rank=64 so the adapter
 #     actually applies. This avoids the CUDA-IPC path's SGLang dependency,
 #     which the vllm-omni-only venv (two-venv image) does not provide.
-#   - algorithm.old_logp_source: rollout — use the sampler-emitted density as
-#     the frozen policy anchor.
 #
 # Boot note: colocate 1x8 lands all 8 hv15 engine replicas on ONE node — the
 # worst-case parallel-boot memcg burst (each loads ~30GB DiT + Qwen2.5-VL TE +
@@ -146,8 +144,9 @@ reward:
 algorithm:
   _target_: unirl.algorithms.flowgrpo.FlowGRPO
   stage_attr: diffusion
-  # Keep the sampler-emitted density as the actual old policy.
-  old_logp_source: rollout
+  # Recompute the frozen policy density through the trainer-side replay path
+  # until the final rollout implementation is validated within clip_range.
+  old_logp_source: replay
   clip_range: 1.0e-4
   clip_schedule: constant
   conditions_cls:

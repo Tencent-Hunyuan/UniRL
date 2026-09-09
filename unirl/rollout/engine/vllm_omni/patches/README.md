@@ -81,7 +81,5 @@ known-invalid adapter.
   not pull vllm.
 - **Every patch needs a DELETE-WHEN row.** Without one it is permanent by default.
 - **0.27 honors `engine_args.diffusion_attention_backend`, not `attention_backend`.**
-  The old AR field is silently dropped by `OmniDiffusionConfig.from_kwargs`. A
-  model adapter that needs a fixed kernel can also export
-  `DIFFUSION_ATTENTION_BACKEND` through its boot intent before `Omni()` spawns;
-  HV1.5 uses both (stage YAML + `Hv15T2vAdapter.boot_kwargs`).
+  The old AR field is silently dropped by `OmniDiffusionConfig.from_kwargs`;
+  HV1.5 pins the diffusion backend in its stage YAML.
