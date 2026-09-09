@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from typing import Any, Dict, List, Optional
 
@@ -146,6 +147,11 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def wake_up(self) -> None:
         """Fan ``handle_wake_task`` to every stage's workers + restore LoRA."""
+        # vLLM disables cuDNN SDPA process-wide at import, including for colocated training.
+        if os.environ.get("UNIRL_KEEP_CUDNN_SDP_OFF"):
+            pass
+        elif torch.cuda.is_available():
+            torch.backends.cuda.enable_cudnn_sdp(True)
         if self._transition_failed:
             # Recover an unknown partial stage state to one known boundary
             # before attempting another wake. If this retry fails, retain the
