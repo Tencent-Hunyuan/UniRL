@@ -494,6 +494,7 @@ def patch_hv15_refiner_torch_linear_lora() -> None:
     try:
         from vllm.lora.layers import BaseLayerWithLoRA
         from vllm.lora.utils import replace_submodule
+        from vllm_omni.diffusion.lora.utils import _match_target_modules
         from vllm_omni.diffusion.models.hunyuan_video.hunyuan_video_15_transformer import (
             HunyuanVideo15Transformer3DModel,
         )
@@ -504,15 +505,6 @@ def patch_hv15_refiner_torch_linear_lora() -> None:
     if getattr(original_replace, "_diffrl_hv15_refiner_torch_linear_lora", False):
         return
 
-    target_paths = (
-        "attn.to_q",
-        "attn.to_k",
-        "attn.to_v",
-        "attn.to_out.0",
-        "ff.net.0.proj",
-        "ff.net.2",
-    )
-
     @wraps(original_replace)
     def _patched_replace(self, peft_helper):
         original_replace(self, peft_helper)
@@ -522,18 +514,39 @@ def patch_hv15_refiner_torch_linear_lora() -> None:
 
         blocks = transformer.context_embedder.token_refiner.refiner_blocks
         prefix = "context_embedder.token_refiner.refiner_blocks"
-        newly_wrapped = 0
-        for block_index in range(len(blocks)):
-            for target_path in target_paths:
+        target_modules = getattr(peft_helper, "target_modules", None)
+        target_pattern = target_modules if isinstance(target_modules, str) and target_modules else None
+        target_list = target_modules if isinstance(target_modules, list) and target_modules else None
+
+        def _matches_target(module_name: str) -> bool:
+            if target_pattern is not None:
+                import regex as re
+
+                return re.search(target_pattern, module_name) is not None
+            return target_list is None or _match_target_modules(module_name, target_list)
+
+        matched = []
+        for block_index, block in enumerate(blocks):
+            for target_path, module in block.named_modules(remove_duplicate=False):
                 module_name = f"{prefix}.{block_index}.{target_path}"
-                module = transformer.get_submodule(module_name)
-                if isinstance(module, torch.nn.Linear):
-                    module = _HV15TorchLinearWithLoRA(module)
-                    replace_submodule(transformer, module_name, module)
-                    newly_wrapped += 1
-                elif not isinstance(module, (_HV15TorchLinearWithLoRA, BaseLayerWithLoRA)):
-                    raise RuntimeError(f"Unsupported HV1.5 refiner LoRA layer {module_name}: {type(module).__name__}")
-                self._lora_modules[f"transformer.{module_name}"] = module
+                full_module_name = f"transformer.{module_name}"
+                if (
+                    target_path
+                    and _matches_target(full_module_name)
+                    and isinstance(
+                        module,
+                        (torch.nn.Linear, _HV15TorchLinearWithLoRA, BaseLayerWithLoRA),
+                    )
+                ):
+                    matched.append((module_name, full_module_name, module))
+
+        newly_wrapped = 0
+        for module_name, full_module_name, module in matched:
+            if isinstance(module, torch.nn.Linear):
+                module = _HV15TorchLinearWithLoRA(module)
+                replace_submodule(transformer, module_name, module)
+                newly_wrapped += 1
+            self._lora_modules[full_module_name] = module
 
         if newly_wrapped:
             logger.info(

@@ -324,6 +324,11 @@ class HunyuanVideo15DiffusionStage(DiffusionStage[HunyuanVideo15Conditions]):
         prompt_embeds = conditions.text_mllm.embeds
         device = prompt_embeds.device
         batch_size = int(prompt_embeds.shape[0])
+        if denoise_seed_keys is not None and len(denoise_seed_keys) != batch_size:
+            raise ValueError(
+                "HunyuanVideo15DiffusionStage.diffuse: denoise_seed_keys length "
+                f"{len(denoise_seed_keys)} != batch_size={batch_size}."
+            )
         T = int(params.num_inference_steps)
         if int(schedule.shape[0]) != T + 1:
             raise ValueError(
