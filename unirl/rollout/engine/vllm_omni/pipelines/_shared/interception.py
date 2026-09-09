@@ -160,11 +160,11 @@ def resolve_request_noise(req: Any, *, caller: str) -> Optional[torch.Tensor]:
     ).resolve()
 
 
-def resolve_request_denoise_seeds(req: Any, *, caller: str) -> Optional[list[str]]:
+def resolve_request_denoise_seed_keys(req: Any, *, caller: str) -> Optional[list[str]]:
     """Slice this request's per-sample SDE-noise keys from the driver batch."""
     extra = getattr(req.sampling_params, "extra_args", None) or {}
-    denoise_seeds = extra.get("denoise_seeds")
-    if denoise_seeds is None:
+    denoise_seed_keys = extra.get("denoise_seed_keys")
+    if denoise_seed_keys is None:
         return None
 
     rid = str(getattr(req, "request_id", "") or "")
@@ -177,12 +177,12 @@ def resolve_request_denoise_seeds(req: Any, *, caller: str) -> Optional[list[str
 
     spp = int(getattr(req.sampling_params, "num_outputs_per_prompt", 1) or 1)
     start, end = idx * spp, (idx + 1) * spp
-    n = len(denoise_seeds)
+    n = len(denoise_seed_keys)
     if spp < 1 or not 0 <= start < end <= n:
         raise IndexError(
-            f"{caller}: grouped slice [{start}:{end}) out of bounds for denoise_seeds length {n} (spp={spp})."
+            f"{caller}: grouped slice [{start}:{end}) out of bounds for denoise_seed_keys length {n} (spp={spp})."
         )
-    return [str(seed) for seed in denoise_seeds[start:end]]
+    return [str(seed_key) for seed_key in denoise_seed_keys[start:end]]
 
 
 def inject_latents(
@@ -230,7 +230,7 @@ __all__ = [
     "inject_latents",
     "make_sde_scheduler",
     "read_captures",
-    "resolve_request_denoise_seeds",
+    "resolve_request_denoise_seed_keys",
     "resolve_request_noise",
     "set_payload",
     "single_request",

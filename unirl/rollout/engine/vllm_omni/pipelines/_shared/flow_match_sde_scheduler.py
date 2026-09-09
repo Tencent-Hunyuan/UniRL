@@ -44,7 +44,7 @@ class FlowMatchSDEDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
         self._initial_latent: Optional[torch.Tensor] = None
         self._initial_timestep: Optional[torch.Tensor] = None
         self._sde_indices_set: Optional[frozenset] = None
-        self._denoise_seeds: Optional[List[str]] = None
+        self._denoise_seed_keys: Optional[List[str]] = None
         self._denoise_base_seed: int = 0
 
     def arm(
@@ -52,7 +52,7 @@ class FlowMatchSDEDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
         *,
         eta: float,
         sde_indices: Optional[List[int]] = None,
-        denoise_seeds: Optional[List[str]] = None,
+        denoise_seed_keys: Optional[List[str]] = None,
         denoise_base_seed: int = 0,
     ) -> None:
         """Per-request arming: SDE strength, sparse step gate, and sample-keyed noise."""
@@ -60,7 +60,7 @@ class FlowMatchSDEDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
             raise ValueError(f"FlowMatchSDEDiscreteScheduler.arm: eta must be >= 0; got eta={eta!r}.")
         self._eta = float(eta)
         self._sde_indices_set = frozenset(int(i) for i in sde_indices) if sde_indices is not None else None
-        self._denoise_seeds = [str(seed) for seed in denoise_seeds] if denoise_seeds is not None else None
+        self._denoise_seed_keys = list(denoise_seed_keys) if denoise_seed_keys is not None else None
         self._denoise_base_seed = int(denoise_base_seed)
 
     def set_timesteps(
@@ -166,16 +166,16 @@ class FlowMatchSDEDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
                 + model_output_f32 * (1 + std_dev_t**2 * (1 - sigma) / (2 * sigma)) * dt
             )
 
-            if generator is None and self._denoise_seeds is not None:
-                if len(self._denoise_seeds) != int(model_output_f32.shape[0]):
+            if generator is None and self._denoise_seed_keys is not None:
+                if len(self._denoise_seed_keys) != int(model_output_f32.shape[0]):
                     raise RuntimeError(
-                        "FlowMatchSDEDiscreteScheduler.step: denoise_seeds length "
-                        f"{len(self._denoise_seeds)} != batch size {int(model_output_f32.shape[0])}."
+                        "FlowMatchSDEDiscreteScheduler.step: denoise_seed_keys length "
+                        f"{len(self._denoise_seed_keys)} != batch size {int(model_output_f32.shape[0])}."
                     )
                 generator = make_denoise_step_generators(
                     base_seed=self._denoise_base_seed,
                     step_index=int(sigma_idx),
-                    sample_ids=self._denoise_seeds,
+                    sample_ids=self._denoise_seed_keys,
                 )
 
             variance_noise = randn_tensor(

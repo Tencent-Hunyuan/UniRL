@@ -21,7 +21,7 @@ from unirl.rollout.engine.vllm_omni.pipelines._shared.interception import (
     drain_trajectory_into,
     inject_latents,
     make_sde_scheduler,
-    resolve_request_denoise_seeds,
+    resolve_request_denoise_seed_keys,
     resolve_request_noise,
     single_request,
     stamp_capture,
@@ -84,14 +84,14 @@ class RLHunyuanVideo15Pipeline(HunyuanVideo15Pipeline):
         """This request's SDE strength + sparse step gate."""
         eta = float(getattr(req.sampling_params, "eta", 0.0) or 0.0)
         extra = getattr(req.sampling_params, "extra_args", None) or {}
-        denoise_seeds = resolve_request_denoise_seeds(
+        denoise_seed_keys = resolve_request_denoise_seed_keys(
             req,
             caller="RLHunyuanVideo15Pipeline._arm_sde",
         )
         self.scheduler.arm(
             eta=eta,
             sde_indices=extra.get("sde_indices"),
-            denoise_seeds=denoise_seeds,
+            denoise_seed_keys=denoise_seed_keys,
             denoise_base_seed=int(extra.get("denoise_base_seed", 0)),
         )
 

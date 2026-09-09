@@ -39,7 +39,7 @@ class Hv15InputAdapter(DitInputAdapter):
         frontier = sample.frontier_gen_part(DiffusionSamplingParams)
         diff_params = frontier.sampling_params
         extra_args = sampling[0].kwargs.setdefault("extra_args", {})
-        extra_args["denoise_seeds"] = [str(sample_id) for sample_id in frontier.sample_ids]
+        extra_args["denoise_seed_keys"] = [str(sample_id) for sample_id in frontier.sample_ids]
         extra_args["denoise_base_seed"] = int(diff_params.seed) if diff_params.seed is not None else 0
         return sampling
 
