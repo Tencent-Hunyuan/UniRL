@@ -49,11 +49,12 @@ def patch_contracts() -> None:
     ForwardBatch.RLData = UniRLFastVideoRLData
 
 
-def _unirl_std_dev_t(sde_type: str, sigma: torch.Tensor, sigma_max: torch.Tensor, eta: float) -> torch.Tensor:
+def _unirl_std_dev_t(sde_type: str, sigma: torch.Tensor, eta: float, sigma_max: float = 0.99) -> torch.Tensor:
     """Return the UniRL kernel's diffusion coefficient; must match ``unirl/sde/kernels.py``."""
     if sde_type == "dance":
         return torch.full_like(sigma, float(eta))
     if sde_type == "flow":
+        # sigma_max is UniRL's constant sigma==1 guard, not the schedule's second sigma.
         return torch.sqrt(sigma / (1 - torch.where(sigma == 1, sigma_max, sigma))) * float(eta)
     raise ValueError(f"FastVideo UniRL transition supports sde_type 'flow' or 'dance'; got {sde_type!r}")
 
@@ -101,7 +102,7 @@ def _sde_step_with_logprob(
         std = torch.zeros_like(sigma)
         return (result, zeros, result, std, sqrt_dt) if return_dt_and_std_dev_t else (result, zeros, result, std)
 
-    std_dev_t = _unirl_std_dev_t(kernel, sigma, sigmas[1].reshape(1, *([1] * (sample.ndim - 1))), resolved_eta)
+    std_dev_t = _unirl_std_dev_t(kernel, sigma, resolved_eta)
     prev_sample_mean = (
         sample * (1 + std_dev_t.square() / (2 * sigma) * dt)
         + model_output * (1 + std_dev_t.square() * (1 - sigma) / (2 * sigma)) * dt
