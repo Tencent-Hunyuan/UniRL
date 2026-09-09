@@ -554,8 +554,7 @@ class UniRLWandBLogger:
         """Log one rollout's metrics to wandb. No-op when disabled."""
         mem_summary = self.memory_monitor.step_summary(step=rollout_id + 1) if self.memory_monitor is not None else None
         if not self.enabled or not self._initialized:
-            # Keep the checkpointed train axis independent of telemetry. This
-            # follows the same path as live logging; log_step itself is a no-op.
+            # Keep the checkpointed train axis independent of telemetry; log_step is a no-op here.
             self._log_train(results)
             return
         from unirl.utils.wandb_metrics import compute_rollout_sample_metrics

@@ -122,7 +122,4 @@ class ARSamplingParams(BaseSamplingParams):
     top_p: float = 0.9
     top_k: int = 0
     stop_token_id: int | None = None
-    # Engines with per-request seeded sampling derive stable child seeds from
-    # this value and sample_ids. None uses the engine's deterministic default
-    # when that mode is enabled, otherwise its standard sampling path.
-    seed: Optional[int] = None
+    seed: Optional[int] = None  # engines with per-request seeded sampling derive child seeds from this + sample_id
