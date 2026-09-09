@@ -119,6 +119,12 @@ class Hv15T2vAdapter(ModelAdapter):
     stage_yaml = "hunyuan_video15_t2v_rl.yaml"
     needs_driver_tokenizer = False
 
+    def boot_kwargs(self) -> Dict[str, Any]:
+        """Select the rollout diffusion attention backend."""
+        kwargs = super().boot_kwargs()
+        kwargs["diffusion_attention_backend"] = self.cfg.diffusion_attention_backend or "TORCH_SDPA"
+        return kwargs
+
     def __init__(self, config: Any, model_config: Any, *, strategy: Any = None, tokenize_fn: Any = None) -> None:
         super().__init__(config, model_config, strategy=strategy, tokenize_fn=tokenize_fn)
         self.input_adapter = Hv15InputAdapter(self.modality)

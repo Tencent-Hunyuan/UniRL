@@ -54,6 +54,7 @@ bundle:
     _target_: unirl.models.hunyuan_video15.config.HunyuanVideo15PipelineConfig
     pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v}
     model_precision: bf16
+    attention_backend: flash_varlen
     shift: 5.0
     load_vae: false
 
@@ -120,6 +121,7 @@ rollout:
     _target_: unirl.rollout.engine.vllm_omni.config.VLLMOmniEngineConfig
     model_path: ${oc.env:PRETRAINED_MODEL,hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v}
     modality: hv15_t2v
+    diffusion_attention_backend: FLASH_ATTN
     # Colocate time-shares the GPU: the engine sleeps (releases GPU memory)
     # while the trainer runs and wakes to generate.
     enable_sleep_mode: true
