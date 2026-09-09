@@ -3,7 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple, Union
 
+from unirl.config.require import require
+
 LoraModuleSelection = Union[str, Tuple[str, ...]]
+_FSDP_MODES = ("full", "hybrid", "no_shard")
 
 
 @dataclass
@@ -86,8 +89,10 @@ class FSDPConfig:
     mixed_precision: bool = True
     # Match FSDP2's default: cast floating block inputs to param_dtype.
     cast_forward_inputs: bool = True
-    # Shard degree: full = the whole world, hybrid = one node (replicate across nodes), no_shard = nobody (DDP — every rank keeps the full model).
+    # Shard degree: full = the whole world, hybrid = hsdp_shard_size ranks
+    # (replicate across groups), no_shard = nobody (DDP — every rank keeps the full model).
     fsdp_mode: str = "full"
+    hsdp_shard_size: int = 8
     reshard_after_forward: bool = True
     activation_checkpointing: bool = False
     # AC/FSDP composition order. "outside" (default) keeps FSDP's gather/cast
@@ -108,10 +113,58 @@ class FSDPConfig:
     ep_size: int = 1
 
 
+def normalize_fsdp_mode(fsdp_mode: str) -> str:
+    """Canonicalize a configured shard mode, rejecting anything unrecognized."""
+    mode = str(fsdp_mode).strip().lower()
+    require(
+        mode in _FSDP_MODES,
+        f"training.fsdp.fsdp_mode={fsdp_mode!r} is not one of {list(_FSDP_MODES)}; "
+        "an unrecognized mode would silently fall back to full sharding.",
+    )
+    return mode
+
+
+def resolve_fsdp_mesh_shape(
+    fsdp_mode: str,
+    *,
+    world_size: int,
+    hsdp_shard_size: int,
+) -> Optional[Tuple[int, int]]:
+    """Validate FSDP geometry and return its ``(replicate, shard)`` mesh shape."""
+    require(
+        isinstance(world_size, int) and world_size >= 1,
+        f"training.fsdp world_size must be a positive integer, got {world_size!r}.",
+    )
+    fsdp_mode = normalize_fsdp_mode(fsdp_mode)
+    if fsdp_mode == "full" or (fsdp_mode == "no_shard" and world_size == 1):
+        return None
+    if fsdp_mode == "no_shard":
+        return (world_size, 1)
+
+    require(
+        isinstance(hsdp_shard_size, int) and hsdp_shard_size >= 2,
+        f"training.fsdp.hsdp_shard_size must be an integer >= 2, got {hsdp_shard_size!r}.",
+    )
+    require(
+        world_size > hsdp_shard_size,
+        f"training.fsdp.fsdp_mode='hybrid' requires world_size > hsdp_shard_size "
+        f"to form at least two replica groups, got world_size={world_size}, "
+        f"hsdp_shard_size={hsdp_shard_size}. Use fsdp_mode='full' for one shard group.",
+    )
+    require(
+        world_size % hsdp_shard_size == 0,
+        f"training.fsdp.fsdp_mode='hybrid' requires world_size divisible by "
+        f"hsdp_shard_size, got world_size={world_size}, hsdp_shard_size={hsdp_shard_size}.",
+    )
+    return (world_size // hsdp_shard_size, hsdp_shard_size)
+
+
 __all__ = [
     "LoraConfig",
     "LoraModuleSelection",
     "EmaLoraConfig",
     "EmaFullConfig",
     "FSDPConfig",
+    "normalize_fsdp_mode",
+    "resolve_fsdp_mesh_shape",
 ]

@@ -33,6 +33,7 @@ from unirl.train.configs import EmaFullConfig, EmaLoraConfig, FSDPConfig, LoraCo
 from unirl.train.ema import EMA, Shadow, inject_mirror, inject_nft, make_decay_fn
 from unirl.train.lora import inject_frozen_adapter, inject_lora, resolve_target_modules_pattern
 from unirl.train.optim import build_lr_scheduler, build_optimizer
+from unirl.utils.distributed_utils import find_dtensor_mesh, init_gloo_group
 
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
@@ -196,7 +197,7 @@ class BaseFSDP2Backend(Remote):
     ) -> None:
         """Build EMA / optimizer / scheduler and set the shared train state."""
         self.model = model
-        self._loss_reduction_mesh = self._find_loss_reduction_mesh(model)
+        self._loss_reduction_mesh = find_dtensor_mesh(model)
 
         self.ema = None
         if shadow is not None:
@@ -413,8 +414,6 @@ class BaseFSDP2Backend(Remote):
         if self._checkpoint_async:
             # Async DCP saves require a CPU-capable process group.
             if dist.is_available() and dist.is_initialized():
-                from unirl.utils.distributed_utils import init_gloo_group
-
                 pg = init_gloo_group()
         _prepare_dcp_directory(path, meta, process_group=pg)
 
@@ -563,16 +562,6 @@ class BaseFSDP2Backend(Remote):
         self._offload_model()
         move_optimizer_state(self.optimizer, "cpu")
         torch.cuda.empty_cache()
-
-    @staticmethod
-    def _find_loss_reduction_mesh(model: nn.Module) -> Optional["DeviceMesh"]:
-        """Return the primary FSDP mesh from the model's DTensor parameters."""
-        from torch.distributed.tensor import DTensor
-
-        for param in model.parameters():
-            if isinstance(param, DTensor):
-                return param.device_mesh
-        return None
 
     def gradient_average_world_size(self) -> int:
         """Ranks in the FSDP mesh whose gradient averaging loss scaling cancels."""

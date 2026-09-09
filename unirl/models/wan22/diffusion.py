@@ -17,11 +17,11 @@ from unirl.utils.dtypes import parse_torch_dtype
 
 from .bundle import WAN22Bundle
 
-_WAN_TIMESTEP_SCALE: float = 1000.0
-
 
 class WAN22DiffusionStep(DiffusionStep[WAN22Bundle, WAN21Conditions]):
     """Per-step WAN 2.2 denoising kernel — stateless, dual-transformer routing."""
+
+    TIMESTEP_SCALE: ClassVar[float] = 1000.0  # sigma [0, 1] -> WAN timestep [0, 1000]
 
     @staticmethod
     def _select_for_sigma(
@@ -64,7 +64,7 @@ class WAN22DiffusionStep(DiffusionStep[WAN22Bundle, WAN21Conditions]):
         )
 
         batch_size = int(sample.shape[0])
-        timestep = sigma * _WAN_TIMESTEP_SCALE
+        timestep = sigma * self.TIMESTEP_SCALE
         if timestep.dim() == 0:
             timestep = timestep.expand(batch_size)
         elif int(timestep.shape[0]) != batch_size:
