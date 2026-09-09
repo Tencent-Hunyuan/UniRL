@@ -881,19 +881,29 @@ class DiffusionTrainer(BaseTrainer):
                     scored = reward.score_and_attach(generated)
                     if first_scored is None:
                         first_scored = scored
-                    rewards = scored.parts[-1].rewards
+                    part = scored.parts[-1]
+                    rewards = part.rewards
                     if rewards is not None:
                         r = hydrate(rewards).to(torch.float32)
                         if scored is first_scored:
                             # Captions read part.rewards, which remote scoring returns dehydrated.
-                            scored.parts[-1].rewards = r
+                            part.rewards = r
                         sums[name] += float(r.sum().item())
                         counts[name] += int(r.numel())
+                    components = part.component_rewards
+                    if isinstance(components, dict):
+                        for component_name, component_values in components.items():
+                            component = hydrate(component_values).to(torch.float32)
+                            metric_name = f"{name}_{str(component_name).replace('/', '_')}"
+                            sums.setdefault(metric_name, 0.0)
+                            counts.setdefault(metric_name, 0)
+                            sums[metric_name] += float(component.sum().item())
+                            counts[metric_name] += int(component.numel())
             # Outside _reward_phase: the driver-side media upload must not hold
             # the train-offload window open.
             if media_prefix and start == 0 and first_scored is not None:
                 self._log_eval_media(first_scored, step, prefix=media_prefix)
-        metrics = {name: sums[name] / max(1, counts[name]) for name, _ in scorers}
+        metrics = {name: total / max(1, counts[name]) for name, total in sums.items()}
         return metrics, sync_pending, n_prompts > 0
 
     def train(

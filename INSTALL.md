@@ -51,13 +51,18 @@ can survive.
 | `sglang` | `sglang[diffusion]`, `flash-attn-4`, torch +cu130 stack, PyAV | Running VLM/LLM examples or `sd3_sglang_*` |
 | `train` | `wandb`, `aiohttp` | Training runs (almost always wanted) |
 | `infer` | `accelerate` | HunyuanImage3 and similar models |
-| `eval` | `torchvision`, `easyocr` | OCR-based reward components |
+| `eval` | `torchvision`, `paddlepaddle`, `paddleocr`, `python-Levenshtein` | OCR-based reward components |
 | `dev` | `pytest`, `ruff`, `pre-commit` | Local development |
 | `dataset-prep` | `datasets`, `pandas`, `pyarrow`, PyAV | Cooking a dataset with a converter under [`datasets/`](datasets/README.md) |
 
 `dataset-prep` is independent of the engine extras — it carries no torch, so cooking in a
 bare venv works for every converter except `datasets/droid100/`, which needs torch as well
 (any engine extra supplies it; a plain `uv pip install torch` is enough for CPU-only prep).
+
+`eval` pulls PaddlePaddle (~180 MB), a second deep-learning framework needed only to run
+the PP-OCRv5 detection and recognition models behind
+[`unirl.reward.local.ocr`](unirl/reward/local/ocr.py). It is deliberately kept out of
+`requirements.txt` for that reason, so install it explicitly when you need OCR rewards.
 
 For development tools (lint and tests):
 

@@ -78,7 +78,7 @@ One diagram for the entire process structure:
 | ScorerActor | `reward_service/workers/actor.py` | `@ray.remote` thin shell: constructs the scorer, forwards `score()` |
 | BaseScorer | `reward_service/scorers/base.py` | The abstract contract: `score(items) -> list[dict]` + `sub_metric_names` |
 | Registry | `reward_service/scorers/registry.py` | `register(name, cls)` + optional-dep tolerance (`_try_import`) |
-| Concrete scorers | `reward_service/scorers/{clip,pickscore,imagereward,hpsv2_scorer,hpsv3_scorer,unified_reward,geneval2,geneval,ocr,wise,videoalign}.py` (+ vendored `_videoalign/`) | One module per reward; each ends with `register("name", Cls)` |
+| Concrete scorers | `reward_service/scorers/{clip,pickscore,imagereward,hpsv2_scorer,hpsv3_scorer,unified_reward,geneval2,geneval,ocr,wise,editscore,videoalign}.py` (+ vendored `_videoalign/`) | One module per reward; each ends with `register("name", Cls)` |
 
 ---
 
@@ -462,7 +462,8 @@ reward_service/
     ├── ocr.py           # ─┘
     ├── unified_reward.py# ─┐
     ├── geneval2.py      #  │ vLLM-style
-    ├── wise.py          # ─┘
+    ├── wise.py          #  │
+    ├── editscore.py     # ─┘ image-editing judge (LoRA on a VLM)
     ├── geneval.py       #  mmdet/mmcv-style (disabled by default)
     └── videoalign.py    #  T2V reward (vendored _videoalign/)
 ```
