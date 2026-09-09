@@ -15,11 +15,11 @@ adv_normalization_scope: group
 normalize_adv_by_std: true
 
 logging:
-  report_to_wandb: false
-  project_name: unirl-train-inference-parity
-  run_name: qwen3-moe-30b-a3b-fsdp-tp4
+  report_to_wandb: true
+  project_name: unirl-qwen3-moe-parity
+  run_name: qwen3-30b-a3b-tp4-bitwise-n8-r1024
   entity: null
-  tags: [experimental, train-inference-parity, qwen3-moe, fsdp, tp4]
+  tags: [experimental, qwen3-moe, bitwise, tp4, gsm8k, n8, response-1024]
 
 bundle:
   _target_: unirl.models.qwen3.bundle.Qwen3Bundle.from_config
@@ -78,6 +78,7 @@ rollout:
     _target_: unirl.rollout.engine.vllm.config.VLLMEngineConfig
     pretrained_model_ckpt_path: ${oc.env:QWEN3_MOE_PATH,/dev/shm/Qwen3-30B-A3B}
     tp_size: 4
+    request_timeout_s: 7200
     max_new_tokens: 1024
     temperature: 1.0
     top_p: 1.0
@@ -92,8 +93,8 @@ rollout:
       gpu_memory_utilization: 0.6
       disable_log_stats: true
       enforce_eager: true
-      enable_prefix_caching: false
-      enable_chunked_prefill: false
+      enable_prefix_caching: true
+      enable_chunked_prefill: true
       moe_backend: triton
       logprobs_mode: processed_logprobs
 
@@ -115,8 +116,6 @@ algorithm:
   loss_agg_mode: seq-mean-token-sum-norm
   horizon: 1024
   sampling_temperature: 1.0
-  alignment_probe: true
-  alignment_gate_only: false
   alignment_require_exact: true
   conditions_cls:
     _target_: hydra.utils.get_class
@@ -147,7 +146,7 @@ data_source:
 
 sampling:
   _target_: unirl.types.sampling.ARSamplingParams
-  samples_per_prompt: 4
+  samples_per_prompt: 8
   temperature: 1.0
   top_p: 1.0
   top_k: 0

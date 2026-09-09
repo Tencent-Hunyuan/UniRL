@@ -28,8 +28,6 @@ class GRPOConfig(BaseAlgorithmConfig):
     conditions_cls: str = ""
     clip_range: float = 1e-4
     clip_schedule: str = "constant"
-    alignment_probe: bool = False
-    alignment_gate_only: bool = False
     alignment_require_exact: bool = False
 
 
@@ -51,8 +49,6 @@ class GRPO(StageAlgorithm):
         horizon: int = 8192,
         conditions_cls: Optional[Type[Any]] = None,
         sampling_temperature: Optional[float] = None,
-        alignment_probe: bool = False,
-        alignment_gate_only: bool = False,
         alignment_require_exact: bool = False,
     ) -> None:
         super().__init__()
@@ -72,64 +68,7 @@ class GRPO(StageAlgorithm):
 
             sampling_temperature = ARSamplingParams.__dataclass_fields__["temperature"].default
         self.sampling_temperature = float(sampling_temperature)
-        self.alignment_probe = bool(alignment_probe)
-        self.alignment_gate_only = bool(alignment_gate_only)
         self.alignment_require_exact = bool(alignment_require_exact)
-
-    def prepare_segment(
-        self,
-        *,
-        conditions: Mapping[str, Condition],
-        segment: "TextSegment",
-    ) -> None:
-        """Capture full-sequence no-grad old-policy logprobs for the rollout tokens."""
-        if (
-            not self.alignment_probe
-            or segment.tokens is None
-            or segment.log_probs is None
-            or int(segment.tokens.shape[0]) == 0
-        ):
-            return
-        if segment.rollout_log_probs is None:
-            segment.rollout_log_probs = segment.log_probs.detach().cpu().clone()
-        typed_conds = typed_conditions(conditions, self.conditions_cls)
-        with torch.no_grad():
-            old_policy_replay = getattr(self.stage, "old_policy_replay", None)
-            replay = old_policy_replay if callable(old_policy_replay) else self.stage.replay
-            old_logp = replay(
-                typed_conds,
-                segment=segment,
-                temperature=self.sampling_temperature,
-            )
-        old_logp_cpu = old_logp.detach().cpu()
-        segment.old_log_probs = old_logp_cpu
-        # Backward-compatible alias for existing metrics and serialized segments.
-        segment.actor_log_probs = old_logp_cpu
-
-        rollout = segment.rollout_log_probs
-        if old_logp.shape != rollout.shape:
-            raise RuntimeError(
-                f"GRPO old-policy/rollout shape mismatch: old={tuple(old_logp.shape)} rollout={tuple(rollout.shape)}"
-            )
-        old_fp32 = old_logp.detach().float()
-        rollout_fp32 = rollout.to(device=old_logp.device).float()
-        finite = bool(torch.isfinite(old_fp32).all().item() and torch.isfinite(rollout_fp32).all().item())
-        mismatch = torch.nonzero(
-            old_fp32 != rollout_fp32,
-            as_tuple=False,
-        ).reshape(-1)
-        absdiff = rollout_replay_logp_absdiff(old_fp32, rollout_fp32)
-        k3 = rollout_replay_k3(old_fp32, rollout_fp32)
-        equal = torch.equal(old_fp32, rollout_fp32)
-        if self.alignment_require_exact and (not finite or not equal):
-            max_abs = absdiff["rollout_replay_logp_absdiff_max"]
-            raise RuntimeError(
-                "GRPO exact full-sequence old-policy alignment gate failed: "
-                f"finite={finite} mismatch_count={int(mismatch.numel())} "
-                f"first_mismatch={int(mismatch[0]) if mismatch.numel() else None} "
-                f"max_absdiff_fp32={max_abs!r} "
-                f"k3_mean={k3['k3_mean']!r} k3_max={k3['k3_max']!r}"
-            )
 
     def compute_loss_and_backward(
         self,
@@ -145,67 +84,10 @@ class GRPO(StageAlgorithm):
         if int(segment.tokens.shape[0]) == 0:
             return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
 
-        if self.alignment_gate_only:
-            cached_old_logp = segment.old_log_probs if segment.old_log_probs is not None else segment.actor_log_probs
-            if cached_old_logp is None:
-                raise RuntimeError("GRPO alignment_gate_only requires alignment_probe old-policy logprobs")
-            rollout_logp = segment.rollout_log_probs if segment.rollout_log_probs is not None else segment.log_probs
-            old_logp = cached_old_logp.to(device=rollout_logp.device).float()
-            rollout_logp = rollout_logp.float()
-            old_absdiff = rollout_replay_logp_absdiff(old_logp, rollout_logp)
-            old_k3 = rollout_replay_k3(old_logp, rollout_logp)
-            metrics = {
-                "old_rollout_logp_absdiff_mean": old_absdiff["rollout_replay_logp_absdiff_mean"],
-                "old_rollout_logp_absdiff_max": old_absdiff["rollout_replay_logp_absdiff_max"],
-                "old_rollout_k3_mean": old_k3["k3_mean"],
-                "old_rollout_k3_max": old_k3["k3_max"],
-                "k3_mean": old_k3["k3_mean"],
-                "k3_max": old_k3["k3_max"],
-                # Compatibility aliases; actor_log_probs historically meant
-                # the no-grad recomputed old-policy logprobs.
-                "actor_rollout_logp_absdiff_mean": old_absdiff["rollout_replay_logp_absdiff_mean"],
-                "actor_rollout_logp_absdiff_max": old_absdiff["rollout_replay_logp_absdiff_max"],
-                **{f"actor_rollout_{key}": value for key, value in old_k3.items()},
-            }
-            if self.alignment_require_exact and not torch.equal(
-                old_logp,
-                rollout_logp,
-            ):
-                mismatch = old_logp != rollout_logp
-                first = int(torch.nonzero(mismatch, as_tuple=False).reshape(-1)[0].item())
-                max_abs = float((old_logp - rollout_logp).abs().max().item())
-                raise RuntimeError(
-                    "GRPO exact alignment gate failed: "
-                    f"mismatch_count={int(mismatch.sum().item())} "
-                    f"first_mismatch={first} max_abs={max_abs}"
-                )
-            return AlgorithmStepResult(
-                loss=0.0,
-                metrics=metrics,
-                num_steps_or_tokens=int(old_logp.shape[0]),
-                has_backward=False,
-            )
-
-        cached_old_logp = segment.old_log_probs if segment.old_log_probs is not None else segment.actor_log_probs
-        if self.alignment_require_exact and cached_old_logp is not None:
-            rollout_reference = (
-                segment.rollout_log_probs if segment.rollout_log_probs is not None else segment.log_probs
-            ).float()
-            old_reference = cached_old_logp.to(
-                device=rollout_reference.device,
-            ).float()
-            if not torch.equal(old_reference, rollout_reference):
-                mismatch = old_reference != rollout_reference
-                first = int(torch.nonzero(mismatch, as_tuple=False).reshape(-1)[0].item())
-                max_abs = float((old_reference - rollout_reference).abs().max().item())
-                raise RuntimeError(
-                    "GRPO exact full-sequence old-policy alignment gate failed before backward: "
-                    f"mismatch_count={int(mismatch.sum().item())} "
-                    f"first_mismatch={first} max_absdiff_fp32={max_abs!r}"
-                )
-
         typed_conds = typed_conditions(conditions, self.conditions_cls)
         new_logp = self.stage.replay(typed_conds, segment=segment, temperature=self.sampling_temperature)
+        if self.alignment_require_exact and segment.rollout_log_probs is None:
+            raise RuntimeError("GRPO exact replay/rollout alignment requires rollout_log_probs")
         rollout_anchor = segment.rollout_log_probs if segment.rollout_log_probs is not None else segment.log_probs
         rollout_anchor_logp = rollout_anchor.to(
             dtype=new_logp.dtype,
@@ -214,6 +96,12 @@ class GRPO(StageAlgorithm):
         if self.alignment_require_exact:
             gradient_reference = new_logp.float()
             rollout_reference = rollout_anchor_logp.float()
+            if gradient_reference.shape != rollout_reference.shape:
+                raise RuntimeError(
+                    "GRPO exact replay/rollout shape mismatch: "
+                    f"replay={tuple(gradient_reference.shape)} "
+                    f"rollout={tuple(rollout_reference.shape)}"
+                )
             finite = bool(torch.isfinite(gradient_reference).all() and torch.isfinite(rollout_reference).all())
             equal = torch.equal(gradient_reference, rollout_reference)
             if not finite or not equal:
@@ -265,6 +153,8 @@ class GRPO(StageAlgorithm):
             **rollout_replay_logp_absdiff(new_logp, rollout_anchor_logp),
             "rollout_replay_k3_mean": gradient_k3["k3_mean"],
             "rollout_replay_k3_max": gradient_k3["k3_max"],
+            "k3_mean": gradient_k3["k3_mean"],
+            "k3_max": gradient_k3["k3_max"],
             "rollout_replay_exact_match_fp32": float(
                 torch.equal(
                     new_logp.detach().float(),
@@ -273,29 +163,6 @@ class GRPO(StageAlgorithm):
             ),
             **{k: float(v.item()) for k, v in ratio_metrics.items()},
         }
-        cached_old_logp = segment.old_log_probs if segment.old_log_probs is not None else segment.actor_log_probs
-        if cached_old_logp is not None:
-            rollout_logp = (
-                (segment.rollout_log_probs if segment.rollout_log_probs is not None else segment.log_probs)
-                .to(device=new_logp.device)
-                .float()
-            )
-            old_logp = cached_old_logp.to(device=new_logp.device).float()
-            old_absdiff = rollout_replay_logp_absdiff(old_logp, rollout_logp)
-            old_k3 = rollout_replay_k3(old_logp, rollout_logp)
-            metrics.update(
-                {
-                    "old_rollout_logp_absdiff_mean": old_absdiff["rollout_replay_logp_absdiff_mean"],
-                    "old_rollout_logp_absdiff_max": old_absdiff["rollout_replay_logp_absdiff_max"],
-                    "old_rollout_k3_mean": old_k3["k3_mean"],
-                    "old_rollout_k3_max": old_k3["k3_max"],
-                    "k3_mean": old_k3["k3_mean"],
-                    "k3_max": old_k3["k3_max"],
-                    "actor_rollout_logp_absdiff_mean": old_absdiff["rollout_replay_logp_absdiff_mean"],
-                    "actor_rollout_logp_absdiff_max": old_absdiff["rollout_replay_logp_absdiff_max"],
-                    **{f"actor_rollout_{key}": value for key, value in old_k3.items()},
-                }
-            )
         return AlgorithmStepResult(
             loss=float(loss.detach().item()),
             metrics=metrics,

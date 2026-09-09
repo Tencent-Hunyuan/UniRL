@@ -396,30 +396,7 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
         temperature: float = 1.0,
         return_values: bool = False,
     ) -> Union[torch.Tensor, ReplayResult]:
-        """Per-token log-prob replay; falls back to the dense ``[B, P_max + T_max]`` :meth:`padding_replay`."""
-        _require_value_head_for_replay(self.model.transformer, return_values)
-        return self.old_policy_replay(
-            conditions,
-            segment=segment,
-            temperature=temperature,
-            return_values=return_values,
-        )
-
-    def old_policy_replay(
-        self,
-        conditions: Qwen3ARConditions,
-        *,
-        segment: TextSegment,
-        temperature: float = 1.0,
-        return_values: bool = False,
-    ) -> Union[torch.Tensor, ReplayResult]:
-        """Score fixed response tokens with the actor's full-sequence forward topology.
-
-        This is the old-policy log-probability contract used by alignment
-        probes. The rollout comparison exercises the same packed/padded
-        teacher-forcing forward family used by the gradient-bearing actor
-        update.
-        """
+        """Score fixed response tokens with a full-sequence teacher-forcing forward."""
         _require_value_head_for_replay(self.model.transformer, return_values)
         attn_impl = getattr(getattr(self.model.transformer, "config", None), "_attn_implementation", None)
         if _packed_replay_supported(attn_impl):

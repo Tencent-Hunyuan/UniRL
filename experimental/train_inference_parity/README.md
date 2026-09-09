@@ -2,9 +2,9 @@
 
 Owner: UniRL Qwen3-MoE parity maintainers
 
-This package incubates exact rollout-versus-old-policy and
-rollout-versus-gradient-replay log-probability contracts without shipping
-monkey patches or experimental kernels in the UniRL wheel.
+This package incubates an exact rollout-versus-gradient-replay log-probability
+contract without shipping monkey patches or experimental kernels in the UniRL
+wheel.
 
 It contains only the bitwise experiment. A normal baseline uses the original
 UniRL Qwen3-MoE AR entry point and does not load this package or its plugin.
@@ -15,10 +15,9 @@ The first model profile is `Qwen3-30B-A3B`:
 
 ```text
 experimental model id: qwen3_moe_30b_a3b
-actor scoring: full prompt+response no-grad forward
+actor scoring: differentiable full prompt+response teacher-forcing forward
 comparison dtype: FP32
-required old-policy metrics: max_absdiff=0, K3 mean/max=0, torch.equal=true
-required gradient-replay metrics: max_absdiff=0, K3 mean/max=0, torch.equal=true
+required metrics: max_absdiff=0, K3 mean/max=0, torch.equal=true
 ```
 
 The supported topology is an FSDP actor world of four with one vLLM TP4
@@ -49,13 +48,6 @@ python -m experimental.train_inference_parity.run \
   --config-name=qwen3_moe_30b_a3b_fsdp_tp4
 ```
 
-Hydra overrides can enable scheduler features:
-
-```bash
-rollout.config.engine_kwargs.enable_chunked_prefill=true
-rollout.config.engine_kwargs.enable_prefix_caching=true
-```
-
 ## Profiles
 
 `public_reference` is the default:
@@ -82,7 +74,7 @@ rollout.config.engine_kwargs.enable_prefix_caching=true
 
 The PASS row was run from this experimental package with
 `VLLM_PLUGINS=unirl_train_inference_parity` and no external UniMatch plugin.
-Both no-grad old-policy replay and gradient-bearing replay reported:
+The gradient-bearing replay reported:
 
 ```text
 token_count=4096
