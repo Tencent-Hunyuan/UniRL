@@ -23,9 +23,6 @@ class WAN21DiffusionStep(DiffusionStep[WAN21Bundle, WAN21Conditions]):
 
     TIMESTEP_SCALE: ClassVar[float] = 1000.0  # sigma [0, 1] -> WAN timestep [0, 1000]
 
-    # Public model contract shared with rollout adapters.
-    TIMESTEP_SCALE: ClassVar[float] = 1000.0
-
     def predict_noise(
         self,
         model: WAN21Bundle,
