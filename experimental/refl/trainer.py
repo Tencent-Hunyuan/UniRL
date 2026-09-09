@@ -14,7 +14,7 @@ from unirl.distributed.group.placement import placement
 from unirl.distributed.tensor.grad_context import enable_grad
 from unirl.trainer.base import BaseTrainer, build_sampling_dict
 from unirl.trainer.hydra import remote_hydra
-from unirl.types.primitives import Images, Texts
+from unirl.types.primitives import Images, ImageSets, Texts, require_single_images
 from unirl.types.sample import Sample
 from unirl.types.sampling import DiffusionSamplingParams, total_samples_per_prompt
 
@@ -36,9 +36,11 @@ def _image_inputs(inputs: Sample, *, text_count: int) -> Optional[Images]:
         if "image" not in part.primitives:
             continue
         image = part.primitives["image"]
-        if not isinstance(image, Images):
-            raise TypeError(f"REFL I2V condition at part {part_index} requires Images, got {type(image).__name__}.")
-        image_inputs.append(image)
+        if not isinstance(image, (Images, ImageSets)):
+            raise TypeError(
+                f"REFL I2V condition at part {part_index} requires Images or ImageSets, got {type(image).__name__}."
+            )
+        image_inputs.append(require_single_images(image, context=f"REFL I2V condition at part {part_index}"))
 
     if not image_inputs:
         return None
