@@ -11,16 +11,23 @@ inference solver without integer-timestep loss.*
 
 ## The pin
 
-The integration targets
-**`Zcchill/FastVideo@7fe1d7db9a0b8aebb46679e7924f597431f23665`** (a snapshot of
-hao-ai-lab/FastVideo PR #1222, the Wan2.1 RL pipeline), injected via
-`cfg.fastvideo_path` / `$FASTVIDEO_PATH` — there is no pip pin. `_unipc.py`
-therefore fingerprints the patched surface at patch-install time (engine init
-and every spawned worker): the parameter lists of
-`FlowUniPCMultistepScheduler.set_timesteps` and `sde_step_with_logprob`, the
-`WorkerMultiprocProc.worker_main` entrypoint, and (engine side) the
-`ForwardBatch.RLData` fields. It also fingerprints the seams the weight and
-offload patches install onto — `MultiprocExecutor.collective_rpc`,
+The integration targets the **unmodified upstream**
+**`hao-ai-lab/FastVideo@2095477eac7e289c7a7ab13acb367ca60687c304`** (PR #1222's
+source snapshot), injected via `cfg.fastvideo_path` / `$FASTVIDEO_PATH` — there
+is no pip pin. Upstream ships none of the RL surface this engine needs, so
+UniRL owns it: `_contracts.py` adds the `RLData.sde_step_indices` / `sde_type`
+fields and the `eta` / `sde_type` parameters on `sde_step_with_logprob` (whose
+stock transition uses a different diffusion law than UniRL's Dance/Flow
+kernels), `_conditions.py` restores the `rl_data` / trajectory / prompt
+embeddings that upstream's `MultiprocExecutor.execute_forward` drops when it
+rebuilds its response batch, and `_weights.py` adds the full-weight update API
+upstream does not expose at all.
+
+`_unipc.py` fingerprints the surface at patch-install time (engine init and
+every spawned worker), taking the **stock** signatures before any UniRL patch
+rewrites them: `sde_step_with_logprob`'s stock parameter list plus the
+`DenoisingStage.forward` source markers, `FlowUniPCMultistepScheduler.set_timesteps`,
+`MultiprocExecutor.collective_rpc` / `execute_forward`, `Worker.execute_forward`,
 `ModuleHookManager.get_from` / `get_forward_hook`,
 `LayerwiseOffloadHook.mutate_params_scope`,
 `fsdp_load.load_model_from_full_model_state_dict`, and
