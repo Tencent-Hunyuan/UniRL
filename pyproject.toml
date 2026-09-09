@@ -93,7 +93,8 @@ vllm = [
 # Exact upstream source snapshot that the fail-closed FastVideo patch package is
 # verified against. This is hao-ai-lab/FastVideo PR #1222's source commit, not
 # Zcchill/FastVideo's UniRL-modified fork; UniRL re-hosts the required RL
-# contracts under unirl/rollout/engine/fastvideo/_patches.
+# contracts under unirl/rollout/engine/fastvideo/_contracts.py, _conditions.py
+# and _weights.py.
 fastvideo = [
   "fastvideo @ git+https://github.com/hao-ai-lab/FastVideo.git@2095477eac7e289c7a7ab13acb367ca60687c304 ; sys_platform == 'linux'",
 ]
