@@ -30,6 +30,7 @@ class VLLMOmniEngineConfig(BaseEngineConfig):
     modality: str = "hi3_t2i"
 
     enable_sleep_mode: bool = True
+    diffusion_attention_backend: Optional[str] = None
 
     stage_yaml_override: Optional[str] = None
 
@@ -67,6 +68,7 @@ class VLLMOmniEngineConfig(BaseEngineConfig):
         intent: Dict[str, Any] = {
             "model_path": str(self.model_path),
             "enable_sleep_mode": bool(self.enable_sleep_mode),
+            "diffusion_attention_backend": self.diffusion_attention_backend,
             "ports": ports,
         }
         intent.update(extra)

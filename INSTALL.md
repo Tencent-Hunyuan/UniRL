@@ -19,6 +19,12 @@ uv venv --python 3.12 --seed .venv && source .venv/bin/activate
 uv pip install -e ".[vllm,train,infer]" --prerelease=allow
 ```
 
+To use a FlashAttention backend for diffusion training or rollout:
+
+```bash
+MAX_JOBS=8 uv pip install -e ".[flash-attn]" --no-build-isolation
+```
+
 ## sglang
 
 ```bash
@@ -48,6 +54,7 @@ can survive.
 | Extra | Adds | Use when |
 |---|---|---|
 | `vllm` | `vllm`, `vllm-omni`, torch +cu130 stack, PyAV | Running any vllm-omni-based example |
+| `flash-attn` | FlashAttention 2 | Selecting a FlashAttention backend for diffusion training or rollout |
 | `sglang` | `sglang[diffusion]`, `flash-attn-4`, torch +cu130 stack, PyAV | Running VLM/LLM examples or `sd3_sglang_*` |
 | `train` | `wandb`, `aiohttp` | Training runs (almost always wanted) |
 | `infer` | `accelerate` | HunyuanImage3 and similar models |

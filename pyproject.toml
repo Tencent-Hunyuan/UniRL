@@ -90,6 +90,9 @@ vllm = [
   # torchaudio >=2.12 on the cu130 index, so this extra does not pin it.
   "av>=14.2,<19 ; sys_platform == 'linux'",
 ]
+flash-attn = [
+  "flash-attn>=2.6.3 ; sys_platform == 'linux'",
+]
 train = [
   "wandb>=0.16,<0.20",
   "aiohttp>=3.9",
