@@ -1,210 +1,22 @@
-"""FastVideo adapter routing deterministic non-SDE steps through UniPC; integration contract in README.md."""
+"""Route FastVideo's deterministic non-SDE steps through UniRL's canonical UniPC; contract in README.md."""
 
 from __future__ import annotations
 
-import dataclasses
 import functools
-import importlib
-import inspect
-import os
 from dataclasses import dataclass, field
 from typing import Any, Optional, Tuple
 
 import numpy as np
 import torch
 
-from unirl.rollout.engine.sigma_verify import verify_engine_used_sigmas
+from unirl.rollout.engine.fastvideo._patches.compat import (
+    SDE_STEP_PARAMS,
+    SET_TIMESTEPS_PARAMS,
+    import_fastvideo_module,
+    require_attr,
+    require_signature,
+)
 from unirl.sde.unipc import UniPCSpec, UniPCStrategy
-
-# The exact upstream surface these patches target; drift fails closed at patch time (README: pin).
-_PINNED_FORK = "hao-ai-lab/FastVideo@2095477eac7e289c7a7ab13acb367ca60687c304"
-
-_SET_TIMESTEPS_PARAMS = (
-    "self",
-    "num_inference_steps",
-    "device",
-    "sigmas",
-    "mu",
-    "shift",
-    "use_karras_sigmas",
-    "use_kerras_sigma",
-)
-# Stock upstream stops at ``return_dt_and_std_dev_t``; ``eta``/``sde_type`` are appended by
-# ``_contracts.patch_transition``, which must therefore run before this fingerprint is taken.
-_SDE_STEP_PARAMS = (
-    "scheduler",
-    "model_output",
-    "timestep",
-    "sample",
-    "prev_sample",
-    "generator",
-    "deterministic",
-    "return_pixel_log_prob",
-    "return_dt_and_std_dev_t",
-    "eta",
-    "sde_type",
-)
-_STOCK_SDE_STEP_PARAMS = _SDE_STEP_PARAMS[:-2]
-_COLLECTIVE_RPC_PARAMS = ("self", "method", "timeout", "args", "kwargs")
-_EXECUTE_FORWARD_PARAMS = ("self", "forward_batch", "fastvideo_args")
-_LOAD_STATE_DICT_PARAMS = (
-    "model",
-    "full_sd_iterator",
-    "device",
-    "param_dtype",
-    "strict",
-    "cpu_offload",
-    "param_names_mapping",
-    "training_mode",
-)
-_LOAD_MODULE_PARAMS = ("module_name", "component_model_path", "transformers_or_diffusers", "fastvideo_args")
-_RL_DATA_FIELDS = frozenset(
-    {
-        "enabled",
-        "collect_log_probs",
-        "store_trajectory",
-        "keep_trajectory_on_cpu",
-        "sde_step_indices",
-        "sde_type",
-        "log_probs",
-        "trajectory_latents",
-        "trajectory_timesteps",
-    }
-)
-
-
-def _import_fastvideo_module(module_name: str, what: str) -> Any:
-    """Import a fastvideo module, distinguishing a missing integration surface from unrelated import errors."""
-    try:
-        return importlib.import_module(module_name)
-    except ModuleNotFoundError as exc:
-        if exc.name is not None and not module_name.startswith(f"{exc.name}.") and exc.name != module_name:
-            raise
-        raise RuntimeError(f"FastVideo UniPC integration requires {what} (pinned surface: {_PINNED_FORK})") from exc
-
-
-def _require_attr(owner: Any, name: str, what: str) -> Any:
-    """Fetch ``owner.name`` or fail closed naming the pinned integration surface."""
-    value = getattr(owner, name, None)
-    if value is None:
-        raise RuntimeError(f"FastVideo UniPC integration requires {what} (pinned surface: {_PINNED_FORK})")
-    return value
-
-
-def _require_signature(fn: Any, expected: Tuple[str, ...], what: str) -> None:
-    """Fingerprint a patched callable's parameter list so fork drift fails at patch time, not mid-rollout."""
-    actual = tuple(inspect.signature(fn).parameters)
-    if actual != expected:
-        raise RuntimeError(
-            f"FastVideo {what} drifted from the pinned integration surface ({_PINNED_FORK}): "
-            f"expected parameters {expected}, got {actual}"
-        )
-
-
-def _verify_rl_data_surface() -> None:
-    """Fail closed unless ``ForwardBatch.RLData`` carries every field the engine-side integration relies on."""
-    module = _import_fastvideo_module("fastvideo.pipelines.pipeline_batch_info", "ForwardBatch.RLData")
-    forward_batch = _require_attr(module, "ForwardBatch", "ForwardBatch.RLData")
-    rl_data = _require_attr(forward_batch, "RLData", "ForwardBatch.RLData")
-    names = {f.name for f in dataclasses.fields(rl_data)}
-    missing = sorted(_RL_DATA_FIELDS - names)
-    if missing:
-        raise RuntimeError(
-            f"FastVideo ForwardBatch.RLData lacks fields {missing} required by the UniPC "
-            f"integration (pinned surface: {_PINNED_FORK}); _contracts.patch_contracts must run first"
-        )
-
-
-def _verify_stock_surface() -> None:
-    """Fingerprint the untouched upstream seams before any UniRL patch rewrites them."""
-    denoising = _import_fastvideo_module(
-        "fastvideo.pipelines.stages.denoising", "pipelines.stages.denoising.sde_step_with_logprob"
-    )
-    original = _require_attr(denoising, "sde_step_with_logprob", "sde_step_with_logprob")
-    if getattr(original, "_unirl_fastvideo_sde", False):
-        return
-    _require_signature(original, _STOCK_SDE_STEP_PARAMS, "stock sde_step_with_logprob")
-    stage = _require_attr(denoising, "DenoisingStage", "DenoisingStage")
-    forward = _require_attr(stage, "forward", "DenoisingStage.forward")
-    try:
-        source = inspect.getsource(forward)
-    except (OSError, TypeError) as exc:
-        raise RuntimeError(f"cannot inspect FastVideo DenoisingStage.forward: {exc}") from exc
-    for marker in ("rl_data", "sde_step_with_logprob", "scheduler.step"):
-        if marker not in source:
-            raise RuntimeError(
-                f"FastVideo DenoisingStage.forward lacks required source marker {marker!r} "
-                f"(pinned surface: {_PINNED_FORK})"
-            )
-
-
-def _verify_weight_surface() -> None:
-    """Fail closed unless the worker/executor/generator seams the weight patch installs onto still exist."""
-    worker = _require_attr(_import_fastvideo_module("fastvideo.worker.gpu_worker", "Worker"), "Worker", "Worker")
-    _require_attr(worker, "execute_forward", "Worker.execute_forward")
-    executor = _require_attr(
-        _import_fastvideo_module("fastvideo.worker.multiproc_executor", "MultiprocExecutor"),
-        "MultiprocExecutor",
-        "MultiprocExecutor",
-    )
-    _require_signature(
-        _require_attr(executor, "collective_rpc", "MultiprocExecutor.collective_rpc"),
-        _COLLECTIVE_RPC_PARAMS,
-        "MultiprocExecutor.collective_rpc",
-    )
-    hooks = _import_fastvideo_module("fastvideo.hooks.hooks", "ModuleHookManager")
-    manager = _require_attr(hooks, "ModuleHookManager", "ModuleHookManager")
-    for name in ("get_from", "get_forward_hook"):
-        _require_attr(manager, name, f"ModuleHookManager.{name}")
-    offload = _import_fastvideo_module("fastvideo.hooks.layerwise_offload", "LayerwiseOffloadHook")
-    _require_attr(
-        _require_attr(offload, "LayerwiseOffloadHook", "LayerwiseOffloadHook"),
-        "mutate_params_scope",
-        "LayerwiseOffloadHook.mutate_params_scope",
-    )
-    # The response patch owns these seams; upstream's execute_forward rebuilds a bare
-    # ForwardBatch that drops rl_data, the trajectory, and the prompt embeddings.
-    _require_signature(
-        _require_attr(executor, "execute_forward", "MultiprocExecutor.execute_forward"),
-        _EXECUTE_FORWARD_PARAMS,
-        "MultiprocExecutor.execute_forward",
-    )
-    worker_proc = _require_attr(
-        _import_fastvideo_module("fastvideo.worker.multiproc_executor", "WorkerMultiprocProc"),
-        "WorkerMultiprocProc",
-        "WorkerMultiprocProc",
-    )
-    _require_attr(worker_proc, "__init__", "WorkerMultiprocProc.__init__")
-    _require_attr(worker, "execute_forward", "Worker.execute_forward")
-
-
-def _verify_offload_surface() -> None:
-    """Fail closed unless the loader seams the offload patch wraps keep their patched-for signatures."""
-    fsdp_load = _import_fastvideo_module("fastvideo.models.loader.fsdp_load", "fsdp_load")
-    state_load = _require_attr(
-        fsdp_load, "load_model_from_full_model_state_dict", "load_model_from_full_model_state_dict"
-    )
-    # The patch reads ``cpu_offload`` out of **kwargs; a positional call would silently no-op.
-    _require_signature(state_load, _LOAD_STATE_DICT_PARAMS, "load_model_from_full_model_state_dict")
-    loader = _import_fastvideo_module("fastvideo.models.loader.component_loader", "PipelineComponentLoader")
-    _require_signature(
-        _require_attr(
-            _require_attr(loader, "PipelineComponentLoader", "PipelineComponentLoader"),
-            "load_module",
-            "PipelineComponentLoader.load_module",
-        ),
-        _LOAD_MODULE_PARAMS,
-        "PipelineComponentLoader.load_module",
-    )
-
-
-def _require_float_wan_timesteps() -> None:
-    """Reject FastVideo's post-scheduler integer cast, which its echo cannot expose."""
-    if os.getenv("DIFFUSIONRL_FASTVIDEO_DANCEGRPO_TIMESTEP_LONG", "0").strip().lower() in ("1", "true", "yes"):
-        raise RuntimeError(
-            "FastVideo canonical UniPC requires floating WAN timesteps; "
-            "unset DIFFUSIONRL_FASTVIDEO_DANCEGRPO_TIMESTEP_LONG"
-        )
 
 
 def _scheduler_timestep_scale(scheduler: Any) -> float:
@@ -261,15 +73,15 @@ def _strategy_from_plan(scheduler: Any, plan: FastVideoUniPCPlan) -> UniPCStrate
 
 def _patch_scheduler_set_timesteps() -> None:
     """Wrap ``FlowUniPCMultistepScheduler.set_timesteps`` to consume canonical sigmas verbatim with float timesteps."""
-    module = _import_fastvideo_module(
+    module = import_fastvideo_module(
         "fastvideo.models.schedulers.scheduling_flow_unipc_multistep", "FlowUniPCMultistepScheduler"
     )
-    FlowUniPCMultistepScheduler = _require_attr(module, "FlowUniPCMultistepScheduler", "FlowUniPCMultistepScheduler")
+    FlowUniPCMultistepScheduler = require_attr(module, "FlowUniPCMultistepScheduler", "FlowUniPCMultistepScheduler")
 
     original = FlowUniPCMultistepScheduler.set_timesteps
     if getattr(original, "_unirl_canonical_sigmas", False):
         return
-    _require_signature(original, _SET_TIMESTEPS_PARAMS, "FlowUniPCMultistepScheduler.set_timesteps")
+    require_signature(original, SET_TIMESTEPS_PARAMS, "FlowUniPCMultistepScheduler.set_timesteps")
 
     @functools.wraps(original)
     def set_timesteps(
@@ -364,13 +176,13 @@ def _single_step_index(scheduler: Any, timestep: Any) -> int:
 
 def _patch_denoising_step() -> None:
     """Wrap ``sde_step_with_logprob`` to dispatch plan indices to SDE kernels and all other indices to UniPC."""
-    denoising = _import_fastvideo_module(
+    denoising = import_fastvideo_module(
         "fastvideo.pipelines.stages.denoising", "pipelines.stages.denoising.sde_step_with_logprob"
     )
-    original = _require_attr(denoising, "sde_step_with_logprob", "pipelines.stages.denoising.sde_step_with_logprob")
+    original = require_attr(denoising, "sde_step_with_logprob", "pipelines.stages.denoising.sde_step_with_logprob")
     if getattr(original, "_unirl_unipc_dispatch", False):
         return
-    _require_signature(original, _SDE_STEP_PARAMS, "sde_step_with_logprob")
+    require_signature(original, SDE_STEP_PARAMS, "sde_step_with_logprob")
 
     @functools.wraps(original)
     def sde_step_with_logprob(
@@ -473,77 +285,10 @@ def _patch_denoising_step() -> None:
     denoising.sde_step_with_logprob = sde_step_with_logprob
 
 
-def _patch_worker_runtime() -> None:
-    _require_float_wan_timesteps()
-    _verify_stock_surface()
-    from unirl.rollout.engine.fastvideo._conditions import patch_conditions
-    from unirl.rollout.engine.fastvideo._contracts import patch_contracts, patch_transition
-    from unirl.rollout.engine.fastvideo._offload import patch_offload
-    from unirl.rollout.engine.fastvideo._weights import patch_weights
-
-    # Contract and transition first: they add the RLData fields and the eta/sde_type
-    # parameters that the UniPC fingerprints and dispatch below rely on.
-    patch_contracts()
-    patch_transition()
-    _verify_rl_data_surface()
+def patch_unipc() -> None:
+    """Pin the scheduler to canonical sigmas, then dispatch non-SDE step indices to UniPC."""
     _patch_scheduler_set_timesteps()
     _patch_denoising_step()
-    patch_conditions()
-    patch_offload()
-    patch_weights()
 
 
-def _worker_main_with_unipc(*args, **kwargs):
-    """Spawn-safe FastVideo worker entrypoint that installs runtime patches."""
-    _patch_worker_runtime()
-    from fastvideo.worker.multiproc_executor import WorkerMultiprocProc
-
-    original = getattr(WorkerMultiprocProc, "_unirl_original_worker_main", WorkerMultiprocProc.worker_main)
-    if original is _worker_main_with_unipc:
-        raise RuntimeError("FastVideo worker entrypoint patch lost the original worker_main")
-    return original(*args, **kwargs)
-
-
-def _patch_worker_entrypoint() -> None:
-    module = _import_fastvideo_module("fastvideo.worker.multiproc_executor", "MultiprocExecutor workers")
-    WorkerMultiprocProc = _require_attr(module, "WorkerMultiprocProc", "MultiprocExecutor workers")
-
-    current = WorkerMultiprocProc.worker_main
-    if current is _worker_main_with_unipc:
-        return
-    WorkerMultiprocProc._unirl_original_worker_main = current
-    WorkerMultiprocProc.worker_main = staticmethod(_worker_main_with_unipc)
-
-
-def patch_fastvideo_unipc() -> None:
-    """Install idempotent parent, worker-entrypoint, and runtime patches after fingerprinting the fork surface."""
-    _verify_weight_surface()
-    _verify_offload_surface()
-    _patch_worker_runtime()
-    _patch_worker_entrypoint()
-
-
-def verify_fastvideo_used_sigmas(
-    actual: Any,
-    *,
-    expected: torch.Tensor,
-    sample_index: int,
-) -> None:
-    """Verify FastVideo's echoed timesteps against the canonical sigma schedule."""
-    actual_with_terminal = actual
-    if actual is not None:
-        actual_t = actual.detach().cpu() if torch.is_tensor(actual) else torch.as_tensor(actual)
-        if actual_t.ndim == 1 and int(actual_t.shape[0]) == int(expected.shape[0]) - 1:
-            actual_with_terminal = torch.cat([actual_t, torch.zeros(1, dtype=actual_t.dtype)])
-    verify_engine_used_sigmas(
-        actual_with_terminal,
-        expected=expected,
-        engine_name=f"fastvideo sample {sample_index}",
-    )
-
-
-__all__ = [
-    "FastVideoUniPCPlan",
-    "patch_fastvideo_unipc",
-    "verify_fastvideo_used_sigmas",
-]
+__all__ = ["FastVideoUniPCPlan", "patch_unipc"]

@@ -15,15 +15,17 @@ The integration targets the **unmodified upstream**
 **`hao-ai-lab/FastVideo@2095477eac7e289c7a7ab13acb367ca60687c304`** (PR #1222's
 source snapshot), injected via `cfg.fastvideo_path` / `$FASTVIDEO_PATH` — there
 is no pip pin. Upstream ships none of the RL surface this engine needs, so
-UniRL owns it: `_contracts.py` adds the `RLData.sde_step_indices` / `sde_type`
-fields and the `eta` / `sde_type` parameters on `sde_step_with_logprob` (whose
-stock transition uses a different diffusion law than UniRL's Dance/Flow
-kernels), `_conditions.py` restores the `rl_data` / trajectory / prompt
+UniRL owns it under `_patches/`: `contracts.py` adds the
+`RLData.sde_step_indices` / `sde_type` fields, `denoising.py` adds the `eta` /
+`sde_type` parameters on `sde_step_with_logprob` and the transition itself
+(whose stock version uses a different diffusion law than UniRL's Dance/Flow
+kernels), `conditions.py` restores the `rl_data` / trajectory / prompt
 embeddings that upstream's `MultiprocExecutor.execute_forward` drops when it
-rebuilds its response batch, and `_weights.py` adds the full-weight update API
-upstream does not expose at all.
+rebuilds its response batch, and `weights.py` adds the full-weight update API
+upstream does not expose at all. `hijack.py` installs them in that order and
+`multiproc.py` re-installs them in every spawned worker.
 
-`_unipc.py` fingerprints the surface at patch-install time (engine init and
+`compat.py` fingerprints the surface at patch-install time (engine init and
 every spawned worker), taking the **stock** signatures before any UniRL patch
 rewrites them: `sde_step_with_logprob`'s stock parameter list plus the
 `DenoisingStage.forward` source markers, `FlowUniPCMultistepScheduler.set_timesteps`,
@@ -105,7 +107,7 @@ monkey-patch doctrine), then update the fingerprints together with the patch.
   that ever changes.
 - **Loading two 14B experts needs the offload patch.** Upstream stages a whole
   DiT on GPU before attaching the layerwise hooks, which transiently exceeds the
-  device. `_offload.py` materializes those modules on CPU, then moves only the
+  device. `_patches/offload.py` materializes those modules on CPU, then moves only the
   stem/head parameters the hooks left real. It reads `cpu_offload` out of
   `**kwargs`, which is why that signature is fingerprinted.
 

@@ -1,11 +1,11 @@
-"""Extend FastVideo's RL contract and transition math to UniRL's kernels; contract in README.md."""
+"""UniRL-owned Flow/Dance transition math for FastVideo RL rollouts; stock upstream uses a third law (README)."""
 
 from __future__ import annotations
 
 import functools
 import math
 from contextvars import ContextVar
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
@@ -19,34 +19,6 @@ class _TransitionContext:
 
     eta: float
     sde_type: Any
-
-
-def patch_contracts() -> None:
-    """Add UniRL's resolved SDE-window fields to ``ForwardBatch.RLData`` idempotently."""
-    from fastvideo.pipelines.pipeline_batch_info import ForwardBatch
-
-    original = ForwardBatch.RLData
-    existing = {field.name for field in fields(original)}
-    if {"sde_step_indices", "sde_type"} <= existing:
-        original._unirl_fastvideo_contract = True
-        return
-
-    missing_base = {"enabled", "collect_log_probs", "store_trajectory", "keep_trajectory_on_cpu"} - existing
-    if missing_base:
-        raise RuntimeError(f"FastVideo RLData is incompatible; missing base fields {sorted(missing_base)}")
-
-    @dataclass
-    class UniRLFastVideoRLData(original):  # type: ignore[valid-type,misc]
-        """Stock FastVideo RLData plus UniRL's resolved transition contract."""
-
-        sde_step_indices: Optional[list[int]] = None
-        sde_type: Any = "dance"
-
-    UniRLFastVideoRLData.__name__ = "RLData"
-    UniRLFastVideoRLData.__qualname__ = "ForwardBatch.RLData"
-    UniRLFastVideoRLData.__module__ = original.__module__
-    UniRLFastVideoRLData._unirl_fastvideo_contract = True
-    ForwardBatch.RLData = UniRLFastVideoRLData
 
 
 def _unirl_std_dev_t(sde_type: str, sigma: torch.Tensor, eta: float, sigma_max: float = 0.99) -> torch.Tensor:
@@ -131,7 +103,7 @@ def _sde_step_with_logprob(
 _sde_step_with_logprob._unirl_fastvideo_sde = True  # type: ignore[attr-defined]
 
 
-def patch_transition() -> None:
+def patch_denoising() -> None:
     """Install UniRL's transition kernel and pass request-local eta/sde_type into the stock loop."""
     from fastvideo.pipelines.stages import denoising
 
@@ -165,4 +137,4 @@ def patch_transition() -> None:
     denoising.DenoisingStage.forward = forward
 
 
-__all__ = ["patch_contracts", "patch_transition"]
+__all__ = ["patch_denoising"]

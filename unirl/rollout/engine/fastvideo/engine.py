@@ -16,12 +16,9 @@ import torch
 from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.rollout.engine.base import BaseRolloutEngine
-from unirl.rollout.engine.fastvideo._unipc import (
-    FastVideoUniPCPlan,
-    patch_fastvideo_unipc,
-    verify_fastvideo_used_sigmas,
-)
+from unirl.rollout.engine.fastvideo._patches import FastVideoUniPCPlan, patch_fastvideo
 from unirl.rollout.engine.fastvideo.config import FastVideoEngineConfig, FastVideoPorts
+from unirl.rollout.engine.sigma_verify import verify_engine_used_sigmas
 from unirl.sde.noise import _derive_group_seed
 from unirl.sde.runtime import FlowMatchSchedulePolicy, ensure_sample_sigmas
 from unirl.sde.unipc import UniPCSpec
@@ -139,6 +136,25 @@ def _resolve_sde_window(raw_indices: Any, num_steps: int) -> List[int]:
     return selected
 
 
+def verify_fastvideo_used_sigmas(
+    actual: Any,
+    *,
+    expected: torch.Tensor,
+    sample_index: int,
+) -> None:
+    """Verify FastVideo's echoed timesteps against the canonical sigma schedule."""
+    actual_with_terminal = actual
+    if actual is not None:
+        actual_t = actual.detach().cpu() if torch.is_tensor(actual) else torch.as_tensor(actual)
+        if actual_t.ndim == 1 and int(actual_t.shape[0]) == int(expected.shape[0]) - 1:
+            actual_with_terminal = torch.cat([actual_t, torch.zeros(1, dtype=actual_t.dtype)])
+    verify_engine_used_sigmas(
+        actual_with_terminal,
+        expected=expected,
+        engine_name=f"fastvideo sample {sample_index}",
+    )
+
+
 class FastVideoRolloutEngine(BaseRolloutEngine):
     """Rollout engine backed by FastVideo ``VideoGenerator`` (RL fork, PR #1222)."""
 
@@ -224,7 +240,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
             timestep_scale=self._timestep_scale,
         )
         _verify_checkpoint_unipc_spec(model_config.pretrained_model_ckpt_path, self._unipc_spec)
-        patch_fastvideo_unipc()
+        patch_fastvideo()
         self._build_generator()
 
         self.schedule_policy = FlowMatchSchedulePolicy.from_pretrained(
