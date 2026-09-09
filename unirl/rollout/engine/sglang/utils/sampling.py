@@ -44,7 +44,7 @@ def derive_sampling_seed(base_seed: int, sample_id: str) -> int:
     return int.from_bytes(digest, byteorder="big", signed=False) & _MAX_SGLANG_SAMPLING_SEED
 
 
-def _deterministic_inference_enabled(engine_kwargs: Dict[str, Any]) -> bool:
+def deterministic_inference_enabled(engine_kwargs: Dict[str, Any]) -> bool:
     """Match the two SGLang server routes that enable deterministic inference."""
     return (
         engine_kwargs.get("enable_deterministic_inference") is True
@@ -63,18 +63,16 @@ def resolve_sampling(config: Any, sample: Sample) -> ResolvedSampling:
     fanout = (len(gen_part.sample_ids) // n_parent) if n_parent else 1
 
     engine_kwargs = getattr(config, "engine_kwargs", None) or {}
-    deterministic = _deterministic_inference_enabled(engine_kwargs)
+    deterministic = deterministic_inference_enabled(engine_kwargs)
     configured_seed = _validated_base_seed(ar.seed) if ar is not None and ar.seed is not None else None
     if configured_seed is not None and not deterministic:
         raise ValueError(
             "sampling.seed requires deterministic SGLang inference via "
             "engine_kwargs.enable_deterministic_inference=true or engine_kwargs.rl_on_policy_target"
         )
-    # SGLang defaults every deterministic request to seed 42. Derive distinct
-    # child seeds here so parallel-sampling fan-out cannot clone one trajectory.
     base_seed = configured_seed
     if base_seed is None and deterministic:
-        base_seed = _DEFAULT_SGLANG_SAMPLING_SEED
+        base_seed = _DEFAULT_SGLANG_SAMPLING_SEED  # SGLang's own deterministic default; see rollout/engine README
     n = 1 if base_seed is not None else fanout
 
     raw_top_k = ar.top_k if ar is not None else config.top_k
@@ -99,4 +97,4 @@ def resolve_sampling(config: Any, sample: Sample) -> ResolvedSampling:
     )
 
 
-__all__ = ["ResolvedSampling", "derive_sampling_seed", "resolve_sampling"]
+__all__ = ["ResolvedSampling", "derive_sampling_seed", "deterministic_inference_enabled", "resolve_sampling"]

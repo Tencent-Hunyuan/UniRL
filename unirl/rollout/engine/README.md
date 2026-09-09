@@ -66,3 +66,10 @@ handler in `../../distributed/weight_sync`.
   multiprocessing authkey. TP>1 cannot broadcast its one-shot file descriptors, so
   `sglang/backends/http.py` sends inlined base64 pickle bytes instead. Re-check the
   `SafeUnpickler` allowlist and broadcast semantics on a SGLang bump.
+- **`rl_on_policy_target` silently switches on deterministic sampling.** SGLang
+  0.5.12.post1 derives `enable_deterministic_inference` from it, and every request
+  that carries no `sampling_seed` then defaults to seed 42 — so one `n=8` request
+  comes back as eight token-identical completions. The adapters therefore send
+  deterministic fan-out as `n=1` requests each carrying one derived
+  `sampling_seed`. Re-check both halves on a SGLang bump: dropping either one
+  restores the clone, silently.
