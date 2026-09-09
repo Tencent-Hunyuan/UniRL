@@ -21,6 +21,19 @@ logger = logging.getLogger(__name__)
 _ENGINE_PROC_PREFIX = "VLLM::"
 
 
+@contextmanager
+def _preserve_cudnn_sdp_state():
+    """Restore the process-wide cuDNN SDPA setting after vLLM imports."""
+    import torch
+
+    enabled = torch.backends.cuda.cudnn_sdp_enabled() if torch.cuda.is_available() else None
+    try:
+        yield
+    finally:
+        if enabled is not None:
+            torch.backends.cuda.enable_cudnn_sdp(enabled)
+
+
 def _import_omni_runtime() -> Dict[str, Any]:
     """Lazy import of the vllm-omni runtime types. Imported once per process."""
     from transformers import AutoTokenizer
@@ -117,10 +130,6 @@ class VLLMOmniBackend:
     @classmethod
     def boot(cls, intent: Dict[str, Any]) -> "VLLMOmniBackend":
         """Spell the intent into ``Omni`` ctor kwargs and spawn."""
-        from unirl.rollout.engine.vllm_omni.patches import install as install_patches
-
-        install_patches()
-
         import multiprocessing as mp
 
         try:
@@ -128,7 +137,13 @@ class VLLMOmniBackend:
         except RuntimeError:
             pass
 
-        rt = _import_omni_runtime()
+        # vLLM disables cuDNN SDPA process-wide at import. Preserve the
+        # colocated train actor's state; spawned workers initialize their own.
+        with _preserve_cudnn_sdp_state():
+            from unirl.rollout.engine.vllm_omni.patches import install as install_patches
+
+            install_patches()
+            rt = _import_omni_runtime()
 
         if intent.get("clear_cuda_visible"):
             os.environ.pop("CUDA_VISIBLE_DEVICES", None)
