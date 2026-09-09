@@ -1,21 +1,4 @@
-"""REPLACE ``SchedulerRLMixin.flow_sde_sampling`` to add the DanceGRPO objective.
-
-Stock upstream sglang supports only ``sde``/``cps``/``ode``; UniRL's
-primary objective for FLUX.2-Klein is ``dance`` (DanceGRPO). ``dance`` is
-FlowGRPO's SDE transition with a **constant** ``std_dev_t = eta`` (vs ``sde``'s
-sigma-dependent ``sqrt(sigma/(1-sigma)) * eta``); ``prev_sample_mean`` and the
-log-prob reduction are otherwise identical to the ``sde`` branch.
-
-This exactly matches UniRL's train-side authority
-``unirl/sde/kernels.py:DanceSDEStrategy`` (``.step`` / ``.compute_log_prob``)
-that ``logprob_source='replay'`` recomputes against -- keeping the rollout
-transition and the train-side log-prob consistent (iter-0 importance ratios ~1).
-Parity with that authority is verified by hand for now (no automated parity test yet).
-
-This is the ONLY REPLACE patch (all infra patches are additive). It re-vendors
-upstream ``flow_sde_sampling`` with one extra ``elif``, so it must be re-synced by
-hand against the pinned upstream source on any sglang bump.
-"""
+"""REPLACE ``SchedulerRLMixin.flow_sde_sampling`` to add the DanceGRPO objective."""
 
 from __future__ import annotations
 
@@ -31,13 +14,9 @@ def patch_dance() -> None:
     import sglang.multimodal_gen.configs.post_training.rl_rollout as rl_rollout
     import sglang.multimodal_gen.runtime.post_training.scheduler_rl_mixin as srm
 
-    # (1) Allow "dance" through request-path validation + CLI choices. Both
-    # `RLRolloutArgs.validate` and `add_cli_args` read this module global at
-    # call time, so reassigning the attribute is sufficient. Idempotent.
     if "dance" not in rl_rollout._VALID_ROLLOUT_SDE_TYPES:
         rl_rollout._VALID_ROLLOUT_SDE_TYPES = tuple(rl_rollout._VALID_ROLLOUT_SDE_TYPES) + ("dance",)
 
-    # (2) REPLACE flow_sde_sampling with the dance-aware version. Idempotent.
     if getattr(srm.SchedulerRLMixin.flow_sde_sampling, "_unirl_dance", False):
         return
     srm.SchedulerRLMixin.flow_sde_sampling = _flow_sde_sampling_with_dance
@@ -52,11 +31,7 @@ def _flow_sde_sampling_with_dance(
     next_sigma: "torch.FloatTensor",
     generator: "torch.Generator",
 ) -> "torch.Tensor":
-    """Re-vendor of upstream ``SchedulerRLMixin.flow_sde_sampling`` + ``dance``.
-
-    Only the ``elif effective_sde_type == "dance"`` branch is new; everything
-    else is byte-for-byte upstream so sde/cps/ode behaviour is unchanged.
-    """
+    """Re-vendor of upstream ``SchedulerRLMixin.flow_sde_sampling`` + ``dance``."""
     rollout_session_data = self._get_rollout_session_data(batch)
     sde_type = batch.rollout_sde_type
     noise_level = float(batch.rollout_noise_level)
@@ -127,9 +102,6 @@ def _flow_sde_sampling_with_dance(
         log_prob_no_const_val = -((full_variance_noise * noise_std_dev) ** 2)
 
     elif effective_sde_type == "dance":
-        # DanceGRPO: identical to the "sde" branch except std_dev_t is the
-        # CONSTANT eta (not sigma-dependent). Mirrors UniRL's train-side
-        # DanceSDEStrategy.step (unirl/sde/kernels.py), which replay uses.
         model_output = model_output.float()
         sample = sample.float()
         variance_noise = self._rollout_variance_noise(batch, model_output, generator)

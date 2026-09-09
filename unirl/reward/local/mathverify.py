@@ -1,19 +1,4 @@
-r"""math-verify reward scorer — the paper's grader (HuggingFace Math-Verify).
-
-The AdaSPO/DRPO paper grades competition-math answers with the ``math-verify``
-library (Appendix D). Unlike :class:`MathBoxedRewardScorer` (a custom ``\boxed``
-regex + sympy matcher that REQUIRES a ``\boxed{}`` / ``####`` and scores 0
-otherwise), math-verify also extracts a final answer from free-form text — e.g. a
-base model that reasons to the correct answer without wrapping it in ``\boxed{}``
-— and handles richer symbolic equivalence. So it does NOT under-count
-correct-but-unboxed generations, which is common for Qwen3-*-Base + thinking and
-otherwise artificially depresses the reward / inflates zero-advantage groups.
-
-Reward = 1.0 if ``math_verify.verify(parse(ground_truth), parse(response))`` else
-0.0. Requires the ``math-verify`` package (``pip install math-verify``; pulls
-``latex2sympy2-extended``) in the node venv. The import is lazy (only the workers
-that actually score need the dependency).
-"""
+r"""math-verify reward scorer — the paper's grader (HuggingFace Math-Verify)."""
 
 from __future__ import annotations
 
@@ -40,7 +25,6 @@ class MathVerifyRewardScorer(LocalRewardBackend):
         self.model = "math_verify"
 
     def _compute_model_rewards(self, request: RewardRequest) -> List[float]:
-        # Lazy import so the dependency is only needed where scoring runs.
         from math_verify import parse, verify
 
         generated = request.texts
@@ -54,10 +38,13 @@ class MathVerifyRewardScorer(LocalRewardBackend):
                 continue
             gt = str(meta["answer"]).strip()
             try:
-                # Gold wrapped in \boxed{} (math-verify's canonical gold form); the
-                # prediction is parsed free-form (math-verify finds the final answer
-                # via \boxed{} else the last expression). verify(gold, target).
-                ok = bool(verify(parse("\\boxed{" + gt + "}"), parse(text or "")))
+                ok = bool(
+                    verify(
+                        parse("\\boxed{" + gt + "}", parsing_timeout=None),
+                        parse(text or "", parsing_timeout=None),
+                        timeout_seconds=None,
+                    )
+                )
             except Exception:
                 ok = False
             rewards.append(1.0 if ok else 0.0)

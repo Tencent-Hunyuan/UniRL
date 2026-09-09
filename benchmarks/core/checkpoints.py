@@ -18,9 +18,6 @@ class ResolvedCkpt:
 
 
 def _slug(name: str) -> str:
-    # Local paths keep their last two components: UniRL checkpoints are conventionally
-    # named checkpoint-<step>, so basename alone collides across training runs — and a
-    # colliding tag would silently resume/rescore another run's outputs.
     parts = Path(name).parts if Path(name).exists() else name.rstrip("/").split("/")[-1:]
     return re.sub(r"[^A-Za-z0-9._-]+", "-", "-".join(parts[-2:]).lstrip("-/")) or "ckpt"
 
@@ -30,13 +27,7 @@ def make_tag(ckpt: str, lora: Optional[str]) -> str:
 
 
 def resolve(ckpt: str, lora: Optional[str], work_dir: Path) -> ResolvedCkpt:
-    """``ckpt`` is the base model (HF id or local path). ``lora`` is either a PEFT
-    adapter dir or a UniRL checkpoint (``checkpoint-<step>`` dir / ``checkpoint.pt``);
-    the latter is exported once to ``work_dir/<tag>/adapter`` via
-    ``unirl.tools.export_adapter`` (works on both adapter- and full-mode saves).
-    A ``.source`` marker pins the export to its origin checkpoint, so a tag collision
-    fails loudly instead of silently evaluating another run's adapter.
-    """
+    """``ckpt`` is the base model (HF id or local path)."""
     tag = make_tag(ckpt, lora)
     if not lora:
         return ResolvedCkpt(base=ckpt, adapter=None, tag=tag)

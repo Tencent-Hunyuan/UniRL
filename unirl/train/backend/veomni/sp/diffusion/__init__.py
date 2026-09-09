@@ -1,9 +1,4 @@
-"""Ulysses SP for diffusers transformers (package).
-
-Public API only. The shared machinery -- the two attention-SP mechanisms, the boundary-hook
-helpers, and the dispatch/registry -- lives in :mod:`.ulysses`; per-model boundary adapters
-live in :mod:`.models` and self-register via ``@register``. To add a model, see :mod:`.models`.
-"""
+"""Ulysses SP for diffusers transformers (package)."""
 
 from unirl.train.backend.veomni.sp.diffusion import models  # noqa: F401 -- registers per-model wrappers
 from unirl.train.backend.veomni.sp.diffusion.ulysses import (

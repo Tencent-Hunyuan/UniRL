@@ -1,0 +1,50 @@
+source     = boogu-project/Boogu-Image  (https://github.com/boogu-project/Boogu-Image)
+commit     = 434fb56d2a5f6ae6f30cce6a8b56e319e9cd1979
+short      = 434fb56
+commit_date= 2026-07 (main @ clone date)
+vendored   = 2026-07-17  (into unirl/models/boogu_image/vendor/, FLAT layout)
+target     = celve/unirl LIN-567/main (@ 80b24995)
+
+Files (upstream path -> vendor file):
+  boogu/models/transformers/transformer_boogu.py -> transformer_boogu.py
+  boogu/models/attention_processor.py            -> attention_processor.py
+  boogu/models/transformers/rope.py              -> rope.py           (pristine)
+  boogu/models/transformers/block_lumina2.py     -> block_lumina2.py
+  boogu/models/transformers/components.py        -> components.py     (pristine)
+  boogu/models/embeddings.py                     -> embeddings.py     (pristine)
+  boogu/utils/import_utils.py                    -> import_utils.py   (pristine)
+  boogu/utils/teacache_util.py                   -> teacache_util.py  (pristine)
+  (new) taylorseer_stubs.py — raising stubs replacing boogu.cache_functions /
+        boogu.taylorseer_utils imports (RL must be cache-free)
+
+NOT vendored (deliberate): boogu/pipelines/* (UniRL stages reimplement
+sampling), boogu/schedulers/* (static-v1 shift == FlowMatchSchedulePolicy
+static shift with shift = e^1.15 = 3.158192909689768; verified to 1 fp32 ulp),
+boogu/cache_functions + taylorseer_utils + ops/triton (inference accel only).
+
+Mechanical changes (see vendor/__init__.py docstring, marked inline):
+  1. import flattening to same-dir relatives (transformer_boogu.py,
+     attention_processor.py, block_lumina2.py)
+  2. triton-RMSNorm + flash-swiglu env conditionals -> torch.nn.RMSNorm +
+     pure-torch swiglu (upstream default-env branches)
+  3. the four os.getenv("device","cpu") attention-processor gates pinned to
+     SDPA processors (BooguImageTransformerBlock.__init__,
+     BooguImageDoubleStreamTransformerBlock.__init__); Flash2Varlen classes
+     kept for optional post-load swap (identical param names)
+  4. taylorseer/cache_functions imports -> taylorseer_stubs.py
+  5. orphaned `import os` / `import warnings` removed
+
+No functional edits to forward math. Zero registered buffers / plain-tensor
+attrs in the tree (verified) -> meta-init is the trivial finalize_meta_init
+case; the non-persistent-buffer warning must come out EMPTY (canary on
+re-vendor).
+
+To re-vendor a newer upstream:
+  1. git -C Boogu-Image fetch && git checkout <new_commit>
+  2. recopy the 8 files (flat) per the table above
+  3. re-apply mechanical changes 1-5
+  4. bump this file; re-run the parity gates (sigma grid, embeds,
+     teacher-forced per-step, free-running) AND the diffuse<->replay ratio==1
+     check PLUS a replay-backward smoke — the ratio test alone runs under
+     no_grad and won't catch grad-only regressions (see bagel's inplace-view
+     lesson).

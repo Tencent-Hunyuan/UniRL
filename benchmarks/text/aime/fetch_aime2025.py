@@ -1,9 +1,4 @@
-"""Fetch AIME 2025 into ``data/aime2025.jsonl``.
-
-AIME 2024 (MIT-tagged upstream) is vendored next to this script; the AIME 2025
-dataset card (yentinglin/aime_2025) declares no license, so that file is fetched
-on demand instead of being committed: ``python benchmarks/text/aime/fetch_aime2025.py``.
-"""
+"""Fetch AIME 2025 into ``data/aime2025.jsonl``."""
 
 from __future__ import annotations
 
@@ -28,12 +23,10 @@ def main() -> None:
     from huggingface_hub import HfApi, hf_hub_download
 
     repo = "yentinglin/aime_2025"
-    # The repo ships the same 30 problems both combined (data/) and split
-    # (part1/ + part2/), so records are deduped by id.
     parquets = [f for f in HfApi().list_repo_files(repo, repo_type="dataset") if f.endswith(".parquet")]
     records = {}
     for filename in sorted(parquets):
-        import pyarrow.parquet as pq  # available via the repo's datasets/pyarrow stack
+        import pyarrow.parquet as pq
 
         table = pq.read_table(hf_hub_download(repo_id=repo, filename=filename, repo_type="dataset"))
         for i, row in enumerate(table.to_pylist()):

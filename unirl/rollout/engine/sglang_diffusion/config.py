@@ -1,16 +1,4 @@
-"""``sglang_diffusion`` engine config — wired by ``_target_``; the rollout actor
-constructs the engine via :meth:`SGLangDiffusionEngineConfig.make_engine`.
-
-Ported from the legacy ``SGLangEngineConfig`` minus all port/placement math: the
-engine reserves its own :class:`SGLangDiffusionPorts` at boot, so there is no
-``with_sglang_ports`` / ``_SGLANG_PORT_*`` here. ``port`` / ``scheduler_port`` survive
-only for remote mode (``local_mode=False``). ``model_family`` is validated against
-the live adapter registry rather than a hardcoded tuple.
-
-``server_intent`` (the successor of the legacy ``build_server_kwargs``) spells this
-config + the model config + the reserved ports as the SGLang ServerArgs intent
-dict; the backend filters it against the real ServerArgs fields and spawns.
-"""
+"""``sglang_diffusion`` engine config — wired by ``_target_``; the rollout actor"""
 
 from __future__ import annotations
 
@@ -27,16 +15,7 @@ from unirl.rollout.engine.ports import ReservedPorts
 
 @dataclass(frozen=True)
 class SGLangDiffusionPorts(ReservedPorts):
-    """The ports one local-mode ``DiffGenerator`` spawn consumes.
-
-    - ``server_port`` — HTTP/server bind (``ServerArgs.port``). Unbound in local
-      mode (``launch_http_server=False``), but injecting it keeps ServerArgs'
-      ``settle_port`` from wandering and mirrors remote mode.
-    - ``scheduler_port`` — the scheduler's zmq REP bind; the client connects here.
-    - ``master_port`` — ``ServerArgs.master_port``: the spawned workers' dist init
-      (``tcp://127.0.0.1:{master_port}``). Left unset, upstream self-settles to a
-      random scanned port; injecting a reserved one keeps colocated siblings apart.
-    """
+    """The ports one local-mode ``DiffGenerator`` spawn consumes."""
 
     server_port: int
     scheduler_port: int
@@ -52,42 +31,31 @@ class SGLangDiffusionEngineConfig(BaseEngineConfig):
 
         return SGLangDiffusionRolloutEngine(config=self, **deps)
 
-    # --- Sampling (live interpolation back to top-level cfg.sampling) ---
     sampling: Any = dc_field(default_factory=lambda: SI("${sampling}"))
 
-    # --- Model family: selects the adapter (registry key) ---
     model_family: str = "sd3"
 
-    # --- Conditions packing ---
     populate_conditions: bool = True
 
-    # --- Engine-internal noise fallback (only when caller didn't pre-ship latents) ---
     init_same_noise: bool = False
 
-    # --- Parallelism & GPU ---
     num_gpus: int = 1
     tp_size: Optional[int] = None
     sp_degree: Optional[int] = None
 
-    # --- SGLang engine behaviour ---
     local_mode: bool = True
     disable_autocast: bool = False
 
-    # --- Forward chunking (None = whole batch in one forward) ---
     forward_batch_size: Optional[int] = None
 
-    # --- Weight sync ---
     target_modules: Optional[Tuple[str, ...]] = None
 
-    # --- LoRA ---
     lora_merge_mode: Optional[str] = None
 
-    # --- SGLang network (remote mode only; local mode self-reserves its ports) ---
     host: Optional[str] = None
     port: Optional[int] = None
     scheduler_port: Optional[int] = None
 
-    # --- Escape hatch for rare / advanced ServerArgs overrides ---
     engine_kwargs: Optional[Dict[str, Any]] = dc_field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -95,7 +63,6 @@ class SGLangDiffusionEngineConfig(BaseEngineConfig):
             self.engine_kwargs = {}
 
         self.model_family = str(self.model_family or "").strip().lower()
-        # Validate against the live adapter registry (importing it registers them).
         from unirl.rollout.engine.sglang_diffusion.adapters import registered_adapters
 
         valid_families = registered_adapters()
@@ -129,10 +96,6 @@ class SGLangDiffusionEngineConfig(BaseEngineConfig):
             f"got port={self.port!r}, scheduler_port={self.scheduler_port!r}",
         )
 
-    # ------------------------------------------------------------------
-    # SGLang ServerArgs intent (successor of the legacy ``build_server_kwargs``)
-    # ------------------------------------------------------------------
-
     def server_intent(
         self,
         *,
@@ -140,24 +103,11 @@ class SGLangDiffusionEngineConfig(BaseEngineConfig):
         ports: Optional[SGLangDiffusionPorts],
         extra: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Spell this config (+ model config + reserved ports) as ServerArgs intent.
-
-        Unfiltered: the backend filters against the real ServerArgs fields and
-        spawns. Precedence (low → high): ``engine_kwargs`` escape-hatch < typed
-        cfg/model fields < adapter ``extra`` < the reserved ports. In local mode
-        the set supplies ``port`` / ``scheduler_port`` / ``master_port`` (all real
-        ServerArgs fields — ``master_port`` is the spawned workers' dist init,
-        which otherwise self-settles to a random scanned port); in remote mode
-        (``ports is None``) they come from ``host`` / ``port`` / ``scheduler_port``
-        on this config.
-        """
+        """Spell this config (+ model config + reserved ports) as ServerArgs intent."""
         intent: Dict[str, Any] = {}
 
-        # Layer 1: escape-hatch (lowest priority). Non-ServerArgs keys are dropped
-        # by the backend's allowed-keys filter, so passing them through is harmless.
         intent.update(self.engine_kwargs or {})
 
-        # Layer 2: typed cfg + model_config fields.
         if model_config.pretrained_model_ckpt_path:
             intent["model_path"] = model_config.pretrained_model_ckpt_path
         intent["num_gpus"] = int(self.num_gpus)
@@ -177,11 +127,9 @@ class SGLangDiffusionEngineConfig(BaseEngineConfig):
         if self.host is not None:
             intent["host"] = str(self.host)
 
-        # Layer 3: adapter model-specific extras (override hook).
         if extra:
             intent.update(extra)
 
-        # Layer 4: ports (highest). Local mode → reserved set; remote → cfg fields.
         if ports is not None:
             intent["port"] = ports.server_port
             intent["scheduler_port"] = ports.scheduler_port

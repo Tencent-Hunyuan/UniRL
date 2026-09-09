@@ -1,31 +1,14 @@
-"""t2i — text-to-image diffusion.
-
-Reads ``primitives["text"]: Texts`` plus ``stage_params["diffusion"]:
-dict``. Builds the unified-MM input tensors via
-``HunyuanImage3TextEmbedStage.embed_for_gen_image``, runs the diffusion
-stage in ``mode="gen_image"``, and decodes the final latent to pixels.
-
-``negative_text`` is rejected: the HI3 tokenizer never consumes
-negative-prompt text — CFG is derived from ``guidance_scale > 1.0`` and
-the unconditional branch is built internally from ``<cfg>`` tokens.
-
-The ``bot_task`` knob (``stage_params["bot_task"]``) is a chat-template
-flag: ``"image"`` is vllm-omni's t2i_vanilla preset; ``"think"`` /
-``"recaption"`` / ``"think_recaption"`` insert static markers that the
-model treats as reasoning-mode hints. This is NOT a separate AR-then-
-diffuse pass -- vllm-omni's t2i is a single diffusion stage and the
-prefix lives in ``input_ids`` only (see vllm-omni
-``prompt_utils.py:23-31``).
-"""
+"""t2i — text-to-image diffusion."""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from dataclasses import replace
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 from unirl.config.require import require
+from unirl.types.noise_recipe import NoiseRecipe
 from unirl.types.primitives import Texts
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp, RolloutTrack
+from unirl.types.sample import Part, Sample
 from unirl.types.sampling import DiffusionSamplingParams
 
 from ..conditions import HunyuanImage3DiffusionConditions
@@ -34,56 +17,75 @@ if TYPE_CHECKING:
     from ..pipeline import HunyuanImage3Pipeline
 
 
-def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
-    """t2i — single-stage text-to-image."""
-    texts = req.primitives.get("text")
+def _prepare_seeded_sampling(
+    sample: Sample,
+    frontier: Part,
+    params: DiffusionSamplingParams,
+) -> Tuple[DiffusionSamplingParams, Optional[List[str]]]:
+    """Prepare request-local RNG streams without touching global RNG state."""
+    recipe_ids = [str(key) for key in NoiseRecipe.from_sample(sample).noise_group_ids]
+    if params.seed is None or not recipe_ids:
+        return params, None
+    if len(recipe_ids) != frontier.batch_size:
+        raise ValueError(
+            "HunyuanImage3 t2i seeded sampling requires noise keys aligned with "
+            f"the frontier batch; got {len(recipe_ids)} for {frontier.batch_size}."
+        )
+
+    sample_ids = [str(sample_id) for sample_id in frontier.sample_ids]
+    seeded_params = replace(params, noise_group_ids=recipe_ids)
+    sde_sample_keys = [f"{recipe_id}:sample:{sample_id}" for recipe_id, sample_id in zip(recipe_ids, sample_ids)]
+    return seeded_params, sde_sample_keys
+
+
+def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
+    """t2i — single-stage text-to-image, filling the frontier (pre-forked) gen Part."""
+    frontier = sample.frontier_gen_part(DiffusionSamplingParams)
+    params = frontier.sampling_params
+    params, sde_sample_keys = _prepare_seeded_sampling(sample, frontier, params)
+    if params.sigmas is None:
+        raise ValueError(
+            "HunyuanImage3 t2i: gen part sampling_params.sigmas is None. The hosting engine must "
+            "pin σ before pipeline.generate."
+        )
+
+    conditioning = sample.conditioning()
+    texts = conditioning[0] if conditioning else None
     require(
         isinstance(texts, Texts),
-        f"HunyuanImage3Pipeline.generate (t2i): input must be Texts, got {type(texts).__name__ if texts is not None else 'None'}",
-    )
-    require(
-        req.primitives.get("negative_text") is None,
-        "HunyuanImage3Pipeline.generate (t2i): negative_text is not supported — "
-        "the HI3 tokenizer never consumes negative-prompt text; CFG is derived from "
-        "guidance_scale > 1.0 (the unconditional branch is built internally from <cfg> tokens).",
+        f"HunyuanImage3Pipeline.generate (t2i): prompt from sample.conditioning()[0] must be Texts, "
+        f"got {type(texts).__name__ if texts is not None else 'None'}",
     )
 
-    params: DiffusionSamplingParams = req.sampling_params.get("diffusion")
-    bot_task: str = str(req.stage_config.get("bot_task", "image"))
+    control = sample.parts[0].control or {}
+    bot_task: str = str(control.get("bot_task", "image"))
+    sys_type = control.get("sys_type")
+    sequence_template = control.get("sequence_template")
 
-    # Build the upstream multimodal input tensors. CFG-batched [cond, uncond]
-    # when guidance > 1; else single batch axis. ``mm`` is
-    # ``{"fused": HunyuanImage3FusedMultimodalCondition, "tokenizer_output": Any}``.
     mm = pipeline.text_embed.embed_for_gen_image(
         texts,
         cfg=float(params.guidance_scale) > 1.0,
         height=int(params.height),
         width=int(params.width),
         bot_task=bot_task,
+        sys_type=None if sys_type is None else str(sys_type),
+        sequence_template=None if sequence_template is None else str(sequence_template),
     )
 
     diff_conds = HunyuanImage3DiffusionConditions(
         fused=mm["fused"],
-        tokenizer_output=mm["tokenizer_output"],
+        # Unread with the cache off, and Part.concat cannot merge it across prompts.
+        tokenizer_output=mm["tokenizer_output"] if pipeline.diffusion.diffuse_kv_cache else None,
     )
-    if req.sigmas is None:
-        raise ValueError(
-            "HunyuanImage3 t2i: req.sigmas is None. Engine adapter must call "
-            "unirl.sde.runtime.ensure_req_sigmas before pipeline.generate."
-        )
-    schedule = req.sigmas.to(pipeline.bundle.device)
+    schedule = params.sigmas.to(pipeline.bundle.device)
 
-    latent_seg = pipeline.diffusion.diffuse(diff_conds, schedule=schedule, params=params)
+    latent_seg = pipeline.diffusion.diffuse(
+        diff_conds,
+        schedule=schedule,
+        params=params,
+        sde_sample_keys=sde_sample_keys,
+    )
     images = pipeline.vae_decode.decode(latent_seg)
 
-    return RolloutResp(
-        tracks={
-            "image": RolloutTrack(
-                sample_ids=list(req.sample_ids),
-                parent_ids=list(req.group_ids),
-                conditions=diff_conds.to_dict(),
-                segment=latent_seg,
-                decoded=images,
-            ),
-        }
-    )
+    filled = frontier.fill(segment=latent_seg, primitives={"image": images}, conditions=diff_conds.to_dict())
+    return sample.with_parts([*sample.parts[:-1], filled])

@@ -1,0 +1,40 @@
+# GenEval-only service configuration.
+#
+# Hosts the classical GenEval compositional scorer (mmdet Mask2Former + CLIP
+# color classification, reward_service/scorers/geneval.py) on a dedicated
+# node / conda env: its stack (mmdet 2.28.2 + mmcv-full 1.7.2, python <= 3.10,
+# torch <= 2.1) conflicts with the trainer image, so it must stay
+# out-of-process. The trainer connects via REWARD_SERVICE_URL=http://<node>:8080
+# (see examples/diffusion/sd3/sd3_opd_multi_teacher.yaml).
+#
+# Start (inside the scorer env):
+#   ray start --head --num-gpus=1
+#   python -m reward_service --config configs/geneval_service.yaml
+
+server:
+  host: 0.0.0.0
+  port: 8080
+  score_timeout_s: 300.0
+
+rewards:
+  - name: geneval
+    scorer: geneval
+    runtime_env: envs/geneval.txt   # empty file; deps come from the host env
+    num_replicas: 1
+    num_gpus: 1
+    num_cpus: 4
+    max_concurrency: 1
+    params:
+      # Empty paths keep the scorer's fallback discovery/download behavior
+      # (mmdet-shipped config + ~155MB Swin-S checkpoint to its cache dir).
+      mmdet_config: ""
+      mmdet_checkpoint: ""
+      clip_arch: ViT-L-14
+      clip_pretrained: openai
+      score_type: score            # continuous reward, mirrors the paper's _evaluate_reward
+      threshold: 0.3
+      counting_threshold: 0.9
+      max_objects: 16
+      nms_threshold: 1.0
+      position_threshold: 0.1
+      device: cuda

@@ -11,6 +11,11 @@
 [![Documentation](https://img.shields.io/badge/docs-unirl--project.github.io-blue)](https://unirl-project.github.io/unirl/)
 [![WeChat](https://img.shields.io/badge/WeChat-微信群-07C160?logo=wechat&logoColor=white)](https://unirl-project.github.io/unirl/community/wechat-qr.jpg)
 
+<br>
+<a href="https://trendshift.io/repositories/48953" target="_blank" rel="noopener noreferrer">
+  <img src="https://trendshift.io/api/badge/trendshift/repositories/48953/daily?language=Python" alt="UniRL ranked #16 Python Repository of the Day on Trendshift" width="250" height="55">
+</a>
+
 </div>
 
 ## News 🚀
@@ -38,6 +43,10 @@ matching domain **trainer** (`DiffusionTrainer`, `ARTrainer`, `PETrainer`,
 the shared **distributed runtime**: Ray `DevicePool`, FSDP, Transfer
 Queue (TQ), and LoRA/full-weight sync. See [`unirl/README.md`](unirl/README.md) for the
 runtime loop, deployment modes, and module map.
+
+The agentic entrypoint extends the AR path with multi-turn tool interaction. It
+preserves each turn as a `Sample` lineage, scores terminal answers through a
+reward service, and trains at a colocated rollout barrier.
 
 ## Team-Proposed Algorithms 🌟
 
@@ -77,9 +86,11 @@ dimension; all listed models are supported (✅).
 | LTX-Video-2.3 | Video diffusion | Text → Audio + Video | ✅ |
 | Qwen-VL | Vision-language AR | Text + Image → Text | ✅ |
 | Qwen3 | LLM AR | Text → Text | ✅ |
+| Qwen3-Omni Thinker | Omni-modality | Text/Image/Audio/Video → Text | ✅ |
 | Prompt-Enhancer | LLM + diffusion | Text → Text → Image | ✅ |
 | HunyuanImage3 | Unified AR + diffusion | Text → Image | ✅ |
 | Bagel | Unified AR + diffusion | Text / Text + Image → Image | ✅ |
+| SenseNova-U1.5 | Unified MoT pixel flow | Text → Image | ✅ |
 
 </div>
 
@@ -102,6 +113,25 @@ Examples are self-contained YAML files selected with
 See [`examples/README.md`](examples/README.md) for the full launch guide, naming
 schema, and how to add a recipe.
 
+## Agentic Workflows 🤖
+
+The agentic rollout engine repeatedly performs model generation followed by an
+environment step and returns a trajectory of `Sample` objects. One public
+workflow is supported:
+
+| Workflow | Entrypoint | Example recipe |
+|---|---|---|
+| Service-scored multi-turn tool use | `train_agentic` | [`deep_research/deep_research_search_judge`](examples/deep_research/deep_research_search_judge.yaml) |
+
+`AgenticTrainer` synchronizes current training weights before every rollout,
+dispatches sibling trajectories concurrently, and waits for complete GRPO groups
+before scoring and training. Each successful trajectory receives one group-normalized
+advantage, which is applied to every generated assistant turn. Failed
+trajectories are excluded from the update.
+
+See the [agent environment guide](unirl/rollout/env/README.md) for the
+environment, tool, and trajectory contracts.
+
 ## Getting Started ⚡
 
 Install dependencies first — see [INSTALL.md](INSTALL.md).
@@ -123,7 +153,9 @@ We are actively expanding model and algorithm coverage. Near-term directions:
 - Extend the team-proposed algorithms (Flow-DPPO, DRPO) to more model families.
 - Broaden reward backends and rollout-engine coverage across domains.
 
-Want a model or algorithm prioritized? [Open an issue](https://github.com/Tencent-Hunyuan/UniRL/issues) to discuss.
+Want a model or algorithm prioritized? Open a
+[feature request](https://github.com/Tencent-Hunyuan/UniRL/issues/new?template=feature-request.yml)
+to discuss.
 
 ## Contributing 🤝
 
@@ -131,8 +163,11 @@ Contributions and questions are welcome. Before opening a pull request, read the
 repository conventions in [`AGENTS.md`](AGENTS.md), run the
 [pre-PR checks](examples/README.md#adding-or-editing-a-recipe) for the files you
 touched, and fill in the [pull request template](.github/pull_request_template.md).
-For questions, bug reports, and feature requests,
-[open an issue](https://github.com/Tencent-Hunyuan/UniRL/issues).
+Use the issue forms for a
+[bug report](https://github.com/Tencent-Hunyuan/UniRL/issues/new?template=bug-report.yml)
+or
+[feature request](https://github.com/Tencent-Hunyuan/UniRL/issues/new?template=feature-request.yml).
+WeChat is fine for chat; bugs still belong on GitHub so they stay searchable.
 
 ## Acknowledgement 🙏
 

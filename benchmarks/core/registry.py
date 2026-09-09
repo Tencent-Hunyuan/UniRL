@@ -1,9 +1,4 @@
-"""Benchmark registry: one :class:`BenchmarkSpec` per benchmark.
-
-Adding a benchmark = drop its prompt data (or a fetch script) under
-``benchmarks/<modality>/<name>/`` and register one spec here. All runner logic
-lives in ``run.py`` / ``core/``; per-benchmark folders hold README + data only.
-"""
+"""Benchmark registry: one :class:`BenchmarkSpec` per benchmark."""
 
 from __future__ import annotations
 
@@ -24,14 +19,16 @@ class BenchmarkSpec:
     """Protocol card for one benchmark. ``data`` is repo-root-relative."""
 
     name: str
-    modality: str  # "t2i": runner renders images | "text": runner queries an OpenAI-compatible endpoint
+    modality: str
     data: str
-    prompt_field: Optional[str] = None  # jsonl/csv/tsv column with the prompt; None for txt (one per line)
+    prompt_field: Optional[str] = None
     samples_per_prompt: int = 4
-    rewards: Tuple[str, ...] = ()  # reward-service scorer names; () = scored externally (see the README)
-    send_metadata: bool = False  # t2i jsonl specs: ship each record as RewardRequest.metadata (geneval*)
+    rewards: Tuple[str, ...] = ()
+    send_metadata: bool = False
     grader: Optional[str] = None  # text benchmarks: "math_verify" | "mc_letter"
-    gen: Dict = field(default_factory=dict)  # generation defaults; CLI flags override
+    gen: Dict = field(default_factory=dict)
+    t2i_linspace_sigmas: bool = False  # Use an explicit flow-match sigma grid.
+    t2i_prompt_seed: bool = False
     notes: str = ""
 
     def data_path(self) -> Path:
@@ -55,15 +52,13 @@ def load_prompts(spec: BenchmarkSpec) -> List[str]:
         with open(path, newline="") as f:
             reader = csv.DictReader(f, delimiter="\t" if path.suffix == ".tsv" else ",")
             prompts = [row[spec.prompt_field] for row in reader]
-    else:  # txt: one prompt per line
+    else:
         prompts = [line for line in path.read_text().splitlines() if line.strip()]
     return list(dict.fromkeys(prompts))
 
 
 def load_metadata(spec: BenchmarkSpec) -> List[Dict]:
-    """Full jsonl records aligned with :func:`load_prompts` order (first record wins
-    per unique prompt). The reward-service geneval scorers read these as
-    ``RewardRequest.metadata`` (``vqa_list`` / ``tag``+``include``)."""
+    """Full jsonl records aligned with :func:`load_prompts` order (first record wins per unique prompt)."""
     records: Dict[str, Dict] = {}
     for line in spec.data_path().read_text().splitlines():
         if line.strip():
@@ -87,8 +82,12 @@ _ALL = (
         data="datasets/geneval2/synthetic/test.jsonl",
         prompt_field="prompt",
         rewards=("geneval2",),
-        send_metadata=True,  # ships each record's vqa_list, so the scorer needs no dataset_path config
-        notes="In-domain compositional T2I (VQAScore soft-TIFA via Qwen3-VL) — the set the GRPO/FlowDPPO recipes train on.",
+        send_metadata=True,
+        samples_per_prompt=1,
+        gen={"num_inference_steps": 40, "guidance_scale": 1.0, "height": 512, "width": 512, "max_sequence_length": 256},
+        t2i_linspace_sigmas=True,
+        t2i_prompt_seed=True,
+        notes="In-domain compositional T2I (Soft-TIFA VQAScore via Qwen3-VL); the DPPO GenEval2 train set. Eval at 512px/40-step/cfg1.0; see README for the reproduction configs.",
     ),
     BenchmarkSpec(
         name="image/geneval",
@@ -96,7 +95,7 @@ _ALL = (
         data="benchmarks/image/geneval/data/evaluation_metadata.jsonl",
         prompt_field="prompt",
         rewards=("geneval",),
-        send_metadata=True,  # ships tag/include/exclude, which the geneval scorer hard-requires
+        send_metadata=True,
         notes="Official GenEval (Mask2Former + CLIP); enable the 'geneval' scorer in the reward service (off by default).",
     ),
     BenchmarkSpec(

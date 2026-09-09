@@ -1,32 +1,4 @@
-"""Re-host the ``sglang-drl`` fork's ``Scheduler`` RL additions on stock upstream.
-
-Stock upstream ``Scheduler`` (``runtime/managers/scheduler.py``) dispatches ZMQ
-requests via ``self.request_handlers`` (keyed by ``type(req)``) and ships only
-the disk-weight + checksum handlers. The fork added nine RL request handlers
-(distributed weight sync, tensor weight sync, LoRA-from-tensors, encode-prompt,
-sleep/wake memory occupation, per-param weight detail) plus two private helpers,
-and gated ``_handle_generation`` / ``_handle_update_weights_from_disk`` behind
-sleep/dirty-module guards.
-
-This patch ports all of that WITHOUT editing sglang source:
-
-  * ``setattr`` the 9 handlers + 2 helpers onto ``Scheduler`` (bodies verbatim
-    from the fork diff). They call ``self.worker.<method>`` -- those worker
-    methods (``is_sleeping``, ``_dirty_modules``, ``set_lora_from_tensors``,
-    ``update_weights_from_tensor``, ...) are installed by ``patch_gpu_worker``.
-  * AROUND-wrap ``Scheduler.__init__`` so that AFTER the upstream ``__init__``
-    builds ``self.request_handlers`` we ``.update(...)`` it with the 9 fork
-    entries. The dict is keyed by the SAME request classes the UniRL
-    adapter sends: the 8 ``*ReqInput`` from ``_patches.io_struct`` and
-    ``SetLoraFromTensorsReq`` from ``_patches.lora_req`` (the single definition
-    sites), so ``type(req)`` dispatch matches.
-  * AROUND-wrap ``_handle_generation`` and ``_handle_update_weights_from_disk``
-    to PREPEND the fork's sleep/dirty guards, then delegate to the upstream
-    body with the original args/kwargs forwarded untouched (upstream
-    ``_handle_generation`` takes a keyword-only ``allow_dynamic_batching``).
-
-Idempotent via sentinel guards. Import-safe (sglang imported inside the fn).
-"""
+"""Re-host the ``sglang-drl`` fork's ``Scheduler`` RL additions on stock upstream."""
 
 from __future__ import annotations
 
@@ -46,13 +18,6 @@ def patch_scheduler() -> None:
     )
     from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 
-    # NOTE: ``logger`` (the scheduler module's logger) is bound here so the
-    # verbatim handler bodies below — nested fns whose free ``logger`` resolves
-    # to THIS enclosing scope (LEGB) — log through the exact upstream object,
-    # keeping log routing identical to the fork.
-    # The request classes used to key the dispatch dict. Imported from the
-    # UniRL single-definition sites so they are the SAME objects the
-    # adapter sends (dispatch is keyed by identity of `type(req)`).
     from unirl.rollout.engine.sglang_diffusion._patches.io_struct import (
         DestroyWeightsUpdateGroupReqInput,
         EncodePromptReqInput,
@@ -67,7 +32,6 @@ def patch_scheduler() -> None:
         SetLoraFromTensorsReq,
     )
 
-    # --- (1) setattr the 9 handlers + 2 helpers onto Scheduler (verbatim) ---
     if not getattr(Scheduler, _HANDLERS_SENTINEL, False):
 
         def _clear_dirty_modules(self, target_modules: "list[str] | None") -> None:
@@ -77,7 +41,6 @@ def patch_scheduler() -> None:
             if target_modules:
                 self.worker._dirty_modules -= set(target_modules)
             else:
-                # target_modules=None means all modules were updated
                 self.worker._dirty_modules.clear()
 
         def _handle_set_lora_from_tensors(self, reqs: List[Any]) -> OutputBatch:
@@ -225,13 +188,11 @@ def patch_scheduler() -> None:
         Scheduler._handle_resume_memory_occupation = _handle_resume_memory_occupation
         setattr(Scheduler, _HANDLERS_SENTINEL, True)
 
-    # --- (2) AROUND-wrap __init__: extend request_handlers after upstream ----
     if not getattr(Scheduler.__init__, _INIT_SENTINEL, False):
         _orig_init = Scheduler.__init__
 
         def __init__(self, *args, **kwargs):
             _orig_init(self, *args, **kwargs)
-            # Bound-method references resolve through the setattr'd attrs above.
             self.request_handlers.update(
                 {
                     SetLoraFromTensorsReq: self._handle_set_lora_from_tensors,
@@ -249,7 +210,6 @@ def patch_scheduler() -> None:
         __init__._unirl_request_handlers = True  # type: ignore[attr-defined]
         Scheduler.__init__ = __init__
 
-    # --- (3) AROUND-wrap _handle_generation: prepend sleep/dirty guards -------
     if not getattr(Scheduler._handle_generation, _GEN_SENTINEL, False):
         _orig_handle_generation = Scheduler._handle_generation
 
@@ -265,11 +225,6 @@ def patch_scheduler() -> None:
         _handle_generation._unirl_sleep_dirty_guard = True  # type: ignore[attr-defined]
         Scheduler._handle_generation = _handle_generation
 
-    # --- (4) AROUND-wrap _handle_update_weights_from_disk: guards + clear -----
-    # The fork's disk handler is identical to upstream's body EXCEPT it adds the
-    # `_clear_dirty_modules` call on success. Upstream does not clear, so wrap to
-    # add it after a successful disk update (parse the success flag off the
-    # returned OutputBatch.error, which upstream sets to None on success).
     if not getattr(Scheduler._handle_update_weights_from_disk, _DISK_SENTINEL, False):
         _orig_handle_disk = Scheduler._handle_update_weights_from_disk
 

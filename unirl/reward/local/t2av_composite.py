@@ -1,57 +1,73 @@
-"""T2AV composite reward — weighted blend of video + audio scorers.
-
-For LTX-2.3 text-to-audio-video, a single track carries both the decoded video
-(``request.generated["video"]``) and the jointly-generated audio
-(``request.generated["audio"]``, injected by the reward service from
-``track.decoded_audio``). This composite runs several inner scorers over the
-SAME request and returns their weighted sum, exposing each as a component.
-
-Mirrors ``VideoRewardScorer``'s composite pattern: inner scorers are resolved
-from the built-in registry by name, so any registered scorer (e.g.
-``videopickscore`` for video quality, ``clap`` for audio-text alignment,
-``imagebind`` for audio-video alignment) can be blended.
-"""
+"""T2AV composite reward — weighted blend of video + audio scorers."""
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List
 
-from unirl.reward.base import BaseRewardComponentSpec, RewardBackend
+from unirl.reward.base import BaseRewardComponentSpec, PromptVideoReward, RewardBackend
 from unirl.types.reward import RewardRequest, RewardResponse
 
-from .registry import resolve_builtin_reward_scorer_class, resolve_builtin_reward_spec_class
+
+def _require_prompt_video_term(weights: Dict[str, float], scorers: Dict[str, RewardBackend]) -> None:
+    coverage = {
+        name: isinstance(scorer, PromptVideoReward) and scorer.covers_prompt_video() for name, scorer in scorers.items()
+    }
+    if any(weights[name] > 0.0 and coverage[name] for name in scorers):
+        return
+    details = ", ".join(f"{name}(weight={weights[name]}, covers_prompt_video={coverage[name]})" for name in weights)
+    raise ValueError(
+        "T2AVCompositeScorer: no positive-weight inner scorer relates the prompt to the video. "
+        f"Current mix: {details}. "
+        "Add videopickscore / videoalign, or set scorers.imagebind.config.mode to "
+        "'text_video' or 'all'. clap and imagebind mode='audio_video' do not cover this."
+    )
 
 
 class T2AVCompositeScorer(RewardBackend):
-    """Weighted blend of inner reward scorers for T2AV (video + audio).
-
-    ``input_kind = "video"``: the track routes through the video path; audio is
-    the parallel side-channel the reward service injects. Each inner scorer
-    reads whichever modality it needs off the shared request.
-    """
+    """Weighted blend of Hydra-instantiated inner reward scorers for T2AV."""
 
     input_kind = "video"
 
-    def __init__(self, *, config: "T2AVCompositeSpec", base_device: str) -> None:
-        super().__init__(model_name="t2av_composite", batch_size=config.batch_size)
-        self.weights: Dict[str, float] = dict(config.weights or {})
-        if not self.weights:
+    def __init__(self, *, config: "T2AVCompositeSpec", base_device: str = "auto") -> None:
+        super().__init__(model_name="t2av_composite")
+        del base_device
+        if not config.weights:
             raise ValueError("T2AVCompositeScorer requires a non-empty `weights` dict (scorer_name -> weight).")
+        if not config.scorers:
+            raise ValueError("T2AVCompositeScorer requires a non-empty `scorers` mapping (name -> RewardBackend).")
 
-        self._scorers: Dict[str, RewardBackend] = {}
-        for name in self.weights:
-            inner_cls = resolve_builtin_reward_scorer_class(name)
-            inner_spec_cls = resolve_builtin_reward_spec_class(name)
-            inner_spec = inner_spec_cls()
-            # Propagate batch_size/device to inner specs that accept them.
-            import dataclasses
+        weights = dict(config.weights)
+        if any(not isinstance(weight, (int, float)) or not math.isfinite(weight) for weight in weights.values()):
+            raise ValueError("T2AVCompositeScorer: weights must be finite numbers.")
+        self.weights = {name: float(weight) for name, weight in weights.items()}
 
-            overrides = {f: getattr(config, f) for f in ("device", "batch_size") if hasattr(inner_spec, f)}
-            if overrides:
-                inner_spec = dataclasses.replace(inner_spec, **overrides)
-            self._scorers[name] = inner_cls(config=inner_spec, base_device=base_device)
+        for name, scorer in config.scorers.items():
+            if not isinstance(scorer, RewardBackend):
+                raise TypeError(
+                    f"T2AVCompositeScorer: scorers[{name!r}] is {type(scorer).__name__}, not a "
+                    "RewardBackend — each entry needs its own `_target_` for Hydra to instantiate."
+                )
+            input_kind = scorer.preferred_input_kind
+            if input_kind != self.input_kind:
+                raise ValueError(
+                    f"T2AVCompositeScorer: scorers[{name!r}] consumes {input_kind!r}, expected {self.input_kind!r}."
+                )
+
+        weight_names = set(self.weights)
+        scorer_names = set(config.scorers)
+        if weight_names != scorer_names:
+            missing = sorted(weight_names - scorer_names)
+            extra = sorted(scorer_names - weight_names)
+            raise ValueError(
+                "T2AVCompositeScorer: `weights` and `scorers` must use the same keys "
+                f"(weights missing scorers={missing}, scorers missing weights={extra})."
+            )
+
+        self._scorers: Dict[str, RewardBackend] = dict(config.scorers)
+        _require_prompt_video_term(self.weights, self._scorers)
 
     def compute_rewards(self, request: RewardRequest) -> RewardResponse:
         start = time.time()
@@ -63,14 +79,17 @@ class T2AVCompositeScorer(RewardBackend):
             total = torch.zeros(bs, dtype=torch.float32)
             for name, scorer in self._scorers.items():
                 resp = scorer.compute_rewards(request)
-                comp = torch.tensor(list(resp.rewards), dtype=torch.float32)
+                comp = torch.tensor(resp.rewards, dtype=torch.float32)
                 if comp.numel() != bs:
                     raise RuntimeError(
                         f"T2AVCompositeScorer: inner scorer {name!r} returned {comp.numel()} rewards "
                         f"for a batch of {bs}."
                     )
+                if resp.successes and not all(resp.successes):
+                    error = next((error for error in (resp.errors or []) if error), "unknown inner error")
+                    raise RuntimeError(f"T2AVCompositeScorer: inner scorer {name!r} failed: {error}")
                 component_rewards[name] = comp.tolist()
-                total = total + float(self.weights[name]) * comp
+                total = total + self.weights[name] * comp
 
             return RewardResponse(
                 rewards=total.tolist(),
@@ -87,9 +106,8 @@ class T2AVCompositeScorer(RewardBackend):
                 compute_time=time.time() - start,
             )
 
-    @property
-    def preferred_input_kind(self) -> str:
-        return self.input_kind
+    def covers_prompt_video(self) -> bool:
+        return True
 
     def is_available(self) -> bool:
         return all(s.is_available() for s in self._scorers.values())
@@ -109,13 +127,10 @@ class T2AVCompositeScorer(RewardBackend):
 
 @dataclass
 class T2AVCompositeSpec(BaseRewardComponentSpec):
-    """Typed config for the T2AV composite reward.
+    """Typed config for the T2AV composite reward."""
 
-    ``weights`` maps inner scorer canonical names (e.g. ``videopickscore``,
-    ``clap``, ``imagebind``) to blend weights. Each named scorer is built from
-    its default Spec with ``device``/``batch_size`` propagated.
-    """
+    weights: Dict[str, float] = field(default_factory=dict)
+    scorers: Dict[str, RewardBackend] = field(default_factory=dict)
 
-    batch_size: int = 8
-    device: str = "auto"
-    weights: Dict[str, float] = field(default_factory=lambda: {"videopickscore": 0.5, "clap": 0.5})
+
+__all__ = ["T2AVCompositeScorer", "T2AVCompositeSpec"]

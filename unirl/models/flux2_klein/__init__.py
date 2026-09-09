@@ -1,14 +1,4 @@
-"""FLUX.2-klein-9B pipeline on the new four-tier typed architecture.
-
-Re-expression of ``main_flux_bundle/unirl/models/flux2.py``
-(Klein branch) + ``main_flux_bundle/unirl/samplers/fsdp/flux2_sampler.py``
-against the typed ``Bundle`` / ``Pipeline`` / ``EmbedStage`` /
-``DiffusionStage`` / ``DecodeStage`` protocols. Sibling of
-:mod:`unirl.models.sd3` and :mod:`unirl.models.qwen_image`.
-
-Importing this package re-exports its bundle / pipeline / config classes;
-recipes wire them by ``_target_`` dotpath.
-"""
+"""FLUX.2-klein-9B pipeline on the typed four-tier architecture."""
 
 from unirl.models.flux2_klein.bundle import Flux2KleinBundle
 from unirl.models.flux2_klein.conditions import Flux2KleinConditions

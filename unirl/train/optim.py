@@ -1,13 +1,4 @@
-"""Optimizer / LR-scheduler factories and their duck-typed protocols.
-
-Kept separate from the config dataclasses (``unirl/train/backend/base.py``)
-so the config layer stays torch-free — launcher scripts, linters, and schema
-tools can import the typed dataclasses without pulling ``torch``.
-
-The protocols capture the method surface the unirl training code actually
-uses; the standard ``torch.optim.AdamW`` /
-``torch.optim.lr_scheduler.LRScheduler`` instances satisfy them structurally.
-"""
+"""Optimizer / LR-scheduler factories and their duck-typed protocols."""
 
 from __future__ import annotations
 
@@ -43,14 +34,7 @@ def _build_named_param_groups(
     base_lr: float,
     group_lrs: Dict[str, float],
 ) -> List[dict]:
-    """Split trainable named params into AdamW param groups by name substring.
-
-    Each ``(substring -> lr)`` in ``group_lrs`` becomes a group whose params'
-    names contain that substring (first match wins); everything else lands in a
-    base group at ``base_lr``. Empty groups are dropped. Used for per-expert LRs
-    (e.g. BAGEL UniGRPO: ``{"moe_gen": <gen_lr>}`` so the image experts train at
-    a different LR than the text/und experts within one optimizer).
-    """
+    """Split trainable named params into AdamW param groups by name substring."""
     base: List[torch.nn.Parameter] = []
     matched: Dict[str, List[torch.nn.Parameter]] = {sub: [] for sub in group_lrs}
     for name, p in named_params:
@@ -75,30 +59,13 @@ def build_optimizer(
     actor: Any = None,
     named_params: Optional[Iterable[Tuple[str, torch.nn.Parameter]]] = None,
 ) -> OptimizerProtocol:
-    """Build an optimizer from a typed :class:`OptimizerConfig`.
-
-    If ``backend`` is provided and its ``build_optimizer`` hook returns a
-    non-None value, that takes precedence. Otherwise the default
-    ``torch.optim.AdamW`` construction is used.
-
-    ``params`` is consulted only on the default path; backend overrides
-    are expected to pull parameters from their own model reference. When
-    ``config.param_group_lrs`` is set AND ``named_params`` is provided, the
-    trainable params are split into per-substring LR groups (see
-    :func:`_build_named_param_groups`); otherwise a single LR is used.
-    """
+    """Build an optimizer from a typed :class:`OptimizerConfig`."""
     del actor
     if backend is not None:
         backend_optimizer = backend.build_optimizer(config)
         if backend_optimizer is not None:
             return backend_optimizer
 
-    # ``foreach=False`` disables the multi-tensor kernel path. Required whenever
-    # the param list mixes regular ``torch.Tensor`` (non-FSDP-wrapped sub-modules
-    # — e.g. SD3's embed/norm layers when only transformer blocks are
-    # ``fully_shard``-wrapped) with ``DTensor`` (FSDP-wrapped block params):
-    # ``_foreach_lerp_`` rejects the mixed bag and trips ``RuntimeError: got mixed
-    # torch.Tensor and DTensor``. Single-tensor kernels handle each independently.
     adam_kwargs = dict(
         betas=(float(config.adam_beta1), float(config.adam_beta2)),
         eps=float(config.adam_epsilon),
@@ -127,13 +94,7 @@ def build_lr_scheduler(
     backend: Any = None,
     actor: Any = None,
 ) -> Optional[LRSchedulerProtocol]:
-    """Build an LR scheduler from a typed :class:`LrSchedulerConfig`.
-
-    Supports the same backend-override path as :func:`build_optimizer`.
-    Returns ``None`` if ``config.type`` is not one of the supported values
-    (``constant`` / ``linear`` / ``cosine``) and the backend did not provide
-    an override.
-    """
+    """Build an LR scheduler from a typed :class:`LrSchedulerConfig`."""
     del actor
     if backend is not None:
         backend_scheduler = backend.build_scheduler(config, optimizer)
@@ -166,6 +127,27 @@ def build_lr_scheduler(
             return max(0.0, 1.0 - (step - warmup_steps) / (total_steps - warmup_steps))
 
         return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    if scheduler_type == "linear_warmup":
+        constant = torch.optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor=1.0,
+            end_factor=1.0,
+            total_iters=1,
+        )
+        if warmup_steps <= 0:
+            return constant
+        warmup = torch.optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor=1e-8,
+            end_factor=1.0,
+            total_iters=warmup_steps,
+        )
+        return torch.optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[warmup, constant],
+            milestones=[warmup_steps],
+        )
 
     if scheduler_type == "cosine":
 

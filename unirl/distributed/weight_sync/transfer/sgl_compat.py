@@ -1,36 +1,5 @@
-# Copyright 2023-2024 SGLang Team
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
-"""Vendored sglang weight-sync utilities (CUDA-only) for the vLLM-Omni flow.
-
-Vendored verbatim (minus NPU/MUSA branches and the ``pybase64`` dependency)
-from sglang 0.5.10.post1:
-
-- ``sglang/srt/utils/patch_torch.py``        -> ``monkey_patch_torch_reductions``
-- ``sglang/srt/weight_sync/tensor_bucket.py`` -> ``FlattenedTensorBucket``
-- ``sglang/srt/utils/common.py``              -> ``MultiprocessingSerializer`` / ``SafeUnpickler``
-
-Why vendored: the vLLM-Omni engine env intentionally does not install sglang
-(the engines are mutually-exclusive uv extras with conflicting torch pins), but
-CUDA-IPC pickles reference their reduction functions *by module path*, so the
-trainer and the engine worker must import the very same module. Keeping the
-implementation under unirl makes that path engine-agnostic.
-
-Compatibility note: ``monkey_patch_torch_reductions`` rewrites the *module
-attributes* ``reductions.reduce_tensor`` / ``reductions.rebuild_cuda_tensor``,
-so pickles produced by unpatched stock reducers still deserialize correctly on
-a patched process (``_device_from_maybe_uuid`` passes plain ints through).
-"""
+# Copyright 2023-2024 SGLang Team; SPDX-License-Identifier: Apache-2.0
+"""Vendored sglang weight-sync utilities (CUDA-only) for the vLLM-Omni flow."""
 
 from __future__ import annotations
 
@@ -44,12 +13,6 @@ from typing import Callable, List, Tuple, Union
 import torch
 from torch.multiprocessing import reductions
 
-# ---------------------------------------------------------------------------
-# patch_torch (CUDA branch only)
-# ---------------------------------------------------------------------------
-
-# The signature has not been changed for years, and we will not need this when
-# the next version is released, so it looks safe to use a constant.
 _REDUCE_TENSOR_ARG_DEVICE_INDEX = 6
 
 
@@ -98,11 +61,6 @@ def _modify_tuple(t, index: int, modifier: Callable):
     return *t[:index], modifier(t[index]), *t[index + 1 :]
 
 
-# ---------------------------------------------------------------------------
-# tensor_bucket
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class FlattenedTensorMetadata:
     """Metadata for a tensor in a flattened bucket"""
@@ -116,12 +74,8 @@ class FlattenedTensorMetadata:
 
 
 class FlattenedTensorBucket:
-    """
-    A bucket that flattens multiple tensors into a single tensor for efficient processing
-    while preserving all metadata needed for reconstruction.
-    """
+    """A bucket flattening many tensors into one, preserving the metadata needed for reconstruction."""
 
-    # This field is solely for users of to check whether the class supports this feature
     supports_multi_dtypes = True
 
     def __init__(
@@ -130,30 +84,20 @@ class FlattenedTensorBucket:
         flattened_tensor: torch.Tensor = None,
         metadata: List[FlattenedTensorMetadata] = None,
     ):
-        """
-        Initialize a tensor bucket from a list of named tensors OR from pre-flattened data.
-        Args:
-            named_tensors: List of (name, tensor) tuples (for creating new bucket)
-            flattened_tensor: Pre-flattened tensor (for reconstruction)
-            metadata: Pre-computed metadata (for reconstruction)
-        """
+        """Initialize a tensor bucket from a list of named tensors OR from pre-flattened data."""
         if named_tensors is not None:
-            # Create bucket from named tensors
             self.metadata: List[FlattenedTensorMetadata] = [None] * len(named_tensors)
             self.flattened_tensor: torch.Tensor = None
 
             if not named_tensors:
                 raise ValueError("Cannot create empty tensor bucket")
 
-            # Collect metadata and flatten tensors
             current_idx = 0
             flattened_tensors: List[torch.Tensor] = [None] * len(named_tensors)
 
             for i, (name, tensor) in enumerate(named_tensors):
                 flattened = tensor.flatten().view(torch.uint8)
                 flattened_tensors[i] = flattened
-
-                # Store metadata
 
                 numel = flattened.numel()
                 metadata_obj = FlattenedTensorMetadata(
@@ -167,10 +111,8 @@ class FlattenedTensorBucket:
                 self.metadata[i] = metadata_obj
                 current_idx += numel
 
-            # Concatenate all flattened tensors
             self.flattened_tensor = torch.cat(flattened_tensors, dim=0)
         else:
-            # Initialize from pre-flattened data
             if flattened_tensor is None or metadata is None:
                 raise ValueError("Must provide either named_tensors or both flattened_tensor and metadata")
             self.flattened_tensor = flattened_tensor
@@ -185,11 +127,7 @@ class FlattenedTensorBucket:
         return self.metadata
 
     def reconstruct_tensors(self) -> List[Tuple[str, torch.Tensor]]:
-        """
-        Reconstruct original tensors from flattened tensor with optimized performance.
-        Uses memory-efficient operations to minimize allocations and copies.
-        """
-        # preallocate the result list
+        """Reconstruct original tensors from flattened tensor with optimized performance."""
         reconstructed = [None] * len(self.metadata)
 
         for i, meta in enumerate(self.metadata):
@@ -200,48 +138,24 @@ class FlattenedTensorBucket:
         return reconstructed
 
 
-# ---------------------------------------------------------------------------
-# MultiprocessingSerializer / SafeUnpickler
-# ---------------------------------------------------------------------------
-
-
 class MultiprocessingSerializer:
     @staticmethod
     def serialize(obj, output_str: bool = False):
-        """
-        Serialize a Python object using ForkingPickler.
-
-        Args:
-            obj: The object to serialize.
-            output_str (bool): If True, return a base64-encoded string instead of raw bytes.
-
-        Returns:
-            bytes or str: The serialized object.
-        """
+        """Serialize a Python object using ForkingPickler."""
         buf = io.BytesIO()
         ForkingPickler(buf).dump(obj)
         buf.seek(0)
         output = buf.read()
 
         if output_str:
-            # Convert bytes to base64-encoded string
             output = base64.b64encode(output).decode("utf-8")
 
         return output
 
     @staticmethod
     def deserialize(data):
-        """
-        Deserialize a previously serialized object.
-
-        Args:
-            data (bytes or str): The serialized data, optionally base64-encoded.
-
-        Returns:
-            The deserialized Python object.
-        """
+        """Deserialize a previously serialized object."""
         if isinstance(data, str):
-            # Decode base64 string to bytes
             data = base64.b64decode(data, validate=True)
 
         return SafeUnpickler(io.BytesIO(data)).load()
@@ -249,7 +163,6 @@ class MultiprocessingSerializer:
 
 class SafeUnpickler(pickle.Unpickler):
     ALLOWED_MODULE_PREFIXES = {
-        # --- Python types ---
         "builtins.",
         "collections.",
         "copyreg.",
@@ -258,28 +171,23 @@ class SafeUnpickler(pickle.Unpickler):
         "operator.",
         "types.",
         "weakref.",
-        # --- PyTorch types ---
         "torch.",
         "torch._tensor.",
         "torch.storage.",
         "torch.nn.parameter.",
         "torch.autograd.function.",
-        # --- torch distributed ---
         "torch.distributed.",
         "torch.distributed._shard.",
         "torch.distributed._composable.",
         "torch._C._distributed_c10d.",
         "torch._C._distributed_fsdp.",
         "torch.distributed.optim.",
-        # --- multiprocessing ---
         "multiprocessing.resource_sharer.",
         "multiprocessing.reduction.",
         "pickletools.",
-        # --- PEFT / LoRA ---
         "peft.",
         "transformers.",
         "huggingface_hub.",
-        # --- unirl (vendored reductions + tensor bucket live here) ---
         "unirl.",
     }
 
@@ -296,14 +204,11 @@ class SafeUnpickler(pickle.Unpickler):
     }
 
     def find_class(self, module, name):
-        # Block deterministic attacks
         if (module, name) in self.DENY_CLASSES:
             raise RuntimeError(
                 f"Blocked unsafe class loading ({module}.{name}), to prevent exploitation of CVE-2025-10164"
             )
-        # Allowlist of safe-to-load modules.
         if any((module + ".").startswith(prefix) for prefix in self.ALLOWED_MODULE_PREFIXES):
             return super().find_class(module, name)
 
-        # Block everything else. (Potential attack surface)
         raise RuntimeError(f"Blocked unsafe class loading ({module}.{name}), to prevent exploitation of CVE-2025-10164")

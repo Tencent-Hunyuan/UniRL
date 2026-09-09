@@ -1,0 +1,178 @@
+# @package _global_
+#
+# Single-node (8 x H20) full-parameter CPPO variant of
+# qwen3_cppo_30b_a3b_base_dapo_sglang_lora.yaml.
+#
+# It keeps every non-LoRA training / sampling / optimization setting aligned
+# with the LoRA recipe.  The only functional changes are: train full model
+# weights instead of a LoRA adapter, and use TensorWeightSync to push the full
+# bf16 model state into the colocated SGLang server every rollout.
+#
+# Run:
+#   VENV_DIR=/path/to/venv \
+#   QWEN3_PATH=/path/to/Qwen3-30B-A3B-Base \
+#   DATA_PATH=/path/to/dapo_math/train.jsonl \
+#   EVAL_DATA_PATH=/path/to/dapo_math/aime_eval.jsonl \
+#   ENTRY=train_ar bash examples/run_experiment_single_node.sh \
+#     ar/qwen3_cppo_30b_a3b_base_dapo_sglang_full_weight_sync
+
+# One node has eight H20s. Use 16 prompts x 16 samples per rollout.
+num_devices: 8
+batch_size: 16
+num_rollouts: 800
+weight_sync_interval: 1
+eval_interval: 10
+eval_num_prompts: 16
+eval_batch_size: 8
+eval_samples_per_prompt: 8
+
+# Park FSDP parameters, gradients, and optimizer state on CPU while the
+# colocated SGLang server owns the eight GPUs for generation.
+enable_fsdp_offload: true
+
+adv_normalization_scope: group
+normalize_adv_by_std: false
+
+logging:
+  report_to_wandb: false
+  project_name: unirl-cppo
+  run_name: cppo_qwen3-30b-a3b-base_dapo_sglang_full_weight_sync
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: [cppo, qwen3, 30b-a3b-base, dapo, sglang, full-weight-sync, single-node]
+
+bundle:
+  _target_: unirl.models.qwen3.bundle.Qwen3Bundle.from_config
+  config:
+    _target_: unirl.models.qwen3.config.Qwen3PipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:QWEN3_PATH,Qwen/Qwen3-30B-A3B-Base}
+    # Keep fp32 storage/master shards; FSDP mixed precision below still
+    # materializes bf16 parameters for forward/backward.
+    model_precision: fp32
+    # Build on meta, shard with FSDP first, then materialize checkpoint weights.
+    # This avoids placing the complete fp32 30B model on every GPU at startup.
+    meta_init_transformer: true
+    use_gradient_checkpointing: true
+
+pipeline:
+  _target_: unirl.models.qwen3.pipeline.Qwen3Pipeline.from_bundle
+  enable_thinking: true
+  autocast_precision: bf16
+  logprob_precision: fp32
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["Qwen3MoeDecoderLayer"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true
+    use_torch_compile: false
+    forward_prefetch: false
+    defer_grad_sync: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    # Full-parameter updates require the full-finetuning scale, not the
+    # LoRA-only 1e-4 scale.
+    learning_rate: 1.0e-6
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 3200 # 800 rollouts x 4 updates per rollout
+
+rollout:
+  _target_: unirl.rollout.engine.sglang.engine.SGLangRolloutEngine
+  config:
+    _target_: unirl.rollout.engine.sglang.config.SGLangEngineConfig
+    backend: http
+    pretrained_model_ckpt_path: ${oc.env:QWEN3_PATH,Qwen/Qwen3-30B-A3B-Base}
+    tp_size: 8
+    ep_size: 8
+    # SGLang enables MoE expert parallelism through ep_size; the pinned
+    # ServerArgs has no separate enable_expert_parallel boolean.
+    max_new_tokens: 4096
+    temperature: 1.0
+    top_p: 1.0
+    concurrency: 64
+    samples_pre_expanded: true
+    # The trainer sleeps SGLang before restoring FSDP onto the same GPUs.
+    # Preserve the latest rollout weights across rounds that intentionally
+    # skip a full sync (including rollout 0 when baseline eval is disabled).
+    enable_memory_saver: true
+    enable_weights_cpu_backup: true
+    skip_server_warmup: false
+    chat_template_kwargs:
+      enable_thinking: true
+    engine_kwargs:
+      # Leaves room for FSDP offload/onload and staged SGLang wake on this
+      # 8-GPU 30B MoE recipe; retune when changing the model or TP layout.
+      mem_fraction_static: 0.15
+      attention_backend: triton
+      disable_cuda_graph: false
+      cuda_graph_max_bs: 64
+      enable_lora: false
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  truncated_reward: keep
+  backend:
+    _target_: unirl.reward.local.mathverify.MathVerifyRewardScorer
+    base_device: cpu
+    config:
+      _target_: unirl.reward.local.mathverify.MathVerifySpec
+
+algorithm:
+  _target_: unirl.algorithms.cppo.CPPO
+  stage_attr: ar
+  cppo_delta: 0.20
+  cppo_w_min: 0.8
+  cppo_delta_b: 0.02
+  loss_agg_mode: seq-mean-token-sum-norm
+  horizon: 4096
+  sampling_temperature: 1.0
+  old_logp_source: rollout
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.qwen3.conditions.Qwen3ARConditions
+
+# Full-weight tensor sync.  Each FSDP shard is gathered at bf16 and serialized
+# as tensor buckets for the colocated SGLang TP workers.
+sync:
+  _target_: unirl.distributed.weight_sync.full.tensor.TensorWeightSync
+  lora_merged: false
+  bucket_size_mb: 512
+  wire_dtype: bf16
+  flush_cache: true
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 4
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: ${oc.env:DATA_PATH}
+      eval_data_path: ${oc.env:EVAL_DATA_PATH,${oc.env:DATA_PATH}}
+      seed: 42
+    algorithm:
+      prompts_per_rollout: 16
+
+sampling:
+  _target_: unirl.types.sampling.ARSamplingParams
+  samples_per_prompt: 16
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 0
+  max_new_tokens: 4096

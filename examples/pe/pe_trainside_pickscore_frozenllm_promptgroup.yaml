@@ -191,7 +191,7 @@ sampling:
     # so the LAST step (index 9) is excluded. Replaces the prior sde_indices:[0..9]
     # which made EVERY step inject noise (over-randomized → smeared images).
     scheduler:
-      _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+      _target_: unirl.sde.index_schedule.AllSDEScheduler
       num_timesteps: ${..num_inference_steps}
       num_sde_steps: 1
       timestep_fraction: [0, 0.9]

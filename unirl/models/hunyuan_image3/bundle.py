@@ -1,33 +1,4 @@
-"""HunyuanImage3Bundle — concrete weights+params holder for HunyuanImage 3.0.
-
-Implements the empty :class:`Bundle` Protocol. Pure container of the
-modules HunyuanImage3 ships with: 1× shared MoE transformer
-(``HunyuanImage3ForCausalMM`` from the upstream ``hunyuan_image_3``
-package), 1× SigLIP2 ViT vision tower, 1× 3D-VAE, 1× tokenizer,
-1× scheduler. No LoRA injection, FSDP wrap, adapter switching, autocast
-helpers, or weight-sync logic — those are lifecycle concerns owned
-outside the bundle.
-
-The shared backbone is a single ``nn.Module`` that operates in either
-``mode="gen_text"`` (autoregressive) or ``mode="gen_image"`` (DiT
-denoise) depending on the call site. The AR and Diffusion stages both
-call into ``self.transformer`` directly with different ``mode=`` kwargs.
-
-MoE expert parallelism is intentionally not exposed here — initial
-integration runs at EP=1 (full backbone replicated). Add EP wiring when
-the training stack grows EP support.
-
-Use :meth:`HunyuanImage3Bundle.from_config` to load a small / single-
-device HuggingFace checkpoint via ``trust_remote_code=True`` (the
-upstream package ships the modeling code in the checkpoint repo). For
-the real 80B ``tencent/HunyuanImage-3.0`` weights this path will OOM —
-the training stack constructs the bundle manually with
-``device_map="auto"``.
-
-Chat-template input prep (tokenizer wrapper + rope helpers) lives on
-``HunyuanImage3TextEmbedStage`` (``embed_for_ar`` / ``embed_for_gen_image``),
-not here.
-"""
+"""HunyuanImage3Bundle — concrete weights+params holder for HunyuanImage 3.0."""
 
 from __future__ import annotations
 
@@ -65,19 +36,11 @@ class HunyuanImage3Bundle(Bundle):
     ) -> None:
         super().__init__()
         self.transformer = transformer
-        # ``vae`` / ``vit`` are exposed as ``@property`` over ``self._vae`` /
-        # ``self._vit`` so :meth:`materialize` can flip them after meta-init
-        # construction (where they're initially ``None``). The backing
-        # transformer always has ``transformer.vae`` / ``transformer.vision_model``
-        # children — they may be on meta until materialized.
         self._vae = vae
         self._vit = vit
         self.tokenizer = tokenizer
         self.scheduler = scheduler
         self.dtype = dtype
-        # Used by :meth:`materialize` so the loaded VAE lands at the same
-        # dtype as ``from_config``'s eager path. Defaults to ``dtype`` when
-        # ``vae_dtype`` isn't provided.
         self.vae_dtype = vae_dtype if vae_dtype is not None else dtype
         self.device = device
         self.pretrained_path = pretrained_path
@@ -92,30 +55,11 @@ class HunyuanImage3Bundle(Bundle):
         return self._vit
 
     def trainable_module(self) -> nn.Module:
-        """The sharded trainable subtree the backend wraps: the bare decoder
-        (``HunyuanImage3Model`` at ``transformer.model``).
-
-        Its diffusion heads + frozen VAE/ViT are wrapper-level *siblings* that
-        stay OUTSIDE the FSDP/VeOmni wrap — loaded by :meth:`materialize`, kept
-        off the optimizer/checkpoint, and (under ``with_aux=()``) left on meta.
-        Handing the backend this single module (not the composite wrapper) is
-        what lets HI3 run under VeOmni. All LoRA adapters (``qkv_proj``/
-        ``o_proj``) live in the decoder, so optimizer / EMA / checkpoint /
-        weight-sync scope is the decoder — which also makes the ``"model."``
-        sync prefix in ``config.py`` resolve correctly (the wrapper handoff
-        double-prefixed it)."""
+        """The sharded trainable subtree the backend wraps: the bare decoder"""
         return self.transformer.model
 
     def prepare_for_expert_parallel(self) -> None:
-        """Make the decoder expert-parallel-ready (backend hook; called only when
-        ``ep_size > 1``, on the meta model, before ``veomni_parallelize``).
-
-        Swaps each decoder layer's ``HunyuanMoE`` (nn.ModuleList experts) for a
-        ``FusedHunyuanMoE`` (fused ``[E,2I,H]`` experts via veomni grouped GEMM +
-        all_to_all) and attaches ``get_parallel_plan`` so VeOmni's EP can
-        ``Shard(0)`` the fused tensors. Flags :meth:`materialize` to fuse the
-        per-expert checkpoint keys and take the EP-sharded load path. Driven
-        solely by ``backend.fsdp_cfg.ep_size`` — there is no separate config flag."""
+        """Make the decoder expert-parallel-ready (backend hook; called only when"""
         from unirl.train.backend.veomni.ep.models.hi3 import replace_hunyuan_moe_with_fused
 
         n_swapped = replace_hunyuan_moe_with_fused(self.transformer.model)
@@ -124,19 +68,7 @@ class HunyuanImage3Bundle(Bundle):
 
     @classmethod
     def from_config(cls, config: HunyuanImage3PipelineConfig) -> "HunyuanImage3Bundle":
-        """Load all HunyuanImage3 components from a HuggingFace checkpoint.
-
-        Loads ``HunyuanImage3ForCausalMM`` via
-        ``AutoModelForCausalLM.from_pretrained(..., trust_remote_code=True)``
-        — the ckpt's ``auto_map`` resolves the wrapper class that owns
-        ``vae`` and ``vision_model``. (``AutoModel`` would land on the
-        backbone-only ``HunyuanImage3Model``, which has neither.)
-
-        ``.to(device)`` is unconditional here, which only works for small
-        checkpoints. The 80B ``tencent/HunyuanImage-3.0`` weights need
-        ``device_map="auto"`` — for that path, callers construct the
-        bundle directly via ``__init__``.
-        """
+        """Load all HunyuanImage3 components from a HuggingFace checkpoint."""
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         from .compat import apply_hi3_transformers5_compat
@@ -151,19 +83,12 @@ class HunyuanImage3Bundle(Bundle):
         vae_raw = config.vae_dtype if config.vae_dtype is not None else config.model_precision
         vae_dtype = parse_torch_dtype(vae_raw, field_name="vae_dtype")
 
-        # Shared MoE backbone — operates in both gen_text and gen_image modes.
-        # Must be ``AutoModelForCausalLM`` so we get ``HunyuanImage3ForCausalMM``
-        # (with .vae / .vision_model / ._tkwrapper); ``AutoModel`` returns
-        # the inner ``HunyuanImage3Model`` (backbone only).
         transformer = AutoModelForCausalLM.from_pretrained(
             path,
             torch_dtype=dtype,
             trust_remote_code=True,
         ).to(device)
 
-        # The 3D-VAE and SigLIP2 ViT are bundled inside the same checkpoint
-        # repo as auxiliary modules — the upstream code attaches them on the
-        # main model, so we expose direct references rather than reloading.
         vae = getattr(transformer, "vae", None) or getattr(transformer, "vae_model", None)
         if vae is None:
             raise RuntimeError(
@@ -174,8 +99,6 @@ class HunyuanImage3Bundle(Bundle):
         vae = vae.to(device=device, dtype=vae_dtype).eval()
         vae.requires_grad_(False)
 
-        # Real upstream attribute is ``vision_model`` (hunyuan.py:1729). The
-        # other names are kept for forward-compat with older / forked weights.
         vit = (
             getattr(transformer, "vit", None)
             or getattr(transformer, "vision_tower", None)
@@ -193,10 +116,6 @@ class HunyuanImage3Bundle(Bundle):
 
         tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
 
-        # Scheduler — upstream ships ``FlowMatchDiscreteScheduler`` inside
-        # ``hunyuan_image_3.hunyuan_image_3_pipeline``. Try direct import; fall
-        # back to a no-scheduler bundle (pipeline will use
-        # ``sde.runtime.get_sigma_schedule`` directly).
         scheduler: Any = None
         try:
             from hunyuan_image_3.hunyuan_image_3_pipeline import (  # type: ignore[import-not-found]
@@ -225,24 +144,12 @@ class HunyuanImage3Bundle(Bundle):
             mrope_section=tuple(config.mrope_section),
         )
 
-    # ------------------------------------------------------------------
-    # Meta-init constructor for large models (80B+).
-    # ------------------------------------------------------------------
-
     @classmethod
     def from_meta_config(
         cls,
         config: HunyuanImage3PipelineConfig,
     ) -> "HunyuanImage3Bundle":
-        """Build the bundle with the full ``HunyuanImage3ForCausalMM`` on
-        meta-device. Returns immediately without any per-rank weight load.
-
-        Used for the 80B path. Every parameter (decoder, lm_head, heads,
-        vae, vit) stays on meta until :meth:`materialize` runs — that
-        single call covers the FSDP-wrapped decoder via DCP plus all
-        wrapper-level non-FSDP children, with vae / vit opt-in via
-        ``with_aux``.
-        """
+        """Build the bundle with the full ``HunyuanImage3ForCausalMM`` on"""
         from accelerate import init_empty_weights
         from transformers import (
             AutoConfig,
@@ -263,23 +170,11 @@ class HunyuanImage3Bundle(Bundle):
         vae_raw = config.vae_dtype if config.vae_dtype is not None else config.model_precision
         vae_dtype = parse_torch_dtype(vae_raw, field_name="vae_dtype")
 
-        # 1. Cheap config load — just JSON.
         hf_config = AutoConfig.from_pretrained(path, trust_remote_code=True)
 
-        # 2. Build full model on meta. ``init_empty_weights`` puts every
-        #    ``nn.Parameter`` allocation on the meta device, so no weight
-        #    memory is allocated. Tokenizer wrapper still needs to be set up
-        #    afterwards — that's metadata, not parameters.
         with init_empty_weights():
             transformer = AutoModelForCausalLM.from_config(hf_config, trust_remote_code=True)
 
-        # ``from_config`` does NOT load ``generation_config.json`` (only
-        # ``from_pretrained`` does). HI3 pipelines read custom fields like
-        # ``sequence_template``, ``bot_task``, ``flow_shift`` off the
-        # generation config to drive t2i / t2t / t2it routing — so we
-        # explicitly load it here. Falls back silently if the file is
-        # missing (the HF default GenerationConfig is fine for non-HI3
-        # paths).
         try:
             transformer.generation_config = GenerationConfig.from_pretrained(path)
         except (OSError, ValueError):
@@ -287,14 +182,8 @@ class HunyuanImage3Bundle(Bundle):
 
         tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
 
-        # VeOmni's ``parallelize`` calls ``init_weights()`` on the module it
-        # wraps (the decoder, via :meth:`trainable_module`) right after
-        # ``to_empty``; stamp it to a no-op so it cannot clobber the real weights
-        # that :meth:`materialize` installs post-shard. Mirrors the qwen_image /
-        # sd3 meta-init bundles. Harmless on the FSDP path (never called there).
         transformer.model.init_weights = lambda: None  # type: ignore[method-assign]
 
-        # Scheduler — same as ``from_config``; tiny, no meta concerns.
         scheduler: Any = None
         try:
             from hunyuan_image_3.hunyuan_image_3_pipeline import (  # type: ignore[import-not-found]
@@ -323,14 +212,6 @@ class HunyuanImage3Bundle(Bundle):
             mrope_section=tuple(config.mrope_section),
         )
 
-    # ------------------------------------------------------------------
-    # Materialization (single entry point, covers decoder + heads + opt-in aux)
-    # ------------------------------------------------------------------
-
-    # Wrapper-level diffusion-head modules: siblings of ``transformer.model``
-    # (the FSDP-wrapped decoder) that are part of the diffusion forward path.
-    # Always materialized — they're tiny vs. the decoder and required for
-    # replay.
     _DECODER_HEAD_ATTRS = (
         "lm_head",
         "final_layer",
@@ -347,30 +228,13 @@ class HunyuanImage3Bundle(Bundle):
         device: torch.device,
         with_aux: Sequence[str] = (),
     ) -> None:
-        """Single-call materialization for the meta-init path.
-
-        Allocates per-rank storage on ``device`` for everything in the
-        materialization set + loads HF weights via DCP's
-        ``set_model_state_dict`` — which transparently handles DTensor
-        (the FSDP-wrapped decoder) and plain tensors (heads, opt-in
-        vae/vit) in one collective. The materialization set is:
-
-        - ``transformer.model`` (FSDP-wrapped decoder, always)
-        - All wrapper-level diffusion heads listed in
-          :attr:`_DECODER_HEAD_ATTRS` (always; tiny, required for replay)
-        - ``transformer.vae`` if ``"vae" in with_aux``
-        - ``transformer.vision_model`` if ``"vit" in with_aux``
-
-        Idempotent: modules already materialized (full-load path or repeat
-        call) skip the per-shard ``to_empty`` step.
-
-        Pre-condition: phase 2 (FSDPPolicy construction → ``fully_shard``)
-        has already run. Bundle's caller is responsible for the wrap order.
-        """
+        """Single-call materialization for the meta-init path."""
         from torch.distributed.checkpoint.state_dict import (
             StateDictOptions,
             set_model_state_dict,
         )
+
+        from unirl.models.types.post_materialize import canonical_param_name
 
         aux_set = tuple(with_aux)
         for name in aux_set:
@@ -379,9 +243,6 @@ class HunyuanImage3Bundle(Bundle):
                     f"HunyuanImage3Bundle.materialize: unknown aux module {name!r}; expected 'vae' or 'vit'."
                 )
 
-        # Plan: (top-level attr name on transformer, module). Decoder is
-        # always first. Heads + aux follow. Top-level attr names double as
-        # state_dict prefixes (decoder -> "model.*"; lm_head -> "lm_head.*").
         plan: List[Tuple[str, nn.Module]] = []
         decoder = getattr(self.transformer, "model", None)
         if decoder is None or not isinstance(decoder, nn.Module):
@@ -411,39 +272,26 @@ class HunyuanImage3Bundle(Bundle):
                 )
             plan.append(("vision_model", vit))
 
-        # 1. Allocate per-rank storage for any module still on meta. The
-        #    decoder's ``to_empty`` is FSDP-aware (per-shard cuda alloc);
-        #    heads and aux are plain ``nn.Module.to_empty``. Already-
-        #    materialized modules (full-load path or repeat call) are
-        #    skipped — the meta check covers both DTensor shards and
-        #    regular params.
         for _attr, module in plan:
             if _module_has_meta_param(module):
                 module.to_empty(device=device)
 
-        # 2. Build filtered state_dict on rank 0 only. Keys retain their
-        #    wrapper-level namespace (e.g. ``model.layers.0.weight``,
-        #    ``lm_head.weight``) — DCP matches them against
-        #    ``self.transformer``'s parameters in a single pass.
         if _current_rank() == 0:
             prefixes = tuple(attr for attr, _ in plan)
             sd = _collect_filtered_state_dict(self.pretrained_path, prefixes=prefixes)
 
-            # Expert parallelism: fuse per-expert checkpoint keys
-            # (model.layers.*.mlp.experts.{j}.{gate_and_up,down}_proj.weight) into
-            # the FusedHunyuanMoE's [E,...] params (gate_and_up half-swapped to
-            # veomni's silu-first convention). Matches prepare_for_expert_parallel's swap.
             if getattr(self, "_ep_enabled", False):
                 from unirl.train.backend.veomni.ep.models.hi3 import fuse_expert_state_dict
 
                 sd = fuse_expert_state_dict(sd)
 
-            # [Bug B fix] LoRA key rename: peft.inject_adapter_in_model wraps
-            # q/k/v/o_proj.weight as q/k/v/o_proj.base_layer.weight. The ckpt
-            # has original names (*.weight). With strict=False,
-            # set_model_state_dict silently skips the mismatch → meta-allocated
-            # NaN params stay. Fix: rename ckpt keys to LoRA-wrapped namespace.
-            expected_names = {name for name, _ in self.transformer.named_parameters(remove_duplicate=False)}
+            # Remap LoRA base_layer keys before loading to avoid skipped parameters.
+            # Canonical names: ``set_model_state_dict`` below matches against
+            # ``state_dict()`` keys, which never carry the AC-wrapper segment
+            # that ``named_parameters()`` exposes.
+            expected_names = {
+                canonical_param_name(name) for name, _ in self.transformer.named_parameters(remove_duplicate=False)
+            }
             rename_map = {}
             for name in expected_names:
                 if not name.endswith((".base_layer.weight", ".base_layer.bias")):
@@ -463,17 +311,12 @@ class HunyuanImage3Bundle(Bundle):
         else:
             sd = {}
 
-        # Expert parallelism: pull the fused expert tensors OUT of the DCP load.
-        # They are EP-sharded DTensors (Shard(0) on the EP mesh); DCP's broadcast
-        # path copies the full [E,...] onto the local [E/ep,...] shard and fails.
-        # load_ep_experts re-shards them with the param's own mesh instead.
         expert_sd = {}
         if getattr(self, "_ep_enabled", False):
             from unirl.train.backend.veomni.ep.models.hi3 import is_fused_expert_key
 
             expert_sd = {k: sd.pop(k) for k in list(sd) if is_fused_expert_key(k)}
 
-        # 3. Single DCP load (non-expert params: FSDP-sharded + plain heads)
         set_model_state_dict(
             self.transformer,
             sd,
@@ -498,12 +341,6 @@ class HunyuanImage3Bundle(Bundle):
             if _current_rank() == 0:
                 logger.info("expert-parallel: loaded %d EP-sharded expert param(s)", n_exp)
 
-            # VeOmni root-shards the non-layer params (wte, ln_f, lm_head) into
-            # DTensors; HI3's ForCausalMM wrapper calls them OUTSIDE the decoder
-            # forward (wte -> inputs_embeds for ViT scatter; ln_f/lm_head -> logits),
-            # hitting `aten.* got mixed Tensor and DTensor`. Hook those three to
-            # all-gather their weights for such direct calls. Pass the whole
-            # transformer so lm_head (on the outer ForCausalMM) is reachable too.
             from unirl.train.backend.veomni.ep import register_unsharded_param_hooks
 
             n_hooked = register_unsharded_param_hooks(self.transformer)
@@ -516,15 +353,24 @@ class HunyuanImage3Bundle(Bundle):
             if _current_rank() == 0:
                 logger.info("expert-parallel: hooked root params for direct all-gather: %d", n_hooked)
 
-        # [Bug B fix] Post-load validation: verify all LoRA base_layer
-        # params are finite and not on meta.
         if _current_rank() == 0:
-            _bl_checked, _bl_bad = 0, 0
+            _bl_checked, _bl_bad, _bl_cpu_offloaded = 0, 0, 0
             for name, p in self.transformer.named_parameters(remove_duplicate=False):
                 if ".base_layer." not in name:
                     continue
                 _bl_checked += 1
-                if p.is_meta or not p.data.isfinite().all():
+                if p.is_meta:
+                    _bl_bad += 1
+                    continue
+                # FSDP2's CPU offload splits DTensor storage mid-construction; the state-dict load already checked them.
+                try:
+                    is_finite = bool(p.data.isfinite().all())
+                except RuntimeError as exc:
+                    if "storage on different device" not in str(exc):
+                        raise
+                    _bl_cpu_offloaded += 1
+                    continue
+                if not is_finite:
                     _bl_bad += 1
             if _bl_checked > 0:
                 if _bl_bad > 0:
@@ -535,20 +381,14 @@ class HunyuanImage3Bundle(Bundle):
                     )
                 print(
                     f"[Bug B fix] HunyuanImage3Bundle.materialize: "
-                    f"verified {_bl_checked} LoRA base_layer params loaded "
-                    f"finite ✓",
+                    f"verified {_bl_checked - _bl_cpu_offloaded} LoRA base_layer "
+                    f"params loaded finite; deferred {_bl_cpu_offloaded} "
+                    f"CPU-offloaded shard(s) ✓",
                     flush=True,
                 )
 
         del sd
 
-        # 4. Post-load casts + freeze + eval for aux modules. Heads stay
-        #    in bundle.dtype (already correct from ``to_empty``); decoder
-        #    stays in whatever FSDP set. Aux needs its target_dtype
-        #    restored — ``to_empty`` preserves the meta tensor's dtype
-        #    (which after the FSDP-policy pre-wrap homogenization is
-        #    bundle.dtype = bf16 across the board, but vae must run in
-        #    vae_dtype for numerical reasons).
         if "vae" in aux_set:
             vae_module = self.transformer.vae
             vae_module.to(dtype=self.vae_dtype).eval().requires_grad_(False)
@@ -560,8 +400,7 @@ class HunyuanImage3Bundle(Bundle):
 
 
 def _module_has_meta_param(module: nn.Module) -> bool:
-    """True if any parameter of ``module`` (recursing into children) is on
-    the meta device. Used to gate per-shard ``to_empty`` calls."""
+    """True if any parameter of ``module`` (recursing into children) is on"""
     for p in module.parameters(recurse=True):
         if p.is_meta:
             return True
@@ -582,16 +421,7 @@ def _collect_filtered_state_dict(
     *,
     prefixes: Sequence[str],
 ) -> Dict[str, torch.Tensor]:
-    """Stream the HF safetensors checkpoint, returning all keys whose
-    top-level prefix matches one of ``prefixes`` (matched as
-    ``prefix + "."``). Keys are returned at the wrapper-level namespace
-    (no stripping) so they match against ``HunyuanImage3ForCausalMM``'s
-    parameter names directly.
-
-    Reads ``model.safetensors.index.json`` to find which shard files
-    contain matching keys, then opens only those shards. Falls back to
-    the single-file ``model.safetensors`` layout when no index is present.
-    """
+    """Stream the HF safetensors checkpoint, returning all keys whose"""
     import json
 
     from safetensors.torch import safe_open
@@ -610,7 +440,6 @@ def _collect_filtered_state_dict(
         with open(index_path) as f:
             index = json.load(f)
         weight_map: Dict[str, str] = index.get("weight_map", {})
-        # Group keys by shard file so we open each file at most once.
         files_to_keys: Dict[str, List[str]] = {}
         for key, fname in weight_map.items():
             if not _matches(key):

@@ -1,19 +1,7 @@
-"""The native ``Backend`` impl — ``DiffGenerator`` + the ZMQ scheduler client.
-
-The ONLY module that imports the SGLang runtime or does I/O. Covers both local
-mode (``from_pretrained`` spawns the worker in-process) and the existing remote
-mode (``local_mode=False`` connects the scheduler client to an externally launched
-server's ``scheduler_port``). Weight-sync ``*ReqInput`` io_struct types stay
-*inside* this module.
-
-Because the SGLang import is lazy (only in :meth:`SGLangBackend.boot` and the
-verbs), the module imports on CPU — the rest of the package is exercisable
-without a GPU.
-"""
+"""The native ``Backend`` impl — ``DiffGenerator`` + the ZMQ scheduler client."""
 
 from __future__ import annotations
 
-import dataclasses
 import logging
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -23,19 +11,7 @@ logger = logging.getLogger(__name__)
 
 
 def _import_sglang_runtime() -> Dict[str, Any]:
-    """Install the UniRL patch suite, then import the runtime types. Once per process.
-
-    Stock upstream sglang (>= 0.5.12.post1) replaced the fork: the RL additions
-    (weight-sync verbs, in-memory LoRA, sleep/wake, rollout IO fields) are
-    re-hosted as in-process patches under ``unirl.rollout.engine.sglang_diffusion._patches``
-    and MUST be installed before any scheduler/worker spawns — ``hijack()`` also
-    wraps the mp process target so spawned children re-install (mirrors the v1
-    engine, ``sglang/engine.py``).
-
-    Import sourcing mirrors v1: types that exist upstream come from upstream;
-    fork-only req types come from ``_patches.io_struct`` / ``_patches.lora_req``
-    (``patch_scheduler`` registers handlers keyed on those exact classes).
-    """
+    """Install the UniRL patch suite, then import the runtime types. Once per process."""
     from unirl.rollout.engine.sglang_diffusion._patches import SglangDiffusionHijack
 
     SglangDiffusionHijack.hijack()
@@ -75,17 +51,7 @@ def _import_sglang_runtime() -> Dict[str, Any]:
 
 
 class _RawResultView:
-    """Flat ``RawResult`` view over upstream's ``GenerationResult``.
-
-    Stock upstream packs the rollout trajectory + native log-probs into the
-    nested ``rollout_trajectory_data`` (RolloutTrajectoryData) instead of the
-    fork's flat ``trajectory_latents`` / ``trajectory_timesteps`` /
-    ``trajectory_log_probs``. This view flattens that path (rtd-only, tolerant
-    of missing levels — mirrors the v1 ``response.py`` accessors; GRPO uses the
-    ``dit_trajectory`` latents so the trajectory stays aligned with
-    ``rollout_log_probs``) and passes every other wire field through, keeping
-    adapters/utils on the unchanged ``RawResult`` protocol.
-    """
+    """Flat ``RawResult`` view over upstream's ``GenerationResult``."""
 
     __slots__ = ("_result",)
 
@@ -101,6 +67,12 @@ class _RawResultView:
     def trajectory_timesteps(self) -> Any:
         rtd = getattr(self._result, "rollout_trajectory_data", None)
         return getattr(getattr(rtd, "dit_trajectory", None), "timesteps", None)
+
+    @property
+    def aux_trajectory_latents(self) -> Any:
+        """LTX-2's co-denoised AUDIO trajectory ``[B, T+1, ...]``; ``None`` for models without one."""
+        rtd = getattr(self._result, "rollout_trajectory_data", None)
+        return getattr(getattr(rtd, "dit_trajectory", None), "audio_latents", None)
 
     @property
     def trajectory_log_probs(self) -> Any:
@@ -119,10 +91,6 @@ class SGLangBackend:
         self._rt = runtime
         self._server_args = server_args
 
-    # ------------------------------------------------------------------ #
-    # Boot — the only place from_pretrained / the import live
-    # ------------------------------------------------------------------ #
-
     @classmethod
     def boot(
         cls,
@@ -130,32 +98,16 @@ class SGLangBackend:
         *,
         local_mode: bool,
     ) -> "SGLangBackend":
-        """Filter intent against ServerArgs, build the generator, return the backend.
-
-        ``server_intent`` is the model/parallelism/port intent dict from
-        ``config.server_intent`` (reserved ports already overlaid — including
-        ``master_port``, the spawned workers' dist init, so no ``MASTER_PORT``
-        env manipulation happens here). We filter it to real ServerArgs fields
-        here (the only place that knows them), then spawn.
-        """
+        """Resolve ServerArgs and model PipelineConfig intent, then build the generator."""
         rt = _import_sglang_runtime()
-        allowed = {f.name for f in dataclasses.fields(rt["ServerArgs"])}
-        server_kwargs = {k: v for k, v in server_intent.items() if k in allowed}
-
-        disable_autocast = server_kwargs.get("disable_autocast")
-        server_args = rt["ServerArgs"].from_kwargs(**server_kwargs)
-        if disable_autocast is not None:
-            server_args.disable_autocast = disable_autocast
+        # from_dict keeps PipelineConfig keys; filtering to ServerArgs fields drops them.
+        server_args = rt["ServerArgs"].from_dict(dict(server_intent))
 
         generator = rt["DiffGenerator"].from_pretrained(
             server_args=server_args,
             local_mode=bool(local_mode),
         )
         return cls(generator, rt, server_args)
-
-    # ------------------------------------------------------------------ #
-    # Generation
-    # ------------------------------------------------------------------ #
 
     def generate(self, sampling_kwargs: Dict[str, Any]) -> List[RawResult]:
         raw = self._gen.generate(sampling_params_kwargs=sampling_kwargs)
@@ -171,9 +123,6 @@ class SGLangBackend:
         from types import SimpleNamespace
 
         pcfg = self._server_args.pipeline_config
-        # SGLang populates arch_config.vae_scale_factor lazily in
-        # vae_config.post_init(); our standalone call here (init_same_noise path)
-        # can run before that hook fired — populate it idempotently.
         vae_cfg = getattr(pcfg, "vae_config", None)
         arch = getattr(vae_cfg, "arch_config", None)
         if arch is not None and not hasattr(arch, "vae_scale_factor") and hasattr(vae_cfg, "post_init"):
@@ -183,15 +132,7 @@ class SGLangBackend:
         full_shape = pcfg.prepare_latent_shape(batch_stub, batch_size, num_frames)
         return tuple(full_shape[1:])
 
-    # ------------------------------------------------------------------ #
-    # Memory / lifecycle / health
-    # ------------------------------------------------------------------ #
-
     def release_memory(self, *, tags: Sequence[str], cpu_backup_tags: Optional[Sequence[str]] = None) -> None:
-        # Stock upstream DiffGenerator has no memory-occupation methods (the fork
-        # added them); route through the scheduler client to the handlers that
-        # ``patch_scheduler`` installs, keyed on the ``_patches`` req types
-        # (mirrors the v1 engine's ``_call_memory_api``).
         self._forward(
             self._rt["ReleaseMemoryOccupationReqInput"](
                 tags=list(tags),
@@ -222,10 +163,6 @@ class SGLangBackend:
         except Exception as exc:  # noqa: BLE001
             logger.warning("SGLang health_check ping failed: %s", exc)
             return False
-
-    # ------------------------------------------------------------------ #
-    # Weight-sync verbs (io_struct types stay here; no RL types cross)
-    # ------------------------------------------------------------------ #
 
     def update_from_tensor(
         self,
@@ -324,10 +261,6 @@ class SGLangBackend:
         if not (isinstance(output, dict) and output):
             raise RuntimeError(f"SGLang checksum query returned invalid payload: {output!r}")
         return output
-
-    # ------------------------------------------------------------------ #
-    # Scheduler request plumbing
-    # ------------------------------------------------------------------ #
 
     def _forward(self, request: Any, *, op: str) -> Any:
         response = self._rt["sync_scheduler_client"].forward(request)

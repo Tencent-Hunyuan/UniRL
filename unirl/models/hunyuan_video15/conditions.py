@@ -1,31 +1,4 @@
-"""HunyuanVideo15Conditions — typed conditions container for HunyuanVideo-1.5.
-
-Concrete instantiation of the ``DiffusionStage[C]`` type parameter.
-Diverges from the SD3 / WAN21 / Qwen-Image conditions shape because
-HunyuanVideo-1.5 uses **two parallel text encoders** — a Qwen2.5-VL
-MLLM stream (``text_mllm``) and a ByT5 glyph stream (``text_glyph``)
-— that the transformer cross-attends to in separate attention heads
-(``encoder_hidden_states`` vs ``encoder_hidden_states_2``). The CFG
-negative branch carries its own pair (``negative_text_*``).
-
-A future I2V port will add the SigLIP ``vision`` slot (already a
-type-level supported :class:`ImageEmbedCondition`); v1 leaves it
-``None`` and the diffusion stage emits a zero placeholder of shape
-``[B, vision_num_semantic_tokens, vision_states_dim]`` per the upstream
-contract.
-
-Each ``TextEmbedCondition`` field carries the encoder's output
-``embeds`` and ``attn_mask``. ``pooled`` is always ``None`` because
-neither Qwen-VL nor ByT5 emits a pooled vector — the transformer reads
-token-level hidden states only.
-
-Pairs ``from_dict`` / ``to_dict`` mirroring SD3 / Qwen-Image for
-round-tripping between the typed form (used inside the pipeline at
-stage call sites) and the generic ``Conditions = Dict[str, Condition]``
-shape on ``RolloutResp``. Keys emitted: ``text_mllm`` /
-``text_glyph`` / (optional) ``negative_text_mllm`` /
-``negative_text_glyph`` / (optional) ``vision``.
-"""
+"""HunyuanVideo15Conditions — dual text streams plus ``[B, vision_num_semantic_tokens, vision_states_dim]``."""
 
 from __future__ import annotations
 
@@ -48,21 +21,11 @@ class HunyuanVideo15Conditions(Batch):
     text_glyph: Optional[TextEmbedCondition] = field(kind=FieldKind.CONCAT, default=None)
     negative_text_mllm: Optional[TextEmbedCondition] = field(kind=FieldKind.CONCAT, default=None)
     negative_text_glyph: Optional[TextEmbedCondition] = field(kind=FieldKind.CONCAT, default=None)
-    # I2V slot — v1 always None, T2V uses the zero-placeholder path inside
-    # the diffusion stage.
     vision: Optional[ImageEmbedCondition] = field(kind=FieldKind.CONCAT, default=None)
 
     @classmethod
     def from_dict(cls, d: Dict[str, Condition]) -> "HunyuanVideo15Conditions":
-        """Build from the generic ``Conditions`` dict shape.
-
-        Validates that BOTH text streams are present (HunyuanVideo-1.5's
-        transformer is dual-stream by contract; a single-stream call
-        would crash at the cross-attention KV pack). The negative
-        branches are optional (CFG-off) but must be present together
-        when CFG is on (the diffusion stage checks at call time).
-        Vision is optional (T2V-only branch).
-        """
+        """Build from the generic ``Conditions`` dict shape."""
         text_mllm = d.get("text_mllm")
         text_glyph = d.get("text_glyph")
         if not isinstance(text_mllm, TextEmbedCondition):
@@ -103,12 +66,7 @@ class HunyuanVideo15Conditions(Batch):
         )
 
     def to_dict(self) -> Dict[str, Condition]:
-        """Convert back to the generic ``Conditions`` dict shape for
-        packing into ``RolloutResp.tracks["video"].conditions``.
-
-        Emits the optional negative_* / vision keys only when populated
-        so the dict shape stays minimal for CFG-off / T2V rollouts.
-        """
+        """Convert back to the generic ``Conditions`` dict shape for packing into ``Part.conditions``."""
         if self.text_mllm is None or self.text_glyph is None:
             raise ValueError(
                 "HunyuanVideo15Conditions.to_dict: both text_mllm and text_glyph "

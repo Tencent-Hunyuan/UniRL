@@ -11,12 +11,7 @@ from unirl.distributed.tensor.backend.transfer_queue.base import Backend
 
 @dataclass
 class MooncakeZeroCopyConfig:
-    """Zero-copy buffer sizing for the Mooncake backend.
-
-    ``single_controller_*`` fields override ``tensor_buffer_size_gb`` /
-    ``bytes_buffer_size_gb`` on the controller-only client (see
-    ``MooncakeBackend.specialize_for_controller``).
-    """
+    """Zero-copy buffer sizing for the Mooncake backend."""
 
     enable: bool = True
     tensor_buffer_size_gb: float = 2.0
@@ -36,10 +31,6 @@ class MooncakeBackendConfig:
     local_buffer_size_gb: int = 10
     client_name: str = "MooncakeStorageClient"
     protocol: str = "rdma"
-    # ``device_name`` is auto-discovered at runtime by ``runtime.create_client``
-    # (sysfs walk → comma-separated HCA list → Mooncake's per-process PIX
-    # selection via ``MC_ENABLE_DEST_DEVICE_AFFINITY=1``). Override at the CLI
-    # with ``transfer_queue.device_name=<name>`` only for ops debugging.
     device_name: Optional[str] = None
     zero_copy: MooncakeZeroCopyConfig = field(default_factory=MooncakeZeroCopyConfig)
 
@@ -71,11 +62,7 @@ class MooncakeBackendConfig:
 
 
 def _zero_copy_to_dict(zero_copy: Any) -> Dict[str, Any]:
-    """Pull zero_copy fields into a plain dict regardless of source shape.
-
-    ``hydra.utils.instantiate`` may pass a DictConfig, a dataclass, or a plain
-    dict depending on conversion settings; attribute access works on all three.
-    """
+    """Pull zero_copy fields into a plain dict regardless of source shape."""
     return {
         "enable": bool(zero_copy.enable),
         "tensor_buffer_size_gb": float(zero_copy.tensor_buffer_size_gb),
@@ -109,8 +96,6 @@ class MooncakeBackend(Backend):
         self._local_buffer_size_gb = int(local_buffer_size_gb)
         self._client_name = str(client_name)
         self._protocol = str(protocol)
-        # ``None`` flows through to the handoff; ``runtime.create_client``
-        # substitutes a comma-list of available HCAs at process init.
         self._device_name = device_name if device_name is None else str(device_name)
         self._zero_copy = _zero_copy_to_dict(zero_copy)
 
@@ -126,7 +111,6 @@ class MooncakeBackend(Backend):
             "protocol": self._protocol,
             "device_name": self._device_name,
             "zero_copy": dict(self._zero_copy),
-            # Pure-client mode: derived byte counts the upstream library reads.
             "global_segment_size": int(self._global_segment_size_gb * 1024**3),
             "local_buffer_size": int(self._local_buffer_size_gb * 1024**3),
         }

@@ -1,22 +1,10 @@
-"""Audio-video / audio-text semantic alignment reward using Meta ImageBind.
-
-Mirrors Flow-Factory's ImageBind reward. Used for LTX-2.3 T2AV where the reward
-service injects the jointly-generated audio into ``request.generated["audio"]``
-alongside the video in ``request.generated["video"]``.
-
-IMPORTANT: ImageBind is licensed under CC-BY-NC-SA 4.0 (NonCommercial). The
-package is NOT a base dependency — it is imported lazily inside ``_load_model``
-so the scorer only pulls it in when a recipe explicitly selects ``imagebind``.
-Install with::
-
-    pip install git+https://github.com/facebookresearch/ImageBind.git
-    pip install git+https://github.com/facebookresearch/pytorchvideo.git
-"""
+"""Audio-video / audio-text semantic alignment reward using Meta ImageBind."""
 
 from __future__ import annotations
 
+import math
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 import torch
@@ -52,33 +40,39 @@ _IB_VISION_SIZE = 224
 _IB_VISION_MEAN = (0.48145466, 0.4578275, 0.40821073)
 _IB_VISION_STD = (0.26862954, 0.26130258, 0.27577711)
 
+_IMAGEBIND_MODES = ("audio_video", "text_audio", "text_video", "all")
+_IMAGEBIND_DEFAULT_WEIGHTS = {"audio_video": 0.5, "text_audio": 0.25, "text_video": 0.25}
+
 
 class ImageBindRewardScorer(LocalRewardBackend):
-    """Audio-video / audio-text alignment reward using Meta ImageBind.
-
-    Modes (``mode`` on the Spec):
-        - "audio_video" (default): cos_sim(audio, video)
-        - "text_audio":            cos_sim(text, audio)
-        - "text_video":            cos_sim(text, video)
-        - "all":                   weighted sum of all three
-
-    ``input_kind = "video"``: video is the primary decoded media; audio arrives
-    as the parallel side-channel (``request.generated["audio"]``).
-
-    IMPORTANT: ImageBind is CC-BY-NC-SA 4.0 (NonCommercial).
-    """
+    """Audio-video / audio-text alignment reward using Meta ImageBind."""
 
     canonical_model_name = "imagebind"
     input_kind = "video"
-    DEFAULT_MODE = "audio_video"
 
     def __init__(self, *, config: "ImageBindSpec", base_device: str) -> None:
-        self._mode = str(config.mode or self.DEFAULT_MODE)
-        self._weights = dict(config.weights or {"audio_video": 0.5, "text_audio": 0.25, "text_video": 0.25})
+        self._mode = config.mode
+        if self._mode not in _IMAGEBIND_MODES:
+            raise ValueError(f"ImageBindSpec.mode must be one of {_IMAGEBIND_MODES}; got {config.mode!r}.")
+        self._weights = dict(config.weights or _IMAGEBIND_DEFAULT_WEIGHTS)
+        if self._mode == "all":
+            if set(self._weights) != set(_IMAGEBIND_DEFAULT_WEIGHTS):
+                raise ValueError(
+                    f"ImageBindSpec.weights must contain exactly {sorted(_IMAGEBIND_DEFAULT_WEIGHTS)} "
+                    f"for mode='all'; got {sorted(self._weights)}."
+                )
+            if any(
+                not isinstance(weight, (int, float)) or not math.isfinite(weight) for weight in self._weights.values()
+            ):
+                raise ValueError("ImageBindSpec.weights values must be finite numbers.")
+            self._weights = {name: float(weight) for name, weight in self._weights.items()}
         super().__init__(
             device=resolve_device(config.device, base_device),
             batch_size=config.batch_size,
         )
+
+    def covers_prompt_video(self) -> bool:
+        return self._mode == "text_video" or (self._mode == "all" and self._weights["text_video"] > 0.0)
 
     def _load_model(self) -> None:
         warnings.warn(_IMAGEBIND_LICENSE_WARNING, stacklevel=2)
@@ -88,8 +82,6 @@ class ImageBindRewardScorer(LocalRewardBackend):
             raise ImportError(_IMAGEBIND_INSTALL_MSG) from e
 
         self.model = imagebind_model.imagebind_huge(pretrained=True).to(self.device).eval()
-
-    # ---- audio preprocessing -------------------------------------------------
 
     def _preprocess_audio_to_melspec(self, audio_list: List[torch.Tensor], src_sample_rate: int) -> torch.Tensor:
         import torch.nn.functional as Fn
@@ -102,7 +94,7 @@ class ImageBindRewardScorer(LocalRewardBackend):
             if wf.ndim == 2:
                 ch_axis = 0 if wf.shape[0] <= wf.shape[1] else 1
                 wf = wf.mean(dim=ch_axis)
-            wf = wf.reshape(1, -1)  # (1, T)
+            wf = wf.reshape(1, -1)
             if src_sample_rate != _IB_AUDIO_SAMPLE_RATE:
                 wf = AF.resample(wf, src_sample_rate, _IB_AUDIO_SAMPLE_RATE)
 
@@ -153,8 +145,6 @@ class ImageBindRewardScorer(LocalRewardBackend):
         spacing = (duration_s - clip_duration) / max(num_clips - 1, 1)
         return [i * spacing for i in range(num_clips)]
 
-    # ---- video preprocessing -------------------------------------------------
-
     def _preprocess_video(self, video_list: List[torch.Tensor]) -> torch.Tensor:
         batch_result = []
         for video in video_list:
@@ -170,7 +160,7 @@ class ImageBindRewardScorer(LocalRewardBackend):
 
     @staticmethod
     def _temporal_subsample_clips(video: torch.Tensor, num_clips: int, frames_per_clip: int) -> List[torch.Tensor]:
-        T = video.shape[0]
+        T = video.shape[1]
         clips = []
         for i in range(num_clips):
             center = int((i + 0.5) * T / num_clips)
@@ -179,7 +169,7 @@ class ImageBindRewardScorer(LocalRewardBackend):
                 min(T - 1, center + frames_per_clip // 2 - 1),
                 frames_per_clip,
             ).long()
-            clips.append(video[indices].permute(1, 0, 2, 3))
+            clips.append(video[:, indices])
         return clips
 
     @staticmethod
@@ -212,8 +202,6 @@ class ImageBindRewardScorer(LocalRewardBackend):
             for x in offsets:
                 crops.append(clip[:, :, :, x : x + crop_size])
         return crops
-
-    # ---- scoring -------------------------------------------------------------
 
     def _compute_model_rewards(self, request: RewardRequest) -> List[float]:
         from imagebind.data import load_and_transform_text
@@ -257,13 +245,11 @@ class ImageBindRewardScorer(LocalRewardBackend):
             return cos(embeddings[ModalityType.TEXT], embeddings[ModalityType.AUDIO])
         if self._mode == "text_video":
             return cos(embeddings[ModalityType.TEXT], embeddings[ModalityType.VISION])
-        if self._mode == "all":
-            w = self._weights
-            av = cos(embeddings[ModalityType.AUDIO], embeddings[ModalityType.VISION])
-            ta = cos(embeddings[ModalityType.TEXT], embeddings[ModalityType.AUDIO])
-            tv = cos(embeddings[ModalityType.TEXT], embeddings[ModalityType.VISION])
-            return w["audio_video"] * av + w["text_audio"] * ta + w["text_video"] * tv
-        raise ValueError(f"Unknown ImageBind mode {self._mode!r}; expected audio_video|text_audio|text_video|all.")
+        w = self._weights
+        av = cos(embeddings[ModalityType.AUDIO], embeddings[ModalityType.VISION])
+        ta = cos(embeddings[ModalityType.TEXT], embeddings[ModalityType.AUDIO])
+        tv = cos(embeddings[ModalityType.TEXT], embeddings[ModalityType.VISION])
+        return w["audio_video"] * av + w["text_audio"] * ta + w["text_video"] * tv
 
 
 @dataclass
@@ -273,4 +259,4 @@ class ImageBindSpec(BaseRewardComponentSpec):
     batch_size: int = 8
     device: str = "auto"
     mode: str = "audio_video"
-    weights: Optional[Dict[str, float]] = field(default=None)
+    weights: Optional[Dict[str, float]] = None

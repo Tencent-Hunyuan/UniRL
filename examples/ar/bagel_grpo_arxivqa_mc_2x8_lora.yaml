@@ -14,7 +14,7 @@
 # (mlp_moe_gen.*) and the frozen SigLIP ViT tower are untouched.
 #
 # Data: build once with
-#   python -m unirl.utils.prepare_arxivqa_mc --out-dir data/arxivqa_mc
+#   python datasets/arxivqa_mc/prepare_arxivqa_mc.py --out-dir data/arxivqa_mc
 # then DATA_PATH=data/arxivqa_mc/train.jsonl (BAGEL_PATH -> local 7B ckpt).
 #
 # Compose check (no GPU/flash-attn needed):

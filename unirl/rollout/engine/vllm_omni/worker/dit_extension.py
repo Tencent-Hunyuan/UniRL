@@ -1,18 +1,4 @@
-"""Worker-extension class installed on the HI3 DiT stage of vllm-omni.
-
-Composes three mixins on top of vllm-omni's ``CustomPipelineWorkerExtension``
-(the base extension class on every diffusion stage):
-
-- ``BucketedIPCReceiveMixin`` — bucketed CUDA-IPC ``update_weights_from_ipc``
-  + LoRA-bucket dispatch + ``VLLMOmniHijack`` install in ``__new__``.
-- ``NcclBroadcastReceiveMixin`` — SGLang-shape NCCL primitives
-  (``init_weights_update_group``, ``update_weights_from_distributed``,
-  ``destroy_weights_update_group``).
-
-Together they cover all three weight-sync transports against the DiT
-stage. ``CustomPipelineWorkerExtension`` is the only base that requires
-inheritance order to come last (it's the "real" parent).
-"""
+"""Worker-extension class installed on the HI3 DiT stage of vllm-omni."""
 
 from __future__ import annotations
 

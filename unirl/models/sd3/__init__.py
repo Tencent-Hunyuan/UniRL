@@ -1,14 +1,4 @@
-"""SD3 pipeline — parallel prototype on the new four-tier architecture.
-
-Re-expression of :class:`unirl.models.sd3.SD3ModelBundle` against the
-typed ``Bundle`` / ``Pipeline`` / ``EmbedStage`` / ``DiffusionStage`` /
-``DecodeStage`` protocols. Legacy SD3 keeps serving production GRPO/DiffusionNFT;
-this package proves the new contracts end-to-end before the algorithm /
-training-backend migration lands.
-
-Importing this package re-exports its bundle / pipeline / config classes;
-recipes wire them by ``_target_`` dotpath.
-"""
+"""SD3 pipeline on the typed four-tier architecture."""
 
 from unirl.models.sd3.bundle import SD3Bundle
 from unirl.models.sd3.conditions import SD3Conditions

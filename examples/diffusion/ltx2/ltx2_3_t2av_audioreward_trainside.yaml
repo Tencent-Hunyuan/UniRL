@@ -12,15 +12,16 @@
 #   - clap           (audio-text alignment, LAION CLAP; zero extra deps)
 # ImageBind (audio-video alignment) is also available as an inner scorer but is
 # NOT enabled here: it requires the facebookresearch/ImageBind package and is
-# CC-BY-NC-SA 4.0 (NonCommercial). To enable, add `imagebind: <weight>` to the
-# composite weights (and install the package).
+# CC-BY-NC-SA 4.0 (NonCommercial). To enable it, nest an ImageBind scorer with
+# mode: text_video or all; audio_video does not relate the prompt to the video,
+# so the composite rejects that mode unless another scorer supplies this term.
 #
 # With audio_joint_sde=true, audio is part of the SDE policy AND now receives a
 # direct reward signal, so it is optimized toward prompt alignment (not just
 # passively coupled through cross-attention).
 #
 # Launch (1 node × 8 GPUs):
-#   bash examples/run_experiment_multinode_taiji.sh diffusion/ltx2/ltx2_3_t2av_audioreward_trainside
+#   bash examples/run_experiment_multinode.sh diffusion/ltx2/ltx2_3_t2av_audioreward_trainside
 
 num_devices: 8
 batch_size: 8
@@ -120,17 +121,26 @@ reward:
   _target_: unirl.reward.service.RewardService
   backend:
     _target_: unirl.reward.local.t2av_composite.T2AVCompositeScorer
-    base_device: cuda
     config:
       _target_: unirl.reward.local.t2av_composite.T2AVCompositeSpec
-      batch_size: 4
-      device: auto
-      # Inner scorer name -> blend weight. videopickscore reads the video,
-      # clap reads the parallel audio side-channel. To add audio-video
-      # alignment, install ImageBind and add `imagebind: <w>` here.
       weights:
         videopickscore: 0.5
         clap: 0.5
+      scorers:
+        videopickscore:
+          _target_: unirl.reward.local.video_pickscore.VideoPickScoreScorer
+          base_device: cuda
+          config:
+            _target_: unirl.reward.local.video_pickscore.VideoPickScoreSpec
+            batch_size: 4
+            device: auto
+        clap:
+          _target_: unirl.reward.local.clap.CLAPRewardScorer
+          base_device: cuda
+          config:
+            _target_: unirl.reward.local.clap.CLAPSpec
+            batch_size: 4
+            device: auto
 
 algorithm:
   _target_: unirl.algorithms.flowgrpo.FlowGRPO
@@ -174,7 +184,7 @@ sampling:
   trajectory_precision: fp16
   logprob_precision: fp32
   scheduler:
-    _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+    _target_: unirl.sde.index_schedule.AllSDEScheduler
     num_timesteps: ${..num_inference_steps}
     num_sde_steps: 5
     timestep_fraction: [0, 0.5]

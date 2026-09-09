@@ -17,7 +17,6 @@ class AestheticRewardScorer(LocalRewardBackend):
     canonical_model_name = "aesthetic"
 
     def __init__(self, *, config: "AestheticSpec", base_device: str) -> None:
-        # Unused: aesthetic is a placeholder; both args ignored.
         del config, base_device
         super().__init__()
 

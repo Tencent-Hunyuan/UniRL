@@ -21,6 +21,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
 
+PROTOCOL_VERSION = "1"
+
 
 class HistoryTurn(BaseModel):
     """One ``(text, media)`` pair in a conversation history.
@@ -50,9 +52,7 @@ class HistoryTurn(BaseModel):
         if self.video_b64 is not None and self.video_path is not None:
             raise ValueError("video_b64 and video_path are mutually exclusive")
         if self.image_b64 is None and self.video_b64 is None and self.video_path is None:
-            raise ValueError(
-                "HistoryTurn must include at least one of image_b64, video_b64, or video_path"
-            )
+            raise ValueError("HistoryTurn must include at least one of image_b64, video_b64, or video_path")
         return self
 
 
@@ -62,11 +62,42 @@ class RewardRequest(BaseModel):
     history: list[HistoryTurn]
     required_rewards: list[str]
     metadata: dict[str, Any] | None = None
+    request_id: str | None = None
+    sample_id: str | None = None
+    group_id: str | None = None
+    source_rank: int | None = None
+    policy_version: int | None = None
+    scorer_version: str | None = None
+    idempotency_key: str | None = None
+
+    def identity(self, *, actual_scorer_version: str | None = None) -> "RewardIdentity":
+        return RewardIdentity(
+            request_id=self.request_id,
+            sample_id=self.sample_id,
+            group_id=self.group_id,
+            source_rank=self.source_rank,
+            policy_version=self.policy_version,
+            scorer_version=actual_scorer_version,
+            idempotency_key=self.idempotency_key,
+        )
+
+
+class RewardIdentity(BaseModel):
+    """Optional item identity echoed across chunked/retried score calls."""
+
+    request_id: str | None = None
+    sample_id: str | None = None
+    group_id: str | None = None
+    source_rank: int | None = None
+    policy_version: int | None = None
+    scorer_version: str | None = None
+    idempotency_key: str | None = None
 
 
 class ScoreRequest(BaseModel):
     """Top-level HTTP body: a batch of RewardRequest."""
 
+    protocol_version: str = PROTOCOL_VERSION
     requests: list[RewardRequest]
 
 
@@ -81,3 +112,5 @@ class ScoreResponse(BaseModel):
 
     results: list[dict[str, dict[str, float]]]
     errors: list[dict[str, str]] = Field(default_factory=list)
+    identities: list[RewardIdentity] = Field(default_factory=list)
+    protocol_version: str = PROTOCOL_VERSION

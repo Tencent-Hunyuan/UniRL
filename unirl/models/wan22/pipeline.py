@@ -1,21 +1,4 @@
-"""WAN22Pipeline — RolloutReq → RolloutResp end-to-end for WAN 2.2 T2V.
-
-Implements the new four-tier flow::
-
-    Texts ──text_embed (wan21)──▶ WAN21Conditions ──diffuse (wan22)──▶ LatentSegment ──vae_decode (wan21)──▶ Videos
-
-Hydra constructs a pipeline via
-``WAN22Pipeline.from_config(WAN22PipelineConfig)`` (see ``config.py``);
-``from_config`` loads the :class:`WAN22Bundle` (dual transformer + WAN
-2.1 VAE/text encoder) then constructs the four stages with the
-precision policy from the config.
-
-WAN 2.2 reuses WAN 2.1's text embedding and VAE stages verbatim (same
-UMT5 with zero-padding, same 3D VAE with per-channel norm) — only the
-diffusion stage swaps in for dual-transformer routing. We do **not**
-inherit ``WAN21Pipeline``: the reuse is by composition (import the
-sibling stages), matching the SD3 convention of one-package-per-model.
-"""
+"""WAN22Pipeline — ``Sample → Sample`` end-to-end for WAN 2.2 T2V/I2V."""
 
 from __future__ import annotations
 
@@ -29,11 +12,9 @@ from unirl.models.wan21.image_encode import WAN21ImageLatentEncodeStage
 from unirl.models.wan21.text_embed import WAN21TextEmbedStage
 from unirl.models.wan21.vae import WAN21VAEDecodeStage
 from unirl.sde.kernels import DanceSDEStrategy, StepStrategy
-from unirl.types.conditions import ImageEmbedCondition, ImageLatentCondition
 from unirl.types.noise_recipe import NoiseRecipe
 from unirl.types.primitives import Images, Texts
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp, RolloutTrack
+from unirl.types.sample import Sample
 from unirl.types.sampling import DiffusionSamplingParams
 
 from .bundle import WAN22Bundle
@@ -42,24 +23,7 @@ from .diffusion import WAN22DiffusionStage, WAN22DiffusionStep
 
 
 class WAN22Pipeline(Pipeline):
-    """WAN 2.2 T2V generate pipeline.
-
-    Reads from ``RolloutReq``:
-
-    - ``primitives["text"]: Texts`` — required prompts.
-    - ``primitives["negative_text"]: Texts`` — optional CFG negatives.
-    - ``stage_params["diffusion"]: dict`` — kwargs for
-      :class:`WAN22DiffusionParams` (extends WAN21 params with optional
-      ``guidance_scale_2``).
-
-    Writes to ``RolloutResp``:
-
-    - ``conditions["text"]: TextEmbedCondition``; plus
-      ``conditions["negative_text"]: TextEmbedCondition`` when negative
-      prompts were supplied.
-    - ``tracks["video"].segment: LatentSegment``.
-    - ``tracks["video"].decoded: Videos``.
-    """
+    """WAN 2.2 T2V/I2V generate pipeline: ``Sample → Sample``."""
 
     def __init__(
         self,
@@ -75,10 +39,6 @@ class WAN22Pipeline(Pipeline):
         logprob_precision: str = "fp32",
         max_sequence_length: int = 512,
     ) -> None:
-        # Stages default to None and are built from the (trainer-injected)
-        # bundle — mirrors SD3Pipeline so the v2 trainer can construct the
-        # pipeline via ``remote_hydra(pipeline_cfg, bundle=self.bundle)`` without
-        # reloading the dual transformer. ``from_config`` still passes pre-built stages.
         super().__init__()
         self.bundle = bundle
         self.text_embed = (
@@ -101,11 +61,7 @@ class WAN22Pipeline(Pipeline):
 
     @classmethod
     def latent_shape(cls, *, model_config: Any, sampling_spec: Any) -> tuple:
-        """Per-sample 5D latent shape ``(C, T_lat, H_lat, W_lat)`` for
-        driver-side noise pre-computation. Same VAE family as WAN 2.1
-        (``AutoencoderKLWan``: 16-channel, /8 spatial, /4 temporal); the
-        dual-transformer routing in WAN 2.2 does not change latent
-        geometry."""
+        """Per-sample 5D latent shape ``(C, T_lat, H_lat, W_lat)`` for"""
         height = int(sampling_spec.height)
         width = int(sampling_spec.width)
         num_frames = int(sampling_spec.num_frames)
@@ -125,20 +81,9 @@ class WAN22Pipeline(Pipeline):
         *,
         strategy: Optional[StepStrategy] = None,
     ) -> "WAN22Pipeline":
-        """Build the full pipeline from a config.
-
-        ``strategy`` is the SDE step strategy. Defaults to
-        :class:`DanceSDEStrategy` (legacy WAN family default). Callers
-        running other strategies (Flow / CPS / DPM2) should pass an
-        explicit strategy built from ``cfg.sampling.sde_strategy``.
-        """
+        """Build the full pipeline from a config."""
         bundle = WAN22Bundle.from_config(config)
 
-        # WAN 2.1's text embed stage expects a ``WAN21Bundle``-compatible
-        # object — we satisfy that contract with ``WAN22Bundle`` (it
-        # exposes the same ``text_encoder`` / ``tokenizer`` /
-        # ``max_sequence_length`` / ``device`` fields). The stage uses
-        # duck-typing so no isinstance check fires.
         text_embed = WAN21TextEmbedStage(bundle, max_sequence_length=int(config.max_sequence_length))
         step = WAN22DiffusionStep()
         diffusion = WAN22DiffusionStage(
@@ -165,113 +110,81 @@ class WAN22Pipeline(Pipeline):
         negatives: Optional[Texts] = None,
         guidance_scale: float = 1.0,
     ) -> WAN21Conditions:
-        """Encode prompts (+ optional CFG negatives) into ``WAN21Conditions``.
-
-        Builds only the text-conditioning slots (``text`` / ``negative_text``);
-        the optional ``image_latent`` / ``image_embed`` slots are left ``None``
-        and attached by :meth:`generate` when an input image is supplied.
-
-        CFG empty negative: same rationale as WAN21Pipeline — WAN training
-        encodes an empty-string negative when none is supplied. WAN22 routes
-        CFG by sigma / ``guidance_scale_2``, so :meth:`generate` passes the
-        **effective** guidance (``max(guidance_scale, guidance_scale_2)``) here;
-        gating on ``> 1.0`` then reproduces WAN22's two-branch ``cfg_active``
-        trigger exactly.
-        """
+        """Encode prompts (+ optional CFG negatives) into ``WAN21Conditions``."""
+        if negatives is not None and len(negatives.texts) != len(texts.texts):
+            raise ValueError(
+                f"WAN22Pipeline.build_conditions: negative_text length "
+                f"{len(negatives.texts)} != text length {len(texts.texts)}"
+            )
         text_cond = self.text_embed.embed(texts)
         if negatives is None and float(guidance_scale) > 1.0:
             negatives = Texts(texts=[""] * len(texts.texts))
         negative_text_cond = self.text_embed.embed(negatives) if negatives is not None else None
         return WAN21Conditions(text=text_cond, negative_text=negative_text_cond)
 
-    def generate(self, req: RolloutReq) -> RolloutResp:
-        """Run WAN 2.2 T2V end-to-end."""
-        texts = req.primitives.get("text")
+    def generate(self, sample: Sample) -> Sample:
+        """Run WAN 2.2 T2V (or I2V) end-to-end, filling the frontier (pre-forked) gen Part."""
+        frontier = sample.parts[-1]
+        params = frontier.sampling_params
+        if not isinstance(params, DiffusionSamplingParams):
+            raise TypeError(
+                f"WAN22Pipeline.generate: frontier gen Part must carry DiffusionSamplingParams, "
+                f"got {type(params).__name__ if params is not None else 'None'}"
+            )
+        if params.sigmas is None:
+            raise ValueError(
+                "WAN22Pipeline.generate: gen part sampling_params.sigmas is None. The hosting "
+                "engine must pin σ before invoking pipeline.generate; see the σ ownership note "
+                "in unirl.models.types.pipeline."
+            )
+
+        conditioning = sample.conditioning()
+        texts = conditioning[0] if conditioning else None
         if not isinstance(texts, Texts):
             raise TypeError(
-                f"WAN22Pipeline.generate: req.primitives['text'] must be Texts, "
+                f"WAN22Pipeline.generate: expected a Texts prompt from sample.conditioning()[0], "
                 f"got {type(texts).__name__ if texts is not None else 'None'}"
             )
-        negatives_raw = req.primitives.get("negative_text")
-        negatives = negatives_raw if isinstance(negatives_raw, Texts) else None
-        if negatives is not None and len(negatives.texts) != len(texts.texts):
-            raise ValueError(
-                f"WAN22Pipeline.generate: negative_text length {len(negatives.texts)} != text length {len(texts.texts)}"
-            )
+        images_prim = next((c for c in conditioning[1:] if isinstance(c, Images)), None)
 
-        params: DiffusionSamplingParams = req.sampling_params.get("diffusion")
-
-        # WAN22 routes CFG by sigma / ``guidance_scale_2`` so the empty-negative
-        # encoding fires whenever either branch's effective guidance is > 1; pass
-        # the max of the two scales to build_conditions, whose ``> 1.0`` gate then
-        # reproduces the original ``cfg_active`` trigger.
         primary_g = float(params.guidance_scale)
         low_g = float(params.guidance_scale_2) if params.guidance_scale_2 is not None else primary_g
         effective_guidance = max(primary_g, low_g)
-        wan_conds = self.build_conditions(texts, negatives=negatives, guidance_scale=effective_guidance)
+        wan_conds = self.build_conditions(texts, guidance_scale=effective_guidance)
 
-        image_latent_cond: Optional[ImageLatentCondition] = None
-        image_embed_cond: Optional[ImageEmbedCondition] = None
-        images_prim = req.primitives.get("image")
         if images_prim is not None:
-            if not isinstance(images_prim, Images):
-                raise TypeError(
-                    f"WAN22Pipeline.generate: req.primitives['image'] must be Images, got {type(images_prim).__name__}"
-                )
-            if int(images_prim.pixels.shape[0]) != len(texts.texts):
+            if len(images_prim) != len(texts.texts):
                 raise ValueError(
-                    f"WAN22Pipeline.generate: image count {images_prim.pixels.shape[0]} "
-                    f"!= text count {len(texts.texts)}"
+                    f"WAN22Pipeline.generate: image count {len(images_prim)} != text count {len(texts.texts)}"
                 )
-            image_latent_cond = WAN21ImageLatentEncodeStage(
+            image_latent = WAN21ImageLatentEncodeStage(
                 self.bundle,
                 num_frames=int(params.num_frames),
                 height=int(params.height),
                 width=int(params.width),
             ).encode(images_prim)
-            # CLIP-vision branch fires only on bundles that actually
-            # loaded a vision tower. WAN 2.2's mainstream checkpoints
-            # set ``image_dim == 0`` and skip this; left in place so a
-            # future 2.2 variant with ``image_dim > 0`` (if it ever
-            # ships) wires up automatically without a pipeline change.
-            if getattr(self.bundle, "uses_clip_vision", False):
-                image_embed_cond = WAN21CLIPVisionEncodeStage(self.bundle).encode(images_prim)
-
-        if image_latent_cond is not None or image_embed_cond is not None:
+            image_embed = (
+                WAN21CLIPVisionEncodeStage(self.bundle).encode(images_prim)
+                if getattr(self.bundle, "uses_clip_vision", False)
+                else None
+            )
             wan_conds = dataclasses.replace(
                 wan_conds,
-                image_latent=image_latent_cond,
-                image_embed=image_embed_cond,
+                image_latent=image_latent,
+                image_embed=image_embed,
             )
 
-        if req.sigmas is None:
-            raise ValueError(
-                "WAN22Pipeline.generate: req.sigmas is None. Engine adapter "
-                "must call unirl.sde.runtime.ensure_req_sigmas before "
-                "pipeline.generate."
-            )
-        schedule = req.sigmas.to(self.bundle.device)
+        schedule = params.sigmas.to(self.bundle.device)
 
-        # Driver-authoritative x_T via the model-aware recipe (NoiseRecipe); a
-        # pre-shipped initial_latents tensor (img2img / i2v first-frame) still wins.
-        initial_latents = NoiseRecipe.from_rollout_req(req).resolve()
+        initial_latents = NoiseRecipe.from_sample(sample).resolve()
 
         latent_seg = self.diffusion.diffuse(
             wan_conds, schedule=schedule, params=params, initial_latents=initial_latents
         )
         videos = self.vae_decode.decode(latent_seg)
 
-        return RolloutResp(
-            tracks={
-                "video": RolloutTrack(
-                    sample_ids=list(req.sample_ids),
-                    parent_ids=list(req.group_ids),
-                    conditions=wan_conds.to_dict(),
-                    segment=latent_seg,
-                    decoded=videos,
-                ),
-            }
-        )
+        filled = frontier.fill(segment=latent_seg, primitives={"video": videos}, conditions=wan_conds.to_dict())
+        return Sample(parts=[*sample.parts[:-1], filled], reward_compute_s=sample.reward_compute_s)
 
 
 __all__ = ["WAN22Pipeline"]

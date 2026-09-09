@@ -7,21 +7,7 @@ from typing import Any, ClassVar
 
 
 class Backend(abc.ABC):
-    """Driver-side bootstrap + per-actor wire-dict producer.
-
-    Each backend variant ``bootstrap()``s any backend-specific Ray actors
-    (storage units for the simple backend; nothing for Mooncake) and returns
-    the *actor handoff* dict that ``TransferQueueRuntime.create_client``
-    consumes. The handoff carries ``manager_type`` (the upstream
-    ``initialize_storage_manager`` discriminator), ``controller_info``, and
-    backend-specific keys.
-
-    ``specialize_for_controller`` produces the controller-only variant of the
-    handoff (Mooncake swaps in smaller zero-copy buffers); default is identity.
-
-    Backend instances hold spawned actor handles as instance attributes so
-    they stay alive as long as the backend object is referenced.
-    """
+    """Driver-side bootstrap + per-actor wire-dict producer."""
 
     manager_type: ClassVar[str]
 

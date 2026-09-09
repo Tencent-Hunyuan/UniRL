@@ -1,27 +1,15 @@
-"""Monkey-patch ``DiffusionLoRAManager._load_adapter`` to accept in-memory
-LoRA tensors.
-
-vLLM-Omni's stock ``DiffusionLoRAManager._load_adapter`` only loads LoRA
-weights from a file path (calls ``LoRAModel.from_local_checkpoint``). For
-RL we need to push freshly-trained adapter tensors directly without going
-through disk. This module lifts the verl-omni hijack pattern verbatim:
-
-- ``OmniTensorLoRARequest`` extends ``vllm_omni.lora.request.LoRARequest``
-  with two extra fields (``peft_config`` dict + ``lora_tensors`` dict).
-- ``VLLMOmniHijack.hijack()`` replaces ``DiffusionLoRAManager._load_adapter``
-  with a version that branches on the request type: tensor requests go
-  through ``LoRAModel.from_lora_tensors``, file-path requests still hit
-  the original code path.
-
-Origin: ``verl-omni/verl_omni/utils/vllm_omni/utils.py``. Lifted as-is.
-Run ``VLLMOmniHijack.hijack()`` once per worker subprocess (typically
-from a worker-extension's ``__new__``).
-"""
+"""Monkey-patch ``DiffusionLoRAManager._load_adapter`` to accept in-memory LoRA tensors."""
 
 from __future__ import annotations
 
+import os
+import signal
+import threading
+import time
+from functools import wraps
 from multiprocessing.process import BaseProcess as _MpBaseProcess
 
+import torch
 from msgspec import field
 
 try:
@@ -29,10 +17,13 @@ try:
 except ImportError:
     from vllm.lora.models import LoRAModel  # type: ignore[no-redef]
 
+from vllm.lora.lora_weights import LoRALayerWeights, PackedLoRALayerWeights
 from vllm.lora.peft_helper import PEFTHelper
 from vllm.lora.utils import get_adapter_absolute_path
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager, logger
 from vllm_omni.lora.request import LoRARequest as OmniLoRARequest
+
+from unirl.rollout.engine.vllm_omni.patches.compat_moe_workspace import patch_moe_workspace_pool
 
 
 class OmniTensorLoRARequest(OmniLoRARequest):
@@ -40,32 +31,62 @@ class OmniTensorLoRARequest(OmniLoRARequest):
     lora_tensors: dict = field(default=None)
 
 
-# ============================================================
-# Subprocess propagation — make spawn children also run hijack
-# ============================================================
-#
-# vllm-omni's ``multiproc_executor`` calls ``mp.set_start_method("spawn", force=True)``.
-# Each spawn child is a fresh Python interpreter that does not inherit the
-# parent's monkey-patches. Without this hook, ``patch_fp32_skip`` (and other
-# patches whose targets are imported by the child) take effect in the driver
-# but NOT in the worker subprocesses where vllm.lora.utils.from_layer is
-# actually called during model loading — fp32 router gate then crashes punica.
-#
-# Mirrors the LIN-210 sglang pattern (``samplers/sglang/patches/_spawn_wrap.py``).
+_FATE_ANCHOR_ENV = "UNIRL_FATE_ANCHOR_PID"
+_FATE_POLL_SECONDS = 5.0
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True  # unknown failure — never take this as "dead"
+    return True
+
+
+def install_fate_sharing(anchor_pid: int, *, arm_pdeathsig: bool) -> None:
+    """Bind this process's lifetime to the root of its spawn chain."""
+    if arm_pdeathsig:
+        try:
+            import ctypes
+
+            ctypes.CDLL("libc.so.6").prctl(1, signal.SIGKILL)
+        except Exception:  # noqa: BLE001 - best effort; the watchdog below is the real guarantee
+            pass
+
+    root = os.environ.get(_FATE_ANCHOR_ENV)
+    root_pid = int(root) if root else int(anchor_pid)
+    os.environ[_FATE_ANCHOR_ENV] = str(root_pid)
+
+    original_ppid = os.getppid()
+
+    def _watch() -> None:
+        while True:
+            time.sleep(_FATE_POLL_SECONDS)
+            if not _pid_alive(root_pid):
+                os._exit(1)
+            if original_ppid != 1 and os.getppid() != original_ppid:
+                os._exit(1)
+
+    threading.Thread(target=_watch, daemon=True, name="unirl-fate-watchdog").start()
 
 
 class _DiffrlPatchedTarget:
-    """Pickleable top-level wrapper that installs patches in the child first.
-
-    Must be a module-level class so spawn's pickler can serialise the wrapped
-    target across the process boundary. Nested functions / closures cannot be
-    pickled and would break spawn.
-    """
+    """Pickleable top-level wrapper that installs patches in the child first."""
 
     def __init__(self, target):
         self._target = target
+        self._anchor_pid = os.getpid()
+        self._arm_pdeathsig = False
 
     def __call__(self, *args, **kwargs):
+        install_fate_sharing(
+            getattr(self, "_anchor_pid", os.getppid()),
+            arm_pdeathsig=getattr(self, "_arm_pdeathsig", False),
+        )
         VLLMOmniHijack.hijack()
         return self._target(*args, **kwargs)
 
@@ -74,18 +95,12 @@ _WRAP_SENTINEL = "_diffrl_target_wrapped"
 
 
 def wrap_mp_process_for_children() -> None:
-    """Replace ``BaseProcess.__init__`` so spawned targets install patches first.
-
-    Patching ``mp.Process.__init__`` alone misses spawn-context Process classes
-    (vllm-omni's stage launcher uses ``get_mp_context().Process`` ==
-    ``SpawnProcess``, a sibling class, not a subclass). All context-specific
-    Process classes inherit from ``BaseProcess``, so patching the root catches
-    every context in one shot.
-    """
+    """Replace ``BaseProcess.__init__`` so spawned targets install patches first."""
     if getattr(_MpBaseProcess, _WRAP_SENTINEL, False):
         return
 
     orig_init = _MpBaseProcess.__init__
+    orig_start = _MpBaseProcess.start
 
     def __init__(
         self,
@@ -109,18 +124,19 @@ def wrap_mp_process_for_children() -> None:
             daemon=daemon,
         )
 
+    def start(self):
+        target = getattr(self, "_target", None)
+        if isinstance(target, _DiffrlPatchedTarget):
+            target._arm_pdeathsig = threading.current_thread() is threading.main_thread()
+        return orig_start(self)
+
     _MpBaseProcess.__init__ = __init__
+    _MpBaseProcess.start = start
     setattr(_MpBaseProcess, _WRAP_SENTINEL, True)
 
 
 def patch_dit_lora_loader() -> None:
-    """Patch ``DiffusionLoRAManager._load_adapter`` (DiT stage) to support in-memory tensors.
-
-    vLLM-Omni's stock loader only accepts on-disk adapters. We branch on the
-    request type: ``OmniTensorLoRARequest`` loads from in-memory tensors via
-    ``LoRAModel.from_lora_tensors``; everything else falls through to the
-    original on-disk loader via ``LoRAModel.from_local_checkpoint``.
-    """
+    """Patch ``DiffusionLoRAManager._load_adapter`` (DiT stage) to support in-memory tensors."""
 
     def hijack__load_adapter(self, lora_request: OmniTensorLoRARequest) -> tuple[LoRAModel, PEFTHelper]:
         if not self._expected_lora_modules:
@@ -140,7 +156,7 @@ def patch_dit_lora_loader() -> None:
 
             peft_helper = PEFTHelper.from_local_dir(
                 lora_path,
-                max_position_embeddings=None,  # no need in diffusion
+                max_position_embeddings=None,
                 tensorizer_config_dict=lora_request.tensorizer_config_dict,
             )
 
@@ -156,7 +172,7 @@ def patch_dit_lora_loader() -> None:
                 tensors=lora_tensors,
                 peft_helper=peft_helper,
                 lora_model_id=lora_request.lora_int_id,
-                device="cpu",  # consistent w/ vllm's behavior
+                device="cpu",
                 dtype=self.dtype,
                 model_vocab_size=None,
                 weights_mapper=None,
@@ -167,7 +183,7 @@ def patch_dit_lora_loader() -> None:
                 expected_lora_modules=self._expected_lora_modules,
                 peft_helper=peft_helper,
                 lora_model_id=lora_request.lora_int_id,
-                device="cpu",  # consistent w/ vllm's behavior
+                device="cpu",
                 dtype=self.dtype,
                 model_vocab_size=None,
                 tensorizer_config_dict=lora_request.tensorizer_config_dict,
@@ -182,21 +198,107 @@ def patch_dit_lora_loader() -> None:
         )
 
         for lora in lora_model.loras.values():
-            lora.optimize()  # ref: _create_merged_loras_inplace, internal scaling
+            lora.optimize()
 
         return lora_model, peft_helper
 
     setattr(DiffusionLoRAManager, "_load_adapter", hijack__load_adapter)
 
 
-def patch_ar_lora_loader() -> None:
-    """Patch ``WorkerLoRAManager._load_adapter`` (AR stage) to support in-memory tensors.
+def _deinterleave_fused_qkv_lora_b(lora_b, output_sizes, base_layer):
+    """Split HI3's GQA-interleaved fused QKV LoRA-B into ``[q, k, v]`` slices."""
+    if len(output_sizes) != 3:
+        return None
+    head_size = getattr(base_layer, "head_size", None)
+    num_kv_heads = getattr(base_layer, "total_num_kv_heads", None)
+    if not isinstance(head_size, int) or head_size <= 0:
+        return None
+    if not isinstance(num_kv_heads, int) or num_kv_heads <= 0:
+        return None
+    q_size, k_size, v_size = output_sizes
+    if k_size <= 0 or v_size != k_size:
+        return None
+    groups = q_size // k_size
+    if groups * k_size != q_size or k_size != num_kv_heads * head_size:
+        return None
+    rank = lora_b.shape[1]
+    try:
+        lora_b_r = lora_b.reshape(num_kv_heads, groups + 2, head_size, rank)
+    except RuntimeError:
+        return None
+    q_b, k_b, v_b = torch.split(lora_b_r, (groups, 1, 1), dim=1)
+    return [q_b.reshape(-1, rank), k_b.reshape(-1, rank), v_b.reshape(-1, rank)]
 
-    Best-effort: vllm's worker_manager is only importable in worker subprocesses
-    that actually instantiate it. Returns just the ``LoRAModel`` (no peft_helper
-    tuple). Mirrors the DiT shim for in-memory tensors and falls through to the
-    original on-disk loader for plain ``LoRARequest``.
-    """
+
+def patch_dit_hi3_lora_weights() -> None:
+    """Resolve and safely repack HI3 DiT LoRA weights."""
+    try:
+        from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import (
+            HunyuanImage3Pipeline,
+        )
+    except (ImportError, AttributeError):
+        return
+
+    original = DiffusionLoRAManager._get_lora_weights
+    if getattr(original, "_diffrl_hi3_lora_weights", False):
+        return
+
+    def wrapped(self, lora_model, full_module_name, _orig=original):
+        weights = _orig(self, lora_model, full_module_name)
+        if not isinstance(getattr(self, "pipeline", None), HunyuanImage3Pipeline):
+            return weights
+
+        prefix = "transformer.layers."
+        if weights is None and full_module_name.startswith(prefix):
+            alias = "model.layers." + full_module_name[len(prefix) :]
+            weights = lora_model.get_lora(alias)
+
+        if weights is None or not full_module_name.endswith(".qkv_proj"):
+            return weights
+        if isinstance(weights, PackedLoRALayerWeights):
+            return weights
+
+        def fail(reason: str) -> None:
+            raise RuntimeError(
+                f"Refusing to install HI3 fused-qkv LoRA for {full_module_name}: {reason}. "
+                "Applying the interleaved tensor would route attention deltas to the wrong output rows."
+            )
+
+        if not isinstance(weights, LoRALayerWeights):
+            fail(f"expected LoRALayerWeights, got {type(weights).__name__}")
+        lora_b = weights.lora_b
+        if not isinstance(lora_b, torch.Tensor) or lora_b.ndim != 2:
+            fail("lora_b is not a 2-D tensor")
+
+        lora_modules = getattr(self, "_lora_modules", None) or {}
+        base_layer = getattr(lora_modules.get(full_module_name), "base_layer", None)
+        output_sizes = [int(size) for size in (getattr(base_layer, "output_sizes", ()) or ())]
+        if not output_sizes or int(lora_b.shape[0]) != sum(output_sizes):
+            fail("base layer exposes no output_sizes matching lora_b's rows")
+
+        slices = _deinterleave_fused_qkv_lora_b(lora_b, output_sizes, base_layer)
+        if slices is None:
+            fail("GQA layout is unrecognised (check head_size/total_num_kv_heads)")
+
+        scaling = float(getattr(weights, "scaling", 1.0))
+        if scaling != 1.0:
+            slices = [part * scaling for part in slices]
+
+        return PackedLoRALayerWeights(
+            module_name=weights.module_name,
+            rank=weights.rank,
+            lora_alphas=[weights.lora_alpha] * 3,
+            lora_a=[weights.lora_a] * 3,
+            lora_b=slices,
+            scaling=[1.0, 1.0, 1.0],
+        )
+
+    wrapped._diffrl_hi3_lora_weights = True
+    DiffusionLoRAManager._get_lora_weights = wrapped
+
+
+def patch_ar_lora_loader() -> None:
+    """Patch ``WorkerLoRAManager._load_adapter`` (AR stage) to support in-memory tensors."""
     try:
         from vllm.lora.worker_manager import WorkerLoRAManager
     except ImportError:
@@ -231,45 +333,18 @@ def patch_ar_lora_loader() -> None:
 
 
 def patch_ar_merged_lora_fused_tensor() -> None:
-    """Accept a single fused lora_b [q+k+v, rank] in MergedQKV set_lora.
-
-    HI3 trains LoRA on a fused qkv_proj; vLLM expects a list [lora_b_q, lora_b_k,
-    lora_b_v]. The checkpoint qkv_proj is GQA-interleaved, training loads it as-is,
-    so lora_b rows are interleaved. vLLM base is block [q;k;v] after _split_qkv_weight
-    — we mirror that reshape-split on lora_b. Falls back to plain split if the base
-    layer lacks head_size/total_num_kv_heads.
-    """
+    """Accept a single fused lora_b [q+k+v, rank] in MergedQKV set_lora."""
     try:
-        import torch
         from vllm.lora.layers import column_parallel_linear as _cpl
     except (ImportError, AttributeError):
         return
-
-    def _deinterleave_gqa(lora_b, output_sizes, base_layer):
-        if len(output_sizes) != 3:
-            return None
-        head_size = getattr(base_layer, "head_size", None)
-        num_kv_heads = getattr(base_layer, "total_num_kv_heads", None)
-        if head_size is None or num_kv_heads is None:
-            return None
-        q_size, k_size, _v = output_sizes
-        groups = q_size // k_size
-        if groups * k_size != q_size or k_size != num_kv_heads * head_size:
-            return None
-        rank = lora_b.shape[1]
-        try:
-            lora_b_r = lora_b.reshape(num_kv_heads, groups + 2, head_size, rank)
-        except RuntimeError:
-            return None
-        q_b, k_b, v_b = torch.split(lora_b_r, (groups, 1, 1), dim=1)
-        return [q_b.reshape(-1, rank), k_b.reshape(-1, rank), v_b.reshape(-1, rank)]
 
     def _make(orig):
         def _set_lora(self, index, lora_a, lora_b, *args, _orig=orig, **kwargs):
             if isinstance(lora_b, torch.Tensor):
                 output_sizes = list(getattr(self.base_layer, "output_sizes", []) or [])
                 if output_sizes and int(lora_b.shape[0]) == sum(output_sizes):
-                    slices = _deinterleave_gqa(lora_b, output_sizes, self.base_layer)
+                    slices = _deinterleave_fused_qkv_lora_b(lora_b, output_sizes, self.base_layer)
                     lora_b = slices if slices is not None else list(torch.split(lora_b, output_sizes, dim=0))
                     if isinstance(lora_a, torch.Tensor):
                         lora_a = [lora_a] * self.n_slices
@@ -278,8 +353,6 @@ def patch_ar_merged_lora_fused_tensor() -> None:
         _set_lora._diffrl_fused_merged_tolerant = True  # type: ignore[attr-defined]
         return _set_lora
 
-    # Patch every merged class that defines its own ``set_lora``; subclasses that
-    # only inherit it are covered transitively by the base-class patch.
     for _name in (
         "MergedColumnParallelLinearWithLoRA",
         "MergedQKVParallelLinearWithLoRA",
@@ -294,25 +367,12 @@ def patch_ar_merged_lora_fused_tensor() -> None:
 
 
 def patch_fp32_skip() -> None:
-    """Patch ``vllm.lora.utils.from_layer`` to skip non-fp16/bf16 layers.
-
-    punica lora_shrink/expand kernels hard-assert inputs.dtype in [fp16, bf16].
-    Skip LoRA wrap for fp32 layers (e.g. HI3 MoE router gate) and for
-    non-fp16/bf16 dtypes (e.g. quantized) so the original layer.forward runs
-    unmodified. If you intentionally want LoRA on such a layer, choose one:
-
-      (a) cast the layer to bf16 in model code (lose precision)
-      (b) wrap with a pure-pytorch LoRA variant (no punica),
-          e.g. vllm_omni DiffusionBaseLinearLayerWithLoRA
-      (c) filter target_modules so it does not match this layer
-
-    Replaces pod-local file patch on ``vllm/lora/utils.py``.
-    """
+    """Patch ``vllm.lora.utils.from_layer`` to skip non-fp16/bf16 layers."""
     try:
         import torch as _torch
         import vllm.lora.utils as _lora_utils
     except (ImportError, AttributeError):
-        return  # vllm not available in this process; skip
+        return
 
     _orig_from_layer = _lora_utils.from_layer
     if getattr(_orig_from_layer, "_diffrl_fp32_skip", False):
@@ -336,8 +396,7 @@ def patch_fp32_skip() -> None:
     _patched_from_layer._diffrl_fp32_skip = True  # type: ignore[attr-defined]
     _lora_utils.from_layer = _patched_from_layer
 
-    # Rebind stale references in modules that did `from vllm.lora.utils import
-    # from_layer` at top level before our patch ran.
+    # Rebind modules that imported from_layer before this patch ran.
     import importlib as _importlib
 
     for _modname in (
@@ -354,25 +413,159 @@ def patch_fp32_skip() -> None:
             _mod.from_layer = _patched_from_layer
 
 
+def patch_hv15_packed_lora_mapping() -> None:
+    """Expose HV1.5's packed QKV mapping to the diffusion LoRA manager."""
+    try:
+        from vllm_omni.diffusion.models.hunyuan_video.hunyuan_video_15_transformer import (
+            HunyuanVideo15Transformer3DModel,
+        )
+    except (ImportError, AttributeError):
+        return
+
+    sentinel = "_diffrl_hv15_packed_lora_mapping"
+    if getattr(HunyuanVideo15Transformer3DModel, sentinel, False):
+        return
+    if not getattr(HunyuanVideo15Transformer3DModel, "stacked_params_mapping", None):
+        HunyuanVideo15Transformer3DModel.stacked_params_mapping = (
+            (".to_qkv", ".to_q", "q"),
+            (".to_qkv", ".to_k", "k"),
+            (".to_qkv", ".to_v", "v"),
+            (".add_kv_proj", ".add_q_proj", "q"),
+            (".add_kv_proj", ".add_k_proj", "k"),
+            (".add_kv_proj", ".add_v_proj", "v"),
+        )
+    setattr(HunyuanVideo15Transformer3DModel, sentinel, True)
+
+
+class _HV15TorchLinearWithLoRA(torch.nn.Module):
+    """Apply one in-memory LoRA adapter to an ordinary HV1.5 ``nn.Linear``."""
+
+    n_slices = 1
+
+    def __init__(self, base_layer: torch.nn.Linear) -> None:
+        super().__init__()
+        self.base_layer = base_layer
+        self.register_buffer("_lora_a", None, persistent=False)
+        self.register_buffer("_lora_b", None, persistent=False)
+
+    def create_lora_weights(self, *_args, **_kwargs) -> None:
+        """Match the manager's layer protocol when its rank buffer grows."""
+        self.reset_lora(0)
+
+    def reset_lora(self, index: int) -> None:
+        if index != 0:
+            raise IndexError(f"HV1.5 torch-linear LoRA only supports adapter slot 0, got {index}")
+        self._lora_a = None
+        self._lora_b = None
+
+    def set_lora(
+        self,
+        index: int,
+        lora_a: torch.Tensor,
+        lora_b: torch.Tensor,
+    ) -> None:
+        if index != 0:
+            raise IndexError(f"HV1.5 torch-linear LoRA only supports adapter slot 0, got {index}")
+        if not (
+            lora_a.ndim == lora_b.ndim == 2
+            and lora_a.shape[1] == self.base_layer.in_features
+            and lora_b.shape == (self.base_layer.out_features, lora_a.shape[0])
+        ):
+            raise ValueError(
+                "HV1.5 torch-linear LoRA shape mismatch: "
+                f"A={tuple(lora_a.shape)}, B={tuple(lora_b.shape)}; expected "
+                f"A=[rank, {self.base_layer.in_features}], "
+                f"B=[{self.base_layer.out_features}, rank]"
+            )
+        self._lora_a = lora_a.detach().to(self.base_layer.weight)
+        self._lora_b = lora_b.detach().to(self.base_layer.weight)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        result = self.base_layer(hidden_states)
+        if self._lora_a is None or self._lora_b is None:
+            return result
+        lora_input = hidden_states.to(self._lora_a.dtype)
+        lora_hidden = torch.nn.functional.linear(lora_input, self._lora_a)
+        return result + torch.nn.functional.linear(lora_hidden, self._lora_b)
+
+
+def patch_hv15_refiner_torch_linear_lora() -> None:
+    """Include HV1.5 token-refiner ``nn.Linear`` layers in vLLM's LoRA policy."""
+    try:
+        from vllm.lora.layers import BaseLayerWithLoRA
+        from vllm.lora.utils import replace_submodule
+        from vllm_omni.diffusion.lora.utils import _match_target_modules
+        from vllm_omni.diffusion.models.hunyuan_video.hunyuan_video_15_transformer import (
+            HunyuanVideo15Transformer3DModel,
+        )
+    except (ImportError, AttributeError):
+        return
+
+    original_replace = DiffusionLoRAManager._replace_layers_with_lora
+    if getattr(original_replace, "_diffrl_hv15_refiner_torch_linear_lora", False):
+        return
+
+    @wraps(original_replace)
+    def _patched_replace(self, peft_helper):
+        original_replace(self, peft_helper)
+        transformer = getattr(self.pipeline, "transformer", None)
+        if not isinstance(transformer, HunyuanVideo15Transformer3DModel):
+            return
+
+        blocks = transformer.context_embedder.token_refiner.refiner_blocks
+        prefix = "context_embedder.token_refiner.refiner_blocks"
+        target_modules = getattr(peft_helper, "target_modules", None)
+        target_pattern = target_modules if isinstance(target_modules, str) and target_modules else None
+        target_list = target_modules if isinstance(target_modules, list) and target_modules else None
+
+        def _matches_target(module_name: str) -> bool:
+            if target_pattern is not None:
+                import regex as re
+
+                return re.search(target_pattern, module_name) is not None
+            return target_list is None or _match_target_modules(module_name, target_list)
+
+        matched = []
+        for block_index, block in enumerate(blocks):
+            for target_path, module in block.named_modules(remove_duplicate=False):
+                module_name = f"{prefix}.{block_index}.{target_path}"
+                full_module_name = f"transformer.{module_name}"
+                if (
+                    target_path
+                    and _matches_target(full_module_name)
+                    and isinstance(
+                        module,
+                        (torch.nn.Linear, _HV15TorchLinearWithLoRA, BaseLayerWithLoRA),
+                    )
+                ):
+                    matched.append((module_name, full_module_name, module))
+
+        newly_wrapped = 0
+        for module_name, full_module_name, module in matched:
+            if isinstance(module, torch.nn.Linear):
+                module = _HV15TorchLinearWithLoRA(module)
+                replace_submodule(transformer, module_name, module)
+                newly_wrapped += 1
+            self._lora_modules[full_module_name] = module
+
+        if newly_wrapped:
+            logger.info(
+                "Wrapped %d HV1.5 token-refiner nn.Linear layers for online LoRA",
+                newly_wrapped,
+            )
+
+    _patched_replace._diffrl_hv15_refiner_torch_linear_lora = True
+    DiffusionLoRAManager._replace_layers_with_lora = _patched_replace
+
+
 def patch_lora_request_passthrough() -> None:
-    """Forward ``lora_request`` through ``Omni.generate`` to ``engine.add_request``.
-
-    Required for HI3-Instruct t2i RL (``think_recaption`` mode) so that the AR
-    prelude stage in vllm-omni picks up the per-rollout LoRA adapter alongside
-    the DiT stage. Without this, ``VLLMOmniRolloutEngine.generate`` cannot pass
-    ``lora_request`` into the AR stage's request scheduler — the AR worker runs
-    the base model while DiT runs the LoRA-adapted model (half-adapted
-    trajectory => silent policy/rollout mismatch).
-
-    Replaces pod-local file patch on ``vllm_omni/entrypoints/omni.py``.
-    """
+    """Forward ``lora_request`` through ``Omni.generate`` to ``engine.add_request``."""
     try:
         from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
         from vllm_omni.entrypoints.omni import Omni
     except (ImportError, AttributeError):
-        return  # vllm-omni not available in this process; skip
+        return
 
-    # ── Omni.generate: stash lora_request on the engine instance ──────
     _orig_omni_generate = Omni.generate
     if not getattr(_orig_omni_generate, "_diffrl_lora_request_passthrough", False):
 
@@ -385,8 +578,7 @@ def patch_lora_request_passthrough() -> None:
                 self.engine._diffrl_pending_lora_request = None
                 raise
             if py_generator:
-                # ``_orig`` returned a generator — wrap so we clear the stash
-                # only when the generator is exhausted / closed.
+
                 def _wrapped(gen, engine):
                     try:
                         yield from gen
@@ -400,7 +592,6 @@ def patch_lora_request_passthrough() -> None:
         _patched_omni_generate._diffrl_lora_request_passthrough = True  # type: ignore[attr-defined]
         Omni.generate = _patched_omni_generate
 
-    # ── AsyncOmniEngine.add_request: pickup from stash ────────────────
     _orig_add_request = AsyncOmniEngine.add_request
     if not getattr(_orig_add_request, "_diffrl_lora_request_passthrough", False):
 
@@ -414,19 +605,7 @@ def patch_lora_request_passthrough() -> None:
 
 
 def patch_sigmas_passthrough() -> None:
-    """Monkey-patch HunyuanImage3Pipeline to forward custom sigmas to DiT scheduler.
-
-    Outer ``HunyuanImage3Pipeline.forward`` extracts sigmas from req and stashes
-    on the instance; inner ``HunyuanImage3Text2ImagePipeline.__call__`` picks up
-    via ``self.model`` (which references the outer instance) and injects as a
-    kwarg so ``scheduler.set_timesteps`` gets the correct schedule.
-
-    Without this, UniRL's FlowMatchSchedulePolicy.sigmas is never
-    forwarded to the DiT scheduler (rollout-train sigma mismatch
-    max abs diff ~0.158 => GRPO log-prob replay incorrect).
-
-    Replaces pod-local file patch on ``vllm_omni/diffusion/models/hunyuan_image3/pipeline_hunyuan_image3.py``.
-    """
+    """Monkey-patch HunyuanImage3Pipeline to forward custom sigmas to DiT scheduler."""
     try:
         from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import (
             HunyuanImage3Pipeline,
@@ -460,15 +639,11 @@ def patch_sigmas_passthrough() -> None:
             _patched_inner_call._diffrl_sigmas_passthrough = True  # type: ignore[attr-defined]
             HunyuanImage3Text2ImagePipeline.__call__ = _patched_inner_call
     except (ImportError, AttributeError):
-        pass  # pipeline not available in this process; skip
+        pass
 
 
 def patch_per_request_ar_seed() -> None:
-    """Stamp a fresh os.urandom seed onto every AR SamplingParams in add_request's
-    sampling_params_list. Without this, a GRPO group's N parallel requests all
-    re-seed from the same shared SamplingParams ref and collapse to byte-identical
-    AR tokens despite temperature > 0.
-    """
+    """Stamp a fresh os.urandom seed onto every AR SamplingParams in add_request's sampling_params_list."""
     try:
         import msgspec as _msgspec
         from vllm import SamplingParams as VLLMSamplingParams
@@ -484,9 +659,6 @@ def patch_per_request_ar_seed() -> None:
 
     def _patched(self, *args, sampling_params_list=None, _orig=_orig, **kwargs):
         if sampling_params_list is not None:
-            # SamplingParams is a msgspec.Struct shared across the N add_request
-            # calls; ``structs.replace`` produces a brand-new instance per request
-            # so the worker queue does not see one object holding the last seed.
             sampling_params_list = [
                 _msgspec.structs.replace(sp, seed=int.from_bytes(_os.urandom(4), "big"))
                 if isinstance(sp, VLLMSamplingParams) and getattr(sp, "seed", None) is None
@@ -499,184 +671,36 @@ def patch_per_request_ar_seed() -> None:
     AsyncOmniEngine.add_request = _patched
 
 
-def patch_master_port_unstrip() -> None:
-    """Keep ``master_port`` alive through ``AsyncOmniEngine._strip_single_engine_args``.
-
-    At the v0.20.0 pin the ``stage_configs_path`` route strips parent
-    ``EngineArgs`` fields (including ``master_port``) from the kwargs that
-    become ``base_engine_args`` for the per-stage YAML merge
-    (``async_omni_engine.py:1558``), and the post-resolution injection loop
-    only re-adds ``enable_sleep_mode`` / ``lora_path`` / ``lora_scale``.
-    Net effect: the engine-reserved per-replica master-port base NEVER
-    reaches ``OmniDiffusionConfig``, so every stage settles from the shared
-    ``(None or 30005) + random(0, 100)`` window with only the 37-stride
-    bind-check scan for collision avoidance (``diffusion/data.py:578``).
-    Eight colocated replicas race that window; fast-booting models (SD3.5)
-    happened to win, slow-booting ones (Qwen-Image, ~35s weight load) lose
-    the check-to-bind TOCTOU and die with ``DistNetworkError ... port:
-    30005, code: -98`` (LIN-382 qwen probe, 2026-06-07).
-
-    Re-attach the caller's ``master_port`` to the stripped dict so the
-    existing ``load_stage_configs_from_yaml`` ``base_engine_args`` merge
-    lands it per stage. Stage-YAML keys still win (none of ours define
-    ``master_port``); the settle scan stays as the TOCTOU fallback.
-
-    DELETE-WHEN: pin >= v0.21.0rc2 — #3803 honors the injected base
-    verbatim (mind the env ``MASTER_PORT`` precedence landmine documented
-    in ``docs/vllm-omni-v2-engine.md``).
-    """
-    try:
-        from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
-
-        _orig = AsyncOmniEngine._strip_single_engine_args
-        if getattr(_orig, "_diffrl_master_port_unstrip", False):
-            return
-
-        def _patched_strip(kwargs, _orig=_orig):
-            out = _orig(kwargs)
-            if isinstance(kwargs, dict):
-                master_port = kwargs.get("master_port")
-                if master_port is not None:
-                    out["master_port"] = master_port
-            return out
-
-        _patched_strip._diffrl_master_port_unstrip = True  # type: ignore[attr-defined]
-        AsyncOmniEngine._strip_single_engine_args = staticmethod(_patched_strip)
-    except (ImportError, AttributeError):
-        pass  # vllm-omni not available in this process; skip
-
-
-def patch_hi3_flow_alignment() -> None:
-    """Port of bjf-frz/fix-hi3-flow (vllm-omni eed27812) to v0.20.0's older
-    KV-cache API: store full 4-D first-step KV, then scatter live image KV by
-    absolute position_ids on subsequent steps. Silent skip on non-v0.20.0.
-
-    Threads position_ids through a thread-local so we only need to patch
-    `_save_image_kv_caches`, `_update_image_kv_caches` and a tiny wrapper
-    around `HunyuanImage3DecoderLayer.forward` (no need to reimplement
-    `ImageKVCacheManager.__call__` for the sake of one line).
-
-    Delete this function once vllm-omni upstream lands the fix in our pinned version.
-    """
-    try:
-        from vllm_omni.diffusion.models.hunyuan_image3 import (
-            hunyuan_image3_transformer as _trans,
-        )
-    except (ImportError, AttributeError):
-        return
-
-    _ImageKVCacheManager = _trans.ImageKVCacheManager
-    _DecoderLayer = _trans.HunyuanImage3DecoderLayer
-
-    if not hasattr(_ImageKVCacheManager, "_save_image_kv_caches"):
-        return
-
-    import threading as _threading
-
-    # Thread-local position_ids stash. Single denoise call chain (DecoderLayer.forward
-    # → self_attn → image_attn → _update_image_kv_caches) is synchronous in one
-    # thread, so the wrapper sets _tls.position_ids on entry and the patched
-    # _update reads it back down the stack.
-    _tls = _threading.local()
-
-    _orig_save = _ImageKVCacheManager._save_image_kv_caches
-    if not getattr(_orig_save, "_diffrl_hi3_flow_aligned", False):
-
-        def _patched_save_image_kv_caches(self, key, value, seq_len):
-            assert key.shape[1] == seq_len, f"first-step q_len({key.shape[1]}) != seq_len({seq_len})"
-            self.image_kv_cache_map = (key.contiguous(), value.contiguous())
-
-        _patched_save_image_kv_caches._diffrl_hi3_flow_aligned = True  # type: ignore[attr-defined]
-        _ImageKVCacheManager._save_image_kv_caches = _patched_save_image_kv_caches
-
-    _orig_update = _ImageKVCacheManager._update_image_kv_caches
-    if not getattr(_orig_update, "_diffrl_hi3_flow_aligned", False):
-
-        def _patched_update_image_kv_caches(self, key, value, seq_len, position_ids=None):
-            cached_key, cached_value = self.image_kv_cache_map
-            bs, q_len = key.shape[0], key.shape[1]
-            if position_ids is None:
-                position_ids = getattr(_tls, "position_ids", None)
-            assert cached_key.dim() == 4, (
-                f"patch_hi3_flow_alignment expects a 4-D cache from the patched "
-                f"_save_image_kv_caches; got dim={cached_key.dim()}."
-            )
-            assert position_ids is not None and position_ids.shape == (bs, q_len), (
-                f"position_ids missing or wrong shape: {None if position_ids is None else tuple(position_ids.shape)} "
-                f"!= ({bs}, {q_len})"
-            )
-            result_k = cached_key.clone()
-            result_v = cached_value.clone()
-            for b in range(bs):
-                result_k[b].index_copy_(0, position_ids[b], key[b])
-                result_v[b].index_copy_(0, position_ids[b], value[b])
-            return result_k.contiguous(), result_v.contiguous()
-
-        _patched_update_image_kv_caches._diffrl_hi3_flow_aligned = True  # type: ignore[attr-defined]
-        _ImageKVCacheManager._update_image_kv_caches = _patched_update_image_kv_caches
-
-    _orig_decoder = _DecoderLayer.forward
-    if not getattr(_orig_decoder, "_diffrl_hi3_flow_aligned", False):
-
-        def _patched_decoder_forward(
-            self,
-            hidden_states,
-            attention_mask=None,
-            position_ids=None,
-            *args,
-            _orig=_orig_decoder,
-            **kwargs,
-        ):
-            _prev = getattr(_tls, "position_ids", None)
-            _tls.position_ids = position_ids
-            try:
-                return _orig(self, hidden_states, attention_mask, position_ids, *args, **kwargs)
-            finally:
-                _tls.position_ids = _prev
-
-        _patched_decoder_forward._diffrl_hi3_flow_aligned = True  # type: ignore[attr-defined]
-        _DecoderLayer.forward = _patched_decoder_forward
-
-
 class VLLMOmniHijack:
-    """Monkey-patches vllm-omni internals to support in-memory LoRA tensors.
-
-    Two managers need patching for HI3 t2i:
-
-    - ``vllm_omni.diffusion.lora.manager.DiffusionLoRAManager._load_adapter``
-      drives the DiT stage and returns ``(LoRAModel, PEFTHelper)``.
-    - ``vllm.lora.worker_manager.WorkerLoRAManager._load_adapter`` drives the
-      AR stage and returns just ``LoRAModel``.
-
-    Both originally only accept on-disk adapters. We branch on the request
-    type and load from in-memory tensors when ``OmniTensorLoRARequest`` is
-    passed, otherwise fall through to the original loader.
-    """
+    """Monkey-patches vllm-omni internals to support in-memory LoRA tensors."""
 
     @staticmethod
     def hijack() -> None:
-        # MUST run first: install the mp.Process wrap so any subsequent
-        # spawn-spawned subprocesses also run this hijack() at startup.
-        # Without this, patches that target functions imported during the
-        # child's model-loading phase (notably patch_fp32_skip → from_layer)
-        # never take effect in the worker subprocesses.
         wrap_mp_process_for_children()
 
+        # StageDiffusionProc never loads vllm_omni.general_plugins, so spawn children get the flush only via wrap_mp.
+        from unirl.rollout.engine.vllm_omni.plugin import register_capture_flush
+
+        register_capture_flush()
+
         patch_dit_lora_loader()
+        patch_dit_hi3_lora_weights()
         patch_ar_lora_loader()
         patch_ar_merged_lora_fused_tensor()
         patch_fp32_skip()
+        patch_hv15_packed_lora_mapping()
+        patch_hv15_refiner_torch_linear_lora()
         patch_lora_request_passthrough()
         patch_per_request_ar_seed()
         patch_sigmas_passthrough()
-        patch_hi3_flow_alignment()
-        patch_master_port_unstrip()
+        patch_moe_workspace_pool()
 
 
 __all__ = [
     "OmniTensorLoRARequest",
     "VLLMOmniHijack",
-    "patch_hi3_flow_alignment",
+    "patch_hv15_packed_lora_mapping",
+    "patch_hv15_refiner_torch_linear_lora",
     "patch_per_request_ar_seed",
     "patch_sigmas_passthrough",
 ]

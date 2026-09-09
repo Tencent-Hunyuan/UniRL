@@ -12,7 +12,7 @@
 #   SFT_EVAL_DATA   eval manifest (defaults to SFT_DATA — supply a real split!)
 #
 # Data prep (HF llava-instruct sample):
-#   python -m unirl.utils.prepare_sft_vlm --out-dir data/sft_vlm
+#   python datasets/sft_manifests/prepare_sft_vlm.py --out-dir data/sft_vlm
 #
 # Launch:
 #   ENTRY=train_sft SFT_DATA=data/sft_vlm/train.jsonl SFT_EVAL_DATA=data/sft_vlm/val.jsonl \

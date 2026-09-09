@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 from unirl.models.types.ar import ARSamplingParams
 from unirl.models.types.pipeline import Pipeline
-from unirl.types.primitives import Images, Texts
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp, RolloutTrack
+from unirl.types.primitives import Texts
+from unirl.types.sample import Sample, Turn
 
 from .ar import QwenVLARParams, QwenVLARStage
 from .bundle import QwenVLBundle
@@ -16,6 +15,8 @@ from .config import QwenVLPipelineConfig
 
 
 class QwenVLPipeline(Pipeline):
+    """Qwen-VL AR (understanding) generate pipeline: ``Sample → Sample``."""
+
     def __init__(
         self,
         *,
@@ -36,17 +37,7 @@ class QwenVLPipeline(Pipeline):
         max_prompt_length: int = 4096,
         pad_to_max_length: bool = False,
     ) -> "QwenVLPipeline":
-        """Wire chat-template + AR stages around an already-loaded bundle.
-
-        The v2 trainer loads the bundle once and injects it
-        (``remote_hydra(pipeline_cfg, bundle=...)``); routing pipeline
-        construction through ``from_config`` instead would load a second copy
-        of the model. This factory shares the single bundle.
-
-        ``pad_to_max_length`` fixes the prompt sequence length to
-        ``max_prompt_length`` so DP rollout shards stay concat-compatible at
-        merge time (see :class:`QwenVLChatTemplateStage`).
-        """
+        """Wire chat-template + AR stages around an already-loaded bundle."""
         chat_template = QwenVLChatTemplateStage(
             bundle,
             max_prompt_length=max_prompt_length,
@@ -62,20 +53,13 @@ class QwenVLPipeline(Pipeline):
         bundle = QwenVLBundle.from_config(config)
         return cls.from_bundle(bundle, max_prompt_length=config.max_prompt_length)
 
-    def generate(self, req: RolloutReq) -> RolloutResp:
-        texts = req.primitives.get("text")
-        if not isinstance(texts, Texts):
-            raise TypeError(
-                f"QwenVLPipeline.generate: req.primitives['text'] must be Texts, "
-                f"got {type(texts).__name__ if texts is not None else 'None'}"
-            )
-
-        pil_images = None
-        images_prim = req.primitives.get("image")
-        if images_prim is not None and isinstance(images_prim, Images):
-            pil_images = images_prim.to_pils()
-
-        chat_overrides: Dict[str, Any] = dict(req.stage_config.get("chat") or {})
+    def _conditions_for(
+        self,
+        turns: List[Turn],
+        control: Optional[Dict[str, Any]] = None,
+    ) -> QwenVLARConditions:
+        """Chat-template + tokenize the trajectory ``turns`` (text + image turns) → :class:`QwenVLARConditions`."""
+        chat_overrides: Dict[str, Any] = dict((control or {}).get("chat") or {})
         if "system_instruction" in chat_overrides:
             chat_stage = QwenVLChatTemplateStage(
                 self.bundle,
@@ -84,20 +68,27 @@ class QwenVLPipeline(Pipeline):
             )
         else:
             chat_stage = self.chat_template
+        return chat_stage.embed(turns)
 
-        conds: QwenVLARConditions = chat_stage.embed(texts, images=pil_images)
-
-        ar = req.sampling_params.get("ar")
-        if ar is not None:
-            params = QwenVLARParams(
-                max_tokens=ar.max_new_tokens,
-                temperature=ar.temperature,
-                top_p=ar.top_p,
-                top_k=ar.top_k,
+    def generate(self, sample: Sample) -> Sample:
+        """Run Qwen-VL AR generation end-to-end, filling the frontier (pre-forked) gen Part."""
+        frontier = sample.parts[-1]
+        ar = frontier.sampling_params
+        if not isinstance(ar, ARSamplingParams):
+            raise TypeError(
+                f"QwenVLPipeline.generate: frontier gen Part must carry ARSamplingParams, "
+                f"got {type(ar).__name__ if ar is not None else 'None'}"
             )
-        else:
-            params = QwenVLARParams()
 
+        turns, _images = sample.vision_conditioning()
+        conds = self._conditions_for(turns, sample.parts[0].control)
+
+        params = QwenVLARParams(
+            max_tokens=ar.max_new_tokens,
+            temperature=ar.temperature,
+            top_p=ar.top_p,
+            top_k=ar.top_k,
+        )
         sampling_params = ARSamplingParams(
             max_new_tokens=int(params.max_tokens),
             temperature=float(params.temperature),
@@ -109,17 +100,8 @@ class QwenVLPipeline(Pipeline):
         segment = self.ar.autoregress(conds, sampling_params=sampling_params, params=params)
         decoded = self._detokenize(segment)
 
-        return RolloutResp(
-            tracks={
-                "ar": RolloutTrack(
-                    sample_ids=list(req.sample_ids),
-                    parent_ids=list(req.group_ids),
-                    conditions=conds.to_dict(),
-                    segment=segment,
-                    decoded=decoded,
-                ),
-            }
-        )
+        filled = frontier.fill(segment=segment, primitives={"text": decoded}, conditions=conds.to_dict())
+        return Sample(parts=[*sample.parts[:-1], filled], reward_compute_s=sample.reward_compute_s)
 
     def _detokenize(self, segment) -> Texts:
         if segment.tokens is None or segment.cu_seqlens is None:

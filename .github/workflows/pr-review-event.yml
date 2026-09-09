@@ -1,0 +1,29 @@
+name: PR Review Event
+
+# Fork review events cannot write labels. Pass only the PR number to the
+# privileged workflow that runs after this one completes.
+on:
+  pull_request_review:
+    types: [submitted, dismissed]
+
+permissions: {}
+
+jobs:
+  capture-review:
+    name: Capture PR review
+    runs-on: ubuntu-latest
+    steps:
+      - name: Save PR number
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/pr-review-event"
+          printf '%s\n' "$PR_NUMBER" > "$RUNNER_TEMP/pr-review-event/pr-number"
+
+      - name: Upload PR number
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-review-event
+          path: ${{ runner.temp }}/pr-review-event/pr-number
+          if-no-files-found: error
+          retention-days: 1

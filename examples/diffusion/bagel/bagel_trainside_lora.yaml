@@ -16,7 +16,7 @@
 # the diffuse↔replay ratio==1 bit-exactness. This = the known-good v3 config on the
 # central-kitchen (reuse) Bagel stack.
 #
-# Launch:  bash scripts/migration/run_reuse_smoke.sh   (offline smoke) or a long-run launcher
+# Launch:  bash examples/run_experiment_single_node.sh diffusion/bagel/bagel_trainside_lora
 # Compose: cd UniRL-main && PYTHONPATH=$PWD python -m unirl.train_diffusion \
 #            --config-name diffusion/bagel/bagel_trainside_lora --cfg job --resolve
 
@@ -176,7 +176,7 @@ sampling:
   # diffuse/replay are index-set-based (unirl.types.sampling.compute_trajectory_positions
   # stores x_t before+after each SDE step independently), so non-contiguous is fully supported.
   scheduler:
-    _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+    _target_: unirl.sde.index_schedule.AllSDEScheduler
     num_timesteps: ${..num_inference_steps}
     timestep_fraction: [0.0, 0.5]
     num_sde_steps: 2

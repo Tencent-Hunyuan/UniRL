@@ -10,11 +10,7 @@ _UNCLOSED_THINK_PATTERN = re.compile(r"<think>(.*)$", re.DOTALL)
 
 
 def split_thinking_tags(text: str) -> Tuple[str, str]:
-    """Split LLM output into ``(content, reasoning_content)``.
-
-    Handles both closed ``<think>...</think>`` and unclosed ``<think>...`` (when
-    ``max_new_tokens`` cuts off before the closing tag).
-    """
+    """Split LLM output into ``(content, reasoning_content)``."""
     matches = _THINK_PATTERN.findall(text)
     if matches:
         reasoning = "\n".join(matches)

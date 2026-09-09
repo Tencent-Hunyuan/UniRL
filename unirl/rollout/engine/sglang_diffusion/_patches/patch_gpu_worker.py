@@ -1,35 +1,4 @@
-"""Re-home the ``sglang-drl`` fork's ``GPUWorker`` RL additions onto stock upstream.
-
-The fork added, to ``runtime/managers/gpu_worker.py:GPUWorker``:
-  * ``__init__`` instance state for sleep/wake + distributed weight updates, and a
-    ``MemorySaverHandler`` (zero-copy GPU sleep/wake).
-  * ~14 net-new methods: ``is_sleeping``, ``_to_torch_dtype``,
-    ``init_weights_update_group`` / ``destroy_weights_update_group``,
-    ``update_weights_from_tensor`` / ``update_weights_from_distributed``,
-    ``encode_prompt``, ``get_weights_detail``, ``set_lora_from_tensors``,
-    ``_get_module_device`` / ``_move_unregistered_tensors`` / ``_move_modules``,
-    ``release_memory_occupation`` / ``resume_memory_occupation``.
-
-All method bodies are copied verbatim from the fork diff
-(``e9b570654..HEAD`` for ``gpu_worker.py``); they are only re-homed as
-``setattr`` (and an AROUND-wrapped ``__init__``) so UniRL can track
-upstream instead of carrying a hard fork. NO sglang source is edited.
-
-The fork called several names as gpu_worker module globals (``get_tp_rank``,
-``WeightsUpdater``, ``get_updatable_modules``, ``iter_materialized_weights``,
-``compute_weights_checksum``, ``LoRAPipeline``); since these patched functions
-live in this module, they import those names locally (import-safe, idempotent).
-
-Cross-patch dependencies (added by sibling patches, called here exactly as the
-fork does):
-  * ``WeightsUpdater.update_weights_from_named_tensors`` -- fork-only, added by
-    ``patch_weights_updater``. Used by ``update_weights_from_tensor`` /
-    ``update_weights_from_distributed``.
-  * ``LoRAPipeline.set_lora(..., lora_tensors=...)`` + the tensor-load path --
-    fork-only, added by ``patch_lora_pipeline``. Used by ``set_lora_from_tensors``.
-
-See the module-level RISKS docstring at the bottom for upstream gaps.
-"""
+"""Re-home the ``sglang-drl`` fork's ``GPUWorker`` RL additions onto stock upstream."""
 
 from __future__ import annotations
 
@@ -42,14 +11,12 @@ def patch_gpu_worker() -> None:
     """Install the fork's ``GPUWorker`` RL additions on stock upstream sglang."""
     from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 
-    # -- AROUND-wrap __init__: add fork instance state + MemorySaverHandler -----
     if not getattr(GPUWorker.__init__, "_unirl_gpu_worker", False):
         _orig_init = GPUWorker.__init__
 
         def __init__(self, *args, **kwargs):
             _orig_init(self, *args, **kwargs)
 
-            # Lazy import: import-safe + avoids a hard dep at patch-install time.
             from sglang.srt.utils.torch_memory_saver_adapter import (
                 TorchMemorySaverAdapter,
             )
@@ -62,11 +29,6 @@ def patch_gpu_worker() -> None:
             self._sleep_restore_map: dict[str, str] = {}
             self._weights_update_groups: dict = {}
 
-            # Memory saver handler (zero-copy sleep/wake).
-            # NOTE: stock-upstream multimodal_gen ServerArgs lacks
-            # ``enable_memory_saver`` (only ``pin_cpu_memory`` exists), so read
-            # both defensively via getattr -- see RISKS. The fork read them as
-            # plain attributes (server_args.enable_memory_saver / .pin_cpu_memory).
             self._memory_saver = MemorySaverHandler(
                 adapter=TorchMemorySaverAdapter.create(enable=getattr(self.server_args, "enable_memory_saver", False)),
                 pipeline=self.pipeline,
@@ -78,8 +40,6 @@ def patch_gpu_worker() -> None:
         __init__._unirl_gpu_worker = True  # type: ignore[attr-defined]
         GPUWorker.__init__ = __init__
 
-    # -- setattr the net-new methods (verbatim fork bodies) --------------------
-    # Idempotency guard: all methods share one sentinel attr on the class.
     if getattr(GPUWorker, "_unirl_gpu_worker_methods", False):
         return
 
@@ -97,16 +57,8 @@ def patch_gpu_worker() -> None:
     GPUWorker._move_modules = _move_modules
     GPUWorker.release_memory_occupation = _release_memory_occupation
     GPUWorker.resume_memory_occupation = _resume_memory_occupation
-    # NOTE: get_weights_checksum is NOT set -- it exists in stock upstream.
 
     GPUWorker._unirl_gpu_worker_methods = True
-
-
-# ===========================================================================
-# Module-level patched method bodies (copied verbatim from the fork diff).
-# ``self`` is the GPUWorker instance; module globals the fork relied on are
-# imported locally inside each body (import-safe).
-# ===========================================================================
 
 
 def _is_sleeping(self) -> bool:
@@ -273,15 +225,7 @@ def _update_weights_from_distributed(
 
 
 def _encode_prompt(self, prompts: list[str]) -> dict:
-    """Encode text prompts into embeddings using the pipeline's text encoding stage.
-
-    Returns a dict mapping tensor names to torch.Tensor values:
-      - prompt_embeds: [B, seq, hidden] sequence embeddings (concatenated along
-        seq dim when multiple encoders produce 3-D output)
-      - pooled_prompt_embeds: [B, hidden] pooled embeddings (concatenated along
-        hidden dim when multiple 2-D outputs exist)
-      - encoder_attention_mask: [B, seq] attention mask for sequence encoders
-    """
+    """Encode prompts: ``prompt_embeds [B, seq, hidden]``, ``pooled [B, hidden]``, ``mask [B, seq]``."""
     from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
     logger = init_logger("sglang.multimodal_gen.runtime.managers.gpu_worker")
@@ -307,16 +251,12 @@ def _encode_prompt(self, prompts: list[str]) -> dict:
 
         result: dict = {}
 
-        # Separate 3D sequence embeds from 2D pooled embeds
         seq_embeds = [e for e in embeds_list if e.ndim >= 3]
         pooled_embeds = [e for e in embeds_list if e.ndim == 2]
 
-        # prompt_embeds: concat sequence embeds along seq dim
         if seq_embeds:
             result["prompt_embeds"] = torch.cat(seq_embeds, dim=1) if len(seq_embeds) > 1 else seq_embeds[0]
 
-        # pooled_prompt_embeds: from 2D embeds first, fallback to pooled_list
-        # (don't merge both — Flux has duplicates across the two sources)
         if not pooled_embeds:
             pooled_embeds = list(pooled_list)
         if pooled_embeds:
@@ -324,7 +264,6 @@ def _encode_prompt(self, prompts: list[str]) -> dict:
                 torch.cat(pooled_embeds, dim=-1) if len(pooled_embeds) > 1 else pooled_embeds[0]
             )
 
-        # Attention masks for sequence encoders
         seq_masks = [m for m in masks_list if m.ndim == 2]
         if seq_masks:
             result["encoder_attention_mask"] = torch.cat(seq_masks, dim=1) if len(seq_masks) > 1 else seq_masks[0]
@@ -397,11 +336,7 @@ def _set_lora_from_tensors(
     strength: Union[float, List[float]] = 1.0,
     lora_alpha: Optional[float] = None,
 ):
-    """Set LoRA adapter from in-memory tensors.
-
-    ``lora_alpha`` (optional) is forwarded to the fork's ``set_lora`` as an
-    adapter-level alpha; ``None`` leaves the pipeline on its per-layer path.
-    """
+    """Set LoRA adapter from in-memory tensors."""
     from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline
     from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 
@@ -437,13 +372,7 @@ def _get_module_device(self, module: torch.nn.Module) -> str:
 
 
 def _move_unregistered_tensors(self, module: torch.nn.Module, device: str) -> None:
-    """
-    Move tensor attributes that are not covered by `module.to(device)`.
-
-    `module.to` handles parameters/buffers/submodules, but some models keep tensor
-    caches in plain Python attributes. We traverse `module.__dict__` and move tensor
-    leaves inside tensors / dict / list / tuple while keeping non-tensor objects.
-    """
+    """Move tensor attributes that are not covered by `module.to(device)`."""
     from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
     logger = init_logger("sglang.multimodal_gen.runtime.managers.gpu_worker")
@@ -477,14 +406,7 @@ def _move_unregistered_tensors(self, module: torch.nn.Module, device: str) -> No
 
 
 def _move_modules(self, names: list[str], device: str) -> bool:
-    """
-    Move selected modules to device.
-
-    This function has all-or-nothing semantics:
-    - Stop on first failure (missing module / device query / move / sanitize).
-    - Roll back modules already moved in this call.
-    - Raise RuntimeError to caller after rollback.
-    """
+    """Move selected modules to device."""
     from sglang.multimodal_gen.runtime.loader.weights_updater import (
         get_updatable_modules,
     )
@@ -513,8 +435,6 @@ def _move_modules(self, names: list[str], device: str) -> bool:
         logger.warning(
             f"[_move_modules] move failed, rollback started: target={device} moved={moved} error={e}",
         )
-        # TODO (mengyang, chenyang): If exception is raised
-        # during rollback, the original exception detail is lost.
         for name in moved:
             module = modules.get(name)
             src_dev = src_device_map.get(name)
@@ -545,14 +465,10 @@ def _release_memory_occupation(self, tags: list[str] | None = None, cpu_backup_t
             "message": "pipeline not initialized",
         }
 
-    # --- memory_saver path: per-component region pause ---
     if self._memory_saver.enabled:
         result = self._memory_saver.release(tags, cpu_backup_tags)
         self._sleeping = result.get("sleeping", False)
         return result
-
-    # --- legacy path: .to("cpu") offload ---
-    # Accept any tags (or None) — legacy path moves all modules regardless.
 
     try:
         modules = get_updatable_modules(self.pipeline)
@@ -608,13 +524,10 @@ def _resume_memory_occupation(self, tags: list[str] | None = None) -> dict:
             "message": "pipeline not initialized",
         }
 
-    # --- memory_saver path: per-component region resume ---
     if self._memory_saver.enabled:
         result = self._memory_saver.resume(tags)
         self._sleeping = result.get("sleeping", False)
         return result
-
-    # --- legacy path: .to(device) restore ---
 
     try:
         if not self._sleep_restore_map:
@@ -645,62 +558,3 @@ def _resume_memory_occupation(self, tags: list[str] | None = None) -> dict:
             "sleeping": self._sleeping,
             "message": f"resume failed; rolled back to keep state consistent: {e}",
         }
-
-
-# ===========================================================================
-# RISKS (upstream gaps vs. the fork) -- surfaced per task requirements.
-# ===========================================================================
-#
-# 1. ServerArgs.enable_memory_saver MISSING upstream.
-#    Stock-upstream ``multimodal_gen/runtime/server_args.py`` defines
-#    ``pin_cpu_memory: bool = True`` (line 208) but NOT ``enable_memory_saver``
-#    (that field lives only in srt ServerArgs and in the fork's multimodal_gen
-#    ServerArgs). __init__ above therefore reads BOTH via getattr with the
-#    fork's defaults (enable_memory_saver=False, pin_cpu_memory=True). Net effect
-#    on the SD3/dance pilots: ``self._memory_saver.enabled`` is False, so
-#    release/resume take the legacy ``.to("cpu")`` path -- functionally fine.
-#    To enable the zero-copy memory_saver path, upstream (or a ServerArgs patch)
-#    must add ``enable_memory_saver``. Worker reads server args as
-#    ``self.server_args`` (confirmed upstream gpu_worker:118).
-#
-# 2. encode_prompt: encode_text return-arity DRIFT (RISK).
-#    The fork unpacks a 3-tuple
-#    ``embeds_list, masks_list, pooled_list = text_stage.encode_text(...)``,
-#    but stock upstream ``TextEncodingStage.encode_text(return_type="list",
-#    return_attention_mask=True)`` now returns a 5-tuple
-#    ``(embeds_list, attn_masks_list, pooled_embeds_list, embeds_masks_list,
-#    seq_lens_list)``. The verbatim fork body will raise "too many values to
-#    unpack" against upstream. Left verbatim (battle-tested) and flagged: this is
-#    the conditions/text-embed path, NOT on the SD3/dance pilots
-#    (populate_conditions=False), so it is exercised only if encode_prompt is
-#    actually called. Fix when adopting the conditions path (re-sync the unpack
-#    or pass return_type="dict").
-#
-# 3. set_lora_from_tensors: depends on a sibling LoRA patch (RISK).
-#    Stock upstream ``LoRAPipeline.set_lora`` does NOT accept ``lora_tensors=``
-#    (and lacks the ``load_lora_adapter_from_tensors`` / ``normalize_lora_state_dict``
-#    helpers the fork added). The body here calls set_lora exactly as the fork
-#    does; it only works once ``patch_lora_pipeline`` re-homes those fork
-#    additions onto upstream. Not on the SD3/dance pilot path.
-#
-# 4. WeightsUpdater.update_weights_from_named_tensors is fork-only.
-#    The class exists upstream (weights_updater.py:154) but this method does NOT.
-#    update_weights_from_tensor / update_weights_from_distributed call it as the
-#    fork does; it must be provided by sibling ``patch_weights_updater``.
-#
-# 5. Forward path (_req_to_output_batch) NOT wrapped -- conditions path DEFERRED.
-#    The fork wrapped an inline ``OutputBatch(...)`` in the forward loop to add
-#    prompt_embeds / pooled_prompt_embeds / encoder_attention_mask /
-#    negative_* and trajectory_log_probs / trajectory_noise_preds.
-#    Upstream has since refactored this into a @staticmethod
-#    ``GPUWorker._req_to_output_batch(result)`` whose OutputBatch ALREADY carries
-#    the native-logprob payload via ``rollout_trajectory_data`` (schedule_batch
-#    OutputBatch:416) and ``trajectory_latents`` -- so the trajectory/log-prob
-#    needs of the SD3/dance pilots are met without any wrap. Upstream OutputBatch
-#    has NO trajectory_log_probs / trajectory_noise_preds / pooled_prompt_embeds /
-#    encoder_attention_mask / neg_pooled_prompt_embeds / negative_attention_mask
-#    fields, and the conditions return_prompt_embeds/return_negative_prompt_embeds
-#    flags are not on the pilot path (populate_conditions=False). We therefore
-#    SKIP wrapping the forward / _req_to_output_batch. Revisit when adopting the
-#    conditions path: it needs both new OutputBatch fields and an AROUND-wrap of
-#    the static ``_req_to_output_batch`` (or its merge helpers).

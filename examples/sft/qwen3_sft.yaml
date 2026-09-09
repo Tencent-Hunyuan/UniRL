@@ -13,7 +13,7 @@
 #   SFT_EVAL_DATA   eval manifest (defaults to SFT_DATA — supply a real split!)
 #
 # Data prep (HF alpaca-cleaned subset):
-#   python -m unirl.utils.prepare_sft_text --dataset yahma/alpaca-cleaned --out-dir data/sft_alpaca
+#   python datasets/sft_manifests/prepare_sft_text.py --dataset yahma/alpaca-cleaned --out-dir data/sft_alpaca
 #
 # Launch:
 #   ENTRY=train_sft SFT_DATA=data/sft_alpaca/train.jsonl SFT_EVAL_DATA=data/sft_alpaca/val.jsonl \

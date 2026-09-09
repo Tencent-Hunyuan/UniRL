@@ -163,7 +163,7 @@ sampling:
   init_same_noise: false
   autocast_precision: bf16
   scheduler:
-    _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+    _target_: unirl.sde.index_schedule.AllSDEScheduler
     num_timesteps: ${..num_inference_steps}
     num_sde_steps: 3
     # SDE-step window: [0,0.5] confines SDE noise to the early high-σ steps

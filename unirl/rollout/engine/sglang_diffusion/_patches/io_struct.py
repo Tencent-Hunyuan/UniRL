@@ -1,15 +1,4 @@
-"""RL request structs the fork added to sglang's post_training ``io_struct``.
-
-Stock upstream sglang ships only ``UpdateWeightFromDiskReqInput`` and
-``GetWeightsChecksumReqInput``; these 8 are fork-new. Defining them here is the
-**single definition site** -- both the UniRL adapter
-(``rollout/engine/sglang/engine.py``) and ``patch_scheduler`` import them from
-here, so the scheduler's ``request_handlers`` dict (keyed by ``type(req)``) and
-the objects the adapter sends are the **same classes** and dispatch matches.
-
-Copied verbatim from
-``sglang-drl/.../runtime/entrypoints/post_training/io_struct.py``.
-"""
+"""RL request structs the fork added to sglang's post_training ``io_struct``."""
 
 from __future__ import annotations
 

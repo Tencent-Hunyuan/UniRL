@@ -1,24 +1,4 @@
-"""BagelVAEDecodeStage — LatentSegment → Images via unpatchify + VAE decode.
-
-Implements ``DecodeStage[LatentSegment, Images]``. Bagel differs from SD3: its
-trajectory latents are stored **packed** (navit) as ``[N, seq, p²·z]`` (seq =
-h·w image tokens, p = ``latent_patch_size``, z = ``latent_channel``), not as a
-spatial ``[N, C, H, W]`` tensor. So decode first **unpatchifies** the final clean
-latent (``segment.latents[:, -1]``) back to spatial ``[N, z, h·p, w·p]`` and then
-runs the FLUX-style autoencoder.
-
-Math mirrors the vendored ``InterleaveInferencer.decode_image``
-(``vendor/inferencer.py``): ``reshape(N, h, w, p, p, z)`` →
-``einsum('nhwpqc->nchpwq')`` → ``reshape(N, z, h·p, w·p)`` → ``vae.decode`` →
-``*0.5 + 0.5`` clamp. The Bagel ``AutoEncoder.decode`` applies its own
-scale/shift internally, so (unlike SD3) no external scaling_factor is needed.
-
-``h, w`` come from the generation ``image_shape`` (height, width); the packed
-seq alone is ambiguous for non-square images, so ``decode`` takes an optional
-``image_shape`` (the pipeline passes ``conditions.image_shape``). When omitted it
-assumes a square grid (``h = w = isqrt(seq)``) and raises if seq isn't a perfect
-square.
-"""
+"""BagelVAEDecodeStage — LatentSegment → Images via unpatchify + VAE decode."""
 
 from __future__ import annotations
 
@@ -43,11 +23,7 @@ def bagel_latent_geometry(
     *,
     latent_downsample: int,
 ) -> Tuple[int, int]:
-    """Token grid ``(h, w)`` for an ``(H, W)`` image: ``h = H // latent_downsample``.
-
-    ``latent_downsample`` (=16 for BAGEL: VAE /8 × patch 2) folds both the VAE
-    spatial downsample and the latent patchify into one factor.
-    """
+    """Token grid ``(h, w)`` for an ``(H, W)`` image: ``h = H // latent_downsample``."""
     H, W = int(image_shape[0]), int(image_shape[1])
     return H // int(latent_downsample), W // int(latent_downsample)
 
@@ -59,13 +35,7 @@ def bagel_latent_shape(
     latent_patch_size: int,
     latent_channels: int,
 ) -> Tuple[int, int]:
-    """Packed per-sample noise shape ``(seq, p²·z)`` for an ``(H, W)`` image.
-
-    Bagel's ``x_T`` is packed ``[h·w, p²·z]`` (the ``packed_init_noises`` shape
-    ``generate_image`` consumes), NOT spatial ``[C, H, W]``. Provided for
-    driver-side noise bookkeeping / pipeline ``latent_shape`` parity; note the
-    trainside sampler currently draws ``x_T`` inside ``generate_image`` itself.
-    """
+    """Packed per-sample noise shape ``(seq, p²·z)`` for an ``(H, W)`` image."""
     h, w = bagel_latent_geometry(image_shape, latent_downsample=latent_downsample)
     return h * w, int(latent_patch_size) ** 2 * int(latent_channels)
 
@@ -78,11 +48,7 @@ def unpatchify_latent(
     patch_size: int,
     latent_channels: int,
 ) -> torch.Tensor:
-    """Unpatchify packed ``[N, h·w, p²·z]`` → spatial ``[N, z, h·p, w·p]``.
-
-    Exact inverse of the vendored patchify (``forward_cache_update_vae``); mirrors
-    ``decode_image``'s ``reshape → einsum('nhwpqc->nchpwq') → reshape``.
-    """
+    """Unpatchify packed ``[N, h·w, p²·z]`` → spatial ``[N, z, h·p, w·p]``."""
     n = int(packed.shape[0])
     p, z = int(patch_size), int(latent_channels)
     x = packed.reshape(n, h, w, p, p, z)
@@ -95,12 +61,7 @@ class BagelVAEDecodeStage(DecodeStage[LatentSegment, Images]):
 
     def __init__(self, bundle: "BagelBundle", *, decode_batch_size: int = 4) -> None:
         self.bundle = bundle
-        # Chunk the VAE decode along the batch axis. With a unified rollout the
-        # pipeline fans ONE prompt out to G samples internally, so this stage can
-        # receive all G latents at once (e.g. G=24 @ 1024²). The fp32 decoder's
-        # upsample conv2d peaks at ~1GB/image, so decoding 24 at once OOMs a
-        # 7B-resident card; 4/chunk bounds the peak. Pure no_grad inference,
-        # per-image independent → numerically identical.
+        # Decode VAE batches in chunks to bound fp32 convolution memory.
         self.decode_batch_size = max(1, int(decode_batch_size))
 
     def decode(
@@ -111,25 +72,14 @@ class BagelVAEDecodeStage(DecodeStage[LatentSegment, Images]):
         grad: bool = False,
         activation_checkpoint: bool = False,
     ) -> Images:
-        """Decode the final clean latent in *s* into ``[N, 3, H, W]`` pixels in ``[0, 1]``.
-
-        Reads ``s.latents[:, -1]`` — the final clean latent ``diffuse`` stores
-        (packed ``[N, seq, p²·z]``). ``image_shape`` (height, width) fixes the
-        token grid; omitted ⇒ square grid from ``isqrt(seq)``.
-
-        ``grad=False`` (default) keeps the rollout path under ``torch.no_grad()``.
-        ``grad=True`` (ReFL direct-reward backprop) runs the decode WITH grad so it
-        flows from the reward through the frozen VAE into ``clean``; the VAE has no
-        trainable params, so only ``clean``'s graph is extended. ``activation_checkpoint``
-        (grad only) recomputes the decode in backward to trade compute for memory.
-        """
+        """Decode the final clean latent in *s* into ``[N, 3, H, W]`` pixels in ``[0, 1]``."""
         if s.latents is None:
             raise ValueError("BagelVAEDecodeStage.decode: segment.latents is None")
         if s.latents.ndim != 4:
             raise ValueError(
                 f"BagelVAEDecodeStage.decode: expected packed latents [N, K, seq, C], got {tuple(s.latents.shape)}"
             )
-        clean = s.latents[:, -1]  # [N, seq, p²·z]
+        clean = s.latents[:, -1]
         n, seq, _ = clean.shape
 
         p = int(self.bundle.latent_patch_size)
@@ -153,8 +103,6 @@ class BagelVAEDecodeStage(DecodeStage[LatentSegment, Images]):
             bs = self.decode_batch_size
             if n <= bs:
                 return vae_fp32.decode(spatial)
-            # Decode in batch-axis chunks to bound the fp32 upsample-conv peak
-            # (per-image independent; cat keeps the [N, 3, H, W] order).
             return torch.cat([vae_fp32.decode(spatial[i : i + bs]) for i in range(0, n, bs)], dim=0)
 
         with nullcontext() if grad else torch.no_grad():
@@ -164,21 +112,9 @@ class BagelVAEDecodeStage(DecodeStage[LatentSegment, Images]):
                 decoded = checkpoint(_decode, clean, use_reentrant=False)
             else:
                 decoded = _decode(clean)
-        # Framework convention (qwen_image / sd3 / flux2_klein): the VAE stays fp32
-        # after the first decode — the .to(float32) above is a one-time lazy upcast,
-        # a no-op on later calls. The shared encode path is dtype-safe regardless:
-        # pipeline.py casts encode inputs/outputs at the vendor boundary, so the
-        # downstream bf16 vae2llm is unaffected. (This also removes the old restore's
-        # leak, where an activation_checkpoint backward recompute re-cast the VAE to
-        # fp32 after the restore had run.)
         pixels = (decoded * 0.5 + 0.5).clamp(0.0, 1.0)
-        # Move to CPU before returning: decoded pixels are only ever consumed as
-        # CPU PIL (reward scoring via tensor_frame_to_pil, rollout dump) and the flow
-        # algorithm uses latents, not decoded images. Keeping them on GPU makes the
-        # reward-step ray.get() gather deserialize onto the driver's cuda:0 (stacked
-        # on the rank-0 worker) → OOM at 32-GPU scale where the gathered batch is 4×
-        # the 8-GPU smoke.
-        return Images(pixels=pixels.cpu())
+        # Return decoded pixels on CPU to avoid driver-side GPU gathers.
+        return Images.from_dense(pixels.cpu())
 
 
 def patchify_latent(
@@ -189,9 +125,7 @@ def patchify_latent(
     patch_size: int,
     latent_channels: int,
 ) -> torch.Tensor:
-    """Spatial ``[N, z, h·p, w·p]`` → packed ``[N, h·w, p²·z]`` (inverse of
-    :func:`unpatchify_latent`; batched form of the vendored
-    ``forward_cache_update_vae`` patchify einsum)."""
+    """Spatial ``[N, z, h·p, w·p]`` → packed ``[N, h·w, p²·z]`` (inverse of"""
     p, z = patch_size, latent_channels
     n = spatial.shape[0]
     cropped = spatial[:, :, : h * p, : w * p]
@@ -200,15 +134,7 @@ def patchify_latent(
 
 
 class BagelVAEEncodeStage:
-    """Images → packed clean latents ``[B, h·w, p²·z]`` — inverse of the decode stage.
-
-    ``pixels ∈ [0, 1] → [-1, 1] → vae.encode → patchify``. The Bagel
-    ``AutoEncoder.encode`` applies its own ``scale·(z - shift)`` internally
-    (unlike SD3 — no external normalization here), but its posterior SAMPLES by
-    default (``reg.sample=True``); this stage forces the deterministic mean for
-    the duration of the call so the stored latent is the one decode reproduces.
-    First consumer: diffusion SFT's target-image encoding.
-    """
+    """Images → packed clean latents ``[B, h·w, p²·z]`` — inverse of the decode stage."""
 
     def __init__(self, bundle: "BagelBundle") -> None:
         self.bundle = bundle
@@ -217,7 +143,12 @@ class BagelVAEEncodeStage:
     def encode(self, p: Images) -> "ImageLatentCondition":
         from unirl.types.conditions.image import ImageLatentCondition
 
-        pixels = p.pixels
+        try:
+            pixels = p.to_dense()
+        except ValueError as exc:
+            raise ValueError(
+                f"BagelVAEEncodeStage.encode requires a non-empty batch with uniform image shapes; {exc}"
+            ) from exc
         if not isinstance(pixels, torch.Tensor) or pixels.ndim != 4 or pixels.shape[1] != 3:
             raise ValueError(
                 f"BagelVAEEncodeStage.encode: expected pixels [B, 3, H, W], got "

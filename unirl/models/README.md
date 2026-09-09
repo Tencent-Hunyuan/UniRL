@@ -42,21 +42,23 @@ A model package bridges three concerns through one shared bundle:
   loaded by `from_config`. No lifecycle logic. The biggest models (HunyuanImage3,
   Bagel) add a `from_meta_config` + `materialize()` path so each rank loads only its
   shard of the large transformer; SD3 / Qwen3 load eagerly.
-- **Pipeline** (`pipeline.py`) — the generate entrypoint (`generate(req) -> resp`):
-  it reads `req.primitives` / `sampling_params` / `sigmas`, builds the model's typed
-  `Conditions`, runs the stage, and packs one or more `RolloutTrack`s.
+- **Pipeline** (`pipeline.py`) — the endomorphic generate entrypoint
+  (`generate(sample) -> sample`): it reads ancestor primitives through
+  `sample.conditioning()`, reads sampling params from a pre-forked generation
+  Part, builds typed `Conditions`, runs the stage, and fills that Part.
 - **Stages** (`diffusion.py` / `ar.py`) — the trainable units. `DiffusionStage`
   exposes `diffuse` (rollout), `replay` (train), and `predict_noise_at_step` (DiffusionNFT);
   `ARStage` exposes `autoregress` and `replay`. Each exposes `trainable_module()`,
   returning the `nn.Module` the FSDP backend wraps and engines eval-scope.
 - **Conditions** (`conditions.py`) — typed `Batch` subclasses with
   `from_dict`/`to_dict`, so the pipeline works in typed form internally but stores
-  the generic `Dict[str, Condition]` shape on the track.
+  the generic `Dict[str, Condition]` shape on the generated Part.
 
 The **bundle is shared, not duplicated**: the trainer builds it once and injects it
 into both sides, so replay reads exactly the weights training updates — hence
 pipelines offer a bundle-injected constructor alongside the self-loading
-`from_config`. σ is engine-pinned: a diffusion pipeline reads `req.sigmas` verbatim
+`from_config`. σ is engine-pinned: a diffusion pipeline reads the generation
+Part's `DiffusionSamplingParams.sigmas` verbatim
 and raises if it's `None` — it doesn't compute σ at generate time. Diffusion
 pipelines also implement `latent_shape()` so the trainer can author the
 byte-identical `x_T` recipe.
@@ -78,7 +80,45 @@ it is the authoritative bundle / pipeline / stage / conditions contract.
 - **Share one bundle.** For colocate/trainside runs the pipeline must be built from
   the *injected* bundle (not `from_config`), or replay reads a stale second copy of
   the weights.
-- **σ is engine-pinned** — a diffusion pipeline reads `req.sigmas` and raises if
+- **σ is engine-pinned** — a diffusion pipeline reads the generation Part's sigmas and raises if
   it's `None`; never build the σ tensor inside `generate`.
 - **CFG empty-negative differs per model** (SD3 `""`, Qwen-Image `" "`) — use the
   model's canonical upstream value or the rollout/replay ratio drifts off 1.0.
+- **HunyuanVideo-1.5 prompt-template whitespace is tokenizer state.** Keep
+  `PROMPT_TEMPLATE_SYSTEM_MESSAGE` byte-identical to upstream because
+  `mllm_crop_start=108` is tied to that exact prefix length; collapsing its
+  indentation drops user-prompt tokens.
+- **Work that needs real storage goes through `types/post_materialize.py`.** A
+  bundle or a structural injector (LoRA / NFT / mirror) may run while the module
+  is still on the meta device, where writing a tensor is a no-op. Register such
+  work with `defer_after_materialize`; the train backend drains it with
+  `apply_deferred_ops` after the weight load. The pair describes
+  model-construction state, not training policy, which is why it lives under
+  `models/types/` and not under `train/`.
+- **Name-keyed matching around materialization compares canonical names.**
+  Deferred ops (and `materialize()`) run post-wrap, and `checkpoint_wrapper`
+  (activation checkpointing) interposes a `_checkpoint_wrapped_module.` segment
+  in `named_parameters()` names while `state_dict()` keys stay canonical (the
+  wrapper's state-dict hooks strip it). Any match between module params and
+  checkpoint keys goes through `canonical_param_name`, exported beside the
+  deferred-op pair in `types/post_materialize.py`.
+
+
+## Conversation composition
+
+`unirl/models/types/conversations.py` holds the transpose helpers with more than
+one model consumer: `build_text_messages` (qwen3, qwen3_5),
+`build_vision_messages` (qwen_vl, qwen3_5), and the two composition rules both
+use — `system_prefix` and `group_consecutive_roles`. The sglang wire render
+imports those two rather than keeping private copies, so the rules have one
+definition.
+
+- **One system rule:** the config `system_instruction` is a default; an explicit
+  `system` turn in the data wins. A path that wants "data is the sole source of
+  truth" leaves `system_instruction` unset in the recipe — not a code branch.
+- **A render with one model consumer stays in that model's package** and imports
+  the shared rules (Qwen3-Omni's URI-media render lives in
+  `unirl/models/qwen3_omni/media.py`, next to the media contract it enforces). It
+  moves into the shared layer when a second consumer actually exists.
+- Model chat stages own *encoding* — chat template, processor, Bagel splits —
+  never the composition rules.

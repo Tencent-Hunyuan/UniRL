@@ -1,12 +1,4 @@
-"""Fetch GPQA-Diamond (gated; NEVER commit the data — it carries a canary string).
-
-Prerequisites: accept the conditions at https://huggingface.co/datasets/Idavidrein/gpqa
-while logged in, then run with a token: ``HF_TOKEN=... python benchmarks/text/gpqa/fetch.py``.
-
-Writes ``data/gpqa_diamond.jsonl`` with ``{id, problem, answer}``: the problem embeds
-the four options (A-D) shuffled with a fixed per-question seed, mirroring the official
-baseline's seeded shuffle (github.com/idavidrein/gpqa baselines/utils.py).
-"""
+"""Fetch GPQA-Diamond (gated; NEVER commit the data — it carries a canary string)."""
 
 from __future__ import annotations
 
@@ -20,7 +12,7 @@ LETTERS = "ABCD"
 
 
 def main() -> None:
-    from huggingface_hub import hf_hub_download  # ships with the repo's transformers/diffusers stack
+    from huggingface_hub import hf_hub_download
 
     csv_path = hf_hub_download(repo_id="Idavidrein/gpqa", filename="gpqa_diamond.csv", repo_type="dataset")
     DATA_DIR.mkdir(exist_ok=True)

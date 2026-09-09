@@ -1,7 +1,5 @@
 from setuptools import find_packages, setup
 
-# Compatibility metadata for older pip/setuptools editable installs.
-# Newer tooling uses pyproject.toml as the source of truth.
 setup(
     name="unirl",
     version="0.1.0",
@@ -36,12 +34,17 @@ setup(
             "wandb>=0.16,<0.20",
             "aiohttp>=3.9",
         ],
+        "cosmos3": [
+            "diffusers>=0.39",
+        ],
         "infer": [
             "accelerate>=0.30",
         ],
         "eval": [
             "torchvision>=0.16",
-            "easyocr>=1.7",
+            "paddlepaddle==3.2.2",
+            "paddleocr==3.5.0",
+            "python-Levenshtein>=0.27",
         ],
         "dev": [
             "pytest>=7.4",

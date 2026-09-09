@@ -125,10 +125,10 @@ The practical consequence:
 ## From rollout to update
 
 1. `unirl.train_ar` builds `ARTrainer` for the text-only Qwen3 recipe.
-2. `SGLangRolloutEngine` samples completions and returns an `"ar"` track with packed
+2. `SGLangRolloutEngine` samples completions and fills the AR `Part` with packed
    `TextSegment.tokens`, `log_probs`, `lengths`, and masks.
 3. `MathBoxedRewardScorer` scores each completion correct/incorrect.
-4. `RolloutTrack.compute_advantages(normalize=False, scope="group")` mean-centers rewards
+4. `Part.compute_advantages(normalize=False, scope="group")` mean-centers rewards
    within each prompt group; the recipe sets `normalize_adv_by_std: false`, so there is **no
    std division**.
 5. `TrainStack.train_track` calls `DRPO.compute_loss_and_backward`, which replays the
@@ -170,7 +170,7 @@ emitted by `_drpo_loss`.
 
 ```bash
 # one-time: build the local jsonl from the raw DAPO-Math + AIME datasets
-python -m unirl.utils.prepare_dapo_math --out-dir data/dapo_math
+python datasets/dapo_math/prepare_dapo_math.py --out-dir data/dapo_math
 
 DATA_PATH=data/dapo_math/train.jsonl EVAL_DATA_PATH=data/dapo_math/aime_eval.jsonl \
 python -m unirl.train_ar --config-name=ar/qwen3_drpo_4b_base_dapo_sglang num_devices=64

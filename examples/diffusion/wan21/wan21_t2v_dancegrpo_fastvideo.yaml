@@ -18,9 +18,9 @@
 #      weights and pushes the merged full model (FastVideo serves merged weights;
 #      it has no separate adapter path here).
 #
-# FastVideo dependency: install UniRL's `fastvideo` extra. pyproject.toml pins
-# the unmodified hao-ai-lab/FastVideo source snapshot validated by UniRL's
-# fail-closed runtime patches. FASTVIDEO_PATH remains a development override.
+# FastVideo dependency: https://github.com/Zcchill/FastVideo at or after
+# 7fe1d7db9a0b8aebb46679e7924f597431f23665. Set $FASTVIDEO_PATH to that
+# checkout; FastVideo is lazy-imported by the rollout engine only.
 #
 # This recipe defaults to replay log-probs. Native mode is enabled by setting
 # rollout.config.native_logprob=true and algorithm.old_logp_source=rollout;
@@ -38,8 +38,9 @@ model_config:
   _target_: unirl.models.wan21.config.WAN21PipelineConfig
   pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,Wan-AI/Wan2.1-T2V-1.3B-Diffusers}
   model_precision: bf16
-  # FlowMatchSchedulePolicy applies this shift once; FastVideo consumes the
-  # resulting canonical sigma schedule without reapplying flow_shift.
+  # Match wan21_t2v_dancegrpo.yaml exactly. FlowMatchSchedulePolicy applies this
+  # shift once; the FastVideo adapter consumes the resulting canonical sigmas
+  # verbatim instead of reapplying its scheduler-local flow_shift.
   shift: 5.0
   max_sequence_length: 512
   # FastVideo owns video decoding; the trainer-side pipeline only replays the
@@ -179,11 +180,13 @@ sampling:
   eta: 0.7
   samples_per_prompt: 16
   seed: 42
+  # Keep false until FastVideo accepts separate driver-authored x_T and
+  # sample-specific SDE streams; one seed currently controls both.
   init_same_noise: false
   # SDE step schedule inherited verbatim from wan21_t2v (DanceGRPO swaps only
   # the kernel, not the schedule).
   scheduler:
-    _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+    _target_: unirl.sde.index_schedule.AllSDEScheduler
     num_timesteps: ${..num_inference_steps}
     timestep_fraction: [0.0, 0.5]   # all steps in first half (num_sde_steps null)
     num_sde_steps: null

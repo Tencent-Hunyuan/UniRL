@@ -1,9 +1,4 @@
-"""Generation drivers: t2i via diffusers, text via an OpenAI-compatible endpoint.
-
-Deterministic image naming is the contract between stages — no manifest file:
-``images/p{prompt_idx:05d}_s{sample_idx}.png`` with seed ``base + 1000*p + s``.
-Both drivers resume by skipping outputs that already exist.
-"""
+"""Generation drivers: t2i via diffusers, text via an OpenAI-compatible endpoint."""
 
 from __future__ import annotations
 
@@ -19,13 +14,10 @@ import requests
 
 from .checkpoints import ResolvedCkpt
 
-# CLI override name -> diffusers pipeline kwarg (None values are dropped -> pipeline defaults)
 T2I_KWARGS = {"steps": "num_inference_steps", "guidance": "guidance_scale", "height": "height", "width": "width"}
 
 
 def _session() -> requests.Session:
-    # Serving endpoints / reward hosts live on the internal network; corporate proxy
-    # env vars would 503 them (same rationale as unirl/reward/remote.py).
     session = requests.Session()
     session.trust_env = False
     return session
@@ -38,23 +30,17 @@ def image_path(images_dir: Path, prompt_idx: int, sample_idx: int) -> Path:
 def t2i_jobs(
     prompts: List[str], images_dir: Path, samples_per_prompt: int, shard: Tuple[int, int] = (0, 1)
 ) -> List[Tuple[int, int]]:
-    """Missing (prompt, sample) jobs for this shard. The full deterministic grid is
-    partitioned BEFORE the exists() filter, so each job is owned by exactly one shard
-    no matter when each shard scans the directory."""
+    """Missing (prompt, sample) jobs for this shard."""
     grid = [(p, s) for p in range(len(prompts)) for s in range(samples_per_prompt)]
     return [(p, s) for p, s in grid[shard[0] :: shard[1]] if not image_path(images_dir, p, s).exists()]
 
 
 def _load_pipe(ckpt: ResolvedCkpt):
-    import torch  # lazy: only the generate stage needs a GPU stack
+    import torch
     from diffusers import AutoPipelineForText2Image
 
     pipe = AutoPipelineForText2Image.from_pretrained(ckpt.base, torch_dtype=torch.bfloat16).to("cuda")
     if ckpt.adapter:
-        # PEFT-native load (NOT pipe.load_lora_weights): the exported adapter keeps
-        # PEFT's 'base_model.model.' key format, which diffusers' loader silently
-        # drops, and diffusers ignores adapter_config.json's lora_alpha. PEFT honors
-        # both; merging restores the stock module type and inference speed.
         from peft import PeftModel
 
         peft_model = PeftModel.from_pretrained(pipe.transformer, ckpt.adapter)
@@ -76,23 +62,42 @@ def run_t2i(
     seed: int,
     gen_kwargs: Dict,
     shard: Tuple[int, int] = (0, 1),
+    linspace_sigmas: bool = False,
+    prompt_seed: bool = False,
 ) -> None:
     jobs = t2i_jobs(prompts, images_dir, samples_per_prompt, shard)
     if not jobs:
         print("[t2i] all images present — nothing to generate")
         return
+    import hashlib
+
+    import numpy as np
     import torch
 
     pipe = _load_pipe(ckpt)
+    call_kwargs = dict(gen_kwargs)
+    if linspace_sigmas:
+        steps = int(gen_kwargs.get("num_inference_steps") or 0)
+        if steps <= 0:
+            raise ValueError("linspace_sigmas requires num_inference_steps in gen defaults/CLI")
+        call_kwargs["sigmas"] = list(np.linspace(1.0, 1.0 / steps, steps))
+
+    def _seed(p: int, s: int) -> int:
+        if prompt_seed:
+            h = int.from_bytes(hashlib.sha256(prompts[p].encode()).digest()[:4], "big")
+            return (seed + h + s) % (2**31)
+        return seed + 1000 * p + s
+
     images_dir.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
     for i in range(0, len(jobs), batch_size):
         batch = jobs[i : i + batch_size]
-        generators = [torch.Generator("cuda").manual_seed(seed + 1000 * p + s) for p, s in batch]
-        images = pipe(prompt=[prompts[p] for p, _ in batch], generator=generators, **gen_kwargs).images
+        gen_dev = "cpu" if prompt_seed else "cuda"
+        generators = [torch.Generator(gen_dev).manual_seed(_seed(p, s)) for p, s in batch]
+        images = pipe(prompt=[prompts[p] for p, _ in batch], generator=generators, **call_kwargs).images
         for (p, s), img in zip(batch, images):
             target = image_path(images_dir, p, s)
-            tmp = target.with_suffix(".tmp.png")  # atomic publish: a killed run leaves no half-written PNG
+            tmp = target.with_suffix(".tmp.png")
             img.save(tmp, format="PNG")
             os.replace(tmp, target)
         done = i + len(batch)
@@ -126,9 +131,7 @@ def run_text(
     gen: Dict,
     concurrency: int = 8,
 ) -> None:
-    """Sample ``samples_per_prompt`` completions per item from an OpenAI-compatible
-    server (``sglang serve`` / ``vllm serve``), appending jsonl rows
-    ``{id, sample, response}`` to ``out_file``."""
+    """Sample ``samples_per_prompt`` completions per item from an OpenAI-compatible server into ``out_file``."""
     done = {(row["id"], row["sample"]) for row in read_completions(out_file)} if out_file.exists() else set()
     jobs = [(item, s) for item in items for s in range(samples_per_prompt) if (item["id"], s) not in done]
     if not jobs:

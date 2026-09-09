@@ -1,14 +1,10 @@
-"""FSDP2 model wrapping.
-
-:func:`fsdp_wrap` applies per-block ``fully_shard`` to the trainable module.
-No handle is returned — the DTensors ARE the handle.  Ported from
-``FSDPPolicy._wrap_model``.
-"""
+"""FSDP2 model wrapping."""
 
 from __future__ import annotations
 
 import logging
-from typing import Dict, Optional, Tuple
+from functools import partial
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 from torch import nn
@@ -19,6 +15,32 @@ from unirl.utils.dtypes import parse_torch_dtype
 logger = logging.getLogger(__name__)
 
 
+def _clone_checkpoint_kwarg(value: Any) -> Any:
+    """Snapshot mutable KV-cache mappings without duplicating tensor storage."""
+    if not (hasattr(value, "key_cache") and hasattr(value, "value_cache")):
+        return value
+    cloned = type(value)(value.num_layers)
+    # BAGEL cache updates replace per-layer entries; they do not mutate the
+    # existing K/V tensors. Copying the mappings is therefore sufficient to
+    # freeze replay state and avoids O(num_layers**2) tensor duplication.
+    cloned.key_cache = dict(value.key_cache)
+    cloned.value_cache = dict(value.value_cache)
+    return cloned
+
+
+def _checkpoint_with_kwarg_snapshots(function: Any, *args: Any, **kwargs: Any) -> Any:
+    """Checkpoint mutable kwargs from a frozen call-time mapping snapshot."""
+    from torch.utils import checkpoint as torch_checkpoint
+
+    checkpoint_kwargs = {key: _clone_checkpoint_kwarg(value) for key, value in kwargs.items()}
+
+    def run(*inner_args: Any, **inner_kwargs: Any) -> Any:
+        call_kwargs = {key: _clone_checkpoint_kwarg(value) for key, value in inner_kwargs.items()}
+        return function(*inner_args, **call_kwargs)
+
+    return torch_checkpoint.checkpoint(run, *args, use_reentrant=False, **checkpoint_kwargs)
+
+
 def fsdp_wrap(
     model: nn.Module,
     stage: Optional[object] = None,
@@ -27,31 +49,18 @@ def fsdp_wrap(
     param_dtype: str = "bf16",
     cpu_offload: bool = False,
     mixed_precision: bool = True,
+    cast_forward_inputs: bool = True,
     fsdp_mode: str = "full",
     reshard_after_forward: bool = True,
     forward_prefetch: bool = False,
     activation_checkpointing: bool = False,
+    ac_wrap_order: str = "outside",
     use_torch_compile: bool = False,
     master_dtype: Optional[str] = None,
+    master_params: Tuple[torch.Tensor, ...] = (),
     root_wrap: bool = True,
 ) -> None:
-    """Apply FSDP2 wrapping to the model.  No handle returned — DTensors
-    ARE the handle.  Ported from FSDPPolicy._wrap_model.
-
-    If ``block_class_names`` is supplied, it takes precedence and
-    ``stage`` is ignored for discovery.  Otherwise we fall back to
-    ``_discover_block_classes(model, stage)`` (model __mro__ then stage
-    source chain).
-
-    ``root_wrap`` (default ON) adds a root ``fully_shard(model)`` after the
-    per-block wrap so the leftover params (embed / final norm / lm_head)
-    are sharded + mp_policy'd instead of staying plain replicated tensors.
-    The root group deliberately does NOT inherit ``reshard_after_forward``:
-    FSDP2's auto policy keeps the root's params materialized after forward,
-    which stages rely on for direct post-forward submodule calls (e.g. the
-    chunked ``lm_head`` in Qwen3 replay). See ``FSDPConfig.root_wrap`` for
-    when to disable it.
-    """
+    """Apply FSDP2 wrapping to the model.  No handle returned — DTensors"""
     from torch.distributed.fsdp import (
         CPUOffloadPolicy,
         FSDPModule,
@@ -61,17 +70,12 @@ def fsdp_wrap(
     from torch.distributed.tensor import DTensor
 
     target_dtype = parse_torch_dtype(param_dtype, field_name="training.fsdp.param_dtype")
-    # Optional high-precision optimizer master for the TRAINABLE (LoRA) params. When set
-    # (e.g. fp32) the trainable params are upcast to this dtype in the cast loop below — even
-    # under mixed precision — while the frozen base and the all-gathered COMPUTE copy stay
-    # param_dtype (bf16) via MixedPrecisionPolicy, so the forward math (and the on-policy
-    # GRPO ratio) is unchanged and only the optimizer accumulation gains precision. This lets
-    # a bf16-loaded 7B base carry an fp32 LoRA master; without it bf16 master weights lose the
-    # ~1e-4 GRPO updates to rounding and the policy drifts into a degenerate (all-white)
-    # reward-hack. None (default) leaves the master dtype to the load/mixed-precision policy
-    # in the cast loop below (an fp32-LOADED model already keeps an fp32 master for free).
     trainable_dtype = (
         parse_torch_dtype(master_dtype, field_name="training.fsdp.master_dtype") if master_dtype is not None else None
+    )
+    require(
+        ac_wrap_order in {"inside", "outside"},
+        f"fsdp_wrap: ac_wrap_order must be 'inside' or 'outside', got {ac_wrap_order!r}",
     )
 
     fsdp_kwargs: Dict[str, object] = {
@@ -81,6 +85,7 @@ def fsdp_wrap(
         fsdp_kwargs["mp_policy"] = MixedPrecisionPolicy(
             param_dtype=target_dtype,
             reduce_dtype=torch.float32,
+            cast_forward_inputs=bool(cast_forward_inputs),
         )
     if cpu_offload:
         fsdp_kwargs["offload_policy"] = CPUOffloadPolicy()
@@ -94,22 +99,12 @@ def fsdp_wrap(
     block_instances = _enumerate_block_instances(model, block_class_names)
 
     casts = 0
-    # Three pre-cast regimes (see trainable_dtype above + MixedPrecisionPolicy),
-    # applied uniformly to EVERY param — blocks and leftovers alike; the wrap
-    # topology below is orthogonal to the dtype policy:
-    #   * explicit master_dtype  → upcast the TRAINABLE (LoRA) params to it even under mixed
-    #     precision; the mp_policy still all-gathers them as param_dtype for compute, so only
-    #     the optimizer master gains precision (the bf16-base + fp32-LoRA-master case).
-    #   * no mp_policy            → storage dtype IS the compute dtype, so pre-cast every
-    #     param to param_dtype.
-    #   * mixed precision, no master_dtype → do NOT pre-cast: fully_shard keeps shards in the
-    #     loaded dtype and casts to mp_policy.param_dtype per forward, so an fp32-loaded model
-    #     gets Megatron-style fp32 master weights for free. Pre-casting to bf16 here would
-    #     round away the ~1e-6 AdamW steps. (Historically a no-op: models were loaded in bf16.)
+    master_param_ids = {id(p) for p in master_params}
+    # Keep trainable and EMA shadow masters at master_dtype.
     for p in model.parameters():
         if isinstance(p, DTensor) or not p.dtype.is_floating_point:
             continue  # already-wrapped params and ints never cast
-        if trainable_dtype is not None and p.requires_grad:
+        if trainable_dtype is not None and (p.requires_grad or id(p) in master_param_ids):
             dst = trainable_dtype
         elif not mixed_precision:
             dst = target_dtype
@@ -119,32 +114,54 @@ def fsdp_wrap(
             p.data = p.data.to(dst)
             casts += 1
 
+    if activation_checkpointing:
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+            CheckpointImpl,
+            CheckpointWrapper,
+            apply_activation_checkpointing,
+            checkpoint_wrapper,
+        )
+
+        block_ids = {id(layer) for layer in block_instances}
+        apply_activation_checkpointing(
+            model,
+            checkpoint_wrapper_fn=partial(
+                checkpoint_wrapper,
+                checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+                checkpoint_fn=_checkpoint_with_kwarg_snapshots,
+            ),
+            check_fn=lambda module: id(module) in block_ids,
+        )
+        # Where fully_shard lands relative to the AC wrapper decides whether the
+        # recompute re-enters FSDP's gather/cast hooks:
+        #
+        # * "outside" (default; fully_shard on the CheckpointWrapper, torchtitan
+        #   order): hooks fire once per use, outside the checkpoint region. This
+        #   matches the composition every pre-knob AC recipe ran — the old
+        #   forward-monkeypatch checkpoint also recomputed without re-entering
+        #   hooks — so untouched recipes keep their validated behavior.
+        # * "inside" (fully_shard on the INNER block): the recompute goes through
+        #   the module's __call__, re-running the pre-forward gather and the
+        #   mp_policy cast. Opt in per recipe where this order was actually
+        #   smoke-validated (the stacked BAGEL it2i consumer pins it).
+        if ac_wrap_order == "outside":
+            wrapped = [m for m in model.modules() if isinstance(m, CheckpointWrapper)]
+            require(
+                len(wrapped) == len(block_instances),
+                f"fsdp_wrap: expected {len(block_instances)} checkpoint wrappers, found {len(wrapped)}",
+            )
+            block_instances = wrapped
+
     for layer in block_instances:
         fully_shard(layer, **fsdp_kwargs)
 
     if root_wrap and not isinstance(model, FSDPModule):
-        # Root wrap: claim the leftover params (everything the block wraps
-        # above did not own — embed / final norm / lm_head / time+patch
-        # embeds) into a root fully_shard group. The ``isinstance`` guard
-        # makes the wrap idempotent and skips the degenerate case where
-        # ``model`` itself is a wrapped block instance.
-        #
-        # The root group must NOT inherit reshard_after_forward: FSDP2's auto
-        # policy never reshards the root after forward, keeping its params
-        # materialized for post-forward direct submodule calls (Qwen3's chunked
-        # lm_head) and activation-checkpoint recomputes. Everything else
-        # (mesh / mp_policy / offload_policy) is shared with the block groups.
+        # Root-wrap leftover parameters but keep them materialized after forward.
         root_kwargs = dict(fsdp_kwargs)
         root_kwargs.pop("reshard_after_forward", None)
         fully_shard(model, **root_kwargs)
     else:
-        # No root wrap: a TRAINABLE param outside every fully_shard group
-        # would receive grads no collective ever DP-syncs (the manual
-        # sync_unsharded_grads net was removed with the default root wrap),
-        # so its replicas would silently drift apart across ranks. Frozen
-        # leftovers (the bagel / hunyuan_image3 LoRA recipes) are fine —
-        # they carry no grads — and a single rank has no replicas to drift.
-        # Fail fast rather than corrupt the run.
+        # Reject trainable parameters outside FSDP groups to prevent rank drift.
         import torch.distributed as dist
 
         if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
@@ -157,15 +174,6 @@ def fsdp_wrap(
             )
 
     if forward_prefetch:
-        # Cross-block forward prefetch: chain each FSDP group to prefetch the
-        # NEXT group's all-gather during its own forward, in forward
-        # (named_modules) order — root → group 0 → … → group N — so the
-        # per-group all-gather overlaps compute instead of stalling the critical
-        # path (a multi-node win; ~no-op over NVLink). Iterates the ACTUAL FSDP
-        # groups (root + blocks + any separately-wrapped leftover group), not
-        # just block_instances, matching set_grad_sync's walk — so no wrapped
-        # group is left unchained. Needs the root wrapped (the default root wrap
-        # above) so FSDP2 has initialized the shared all-gather comm context.
         if not isinstance(model, FSDPModule):
             raise ValueError(
                 "fsdp_wrap: forward_prefetch=True needs the model root-wrapped so FSDP2 "
@@ -176,21 +184,6 @@ def fsdp_wrap(
         for cur, nxt in zip(fsdp_groups, fsdp_groups[1:]):
             cur.set_modules_to_forward_prefetch([nxt])
 
-    if activation_checkpointing:
-        from torch.utils import checkpoint as _ckpt
-
-        def _make_ckpt_forward(orig_fwd: object) -> object:
-            def wrapped(*args: object, **kwargs: object) -> object:
-                def fn(*a: object) -> object:
-                    return orig_fwd(*a, **kwargs)
-
-                return _ckpt.checkpoint(fn, *args, use_reentrant=False)
-
-            return wrapped
-
-        for layer in block_instances:
-            layer.forward = _make_ckpt_forward(layer.forward)
-
     if use_torch_compile:
         for layer in block_instances:
             layer.forward = torch.compile(layer.forward)
@@ -198,13 +191,14 @@ def fsdp_wrap(
     if _current_rank() == 0:
         logger.info(
             "fsdp_wrap: wrapped %d block(s) of class %r "
-            "(%s, cpu_offload=%s, mixed_precision=%s, reshard=%s, prefetch=%s, "
+            "(%s, cpu_offload=%s, mixed_precision=%s, cast_forward_inputs=%s, reshard=%s, prefetch=%s, "
             "ac=%s, compile=%s, dtype_casts=%d, master_dtype=%s, root_wrap=%s)",
             len(block_instances),
             tuple(block_class_names),
-            "HSDP" if mesh is not None else "FSDP2",
+            fsdp_mode,
             cpu_offload,
             mixed_precision,
+            cast_forward_inputs,
             reshard_after_forward,
             forward_prefetch,
             activation_checkpointing,
@@ -213,11 +207,6 @@ def fsdp_wrap(
             master_dtype,
             root_wrap,
         )
-
-
-# ------------------------------------------------------------------
-# Block-class discovery (ported from FSDPPolicy)
-# ------------------------------------------------------------------
 
 
 def _discover_block_classes(model: nn.Module, stage: object) -> Tuple[str, ...]:
@@ -250,13 +239,19 @@ def _enumerate_block_instances(
     return tuple(m for _, m in model.named_modules() if type(m).__name__ in names)
 
 
-# ------------------------------------------------------------------
-# HSDP mesh (ported from FSDPPolicy)
-# ------------------------------------------------------------------
+# Parameter shard degree: full = world default, hybrid = 8 ranks, no_shard = 1 rank (DDP).
+_SHARD_DEGREE: Dict[str, Optional[int]] = {"full": None, "hybrid": 8, "no_shard": 1}
 
 
 def _create_device_mesh(fsdp_mode: str) -> Optional[object]:
-    if str(fsdp_mode).strip().lower() != "hybrid":
+    mode = str(fsdp_mode).strip().lower()
+    require(
+        mode in _SHARD_DEGREE,
+        f"training.fsdp.fsdp_mode={fsdp_mode!r} is not one of {sorted(_SHARD_DEGREE)}; "
+        "an unrecognized mode would silently fall back to full sharding.",
+    )
+    shard_size = _SHARD_DEGREE[mode]
+    if shard_size is None:
         return None
 
     import torch.distributed as dist
@@ -265,7 +260,8 @@ def _create_device_mesh(fsdp_mode: str) -> Optional[object]:
         return None
 
     world_size = dist.get_world_size()
-    shard_size = 8
+    # A world that the shard degree cannot split (including single-rank
+    # ``no_shard``) already matches the default 1D mesh.
     if world_size <= shard_size or world_size % shard_size != 0:
         return None
 
@@ -277,7 +273,7 @@ def _create_device_mesh(fsdp_mode: str) -> Optional[object]:
         (replicate_size, shard_size),
         mesh_dim_names=("dp_replicate", "dp_shard"),
     )
-    logger.info("fsdp_wrap: HSDP mesh dp_replicate=%d x dp_shard=%d", replicate_size, shard_size)
+    logger.info("fsdp_wrap: %s mesh dp_replicate=%d x dp_shard=%d", mode, replicate_size, shard_size)
     return mesh
 
 

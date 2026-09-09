@@ -13,7 +13,6 @@ logger = logging.getLogger(__name__)
 
 @register("QwenImageTransformer2DModel")
 def _wrap_qwen_image(model, sp_group):
-    # qwen pos_embed returns (vid, txt) freqs; slice each on dim 0 (the per-stream freq dim).
     _install_boundary_hooks(
         model,
         sp_group,

@@ -1,8 +1,4 @@
-"""Miscellaneous utilities for the distributed controller.
-
-Network helpers used by DevicePool and RoleProxy, plus the ``Broadcast``
-dispatch marker and the generic ``collect_leaves`` tree walker.
-"""
+"""Miscellaneous utilities for the distributed controller."""
 
 from __future__ import annotations
 
@@ -14,44 +10,17 @@ import torch
 
 from unirl.distributed.tensor.batch import Batch
 
-# ── CUDA IPC compatibility ──
-
-# cudaMalloc-backed IPC handles always have a 66-byte device handle (CUDA_IPC_HANDLE_SIZE=64
-# + 2 bytes padding).  Expandable-segments (VMM) allocations produce shorter handles
-# because they use pidfd_getfd for cross-process sharing instead of the legacy IPC path.
 _CUDA_IPC_HANDLE_BYTES = 66
 
 
 def cuda_ipc_needs_clone(storage: torch.UntypedStorage) -> tuple:
-    """Return (ipc_handle, needs_clone) for a CUDA storage.
-
-    needs_clone is True when the storage was allocated by the expandable-segments
-    (VMM) allocator: its IPC handle is not a standard cudaMalloc handle and cannot
-    be opened by other processes on kernels lacking pidfd_getfd (Linux < 5.6).
-    The caller should clone to a cudaMalloc-backed allocation before sharing.
-
-    Returns the probe handle so the caller avoids a second _share_cuda_() call.
-    """
+    """Return (ipc_handle, needs_clone) for a CUDA storage."""
     handle = storage._share_cuda_()
     return handle, len(handle[1]) != _CUDA_IPC_HANDLE_BYTES
 
 
-# ── Broadcast wrapper ──
-
-
 class Broadcast:
-    """Mark a value as broadcast — it will NOT be split across workers.
-
-    Usage::
-
-        role.forward(images, lr=Broadcast(0.01), config=Broadcast(cfg_dict))
-
-    Dispatch infers the batch size from the first batch-axis field it finds
-    (see ``pytree.infer_batch_size``) and splits every field whose leading
-    dim matches it, replicating the rest. Wrap a value in ``Broadcast(...)``
-    to force it to be replicated rather than split — e.g. per-rollout
-    metadata whose leading dim happens to coincide with the batch size.
-    """
+    """Mark a value as broadcast — it will NOT be split across workers."""
 
     __slots__ = ("value",)
 
@@ -62,22 +31,8 @@ class Broadcast:
         return f"Broadcast({self.value!r})"
 
 
-# ── Generic tree traversal ──
-
-
 def collect_leaves(x, leaf_type: Type) -> list:
-    """Depth-first collect all instances of leaf_type from an arbitrary structure.
-
-    Traversal rules:
-      - isinstance(x, leaf_type) -> append and stop recursing
-      - Batch / dict -> recurse into values, keys sorted alphabetically
-      - list / tuple  -> recurse in positional order
-      - everything else -> skip
-
-    Sorting dict/Batch keys ensures deterministic ordering across call sites,
-    which is critical for aligning controller-side collect_leaves(TensorRef)
-    with worker-side collect_leaves(torch.Tensor) by index.
-    """
+    """Depth-first collect all instances of leaf_type from an arbitrary structure."""
     result = []
     if isinstance(x, leaf_type):
         result.append(x)
@@ -95,9 +50,6 @@ def collect_leaves(x, leaf_type: Type) -> list:
     return result
 
 
-# ── Network helpers ──
-
-
 def get_open_port() -> int:
     """Find an available TCP port on the local machine."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -106,11 +58,7 @@ def get_open_port() -> int:
 
 
 def get_node_ip_and_port(pg, bundle_index: int = 0) -> Tuple[str, int]:
-    """Get IP and an open port on the node where a PG bundle landed.
-
-    Both values come from the same worker node, avoiding
-    controller-vs-worker mismatch. Uses a lightweight probe actor.
-    """
+    """Get IP and an open port on the node where a PG bundle landed."""
     import ray
     from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 

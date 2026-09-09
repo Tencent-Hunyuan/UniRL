@@ -1,28 +1,14 @@
-"""Diffusion sampling-kwargs assembly shared by every DiT-bearing input adapter.
-
-Moved off the adapter ABC (the bodies read no adapter state — every value
-comes from the request's typed ``DiffusionSamplingParams``) so the
-input-side sub-adapters, which are not ``ModelAdapter`` subclasses, can call
-them as plain functions.
-"""
+"""Diffusion sampling-kwargs assembly shared by every DiT-bearing input adapter."""
 
 from __future__ import annotations
 
 from typing import Any, Dict
 
-from unirl.rollout.engine.vllm_omni.utils.sigmas import sigmas_list_from_req
-from unirl.types.rollout_req import RolloutReq
+from unirl.rollout.engine.vllm_omni.utils.sigmas import sigmas_list_from_diffusion
 
 
-def core_diff_kwargs(req: RolloutReq, diff_params: Any) -> Dict[str, Any]:
-    """The diffusion sampling kwargs common to every DiT stage.
-
-    Every value reads off the request's typed ``DiffusionSamplingParams``
-    — the engine keeps no sampling defaults. ``eta`` rides as a typed
-    first-class field; ``guidance_scale_provided`` marks the explicit CFG
-    choice; trajectory latents are always requested (dense — replay needs
-    ``x_t`` at every slot).
-    """
+def core_diff_kwargs(diff_params: Any) -> Dict[str, Any]:
+    """The diffusion sampling kwargs common to every DiT stage."""
     num_inference_steps = int(diff_params.num_inference_steps)
     diff_kwargs: Dict[str, Any] = dict(
         height=int(diff_params.height),
@@ -35,7 +21,7 @@ def core_diff_kwargs(req: RolloutReq, diff_params: Any) -> Dict[str, Any]:
         return_trajectory_decoded=False,
         num_outputs_per_prompt=1,
     )
-    sigmas = sigmas_list_from_req(req, num_inference_steps)
+    sigmas = sigmas_list_from_diffusion(diff_params, num_inference_steps)
     if sigmas is not None:
         diff_kwargs["sigmas"] = sigmas
     return diff_kwargs

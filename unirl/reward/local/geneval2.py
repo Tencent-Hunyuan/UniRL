@@ -1,12 +1,4 @@
-"""GenEval2 Soft-TIFA reward scorer.
-
-Computes compositional generation quality using Qwen3-VL VQA scoring.
-For each image, runs per-atom visual question answering and aggregates
-answer probabilities via geometric mean (matching GenEval2 benchmark).
-
-Reference: https://github.com/facebookresearch/GenEval2
-Adapted from flow_factory/rewards/geneval2_soft_tifa.py
-"""
+"""GenEval2 Soft-TIFA reward scorer."""
 
 from __future__ import annotations
 
@@ -53,17 +45,11 @@ _WORD_TO_DIGIT = {
     "ten": "10",
 }
 
-# Non-counting GenEval2 atoms expect "Yes" (matches remote reward-service scorer).
 _YES_SURFACE_FORMS = ("Yes", "yes", " Yes", " yes")
 
 
 def _answer_surface_forms(question: str, expected: str) -> tuple[str, ...]:
-    """Surface forms of the expected answer to score at the first token.
-
-    Mirrors GenEval2 ``soft_tifa()`` and ``unirl-reward-service`` geneval2 scorer:
-    counting atoms ("How many ...?") score the expected number word and its digit;
-    every other atom in the benchmark expects "Yes".
-    """
+    """Surface forms of the expected answer to score at the first token."""
     expected = (expected or "").strip()
     if question.startswith("How many"):
         forms = [expected, expected.capitalize(), " " + expected, " " + expected.capitalize()]
@@ -114,15 +100,7 @@ def _resolve_data_paths(data_path: str) -> List[Path]:
 
 
 class GenEval2RewardScorer(LocalRewardBackend):
-    """GenEval2 Soft-TIFA compositional reward using Qwen3-VL VQA.
-
-    For each image, asks VQA questions from the GenEval2 benchmark and
-    computes the soft probability of the correct answer. Scores are
-    aggregated across atoms using geometric mean (default) or arithmetic mean.
-
-    This scorer is slow (one VLM generation per VQA atom per image) but
-    provides high-quality compositional evaluation.
-    """
+    """GenEval2 Soft-TIFA compositional reward using Qwen3-VL VQA."""
 
     canonical_model_name = "geneval2"
 
@@ -189,7 +167,6 @@ class GenEval2RewardScorer(LocalRewardBackend):
             )
 
         probs = torch.nn.functional.softmax(outputs.scores[0], dim=-1)
-        # Sum probabilities for all valid answer token IDs
         return sum(probs[0, tid].item() for tid in answer_token_ids)
 
     def _answer_token_ids(self, question: str, expected: str) -> List[int]:
@@ -258,21 +235,7 @@ class GenEval2RewardScorer(LocalRewardBackend):
 
 @dataclass
 class GenEval2Spec(BaseRewardComponentSpec):
-    """Typed config for the GenEval2 Soft-TIFA reward component.
-
-    Args:
-        batch_size: Batch size for reward computation (kept at 1 due to
-            sequential VQA per image).
-        device: Device for the Qwen3-VL model: "auto", "cuda", or "cpu". Local
-            rewards are auto-placed on the trainer's GPU and do NOT pin a specific
-            ordinal — an explicit "cuda:<index>" is rejected; to give this heavy
-            VLM its own GPU(s), use the remote reward backend instead.
-        model_name: Hugging Face model ID for the VLM (default Qwen3-VL-8B).
-        data_path: Path to GenEval2 JSONL file or directory containing
-            train.jsonl/test.jsonl. Used for prompt -> vqa_list lookup.
-        aggregation: Score aggregation across VQA atoms: "gm" (geometric mean,
-            default, matching GenEval2 benchmark) or "am" (arithmetic mean).
-    """
+    """Typed config for the GenEval2 Soft-TIFA reward component."""
 
     batch_size: int = 1
     device: str = "auto"

@@ -1,22 +1,4 @@
-"""BagelBundle — weights+params holder for BAGEL-7B-MoT (gen-only T2I).
-
-Implements the empty :class:`Bundle` Protocol. Pure container of the modules
-BAGEL ships with for text-to-image: one MoT transformer (``Bagel`` wrapping a
-``Qwen2ForCausalLM`` whose ``Qwen2MoTDecoderLayer`` blocks hold both und and gen
-experts) + one FLUX-style VAE + one tokenizer. The und ViT tower is opt-in
-(``config.enable_vit`` → ``visual_und=True``): pure T2I needs only the gen
-expert + VAE; image-INPUT tasks (it2i editing / i2t / it2t) need the ViT to
-prefill image semantics into the KV context.
-
-LoRA injection / FSDP wrap / autocast lifecycle are owned outside the bundle
-(the train backend), so ``from_config`` only loads + freezes. The trainable
-surface is ``model.language_model`` (the MoT, where the ``*_moe_gen`` experts
-live); the FSDP block class is ``Qwen2MoTDecoderLayer``.
-
-Construction mirrors flow_grpo's ``train_bagel.py`` setup so the vendored
-``InterleaveInferencer`` / ``generate_image`` path the diffusion stage delegates
-to behaves identically.
-"""
+"""BagelBundle — weights+params holder for BAGEL-7B-MoT (gen-only T2I)."""
 
 from __future__ import annotations
 
@@ -29,9 +11,9 @@ from accelerate import init_empty_weights, load_checkpoint_and_dispatch
 from unirl.models.types.bundle import Bundle
 from unirl.utils.dtypes import parse_torch_dtype
 
+from . import rl_ops
 from .config import BagelPipelineConfig
 from .vendor.data.data_utils import add_special_tokens
-from .vendor.data.transforms import ImageTransform
 from .vendor.inferencer import InterleaveInferencer
 from .vendor.modeling.autoencoder import load_ae
 from .vendor.modeling.bagel import (
@@ -44,7 +26,6 @@ from .vendor.modeling.bagel import (
 )
 from .vendor.modeling.qwen2 import Qwen2Tokenizer
 
-# FSDP wrap block class for the MoT decoder (recipe backend.block_class_names).
 BAGEL_FSDP_BLOCK_CLASS = "Qwen2MoTDecoderLayer"
 
 
@@ -71,12 +52,8 @@ class BagelBundle(Bundle):
         config: Optional[BagelPipelineConfig] = None,
     ) -> None:
         super().__init__()
-        self.config = config  # Defaults for the separately constructed pipeline.
+        self.config = config
         self.model = model
-        # The trainable MoT (where the *_moe_gen experts live). Same object the
-        # vendored generate_image / _forward_flow run on, so FSDP2 fully_shard
-        # (in-place) on this reference shards the gen forward too. Named
-        # ``transformer`` so recipes can set backend.trainable_attr: transformer.
         self.transformer = model.language_model
         self.vae = vae
         self.tokenizer = tokenizer
@@ -94,18 +71,7 @@ class BagelBundle(Bundle):
 
     @classmethod
     def from_config(cls, config: BagelPipelineConfig) -> "BagelBundle":
-        """Load BAGEL-7B-MoT (gen + optional und ViT) from a local checkpoint dir.
-
-        Replicates flow_grpo/train_bagel.py:316-414 minus LoRA/optimizer (which
-        the train backend owns). Loads the EMA weights via
-        ``load_checkpoint_and_dispatch`` onto a single device; the FSDP wrap and
-        LoRA injection run later in :class:`FSDPBackend`.
-
-        Note: ``load_checkpoint_and_dispatch`` attaches accelerate device hooks.
-        For the dedicated FSDP path (Phase 6) those may need removal via
-        ``accelerate.hooks.remove_hook_from_module`` before ``fully_shard``; for
-        the standalone bundle smoke they are harmless.
-        """
+        """Load BAGEL-7B-MoT (gen + optional und ViT) from a local checkpoint dir."""
         device = config.device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         if isinstance(device, str):
             device = torch.device(device)
@@ -124,9 +90,6 @@ class BagelBundle(Bundle):
 
         vit_config = None
         if config.enable_vit:
-            # Official inference setup (ByteDance-Seed/Bagel app.py @ vendored
-            # commit a2fa77d): no RoPE, drop the last SigLIP layer; the checkpoint
-            # stores the patch embedding as a Linear (converted below, pre-load).
             vit_config = SiglipVisionConfig.from_json_file(os.path.join(model_dir, "vit_config.json"))
             vit_config.rope = False
             vit_config.num_hidden_layers -= 1
@@ -150,12 +113,6 @@ class BagelBundle(Bundle):
             if config.enable_vit:
                 model.vit_model.vision_model.embeddings.convert_conv2d_to_linear(vit_config, meta=True)
 
-        # force_hooks=True attaches accelerate AlignDevicesHooks (matching
-        # flow_grpo/train_bagel.py) so the vendored inferencer / generate_image
-        # path — which builds packed index tensors on CPU and calls submodule
-        # forwards directly — has its inputs auto-moved to the model device.
-        # Phase 6 (UniRL FSDP) must remove these hooks before fully_shard
-        # (accelerate.hooks.remove_hook_from_module(model, recurse=True)).
         model = load_checkpoint_and_dispatch(
             model,
             checkpoint=os.path.join(model_dir, "ema.safetensors"),
@@ -170,31 +127,16 @@ class BagelBundle(Bundle):
         tokenizer, new_token_ids, _ = add_special_tokens(tokenizer)
 
         # Image transforms (image-conditioned paths only; pure T2I never exercises
-        # them, but the inferencer constructor requires both). Sizes follow flow_grpo
-        # (vae 512/256, vit 490/112). NB: the ViT resize STRIDE must equal the SigLIP
-        # patch size (14) — patchify() asserts h % patch_size == 0, so a stride that is
-        # not a multiple of 14 makes non-square image inputs crash. flow_grpo's stride 7
-        # (half a patch) is that bug; use 14 to keep resized dims patch-aligned.
-        vae_transform = ImageTransform(512, 256, 8)
-        vit_transform = ImageTransform(490, 112, 14)
+        # them, but the inferencer constructor requires both). The geometry lives in
+        # rl_ops so the vllm_omni worker's it2i prefill builds the SAME pair — see
+        # rl_ops.build_image_transforms for the sizes and the stride-14 rationale.
+        vae_transform, vit_transform = rl_ops.build_image_transforms()
 
         vae_model = vae_model.to(device=device, dtype=vae_dtype).eval()
         vae_model.requires_grad_(False)
-        # Freeze the whole MoT. LoRA recipes (use_lora=True) keep it frozen and the
-        # backend's inject_lora adds the trainable adapters. Full fine-tuning
-        # (use_lora=False) instead unfreezes the MoT decoder blocks below.
         model.requires_grad_(False)
         if not config.use_lora:
-            # Full fine-tuning: unfreeze ONLY the Qwen2MoTDecoderLayer blocks (the
-            # und + gen experts) — the exact set the backend FSDP-wraps
-            # (block_class_names=[BAGEL_FSDP_BLOCK_CLASS]). embed/norm/lm_head, the
-            # VAE and the gen heads stay frozen so (a) the trainable set == the
-            # sharded block set and (b) the unsharded leftovers (root_wrap=false)
-            # carry no grad — which keeps fsdp_wrap's no-root-wrap DP-sync guard
-            # satisfied. The backend (no lora_cfg) then builds the optimizer over
-            # these params; per-expert LRs (param_group_lrs={moe_gen: ...}) match by
-            # name exactly as in the LoRA path. fsdp_wrap reads requires_grad here to
-            # decide the fp32-master upcast, so this MUST run before the backend wrap.
+            # Unfreeze decoder blocks before FSDP wrapping so trainable and sharded parameter sets match.
             n_blocks = 0
             for module in model.language_model.modules():
                 if type(module).__name__ == BAGEL_FSDP_BLOCK_CLASS:
@@ -234,13 +176,7 @@ class BagelBundle(Bundle):
         )
 
     def trainable_module(self) -> "torch.nn.Module":
-        """Return the MoT transformer — the FSDP wrap target / trainable root.
-
-        ``model.language_model`` holds the ``Qwen2MoTDecoderLayer`` blocks whose
-        ``*_moe_gen`` experts are the only trained params (via LoRA). The gen
-        heads (``vae2llm`` / ``time_embedder`` / ``llm2vae`` / ``latent_pos_embed``)
-        sit on the parent ``Bagel`` module and stay frozen in the LoRA setup.
-        """
+        """Return the MoT transformer — the FSDP wrap target / trainable root."""
         return self.transformer
 
 

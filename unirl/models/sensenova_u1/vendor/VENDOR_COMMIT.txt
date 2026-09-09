@@ -1,0 +1,20 @@
+source   = OpenSenseNova/SenseNova-U1 (https://github.com/OpenSenseNova/SenseNova-U1)
+commit   = a62fd54afed7a8d4c1cb4e10f0c39253d1be6fde
+short    = a62fd54
+vendored = 2026-08-24
+license  = Apache-2.0
+
+Vendored subtree:
+  src/sensenova_u1/models/neo_unify/
+    -> unirl/models/sensenova_u1/vendor/neo_unify/
+
+The subtree is byte-pristine at import. UniRL adapters outside vendor/ own the
+FlowGRPO sigma-time conversion, stochastic transition math, trajectory replay,
+prompt-cache conditions, FSDP trainability policy, and Sample-native pipeline.
+
+To update:
+  1. fetch and pin a new upstream commit;
+  2. replace the complete neo_unify subtree;
+  3. update this file;
+  4. rerun checkpoint-load, reference-inference parity, rollout/replay-ratio,
+     and replay-backward tests.

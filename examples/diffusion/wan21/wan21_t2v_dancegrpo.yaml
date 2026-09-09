@@ -140,7 +140,7 @@ sampling:
   # SDE step schedule inherited verbatim from wan21_t2v (DanceGRPO swaps only
   # the kernel, not the schedule).
   scheduler:
-    _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+    _target_: unirl.sde.index_schedule.AllSDEScheduler
     num_timesteps: ${..num_inference_steps}
     timestep_fraction: [0.0, 0.5]   # all steps in first half (num_sde_steps null)
     num_sde_steps: null

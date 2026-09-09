@@ -1,35 +1,4 @@
-"""The native ``Backend`` impl — in-process ``sglang.Engine`` (no HTTP hop).
-
-The in-process twin of :mod:`.http`: the SGLang import is lazy (only
-:func:`_import_sglang_engine`, called from :meth:`NativeBackend.boot`), so the
-module imports on CPU. "In-process" means the *handle* — ``Engine`` still
-spawns the scheduler subprocesses (one per TP rank) + the detokenizer; only the
-TokenizerManager lives in the calling process. GPU memory layout, CUDA-IPC
-weight transfer, and the NCCL env quarantine are therefore unchanged from the
-HTTP impl; what disappears is the SRT HTTP server, the health poll, the proxy
-whitelist, and per-request JSON serialization.
-
-Loop discipline (the load-bearing invariant): ``Engine.__init__`` creates and
-owns ``engine.loop``, and the TokenizerManager's handler task binds to it at
-the first await — so EVERY coroutine here must run on that loop (via
-:meth:`NativeBackend._run`), never on a fresh one (a fresh loop would work once
-and deadlock on the second call). Engine's own sync wrappers already run on
-``self.loop``. Corollary: all verbs must be invoked from one thread — the Ray
-actor's single RPC thread today (``max_concurrency=1``); a concurrent
-``run_until_complete`` on the same loop raises.
-
-Verb routing: public ``Engine`` methods where the seam signatures match
-(memory, NCCL group, distributed update); the two verbs whose seam payloads
-arrive pre-serialized (``update_from_tensor``, ``set_lora``) construct the
-installed runtime's io_struct request and call the ``tokenizer_manager``
-coroutine directly — exactly what the HTTP endpoints do server-side, so the
-payloads are version-matched to the runtime by construction (same rationale as
-the HTTP impl's io_struct usage).
-
-Deliberate divergence from the HTTP impl: ``generate`` has NO retry loop. The
-HTTP 60-retry absorbs transport flakiness that does not exist in-process; an
-in-process exception is a real failure and must surface immediately.
-"""
+"""The native ``Backend`` impl — in-process ``sglang.Engine`` (no HTTP hop)."""
 
 from __future__ import annotations
 
@@ -38,19 +7,17 @@ import dataclasses
 import logging
 import multiprocessing
 import os
+import threading
 import time
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Callable, Coroutine, Dict, List, Optional, Sequence, TypeVar
 
+from unirl.rollout.engine.sglang.backends.base import _filter_server_args_or_raise
 from unirl.rollout.engine.sglang.backends.http import parse_generate_response
 
 logger = logging.getLogger(__name__)
+T = TypeVar("T")
 
 
-# ---------------------------------------------------------------------------
-# Wire mapping — pure, module-level (CPU-testable without sglang)
-# ---------------------------------------------------------------------------
-
-#: /generate payload keys that map 1:1 onto ``Engine.async_generate`` kwargs.
 _GENERATE_PASSTHROUGH = (
     "input_ids",
     "sampling_params",
@@ -62,13 +29,7 @@ _GENERATE_PASSTHROUGH = (
 
 
 def payload_to_generate_kwargs(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Map one ready-to-POST ``/generate`` payload to ``async_generate`` kwargs.
-
-    ``text`` → ``prompt``; the rest pass through by name. An unknown key
-    raises: the HTTP path would have forwarded it to the server, so silently
-    dropping it here would be an invisible behavioral divergence. The payload
-    is not mutated.
-    """
+    """Map one ready-to-POST ``/generate`` payload to ``async_generate`` kwargs."""
     unknown = set(payload) - set(_GENERATE_PASSTHROUGH) - {"text"}
     if unknown:
         raise ValueError(f"sglang native backend: unmapped /generate payload keys: {sorted(unknown)}")
@@ -78,18 +39,8 @@ def payload_to_generate_kwargs(payload: Dict[str, Any]) -> Dict[str, Any]:
     return kwargs
 
 
-# ---------------------------------------------------------------------------
-# Lazy runtime import — the only place sglang is named (once per process)
-# ---------------------------------------------------------------------------
-
-
 def _import_sglang_engine() -> Dict[str, Any]:
-    """Lazy import of the Engine entrypoint + the io_struct request types.
-
-    Only called from :meth:`NativeBackend.boot`, so the module imports on CPU.
-    Only the two io_structs whose verbs bypass the public Engine methods are
-    needed (see the module docstring's verb routing).
-    """
+    """Lazy import of the Engine entrypoint + the io_struct request types."""
     from sglang.srt.entrypoints.engine import Engine
     from sglang.srt.managers.io_struct import (
         LoadLoRAAdapterFromTensorsReqInput,
@@ -107,9 +58,92 @@ def _import_sglang_engine() -> Dict[str, Any]:
     }
 
 
-# ---------------------------------------------------------------------------
-# The backend
-# ---------------------------------------------------------------------------
+class LoopThread:
+    """Drive one externally-owned event loop: serve generation, park for verbs."""
+
+    def __init__(self, loop: asyncio.AbstractEventLoop, *, label: str) -> None:
+        self._loop = loop
+        self._label = label
+        self._cond = threading.Condition()
+        self._thread: Optional[threading.Thread] = None
+        self._inflight = 0
+        self._closed = False
+
+    @property
+    def serving(self) -> bool:
+        """Whether the loop thread is currently running (unlocked snapshot)."""
+        thread = self._thread
+        return thread is not None and thread.is_alive()
+
+    def _ensure_serving_locked(self) -> None:
+        if self._thread is not None and not self._thread.is_alive():
+            self._thread.join()
+            self._thread = None
+        if self._thread is None:
+            self._thread = threading.Thread(target=self._loop.run_forever, name=f"{self._label} loop", daemon=True)
+            self._thread.start()
+
+    def _park_locked(self) -> None:
+        if self._thread is None:
+            return
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.join()
+        self._thread = None
+
+    def run(self, coroutine: Coroutine[Any, Any, T]) -> T:
+        """Submit one coroutine onto the serving loop; block for its result."""
+        with self._cond:
+            if self._closed:
+                coroutine.close()
+                raise RuntimeError(f"{self._label} loop thread is closed")
+            self._ensure_serving_locked()
+            future = asyncio.run_coroutine_threadsafe(coroutine, self._loop)
+            self._inflight += 1
+        try:
+            return future.result()
+        finally:
+            with self._cond:
+                self._inflight -= 1
+                self._cond.notify_all()
+
+    def run_control(self, coroutine: Coroutine[Any, Any, Any], *, timeout_s: float = 10.0) -> Any:
+        """Best-effort control: no-op ``None`` when parked/closed, bounded wait"""
+        with self._cond:
+            if self._closed or self._thread is None or not self._thread.is_alive():
+                coroutine.close()
+                return None
+            future = asyncio.run_coroutine_threadsafe(coroutine, self._loop)
+        try:
+            return future.result(timeout=timeout_s)
+        except Exception as exc:  # noqa: BLE001 — best-effort by contract
+            future.cancel()
+            logger.warning("%s control failed or timed out (best-effort): %s", self._label, exc)
+            return None
+
+    def run_parked(self, fn: Callable[[], T]) -> T:
+        """Run ``fn`` with the loop parked (idle), holding the lifecycle lock."""
+        with self._cond:
+            if self._closed:
+                raise RuntimeError(f"{self._label} loop thread is closed")
+            if self._inflight:
+                raise RuntimeError(
+                    f"{self._label}: verb requires quiesced generation "
+                    f"({self._inflight} submissions in flight) — abort/drain first"
+                )
+            self._park_locked()
+            return fn()
+
+    def close(self, *, finalizer: Optional[Callable[[], None]] = None) -> None:
+        """Close once: wait for in-flight submissions, park, then finalize."""
+        with self._cond:
+            if self._closed:
+                return
+            while self._inflight:
+                self._cond.wait()
+            self._closed = True
+            self._park_locked()
+            if finalizer is not None:
+                finalizer()
 
 
 class NativeBackend:
@@ -126,10 +160,8 @@ class NativeBackend:
         self._concurrency = int(concurrency)
         self._rt = runtime
         self._logged_first_response = False
-
-    # ------------------------------------------------------------------ #
-    # Boot — the only place the sglang import / spawn / env quarantine live
-    # ------------------------------------------------------------------ #
+        self._lt = LoopThread(engine.loop, label="sglang NativeBackend")
+        self._sem = asyncio.Semaphore(int(concurrency))
 
     @classmethod
     def boot(
@@ -138,31 +170,23 @@ class NativeBackend:
         *,
         concurrency: int,
     ) -> "NativeBackend":
-        """Filter intent against ServerArgs, construct the in-process Engine.
-
-        ``server_intent`` is the same config-spelled ServerArgs intent the HTTP
-        impl consumes (reserved ports already overlaid — ``nccl_port`` is kept
-        deliberately: the colocate de-sync rationale is unchanged, Engine left
-        with ``nccl_port=None`` still races get_free_port() at the synchronized
-        post-load moment; ``port`` flows through as a harmless unused
-        ServerArgs field). ``Engine(**kwargs)`` blocks until the schedulers are
-        up and the model is loaded — no health poll, no timeout knob.
-        """
+        """Filter intent against ServerArgs, construct the in-process Engine."""
         rt = _import_sglang_engine()
 
         allowed = {f.name for f in dataclasses.fields(rt["ServerArgs"])}
-        engine_kwargs = {k: v for k, v in server_intent.items() if k in allowed}
-        # The Engine entrypoint defaults log_level to "error" (the HTTP
-        # server path runs at "info") — restore parity so scheduler logs and
-        # this module's post-init lines stay visible. Intent overrides win.
+        engine_kwargs = _filter_server_args_or_raise(
+            server_intent,
+            allowed=allowed,
+            backend_name="native",
+        )
+        tp_size = int(engine_kwargs.get("tp_size", 1) or 1)
+        if tp_size > 1:
+            raise NotImplementedError(
+                "SGLang native backend does not support rollout tp_size>1 in UniRL yet; "
+                "use backend='http' for rollout TP/EP."
+            )
         engine_kwargs.setdefault("log_level", "info")
 
-        # --- Env quarantine: the HTTP impl's block minus the no_proxy
-        # whitelist (no HTTP warmup self-check to misroute). The rest is
-        # unchanged because the schedulers are still subprocesses.
-
-        # CUDA-IPC tensor sync requires the non-expandable allocator on older
-        # kernels (<5.10) that lack pidfd_getfd; matches PE rollout_actor.py.
         try:
             import torch
 
@@ -170,10 +194,6 @@ class NativeBackend:
         except Exception:
             pass
 
-        # NCCL transport defaults — required for cross-process NCCL groups
-        # used by weight sync to establish P2P/CUMEM channels. sglang's
-        # _set_envs_and_config() defaults these to "0" when enable_symm_mem
-        # is False, breaking broadcast with "Cuda failure 'invalid argument'".
         os.environ.setdefault("NCCL_CUMEM_ENABLE", "1")
         os.environ.setdefault("NCCL_NVLS_ENABLE", "1")
 
@@ -184,14 +204,9 @@ class NativeBackend:
             engine_kwargs.get("nccl_port"),
         )
 
-        # ``set_start_method`` is process-global; matches the HTTP impl so
-        # torch CUDA init in the scheduler children happens cleanly.
         multiprocessing.set_start_method("spawn", force=True)
         engine = rt["Engine"](**engine_kwargs)
 
-        # Bind-mapping gate twin: the settled ServerArgs must echo the
-        # reserved ports verbatim — a runtime upgrade that silently re-settles
-        # them shows up here.
         settled = getattr(engine, "server_args", None)
         logger.info(
             "SGLang Engine ready (settled ServerArgs: port=%s nccl_port=%s)",
@@ -200,23 +215,13 @@ class NativeBackend:
         )
         return cls(engine, concurrency=concurrency, runtime=rt)
 
-    # ------------------------------------------------------------------ #
-    # The single loop seam — every coroutine runs on engine.loop
-    # ------------------------------------------------------------------ #
-
-    def _run(self, coro: Any) -> Any:
-        return self._engine.loop.run_until_complete(coro)
-
-    # ------------------------------------------------------------------ #
-    # Generation — per-payload fan-out on engine.loop (no retry; see module
-    # docstring)
-    # ------------------------------------------------------------------ #
-
     def generate(self, requests: List[Dict[str, Any]]) -> List[Any]:
-        """Fan the per-prompt payloads out on engine.loop; flatten prompt-major."""
+        """Generate the payloads on engine.loop; flatten prompt-major."""
         self._require_alive("generate")
+        if len(requests) == 1:
+            return self._lt.run(self._agen_one(requests[0]))
         t0 = time.perf_counter()
-        results = self._run(self._generate_async(requests))
+        results = self._lt.run(self._agen_many(requests))
         elapsed = time.perf_counter() - t0
         logger.info(
             "sglang NativeBackend.generate: %d requests -> %d results in %.2fs",
@@ -226,43 +231,77 @@ class NativeBackend:
         )
         return results
 
-    async def _generate_async(self, requests: List[Dict[str, Any]]) -> List[Any]:
-        sem = asyncio.Semaphore(self._concurrency)
+    async def _agen_one(self, payload: Dict[str, Any]) -> List[Any]:
+        """Generate ONE ``/generate`` payload on engine.loop, bounded by the"""
+        kwargs = payload_to_generate_kwargs(payload)
+        async with self._sem:
+            try:
+                response = await self._engine.async_generate(**kwargs)
+            except Exception as exc:
+                raise RuntimeError(f"sglang NativeBackend.generate failed: {exc}") from exc
+        parsed = parse_generate_response(response)
+        if not self._logged_first_response and parsed:
+            self._logged_first_response = True
+            first = parsed[0]
+            logger.info(
+                "sglang first response: token_ids=%d logprobs=%d raw_text[:200]=%r",
+                len(first.token_ids),
+                len(first.logprobs),
+                first.text[:200],
+            )
+        return parsed
 
-        async def _generate_one(payload: Dict[str, Any]) -> List[Any]:
-            kwargs = payload_to_generate_kwargs(payload)
-            async with sem:
-                try:
-                    response = await self._engine.async_generate(**kwargs)
-                except Exception as exc:
-                    raise RuntimeError(f"sglang NativeBackend.generate failed: {exc}") from exc
-            parsed = parse_generate_response(response)
-            if not self._logged_first_response and parsed:
-                self._logged_first_response = True
-                first = parsed[0]
-                logger.info(
-                    "sglang first response: token_ids=%d logprobs=%d raw_text[:200]=%r",
-                    len(first.token_ids),
-                    len(first.logprobs),
-                    first.text[:200],
-                )
-            return parsed
-
-        nested = await asyncio.gather(*(_generate_one(p) for p in requests))
+    async def _agen_many(self, requests: List[Dict[str, Any]]) -> List[Any]:
+        """Fan payloads out concurrently; flatten prompt-major."""
+        nested = await asyncio.gather(*(self._agen_one(p) for p in requests), return_exceptions=True)
+        for item in nested:
+            if isinstance(item, BaseException):
+                raise item
         return [item for sublist in nested for item in sublist]
 
-    # ------------------------------------------------------------------ #
-    # Result normalization — the native twin of _check_update_response
-    # ------------------------------------------------------------------ #
+    def abort(self, *, abort_all: bool = True, rid: Optional[str] = None) -> None:
+        self._lt.run_control(self._aabort(abort_all=abort_all, rid=rid))
+
+    def pause(self) -> None:
+        self._lt.run_control(self._apause())
+
+    def resume(self) -> None:
+        self._lt.run_control(self._aresume())
+
+    async def _aabort(self, *, abort_all: bool = True, rid: Optional[str] = None) -> None:
+        """Abort in-flight generation (best-effort across sglang versions)."""
+        tm = getattr(self._engine, "tokenizer_manager", None)
+        fn = getattr(tm, "abort_request", None)
+        if fn is None:
+            logger.warning("sglang NativeBackend: tokenizer_manager.abort_request unavailable; abort is a no-op")
+            return
+        try:
+            res = fn(rid=rid, abort_all=abort_all) if rid is not None else fn(abort_all=abort_all)
+        except TypeError:
+            res = fn(rid) if rid is not None else fn()
+        if asyncio.iscoroutine(res):
+            await res
+
+    async def _apause(self) -> None:
+        """Pause generation admission if the runtime supports it (best-effort)."""
+        await self._call_optional("pause_generation")
+
+    async def _aresume(self) -> None:
+        """Resume generation admission if the runtime supports it (best-effort)."""
+        await self._call_optional("continue_generation")
+
+    async def _call_optional(self, name: str) -> None:
+        tm = getattr(self._engine, "tokenizer_manager", None)
+        fn = getattr(tm, name, None) or getattr(self._engine, name, None)
+        if fn is None:
+            return
+        res = fn()
+        if asyncio.iscoroutine(res):
+            await res
 
     @staticmethod
     def _check_result(result: Any, operation: str) -> None:
-        """Raise on failure; absent success means ok (HTTP-checker parity).
-
-        Absorbs the three native result shapes: ``(success, message)`` tuples
-        from the tokenizer_manager coroutines, plain dicts, and io_struct
-        ReqOutput objects with a ``success`` attribute.
-        """
+        """Raise on failure; absent success means ok (HTTP-checker parity)."""
         success, detail = True, "unknown"
         if isinstance(result, (tuple, list)) and len(result) >= 2:
             success, detail = bool(result[0]), result[1]
@@ -279,72 +318,61 @@ class NativeBackend:
         if self._engine is None:
             raise RuntimeError(f"Cannot {operation}: native sglang engine is shut down.")
 
-    # ------------------------------------------------------------------ #
-    # Memory / lifecycle / health
-    # ------------------------------------------------------------------ #
-
     def flush_cache(self) -> None:
-        """Flush the sglang scheduler cache; retry until it succeeds.
-
-        Mirrors the HTTP impl: the scheduler reports failure while pending
-        requests exist (the condition that made /flush_cache return non-200);
-        retry up to 60 × 1s. Precondition for sleep so release actually frees
-        the KV pool.
-        """
+        """Flush the sglang scheduler cache; retry until it succeeds."""
         self._require_alive("flush cache")
-        last: Any = None
-        for _ in range(60):
-            last = self._engine.flush_cache()
-            if getattr(last, "success", True):
-                return
-            time.sleep(1.0)
-        raise TimeoutError(f"sglang NativeBackend: flush_cache did not succeed after 60 attempts (last result: {last})")
+
+        def _flush() -> None:
+            last: Any = None
+            for _ in range(60):
+                last = self._engine.flush_cache()
+                if getattr(last, "success", True):
+                    return
+                time.sleep(1.0)
+            raise TimeoutError(
+                f"sglang NativeBackend: flush_cache did not succeed after 60 attempts (last result: {last})"
+            )
+
+        self._lt.run_parked(_flush)
 
     def release_memory(self, *, tags: Optional[Sequence[str]] = None) -> None:
         self._require_alive("release memory")
-        result = self._engine.release_memory_occupation(tags=list(tags) if tags is not None else None)
+        result = self._lt.run_parked(
+            lambda: self._engine.release_memory_occupation(tags=list(tags) if tags is not None else None)
+        )
         self._check_result(result, "release_memory")
 
     def resume_memory(self, *, tags: Optional[Sequence[str]] = None) -> None:
         self._require_alive("resume memory")
-        result = self._engine.resume_memory_occupation(tags=list(tags) if tags is not None else None)
+        result = self._lt.run_parked(
+            lambda: self._engine.resume_memory_occupation(tags=list(tags) if tags is not None else None)
+        )
         self._check_result(result, "resume_memory")
 
     def ping(self) -> bool:
-        """Liveness of the Engine's child processes (schedulers + detokenizer).
-
-        Weaker than the HTTP impl's /health_generate (existence probe, not a
-        generation probe) — acceptable because health_check() short-circuits
-        while offloaded and a wedged-but-alive scheduler surfaces in generate.
-        """
+        """Liveness of the Engine's child processes (schedulers + detokenizer)."""
         if self._engine is None:
             return False
         try:
             pids = self._engine.get_all_child_pids()
             for pid in pids:
                 os.kill(pid, 0)
-            # An empty pid list after a successful boot means the children
-            # are gone.
             return bool(pids)
         except Exception:
             return False
 
     def shutdown(self) -> None:
-        """Shut the Engine down once; tolerate the re-entrant callers.
-
-        Engine registers its own atexit shutdown and the rollout engine's
-        ``__del__`` re-enters ours — the None-swap makes our side idempotent.
-        """
-        if self._engine is None:
+        """Shut the Engine down once; tolerate the re-entrant callers."""
+        engine = self._engine
+        if engine is None:
             return
-        engine, self._engine = self._engine, None
-        logger.info("Shutting down in-process SGLang Engine")
-        engine.shutdown()
 
-    # ------------------------------------------------------------------ #
-    # Weight-sync verbs — public Engine methods where signatures match;
-    # io_struct + tokenizer_manager for the pre-serialized payloads
-    # ------------------------------------------------------------------ #
+        def _shutdown() -> None:
+            self._engine = None
+            logger.info("Shutting down in-process SGLang Engine")
+            engine.shutdown()
+
+        self._lt.close(finalizer=_shutdown)
 
     def update_from_tensor(
         self,
@@ -353,20 +381,17 @@ class NativeBackend:
         load_format: Optional[str],
         flush_cache: bool,
     ) -> None:
-        """Update weights from pre-serialized per-TP-rank tensor bags.
-
-        The public ``Engine.update_weights_from_tensor`` takes RAW tensors and
-        re-serializes — our seam carries the bags already serialized, so this
-        constructs the io_struct and calls the tokenizer_manager coroutine
-        directly (exactly what the HTTP endpoint does server-side).
-        """
+        """Update weights from pre-serialized per-TP-rank tensor bags."""
         self._require_alive("update_from_tensor")
         obj = self._rt["UpdateWeightsFromTensorReqInput"](
             serialized_named_tensors=serialized_named_tensors,
             load_format=load_format,
             flush_cache=flush_cache,
         )
-        result = self._run(self._engine.tokenizer_manager.update_weights_from_tensor(obj, None))
+        engine = self._engine
+        result = self._lt.run_parked(
+            lambda: engine.loop.run_until_complete(engine.tokenizer_manager.update_weights_from_tensor(obj, None))
+        )
         self._check_result(result, "update_from_tensor")
 
     def init_weights_group(
@@ -380,13 +405,15 @@ class NativeBackend:
         backend: str,
     ) -> None:
         self._require_alive("init_weights_group")
-        result = self._engine.init_weights_update_group(
-            master_address=master_address,
-            master_port=int(master_port),
-            rank_offset=int(rank_offset),
-            world_size=int(world_size),
-            group_name=str(group_name),
-            backend=str(backend),
+        result = self._lt.run_parked(
+            lambda: self._engine.init_weights_update_group(
+                master_address=master_address,
+                master_port=int(master_port),
+                rank_offset=int(rank_offset),
+                world_size=int(world_size),
+                group_name=str(group_name),
+                backend=str(backend),
+            )
         )
         self._check_result(result, "init_weights_group")
         logger.info(
@@ -414,18 +441,20 @@ class NativeBackend:
             flush_cache,
         )
         self._require_alive("update_from_distributed")
-        result = self._engine.update_weights_from_distributed(
-            names=list(names),
-            dtypes=list(dtypes),
-            shapes=[list(s) for s in shapes],
-            group_name=str(group_name),
-            flush_cache=flush_cache,
+        result = self._lt.run_parked(
+            lambda: self._engine.update_weights_from_distributed(
+                names=list(names),
+                dtypes=list(dtypes),
+                shapes=[list(s) for s in shapes],
+                group_name=str(group_name),
+                flush_cache=flush_cache,
+            )
         )
         self._check_result(result, "update_from_distributed")
 
     def destroy_weights_group(self, *, group_name: str) -> None:
         self._require_alive("destroy_weights_group")
-        result = self._engine.destroy_weights_update_group(group_name=str(group_name))
+        result = self._lt.run_parked(lambda: self._engine.destroy_weights_update_group(group_name=str(group_name)))
         self._check_result(result, "destroy_weights_group")
 
     def set_lora(
@@ -435,13 +464,7 @@ class NativeBackend:
         lora_tensors: Dict[str, Any],
         config_dict: Optional[dict] = None,
     ) -> None:
-        """Serialize the LoRA tensor bag and hot-load it on the Engine.
-
-        Parity with the HTTP impl: same MultiprocessingSerializer call, same
-        io_struct — delivered to the tokenizer_manager coroutine instead of
-        POSTed (the /load_lora_adapter_from_tensors endpoint does exactly
-        this server-side).
-        """
+        """Serialize the LoRA tensor bag and hot-load it on the Engine."""
         self._require_alive("set_lora")
         serialized = self._rt["MultiprocessingSerializer"].serialize(lora_tensors, output_str=True)
         obj = self._rt["LoadLoRAAdapterFromTensorsReqInput"](
@@ -449,8 +472,11 @@ class NativeBackend:
             config_dict=dict(config_dict or {}),
             serialized_tensors=serialized,
         )
-        result = self._run(self._engine.tokenizer_manager.load_lora_adapter_from_tensors(obj, None))
+        engine = self._engine
+        result = self._lt.run_parked(
+            lambda: engine.loop.run_until_complete(engine.tokenizer_manager.load_lora_adapter_from_tensors(obj, None))
+        )
         self._check_result(result, "set_lora")
 
 
-__all__ = ["NativeBackend", "payload_to_generate_kwargs"]
+__all__ = ["LoopThread", "NativeBackend", "payload_to_generate_kwargs"]

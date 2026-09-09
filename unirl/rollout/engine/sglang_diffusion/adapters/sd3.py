@@ -1,10 +1,4 @@
-"""SD3 / SDXL-family flow-match image adapter — the default path, end to end.
-
-Generic schedule policy (``model_config.shift``), ``transformer.`` LoRA prefix,
-SDE label from the strategy, 5-D passthrough trajectory, ``Images`` decode, and
-``text`` + ``negative_text`` condition fusion all come from ``ImageAdapter``;
-nothing here needs overriding.
-"""
+"""SD3 / SDXL-family flow-match image adapter — the default path, end to end."""
 
 from __future__ import annotations
 

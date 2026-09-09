@@ -1,51 +1,4 @@
-"""FLUX.2-klein diffusion: typed params + per-step kernel + rollout-level stage.
-
-Mirrors :mod:`unirl.models.sd3.diffusion` and
-:mod:`unirl.models.qwen_image.diffusion`. Three classes:
-
-- :class:`Flux2KleinDiffusionParams` — typed request-shape knobs
-  (steps / guidance / size / seed / sde_indices / eta /
-  init_same_noise / samples_per_prompt / noise_group_ids).
-- :class:`Flux2KleinDiffusionStep` — stateless per-step kernel. Packs
-  patchified latents ``[B, 128, H_pat, W_pat]`` into the transformer's
-  expected ``[B, H_pat*W_pat, 128]`` layout, builds RoPE ``txt_ids`` /
-  ``img_ids``, calls the transformer with ``guidance=torch.zeros(B)``
-  (Klein has no guidance distillation), and unpacks the noise
-  prediction back to patchified spatial form.
-- :class:`Flux2KleinDiffusionStage` — implements
-  ``DiffusionStage[Flux2KleinConditions]``. Owns the SDE strategy and
-  loop bookkeeping; segment latents stay in patchified ``[B, 128,
-  H_pat, W_pat]`` shape so :class:`Flux2KleinVAEDecodeStage` can read
-  them directly without per-shape special-casing.
-
-Klein vs. dev (FLUX.2-dev) differences:
-
-- **No CFG branch consumed by the transformer**. Klein checkpoints ship
-  with ``has_pooled_projections=false`` and ``guidance_embeds=false``,
-  so we always feed ``guidance=torch.zeros(B)`` and never pass
-  ``pooled_projections``. The Klein training script also runs with
-  ``guidance_scale=1.0`` so the CFG combine math is bypassed
-  end-to-end.
-- **Pre-patchified latent space**. Latents live in the 128-channel
-  patchified space ``[B, 128, H_pix/16, W_pix/16]`` throughout the SDE
-  loop (vs. dev's 32-channel ``[B, 32, H_pix/8, W_pix/8]`` form). The
-  VAE decode stage handles the inverse: unpack → denormalize →
-  unpatchify → decode.
-- **4-axis RoPE ids**. ``txt_ids`` ``[B, L, 4]`` and ``img_ids``
-  ``[B, H_pat*W_pat, 4]`` are built via :func:`prepare_text_ids` /
-  :func:`prepare_latent_ids`; passing FLUX.1's 3-axis form crashes
-  inside ``FluxPosEmbed`` because Klein's
-  ``axes_dims_rope=[32, 32, 32, 32]``.
-- **Replay uses eval() mode**. To mirror the legacy
-  ``Flux2Sampler.compute_log_prob_for_training`` Klein branch and the
-  FLUX.2 PR's safety fence: the transformer stays in ``.eval()``
-  inside ``step.predict_noise`` during replay. Caller manages
-  ``train()`` / ``eval()`` mode at the outer scope.
-
-Math mirrors ``samplers/fsdp/flux2_sampler.py::Flux2Sampler.sample``
-(Klein branch). The new-design path does NOT import legacy code; the
-two implementations must stay in spec sync via review and tests.
-"""
+"""FLUX.2-klein diffusion — the SDE loop runs in patchified ``[B, 128, H_pix/16, W_pix/16]`` space."""
 
 from __future__ import annotations
 
@@ -55,9 +8,11 @@ from typing import ClassVar, List, Optional, Set, Tuple
 
 import torch
 
+from unirl.models.types.batched_replay import BatchedStepReplayMixin
 from unirl.models.types.diffusion import DiffusionStage, DiffusionStep
 from unirl.models.types.replay_result import ReplayResult
-from unirl.sde.kernels import StepStrategy
+from unirl.sde.kernels import SDEStrategy, StepStrategy
+from unirl.types.conditions import TextEmbedCondition
 from unirl.types.sampling import compute_trajectory_positions
 from unirl.types.segments.latent import LatentSegment
 from unirl.utils.dtypes import parse_torch_dtype
@@ -74,18 +29,7 @@ from .flux2_klein_utils import (
 
 @dataclass
 class Flux2KleinDiffusionParams:
-    """Per-request sampling knobs for FLUX.2-klein diffusion.
-
-    Strategy + precision knobs are *not* here — they live at
-    :class:`Flux2KleinDiffusionStage` construction since precision is
-    operator policy, not request shape. Klein's transformer ignores
-    ``guidance_scale`` (no guidance distillation, no CFG-consuming
-    pooled projection), but the field is kept for API symmetry with
-    SD3 / Qwen-Image. ``guidance_scale > 1.0`` will *also* trigger a
-    classical CFG combine if ``conditions.negative_text`` is supplied
-    — the canonical Klein recipe runs at ``guidance_scale=1.0`` with
-    no negative branch.
-    """
+    """Per-request sampling knobs for FLUX.2-klein diffusion."""
 
     num_inference_steps: int = 10
     guidance_scale: float = 1.0
@@ -100,12 +44,7 @@ class Flux2KleinDiffusionParams:
 
 
 class Flux2KleinDiffusionStep(DiffusionStep[Flux2KleinBundle, Flux2KleinConditions]):
-    """Per-step FLUX.2-klein denoising kernel — stateless.
-
-    Operates on patchified ``[B, 128, H_pat, W_pat]`` latents. Packs to
-    ``[B, H_pat*W_pat, 128]`` for the transformer forward, then unpacks
-    the noise prediction back to spatial form.
-    """
+    """Per-step Klein kernel — stateless; packs ``[B, 128, H_pat, W_pat]`` to ``[B, H_pat*W_pat, 128]`` and back."""
 
     def predict_noise(
         self,
@@ -116,16 +55,7 @@ class Flux2KleinDiffusionStep(DiffusionStep[Flux2KleinBundle, Flux2KleinConditio
         *,
         guidance_scale: float,
     ) -> torch.Tensor:
-        """Run Klein transformer forward.
-
-        ``sample`` is the patchified latent ``[B, 128, H_pat, W_pat]``.
-        Returns the noise prediction in the same shape.
-
-        Klein's transformer expects ``guidance=torch.zeros(B)`` (no
-        guidance distillation) and does **not** accept
-        ``pooled_projections``. ``txt_ids`` / ``img_ids`` are 4-axis
-        RoPE coordinate tensors.
-        """
+        """Run the Klein transformer forward on the patchified latent ``[B, 128, H_pat, W_pat]``."""
         if conditions.text is None:
             raise ValueError("Flux2KleinDiffusionStep.predict_noise: conditions.text is None")
         text = conditions.text
@@ -151,12 +81,6 @@ class Flux2KleinDiffusionStep(DiffusionStep[Flux2KleinBundle, Flux2KleinConditio
         txt_ids = prepare_text_ids(prompt_embeds).to(device=device)
         img_ids = prepare_latent_ids(sample).to(device=device)
 
-        # Image-edit conditioning: append the source-image condition tokens to
-        # the noise token sequence (and their RoPE ids to img_ids), mirroring
-        # diffusers' Flux2KleinPipeline reference path
-        # (latent_model_input = cat([latents, image_latents], dim=1)). The
-        # transformer attends jointly; we slice the prediction back to the
-        # noise tokens afterwards. Pure T2I leaves these None → no-op.
         cond_tokens = conditions.image_latent
         if cond_tokens is not None:
             cond_tokens = cond_tokens.to(device=device, dtype=dtype)
@@ -179,7 +103,6 @@ class Flux2KleinDiffusionStep(DiffusionStep[Flux2KleinBundle, Flux2KleinConditio
             joint_attention_kwargs=None,
             return_dict=False,
         )[0]
-        # Drop the condition-token predictions; keep only the noise tokens.
         noise_pred_packed = noise_pred_packed[:, :noise_seq_len]
 
         if guidance_scale > 1.0:
@@ -204,8 +127,6 @@ class Flux2KleinDiffusionStep(DiffusionStep[Flux2KleinBundle, Flux2KleinConditio
         latent_h = int(sample.shape[-2])
         latent_w = int(sample.shape[-1])
         return unpack_latents(noise_pred_packed, latent_h, latent_w)
-
-    # ---- Protocol surface ---------------------------------------------------
 
     def forward(
         self,
@@ -289,34 +210,14 @@ class Flux2KleinDiffusionStep(DiffusionStep[Flux2KleinBundle, Flux2KleinConditio
         )
 
 
-class Flux2KleinDiffusionStage(DiffusionStage[Flux2KleinConditions]):
-    """FLUX.2-klein rollout-level diffusion stage.
-
-    Owns the SDE ``strategy`` (DanceSDE by default for Klein), the
-    bundle, the kernel, and the precision policy. The kernel is
-    stateless and is invoked per-step with the strategy passed in.
-
-    Segment latents are stored as **patchified** spatial tensors
-    ``[B, K, 128, H_pat, W_pat]`` so :class:`Flux2KleinVAEDecodeStage`
-    can read them directly. The pack/unpack at the transformer
-    boundary lives in :class:`Flux2KleinDiffusionStep`.
-
-    ``_no_split_modules`` is the model-side fallback used by
-    FSDPPolicy: Klein's transformer block classes are
-    ``Flux2TransformerBlock`` (dual-stream) plus
-    ``Flux2SingleTransformerBlock`` (single-stream). These match the
-    installed diffusers ``Flux2Transformer2DModel._no_split_modules``.
-    """
+class Flux2KleinDiffusionStage(BatchedStepReplayMixin, DiffusionStage[Flux2KleinConditions]):
+    """FLUX.2-klein rollout-level diffusion stage."""
 
     _no_split_modules: ClassVar[Tuple[str, ...]] = (
         "Flux2TransformerBlock",
         "Flux2SingleTransformerBlock",
     )
 
-    # FLUX.2-klein VAE spatial downsample (8×) and patchify factor (2×)
-    # → effective patchified downsample 16×. The bundle's
-    # ``transformer.config.in_channels`` is the patchified channel count
-    # (128 = 32 × 4); we use it to derive ``latent_channels`` (32).
     DEFAULT_VAE_SCALE_FACTOR: ClassVar[int] = 8
     DEFAULT_PATCHIFY_FACTOR: ClassVar[int] = 2
 
@@ -332,6 +233,7 @@ class Flux2KleinDiffusionStage(DiffusionStage[Flux2KleinConditions]):
         vae_scale_factor: int = 8,
         patchify_factor: int = 2,
         latent_channels: Optional[int] = None,
+        batch_replay_steps: bool = False,
     ) -> None:
         self.model = model
         self.step = step
@@ -341,15 +243,12 @@ class Flux2KleinDiffusionStage(DiffusionStage[Flux2KleinConditions]):
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="logprob_precision")
         self.vae_scale_factor = int(vae_scale_factor)
         self.patchify_factor = int(patchify_factor)
+        self.batch_replay_steps = bool(batch_replay_steps)
         if latent_channels is None:
             tx_cfg = getattr(model.transformer, "config", None)
             in_channels = getattr(tx_cfg, "in_channels", 128) if tx_cfg is not None else 128
             latent_channels = int(in_channels)
         self.latent_channels = int(latent_channels)
-
-    # ------------------------------------------------------------------
-    # Sampling
-    # ------------------------------------------------------------------
 
     def _patchified_shape(self, height: int, width: int) -> Tuple[int, int, int]:
         """Compute the patchified ``(C, H_pat, W_pat)`` for ``(height, width)`` pixels."""
@@ -371,14 +270,7 @@ class Flux2KleinDiffusionStage(DiffusionStage[Flux2KleinConditions]):
         params: Flux2KleinDiffusionParams,
         initial_latents: Optional[torch.Tensor] = None,
     ) -> LatentSegment:
-        """Run full FLUX.2-klein sampling. Returns a ``LatentSegment``.
-
-        Segment latents stay in patchified spatial form
-        ``[B, K, 128, H_pat, W_pat]``. The driver may pre-ship
-        ``initial_latents`` (in the same patchified spatial form) via
-        ``req.request_conditions['initial_latents']``; when absent we
-        sample fresh Gaussian noise.
-        """
+        """Run full FLUX.2-klein sampling; the segment stores patchified ``[B, K, 128, H_pat, W_pat]``."""
         from unirl.sde.noise import generate_latents
 
         if conditions.text is None or conditions.text.embeds is None:
@@ -436,9 +328,6 @@ class Flux2KleinDiffusionStage(DiffusionStage[Flux2KleinConditions]):
         )
         sigma_max = schedule[1].float() if int(schedule.shape[0]) > 1 else torch.tensor(0.99)
 
-        # Klein's transformer keeps `.eval()` mode during sampling
-        # (matches legacy Flux2Sampler.sample). Caller is responsible
-        # for restoring `.train()` after rollout finishes.
         self.model.transformer.eval()
 
         for i in range(T):
@@ -468,7 +357,7 @@ class Flux2KleinDiffusionStage(DiffusionStage[Flux2KleinConditions]):
                 sde_logp_list.append(log_prob.to(dtype=self.logprob_dtype))
 
         positions_collected = [p for p, _ in stored_pairs]
-        latents_stacked = torch.stack([t for _, t in stored_pairs], dim=1)  # [B, K, C, H_pat, W_pat]
+        latents_stacked = torch.stack([t for _, t in stored_pairs], dim=1)
 
         sde_logp = torch.stack(sde_logp_list, dim=1) if sde_logp_list else None
         sde_indices_tensor = torch.tensor(sde_sorted, dtype=torch.long, device=device) if sde_sorted else None
@@ -483,10 +372,6 @@ class Flux2KleinDiffusionStage(DiffusionStage[Flux2KleinConditions]):
             sde_indices=sde_indices_tensor,
         )
 
-    # ------------------------------------------------------------------
-    # Replay
-    # ------------------------------------------------------------------
-
     def replay(
         self,
         conditions: Flux2KleinConditions,
@@ -495,16 +380,7 @@ class Flux2KleinDiffusionStage(DiffusionStage[Flux2KleinConditions]):
         params: Flux2KleinDiffusionParams,
         step_indices: Optional[List[int]] = None,
     ) -> ReplayResult:
-        """Segment-based log-prob replay over the rollout's SDE transitions.
-
-        Mirrors :class:`SD3DiffusionStage.replay`. Klein-specific
-        difference: the transformer is held in ``.eval()`` mode for the
-        forward pass (matches legacy
-        ``Flux2Sampler.compute_log_prob_for_training`` Klein branch).
-        Caller manages the outer ``.train()`` / ``.eval()`` mode and
-        grad scope; this method only manages the autocast scope and
-        the per-step eval flip.
-        """
+        """Segment-based log-prob replay over the rollout's SDE transitions."""
         if segment.sde_indices is None or segment.latents is None:
             raise ValueError("Flux2KleinDiffusionStage.replay: segment.sde_indices / latents missing")
         if segment.sigmas is None:
@@ -537,10 +413,21 @@ class Flux2KleinDiffusionStage(DiffusionStage[Flux2KleinConditions]):
             else nullcontext()
         )
 
-        # Klein replay uses ``.eval()`` to match the legacy sampler.
         prior_training = self.model.transformer.training
         self.model.transformer.eval()
         try:
+            if self.batch_replay_steps and len(target) > 1 and isinstance(self.strategy, SDEStrategy):
+                with autocast_ctx:
+                    return self._replay_batched_steps(
+                        conditions,
+                        segment=segment,
+                        params=params,
+                        target=target,
+                        sigmas=sigmas,
+                        sigma_max=sigma_max,
+                        device=device,
+                    )
+
             log_probs: List[torch.Tensor] = []
             prev_sample_means: List[torch.Tensor] = []
             with autocast_ctx:
@@ -579,9 +466,24 @@ class Flux2KleinDiffusionStage(DiffusionStage[Flux2KleinConditions]):
         means_t = torch.stack(prev_sample_means, dim=1).to(dtype=self.trajectory_dtype) if prev_sample_means else None
         return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
 
-    # ------------------------------------------------------------------
-    # Single-step noise prediction (forward-process algorithms: DiffusionNFT et al.)
-    # ------------------------------------------------------------------
+    @staticmethod
+    def _tile_conditions(conditions: Flux2KleinConditions, repeats: int) -> Flux2KleinConditions:
+        def _rep(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+            return t.repeat(repeats, *([1] * (t.dim() - 1))) if t is not None else None
+
+        def _tile(cond: Optional[TextEmbedCondition]) -> Optional[TextEmbedCondition]:
+            if cond is None:
+                return None
+            return TextEmbedCondition(
+                embeds=_rep(cond.embeds), pooled=_rep(cond.pooled), attn_mask=_rep(cond.attn_mask)
+            )
+
+        return Flux2KleinConditions(
+            text=_tile(conditions.text),
+            negative_text=_tile(conditions.negative_text),
+            image_latent=_rep(conditions.image_latent),
+            image_latent_ids=_rep(conditions.image_latent_ids),
+        )
 
     def predict_noise_at_step(
         self,
@@ -591,11 +493,7 @@ class Flux2KleinDiffusionStage(DiffusionStage[Flux2KleinConditions]):
         sigma: torch.Tensor,
         params: Flux2KleinDiffusionParams,
     ) -> torch.Tensor:
-        """Single ``(xt, sigma)`` model forward — no scheduler iteration.
-
-        ``sample`` is patchified ``[B, 128, H_pat, W_pat]``. Delegates
-        to :meth:`Flux2KleinDiffusionStep.predict_noise`.
-        """
+        """Single ``(xt, sigma)`` model forward — no scheduler iteration."""
         return self.step.predict_noise(
             self.model,
             sample,
@@ -604,18 +502,8 @@ class Flux2KleinDiffusionStage(DiffusionStage[Flux2KleinConditions]):
             guidance_scale=float(params.guidance_scale),
         )
 
-    # ------------------------------------------------------------------
-    # Trainable surface for FSDPPolicy
-    # ------------------------------------------------------------------
-
     def trainable_module(self) -> "torch.nn.Module":
-        """Return the module the diffusion forward operates on.
-
-        For FLUX.2-klein, that's the bundle's transformer
-        (``Flux2Transformer2DModel``) — the FSDP wrap target. Aux
-        modules (VAE, Qwen3 text encoder) are siblings on the bundle,
-        never under the transformer.
-        """
+        """Return the module the diffusion forward operates on."""
         return self.model.transformer
 
 

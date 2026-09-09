@@ -85,7 +85,7 @@ policy. Like the GRPO-style diffusion recipes, the recipe sets
 | New Gaussian mean `µ_θ` | `stage.replay(...).prev_sample_means` → `new_means` |
 | Gaussian scale `σ_t` | `FlowDPPO._compute_sigma_t` (from `segment.sigmas`, `dt`, `params.eta`) |
 | KL threshold `τ` (paper `δ`) | `algorithm.kl_mask_threshold` |
-| Advantage `A_i` | `track.advantages`, broadcast to `[B, S]` |
+| Advantage `A_i` | `part.advantages`, broadcast to `[B, S]` |
 | Masked objective | `_flowdppo_kl_adv_loss` |
 
 ## From rollout to update
@@ -95,7 +95,7 @@ The rollout follows the same GRPO-style SDE path, plus the per-step Gaussian mea
 1. Selected SDE steps produce `LatentSegment.latents`, `sigmas`, `sde_indices`, and
    (in rollout mode) `sde_logp`.
 2. `RewardService` scores the decoded images, then
-   `RolloutTrack.compute_advantages(normalize=True, use_global_std=True)` writes
+   `Part.compute_advantages(normalize=True, use_global_std=True)` writes
    prompt-centered, batch-std advantages.
 3. `TrainStack.train_track` calls `FlowDPPO.prepare_segment` once: a `no_grad`
    replay at pre-update weights that keeps `sde_logp` if present, fills it if missing,

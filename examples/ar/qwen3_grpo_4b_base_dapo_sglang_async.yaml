@@ -12,11 +12,9 @@
 #   python -m unirl.train_async_ar --config-name=ar/qwen3_grpo_4b_base_dapo_sglang_async \
 #     num_devices=4 batch_size=8 sampling.samples_per_prompt=4
 #
-# DIVISIBILITY (DP_SCATTER): with train_fraction=0.5 the slabs are
-# num_devices/2 each. Both `batch_size * samples_per_prompt % train_slab == 0`
-# AND `% rollout_slab == 0` must hold, and `train_fraction * num_devices` must
-# be an integer. At num_devices=32 / batch_size=64 / spp=8 → 16/16 slabs,
-# 512 % 16 == 0 (OK). Changing train_fraction or the batch can break this.
+# DIVISIBILITY: `batch_size * samples_per_prompt` must divide evenly over
+# the train slab, and `train_fraction * num_devices` must be an integer.
+# Prompt-unit rollout dispatch has no rollout-DP divisibility requirement.
 
 num_devices: 32
 batch_size: 64 # prompts_per_rollout
@@ -26,19 +24,10 @@ num_rollouts: 800
 # train-bound, lower for generation-bound workloads (mind DIVISIBILITY above).
 train_fraction: 0.5
 
-# Async knobs (one unified loop): max_inflight = concurrent generations (overlap
-# depth; 1 ≈ one-step pipeline). buffer_max_staleness = weight-syncs a buffered
-# group may cross: 0 = on-policy (ratio≈1), >0 = off-policy continuous buffer.
-max_inflight: 1
-buffer_max_staleness: 0
-
-# Push the full dense weights into SGLang every N rollouts. =1 is the on-policy
-# reward-parity baseline vs the colocate ARTrainer (a sync sits between every
-# gen/train pair, so there is NO overlap). Set >1 to actually overlap
-# generate(N+1) with train(N): the data is then off-policy by <= interval
-# weight versions, absorbed by the rollout-anchored PPO ratio (old_logp =
-# segment.log_probs), exactly the slime train_async trade-off.
-weight_sync_interval: 1
+max_inflight: 2          # globally admitted batch-equivalents
+per_worker_inflight: 14  # concurrent prompt trees per rollout worker
+weight_sync_interval: 1  # trained batches per publication; also configures the output-version lag filter
+buffer_max_staleness: 2  # maximum allowed rollout-version lag
 
 # AIME eval every 10 rollouts + a pre-train baseline (rollout -1).
 eval_interval: 10

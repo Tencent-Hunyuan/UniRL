@@ -9,7 +9,7 @@
 #     train half — FSDPBackend (HunyuanVideo15TransformerBlock wrap)
 #     rollout half — vllm-omni "t2v" modality (single DiT stage)
 #   - LoRA r64 trained, MERGED full-weight pushed to rollout via NCCL
-#     broadcast (sync.use_merged: true folds the LoRA delta into base).
+#     broadcast (sync.lora_merged: true folds the LoRA delta into base).
 #   - DanceGRPO-aligned hyperparameters: steps=16, cfg=0, eta=0.25,
 #     shift=5.0, lr=1e-5, weight_decay=1e-4.
 # Layout: 2 nodes × 8 GPUs, 8 train + 8 rollout (train_fraction=0.5).
@@ -19,8 +19,8 @@
 # to nccl_broadcast cleared the hang. See feat-branch commit 0ec7774 +
 # notes for details.
 #
-# Launch (2 nodes x 8 GPUs, taiji SPMD):
-#   bash examples/run_experiment_multinode_taiji.sh diffusion/hunyuan_video15/hunyuan_video15_t2v_vllmomni_nccl_separate
+# Launch (2 nodes x 8 GPUs, SPMD):
+#   bash examples/run_experiment_multinode.sh diffusion/hunyuan_video15/hunyuan_video15_t2v_vllmomni_nccl_separate
 
 num_devices: 16                    # 2 nodes × 8 GPUs
 batch_size: 16                     # prompts_per_rollout
@@ -63,6 +63,9 @@ backend:
   fsdp_cfg:
     _target_: unirl.train.configs.FSDPConfig
     param_dtype: bf16
+    # Same LoRA optimizer contract as trainside/colocate: a bf16 load keeps a
+    # bf16 master unless this is set, and ~1e-6 AdamW steps round away.
+    master_dtype: fp32
     cpu_offload: false
     mixed_precision: true
     fsdp_mode: full
@@ -135,12 +138,10 @@ algorithm:
   stage_attr: diffusion
   clip_range: 1.0e-4
   clip_schedule: constant
-  # Separate-slab rollout (vllm-omni) computes log_probs via a different code
-  # path than the train-side replay (merged-weight forward vs LoRA-adapter
-  # forward, different scheduler impl). This causes ~1e-4 numerical drift in
-  # old_logp that trips the tight clip_range and wastes gradient signal.
-  # "replay" recomputes old_logp at pre-update weights on the train replica,
-  # ensuring the π_old anchor uses the exact same code path as new_logp.
+  # Keep trainer-side replay. This recipe pushes merged full weights
+  # (sync.lora_merged: true), so sampler logp is a vLLM merged-weight forward
+  # while train new_logp is FSDP LoRA-adapter. That remaining path gap still
+  # sits near clip_range (1e-4), so both HV1.5 vLLM-Omni recipes use replay.
   old_logp_source: replay
   conditions_cls:
     _target_: hydra.utils.get_class
@@ -186,7 +187,7 @@ sampling:
   seed: 42
   init_same_noise: false
   scheduler:
-    _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+    _target_: unirl.sde.index_schedule.AllSDEScheduler
     num_timesteps: ${..num_inference_steps}
     # feat-branch v1 vllm_omni separate recipe: SDE candidate pool = first 60%
     # of the schedule (steps 0..8 at T=16), then 8 of those are drawn as the
@@ -200,12 +201,11 @@ sampling:
 # Wired to the rollout slab by DiffusionTrainer's one-time handshake. Folds
 # the trained LoRA delta into the base weights and pushes the merged full
 # model so the rollout engine runs the merged weights without a separate
-# adapter (use_merged: true).
+# adapter (lora_merged: true).
 sync:
   _target_: unirl.distributed.weight_sync.full.nccl.NCCLWeightSync
-  use_merged: true
+  lora_merged: true
   group_name: weight_sync
   bucket_size_mb: 512
   flush_cache: true
-  target_modules: ["transformer"]
-  param_name_prefix: "transformer."
+  name_remap: {"*": "transformer.*"}

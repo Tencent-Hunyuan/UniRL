@@ -1,17 +1,11 @@
-"""Conditioning embedding stage interface.
-
-``EmbedStage[P, C]``: ``Primitive → Condition``. Same shape as
-``EncodeStage``, separate name for the text-encoder flavor of the operation.
-
-The legacy ``SampleStage`` has been removed — its rollout-level role is
-subsumed by typed ``DiffusionStage`` / ``ARStage``.
-"""
+"""Conditioning embedding stage interface."""
 
 from __future__ import annotations
 
 from typing import Protocol, TypeVar, runtime_checkable
 
 P = TypeVar("P")
+ImageP = TypeVar("ImageP")
 C = TypeVar("C")
 
 
@@ -22,4 +16,11 @@ class EmbedStage(Protocol[P, C]):
     def embed(self, p: P) -> C: ...
 
 
-__all__ = ["EmbedStage"]
+@runtime_checkable
+class ImageConditionedEmbedStage(Protocol[P, ImageP, C]):
+    """Embed a primitive with optional image context into its condition form."""
+
+    def embed(self, p: P, images: ImageP | None = None) -> C: ...
+
+
+__all__ = ["EmbedStage", "ImageConditionedEmbedStage"]

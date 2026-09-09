@@ -1,23 +1,4 @@
-"""v2 full-weight checkpoint-path sync (COLOCATE, single-node).
-
-Simplest full-weight transport: the train slab serializes the freshly-trained
-full base weights to a file on a shared/local path, and each co-located rollout
-engine loads it via ``update_weights_from_path``. Full-weight analogue of the
-LoRA / tensor / nccl / ipc handlers, used to bring up the FastVideo engine
-before the faster zero-copy transports are wired.
-
-Mirrors ``TensorWeightSync`` (colocate, ``rollout`` is a LOCAL sibling) but the
-handoff is a torch.save file instead of a serialized tensor bag:
-
-  rank0: ``_iter_full_tensors`` (FSDP all-gather; all ranks in lockstep) →
-         ``torch.save`` to ``{sync_dir}/weights_v{N}`` + ``.ready`` marker
-  every rank: wait for marker → ``self._rollout.update_weights_from_path(path)``
-
-The weight walk yields the bare trainable-module (transformer) keys, which is
-exactly what the FastVideo engine's ``transformer.load_state_dict`` expects — so
-no ``name_remap`` is needed for the default FastVideo case. All torch imports
-are deferred so the driver can import this module for ``remote(...)``.
-"""
+"""v2 full-weight checkpoint-path sync (COLOCATE, single-node)."""
 
 from __future__ import annotations
 
@@ -71,9 +52,6 @@ class CheckpointWeightSync(FullWeightSync):
         track_prefix: str = "",
         wire_dtype: Any = None,
     ) -> None:
-        # NOTE: no ``bucket_size_mb`` — the base's size-bounded bucketing
-        # (``_iter_buckets``) is for streaming transports; this handler writes the
-        # whole state_dict in one ``torch.save``, so bucketing never runs.
         super().__init__(
             backend=backend,
             flush_cache=flush_cache,
@@ -83,10 +61,8 @@ class CheckpointWeightSync(FullWeightSync):
             track_prefix=track_prefix,
             wire_dtype=wire_dtype,
         )
+        self.version = 0
         self._rollout = rollout  # local engine sibling (colocate)
-        # Isolate concurrent/restarted jobs. Ray's job id is identical on every
-        # train rank; the rollout class / track prefix isolates multiple checkpoint
-        # bridges within one job.
         scope = self._track_prefix or type(rollout).__name__
         scope = re.sub(r"[^A-Za-z0-9_.-]+", "_", scope).strip("._") or "default"
         self._dir = os.path.join(str(sync_dir), _shared_run_id(run_id), scope)
@@ -94,26 +70,15 @@ class CheckpointWeightSync(FullWeightSync):
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def sync(self) -> None:
-        """Publish the full weights to a file and load it into the local engine.
-
-        Runs on every train rank (``BROADCAST``). ``_iter_full_tensors`` all-gathers
-        each FSDP shard on every rank in lockstep, so all ranks must iterate; only
-        rank-0 keeps the materialized tensors and writes the file. The path is
-        deterministic from ``weight_version`` (incremented in lockstep on every
-        rank), so all ranks agree on it without a broadcast.
-        """
+        """Publish the full weights to a file and load it into the local engine."""
         import torch
 
-        version = int(self.weight_version)
+        version = self.version
         path = os.path.join(self._dir, f"weights_v{version}.pt")
         marker = path + ".ready"
 
         if self._my_rank == 0:
             os.makedirs(self._dir, exist_ok=True)
-            # A restarted actor can reuse the same version inside the same Ray
-            # job. Remove that version's stale publication before the first FSDP
-            # all-gather; the collective then keeps every rank from reaching the
-            # marker wait until this cleanup has happened.
             for stale in (path, path + ".tmp", marker, marker + ".tmp"):
                 try:
                     os.remove(stale)
@@ -129,28 +94,22 @@ class CheckpointWeightSync(FullWeightSync):
         if self._my_rank == 0:
             tmp = path + ".tmp"
             torch.save(state_dict, tmp)
-            os.replace(tmp, path)  # atomic publish
+            os.replace(tmp, path)
             marker_tmp = marker + ".tmp"
             with open(marker_tmp, "w") as fh:
                 fh.write(f"version={version}\npath={path}\n")
-            os.replace(marker_tmp, marker)  # marker becomes visible atomically
+            os.replace(marker_tmp, marker)
             del state_dict
 
         self._wait_for_marker(marker, path)
         self._rollout.update_weights_from_path(path, track_prefix=self._track_prefix)
 
-        self.weight_version += 1
+        self.version += 1
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
     def _cleanup_old_versions(self, publishing_version: int) -> None:
-        """Keep only the version being published and the last good fallback.
-
-        Cleanup runs at the *next* sync, after the previous driver-level
-        BROADCAST completed and after rollout ``wake_up`` consumed its cached
-        checkpoint. Retaining ``publishing_version - 1`` keeps wake fail-closed
-        if the new publication/load fails partway through.
-        """
+        """Keep only the version being published and the last good fallback."""
         keep = {publishing_version, max(0, publishing_version - 1)}
         pattern = re.compile(r"^weights_v(\d+)\.pt(?:\..*)?$")
         try:
@@ -182,8 +141,6 @@ class CheckpointWeightSync(FullWeightSync):
         if self._my_rank != 0:
             return
         shutil.rmtree(self._dir, ignore_errors=True)
-        # Remove now-empty scope/run/root directories without touching siblings
-        # belonging to another bridge or concurrent Ray job.
         parent = os.path.dirname(self._dir)
         root = os.path.dirname(parent)
         for directory in (parent, root):

@@ -1,49 +1,32 @@
-"""
-Data source implementations for GRPO training.
-
-The default data-source contract is prompt-first:
-- prompts plus optional typed media references and metadata for rollout/eval input
-
-Runtime prompt embeddings are produced inside rollout engines and training
-pipelines, not provided by the external dataset.
-"""
+"""Data source implementations for GRPO training."""
 
 import logging
 import os
-from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
+from collections import Counter
+from functools import partial
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, cast
 
 import torch
 from torch.utils.data import DataLoader
 
-from unirl.types.primitives import Images, Texts, Videos
-from unirl.types.prompts import RolloutInputs
+from unirl.types.media import MediaRef, MediaRefs
+from unirl.types.primitives import Image, Images, Texts, Videos
+from unirl.types.sample import Part, PrimitiveMap, Sample
+from unirl.utils.video import load_video
 
 from .datasets import PromptExampleDataset, TextPromptDataset, normalize_prompt_example
 
 logger = logging.getLogger(__name__)
 
 
-def _load_condition_images(media_refs: List[Any]) -> Optional[List[Any]]:
-    """Load ``(modality="image", role="condition")`` media refs into ``Image``.
-
-    Returns a per-prompt list of ``Image`` (or ``None`` for prompts that
-    carry no condition image), or ``None`` when no prompt in the batch
-    has a condition image — letting the caller omit the ``images`` key
-    from the collated batch entirely.
-
-    Raises ``ValueError`` if any prompt carries more than one condition
-    image (WAN I2V is single-frame conditioned).
-    """
-    if not media_refs:
+def _load_condition_images(media_refs: List[Any]) -> Optional[List[Image]]:
+    """Load ``(modality="image", role="condition")`` media refs into ``Image``."""
+    if not media_refs or not any(media_refs):
         return None
-    # Local imports keep PIL / torchvision off the import path for
-    # text-only training runs that never touch this code.
     import PIL.Image
     import torchvision.transforms.functional as TF
 
-    from unirl.types.primitives import Image as PrimImage
-
-    images_per_prompt: List[Any] = []
+    images_per_prompt: List[Optional[Image]] = []
     any_loaded = False
     for refs in media_refs:
         selected = [
@@ -55,29 +38,27 @@ def _load_condition_images(media_refs: List[Any]) -> Optional[List[Any]]:
             images_per_prompt.append(None)
             continue
         if len(selected) > 1:
-            raise ValueError(f"WAN I2V expects <=1 (image, condition) MediaRef per prompt, got {len(selected)}")
+            raise ValueError(f"Expected at most one condition image per prompt, got {len(selected)}")
         pil = PIL.Image.open(selected[0].uri).convert("RGB")
-        tensor = TF.to_tensor(pil)  # [3, H, W] in [0, 1]
-        images_per_prompt.append(PrimImage(pixels=tensor))
+        tensor = TF.to_tensor(pil)
+        images_per_prompt.append(Image(pixels=tensor))
         any_loaded = True
 
     if not any_loaded:
         return None
-    return images_per_prompt
+    missing = [index for index, image in enumerate(images_per_prompt) if image is None]
+    if missing:
+        raise ValueError(
+            f"Condition-image batch is incomplete: {len(missing)}/{len(images_per_prompt)} "
+            f"prompts are missing an image (e.g. prompt index {missing[0]})."
+        )
+    return cast(List[Image], images_per_prompt)
 
 
 def _load_condition_videos(media_refs: List[Any]) -> Optional[List[Any]]:
-    """Load ``(modality="video", role="condition")`` media refs into ``Video``.
-
-    Returns a per-prompt list of ``Video`` (or ``None`` for prompts that carry
-    no condition video), or ``None`` when no prompt in the batch has a
-    condition video. WAN V2V consumes one reference video per prompt.
-    """
-    if not media_refs:
+    """Load ``(modality="video", role="condition")`` media refs into ``Video``."""
+    if not media_refs or not any(media_refs):
         return None
-    # Local imports keep video IO dependencies off text/image-only runs.
-    import torchvision.io
-
     from unirl.types.primitives import Video as PrimVideo
 
     videos_per_prompt: List[Any] = []
@@ -94,30 +75,7 @@ def _load_condition_videos(media_refs: List[Any]) -> Optional[List[Any]]:
         if len(selected) > 1:
             raise ValueError(f"WAN V2V expects <=1 (video, condition) MediaRef per prompt, got {len(selected)}")
 
-        uri = selected[0].uri
-        if str(uri).endswith((".pt", ".pth")):
-            # weights_only=True blocks arbitrary code execution from a crafted
-            # manifest pointing at an untrusted .pt (condition videos are plain tensors).
-            frames = torch.load(uri, map_location="cpu", weights_only=True)
-        elif str(uri).endswith((".npy", ".npz")):
-            import numpy as np
-
-            loaded = np.load(uri)
-            frames = loaded["frames"] if isinstance(loaded, np.lib.npyio.NpzFile) else loaded
-            frames = torch.as_tensor(frames)
-        else:
-            frames, _, _ = torchvision.io.read_video(uri, pts_unit="sec", output_format="TCHW")
-        if frames.numel() == 0:
-            raise ValueError(f"Condition video has no decoded frames: {uri}")
-        if frames.dtype == torch.uint8:
-            frames = frames.to(dtype=torch.float32).div_(255.0)
-        else:
-            frames = frames.to(dtype=torch.float32).clamp_(0.0, 1.0)
-        if int(frames.shape[1]) != 3:
-            raise ValueError(
-                f"WAN V2V expects RGB condition video frames [T, 3, H, W], got {tuple(frames.shape)} from {uri}"
-            )
-        videos_per_prompt.append(PrimVideo(frames=frames))
+        videos_per_prompt.append(PrimVideo(frames=load_video(selected[0].uri)))
         any_loaded = True
 
     if not any_loaded:
@@ -125,17 +83,15 @@ def _load_condition_videos(media_refs: List[Any]) -> Optional[List[Any]]:
     return videos_per_prompt
 
 
-def _validate_homogeneous_images(images: List[Any]) -> None:
-    """Reject batches where some prompts have condition images and others don't."""
-    populated = [img for img in images if img is not None]
-    if populated and len(populated) != len(images):
-        missing = [i for i, img in enumerate(images) if img is None]
-        raise ValueError(
-            f"Heterogeneous I2V batch — {len(missing)}/{len(images)} prompts "
-            f"are missing a condition image (e.g. prompt index {missing[0]}). "
-            f"Split into separate requests so each batch is either fully T2V or "
-            f"fully I2V; per-sample channel-concat is not supported."
-        )
+def _validate_video_media_roles(media_refs: List[Any]) -> None:
+    roles = {
+        getattr(ref, "role", None)
+        for refs in media_refs
+        for ref in (refs or [])
+        if getattr(ref, "modality", None) == "video"
+    }
+    if "condition" in roles and "prompt" in roles:
+        raise ValueError("A batch cannot mix (video, condition) and (video, prompt) MediaRefs.")
 
 
 def _validate_homogeneous_videos(videos: List[Any]) -> None:
@@ -150,24 +106,57 @@ def _validate_homogeneous_videos(videos: List[Any]) -> None:
         )
 
 
-_SUPPORTED_MEDIA_REF_ROLES: Set[Tuple[str, str]] = {("image", "condition"), ("video", "condition")}
+_SUPPORTED_MEDIA_REF_ROLES: Set[Tuple[str, str]] = {
+    ("image", "condition"),
+    ("image", "prompt"),
+    ("video", "condition"),
+    ("audio", "prompt"),
+    ("video", "prompt"),
+}
+
+
+def _dataset_metadata(items: List[Dict[str, Any]], *, context: str) -> List[Optional[Dict[str, Any]]]:
+    """Keep dataset/reward metadata separate from typed model inputs."""
+    values: List[Optional[Dict[str, Any]]] = []
+    for row, item in enumerate(items):
+        metadata = item.get("metadata")
+        if isinstance(metadata, dict) and "_media_refs" in metadata:
+            raise ValueError(
+                f"{context}: metadata['_media_refs'] is no longer a model-input channel "
+                f"(row {row}); use the dataset media/media_refs field."
+            )
+        values.append(metadata)
+    return values
+
+
+def _prompt_media_primitive(
+    media_refs: List[Any],
+    *,
+    context: str,
+) -> Optional[MediaRefs]:
+    """Build a batch-aligned sparse prompt-media primitive."""
+    rows: List[List[MediaRef]] = []
+    any_prompt_media = False
+    for row, refs in enumerate(media_refs):
+        selected = [ref for ref in (refs or []) if getattr(ref, "role", None) == "prompt"]
+        typed: List[MediaRef] = []
+        for ref in selected:
+            if isinstance(ref, MediaRef):
+                typed.append(ref)
+                continue
+            modality = getattr(ref, "modality", None)
+            uri = getattr(ref, "uri", None)
+            try:
+                typed.append(MediaRef(modality=modality, role="prompt", uri=uri))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{context}: prompt {row} invalid media ref: {exc}") from exc
+        rows.append(typed)
+        any_prompt_media = any_prompt_media or bool(typed)
+    return MediaRefs.from_rows(rows) if any_prompt_media else None
 
 
 def _reject_unsupported_media_refs(batch: Dict[str, Any], *, context: str) -> None:
-    """Fail loud when a dataset hands unsupported media_refs to the driver.
-
-    The ``media_refs`` channel carries a ``MediaRef(uri, modality, role)``
-    URI list. The driver consumes the ``(image, condition)`` (modality,
-    role) pair via :func:`_load_condition_images`
-    → ``RolloutInputs.primitives['image']: Images``;
-    all other (modality, role) combinations are not yet typed and
-    would be silently dropped (degrading I2V/V2V/text-conditioned jobs
-    into a misconfigured run).
-
-    Supported set: see :data:`_SUPPORTED_MEDIA_REF_ROLES`. Anything else
-    raises ``NotImplementedError`` with a per-prompt index of the first
-    offending entry so debugging is straightforward.
-    """
+    """Fail loud when a dataset hands unsupported media_refs to the driver."""
     refs = batch.get("media_refs")
     if not refs:
         return
@@ -175,6 +164,7 @@ def _reject_unsupported_media_refs(batch: Dict[str, Any], *, context: str) -> No
         raise TypeError(
             f"{context}: media_refs must be a list of per-prompt MediaRef lists, got {type(refs).__name__}."
         )
+    _validate_video_media_roles(refs)
     bad: List[Tuple[int, Any]] = []
     for i, per_prompt in enumerate(refs or []):
         for r in per_prompt or []:
@@ -186,52 +176,61 @@ def _reject_unsupported_media_refs(batch: Dict[str, Any], *, context: str) -> No
         return
     raise NotImplementedError(
         f"{context}: media_refs include {len(bad)} unsupported (modality, role) "
-        f"entries; the driver currently consumes only (image, condition) and (video, condition). "
+        f"entries; supported pairs are {sorted(_SUPPORTED_MEDIA_REF_ROLES)}. "
         f"First bad entry: prompt={bad[0][0]}, ref={bad[0][1]!r}."
     )
 
 
+def _input_sample(
+    primitives: PrimitiveMap,
+    *,
+    sample_ids: List[str],
+    metadata: Optional[List[Optional[Dict[str, Any]]]] = None,
+) -> Sample:
+    """Build the data-source request as a text-rooted input Part chain."""
+    if len(set(sample_ids)) != len(sample_ids):
+        duplicates = sorted(sample_id for sample_id, count in Counter(sample_ids).items() if count > 1)
+        raise ValueError(f"Data-source input requires unique root sample_ids; duplicates: {duplicates[:3]}")
+    if metadata is not None and len(metadata) != len(sample_ids):
+        raise ValueError(f"Data-source metadata count {len(metadata)} != sample_ids count {len(sample_ids)}.")
+    text = primitives.get("text")
+    if not isinstance(text, Texts):
+        raise TypeError(f"Data-source input requires a Texts root, got {type(text).__name__}.")
+    unsupported = set(primitives) - {"text", "image", "video", "media"}
+    if unsupported:
+        raise ValueError(f"Data-source input has unsupported primitive keys: {sorted(unsupported)}")
+
+    root = Part.input(sample_ids, primitives={"text": text}, metadata=metadata)
+    parts = [root]
+    parent = root
+    for key in ("image", "video", "media"):
+        primitive = primitives.get(key)
+        if primitive is None:
+            continue
+        parent = parent.input_child({key: primitive})
+        parts.append(parent)
+    return Sample.request(*parts)
+
+
 class MultimodalRLDataSource:
-    """
-    Multimodal runtime data source for RL training.
-
-    This layer owns run-time example ordering, batching, and train/eval source
-    selection. Dataset implementations stay responsible for loading indexed
-    examples from storage.
-
-    Accepted user-facing formats:
-    - JSON/TXT/JSONL prompt datasets
-    - JSON manifests with ``prompt`` or ``caption`` plus optional ``media``
-      references and extra metadata
-    """
+    """Multimodal runtime data source for RL training."""
 
     def __init__(self, args):
-        """
-        Initialize data source from arguments.
-
-        Args:
-            args: Hydra ``cfg`` (DictConfig) with:
-                - run.data_path: Path to data file (JSON, JSONL, or TXT)
-                - run.seed: Random seed
-                - algorithm.prompts_per_rollout: Batch size
-        """
+        """Initialize data source from arguments."""
         self.args = args
         self.data_path = args.run.data_path
         self.eval_data_path = args.run.eval_data_path
         self.seed = args.run.seed
+        self.shuffle = bool(getattr(args.run, "shuffle", True))
         self.prompts_per_rollout = int(args.algorithm.prompts_per_rollout)
         self.drop_last = True
 
-        # Training data and eval data are treated as separate prompt sources.
         self.train_dataset = None
         self.eval_dataset = None
         self._dataloader = None
         self._iter: Optional[Iterator] = None
         self._eval_dataset_ready = False
         self._shuffle_generator = torch.Generator()
-        # ``self.seed`` may be None (run.seed=null) — torch.Generator needs an
-        # int, so draw from OS entropy. Per-process shuffle order then becomes
-        # non-reproducible, matching the seed=null contract.
         if self.seed is None:
             _shuffle_seed = int.from_bytes(os.urandom(8), "big") & 0x7FFFFFFF
         else:
@@ -304,20 +303,21 @@ class MultimodalRLDataSource:
                 f"prompts_per_rollout={self.prompts_per_rollout})."
             )
 
+        should_shuffle = sampler is None and self.shuffle
         self._dataloader = DataLoader(
             self.train_dataset,
             batch_size=self.prompts_per_rollout,
             sampler=sampler,
-            shuffle=(sampler is None),  # Only shuffle if not using custom sampler
-            generator=self._shuffle_generator if sampler is None else None,
-            num_workers=0,  # Keep simple for Ray
+            shuffle=should_shuffle,
+            generator=self._shuffle_generator if should_shuffle else None,
+            num_workers=0,
             collate_fn=self._collate_text,
             drop_last=True,
         )
 
         self._iter = iter(self._dataloader)
 
-    def _collate_text(self, batch: List[Dict[str, Any]]) -> RolloutInputs:
+    def _collate_text(self, batch: List[Dict[str, Any]]) -> Sample:
         """Collate function for text prompt dataset."""
         prompts = [item["prompt"] for item in batch]
         prompt_ids = self._resolve_prompt_ids(batch)
@@ -330,21 +330,18 @@ class MultimodalRLDataSource:
         primitives: Dict[str, Any] = {"text": Texts(texts=prompts)}
         images = _load_condition_images(media_refs)
         if images is not None:
-            _validate_homogeneous_images(images)
-            primitives["image"] = Images.from_list([img for img in images if img is not None])
-        videos = _load_condition_videos(media_refs)
-        if videos is not None:
-            _validate_homogeneous_videos(videos)
-            primitives["video"] = Videos.from_list([vid for vid in videos if vid is not None])
+            primitives["image"] = Images.from_list(images)
+        condition_videos = _load_condition_videos(media_refs)
+        if condition_videos is not None:
+            _validate_homogeneous_videos(condition_videos)
+            primitives["video"] = Videos.from_list([video for video in condition_videos if video is not None])
+        prompt_media = _prompt_media_primitive(media_refs, context="MultimodalRLDataSource._collate_text")
+        if prompt_media is not None:
+            primitives["media"] = prompt_media
 
-        metadata_list = [item.get("metadata") for item in batch]
+        metadata_list = _dataset_metadata(batch, context="MultimodalRLDataSource._collate_text")
 
-        return RolloutInputs(
-            primitives=primitives,
-            sample_ids=sample_ids,
-            group_ids=list(prompt_ids),
-            metadata=metadata_list,
-        )
+        return _input_sample(primitives, sample_ids=sample_ids, metadata=metadata_list)
 
     @property
     def num_prompts(self) -> int:
@@ -353,8 +350,8 @@ class MultimodalRLDataSource:
             return len(self.train_dataset)
         return 0
 
-    def _prompt_examples_to_batch(self, prompt_examples: List[Dict[str, Any]]) -> RolloutInputs:
-        """Convert normalized prompt examples into a RolloutInputs."""
+    def _prompt_examples_to_batch(self, prompt_examples: List[Dict[str, Any]]) -> Sample:
+        """Convert normalized prompt examples into an input-only ``Sample``."""
         prompts = [item["prompt"] for item in prompt_examples]
         prompt_ids = self._resolve_prompt_ids(prompt_examples)
         sample_ids = [f"prompt:{pid}:sample:0" for pid in prompt_ids]
@@ -368,21 +365,18 @@ class MultimodalRLDataSource:
         primitives: Dict[str, Any] = {"text": Texts(texts=prompts)}
         images = _load_condition_images(media_refs)
         if images is not None:
-            _validate_homogeneous_images(images)
-            primitives["image"] = Images.from_list([img for img in images if img is not None])
-        videos = _load_condition_videos(media_refs)
-        if videos is not None:
-            _validate_homogeneous_videos(videos)
-            primitives["video"] = Videos.from_list([vid for vid in videos if vid is not None])
+            primitives["image"] = Images.from_list(images)
+        condition_videos = _load_condition_videos(media_refs)
+        if condition_videos is not None:
+            _validate_homogeneous_videos(condition_videos)
+            primitives["video"] = Videos.from_list([video for video in condition_videos if video is not None])
+        prompt_media = _prompt_media_primitive(media_refs, context="MultimodalRLDataSource._prompt_examples_to_batch")
+        if prompt_media is not None:
+            primitives["media"] = prompt_media
 
-        metadata_list = [item.get("metadata") for item in prompt_examples]
+        metadata_list = _dataset_metadata(prompt_examples, context="MultimodalRLDataSource._prompt_examples_to_batch")
 
-        return RolloutInputs(
-            primitives=primitives,
-            sample_ids=sample_ids,
-            group_ids=list(prompt_ids),
-            metadata=metadata_list,
-        )
+        return _input_sample(primitives, sample_ids=sample_ids, metadata=metadata_list)
 
     def _resolve_prompt_ids(self, prompt_examples: List[Dict[str, Any]]) -> List[str]:
         """Resolve deterministic prompt IDs even if a dataset forgot to provide them."""
@@ -395,15 +389,14 @@ class MultimodalRLDataSource:
                 prompt_ids.append(str(prompt_id))
         return prompt_ids
 
-    def get_samples(self, batch_size: int) -> RolloutInputs:
-        """Get next batch of samples as a typed ``RolloutInputs``."""
+    def get_samples(self, batch_size: int) -> Sample:
+        """Get the next batch as an input-only request ``Sample``."""
         if self._iter is None:
             raise RuntimeError("MultimodalRLDataSource is not initialized. Training DataLoader is unavailable.")
 
         try:
             batch = next(self._iter)
         except StopIteration:
-            # Reset iterator
             self._iter = iter(self._dataloader)
             batch = next(self._iter)
 
@@ -414,21 +407,8 @@ class MultimodalRLDataSource:
         batch_size: int,
         *,
         eval_num_prompts: int = -1,
-    ) -> Iterator[RolloutInputs]:
-        """Yield the evaluation prompt source in deterministic batches.
-
-        Args:
-            batch_size: number of prompts per yielded batch. ``batch_size <= 0``
-                yields nothing (safer than clamping to 1, which would silently
-                iterate the full dataset prompt-by-prompt).
-            eval_num_prompts: cap on total prompts iterated across all batches.
-                Sentinel encoding (matches the trainer's ``eval_num_prompts``
-                config knob):
-                  * ``-1`` (default, or any negative value) — full eval dataset.
-                  * ``0`` — yield nothing (explicit opt-out).
-                  * ``N > 0`` — first ``min(N, len(eval_dataset))`` prompts; the
-                    tail batch may be shorter than ``batch_size``.
-        """
+    ) -> Iterator[Sample]:
+        """Yield the evaluation prompt source in deterministic batches."""
         batch_size = int(batch_size)
         eval_num_prompts = int(eval_num_prompts)
         if batch_size <= 0 or eval_num_prompts == 0:
@@ -460,12 +440,8 @@ class MultimodalRLDataSource:
             ]
             yield self._prompt_examples_to_batch(prompt_examples)
 
-    def get_eval_samples(self, batch_size: int) -> RolloutInputs:
-        """Return the first eval batch (BC shim over :meth:`iter_eval_batches`).
-
-        ``batch_size <= 0`` returns an empty batch. Otherwise yields the first
-        deterministic batch of up to ``batch_size`` prompts.
-        """
+    def get_eval_samples(self, batch_size: int) -> Sample:
+        """Return the first eval batch (BC shim over :meth:`iter_eval_batches`)."""
         batch_size = int(batch_size)
         if batch_size <= 0:
             return self._prompt_examples_to_batch([])
@@ -475,24 +451,159 @@ class MultimodalRLDataSource:
         )
 
 
-class DefaultDataSource:
-    """
-    Default data source that returns simple prompts.
-
-    Used when no data_path is specified or as fallback.
-    """
+class MultiDomainRLDataSource:
+    """Round-robin multi-domain prompt source — one domain per rollout batch."""
 
     def __init__(self, args):
-        """
-        Initialize default data source.
+        run_cfg = args.run
+        entries = list(getattr(run_cfg, "domains", None) or [])
+        if not entries:
+            raise ValueError("MultiDomainRLDataSource requires args.run.domains (a non-empty list).")
 
-        Args:
-            args: Hydra ``cfg`` (DictConfig)
-        """
+        self.domains: List[Dict[str, Optional[str]]] = []
+        for entry in entries:
+            get = entry.get if hasattr(entry, "get") else lambda k, d=None: getattr(entry, k, d)
+            name, data_path, eval_data_path = get("name"), get("data_path"), get("eval_data_path")
+            if not name or not data_path:
+                raise ValueError(f"Each domain entry needs 'name' and 'data_path'; got {entry!r}.")
+            if not os.path.exists(str(data_path)):
+                raise FileNotFoundError(f"Domain {name!r} data_path not found: {data_path}")
+            if eval_data_path and not os.path.exists(str(eval_data_path)):
+                raise FileNotFoundError(f"Domain {name!r} eval_data_path not found: {eval_data_path}")
+            self.domains.append(
+                {
+                    "name": str(name),
+                    "data_path": str(data_path),
+                    "eval_data_path": str(eval_data_path) if eval_data_path else None,
+                }
+            )
+        names = [d["name"] for d in self.domains]
+        if len(set(names)) != len(names):
+            raise ValueError(f"Domain names must be unique, got {names}.")
+
+        self.seed = getattr(run_cfg, "seed", None)
+        self.prompts_per_rollout = int(args.algorithm.prompts_per_rollout)
+        self.drop_last = True
+
+        self._datasets: List[TextPromptDataset] = []
+        self._dataloaders: List[DataLoader] = []
+        self._iters: List[Iterator] = []
+        self._eval_datasets: Optional[List[TextPromptDataset]] = None
+        self._iter_counter = 0
+
+        for i, domain in enumerate(self.domains):
+            ds = TextPromptDataset(file_path=domain["data_path"])
+            if len(ds) < self.prompts_per_rollout:
+                raise ValueError(
+                    f"Domain {domain['name']!r} dataset is smaller than prompts_per_rollout, which "
+                    f"would produce an empty DataLoader with drop_last=True "
+                    f"(num_prompts={len(ds)}, prompts_per_rollout={self.prompts_per_rollout})."
+                )
+            # Per-domain generator offset by index; seed=None -> OS entropy
+            # (the base class's seed=null contract).
+            generator = torch.Generator()
+            if self.seed is None:
+                generator.manual_seed(int.from_bytes(os.urandom(8), "big") & 0x7FFFFFFF)
+            else:
+                generator.manual_seed(int(self.seed) + i)
+            loader = DataLoader(
+                ds,
+                batch_size=self.prompts_per_rollout,
+                shuffle=True,
+                generator=generator,
+                num_workers=0,  # Keep simple for Ray
+                collate_fn=partial(self._collate_domain, domain["name"]),
+                drop_last=True,
+            )
+            self._datasets.append(ds)
+            self._dataloaders.append(loader)
+            self._iters.append(iter(loader))
+            logger.info(
+                "MultiDomainRLDataSource: domain %r — %d prompts from %s",
+                domain["name"],
+                len(ds),
+                domain["data_path"],
+            )
+
+    def _domain_examples_to_batch(self, domain: str, examples: List[Dict[str, Any]], *, tag: str) -> Sample:
+        """Build a Sample from one domain's prompt examples, domain-stamped."""
+        if any(item.get("media_refs") for item in examples):
+            raise ValueError(
+                f"MultiDomainRLDataSource is text-prompt-only; domain {domain!r} has media_refs. "
+                "Extend it alongside MultimodalRLDataSource._collate_text when a recipe needs media."
+            )
+        prompts = [item["prompt"] for item in examples]
+        prompt_ids = []
+        for idx, item in enumerate(examples):
+            pid = item.get("prompt_id")
+            pid = f"{tag}:{idx}" if pid is None or not str(pid).strip() else str(pid)
+            # Domain prefix keeps ids unique across domains (the eval Sample
+            # concatenates all domains into one id namespace).
+            prompt_ids.append(f"{domain}:{pid}")
+        sample_ids = [f"prompt:{pid}:sample:0" for pid in prompt_ids]
+        metadata_list: List[Optional[Dict[str, Any]]] = []
+        for item in examples:
+            md = dict(item.get("metadata") or {})
+            md["domain"] = domain
+            metadata_list.append(md)
+        return _input_sample({"text": Texts(texts=prompts)}, sample_ids=sample_ids, metadata=metadata_list)
+
+    def _collate_domain(self, domain: str, batch: List[Dict[str, Any]]) -> Sample:
+        return self._domain_examples_to_batch(domain, batch, tag="train")
+
+    def get_samples(self, batch_size: int) -> Sample:
+        """Next single-domain batch; domains cycle in declaration order."""
+        idx = self._iter_counter % len(self.domains)
+        self._iter_counter += 1
+        try:
+            return next(self._iters[idx])
+        except StopIteration:
+            self._iters[idx] = iter(self._dataloaders[idx])
+            return next(self._iters[idx])
+
+    @property
+    def num_prompts(self) -> int:
+        return sum(len(ds) for ds in self._datasets)
+
+    def _ensure_eval_datasets(self) -> List[TextPromptDataset]:
+        if self._eval_datasets is None:
+            self._eval_datasets = [
+                TextPromptDataset(file_path=domain["eval_data_path"] or domain["data_path"]) for domain in self.domains
+            ]
+        return self._eval_datasets
+
+    def get_eval_samples(self, batch_size: int) -> Sample:
+        """One deterministic eval Sample of up to ``batch_size`` prompts."""
+        batch_size = int(batch_size)
+        if batch_size <= 0:
+            return self._domain_examples_to_batch(self.domains[0]["name"], [], tag="eval")
+        eval_datasets = self._ensure_eval_datasets()
+        per_domain, remainder = divmod(batch_size, len(self.domains))
+        batches: List[Sample] = []
+        for i, (domain, ds) in enumerate(zip(self.domains, eval_datasets)):
+            limit = min(per_domain + int(i < remainder), len(ds))
+            if limit <= 0:
+                continue
+            examples = [
+                normalize_prompt_example(ds.get_prompt_example(idx), default_prompt_id=f"eval:{idx}")
+                for idx in range(limit)
+            ]
+            batches.append(self._domain_examples_to_batch(domain["name"], examples, tag="eval"))
+        if not batches:
+            return self._domain_examples_to_batch(self.domains[0]["name"], [], tag="eval")
+        if len(batches) == 1:
+            return batches[0]
+        return Sample.concat(batches)
+
+
+class DefaultDataSource:
+    """Default data source that returns simple prompts."""
+
+    def __init__(self, args):
+        """Initialize default data source."""
         self.args = args
         self.drop_last = False
 
-        # Default prompts for different scenarios
         self.prompts = [
             "A beautiful sunset over the ocean",
             "A cat playing with a ball of yarn",
@@ -510,23 +621,21 @@ class DefaultDataSource:
     def num_prompts(self) -> int:
         return len(self.prompts)
 
-    def get_samples(self, batch_size: int) -> RolloutInputs:
+    def get_samples(self, batch_size: int) -> Sample:
         """Get next batch of prompts."""
         prompts = []
         for _ in range(batch_size):
             prompts.append(self.prompts[self._index % len(self.prompts)])
             self._index += 1
-        return RolloutInputs(
-            primitives={"text": Texts(texts=prompts)},
+        return _input_sample(
+            {"text": Texts(texts=prompts)},
             sample_ids=[f"prompt:{i}:sample:0" for i in range(len(prompts))],
-            group_ids=[f"prompt:{i}" for i in range(len(prompts))],
         )
 
-    def _prompts_to_inputs(self, prompts: List[str], *, offset: int = 0) -> RolloutInputs:
-        return RolloutInputs(
-            primitives={"text": Texts(texts=prompts)},
+    def _prompts_to_inputs(self, prompts: List[str], *, offset: int = 0) -> Sample:
+        return _input_sample(
+            {"text": Texts(texts=prompts)},
             sample_ids=[f"prompt:{offset + i}:sample:0" for i in range(len(prompts))],
-            group_ids=[f"prompt:{offset + i}" for i in range(len(prompts))],
         )
 
     def iter_eval_batches(
@@ -534,17 +643,8 @@ class DefaultDataSource:
         batch_size: int,
         *,
         eval_num_prompts: int = -1,
-    ) -> Iterator[RolloutInputs]:
-        """Yield the default eval prompts in deterministic batches.
-
-        Args:
-            batch_size: number of prompts per yielded batch. ``batch_size <= 0``
-                yields nothing.
-            eval_num_prompts: cap on total prompts iterated. Same sentinel
-                encoding as :meth:`MultimodalRLDataSource.iter_eval_batches`:
-                ``-1`` (default) = full list; ``0`` = empty; ``N > 0`` = first
-                ``min(N, len(self.prompts))``.
-        """
+    ) -> Iterator[Sample]:
+        """Yield the default eval prompts in deterministic batches."""
         batch_size = int(batch_size)
         eval_num_prompts = int(eval_num_prompts)
         if batch_size <= 0 or eval_num_prompts == 0:
@@ -555,7 +655,7 @@ class DefaultDataSource:
             end = min(start + batch_size, limit)
             yield self._prompts_to_inputs(self.prompts[start:end], offset=start)
 
-    def get_eval_samples(self, batch_size: int) -> RolloutInputs:
+    def get_eval_samples(self, batch_size: int) -> Sample:
         """Return the first eval batch (BC shim over :meth:`iter_eval_batches`)."""
         batch_size = int(batch_size)
         if batch_size <= 0:

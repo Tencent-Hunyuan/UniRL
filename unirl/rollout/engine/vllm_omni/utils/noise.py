@@ -1,56 +1,46 @@
-"""Driver-authoritative x_T packing for the single-stage DiT request builders.
-
-Shared verbatim by the ``sd35_t2i`` and ``t2v`` adapters (the HI3 shapes pack
-their recipe-only variant inline — their DiT latent shape is AR-dynamic, so a
-materialized tensor is rejected there).
-"""
+"""Driver-authoritative x_T packing for the single-stage DiT request builders."""
 
 from __future__ import annotations
 
 from typing import Any, Dict
 
-from unirl.types.rollout_req import RolloutReq
+from unirl.types.sample import Part
 
 
 def pack_initial_noise_extra_args(
     extra_args: Dict[str, Any],
-    req: RolloutReq,
+    gen_part: Part,
     diff_params: Any,
     *,
-    n_samples: int,
     caller: str,
 ) -> None:
-    """Pack the per-sample x_T (tensor or recipe) into ``extra_args`` in place.
-
-    - ``request_conditions['initial_latents']`` → a single ``[B, C, H, W]``
-      ``initial_noise_batch`` tensor; the worker pipeline's ``prepare_latents``
-      slices its row by request index. Sourced from a CONCAT field so it's
-      sliced correctly under multi-actor sharding.
-    - else ``req.init_noise_group_ids`` (+ ``init_noise_latent_shape``) → the
-      x_T RECIPE; the worker regenerates each gid's noise on CPU-fp32.
-
-    Batch-dim mismatches indicate an upstream slicing bug — fail fast here
-    instead of silently mis-slicing inside the worker.
-    """
-    initial_latent_cond = (req.request_conditions or {}).get("initial_latents")
-    if initial_latent_cond is not None:
-        initial_noise = initial_latent_cond.latents
-        if int(initial_noise.shape[0]) != n_samples:
+    """Pack the per-sample x_T — a ``[B, C, H, W]`` ``initial_noise_batch`` tensor or a recipe — into ``extra_args``."""
+    n_samples = len(gen_part.sample_ids)
+    if bool(getattr(diff_params, "disable_driver_xt", False)):
+        return
+    seg = gen_part.segment
+    initial_latents = getattr(seg, "initial_latents", None) if seg is not None else None
+    if initial_latents is not None:
+        if int(initial_latents.shape[0]) != n_samples:
             raise RuntimeError(
-                f"{caller}: initial_latents.shape[0]={int(initial_noise.shape[0])} "
-                f"!= sample count {n_samples} after sharding."
+                f"{caller}: initial_latents.shape[0]={int(initial_latents.shape[0])} "
+                f"!= diffusion sample count {n_samples} after sharding."
             )
-        # Tensor stays on whatever device the caller left it (typically CPU);
-        # the worker pipeline does the device move inside ``prepare_latents``.
-        extra_args["initial_noise_batch"] = initial_noise
-    elif req.init_noise_group_ids and req.init_noise_latent_shape:
-        if len(req.init_noise_group_ids) != n_samples:
-            raise RuntimeError(
-                f"{caller}: init_noise_group_ids len {len(req.init_noise_group_ids)} "
-                f"!= sample count {n_samples} after sharding."
-            )
-        extra_args["init_noise_group_ids"] = [str(g) for g in req.init_noise_group_ids]
-        extra_args["init_noise_latent_shape"] = [int(x) for x in req.init_noise_latent_shape]
+        extra_args["initial_noise_batch"] = initial_latents
+    elif diff_params.init_noise_latent_shape:
+        explicit_keys = list(getattr(gen_part, "init_noise_group_ids", []) or [])
+        if explicit_keys:
+            if len(explicit_keys) != n_samples:
+                raise RuntimeError(
+                    f"{caller}: init_noise_group_ids count {len(explicit_keys)} "
+                    f"!= diffusion sample count {n_samples} after sharding."
+                )
+            keys = explicit_keys
+        else:
+            share = bool(getattr(diff_params, "init_same_noise", False))
+            keys = gen_part.group_ids if share else list(gen_part.sample_ids)
+        extra_args["init_noise_group_ids"] = [str(k) for k in keys]
+        extra_args["init_noise_latent_shape"] = [int(x) for x in diff_params.init_noise_latent_shape]
         extra_args["init_noise_seed"] = int(diff_params.seed) if getattr(diff_params, "seed", None) is not None else 0
 
 

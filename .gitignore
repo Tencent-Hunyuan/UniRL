@@ -56,6 +56,10 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+!unirl/rollout/env/
+!unirl/rollout/env/**/
+!unirl/rollout/env/**/*.py
+!unirl/rollout/env/**/*.md
 
 # Jupyter / notebooks
 .ipynb_checkpoints/
@@ -72,10 +76,32 @@ local/
 *.pkl
 *.log
 
-# Datasets: keep the committed pickscore prompts, ignore other (local-only) datasets
-datasets/*
-!datasets/pickscore
-!datasets/geneval2
+# Datasets: converter code, guides, and committed prompt sets are tracked;
+# everything else under datasets/ is downloaded or generated and stays local.
+# Keyed on file type rather than on dataset name, so adding a new
+# datasets/<name>/ needs no entry here, and a converter whose --out-dir points
+# inside datasets/ (several guides cook that way) cannot leak a cooked dataset
+# into the tree.
+datasets/**
+!datasets/**/
+!datasets/**/*.py
+!datasets/**/*.md
+
+# Committed prompt sets: small versioned inputs, not generated data. Committing
+# data is the one case that should need an explicit decision here.
+!datasets/geneval/*.jsonl
+!datasets/geneval2/synthetic/*.jsonl
+!datasets/image_edit/*.jsonl
+!datasets/ocr/*.txt
+!datasets/pickscore/*.txt
+
+# Downloaded snapshots and cooked outputs, whatever they happen to contain --
+# last, so the code re-includes above do not reach inside them.
+datasets/**/raw/
+datasets/**/processed/
+
+# Default --out-dir of the datasets/ converters
+/data/
 
 # Large model artifacts (defense-in-depth)
 models/**/*.bin
@@ -104,3 +130,7 @@ benchmarks/image/dpg_bench/data/
 benchmarks/text/aime/data/aime2025.jsonl
 benchmarks/text/gpqa/data/
 benchmarks_results/
+
+# Private experimental packages (dirs or stray files) stay local-only
+# (the tier is also not packaged).
+experimental/private_*

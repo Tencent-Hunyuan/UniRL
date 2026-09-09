@@ -29,7 +29,7 @@ knows nothing about DTensor sharding or wrap topology.
 
 ## How it works
 
-- **`FSDPBackend`** (`backend/fsdp.py`) holds the FSDP2-wrapped module
+- **`FSDPBackend`** (`backend/fsdp/backend.py`) holds the FSDP2-wrapped module
   (`bundle.<trainable_attr>`, default `transformer`), the optimizer, scheduler, and
   EMA (when configured). Structural injection (`inject_lora` / `inject_nft` /
   `inject_mirror`) happens once at construction, *before* `fsdp_wrap`.
@@ -40,18 +40,21 @@ knows nothing about DTensor sharding or wrap topology.
   `train_track`: move the segment onto device → `prepare_segment` (freeze π_old
   once) → `num_updates_per_batch` optimizer steps over disjoint mini-batches, each a
   micro-batch loop of `compute_loss_and_backward`. The mini/micro slicing comes from
-  one source, `_optimizer_step_slices`, shared with `prepare_segment` — so when an
-  algorithm replays its anchor, it's recomputed at the *exact* geometry training
-  uses, which is what pins the on-policy PPO ratio to 1 under bf16's batch-shape
-  sensitivity.
+  one source — the injected `micro_planner` (`stack/planner/`; `CountPlanner` by
+  default, `TokenBudgetPlanner` for token packing) — shared with `prepare_segment`,
+  so when an algorithm replays its anchor, it's recomputed at the *exact* geometry
+  training uses, which is what pins the on-policy PPO ratio to 1 under bf16's
+  batch-shape sensitivity. `AgenticTrainer` uses the same interface after
+  concatenating every successful trajectory's generated assistant turns.
 - **`UnifiedModelTrainStack`** (`unified_model_stack.py`) drives two algorithms
   (`ar` + `image`) backward-accumulating into one shared optimizer step on one
   shared backbone (HunyuanImage3).
 
-**Extending it:** a new structural injection mode is an `inject_<mode>` in
-`inject.py` (called before `fsdp_wrap`) plus a config in `configs.py`; a new
-optimizer or LR schedule is a branch in `factories.py` plus fields on
-`OptimizerConfig`/`LrSchedulerConfig`; a multi-update-capable algorithm sets
+**Extending it:** a new structural injection mode is an `inject_<mode>` alongside
+`inject_lora` (`lora.py`) and `inject_nft` / `inject_mirror` (`ema.py`), called
+before `fsdp_wrap`, plus a config in `configs.py`; a new optimizer or LR schedule
+is a branch in `optim.py` plus fields on `OptimizerConfig` / `LrSchedulerConfig`
+in `backend/base.py`; a multi-update-capable algorithm sets
 `supports_multi_update = True` and declares `anchor_fields` (see
 `../algorithms/README.md`).
 
@@ -69,8 +72,20 @@ optimizer or LR schedule is a branch in `factories.py` plus fields on
   away (the policy drifts into a degenerate reward-hack). An fp32-loaded model gets an
   fp32 master for free; a bf16 load needs `master_dtype: fp32` set explicitly. The
   ctor never warns.
+- **The EP fused-expert layout registry is keyed by `config.model_type`, never by
+  parameter-name suffix** (`backend/veomni/ep/experts.py`). HunyuanImage3's fused
+  params end in `.experts.down_proj` too, but its `gate_and_up` halves are stored
+  swapped relative to Qwen3-MoE's `gate_up`, so a suffix match would silently hand
+  one model's packing semantics to another — today that only fails closed because
+  HI3's *other* suffix happens not to match. An `ExpertExportLayout` pairs a model
+  module's `is_fused_expert_param(name)` and
+  `iter_hf_expert_tensors(name, stacked)` operations; register it in
+  `_EXPERT_EXPORT_LAYOUTS_BY_MODEL_TYPE` to enable full-weight sync for that family.
+  Consumers outside `train/` take the transform from
+  `backend.expert_weight_export_transform()` — `distributed/weight_sync/` must not
+  import the layout (the core-dependency guard rejects it).
 - **Advantages are not computed here** — `train` raises if
-  `resp_track.advantages is None`; the trainer must call `compute_advantages` on the
+  `part.advantages is None`; the trainer must call `compute_advantages` on the
   full shard first.
 - **`fsdp_wrap` wraps *nothing* when no block class is discovered** — the warning
   says "root-only wrap" but `_enumerate_block_instances` returns `()`, so the
@@ -87,6 +102,16 @@ optimizer or LR schedule is a branch in `factories.py` plus fields on
   skips backward (an all-empty micro) while earlier ones ran, `TrainStack.train`
   raises instead of silently stepping on never-synced grads (which would also
   leak the stale accumulation into the next step's reduce-scatter).
+- **`fsdp_mode: no_shard` trades memory for the all-gather** — a `(world, 1)` mesh
+  leaves the full model on every rank, so no parameter bytes cross ranks and only
+  gradients are all-reduced (DDP). It pays off where the re-gathered bytes dwarf the
+  gradient (LoRA on a frozen base re-gathers the whole backbone *every* micro-batch)
+  and the model still fits unsharded — per-rank memory becomes the whole model +
+  grads + optimizer state. `reshard_after_forward` is **not** a no-op here: `false`
+  keeps every block's unsharded compute copy resident, which is a second full copy of
+  the model whenever `param_dtype` upcasts (fp32 compute over a bf16 checkpoint), so
+  leave it `true` unless that copy is cheap. `defer_grad_sync: true` then gives one
+  all-reduce per optimizer step. VeOmni only supports `full`.
 
 ## Profiling → Perfetto
 

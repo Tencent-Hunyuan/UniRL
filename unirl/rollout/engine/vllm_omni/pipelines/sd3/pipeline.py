@@ -1,33 +1,4 @@
-"""RL-aware StableDiffusion 3.5 pipeline subclass.
-
-``forward`` follows the RL interception protocol (see
-``pipelines/_shared/interception.py``): **install** (once) → **arm** (every
-request) → run (upstream) → **harvest**. The interceptions, mapped to
-upstream's stages (``vllm_omni/diffusion/models/sd3/pipeline_sd3.py:132``):
-
-- SDE scheduler swap (the behavior policy + dense-trajectory recorder) in
-  place of the upstream ``FlowMatchEulerDiscreteScheduler``, installed
-  regardless of eta: ``resp_to_samples`` requires ``segment.latents`` to be
-  non-empty, and only this scheduler captures the trajectory — at eta=0 the
-  SDE math stays dormant and it degenerates to pure Euler ODE.
-- A conditioning **tap** on ``encode_prompt``: captures ``prompt_embeds`` +
-  ``pooled_prompt_embeds`` for the trainer-side ``SD3Conditions.text``
-  (``SD3DiffusionStage.replay`` recomputes per-step log-probs in a separate
-  process and can't share the encoder).
-- An initial-noise **injection** through the ``prepare_latents`` override —
-  the driver-authored x_T (slice or recipe) replaces upstream's RNG draw.
-- A T5-truncation **workaround** (upstream defect carrier; delete when the
-  pin advances past the fix).
-
-Everything else — prompt encoding (CLIP-L + CLIP-G + T5), latent prep,
-dynamic-shift timestep build, the diffusion loop itself, VAE decode with
-shift_factor — is handled by upstream's ``forward`` at
-``pipeline_sd3.py:610-737``.
-
-This class is loaded inside vLLM-Omni's worker subprocess via
-``custom_pipeline_args.pipeline_class`` injected from
-``stage_configs/sd35_t2i_rl.yaml``.
-"""
+"""RL-aware StableDiffusion 3.5 pipeline subclass."""
 
 from __future__ import annotations
 
@@ -40,6 +11,7 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.sd3.pipeline_sd3 import StableDiffusion3Pipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 from unirl.rollout.engine.vllm_omni.pipelines._shared.flow_match_sde_scheduler import (
     FlowMatchSDEDiscreteScheduler,
@@ -47,60 +19,37 @@ from unirl.rollout.engine.vllm_omni.pipelines._shared.flow_match_sde_scheduler i
 from unirl.rollout.engine.vllm_omni.pipelines._shared.interception import (
     detach_cpu,
     drain_trajectory_into,
+    finalize_output,
     inject_latents,
     make_sde_scheduler,
     resolve_request_noise,
-    stamp_custom_output,
+    single_request,
+    stamp_capture,
 )
 
 
 class RLStableDiffusion3Pipeline(StableDiffusion3Pipeline):
     """SD3.5 pipeline with the RL interception protocol installed."""
 
+    # Upstream opts into request batching; RL rollout does not — see ``single_request``.
+    supports_request_batch = False
+
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         super().__init__(od_config=od_config, prefix=prefix)
-        # Upstream ``__init__`` constructs ``self.scheduler`` at
-        # ``pipeline_sd3.py:191``; stash it as the config donor for the SDE
-        # swap. We never swap back — our scheduler is installed for the
-        # lifetime of this pipeline instance.
         self._upstream_scheduler: FlowMatchEulerDiscreteScheduler = self.scheduler
-        # Conditioning-tap state: armed (reset) every request, filled by the
-        # tap's first call; the flag keeps the install idempotent.
         self._captured_conditioning: Optional[Dict[str, Any]] = None
         self._conditioning_tap_installed: bool = False
         self._t5_workaround_installed: bool = False
-        # Per-request x_T hand-off: armed every request, consumed once by the
-        # ``prepare_latents`` override. ``None`` = upstream RNG fires.
         self._pending_initial_noise: Optional[torch.Tensor] = None
 
-    # ------------------------------------------------------------------ #
-    # install — once per pipeline lifetime, idempotent
-    # ------------------------------------------------------------------ #
-
     def _install_sde_scheduler(self) -> None:
-        """Swap in the trajectory-capturing SDE scheduler (the from_config
-        path keeps dynamic shifting working — read by ``prepare_timesteps``
-        at ``pipeline_sd3.py:507``). SD3 has a single ``self.scheduler``
-        attribute; a plain reassignment is sufficient. Always installed,
-        even for eta=0 flows (NFT) — per-request eta rides ``_arm_sde``."""
+        """Swap in the trajectory-capturing SDE scheduler via ``from_config``; always installed, even at eta=0."""
         if isinstance(self.scheduler, FlowMatchSDEDiscreteScheduler):
             return
         self.scheduler = make_sde_scheduler(self._upstream_scheduler.config)
 
     def _install_conditioning_tap(self) -> None:
-        """Wrap ``encode_prompt`` to capture the text conditioning.
-
-        First-call-only per request: the tap writes ``_captured_conditioning``
-        only while it's ``None`` (re-armed each ``forward``), i.e. the
-        positive-prompt encode; upstream's possible second call for CFG
-        negatives is observed but not recorded.
-
-        Upstream returns ``(prompt_embeds, pooled_prompt_embeds)``
-        (``pipeline_sd3.py:418``). Both are needed: ``prompt_embeds`` is the
-        joint CLIP-L+CLIP-G+T5 sequence ([B, L, D]) used as cross-attn K/V on
-        the DiT; ``pooled_prompt_embeds`` ([B, D_pooled]) feeds the AdaLN
-        modulation.
-        """
+        """Capture ``encode_prompt``: joint ``[B, L, D]`` for cross-attn, pooled ``[B, D_pooled]`` for AdaLN."""
         if self._conditioning_tap_installed:
             return
 
@@ -121,15 +70,7 @@ class RLStableDiffusion3Pipeline(StableDiffusion3Pipeline):
         self._conditioning_tap_installed = True
 
     def _install_t5_truncation_workaround(self) -> None:
-        """WORKAROUND: replace ``_get_t5_prompt_embeds`` to skip a
-        cross-device warning check.
-
-        Upstream builds the truncated token ids on ``self.device`` but leaves
-        the untruncated ids on CPU before calling ``torch.equal`` for a
-        truncation warning. The warning path is only informational and can
-        crash long-prompt rollouts; this drops that branch while preserving
-        the embedding path. Delete once upstream fixes the device handling.
-        """
+        """WORKAROUND: replace ``_get_t5_prompt_embeds`` to skip a cross-device warning check."""
         if self._t5_workaround_installed:
             return
 
@@ -180,10 +121,6 @@ class RLStableDiffusion3Pipeline(StableDiffusion3Pipeline):
         self._get_t5_prompt_embeds = patched_get_t5_prompt_embeds  # type: ignore[assignment]
         self._t5_workaround_installed = True
 
-    # ------------------------------------------------------------------ #
-    # arm — every request (stale-leak guards)
-    # ------------------------------------------------------------------ #
-
     def _arm_sde(self, req: OmniDiffusionRequest) -> None:
         """This request's SDE strength + sparse step gate."""
         eta = float(getattr(req.sampling_params, "eta", 0.0) or 0.0)
@@ -198,28 +135,16 @@ class RLStableDiffusion3Pipeline(StableDiffusion3Pipeline):
         """Fresh capture buffer so the tap records THIS request's first encode."""
         self._captured_conditioning = None
 
-    # ------------------------------------------------------------------ #
     # run-phase interception — upstream-called name, cannot be renamed
-    # ------------------------------------------------------------------ #
 
     def prepare_latents(self, *args, **kwargs):  # type: ignore[override]
-        """Initial-noise injection point: bypass upstream RNG when the driver
-        supplied an x_T. Upstream only calls ``randn_tensor`` when its
-        ``latents`` arg is ``None``; slotting our tensor in skips the draw
-        and leaves the body unchanged. (No diffusers-style
-        ``init_noise_sigma`` scaling — Flow-Match noise is unit-variance at
-        t=1, so the tensor IS the start-of-denoise state.) Consume-once:
-        a CFG-driven second call falls back to upstream behavior.
-        """
+        """Initial-noise injection point: bypass upstream RNG when the driver supplied an x_T."""
+        upstream = super().prepare_latents
         noise = self._pending_initial_noise
         if noise is not None:
-            args, kwargs = inject_latents(args, kwargs, noise)
+            args, kwargs = inject_latents(upstream, args, kwargs, noise)
             self._pending_initial_noise = None
-        return super().prepare_latents(*args, **kwargs)
-
-    # ------------------------------------------------------------------ #
-    # harvest — export onto the wire
-    # ------------------------------------------------------------------ #
+        return upstream(*args, **kwargs)
 
     def _harvest_trajectory(self, out: DiffusionOutput) -> None:
         if isinstance(self.scheduler, FlowMatchSDEDiscreteScheduler):
@@ -227,29 +152,26 @@ class RLStableDiffusion3Pipeline(StableDiffusion3Pipeline):
 
     def _harvest_conditioning(self, out: DiffusionOutput) -> None:
         if self._captured_conditioning is not None:
-            stamp_custom_output(out, "text_capture", self._captured_conditioning)
+            stamp_capture(out, "text_capture", self._captured_conditioning)
 
-    # ------------------------------------------------------------------ #
-    # the protocol
-    # ------------------------------------------------------------------ #
-
-    def forward(self, req: OmniDiffusionRequest, **kwargs) -> DiffusionOutput:
+    def forward(self, req: DiffusionRequestBatch, **kwargs) -> list[DiffusionOutput]:
+        """Single-request batch in, one-element list out."""
+        one = single_request(req, caller="RLStableDiffusion3Pipeline.forward")
         self._install_sde_scheduler()
         self._install_conditioning_tap()
         self._install_t5_truncation_workaround()
 
-        self._arm_sde(req)
-        self._arm_initial_noise(req)
+        self._arm_sde(one)
+        self._arm_initial_noise(one)
         self._arm_conditioning_tap()
 
-        # Delegate the entire denoise pipeline (prompt encoding, latent prep,
-        # timestep build, diffusion loop, VAE decode) to upstream; the
-        # installed tap/injector fire inside.
-        out = super().forward(req, **kwargs)
+        outs = super().forward(req, **kwargs)
 
+        out = outs[0]
         self._harvest_trajectory(out)
         self._harvest_conditioning(out)
-        return out
+        finalize_output(out)
+        return outs
 
 
 __all__ = ["RLStableDiffusion3Pipeline"]

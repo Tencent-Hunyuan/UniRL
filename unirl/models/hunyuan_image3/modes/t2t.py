@@ -1,18 +1,4 @@
-"""t2t — text-to-text autoregressive generation.
-
-Reads ``primitives["text"]: Texts`` and ``stage_params["ar"]: dict``
-(optional). Builds the chat-templated input tensors via
-``HunyuanImage3TextEmbedStage.embed_for_ar(...)`` (mode="gen_text"),
-then runs ``HunyuanImage3ARStage.autoregress`` against the backbone in
-``mode="gen_text"`` and detokenizes the resulting ``TextSegment`` back
-into a ``Texts`` primitive on the response.
-
-The bot_task knob (``"auto"`` / ``"image"`` / ``"think"`` /
-``"recaption"`` / ``"think_recaption"`` / ``"img_ratio"``) drives both
-chat-template splicing (in ``embed_for_ar``) and stop-token selection
-(via ``_stop_tokens_for_bot_task``). Stop-token sets mirror upstream
-``pipeline_hunyuan_image3.py:627-632``.
-"""
+"""t2t — text-to-text autoregressive generation."""
 
 from __future__ import annotations
 
@@ -21,8 +7,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from unirl.models.types.ar import ARSamplingParams
 from unirl.types.primitives import Texts
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp, RolloutTrack
+from unirl.types.sample import Sample
 
 from ..ar import HunyuanImage3ARParams
 from ..conditions import HunyuanImage3ARConditions
@@ -32,11 +17,6 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from ..pipeline import HunyuanImage3Pipeline
 
-# The upstream tokenizer's apply_chat_template asserts
-# ``bot_task in {"image", "auto", "think", "recaption", "img_ratio"}`` —
-# the composite presets must be mapped before any template call. Mirrors
-# vllm-omni ``pipeline_hunyuan_image3.py:1461-1465``. The ORIGINAL value
-# still drives stop-token selection and the params record.
 _TOKENIZER_BOT_TASKS = {"think_recaption": "think", "vanilla": "image"}
 
 
@@ -44,19 +24,21 @@ def _tokenizer_bot_task(bot_task: str) -> str:
     return _TOKENIZER_BOT_TASKS.get(bot_task, bot_task)
 
 
-def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
+def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
     """t2t — single AR-stage rollout, no diffusion."""
-    texts = req.primitives.get("text")
+    frontier = sample.frontier_gen_part(ARSamplingParams)
+    ar = frontier.sampling_params
+
+    conditioning = sample.conditioning()
+    texts = conditioning[0] if conditioning else None
     if not isinstance(texts, Texts):
         raise TypeError(
             f"HunyuanImage3Pipeline.generate (t2t): "
-            f"req.primitives['text'] must be Texts, "
+            f"prompt from sample.conditioning()[0] must be Texts, "
             f"got {type(texts).__name__ if texts is not None else 'None'}"
         )
 
-    # Build HunyuanImage3ARParams from typed sampling params + model-specific stage_config.
-    ar = req.sampling_params.get("ar")
-    model_cfg: Dict[str, Any] = dict(req.stage_config.get("ar") or {})
+    model_cfg: Dict[str, Any] = dict((sample.parts[0].control or {}).get("ar") or {})
     ar_params = HunyuanImage3ARParams(
         max_tokens=ar.max_new_tokens if ar is not None else model_cfg.get("max_tokens", 2048),
         temperature=ar.temperature if ar is not None else model_cfg.get("temperature", 0.6),
@@ -73,19 +55,11 @@ def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
     bot_task = str(ar_params.bot_task)
     tok_bot_task = _tokenizer_bot_task(bot_task)
 
-    # Resolve the system prompt. Mirrors upstream's
-    # ``HunyuanImage3ForCausalMM.generate_image`` flow: per-bot_task
-    # defaults under ``use_system_prompt='dynamic'``, an explicit string
-    # under ``use_system_prompt='custom'``, or one of the named presets.
-    # Uses the MAPPED bot_task — upstream get_system_prompt's ``dynamic``
-    # branch only knows {think, recaption, image}.
     system_prompt = _resolve_system_prompt(
         pipeline.bundle, tok_bot_task, ar_params.use_system_prompt, ar_params.system_prompt
     )
     system_prompt_list = [system_prompt] * len(texts.texts) if system_prompt is not None else None
 
-    # Build the unified-multimodal tensors via the chat-template wrapper.
-    # ``mm`` is ``{"fused": HunyuanImage3FusedMultimodalCondition, "tokenizer_output": Any}``.
     mm = pipeline.text_embed.embed_for_ar(
         texts,
         bot_task=tok_bot_task,
@@ -98,8 +72,6 @@ def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
         tokenizer_output=mm["tokenizer_output"],
     )
 
-    # Resolve stop tokens. Caller-supplied ``stop_token_ids`` wins; else
-    # we derive from ``bot_task`` against the bundle's tokenizer wrapper.
     stop_ids: List[int] = list(ar_params.stop_token_ids or [])
     if not stop_ids:
         stop_ids = _stop_tokens_for_bot_task(pipeline.bundle, bot_task)
@@ -124,37 +96,18 @@ def generate(pipeline: "HunyuanImage3Pipeline", req: RolloutReq) -> RolloutResp:
         taylor_cache_order=ar_params.taylor_cache_order,
     )
 
-    # text_seg.tokens: packed varlen [sum_lengths] long
-    # text_seg.cu_seqlens: [B+1] long
     text_seg = pipeline.ar.autoregress(ar_conds, sampling_params=sampling_params, params=ar_params_with_stops)
 
-    # Detokenize back to Texts for downstream reward / display consumption.
     decoded_texts = pipeline._detokenize_text_segment(text_seg)
 
-    return RolloutResp(
-        tracks={
-            "ar": RolloutTrack(
-                sample_ids=list(req.sample_ids),
-                parent_ids=list(req.group_ids),
-                conditions=ar_conds.to_dict(),
-                segment=text_seg,
-                decoded=decoded_texts,
-            ),
-        }
-    )
+    filled = frontier.fill(segment=text_seg, primitives={"text": decoded_texts}, conditions=ar_conds.to_dict())
+    return sample.with_parts([*sample.parts[:-1], filled])
 
 
 def _resolve_system_prompt(
     bundle, bot_task: str, use_system_prompt: Optional[str], system_prompt: Optional[str]
 ) -> Optional[str]:
-    """Mirror upstream ``get_system_prompt(sys_type, bot_task, system_prompt)``.
-
-    Reads ``use_system_prompt`` from the request (or falls back to the
-    bundle's gen_config default). ``custom`` -> use explicit
-    ``system_prompt`` arg. ``dynamic`` -> per-bot_task preset.
-    Named presets (``en_vanilla`` / ``en_recaption`` / ``en_think_recaption``)
-    -> static lookup. ``None`` -> no system prompt.
-    """
+    """Mirror upstream ``get_system_prompt(sys_type, bot_task, system_prompt)``."""
     import importlib
     import sys
 
@@ -164,10 +117,6 @@ def _resolve_system_prompt(
     if sys_type is None and gen_config is not None:
         sys_type = getattr(gen_config, "use_system_prompt", None)
 
-    # Resolve upstream's ``system_prompt`` module via a sibling import on
-    # the transformer's own module path. With ``trust_remote_code=True``
-    # the transformer lives under e.g. ``transformers_modules.<ckpt>.hunyuan``;
-    # the system_prompt.py is at ``transformers_modules.<ckpt>.system_prompt``.
     try:
         transformer_mod = sys.modules[type(transformer).__module__]
         package = transformer_mod.__package__ or transformer_mod.__name__.rsplit(".", 1)[0]
@@ -179,19 +128,10 @@ def _resolve_system_prompt(
 
 
 def _stop_tokens_for_bot_task(bundle, bot_task: str) -> List[int]:
-    """Mirror upstream's stop-token dict at
-    ``vllm-omni/.../pipeline_hunyuan_image3.py:627-632``.
-
-    Falls back to an empty list when the bundle has no usable tokenizer
-    wrapper (e.g. fake-bundle unit tests). Callers may seed
-    ``ar_params.stop_token_ids`` to override.
-    """
+    """Mirror upstream's stop-token dict at ``vllm-omni/.../pipeline_hunyuan_image3.py:627-632``."""
     transformer = bundle.transformer
     tkw = getattr(transformer, "_tkwrapper", None) or getattr(transformer, "_tokenizer", None)
     if tkw is None:
-        # Bundle hasn't had its tokenizer loaded yet (fake-bundle path
-        # or pre-prefill). Return empty -- ``autoregress`` then runs
-        # to ``max_tokens`` without an early stop.
         return []
 
     eos = getattr(tkw, "eos_token_id", None)
@@ -223,5 +163,4 @@ def _stop_tokens_for_bot_task(bundle, bot_task: str) -> List[int]:
         if extra_auto_stops:
             return extra_auto_stops
         return [int(boi)] if boi is not None else []
-    # Unknown bot_task -- fall back to eos.
     return [int(eos)] if eos is not None else []

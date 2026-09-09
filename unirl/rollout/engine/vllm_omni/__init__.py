@@ -1,16 +1,4 @@
-"""vLLM-Omni rollout engine.
-
-A thin engine core over one backend seam (``backends/`` — the only code that
-imports the vllm-omni runtime, boot included), with per-modality adapters
-(``adapters/`` — registry keyed on ``config.modality``, per-output-shape base
-adapters holding the conversion), a pure ``utils/`` bag, a ``WeightSync``
-component, typed self-reserved ports, and the worker-side role packages
-(``worker/`` / ``pipelines/`` / ``patches/``). Recipes select it by pointing
-their rollout ``_target_`` lines here.
-
-Imports are lazy: engine modules pull ``rollout.engine.base`` whose import
-chain is still initializing when reached from ``base → types → distributed``.
-"""
+"""vLLM-Omni rollout engine."""
 
 
 def __getattr__(name: str):

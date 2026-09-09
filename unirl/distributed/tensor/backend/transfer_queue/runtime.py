@@ -1,17 +1,4 @@
-"""Driver- and actor-side TransferQueue lifecycle.
-
-``TransferQueueRuntime`` owns the per-process state — the TQ client plus the
-driver-only ``Backend`` and ``TransferQueueController`` anchors — and exposes
-it as instance methods. Exactly one runtime is "current" per process; the
-``TQTransport`` wraps the client for the ``TensorTransport`` interface.
-
-The driver instantiates one runtime, calls ``install()`` to bind it as
-current, then ``init(cfg)`` to spawn the controller and bootstrap the
-backend. ``init`` returns the *(controller_handoff, actor_handoff)* tuple
-that flows over Ray RPC; both sides ultimately feed their handoff to
-``create_client``. Disabled = ``cfg.transfer_queue`` is absent — ``init``
-returns ``None`` and the runtime stays empty.
-"""
+"""Driver- and actor-side TransferQueue lifecycle."""
 
 from __future__ import annotations
 
@@ -45,11 +32,7 @@ def _get_local_ip() -> str:
 
 
 def _run_async_in_temp_loop(async_func: Callable[..., Any], *args, **kwargs) -> Any:
-    """Run a coroutine on a fresh background event loop.
-
-    Needed because the calling context (server mode) may already own an event
-    loop, and we can't reuse it for synchronous bridging.
-    """
+    """Run a coroutine on a fresh background event loop."""
     tmp_event_loop = asyncio.new_event_loop()
     thread = threading.Thread(
         target=tmp_event_loop.run_forever,
@@ -75,13 +58,7 @@ def _run_async_in_temp_loop(async_func: Callable[..., Any], *args, **kwargs) -> 
 
 
 class TransferQueueRuntime:
-    """Per-process owner of the TransferQueue client + driver-side anchors.
-
-    Exactly one runtime is "current" per process. ``current()`` returns it,
-    ``install()`` binds ``self`` as current, ``clear_current()`` unbinds.
-    On actors, ``backend`` and ``controller`` stay ``None``; on the driver,
-    ``init()`` populates them.
-    """
+    """Per-process owner of the TransferQueue client + driver-side anchors."""
 
     _current: "TransferQueueRuntime | None" = None
 
@@ -89,8 +66,6 @@ class TransferQueueRuntime:
         self.client: "AsyncTransferQueueClient | TransferQueueClient | None" = None
         self.backend: "Backend | None" = None
         self.controller: "ActorHandle | None" = None
-
-    # -- process-singleton plumbing ---------------------------------------
 
     @classmethod
     def current(cls) -> "TransferQueueRuntime | None":
@@ -109,22 +84,14 @@ class TransferQueueRuntime:
         """Unbind the process runtime (test/teardown helper)."""
         cls._current = None
 
-    # -- driver-side ------------------------------------------------------
-
     def init(self, cfg: DictConfig) -> "tuple[dict, dict] | None":
-        """Spawn controller + backend-side actors; return ``(controller, actor)`` handoffs.
-
-        Returns ``None`` when ``cfg.transfer_queue`` is absent (TQ disabled).
-        """
+        """Spawn controller + backend-side actors; return ``(controller, actor)`` handoffs."""
         tq_cfg = cfg.get("transfer_queue")
         if tq_cfg is None:
             return None
 
         from transfer_queue import TransferQueueController, process_zmq_server_info
 
-        # The `transfer_queue:` block is a standard Hydra _target_ config (the
-        # backend and its nested zero_copy both carry `_target_`), so instantiate
-        # it directly.
         self.backend = instantiate(tq_cfg)
         self.controller = TransferQueueController.remote()
         controller_info = process_zmq_server_info(self.controller)
@@ -141,17 +108,12 @@ class TransferQueueRuntime:
         ray.get(refs)
 
     def reset_actors_zero_copy_buffer_free(self, actors: list) -> None:
-        # Zero-copy buffer free-list reset is Mooncake-specific; skip it for
-        # other backends (e.g. the simple in-Ray storage backend has no such
-        # buffers, so the upstream reset call is meaningless there).
         if self.backend is None or self.backend.manager_type != "MooncakeStorageManager":
             return
         import ray
 
         refs = [actor.reset_zero_copy_buffer_free.remote() for actor in actors]
         ray.get(refs)
-
-    # -- per-process (driver and actor) -----------------------------------
 
     def create_client(
         self,
@@ -164,17 +126,10 @@ class TransferQueueRuntime:
         from transfer_queue import AsyncTransferQueueClient, TransferQueueClient
 
         if handoff.get("manager_type") == "MooncakeStorageManager":
-            # Mooncake binds to LOCAL_IP; otherwise it picks a random interface.
             local_ip = os.getenv("LOCAL_IP", _get_local_ip())
             os.environ["MC_TCP_BIND_ADDRESS"] = local_ip
             handoff["local_hostname"] = local_ip
 
-            # Per-process GPU↔HCA affinity. With this env flag set and a
-            # comma-list device_name, Mooncake's setup() picks the PIX-distance
-            # HCA from the active CUDA context. Without it, every client binds
-            # to the first listed bond regardless of GPU placement, causing
-            # `-800` on wrong-NUMA ranks once CUDA initializes.
-            # See LIN-186/docs/mooncake_-800_diagnosis.md (probe G6).
             os.environ["MC_ENABLE_DEST_DEVICE_AFFINITY"] = "1"
             if not handoff.get("device_name"):
                 from unirl.distributed.tensor.backend.transfer_queue.topology import list_rdma_bonds

@@ -1,11 +1,4 @@
-"""Payload helper for :class:`~unirl.distributed.weight_sync.lora.base.LoraWeightSyncBase`.
-
-``_peft_config_dict`` turns trainer-side state into a JSON/Ray-safe PEFT adapter
-config for the LoRA path (``set_lora_from_tensors``).
-
-Imported lazily from ``lora/base.py`` so the driver can reference the handler class
-for ``remote(...)`` without eagerly pulling torch.
-"""
+"""Payload helper for :class:`~unirl.distributed.weight_sync.lora.base.LoraWeightSyncBase`."""
 
 from __future__ import annotations
 

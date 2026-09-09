@@ -60,6 +60,9 @@ class BaseScorer(ABC):
     """
 
     name: str = ""
+    version: str = "1"
+    input_kind: str = "image"
+    supports_offload: bool = False
     sub_metric_names: tuple[str, ...] = ()
 
     @abstractmethod
@@ -85,3 +88,20 @@ class BaseScorer(ABC):
 
     def close(self) -> None:
         """Release heavy resources (model, vLLM engine). Default is a no-op."""
+
+    def onload(self) -> None:
+        """Optionally restore model device state before scoring."""
+
+    def offload(self) -> None:
+        """Optionally release model device state after draining."""
+
+    def drain(self) -> None:
+        """Optionally flush scorer-internal asynchronous work."""
+
+    def health(self) -> dict:
+        return {
+            "name": self.name,
+            "version": self.version,
+            "input_kind": self.input_kind,
+            "supports_offload": self.supports_offload,
+        }

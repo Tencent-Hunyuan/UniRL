@@ -1,34 +1,13 @@
-"""HunyuanImage3Pipeline — RolloutReq → RolloutResp dispatcher.
-
-Per-task generate logic lives in ``modes/<task>.py`` (one file each for
-``t2t``, ``i2t``, ``t2i``, ``it2i``, ``t2ti``). This module is a thin
-dispatcher:
-it instantiates / composes the shared stages (``Bundle``,
-``TextEmbedStage``, ``DiffusionStage``, ``ARStage``, ``VAEEncodeStage``,
-``VAEDecodeStage``, ``VitEncodeStage``) and routes ``generate(req)`` to
-the matching ``modes.<task>.generate`` based on
-``req.stage_params["task"]``.
-
-Hydra registers ``model/hunyuan_image3`` against
-``HunyuanImage3Pipeline.from_config`` via ``config.py``; that path
-remains unchanged across the per-mode split.
-
-Detokenization (``_detokenize_text_segment``) stays on this class
-because multiple modes need it. σ schedule construction is no longer
-the pipeline's concern — the engine adapter pins ``req.sigmas`` via
-:func:`unirl.sde.runtime.ensure_req_sigmas` before invoking
-``generate``; modes read ``req.sigmas`` directly.
-"""
+"""HunyuanImage3Pipeline — ``Sample → Sample`` dispatcher."""
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from unirl.models.types.pipeline import Pipeline
 from unirl.sde.kernels import CPSSDEStrategy, StepStrategy
 from unirl.types.primitives import Texts
-from unirl.types.rollout_req import RolloutReq
-from unirl.types.rollout_resp import RolloutResp
+from unirl.types.sample import Sample
 
 from .ar import HunyuanImage3ARStage
 from .bundle import HunyuanImage3Bundle
@@ -43,39 +22,7 @@ from .vit_encode import HunyuanImage3VitEncodeStage
 
 
 class HunyuanImage3Pipeline(Pipeline):
-    """HunyuanImage 3.0 generate pipeline.
-
-    Reads from ``RolloutReq``:
-
-    - ``primitives["text"]: Texts`` — required prompts.
-    - ``primitives["negative_text"]`` — rejected for t2i / it2i: the HI3
-      tokenizer never consumes negative-prompt text; CFG derives from
-      ``guidance_scale > 1.0``.
-    - ``primitives["image"]: Images`` — required for i2t / it2i.
-    - ``stage_params["task"]: str`` — one of ``{"t2t", "i2t", "t2i",
-      "it2i", "t2ti"}``. Defaults to ``"t2i"`` if absent.
-    - ``stage_params["bot_task"]: str`` — chat-template flag forwarded to
-      ``HunyuanImage3TextEmbedStage.embed_for_gen_image`` (t2i / it2i),
-      or the CoT-chain preset for t2ti (default ``"think_recaption"``).
-    - ``stage_params["diffusion"]: dict`` — kwargs for
-      :class:`HunyuanImage3DiffusionParams` (t2i / it2i).
-    - ``stage_params["ar"]: dict`` — kwargs for AR (t2t / i2t / t2ti).
-
-    t2ti (text → CoT text + image) requires a sampling dict with both
-    ``"ar"`` and ``"diffusion"`` entries and returns TWO
-    tracks: ``"ar"`` (root, the CoT TextSegment) and ``"image"``
-    (``parent_track="ar"``, the LatentSegment). Fan-out
-    (``samples_per_prompt``) is NOT honored by t2ti — replication
-    belongs to the engine adapter, as with the other HI3 modes.
-
-    Writes to ``RolloutResp``:
-
-    - ``conditions``: per-task — see each ``modes/<task>.py``.
-    - ``tracks["ar"].segment: TextSegment`` for AR-mode tasks.
-    - ``tracks["image"].segment: LatentSegment`` for diffusion-mode tasks.
-    - ``tracks["ar"].decoded: Texts`` (AR-mode) /
-      ``tracks["image"].decoded: Images`` (diffusion-mode).
-    """
+    """HunyuanImage 3.0 generate pipeline: ``Sample → Sample``."""
 
     def __init__(
         self,
@@ -106,18 +53,24 @@ class HunyuanImage3Pipeline(Pipeline):
         *,
         strategy: Optional[StepStrategy] = None,
     ) -> "HunyuanImage3Pipeline":
-        """Build the full pipeline from a config.
-
-        ``strategy`` is the SDE step strategy. Defaults to
-        :class:`CPSSDEStrategy`; callers running GRPO with a specific
-        Flow / Dance / DPM2 strategy should pass an explicit instance
-        built from ``cfg.sampling.sde_strategy``.
-        """
+        """Build the full pipeline from a config."""
         return cls._assemble(
             HunyuanImage3Bundle.from_config(config),
             config=config,
             strategy=strategy,
         )
+
+    @classmethod
+    def latent_shape(cls, *, model_config: Any, sampling_spec: Any) -> tuple:
+        """Per-sample latent shape ``(C, H_lat, W_lat)`` for driver-side noise"""
+        height = int(sampling_spec.height)
+        width = int(sampling_spec.width)
+        if height <= 0 or width <= 0 or height % 16 or width % 16:
+            raise NotImplementedError(
+                f"HunyuanImage3Pipeline.latent_shape: {height}x{width} is not a multiple of the "
+                "16x VAE factor; opting out of the driver x_T recipe (engine RNG fallback)."
+            )
+        return (32, height // 16, width // 16)
 
     @classmethod
     def from_meta_config(
@@ -126,14 +79,7 @@ class HunyuanImage3Pipeline(Pipeline):
         *,
         strategy: Optional[StepStrategy] = None,
     ) -> "HunyuanImage3Pipeline":
-        """Build the pipeline with every parameter on meta-device.
-
-        Used for the 80B path — no weight memory allocated anywhere.
-        Caller materializes via :meth:`HunyuanImage3Bundle.materialize`
-        (which covers the FSDP-wrapped decoder + wrapper-level heads +
-        opt-in vae / vit) after constructing the FSDPPolicy that wraps
-        the diffusion stage.
-        """
+        """Build the pipeline with every parameter on meta-device."""
         return cls._assemble(
             HunyuanImage3Bundle.from_meta_config(config),
             config=config,
@@ -148,15 +94,7 @@ class HunyuanImage3Pipeline(Pipeline):
         config: HunyuanImage3PipelineConfig,
         strategy: Optional[StepStrategy] = None,
     ) -> "HunyuanImage3Pipeline":
-        """Assemble the pipeline from an ALREADY-built (possibly shared) bundle.
-
-        ``from_config`` / ``from_meta_config`` each build their own bundle; this
-        instead takes a bundle the caller already constructed. Trainers build ONE
-        bundle and share it across the FSDP backend and this pipeline, so replay
-        reads the trained weights — see :class:`~unirl.trainer.unified_model.`
-        ``UnifiedModelTrainer``, whose ``pipeline_cfg`` targets this with ``bundle=`` auto-
-        injected from the shared sibling.
-        """
+        """Assemble the pipeline from an ALREADY-built (possibly shared) bundle."""
         return cls._assemble(bundle, config=config, strategy=strategy)
 
     @classmethod
@@ -176,6 +114,7 @@ class HunyuanImage3Pipeline(Pipeline):
             autocast_precision=config.autocast_precision,
             trajectory_precision=config.trajectory_precision,
             logprob_precision=config.logprob_precision,
+            diffuse_kv_cache=bool(config.diffuse_kv_cache),
         )
         vae_decode = HunyuanImage3VAEDecodeStage(bundle)
         vae_encode = HunyuanImage3VAEEncodeStage(bundle)
@@ -192,52 +131,28 @@ class HunyuanImage3Pipeline(Pipeline):
             shift=float(config.shift),
         )
 
-    def generate(self, req: RolloutReq) -> RolloutResp:
-        """Dispatch to the per-task generate function in ``modes/``.
-
-        ``stage_params["task"]`` selects the topology. Lazy-imports the
-        modes package to avoid the circular ``modes -> pipeline`` ref
-        (mode files type-annotate ``pipeline: "HunyuanImage3Pipeline"``).
-        """
+    def generate(self, sample: Sample) -> Sample:
+        """Dispatch to the per-task generate function in ``modes/``."""
         from .modes import i2t, it2i, t2i, t2t, t2ti
 
-        task = req.stage_config.get("task", "t2i")
+        task = (sample.parts[0].control or {}).get("task", "t2i")
         if task == "t2t":
-            return t2t.generate(self, req)
+            return t2t.generate(self, sample)
         if task == "i2t":
-            return i2t.generate(self, req)
+            return i2t.generate(self, sample)
         if task == "t2i":
-            return t2i.generate(self, req)
+            return t2i.generate(self, sample)
         if task == "it2i":
-            return it2i.generate(self, req)
+            return it2i.generate(self, sample)
         if task == "t2ti":
-            return t2ti.generate(self, req)
+            return t2ti.generate(self, sample)
         raise ValueError(
             f"HunyuanImage3Pipeline.generate: unknown task={task!r}; "
             f"expected one of 't2t', 'i2t', 't2i', 'it2i', 't2ti'."
         )
 
-    # ------------------------------------------------------------------
-    # Helpers shared by multiple modes.
-    # ------------------------------------------------------------------
-
     def _detokenize_text_segment(self, text_seg, *, skip_special_tokens: bool = True) -> Texts:
-        """Detokenize a varlen ``TextSegment`` back into a ``Texts`` primitive.
-
-        Reads ``text_seg.tokens`` + ``text_seg.cu_seqlens`` to slice each
-        sample's tokens, runs ``self.bundle.tokenizer.decode`` per sample,
-        and packages the results into ``Texts``. Returns empty strings
-        when the bundle has no tokenizer (used by fake-bundle tests).
-
-        ``skip_special_tokens=False`` keeps control markers like
-        ``</think>`` / ``</recaption>`` in the decoded text — t2ti's
-        bridge needs them to truncate and re-feed the CoT.
-
-        Shape contract:
-            text_seg.tokens     : packed varlen [sum_lengths] long
-            text_seg.cu_seqlens : [B+1] long
-            returned Texts.texts: list[str] of length B
-        """
+        """Detokenize a varlen ``TextSegment`` back into a ``Texts`` primitive."""
         tokenizer = self.bundle.tokenizer
         if text_seg.tokens is None or text_seg.cu_seqlens is None:
             return Texts(texts=[])
@@ -249,9 +164,6 @@ class HunyuanImage3Pipeline(Pipeline):
             a = int(text_seg.cu_seqlens[k].item())
             b = int(text_seg.cu_seqlens[k + 1].item())
             ids = text_seg.tokens[a:b].tolist()
-            # clean_up_tokenization_spaces=False: the HunyuanImage3 BPE tokenizer
-            # warns that the WordPiece-oriented cleanup is destructive for BPE
-            # (inserts spaces between characters) — disable it for coherent text.
             out.append(
                 tokenizer.decode(ids, skip_special_tokens=skip_special_tokens, clean_up_tokenization_spaces=False)
             )

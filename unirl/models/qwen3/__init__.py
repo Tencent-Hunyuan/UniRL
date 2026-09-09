@@ -1,13 +1,4 @@
-"""Qwen3 causal LM pipeline on the typed stage/pipeline architecture.
-
-Port of :class:`unirl.models.llm.bundle.LLMModelBundle` (the
-generic HF causal LM adapter that ``unirl-pe`` tested with Qwen3)
-into the typed ``Bundle`` / ``Pipeline`` / ``EmbedStage`` / ``ARStage``
-protocols. Sibling of :mod:`unirl.models.qwen_image`.
-
-Importing this package re-exports its bundle / pipeline / config classes;
-recipes wire them by ``_target_`` dotpath.
-"""
+"""Qwen3 causal LM pipeline on the typed stage/pipeline architecture."""
 
 from unirl.models.qwen3.ar import (
     Qwen3ARParams,

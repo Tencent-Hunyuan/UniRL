@@ -182,7 +182,7 @@ sampling:
     # per rollout). timestep_fraction [0, 0.9] = pool range(0, int(10*0.9))=0..8,
     # so the LAST step (index 9) is excluded.
     scheduler:
-      _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+      _target_: unirl.sde.index_schedule.AllSDEScheduler
       num_timesteps: ${..num_inference_steps}
       num_sde_steps: 1
       timestep_fraction: [0, 0.9]

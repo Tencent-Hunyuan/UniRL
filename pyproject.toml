@@ -24,13 +24,26 @@ dependencies = [
   "omegaconf>=2.3",
   # Match the engine stacks' 5.6.x baseline; BAGEL vendor smoke passed on 5.6.0.
   "transformers>=5.6,<5.7",
-  "peft>=0.14.0",  # exclude_modules support used by LoRA/NFT adapter injection
+  "huggingface-hub>=0.34",
+  # Vendored Boogu-Image DiT (unirl/models/boogu_image/vendor/) imports einops
+  # in transformer_boogu.py / attention_processor.py / rope.py. Pure-python,
+  # engine-agnostic.
+  "einops>=0.7",
+  # 0.20 floor: older peft imports transformers cache symbols (HybridCache)
+  # removed in 5.x and fails at import against the transformers pin above.
+  # exclude_modules support (>=0.14) used by LoRA/NFT adapter injection.
+  "peft>=0.20",
   "safetensors>=0.4",
   "Pillow>=10",
   "requests>=2.31",
   "psutil>=5.9",
   "tensordict>=0.5",
 ]
+
+# Parent/inline engines load this. Multi-stage StageDiffusionProc does not —
+# VLLMOmniHijack.hijack() reinstalls the same hook in spawn children.
+[project.entry-points."vllm_omni.general_plugins"]
+unirl_capture_flush = "unirl.rollout.engine.vllm_omni.plugin:register_capture_flush"
 
 [project.optional-dependencies]
 # sglang pinned to the upstream release the UniRL sglang patch package
@@ -56,14 +69,26 @@ sglang = [
   "torch==2.11.0+cu130 ; sys_platform == 'linux'",
   "torchvision==0.26.0+cu130 ; sys_platform == 'linux'",
   "torchaudio==2.11.0+cu130 ; sys_platform == 'linux'",
+  # Flash-Linear-Attention (FLA) fast path for Qwen3.5 hybrid attention layers
+  # (3 GDN + 1 full per 4). Without it, transformers falls back to the torch
+  # implementation ("The fast path is not available because one of the required
+  # library is not installed"). The [conv1d] extra pulls causal-conv1d, the
+  # [tilelang] extra is already satisfied transitively. Pin to the version
+  # verified on-pod with sglang 0.5.12.post1 / torch 2.11.0+cu130.
+  "flash-linear-attention[conv1d]==0.5.1 ; sys_platform == 'linux'",
+  "av>=14.2,<19 ; sys_platform == 'linux'",
 ]
-# CUDA 12.9 stack: vllm 0.20.0 PyPI wheels are compiled against CUDA 12.9.
+# CUDA 13: vllm >=0.26 wants a bare `torch==2.13.0` whose wheel is cu130, and a
+# +cu129 pin would resolve anyway, linking a CUDA-12 torch under a CUDA-13 vllm.
+# Prerelease, so installs need --prerelease=allow, plus sglang's compat layer.
 vllm = [
-  "vllm==0.20.0 ; sys_platform == 'linux'",
-  "vllm-omni==0.20.0 ; sys_platform == 'linux'",
-  "torch==2.11.0+cu129 ; sys_platform == 'linux'",
-  "torchvision==0.26.0+cu129 ; sys_platform == 'linux'",
-  "torchaudio==2.11.0+cu129 ; sys_platform == 'linux'",
+  "vllm==0.27.0 ; sys_platform == 'linux'",
+  "vllm-omni==0.27.0rc1 ; sys_platform == 'linux'",
+  "torch==2.13.0+cu130 ; sys_platform == 'linux'",
+  "torchvision==0.28.0+cu130 ; sys_platform == 'linux'",
+  # torchaudio 2.11.0+cu130 is ABI-built against torch 2.11; there is no
+  # torchaudio >=2.12 on the cu130 index, so this extra does not pin it.
+  "av>=14.2,<19 ; sys_platform == 'linux'",
 ]
 # Exact upstream source snapshot that the fail-closed FastVideo patch package is
 # verified against. This is hao-ai-lab/FastVideo PR #1222's source commit, not
@@ -78,12 +103,17 @@ train = [
   # MathVerifyRewardScorer (unirl/reward/local/mathverify.py) — the paper's grader.
   "math-verify>=0.6",
 ]
+cosmos3 = [
+  "diffusers>=0.39",
+]
 infer = [
   "accelerate>=0.30",
 ]
 eval = [
   "torchvision>=0.16",
-  "easyocr>=1.7",
+  "paddlepaddle==3.2.2",
+  "paddleocr==3.5.0",
+  "python-Levenshtein>=0.27",
 ]
 # VeOmni's torch-native distributed layer (FSDP2/EP parallelize), consumed
 # exclusively through unirl.train.backend.veomni._compat — a selective import
@@ -98,6 +128,26 @@ dev = [
   "pytest-cov>=4.1",
   "ruff>=0.6",
   "pre-commit>=3.6",
+]
+# Offline converters under datasets/ (see datasets/README.md). None of this is
+# imported by unirl/, which is why it is not a base dependency: you install it in
+# a checkout to cook a dataset, then train without it. Reading a Hub dataset needs
+# `datasets`; arxivqa_mc reads Vero's parquet shards through pyarrow directly
+# (deliberately not via `datasets`, to keep the nested structs unreshaped); the
+# LeRobot droid100 prep reads parquet metadata with pandas and decodes video with
+# av. The av bound matches the sglang/vllm extras so installing both cannot
+# conflict.
+#
+# torch is deliberately NOT here even though droid100 imports it (clip resize +
+# .pt writes): adding it would put a second torch declaration outside the engine
+# extras, and pinning exactly one is what lets each engine carry its own CUDA
+# stack. droid100 is the only converter that needs it; datasets/droid100/README.md
+# says so, and every other converter runs in a bare dataset-prep venv.
+dataset-prep = [
+  "datasets>=2.14",
+  "pandas>=2",
+  "pyarrow>=14",
+  "av>=14.2,<19",
 ]
 
 [tool.uv]
@@ -132,25 +182,17 @@ environments = [
   "sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 
-# vllm's PyPI wheel is manylinux_2_35 and its GitHub +cu129 wheel manylinux_2_31;
-# the fleet pods are glibc 2.28, so vllm must build from sdist on-pod. Its
-# build-requires omits numpy (CMake configure fails), and the build-env torch
-# must match the runtime +cu129 flavor or the compiled kernels link CUDA 13 libs.
-# First build is slow (or export VLLM_USE_PRECOMPILED=1); uv caches it per pod.
-# (Plain-string pin instead of match-runtime: bump together with the torch
-# anchor in the vllm extra above.)
+# Only fires if resolution falls back to the sdist: build-requires omits numpy,
+# and the build-env torch must match the runtime flavor.
 [tool.uv.extra-build-dependencies]
 vllm = [
   "numpy",
-  "torch==2.11.0+cu129",
+  "torch==2.13.0+cu130",
 ]
 
 # Non-explicit and ahead of the implicit PyPI default: participates in
 # resolution for ALL packages, including the engines' transitive torch pins.
-[[tool.uv.index]]
-name = "torch-cu129"
-url = "https://download.pytorch.org/whl/cu129"
-
+# Both extras are cu13, so a cu129 index here would mix flavors in unpinned deps.
 [[tool.uv.index]]
 name = "torch-cu130"
 url = "https://download.pytorch.org/whl/cu130"
@@ -172,11 +214,15 @@ include = [
 line-length = 120
 target-version = "py312"
 # unirl-reward-service/ is a vendored standalone sub-project with its own pyproject and
-# lint/test tooling; it is not governed by this repo's lint (mirrors its
-# exclusion from this repo's pytest). Its vendored upstream model code carries
+# lint/test tooling; it is not governed by this repo's lint. Its vendored
+# upstream model code carries
 # semantically-meaningful trailing whitespace (VideoAlign prompt templates) that
 # must not be auto-stripped.
-extend-exclude = ["unirl-reward-service", "unirl/models/bagel/vendor"]
+extend-exclude = [
+  "unirl-reward-service",
+  "unirl/models/bagel/vendor",
+  "unirl/models/sensenova_u1/vendor",
+]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I"]
