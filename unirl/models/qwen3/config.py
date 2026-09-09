@@ -22,6 +22,7 @@ class Qwen3PipelineConfig:
 
     autocast_precision: str = "bf16"
     logprob_precision: str = "fp32"
+    exact_actor_logprobs: bool = False
 
     use_gradient_checkpointing: bool = False
 
@@ -33,6 +34,7 @@ class Qwen3PipelineConfig:
     lora_target_modules: Optional[List[str]] = None
 
     use_value_head: bool = False
+    external_libs: Optional[List[str]] = None
 
     system_instruction: Optional[str] = None
     enable_thinking: bool = False

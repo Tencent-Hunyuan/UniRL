@@ -1,0 +1,23 @@
+# @package _global_
+defaults:
+  - qwen3_moe_30b_a3b_fsdp_tp4
+  - _self_
+
+parity_profile: public_reference
+
+logging:
+  report_to_wandb: true
+  project_name: unirl-qwen3-moe-parity
+  run_name: qwen3-30b-a3b-tp4-bitwise-n8-r1024
+  entity: null
+  tags: [experimental, qwen3-moe, bitwise, tp4, gsm8k, n8, response-1024]
+
+rollout:
+  config:
+    request_timeout_s: 7200
+    engine_kwargs:
+      enable_chunked_prefill: true
+      enable_prefix_caching: true
+
+sampling:
+  samples_per_prompt: 8

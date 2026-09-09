@@ -35,6 +35,66 @@ class TensorWeightSync(FullWeightSync):
             wire_dtype=wire_dtype,
         )
         self._rollout = rollout
+        self._extracted_buckets = None
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def extract(self) -> None:
+        """Gather EP/FSDP weights to CPU before the actor is offloaded."""
+        import torch
+
+        if self._extracted_buckets is not None:
+            raise RuntimeError("TensorWeightSync.extract called with an unconsumed cache")
+        extracted = []
+        for bucket, is_last in self._iter_buckets():
+            cpu_bucket = [
+                (
+                    name,
+                    tensor.detach().to(
+                        device="cpu",
+                        dtype=self._wire_dtype or tensor.dtype,
+                        copy=True,
+                    ),
+                )
+                for name, tensor in bucket
+            ]
+            extracted.append((cpu_bucket, is_last))
+            del bucket
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        self._extracted_buckets = extracted
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def push(self) -> None:
+        """Push a CPU extraction after actor offload and staged weight wake."""
+        import torch
+
+        cached = self._extracted_buckets
+        if cached is None:
+            raise RuntimeError("TensorWeightSync.push requires extract() first")
+        original_iter = self._iter_buckets
+
+        def cached_cuda_buckets():
+            device = torch.device("cuda", torch.cuda.current_device())
+            for cpu_bucket, is_last in cached:
+                gpu_bucket = [
+                    (
+                        name,
+                        tensor.to(device=device, non_blocking=False).contiguous(),
+                    )
+                    for name, tensor in cpu_bucket
+                ]
+                yield gpu_bucket, is_last
+
+        self._iter_buckets = cached_cuda_buckets
+        try:
+            self.sync()
+        finally:
+            self._iter_buckets = original_iter
+            self._extracted_buckets = None
+            cached.clear()
+            if torch.cuda.is_available():
+                torch.cuda.ipc_collect()
+                torch.cuda.empty_cache()
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def sync(self) -> None:
@@ -78,9 +138,9 @@ class TensorWeightSync(FullWeightSync):
 
             fanout = int(getattr(receiver, "weight_payload_fanout", tp_size))
             sglang_tp_fanout = use_sglang and fanout > 1
-            participates_in_sglang_tp = sglang_tp_fanout and dist_ready
+            participates_in_tp = fanout > 1 and dist_ready
 
-            if not is_tp_zero and not participates_in_sglang_tp:
+            if not is_tp_zero and not participates_in_tp:
                 del by_dtype, bucket
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
@@ -91,20 +151,21 @@ class TensorWeightSync(FullWeightSync):
             for i, grouped in enumerate(groups):
                 flush = self._flush_cache and is_last and i == n_dtypes - 1
                 payload_keepalive = None
-                if sglang_tp_fanout:
-                    if dist_ready:
-                        local_payload, serialization_error = self._serialize_payload_or_error(
-                            grouped,
-                            FlattenedTensorBucket,
-                            MultiprocessingSerializer,
-                        )
-                        payload_per_rank = self._gather_sglang_tp_payloads(
-                            local_payload,
-                            local_error=serialization_error,
-                            rank_info=ri,
-                            tp_size=tp_size,
-                        )
-                    else:
+                distributed_tp_fanout = fanout > 1 and dist_ready
+                if distributed_tp_fanout:
+                    local_payload, serialization_error = self._serialize_payload_or_error(
+                        grouped,
+                        FlattenedTensorBucket,
+                        MultiprocessingSerializer,
+                    )
+                    payload_per_rank = self._gather_sglang_tp_payloads(
+                        local_payload,
+                        local_error=serialization_error,
+                        rank_info=ri,
+                        tp_size=tp_size,
+                    )
+                elif sglang_tp_fanout:
+                    if not dist_ready:
                         payload_per_rank, payload_keepalive = self._serialize_single_process_sglang_tp_payloads(
                             grouped,
                             fanout=fanout,
@@ -135,7 +196,7 @@ class TensorWeightSync(FullWeightSync):
                     except BaseException as exc:  # keep peer ranks from hanging
                         update_error = f"{type(exc).__name__}: {exc}"
 
-                if participates_in_sglang_tp:
+                if distributed_tp_fanout:
                     self._raise_if_sglang_tp_update_failed(update_error, rank_info=ri)
                 elif update_error is not None:
                     raise RuntimeError(f"TensorWeightSync: rollout update failed: {update_error}")

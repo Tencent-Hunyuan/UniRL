@@ -648,12 +648,24 @@ class UniRLWandBLogger:
                     parts += f"±{ratio_std:.4f}"
             if clip_fraction is not None:
                 parts += f" clip={clip_fraction:.2f}"
-            k3_mean = _metric(metrics, "k3_mean")
-            absdiff_mean = _metric(metrics, "rollout_replay_logp_absdiff_mean")
-            if k3_mean is not None:
-                parts += f" k3={k3_mean:.2e}"
-            if absdiff_mean is not None:
-                parts += f" |Δlogp|={absdiff_mean:.2e}"
+            train_absdiff_mean = _metric(metrics, "rollout_replay_logp_absdiff_mean")
+            train_absdiff_max = _metric(metrics, "rollout_replay_logp_absdiff_max")
+            train_k3_max = _metric(metrics, "rollout_replay_k3_max")
+            old_absdiff_max = _metric(metrics, "old_rollout_logp_absdiff_max")
+            old_k3_mean = _metric(metrics, "old_rollout_k3_mean")
+            old_k3_max = _metric(metrics, "old_rollout_k3_max")
+            if train_absdiff_mean is not None:
+                parts += f" train|Δlogp|mean={train_absdiff_mean:.8e}"
+            if train_absdiff_max is not None:
+                parts += f" train|Δlogp|max={train_absdiff_max:.8e}"
+            if train_k3_max is not None:
+                parts += f" train_k3_max={train_k3_max:.8e}"
+            if old_absdiff_max is not None:
+                parts += f" old|Δlogp|max={old_absdiff_max:.8e}"
+            if old_k3_mean is not None:
+                parts += f" old_k3_mean={old_k3_mean:.8e}"
+            if old_k3_max is not None:
+                parts += f" old_k3_max={old_k3_max:.8e}"
             return parts
 
         if isinstance(results, dict):

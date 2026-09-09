@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import logging
 from typing import Any
 
@@ -58,6 +59,9 @@ class Qwen3Bundle(Bundle):
     @classmethod
     def from_config(cls, config: Qwen3PipelineConfig) -> "Qwen3Bundle":
         """Load the Qwen3 transformer + tokenizer from a HuggingFace-layout checkpoint."""
+        for module_name in config.external_libs or ():
+            importlib.import_module(str(module_name))
+
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         path = config.pretrained_model_ckpt_path
@@ -74,8 +78,15 @@ class Qwen3Bundle(Bundle):
             from transformers import AutoConfig
 
             hf_config = AutoConfig.from_pretrained(path, trust_remote_code=bool(config.trust_remote_code))
+            model_kwargs = {}
+            if getattr(config, "attn_implementation", None):
+                model_kwargs["attn_implementation"] = str(config.attn_implementation)
             transformer, meta_init_state = build_meta_init_transformer(
-                lambda: AutoModelForCausalLM.from_config(hf_config, trust_remote_code=bool(config.trust_remote_code)),
+                lambda: AutoModelForCausalLM.from_config(
+                    hf_config,
+                    trust_remote_code=bool(config.trust_remote_code),
+                    **model_kwargs,
+                ),
                 dtype=dtype,
             )
         else:

@@ -55,9 +55,14 @@ def gather_sde_field(
 
 
 def rollout_replay_logp_absdiff(new_logp: torch.Tensor, old_logp: torch.Tensor) -> Dict[str, float]:
-    """Per-token |Δlogp| between rollout and replay — AR train-rollout drift gauge."""
+    """FP32 per-token |Δlogp| between two identically shaped log-prob tensors."""
+    if new_logp.shape != old_logp.shape:
+        raise ValueError(
+            "rollout_replay_logp_absdiff requires identical shapes; "
+            f"got new={tuple(new_logp.shape)} old={tuple(old_logp.shape)}"
+        )
     with torch.no_grad():
-        absdiff = (new_logp - old_logp).abs()
+        absdiff = (new_logp.float() - old_logp.float()).abs()
     return {
         "rollout_replay_logp_absdiff_mean": float(absdiff.mean()),
         "rollout_replay_logp_absdiff_max": float(absdiff.max()),
@@ -66,6 +71,10 @@ def rollout_replay_logp_absdiff(new_logp: torch.Tensor, old_logp: torch.Tensor) 
 
 def rollout_replay_k3(new_logp: torch.Tensor, old_logp: torch.Tensor) -> Dict[str, float]:
     """Per-token K3 KL estimator between rollout and replay log-probs."""
+    if new_logp.shape != old_logp.shape:
+        raise ValueError(
+            f"rollout_replay_k3 requires identical shapes; got new={tuple(new_logp.shape)} old={tuple(old_logp.shape)}"
+        )
     with torch.no_grad():
         log_r = (new_logp.float() - old_logp.float()).clamp(min=-20.0, max=20.0)
         k3 = torch.expm1(log_r) - log_r

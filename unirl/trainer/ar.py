@@ -297,10 +297,18 @@ class ARTrainer(BaseTrainer):
 
         try:
             if do_sync and do_offload and self._supports_staged_wake:
-                self.rollout.wake_up(tags=["weights"])
-                self.weight_sync.sync()
-                train_state_maybe_offloaded = True
-                self.backend.offload()
+                split_sync = all(hasattr(self.weight_sync, method) for method in ("extract", "push"))
+                if split_sync:
+                    self.weight_sync.extract()
+                    train_state_maybe_offloaded = True
+                    self.backend.offload()
+                    self.rollout.wake_up(tags=["weights"])
+                    self.weight_sync.push()
+                else:
+                    self.rollout.wake_up(tags=["weights"])
+                    self.weight_sync.sync()
+                    train_state_maybe_offloaded = True
+                    self.backend.offload()
                 full_wake_after_train_offload_in_progress = True
                 self.rollout.wake_up()
                 full_wake_after_train_offload_in_progress = False

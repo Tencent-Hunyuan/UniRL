@@ -24,6 +24,8 @@ from .bundle import Qwen3Bundle
 from .conditions import Qwen3ARConditions
 
 logger = logging.getLogger(__name__)
+_EXACT_CONTEXT_FACTORY = None
+_EXACT_LOG_SOFTMAX = None
 
 _SPARSE_PACKED_ATTN = ("flex_attention", "flash_attention_2", "flash_attention_3", "flash_attention_4")
 
@@ -50,6 +52,45 @@ def _packed_replay_supported(attn_impl: Optional[str]) -> bool:
     except Exception:
         return False
     return True
+
+
+def _exact_actor_enabled(model: Any) -> bool:
+    return bool(getattr(model, "_unirl_exact_actor_logprobs", False))
+
+
+def _exact_actor_context(model: Any):
+    if not _exact_actor_enabled(model):
+        return nullcontext()
+    if _EXACT_CONTEXT_FACTORY is None:
+        raise RuntimeError(
+            "exact_actor_logprobs requires an exact actor provider; load the train-inference parity FSDP adaptor first"
+        )
+    return _EXACT_CONTEXT_FACTORY()
+
+
+def _selected_token_log_probs(
+    model: Any,
+    hidden: torch.Tensor,
+    tokens: torch.Tensor,
+    temperature: float,
+) -> torch.Tensor:
+    with _exact_actor_context(model):
+        logits = model.lm_head(hidden).float() / temperature
+        if _exact_actor_enabled(model):
+            if _EXACT_LOG_SOFTMAX is None:
+                raise RuntimeError("exact_actor_logprobs requires an exact log-softmax provider")
+            return _EXACT_LOG_SOFTMAX(logits, dim=-1).gather(-1, tokens.unsqueeze(-1)).squeeze(-1)
+        chosen = logits.gather(-1, tokens.unsqueeze(-1)).squeeze(-1)
+        return chosen - torch.logsumexp(logits, dim=-1)
+
+
+def register_exact_actor_provider(*, context_factory, log_softmax) -> None:
+    """Register a process-local exact provider without importing experimental code."""
+    global _EXACT_CONTEXT_FACTORY, _EXACT_LOG_SOFTMAX
+    if not callable(context_factory) or not callable(log_softmax):
+        raise TypeError("exact actor providers must be callable")
+    _EXACT_CONTEXT_FACTORY = context_factory
+    _EXACT_LOG_SOFTMAX = log_softmax
 
 
 def _replay_aware_forward(
@@ -80,8 +121,9 @@ def _replay_aware_forward(
     autocast_ctx = (
         torch.autocast("cuda", autocast_dtype) if autocast_dtype in (torch.float16, torch.bfloat16) else nullcontext()
     )
-    with autocast_ctx:
-        hidden = self.model(**kw, use_cache=False, return_dict=True).last_hidden_state
+    with _exact_actor_context(self):
+        with autocast_ctx:
+            hidden = self.model(**kw, use_cache=False, return_dict=True).last_hidden_state
 
     T = float(temperature) if float(temperature) > 0.0 else 1.0
     value_head = getattr(self, "value_head", None) if return_values else None
@@ -91,8 +133,7 @@ def _replay_aware_forward(
         targets = response_tokens
 
         def _flat_logp_chunk(h: torch.Tensor, tok: torch.Tensor) -> torch.Tensor:
-            lf = self.lm_head(h).float() / T
-            return lf.gather(-1, tok.unsqueeze(-1)).squeeze(-1) - torch.logsumexp(lf, dim=-1)
+            return _selected_token_log_probs(self, h, tok, T)
 
         flat_parts: List[torch.Tensor] = []
         flat_chunk = 2048
@@ -118,9 +159,7 @@ def _replay_aware_forward(
     resp_hidden = hidden[:, prompt_len - 1 : prompt_len - 1 + T_max, :]
 
     def _logp_chunk(h: torch.Tensor, tok: torch.Tensor) -> torch.Tensor:
-        lf = self.lm_head(h).float() / T
-        chosen = lf.gather(-1, tok.unsqueeze(-1)).squeeze(-1)
-        return chosen - torch.logsumexp(lf, dim=-1)
+        return _selected_token_log_probs(self, h, tok, T)
 
     bsz = resp_hidden.size(0)
     chunk = max(64, 2048 // max(1, bsz))
@@ -248,11 +287,13 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
         model: Qwen3Bundle,
         autocast_precision: str = "bf16",
         logprob_precision: str = "fp32",
+        exact_actor_logprobs: bool = False,
     ) -> None:
         self.model = model
         self.autocast_dtype = parse_torch_dtype(autocast_precision, field_name="Qwen3ARStage.autocast_precision")
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="Qwen3ARStage.logprob_precision")
         transformer = model.transformer
+        transformer._unirl_exact_actor_logprobs = bool(exact_actor_logprobs)
         if getattr(transformer.forward, "__func__", None) is not _replay_aware_forward:
             transformer.forward = MethodType(_replay_aware_forward, transformer)
 
@@ -356,6 +397,29 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
         return_values: bool = False,
     ) -> Union[torch.Tensor, ReplayResult]:
         """Per-token log-prob replay; falls back to the dense ``[B, P_max + T_max]`` :meth:`padding_replay`."""
+        _require_value_head_for_replay(self.model.transformer, return_values)
+        return self.old_policy_replay(
+            conditions,
+            segment=segment,
+            temperature=temperature,
+            return_values=return_values,
+        )
+
+    def old_policy_replay(
+        self,
+        conditions: Qwen3ARConditions,
+        *,
+        segment: TextSegment,
+        temperature: float = 1.0,
+        return_values: bool = False,
+    ) -> Union[torch.Tensor, ReplayResult]:
+        """Score fixed response tokens with the actor's full-sequence forward topology.
+
+        This is the old-policy log-probability contract used by alignment
+        probes. The rollout comparison exercises the same packed/padded
+        teacher-forcing forward family used by the gradient-bearing actor
+        update.
+        """
         _require_value_head_for_replay(self.model.transformer, return_values)
         attn_impl = getattr(getattr(self.model.transformer, "config", None), "_attn_implementation", None)
         if _packed_replay_supported(attn_impl):
@@ -592,4 +656,9 @@ def _pack_text_segment(
     )
 
 
-__all__ = ["Qwen3ARParams", "Qwen3ARStage", "Qwen3ARStep"]
+__all__ = [
+    "Qwen3ARParams",
+    "Qwen3ARStage",
+    "Qwen3ARStep",
+    "register_exact_actor_provider",
+]

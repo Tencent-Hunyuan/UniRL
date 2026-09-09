@@ -1,0 +1,154 @@
+# @package _global_
+
+parity_profile: public_reference
+parity:
+  train_tp: 4
+
+num_devices: 4
+devices_per_node: 4
+batch_size: 4
+num_rollouts: 1
+weight_sync_interval: 1
+eval_interval: 0
+enable_fsdp_offload: true
+adv_normalization_scope: group
+normalize_adv_by_std: true
+
+logging:
+  report_to_wandb: false
+  project_name: unirl-train-inference-parity
+  run_name: qwen3-moe-30b-a3b-fsdp-tp4
+  entity: null
+  tags: [experimental, train-inference-parity, qwen3-moe, fsdp, tp4]
+
+bundle:
+  _target_: unirl.models.qwen3.bundle.Qwen3Bundle.from_config
+  config:
+    _target_: unirl.models.qwen3.config.Qwen3PipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:QWEN3_MOE_PATH,/dev/shm/Qwen3-30B-A3B}
+    meta_init_transformer: true
+    model_precision: bf16
+    attn_implementation: flash_attention_3
+    autocast_precision: bf16
+    logprob_precision: fp32
+    exact_actor_logprobs: true
+    external_libs:
+      - experimental.train_inference_parity.models.qwen3_moe_30b_a3b.fsdp
+    use_gradient_checkpointing: true
+    max_prompt_length: 256
+
+pipeline:
+  _target_: experimental.train_inference_parity.models.qwen3_moe_30b_a3b.actor.ParityQwen3Pipeline.from_bundle
+  enable_thinking: true
+  max_prompt_length: 256
+  autocast_precision: bf16
+  logprob_precision: fp32
+  exact_actor_logprobs: true
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["Qwen3MoeDecoderLayer"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true
+    use_torch_compile: false
+    forward_prefetch: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 1.0e-6
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.01
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 200
+
+rollout:
+  _target_: unirl.rollout.engine.vllm.engine.VLLMRolloutEngine
+  config:
+    _target_: unirl.rollout.engine.vllm.config.VLLMEngineConfig
+    pretrained_model_ckpt_path: ${oc.env:QWEN3_MOE_PATH,/dev/shm/Qwen3-30B-A3B}
+    tp_size: 4
+    max_new_tokens: 1024
+    temperature: 1.0
+    top_p: 1.0
+    top_k: 0
+    ignore_eos: true
+    chat_template_kwargs:
+      enable_thinking: true
+    engine_kwargs:
+      max_model_len: 1280
+      max_num_batched_tokens: 1280
+      max_num_seqs: 16
+      gpu_memory_utilization: 0.6
+      disable_log_stats: true
+      enforce_eager: true
+      enable_prefix_caching: false
+      enable_chunked_prefill: false
+      moe_backend: triton
+      logprobs_mode: processed_logprobs
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  truncated_reward: keep
+  backend:
+    _target_: unirl.reward.local.gsm8k_exact_match.GSM8KExactMatchRewardScorer
+    base_device: cpu
+    config:
+      _target_: unirl.reward.local.gsm8k_exact_match.GSM8KExactMatchSpec
+
+algorithm:
+  _target_: experimental.train_inference_parity.algorithm.TrainInferenceParityGRPO
+  stage_attr: ar
+  clip_range: 0.2
+  clip_range_high: 0.28
+  clip_schedule: constant
+  loss_agg_mode: seq-mean-token-sum-norm
+  horizon: 1024
+  sampling_temperature: 1.0
+  alignment_probe: true
+  alignment_gate_only: false
+  alignment_require_exact: true
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.qwen3.conditions.Qwen3ARConditions
+
+sync:
+  _target_: unirl.distributed.weight_sync.full.tensor.TensorWeightSync
+  lora_merged: false
+  bucket_size_mb: 512
+  flush_cache: true
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 1
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: ${oc.env:DATA_PATH,datasets/gsm8k/train.jsonl}
+      eval_data_path: ${oc.env:EVAL_DATA_PATH,datasets/gsm8k/test.jsonl}
+      seed: 42
+      shuffle: false
+    algorithm:
+      prompts_per_rollout: 4
+
+sampling:
+  _target_: unirl.types.sampling.ARSamplingParams
+  samples_per_prompt: 4
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 0
+  max_new_tokens: 1024
