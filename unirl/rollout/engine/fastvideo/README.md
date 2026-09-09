@@ -4,10 +4,10 @@
 > in-process `VideoGenerator` driven one prompt at a time through
 > `executor.execute_forward`. Full map: [`../README.md`](../README.md).
 
-*Runs WAN 2.1 rollouts on the pinned FastVideo RL fork and re-routes its
-hard-coded deterministic Euler steps through UniRL's canonical UniPC solver
-(`unirl/sde/unipc.py`), so rollouts follow the checkpoint's native inference
-solver without integer-timestep loss.*
+*Runs WAN 2.1 and WAN 2.2 A14B T2V rollouts on the pinned FastVideo RL fork and
+re-routes its hard-coded deterministic Euler steps through UniRL's canonical
+UniPC solver (`unirl/sde/unipc.py`), so rollouts follow the checkpoint's native
+inference solver without integer-timestep loss.*
 
 ## The pin
 
@@ -19,9 +19,14 @@ therefore fingerprints the patched surface at patch-install time (engine init
 and every spawned worker): the parameter lists of
 `FlowUniPCMultistepScheduler.set_timesteps` and `sde_step_with_logprob`, the
 `WorkerMultiprocProc.worker_main` entrypoint, and (engine side) the
-`ForwardBatch.RLData` fields. Drift fails closed at init instead of mid-rollout.
-Before editing a patch, read that exact commit (CLAUDE.md: monkey-patch
-doctrine), then update the fingerprints together with the patch.
+`ForwardBatch.RLData` fields. It also fingerprints the seams the weight and
+offload patches install onto — `MultiprocExecutor.collective_rpc`,
+`ModuleHookManager.get_from` / `get_forward_hook`,
+`LayerwiseOffloadHook.mutate_params_scope`,
+`fsdp_load.load_model_from_full_model_state_dict`, and
+`PipelineComponentLoader.load_module`. Drift fails closed at init instead of
+mid-rollout. Before editing a patch, read that exact commit (CLAUDE.md:
+monkey-patch doctrine), then update the fingerprints together with the patch.
 
 ## How the canonical UniPC path works
 
@@ -35,7 +40,8 @@ doctrine), then update the fingerprints together with the patch.
   `int64`, which truncates conditioning (`833` vs `833.333…`, the drift #248
   tracked).
 - **Solver SSOT.** `WAN21PipelineConfig.unipc_*` declares the deterministic
-  solver. At init the engine verifies it against the checkpoint's
+  solver (`WAN22PipelineConfig` inherits the same fields). At init the engine
+  verifies it against the checkpoint's
   `scheduler/scheduler_config.json`, resolving either a local diffusers-layout
   directory or a Hugging Face model repo — fail closed on a mismatch, a
   missing/unreadable file, a non-UniPC `_class_name`, or a non-empty
@@ -55,9 +61,46 @@ doctrine), then update the fingerprints together with the patch.
   zero log-prob column `_build_segment` slices off before building
   `LatentSegment`.
 - **Verification.** Every sample's worker-echoed `RLData.trajectory_timesteps`
-  goes through `verify_engine_used_sigmas` (scale-normalized), and
-  `_wan_timestep_scale` pins `num_train_timesteps == 1000` against the WAN21
-  model contract.
+  goes through `verify_engine_used_sigmas` (scale-normalized). The patched
+  `set_timesteps` pins the live scheduler's own `num_train_timesteps` onto the
+  scheduler, and dispatch fails closed unless it equals the
+  `timestep_scale` the request plan carries — the engine resolves that from the
+  selected family's step kernel (`WAN21DiffusionStep.TIMESTEP_SCALE` /
+  `WAN22DiffusionStep.TIMESTEP_SCALE`).
+
+## WAN 2.2 A14B dual expert
+
+`model_family: wan2.2` turns on boundary-routed dual-expert rollout.
+
+- **Boundary agreement.** FastVideo selects the expert on
+  `t >= boundary_ratio * num_train_timesteps` and UniRL's trainside routes on
+  `sigma >= boundary_ratio`. Those two agree only when the model config's
+  `num_train_timesteps` equals the step kernel's `TIMESTEP_SCALE`, so the engine
+  `require`s exactly that at init, then pins `boundary_ratio` onto both
+  `pipeline_config` and `dit_config` before boot and onto every request batch.
+  FastVideo's `transformer` is the high-noise expert and `transformer_2` the
+  low-noise one; the weight sync routes `high_noise.*` / `low_noise.*`
+  accordingly. The engine also verifies the checkpoint's `model_index.json`
+  declares both.
+- **Weight sync ships a path, not a state dict.** An A14B state dict through the
+  worker pipes exhausts `/dev/shm`, so `update_transformer_weights_from_path`
+  sends only the `CheckpointWeightSync` file path and each worker `torch.load`s
+  it (`weights_only=True`) and splits the experts itself. Every worker reads the
+  whole file, so host RAM — not `/dev/shm` — bounds `sp_size`.
+- **Mutating layerwise-offloaded blocks must use
+  `LayerwiseOffloadHook.mutate_params_scope()`.** The hooks are circularly
+  linked: the last block's `pre_forward` prefetches block 0's parameters onto
+  GPU, and `wait_and_replace_params` reuses a cached `gpu_named_parameters`
+  entry when one exists. Writing `state.cpu_named_parameters` directly therefore
+  leaves that prefetched copy stale, so block 0 of each expert would run the
+  previous policy's weights for one forward. The colocate loop currently hides
+  this by tearing the generator down every step; the scope keeps it correct if
+  that ever changes.
+- **Loading two 14B experts needs the offload patch.** Upstream stages a whole
+  DiT on GPU before attaching the layerwise hooks, which transiently exceeds the
+  device. `_offload.py` materializes those modules on CPU, then moves only the
+  stem/head parameters the hooks left real. It reads `cpu_offload` out of
+  `**kwargs`, which is why that signature is fingerprinted.
 
 ## Gotchas
 
