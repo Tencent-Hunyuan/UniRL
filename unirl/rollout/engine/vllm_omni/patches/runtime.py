@@ -492,6 +492,7 @@ class _HV15TorchLinearWithLoRA(torch.nn.Module):
 def patch_hv15_refiner_torch_linear_lora() -> None:
     """Include HV1.5 token-refiner ``nn.Linear`` layers in vLLM's LoRA policy."""
     try:
+        from vllm.lora.layers import BaseLayerWithLoRA
         from vllm.lora.utils import replace_submodule
         from vllm_omni.diffusion.models.hunyuan_video.hunyuan_video_15_transformer import (
             HunyuanVideo15Transformer3DModel,
@@ -503,13 +504,13 @@ def patch_hv15_refiner_torch_linear_lora() -> None:
     if getattr(original_replace, "_diffrl_hv15_refiner_torch_linear_lora", False):
         return
 
-    target_suffixes = (
-        ".attn.to_q",
-        ".attn.to_k",
-        ".attn.to_v",
-        ".attn.to_out.0",
-        ".ff.net.0.proj",
-        ".ff.net.2",
+    target_paths = (
+        "attn.to_q",
+        "attn.to_k",
+        "attn.to_v",
+        "attn.to_out.0",
+        "ff.net.0.proj",
+        "ff.net.2",
     )
 
     @wraps(original_replace)
@@ -519,43 +520,21 @@ def patch_hv15_refiner_torch_linear_lora() -> None:
         if not isinstance(transformer, HunyuanVideo15Transformer3DModel):
             return
 
-        refiner = getattr(getattr(transformer, "context_embedder", None), "token_refiner", None)
-        blocks = getattr(refiner, "refiner_blocks", ())
-        expected = len(blocks) * len(target_suffixes)
-        if expected == 0:
-            return
-
-        matched: dict[str, torch.nn.Module] = {}
-        prefix = "context_embedder.token_refiner.refiner_blocks."
-        for module_name, module in transformer.named_modules(remove_duplicate=False):
-            if not module_name.startswith(prefix) or not module_name.endswith(target_suffixes):
-                continue
-            matched[module_name] = module
-
-        registered = 0
+        blocks = transformer.context_embedder.token_refiner.refiner_blocks
+        prefix = "context_embedder.token_refiner.refiner_blocks"
         newly_wrapped = 0
-        for module_name, module in matched.items():
-            full_module_name = f"transformer.{module_name}"
-            already_wrapped = isinstance(module, _HV15TorchLinearWithLoRA) or (
-                callable(getattr(module, "set_lora", None)) and hasattr(module, "base_layer")
-            )
-            if already_wrapped:
-                self._lora_modules[full_module_name] = module
-                registered += 1
-                continue
-            if not isinstance(module, torch.nn.Linear):
-                continue
-            wrapped = _HV15TorchLinearWithLoRA(module)
-            replace_submodule(transformer, module_name, wrapped)
-            self._lora_modules[full_module_name] = wrapped
-            registered += 1
-            newly_wrapped += 1
+        for block_index in range(len(blocks)):
+            for target_path in target_paths:
+                module_name = f"{prefix}.{block_index}.{target_path}"
+                module = transformer.get_submodule(module_name)
+                if isinstance(module, torch.nn.Linear):
+                    module = _HV15TorchLinearWithLoRA(module)
+                    replace_submodule(transformer, module_name, module)
+                    newly_wrapped += 1
+                elif not isinstance(module, (_HV15TorchLinearWithLoRA, BaseLayerWithLoRA)):
+                    raise RuntimeError(f"Unsupported HV1.5 refiner LoRA layer {module_name}: {type(module).__name__}")
+                self._lora_modules[f"transformer.{module_name}"] = module
 
-        if registered != expected:
-            raise RuntimeError(
-                "HV1.5 token-refiner LoRA coverage is incomplete: "
-                f"registered {registered}/{expected} token-refiner LoRA targets"
-            )
         if newly_wrapped:
             logger.info(
                 "Wrapped %d HV1.5 token-refiner nn.Linear layers for online LoRA",
