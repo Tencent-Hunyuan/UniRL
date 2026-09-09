@@ -463,27 +463,22 @@ class _HV15TorchLinearWithLoRA(torch.nn.Module):
         index: int,
         lora_a: torch.Tensor,
         lora_b: torch.Tensor,
-        *_args,
-        **_kwargs,
     ) -> None:
         if index != 0:
             raise IndexError(f"HV1.5 torch-linear LoRA only supports adapter slot 0, got {index}")
-        if not torch.is_tensor(lora_a) or not torch.is_tensor(lora_b):
-            raise TypeError("HV1.5 torch-linear LoRA expects tensor A/B weights")
-        if lora_a.ndim != 2 or lora_b.ndim != 2:
+        if not (
+            lora_a.ndim == lora_b.ndim == 2
+            and lora_a.shape[1] == self.base_layer.in_features
+            and lora_b.shape == (self.base_layer.out_features, lora_a.shape[0])
+        ):
             raise ValueError(
-                f"HV1.5 torch-linear LoRA expects rank-2 A/B weights, got ndim={lora_a.ndim}/{lora_b.ndim}"
+                "HV1.5 torch-linear LoRA shape mismatch: "
+                f"A={tuple(lora_a.shape)}, B={tuple(lora_b.shape)}; expected "
+                f"A=[rank, {self.base_layer.in_features}], "
+                f"B=[{self.base_layer.out_features}, rank]"
             )
-        expected_a = (int(lora_a.shape[0]), self.base_layer.in_features)
-        expected_b = (self.base_layer.out_features, int(lora_a.shape[0]))
-        if tuple(lora_a.shape) != expected_a:
-            raise ValueError(f"HV1.5 torch-linear LoRA A shape {tuple(lora_a.shape)} does not match {expected_a}")
-        if tuple(lora_b.shape) != expected_b:
-            raise ValueError(f"HV1.5 torch-linear LoRA B shape {tuple(lora_b.shape)} does not match {expected_b}")
-        device = self.base_layer.weight.device
-        dtype = self.base_layer.weight.dtype
-        self._lora_a = lora_a.detach().to(device=device, dtype=dtype).contiguous()
-        self._lora_b = lora_b.detach().to(device=device, dtype=dtype).contiguous()
+        self._lora_a = lora_a.detach().to(self.base_layer.weight)
+        self._lora_b = lora_b.detach().to(self.base_layer.weight)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         result = self.base_layer(hidden_states)
