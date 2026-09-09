@@ -16,8 +16,8 @@ import torch
 from unirl.rollout.engine.sigma_verify import verify_engine_used_sigmas
 from unirl.sde.unipc import UniPCSpec, UniPCStrategy
 
-# The exact fork surface these patches target; drift fails closed at patch time (README: pin).
-_PINNED_FORK = "Zcchill/FastVideo@7fe1d7db9a0b8aebb46679e7924f597431f23665"
+# The exact upstream surface these patches target; drift fails closed at patch time (README: pin).
+_PINNED_FORK = "hao-ai-lab/FastVideo@2095477eac7e289c7a7ab13acb367ca60687c304"
 
 _SET_TIMESTEPS_PARAMS = (
     "self",
@@ -29,6 +29,8 @@ _SET_TIMESTEPS_PARAMS = (
     "use_karras_sigmas",
     "use_kerras_sigma",
 )
+# Stock upstream stops at ``return_dt_and_std_dev_t``; ``eta``/``sde_type`` are appended by
+# ``_contracts.patch_transition``, which must therefore run before this fingerprint is taken.
 _SDE_STEP_PARAMS = (
     "scheduler",
     "model_output",
@@ -42,6 +44,7 @@ _SDE_STEP_PARAMS = (
     "eta",
     "sde_type",
 )
+_STOCK_SDE_STEP_PARAMS = _SDE_STEP_PARAMS[:-2]
 _COLLECTIVE_RPC_PARAMS = ("self", "method", "timeout", "args", "kwargs")
 _LOAD_STATE_DICT_PARAMS = (
     "model",
@@ -107,8 +110,31 @@ def _verify_rl_data_surface() -> None:
     if missing:
         raise RuntimeError(
             f"FastVideo ForwardBatch.RLData lacks fields {missing} required by the UniPC "
-            f"integration (pinned surface: {_PINNED_FORK})"
+            f"integration (pinned surface: {_PINNED_FORK}); _contracts.patch_contracts must run first"
         )
+
+
+def _verify_stock_surface() -> None:
+    """Fingerprint the untouched upstream seams before any UniRL patch rewrites them."""
+    denoising = _import_fastvideo_module(
+        "fastvideo.pipelines.stages.denoising", "pipelines.stages.denoising.sde_step_with_logprob"
+    )
+    original = _require_attr(denoising, "sde_step_with_logprob", "sde_step_with_logprob")
+    if getattr(original, "_unirl_fastvideo_sde", False):
+        return
+    _require_signature(original, _STOCK_SDE_STEP_PARAMS, "stock sde_step_with_logprob")
+    stage = _require_attr(denoising, "DenoisingStage", "DenoisingStage")
+    forward = _require_attr(stage, "forward", "DenoisingStage.forward")
+    try:
+        source = inspect.getsource(forward)
+    except (OSError, TypeError) as exc:
+        raise RuntimeError(f"cannot inspect FastVideo DenoisingStage.forward: {exc}") from exc
+    for marker in ("rl_data", "sde_step_with_logprob", "scheduler.step"):
+        if marker not in source:
+            raise RuntimeError(
+                f"FastVideo DenoisingStage.forward lacks required source marker {marker!r} "
+                f"(pinned surface: {_PINNED_FORK})"
+            )
 
 
 def _verify_weight_surface() -> None:
@@ -434,11 +460,18 @@ def _patch_denoising_step() -> None:
 
 def _patch_worker_runtime() -> None:
     _require_float_wan_timesteps()
-    _patch_scheduler_set_timesteps()
-    _patch_denoising_step()
+    _verify_stock_surface()
+    from unirl.rollout.engine.fastvideo._contracts import patch_contracts, patch_transition
     from unirl.rollout.engine.fastvideo._offload import patch_offload
     from unirl.rollout.engine.fastvideo._weights import patch_weights
 
+    # Contract and transition first: they add the RLData fields and the eta/sde_type
+    # parameters that the UniPC fingerprints and dispatch below rely on.
+    patch_contracts()
+    patch_transition()
+    _verify_rl_data_surface()
+    _patch_scheduler_set_timesteps()
+    _patch_denoising_step()
     patch_offload()
     patch_weights()
 
@@ -467,7 +500,6 @@ def _patch_worker_entrypoint() -> None:
 
 def patch_fastvideo_unipc() -> None:
     """Install idempotent parent, worker-entrypoint, and runtime patches after fingerprinting the fork surface."""
-    _verify_rl_data_surface()
     _verify_weight_surface()
     _verify_offload_surface()
     _patch_worker_runtime()
