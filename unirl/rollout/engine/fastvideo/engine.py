@@ -101,6 +101,33 @@ def _model_timestep_scale(model_family: str) -> float:
     return float(WAN21DiffusionStep.TIMESTEP_SCALE)
 
 
+def _verify_dual_expert_checkpoint(ckpt_path: str) -> None:
+    """Fail closed unless the A14B checkpoint declares both boundary-routed transformers."""
+    checkpoint = Path(ckpt_path).expanduser()
+    if checkpoint.is_dir():
+        path = checkpoint / "model_index.json"
+    else:
+        try:
+            from huggingface_hub import hf_hub_download
+
+            path = Path(hf_hub_download(repo_id=ckpt_path, filename="model_index.json"))
+        except Exception as exc:
+            raise RuntimeError(
+                f"FastVideo WAN 2.2 cannot resolve {ckpt_path!r}/model_index.json as either a local "
+                "diffusers-layout checkpoint or a Hugging Face model repo."
+            ) from exc
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"FastVideo WAN 2.2 cannot verify the dual-expert layout without {path}") from exc
+    missing = [name for name in ("transformer", "transformer_2") if name not in payload]
+    if missing:
+        raise RuntimeError(
+            f"Checkpoint {path} lacks {missing}; the WAN 2.2 A14B rollout requires both boundary-routed experts."
+        )
+
+
 def _resolve_sde_window(raw_indices: Any, num_steps: int) -> List[int]:
     """Return sorted SDE step indices; ``None`` → all-steps SDE here but no-SDE trainside (README Gotchas)."""
     if raw_indices is None:
@@ -173,6 +200,22 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         )
         self._sde_type = str(strategy.canonical_name)
         self._timestep_scale = _model_timestep_scale(config.model_family)
+        self._is_dual_expert = config.model_family in {"wan2.2", "wan22"}
+        if self._is_dual_expert:
+            boundary_ratio = float(getattr(model_config, "boundary_ratio", 0.0))
+            require(
+                0.0 < boundary_ratio < 1.0,
+                f"WAN 2.2 model_config.boundary_ratio must be in (0, 1); got {boundary_ratio}",
+            )
+            # FastVideo routes on t >= boundary_ratio * num_train_timesteps; UniRL routes on
+            # sigma >= boundary_ratio. The two agree only at this scale (README: dual expert).
+            require(
+                float(getattr(model_config, "num_train_timesteps", 0)) == self._timestep_scale,
+                "WAN 2.2 FastVideo rollout requires model_config.num_train_timesteps to equal the "
+                f"step kernel's TIMESTEP_SCALE ({self._timestep_scale:g})",
+            )
+            self._boundary_ratio = boundary_ratio
+            _verify_dual_expert_checkpoint(model_config.pretrained_model_ckpt_path)
         # Probe plan so unsupported kernels (cps/dpm2) fail at init, not per request.
         FastVideoUniPCPlan(
             sde_type=self._sde_type,
@@ -235,6 +278,8 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         }
         fv_kwargs.update(ekw)
         self._fastvideo_args = FastVideoArgs.from_kwargs(**fv_kwargs)
+        if self._is_dual_expert:
+            self._align_dual_expert_args(self._fastvideo_args)
         backend = str(getattr(self._fastvideo_args, "distributed_executor_backend", "mp"))
         require(
             backend == "mp",
@@ -258,6 +303,18 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
                     max_port_attempts,
                     self._ports.master_port,
                 )
+
+    def _align_dual_expert_args(self, fastvideo_args: Any) -> None:
+        """Pin the boundary UniRL owns onto FastVideo's WAN 2.2 pipeline and dit configs."""
+        pipeline_config = fastvideo_args.pipeline_config
+        dit_config = getattr(pipeline_config, "dit_config", None)
+        require(dit_config is not None, "WAN 2.2 FastVideo pipeline has no dit_config")
+        require(
+            hasattr(dit_config, "boundary_ratio"),
+            "WAN 2.2 FastVideo requires a dual-expert pipeline config with dit_config.boundary_ratio",
+        )
+        pipeline_config.boundary_ratio = self._boundary_ratio
+        dit_config.boundary_ratio = self._boundary_ratio
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
     def generate(self, sample: Sample) -> Sample:
@@ -411,6 +468,9 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
                     sde_type=step_plan,
                 ),
             )
+            if self._is_dual_expert:
+                batch.boundary_ratio = self._boundary_ratio
+                batch.guidance_scale_2 = self._low_noise_guidance(params)
             out = self._generator.executor.execute_forward(batch, self._fastvideo_args)
             rl = out.rl_data
             verify_fastvideo_used_sigmas(
@@ -472,6 +532,13 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
             "neg_embeds": all_neg_embeds,
             "neg_masks": all_neg_masks,
         }
+
+    def _low_noise_guidance(self, params: Any) -> float:
+        """Resolve the low-noise expert's CFG scale, falling back to the shared one."""
+        scale = getattr(params, "guidance_scale_2", None)
+        if scale is None:
+            scale = getattr(self.model_config, "guidance_scale_2", None)
+        return float(scale) if scale is not None else float(params.guidance_scale)
 
     def _build_response(
         self,
