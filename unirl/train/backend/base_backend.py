@@ -174,9 +174,7 @@ class BaseFSDP2Backend(Remote):
                 bias=lora_cfg.bias,
                 task_type=lora_cfg.task_type,
             )
-            # Frozen sibling adapters (e.g. OPD teachers): structure injected pre-wrap so
-            # FSDP shards them, weights loaded post-materialize; requires_grad=False keeps
-            # them out of the optimizer, weight sync and adapter checkpoints (see README).
+            # Frozen sibling adapters (e.g. OPD teachers) — see ../readme.md Gotchas.
             for spec in normalize_frozen_adapters(getattr(lora_cfg, "frozen_adapters", None)):
                 self._frozen_adapters[spec.name] = inject_frozen_adapter(model, name=spec.name, path=spec.path)
         if ema_cfg is not None:
@@ -543,12 +541,22 @@ class BaseFSDP2Backend(Remote):
         recorded = (lora_config or {}).get("frozen_adapters") if isinstance(lora_config, dict) else None
         if recorded is None:
             return
-        if dict(recorded) != self._frozen_adapters:
-            raise RuntimeError(
-                f"{type(self).__name__}.load: frozen_adapters differ from the checkpoint's "
-                f"(checkpoint: {sorted(recorded)}, live: {sorted(self._frozen_adapters)}, or a weight sha256 "
-                "changed). Resume with the same teacher checkpoints or start a new run."
-            )
+        recorded = dict(recorded)
+        if recorded == self._frozen_adapters:
+            return
+        live = self._frozen_adapters
+        added = sorted(set(live) - set(recorded))
+        removed = sorted(set(recorded) - set(live))
+        changed = sorted(
+            f"{name} ({recorded[name][:12]}... -> {live[name][:12]}...)"
+            for name in set(recorded) & set(live)
+            if recorded[name] != live[name]
+        )
+        raise RuntimeError(
+            f"{type(self).__name__}.load: frozen_adapters differ from the checkpoint's "
+            f"(added: {added}, removed: {removed}, weights changed: {changed}). "
+            "Resume with the same teacher checkpoints or start a new run."
+        )
 
     def _reject_meta(
         self,

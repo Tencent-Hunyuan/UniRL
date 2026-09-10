@@ -106,7 +106,10 @@ in `backend/base.py`; a multi-update-capable algorithm sets
   the peft checkpoint on every rank, maps `base_model.model.<m>.lora_A.weight` to
   `<m>.lora_A.<name>.weight`, refuses unexpected / missing / mis-shaped tensors, and
   reshards via `set_model_state_dict(full_state_dict=True)`. Anything that reads teacher
-  weights before `apply_deferred_ops` sees peft's zero-init `lora_B` (a null teacher).
+  weights before `apply_deferred_ops` gets something other than the checkpoint: peft's random
+  `lora_A` over a zeroed `lora_B` (a null teacher) on an eager bundle, and *uninitialized*
+  storage on a meta-init one, because `to_empty` wipes whatever peft wrote. `inject_lora`
+  defers `_reset_adapter` for the trainable adapter for exactly the same reason.
 - **Adapter checkpoints hold only the trainable adapter(s); frozen adapters are excluded on
   save *and* load** — they are re-created from `frozen_adapters` paths at build time, so
   loading them back would silently pin an old teacher over a changed recipe. The checkpoint
