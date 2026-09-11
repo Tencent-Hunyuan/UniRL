@@ -60,7 +60,8 @@ class HunyuanVideo10DiffusionStep(DiffusionStep[HunyuanVideo10Bundle, HunyuanVid
             timestep = sigma.expand(batch_size)
         else:
             timestep = sigma
-        timestep = timestep.to(device=device, dtype=dtype) * self.TIMESTEP_SCALE
+        # Match Diffusers/SGLang: scale fp32 sigma before casting to the transformer dtype.
+        timestep = (timestep.to(device=device, dtype=torch.float32) * self.TIMESTEP_SCALE).to(dtype=dtype)
 
         guidance = torch.full((batch_size,), guidance_scale, device=device, dtype=dtype)
 
