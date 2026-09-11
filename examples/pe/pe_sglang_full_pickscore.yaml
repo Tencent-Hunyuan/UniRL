@@ -251,9 +251,6 @@ rollout:
       _target_: unirl.rollout.engine.sglang.config.SGLangEngineConfig
       pretrained_model_ckpt_path: ${oc.env:LLM_MODEL,Qwen/Qwen3-0.6B}
       tp_size: 1
-      max_new_tokens: 512
-      temperature: 0.7
-      top_p: 0.9
       # Transport: in-process sglang.Engine (native). Use "http" (separate SRT
       # server subprocess) only if a native issue needs the HTTP fallback.
       backend: native

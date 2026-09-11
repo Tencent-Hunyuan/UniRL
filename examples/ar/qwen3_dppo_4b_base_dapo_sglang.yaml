@@ -120,9 +120,6 @@ rollout:
     backend: native
     pretrained_model_ckpt_path: ${oc.env:QWEN3_PATH,Qwen/Qwen3-4B-Base}
     tp_size: 1
-    max_new_tokens: 8192
-    temperature: 1.0
-    top_p: 1.0
     concurrency: 16
     # ARTrainer pre-expands the req by samples_per_prompt, so the engine emits
     # one completion per entry (n=1); else samples double-count.
@@ -168,11 +165,11 @@ algorithm:
   stage_attr: ar # resolves stage from the trainer-injected pipeline (.ar)
   dppo_delta: 0.15 # δ: uniform token-level Binary-TV threshold (0.15 dense; paper §4)
   loss_agg_mode: seq-mean-token-sum-norm # per-seq token-sum / horizon, mean over seqs
-  horizon: 8192 # fixed length normalizer for seq-mean-token-sum-norm (= max_new_tokens)
+  horizon: ${sampling.max_new_tokens} # fixed length normalizer for seq-mean-token-sum-norm (= max_new_tokens)
   # 1.0 — must equal sampling.temperature below so replay's log_softmax(logits/T)
   # matches the SGLang sampler's tempered output_token_logprobs (ratio_mean ≈ 1,
   # and the Binary-TV divergence |pi-mu| reflects only policy drift).
-  sampling_temperature: 1.0
+  sampling_temperature: ${sampling.temperature}
   # rollout = anchor the ratio AND the Binary-TV divergence μ on the SGLang
   # sampler's emitted logprobs for ALL 4 mini-batch updates below — exact parity
   # with the released verl run (rollout_correction.bypass_mode=True). This is the
