@@ -27,6 +27,8 @@ _SUPERVISED_EXCLUDED_KEYS = {
     "prompt",
     "caption",
     "response",
+    "chosen",
+    "rejected",
     "messages",
     "tools",
     "media",
@@ -105,6 +107,8 @@ def normalize_supervised_example(
     if messages is not None:
         if "prompt" in item or "caption" in item or "response" in item:
             raise ValueError("Agent supervised examples use 'messages' and may not also set prompt/response fields.")
+        if "chosen" in item or "rejected" in item:
+            raise ValueError("Preference examples use 'prompt' with 'chosen'/'rejected' and may not set 'messages'.")
         if not isinstance(messages, list) or len(messages) < 2:
             raise ValueError("Agent supervised example 'messages' must be a list with at least two turns.")
         normalized_messages: List[Dict[str, Any]] = []
@@ -155,6 +159,18 @@ def normalize_supervised_example(
                     f"Supervised example 'response' must be a non-empty string, got {type(response).__name__}."
                 )
             record["response"] = response
+
+        has_preference = "chosen" in item or "rejected" in item
+        if has_preference:
+            if response is not None:
+                raise ValueError("Supervised example may not set both 'response' and 'chosen'/'rejected'.")
+            for key in ("chosen", "rejected"):
+                branch = item.get(key)
+                if not isinstance(branch, str) or not branch:
+                    raise ValueError(
+                        f"Preference example {key!r} must be a non-empty string, got {type(branch).__name__}."
+                    )
+                record[key] = branch
 
     media_refs = _normalize_media_refs(item.get("media_refs", item.get("media")), base_dir=base_dir)
     if media_refs:

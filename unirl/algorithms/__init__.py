@@ -17,6 +17,8 @@ _EXPORTS = (
     ("CPPO", "cppo"),
     ("CPPOConfig", "cppo"),
     ("Cosmos3JointFlowMatchSFT", "cosmos3_sft"),
+    ("DPO", "dpo"),
+    ("DPOConfig", "dpo"),
     ("DPPO", "dppo"),
     ("DPPOConfig", "dppo"),
     ("DRPO", "drpo"),

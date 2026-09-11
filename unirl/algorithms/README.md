@@ -51,6 +51,12 @@ not just three-tensor arithmetic.
   teacher LoRA adapters (backend-owned `frozen_adapters`), distillation rather than RL:
   it ignores advantages and picks its teacher from the batch's `metadata["domain"]`
   (`diffusionopd.py`).
+- **DPO is the offline preference family** (`dpo.py`) — the only algorithm here
+  that needs neither rollout nor advantages. It replays the same segment twice,
+  once with the LoRA adapter live and once under `adapters_disabled` (the
+  reference policy), reduces both to per-sequence log-probs, and applies the
+  Bradley-Terry objective to adjacent chosen/rejected rows. Despite the name it
+  is unrelated to `DPPO`/`FlowDPPO`, which are Divergence-PPO trust regions.
 - **The anchor contract — the subtle part.** bf16 forwards are batch-shape
   sensitive, so a π_old anchor computed at a different geometry than `new_logp`
   drifts the on-policy ratio off 1 (and FlowDPPO's KL off 0). Algorithms just declare
@@ -88,6 +94,27 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   so `stage.replay` still emits log-probs) **with `add_kl_coefficient=false`**. Never pair a
   near-zero `eta` with `add_kl_coefficient=true` — the KL divides by a transition std that
   scales with `eta` (the algorithm raises at init on `eta == 0`, but cannot judge "too small").
+- **DPO's pair layout is positional, so batch geometry is load-bearing.** A
+  preference `Part` is `2P` rows laid out `[chosen0, rejected0, chosen1, ...]`,
+  and the loss recovers the pair with `[0::2]`/`[1::2]`. Nothing downstream
+  knows a pair is a unit: `pytree_chunk` shards contiguously for `DP_SCATTER`
+  and `CountPlanner` slices contiguously into micros, so an odd rows-per-rank or
+  an odd `micro_batch_size` silently severs pairs. Hence `micro_batch_size: 2`
+  and a recipe `batch_size` counting **pairs** — with `batch_size % dp_size == 0`
+  already enforced by the trainer, pair-counted batches make rows-per-rank even
+  automatically. `DPO._split_adjacent` raises on an odd count rather than
+  training on mismatched rows.
+- **DPO is LoRA-only, and the adapter must not reach the frozen towers.** The
+  reference policy is the *same* weights with adapters disabled
+  (`_resolve_reference_model` raises without a LoRA adapter), so an adapter
+  injected inside `visual`/`audio_tower` would move the reference too and shrink
+  the objective toward zero. Keep `exclude_modules: ".*visual.*|.*audio_tower.*"`.
+- **DPO's first step should report `dpo_loss ≈ log 2 = 0.693`.** PEFT zero-inits
+  LoRA `B`, so before any optimizer step the policy and the adapter-disabled
+  reference are the same function and the logit margin is exactly 0. A first step
+  far from 0.693 means the reference is not actually frozen (or the pairing is
+  misaligned). Expect `reward_accuracy == 0` there too — exact ties fail the
+  strict `>`, so it is not a bug.
 - **AR `sampling_temperature` must equal the rollout `sampling.temperature`** —
   `ARStage.replay` rescales logits by it (`log_softmax(logits / T)`) to match SGLang's
   distribution; when unset it silently falls back to the `ARSamplingParams` default,

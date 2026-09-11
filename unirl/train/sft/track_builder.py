@@ -568,6 +568,51 @@ class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
         )
 
 
+class ARPreferenceTrackBuilder(ARSupervisedTrackBuilder):
+    """Preference records → one AR ``Part`` of ``2P`` rows, chosen at even indices; see ``README.md`` Gotchas."""
+
+    rows_per_record = 2
+
+    @distributed(dispatch_mode=Dispatch.DP_SCATTER)
+    def build(self, records: List[Record]) -> Part:
+        """Tokenize + embed one shard of preference records into adjacent chosen/rejected rows."""
+        if not records:
+            raise ValueError("ARPreferenceTrackBuilder.build: empty record shard.")
+        for r in records:
+            for key in ("chosen", "rejected"):
+                if not isinstance(r.get(key), str) or not r[key]:
+                    raise ValueError(
+                        f"ARPreferenceTrackBuilder: record {r.get('sample_id')!r} has no non-empty {key!r} — "
+                        "preference manifests must carry both branches."
+                    )
+        with torch.no_grad():
+            conditions = self._embed_prompts(records).repeat_interleave(2)
+            tokens, loss_masks = self._tokenize_preference_branches(records)
+        segment = TextSegment.pack(tokens=tokens, loss_mask=loss_masks)
+        part = Part(
+            sample_ids=[sid for sid in _sample_ids(records) for _ in range(2)],
+            conditions=conditions.to_dict(),
+            segment=segment,
+            metadata=[dict(record.get("metadata") or {}) for record in records for _ in range(2)],
+        )
+        if part.batch_size != 2 * len(records):
+            raise RuntimeError(
+                f"ARPreferenceTrackBuilder.build: built {part.batch_size} rows from {len(records)} "
+                "records — the chosen/rejected pairing is broken."
+            )
+        return part
+
+    def _tokenize_preference_branches(self, records: Sequence[Record]) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        """Interleave both branches as ``[chosen0, rejected0, chosen1, ...]`` via the shared response tokenizer."""
+        branch_records: List[Record] = []
+        for r in records:
+            for key in ("chosen", "rejected"):
+                branch = {k: v for k, v in r.items() if k not in ("chosen", "rejected")}
+                branch["response"] = r[key]
+                branch_records.append(branch)
+        return self._tokenize_responses(branch_records)
+
+
 class DiffusionSupervisedTrackBuilder(SupervisedTrackBuilder):
     """Dataset records → diffusion ``Part`` with an x0-only segment."""
 

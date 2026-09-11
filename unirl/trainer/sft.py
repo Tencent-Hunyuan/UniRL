@@ -7,7 +7,7 @@ import logging
 import os
 from typing import Any, Dict, List, Optional
 
-from hydra.utils import instantiate
+from hydra.utils import get_class, instantiate
 from omegaconf import DictConfig
 
 from unirl.distributed.group.placement import placement
@@ -81,7 +81,9 @@ class SFTTrainer(BaseTrainer):
             self.bundle = remote_hydra(bundle_cfg)
             self.pipeline = remote_hydra(pipeline_cfg, bundle=self.bundle)
             self.backend = remote_hydra(backend_cfg, bundle=self.bundle)
-            self.algorithm = remote_hydra(algorithm_cfg, pipeline=self.pipeline)
+            algo_cls = get_class(str(algorithm_cfg.get("_target_", "")))
+            algo_extra = {"backend": self.backend} if getattr(algo_cls, "requires_backend", False) else {}
+            self.algorithm = remote_hydra(algorithm_cfg, pipeline=self.pipeline, **algo_extra)
             self.stack = remote_hydra(stack_cfg, fsdp_backend=self.backend, algorithm=self.algorithm)
             self.track_builder = remote_hydra(track_builder_cfg, pipeline=self.pipeline)
 
@@ -90,13 +92,30 @@ class SFTTrainer(BaseTrainer):
         self.dp_size = self.stack.dp_size
         if self.batch_size % self.dp_size:
             raise ValueError(f"SFTTrainer: batch_size={self.batch_size} must be divisible by dp={self.dp_size}")
-        logger.info("SFTTrainer ready: dp=%d batch=%d", self.dp_size, self.batch_size)
+        # A preference builder emits 2 rows per record, so the pair must not straddle a rank or micro slice.
+        track_builder_cls = get_class(str(track_builder_cfg.get("_target_", "")))
+        self.rows_per_record = int(getattr(track_builder_cls, "rows_per_record", 1))
+        if self.rows_per_record > 1:
+            micro = int(stack_cfg.get("micro_batch_size", 1))
+            if micro % self.rows_per_record:
+                raise ValueError(
+                    f"SFTTrainer: stack.micro_batch_size={micro} must be a multiple of "
+                    f"rows_per_record={self.rows_per_record}, or a record's rows are split across "
+                    f"forwards and the pairwise loss cannot be formed."
+                )
+        logger.info(
+            "SFTTrainer ready: dp=%d batch=%d rows_per_record=%d", self.dp_size, self.batch_size, self.rows_per_record
+        )
 
     def _build_part(self, records: List[Dict[str, Any]], timer: PhaseTimer) -> Part:
         with timer.phase("build"):
             part = self.track_builder.build(records)
-        if part.batch_size != len(records):
-            raise RuntimeError(f"SFTTrainer: Part builder built {part.batch_size} rows from {len(records)} records.")
+        expected_rows = len(records) * self.rows_per_record
+        if part.batch_size != expected_rows:
+            raise RuntimeError(
+                f"SFTTrainer: Part builder built {part.batch_size} rows from {len(records)} records "
+                f"(expected {expected_rows} at rows_per_record={self.rows_per_record})."
+            )
         return part
 
     def train_step(
