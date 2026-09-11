@@ -32,11 +32,37 @@ class LocalLoraWeightSync(LoraWeightSyncBase):
             track_prefix=track_prefix,
         )
         self._rollout = rollout
+        self._cached = None
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def extract(self) -> None:
+        """Read the adapter out of the FSDP model and cache it (returns nothing)."""
+        self._extract_to_cache()
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def push(self) -> None:
+        """Load the adapter cached by :meth:`extract` into the engine."""
+        self._push_from_cache()
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def sync(self) -> None:
-        """Extract LoRA from the local FSDP model and load it into the engine."""
-        lora_tensors, peft_config = self._extract()
+        """:meth:`extract` + :meth:`push` in one dispatch — for the no-dance case."""
+        self._extract_to_cache()
+        self._push_from_cache()
+
+    def _extract_to_cache(self) -> None:
+        """Cache ``(tensors, peft_config)``; the read needs the trainer resident."""
+        self._cached = self._extract()
+
+    def _push_from_cache(self) -> None:
+        """Load the cached adapter into the engine, keeping the cache for reuse."""
+        if self._cached is None:
+            raise RuntimeError("LocalLoraWeightSync.push: call extract() (or sync()) first")
+        # The cache outlives the push on purpose. The adapter only changes when
+        # the optimizer steps, so a caller that pushes again before the next step
+        # -- an accumulate window, or an eval's later chunks -- can reuse it
+        # instead of onloading the trainer just to read identical weights.
+        lora_tensors, peft_config = self._cached
         self._rollout.set_lora_from_tensors(self._adapter_name, lora_tensors, peft_config=peft_config)
         rank = self.rank_info.rank if self.rank_info is not None else 0
         logger.info(

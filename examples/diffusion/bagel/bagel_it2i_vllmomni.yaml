@@ -62,11 +62,11 @@ workers_per_device: 1
 # rollouts the loop pushes the freshly-trained adapter into the vLLM-Omni engine.
 # 1 = on-policy; >1 lags rollout weights (off-policy drift).
 weight_sync_interval: 1
-# Safe default. Set false only after measuring the full training peak for the
-# exact model, reward, sampling geometry, and accelerator.
-enable_fsdp_offload: false
-offload_train_during_reward: false
-rollout_sleep_after_generate: true
+# Per-role residency. Park a role only after measuring the full training peak
+# for the exact model, reward, sampling geometry, and accelerator.
+train_resident: true
+rollout_resident: false
+reward_resident: true
 
 # NB: no `task_config.task: it2i` here. On the trainside recipe that pin is what
 # makes a source-image-less dataset fail loudly; on this path the modality does it —
