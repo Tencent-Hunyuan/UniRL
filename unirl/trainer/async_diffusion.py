@@ -42,12 +42,20 @@ class AsyncDiffusionTrainer(AsyncRolloutTrainerMixin, DiffusionTrainer):
                 "retain one rollout_id and one SDE schedule per training batch; "
                 f"got {max_inflight}."
             )
-        if bool(diffusion_kwargs.get("offload_train_during_reward", False)):
+        if not bool(diffusion_kwargs.get("reward_resident", True)):
             raise ValueError(
-                "AsyncDiffusionTrainer does not support offload_train_during_reward: async scoring "
-                "runs at reap time outside _reward_phase(), so the option would be silently ignored "
-                "and a reward sharing the train slab could still OOM. Remove the option or use the "
+                "AsyncDiffusionTrainer does not support reward_resident=false: async scoring runs "
+                "at reap time outside _reward_phase(), so the policy would be silently ignored and "
+                "a reward sharing the train slab could still OOM. Drop the key or use the "
                 "synchronous trainer."
+            )
+        if not bool(diffusion_kwargs.get("rollout_resident", True)):
+            raise ValueError(
+                "AsyncDiffusionTrainer does not support rollout_resident=false: the engine owns a "
+                "dedicated slab and is never idle -- the async loop keeps submitting prompts across "
+                "evaluation and checkpoint boundaries, so parking it there would sleep an engine "
+                "that is about to be asked to generate. Drop the key or use the synchronous "
+                "trainer."
             )
         per_worker_inflight = int(per_worker_inflight)
         cfg = diffusion_kwargs["cfg"]

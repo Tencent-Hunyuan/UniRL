@@ -18,6 +18,7 @@ from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample
 from unirl.trainer.eval_suites import EvalRewardSuite, build_eval_suites
 from unirl.trainer.hydra import parse_hydra_cfg, remote_hydra
+from unirl.trainer.residency import ResidencyPlanner, ResidencyPolicy, Role
 from unirl.types.primitives import Texts
 from unirl.types.sample import Sample
 from unirl.types.sampling import BaseSamplingParams, total_samples_per_prompt
@@ -183,6 +184,20 @@ _RETIRED_EVAL_KEYS = {
     "eval_mu": "not needed: dynamic-shift μ re-derives from the eval steps/resolution",
 }
 
+_RETIRED_RESIDENCY_KEYS = {
+    "enable_fsdp_offload": (
+        "train_resident: <inverted>   (true offloaded the trainer, so it becomes false; "
+        "the one key now covers every idle phase, not just generation)"
+    ),
+    "offload_train_during_reward": (
+        "train_resident: <inverted>   (true offloaded the trainer, so it becomes false; "
+        "the same one key covers generation as well)"
+    ),
+    "rollout_sleep_after_generate": (
+        "rollout_resident: <inverted>   (true was sleep-after-generate, so it becomes false)"
+    ),
+}
+
 # Engine/driver-owned object fields the overlay cannot carry: overrides come from
 # plain YAML (never hydra-instantiated), so a nested ``_target_`` would ride into
 # the params as a bare dict and only blow up deep inside the first eval's request
@@ -196,6 +211,19 @@ def cfg_scale_of(params: Any) -> float:
     """The CFG scale a diffusion params object will actually be sampled with."""
     scale = getattr(params, "cfg_text_scale", None)
     return float(params.guidance_scale if scale is None else scale)
+
+
+def reject_retired_residency_keys(cfg: Any) -> None:
+    """Fail fast on the phase-scoped offload flags that per-role residency replaced."""
+    present = sorted(key for key in _RETIRED_RESIDENCY_KEYS if cfg is not None and cfg.get(key) is not None)
+    if not present:
+        return
+    moves = "\n".join(f"  {key}: X   ->   {_RETIRED_RESIDENCY_KEYS[key]}" for key in present)
+    raise ValueError(
+        "These per-phase offload flags are not supported. Residency is now one choice per role, "
+        "held for as long as the role is idle, which is what lets the loop skip the offload/onload "
+        f"round trip they forced between generation and scoring:\n{moves}"
+    )
 
 
 def reject_retired_eval_keys(cfg: Any) -> None:
@@ -300,9 +328,9 @@ class DiffusionTrainer(BaseTrainer):
         train_fraction: float = 0.5,
         worker_max_concurrency: Optional[int | Sequence[int]] = None,
         reward_fraction: float = 0.0,
-        enable_fsdp_offload: bool = False,
-        offload_train_during_reward: bool = False,
-        rollout_sleep_after_generate: bool = True,
+        train_resident: bool = True,
+        rollout_resident: bool = False,
+        reward_resident: bool = True,
         adv_use_global_std: bool = False,
         accumulate_rollouts: int = 1,
         eval_interval: int = 0,
@@ -320,17 +348,19 @@ class DiffusionTrainer(BaseTrainer):
             worker_max_concurrency=worker_max_concurrency,
         )
         reject_retired_eval_keys(cfg)
+        reject_retired_residency_keys(cfg)
         self.batch_size = batch_size
         self._layout = str(layout)
         self._train_fraction = float(train_fraction)
-        self._enable_fsdp_offload = bool(enable_fsdp_offload)
-        # Independent from generate-time offload: when enabled, a reward that
-        # shares the train slab may borrow its GPU after generation completes.
-        self._offload_train_during_reward = bool(offload_train_during_reward)
-        # Process lifetime is independent from weight residency. False keeps an
-        # external rollout engine's weights resident after generate/eval; the
-        # default preserves the historical phase-sleep behavior.
-        self._rollout_sleep_after_generate = bool(rollout_sleep_after_generate)
+        # Residency is per role and phase-independent: `true` keeps a role's
+        # weights on the GPU while it is idle, `false` parks them on CPU. No
+        # value here ever stops a role's process; only its weights move.
+        self._residency_policy = ResidencyPolicy(
+            train_resident=bool(train_resident),
+            rollout_resident=bool(rollout_resident),
+            reward_resident=bool(reward_resident),
+        )
+        self._residency: Optional[ResidencyPlanner] = None
         self._adv_use_global_std = bool(adv_use_global_std)
         self.eval_interval = int(eval_interval)
         self.eval_num_prompts = int(eval_num_prompts)
@@ -342,6 +372,11 @@ class DiffusionTrainer(BaseTrainer):
         self._task_config: Dict[str, Any] = dict(task_config) if task_config else {}
         self._rollout_is_trainside = False
         self._uses_ema = False
+        # Set from the built weight_sync's capabilities in _build_residency_planner.
+        self._staged_weight_sync = False
+        # Whether the weight sync still holds the adapter this trainer last read.
+        # Invalidated by the optimizer step, which is the only thing that changes it.
+        self._adapter_cached = False
 
         self.data_source = instantiate(data_source_cfg)
         self._data_source_cfg = data_source_cfg
@@ -462,7 +497,7 @@ class DiffusionTrainer(BaseTrainer):
         self.accumulate_rollouts = int(accumulate_rollouts)
         self._validate_accumulation(stack_cfg)
 
-        self._validate_residency_config()
+        self._build_residency_planner()
         _validate_dp_geometry(
             batch_size=int(batch_size),
             samples_per_prompt=total_samples_per_prompt(self.sampling_params),
@@ -556,37 +591,65 @@ class DiffusionTrainer(BaseTrainer):
         self._uses_ema = getattr(algo_cls, "requires_ema_rollout", False)
         # requires_advantages=False algorithms keep rewards for monitoring only.
         self._algo_requires_advantages = getattr(algo_cls, "requires_advantages", True)
-        if self._uses_ema and self._offload_train_during_reward:
-            raise ValueError(
-                "offload_train_during_reward is not supported with EMA/DiffusionNFT algorithms "
-                f"({algo_cls.__name__} sets requires_ema_rollout): the reward-phase offload has "
-                "not been validated against backend.ema state. Disable one of the two instead of "
-                "having the trainer silently ignore the requested policy."
-            )
         needs_backend = self._uses_ema or getattr(algo_cls, "requires_backend", False)
         algo_extra = {"backend": self.backend} if needs_backend else {}
         self.algorithm = remote_hydra(algorithm_cfg, pipeline=self.pipeline, **algo_extra)
         self.stack = remote_hydra(stack_cfg, fsdp_backend=self.backend, algorithm=self.algorithm)
 
-    def _validate_residency_config(self) -> None:
-        """Reject requested residency policies that the selected topology drops."""
-        if self._offload_train_during_reward and self.reward is None:
-            raise ValueError(
-                "offload_train_during_reward requires a configured reward: this run has no reward phase "
-                "to borrow train memory. Disable the unused policy or configure a reward."
-            )
-        if (
-            self._uses_ema
-            and self._enable_fsdp_offload
-            and self._layout != "separate"
-            and not self._rollout_is_trainside
-        ):
-            raise ValueError(
-                "enable_fsdp_offload is not supported with EMA/DiffusionNFT algorithms and an "
-                "external colocated rollout: generation-time train offload has not been validated "
-                "against backend.ema state. Disable one of the two instead of having the trainer "
-                "silently ignore the requested policy."
-            )
+    def _build_residency_planner(self) -> None:
+        """Wire the residency planner to the roles that actually share this slab."""
+        policy = self._residency_policy
+        # Capability, not class name: a parked trainer needs the push split into a
+        # read (weights resident) and a load (rollout awake), which only the LoRA
+        # syncs expose. Probe the built object so a new implementation is picked up
+        # by having the methods rather than by being named.
+        self._staged_weight_sync = self.weight_sync is not None and all(
+            hasattr(self.weight_sync, name) for name in ("extract", "push")
+        )
+        # Train is parkable only where parking frees something the active role can
+        # use: not on a separate slab, and not behind a trainside rollout, whose
+        # generation reads the very weights that would be parked.
+        train_parkable = self._layout != "separate" and not self._rollout_is_trainside
+        if not policy.train_resident:
+            # Order matters: an unparkable trainer is the more basic reason, and
+            # reporting the sync instead would send the reader after the wrong knob.
+            if not train_parkable:
+                reason = (
+                    f"layout: {self._layout} puts the trainer on its own slab"
+                    if self._layout == "separate"
+                    else "a trainside rollout generates from the trainer's own weights"
+                )
+                raise ValueError(
+                    f"train_resident=false has nothing to park here: {reason}, so parking would "
+                    "move memory no other role can use. Drop the key instead of having the trainer "
+                    "silently ignore the requested policy."
+                )
+            if self.weight_sync is not None and not self._staged_weight_sync:
+                raise ValueError(
+                    "train_resident=false is not supported with this weight sync: "
+                    f"{type(self.weight_sync).__name__} exposes sync() alone, which reads the "
+                    "trainer's weights and loads them into the rollout in one call, so it cannot "
+                    "run with the trainer parked. Use a LoRA sync, or set train_resident=true "
+                    "instead of having the trainer silently ignore the requested policy."
+                )
+            if self._uses_ema and not self._rollout_is_trainside:
+                raise ValueError(
+                    "train_resident=false is not supported with EMA/DiffusionNFT algorithms and an "
+                    "external colocated rollout: parking the trainer has not been validated against "
+                    "backend.ema state, which the contrastive branch reads. Set train_resident=true "
+                    "instead of having the trainer silently ignore the requested policy."
+                )
+        self._residency = ResidencyPlanner(
+            policy,
+            train=(self.backend.onload, self.backend.offload) if train_parkable else None,
+            rollout=(self.rollout.wake_up, self.rollout.sleep),
+            reward=(
+                (self.reward.onload, self.reward.offload)
+                if self.reward is not None and not self._reward_is_separate
+                else None
+            ),
+            run_steps=_run_cleanup_steps,
+        )
 
     def _build_rollout(self, rollout_cfg, *, allow_pipeline: bool):
         """Build the rollout remote in the currently active placement scope."""
@@ -678,26 +741,36 @@ class DiffusionTrainer(BaseTrainer):
             request = request.with_parts([*request.parts[:-1], frontier])
         return request
 
-    def _offload_for_reward_phase(self) -> bool:
-        """Whether a colocated reward may temporarily borrow the train cards."""
-        return self._offload_train_during_reward and not self._reward_is_separate
+    def _prepare_for_save(self) -> None:
+        """Checkpointing reads the trainer's weights, and evaluate() may have parked them."""
+        self._residency.enter(Role.TRAIN)
+
+    def _cache_adapter_for_push(self) -> bool:
+        """Read the adapter while the trainer is resident; True if a later push can use it."""
+        if self.weight_sync is None or not self._staged_weight_sync:
+            return False
+        if not self._adapter_cached:
+            # enter() rather than set(): the read must not put the trainer on the
+            # slab beside a reward that the rollout phase has not parked yet.
+            self._residency.enter(Role.TRAIN)
+            self.weight_sync.extract()
+            self._adapter_cached = True
+        return True
+
+    def _push_or_sync(self, *, staged: bool) -> None:
+        """Load the adapter into an awake rollout, from cache when one was taken."""
+        if self.weight_sync is None:
+            return
+        if staged:
+            self.weight_sync.push()
+        else:
+            self.weight_sync.sync()
 
     @contextmanager
     def _reward_phase(self) -> Iterator[None]:
-        """Temporarily offload FSDP state while a colocated reward is active."""
-        should_offload = self._offload_for_reward_phase()
-        try:
-            if should_offload:
-                self.backend.offload()
-            yield
-        finally:
-            if should_offload:
-                _run_cleanup_steps([("reward train onload", self.backend.onload)])
-
-    def _sleep_rollout_then_onload_train(self) -> None:
-        """Restore train state only after the colocated rollout is safely asleep."""
-        self.rollout.sleep()
-        self.backend.onload()
+        """Give the reward the slab, leaving the trainer parked if it already is."""
+        self._residency.enter(Role.REWARD)
+        yield
 
     def _generate_with_residency(
         self,
@@ -706,26 +779,25 @@ class DiffusionTrainer(BaseTrainer):
         sync_weights: bool,
         sleep_rollout: bool,
     ) -> Sample:
-        """Generate with exception-safe EMA, rollout, and FSDP lifecycle cleanup."""
-        # No EMA term: _validate_residency_config already rejected the EMA x
-        # offload x colocated-external combination at startup, fail-fast
-        # instead of silently skipping the requested offload here.
-        should_offload_train = (
-            self._enable_fsdp_offload and self._layout != "separate" and not self._rollout_is_trainside
-        )
+        """Generate with exception-safe EMA and residency cleanup."""
+        # No EMA term: _build_residency_planner already rejected the EMA x
+        # parked-train x colocated-external combination at startup, fail-fast
+        # instead of silently skipping the requested policy.
+        will_park_train = not self._residency.policy.train_resident and self._residency.parkable(Role.TRAIN)
         # Swap EMA weights only for trainside rollout; remote engines receive
         # them through weight sync.
         should_swap_ema = self._uses_ema and self._rollout_is_trainside
-        train_offload_attempted = False
+        staged_sync = False
         ema_apply_attempted = False
         generation_succeeded = False
         try:
-            self.rollout.wake_up()
-            if sync_weights and self.weight_sync is not None:
-                self.weight_sync.sync()
-            if should_offload_train:
-                train_offload_attempted = True
-                self.backend.offload()
+            if sync_weights and will_park_train:
+                staged_sync = self._cache_adapter_for_push()
+            # Parks the trainer (and a non-resident reward) before waking the
+            # rollout, so the peak never holds two roles at once.
+            self._residency.enter(Role.ROLLOUT)
+            if sync_weights:
+                self._push_or_sync(staged=staged_sync)
             if should_swap_ema:
                 ema_apply_attempted = True
                 self.backend.apply_eval_ema()
@@ -736,25 +808,18 @@ class DiffusionTrainer(BaseTrainer):
             cleanup_steps: List[Tuple[str, Callable[[], None]]] = []
             if ema_apply_attempted:
                 cleanup_steps.append(("EMA restore", self.backend.restore_from_eval))
-            should_sleep_rollout = sleep_rollout or not generation_succeeded
-            if should_sleep_rollout and train_offload_attempted:
-                # These operations are dependent: if sleep fails, loading FSDP
-                # into a still-resident rollout can turn the original error into
-                # a second OOM and leave both roles partially initialized.
-                cleanup_steps.append(
-                    ("rollout sleep before generate train onload", self._sleep_rollout_then_onload_train)
-                )
-            elif should_sleep_rollout:
-                cleanup_steps.append(("rollout sleep", self.rollout.sleep))
-            elif train_offload_attempted:
-                cleanup_steps.append(("generate train onload", self.backend.onload))
             _run_cleanup_steps(cleanup_steps)
+            # The trainer is deliberately not reloaded here. It stays parked
+            # through the reward phase and comes back once, before the optimizer
+            # step, which is the only point that needs it.
+            if sleep_rollout or not generation_succeeded:
+                self._residency.set(Role.ROLLOUT, False)
 
     def _generate_for_training(self, sample: Sample, *, sync_weights: bool) -> Sample:
         return self._generate_with_residency(
             sample,
             sync_weights=sync_weights,
-            sleep_rollout=self._rollout_sleep_after_generate,
+            sleep_rollout=not self._residency.policy.rollout_resident,
         )
 
     def _rollout_and_score(
@@ -815,6 +880,14 @@ class DiffusionTrainer(BaseTrainer):
         final_id = window_ids[-1]
         training_progress = final_id / max(1, num_rollouts - 1)
         parts = tuple(sample.parts[-1] for sample in samples)
+        # First point in the window that needs the trainer on the GPU. With
+        # accumulate_rollouts > 1 it stayed parked across every rollout and
+        # reward above, so this is one onload per optimizer step rather than one
+        # per rollout.
+        self._residency.enter(Role.TRAIN)
+        # Invalidate before the step, not after: once it has begun the weights can
+        # change, so a step that raises must not leave the cache looking current.
+        self._adapter_cached = False
         result = self.stack.train_track(
             parts if len(parts) > 1 else parts[0], training_progress=float(training_progress)
         )
@@ -844,7 +917,7 @@ class DiffusionTrainer(BaseTrainer):
         eval_sp = self._eval_sampling_params
         eval_diffusion = eval_sp.get("diffusion")
         sync_requested = bool(sync_weights)
-        sleep_requested = sleep_after and self._rollout_sleep_after_generate
+        sleep_requested = sleep_after and not self._residency.policy.rollout_resident
         # A no-sync evaluation must preserve the already-resident adapter.
         # Engines such as SGLang discard their LoRA pool on sleep and cannot
         # reconstruct it without a push, so keep them awake across chunks and
@@ -890,11 +963,11 @@ class DiffusionTrainer(BaseTrainer):
             if not generated_any:
                 self._prepare_empty_evaluation(sync_weights=sync_pending, sleep_rollout=sleep_requested)
             elif sleep_at_end:
-                self.rollout.sleep()
+                self._residency.set(Role.ROLLOUT, False)
             evaluation_succeeded = True
         finally:
             if not evaluation_succeeded:
-                _run_cleanup_steps([("evaluation rollout sleep", self.rollout.sleep)])
+                _run_cleanup_steps([("evaluation rollout sleep", lambda: self._residency.set(Role.ROLLOUT, False))])
         logger.info(
             "EVAL step %d  (%d samples/prompt, %d steps, %dx%d, cfg=%.1f eta=%.1f)  %s",
             step,
@@ -913,13 +986,16 @@ class DiffusionTrainer(BaseTrainer):
         """Preserve evaluation wake/sync/sleep semantics when every set is empty."""
         prepare_succeeded = False
         try:
-            self.rollout.wake_up()
-            if sync_weights and self.weight_sync is not None:
-                self.weight_sync.sync()
+            staged = self._cache_adapter_for_push() if sync_weights else False
+            self._residency.enter(Role.ROLLOUT)
+            if sync_weights:
+                self._push_or_sync(staged=staged)
             prepare_succeeded = True
         finally:
             if sleep_rollout or not prepare_succeeded:
-                _run_cleanup_steps([("empty evaluation rollout sleep", self.rollout.sleep)])
+                _run_cleanup_steps(
+                    [("empty evaluation rollout sleep", lambda: self._residency.set(Role.ROLLOUT, False))]
+                )
 
     def _eval_pass(
         self,

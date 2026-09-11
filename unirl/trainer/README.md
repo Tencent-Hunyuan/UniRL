@@ -52,17 +52,37 @@ stay swappable by `_target_`.
   Parts for training. (ReFL — which differentiates
   directly through decoded media and uses no rollout Samples or advantages —
   lives outside core as `experimental/refl`.)
-- **Diffusion role residency is opt-in.** `rollout_sleep_after_generate=true`
-  preserves phase-based rollout sleep (the default; the async entry point
-  defaults it to `false` — its dedicated rollout slab stays resident); `false`
-  keeps an external engine's weights resident across rollout/reward/train. Train-state policies are
-  independent: `enable_fsdp_offload` lets an external rollout borrow train memory
-  during generation, while `offload_train_during_reward` lets a reward sharing the
-  train slab borrow it during scoring. A reward on a separate `reward_fraction`
-  slab never triggers train offload. `offload_train_during_reward` is rejected at
-  startup with EMA/DiffusionNFT algorithms (unvalidated against `backend.ema`
-  state) and with `AsyncDiffusionTrainer` (async scoring runs outside
-  `_reward_phase()`), rather than being silently ignored.
+- **Diffusion residency is one choice per role, not per phase.** `train_resident`,
+  `rollout_resident` and `reward_resident` each say whether that role keeps its
+  weights on the GPU while it is idle; only weights move, never a role's process.
+  Defaults (`true`/`false`/`true`) reproduce the historical behaviour, and the
+  async entry point keeps its dedicated rollout slab resident. `ResidencyPlanner`
+  turns a phase's needs into transitions and issues only the ones that change
+  something, so a reward phase inherits an already-parked trainer instead of
+  re-offloading it, and the trainer returns once per optimizer step rather than
+  once per rollout. Roles that do not share the slab — a reward behind
+  `reward_fraction`, or the trainer behind `layout: separate` or a trainside
+  rollout — are not tracked, so nothing moves memory the active role could not
+  use — and asking to park one of them is rejected rather than ignored. The
+  startup rejections are: `train_resident=false` where there is nothing to park
+  (`layout: separate`, or a trainside rollout, whose generation reads the very
+  weights that would go), with a full-weight sync whose single `sync()` reads the
+  trainer and loads the rollout in one call, or with EMA/DiffusionNFT plus an
+  external colocated rollout (unvalidated against `backend.ema` state); and under
+  `AsyncDiffusionTrainer`, `reward_resident=false` (async scoring runs outside
+  `_reward_phase()`) and `rollout_resident=false` (the engine owns a dedicated slab
+  and is never idle, so parking it at an evaluation or checkpoint boundary would
+  sleep an engine the loop is about to use).
+
+  Both the optimizer step and checkpointing consume the trainer, so it is made
+  resident before each; the checkpoint one sits behind
+  `maybe_save_checkpoint`'s own due-or-not predicate, so a window that evaluates
+  without saving keeps the trainer parked. A LoRA sync holds its extracted adapter
+  past the push and until the next optimizer step, so an accumulate window and an
+  eval's later chunks reuse it instead of onloading the trainer to read weights
+  that cannot have changed. A pinned rollout (`rollout_resident: true`) is not
+  slept even when generation raises: the policy says its weights stay put, and the
+  caller that set it owns the peak.
 
 The current trainer surface is:
 
