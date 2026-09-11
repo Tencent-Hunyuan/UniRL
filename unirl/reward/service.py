@@ -148,9 +148,15 @@ class RewardService(Remote):
     def is_available(self) -> bool:
         return self.backend.is_available()
 
+    # Broadcast, not scatter: every reward worker holds its own copy of the
+    # scorer, so each has to move its own weights. Undecorated, these were
+    # unreachable through the role's Handle, which is why nothing had ever
+    # driven reward residency from the training loop.
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
     def offload(self) -> None:
         self.backend.offload()
 
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
     def onload(self) -> None:
         self.backend.onload()
 
