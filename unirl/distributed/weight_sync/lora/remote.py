@@ -64,7 +64,7 @@ class RemoteLoraWeightSync(LoraWeightSyncBase):
             self._cached = (lora_tensors, peft_config)
 
     def _push_from_cache(self) -> None:
-        """Rank 0 ships the cached adapter to the targets, then clears the cache."""
+        """Rank 0 ships the cached adapter to the targets, keeping the cache for reuse."""
         rank = self.rank_info.rank if self.rank_info is not None else 0
         if rank != 0:
             return
@@ -72,8 +72,11 @@ class RemoteLoraWeightSync(LoraWeightSyncBase):
             raise RuntimeError("RemoteLoraWeightSync.push: call extract() (or sync()) first")
         if not self._targets:
             raise RuntimeError("RemoteLoraWeightSync.push: call set_rollout_targets() first")
+        # Held past the push, like LocalLoraWeightSync: the adapter only changes
+        # when the optimizer steps, so a caller that pushes again before the next
+        # step reuses it rather than reading a parked trainer. The trainer tracks
+        # that with one flag for both implementations, so they have to agree.
         lora_tensors, peft_config = self._cached
-        self._cached = None
 
         import ray
 
