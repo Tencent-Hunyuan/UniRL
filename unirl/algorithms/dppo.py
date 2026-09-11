@@ -87,6 +87,10 @@ class DPPO(StageAlgorithm):
     """DPPO for AR token-level policies — the foundational Binary-TV trust region."""
 
     supports_multi_update = True
+    anchor_fields = ("log_probs",)
+
+    def recomputes_anchor(self) -> bool:
+        return self.old_logp_source == "replay"
 
     def __init__(
         self,
