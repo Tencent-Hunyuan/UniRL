@@ -96,7 +96,8 @@ backend:
     _target_: unirl.train.configs.LoraConfig
     rank: 32
     alpha: 64
-    dropout: 0.05
+    # PEFT's ParamWrapper (target_parameters) rejects lora_dropout != 0.
+    dropout: 0.0
     bias: none
     task_type: CAUSAL_LM
     target_modules:

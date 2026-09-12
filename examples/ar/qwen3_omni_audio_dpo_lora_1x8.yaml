@@ -94,7 +94,8 @@ backend:
     _target_: unirl.train.configs.LoraConfig
     rank: 32
     alpha: 64
-    dropout: 0.05
+    # PEFT's ParamWrapper (target_parameters) rejects lora_dropout != 0.
+    dropout: 0.0
     bias: none
     task_type: CAUSAL_LM
     target_modules:
@@ -102,6 +103,11 @@ backend:
       - k_proj
       - v_proj
       - o_proj
+    # Packed MoE experts are nn.Parameter, so they need naming here rather than in
+    # target_modules; training-only (see unirl/train/readme.md Gotchas).
+    target_parameters:
+      - gate_up_proj
+      - down_proj
     # PEFT injects adapters by name even under frozen encoder modules, and an
     # adapter inside a tower would also change what the reference policy is.
     exclude_modules: ".*visual.*|.*audio_tower.*"

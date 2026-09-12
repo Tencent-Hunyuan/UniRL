@@ -98,6 +98,12 @@ def inject_lora(
     extra: Dict[str, Any] = {}
     if target_parameters:
         # Packed MoE experts are nn.Parameter, not nn.Linear, so PEFT needs them named here.
+        if float(dropout) != 0.0:
+            raise ValueError(
+                f"inject_lora: target_parameters={list(target_parameters)} routes through PEFT's "
+                f"ParamWrapper, which rejects lora_dropout != 0; got dropout={dropout}. Set "
+                f"lora_cfg.dropout=0.0, or drop target_parameters."
+            )
         extra["target_parameters"] = list(target_parameters)
 
     peft_cfg = LoraConfig(
