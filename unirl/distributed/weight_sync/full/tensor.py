@@ -23,6 +23,7 @@ class TensorWeightSync(FullWeightSync):
         name_remap: Optional[Dict[str, Optional[str]]] = None,
         track_prefix: str = "",
         wire_dtype: Any = None,
+        delta_sync: bool = False,
     ) -> None:
         super().__init__(
             backend=backend,
@@ -33,6 +34,7 @@ class TensorWeightSync(FullWeightSync):
             name_remap=name_remap,
             track_prefix=track_prefix,
             wire_dtype=wire_dtype,
+            delta_sync=delta_sync,
         )
         self._rollout = rollout
 
