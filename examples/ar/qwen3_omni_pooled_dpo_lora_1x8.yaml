@@ -1,5 +1,5 @@
 # @package _global_
-# Qwen3-Omni Thinker · Omni-Preference pooled audio+image · offline DPO + LoRA · 8 GPU.
+# Qwen3-Omni Thinker · Omni-Preference pooled audio+image+video · offline DPO + LoRA · 8 GPU.
 #
 # Offline direct preference optimization: no rollout, no reward, no weight sync.
 # One manifest row is one preference pair; ARPreferenceTrackBuilder expands it
@@ -11,8 +11,9 @@
 #
 # Prepare:
 #   python datasets/omni_preference/convert_omni_preference_to_unirl.py \
-#     --snapshot /path/to/Omni-Preference --modality image   # then concatenate with the audio manifest \
-#     --out-dir datasets/omni_preference_pooled_dpo
+#     --snapshot /path/to/Omni-Preference --modality audio|image|video \
+#     --out-dir datasets/omni_preference_<modality>_dpo
+#   then pool the three, equalising rows per modality (see the dataset README).
 #
 # Launch:
 #   QWEN3_OMNI_PATH=/path/to/Qwen3-Omni-30B-A3B-Instruct \
@@ -37,7 +38,7 @@ logging:
   project_name: ${oc.env:WANDB_PROJECT,unirl-qwen3-omni-dpo}
   run_name: ${oc.env:WANDB_RUN_NAME,qwen3-omni-omni-preference-pooled-dpo-lora}
   entity: ${oc.env:WANDB_ENTITY,null}
-  tags: [dpo, qwen3-omni, thinker, pooled, audio, image, omni-preference, lora, moe-lora, 1x8]
+  tags: [dpo, qwen3-omni, thinker, pooled, audio, image, video, omni-preference, lora, moe-lora, 1x8]
 
 bundle:
   _target_: unirl.models.qwen3_omni.bundle.Qwen3OmniBundle.from_config
@@ -54,13 +55,21 @@ bundle:
     lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
     use_gradient_checkpointing: true
     max_prompt_length: 16384
-    image_max_pixels: 262144
+    # Media budgets follow verl's published Omni-Preference DPO run, whose accuracy
+    # this recipe is benchmarked against; they are wider than the GSPO recipes' 262144.
+    image_max_pixels: 602112
+    video_max_pixels: 602112
+    video_max_frames: 8
+    video_fps: 2.0
     use_audio_in_video: false
 
 pipeline:
   _target_: unirl.models.qwen3_omni.pipeline.Qwen3OmniPipeline.from_bundle
   max_prompt_length: 16384
   image_max_pixels: ${bundle.config.image_max_pixels}
+  video_max_pixels: ${bundle.config.video_max_pixels}
+  video_max_frames: ${bundle.config.video_max_frames}
+  video_fps: ${bundle.config.video_fps}
   use_audio_in_video: false
   autocast_precision: bf16
   logprob_precision: fp32

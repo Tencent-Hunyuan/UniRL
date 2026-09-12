@@ -5,6 +5,8 @@ Rubric-grounded multimodal preference pairs for Qwen3-Omni Thinker offline DPO.
 Used by:
 
 - `examples/ar/qwen3_omni_audio_dpo_lora_1x8.yaml`
+- `examples/ar/qwen3_omni_image_dpo_lora_1x8.yaml`
+- `examples/ar/qwen3_omni_pooled_dpo_lora_1x8.yaml`
 
 ## Source
 
@@ -64,6 +66,15 @@ the medium referenced at `role="prompt"`:
 Observed audio counts: 5707 raw rows → 1335 dropped as `equal` → 4372 pairs
 (4155 train / 217 val at the default `--test-ratio 0.05`).
 
+## Pool the modalities
+
+The pooled recipe trains on all three modalities at once. Concatenating the
+per-modality manifests as-is would weight each modality by its row count;
+`group_by_modality` then emits proportionally many single-modality blocks. Take
+the same number of rows from each modality instead — a multiple of the recipe's
+`batch_size`, so no modality contributes a partial block — and interleave the
+validation splits round-robin so that a `eval_num_samples` prefix stays balanced.
+
 ## Gotchas
 
 - **Media basenames in the jsonl are not byte-equal to the filenames on disk.**
@@ -74,5 +85,10 @@ Observed audio counts: 5707 raw rows → 1335 dropped as `equal` → 4372 pairs
   all 1167 — a literal matcher silently discards ~61% of the data as "missing
   media" instead of failing.
 - **One modality per manifest.** The converter writes one directory per
-  `--modality` and the recipe points at a single pair of manifests. Mixed-modality
-  batches are untested here.
+  `--modality`. Pool them only as described above; mixing modalities inside a
+  single batch breaks `Batch.slice` (see `unirl/train/readme.md` Gotchas).
+- **A blanket `hf download --include 'video-dataset/*'` is not worth running.**
+  The repo holds 11765 video files but `final_rl_data.jsonl` references only
+  1572 of them, and the blanket walk resolves roughly one file per two seconds
+  against roughly five per second for direct per-file fetches. Fetch the
+  referenced basenames instead.
