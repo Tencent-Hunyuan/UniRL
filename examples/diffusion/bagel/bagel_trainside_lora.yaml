@@ -46,6 +46,7 @@ bundle:
 
 pipeline:
   _target_: unirl.models.bagel.pipeline.BagelPipeline
+  batch_replay_steps: true
   # v3-equivalent: bf16 heads + bf16 transformer compute under autocast bf16 (no
   # fp32-heads → vendor stays byte-pristine). fp32 LoRA master (below) is the only
   # precision lever — it is THE reward-collapse fix.
