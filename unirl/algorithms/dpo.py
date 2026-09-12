@@ -96,6 +96,8 @@ class DPO(StageAlgorithm):
             return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
 
         loss, metrics, num_pairs = self._pair_loss(conditions, segment)
+        if num_pairs == 0:
+            return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
         (loss * loss_scale).backward()
         return AlgorithmStepResult(
             loss=float(loss.detach().item()),
@@ -112,12 +114,24 @@ class DPO(StageAlgorithm):
         segment: "TextSegment",
         sample_ids: Optional[Sequence[str]] = None,
     ) -> Tuple[float, float]:
-        """Forward-only ``(loss_sum, num_pairs)`` for validation."""
+        """Forward-only ``(loss_sum, num_pairs)`` for validation; zero-mask pad pairs are excluded."""
         del sample_ids
         if segment is None or segment.tokens is None or int(segment.tokens.shape[0]) == 0:
             return 0.0, 0.0
         loss, _, num_pairs = self._pair_loss(conditions, segment)
+        if num_pairs <= 0:
+            return 0.0, 0.0
         return float(loss.detach().item()) * num_pairs, float(num_pairs)
+
+    @staticmethod
+    def _real_pair_mask(segment: "TextSegment", reference: torch.Tensor) -> Optional[torch.Tensor]:
+        """Boolean ``[P]`` keeping pairs with any supervised token, or None when all are real."""
+        if segment.loss_mask is None or segment.lengths is None:
+            return None
+        per_row = torch.split(segment.loss_mask, segment.lengths.tolist())
+        alive = torch.tensor([bool(chunk.any()) for chunk in per_row], device=reference.device)
+        keep = alive[0::2] | alive[1::2]
+        return None if bool(keep.all()) else keep
 
     def _pair_loss(
         self,
@@ -136,6 +150,15 @@ class DPO(StageAlgorithm):
         ref_seq = self._reduce_to_sequences(ref_logp.detach(), segment)
         policy_chosen, policy_rejected = self._split_adjacent(policy_seq)
         ref_chosen, ref_rejected = self._split_adjacent(ref_seq)
+
+        # Drop DP-pad pairs (both branches fully masked) before the mean: they would each
+        # score exactly log 2 and pull the reported loss toward it.
+        keep = self._real_pair_mask(segment, policy_chosen)
+        if keep is not None:
+            if not bool(keep.any()):
+                return policy_chosen.sum() * 0.0, {}, 0
+            policy_chosen, policy_rejected = policy_chosen[keep], policy_rejected[keep]
+            ref_chosen, ref_rejected = ref_chosen[keep], ref_rejected[keep]
 
         logits = (policy_chosen - policy_rejected) - (ref_chosen - ref_rejected)
         if self.loss_type == "ipo":
