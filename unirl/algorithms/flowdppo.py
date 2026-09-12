@@ -265,7 +265,7 @@ class FlowDPPO(StageAlgorithm):
         target_steps: List[int],
         device: torch.device,
     ) -> torch.Tensor:
-        """Per-step KL-normalization sigma_t ``[1, S', 1, 1, 1]``; ones when ``add_kl_coefficient=False``."""
+        """Per-step KL-normalization sigma_t ``[1, S']``; ones when ``add_kl_coefficient=False``."""
         return _transition_sigma(
             self.stage,
             segment=segment,
