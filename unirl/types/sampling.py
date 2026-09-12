@@ -116,3 +116,8 @@ class ARSamplingParams(BaseSamplingParams):
     top_k: int = 0
     stop_token_id: int | None = None
     seed: Optional[int] = None  # engines with per-request seeded sampling derive child seeds from this + sample_id
+
+    @property
+    def emits_fixed_length(self) -> bool:
+        """Return whether ``max_new_tokens`` is an exact length rather than a cap."""
+        return False

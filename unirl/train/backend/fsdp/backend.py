@@ -61,6 +61,12 @@ class FSDPBackend(BaseFSDP2Backend):
         )
 
         model = resolve_trainable_module(bundle, trainable_attr)
+        if getattr(bundle, "requires_unwrapped_trainable_root", False) and fsdp_cfg.root_wrap:
+            raise ValueError(
+                f"{type(bundle).__name__} requires fsdp_cfg.root_wrap=false because its stages call replicated "
+                "trainable-root children directly; root wrapping would expose sharded DTensors outside the root "
+                "forward."
+            )
         shadow = self._inject_structural(model, lora_cfg, ema_lora_cfg, ema_cfg)
 
         fsdp_wrap(

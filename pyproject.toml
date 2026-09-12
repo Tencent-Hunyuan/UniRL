@@ -108,6 +108,8 @@ cosmos3 = [
 ]
 infer = [
   "accelerate>=0.30",
+  # Janus-Pro's vendored SigLIP implementation imports timm directly.
+  "timm>=0.9.16",
 ]
 eval = [
   "torchvision>=0.16",
@@ -210,6 +212,9 @@ include = [
   "unirl.*",
 ]
 
+[tool.setuptools.package-data]
+"unirl.models.janus_pro.vendor" = ["LICENSE-CODE", "VENDOR_COMMIT.txt"]
+
 [tool.ruff]
 line-length = 120
 target-version = "py312"
@@ -221,6 +226,7 @@ target-version = "py312"
 extend-exclude = [
   "unirl-reward-service",
   "unirl/models/bagel/vendor",
+  "unirl/models/janus_pro/vendor",
   "unirl/models/sensenova_u1/vendor",
 ]
 

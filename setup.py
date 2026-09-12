@@ -13,6 +13,9 @@ setup(
             "unirl.*",
         ),
     ),
+    package_data={
+        "unirl.models.janus_pro.vendor": ["LICENSE-CODE", "VENDOR_COMMIT.txt"],
+    },
     install_requires=[
         "numpy>=1.24,<3",
         "torch>=2.1",
@@ -24,6 +27,7 @@ setup(
         "transformers>=5.6,<5.7",
         "peft>=0.14.0",
         "safetensors>=0.4",
+        "einops>=0.7",
         "Pillow>=10",
         "requests>=2.31",
         "psutil>=5.9",
@@ -39,6 +43,7 @@ setup(
         ],
         "infer": [
             "accelerate>=0.30",
+            "timm>=0.9.16",
         ],
         "eval": [
             "torchvision>=0.16",
