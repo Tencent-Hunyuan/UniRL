@@ -192,6 +192,7 @@ ar:
     stage_attr: ar
     clip_range: 1.0e-2 # AR track — diffusion track above keeps 1e-4
     clip_schedule: constant
+    sampling_temperature: ${sampling.ar.temperature}
     conditions_cls:
       _target_: hydra.utils.get_class
       path: unirl.models.qwen3.conditions.Qwen3ARConditions
