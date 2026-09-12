@@ -93,10 +93,20 @@ saturates.
 `2e-5` buys nothing over `1e-5` (+0.0004) and its eval loss is non-monotone early
 (0.4714 at step 25, 0.4827 at step 50), so `1e-5` is the recipe default.
 
+Raising LoRA rank past 32 does not help either: `rank=128, alpha=256` at `1e-5`
+lands at 0.8289 [0.803, 0.855], *below* `rank=32`. Capacity is not the binding
+constraint.
+
 Accuracy here weights the three modalities equally, which is what the reference
 protocol does (`val_max_samples=96` split evenly across modalities). Averaging over
 the 877 rows instead weights by split size (217/306/354) and reads differently — do
 not compare the two.
+
+**Score the whole split, not a 96-row prefix.** A 96-row evaluation carries a 95% CI
+of roughly ±0.06, which is wider than every effect measured here, and the two
+protocols genuinely disagree: `rank=128` scores 0.9167 on the first 96 rows — its
+best result, and above the reference — while scoring 0.8289 on all 877, its worst.
+Ranking configurations on 96 rows would have picked the wrong one.
 
 ## Gotchas
 
