@@ -119,3 +119,55 @@ new remote reward needs no UniRL code — add it to the server and list its name
   may be `text`.
 - **`base_device` is ignored by the remote backend** (it's HTTP-only); local
   scorers honor it, falling back to CPU with a warning if CUDA is unavailable.
+
+## Differentiable rewards through a managed child
+
+The autograd graph cannot cross a process boundary, so the chain rule is relayed
+instead. `_ManagedScore` (`unirl/reward/differentiable.py`) wraps two RPCs as ONE
+node in the parent's graph:
+
+- **forward** — ship image tensors as CUDA-IPC handles; the child scores under
+  `enable_grad` and RETAINS its subgraph keyed by `call_id`.
+- **backward** — ship `dL/dr` (plain floats); the child backwards its own segment and
+  returns `dL/dimage` as IPC handles, spliced back into the caller's graph.
+
+Requirements (enforced child-side, surfaced as exceptions in the parent): the negotiated
+`cuda_ipc` data plane, a `supports_grad` scorer, uniform image shapes, and
+`gpu_residency: resident` — the forward+backward pair is indivisible, so a `per_call`
+offload between the two RPCs would drop the retained subgraph.
+
+Failure semantics are deliberately harsher than scalar scoring: **any error raises**. A
+gradient has no NaN-soft-fail; training must stop rather than step on a
+half-differentiable reward.
+
+### Transport negotiation
+
+`process.transport` selects the data plane; HTTP stays the control plane either way.
+
+| value | behavior |
+|---|---|
+| `auto` (default) | negotiate `cuda_ipc` via `/handshake`, fall back to HTTP silently |
+| `cuda_ipc` | require the negotiation to succeed; fail startup otherwise |
+| `http` | never negotiate (base64 payloads only) |
+
+`cuda_ipc` is same-device, torch-version- and allocator-gated. The child applies the checks
+and its answer is authoritative. An explicit `cuda_ipc` request that cannot be honored is a
+configuration error, not a fallback — differentiable scoring has no b64 path.
+
+### CUDA-IPC wire format
+
+Version 1 is `base64(pickle((rebuild_fn, args)))` exactly as produced by
+`torch.multiprocessing.reductions.reduce_tensor` — the mechanism torch itself uses to share
+CUDA tensors between processes. The handle is a few dozen bytes; the storage never moves.
+Tensors must come from the regular `cudaMalloc` pool (`expandable_segments` and cumem/VMM
+regions are not exportable), which is why a slept vLLM engine's memory cannot ride this plane.
+
+**Lifetime**: the producer keeps the source tensor alive until the consumer is done — the
+parent retains request tensors until the response arrives, the child retains gradient tensors
+until the parent acks (next request or explicit release). Consumers `.clone()` if they need
+the data past that window.
+
+**Two copies, kept in sync**: `unirl/reward/tensor_ipc.py` and
+`unirl-reward-service/reward_service/tensor_ipc.py` are byte-identical twins. The two ends of
+the wire share no Python package — that is the point of the managed venv boundary — so the
+codec is duplicated rather than imported across it.
