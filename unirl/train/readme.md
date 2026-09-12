@@ -61,6 +61,16 @@ in `backend/base.py`; a multi-update-capable algorithm sets
 
 ## Gotchas
 
+- **`lora_cfg.target_parameters` reaches packed MoE experts, but only training
+  consumes it.** Qwen MoE packs its experts as `nn.Parameter`
+  (`gate_up_proj`/`down_proj`), not `nn.Linear`, so `target_modules` cannot match
+  them and an attention-only adapter leaves the expert stack frozen. PEFT names
+  these through `target_parameters`. It is opt-in (default `None`) because the
+  weight-sync and export paths cannot fold such an adapter:
+  `unirl/utils/peft_merge.py` raises `NotImplementedError` on packed-expert LoRA,
+  which every full-weight sync and `tools/export_full.py` goes through. Safe for
+  training that keeps LoRA sharded and needs no rollout engine (offline DPO/SFT);
+  do not pair it with a full-sync rollout recipe until the merge supports it.
 - **`num_updates_per_batch > 1` needs `supports_multi_update` *and* must evenly
   divide the per-worker batch** — otherwise the ctor or `_build_mini_batch_slices`
   raises (a ragged mini-batch would silently drop samples and desync grad-accum

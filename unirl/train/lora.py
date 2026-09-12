@@ -8,7 +8,7 @@ import os
 import re
 from contextlib import contextmanager
 from functools import partial
-from typing import Iterator, Optional, Sequence, Union
+from typing import Any, Dict, Iterator, Optional, Sequence, Union
 
 from torch import nn
 
@@ -80,6 +80,7 @@ def inject_lora(
     alpha: int,
     target_modules: ModuleSelection,
     module_prefix: str = "",
+    target_parameters: Optional[Sequence[str]] = None,
     exclude_modules: Optional[ModuleSelection] = None,
     dropout: float = 0.0,
     bias: str = "none",
@@ -94,6 +95,11 @@ def inject_lora(
         module_prefix=module_prefix,
     )
 
+    extra: Dict[str, Any] = {}
+    if target_parameters:
+        # Packed MoE experts are nn.Parameter, not nn.Linear, so PEFT needs them named here.
+        extra["target_parameters"] = list(target_parameters)
+
     peft_cfg = LoraConfig(
         r=int(rank),
         lora_alpha=int(alpha),
@@ -102,6 +108,7 @@ def inject_lora(
         exclude_modules=normalize_optional_module_selection(exclude_modules),
         bias=str(bias),
         task_type=str(task_type),
+        **extra,
     )
     inject_adapter_in_model(peft_cfg, model, adapter_name=adapter_name)
 

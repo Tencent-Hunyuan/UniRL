@@ -169,6 +169,7 @@ class BaseFSDP2Backend(Remote):
                 alpha=lora_cfg.alpha,
                 target_modules=lora_cfg.target_modules,
                 module_prefix=lora_cfg.module_prefix,
+                target_parameters=getattr(lora_cfg, "target_parameters", None),
                 exclude_modules=lora_cfg.exclude_modules,
                 dropout=lora_cfg.dropout,
                 bias=lora_cfg.bias,
