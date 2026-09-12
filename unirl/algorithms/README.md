@@ -106,6 +106,13 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   `loss_agg_mode`. `TrainStack` and the `UnifiedModelTrainStack` AR track share the resolution
   (`train/stack/loss_scale.py`); `train/readme.md` Gotchas define "one update" per stack (an
   accumulation window averages its parts) and the zero-token behaviour.
+- **`DiffusionTeacherProvider` contract, lifecycle, and isolation** — `DiffusionOPD`
+  delegates teacher replay to a `DiffusionTeacherProvider`. Replay always runs under
+  `torch.no_grad()` and returns detached means `[B, S', *latent]`, never leaking teacher
+  gradients or entering the student optimizer/checkpoint (`assert_isolation`).
+  `FullModelTeacherProvider` provides explicit device placement and CPU offload/wake
+  management (`offload_to_cpu: true`); its `teardown_on_failure` contract ensures any
+  associated remote role or pinned GPU memory is cleaned up if replay raises.
 - **AR `sampling_temperature` must equal the rollout `sampling.temperature`** —
   `ARStage.replay` rescales logits by it (`log_softmax(logits / T)`) to match SGLang's
   distribution; when unset it silently falls back to the `ARSamplingParams` default,
