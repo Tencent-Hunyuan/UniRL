@@ -71,6 +71,12 @@ def _drpo_loss(
 class DRPO(StageAlgorithm):
     """DRPO for AR token-level policies — the paper's proposed method (§3)."""
 
+    anchor_fields = ("log_probs",)
+
+    @property
+    def recomputes_anchor(self) -> bool:
+        return self.old_logp_source == "replay"
+
     def __init__(
         self,
         *,

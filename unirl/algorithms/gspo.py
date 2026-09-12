@@ -37,6 +37,7 @@ class GSPO(StageAlgorithm):
     supports_multi_update = True
     anchor_fields = ("log_probs", "rollout_log_probs")
 
+    @property
     def recomputes_anchor(self) -> bool:
         return self.old_logp_source == "replay"
 

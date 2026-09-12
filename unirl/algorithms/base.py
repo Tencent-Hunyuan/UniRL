@@ -245,11 +245,8 @@ class StageAlgorithm(Remote, ABC):
     requires_backend: bool = False
     requires_advantages: bool = True
     loss_weighting: str = "sample"
+    recomputes_anchor: bool = False
     anchor_fields: Tuple[str, ...] = ()
-
-    def recomputes_anchor(self) -> bool:
-        """Whether the anchor must be recomputed at the exact ``(mini, micro)`` geometry training uses."""
-        return False
 
     def prepare_segment(
         self,

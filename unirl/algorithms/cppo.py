@@ -124,6 +124,11 @@ class CPPO(StageAlgorithm):
     """CPPO (Binary-TV) for AR token-level policies — the paper's proposed method."""
 
     supports_multi_update = True
+    anchor_fields = ("log_probs",)
+
+    @property
+    def recomputes_anchor(self) -> bool:
+        return self.old_logp_source == "replay"
 
     def __init__(
         self,
