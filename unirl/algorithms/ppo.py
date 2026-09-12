@@ -85,6 +85,7 @@ class PPO(StageAlgorithm):
     """PPO over an AR ``TextSegment`` with a train-side value head."""
 
     supports_multi_update = True
+    recomputes_anchor = True
     anchor_fields = ("values",)
 
     def __init__(
@@ -138,10 +139,6 @@ class PPO(StageAlgorithm):
 
             sampling_temperature = ARSamplingParams.__dataclass_fields__["temperature"].default
         self.sampling_temperature = float(sampling_temperature)
-
-    def recomputes_anchor(self) -> bool:
-        """Critic anchors must use the exact micro geometry of the train forward."""
-        return True
 
     def prepare_segment(
         self,

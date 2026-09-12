@@ -104,7 +104,7 @@ class TrainStack(Remote):
         if part.segment is None:
             return
         algorithm = self.algorithm
-        if not algorithm.recomputes_anchor():
+        if not algorithm.recomputes_anchor:
             algorithm.prepare_segment(conditions=part.conditions, segment=part.segment)
             return
         micro_slices = [r for update in plans for r in update]

@@ -10,7 +10,7 @@
   <img src="../../assets/algorithm-contract-new.png" alt="UniRL algorithm contract: a StageAlgorithm combines new_logp from replay, the frozen pi_old anchor, and advantages into a loss (four interchangeable families: GRPO, FlowDPPO, DRPO, and DiffusionNFT as the ratio-free exception), and declares knobs — requires_ema_rollout, supports_multi_update, anchor_fields/recomputes_anchor — that reconfigure the sampler and train stack around it" width="100%">
 </div>
 
-*A `StageAlgorithm` is two things: a **loss combine** (`stage.replay → new_logp`, mixed with the frozen **π_old** anchor and advantages — four interchangeable families) and a few **declared knobs** (`requires_ema_rollout`, `supports_multi_update`, `anchor_fields`/`recomputes_anchor()`) that reconfigure the sampler and the train loop around it.*
+*A `StageAlgorithm` is two things: a **loss combine** (`stage.replay → new_logp`, mixed with the frozen **π_old** anchor and advantages — four interchangeable families) and a few **declared knobs** (`requires_ema_rollout`, `supports_multi_update`, `anchor_fields`/`recomputes_anchor`) that reconfigure the sampler and the train loop around it.*
 
 ## What it is
 
@@ -30,7 +30,7 @@ the sampler whether to roll out under EMA weights (DiffusionNFT sets it `True`; 
 `supports_multi_update` tells `TrainStack` whether one rollout may be split into N
 optimizer steps (it *raises* if a `False` algorithm meets `num_updates_per_batch > 1`).
 The π_old anchor geometry is *not* centralized here — the algorithm only declares
-`anchor_fields` / `recomputes_anchor()`; `TrainStack` does the per-slice recompute.
+`anchor_fields` / `recomputes_anchor`; `TrainStack` does the per-slice recompute.
 So this module keeps four rollout/update **contracts** selectable at the loss node,
 not just three-tensor arithmetic.
 
@@ -54,7 +54,7 @@ not just three-tensor arithmetic.
 - **The anchor contract — the subtle part.** bf16 forwards are batch-shape
   sensitive, so a π_old anchor computed at a different geometry than `new_logp`
   drifts the on-policy ratio off 1 (and FlowDPPO's KL off 0). Algorithms just declare
-  `anchor_fields` (which segment fields to freeze) and `recomputes_anchor()`
+  `anchor_fields` (which segment fields to freeze) and `recomputes_anchor`
   (whether `prepare_segment` replays); `TrainStack` then recomputes the anchor over
   the *exact same* mini/micro slices it will train on. No hardcoded field names.
 - **Variants are recipes, not classes.** DanceGRPO and MixGRPO are `FlowGRPO`

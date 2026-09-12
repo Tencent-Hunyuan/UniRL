@@ -81,8 +81,7 @@ class UnifiedModelTrainStack(Remote):
         prepare = getattr(algorithm, "prepare_segment", None)
         if prepare is None:
             return
-        recomputes = getattr(algorithm, "recomputes_anchor", None)
-        if recomputes is None or not recomputes():
+        if not algorithm.recomputes_anchor:
             prepare(conditions=part.conditions, segment=part.segment)
             return
         micro_slices = [sl for step in self._optimizer_step_slices(int(part.batch_size)) for sl in step]

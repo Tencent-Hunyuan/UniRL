@@ -95,10 +95,8 @@ class FlowDPPO(StageAlgorithm):
 
     supports_multi_update = True
     requires_backend = True
+    recomputes_anchor = True
     anchor_fields = ("sde_logp", "sde_means")
-
-    def recomputes_anchor(self) -> bool:
-        return True
 
     def __init__(
         self,
