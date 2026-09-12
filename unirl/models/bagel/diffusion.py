@@ -36,7 +36,6 @@ class BagelDiffusionParams(DiffusionSamplingParams):
     width: int = 512
     eta: float = 1.0
 
-    cfg_text_scale: float = 1.0
     cfg_img_scale: float = 1.0
     cfg_interval: Tuple[float, float] = (0.0, 1.0)
     cfg_renorm_min: float = 0.0
@@ -318,7 +317,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         """CFG scales after the per-step ``cfg_interval`` gate (matches generate_image)."""
         lo, hi = float(params.cfg_interval[0]), float(params.cfg_interval[1])
         if lo < t_value <= hi:
-            return float(params.cfg_text_scale), float(params.cfg_img_scale)
+            return float(params.guidance_scale), float(params.cfg_img_scale)
         return 1.0, 1.0
 
     def diffuse(
