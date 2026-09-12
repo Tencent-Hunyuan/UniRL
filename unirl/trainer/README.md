@@ -296,14 +296,15 @@ logging:
 ```
 
 `eval_samples_per_prompt: 1` is a real override even when the rollout's
-`samples_per_prompt` is larger. `samples_per_prompt` is the sole diffusion
-fan-out field; the retired `num_samples_per_prompt` alias is not accepted.
+`samples_per_prompt` is larger. Diffusion sampling has one field per value:
+`samples_per_prompt` controls fan-out and `guidance_scale` controls text CFG,
+including for BAGEL. The retired `num_samples_per_prompt` and
+`cfg_text_scale` fields are not accepted.
 
 CFG has no eval knob of its own: leave `guidance_scale` unmentioned and eval
 runs at the training guidance (a CFG-off run cannot silently evaluate with CFG
-on); name it in `eval_sampling:` to decouple the two. BAGEL-family params
-consume `cfg_text_scale`, and passing the inert `guidance_scale` there raises.
-Unknown overlay fields raise, and the retired per-field knobs
+on); name it in `eval_sampling:` to decouple the two. Unknown overlay fields
+raise, and the retired per-field knobs
 (`eval_cfg_text_scale`, `eval_num_inference_steps`, ...) fail fast with a
 migration hint. Dynamic-shift models re-derive μ from the eval
 steps/resolution, so a decoupled eval stays on the model's official schedule;

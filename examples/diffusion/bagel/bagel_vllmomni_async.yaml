@@ -160,8 +160,7 @@ data_source:
 sampling:
   _target_: unirl.models.bagel.diffusion.BagelDiffusionParams
   num_inference_steps: 14              # STEPS (σ schedule = steps+1 = 15 points); adapter sends +1 to the worker
-  guidance_scale: 1.0
-  cfg_text_scale: 1.0                  # cfg=1 → single-forward "No CFG" path
+  guidance_scale: 1.0                  # cfg=1 → single-forward "No CFG" path
   cfg_img_scale: 1.0
   cfg_interval: [0.0, 1.0]
   cfg_renorm_min: 0.0

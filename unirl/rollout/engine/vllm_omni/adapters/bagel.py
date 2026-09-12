@@ -84,7 +84,7 @@ class BagelInputAdapter(DitInputAdapter):
         if self._spp(sample) <= 1:
             return False
         diff_params = sample.frontier_gen_part(DiffusionSamplingParams).sampling_params
-        return float(diff_params.cfg_text_scale) <= 1.0 and float(diff_params.cfg_img_scale) <= 1.0
+        return float(diff_params.guidance_scale) <= 1.0 and float(diff_params.cfg_img_scale) <= 1.0
 
     def build_prompts(self, sample: Sample) -> List[Any]:
         """Plain ``{"prompt": text}`` dicts (no ``modalities`` → image path)."""
@@ -176,7 +176,8 @@ class BagelInputAdapter(DitInputAdapter):
         sigmas_list_from_diffusion(diff_params, num_steps)
 
         extra_args: Dict[str, Any] = {
-            "cfg_text_scale": float(getattr(diff_params, "cfg_text_scale", 1.0)),
+            # Translate the canonical field to BAGEL's worker API.
+            "cfg_text_scale": float(diff_params.guidance_scale),
             "cfg_img_scale": float(getattr(diff_params, "cfg_img_scale", 1.0)),
             "cfg_interval": tuple(getattr(diff_params, "cfg_interval", (0.0, 1.0))),
             "cfg_renorm_min": float(getattr(diff_params, "cfg_renorm_min", 0.0)),

@@ -235,12 +235,11 @@ class PETrainer(BaseTrainer):
     def evaluate(self, step: int) -> float:
         """Periodic eval on the eval set (no training); returns the mean image reward."""
         base_diffusion = self.sampling_params.get("diffusion")
-        replace_kwargs = dict(eta=self.eval_eta)
-        if "cfg_text_scale" in {f.name for f in dataclasses.fields(base_diffusion)}:
-            replace_kwargs["cfg_text_scale"] = self.eval_cfg_text_scale
-        else:
-            replace_kwargs["guidance_scale"] = self.eval_cfg_text_scale
-        eval_diffusion = dataclasses.replace(base_diffusion, **replace_kwargs)
+        eval_diffusion = dataclasses.replace(
+            base_diffusion,
+            eta=self.eval_eta,
+            guidance_scale=self.eval_cfg_text_scale,
+        )
         eval_sp = {**self.sampling_params, "diffusion": eval_diffusion}
         self.rollout.wake_up()
         try:

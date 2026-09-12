@@ -222,8 +222,7 @@ sampling:
     _target_: unirl.models.bagel.diffusion.BagelDiffusionParams
     samples_per_prompt: 1             # M=1 image per chain
     num_inference_steps: 25           # diffusion timesteps
-    guidance_scale: 1.0
-    cfg_text_scale: 1.0               # cfg=1 -> single forward (no CFG during training)
+    guidance_scale: 1.0               # cfg=1 -> single forward (no CFG during training)
     cfg_img_scale: 1.0
     cfg_interval: [0.0, 1.0]
     cfg_renorm_min: 0.0

@@ -156,8 +156,7 @@ data_source:
 sampling:
   _target_: unirl.models.bagel.diffusion.BagelDiffusionParams
   num_inference_steps: 14              # STEPS (σ schedule = steps+1 = 15 points; == old 15-point bagel schedule, 14 stepped)
-  guidance_scale: 1.0                  # cfg=1 (bagel uses cfg_text_scale below; kept consistent)
-  cfg_text_scale: 1.0                  # cfg=1 → single-forward "No CFG" path in _forward_flow
+  guidance_scale: 1.0                  # cfg=1 → single-forward "No CFG" path in _forward_flow
   cfg_img_scale: 1.0
   cfg_interval: [0.0, 1.0]
   cfg_renorm_min: 0.0
