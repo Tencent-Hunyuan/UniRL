@@ -148,7 +148,7 @@ Unlike FlowGRPO/FlowDPPO, `DRPO` does **not** freeze a train-side `old_logp` in
 | `drpo_epsilon` | Regularization threshold `ε` (code) / `δ` (paper). Default `12.5` (paper §4). Larger ⇒ weaker regularization; per-token trust region is `ε_t = ε / µ`. |
 | `sampling_temperature` | **MUST equal `sampling.temperature`**. Replay tempers logits so `π` and `µ` share a distribution (`ratio_mean ≈ 1`). |
 | `loss_agg_mode` | `token-mean`, or the recipe's `seq-mean-token-sum-norm`. |
-| `horizon` | Fixed normalizer for `seq-mean-token-sum-norm`; recipe `8192`. |
+| `horizon` | Fixed normalizer for `seq-mean-token-sum-norm`; the recipe derives it from `${sampling.max_new_tokens}`. |
 | `normalize_adv_by_std` | Recipe `false` → mean-center only (no std division). |
 
 ## Debug checklist

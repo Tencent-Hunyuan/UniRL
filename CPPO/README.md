@@ -136,7 +136,7 @@ the canonical mode. (`old_logp_source: replay` is available for ablations.)
 | `cppo_delta_b` | Dynamic prefix-budget floor `δ_b^min` (0.02); `δ_b^seq = clamp(P90(D), δ_b, 2·δ_b)`. |
 | `sampling_temperature` | **MUST equal `sampling.temperature`**. |
 | `loss_agg_mode` | `token-mean`, or the recipe's `seq-mean-token-sum-norm`. |
-| `horizon` | Fixed normalizer for `seq-mean-token-sum-norm`; recipe `16384`. |
+| `horizon` | Fixed normalizer for `seq-mean-token-sum-norm`; the recipe derives it from `${sampling.max_new_tokens}`. |
 | `old_logp_source` | `rollout` (canonical: `µ` = the SGLang sampler's logp) or `replay` (ablation). |
 
 Metric source: `ratio_mean`, `ratio_max`, `approx_kl` (k3), `masked_fraction` (the budget-mask
