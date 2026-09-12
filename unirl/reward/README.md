@@ -60,6 +60,21 @@ the remote backend (`remote.py`) sends one or more bounded `POST /score` calls,
 multiplexes every requested reward in each item, and derives success from the
 merged response.
 
+### Overlapping scoring with generation
+
+`RewardStack` (`stack.py`) is the optional worker-side scheduler for the diffusion
+training path. It receives one DP shard, slices the frontier Part into
+`micro_batch_size` rows at a time, calls the rollout engine per micro, and scores
+micro *k* on a one-thread pool while micro *k+1* generates — then `Part.concat`s the
+scored chunks back into one Sample. Both the engine and the `RewardService` arrive as
+sibling roles resolved on the same Worker, so every call is in-process: no dispatch,
+hence no `batch_size % dp_size` constraint on a micro.
+
+Wired by a `rewardstack:` block; `DiffusionTrainer` builds it beside the rollout
+engine and scores inside the generation residency window instead of `_reward_phase()`.
+`overlap: false` runs the same loop serially and is the control arm for measuring
+whether the overlap paid.
+
 ### Managed image scorers
 
 `ManagedScorerProcessBackend` is the environment-isolated, rank-affine middle
@@ -109,6 +124,27 @@ new remote reward needs no UniRL code — add it to the server and list its name
 
 ## Gotchas
 
+- **`rewardstack:` is colocate-only, and it takes over two driver-side facts** —
+  `RewardStack` resolves the engine and the service as siblings on one Worker, so
+  `layout: separate` or `reward_fraction > 0` place them in different placement
+  scopes and the trainer rejects the block. It also scores inside the generation
+  window, so `offload_train_during_reward` is rejected alongside it, and the
+  driver-side `perf/generate_time_s` / `perf/reward_time_s` timers stop firing
+  because those patch the Handle attributes the stack no longer routes through.
+  Set `micro_batch_size` equal to `rollout.forward_batch_size` to keep chunk
+  boundaries — and the per-step SDE noise draw order — identical to the serial path.
+- **No scorer that draws from the global RNG may run under `overlap: true`** — SD3's
+  per-step SDE noise comes from the shared global CUDA generator
+  (`sde/kernels.py:300`, `generator=None`, and no model threads one), so a scorer
+  drawing concurrently interleaves with the sampler's draws in an unspecified order
+  and makes the *rollout* nondeterministic, not just the score. PickScore, CLIP and
+  HPS draw nothing; a sampling in-process LLM judge or a diffusion-based scorer does.
+  Use `overlap: false` for those.
+- **Two smaller consequences of the stack owning the micro loop** — the engine's own
+  chunk loop goes inert, so `sglang_diffusion`'s per-chunk `torch.cuda.empty_cache()`
+  (`engine.py:136`) stops firing and peak *reserved* memory can shift on those
+  recipes; and a generate failure surfaces up to one scoring call late, because the
+  executor drains before the exception leaves the step.
 - **A non-finite/missing reward fails the whole step, by design** — fix the scorer.
   `raise_on_failure=False` (remote only) does *not* let training continue on it: the
   backend returns zeros with `successes=[False]`, and `score_and_attach`'s fail-fast
