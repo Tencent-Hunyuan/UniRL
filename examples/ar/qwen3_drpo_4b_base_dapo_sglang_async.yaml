@@ -91,9 +91,6 @@ rollout:
     backend: native
     pretrained_model_ckpt_path: ${oc.env:QWEN3_PATH,Qwen/Qwen3-4B-Base}
     tp_size: 1
-    max_new_tokens: 8192
-    temperature: 1.0
-    top_p: 1.0
     concurrency: 16
     samples_pre_expanded: true
     chat_template_kwargs:
@@ -124,8 +121,8 @@ algorithm:
   drpo_epsilon: 12.5
   penalty_mu_weighted: true
   loss_agg_mode: seq-mean-token-sum-norm
-  horizon: 8192
-  sampling_temperature: 1.0
+  horizon: ${sampling.max_new_tokens}
+  sampling_temperature: ${sampling.temperature}
   old_logp_source: rollout
   conditions_cls:
     _target_: hydra.utils.get_class

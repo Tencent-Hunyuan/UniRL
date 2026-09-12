@@ -28,11 +28,11 @@ algorithm:
                                  #   token-adaptive SPO quadratic (per-token trust
                                  #   region ε_t = ε/µ); larger ε ⇒ weaker regularization.
   loss_agg_mode: seq-mean-token-sum-norm  # per-seq Σ(token loss) / horizon, mean over seqs
-  horizon: 8192                  # fixed length normalizer for seq-mean-token-sum-norm
+  horizon: ${sampling.max_new_tokens}  # fixed length normalizer for seq-mean-token-sum-norm
   # 1.0 — MUST equal sampling.temperature below. Replay tempers logits
   #   (log_softmax(logits / T)) so new_logp (π) and rollout logp (µ) live on the
   #   same distribution ⇒ ratio_mean ≈ 1 on update 1.
-  sampling_temperature: 1.0
+  sampling_temperature: ${sampling.temperature}
   conditions_cls:
     _target_: hydra.utils.get_class
     path: unirl.models.qwen3.conditions.Qwen3ARConditions
@@ -57,9 +57,6 @@ rollout:
     backend: native
     pretrained_model_ckpt_path: ${oc.env:QWEN3_PATH,Qwen/Qwen3-4B-Base}
     tp_size: 1
-    max_new_tokens: 8192
-    temperature: 1.0             # keep == sampling.temperature / sampling_temperature
-    top_p: 0.9
     samples_pre_expanded: true   # trainer pre-expands req by samples_per_prompt; engine emits n=1
     system_instruction: /no_think         # keep the base model from emitting a long <think>
     chat_template_kwargs:                  #   block before \boxed{}
