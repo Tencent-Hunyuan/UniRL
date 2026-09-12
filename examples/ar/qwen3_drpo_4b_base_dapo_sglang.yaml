@@ -139,6 +139,8 @@ rollout:
       # sampling/log-softmax and native activations/layernorms that match the
       # FSDP trainer. Without it, rollout logprobs drift from replay and
       # SGLang 0.5.12.post1 also tries to JIT an incompatible activation kernel.
+      # It further forces deterministic sampling, so the engine sends this recipe's
+      # 8 samples/prompt as 8 seeded n=1 requests (see unirl/rollout/engine/README.md).
       rl_on_policy_target: fsdp
       # FULL fine-tuning: lower the SRT KV reservation to give FSDP headroom for
       # the per-rollout full-weight all-gather. No LoRA pool — full dense weights

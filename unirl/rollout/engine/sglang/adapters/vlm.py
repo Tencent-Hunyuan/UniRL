@@ -38,19 +38,20 @@ class VLMAdapter(TextLMAdapter):
     def build_inputs(self, sample: Sample, *, sampling: ResolvedSampling) -> PreparedInputs:
         conversations, images_list, k = build_vision_conversations(sample, sampling.system_instruction)
         require(
-            k == sampling.n,
+            k == sampling.fanout,
             f"{type(self).__name__}.build_inputs: de-expanded fan-out k={k} != "
-            f"resolved n={sampling.n}; conversation grouping and the sampling block "
+            f"resolved fanout={sampling.fanout}; conversation grouping and the sampling block "
             "disagree on the gen branch.",
         )
 
         wire: List[Dict[str, Any]] = []
         prompt_token_ids: List[List[int]] = []
-        mm_encs: List[MMEncoding] = []
-        for messages, images in zip(conversations, images_list):
-            mm = self.encode_mm(messages, images)
-            mm_encs.append(mm)
-            payload = self.base_payload(sampling)
+        mm_encs = [self.encode_mm(messages, images) for messages, images in zip(conversations, images_list)]
+        if sampling.base_seed is not None:
+            mm_encs = [mm for mm in mm_encs for _ in range(k)]
+        sample_ids = self._wire_seed_identities(sample, sampling, expected=len(mm_encs))
+        for mm, sample_id in zip(mm_encs, sample_ids):
+            payload = self.base_payload(sampling, sample_id=sample_id)
             payload["text"] = mm.text
             payload["image_data"] = pil_to_base64(mm.image)
             wire.append(payload)

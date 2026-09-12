@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -19,6 +19,7 @@ from unirl.rollout.engine.sglang.utils import (
     build_text_conversations,
     pack_prompt_condition,
 )
+from unirl.rollout.engine.sglang.utils.sampling import derive_sampling_seed
 from unirl.types.primitives import Texts
 from unirl.types.sample import Sample
 from unirl.types.segments.base import SegmentStatus
@@ -72,20 +73,27 @@ class TextLMAdapter(ModelAdapter):
         if use_template:
             conversations, k = build_text_conversations(sample, sampling.system_instruction)
             require(
-                k == sampling.n,
+                k == sampling.fanout,
                 f"{type(self).__name__}.build_inputs: de-expanded fan-out k={k} != "
-                f"resolved n={sampling.n}; conversation grouping and the sampling block "
+                f"resolved fanout={sampling.fanout}; conversation grouping and the sampling block "
                 "disagree on the gen branch.",
             )
-            for messages in conversations:
-                payload = self.base_payload(sampling)
+            if sampling.base_seed is not None:
+                conversations = [messages for messages in conversations for _ in range(k)]
+            sample_ids = self._wire_seed_identities(sample, sampling, expected=len(conversations))
+            for messages, sample_id in zip(conversations, sample_ids):
+                payload = self.base_payload(sampling, sample_id=sample_id)
                 ids = self.apply_chat_template(messages)
                 payload["input_ids"] = ids
                 prompt_token_ids.append(list(ids))
                 wire.append(payload)
         else:
-            for prompt in self.extract_prompts(sample):
-                payload = self.base_payload(sampling)
+            prompts = self.extract_prompts(sample)
+            if sampling.base_seed is not None:
+                prompts = [prompt for prompt in prompts for _ in range(sampling.fanout)]
+            sample_ids = self._wire_seed_identities(sample, sampling, expected=len(prompts))
+            for prompt, sample_id in zip(prompts, sample_ids):
+                payload = self.base_payload(sampling, sample_id=sample_id)
                 payload["text"] = prompt
                 ids = list(self._tokenizer.encode(prompt))
                 prompt_token_ids.append(list(ids))
@@ -105,7 +113,31 @@ class TextLMAdapter(ModelAdapter):
         )
         return list(text_primitive.texts)
 
-    def base_payload(self, sampling: ResolvedSampling) -> Dict[str, Any]:
+    @staticmethod
+    def _wire_seed_identities(
+        sample: Sample,
+        sampling: ResolvedSampling,
+        *,
+        expected: int,
+    ) -> List[Optional[str]]:
+        """Return sample IDs aligned to wire requests, or ``None`` when no wire seed is needed."""
+        if sampling.base_seed is None:
+            return [None] * expected
+
+        identities = sample.parts[-1].validated_sample_ids(context="SGLang per-request seed derivation")
+        require(
+            len(identities) == expected,
+            "SGLang per-request seed derivation requires one stable sample_id per wire request; "
+            f"got {len(identities)} ids for {expected} requests",
+        )
+        return identities
+
+    def base_payload(
+        self,
+        sampling: ResolvedSampling,
+        *,
+        sample_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """The sampling fields every ``/generate`` payload carries."""
         block = dict(sampling.block)
         if self._response_forbidden_token_ids:
@@ -113,10 +145,14 @@ class TextLMAdapter(ModelAdapter):
             for token_id in self._response_forbidden_token_ids:
                 logit_bias[str(token_id)] = -1.0e9
             block["logit_bias"] = logit_bias
-        return {
+        payload = {
             "sampling_params": block,
             "return_logprob": sampling.return_logprob,
         }
+        if sampling.base_seed is not None:
+            require(sample_id is not None, "SGLang per-request seed derivation requires a stable sample_id")
+            payload["sampling_params"]["sampling_seed"] = derive_sampling_seed(sampling.base_seed, sample_id)
+        return payload
 
     def apply_chat_template(self, messages: List[Dict[str, Any]]) -> List[int]:
         """Tokenize a chat conversation into ``input_ids`` via the chat template."""
