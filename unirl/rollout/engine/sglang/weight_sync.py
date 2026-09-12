@@ -79,6 +79,17 @@ class WeightSync:
     def destroy_weights_update_group(self, *, group_name: str) -> None:
         self._backend.destroy_weights_group(group_name=str(group_name))
 
+    def update_weights_from_ipc(
+        self,
+        *,
+        zmq_handles: Dict[str, str],
+        flush_cache: bool = True,
+    ) -> None:
+        """Push full weights via ZMQ + CUDA IPC (checkpoint-engine protocol)."""
+        if not zmq_handles:
+            raise ValueError("zmq_handles must be non-empty for IPC update")
+        self._backend.update_from_ipc(zmq_handles=dict(zmq_handles), flush_cache=flush_cache)
+
     def set_lora_from_tensors(
         self,
         adapter_name: str,
