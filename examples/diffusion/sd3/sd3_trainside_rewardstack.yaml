@@ -1,0 +1,34 @@
+# @package _global_
+# FlowGRPO-Fast SD3 colocate with the reward stack — A/B sibling of sd3_trainside.
+#
+# Everything comes from sd3_trainside: same model, LoRA, rollout engine, reward,
+# algorithm, data and sampling. The only addition is the `rewardstack:` block, which
+# moves the micro-batch loop out of the engine and scores each micro while the next
+# one generates.
+#
+# micro_batch_size matches sd3_trainside's rollout.forward_batch_size (16), so the
+# engine's own chunk loop short-circuits and the chunk boundaries — hence the per-step
+# SDE noise draw order — are identical to the baseline. That is what makes the A/B
+# meaningful: at overlap=false this recipe must reproduce sd3_trainside's reward curve
+# step for step, and only perf/step_time_s should move at overlap=true.
+#
+# Launch:
+#   bash examples/run_experiment_single_node.sh diffusion/sd3/sd3_trainside_rewardstack
+#
+# A/B protocol (same seed, same num_rollouts, wandb on):
+#   1. diffusion/sd3/sd3_trainside                                  baseline
+#   2. diffusion/sd3/sd3_trainside_rewardstack rewardstack.overlap=false   parity control
+#   3. diffusion/sd3/sd3_trainside_rewardstack                             overlapped
+# Compare rollout/reward_mean (1 vs 2 must match exactly) and perf/step_time_s.
+
+defaults:
+  - sd3_trainside
+  - _self_
+
+rewardstack:
+  _target_: unirl.reward.stack.RewardStack
+  micro_batch_size: 16          # = sd3_trainside rollout.forward_batch_size
+  overlap: true
+
+logging:
+  tags: [sd3, flowgrpo, trainside, rewardstack, overlap]

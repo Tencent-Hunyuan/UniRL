@@ -139,14 +139,6 @@ stack:
   max_grad_norm: 1.0
   num_updates_per_batch: 2      # PPO mini-batches per rollout (π_old frozen once); v1 parity
 
-# Micro-batched rollout with scoring overlapped one micro behind. micro_batch_size
-# matches rollout.forward_batch_size above, so the engine's own chunk loop is inert
-# and chunk boundaries — hence the RNG draw order — are unchanged.
-rewardstack:
-  _target_: unirl.reward.stack.RewardStack
-  micro_batch_size: 16
-  overlap: true
-
 data_source:
   # Real prompts loaded from file: MultimodalRLDataSource reads TXT/JSON/JSONL
   # via data_path and exposes get_samples(bs). (DefaultDataSource returns only
