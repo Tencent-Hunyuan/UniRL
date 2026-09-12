@@ -46,6 +46,10 @@ class FlowGRPO(StageAlgorithm):
     requires_backend = True
     anchor_fields = ("sde_logp",)
 
+    @property
+    def recomputes_anchor(self) -> bool:
+        return self.old_logp_source == "replay"
+
     def __init__(
         self,
         *,
@@ -76,7 +80,6 @@ class FlowGRPO(StageAlgorithm):
             self.old_logp_source in ("rollout", "replay"),
             f"FlowGRPO: old_logp_source must be 'rollout' or 'replay'; got {old_logp_source!r}",
         )
-        self.recomputes_anchor = self.old_logp_source == "replay"
         _require_replay_anchor_for_batched_replay(self.stage, self.old_logp_source, algo="FlowGRPO")
         self.conditions_cls = conditions_cls
 

@@ -89,6 +89,10 @@ class DPPO(StageAlgorithm):
     supports_multi_update = True
     anchor_fields = ("log_probs",)
 
+    @property
+    def recomputes_anchor(self) -> bool:
+        return self.old_logp_source == "replay"
+
     def __init__(
         self,
         *,
@@ -122,7 +126,6 @@ class DPPO(StageAlgorithm):
         self.old_logp_source = str(old_logp_source).strip().lower()
         if self.old_logp_source not in ("rollout", "replay"):
             raise ValueError(f"DPPO: old_logp_source must be 'rollout' or 'replay'; got {old_logp_source!r}")
-        self.recomputes_anchor = self.old_logp_source == "replay"
 
     def prepare_segment(
         self,

@@ -15,7 +15,7 @@ from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
 from unirl.train.backend.fsdp import FSDPBackend
 from unirl.train.stack import TrainStepResult, _build_micro_batch_slices
-from unirl.train.stack.base import _aggregate_update_results
+from unirl.train.stack.base import _aggregate_update_results, _validate_anchor_contract
 from unirl.train.stack.planner.types import _positive_int, _update_ranges
 from unirl.types.sample import Part, Sample
 from unirl.types.sampling import ARSamplingParams, DiffusionSamplingParams
@@ -50,6 +50,8 @@ class UnifiedModelTrainStack(Remote):
         self.num_updates_per_batch = _positive_int(
             name="UnifiedModelTrainStack.num_updates_per_batch", value=num_updates_per_batch
         )
+        _validate_anchor_contract(self.ar_algorithm)
+        _validate_anchor_contract(self.image_algorithm)
         if self.num_updates_per_batch > 1:
             for name, algo in (("ar", self.ar_algorithm), ("image", self.image_algorithm)):
                 if not getattr(algo, "supports_multi_update", False):

@@ -64,6 +64,13 @@ def _align_track_to_model(part: Part, *, device: torch.device) -> None:
         part.advantages = part.advantages.to(device=device)
 
 
+def _validate_anchor_contract(algorithm: StageAlgorithm) -> None:
+    if not isinstance(algorithm.recomputes_anchor, bool):
+        raise TypeError(f"{type(algorithm).__name__}.recomputes_anchor must be a bool attribute.")
+    if algorithm.recomputes_anchor and not algorithm.anchor_fields:
+        raise ValueError(f"{type(algorithm).__name__} recomputes its anchor but declares no anchor_fields.")
+
+
 class TrainStack(Remote):
     """Single-stage stage-driven train stack — family-agnostic."""
 
@@ -97,6 +104,7 @@ class TrainStack(Remote):
         self.micro_batch_size = int(micro_batch_size)
         self.max_grad_norm = float(max_grad_norm)
         self.micro_planner: MicroPlanner = micro_planner if micro_planner is not None else CountPlanner()
+        _validate_anchor_contract(algorithm)
         self.micro_planner.validate(algorithm)
 
     def prepare_segment(self, part: Part, *, plans: Plan) -> None:
