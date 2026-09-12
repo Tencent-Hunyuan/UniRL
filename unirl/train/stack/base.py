@@ -15,7 +15,7 @@ from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
 from unirl.distributed.tensor.batch import _move_value
 from unirl.train.backend.fsdp import FSDPBackend
-from unirl.train.stack.planner import CountPlanner, MicroPlanner, Plan, UpdatePlan, _positive_int
+from unirl.train.stack.planner import CountPlanner, MicroPlanner, Plan, UpdatePlan, UpdatePlanner, _positive_int
 from unirl.types.sample import Part
 from unirl.utils.metrics import aggregate_numeric_metrics
 
@@ -64,6 +64,13 @@ def _align_track_to_model(part: Part, *, device: torch.device) -> None:
         part.advantages = part.advantages.to(device=device)
 
 
+def _release_reordered_track_inputs(part: Part) -> None:
+    """Drop device-heavy fields after a planner has produced an independent reordered Part."""
+    part.segment = None
+    part.conditions = {}
+    part.advantages = None
+
+
 class TrainStack(Remote):
     """Single-stage stage-driven train stack — family-agnostic."""
 
@@ -76,6 +83,8 @@ class TrainStack(Remote):
         max_grad_norm: float,
         num_updates_per_batch: int = 1,
         micro_planner: Optional[MicroPlanner] = None,
+        shuffle_updates: bool = False,
+        shuffle_seed: Optional[int] = None,
     ) -> None:
         super().__init__()
         cls = type(self).__name__
@@ -97,7 +106,12 @@ class TrainStack(Remote):
         self.micro_batch_size = int(micro_batch_size)
         self.max_grad_norm = float(max_grad_norm)
         self.micro_planner: MicroPlanner = micro_planner if micro_planner is not None else CountPlanner()
-        self.micro_planner.validate(algorithm)
+        self.update_planner = UpdatePlanner(
+            self.micro_planner,
+            shuffle_updates=shuffle_updates,
+            shuffle_seed=shuffle_seed,
+        )
+        self.update_planner.validate(algorithm)
 
     def prepare_segment(self, part: Part, *, plans: Plan) -> None:
         """Freeze the π_old anchor once, before the ``num_updates_per_batch`` loop."""
@@ -334,6 +348,7 @@ class TrainStack(Remote):
         parts: Union[Part, Tuple[Part, ...]],
         *,
         training_progress: float,
+        rollout_id: Optional[int] = None,
     ) -> TrainStepResult:
         """Driver-callable: arrange → prepare → run updates → on_rollout_end."""
         window = parts if isinstance(parts, tuple) else (parts,)
@@ -346,15 +361,18 @@ class TrainStack(Remote):
                 "optimizer steps inside the window would re-step on partial gradients."
             )
         arranged = []
-        for part in window:
-            self._align_track_inputs(part)
-            arranged.append(
-                self.micro_planner.arrange(
-                    part,
-                    num_updates=self.num_updates_per_batch,
-                    micro_batch_size=self.micro_batch_size,
-                )
+        for input_part in window:
+            part, plans = self.update_planner.arrange(
+                input_part,
+                num_updates=self.num_updates_per_batch,
+                micro_batch_size=self.micro_batch_size,
+                shuffle_step=rollout_id,
             )
+            if part is not input_part:
+                _release_reordered_track_inputs(input_part)
+            self._align_track_inputs(part)
+            arranged.append((part, plans))
+        del input_part, parts, window
         from unirl.utils.profiling import profile_mode
 
         profiler = self._train_step_profiler() if profile_mode() == "train" else None

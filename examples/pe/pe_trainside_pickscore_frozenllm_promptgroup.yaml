@@ -112,6 +112,7 @@ diffusion:
     micro_batch_size: 1
     max_grad_norm: 1.0
     num_updates_per_batch: 2
+    shuffle_updates: true
 
 # ── AR side (Qwen3) — FROZEN rewriter: bundle + pipeline ONLY ───────────────
 # No backend / algorithm / stack: freeze_llm=true makes PETrainer build a
