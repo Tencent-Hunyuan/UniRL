@@ -149,15 +149,18 @@ rollout:
 
 reward:
   # math-verify (the paper's grader, Appendix D). 1.0 if the parsed answer matches
-  # the ground truth else 0.0. Unlike MathBoxed it extracts the final answer even
-  # without \boxed{} (Qwen3-Base + thinking often reasons to the answer unboxed),
-  # so it does not under-count correct generations / inflate zero-advantage groups.
+  # the ground truth else 0.0. Unlike a `\boxed{}`-only matcher it extracts the
+  # final answer even without \boxed{} (Qwen3-Base + thinking often reasons to the
+  # answer unboxed), so it does not under-count correct generations / inflate
+  # zero-advantage groups.
   _target_: unirl.reward.service.RewardService
   # keep = score the partial text of truncated (length-capped) traces instead of
   # forcing 0, matching verl's dapo reward manager with overlong_buffer disabled.
   # As responses lengthen and truncation approaches 100%, the default "zero" would
   # collapse reward_mean; "keep" stays flat (verl parity). Use "soft" for verl's
   # graded overlong penalty, or "zero" to restore the anti-ramble hard zeroing.
+  # Caveat: math-verify parses the last expression anywhere in the kept text, so
+  # a trace truncated mid-derivation can score 1.0 off an intermediate value.
   truncated_reward: keep
   backend:
     _target_: unirl.reward.local.mathverify.MathVerifyRewardScorer

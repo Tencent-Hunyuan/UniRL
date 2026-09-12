@@ -119,3 +119,9 @@ new remote reward needs no UniRL code — add it to the server and list its name
   may be `text`.
 - **`base_device` is ignored by the remote backend** (it's HTTP-only); local
   scorers honor it, falling back to CPU with a warning if CUDA is unavailable.
+- **`local/math_boxed.py` and `local/gsm8k_exact_match.py` are deliberately kept
+  with no in-tree caller.** Text scorers are wired by direct Hydra `_target_`
+  dotpath rather than through `local/registry.py` (`mathverify` isn't registered
+  either), so an out-of-tree recipe can name them even though every shipped math
+  recipe now uses `local/mathverify.py`. They are not orphans to sweep; delete
+  them only as a deliberate breaking change.
