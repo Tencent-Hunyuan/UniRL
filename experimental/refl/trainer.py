@@ -12,6 +12,7 @@ from omegaconf import DictConfig
 
 from unirl.distributed.group.placement import placement
 from unirl.distributed.tensor.grad_context import enable_grad
+from unirl.reward.client import RewardClient
 from unirl.trainer.base import BaseTrainer, build_sampling_dict
 from unirl.trainer.hydra import remote_hydra
 from unirl.types.primitives import Images, Texts
@@ -79,7 +80,7 @@ class REFLTrainer(BaseTrainer):
 
         with placement(self.pool, fraction=1.0, shared_workers=True):
             self.actor = remote_hydra(cfg.actor)
-            self.reward = remote_hydra(cfg.reward)
+            self.reward = RewardClient(remote_hydra(cfg.reward))
         self.actor.initialize()
         self.backend = self.actor
 

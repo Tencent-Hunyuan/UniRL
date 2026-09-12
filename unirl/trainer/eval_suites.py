@@ -9,6 +9,7 @@ from typing import Any, List, Optional
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
 
+from unirl.reward.client import RewardClient
 from unirl.trainer.hydra import remote_hydra
 
 logger = logging.getLogger(__name__)
@@ -63,7 +64,7 @@ def build_eval_suites(
         suites.append(
             EvalRewardSuite(
                 name=name,
-                reward=remote_hydra(reward_cfg),
+                reward=RewardClient(remote_hydra(reward_cfg)),
                 data_source=suite_source,
                 num_prompts=None if entry.get("num_prompts") is None else int(entry.get("num_prompts")),
             )

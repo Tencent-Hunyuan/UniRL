@@ -12,7 +12,7 @@ from hydra.utils import get_class, get_object, instantiate
 from omegaconf import DictConfig, OmegaConf
 
 from unirl.distributed.group.placement import placement, remote
-from unirl.distributed.tensor import hydrate
+from unirl.reward.client import RewardClient
 from unirl.train.configs import FSDPConfig, resolve_fsdp_mesh_shape
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample
@@ -48,15 +48,16 @@ def _validate_prompt_tree_dp_geometry(
     reward_dp_size: int,
     context: str,
 ) -> None:
-    roles = [("reward", reward_dp_size)]
-    if rollout_dp_size is not None:
-        roles.insert(0, ("rollout", rollout_dp_size))
-    for role, dp_size in roles:
-        if batch_size % dp_size:
-            raise ValueError(
-                f"{context}: {role} dp_size={dp_size} must divide batch_size={batch_size} "
-                "root prompt trees; DP_SCATTER preserves each prompt's whole subtree."
-            )
+    if rollout_dp_size is not None and batch_size % rollout_dp_size:
+        raise ValueError(
+            f"{context}: rollout dp_size={rollout_dp_size} must divide batch_size={batch_size} "
+            "root prompt trees; rollout DP_SCATTER preserves each prompt's whole subtree."
+        )
+    if batch_size % reward_dp_size:
+        raise ValueError(
+            f"{context}: reward dp_size={reward_dp_size} must divide batch_size={batch_size} "
+            "root prompts so its frontier-row RewardRequest shards keep prompt groups aligned."
+        )
 
 
 def _validate_dp_geometry(
@@ -453,7 +454,7 @@ class DiffusionTrainer(BaseTrainer):
 
         if reward_separate:
             with placement(self.pool, fraction=reward_fraction, shared_workers=True):
-                self.reward = remote_hydra(reward_cfg)
+                self.reward = RewardClient(remote_hydra(reward_cfg))
                 self._wire_eval_suites()
 
         self._validate_reward_config()
@@ -550,7 +551,7 @@ class DiffusionTrainer(BaseTrainer):
         self.pipeline = remote_hydra(pipeline_cfg, bundle=self.bundle)
         self.backend = remote_hydra(backend_cfg, bundle=self.bundle)
         if reward_cfg is not None:
-            self.reward = remote_hydra(reward_cfg)
+            self.reward = RewardClient(remote_hydra(reward_cfg))
             self._wire_eval_suites()
         algo_cls = get_class(str(algorithm_cfg.get("_target_", "")))
         self._uses_ema = getattr(algo_cls, "requires_ema_rollout", False)
@@ -774,9 +775,6 @@ class DiffusionTrainer(BaseTrainer):
         part = sample.parts[-1]
         mean_reward = 0.0
         if part.rewards is not None:
-            part.rewards = hydrate(part.rewards)
-            if isinstance(part.component_rewards, dict):
-                part.component_rewards = {name: hydrate(value) for name, value in part.component_rewards.items()}
             mean_reward = float(part.rewards.to(torch.float32).mean().item())
             if self._algo_requires_advantages:
                 part = part.compute_advantages(normalize=True, use_global_std=self._adv_use_global_std)
@@ -967,16 +965,13 @@ class DiffusionTrainer(BaseTrainer):
                     part = scored.parts[-1]
                     rewards = part.rewards
                     if rewards is not None:
-                        r = hydrate(rewards).to(torch.float32)
-                        if scored is first_scored:
-                            # Captions read part.rewards, which remote scoring returns dehydrated.
-                            part.rewards = r
+                        r = rewards.to(torch.float32)
                         sums[name] += float(r.sum().item())
                         counts[name] += int(r.numel())
                     components = part.component_rewards
                     if isinstance(components, dict):
                         for component_name, component_values in components.items():
-                            component = hydrate(component_values).to(torch.float32)
+                            component = component_values.to(torch.float32)
                             metric_name = f"{name}_{str(component_name).replace('/', '_')}"
                             sums.setdefault(metric_name, 0.0)
                             counts.setdefault(metric_name, 0)

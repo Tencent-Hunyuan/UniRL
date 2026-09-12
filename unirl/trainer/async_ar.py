@@ -9,7 +9,7 @@ from hydra.utils import instantiate
 from omegaconf import DictConfig
 
 from unirl.distributed.group.placement import placement, remote
-from unirl.distributed.tensor import hydrate
+from unirl.reward.client import RewardClient
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.ar import ARTrainer, ar_preflight
 from unirl.trainer.async_rollout import (
@@ -137,7 +137,7 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
             self.bundle = remote_hydra(bundle_cfg)
             self.pipeline = remote_hydra(pipeline_cfg, bundle=self.bundle)
             self.backend = remote_hydra(backend_cfg, bundle=self.bundle)
-            self.reward = remote_hydra(reward_cfg)
+            self.reward = RewardClient(remote_hydra(reward_cfg))
             self.algorithm = remote_hydra(algorithm_cfg, pipeline=self.pipeline)
             self.stack = remote_hydra(stack_cfg, fsdp_backend=self.backend, algorithm=self.algorithm)
             if sync_cfg is not None:
@@ -196,7 +196,6 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
         part = sample.parts[-1]
         mean_reward = 0.0
         if part.rewards is not None:
-            part.rewards = hydrate(part.rewards)
             mean_reward = float(part.rewards.to(torch.float32).mean().item())
         if self.advantage_mode == "grpo":
             part = part.compute_advantages(

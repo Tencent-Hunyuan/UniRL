@@ -4,47 +4,12 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
-import torch
-
-from unirl.distributed.tensor.batch import Batch
 from unirl.reward.base import BaseRewardComponentSpec, RewardBackend
 from unirl.types.reward import RewardRequest, RewardResponse
 
 DOMAIN_KEY = "domain"
-
-
-def _select_rows(value: Any, indices: torch.Tensor) -> Any:
-    """Re-index one request field along the batch dim."""
-    if value is None:
-        return None
-    if isinstance(value, Batch):
-        return value.select(indices)
-    raise TypeError(
-        f"PerDomainRewardScorer: cannot row-select request field of type {type(value).__name__}; "
-        "expected a Batch primitive (Texts/Images/Videos/Audios)."
-    )
-
-
-def _select_request(request: RewardRequest, indices: List[int]) -> RewardRequest:
-    """A fresh ``RewardRequest`` holding only the given rows."""
-    idx = torch.tensor(indices, dtype=torch.long)
-
-    def _pick(x: Optional[List[Any]]) -> Optional[List[Any]]:
-        return None if x is None else [x[i] for i in indices]
-
-    return RewardRequest(
-        primitives={k: _select_rows(v, idx) for k, v in request.primitives.items()},
-        generated={k: _select_rows(v, idx) for k, v in request.generated.items()},
-        metadata=_pick(request.metadata),
-        prompt_ids=_pick(request.prompt_ids),
-        sample_ids=_pick(request.sample_ids),
-        group_ids=_pick(request.group_ids),
-        reward_types=list(request.reward_types),
-        return_components=request.return_components,
-        audio_sample_rate=request.audio_sample_rate,
-    )
 
 
 class PerDomainRewardScorer(RewardBackend):
@@ -85,7 +50,7 @@ class PerDomainRewardScorer(RewardBackend):
         component_rewards: Dict[str, List[float]] = {d: [float("nan")] * bs for d in self._scorers}
 
         for domain, indices in groups.items():
-            resp = self._scorers[domain].compute_rewards(_select_request(request, indices))
+            resp = self._scorers[domain].compute_rewards(request.select(indices))
             if len(resp.rewards) != len(indices):
                 raise RuntimeError(
                     f"PerDomainRewardScorer: scorer for domain {domain!r} returned "

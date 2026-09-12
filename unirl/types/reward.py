@@ -1,13 +1,13 @@
 """Shared reward data types."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional, Union
 
 import torch
 from PIL import Image
 
-from unirl.distributed.tensor.batch import Batch, concat_field, max_field
+from unirl.distributed.tensor.batch import Batch, concat_field, max_field, shared_field
 
 
 class RewardType(Enum):
@@ -19,18 +19,46 @@ class RewardType(Enum):
 
 
 @dataclass
-class RewardRequest:
-    """Request for reward computation."""
+class RewardRequest(Batch):
+    """Row-aligned, DP-shardable request for reward computation."""
 
-    primitives: Dict[str, Any] = field(default_factory=dict)
-    generated: Dict[str, Any] = field(default_factory=dict)
-    metadata: Optional[List[Optional[Dict[str, Any]]]] = None
-    prompt_ids: Optional[List[str]] = None
-    sample_ids: Optional[List[str]] = None
-    group_ids: Optional[List[str]] = None
-    reward_types: List[RewardType] = field(default_factory=lambda: [RewardType.IMAGE_TEXT_ALIGNMENT])
-    return_components: bool = False
-    audio_sample_rate: Optional[int] = None
+    primitives: Dict[str, Any] = concat_field(default_factory=dict)
+    generated: Dict[str, Any] = concat_field(default_factory=dict)
+    metadata: Optional[List[Optional[Dict[str, Any]]]] = concat_field(default=None)
+    prompt_ids: Optional[List[str]] = concat_field(default=None)
+    sample_ids: Optional[List[str]] = concat_field(default=None)
+    group_ids: Optional[List[str]] = concat_field(default=None)
+    response_lengths: Optional[List[int]] = concat_field(default=None)
+    reward_types: List[RewardType] = shared_field(default_factory=lambda: [RewardType.IMAGE_TEXT_ALIGNMENT])
+    return_components: bool = shared_field(default=False)
+    audio_sample_rate: Optional[int] = shared_field(default=None)
+    max_new_tokens: Optional[int] = shared_field(default=None)
+
+    def __post_init__(self) -> None:
+        batch_size = self.batch_size
+        named_values = [
+            *((f"generated[{key!r}]", value) for key, value in self.generated.items() if value is not None),
+            *((f"primitives[{key!r}]", value) for key, value in self.primitives.items() if value is not None),
+        ]
+        for name, value in named_values:
+            try:
+                size = len(value)
+            except TypeError:
+                raise TypeError(f"RewardRequest.{name} must be row-aligned and sized, got {type(value).__name__}.")
+            if size != batch_size:
+                raise ValueError(f"RewardRequest.{name} has {size} rows, expected {batch_size}.")
+
+        for name in ("metadata", "prompt_ids", "sample_ids", "group_ids", "response_lengths"):
+            value = getattr(self, name)
+            if value is not None and len(value) != batch_size:
+                raise ValueError(f"RewardRequest.{name} has {len(value)} rows, expected {batch_size}.")
+
+        if (self.response_lengths is None) != (self.max_new_tokens is None):
+            raise ValueError("RewardRequest.response_lengths and max_new_tokens must be provided together.")
+
+    def slice(self, start: int, end: int) -> "RewardRequest":
+        """Slice rows through select so packed TensorRefs remain zero-copy views."""
+        return self.select(range(int(start), int(end)))
 
     @property
     def prompts(self) -> List[str]:

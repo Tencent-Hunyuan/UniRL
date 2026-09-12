@@ -16,8 +16,8 @@ from hydra.utils import instantiate
 from omegaconf import DictConfig
 
 from unirl.distributed.group.placement import placement, remote
-from unirl.distributed.tensor import hydrate
 from unirl.models.pe.pipeline import PEPipeline
+from unirl.reward.client import RewardClient
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample
 from unirl.trainer.eval_suites import build_eval_suites
@@ -118,7 +118,7 @@ class PETrainer(BaseTrainer):
                 self.pe_pipeline = None
                 self.rollout = remote(**rollout_parsed)
 
-            self.reward = remote_hydra(reward_cfg)
+            self.reward = RewardClient(remote_hydra(reward_cfg))
             self._eval_suites = build_eval_suites(
                 eval_rewards_cfg, data_source_cfg=data_source_cfg, enabled=self.eval_interval > 0
             )
@@ -202,18 +202,13 @@ class PETrainer(BaseTrainer):
         parts_by_name = {"ar": ar_idx, "diffusion": diff_idx}
 
         sample = self.reward.score_and_attach(sample)
-        diff_part = sample.parts[diff_idx]
-        if diff_part.rewards is not None:
-            diff_part.rewards = hydrate(diff_part.rewards)
-        if isinstance(diff_part.component_rewards, dict):
-            diff_part.component_rewards = {name: hydrate(value) for name, value in diff_part.component_rewards.items()}
 
         sample = sample.propagate_rewards(op="mean")
 
         mean_reward = 0.0
         di_rewards = sample.parts[diff_idx].rewards
         if di_rewards is not None:
-            mean_reward = float(hydrate(di_rewards).to(torch.float32).mean().item())
+            mean_reward = float(di_rewards.to(torch.float32).mean().item())
 
         new_parts = list(sample.parts)
         for name in self._train_tracks:
@@ -291,7 +286,7 @@ class PETrainer(BaseTrainer):
                 scored = reward.score_and_attach(generated)
                 rewards = scored.parts[-1].rewards
                 if rewards is not None:
-                    r = hydrate(rewards).to(torch.float32)
+                    r = rewards.to(torch.float32)
                     sums[name] += float(r.sum().item())
                     counts[name] += int(r.numel())
         return {name: sums[name] / max(1, counts[name]) for name, _ in scorers}
