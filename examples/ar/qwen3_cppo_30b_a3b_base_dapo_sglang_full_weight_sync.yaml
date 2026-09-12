@@ -99,9 +99,6 @@ rollout:
     ep_size: 8
     # SGLang enables MoE expert parallelism through ep_size; the pinned
     # ServerArgs has no separate enable_expert_parallel boolean.
-    max_new_tokens: 4096
-    temperature: 1.0
-    top_p: 1.0
     concurrency: 64
     samples_pre_expanded: true
     # The trainer sleeps SGLang before restoring FSDP onto the same GPUs.
@@ -137,8 +134,8 @@ algorithm:
   cppo_w_min: 0.8
   cppo_delta_b: 0.02
   loss_agg_mode: seq-mean-token-sum-norm
-  horizon: 4096
-  sampling_temperature: 1.0
+  horizon: ${sampling.max_new_tokens}
+  sampling_temperature: ${sampling.temperature}
   old_logp_source: rollout
   conditions_cls:
     _target_: hydra.utils.get_class
