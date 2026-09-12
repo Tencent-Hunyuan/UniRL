@@ -115,6 +115,16 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   far from 0.693 means the reference is not actually frozen (or the pairing is
   misaligned). Expect `reward_accuracy == 0` there too — exact ties fail the
   strict `>`, so it is not a bug.
+- **DPO allows `num_updates_per_batch > 1` for a reason the other families do
+  not.** The multi-update gate exists to stop a *moving π_old anchor*, but DPO
+  has no π_old: its reference is the adapter-disabled base — frozen weights,
+  recomputed inline in the same micro geometry as the policy forward. So N
+  optimizer steps per batch is sound, and it is how the objective reaches a
+  useful margin in a modest number of data batches. Two knock-ons: the LR
+  schedule counts *optimizer* steps, so `total_steps` must be
+  `num_steps × num_updates_per_batch`; and each update's slice must stay a
+  multiple of `rows_per_record` so no pair is split across updates (the trainer
+  checks both).
 - **AR `sampling_temperature` must equal the rollout `sampling.temperature`** —
   `ARStage.replay` rescales logits by it (`log_softmax(logits / T)`) to match SGLang's
   distribution; when unset it silently falls back to the `ARSamplingParams` default,

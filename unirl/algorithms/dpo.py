@@ -37,7 +37,9 @@ class DPO(StageAlgorithm):
 
     requires_advantages = False
     requires_backend = True
-    supports_multi_update = False
+    # The reference is the adapter-disabled base, recomputed inline per micro-batch, so it
+    # cannot drift as the policy updates — see ``README.md`` Gotchas.
+    supports_multi_update = True
 
     def __init__(
         self,
