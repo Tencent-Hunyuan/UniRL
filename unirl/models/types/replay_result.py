@@ -19,7 +19,9 @@ class ReplayResult:
     prev_sample_means: Optional[torch.Tensor] = None
     """The SDE transition's mean μ_θ at each replayed step. Shape
     ``[B, S', *latent_shape]`` for diffusion. Used by GRPO's KL penalty.
-    ``None`` when the stage doesn't produce it."""
+    Kept at the SDE kernel's native fp32 — narrowing it to the trajectory
+    dtype re-scores a different distribution than log-prob did (see Gotchas
+    in ``unirl/sde/README.md``). ``None`` when the stage doesn't produce it."""
 
     logits: Optional[torch.Tensor] = None
     """Per-step token logits at each replayed position. Shape
