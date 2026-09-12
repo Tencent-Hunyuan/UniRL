@@ -295,10 +295,11 @@ logging:
   log_media: true         # also uploads the eval panel (below)
 ```
 
-`eval_samples_per_prompt: 1` is a real override even when the rollout's
-`samples_per_prompt` is larger. Diffusion sampling has one field per value:
-`samples_per_prompt` controls fan-out and `guidance_scale` controls text CFG,
-including for BAGEL. The retired `num_samples_per_prompt` and
+`eval_samples_per_prompt` is a real override whenever it differs from the
+rollout's `samples_per_prompt`; the retired alias previously caused the
+rollout fan-out to win silently. Diffusion sampling now has one field per
+value: `samples_per_prompt` controls fan-out and `guidance_scale` controls
+text CFG, including for BAGEL. The retired `num_samples_per_prompt` and
 `cfg_text_scale` fields are not accepted.
 
 CFG has no eval knob of its own: leave `guidance_scale` unmentioned and eval

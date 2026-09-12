@@ -23,9 +23,10 @@
 #
 # Contract notes:
 #   - The adapter translates canonical guidance_scale to BAGEL's
-#     extra_args.cfg_text_scale and also sends cfg_img_scale. It always sends
-#     both because upstream BAGEL defaults a missing cfg_text_scale to 4.0
-#     (CFG ON); trainside cfg=1 must remain a single-forward path.
+#     extra_args.cfg_text_scale; guidance_scale is not forwarded as a top-level
+#     worker argument. It also always sends cfg_img_scale because upstream
+#     BAGEL defaults a missing cfg_text_scale to 4.0 (CFG ON); trainside cfg=1
+#     must remain a single-forward path.
 #   - num_inference_steps is sent as trainside_steps + 1: BAGEL builds
 #     linspace(1, 0, num_timesteps) and loops num_timesteps-1 steps. BAGEL builds
 #     its sigma schedule internally (it ignores sampling_params.sigmas), with a

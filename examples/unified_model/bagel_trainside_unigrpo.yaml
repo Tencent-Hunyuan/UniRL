@@ -18,7 +18,7 @@
 # Key UniGRPO alignment:
 #   - N = ar.samples_per_prompt = G (group of thinking chains); M = 1 image/chain.
 #   - image SHARES the AR's prompt-level advantage (UnifiedModelTrainer M=1 path).
-#   - no CFG during training (cfg_*_scale = 1 -> single-forward).
+#   - no CFG during training (guidance_scale = cfg_img_scale = 1 -> single-forward).
 #   - velocity-MSE regularization (mse_weight) replaces the latent-KL; text KL = 0.
 #   - per-expert LR in one optimizer: reasoning(und) 1e-6, denoising(gen) 3e-5.
 #   - GRPO-Guard RatioNorm on the off-policy PPO update(s).

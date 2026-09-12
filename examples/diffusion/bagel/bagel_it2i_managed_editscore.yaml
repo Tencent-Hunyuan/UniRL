@@ -253,13 +253,14 @@ data_source:
       prompts_per_rollout: ${batch_size}
 
 # BAGEL edit sampling (BagelDiffusionParams). guidance_scale amplifies the
-# INSTRUCTION, cfg_img amplifies the SOURCE (cfg_img active only when guidance_scale>1).
+# INSTRUCTION; cfg_img_scale adds a SOURCE-CFG forward, whose result is combined
+# only when guidance_scale>1.
 sampling:
   _target_: unirl.models.bagel.diffusion.BagelDiffusionParams
   num_inference_steps: 14              # STEPS (σ schedule = steps+1 = 15 points); the adapter sends +1 to the worker
-  guidance_scale: 1                    # 1 = No-CFG single forward (validated). >1 = +1 forward/step -> more memory
-  cfg_img_scale: 1.0                   # source<->diversity knob; only active when guidance_scale>1
-  cfg_interval: [0.4, 1.0]             # CFG schedule; only active when guidance_scale>1
+  guidance_scale: 1.0                  # 1 = No-CFG single forward (validated). >1 = +1 forward/step -> more memory
+  cfg_img_scale: 1.0                   # >1 adds a source-CFG forward; keep 1 unless guidance_scale>1
+  cfg_interval: [0.4, 1.0]             # timestep interval for both CFG scales
   cfg_renorm_min: 0.0
   cfg_renorm_type: text_channel        # CFG renorm; only active when guidance_scale>1
   eta: 1.0                             # SDE noise scale (per-step stochasticity = GRPO exploration)

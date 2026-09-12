@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any, Dict, List
 
 from unirl.models.bagel.conditions import BagelDiffusionConditions
+from unirl.models.bagel.diffusion import BagelDiffusionParams
 from unirl.rollout.engine.vllm_omni.adapters.base import ModelAdapter, register_adapter
 from unirl.rollout.engine.vllm_omni.adapters.dit import (
     DitInputAdapter,
@@ -27,7 +28,6 @@ from unirl.rollout.engine.vllm_omni.utils.sigmas import sigmas_list_from_diffusi
 from unirl.sde.runtime import FlowMatchSchedulePolicy
 from unirl.types.primitives import Images, Texts
 from unirl.types.sample import Sample
-from unirl.types.sampling import DiffusionSamplingParams
 
 
 def _conditioning_rows(
@@ -43,7 +43,7 @@ def _conditioning_rows(
         raise ValueError(f"{caller}: expected exactly one Texts conditioning batch, got {len(text_batches)}")
 
     prompt_rows = list(text_batches[0].texts)
-    n_samples = len(sample.frontier_gen_part(DiffusionSamplingParams).sample_ids)
+    n_samples = len(sample.frontier_gen_part(BagelDiffusionParams).sample_ids)
     if len(prompt_rows) != n_samples:
         raise RuntimeError(f"{caller}: prompt count {len(prompt_rows)} != diffusion sample count {n_samples}")
 
@@ -70,9 +70,8 @@ class BagelInputAdapter(DitInputAdapter):
 
     def _spp(self, sample: Sample) -> int:
         """``samples_per_prompt`` — the GRPO group size; 1 disables packing."""
-        diff_params = sample.frontier_gen_part(DiffusionSamplingParams).sampling_params
-        raw_spp = getattr(diff_params, "samples_per_prompt", 1)
-        spp = 1 if raw_spp is None else int(raw_spp)
+        diff_params = sample.frontier_gen_part(BagelDiffusionParams).sampling_params
+        spp = int(diff_params.samples_per_prompt)
         if spp < 1:
             raise ValueError(f"{self.modality}: samples_per_prompt must be >= 1, got {spp}")
         return spp
@@ -83,7 +82,7 @@ class BagelInputAdapter(DitInputAdapter):
             return False
         if self._spp(sample) <= 1:
             return False
-        diff_params = sample.frontier_gen_part(DiffusionSamplingParams).sampling_params
+        diff_params = sample.frontier_gen_part(BagelDiffusionParams).sampling_params
         return float(diff_params.guidance_scale) <= 1.0 and float(diff_params.cfg_img_scale) <= 1.0
 
     def build_prompts(self, sample: Sample) -> List[Any]:
@@ -94,7 +93,7 @@ class BagelInputAdapter(DitInputAdapter):
             image_input=self.image_input,
             caller=caller,
         )
-        gen_part = sample.frontier_gen_part(DiffusionSamplingParams)
+        gen_part = sample.frontier_gen_part(BagelDiffusionParams)
         n_samples = len(gen_part.sample_ids)
         if self.image_input:
             return [
@@ -130,7 +129,7 @@ class BagelInputAdapter(DitInputAdapter):
     def build_sampling(self, sample: Sample) -> List[StageSampling]:
         """One diffusion-stage intent with the BAGEL-specific kwargs."""
         spp = self._spp(sample)
-        gen_part = sample.frontier_gen_part(DiffusionSamplingParams)
+        gen_part = sample.frontier_gen_part(BagelDiffusionParams)
         diff_params = gen_part.sampling_params
         pack = self._is_packable_t2i(sample)
 
@@ -166,7 +165,7 @@ class BagelInputAdapter(DitInputAdapter):
             return_trajectory_decoded=False,
             num_outputs_per_prompt=num_outputs_per_prompt,
         )
-        seed = getattr(diff_params, "seed", None)
+        seed = diff_params.seed
         if seed is not None:
             diff_kwargs["seed"] = int(seed)
 
@@ -178,25 +177,23 @@ class BagelInputAdapter(DitInputAdapter):
         extra_args: Dict[str, Any] = {
             # Translate the canonical field to BAGEL's worker API.
             "cfg_text_scale": float(diff_params.guidance_scale),
-            "cfg_img_scale": float(getattr(diff_params, "cfg_img_scale", 1.0)),
-            "cfg_interval": tuple(getattr(diff_params, "cfg_interval", (0.0, 1.0))),
-            "cfg_renorm_min": float(getattr(diff_params, "cfg_renorm_min", 0.0)),
-            "cfg_renorm_type": str(getattr(diff_params, "cfg_renorm_type", "global")),
+            "cfg_img_scale": float(diff_params.cfg_img_scale),
+            "cfg_interval": tuple(diff_params.cfg_interval),
+            "cfg_renorm_min": float(diff_params.cfg_renorm_min),
+            "cfg_renorm_type": str(diff_params.cfg_renorm_type),
         }
-        sde_indices = getattr(diff_params, "sde_indices", None)
+        sde_indices = diff_params.sde_indices
         # eta == 0 (deterministic eval) means no step is stochastic. Shipping a
         # non-empty gate anyway makes the worker scheduler raise ("step_index=N is in
         # the SDE gate but eta=0.0"); an absent gate is its documented pure-Euler
         # path, and matches trainside, whose ``diffuse`` gates per-step eta on the same
         # params.eta and simply records no log-probs. FlowSDEStrategy uses 1e-7
         # as the deterministic cutoff; the wire gate must use the same threshold.
-        if sde_indices is not None and float(getattr(diff_params, "eta", 0.0)) >= 1e-7:
+        if sde_indices is not None and float(diff_params.eta) >= 1e-7:
             extra_args["sde_indices"] = sorted({int(i) for i in sde_indices})
         if diff_params.sigmas is not None and int(diff_params.sigmas.shape[0]) > 1:
             extra_args["sigma_max"] = float(diff_params.sigmas[1].item())
-        traj_prec = getattr(diff_params, "trajectory_precision", None)
-        if traj_prec is not None:
-            extra_args["trajectory_precision"] = str(traj_prec)
+        extra_args["trajectory_precision"] = diff_params.trajectory_precision
 
         pack_initial_noise_extra_args(extra_args, gen_part, diff_params, caller=self.modality)
         diff_kwargs["extra_args"] = extra_args
@@ -216,7 +213,7 @@ class BagelOutputAdapter(DitOutputAdapter):
         diff_outputs, _, _ = collect_dit_outputs(
             per_request, final_output_type=self.final_output_type, stage_id=self.stage_id, modality=self.modality
         )
-        diff_params = sample.frontier_gen_part(DiffusionSamplingParams).sampling_params
+        diff_params = sample.frontier_gen_part(BagelDiffusionParams).sampling_params
         return build_image_segment(diff_outputs, expected_sigmas=diff_params.sigmas)
 
     def build_decoded(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Any:
@@ -234,7 +231,7 @@ class BagelOutputAdapter(DitOutputAdapter):
             image_input=self.image_input,
             caller=f"{self.modality}.build_conditions",
         )
-        gen_part = sample.frontier_gen_part(DiffusionSamplingParams)
+        gen_part = sample.frontier_gen_part(BagelDiffusionParams)
         diff_params = gen_part.sampling_params
         image_shape = (int(diff_params.height), int(diff_params.width))
         conditions = BagelDiffusionConditions(
