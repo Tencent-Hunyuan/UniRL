@@ -85,7 +85,7 @@ class PPO(StageAlgorithm):
     """PPO over an AR ``TextSegment`` with a train-side value head."""
 
     supports_multi_update = True
-    recomputes_anchor = True
+    recomputes_anchor = True  # Critic values must use the exact training micro geometry.
     anchor_fields = ("values",)
 
     def __init__(

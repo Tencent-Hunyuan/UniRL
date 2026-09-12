@@ -64,7 +64,8 @@ not just three-tensor arithmetic.
 **Extending it:** a new diffusion loss subclasses `StageAlgorithm`, calls
 `stage.replay(...)`, computes a per-element loss, and `(loss * loss_scale).backward()`;
 if it needs multi-update, set `anchor_fields` and `supports_multi_update = True` and
-mirror `FlowGRPO`. A new AR loss mirrors `GRPO` (early-return on an empty
+declare `recomputes_anchor` when `prepare_segment` must follow the planned micro
+geometry (see `FlowGRPO`). A new AR loss mirrors `GRPO` (early-return on an empty
 segment, expand advantages per token), keeping `supports_multi_update = False`.
 
 ## Gotchas
@@ -73,11 +74,10 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   SGLang rollout emits no per-step `sde_logp`, so the `rollout` source raises in
   `prepare_segment`. Use `replay` (the cost is one extra `torch.no_grad` replay).
 - **`num_updates_per_batch > 1` on DiffusionNFT** raises in `TrainStack.__init__` — DiffusionNFT keeps
-  the default `supports_multi_update = False`. The four that allow it all freeze a
-  stable anchor: `FlowGRPO`/`FlowDPPO` freeze `sde_logp` once in
-  `prepare_segment`, while `GRPO`/`DRPO` reuse the rollout log-prob as the anchor
-  for all N steps (verl `bypass_mode` parity — so the AR ratio also carries the
-  rollout-vs-train engine gap, by design).
+  the default `supports_multi_update = False`. Multi-update algorithms freeze their
+  declared anchors: `FlowGRPO`/`FlowDPPO` prepare `sde_logp`; `GRPO` always reuses
+  the rollout log-prob, while DPPO/CPPO/DRPO do so under `old_logp_source: rollout`
+  and recompute it over the planned training micros under `replay`.
 - **FlowDPPO isn't fully on-policy under `rollout`** — it always replays `sde_means`
   (KL = 0) but keeps the engine's `sde_logp`, so its ratio isn't pinned to 1. Use
   `replay` to also pin the ratio.

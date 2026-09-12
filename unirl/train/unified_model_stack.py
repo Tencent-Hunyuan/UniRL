@@ -54,7 +54,7 @@ class UnifiedModelTrainStack(Remote):
         _validate_anchor_contract(self.image_algorithm)
         if self.num_updates_per_batch > 1:
             for name, algo in (("ar", self.ar_algorithm), ("image", self.image_algorithm)):
-                if not getattr(algo, "supports_multi_update", False):
+                if not algo.supports_multi_update:
                     raise ValueError(
                         f"num_updates_per_batch={self.num_updates_per_batch} requires every algorithm's "
                         f"π_old anchor to stay frozen across the N optimizer steps, but the {name!r} "
@@ -80,21 +80,17 @@ class UnifiedModelTrainStack(Remote):
         """Freeze one algorithm's π_old anchor once, before the multi-update loop."""
         if part.segment is None:
             return
-        prepare = getattr(algorithm, "prepare_segment", None)
-        if prepare is None:
-            return
         if not algorithm.recomputes_anchor:
-            prepare(conditions=part.conditions, segment=part.segment)
+            algorithm.prepare_segment(conditions=part.conditions, segment=part.segment)
             return
         micro_slices = [sl for step in self._optimizer_step_slices(int(part.batch_size)) for sl in step]
         if len(micro_slices) == 1:
-            prepare(conditions=part.conditions, segment=part.segment)
+            algorithm.prepare_segment(conditions=part.conditions, segment=part.segment)
             return
-        anchor_fields = getattr(algorithm, "anchor_fields", ())
-        collected: Dict[str, List[torch.Tensor]] = {field: [] for field in anchor_fields}
+        collected: Dict[str, List[torch.Tensor]] = {field: [] for field in algorithm.anchor_fields}
         for start, end in micro_slices:
             micro = part.slice(start, end)
-            prepare(conditions=micro.conditions, segment=micro.segment)
+            algorithm.prepare_segment(conditions=micro.conditions, segment=micro.segment)
             for field in collected:
                 value = getattr(micro.segment, field, None)
                 if value is None:

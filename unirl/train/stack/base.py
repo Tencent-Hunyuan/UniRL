@@ -65,9 +65,11 @@ def _align_track_to_model(part: Part, *, device: torch.device) -> None:
 
 
 def _validate_anchor_contract(algorithm: StageAlgorithm) -> None:
-    if not isinstance(algorithm.recomputes_anchor, bool):
+    """Reject anchor declarations whose per-micro outputs would be discarded."""
+    recomputes_anchor = algorithm.recomputes_anchor
+    if not isinstance(recomputes_anchor, bool):
         raise TypeError(f"{type(algorithm).__name__}.recomputes_anchor must be a bool attribute.")
-    if algorithm.recomputes_anchor and not algorithm.anchor_fields:
+    if recomputes_anchor and not algorithm.anchor_fields:
         raise ValueError(f"{type(algorithm).__name__} recomputes its anchor but declares no anchor_fields.")
 
 
@@ -91,7 +93,7 @@ class TrainStack(Remote):
         if float(max_grad_norm) <= 0.0:
             raise ValueError(f"{cls}.max_grad_norm must be > 0; got {max_grad_norm}.")
         self.num_updates_per_batch = _positive_int(name=f"{cls}.num_updates_per_batch", value=num_updates_per_batch)
-        if self.num_updates_per_batch > 1 and not getattr(algorithm, "supports_multi_update", False):
+        if self.num_updates_per_batch > 1 and not algorithm.supports_multi_update:
             raise ValueError(
                 f"num_updates_per_batch={self.num_updates_per_batch} requires an algorithm whose "
                 f"old_logp anchor stays frozen across the N optimizer steps "
