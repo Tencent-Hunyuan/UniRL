@@ -90,7 +90,10 @@ backend:
     use_torch_compile: false
   optimizer_cfg:
     _target_: unirl.train.backend.base.OptimizerConfig
-    learning_rate: 1.0e-6
+    # 10x the published reference's 1e-6. At 1e-6 this setup underfits — held-out
+    # accuracy matches accuracy on seen training rows, and the eval loss bottoms out
+    # by step 150. See README.md in datasets/omni_preference for the sweep.
+    learning_rate: 1.0e-5
     adam_beta1: 0.9
     adam_beta2: 0.999
     adam_epsilon: 1.0e-8
