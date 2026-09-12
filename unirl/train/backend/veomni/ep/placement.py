@@ -56,11 +56,27 @@ def gather_stacked_expert_block(
 ) -> torch.Tensor:
     """Gather contiguous ``[E/ep,...]`` blocks and concatenate the expert axis."""
     block = local_block.contiguous()
-    if block.device.type == "cpu" and dist.is_initialized() and dist.get_backend(ep_group) == "nccl":
+    backend = dist.get_backend(ep_group)
+    group_size = dist.get_world_size(ep_group)
+    if group_size != ep_size:
+        raise RuntimeError(f"EP placement: ep_size={ep_size} does not match group world_size={group_size}.")
+    if block.device.type == "cpu" and backend == "nccl":
         block = block.cuda()
-    gathered = [torch.empty_like(block) for _ in range(ep_size)]
-    dist.all_gather(gathered, block, group=ep_group)
-    return torch.cat(gathered, dim=0)
+
+    # Keep the list path for legacy Gloo (requirements.txt still permits torch 2.1).
+    if backend != "nccl":
+        gathered = [torch.empty_like(block) for _ in range(ep_size)]
+        dist.all_gather(gathered, block, group=ep_group)
+        return torch.cat(gathered, dim=0)
+
+    # Write rank-contiguous blocks directly into the final tensor, avoiding the
+    # extra full-size allocation and copy made by list all_gather + torch.cat.
+    stacked = block.new_empty((ep_size * block.shape[0], *block.shape[1:]))
+    gather_single = getattr(dist, "all_gather_single", None)  # PyTorch >= 2.13
+    if gather_single is None:
+        gather_single = dist.all_gather_into_tensor
+    gather_single(stacked, block, group=ep_group)
+    return stacked
 
 
 def assign_local_block(param: torch.Tensor, block: torch.Tensor) -> None:
