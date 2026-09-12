@@ -37,6 +37,10 @@ def _flow_sde_sampling_with_dance(
     noise_level = float(batch.rollout_noise_level)
     log_prob_no_const = batch.rollout_log_prob_no_const
     debug_mode = bool(getattr(batch, "rollout_debug_mode", False))
+    dtype_roundtrip = bool(getattr(batch, "rollout_dtype_roundtrip", False))
+    # Match the dtype emitted to the next denoising step.
+    emitted_dtype = model_output.dtype
+    reduce_roundtrip_stats = False
 
     if not log_prob_no_const and sde_type != "ode":
         assert noise_level > 0, "True log-probability computation requires a non-zero noise level."
@@ -135,6 +139,17 @@ def _flow_sde_sampling_with_dance(
     else:
         raise ValueError(f"Unsupported sde_type: {sde_type}")
 
+    if dtype_roundtrip:
+        prev_sample = prev_sample.to(dtype=emitted_dtype)
+        if effective_sde_type == "ode":
+            prev_sample_mean = prev_sample
+        else:
+            is_sp_sharded = bool(getattr(batch, "did_sp_shard_latents", False))
+            if tuple(prev_sample.shape) != tuple(full_variance_noise.shape) and not is_sp_sharded:
+                raise RuntimeError("rollout_dtype_roundtrip found an unexpected transition/noise shape mismatch")
+            reduce_roundtrip_stats = is_sp_sharded
+            log_prob_no_const_val = -((prev_sample.float() - prev_sample_mean) ** 2)
+
     reduce_dims = list(range(1, len(log_prob_no_const_val.shape)))
     local_elem_count = log_prob_no_const_val.new_full(
         (log_prob_no_const_val.shape[0],),
@@ -147,6 +162,12 @@ def _flow_sde_sampling_with_dance(
         log_prob_local_sum = (
             log_prob_no_const_val / (2 * (noise_std_dev**2)) - torch.log(noise_std_dev) - _LOG_SQRT_2PI
         ).sum(dim=list(range(1, len(log_prob_no_const_val.shape))))
+
+    if reduce_roundtrip_stats:
+        from sglang.multimodal_gen.runtime.post_training.sp_utils import all_reduce_if_sp_sharded
+
+        stats = torch.stack((log_prob_local_sum, local_elem_count))
+        log_prob_local_sum, local_elem_count = all_reduce_if_sp_sharded(batch, stats).unbind(0)
 
     if debug_mode:
         self.append_local_rollout_debug_tensors(
