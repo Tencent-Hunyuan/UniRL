@@ -179,7 +179,7 @@ class AgenticTrainer(BaseTrainer):
         return prepare_input_sample(
             inputs,
             rollout_id,
-            allowed_primitives={"text"},
+            allowed_primitives={"text", "image"},
             caller="AgenticTrainer._build_request_sample",
             root_control={"ar": {"stop": list(self._stop)}},
         )

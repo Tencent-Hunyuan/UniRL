@@ -7,7 +7,7 @@ import torch
 from unirl.config.require import require
 from unirl.models.types.conversations import build_vision_messages, tokenize_agent_target
 from unirl.types.conditions import TextTokenCondition
-from unirl.types.primitives import Images, Texts
+from unirl.types.primitives import Images, ImageSets, Texts
 from unirl.types.sample import Turn
 
 from .bundle import QwenVLBundle
@@ -68,9 +68,9 @@ class QwenVLChatTemplateStage:
             if not turns:
                 raise ValueError("QwenVLChatTemplateStage.embed: expected at least one conversation turn.")
             require(
-                sum(isinstance(t.content, Images) for t in turns) <= 1,
+                sum(isinstance(t.content, (Images, ImageSets)) for t in turns) <= 1,
                 "QwenVLChatTemplateStage.embed: at most one image turn per request is "
-                "supported (multi-image trajectories are out of scope).",
+                "supported; one ImageSets turn may contain multiple ordered attachments.",
             )
             conversations = build_vision_messages(turns, self.system_instruction)
 

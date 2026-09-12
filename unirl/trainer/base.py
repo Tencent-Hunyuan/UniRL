@@ -233,14 +233,14 @@ class BaseTrainer:
     def _upload_media_previews(self, sample: Sample, step: int, *, prefix: str, step_key: str) -> None:
         """Upload one preview grid per generated track of ``sample`` under ``prefix``."""
         from unirl.types.media_preview import build_media_preview_for_part
-        from unirl.types.primitives import Images, Texts
+        from unirl.types.primitives import Images, ImageSets, Texts
 
         wb = self.wandb_logger
         gen_parts = sample.gen_parts()
         multi = len(gen_parts) > 1
         cond = sample.conditioning()
         default_prompts = next((list(c.texts) for c in cond if isinstance(c, Texts)), None)
-        input_image = next((c for c in cond if isinstance(c, Images)), None)
+        input_image = next((c for c in cond if isinstance(c, (Images, ImageSets))), None)
         for part in gen_parts:
             name = "ar" if isinstance(part.sampling_params, ARSamplingParams) else "diffusion"
             preview = part.media_preview

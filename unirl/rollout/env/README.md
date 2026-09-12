@@ -14,7 +14,7 @@ itself lives in [`unirl/rollout/harness/tool_agent.py`](../harness/tool_agent.py
   An observation is a decoded `Primitive`; `None` appends no turn. The environment, rather than
   the loop, decides when the episode is done.
 - `Environment.close(sample)` is an optional, idempotent teardown hook. It must not raise.
-- A `Tool` exposes a JSON function schema and `execute(arguments) -> str`. A `StatefulTool` instead
+- A `Tool` exposes a JSON function schema and `execute(arguments) -> str | PrimitiveValue`. A `StatefulTool` instead
   implements the session lifecycle `session_start`, `execute_session`, and `session_end`.
 
 `Environment` instances are shared by concurrent trajectory threads on a worker. Implementations
@@ -73,8 +73,8 @@ complete, and failure cleanup quiesces and discards unfinished work.
 
 `ToolEnvironment` reads the latest `Texts` frontier and parses the last Hermes/Qwen-style
 `<tool_call>{...}</tool_call>`. It also accepts a balanced JSON object when a stop string removed
-the closing tag. A valid call is dispatched and its raw text result becomes the next `tool`
-observation; chat-template rendering adds any tool-response markup. Tool schemas are injected into
+the closing tag. A valid call is dispatched and its text or single-trajectory multimodal result
+becomes the next `tool` observation; chat-template rendering adds any tool-response markup. Tool schemas are injected into
 the inner engine's `chat_template_kwargs` when that configuration supports them, unless the recipe
 already supplied `tools`.
 

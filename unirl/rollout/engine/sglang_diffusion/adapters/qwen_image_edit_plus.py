@@ -11,7 +11,7 @@ from unirl.rollout.engine.sglang_diffusion import utils
 from unirl.rollout.engine.sglang_diffusion.adapters.base import register_adapter
 from unirl.rollout.engine.sglang_diffusion.adapters.qwen_image import QwenImageAdapter
 from unirl.rollout.engine.sglang_diffusion.backends import RawResult
-from unirl.types.primitives import Texts
+from unirl.types.primitives import Texts, require_single_images
 from unirl.types.sample import Sample
 from unirl.types.sampling import DiffusionSamplingParams
 
@@ -36,7 +36,10 @@ class QwenImageEditPlusAdapter(QwenImageAdapter):
         gen_part = sample.frontier_gen_part(DiffusionSamplingParams)
         prompts = list(text_turns[0].texts)
         unique_prompts, k = utils.deexpand_prompts_from_groups(prompts, list(gen_part.group_ids))
-        images_prim = image_batches[0]
+        images_prim = require_single_images(
+            image_batches[0],
+            context=f"{self.model_family}.build_prompts",
+        )
         pil_images = images_prim.to_pils()
         unique_pils = utils.first_per_group(pil_images, list(gen_part.group_ids)) if k > 1 else pil_images
         out: Dict[str, Any] = {

@@ -8,8 +8,8 @@ import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from uuid import uuid4
 
-from unirl.rollout.env.tools.base import StatefulTool, Tool
-from unirl.types.primitives import PrimitiveValue, Texts
+from unirl.rollout.env.tools.base import StatefulTool, Tool, ToolResult
+from unirl.types.primitives import PrimitiveValue, Texts, primitive_modality_key
 from unirl.types.sample import Sample, _part_with_field
 
 logger = logging.getLogger(__name__)
@@ -122,7 +122,7 @@ class ToolEnvironment:
 
         sessions = (sample.parts[0].control or {}).get("tool_sessions", {})
         calls = [parse_tool_call(t) for t in texts]
-        results: List[Optional[str]] = [self._run(c, sessions) if c is not None else None for c in calls]
+        results: List[Optional[ToolResult]] = [self._run(c, sessions) if c is not None else None for c in calls]
         per_sample_done = [c is None for c in calls]
         any_call = any(c is not None for c in calls)
 
@@ -136,10 +136,17 @@ class ToolEnvironment:
         if (not any_call) or (turn >= self.max_turns):
             return None, True, info
 
-        observation = Texts(texts=[r if r is not None else "" for r in results])
+        multimodal = [result for result in results if result is not None and not isinstance(result, str)]
+        if multimodal:
+            if len(results) != 1 or results[0] is None or isinstance(results[0], str):
+                raise ValueError("ToolEnvironment cannot batch mixed text and multimodal tool results")
+            primitive_modality_key(results[0])
+            observation = results[0]
+        else:
+            observation = Texts(texts=[r if isinstance(r, str) else "" for r in results])
         return observation, False, info
 
-    def _run(self, call: Dict[str, Any], sessions: Dict[str, str]) -> str:
+    def _run(self, call: Dict[str, Any], sessions: Dict[str, str]) -> ToolResult:
         """Dispatch one parsed call to its tool; surface any failure to the model as text."""
         name = call["name"]
         tool = self._tools.get(name)
