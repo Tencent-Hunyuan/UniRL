@@ -37,6 +37,16 @@ class DPO(StageAlgorithm):
 
     requires_advantages = False
     requires_backend = True
+    # Declared so every DP rank reduces the same key set, including one that saw only pads.
+    eval_metric_keys = (
+        "chosen_rewards",
+        "logits_mean",
+        "policy_chosen_logp",
+        "policy_rejected_logp",
+        "rejected_rewards",
+        "reward_accuracy",
+        "reward_margin",
+    )
     # The reference is the adapter-disabled base, recomputed inline per micro-batch, so it
     # cannot drift as the policy updates — see ``README.md`` Gotchas.
     supports_multi_update = True

@@ -339,8 +339,12 @@ class TrainStack(Remote):
                     weight_sum += float(w)
         finally:
             model.train(was_training)
-        keys = sorted(extra_sums)
-        reduced = self._all_reduce_sums([loss_sum, weight_sum] + [extra_sums[k] for k in keys])
+        # Every rank must reduce the same number of values. A rank whose shard held only pad
+        # rows produces no metrics, so take the key set from the algorithm's declaration
+        # rather than from this rank's observations.
+        declared = getattr(self.algorithm, "eval_metric_keys", ())
+        keys = sorted(declared) if declared else sorted(extra_sums)
+        reduced = self._all_reduce_sums([loss_sum, weight_sum] + [extra_sums.get(k, 0.0) for k in keys])
         global_loss, global_weight = reduced[0], reduced[1]
         if global_weight <= 0.0:
             raise ValueError(f"{type(self).__name__}.eval_track: zero eval weight (empty/fully-padded batch?).")
