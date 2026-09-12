@@ -228,23 +228,6 @@ def build_eval_sampling(
         updates["samples_per_prompt"] = int(samples_per_prompt)
     updates.update(_resolve_overrides(overrides, field_names))
 
-    # Legacy alias default 1 means unset. replace() copies the training alias,
-    # so a canonical override of 1 has to move both fields or it reverts.
-    if "num_samples_per_prompt" in field_names:
-        if "samples_per_prompt" in updates:
-            canonical = int(updates["samples_per_prompt"])
-            alias = updates.get("num_samples_per_prompt")
-            if alias is not None and int(alias) != canonical:
-                raise ValueError(
-                    f"eval fan-out is split: samples_per_prompt={canonical} vs "
-                    f"num_samples_per_prompt={int(alias)}. {type(base).__name__} keeps the "
-                    "latter as a legacy alias of the former, so the split would be silent. "
-                    "Set one fan-out, or set both to the same value."
-                )
-            updates["num_samples_per_prompt"] = canonical
-        elif "num_samples_per_prompt" in updates:
-            updates["samples_per_prompt"] = int(updates["num_samples_per_prompt"])
-
     # Only the cfg_text_scale families declare both; elsewhere the sibling is not a
     # field at all and _resolve_overrides already rejected it.
     if "cfg_text_scale" in field_names and "guidance_scale" in updates:

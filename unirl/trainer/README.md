@@ -296,9 +296,8 @@ logging:
 ```
 
 `eval_samples_per_prompt: 1` is a real override even when the rollout's
-`samples_per_prompt` is larger: the resolver keeps the legacy
-`num_samples_per_prompt` alias in lockstep, and a split between the two
-raises.
+`samples_per_prompt` is larger. `samples_per_prompt` is the sole diffusion
+fan-out field; the retired `num_samples_per_prompt` alias is not accepted.
 
 CFG has no eval knob of its own: leave `guidance_scale` unmentioned and eval
 runs at the training guidance (a CFG-off run cannot silently evaluate with CFG
