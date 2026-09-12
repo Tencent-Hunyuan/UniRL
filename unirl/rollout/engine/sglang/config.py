@@ -119,10 +119,6 @@ class SGLangEngineConfig(BaseEngineConfig):
 
     image_token: Optional[str] = None
 
-    max_new_tokens: int = 512
-    temperature: float = 0.7
-    top_p: float = 0.9
-    top_k: int = 0
     response_forbidden_tokens: Optional[List[str]] = None
 
     system_instruction: Optional[str] = None
@@ -180,18 +176,6 @@ class SGLangEngineConfig(BaseEngineConfig):
         require(
             self.concurrency >= 1,
             f"SGLangEngineConfig.concurrency must be >= 1; got {self.concurrency!r}",
-        )
-        require(
-            self.max_new_tokens >= 1,
-            f"SGLangEngineConfig.max_new_tokens must be >= 1; got {self.max_new_tokens!r}",
-        )
-        require(
-            self.temperature > 0,
-            f"SGLangEngineConfig.temperature must be > 0; got {self.temperature!r}",
-        )
-        require(
-            0.0 < self.top_p <= 1.0,
-            f"SGLangEngineConfig.top_p must be in (0, 1]; got {self.top_p!r}",
         )
 
         self.backend = str(self.backend).strip().lower()

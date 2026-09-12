@@ -22,10 +22,11 @@
 #     paths the trainer's LoRA sync needs.
 #
 # Contract notes:
-#   - CFG is steered through extra_args (cfg_text_scale / cfg_img_scale / ...),
-#     NOT guidance_scale — and the adapter ALWAYS sends them, because upstream
-#     BAGEL defaults a missing cfg_text_scale to 4.0 (CFG ON). The trainside
-#     recipe runs cfg=1 (single-forward), so the adapter passes 1.0/1.0.
+#   - The adapter translates canonical guidance_scale to BAGEL's
+#     extra_args.cfg_text_scale; guidance_scale is not forwarded as a top-level
+#     worker argument. It also always sends cfg_img_scale because upstream
+#     BAGEL defaults a missing cfg_text_scale to 4.0 (CFG ON); trainside cfg=1
+#     must remain a single-forward path.
 #   - num_inference_steps is sent as trainside_steps + 1: BAGEL builds
 #     linspace(1, 0, num_timesteps) and loops num_timesteps-1 steps. BAGEL builds
 #     its sigma schedule internally (it ignores sampling_params.sigmas), with a

@@ -91,7 +91,7 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
 - **AR `sampling_temperature` must equal the rollout `sampling.temperature`** —
   `ARStage.replay` rescales logits by it (`log_softmax(logits / T)`) to match SGLang's
   distribution; when unset it silently falls back to the `ARSamplingParams` default,
-  *not* the engine's actual temperature, biasing every ratio with no raise. Watch
+  *not* the request Sample's actual temperature, biasing every ratio with no raise. Watch
   `rollout_replay_logp_absdiff_mean` — it should be ~0 on an on-policy step.
 - **DiffusionNFT's `ref_deviation_coef > 0` anchors to the LoRA-disabled base, not the EMA shadow** — the
   shadow tracks the policy by construction, so anchoring to it would bound no drift. The reference

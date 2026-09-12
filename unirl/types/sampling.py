@@ -88,14 +88,7 @@ class DiffusionSamplingParams(BaseSamplingParams):
     guidance_scale_2: Optional[float] = None
     strength: Optional[float] = None
 
-    num_samples_per_prompt: int = 1
-
     def __post_init__(self) -> None:
-        if self.num_samples_per_prompt != 1 and self.samples_per_prompt == 1:
-            object.__setattr__(self, "samples_per_prompt", self.num_samples_per_prompt)
-        elif self.samples_per_prompt != 1 and self.num_samples_per_prompt == 1:
-            object.__setattr__(self, "num_samples_per_prompt", self.samples_per_prompt)
-
         reserved = {f.name for f in fields(self) if f.name != "sampler_kwargs"}
         shadowed = reserved & set(self.sampler_kwargs)
         require(

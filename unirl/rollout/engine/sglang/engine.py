@@ -161,11 +161,11 @@ class SGLangRolloutEngine(BaseRolloutEngine):
         self._version = 0
 
     def _prepare_generation(self, sample: Sample) -> Any:
+        sampling = resolve_sampling(self.cfg, sample)
         require(
             int(sample.parts[-1].batch_size) > 0,
             "SGLangRolloutEngine.generate requires a non-empty Sample (gen batch_size > 0)",
         )
-        sampling = resolve_sampling(self.cfg, sample)
         prepared = self.adapter.build_inputs(sample, sampling=sampling)
         active_adapter = self._weight_sync.active_adapter
         if active_adapter:
