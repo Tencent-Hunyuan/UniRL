@@ -61,7 +61,7 @@ class FSDPBackend(BaseFSDP2Backend):
         )
 
         model = resolve_trainable_module(bundle, trainable_attr)
-        if bool(getattr(bundle, "requires_unwrapped_trainable_root", False)) and bool(fsdp_cfg.root_wrap):
+        if getattr(bundle, "requires_unwrapped_trainable_root", False) and fsdp_cfg.root_wrap:
             raise ValueError(
                 f"{type(bundle).__name__} requires fsdp_cfg.root_wrap=false because its stages call replicated "
                 "trainable-root children directly; root wrapping would expose sharded DTensors outside the root "

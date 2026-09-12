@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import Any, Tuple
 
 from unirl.config.validation import validate_precision_type
 
@@ -19,7 +19,7 @@ JANUS_PRO_LORA_TARGETS = (
 @dataclass
 class JanusProPipelineConfig:
     pretrained_model_ckpt_path: str
-    trust_remote_code: bool = True
+    trust_remote_code: bool = False
 
     model_precision: Any = "bf16"
     device: Any = None
@@ -35,7 +35,7 @@ class JanusProPipelineConfig:
     weight_sync_param_name_prefix: str = "language_model."
 
     use_lora: bool = False
-    lora_target_modules: Optional[List[str]] = None
+    lora_target_modules: Tuple[str, ...] = JANUS_PRO_LORA_TARGETS
 
     freeze_vision_tower: bool = True
     freeze_aligner: bool = True
@@ -48,6 +48,8 @@ class JanusProPipelineConfig:
 
     def __post_init__(self) -> None:
         validate_precision_type(self.model_precision, field="JanusProPipelineConfig.model_precision")
+        if self.max_prompt_length < 1:
+            raise ValueError(f"JanusProPipelineConfig.max_prompt_length must be >= 1; got {self.max_prompt_length}.")
         unsupported_unfrozen = [
             name
             for name, frozen in (
@@ -62,8 +64,6 @@ class JanusProPipelineConfig:
                 "Janus-Pro training currently optimizes only language-model decoder blocks; "
                 f"{', '.join(unsupported_unfrozen)} must remain true."
             )
-        if self.lora_target_modules is None:
-            self.lora_target_modules = list(JANUS_PRO_LORA_TARGETS)
 
 
 __all__ = ["JANUS_PRO_LORA_TARGETS", "JanusProPipelineConfig"]

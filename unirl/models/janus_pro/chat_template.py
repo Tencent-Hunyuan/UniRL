@@ -34,7 +34,7 @@ class JanusProChatTemplateStage:
         assistant_role: str = "<|Assistant|>",
         image_placeholder: str = "<image_placeholder>",
         system_instruction: Optional[str] = None,
-        max_prompt_length: int = 4096,
+        max_prompt_length: int,
     ) -> None:
         self.bundle = bundle
         self.user_role = str(user_role)

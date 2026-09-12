@@ -108,8 +108,7 @@ cosmos3 = [
 ]
 infer = [
   "accelerate>=0.30",
-  # Janus-Pro's vendored SigLIP/VQ implementation imports both directly.
-  "einops>=0.7",
+  # Janus-Pro's vendored SigLIP implementation imports timm directly.
   "timm>=0.9.16",
 ]
 eval = [

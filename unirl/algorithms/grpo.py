@@ -48,6 +48,7 @@ class GRPO(StageAlgorithm):
     # ``log_probs`` (mirrors GSPO); the stack writes both back per micro.
     anchor_fields = ("log_probs", "rollout_log_probs")
 
+    @property
     def recomputes_anchor(self) -> bool:
         # Only ``replay`` re-derives log_probs; ``rollout`` keeps the engine's emission.
         return self.old_logp_source == "replay"

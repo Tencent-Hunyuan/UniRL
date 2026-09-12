@@ -19,7 +19,7 @@ from .ar import (
     _position_ids_from_attention_mask,
 )
 from .bundle import JanusProBundle
-from .conditions import JanusProImageARConditions
+from .conditions import JanusProImageARConditions, _finite_cfg_weight
 
 
 @dataclass
@@ -36,6 +36,12 @@ class JanusProImageARSamplingParams(ARSamplingParams):
     height: Optional[int] = None
     patch_size: int = 16
 
+    def __post_init__(self) -> None:
+        self.cfg_weight = _finite_cfg_weight(
+            self.cfg_weight,
+            where="JanusProImageARSamplingParams.cfg_weight",
+        )
+
     @property
     def emits_fixed_length(self) -> bool:
         """Return true because image generation emits exactly one token per VQ grid cell."""
@@ -43,12 +49,16 @@ class JanusProImageARSamplingParams(ARSamplingParams):
 
 
 def _resolve_image_grid(params: ARSamplingParams) -> Tuple[int, int, int, int]:
-    width = getattr(params, "width", None)
-    height = getattr(params, "height", None)
-    img_size = int(getattr(params, "img_size", 384))
+    if not isinstance(params, JanusProImageARSamplingParams):
+        raise TypeError(
+            f"Janus-Pro image generation requires JanusProImageARSamplingParams; got {type(params).__name__}."
+        )
+    width = params.width
+    height = params.height
+    img_size = int(params.img_size)
     width = img_size if width is None else int(width)
     height = img_size if height is None else int(height)
-    patch_size = int(getattr(params, "patch_size", 16))
+    patch_size = int(params.patch_size)
     if width <= 0 or height <= 0 or patch_size <= 0:
         raise ValueError(
             "JanusProImageARSamplingParams requires positive width, height, and patch_size; "
@@ -99,9 +109,6 @@ class JanusProImageARStage(ARStage[JanusProImageARConditions]):
     def _device(self) -> torch.device:
         return next(self.model.transformer.parameters()).device
 
-    def _language_body(self) -> torch.nn.Module:
-        return _language_body(self.model.transformer)
-
     def _autocast_ctx(self, device: torch.device):
         if device.type == "cuda" and self.autocast_dtype in (torch.float16, torch.bfloat16):
             return torch.autocast("cuda", self.autocast_dtype)
@@ -143,7 +150,7 @@ class JanusProImageARStage(ARStage[JanusProImageARConditions]):
     def _cfg_logits(logits: torch.Tensor, cfg_weight: float) -> torch.Tensor:
         cond = logits[0::2]
         uncond = logits[1::2]
-        return uncond + float(cfg_weight) * (cond - uncond)
+        return uncond + cfg_weight * (cond - uncond)
 
     def autoregress(
         self,
@@ -155,21 +162,21 @@ class JanusProImageARStage(ARStage[JanusProImageARConditions]):
         _width, _height, _patch_size, token_count = _resolve_image_grid(sampling_params)
         device = self._device()
         step = JanusProARStep(
-            temperature=float(sampling_params.temperature),
-            top_p=float(sampling_params.top_p),
-            top_k=int(sampling_params.top_k),
+            temperature=sampling_params.temperature,
+            top_p=sampling_params.top_p,
+            top_k=sampling_params.top_k,
         )
         # `conditions.cfg_weight` is the single source of truth: replay runs from
         # GRPO with no sampling_params, so anchoring the rollout on a different
         # value would silently bias every importance ratio. The pipeline copies
         # sampling_params.cfg_weight into the conditions, so a mismatch here
         # means the two were wired from different places.
-        cfg_weight = float(conditions.cfg_weight)
+        cfg_weight = conditions.cfg_weight
         sampled_cfg = getattr(sampling_params, "cfg_weight", None)
-        if sampled_cfg is not None and float(sampled_cfg) != cfg_weight:
+        if sampled_cfg is not None and sampled_cfg != cfg_weight:
             raise ValueError(
                 "JanusProImageARStage: sampling_params.cfg_weight="
-                f"{float(sampled_cfg)} disagrees with conditions.cfg_weight={cfg_weight}; "
+                f"{sampled_cfg} disagrees with conditions.cfg_weight={cfg_weight}; "
                 "replay can only see the conditions value, so the PPO ratio would be biased."
             )
 
@@ -177,7 +184,7 @@ class JanusProImageARStage(ARStage[JanusProImageARConditions]):
             inputs_embeds, attention_mask = self._prepare_paired_prompt_embeds(conditions, device=device)
             paired_batch = int(inputs_embeds.shape[0])
             batch_size = paired_batch // 2
-            body = self._language_body()
+            body = _language_body(self.model.transformer)
             past_key_values = None
             cur_attention_mask = attention_mask
             generated_tokens = torch.empty((batch_size, token_count), dtype=torch.long, device=device)
@@ -228,7 +235,6 @@ class JanusProImageARStage(ARStage[JanusProImageARConditions]):
         return TextSegment.pack(
             tokens=[generated_tokens[i] for i in range(batch_size)],
             log_probs=[generated_logps[i] for i in range(batch_size)],
-            rollout_log_probs=[generated_logps[i] for i in range(batch_size)],
         )
 
     def replay(
@@ -264,7 +270,7 @@ class JanusProImageARStage(ARStage[JanusProImageARConditions]):
 
         paired_response_mask = torch.stack([response_mask, response_mask], dim=1).reshape(paired_batch, t_max)
         with self._autocast_ctx(device):
-            body = self._language_body()
+            body = _language_body(self.model.transformer)
             paired_response_tokens = torch.stack([response_tokens, response_tokens], dim=1).reshape(
                 paired_batch,
                 t_max,
@@ -287,7 +293,9 @@ class JanusProImageARStage(ARStage[JanusProImageARConditions]):
                 use_cache=False,
             )
 
-            temp = float(temperature) if float(temperature) > 0.0 else 1.0
+            temp = float(temperature)
+            if temp <= 0.0:
+                temp = 1.0
             prompt_len = int(inputs_embeds.shape[1])
             prediction_hidden = out.last_hidden_state[:, prompt_len - 1 : prompt_len - 1 + t_max, :]
             if int(prediction_hidden.shape[1]) != t_max:
@@ -296,7 +304,7 @@ class JanusProImageARStage(ARStage[JanusProImageARConditions]):
                     f"got {prediction_hidden.shape[1]}, expected {t_max}."
                 )
             logits = self.model.model.gen_head(prediction_hidden)
-            cfg_logits = self._cfg_logits(logits, float(conditions.cfg_weight))
+            cfg_logits = self._cfg_logits(logits, conditions.cfg_weight)
             log_probs_full = F.log_softmax(cfg_logits.float() / temp, dim=-1)
             per_token_logps = log_probs_full.gather(-1, response_tokens.unsqueeze(-1)).squeeze(-1)
 

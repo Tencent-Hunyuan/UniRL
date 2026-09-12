@@ -66,19 +66,16 @@ class JanusProBundle(Bundle):
 
         model = AutoModelForCausalLM.from_pretrained(
             path,
-            trust_remote_code=bool(config.trust_remote_code),
+            trust_remote_code=config.trust_remote_code,
             torch_dtype=dtype,
         ).to(device=device, dtype=dtype)
-        # With trust_remote_code a checkpoint shipping its own modeling file can
-        # win over the vendored registration, which would silently drop the
-        # transformers-5.x compatibility patches recorded in VENDOR_COMMIT.txt —
-        # including the grad-safety clone in prepare_inputs_embeds that replay
-        # backprop depends on. Fail loudly instead of training the wrong class.
+        # Keep this as a backstop for explicit trust_remote_code overrides: remote
+        # modeling code must not silently replace the reviewed vendored runtime.
         if not isinstance(model, MultiModalityCausalLM):
             raise TypeError(
                 f"JanusProBundle: {path} resolved to {type(model).__module__}.{type(model).__name__}, "
-                "not the vendored MultiModalityCausalLM. Set trust_remote_code=false, or re-vendor "
-                "if the checkpoint genuinely needs newer modeling code."
+                "not the vendored MultiModalityCausalLM. Re-vendor the checkpoint's modeling code "
+                "instead of enabling an unreviewed remote implementation."
             )
         model.eval()
 
@@ -102,18 +99,13 @@ class JanusProBundle(Bundle):
                 len(decoder_blocks),
             )
 
-        if config.freeze_vision_tower and hasattr(model, "vision_model"):
-            model.vision_model.requires_grad_(False)
-            logger.info("Froze Janus-Pro vision tower.")
-        if config.freeze_aligner and hasattr(model, "aligner"):
-            model.aligner.requires_grad_(False)
-            logger.info("Froze Janus-Pro understanding aligner.")
-        if config.freeze_generation_tower:
-            for name in ("gen_vision_model", "gen_aligner", "gen_head", "gen_embed"):
-                module = getattr(model, name, None)
-                if hasattr(module, "requires_grad_"):
-                    module.requires_grad_(False)
-            logger.info("Froze Janus-Pro image-generation tower.")
+        # JanusProPipelineConfig rejects unsupported unfreezing, so these towers
+        # are unconditional rather than re-testing validated flags.
+        model.vision_model.requires_grad_(False)
+        model.aligner.requires_grad_(False)
+        for name in ("gen_vision_model", "gen_aligner", "gen_head", "gen_embed"):
+            getattr(model, name).requires_grad_(False)
+        logger.info("Froze Janus-Pro vision, understanding-aligner, and image-generation towers.")
 
         if config.use_gradient_checkpointing:
             lm = getattr(model, "language_model", None)

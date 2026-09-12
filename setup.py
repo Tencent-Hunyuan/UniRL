@@ -27,6 +27,7 @@ setup(
         "transformers>=5.6,<5.7",
         "peft>=0.14.0",
         "safetensors>=0.4",
+        "einops>=0.7",
         "Pillow>=10",
         "requests>=2.31",
         "psutil>=5.9",
@@ -42,7 +43,6 @@ setup(
         ],
         "infer": [
             "accelerate>=0.30",
-            "einops>=0.7",
             "timm>=0.9.16",
         ],
         "eval": [

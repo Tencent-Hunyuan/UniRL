@@ -29,7 +29,6 @@ bundle:
   config:
     _target_: unirl.models.janus_pro.config.JanusProPipelineConfig
     pretrained_model_ckpt_path: ${oc.env:JANUS_PRO_PATH,deepseek-ai/Janus-Pro-7B}
-    trust_remote_code: true
     model_precision: bf16
     autocast_precision: bf16
     logprob_precision: fp32

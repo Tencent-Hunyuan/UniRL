@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Sequence
 
@@ -7,6 +8,16 @@ import torch
 
 from unirl.distributed.tensor.batch import Batch, FieldKind, field
 from unirl.types.conditions import TextTokenCondition
+
+
+def _finite_cfg_weight(value: Any, *, where: str) -> float:
+    try:
+        normalized = float(value)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(f"{where} must be a finite number, got {value!r}.") from exc
+    if not math.isfinite(normalized):
+        raise ValueError(f"{where} must be finite, got {value!r}.")
+    return normalized
 
 
 def _pad_seq_tensor(value: Optional[torch.Tensor], target_seq_len: int) -> Optional[torch.Tensor]:
@@ -182,9 +193,15 @@ class JanusProARConditions(Batch):
 class JanusProImageARConditions(Batch):
     """Conditions for Janus-Pro Text -> Image autoregressive token generation."""
 
+    cfg_weight: float = field(kind=FieldKind.SHARED)
     prompt: Optional[TextTokenCondition] = field(kind=FieldKind.CONCAT, default=None)
     cfg_prompt: Optional[TextTokenCondition] = field(kind=FieldKind.CONCAT, default=None)
-    cfg_weight: float = field(kind=FieldKind.SHARED, default=5.0)
+
+    def __post_init__(self) -> None:
+        self.cfg_weight = _finite_cfg_weight(
+            self.cfg_weight,
+            where="JanusProImageARConditions.cfg_weight",
+        )
 
     @classmethod
     def concat(cls, items: Sequence["JanusProImageARConditions"]) -> "JanusProImageARConditions":
@@ -198,10 +215,14 @@ class JanusProImageARConditions(Batch):
         if any(not isinstance(prompt, TextTokenCondition) for prompt in cfg_prompts):
             return Batch.concat.__func__(cls, items)
 
+        cfg_weight = items[0].cfg_weight
+        if any(item.cfg_weight != cfg_weight for item in items[1:]):
+            raise ValueError("JanusProImageARConditions.concat requires one shared cfg_weight.")
+
         return cls(
             prompt=TextTokenCondition.concat([prompt for prompt in prompts if prompt is not None]),
             cfg_prompt=TextTokenCondition.concat([prompt for prompt in cfg_prompts if prompt is not None]),
-            cfg_weight=float(items[0].cfg_weight),
+            cfg_weight=cfg_weight,
         )
 
     @classmethod
@@ -221,7 +242,7 @@ class JanusProImageARConditions(Batch):
         return cls(
             prompt=prompt,
             cfg_prompt=cfg_prompt,
-            cfg_weight=float(d.get("cfg_weight", 5.0)),
+            cfg_weight=d["cfg_weight"],
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -242,7 +263,7 @@ class JanusProImageARConditions(Batch):
         return {
             "prompt": self.prompt,
             "cfg_prompt": self.cfg_prompt,
-            "cfg_weight": float(self.cfg_weight),
+            "cfg_weight": self.cfg_weight,
         }
 
 

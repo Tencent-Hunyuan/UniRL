@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import logging
-from dataclasses import dataclass
-from dataclasses import field as dc_field
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 import torch
 import torch.distributed as dist
@@ -16,17 +13,6 @@ from unirl.utils.dtypes import parse_torch_dtype
 
 from .bundle import JanusProBundle
 from .conditions import JanusProARConditions
-
-logger = logging.getLogger(__name__)
-
-
-@dataclass
-class JanusProARParams:
-    max_tokens: int = 512
-    temperature: float = 0.7
-    top_p: float = 0.9
-    top_k: int = 0
-    stop_token_ids: List[int] = dc_field(default_factory=list)
 
 
 class JanusProARStep(ARStep):
@@ -136,6 +122,11 @@ def _left_repack_prompt(
 
     attention_mask = prompt.attention_mask.to(device=device, dtype=torch.long)
     images_seq_mask = images_seq_mask.to(device=device, dtype=torch.bool)
+    if images_seq_mask.shape != attention_mask.shape:
+        raise ValueError(
+            "Janus-Pro AR requires images_seq_mask to match the prompt shape; "
+            f"got {tuple(images_seq_mask.shape)} and {tuple(attention_mask.shape)}."
+        )
     max_len = int(repacked_ids.shape[1])
     repacked_img_mask = torch.zeros_like(repacked_ids, dtype=torch.bool)
     real_mask = attention_mask.bool()
@@ -202,16 +193,15 @@ class JanusProARStage(ARStage[JanusProARConditions]):
         conditions: JanusProARConditions,
         *,
         sampling_params: ARSamplingParams,
-        params: Optional[JanusProARParams] = None,
         **_kwargs,
     ) -> TextSegment:
         device = next(self.model.transformer.parameters()).device
         step = JanusProARStep(
-            temperature=float(sampling_params.temperature),
-            top_p=float(sampling_params.top_p),
-            top_k=int(sampling_params.top_k),
+            temperature=sampling_params.temperature,
+            top_p=sampling_params.top_p,
+            top_k=sampling_params.top_k,
         )
-        stop_ids = self._resolve_stop_ids(params, sampling_params)
+        stop_ids = self._resolve_stop_ids(sampling_params)
         max_new = int(sampling_params.max_new_tokens)
 
         with torch.no_grad(), self._autocast_ctx(device):
@@ -255,8 +245,9 @@ class JanusProARStage(ARStage[JanusProARConditions]):
                 # A row that already emitted its stop token keeps decoding (FSDP
                 # needs every rank in every collective) but stops recording.
                 active = ~finished
+                log_prob = log_prob.float()
                 generated_tokens[:, i] = torch.where(active, token_id, torch.zeros_like(token_id))
-                generated_logps[:, i] = torch.where(active, log_prob.float(), torch.zeros_like(log_prob.float()))
+                generated_logps[:, i] = torch.where(active, log_prob, torch.zeros_like(log_prob))
                 lengths += active.long()
                 if stop_ids_t is not None:
                     finished |= active & (token_id.unsqueeze(-1) == stop_ids_t).any(dim=-1)
@@ -285,7 +276,6 @@ class JanusProARStage(ARStage[JanusProARConditions]):
         return TextSegment.pack(
             tokens=[generated_tokens[b, :n] for b, n in enumerate(lens)],
             log_probs=[generated_logps[b, :n] for b, n in enumerate(lens)],
-            rollout_log_probs=[generated_logps[b, :n] for b, n in enumerate(lens)],
         )
 
     def replay(
@@ -299,7 +289,8 @@ class JanusProARStage(ARStage[JanusProARConditions]):
             raise ValueError("JanusProARStage.replay: segment requires tokens with cu_seqlens")
 
         device = next(self.model.transformer.parameters()).device
-        inputs_embeds, attention_mask = self._prepare_prompt_embeds(conditions, device=device)
+        with self._autocast_ctx(device):
+            inputs_embeds, attention_mask = self._prepare_prompt_embeds(conditions, device=device)
         batch_size = int(inputs_embeds.shape[0])
         lengths = [int(n) for n in segment.lengths.tolist()]
         if batch_size != len(lengths):
@@ -344,7 +335,9 @@ class JanusProARStage(ARStage[JanusProARConditions]):
                 "JanusProARStage.replay: unexpected teacher-forced length "
                 f"{hidden.shape[1]}, expected {prompt_len + t_max - 1}."
             )
-        temp = float(temperature) if float(temperature) > 0.0 else 1.0
+        temp = float(temperature)
+        if temp <= 0.0:
+            temp = 1.0
         flat: List[torch.Tensor] = []
         for b, n in enumerate(lengths):
             if n == 0:
@@ -365,12 +358,9 @@ class JanusProARStage(ARStage[JanusProARConditions]):
 
     def _resolve_stop_ids(
         self,
-        params: Optional[JanusProARParams],
         sampling_params: ARSamplingParams,
     ) -> List[int]:
         ids: List[int] = []
-        if params is not None and params.stop_token_ids:
-            ids.extend(int(t) for t in params.stop_token_ids)
         if sampling_params.stop_token_id is not None:
             ids.append(int(sampling_params.stop_token_id))
         eos = getattr(self.model.tokenizer, "eos_token_id", None)
@@ -389,4 +379,4 @@ class JanusProARStage(ARStage[JanusProARConditions]):
         return out
 
 
-__all__ = ["JanusProARParams", "JanusProARStage", "JanusProARStep"]
+__all__ = ["JanusProARStage", "JanusProARStep"]

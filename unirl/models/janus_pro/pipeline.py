@@ -7,7 +7,7 @@ from unirl.models.types.pipeline import Pipeline
 from unirl.types.primitives import Images, Texts
 from unirl.types.sample import Sample
 
-from .ar import JanusProARParams, JanusProARStage
+from .ar import JanusProARStage
 from .bundle import JanusProBundle
 from .chat_template import JanusProChatTemplateStage
 from .conditions import JanusProARConditions, JanusProImageARConditions
@@ -46,47 +46,38 @@ class JanusProPipeline(Pipeline):
         if isinstance(config, dict):
             config = JanusProPipelineConfig(**{k: v for k, v in config.items() if k != "_target_"})
 
-        if config is None:
-            chat_template = JanusProChatTemplateStage(
-                bundle,
-                max_prompt_length=4096 if max_prompt_length is None else int(max_prompt_length),
-            )
-            ar = JanusProARStage(model=bundle)
-            image_prompt = JanusProImagePromptStage(
-                bundle,
-                max_prompt_length=4096 if max_prompt_length is None else int(max_prompt_length),
-            )
-            image_ar = JanusProImageARStage(model=bundle)
-            return cls(
-                bundle=bundle,
-                chat_template=chat_template,
-                ar=ar,
-                image_prompt=image_prompt,
-                image_ar=image_ar,
-            )
+        defaults = JanusProPipelineConfig
+        user_role = config.user_role if config is not None else defaults.user_role
+        assistant_role = config.assistant_role if config is not None else defaults.assistant_role
+        image_placeholder = config.image_placeholder if config is not None else defaults.image_placeholder
+        autocast_precision = config.autocast_precision if config is not None else defaults.autocast_precision
+        logprob_precision = config.logprob_precision if config is not None else defaults.logprob_precision
+        prompt_length = config.max_prompt_length if config is not None else defaults.max_prompt_length
+        if max_prompt_length is not None:
+            prompt_length = int(max_prompt_length)
 
         chat_template = JanusProChatTemplateStage(
             bundle,
-            user_role=config.user_role,
-            assistant_role=config.assistant_role,
-            image_placeholder=config.image_placeholder,
-            max_prompt_length=config.max_prompt_length if max_prompt_length is None else int(max_prompt_length),
+            user_role=user_role,
+            assistant_role=assistant_role,
+            image_placeholder=image_placeholder,
+            max_prompt_length=prompt_length,
         )
         ar = JanusProARStage(
             model=bundle,
-            autocast_precision=config.autocast_precision,
-            logprob_precision=config.logprob_precision,
+            autocast_precision=autocast_precision,
+            logprob_precision=logprob_precision,
         )
         image_prompt = JanusProImagePromptStage(
             bundle,
-            user_role=config.user_role,
-            assistant_role=config.assistant_role,
-            max_prompt_length=config.max_prompt_length if max_prompt_length is None else int(max_prompt_length),
+            user_role=user_role,
+            assistant_role=assistant_role,
+            max_prompt_length=prompt_length,
         )
         image_ar = JanusProImageARStage(
             model=bundle,
-            autocast_precision=config.autocast_precision,
-            logprob_precision=config.logprob_precision,
+            autocast_precision=autocast_precision,
+            logprob_precision=logprob_precision,
         )
         return cls(
             bundle=bundle,
@@ -154,24 +145,9 @@ class JanusProPipeline(Pipeline):
 
         conds: JanusProARConditions = chat_stage.embed(texts, images=images_prim.to_pils())
 
-        # Normalize numeric types while preserving the caller's explicit stop token.
-        ar = frontier.sampling_params
-        params = JanusProARParams(
-            max_tokens=ar.max_new_tokens,
-            temperature=ar.temperature,
-            top_p=ar.top_p,
-            top_k=ar.top_k,
-            stop_token_ids=[] if ar.stop_token_id is None else [int(ar.stop_token_id)],
-        )
-        sampling_params = ARSamplingParams(
-            max_new_tokens=int(params.max_tokens),
-            temperature=float(params.temperature),
-            top_p=float(params.top_p),
-            top_k=int(params.top_k),
-            stop_token_id=None if ar.stop_token_id is None else int(ar.stop_token_id),
-        )
-
-        segment = self.ar.autoregress(conds, sampling_params=sampling_params, params=params)
+        # The frontier is authoritative; forwarding it intact preserves shared
+        # fields such as samples_per_prompt and seed as the sampling API evolves.
+        segment = self.ar.autoregress(conds, sampling_params=frontier.sampling_params)
         decoded = self._detokenize(segment)
         return sample.with_filled_frontier(
             segment=segment,
@@ -191,7 +167,7 @@ class JanusProPipeline(Pipeline):
         texts = self._single(sample.turns(), Texts, "t2i")
         conds: JanusProImageARConditions = self.image_prompt.embed(
             texts,
-            cfg_weight=float(sampling_params.cfg_weight),
+            cfg_weight=sampling_params.cfg_weight,
         )
         segment = self.image_ar.autoregress(conds, sampling_params=sampling_params)
         decoded = self.image_ar.decode(segment, sampling_params=sampling_params)

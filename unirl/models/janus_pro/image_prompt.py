@@ -38,7 +38,7 @@ class JanusProImagePromptStage:
         user_role: str = "<|User|>",
         assistant_role: str = "<|Assistant|>",
         system_prompt: str = "",
-        max_prompt_length: int = 4096,
+        max_prompt_length: int,
     ) -> None:
         self.bundle = bundle
         self.user_role = str(user_role)
@@ -46,7 +46,7 @@ class JanusProImagePromptStage:
         self.system_prompt = str(system_prompt)
         self.max_prompt_length = int(max_prompt_length)
 
-    def embed(self, texts: Texts, *, cfg_weight: float = 5.0) -> JanusProImageARConditions:
+    def embed(self, texts: Texts, *, cfg_weight: float) -> JanusProImageARConditions:
         processor = self.bundle.processor
         tokenizer = self.bundle.tokenizer
         prompt_rows: List[List[int]] = []
@@ -79,7 +79,7 @@ class JanusProImagePromptStage:
         return JanusProImageARConditions(
             prompt=_right_pad_rows(prompt_rows, pad_id=self.bundle.pad_token_id, device=self.bundle.device),
             cfg_prompt=_right_pad_rows(cfg_rows, pad_id=self.bundle.pad_token_id, device=self.bundle.device),
-            cfg_weight=float(cfg_weight),
+            cfg_weight=cfg_weight,
         )
 
 

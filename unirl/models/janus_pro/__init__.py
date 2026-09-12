@@ -1,6 +1,6 @@
 """Janus-Pro multimodal understanding and autoregressive image-generation package."""
 
-from .ar import JanusProARParams, JanusProARStage, JanusProARStep
+from .ar import JanusProARStage, JanusProARStep
 from .bundle import JanusProBundle
 from .chat_template import JanusProChatTemplateStage
 from .conditions import JanusProARConditions, JanusProImageARConditions
@@ -12,7 +12,6 @@ from .pipeline import JanusProPipeline
 __all__ = [
     "JANUS_PRO_LORA_TARGETS",
     "JanusProARConditions",
-    "JanusProARParams",
     "JanusProARStage",
     "JanusProARStep",
     "JanusProBundle",
