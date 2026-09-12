@@ -60,7 +60,8 @@ class HunyuanVideo10DiffusionStep(DiffusionStep[HunyuanVideo10Bundle, HunyuanVid
             timestep = sigma.expand(batch_size)
         else:
             timestep = sigma
-        timestep = timestep.to(device=device, dtype=dtype) * self.TIMESTEP_SCALE
+        # Match Diffusers/SGLang: keep the scaled timestep in fp32 through the sinusoidal embedding.
+        timestep = timestep.to(device=device, dtype=torch.float32) * self.TIMESTEP_SCALE
 
         guidance = torch.full((batch_size,), guidance_scale, device=device, dtype=dtype)
 
