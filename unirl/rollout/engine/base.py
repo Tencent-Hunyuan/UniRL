@@ -3,13 +3,66 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Any, Dict, FrozenSet, List, Optional, Protocol, runtime_checkable
 
 import torch
 
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
 from unirl.types.sample import Sample
+
+
+@dataclass(frozen=True)
+class RolloutCapabilities:
+    """Execution policies a rollout engine consumes rather than ignores."""
+
+    rollout_precisions: FrozenSet[str] = frozenset({"bf16"})
+    reward_image_resize: bool = False
+    transactional_weight_publication: bool = False
+
+
+def resolve_rollout_capabilities(
+    config: object,
+    *,
+    fallback: Optional[RolloutCapabilities] = None,
+    track_prefix: str = "",
+) -> RolloutCapabilities:
+    """Resolve capabilities from a nested engine-config declaration without constructing the engine."""
+    default = fallback or RolloutCapabilities()
+    if not isinstance(config, Mapping):
+        return default
+    target = config.get("_target_")
+    if not isinstance(target, str):
+        return default
+    from hydra.utils import get_class
+
+    config_cls = get_class(target)
+    resolver = getattr(config_cls, "resolve_rollout_capabilities", None)
+    capabilities = resolver(config, track_prefix=track_prefix) if callable(resolver) else default
+    if not isinstance(capabilities, RolloutCapabilities):
+        raise TypeError(f"{config_cls.__name__}.resolve_rollout_capabilities() must return RolloutCapabilities.")
+    return capabilities
+
+
+@runtime_checkable
+class TransactionalWeightReceiver(Protocol):
+    """Optional all-or-nothing publication boundary for bucketed weight sync."""
+
+    def begin_weights_update(self, *, group_name: str, track_prefix: str = "") -> None: ...
+
+    def prepare_weights_update(
+        self,
+        *,
+        names: List[str],
+        dtypes: List[str],
+        shapes: List[List[int]],
+        group_name: str,
+        track_prefix: str = "",
+    ) -> None: ...
+
+    def finish_weights_update(self, *, group_name: str, track_prefix: str = "") -> None: ...
 
 
 class BaseEngineConfig(ABC):
@@ -22,6 +75,8 @@ class BaseEngineConfig(ABC):
 
 class BaseRolloutEngine(Remote, ABC):
     """Rollout engine ABC: fill and return one ``Sample``; ``generate`` may be called concurrently."""
+
+    capabilities = RolloutCapabilities()
 
     @abstractmethod
     def shutdown(self) -> None:
@@ -171,4 +226,10 @@ class BaseRolloutEngine(Remote, ABC):
         return sample.with_parts([*sample.parts[:-1], gen])
 
 
-__all__ = ["BaseRolloutEngine"]
+__all__ = [
+    "BaseEngineConfig",
+    "BaseRolloutEngine",
+    "RolloutCapabilities",
+    "TransactionalWeightReceiver",
+    "resolve_rollout_capabilities",
+]

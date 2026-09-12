@@ -40,6 +40,8 @@ def main(cfg: DictConfig) -> None:
         stack_cfg=cfg.stack,
         data_source_cfg=cfg.data_source,
         sampling_cfg=cfg.sampling,
+        scout_sampling_cfg=cfg.get("scout_sampling"),
+        contrastive_rollout_cfg=cfg.get("contrastive_rollout"),
         sync_cfg=cfg.get("sync"),
         logging_cfg=cfg.get("logging"),
         layout=cfg.get("layout", "colocate"),

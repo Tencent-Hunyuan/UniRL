@@ -11,7 +11,7 @@ import torch
 from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.models.pe.instruction import postprocess_pe_texts
-from unirl.rollout.engine.base import BaseRolloutEngine
+from unirl.rollout.engine.base import BaseRolloutEngine, TransactionalWeightReceiver
 from unirl.rollout.engine.composed.config import ComposedRolloutEngineConfig
 from unirl.types.primitives import Texts
 from unirl.types.sample import Part, Sample
@@ -334,6 +334,14 @@ class ComposedRolloutEngine(BaseRolloutEngine):
             )
         return [child]
 
+    def _transactional_children_for_track_prefix(self, track_prefix: str) -> List[TransactionalWeightReceiver]:
+        """Resolve routed children that implement atomic bucket publication."""
+        children = self._children_for_track_prefix(track_prefix)
+        transactional = [child for child in children if isinstance(child, TransactionalWeightReceiver)]
+        if not transactional:
+            raise RuntimeError(f"Composed rollout child {track_prefix!r} does not support transactional publication.")
+        return transactional
+
     def update_weights_from_ipc(
         self,
         *,
@@ -366,6 +374,7 @@ class ComposedRolloutEngine(BaseRolloutEngine):
         group_name: str,
         backend: str = "nccl",
         track_prefix: str = "",
+        timeout_s: Optional[float] = None,
     ) -> None:
         """Route NCCL group setup to one child via ``track_prefix``."""
         if not track_prefix:
@@ -374,7 +383,7 @@ class ComposedRolloutEngine(BaseRolloutEngine):
                 f"so the group can be routed to one child; expected one of {sorted(self._child_by_name)}."
             )
         for child in self._children_for_track_prefix(track_prefix):
-            child.init_weights_update_group(
+            kwargs = dict(
                 master_address=master_address,
                 master_port=master_port,
                 rank_offset=rank_offset,
@@ -382,6 +391,9 @@ class ComposedRolloutEngine(BaseRolloutEngine):
                 group_name=group_name,
                 backend=backend,
             )
+            if timeout_s is not None and isinstance(child, TransactionalWeightReceiver):
+                kwargs["timeout_s"] = timeout_s
+            child.init_weights_update_group(**kwargs)
 
     def update_weights_from_distributed(
         self,
@@ -409,6 +421,49 @@ class ComposedRolloutEngine(BaseRolloutEngine):
                 target_modules=target_modules,
                 flush_cache=flush_cache,
             )
+
+    def begin_weights_update(self, *, group_name: str, track_prefix: str = "") -> None:
+        """Open a transactional publication on the routed child when supported."""
+        if not track_prefix:
+            raise ValueError(
+                "ComposedRolloutEngine.begin_weights_update requires track_prefix "
+                f"so the update can be routed to one child; expected one of {sorted(self._child_by_name)}."
+            )
+        for child in self._transactional_children_for_track_prefix(track_prefix):
+            child.begin_weights_update(group_name=group_name)
+
+    def prepare_weights_update(
+        self,
+        *,
+        names: List[str],
+        dtypes: List[str],
+        shapes: List[List[int]],
+        group_name: str,
+        track_prefix: str = "",
+    ) -> None:
+        """Prepare a transactional publication on the routed child when supported."""
+        if not track_prefix:
+            raise ValueError(
+                "ComposedRolloutEngine.prepare_weights_update requires track_prefix "
+                f"so the update can be routed to one child; expected one of {sorted(self._child_by_name)}."
+            )
+        for child in self._transactional_children_for_track_prefix(track_prefix):
+            child.prepare_weights_update(
+                names=names,
+                dtypes=dtypes,
+                shapes=shapes,
+                group_name=group_name,
+            )
+
+    def finish_weights_update(self, *, group_name: str, track_prefix: str = "") -> None:
+        """Commit a transactional publication on the routed child when supported."""
+        if not track_prefix:
+            raise ValueError(
+                "ComposedRolloutEngine.finish_weights_update requires track_prefix "
+                f"so the update can be routed to one child; expected one of {sorted(self._child_by_name)}."
+            )
+        for child in self._transactional_children_for_track_prefix(track_prefix):
+            child.finish_weights_update(group_name=group_name)
 
     def destroy_weights_update_group(
         self,

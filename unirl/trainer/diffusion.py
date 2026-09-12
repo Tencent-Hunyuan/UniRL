@@ -1,5 +1,7 @@
 import dataclasses
+import hashlib
 import inspect
+import json
 import logging
 import os
 import sys
@@ -13,17 +15,47 @@ from omegaconf import DictConfig, OmegaConf
 
 from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
+from unirl.rollout.engine.base import RolloutCapabilities, resolve_rollout_capabilities
 from unirl.train.configs import FSDPConfig, resolve_fsdp_mesh_shape
 from unirl.train.stack import TrainStepResult
-from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample
+from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample, unwrap_replicated_int
+from unirl.trainer.contrastive import (
+    ContrastiveRolloutConfig,
+    build_contrastive_config,
+    select_top_bottom_indices,
+)
 from unirl.trainer.eval_suites import EvalRewardSuite, build_eval_suites
 from unirl.trainer.hydra import parse_hydra_cfg, remote_hydra
+from unirl.types.noise_recipe import NoiseRecipe
 from unirl.types.primitives import Texts
-from unirl.types.sample import Sample
-from unirl.types.sampling import BaseSamplingParams, total_samples_per_prompt
+from unirl.types.sample import Part, Sample
+from unirl.types.sampling import BaseSamplingParams, DiffusionSamplingParams, total_samples_per_prompt
 from unirl.utils.wandb_metrics import pooled_window_reward_metrics
 
 logger = logging.getLogger(__name__)
+_AUTO_NOISE_LATENT_SHAPE = object()
+
+
+def _stable_fingerprint(value: Any) -> str:
+    """SHA-256 identity for a resolved config or JSON-compatible payload."""
+    value = OmegaConf.to_container(value, resolve=True) if OmegaConf.is_config(value) else value
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _validate_rollout_sampling_capabilities(
+    capabilities: RolloutCapabilities,
+    **sampling_by_label: DiffusionSamplingParams,
+) -> None:
+    """Reject request policies the selected rollout engine would ignore."""
+    for label, params in sampling_by_label.items():
+        if params.rollout_precision not in capabilities.rollout_precisions:
+            raise ValueError(
+                f"{label}.rollout_precision={params.rollout_precision!r} is unsupported by the rollout engine; "
+                f"supported={sorted(capabilities.rollout_precisions)}."
+            )
+        if params.reward_image_size is not None and not capabilities.reward_image_resize:
+            raise ValueError(f"{label}.reward_image_size requires a rollout engine with image-resize capability.")
 
 
 def _run_cleanup_steps(steps: List[Tuple[str, Callable[[], None]]]) -> None:
@@ -226,7 +258,26 @@ def build_eval_sampling(
     updates: Dict[str, Any] = {"eta": float(eta)}
     if samples_per_prompt is not None:
         updates["samples_per_prompt"] = int(samples_per_prompt)
-    updates.update(_resolve_overrides(overrides, field_names))
+    resolved_overrides = _resolve_overrides(overrides, field_names)
+    updates.update(resolved_overrides)
+    if "num_samples_per_prompt" in resolved_overrides:
+        alias_fanout = int(resolved_overrides["num_samples_per_prompt"])
+        canonical_fanout = resolved_overrides.get("samples_per_prompt")
+        if canonical_fanout is not None and int(canonical_fanout) != alias_fanout:
+            raise ValueError(
+                "eval_sampling sets conflicting samples_per_prompt and "
+                f"num_samples_per_prompt values: {canonical_fanout} vs {alias_fanout}."
+            )
+        updates["samples_per_prompt"] = alias_fanout
+    # ``DiffusionSamplingParams`` retains the deprecated
+    # ``num_samples_per_prompt`` alias. dataclasses.replace() reruns
+    # ``__post_init__``; changing only the canonical field to 1 while the alias
+    # still carries the rollout fanout would silently restore the old fanout.
+    # Keep both fields synchronized for every eval overlay.
+    if "samples_per_prompt" in updates and "num_samples_per_prompt" in field_names:
+        updates["num_samples_per_prompt"] = int(updates["samples_per_prompt"])
+    elif "num_samples_per_prompt" in updates and "samples_per_prompt" in field_names:
+        updates["samples_per_prompt"] = int(updates["num_samples_per_prompt"])
 
     # Only the cfg_text_scale families declare both; elsewhere the sibling is not a
     # field at all and _resolve_overrides already rejected it.
@@ -294,6 +345,8 @@ class DiffusionTrainer(BaseTrainer):
         stack_cfg: DictConfig,
         data_source_cfg: DictConfig,
         sampling_cfg: DictConfig,
+        scout_sampling_cfg: Optional[DictConfig] = None,
+        contrastive_rollout_cfg: Optional[Any] = None,
         sync_cfg: Optional[DictConfig] = None,
         logging_cfg: Optional[DictConfig] = None,
         layout: str = "colocate",
@@ -340,13 +393,27 @@ class DiffusionTrainer(BaseTrainer):
         self._eval_rewards_cfg = eval_rewards_cfg
         self._eval_suites: List[EvalRewardSuite] = []
         self._task_config: Dict[str, Any] = dict(task_config) if task_config else {}
+        self._trace_model_fingerprint = _stable_fingerprint(bundle_cfg)
+        self._trace_pipeline_fingerprint = _stable_fingerprint(pipeline_cfg)
+        self._trace_reward_fingerprint = _stable_fingerprint(reward_cfg)
         self._rollout_is_trainside = False
         self._uses_ema = False
+        self._rollout_rpc_blocked = False
 
         self.data_source = instantiate(data_source_cfg)
         self._data_source_cfg = data_source_cfg
 
         self.sampling_params: Dict[str, BaseSamplingParams] = build_sampling_dict(sampling_cfg)
+        self._contrastive: Optional[ContrastiveRolloutConfig] = build_contrastive_config(contrastive_rollout_cfg)
+        self._scout_sampling_params: Optional[Dict[str, BaseSamplingParams]] = (
+            build_sampling_dict(scout_sampling_cfg) if scout_sampling_cfg is not None else None
+        )
+        if (self._contrastive is None) != (self._scout_sampling_params is None):
+            raise ValueError(
+                "contrastive_rollout and scout_sampling must be configured together; "
+                "one without the other cannot define a candidate-selection protocol."
+            )
+        self._normalize_contrastive_sampling()
         # Frozen at init, so overlay contradictions surface at startup rather than an
         # hour in.
         self._eval_sampling_params: Dict[str, BaseSamplingParams] = build_eval_sampling(
@@ -374,6 +441,15 @@ class DiffusionTrainer(BaseTrainer):
                 pipeline_cfg=pipeline_cfg,
                 model_cfg=bundle_cfg,
                 sampling_spec=self._eval_sampling_params.get("diffusion"),
+            )
+        )
+        self._scout_noise_latent_shape: Optional[list] = (
+            None
+            if self._scout_sampling_params is None or self._noise_latent_shape is None
+            else self._resolve_noise_latent_shape(
+                pipeline_cfg=pipeline_cfg,
+                model_cfg=bundle_cfg,
+                sampling_spec=self._scout_sampling_params.get("diffusion"),
             )
         )
         if self.eval_interval > 0 and bool((self.logging_cfg or {}).get("log_media", False)):
@@ -472,6 +548,7 @@ class DiffusionTrainer(BaseTrainer):
             train_dp_size=int(self.stack.dp_size),
             require_rollout_dp_divisibility=not self._prompt_local_rollout,
         )
+        self._validate_contrastive_config()
 
     def _validate_reward_config(self) -> None:
         """A missing ``reward:`` block is legal only for requires_advantages=False algorithms."""
@@ -489,6 +566,107 @@ class DiffusionTrainer(BaseTrainer):
                 "but the recipe has no `reward:` block. Set eval_interval: 0 or configure a "
                 "(monitoring-only) reward."
             )
+
+    def _normalize_contrastive_sampling(self) -> None:
+        """Make the naive control inherit one authoritative generation policy."""
+        config = self._contrastive
+        scout_params = self._scout_sampling_params
+        if config is None or scout_params is None:
+            return
+        expected_keys = {"diffusion"}
+        if set(self.sampling_params) != expected_keys or set(scout_params) != expected_keys:
+            raise ValueError(
+                "contrastive rollout currently requires exactly one diffusion sampling stage; "
+                f"got sampling={sorted(self.sampling_params)}, scout_sampling={sorted(scout_params)}."
+            )
+        main = self.sampling_params["diffusion"]
+        scout = scout_params["diffusion"]
+        if not isinstance(main, DiffusionSamplingParams) or not isinstance(scout, DiffusionSamplingParams):
+            raise TypeError("contrastive rollout selection currently supports one diffusion sampling stage.")
+        if config.mode == "naive":
+            scout_count = int(scout.samples_per_prompt)
+            self._scout_sampling_params = {
+                "diffusion": dataclasses.replace(
+                    main,
+                    samples_per_prompt=scout_count,
+                    num_samples_per_prompt=scout_count,
+                    reward_image_size=scout.reward_image_size,
+                )
+            }
+
+    def _validate_contrastive_config(self) -> None:
+        """Fail fast on two-stage geometry and seed mismatches."""
+
+        config = self._contrastive
+        scout_params = self._scout_sampling_params
+        if config is None or scout_params is None:
+            return
+        if self.reward is None:
+            raise ValueError("contrastive rollout selection requires a configured reward.")
+        if self.accumulate_rollouts != 1:
+            raise ValueError("contrastive rollout selection currently requires accumulate_rollouts=1.")
+
+        main = self.sampling_params.get("diffusion")
+        scout = scout_params.get("diffusion")
+        _validate_rollout_sampling_capabilities(
+            self._rollout_capabilities,
+            sampling=main,
+            scout_sampling=scout,
+        )
+        if total_samples_per_prompt(self.sampling_params) != config.selected_count:
+            raise ValueError(
+                "sampling.samples_per_prompt must equal top_k + bottom_k for the BF16/train subset; "
+                f"got {total_samples_per_prompt(self.sampling_params)} vs {config.selected_count}."
+            )
+        scout_count = total_samples_per_prompt(scout_params)
+        if scout_count < config.selected_count:
+            raise ValueError(
+                f"scout_sampling.samples_per_prompt={scout_count} is smaller than selected K={config.selected_count}."
+            )
+        if main.rollout_precision != "bf16":
+            raise ValueError(
+                "contrastive rollout requires sampling.rollout_precision=bf16 for the train subset; "
+                f"got {main.rollout_precision!r}."
+            )
+        if config.mode == "scout_regen":
+            if main.seed != scout.seed:
+                raise ValueError(
+                    f"scout and regeneration must share sampling.seed for identical x_T; "
+                    f"got {scout.seed} vs {main.seed}."
+                )
+            if (int(main.height), int(main.width)) != (int(scout.height), int(scout.width)):
+                raise ValueError(
+                    "scout and regeneration must share latent geometry; "
+                    f"got scout={scout.height}x{scout.width}, regen={main.height}x{main.width}."
+                )
+            if main.seed is None:
+                raise ValueError("scout_regen requires a non-null sampling.seed for deterministic x_T reuse.")
+            if bool(main.disable_driver_xt) or bool(scout.disable_driver_xt):
+                raise ValueError("scout_regen forbids disable_driver_xt: selected x_T must be reproducible.")
+            if self._noise_latent_shape is None or self._scout_noise_latent_shape is None:
+                raise ValueError(
+                    "scout_regen requires driver-authored latent shapes; DISABLE_DRIVER_XT and "
+                    "pipelines without latent_shape() cannot preserve selected x_T."
+                )
+            if self._noise_latent_shape != self._scout_noise_latent_shape:
+                raise ValueError(
+                    "scout_regen requires identical inferred latent shapes; "
+                    f"got scout={self._scout_noise_latent_shape}, regen={self._noise_latent_shape}."
+                )
+            if bool(main.init_same_noise) != bool(scout.init_same_noise):
+                raise ValueError("scout and regeneration must use the same init_same_noise policy for identical x_T.")
+
+        chunk = config.prompt_chunk_size
+        if int(self.batch_size) % chunk:
+            raise ValueError(
+                f"batch_size={self.batch_size} must be divisible by contrastive prompt_chunk_size={chunk}."
+            )
+        _validate_prompt_tree_dp_geometry(
+            batch_size=chunk,
+            rollout_dp_size=int(self.rollout.dp_size),
+            reward_dp_size=int(self.reward.dp_size),
+            context="contrastive prompt chunk",
+        )
 
     def _validate_accumulation(self, stack_cfg: DictConfig) -> None:
         """``accumulate_rollouts > 1`` needs single-update, non-EMA, cycle-aligned cadences."""
@@ -591,7 +769,16 @@ class DiffusionTrainer(BaseTrainer):
     def _build_rollout(self, rollout_cfg, *, allow_pipeline: bool):
         """Build the rollout remote in the currently active placement scope."""
         rollout_parsed = parse_hydra_cfg(rollout_cfg)
-        if "pipeline" in inspect.signature(rollout_parsed["role_cls"]).parameters:
+        role_cls = rollout_parsed["role_cls"]
+        capabilities = getattr(role_cls, "capabilities", None)
+        if not isinstance(capabilities, RolloutCapabilities):
+            raise TypeError(f"{role_cls.__name__} must declare RolloutCapabilities.")
+        self._rollout_capabilities = resolve_rollout_capabilities(
+            rollout_parsed.get("config"),
+            fallback=capabilities,
+        )
+        self._rollout_config = rollout_parsed.get("config")
+        if "pipeline" in inspect.signature(role_cls).parameters:
             if not allow_pipeline:
                 raise ValueError(
                     "layout='separate' requires a dedicated-rollout engine "
@@ -608,7 +795,16 @@ class DiffusionTrainer(BaseTrainer):
         """One-time cross-slab handshake: hand rank 0 the rollout Worker handles."""
         if str(sync_cfg.get("_target_", "")).endswith("NCCLWeightSync"):
             addr, port = self.weight_sync.pick_master()[0]
-            self.weight_sync.set_rollout_targets(self.rollout.workers, self.rollout.role_name)
+            sync_capabilities = resolve_rollout_capabilities(
+                self._rollout_config,
+                fallback=self._rollout_capabilities,
+                track_prefix=str(sync_cfg.get("track_prefix", "") or ""),
+            )
+            self.weight_sync.set_rollout_targets(
+                self.rollout.workers,
+                self.rollout.role_name,
+                transactional=sync_capabilities.transactional_weight_publication,
+            )
             self.weight_sync.connect(
                 master_addr=addr,
                 master_port=port,
@@ -641,10 +837,12 @@ class DiffusionTrainer(BaseTrainer):
         rollout_id: int,
         *,
         sampling: Optional[Dict[str, BaseSamplingParams]] = None,
+        noise_latent_shape: Any = _AUTO_NOISE_LATENT_SHAPE,
     ) -> Sample:
         """Turn a data source batch into a request :class:`Sample`."""
         sp = sampling if sampling is not None else self.sampling_params
-        noise_latent_shape = self._eval_noise_latent_shape if sampling is not None else self._noise_latent_shape
+        if noise_latent_shape is _AUTO_NOISE_LATENT_SHAPE:
+            noise_latent_shape = self._eval_noise_latent_shape if sampling is not None else self._noise_latent_shape
         diffusion = sp.get("diffusion")
         sde_indices = diffusion.resolve_sde_indices(rollout_id)
         diffusion = dataclasses.replace(
@@ -660,7 +858,10 @@ class DiffusionTrainer(BaseTrainer):
         samples_per_prompt = total_samples_per_prompt(sp)
         request = request.fork(samples_per_prompt, sampling_params=diffusion)
 
-        if sampling is not None and noise_latent_shape is not None:
+        # Eval keys x_T by prompt text so the same comparison grid survives
+        # checkpoint/rank changes. A training scout passes its own sampling dict
+        # too, but must retain rollout-keyed sample ids for fresh exploration.
+        if sampling is self._eval_sampling_params and noise_latent_shape is not None:
             from unirl.sde.noise import make_prompt_seed_group_id
 
             texts = next((value for value in request.conditioning() if isinstance(value, Texts)), None)
@@ -677,6 +878,250 @@ class DiffusionTrainer(BaseTrainer):
             frontier = dataclasses.replace(request.parts[-1], init_noise_group_ids=noise_group_ids)
             request = request.with_parts([*request.parts[:-1], frontier])
         return request
+
+    def _selected_sampling_params(self, rollout_id: int) -> DiffusionSamplingParams:
+        """Resolve the BF16/train params for a selected K-row prompt group."""
+
+        base = self.sampling_params.get("diffusion")
+        if self._contrastive is None or not isinstance(base, DiffusionSamplingParams):
+            raise RuntimeError("_selected_sampling_params called without a diffusion contrastive config.")
+        return dataclasses.replace(
+            base,
+            sde_indices=base.resolve_sde_indices(rollout_id),
+            scheduler=None,
+            sigmas=None,
+            init_noise_latent_shape=self._noise_latent_shape,
+        )
+
+    @staticmethod
+    def _selected_regen_shell(selected: Part, params: DiffusionSamplingParams) -> Part:
+        """Clear scout outputs while preserving ids and initial-noise keys."""
+
+        return dataclasses.replace(
+            selected,
+            segment=None,
+            primitives={},
+            primitive_metadata={},
+            conditions={},
+            media_preview=None,
+            rewards=None,
+            component_rewards=None,
+            advantages=None,
+            status=None,
+            metadata=[],
+            sampling_params=params,
+            output_version=None,
+            harness_status=None,
+        )
+
+    def _score_generated_sample(self, sample: Sample) -> Sample:
+        """Score and hydrate a generated frontier without computing advantages."""
+
+        if self.reward is None:
+            raise RuntimeError("contrastive rollout selection requires a reward.")
+        with self._reward_phase():
+            sample = self.reward.score_and_attach(sample)
+        part = sample.parts[-1]
+        if part.rewards is None:
+            raise RuntimeError("contrastive reward returned no frontier rewards.")
+        part.rewards = hydrate(part.rewards)
+        if not torch.isfinite(part.rewards).all():
+            bad = torch.nonzero(~torch.isfinite(part.rewards), as_tuple=False).flatten().tolist()
+            raise ValueError(f"contrastive reward returned non-finite values at rows {bad[:8]}.")
+        if isinstance(part.component_rewards, dict):
+            part.component_rewards = {name: hydrate(value) for name, value in part.component_rewards.items()}
+        return sample.with_parts([*sample.parts[:-1], part])
+
+    def _write_contrastive_trace(
+        self,
+        rollout_id: int,
+        *,
+        policy_version: int,
+        groups: List[Dict[str, Any]],
+    ) -> None:
+        config = self._contrastive
+        if config is None or not config.trace_dir or rollout_id % config.trace_interval or not groups:
+            return
+        os.makedirs(config.trace_dir, exist_ok=True)
+        scout = self._scout_sampling_params["diffusion"]
+        payload = {
+            "schema_version": 1,
+            "rollout_id": rollout_id,
+            "policy_version": policy_version,
+            "policy_snapshot_id": config.policy_snapshot_id,
+            "model_fingerprint": self._trace_model_fingerprint,
+            "pipeline_fingerprint": self._trace_pipeline_fingerprint,
+            "reward_fingerprint": self._trace_reward_fingerprint,
+            "comparison_fingerprint": _stable_fingerprint(
+                {
+                    "guidance_scale": scout.guidance_scale,
+                    "height": scout.height,
+                    "width": scout.width,
+                    "num_frames": scout.num_frames,
+                    "eta": scout.eta,
+                    "init_same_noise": scout.init_same_noise,
+                    "reward_image_size": scout.reward_image_size,
+                }
+            ),
+            "mode": config.mode,
+            "top_k": config.top_k,
+            "bottom_k": config.bottom_k,
+            "scout_steps": int(scout.num_inference_steps),
+            "scout_precision": scout.rollout_precision,
+            "groups": groups,
+        }
+        path = os.path.join(config.trace_dir, f"rollout_{rollout_id:06d}.json")
+        temporary = f"{path}.tmp"
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True, allow_nan=False)
+        os.replace(temporary, path)
+
+    def _contrastive_rollout_and_score(
+        self,
+        inputs: Sample,
+        *,
+        sync_weights: bool,
+        rollout_id: int,
+    ) -> Tuple[Sample, float]:
+        """Run a chunked naive or scout→select→BF16-regenerate rollout."""
+
+        config = self._contrastive
+        scout_sampling = self._scout_sampling_params
+        if config is None or scout_sampling is None:
+            raise RuntimeError("_contrastive_rollout_and_score called without contrastive configuration.")
+
+        chunks: List[Sample] = []
+        trace_groups: List[Dict[str, Any]] = []
+        trace_policy_versions: set[int] = set()
+        sync_pending = bool(sync_weights)
+        generation_succeeded = False
+        try:
+            for start in range(0, inputs.batch_size, config.prompt_chunk_size):
+                end = min(start + config.prompt_chunk_size, inputs.batch_size)
+                input_chunk = inputs.slice(start, end)
+                scout_request = self._build_request_sample(
+                    input_chunk,
+                    rollout_id,
+                    sampling=scout_sampling,
+                    noise_latent_shape=self._scout_noise_latent_shape,
+                )
+                scout = self._generate_with_residency(
+                    scout_request,
+                    sync_weights=sync_pending,
+                    sleep_rollout=False,
+                )
+                sync_pending = False
+                scout = self._score_generated_sample(scout)
+                scout_part = scout.parts[-1]
+                selected_indices = select_top_bottom_indices(
+                    scout_part,
+                    top_k=config.top_k,
+                    bottom_k=config.bottom_k,
+                )
+                if config.trace_dir and rollout_id % config.trace_interval == 0:
+                    if scout_part.output_version is None:
+                        raise RuntimeError("Contrastive trace requires rollout output_version provenance.")
+                    trace_policy_versions.add(scout_part.output_version)
+                    texts = next((value for value in scout.conditioning() if isinstance(value, Texts)), None)
+                    if not isinstance(texts, Texts) or len(texts.texts) != scout_part.batch_size:
+                        raise RuntimeError("Contrastive trace requires one prompt per scout candidate.")
+                    noise_recipe = NoiseRecipe.from_sample(scout)
+                    if len(noise_recipe.noise_group_ids) != scout_part.batch_size:
+                        raise RuntimeError("Contrastive trace requires one deterministic noise key per candidate.")
+                    selected_kind: Dict[int, str] = {}
+                    selected_list = [int(index) for index in selected_indices.tolist()]
+                    selected_per_group = config.selected_count
+                    for offset in range(0, len(selected_list), selected_per_group):
+                        for row in selected_list[offset : offset + config.top_k]:
+                            selected_kind[row] = "top"
+                        for row in selected_list[offset + config.top_k : offset + selected_per_group]:
+                            selected_kind[row] = "bottom"
+                    group_ids = scout_part.group_ids
+                    for group_id in dict.fromkeys(group_ids):
+                        rows = [row for row, value in enumerate(group_ids) if value == group_id]
+                        prompts = {texts.texts[row] for row in rows}
+                        if len(prompts) != 1:
+                            raise RuntimeError(f"Contrastive trace group {group_id!r} contains mixed prompts.")
+                        trace_groups.append(
+                            {
+                                "group_id": group_id,
+                                "prompt_sha256": _stable_fingerprint(next(iter(prompts))),
+                                "noise_sha256": _stable_fingerprint(
+                                    {
+                                        "base_seed": noise_recipe.base_seed,
+                                        "latent_shape": noise_recipe.latent_shape,
+                                        "keys": [noise_recipe.noise_group_ids[row] for row in rows],
+                                    }
+                                ),
+                                "candidates": [
+                                    {
+                                        "sample_id": scout_part.sample_ids[row],
+                                        "reward": float(scout_part.rewards[row].item()),
+                                        "selection": selected_kind.get(row),
+                                    }
+                                    for row in rows
+                                ],
+                            }
+                        )
+                selected = scout_part.select(selected_indices)
+                train_params = self._selected_sampling_params(rollout_id)
+
+                if config.mode == "naive":
+                    # Paper comparator: generate the full-step BF16 pool once,
+                    # select K rows, and train those exact high-fidelity samples.
+                    selected = dataclasses.replace(selected, sampling_params=train_params)
+                    final = scout.replace_frontier(selected)
+                else:
+                    regen_request = scout.replace_frontier(self._selected_regen_shell(selected, train_params))
+                    final = self._generate_with_residency(
+                        regen_request,
+                        sync_weights=False,
+                        sleep_rollout=False,
+                    )
+                    final = self._score_generated_sample(final)
+                    regen_params = final.parts[-1].sampling_params
+                    if not isinstance(regen_params, DiffusionSamplingParams):
+                        raise TypeError("BF16 regeneration returned non-diffusion sampling params.")
+                    expected_sigmas = int(regen_params.num_inference_steps) + 1
+                    if regen_params.sigmas is None or int(regen_params.sigmas.numel()) != expected_sigmas:
+                        raise RuntimeError(
+                            "BF16 regeneration reused an invalid scout sigma schedule: "
+                            f"expected {expected_sigmas} values, got "
+                            f"{None if regen_params.sigmas is None else int(regen_params.sigmas.numel())}."
+                        )
+                chunks.append(final)
+            generation_succeeded = True
+        finally:
+            if (self._rollout_sleep_after_generate or not generation_succeeded) and not self._rollout_rpc_blocked:
+                _run_cleanup_steps([("contrastive rollout sleep", self.rollout.sleep)])
+
+        sample = Sample.concat(chunks)
+        part = sample.parts[-1]
+        if part.rewards is None:
+            raise RuntimeError("contrastive final subset has no rewards.")
+        part.rewards = hydrate(part.rewards)
+        part = part.compute_advantages(
+            normalize=True,
+            use_global_std=self._adv_use_global_std,
+        )
+        sample = sample.replace_frontier(part)
+
+        if not part.metadata:
+            root_md = sample.root_metadata(-1)
+            if any(md for md in root_md):
+                part.metadata = [dict(md) if md else {} for md in root_md]
+
+        mean_reward = float(part.rewards.to(torch.float32).mean().item())
+        if trace_groups:
+            if len(trace_policy_versions) != 1:
+                raise RuntimeError(f"Contrastive trace combined policy versions {sorted(trace_policy_versions)}.")
+            self._write_contrastive_trace(
+                rollout_id,
+                policy_version=next(iter(trace_policy_versions)),
+                groups=trace_groups,
+            )
+        self._drop_decoded(sample, rollout_id=rollout_id)
+        return sample, mean_reward
 
     def _offload_for_reward_phase(self) -> bool:
         """Whether a colocated reward may temporarily borrow the train cards."""
@@ -719,10 +1164,19 @@ class DiffusionTrainer(BaseTrainer):
         train_offload_attempted = False
         ema_apply_attempted = False
         generation_succeeded = False
+        weight_sync_attempted = False
+        weight_sync_succeeded = False
         try:
             self.rollout.wake_up()
             if sync_weights and self.weight_sync is not None:
+                weight_sync_attempted = True
                 self.weight_sync.sync()
+                weight_sync_succeeded = True
+                published_version = unwrap_replicated_int(
+                    self.backend.get_optimizer_step_count(),
+                    name="backend optimizer step count",
+                )
+                self.rollout.set_version(published_version)
             if should_offload_train:
                 train_offload_attempted = True
                 self.backend.offload()
@@ -736,7 +1190,10 @@ class DiffusionTrainer(BaseTrainer):
             cleanup_steps: List[Tuple[str, Callable[[], None]]] = []
             if ema_apply_attempted:
                 cleanup_steps.append(("EMA restore", self.backend.restore_from_eval))
-            should_sleep_rollout = sleep_rollout or not generation_succeeded
+            publication_failed = weight_sync_attempted and not weight_sync_succeeded
+            if publication_failed:
+                self._rollout_rpc_blocked = True
+            should_sleep_rollout = (sleep_rollout or not generation_succeeded) and not publication_failed
             if should_sleep_rollout and train_offload_attempted:
                 # These operations are dependent: if sleep fails, loading FSDP
                 # into a still-resident rollout can turn the original error into
@@ -807,9 +1264,20 @@ class DiffusionTrainer(BaseTrainer):
         window_rewards: List[float] = []
         for rollout_id in window_ids:
             inputs = self.data_source.get_samples(self.batch_size)
-            sample = self._build_request_sample(inputs, rollout_id)
             sync_weights = (rollout_id > 0 and rollout_id % weight_sync_interval == 0) or (rollout_id == force_sync_at)
-            sample, mean_reward = self._rollout_and_score(sample, sync_weights=sync_weights, rollout_id=rollout_id)
+            if self._contrastive is None:
+                sample = self._build_request_sample(inputs, rollout_id)
+                sample, mean_reward = self._rollout_and_score(
+                    sample,
+                    sync_weights=sync_weights,
+                    rollout_id=rollout_id,
+                )
+            else:
+                sample, mean_reward = self._contrastive_rollout_and_score(
+                    inputs,
+                    sync_weights=sync_weights,
+                    rollout_id=rollout_id,
+                )
             samples.append(sample)
             window_rewards.append(mean_reward)
         final_id = window_ids[-1]
@@ -893,7 +1361,7 @@ class DiffusionTrainer(BaseTrainer):
                 self.rollout.sleep()
             evaluation_succeeded = True
         finally:
-            if not evaluation_succeeded:
+            if not evaluation_succeeded and not self._rollout_rpc_blocked:
                 _run_cleanup_steps([("evaluation rollout sleep", self.rollout.sleep)])
         logger.info(
             "EVAL step %d  (%d samples/prompt, %d steps, %dx%d, cfg=%.1f eta=%.1f)  %s",
@@ -912,13 +1380,20 @@ class DiffusionTrainer(BaseTrainer):
     def _prepare_empty_evaluation(self, *, sync_weights: bool, sleep_rollout: bool) -> None:
         """Preserve evaluation wake/sync/sleep semantics when every set is empty."""
         prepare_succeeded = False
+        weight_sync_attempted = False
+        weight_sync_succeeded = False
         try:
             self.rollout.wake_up()
             if sync_weights and self.weight_sync is not None:
+                weight_sync_attempted = True
                 self.weight_sync.sync()
+                weight_sync_succeeded = True
             prepare_succeeded = True
         finally:
-            if sleep_rollout or not prepare_succeeded:
+            publication_failed = weight_sync_attempted and not weight_sync_succeeded
+            if publication_failed:
+                self._rollout_rpc_blocked = True
+            if (sleep_rollout or not prepare_succeeded) and not publication_failed:
                 _run_cleanup_steps([("empty evaluation rollout sleep", self.rollout.sleep)])
 
     def _eval_pass(

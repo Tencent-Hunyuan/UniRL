@@ -80,6 +80,14 @@ class DiffusionSamplingParams(BaseSamplingParams):
     autocast_precision: str = "bf16"
     trajectory_precision: str = "fp16"
     logprob_precision: str = "fp32"
+    # Rollout-engine execution policy. Core model pipelines intentionally ignore
+    # this field; engines with a quantized inference copy may use ``fp8`` for a
+    # low-precision scout while the BF16 regeneration keeps ``bf16``.
+    rollout_precision: str = "bf16"
+    # Optional scout-only transport optimization: resize decoded images on the
+    # rollout GPU before reward dispatch (preference scorers resize internally
+    # anyway). The high-fidelity train/eval configs leave this unset.
+    reward_image_size: Optional[int] = None
 
     max_sequence_length: Optional[int] = None
     taylor_cache_interval: Optional[int] = None
@@ -95,12 +103,30 @@ class DiffusionSamplingParams(BaseSamplingParams):
             object.__setattr__(self, "samples_per_prompt", self.num_samples_per_prompt)
         elif self.samples_per_prompt != 1 and self.num_samples_per_prompt == 1:
             object.__setattr__(self, "num_samples_per_prompt", self.samples_per_prompt)
+        elif self.samples_per_prompt != self.num_samples_per_prompt:
+            raise ValueError(
+                "DiffusionSamplingParams received conflicting samples_per_prompt and "
+                f"num_samples_per_prompt values: {self.samples_per_prompt} vs {self.num_samples_per_prompt}."
+            )
 
         reserved = {f.name for f in fields(self) if f.name != "sampler_kwargs"}
         shadowed = reserved & set(self.sampler_kwargs)
         require(
             not shadowed,
             f"DiffusionSamplingParams.sampler_kwargs cannot contain reserved keys {sorted(shadowed)}; set them as fields instead",
+        )
+        require(
+            self.rollout_precision in {"bf16", "fp8"},
+            f"DiffusionSamplingParams.rollout_precision must be bf16|fp8, got {self.rollout_precision!r}",
+        )
+        require(
+            self.reward_image_size is None
+            or (
+                isinstance(self.reward_image_size, int)
+                and not isinstance(self.reward_image_size, bool)
+                and self.reward_image_size > 0
+            ),
+            f"DiffusionSamplingParams.reward_image_size must be positive when set, got {self.reward_image_size!r}",
         )
 
     def resolve_sde_indices(self, rollout_id: int) -> List[int]:
