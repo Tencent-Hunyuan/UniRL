@@ -152,13 +152,18 @@ class SFTTrainer(BaseTrainer):
         weight_sum = 0.0
         batches = 0
         timer = PhaseTimer()
+        extra_sums: Dict[str, float] = {}
         for records in self.data_source.iter_eval_batches(self.eval_batch_size, eval_num_samples=self.eval_num_samples):
             records = self._pad_to_dp(records)
             part = self._build_part(records, timer)
             with timer.phase("forward"):
                 metrics = self.stack.eval_track(part)
-            loss_sum += float(metrics["loss"]) * float(metrics["weight"])
-            weight_sum += float(metrics["weight"])
+            weight = float(metrics["weight"])
+            loss_sum += float(metrics["loss"]) * weight
+            for key, value in metrics.items():
+                if key not in ("loss", "weight"):
+                    extra_sums[key] = extra_sums.get(key, 0.0) + float(value) * weight
+            weight_sum += weight
             batches += 1
         if weight_sum <= 0.0:
             logger.warning("SFTTrainer.evaluate: no eval data (eval_num_samples=%s).", self.eval_num_samples)
@@ -182,6 +187,8 @@ class SFTTrainer(BaseTrainer):
                 "loss": eval_loss,
                 "time_s": eval_time,
                 **{f"{name}_time_s": seconds for name, seconds in timer.phases.items()},
+                # Algorithm-declared eval metrics (e.g. DPO's reward_accuracy), weight-averaged.
+                **{k: v / weight_sum for k, v in extra_sums.items()},
             },
         )
         return eval_loss

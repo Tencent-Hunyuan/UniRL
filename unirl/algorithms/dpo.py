@@ -113,15 +113,16 @@ class DPO(StageAlgorithm):
         conditions: Mapping[str, Condition],
         segment: "TextSegment",
         sample_ids: Optional[Sequence[str]] = None,
-    ) -> Tuple[float, float]:
-        """Forward-only ``(loss_sum, num_pairs)`` for validation; zero-mask pad pairs are excluded."""
+    ) -> Tuple[float, float, Dict[str, float]]:
+        """Forward-only ``(loss_sum, num_pairs, metrics)``; zero-mask pad pairs are excluded."""
         del sample_ids
         if segment is None or segment.tokens is None or int(segment.tokens.shape[0]) == 0:
-            return 0.0, 0.0
-        loss, _, num_pairs = self._pair_loss(conditions, segment)
+            return 0.0, 0.0, {}
+        loss, metrics, num_pairs = self._pair_loss(conditions, segment)
         if num_pairs <= 0:
-            return 0.0, 0.0
-        return float(loss.detach().item()) * num_pairs, float(num_pairs)
+            return 0.0, 0.0, {}
+        reported = {key: float(value) for key, value in metrics.items() if key != "dpo_loss"}
+        return float(loss.detach().item()) * num_pairs, float(num_pairs), reported
 
     @staticmethod
     def _real_pair_mask(segment: "TextSegment", reference: torch.Tensor) -> Optional[torch.Tensor]:

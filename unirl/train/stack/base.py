@@ -321,22 +321,32 @@ class TrainStack(Remote):
                 mbs = self.micro_batch_size
                 loss_sum = 0.0
                 weight_sum = 0.0
+                extra_sums: Dict[str, float] = {}
                 for start in range(0, bs, mbs):
                     end = min(start + mbs, bs)
                     micro = part.slice(start, end)
-                    s, w = eval_fn(
+                    result = eval_fn(
                         conditions=micro.conditions,
                         segment=micro.segment,
                         sample_ids=list(micro.sample_ids) if micro.sample_ids else None,
                     )
+                    # An algorithm may return (loss_sum, weight) or (loss_sum, weight, metrics);
+                    # the extra metrics are weight-scaled so they reduce like the loss does.
+                    s, w = result[0], result[1]
+                    for key, value in (result[2] if len(result) > 2 else {}).items():
+                        extra_sums[key] = extra_sums.get(key, 0.0) + float(value) * float(w)
                     loss_sum += float(s)
                     weight_sum += float(w)
         finally:
             model.train(was_training)
-        global_loss, global_weight = self._all_reduce_sums([loss_sum, weight_sum])
+        keys = sorted(extra_sums)
+        reduced = self._all_reduce_sums([loss_sum, weight_sum] + [extra_sums[k] for k in keys])
+        global_loss, global_weight = reduced[0], reduced[1]
         if global_weight <= 0.0:
             raise ValueError(f"{type(self).__name__}.eval_track: zero eval weight (empty/fully-padded batch?).")
-        return {"loss": global_loss / global_weight, "weight": global_weight}
+        out = {"loss": global_loss / global_weight, "weight": global_weight}
+        out.update({k: reduced[2 + i] / global_weight for i, k in enumerate(keys)})
+        return out
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
     def train_track(
