@@ -204,8 +204,11 @@ class Qwen3OmniChatTemplateStage:
                 if image is not None:
                     processor_kwargs["images"] = [image]
                 if video_frames is not None:
-                    processor_kwargs.update(mm_kwargs)
                     processor_kwargs["videos"] = [video_frames]
+                # Carries images_kwargs and videos_kwargs both; merging it under the video
+                # branch alone made image_max_pixels inert — see README.md Gotchas.
+                if image is not None or video_frames is not None:
+                    processor_kwargs.update(mm_kwargs)
                 if audio_wave is not None:
                     processor_kwargs["audio"] = [audio_wave]
                 if audio_in_video:
