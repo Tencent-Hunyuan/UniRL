@@ -21,6 +21,7 @@ _MEM_PHASE_SPECS: Tuple[Tuple[str, str, str], ...] = (
     ("backend", "offload", "offload"),
     ("backend", "onload", "onload"),
     ("reward", "score_and_attach", "reward"),
+    ("reward_stack", "rollout_and_score", "rollout_score"),
     ("stack", "train_track", "train"),
     ("diffusion.stack", "train_track", "diffusion_train"),
     ("ar.stack", "train_track", "ar_train"),
