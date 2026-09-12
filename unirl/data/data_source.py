@@ -4,14 +4,14 @@ import logging
 import os
 from collections import Counter
 from functools import partial
-from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, cast
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Union
 
 import torch
 from torch.utils.data import DataLoader
 
 from unirl.types.media import MediaRef, MediaRefs
-from unirl.types.primitives import Image, Images, Texts, Videos
-from unirl.types.sample import Part, PrimitiveMap, Sample
+from unirl.types.primitives import Image, Images, PrimitiveValue, Texts, Videos
+from unirl.types.sample import Part, Sample
 from unirl.utils.video import load_video
 
 from .datasets import PromptExampleDataset, TextPromptDataset, normalize_prompt_example
@@ -19,14 +19,14 @@ from .datasets import PromptExampleDataset, TextPromptDataset, normalize_prompt_
 logger = logging.getLogger(__name__)
 
 
-def _load_condition_images(media_refs: List[Any]) -> Optional[List[Image]]:
-    """Load ``(modality="image", role="condition")`` media refs into ``Image``."""
+def _load_condition_images(media_refs: List[Any]) -> Optional[List[Images]]:
+    """Load ``(image, condition)`` refs into one ``Images`` per slot; ragged batches rejected (the transpose zips)."""
     if not media_refs or not any(media_refs):
         return None
     import PIL.Image
     import torchvision.transforms.functional as TF
 
-    images_per_prompt: List[Optional[Image]] = []
+    images_per_prompt: List[List[Image]] = []
     any_loaded = False
     for refs in media_refs:
         selected = [
@@ -34,25 +34,29 @@ def _load_condition_images(media_refs: List[Any]) -> Optional[List[Image]]:
             for r in (refs or [])
             if getattr(r, "modality", None) == "image" and getattr(r, "role", None) == "condition"
         ]
-        if not selected:
-            images_per_prompt.append(None)
-            continue
-        if len(selected) > 1:
-            raise ValueError(f"Expected at most one condition image per prompt, got {len(selected)}")
-        pil = PIL.Image.open(selected[0].uri).convert("RGB")
-        tensor = TF.to_tensor(pil)
-        images_per_prompt.append(Image(pixels=tensor))
-        any_loaded = True
+        references = []
+        for ref in selected:
+            with PIL.Image.open(ref.uri) as pil:
+                references.append(Image(pixels=TF.to_tensor(pil.convert("RGB"))))
+        images_per_prompt.append(references)
+        any_loaded = any_loaded or bool(references)
 
     if not any_loaded:
         return None
-    missing = [index for index, image in enumerate(images_per_prompt) if image is None]
+    missing = [index for index, references in enumerate(images_per_prompt) if not references]
     if missing:
         raise ValueError(
             f"Condition-image batch is incomplete: {len(missing)}/{len(images_per_prompt)} "
             f"prompts are missing an image (e.g. prompt index {missing[0]})."
         )
-    return cast(List[Image], images_per_prompt)
+    counts = sorted({len(references) for references in images_per_prompt})
+    if len(counts) > 1:
+        raise ValueError(
+            f"Condition-image batch is ragged: prompts carry {counts} reference images. "
+            f"Every prompt in a batch must carry the same number — bucket the dataset by "
+            f"reference count so each batch is uniform."
+        )
+    return [Images.from_list(list(slot)) for slot in zip(*images_per_prompt)]
 
 
 def _load_condition_videos(media_refs: List[Any]) -> Optional[List[Any]]:
@@ -182,12 +186,12 @@ def _reject_unsupported_media_refs(batch: Dict[str, Any], *, context: str) -> No
 
 
 def _input_sample(
-    primitives: PrimitiveMap,
+    primitives: Dict[str, Union[PrimitiveValue, List[PrimitiveValue]]],
     *,
     sample_ids: List[str],
     metadata: Optional[List[Optional[Dict[str, Any]]]] = None,
 ) -> Sample:
-    """Build the data-source request as a text-rooted input Part chain."""
+    """Build the data-source request as a text-rooted Part chain; a list value chains one Part per element."""
     if len(set(sample_ids)) != len(sample_ids):
         duplicates = sorted(sample_id for sample_id, count in Counter(sample_ids).items() if count > 1)
         raise ValueError(f"Data-source input requires unique root sample_ids; duplicates: {duplicates[:3]}")
@@ -204,11 +208,12 @@ def _input_sample(
     parts = [root]
     parent = root
     for key in ("image", "video", "media"):
-        primitive = primitives.get(key)
-        if primitive is None:
+        value = primitives.get(key)
+        if value is None:
             continue
-        parent = parent.input_child({key: primitive})
-        parts.append(parent)
+        for primitive in value if isinstance(value, list) else [value]:
+            parent = parent.input_child({key: primitive})
+            parts.append(parent)
     return Sample.request(*parts)
 
 
@@ -330,7 +335,7 @@ class MultimodalRLDataSource:
         primitives: Dict[str, Any] = {"text": Texts(texts=prompts)}
         images = _load_condition_images(media_refs)
         if images is not None:
-            primitives["image"] = Images.from_list(images)
+            primitives["image"] = images
         condition_videos = _load_condition_videos(media_refs)
         if condition_videos is not None:
             _validate_homogeneous_videos(condition_videos)
@@ -365,7 +370,7 @@ class MultimodalRLDataSource:
         primitives: Dict[str, Any] = {"text": Texts(texts=prompts)}
         images = _load_condition_images(media_refs)
         if images is not None:
-            primitives["image"] = Images.from_list(images)
+            primitives["image"] = images
         condition_videos = _load_condition_videos(media_refs)
         if condition_videos is not None:
             _validate_homogeneous_videos(condition_videos)

@@ -24,6 +24,8 @@ class RewardRequest:
 
     primitives: Dict[str, Any] = field(default_factory=dict)
     generated: Dict[str, Any] = field(default_factory=dict)
+    # Ordered user image turns; single-source rewards treat slot 0 as the primary source.
+    image_references: List[Any] = field(default_factory=list)
     metadata: Optional[List[Optional[Dict[str, Any]]]] = None
     prompt_ids: Optional[List[str]] = None
     sample_ids: Optional[List[str]] = None

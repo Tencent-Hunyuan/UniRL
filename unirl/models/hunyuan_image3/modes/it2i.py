@@ -105,11 +105,13 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
         f"must be Texts, "
         f"got {type(texts).__name__ if texts is not None else 'None'}",
     )
-    images = next((c for c in conditioning[1:] if isinstance(c, Images)), None)
+    image_inputs = [c for c in conditioning[1:] if isinstance(c, Images)]
     require(
-        isinstance(images, Images),
-        "HunyuanImage3Pipeline.generate (it2i): expected a chained Images input in sample.conditioning(), found none",
+        len(image_inputs) == 1,
+        "HunyuanImage3Pipeline.generate (it2i): expected exactly one chained Images input in "
+        f"sample.conditioning(), got {len(image_inputs)}",
     )
+    images = image_inputs[0]
 
     require(
         int(params.samples_per_prompt) <= 2,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from typing import Sequence, Union
 
 import torch
 
@@ -68,7 +69,7 @@ class Flux2KleinVAEDecodeStage(DecodeStage[LatentSegment, Images]):
 
 
 class Flux2KleinVAEEncodeStage:
-    """Encode a source/reference image into packed condition tokens + ids."""
+    """Encode source/reference images into packed condition tokens + ids, one RoPE time offset per slot."""
 
     REFERENCE_TIME_SCALE: int = 10
 
@@ -76,7 +77,26 @@ class Flux2KleinVAEEncodeStage:
         self.bundle = bundle
 
     @torch.no_grad()
-    def encode(self, images: Images, *, height: int, width: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def encode(
+        self,
+        images: Union[Images, Sequence[Images]],
+        *,
+        height: int,
+        width: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        references = [images] if isinstance(images, Images) else list(images)
+        if not references:
+            raise ValueError("Flux2KleinVAEEncodeStage.encode: no reference images given")
+        encoded = [
+            self._encode_slot(reference, height=height, width=width, slot=slot)
+            for slot, reference in enumerate(references)
+        ]
+        tokens = torch.cat([token for token, _ in encoded], dim=1)
+        ids = torch.cat([ref_ids for _, ref_ids in encoded], dim=1)
+        return tokens, ids
+
+    def _encode_slot(self, images: Images, *, height: int, width: int, slot: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Encode one reference slot; T=``scale * (slot + 1)`` must match upstream ``_prepare_image_ids``."""
         if self.bundle.vae is None:
             raise RuntimeError(
                 "Flux2KleinVAEEncodeStage.encode: no VAE loaded "
@@ -122,7 +142,7 @@ class Flux2KleinVAEEncodeStage:
 
         image_tokens = pack_latents(image_latents)
 
-        t = torch.full((1,), self.REFERENCE_TIME_SCALE, device=device, dtype=torch.long)
+        t = torch.full((1,), self.REFERENCE_TIME_SCALE * (slot + 1), device=device, dtype=torch.long)
         h = torch.arange(h_pat, device=device)
         w = torch.arange(w_pat, device=device)
         s = torch.arange(1, device=device)
