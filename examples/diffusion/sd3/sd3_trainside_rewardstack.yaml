@@ -7,19 +7,23 @@
 # one generates.
 #
 # micro_batch_size matches sd3_trainside's rollout.forward_batch_size (16), so the
-# engine's own chunk loop short-circuits and the chunk boundaries — hence the per-step
-# SDE noise draw order — are identical to the baseline. That is what makes the A/B
-# meaningful: at overlap=false this recipe must reproduce sd3_trainside's reward curve
-# step for step, and only perf/step_time_s should move at overlap=true.
+# engine's own chunk loop short-circuits and the chunk boundaries are identical to the
+# baseline's.
 #
-# Launch:
-#   bash examples/run_experiment_single_node.sh diffusion/sd3/sd3_trainside_rewardstack
+# Reward parity is STATISTICAL, not exact. Only x_T is seeded (generate_latents takes
+# base_seed=sampling.seed); the per-step SDE noise reaches randn_tensor with
+# generator=None (models/sd3/diffusion.py calls strategy.denoise with no generator) and
+# nothing seeds the global RNG at startup, so two runs of THIS baseline already diverge.
+# LoRA-A is drawn from the same unseeded global RNG. Compare against a repeated baseline,
+# never against a single one.
 #
-# A/B protocol (same seed, same num_rollouts, wandb on):
-#   1. diffusion/sd3/sd3_trainside                                  baseline
-#   2. diffusion/sd3/sd3_trainside_rewardstack rewardstack.overlap=false   parity control
-#   3. diffusion/sd3/sd3_trainside_rewardstack                             overlapped
-# Compare rollout/reward_mean (1 vs 2 must match exactly) and perf/step_time_s.
+# A/B protocol (wandb on, same num_rollouts):
+#   1. diffusion/sd3/sd3_trainside                                        baseline
+#   2. diffusion/sd3/sd3_trainside                                        baseline repeat
+#   3. diffusion/sd3/sd3_trainside_rewardstack rewardstack.overlap=false  micro-batching only
+#   4. diffusion/sd3/sd3_trainside_rewardstack                            overlapped
+# 1 vs 2 gives the run-to-run reward band; 3 and 4 must fall inside it. The claim under
+# test is perf/step_time_s (4 vs 1), where run-to-run noise is small and systematic.
 
 defaults:
   - sd3_trainside
