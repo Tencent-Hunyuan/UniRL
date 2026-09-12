@@ -93,6 +93,13 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   `[1, S', 1, 1, 1]` right-aligned `S'` onto the channel axis for video: a raise when
   `C != S'`, a silently mis-scaled per-step KL when `C == S'`. Never reshape sigma to a
   hardcoded rank in a new consumer; pass the `[1, S']` tensor through `_gaussian_kl_div`.
+- **`DiffusionTeacherProvider` contract, lifecycle, and isolation** — `DiffusionOPD`
+  delegates teacher replay to a `DiffusionTeacherProvider`. Replay always runs under
+  `torch.no_grad()` and returns detached means `[B, S', *latent]`, never leaking teacher
+  gradients or entering the student optimizer/checkpoint (`assert_isolation`).
+  `FullModelTeacherProvider` provides explicit device placement and CPU offload/wake
+  management (`offload_to_cpu: true`); its `teardown_on_failure` contract ensures any
+  associated remote role or pinned GPU memory is cleaned up if replay raises.
 - **AR `sampling_temperature` must equal the rollout `sampling.temperature`** —
   `ARStage.replay` rescales logits by it (`log_softmax(logits / T)`) to match SGLang's
   distribution; when unset it silently falls back to the `ARSamplingParams` default,
