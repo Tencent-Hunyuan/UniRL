@@ -5,9 +5,9 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from numbers import Integral
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, cast
 
-from unirl.types.sample import Sample
+from unirl.types.sample import Part, Sample
 from unirl.types.sampling import ARSamplingParams
 
 _DEFAULT_SGLANG_SAMPLING_SEED = 42
@@ -53,28 +53,24 @@ def deterministic_inference_enabled(engine_kwargs: Dict[str, Any]) -> bool:
     )
 
 
-def _require_ar_sampling(sample: Sample) -> ARSamplingParams:
+def _require_ar_frontier(sample: Sample) -> Part:
     """Require ``ARSamplingParams`` on the request ``Sample`` frontier."""
-    if not sample.parts:
-        got = "an empty Sample"
-    else:
-        ar = sample.parts[-1].sampling_params
-        if isinstance(ar, ARSamplingParams):
-            return ar
-        got = "missing sampling_params" if ar is None else type(ar).__name__
-    raise TypeError(
-        "SGLang generation requires ARSamplingParams on the request Sample frontier "
-        f"(sample.parts[-1].sampling_params); got {got}. Direct callers must "
-        "fork(..., sampling_params=ARSamplingParams(...)); in-tree trainer, PE, and "
-        "agentic paths already stamp this. Engine-config temperature / top_p / "
-        "top_k / max_new_tokens is no longer a fallback."
-    )
+    try:
+        return sample.frontier_gen_part(ARSamplingParams)
+    except ValueError as exc:
+        raise TypeError(
+            "SGLang generation requires ARSamplingParams on the request Sample frontier. "
+            f"{exc}. Direct callers must fork(..., sampling_params=ARSamplingParams(...)); "
+            "in-tree trainer, PE, and agentic paths already stamp this. Engine-config "
+            "temperature / top_p / top_k / max_new_tokens is no longer a fallback."
+        ) from exc
 
 
 def resolve_sampling(config: Any, sample: Sample) -> ResolvedSampling:
     """Resolve the SRT sampling block from the request Sample's ARSamplingParams."""
-    ar = _require_ar_sampling(sample)
-    input_part, gen_part = sample.parts[0], sample.parts[-1]
+    gen_part = _require_ar_frontier(sample)
+    ar = cast(ARSamplingParams, gen_part.sampling_params)
+    input_part = sample.parts[0]
     control_ar: Dict[str, Any] = dict(input_part.control.get("ar") or {})
 
     parent_part = sample.parts[-2] if len(sample.parts) >= 2 else input_part
