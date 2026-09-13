@@ -18,7 +18,7 @@ from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample
 from unirl.trainer.eval_suites import EvalRewardSuite, build_eval_suites
 from unirl.trainer.hydra import parse_hydra_cfg, remote_hydra
-from unirl.trainer.residency import ResidencyPlanner, ResidencyPolicy, Role
+from unirl.trainer.residency import DEFAULT_RESIDENCY_POLICY, ResidencyPlanner, ResidencyPolicy, Role
 from unirl.types.primitives import Texts
 from unirl.types.sample import Sample
 from unirl.types.sampling import BaseSamplingParams, total_samples_per_prompt
@@ -314,9 +314,9 @@ class DiffusionTrainer(BaseTrainer):
         train_fraction: float = 0.5,
         worker_max_concurrency: Optional[int | Sequence[int]] = None,
         reward_fraction: float = 0.0,
-        train_resident: bool = True,
-        rollout_resident: bool = False,
-        reward_resident: bool = True,
+        train_resident: bool = DEFAULT_RESIDENCY_POLICY.train_resident,
+        rollout_resident: bool = DEFAULT_RESIDENCY_POLICY.rollout_resident,
+        reward_resident: bool = DEFAULT_RESIDENCY_POLICY.reward_resident,
         adv_use_global_std: bool = False,
         accumulate_rollouts: int = 1,
         eval_interval: int = 0,
@@ -342,9 +342,9 @@ class DiffusionTrainer(BaseTrainer):
         # weights on the GPU while it is idle, `false` parks them on CPU. No
         # value here ever stops a role's process; only its weights move.
         self._residency_policy = ResidencyPolicy(
-            train_resident=bool(train_resident),
-            rollout_resident=bool(rollout_resident),
-            reward_resident=bool(reward_resident),
+            train_resident=train_resident,
+            rollout_resident=rollout_resident,
+            reward_resident=reward_resident,
         )
         self._residency: Optional[ResidencyPlanner] = None
         self._adv_use_global_std = bool(adv_use_global_std)
@@ -360,9 +360,6 @@ class DiffusionTrainer(BaseTrainer):
         self._uses_ema = False
         # Set from the built weight_sync's capabilities in _build_residency_planner.
         self._staged_weight_sync = False
-        # Whether the weight sync still holds the adapter this trainer last read.
-        # Invalidated by the optimizer step, which is the only thing that changes it.
-        self._adapter_cached = False
 
         self.data_source = instantiate(data_source_cfg)
         self._data_source_cfg = data_source_cfg
@@ -589,8 +586,9 @@ class DiffusionTrainer(BaseTrainer):
         # read (weights resident) and a load (rollout awake), which only the LoRA
         # syncs expose. Probe the built object so a new implementation is picked up
         # by having the methods rather than by being named.
+        staged_methods = ("extract", "push", "has_staged_adapter", "invalidate")
         self._staged_weight_sync = self.weight_sync is not None and all(
-            hasattr(self.weight_sync, name) for name in ("extract", "push")
+            hasattr(self.weight_sync, name) for name in staged_methods
         )
         # Train is parkable only where parking frees something the active role can
         # use: not on a separate slab, and not behind a trainside rollout, whose
@@ -735,12 +733,11 @@ class DiffusionTrainer(BaseTrainer):
         """Read the adapter while the trainer is resident; True if a later push can use it."""
         if self.weight_sync is None or not self._staged_weight_sync:
             return False
-        if not self._adapter_cached:
+        if not self.weight_sync.has_staged_adapter()[0]:
             # enter() rather than set(): the read must not put the trainer on the
             # slab beside a reward that the rollout phase has not parked yet.
             self._residency.enter(Role.TRAIN)
             self.weight_sync.extract()
-            self._adapter_cached = True
         return True
 
     def _push_or_sync(self, *, staged: bool) -> None:
@@ -753,9 +750,10 @@ class DiffusionTrainer(BaseTrainer):
             self.weight_sync.sync()
 
     @contextmanager
-    def _reward_phase(self) -> Iterator[None]:
+    def _reward_phase(self, *, preserve_rollout: bool = False) -> Iterator[None]:
         """Give the reward the slab, leaving the trainer parked if it already is."""
-        self._residency.enter(Role.REWARD)
+        preserve = (Role.ROLLOUT,) if preserve_rollout else ()
+        self._residency.enter(Role.REWARD, preserve=preserve)
         yield
 
     def _generate_with_residency(
@@ -873,7 +871,8 @@ class DiffusionTrainer(BaseTrainer):
         self._residency.enter(Role.TRAIN)
         # Invalidate before the step, not after: once it has begun the weights can
         # change, so a step that raises must not leave the cache looking current.
-        self._adapter_cached = False
+        if self._staged_weight_sync:
+            self.weight_sync.invalidate()
         result = self.stack.train_track(
             parts if len(parts) > 1 else parts[0], training_progress=float(training_progress)
         )
@@ -1021,7 +1020,7 @@ class DiffusionTrainer(BaseTrainer):
             )
             sync_pending = False
             first_scored: Optional[Sample] = None
-            with self._reward_phase():
+            with self._reward_phase(preserve_rollout=not sleep_rollout):
                 for name, reward in scorers:
                     scored = reward.score_and_attach(generated)
                     if first_scored is None:

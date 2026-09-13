@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Collection, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +39,9 @@ class ResidencyPolicy:
         }[role]
 
 
+DEFAULT_RESIDENCY_POLICY = ResidencyPolicy()
+
+
 class _RoleState:
     """One role's transitions plus whether its weights are on the GPU right now."""
 
@@ -52,10 +55,10 @@ class _RoleState:
         starts_on_gpu: bool,
     ) -> None:
         self.role = role
-        self.pinned = bool(pinned)
+        self.pinned = pinned
         self._onload = onload
         self._offload = offload
-        self.on_gpu = bool(starts_on_gpu)
+        self.on_gpu = starts_on_gpu
 
     def request(self, on_gpu: bool) -> Optional[Step]:
         """The labelled transition needed to reach ``on_gpu``, or None if already there."""
@@ -117,11 +120,6 @@ class ResidencyPlanner:
         """The policy this planner enforces."""
         return self._policy
 
-    def on_gpu(self, role: Role) -> bool:
-        """Whether ``role``'s weights are currently resident."""
-        state = self._states.get(role)
-        return True if state is None else state.on_gpu
-
     def parkable(self, role: Role) -> bool:
         """Whether ``role`` is on this slab and can therefore be parked at all."""
         return role in self._states
@@ -139,12 +137,18 @@ class ResidencyPlanner:
         if state is not None:
             self._apply([state.request(on_gpu)])
 
-    def enter(self, active: Role) -> None:
+    def enter(self, active: Role, *, preserve: Collection[Role] = ()) -> None:
         """Park every other role, then make ``active`` resident."""
         # Park unconditionally, including when ``active`` itself is untracked: a
         # trainside rollout or a trainer on a separate slab still runs, and still
         # displaces anything sharing the slab it runs on.
-        self._apply([state.request(False) for role, state in self._states.items() if role is not active])
+        self._apply(
+            [
+                state.request(False)
+                for role, state in self._states.items()
+                if role is not active and role not in preserve
+            ]
+        )
         state = self._states.get(active)
         if state is not None:
             self._apply([state.request(True)])

@@ -9,6 +9,7 @@ import hydra
 from omegaconf import DictConfig
 
 from unirl.trainer.diffusion import DiffusionTrainer
+from unirl.trainer.residency import DEFAULT_RESIDENCY_POLICY
 
 
 def _resolve_task_config(cfg: DictConfig):
@@ -45,9 +46,9 @@ def main(cfg: DictConfig) -> None:
         layout=cfg.get("layout", "colocate"),
         train_fraction=cfg.get("train_fraction", 0.5),
         reward_fraction=cfg.get("reward_fraction", 0.0),
-        train_resident=cfg.get("train_resident", True),
-        rollout_resident=cfg.get("rollout_resident", False),
-        reward_resident=cfg.get("reward_resident", True),
+        train_resident=cfg.get("train_resident", DEFAULT_RESIDENCY_POLICY.train_resident),
+        rollout_resident=cfg.get("rollout_resident", DEFAULT_RESIDENCY_POLICY.rollout_resident),
+        reward_resident=cfg.get("reward_resident", DEFAULT_RESIDENCY_POLICY.reward_resident),
         adv_use_global_std=cfg.get("adv_use_global_std", False),
         accumulate_rollouts=cfg.get("accumulate_rollouts", 1),
         eval_interval=cfg.get("eval_interval", 0),

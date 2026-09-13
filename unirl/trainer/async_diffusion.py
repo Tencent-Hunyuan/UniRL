@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 from typing import Any, Dict, Optional, Tuple
 
 import torch
@@ -15,7 +16,10 @@ from unirl.trainer.async_rollout import (
     training_version_metrics,
 )
 from unirl.trainer.diffusion import DiffusionTrainer
+from unirl.trainer.residency import DEFAULT_RESIDENCY_POLICY
 from unirl.types.sample import Sample
+
+ASYNC_RESIDENCY_POLICY = replace(DEFAULT_RESIDENCY_POLICY, rollout_resident=True)
 
 
 class AsyncDiffusionTrainer(AsyncRolloutTrainerMixin, DiffusionTrainer):
@@ -42,14 +46,14 @@ class AsyncDiffusionTrainer(AsyncRolloutTrainerMixin, DiffusionTrainer):
                 "retain one rollout_id and one SDE schedule per training batch; "
                 f"got {max_inflight}."
             )
-        if not bool(diffusion_kwargs.get("reward_resident", True)):
+        if not diffusion_kwargs.get("reward_resident", ASYNC_RESIDENCY_POLICY.reward_resident):
             raise ValueError(
                 "AsyncDiffusionTrainer does not support reward_resident=false: async scoring runs "
                 "at reap time outside _reward_phase(), so the policy would be silently ignored and "
                 "a reward sharing the train slab could still OOM. Drop the key or use the "
                 "synchronous trainer."
             )
-        if not bool(diffusion_kwargs.get("rollout_resident", True)):
+        if not diffusion_kwargs.setdefault("rollout_resident", ASYNC_RESIDENCY_POLICY.rollout_resident):
             raise ValueError(
                 "AsyncDiffusionTrainer does not support rollout_resident=false: the engine owns a "
                 "dedicated slab and is never idle -- the async loop keeps submitting prompts across "

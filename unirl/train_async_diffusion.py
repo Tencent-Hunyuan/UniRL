@@ -6,7 +6,7 @@ from __future__ import annotations
 import hydra
 from omegaconf import DictConfig
 
-from unirl.trainer.async_diffusion import AsyncDiffusionTrainer
+from unirl.trainer.async_diffusion import ASYNC_RESIDENCY_POLICY, AsyncDiffusionTrainer
 
 
 @hydra.main(version_base=None, config_path="../examples", config_name="diffusion/bagel/bagel_vllmomni_async")
@@ -30,11 +30,11 @@ def main(cfg: DictConfig) -> None:
         reward_fraction=cfg.get("reward_fraction", 0.0),
         # Forwarded so the trainer can reject it — async scores at reap time outside
         # _reward_phase(), and dropping the key here would silently ignore the policy.
-        reward_resident=cfg.get("reward_resident", True),
+        reward_resident=cfg.get("reward_resident", ASYNC_RESIDENCY_POLICY.reward_resident),
         # Async keeps the rollout resident by default (the sync entry parks it):
         # it owns a dedicated slab, and evaluate() also passes sleep_after=False.
-        rollout_resident=cfg.get("rollout_resident", True),
-        train_resident=cfg.get("train_resident", True),
+        rollout_resident=cfg.get("rollout_resident", ASYNC_RESIDENCY_POLICY.rollout_resident),
+        train_resident=cfg.get("train_resident", ASYNC_RESIDENCY_POLICY.train_resident),
         adv_use_global_std=cfg.get("adv_use_global_std", False),
         eval_interval=cfg.get("eval_interval", 0),
         eval_num_prompts=cfg.get("eval_num_prompts", 64),
