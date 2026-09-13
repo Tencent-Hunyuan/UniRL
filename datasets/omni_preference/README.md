@@ -124,12 +124,28 @@ and 0.8675 on the second — a 2.8pp swing from the split alone, comparable to t
 `5e-6 → 1e-5` learning-rate step (2.5pp). Reproduce the reference's split before
 reading anything into a difference against its published number.
 
-**The reference implementation's audio split is much smaller than this one's, which
-matters when comparing against it.** Its converter matches audio basenames literally
-and drops 2669 of 4372 pairs as missing media, keeping 1504 training rows where this
-converter keeps 4155 (see the basename gotcha below). Audio is also its weakest
-modality. Any accuracy comparison against it is therefore confounded by training-set
-size unless its parquet is rebuilt with the folded basename matcher.
+**The reference implementation's audio split is much smaller than this one's, but
+that turns out not to matter for preference accuracy.** Its converter matches audio
+basenames literally and drops 2669 of 4372 pairs as missing media, keeping 1504
+training rows where this converter keeps 4155 (see the basename gotcha below).
+Rebuilding its parquet with the folded matcher — its own row builder and split, only
+the basename lookup swapped — raises its audio training set 1504 → 3935 and changes
+balanced accuracy by **−0.0025 (p=0.94)**, with audio itself going 0.6444 → 0.6370.
+
+That is worth stating plainly because the opposite is easy to argue from true facts:
+audio is the reference's weakest modality *and* its most data-starved one. Both hold,
+and the causal conclusion is still wrong. The recovered pairs are real data, but they
+buy nothing on this metric.
+
+**Check for media leakage before comparing two models trained from different
+splits.** Two converters with different `--test-ratio` hold out different media, so
+one model's validation rows routinely contain media the other model trained on.
+Scoring this recipe on the reference's validation split puts **74.5% (1085/1457)** of
+those rows on media this recipe trained on, which inflated a measured gap from
++0.062 to +0.118 and its significance from p=0.03 to p=1e-15. Pass
+`--exclude-media-in <the other model's train manifest>`, or build an eval set whose
+media appear in neither training split. The check costs seconds; without it every
+cross-split number is quietly wrong in the favourable direction.
 
 ## Gotchas
 
