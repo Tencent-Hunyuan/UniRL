@@ -1,0 +1,42 @@
+# @package _global_
+# sd3_trainside_http with the reward stack — the HTTP arm of the overlap A/B.
+#
+# Everything comes from sd3_trainside_http: same model, LoRA, rollout engine, remote
+# reward, algorithm, data and sampling. Inheriting is safe here because this file only
+# ADDS `rewardstack:` — it does not have to replace a subtree, which is why
+# sd3_trainside_http is a standalone copy while this one is not.
+#
+# Why the overlap should pay here and did not colocated: `_post_score` is a blocking
+# `Session.post` that releases the GIL for the whole round trip, and the client does no
+# concurrency of its own (`_post_score_requests` is a sequential loop). So a rank's
+# entire remote-reward wall time — fp32 D2H, JPEG+base64 encode, transport, server
+# inference, and any queueing behind the other ranks — is dead time today.
+#
+# micro_batch_size matches rollout.forward_batch_size (16), so the engine's own chunk
+# loop stays inert and chunk boundaries match the baseline's. It also sets the POST
+# size: 8 POSTs of 16 images instead of one of 128.
+#
+# A/B protocol (wandb on, same +num_rollouts), all three on GPUs 0-5 with one reward
+# server on GPU 6 — never compare these against the colocated 8-GPU numbers, which
+# differ in both topology and device count:
+#   1. diffusion/sd3/sd3_trainside_http                                        HTTP baseline, one 128-image POST
+#   2. diffusion/sd3/sd3_trainside_http_rewardstack rewardstack.overlap=false  8 POSTs of 16, serial
+#   3. diffusion/sd3/sd3_trainside_http_rewardstack                            8 POSTs of 16, one in flight
+# Arm 2 is what separates "smaller requests" from "overlapped requests".
+#
+# Read perf/rollout_score_time_s (arm 3) against perf/generate_time_s +
+# perf/reward_time_s (arm 1). The stack holds exactly one scoring call in flight, so if
+# a remote score exceeds the per-micro generate window the pipeline goes score-bound and
+# the recoverable amount is capped at roughly one generate window per micro.
+
+defaults:
+  - sd3_trainside_http
+  - _self_
+
+rewardstack:
+  _target_: unirl.reward.stack.RewardStack
+  micro_batch_size: 16          # = sd3_trainside_http rollout.forward_batch_size
+  overlap: true
+
+logging:
+  tags: [sd3, flowgrpo, trainside, rewardstack, http, overlap]
