@@ -33,7 +33,6 @@ class RemoteLoraWeightSync(LoraWeightSyncBase):
         )
         self._copy = bool(copy)
         self._targets: List[tuple] = []
-        self._cached = None
 
     @distributed(dispatch_mode=Dispatch.BROADCAST, execute_mode=Execute.RANK_ZERO)
     def set_rollout_targets(self, targets: List[tuple]) -> None:

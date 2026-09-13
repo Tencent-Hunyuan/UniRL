@@ -55,8 +55,10 @@ stay swappable by `_target_`.
 - **Diffusion residency is one choice per role, not per phase.** `train_resident`,
   `rollout_resident` and `reward_resident` each say whether that role keeps its
   weights on the GPU while it is idle; only weights move, never a role's process.
-  Defaults (`true`/`false`/`true`) reproduce the historical behaviour, and the
-  async entry point keeps its dedicated rollout slab resident. `ResidencyPlanner`
+  Synchronous defaults (`true`/`false`/`true`) reproduce the historical behaviour.
+  Async defaults (`true`/`true`/`true`) keep its dedicated rollout slab resident;
+  direct `AsyncDiffusionTrainer` construction and the async entry point use the
+  same policy. `ResidencyPlanner`
   turns a phase's needs into transitions and issues only the ones that change
   something, so a reward phase inherits an already-parked trainer instead of
   re-offloading it, and the trainer returns once per optimizer step rather than
@@ -80,7 +82,10 @@ stay swappable by `_target_`.
   without saving keeps the trainer parked. A LoRA sync holds its extracted adapter
   past the push and until the next optimizer step, so an accumulate window and an
   eval's later chunks reuse it instead of onloading the trainer to read weights
-  that cannot have changed. A pinned rollout (`rollout_resident: true`) is not
+  that cannot have changed. A no-sync eval preserves an unpinned rollout while
+  scoring between chunks because sleeping engines such as SGLang would discard
+  the adapter that the caller deliberately did not repush. A pinned rollout
+  (`rollout_resident: true`) is not
   slept even when generation raises: the policy says its weights stay put, and the
   caller that set it owns the peak.
 

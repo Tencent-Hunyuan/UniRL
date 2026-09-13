@@ -32,7 +32,6 @@ class LocalLoraWeightSync(LoraWeightSyncBase):
             track_prefix=track_prefix,
         )
         self._rollout = rollout
-        self._cached = None
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def extract(self) -> None:
