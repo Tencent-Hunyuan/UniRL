@@ -93,6 +93,13 @@ saturates.
 `2e-5` buys nothing over `1e-5` (+0.0004) and its eval loss is non-monotone early
 (0.4714 at step 25, 0.4827 at step 50), so `1e-5` is the recipe default.
 
+The same effect reproduces in the reference implementation itself, which is the
+strongest evidence that this is a property of the data and not of this port: running
+the reference's own recipe on its own data with `LR` as the only change moves its
+step-50 self-reported validation accuracy from 0.8229 to 1.0000 and its margin from
+0.399 to 2.039, with matched-step training loss dropping 0.6644 → 0.4649. `1e-6`
+leaves real headroom on this dataset.
+
 Raising LoRA rank past 32 does not help either: `rank=128, alpha=256` at `1e-5`
 lands at 0.8289 [0.803, 0.855], *below* `rank=32`. Capacity is not the binding
 constraint.
@@ -116,6 +123,13 @@ produce different held-out *examples*, and one checkpoint scores 0.8395 on the f
 and 0.8675 on the second — a 2.8pp swing from the split alone, comparable to the
 `5e-6 → 1e-5` learning-rate step (2.5pp). Reproduce the reference's split before
 reading anything into a difference against its published number.
+
+**The reference implementation's audio split is much smaller than this one's, which
+matters when comparing against it.** Its converter matches audio basenames literally
+and drops 2669 of 4372 pairs as missing media, keeping 1504 training rows where this
+converter keeps 4155 (see the basename gotcha below). Audio is also its weakest
+modality. Any accuracy comparison against it is therefore confounded by training-set
+size unless its parquet is rebuilt with the folded basename matcher.
 
 ## Gotchas
 
