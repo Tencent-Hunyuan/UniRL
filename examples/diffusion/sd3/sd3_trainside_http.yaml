@@ -15,6 +15,7 @@
 # micro_batch_size 16 the stack forms 8 micros and overlaps 7 scores.
 #
 num_devices: 6                # GPUs 0-5; GPU 6 runs the reward server
+devices_per_node: 6           # this node contributes 6; DevicePool requires num_devices % devices_per_node == 0
 batch_size: 48                # prompts_per_rollout
 adv_use_global_std: true     # advantage: divide by ONE batch-wide std (v1 parity), not per-group
 # samples_per_prompt lives inside `sampling` (DiffusionSamplingParams).
