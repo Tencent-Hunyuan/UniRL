@@ -108,6 +108,15 @@ protocols genuinely disagree: `rank=128` scores 0.9167 on the first 96 rows — 
 best result, and above the reference — while scoring 0.8289 on all 877, its worst.
 Ranking configurations on 96 rows would have picked the wrong one.
 
+**The converter's `--test-ratio` decides which examples are held out, and that is
+worth more than any hyperparameter measured here.** This converter defaults to
+`0.05` and holds out whole media groups one at a time; the reference implementation
+uses `0.10` and accumulates groups until a row target is met. The two produce
+different held-out *examples*, and one checkpoint scores 0.8395 on the first and
+0.8675 on the second — a 9.5pp swing from the split alone, larger than the entire
+`1e-6 → 1e-5` learning-rate effect. Reproduce the reference's split before reading
+anything into a difference against its published number.
+
 ## Gotchas
 
 - **Media basenames in the jsonl are not byte-equal to the filenames on disk.**
