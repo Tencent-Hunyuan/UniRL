@@ -166,14 +166,6 @@ class FrozenLoraTeacherProvider(DiffusionTeacherProvider):
                             )
 
 
-class _TeacherModelWrapper:
-    """Minimal bundle-compatible wrapper presenting device and transformer."""
-
-    def __init__(self, transformer: torch.nn.Module, device: torch.device) -> None:
-        self.transformer = transformer
-        self.device = device
-
-
 class FullModelTeacherProvider(DiffusionTeacherProvider):
     """Synchronous single-teacher full-model provider with explicit placement."""
 
@@ -197,6 +189,15 @@ class FullModelTeacherProvider(DiffusionTeacherProvider):
         self.guidance_scale = float(guidance_scale) if guidance_scale is not None else None
         self.dtype = dtype
 
+        if stage is not None:
+            stage_model = getattr(stage, "model", None)
+            if stage_model is None:
+                raise ValueError("FullModelTeacherProvider: an explicit stage must own its teacher model.")
+            if model is not None and model is not stage_model:
+                raise ValueError("FullModelTeacherProvider: model must be the same object as stage.model.")
+            model = stage_model
+        self._model = model
+
         if device is None:
             if model is not None and hasattr(model, "device"):
                 self.device = torch.device(model.device)
@@ -207,7 +208,6 @@ class FullModelTeacherProvider(DiffusionTeacherProvider):
         else:
             self.device = torch.device(device)
 
-        self._model = model
         self._freeze_parameters()
 
         self.offload_to_cpu = bool(offload_to_cpu)
@@ -228,12 +228,6 @@ class FullModelTeacherProvider(DiffusionTeacherProvider):
             yield from self._model.parameters()
         elif hasattr(self._model, "transformer") and isinstance(self._model.transformer, nn.Module):
             yield from self._model.transformer.parameters()
-        elif self.stage is not None and hasattr(self.stage, "model"):
-            m = self.stage.model
-            if isinstance(m, nn.Module):
-                yield from m.parameters()
-            elif hasattr(m, "transformer") and isinstance(m.transformer, nn.Module):
-                yield from m.transformer.parameters()
 
     def _to_device(self, target_device: torch.device) -> None:
         """Move underlying teacher module or wrapper to target device."""
@@ -250,18 +244,14 @@ class FullModelTeacherProvider(DiffusionTeacherProvider):
         """Bind optional stage and condition context from the calling algorithm."""
         if self.conditions_cls is None:
             self.conditions_cls = conditions_cls
-        if self.stage is None and stage is not None:
+        if self.stage is None and stage is not None and self._model is not None:
+            if hasattr(getattr(stage, "model", None), "transformer") and not hasattr(self._model, "transformer"):
+                raise ValueError(
+                    "FullModelTeacherProvider: this stage requires a compatible teacher bundle with its "
+                    "replay configuration; a bare teacher module cannot replace the bundle."
+                )
             self.stage = copy.copy(stage)
-            target_model = self._model
-            if target_model is not None:
-                if (
-                    hasattr(stage, "model")
-                    and hasattr(stage.model, "transformer")
-                    and not hasattr(target_model, "transformer")
-                    and isinstance(target_model, nn.Module)
-                ):
-                    target_model = _TeacherModelWrapper(target_model, self.device)
-                self.stage.model = target_model
+            self.stage.model = self._model
 
     def wake(self) -> None:
         """Wake or onload the teacher to the execution device."""
