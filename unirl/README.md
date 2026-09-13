@@ -143,7 +143,7 @@ flows through them like this:
 2. The `<Domain>Trainer` (e.g. `trainer/diffusion.py`) acquires a Ray `DevicePool` and builds the rollout and train workers.
 3. The trainer builds a typed `Sample` lineage and dispatches it to the rollout engine.
 4. The engine returns the lineage with generated `Part`s filled with conditions, segments, primitive maps, and media previews.
-5. `RewardService.score_and_attach` attaches rewards; `Part.compute_advantages` z-scores them into advantages.
+5. Driver-side `RewardClient.score_and_attach` sends a minimal request to `RewardService.score` and attaches its response; `Part.compute_advantages` z-scores the rewards into advantages.
 6. `TrainStack.train_track(...)` shards the generated `Part` across train workers and runs the mini-batch optimizer loop.
 7. Each train worker owns a model `Bundle`, an `FSDPBackend`, and one loss algorithm.
 8. Dedicated-rollout modes (separate / colocate) sync trainer weights back to the rollout workers.

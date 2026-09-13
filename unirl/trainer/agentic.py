@@ -13,7 +13,7 @@ from hydra.utils import instantiate
 from omegaconf import DictConfig
 
 from unirl.distributed.group.placement import placement, remote
-from unirl.distributed.tensor import hydrate
+from unirl.reward.client import RewardClient
 from unirl.rollout.manager import RolloutManager, required_worker_concurrency, validate_worker_inflight
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import (
@@ -103,7 +103,7 @@ class AgenticTrainer(BaseTrainer):
                 self.bundle = remote_hydra(bundle_cfg)
                 self.pipeline = remote_hydra(pipeline_cfg, bundle=self.bundle)
                 self.backend = remote_hydra(backend_cfg, bundle=self.bundle)
-                self.reward = remote_hydra(reward_cfg)
+                self.reward = RewardClient(remote_hydra(reward_cfg))
                 self.algorithm = remote_hydra(algorithm_cfg, pipeline=self.pipeline)
                 self.stack = remote_hydra(stack_cfg, fsdp_backend=self.backend, algorithm=self.algorithm)
                 self._build_colocated_rollout(rollout_cfg, sync_cfg)
@@ -268,7 +268,7 @@ class AgenticTrainer(BaseTrainer):
         scored_rewards = scored.parts[-1].rewards
         if scored_rewards is None:
             raise RuntimeError("reward service returned no rewards")
-        values = hydrate(scored_rewards).to(torch.float32).flatten()
+        values = scored_rewards.to(torch.float32).flatten()
         if values.numel() != score_count + score_padding:
             raise RuntimeError(
                 f"reward service returned {values.numel()} rewards for {score_count + score_padding} scoring rows"

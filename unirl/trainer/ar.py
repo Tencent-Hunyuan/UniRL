@@ -12,7 +12,7 @@ from hydra.utils import get_object, instantiate
 from omegaconf import DictConfig
 
 from unirl.distributed.group.placement import placement, remote
-from unirl.distributed.tensor import hydrate
+from unirl.reward.client import RewardClient
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample
 from unirl.trainer.hydra import parse_hydra_cfg, remote_hydra
@@ -125,7 +125,7 @@ class ARTrainer(BaseTrainer):
             self.pipeline = remote_hydra(pipeline_cfg, bundle=self.bundle)
             self.backend = remote_hydra(backend_cfg, bundle=self.bundle)
 
-            self.reward = remote_hydra(reward_cfg)
+            self.reward = RewardClient(remote_hydra(reward_cfg))
             self.algorithm = remote_hydra(algorithm_cfg, pipeline=self.pipeline)
             self.stack = remote_hydra(stack_cfg, fsdp_backend=self.backend, algorithm=self.algorithm)
 
@@ -379,9 +379,6 @@ class ARTrainer(BaseTrainer):
         part = sample.parts[-1]
         mean_reward = 0.0
         if part.rewards is not None:
-            part.rewards = hydrate(part.rewards)
-            if isinstance(part.component_rewards, dict):
-                part.component_rewards = {name: hydrate(value) for name, value in part.component_rewards.items()}
             mean_reward = float(part.rewards.to(torch.float32).mean().item())
             if self.advantage_mode == "grpo":
                 part = part.compute_advantages(
@@ -467,7 +464,7 @@ class ARTrainer(BaseTrainer):
                     scored = self.reward.score_and_attach(generated)
                     rewards = scored.parts[-1].rewards
                     if rewards is not None:
-                        rewards = hydrate(rewards).to(torch.float32)
+                        rewards = rewards.to(torch.float32)
                         fanout = total_samples_per_prompt(eval_sp)
                         expected_total = dispatch_inputs.batch_size * fanout
                         if int(rewards.numel()) != expected_total:

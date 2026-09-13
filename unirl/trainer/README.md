@@ -42,8 +42,9 @@ stay swappable by `_target_`.
   rollout per call: `wake_up` → (sync weights, if due) →
   `rollout.generate(sample)` → `reward.score_and_attach(sample)` →
   `part.compute_advantages(...)` → drop reward-only decoded media →
-  `stack.train_track(...)`. The driver builds a request `Sample` whose Parts
-  preserve prompt lineage and carry sampling parameters. A single-stage stack
+  `stack.train_track(...)`. The reward client projects only scoring inputs into a
+  `RewardRequest`; the original Sample keeps its trajectory refs. The driver builds
+  a rollout request `Sample` whose Parts preserve prompt lineage and carry sampling parameters. A single-stage stack
   receives the trainable frontier `Part`; `UnifiedModelTrainStack` receives the
   whole `Sample` so AR and image Parts are sharded by the same prompt trees.
   `AgenticTrainer` uses a manager to collect `List[Sample]` groups of
