@@ -80,11 +80,9 @@ class DPO(StageAlgorithm):
         self.loss_type = str(loss_type)
         self.average_log_prob = bool(average_log_prob)
         self.conditions_cls = conditions_cls
-        if sampling_temperature is None:
-            from unirl.types.sampling import ARSamplingParams
-
-            sampling_temperature = ARSamplingParams.__dataclass_fields__["temperature"].default
-        self.sampling_temperature = float(sampling_temperature)
+        # Unscaled log-probs. Offline DPO never samples, so there is no rollout
+        # temperature to match here — see README.md Gotchas.
+        self.sampling_temperature = 1.0 if sampling_temperature is None else float(sampling_temperature)
         # beta>0 is the DPO temperature, so the reference policy is never optional here.
         self._ref_model = _resolve_reference_model(backend, beta=self.beta, algo="DPO")
         if self._ref_model is None:

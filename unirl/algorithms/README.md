@@ -114,7 +114,16 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   reference are the same function and the logit margin is exactly 0. A first step
   far from 0.693 means the reference is not actually frozen (or the pairing is
   misaligned). Expect `reward_accuracy == 0` there too — exact ties fail the
-  strict `>`, so it is not a bug.
+  strict `>`, so it is not a bug. Note what this check *cannot* see: it holds for
+  **any** value of `sampling_temperature`, because a zero margin stays zero under
+  any scaling. It validates the reference and the pairing, not the scaling.
+- **`sampling_temperature` defaults to 1.0 here, not to `ARSamplingParams`.**
+  `replay` divides the `lm_head` logits by it, and that does not cancel out of
+  `(π_c − π_r) − (ref_c − ref_r)`: `log_softmax` is non-linear in the temperature,
+  so the margin scales by roughly `1/T` and the effective `beta` moves with it.
+  Offline DPO never samples, so inheriting a *generation* default (0.7) would
+  silently rescale the objective against reference implementations, which compute
+  preference log-probs at 1.0.
 - **DPO allows `num_updates_per_batch > 1` for a reason the other families do
   not.** The multi-update gate exists to stop a *moving π_old anchor*, but DPO
   has no π_old: its reference is the adapter-disabled base — frozen weights,
