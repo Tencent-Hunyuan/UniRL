@@ -17,7 +17,7 @@ from .base import (
     rollout_replay_logp_absdiff,
     typed_conditions,
 )
-from .grpo import GRPO
+from .grpo import GRPO, aggregate_token_losses
 
 
 @dataclass
@@ -219,15 +219,13 @@ class CPPO(StageAlgorithm):
             delta_b=self.cppo_delta_b,
         )
 
-        if segment.loss_mask is not None:
-            mask = segment.loss_mask.to(dtype=loss_per_elem.dtype, device=loss_per_elem.device)
-            loss_per_elem = loss_per_elem * mask
-
-        if self.loss_agg_mode == "seq-mean-token-sum-norm" and segment.lengths is not None:
-            parts = torch.split(loss_per_elem, segment.lengths.tolist())
-            loss = torch.stack([p.sum() for p in parts]).mean() / float(self.horizon)
-        else:
-            loss = loss_per_elem.mean()
+        loss = aggregate_token_losses(
+            loss_per_elem,
+            lengths=segment.lengths,
+            loss_mask=segment.loss_mask,
+            loss_agg_mode=self.loss_agg_mode,
+            horizon=self.horizon,
+        )
         (loss * loss_scale).backward()
 
         metrics: Dict[str, Any] = {

@@ -88,6 +88,9 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   so `stage.replay` still emits log-probs) **with `add_kl_coefficient=false`**. Never pair a
   near-zero `eta` with `add_kl_coefficient=true` — the KL divides by a transition std that
   scales with `eta` (the algorithm raises at init on `eta == 0`, but cannot judge "too small").
+- **AR `loss_mask` is in the reduction denominator** — `aggregate_token_losses`
+  (GRPO, DRPO, CPPO, DPPO) divides by the active mask weight, not the packed
+  length. `seq-mean-token-mean` is a first-class mode, not a silent `token-mean`.
 - **AR `sampling_temperature` must equal the rollout `sampling.temperature`** —
   `ARStage.replay` rescales logits by it (`log_softmax(logits / T)`) to match SGLang's
   distribution; when unset it silently falls back to the `ARSamplingParams` default,
