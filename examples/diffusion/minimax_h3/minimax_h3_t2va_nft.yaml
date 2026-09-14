@@ -107,10 +107,9 @@ backend:
     bias: none
     task_type: FEATURE_EXTRACTION
     shadow_adapter: old
-    # Decay is exactly 0 below ema_flat_steps, so the shadow is a hard copy for
-    # the first 75 refreshes.
+    # Start trailing the trainable adapter from the first refresh.
     ema_decay_type: warmup
-    ema_flat_steps: 75
+    ema_flat_steps: 0
     ema_uprate: 0.0075
     ema_uphold: 0.999
     timing: rollout_end
