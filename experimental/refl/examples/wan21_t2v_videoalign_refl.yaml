@@ -113,7 +113,7 @@ data_source:
       data_path: ${oc.env:DATA_PATH,datasets/refl_videoalign/train.txt}
       eval_data_path: ${oc.env:EVAL_DATA_PATH,${oc.env:DATA_PATH,datasets/refl_videoalign/test.txt}}
       seed: 42
-      shuffle: false
+      shuffle: true
     algorithm:
       prompts_per_rollout: ${batch_size}
 

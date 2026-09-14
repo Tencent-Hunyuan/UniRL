@@ -10,11 +10,7 @@ converter and nothing to cook.
 
 ## Source
 
-Curated captions of short live-action clips, filtered to portrait 720x1280 sources. Scenes
-centre on one or two people speaking and gesturing. That filter is why the set is small and
-why the phrasing clusters tightly: nearly every prompt is one sentence naming a subject, an
-action, and a setting, which keeps the VideoAlign text-alignment (TA) head on comparable
-footing across the batch.
+This prompt set was internally constructed by the Tencent Hunyuan team.
 
 ## Format
 
@@ -35,10 +31,9 @@ Prompts run 67–166 characters, median 99.
 | `train.txt` | 653 |
 | `test.txt` | 24 |
 
-The source file held 678 lines with one exact duplicate; the duplicate was dropped, leaving
-677 unique prompts split with a seeded shuffle (`random.Random(42)`). `test.txt` is sized at
-24 = 3 full rollouts at the recipe's `batch_size: 8`, deliberately small because an 81-frame
-480x832 generation per prompt makes held-out scoring expensive.
+The committed files define the dataset split. `test.txt` is sized at 24 = 3 full rollouts at
+the recipe's `batch_size: 8`, deliberately small because an 81-frame 480x832 generation per
+prompt makes held-out scoring expensive.
 
 Note that `experimental/refl` does not currently run periodic eval (see the "Deliberately not
 ported" section of [`experimental/refl/README.md`](../../experimental/refl/README.md)), so
