@@ -250,7 +250,7 @@ class Qwen3OmniThinkerInputAdapter:
         ar = frontier.sampling_params
         assert isinstance(ar, ARSamplingParams)
 
-        chat_overrides = dict((sample.parts[0].control or {}).get("chat") or {})
+        chat_overrides = dict(sample.parts[0].control.get("chat") or {})
         system_instruction = chat_overrides.get("system_instruction", self.system_instruction)
         template_overrides = dict(chat_overrides.get("template_kwargs") or {})
         conversations = build_omni_messages(

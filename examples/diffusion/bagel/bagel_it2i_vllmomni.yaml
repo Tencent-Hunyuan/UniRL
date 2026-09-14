@@ -68,7 +68,7 @@ enable_fsdp_offload: false
 offload_train_during_reward: false
 rollout_sleep_after_generate: true
 
-# NB: no `task_config.task: it2i` here. On the trainside recipe that pin is what
+# NB: no `control.task: it2i` here. On the trainside recipe that pin is what
 # makes a source-image-less dataset fail loudly; on this path the modality does it —
 # BagelIt2iAdapter.validate_request rejects a Sample without image conditioning.
 
