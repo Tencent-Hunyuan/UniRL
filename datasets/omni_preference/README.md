@@ -165,21 +165,32 @@ cross-split number is quietly wrong in the favourable direction.
   over the full 217-row audio split was an adequately-powered null result
   (78/75/64 win/lose/tie, p=0.872) even though the training objective moved a lot —
   optimising this metric is not the same as improving generations.
-- **The cross-stack comparison against verl-omni does not close.** On one
-  hand-built split fed to both stacks (4200 train / 600 val, 1400+200 per
-  modality, verified byte-identical row sets), same `lr=1e-5`, same 130 data
-  batches, same 4 optimizer updates per batch, scored by one harness with a
-  deterministic reduction: this implementation reaches balanced accuracy 0.8067
-  and verl 0.7483 (+5.8pp, p=0.015), with mean margins 0.9531 vs 0.2236 (4.3×).
-  **The residual is unexplained.** What it is *not*: the loss formula (bit-identical
-  over 8 variants), the data (one shared file), the reduction nondeterminism (fixing
-  it moved neither number in the fourth decimal), or the integrated learning rate
-  (verl's cosine over 130 batch-units reused 4× and a cosine over 520 update-units
-  both sum to 2.60e-03 — equal, not merely close). Note also that verl's own logged
-  `val/reward_accuracy` is inflated by an unweighted `np.mean` over unequal
+- **The cross-stack difference against verl-omni is the length shortcut, not a
+  training gap.** On one hand-built split fed to both stacks (4200 train / 600
+  val, 1400+200 per modality, verified byte-identical row sets), same `lr=1e-5`,
+  same 130 data batches, same 4 optimizer updates per batch, both adapters scored
+  in one process on the same rows: raw `reward_accuracy` 0.8133 here vs 0.7483 for
+  verl, and the paired McNemar test on the 115 discordant rows is significant
+  (77 vs 38, p=0.0004). But 497 of the 600 val rows have the longer answer as
+  `chosen`, and the difference sits entirely in that skew: **+10.5pp where chosen
+  is longer, −12.6pp where it is not.** Taking the unweighted mean of the two
+  length buckets so the 83/17 skew cannot carry the result gives 0.6064 vs 0.6172,
+  a gap of **−0.011, 95% CI [−0.067, +0.042]** — a null, and marginally the other
+  way. It stays a null under the ±4-row spread between harness runs. So the two
+  stacks are not distinguishable on preference quality here; the raw gap is a real
+  measurement of a confounded metric. Ruled out along the way, each by measurement:
+  the loss formula (bit-identical over 8 variants), the data (one shared file), the
+  reduction nondeterminism (fixing it moved neither number in the fourth decimal),
+  and the integrated learning rate (verl's cosine over 130 batch-units reused 4×
+  and a cosine over 520 update-units both sum to 2.60e-03 — equal, not merely
+  close). A weight-space comparison of the two adapters is **not** usable for this:
+  median cosine between the effective `ΔW` is +0.0004 over 288/288 modules, but the
+  two `lora_A` row spaces overlap exactly as much as two random draws (0.1065 vs a
+  null of 0.1072), so PEFT's random `A` init forces that orthogonality and it
+  carries no information about what was learned. Note separately that verl's own
+  logged `val/reward_accuracy` is inflated by an unweighted `np.mean` over unequal
   micro-batches in `reduce_metrics`: recomputing from its own dumped tensors gives
-  0.5000 where it logged 0.6875, and correcting it reverses the apparent ranking.
-  Do not read this comparison as cross-stack parity.
+  0.5000 where it logged 0.6875.
 
 - **Media basenames in the jsonl are not byte-equal to the filenames on disk.**
   The jsonl spells them with `_` where the file uses a space, and HTML-escapes
