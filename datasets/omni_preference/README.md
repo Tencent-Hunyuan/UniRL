@@ -165,8 +165,35 @@ cross-split number is quietly wrong in the favourable direction.
   over the full 217-row audio split was an adequately-powered null result
   (78/75/64 win/lose/tie, p=0.872) even though the training objective moved a lot —
   optimising this metric is not the same as improving generations.
-- **The raw gap against verl-omni is carried by the length confound; whether
-  anything else remains is undetermined.** On one hand-built split fed to both
+- **Cross-loading an adapter between the two stacks is not a valid comparison, and
+  every number below that does so is void.** Each model scores far better under the
+  stack it was trained in. Measured on the same val rows, `reward_accuracy`:
+
+  | | this harness | verl's harness |
+  |---|---|---|
+  | UniRL adapter | 0.8067 | 0.7274 |
+  | verl adapter (step 30) | 0.7417 | 0.9271 |
+
+  Both diagonal entries beat both off-diagonal ones: UniRL loses 7.9pp moving to
+  verl's harness, verl loses 18.5pp moving to this one. This is not a weight-transfer
+  bug — both round-trips are exact. verl's own exported adapter reloaded into verl
+  gives `0.9270833333333334` / margin `1.0472586419847276`, bit-identical to its live
+  value; and round-tripping a UniRL adapter through this harness's PEFT-dir branch
+  reproduces its native reading (0.8150 both). The models are transferred faithfully
+  and still score differently, so what differs is the **input pipeline** — the prompt
+  rendering, media processing and tokenisation each stack feeds the same row through.
+  A model performs best on the rendering it was trained on.
+
+  This is what the long-unexplained ~0.20 was: verl self-reports 0.9670 at step 130
+  and this harness reads 0.7483 from its checkpoint, a difference of 0.2187. It is
+  the cross-stack evaluation penalty, not a metric bug and not a training difference.
+  Consequently the "+5.8pp for UniRL" reported earlier was verl's model run through a
+  foreign pipeline, and does not support any claim about either implementation.
+  Comparing own-pipeline numbers (verl 0.9670, UniRL 0.8067) is also not sound: the
+  two renderings do not pose equally hard tasks, so that 16pp is a property of the
+  pipelines as much as of the training.
+- **The length confound below is still real, but it was measured under that invalid
+  comparison.** On one hand-built split fed to both
   stacks (4200 train / 600 val, 1400+200 per modality, verified byte-identical row
   sets), same `lr=1e-5`, same 130 data batches, same 4 optimizer updates per batch,
   both adapters scored in one process on the same rows: raw `reward_accuracy`
