@@ -227,7 +227,7 @@ class Hi3InputAdapter:
 
     def build_prompts(self, sample: Sample) -> List[Dict[str, Any]]:
         """The HI3 chat-templated per-prompt entries (+ the image gates)."""
-        task, sys_type = self._resolve_task(sample.parts[0].control or {})
+        task, sys_type = self._resolve_task(sample.parts[0].control)
 
         if self.image_input:
             turns, images = sample.vision_conditioning()
@@ -367,7 +367,7 @@ class Hi3DitRecaptionInputAdapter:
         cot = turns[1].content
         gen_part = sample.frontier_gen_part(DiffusionSamplingParams)
         diff_params = gen_part.sampling_params
-        sys_type = (sample.parts[0].control or {}).get("sys_type") or self.sys_type
+        sys_type = sample.parts[0].control.get("sys_type") or self.sys_type
 
         base_kwargs = core_diff_kwargs(diff_params)
         height = int(base_kwargs["height"])

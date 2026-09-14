@@ -210,7 +210,7 @@ class UnifiedModelTrainer(BaseTrainer):
             rollout_id,
             allowed_primitives={"text"},
             caller="UnifiedModelTrainer._build_request_sample",
-            control=dict(self._control),
+            control=self._control,
             require_single_input_part=True,
         )
         return request.fork(ar_params.samples_per_prompt, sampling_params=ar_params).fork(
@@ -266,7 +266,7 @@ class UnifiedModelTrainer(BaseTrainer):
         ar_input = Part.input(
             [f"r{rid}:a{k}" for k in range(n_ar)],
             primitives={"text": ar_texts},
-            control=dict(input_part.control),
+            control=input_part.control,
         )
         ar_request = (
             Sample.request(ar_input)
@@ -293,7 +293,7 @@ class UnifiedModelTrainer(BaseTrainer):
         dit_input = Part.input(
             [sid.replace("/", "_") for sid in image_shell.sample_ids],
             primitives={"text": dit_prompts},
-            control=dict(input_part.control),
+            control=input_part.control,
         )
         cot_input = dit_input.input_child(primitives={"text": dit_cot})
         dit_out = dit_engine.generate(

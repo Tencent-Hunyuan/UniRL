@@ -640,7 +640,7 @@ class DiffusionTrainer(BaseTrainer):
             rollout_id,
             allowed_primitives={"text", "image", "video"},
             caller="DiffusionTrainer._build_request_sample",
-            control=dict(self._control),
+            control=self._control,
         )
         samples_per_prompt = total_samples_per_prompt(sp)
         request = request.fork(samples_per_prompt, sampling_params=diffusion)
