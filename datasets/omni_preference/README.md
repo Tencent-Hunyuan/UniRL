@@ -227,10 +227,24 @@ cross-split number is quietly wrong in the favourable direction.
   It reaches log 2 at step 0 (`eval_loss=0.69315`) and its eval loss falls to 0.53899,
   so the run itself is sound. Combined with the 44-knob audit, this rules out
   configuration as the explanation: every setting verl's launch line specifies is now
-  either matched, measured inert, or structurally absent. Read together with the length
-  analysis above — the raw gap is carried by the 497/600 length skew, and the two
-  models differ in *length sensitivity* (+0.231, CI [+0.120, +0.335]) rather than in
-  configuration — the remaining difference is not a knob to find.
+  either matched, measured inert, or structurally absent.
+- **Aligning the training *process*, not just the knobs, also does not close it.**
+  Reading verl's engine rather than its config surfaced three process differences the
+  knob audit could not see. Two are real and one is not: (i) verl computes the reference
+  log-probs in a separate `infer_batch` pass under `module.eval()` while the policy runs
+  under `module.train()` — measured a bit-exact no-op here (`max |diff| = 0.000e+00` over
+  60 rows, 0 ranking flips), since the thinker has no dropout or batchnorm in the path;
+  (ii) its scheduler advances only on the last mini-batch of each data batch
+  (`update_lr_scheduler=batch_idx == total_num_iterations - 1`), which is what
+  `steps_per_advance` reproduces; and (iii) `forward_backward_batch` accumulates raw
+  micro-batch means with no division by `len(micro_batches)`, making its gradient `N×`
+  larger — predicted 2× for this geometry and measured **1.93×/1.93×/1.92×/1.95×** on the
+  first four steps once `normalize_across_micros=false` was implemented. Adding that
+  fourth alignment gives **0.8067**, i.e. back to the unaligned number and still +5.8pp
+  over verl. The 2× is absorbed by `clip_grad=1.0`, which fires on 78% of verl's steps
+  and 100% of ours. Read together with the length analysis above — the raw gap is carried
+  by the 497/600 length skew, and the two models differ in *length sensitivity* (+0.231,
+  CI [+0.120, +0.335]) — neither configuration nor training process explains it.
 
 - **Media basenames in the jsonl are not byte-equal to the filenames on disk.**
   The jsonl spells them with `_` where the file uses a space, and HTML-escapes
