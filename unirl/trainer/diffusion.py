@@ -297,7 +297,7 @@ class DiffusionTrainer(BaseTrainer):
         eval_eta: float = 0.0,
         eval_sampling_cfg: Optional[Any] = None,
         eval_rewards_cfg: Optional[Any] = None,
-        task_config: Optional[Dict[str, Any]] = None,
+        control: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__(
             cfg=cfg,
@@ -324,7 +324,7 @@ class DiffusionTrainer(BaseTrainer):
         self.eval_eta = float(eval_eta)
         self._eval_rewards_cfg = eval_rewards_cfg
         self._eval_suites: List[EvalRewardSuite] = []
-        self._task_config: Dict[str, Any] = dict(task_config) if task_config else {}
+        self._control: Dict[str, Any] = dict(control) if control else {}
         self._rollout_is_trainside = False
         self._uses_ema = False
 
@@ -640,7 +640,7 @@ class DiffusionTrainer(BaseTrainer):
             rollout_id,
             allowed_primitives={"text", "image", "video"},
             caller="DiffusionTrainer._build_request_sample",
-            root_control=dict(self._task_config),
+            control=self._control,
         )
         samples_per_prompt = total_samples_per_prompt(sp)
         request = request.fork(samples_per_prompt, sampling_params=diffusion)
