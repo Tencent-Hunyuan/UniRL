@@ -83,6 +83,12 @@ def unwrap_replicated_int(value: object, *, name: str) -> int:
     return value
 
 
+def reject_retired_stage_config(cfg: Any) -> None:
+    """Reject leftover ``stage_config`` recipe keys renamed to ``task_config``."""
+    if cfg is not None and "stage_config" in cfg:
+        raise ValueError("`stage_config` is no longer supported; rename the recipe key to `task_config`")
+
+
 def init_transfer_queue(cfg: DictConfig) -> Optional[dict]:
     """Driver-side TransferQueue bootstrap for ``transport_kind=transfer_queue``."""
     if cfg.get("transport_kind", "colocate_store") not in ("transfer_queue", "tq"):
@@ -117,6 +123,7 @@ class BaseTrainer:
         logging_cfg: Optional[DictConfig] = None,
         worker_max_concurrency: Optional[int | Sequence[int]] = None,
     ) -> None:
+        reject_retired_stage_config(cfg)
         self.num_devices = cfg.num_devices
         if worker_max_concurrency is None:
             configured_concurrency = cfg.get("worker_max_concurrency")

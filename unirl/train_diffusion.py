@@ -3,25 +3,10 @@
 
 from __future__ import annotations
 
-import warnings
-
 import hydra
 from omegaconf import DictConfig
 
 from unirl.trainer.diffusion import DiffusionTrainer
-
-
-def _resolve_task_config(cfg: DictConfig):
-    if "stage_config" not in cfg:
-        return cfg.get("task_config")
-    if "task_config" in cfg:
-        raise ValueError("Specify only task_config; do not set deprecated stage_config alongside it")
-    warnings.warn(
-        "`stage_config` is deprecated; rename the recipe key to `task_config`",
-        FutureWarning,
-        stacklevel=2,
-    )
-    return cfg.get("stage_config")
 
 
 @hydra.main(version_base=None, config_path="../examples", config_name="diffusion/sd3/sd3_trainside")
@@ -58,7 +43,7 @@ def main(cfg: DictConfig) -> None:
         # Any DiffusionSamplingParams field; everything it omits inherits `sampling`.
         eval_sampling_cfg=cfg.get("eval_sampling"),
         eval_rewards_cfg=cfg.get("eval_rewards"),
-        task_config=_resolve_task_config(cfg),
+        task_config=cfg.get("task_config"),
     )
     trainer.train(
         num_rollouts=cfg.get("num_rollouts", 100),
