@@ -61,14 +61,21 @@ handler in `../../distributed/weight_sync`.
 - **An engine that will serve as an agentic inner must make `generate` safe for
   concurrent callers** — the agentic coordinator drives one trajectory per drain
   thread.
-- **One SGLang `MultiprocessingSerializer` LoRA payload is TP1-only.** Stock
-  upstream serializes with `ForkingPickler`, whose `resource_sharer` file
-  descriptors are one-shot: broadcasting the same payload to TP>1 scheduler
-  subprocesses lets one rank consume the handles and makes the others fail with
-  `EOFError`. `sglang/backends/base.py` keeps the zero-copy path for TP1, where a
-  SGLang 0.5.10 Qwen3-0.6B hot-load measured 2.09x faster after warmup, and uses
-  base64 pickle bytes for TP>1; a pinned-0.5.12 serializer microbenchmark confirmed
-  the topology split. The TP1 server must inherit the sender's multiprocessing
-  authkey, as UniRL's spawned HTTP server and native Engine do. Re-check both the
-  `SafeUnpickler` allowlist and this topology gate on a SGLang bump; the A/B
-  conditions and results are recorded in PR #227.
+- **SGLang LoRA serialization is topology-sensitive.** TP1 keeps
+  `MultiprocessingSerializer` and requires the server to inherit the sender's
+  multiprocessing authkey. TP>1 cannot broadcast its one-shot file descriptors, so
+  `sglang/backends/http.py` sends inlined base64 pickle bytes instead. Re-check the
+  `SafeUnpickler` allowlist and broadcast semantics on a SGLang bump.
+- **`rl_on_policy_target` silently switches on deterministic sampling.** SGLang
+  0.5.12.post1 derives `enable_deterministic_inference` from it, and every request
+  that carries no `sampling_seed` then defaults to seed 42 — so one `n=8` request
+  comes back as eight token-identical completions. The adapters therefore send
+  deterministic fan-out as `n=1` requests each carrying one derived
+  `sampling_seed`. Re-check both halves on a SGLang bump: dropping either one
+  restores the clone, silently.
+- **SGLang request sampling lives on the Sample, not the engine config.** Direct
+  callers must `fork(..., sampling_params=ARSamplingParams(...))` before
+  `generate`. Missing or non-`ARSamplingParams` frontiers now error; in-tree
+  trainer, PE, and agentic paths already stamp this. `temperature` / `top_p` /
+  `top_k` / `max_new_tokens` are gone from `SGLangEngineConfig` — there is no
+  engine-config fallback.

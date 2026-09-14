@@ -1,0 +1,100 @@
+# @package _global_
+# DanceGRPO WAN 2.2 T2V A14B with the FastVideo rollout engine, colocate, v2 trainer, 1x8.
+#
+# This is wan22_t2v_14b_dancegrpo.yaml with rollout moved from the in-process
+# trainside engine to the dedicated FastVideo VideoGenerator engine (+ the
+# weight-sync block a dedicated engine requires). Reward, LoRA targets, Dance
+# SDE kernel, replay log-prob, sigma schedule, and SDE-index window remain
+# aligned with the official recipe. The deterministic non-SDE tail intentionally
+# uses UniPC instead of the trainside recipe's eta=0 Euler steps, so generated
+# trajectories can differ (unirl/sde/README.md).
+#
+# WAN 2.2 A14B delta over the WAN 2.1 FastVideo recipe:
+#   1. `model_family: wan2.2` selects boundary-routed dual-expert rollout. The
+#      engine pins `boundary_ratio` onto FastVideo's pipeline/dit configs and
+#      verifies the checkpoint declares both `transformer` and `transformer_2`.
+#   2. Two 14B experts do not fit alongside the trainer, so the rollout runs
+#      with layerwise DiT offload plus CPU text-encoder/VAE offload.
+#   3. The weight sync ships a checkpoint path; each worker splits it on the
+#      `high_noise.*` / `low_noise.*` prefixes and loads both experts.
+#
+# FastVideo dependency: see unirl/rollout/engine/fastvideo/README.md for the
+# pinned surface. Set $FASTVIDEO_PATH to that checkout; FastVideo is
+# lazy-imported by the rollout engine only.
+#
+# This recipe defaults to replay log-probs. Native mode is enabled by setting
+# rollout.config.native_logprob=true and algorithm.old_logp_source=rollout;
+# both modes use the same SDE sampling window.
+
+defaults:
+  - wan22_t2v_14b_dancegrpo
+  - _self_
+
+weight_sync_interval: 1      # push freshly-trained weights into FastVideo every rollout (on-policy)
+
+# Shared nodes (lifted from the trainside recipe so the dedicated FastVideo
+# engine can be injected with the same model config + SDE kernel).
+model_config:
+  _target_: unirl.models.wan22.config.WAN22PipelineConfig
+  pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,Wan-AI/Wan2.2-T2V-A14B-Diffusers}
+  model_precision: bf16
+  shift: 5.0
+  max_sequence_length: 512
+  # Sigma boundary routing the high-noise / low-noise experts; the engine pins
+  # the same value onto FastVideo's dit_config so both engines agree.
+  boundary_ratio: 0.875
+  num_train_timesteps: 1000
+  # Deterministic-solver SSOT: the engine verifies these against the
+  # checkpoint's scheduler/scheduler_config.json at init.
+  unipc_solver_order: 2
+  unipc_solver_type: bh2
+  unipc_lower_order_final: true
+  # FastVideo owns video decoding; the trainer-side pipeline only replays the
+  # returned latent trajectory and does not need a duplicate VAE on the same GPU.
+  load_vae: false
+
+strategy:
+  _target_: unirl.sde.kernels.DanceSDEStrategy
+
+bundle:
+  config: ${model_config}
+
+pipeline:
+  strategy: ${strategy}
+
+rollout:
+  _target_: unirl.rollout.engine.fastvideo.engine.FastVideoRolloutEngine
+  config:
+    _target_: unirl.rollout.engine.fastvideo.config.FastVideoEngineConfig
+    model_family: wan2.2
+    # replay recipe: engine returns the trajectory, trainer recomputes log-probs.
+    # Flip to true (+ algorithm.old_logp_source: rollout) for the native path.
+    native_logprob: false
+    init_same_noise: ${sampling.init_same_noise}
+    num_gpus: 1
+    tp_size: 1
+    sp_size: 1
+    local_mode: true
+    forward_batch_size: 1           # CPU-output concat cadence (NOT a GPU batch: the
+                                    # forward runs one video at a time regardless)
+    fastvideo_path: ${oc.env:FASTVIDEO_PATH,null}
+    engine_kwargs:
+      # Two 14B experts stay on CPU; only the active layers are prefetched.
+      dit_layerwise_offload: true
+      text_encoder_cpu_offload: true
+      vae_cpu_offload: true
+  model_config: ${model_config}
+  strategy: ${strategy}
+
+algorithm:
+  old_logp_source: replay
+
+sync:
+  _target_: unirl.distributed.weight_sync.full.checkpoint.CheckpointWeightSync
+  lora_merged: true
+  sync_dir: ${oc.env:WEIGHT_SYNC_DIR,/tmp/unirl_fastvideo_weight_sync_wan22}
+  flush_cache: true
+
+logging:
+  run_name: ${oc.env:WANDB_RUN_NAME,wan22_t2v_14b_dancegrpo_fastvideo}
+  tags: ["wan22", "t2v", "dancegrpo", "grpo", "video", "pickscore", "fastvideo", "dual-transformer", "v2"]

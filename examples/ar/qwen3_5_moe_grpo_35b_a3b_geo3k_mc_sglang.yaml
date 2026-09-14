@@ -94,9 +94,6 @@ rollout:
     samples_pre_expanded: true
     image_token: "<|image_pad|>"
     response_forbidden_tokens: ["<|image_pad|>", "<|video_pad|>"]
-    max_new_tokens: 512
-    temperature: 0.7
-    top_p: 0.9
     concurrency: 8
     enable_memory_saver: true
     enable_weights_cpu_backup: true
@@ -124,7 +121,7 @@ algorithm:
   conditions_cls:
     _target_: hydra.utils.get_class
     path: unirl.models.qwen3_5.conditions.Qwen3_5ARConditions
-  sampling_temperature: 0.7
+  sampling_temperature: ${sampling.temperature}
 
 sync:
   _target_: unirl.distributed.weight_sync.full.tensor.TensorWeightSync

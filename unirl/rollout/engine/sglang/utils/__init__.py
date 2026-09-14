@@ -7,13 +7,18 @@ from unirl.rollout.engine.sglang.utils.conversations import (
     unique_group_indices,
 )
 from unirl.rollout.engine.sglang.utils.images import pil_to_base64
-from unirl.rollout.engine.sglang.utils.sampling import ResolvedSampling, resolve_sampling
+from unirl.rollout.engine.sglang.utils.sampling import (
+    ResolvedSampling,
+    deterministic_inference_enabled,
+    resolve_sampling,
+)
 from unirl.rollout.engine.sglang.utils.thinking import split_thinking_tags
 
 __all__ = [
     "ResolvedSampling",
     "build_text_conversations",
     "build_vision_conversations",
+    "deterministic_inference_enabled",
     "pack_prompt_condition",
     "pil_to_base64",
     "resolve_sampling",

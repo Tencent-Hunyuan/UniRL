@@ -25,6 +25,7 @@ from unirl.train.configs import (
     FSDPConfig,
     LoraConfig,
 )
+from unirl.utils.distributed_utils import ensure_dist_initialized
 from unirl.utils.dtypes import parse_torch_dtype
 
 
@@ -53,12 +54,19 @@ class FSDPBackend(BaseFSDP2Backend):
         self._bundle = bundle
         self._rank = int(rank)
         self._device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        ensure_dist_initialized()
 
         self._weight_sync_dtype: torch.dtype = parse_torch_dtype(
             fsdp_cfg.param_dtype, field_name="training.fsdp.param_dtype"
         )
 
         model = resolve_trainable_module(bundle, trainable_attr)
+        if getattr(bundle, "requires_unwrapped_trainable_root", False) and fsdp_cfg.root_wrap:
+            raise ValueError(
+                f"{type(bundle).__name__} requires fsdp_cfg.root_wrap=false because its stages call replicated "
+                "trainable-root children directly; root wrapping would expose sharded DTensors outside the root "
+                "forward."
+            )
         shadow = self._inject_structural(model, lora_cfg, ema_lora_cfg, ema_cfg)
 
         fsdp_wrap(
@@ -69,6 +77,7 @@ class FSDPBackend(BaseFSDP2Backend):
             mixed_precision=fsdp_cfg.mixed_precision,
             cast_forward_inputs=fsdp_cfg.cast_forward_inputs,
             fsdp_mode=fsdp_cfg.fsdp_mode,
+            hsdp_shard_size=fsdp_cfg.hsdp_shard_size,
             reshard_after_forward=fsdp_cfg.reshard_after_forward,
             forward_prefetch=fsdp_cfg.forward_prefetch,
             activation_checkpointing=fsdp_cfg.activation_checkpointing,
