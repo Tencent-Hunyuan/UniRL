@@ -199,13 +199,21 @@ class DPO(StageAlgorithm):
         lengths = segment.lengths.to(device)
         num_seqs = int(lengths.shape[0])
         seg_ids = torch.repeat_interleave(torch.arange(num_seqs, device=device), lengths)
+        # Scatter to [S, Lmax] once and sum along a fixed axis: index_add/scatter_add_
+        # accumulate with atomics and are not deterministic -- see README.md Gotchas.
+        offsets = torch.cumsum(lengths, 0) - lengths
+        cols = torch.arange(packed_logp.shape[0], device=device) - offsets.repeat_interleave(lengths)
+        dense = packed_logp.new_zeros(num_seqs, int(lengths.max()))  # [S, Lmax]
         if segment.loss_mask is not None:
             mask = segment.loss_mask.to(dtype=packed_logp.dtype, device=device)
+            dense[seg_ids, cols] = mask
+            denom = dense.sum(dim=1)
             packed_logp = packed_logp * mask
-            denom = packed_logp.new_zeros(num_seqs).index_add(0, seg_ids, mask)
         else:
             denom = lengths.to(packed_logp.dtype)
-        seq_logp = packed_logp.new_zeros(num_seqs).index_add(0, seg_ids, packed_logp)
+        dense = dense.zero_()
+        dense[seg_ids, cols] = packed_logp
+        seq_logp = dense.sum(dim=1)
         if self.average_log_prob:
             seq_logp = seq_logp / denom.clamp(min=1)
         return seq_logp

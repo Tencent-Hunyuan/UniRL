@@ -117,6 +117,22 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   strict `>`, so it is not a bug. Note what this check *cannot* see: it holds for
   **any** value of `sampling_temperature`, because a zero margin stays zero under
   any scaling. It validates the reference and the pairing, not the scaling.
+- **The segment-sum must not use `index_add`/`scatter_add_`.** Both accumulate
+  with CUDA atomics, so the addition order varies between otherwise identical
+  calls and the per-sequence sum is not reproducible. Measured spread on one
+  fixed input over 8 calls: `index_add` 0 at 64 tokens, 1.2e-03 at 622, 3.9e-02
+  at 4096, 1.6e-01 at 16384; `scatter_add_` is no better (1.9e-01 at 16384).
+  This is invisible in the loss and in the forward — the `replay` output is
+  bitwise identical across calls (30/30 rows measured) — and surfaces only after
+  the reduction, where it made the policy and the *adapter-disabled* reference
+  differ at zero adapter delta. The visible symptom was the log-2 control
+  reporting `reward_accuracy = 0.15` instead of 0: with a true margin of exactly
+  0, tie-breaking noise of 1e-07 is resolved by the strict `>`, and because the
+  error scales with length it hit long image rows (6/20) and never short audio
+  rows (0/20), which reads exactly like a modality-dependent modelling effect.
+  `_reduce_to_sequences` therefore scatters to `[S, Lmax]` and sums along a fixed
+  axis, which is a shape-determined tree reduction; the control then returns
+  exactly 0.0 with every margin identically zero.
 - **What a bit-identical loss does and does not prove.** Reproducing a reference
   implementation's loss to `|d| = 0` shows the formula is right *given the same
   log-probs*. It says nothing about the rest of the chain — manifest conversion,
