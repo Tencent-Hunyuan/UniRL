@@ -73,6 +73,18 @@ in `backend/base.py`; a multi-update-capable algorithm sets
   same integrated LR of 2.60e-03). `steps_per_advance != 1` raises on `linear_warmup`,
   which composes `LinearLR`/`SequentialLR` and advances internally.
 
+- **`algorithm.normalize_across_micros=false` accumulates raw micro means, which is
+  what verl-omni's engine does.** `TrainStack` normally scales each micro-batch's loss
+  by its share of the update, so the gradient is the mean over every sample in the
+  optimizer step. verl's `forward_backward_batch` instead calls `loss.backward()` on
+  each micro-batch's own `.mean()` with no division by `len(micro_batches)`, and
+  `postprocess_batch_func` only collects the losses — so its gradient is the *sum* of
+  micro means, i.e. `N×` larger for `N` micro-batches per update. Setting this flag
+  false reproduces that. Note the two are not equivalent under `clip_grad`: the scale-up
+  is a no-op on any step whose norm already exceeds the clip (78% of verl's steps, 100%
+  of ours at `clip_grad=1.0`), so this changes the effective step size only on the
+  unclipped minority. The reported `loss` stays a proper average either way, so the
+  step-0 log-2 check still holds.
 - **A mixed-modality batch builds but cannot be sliced.** `ARPreferenceTrackBuilder`
   happily produces one `Part` from audio and image records together — the per-sample
   media lists line up with the row count, and `Batch.slice` on the whole batch looks
