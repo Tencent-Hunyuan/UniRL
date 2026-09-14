@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from functools import partial
 from typing import Any, Dict, Optional, Tuple
 
@@ -15,6 +16,24 @@ from unirl.utils.distributed_utils import find_dtensor_mesh
 from unirl.utils.dtypes import parse_torch_dtype
 
 logger = logging.getLogger(__name__)
+
+
+def configure_copy_engine_all_gather(enable: bool) -> None:
+    """Configure NCCL's zero-CTA policy before the default group is created."""
+    if not enable:
+        return
+
+    policy = os.environ.get("NCCL_CTA_POLICY")
+    require(
+        policy in {None, "2"},
+        f"FSDP copy-engine all-gather requires NCCL_CTA_POLICY=2, but the environment sets it to {policy!r}.",
+    )
+    require(
+        not torch.distributed.is_initialized() or policy == "2",
+        "FSDP copy-engine all-gather was enabled after the default process group "
+        "was initialized. Set NCCL_CTA_POLICY=2 before distributed initialization.",
+    )
+    os.environ["NCCL_CTA_POLICY"] = "2"
 
 
 def _clone_checkpoint_kwarg(value: Any) -> Any:
@@ -62,6 +81,7 @@ def fsdp_wrap(
     master_dtype: Optional[str] = None,
     master_params: Tuple[torch.Tensor, ...] = (),
     root_wrap: bool = True,
+    copy_engine_all_gather: bool = False,
 ) -> None:
     """Apply FSDP2 wrapping to the model.  No handle returned — DTensors"""
     from torch.distributed.fsdp import (
@@ -176,6 +196,21 @@ def fsdp_wrap(
                 f"every fully_shard group (e.g. {stray[:3]}); their grads would never be "
                 "DP-synced and replicas drift. Enable training.fsdp.root_wrap or freeze them.",
             )
+
+    if copy_engine_all_gather:
+        fsdp_roots = (
+            (model,)
+            if isinstance(model, FSDPModule)
+            else tuple(module for module in block_instances if isinstance(module, FSDPModule))
+        )
+        require(fsdp_roots, "FSDP copy-engine all-gather requires at least one fully-sharded module.")
+        for fsdp_root in fsdp_roots:
+            setter = getattr(fsdp_root, "set_symm_mem_for_comm", None)
+            require(
+                callable(setter),
+                "FSDP copy-engine all-gather requires a PyTorch build with FSDPModule.set_symm_mem_for_comm().",
+            )
+            setter("NCCL")
 
     if mode == "hybrid":
         _validate_hsdp_mesh(model, expected_mesh=mesh)

@@ -11,7 +11,7 @@ from unirl.models.types.post_materialize import apply_deferred_ops
 from unirl.train.backend.base import LrSchedulerConfig, OptimizerConfig, resolve_trainable_module
 from unirl.train.backend.base_backend import BaseFSDP2Backend
 from unirl.train.backend.fsdp.state import clip_grad_norm, fsdp_offload, fsdp_onload
-from unirl.train.backend.fsdp.wrap import fsdp_wrap
+from unirl.train.backend.fsdp.wrap import configure_copy_engine_all_gather, fsdp_wrap
 from unirl.train.backend.sharded_load import load_trainable_weights
 from unirl.train.backend.sharded_state import (
     StateDict,
@@ -54,6 +54,7 @@ class FSDPBackend(BaseFSDP2Backend):
         self._bundle = bundle
         self._rank = int(rank)
         self._device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        configure_copy_engine_all_gather(fsdp_cfg.copy_engine_all_gather)
         ensure_dist_initialized()
 
         self._weight_sync_dtype: torch.dtype = parse_torch_dtype(
@@ -86,6 +87,7 @@ class FSDPBackend(BaseFSDP2Backend):
             master_dtype=getattr(fsdp_cfg, "master_dtype", None),
             master_params=tuple(shd for _, shd in shadow.iter_pairs()) if shadow is not None else (),
             root_wrap=getattr(fsdp_cfg, "root_wrap", True),
+            copy_engine_all_gather=fsdp_cfg.copy_engine_all_gather,
         )
 
         load_trainable_weights(
