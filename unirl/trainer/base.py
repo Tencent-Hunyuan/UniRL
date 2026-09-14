@@ -83,20 +83,6 @@ def unwrap_replicated_int(value: object, *, name: str) -> int:
     return value
 
 
-_RETIRED_CONTROL_RECIPE_KEYS = ("stage_config", "task_config")
-
-
-def reject_retired_control_keys(cfg: Any) -> None:
-    """Reject leftover recipe keys for root ``Part.control``."""
-    if cfg is None:
-        return
-    present = [key for key in _RETIRED_CONTROL_RECIPE_KEYS if key in cfg]
-    if not present:
-        return
-    names = " and ".join(f"`{key}`" for key in present)
-    raise ValueError(f"{names} no longer supported; rename the recipe key to `control`")
-
-
 def init_transfer_queue(cfg: DictConfig) -> Optional[dict]:
     """Driver-side TransferQueue bootstrap for ``transport_kind=transfer_queue``."""
     if cfg.get("transport_kind", "colocate_store") not in ("transfer_queue", "tq"):
@@ -131,7 +117,6 @@ class BaseTrainer:
         logging_cfg: Optional[DictConfig] = None,
         worker_max_concurrency: Optional[int | Sequence[int]] = None,
     ) -> None:
-        reject_retired_control_keys(cfg)
         self.num_devices = cfg.num_devices
         if worker_max_concurrency is None:
             configured_concurrency = cfg.get("worker_max_concurrency")
