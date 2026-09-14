@@ -48,8 +48,6 @@ def install() -> None:
 
 install()
 
-from unirl.rollout.engine.vllm_omni.patches import compat_hi3_lora as _hi3_lora_compat  # noqa: F401, E402
-
 
 class HI3ARWorkerExtension:
     """vllm-omni ``worker_extension_cls`` qualname target for HI3 AR."""

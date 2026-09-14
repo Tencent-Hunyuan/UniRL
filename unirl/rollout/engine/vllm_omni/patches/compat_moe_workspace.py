@@ -46,7 +46,7 @@ def _patch_workspace_manager_class(
     workspace_manager_class: type,
     *,
     allocator_provider: Callable[[], Any],
-    workspace_id_provider: Callable[[Any], int],
+    workspace_id_provider: Callable[[Any], int | None],
 ) -> None:
     """Route ``_ensure_workspace_size`` growth through the dedicated CuMem tag."""
     if getattr(workspace_manager_class, _WORKSPACE_MANAGER_MARKER, False):
@@ -55,14 +55,14 @@ def _patch_workspace_manager_class(
     original_ensure_workspace_size = workspace_manager_class._ensure_workspace_size
 
     def ensure_workspace_size(manager: Any, required_bytes: int) -> Any:
-        workspace_id = workspace_id_provider(manager)
         try:
+            workspace_id = workspace_id_provider(manager)
+            if workspace_id is None:
+                return original_ensure_workspace_size(manager, required_bytes)
             current_workspace = manager._current_workspaces[workspace_id]
             current_size = manager._workspace_size_bytes(current_workspace)
             workspace_locked = manager.is_locked()
         except (AttributeError, IndexError):
-            # An out-of-range slot means an unconfigured lane, which vLLM itself
-            # reports with a precise error once it reaches its own bounds check.
             return original_ensure_workspace_size(manager, required_bytes)
         if current_size >= required_bytes:
             return original_ensure_workspace_size(manager, required_bytes)
@@ -116,11 +116,14 @@ def patch_moe_workspace_pool() -> None:
     except ImportError:
         _workspace_lane = None
 
-    def workspace_id_provider(manager: Any) -> int:
-        # vLLM 0.28 slots workspaces by lane within ubatch; these defaults
-        # reproduce the flat per-ubatch layout that earlier versions used.
+    def workspace_id_provider(manager: Any) -> int | None:
+        # Delegate invalid lanes before indexing. A lane can otherwise flatten
+        # onto the next ubatch's valid slot and release an unrelated workspace.
         lane = 0 if _workspace_lane is None else _workspace_lane.get()
-        return dbo_current_ubatch_id() * getattr(manager, "_num_lanes", 1) + lane
+        num_lanes = getattr(manager, "_num_lanes", 1)
+        if lane < 0 or lane >= num_lanes:
+            return None
+        return dbo_current_ubatch_id() * num_lanes + lane
 
     _patch_workspace_manager_class(
         WorkspaceManager,

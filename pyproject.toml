@@ -41,10 +41,9 @@ dependencies = [
   "tensordict>=0.5",
 ]
 
-# Parent/inline engines load this. Multi-stage StageDiffusionProc does not —
-# VLLMOmniHijack.hijack() reinstalls the same hook in spawn children.
+# vllm-omni 0.28 loads this in parent and spawned stage processes.
 [project.entry-points."vllm_omni.general_plugins"]
-unirl_capture_flush = "unirl.rollout.engine.vllm_omni.plugin:register_capture_flush"
+unirl_runtime = "unirl.rollout.engine.vllm_omni.plugin:register_unirl_runtime"
 
 [project.optional-dependencies]
 # sglang pinned to the upstream release the UniRL sglang patch package
@@ -60,6 +59,9 @@ unirl_capture_flush = "unirl.rollout.engine.vllm_omni.plugin:register_capture_fl
 # (upgrade pending; verified meanwhile via a 2.34-prefixed python).
 sglang = [
   "sglang[diffusion]==0.5.12.post1 ; sys_platform == 'linux'",
+  # sglang leaves kernels unpinned; transformers 5.6.0 requires its 0.12 API.
+  # The vllm extra conflicts with this extra and resolves its own 0.14.1 pin.
+  "kernels>=0.12,<0.13 ; sys_platform == 'linux'",
   # sglang pins a prerelease; a first-party declaration makes it "explicitly
   # requested" under uv's default prerelease policy (scoped, not global).
   "flash-attn-4>=4.0.0b9,<5 ; sys_platform == 'linux'",
@@ -81,10 +83,9 @@ sglang = [
 ]
 # CUDA 13: vllm >=0.26 wants a bare `torch==2.13.0` whose wheel is cu130, and a
 # +cu129 pin would resolve anyway, linking a CUDA-12 torch under a CUDA-13 vllm.
-# Prerelease, so installs need --prerelease=allow, plus sglang's compat layer.
 vllm = [
   "vllm==0.28.0 ; sys_platform == 'linux'",
-  "vllm-omni==0.28.0rc1 ; sys_platform == 'linux'",
+  "vllm-omni==0.28.0 ; sys_platform == 'linux'",
   # vllm-omni 0.28 needs >=5.10.1,<5.15 (5.10.0 is yanked, 5.15 has a known
   # construction regression); exact because there is no uv.lock to hold it, and
   # 5.12.1 is what sglang 0.5.15+ pins, so unifying later is a bump not a port.
@@ -165,26 +166,16 @@ conflicts = [
 # other package take its newest from PyPI while +cuXXX outranks same-release
 # PyPI builds where it matters.
 index-strategy = "unsafe-best-match"
-# sglang 0.5.12.post1 pins transformers==5.6.0 but leaves its `kernels`
-# integration unpinned; kernels >=0.15 changed LayerRepository's signature and
-# breaks transformers 5.6.0 at import time. Hold it to transformers' own
-# declared bound. Scoped to that fork in practice: nothing the vllm extra
-# resolves requires kernels, so this does not cap its transformers at <5.13.
-#
 # transformers 5.6.0 accepts tokenizers<=0.23.0, but tokenizers 0.23.0(rc)
 # dropped the `cls` kwarg from RobertaProcessing.__new__, so deserializing a
 # saved CLIP tokenizer.json raises TypeError at rollout init (the SD3 text
-# encoders, e2e-confirmed on H20). The sglang install's --prerelease=allow flag
-# (see INSTALL.md) otherwise selects 0.23.0rc*; this override outranks it AND
-# guards against 0.23.0 shipping stable. tokenizers 0.22.2 verified on both
-# engine venvs.
+# encoders, e2e-confirmed on H20). Keep both engine stacks on the verified
+# tokenizers 0.22 family.
 override-dependencies = [
-  "kernels>=0.12,<0.13",
   "tokenizers>=0.22,<0.23",
-  # sglang[diffusion] hard-pins diffusers==0.37.0 (still pinned on sglang main),
-  # colliding with the base diffusers>=0.38.0 floor (#91); override to the floor
-  # so ".[sglang,...]" stays solvable (same tactic as kernels/tokenizers above).
-  "diffusers>=0.38.0",
+  # Override sglang[diffusion]'s stale 0.37 pin with the exact version required
+  # by vllm-omni 0.28.0. Both mutually exclusive engine stacks use this version.
+  "diffusers==0.40.0",
 ]
 environments = [
   "sys_platform == 'linux' and platform_machine == 'x86_64'",

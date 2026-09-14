@@ -11,15 +11,9 @@ from multiprocessing.process import BaseProcess as _MpBaseProcess
 
 import torch
 from msgspec import field
-
-try:
-    from vllm.lora.lora_model import LoRAModel
-except ImportError:
-    from vllm.lora.models import LoRAModel  # type: ignore[no-redef]
-
+from vllm.lora.lora_model import LoRAModel
 from vllm.lora.lora_weights import LoRALayerWeights, PackedLoRALayerWeights
 from vllm.lora.peft_helper import PEFTHelper
-from vllm.lora.utils import get_adapter_absolute_path
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager, logger
 from vllm_omni.lora.request import LoRARequest as OmniLoRARequest
 
@@ -137,28 +131,23 @@ def wrap_mp_process_for_children() -> None:
 
 def patch_dit_lora_loader() -> None:
     """Patch ``DiffusionLoRAManager._load_adapter`` (DiT stage) to support in-memory tensors."""
+    original = DiffusionLoRAManager._load_adapter
+    if getattr(original, "_diffrl_tensor_lora_loader", False):
+        return
 
-    def hijack__load_adapter(self, lora_request: OmniTensorLoRARequest) -> tuple[LoRAModel, PEFTHelper]:
+    def hijack__load_adapter(
+        self,
+        lora_request: OmniTensorLoRARequest,
+        _orig=original,
+    ) -> tuple[LoRAModel, PEFTHelper]:
+        if not isinstance(lora_request, OmniTensorLoRARequest):
+            return _orig(self, lora_request)
         if not self._expected_lora_modules:
             raise ValueError("No supported LoRA modules found in the diffusion pipeline.")
 
         logger.debug("Supported LoRA modules: %s", self._expected_lora_modules)
 
-        lora_tensors = None
-
-        if isinstance(lora_request, OmniTensorLoRARequest):
-            peft_config = lora_request.peft_config
-            lora_tensors = lora_request.lora_tensors
-            peft_helper = PEFTHelper.from_dict(peft_config)
-        else:
-            lora_path = get_adapter_absolute_path(lora_request.lora_path)
-            logger.debug("Resolved LoRA path: %s", lora_path)
-
-            peft_helper = PEFTHelper.from_local_dir(
-                lora_path,
-                max_position_embeddings=None,
-                tensorizer_config_dict=lora_request.tensorizer_config_dict,
-            )
+        peft_helper = PEFTHelper.from_dict(lora_request.peft_config or {})
 
         logger.info(
             "Loaded PEFT config: r=%d, lora_alpha=%d, target_modules=%s",
@@ -167,28 +156,15 @@ def patch_dit_lora_loader() -> None:
             peft_helper.target_modules,
         )
 
-        if isinstance(lora_request, OmniTensorLoRARequest):
-            lora_model = LoRAModel.from_lora_tensors(
-                tensors=lora_tensors,
-                peft_helper=peft_helper,
-                lora_model_id=lora_request.lora_int_id,
-                device="cpu",
-                dtype=self.dtype,
-                model_vocab_size=None,
-                weights_mapper=None,
-            )
-        else:
-            lora_model = LoRAModel.from_local_checkpoint(
-                lora_path,
-                expected_lora_modules=self._expected_lora_modules,
-                peft_helper=peft_helper,
-                lora_model_id=lora_request.lora_int_id,
-                device="cpu",
-                dtype=self.dtype,
-                model_vocab_size=None,
-                tensorizer_config_dict=lora_request.tensorizer_config_dict,
-                weights_mapper=None,
-            )
+        lora_model = LoRAModel.from_lora_tensors(
+            tensors=lora_request.lora_tensors or {},
+            peft_helper=peft_helper,
+            lora_model_id=lora_request.lora_int_id,
+            device="cpu",
+            dtype=self.dtype,
+            model_vocab_size=None,
+            weights_mapper=None,
+        )
 
         logger.info(
             "Loaded LoRA model: id=%d, num_modules=%d, modules=%s",
@@ -202,6 +178,7 @@ def patch_dit_lora_loader() -> None:
 
         return lora_model, peft_helper
 
+    hijack__load_adapter._diffrl_tensor_lora_loader = True  # type: ignore[attr-defined]
     setattr(DiffusionLoRAManager, "_load_adapter", hijack__load_adapter)
 
 
@@ -317,6 +294,9 @@ def patch_ar_lora_loader() -> None:
 
         model = self._adapter_manager.model
         hf_to_vllm_mapper = getattr(model, "hf_to_vllm_mapper", None)
+        if hf_to_vllm_mapper is not None:
+            hf_to_vllm_mapper = hf_to_vllm_mapper.get_unstacked_mapper()
+        lora_skip_prefixes = getattr(model, "lora_skip_prefixes", None)
         lora = self._lora_model_cls.from_lora_tensors(
             tensors=lora_request.lora_tensors or {},
             peft_helper=peft_helper,
@@ -325,6 +305,7 @@ def patch_ar_lora_loader() -> None:
             dtype=self.lora_config.lora_dtype,
             model_vocab_size=self.vocab_size,
             weights_mapper=hf_to_vllm_mapper,
+            skip_prefixes=lora_skip_prefixes,
         )
         return lora
 
@@ -401,7 +382,6 @@ def patch_fp32_skip() -> None:
 
     for _modname in (
         "vllm.lora.lora_model",
-        "vllm.lora.models",
         "vllm.lora.model_manager",
         "vllm.lora.worker_manager",
     ):
@@ -677,11 +657,6 @@ class VLLMOmniHijack:
     @staticmethod
     def hijack() -> None:
         wrap_mp_process_for_children()
-
-        # StageDiffusionProc never loads vllm_omni.general_plugins, so spawn children get the flush only via wrap_mp.
-        from unirl.rollout.engine.vllm_omni.plugin import register_capture_flush
-
-        register_capture_flush()
 
         patch_dit_lora_loader()
         patch_dit_hi3_lora_weights()
