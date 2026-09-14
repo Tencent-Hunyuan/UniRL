@@ -193,10 +193,10 @@ class Hi3InputAdapter:
         self.vanilla_task = vanilla_task
         self.sys_type = sys_type
 
-    def _resolve_task(self, task_config: Dict[str, Any]) -> Tuple[str, str]:
-        """Resolve ``(task_key, sys_type)`` with the ``task_config`` overrides."""
-        sys_type = task_config.get("sys_type") or self.sys_type
-        bot_task = task_config.get("bot_task")
+    def _resolve_task(self, control: Dict[str, Any]) -> Tuple[str, str]:
+        """Resolve ``(task_key, sys_type)`` with the root ``Part.control`` overrides."""
+        sys_type = control.get("sys_type") or self.sys_type
+        bot_task = control.get("bot_task")
         if self.bot_task_base and bot_task:
             if bot_task == "vanilla" and self.vanilla_task is not None:
                 return self.vanilla_task

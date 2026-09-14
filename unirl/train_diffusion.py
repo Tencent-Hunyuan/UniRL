@@ -43,7 +43,7 @@ def main(cfg: DictConfig) -> None:
         # Any DiffusionSamplingParams field; everything it omits inherits `sampling`.
         eval_sampling_cfg=cfg.get("eval_sampling"),
         eval_rewards_cfg=cfg.get("eval_rewards"),
-        task_config=cfg.get("task_config"),
+        control=cfg.get("control"),
     )
     trainer.train(
         num_rollouts=cfg.get("num_rollouts", 100),

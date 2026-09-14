@@ -26,7 +26,7 @@ def prepare_input_sample(
     *,
     allowed_primitives: set[str],
     caller: str,
-    root_control: Optional[Dict[str, Any]] = None,
+    control: Optional[Dict[str, Any]] = None,
     require_single_input_part: bool = False,
 ) -> Sample:
     """Prepare a data-source input tree for one rollout without rebuilding it."""
@@ -57,8 +57,8 @@ def prepare_input_sample(
     if len(metadata) != len(root.sample_ids):
         raise ValueError(f"{caller}: root metadata has {len(metadata)} rows for {len(root.sample_ids)} root samples.")
     root = replace(root, metadata=[{**(row or {}), "rollout_id": int(rollout_id)} for row in metadata])
-    if root_control is not None:
-        root = replace(root, control={**root.control, **root_control})
+    if control is not None:
+        root = replace(root, control={**root.control, **control})
     return namespaced.with_parts([root, *namespaced.parts[1:]])
 
 
@@ -83,10 +83,18 @@ def unwrap_replicated_int(value: object, *, name: str) -> int:
     return value
 
 
-def reject_retired_stage_config(cfg: Any) -> None:
-    """Reject leftover ``stage_config`` recipe keys renamed to ``task_config``."""
-    if cfg is not None and "stage_config" in cfg:
-        raise ValueError("`stage_config` is no longer supported; rename the recipe key to `task_config`")
+_RETIRED_CONTROL_RECIPE_KEYS = ("stage_config", "task_config")
+
+
+def reject_retired_control_keys(cfg: Any) -> None:
+    """Reject leftover recipe keys for root ``Part.control``."""
+    if cfg is None:
+        return
+    present = [key for key in _RETIRED_CONTROL_RECIPE_KEYS if key in cfg]
+    if not present:
+        return
+    names = " and ".join(f"`{key}`" for key in present)
+    raise ValueError(f"{names} no longer supported; rename the recipe key to `control`")
 
 
 def init_transfer_queue(cfg: DictConfig) -> Optional[dict]:
@@ -123,7 +131,7 @@ class BaseTrainer:
         logging_cfg: Optional[DictConfig] = None,
         worker_max_concurrency: Optional[int | Sequence[int]] = None,
     ) -> None:
-        reject_retired_stage_config(cfg)
+        reject_retired_control_keys(cfg)
         self.num_devices = cfg.num_devices
         if worker_max_concurrency is None:
             configured_concurrency = cfg.get("worker_max_concurrency")

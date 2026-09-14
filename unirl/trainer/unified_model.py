@@ -70,7 +70,7 @@ class UnifiedModelTrainer(BaseTrainer):
         stack_cfg: DictConfig,
         data_source_cfg: DictConfig,
         sampling_cfg: DictConfig,
-        task_config: Optional[Dict[str, Any]] = None,
+        control: Optional[Dict[str, Any]] = None,
         ar_rollout_cfg: Optional[DictConfig] = None,
         dit_rollout_cfg: Optional[DictConfig] = None,
         rollout_cfg: Optional[DictConfig] = None,
@@ -101,7 +101,7 @@ class UnifiedModelTrainer(BaseTrainer):
         self.data_source = instantiate(data_source_cfg)
 
         self.sampling_params: Dict[str, BaseSamplingParams] = build_sampling_dict(sampling_cfg)
-        self._task_config: Dict[str, Any] = dict(task_config) if task_config else {}
+        self._control: Dict[str, Any] = dict(control) if control else {}
 
         self.weight_sync = None
 
@@ -210,7 +210,7 @@ class UnifiedModelTrainer(BaseTrainer):
             rollout_id,
             allowed_primitives={"text"},
             caller="UnifiedModelTrainer._build_request_sample",
-            root_control=dict(self._task_config),
+            control=dict(self._control),
             require_single_input_part=True,
         )
         return request.fork(ar_params.samples_per_prompt, sampling_params=ar_params).fork(
