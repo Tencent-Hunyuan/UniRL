@@ -220,7 +220,6 @@ def reject_retired_residency_keys(cfg: Any) -> None:
     )
 
 
-
 def reject_retired_eval_keys(cfg: Any) -> None:
     """Fail fast on the per-field ``eval_*`` knobs that ``eval_sampling:`` replaced."""
     present = sorted(key for key in _RETIRED_EVAL_KEYS if cfg is not None and cfg.get(key) is not None)
