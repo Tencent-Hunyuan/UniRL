@@ -117,6 +117,22 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   strict `>`, so it is not a bug. Note what this check *cannot* see: it holds for
   **any** value of `sampling_temperature`, because a zero margin stays zero under
   any scaling. It validates the reference and the pairing, not the scaling.
+- **What a bit-identical loss does and does not prove.** Reproducing a reference
+  implementation's loss to `|d| = 0` shows the formula is right *given the same
+  log-probs*. It says nothing about the rest of the chain — manifest conversion,
+  prompt rendering, media injection, tokenisation, masking scope, metric
+  aggregation — and a wrong input there yields a faithfully-computed wrong number.
+  Every defect found while building this algorithm was invisible at the loss layer:
+  pad rows polluting an eval mean, `target_parameters` missing from the checkpoint
+  meta (silently rebuilding an attention-only adapter on resume), a rank-dependent
+  all-reduce width hanging NCCL for 1800 s, `image_max_pixels` silently inert for
+  image-only rows, a generation-default sampling temperature rescaling the
+  objective, and a modality marker surviving in the prompt as literal tokens.
+  Pair the loss check with checks that can see those: give each knob two values and
+  require the output to change, assert declared metric keys match emitted ones, and
+  compare what the docs claim against what the code does. Two configurations that
+  should differ but produce bit-identical numbers are a bug signature, not a
+  reassurance.
 - **`sampling_temperature` defaults to 1.0 here, not to `ARSamplingParams`.**
   `replay` divides the `lm_head` logits by it, and that does not cancel out of
   `(π_c − π_r) − (ref_c − ref_r)`: `log_softmax` is non-linear in the temperature,
