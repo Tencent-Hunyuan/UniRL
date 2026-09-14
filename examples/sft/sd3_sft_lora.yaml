@@ -12,8 +12,10 @@
 #   SFT_DATA          train manifest (.jsonl rows: {"prompt",
 #                     "media": [{"modality": "image", "role": "target", "uri": ...}]})
 #   SFT_EVAL_DATA     optional eval manifest (validation is disabled when unset)
-#   SFT_CACHE_DIR / SFT_CACHE_FINGERPRINT
-#                     optional cache root + explicit model/config revision
+#   SFT_CACHE_DIR     optional cache root; entries are namespaced by the frozen encoders'
+#                     own weights and stage config, so a swapped checkpoint is a cold cache
+#   SFT_CACHE_FINGERPRINT
+#                     optional extra salt, only for isolating caches by hand
 #
 # Data prep (HF naruto-blip-captions):
 #   python datasets/sft_manifests/prepare_sft_t2i.py --out-dir data/sft_t2i

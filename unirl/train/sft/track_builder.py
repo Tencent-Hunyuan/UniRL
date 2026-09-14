@@ -65,16 +65,21 @@ def _prefetch_batch_key(records: Sequence[Record]) -> str:
 
 
 class _TensorDiskCache:
-    """Small atomic torch-object cache namespaced by an explicit model fingerprint."""
+    """Small atomic torch-object cache namespaced by the encoders whose work it stands in for."""
 
     def __init__(self, root: str, *, fingerprint: str, kind: str, max_entries: int) -> None:
         if max_entries < 1:
             raise ValueError(f"_TensorDiskCache: max_entries must be >= 1; got {max_entries!r}")
         namespace = hashlib.sha256(f"{_TENSOR_CACHE_SCHEMA_VERSION}:{fingerprint}".encode()).hexdigest()[:20]
+        self.kind = kind
         self.directory = Path(root).expanduser().resolve() / namespace / kind
         self.directory.mkdir(parents=True, exist_ok=True)
         self.max_entries = max_entries
         self._writes = 0
+        self._hits = 0
+        self._misses = 0
+        self._evicted = 0
+        self._warned_capacity = False
         self._known_entries = {path.stem for path in self.directory.glob("*.pt")}
         if len(self._known_entries) > self.max_entries:
             self._evict()
@@ -82,11 +87,15 @@ class _TensorDiskCache:
     def get(self, key: str) -> Optional[Any]:
         path = self.directory / f"{key}.pt"
         if not path.is_file():
+            self._misses += 1
             return None
         try:
-            return torch.load(path, map_location="cpu", weights_only=False)
+            value = torch.load(path, map_location="cpu", weights_only=False)
         except FileNotFoundError:
+            self._misses += 1  # a concurrent eviction reads as a miss
             return None
+        self._hits += 1
+        return value
 
     def put(self, key: str, value: Any) -> None:
         path = self.directory / f"{key}.pt"
@@ -115,12 +124,34 @@ class _TensorDiskCache:
         if len(entries) <= self.max_entries:
             return
         entries.sort(key=lambda item: item[0])
-        for _, path in entries[: len(entries) - self.max_entries]:
+        doomed = entries[: len(entries) - self.max_entries]
+        for _, path in doomed:
             try:
                 path.unlink()
             except FileNotFoundError:
                 pass
+        self._evicted += len(doomed)
+        self._warn_capacity()
         self._known_entries = {path.stem for _, path in entries[-self.max_entries :] if path.exists()}
+
+    def _warn_capacity(self) -> None:
+        """Evicting at all means the working set does not fit — say so once, not silently."""
+        if self._warned_capacity:
+            return
+        self._warned_capacity = True
+        logger.warning(
+            "SFT %s cache at %s is evicting (max_entries=%d, %d entries dropped, hits=%d misses=%d). "
+            "Eviction order is by write time while training reads in shuffled order, so once the "
+            "working set stops fitting later epochs mostly miss and the cache costs more than it "
+            "saves. Raise cache_max_entries past the number of rows you train on (budget the disk: "
+            "a 512px SD3 latent is ~0.3MB/row, a T5 text condition ~4MB/row), or turn the cache off.",
+            self.kind,
+            self.directory,
+            self.max_entries,
+            self._evicted,
+            self._hits,
+            self._misses,
+        )
 
 
 def _media_stat_fingerprint(uri: str) -> Dict[str, Any]:
@@ -147,6 +178,64 @@ def _encoder_cache_is_safe(modules: Sequence[Any]) -> bool:
             if parameter.requires_grad:
                 return False
     return has_parameters
+
+
+def _sampled_parameter_values(module: Any, *, tensors: int = 8, per_tensor: int = 16) -> List[float]:
+    """A few deterministic samples from a module's weights — enough to tell checkpoints apart."""
+    parameters = [p for p in module.parameters() if not p.is_meta and p.numel()]
+    if not parameters:
+        return []
+    stride = max(1, len(parameters) // tensors)
+    values: List[float] = []
+    for parameter in parameters[::stride][:tensors]:
+        flat = parameter.detach().reshape(-1)
+        step = max(1, flat.numel() // per_tensor)
+        sampled = flat[::step][:per_tensor].to(device="cpu", dtype=torch.float64)
+        values.extend(float(value) for value in sampled.tolist())
+    return values
+
+
+_SCALAR_CONFIG_TYPES = (bool, int, float, str, torch.dtype)
+
+
+def _stage_config(stage: Any) -> Dict[str, Any]:
+    """Scalar constructor state of an encode stage — the part of its behaviour weights cannot see."""
+    if stage is None:
+        return {}
+    config: Dict[str, Any] = {}
+    for name, value in getattr(stage, "__dict__", {}).items():
+        if name.startswith("_"):
+            continue
+        if isinstance(value, _SCALAR_CONFIG_TYPES):
+            config[name] = str(value) if isinstance(value, torch.dtype) else value
+        elif isinstance(value, (tuple, list)) and all(isinstance(item, _SCALAR_CONFIG_TYPES) for item in value):
+            config[name] = [str(item) if isinstance(item, torch.dtype) else item for item in value]
+    return {"class": type(stage).__name__, "config": config}
+
+
+def _encoder_cache_fingerprint(modules: Sequence[Any], stage: Any, salt: Optional[str]) -> str:
+    """Fingerprint an encoder by what determines its output, so the cache namespace moves with it.
+
+    Entries are only valid while the code that wrote them would write them again. An
+    operator-supplied revision string cannot be trusted to track a checkpoint, dtype or
+    max-length change — reusing one across models silently trains on stale latents — so
+    the namespace is derived from the frozen weights (structure plus sampled values) and
+    the encode stage's scalar config. ``salt`` stays available for isolating caches by hand.
+    """
+    encoders: List[Any] = []
+    with torch.no_grad():
+        for module in modules:
+            encoders.append(
+                {
+                    "class": type(module).__name__,
+                    "parameters": [
+                        (name, tuple(parameter.shape), str(parameter.dtype))
+                        for name, parameter in module.named_parameters()
+                    ],
+                    "samples": _sampled_parameter_values(module),
+                }
+            )
+    return _cache_key({"salt": salt, "encoders": encoders, "stage": _stage_config(stage)})
 
 
 def _load_pil_image(uri: str):
@@ -516,32 +605,8 @@ class DiffusionSupervisedTrackBuilder(SupervisedTrackBuilder):
             )
         self.image_load_workers = image_load_workers
         cache_requested = cache_text_conditions or cache_vae_latents
-        if cache_requested and (not cache_dir or not cache_fingerprint):
-            raise ValueError(
-                "DiffusionSupervisedTrackBuilder: cache_dir and cache_fingerprint are required "
-                "when an encoder cache is enabled."
-            )
-        self._validate_encoder_cache_targets(cache_text_conditions, cache_vae_latents)
-        self._text_cache = (
-            _TensorDiskCache(
-                cache_dir,
-                fingerprint=cache_fingerprint,
-                kind="text-conditions",
-                max_entries=cache_max_entries,
-            )
-            if cache_text_conditions
-            else None
-        )
-        self._vae_cache = (
-            _TensorDiskCache(
-                cache_dir,
-                fingerprint=cache_fingerprint,
-                kind="vae-latents",
-                max_entries=cache_max_entries,
-            )
-            if cache_vae_latents
-            else None
-        )
+        if cache_requested and not cache_dir:
+            raise ValueError("DiffusionSupervisedTrackBuilder: cache_dir is required when an encoder cache is enabled.")
         align = resolution_align
         if self.height % align or self.width % align:
             raise ValueError(
@@ -565,6 +630,30 @@ class DiffusionSupervisedTrackBuilder(SupervisedTrackBuilder):
         self._conditions_kwargs: Dict[str, Any] = {"guidance_scale": self.guidance_scale}
         if "image_shape" in inspect.signature(build_conditions).parameters:
             self._conditions_kwargs["image_shape"] = (self.height, self.width)
+
+        text_encoders, vae_encoders = self._resolve_cache_encoders(cache_text_conditions, cache_vae_latents)
+        self._text_cache = (
+            _TensorDiskCache(
+                cache_dir,
+                fingerprint=_encoder_cache_fingerprint(
+                    text_encoders, getattr(pipeline, "text_embed", None), cache_fingerprint
+                ),
+                kind="text-conditions",
+                max_entries=cache_max_entries,
+            )
+            if text_encoders is not None
+            else None
+        )
+        self._vae_cache = (
+            _TensorDiskCache(
+                cache_dir,
+                fingerprint=_encoder_cache_fingerprint(vae_encoders, self._encode, cache_fingerprint),
+                kind="vae-latents",
+                max_entries=cache_max_entries,
+            )
+            if vae_encoders is not None
+            else None
+        )
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
     def build(self, records: List[Record]) -> Part:
@@ -591,12 +680,15 @@ class DiffusionSupervisedTrackBuilder(SupervisedTrackBuilder):
             metadata=[dict(record.get("metadata") or {}) for record in records],
         )
 
-    def _validate_encoder_cache_targets(
+    def _resolve_cache_encoders(
         self,
         cache_text_conditions: bool,
         cache_vae_latents: bool,
-    ) -> None:
+    ) -> Tuple[Optional[List[Any]], Optional[List[Any]]]:
+        """Vet and return the frozen modules each enabled cache stands in for (``None`` when off)."""
         bundle = self.pipeline.bundle
+        text_modules: Optional[List[Any]] = None
+        vae_modules: Optional[List[Any]] = None
         if cache_text_conditions:
             text_modules = []
             for name in ("text_encoder", "text_encoder_2", "text_encoder_3"):
@@ -609,11 +701,12 @@ class DiffusionSupervisedTrackBuilder(SupervisedTrackBuilder):
                     "frozen text encoders in eval mode."
                 )
         if cache_vae_latents:
-            vae = getattr(bundle, "vae", None)
-            if not _encoder_cache_is_safe([vae]):
+            vae_modules = [getattr(bundle, "vae", None)]
+            if not _encoder_cache_is_safe(vae_modules):
                 raise ValueError(
                     "DiffusionSupervisedTrackBuilder: cache_vae_latents requires a frozen VAE in eval mode."
                 )
+        return text_modules, vae_modules
 
     def _text_cache_key(self, record: Record) -> str:
         return _cache_key(
