@@ -51,12 +51,6 @@ class MiniMaxH3PipelineConfig:
     video_shift: float = 12.0
     audio_shift: float = 3.0
 
-    # MiniMax-H3 conditions on the UNNORMALIZED hidden state its Qwen3-VL
-    # conditioner produces after its 50th decoder layer, i.e.
-    # ``hidden_states[50]`` -- not ``last_hidden_state``. This is fixed by the
-    # checkpoint and therefore is not exposed as a config option.
-    max_sequence_length: int = 512
-
     # When True (default) video AND audio form a single joint SDE policy: audio
     # is SDE-stepped on its OWN schedule with the same ``eta`` as video, emits
     # its own per-step log-prob, and the two merge by an element-weighted mean

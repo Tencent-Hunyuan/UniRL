@@ -73,3 +73,9 @@ handler in `../../distributed/weight_sync`.
   deterministic fan-out as `n=1` requests each carrying one derived
   `sampling_seed`. Re-check both halves on a SGLang bump: dropping either one
   restores the clone, silently.
+- **SGLang request sampling lives on the Sample, not the engine config.** Direct
+  callers must `fork(..., sampling_params=ARSamplingParams(...))` before
+  `generate`. Missing or non-`ARSamplingParams` frontiers now error; in-tree
+  trainer, PE, and agentic paths already stamp this. `temperature` / `top_p` /
+  `top_k` / `max_new_tokens` are gone from `SGLangEngineConfig` — there is no
+  engine-config fallback.

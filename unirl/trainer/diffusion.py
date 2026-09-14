@@ -174,7 +174,7 @@ def _preflight_trainside_geometry(
 
 # Per-field eval knobs the overlay replaced (or dropped), and what to write instead.
 _RETIRED_EVAL_KEYS = {
-    "eval_cfg_text_scale": "eval_sampling: {guidance_scale: X}   (BAGEL family: cfg_text_scale)",
+    "eval_cfg_text_scale": "eval_sampling: {guidance_scale: X}",
     "eval_num_inference_steps": "eval_sampling: {num_inference_steps: X}",
     "eval_height": "eval_sampling: {height: X}",
     "eval_width": "eval_sampling: {width: X}",
@@ -190,12 +190,6 @@ _RETIRED_EVAL_KEYS = {
 _UNSUPPORTED_OVERLAY_FIELDS = frozenset(
     {"scheduler", "sde_strategy", "sigmas", "noise_group_ids", "init_noise_latent_shape"}
 )
-
-
-def cfg_scale_of(params: Any) -> float:
-    """The CFG scale a diffusion params object will actually be sampled with."""
-    scale = getattr(params, "cfg_text_scale", None)
-    return float(params.guidance_scale if scale is None else scale)
 
 
 def reject_retired_eval_keys(cfg: Any) -> None:
@@ -227,15 +221,6 @@ def build_eval_sampling(
     if samples_per_prompt is not None:
         updates["samples_per_prompt"] = int(samples_per_prompt)
     updates.update(_resolve_overrides(overrides, field_names))
-
-    # Only the cfg_text_scale families declare both; elsewhere the sibling is not a
-    # field at all and _resolve_overrides already rejected it.
-    if "cfg_text_scale" in field_names and "guidance_scale" in updates:
-        raise ValueError(
-            f"eval_sampling sets `guidance_scale`, which {type(base).__name__} declares but its "
-            "pipeline discards — the eval would silently run at the training CFG. "
-            "Set `cfg_text_scale` instead."
-        )
 
     steps = int(updates.get("num_inference_steps", base.num_inference_steps))
     if float(updates["eta"]) <= 0.0:
@@ -902,7 +887,7 @@ class DiffusionTrainer(BaseTrainer):
             int(eval_diffusion.num_inference_steps),
             int(eval_diffusion.height),
             int(eval_diffusion.width),
-            cfg_scale_of(eval_diffusion),
+            float(eval_diffusion.guidance_scale),
             float(eval_diffusion.eta),
             "  ".join(f"{k}={v:.4f}" for k, v in metrics.items()),
         )

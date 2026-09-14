@@ -112,9 +112,6 @@ rollout:
     backend: native
     pretrained_model_ckpt_path: ${oc.env:QWEN3_PATH,Qwen/Qwen3-4B-Base}
     tp_size: 1
-    max_new_tokens: 8192
-    temperature: 1.0
-    top_p: 1.0
     concurrency: 16
     # ARTrainer pre-expands the req by samples_per_prompt, so the engine emits
     # one completion per entry (n=1); else samples double-count.
@@ -174,10 +171,10 @@ algorithm:
   clip_range_high: null # symmetric clip — standard Dr.GRPO (the vanilla baseline uses 0.28)
   clip_schedule: constant
   loss_agg_mode: seq-mean-token-sum-norm # per-seq token-sum / horizon, mean over seqs
-  horizon: 8192 # fixed length normalizer for seq-mean-token-sum-norm (= max_new_tokens)
+  horizon: ${sampling.max_new_tokens} # fixed length normalizer for seq-mean-token-sum-norm (= max_new_tokens)
   # 1.0 — must equal sampling.temperature below so replay's log_softmax(logits/T)
   # matches the SGLang sampler's tempered output_token_logprobs (ratio_mean ≈ 1).
-  sampling_temperature: 1.0
+  sampling_temperature: ${sampling.temperature}
   conditions_cls:
     _target_: hydra.utils.get_class
     path: unirl.models.qwen3.conditions.Qwen3ARConditions

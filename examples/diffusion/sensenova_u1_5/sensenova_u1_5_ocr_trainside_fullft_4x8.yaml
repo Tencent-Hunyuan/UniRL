@@ -175,7 +175,3 @@ eval_sampling:
   height: 320
   width: 320
   eta: 0.0
-  # DiffusionSamplingParams keeps a legacy alias. Set both so replacing a
-  # training value of four really produces one deterministic eval sample.
-  samples_per_prompt: 1
-  num_samples_per_prompt: 1
