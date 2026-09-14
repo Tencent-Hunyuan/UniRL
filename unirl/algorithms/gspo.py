@@ -15,6 +15,7 @@ from .base import (
     BaseAlgorithmConfig,
     StageAlgorithm,
     _grpo_clip_loss,
+    _prepare_ar_logp_anchor,
     _resolve_clip_range_from_schedule,
     rollout_replay_k3,
     rollout_replay_logp_absdiff,
@@ -37,6 +38,7 @@ class GSPO(StageAlgorithm):
     supports_multi_update = True
     anchor_fields = ("log_probs", "rollout_log_probs")
 
+    @property
     def recomputes_anchor(self) -> bool:
         return self.old_logp_source == "replay"
 
@@ -83,20 +85,14 @@ class GSPO(StageAlgorithm):
         segment: "TextSegment",
     ) -> None:
         """Freeze the selected π_old anchor before optimizer updates."""
-        if segment.tokens is None or segment.log_probs is None or int(segment.tokens.shape[0]) == 0:
-            return
-        if segment.rollout_log_probs is None:
-            segment.rollout_log_probs = segment.log_probs.detach().cpu().clone()
-        if self.old_logp_source == "rollout":
-            return
-        typed_conds = typed_conditions(conditions, self.conditions_cls)
-        with torch.no_grad():
-            frozen = self.stage.replay(
-                typed_conds,
-                segment=segment,
-                temperature=self.sampling_temperature,
-            )
-        segment.log_probs = frozen.detach().cpu()
+        _prepare_ar_logp_anchor(
+            stage=self.stage,
+            conditions=conditions,
+            segment=segment,
+            conditions_cls=self.conditions_cls,
+            old_logp_source=self.old_logp_source,
+            sampling_temperature=self.sampling_temperature,
+        )
 
     def compute_loss_and_backward(
         self,
@@ -123,7 +119,13 @@ class GSPO(StageAlgorithm):
             else _resolve_clip_range_from_schedule(self.clip_range_high, self.clip_schedule, training_progress)
         )
 
-        seq_new, seq_old, seq_adv = self._reduce_to_sequences(new_logp, old_logp, advantages, segment.lengths)
+        seq_new, seq_old, seq_adv = self._reduce_to_sequences(
+            new_logp,
+            old_logp,
+            advantages,
+            segment.lengths,
+            loss_mask=segment.loss_mask,
+        )
         if seq_new.numel() == 0:
             return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
 
@@ -161,6 +163,8 @@ class GSPO(StageAlgorithm):
         old_logp: torch.Tensor,
         advantages: torch.Tensor,
         lengths: torch.Tensor,
+        *,
+        loss_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Reduce packed per-token log-probs to one length-normalized value per sequence via a segment-sum."""
         device = new_logp.device
@@ -170,12 +174,21 @@ class GSPO(StageAlgorithm):
             raise ValueError(f"GSPO: advantages batch={int(advantages.shape[0])} != sequences={num_seqs}")
 
         seg_ids = torch.repeat_interleave(torch.arange(num_seqs, device=device), lengths)
-        denom = lengths.to(new_logp.dtype).clamp(min=1)
+        if loss_mask is not None:
+            mask = loss_mask.to(dtype=new_logp.dtype, device=device)
+            new_logp = new_logp * mask
+            old_logp = old_logp * mask
+            denom = new_logp.new_zeros(num_seqs).index_add(0, seg_ids, mask)
+            valid = denom > 0
+        else:
+            denom = lengths.to(new_logp.dtype)
+            valid = lengths > 0
+
+        denom = denom.clamp(min=1)
         seq_new = new_logp.new_zeros(num_seqs).index_add(0, seg_ids, new_logp) / denom
         seq_old = old_logp.new_zeros(num_seqs).index_add(0, seg_ids, old_logp) / denom
         seq_adv = advantages.detach().to(dtype=new_logp.dtype, device=device)
 
-        valid = lengths > 0
         if bool(valid.all()):
             return seq_new, seq_old, seq_adv
         return seq_new[valid], seq_old[valid], seq_adv[valid]

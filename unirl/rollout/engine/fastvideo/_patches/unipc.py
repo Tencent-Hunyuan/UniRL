@@ -1,124 +1,30 @@
-"""FastVideo adapter routing deterministic non-SDE steps through UniPC; integration contract in README.md."""
+"""Route FastVideo's deterministic non-SDE steps through UniRL's canonical UniPC; contract in README.md."""
 
 from __future__ import annotations
 
-import dataclasses
 import functools
-import importlib
-import inspect
-import os
 from dataclasses import dataclass, field
 from typing import Any, Optional, Tuple
 
 import numpy as np
 import torch
 
-from unirl.models.wan21.diffusion import WAN21DiffusionStep
-from unirl.rollout.engine.sigma_verify import verify_engine_used_sigmas
+from unirl.rollout.engine.fastvideo._patches.compat import (
+    SDE_STEP_PARAMS,
+    SET_TIMESTEPS_PARAMS,
+    import_fastvideo_module,
+    require_attr,
+    require_signature,
+)
 from unirl.sde.unipc import UniPCSpec, UniPCStrategy
 
-# The exact fork surface these patches target; drift fails closed at patch time (README: pin).
-_PINNED_FORK = "Zcchill/FastVideo@7fe1d7db9a0b8aebb46679e7924f597431f23665"
 
-_SET_TIMESTEPS_PARAMS = (
-    "self",
-    "num_inference_steps",
-    "device",
-    "sigmas",
-    "mu",
-    "shift",
-    "use_karras_sigmas",
-    "use_kerras_sigma",
-)
-_SDE_STEP_PARAMS = (
-    "scheduler",
-    "model_output",
-    "timestep",
-    "sample",
-    "prev_sample",
-    "generator",
-    "deterministic",
-    "return_pixel_log_prob",
-    "return_dt_and_std_dev_t",
-    "eta",
-    "sde_type",
-)
-_RL_DATA_FIELDS = frozenset(
-    {
-        "enabled",
-        "collect_log_probs",
-        "store_trajectory",
-        "keep_trajectory_on_cpu",
-        "sde_step_indices",
-        "sde_type",
-        "log_probs",
-        "trajectory_latents",
-        "trajectory_timesteps",
-    }
-)
-
-
-def _import_fastvideo_module(module_name: str, what: str) -> Any:
-    """Import a fastvideo module, distinguishing a missing integration surface from unrelated import errors."""
-    try:
-        return importlib.import_module(module_name)
-    except ModuleNotFoundError as exc:
-        if exc.name is not None and not module_name.startswith(f"{exc.name}.") and exc.name != module_name:
-            raise
-        raise RuntimeError(f"FastVideo UniPC integration requires {what} (pinned surface: {_PINNED_FORK})") from exc
-
-
-def _require_attr(owner: Any, name: str, what: str) -> Any:
-    """Fetch ``owner.name`` or fail closed naming the pinned integration surface."""
-    value = getattr(owner, name, None)
-    if value is None:
-        raise RuntimeError(f"FastVideo UniPC integration requires {what} (pinned surface: {_PINNED_FORK})")
-    return value
-
-
-def _require_signature(fn: Any, expected: Tuple[str, ...], what: str) -> None:
-    """Fingerprint a patched callable's parameter list so fork drift fails at patch time, not mid-rollout."""
-    actual = tuple(inspect.signature(fn).parameters)
-    if actual != expected:
-        raise RuntimeError(
-            f"FastVideo {what} drifted from the pinned integration surface ({_PINNED_FORK}): "
-            f"expected parameters {expected}, got {actual}"
-        )
-
-
-def _verify_rl_data_surface() -> None:
-    """Fail closed unless ``ForwardBatch.RLData`` carries every field the engine-side integration relies on."""
-    module = _import_fastvideo_module("fastvideo.pipelines.pipeline_batch_info", "ForwardBatch.RLData")
-    forward_batch = _require_attr(module, "ForwardBatch", "ForwardBatch.RLData")
-    rl_data = _require_attr(forward_batch, "RLData", "ForwardBatch.RLData")
-    names = {f.name for f in dataclasses.fields(rl_data)}
-    missing = sorted(_RL_DATA_FIELDS - names)
-    if missing:
-        raise RuntimeError(
-            f"FastVideo ForwardBatch.RLData lacks fields {missing} required by the UniPC "
-            f"integration (pinned surface: {_PINNED_FORK})"
-        )
-
-
-def _require_float_wan_timesteps() -> None:
-    """Reject FastVideo's post-scheduler integer cast, which its echo cannot expose."""
-    if os.getenv("DIFFUSIONRL_FASTVIDEO_DANCEGRPO_TIMESTEP_LONG", "0").strip().lower() in ("1", "true", "yes"):
-        raise RuntimeError(
-            "FastVideo canonical UniPC requires floating WAN timesteps; "
-            "unset DIFFUSIONRL_FASTVIDEO_DANCEGRPO_TIMESTEP_LONG"
-        )
-
-
-def _wan_timestep_scale(scheduler: Any) -> float:
-    """Return the model-owned scale after validating the worker scheduler contract."""
-    expected = float(WAN21DiffusionStep.TIMESTEP_SCALE)
+def _scheduler_timestep_scale(scheduler: Any) -> float:
+    """Return the live scheduler's own timestep scale, which ``index_for_timestep`` matches against."""
     actual = getattr(scheduler.config, "num_train_timesteps", None)
-    if actual != expected:
-        raise RuntimeError(
-            "FastVideo scheduler num_train_timesteps does not match the WAN21 model "
-            f"timestep scale: scheduler={actual!r}, model={expected:g}"
-        )
-    return expected
+    if not isinstance(actual, (int, float)) or not float(actual) > 0.0:
+        raise RuntimeError(f"FastVideo scheduler has no usable num_train_timesteps: {actual!r}")
+    return float(actual)
 
 
 @dataclass(frozen=True)
@@ -128,6 +34,7 @@ class FastVideoUniPCPlan:
     sde_type: str
     sde_indices: Tuple[int, ...]
     spec: UniPCSpec = field(default_factory=UniPCSpec)
+    timestep_scale: float = 0.0
 
     def __post_init__(self) -> None:
         canonical = str(self.sde_type).strip().lower()
@@ -138,8 +45,14 @@ class FastVideoUniPCPlan:
             raise ValueError(f"FastVideo UniPC requires sorted unique non-negative SDE indices; got {indices}")
         if not isinstance(self.spec, UniPCSpec):
             raise ValueError(f"FastVideo UniPC plan requires a UniPCSpec; got {type(self.spec).__name__}")
+        scale = float(self.timestep_scale)
+        if not scale > 0.0:
+            raise ValueError(
+                f"FastVideo UniPC requires the model-owned positive timestep_scale; got {self.timestep_scale!r}"
+            )
         object.__setattr__(self, "sde_type", canonical)
         object.__setattr__(self, "sde_indices", indices)
+        object.__setattr__(self, "timestep_scale", scale)
 
 
 def _strategy_from_plan(scheduler: Any, plan: FastVideoUniPCPlan) -> UniPCStrategy:
@@ -160,15 +73,15 @@ def _strategy_from_plan(scheduler: Any, plan: FastVideoUniPCPlan) -> UniPCStrate
 
 def _patch_scheduler_set_timesteps() -> None:
     """Wrap ``FlowUniPCMultistepScheduler.set_timesteps`` to consume canonical sigmas verbatim with float timesteps."""
-    module = _import_fastvideo_module(
+    module = import_fastvideo_module(
         "fastvideo.models.schedulers.scheduling_flow_unipc_multistep", "FlowUniPCMultistepScheduler"
     )
-    FlowUniPCMultistepScheduler = _require_attr(module, "FlowUniPCMultistepScheduler", "FlowUniPCMultistepScheduler")
+    FlowUniPCMultistepScheduler = require_attr(module, "FlowUniPCMultistepScheduler", "FlowUniPCMultistepScheduler")
 
     original = FlowUniPCMultistepScheduler.set_timesteps
     if getattr(original, "_unirl_canonical_sigmas", False):
         return
-    _require_signature(original, _SET_TIMESTEPS_PARAMS, "FlowUniPCMultistepScheduler.set_timesteps")
+    require_signature(original, SET_TIMESTEPS_PARAMS, "FlowUniPCMultistepScheduler.set_timesteps")
 
     @functools.wraps(original)
     def set_timesteps(
@@ -193,6 +106,7 @@ def _patch_scheduler_set_timesteps() -> None:
                 use_kerras_sigma=use_kerras_sigma,
             )
             self._unirl_canonical_schedule = False
+            self._unirl_timestep_scale = None
             self._unirl_unipc_strategy = None
             self._unirl_device_sigmas = None
             return
@@ -224,7 +138,7 @@ def _patch_scheduler_set_timesteps() -> None:
         if str(getattr(self.config, "final_sigmas_type", "zero")) != "zero":
             raise ValueError("FastVideo canonical UniPC requires final_sigmas_type='zero'")
 
-        timestep_scale = _wan_timestep_scale(self)
+        timestep_scale = _scheduler_timestep_scale(self)
         terminal = np.zeros(1, dtype=np.float32)
         schedule = np.concatenate([external, terminal])
         self.sigmas = torch.from_numpy(schedule).cpu()
@@ -242,6 +156,7 @@ def _patch_scheduler_set_timesteps() -> None:
         # The strategy is built lazily at the first UniPC-dispatched denoising
         # call, from the request plan's model-owned spec (README: dispatch).
         self._unirl_canonical_schedule = True
+        self._unirl_timestep_scale = timestep_scale
         self._unirl_unipc_strategy = None
         self._unirl_device_sigmas = None
 
@@ -261,13 +176,13 @@ def _single_step_index(scheduler: Any, timestep: Any) -> int:
 
 def _patch_denoising_step() -> None:
     """Wrap ``sde_step_with_logprob`` to dispatch plan indices to SDE kernels and all other indices to UniPC."""
-    denoising = _import_fastvideo_module(
+    denoising = import_fastvideo_module(
         "fastvideo.pipelines.stages.denoising", "pipelines.stages.denoising.sde_step_with_logprob"
     )
-    original = _require_attr(denoising, "sde_step_with_logprob", "pipelines.stages.denoising.sde_step_with_logprob")
+    original = require_attr(denoising, "sde_step_with_logprob", "pipelines.stages.denoising.sde_step_with_logprob")
     if getattr(original, "_unirl_unipc_dispatch", False):
         return
-    _require_signature(original, _SDE_STEP_PARAMS, "sde_step_with_logprob")
+    require_signature(original, SDE_STEP_PARAMS, "sde_step_with_logprob")
 
     @functools.wraps(original)
     def sde_step_with_logprob(
@@ -330,6 +245,12 @@ def _patch_denoising_step() -> None:
                 raise RuntimeError(
                     "FastVideo worker did not install the canonical UniPC schedule patch before denoising"
                 )
+            if float(getattr(scheduler, "_unirl_timestep_scale", 0.0)) != float(sde_type.timestep_scale):
+                raise RuntimeError(
+                    "FastVideo scheduler was pinned with a different model timestep scale than this request's "
+                    f"plan: scheduler={getattr(scheduler, '_unirl_timestep_scale', None)!r}, "
+                    f"plan={sde_type.timestep_scale!r}"
+                )
             strategy = _strategy_from_plan(scheduler, sde_type)
             strategy.init_schedule(scheduler.sigmas)
             scheduler._unirl_unipc_strategy = strategy
@@ -364,62 +285,10 @@ def _patch_denoising_step() -> None:
     denoising.sde_step_with_logprob = sde_step_with_logprob
 
 
-def _patch_worker_runtime() -> None:
-    _require_float_wan_timesteps()
+def patch_unipc() -> None:
+    """Pin the scheduler to canonical sigmas, then dispatch non-SDE step indices to UniPC."""
     _patch_scheduler_set_timesteps()
     _patch_denoising_step()
 
 
-def _worker_main_with_unipc(*args, **kwargs):
-    """Spawn-safe FastVideo worker entrypoint that installs runtime patches."""
-    _patch_worker_runtime()
-    from fastvideo.worker.multiproc_executor import WorkerMultiprocProc
-
-    original = getattr(WorkerMultiprocProc, "_unirl_original_worker_main", WorkerMultiprocProc.worker_main)
-    if original is _worker_main_with_unipc:
-        raise RuntimeError("FastVideo worker entrypoint patch lost the original worker_main")
-    return original(*args, **kwargs)
-
-
-def _patch_worker_entrypoint() -> None:
-    module = _import_fastvideo_module("fastvideo.worker.multiproc_executor", "MultiprocExecutor workers")
-    WorkerMultiprocProc = _require_attr(module, "WorkerMultiprocProc", "MultiprocExecutor workers")
-
-    current = WorkerMultiprocProc.worker_main
-    if current is _worker_main_with_unipc:
-        return
-    WorkerMultiprocProc._unirl_original_worker_main = current
-    WorkerMultiprocProc.worker_main = staticmethod(_worker_main_with_unipc)
-
-
-def patch_fastvideo_unipc() -> None:
-    """Install idempotent parent, worker-entrypoint, and runtime patches after fingerprinting the fork surface."""
-    _verify_rl_data_surface()
-    _patch_worker_runtime()
-    _patch_worker_entrypoint()
-
-
-def verify_fastvideo_used_sigmas(
-    actual: Any,
-    *,
-    expected: torch.Tensor,
-    sample_index: int,
-) -> None:
-    """Verify FastVideo's echoed timesteps against the canonical sigma schedule."""
-    actual_with_terminal = actual
-    if actual is not None:
-        actual_t = actual.detach().cpu() if torch.is_tensor(actual) else torch.as_tensor(actual)
-        if actual_t.ndim == 1 and int(actual_t.shape[0]) == int(expected.shape[0]) - 1:
-            actual_with_terminal = torch.cat([actual_t, torch.zeros(1, dtype=actual_t.dtype)])
-    verify_engine_used_sigmas(
-        actual_with_terminal,
-        expected=expected,
-        engine_name=f"fastvideo sample {sample_index}",
-    )
-
-
-__all__ = [
-    "FastVideoUniPCPlan",
-    "patch_fastvideo_unipc",
-    "verify_fastvideo_used_sigmas",
-]
+__all__ = ["FastVideoUniPCPlan", "patch_unipc"]

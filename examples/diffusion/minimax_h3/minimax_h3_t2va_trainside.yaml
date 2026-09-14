@@ -41,7 +41,7 @@ bundle:
   _target_: unirl.models.minimax_h3.bundle.MiniMaxH3Bundle.from_config
   config:
     _target_: unirl.models.minimax_h3.config.MiniMaxH3PipelineConfig
-    # Required local snapshot: meta-init's sharded loader does not accept HF repo IDs.
+    # Accepts a Hub ID or local snapshot; meta-init resolves transformer shards locally.
     pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL}
     model_precision: bf16
     # Both VAEs are fp32 by checkpoint contract. The AUDIO VAE especially:
@@ -183,12 +183,8 @@ reward:
   _target_: unirl.reward.service.RewardService
   backend:
     _target_: unirl.reward.local.t2av_composite.T2AVCompositeScorer
-    base_device: cpu
     config:
       _target_: unirl.reward.local.t2av_composite.T2AVCompositeSpec
-      device: cpu
-      batch_size: 2
-      frame_selection: middle
       # videopickscore scores the middle frame (image-text alignment), and
       # clap scores generated-audio-vs-text. Neither measures motion or A/V
       # sync; the only real sync scorer is imagebind, which is CC-BY-NC-SA and
@@ -196,6 +192,22 @@ reward:
       weights:
         videopickscore: 0.5
         clap: 0.5
+      scorers:
+        videopickscore:
+          _target_: unirl.reward.local.video_pickscore.VideoPickScoreScorer
+          base_device: cpu
+          config:
+            _target_: unirl.reward.local.video_pickscore.VideoPickScoreSpec
+            batch_size: 2
+            device: cpu
+            frame_selection: middle
+        clap:
+          _target_: unirl.reward.local.clap.CLAPRewardScorer
+          base_device: cpu
+          config:
+            _target_: unirl.reward.local.clap.CLAPSpec
+            batch_size: 2
+            device: cpu
 
 algorithm:
   _target_: unirl.algorithms.flowgrpo.FlowGRPO

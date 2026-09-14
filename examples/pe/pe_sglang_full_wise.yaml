@@ -187,6 +187,7 @@ ar:
     stage_attr: ar
     clip_range: 1.0e-2 # AR track — diffusion track above keeps 1e-4
     clip_schedule: constant
+    sampling_temperature: ${sampling.ar.temperature}
     conditions_cls:
       _target_: hydra.utils.get_class
       path: unirl.models.qwen3.conditions.Qwen3ARConditions
@@ -227,9 +228,6 @@ rollout:
       backend: native
       pretrained_model_ckpt_path: ${oc.env:LLM_MODEL,Qwen/Qwen3-0.6B}
       tp_size: 1
-      max_new_tokens: 1024          # headroom for Qwen3 <think> + the revised prompt
-      temperature: 0.7
-      top_p: 0.9
       concurrency: 4
       engine_kwargs:
         mem_fraction_static: 0.25

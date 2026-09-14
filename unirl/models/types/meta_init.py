@@ -2,13 +2,84 @@
 
 from __future__ import annotations
 
+import glob
+import json
 import logging
+import os
+import re
 from typing import Callable, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_safetensors(weights_path: str, checkpoint_path: str, expected: str) -> None:
+    paths = glob.glob(os.path.join(glob.escape(weights_path), "*.safetensors"))
+    shards = {os.path.basename(path) for path in paths if os.path.isfile(path)}
+    if not os.path.isdir(weights_path) or not shards:
+        raise ValueError(f"Meta-init checkpoint {checkpoint_path!r} does not contain expected {expected!r}.")
+
+    incomplete_index = None
+    for index_path in glob.glob(os.path.join(glob.escape(weights_path), "*.safetensors.index.json")):
+        try:
+            with open(index_path) as handle:
+                weight_map = json.load(handle)["weight_map"]
+            if (
+                not isinstance(weight_map, dict)
+                or not weight_map
+                or not all(isinstance(name, str) for name in weight_map.values())
+            ):
+                raise TypeError("weight_map must be a non-empty string mapping")
+            referenced = {os.path.basename(name) for name in weight_map.values()}
+        except (OSError, KeyError, TypeError, AttributeError, ValueError):
+            continue
+        if referenced <= shards:
+            return
+        if referenced & shards:
+            incomplete_index = referenced
+
+    numbered: dict[tuple[str, int], set[int]] = {}
+    for shard in shards:
+        match = re.match(r"^(.*)-(\d+)-of-(\d+)\.safetensors$", shard)
+        if not match:
+            return
+        numbered.setdefault((match.group(1), int(match.group(3))), set()).add(int(match.group(2)))
+
+    if any(present == set(range(1, total + 1)) for (_, total), present in numbered.items()):
+        return
+    if incomplete_index is not None:
+        missing = sorted(incomplete_index - shards)
+        raise ValueError(f"Meta-init checkpoint {checkpoint_path!r} is incomplete; missing shard(s): {missing[:8]}.")
+    if numbered:
+        (_, total), present = max(numbered.items(), key=lambda item: len(item[1]))
+        missing = sorted(set(range(1, total + 1)) - present)
+        raise ValueError(
+            f"Meta-init checkpoint {checkpoint_path!r} is incomplete; missing numbered shard(s): {missing[:8]}."
+        )
+
+
+def resolve_meta_init_weights(checkpoint_path: str, *, component: Optional[str] = None) -> str:
+    """Resolve and validate the local safetensors directory for a meta-init bundle."""
+    snapshot_path = checkpoint_path
+    expected = os.path.join(component, "*.safetensors") if component else "*.safetensors"
+    if not os.path.isdir(snapshot_path):
+        from huggingface_hub import snapshot_download
+
+        try:
+            snapshot_path = snapshot_download(
+                repo_id=checkpoint_path,
+                allow_patterns=[expected, f"{expected}.index.json"],
+            )
+        except Exception as exc:
+            raise ValueError(
+                f"Meta-init checkpoint {checkpoint_path!r} could not be resolved; expected {expected!r}: {exc}"
+            ) from exc
+
+    weights_path = os.path.join(snapshot_path, component) if component else snapshot_path
+    _validate_safetensors(weights_path, checkpoint_path, expected)
+    return weights_path
 
 
 def capture_init_state(model: nn.Module) -> dict:
@@ -172,6 +243,7 @@ def build_meta_init_transformer(
 
 
 __all__ = [
+    "resolve_meta_init_weights",
     "capture_init_state",
     "restore_init_state",
     "recover_rope_inv_freq",

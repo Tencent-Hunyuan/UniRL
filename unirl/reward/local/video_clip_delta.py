@@ -31,6 +31,9 @@ class VideoCLIPDeltaScorer(PickScoreRewardScorer):
         self.source_sim_floor = float(getattr(config, "source_sim_floor", 0.3))
         super().__init__(config=config, base_device=base_device)
 
+    def covers_prompt_video(self) -> bool:
+        return True
+
     @staticmethod
     def _sample_frames_pil(video: "Video", k: int) -> list["Image.Image"]:
         """K evenly-spaced frames of a per-sample ``Video`` (frames ``[T, C, H, W]``)."""

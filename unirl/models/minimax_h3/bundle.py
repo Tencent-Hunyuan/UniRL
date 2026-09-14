@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import torch
 from torch import nn
 
 from unirl.models.types.bundle import Bundle
-from unirl.models.types.meta_init import build_meta_init_transformer
+from unirl.models.types.meta_init import build_meta_init_transformer, resolve_meta_init_weights
 from unirl.utils.dtypes import parse_torch_dtype
 
 from .config import MiniMaxH3PipelineConfig
@@ -35,7 +34,7 @@ class MiniMaxH3Bundle(Bundle):
         dtype: torch.dtype,
         device: torch.device,
         pretrained_path: str,
-        max_sequence_length: int,
+        text_encoder_onload_for_embed: bool,
     ) -> None:
         super().__init__()
         self.transformer = transformer
@@ -50,7 +49,7 @@ class MiniMaxH3Bundle(Bundle):
         # (``.type``) off it -- pass it straight to ``.to()`` / ``device=``.
         self.device = device
         self.pretrained_path = pretrained_path
-        self.max_sequence_length = max_sequence_length
+        self.text_encoder_onload_for_embed = text_encoder_onload_for_embed
 
     @classmethod
     def from_config(cls, config: MiniMaxH3PipelineConfig) -> "MiniMaxH3Bundle":
@@ -58,12 +57,6 @@ class MiniMaxH3Bundle(Bundle):
         from transformers import AutoProcessor, AutoTokenizer, Qwen3VLForConditionalGeneration
 
         path = config.pretrained_model_ckpt_path
-        transformer_weights_path = os.path.join(path, "transformer")
-        if config.meta_init_transformer and not os.path.isdir(transformer_weights_path):
-            raise ValueError(
-                "MiniMaxH3Bundle: meta-init requires pretrained_model_ckpt_path to be a local snapshot root "
-                f"containing transformer/*.safetensors; got {path!r}. Set PRETRAINED_MODEL to a downloaded snapshot."
-            )
         vae_path = config.vae_ckpt_path or path
         te_path = config.text_encoder_ckpt_path or path
 
@@ -95,6 +88,7 @@ class MiniMaxH3Bundle(Bundle):
         # explicit `keep_in_fp32` hand-off below.
         meta_init_state = None
         if config.meta_init_transformer:
+            transformer_weights_path = resolve_meta_init_weights(path, component="transformer")
             transformer_config = MiniMaxH3Transformer3DModel.load_config(path, subfolder="transformer")
             transformer, meta_init_state = build_meta_init_transformer(
                 lambda: MiniMaxH3Transformer3DModel.from_config(transformer_config),
@@ -141,7 +135,7 @@ class MiniMaxH3Bundle(Bundle):
             dtype=dtype,
             device=device,
             pretrained_path=path,
-            max_sequence_length=int(config.max_sequence_length),
+            text_encoder_onload_for_embed=config.text_encoder_onload_for_embed,
         )
         if config.meta_init_transformer:
             # Diffusers layout: the backend's sharded loader reads the

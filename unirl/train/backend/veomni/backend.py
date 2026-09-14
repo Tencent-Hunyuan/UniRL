@@ -8,7 +8,12 @@ import torch
 
 from unirl.models.types.bundle import Bundle
 from unirl.models.types.post_materialize import apply_deferred_ops
-from unirl.train.backend.base import LrSchedulerConfig, OptimizerConfig, resolve_trainable_module
+from unirl.train.backend.base import (
+    ExpertWeightExportTransform,
+    LrSchedulerConfig,
+    OptimizerConfig,
+    resolve_trainable_module,
+)
 from unirl.train.backend.base_backend import BaseFSDP2Backend
 from unirl.train.backend.sharded_load import load_trainable_weights
 from unirl.train.backend.sharded_state import (
@@ -23,6 +28,7 @@ from unirl.train.backend.veomni.ep.checkpoint import (
     load_ep_model_state_dict,
     load_ep_optimizer_state_dict,
 )
+from unirl.train.backend.veomni.ep.experts import resolve_expert_weight_export_transform
 from unirl.train.backend.veomni.ep.placement import has_ep_params
 from unirl.train.backend.veomni.state import clip_grad_norm, veomni_offload, veomni_onload
 from unirl.train.backend.veomni.wrap import veomni_parallelize
@@ -31,7 +37,9 @@ from unirl.train.configs import (
     EmaLoraConfig,
     FSDPConfig,
     LoraConfig,
+    normalize_fsdp_mode,
 )
+from unirl.utils.distributed_utils import ensure_dist_initialized
 from unirl.utils.dtypes import parse_torch_dtype
 
 
@@ -61,7 +69,7 @@ class VeOmniBackend(BaseFSDP2Backend):
         from unirl.train.backend.veomni import _compat
 
         _, _, local_rank = _compat.rank_world_local()
-        _compat.ensure_dist_initialized(local_rank)
+        ensure_dist_initialized(local_rank)
         import torch.distributed as dist
 
         self._rank = dist.get_rank() if dist.is_initialized() else int(rank)
@@ -116,6 +124,12 @@ class VeOmniBackend(BaseFSDP2Backend):
             activation_checkpointing=fsdp_cfg.activation_checkpointing,
             use_torch_compile=fsdp_cfg.use_torch_compile,
         )
+        model_has_ep = has_ep_params(model)
+        if (self._ep_size > 1) != model_has_ep:
+            raise RuntimeError(
+                f"VeOmniBackend: inconsistent EP placement: ep_size={self._ep_size}, "
+                f"model_has_ep_params={model_has_ep}."
+            )
 
         # Install Ulysses hooks after VeOmni parallelization.
         from unirl.train.backend.veomni.sp import apply_sequence_parallelism
@@ -176,6 +190,10 @@ class VeOmniBackend(BaseFSDP2Backend):
             "ep_size": self._ep_size,
         }
 
+    def expert_weight_export_transform(self) -> Optional[ExpertWeightExportTransform]:
+        """Resolve the transform exporting this model's EP-sharded expert weights."""
+        return resolve_expert_weight_export_transform(self.model) if self._ep_size > 1 else None
+
     def _gather_optimizer_state(self) -> StateDict:
         if has_ep_params(self.model):
             return gather_ep_optimizer_state_dict(self.model, self.optimizer)
@@ -210,7 +228,7 @@ class VeOmniBackend(BaseFSDP2Backend):
 
 def _validate_fsdp_cfg(fsdp_cfg: FSDPConfig) -> None:
     """Assert the v1-supported FSDPConfig subset (fail fast, actionably)."""
-    if str(fsdp_cfg.fsdp_mode).strip().lower() != "full":
+    if normalize_fsdp_mode(fsdp_cfg.fsdp_mode) != "full":
         raise ValueError(
             f"VeOmniBackend: fsdp_mode={fsdp_cfg.fsdp_mode!r} unsupported (v1 supports 'full'; "
             "HSDP/hybrid stays on FSDPBackend)."

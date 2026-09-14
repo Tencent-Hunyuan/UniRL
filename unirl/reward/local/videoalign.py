@@ -607,6 +607,9 @@ class VideoAlignRewardScorer(LocalRewardBackend):
         self._mq_coef = float(getattr(config, "mq_coef", 1.0))
         self._ta_coef = float(getattr(config, "ta_coef", 1.0))
 
+    def covers_prompt_video(self) -> bool:
+        return self._ta_coef > 0.0
+
     def _load_model(self) -> None:
         os.environ.setdefault("FORCE_QWENVL_VIDEO_READER", "decord")
         checkpoint_path = self.model_kwargs.get("checkpoint_path") or os.environ.get("VIDEOALIGN_CKPT")

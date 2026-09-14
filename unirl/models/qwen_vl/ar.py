@@ -203,6 +203,7 @@ class QwenVLARStage(ARStage[QwenVLARConditions]):
                 "attention_mask": model_kwargs.get("attention_mask"),
                 "cache_position": model_kwargs.get("cache_position"),
                 "use_cache": True,
+                "logits_to_keep": 1,
             }
             if is_first_step:
                 if "pixel_values" in model_kwargs:

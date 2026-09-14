@@ -23,6 +23,7 @@ from unirl.rollout.engine.vllm_omni.pipelines._shared.interception import (
     make_sde_scheduler,
     resolve_request_noise,
     single_request,
+    slice_request_denoise_seed_keys,
     stamp_capture,
 )
 
@@ -83,7 +84,16 @@ class RLHunyuanVideo15Pipeline(HunyuanVideo15Pipeline):
         """This request's SDE strength + sparse step gate."""
         eta = float(getattr(req.sampling_params, "eta", 0.0) or 0.0)
         extra = getattr(req.sampling_params, "extra_args", None) or {}
-        self.scheduler.arm(eta=eta, sde_indices=extra.get("sde_indices"))
+        denoise_seed_keys = slice_request_denoise_seed_keys(
+            req,
+            caller="RLHunyuanVideo15Pipeline._arm_sde",
+        )
+        self.scheduler.arm(
+            eta=eta,
+            sde_indices=extra.get("sde_indices"),
+            denoise_seed_keys=denoise_seed_keys,
+            denoise_base_seed=int(extra.get("denoise_base_seed", 0)),
+        )
 
     def _arm_initial_noise(self, req: OmniDiffusionRequest) -> None:
         """This request's driver-authored x_T (batch slice or recipe row)."""

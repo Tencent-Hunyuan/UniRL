@@ -7,8 +7,8 @@
 # from <ckpt>/transformer post-shard, and the bundle's CPU-twin restore
 # repairs init-computed state like PatchEmbed's non-persistent pos_embed).
 #
-# PRETRAINED_MODEL must point at a LOCAL SD3.5-medium dir for this recipe
-# (the post-shard load reads <path>/transformer/*.safetensors directly).
+# PRETRAINED_MODEL accepts an SD3.5-medium Hub ID or local snapshot; meta-init
+# resolves and validates transformer/*.safetensors before auxiliary models load.
 
 num_devices: 8
 batch_size: 48                # prompts_per_rollout

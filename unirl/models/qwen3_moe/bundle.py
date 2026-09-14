@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 
 from unirl.models.types.bundle import Bundle
-from unirl.models.types.meta_init import finalize_meta_init
+from unirl.models.types.meta_init import finalize_meta_init, resolve_meta_init_weights
 from unirl.utils.dtypes import canonical_torch_dtype_name, parse_torch_dtype
 
 
@@ -69,6 +69,7 @@ class Qwen3MoeBundle(Bundle):
                 "Qwen3MoeBundle requires meta_init_transformer=true: VeOmniBackend "
                 "materializes and loads this EP model only after parallelization."
             )
+        transformer_weights_path = resolve_meta_init_weights(pretrained_model_ckpt_path)
 
         from unirl.train.backend.veomni import _compat
 
@@ -113,7 +114,7 @@ class Qwen3MoeBundle(Bundle):
             device=device,
             pretrained_path=pretrained_model_ckpt_path,
         )
-        bundle._transformer_weights_path = pretrained_model_ckpt_path
+        bundle._transformer_weights_path = transformer_weights_path
         return bundle
 
 
