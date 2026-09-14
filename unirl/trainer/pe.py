@@ -20,10 +20,15 @@ from unirl.distributed.tensor import hydrate
 from unirl.models.pe.pipeline import PEPipeline
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample
-from unirl.trainer.eval_suites import build_eval_suites
+from unirl.trainer.eval_suites import build_eval_suites, pad_eval_inputs
 from unirl.trainer.hydra import parse_hydra_cfg, remote_hydra
 from unirl.types.sample import Sample
-from unirl.types.sampling import ARSamplingParams, BaseSamplingParams, DiffusionSamplingParams
+from unirl.types.sampling import (
+    ARSamplingParams,
+    BaseSamplingParams,
+    DiffusionSamplingParams,
+    total_samples_per_prompt,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -279,11 +284,14 @@ class PETrainer(BaseTrainer):
         all_inputs = data_source.get_eval_samples(num_prompts)
         n_prompts = all_inputs.batch_size
         chunk = max(1, self.batch_size)
-        usable = n_prompts - n_prompts % chunk or n_prompts
+        fanout = total_samples_per_prompt(eval_sp)
+        # Pad the ragged tail instead of flooring it, so the scored set no longer depends on the training batch size.
+        dispatch_inputs = pad_eval_inputs(all_inputs, chunk) if n_prompts > chunk else all_inputs
         sums = {name: 0.0 for name, _ in scorers}
         counts = {name: 0 for name, _ in scorers}
-        for start in range(0, usable, chunk):
-            sub = all_inputs.slice(start, min(start + chunk, n_prompts))
+        n_dispatch = dispatch_inputs.batch_size
+        for start in range(0, n_dispatch, chunk):
+            sub = dispatch_inputs.slice(start, start + chunk)
             request = self._build_request_sample(sub, step, sampling=eval_sp)
             generated = self.rollout.generate(request)
             for name, reward in scorers:
@@ -291,6 +299,12 @@ class PETrainer(BaseTrainer):
                 rewards = scored.parts[-1].rewards
                 if rewards is not None:
                     r = hydrate(rewards).to(torch.float32)
+                    if int(r.numel()) != sub.batch_size * fanout:
+                        raise RuntimeError(
+                            f"PETrainer._eval_pass: reward count {int(r.numel())} != dispatch roots "
+                            f"{sub.batch_size} * fanout {fanout}."
+                        )
+                    r = r[: max(0, min(start + chunk, n_prompts) - start) * fanout]
                     sums[name] += float(r.sum().item())
                     counts[name] += int(r.numel())
         return {name: sums[name] / max(1, counts[name]) for name, _ in scorers}
