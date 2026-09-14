@@ -35,7 +35,6 @@ class MiniMaxH3Bundle(Bundle):
         dtype: torch.dtype,
         device: torch.device,
         pretrained_path: str,
-        max_sequence_length: int,
     ) -> None:
         super().__init__()
         self.transformer = transformer
@@ -50,7 +49,6 @@ class MiniMaxH3Bundle(Bundle):
         # (``.type``) off it -- pass it straight to ``.to()`` / ``device=``.
         self.device = device
         self.pretrained_path = pretrained_path
-        self.max_sequence_length = max_sequence_length
 
     @classmethod
     def from_config(cls, config: MiniMaxH3PipelineConfig) -> "MiniMaxH3Bundle":
@@ -141,7 +139,6 @@ class MiniMaxH3Bundle(Bundle):
             dtype=dtype,
             device=device,
             pretrained_path=path,
-            max_sequence_length=int(config.max_sequence_length),
         )
         if config.meta_init_transformer:
             # Diffusers layout: the backend's sharded loader reads the
