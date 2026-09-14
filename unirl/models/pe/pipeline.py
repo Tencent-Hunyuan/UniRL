@@ -7,11 +7,11 @@ from typing import Optional
 
 from unirl.models.types.pipeline import Pipeline
 from unirl.types.primitives import Texts
-from unirl.types.sample import Part, Sample, ar_child_control
+from unirl.types.sample import Part, Sample
 from unirl.types.sampling import ARSamplingParams, DiffusionSamplingParams
 
 from .bundle import PEBundle
-from .instruction import postprocess_pe_texts
+from .instruction import ar_child_control, postprocess_pe_texts
 
 logger = logging.getLogger(__name__)
 

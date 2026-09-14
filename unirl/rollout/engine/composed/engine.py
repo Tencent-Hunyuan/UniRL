@@ -10,11 +10,11 @@ import torch
 
 from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, distributed
-from unirl.models.pe.instruction import postprocess_pe_texts
+from unirl.models.pe.instruction import ar_child_control, postprocess_pe_texts
 from unirl.rollout.engine.base import BaseRolloutEngine
 from unirl.rollout.engine.composed.config import ComposedRolloutEngineConfig
 from unirl.types.primitives import Texts
-from unirl.types.sample import Part, Sample, ar_child_control
+from unirl.types.sample import Part, Sample
 from unirl.types.sampling import ARSamplingParams, DiffusionSamplingParams
 
 logger = logging.getLogger(__name__)

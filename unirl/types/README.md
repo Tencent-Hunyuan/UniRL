@@ -127,7 +127,7 @@ response = engine.generate(request)
 text_track = response.tracks["ar"]
 ```
 
-After:
+After. Root-input overlays (task, bot_task, chat, ar) live on `Part.control`:
 
 ```python
 from unirl.types.sample import Part, Sample

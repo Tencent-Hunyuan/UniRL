@@ -43,15 +43,6 @@ PRIMITIVE_MODALITY_ORDER = ("text", "image", "video", "audio", "media")
 TURN_ROLES = ("system", "user", "assistant", "tool")
 
 
-def ar_child_control(control: Dict[str, Any], *, system_instruction: Optional[str] = None) -> Dict[str, Any]:
-    """Copy parent ``chat``/``ar`` bags for an AR child Part, optionally injecting a system instruction."""
-    child: Dict[str, Any] = {key: dict(control[key]) for key in ("chat", "ar") if key in control}
-    if system_instruction:
-        for key in ("ar", "chat"):
-            child.setdefault(key, {})["system_instruction"] = system_instruction
-    return child
-
-
 @dataclass
 class Turn:
     """One conditioning turn: a role tag + its frontier-aligned content primitive."""
@@ -767,5 +758,4 @@ __all__ = [
     "PRIMITIVE_MODALITY_ORDER",
     "Turn",
     "TURN_ROLES",
-    "ar_child_control",
 ]
