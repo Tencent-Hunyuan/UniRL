@@ -117,5 +117,34 @@ new remote reward needs no UniRL code — add it to the server and list its name
 - **`input_kind` must match the media** (`image`/`video`/`text`) — it picks which
   decoded key the backend sees. Remote allows only `image`/`video`; local scorers
   may be `text`.
+- **`math_verify` grades in a child process, and that is not optional.** Its own
+  timeouts are `signal.alarm`-based, so they work only on the main thread — which the
+  reward path is not; enabling them there raises and scores every sample 0. Inside the
+  child the main thread is the child's own, so they work and are passed through
+  (`UNIRL_MATHVERIFY_TIMEOUT_S`, default 10s). One child per reward call grades the
+  whole batch and exits — ~1.2s, amortised over the ~16 grades a call carries — and
+  shares nothing with the caller, so a child that is OOM-killed can only cost its own
+  batch, which is scored 0.0. Three details are load-bearing: `forkserver` rather than
+  `fork`, because `fork` runs `logging`'s registered at-fork handler, which acquires
+  the logging lock with no timeout and can block the forking thread forever when the
+  worker's other threads log; `wait()` on the child's sentinel as well as the pipe, so
+  a child that dies immediately costs a round-trip instead of the whole deadline; and
+  `proc.start()` inside the `try`, because `forkserver` forks the child *before* the
+  parent writes the job payload to it, so a child dying in that window raises
+  `BrokenPipeError` out of `start()`. **Do not reintroduce a `multiprocessing.Pool`
+  here**: `Pool.terminate()` is unbounded. `_terminate_pool` sends each worker `SIGTERM`
+  and then joins it with no timeout (CPython 3.12 `pool.py:732`), and a Python signal
+  handler only runs between bytecodes — so a grade inside a long C-level `sympy` call
+  never handles the `SIGTERM`, never exits, and the join blocks forever. That is the
+  same runaway expression whose slowness tripped the deadline that called `terminate()`,
+  so the condition triggering the teardown is the one that makes it hang. Confirmed by a
+  captured stack from a 32-GPU reproduction. `proc.kill()` is used instead because
+  `SIGKILL` cannot be caught, blocked or ignored and needs no bytecode boundary.
+- **A standalone test of the grader needs a real file with an `if __name__ ==
+  "__main__":` guard.** `forkserver` re-imports `__main__` in the child, so an unguarded
+  script — or a heredoc, where `__main__` is `<stdin>` — makes every grade return
+  `False` from a completely healthy grader, which is indistinguishable from the grader
+  failing closed. Production is unaffected: in a reward worker `__main__` is Ray's
+  `default_worker.py`.
 - **`base_device` is ignored by the remote backend** (it's HTTP-only); local
   scorers honor it, falling back to CPU with a warning if CUDA is unavailable.
