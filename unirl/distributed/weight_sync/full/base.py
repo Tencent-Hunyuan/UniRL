@@ -42,6 +42,15 @@ def _apply_name_remap(name: str, name_remap: Dict[str, Optional[str]]) -> Option
     return name
 
 
+def _resolve_delta_encoder(delta_sync: object):
+    """Return a shard-local delta encoder when delta_sync is set, else None (dense full-tensor push)."""
+    if not delta_sync:
+        return None
+    raise NotImplementedError(
+        "FullWeightSync: delta_sync is set but no DeltaWeightEncoder is wired yet; set delta_sync=false."
+    )
+
+
 class FullWeightSync(Remote):
     """Base for full-weight sync Remotes."""
 
@@ -56,10 +65,13 @@ class FullWeightSync(Remote):
         name_remap: Optional[Dict[str, Optional[str]]] = None,
         track_prefix: str = "",
         wire_dtype: Any = None,
+        delta_sync: bool = False,
     ) -> None:
         super().__init__()
         from unirl.utils.dtypes import parse_torch_dtype
 
+        # Sparse shard-local delta sync ships only changed weight bytes; no encoder is wired yet.
+        self._delta_encoder = _resolve_delta_encoder(delta_sync)
         self._backend = backend
         self._bucket_bytes = int(bucket_size_mb) * 1024 * 1024
         self._flush_cache = bool(flush_cache)
