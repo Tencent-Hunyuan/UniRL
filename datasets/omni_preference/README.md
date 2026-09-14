@@ -204,6 +204,12 @@ cross-split number is quietly wrong in the favourable direction.
   marker is junk text in this pipeline, which injects media as typed content blocks,
   and is the placeholder in verl's, which passes a raw string plus an `audios` list.
   Both render to the same `<|audio_start|><|audio_pad|><|audio_end|>` span.
+  Retraining with the system turn in place moves this implementation from 0.8067 to
+  **0.8167** accuracy and 0.9470 to **1.0840** margin (eval loss 0.53899 -> 0.53245),
+  by modality +0.5pp audio / +2.5pp image / +0.0pp video. So the missing system turn
+  was a real defect worth fixing, but it accounts for only ~1pp of the ~18pp
+  cross-stack asymmetry -- it is not the whole of the pipeline difference, and the
+  rest is still unattributed.
   Consequently the "+5.8pp for UniRL" reported earlier was verl's model run through a
   foreign pipeline, and does not support any claim about either implementation.
   Comparing own-pipeline numbers (verl 0.9670, UniRL 0.8067) is also not sound: the
