@@ -104,6 +104,8 @@ def build_lr_scheduler(
     scheduler_type = str(config.type)
     warmup_steps = int(config.warmup_steps)
     total_steps = int(config.total_steps)
+    steps_per_advance = max(1, int(getattr(config, "steps_per_advance", 1)))
+    step_offset = 1 if bool(getattr(config, "one_based_steps", False)) else 0
 
     if scheduler_type == "constant":
         return torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: 1.0)
@@ -122,6 +124,7 @@ def build_lr_scheduler(
     if scheduler_type == "linear":
 
         def lr_lambda(step: int) -> float:
+            step = step // steps_per_advance + step_offset
             if step < warmup_steps:
                 return step / max(1, warmup_steps)
             return max(0.0, 1.0 - (step - warmup_steps) / (total_steps - warmup_steps))
@@ -129,6 +132,12 @@ def build_lr_scheduler(
         return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     if scheduler_type == "linear_warmup":
+        if steps_per_advance != 1:
+            raise ValueError(
+                "steps_per_advance is only implemented for the 'linear' and 'cosine' schedules; "
+                f"'linear_warmup' composes LinearLR/SequentialLR, which advance internally. "
+                f"Got steps_per_advance={steps_per_advance}."
+            )
         constant = torch.optim.lr_scheduler.LinearLR(
             optimizer,
             start_factor=1.0,
@@ -152,6 +161,7 @@ def build_lr_scheduler(
     if scheduler_type == "cosine":
 
         def lr_lambda(step: int) -> float:
+            step = step // steps_per_advance + step_offset
             if step < warmup_steps:
                 return step / max(1, warmup_steps)
             progress = (step - warmup_steps) / (total_steps - warmup_steps)

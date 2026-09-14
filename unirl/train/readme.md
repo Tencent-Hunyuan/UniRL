@@ -61,6 +61,18 @@ in `backend/base.py`; a multi-update-capable algorithm sets
 
 ## Gotchas
 
+- **`LrSchedulerConfig.steps_per_advance` / `one_based_steps` exist to match other
+  stacks' step conventions; both default to a no-op.** The schedule normally advances
+  once per optimizer step, counting from 0. Two conventions differ, and neither is
+  reachable by tuning `warmup_steps`/`total_steps`: verl-omni advances once per *data
+  batch* (its cosine spans 130 units while performing 520 updates, so the LR is held
+  constant across each batch's updates), and its warmup is 1-based, so its first batch
+  already runs at `1/warmup × base` rather than at 0. Set `steps_per_advance` to
+  `num_updates_per_batch` and `one_based_steps: true` to reproduce that; with both set,
+  the emitted trace matches verl's logged 130 values exactly (`max |diff| = 0`, and the
+  same integrated LR of 2.60e-03). `steps_per_advance != 1` raises on `linear_warmup`,
+  which composes `LinearLR`/`SequentialLR` and advances internally.
+
 - **A mixed-modality batch builds but cannot be sliced.** `ARPreferenceTrackBuilder`
   happily produces one `Part` from audio and image records together — the per-sample
   media lists line up with the row count, and `Batch.slice` on the whole batch looks
