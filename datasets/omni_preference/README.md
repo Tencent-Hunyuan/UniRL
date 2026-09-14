@@ -219,6 +219,18 @@ cross-split number is quietly wrong in the favourable direction.
   dropped and the two already agree. The three real ones are the sampler above, the LR
   step convention (see `unirl/train/readme.md`), and `attn_implementation` (verl uses
   `sdpa`, measured −0.0197 against `flash_attention_2` here).
+- **Applying all three alignments does not close the gap.** A run with verl's exact
+  draw (row multiset identical), verl's LR trace (matching its logged 130 values
+  bit-for-bit, `max |diff| = 0`), and `attn_implementation: sdpa` scores 0.8050 against
+  verl's 0.7483 — a gap of **+5.7pp (p=0.018)**, versus +5.8pp before aligning. The
+  three changes together moved the result by **−0.0017**, i.e. nothing beyond noise.
+  It reaches log 2 at step 0 (`eval_loss=0.69315`) and its eval loss falls to 0.53899,
+  so the run itself is sound. Combined with the 44-knob audit, this rules out
+  configuration as the explanation: every setting verl's launch line specifies is now
+  either matched, measured inert, or structurally absent. Read together with the length
+  analysis above — the raw gap is carried by the 497/600 length skew, and the two
+  models differ in *length sensitivity* (+0.231, CI [+0.120, +0.335]) rather than in
+  configuration — the remaining difference is not a knob to find.
 
 - **Media basenames in the jsonl are not byte-equal to the filenames on disk.**
   The jsonl spells them with `_` where the file uses a space, and HTML-escapes
