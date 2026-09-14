@@ -55,7 +55,8 @@ knows nothing about DTensor sharding or wrap topology.
 before `fsdp_wrap`, plus a config in `configs.py`; a new optimizer or LR schedule
 is a branch in `optim.py` plus fields on `OptimizerConfig` / `LrSchedulerConfig`
 in `backend/base.py`; a multi-update-capable algorithm sets
-`supports_multi_update = True` and declares `anchor_fields` (see
+`supports_multi_update = True`, declares `anchor_fields`, and exposes
+`recomputes_anchor` when its anchor must follow the planned micro geometry (see
 `../algorithms/README.md`).
 
 ## Gotchas

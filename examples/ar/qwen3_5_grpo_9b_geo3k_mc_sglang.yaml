@@ -96,9 +96,6 @@ rollout:
     # image_pad to match image_grid_thw; this value is not the full image marker.
     image_token: "<|image_pad|>"
     response_forbidden_tokens: ["<|image_pad|>", "<|video_pad|>"]
-    max_new_tokens: 8192
-    temperature: 1.0
-    top_p: 1.0
     concurrency: 16
     chat_template_kwargs:
       enable_thinking: false
@@ -126,7 +123,7 @@ algorithm:
   clip_range_high: 0.28  # DAPO clip-higher (ms-swift epsilon_high=0.28)
   clip_schedule: constant
   loss_agg_mode: seq-mean-token-mean  # ms-swift loss_type=grpo
-  sampling_temperature: 1.0
+  sampling_temperature: ${sampling.temperature}
   conditions_cls:
     _target_: hydra.utils.get_class
     path: unirl.models.qwen3_5.conditions.Qwen3_5ARConditions

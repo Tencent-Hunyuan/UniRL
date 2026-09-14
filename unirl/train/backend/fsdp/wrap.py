@@ -195,6 +195,9 @@ def fsdp_wrap(
         for layer in block_instances:
             layer.forward = torch.compile(layer.forward)
 
+    # Rollout may temporarily retain unsharded params across cached decode.
+    model._unirl_fsdp_reshard_after_forward = fsdp_kwargs["reshard_after_forward"]
+
     if _current_rank() == 0:
         logger.info(
             "fsdp_wrap: wrapped %d block(s) of class %r "

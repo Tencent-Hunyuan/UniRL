@@ -50,7 +50,7 @@ can survive.
 | `vllm` | `vllm`, `vllm-omni`, torch +cu130 stack, PyAV | Running any vllm-omni-based example |
 | `sglang` | `sglang[diffusion]`, `flash-attn-4`, torch +cu130 stack, PyAV | Running VLM/LLM examples or `sd3_sglang_*` |
 | `train` | `wandb`, `aiohttp` | Training runs (almost always wanted) |
-| `infer` | `accelerate` | HunyuanImage3 and similar models |
+| `infer` | `accelerate`, `timm` | HunyuanImage3, Janus-Pro, and similar models |
 | `eval` | `torchvision`, `paddlepaddle`, `paddleocr`, `python-Levenshtein` | OCR-based reward components |
 | `dev` | `pytest`, `ruff`, `pre-commit` | Local development |
 | `dataset-prep` | `datasets`, `pandas`, `pyarrow`, PyAV | Cooking a dataset with a converter under [`datasets/`](datasets/README.md) |

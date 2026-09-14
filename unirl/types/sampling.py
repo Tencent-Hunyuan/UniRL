@@ -5,7 +5,7 @@ from __future__ import annotations
 from abc import ABC
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Set
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Sequence, Set
 
 from unirl.config.require import require
 
@@ -88,14 +88,7 @@ class DiffusionSamplingParams(BaseSamplingParams):
     guidance_scale_2: Optional[float] = None
     strength: Optional[float] = None
 
-    num_samples_per_prompt: int = 1
-
     def __post_init__(self) -> None:
-        if self.num_samples_per_prompt != 1 and self.samples_per_prompt == 1:
-            object.__setattr__(self, "samples_per_prompt", self.num_samples_per_prompt)
-        elif self.samples_per_prompt != 1 and self.num_samples_per_prompt == 1:
-            object.__setattr__(self, "num_samples_per_prompt", self.samples_per_prompt)
-
         reserved = {f.name for f in fields(self) if f.name != "sampler_kwargs"}
         shadowed = reserved & set(self.sampler_kwargs)
         require(
@@ -116,6 +109,8 @@ class DiffusionSamplingParams(BaseSamplingParams):
 @dataclass
 class ARSamplingParams(BaseSamplingParams):
     """AR (autoregressive) sampling parameters for LLM-based PE generation."""
+
+    emits_fixed_length: ClassVar[bool] = False
 
     temperature: float = 0.7
     max_new_tokens: int = 512

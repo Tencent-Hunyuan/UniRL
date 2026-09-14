@@ -30,7 +30,7 @@ sampling:
   temperature: 1.0
   top_p: 1.0
   top_k: 0
-  max_new_tokens: 2048
+  max_new_tokens: 2048 # per TURN (reasoning + a tool call / the final answer)
 
 logging:
   report_to_wandb: false
@@ -92,9 +92,6 @@ rollout:
       backend: native
       pretrained_model_ckpt_path: ${oc.env:QWEN3_INSTRUCT_PATH,Qwen/Qwen3-4B-Instruct}
       tp_size: 1
-      max_new_tokens: 2048 # per TURN (reasoning + a tool call / the final answer)
-      temperature: 1.0
-      top_p: 1.0
       concurrency: 8
       # The deep-research framing — verbatim from AReaL's tongyi_deepresearch
       # SYSTEM_PROMPT, adapted for UniRL: the <tools> JSON block is dropped because
@@ -150,7 +147,7 @@ algorithm:
   clip_range_high: null
   clip_schedule: constant
   loss_agg_mode: seq-mean-token-mean
-  horizon: 2048
+  horizon: ${sampling.max_new_tokens}
   sampling_temperature: ${sampling.temperature}
   conditions_cls:
     _target_: hydra.utils.get_class
