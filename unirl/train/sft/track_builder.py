@@ -214,14 +214,7 @@ def _stage_config(stage: Any) -> Dict[str, Any]:
 
 
 def _encoder_cache_fingerprint(modules: Sequence[Any], stage: Any, salt: Optional[str]) -> str:
-    """Fingerprint an encoder by what determines its output, so the cache namespace moves with it.
-
-    Entries are only valid while the code that wrote them would write them again. An
-    operator-supplied revision string cannot be trusted to track a checkpoint, dtype or
-    max-length change — reusing one across models silently trains on stale latents — so
-    the namespace is derived from the frozen weights (structure plus sampled values) and
-    the encode stage's scalar config. ``salt`` stays available for isolating caches by hand.
-    """
+    """Fingerprint an encoder by what determines its output, so the cache namespace moves with it."""
     encoders: List[Any] = []
     with torch.no_grad():
         for module in modules:
