@@ -1,0 +1,35 @@
+# @package _global_
+# MiniMax-H3 t2va Flow-GRPO — 8 nodes x 8 GPUs, copy-engine HSDP validation.
+#
+# Each eight-rank shard group stays within one H20 node, where NCCL symmetric
+# memory plus zero-CTA all-gather can use copy engines. Eight groups exercise
+# HSDP's inter-group gradient synchronization at the full allocation scale.
+#
+# Launch:
+#   bash examples/run_experiment_multinode.sh \
+#     diffusion/minimax_h3/minimax_h3_t2va_trainside_hsdp_8x8_copyengine_validation
+
+defaults:
+  - minimax_h3_t2va_trainside
+  - _self_
+
+num_devices: 64
+batch_size: 64
+num_rollouts: 1
+
+logging:
+  tags: [minimax-h3, t2va, flowgrpo, trainside, hsdp, 8x8, copy-engine, validation]
+
+bundle:
+  config:
+    text_encoder_onload_for_embed: true
+
+backend:
+  fsdp_cfg:
+    fsdp_mode: hybrid
+    hsdp_shard_size: 8
+    copy_engine_all_gather: true
+
+sampling:
+  num_inference_steps: 2
+  sde_indices: [0]
