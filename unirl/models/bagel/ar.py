@@ -81,6 +81,7 @@ class BagelARStage(ARStage[BagelARConditions]):
         autocast_precision: str = "bf16",
         logprob_precision: str = "fp32",
         replay_mode: str = "train",
+        replay_attention_backend: str = "sdpa",
     ) -> None:
         self.model = model
         self.autocast_dtype = parse_torch_dtype(autocast_precision, field_name="BagelARStage.autocast_precision")
@@ -89,6 +90,11 @@ class BagelARStage(ARStage[BagelARConditions]):
         require(
             self.replay_mode in ("train", "inference"),
             f"BagelARStage: replay_mode must be 'train' or 'inference'; got {replay_mode!r}.",
+        )
+        self.replay_attention_backend = str(replay_attention_backend).strip().lower()
+        require(
+            self.replay_attention_backend in ("sdpa", "flex"),
+            f"BagelARStage: replay_attention_backend must be 'sdpa' or 'flex'; got {replay_attention_backend!r}.",
         )
         llm_cfg = getattr(getattr(getattr(model, "model", None), "config", None), "llm_config", None)
         require(
@@ -267,6 +273,7 @@ class BagelARStage(ARStage[BagelARConditions]):
                     splits=splits,
                     response_input=response_input,
                     device=device,
+                    attention_backend=self.replay_attention_backend,
                 )
                 logits = rl_ops.und_replay_logits(bagel, packed)
                 logp_full = torch.log_softmax(logits.float() / temp, dim=-1)
