@@ -193,6 +193,32 @@ cross-split number is quietly wrong in the favourable direction.
   logged `val/reward_accuracy` is inflated by an unweighted `np.mean` over unequal
   micro-batches in `reduce_metrics`: recomputing from its own dumped tensors gives
   0.5000 where it logged 0.6875.
+- **verl-omni's DPO recipe trains on 63% of its own training split.** Its
+  `ModalityGroupedBatchSampler` takes `replacement=True` by default and its launch
+  line never overrides it, so the training sampler draws each batch's 32 rows with
+  `torch.randint` from one modality. Replaying that draw for the published
+  `num_batches=130` over a 4200-row split gives **2646 distinct rows (63.0%), 1554
+  rows (37.0%) never seen, and 1098 rows repeated up to 6×** — a bootstrap resample,
+  not an epoch. Anything comparing against this recipe is comparing against that
+  exposure, so a single shuffled pass is a different experiment even when the split
+  file is byte-identical. To feed UniRL the same rows, replay the draw into a manifest
+  and read it with `shuffle=false`; `group_by_modality` must stay at the batch size
+  regardless (a mixed-modality micro-batch raises), and it reorders blocks, so the row
+  multiset is reproduced exactly while batch order is not.
+- **Aligning every actionable knob to verl-omni takes 3 changes, not 13.** A
+  knob-by-knob audit of verl's resolved launch line found 44 settings: 30 already
+  matched, 1 is structural (UniRL packs varlen natively vs `use_remove_padding`), and
+  7 of the 13 apparent mismatches closed under measurement rather than argument —
+  `image_min_pixels`/`sample_rate`/`frame_factor` are already equal; `video_min_pixels`
+  3136-vs-100352 is inert (0/12 rows change tokenization, since it is a floor and every
+  frame already clears it); `scale_factor` 28 does not even match verl's own processor
+  (`patch 16 × merge 2 = 32`); `max_length=4096` truncates 0/12 rows; `exclude_modules`
+  selects an identical 192/192 modules and 96/96 parameters, with all three extra
+  patterns matching zero modules in a thinker-only load; and verl's saved
+  `adapter_config.json` reads `lora_dropout: 0.0`, so its requested 0.05 was silently
+  dropped and the two already agree. The three real ones are the sampler above, the LR
+  step convention (see `unirl/train/readme.md`), and `attn_implementation` (verl uses
+  `sdpa`, measured −0.0197 against `flash_attention_2` here).
 
 - **Media basenames in the jsonl are not byte-equal to the filenames on disk.**
   The jsonl spells them with `_` where the file uses a space, and HTML-escapes
