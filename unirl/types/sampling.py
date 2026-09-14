@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import math
 from abc import ABC
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, fields
-from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Sequence, Set
+from numbers import Integral, Real
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Set
 
 from unirl.config.require import require
 
@@ -14,12 +16,92 @@ if TYPE_CHECKING:
 
     from unirl.sde.index_schedule import TimestepScheduler
 
+_BOOL_TRUE = {"true", "1"}
+_BOOL_FALSE = {"false", "0"}
+
+
+def _as_int(value: Any, *, name: str, optional: bool = False) -> int | None:
+    """Coerce ``value`` to ``int``, or ``None`` when ``optional``."""
+    if value is None:
+        if optional:
+            return None
+        raise TypeError(f"{name} must be an integer, got None")
+    if isinstance(value, bool):
+        raise TypeError(f"{name} must be an integer, got {value!r}")
+    if isinstance(value, Integral):
+        return int(value)
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            number = float(text)
+        except ValueError as exc:
+            raise TypeError(f"{name} must be an integer, got {value!r}") from exc
+    elif isinstance(value, Real):
+        number = float(value)
+    else:
+        raise TypeError(f"{name} must be an integer, got {value!r}")
+    if not math.isfinite(number) or number != int(number):
+        raise ValueError(f"{name} must be an integer, got {value!r}")
+    return int(number)
+
+
+def _as_float(value: Any, *, name: str, optional: bool = False) -> float | None:
+    """Coerce ``value`` to a finite ``float``, or ``None`` when ``optional``."""
+    if value is None:
+        if optional:
+            return None
+        raise TypeError(f"{name} must be a finite float, got None")
+    if isinstance(value, bool):
+        raise TypeError(f"{name} must be a finite float, got {value!r}")
+    if isinstance(value, str):
+        value = value.strip()
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(f"{name} must be a finite float, got {value!r}") from exc
+    if not math.isfinite(number):
+        raise ValueError(f"{name} must be a finite float, got {value!r}")
+    return number
+
+
+def _as_bool(value: Any, *, name: str) -> bool:
+    """Coerce ``value`` to ``bool`` without treating nonempty strings as true."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        key = value.strip().lower()
+        if key in _BOOL_TRUE:
+            return True
+        if key in _BOOL_FALSE:
+            return False
+        raise TypeError(f"{name} must be a boolean, got {value!r}")
+    if isinstance(value, Integral) and value in (0, 1):
+        return bool(value)
+    raise TypeError(f"{name} must be a boolean, got {value!r}")
+
+
+def _as_int_list(value: Any, *, name: str, optional: bool = False) -> list[int] | None:
+    """Coerce ``value`` to ``list[int]``, or ``None`` when ``optional``."""
+    if value is None:
+        if optional:
+            return None
+        raise TypeError(f"{name} must be a sequence of integers, got None")
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise TypeError(f"{name} must be a sequence of integers, got {value!r}")
+    return [_as_int(item, name=f"{name}[{index}]") for index, item in enumerate(value)]
+
 
 @dataclass
 class BaseSamplingParams(ABC):
     """Marker base for all sampling config dataclasses."""
 
     samples_per_prompt: int = 1
+
+    def __post_init__(self) -> None:
+        self.samples_per_prompt = _as_int(
+            self.samples_per_prompt,
+            name=f"{type(self).__name__}.samples_per_prompt",
+        )
 
 
 def _is_param_dict(sampling: Any) -> bool:
@@ -89,11 +171,50 @@ class DiffusionSamplingParams(BaseSamplingParams):
     strength: Optional[float] = None
 
     def __post_init__(self) -> None:
+        super().__post_init__()
+        prefix = type(self).__name__
+        self.num_inference_steps = _as_int(self.num_inference_steps, name=f"{prefix}.num_inference_steps")
+        self.guidance_scale = _as_float(self.guidance_scale, name=f"{prefix}.guidance_scale")
+        self.height = _as_int(self.height, name=f"{prefix}.height")
+        self.width = _as_int(self.width, name=f"{prefix}.width")
+        self.num_frames = _as_int(self.num_frames, name=f"{prefix}.num_frames")
+        self.seed = _as_int(self.seed, name=f"{prefix}.seed", optional=True)
+        self.init_same_noise = _as_bool(self.init_same_noise, name=f"{prefix}.init_same_noise")
+        self.init_noise_latent_shape = _as_int_list(
+            self.init_noise_latent_shape,
+            name=f"{prefix}.init_noise_latent_shape",
+            optional=True,
+        )
+        self.disable_driver_xt = _as_bool(self.disable_driver_xt, name=f"{prefix}.disable_driver_xt")
+        self.eta = _as_float(self.eta, name=f"{prefix}.eta")
+        self.sde_indices = _as_int_list(self.sde_indices, name=f"{prefix}.sde_indices", optional=True)
+        self.max_sequence_length = _as_int(
+            self.max_sequence_length,
+            name=f"{prefix}.max_sequence_length",
+            optional=True,
+        )
+        self.taylor_cache_interval = _as_int(
+            self.taylor_cache_interval,
+            name=f"{prefix}.taylor_cache_interval",
+            optional=True,
+        )
+        self.taylor_cache_order = _as_int(
+            self.taylor_cache_order,
+            name=f"{prefix}.taylor_cache_order",
+            optional=True,
+        )
+        self.distilled_guidance_scale = _as_float(
+            self.distilled_guidance_scale,
+            name=f"{prefix}.distilled_guidance_scale",
+            optional=True,
+        )
+        self.guidance_scale_2 = _as_float(self.guidance_scale_2, name=f"{prefix}.guidance_scale_2", optional=True)
+        self.strength = _as_float(self.strength, name=f"{prefix}.strength", optional=True)
         reserved = {f.name for f in fields(self) if f.name != "sampler_kwargs"}
         shadowed = reserved & set(self.sampler_kwargs)
         require(
             not shadowed,
-            f"DiffusionSamplingParams.sampler_kwargs cannot contain reserved keys {sorted(shadowed)}; set them as fields instead",
+            f"{prefix}.sampler_kwargs cannot contain reserved keys {sorted(shadowed)}; set them as fields instead",
         )
 
     def resolve_sde_indices(self, rollout_id: int) -> List[int]:
@@ -118,3 +239,13 @@ class ARSamplingParams(BaseSamplingParams):
     top_k: int = 0
     stop_token_id: int | None = None
     seed: Optional[int] = None  # engines with per-request seeded sampling derive child seeds from this + sample_id
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        prefix = type(self).__name__
+        self.temperature = _as_float(self.temperature, name=f"{prefix}.temperature")
+        self.max_new_tokens = _as_int(self.max_new_tokens, name=f"{prefix}.max_new_tokens")
+        self.top_p = _as_float(self.top_p, name=f"{prefix}.top_p")
+        self.top_k = _as_int(self.top_k, name=f"{prefix}.top_k")
+        self.stop_token_id = _as_int(self.stop_token_id, name=f"{prefix}.stop_token_id", optional=True)
+        self.seed = _as_int(self.seed, name=f"{prefix}.seed", optional=True)

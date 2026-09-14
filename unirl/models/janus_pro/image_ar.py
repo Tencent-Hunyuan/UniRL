@@ -8,6 +8,7 @@ import torch.nn.functional as F
 
 from unirl.models.types.ar import ARSamplingParams, ARStage
 from unirl.types.primitives import Images
+from unirl.types.sampling import _as_int
 from unirl.types.segments import TextSegment
 from unirl.utils.dtypes import parse_torch_dtype
 
@@ -42,10 +43,14 @@ class JanusProImageARSamplingParams(ARSamplingParams):
     height: Optional[int] = None
 
     def __post_init__(self) -> None:
+        super().__post_init__()
         self.cfg_weight = _finite_cfg_weight(
             self.cfg_weight,
             where="JanusProImageARSamplingParams.cfg_weight",
         )
+        self.img_size = _as_int(self.img_size, name="JanusProImageARSamplingParams.img_size")
+        self.width = _as_int(self.width, name="JanusProImageARSamplingParams.width", optional=True)
+        self.height = _as_int(self.height, name="JanusProImageARSamplingParams.height", optional=True)
 
 
 def _resolve_image_grid(params: ARSamplingParams) -> Tuple[int, int, int]:
