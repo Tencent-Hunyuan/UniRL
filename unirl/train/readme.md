@@ -68,6 +68,12 @@ in `backend/base.py`; a multi-update-capable algorithm sets
 - **`optimizer_step` silently *skips* (does not crash) on a non-finite grad norm**
   and zeroes grads — a flat loss curve with a logged warning means grads went
   non-finite.
+- **`optimizer_step` releases grads on both exits** — the skip path always did;
+  the committed-update path now does too. Nothing reads `.grad` between updates,
+  but `offload()`/`onload()` move "params + grads + optimizer" as one train
+  state, so consumed grads otherwise ride the rollout boundary and the next
+  batch's anchor prep. Accumulation windows are unaffected: non-stepping parts
+  run `zero_grad=False`, the stepping update still zeroes at entry.
 - **`master_dtype` defaults to `None`, so the optimizer master follows `param_dtype`** —
   a bf16-loaded base then keeps a bf16 LoRA master and the ~1e-6 AdamW steps round
   away (the policy drifts into a degenerate reward-hack). An fp32-loaded model gets an

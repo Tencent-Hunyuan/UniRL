@@ -308,6 +308,10 @@ class BaseFSDP2Backend(Remote):
         if self.ema is not None:
             self.ema.step(self._optimizer_step_count)
         self._optimizer_step_count += 1
+        # Grads are consumed. offload()/onload() move "params + grads + optimizer"
+        # as one train state, so releasing here keeps dead tensors off the bus
+        # across the rollout boundary and anchor prep.
+        self.optimizer.zero_grad(set_to_none=True)
         return grad_norm
 
     def on_rollout_end(self) -> None:
