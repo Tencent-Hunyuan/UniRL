@@ -86,6 +86,7 @@ class MiniMaxH3InputAdapter(DitInputAdapter):
             audio_flow_shift=self.audio_shift,
             audio_joint_sde=self.audio_joint_sde,
             capture_transition_means=bool(sampler_kwargs.get("capture_transition_means", False)),
+            reward_num_frames=int(sampler_kwargs.get("reward_num_frames", 9)),
             # Only forward-process recipes need this: with SDE steps the pipeline
             # already infers that it is recording for an algorithm, and eval must
             # keep inferring the opposite from the same empty schedule.

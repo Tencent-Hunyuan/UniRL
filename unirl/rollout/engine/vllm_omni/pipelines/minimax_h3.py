@@ -552,7 +552,8 @@ class MiniMaxH3RLPipeline(MiniMaxH3Pipeline):
                             "MiniMax-H3 worker transition-mean count mismatch: "
                             f"means={len(self._rl_video_means)} sde_indices={len(self._rl_sde_indices)}"
                         )
-                    payload["video_means"] = torch.stack(self._rl_video_means, dim=0).unsqueeze(0)
+                    if self._rl_video_means:
+                        payload["video_means"] = torch.stack(self._rl_video_means, dim=0).unsqueeze(0)
                 output.trajectory_timesteps = {
                     "video": self._rl_video_sigmas,
                     "audio": self._rl_audio_sigmas,
