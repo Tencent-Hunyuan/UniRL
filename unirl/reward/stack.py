@@ -19,7 +19,7 @@ class RewardStack(Remote):
         rollout: Any,
         reward: Any,
         micro_batch_size: int,
-        overlap: bool = True,
+        overlap: bool = False,
     ) -> None:
         super().__init__()
         cls = type(self).__name__
@@ -47,7 +47,7 @@ class RewardStack(Remote):
         return sample.replace_frontier(Part.concat(parts))
 
     def _serial(self, sample: Sample, gen: Part, bounds: Sequence[Tuple[int, int]]) -> List[Part]:
-        """Generate then score each micro in turn — the control arm for the overlapped path."""
+        """Generate then score each micro in turn — the default path; see the reward README."""
         return [self._score(self._generate(sample, gen, start, end)).parts[-1] for start, end in bounds]
 
     def _overlapped(self, sample: Sample, gen: Part, bounds: Sequence[Tuple[int, int]]) -> List[Part]:
