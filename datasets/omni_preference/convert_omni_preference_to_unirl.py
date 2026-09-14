@@ -28,19 +28,16 @@ MODALITY_CONFIGS = {
         "jsonl_relpath": "dataset_jsonl/image/final_rl_data.jsonl",
         "media_field": "images",
         "media_subdir": None,
-        "placeholder": "<image>",
     },
     "video": {
         "jsonl_relpath": "dataset_jsonl/video/final_rl_data.jsonl",
         "media_field": "videos",
         "media_subdir": "video-dataset",
-        "placeholder": "<video>",
     },
     "audio": {
         "jsonl_relpath": "dataset_jsonl/audio/final_rl_data.jsonl",
         "media_field": "audios",
         "media_subdir": "audio_files",
-        "placeholder": "<audio>",
     },
 }
 
@@ -195,7 +192,6 @@ def main() -> None:
         resolved = resolved[: args.max_rows]
 
     test_keys = _test_media_keys(resolved, args.test_ratio, args.seed)
-    placeholder = MODALITY_CONFIGS[modality]["placeholder"]
     os.makedirs(args.out_dir, exist_ok=True)
     counts = {"train": 0, "val": 0}
     handles = {split: open(os.path.join(args.out_dir, f"{split}.jsonl"), "w", encoding="utf-8") for split in counts}
@@ -204,8 +200,7 @@ def main() -> None:
             split = "val" if Path(record["dataset_media_rel"]).name in test_keys else "train"
             row = {
                 "sample_id": record["sample_id"],
-                # The placeholder marks where the chat stage splices the medium into the rendered prompt.
-                "prompt": f"{placeholder}{record['question']}",
+                "prompt": record["question"],
                 "chosen": record["chosen"],
                 "rejected": record["rejected"],
                 "media_refs": [{"modality": modality, "role": "prompt", "uri": record["media_abs"]}],

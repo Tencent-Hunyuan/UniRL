@@ -51,12 +51,13 @@ The converter:
 5. writes `train.jsonl`, `val.jsonl` and a `manifest.json` of counters.
 
 Emitted rows use the preference shape accepted by `unirl/data/sft.py`, with the
-modality placeholder (`<audio>`/`<image>`/`<video>`) prefixed onto the prompt and
-the medium referenced at `role="prompt"`:
+medium referenced at `role="prompt"` and the question carried bare — the chat stage
+injects the medium as its own turn, so a `<audio>`/`<image>`/`<video>` marker in the
+prompt text would survive as literal tokens (see Gotchas):
 
 ```json
 {"sample_id": "omni_pref_audio_0",
- "prompt": "<audio>does someone crash and fall?",
+ "prompt": "does someone crash and fall?",
  "chosen": "No, there is no indication of a crash or fall ...",
  "rejected": "No, there is no crash or fall in the audio.",
  "media_refs": [{"modality": "audio", "role": "prompt", "uri": "/abs/path.wav"}],
@@ -148,6 +149,22 @@ media appear in neither training split. The check costs seconds; without it ever
 cross-split number is quietly wrong in the favourable direction.
 
 ## Gotchas
+
+- **Do not prefix a `<audio>`/`<image>`/`<video>` marker onto the prompt.** Those
+  strings are not special tokens — the tokenizer splits each into three ordinary text
+  tokens — and `Qwen3OmniChatTemplateStage.embed_sft_prompt` injects the medium as its
+  own user turn regardless, so a marker in the prompt text is never consumed and
+  simply trains on junk. The sibling `dcase2025_audio_qa` converter writes the
+  question bare, which is the convention to follow. This converter carried such a
+  prefix through every run recorded above; stripping it moved balanced accuracy by
+  −0.010 on a fixed checkpoint, so it is a data-quality defect rather than a large
+  metric effect, but the emitted manifests were not what the README claimed.
+- **`reward_accuracy` on this dataset is weaker than it looks.** Picking whichever
+  answer is longer already scores 72.8% (audio), 85.9% (image) and 82.5% (video), so
+  roughly four fifths of the signal is answer length. A model-quality judgement run
+  over the full 217-row audio split was an adequately-powered null result
+  (78/75/64 win/lose/tie, p=0.872) even though the training objective moved a lot —
+  optimising this metric is not the same as improving generations.
 
 - **Media basenames in the jsonl are not byte-equal to the filenames on disk.**
   The jsonl spells them with `_` where the file uses a space, and HTML-escapes
