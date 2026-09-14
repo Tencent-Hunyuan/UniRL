@@ -6,6 +6,7 @@ Run with torchrun. The process group must span whole HSDP shard groups.
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import statistics
@@ -149,6 +150,10 @@ def main() -> None:
             ),
             flush=True,
         )
+    del optimizer, model
+    gc.collect()
+    torch.cuda.synchronize(device)
+    dist.barrier()
     dist.destroy_process_group()
 
 
