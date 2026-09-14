@@ -119,3 +119,6 @@ new remote reward needs no UniRL code — add it to the server and list its name
   may be `text`.
 - **`base_device` is ignored by the remote backend** (it's HTTP-only); local
   scorers honor it, falling back to CPU with a warning if CUDA is unavailable.
+- **ImageBind `mode: audio_video` is prompt-blind** — cosine of generated audio vs
+  video, no prompt. Construction raises unless `allow_prompt_blind: true` (eval
+  measurement only). A training `reward:` should use `mode: all` or `text_video`.
