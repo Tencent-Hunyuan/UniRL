@@ -187,6 +187,23 @@ cross-split number is quietly wrong in the favourable direction.
   This is what the long-unexplained ~0.20 was: verl self-reports 0.9670 at step 130
   and this harness reads 0.7483 from its checkpoint, a difference of 0.2187. It is
   the cross-stack evaluation penalty, not a metric bug and not a training difference.
+- **The pipeline difference is a missing system turn, and it is the whole of it.**
+  Rendering the same row through both stacks' processors, the user turn is
+  byte-identical — `<|im_start|>user\n<|audio_start|><|audio_pad|><|audio_end|>Are
+  multiple birds singing?<|im_end|>` — so media placement and turn structure already
+  agree (`build_omni_messages` merges the two same-role turns `embed_sft_prompt`
+  emits into one user message, so there is no two-turn problem). What differs is that
+  `verl_omni/utils/dataset/qwen3_omni_transform.py` unconditionally prepends
+  Qwen3-Omni's canonical system message, while `system_instruction` defaults to
+  `None` here and no recipe set one. The chat template does **not** supply a default,
+  so the prompt was rendering at **16 tokens where the model expects 56**, with no
+  system turn at all — off-distribution for a model whose instruction tuning assumes
+  it. The DPO recipe now sets `pipeline.system_instruction` to that exact string
+  (verified equal to verl's constant character for character). Note the earlier
+  `<audio>` marker finding is consistent with this rather than contradicting it: the
+  marker is junk text in this pipeline, which injects media as typed content blocks,
+  and is the placeholder in verl's, which passes a raw string plus an `audios` list.
+  Both render to the same `<|audio_start|><|audio_pad|><|audio_end|>` span.
   Consequently the "+5.8pp for UniRL" reported earlier was verl's model run through a
   foreign pipeline, and does not support any claim about either implementation.
   Comparing own-pipeline numbers (verl 0.9670, UniRL 0.8067) is also not sound: the
