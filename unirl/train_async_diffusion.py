@@ -43,7 +43,7 @@ def main(cfg: DictConfig) -> None:
         # Any DiffusionSamplingParams field; everything it omits inherits `sampling`.
         eval_sampling_cfg=cfg.get("eval_sampling"),
         eval_rewards_cfg=cfg.get("eval_rewards"),
-        task_config=cfg.get("task_config"),
+        control=cfg.get("control"),
         max_inflight=int(cfg.get("max_inflight", 1)),
         per_worker_inflight=int(cfg.get("per_worker_inflight", 1)),
         weight_sync_interval=int(cfg.get("weight_sync_interval", 1)),

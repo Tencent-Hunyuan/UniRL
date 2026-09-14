@@ -10,7 +10,7 @@ import torch
 
 from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, distributed
-from unirl.models.pe.instruction import postprocess_pe_texts
+from unirl.models.pe.instruction import ar_child_control, postprocess_pe_texts
 from unirl.rollout.engine.base import BaseRolloutEngine
 from unirl.rollout.engine.composed.config import ComposedRolloutEngineConfig
 from unirl.types.primitives import Texts
@@ -193,7 +193,7 @@ class ComposedRolloutEngine(BaseRolloutEngine):
         ar_input = Part.input(
             sample_ids=list(input_part.sample_ids),
             primitives={"text": text_primitive},
-            control=self._ar_control(input_part.control or {}),
+            control=ar_child_control(input_part.control, system_instruction=self.cfg.pe_instruction),
         )
         ar_out = self._ar.generate(Sample(parts=[ar_input, ar_shell]))
         ar_part = ar_out.parts[-1]
@@ -278,14 +278,6 @@ class ComposedRolloutEngine(BaseRolloutEngine):
             "ComposedRolloutEngine.generate: requires a diffusion gen-shell Part (DiffusionSamplingParams)",
         )
         return input_part, ar_shell, diffusion_shell
-
-    def _ar_control(self, control: Dict[str, Any]) -> Dict[str, Any]:
-        """The AR child input Part's ``control``: parent's "chat" + "ar" subsets"""
-        ar_control: Dict[str, Any] = {key: dict(control[key]) for key in ("chat", "ar") if key in control}
-        if self.cfg.pe_instruction:
-            for key in ("ar", "chat"):
-                ar_control.setdefault(key, {})["system_instruction"] = self.cfg.pe_instruction
-        return ar_control
 
     def _extract_pe(self, pe_texts: Texts, text_primitive: Texts, samples_per_prompt: int) -> Texts:
         """Optional marker-based PE extraction: keep only the substring after the"""

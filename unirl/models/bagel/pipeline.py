@@ -243,7 +243,7 @@ class BagelPipeline(Pipeline):
     @staticmethod
     def _resolve_task(sample: Sample) -> str:
         """Resolve the task mode: explicit ``parts[0].control["task"]`` wins, else infer."""
-        task = (sample.parts[0].control or {}).get("task")
+        task = sample.parts[0].control.get("task")
         if task is not None:
             return str(task)
         frontier_params = sample.parts[-1].sampling_params

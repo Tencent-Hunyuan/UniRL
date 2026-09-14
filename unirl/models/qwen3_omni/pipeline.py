@@ -106,10 +106,10 @@ class Qwen3OmniPipeline(Pipeline):
     def _conditions_for(
         self,
         turns: List[Turn],
-        control: Optional[Dict[str, Any]] = None,
+        control: Dict[str, Any],
     ) -> Qwen3OmniARConditions:
         """Render the trajectory using config plus root-Part chat overrides."""
-        chat_overrides: Dict[str, Any] = dict((control or {}).get("chat") or {})
+        chat_overrides: Dict[str, Any] = dict(control.get("chat") or {})
         system_instruction = chat_overrides.get(
             "system_instruction",
             self.chat_template.system_instruction,
