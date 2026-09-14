@@ -165,29 +165,31 @@ cross-split number is quietly wrong in the favourable direction.
   over the full 217-row audio split was an adequately-powered null result
   (78/75/64 win/lose/tie, p=0.872) even though the training objective moved a lot —
   optimising this metric is not the same as improving generations.
-- **The cross-stack difference against verl-omni is the length shortcut, not a
-  training gap.** On one hand-built split fed to both stacks (4200 train / 600
-  val, 1400+200 per modality, verified byte-identical row sets), same `lr=1e-5`,
-  same 130 data batches, same 4 optimizer updates per batch, both adapters scored
-  in one process on the same rows: raw `reward_accuracy` 0.8133 here vs 0.7483 for
-  verl, and the paired McNemar test on the 115 discordant rows is significant
-  (77 vs 38, p=0.0004). But 497 of the 600 val rows have the longer answer as
-  `chosen`, and the difference sits entirely in that skew: **+10.5pp where chosen
-  is longer, −12.6pp where it is not.** Taking the unweighted mean of the two
-  length buckets so the 83/17 skew cannot carry the result gives 0.6064 vs 0.6172,
-  a gap of **−0.011, 95% CI [−0.067, +0.042]** — a null, and marginally the other
-  way. It stays a null under the ±4-row spread between harness runs. So the two
-  stacks are not distinguishable on preference quality here; the raw gap is a real
-  measurement of a confounded metric. Ruled out along the way, each by measurement:
-  the loss formula (bit-identical over 8 variants), the data (one shared file), the
-  reduction nondeterminism (fixing it moved neither number in the fourth decimal),
-  and the integrated learning rate (verl's cosine over 130 batch-units reused 4×
-  and a cosine over 520 update-units both sum to 2.60e-03 — equal, not merely
-  close). A weight-space comparison of the two adapters is **not** usable for this:
-  median cosine between the effective `ΔW` is +0.0004 over 288/288 modules, but the
-  two `lora_A` row spaces overlap exactly as much as two random draws (0.1065 vs a
-  null of 0.1072), so PEFT's random `A` init forces that orthogonality and it
-  carries no information about what was learned. Note separately that verl's own
+- **The raw gap against verl-omni is carried by the length confound; whether
+  anything else remains is undetermined.** On one hand-built split fed to both
+  stacks (4200 train / 600 val, 1400+200 per modality, verified byte-identical row
+  sets), same `lr=1e-5`, same 130 data batches, same 4 optimizer updates per batch,
+  both adapters scored in one process on the same rows: raw `reward_accuracy`
+  0.8133 here vs 0.7483 for verl, paired McNemar significant (77 vs 38 discordant,
+  p=0.0004). 497 of the 600 val rows have the longer answer as `chosen`, and the
+  difference sits in that skew: **+10.5pp where chosen is longer, −12.6pp where it
+  is not**. Balancing the two length buckets gives 0.6064 vs 0.6172, a gap of
+  −0.011, 95% CI [−0.067, +0.042]. **Do not read that as equivalence**: the small
+  bucket is 103 rows, so the interval is ±5.5pp and cannot exclude any effect below
+  ~5pp — it is "not detected", not "not there", and no equivalence margin was set
+  in advance. What *is* established, because rejection is not weakened by low power:
+  the two models are functionally different. Their length sensitivity differs by
+  +0.231, 95% CI [+0.120, +0.335], their per-row margins share only 56% of variance
+  (r=0.746), and they disagree on the ranking of 115/600 rows. Ruled out as causes
+  of the raw gap, each by measurement: the loss formula (bit-identical over 8
+  variants), the data (one shared file), the reduction nondeterminism (fixing it
+  moved neither number in the fourth decimal), and the integrated learning rate
+  (verl's cosine over 130 batch-units reused 4× and a cosine over 520 update-units
+  both sum to 2.60e-03 — equal, not merely close). A weight-space comparison cannot
+  answer this: median cosine between the effective `ΔW` is +0.0004 over 288/288
+  modules, but the two `lora_A` row spaces overlap exactly as much as two random
+  draws (0.1065 vs a null of 0.1072), so PEFT's random `A` init forces that
+  orthogonality and it carries no information. Note separately that verl's own
   logged `val/reward_accuracy` is inflated by an unweighted `np.mean` over unequal
   micro-batches in `reduce_metrics`: recomputing from its own dumped tensors gives
   0.5000 where it logged 0.6875.
