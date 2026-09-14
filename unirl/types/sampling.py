@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import math
+import sys
+import types
 from abc import ABC
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, fields
 from numbers import Integral, Real
-from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Set
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Set, Union, get_args, get_origin, get_type_hints
 
 from unirl.config.require import require
 
@@ -91,6 +93,61 @@ def _as_int_list(value: Any, *, name: str, optional: bool = False) -> list[int] 
     return [_as_int(item, name=f"{name}[{index}]") for index, item in enumerate(value)]
 
 
+_UNION_ORIGINS: tuple[Any, ...] = (Union, types.UnionType)
+
+
+def _type_hints_for(cls: type) -> dict[str, Any]:
+    """Resolve annotations, including ``Optional[torch.Tensor]`` without importing torch here."""
+    module = sys.modules.get(cls.__module__)
+    globalns = dict(getattr(module, "__dict__", {})) if module is not None else {}
+    globalns = {
+        "Any": Any,
+        "ClassVar": ClassVar,
+        "Dict": Dict,
+        "List": List,
+        "Optional": Optional,
+        "Union": Union,
+        **globalns,
+    }
+    if "torch" not in globalns:
+        globalns["torch"] = sys.modules.get("torch") or types.SimpleNamespace(Tensor=type("Tensor", (), {}))
+    return get_type_hints(cls, globalns=globalns)
+
+
+def _unwrap_optional(annotation: Any) -> tuple[Any, bool]:
+    """Return ``(inner, is_optional)`` for ``T | None`` / ``Optional[T]``."""
+    origin = get_origin(annotation)
+    args = get_args(annotation)
+    if origin in _UNION_ORIGINS and type(None) in args:
+        rest = [arg for arg in args if arg is not type(None)]
+        if len(rest) == 1:
+            return rest[0], True
+    return annotation, False
+
+
+def _normalize_fields(obj: Any) -> None:
+    """Coerce canonical numeric/bool fields from the instance's type annotations."""
+    prefix = type(obj).__name__
+    hints = _type_hints_for(type(obj))
+    for f in fields(obj):
+        annotation = hints.get(f.name)
+        if annotation is None:
+            continue
+        inner, optional = _unwrap_optional(annotation)
+        origin = get_origin(inner)
+        args = get_args(inner)
+        name = f"{prefix}.{f.name}"
+        value = getattr(obj, f.name)
+        if inner is bool:
+            setattr(obj, f.name, _as_bool(value, name=name))
+        elif inner is int:
+            setattr(obj, f.name, _as_int(value, name=name, optional=optional))
+        elif inner is float:
+            setattr(obj, f.name, _as_float(value, name=name, optional=optional))
+        elif origin is list and args == (int,):
+            setattr(obj, f.name, _as_int_list(value, name=name, optional=optional))
+
+
 @dataclass
 class BaseSamplingParams(ABC):
     """Marker base for all sampling config dataclasses."""
@@ -98,10 +155,7 @@ class BaseSamplingParams(ABC):
     samples_per_prompt: int = 1
 
     def __post_init__(self) -> None:
-        self.samples_per_prompt = _as_int(
-            self.samples_per_prompt,
-            name=f"{type(self).__name__}.samples_per_prompt",
-        )
+        _normalize_fields(self)
 
 
 def _is_param_dict(sampling: Any) -> bool:
@@ -172,49 +226,11 @@ class DiffusionSamplingParams(BaseSamplingParams):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        prefix = type(self).__name__
-        self.num_inference_steps = _as_int(self.num_inference_steps, name=f"{prefix}.num_inference_steps")
-        self.guidance_scale = _as_float(self.guidance_scale, name=f"{prefix}.guidance_scale")
-        self.height = _as_int(self.height, name=f"{prefix}.height")
-        self.width = _as_int(self.width, name=f"{prefix}.width")
-        self.num_frames = _as_int(self.num_frames, name=f"{prefix}.num_frames")
-        self.seed = _as_int(self.seed, name=f"{prefix}.seed", optional=True)
-        self.init_same_noise = _as_bool(self.init_same_noise, name=f"{prefix}.init_same_noise")
-        self.init_noise_latent_shape = _as_int_list(
-            self.init_noise_latent_shape,
-            name=f"{prefix}.init_noise_latent_shape",
-            optional=True,
-        )
-        self.disable_driver_xt = _as_bool(self.disable_driver_xt, name=f"{prefix}.disable_driver_xt")
-        self.eta = _as_float(self.eta, name=f"{prefix}.eta")
-        self.sde_indices = _as_int_list(self.sde_indices, name=f"{prefix}.sde_indices", optional=True)
-        self.max_sequence_length = _as_int(
-            self.max_sequence_length,
-            name=f"{prefix}.max_sequence_length",
-            optional=True,
-        )
-        self.taylor_cache_interval = _as_int(
-            self.taylor_cache_interval,
-            name=f"{prefix}.taylor_cache_interval",
-            optional=True,
-        )
-        self.taylor_cache_order = _as_int(
-            self.taylor_cache_order,
-            name=f"{prefix}.taylor_cache_order",
-            optional=True,
-        )
-        self.distilled_guidance_scale = _as_float(
-            self.distilled_guidance_scale,
-            name=f"{prefix}.distilled_guidance_scale",
-            optional=True,
-        )
-        self.guidance_scale_2 = _as_float(self.guidance_scale_2, name=f"{prefix}.guidance_scale_2", optional=True)
-        self.strength = _as_float(self.strength, name=f"{prefix}.strength", optional=True)
         reserved = {f.name for f in fields(self) if f.name != "sampler_kwargs"}
         shadowed = reserved & set(self.sampler_kwargs)
         require(
             not shadowed,
-            f"{prefix}.sampler_kwargs cannot contain reserved keys {sorted(shadowed)}; set them as fields instead",
+            f"{type(self).__name__}.sampler_kwargs cannot contain reserved keys {sorted(shadowed)}; set them as fields instead",
         )
 
     def resolve_sde_indices(self, rollout_id: int) -> List[int]:
@@ -239,13 +255,3 @@ class ARSamplingParams(BaseSamplingParams):
     top_k: int = 0
     stop_token_id: int | None = None
     seed: Optional[int] = None  # engines with per-request seeded sampling derive child seeds from this + sample_id
-
-    def __post_init__(self) -> None:
-        super().__post_init__()
-        prefix = type(self).__name__
-        self.temperature = _as_float(self.temperature, name=f"{prefix}.temperature")
-        self.max_new_tokens = _as_int(self.max_new_tokens, name=f"{prefix}.max_new_tokens")
-        self.top_p = _as_float(self.top_p, name=f"{prefix}.top_p")
-        self.top_k = _as_int(self.top_k, name=f"{prefix}.top_k")
-        self.stop_token_id = _as_int(self.stop_token_id, name=f"{prefix}.stop_token_id", optional=True)
-        self.seed = _as_int(self.seed, name=f"{prefix}.seed", optional=True)
