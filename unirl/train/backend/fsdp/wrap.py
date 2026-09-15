@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import socket
 from functools import partial
 from typing import Any, Dict, Optional, Tuple
 
@@ -26,6 +27,12 @@ def _new_copy_engine_pg_options() -> Any:
         nccl_version is not None and tuple(nccl_version[:2]) >= (2, 28),
         f"FSDP copy-engine all-gather requires NCCL >= 2.28, got {nccl_version}.",
     )
+    from torch.distributed.fsdp import FSDPModule
+
+    require(
+        hasattr(FSDPModule, "set_symm_mem_for_comm"),
+        "FSDP copy-engine all-gather requires PyTorch with FSDPModule.set_symm_mem_for_comm().",
+    )
     process_group_nccl = getattr(torch.distributed, "ProcessGroupNCCL", None)
     require(
         process_group_nccl is not None
@@ -39,18 +46,24 @@ def _new_copy_engine_pg_options() -> Any:
         "FSDP copy-engine all-gather requires ProcessGroupNCCL.Options.config.cta_policy.",
     )
     options.config.cta_policy = process_group_nccl.NCCL_CTA_POLICY_ZERO
+    options._timeout = torch.distributed.constants.default_pg_timeout
     return options
 
 
-def configure_copy_engine_all_gather(enable: bool) -> Any:
-    """Build explicit NCCL zero-CTA options before the default group is created."""
+def configure_copy_engine_all_gather(enable: bool, *, fsdp_mode: str) -> None:
+    """Validate copy-engine support before the default group is created."""
     if not enable:
         return None
 
+    require(
+        normalize_fsdp_mode(fsdp_mode) != "no_shard",
+        "FSDP copy-engine all-gather is invalid with fsdp_mode='no_shard'.",
+    )
     policy = os.environ.get("NCCL_CTA_POLICY")
     require(
         policy in {None, "2"},
-        f"FSDP copy-engine all-gather requires NCCL_CTA_POLICY=2, but the environment sets it to {policy!r}.",
+        "FSDP copy-engine all-gather sets zero-CTA on its shard communicators, but "
+        f"NCCL_CTA_POLICY={policy!r} would override it. Unset NCCL_CTA_POLICY or set it to '2'.",
     )
     require(
         not torch.distributed.is_initialized(),
@@ -58,7 +71,8 @@ def configure_copy_engine_all_gather(enable: bool) -> Any:
         "was initialized. Construct FSDPBackend before any sibling initializes the default "
         "communicator so it can be created with an explicit zero-CTA policy.",
     )
-    return _new_copy_engine_pg_options()
+    _new_copy_engine_pg_options()
+    return None
 
 
 def _clone_checkpoint_kwarg(value: Any) -> Any:
@@ -139,10 +153,6 @@ def fsdp_wrap(
         fsdp_kwargs["offload_policy"] = CPUOffloadPolicy()
 
     mode = normalize_fsdp_mode(fsdp_mode)
-    require(
-        not copy_engine_all_gather or mode != "no_shard",
-        "FSDP copy-engine all-gather is invalid with fsdp_mode='no_shard'.",
-    )
     mesh = _create_device_mesh(
         mode,
         hsdp_shard_size=hsdp_shard_size,
@@ -331,7 +341,12 @@ def _create_device_mesh(
         hsdp_shard_size=hsdp_shard_size,
     )
     if mesh_shape is None:
-        return None
+        if not copy_engine_all_gather:
+            return None
+        mesh_shape = (dist.get_world_size(),)
+        mesh_dim_names = ("dp_shard",)
+    else:
+        mesh_dim_names = ("dp_replicate", "dp_shard")
 
     from torch.distributed.device_mesh import init_device_mesh
 
@@ -341,11 +356,21 @@ def _create_device_mesh(
     mesh = init_device_mesh(
         "cuda",
         mesh_shape,
-        mesh_dim_names=("dp_replicate", "dp_shard"),
+        mesh_dim_names=mesh_dim_names,
         backend_override=backend_override,
     )
+    if copy_engine_all_gather:
+        shard_group = mesh.get_group("dp_shard")
+        hosts = [None] * dist.get_world_size(shard_group)
+        dist.all_gather_object(hosts, socket.gethostname(), group=shard_group)
+        require(
+            len(set(hosts)) == 1,
+            "FSDP copy-engine all-gather requires each dp_shard group to stay within one node; "
+            f"this group spans hosts {sorted(set(hosts))}. Use hybrid mode with a node-local hsdp_shard_size.",
+        )
     if _current_rank() == 0:
-        logger.info("fsdp_wrap: %s mesh dp_replicate=%d x dp_shard=%d", fsdp_mode, *mesh_shape)
+        dimensions = " x ".join(f"{name}={size}" for name, size in zip(mesh_dim_names, mesh_shape))
+        logger.info("fsdp_wrap: %s mesh %s", fsdp_mode, dimensions)
     return mesh
 
 

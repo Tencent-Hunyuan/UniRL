@@ -24,7 +24,6 @@ from unirl.train.configs import (
     EmaLoraConfig,
     FSDPConfig,
     LoraConfig,
-    normalize_fsdp_mode,
 )
 from unirl.utils.distributed_utils import ensure_dist_initialized
 from unirl.utils.dtypes import parse_torch_dtype
@@ -55,17 +54,16 @@ class FSDPBackend(BaseFSDP2Backend):
         self._bundle = bundle
         self._rank = int(rank)
         self._device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        pg_options = configure_copy_engine_all_gather(fsdp_cfg.copy_engine_all_gather)
-        default_pg_options = pg_options if normalize_fsdp_mode(fsdp_cfg.fsdp_mode) != "hybrid" else None
+        configure_copy_engine_all_gather(
+            fsdp_cfg.copy_engine_all_gather,
+            fsdp_mode=fsdp_cfg.fsdp_mode,
+        )
         pg_device = None
-        if pg_options is not None:
+        if fsdp_cfg.copy_engine_all_gather:
             pg_device = torch.device(self._device)
             if pg_device.index is None:
                 pg_device = torch.device(pg_device.type, torch.cuda.current_device())
-        ensure_dist_initialized(
-            pg_options=default_pg_options,
-            device_id=pg_device,
-        )
+        ensure_dist_initialized(device_id=pg_device)
 
         self._weight_sync_dtype: torch.dtype = parse_torch_dtype(
             fsdp_cfg.param_dtype, field_name="training.fsdp.param_dtype"
