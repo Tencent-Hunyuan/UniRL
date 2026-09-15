@@ -134,6 +134,19 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   Set `track_builder.append_eos: false` to match verl's span. Neither choice is
   wrong, but they are different objectives, and comparing across them is not a
   comparison of implementations.
+- **Dense-padded pairing shifts the margin slightly, and the shift tracks the length
+  difference.** `Qwen3OmniARStage.replay` forwards a pair as a dense `[B, T]` batch
+  padded to the longer branch, so the shorter branch carries the padding; verl-omni
+  instead runs `pad_mode=no_padding` over nested tensors, where each branch sees only
+  its own tokens. Forwarding each branch alone and re-deriving the margin changes it
+  by **mean +0.003, median +0.005, max 0.13**, and that shift correlates with
+  `len(chosen) − len(rejected)` at **+0.21** — so padding is not perfectly inert and
+  the leak is length-dependent, which is the same direction as the length-sensitivity
+  gap against verl. It is small: 55/60 ranking decisions are unchanged, and the
+  accuracy difference (0.70 paired vs 0.65 alone) is well inside the ±8.4pp binomial
+  SE at n=60 and not significant (McNemar p=0.37). Worth knowing before attributing a
+  few points of accuracy to anything else; not worth restructuring the forward for on
+  this evidence.
 - **The segment-sum must not use `index_add`/`scatter_add_`.** Both accumulate
   with CUDA atomics, so the addition order varies between otherwise identical
   calls and the per-sequence sum is not reproducible. Measured spread on one
