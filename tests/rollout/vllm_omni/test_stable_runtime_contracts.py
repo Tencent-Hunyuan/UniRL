@@ -96,6 +96,16 @@ def test_collective_rpc_rejects_unsupported_stage() -> None:
         )
 
 
+def test_collective_rpc_rejects_false_except_idempotent_lora_removal() -> None:
+    backend = _backend(_Engine())
+    with pytest.raises(RuntimeError, match="returned False"):
+        backend._require_rpc_success("set_lora_from_tensor_dict", 0, [False])
+    with pytest.raises(RuntimeError, match="unexpected result"):
+        backend._require_rpc_success("update_weights", 0, ["failed"])
+
+    backend._require_rpc_success("remove_lora", 0, [False], allow_false=True)
+
+
 def test_boot_passes_stable_deploy_config_and_reads_engine_stages(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict = {}
 

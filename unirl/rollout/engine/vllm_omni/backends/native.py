@@ -309,7 +309,13 @@ class VLLMOmniBackend:
         return str(metadata.stage_type)
 
     @staticmethod
-    def _require_rpc_success(action: str, stage_id: int, results: object) -> None:
+    def _require_rpc_success(
+        action: str,
+        stage_id: int,
+        results: object,
+        *,
+        allow_false: bool = False,
+    ) -> None:
         """Fail closed when a stage or replica reports an unsupported/failed RPC."""
 
         def validate(result: object) -> None:
@@ -319,8 +325,12 @@ class VLLMOmniBackend:
                 for item in result:
                     validate(item)
                 return
-            if not isinstance(result, Mapping):
+            if isinstance(result, bool):
+                if not result and not allow_false:
+                    raise RuntimeError(f"vllm-omni {action} returned False on stage {stage_id}")
                 return
+            if not isinstance(result, Mapping):
+                raise RuntimeError(f"vllm-omni {action} returned an unexpected result on stage {stage_id}: {result!r}")
 
             status = result.get("status")
             error = result.get("error")
@@ -337,6 +347,7 @@ class VLLMOmniBackend:
         *,
         args: tuple = (),
         kwargs: Optional[dict] = None,
+        allow_false: bool = False,
     ) -> List[Any]:
         results = self._require_omni().engine.collective_rpc(
             method=method,
@@ -344,7 +355,7 @@ class VLLMOmniBackend:
             kwargs=kwargs,
             stage_ids=[stage_id],
         )
-        self._require_rpc_success(method, stage_id, results)
+        self._require_rpc_success(method, stage_id, results, allow_false=allow_false)
         return results
 
     @staticmethod
@@ -650,7 +661,12 @@ class VLLMOmniBackend:
     def _remove_existing_lora(self, adapter_id: int) -> None:
         """Drop the existing adapter on every stage before re-adding."""
         for sid in self._stage_ids():
-            self._collective_rpc(sid, "remove_lora", args=(int(adapter_id),))
+            self._collective_rpc(
+                sid,
+                "remove_lora",
+                args=(int(adapter_id),),
+                allow_false=True,
+            )
 
     def param_checksums(self, *, names: List[str]) -> dict:
         """Fan ``_diffrl_loaded_param_checksums`` across stages and ranks."""

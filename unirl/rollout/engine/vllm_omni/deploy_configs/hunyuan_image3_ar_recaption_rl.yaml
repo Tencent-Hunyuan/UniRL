@@ -1,5 +1,5 @@
 # HunyuanImage-3 terminal AR recaption deployment for the two-engine trainer.
-pipeline: unirl_hi3_ar_text
+pipeline: unirl_hi3_ar_recaption
 async_chunk: false
 distributed_executor_backend: mp
 

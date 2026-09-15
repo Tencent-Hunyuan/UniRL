@@ -87,6 +87,7 @@ def test_hi3_text_topologies_preserve_legacy_output_contract() -> None:
     pytest.importorskip("vllm_omni")
     from unirl.rollout.engine.vllm_omni.pipeline_configs import (
         UNIRL_HI3_AR_MULTIMODAL_TEXT,
+        UNIRL_HI3_AR_RECAPTION,
         UNIRL_HI3_AR_TEXT,
         UNIRL_QWEN3_OMNI_THINKER,
     )
@@ -100,6 +101,12 @@ def test_hi3_text_topologies_preserve_legacy_output_contract() -> None:
     assert text_stage.requires_multimodal_data is False
     assert multimodal_stage.requires_multimodal_data is True
 
+    recaption_stage = UNIRL_HI3_AR_RECAPTION.stages[0]
+    assert recaption_stage.final_output_type == "text"
+    assert recaption_stage.engine_output_type == "latent"
+    assert recaption_stage.owns_tokenizer is True
+    assert recaption_stage.requires_multimodal_data is False
+
     qwen_stage = UNIRL_QWEN3_OMNI_THINKER.stages[0]
     assert qwen_stage.model_arch == "Qwen3OmniMoeThinkerForConditionalGeneration"
     assert qwen_stage.engine_output_type == "text"
@@ -109,3 +116,11 @@ def test_hi3_t2i_does_not_forward_at_raw_prefill_output() -> None:
     config = yaml.safe_load((DEPLOY_DIR / "hunyuan_image3_t2i_rl.yaml").read_text())
     stage_zero = config["stages"][0]
     assert stage_zero["omni_kv_config"] == {"need_send_cache": True}
+
+
+@pytest.mark.parametrize("name", ["hunyuan_image3_ar_rl.yaml", "hunyuan_image3_i2t_rl.yaml"])
+def test_hi3_text_lora_adapters_install_weight_sync_extension(name: str) -> None:
+    config = yaml.safe_load((DEPLOY_DIR / name).read_text())
+    stage_zero = config["stages"][0]
+    assert stage_zero["enable_lora"] is True
+    assert stage_zero["worker_extension_cls"].endswith(".HI3ARWeightSyncExtension")
