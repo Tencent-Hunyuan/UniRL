@@ -27,18 +27,14 @@ class MathVerifyRewardScorer(LocalRewardBackend):
         """Grade every job and send the verdicts back; runs in the child, never the caller."""
         from math_verify import parse, verify
 
-        verdicts: List[bool] = []
-        for gold, prediction in jobs:
-            try:
-                verdicts.append(
-                    verify(
-                        parse("\\boxed{" + gold + "}", parsing_timeout=seconds),
-                        parse(prediction, parsing_timeout=seconds),
-                        timeout_seconds=seconds,
-                    )
-                )
-            except Exception:
-                verdicts.append(False)
+        verdicts = [
+            verify(
+                parse("\\boxed{" + gold + "}", parsing_timeout=seconds),
+                parse(prediction, parsing_timeout=seconds),
+                timeout_seconds=seconds,
+            )
+            for gold, prediction in jobs
+        ]
         conn.send(verdicts)
 
     @staticmethod
