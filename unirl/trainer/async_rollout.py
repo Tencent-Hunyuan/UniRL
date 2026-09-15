@@ -6,6 +6,7 @@ import logging
 import time
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
+from unirl.reward.async_dispatch import chain_reward
 from unirl.rollout.manager import (
     RolloutManager,
     keep_within_lag,
@@ -191,6 +192,11 @@ class AsyncRolloutTrainerMixin:
         raise NotImplementedError
 
     def _score_completed(self, rollout_id: int, completed: "Sample") -> "Sample":
+        if getattr(self, "_async_reward", False):
+            if completed.parts[-1].rewards is None:
+                raise RuntimeError("async reward pipeline returned a completed group without attached rewards")
+            self._drop_decoded(completed, rollout_id=rollout_id)
+            return completed
         scored = self.reward.score_and_attach(completed)
         self._drop_decoded(scored, rollout_id=rollout_id)
         return scored
@@ -230,7 +236,30 @@ class AsyncRolloutTrainerMixin:
 
         self._next_generation_id = start_rollout
         engine_slots = self.rollout.engine_slots
-        launchers = [lambda sample, slot=slot: slot.launch("generate_on_slot", sample) for slot in engine_slots]
+        export_outputs_to_cpu = getattr(self, "_reward_client_on_driver", False)
+        if getattr(self, "_async_reward", False):
+            if self.reward is None:
+                raise ValueError("async_reward=true requires a configured `reward:` service")
+            launchers = [
+                lambda sample, slot=slot: chain_reward(
+                    slot.launch(
+                        "generate_on_slot",
+                        sample,
+                        export_outputs_to_cpu=export_outputs_to_cpu,
+                    ),
+                    self.reward,
+                )
+                for slot in engine_slots
+            ]
+        else:
+            launchers = [
+                lambda sample, slot=slot: slot.launch(
+                    "generate_on_slot",
+                    sample,
+                    export_outputs_to_cpu=export_outputs_to_cpu,
+                )
+                for slot in engine_slots
+            ]
         self._rollout_manager = RolloutManager(
             self.rollout,
             launchers=launchers,
@@ -295,7 +324,11 @@ class AsyncRolloutTrainerMixin:
             try:
                 self._rollout_manager.close()
             finally:
-                self._finish_wandb()
+                try:
+                    if getattr(self, "_reward_client_on_driver", False):
+                        self.reward.shutdown()
+                finally:
+                    self._finish_wandb()
 
     def _sync_rollout(self, *, force: bool = False, require_empty: bool = False) -> None:
         manager = self._rollout_manager

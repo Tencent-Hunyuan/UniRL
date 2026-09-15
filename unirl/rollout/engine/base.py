@@ -68,9 +68,21 @@ class BaseRolloutEngine(Remote, ABC):
     def generate(self, sample: Sample) -> Sample:
         """Synchronously fill and return one request ``Sample``; each concrete contract owns its dispatch mode."""
 
-    def generate_on_slot(self, sample: Sample) -> Sample:
-        """Undecorated per-engine entry point for driver-side lane dispatch."""
-        return self.generate(sample)
+    def generate_on_slot(self, sample: Sample, *, export_outputs_to_cpu: bool = False) -> Sample:
+        """Generate on one engine slot and optionally export outputs to CPU."""
+        result = self.generate(sample)
+        if not export_outputs_to_cpu:
+            return result
+        from unirl.distributed.tensor.ref import TensorRef, map_tree
+
+        def export_to_cpu(value):
+            if isinstance(value, TensorRef):
+                return value.transform(lambda tensor: tensor.cpu() if tensor.is_cuda else tensor)
+            if isinstance(value, torch.Tensor) and value.is_cuda:
+                return value.cpu()
+            return value
+
+        return map_tree(result, export_to_cpu)
 
     def abort(self, ids: Optional[List[str]] = None) -> List[Sample]:
         """Best-effort cancel of in-flight generation; return any partials. Default no-op."""
