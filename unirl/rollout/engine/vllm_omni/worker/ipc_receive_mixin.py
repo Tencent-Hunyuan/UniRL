@@ -228,10 +228,7 @@ class BucketedIPCReceiveMixin:
 
     def _diffrl_parameter_source(self):
         """Return the loaded module behind AR or diffusion runner wrappers."""
-        runner = getattr(self, "model_runner", None)
-        if runner is None:
-            return None
-        queue = [getattr(runner, attr, None) for attr in ("pipeline", "model")]
+        queue = [self]
         seen: set[int] = set()
         while queue:
             obj = queue.pop(0)
@@ -240,7 +237,18 @@ class BucketedIPCReceiveMixin:
             seen.add(id(obj))
             if callable(getattr(obj, "named_parameters", None)):
                 return obj
-            queue.extend(getattr(obj, attr, None) for attr in ("transformer", "model", "bagel"))
+            queue.extend(
+                getattr(obj, attr, None)
+                for attr in (
+                    "worker",
+                    "model_runner",
+                    "runner",
+                    "pipeline",
+                    "transformer",
+                    "model",
+                    "bagel",
+                )
+            )
         return None
 
     def _diffrl_describe_params(
