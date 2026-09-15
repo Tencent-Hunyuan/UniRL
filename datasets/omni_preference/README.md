@@ -235,6 +235,19 @@ cross-split number is quietly wrong in the favourable direction.
   than a contract difference. Since a raw margin here is 3–6, per-pair noise of that
   size is 20–30% of the quantity being thresholded; it does not bias the mean margin
   but it flips near-tie pairs, which is what accuracy counts.
+- **The residual gap is reproducible, not run-to-run noise — a control this
+  comparison had been missing all along.** Every cross-stack number up to this point
+  compared two *single* runs without ever measuring how much one config varies
+  against itself. LoRA init is not seeded here, so re-running the identical aligned
+  config is a genuine replicate (its step-2 loss differs, 0.69285 vs 0.69600). Two
+  replicates land at **0.7633 and 0.7583** accuracy (margins 0.5976 / 0.5865, eval
+  loss 0.58609 / 0.58500) — a spread of 0.50pp, against a gap to verl of **+3.92pp**,
+  about 8× larger. So the gap survives, and its margin component (≈0.59 vs 0.307,
+  still ~1.9×) survives too. Two replicates cannot estimate a variance, so treat
+  0.50pp as one draw rather than a confidence bound; but the gap is not explained by
+  restart noise, and it is no longer explained by any difference in configuration,
+  training process, or input contract, all of which are now aligned or measured
+  inert. What remains unattributed is ~4pp of accuracy and a ~1.9× margin ratio.
   Consequently the "+5.8pp for UniRL" reported earlier was verl's model run through a
   foreign pipeline, and does not support any claim about either implementation.
   Comparing own-pipeline numbers (verl 0.9670, UniRL 0.8067) is also not sound: the
