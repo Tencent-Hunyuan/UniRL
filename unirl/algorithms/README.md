@@ -144,9 +144,22 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   the leak is length-dependent, which is the same direction as the length-sensitivity
   gap against verl. It is small: 55/60 ranking decisions are unchanged, and the
   accuracy difference (0.70 paired vs 0.65 alone) is well inside the ±8.4pp binomial
-  SE at n=60 and not significant (McNemar p=0.37). Worth knowing before attributing a
-  few points of accuracy to anything else; not worth restructuring the forward for on
-  this evidence.
+  SE at n=60 and not significant (McNemar p=0.37).
+
+  Repeating it powered, over the full 600-row split with every row scored both ways,
+  separates the two halves of the claim cleanly. The **leak is real and
+  length-dependent**: the shift correlates with `len(chosen) − len(rejected)` at
+  **+0.221, 95% CI [+0.144, +0.296]**, excluding zero, and it splits by direction —
+  padding *helps* when chosen is longer (n=478, accuracy +1.67pp, mean shift +0.027)
+  and *hurts* when chosen is shorter (n=94, −5.32pp, mean shift −0.006). So dense
+  padding systematically favours the longer branch, which is the mechanism a
+  length-sensitivity difference would need. But its effect on **overall** accuracy is
+  not resolvable: +0.83pp, 95% CI [−0.83, +2.50], McNemar p=0.42 (15 vs 10 discordant
+  of 600), because this split is 478/94 skewed toward chosen-longer and the two
+  directions cancel. The CI's upper bound is below the ~3.9pp residual it was meant to
+  explain, so padding is not that explanation. On a length-balanced set the
+  cancellation would not hold, which is the case where switching to a no-padding
+  forward would actually matter.
 - **The segment-sum must not use `index_add`/`scatter_add_`.** Both accumulate
   with CUDA atomics, so the addition order varies between otherwise identical
   calls and the per-sequence sum is not reproducible. Measured spread on one
