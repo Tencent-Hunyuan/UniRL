@@ -24,7 +24,7 @@ def _new_copy_engine_pg_options() -> Any:
     require(torch.cuda.is_available(), "FSDP copy-engine all-gather requires CUDA.")
     nccl_version = torch.cuda.nccl.version()
     require(
-        nccl_version is not None and tuple(nccl_version[:2]) >= (2, 28),
+        tuple(nccl_version[:2]) >= (2, 28),
         f"FSDP copy-engine all-gather requires NCCL >= 2.28, got {nccl_version}.",
     )
     from torch.distributed.fsdp import FSDPModule
@@ -68,11 +68,11 @@ def configure_copy_engine_all_gather(enable: bool, *, fsdp_mode: str) -> None:
     require(
         not torch.distributed.is_initialized(),
         "FSDP copy-engine all-gather was enabled after the default process group "
-        "was initialized. Construct FSDPBackend before any sibling initializes the default "
-        "communicator so it can be created with an explicit zero-CTA policy.",
+        "was initialized. Construct FSDPBackend first so WORLD is bound to an indexed "
+        "CUDA device and the zero-CTA shard communicator can be split from it.",
     )
     _new_copy_engine_pg_options()
-    return None
+    return
 
 
 def _clone_checkpoint_kwarg(value: Any) -> Any:
@@ -244,12 +244,7 @@ def fsdp_wrap(
         fsdp_modules = tuple(module for module in model.modules() if isinstance(module, FSDPModule))
         require(fsdp_modules, "FSDP copy-engine all-gather requires at least one fully-sharded module.")
         for fsdp_module in fsdp_modules:
-            setter = getattr(fsdp_module, "set_symm_mem_for_comm", None)
-            require(
-                callable(setter),
-                "FSDP copy-engine all-gather requires a PyTorch build with FSDPModule.set_symm_mem_for_comm().",
-            )
-            setter("NCCL")
+            fsdp_module.set_symm_mem_for_comm("NCCL")
 
     if mode == "hybrid":
         _validate_hsdp_mesh(model, expected_mesh=mesh)
