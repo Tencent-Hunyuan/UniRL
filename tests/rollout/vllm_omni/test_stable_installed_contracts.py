@@ -104,3 +104,17 @@ def test_hi3_expert_mapping_tuple_is_unwrapped(monkeypatch: pytest.MonkeyPatch) 
     compat_hi3_lora.install()
 
     assert vllm_utils.get_moe_expert_mapping(object()) == mapping
+
+
+def test_diffusion_parameter_probe_reaches_wrapped_transformer() -> None:
+    import torch
+
+    from unirl.rollout.engine.vllm_omni.worker.ipc_receive_mixin import BucketedIPCReceiveMixin
+
+    worker = object.__new__(BucketedIPCReceiveMixin)
+    transformer = torch.nn.Linear(4, 3)
+    worker.model_runner = type("Runner", (), {"pipeline": type("Pipeline", (), {"transformer": transformer})()})()
+
+    descriptions = worker._diffrl_describe_params()
+
+    assert descriptions["weight"] == ((3, 4), "torch.float32")
