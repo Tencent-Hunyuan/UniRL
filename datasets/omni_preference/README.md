@@ -234,7 +234,17 @@ cross-split number is quietly wrong in the favourable direction.
   +0.02 across four rows — **mixed signs, mean −0.07**, so zero-mean noise rather
   than a contract difference. Since a raw margin here is 3–6, per-pair noise of that
   size is 20–30% of the quantity being thresholded; it does not bias the mean margin
-  but it flips near-tie pairs, which is what accuracy counts.
+  but it flips near-tie pairs, which is what accuracy counts. **Correction:** that
+  comparison fed verl's tensors through a dense `model(...)` call and this stack's
+  through `pipeline.ar.replay(...)`, which are two different code paths *within this
+  stack* — packed varlen with `fuse_full_ids` versus a dense forward. Running the
+  same row through both paths here, no adapter, gives mixed-sign differences up to
+  0.54 (mean +0.19), the same scale as the "cross-stack" spread, so those numbers
+  measured my own two paths and say nothing about verl. Position ids are separately
+  confirmed **numerically identical** between the stacks (`max |diff| = 0`, zero
+  mismatched elements), and verl's negative-sentinel substitution before
+  `get_rope_index` is a no-op — raw and sentinel ids return bit-identical positions.
+  So rope is not the cause either.
 - **The residual gap is reproducible, not run-to-run noise — a control this
   comparison had been missing all along.** Every cross-stack number up to this point
   compared two *single* runs without ever measuring how much one config varies
