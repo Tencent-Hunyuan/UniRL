@@ -22,8 +22,6 @@ stages:
         rope_type: default
     omni_kv_config:
       need_send_cache: true
-      kv_transfer_criteria:
-        type: prefill_finished
     default_sampling_params:
       temperature: 0.0
       top_p: 1.0

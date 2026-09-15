@@ -103,3 +103,9 @@ def test_hi3_text_topologies_preserve_legacy_output_contract() -> None:
     qwen_stage = UNIRL_QWEN3_OMNI_THINKER.stages[0]
     assert qwen_stage.model_arch == "Qwen3OmniMoeThinkerForConditionalGeneration"
     assert qwen_stage.engine_output_type == "text"
+
+
+def test_hi3_t2i_does_not_forward_at_raw_prefill_output() -> None:
+    config = yaml.safe_load((DEPLOY_DIR / "hunyuan_image3_t2i_rl.yaml").read_text())
+    stage_zero = config["stages"][0]
+    assert stage_zero["omni_kv_config"] == {"need_send_cache": True}
