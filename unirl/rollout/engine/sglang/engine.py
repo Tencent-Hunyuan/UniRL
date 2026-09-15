@@ -133,6 +133,7 @@ class SGLangRolloutEngine(BaseRolloutEngine):
             self._backend = NativeBackend.boot(
                 intent,
                 concurrency=concurrency,
+                cuda_visible_devices=self._tp_visible_devices,
             )
         else:
             bind_host = str(engine_kwargs.get("host") or config.host or "0.0.0.0")
