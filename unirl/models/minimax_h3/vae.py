@@ -34,7 +34,16 @@ def _sp_decode_group():
     _compat.ensure_installed()
     from veomni.distributed.parallel_state import get_parallel_state
 
-    state = get_parallel_state()
+    # The backend only calls initialize_sequence_parallel_state() when sp_size > 1, so
+    # at sp_size == 1 there is no VeOmni parallel state to read: probing it raises
+    # "The product of parallel sizes should be equal to the world size." Treat an
+    # uninitialized state as "no SP" rather than as an error.
+    try:
+        state = get_parallel_state()
+    except ValueError as exc:
+        if str(exc) != "The product of parallel sizes should be equal to the world size.":
+            raise
+        return None
     sp_size = int(state.sp_size)
     if sp_size <= 1:
         return None
