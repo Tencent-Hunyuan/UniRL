@@ -117,38 +117,16 @@ new remote reward needs no UniRL code — add it to the server and list its name
 - **`input_kind` must match the media** (`image`/`video`/`text`) — it picks which
   decoded key the backend sees. Remote allows only `image`/`video`; local scorers
   may be `text`.
-- **`math_verify` grades in a child process, and that is not optional.** Its own
-  timeouts are `signal.alarm`-based, so they require the main thread. A synchronous
-  Ray actor may run reward code on its main thread, but a threaded actor
-  (`worker_max_concurrency > 1`) does not; inline grading would therefore behave
-  differently across worker configurations. Inside the child the main thread is the
-  child's own, so the timeouts work consistently and are passed through
-  (`UNIRL_MATHVERIFY_TIMEOUT_S`, default 10s). One child per reward call grades the
-  whole batch and exits. The forkserver preloads both `math_verify` and this target
-  module so children inherit their imports instead of repeating them. A child that is
-  OOM-killed, exits early, or misses the outer deadline raises from the scorer so the
-  reward step fails instead of treating an infrastructure failure as a successful
-  batch of zero rewards. The parent budget (`3 * timeout * jobs + 60s`) covers two
-  parse windows and one ordinary verification window per job; it remains a hard
-  aggregate cap, not an allowance for every internal parser retry or candidate pair.
-  Three details are load-bearing: `forkserver` rather than `fork`, because `fork`
-  inherits Ray's signal handlers, `atexit` state, CUDA state, and copies of locks held
-  by other threads; additionally, `logging`'s registered at-fork handler acquires its
-  module lock with no timeout before the fork; `wait()` on the child's sentinel as
-  well as the pipe, so a child that dies immediately costs a round-trip instead of
-  the whole deadline; and `proc.start()` inside the `try`, because `forkserver` forks
-  the child *before* the parent writes the job payload to it, so a child dying in that
-  window raises `BrokenPipeError` out of `start()`. **Do not reintroduce a
-  `multiprocessing.Pool` here**: `Pool.terminate()` sends each worker `SIGTERM` and
-  then joins it with no timeout (CPython 3.12 `pool.py:732`). A pool worker created
-  with `fork` may run inherited Ray signal/exit handlers against inconsistent
-  post-fork state and fail to exit; the captured 32-GPU stack confirms that the parent
-  can then remain blocked in this unbounded join. `proc.kill()` is used instead
-  because `SIGKILL` cannot be caught, blocked, or ignored.
-- **A standalone test of the grader needs a real file with an `if __name__ ==
-  "__main__":` guard.** `forkserver` re-imports `__main__` in the child, so an unguarded
-  script — or a heredoc, where `__main__` is `<stdin>` — makes child startup fail.
-  Production is unaffected: in a reward worker `__main__` is Ray's
-  `default_worker.py`.
+- **`math_verify` grades each batch in a `forkserver` child.** Its
+  `signal.alarm` timeouts require the main thread, which threaded Ray actors do not
+  provide. The forkserver preloads `math_verify` and the scorer module, avoiding
+  repeated imports without inheriting the worker's threaded process state. The parent
+  waits on both the result pipe and child sentinel; keep `proc.start()` inside the
+  cleanup boundary so startup failures also release resources. Per-operation timeout
+  is `UNIRL_MATHVERIFY_TIMEOUT_S` (default 10s), with a hard batch cap of
+  `3 * timeout * jobs + 60s`. Wrong or unparsable answers return 0.0, while child,
+  IPC, and batch-timeout failures raise. Teardown uses `SIGKILL` plus a bounded join;
+  do not replace it with `multiprocessing.Pool.terminate()`, whose worker join is
+  unbounded.
 - **`base_device` is ignored by the remote backend** (it's HTTP-only); local
   scorers honor it, falling back to CPU with a warning if CUDA is unavailable.
