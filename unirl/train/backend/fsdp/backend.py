@@ -58,12 +58,7 @@ class FSDPBackend(BaseFSDP2Backend):
             fsdp_cfg.copy_engine_all_gather,
             fsdp_mode=fsdp_cfg.fsdp_mode,
         )
-        pg_device = None
-        if fsdp_cfg.copy_engine_all_gather:
-            pg_device = torch.device(self._device)
-            if pg_device.index is None:
-                pg_device = torch.device(pg_device.type, torch.cuda.current_device())
-        ensure_dist_initialized(device_id=pg_device)
+        ensure_dist_initialized()
 
         self._weight_sync_dtype: torch.dtype = parse_torch_dtype(
             fsdp_cfg.param_dtype, field_name="training.fsdp.param_dtype"

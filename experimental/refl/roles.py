@@ -76,11 +76,6 @@ class ReflActorRole(Remote):
         self.kl_weight = float(kl_weight)
 
     def initialize(self) -> None:
-        if self._fsdp_cfg.copy_engine_all_gather:
-            raise ValueError(
-                "ReflActorRole does not support copy_engine_all_gather because it initializes the default process "
-                "group before FSDPBackend; use the standard trainer path."
-            )
         torch.cuda.set_device(self.device)
         if self.rank_info is not None and int(self.rank_info.world_size) > 1 and not dist.is_initialized():
             dist.init_process_group(backend="nccl")
