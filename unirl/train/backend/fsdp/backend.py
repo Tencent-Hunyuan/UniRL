@@ -54,8 +54,8 @@ class FSDPBackend(BaseFSDP2Backend):
         self._bundle = bundle
         self._rank = int(rank)
         self._device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        configure_copy_engine_all_gather(fsdp_cfg.copy_engine_all_gather)
-        ensure_dist_initialized()
+        pg_options = configure_copy_engine_all_gather(fsdp_cfg.copy_engine_all_gather)
+        ensure_dist_initialized(pg_options=pg_options)
 
         self._weight_sync_dtype: torch.dtype = parse_torch_dtype(
             fsdp_cfg.param_dtype, field_name="training.fsdp.param_dtype"

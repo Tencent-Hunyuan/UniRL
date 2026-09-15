@@ -63,13 +63,16 @@ def train_step(model: nn.Module, optimizer: torch.optim.Optimizer, inputs: torch
 
 def main() -> None:
     args = parse_args()
+    pg_options = None
     if args.copy_engine:
         os.environ["NCCL_CTA_POLICY"] = "2"
+        pg_options = dist.ProcessGroupNCCL.Options()
+        pg_options.config.cta_policy = dist.ProcessGroupNCCL.NCCL_CTA_POLICY_ZERO
 
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
-    dist.init_process_group("nccl", device_id=device)
+    dist.init_process_group("nccl", device_id=device, pg_options=pg_options)
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     if world_size % args.shard_size:
