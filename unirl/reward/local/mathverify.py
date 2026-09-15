@@ -31,12 +31,10 @@ class MathVerifyRewardScorer(LocalRewardBackend):
         for gold, prediction in jobs:
             try:
                 verdicts.append(
-                    bool(
-                        verify(
-                            parse("\\boxed{" + gold + "}", parsing_timeout=seconds),
-                            parse(prediction, parsing_timeout=seconds),
-                            timeout_seconds=seconds,
-                        )
+                    verify(
+                        parse("\\boxed{" + gold + "}", parsing_timeout=seconds),
+                        parse(prediction, parsing_timeout=seconds),
+                        timeout_seconds=seconds,
                     )
                 )
             except Exception:
@@ -69,7 +67,6 @@ class MathVerifyRewardScorer(LocalRewardBackend):
                     raise RuntimeError(f"math-verify returned {len(verdicts)} verdicts for {len(jobs)} jobs")
                 return verdicts
             if proc.sentinel in ready:
-                proc.join(timeout=0)
                 raise RuntimeError(f"math-verify child exited with code {proc.exitcode} before returning verdicts")
             raise TimeoutError(f"math-verify child did not return {len(jobs)} verdicts within {deadline_s}s")
         finally:
