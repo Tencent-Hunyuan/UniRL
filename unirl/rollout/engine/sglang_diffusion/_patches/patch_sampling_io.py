@@ -108,6 +108,15 @@ def _wrap_validate_with_pipeline_config(SamplingParams) -> None:
 _GEN_SENTINEL = "_unirl_diff_gen_index"
 
 
+def _is_per_prompt_condition_image(ci) -> bool:
+    """Whether ``condition_image`` is per-prompt: nested for multi-ref, or flat with more than one prompt."""
+    if not isinstance(ci, list) or not ci:
+        return False
+    if all(isinstance(entry, list) for entry in ci):
+        return True
+    return len(ci) > 1
+
+
 def _wrap_diff_generator_generate() -> None:
     """AROUND-wrap ``DiffGenerator.generate`` to index ``condition_image`` per prompt."""
     try:
@@ -125,7 +134,7 @@ def _wrap_diff_generator_generate() -> None:
 
     def generate(self, sampling_params_kwargs=None, *args, **kwargs):
         ci = (sampling_params_kwargs or {}).get("condition_image")
-        if isinstance(ci, list) and len(ci) > 1:
+        if _is_per_prompt_condition_image(ci):
             _local.condition_image_per_prompt = ci
             _local.condition_image_idx = 0
         else:
@@ -313,7 +322,7 @@ def _wrap_prepare_request(utils_mod, SamplingParams) -> None:
         condition_image = getattr(sampling_params, "condition_image", None)
         if condition_image is not None:
             stash = getattr(_local, "condition_image_per_prompt", None)
-            if isinstance(stash, list) and len(stash) > 1:
+            if isinstance(stash, list) and stash:
                 idx = getattr(_local, "condition_image_idx", 0)
                 if idx >= len(stash):
                     raise RuntimeError(
