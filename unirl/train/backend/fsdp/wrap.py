@@ -65,12 +65,6 @@ def configure_copy_engine_all_gather(enable: bool, *, fsdp_mode: str) -> None:
         "FSDP copy-engine all-gather sets zero-CTA on its shard communicators, but "
         f"NCCL_CTA_POLICY={policy!r} would override it. Unset NCCL_CTA_POLICY or set it to '2'.",
     )
-    require(
-        not torch.distributed.is_initialized(),
-        "FSDP copy-engine all-gather was enabled after the default process group "
-        "was initialized. Construct FSDPBackend first so WORLD is bound to an indexed "
-        "CUDA device and the zero-CTA shard communicator can be split from it.",
-    )
     _new_copy_engine_pg_options()
     return
 
