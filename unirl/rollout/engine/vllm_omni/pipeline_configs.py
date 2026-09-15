@@ -54,6 +54,26 @@ UNIRL_HI3_AR_MULTIMODAL_TEXT = _hi3_text_pipeline(
     requires_multimodal_data=True,
 )
 
+UNIRL_QWEN3_OMNI_THINKER = PipelineConfig(
+    model_type="unirl_qwen3_omni_thinker",
+    model_arch="Qwen3OmniMoeThinkerForConditionalGeneration",
+    stages=(
+        StagePipelineConfig(
+            stage_id=0,
+            model_stage="thinker",
+            execution_type=StageExecutionType.LLM_AR,
+            final_output=True,
+            final_output_type="text",
+            owns_tokenizer=True,
+            requires_multimodal_data=True,
+            hf_config_name="thinker_config",
+            model_arch="Qwen3OmniMoeThinkerForConditionalGeneration",
+            engine_output_type="text",
+            sampling_constraints={"detokenize": True},
+        ),
+    ),
+)
+
 
 def register_unirl_pipeline_configs() -> None:
     """Register UniRL's custom topologies once, rejecting key collisions."""
@@ -61,6 +81,7 @@ def register_unirl_pipeline_configs() -> None:
         UNIRL_RL_IMAGE_DIFFUSION,
         UNIRL_HI3_AR_TEXT,
         UNIRL_HI3_AR_MULTIMODAL_TEXT,
+        UNIRL_QWEN3_OMNI_THINKER,
     ):
         existing = OMNI_PIPELINES.get(pipeline.model_type)
         if existing is None:
@@ -75,6 +96,7 @@ def register_unirl_pipeline_configs() -> None:
 __all__ = [
     "UNIRL_HI3_AR_MULTIMODAL_TEXT",
     "UNIRL_HI3_AR_TEXT",
+    "UNIRL_QWEN3_OMNI_THINKER",
     "UNIRL_RL_IMAGE_DIFFUSION",
     "register_unirl_pipeline_configs",
 ]

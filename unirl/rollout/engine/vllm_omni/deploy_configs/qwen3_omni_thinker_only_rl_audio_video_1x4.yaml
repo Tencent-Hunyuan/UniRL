@@ -1,5 +1,5 @@
 # Qwen3-Omni Thinker-only audio-in-video deployment, TP=4.
-pipeline: qwen3_omni_moe_thinker_only
+pipeline: unirl_qwen3_omni_thinker
 async_chunk: false
 distributed_executor_backend: mp
 dtype: bfloat16

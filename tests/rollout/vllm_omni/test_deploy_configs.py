@@ -88,6 +88,7 @@ def test_hi3_text_topologies_preserve_legacy_output_contract() -> None:
     from unirl.rollout.engine.vllm_omni.pipeline_configs import (
         UNIRL_HI3_AR_MULTIMODAL_TEXT,
         UNIRL_HI3_AR_TEXT,
+        UNIRL_QWEN3_OMNI_THINKER,
     )
 
     text_stage = UNIRL_HI3_AR_TEXT.stages[0]
@@ -98,3 +99,7 @@ def test_hi3_text_topologies_preserve_legacy_output_contract() -> None:
         assert stage.owns_tokenizer is True
     assert text_stage.requires_multimodal_data is False
     assert multimodal_stage.requires_multimodal_data is True
+
+    qwen_stage = UNIRL_QWEN3_OMNI_THINKER.stages[0]
+    assert qwen_stage.model_arch == "Qwen3OmniMoeThinkerForConditionalGeneration"
+    assert qwen_stage.engine_output_type == "text"
