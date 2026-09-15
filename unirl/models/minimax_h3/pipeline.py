@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
@@ -210,6 +211,7 @@ class MiniMaxH3Pipeline(Pipeline):
                 video_decode_s=t_video - t_denoise,
                 audio_decode_s=t_audio - t_video,
                 total_s=t_audio - t_start,
+                video_sha=hashlib.sha256(videos.frames.numpy().tobytes()).hexdigest()[:32],
             )
 
         filled = gen.fill(
