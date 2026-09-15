@@ -306,7 +306,7 @@ class VLLMOmniBackend:
 
     def _stage_type(self, stage_id: int) -> str:
         metadata = self._require_omni().engine.get_stage_metadata(stage_id)
-        return str(getattr(metadata, "stage_type", "llm"))
+        return str(metadata.stage_type)
 
     @staticmethod
     def _require_rpc_success(action: str, stage_id: int, results: object) -> None:
