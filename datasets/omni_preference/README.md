@@ -257,7 +257,25 @@ cross-split number is quietly wrong in the favourable direction.
   0.50pp as one draw rather than a confidence bound; but the gap is not explained by
   restart noise, and it is no longer explained by any difference in configuration,
   training process, or input contract, all of which are now aligned or measured
-  inert. What remains unattributed is ~4pp of accuracy and a ~1.9× margin ratio.
+  inert.
+- **On a length-balanced, leak-free eval set the two stacks are indistinguishable,
+  and most of the residual was the length skew itself.** Every number above rests on
+  a split that is 478/94 skewed toward "chosen is the longer answer". Drawing a fresh
+  set from the 9426 pool rows whose media appear in *neither* shared split — 600 rows,
+  exactly 100 chosen-longer and 100 chosen-shorter per modality, leak check 0 —
+  gives **UniRL 0.5683 vs verl 0.5550, a gap of +1.33pp (z=0.47, p=0.642)**, margins
+  0.2447 vs 0.1210. Against +4.17pp on the skewed split, so **~2.8pp of the residual
+  was the length shortcut**, not any implementation difference. Per modality: audio
+  0.5450 vs 0.5450 (identical), video 0.5250 vs 0.5350 (verl ahead), image 0.6350 vs
+  0.5850. Treat p=0.642 as "not detected" rather than equivalence — n=600 against a
+  1.3pp effect has little power — but this is the least confounded reading available.
+
+  The same numbers carry a second, larger warning: **both** models fall from ~0.76 to
+  ~0.56 when the length shortcut is removed, against a 0.50 floor. Two independent
+  results already said this — a longer-wins rule alone scores 72.8/85.9/82.5, and a
+  217-row judged comparison was an adequately-powered null (p=0.872) — and this makes
+  three. What DPO learns on this dataset is largely answer length, so a rising
+  `reward_accuracy` here is not evidence of better generations.
   Consequently the "+5.8pp for UniRL" reported earlier was verl's model run through a
   foreign pipeline, and does not support any claim about either implementation.
   Comparing own-pipeline numbers (verl 0.9670, UniRL 0.8067) is also not sound: the
