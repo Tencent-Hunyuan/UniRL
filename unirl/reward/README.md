@@ -118,32 +118,33 @@ new remote reward needs no UniRL code — add it to the server and list its name
   decoded key the backend sees. Remote allows only `image`/`video`; local scorers
   may be `text`.
 - **`math_verify` grades in a child process, and that is not optional.** Its own
-  timeouts are `signal.alarm`-based, so they work only on the main thread — which the
-  reward path is not; enabling them there raises and scores every sample 0. Inside the
-  child the main thread is the child's own, so they work and are passed through
+  timeouts are `signal.alarm`-based, so they require the main thread. A synchronous
+  Ray actor may run reward code on its main thread, but a threaded actor
+  (`worker_max_concurrency > 1`) does not; inline grading would therefore behave
+  differently across worker configurations. Inside the child the main thread is the
+  child's own, so the timeouts work consistently and are passed through
   (`UNIRL_MATHVERIFY_TIMEOUT_S`, default 10s). One child per reward call grades the
-  whole batch and exits — ~1.2s, amortised over the ~16 grades a call carries — and
-  shares nothing with the caller. A child that is OOM-killed, exits early, or misses
-  the outer deadline raises from the scorer so the reward step fails instead of
-  treating an infrastructure failure as a successful batch of zero rewards. The
-  parent budget (`timeout * jobs + 60s`) is an aggregate containment cap, not an
-  allowance for every internal parser retry. Three details are load-bearing:
-  `forkserver` rather than
-  `fork`, because `fork` runs `logging`'s registered at-fork handler, which acquires
-  the logging lock with no timeout and can block the forking thread forever when the
-  worker's other threads log; `wait()` on the child's sentinel as well as the pipe, so
-  a child that dies immediately costs a round-trip instead of the whole deadline; and
-  `proc.start()` inside the `try`, because `forkserver` forks the child *before* the
-  parent writes the job payload to it, so a child dying in that window raises
-  `BrokenPipeError` out of `start()`. **Do not reintroduce a `multiprocessing.Pool`
-  here**: `Pool.terminate()` is unbounded. `_terminate_pool` sends each worker `SIGTERM`
-  and then joins it with no timeout (CPython 3.12 `pool.py:732`), and a Python signal
-  handler only runs between bytecodes — so a grade inside a long C-level `sympy` call
-  never handles the `SIGTERM`, never exits, and the join blocks forever. That is the
-  same runaway expression whose slowness tripped the deadline that called `terminate()`,
-  so the condition triggering the teardown is the one that makes it hang. Confirmed by a
-  captured stack from a 32-GPU reproduction. `proc.kill()` is used instead because
-  `SIGKILL` cannot be caught, blocked or ignored and needs no bytecode boundary.
+  whole batch and exits. The forkserver preloads both `math_verify` and this target
+  module so children inherit their imports instead of repeating them. A child that is
+  OOM-killed, exits early, or misses the outer deadline raises from the scorer so the
+  reward step fails instead of treating an infrastructure failure as a successful
+  batch of zero rewards. The parent budget (`3 * timeout * jobs + 60s`) covers two
+  parse windows and one ordinary verification window per job; it remains a hard
+  aggregate cap, not an allowance for every internal parser retry or candidate pair.
+  Three details are load-bearing: `forkserver` rather than `fork`, because `fork`
+  inherits Ray's signal handlers, `atexit` state, CUDA state, and copies of locks held
+  by other threads; additionally, `logging`'s registered at-fork handler acquires its
+  module lock with no timeout before the fork; `wait()` on the child's sentinel as
+  well as the pipe, so a child that dies immediately costs a round-trip instead of
+  the whole deadline; and `proc.start()` inside the `try`, because `forkserver` forks
+  the child *before* the parent writes the job payload to it, so a child dying in that
+  window raises `BrokenPipeError` out of `start()`. **Do not reintroduce a
+  `multiprocessing.Pool` here**: `Pool.terminate()` sends each worker `SIGTERM` and
+  then joins it with no timeout (CPython 3.12 `pool.py:732`). A pool worker created
+  with `fork` may run inherited Ray signal/exit handlers against inconsistent
+  post-fork state and fail to exit; the captured 32-GPU stack confirms that the parent
+  can then remain blocked in this unbounded join. `proc.kill()` is used instead
+  because `SIGKILL` cannot be caught, blocked, or ignored.
 - **A standalone test of the grader needs a real file with an `if __name__ ==
   "__main__":` guard.** `forkserver` re-imports `__main__` in the child, so an unguarded
   script — or a heredoc, where `__main__` is `<stdin>` — makes child startup fail.

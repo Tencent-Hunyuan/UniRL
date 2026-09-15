@@ -43,13 +43,14 @@ def _grade_in_child(jobs: List[Tuple[str, str]], *, seconds: int) -> List[bool]:
     from multiprocessing.connection import wait
 
     ctx = multiprocessing.get_context("forkserver")  # not fork — see ../README.md
-    ctx.set_forkserver_preload(["math_verify"])
+    ctx.set_forkserver_preload(["math_verify", __name__])
     receiver, sender = ctx.Pipe(duplex=False)
     proc = ctx.Process(target=_grade_all, args=(sender, jobs, seconds), daemon=True)
     try:
         proc.start()  # inside the try: a child dying here raises out of start()
         # sentinel as well as the pipe, so a child that dies costs a round-trip, not the budget.
-        deadline_s = seconds * len(jobs) + 60
+        # Each job has two parse windows and at least one verification window.
+        deadline_s = 3 * seconds * len(jobs) + 60
         ready = wait([receiver, proc.sentinel], timeout=deadline_s)
         if receiver in ready:
             verdicts = receiver.recv()
