@@ -55,36 +55,11 @@ knows nothing about DTensor sharding or wrap topology.
 before `fsdp_wrap`, plus a config in `configs.py`; a new optimizer or LR schedule
 is a branch in `optim.py` plus fields on `OptimizerConfig` / `LrSchedulerConfig`
 in `backend/base.py`; a multi-update-capable algorithm sets
-`supports_multi_update = True`, declares `anchor_fields`, and exposes
-`recomputes_anchor` when its anchor must follow the planned micro geometry (see
+`supports_multi_update = True` and declares `anchor_fields` (see
 `../algorithms/README.md`).
 
 ## Gotchas
 
-- **`LrSchedulerConfig.steps_per_advance` / `one_based_steps` exist to match other
-  stacks' step conventions; both default to a no-op.** The schedule normally advances
-  once per optimizer step, counting from 0. Two conventions differ, and neither is
-  reachable by tuning `warmup_steps`/`total_steps`: verl-omni advances once per *data
-  batch* (its cosine spans 130 units while performing 520 updates, so the LR is held
-  constant across each batch's updates), and its warmup is 1-based, so its first batch
-  already runs at `1/warmup × base` rather than at 0. Set `steps_per_advance` to
-  `num_updates_per_batch` and `one_based_steps: true` to reproduce that; with both set,
-  the emitted trace matches verl's logged 130 values exactly (`max |diff| = 0`, and the
-  same integrated LR of 2.60e-03). `steps_per_advance != 1` raises on `linear_warmup`,
-  which composes `LinearLR`/`SequentialLR` and advances internally.
-
-- **`algorithm.normalize_across_micros=false` accumulates raw micro means, which is
-  what verl-omni's engine does.** `TrainStack` normally scales each micro-batch's loss
-  by its share of the update, so the gradient is the mean over every sample in the
-  optimizer step. verl's `forward_backward_batch` instead calls `loss.backward()` on
-  each micro-batch's own `.mean()` with no division by `len(micro_batches)`, and
-  `postprocess_batch_func` only collects the losses — so its gradient is the *sum* of
-  micro means, i.e. `N×` larger for `N` micro-batches per update. Setting this flag
-  false reproduces that. Note the two are not equivalent under `clip_grad`: the scale-up
-  is a no-op on any step whose norm already exceeds the clip (78% of verl's steps, 100%
-  of ours at `clip_grad=1.0`), so this changes the effective step size only on the
-  unclipped minority. The reported `loss` stays a proper average either way, so the
-  step-0 log-2 check still holds.
 - **A mixed-modality batch builds but cannot be sliced.** `ARPreferenceTrackBuilder`
   happily produces one `Part` from audio and image records together — the per-sample
   media lists line up with the row count, and `Batch.slice` on the whole batch looks
@@ -169,18 +144,6 @@ in `backend/base.py`; a multi-update-capable algorithm sets
   the model whenever `param_dtype` upcasts (fp32 compute over a bf16 checkpoint), so
   leave it `true` unless that copy is cheap. `defer_grad_sync: true` then gives one
   all-reduce per optimizer step. VeOmni only supports `full`.
-- **`copy_engine_all_gather: true` takes the FSDP all-gather off the SMs** — FSDPBackend
-  creates the default NCCL group with the zero-CTA policy and every `fully_shard` group
-  allocates its all-gather buffer from NCCL symmetric memory, so the gather runs on the
-  copy engines (`cudaMemcpyBatchAsync`) instead of an `ncclDevKernel_AllGather` kernel.
-  Needs PyTorch >= 2.13, NCCL >= 2.28, and a shard group that stays on one node over
-  NVLink (`full` on a single node, or `hybrid` with `hsdp_shard_size:
-  devices_per_node`); `no_shard` and VeOmni reject it. FSDPBackend must be what brings
-  up `torch.distributed` (it binds WORLD to the rank's CUDA device so DeviceMesh splits
-  the shard group from it and the policy is inherited), and
-  `NCCL_CTA_POLICY` must stay unset or `2`. WORLD keeps the usual `cpu:gloo,cuda:nccl`
-  pair, so in `hybrid` mode torch logs one `ProcessGroupGloo::split ... Falling back to
-  default options` warning per process while splitting the gloo half; it is expected.
 
 ## Profiling → Perfetto
 

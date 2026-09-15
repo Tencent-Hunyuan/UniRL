@@ -26,13 +26,11 @@ class OptimizerConfig:
 
 @dataclass
 class LrSchedulerConfig:
-    """Learning-rate scheduler hyperparameters; see ``unirl/train/readme.md`` Gotchas."""
+    """Learning-rate scheduler hyperparameters."""
 
     type: str
     warmup_steps: int
     total_steps: int
-    steps_per_advance: int = 1
-    one_based_steps: bool = False
 
 
 def resolve_trainable_module(bundle: object, trainable_attr: str):
