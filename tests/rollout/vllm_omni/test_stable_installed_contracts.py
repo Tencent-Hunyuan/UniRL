@@ -90,3 +90,17 @@ def test_diffusion_lora_loader_delegates_non_tensor_requests(monkeypatch: pytest
     manager = object()
     assert DiffusionLoRAManager._load_adapter(manager, request) is expected
     assert calls == [(manager, request)]
+
+
+def test_hi3_expert_mapping_tuple_is_unwrapped(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm.model_executor import utils as vllm_utils
+
+    from unirl.rollout.engine.vllm_omni.patches import compat_hi3_lora
+
+    mapping = [("experts.0", "weight", 0, "w")]
+    monkeypatch.setattr(vllm_utils, "get_moe_expert_mapping", lambda _model: (mapping, {"old": "new"}))
+    monkeypatch.setattr(compat_hi3_lora, "_INSTALLED", False)
+
+    compat_hi3_lora.install()
+
+    assert vllm_utils.get_moe_expert_mapping(object()) == mapping
