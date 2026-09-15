@@ -23,6 +23,21 @@ from reward_service.scorers.base import BaseScorer, ScoreItem
 from reward_service.scorers.registry import register
 
 
+def _embeds(output: object) -> torch.Tensor:
+    """Unwrap CLIP get_*_features, which returns a ModelOutput rather than a tensor on transformers 5.x."""
+    if isinstance(output, torch.Tensor):
+        return output
+    pooled = getattr(output, "pooler_output", None)
+    if pooled is not None:
+        return pooled
+    hidden = getattr(output, "last_hidden_state", None)
+    if hidden is not None:
+        return hidden[:, 0]
+    if isinstance(output, (tuple, list)):
+        return output[0]
+    raise TypeError(f"PickScoreScorer: unexpected CLIP feature output {type(output)}")
+
+
 class PickScoreScorer(BaseScorer):
     name = "pickscore"
     sub_metric_names = ("pickscore",)
@@ -66,9 +81,9 @@ class PickScoreScorer(BaseScorer):
         )
         text_inputs = {k: v.to(self.device) for k, v in text_inputs.items()}
 
-        image_embs = self.model.get_image_features(**image_inputs)
+        image_embs = _embeds(self.model.get_image_features(**image_inputs))
         image_embs = image_embs / image_embs.norm(p=2, dim=-1, keepdim=True)
-        text_embs = self.model.get_text_features(**text_inputs)
+        text_embs = _embeds(self.model.get_text_features(**text_inputs))
         text_embs = text_embs / text_embs.norm(p=2, dim=-1, keepdim=True)
 
         logit_scale = self.model.logit_scale.exp()

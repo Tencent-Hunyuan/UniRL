@@ -1,0 +1,31 @@
+# @package _global_
+# FlowGRPO-Fast SD3 colocate with the reward stack — A/B sibling of sd3_trainside.
+#
+# Everything comes from sd3_trainside: same model, LoRA, rollout engine, reward,
+# algorithm, data and sampling. The only addition is the `rewardstack:` block, which
+# moves the micro-batch loop out of the engine and into the worker.
+#
+# Measured on this recipe there is nothing to win: reward is 3.12 s of a 108.8 s step
+# (2.9%) and training is 65%, so the ceiling is under 3 s and the stack recovers 0.15 s.
+# It exists to exercise the mechanism and as the colocate control for the HTTP pair —
+# the case the stack is for is a reward that costs real time, i.e. sd3_trainside_http.
+#
+# micro_batch_size matches sd3_trainside's rollout.forward_batch_size (16), so the
+# engine's own chunk loop short-circuits and chunk boundaries match the baseline's.
+#
+# Reward parity is STATISTICAL, not exact: only x_T is seeded, the per-step SDE noise
+# reaches randn_tensor with generator=None, and nothing seeds the global RNG at startup,
+# so two runs of the unmodified baseline already diverge. Compare against a repeated
+# baseline, never a single one.
+
+defaults:
+  - sd3_trainside
+  - _self_
+
+rewardstack:
+  _target_: unirl.reward.stack.RewardStack
+  micro_batch_size: 16          # = sd3_trainside rollout.forward_batch_size
+  overlap: false        # measured default; true is opt-in and unproven — see the reward README
+
+logging:
+  tags: [sd3, flowgrpo, trainside, rewardstack]
