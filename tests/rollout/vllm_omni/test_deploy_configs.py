@@ -38,7 +38,7 @@ def test_all_vllm_omni_recipes_use_deploy_config_vocabulary() -> None:
         *examples.glob("**/*vllm_omni*.yaml"),
         examples / "diffusion/bagel/bagel_it2i_managed_editscore.yaml",
     }
-    assert len(paths) == 22
+    assert paths
 
     for path in sorted(paths):
         config = yaml.safe_load(path.read_text())

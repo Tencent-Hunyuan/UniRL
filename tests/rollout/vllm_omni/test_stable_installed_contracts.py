@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import importlib
+import os
 from importlib.metadata import version
 
 import pytest
 
-pytest.importorskip("vllm")
-pytest.importorskip("vllm_omni")
+if os.environ.get("VLLM_OMNI_REQUIRE_INSTALLED") == "1":
+    importlib.import_module("vllm")
+    importlib.import_module("vllm_omni")
+else:
+    pytest.importorskip("vllm")
+    pytest.importorskip("vllm_omni")
 
 
 def test_exact_stable_runtime_is_installed() -> None:

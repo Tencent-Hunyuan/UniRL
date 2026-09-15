@@ -80,6 +80,6 @@ known-invalid adapter.
   submodules, loaded lazily — `import unirl.rollout.engine.vllm_omni.patches` must
   not pull vllm.
 - **Every patch needs a DELETE-WHEN row.** Without one it is permanent by default.
-- **0.27 honors `engine_args.diffusion_attention_backend`, not `attention_backend`.**
-  The old AR field is silently dropped by `OmniDiffusionConfig.from_kwargs`;
-  HV1.5 pins the diffusion backend in its stage YAML.
+- **0.28 honors `diffusion_attention_backend`, not `attention_backend`.**
+  The AR field is silently dropped by `OmniDiffusionConfig.from_kwargs`;
+  HV1.5 pins the diffusion backend in its deploy config.

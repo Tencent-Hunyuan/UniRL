@@ -292,7 +292,7 @@ class VLLMOmniBackend:
             build_prompt_tokens,
         )
 
-        # vllm-omni 0.27 returns a PromptTokensResult here, not a bare id list.
+        # vLLM-Omni returns a PromptTokensResult here, not a bare id list.
         return list(build_prompt_tokens(text, self._tokenizer, task=task, sys_type=sys_type).token_ids)
 
     def num_stages(self) -> int:
