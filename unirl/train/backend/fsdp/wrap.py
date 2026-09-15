@@ -18,10 +18,10 @@ from unirl.utils.dtypes import parse_torch_dtype
 logger = logging.getLogger(__name__)
 
 
-def configure_copy_engine_all_gather(enable: bool) -> None:
-    """Configure NCCL's zero-CTA policy before the default group is created."""
+def configure_copy_engine_all_gather(enable: bool) -> Any:
+    """Build explicit NCCL zero-CTA options before the default group is created."""
     if not enable:
-        return
+        return None
 
     policy = os.environ.get("NCCL_CTA_POLICY")
     require(
@@ -29,11 +29,19 @@ def configure_copy_engine_all_gather(enable: bool) -> None:
         f"FSDP copy-engine all-gather requires NCCL_CTA_POLICY=2, but the environment sets it to {policy!r}.",
     )
     require(
-        not torch.distributed.is_initialized() or policy == "2",
+        not torch.distributed.is_initialized(),
         "FSDP copy-engine all-gather was enabled after the default process group "
-        "was initialized. Set NCCL_CTA_POLICY=2 before distributed initialization.",
+        "was initialized. The communicator must be created with an explicit zero-CTA policy.",
     )
     os.environ["NCCL_CTA_POLICY"] = "2"
+    process_group_nccl = getattr(torch.distributed, "ProcessGroupNCCL", None)
+    require(
+        process_group_nccl is not None,
+        "FSDP copy-engine all-gather requires a PyTorch build with ProcessGroupNCCL options.",
+    )
+    options = process_group_nccl.Options()
+    options.config.cta_policy = process_group_nccl.NCCL_CTA_POLICY_ZERO
+    return options
 
 
 def _clone_checkpoint_kwarg(value: Any) -> Any:
