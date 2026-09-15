@@ -63,21 +63,23 @@ def _sharded_decode_clips(vae, z: torch.Tensor, num_chunks: int, group) -> list[
                 z[
                     :,
                     :,
-                    i * vae.tokens_chunk_size : i * vae.tokens_chunk_size
-                    + vae.tokens_chunk_size
-                    + vae.token_overlap,
+                    i * vae.tokens_chunk_size : i * vae.tokens_chunk_size + vae.tokens_chunk_size + vae.token_overlap,
                 ]
             )
             for i in range(rank, num_chunks, world)
         ]
         if any(clip.ndim != 5 for clip in local):
             raise RuntimeError("MiniMax-H3 sharded decode expected 5-D [B, C, T, H, W] clips")
+        if any(clip.shape != local[0].shape or clip.dtype != z.dtype for clip in local):
+            raise RuntimeError("MiniMax-H3 sharded decode produced ragged clips on one rank")
     except BaseException as exc:  # re-raised below, after the status exchange
         error = exc
         local = []
 
     # probe[0]=ok, probe[1]=has-clip, probe[2:7]=clip shape. Fixed size so a failed rank
-    # still participates with the same payload shape.
+    # still participates with the same payload shape. Every decision below is a pure
+    # function of `probes`, so all ranks raise together instead of stranding peers in
+    # the gather (an all_gather shape mismatch is an 1800s NCCL timeout, not an error).
     probe = torch.zeros(7, dtype=torch.int64, device=z.device)
     probe[0] = int(error is None)
     if error is None and local:
@@ -90,9 +92,12 @@ def _sharded_decode_clips(vae, z: torch.Tensor, num_chunks: int, group) -> list[
             raise error
         raise RuntimeError("MiniMax-H3 sharded decode failed on another SP rank")
 
-    ref = next(tuple(int(v) for v in p[2:]) for p in probes if int(p[1]))
-    if any(tuple(clip.shape) != ref or clip.dtype != z.dtype for clip in local):
-        raise RuntimeError("MiniMax-H3 sharded decode produced ragged clips; this geometry is unsupported")
+    shapes = {tuple(int(v) for v in p[2:]) for p in probes if int(p[1])}
+    if len(shapes) != 1:
+        raise RuntimeError(
+            f"MiniMax-H3 sharded decode saw disagreeing clip shapes across the SP group: {sorted(shapes)}"
+        )
+    ref = shapes.pop()
     per_rank = (num_chunks + world - 1) // world
     slab = torch.zeros((per_rank, *ref), dtype=z.dtype, device=z.device)
     for index, clip in enumerate(local):
