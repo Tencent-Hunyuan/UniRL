@@ -118,9 +118,17 @@ def test_hi3_t2i_does_not_forward_at_raw_prefill_output() -> None:
     assert stage_zero["omni_kv_config"] == {"need_send_cache": True}
 
 
-@pytest.mark.parametrize("name", ["hunyuan_image3_ar_rl.yaml", "hunyuan_image3_i2t_rl.yaml"])
-def test_hi3_text_lora_adapters_install_weight_sync_extension(name: str) -> None:
+@pytest.mark.parametrize(
+    "name",
+    [
+        "hunyuan_image3_ar_rl.yaml",
+        "hunyuan_image3_i2t_rl.yaml",
+        "hunyuan_image3_it2i_rl.yaml",
+    ],
+)
+def test_hi3_ar_lora_stages_force_mp_weight_sync_workers(name: str) -> None:
     config = yaml.safe_load((DEPLOY_DIR / name).read_text())
     stage_zero = config["stages"][0]
     assert stage_zero["enable_lora"] is True
     assert stage_zero["worker_extension_cls"].endswith(".HI3ARWeightSyncExtension")
+    assert stage_zero["distributed_executor_backend"] == "mp"
