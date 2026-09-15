@@ -121,28 +121,24 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   `average_log_prob=false` that term does not cancel.** The margin is a *sum* over
   supervised response tokens, so every extra supervised token adds
   `(π_c − ref_c) − (π_r − ref_r)` for that position. `ARPreferenceTrackBuilder`
-  appends EOS and supervises it (`append_eos=true`); verl-omni marks only the
-  assistant text span its chat template produces, which is exactly **one token fewer
-  per branch on every row** (measured on 5 rows × 2 branches: 7/8, 1/2, 5/6, 12/13,
-  9/10, …). That single position carries a large share of the objective. Dropping it
-  at scoring time costs this stack **−12.9pp accuracy and 54% of the margin**
-  (1.1150 → 0.5144) but costs verl only −2.5pp and 9%, and on the common span verl
-  scores *higher* (0.7583 vs 0.7083). `P(EOS)` also depends on what precedes it — a
-  one-word answer ends differently from a sentence — so the term correlates with
-  answer length, which is the mechanism behind the length-sensitivity difference
-  (+0.231, CI [+0.120, +0.335]) reported in `datasets/omni_preference/README.md`.
-  Set `track_builder.append_eos: false` to match verl's span. Neither choice is
-  wrong, but they are different objectives, and comparing across them is not a
-  comparison of implementations.
+  appends EOS and supervises it (`append_eos=true`); supervising only the assistant
+  text span the chat template produces is exactly **one token fewer per branch on
+  every row** (measured on 5 rows × 2 branches: 7/8, 1/2, 5/6, 12/13, 9/10, …). That
+  single position carries a large share of the objective: dropping it at scoring time
+  costs **−12.9pp accuracy and 54% of the margin** (1.1150 → 0.5144) for a model
+  trained with it, and much less for one trained without. `P(EOS)` also depends on
+  what precedes it — a one-word answer ends differently from a sentence — so the term
+  correlates with answer length. Set `track_builder.append_eos: false` for the
+  text-only span. Neither choice is wrong, but they are different objectives, and a
+  model must be scored under the span it was trained on.
 - **Dense-padded pairing shifts the margin slightly, and the shift tracks the length
   difference.** `Qwen3OmniARStage.replay` forwards a pair as a dense `[B, T]` batch
-  padded to the longer branch, so the shorter branch carries the padding; verl-omni
-  instead runs `pad_mode=no_padding` over nested tensors, where each branch sees only
-  its own tokens. Forwarding each branch alone and re-deriving the margin changes it
+  padded to the longer branch, so the shorter branch carries the padding. Forwarding
+  each branch alone and re-deriving the margin changes it
   by **mean +0.003, median +0.005, max 0.13**, and that shift correlates with
   `len(chosen) − len(rejected)` at **+0.21** — so padding is not perfectly inert and
-  the leak is length-dependent, which is the same direction as the length-sensitivity
-  gap against verl. It is small: 55/60 ranking decisions are unchanged, and the
+  the leak is length-dependent. It is small: 55/60 ranking decisions are unchanged,
+  and the
   accuracy difference (0.70 paired vs 0.65 alone) is well inside the ±8.4pp binomial
   SE at n=60 and not significant (McNemar p=0.37).
 

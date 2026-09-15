@@ -55,8 +55,7 @@ bundle:
     lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
     use_gradient_checkpointing: true
     max_prompt_length: 16384
-    # Media budgets follow verl's published Omni-Preference DPO run, whose accuracy
-    # this recipe is benchmarked against; they are wider than the GSPO recipes' 262144.
+    # Media budgets for Omni-Preference; wider than the GSPO recipes' 262144.
     image_max_pixels: 602112
     video_max_pixels: 602112
     video_max_frames: 8
@@ -147,7 +146,7 @@ stack:
   _target_: unirl.train.stack.TrainStack
   micro_batch_size: 2   # one whole preference pair per forward
   max_grad_norm: 1.0
-  # 4 optimizer steps per data batch, matching verl's train_batch=32 / ppo_mini=8.
+  # 4 optimizer steps per data batch (batch_size 32 / 8 pairs per update).
   # 8 rows/rank / 4 = 2 rows = 1 whole pair per update.
   num_updates_per_batch: 4
 

@@ -135,7 +135,7 @@ stack:
   _target_: unirl.train.stack.TrainStack
   micro_batch_size: 2   # one whole preference pair per forward
   max_grad_norm: 1.0
-  # 4 optimizer steps per data batch, matching verl's train_batch=32 / ppo_mini=8.
+  # 4 optimizer steps per data batch (batch_size 32 / 8 pairs per update).
   # 8 rows/rank / 4 = 2 rows = 1 whole pair per update.
   num_updates_per_batch: 4
 
