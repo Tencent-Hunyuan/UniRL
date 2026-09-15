@@ -117,6 +117,23 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   strict `>`, so it is not a bug. Note what this check *cannot* see: it holds for
   **any** value of `sampling_temperature`, because a zero margin stays zero under
   any scaling. It validates the reference and the pairing, not the scaling.
+- **The supervised span decides how much of the margin is the EOS token, and with
+  `average_log_prob=false` that term does not cancel.** The margin is a *sum* over
+  supervised response tokens, so every extra supervised token adds
+  `(π_c − ref_c) − (π_r − ref_r)` for that position. `ARPreferenceTrackBuilder`
+  appends EOS and supervises it (`append_eos=true`); verl-omni marks only the
+  assistant text span its chat template produces, which is exactly **one token fewer
+  per branch on every row** (measured on 5 rows × 2 branches: 7/8, 1/2, 5/6, 12/13,
+  9/10, …). That single position carries a large share of the objective. Dropping it
+  at scoring time costs this stack **−12.9pp accuracy and 54% of the margin**
+  (1.1150 → 0.5144) but costs verl only −2.5pp and 9%, and on the common span verl
+  scores *higher* (0.7583 vs 0.7083). `P(EOS)` also depends on what precedes it — a
+  one-word answer ends differently from a sentence — so the term correlates with
+  answer length, which is the mechanism behind the length-sensitivity difference
+  (+0.231, CI [+0.120, +0.335]) reported in `datasets/omni_preference/README.md`.
+  Set `track_builder.append_eos: false` to match verl's span. Neither choice is
+  wrong, but they are different objectives, and comparing across them is not a
+  comparison of implementations.
 - **The segment-sum must not use `index_add`/`scatter_add_`.** Both accumulate
   with CUDA atomics, so the addition order varies between otherwise identical
   calls and the per-sequence sum is not reproducible. Measured spread on one
