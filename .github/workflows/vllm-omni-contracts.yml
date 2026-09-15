@@ -17,7 +17,7 @@ jobs:
 
       - name: Install focused test dependencies
         run: |
-          python -m pip install pytest pyyaml pillow psutil hydra-core omegaconf numpy ray
+          python -m pip install pytest pyyaml pillow psutil hydra-core omegaconf numpy ray diffusers==0.40.0
           python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
 
       - name: Run vLLM-Omni contracts
