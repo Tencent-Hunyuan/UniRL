@@ -235,8 +235,14 @@ class BucketedIPCReceiveMixin:
             if obj is None or id(obj) in seen:
                 continue
             seen.add(id(obj))
-            if callable(getattr(obj, "named_parameters", None)):
-                return obj
+            named_parameters = getattr(obj, "named_parameters", None)
+            if callable(named_parameters):
+                try:
+                    next(iter(named_parameters()))
+                except StopIteration:
+                    pass
+                else:
+                    return obj
             queue.extend(
                 getattr(obj, attr, None)
                 for attr in (

@@ -112,6 +112,7 @@ def test_diffusion_parameter_probe_reaches_wrapped_transformer() -> None:
     from unirl.rollout.engine.vllm_omni.worker.ipc_receive_mixin import BucketedIPCReceiveMixin
 
     worker = object.__new__(BucketedIPCReceiveMixin)
+    worker.worker = torch.nn.Module()
     transformer = torch.nn.Linear(4, 3)
     worker.model_runner = type("Runner", (), {"pipeline": type("Pipeline", (), {"transformer": transformer})()})()
 
