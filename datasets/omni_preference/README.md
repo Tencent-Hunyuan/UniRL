@@ -209,7 +209,16 @@ cross-split number is quietly wrong in the favourable direction.
   by modality +0.5pp audio / +2.5pp image / +0.0pp video. So the missing system turn
   was a real defect worth fixing, but it accounts for only ~1pp of the ~18pp
   cross-stack asymmetry -- it is not the whole of the pipeline difference, and the
-  rest is still unattributed.
+  rest is still unattributed. Aligning the remaining piece -- the supervised span,
+  where verl marks only the assistant text and this stack also supervises the
+  appended EOS (`track_builder.append_eos: false`; see `unirl/algorithms/README.md`)
+  -- brings both models onto one objective for the first time: **UniRL 0.7633 vs verl
+  0.7217, a gap of +4.2pp (z=1.65, p=0.099)**, margins 0.5976 vs 0.3067. That is the
+  first cross-stack reading where both sides are scored under the same input contract
+  *and* the same supervision contract, and it is no longer significant at 0.05.
+  Note both numbers drop when EOS leaves the objective (UniRL 0.8167 -> 0.7633, verl
+  0.7483 -> 0.7217): supervising EOS raises this metric for both, so the earlier
+  absolute figures were partly measuring it.
   Consequently the "+5.8pp for UniRL" reported earlier was verl's model run through a
   foreign pipeline, and does not support any claim about either implementation.
   Comparing own-pipeline numbers (verl 0.9670, UniRL 0.8067) is also not sound: the
