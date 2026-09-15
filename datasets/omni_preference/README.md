@@ -219,6 +219,22 @@ cross-split number is quietly wrong in the favourable direction.
   Note both numbers drop when EOS leaves the objective (UniRL 0.8167 -> 0.7633, verl
   0.7483 -> 0.7217): supervising EOS raises this metric for both, so the earlier
   absolute figures were partly measuring it.
+- **The input contract is fully aligned; what remains is forward noise of the same
+  order as the gap.** Feeding verl's own transformed tensors and this stack's own
+  through one base model with **no adapter** (same weights, same rows) isolates the
+  forward path from anything either run learned. The prompt is 303 tokens on both
+  sides, the answer tokens match, and the supervised counts match exactly. verl's
+  sequence is 2 tokens longer only because it keeps an unsupervised `<|im_end|>\n`
+  *after* the supervised span, which under causal attention cannot affect any
+  supervised log-prob. Also ruled out by measurement: audio decoding (verl uses
+  `librosa.load`, this stack PyAV — waveform correlation ~1.0000, mel relative
+  difference 0.03–0.34%) and the adapter name→parameter map (576/576 placed, 0
+  unwritten, 0 shape mismatches). What is left is that the same weights on the same
+  tokens still give summed response log-probs differing by −0.40 / −0.90 / +1.00 /
+  +0.02 across four rows — **mixed signs, mean −0.07**, so zero-mean noise rather
+  than a contract difference. Since a raw margin here is 3–6, per-pair noise of that
+  size is 20–30% of the quantity being thresholded; it does not bias the mean margin
+  but it flips near-tie pairs, which is what accuracy counts.
   Consequently the "+5.8pp for UniRL" reported earlier was verl's model run through a
   foreign pipeline, and does not support any claim about either implementation.
   Comparing own-pipeline numbers (verl 0.9670, UniRL 0.8067) is also not sound: the
