@@ -31,7 +31,6 @@ def find_dtensor_mesh(model: torch.nn.Module) -> DeviceMesh | None:
 def ensure_dist_initialized(
     local_rank: int | None = None,
     *,
-    pg_options: Any = None,
     device_id: torch.device | str | None = None,
 ) -> None:
     """Idempotently bring up the default process group."""
@@ -40,12 +39,7 @@ def ensure_dist_initialized(
     if torch.cuda.is_available() and local_rank is not None:
         torch.cuda.set_device(local_rank)
     if not dist.is_initialized():
-        kwargs = {}
-        if pg_options is not None:
-            kwargs["pg_options"] = pg_options
-        if device_id is not None:
-            kwargs["device_id"] = torch.device(device_id)
-        dist.init_process_group(**kwargs)
+        dist.init_process_group(device_id=torch.device(device_id) if device_id is not None else None)
         logger.info(
             "ensure_dist_initialized: default process group up (rank=%s world=%s)",
             dist.get_rank(),
