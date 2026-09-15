@@ -78,7 +78,7 @@ class MiniMaxH3Pipeline(Pipeline):
                 trajectory_precision=config.trajectory_precision,
                 logprob_precision=config.logprob_precision,
             ),
-            video_decode=MiniMaxH3VideoDecodeStage(bundle),
+            video_decode=MiniMaxH3VideoDecodeStage(bundle, shard_across_sp=config.video_decode_shard_across_sp),
             audio_decode=MiniMaxH3AudioDecodeStage(bundle),
             config=config,
         )
