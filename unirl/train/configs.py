@@ -87,8 +87,8 @@ class FSDPConfig:
     param_dtype: str = "bf16"
     cpu_offload: bool = False
     mixed_precision: bool = True
-    # Use NCCL symmetric-memory staging and zero-CTA policy for FSDP
-    # all-gathers. Supported topologies can execute these on copy engines.
+    # Use NCCL symmetric-memory staging plus an explicit zero-CTA policy for
+    # FSDP all-gathers. Requires NCCL >= 2.28 and a CE-capable shard topology.
     copy_engine_all_gather: bool = False
     # Match FSDP2's default: cast floating block inputs to param_dtype.
     cast_forward_inputs: bool = True

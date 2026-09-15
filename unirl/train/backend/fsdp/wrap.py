@@ -18,6 +18,30 @@ from unirl.utils.dtypes import parse_torch_dtype
 logger = logging.getLogger(__name__)
 
 
+def _new_copy_engine_pg_options() -> Any:
+    """Build NCCL options that require zero-CTA collectives."""
+    require(torch.cuda.is_available(), "FSDP copy-engine all-gather requires CUDA.")
+    nccl_version = torch.cuda.nccl.version()
+    require(
+        nccl_version is not None and tuple(nccl_version[:2]) >= (2, 28),
+        f"FSDP copy-engine all-gather requires NCCL >= 2.28, got {nccl_version}.",
+    )
+    process_group_nccl = getattr(torch.distributed, "ProcessGroupNCCL", None)
+    require(
+        process_group_nccl is not None
+        and hasattr(process_group_nccl, "Options")
+        and hasattr(process_group_nccl, "NCCL_CTA_POLICY_ZERO"),
+        "FSDP copy-engine all-gather requires ProcessGroupNCCL zero-CTA support (NCCL >= 2.28).",
+    )
+    options = process_group_nccl.Options()
+    require(
+        hasattr(getattr(options, "config", None), "cta_policy"),
+        "FSDP copy-engine all-gather requires ProcessGroupNCCL.Options.config.cta_policy.",
+    )
+    options.config.cta_policy = process_group_nccl.NCCL_CTA_POLICY_ZERO
+    return options
+
+
 def configure_copy_engine_all_gather(enable: bool) -> Any:
     """Build explicit NCCL zero-CTA options before the default group is created."""
     if not enable:
@@ -31,17 +55,10 @@ def configure_copy_engine_all_gather(enable: bool) -> Any:
     require(
         not torch.distributed.is_initialized(),
         "FSDP copy-engine all-gather was enabled after the default process group "
-        "was initialized. The communicator must be created with an explicit zero-CTA policy.",
+        "was initialized. Construct FSDPBackend before any sibling initializes the default "
+        "communicator so it can be created with an explicit zero-CTA policy.",
     )
-    os.environ["NCCL_CTA_POLICY"] = "2"
-    process_group_nccl = getattr(torch.distributed, "ProcessGroupNCCL", None)
-    require(
-        process_group_nccl is not None,
-        "FSDP copy-engine all-gather requires a PyTorch build with ProcessGroupNCCL options.",
-    )
-    options = process_group_nccl.Options()
-    options.config.cta_policy = process_group_nccl.NCCL_CTA_POLICY_ZERO
-    return options
+    return _new_copy_engine_pg_options()
 
 
 def _clone_checkpoint_kwarg(value: Any) -> Any:
@@ -122,7 +139,15 @@ def fsdp_wrap(
         fsdp_kwargs["offload_policy"] = CPUOffloadPolicy()
 
     mode = normalize_fsdp_mode(fsdp_mode)
-    mesh = _create_device_mesh(mode, hsdp_shard_size=hsdp_shard_size)
+    require(
+        not copy_engine_all_gather or mode != "no_shard",
+        "FSDP copy-engine all-gather is invalid with fsdp_mode='no_shard'.",
+    )
+    mesh = _create_device_mesh(
+        mode,
+        hsdp_shard_size=hsdp_shard_size,
+        copy_engine_all_gather=copy_engine_all_gather,
+    )
     if mesh is not None:
         fsdp_kwargs["mesh"] = mesh
 
@@ -206,14 +231,10 @@ def fsdp_wrap(
             )
 
     if copy_engine_all_gather:
-        fsdp_roots = (
-            (model,)
-            if isinstance(model, FSDPModule)
-            else tuple(module for module in block_instances if isinstance(module, FSDPModule))
-        )
-        require(fsdp_roots, "FSDP copy-engine all-gather requires at least one fully-sharded module.")
-        for fsdp_root in fsdp_roots:
-            setter = getattr(fsdp_root, "set_symm_mem_for_comm", None)
+        fsdp_modules = tuple(module for module in model.modules() if isinstance(module, FSDPModule))
+        require(fsdp_modules, "FSDP copy-engine all-gather requires at least one fully-sharded module.")
+        for fsdp_module in fsdp_modules:
+            setter = getattr(fsdp_module, "set_symm_mem_for_comm", None)
             require(
                 callable(setter),
                 "FSDP copy-engine all-gather requires a PyTorch build with FSDPModule.set_symm_mem_for_comm().",
@@ -292,7 +313,12 @@ def _enumerate_block_instances(
     return tuple(m for _, m in model.named_modules() if type(m).__name__ in names)
 
 
-def _create_device_mesh(fsdp_mode: str, *, hsdp_shard_size: int) -> Optional[object]:
+def _create_device_mesh(
+    fsdp_mode: str,
+    *,
+    hsdp_shard_size: int,
+    copy_engine_all_gather: bool = False,
+) -> Optional[object]:
     import torch.distributed as dist
 
     require(
@@ -309,10 +335,14 @@ def _create_device_mesh(fsdp_mode: str, *, hsdp_shard_size: int) -> Optional[obj
 
     from torch.distributed.device_mesh import init_device_mesh
 
+    backend_override = None
+    if copy_engine_all_gather:
+        backend_override = {"dp_shard": ("nccl", _new_copy_engine_pg_options())}
     mesh = init_device_mesh(
         "cuda",
         mesh_shape,
         mesh_dim_names=("dp_replicate", "dp_shard"),
+        backend_override=backend_override,
     )
     if _current_rank() == 0:
         logger.info("fsdp_wrap: %s mesh dp_replicate=%d x dp_shard=%d", fsdp_mode, *mesh_shape)
