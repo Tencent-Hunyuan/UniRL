@@ -2,7 +2,6 @@ r"""math-verify reward scorer — the paper's grader (HuggingFace Math-Verify)."
 
 from __future__ import annotations
 
-import logging
 import os
 from dataclasses import dataclass
 from typing import Any, List, Tuple
@@ -12,9 +11,9 @@ from unirl.types.reward import RewardRequest
 
 from .base import LocalRewardBackend
 
-logger = logging.getLogger(__name__)
-
-_VERIFY_TIMEOUT_S = int(float(os.environ.get("UNIRL_MATHVERIFY_TIMEOUT_S", "10")))
+_VERIFY_TIMEOUT_S = int(os.environ.get("UNIRL_MATHVERIFY_TIMEOUT_S", "10"))
+if _VERIFY_TIMEOUT_S <= 0:
+    raise ValueError("UNIRL_MATHVERIFY_TIMEOUT_S must be a positive integer")
 
 
 def _grade_all(conn: Any, jobs: List[Tuple[str, str]], seconds: int) -> None:
@@ -39,7 +38,7 @@ def _grade_all(conn: Any, jobs: List[Tuple[str, str]], seconds: int) -> None:
 
 
 def _grade_in_child(jobs: List[Tuple[str, str]], *, seconds: int) -> List[bool]:
-    """Grade a batch in one child process, scoring all of it False if it never answers."""
+    """Grade a batch in one child process, raising if the child never answers."""
     import multiprocessing
     from multiprocessing.connection import wait
 
@@ -50,18 +49,24 @@ def _grade_in_child(jobs: List[Tuple[str, str]], *, seconds: int) -> List[bool]:
     try:
         proc.start()  # inside the try: a child dying here raises out of start()
         # sentinel as well as the pipe, so a child that dies costs a round-trip, not the budget.
-        if receiver in wait([receiver, proc.sentinel], timeout=seconds * len(jobs) + 60):
-            return list(receiver.recv())
-        logger.warning("math-verify: %d grades did not return, scored 0.0", len(jobs))
-    except Exception as exc:
-        logger.warning("math-verify: grader failed (%r), scored 0.0", exc)
+        deadline_s = seconds * len(jobs) + 60
+        ready = wait([receiver, proc.sentinel], timeout=deadline_s)
+        if receiver in ready:
+            verdicts = receiver.recv()
+            if len(verdicts) != len(jobs):
+                raise RuntimeError(f"math-verify returned {len(verdicts)} verdicts for {len(jobs)} jobs")
+            return verdicts
+        if proc.sentinel in ready:
+            proc.join(timeout=0)
+            raise RuntimeError(f"math-verify child exited with code {proc.exitcode} before returning verdicts")
+        raise TimeoutError(f"math-verify child did not return {len(jobs)} verdicts within {deadline_s}s")
     finally:
         if proc.pid is not None:
-            proc.kill()
+            if proc.is_alive():
+                proc.kill()
             proc.join(timeout=1.0)
         receiver.close()
         sender.close()
-    return [False] * len(jobs)
 
 
 class MathVerifyRewardScorer(LocalRewardBackend):

@@ -123,8 +123,12 @@ new remote reward needs no UniRL code — add it to the server and list its name
   child the main thread is the child's own, so they work and are passed through
   (`UNIRL_MATHVERIFY_TIMEOUT_S`, default 10s). One child per reward call grades the
   whole batch and exits — ~1.2s, amortised over the ~16 grades a call carries — and
-  shares nothing with the caller, so a child that is OOM-killed can only cost its own
-  batch, which is scored 0.0. Three details are load-bearing: `forkserver` rather than
+  shares nothing with the caller. A child that is OOM-killed, exits early, or misses
+  the outer deadline raises from the scorer so the reward step fails instead of
+  treating an infrastructure failure as a successful batch of zero rewards. The
+  parent budget (`timeout * jobs + 60s`) is an aggregate containment cap, not an
+  allowance for every internal parser retry. Three details are load-bearing:
+  `forkserver` rather than
   `fork`, because `fork` runs `logging`'s registered at-fork handler, which acquires
   the logging lock with no timeout and can block the forking thread forever when the
   worker's other threads log; `wait()` on the child's sentinel as well as the pipe, so
@@ -142,9 +146,8 @@ new remote reward needs no UniRL code — add it to the server and list its name
   `SIGKILL` cannot be caught, blocked or ignored and needs no bytecode boundary.
 - **A standalone test of the grader needs a real file with an `if __name__ ==
   "__main__":` guard.** `forkserver` re-imports `__main__` in the child, so an unguarded
-  script — or a heredoc, where `__main__` is `<stdin>` — makes every grade return
-  `False` from a completely healthy grader, which is indistinguishable from the grader
-  failing closed. Production is unaffected: in a reward worker `__main__` is Ray's
+  script — or a heredoc, where `__main__` is `<stdin>` — makes child startup fail.
+  Production is unaffected: in a reward worker `__main__` is Ray's
   `default_worker.py`.
 - **`base_device` is ignored by the remote backend** (it's HTTP-only); local
   scorers honor it, falling back to CPU with a warning if CUDA is unavailable.
