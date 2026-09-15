@@ -60,6 +60,12 @@ pipeline:
   _target_: unirl.models.qwen3_omni.pipeline.Qwen3OmniPipeline.from_bundle
   max_prompt_length: 16384
   use_audio_in_video: false
+  # Qwen3-Omni's canonical system prompt. The chat template does not inject one, so
+  # leaving this unset feeds the model a prompt with no system turn — 16 tokens where
+  # the model expects 56. See datasets/omni_preference/README.md Gotchas.
+  system_instruction: >-
+    You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, capable of
+    perceiving auditory and visual inputs, as well as generating text and speech.
   autocast_precision: bf16
   logprob_precision: fp32
 
