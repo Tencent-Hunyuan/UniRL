@@ -42,7 +42,10 @@ stay swappable by `_target_`.
   rollout per call: `wake_up` → (sync weights, if due) →
   `rollout.generate(sample)` → `reward.score_and_attach(sample)` →
   `part.compute_advantages(...)` → drop reward-only decoded media →
-  `stack.train_track(...)`. The driver builds a request `Sample` whose Parts
+  `stack.train_track(...)`. Reward scoring and advantages are capability-gated:
+  `requires_advantages=False` algorithms (supervised / teacher-anchored, e.g. the
+  planned AR OPD) may run without a `reward:` block, keeping any configured
+  reward for monitoring only. The driver builds a request `Sample` whose Parts
   preserve prompt lineage and carry sampling parameters. A single-stage stack
   receives the trainable frontier `Part`; `UnifiedModelTrainStack` receives the
   whole `Sample` so AR and image Parts are sharded by the same prompt trees.

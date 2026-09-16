@@ -8,7 +8,7 @@ from contextlib import contextmanager, nullcontext
 from typing import Dict, Iterator, Optional, Set, Tuple
 
 import torch
-from hydra.utils import get_object, instantiate
+from hydra.utils import get_class, get_object, instantiate
 from omegaconf import DictConfig
 
 from unirl.distributed.group.placement import placement, remote
@@ -66,7 +66,7 @@ class ARTrainer(BaseTrainer):
         pipeline_cfg: DictConfig,
         backend_cfg: DictConfig,
         rollout_cfg: DictConfig,
-        reward_cfg: DictConfig,
+        reward_cfg: Optional[DictConfig] = None,
         algorithm_cfg: DictConfig,
         stack_cfg: DictConfig,
         data_source_cfg: DictConfig,
@@ -91,6 +91,12 @@ class ARTrainer(BaseTrainer):
             rollout_cfg=rollout_cfg,
             stack_cfg=stack_cfg,
         )
+        # Teacher-anchored algorithms declare requires_backend / requires_advantages=False
+        # (mirrors DiffusionTrainer._build_train_side); validate before building anything so a
+        # misconfigured recipe fails fast without a half-constructed device pool or actors.
+        algo_cls = get_class(str(algorithm_cfg.get("_target_", "")))
+        self._algo_requires_advantages = getattr(algo_cls, "requires_advantages", True)
+        self._validate_reward_config(reward_cfg, eval_interval)
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
         self.batch_size = batch_size
         self.adv_normalization_scope = adv_normalization_scope
@@ -118,6 +124,7 @@ class ARTrainer(BaseTrainer):
         self.sampling_params: Dict[str, BaseSamplingParams] = build_sampling_dict(sampling_cfg)
 
         self.weight_sync = None
+        self.reward = None
         self._supports_staged_wake = False
 
         with placement(self.pool, fraction=1.0, shared_workers=True):
@@ -125,8 +132,10 @@ class ARTrainer(BaseTrainer):
             self.pipeline = remote_hydra(pipeline_cfg, bundle=self.bundle)
             self.backend = remote_hydra(backend_cfg, bundle=self.bundle)
 
-            self.reward = remote_hydra(reward_cfg)
-            self.algorithm = remote_hydra(algorithm_cfg, pipeline=self.pipeline)
+            if reward_cfg is not None:
+                self.reward = remote_hydra(reward_cfg)
+            algo_extra = {"backend": self.backend} if getattr(algo_cls, "requires_backend", False) else {}
+            self.algorithm = remote_hydra(algorithm_cfg, pipeline=self.pipeline, **algo_extra)
             self.stack = remote_hydra(stack_cfg, fsdp_backend=self.backend, algorithm=self.algorithm)
 
             rollout_parsed = parse_hydra_cfg(rollout_cfg)
@@ -203,6 +212,23 @@ class ARTrainer(BaseTrainer):
                 if sync_cfg is not None:
                     self.weight_sync = remote_hydra(sync_cfg, backend=self.backend)
                     self.weight_sync.set_rollout_targets([(self.rollout.role_name, self.rollout.workers)])
+
+    def _validate_reward_config(self, reward_cfg: Optional[DictConfig], eval_interval: int) -> None:
+        """A missing ``reward:`` block is legal only for requires_advantages=False algorithms."""
+        if reward_cfg is not None:
+            return
+        if self._algo_requires_advantages:
+            raise ValueError(
+                "The recipe has no `reward:` block, but the algorithm requires advantages "
+                "(requires_advantages=True) — RL training cannot run without a reward model. "
+                "Only supervised/teacher-anchored algorithms may omit `reward:`."
+            )
+        if int(eval_interval) > 0:
+            raise ValueError(
+                f"eval_interval={int(eval_interval)} needs a reward to score eval generations, "
+                "but the recipe has no `reward:` block. Set eval_interval: 0 or configure a "
+                "(monitoring-only) reward."
+            )
 
     def _ensure_anchored_backend_loaded(self) -> None:
         if not self._enable_fsdp_offload or self._anchored_backend_offloaded is False:
@@ -374,7 +400,8 @@ class ARTrainer(BaseTrainer):
 
                 sample = deep_hydrate(sample)
 
-        sample = self.reward.score_and_attach(sample)
+        if self.reward is not None:
+            sample = self.reward.score_and_attach(sample)
 
         part = sample.parts[-1]
         mean_reward = 0.0
@@ -383,12 +410,19 @@ class ARTrainer(BaseTrainer):
             if isinstance(part.component_rewards, dict):
                 part.component_rewards = {name: hydrate(value) for name, value in part.component_rewards.items()}
             mean_reward = float(part.rewards.to(torch.float32).mean().item())
-            if self.advantage_mode == "grpo":
+            if self._algo_requires_advantages and self.advantage_mode == "grpo":
                 part = part.compute_advantages(
                     normalize=self.normalize_adv_by_std,
                     scope=self.adv_normalization_scope,
                 )
             sample = sample.with_parts([*sample.parts[:-1], part])
+
+        # Project root-Part metadata onto the gen Part's rows; only ever fills an empty field.
+        gen_part = sample.parts[-1]
+        if not gen_part.metadata:
+            root_md = sample.root_metadata(-1)
+            if any(md for md in root_md):
+                gen_part.metadata = [dict(md) if md else {} for md in root_md]
 
         self._dump_rollout_samples(sample, rollout_id)
         self._drop_decoded(sample, rollout_id=rollout_id)
