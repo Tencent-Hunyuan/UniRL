@@ -87,10 +87,7 @@ class FSDPConfig:
     param_dtype: str = "bf16"
     cpu_offload: bool = False
     mixed_precision: bool = True
-    # Set NCCL zero-CTA on the default communicator so FSDP all-gather can use
-    # the copy engine. The policy is communicator-wide (reduce-scatter and other
-    # WORLD collectives share it), not all-gather-only. Requires PyTorch >= 2.13,
-    # NCCL >= 2.28, and a node-local shard group.
+    # NCCL zero-CTA on WORLD so FSDP all-gather uses copy engines (communicator-wide).
     copy_engine_all_gather: bool = False
     # Match FSDP2's default: cast floating block inputs to param_dtype.
     cast_forward_inputs: bool = True
