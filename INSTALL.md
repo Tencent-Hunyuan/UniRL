@@ -16,14 +16,14 @@ explicit `CUDA_COMPAT_DIR`.
 
 ```bash
 uv venv --python 3.12 --seed .venv && source .venv/bin/activate
-uv pip install -e ".[vllm,train,infer]" --prerelease=allow
+uv pip install -e ".[vllm,train,infer]"
 ```
 
 ## sglang
 
 ```bash
 uv venv --python 3.12 --seed .venv-sglang && source .venv-sglang/bin/activate
-uv pip install -e ".[sglang,train,infer]" --prerelease=allow
+uv pip install -e ".[sglang,train,infer]"
 ```
 
 This extra reaches `causal-conv1d` through `flash-linear-attention[conv1d]`,
@@ -69,7 +69,7 @@ For development tools (lint and tests):
 ```bash
 uv pip install -e ".[vllm,train,infer,eval,dev]"
 # or, for the sglang engine:
-uv pip install -e ".[sglang,train,infer,eval,dev]" --prerelease=allow
+uv pip install -e ".[sglang,train,infer,eval,dev]"
 ```
 
 ## Environment

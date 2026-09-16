@@ -90,7 +90,7 @@ Engine dirs use two layouts. The compact engines (`trainside`, `fastvideo`,
 management), `utils/`, `weight_sync.py`, and a
 runtime-patch dir for the pinned upstream (`sglang_diffusion/_patches/`,
 `vllm_omni/patches/`). `vllm_omni` additionally carries worker-subprocess code
-(`pipelines/`, `worker/`) and stage boot configs (`stage_configs/`).
+(`pipelines/`, `worker/`) and deployment configs (`deploy_configs/`).
 
 Model onboarding is per-engine, and the adapter file is usually **not** the whole
 change surface:
@@ -107,7 +107,7 @@ change surface:
   model needs a new upstream patch.
 - **`vllm_omni`:** add an `adapters/<family>.py` binder (keyed by modality),
   register it, import it in `adapters/__init__.py`, and add the appropriate boot
-  YAML under `stage_configs/`. DiT families additionally need a worker-side
+  YAML under `deploy_configs/`. DiT families additionally need a worker-side
   `pipelines/<model>/pipeline.py`; if the AR/DiT worker needs new behavior, add a
   `worker/` extension or `patches/compat_<model>.py`.
 

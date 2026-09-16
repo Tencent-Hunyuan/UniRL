@@ -61,7 +61,7 @@ class OmniRawResult(Protocol):
     request_id: str
     stage_id: Optional[int]
     final_output_type: Optional[str]
-    request_output: Optional[Any]
+    outputs: Sequence[Any]
     prompt_token_ids: Optional[Sequence[int]]
     images: Optional[Sequence[Any]]
     trajectory_latents: Optional["torch.Tensor"]
