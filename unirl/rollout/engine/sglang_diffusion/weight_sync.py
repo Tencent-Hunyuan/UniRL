@@ -13,6 +13,27 @@ from unirl.utils.peft_merge import adapt_lora_for_sglang
 logger = logging.getLogger(__name__)
 
 
+def _partition_lora_tensors(
+    tensors: Dict[str, torch.Tensor],
+    target_modules: List[str],
+) -> Dict[str, Dict[str, torch.Tensor]]:
+    """Split component-prefixed LoRA keys for SGLang's one-target IPC API."""
+    groups: Dict[str, Dict[str, torch.Tensor]] = {name: {} for name in target_modules}
+    default_target = target_modules[0]
+    prefixed_targets = sorted(target_modules, key=len, reverse=True)
+    for key, tensor in tensors.items():
+        target = default_target
+        normalized_key = key
+        for candidate in prefixed_targets:
+            prefix = f"{candidate}."
+            if key.startswith(prefix):
+                target = candidate
+                normalized_key = key[len(prefix) :]
+                break
+        groups[target][normalized_key] = tensor
+    return {name: values for name, values in groups.items() if values}
+
+
 class WeightSync:
     """Sync ops + LoRA lifecycle over the seam (one instance per engine)."""
 
@@ -112,12 +133,14 @@ class WeightSync:
             raise ValueError(f"SGLang requires integral lora_alpha; got {adapter_alpha!r}")
         if adapter_rank is not None and int(adapter_rank) != adapter_rank:
             raise ValueError(f"SGLang requires integral LoRA rank; got {adapter_rank!r}")
-        self._backend.set_lora(
-            lora_tensors=stripped,
-            target_modules=self._target_modules,
-            lora_alpha=(int(adapter_alpha) if adapter_alpha is not None else None),
-            lora_rank=(int(adapter_rank) if adapter_rank is not None else None),
-        )
+        grouped = _partition_lora_tensors(stripped, self._target_modules)
+        for target_module, target_tensors in grouped.items():
+            self._backend.set_lora(
+                lora_tensors=target_tensors,
+                target_module=target_module,
+                lora_alpha=(int(adapter_alpha) if adapter_alpha is not None else None),
+                lora_rank=(int(adapter_rank) if adapter_rank is not None else None),
+            )
         self._active_adapter = adapter_name
         self._lora_loaded = True
 

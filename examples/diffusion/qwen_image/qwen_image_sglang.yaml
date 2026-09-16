@@ -2,7 +2,7 @@
 # Qwen-Image + sglang_diffusion (v2 engine) colocate, REPLAY logprob, DanceGRPO, 1x8 H20.
 #
 # Composition: the rollout/sync blocks of sd3_sglang_replay_colocate.yaml
-# (v2 engine, stock sglang 0.5.12.post1 + in-process _patches) x the model/training
+# (v2 engine, stock sglang 0.5.19 + in-process _patches) x the model/training
 # blocks of qwen_image_dancegrpo.yaml (trainside reference — the parity oracle:
 # same prompts/seeds/x_T must produce matching trajectories/logprobs).
 #

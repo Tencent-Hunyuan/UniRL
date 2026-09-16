@@ -84,7 +84,7 @@ class Backend(Protocol):
         self,
         *,
         lora_tensors: Dict[str, Any],
-        target_modules: List[str],
+        target_module: str,
         lora_alpha: Optional[int] = None,
         lora_rank: Optional[int] = None,
     ) -> None: ...
