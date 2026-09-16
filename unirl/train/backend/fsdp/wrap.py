@@ -18,20 +18,6 @@ from unirl.utils.dtypes import parse_torch_dtype
 logger = logging.getLogger(__name__)
 
 
-def copy_engine_pg_options() -> Any:
-    """NCCL options that pin default-group collectives to zero-CTA (copy engine)."""
-    nccl_version = torch.cuda.nccl.version()
-    require(
-        tuple(nccl_version[:2]) >= (2, 28),
-        f"FSDP copy-engine all-gather requires NCCL >= 2.28, got {nccl_version}.",
-    )
-    process_group_nccl = torch.distributed.ProcessGroupNCCL
-    options = process_group_nccl.Options()
-    options.config.cta_policy = process_group_nccl.NCCL_CTA_POLICY_ZERO
-    options._timeout = torch.distributed.constants.default_pg_timeout
-    return options
-
-
 def _clone_checkpoint_kwarg(value: Any) -> Any:
     """Snapshot mutable KV-cache mappings without duplicating tensor storage."""
     if not (hasattr(value, "key_cache") and hasattr(value, "value_cache")):
