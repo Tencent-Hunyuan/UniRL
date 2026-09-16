@@ -46,6 +46,7 @@ def _concat_rollout_trajectory_data(output_batches: list):
         new_dit = RolloutDitTrajectory(
             latents=_cat0([r.dit_trajectory.latents for r in rtds if r.dit_trajectory is not None]),
             timesteps=first.dit_trajectory.timesteps,
+            sigmas=first.dit_trajectory.sigmas,
         )
         _auds = [getattr(r.dit_trajectory, "audio_latents", None) for r in rtds if r.dit_trajectory is not None]
         if _auds and all(a is not None for a in _auds):
@@ -90,6 +91,7 @@ def _slice_rollout_trajectory_keepdim(rtd, idx: int):
         new_dit = RolloutDitTrajectory(
             latents=_slice_row_keepdim(rtd.dit_trajectory.latents, idx),
             timesteps=rtd.dit_trajectory.timesteps,
+            sigmas=rtd.dit_trajectory.sigmas,
         )
         _aud = getattr(rtd.dit_trajectory, "audio_latents", None)
         if _aud is not None:

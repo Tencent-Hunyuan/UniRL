@@ -110,12 +110,9 @@ _GEN_SENTINEL = "_unirl_diff_gen_index"
 
 def _wrap_diff_generator_generate() -> None:
     """AROUND-wrap ``DiffGenerator.generate`` to index ``condition_image`` per prompt."""
-    try:
-        from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import (
-            DiffGenerator,
-        )
-    except Exception:  # pragma: no cover - environment dependent
-        return
+    from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import (
+        DiffGenerator,
+    )
 
     orig = DiffGenerator.__dict__.get("generate")
     if orig is None:
@@ -147,17 +144,16 @@ _IVL_SENTINEL = "_unirl_ivl_cond_img"
 
 def _wrap_input_validation_condition_image() -> None:
     """AROUND-wrap ``InputValidationStage.forward`` to preprocess ``condition_image`` when ``image_path`` is None."""
-    try:
-        import sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation as ivl_mod
-    except ImportError:
-        return  # pragma: no cover - upstream module missing
+    import sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation as ivl_mod
 
     IVL = getattr(ivl_mod, "InputValidationStage", None)
     if IVL is None:
-        return  # pragma: no cover
+        raise AttributeError("InputValidationStage missing upstream")
 
     orig_forward = IVL.__dict__.get("forward")
-    if orig_forward is None or getattr(orig_forward, _IVL_SENTINEL, False):
+    if orig_forward is None:
+        raise AttributeError("InputValidationStage.forward missing upstream")
+    if getattr(orig_forward, _IVL_SENTINEL, False):
         return
 
     def forward(self, batch, server_args, __orig=orig_forward):

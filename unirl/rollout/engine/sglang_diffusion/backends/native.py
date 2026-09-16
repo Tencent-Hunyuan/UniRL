@@ -237,14 +237,14 @@ class SGLangBackend:
         self,
         *,
         lora_tensors: Dict[str, Any],
-        target_modules: List[str],
+        target_module: str,
         lora_alpha: Optional[int] = None,
         lora_rank: Optional[int] = None,
     ) -> None:
-        serialized = self._rt["MultiprocessingSerializer"].serialize(lora_tensors)
+        serialized = self._rt["MultiprocessingSerializer"].serialize(list(lora_tensors.items()))
         request = self._rt["UpdateWeightFromTensorReqInput"](
             serialized_named_tensors=[serialized],
-            target_modules=list(target_modules),
+            target_modules=[target_module],
             weight_update_mode="lora_merge",
             lora_alpha=lora_alpha,
             lora_rank=lora_rank,

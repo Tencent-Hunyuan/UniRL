@@ -9,6 +9,8 @@ def patch_gpu_worker() -> None:
     """Extend the v0.5.19 worker without replacing its native post-training API."""
     from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 
+    _patch_flattened_bucket_payload()
+
     if not getattr(GPUWorker.__init__, "_unirl_gpu_worker", False):
         orig_init = GPUWorker.__init__
 
@@ -93,6 +95,30 @@ def patch_gpu_worker() -> None:
     GPUWorker.release_memory_occupation = release_memory_occupation
     GPUWorker.resume_memory_occupation = resume_memory_occupation
     GPUWorker._unirl_gpu_worker_methods = True
+
+
+def _patch_flattened_bucket_payload() -> None:
+    """Accept UniRL's direct one-module flattened-bucket payload."""
+    from sglang.multimodal_gen.runtime.post_training.weights_updater import (
+        WeightsUpdater,
+    )
+
+    orig = WeightsUpdater._resolve_module_payloads
+    if getattr(orig, "_unirl_flattened_bucket", False):
+        return
+
+    def _resolve_module_payloads(self, named_tensors, modules_to_update):
+        if (
+            isinstance(named_tensors, dict)
+            and "flattened_tensor" in named_tensors
+            and "metadata" in named_tensors
+            and len(modules_to_update) == 1
+        ):
+            return {modules_to_update[0][0]: named_tensors}
+        return orig(self, named_tensors, modules_to_update)
+
+    _resolve_module_payloads._unirl_flattened_bucket = True  # type: ignore[attr-defined]
+    WeightsUpdater._resolve_module_payloads = _resolve_module_payloads
 
 
 def _init_weights_update_group(

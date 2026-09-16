@@ -129,7 +129,6 @@ class SglangDiffusionHijack:
         from unirl.rollout.engine.sglang_diffusion._patches.patch_set_timesteps import (
             patch_set_timesteps,
         )
-        from unirl.rollout.engine.sglang_diffusion._patches.patch_srt import patch_srt
         from unirl.rollout.engine.sglang_diffusion._patches.patch_vae_decode_safe import (
             patch_vae_decode_safe,
         )
@@ -138,7 +137,6 @@ class SglangDiffusionHijack:
         )
 
         for patch in (
-            patch_srt,
             patch_sampling_io,
             patch_conditions,
             patch_latent_prep,

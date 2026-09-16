@@ -9,7 +9,7 @@
 
 ## What it is
 
-18 modules installed by one idempotent `SglangDiffusionHijack.hijack()`
+17 modules installed by one idempotent `SglangDiffusionHijack.hijack()`
 (`hijack.py`). Every patch is `setattr`, dataclass-field injection, or an
 AROUND-wrap — **no sglang source is edited**, so a version bump is a re-pin, not a
 re-merge.
@@ -58,7 +58,6 @@ Re-homed fork surface:
 | `patch_gpu_worker.py` | Upstream owns tensor/LoRA updates and ordinary CPU sleep/wake; UniRL adds external-process-group broadcasts plus tagged CUDA-VM sleep/wake | upstream accepts external distributed broadcasts and tagged memory-saver regions |
 | `patch_scheduler.py` | Registers those UniRL-only verbs and blocks generation while resumed CUDA-VM regions contain disposable weights | same |
 | `patch_safe_unpickler.py` | sglang's `SafeUnpickler` (CVE-2025-10164 mitigation) allowlists `builtins`/`torch`/… but **not** `unirl.`, so the first full-weight push dies. Must be installed **in every process that deserializes** | upstream allowlists are configurable |
-| `patch_srt.py` | `TorchMemorySaverAdapter.is_available()` is missing; the only srt fork edit that matters. No-op if upstream defines it | upstream adds it |
 
 Driver-authoritative rollout contract — these are what keep the GRPO ratio honest:
 
