@@ -76,10 +76,7 @@ class ReflActorRole(Remote):
 
     def initialize(self) -> None:
         torch.cuda.set_device(self.device)
-        try:
-            self._model_config.device = self.device
-        except Exception:
-            pass
+        self._model_config.device = self.device
 
         pipeline_cls = get_class(self._pipeline_target)
         self.pipeline = pipeline_cls.from_config(self._model_config, strategy=self._strategy)
@@ -105,7 +102,7 @@ class ReflActorRole(Remote):
             optimizer_cfg=self._optimizer_cfg,
             scheduler_cfg=self._scheduler_cfg,
             device=self.device,
-            rank=int(self.rank_info.rank) if self.rank_info is not None else 0,
+            rank=int(self.rank_info.rank),
             lora_cfg=self._lora_cfg,
         )
         logger.info(
@@ -140,7 +137,7 @@ class ReflActorRole(Remote):
         conditions = self.pipeline.build_refl_conditions(texts, images=images, params=params)
         schedule = get_sigma_schedule(
             int(params.num_inference_steps),
-            shift=float(getattr(self.pipeline, "shift", 5.0)),
+            shift=float(self.pipeline.shift),
             device=self.pipeline.bundle.device,
         )
         result = self.pipeline.diffusion.diffuse_with_grad(conditions, schedule=schedule, params=params)
@@ -175,7 +172,7 @@ class ReflActorRole(Remote):
         """Clip + one optimizer step; returns grad_norm and current lr."""
         grad_norm = float(self.backend.optimizer_step(max_grad_norm=float(max_grad_norm)))
         lr = 0.0
-        sched = getattr(self.backend, "scheduler", None)
+        sched = self.backend.scheduler
         if sched is not None:
             last = sched.get_last_lr()
             lr = float(last[0]) if last else 0.0
