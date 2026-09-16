@@ -11,7 +11,14 @@ import threading
 import time
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Sequence, TypeVar
 
-from unirl.rollout.engine.sglang.backends.base import _filter_server_args_or_raise
+from unirl.rollout.engine.sglang.backends.base import (
+    _filter_server_args_or_raise,
+    _normalize_cuda_visible_devices,
+    _preloaded_cuda_driver_libraries,
+    _preserve_cuda_driver_preloads,
+    _run_sglang_scheduler_with_cuda_driver_preload,
+    _scheduler_spawn_environment,
+)
 from unirl.rollout.engine.sglang.backends.http import parse_generate_response
 
 logger = logging.getLogger(__name__)
@@ -169,6 +176,7 @@ class NativeBackend:
         server_intent: Dict[str, Any],
         *,
         concurrency: int,
+        cuda_visible_devices: Optional[Sequence[str]] = None,
     ) -> "NativeBackend":
         """Filter intent against ServerArgs, construct the in-process Engine."""
         rt = _import_sglang_engine()
@@ -205,7 +213,25 @@ class NativeBackend:
         )
 
         multiprocessing.set_start_method("spawn", force=True)
-        engine = rt["Engine"](**engine_kwargs)
+        visible_devices = _normalize_cuda_visible_devices(
+            cuda_visible_devices,
+            tp_size=tp_size,
+        )
+        if visible_devices is not None:
+            engine_kwargs["base_gpu_id"] = 0
+        cuda_driver_preloads = _preloaded_cuda_driver_libraries()
+        engine_cls = rt["Engine"]
+        if cuda_driver_preloads:
+
+            class _CudaCompatEngine(engine_cls):
+                run_scheduler_process_func = staticmethod(_run_sglang_scheduler_with_cuda_driver_preload)
+
+            engine_cls = _CudaCompatEngine
+        with (
+            _scheduler_spawn_environment(visible_devices),
+            _preserve_cuda_driver_preloads(cuda_driver_preloads),
+        ):
+            engine = engine_cls(**engine_kwargs)
 
         settled = getattr(engine, "server_args", None)
         logger.info(
