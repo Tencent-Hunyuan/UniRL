@@ -66,7 +66,7 @@ class ARTrainer(BaseTrainer):
         pipeline_cfg: DictConfig,
         backend_cfg: DictConfig,
         rollout_cfg: DictConfig,
-        reward_cfg: Optional[DictConfig] = None,
+        reward_cfg: Optional[DictConfig],
         algorithm_cfg: DictConfig,
         stack_cfg: DictConfig,
         data_source_cfg: DictConfig,
@@ -96,7 +96,20 @@ class ARTrainer(BaseTrainer):
         # misconfigured recipe fails fast without a half-constructed device pool or actors.
         algo_cls = get_class(str(algorithm_cfg.get("_target_", "")))
         self._algo_requires_advantages = getattr(algo_cls, "requires_advantages", True)
-        self._validate_reward_config(reward_cfg, eval_interval)
+        eval_interval = int(eval_interval)
+        if reward_cfg is None:
+            if self._algo_requires_advantages:
+                raise ValueError(
+                    "The recipe has no `reward:` block, but the algorithm requires advantages "
+                    "(requires_advantages=True) — RL training cannot run without a reward model. "
+                    "Only supervised/teacher-anchored algorithms may omit `reward:`."
+                )
+            if eval_interval > 0:
+                raise ValueError(
+                    f"eval_interval={eval_interval} needs a reward to score eval generations, "
+                    "but the recipe has no `reward:` block. Set eval_interval: 0 or configure a "
+                    "(monitoring-only) reward."
+                )
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
         self.batch_size = batch_size
         self.adv_normalization_scope = adv_normalization_scope
@@ -105,7 +118,7 @@ class ARTrainer(BaseTrainer):
         if self.advantage_mode not in ("grpo", "gae"):
             raise ValueError(f"ARTrainer: advantage_mode must be 'grpo' or 'gae', got {advantage_mode!r}")
         self.balance_shards = bool(balance_shards)
-        self.eval_interval = int(eval_interval)
+        self.eval_interval = eval_interval
         _num = int(eval_num_prompts)
         self.eval_num_prompts = -1 if _num < 0 else _num
         self.eval_batch_size = max(1, int(eval_batch_size))
@@ -212,23 +225,6 @@ class ARTrainer(BaseTrainer):
                 if sync_cfg is not None:
                     self.weight_sync = remote_hydra(sync_cfg, backend=self.backend)
                     self.weight_sync.set_rollout_targets([(self.rollout.role_name, self.rollout.workers)])
-
-    def _validate_reward_config(self, reward_cfg: Optional[DictConfig], eval_interval: int) -> None:
-        """A missing ``reward:`` block is legal only for requires_advantages=False algorithms."""
-        if reward_cfg is not None:
-            return
-        if self._algo_requires_advantages:
-            raise ValueError(
-                "The recipe has no `reward:` block, but the algorithm requires advantages "
-                "(requires_advantages=True) — RL training cannot run without a reward model. "
-                "Only supervised/teacher-anchored algorithms may omit `reward:`."
-            )
-        if int(eval_interval) > 0:
-            raise ValueError(
-                f"eval_interval={int(eval_interval)} needs a reward to score eval generations, "
-                "but the recipe has no `reward:` block. Set eval_interval: 0 or configure a "
-                "(monitoring-only) reward."
-            )
 
     def _ensure_anchored_backend_loaded(self) -> None:
         if not self._enable_fsdp_offload or self._anchored_backend_offloaded is False:

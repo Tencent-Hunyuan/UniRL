@@ -35,7 +35,7 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
         pipeline_cfg: DictConfig,
         backend_cfg: DictConfig,
         rollout_cfg: DictConfig,
-        reward_cfg: Optional[DictConfig] = None,
+        reward_cfg: Optional[DictConfig],
         algorithm_cfg: DictConfig,
         stack_cfg: DictConfig,
         data_source_cfg: DictConfig,
