@@ -76,9 +76,11 @@ class FSDPBackend(BaseFSDP2Backend):
             process_group_nccl = torch.distributed.ProcessGroupNCCL
             options = process_group_nccl.Options()
             options.config.cta_policy = process_group_nccl.NCCL_CTA_POLICY_ZERO
-            options._timeout = torch.distributed.constants.default_pg_timeout
+            timeout = torch.distributed.constants.default_pg_timeout
+            options._timeout = timeout
             torch.distributed.init_process_group(
                 pg_options=options,
+                timeout=timeout,
                 device_id=torch.device("cuda", torch.cuda.current_device()),
             )
         else:
