@@ -209,13 +209,13 @@ def _iter_subclasses(cls):
 
 
 def _install_sampling_params_fields(SamplingParams) -> None:
-    """Register the four fields on SamplingParams and every live subclass."""
+    """Register UniRL fields on SamplingParams and every live subclass."""
     for cls in _iter_subclasses(SamplingParams):
         _register_and_wrap_init(cls)
 
 
 def _register_and_wrap_init(cls) -> None:
-    """Add the four fields to ``cls`` and wrap its ``__init__`` to accept them."""
+    """Add UniRL fields to ``cls`` and wrap its ``__init__`` to accept them."""
     own_fields = cls.__dict__.get("__dataclass_fields__")
     if own_fields is None:
         own_fields = dict(getattr(cls, "__dataclass_fields__", {}))
@@ -276,7 +276,7 @@ def _install_req_denoise_seeds(sb_mod) -> None:
 
 
 def _wrap_prepare_request(utils_mod, SamplingParams) -> None:
-    """AROUND-wrap ``prepare_request`` to copy the four IO fields onto the Req."""
+    """AROUND-wrap ``prepare_request`` to lower driver-only IO onto the Req."""
     orig = utils_mod.prepare_request
     if getattr(orig, _PREP_SENTINEL, False):
         return
@@ -305,10 +305,6 @@ def _wrap_prepare_request(utils_mod, SamplingParams) -> None:
         denoise_seeds = getattr(sampling_params, "denoise_seeds", None)
         if denoise_seeds is not None:
             req.denoise_seeds = denoise_seeds
-
-        max_sequence_length = getattr(sampling_params, "max_sequence_length", None)
-        if max_sequence_length is not None:
-            req.max_sequence_length = int(max_sequence_length)
 
         condition_image = getattr(sampling_params, "condition_image", None)
         if condition_image is not None:
