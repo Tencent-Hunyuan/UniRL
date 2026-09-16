@@ -182,13 +182,15 @@ def fsdp_wrap(
     if copy_engine_all_gather:
         import torch.distributed as dist
 
-        shard_group = mesh.get_group("dp_shard") if mesh is not None else None
+        shard_group = mesh.get_group("dp_shard") if mesh is not None else dist.group.WORLD
+        _require_zero_cta_policy(shard_group)
         hosts = [None] * dist.get_world_size(shard_group)
         dist.all_gather_object(hosts, socket.gethostname(), group=shard_group)
         require(
             len(set(hosts)) == 1,
             "FSDP copy-engine all-gather requires each shard group to stay within one node; "
-            f"this group spans hosts {sorted(set(hosts))}. Use hybrid mode with a node-local hsdp_shard_size.",
+            f"this group spans hosts {sorted(set(hosts))}. Use hybrid mode with a node-local hsdp_shard_size "
+            "(the check compares hostnames, so one-pod-per-GPU layouts fail it even on a single node).",
         )
         fsdp_modules = tuple(module for module in model.modules() if isinstance(module, FSDPModule))
         require(fsdp_modules, "FSDP copy-engine all-gather requires at least one fully-sharded module.")
@@ -292,6 +294,30 @@ def _create_device_mesh(fsdp_mode: str, *, hsdp_shard_size: int) -> Optional[obj
     if _current_rank() == 0:
         logger.info("fsdp_wrap: %s mesh dp_replicate=%d x dp_shard=%d", fsdp_mode, *mesh_shape)
     return mesh
+
+
+def _require_zero_cta_policy(group: object) -> None:
+    """Confirm the all-gather communicator carries zero-CTA instead of trusting how it was created.
+
+    The policy only reaches a shard sub-group when DeviceMesh splits it from a
+    default group that FSDPBackend bound to an indexed CUDA device (torch copies
+    the parent's NCCL options into the split). Any other creation path hands
+    the sub-group fresh default options and NCCL silently falls back to kernel
+    all-gathers, so the flag would be on with no effect.
+    """
+    import torch.distributed as dist
+
+    nccl_backend = group._get_backend(torch.device("cuda"))
+    policy = int(nccl_backend.options.config.cta_policy)
+    zero_cta = int(dist.ProcessGroupNCCL.NCCL_CTA_POLICY_ZERO)
+    require(
+        policy == zero_cta,
+        f"fsdp_wrap: the copy-engine all-gather communicator {group.group_desc!r} has cta_policy={policy}, "
+        f"not zero-CTA ({zero_cta}). FSDPBackend must bring up the default process group itself so WORLD "
+        "carries the policy and DeviceMesh splits the shard group from it; initialize nothing before it.",
+    )
+    if _current_rank() == 0:
+        logger.info("fsdp_wrap: copy-engine all-gather on %r (cta_policy=%d)", group.group_desc, policy)
 
 
 def _validate_hsdp_mesh(model: nn.Module, *, expected_mesh: object) -> None:
