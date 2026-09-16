@@ -60,6 +60,7 @@ class SGLangRolloutEngine(BaseRolloutEngine):
         self._device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._is_offloaded = False
         self._weights_onloaded_for_sync = False
+        self._checkpoint_engine_sync_error: Optional[str] = None
 
         self._tp_rank = int(tp_rank)
         self._tp_size = int(tp_size)
@@ -181,6 +182,11 @@ class SGLangRolloutEngine(BaseRolloutEngine):
         """Generate one whole Sample synchronously through the backend seam."""
         if not self._is_tp_zero:
             return None
+        if self._checkpoint_engine_sync_error is not None:
+            raise RuntimeError(
+                "SGLang rollout is unhealthy after a failed checkpoint-engine update: "
+                f"{self._checkpoint_engine_sync_error}"
+            )
         prepared = self._prepare_generation(sample)
         raw = self._backend.generate(prepared.wire)
         return self._finish_generation(sample, prepared, raw)
@@ -256,6 +262,8 @@ class SGLangRolloutEngine(BaseRolloutEngine):
     def health_check(self) -> bool:
         if not self._is_tp_zero:
             return True
+        if self._checkpoint_engine_sync_error is not None:
+            return False
         if self._is_offloaded:
             return True
         return self._backend.ping()
@@ -366,6 +374,37 @@ class SGLangRolloutEngine(BaseRolloutEngine):
         if not self._is_tp_zero or self._weight_sync is None:
             return False
         return self._weight_sync.lora_dirty
+
+    def update_weights_from_checkpoint_engine_ipc(
+        self,
+        *,
+        zmq_handles: Dict[str, str],
+        flush_cache: bool = True,
+        track_prefix: str = "",
+        timeout_s: Optional[float] = None,
+    ) -> None:
+        """Update weights via ZMQ + CUDA IPC (checkpoint_engine protocol)."""
+        del track_prefix
+        if not self._is_tp_zero:
+            return
+        if self._checkpoint_engine_sync_error is not None:
+            raise RuntimeError(
+                "SGLang rollout cannot retry checkpoint-engine IPC after a failed update; restart the rollout backend"
+            )
+        try:
+            self._weight_sync.update_weights_from_ipc(
+                zmq_handles=zmq_handles,
+                flush_cache=flush_cache,
+                timeout_s=timeout_s,
+            )
+        except BaseException as exc:
+            self.mark_checkpoint_engine_sync_failed(str(exc))
+            raise
+        self._version += 1
+
+    def mark_checkpoint_engine_sync_failed(self, error: str) -> None:
+        """Poison this rollout after a possibly partial live-weight update."""
+        self._checkpoint_engine_sync_error = str(error)
 
 
 __all__ = ["SGLangRolloutEngine"]
