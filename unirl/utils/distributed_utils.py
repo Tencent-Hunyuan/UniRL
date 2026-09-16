@@ -28,19 +28,42 @@ def find_dtensor_mesh(model: torch.nn.Module) -> DeviceMesh | None:
     return None
 
 
-def ensure_dist_initialized(local_rank: int | None = None) -> None:
-    """Idempotently bring up the default process group."""
+def ensure_dist_initialized(
+    local_rank: int | None = None,
+    *,
+    backend: str | None = None,
+    pg_options: Any | None = None,
+    device_id: torch.device | None = None,
+    timeout: timedelta | None = None,
+) -> None:
+    """Idempotently bring up the default process group.
+
+    The keyword arguments only shape the group this call creates. Asking for
+    them once the group already exists raises instead of silently returning:
+    a caller that needs specific communicator options (FSDP copy-engine
+    all-gather pins zero-CTA on WORLD) cannot get them any other way.
+    """
     if not dist.is_available():
         raise RuntimeError("torch.distributed is unavailable")
     if torch.cuda.is_available() and local_rank is not None:
         torch.cuda.set_device(local_rank)
-    if not dist.is_initialized():
-        dist.init_process_group()
-        logger.info(
-            "ensure_dist_initialized: default process group up (rank=%s world=%s)",
-            dist.get_rank(),
-            dist.get_world_size(),
-        )
+    requested = {"backend": backend, "pg_options": pg_options, "device_id": device_id, "timeout": timeout}
+    kwargs = {name: value for name, value in requested.items() if value is not None}
+    if dist.is_initialized():
+        if kwargs:
+            raise RuntimeError(
+                "ensure_dist_initialized: the default process group already exists, so the requested "
+                f"{sorted(kwargs)} cannot be applied to it. Bring the group up through this call first."
+            )
+        return
+    dist.init_process_group(**kwargs)
+    logger.info(
+        "ensure_dist_initialized: default process group up (rank=%s world=%s backend=%s device_id=%s)",
+        dist.get_rank(),
+        dist.get_world_size(),
+        dist.get_backend(),
+        device_id,
+    )
 
 
 def init_gloo_group():
