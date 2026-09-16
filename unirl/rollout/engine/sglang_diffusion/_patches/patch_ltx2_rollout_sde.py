@@ -8,6 +8,7 @@ _SENTINEL = "_unirl_ltx2_rollout_sde"
 def patch_ltx2_rollout_sde() -> None:
     _patch_all_valid_prompt_mask()
     _patch_rope_precision_alignment()
+    _patch_sigma_alignment()
     _patch_audio_trajectory_alignment()
     _patch_av_decode_carry()
     _patch_sde_logprob_bridge()
@@ -80,6 +81,27 @@ def _patch_rope_precision_alignment() -> None:
     apply_split_rotary_emb._unirl_fp32_rope = True  # type: ignore[attr-defined]
     module.apply_interleaved_rotary_emb = apply_interleaved_rotary_emb
     module.apply_split_rotary_emb = apply_split_rotary_emb
+
+
+def _patch_sigma_alignment() -> None:
+    """Keep the driver-pinned σ schedule across LTX-2's model defaults."""
+    from sglang.multimodal_gen.runtime.pipelines.ltx_2_pipeline import (
+        LTX2SigmaPreparationStage,
+    )
+
+    orig = LTX2SigmaPreparationStage.forward
+    if getattr(orig, _SENTINEL, False):
+        return
+
+    def forward(self, batch, server_args):
+        pinned = getattr(batch, "sigmas", None)
+        result = orig(self, batch, server_args)
+        if getattr(batch, "rollout", False) and pinned:
+            result.sigmas = pinned
+        return result
+
+    forward._unirl_ltx2_rollout_sde = True  # type: ignore[attr-defined]
+    LTX2SigmaPreparationStage.forward = forward
 
 
 def _patch_av_decode_carry() -> None:

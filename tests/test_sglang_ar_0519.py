@@ -2,8 +2,11 @@ import asyncio
 from dataclasses import dataclass
 from types import SimpleNamespace
 
+import pytest
+
 from unirl.rollout.engine.sglang.backends.http import HTTPBackend, asdict_drop_none
 from unirl.rollout.engine.sglang.backends.native import NativeBackend
+from unirl.rollout.engine.sglang.config import SGLangEngineConfig, SGLangPorts
 
 
 @dataclass
@@ -104,3 +107,28 @@ def test_native_lora_uses_public_engine_api():
         "config_dict": {"r": 8},
     }
     engine.loop.close()
+
+
+def test_server_intent_maps_legacy_cuda_graph_batch_size():
+    config = SGLangEngineConfig(
+        pretrained_model_ckpt_path="/model",
+        engine_kwargs={"cuda_graph_max_bs": 16},
+    )
+
+    intent = config.server_intent(ports=SGLangPorts(65000, 65001))
+
+    assert intent["cuda_graph_max_bs_decode"] == 16
+    assert "cuda_graph_max_bs" not in intent
+
+
+def test_server_intent_rejects_conflicting_cuda_graph_batch_sizes():
+    config = SGLangEngineConfig(
+        pretrained_model_ckpt_path="/model",
+        engine_kwargs={
+            "cuda_graph_max_bs": 16,
+            "cuda_graph_max_bs_decode": 32,
+        },
+    )
+
+    with pytest.raises(ValueError, match="cannot set both"):
+        config.server_intent(ports=SGLangPorts(65000, 65001))

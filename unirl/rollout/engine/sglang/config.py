@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import random
 import socket
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -11,14 +10,10 @@ from unirl.config.require import require
 from unirl.rollout.engine.base import BaseEngineConfig
 from unirl.rollout.engine.ports import ReservedPorts
 
-_SGLANG_GRPC_PORT_OFFSET = 30000
-_SGLANG_MAX_DERIVED_GRPC_BASE_PORT = 65535 - _SGLANG_GRPC_PORT_OFFSET
-_SGLANG_SAFE_SERVER_PORT_MIN = 1024
 _REQUIRED_SERVER_ARGS_METADATA_KEY = "_unirl_required_server_args"
 _LOAD_BEARING_SERVER_ARGS = frozenset(
     {
         "ep_size",
-        "enable_expert_parallel",
         "enable_memory_saver",
         "enable_weights_cpu_backup",
         "skip_server_warmup",
@@ -37,21 +32,6 @@ def _bind_tcp_port(port: int) -> socket.socket:
     return sock
 
 
-def _reserve_safe_server_port() -> socket.socket:
-    """Reserve a SGLang server port whose derived gRPC port cannot overflow."""
-    last_error: Optional[Exception] = None
-    for _ in range(1024):
-        server_port = random.randint(_SGLANG_SAFE_SERVER_PORT_MIN, _SGLANG_MAX_DERIVED_GRPC_BASE_PORT)
-        try:
-            return _bind_tcp_port(server_port)
-        except OSError as exc:
-            last_error = exc
-            continue
-    raise OSError(
-        f"no free SGLang server port in [{_SGLANG_SAFE_SERVER_PORT_MIN}, {_SGLANG_MAX_DERIVED_GRPC_BASE_PORT}]"
-    ) from last_error
-
-
 @dataclass(frozen=True)
 class SGLangPorts(ReservedPorts):
     """The ports one SRT server spawn consumes."""
@@ -61,19 +41,13 @@ class SGLangPorts(ReservedPorts):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        require(
-            self.server_port <= _SGLANG_MAX_DERIVED_GRPC_BASE_PORT,
-            "SGLangPorts.server_port must be <= "
-            f"{_SGLANG_MAX_DERIVED_GRPC_BASE_PORT} because SGLang derives grpc_port as port + "
-            f"{_SGLANG_GRPC_PORT_OFFSET}; got {self.server_port}",
-        )
 
     @classmethod
     def reserve(cls) -> "SGLangPorts":
         """Reserve SGLang HTTP and NCCL ports on this node."""
         socks = []
         try:
-            server_sock = _reserve_safe_server_port()
+            server_sock = _bind_tcp_port(0)
             socks.append(server_sock)
             nccl_sock = _bind_tcp_port(0)
             socks.append(nccl_sock)
@@ -103,7 +77,6 @@ class SGLangEngineConfig(BaseEngineConfig):
     pp_size: Optional[int] = None
     ep_size: Optional[int] = None
     dp_size: Optional[int] = None
-    enable_expert_parallel: Optional[bool] = None
 
     host: Optional[str] = None
 
@@ -206,6 +179,13 @@ class SGLangEngineConfig(BaseEngineConfig):
         intent: Dict[str, Any] = {}
 
         intent.update(self.engine_kwargs or {})
+        if "cuda_graph_max_bs" in intent:
+            require(
+                "cuda_graph_max_bs_decode" not in intent,
+                "SGLangEngineConfig.engine_kwargs cannot set both the retired "
+                "cuda_graph_max_bs alias and cuda_graph_max_bs_decode",
+            )
+            intent["cuda_graph_max_bs_decode"] = intent.pop("cuda_graph_max_bs")
 
         intent["model_path"] = self.pretrained_model_ckpt_path
         if self.tp_size is not None:
@@ -216,8 +196,6 @@ class SGLangEngineConfig(BaseEngineConfig):
             intent["ep_size"] = int(self.ep_size)
         if self.dp_size is not None:
             intent["dp_size"] = int(self.dp_size)
-        if self.enable_expert_parallel is not None:
-            intent["enable_expert_parallel"] = bool(self.enable_expert_parallel)
         if self.enable_memory_saver is not None:
             intent["enable_memory_saver"] = bool(self.enable_memory_saver)
         if self.enable_weights_cpu_backup is not None:
