@@ -28,19 +28,35 @@ def find_dtensor_mesh(model: torch.nn.Module) -> DeviceMesh | None:
     return None
 
 
-def ensure_dist_initialized(local_rank: int | None = None) -> None:
+def ensure_dist_initialized(
+    local_rank: int | None = None,
+    *,
+    pg_options: Any | None = None,
+    device_id: torch.device | int | None = None,
+) -> None:
     """Idempotently bring up the default process group."""
     if not dist.is_available():
         raise RuntimeError("torch.distributed is unavailable")
     if torch.cuda.is_available() and local_rank is not None:
         torch.cuda.set_device(local_rank)
-    if not dist.is_initialized():
-        dist.init_process_group()
-        logger.info(
-            "ensure_dist_initialized: default process group up (rank=%s world=%s)",
-            dist.get_rank(),
-            dist.get_world_size(),
-        )
+    if dist.is_initialized():
+        if pg_options is not None:
+            raise RuntimeError(
+                "FSDP copy-engine all-gather must configure the default process group at init; "
+                "WORLD is already initialized."
+            )
+        return
+    kwargs: dict[str, Any] = {}
+    if pg_options is not None:
+        kwargs["pg_options"] = pg_options
+    if device_id is not None:
+        kwargs["device_id"] = device_id
+    dist.init_process_group(**kwargs)
+    logger.info(
+        "ensure_dist_initialized: default process group up (rank=%s world=%s)",
+        dist.get_rank(),
+        dist.get_world_size(),
+    )
 
 
 def init_gloo_group():

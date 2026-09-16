@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+import os
 from typing import Optional, Tuple
 
 import torch
 
+from unirl.config.require import require
 from unirl.models.types.bundle import Bundle
 from unirl.models.types.post_materialize import apply_deferred_ops
 from unirl.train.backend.base import LrSchedulerConfig, OptimizerConfig, resolve_trainable_module
 from unirl.train.backend.base_backend import BaseFSDP2Backend
 from unirl.train.backend.fsdp.state import clip_grad_norm, fsdp_offload, fsdp_onload
-from unirl.train.backend.fsdp.wrap import fsdp_wrap
+from unirl.train.backend.fsdp.wrap import copy_engine_pg_options, fsdp_wrap
 from unirl.train.backend.sharded_load import load_trainable_weights
 from unirl.train.backend.sharded_state import (
     StateDict,
@@ -24,6 +26,7 @@ from unirl.train.configs import (
     EmaLoraConfig,
     FSDPConfig,
     LoraConfig,
+    normalize_fsdp_mode,
 )
 from unirl.utils.distributed_utils import ensure_dist_initialized
 from unirl.utils.dtypes import parse_torch_dtype
@@ -54,7 +57,27 @@ class FSDPBackend(BaseFSDP2Backend):
         self._bundle = bundle
         self._rank = int(rank)
         self._device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        ensure_dist_initialized()
+        pg_options = None
+        device_id = None
+        if fsdp_cfg.copy_engine_all_gather:
+            require(
+                normalize_fsdp_mode(fsdp_cfg.fsdp_mode) != "no_shard",
+                "FSDP copy-engine all-gather is invalid with fsdp_mode='no_shard'.",
+            )
+            policy = os.environ.get("NCCL_CTA_POLICY")
+            require(
+                policy in {None, "2"},
+                "FSDP copy-engine all-gather sets zero-CTA on the default NCCL group, but "
+                f"NCCL_CTA_POLICY={policy!r} would override it. Unset NCCL_CTA_POLICY or set it to '2'.",
+            )
+            pg_options = copy_engine_pg_options()
+            if self._device.type == "cuda":
+                device_id = (
+                    self._device
+                    if self._device.index is not None
+                    else torch.device("cuda", torch.cuda.current_device())
+                )
+        ensure_dist_initialized(pg_options=pg_options, device_id=device_id)
 
         self._weight_sync_dtype: torch.dtype = parse_torch_dtype(
             fsdp_cfg.param_dtype, field_name="training.fsdp.param_dtype"

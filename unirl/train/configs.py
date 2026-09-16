@@ -87,8 +87,8 @@ class FSDPConfig:
     param_dtype: str = "bf16"
     cpu_offload: bool = False
     mixed_precision: bool = True
-    # Use a dedicated NCCL symmetric-memory shard communicator with an explicit
-    # zero-CTA policy. Requires PyTorch >= 2.13, NCCL >= 2.28, and node-local NVLink.
+    # Pin the default NCCL group to zero-CTA so FSDP all-gather can use the copy
+    # engine. Requires PyTorch >= 2.13, NCCL >= 2.28, and node-local NVLink.
     copy_engine_all_gather: bool = False
     # Match FSDP2's default: cast floating block inputs to param_dtype.
     cast_forward_inputs: bool = True
