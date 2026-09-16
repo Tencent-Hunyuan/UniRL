@@ -31,9 +31,6 @@ from unirl.train.configs import (
 from unirl.utils.distributed_utils import ensure_dist_initialized
 from unirl.utils.dtypes import parse_torch_dtype
 
-# Same pair ensure_dist_initialized() resolves to; device_id alone would narrow WORLD to NCCL.
-_COPY_ENGINE_PG_BACKEND = "cpu:gloo,cuda:nccl"
-
 
 def _copy_engine_process_group_args(fsdp_cfg: FSDPConfig, device: torch.device) -> Tuple[object, torch.device]:
     """Validate the copy-engine preconditions and build the zero-CTA NCCL options for WORLD."""
@@ -97,8 +94,9 @@ class FSDPBackend(BaseFSDP2Backend):
         if fsdp_cfg.copy_engine_all_gather:
             pg_options, pg_device = _copy_engine_process_group_args(fsdp_cfg, self._device)
             torch.cuda.set_device(pg_device)
-            ensure_dist_initialized(
-                backend=_COPY_ENGINE_PG_BACKEND,
+            # device_id without backend would narrow WORLD to NCCL; keep the default pair.
+            torch.distributed.init_process_group(
+                backend="cpu:gloo,cuda:nccl",
                 pg_options=pg_options,
                 device_id=pg_device,
                 timeout=torch.distributed.constants.default_pg_timeout,
