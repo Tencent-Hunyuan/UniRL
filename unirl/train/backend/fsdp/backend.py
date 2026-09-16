@@ -74,12 +74,6 @@ class FSDPBackend(BaseFSDP2Backend):
                 "FSDP copy-engine all-gather sets zero-CTA on the default NCCL group, but "
                 f"NCCL_CTA_POLICY={policy!r} would override it. Unset NCCL_CTA_POLICY or set it to '2'.",
             )
-            require(
-                not torch.distributed.is_initialized(),
-                "FSDP copy-engine all-gather was enabled after the default process group was initialized. "
-                "Construct FSDPBackend before anything else brings up torch.distributed, so WORLD is created "
-                "with the zero-CTA policy and bound to an indexed CUDA device for DeviceMesh to split from.",
-            )
             pg_device = self._device
             if pg_device.index is None:
                 pg_device = torch.device("cuda", torch.cuda.current_device())
@@ -87,13 +81,14 @@ class FSDPBackend(BaseFSDP2Backend):
             process_group_nccl = torch.distributed.ProcessGroupNCCL
             options = process_group_nccl.Options()
             options.config.cta_policy = process_group_nccl.NCCL_CTA_POLICY_ZERO
-            options._timeout = torch.distributed.constants.default_pg_timeout
+            timeout = torch.distributed.constants.default_pg_timeout
+            options._timeout = timeout
             # device_id without backend would narrow WORLD to NCCL; keep the default pair.
             torch.distributed.init_process_group(
                 backend="cpu:gloo,cuda:nccl",
                 pg_options=options,
                 device_id=pg_device,
-                timeout=torch.distributed.constants.default_pg_timeout,
+                timeout=timeout,
             )
         else:
             ensure_dist_initialized()
