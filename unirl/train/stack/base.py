@@ -162,10 +162,6 @@ class TrainStack(Remote):
             self.fsdp_backend.zero_grad()
 
         loss_scales, global_weight = self._resolve_loss_scales(part, micros=micros)
-        # Reporting weights stay a proper average even when the backward accumulates raw
-        # micro means, so `loss` remains comparable across settings (the log-2 check).
-        report_total = sum(end - start for start, end in micros)
-        report_scales = [(end - start) / report_total for start, end in micros]
         micro_results: List[AlgorithmStepResult] = []
         total_loss = 0.0
         weighted_loss_sum = 0.0
@@ -187,7 +183,7 @@ class TrainStack(Remote):
             )
             micro_results.append(result)
             if global_weight is None:
-                total_loss += result.loss * report_scales[i]
+                total_loss += result.loss * loss_scales[i]
             else:
                 weighted_loss_sum += result.loss * self._micro_loss_weight(part, start, end)
             has_backward = has_backward or result.has_backward
@@ -257,10 +253,6 @@ class TrainStack(Remote):
         """Per-micro ``loss_scale`` factors for one optimizer step."""
         weighting = str(getattr(self.algorithm, "loss_weighting", "sample"))
         if weighting == "sample":
-            if not bool(getattr(self.algorithm, "normalize_across_micros", True)):
-                # Accumulate raw micro means instead of averaging over the update; see
-                # unirl/train/readme.md Gotchas.
-                return [1.0 for _ in micros], None
             update_total = sum(end - start for start, end in micros)
             return [(end - start) / update_total for start, end in micros], None
         if weighting != "token":

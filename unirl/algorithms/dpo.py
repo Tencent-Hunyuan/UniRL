@@ -64,7 +64,6 @@ class DPO(StageAlgorithm):
         average_log_prob: bool = False,
         conditions_cls: Optional[Type[Any]] = None,
         sampling_temperature: Optional[float] = None,
-        normalize_across_micros: bool = True,
     ) -> None:
         super().__init__()
         if stage is None and pipeline is None:
@@ -77,7 +76,6 @@ class DPO(StageAlgorithm):
             raise ValueError(f"DPO: label_smoothing must be in [0, 0.5); got {label_smoothing!r}.")
         self.stage = stage
         self.beta = float(beta)
-        self.normalize_across_micros = bool(normalize_across_micros)
         self.label_smoothing = float(label_smoothing)
         self.loss_type = str(loss_type)
         self.average_log_prob = bool(average_log_prob)
