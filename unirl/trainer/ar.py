@@ -447,6 +447,11 @@ class ARTrainer(BaseTrainer):
 
     def evaluate(self, rollout_id: int) -> float:
         """Periodic eval — ``avg@k`` accuracy on the eval prompt set."""
+        if self.reward is None:
+            raise RuntimeError(
+                "ARTrainer.evaluate: no reward configured (the recipe has no `reward:` "
+                "block) — evaluation scores generations and needs one."
+            )
         import dataclasses
 
         eval_ar = dataclasses.replace(
