@@ -642,35 +642,6 @@ def patch_sigmas_passthrough() -> None:
         pass
 
 
-def patch_per_request_ar_seed() -> None:
-    """Stamp a fresh os.urandom seed onto every AR SamplingParams in add_request's sampling_params_list."""
-    try:
-        import msgspec as _msgspec
-        from vllm import SamplingParams as VLLMSamplingParams
-        from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
-    except (ImportError, AttributeError):
-        return
-
-    _orig = AsyncOmniEngine.add_request
-    if getattr(_orig, "_diffrl_per_request_ar_seed", False):
-        return
-
-    import os as _os
-
-    def _patched(self, *args, sampling_params_list=None, _orig=_orig, **kwargs):
-        if sampling_params_list is not None:
-            sampling_params_list = [
-                _msgspec.structs.replace(sp, seed=int.from_bytes(_os.urandom(4), "big"))
-                if isinstance(sp, VLLMSamplingParams) and getattr(sp, "seed", None) is None
-                else sp
-                for sp in sampling_params_list
-            ]
-        return _orig(self, *args, sampling_params_list=sampling_params_list, **kwargs)
-
-    _patched._diffrl_per_request_ar_seed = True  # type: ignore[attr-defined]
-    AsyncOmniEngine.add_request = _patched
-
-
 class VLLMOmniHijack:
     """Monkey-patches vllm-omni internals to support in-memory LoRA tensors."""
 
@@ -691,7 +662,6 @@ class VLLMOmniHijack:
         patch_hv15_packed_lora_mapping()
         patch_hv15_refiner_torch_linear_lora()
         patch_lora_request_passthrough()
-        patch_per_request_ar_seed()
         patch_sigmas_passthrough()
         patch_moe_workspace_pool()
 
@@ -701,6 +671,5 @@ __all__ = [
     "VLLMOmniHijack",
     "patch_hv15_packed_lora_mapping",
     "patch_hv15_refiner_torch_linear_lora",
-    "patch_per_request_ar_seed",
     "patch_sigmas_passthrough",
 ]
