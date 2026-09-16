@@ -229,6 +229,7 @@ class VeOmniBackend(BaseFSDP2Backend):
 def _validate_fsdp_cfg(fsdp_cfg: FSDPConfig) -> None:
     """Assert the v1-supported FSDPConfig subset (fail fast, actionably)."""
     if fsdp_cfg.copy_engine_all_gather:
+        # TODO: wire copy-engine — zero-CTA WORLD at init, then set_symm_mem_for_comm after parallelize_model_fsdp2.
         raise ValueError(
             "VeOmniBackend: copy_engine_all_gather=true is unsupported; use FSDPBackend for NCCL symmetric-memory "
             "all-gather."
