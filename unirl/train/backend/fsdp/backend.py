@@ -32,40 +32,6 @@ from unirl.utils.distributed_utils import ensure_dist_initialized
 from unirl.utils.dtypes import parse_torch_dtype
 
 
-def _copy_engine_process_group_args(fsdp_cfg: FSDPConfig, device: torch.device) -> Tuple[object, torch.device]:
-    """Validate the copy-engine preconditions and build the zero-CTA NCCL options for WORLD."""
-    require(
-        normalize_fsdp_mode(fsdp_cfg.fsdp_mode) != "no_shard",
-        "FSDP copy-engine all-gather is invalid with fsdp_mode='no_shard'.",
-    )
-    pg_device = torch.device(device)
-    require(pg_device.type == "cuda", "FSDP copy-engine all-gather requires a CUDA device.")
-    process_group_nccl = torch.distributed.ProcessGroupNCCL
-    nccl_version = torch.cuda.nccl.version()
-    require(
-        tuple(nccl_version[:2]) >= (2, 28),
-        f"FSDP copy-engine all-gather requires NCCL >= 2.28, got {nccl_version}.",
-    )
-    policy = os.environ.get("NCCL_CTA_POLICY")
-    require(
-        policy in {None, "2"},
-        "FSDP copy-engine all-gather sets zero-CTA on the default NCCL group, but "
-        f"NCCL_CTA_POLICY={policy!r} would override it. Unset NCCL_CTA_POLICY or set it to '2'.",
-    )
-    require(
-        not torch.distributed.is_initialized(),
-        "FSDP copy-engine all-gather was enabled after the default process group was initialized. "
-        "Construct FSDPBackend before anything else brings up torch.distributed, so WORLD is created "
-        "with the zero-CTA policy and bound to an indexed CUDA device for DeviceMesh to split from.",
-    )
-    if pg_device.index is None:
-        pg_device = torch.device("cuda", torch.cuda.current_device())
-    options = process_group_nccl.Options()
-    options.config.cta_policy = process_group_nccl.NCCL_CTA_POLICY_ZERO
-    options._timeout = torch.distributed.constants.default_pg_timeout
-    return options, pg_device
-
-
 class FSDPBackend(BaseFSDP2Backend):
     """Single-track FSDP training backend."""
 
@@ -92,12 +58,40 @@ class FSDPBackend(BaseFSDP2Backend):
         self._rank = int(rank)
         self._device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         if fsdp_cfg.copy_engine_all_gather:
-            pg_options, pg_device = _copy_engine_process_group_args(fsdp_cfg, self._device)
+            require(
+                normalize_fsdp_mode(fsdp_cfg.fsdp_mode) != "no_shard",
+                "FSDP copy-engine all-gather is invalid with fsdp_mode='no_shard'.",
+            )
+            require(self._device.type == "cuda", "FSDP copy-engine all-gather requires a CUDA device.")
+            nccl_version = torch.cuda.nccl.version()
+            require(
+                tuple(nccl_version[:2]) >= (2, 28),
+                f"FSDP copy-engine all-gather requires NCCL >= 2.28, got {nccl_version}.",
+            )
+            policy = os.environ.get("NCCL_CTA_POLICY")
+            require(
+                policy in {None, "2"},
+                "FSDP copy-engine all-gather sets zero-CTA on the default NCCL group, but "
+                f"NCCL_CTA_POLICY={policy!r} would override it. Unset NCCL_CTA_POLICY or set it to '2'.",
+            )
+            require(
+                not torch.distributed.is_initialized(),
+                "FSDP copy-engine all-gather was enabled after the default process group was initialized. "
+                "Construct FSDPBackend before anything else brings up torch.distributed, so WORLD is created "
+                "with the zero-CTA policy and bound to an indexed CUDA device for DeviceMesh to split from.",
+            )
+            pg_device = self._device
+            if pg_device.index is None:
+                pg_device = torch.device("cuda", torch.cuda.current_device())
             torch.cuda.set_device(pg_device)
+            process_group_nccl = torch.distributed.ProcessGroupNCCL
+            options = process_group_nccl.Options()
+            options.config.cta_policy = process_group_nccl.NCCL_CTA_POLICY_ZERO
+            options._timeout = torch.distributed.constants.default_pg_timeout
             # device_id without backend would narrow WORLD to NCCL; keep the default pair.
             torch.distributed.init_process_group(
                 backend="cpu:gloo,cuda:nccl",
-                pg_options=pg_options,
+                pg_options=options,
                 device_id=pg_device,
                 timeout=torch.distributed.constants.default_pg_timeout,
             )
