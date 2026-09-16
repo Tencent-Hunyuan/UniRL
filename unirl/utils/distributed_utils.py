@@ -37,9 +37,6 @@ def ensure_dist_initialized(
     timeout: timedelta | None = None,
 ) -> None:
     """Idempotently bring up the default process group; keyword options only shape the group this call creates."""
-    # Asking for options once the group already exists raises instead of silently
-    # returning: a caller that needs specific communicator options (FSDP copy-engine
-    # all-gather pins zero-CTA on WORLD) cannot get them any other way.
     if not dist.is_available():
         raise RuntimeError("torch.distributed is unavailable")
     if torch.cuda.is_available() and local_rank is not None:

@@ -298,11 +298,7 @@ def _create_device_mesh(fsdp_mode: str, *, hsdp_shard_size: int) -> Optional[obj
 
 def _require_zero_cta_policy(group: object) -> None:
     """Confirm the all-gather communicator carries zero-CTA instead of trusting how it was created."""
-    # The policy only reaches a shard sub-group when DeviceMesh splits it from a
-    # default group that FSDPBackend bound to an indexed CUDA device (torch copies
-    # the parent's NCCL options into the split). Any other creation path hands
-    # the sub-group fresh default options and NCCL silently falls back to kernel
-    # all-gathers, so the flag would be on with no effect.
+    # Only a DeviceMesh split from a device-bound WORLD inherits the policy; otherwise NCCL falls back silently.
     import torch.distributed as dist
 
     nccl_backend = group._get_backend(torch.device("cuda"))

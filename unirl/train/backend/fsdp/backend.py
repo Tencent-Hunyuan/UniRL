@@ -31,9 +31,7 @@ from unirl.train.configs import (
 from unirl.utils.distributed_utils import ensure_dist_initialized
 from unirl.utils.dtypes import parse_torch_dtype
 
-# Same device->backend map ensure_dist_initialized() resolves to without arguments,
-# spelled out because init_process_group(device_id=cuda) alone would narrow the
-# default group to NCCL and move object/CPU collectives off gloo.
+# Same pair ensure_dist_initialized() resolves to; device_id alone would narrow WORLD to NCCL.
 _COPY_ENGINE_PG_BACKEND = "cpu:gloo,cuda:nccl"
 
 
