@@ -34,7 +34,7 @@ class _DiffrlPatchedTarget:
 
         _os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
         try:
-            import sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline as _lp  # noqa: F401
+            import sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline as _lp  # noqa: F401
         except Exception:
             pass
 
@@ -78,16 +78,16 @@ def wrap_mp_process_for_children() -> None:
     setattr(_MpBaseProcess, _WRAP_SENTINEL, True)
 
 
-def _safe_apply(patch_fn) -> None:
-    """Apply one patch; log-and-skip if its upstream target is unavailable."""
+def _apply(patch_fn) -> None:
+    """Apply one patch and fail boot if the pinned upstream contract changed."""
     try:
         patch_fn()
-    except Exception as exc:  # pragma: no cover - environment dependent
-        logger.warning(
-            "sglang patch %s skipped: %r",
+    except Exception:
+        logger.exception(
+            "sglang patch %s failed",
             getattr(patch_fn, "__name__", patch_fn),
-            exc,
         )
+        raise
 
 
 class SglangDiffusionHijack:
@@ -110,9 +110,6 @@ class SglangDiffusionHijack:
         )
         from unirl.rollout.engine.sglang_diffusion._patches.patch_latent_prep import (
             patch_latent_prep,
-        )
-        from unirl.rollout.engine.sglang_diffusion._patches.patch_lora_tensors import (
-            patch_lora_tensors,
         )
         from unirl.rollout.engine.sglang_diffusion._patches.patch_ltx2_rollout_sde import (
             patch_ltx2_rollout_sde,
@@ -139,9 +136,6 @@ class SglangDiffusionHijack:
         from unirl.rollout.engine.sglang_diffusion._patches.patch_wan_scheduler import (
             patch_wan_scheduler,
         )
-        from unirl.rollout.engine.sglang_diffusion._patches.patch_weights_updater import (
-            patch_weights_updater,
-        )
 
         for patch in (
             patch_srt,
@@ -150,8 +144,6 @@ class SglangDiffusionHijack:
             patch_latent_prep,
             patch_rollout_trajectory,
             patch_gpu_worker,
-            patch_weights_updater,
-            patch_lora_tensors,
             patch_scheduler,
             patch_denoising,
             patch_dance,
@@ -161,4 +153,4 @@ class SglangDiffusionHijack:
             patch_ltx2_rollout_sde,
             patch_safe_unpickler,
         ):
-            _safe_apply(patch)
+            _apply(patch)
