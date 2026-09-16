@@ -130,3 +130,12 @@ new remote reward needs no UniRL code — add it to the server and list its name
   unbounded.
 - **`base_device` is ignored by the remote backend** (it's HTTP-only); local
   scorers honor it, falling back to CPU with a warning if CUDA is unavailable.
+- **`conditioning_source` selects which input the scorer is shown.** The default
+  `nearest` keys `Sample.conditioning()` by modality with the nearest ancestor winning,
+  so a composed AR→image rollout (PE rewrite, HI3/BAGEL recaption or thinking) scores
+  the image against that *generated* text; `input` keeps only non-generated ancestors,
+  so the scorer sees the user's prompt. Single-stage T2I/it2i rollouts have one input
+  ancestor and score identically either way. Per-sample metadata always comes from the
+  root, so a judge meant to grade the image against the user's intent — the WISE PE
+  recipe — needs `input` to keep its prompt and metadata consistent. Within either mode
+  the nearest same-modality value still wins.

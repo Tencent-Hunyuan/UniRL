@@ -19,11 +19,34 @@ from .base import DifferentiableReward, RewardBackend
 logger = logging.getLogger(__name__)
 
 
-def _build_reward_request(sample: Sample, preferred_input_kind: str) -> RewardRequest:
+_CONDITIONING_SOURCES = ("nearest", "input")
+
+
+def _input_conditioning(sample: Sample) -> List[PrimitiveValue]:
+    """Non-generated conditioning, repeated to the frontier's rows by the uniform fan-out."""
+    first_gen = next((i for i, part in enumerate(sample.parts) if part.is_gen), None)
+    if first_gen is None or first_gen == 0:
+        return sample.conditioning()
+    input_rows = sample.parts[first_gen].batch_size
+    frontier_rows = sample.parts[-1].batch_size
+    if input_rows == 0 or frontier_rows % input_rows:
+        raise ValueError(
+            f"conditioning_source='input' needs a uniform fan-out; got {frontier_rows} frontier rows "
+            f"for {input_rows} input-aligned rows."
+        )
+    factor = frontier_rows // input_rows
+    conditioning = sample.conditioning_at(first_gen)
+    return conditioning if factor == 1 else [prim.repeat_interleave(factor) for prim in conditioning]
+
+
+def _build_reward_request(
+    sample: Sample, preferred_input_kind: str, conditioning_source: str = "nearest"
+) -> RewardRequest:
     """Assemble a :class:`RewardRequest` from a response ``Sample``."""
     frontier = sample.parts[-1]
     primitives: Dict[str, PrimitiveValue] = {}
-    for prim in sample.conditioning():
+    conditioning = sample.conditioning() if conditioning_source == "nearest" else _input_conditioning(sample)
+    for prim in conditioning:
         primitives[primitive_modality_key(prim)] = prim
 
     if preferred_input_kind not in frontier.primitives:
@@ -58,18 +81,25 @@ class RewardService(Remote):
         truncated_reward: str = "zero",
         overlong_buffer_len: int = 4096,
         overlong_penalty_factor: float = 1.0,
+        conditioning_source: str = "nearest",
     ) -> None:
         super().__init__()
         self.backend = backend
         self.truncated_reward = str(truncated_reward)
         self.overlong_buffer_len = int(overlong_buffer_len)
         self.overlong_penalty_factor = float(overlong_penalty_factor)
+        self.conditioning_source = str(conditioning_source)
         if self.truncated_reward not in ("zero", "keep", "soft"):
             raise ValueError(f"truncated_reward must be zero|keep|soft, got {self.truncated_reward!r}")
+        if self.conditioning_source not in _CONDITIONING_SOURCES:
+            raise ValueError(
+                f"conditioning_source must be {'|'.join(_CONDITIONING_SOURCES)}, got {self.conditioning_source!r}"
+            )
         logger.info(
-            "RewardService initialized with backend=%s, truncated_reward=%s",
+            "RewardService initialized with backend=%s, truncated_reward=%s, conditioning_source=%s",
             backend.get_model_name() or type(backend).__name__,
             self.truncated_reward,
+            self.conditioning_source,
         )
 
     @property
@@ -110,7 +140,7 @@ class RewardService(Remote):
         if not frontier.primitives:
             raise ValueError("RewardService.score_and_attach: frontier Part has no generated primitives to score.")
 
-        request = _build_reward_request(sample, self.preferred_input_kind)
+        request = _build_reward_request(sample, self.preferred_input_kind, self.conditioning_source)
         reward_response = self.compute_rewards(request)
 
         failed = [(i, e) for i, (ok, e) in enumerate(zip(reward_response.successes, reward_response.errors)) if not ok]
