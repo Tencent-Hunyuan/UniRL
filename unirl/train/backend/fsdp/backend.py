@@ -78,10 +78,18 @@ class FSDPBackend(BaseFSDP2Backend):
             options.config.cta_policy = process_group_nccl.NCCL_CTA_POLICY_ZERO
             timeout = torch.distributed.constants.default_pg_timeout
             options._timeout = timeout
+            pg_device = torch.device(self._device)
+            require(
+                pg_device.type == "cuda",
+                "FSDP copy-engine all-gather requires a CUDA device.",
+            )
+            if pg_device.index is None:
+                pg_device = torch.device("cuda", torch.cuda.current_device())
+            torch.cuda.set_device(pg_device)
             torch.distributed.init_process_group(
                 pg_options=options,
                 timeout=timeout,
-                device_id=torch.device("cuda", torch.cuda.current_device()),
+                device_id=pg_device,
             )
         else:
             ensure_dist_initialized()
