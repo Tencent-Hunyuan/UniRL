@@ -43,17 +43,7 @@ def _copy_engine_process_group_args(fsdp_cfg: FSDPConfig, device: torch.device) 
     )
     pg_device = torch.device(device)
     require(pg_device.type == "cuda", "FSDP copy-engine all-gather requires a CUDA device.")
-    from torch.distributed.fsdp import FSDPModule
-
-    process_group_nccl = getattr(torch.distributed, "ProcessGroupNCCL", None)
-    require(
-        process_group_nccl is not None
-        and hasattr(process_group_nccl, "NCCL_CTA_POLICY_ZERO")
-        and hasattr(getattr(process_group_nccl.Options(), "config", None), "cta_policy")
-        and hasattr(FSDPModule, "set_symm_mem_for_comm"),
-        "FSDP copy-engine all-gather requires PyTorch >= 2.13 (ProcessGroupNCCL zero-CTA options and "
-        f"FSDPModule.set_symm_mem_for_comm); this build is torch {torch.__version__}.",
-    )
+    process_group_nccl = torch.distributed.ProcessGroupNCCL
     nccl_version = torch.cuda.nccl.version()
     require(
         tuple(nccl_version[:2]) >= (2, 28),

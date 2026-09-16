@@ -130,7 +130,7 @@ in `backend/base.py`; a multi-update-capable algorithm sets
   NVLink (`full` on a single node, or `hybrid` with `hsdp_shard_size:
   devices_per_node`); `no_shard` and VeOmni reject it. FSDPBackend must be what brings
   up `torch.distributed` (it binds WORLD to the rank's CUDA device so DeviceMesh splits
-  the shard group from it and the policy is inherited; `fsdp_wrap` asserts this), and
+  the shard group from it and the policy is inherited), and
   `NCCL_CTA_POLICY` must stay unset or `2`. WORLD keeps the usual `cpu:gloo,cuda:nccl`
   pair, so in `hybrid` mode torch logs one `ProcessGroupGloo::split ... Falling back to
   default options` warning per process while splitting the gloo half; it is expected.
