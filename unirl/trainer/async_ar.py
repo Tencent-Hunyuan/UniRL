@@ -70,6 +70,11 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
                 "requires_backend or requires_advantages=False). Use the synchronous ARTrainer; async "
                 "teacher-anchored training is not implemented."
             )
+        if reward_cfg is None:
+            raise ValueError(
+                "AsyncARTrainer requires a `reward:` block. Reward-free AR training is supported "
+                "only by the synchronous ARTrainer."
+            )
         per_worker_inflight = int(per_worker_inflight)
         self._train_fraction = float(train_fraction)
         configured_concurrency = cfg.get("worker_max_concurrency")
