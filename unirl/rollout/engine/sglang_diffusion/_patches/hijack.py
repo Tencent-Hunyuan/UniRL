@@ -108,26 +108,14 @@ class SglangDiffusionHijack:
         from unirl.rollout.engine.sglang_diffusion._patches.patch_gpu_worker import (
             patch_gpu_worker,
         )
-        from unirl.rollout.engine.sglang_diffusion._patches.patch_grouped_dispatch import (
-            patch_grouped_dispatch,
-        )
         from unirl.rollout.engine.sglang_diffusion._patches.patch_latent_prep import (
             patch_latent_prep,
-        )
-        from unirl.rollout.engine.sglang_diffusion._patches.patch_lora_slice_2d import (
-            patch_lora_slice_2d,
         )
         from unirl.rollout.engine.sglang_diffusion._patches.patch_lora_tensors import (
             patch_lora_tensors,
         )
         from unirl.rollout.engine.sglang_diffusion._patches.patch_ltx2_rollout_sde import (
             patch_ltx2_rollout_sde,
-        )
-        from unirl.rollout.engine.sglang_diffusion._patches.patch_pipeline import (
-            patch_pipeline,
-        )
-        from unirl.rollout.engine.sglang_diffusion._patches.patch_platform_device import (
-            patch_platform_device,
         )
         from unirl.rollout.engine.sglang_diffusion._patches.patch_rollout_trajectory import (
             patch_rollout_trajectory,
@@ -140,9 +128,6 @@ class SglangDiffusionHijack:
         )
         from unirl.rollout.engine.sglang_diffusion._patches.patch_scheduler import (
             patch_scheduler,
-        )
-        from unirl.rollout.engine.sglang_diffusion._patches.patch_sd3_lora_pipeline import (
-            patch_sd3_lora_pipeline,
         )
         from unirl.rollout.engine.sglang_diffusion._patches.patch_set_timesteps import (
             patch_set_timesteps,
@@ -160,18 +145,13 @@ class SglangDiffusionHijack:
 
         for patch in (
             patch_srt,
-            patch_platform_device,
             patch_sampling_io,
             patch_conditions,
             patch_latent_prep,
             patch_rollout_trajectory,
-            patch_pipeline,
-            patch_grouped_dispatch,
             patch_gpu_worker,
             patch_weights_updater,
-            patch_sd3_lora_pipeline,
             patch_lora_tensors,
-            patch_lora_slice_2d,
             patch_scheduler,
             patch_denoising,
             patch_dance,

@@ -9,18 +9,18 @@
 
 ## What it is
 
-26 modules installed by one idempotent `SglangDiffusionHijack.hijack()`
+21 modules installed by one idempotent `SglangDiffusionHijack.hijack()`
 (`hijack.py`). Every patch is `setattr`, dataclass-field injection, or an
 AROUND-wrap — **no sglang source is edited**, so a version bump is a re-pin, not a
 re-merge.
 
 ## Why it exists
 
-The fork (`sglang-drl`) added the RL surface stock sglang has never had: in-memory
-weight and LoRA push, driver-pinned σ, driver-authoritative `x_T`, per-sample SDE
-noise, sleep/wake, and conditions emission. Depending on the fork means re-merging
-it on every upstream release. Re-homing the same semantics as patches means the
-only maintenance is re-checking this table when the pin moves.
+The fork (`sglang-drl`) added rollout behavior that stock sglang still does not
+fully provide: driver-pinned σ, driver-authoritative `x_T`, per-sample SDE noise,
+tagged CUDA-VM sleep/wake, distributed weight push, and conditions emission.
+Depending on the fork means re-merging it on every upstream release. Re-homing
+only the missing semantics as patches keeps each upstream upgrade reviewable.
 
 ## How it works
 
@@ -59,8 +59,6 @@ Re-homed fork surface:
 | `patch_scheduler.py` | `Scheduler.request_handlers` ships only disk-weight + checksum; the fork added 9 RL handlers plus sleep/dirty-module guards on `_handle_generation` | same |
 | `patch_weights_updater.py` | `WeightsUpdater` updates from disk only — no in-memory named-tensor path. Copied bodies are nested fns, so their free globals resolve via **this** module's LEGB scope; every name must be re-bound locally | upstream accepts named tensors |
 | `patch_lora_tensors.py` | **Heaviest patch.** Three-way divergence: the fork's 2-value `lora_merge_mode` vs upstream's independently-evolved 3-value `LORA_MERGE_MODES`. We re-home the fork's *semantics* onto upstream's `merge_weights` plumbing rather than copying its `set_lora`, since a blanket REPLACE would destroy upstream's merge-mode system. Registers `"online"` as a merge mode — **collides if upstream later adds its own `"online"`** | upstream supports unmerged in-memory LoRA |
-| `patch_sd3_lora_pipeline.py` | Upstream's `StableDiffusion3Pipeline` does not inherit `LoRAPipeline`, so `set_lora_from_tensors` fails `Lora is not enabled`. `__bases__` reassignment is legal here because the solid layout is unchanged | upstream adds LoRA to SD3 |
-| `patch_lora_slice_2d.py` | `MergedColumnParallelLinearWithLoRA.slice_lora_b_weights` assumes a 3-D `[N, out_dim, rank]` B tensor; diffusers PEFT delivers FLUX.2-Klein's `ff.linear_in` as 2-D `[total_out, rank]` → `IndexError`. **TP=1 only** — the 2-D path treats the merged output dim as one contiguous shard | upstream tolerates 2-D B |
 | `patch_safe_unpickler.py` | sglang's `SafeUnpickler` (CVE-2025-10164 mitigation) allowlists `builtins`/`torch`/… but **not** `unirl.`, so the first full-weight push dies. Must be installed **in every process that deserializes** | upstream allowlists are configurable |
 | `patch_srt.py` | `TorchMemorySaverAdapter.is_available()` is missing; the only srt fork edit that matters. No-op if upstream defines it | upstream adds it |
 
@@ -82,9 +80,6 @@ Version-window and environment bridges:
 
 | Module | What stock upstream does wrong | DELETE-WHEN |
 | --- | --- | --- |
-| `patch_grouped_dispatch.py` | v0.5.12.post1 shipped an unfinished grouped-pipeline refactor: `_execute_stages` accepts a `run_stage` callback but never calls it, so a grouped request hits `AttributeError: 'list' object has no attribute 'seed'`. **Self-retiring** — no-op on sglang ≥ `3142278c5` (2026-05-26), which post1 predates by 3 days | the pin moves past `3142278c5` |
-| `patch_pipeline.py` | The grouped path never sets `component_residency_manager`, so `begin_component_residency_request` dereferences `None`. Post-fork upstream addition — the fork could not have hit it | upstream sets it on the grouped path |
-| `patch_platform_device.py` | `get_available_gpu_memory` overrides the requested `device_id` with `get_rank()` whenever a PG exists; under colocate the rank is not the local visible device → `Invalid device id` | upstream respects the passed id |
 | `patch_vae_decode_safe.py` | **Opt-in, default no-op** — set `UNIRL_DISABLE_CUDNN=1`. Diagnostic for a `munmap_chunk(): invalid pointer` inside `Conv2d._conv_forward` on cuda-compat-13 + driver 535 | the compat-layer bug is gone |
 
 ## Gotchas
@@ -97,8 +92,6 @@ Version-window and environment bridges:
 - **Patched bodies copied verbatim from the fork are nested functions**, so their
   free globals resolve in *this* package's scope, not sglang's — re-bind every
   name locally or the patch fails at call time, not at install time.
-- **`patch_lora_slice_2d` is sound only at TP=1**, which is what rollout runs (one
-  GPU per actor). TP>1 with a 2-D B tensor needs a real fix upstream.
 - **Two patches are silent when they regress**, so check them first when the GRPO
   ratio drifts: `patch_rollout_trajectory` (identical trajectories → zero
   gradient) and `patch_denoising` (identical per-step noise → frozen exploration).
