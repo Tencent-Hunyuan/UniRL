@@ -26,7 +26,7 @@ def prepare_input_sample(
     *,
     allowed_primitives: set[str],
     caller: str,
-    root_control: Optional[Dict[str, Any]] = None,
+    control: Optional[Dict[str, Any]] = None,
     require_single_input_part: bool = False,
 ) -> Sample:
     """Prepare a data-source input tree for one rollout without rebuilding it."""
@@ -57,8 +57,8 @@ def prepare_input_sample(
     if len(metadata) != len(root.sample_ids):
         raise ValueError(f"{caller}: root metadata has {len(metadata)} rows for {len(root.sample_ids)} root samples.")
     root = replace(root, metadata=[{**(row or {}), "rollout_id": int(rollout_id)} for row in metadata])
-    if root_control is not None:
-        root = replace(root, control={**root.control, **root_control})
+    if control is not None:
+        root = replace(root, control={**root.control, **control})
     return namespaced.with_parts([root, *namespaced.parts[1:]])
 
 

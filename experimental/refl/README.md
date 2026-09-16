@@ -13,9 +13,9 @@ One command per config; a Ray cluster must be up (`ray start --head`).
 
 ```bash
 # WAN 2.1 T2V + VideoAlign (Qwen2-VL VQ/MQ/TA) reward
+# (prompts default to the committed datasets/refl_videoalign/ set)
 export PRETRAINED_MODEL=/path/to/Wan2.1-T2V-1.3B-Diffusers \
-       VIDEOALIGN_MODEL_PATH=/path/to/VideoReward \
-       DATA_PATH=/path/to/prompts.txt
+       VIDEOALIGN_MODEL_PATH=/path/to/VideoReward
 RAY_ADDRESS=auto python -m experimental.refl.run --config-name=wan21_t2v_videoalign_refl num_devices=8
 
 # SD3.5 T2I + PickScore reward (core scorer — no package-local reward)

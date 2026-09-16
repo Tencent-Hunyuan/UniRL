@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from unirl.models.types.ar import ARSamplingParams
 from unirl.models.types.pipeline import Pipeline
@@ -56,10 +56,10 @@ class QwenVLPipeline(Pipeline):
     def _conditions_for(
         self,
         turns: List[Turn],
-        control: Optional[Dict[str, Any]] = None,
+        control: Dict[str, Any],
     ) -> QwenVLARConditions:
         """Chat-template + tokenize the trajectory ``turns`` (text + image turns) → :class:`QwenVLARConditions`."""
-        chat_overrides: Dict[str, Any] = dict((control or {}).get("chat") or {})
+        chat_overrides: Dict[str, Any] = dict(control.get("chat") or {})
         if "system_instruction" in chat_overrides:
             chat_stage = QwenVLChatTemplateStage(
                 self.bundle,
