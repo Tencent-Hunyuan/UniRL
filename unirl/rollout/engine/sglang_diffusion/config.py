@@ -120,9 +120,11 @@ class SGLangDiffusionEngineConfig(BaseEngineConfig):
         if self.lora_merge_mode is not None:
             intent["lora_merge_mode"] = self.lora_merge_mode
         elif model_config.use_lora:
-            intent.setdefault("lora_merge_mode", "online")
-        if model_config.use_lora and model_config.lora_target_modules is not None:
-            intent["lora_target_modules"] = list(model_config.lora_target_modules)
+            intent.setdefault("lora_merge_mode", "dynamic")
+        if model_config.use_lora:
+            lora_targets = self.target_modules or model_config.lora_target_modules
+            if lora_targets is not None:
+                intent["lora_target_modules"] = list(lora_targets)
 
         if self.host is not None:
             intent["host"] = str(self.host)

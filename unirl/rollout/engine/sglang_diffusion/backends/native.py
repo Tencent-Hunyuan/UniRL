@@ -21,9 +21,11 @@ def _import_sglang_runtime() -> Dict[str, Any]:
     )
     from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
         GetWeightsChecksumReqInput,
+        UpdateWeightFromTensorReqInput,
     )
     from sglang.multimodal_gen.runtime.scheduler_client import sync_scheduler_client
     from sglang.multimodal_gen.runtime.server_args import ServerArgs
+    from sglang.srt.utils import MultiprocessingSerializer
 
     from unirl.rollout.engine.sglang_diffusion._patches.io_struct import (
         DestroyWeightsUpdateGroupReqInput,
@@ -31,9 +33,7 @@ def _import_sglang_runtime() -> Dict[str, Any]:
         ReleaseMemoryOccupationReqInput,
         ResumeMemoryOccupationReqInput,
         UpdateWeightsFromDistributedReqInput,
-        UpdateWeightsFromTensorReqInput,
     )
-    from unirl.rollout.engine.sglang_diffusion._patches.lora_req import SetLoraFromTensorsReq
 
     return {
         "DiffGenerator": DiffGenerator,
@@ -42,10 +42,10 @@ def _import_sglang_runtime() -> Dict[str, Any]:
         "InitWeightsUpdateGroupReqInput": InitWeightsUpdateGroupReqInput,
         "DestroyWeightsUpdateGroupReqInput": DestroyWeightsUpdateGroupReqInput,
         "UpdateWeightsFromDistributedReqInput": UpdateWeightsFromDistributedReqInput,
-        "UpdateWeightsFromTensorReqInput": UpdateWeightsFromTensorReqInput,
+        "UpdateWeightFromTensorReqInput": UpdateWeightFromTensorReqInput,
         "ReleaseMemoryOccupationReqInput": ReleaseMemoryOccupationReqInput,
         "ResumeMemoryOccupationReqInput": ResumeMemoryOccupationReqInput,
-        "SetLoraFromTensorsReq": SetLoraFromTensorsReq,
+        "MultiprocessingSerializer": MultiprocessingSerializer,
         "sync_scheduler_client": sync_scheduler_client,
     }
 
@@ -172,13 +172,14 @@ class SGLangBackend:
         load_format: Optional[str],
         flush_cache: bool,
     ) -> None:
+        request = self._rt["UpdateWeightFromTensorReqInput"](
+            serialized_named_tensors=serialized_named_tensors,
+            target_modules=list(target_modules),
+            load_format=load_format,
+        )
+        request.flush_cache = flush_cache
         self._forward(
-            self._rt["UpdateWeightsFromTensorReqInput"](
-                serialized_named_tensors=serialized_named_tensors,
-                target_modules=list(target_modules),
-                load_format=load_format,
-                flush_cache=flush_cache,
-            ),
+            request,
             op="update_weights_from_tensor",
         )
 
@@ -235,23 +236,20 @@ class SGLangBackend:
     def set_lora(
         self,
         *,
-        lora_nickname: str,
         lora_tensors: Dict[str, Any],
-        target: str = "all",
-        strength: float = 1.0,
-        lora_alpha: Optional[float] = None,
+        target_module: str,
+        lora_alpha: Optional[int] = None,
+        lora_rank: Optional[int] = None,
     ) -> None:
-        request = self._rt["SetLoraFromTensorsReq"](
-            lora_nickname=str(lora_nickname),
-            lora_tensors=lora_tensors,
-            target=target,
-            strength=strength,
+        serialized = self._rt["MultiprocessingSerializer"].serialize(list(lora_tensors.items()))
+        request = self._rt["UpdateWeightFromTensorReqInput"](
+            serialized_named_tensors=[serialized],
+            target_modules=[target_module],
+            weight_update_mode="lora_merge",
             lora_alpha=lora_alpha,
+            lora_rank=lora_rank,
         )
-        response = self._rt["sync_scheduler_client"].forward(request)
-        error = getattr(response, "error", None)
-        if error is not None:
-            raise RuntimeError(f"set_lora_from_tensors failed: {error}")
+        self._forward(request, op="set_lora_from_tensors")
 
     def weights_checksum(self, *, module_names: List[str]) -> dict:
         response = self._rt["sync_scheduler_client"].forward(

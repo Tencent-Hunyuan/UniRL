@@ -34,7 +34,7 @@ class _DiffrlPatchedTarget:
 
         _os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
         try:
-            import sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline as _lp  # noqa: F401
+            import sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline as _lp  # noqa: F401
         except Exception:
             pass
 
@@ -78,16 +78,16 @@ def wrap_mp_process_for_children() -> None:
     setattr(_MpBaseProcess, _WRAP_SENTINEL, True)
 
 
-def _safe_apply(patch_fn) -> None:
-    """Apply one patch; log-and-skip if its upstream target is unavailable."""
+def _apply(patch_fn) -> None:
+    """Apply one patch and fail boot if the pinned upstream contract changed."""
     try:
         patch_fn()
-    except Exception as exc:  # pragma: no cover - environment dependent
-        logger.warning(
-            "sglang patch %s skipped: %r",
+    except Exception:
+        logger.exception(
+            "sglang patch %s failed",
             getattr(patch_fn, "__name__", patch_fn),
-            exc,
         )
+        raise
 
 
 class SglangDiffusionHijack:
@@ -108,26 +108,11 @@ class SglangDiffusionHijack:
         from unirl.rollout.engine.sglang_diffusion._patches.patch_gpu_worker import (
             patch_gpu_worker,
         )
-        from unirl.rollout.engine.sglang_diffusion._patches.patch_grouped_dispatch import (
-            patch_grouped_dispatch,
-        )
         from unirl.rollout.engine.sglang_diffusion._patches.patch_latent_prep import (
             patch_latent_prep,
         )
-        from unirl.rollout.engine.sglang_diffusion._patches.patch_lora_slice_2d import (
-            patch_lora_slice_2d,
-        )
-        from unirl.rollout.engine.sglang_diffusion._patches.patch_lora_tensors import (
-            patch_lora_tensors,
-        )
         from unirl.rollout.engine.sglang_diffusion._patches.patch_ltx2_rollout_sde import (
             patch_ltx2_rollout_sde,
-        )
-        from unirl.rollout.engine.sglang_diffusion._patches.patch_pipeline import (
-            patch_pipeline,
-        )
-        from unirl.rollout.engine.sglang_diffusion._patches.patch_platform_device import (
-            patch_platform_device,
         )
         from unirl.rollout.engine.sglang_diffusion._patches.patch_rollout_trajectory import (
             patch_rollout_trajectory,
@@ -141,37 +126,22 @@ class SglangDiffusionHijack:
         from unirl.rollout.engine.sglang_diffusion._patches.patch_scheduler import (
             patch_scheduler,
         )
-        from unirl.rollout.engine.sglang_diffusion._patches.patch_sd3_lora_pipeline import (
-            patch_sd3_lora_pipeline,
-        )
         from unirl.rollout.engine.sglang_diffusion._patches.patch_set_timesteps import (
             patch_set_timesteps,
         )
-        from unirl.rollout.engine.sglang_diffusion._patches.patch_srt import patch_srt
         from unirl.rollout.engine.sglang_diffusion._patches.patch_vae_decode_safe import (
             patch_vae_decode_safe,
         )
         from unirl.rollout.engine.sglang_diffusion._patches.patch_wan_scheduler import (
             patch_wan_scheduler,
         )
-        from unirl.rollout.engine.sglang_diffusion._patches.patch_weights_updater import (
-            patch_weights_updater,
-        )
 
         for patch in (
-            patch_srt,
-            patch_platform_device,
             patch_sampling_io,
             patch_conditions,
             patch_latent_prep,
             patch_rollout_trajectory,
-            patch_pipeline,
-            patch_grouped_dispatch,
             patch_gpu_worker,
-            patch_weights_updater,
-            patch_sd3_lora_pipeline,
-            patch_lora_tensors,
-            patch_lora_slice_2d,
             patch_scheduler,
             patch_denoising,
             patch_dance,
@@ -181,4 +151,4 @@ class SglangDiffusionHijack:
             patch_ltx2_rollout_sde,
             patch_safe_unpickler,
         ):
-            _safe_apply(patch)
+            _apply(patch)

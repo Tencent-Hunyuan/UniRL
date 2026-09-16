@@ -149,7 +149,14 @@ def _launch_server_with_env(server_args: Any, env_overrides: Dict[str, str]) -> 
 
 def asdict_drop_none(req: Any) -> Dict[str, Any]:
     """The wire view of an io_struct request: its fields minus the ``None``s."""
-    return {k: v for k, v in dataclasses.asdict(req).items() if v is not None}
+    if dataclasses.is_dataclass(req):
+        values = dataclasses.asdict(req)
+    else:
+        fields = getattr(type(req), "__struct_fields__", ())
+        if not fields:
+            raise TypeError(f"Unsupported request struct: {type(req).__name__}")
+        values = {name: getattr(req, name) for name in fields}
+    return {key: value for key, value in values.items() if value is not None}
 
 
 @dataclass(frozen=True)
@@ -561,7 +568,7 @@ class HTTPBackend:
             self._rt["LoadLoRAAdapterFromTensorsReqInput"](
                 lora_name=str(lora_name),
                 config_dict=dict(config_dict or {}),
-                serialized_tensors=serialized,
+                serialized_named_tensors=[serialized] * self._tp_size,
             ),
             "set_lora",
         )
