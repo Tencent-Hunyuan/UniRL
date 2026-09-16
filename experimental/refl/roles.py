@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
-import torch.distributed as dist
 from hydra.utils import get_class
 
 from unirl.distributed.group.dispatch import Dispatch, Execute, distributed
@@ -77,9 +76,6 @@ class ReflActorRole(Remote):
 
     def initialize(self) -> None:
         torch.cuda.set_device(self.device)
-        if self.rank_info is not None and int(self.rank_info.world_size) > 1 and not dist.is_initialized():
-            dist.init_process_group(backend="nccl")
-
         try:
             self._model_config.device = self.device
         except Exception:
