@@ -134,12 +134,6 @@ in `backend/base.py`; a multi-update-capable algorithm sets
   `NCCL_CTA_POLICY` must stay unset or `2`. WORLD keeps the usual `cpu:gloo,cuda:nccl`
   pair, so in `hybrid` mode torch logs one `ProcessGroupGloo::split ... Falling back to
   default options` warning per process while splitting the gloo half; it is expected.
-  NCCL decides per collective at enqueue time and falls back to kernels silently when a
-  precondition breaks, so the acceptance check is a profiler trace with no
-  `ncclDevKernel_AllGather*` / `ncclSymkDevKernel_AllGather*` kernels. On H20 it is
-  throughput-neutral (NCCL kernels barely contend with GEMM waves there); leave it off
-  unless a trace shows SM contention. Short-lived processes may log
-  `ncclCommWindowDeregister failed` at teardown; the run still exits cleanly.
 
 ## Profiling → Perfetto
 
