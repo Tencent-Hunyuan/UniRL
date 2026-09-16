@@ -9,7 +9,7 @@
 
 ## What it is
 
-21 modules installed by one idempotent `SglangDiffusionHijack.hijack()`
+18 modules installed by one idempotent `SglangDiffusionHijack.hijack()`
 (`hijack.py`). Every patch is `setattr`, dataclass-field injection, or an
 AROUND-wrap — **no sglang source is edited**, so a version bump is a re-pin, not a
 re-merge.
@@ -33,7 +33,8 @@ A parent-only patch would silently no-op in the worker —
 
 Install **before** importing `DiffGenerator` (which forces spawn at import) and
 before `from_pretrained` spawns the scheduler. Idempotent; safe from parent and
-child.
+child. Patch installation is fail-closed: an incompatible pinned SGLang layout
+aborts engine boot instead of silently running without the rollout contract.
 
 **Extending it:** a new patch is a module here with an idempotent `install()`
 called from `hijack.py`, plus a row below. Prefer AROUND-wrap over REPLACE — a
@@ -47,18 +48,15 @@ identity:
 
 | Module | What it defines |
 | --- | --- |
-| `io_struct.py` | The 8 fork-new post-training request structs (upstream ships only `UpdateWeightFromDiskReqInput` / `GetWeightsChecksumReqInput`) |
-| `lora_req.py` | `SetLoraFromTensorsReq` — the in-memory LoRA request; stdlib-only, import-safe |
-| `memory_saver.py` | Verbatim fork copy of the CUDA-VM sleep/wake helper; its imports resolve against stock upstream |
+| `io_struct.py` | The 5 UniRL-only distributed-sync and tagged sleep/wake request structs |
+| `memory_saver.py` | Tagged CUDA-VM sleep/wake helper layered over `torch_memory_saver` |
 
 Re-homed fork surface:
 
 | Module | What stock upstream does wrong | DELETE-WHEN |
 | --- | --- | --- |
-| `patch_gpu_worker.py` | `GPUWorker` has no sleep/wake or distributed weight-update state and lacks ~14 RL methods. Bodies copied verbatim from the fork diff `e9b570654..HEAD`; depends on `patch_weights_updater` and `patch_lora_tensors` | upstream ships an RL worker surface |
-| `patch_scheduler.py` | `Scheduler.request_handlers` ships only disk-weight + checksum; the fork added 9 RL handlers plus sleep/dirty-module guards on `_handle_generation` | same |
-| `patch_weights_updater.py` | `WeightsUpdater` updates from disk only — no in-memory named-tensor path. Copied bodies are nested fns, so their free globals resolve via **this** module's LEGB scope; every name must be re-bound locally | upstream accepts named tensors |
-| `patch_lora_tensors.py` | **Heaviest patch.** Three-way divergence: the fork's 2-value `lora_merge_mode` vs upstream's independently-evolved 3-value `LORA_MERGE_MODES`. We re-home the fork's *semantics* onto upstream's `merge_weights` plumbing rather than copying its `set_lora`, since a blanket REPLACE would destroy upstream's merge-mode system. Registers `"online"` as a merge mode — **collides if upstream later adds its own `"online"`** | upstream supports unmerged in-memory LoRA |
+| `patch_gpu_worker.py` | Upstream owns tensor/LoRA updates and ordinary CPU sleep/wake; UniRL adds external-process-group broadcasts plus tagged CUDA-VM sleep/wake | upstream accepts external distributed broadcasts and tagged memory-saver regions |
+| `patch_scheduler.py` | Registers those UniRL-only verbs and blocks generation while resumed CUDA-VM regions contain disposable weights | same |
 | `patch_safe_unpickler.py` | sglang's `SafeUnpickler` (CVE-2025-10164 mitigation) allowlists `builtins`/`torch`/… but **not** `unirl.`, so the first full-weight push dies. Must be installed **in every process that deserializes** | upstream allowlists are configurable |
 | `patch_srt.py` | `TorchMemorySaverAdapter.is_available()` is missing; the only srt fork edit that matters. No-op if upstream defines it | upstream adds it |
 
@@ -88,7 +86,7 @@ Version-window and environment bridges:
   sglang bump, re-sync its re-vendored `flow_sde_sampling` body by hand first.
 - **Install order matters.** `hijack.py` must run before `DiffGenerator` is
   imported; `patch_wan_scheduler` requires `patch_set_timesteps`;
-  `patch_gpu_worker` requires `patch_weights_updater` and `patch_lora_tensors`.
+  `patch_scheduler` requires `patch_gpu_worker`.
 - **Patched bodies copied verbatim from the fork are nested functions**, so their
   free globals resolve in *this* package's scope, not sglang's — re-bind every
   name locally or the patch fails at call time, not at install time.

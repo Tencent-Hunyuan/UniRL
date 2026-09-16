@@ -103,16 +103,22 @@ class WeightSync:
             lora_tensors,
             pipeline_prefix=self._pipeline_prefix,
         )
-        nickname = adapter_name
         adapter_alpha = None
+        adapter_rank = None
         if peft_config is not None:
             adapter_alpha = peft_config.get("lora_alpha")
+            adapter_rank = peft_config.get("r")
+        if adapter_alpha is not None and int(adapter_alpha) != adapter_alpha:
+            raise ValueError(f"SGLang requires integral lora_alpha; got {adapter_alpha!r}")
+        if adapter_rank is not None and int(adapter_rank) != adapter_rank:
+            raise ValueError(f"SGLang requires integral LoRA rank; got {adapter_rank!r}")
         self._backend.set_lora(
-            lora_nickname=nickname,
             lora_tensors=stripped,
-            lora_alpha=(float(adapter_alpha) if adapter_alpha is not None else None),
+            target_modules=self._target_modules,
+            lora_alpha=(int(adapter_alpha) if adapter_alpha is not None else None),
+            lora_rank=(int(adapter_rank) if adapter_rank is not None else None),
         )
-        self._active_adapter = nickname
+        self._active_adapter = adapter_name
         self._lora_loaded = True
 
         layer_names = set()
@@ -126,9 +132,8 @@ class WeightSync:
                     break
             layer_names.add(base)
         logger.info(
-            "SGLang LoRA loaded from tensors (adapter=%s, nickname=%s) — %d layers",
+            "SGLang LoRA loaded from tensors (adapter=%s) — %d layers",
             adapter_name,
-            nickname,
             len(layer_names),
         )
 
