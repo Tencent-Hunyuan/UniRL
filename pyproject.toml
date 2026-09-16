@@ -90,6 +90,13 @@ vllm = [
   # torchaudio >=2.12 on the cu130 index, so this extra does not pin it.
   "av>=14.2,<19 ; sys_platform == 'linux'",
 ]
+# Exact upstream source snapshot that the fail-closed FastVideo patch package is
+# verified against. This is hao-ai-lab/FastVideo PR #1222's source commit, not
+# Zcchill/FastVideo's UniRL-modified fork; UniRL re-hosts the required RL
+# contracts under unirl/rollout/engine/fastvideo/_patches/.
+fastvideo = [
+  "fastvideo @ git+https://github.com/hao-ai-lab/FastVideo.git@2095477eac7e289c7a7ab13acb367ca60687c304 ; sys_platform == 'linux'",
+]
 train = [
   "wandb>=0.16,<0.20",
   "aiohttp>=3.9",
@@ -101,10 +108,14 @@ cosmos3 = [
 ]
 infer = [
   "accelerate>=0.30",
+  # Janus-Pro's vendored SigLIP implementation imports timm directly.
+  "timm>=0.9.16",
 ]
 eval = [
   "torchvision>=0.16",
-  "easyocr>=1.7",
+  "paddlepaddle==3.2.2",
+  "paddleocr==3.5.0",
+  "python-Levenshtein>=0.27",
 ]
 # VeOmni's torch-native distributed layer (FSDP2/EP parallelize), consumed
 # exclusively through unirl.train.backend.veomni._compat — a selective import
@@ -201,6 +212,9 @@ include = [
   "unirl.*",
 ]
 
+[tool.setuptools.package-data]
+"unirl.models.janus_pro.vendor" = ["LICENSE-CODE", "VENDOR_COMMIT.txt"]
+
 [tool.ruff]
 line-length = 120
 target-version = "py312"
@@ -212,6 +226,7 @@ target-version = "py312"
 extend-exclude = [
   "unirl-reward-service",
   "unirl/models/bagel/vendor",
+  "unirl/models/janus_pro/vendor",
   "unirl/models/sensenova_u1/vendor",
 ]
 

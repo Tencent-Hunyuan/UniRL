@@ -316,7 +316,7 @@ class SenseNovaU1DiffusionStage(DiffusionStage[SenseNovaU1Conditions]):
             if log_prob is not None:
                 log_probs.append(log_prob.to(dtype=self.logprob_dtype))
                 if mean is not None:
-                    means.append(mean.detach().to(dtype=self.trajectory_dtype))
+                    means.append(mean.detach())
 
         return LatentSegment(
             latents=torch.stack([value for _, value in stored], dim=1),
@@ -444,7 +444,7 @@ class SenseNovaU1DiffusionStage(DiffusionStage[SenseNovaU1Conditions]):
 
         return ReplayResult(
             log_probs=torch.cat(batch_log_probs, dim=0).to(dtype=self.logprob_dtype),
-            prev_sample_means=torch.cat(batch_means, dim=0).to(dtype=self.trajectory_dtype),
+            prev_sample_means=torch.cat(batch_means, dim=0),
         )
 
     def predict_noise_at_step(

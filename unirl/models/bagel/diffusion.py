@@ -36,7 +36,6 @@ class BagelDiffusionParams(DiffusionSamplingParams):
     width: int = 512
     eta: float = 1.0
 
-    cfg_text_scale: float = 1.0
     cfg_img_scale: float = 1.0
     cfg_interval: Tuple[float, float] = (0.0, 1.0)
     cfg_renorm_min: float = 0.0
@@ -325,7 +324,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         """CFG scales after the per-step ``cfg_interval`` gate (matches generate_image)."""
         lo, hi = float(params.cfg_interval[0]), float(params.cfg_interval[1])
         if lo < t_value <= hi:
-            return float(params.cfg_text_scale), float(params.cfg_img_scale)
+            return float(params.guidance_scale), float(params.cfg_img_scale)
         return 1.0, 1.0
 
     def diffuse(
@@ -395,7 +394,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
                 if log_prob is not None:
                     sde_logp_list.append(log_prob.to(dtype=self.logprob_dtype))
                     if prev_mean is not None:
-                        sde_means_list.append(prev_mean.detach().to(dtype=self.trajectory_dtype))
+                        sde_means_list.append(prev_mean.detach())
 
         positions_collected = [p for p, _ in stored_pairs]
         latents_stacked = torch.stack([t for _, t in stored_pairs], dim=0).unsqueeze(0)
@@ -521,7 +520,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
                 prev_sample_means.append(prev_mean)
 
         log_probs_t = torch.stack(log_probs, dim=0).unsqueeze(0).to(dtype=self.logprob_dtype)
-        means_t = torch.stack(prev_sample_means, dim=0).unsqueeze(0).to(dtype=self.trajectory_dtype)
+        means_t = torch.stack(prev_sample_means, dim=0).unsqueeze(0)
         return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
 
     def build_forward_kwargs(

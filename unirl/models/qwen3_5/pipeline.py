@@ -102,10 +102,10 @@ class Qwen3_5Pipeline(Pipeline):
     def _conditions_for(
         self,
         turns: List[Turn],
-        control: Optional[Dict[str, Any]] = None,
+        control: Dict[str, Any],
     ) -> Qwen3_5ARConditions:
         """Render one role-aware text/image trajectory into replay conditions."""
-        chat_overrides: Dict[str, Any] = dict((control or {}).get("chat") or {})
+        chat_overrides: Dict[str, Any] = dict(control.get("chat") or {})
         if "system_instruction" in chat_overrides:
             chat_stage = Qwen3_5ChatTemplateStage(
                 self.bundle,

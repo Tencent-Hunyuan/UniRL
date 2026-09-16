@@ -6,6 +6,7 @@ import os
 import signal
 import threading
 import time
+from functools import wraps
 from multiprocessing.process import BaseProcess as _MpBaseProcess
 
 import torch
@@ -412,6 +413,151 @@ def patch_fp32_skip() -> None:
             _mod.from_layer = _patched_from_layer
 
 
+def patch_hv15_packed_lora_mapping() -> None:
+    """Expose HV1.5's packed QKV mapping to the diffusion LoRA manager."""
+    try:
+        from vllm_omni.diffusion.models.hunyuan_video.hunyuan_video_15_transformer import (
+            HunyuanVideo15Transformer3DModel,
+        )
+    except (ImportError, AttributeError):
+        return
+
+    sentinel = "_diffrl_hv15_packed_lora_mapping"
+    if getattr(HunyuanVideo15Transformer3DModel, sentinel, False):
+        return
+    if not getattr(HunyuanVideo15Transformer3DModel, "stacked_params_mapping", None):
+        HunyuanVideo15Transformer3DModel.stacked_params_mapping = (
+            (".to_qkv", ".to_q", "q"),
+            (".to_qkv", ".to_k", "k"),
+            (".to_qkv", ".to_v", "v"),
+            (".add_kv_proj", ".add_q_proj", "q"),
+            (".add_kv_proj", ".add_k_proj", "k"),
+            (".add_kv_proj", ".add_v_proj", "v"),
+        )
+    setattr(HunyuanVideo15Transformer3DModel, sentinel, True)
+
+
+class _HV15TorchLinearWithLoRA(torch.nn.Module):
+    """Apply one in-memory LoRA adapter to an ordinary HV1.5 ``nn.Linear``."""
+
+    n_slices = 1
+
+    def __init__(self, base_layer: torch.nn.Linear) -> None:
+        super().__init__()
+        self.base_layer = base_layer
+        self.register_buffer("_lora_a", None, persistent=False)
+        self.register_buffer("_lora_b", None, persistent=False)
+
+    def create_lora_weights(self, *_args, **_kwargs) -> None:
+        """Match the manager's layer protocol when its rank buffer grows."""
+        self.reset_lora(0)
+
+    def reset_lora(self, index: int) -> None:
+        if index != 0:
+            raise IndexError(f"HV1.5 torch-linear LoRA only supports adapter slot 0, got {index}")
+        self._lora_a = None
+        self._lora_b = None
+
+    def set_lora(
+        self,
+        index: int,
+        lora_a: torch.Tensor,
+        lora_b: torch.Tensor,
+    ) -> None:
+        if index != 0:
+            raise IndexError(f"HV1.5 torch-linear LoRA only supports adapter slot 0, got {index}")
+        if not (
+            lora_a.ndim == lora_b.ndim == 2
+            and lora_a.shape[1] == self.base_layer.in_features
+            and lora_b.shape == (self.base_layer.out_features, lora_a.shape[0])
+        ):
+            raise ValueError(
+                "HV1.5 torch-linear LoRA shape mismatch: "
+                f"A={tuple(lora_a.shape)}, B={tuple(lora_b.shape)}; expected "
+                f"A=[rank, {self.base_layer.in_features}], "
+                f"B=[{self.base_layer.out_features}, rank]"
+            )
+        self._lora_a = lora_a.detach().to(self.base_layer.weight)
+        self._lora_b = lora_b.detach().to(self.base_layer.weight)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        result = self.base_layer(hidden_states)
+        if self._lora_a is None or self._lora_b is None:
+            return result
+        lora_input = hidden_states.to(self._lora_a.dtype)
+        lora_hidden = torch.nn.functional.linear(lora_input, self._lora_a)
+        return result + torch.nn.functional.linear(lora_hidden, self._lora_b)
+
+
+def patch_hv15_refiner_torch_linear_lora() -> None:
+    """Include HV1.5 token-refiner ``nn.Linear`` layers in vLLM's LoRA policy."""
+    try:
+        from vllm.lora.layers import BaseLayerWithLoRA
+        from vllm.lora.utils import replace_submodule
+        from vllm_omni.diffusion.lora.utils import _match_target_modules
+        from vllm_omni.diffusion.models.hunyuan_video.hunyuan_video_15_transformer import (
+            HunyuanVideo15Transformer3DModel,
+        )
+    except (ImportError, AttributeError):
+        return
+
+    original_replace = DiffusionLoRAManager._replace_layers_with_lora
+    if getattr(original_replace, "_diffrl_hv15_refiner_torch_linear_lora", False):
+        return
+
+    @wraps(original_replace)
+    def _patched_replace(self, peft_helper):
+        original_replace(self, peft_helper)
+        transformer = getattr(self.pipeline, "transformer", None)
+        if not isinstance(transformer, HunyuanVideo15Transformer3DModel):
+            return
+
+        blocks = transformer.context_embedder.token_refiner.refiner_blocks
+        prefix = "context_embedder.token_refiner.refiner_blocks"
+        target_modules = getattr(peft_helper, "target_modules", None)
+        target_pattern = target_modules if isinstance(target_modules, str) and target_modules else None
+        target_list = target_modules if isinstance(target_modules, list) and target_modules else None
+
+        def _matches_target(module_name: str) -> bool:
+            if target_pattern is not None:
+                import regex as re
+
+                return re.search(target_pattern, module_name) is not None
+            return target_list is None or _match_target_modules(module_name, target_list)
+
+        matched = []
+        for block_index, block in enumerate(blocks):
+            for target_path, module in block.named_modules(remove_duplicate=False):
+                module_name = f"{prefix}.{block_index}.{target_path}"
+                full_module_name = f"transformer.{module_name}"
+                if (
+                    target_path
+                    and _matches_target(full_module_name)
+                    and isinstance(
+                        module,
+                        (torch.nn.Linear, _HV15TorchLinearWithLoRA, BaseLayerWithLoRA),
+                    )
+                ):
+                    matched.append((module_name, full_module_name, module))
+
+        newly_wrapped = 0
+        for module_name, full_module_name, module in matched:
+            if isinstance(module, torch.nn.Linear):
+                module = _HV15TorchLinearWithLoRA(module)
+                replace_submodule(transformer, module_name, module)
+                newly_wrapped += 1
+            self._lora_modules[full_module_name] = module
+
+        if newly_wrapped:
+            logger.info(
+                "Wrapped %d HV1.5 token-refiner nn.Linear layers for online LoRA",
+                newly_wrapped,
+            )
+
+    _patched_replace._diffrl_hv15_refiner_torch_linear_lora = True
+    DiffusionLoRAManager._replace_layers_with_lora = _patched_replace
+
+
 def patch_lora_request_passthrough() -> None:
     """Forward ``lora_request`` through ``Omni.generate`` to ``engine.add_request``."""
     try:
@@ -542,6 +688,8 @@ class VLLMOmniHijack:
         patch_ar_lora_loader()
         patch_ar_merged_lora_fused_tensor()
         patch_fp32_skip()
+        patch_hv15_packed_lora_mapping()
+        patch_hv15_refiner_torch_linear_lora()
         patch_lora_request_passthrough()
         patch_per_request_ar_seed()
         patch_sigmas_passthrough()
@@ -551,6 +699,8 @@ class VLLMOmniHijack:
 __all__ = [
     "OmniTensorLoRARequest",
     "VLLMOmniHijack",
+    "patch_hv15_packed_lora_mapping",
+    "patch_hv15_refiner_torch_linear_lora",
     "patch_per_request_ar_seed",
     "patch_sigmas_passthrough",
 ]

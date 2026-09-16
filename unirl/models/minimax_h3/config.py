@@ -51,12 +51,6 @@ class MiniMaxH3PipelineConfig:
     video_shift: float = 12.0
     audio_shift: float = 3.0
 
-    # MiniMax-H3 conditions on the UNNORMALIZED hidden state its Qwen3-VL
-    # conditioner produces after its 50th decoder layer, i.e.
-    # ``hidden_states[50]`` -- not ``last_hidden_state``. This is fixed by the
-    # checkpoint and therefore is not exposed as a config option.
-    max_sequence_length: int = 512
-
     # When True (default) video AND audio form a single joint SDE policy: audio
     # is SDE-stepped on its OWN schedule with the same ``eta`` as video, emits
     # its own per-step log-prob, and the two merge by an element-weighted mean
@@ -87,6 +81,11 @@ class MiniMaxH3PipelineConfig:
     # transfer cost is negligible against a 22k-row denoising loop. This is what
     # makes an 8-GPU trainside recipe fit at all.
     aux_components_on_cpu: bool = False
+    # When the frozen conditioner is parked on CPU, temporarily move the VAEs
+    # off GPU and onload Qwen3-VL only while computing uncached prompt embeds.
+    # Intended for ~95 GB H20-class devices; lower-memory recipes leave it off.
+    # UNIRL_MINIMAX_H3_ONLOAD_SERIALIZE=0 disables the per-node residency lock.
+    text_encoder_onload_for_embed: bool = False
 
     # The two VAEs are a SEPARATE decision from the conditioner, and default to
     # the train device even when the conditioner is parked. Together they are
