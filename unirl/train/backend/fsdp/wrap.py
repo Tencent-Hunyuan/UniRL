@@ -19,8 +19,8 @@ from unirl.utils.dtypes import parse_torch_dtype
 logger = logging.getLogger(__name__)
 
 
-def _new_copy_engine_pg_options() -> Any:
-    """Build NCCL options that require zero-CTA collectives."""
+def _validate_copy_engine_support() -> Any:
+    """Return ProcessGroupNCCL after validating copy-engine prerequisites."""
     require(torch.cuda.is_available(), "FSDP copy-engine all-gather requires CUDA.")
     nccl_version = torch.cuda.nccl.version()
     require(
@@ -40,6 +40,12 @@ def _new_copy_engine_pg_options() -> Any:
         and hasattr(process_group_nccl, "NCCL_CTA_POLICY_ZERO"),
         "FSDP copy-engine all-gather requires ProcessGroupNCCL zero-CTA support (NCCL >= 2.28).",
     )
+    return process_group_nccl
+
+
+def _new_copy_engine_pg_options() -> Any:
+    """Build NCCL options that require zero-CTA collectives."""
+    process_group_nccl = _validate_copy_engine_support()
     options = process_group_nccl.Options()
     require(
         hasattr(getattr(options, "config", None), "cta_policy"),
@@ -51,9 +57,9 @@ def _new_copy_engine_pg_options() -> Any:
 
 
 def configure_copy_engine_all_gather(enable: bool, *, fsdp_mode: str) -> None:
-    """Validate copy-engine support before the default group is created."""
+    """Validate copy-engine configuration and runtime support."""
     if not enable:
-        return None
+        return
 
     require(
         normalize_fsdp_mode(fsdp_mode) != "no_shard",
@@ -65,8 +71,7 @@ def configure_copy_engine_all_gather(enable: bool, *, fsdp_mode: str) -> None:
         "FSDP copy-engine all-gather sets zero-CTA on its shard communicators, but "
         f"NCCL_CTA_POLICY={policy!r} would override it. Unset NCCL_CTA_POLICY or set it to '2'.",
     )
-    _new_copy_engine_pg_options()
-    return
+    _validate_copy_engine_support()
 
 
 def _clone_checkpoint_kwarg(value: Any) -> Any:
