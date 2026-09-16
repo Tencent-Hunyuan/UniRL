@@ -228,6 +228,11 @@ class VeOmniBackend(BaseFSDP2Backend):
 
 def _validate_fsdp_cfg(fsdp_cfg: FSDPConfig) -> None:
     """Assert the v1-supported FSDPConfig subset (fail fast, actionably)."""
+    if fsdp_cfg.copy_engine_all_gather:
+        raise ValueError(
+            "VeOmniBackend: copy_engine_all_gather=true is unsupported; use FSDPBackend for NCCL symmetric-memory "
+            "all-gather."
+        )
     if normalize_fsdp_mode(fsdp_cfg.fsdp_mode) != "full":
         raise ValueError(
             f"VeOmniBackend: fsdp_mode={fsdp_cfg.fsdp_mode!r} unsupported (v1 supports 'full'; "
