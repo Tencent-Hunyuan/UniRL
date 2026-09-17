@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Type, Union
@@ -19,9 +20,12 @@ from unirl.algorithms.base import (
     transition_sigma,
     typed_conditions,
 )
+from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.train.lora import adapter_active, adapter_names, adapter_of_lora_key
+from unirl.utils.dtypes import parse_torch_dtype
 
 DOMAIN_KEY = "domain"
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -182,7 +186,7 @@ class FullModelTeacherProvider(DiffusionTeacherProvider):
         model: Optional[Any] = None,
         stage: Optional[Any] = None,
         device: Optional[Union[str, torch.device]] = None,
-        dtype: Optional[torch.dtype] = torch.bfloat16,
+        dtype: Optional[Union[str, torch.dtype]] = torch.bfloat16,
         offload_to_cpu: bool = False,
         guidance_scale: Optional[float] = None,
         name: str = "full_teacher",
@@ -194,7 +198,7 @@ class FullModelTeacherProvider(DiffusionTeacherProvider):
         self.stage = stage
         self.conditions_cls = conditions_cls
         self.guidance_scale = float(guidance_scale) if guidance_scale is not None else None
-        self.dtype = dtype
+        self.dtype = parse_torch_dtype(dtype, field_name="FullModelTeacherProvider.dtype", allow_none=True)
 
         if stage is not None:
             stage_model = getattr(stage, "model", None)
@@ -224,28 +228,37 @@ class FullModelTeacherProvider(DiffusionTeacherProvider):
         elif self._model is not None:
             self._to_device(self.device)
 
+    def _teacher_module(self) -> Optional[nn.Module]:
+        """Return the module used by teacher replay, if it is locally owned."""
+        if isinstance(self._model, nn.Module):
+            return self._model
+        transformer = getattr(self._model, "transformer", None)
+        return transformer if isinstance(transformer, nn.Module) else None
+
     def _freeze_parameters(self) -> None:
-        """Ensure all teacher parameters have requires_grad=False."""
-        for p in self.parameters():
-            p.requires_grad = False
+        """Put the local teacher in eval mode and freeze all of its parameters."""
+        module = self._teacher_module()
+        if module is not None:
+            module.eval()
+            module.requires_grad_(False)
 
     def parameters(self) -> Iterator[torch.nn.Parameter]:
         """Iterate over all teacher parameters for isolation and frozen checks."""
-        if isinstance(self._model, nn.Module):
-            yield from self._model.parameters()
-        elif hasattr(self._model, "transformer") and isinstance(self._model.transformer, nn.Module):
-            yield from self._model.transformer.parameters()
+        module = self._teacher_module()
+        if module is not None:
+            yield from module.parameters()
 
     def _to_device(self, target_device: torch.device) -> None:
         """Move underlying teacher module or wrapper to target device."""
-        if self._model is None:
+        module = self._teacher_module()
+        if module is None:
             return
-        if isinstance(self._model, nn.Module):
-            self._model.to(device=target_device, dtype=self.dtype)
-        elif hasattr(self._model, "transformer") and isinstance(self._model.transformer, nn.Module):
-            self._model.transformer.to(device=target_device, dtype=self.dtype)
-            if hasattr(self._model, "device"):
-                self._model.device = target_device
+        to_kwargs: Dict[str, Any] = {"device": target_device}
+        if self.dtype is not None:
+            to_kwargs["dtype"] = self.dtype
+        module.to(**to_kwargs)
+        if not isinstance(self._model, nn.Module) and hasattr(self._model, "device"):
+            self._model.device = target_device
 
     def setup(self, *, stage: Any = None, conditions_cls: Optional[Type[Any]] = None) -> None:
         """Bind optional stage and condition context from the calling algorithm."""
@@ -280,20 +293,38 @@ class FullModelTeacherProvider(DiffusionTeacherProvider):
 
     def teardown(self) -> None:
         """Release teacher resources, terminate roles, and reclaim memory."""
+        errors: List[tuple[str, BaseException]] = []
         if self.role is not None:
+            found_cleanup = False
+            role_errors: List[tuple[str, BaseException]] = []
             for method in ("teardown", "shutdown", "stop"):
-                if hasattr(self.role, method):
-                    try:
-                        getattr(self.role, method)()
-                    except Exception:
-                        pass
+                cleanup = getattr(self.role, method, None)
+                if not callable(cleanup):
+                    continue
+                found_cleanup = True
+                try:
+                    cleanup()
+                except BaseException as exc:
+                    role_errors.append((f"role.{method}", exc))
+                    continue
+                else:
+                    self.role = None
                     break
-            self.role = None
-        if self.offload_to_cpu or self._is_awake:
-            self._to_device(torch.device("cpu"))
-            if torch.cuda.is_available() and self.device.type == "cuda":
-                torch.cuda.empty_cache()
-        self._is_awake = False
+            if not found_cleanup:
+                self.role = None
+            elif self.role is not None:
+                errors.extend(role_errors)
+        try:
+            if self.offload_to_cpu or self._is_awake:
+                self._to_device(torch.device("cpu"))
+                if torch.cuda.is_available() and self.device.type == "cuda":
+                    torch.cuda.empty_cache()
+            self._is_awake = False
+        except BaseException as exc:
+            errors.append(("model offload", exc))
+        if errors:
+            details = ", ".join(name for name, _ in errors)
+            raise RuntimeError(f"FullModelTeacherProvider.teardown failed during {details}.") from errors[0][1]
 
     def teardown_on_failure(self, exc: BaseException) -> None:
         """Exception-safe cleanup ensuring no leaked roles or memory on failure."""
@@ -458,6 +489,13 @@ class DiffusionOPD(StageAlgorithm):
             return []
         return [int(i) for i in segment.sde_indices.tolist()]
 
+    def _teardown_teacher_on_failure(self, exc: BaseException) -> None:
+        """Best-effort teacher cleanup without replacing the active failure."""
+        try:
+            self.teacher_provider.teardown_on_failure(exc)
+        except BaseException:
+            logger.exception("DiffusionOPD: teacher cleanup failed while handling %r.", exc)
+
     def prepare_part(self, part: Any) -> Any:
         """Freeze the batch's teacher transition means on ``segment.sde_means``."""
         target_steps = self._resolve_target_steps(part.segment)
@@ -474,11 +512,13 @@ class DiffusionOPD(StageAlgorithm):
                 )
             domain = str(next(iter(domains)))
         elif isinstance(self.teacher_provider, FrozenLoraTeacherProvider):
-            raise RuntimeError(
-                "DiffusionOPD.prepare_part: no per-row metadata[{key!r}] on the train Part. "
-                "Use a domain-stamping data source (MultiDomainRLDataSource) — the trainer "
-                "projects root metadata onto the train Part automatically.".format(key=DOMAIN_KEY)
-            )
+            if len(self.teacher_provider.teachers) != 1:
+                raise RuntimeError(
+                    "DiffusionOPD.prepare_part: no per-row metadata[{key!r}] on the train Part. "
+                    "Use a domain-stamping data source (MultiDomainRLDataSource) — the trainer "
+                    "projects root metadata onto the train Part automatically.".format(key=DOMAIN_KEY)
+                )
+            domain = next(iter(self.teacher_provider.teachers))
 
         try:
             self.teacher_provider.wake()
@@ -489,14 +529,12 @@ class DiffusionOPD(StageAlgorithm):
                 step_indices=target_steps,
                 domain=domain,
             )
-        except Exception as exc:
-            self.teacher_provider.teardown_on_failure(exc)
-            raise
-        finally:
+            if means is None:
+                raise RuntimeError("DiffusionOPD.prepare_part: teacher provider returned prev_sample_means=None.")
             self.teacher_provider.offload()
-
-        if means is None:
-            raise RuntimeError("DiffusionOPD.prepare_part: teacher provider returned prev_sample_means=None.")
+        except BaseException as exc:
+            self._teardown_teacher_on_failure(exc)
+            raise
 
         part.segment.sde_means = means.detach().cpu()
         self._active_teacher = domain or getattr(self.teacher_provider, "name", "teacher")
@@ -516,37 +554,43 @@ class DiffusionOPD(StageAlgorithm):
         if not target_steps or segment.sde_means is None:
             return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
 
-        typed_conds = typed_conditions(conditions, self.conditions_cls)
-        replay_result = self.stage.replay(
-            typed_conds,
-            segment=segment,
-            params=self.params,
-            step_indices=target_steps,
-        )
-        student_means = replay_result.prev_sample_means  # [B, S', *latent]
-        if student_means is None:
-            raise RuntimeError(
-                "DiffusionOPD.compute_loss_and_backward: stage.replay() returned "
-                "prev_sample_means=None for the student forward."
+        try:
+            typed_conds = typed_conditions(conditions, self.conditions_cls)
+            replay_result = self.stage.replay(
+                typed_conds,
+                segment=segment,
+                params=self.params,
+                step_indices=target_steps,
             )
+            student_means = replay_result.prev_sample_means  # [B, S', *latent]
+            if student_means is None:
+                raise RuntimeError(
+                    "DiffusionOPD.compute_loss_and_backward: stage.replay() returned "
+                    "prev_sample_means=None for the student forward."
+                )
 
-        teacher_means = gather_sde_field(segment.sde_means, segment.sde_indices, target_steps, field_name="sde_means")
-        # Replay means are fp32 by contract; align the stored teacher anchor before squaring.
-        teacher_f32 = teacher_means.to(device=student_means.device, dtype=torch.float32)
+            teacher_means = gather_sde_field(
+                segment.sde_means, segment.sde_indices, target_steps, field_name="sde_means"
+            )
+            # Replay means are fp32 by contract; align the stored teacher anchor before squaring.
+            teacher_f32 = teacher_means.to(device=student_means.device, dtype=torch.float32)
 
-        sigma_t = transition_sigma(
-            self.stage,
-            segment=segment,
-            target_steps=target_steps,
-            eta=self.params.eta,
-            device=student_means.device,
-            add_coefficient=self.add_kl_coefficient,
-        )
-        kl_per_elem = gaussian_kl_div(student_means, teacher_f32, sigma_t)
-        kl_per_sample_step = kl_per_elem.mean(dim=tuple(range(2, kl_per_elem.ndim)))  # [B, S']
-        loss = kl_per_sample_step.mean()
+            sigma_t = transition_sigma(
+                self.stage,
+                segment=segment,
+                target_steps=target_steps,
+                eta=self.params.eta,
+                device=student_means.device,
+                add_coefficient=self.add_kl_coefficient,
+            )
+            kl_per_elem = gaussian_kl_div(student_means, teacher_f32, sigma_t)
+            kl_per_sample_step = kl_per_elem.mean(dim=tuple(range(2, kl_per_elem.ndim)))  # [B, S']
+            loss = kl_per_sample_step.mean()
 
-        (loss * loss_scale).backward()
+            (loss * loss_scale).backward()
+        except BaseException as exc:
+            self._teardown_teacher_on_failure(exc)
+            raise
 
         metrics: Dict[str, Any] = {"distill_loss": float(loss.detach().item())}
         if self._active_teacher is not None:
@@ -558,6 +602,11 @@ class DiffusionOPD(StageAlgorithm):
             num_steps_or_tokens=len(target_steps),
             has_backward=True,
         )
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def shutdown(self) -> None:
+        """Release teacher resources after training completes or aborts."""
+        self.teacher_provider.teardown()
 
 
 __all__ = [
