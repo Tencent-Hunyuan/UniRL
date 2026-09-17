@@ -107,6 +107,33 @@ GPU residency through the child's `onload`, `offload`, and `shutdown` endpoints;
 new remote reward needs no UniRL code — add it to the server and list its name in
 `RemoteRewardSpec.required_rewards`.
 
+### DyRef rewards
+
+`DyRefRewardScorer` combines generated-to-clean-target SigLIPv2 similarity,
+the paper's sigmoid DRS transform, and CSD style similarity. The DyRef data
+source keeps the clean target out of model conditioning and exposes its local
+path only through reserved reward metadata. CSD selects the ordered condition
+image indexed by `metadata.dyref.style_reference_index`; non-style rows receive
+a constant zero style term, which cancels under per-group GRPO centering.
+
+The scorer also emits `component_rewards["dar_weight"]`.
+`DyRefFlowGRPO.prepare_part` applies that group-constant weight after ordinary
+GRPO advantage normalization, matching the paper's weighted policy objective.
+Use one reward worker when reproducing the paper so DAR's batch-mean weight
+normalization spans every prompt group in the rollout.
+
+The public DyRef code uses `dar_min_weight=0.5`, but its reported raw
+similarities (roughly 0.75–0.95) make `(1-p)^2` hit that floor for nearly every
+group and normalize back to one. UniRL's DyRef recipes use `0.01` so DAR is
+actually dynamic; treat it as an explicit reproducibility deviation and verify
+the logged `dar_weight` distribution before a full run.
+
+Install the `train` extra for the pinned OpenAI CLIP code and provide the
+official [CSD ViT-L](https://huggingface.co/tomg-group-umd/CSD-ViT-L)
+checkpoint via the recipe. The source wrapper is MIT-licensed (see
+`local/CSD_LICENSE`); the separately downloaded checkpoint has its own model
+card license.
+
 ## Gotchas
 
 - **A non-finite/missing reward fails the whole step, by design** — fix the scorer.

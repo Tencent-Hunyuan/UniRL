@@ -100,6 +100,8 @@ fastvideo = [
 train = [
   "wandb>=0.16,<0.20",
   "aiohttp>=3.9",
+  # DyRef CSD style reward imports the official OpenAI CLIP `clip` module.
+  "clip @ git+https://github.com/openai/CLIP.git@d05afc436d78f1c48dc0dbf8e5980a9d471f35f6",
   # MathVerifyRewardScorer (unirl/reward/local/mathverify.py) — the paper's grader.
   "math-verify>=0.6",
 ]
@@ -214,6 +216,7 @@ include = [
 
 [tool.setuptools.package-data]
 "unirl.models.janus_pro.vendor" = ["LICENSE-CODE", "VENDOR_COMMIT.txt"]
+"unirl.reward.local" = ["CSD_LICENSE"]
 
 [tool.ruff]
 line-length = 120
