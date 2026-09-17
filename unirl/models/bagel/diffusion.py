@@ -13,7 +13,7 @@ from unirl.config.require import require
 from unirl.models.types.diffusion import DiffusionStage
 from unirl.models.types.replay_result import ReplayResult
 from unirl.sde.kernels import FlowSDEStrategy, StepStrategy
-from unirl.types.sampling import DiffusionSamplingParams, compute_trajectory_positions
+from unirl.types.sampling import DiffusionSamplingParams, _as_float, compute_trajectory_positions
 from unirl.types.segments.latent import LatentSegment
 from unirl.utils.dtypes import parse_torch_dtype
 
@@ -44,8 +44,10 @@ class BagelDiffusionParams(DiffusionSamplingParams):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        self.cfg_img_scale = _as_float(self.cfg_img_scale, name="BagelDiffusionParams.cfg_img_scale")
+        self.cfg_renorm_min = _as_float(self.cfg_renorm_min, name="BagelDiffusionParams.cfg_renorm_min")
         require(
-            int(self.num_inference_steps) >= 2,
+            self.num_inference_steps >= 2,
             f"BagelDiffusionParams.num_inference_steps must be >= 2; got {self.num_inference_steps}",
         )
         require(
