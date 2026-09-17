@@ -6,7 +6,8 @@ from contextlib import nullcontext
 
 import torch
 
-from unirl.models.types.codec import DecodeStage
+from unirl.models.types.codec import DecodeStage, EncodeStage
+from unirl.types.conditions import ImageLatentCondition
 from unirl.types.primitives import ImagePrimitive, Images, ImageSets
 from unirl.types.segments import LatentSegment
 
@@ -82,6 +83,7 @@ class Flux2KleinVAEEncodeStage:
         *,
         height: int,
         width: int,
+        resize_mode: str = "stretch",
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if isinstance(images, ImageSets):
             references = images.to_slots(context="Flux2KleinVAEEncodeStage.encode")
@@ -90,14 +92,22 @@ class Flux2KleinVAEEncodeStage:
         if not references:
             raise ValueError("Flux2KleinVAEEncodeStage.encode: no reference images given")
         encoded = [
-            self._encode_slot(reference, height=height, width=width, slot=slot)
+            self._encode_slot(reference, height=height, width=width, slot=slot, resize_mode=resize_mode)
             for slot, reference in enumerate(references)
         ]
         tokens = torch.cat([token for token, _ in encoded], dim=1)
         ids = torch.cat([ref_ids for _, ref_ids in encoded], dim=1)
         return tokens, ids
 
-    def _encode_slot(self, images: Images, *, height: int, width: int, slot: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def _encode_slot(
+        self,
+        images: Images,
+        *,
+        height: int,
+        width: int,
+        slot: int,
+        resize_mode: str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Encode one reference slot; T=``scale * (slot + 1)`` must match upstream ``_prepare_image_ids``."""
         if self.bundle.vae is None:
             raise RuntimeError(
@@ -128,7 +138,12 @@ class Flux2KleinVAEEncodeStage:
         # multiples of 16) and matches the edited-image resolution.
         from torchvision.transforms.functional import pil_to_tensor
 
-        condition_pils = resize_condition_pils(images.to_pils(), height=height, width=width)
+        condition_pils = resize_condition_pils(
+            images.to_pils(),
+            height=height,
+            width=width,
+            mode=resize_mode,
+        )
         pixels = torch.stack(
             [pil_to_tensor(pil).to(dtype=torch.float32).div_(255.0) for pil in condition_pils],
             dim=0,
@@ -154,4 +169,26 @@ class Flux2KleinVAEEncodeStage:
         return image_tokens.to(dtype=self.bundle.dtype), image_ids
 
 
-__all__ = ["Flux2KleinVAEDecodeStage", "Flux2KleinVAEEncodeStage"]
+class Flux2KleinTargetVAEEncodeStage(EncodeStage[Images, ImageLatentCondition]):
+    """Encode clean target pixels into normalized patchified FLUX.2 latents."""
+
+    def __init__(self, bundle: Flux2KleinBundle) -> None:
+        self.bundle = bundle
+
+    @torch.no_grad()
+    def encode(self, images: Images) -> ImageLatentCondition:
+        """Encode ``[B,3,H,W]`` targets into ``[B,128,H/16,W/16]``."""
+        if self.bundle.vae is None:
+            raise RuntimeError("Flux2KleinTargetVAEEncodeStage.encode requires a loaded VAE.")
+        pixels = images.to_dense().to(device=self.bundle.device, dtype=torch.float32)
+        if pixels.shape[1] != 3:
+            raise ValueError(
+                f"Flux2KleinTargetVAEEncodeStage.encode expects RGB images, got shape {tuple(pixels.shape)}."
+            )
+        vae = self.bundle.vae.to(torch.float32)
+        latents = vae.encode(pixels * 2.0 - 1.0).latent_dist.mode()
+        latents = normalize_patchified_latents(patchify_latents(latents), vae)
+        return ImageLatentCondition(latents=latents)
+
+
+__all__ = ["Flux2KleinTargetVAEEncodeStage", "Flux2KleinVAEDecodeStage", "Flux2KleinVAEEncodeStage"]

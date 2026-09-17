@@ -72,12 +72,12 @@ class Flux2KleinAdapter(ImageAdapter):
                 image_set.to_pils(),
                 height=int(gen_part.sampling_params.height),
                 width=int(gen_part.sampling_params.width),
+                mode=str(getattr(self.model_config, "condition_image_resize_mode", "stretch")),
             )
             for image_set in unique_sets
         ]
         if counts[0] == 1:
-            flat = [row[0] for row in reference_rows]
-            condition_image: Any = flat if len(flat) > 1 else flat[0]
+            condition_image: Any = reference_rows if len(reference_rows) > 1 else reference_rows[0][0]
         else:
             condition_image = reference_rows
         out: Dict[str, Any] = {

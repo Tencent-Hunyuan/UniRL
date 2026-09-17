@@ -8,7 +8,7 @@ from typing import Any, Optional, Tuple
 from unirl.models.types.pipeline import Pipeline
 from unirl.sde.kernels import DanceSDEStrategy, StepStrategy
 from unirl.types.noise_recipe import NoiseRecipe
-from unirl.types.primitives import Images, ImageSets, Texts, as_image_sets
+from unirl.types.primitives import ImagePrimitive, Images, ImageSets, Texts, as_image_sets
 from unirl.types.sample import Sample
 
 from .bundle import Flux2KleinBundle
@@ -21,7 +21,7 @@ from .diffusion import (
 )
 from .schedule import Flux2KleinSchedulePolicy, build_flux2_klein_schedule_policy
 from .text_embed import Flux2KleinTextEmbedStage
-from .vae import Flux2KleinVAEDecodeStage, Flux2KleinVAEEncodeStage
+from .vae import Flux2KleinTargetVAEEncodeStage, Flux2KleinVAEDecodeStage, Flux2KleinVAEEncodeStage
 
 
 class Flux2KleinPipeline(Pipeline):
@@ -42,6 +42,7 @@ class Flux2KleinPipeline(Pipeline):
         batch_replay_steps: bool = False,
         max_sequence_length: int = 512,
         qwen3_extraction_layers: Tuple[int, ...] = (9, 18, 27),
+        condition_image_resize_mode: str = "stretch",
     ) -> None:
         super().__init__()
         self.bundle = bundle
@@ -67,7 +68,14 @@ class Flux2KleinPipeline(Pipeline):
         self.diffusion = diffusion
         self.vae_decode = vae_decode if vae_decode is not None else Flux2KleinVAEDecodeStage(bundle)
         self.vae_encode = Flux2KleinVAEEncodeStage(bundle)
+        self.target_vae_encode = Flux2KleinTargetVAEEncodeStage(bundle)
         self.shift = shift
+        self.condition_image_resize_mode = str(condition_image_resize_mode)
+        if self.condition_image_resize_mode not in {"stretch", "crop"}:
+            raise ValueError(
+                "Flux2KleinPipeline.condition_image_resize_mode must be 'stretch' or 'crop', "
+                f"got {self.condition_image_resize_mode!r}."
+            )
 
     def build_schedule_policy(self):
         """Build the Klein-specific schedule policy."""
@@ -118,6 +126,7 @@ class Flux2KleinPipeline(Pipeline):
             diffusion=diffusion,
             vae_decode=vae_decode,
             shift=float(config.shift),
+            condition_image_resize_mode=config.condition_image_resize_mode,
         )
 
     def build_conditions(
@@ -125,9 +134,11 @@ class Flux2KleinPipeline(Pipeline):
         texts: Texts,
         *,
         negatives: Optional[Texts] = None,
+        images: Optional[ImagePrimitive] = None,
         guidance_scale: float = 1.0,
+        image_shape: Optional[Tuple[int, int]] = None,
     ) -> Flux2KleinConditions:
-        """Encode prompts (+ optional CFG negatives) into ``Flux2KleinConditions``."""
+        """Encode prompts and optional ordered reference images."""
         if negatives is not None and len(negatives.texts) != len(texts.texts):
             raise ValueError(
                 f"Flux2KleinPipeline.build_conditions: negative_text length "
@@ -137,7 +148,25 @@ class Flux2KleinPipeline(Pipeline):
         if negatives is None and float(guidance_scale) > 1.0:
             negatives = Texts(texts=[""] * len(texts.texts))
         negative_text_cond = self.text_embed.embed(negatives) if negatives is not None else None
-        return Flux2KleinConditions(text=text_cond, negative_text=negative_text_cond)
+        conditions = Flux2KleinConditions(text=text_cond, negative_text=negative_text_cond)
+        if images is not None:
+            references = as_image_sets(images)
+            if len(references) != len(texts):
+                raise ValueError(
+                    f"Flux2KleinPipeline.build_conditions: image-set batch {len(references)} "
+                    f"!= text batch {len(texts)}."
+                )
+            if image_shape is None:
+                raise ValueError("Flux2KleinPipeline.build_conditions: images require image_shape=(height, width).")
+            image_tokens, image_ids = self.vae_encode.encode(
+                references,
+                height=int(image_shape[0]),
+                width=int(image_shape[1]),
+                resize_mode=self.condition_image_resize_mode,
+            )
+            conditions.image_latent = image_tokens
+            conditions.image_latent_ids = image_ids
+        return conditions
 
     def generate(self, sample: Sample) -> Sample:
         """Run FLUX.2-klein-9B t2i/edit end-to-end, filling the frontier (pre-forked) gen Part."""
@@ -171,19 +200,12 @@ class Flux2KleinPipeline(Pipeline):
         if bool(params.init_same_noise) and not params.noise_group_ids:
             params = _dc.replace(params, noise_group_ids=list(frontier.group_ids))
 
-        klein_conds = self.build_conditions(texts, guidance_scale=float(params.guidance_scale))
-        if references is not None:
-            if len(references) != len(texts.texts):
-                raise ValueError(
-                    f"Flux2KleinPipeline.generate: image-set batch {len(references)} != text count {len(texts.texts)}"
-                )
-            image_tokens, image_ids = self.vae_encode.encode(
-                references,
-                height=int(params.height),
-                width=int(params.width),
-            )
-            klein_conds.image_latent = image_tokens
-            klein_conds.image_latent_ids = image_ids
+        klein_conds = self.build_conditions(
+            texts,
+            images=references,
+            guidance_scale=float(params.guidance_scale),
+            image_shape=(int(params.height), int(params.width)),
+        )
         schedule = sampling.sigmas.to(self.bundle.device)
 
         initial_latents = NoiseRecipe.from_sample(sample).resolve()

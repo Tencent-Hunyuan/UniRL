@@ -35,6 +35,7 @@ class Flux2KleinPipelineConfig:
     max_sequence_length: int = 512
 
     qwen3_extraction_layers: Tuple[int, ...] = (9, 18, 27)
+    condition_image_resize_mode: str = "stretch"
 
     use_lora: bool = False
     lora_target_modules: Optional[List[str]] = None
@@ -43,6 +44,11 @@ class Flux2KleinPipelineConfig:
 
     def __post_init__(self) -> None:
         validate_precision_type(self.model_precision, field="Flux2KleinPipelineConfig.model_precision")
+        if self.condition_image_resize_mode not in {"stretch", "crop"}:
+            raise ValueError(
+                "Flux2KleinPipelineConfig.condition_image_resize_mode must be 'stretch' or 'crop', "
+                f"got {self.condition_image_resize_mode!r}."
+            )
 
     def build_schedule_policy(self):
         """Build the Klein-specific schedule policy without a Pipeline instance."""

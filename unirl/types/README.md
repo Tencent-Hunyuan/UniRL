@@ -197,6 +197,7 @@ ImageSets.from_rows([
 `ImageSets` is the preferred Part-level condition-image primitive; `ImageSet`
 is its row value, while legacy singleton-row `Images` remains accepted during
 migration. Candidate generations remain separate rows created by `fork` and
-are not image set members. Single-image consumers call
-`require_single_images(...)`; dense multi-reference consumers call
-`to_slots(...)` and therefore still require image-count bucketing.
+are not image set members. Single-image-only consumers call
+`require_single_images(...)`; FLUX.2 calls `to_slots(...)` and therefore
+requires image-count bucketing. Qwen-Image-Edit-2511 consumes each ordered row
+directly and groups rows by their complete source-latent shape tuple.
