@@ -94,11 +94,11 @@ class ARTrainer(BaseTrainer):
         # Teacher-anchored algorithms declare requires_backend / requires_advantages=False
         # (mirrors DiffusionTrainer._build_train_side); validate before building anything so a
         # misconfigured recipe fails fast without a half-constructed device pool or actors.
-        algo_cls = get_class(str(algorithm_cfg.get("_target_", "")))
-        self._algo_requires_advantages = getattr(algo_cls, "requires_advantages", True)
+        algorithm_cls = get_class(algorithm_cfg["_target_"])
+        self._algorithm_requires_advantages = algorithm_cls.requires_advantages
         eval_interval = int(eval_interval)
         if reward_cfg is None:
-            if self._algo_requires_advantages:
+            if self._algorithm_requires_advantages:
                 raise ValueError(
                     "The recipe has no `reward:` block, but the algorithm requires advantages "
                     "(requires_advantages=True) — RL training cannot run without a reward model. "
@@ -147,7 +147,7 @@ class ARTrainer(BaseTrainer):
 
             if reward_cfg is not None:
                 self.reward = remote_hydra(reward_cfg)
-            algo_extra = {"backend": self.backend} if getattr(algo_cls, "requires_backend", False) else {}
+            algo_extra = {"backend": self.backend} if algorithm_cls.requires_backend else {}
             self.algorithm = remote_hydra(algorithm_cfg, pipeline=self.pipeline, **algo_extra)
             self.stack = remote_hydra(stack_cfg, fsdp_backend=self.backend, algorithm=self.algorithm)
 
@@ -406,18 +406,18 @@ class ARTrainer(BaseTrainer):
             if isinstance(part.component_rewards, dict):
                 part.component_rewards = {name: hydrate(value) for name, value in part.component_rewards.items()}
             mean_reward = float(part.rewards.to(torch.float32).mean().item())
-            if self._algo_requires_advantages and self.advantage_mode == "grpo":
+            if self._algorithm_requires_advantages and self.advantage_mode == "grpo":
                 part = part.compute_advantages(
                     normalize=self.normalize_adv_by_std,
                     scope=self.adv_normalization_scope,
                 )
-            sample = sample.with_parts([*sample.parts[:-1], part])
+                sample = sample.with_parts([*sample.parts[:-1], part])
 
         # Project root-Part metadata onto the gen Part's rows; only ever fills an empty field.
         gen_part = sample.parts[-1]
         if not gen_part.metadata:
             root_md = sample.root_metadata(-1)
-            if any(md for md in root_md):
+            if any(root_md):
                 gen_part.metadata = [dict(md) if md else {} for md in root_md]
 
         self._dump_rollout_samples(sample, rollout_id)

@@ -63,10 +63,10 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
             rollout_cfg=rollout_cfg,
             stack_cfg=stack_cfg,
         )
-        algo_cls = get_class(str(algorithm_cfg.get("_target_", "")))
-        if getattr(algo_cls, "requires_backend", False) or not getattr(algo_cls, "requires_advantages", True):
+        algorithm_cls = get_class(algorithm_cfg["_target_"])
+        if algorithm_cls.requires_backend or not algorithm_cls.requires_advantages:
             raise ValueError(
-                f"AsyncARTrainer does not support teacher-anchored algorithms ({algo_cls.__name__} sets "
+                f"AsyncARTrainer does not support teacher-anchored algorithms ({algorithm_cls.__name__} sets "
                 "requires_backend or requires_advantages=False). Use the synchronous ARTrainer; async "
                 "teacher-anchored training is not implemented."
             )
