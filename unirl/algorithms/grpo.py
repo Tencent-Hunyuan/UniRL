@@ -33,6 +33,38 @@ class GRPOConfig(BaseAlgorithmConfig):
     old_logp_source: str = "rollout"
 
 
+def aggregate_token_losses(
+    loss_per_elem: torch.Tensor,
+    *,
+    lengths: torch.Tensor,
+    loss_mask: Optional[torch.Tensor],
+    loss_agg_mode: str,
+    horizon: int,
+) -> torch.Tensor:
+    """Reduce packed per-token losses with a mask-aware token or sequence mean."""
+    mask: Optional[torch.Tensor] = None
+    if loss_mask is not None:
+        mask = loss_mask.to(dtype=loss_per_elem.dtype, device=loss_per_elem.device)
+        loss_per_elem = loss_per_elem * mask
+
+    if loss_agg_mode in ("seq-mean-token-sum-norm", "seq-mean-token-mean"):
+        parts = torch.split(loss_per_elem, lengths.tolist())
+        if mask is None:
+            if loss_agg_mode == "seq-mean-token-sum-norm":
+                return torch.stack([p.sum() for p in parts]).mean() / float(horizon)
+            return torch.stack([p.mean() if p.numel() else p.new_zeros(()) for p in parts]).mean()
+        mask_parts = torch.split(mask, lengths.tolist())
+        valid_parts = [(p, float(m.sum().item())) for p, m in zip(parts, mask_parts) if bool(m.any())]
+        if loss_agg_mode == "seq-mean-token-sum-norm":
+            per_seq = [p.sum() / float(horizon) for p, _ in valid_parts]
+        else:
+            per_seq = [p.sum() / weight for p, weight in valid_parts]
+        return torch.stack(per_seq).mean() if per_seq else loss_per_elem.sum() * 0.0
+    if mask is None:
+        return loss_per_elem.mean()
+    return loss_per_elem.sum() / mask.sum().clamp(min=1)
+
+
 class GRPO(StageAlgorithm):
     """GRPO over an AR ``TextSegment`` via ``ARStage.replay``."""
 
@@ -140,30 +172,13 @@ class GRPO(StageAlgorithm):
             clip_range_high=clip_high,
         )
 
-        mask: Optional[torch.Tensor] = None
-        if segment.loss_mask is not None:
-            mask = segment.loss_mask.to(dtype=loss_per_elem.dtype, device=loss_per_elem.device)
-            loss_per_elem = loss_per_elem * mask
-
-        if self.loss_agg_mode in ("seq-mean-token-sum-norm", "seq-mean-token-mean"):
-            parts = torch.split(loss_per_elem, segment.lengths.tolist())
-            if mask is None:
-                if self.loss_agg_mode == "seq-mean-token-sum-norm":
-                    loss = torch.stack([p.sum() for p in parts]).mean() / float(self.horizon)
-                else:
-                    loss = torch.stack([p.mean() if p.numel() else p.new_zeros(()) for p in parts]).mean()
-            else:
-                mask_parts = torch.split(mask, segment.lengths.tolist())
-                valid_parts = [(p, float(m.sum().item())) for p, m in zip(parts, mask_parts) if bool(m.any())]
-                if self.loss_agg_mode == "seq-mean-token-sum-norm":
-                    per_seq = [p.sum() / float(self.horizon) for p, _ in valid_parts]
-                else:
-                    per_seq = [p.sum() / weight for p, weight in valid_parts]
-                loss = torch.stack(per_seq).mean() if per_seq else loss_per_elem.sum() * 0.0
-        elif mask is None:
-            loss = loss_per_elem.mean()
-        else:
-            loss = loss_per_elem.sum() / mask.sum().clamp(min=1)
+        loss = aggregate_token_losses(
+            loss_per_elem,
+            lengths=segment.lengths,
+            loss_mask=segment.loss_mask,
+            loss_agg_mode=self.loss_agg_mode,
+            horizon=self.horizon,
+        )
         (loss * loss_scale).backward()
 
         rollout_logp = (segment.rollout_log_probs if segment.rollout_log_probs is not None else segment.log_probs).to(
@@ -206,4 +221,4 @@ class GRPO(StageAlgorithm):
         return torch.cat(chunks, dim=0)
 
 
-__all__ = ["GRPO", "GRPOConfig"]
+__all__ = ["GRPO", "GRPOConfig", "aggregate_token_losses"]
