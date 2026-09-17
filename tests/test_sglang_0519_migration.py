@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import torch
 
 from unirl.rollout.engine.sglang_diffusion._patches import (
+    patch_gpu_worker,
     patch_rollout_trajectory,
 )
 from unirl.rollout.engine.sglang_diffusion.backends.native import SGLangBackend
@@ -51,6 +52,14 @@ def _backend():
         "sync_scheduler_client": client,
     }
     return SGLangBackend(None, runtime, SimpleNamespace()), client
+
+
+def test_diffusion_server_args_can_omit_srt_memory_saver_knobs():
+    assert patch_gpu_worker._memory_saver_options(SimpleNamespace()) == (False, True)
+    assert patch_gpu_worker._memory_saver_options(SimpleNamespace(enable_memory_saver=True, pin_cpu_memory=False)) == (
+        True,
+        False,
+    )
 
 
 def test_tensor_update_uses_native_request_and_preserves_flush_cache():

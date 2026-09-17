@@ -5,6 +5,14 @@ from __future__ import annotations
 import torch
 
 
+def _memory_saver_options(server_args) -> tuple[bool, bool]:
+    """Read memory-saver knobs that are optional on diffusion ServerArgs."""
+    return (
+        bool(getattr(server_args, "enable_memory_saver", False)),
+        bool(getattr(server_args, "pin_cpu_memory", True)),
+    )
+
+
 def patch_gpu_worker() -> None:
     """Extend the v0.5.19 worker without replacing its native post-training API."""
     from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
@@ -25,12 +33,13 @@ def patch_gpu_worker() -> None:
                 MemorySaverHandler,
             )
 
+            enable_memory_saver, pin_cpu_memory = _memory_saver_options(self.server_args)
             self._weights_update_groups: dict = {}
             self._memory_saver = MemorySaverHandler(
-                adapter=TorchMemorySaverAdapter.create(enable=self.server_args.enable_memory_saver),
+                adapter=TorchMemorySaverAdapter.create(enable=enable_memory_saver),
                 pipeline=self.pipeline,
                 local_rank=self.local_rank,
-                pin_cpu_memory=self.server_args.pin_cpu_memory,
+                pin_cpu_memory=pin_cpu_memory,
             )
             self._memory_saver_sleeping = False
             self._dirty_modules = self._memory_saver.dirty_modules
