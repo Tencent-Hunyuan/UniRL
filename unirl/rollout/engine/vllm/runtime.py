@@ -202,15 +202,13 @@ def engine_process_main(
                 if command == "generate":
                     payloads = list(message["payloads"])
                     sampling_blocks = [dict(payload["sampling_params"]) for payload in payloads]
-                    if sampling_blocks and any(block != sampling_blocks[0] for block in sampling_blocks[1:]):
-                        raise ValueError("one vLLM batch requires identical sampling parameters")
                     prompts = [
                         {"prompt_token_ids": [int(token) for token in payload["input_ids"]]} for payload in payloads
                     ]
-                    params = _sampling_params(
-                        sampling_blocks[0] if sampling_blocks else {},
-                        return_logprob=bool(payloads and payloads[0].get("return_logprob", True)),
-                    )
+                    params = [
+                        _sampling_params(block, return_logprob=bool(payload.get("return_logprob", True)))
+                        for payload, block in zip(payloads, sampling_blocks, strict=True)
+                    ]
                     outputs = llm.generate(prompts, params, use_tqdm=False)
                     result = _plain_outputs(outputs)
                 elif command == "sleep":

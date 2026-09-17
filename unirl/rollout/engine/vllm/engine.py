@@ -18,9 +18,9 @@ from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.rollout.engine.base import BaseRolloutEngine
 from unirl.rollout.engine.sglang.adapters.text import TextLMAdapter
-from unirl.rollout.engine.sglang.utils import resolve_sampling
 from unirl.rollout.engine.vllm.config import VLLMEngineConfig
 from unirl.rollout.engine.vllm.runtime import engine_process_main
+from unirl.rollout.engine.vllm.sampling import resolve_sampling
 from unirl.types.sample import Sample
 
 logger = logging.getLogger(__name__)
@@ -203,9 +203,13 @@ class VLLMRolloutEngine(BaseRolloutEngine):
         sampling = resolve_sampling(self.cfg, sample)
         prepared = self.adapter.build_inputs(sample, sampling=sampling)
         self._truncate_prepared_prompts(prepared)
-        if self.cfg.ignore_eos:
-            for payload in prepared.wire:
-                payload["sampling_params"]["ignore_eos"] = True
+        for payload in prepared.wire:
+            block = payload["sampling_params"]
+            sampling_seed = block.pop("sampling_seed", None)
+            if sampling_seed is not None:
+                block["seed"] = int(sampling_seed)
+            if self.cfg.ignore_eos:
+                block["ignore_eos"] = True
         response = self._request(
             "generate",
             payloads=prepared.wire,
@@ -232,6 +236,11 @@ class VLLMRolloutEngine(BaseRolloutEngine):
             raise ValueError(f"vLLM sleep level must be 1 or 2, got {level}")
         self._weight_sync_sleep_level = int(level)
         self._preserve_next_weight_sleep = bool(preserve_next_sleep)
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def preserve_weights_for_next_sleep(self) -> None:
+        """Force the next sleep to retain weights for a wake without sync."""
+        self._preserve_next_weight_sleep = True
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def wake_up(self, tags: Optional[List[str]] = None) -> None:
@@ -386,60 +395,53 @@ class VLLMRolloutEngine(BaseRolloutEngine):
                 "request_id": request_id,
                 "command": command,
             }
-        try:
-            connection.send(request)
-            response = self._recv(
-                connection=connection,
-                timeout_s=self.cfg.timeout_for(command) if timeout_s is None else timeout_s,
-                expected_request_id=request_id,
-                expected_command=command,
-            )
-            result = response["result"]
-            if not response["ok"]:
-                if command in {
-                    "init_native_weight_transfer",
-                    "start_native_weight_update",
-                    "update_native_weights",
-                    "finish_native_weight_update",
-                    "release_native_ipc",
-                }:
-                    self._validate_update_result(result, expected_status="aborted")
-                with self._lock:
-                    if (
-                        command
-                        in {
-                            "sleep",
-                            "wake_up",
-                            "init_native_weight_transfer",
-                            "start_native_weight_update",
-                            "update_native_weights",
-                            "finish_native_weight_update",
-                            "release_native_ipc",
-                        }
-                        and self._connection_state is VLLMConnectionState.INFLIGHT
-                    ):
-                        self._mark_broken_locked()
-                    elif self._connection_state is VLLMConnectionState.INFLIGHT:
-                        self._connection_state = VLLMConnectionState.IDLE
-                raise RuntimeError(
-                    f"vLLM {command} request {request_id} failed: "
-                    f"{response.get('error')}\n{response.get('traceback', '')}"
+            try:
+                connection.send(request)
+                response = self._recv(
+                    connection=connection,
+                    timeout_s=self.cfg.timeout_for(command) if timeout_s is None else timeout_s,
+                    expected_request_id=request_id,
+                    expected_command=command,
                 )
-            self._validate_command_result(command, result)
-        except BaseException as error:
-            with self._lock:
+                result = response["result"]
+                if not response["ok"]:
+                    if command in {
+                        "init_native_weight_transfer",
+                        "start_native_weight_update",
+                        "update_native_weights",
+                        "finish_native_weight_update",
+                        "release_native_ipc",
+                    }:
+                        self._validate_update_result(result, expected_status="aborted")
+                    if command in {
+                        "sleep",
+                        "wake_up",
+                        "init_native_weight_transfer",
+                        "start_native_weight_update",
+                        "update_native_weights",
+                        "finish_native_weight_update",
+                        "release_native_ipc",
+                    }:
+                        self._mark_broken_locked()
+                    else:
+                        self._connection_state = VLLMConnectionState.IDLE
+                    raise RuntimeError(
+                        f"vLLM {command} request {request_id} failed: "
+                        f"{response.get('error')}\n{response.get('traceback', '')}"
+                    )
+                self._validate_command_result(command, result)
+            except BaseException as error:
                 if self._connection_state is VLLMConnectionState.INFLIGHT:
                     self._mark_broken_locked()
-            if isinstance(error, (TimeoutError, EOFError, BrokenPipeError, OSError, _ProtocolError)):
-                raise type(error)(f"vLLM {command} request {request_id} broke the connection: {error}") from error
-            raise
-        with self._lock:
+                if isinstance(error, (TimeoutError, EOFError, BrokenPipeError, OSError, _ProtocolError)):
+                    raise type(error)(f"vLLM {command} request {request_id} broke the connection: {error}") from error
+                raise
             if self._connection_state is not VLLMConnectionState.INFLIGHT:
                 raise RuntimeError(
                     f"vLLM {command} request {request_id} completed after runtime became {self._connection_state.value}"
                 )
             self._connection_state = VLLMConnectionState.IDLE
-        return result
+            return result
 
     def _recv(
         self,
@@ -548,9 +550,13 @@ class VLLMRolloutEngine(BaseRolloutEngine):
 
     def _break_connection(self) -> None:
         with self._lock:
+            if self._connection_state is VLLMConnectionState.BROKEN:
+                return
             self._mark_broken_locked()
 
     def _mark_broken_locked(self) -> None:
+        if self._connection_state is VLLMConnectionState.BROKEN:
+            return
         self._connection_state = VLLMConnectionState.BROKEN
         self._dispose_runtime_locked()
 
