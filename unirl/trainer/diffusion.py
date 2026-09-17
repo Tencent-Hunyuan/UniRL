@@ -793,7 +793,8 @@ class DiffusionTrainer(BaseTrainer):
         for rollout_id in window_ids:
             inputs = self.data_source.get_samples(self.batch_size)
             sample = self._build_request_sample(inputs, rollout_id)
-            sync_weights = (rollout_id > 0 and rollout_id % weight_sync_interval == 0) or (rollout_id == force_sync_at)
+            # Rollout 0 must receive the injected or warm-started LoRA before external-engine generation.
+            sync_weights = (rollout_id % weight_sync_interval == 0) or (rollout_id == force_sync_at)
             sample, mean_reward = self._rollout_and_score(sample, sync_weights=sync_weights, rollout_id=rollout_id)
             samples.append(sample)
             window_rewards.append(mean_reward)

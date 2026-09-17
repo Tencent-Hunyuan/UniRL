@@ -85,6 +85,7 @@ def inject_lora(
     bias: str = "none",
     task_type: str = "FEATURE_EXTRACTION",
     adapter_name: str = "default",
+    reset_after_materialize: bool = True,
 ) -> None:
     """Inject a single LoRA adapter.  No Shadow, no EMA."""
     from peft import LoraConfig, inject_adapter_in_model
@@ -120,7 +121,8 @@ def inject_lora(
             n_trainable,
         )
 
-    defer_after_materialize(model, partial(_reset_adapter, name=adapter_name))
+    if reset_after_materialize:
+        defer_after_materialize(model, partial(_reset_adapter, name=adapter_name))
 
 
 def _reset_adapter(model: nn.Module, *, name: str) -> None:
@@ -213,6 +215,93 @@ def _resolve_adapter_checkpoint(path: str) -> tuple:
     except Exception:
         weight_path = hf_hub_download(filename="adapter_model.bin", **dl_kwargs)
     return config_path, weight_path
+
+
+def load_trainable_adapter(
+    model: nn.Module,
+    *,
+    path: str,
+    adapter_name: str = "default",
+    expected_rank: Optional[int] = None,
+    expected_alpha: Optional[int] = None,
+) -> None:
+    """Load a PEFT adapter into an already-injected trainable LoRA bank."""
+    from peft import set_peft_model_state_dict
+    from peft.tuners.lora import LoraLayer
+
+    if any(parameter.is_meta for parameter in model.parameters()):
+        raise NotImplementedError(
+            "load_trainable_adapter: initial adapter loading requires an eager trainable module; "
+            "disable meta_init_transformer."
+        )
+    if adapter_name not in adapter_names(model):
+        raise ValueError(f"load_trainable_adapter: adapter {adapter_name!r} has not been injected.")
+
+    config_path, weight_path = _resolve_adapter_checkpoint(path)
+    with open(config_path) as source:
+        adapter_cfg = json.load(source)
+    rank = int(adapter_cfg["r"])
+    alpha = int(adapter_cfg.get("lora_alpha", rank))
+    if expected_rank is not None and rank != int(expected_rank):
+        raise ValueError(f"load_trainable_adapter: checkpoint rank {rank} != configured rank {int(expected_rank)}.")
+    if expected_alpha is not None and alpha != int(expected_alpha):
+        raise ValueError(f"load_trainable_adapter: checkpoint alpha {alpha} != configured alpha {int(expected_alpha)}.")
+
+    if weight_path.endswith(".safetensors"):
+        from safetensors.torch import load_file
+
+        state_dict = load_file(weight_path)
+    else:
+        import torch
+
+        state_dict = torch.load(weight_path, map_location="cpu", weights_only=True)
+    if not isinstance(state_dict, dict) or not state_dict:
+        raise ValueError(f"load_trainable_adapter: {weight_path!r} contains no adapter tensors.")
+    lora_keys = [
+        key
+        for key in state_dict
+        if ".lora_A." in key or ".lora_B." in key or key.endswith((".lora_A.weight", ".lora_B.weight"))
+    ]
+    if not lora_keys:
+        raise ValueError(f"load_trainable_adapter: {weight_path!r} contains no LoRA A/B tensors.")
+    load_result = set_peft_model_state_dict(model, state_dict, adapter_name=adapter_name)
+    unexpected = list(getattr(load_result, "unexpected_keys", []) or [])
+    if unexpected:
+        raise ValueError(
+            f"load_trainable_adapter: {len(unexpected)} tensor(s) in {weight_path!r} matched no "
+            f"parameter (first: {unexpected[:3]})."
+        )
+    missing = []
+    for key in getattr(load_result, "missing_keys", None) or []:
+        parts = key.split(".")
+        for bank in ("lora_A", "lora_B", "lora_embedding_A", "lora_embedding_B"):
+            if bank in parts:
+                bank_index = parts.index(bank)
+                if bank_index + 1 < len(parts) and parts[bank_index + 1] == adapter_name:
+                    missing.append(key)
+                break
+    if missing:
+        raise ValueError(
+            f"load_trainable_adapter: {len(missing)} tensor(s) of adapter {adapter_name!r} are "
+            f"missing from {weight_path!r} (first: {missing[:3]})."
+        )
+
+    covered = [module for module in model.modules() if isinstance(module, LoraLayer) and adapter_name in module.lora_A]
+    if not covered:
+        raise ValueError(f"load_trainable_adapter: checkpoint {path!r} covered no LoRA layers.")
+    _activate(model, adapter_name)
+    _set_adapter_requires_grad(model, adapter_name, True)
+    if hasattr(model, "_hf_peft_config_loaded"):
+        model._hf_peft_config_loaded = True
+    if _current_rank() == 0:
+        logger.info(
+            "load_trainable_adapter: %r from %s — rank=%d, alpha=%d, %d layer(s)",
+            adapter_name,
+            path,
+            rank,
+            alpha,
+            len(covered),
+        )
 
 
 def inject_frozen_adapter(
@@ -348,6 +437,7 @@ __all__ = [
     "adapters_disabled",
     "inject_frozen_adapter",
     "inject_lora",
+    "load_trainable_adapter",
     "normalize_module_selection",
     "normalize_optional_module_selection",
     "resolve_target_modules_pattern",

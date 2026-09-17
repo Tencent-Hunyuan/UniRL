@@ -31,7 +31,12 @@ from unirl.train.backend.sharded_state import (
 )
 from unirl.train.configs import EmaFullConfig, EmaLoraConfig, FSDPConfig, LoraConfig, normalize_frozen_adapters
 from unirl.train.ema import EMA, Shadow, inject_mirror, inject_nft, make_decay_fn
-from unirl.train.lora import inject_frozen_adapter, inject_lora, resolve_target_modules_pattern
+from unirl.train.lora import (
+    inject_frozen_adapter,
+    inject_lora,
+    load_trainable_adapter,
+    resolve_target_modules_pattern,
+)
 from unirl.train.optim import build_lr_scheduler, build_optimizer
 from unirl.utils.distributed_utils import find_dtensor_mesh, init_gloo_group
 
@@ -163,6 +168,7 @@ class BaseFSDP2Backend(Remote):
                 task_type=ema_lora_cfg.task_type,
             )
         elif lora_cfg is not None:
+            initial_adapter_path = getattr(lora_cfg, "initial_adapter_path", None)
             inject_lora(
                 model,
                 rank=lora_cfg.rank,
@@ -173,7 +179,15 @@ class BaseFSDP2Backend(Remote):
                 dropout=lora_cfg.dropout,
                 bias=lora_cfg.bias,
                 task_type=lora_cfg.task_type,
+                reset_after_materialize=not bool(initial_adapter_path),
             )
+            if initial_adapter_path:
+                load_trainable_adapter(
+                    model,
+                    path=str(initial_adapter_path),
+                    expected_rank=lora_cfg.rank,
+                    expected_alpha=lora_cfg.alpha,
+                )
             # Frozen sibling adapters (e.g. OPD teachers): injected pre-wrap so FSDP
             # shards them and checkpoints stay symmetric; requires_grad=False keeps
             # them out of the optimizer and weight sync.
@@ -245,6 +259,7 @@ class BaseFSDP2Backend(Remote):
                 "dropout": active_lora.dropout,
                 "bias": active_lora.bias,
                 "task_type": active_lora.task_type,
+                "initial_adapter_path": getattr(active_lora, "initial_adapter_path", None),
             }
             if active_lora is not None
             else None

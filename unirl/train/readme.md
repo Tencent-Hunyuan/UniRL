@@ -73,6 +73,13 @@ in `backend/base.py`; a multi-update-capable algorithm sets
   away (the policy drifts into a degenerate reward-hack). An fp32-loaded model gets an
   fp32 master for free; a bf16 load needs `master_dtype: fp32` set explicitly. The
   ctor never warns.
+- **`LoraConfig.initial_adapter_path` is initialization, not resume** — it loads a
+  standard PEFT adapter folder into the trainable `default` bank before FSDP wrapping,
+  while optimizer/scheduler counters start at zero. Export a UniRL SFT checkpoint with
+  `python -m unirl.tools.export_adapter` first. Rank and alpha must match the new
+  recipe exactly, and the bundle must use eager transformer construction;
+  `meta_init_transformer` is rejected. Use trainer `load_dir` only to resume the same
+  run with optimizer and data-cursor state.
 - **The EP fused-expert layout registry is keyed by `config.model_type`, never by
   parameter-name suffix** (`backend/veomni/ep/experts.py`). HunyuanImage3's fused
   params end in `.experts.down_proj` too, but its `gate_and_up` halves are stored
