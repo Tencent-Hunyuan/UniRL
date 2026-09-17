@@ -316,6 +316,7 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
                 past_key_values=model_kwargs.get("past_key_values"),
                 attention_mask=model_kwargs.get("attention_mask"),
                 use_cache=True,
+                logits_to_keep=1,
             )
             with torch.no_grad():
                 out = transformer(**model_inputs, return_dict=True)

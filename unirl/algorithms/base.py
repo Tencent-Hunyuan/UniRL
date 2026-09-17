@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from unirl.types.conditions import Condition
     from unirl.types.sample import Part
     from unirl.types.segments.base import Segment
+    from unirl.types.segments.text import TextSegment
 
 
 def typed_conditions(
@@ -25,6 +26,30 @@ def typed_conditions(
     if conditions_cls is None:
         return conditions
     return conditions_cls.from_dict(dict(conditions))
+
+
+def _prepare_ar_logp_anchor(
+    *,
+    stage: Any,
+    conditions: Mapping[str, "Condition"],
+    segment: "TextSegment",
+    conditions_cls: Optional[Type[Any]],
+    old_logp_source: str,
+    sampling_temperature: float,
+) -> None:
+    """Freeze an AR rollout- or replay-sourced log-prob anchor."""
+    if segment.log_probs is None:
+        return
+    if old_logp_source != "replay":
+        return
+    if segment.rollout_log_probs is None:
+        segment.rollout_log_probs = segment.log_probs.detach().cpu().clone()
+    if segment.tokens is None or segment.tokens.shape[0] == 0:
+        return
+    typed_conds = typed_conditions(conditions, conditions_cls)
+    with torch.no_grad():
+        frozen = stage.replay(typed_conds, segment=segment, temperature=sampling_temperature)
+    segment.log_probs = frozen.detach().cpu()
 
 
 def gather_sde_field(

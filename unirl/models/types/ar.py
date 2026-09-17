@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any, Protocol, Tuple, TypeVar, runtime_checkable
+from contextlib import contextmanager
+from typing import Any, Iterator, Protocol, Tuple, TypeVar, runtime_checkable
 
 import torch
 
@@ -45,6 +46,23 @@ class ARStep(Protocol[B, C, S]):
     def step(self, model: B, conditions: C, state: S) -> Tuple[torch.Tensor, torch.Tensor, S]: ...
 
 
+@contextmanager
+def select_last_lm_head_row(lm_head: torch.nn.Module) -> Iterator[None]:
+    """Project only the final hidden-state row for a scoped model forward."""
+
+    def _select_hidden_states(_module: torch.nn.Module, args: Tuple[Any, ...]) -> Tuple[Any, ...]:
+        if not args or not isinstance(args[0], torch.Tensor) or args[0].ndim != 3:
+            raise ValueError("select_last_lm_head_row: expected lm_head input shape [B, L, H]")
+        hidden_states = args[0]
+        return (hidden_states[:, -1:, :], *args[1:])
+
+    handle = lm_head.register_forward_pre_hook(_select_hidden_states)
+    try:
+        yield
+    finally:
+        handle.remove()
+
+
 def left_pad_prompt(
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
@@ -73,4 +91,4 @@ def left_pad_prompt(
     return lp_ids, lp_mask
 
 
-__all__ = ["ARSamplingParams", "ARStage", "ARStep", "left_pad_prompt"]
+__all__ = ["ARSamplingParams", "ARStage", "ARStep", "left_pad_prompt", "select_last_lm_head_row"]

@@ -108,7 +108,7 @@ class ToolEnvironment:
             sid = uuid4().hex
             tool.session_start(sid, context)
             sessions[tool.name] = sid
-        control = dict(root.control or {})
+        control = dict(root.control)
         control["tool_sessions"] = sessions
         return Sample.request(_part_with_field(root, "control", control))
 
@@ -120,7 +120,7 @@ class ToolEnvironment:
             raise TypeError(f"ToolEnvironment.step expects a Texts frontier primitive; got {type(frontier).__name__}")
         texts = frontier.texts
 
-        sessions = (sample.parts[0].control or {}).get("tool_sessions", {})
+        sessions = sample.parts[0].control.get("tool_sessions", {})
         calls = [parse_tool_call(t) for t in texts]
         results: List[Optional[str]] = [self._run(c, sessions) if c is not None else None for c in calls]
         per_sample_done = [c is None for c in calls]
@@ -160,7 +160,7 @@ class ToolEnvironment:
         """Guaranteed teardown: end every open tool session for this trajectory."""
         if not self._stateful_tools:
             return
-        sessions = (sample.parts[0].control or {}).get("tool_sessions", {}) if sample.parts else {}
+        sessions = sample.parts[0].control.get("tool_sessions", {}) if sample.parts else {}
         if not sessions:
             return
         self._end_sessions(sessions)

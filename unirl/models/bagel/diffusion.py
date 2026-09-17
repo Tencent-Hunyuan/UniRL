@@ -387,7 +387,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
                 if log_prob is not None:
                     sde_logp_list.append(log_prob.to(dtype=self.logprob_dtype))
                     if prev_mean is not None:
-                        sde_means_list.append(prev_mean.detach().to(dtype=self.trajectory_dtype))
+                        sde_means_list.append(prev_mean.detach())
 
         positions_collected = [p for p, _ in stored_pairs]
         latents_stacked = torch.stack([t for _, t in stored_pairs], dim=0).unsqueeze(0)
@@ -469,7 +469,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
                 prev_sample_means.append(prev_mean)
 
         log_probs_t = torch.stack(log_probs, dim=0).unsqueeze(0).to(dtype=self.logprob_dtype)
-        means_t = torch.stack(prev_sample_means, dim=0).unsqueeze(0).to(dtype=self.trajectory_dtype)
+        means_t = torch.stack(prev_sample_means, dim=0).unsqueeze(0)
         return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
 
     def build_forward_kwargs(

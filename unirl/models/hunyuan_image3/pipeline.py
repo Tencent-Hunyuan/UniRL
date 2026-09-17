@@ -135,7 +135,7 @@ class HunyuanImage3Pipeline(Pipeline):
         """Dispatch to the per-task generate function in ``modes/``."""
         from .modes import i2t, it2i, t2i, t2t, t2ti
 
-        task = (sample.parts[0].control or {}).get("task", "t2i")
+        task = sample.parts[0].control.get("task", "t2i")
         if task == "t2t":
             return t2t.generate(self, sample)
         if task == "i2t":

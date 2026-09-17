@@ -14,6 +14,7 @@ from .base import (
     AlgorithmStepResult,
     BaseAlgorithmConfig,
     StageAlgorithm,
+    _prepare_ar_logp_anchor,
     rollout_replay_logp_absdiff,
     typed_conditions,
 )
@@ -124,7 +125,7 @@ class CPPO(StageAlgorithm):
     """CPPO (Binary-TV) for AR token-level policies — the paper's proposed method."""
 
     supports_multi_update = True
-    anchor_fields = ("log_probs",)
+    anchor_fields = ("log_probs", "rollout_log_probs")
 
     @property
     def recomputes_anchor(self) -> bool:
@@ -177,14 +178,14 @@ class CPPO(StageAlgorithm):
         segment: "TextSegment",
     ) -> None:
         """Freeze the ``pi_old`` / ``mu`` anchor before the ``num_updates_per_batch`` loop, per ``old_logp_source``."""
-        if self.old_logp_source != "replay":
-            return
-        if segment.tokens is None or segment.log_probs is None or int(segment.tokens.shape[0]) == 0:
-            return
-        typed_conds = typed_conditions(conditions, self.conditions_cls)
-        with torch.no_grad():
-            frozen = self.stage.replay(typed_conds, segment=segment, temperature=self.sampling_temperature)
-        segment.log_probs = frozen.detach().cpu()
+        _prepare_ar_logp_anchor(
+            stage=self.stage,
+            conditions=conditions,
+            segment=segment,
+            conditions_cls=self.conditions_cls,
+            old_logp_source=self.old_logp_source,
+            sampling_temperature=self.sampling_temperature,
+        )
 
     def compute_loss_and_backward(
         self,
@@ -230,10 +231,13 @@ class CPPO(StageAlgorithm):
             loss = loss_per_elem.mean()
         (loss * loss_scale).backward()
 
+        rollout_logp = (segment.rollout_log_probs if segment.rollout_log_probs is not None else segment.log_probs).to(
+            dtype=new_logp.dtype, device=new_logp.device
+        )
         metrics: Dict[str, Any] = {
             "policy_loss": float(loss.detach().item()),
             "cppo_delta": self.cppo_delta,
-            **rollout_replay_logp_absdiff(new_logp, old_logp),
+            **rollout_replay_logp_absdiff(new_logp, rollout_logp),
             **{k: float(v.item()) for k, v in ratio_metrics.items()},
         }
         return AlgorithmStepResult(

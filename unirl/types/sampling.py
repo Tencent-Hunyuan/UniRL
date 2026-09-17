@@ -5,7 +5,7 @@ from __future__ import annotations
 from abc import ABC
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Set
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Sequence, Set
 
 from unirl.config.require import require
 
@@ -109,6 +109,8 @@ class DiffusionSamplingParams(BaseSamplingParams):
 @dataclass
 class ARSamplingParams(BaseSamplingParams):
     """AR (autoregressive) sampling parameters for LLM-based PE generation."""
+
+    emits_fixed_length: ClassVar[bool] = False
 
     temperature: float = 0.7
     max_new_tokens: int = 512
