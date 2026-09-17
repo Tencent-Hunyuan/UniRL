@@ -48,3 +48,6 @@ configs/service.yaml
 
 # Runtime logs
 logs/
+
+# Generated benchmark results.
+docs/benchmarks/raw/
