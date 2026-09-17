@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from unirl.models.qwen_image.vae import QwenImageVAEDecodeStage
+from unirl.models.qwen_image.vae import QwenImageVAEDecodeStage, QwenImageVAEEncodeStage
 from unirl.models.types.pipeline import Pipeline
 from unirl.sde.kernels import FlowSDEStrategy, StepStrategy
 from unirl.types.noise_recipe import NoiseRecipe
-from unirl.types.primitives import Images, ImageSets, Texts, require_single_images
+from unirl.types.primitives import ImagePrimitive, Images, ImageSets, Texts, as_image_sets
 from unirl.types.sample import Sample
 from unirl.types.sampling import DiffusionSamplingParams
 
@@ -66,6 +66,7 @@ class QwenImageEditPlusPipeline(Pipeline):
             )
         self.diffusion = diffusion
         self.vae_encode = vae_encode if vae_encode is not None else QwenImageEditPlusVAEEncodeStage(bundle)
+        self.target_vae_encode = QwenImageVAEEncodeStage(bundle)
         self.vae_decode = vae_decode if vae_decode is not None else QwenImageVAEDecodeStage(bundle)
         self.shift = shift
 
@@ -136,10 +137,10 @@ class QwenImageEditPlusPipeline(Pipeline):
         texts: Texts,
         *,
         negatives: Optional[Texts] = None,
-        images: Optional[Images] = None,
+        images: Optional[ImagePrimitive] = None,
         guidance_scale: float = 1.0,
     ) -> QwenImageEditPlusConditions:
-        """Build the text side of Edit-Plus conditions."""
+        """Build Edit-Plus text and ordered source-image conditions."""
         if negatives is not None and len(negatives.texts) != len(texts.texts):
             raise ValueError(
                 f"QwenImageEditPlusPipeline.build_conditions: negative_text length "
@@ -152,10 +153,26 @@ class QwenImageEditPlusPipeline(Pipeline):
             )
         if negatives is None and float(guidance_scale) > 1.0:
             negatives = Texts(texts=[" "] * len(texts.texts))
-        embed_images = images if self.use_condition_image_prompt else None
+        references = as_image_sets(images) if images is not None else None
+        if references is not None:
+            if len(references) != len(texts):
+                raise ValueError(
+                    "QwenImageEditPlusPipeline.build_conditions: image-set batch "
+                    f"{len(references)} != text batch {len(texts)}."
+                )
+            counts = references.counts.tolist()
+            if any(int(count) < 1 for count in counts):
+                raise ValueError(
+                    "QwenImageEditPlusPipeline.build_conditions requires at least one source image per row; "
+                    f"counts={counts}."
+                )
+        embed_images = references if self.use_condition_image_prompt else None
         text_cond = self.text_embed.embed(texts, embed_images)
         negative_text_cond = self.text_embed.embed(negatives, embed_images) if negatives is not None else None
-        return QwenImageEditPlusConditions(text=text_cond, negative_text=negative_text_cond)
+        conditions = QwenImageEditPlusConditions(text=text_cond, negative_text=negative_text_cond)
+        if references is not None:
+            conditions.image_latent = self.vae_encode.encode(references)
+        return conditions
 
     def generate(self, sample: Sample) -> Sample:
         """Run Edit-Plus text+image → image and fill the diffusion frontier."""
@@ -191,22 +208,17 @@ class QwenImageEditPlusPipeline(Pipeline):
                 f"primitive (Edit-Plus is edit-only), got {len(image_inputs)}"
             )
         texts = text_inputs[0]
-        images = require_single_images(
-            image_inputs[0],
-            context="QwenImageEditPlusPipeline.generate",
-        )
-        if len(images) != len(texts.texts):
+        references = as_image_sets(image_inputs[0])
+        if len(references) != len(texts.texts):
             raise ValueError(
-                f"QwenImageEditPlusPipeline.generate: image batch {len(images)} != text batch {len(texts.texts)}"
+                f"QwenImageEditPlusPipeline.generate: image batch {len(references)} != text batch {len(texts.texts)}"
             )
 
         edit_conds = self.build_conditions(
             texts,
-            images=images,
+            images=references,
             guidance_scale=float(params.guidance_scale),
         )
-        image_latent = self.vae_encode.encode(images)
-        edit_conds.image_latent = image_latent
 
         schedule = params.sigmas.to(self.bundle.device)
         initial_latents = NoiseRecipe.from_sample(sample).resolve()

@@ -11,7 +11,7 @@ from unirl.rollout.engine.sglang_diffusion import utils
 from unirl.rollout.engine.sglang_diffusion.adapters.base import register_adapter
 from unirl.rollout.engine.sglang_diffusion.adapters.qwen_image import QwenImageAdapter
 from unirl.rollout.engine.sglang_diffusion.backends import RawResult
-from unirl.types.primitives import Texts, require_single_images
+from unirl.types.primitives import Texts, as_image_sets
 from unirl.types.sample import Sample
 from unirl.types.sampling import DiffusionSamplingParams
 
@@ -36,15 +36,24 @@ class QwenImageEditPlusAdapter(QwenImageAdapter):
         gen_part = sample.frontier_gen_part(DiffusionSamplingParams)
         prompts = list(text_turns[0].texts)
         unique_prompts, k = utils.deexpand_prompts_from_groups(prompts, list(gen_part.group_ids))
-        images_prim = require_single_images(
-            image_batches[0],
-            context=f"{self.model_family}.build_prompts",
-        )
-        pil_images = images_prim.to_pils()
-        unique_pils = utils.first_per_group(pil_images, list(gen_part.group_ids)) if k > 1 else pil_images
+        image_sets = as_image_sets(image_batches[0])
+        if len(image_sets) != len(prompts):
+            raise ValueError(
+                f"{self.model_family}.build_prompts: image row count {len(image_sets)} != prompt count {len(prompts)}."
+            )
+        pil_rows = image_sets.to_pil_rows()
+        counts = [len(row) for row in pil_rows]
+        if any(count < 1 for count in counts):
+            raise ValueError(f"{self.model_family}.build_prompts requires non-empty image rows; counts={counts}.")
+        unique_rows = utils.first_per_group(pil_rows, list(gen_part.group_ids)) if k > 1 else pil_rows
+        condition_image: Any
+        if len(unique_rows) > 1:
+            condition_image = unique_rows
+        else:
+            condition_image = unique_rows[0][0] if len(unique_rows[0]) == 1 else unique_rows[0]
         out: Dict[str, Any] = {
             "prompt": unique_prompts if len(unique_prompts) > 1 else unique_prompts[0],
-            "condition_image": unique_pils if len(unique_pils) > 1 else unique_pils[0],
+            "condition_image": condition_image,
         }
         if k > 1:
             out["num_outputs_per_prompt"] = k
@@ -56,11 +65,11 @@ class QwenImageEditPlusAdapter(QwenImageAdapter):
         cond_dict["image_latent"] = QwenImageEditPlusLatentCondition(latents=self._collect_image_latents(results))
         return cond_dict
 
-    def _collect_image_latents(self, results: List[RawResult]) -> List[torch.Tensor]:
-        """Collect per-result image latents without forcing a shared grid."""
+    def _collect_image_latents(self, results: List[RawResult]) -> List[List[torch.Tensor]]:
+        """Rebuild ordered per-result source latents without forcing shared grids."""
         from unirl.models.qwen_image.diffusion import _unpack_latents
 
-        tensors: List[torch.Tensor] = []
+        rows: List[List[torch.Tensor]] = []
         for r in results:
             packed_list = getattr(r, "image_latent", None)
             sizes_list = getattr(r, "image_latent_sizes", None)
@@ -74,16 +83,29 @@ class QwenImageEditPlusAdapter(QwenImageAdapter):
                 )
             packed = packed_list[0]
             sizes = sizes_list[0]
-            if len(sizes) != 1:
-                raise NotImplementedError(
-                    f"build_condition: multi-image Edit-Plus not supported (got {len(sizes)} source images per prompt)."
+            if not sizes:
+                raise RuntimeError("build_condition: Edit-Plus rollout returned an empty source-image size list.")
+            offset = 0
+            row: List[torch.Tensor] = []
+            for vae_width, vae_height in sizes:
+                latent_h = int(vae_height) // _VAE_SCALE_FACTOR
+                latent_w = int(vae_width) // _VAE_SCALE_FACTOR
+                token_count = (latent_h // 2) * (latent_w // 2)
+                chunk = packed[:, offset : offset + token_count]
+                if int(chunk.shape[1]) != token_count:
+                    raise RuntimeError(
+                        "build_condition: captured Edit-Plus image_latent is shorter than vae_image_sizes "
+                        f"requires at source {len(row)} ({int(chunk.shape[1])} != {token_count})."
+                    )
+                row.append(_unpack_latents(chunk, latent_h=latent_h, latent_w=latent_w).squeeze(0))
+                offset += token_count
+            if offset != int(packed.shape[1]):
+                raise RuntimeError(
+                    "build_condition: captured Edit-Plus image_latent has trailing tokens after splitting "
+                    f"{len(sizes)} sources ({int(packed.shape[1]) - offset} extra)."
                 )
-            vae_width, vae_height = sizes[0]
-            latent_h = int(vae_height) // _VAE_SCALE_FACTOR
-            latent_w = int(vae_width) // _VAE_SCALE_FACTOR
-            spatial = _unpack_latents(packed, latent_h=latent_h, latent_w=latent_w)
-            tensors.append(spatial.squeeze(0))
-        return tensors
+            rows.append(row)
+        return rows
 
 
 __all__ = ["QwenImageEditPlusAdapter"]

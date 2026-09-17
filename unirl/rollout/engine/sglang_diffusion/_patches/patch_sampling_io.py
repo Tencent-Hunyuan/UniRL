@@ -56,6 +56,9 @@ def patch_sampling_io() -> None:
     # Preprocess PIL-only requests so Edit-Plus receives VAE image sizes.
     _wrap_input_validation_condition_image()
 
+    # Reject multi-reference text conditions that exceed the requested replay limit.
+    _wrap_image_encoding_sequence_limit()
+
 
 def _install_json_safe_tensor_guard(sp_mod) -> None:
     """Make ``sampling_params._json_safe`` tolerate ``torch.Tensor`` values."""
@@ -108,13 +111,14 @@ def _wrap_validate_with_pipeline_config(SamplingParams) -> None:
 _GEN_SENTINEL = "_unirl_diff_gen_index"
 
 
-def _is_per_prompt_condition_image(ci) -> bool:
-    """Whether ``condition_image`` is per-prompt: nested for multi-ref, or flat with more than one prompt."""
+def _is_per_prompt_condition_image(ci, prompt) -> bool:
+    """Recognize nested rows and legacy flat one-image-per-prompt lists."""
     if not isinstance(ci, list) or not ci:
         return False
     if all(isinstance(entry, list) for entry in ci):
         return True
-    return len(ci) > 1
+    prompt_count = len(prompt) if isinstance(prompt, list) else 1
+    return prompt_count > 1 and len(ci) == prompt_count
 
 
 def _wrap_diff_generator_generate() -> None:
@@ -133,8 +137,9 @@ def _wrap_diff_generator_generate() -> None:
         return
 
     def generate(self, sampling_params_kwargs=None, *args, **kwargs):
-        ci = (sampling_params_kwargs or {}).get("condition_image")
-        if _is_per_prompt_condition_image(ci):
+        sampling_kwargs = sampling_params_kwargs or {}
+        ci = sampling_kwargs.get("condition_image")
+        if _is_per_prompt_condition_image(ci, sampling_kwargs.get("prompt")):
             _local.condition_image_per_prompt = ci
             _local.condition_image_idx = 0
         else:
@@ -152,6 +157,7 @@ def _wrap_diff_generator_generate() -> None:
 
 
 _IVL_SENTINEL = "_unirl_ivl_cond_img"
+_IMAGE_ENCODING_LIMIT_SENTINEL = "_unirl_image_encoding_limit"
 
 
 def _wrap_input_validation_condition_image() -> None:
@@ -178,6 +184,7 @@ def _wrap_input_validation_condition_image() -> None:
         if condition_image is None or image_path is not None or vae_image_sizes is not None:
             return batch
 
+        # Upstream uses the final ref for canvas sizing but preprocesses every list item into VAE inputs.
         img = condition_image[-1] if isinstance(condition_image, list) else condition_image
         condition_image_width = img.width
         condition_image_height = img.height
@@ -192,6 +199,53 @@ def _wrap_input_validation_condition_image() -> None:
 
     setattr(forward, _IVL_SENTINEL, True)
     IVL.forward = forward
+
+
+def _wrap_image_encoding_sequence_limit() -> None:
+    """Reject overlong multi-reference Qwen embeddings before denoising."""
+    try:
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.image_encoding import (
+            ImageEncodingStage,
+        )
+    except ImportError:
+        return  # pragma: no cover - upstream module missing
+
+    orig = ImageEncodingStage.__dict__.get("forward")
+    if orig is None or getattr(orig, _IMAGE_ENCODING_LIMIT_SENTINEL, False):
+        return
+
+    def forward(self, batch, server_args, __orig=orig):
+        batch = __orig(self, batch, server_args)
+        limit = getattr(batch, "max_sequence_length", None)
+        condition_images = getattr(batch, "condition_image", None)
+        reference_count = (
+            len(condition_images) if isinstance(condition_images, list) else int(condition_images is not None)
+        )
+        if limit is None or reference_count <= 1:
+            return batch
+
+        lengths = []
+        for masks_name, embeds_name in (
+            ("prompt_embeds_mask", "prompt_embeds"),
+            ("negative_prompt_embeds_mask", "negative_prompt_embeds"),
+        ):
+            masks = getattr(batch, masks_name, None)
+            embeds = getattr(batch, embeds_name, None)
+            if isinstance(masks, (list, tuple)):
+                lengths.extend(int(mask.sum(dim=-1).max().item()) for mask in masks if mask is not None)
+            elif isinstance(embeds, (list, tuple)):
+                lengths.extend(
+                    int(embed.shape[1]) for embed in embeds if embed is not None and getattr(embed, "ndim", 0) >= 2
+                )
+        if lengths and max(lengths) > int(limit):
+            raise ValueError(
+                f"Qwen multi-reference prompt length {max(lengths)} exceeds max_sequence_length={int(limit)} "
+                f"for {reference_count} references; raise the limit or use fewer references."
+            )
+        return batch
+
+    setattr(forward, _IMAGE_ENCODING_LIMIT_SENTINEL, True)
+    ImageEncodingStage.forward = forward
 
 
 def _make_dataclass_field(name: str, default, type_str: str):
@@ -331,6 +385,8 @@ def _wrap_prepare_request(utils_mod, SamplingParams) -> None:
                         f"mismatch. This is a UniRL patch bug."
                     )
                 condition_image = stash[idx]
+                if isinstance(condition_image, list) and len(condition_image) == 1:
+                    condition_image = condition_image[0]
                 _local.condition_image_idx = idx + 1
             req.condition_image = condition_image
 

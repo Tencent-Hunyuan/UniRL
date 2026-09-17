@@ -45,14 +45,17 @@ class QwenImageEditPlusDiffusionStep(QwenImageDiffusionStep):
                 f"{len(image_latent_cond.latents)} != sample batch {int(sample.shape[0])}"
             )
 
-        groups: Dict[tuple[int, ...], List[int]] = {}
-        for index, latent in enumerate(image_latent_cond.latents):
-            if latent.ndim != 3:
+        groups: Dict[tuple[tuple[int, ...], ...], List[int]] = {}
+        for index, row in enumerate(image_latent_cond.latents):
+            if not row:
+                raise ValueError(f"QwenImageEditPlusDiffusionStep.predict_noise: source-image row {index} is empty.")
+            bad_shapes = [tuple(latent.shape) for latent in row if latent.ndim != 3]
+            if bad_shapes:
                 raise ValueError(
                     "QwenImageEditPlusDiffusionStep.predict_noise: each source-image latent "
-                    f"must be [C, H, W], got {tuple(latent.shape)}"
+                    f"must be [C, H, W], got {bad_shapes} in row {index}."
                 )
-            groups.setdefault(tuple(latent.shape), []).append(index)
+            groups.setdefault(tuple(tuple(latent.shape) for latent in row), []).append(index)
 
         result = None
         for indices in groups.values():
@@ -63,13 +66,12 @@ class QwenImageEditPlusDiffusionStep(QwenImageDiffusionStep):
                 if sigma.dim() > 0 and int(sigma.shape[0]) == int(sample.shape[0])
                 else sigma
             )
-            sub_image_latents = torch.stack(sub_conditions.image_latent.latents, dim=0)
             prediction = self._predict_noise_uniform(
                 model,
                 sample.index_select(0, batch_indices),
                 sub_sigma,
                 sub_conditions,
-                sub_image_latents,
+                sub_conditions.image_latent.latents,
                 guidance_scale=guidance_scale,
                 latent_h=latent_h,
                 latent_w=latent_w,
@@ -86,7 +88,7 @@ class QwenImageEditPlusDiffusionStep(QwenImageDiffusionStep):
         sample: torch.Tensor,
         sigma: torch.Tensor,
         conditions: QwenImageEditPlusConditions,
-        image_latents: torch.Tensor,
+        image_latent_rows: List[List[torch.Tensor]],
         *,
         guidance_scale: float,
         latent_h: int,
@@ -111,12 +113,21 @@ class QwenImageEditPlusDiffusionStep(QwenImageDiffusionStep):
         noise_seq_len = int(packed.shape[1])
 
         # --- Source-image latent concat (Edit-Plus extension) -------------
-        image_latents = image_latents.to(device=device, dtype=dtype)
-        img_latent_h = int(image_latents.shape[-2])
-        img_latent_w = int(image_latents.shape[-1])
-        image_packed = _pack_latents(image_latents)
+        packed_rows = []
+        img_shapes = []
+        for row in image_latent_rows:
+            row_packed = []
+            row_shapes = [(1, latent_h // 2, latent_w // 2)]
+            for image_latent in row:
+                image_latent = image_latent.to(device=device, dtype=dtype).unsqueeze(0)
+                img_latent_h = int(image_latent.shape[-2])
+                img_latent_w = int(image_latent.shape[-1])
+                row_packed.append(_pack_latents(image_latent))
+                row_shapes.append((1, img_latent_h // 2, img_latent_w // 2))
+            packed_rows.append(torch.cat(row_packed, dim=1))
+            img_shapes.append(row_shapes)
+        image_packed = torch.cat(packed_rows, dim=0)
         packed = torch.cat([packed, image_packed], dim=1)
-        img_shapes = [[(1, latent_h // 2, latent_w // 2), (1, img_latent_h // 2, img_latent_w // 2)]] * batch_size
 
         if sigma.dim() == 0:
             timestep = sigma.unsqueeze(0).expand(batch_size).to(device, dtype=dtype)
