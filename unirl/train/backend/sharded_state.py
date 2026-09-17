@@ -269,14 +269,6 @@ def _to_cpu_state_dict(state_dict: StateDict) -> StateDict:
     return converted
 
 
-def _is_cold_adamw(optimizer: torch.optim.Optimizer) -> bool:
-    return (
-        isinstance(optimizer, torch.optim.AdamW)
-        and not optimizer.state
-        and all(param.grad is None for group in optimizer.param_groups for param in group["params"])
-    )
-
-
 def _export_optimizer_state_dict(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -286,7 +278,11 @@ def _export_optimizer_state_dict(
     """Export without advancing a cold AdamW clock."""
     from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
 
-    cold = _is_cold_adamw(optimizer)
+    cold = (
+        isinstance(optimizer, torch.optim.AdamW)
+        and not optimizer.state
+        and all(param.grad is None for group in optimizer.param_groups for param in group["params"])
+    )
     try:
         try:
             exported = dict(get_optimizer_state_dict(model, optimizer, options=options))
@@ -296,8 +292,7 @@ def _export_optimizer_state_dict(
             state = exported.get("state")
             if isinstance(state, dict):
                 for entry in state.values():
-                    step = entry["step"]
-                    entry["step"] = torch.zeros_like(step) if isinstance(step, torch.Tensor) else 0
+                    entry["step"] = torch.zeros_like(entry["step"])
         return exported
     finally:
         if cold:
