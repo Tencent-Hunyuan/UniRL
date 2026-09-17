@@ -24,7 +24,6 @@ stage_args:
     stage_type: diffusion
     runtime:
       devices: "4,5,6,7"
-      max_batch_size: 1
     engine_args:
       max_num_seqs: 1
       model_stage: dit

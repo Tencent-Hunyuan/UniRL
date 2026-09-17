@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import socket
 from functools import partial
 from typing import Any, Dict, Optional, Tuple
 
@@ -10,6 +11,8 @@ import torch
 from torch import nn
 
 from unirl.config.require import require
+from unirl.train.configs import normalize_fsdp_mode, resolve_fsdp_mesh_shape
+from unirl.utils.distributed_utils import find_dtensor_mesh
 from unirl.utils.dtypes import parse_torch_dtype
 
 logger = logging.getLogger(__name__)
@@ -49,14 +52,18 @@ def fsdp_wrap(
     param_dtype: str = "bf16",
     cpu_offload: bool = False,
     mixed_precision: bool = True,
+    cast_forward_inputs: bool = True,
     fsdp_mode: str = "full",
+    hsdp_shard_size: int,
     reshard_after_forward: bool = True,
     forward_prefetch: bool = False,
     activation_checkpointing: bool = False,
     ac_wrap_order: str = "outside",
     use_torch_compile: bool = False,
     master_dtype: Optional[str] = None,
+    master_params: Tuple[torch.Tensor, ...] = (),
     root_wrap: bool = True,
+    copy_engine_all_gather: bool = False,
 ) -> None:
     """Apply FSDP2 wrapping to the model.  No handle returned — DTensors"""
     from torch.distributed.fsdp import (
@@ -83,11 +90,13 @@ def fsdp_wrap(
         fsdp_kwargs["mp_policy"] = MixedPrecisionPolicy(
             param_dtype=target_dtype,
             reduce_dtype=torch.float32,
+            cast_forward_inputs=bool(cast_forward_inputs),
         )
     if cpu_offload:
         fsdp_kwargs["offload_policy"] = CPUOffloadPolicy()
 
-    mesh = _create_device_mesh(fsdp_mode)
+    mode = normalize_fsdp_mode(fsdp_mode)
+    mesh = _create_device_mesh(mode, hsdp_shard_size=hsdp_shard_size)
     if mesh is not None:
         fsdp_kwargs["mesh"] = mesh
 
@@ -96,11 +105,12 @@ def fsdp_wrap(
     block_instances = _enumerate_block_instances(model, block_class_names)
 
     casts = 0
-    # Keep trainable masters at master_dtype; bf16 pre-casting can erase small optimizer steps.
+    master_param_ids = {id(p) for p in master_params}
+    # Keep trainable and EMA shadow masters at master_dtype.
     for p in model.parameters():
         if isinstance(p, DTensor) or not p.dtype.is_floating_point:
             continue  # already-wrapped params and ints never cast
-        if trainable_dtype is not None and p.requires_grad:
+        if trainable_dtype is not None and (p.requires_grad or id(p) in master_param_ids):
             dst = trainable_dtype
         elif not mixed_precision:
             dst = target_dtype
@@ -169,6 +179,25 @@ def fsdp_wrap(
                 "DP-synced and replicas drift. Enable training.fsdp.root_wrap or freeze them.",
             )
 
+    if copy_engine_all_gather:
+        import torch.distributed as dist
+
+        shard_group = mesh.get_group("dp_shard") if mesh is not None else None
+        hosts = [None] * dist.get_world_size(shard_group)
+        dist.all_gather_object(hosts, socket.gethostname(), group=shard_group)
+        require(
+            len(set(hosts)) == 1,
+            "FSDP copy-engine all-gather requires each shard group to stay within one node; "
+            f"this group spans hosts {sorted(set(hosts))}. Use hybrid mode with a node-local hsdp_shard_size.",
+        )
+        fsdp_modules = tuple(module for module in model.modules() if isinstance(module, FSDPModule))
+        require(fsdp_modules, "FSDP copy-engine all-gather requires at least one fully-sharded module.")
+        for fsdp_module in fsdp_modules:
+            fsdp_module.set_symm_mem_for_comm("NCCL")
+
+    if mode == "hybrid":
+        _validate_hsdp_mesh(model, expected_mesh=mesh)
+
     if forward_prefetch:
         if not isinstance(model, FSDPModule):
             raise ValueError(
@@ -184,16 +213,20 @@ def fsdp_wrap(
         for layer in block_instances:
             layer.forward = torch.compile(layer.forward)
 
+    # Rollout may temporarily retain unsharded params across cached decode.
+    model._unirl_fsdp_reshard_after_forward = fsdp_kwargs["reshard_after_forward"]
+
     if _current_rank() == 0:
         logger.info(
             "fsdp_wrap: wrapped %d block(s) of class %r "
-            "(%s, cpu_offload=%s, mixed_precision=%s, reshard=%s, prefetch=%s, "
+            "(%s, cpu_offload=%s, mixed_precision=%s, cast_forward_inputs=%s, reshard=%s, prefetch=%s, "
             "ac=%s, compile=%s, dtype_casts=%d, master_dtype=%s, root_wrap=%s)",
             len(block_instances),
             tuple(block_class_names),
             fsdp_mode,
             cpu_offload,
             mixed_precision,
+            cast_forward_inputs,
             reshard_after_forward,
             forward_prefetch,
             activation_checkpointing,
@@ -234,42 +267,47 @@ def _enumerate_block_instances(
     return tuple(m for _, m in model.named_modules() if type(m).__name__ in names)
 
 
-# Parameter shard degree: full = world default, hybrid = 8 ranks, no_shard = 1 rank (DDP).
-_SHARD_DEGREE: Dict[str, Optional[int]] = {"full": None, "hybrid": 8, "no_shard": 1}
-
-
-def _create_device_mesh(fsdp_mode: str) -> Optional[object]:
-    mode = str(fsdp_mode).strip().lower()
-    require(
-        mode in _SHARD_DEGREE,
-        f"training.fsdp.fsdp_mode={fsdp_mode!r} is not one of {sorted(_SHARD_DEGREE)}; "
-        "an unrecognized mode would silently fall back to full sharding.",
-    )
-    shard_size = _SHARD_DEGREE[mode]
-    if shard_size is None:
-        return None
-
+def _create_device_mesh(fsdp_mode: str, *, hsdp_shard_size: int) -> Optional[object]:
     import torch.distributed as dist
 
-    if not (dist.is_available() and dist.is_initialized()):
-        return None
-
-    world_size = dist.get_world_size()
-    # A world that the shard degree cannot split (including single-rank
-    # ``no_shard``) already matches the default 1D mesh.
-    if world_size <= shard_size or world_size % shard_size != 0:
+    require(
+        dist.is_available() and dist.is_initialized(),
+        "fsdp_wrap requires an initialized default process group.",
+    )
+    mesh_shape = resolve_fsdp_mesh_shape(
+        fsdp_mode,
+        world_size=dist.get_world_size(),
+        hsdp_shard_size=hsdp_shard_size,
+    )
+    if mesh_shape is None:
         return None
 
     from torch.distributed.device_mesh import init_device_mesh
 
-    replicate_size = world_size // shard_size
     mesh = init_device_mesh(
         "cuda",
-        (replicate_size, shard_size),
+        mesh_shape,
         mesh_dim_names=("dp_replicate", "dp_shard"),
     )
-    logger.info("fsdp_wrap: %s mesh dp_replicate=%d x dp_shard=%d", mode, replicate_size, shard_size)
+    if _current_rank() == 0:
+        logger.info("fsdp_wrap: %s mesh dp_replicate=%d x dp_shard=%d", fsdp_mode, *mesh_shape)
     return mesh
+
+
+def _validate_hsdp_mesh(model: nn.Module, *, expected_mesh: object) -> None:
+    """Confirm FSDP installed the requested HSDP mesh, rather than silently sharding flat."""
+    actual_mesh = find_dtensor_mesh(model)
+    require(
+        actual_mesh is not None,
+        "fsdp_wrap: hybrid mode produced no DTensor parameters; HSDP was not installed.",
+    )
+    expected = (tuple(expected_mesh.mesh_dim_names or ()), tuple(int(size) for size in expected_mesh.shape))
+    actual = (tuple(actual_mesh.mesh_dim_names or ()), tuple(int(size) for size in actual_mesh.shape))
+    require(
+        actual == expected,
+        f"fsdp_wrap: hybrid mode requested mesh {expected[0]}={expected[1]}, "
+        f"but the wrapped parameters use {actual[0]}={actual[1]}.",
+    )
 
 
 def _current_rank() -> int:

@@ -13,6 +13,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
+from unirl.train.configs import FSDPConfig, resolve_fsdp_mesh_shape
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample
 from unirl.trainer.eval_suites import EvalRewardSuite, build_eval_suites
@@ -58,7 +59,7 @@ def _validate_prompt_tree_dp_geometry(
             )
 
 
-def _validate_diffusion_dp_geometry(
+def _validate_dp_geometry(
     *,
     batch_size: int,
     samples_per_prompt: int,
@@ -102,9 +103,78 @@ def _validate_diffusion_dp_geometry(
         )
 
 
+def _preflight_trainside_geometry(
+    *,
+    num_devices: int,
+    layout: str,
+    reward_fraction: float,
+    batch_size: int,
+    samples_per_prompt: int,
+    num_updates_per_batch: int,
+    prompt_local_rollout: bool,
+    has_reward: bool,
+    backend_cfg: DictConfig,
+    rollout_cfg: DictConfig,
+) -> None:
+    """Reject statically-known trainside DP geometry before constructing heavy model roles."""
+    rollout_target = str(rollout_cfg.get("_target_", ""))
+    if not rollout_target.endswith(".TrainsideRolloutEngine") or layout == "separate":
+        return
+
+    shared_devices_f = (1.0 - reward_fraction) * num_devices
+    shared_devices = int(round(shared_devices_f))
+    if abs(shared_devices_f - shared_devices) > 1e-9:
+        raise ValueError(
+            f"Static trainside geometry: reward_fraction={reward_fraction} of num_devices={num_devices} "
+            f"leaves {shared_devices_f} shared train/rollout devices, not an integer."
+        )
+
+    # The recipe carries a raw DictConfig, so unset keys fall back to the one
+    # place the defaults live rather than to literals repeated here.
+    fsdp_cfg = backend_cfg.get("fsdp_cfg", {})
+    sp_size = int(fsdp_cfg.get("sp_size", None) or FSDPConfig.sp_size)
+    if shared_devices % sp_size:
+        raise ValueError(
+            f"Static trainside geometry: {shared_devices} shared devices are not divisible by sp_size={sp_size}."
+        )
+    # Called for its validation: raises when the shared world cannot form the
+    # configured mesh, while the wrap-time call owns the real world size.
+    resolve_fsdp_mesh_shape(
+        fsdp_cfg.get("fsdp_mode", FSDPConfig.fsdp_mode),
+        world_size=shared_devices,
+        hsdp_shard_size=int(fsdp_cfg.get("hsdp_shard_size", None) or FSDPConfig.hsdp_shard_size),
+    )
+    shared_dp_size = shared_devices // sp_size
+
+    # Mirror the runtime call below, which reads self.reward.dp_size. A reward
+    # Handle carries no sp/tp/pp, so its dp_size is its slab width: the reward
+    # slab when reward_fraction carves one, else the shared devices it colocates
+    # on. Only a recipe with no reward: block at all scores with dp_size 1.
+    if reward_fraction > 0.0:
+        reward_devices_f = reward_fraction * num_devices
+        reward_dp_size = int(round(reward_devices_f))
+        if abs(reward_devices_f - reward_dp_size) > 1e-9:
+            raise ValueError(
+                f"Static trainside geometry: reward_fraction={reward_fraction} of num_devices={num_devices} "
+                f"requests {reward_devices_f} reward devices, not an integer."
+            )
+    else:
+        reward_dp_size = shared_devices if has_reward else 1
+
+    _validate_dp_geometry(
+        batch_size=batch_size,
+        samples_per_prompt=samples_per_prompt,
+        num_updates_per_batch=num_updates_per_batch,
+        rollout_dp_size=shared_dp_size,
+        reward_dp_size=reward_dp_size,
+        train_dp_size=shared_dp_size,
+        require_rollout_dp_divisibility=not prompt_local_rollout,
+    )
+
+
 # Per-field eval knobs the overlay replaced (or dropped), and what to write instead.
 _RETIRED_EVAL_KEYS = {
-    "eval_cfg_text_scale": "eval_sampling: {guidance_scale: X}   (BAGEL family: cfg_text_scale)",
+    "eval_cfg_text_scale": "eval_sampling: {guidance_scale: X}",
     "eval_num_inference_steps": "eval_sampling: {num_inference_steps: X}",
     "eval_height": "eval_sampling: {height: X}",
     "eval_width": "eval_sampling: {width: X}",
@@ -120,12 +190,6 @@ _RETIRED_EVAL_KEYS = {
 _UNSUPPORTED_OVERLAY_FIELDS = frozenset(
     {"scheduler", "sde_strategy", "sigmas", "noise_group_ids", "init_noise_latent_shape"}
 )
-
-
-def cfg_scale_of(params: Any) -> float:
-    """The CFG scale a diffusion params object will actually be sampled with."""
-    scale = getattr(params, "cfg_text_scale", None)
-    return float(params.guidance_scale if scale is None else scale)
 
 
 def reject_retired_eval_keys(cfg: Any) -> None:
@@ -157,15 +221,6 @@ def build_eval_sampling(
     if samples_per_prompt is not None:
         updates["samples_per_prompt"] = int(samples_per_prompt)
     updates.update(_resolve_overrides(overrides, field_names))
-
-    # Only the cfg_text_scale families declare both; elsewhere the sibling is not a
-    # field at all and _resolve_overrides already rejected it.
-    if "cfg_text_scale" in field_names and "guidance_scale" in updates:
-        raise ValueError(
-            f"eval_sampling sets `guidance_scale`, which {type(base).__name__} declares but its "
-            "pipeline discards — the eval would silently run at the training CFG. "
-            "Set `cfg_text_scale` instead."
-        )
 
     steps = int(updates.get("num_inference_steps", base.num_inference_steps))
     if float(updates["eta"]) <= 0.0:
@@ -242,7 +297,7 @@ class DiffusionTrainer(BaseTrainer):
         eval_eta: float = 0.0,
         eval_sampling_cfg: Optional[Any] = None,
         eval_rewards_cfg: Optional[Any] = None,
-        task_config: Optional[Dict[str, Any]] = None,
+        control: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__(
             cfg=cfg,
@@ -269,7 +324,7 @@ class DiffusionTrainer(BaseTrainer):
         self.eval_eta = float(eval_eta)
         self._eval_rewards_cfg = eval_rewards_cfg
         self._eval_suites: List[EvalRewardSuite] = []
-        self._task_config: Dict[str, Any] = dict(task_config) if task_config else {}
+        self._control: Dict[str, Any] = dict(control) if control else {}
         self._rollout_is_trainside = False
         self._uses_ema = False
 
@@ -344,6 +399,19 @@ class DiffusionTrainer(BaseTrainer):
             )
         self._reward_is_separate = reward_separate
 
+        _preflight_trainside_geometry(
+            num_devices=int(self.num_devices),
+            layout=self._layout,
+            reward_fraction=reward_fraction,
+            batch_size=int(batch_size),
+            samples_per_prompt=total_samples_per_prompt(self.sampling_params),
+            num_updates_per_batch=int(stack_cfg.get("num_updates_per_batch", 1)),
+            prompt_local_rollout=self._prompt_local_rollout,
+            has_reward=reward_cfg is not None,
+            backend_cfg=backend_cfg,
+            rollout_cfg=rollout_cfg,
+        )
+
         train_cfgs = dict(
             bundle_cfg=bundle_cfg,
             pipeline_cfg=pipeline_cfg,
@@ -380,7 +448,7 @@ class DiffusionTrainer(BaseTrainer):
         self._validate_accumulation(stack_cfg)
 
         self._validate_residency_config()
-        _validate_diffusion_dp_geometry(
+        _validate_dp_geometry(
             batch_size=int(batch_size),
             samples_per_prompt=total_samples_per_prompt(self.sampling_params),
             num_updates_per_batch=int(stack_cfg.get("num_updates_per_batch", 1)),
@@ -572,7 +640,7 @@ class DiffusionTrainer(BaseTrainer):
             rollout_id,
             allowed_primitives={"text", "image", "video"},
             caller="DiffusionTrainer._build_request_sample",
-            root_control=dict(self._task_config),
+            control=self._control,
         )
         samples_per_prompt = total_samples_per_prompt(sp)
         request = request.fork(samples_per_prompt, sampling_params=diffusion)
@@ -819,7 +887,7 @@ class DiffusionTrainer(BaseTrainer):
             int(eval_diffusion.num_inference_steps),
             int(eval_diffusion.height),
             int(eval_diffusion.width),
-            cfg_scale_of(eval_diffusion),
+            float(eval_diffusion.guidance_scale),
             float(eval_diffusion.eta),
             "  ".join(f"{k}={v:.4f}" for k, v in metrics.items()),
         )
@@ -881,19 +949,29 @@ class DiffusionTrainer(BaseTrainer):
                     scored = reward.score_and_attach(generated)
                     if first_scored is None:
                         first_scored = scored
-                    rewards = scored.parts[-1].rewards
+                    part = scored.parts[-1]
+                    rewards = part.rewards
                     if rewards is not None:
                         r = hydrate(rewards).to(torch.float32)
                         if scored is first_scored:
                             # Captions read part.rewards, which remote scoring returns dehydrated.
-                            scored.parts[-1].rewards = r
+                            part.rewards = r
                         sums[name] += float(r.sum().item())
                         counts[name] += int(r.numel())
+                    components = part.component_rewards
+                    if isinstance(components, dict):
+                        for component_name, component_values in components.items():
+                            component = hydrate(component_values).to(torch.float32)
+                            metric_name = f"{name}_{str(component_name).replace('/', '_')}"
+                            sums.setdefault(metric_name, 0.0)
+                            counts.setdefault(metric_name, 0)
+                            sums[metric_name] += float(component.sum().item())
+                            counts[metric_name] += int(component.numel())
             # Outside _reward_phase: the driver-side media upload must not hold
             # the train-offload window open.
             if media_prefix and start == 0 and first_scored is not None:
                 self._log_eval_media(first_scored, step, prefix=media_prefix)
-        metrics = {name: sums[name] / max(1, counts[name]) for name, _ in scorers}
+        metrics = {name: total / max(1, counts[name]) for name, total in sums.items()}
         return metrics, sync_pending, n_prompts > 0
 
     def train(

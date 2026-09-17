@@ -10,7 +10,7 @@ import logging
 import os
 import sys
 import types
-from typing import Optional, Tuple
+from typing import Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -111,19 +111,3 @@ def rank_world_local() -> Tuple[int, int, int]:
     world = int(os.environ.get("WORLD_SIZE", "1"))
     local = int(os.environ.get("LOCAL_RANK", "0"))
     return rank, world, local
-
-
-def ensure_dist_initialized(local_rank: Optional[int] = None) -> None:
-    """Idempotently bring up the default process group."""
-    import torch
-    import torch.distributed as dist
-
-    if torch.cuda.is_available() and local_rank is not None:
-        torch.cuda.set_device(local_rank)
-    if not dist.is_initialized():
-        dist.init_process_group()
-        logger.info(
-            "ensure_dist_initialized: default process group up (rank=%s world=%s)",
-            dist.get_rank(),
-            dist.get_world_size(),
-        )

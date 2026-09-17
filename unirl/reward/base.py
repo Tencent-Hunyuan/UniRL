@@ -55,6 +55,15 @@ class RewardBackend(ABC):
 
 
 @runtime_checkable
+class PromptVideoReward(Protocol):
+    """Optional capability for rewards that score prompt-to-video alignment."""
+
+    def covers_prompt_video(self) -> bool:
+        """Whether the configured reward gives prompt-to-video alignment positive weight."""
+        ...
+
+
+@runtime_checkable
 class DifferentiableReward(Protocol):
     """Optional capability: in-process ``nn.Module`` rewards returning a grad-carrying score tensor for ReFL."""
 
@@ -75,5 +84,6 @@ class BaseRewardComponentSpec(ABC):
 __all__ = [
     "BaseRewardComponentSpec",
     "DifferentiableReward",
+    "PromptVideoReward",
     "RewardBackend",
 ]

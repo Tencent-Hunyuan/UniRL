@@ -1,22 +1,46 @@
-"""Distributed helper utilities shared by rollout-side weight sync."""
+"""Shared distributed-process and process-group utilities."""
 
 from __future__ import annotations
 
+import logging
 from datetime import timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+import torch
 import torch.distributed as dist
-from torch.distributed.distributed_c10d import (
-    Backend,
-    PrefixStore,
-    Store,
-    _new_process_group_helper,
-    _world,
-    default_pg_timeout,
-    rendezvous,
-)
+
+if TYPE_CHECKING:
+    from torch.distributed.device_mesh import DeviceMesh
+    from torch.distributed.distributed_c10d import Backend, Store
+
+logger = logging.getLogger(__name__)
 
 GLOO_GROUP = None
+
+
+def find_dtensor_mesh(model: torch.nn.Module) -> DeviceMesh | None:
+    """Return one DTensor parameter's device mesh."""
+    from torch.distributed.tensor import DTensor
+
+    for param in model.parameters():
+        if isinstance(param, DTensor):
+            return param.device_mesh
+    return None
+
+
+def ensure_dist_initialized(local_rank: int | None = None) -> None:
+    """Idempotently bring up the default process group."""
+    if not dist.is_available():
+        raise RuntimeError("torch.distributed is unavailable")
+    if torch.cuda.is_available() and local_rank is not None:
+        torch.cuda.set_device(local_rank)
+    if not dist.is_initialized():
+        dist.init_process_group()
+        logger.info(
+            "ensure_dist_initialized: default process group up (rank=%s world=%s)",
+            dist.get_rank(),
+            dist.get_world_size(),
+        )
 
 
 def init_gloo_group():
@@ -46,6 +70,15 @@ def init_process_group(
     pg_options: Any | None = None,
 ):
     """Copy of PyTorch init_process_group that can create extra main groups."""
+    from torch.distributed.distributed_c10d import (
+        Backend,
+        PrefixStore,
+        _new_process_group_helper,
+        _world,
+        default_pg_timeout,
+        rendezvous,
+    )
+
     assert (store is None) or (init_method is None), "Cannot specify both init_method and store."
 
     if store is not None:

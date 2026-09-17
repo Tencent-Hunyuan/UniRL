@@ -40,9 +40,12 @@ stay swappable by `_target_`.
   disjoint `placement` slabs and runs a one-time cross-slab handshake for weight sync.
 - **The Sample-native loop** (`train_step`) is the conductor sequence, one
   rollout per call: `wake_up` → (sync weights, if due) →
-  `rollout.generate(sample)` → `reward.score_and_attach(sample)` →
-  `part.compute_advantages(...)` → drop reward-only decoded media →
-  `stack.train_track(...)`. The driver builds a request `Sample` whose Parts
+  `rollout.generate(sample)` → (if configured) `reward.score_and_attach(sample)` →
+  (if required) `part.compute_advantages(...)` → drop reward-only decoded media →
+  `stack.train_track(...)`. On synchronous `ARTrainer`, `requires_advantages=False`
+  algorithms (supervised / teacher-anchored, e.g. the planned AR OPD) may omit the
+  `reward:` block; a configured reward is retained for monitoring only. The driver
+  builds a request `Sample` whose Parts
   preserve prompt lineage and carry sampling parameters. A single-stage stack
   receives the trainable frontier `Part`; `UnifiedModelTrainStack` receives the
   whole `Sample` so AR and image Parts are sharded by the same prompt trees.
@@ -295,11 +298,17 @@ logging:
   log_media: true         # also uploads the eval panel (below)
 ```
 
+`eval_samples_per_prompt` is a real override whenever it differs from the
+rollout's `samples_per_prompt`; the retired alias previously caused the
+rollout fan-out to win silently. Diffusion sampling now has one field per
+value: `samples_per_prompt` controls fan-out and `guidance_scale` controls
+text CFG, including for BAGEL. The retired `num_samples_per_prompt` and
+`cfg_text_scale` fields are not accepted.
+
 CFG has no eval knob of its own: leave `guidance_scale` unmentioned and eval
 runs at the training guidance (a CFG-off run cannot silently evaluate with CFG
-on); name it in `eval_sampling:` to decouple the two. BAGEL-family params
-consume `cfg_text_scale`, and passing the inert `guidance_scale` there raises.
-Unknown overlay fields raise, and the retired per-field knobs
+on); name it in `eval_sampling:` to decouple the two. Unknown overlay fields
+raise, and the retired per-field knobs
 (`eval_cfg_text_scale`, `eval_num_inference_steps`, ...) fail fast with a
 migration hint. Dynamic-shift models re-derive μ from the eval
 steps/resolution, so a decoupled eval stays on the model's official schedule;

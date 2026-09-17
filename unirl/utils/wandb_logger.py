@@ -22,6 +22,20 @@ if TYPE_CHECKING:
 module_logger = logging.getLogger(__name__)
 
 
+def _normalize_stereo_audio(audio: torch.Tensor) -> torch.Tensor:
+    """Normalize ``[L]``, ``[C, L]``, or ``[L, C]`` audio to interleaved ``[L, 2]`` samples."""
+    samples = audio.detach().float().cpu()
+    if samples.ndim == 1:
+        samples = samples.unsqueeze(1)
+    elif samples.ndim == 2 and samples.shape[0] in (1, 2):
+        samples = samples.T
+    elif samples.ndim != 2 or samples.shape[1] not in (1, 2):
+        raise ValueError(f"Expected mono/stereo audio shaped [L], [C, L], or [L, C], got {tuple(samples.shape)}")
+    if samples.shape[1] == 1:
+        samples = samples.expand(-1, 2)
+    return torch.clamp(samples, -1.0, 1.0)
+
+
 def _write_video_with_audio(
     frames: Any,
     fps: int,
@@ -56,13 +70,7 @@ def _write_video_with_audio(
         for packet in video_stream.encode():
             container.mux(packet)
 
-        samples = audio.float().cpu()
-        if samples.ndim == 1:
-            samples = samples.unsqueeze(0)
-        if samples.shape[0] == 1:
-            samples = samples.expand(2, -1)
-        samples = samples.T
-        samples = torch.clamp(samples, -1.0, 1.0)
+        samples = _normalize_stereo_audio(audio)
         int16_samples = (samples * 32767.0).to(torch.int16)
 
         audio_frame = av.AudioFrame.from_ndarray(
@@ -546,6 +554,8 @@ class UniRLWandBLogger:
         """Log one rollout's metrics to wandb. No-op when disabled."""
         mem_summary = self.memory_monitor.step_summary(step=rollout_id + 1) if self.memory_monitor is not None else None
         if not self.enabled or not self._initialized:
+            # Keep the checkpointed train axis independent of telemetry; log_step is a no-op here.
+            self._log_train(results)
             return
         from unirl.utils.wandb_metrics import compute_rollout_sample_metrics
 
@@ -571,9 +581,7 @@ class UniRLWandBLogger:
         self,
         results: Union["TrainStepResult", Dict[str, "TrainStepResult"]],
     ) -> None:
-        """Emit ``train/*`` points, one per optimizer update, single- and multi-track."""
-        if not self.enabled or not self._initialized:
-            return
+        """Advance the train axis and emit enabled ``train/*`` points."""
 
         if isinstance(results, dict):
             per_track_updates: Dict[str, List[Dict[str, Any]]] = {}

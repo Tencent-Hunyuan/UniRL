@@ -70,7 +70,7 @@ class UnifiedModelTrainer(BaseTrainer):
         stack_cfg: DictConfig,
         data_source_cfg: DictConfig,
         sampling_cfg: DictConfig,
-        task_config: Optional[Dict[str, Any]] = None,
+        control: Optional[Dict[str, Any]] = None,
         ar_rollout_cfg: Optional[DictConfig] = None,
         dit_rollout_cfg: Optional[DictConfig] = None,
         rollout_cfg: Optional[DictConfig] = None,
@@ -101,7 +101,7 @@ class UnifiedModelTrainer(BaseTrainer):
         self.data_source = instantiate(data_source_cfg)
 
         self.sampling_params: Dict[str, BaseSamplingParams] = build_sampling_dict(sampling_cfg)
-        self._task_config: Dict[str, Any] = dict(task_config) if task_config else {}
+        self._control: Dict[str, Any] = dict(control) if control else {}
 
         self.weight_sync = None
 
@@ -210,7 +210,7 @@ class UnifiedModelTrainer(BaseTrainer):
             rollout_id,
             allowed_primitives={"text"},
             caller="UnifiedModelTrainer._build_request_sample",
-            root_control=dict(self._task_config),
+            control=self._control,
             require_single_input_part=True,
         )
         return request.fork(ar_params.samples_per_prompt, sampling_params=ar_params).fork(
@@ -266,7 +266,7 @@ class UnifiedModelTrainer(BaseTrainer):
         ar_input = Part.input(
             [f"r{rid}:a{k}" for k in range(n_ar)],
             primitives={"text": ar_texts},
-            control=dict(input_part.control),
+            control=input_part.control,
         )
         ar_request = (
             Sample.request(ar_input)
@@ -293,7 +293,7 @@ class UnifiedModelTrainer(BaseTrainer):
         dit_input = Part.input(
             [sid.replace("/", "_") for sid in image_shell.sample_ids],
             primitives={"text": dit_prompts},
-            control=dict(input_part.control),
+            control=input_part.control,
         )
         cot_input = dit_input.input_child(primitives={"text": dit_cot})
         dit_out = dit_engine.generate(
@@ -465,12 +465,11 @@ class UnifiedModelTrainer(BaseTrainer):
     def evaluate(self, step: int) -> float:
         """Periodic eval on the eval set (no training); returns the mean image reward."""
         base_diffusion = self.sampling_params.get("diffusion")
-        replace_kwargs = dict(eta=self.eval_eta)
-        if "cfg_text_scale" in {f.name for f in dataclasses.fields(base_diffusion)}:
-            replace_kwargs["cfg_text_scale"] = self.eval_cfg_text_scale
-        else:
-            replace_kwargs["guidance_scale"] = self.eval_cfg_text_scale
-        eval_diffusion = dataclasses.replace(base_diffusion, **replace_kwargs)
+        eval_diffusion = dataclasses.replace(
+            base_diffusion,
+            eta=self.eval_eta,
+            guidance_scale=self.eval_cfg_text_scale,
+        )
         eval_sp = {**self.sampling_params, "diffusion": eval_diffusion}
         if not self._single_engine and self.weight_sync is not None:
             if self._enable_fsdp_offload:

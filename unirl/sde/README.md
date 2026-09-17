@@ -109,6 +109,13 @@ MixGRPO keeps `FlowSDEStrategy` and adds a `WindowScheduler` under
 - **The dtype round-trip in `_finalize_logp` is not a no-op cast.** It simulates
   trajectory *storage* precision so replay-time log-prob matches sampling-time
   log-prob. Delete it as dead code and the ratio drifts. Skipped for `eta<1e-7`.
+- **`prev_sample_means` leave replay at the kernel's native fp32 — don't narrow
+  them to `trajectory_precision`.** Log-prob scores the fp32 mean; FlowDPPO's
+  Gaussian-KL mask (`(Δmean)²/(2σ²)` vs the 1e-5 threshold) scores whatever
+  replay returns, so a bf16 round-trip re-scores a *different* distribution:
+  ULP-scale rounding dwarfs the threshold, and sub-ULP policy deltas collapse to
+  KL=0. `log_probs` keeps its explicit `logprob_dtype` cast; only the mean must
+  not follow the trajectory dtype.
 - **`ensure_sample_sigmas` takes height/width/steps with no defaults, on purpose** —
   a silent `1024×1024` mis-derives μ for dynamic-shift models rendering at anything
   else (e.g. WAN T2V at 480×832).

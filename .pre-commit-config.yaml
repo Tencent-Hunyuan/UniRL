@@ -10,9 +10,11 @@ default_stages: [pre-commit, pre-push, manual]
 #     hooks must not rewrite it either.
 #   - unirl/models/boogu_image/vendor/ : pristine boogu-project/Boogu-Image model code
 #     (see VENDOR_COMMIT.txt); same re-vendor rationale as bagel/vendor/.
+#   - unirl/models/sensenova_u1/vendor/ : pristine OpenSenseNova/SenseNova-U1
+#     NEO-Unify model code (see VENDOR_COMMIT.txt).
 #   - benchmarks/*/*/data/ : vendored upstream benchmark prompt sets (GenEval,
 #     PartiPrompts, VBench, ...); kept byte-identical so upstream checksums verify.
-exclude: ^(unirl-reward-service/|unirl/models/bagel/vendor/|unirl/models/boogu_image/vendor/|benchmarks/[^/]+/[^/]+/data/)
+exclude: ^(unirl-reward-service/|unirl/models/bagel/vendor/|unirl/models/boogu_image/vendor/|unirl/models/sensenova_u1/vendor/|benchmarks/[^/]+/[^/]+/data/)
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks

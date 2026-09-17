@@ -20,9 +20,10 @@ stage_args:
     runtime:
       process: true
       devices: "0"
-      max_batch_size: 4
     engine_args:
       model_stage: diffusion
+      # The pipeline sets supports_request_batch=False, which requires this.
+      max_num_seqs: 1
       enforce_eager: true
       distributed_executor_backend: "mp"
       vae_use_slicing: false

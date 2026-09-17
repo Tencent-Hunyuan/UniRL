@@ -1,24 +1,24 @@
 #!/usr/bin/env bash
 #
-# Multi-node experiment launcher for the taiji platform. Two launch modes pick
-# how Ray is brought up across nodes (LAUNCH); both end with the head running
-# the single training driver and every other node joined to its Ray cluster:
+# Multi-node experiment launcher. Two launch modes pick how Ray is brought up
+# across nodes (LAUNCH); both end with the head running the single training
+# driver and every other node joined to its Ray cluster:
 #
-#   LAUNCH=spmd (default) — the platform runs this SAME script on every node.
+#   LAUNCH=spmd (default) — the scheduler runs this SAME script on every node.
 #       rank 0 (INDEX=0) starts the Ray head + driver; every other rank joins
-#       Ray and idles. Submit once as the platform's multi-node job entrypoint;
-#       taiji fans the script out and sets INDEX + CHIEF_IP per node.
+#       Ray and idles. Submit once as the cluster's multi-node job entrypoint;
+#       the scheduler fans the script out and sets INDEX + CHIEF_IP per node.
 #
 #   LAUNCH=ssh — run this script ONCE on the head. It starts the Ray head, then
 #       ssh's `ray start` onto every other node in NODE_IP_LIST, then runs the
 #       driver. For interactive multi-node sessions where you only have a shell
-#       on the head. Prereqs: passwordless ssh head->workers (taiji provides it),
-#       the repo at the SAME path on every node (shared mount), and CONDA_ENV set
-#       so a non-login ssh shell finds `ray`. taiji sets NODE_IP_LIST (format
+#       on the head. Prereqs: passwordless ssh head->workers, the repo at the
+#       SAME path on every node (shared mount), and CONDA_ENV set so a non-login
+#       ssh shell finds `ray`. Typical job env: NODE_IP_LIST (format
 #       IP:GPUS,IP:GPUS,...) + CHIEF_IP.
 #
-# Cluster topology defaults to taiji's job env (see "Cluster topology" below);
-# set the explicit vars to run on any other cluster.
+# Cluster topology defaults to common multi-node job env (see below);
+# set the explicit vars to override.
 #
 # The driver is one of the Hydra entrypoints, selected with ENTRY:
 #   train_diffusion (default)  examples/diffusion/ (sd3_*, wan2*, qwen_image_*)
@@ -35,12 +35,12 @@
 # via ${oc.env:...}; export them to override a conf's own default.
 #
 # Examples:
-#   # SPMD batch (taiji lands this same line on every node):
-#   bash examples/run_experiment_multinode_taiji.sh diffusion/sd3/sd3_sglang_rollout_colocate
+#   # SPMD batch (the scheduler lands this same line on every node):
+#   bash examples/run_experiment_multinode.sh diffusion/sd3/sd3_sglang_rollout_colocate
 #   # ssh fan-out (run once on the head only):
-#   LAUNCH=ssh bash examples/run_experiment_multinode_taiji.sh diffusion/sd3/sd3_sglang_rollout_colocate
+#   LAUNCH=ssh bash examples/run_experiment_multinode.sh diffusion/sd3/sd3_sglang_rollout_colocate
 #   # VLM/AR recipe (4x8):
-#   ENTRY=train_ar bash examples/run_experiment_multinode_taiji.sh ar/qwen_vl_grpo_geo3k_mc_4x8
+#   ENTRY=train_ar bash examples/run_experiment_multinode.sh ar/qwen_vl_grpo_geo3k_mc_4x8
 #
 set -euo pipefail
 
@@ -127,16 +127,16 @@ export REPORT_TO_WANDB="${REPORT_TO_WANDB:-false}"
 export WANDB_RUN_NAME="${WANDB_RUN_NAME:-${EXPERIMENT}}"
 export RAY_ADDRESS="${RAY_ADDRESS:-auto}"
 
-# --- Cluster topology (taiji platform defaults) -----------------------------
-# Defaults come from taiji's multi-node job env (commented per line); the
-# explicit vars always win, so this launcher also runs on a non-taiji cluster.
-NUM_NODES="${NUM_NODES:-${HOST_NUM:-2}}"               # taiji HOST_NUM:     node count
-GPUS_PER_NODE="${GPUS_PER_NODE:-${HOST_GPU_NUM:-8}}"   # taiji HOST_GPU_NUM: GPUs per node
-NODE_RANK="${NODE_RANK:-${INDEX:-0}}"                  # taiji INDEX:        this node's rank
+# --- Cluster topology -------------------------------------------------------
+# Defaults come from common multi-node job env (commented per line); the
+# explicit vars always win.
+NUM_NODES="${NUM_NODES:-${HOST_NUM:-2}}"               # HOST_NUM:     node count
+GPUS_PER_NODE="${GPUS_PER_NODE:-${HOST_GPU_NUM:-8}}"   # HOST_GPU_NUM: GPUs per node
+NODE_RANK="${NODE_RANK:-${INDEX:-0}}"                  # INDEX:        this node's rank
 RAY_PORT="${RAY_PORT:-6379}"
 LAUNCH="${LAUNCH:-spmd}"                               # spmd: platform runs this per node | ssh: head fans out
 
-# This node's IP. Prefer an explicit NODE_IP, else taiji's LOCAL_IP. On multi-NIC
+# This node's IP. Prefer an explicit NODE_IP, else LOCAL_IP. On multi-NIC
 # / container nodes `hostname -I` often returns a container-internal IP that peers
 # can't reach, so when CHIEF_IP is known, pick this node's IP on the chief's /16.
 all_ips="$(hostname -I 2>/dev/null || true)"
@@ -152,7 +152,7 @@ if [ -z "${NODE_IP:-}" ]; then
 fi
 NODE_IP="${NODE_IP:-127.0.0.1}"
 
-HEAD_IP="${HEAD_IP:-${CHIEF_IP:-${NODE_IP}}}"          # taiji CHIEF_IP:     head node IP
+HEAD_IP="${HEAD_IP:-${CHIEF_IP:-${NODE_IP}}}"          # CHIEF_IP:     head node IP
 
 # --- Driver command ---------------------------------------------------------
 # num_devices spans the whole cluster; the conf's own value is overridden so one
@@ -199,7 +199,7 @@ if [ "${LAUNCH}" = "ssh" ]; then
         exit 2
     fi
     if [ -z "${NODE_IP_LIST:-}" ]; then
-        echo "LAUNCH=ssh needs NODE_IP_LIST (taiji sets it; format IP:GPUS,IP:GPUS,...)." >&2
+        echo "LAUNCH=ssh needs NODE_IP_LIST (format IP:GPUS,IP:GPUS,...)." >&2
         exit 2
     fi
     start_ray_head
@@ -237,7 +237,7 @@ if [ "${LAUNCH}" = "ssh" ]; then
              GPUS_PER_NODE='${w_gpu}' RAY_PORT='${RAY_PORT}' \
              CONDA_ENV='${CONDA_ENV:-}' CONDA_SH='${CONDA_SH:-}' VENV_DIR='${VENV_DIR:-}' \
              ${ssh_nccl_env}\
-             nohup bash examples/run_experiment_multinode_taiji.sh '${EXPERIMENT}' \
+             nohup bash examples/run_experiment_multinode.sh '${EXPERIMENT}' \
              >/tmp/unirl_ray_worker_${worker_n}.log 2>&1 &" \
             || echo "[head] WARNING: ssh to ${w_ip} failed; that node will not join." >&2
     done

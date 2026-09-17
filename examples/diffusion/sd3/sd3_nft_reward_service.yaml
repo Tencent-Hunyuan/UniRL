@@ -112,14 +112,14 @@ algorithm:
     path: unirl.models.sd3.conditions.SD3Conditions
   params: ${sampling}
   beta: 1.0
-  adv_clip_max: 5.0
+  adv_std_saturate: 5.0
   adv_mode: raw
   use_adaptive_weight: true
   train_timestep_mode: all
   shuffle_train_timesteps: true
   apply_time_shift_in_loss: false
   training_timestep_fraction: 0.99
-  kl_coef: 0.0
+  ref_deviation_coef: 0.0
 
 stack:
   _target_: unirl.train.stack.TrainStack
