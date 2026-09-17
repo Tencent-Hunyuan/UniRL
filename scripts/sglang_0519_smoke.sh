@@ -3,6 +3,9 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+export PIP_INDEX_URL=https://mirrors.cloud.tencent.com/pypi/simple
+export PIP_TRUSTED_HOST=mirrors.cloud.tencent.com
+
 python3 - <<'PY'
 import torch
 
@@ -14,12 +17,10 @@ print("gpu", torch.cuda.get_device_name(0))
 PY
 
 python3 -m pip install \
-  --index-url https://mirrors.cloud.tencent.com/pypi/simple \
-  --trusted-host mirrors.cloud.tencent.com \
   --no-deps \
   --force-reinstall \
   "sglang==0.5.19"
-python3 -m pip install --no-deps -e .
+python3 -m pip install --no-build-isolation --no-deps -e .
 
 python3 - <<'PY'
 from importlib import metadata
