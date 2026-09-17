@@ -1,6 +1,7 @@
 """SFT domain package — worker-side supervised track builders."""
 
 from unirl.train.sft.track_builder import (
+    ARPreferenceTrackBuilder,
     ARSupervisedTrackBuilder,
     DiffusionSupervisedTrackBuilder,
     SupervisedTrackBuilder,
@@ -8,6 +9,7 @@ from unirl.train.sft.track_builder import (
 )
 
 __all__ = [
+    "ARPreferenceTrackBuilder",
     "ARSupervisedTrackBuilder",
     "DiffusionSupervisedTrackBuilder",
     "SupervisedTrackBuilder",

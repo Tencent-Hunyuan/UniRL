@@ -51,6 +51,12 @@ not just three-tensor arithmetic.
   teacher LoRA adapters (backend-owned `frozen_adapters`), distillation rather than RL:
   it ignores advantages and picks its teacher from the batch's `metadata["domain"]`
   (`diffusionopd.py`).
+- **DPO is the offline preference family** (`dpo.py`) — the only algorithm here
+  that needs neither rollout nor advantages. It replays the same segment twice,
+  once with the LoRA adapter live and once under `adapters_disabled` (the
+  reference policy), reduces both to per-sequence log-probs, and applies the
+  Bradley-Terry objective to adjacent chosen/rejected rows. Despite the name it
+  is unrelated to `DPPO`/`FlowDPPO`, which are Divergence-PPO trust regions.
 - **The anchor contract — the subtle part.** bf16 forwards are batch-shape
   sensitive, so a π_old anchor computed at a different geometry than `new_logp`
   drifts the on-policy ratio off 1 (and FlowDPPO's KL off 0). Algorithms just declare
@@ -88,6 +94,117 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   so `stage.replay` still emits log-probs) **with `add_kl_coefficient=false`**. Never pair a
   near-zero `eta` with `add_kl_coefficient=true` — the KL divides by a transition std that
   scales with `eta` (the algorithm raises at init on `eta == 0`, but cannot judge "too small").
+- **DPO's pair layout is positional, so batch geometry is load-bearing.** A
+  preference `Part` is `2P` rows laid out `[chosen0, rejected0, chosen1, ...]`,
+  and the loss recovers the pair with `[0::2]`/`[1::2]`. Nothing downstream
+  knows a pair is a unit: `pytree_chunk` shards contiguously for `DP_SCATTER`
+  and `CountPlanner` slices contiguously into micros, so an odd rows-per-rank or
+  an odd `micro_batch_size` silently severs pairs. Hence `micro_batch_size: 2`
+  and a recipe `batch_size` counting **pairs** — with `batch_size % dp_size == 0`
+  already enforced by the trainer, pair-counted batches make rows-per-rank even
+  automatically. `DPO._split_adjacent` raises on an odd count rather than
+  training on mismatched rows.
+- **DPO is LoRA-only, and the adapter must not reach the frozen towers.** The
+  reference policy is the *same* weights with adapters disabled
+  (`_resolve_reference_model` raises without a LoRA adapter), so an adapter
+  injected inside `visual`/`audio_tower` would move the reference too and shrink
+  the objective toward zero. Keep `exclude_modules: ".*visual.*|.*audio_tower.*"`.
+- **DPO's first step should report `dpo_loss ≈ log 2 = 0.693`.** PEFT zero-inits
+  LoRA `B`, so before any optimizer step the policy and the adapter-disabled
+  reference are the same function and the logit margin is exactly 0. A first step
+  far from 0.693 means the reference is not actually frozen (or the pairing is
+  misaligned). Expect `reward_accuracy == 0` there too — exact ties fail the
+  strict `>`, so it is not a bug. Note what this check *cannot* see: it holds for
+  **any** value of `sampling_temperature`, because a zero margin stays zero under
+  any scaling. It validates the reference and the pairing, not the scaling.
+- **The supervised span decides how much of the margin is the EOS token, and with
+  `average_log_prob=false` that term does not cancel.** The margin is a *sum* over
+  supervised response tokens, so every extra supervised token adds
+  `(π_c − ref_c) − (π_r − ref_r)` for that position. `ARPreferenceTrackBuilder`
+  appends EOS and supervises it (`append_eos=true`); supervising only the assistant
+  text span the chat template produces is exactly **one token fewer per branch on
+  every row** (measured on 5 rows × 2 branches: 7/8, 1/2, 5/6, 12/13, 9/10, …). That
+  single position carries a large share of the objective: dropping it at scoring time
+  costs **−12.9pp accuracy and 54% of the margin** (1.1150 → 0.5144) for a model
+  trained with it, and much less for one trained without. `P(EOS)` also depends on
+  what precedes it — a one-word answer ends differently from a sentence — so the term
+  correlates with answer length. Set `track_builder.append_eos: false` for the
+  text-only span. Neither choice is wrong, but they are different objectives, and a
+  model must be scored under the span it was trained on.
+- **Dense-padded pairing shifts the margin slightly, and the shift tracks the length
+  difference.** `Qwen3OmniARStage.replay` forwards a pair as a dense `[B, T]` batch
+  padded to the longer branch, so the shorter branch carries the padding. Forwarding
+  each branch alone and re-deriving the margin changes it
+  by **mean +0.003, median +0.005, max 0.13**, and that shift correlates with
+  `len(chosen) − len(rejected)` at **+0.21** — so padding is not perfectly inert and
+  the leak is length-dependent. It is small: 55/60 ranking decisions are unchanged,
+  and the
+  accuracy difference (0.70 paired vs 0.65 alone) is well inside the ±8.4pp binomial
+  SE at n=60 and not significant (McNemar p=0.37).
+
+  Repeating it powered, over the full 600-row split with every row scored both ways,
+  separates the two halves of the claim cleanly. The **leak is real and
+  length-dependent**: the shift correlates with `len(chosen) − len(rejected)` at
+  **+0.221, 95% CI [+0.144, +0.296]**, excluding zero, and it splits by direction —
+  padding *helps* when chosen is longer (n=478, accuracy +1.67pp, mean shift +0.027)
+  and *hurts* when chosen is shorter (n=94, −5.32pp, mean shift −0.006). So dense
+  padding systematically favours the longer branch, which is the mechanism a
+  length-sensitivity difference would need. But its effect on **overall** accuracy is
+  not resolvable: +0.83pp, 95% CI [−0.83, +2.50], McNemar p=0.42 (15 vs 10 discordant
+  of 600), because this split is 478/94 skewed toward chosen-longer and the two
+  directions cancel. The CI's upper bound is below the ~3.9pp residual it was meant to
+  explain, so padding is not that explanation. On a length-balanced set the
+  cancellation would not hold, which is the case where switching to a no-padding
+  forward would actually matter.
+- **The segment-sum must not use `index_add`/`scatter_add_`.** Both accumulate
+  with CUDA atomics, so the addition order varies between otherwise identical
+  calls and the per-sequence sum is not reproducible. Measured spread on one
+  fixed input over 8 calls: `index_add` 0 at 64 tokens, 1.2e-03 at 622, 3.9e-02
+  at 4096, 1.6e-01 at 16384; `scatter_add_` is no better (1.9e-01 at 16384).
+  This is invisible in the loss and in the forward — the `replay` output is
+  bitwise identical across calls (30/30 rows measured) — and surfaces only after
+  the reduction, where it made the policy and the *adapter-disabled* reference
+  differ at zero adapter delta. The visible symptom was the log-2 control
+  reporting `reward_accuracy = 0.15` instead of 0: with a true margin of exactly
+  0, tie-breaking noise of 1e-07 is resolved by the strict `>`, and because the
+  error scales with length it hit long image rows (6/20) and never short audio
+  rows (0/20), which reads exactly like a modality-dependent modelling effect.
+  `_reduce_to_sequences` therefore scatters to `[S, Lmax]` and sums along a fixed
+  axis, which is a shape-determined tree reduction; the control then returns
+  exactly 0.0 with every margin identically zero.
+- **What a bit-identical loss does and does not prove.** Reproducing a reference
+  implementation's loss to `|d| = 0` shows the formula is right *given the same
+  log-probs*. It says nothing about the rest of the chain — manifest conversion,
+  prompt rendering, media injection, tokenisation, masking scope, metric
+  aggregation — and a wrong input there yields a faithfully-computed wrong number.
+  Every defect found while building this algorithm was invisible at the loss layer:
+  pad rows polluting an eval mean, `target_parameters` missing from the checkpoint
+  meta (silently rebuilding an attention-only adapter on resume), a rank-dependent
+  all-reduce width hanging NCCL for 1800 s, `image_max_pixels` silently inert for
+  image-only rows, a generation-default sampling temperature rescaling the
+  objective, and a modality marker surviving in the prompt as literal tokens.
+  Pair the loss check with checks that can see those: give each knob two values and
+  require the output to change, assert declared metric keys match emitted ones, and
+  compare what the docs claim against what the code does. Two configurations that
+  should differ but produce bit-identical numbers are a bug signature, not a
+  reassurance.
+- **`sampling_temperature` defaults to 1.0 here, not to `ARSamplingParams`.**
+  `replay` divides the `lm_head` logits by it, and that does not cancel out of
+  `(π_c − π_r) − (ref_c − ref_r)`: `log_softmax` is non-linear in the temperature,
+  so the margin scales by roughly `1/T` and the effective `beta` moves with it.
+  Offline DPO never samples, so inheriting a *generation* default (0.7) would
+  silently rescale the objective against reference implementations, which compute
+  preference log-probs at 1.0.
+- **DPO allows `num_updates_per_batch > 1` for a reason the other families do
+  not.** The multi-update gate exists to stop a *moving π_old anchor*, but DPO
+  has no π_old: its reference is the adapter-disabled base — frozen weights,
+  recomputed inline in the same micro geometry as the policy forward. So N
+  optimizer steps per batch is sound, and it is how the objective reaches a
+  useful margin in a modest number of data batches. Two knock-ons: the LR
+  schedule counts *optimizer* steps, so `total_steps` must be
+  `num_steps × num_updates_per_batch`; and each update's slice must stay a
+  multiple of `rows_per_record` so no pair is split across updates (the trainer
+  checks both).
 - **AR `sampling_temperature` must equal the rollout `sampling.temperature`** —
   `ARStage.replay` rescales logits by it (`log_softmax(logits / T)`) to match SGLang's
   distribution; when unset it silently falls back to the `ARSamplingParams` default,
