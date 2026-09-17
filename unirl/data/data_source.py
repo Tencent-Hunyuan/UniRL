@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader
 
 from unirl.types.media import MediaRef, MediaRefs
 from unirl.types.primitives import Image, ImageSet, ImageSets, Texts, Videos
+from unirl.types.reward import REWARD_MEDIA_METADATA_KEY
 from unirl.types.sample import Part, PrimitiveMap, Sample
 from unirl.utils.video import load_video
 
@@ -102,6 +103,7 @@ def _validate_homogeneous_videos(videos: List[Any]) -> None:
 _SUPPORTED_MEDIA_REF_ROLES: Set[Tuple[str, str]] = {
     ("image", "condition"),
     ("image", "prompt"),
+    ("image", "target"),
     ("video", "condition"),
     ("audio", "prompt"),
     ("video", "prompt"),
@@ -118,7 +120,20 @@ def _dataset_metadata(items: List[Dict[str, Any]], *, context: str) -> List[Opti
                 f"{context}: metadata['_media_refs'] is no longer a model-input channel "
                 f"(row {row}); use the dataset media/media_refs field."
             )
-        values.append(metadata)
+        if isinstance(metadata, dict) and REWARD_MEDIA_METADATA_KEY in metadata:
+            raise ValueError(
+                f"{context}: metadata[{REWARD_MEDIA_METADATA_KEY!r}] is reserved for data-source reward inputs "
+                f"(row {row})."
+            )
+        value = dict(metadata or {})
+        target_refs = [
+            ref for ref in (item.get("media_refs") or []) if isinstance(ref, MediaRef) and ref.role == "target"
+        ]
+        if target_refs:
+            value[REWARD_MEDIA_METADATA_KEY] = [
+                {"modality": ref.modality, "role": ref.role, "uri": ref.uri} for ref in target_refs
+            ]
+        values.append(value or None)
     return values
 
 

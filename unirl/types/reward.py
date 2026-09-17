@@ -9,6 +9,8 @@ from PIL import Image
 
 from unirl.distributed.tensor.batch import Batch, concat_field, max_field
 
+REWARD_MEDIA_METADATA_KEY = "_reward_media"
+
 
 class RewardType(Enum):
     """Types of reward computation."""
@@ -107,6 +109,7 @@ class RewardResponse(Batch):
 
 
 __all__ = [
+    "REWARD_MEDIA_METADATA_KEY",
     "RewardRequest",
     "RewardResponse",
     "RewardType",

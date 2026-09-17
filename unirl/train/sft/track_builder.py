@@ -15,7 +15,7 @@ from unirl.models.types.codec import EncodeStage
 from unirl.models.types.conversations import tokenize_agent_target
 from unirl.types.conditions import ImageLatentCondition
 from unirl.types.media import MediaRef, MediaRefs
-from unirl.types.primitives import Images, Texts, Video, Videos
+from unirl.types.primitives import Image, Images, ImageSet, ImageSets, Texts, Video, Videos
 from unirl.types.sample import Part
 from unirl.types.segments.latent import make_image_segment, make_video_segment
 from unirl.types.segments.text import TextSegment
@@ -70,6 +70,20 @@ def _sample_ids(records: Sequence[Record]) -> List[str]:
 
 def _pad_flags(records: Sequence[Record]) -> List[bool]:
     return [bool(r.get("_eval_pad", False)) for r in records]
+
+
+def _load_condition_image_sets(records: Sequence[Record]) -> Optional[ImageSets]:
+    """Load ordered condition-image refs into row-aligned image sets."""
+    import torchvision.transforms.functional as TF
+
+    rows: List[ImageSet] = []
+    any_images = False
+    for record in records:
+        uris = _media_uris(record, role="condition", modality="image")
+        images = [Image(pixels=TF.to_tensor(_load_pil_image(uri))) for uri in uris]
+        rows.append(ImageSet.from_list(images))
+        any_images = any_images or bool(images)
+    return ImageSets(rows=rows) if any_images else None
 
 
 class SupervisedTrackBuilder(Remote):
@@ -321,6 +335,8 @@ class DiffusionSupervisedTrackBuilder(SupervisedTrackBuilder):
                 "add one (every diffusion pipeline exposes it) so SFT encodes prompts exactly "
                 "like rollout does."
             )
+        self._build_conditions = build_conditions
+        self._build_conditions_accepts_images = "images" in inspect.signature(build_conditions).parameters
         self._conditions_kwargs: Dict[str, Any] = {"guidance_scale": self.guidance_scale}
         if "image_shape" in inspect.signature(build_conditions).parameters:
             self._conditions_kwargs["image_shape"] = (self.height, self.width)
@@ -332,7 +348,16 @@ class DiffusionSupervisedTrackBuilder(SupervisedTrackBuilder):
             raise ValueError("DiffusionSupervisedTrackBuilder.build: empty record shard.")
         with torch.no_grad():
             texts = Texts(texts=[str(r["prompt"]) for r in records])
-            conditions = self.pipeline.build_conditions(texts, **self._conditions_kwargs)
+            condition_kwargs = dict(self._conditions_kwargs)
+            references = _load_condition_image_sets(records)
+            if references is not None:
+                if not self._build_conditions_accepts_images:
+                    raise ValueError(
+                        "DiffusionSupervisedTrackBuilder: manifest carries role='condition' images, but "
+                        f"{type(self.pipeline).__name__}.build_conditions has no images parameter."
+                    )
+                condition_kwargs["images"] = references
+            conditions = self._build_conditions(texts, **condition_kwargs)
             pixels = self._load_target_pixels(records)
             latents = self._encode.encode(Images.from_dense(pixels)).latents
         if latents.shape[0] != len(records):
