@@ -13,7 +13,12 @@ print("torch", torch.__version__, "cuda", torch.version.cuda)
 print("gpu", torch.cuda.get_device_name(0))
 PY
 
-python3 -m pip install --no-deps --force-reinstall "sglang==0.5.19"
+python3 -m pip install \
+  --index-url https://mirrors.cloud.tencent.com/pypi/simple \
+  --trusted-host mirrors.cloud.tencent.com \
+  --no-deps \
+  --force-reinstall \
+  "sglang==0.5.19"
 python3 -m pip install --no-deps -e .
 
 python3 - <<'PY'
