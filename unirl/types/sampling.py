@@ -6,8 +6,6 @@ import math
 from abc import ABC
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, fields
-from decimal import Decimal, InvalidOperation
-from numbers import Integral, Real
 from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Set
 
 from unirl.config.require import require
@@ -27,26 +25,14 @@ def _as_int(value: Any, *, name: str, optional: bool = False) -> int | None:
         if optional:
             return None
         raise TypeError(f"{name} must be an integer, got None")
-    if isinstance(value, bool):
-        raise TypeError(f"{name} must be an integer, got {value!r}")
-    if isinstance(value, Integral):
-        return int(value)
+    if type(value) is int:
+        return value
     if isinstance(value, str):
-        text = value.strip()
         try:
-            number = Decimal(text)
-        except (InvalidOperation, ValueError) as exc:
+            return int(value.strip(), 10)
+        except ValueError as exc:
             raise TypeError(f"{name} must be an integer, got {value!r}") from exc
-        if not number.is_finite() or number != number.to_integral_value():
-            raise ValueError(f"{name} must be an integer, got {value!r}")
-        return int(number)
-    elif isinstance(value, Real):
-        number = float(value)
-    else:
-        raise TypeError(f"{name} must be an integer, got {value!r}")
-    if not math.isfinite(number) or number != int(number):
-        raise ValueError(f"{name} must be an integer, got {value!r}")
-    return int(number)
+    raise TypeError(f"{name} must be an integer, got {value!r}")
 
 
 def _as_float(value: Any, *, name: str, optional: bool = False) -> float | None:
@@ -55,13 +41,13 @@ def _as_float(value: Any, *, name: str, optional: bool = False) -> float | None:
         if optional:
             return None
         raise TypeError(f"{name} must be a finite float, got None")
-    if isinstance(value, bool):
+    if type(value) not in (int, float) and not isinstance(value, str):
         raise TypeError(f"{name} must be a finite float, got {value!r}")
     if isinstance(value, str):
         value = value.strip()
     try:
         number = float(value)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise TypeError(f"{name} must be a finite float, got {value!r}") from exc
     if not math.isfinite(number):
         raise ValueError(f"{name} must be a finite float, got {value!r}")
@@ -79,8 +65,6 @@ def _as_bool(value: Any, *, name: str) -> bool:
         if key in _BOOL_FALSE:
             return False
         raise TypeError(f"{name} must be a boolean, got {value!r}")
-    if isinstance(value, Integral) and value in (0, 1):
-        return bool(value)
     raise TypeError(f"{name} must be a boolean, got {value!r}")
 
 
