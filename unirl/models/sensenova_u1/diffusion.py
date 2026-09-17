@@ -13,7 +13,7 @@ from unirl.config.require import require
 from unirl.models.types.diffusion import DiffusionStage
 from unirl.models.types.replay_result import ReplayResult
 from unirl.sde.kernels import FlowSDEStrategy, StepStrategy
-from unirl.types.sampling import DiffusionSamplingParams, _as_float, compute_trajectory_positions
+from unirl.types.sampling import DiffusionSamplingParams, compute_trajectory_positions
 from unirl.types.segments.latent import LatentSegment
 from unirl.utils.dtypes import parse_torch_dtype
 
@@ -40,7 +40,6 @@ class SenseNovaU1DiffusionParams(DiffusionSamplingParams):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        self.t_eps = _as_float(self.t_eps, name="SenseNovaU1DiffusionParams.t_eps")
         if not isinstance(self.cfg_interval, tuple):
             self.cfg_interval = tuple(self.cfg_interval)
         require(
@@ -51,7 +50,7 @@ class SenseNovaU1DiffusionParams(DiffusionSamplingParams):
             self.cfg_norm in CFG_NORM_TYPES,
             f"SenseNovaU1DiffusionParams.cfg_norm must be one of {CFG_NORM_TYPES}; got {self.cfg_norm!r}.",
         )
-        require(self.t_eps > 0.0, f"SenseNovaU1DiffusionParams.t_eps must be positive; got {self.t_eps}.")
+        require(float(self.t_eps) > 0.0, f"SenseNovaU1DiffusionParams.t_eps must be positive; got {self.t_eps}.")
 
 
 def resolve_noise_scale(model: torch.nn.Module, image_shape: Tuple[int, int]) -> float:
