@@ -50,7 +50,9 @@ not just three-tensor arithmetic.
   DiffusionOPD is the teacher-anchored family — a per-step Gaussian KL against frozen
   teacher LoRA adapters (backend-owned `frozen_adapters`), distillation rather than RL:
   it ignores advantages and picks its teacher from the batch's `metadata["domain"]`
-  (`diffusionopd.py`).
+  (`diffusionopd.py`). AROPD is its AR sibling — a gap-weighted stop-gradient policy
+  gradient over the student's own sampled tokens against one frozen-LoRA same-backbone
+  teacher (`aropd.py`).
 - **The anchor contract — the subtle part.** bf16 forwards are batch-shape
   sensitive, so a π_old anchor computed at a different geometry than `new_logp`
   drifts the on-policy ratio off 1 (and FlowDPPO's KL off 0). Algorithms just declare
@@ -93,6 +95,29 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   distribution; when unset it silently falls back to the `ARSamplingParams` default,
   *not* the request Sample's actual temperature, biasing every ratio with no raise. Watch
   `rollout_replay_logp_absdiff_mean` — it should be ~0 on an on-policy step.
+- **AROPD is a policy gradient, not token KD** — the OPD objective is
+  `max_θ E_{a~π_θ}[log π_T(a)]` over the *student's own* sampled tokens (the GKD
+  on-policy form). Its score-function estimator with the student log-prob as
+  control variate is `∇ = E[(log π_T(a) − log π_θ(a))·∇log π_θ(a)]`, implemented as
+  `loss = −Σ sg(teacher_logp − old_logp)·new_logp / Σmask`: the gap is the per-token
+  REINFORCE advantage, stopped-gradient on both sides, `new_logp` the only
+  differentiated operand. Backpropping `mean(new_logp − teacher_logp)` directly
+  instead (`∇ = ∇mean(new_logp)`, teacher constant) just pushes the student's own
+  log-prob up unboundedly — the sign of the gap never enters. By default the gap is
+  batch-normalized (`normalize_gap: true`; a control variate — `E[b·∇log π_θ] = 0`
+  keeps the estimator unbiased) because raw gaps are unbounded: a teacher that
+  despises a sampled continuation emits −15-nat gaps whose gradient swamps the step —
+  the same scale-fix GRPO applies via `normalize_adv_by_std` and DiffusionOPD via its
+  transition-sigma division. Equivalence check:
+  at `θ = θ_old` (one update per rollout, `supports_multi_update = False`) the
+  surrogate's gradient equals the gap-weighted score function; across updates the
+  frozen gap keeps it an off-policy REINFORCE with the ratio absorbed into
+  `new_logp`. `prepare_segment` freezes `segment.teacher_log_probs` under
+  `adapter_active(model, teacher)` + `no_grad` — same-anchor geometry as `new_logp`
+  (same replay, same temperature), so `teacher_gap_abs_mean` is drift-free by
+  construction. The student side of the gap is the rollout's own
+  `segment.log_probs` (the trainside sampler emits tempered per-token log-probs),
+  so a missing `log_probs` raises rather than silently degrading to KD.
 - **DiffusionNFT's `ref_deviation_coef > 0` anchors to the LoRA-disabled base, not the EMA shadow** — the
   shadow tracks the policy by construction, so anchoring to it would bound no drift. The reference
   is a third `predict_noise_at_step` per trained timestep, on top of the trainable and shadow ones;

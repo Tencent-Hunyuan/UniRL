@@ -1,0 +1,161 @@
+# @package _global_
+# AR AROPD — sampled-token on-policy distillation, Qwen3-4B-Base student with a
+# same-backbone frozen-LoRA teacher, DAPO-Math — v2 trainer (ARTrainer), trainside
+# rollout (no serving engine), 8 GPU.
+#
+# Teacher-anchored: NO reward block (legal since the A1 capability negotiation —
+# requires_advantages=False algorithms may omit `reward:`; add a monitoring-only
+# reward if desired). The loss is the stop-gradient policy-gradient OPD estimator
+# in unirl/algorithms/README.md — NOT direct KD on mean(student_logp - teacher_logp).
+#
+# Teacher: the frozen LoRA adapter named `teacher` (backend.lora_cfg.frozen_adapters),
+# injected pre-FSDP-wrap on the same backbone as the trainable student adapter
+# (`default`). Same tokenizer/vocabulary by construction. Build one with the SFT
+# path (see the A2 PR's test plan) and point TEACHER_LORA_PATH at its checkpoint dir.
+#
+# A2 scope locks: single teacher, synchronous ARTrainer, one sample per prompt,
+# one optimizer update per rollout (supports_multi_update=False), no reward.
+#
+# Data prep (one-time) — build the local jsonl from the raw DAPO-Math-17k dataset:
+#   python datasets/dapo_math/prepare_dapo_math.py --out-dir data/dapo_math
+#   → data/dapo_math/{train.jsonl, aime_eval.jsonl}
+#
+# Run (8 GPU; shrink num_devices + add +devices_per_node for smaller nodes):
+#   TEACHER_LORA_PATH=<teacher-adapter-dir> \
+#   DATA_PATH=data/dapo_math/train.jsonl \
+#   python -m unirl.train_ar --config-name=ar/qwen3_aropd_4b_base_dapo_trainside num_devices=8
+
+num_devices: 8
+batch_size: 16 # prompts_per_rollout
+num_rollouts: 100
+weight_sync_interval: 1 # unused without a serving rollout; kept for symmetry
+eval_interval: 0 # no reward -> no eval scoring (ARTrainer rejects eval_interval>0)
+
+logging:
+  report_to_wandb: true
+  project_name: unirl-aropd
+  run_name: aropd_qwen3-4b-base_dapo_trainside
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: [aropd, opd, distillation, qwen3, 4b-base, dapo, trainside, v2]
+
+bundle:
+  _target_: unirl.models.qwen3.bundle.Qwen3Bundle.from_config
+  config:
+    _target_: unirl.models.qwen3.config.Qwen3PipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:QWEN3_PATH,Qwen/Qwen3-4B-Base}
+    # fp32 storage: the frozen backbone is the teacher's base — exact replay
+    # keeps the teacher gap measurements free of bf16 cast noise.
+    model_precision: fp32
+    use_gradient_checkpointing: true
+    # sdpa: trainside replay falls back to the padded path (packed-varlen needs
+    # flex/flash). flex_attention requires a working inductor autotune, which
+    # some driver/GPU combos lack (H20 + torch 2.11 cu126: NoValidChoicesError
+    # at generation). sdpa is the portable choice for a recipe whose rollout
+    # itself runs on the train side.
+    attn_implementation: sdpa
+
+pipeline:
+  _target_: unirl.models.qwen3.pipeline.Qwen3Pipeline.from_bundle
+  # MUST match the rollout's trainside chat template (enable_thinking: true
+  # below) so train/rollout prompts agree.
+  enable_thinking: true
+  autocast_precision: bf16
+  # fp32: per-token logp un-rounded — the teacher gap is the training signal,
+  # keep both sides of the subtraction on the same exact scale.
+  logprob_precision: fp32
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["Qwen3DecoderLayer"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true
+    use_torch_compile: false
+    forward_prefetch: false
+    defer_grad_sync: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    # LoRA student (rank 16) — a full-weight lr (1e-6) barely moves an adapter;
+    # 1e-5 is the usual LoRA-RL range. Halve it if the gap oscillates.
+    learning_rate: 1.0e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 1000
+  # Student = the trainable `default` LoRA adapter; teacher = the frozen adapter
+  # `teacher` injected pre-FSDP-wrap and loaded from TEACHER_LORA_PATH. AROPD
+  # routes teacher replays through it via adapter_active().
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 16
+    alpha: 32
+    dropout: 0.0
+    bias: none
+    task_type: CAUSAL_LM
+    target_modules: [q_proj, k_proj, v_proj, o_proj]
+    frozen_adapters:
+      - name: teacher
+        path: ${oc.env:TEACHER_LORA_PATH}
+
+rollout:
+  # In-process trainside rollout: the train actor's Qwen3 pipeline IS the
+  # sampler (stage_attrs: ["ar"]) — no serving engine, no weight sync. The
+  # rollout generates under the student (`default`) adapter; AROPD's
+  # prepare_segment replays the same segments under the frozen teacher adapter.
+  _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
+  stage_attrs: [ar]
+
+algorithm:
+  _target_: unirl.algorithms.aropd.AROPD
+  stage_attr: ar # resolves stage from the trainer-injected pipeline (.ar)
+  teacher: teacher # must match backend.lora_cfg.frozen_adapters[].name
+  # Batch-normalize the per-token gap (control variate, unbiased; bounds the
+  # -15-nat spikes a teacher emits on continuations it despises — mirrors GRPO's
+  # normalize_adv_by_std). Set false for the raw-gap estimator.
+  normalize_gap: true
+  # 1.0 — must equal sampling.temperature below so the teacher replay's
+  # log_softmax(logits/T) matches the rollout sampler's tempered log-probs.
+  sampling_temperature: ${sampling.temperature}
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.qwen3.conditions.Qwen3ARConditions
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  # AROPD freezes the teacher anchor per rollout; multi-update against it is
+  # unvalidated (supports_multi_update=False -> the stack enforces exactly 1).
+  num_updates_per_batch: 1
+  # CountPlanner (no micro_planner): token-budget packing requires a
+  # seq-mean loss_agg_mode, which AROPD's masked token-mean does not declare.
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: ${oc.env:DATA_PATH} # local jsonl; build with datasets/dapo_math/prepare_dapo_math.py
+      eval_data_path: ${oc.env:EVAL_DATA_PATH,${oc.env:DATA_PATH}}
+      seed: 42
+    algorithm:
+      prompts_per_rollout: 16 # 16 prompts x 1 sample = 16 sequences / rollout
+
+sampling:
+  _target_: unirl.types.sampling.ARSamplingParams
+  # A2 scope: one sample per prompt (the gap estimator needs no group).
+  samples_per_prompt: 1
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 0 # off — Qwen3's generation_config default (20) would peak sampling
+  max_new_tokens: 512
