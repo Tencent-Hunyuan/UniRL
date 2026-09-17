@@ -118,6 +118,7 @@ class ARTrainer(BaseTrainer):
         self.sampling_params: Dict[str, BaseSamplingParams] = build_sampling_dict(sampling_cfg)
 
         self.weight_sync = None
+        self._gpu_streaming_sync = False
         self._supports_staged_wake = False
 
         with placement(self.pool, fraction=1.0, shared_workers=True):
@@ -204,6 +205,11 @@ class ARTrainer(BaseTrainer):
                     self.weight_sync = remote_hydra(sync_cfg, backend=self.backend)
                     self.weight_sync.set_rollout_targets([(self.rollout.role_name, self.rollout.workers)])
 
+        if self.weight_sync is not None:
+            uses_gpu_streaming = getattr(self.weight_sync, "uses_gpu_streaming", None)
+            if callable(uses_gpu_streaming):
+                self._gpu_streaming_sync = bool(uses_gpu_streaming())
+
     def _ensure_anchored_backend_loaded(self) -> None:
         if not self._enable_fsdp_offload or self._anchored_backend_offloaded is False:
             return
@@ -236,6 +242,9 @@ class ARTrainer(BaseTrainer):
         self.rollout.sleep()
         self._anchored_rollout_awake = False
 
+    def _uses_gpu_streaming_weight_sync(self) -> bool:
+        return self._gpu_streaming_sync
+
     @contextmanager
     def _anchored_rollout_session(
         self,
@@ -247,6 +256,11 @@ class ARTrainer(BaseTrainer):
         original_error: Optional[BaseException] = None
         try:
             if sync_weights and self.weight_sync is not None:
+                if self._uses_gpu_streaming_weight_sync():
+                    raise RuntimeError(
+                        "vLLM native IPC weight sync requires the SPMD one-Actor-rank-per-TP-rank "
+                        "layout and does not support rollout_anchor_device"
+                    )
                 self._ensure_anchored_backend_loaded()
                 self.weight_sync.extract()
             self._ensure_anchored_backend_offloaded()
@@ -294,14 +308,31 @@ class ARTrainer(BaseTrainer):
         do_sync = sync_weights and self.weight_sync is not None
         train_state_maybe_offloaded = False
         full_wake_after_train_offload_in_progress = False
+        gpu_streaming_sync = bool(do_sync and self._uses_gpu_streaming_weight_sync())
+        if gpu_streaming_sync and not do_offload:
+            raise RuntimeError(
+                "vLLM native IPC weight sync requires enable_fsdp_offload=true "
+                "so optimizer/model state can be released around rollout"
+            )
 
         try:
             if do_sync and do_offload and self._supports_staged_wake:
-                self.rollout.wake_up(tags=["weights"])
-                self.weight_sync.sync()
-                train_state_maybe_offloaded = True
-                self.backend.offload()
-                full_wake_after_train_offload_in_progress = True
+                if gpu_streaming_sync:
+                    # Keep only the FSDP local parameter shard resident.  The
+                    # optimizer is not needed by weight export and gradients
+                    # have already been consumed by the preceding step.
+                    self.backend.offload(model=False, optimizer=True, clear_gradients=True)
+                    train_state_maybe_offloaded = True
+                    full_wake_after_train_offload_in_progress = True
+                    self.rollout.wake_up(tags=["weights"])
+                    self.weight_sync.sync()
+                    self.backend.offload(model=True, optimizer=False)
+                else:
+                    self.rollout.wake_up(tags=["weights"])
+                    self.weight_sync.sync()
+                    train_state_maybe_offloaded = True
+                    self.backend.offload()
+                    full_wake_after_train_offload_in_progress = True
                 self.rollout.wake_up()
                 full_wake_after_train_offload_in_progress = False
             elif do_sync:

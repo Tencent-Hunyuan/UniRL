@@ -23,6 +23,13 @@ class BaseEngineConfig(ABC):
 class BaseRolloutEngine(Remote, ABC):
     """Rollout engine ABC: fill and return one ``Sample``; ``generate`` may be called concurrently."""
 
+    _component_name = "base"
+
+    @classmethod
+    def component_name(cls) -> str:
+        """Return the stable framework identifier for this engine type."""
+        return cls._component_name
+
     @abstractmethod
     def shutdown(self) -> None:
         """Release worker subprocesses and any other engine-owned resources."""
