@@ -353,15 +353,19 @@ def _apply_optimizer_state_dict(
     from torch.distributed.checkpoint.state_dict import set_optimizer_state_dict
 
     was_cold = _is_cold_optimizer(optimizer)
-    incoming_cold = _optimizer_state_dict_is_cold(state_dict)
     step_count = getattr(optimizer, "_step_count", None)
     lrs = [group.get("lr") for group in optimizer.param_groups]
     applied = False
+    incoming_cold = False
     try:
         try:
             set_optimizer_state_dict(model, optimizer, optim_state_dict=state_dict, options=options)
         except TypeError:
             set_optimizer_state_dict(model, optimizer, optim_state_dict=state_dict)
+        if was_cold:
+            incoming_cold = _optimizer_state_dict_is_cold({"state": optimizer.state})
+            if incoming_cold:
+                lrs = [group.get("lr") for group in optimizer.param_groups]
         applied = True
     finally:
         if was_cold and (not applied or incoming_cold):
