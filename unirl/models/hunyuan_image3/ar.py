@@ -98,9 +98,21 @@ class HunyuanImage3ARStep(ARStep[HunyuanImage3Bundle, HunyuanImage3ARConditions,
         input_ids: torch.Tensor = fused.input_ids
         batch_size = int(input_ids.shape[0])
 
+        if batch_size > 1 and self._real_pos(conditions, device=input_ids.device) is None:
+            raise ValueError(
+                "HunyuanImage3ARStep.init_state: batched AR requires "
+                "conditions.tokenizer_output.real_pos — the per-row first-<pad> index. "
+                "Without it the static KV cache cannot be masked per row, so short rows would "
+                "attend their own right-pad KV and be fed a pad token as the next input. "
+                "Populate it via HunyuanImage3TextEmbedStage.embed_for_ar(...)."
+            )
+
         prompt_len = int(input_ids.shape[1])
         past_kv_initial = self._build_kv_cache(
-            transformer, batch_size=batch_size, max_cache_len=prompt_len + int(max_new_tokens)
+            transformer,
+            batch_size=batch_size,
+            max_cache_len=prompt_len + int(max_new_tokens),
+            dynamic=batch_size == 1,
         )
 
         cond_vit = conditions.cond_vit
@@ -152,6 +164,7 @@ class HunyuanImage3ARStep(ARStep[HunyuanImage3Bundle, HunyuanImage3ARConditions,
         device = state.input_ids.device
         batch_size = int(state.input_ids.shape[0])
         model_kwargs = state.model_kwargs
+        real_pos = self._real_pos(conditions, device=device)
 
         cond_kwargs: Dict[str, Any] = {}
         if state.step_idx == 0:
@@ -164,10 +177,17 @@ class HunyuanImage3ARStep(ARStep[HunyuanImage3Bundle, HunyuanImage3ARConditions,
                 "cond_timesteps": model_kwargs.get("cond_timesteps"),
                 "cond_timesteps_index": model_kwargs.get("cond_timesteps_index"),
             }
+        past_key_values = model_kwargs.get("past_key_values")
+        attention_mask = self._cache_attention_mask(
+            model_kwargs.get("attention_mask"),
+            past_key_values,
+            real_pos,
+            step_idx=state.step_idx,
+        )
         model_inputs = transformer.prepare_inputs_for_generation(
             state.input_ids,
-            past_key_values=model_kwargs.get("past_key_values"),
-            attention_mask=model_kwargs.get("attention_mask"),
+            past_key_values=past_key_values,
+            attention_mask=attention_mask,
             tokenizer_output=model_kwargs.get("tokenizer_output"),
             position_ids=model_kwargs["position_ids"],
             custom_pos_emb=model_kwargs["custom_pos_emb"],
@@ -185,16 +205,10 @@ class HunyuanImage3ARStep(ARStep[HunyuanImage3Bundle, HunyuanImage3ARConditions,
             raise RuntimeError("HunyuanImage3ARStep.step: model output has no .logits in mode='gen_text'.")
 
         logits_device = logits.device
-        if state.step_idx == 0 and conditions.tokenizer_output is not None:
-            real_pos = getattr(conditions.tokenizer_output, "real_pos", None)
-            if real_pos is not None:
-                real_pos_t = real_pos.to(device=logits_device, dtype=torch.long)
-                if real_pos_t.dim() == 2:
-                    real_pos_t = real_pos_t[:, -1]
-                last_valid = (real_pos_t - 1).clamp(min=0, max=logits.shape[1] - 1)
-                next_logits = logits[torch.arange(batch_size, device=logits_device), last_valid]
-            else:
-                next_logits = logits[:, -1, :]
+        if state.step_idx == 0 and real_pos is not None:
+            real_pos_t = real_pos.to(device=logits_device)
+            last_valid = (real_pos_t - 1).clamp(min=0, max=logits.shape[1] - 1)
+            next_logits = logits[torch.arange(batch_size, device=logits_device), last_valid]
         else:
             next_logits = logits[:, -1, :]
         if next_logits.device != device:
@@ -202,7 +216,13 @@ class HunyuanImage3ARStep(ARStep[HunyuanImage3Bundle, HunyuanImage3ARConditions,
 
         token_id, log_prob = self.sample(next_logits)
 
-        state.input_ids = torch.cat([state.input_ids, token_id.unsqueeze(-1)], dim=1)
+        state.input_ids = self._place_token(
+            state.input_ids,
+            token_id,
+            real_pos,
+            step_idx=state.step_idx,
+            pad_id=int(getattr(transformer.config, "pad_id", 0) or 0),
+        )
         updated = transformer._update_model_kwargs_for_generation(out, model_kwargs)
         new_kwargs: Dict[str, Any] = dict(updated)
         for carry in ("cond_vit_images", "cond_vit_image_mask", "vit_kwargs", "custom_pos_emb", "rope_image_info"):
@@ -215,8 +235,61 @@ class HunyuanImage3ARStep(ARStep[HunyuanImage3Bundle, HunyuanImage3ARConditions,
         return token_id, log_prob, state
 
     @staticmethod
-    def _build_kv_cache(transformer, *, batch_size: int, max_cache_len: int):
-        """Pre-build a ``HunyuanStaticCache`` for the AR loop."""
+    def _real_pos(conditions: HunyuanImage3ARConditions, *, device: torch.device) -> Optional[torch.Tensor]:
+        """Per-row true prompt length — the first ``<pad>`` index, so also the next free slot. [B] long"""
+        if conditions.tokenizer_output is None:
+            return None
+        real_pos = getattr(conditions.tokenizer_output, "real_pos", None)
+        if real_pos is None:
+            return None
+        real_pos = real_pos.to(device=device, dtype=torch.long)
+        if real_pos.dim() == 2:
+            real_pos = real_pos[:, -1]
+        return real_pos.reshape(-1)
+
+    @staticmethod
+    def _cache_attention_mask(
+        attention_mask: Optional[torch.Tensor],
+        past_key_values: Any,
+        real_pos: Optional[torch.Tensor],
+        *,
+        step_idx: int,
+    ) -> Optional[torch.Tensor]:
+        """Extend a bool mask over a non-dynamic cache's full key axis — see README ``## Gotchas``. [B, 1, q, S] bool"""
+        if real_pos is None or getattr(past_key_values, "dynamic", True):
+            return attention_mask
+        key_len = int(past_key_values.max_cache_len)
+        if attention_mask is not None:
+            pad = key_len - int(attention_mask.shape[-1])
+            if pad <= 0:
+                return attention_mask
+            tail = torch.zeros(
+                *attention_mask.shape[:-1], pad, dtype=attention_mask.dtype, device=attention_mask.device
+            )
+            return torch.cat([attention_mask, tail], dim=-1)
+        keys = torch.arange(key_len, device=real_pos.device)
+        return (keys[None, :] < (real_pos[:, None] + step_idx))[:, None, None, :]
+
+    @staticmethod
+    def _place_token(
+        input_ids: torch.Tensor,
+        token_id: torch.Tensor,
+        real_pos: Optional[torch.Tensor],
+        *,
+        step_idx: int,
+        pad_id: int,
+    ) -> torch.Tensor:
+        """Write the sampled token at each row's own next slot ``real_pos + step_idx`` in the right-padded buffer."""
+        grown = torch.cat([input_ids, torch.full_like(input_ids[:, :1], pad_id)], dim=1)
+        if real_pos is None:
+            grown[:, -1] = token_id
+            return grown
+        slot = (real_pos.to(device=grown.device) + step_idx).unsqueeze(-1)
+        return grown.scatter(1, slot, token_id.unsqueeze(-1))
+
+    @staticmethod
+    def _build_kv_cache(transformer, *, batch_size: int, max_cache_len: int, dynamic: bool):
+        """Pre-build a ``HunyuanStaticCache`` for the AR loop — see README ``## Gotchas`` for ``dynamic``."""
         import sys as _sys
 
         upstream_mod = _sys.modules.get(type(transformer).__module__)
@@ -232,7 +305,7 @@ class HunyuanImage3ARStep(ARStep[HunyuanImage3Bundle, HunyuanImage3ARConditions,
                 batch_size=batch_size,
                 max_cache_len=max_cache_len,
                 dtype=torch.bfloat16,
-                dynamic=True,
+                dynamic=dynamic,
             )
         except Exception:  # noqa: BLE001 -- fall back to HF default cache
             return None
