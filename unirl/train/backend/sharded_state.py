@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Dict, Iterator, List, Optional
+from typing import Dict, Iterator, Optional
 
 import torch
 from torch import nn
@@ -54,9 +54,10 @@ def load_model_state_dict(
 
 
 def gather_optimizer_state_dict(model: nn.Module, optimizer: torch.optim.Optimizer) -> StateDict:
-    """Rank-0 DCP optimizer gather (empty on other ranks); cold AdamW stays unstepped. See ``../readme.md`` Gotchas."""
+    """Rank-0 DCP optimizer gather; preserves cold AdamW state."""
     options = _build_state_dict_options(full_state_dict=True, cpu_offload=True)
-    return _export_optimizer_state_dict(model, optimizer, options=options, rank0_only=True)
+    full = _export_optimizer_state_dict(model, optimizer, options=options)
+    return full if _current_rank() == 0 else {}
 
 
 def gather_lora_state_dict(model: nn.Module) -> StateDict:
@@ -84,13 +85,18 @@ def load_optimizer_state_dict(
     *,
     broadcast_from_rank0: bool = True,
 ) -> None:
-    """Load a full optimizer state dict; a cold checkpoint leaves AdamW unstepped. See ``../readme.md`` Gotchas."""
+    """Load a full optimizer state dict and reshard it into ``optimizer``."""
+    from torch.distributed.checkpoint.state_dict import set_optimizer_state_dict
+
     options = _build_state_dict_options(
         full_state_dict=True,
         broadcast_from_rank0=broadcast_from_rank0,
         cpu_offload=False,
     )
-    _apply_optimizer_state_dict(model, optimizer, state_dict, options=options)
+    try:
+        set_optimizer_state_dict(model, optimizer, optim_state_dict=state_dict, options=options)
+    except TypeError:
+        set_optimizer_state_dict(model, optimizer, optim_state_dict=state_dict)
 
 
 def sharded_model_state_dict(model: nn.Module) -> StateDict:
@@ -105,9 +111,9 @@ def sharded_model_state_dict(model: nn.Module) -> StateDict:
 
 
 def sharded_optimizer_state_dict(model: nn.Module, optimizer: torch.optim.Optimizer) -> StateDict:
-    """Per-rank sharded optimizer state for DCP; cold AdamW stays unstepped. See ``../readme.md`` Gotchas."""
+    """Per-rank sharded optimizer state for DCP; preserves cold AdamW state."""
     options = _build_state_dict_options(full_state_dict=False)
-    return _export_optimizer_state_dict(model, optimizer, options=options, rank0_only=False)
+    return _export_optimizer_state_dict(model, optimizer, options=options)
 
 
 def load_sharded_model_state_dict(model: nn.Module, state_dict: StateDict, *, strict: bool = True) -> None:
@@ -124,9 +130,14 @@ def load_sharded_model_state_dict(model: nn.Module, state_dict: StateDict, *, st
 def load_sharded_optimizer_state_dict(
     model: nn.Module, optimizer: torch.optim.Optimizer, state_dict: StateDict
 ) -> None:
-    """Load sharded optimizer state; a cold checkpoint leaves AdamW unstepped. See ``../readme.md`` Gotchas."""
+    """Load a per-rank sharded optimizer state read by ``dcp.load`` in place."""
+    from torch.distributed.checkpoint.state_dict import set_optimizer_state_dict
+
     options = _build_state_dict_options(full_state_dict=False)
-    _apply_optimizer_state_dict(model, optimizer, state_dict, options=options)
+    try:
+        set_optimizer_state_dict(model, optimizer, optim_state_dict=state_dict, options=options)
+    except TypeError:
+        set_optimizer_state_dict(model, optimizer, optim_state_dict=state_dict)
 
 
 def drop_meta_entries(state_dict: StateDict) -> StateDict:
@@ -258,60 +269,12 @@ def _to_cpu_state_dict(state_dict: StateDict) -> StateDict:
     return converted
 
 
-def _is_cold_optimizer(optimizer: torch.optim.Optimizer) -> bool:
-    if optimizer.state:
-        return False
-    for group in optimizer.param_groups:
-        for param in group["params"]:
-            if param.grad is not None:
-                return False
-    return True
-
-
-def _optimizer_state_entries(state_dict: StateDict) -> Iterator[Dict[str, object]]:
-    state = state_dict.get("state")
-    if not isinstance(state, dict):
-        return
-    for entry in state.values():
-        if isinstance(entry, dict) and "step" in entry:
-            yield entry
-
-
-def _zero_optimizer_steps(state_dict: StateDict) -> None:
-    for entry in _optimizer_state_entries(state_dict):
-        step = entry["step"]
-        entry["step"] = torch.zeros_like(step) if isinstance(step, torch.Tensor) else 0
-
-
-def _optimizer_state_dict_is_cold(state_dict: StateDict) -> bool:
-    if not state_dict.get("state"):
-        return True
-    entries = list(_optimizer_state_entries(state_dict))
-    if not entries:
-        return False
-    for entry in entries:
-        step = entry["step"]
-        if isinstance(step, torch.Tensor):
-            if bool(local_view(step).detach().cpu().any()):
-                return False
-        elif step != 0:
-            return False
-    return True
-
-
-def _restore_cold_optimizer(
-    optimizer: torch.optim.Optimizer,
-    *,
-    step_count: Optional[int],
-    lrs: List[object],
-) -> None:
-    optimizer.state.clear()
-    for group, lr in zip(optimizer.param_groups, lrs):
-        if "lr" in group:
-            group["lr"] = lr
-    if step_count is not None:
-        optimizer._step_count = step_count
-    optimizer.zero_grad(set_to_none=True)
+def _is_cold_adamw(optimizer: torch.optim.Optimizer) -> bool:
+    return (
+        isinstance(optimizer, torch.optim.AdamW)
+        and not optimizer.state
+        and all(param.grad is None for group in optimizer.param_groups for param in group["params"])
+    )
 
 
 def _export_optimizer_state_dict(
@@ -319,57 +282,27 @@ def _export_optimizer_state_dict(
     optimizer: torch.optim.Optimizer,
     *,
     options: object,
-    rank0_only: bool,
 ) -> StateDict:
-    """Call ``get_optimizer_state_dict`` without advancing a cold AdamW clock. See ``../readme.md`` Gotchas."""
+    """Export without advancing a cold AdamW clock."""
     from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
 
-    cold = _is_cold_optimizer(optimizer)
-    step_count = getattr(optimizer, "_step_count", None)
-    lrs = [group.get("lr") for group in optimizer.param_groups]
+    cold = _is_cold_adamw(optimizer)
     try:
         try:
             exported = dict(get_optimizer_state_dict(model, optimizer, options=options))
         except TypeError:
             exported = dict(get_optimizer_state_dict(model, optimizer))
         if cold:
-            _zero_optimizer_steps(exported)
-        if rank0_only and _current_rank() != 0:
-            return {}
+            state = exported.get("state")
+            if isinstance(state, dict):
+                for entry in state.values():
+                    step = entry["step"]
+                    entry["step"] = torch.zeros_like(step) if isinstance(step, torch.Tensor) else 0
         return exported
     finally:
         if cold:
-            _restore_cold_optimizer(optimizer, step_count=step_count, lrs=lrs)
-
-
-def _apply_optimizer_state_dict(
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    state_dict: StateDict,
-    *,
-    options: object,
-) -> None:
-    """Call ``set_optimizer_state_dict`` without leaving a dummy step on a cold AdamW. See ``../readme.md`` Gotchas."""
-    from torch.distributed.checkpoint.state_dict import set_optimizer_state_dict
-
-    was_cold = _is_cold_optimizer(optimizer)
-    step_count = getattr(optimizer, "_step_count", None)
-    lrs = [group.get("lr") for group in optimizer.param_groups]
-    applied = False
-    incoming_cold = False
-    try:
-        try:
-            set_optimizer_state_dict(model, optimizer, optim_state_dict=state_dict, options=options)
-        except TypeError:
-            set_optimizer_state_dict(model, optimizer, optim_state_dict=state_dict)
-        if was_cold:
-            incoming_cold = _optimizer_state_dict_is_cold({"state": optimizer.state})
-            if incoming_cold:
-                lrs = [group.get("lr") for group in optimizer.param_groups]
-        applied = True
-    finally:
-        if was_cold and (not applied or incoming_cold):
-            _restore_cold_optimizer(optimizer, step_count=step_count, lrs=lrs)
+            optimizer.state.clear()
+            optimizer.zero_grad(set_to_none=True)
 
 
 __all__ = [

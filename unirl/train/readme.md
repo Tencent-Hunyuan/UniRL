@@ -74,8 +74,8 @@ in `backend/base.py`; a multi-update-capable algorithm sets
   UniRL hits this when `optimizer_step` skips (non-finite grad, or a window
   with no backward) and `maybe_save_checkpoint` still fires. `sharded_state`
   materializes the export, writes `step=0`, and restores the live optimizer
-  to empty; loading that checkpoint does the same. Already-stepped optimizers
-  are unchanged.
+  to empty, so loading that checkpoint preserves the first real AdamW update.
+  Already-stepped optimizers are unchanged.
 - **`master_dtype` defaults to `None`, so the optimizer master follows `param_dtype`** —
   a bf16-loaded base then keeps a bf16 LoRA master and the ~1e-6 AdamW steps round
   away (the policy drifts into a degenerate reward-hack). An fp32-loaded model gets an
