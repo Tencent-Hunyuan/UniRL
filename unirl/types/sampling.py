@@ -8,6 +8,7 @@ import types
 from abc import ABC
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, fields
+from decimal import Decimal, InvalidOperation
 from numbers import Integral, Real
 from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Set, Union, get_args, get_origin, get_type_hints
 
@@ -35,9 +36,12 @@ def _as_int(value: Any, *, name: str, optional: bool = False) -> int | None:
     if isinstance(value, str):
         text = value.strip()
         try:
-            number = float(text)
-        except ValueError as exc:
+            number = Decimal(text)
+        except (InvalidOperation, ValueError) as exc:
             raise TypeError(f"{name} must be an integer, got {value!r}") from exc
+        if not number.is_finite() or number != number.to_integral_value():
+            raise ValueError(f"{name} must be an integer, got {value!r}")
+        return int(number)
     elif isinstance(value, Real):
         number = float(value)
     else:
