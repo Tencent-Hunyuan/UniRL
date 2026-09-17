@@ -284,15 +284,10 @@ def _export_optimizer_state_dict(
         and all(param.grad is None for group in optimizer.param_groups for param in group["params"])
     )
     try:
-        try:
-            exported = dict(get_optimizer_state_dict(model, optimizer, options=options))
-        except TypeError:
-            exported = dict(get_optimizer_state_dict(model, optimizer))
+        exported = get_optimizer_state_dict(model, optimizer, options=options)
         if cold:
-            state = exported.get("state")
-            if isinstance(state, dict):
-                for entry in state.values():
-                    entry["step"] = torch.zeros_like(entry["step"])
+            for entry in exported.get("state", {}).values():
+                entry["step"] = torch.zeros_like(entry["step"])
         return exported
     finally:
         if cold:
