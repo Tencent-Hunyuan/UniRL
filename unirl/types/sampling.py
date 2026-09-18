@@ -61,7 +61,8 @@ class BaseSamplingParams(ABC):
     samples_per_prompt: int = 1
 
     def __post_init__(self) -> None:
-        self.samples_per_prompt = _coerce_type(self.samples_per_prompt, int, "samples_per_prompt")
+        cls = type(self).__name__
+        self.samples_per_prompt = _coerce_type(self.samples_per_prompt, int, f"{cls}.samples_per_prompt")
 
 
 def _is_param_dict(sampling: Any) -> bool:
@@ -132,28 +133,34 @@ class DiffusionSamplingParams(BaseSamplingParams):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        self.num_inference_steps = _coerce_type(self.num_inference_steps, int, "num_inference_steps")
-        self.guidance_scale = _coerce_type(self.guidance_scale, float, "guidance_scale")
-        self.height = _coerce_type(self.height, int, "height")
-        self.width = _coerce_type(self.width, int, "width")
-        self.num_frames = _coerce_type(self.num_frames, int, "num_frames")
-        self.seed = _coerce_type(self.seed, int, "seed", True)
-        self.init_same_noise = _coerce_type(self.init_same_noise, bool, "init_same_noise")
-        self.disable_driver_xt = _coerce_type(self.disable_driver_xt, bool, "disable_driver_xt")
-        self.eta = _coerce_type(self.eta, float, "eta")
-        self.max_sequence_length = _coerce_type(self.max_sequence_length, int, "max_sequence_length", True)
-        self.taylor_cache_interval = _coerce_type(self.taylor_cache_interval, int, "taylor_cache_interval", True)
-        self.taylor_cache_order = _coerce_type(self.taylor_cache_order, int, "taylor_cache_order", True)
+        cls = type(self).__name__
+        self.num_inference_steps = _coerce_type(self.num_inference_steps, int, f"{cls}.num_inference_steps")
+        self.guidance_scale = _coerce_type(self.guidance_scale, float, f"{cls}.guidance_scale")
+        self.height = _coerce_type(self.height, int, f"{cls}.height")
+        self.width = _coerce_type(self.width, int, f"{cls}.width")
+        self.num_frames = _coerce_type(self.num_frames, int, f"{cls}.num_frames")
+        self.seed = _coerce_type(self.seed, int, f"{cls}.seed", True)
+        self.init_same_noise = _coerce_type(self.init_same_noise, bool, f"{cls}.init_same_noise")
+        self.disable_driver_xt = _coerce_type(self.disable_driver_xt, bool, f"{cls}.disable_driver_xt")
+        self.eta = _coerce_type(self.eta, float, f"{cls}.eta")
+        self.max_sequence_length = _coerce_type(self.max_sequence_length, int, f"{cls}.max_sequence_length", True)
+        self.taylor_cache_interval = _coerce_type(
+            self.taylor_cache_interval,
+            int,
+            f"{cls}.taylor_cache_interval",
+            True,
+        )
+        self.taylor_cache_order = _coerce_type(self.taylor_cache_order, int, f"{cls}.taylor_cache_order", True)
         self.distilled_guidance_scale = _coerce_type(
             self.distilled_guidance_scale,
             float,
-            "distilled_guidance_scale",
+            f"{cls}.distilled_guidance_scale",
             True,
         )
-        self.guidance_scale_2 = _coerce_type(self.guidance_scale_2, float, "guidance_scale_2", True)
-        self.strength = _coerce_type(self.strength, float, "strength", True)
+        self.guidance_scale_2 = _coerce_type(self.guidance_scale_2, float, f"{cls}.guidance_scale_2", True)
+        self.strength = _coerce_type(self.strength, float, f"{cls}.strength", True)
         if self.init_noise_latent_shape is not None:
-            name = "init_noise_latent_shape"
+            name = f"{cls}.init_noise_latent_shape"
             if isinstance(self.init_noise_latent_shape, (str, bytes)) or not isinstance(
                 self.init_noise_latent_shape, Sequence
             ):
@@ -162,7 +169,7 @@ class DiffusionSamplingParams(BaseSamplingParams):
                 _coerce_type(item, int, f"{name}[{index}]") for index, item in enumerate(self.init_noise_latent_shape)
             ]
         if self.sde_indices is not None:
-            name = "sde_indices"
+            name = f"{cls}.sde_indices"
             if isinstance(self.sde_indices, (str, bytes)) or not isinstance(self.sde_indices, Sequence):
                 raise TypeError(f"{name} must be a sequence of integers, got {self.sde_indices!r}")
             self.sde_indices = [
@@ -172,7 +179,7 @@ class DiffusionSamplingParams(BaseSamplingParams):
         shadowed = reserved & set(self.sampler_kwargs)
         require(
             not shadowed,
-            f"{type(self).__name__}.sampler_kwargs cannot contain reserved keys {sorted(shadowed)}; set them as fields instead",
+            f"{cls}.sampler_kwargs cannot contain reserved keys {sorted(shadowed)}; set them as fields instead",
         )
 
     def resolve_sde_indices(self, rollout_id: int) -> List[int]:
@@ -200,9 +207,10 @@ class ARSamplingParams(BaseSamplingParams):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        self.temperature = _coerce_type(self.temperature, float, "temperature")
-        self.max_new_tokens = _coerce_type(self.max_new_tokens, int, "max_new_tokens")
-        self.top_p = _coerce_type(self.top_p, float, "top_p")
-        self.top_k = _coerce_type(self.top_k, int, "top_k")
-        self.stop_token_id = _coerce_type(self.stop_token_id, int, "stop_token_id", True)
-        self.seed = _coerce_type(self.seed, int, "seed", True)
+        cls = type(self).__name__
+        self.temperature = _coerce_type(self.temperature, float, f"{cls}.temperature")
+        self.max_new_tokens = _coerce_type(self.max_new_tokens, int, f"{cls}.max_new_tokens")
+        self.top_p = _coerce_type(self.top_p, float, f"{cls}.top_p")
+        self.top_k = _coerce_type(self.top_k, int, f"{cls}.top_k")
+        self.stop_token_id = _coerce_type(self.stop_token_id, int, f"{cls}.stop_token_id", True)
+        self.seed = _coerce_type(self.seed, int, f"{cls}.seed", True)
