@@ -325,7 +325,7 @@ def run_tp_sync(args: argparse.Namespace) -> dict[str, Any]:
         {
             "enable_lora": True,
             "max_lora_rank": 8,
-            "lora_target_modules": ["q_proj"],
+            "lora_target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
         }
     )
     config = SGLangEngineConfig(
@@ -366,7 +366,7 @@ def run_tp_sync(args: argparse.Namespace) -> dict[str, Any]:
                 lora_dropout=0.0,
                 bias="none",
                 task_type="CAUSAL_LM",
-                target_modules=["q_proj"],
+                target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
             ),
         )
         backend = _PlainSyncBackend(pipeline.bundle.transformer)
