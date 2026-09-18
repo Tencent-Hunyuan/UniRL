@@ -24,45 +24,35 @@ def _coerce(
     optional: bool = False,
 ) -> int | float | bool | None:
     """Coerce a scalar config value to ``target``, preserving optional ``None``."""
-    if target is int:
-        expected = "an integer"
-    elif target is float:
-        expected = "a finite float"
-    elif target is bool:
-        expected = "a boolean"
-    else:
-        raise ValueError(f"unsupported coercion target {target!r}")
-
+    expected = "finite float" if target is float else target.__name__
+    message = f"{name} must be {expected}, got {value!r}"
     if value is None:
         if optional:
             return None
-        raise TypeError(f"{name} must be {expected}, got None")
+        raise TypeError(message)
 
-    if target is int:
-        if type(value) is int:
-            return value
-        if isinstance(value, str):
-            try:
-                return int(value.strip(), 10)
-            except ValueError as exc:
-                raise TypeError(f"{name} must be {expected}, got {value!r}") from exc
-    elif target is float and (type(value) in (int, float) or isinstance(value, str)):
-        try:
-            number = float(value.strip() if isinstance(value, str) else value)
-        except (ValueError, OverflowError) as exc:
-            raise TypeError(f"{name} must be {expected}, got {value!r}") from exc
-        if not math.isfinite(number):
-            raise ValueError(f"{name} must be {expected}, got {value!r}")
-        return number
-    elif target is bool and type(value) is bool:
+    if type(value) is target:
+        if target is float and not math.isfinite(value):
+            raise ValueError(message)
         return value
-    elif target is bool and isinstance(value, str):
+    if target is float and (type(value) is int or isinstance(value, str)):
+        try:
+            number = float(value)
+        except (ValueError, OverflowError) as exc:
+            raise TypeError(message) from exc
+        if not math.isfinite(number):
+            raise ValueError(message)
+        return number
+    if target is int and isinstance(value, str):
+        try:
+            return int(value.strip(), 10)
+        except ValueError as exc:
+            raise TypeError(message) from exc
+    if target is bool and isinstance(value, str):
         key = value.strip().lower()
-        if key == "true":
-            return True
-        if key == "false":
-            return False
-    raise TypeError(f"{name} must be {expected}, got {value!r}")
+        if key in ("true", "false"):
+            return key == "true"
+    raise TypeError(message)
 
 
 @dataclass
