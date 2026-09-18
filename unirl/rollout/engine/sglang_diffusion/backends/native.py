@@ -10,6 +10,23 @@ from unirl.rollout.engine.sglang_diffusion.backends.base import RawResult
 logger = logging.getLogger(__name__)
 
 
+def _strip_flattened_bucket_module_prefix(payload: Any, target_modules: List[str]) -> bool:
+    """Make legacy pipeline-qualified bucket names relative to one upstream module."""
+    if len(target_modules) != 1 or not isinstance(payload, dict):
+        return False
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, list):
+        return False
+    prefix = f"{target_modules[0]}."
+    changed = False
+    for item in metadata:
+        name = getattr(item, "name", None)
+        if isinstance(name, str) and name.startswith(prefix):
+            item.name = name[len(prefix) :]
+            changed = True
+    return changed
+
+
 def _import_sglang_runtime() -> Dict[str, Any]:
     """Install the UniRL patch suite, then import the runtime types. Once per process."""
     from unirl.rollout.engine.sglang_diffusion._patches import SglangDiffusionHijack
@@ -172,6 +189,15 @@ class SGLangBackend:
         load_format: Optional[str],
         flush_cache: bool,
     ) -> None:
+        if load_format == "flattened_bucket":
+            serializer = self._rt["MultiprocessingSerializer"]
+            normalized_payloads = []
+            for serialized in serialized_named_tensors:
+                payload = serializer.deserialize(serialized)
+                if _strip_flattened_bucket_module_prefix(payload, target_modules):
+                    serialized = serializer.serialize(payload, output_str=isinstance(serialized, str))
+                normalized_payloads.append(serialized)
+            serialized_named_tensors = normalized_payloads
         request = self._rt["UpdateWeightFromTensorReqInput"](
             serialized_named_tensors=serialized_named_tensors,
             target_modules=list(target_modules),

@@ -7,7 +7,10 @@ from unirl.rollout.engine.sglang_diffusion._patches import (
     patch_gpu_worker,
     patch_rollout_trajectory,
 )
-from unirl.rollout.engine.sglang_diffusion.backends.native import SGLangBackend
+from unirl.rollout.engine.sglang_diffusion.backends.native import (
+    SGLangBackend,
+    _strip_flattened_bucket_module_prefix,
+)
 from unirl.rollout.engine.sglang_diffusion.config import (
     SGLangDiffusionEngineConfig,
 )
@@ -40,8 +43,15 @@ class _SchedulerClient:
 
 class _Serializer:
     @staticmethod
-    def serialize(value):
+    def serialize(value, output_str=False):
+        del output_str
         return ("serialized", value)
+
+    @staticmethod
+    def deserialize(value):
+        if isinstance(value, tuple) and value[0] == "payload":
+            return value[1]
+        return {"metadata": []}
 
 
 def _backend():
@@ -77,6 +87,41 @@ def test_tensor_update_uses_native_request_and_preserves_flush_cache():
     assert request.target_modules == ["transformer"]
     assert request.load_format == "flattened_bucket"
     assert request.flush_cache is False
+
+
+def test_tensor_update_strips_legacy_pipeline_prefix_for_upstream_module_loader():
+    backend, client = _backend()
+    payload = {
+        "flattened_tensor": object(),
+        "metadata": [
+            SimpleNamespace(name="transformer.pos_embed.proj.weight"),
+            SimpleNamespace(name="transformer.proj_out.weight"),
+        ],
+    }
+
+    backend.update_from_tensor(
+        serialized_named_tensors=[("payload", payload)],
+        target_modules=["transformer"],
+        load_format="flattened_bucket",
+        flush_cache=True,
+    )
+
+    request = client.requests[0]
+    normalized = request.serialized_named_tensors[0][1]
+    assert [item.name for item in normalized["metadata"]] == [
+        "pos_embed.proj.weight",
+        "proj_out.weight",
+    ]
+
+
+def test_tensor_prefix_strip_is_noop_for_relative_or_multi_module_payload():
+    relative = {"metadata": [SimpleNamespace(name="proj_out.weight")]}
+    multi = {"metadata": [SimpleNamespace(name="transformer.proj_out.weight")]}
+
+    assert not _strip_flattened_bucket_module_prefix(relative, ["transformer"])
+    assert not _strip_flattened_bucket_module_prefix(multi, ["transformer", "transformer_2"])
+    assert relative["metadata"][0].name == "proj_out.weight"
+    assert multi["metadata"][0].name == "transformer.proj_out.weight"
 
 
 def test_lora_update_uses_native_lora_merge_mode():

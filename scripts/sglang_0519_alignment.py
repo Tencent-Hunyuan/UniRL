@@ -539,7 +539,7 @@ def run_sd3_sync(args: argparse.Namespace) -> dict[str, Any]:
         base_parameter = next(
             parameter
             for name, parameter in pipeline.bundle.transformer.named_parameters()
-            if name.endswith("pos_embed.proj.weight")
+            if name.endswith("proj_out.weight")
         )
         with torch.no_grad():
             base_parameter.add_(0.05)
