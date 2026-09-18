@@ -78,6 +78,7 @@ class UnifiedModelTrainer(BaseTrainer):
         dump_dir: Optional[str] = None,
         logging_cfg: Optional[DictConfig] = None,
         enable_fsdp_offload: bool = True,
+        rollout_pipeline_chunks: int = 1,
         eval_interval: int = 0,
         eval_num_prompts: int = 32,
         eval_cfg_text_scale: float = 4.0,
@@ -87,6 +88,11 @@ class UnifiedModelTrainer(BaseTrainer):
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
         self.batch_size = batch_size
         self._enable_fsdp_offload = bool(enable_fsdp_offload)
+        self._rollout_pipeline_chunks = int(rollout_pipeline_chunks)
+        if self._rollout_pipeline_chunks < 1:
+            raise ValueError(
+                f"UnifiedModelTrainer.rollout_pipeline_chunks must be >= 1; got {rollout_pipeline_chunks}."
+            )
 
         self.eval_interval = int(eval_interval)
         self.eval_num_prompts = int(eval_num_prompts)
@@ -236,7 +242,7 @@ class UnifiedModelTrainer(BaseTrainer):
 
         n = sample.parts[0].batch_size
         if self.dp <= 1 or n <= 1:
-            return self._run_rollout_one(self.ar_rollouts[0], self.dit_rollouts[0], sample)
+            return self._run_rollout_pipelined(self.ar_rollouts[0], self.dit_rollouts[0], sample)
 
         groups = sample.split()
         bounds = [(n * r) // self.dp for r in range(self.dp + 1)]
@@ -246,11 +252,69 @@ class UnifiedModelTrainer(BaseTrainer):
             if lo >= hi:
                 continue
             sub = Sample.concat(groups[lo:hi])
-            shards.append(self._run_rollout_one(self.ar_rollouts[r], self.dit_rollouts[r], sub))
+            shards.append(self._run_rollout_pipelined(self.ar_rollouts[r], self.dit_rollouts[r], sub))
         return Sample.concat(shards)
+
+    def _pipeline_chunk_bounds(self, n_prompts: int) -> List[Tuple[int, int]]:
+        """Return contiguous prompt-tree ranges, or [] for the serial path."""
+        chunks = int(self._rollout_pipeline_chunks)
+        if chunks <= 1 or n_prompts <= 1:
+            return []
+        chunks = min(chunks, n_prompts)
+        bounds = [(n_prompts * i) // chunks for i in range(chunks + 1)]
+        return [(bounds[i], bounds[i + 1]) for i in range(chunks) if bounds[i] < bounds[i + 1]]
+
+    def _run_rollout_pipelined(self, ar_engine: Any, dit_engine: Any, sample: Sample) -> Sample:
+        """Overlap AR and DiT on adjacent chunks with one pending call per engine."""
+        spans = self._pipeline_chunk_bounds(int(sample.parts[0].batch_size))
+        if not spans:
+            return self._run_rollout_one(ar_engine, dit_engine, sample)
+
+        groups = sample.split()
+        chunks = [Sample.concat(groups[lo:hi]) for lo, hi in spans]
+        pending_ar = None
+        pending_dit = None
+        previous = None
+        filled: List[Sample] = []
+        try:
+            pending_ar = ar_engine.launch_nowait("generate", self._build_ar_request(chunks[0]))
+            for i, chunk in enumerate(chunks):
+                ar_out = pending_ar.result()
+                pending_ar = None
+                if i + 1 < len(chunks):
+                    pending_ar = ar_engine.launch_nowait("generate", self._build_ar_request(chunks[i + 1]))
+
+                dit_request, ar_part = self._build_dit_request(chunk, ar_out)
+                completed_dit = None
+                if pending_dit is not None:
+                    completed_dit = pending_dit.result()
+                    pending_dit = None
+                pending_dit = dit_engine.launch_nowait("generate", dit_request)
+                if previous is not None:
+                    filled.append(self._finish_dit(previous[0], previous[1], completed_dit))
+                previous = (chunk, ar_part)
+
+            last_dit = pending_dit.result()
+            pending_dit = None
+            filled.append(self._finish_dit(previous[0], previous[1], last_dit))
+        except BaseException:
+            for pending in (pending_ar, pending_dit):
+                if pending is not None:
+                    try:
+                        pending.wait()
+                    except BaseException:
+                        pass
+            raise
+        return Sample.concat(filled)
 
     def _run_rollout_one(self, ar_engine: Any, dit_engine: Any, sample: Sample) -> Sample:
         """One (AR, DiT) engine pair: fill the unified ``[input, ar, image]`` lineage."""
+        ar_out = ar_engine.generate(self._build_ar_request(sample))
+        dit_request, ar_part = self._build_dit_request(sample, ar_out)
+        return self._finish_dit(sample, ar_part, dit_engine.generate(dit_request))
+
+    def _build_ar_request(self, sample: Sample) -> Sample:
+        """Build the flat AR request for one prompt-tree chunk."""
         input_part = sample.parts[0]
         ar_shell = sample.gen_part(ARSamplingParams)
         image_shell = sample.gen_part(DiffusionSamplingParams)
@@ -258,7 +322,6 @@ class UnifiedModelTrainer(BaseTrainer):
         if not isinstance(prompts, Texts):
             raise TypeError("UnifiedModelTrainer.run_rollout: input Part must contain a 'text' Texts primitive.")
         n_rec = ar_shell.sampling_params.samples_per_prompt
-        n_img = image_shell.sampling_params.samples_per_prompt
         rid = self._dump_rollout_id
 
         ar_texts = Texts(texts=[t for t in prompts.texts for _ in range(n_rec)])
@@ -273,7 +336,19 @@ class UnifiedModelTrainer(BaseTrainer):
             .fork(1, sampling_params=image_shell.sampling_params)
             .fork(1, sampling_params=ar_shell.sampling_params)
         )
-        ar_out = ar_engine.generate(ar_request)
+        return ar_request
+
+    def _build_dit_request(self, sample: Sample, ar_out: Sample) -> Tuple[Sample, Part]:
+        """Fill the AR shell and build its dependent flat DiT request."""
+        input_part = sample.parts[0]
+        ar_shell = sample.gen_part(ARSamplingParams)
+        image_shell = sample.gen_part(DiffusionSamplingParams)
+        prompts = input_part.primitives.get("text")
+        if not isinstance(prompts, Texts):
+            raise TypeError("UnifiedModelTrainer.run_rollout: input Part must contain a 'text' Texts primitive.")
+        n_rec = ar_shell.sampling_params.samples_per_prompt
+        n_img = image_shell.sampling_params.samples_per_prompt
+        n_ar = len(prompts.texts) * n_rec
         ar_gen = ar_out.parts[-1]
         recaptions = ar_gen.primitives.get("text")
         if not isinstance(recaptions, Texts) or len(recaptions.texts) != n_ar:
@@ -296,9 +371,12 @@ class UnifiedModelTrainer(BaseTrainer):
             control=input_part.control,
         )
         cot_input = dit_input.input_child(primitives={"text": dit_cot})
-        dit_out = dit_engine.generate(
-            Sample.request(dit_input, cot_input).fork(1, sampling_params=image_shell.sampling_params)
-        )
+        return Sample.request(dit_input, cot_input).fork(1, sampling_params=image_shell.sampling_params), ar_part
+
+    def _finish_dit(self, sample: Sample, ar_part: Part, dit_out: Sample) -> Sample:
+        """Fill the image shell and materialize both tracks before DP scatter."""
+        input_part = sample.parts[0]
+        image_shell = sample.gen_part(DiffusionSamplingParams)
         img_gen = dit_out.parts[-1]
         if len(img_gen.sample_ids) != len(image_shell.sample_ids):
             raise RuntimeError(

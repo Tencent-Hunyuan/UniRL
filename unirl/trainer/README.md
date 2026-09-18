@@ -327,6 +327,10 @@ without driver-authored x_T. `media_log_interval` does not apply
 
 ## Gotchas
 
+- **HI3 two-engine rollout returns whole chunks.** `rollout_pipeline_chunks > 1`
+  overlaps the next chunk's AR with the current chunk's DiT using one pending
+  call per engine. It preserves complete prompt trees and output order; smaller
+  chunks can reduce per-engine batch throughput, so the recipe keeps this off.
 - **Multi-update means disjoint optimizer mini-batches, not repeated full-batch
   epochs.** See [Multiple optimizer updates per rollout](#multiple-optimizer-updates-per-rollout)
   for the algorithm and divisibility constraints.
