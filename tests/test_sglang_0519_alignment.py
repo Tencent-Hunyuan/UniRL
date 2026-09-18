@@ -17,6 +17,13 @@ def _load_alignment_module():
 alignment = _load_alignment_module()
 
 
+def test_ar_alignment_uses_production_fsdp_target():
+    engine_kwargs = alignment._ar_engine_kwargs(0.3)
+
+    assert engine_kwargs["rl_on_policy_target"] == "fsdp"
+    assert "enable_deterministic_inference" not in engine_kwargs
+
+
 def test_tensor_digest_is_bitwise_and_dtype_sensitive():
     values = torch.tensor([1.0, 2.0], dtype=torch.float32)
 

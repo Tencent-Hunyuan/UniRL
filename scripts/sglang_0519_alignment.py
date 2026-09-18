@@ -140,6 +140,18 @@ def _ar_request(args: argparse.Namespace) -> Sample:
     return Sample.request(root).fork(1, sampling_params=sampling)
 
 
+def _ar_engine_kwargs(mem_fraction_static: float) -> dict[str, Any]:
+    """Production Qwen3 train/inference alignment settings."""
+    return {
+        "mem_fraction_static": mem_fraction_static,
+        "skip_server_warmup": True,
+        "disable_cuda_graph": True,
+        "rl_on_policy_target": "fsdp",
+        "enable_memory_saver": True,
+        "enable_weights_cpu_backup": True,
+    }
+
+
 def run_ar(args: argparse.Namespace) -> dict[str, Any]:
     from unirl.models.qwen3.conditions import Qwen3ARConditions
     from unirl.models.qwen3.config import Qwen3PipelineConfig
@@ -155,14 +167,7 @@ def run_ar(args: argparse.Namespace) -> dict[str, Any]:
         tp_size=1,
         concurrency=1,
         samples_pre_expanded=True,
-        engine_kwargs={
-            "mem_fraction_static": args.mem_fraction_static,
-            "skip_server_warmup": True,
-            "disable_cuda_graph": True,
-            "enable_deterministic_inference": True,
-            "enable_memory_saver": True,
-            "enable_weights_cpu_backup": True,
-        },
+        engine_kwargs=_ar_engine_kwargs(args.mem_fraction_static),
     )
     engine = SGLangRolloutEngine(config=config)
     try:
@@ -213,6 +218,7 @@ def run_ar(args: argparse.Namespace) -> dict[str, Any]:
         "rollout_replay_absdiff": metrics,
         "signed_objective": objective,
         "gradient_norm": grad_norm,
+        "rl_on_policy_target": "fsdp",
         "bitwise_repeat": True,
         "bitwise_sleep_wake": True,
     }
