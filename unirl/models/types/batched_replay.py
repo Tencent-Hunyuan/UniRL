@@ -17,7 +17,7 @@ class BatchedStepReplayMixin:
 
     def _tile_conditions(self, conditions: Any, repeats: int) -> Any:
         """Repeat EVERY conditioning field ``repeats``× along the batch dim."""
-        raise NotImplementedError(f"{type(self).__name__} must implement _tile_conditions for batched replay")
+        return type(conditions).concat([conditions] * repeats)
 
     def _batched_step_kwargs(self, segment: "LatentSegment", params: Any) -> Dict[str, Any]:
         """Return model-specific arguments for the batched step call."""

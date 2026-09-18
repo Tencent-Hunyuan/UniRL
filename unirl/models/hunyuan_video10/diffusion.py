@@ -455,11 +455,6 @@ class HunyuanVideo10DiffusionStage(BatchedStepReplayMixin, DiffusionStage[Hunyua
         means_t = torch.stack(prev_sample_means, dim=1).to(dtype=self.trajectory_dtype) if prev_sample_means else None
         return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
 
-    @staticmethod
-    def _tile_conditions(conditions: HunyuanVideo10Conditions, repeats: int) -> HunyuanVideo10Conditions:
-        """Repeat conditions in step-major order for grouped replay."""
-        return HunyuanVideo10Conditions.concat([conditions] * repeats)
-
     def predict_noise_at_step(
         self,
         conditions: HunyuanVideo10Conditions,

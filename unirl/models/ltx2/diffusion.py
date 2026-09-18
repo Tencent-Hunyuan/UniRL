@@ -468,11 +468,6 @@ class LTX2DiffusionStage(BatchedStepReplayMixin, DiffusionStage[LTX2Conditions])
         means_t = torch.stack(prev_sample_means, dim=1).to(dtype=self.trajectory_dtype) if prev_sample_means else None
         return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
 
-    @staticmethod
-    def _tile_conditions(conditions: LTX2Conditions, repeats: int) -> LTX2Conditions:
-        """Repeat video/audio text conditions in step-major order for grouped replay."""
-        return LTX2Conditions.concat([conditions] * repeats)
-
     def _replay_batched_steps(
         self,
         conditions: LTX2Conditions,
