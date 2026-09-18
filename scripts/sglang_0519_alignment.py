@@ -163,6 +163,56 @@ def _ar_replay_kwargs() -> dict[str, Any]:
     }
 
 
+@torch.no_grad()
+def _ar_replay_formula_variants(
+    pipeline,
+    conditions,
+    segment,
+    *,
+    temperature: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Score fixed tokens on one HF hidden-state tensor with both head formulas."""
+    if conditions.prompt is None or conditions.prompt.input_ids is None:
+        raise ValueError("AR formula diagnosis requires prompt input_ids")
+    if int(segment.lengths.numel()) != 1:
+        raise ValueError("AR formula diagnosis currently requires batch size 1")
+
+    transformer = pipeline.bundle.transformer
+    device = next(transformer.parameters()).device
+    prompt_ids = conditions.prompt.input_ids.to(device)
+    prompt_mask = conditions.prompt.attention_mask.to(device)
+    prompt_len = int(prompt_mask.long().sum().item())
+    prompt_ids = prompt_ids[:, :prompt_len]
+    response_len = int(segment.lengths[0].item())
+    response_tokens = segment.tokens[:response_len].to(device).unsqueeze(0)
+    full_ids = torch.cat([prompt_ids, response_tokens], dim=1)
+    full_mask = torch.ones_like(full_ids)
+    position_ids = torch.arange(full_ids.shape[1], device=device).unsqueeze(0)
+
+    with torch.autocast("cuda", torch.bfloat16):
+        hidden = transformer.model(
+            input_ids=full_ids,
+            attention_mask=full_mask,
+            position_ids=position_ids,
+            use_cache=False,
+            return_dict=True,
+        ).last_hidden_state
+    response_hidden = hidden[:, prompt_len - 1 : prompt_len - 1 + response_len]
+    target = response_tokens.unsqueeze(-1)
+
+    fp32_logits = transformer.lm_head(response_hidden).float() / float(temperature)
+    fp32_log_probs = (fp32_logits.gather(-1, target).squeeze(-1) - torch.logsumexp(fp32_logits, dim=-1)).reshape(-1)
+
+    weight = transformer.lm_head.weight
+    bf16_logits = torch.matmul(
+        response_hidden.bfloat16(),
+        weight.T.bfloat16(),
+    )
+    bf16_scaled = bf16_logits.bfloat16().div(float(temperature)).bfloat16()
+    bf16_log_probs = torch.log_softmax(bf16_scaled, dim=-1).gather(-1, target).squeeze(-1)
+    return fp32_log_probs, bf16_log_probs.reshape(-1).float()
+
+
 def run_ar(args: argparse.Namespace) -> dict[str, Any]:
     from unirl.models.qwen3.conditions import Qwen3ARConditions
     from unirl.models.qwen3.config import Qwen3PipelineConfig
@@ -212,8 +262,17 @@ def run_ar(args: argparse.Namespace) -> dict[str, Any]:
         segment=first.segment,
         temperature=args.temperature,
     )
+    formula_fp32, formula_sglang = _ar_replay_formula_variants(
+        pipeline,
+        conditions,
+        first.segment,
+        temperature=args.temperature,
+    )
     rollout_log_probs = first.segment.log_probs.to(replay.device, dtype=replay.dtype)
     metrics = _drift(replay, rollout_log_probs)
+    formula_consistency = _drift(formula_fp32, replay)
+    head_precision_effect = _drift(formula_sglang, formula_fp32)
+    residual_after_sglang_formula = _drift(formula_sglang, rollout_log_probs)
     if metrics["mean"] >= args.logprob_mean_limit or metrics["max"] >= args.logprob_max_limit:
         raise AssertionError(
             f"AR rollout/replay drift exceeded limits: {metrics}, "
@@ -227,6 +286,9 @@ def run_ar(args: argparse.Namespace) -> dict[str, Any]:
         "rollout_log_probs_sha256": _tensor_digest(first.segment.log_probs),
         "num_tokens": int(first.segment.tokens.numel()),
         "rollout_replay_absdiff": metrics,
+        "replay_formula_consistency_absdiff": formula_consistency,
+        "head_precision_effect_absdiff": head_precision_effect,
+        "residual_after_sglang_formula_absdiff": residual_after_sglang_formula,
         "signed_objective": objective,
         "gradient_norm": grad_norm,
         "rl_on_policy_target": "fsdp",
