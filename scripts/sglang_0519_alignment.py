@@ -147,6 +147,7 @@ def _ar_engine_kwargs(mem_fraction_static: float) -> dict[str, Any]:
         "skip_server_warmup": True,
         "disable_cuda_graph": True,
         "rl_on_policy_target": "fsdp",
+        "attention_backend": "triton",
         "enable_memory_saver": True,
         "enable_weights_cpu_backup": True,
     }

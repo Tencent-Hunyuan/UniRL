@@ -21,6 +21,7 @@ def test_ar_alignment_uses_production_fsdp_target():
     engine_kwargs = alignment._ar_engine_kwargs(0.3)
 
     assert engine_kwargs["rl_on_policy_target"] == "fsdp"
+    assert engine_kwargs["attention_backend"] == "triton"
     assert "enable_deterministic_inference" not in engine_kwargs
 
 
