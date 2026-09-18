@@ -325,6 +325,7 @@ def run_tp_sync(args: argparse.Namespace) -> dict[str, Any]:
         {
             "enable_lora": True,
             "max_lora_rank": 8,
+            "lora_target_modules": ["q_proj"],
         }
     )
     config = SGLangEngineConfig(
