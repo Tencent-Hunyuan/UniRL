@@ -19,6 +19,7 @@ alignment = _load_alignment_module()
 
 def test_ar_alignment_uses_production_fsdp_target():
     engine_kwargs = alignment._ar_engine_kwargs(0.3)
+    replay_kwargs = alignment._ar_replay_kwargs()
 
     assert engine_kwargs["rl_on_policy_target"] == "fsdp"
     assert engine_kwargs["attention_backend"] == "triton"
@@ -26,6 +27,10 @@ def test_ar_alignment_uses_production_fsdp_target():
     assert engine_kwargs["cuda_graph_max_bs_decode"] == 16
     assert "enable_memory_saver" not in engine_kwargs
     assert "enable_deterministic_inference" not in engine_kwargs
+    assert replay_kwargs["model_precision"] == "fp32"
+    assert replay_kwargs["attn_implementation"] == "flex_attention"
+    assert replay_kwargs["autocast_precision"] == "bf16"
+    assert replay_kwargs["logprob_precision"] == "fp32"
 
 
 def test_tensor_digest_is_bitwise_and_dtype_sensitive():

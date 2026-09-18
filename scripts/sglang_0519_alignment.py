@@ -152,6 +152,17 @@ def _ar_engine_kwargs(mem_fraction_static: float) -> dict[str, Any]:
     }
 
 
+def _ar_replay_kwargs() -> dict[str, Any]:
+    """Production Qwen3 trainer-side replay settings."""
+    return {
+        "model_precision": "fp32",
+        "attn_implementation": "flex_attention",
+        "device": torch.device("cuda"),
+        "autocast_precision": "bf16",
+        "logprob_precision": "fp32",
+    }
+
+
 def run_ar(args: argparse.Namespace) -> dict[str, Any]:
     from unirl.models.qwen3.conditions import Qwen3ARConditions
     from unirl.models.qwen3.config import Qwen3PipelineConfig
@@ -167,6 +178,7 @@ def run_ar(args: argparse.Namespace) -> dict[str, Any]:
         tp_size=1,
         concurrency=1,
         samples_pre_expanded=True,
+        chat_template_kwargs={"enable_thinking": True},
         engine_kwargs=_ar_engine_kwargs(args.mem_fraction_static),
     )
     engine = SGLangRolloutEngine(config=config)
@@ -191,11 +203,7 @@ def run_ar(args: argparse.Namespace) -> dict[str, Any]:
     pipeline = Qwen3Pipeline.from_config(
         Qwen3PipelineConfig(
             pretrained_model_ckpt_path=args.model,
-            model_precision="bf16",
-            attn_implementation="sdpa",
-            device=torch.device("cuda"),
-            autocast_precision="bf16",
-            logprob_precision="fp32",
+            **_ar_replay_kwargs(),
         )
     )
     conditions = Qwen3ARConditions.from_dict(first.conditions)
@@ -222,6 +230,8 @@ def run_ar(args: argparse.Namespace) -> dict[str, Any]:
         "signed_objective": objective,
         "gradient_norm": grad_norm,
         "rl_on_policy_target": "fsdp",
+        "replay_model_precision": "fp32",
+        "replay_attention_backend": "flex_attention",
         "bitwise_repeat": True,
         "bitwise_sleep_wake": bitwise_sleep_wake,
     }
