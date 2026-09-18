@@ -35,6 +35,23 @@ __all__ = [
     "update_context_text",
 ]
 
+_COMPILED_CREATE_BLOCK_MASK: Any = None
+
+
+def _get_compiled_create_block_mask() -> Callable[..., Any]:
+    """Lazily compile and cache FlexAttention's BlockMask builder."""
+    global _COMPILED_CREATE_BLOCK_MASK
+    if _COMPILED_CREATE_BLOCK_MASK is None:
+        try:
+            from torch.nn.attention.flex_attention import create_block_mask
+        except ImportError as exc:
+            raise RuntimeError(
+                "pack_und_forward_inputs: attention_backend='flex' requires PyTorch >= 2.5 "
+                "with torch.nn.attention.flex_attention."
+            ) from exc
+        _COMPILED_CREATE_BLOCK_MASK = torch.compile(create_block_mask)
+    return _COMPILED_CREATE_BLOCK_MASK
+
 
 def disable_inference_cache(model: Any) -> None:
     """Turn off the TaylorSeer cache for the RL path (per-step determinism)."""
@@ -581,26 +598,18 @@ def _build_und_attention_mask(
 
         return [prepare_attention_mask_per_sample(split_lens, attn_modes, device=device)]
     if backend == "flex":
-        try:
-            from torch.nn.attention.flex_attention import create_block_mask
-        except ImportError as exc:
-            raise RuntimeError(
-                "pack_und_forward_inputs: attention_backend='flex' requires PyTorch >= 2.5 "
-                "with torch.nn.attention.flex_attention."
-            ) from exc
         from .vendor.data.data_utils import create_sparse_mask
 
         seqlen = sum(sample_lens)
         mask_mod = create_sparse_mask(sample_lens, split_lens, attn_modes, device)
-        return create_block_mask(
+        return _get_compiled_create_block_mask()(
             mask_mod,
             B=1,
-            H=model.num_heads,
+            H=None,
             Q_LEN=seqlen,
             KV_LEN=seqlen,
             device=device,
             BLOCK_SIZE=128,
-            _compile=True,
         )
     raise ValueError(f"pack_und_forward_inputs: attention_backend must be 'sdpa' or 'flex'; got {attention_backend!r}.")
 
