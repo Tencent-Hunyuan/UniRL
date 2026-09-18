@@ -8,7 +8,10 @@ from unirl.rollout.engine.sglang_diffusion._patches import (
     patch_gpu_worker,
     patch_rollout_trajectory,
 )
-from unirl.rollout.engine.sglang_diffusion.backends.native import SGLangBackend
+from unirl.rollout.engine.sglang_diffusion.backends.native import (
+    SGLangBackend,
+    _stage_lora_tensors_for_ipc,
+)
 from unirl.rollout.engine.sglang_diffusion.config import (
     SGLangDiffusionEngineConfig,
 )
@@ -130,6 +133,21 @@ def test_lora_update_uses_native_lora_merge_mode():
     assert request.weight_update_mode == "lora_merge"
     assert request.lora_alpha == 32
     assert request.lora_rank == 16
+
+
+def test_cpu_lora_tensors_are_staged_before_native_ipc_serialization():
+    cpu_tensor = torch.tensor([1.0])
+    marker = object()
+    tensors = {"layer.lora_A.weight": cpu_tensor, "marker": marker}
+
+    staged = _stage_lora_tensors_for_ipc(
+        tensors,
+        device=torch.device("cpu"),
+    )
+
+    assert staged is not tensors
+    assert torch.equal(staged["layer.lora_A.weight"], cpu_tensor)
+    assert staged["marker"] is marker
 
 
 def test_lora_rollout_defaults_to_upstream_dynamic_mode():

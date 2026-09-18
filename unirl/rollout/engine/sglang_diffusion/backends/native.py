@@ -5,9 +5,24 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional, Sequence
 
+import torch
+
 from unirl.rollout.engine.sglang_diffusion.backends.base import RawResult
 
 logger = logging.getLogger(__name__)
+
+
+def _stage_lora_tensors_for_ipc(lora_tensors: Dict[str, Any], *, device: Optional[torch.device] = None):
+    """Move CPU adapter tensors onto CUDA before the UUID-aware reduction hook."""
+    has_cpu_tensor = any(torch.is_tensor(tensor) and tensor.device.type == "cpu" for tensor in lora_tensors.values())
+    if not has_cpu_tensor:
+        return lora_tensors
+    if device is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    return {
+        name: tensor.to(device) if torch.is_tensor(tensor) and tensor.device.type == "cpu" else tensor
+        for name, tensor in lora_tensors.items()
+    }
 
 
 def _import_sglang_runtime() -> Dict[str, Any]:
@@ -241,7 +256,8 @@ class SGLangBackend:
         lora_alpha: Optional[int] = None,
         lora_rank: Optional[int] = None,
     ) -> None:
-        serialized = self._rt["MultiprocessingSerializer"].serialize(list(lora_tensors.items()))
+        ipc_tensors = _stage_lora_tensors_for_ipc(lora_tensors)
+        serialized = self._rt["MultiprocessingSerializer"].serialize(list(ipc_tensors.items()))
         request = self._rt["UpdateWeightFromTensorReqInput"](
             serialized_named_tensors=[serialized],
             target_modules=[target_module],
