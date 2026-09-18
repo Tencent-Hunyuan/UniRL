@@ -9,6 +9,7 @@ from vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 import (
     HunyuanImage3Pipeline,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 from unirl.rollout.engine.vllm_omni.pipelines._shared.flow_match_sde_scheduler import (
     FlowMatchSDEDiscreteScheduler,
@@ -16,7 +17,9 @@ from unirl.rollout.engine.vllm_omni.pipelines._shared.flow_match_sde_scheduler i
 from unirl.rollout.engine.vllm_omni.pipelines._shared.interception import (
     detach_cpu,
     drain_trajectory_into,
-    stamp_custom_output,
+    finalize_output,
+    single_request,
+    stamp_capture,
 )
 from unirl.types.noise_recipe import NoiseRecipe
 
@@ -149,22 +152,25 @@ class RLHunyuanImage3Pipeline(HunyuanImage3Pipeline):
 
     def _harvest_conditioning(self, out: DiffusionOutput) -> None:
         if self._captured_conditioning is not None:
-            stamp_custom_output(out, "fused_mm_capture", self._captured_conditioning)
+            stamp_capture(out, "fused_mm_capture", self._captured_conditioning)
 
-    def forward(self, req: OmniDiffusionRequest, **kwargs) -> DiffusionOutput:
+    def forward(self, req: DiffusionRequestBatch, **kwargs) -> DiffusionOutput:
+        """Single-request batch in, single output out — see ``single_request``."""
+        one = single_request(req, caller="RLHunyuanImage3Pipeline.forward")
         # Installs materialize the inner pipeline; they must precede arming.
         self._install_sde_scheduler()
         self._install_conditioning_tap()
         self._install_initial_noise_injector()
 
-        self._arm_sde(req)
-        self._arm_initial_noise(req)
+        self._arm_sde(one)
+        self._arm_initial_noise(one)
         self._arm_conditioning_tap()
 
         out = super().forward(req, **kwargs)
 
         self._harvest_trajectory(out)
         self._harvest_conditioning(out)
+        finalize_output(out)
         return out
 
 

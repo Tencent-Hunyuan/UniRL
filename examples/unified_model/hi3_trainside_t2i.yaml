@@ -37,7 +37,7 @@ eval_eta: 0.0
 eval_sampling:
   guidance_scale: 1.0          # pinned: eval stays unguided even if the rollout CFG changes
 
-task_config:
+control:
   task: t2i
   bot_task: image              # no reasoning marker
   sys_type: en_vanilla         # overrides the checkpoint's en_unified default
@@ -173,7 +173,7 @@ sampling:
   seed: 42                     # base_seed of the driver-authored x_T recipe
   init_same_noise: false       # per-sample x_T -> diverse GRPO groups
   scheduler:
-    _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+    _target_: unirl.sde.index_schedule.AllSDEScheduler
     num_timesteps: ${..num_inference_steps}
     num_sde_steps: 3
     timestep_fraction: [0, 0.5]

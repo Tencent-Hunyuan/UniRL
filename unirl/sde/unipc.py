@@ -22,7 +22,7 @@ def _clamped_lambda(alpha: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
     return torch.log(torch.clamp(alpha, min=eps)) - torch.log(torch.clamp(sigma, min=eps))
 
 
-@dataclass
+@dataclass(frozen=True)
 class UniPCSpec:
     """Model-owned UniPC solver contract; engine adapters verify the checkpoint scheduler against it."""
 
@@ -32,10 +32,10 @@ class UniPCSpec:
     disable_corrector: Tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
-        self.solver_order = int(self.solver_order)
-        self.solver_type = str(self.solver_type)
-        self.lower_order_final = bool(self.lower_order_final)
-        self.disable_corrector = tuple(int(i) for i in self.disable_corrector)
+        object.__setattr__(self, "solver_order", int(self.solver_order))
+        object.__setattr__(self, "solver_type", str(self.solver_type))
+        object.__setattr__(self, "lower_order_final", bool(self.lower_order_final))
+        object.__setattr__(self, "disable_corrector", tuple(int(i) for i in self.disable_corrector))
         if self.solver_order < 1:
             raise ValueError(f"UniPC solver_order must be >= 1; got {self.solver_order}")
         if self.solver_type not in {"bh1", "bh2"}:

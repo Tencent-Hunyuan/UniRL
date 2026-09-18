@@ -27,6 +27,12 @@ Needs the converter dependencies (`pip install -e '.[dataset-prep]'`, see
 `pandas` and decodes video with `av`. Both are required lazily, so a missing one exits with
 the package to install rather than a traceback.
 
+**Also needs torch**, which `dataset-prep` does not carry (torch enters through an engine
+extra so each engine can pin its own CUDA stack). This prep resizes clips and writes `.pt`
+tensors, so in a bare `dataset-prep` venv it fails at import with
+`ModuleNotFoundError: No module named 'torch'`. Any engine extra supplies it; `pip install
+torch` is enough for CPU-only prep. It is the only converter here with this requirement.
+
 ```bash
 python datasets/droid100/prepare_droid100.py --root datasets/droid100_debug
 ```

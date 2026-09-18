@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from unirl.types.conditions import Condition
     from unirl.types.sample import Part
     from unirl.types.segments.base import Segment
+    from unirl.types.segments.text import TextSegment
 
 
 def typed_conditions(
@@ -25,6 +26,30 @@ def typed_conditions(
     if conditions_cls is None:
         return conditions
     return conditions_cls.from_dict(dict(conditions))
+
+
+def _prepare_ar_logp_anchor(
+    *,
+    stage: Any,
+    conditions: Mapping[str, "Condition"],
+    segment: "TextSegment",
+    conditions_cls: Optional[Type[Any]],
+    old_logp_source: str,
+    sampling_temperature: float,
+) -> None:
+    """Freeze an AR rollout- or replay-sourced log-prob anchor."""
+    if segment.log_probs is None:
+        return
+    if old_logp_source != "replay":
+        return
+    if segment.rollout_log_probs is None:
+        segment.rollout_log_probs = segment.log_probs.detach().cpu().clone()
+    if segment.tokens is None or segment.tokens.shape[0] == 0:
+        return
+    typed_conds = typed_conditions(conditions, conditions_cls)
+    with torch.no_grad():
+        frozen = stage.replay(typed_conds, segment=segment, temperature=sampling_temperature)
+    segment.log_probs = frozen.detach().cpu()
 
 
 def gather_sde_field(
@@ -186,24 +211,25 @@ def _reference_kl_loss(
     return kl_per_sample.mean()
 
 
-def _resolve_reference_model(backend: Any, *, beta: float, algo: str) -> Any:
+def _resolve_reference_model(backend: Any, *, beta: float, algo: str, coef_name: str = "beta") -> Any:
     """Resolve the trainable model for the adapter-disabled reference replay, or None."""
-    if float(beta) < 0.0:
-        raise ValueError(f"{algo}: beta must be >= 0; got {beta!r}.")
-    if float(beta) == 0.0:
+    coef = float(beta)
+    if not math.isfinite(coef) or coef < 0.0:
+        raise ValueError(f"{algo}: {coef_name} must be finite and >= 0; got {beta!r}.")
+    if coef == 0.0:
         return None
     model = getattr(backend, "model", None) if backend is not None else None
     if model is None:
         raise ValueError(
-            f"{algo}: beta>0 needs the trainable model to define the reference policy, but "
+            f"{algo}: {coef_name}>0 needs the trainable model to define the reference policy, but "
             f"no `backend` was injected. The v2 DiffusionTrainer injects it when the "
-            f"algorithm declares requires_backend=True."
+            f"algorithm declares requires_backend=True or requires_ema_rollout=True."
         )
     if not any("lora_" in name for name, _ in model.named_parameters()):
         raise ValueError(
-            f"{algo}: beta>0 computes KL against the LoRA-disabled base model (reference "
+            f"{algo}: {coef_name}>0 anchors the policy to the LoRA-disabled base model (reference "
             f"policy), which requires a LoRA adapter, but the trainable model has none. Use "
-            f"a LoRA recipe, or set beta=0."
+            f"a LoRA recipe, or set {coef_name}=0."
         )
     return model
 
@@ -244,11 +270,8 @@ class StageAlgorithm(Remote, ABC):
     requires_backend: bool = False
     requires_advantages: bool = True
     loss_weighting: str = "sample"
+    recomputes_anchor: bool = False
     anchor_fields: Tuple[str, ...] = ()
-
-    def recomputes_anchor(self) -> bool:
-        """Whether the anchor must be recomputed at the exact ``(mini, micro)`` geometry training uses."""
-        return False
 
     def prepare_segment(
         self,

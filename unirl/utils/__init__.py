@@ -1,1 +1,1 @@
-"""Small supporting mechanisms; import from the defining module (misc, media, scheduler_utils, wandb_logger, ...)."""
+"""Small supporting mechanisms; import from the defining module (media, metrics, profiling, wandb_logger, ...)."""

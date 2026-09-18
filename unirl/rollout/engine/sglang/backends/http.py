@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import base64
 import dataclasses
 import json
 import logging
 import multiprocessing
 import os
+import pickle
 import signal
 import threading
 import time
@@ -209,11 +211,13 @@ class HTTPBackend:
         base_url: str,
         *,
         concurrency: int,
+        tp_size: int,
         runtime: Dict[str, Any],
     ) -> None:
         self._server_process: Optional[multiprocessing.Process] = server_process
         self._base_url = base_url
         self._concurrency = int(concurrency)
+        self._tp_size = int(tp_size)
         self._rt = runtime
         self._sem = threading.Semaphore(int(concurrency))
         self._logged_first_response = False
@@ -296,7 +300,7 @@ class HTTPBackend:
             getattr(server_args, "nccl_port", None),
             getattr(server_args, "host", None),
         )
-        return cls(process, base_url, concurrency=concurrency, runtime=rt)
+        return cls(process, base_url, concurrency=concurrency, tp_size=tp_size, runtime=rt)
 
     def generate(self, requests: List[Dict[str, Any]]) -> List[_HTTPRawResult]:
         """POST the per-prompt payloads concurrently; flatten prompt-major."""
@@ -548,7 +552,10 @@ class HTTPBackend:
         config_dict: Optional[dict] = None,
     ) -> None:
         """Serialize the LoRA tensor bag and hot-load it on the SRT server."""
-        serialized = self._rt["MultiprocessingSerializer"].serialize(lora_tensors, output_str=True)
+        if self._tp_size == 1:
+            serialized = self._rt["MultiprocessingSerializer"].serialize(lora_tensors, output_str=True)
+        else:
+            serialized = base64.b64encode(pickle.dumps(lora_tensors)).decode("utf-8")
         self._post_struct(
             "/load_lora_adapter_from_tensors",
             self._rt["LoadLoRAAdapterFromTensorsReqInput"](

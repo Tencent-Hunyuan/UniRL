@@ -33,6 +33,8 @@ stage_args:
       # t2i_rl.yaml for the full rationale.
       worker_extension_cls: unirl.rollout.engine.vllm_omni.worker.ar_extension.HI3ARWeightSyncExtension
       enable_lora: true
+      # Routes MoE LoRA off vLLM 0.27's fused one-shot kernel, which faults here.
+      fully_sharded_loras: true
       # Colocate-memory trim: the AR stage only needs prompt + max_new_tokens
       # (~4096), not the model's full 22800 ctx. Capping max_model_len shrinks
       # the KV-cache reservation (~21 GiB → a few GiB) and gpu_memory_util 0.9→0.7

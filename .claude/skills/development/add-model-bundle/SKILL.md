@@ -60,6 +60,7 @@ Single-transformer bundles (the common case) branch in `from_config`:
 
 ```python
 if config.meta_init_transformer:
+    weights_path = resolve_meta_init_weights(path, component="transformer")
     transformer_config = <Class>.load_config(path, subfolder="transformer")   # diffusers
     transformer, meta_init_state = build_meta_init_transformer(               # unirl.models.types.meta_init
         lambda: <Class>.from_config(transformer_config),
@@ -70,14 +71,15 @@ else:
 ...
 bundle = cls(...)
 if config.meta_init_transformer:
-    bundle._transformer_weights_path = os.path.join(path, "transformer")      # diffusion layout
+    bundle._transformer_weights_path = weights_path
     bundle._meta_init_state = meta_init_state
 return bundle
 ```
 
+- `resolve_meta_init_weights` passes local snapshots through, resolves Hub IDs into the shared cache, and validates complete root/component safetensors shards.
 - `build_meta_init_transformer` builds under `accelerate.init_empty_weights(include_buffers=False)`, captures init-computed non-persistent buffers/plain tensor attributes, dtype-casts (metadata-only on meta), and stamps `init_weights` to a no-op. Stash its returned state on `bundle._meta_init_state`; the backend restores it after the sharded weight load, including across Ray actor serialization.
-- Stash `_transformer_weights_path` = the safetensors dir the backend reads via `load_sharded` (`unirl/train/backend/sharded_load.py`): `<ckpt>/transformer` for diffusers-layout models; the **checkpoint root** (`path`) for AR/VL models loaded through `AutoModelForCausalLM` (no subfolder).
-- AR/VL bundles use the same helper with an `AutoModelForCausalLM.from_config(...)` (qwen3) or `ModelClass(cfg)` (qwen_vl) factory. Structural setup that does not touch weights (`gradient_checkpointing_enable`, `requires_grad_(False)` for a frozen vision tower) runs on both builds and persists through `to_empty` + load.
+- Stash `_transformer_weights_path` from `resolve_meta_init_weights`; it is the local safetensors directory consumed by `load_sharded` (`unirl/train/backend/sharded_load.py`).
+- AR/VL checkpoint-root layouts call `resolve_meta_init_weights(path)` without `component`, then use an `AutoModelForCausalLM.from_config(...)` (qwen3) or `ModelClass(cfg)` (qwen_vl) factory. Structural setup that does not touch weights (`gradient_checkpointing_enable`, `requires_grad_(False)` for a frozen vision tower) runs on both builds and persists through `to_empty` + load.
 
 Per-architecture init-computed state that `to_empty` destroys is handled by the shared capture/restore path. `build_meta_init_transformer` deliberately keeps buffers and `__dict__` tensors real on CPU while parameters are meta, and raises if a captured tensor is unexpectedly still meta. This covers plain-tensor rope tables (Qwen-Image `QwenEmbedRope.pos_freqs`) and non-persistent sincos buffers (SD3 `PatchEmbed.pos_embed`) without bespoke rebuild/deferred-stamp helpers.
 - params the checkpoint omits (FLUX.2-klein guidance embedder): zero-init them post-load via a deferred op keyed on checkpoint-absent names — `to_empty` leaves them as garbage (not meta), so an `is_meta`-gated fix won't catch them.

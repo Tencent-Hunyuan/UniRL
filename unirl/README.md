@@ -46,7 +46,7 @@ As source, the package falls into four groups:
 | `algorithms/` | Per-track loss algorithms (GRPO, DiffusionNFT, FlowDPPO, DRPO) |
 | `models/` | Per-model bundles, pipelines, stages, conditions; text/vision/vae helpers |
 | `reward/` | `RewardService` holding one backend — local scorers or the remote HTTP client |
-| `sde/` | SDE step kernels, σ schedule/shift, initial-noise generation (the `NoiseRecipe` contract lives in `types/`) |
+| `sde/` | SDE step kernels, σ schedule/shift, SDE-index schedule, initial-noise generation (the `NoiseRecipe` contract lives in `types/`) |
 | [`types/`](types/README.md) | Shared typed contracts: `Sample` / `Part`, primitives, conditions, segments, rewards, sampling; includes the request/response migration guide |
 | `data/` | Data source and dataset readers |
 | [`utils/`](utils/README.md) | Domain-agnostic leaves with several owners: logging, dtype, media/video, metric aggregation, profiling, memory monitoring |
@@ -88,16 +88,15 @@ The already-clean directions are locked by
 `models/` never imports algorithms, data, rewards, rollout, or trainers;
 `algorithms/` sees model contracts, never concrete model families; `train/`
 sees model contracts and `algorithms/base`, never concrete algorithms;
-`distributed/` never imports algorithms, data, models, rewards, rollout, or
-trainers.
+`distributed/` never imports algorithms, data, models, rewards, rollout, the
+train stack, or trainers.
 
 Directions the tree does not yet satisfy are left unlocked rather than hidden
 behind allowlists. The open debt, named so it is not copied as precedent:
-`models/` (`hunyuan_image3`, `qwen3_5`, `qwen3_moe`) and
-`distributed/weight_sync/` reach into `train/backend/veomni` (EP fusing /
-`_compat`), `models/cosmos3` subclasses the train-side SFT track builder, and
-`algorithms/` flips `train/lora` adapters. That is migration work, not a
-convention to copy.
+`models/` (`hunyuan_image3`, `qwen3_5`, `qwen3_moe`) reaches into
+`train/backend/veomni` (EP fusing / `_compat`), `models/cosmos3` subclasses the
+train-side SFT track builder, and `algorithms/` flips `train/lora` adapters.
+That is migration work, not a convention to copy.
 
 ## Where new code goes
 

@@ -86,7 +86,11 @@ class CLAPRewardScorer(LocalRewardBackend):
 
             inputs = self.processor(
                 text=batch_prompts,
-                audios=waveforms_np,
+                # `audios=` was deprecated and is now rejected outright by
+                # ClapProcessor (transformers 5.x): "You passed keyword argument
+                # `audios` which is deprecated. Please use `audio` instead."
+                # It surfaces as every sample failing scoring, not as a crash.
+                audio=waveforms_np,
                 sampling_rate=self.CLAP_SAMPLE_RATE,
                 return_tensors="pt",
                 padding=True,

@@ -9,6 +9,7 @@ import torch
 from unirl.rollout.engine.vllm_omni.adapters.base import ModelAdapter, register_adapter
 from unirl.rollout.engine.vllm_omni.adapters.dit import DitInputAdapter, DitOutputAdapter
 from unirl.rollout.engine.vllm_omni.backends import GenerateCall, OmniRawResult, StageSampling
+from unirl.rollout.engine.vllm_omni.pipelines._shared.interception import read_captures
 from unirl.rollout.engine.vllm_omni.utils import (
     collect_dit_outputs,
     grouped_pils_to_videos,
@@ -35,6 +36,11 @@ class Hv15InputAdapter(DitInputAdapter):
     def build_sampling(self, sample: Sample) -> List[StageSampling]:
         sampling = super().build_sampling(sample)
         sampling[0].kwargs["num_frames"] = _num_frames(sample)
+        frontier = sample.frontier_gen_part(DiffusionSamplingParams)
+        diff_params = frontier.sampling_params
+        extra_args = sampling[0].kwargs.setdefault("extra_args", {})
+        extra_args["denoise_seed_keys"] = [str(sample_id) for sample_id in frontier.sample_ids]
+        extra_args["denoise_base_seed"] = int(diff_params.seed) if diff_params.seed is not None else 0
         return sampling
 
 
@@ -45,7 +51,7 @@ class Hv15VideoOutputAdapter(DitOutputAdapter):
 
     _MISSING_CAPTURE_MSG = (
         "build_response: HV1.5 t2v rollout returned no 'text_capture' "
-        "on DiffusionOutput.custom_output (or it lacked the dual-stream "
+        "on the output envelope's unirl metadata (or it lacked the dual-stream "
         "text_mllm/text_glyph embeds). Check that "
         "RLHunyuanVideo15Pipeline's encode_prompt hook ran in every DiT "
         "worker — verify custom_pipeline_args.pipeline_class in the stage "
@@ -66,7 +72,7 @@ class Hv15VideoOutputAdapter(DitOutputAdapter):
             per_request, final_output_type=self.final_output_type, stage_id=self.stage_id, modality=self.modality
         )
 
-        captures = [(getattr(d, "custom_output", None) or {}).get("text_capture") for d in diff_outputs]
+        captures = [read_captures(d).get("text_capture") for d in diff_outputs]
         if any(c is None for c in captures):
             raise RuntimeError(self._MISSING_CAPTURE_MSG)
 

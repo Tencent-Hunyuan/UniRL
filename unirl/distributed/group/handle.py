@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass
 from itertools import count
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple, Type
@@ -16,6 +17,7 @@ from unirl.distributed.group.dispatch import (
     Execute,
     resolve_backward_dispatch_mode,
 )
+from unirl.distributed.group.ray_utils import get_actor_results, inspect_ready_actor_results
 from unirl.distributed.group.remote import RankInfo, Remote
 from unirl.distributed.tensor import TensorRef, WorkerLocalTransport, map_tree
 from unirl.distributed.tensor.backend.gpu_store.handle import GPUTensorHandle
@@ -239,6 +241,7 @@ class PendingHandleCall:
         *,
         targets: Optional[List[Any]] = None,
         collect_fn: Optional[Callable] = None,
+        leases: Optional[List[Any]] = None,
     ) -> None:
         self._handle = handle
         self._method_name = method_name
@@ -246,17 +249,61 @@ class PendingHandleCall:
         self._worker_local = worker_local
         self._targets = targets
         self._collect_fn = collect_fn
+        self._leases = leases
         self._consumed = False
         self._value: Any = None
+        self._discard_futures: Optional[List[Any]] = None
 
     def ready(self) -> bool:
-        """True once every worker's ref is resolved (non-blocking probe)."""
-        done, _ = ray.wait(self._refs, num_returns=len(self._refs), timeout=0)
-        return len(done) == len(self._refs)
+        """True when every rank succeeded; raise immediately on a ready rank-local error."""
+        return inspect_ready_actor_results(
+            self._refs,
+            pool=self._handle.pool,
+            role_name=self._handle.role_name,
+            method_name=self._method_name,
+        )
 
     def wait(self) -> None:
-        """Block until every worker finishes, without collecting; re-raises worker errors."""
-        ray.get(self._refs)
+        """Block until completion and safely discard the collected return value."""
+        if self._consumed:
+            return
+        self.result()
+        self._value = None
+
+    def discard_on_completion(self) -> None:
+        """Retain leases and discard outputs when all worker refs finish."""
+        if self._consumed:
+            self._value = None
+            return
+        if self._discard_futures is not None:
+            return
+        try:
+            futures = [ref.future() for ref in self._refs]
+        except Exception:
+            threading.Thread(
+                target=self._discard_result,
+                name="pending-handle-discard",
+                daemon=True,
+            ).start()
+            return
+        if not futures:
+            self._discard_result()
+            return
+
+        remaining = len(futures)
+        lock = threading.Lock()
+
+        def on_done(_) -> None:
+            nonlocal remaining
+            with lock:
+                remaining -= 1
+                complete = remaining == 0
+            if complete:
+                self._discard_result()
+
+        self._discard_futures = futures
+        for future in futures:
+            future.add_done_callback(on_done)
 
     def result(self) -> Any:
         """Block if needed, then rebind + collect: the method's collected return value."""
@@ -266,14 +313,30 @@ class PendingHandleCall:
         collect_fn = self._collect_fn
         if collect_fn is None:
             _, _, collect_fn, _ = handle._method_configs[self._method_name]
-        self._value = handle._resolve_call(
-            collect_fn,
-            self._refs,
-            worker_local=self._worker_local,
-            targets=self._targets,
-        )
+        try:
+            self._value = handle._resolve_call(
+                collect_fn,
+                self._refs,
+                worker_local=self._worker_local,
+                targets=self._targets,
+                method_name=self._method_name,
+            )
+        finally:
+            self._release_leases()
         self._consumed = True
         return self._value
+
+    def _release_leases(self) -> None:
+        """Release handles owning destination TensorStore entries after RPC consumption."""
+        self._leases = None
+
+    def _discard_result(self) -> None:
+        try:
+            self.wait()
+        except Exception:
+            logger.debug("PendingHandleCall: discarded call failed during completion", exc_info=True)
+        finally:
+            self._discard_futures = None
 
 
 class Slot:
@@ -290,6 +353,7 @@ class Slot:
     def launch(self, method_name: str, *args, **kwargs) -> PendingHandleCall:
         """Launch an undecorated role method on this worker."""
         handle = self._handle
+        handle.pool.assert_usable()
         if method_name in handle._method_configs:
             raise AttributeError(f"{method_name!r} is distributed; call it on the Handle")
         if not hasattr(_owning_class(handle.role_cls), method_name):
@@ -315,6 +379,7 @@ class Slot:
             worker_local,
             targets=[worker],
             collect_fn=lambda _, results: results[0],
+            leases=shards,
         )
 
     def call(self, method_name: str, *args, **kwargs) -> Any:
@@ -334,6 +399,7 @@ class Handle:
         init_kwargs: Optional[Dict[str, Any]] = None,
         slot_id: int = 0,
     ) -> None:  # noqa: D107 (args documented in class docstring)
+        pool.assert_usable()
         self.role_cls = role_cls
         self.pool = pool
         self.role_name = role_name or _make_role_name(role_cls)
@@ -382,8 +448,18 @@ class Handle:
         is_tp_engine = _is_sglang_rollout_role(role_cls)
         tp_visible_device_map: Dict[int, List[str]] = {}
         if is_tp_engine and any(rank_info.tp_size > 1 for rank_info in self.rank_infos):
-            node_ips = ray.get([worker.get_node_ip.remote() for worker in self.workers])
-            cuda_visible_devices = ray.get([worker.get_cuda_visible_devices.remote() for worker in self.workers])
+            node_ips = get_actor_results(
+                [worker.get_node_ip.remote() for worker in self.workers],
+                pool=self.pool,
+                role_name=self.role_name,
+                method_name="get_node_ip",
+            )
+            cuda_visible_devices = get_actor_results(
+                [worker.get_cuda_visible_devices.remote() for worker in self.workers],
+                pool=self.pool,
+                role_name=self.role_name,
+                method_name="get_cuda_visible_devices",
+            )
             tp_visible_device_map = _build_tp_visible_device_map(
                 self.rank_infos,
                 node_ips=node_ips,
@@ -412,7 +488,7 @@ class Handle:
                 kwargs["tp_visible_devices"] = tp_visible_device_map[i]
             return kwargs
 
-        ray.get(
+        get_actor_results(
             [
                 w.add_remote.remote(
                     self.role_name,
@@ -422,7 +498,10 @@ class Handle:
                     dist_env={"RANK": str(i), **self._dist_env_base},
                 )
                 for i, w in enumerate(self.workers)
-            ]
+            ],
+            pool=self.pool,
+            role_name=self.role_name,
+            method_name="add_remote",
         )
 
         self._method_configs: Dict[str, tuple] = {}
@@ -456,6 +535,22 @@ class Handle:
         return Slot(self, index)
 
     @property
+    def engine_slots(self) -> List[Slot]:
+        """Slots that host addressable rollout-engine heads, one per DP replica."""
+        if self.sp_size > 1:
+            raise RuntimeError(
+                f"slot-local rollout dispatch does not support sequence-parallel engines; got sp_size={self.sp_size}"
+            )
+        slots = [
+            self.slot(index)
+            for index, info in enumerate(self.rank_infos)
+            if info.tp_rank == 0 and info.pp_rank == 0 and info.sp_rank == 0
+        ]
+        if len(slots) != self.dp_size:
+            raise RuntimeError(f"expected {self.dp_size} rollout engine slots, found {len(slots)}")
+        return slots
+
+    @property
     def ep_size(self) -> int:
         """Expert-parallel degree requested for rollout-side engines."""
         return self.rank_infos[0].ep_size if self.rank_infos else 1
@@ -467,11 +562,22 @@ class Handle:
 
     def initialize(self, *args, **kwargs) -> None:
         """Call role.initialize(*args, **kwargs) on all workers."""
+        self.pool.assert_usable()
         ray.get(self.workers[0]._release_port.remote(self._group_port))
 
-        ray.get([w.call.remote(self.role_name, "initialize", args, kwargs) for w in self.workers])
+        get_actor_results(
+            [w.call.remote(self.role_name, "initialize", args, kwargs) for w in self.workers],
+            pool=self.pool,
+            role_name=self.role_name,
+            method_name="initialize",
+        )
 
-        self.rank_infos = ray.get([w.get_rank_info.remote(self.role_name) for w in self.workers])
+        self.rank_infos = get_actor_results(
+            [w.get_rank_info.remote(self.role_name) for w in self.workers],
+            pool=self.pool,
+            role_name=self.role_name,
+            method_name="get_rank_info",
+        )
 
     def _bind_methods(self, role_cls) -> None:
         """Scan role_cls for @distributed methods and create handle functions."""
@@ -483,7 +589,7 @@ class Handle:
             config = getattr(method, DISTRIBUTED_CONFIG_ATTR, None)
             if config is None:
                 continue
-            if name == "slot":
+            if name in {"slot", "engine_slots"}:
                 raise TypeError(f"distributed method {name!r} collides with the Handle API")
 
             fns = DISPATCH_MODE_REGISTRY[config["dispatch_mode"]]
@@ -521,7 +627,7 @@ class Handle:
                 call_id = f"{method_name}_{next(self._grad_call_counter)}"
                 input_metas = collect_leaves(args, TensorRef) + collect_leaves(tuple(kwargs.values()), TensorRef)
 
-            refs, worker_local = self._launch_call(
+            refs, worker_local, leases = self._launch_call(
                 method_name,
                 dispatch_mode,
                 dispatch_fn,
@@ -531,12 +637,16 @@ class Handle:
                 grad_mode=ctx is not None,
                 call_id=call_id,
             )
-            collected = self._resolve_call(
-                collect_fn,
-                refs,
-                worker_local=worker_local,
-                ray_get_timeout=ray_get_timeout,
-            )
+            try:
+                collected = self._resolve_call(
+                    collect_fn,
+                    refs,
+                    worker_local=worker_local,
+                    ray_get_timeout=ray_get_timeout,
+                    method_name=method_name,
+                )
+            finally:
+                leases.clear()
 
             if ctx is not None:
                 output_metas = collect_leaves(collected, TensorRef)
@@ -567,8 +677,9 @@ class Handle:
         *,
         grad_mode: bool,
         call_id: Optional[str],
-    ) -> Tuple[List, bool]:
-        """Launch a distributed call; returns ``(refs, worker_local)``."""
+    ) -> Tuple[List, bool, List]:
+        """Launch a distributed call and retain localized argument leases."""
+        self.pool.assert_usable()
         batch_size = infer_batch_size(args, kwargs)
         if (
             dispatch_mode in (Dispatch.DP_SCATTER, Dispatch.DP_SCATTER_HEAD)
@@ -582,7 +693,7 @@ class Handle:
         worker_local = issubclass(transport_cls, WorkerLocalTransport)
         shards = transport_cls.localize(shards, self.pool, self.device_ids, self.worker_ids)
         refs = execute_fn(method_name, shards, grad_mode=grad_mode, call_id=call_id)
-        return refs, worker_local
+        return refs, worker_local, shards
 
     def _resolve_call(
         self,
@@ -592,9 +703,16 @@ class Handle:
         worker_local: bool,
         ray_get_timeout: Optional[float] = None,
         targets: Optional[List[Any]] = None,
+        method_name: str = "call",
     ):
         """Resolve a launched call into its collected method return value."""
-        results = ray.get(refs, timeout=ray_get_timeout)
+        results = get_actor_results(
+            refs,
+            pool=self.pool,
+            role_name=self.role_name,
+            method_name=method_name,
+            timeout=ray_get_timeout,
+        )
         workers = self.workers if targets is None else targets
         results = [self._rebind_tree(r, workers[i], worker_local=worker_local) for i, r in enumerate(results)]
         return collect_fn(self, results)
@@ -608,7 +726,7 @@ class Handle:
                 f"{method_name!r} is not a @distributed method of {_owning_class(self.role_cls).__name__}"
             ) from None
 
-        refs, worker_local = self._launch_call(
+        refs, worker_local, leases = self._launch_call(
             method_name,
             dispatch_mode,
             dispatch_fn,
@@ -618,7 +736,7 @@ class Handle:
             grad_mode=False,
             call_id=None,
         )
-        return PendingHandleCall(self, method_name, refs, worker_local)
+        return PendingHandleCall(self, method_name, refs, worker_local, leases=leases)
 
     def _execute_all(self, method_name: str, shards: List, grad_mode: bool = False, call_id=None) -> List:
         """Send RPC to all Workers."""

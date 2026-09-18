@@ -40,7 +40,7 @@ class LocalLoraWeightSync(LoraWeightSyncBase):
         self._rollout.set_lora_from_tensors(self._adapter_name, lora_tensors, peft_config=peft_config)
         rank = self.rank_info.rank if self.rank_info is not None else 0
         logger.info(
-            "[LoRA-SYNC] rank %s: pushed %d LoRA tensors to rollout (adapter=%s, track=%s)",
+            "[LoRA-SYNC] rank %s: dispatched %d LoRA tensors to local rollout receiver (adapter=%s, track=%s)",
             rank,
             len(lora_tensors),
             self._adapter_name,

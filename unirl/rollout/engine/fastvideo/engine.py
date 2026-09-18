@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import logging
 import os
 import sys
@@ -15,12 +16,9 @@ import torch
 from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.rollout.engine.base import BaseRolloutEngine
-from unirl.rollout.engine.fastvideo._unipc import (
-    FastVideoUniPCPlan,
-    patch_fastvideo_unipc,
-    verify_fastvideo_used_sigmas,
-)
+from unirl.rollout.engine.fastvideo._patches import FastVideoUniPCPlan, patch_fastvideo
 from unirl.rollout.engine.fastvideo.config import FastVideoEngineConfig, FastVideoPorts
+from unirl.rollout.engine.sigma_verify import verify_engine_used_sigmas
 from unirl.sde.noise import _derive_group_seed
 from unirl.sde.runtime import FlowMatchSchedulePolicy, ensure_sample_sigmas
 from unirl.sde.unipc import UniPCSpec
@@ -34,8 +32,101 @@ from unirl.types.segments.latent import make_video_segment
 logger = logging.getLogger(__name__)
 
 
+def _verify_checkpoint_unipc_spec(ckpt_path: str, spec: UniPCSpec) -> None:
+    """Fail closed unless the checkpoint's scheduler_config.json declares the model-owned UniPC solver spec."""
+    checkpoint = Path(ckpt_path).expanduser()
+    if checkpoint.is_dir():
+        path = checkpoint / "scheduler" / "scheduler_config.json"
+    else:
+        try:
+            from huggingface_hub import hf_hub_download
+
+            path = Path(
+                hf_hub_download(
+                    repo_id=ckpt_path,
+                    filename="scheduler/scheduler_config.json",
+                )
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "FastVideo canonical UniPC cannot resolve "
+                f"{ckpt_path!r}/scheduler/scheduler_config.json as either a local "
+                "diffusers-layout checkpoint or a Hugging Face model repo."
+            ) from exc
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            declared_cfg = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"FastVideo canonical UniPC cannot verify model_config.unipc_* without {path}; "
+            "use a diffusers-layout local checkpoint or Hugging Face model repo containing "
+            "scheduler/scheduler_config.json."
+        ) from exc
+    class_name = str(declared_cfg.get("_class_name", ""))
+    if "UniPC" not in class_name:
+        raise RuntimeError(
+            f"Checkpoint scheduler {path} declares _class_name={class_name!r}; the canonical "
+            "FastVideo path requires the checkpoint's native solver to be a UniPC scheduler."
+        )
+    defaults = UniPCSpec()
+    declared = UniPCSpec(
+        solver_order=declared_cfg.get("solver_order", defaults.solver_order),
+        solver_type=declared_cfg.get("solver_type", defaults.solver_type),
+        lower_order_final=declared_cfg.get("lower_order_final", defaults.lower_order_final),
+        disable_corrector=tuple(declared_cfg.get("disable_corrector") or ()),
+    )
+    if declared != spec:
+        hint = (
+            "; the checkpoint's non-empty disable_corrector has no model-config knob"
+            if declared.disable_corrector != spec.disable_corrector
+            else ""
+        )
+        raise RuntimeError(
+            f"Checkpoint scheduler {path} declares {declared}, but model_config.unipc_* spells "
+            f"{spec}; align model_config.unipc_* with the checkpoint scheduler{hint}."
+        )
+
+
+def _model_timestep_scale(model_family: str) -> float:
+    """Return the declared WAN step-kernel timestep scale for ``model_family``."""
+    if model_family in {"wan2.2", "wan22"}:
+        from unirl.models.wan22.diffusion import WAN22DiffusionStep
+
+        return float(WAN22DiffusionStep.TIMESTEP_SCALE)
+    from unirl.models.wan21.diffusion import WAN21DiffusionStep
+
+    return float(WAN21DiffusionStep.TIMESTEP_SCALE)
+
+
+def _verify_dual_expert_checkpoint(ckpt_path: str) -> None:
+    """Fail closed unless the A14B checkpoint declares both boundary-routed transformers."""
+    checkpoint = Path(ckpt_path).expanduser()
+    if checkpoint.is_dir():
+        path = checkpoint / "model_index.json"
+    else:
+        try:
+            from huggingface_hub import hf_hub_download
+
+            path = Path(hf_hub_download(repo_id=ckpt_path, filename="model_index.json"))
+        except Exception as exc:
+            raise RuntimeError(
+                f"FastVideo WAN 2.2 cannot resolve {ckpt_path!r}/model_index.json as either a local "
+                "diffusers-layout checkpoint or a Hugging Face model repo."
+            ) from exc
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"FastVideo WAN 2.2 cannot verify the dual-expert layout without {path}") from exc
+    missing = [name for name in ("transformer", "transformer_2") if name not in payload]
+    if missing:
+        raise RuntimeError(
+            f"Checkpoint {path} lacks {missing}; the WAN 2.2 A14B rollout requires both boundary-routed experts."
+        )
+
+
 def _resolve_sde_window(raw_indices: Any, num_steps: int) -> List[int]:
-    """Return the canonical SDE segment indices for a request (``None`` spells all-steps SDE)."""
+    """Return sorted SDE step indices; ``None`` → all-steps SDE here but no-SDE trainside (README Gotchas)."""
     if raw_indices is None:
         return list(range(int(num_steps)))
     selected = sorted({int(i) for i in raw_indices})
@@ -43,6 +134,25 @@ def _resolve_sde_window(raw_indices: Any, num_steps: int) -> List[int]:
     if bad:
         raise ValueError(f"FastVideo SDE indices out of range for num_steps={num_steps}: {bad}")
     return selected
+
+
+def verify_fastvideo_used_sigmas(
+    actual: Any,
+    *,
+    expected: torch.Tensor,
+    sample_index: int,
+) -> None:
+    """Verify FastVideo's echoed timesteps against the canonical sigma schedule."""
+    actual_with_terminal = actual
+    if actual is not None:
+        actual_t = actual.detach().cpu() if torch.is_tensor(actual) else torch.as_tensor(actual)
+        if actual_t.ndim == 1 and int(actual_t.shape[0]) == int(expected.shape[0]) - 1:
+            actual_with_terminal = torch.cat([actual_t, torch.zeros(1, dtype=actual_t.dtype)])
+    verify_engine_used_sigmas(
+        actual_with_terminal,
+        expected=expected,
+        engine_name=f"fastvideo sample {sample_index}",
+    )
 
 
 class FastVideoRolloutEngine(BaseRolloutEngine):
@@ -93,13 +203,44 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
             "FastVideo canonical UniPC requires the model config to own the solver spec "
             "(unipc_solver_order / unipc_solver_type / unipc_lower_order_final)",
         )
-        # Model-owned solver SSOT; workers verify the checkpoint scheduler against it.
+        # Model-owned solver SSOT, verified against the checkpoint scheduler config below (README: Solver SSOT).
         self._unipc_spec = UniPCSpec(
             solver_order=model_config.unipc_solver_order,
             solver_type=model_config.unipc_solver_type,
             lower_order_final=model_config.unipc_lower_order_final,
         )
-        patch_fastvideo_unipc()
+        require(
+            strategy is not None and getattr(strategy, "canonical_name", None) is not None,
+            "FastVideoRolloutEngine requires an injected SDE strategy with a canonical_name; "
+            "set the rollout node's `strategy:` in the recipe (a separate injection from pipeline.strategy)",
+        )
+        self._sde_type = str(strategy.canonical_name)
+        self._timestep_scale = _model_timestep_scale(config.model_family)
+        self._is_dual_expert = config.model_family in {"wan2.2", "wan22"}
+        if self._is_dual_expert:
+            boundary_ratio = float(getattr(model_config, "boundary_ratio", 0.0))
+            require(
+                0.0 < boundary_ratio < 1.0,
+                f"WAN 2.2 model_config.boundary_ratio must be in (0, 1); got {boundary_ratio}",
+            )
+            # FastVideo routes on t >= boundary_ratio * num_train_timesteps; UniRL routes on
+            # sigma >= boundary_ratio. The two agree only at this scale (README: dual expert).
+            require(
+                float(getattr(model_config, "num_train_timesteps", 0)) == self._timestep_scale,
+                "WAN 2.2 FastVideo rollout requires model_config.num_train_timesteps to equal the "
+                f"step kernel's TIMESTEP_SCALE ({self._timestep_scale:g})",
+            )
+            self._boundary_ratio = boundary_ratio
+            _verify_dual_expert_checkpoint(model_config.pretrained_model_ckpt_path)
+        # Probe plan so unsupported kernels (cps/dpm2) fail at init, not per request.
+        FastVideoUniPCPlan(
+            sde_type=self._sde_type,
+            sde_indices=(),
+            spec=self._unipc_spec,
+            timestep_scale=self._timestep_scale,
+        )
+        _verify_checkpoint_unipc_spec(model_config.pretrained_model_ckpt_path, self._unipc_spec)
+        patch_fastvideo()
         self._build_generator()
 
         self.schedule_policy = FlowMatchSchedulePolicy.from_pretrained(
@@ -153,6 +294,8 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         }
         fv_kwargs.update(ekw)
         self._fastvideo_args = FastVideoArgs.from_kwargs(**fv_kwargs)
+        if self._is_dual_expert:
+            self._align_dual_expert_args(self._fastvideo_args)
         backend = str(getattr(self._fastvideo_args, "distributed_executor_backend", "mp"))
         require(
             backend == "mp",
@@ -176,6 +319,18 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
                     max_port_attempts,
                     self._ports.master_port,
                 )
+
+    def _align_dual_expert_args(self, fastvideo_args: Any) -> None:
+        """Pin the boundary UniRL owns onto FastVideo's WAN 2.2 pipeline and dit configs."""
+        pipeline_config = fastvideo_args.pipeline_config
+        dit_config = getattr(pipeline_config, "dit_config", None)
+        require(dit_config is not None, "WAN 2.2 FastVideo pipeline has no dit_config")
+        require(
+            hasattr(dit_config, "boundary_ratio"),
+            "WAN 2.2 FastVideo requires a dual-expert pipeline config with dit_config.boundary_ratio",
+        )
+        pipeline_config.boundary_ratio = self._boundary_ratio
+        dit_config.boundary_ratio = self._boundary_ratio
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
     def generate(self, sample: Sample) -> Sample:
@@ -279,23 +434,19 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         sp.return_frames = False
         sp.return_trajectory_latents = False
         sp.return_trajectory_decoded = False
-        # Canonical σ are already fully shifted by FlowMatchSchedulePolicy.
-        # FastVideo's adapter patch consumes them verbatim and appends the
-        # terminal zero; no engine-specific shift pre-image is allowed.
+        # Canonical σ verbatim — already shifted; no engine-side transform (README: σ SSOT).
         sp.sigmas = [float(x) for x in sigmas.detach().cpu().to(torch.float32).tolist()[:-1]]
 
-        # Resolve the trainer's exploration window once. The worker dispatches
-        # these indices to the selected SDE kernel and every other index to
-        # canonical UniPC. ``None`` keeps the legacy all-SDE spelling; an
-        # explicit empty list makes the full path deterministic.
+        # ``None`` → all-steps SDE; an explicit empty list → fully deterministic (README Gotchas).
         resolved_sde_indices = _resolve_sde_window(
             getattr(params, "sde_indices", None),
             int(params.num_inference_steps),
         )
         step_plan = FastVideoUniPCPlan(
-            sde_type=str(getattr(self.strategy, "canonical_name", "flow")),
+            sde_type=self._sde_type,
             sde_indices=tuple(resolved_sde_indices),
             spec=self._unipc_spec,
+            timestep_scale=self._timestep_scale,
         )
 
         all_log_probs: List[torch.Tensor] = []
@@ -328,13 +479,14 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
                     collect_log_probs=bool(self.cfg.native_logprob),
                     store_trajectory=True,
                     keep_trajectory_on_cpu=True,
-                    # Force FastVideo's RL branch through its helper on every
-                    # index. FastVideoUniPCPlan then dispatches selected indices
-                    # to SDE and all remaining indices to canonical UniPC.
+                    # sde_step_indices=None routes every index through the patched helper (README: Solver SSOT).
                     sde_step_indices=None,
                     sde_type=step_plan,
                 ),
             )
+            if self._is_dual_expert:
+                batch.boundary_ratio = self._boundary_ratio
+                batch.guidance_scale_2 = self._low_noise_guidance(params)
             out = self._generator.executor.execute_forward(batch, self._fastvideo_args)
             rl = out.rl_data
             verify_fastvideo_used_sigmas(
@@ -396,6 +548,13 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
             "neg_embeds": all_neg_embeds,
             "neg_masks": all_neg_masks,
         }
+
+    def _low_noise_guidance(self, params: Any) -> float:
+        """Resolve the low-noise expert's CFG scale, falling back to the shared one."""
+        scale = getattr(params, "guidance_scale_2", None)
+        if scale is None:
+            scale = getattr(self.model_config, "guidance_scale_2", None)
+        return float(scale) if scale is not None else float(params.guidance_scale)
 
     def _build_response(
         self,

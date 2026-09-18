@@ -56,10 +56,9 @@ adv_use_global_std: false      # per-group GRPO normalization
 num_rollouts: 10000            # intentionally large; stop manually
 
 # Periodic eval is DISABLED: not yet validated for it2i (the eval path must
-# carry the source-image condition end-to-end). The old blocker — the trainer
-# replacing the BAGEL-only ``cfg_text_scale`` sampling field (TypeError on hi3)
-# — was fixed by #202 (field-checked, falls back to ``guidance_scale``), so
-# this can be enabled once an it2i eval run is validated.
+# carry the source-image condition end-to-end). Diffusion families now share
+# the canonical ``guidance_scale`` field, so this can be enabled once an it2i
+# eval run is validated.
 eval_interval: 0
 
 transport_kind: colocate_store
@@ -67,7 +66,7 @@ workers_per_device: 1
 
 # Pin the it2i edit task: every sample MUST carry a source image (dataset media
 # role: condition). HunyuanImage3Pipeline.generate routes task=it2i -> modes/it2i.
-task_config:
+control:
   task: it2i
   bot_task: image              # direct edit, no CoT (template flag for embed_for_gen_image)
 
@@ -224,7 +223,7 @@ sampling:
                                  # per (seed, rollout_id, sample_id). seed=null -> engine RNG.
   init_same_noise: false         # per-sample x_T -> diverse GRPO groups
   scheduler:
-    _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+    _target_: unirl.sde.index_schedule.AllSDEScheduler
     num_timesteps: ${..num_inference_steps}
     num_sde_steps: 3
     timestep_fraction: [0, 0.5]

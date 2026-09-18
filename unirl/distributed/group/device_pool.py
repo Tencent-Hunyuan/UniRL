@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Sequence, Set
 
 import ray
 from ray.util.placement_group import placement_group
@@ -29,7 +29,7 @@ class DevicePool:
         workers_per_device: int = 1,
         transport_kind: str = "colocate_store",
         tq_handoff: Optional[dict] = None,
-        worker_max_concurrency: int = 1,
+        worker_max_concurrency: int | Sequence[int] = 1,
     ) -> None:
         if num_devices % devices_per_node != 0:
             raise ValueError(f"num_devices ({num_devices}) must be divisible by devices_per_node ({devices_per_node})")
@@ -44,7 +44,17 @@ class DevicePool:
             )
         self.tq_handoff = tq_handoff
 
-        self.worker_max_concurrency = max(1, int(worker_max_concurrency))
+        if isinstance(worker_max_concurrency, int):
+            per_device_concurrency = [max(1, worker_max_concurrency)] * num_devices
+        else:
+            per_device_concurrency = [max(1, value) for value in worker_max_concurrency]
+            if len(per_device_concurrency) != num_devices:
+                raise ValueError(
+                    "worker_max_concurrency must provide one value per device: "
+                    f"{len(per_device_concurrency)} != {num_devices}"
+                )
+        self._worker_concurrency_by_device = per_device_concurrency
+        self.max_worker_concurrency = max(per_device_concurrency)
 
         self.workers: List[ray.actor.ActorHandle] = []
 
@@ -62,10 +72,29 @@ class DevicePool:
         self._worker_id_to_slot: Dict[str, int] = {}
         self._device_to_workers: Dict[int, List] = {}  # device_id → [slot0, slot1, ...]
         self._worker_by_id: Dict[str, Any] = {}  # worker_id → handle
+        self._poison_reason: Optional[str] = None
 
     @property
     def num_gpus(self) -> int:
         return self.num_devices
+
+    def mark_poisoned(self, *, rank: int, role_name: str, method_name: str, error: BaseException) -> None:
+        """Poison the pool with the first rank-local failure context."""
+        if self._poison_reason is not None:
+            return
+        error_text = str(error)
+        error_summary = error_text.splitlines()[0] if error_text else "<no message>"
+        self._poison_reason = (
+            f"rank={rank}, role={role_name!r}, method={method_name!r}, error={type(error).__name__}: {error_summary}"
+        )
+        logger.error("DevicePool poisoned: %s", self._poison_reason)
+
+    def assert_usable(self) -> None:
+        """Reject distributed RPCs after any rank-local actor task failure."""
+        if self._poison_reason is not None:
+            raise RuntimeError(
+                f"DevicePool is poisoned; refusing to issue another distributed RPC ({self._poison_reason})"
+            )
 
     @property
     def transport_cls(self) -> type:
@@ -137,8 +166,9 @@ class DevicePool:
                 placement_group_bundle_index=bundle_index,
             ),
         )
-        if self.worker_max_concurrency > 1:
-            options["max_concurrency"] = self.worker_max_concurrency
+        max_concurrency = self._worker_concurrency_by_device[device_id]
+        if max_concurrency > 1:
+            options["max_concurrency"] = max_concurrency
         if env_vars:
             options["runtime_env"] = {"env_vars": env_vars}
 
@@ -281,6 +311,8 @@ class DevicePool:
         slot_id: Optional[int] = None,
     ) -> Handle:
         """Create a Handle for role_cls on this pool."""
+        self.assert_usable()
+
         from unirl.distributed.group.placement import current_placement
 
         if device_ids is None:

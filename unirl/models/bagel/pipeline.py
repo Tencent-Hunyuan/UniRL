@@ -227,7 +227,8 @@ class BagelPipeline(Pipeline):
         if negatives is not None:
             raise ValueError(
                 "BagelPipeline.build_conditions: Bagel CFG uses prefilled cfg contexts, not "
-                "negative prompt embeddings — pass negatives=None and set cfg_*_scale on the params."
+                "negative prompt embeddings — pass negatives=None and set "
+                "guidance_scale/cfg_img_scale on the params."
             )
         contexts = [self._build_contexts(prompt, image=None) for prompt in texts.texts]
         shape = image_shape
@@ -242,7 +243,7 @@ class BagelPipeline(Pipeline):
     @staticmethod
     def _resolve_task(sample: Sample) -> str:
         """Resolve the task mode: explicit ``parts[0].control["task"]`` wins, else infer."""
-        task = (sample.parts[0].control or {}).get("task")
+        task = sample.parts[0].control.get("task")
         if task is not None:
             return str(task)
         frontier_params = sample.parts[-1].sampling_params

@@ -250,7 +250,7 @@ class Qwen3OmniThinkerInputAdapter:
         ar = frontier.sampling_params
         assert isinstance(ar, ARSamplingParams)
 
-        chat_overrides = dict((sample.parts[0].control or {}).get("chat") or {})
+        chat_overrides = dict(sample.parts[0].control.get("chat") or {})
         system_instruction = chat_overrides.get("system_instruction", self.system_instruction)
         template_overrides = dict(chat_overrides.get("template_kwargs") or {})
         conversations = build_omni_messages(
@@ -496,7 +496,6 @@ class Qwen3OmniThinkerAdapter(ModelAdapter):
     """Qwen3-Omni Thinker — text/video → AR text (single stage, TP>1, LoRA)."""
 
     stage_yaml = "qwen3_omni_thinker_only_rl_1x4.yaml"
-    stage_yaml_source = "local"
     omni_mode = None
     needs_sigmas = False
     needs_driver_tokenizer = False

@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 
 from unirl.models.types.bundle import Bundle
-from unirl.models.types.meta_init import build_meta_init_transformer
+from unirl.models.types.meta_init import build_meta_init_transformer, resolve_meta_init_weights
 from unirl.utils.dtypes import parse_torch_dtype
 
 from .config import QwenImagePipelineConfig
@@ -27,7 +27,7 @@ class QwenImageBundle(Bundle):
         transformer: nn.Module,
         vae: Optional[nn.Module],
         text_encoder: Optional[nn.Module],
-        tokenizer: Any,
+        tokenizer: Optional[Any],
         scheduler: Any,
         dtype: torch.dtype,
         device: torch.device,
@@ -85,6 +85,7 @@ class QwenImageBundle(Bundle):
 
         meta_init_state = None
         if config.meta_init_transformer:
+            transformer_weights_path = resolve_meta_init_weights(path, component="transformer")
             transformer_config = QwenImageTransformer2DModel.load_config(path, subfolder="transformer")
             transformer, meta_init_state = build_meta_init_transformer(
                 lambda: QwenImageTransformer2DModel.from_config(transformer_config), dtype=dtype
@@ -104,6 +105,7 @@ class QwenImageBundle(Bundle):
             vae.requires_grad_(False)
 
         text_encoder = None
+        tokenizer = None
         if config.load_text_encoder:
             text_encoder = (
                 Qwen2_5_VLForConditionalGeneration.from_pretrained(
@@ -113,8 +115,7 @@ class QwenImageBundle(Bundle):
                 .eval()
             )
             text_encoder.requires_grad_(False)
-
-        tokenizer = Qwen2Tokenizer.from_pretrained(text_encoder_path, subfolder="tokenizer")
+            tokenizer = Qwen2Tokenizer.from_pretrained(text_encoder_path, subfolder="tokenizer")
 
         scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(path, subfolder="scheduler")
 
@@ -129,7 +130,7 @@ class QwenImageBundle(Bundle):
             pretrained_path=path,
         )
         if config.meta_init_transformer:
-            bundle._transformer_weights_path = os.path.join(path, "transformer")
+            bundle._transformer_weights_path = transformer_weights_path
             bundle._meta_init_state = meta_init_state
         return bundle
 

@@ -9,9 +9,8 @@
 # in-process on the wrapped training pipeline (no weight sync) — the
 # cleanest backend-parity comparison.
 #
-# QWEN_IMAGE_PATH must point at a LOCAL checkpoint dir for this recipe
-# (the post-shard weight load reads <path>/transformer/*.safetensors
-# directly; HF repo IDs are rejected with an actionable error).
+# QWEN_IMAGE_PATH accepts a Hub ID or local snapshot; meta-init resolves and
+# validates transformer/*.safetensors before auxiliary models load.
 
 num_devices: 8
 batch_size: 48                # prompts_per_rollout
@@ -161,7 +160,7 @@ sampling:
   trajectory_precision: bf16
   logprob_precision: fp32
   scheduler:
-    _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+    _target_: unirl.sde.index_schedule.AllSDEScheduler
     num_timesteps: ${..num_inference_steps}
     num_sde_steps: 3
     # SDE-step window: [0,0.5] confines SDE noise to the early high-σ steps
