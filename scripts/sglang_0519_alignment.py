@@ -164,53 +164,27 @@ def _ar_replay_kwargs() -> dict[str, Any]:
 
 
 @torch.no_grad()
-def _ar_replay_formula_variants(
-    pipeline,
-    conditions,
+def _ar_head_formula_variants(
+    hidden: torch.Tensor,
+    lm_head: torch.nn.Module,
     segment,
     *,
     temperature: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Score fixed tokens on one HF hidden-state tensor with both head formulas."""
-    if conditions.prompt is None or conditions.prompt.input_ids is None:
-        raise ValueError("AR formula diagnosis requires prompt input_ids")
-    if int(segment.lengths.numel()) != 1:
-        raise ValueError("AR formula diagnosis currently requires batch size 1")
+    """Score the exact replay hidden states with fp32 and SGLang head formulas."""
+    flat_hidden = hidden.reshape(-1, hidden.shape[-1])
+    target = segment.tokens[: flat_hidden.shape[0]].to(hidden.device).unsqueeze(-1)
+    fp32_logits = lm_head(flat_hidden).float() / float(temperature)
+    fp32_log_probs = fp32_logits.gather(-1, target).squeeze(-1) - torch.logsumexp(fp32_logits, dim=-1)
 
-    transformer = pipeline.bundle.transformer
-    device = next(transformer.parameters()).device
-    prompt_ids = conditions.prompt.input_ids.to(device)
-    prompt_mask = conditions.prompt.attention_mask.to(device)
-    prompt_len = int(prompt_mask.long().sum().item())
-    prompt_ids = prompt_ids[:, :prompt_len]
-    response_len = int(segment.lengths[0].item())
-    response_tokens = segment.tokens[:response_len].to(device).unsqueeze(0)
-    full_ids = torch.cat([prompt_ids, response_tokens], dim=1)
-    full_mask = torch.ones_like(full_ids)
-    position_ids = torch.arange(full_ids.shape[1], device=device).unsqueeze(0)
-
-    with torch.autocast("cuda", torch.bfloat16):
-        hidden = transformer.model(
-            input_ids=full_ids,
-            attention_mask=full_mask,
-            position_ids=position_ids,
-            use_cache=False,
-            return_dict=True,
-        ).last_hidden_state
-    response_hidden = hidden[:, prompt_len - 1 : prompt_len - 1 + response_len]
-    target = response_tokens.unsqueeze(-1)
-
-    fp32_logits = transformer.lm_head(response_hidden).float() / float(temperature)
-    fp32_log_probs = (fp32_logits.gather(-1, target).squeeze(-1) - torch.logsumexp(fp32_logits, dim=-1)).reshape(-1)
-
-    weight = transformer.lm_head.weight
+    weight = lm_head.weight
     bf16_logits = torch.matmul(
-        response_hidden.bfloat16(),
+        flat_hidden.bfloat16(),
         weight.T.bfloat16(),
     )
     bf16_scaled = bf16_logits.bfloat16().div(float(temperature)).bfloat16()
     bf16_log_probs = torch.log_softmax(bf16_scaled, dim=-1).gather(-1, target).squeeze(-1)
-    return fp32_log_probs, bf16_log_probs.reshape(-1).float()
+    return fp32_log_probs, bf16_log_probs.float()
 
 
 def run_ar(args: argparse.Namespace) -> dict[str, Any]:
@@ -257,14 +231,25 @@ def run_ar(args: argparse.Namespace) -> dict[str, Any]:
         )
     )
     conditions = Qwen3ARConditions.from_dict(first.conditions)
-    replay = pipeline.ar.replay(
-        conditions,
-        segment=first.segment,
-        temperature=args.temperature,
-    )
-    formula_fp32, formula_sglang = _ar_replay_formula_variants(
-        pipeline,
-        conditions,
+    replay_hidden: list[torch.Tensor] = []
+
+    def _capture_lm_head_input(_module, inputs) -> None:
+        replay_hidden.append(inputs[0].detach())
+
+    hook = pipeline.bundle.transformer.lm_head.register_forward_pre_hook(_capture_lm_head_input)
+    try:
+        replay = pipeline.ar.replay(
+            conditions,
+            segment=first.segment,
+            temperature=args.temperature,
+        )
+    finally:
+        hook.remove()
+    if len(replay_hidden) != 1:
+        raise AssertionError(f"expected one replay lm_head call, captured {len(replay_hidden)}")
+    formula_fp32, formula_sglang = _ar_head_formula_variants(
+        replay_hidden[0],
+        pipeline.bundle.transformer.lm_head,
         first.segment,
         temperature=args.temperature,
     )
