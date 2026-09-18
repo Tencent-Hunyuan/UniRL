@@ -11,8 +11,9 @@
 # shares — nor offload-thrashes — the policy's cards ("reward doesn't steal
 # cards"). The reward slab takes the tail of the pool, mirroring how
 # layout="separate" gives the rollout engine the tail. Cross-slab
-# reward.score_and_attach is DP_SCATTER-dispatched and pytree-merged back on the
-# driver, so the trainer is unchanged. To reproduce the 16-GPU scenario, set
+# RewardService.score dispatches only a row-aligned RewardRequest and merges the
+# scalar response on the driver; trajectory refs stay on their producing slab.
+# To reproduce the 16-GPU scenario, set
 # num_devices: 16 and reward_fraction: 0.125 (= 2 of 16 GPUs).
 #
 # NOTE: PickScore is tiny — dedicating whole cards to it is wasteful and this

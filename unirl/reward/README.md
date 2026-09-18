@@ -6,10 +6,10 @@
 > Full map: [`../README.md`](../README.md).
 
 <div align="center">
-  <img src="../../assets/reward-flow-new.png" alt="UniRL reward: RewardService.score_and_attach turns the rollout output (decoded image or text) into a per-sample reward via exactly one backend — local is a single in-process scorer (PickScore, CLIP, HPS, OCR, GenEval2, …) while remote is an HTTP server that runs a panel of reward models (required_rewards) and weight-aggregates them (weighted_sum, mean, min, max) into one reward plus the per-model breakdown; the trainer then z-scores that reward into the advantage" width="100%">
+  <img src="../../assets/reward-flow-new.png" alt="UniRL reward: RewardClient projects the rollout Sample into a row-aligned RewardRequest, RewardService scores it through exactly one backend, and the client attaches the returned scalar rewards before the trainer computes advantages" width="100%">
 </div>
 
-*One `RewardService` wraps **one backend**: a single in-process scorer (local) or a remote HTTP server that runs and weight-aggregates a **panel** of reward models. The per-sample reward it attaches is what the trainer z-scores into the advantage.*
+*One `RewardService` wraps **one backend**: a single in-process scorer (local) or a remote HTTP server that runs and weight-aggregates a **panel** of reward models. `RewardClient` keeps the full training Sample on its producing slab and sends the service only the row-aligned request that backend consumes.*
 
 ## What it is
 
@@ -38,21 +38,25 @@ easy to get wrong — so this module owns both:
 
 ## How it works
 
-Everything goes through one method, `RewardService.score_and_attach(sample)`
-(`service.py`). It runs per DP shard (sharding the Sample by prompt-tree), so it
-never mutates the input Sample — it returns a fresh one. Per call it:
+The trainer-facing `RewardClient.score_and_attach(sample)` (`client.py`) is a
+driver-side adapter over the distributed `RewardService.score(request)`
+(`service.py`). It never mutates the input Sample — it returns a fresh one whose
+trajectory and condition refs are the original producer-owned objects. Per call it:
 
 1. **Refuses precomputed rewards** — raises if the frontier Part already has
    `rewards` (actor-side scoring is the only writer).
-2. **Pairs input with output** — the conditioning (`Sample.conditioning`) with the
-   media in the frontier Part's `primitive`, already row-aligned (no expansion).
-3. **Scores** — hands a typed `RewardRequest` to `backend.compute_rewards`, getting
-   back rewards, per-component rewards, and per-sample success flags.
-4. **Fails fast** — raises and names the sample if any failed.
+2. **Projects the wire payload** — pairs `Sample.conditioning()` with the frontier
+   primitives in a typed `RewardRequest`; segment tensors, encoded conditions,
+   previews, and existing training fields never enter the reward RPC.
+3. **DP-shards rows** — `RewardRequest` is a `Batch`, so each worker receives the
+   same frontier-row range that its backend scores independently.
+4. **Scores and fails fast** — the worker calls `backend.compute_rewards` and raises
+   before DP merge if any row failed.
 5. **Zeroes runaway AR traces** — when the scored Part is itself an AR generation,
    one that hit `max_new_tokens` (never terminated) gets reward 0, so training
    doesn't learn to ramble to the cap.
-6. **Attaches** `rewards` + `component_rewards` and returns the Sample.
+6. **Returns scalars only** — `RewardResponse` is merged on the driver, which
+   attaches float32 CPU `rewards` + `component_rewards` to a copy of the Sample.
 
 A backend is just `compute_rewards(request) -> RewardResponse`. Local scorers
 (`local/`) subclass `LocalRewardBackend` and implement `_compute_model_rewards`;
@@ -111,9 +115,12 @@ new remote reward needs no UniRL code — add it to the server and list its name
 
 - **A non-finite/missing reward fails the whole step, by design** — fix the scorer.
   `raise_on_failure=False` (remote only) does *not* let training continue on it: the
-  backend returns zeros with `successes=[False]`, and `score_and_attach`'s fail-fast
+  backend returns zeros with `successes=[False]`, and `RewardService.score`'s fail-fast
   then raises on those flags anyway. So it can't silently zero-poison a group; leave
   it `True`.
+- **Reward DP shards frontier rows, not the full Sample tree.** Conditioning has
+  already been projected onto those rows, and built-in backends score rows
+  independently. GRPO sibling aggregation remains a driver-side advantage concern.
 - **`input_kind` must match the media** (`image`/`video`/`text`) — it picks which
   decoded key the backend sees. Remote allows only `image`/`video`; local scorers
   may be `text`.
