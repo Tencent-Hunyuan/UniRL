@@ -1,10 +1,4 @@
-"""WorkerLocalTransport — worker-resident transports + the ``localize`` routing.
-
-The ``TensorTransport`` subclass that worker-resident backends (colocate, gpu)
-extend: ref-count lifecycle, cross-worker NCCL transfer, on-worker compute, and
-the ``localize`` find/move/replace routing. ``isinstance(t, WorkerLocalTransport)``
-is the controller's locality discriminator.
-"""
+"""WorkerLocalTransport — worker-resident transports + the ``localize`` routing."""
 
 from __future__ import annotations
 
@@ -29,11 +23,7 @@ def _apply_tensor_op(t: torch.Tensor, op: str, *args) -> torch.Tensor:
 
 
 class WorkerLocalTransport(TensorTransport):
-    """Worker-resident transport: ref-count lifecycle, cross-worker NCCL, and ``localize``.
-
-    GLOBAL backends (transfer queue) are plain ``TensorTransport`` and implement none
-    of this; ``isinstance(t, WorkerLocalTransport)`` is the locality discriminator.
-    """
+    """Worker-resident transport: ref-count lifecycle, cross-worker NCCL, and ``localize``."""
 
     REMOTE_OPS: ClassVar[frozenset] = frozenset({"incref", "decref", "tensor_op", "get_cpu", "nccl_send", "nccl_recv"})
 
@@ -59,12 +49,7 @@ class WorkerLocalTransport(TensorTransport):
 
     @classmethod
     def _move_key(cls, span: Any, dst: Tuple[str, int], pool: Any) -> Optional[tuple]:
-        """A span's transfer identity wrt ``dst``, or ``None`` if already resolvable there.
-
-        Short-circuit: object_ref (CPU/plasma) resolves anywhere; else ``_is_local``;
-        else the by-VALUE key ``(src_device, dst_device, store_key, start, stop)`` so
-        identical foreign slices to one device dedup to a single transfer.
-        """
+        """A span's transfer identity wrt ``dst``, or ``None`` if already resolvable there."""
         dst_worker_id, dst_device_id = dst
         h = span.handle
         if getattr(h, "object_ref", None) is not None:
@@ -75,11 +60,7 @@ class WorkerLocalTransport(TensorTransport):
 
     @classmethod
     def _replace_leaf(cls, moved: Dict[tuple, Any], dst: Tuple[str, int], pool: Any) -> Callable[[Any], Any]:
-        """``map_tree`` leaf for REPLACE: swap foreign spans for their moved result.
-
-        An all-local ref is returned UNCHANGED (same object), preserving grad /
-        retain_grad_flag / _packed_cu_seqlens that ``with_spans`` would drop.
-        """
+        """``map_tree`` leaf for REPLACE: swap foreign spans for their moved result."""
 
         def leaf(o: Any) -> Any:
             if isinstance(o, TensorRef):
@@ -93,14 +74,7 @@ class WorkerLocalTransport(TensorTransport):
 
     @classmethod
     def _move(cls, pool: Any, to_move: Dict[tuple, Any]) -> Dict[tuple, Any]:
-        """One batched NCCL hop per ``(src, dst)`` device group; return key → received span.
-
-        Ordering invariant: each group's ``keys`` list is reused in the SAME order for the
-        send, the recv shapes/dtypes, and ``zip(keys, recv_handles)`` — do not reorder one
-        without the others. Device pairs run in sorted order, one at a time; recv posts
-        before send, and both complete before the next pair starts. Recv shapes are the
-        SLICED span shapes (exactly the rows shipped), not the full handle block.
-        """
+        """One batched NCCL hop per ``(src, dst)`` device group; return key → received span."""
         groups: Dict[Tuple[int, int], List[tuple]] = {}
         for key in to_move:
             groups.setdefault((key[0], key[1]), []).append(key)
@@ -123,11 +97,7 @@ class WorkerLocalTransport(TensorTransport):
 
     @classmethod
     def localize(cls, shards: list, pool: Any, device_ids: List[int], worker_ids: List[str]) -> list:
-        """Make every ref resolvable on its dst worker — FIND (pure) / MOVE (NCCL) / REPLACE (pure).
-
-        The shared skeleton for all worker-local backends; only ``_is_local`` varies. Shards
-        are returned untouched when nothing is foreign.
-        """
+        """Make every ref resolvable on its dst worker — FIND (pure) / MOVE (NCCL) / REPLACE (pure)."""
         dsts = list(zip(worker_ids, device_ids))
 
         to_move: Dict[tuple, Any] = {}

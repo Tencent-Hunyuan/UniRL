@@ -123,9 +123,7 @@ class PickScoreRewardScorer(LocalRewardBackend):
         prompts: List[str],
         records=None,
     ) -> torch.Tensor:
-        """Differentiable PickScore: image tensor ``[B, C, H, W]`` in ``[0, 1]``
-        → ``[B]`` reward with ``grad_fn``. Reuses the frozen CLIP module; only the
-        image path keeps grad (text + logit_scale are constants)."""
+        """Differentiable PickScore: image tensor ``[B, C, H, W]`` in ``[0, 1]`` → ``[B]`` reward with ``grad_fn``."""
 
         def _extract_tensor(output):
             if isinstance(output, torch.Tensor):

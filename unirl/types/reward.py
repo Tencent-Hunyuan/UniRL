@@ -20,25 +20,7 @@ class RewardType(Enum):
 
 @dataclass
 class RewardRequest:
-    """Request for reward computation.
-
-    Two typed primitive dicts describe one scoring unit:
-
-    ``primitives``
-        Input context — what was fed to the model. From the scored
-        ``Sample``'s conditioning (its ancestor input Parts). Typical keys:
-        ``"text"`` (prompt ``Texts``), ``"image"`` (conditioning ``Images``).
-
-    ``generated``
-        Model output being scored — the frontier ``Part``'s complete
-        ``primitives`` map.
-        Typical keys: ``"image"`` (generated ``Images``), ``"video"``
-        (generated ``Videos``), ``"text"`` (generated ``Texts``).
-
-    Backward-compat properties (``prompts``, ``images``, ``videos``,
-    ``texts``) bridge to the new structure with lazy format conversion
-    so existing scorers work unchanged.
-    """
+    """Request for reward computation."""
 
     primitives: Dict[str, Any] = field(default_factory=dict)
     generated: Dict[str, Any] = field(default_factory=dict)
@@ -64,7 +46,7 @@ class RewardRequest:
             return None
         from unirl.utils.media import tensor_frame_to_pil
 
-        return [tensor_frame_to_pil(img) for img in prim.pixels.unbind(0)]
+        return [tensor_frame_to_pil(image.pixels) for image in prim.to_list()]
 
     @property
     def videos(self) -> Optional[List[torch.Tensor]]:
@@ -82,12 +64,7 @@ class RewardRequest:
 
     @property
     def audio(self) -> Optional[List[torch.Tensor]]:
-        """Generated audio waveforms, one ``[C, L]`` (or ``[L]``) tensor per sample.
-
-        Populated when a Part carries a parallel audio stream (LTX-2.3 T2AV);
-        the reward service places the decoded ``Audios`` under
-        ``generated["audio"]``. ``None`` for non-audio requests.
-        """
+        """Generated audio waveforms, one ``[C, L]`` (or ``[L]``) tensor per sample."""
         prim = self.generated.get("audio")
         if prim is None:
             return None
@@ -114,15 +91,7 @@ class RewardRequest:
 
 @dataclass
 class RewardResponse(Batch):
-    """
-    Response from reward computation.
-
-    Contains both aggregated rewards and optional per-component reward breakdowns.
-
-    ``compute_time`` is reduced by ``max`` when multiple responses are
-    concatenated — it is a wall-clock measurement, so the max across
-    parallel-produced responses is the meaningful aggregate.
-    """
+    """Response from reward computation."""
 
     rewards: List[float] = concat_field(default_factory=list)
     component_rewards: Dict[str, List[float]] = concat_field(default_factory=dict)

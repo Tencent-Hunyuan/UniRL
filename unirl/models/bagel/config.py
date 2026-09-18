@@ -1,21 +1,4 @@
-"""Construction config for the Bagel (BAGEL-7B-MoT) pipeline.
-
-Weights+params only: LoRA injection, FSDP wrap, and autocast lifecycle live
-outside the bundle (in the train / rollout actors), mirroring
-:class:`unirl.models.sd3.config.SD3PipelineConfig` and
-:class:`unirl.models.hunyuan_image3.config.HunyuanImage3PipelineConfig`.
-
-Per-request sampling knobs (CFG scales, ``noise_level``, ``num_timesteps``,
-SDE window) are intentionally NOT here — they live in ``BagelDiffusionParams``
-consumed by the diffusion stage, the same split SD3 uses between its config and
-``DiffusionSamplingParams``.
-
-Fixed BAGEL topology constants (``qk_norm``, ``tie_word_embeddings``,
-``layer_module``, ``connector_act``) are not exposed here — they are not tunable
-for this checkpoint and live as constants in the bundle. ``visual_und`` IS
-exposed (as ``enable_vit``): the und ViT tower is optional and only needed for
-image-input tasks.
-"""
+"""Construction config for the Bagel (BAGEL-7B-MoT) pipeline."""
 
 from __future__ import annotations
 
@@ -47,17 +30,7 @@ BAGEL_UND_LORA_TARGETS: Tuple[str, ...] = (
 
 @dataclass
 class BagelPipelineConfig:
-    """Construction args for ``BagelBundle.from_config``.
-
-    BAGEL-7B-MoT is a single MoT transformer that runs both the und
-    (understanding) and gen (image-generation) paths on shared weights; only the
-    gen expert is trained. The bundle owns one transformer + one FLUX-style VAE +
-    one tokenizer; for pure text-to-image the und ViT stays disabled
-    (``enable_vit=False`` → ``visual_und=False``), image-input tasks opt in.
-
-    ``device`` may be runtime-injected by the actor after compose; the other
-    fields are read once during bundle construction.
-    """
+    """Construction args for ``BagelBundle.from_config``."""
 
     pretrained_model_ckpt_path: str
     model_precision: Any = "bf16"

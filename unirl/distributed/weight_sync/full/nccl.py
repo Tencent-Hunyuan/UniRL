@@ -1,41 +1,4 @@
-"""v2 full-weight NCCL sync (SEPARATE slabs, cross-node capable).
-
-``NCCLWeightSync`` lives on the TRAIN slab as a sibling of the FSDP ``backend``
-ONLY — the rollout engine is on a different device slab, so it is NOT a sibling
-and cannot be injected (cross-slab ``HandleRef`` resolution raises). Instead the
-driver hands rank 0 the rollout slab's Worker actor handles once
-(``set_rollout_targets``); rank 0 then self-drives the rollout side via
-non-blocking ``handle.call.remote(...)`` + ``ray.get`` from inside its own
-Worker. This provides the concurrency the NCCL rendezvous barrier needs without
-threads (train rank 0 and the rollout workers are distinct processes).
-
-Group layout: train rank 0 is group rank 0; rollout engine ``i`` joins at
-``rank_offset = i*tp_size + 1`` and its SGLang scheduler subprocesses compute
-``global_rank = rank_offset + tp_rank`` internally. With ``tp_size=1`` this is
-the historical ``rank_offset = i + 1``. Other train ranks are NOT in the
-broadcast group — they participate only in the train-mesh all-gather that
-``raw_state_dict`` performs (so rank 0 sees full tensors), then discard.
-
-Rollout TP: the driver passes only the tp_rank==0 worker of each engine as a
-target (and ``num_rollout_gpus = num_engines*tp_size``). ``dist.broadcast``
-delivers the FULL tensor to every group rank; each SGLang TP rank's own
-``weight_loader`` reshards it — so ``sync()`` is unchanged, only ``connect``'s
-rank_offset/world_size scale with ``tp_size``.
-
-Driver wiring (in the trainer, once both slabs exist; engine workers alive)::
-
-    addr, port = ws.pick_master()[0]
-    tp = rollout.tp_size
-    targets = [w for w, ri in zip(rollout.workers, rollout.rank_infos) if ri.tp_rank == 0]
-    ws.set_rollout_targets(targets, rollout.role_name)
-    ws.connect(master_addr=addr, master_port=port, num_rollout_gpus=len(targets)*tp, tp_size=tp)
-    ...
-    ws.sync()   # every weight_sync_interval
-
-Scope: single-/multi-node, rollout TP≥1, single-stage. PP>1 needs a per-stage
-rank_offset map and is out of scope (raise upstream). Torch/ray imports are
-deferred so the driver can import this module for ``remote(...)``.
-"""
+"""v2 full-weight NCCL sync (SEPARATE slabs, cross-node capable)."""
 
 from __future__ import annotations
 
@@ -91,11 +54,7 @@ class NCCLWeightSync(FullWeightSync):
 
     @distributed(dispatch_mode=Dispatch.BROADCAST, execute_mode=Execute.RANK_ZERO)
     def set_rollout_targets(self, actor_handles: List[Any], role_name: str) -> None:
-        """Rank 0 caches the rollout slab's Worker actor handles + role name.
-
-        Handles are plain picklable Ray actor handles (NOT a cross-slab
-        ``HandleRef``), so they survive the ``Worker.call`` arg path.
-        """
+        """Rank 0 caches the rollout slab's Worker actor handles + role name."""
         self._rollout_targets = list(actor_handles)
         self._rollout_role = str(role_name)
 
@@ -103,20 +62,7 @@ class NCCLWeightSync(FullWeightSync):
     def connect(
         self, *, master_addr: str, master_port: int, num_rollout_gpus: int, tp_size: int = 1, pp_size: int = 1
     ) -> None:
-        """Bring up the broadcast group (rank 0 + all rollout engine GPUs).
-
-        Fires each rollout worker's ``init_weights_update_group`` NON-BLOCKING
-        first, then joins as group rank 0 (which blocks on the barrier), then
-        awaits the rollout joins. The non-blocking fire is what lets the
-        rendezvous complete — no thread needed (distinct processes).
-
-        Rollout TP: each ``_rollout_targets`` entry is the tp_rank==0 worker of
-        one SGLang engine, and SGLang internally assigns ``rank_offset +
-        tp_rank`` to its ``tp_size`` scheduler subprocesses. So engine ``i``
-        occupies the contiguous NCCL block ``[i*tp_size+1, (i+1)*tp_size]`` and
-        the group world size is ``num_engines*tp_size + 1``. ``tp_size=1``
-        reproduces the historical ``rank_offset = i+1`` layout exactly.
-        """
+        """Bring up the broadcast group (rank 0 + all rollout engine GPUs)."""
         import ray
 
         from unirl.utils.distributed_utils import init_process_group
@@ -160,14 +106,7 @@ class NCCLWeightSync(FullWeightSync):
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def sync(self) -> None:
-        """Broadcast the current full weights into the rollout engines.
-
-        Every train rank runs the identical bucket loop (lockstep all-gather in
-        ``raw_state_dict``). Rank 0, per bucket: tells every rollout worker to
-        post matching recvs (non-blocking), broadcasts each tensor, then awaits
-        the recvs. Ranks >= 1 just consume the generator (their half of the
-        all-gather) and discard.
-        """
+        """Broadcast the current full weights into the rollout engines."""
         import ray
         import torch.distributed as dist
 
@@ -197,7 +136,6 @@ class NCCLWeightSync(FullWeightSync):
             for _, tensor in bucket:
                 dist.broadcast(tensor.data.contiguous(), 0, group=self._model_update_group)
             ray.get(recv_refs)
-        self.weight_version += 1
 
 
 __all__ = ["NCCLWeightSync"]

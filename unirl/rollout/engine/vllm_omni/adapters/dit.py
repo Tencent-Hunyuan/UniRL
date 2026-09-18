@@ -1,16 +1,4 @@
-"""Shared DiT sub-adapter bases — the universal request/response skeletons.
-
-Two bases, one per conversion side. They hold the frozen single-stage DiT
-skeletons; a model family derives a small subclass **in its own file**
-overriding hooks only (``Hv15InputAdapter.extras``,
-``Sd3OutputAdapter.conditions``, …). A hook or parameter is added here only
-when a second family needs the same one — family quirks otherwise stay in
-the family's subclass.
-
-Naming rule: universal classes live here with no family prefix;
-family-specific sub-adapters carry the family prefix and live in the family
-file (``hi3.py`` / ``sd3.py`` / ``hv15.py``).
-"""
+"""Shared DiT sub-adapter bases — the universal request/response skeletons."""
 
 from __future__ import annotations
 
@@ -42,13 +30,7 @@ def _negative_prompt_from_params(diff_params: Any, *, default: str) -> str:
 
 
 def _grouped_texts_from_sample(sample: Sample, *, caller: str) -> tuple[List[str], int]:
-    """Collapse a Sample's complete contiguous diffusion groups to engine prompts.
-
-    The Sample is already expanded to one row per generated output, whereas
-    vLLM-Omni accepts one prompt plus ``num_outputs_per_prompt``.  Validate the
-    lineage before collapsing so a DP shard that splits or interleaves siblings
-    cannot silently pair the wrong prompt with an output.
-    """
+    """Collapse a Sample's complete contiguous diffusion groups to engine prompts."""
     gen_part = sample.frontier_gen_part(DiffusionSamplingParams)
     diff_params = gen_part.sampling_params
     spp = int(getattr(diff_params, "samples_per_prompt", 1) or 1)
@@ -90,14 +72,7 @@ def _grouped_texts_from_sample(sample: Sample, *, caller: str) -> tuple[List[str
 
 
 class DitInputAdapter:
-    """Request ``Sample`` → one single-diffusion-stage :class:`GenerateCall`.
-
-    ``build`` is pure assembly over two parallel hooks that mirror the wire
-    type's payload fields 1:1 — :meth:`build_prompts` / :meth:`build_sampling`
-    — both with the raw-``Sample`` currency (each hook locates the diffusion
-    gen Part and derives what it needs from its typed sampling params; the
-    accessors are cheap). Children derive either via ``super()``.
-    """
+    """Request ``Sample`` → one single-diffusion-stage :class:`GenerateCall`."""
 
     def __init__(self, modality: str) -> None:
         self.modality = modality
@@ -111,9 +86,7 @@ class DitInputAdapter:
         return [{"prompt": text, "negative_prompt": negative_prompt} for text in texts.texts]
 
     def build_sampling(self, sample: Sample) -> List[StageSampling]:
-        """The single diffusion-stage intent: the typed diffusion kwargs,
-        optional ``max_sequence_length`` / ``seed``, sparse SDE indices, and
-        the driver-authoritative x_T recipe."""
+        """The diffusion-stage intent: typed kwargs, optional length/seed, sparse SDE indices, and the x_T recipe."""
         gen_part = sample.frontier_gen_part(DiffusionSamplingParams)
         diff_params = gen_part.sampling_params
 
@@ -137,17 +110,7 @@ class DitInputAdapter:
 
 
 class DitOutputAdapter:
-    """Per-request DiT results → the filled diffusion ``Part`` of the ``Sample``.
-
-    The request already carries the typed generation shell. ``build`` locates
-    that shell with :class:`DiffusionSamplingParams`, derives its segment,
-    decoded primitive, and replay conditions, then fills that one ``Part``
-    directly. There is no response-wide condition bag or named-track assembly.
-
-    Every hook has the uniform ``(sample, per_request)`` currency: raw wire
-    groups in, one field of the target Part out. Children derive any hook via
-    ``super()``.
-    """
+    """Per-request DiT results → the filled diffusion ``Part`` of the ``Sample``."""
 
     final_output_type = "image"
 
@@ -164,10 +127,7 @@ class DitOutputAdapter:
         return build_image_segment(diff_outputs, expected_sigmas=expected_sigmas)
 
     def build_decoded(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Any:
-        """The decoded diffusion primitive.
-
-        Default: flat PILs as ``Images``; HV1.5 swaps it for packed videos.
-        """
+        """The decoded diffusion primitive."""
         del sample
         _, _, pil_images = collect_dit_outputs(
             per_request, final_output_type=self.final_output_type, stage_id=self.stage_id, modality=self.modality

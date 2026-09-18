@@ -1,21 +1,4 @@
-"""Dispatch modes, dispatch/collect functions, and @distributed decorator.
-
-All dispatch/collect logic lives here — single source of truth.
-Handle imports from this module and uses DISPATCH_MODE_REGISTRY.
-
-Design:
-  - Dispatch enum: declares how input flows to workers
-  - Execute enum: declares which workers run
-  - Each Dispatch mode is paired with dispatch_fn + collect_fn in DISPATCH_MODE_REGISTRY
-  - dispatch/collect functions take (wg, args, kwargs, batch_size) to access rank_info, dp_size, etc.
-  - @distributed decorator marks Remote methods with their dispatch/execute modes
-
-DP-aware dispatch (DP_SCATTER, DP_SCATTER_HEAD):
-  - Input is split by dp_size (not world_size) using recursive pytree_chunk
-  - Workers in the same DP group (varying TP/PP/SP rank) receive the SAME shard
-  - Collect filters: only tp_rank==0, pp_last_stage, sp_rank==0 results are kept
-  - Kept results are merged via pytree_cat to reconstruct the full batch
-"""
+"""Dispatch modes, dispatch/collect functions, and @distributed decorator."""
 
 from __future__ import annotations
 
@@ -41,12 +24,7 @@ CollectFn: TypeAlias = Callable[["Handle", List[Any]], Any]
 
 
 def _unwrap_broadcast(args: tuple, kwargs: dict):
-    """Strip top-level Broadcast wrappers from args and kwargs.
-
-    Broadcast is a controller-side dispatch annotation: it must be consumed
-    here and never reach workers. Only top-level args/kwargs values can be
-    Broadcast — nesting is not supported.
-    """
+    """Strip top-level Broadcast wrappers from args and kwargs."""
     clean_args = tuple(v.value if isinstance(v, Broadcast) else v for v in args)
     clean_kwargs = {k: (v.value if isinstance(v, Broadcast) else v) for k, v in kwargs.items()}
     return clean_args, clean_kwargs
@@ -85,10 +63,7 @@ def _dispatch_scatter(
     kwargs: Dict[str, Any],
     batch_size: Optional[int],
 ) -> List[Shard]:
-    """Split args/kwargs by world_size (treat every worker as its own DP rank).
-
-    Equivalent to DP_SCATTER with dp_size == world_size.
-    """
+    """Split args/kwargs by world_size (treat every worker as its own DP rank)."""
     if batch_size is None:
         args, kwargs = _unwrap_broadcast(args, kwargs)
         return [(args, kwargs)] * wg.world_size
@@ -108,14 +83,7 @@ def _dispatch_dp_scatter(
     kwargs: Dict[str, Any],
     batch_size: Optional[int],
 ) -> List[Shard]:
-    """Split args/kwargs by dp_size, assign by dp_rank.
-
-    Workers in the same DP group (different TP/PP/SP ranks) receive
-    the identical data shard. Each worker is responsible for internal
-    slicing (TP slices hidden dim, PP runs its own layers, etc.).
-
-    If batch_size is None (all broadcast), replicate to all workers.
-    """
+    """Split args/kwargs by dp_size, assign by dp_rank."""
     dp_size = wg.dp_size
 
     if batch_size is None:
@@ -140,11 +108,7 @@ def _dispatch_dp_scatter_head(
     kwargs: Dict[str, Any],
     batch_size: Optional[int],
 ) -> List[Shard]:
-    """Like DP_SCATTER, but non-head ranks receive empty args/kwargs.
-
-    DP head rank per group: tp_rank==0, pp_rank==0, sp_rank==0.
-    This saves RPC bandwidth when workers broadcast data internally.
-    """
+    """Like DP_SCATTER, but non-head ranks receive empty args/kwargs."""
     dp_size = wg.dp_size
 
     if batch_size is None:
@@ -175,13 +139,7 @@ def _collect_passthrough(wg, results: List) -> List:
 
 
 def _collect_dp_merge(wg, results: List) -> Any:
-    """Collect only DP-head results per DP group, then merge.
-
-    DP head: tp_rank==0, is_pipeline_last_stage, sp_rank==0.
-    Returns the pytree_cat'd result across DP ranks.
-
-    Handles Execute.RANK_ZERO case where len(results) < world_size.
-    """
+    """Collect only DP-head results per DP group, then merge."""
     dp_results = []
     for i in range(len(results)):
         ri = wg.rank_infos[i]
@@ -209,19 +167,7 @@ def resolve_backward_dispatch_mode(
     fwd_dispatch_mode: Dispatch,
     rank_infos: list,
 ) -> Dispatch:
-    """Return the dispatch mode for the backward RPC, or raise if unsupported.
-
-    Rules:
-      DP_SCATTER      + pp_size==1 → DP_SCATTER (grad shards align with output shards)
-      DP_SCATTER_HEAD + pp_size==1 → DP_SCATTER (all ranks must participate in backward)
-      DP_SCATTER / DP_SCATTER_HEAD + pp_size>1 → Error (autograd graph broken across PP)
-      BROADCAST → Error
-      SCATTER   → Error
-
-    !! IMPORTANT — adding a new Dispatch variant !!
-    Update this function to decide whether DP_SCATTER backward is correct,
-    or a hard error is needed.  Also check Remote._auto_backward's dispatch_mode.
-    """
+    """Return the dispatch mode for the backward RPC, or raise if unsupported."""
     if fwd_dispatch_mode in (Dispatch.BROADCAST, Dispatch.SCATTER):
         raise ValueError(
             f"Method '{method_name}' uses dispatch_mode={fwd_dispatch_mode.name}, "
@@ -249,21 +195,7 @@ def distributed(
     dispatch_mode: Dispatch = Dispatch.DP_SCATTER,
     execute_mode: Execute = Execute.ALL,
 ) -> Callable:
-    """Declare SPMD dispatch/execute mode on a Role method.
-
-    Handle scans for this attribute and auto-generates proxy methods.
-    Default dispatch mode is DP_SCATTER.
-
-    Usage:
-        class DiffusionRemote(Remote):
-            @distributed
-            def rollout(self, samples, prompts):
-                ...
-
-            @distributed(dispatch_mode=Dispatch.BROADCAST, execute_mode=Execute.RANK_ZERO)
-            def get_metrics(self):
-                ...
-    """
+    """Declare SPMD dispatch/execute mode on a Role method."""
 
     def decorator(func: Callable) -> Callable:
         @wraps(func)

@@ -1,30 +1,4 @@
-"""VideoAlign reward scorer (REFL-compatible / BPTT-differentiable).
-
-Wraps :class:`VideoRewardWrapper` (Qwen2-VL-based reward model producing
-three scalar scores per (video, prompt) pair: VQ / MQ / TA) and exposes a
-recipe-local differentiable REFL entry point.
-
-Reward = ``w_vq * VQ + w_mq * MQ + w_ta * TA``  (defaults to 1 / 1 / 1).
-
-Gradient flow
--------------
-The Qwen2-VL vision encoder is differentiable w.r.t. the input pixels when
-the *fast* image processor is used (the wrapper force-installs
-``Qwen2VLImageProcessorFast`` on construction). The generated video arrives
-via ``compute_rewards_differentiable`` as ``[B, C, T, H, W]`` float in
-``[-1, 1]`` with a live ``grad_fn`` (BPTT path); we forward into the wrapper under
-``torch.enable_grad`` so the linear combination of VQ/MQ/TA traces back
-through the vision tower into the diffusion graph.
-
-Self-containment
-----------------
-This scorer no longer requires the sibling ``mmrl`` repo on disk. The
-Qwen2-VL reward backbone, prompt template, checkpoint loader and
-inference wrapper all live under
-:mod:`experimental.refl.reward.videoalign.model` / :mod:`...wrapper`. The
-``mmrl_repo_root`` Spec field has been removed; ``MMRL_REPO_ROOT`` env
-var is now irrelevant.
-"""
+"""VideoAlign differentiable reward — consumes ``[B, C, T, H, W]`` float video in ``[-1, 1]``."""
 
 from __future__ import annotations
 
@@ -64,7 +38,6 @@ class VideoAlignRewardScorer(LocalRewardBackend):
             w_vq=config.w_vq,
             w_mq=config.w_mq,
             w_ta=config.w_ta,
-            differentiable=config.differentiable,
         )
 
     def _load_model(self) -> None:
@@ -81,7 +54,6 @@ class VideoAlignRewardScorer(LocalRewardBackend):
         self._w_ta = float(self.model_kwargs["w_ta"])
         self._use_norm = bool(self.model_kwargs["use_norm"])
         self._reward_num_frames = int(self.model_kwargs["reward_num_frames"])
-        self._differentiable = bool(self.model_kwargs["differentiable"])
 
         logger.info(
             "VideoAlignRewardScorer: loading VideoRewardWrapper from %s",
@@ -133,8 +105,7 @@ class VideoAlignRewardScorer(LocalRewardBackend):
                 ds.append(v)
             per_sample_videos = ds
 
-        autograd_ctx = torch.enable_grad if self._differentiable else torch.no_grad
-        with autograd_ctx():
+        with torch.enable_grad():
             scores = self.model.forward_scores(
                 per_sample_videos,
                 prompts,
@@ -145,16 +116,11 @@ class VideoAlignRewardScorer(LocalRewardBackend):
         return reward.float()
 
     def offload(self) -> None:
-        if self.model is not None and getattr(self.model, "model", None) is not None:
-            self.model.model.cpu()
-            torch.cuda.empty_cache()
+        self.model.model.cpu()
+        torch.cuda.empty_cache()
 
     def onload(self) -> None:
-        if self.model is not None and getattr(self.model, "model", None) is not None:
-            self.model.model.to(self.device)
-
-    def is_available(self) -> bool:
-        return bool(self._is_loaded)
+        self.model.model.to(self.device)
 
     def dispose(self) -> None:
         self.offload()
@@ -162,27 +128,7 @@ class VideoAlignRewardScorer(LocalRewardBackend):
 
 @dataclass
 class VideoAlignSpec(BaseRewardComponentSpec):
-    """Typed config for :class:`VideoAlignRewardScorer`.
-
-    Args:
-        reward_model_path: Directory containing ``model_config.json`` and
-            the ``checkpoint-*`` subdir (with ``model.pth`` or LoRA split).
-            Required.
-        device: ``"auto"`` / ``"cuda"`` / ``"cuda:N"`` — resolved against
-            ``base_device``.
-        batch_size: kept for parity with sibling specs.
-        resize_height / resize_width: bicubic target before the Qwen2-VL
-            vision encoder. Defaults (336 × 588) match the published
-            checkpoints.
-        micro_batch_size: max samples per reward forward (peak-VRAM knob).
-        reward_num_frames: temporal downsample to this many uniformly
-            spaced frames before scoring; ``<= 0`` disables.
-        use_norm: z-score normalise each dimension using the means / stds
-            stored under ``inference_config`` in ``model_config.json``.
-        w_vq, w_mq, w_ta: linear combination weights into the final scalar.
-        differentiable: keep autograd on the reward forward (default True —
-            required for REFL). Set False for historical GRPO / replay.
-    """
+    """Typed config for :class:`VideoAlignRewardScorer`."""
 
     reward_model_path: str = ""
 
@@ -198,8 +144,6 @@ class VideoAlignSpec(BaseRewardComponentSpec):
     w_vq: float = 1.0
     w_mq: float = 1.0
     w_ta: float = 1.0
-
-    differentiable: bool = True
 
 
 __all__ = [

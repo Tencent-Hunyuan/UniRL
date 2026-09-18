@@ -1,26 +1,4 @@
-"""WAN21CLIPVisionEncodeStage — Images → ImageEmbedCondition via CLIP vision.
-
-Mirrors diffusers ``pipelines/wan/pipeline_wan_i2v.py`` CLIP encoding:
-preprocess via ``CLIPImageProcessor``, run ``CLIPVisionModel`` with
-``output_hidden_states=True``, then read the **penultimate** hidden
-state (``hidden_states[-2]``) as the patch-token embedding stream.
-
-This stage is constructed only when ``bundle.uses_clip_vision`` is
-``True`` (i.e. the transformer checkpoint declares ``image_dim > 0``).
-WAN 2.2's mainstream checkpoints set ``image_dim == 0`` and skip the
-stage entirely; the WAN 2.1 I2V 14B/720P family declares ``image_dim``
-and triggers it.
-
-The output ``ImageEmbedCondition`` carries:
-
-- ``embeds: [B, num_patches, dim]`` — penultimate hidden state.
-- ``attn_mask: [B, num_patches]`` — all-ones long tensor (CLIP ViT
-  encodes the full patch grid without padding).
-
-The diffusion stage forwards ``embeds`` to the transformer as
-``encoder_hidden_states_image=…`` (with CFG batch-doubling when
-``guidance_scale > 1.0``).
-"""
+"""WAN21CLIPVisionEncodeStage — packed Images → CLIP vision condition."""
 
 from __future__ import annotations
 
@@ -35,13 +13,7 @@ from unirl.types.primitives import Images
 
 @runtime_checkable
 class _VisionBundle(Protocol):
-    """Structural Protocol for bundles that own a CLIP vision tower.
-
-    Both :class:`WAN21Bundle` (when ``uses_clip_vision`` is true) and
-    structurally-compatible bundles satisfy this. WAN 2.2 does NOT load
-    CLIP by default, but the same stage could be reused if a 2.2 I2V
-    variant with ``image_dim > 0`` ever ships.
-    """
+    """Structural Protocol for bundles that own a CLIP vision tower."""
 
     vision_encoder: Any
     image_processor: Any

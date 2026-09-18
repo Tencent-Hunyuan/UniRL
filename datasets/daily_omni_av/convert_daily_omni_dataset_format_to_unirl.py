@@ -1,27 +1,5 @@
 #!/usr/bin/env python3
-"""Convert Daily-Omni audio/video MCQA data to UniRL JSONL.
-
-Reads the official Daily-Omni release — ``qa.json`` plus the ``Videos/`` tree unpacked from
-``Videos.tar`` (https://huggingface.co/datasets/liarliar/Daily-Omni) — and writes the jsonl
-that ``unirl.data.data_source.MultimodalRLDataSource`` expects::
-
-    {"prompt": <question + choices + answer-format instruction>,
-     "prompt_id": "daily_omni_av:<split>:<index>:<video_id>",
-     "media_refs": [{"modality": "video", "role": "prompt", "uri": "<abs>/<id>_video.mp4"}],
-     "metadata": {"answer": "<A|B|C|D>", "video_id": <str>, "qa_type": <str>}}
-
-Only a video media ref is emitted: the loader has no audio role, and Qwen3-Omni extracts the
-embedded audio track from that same file when ``use_audio_in_video=true``.
-
-Daily-Omni is published as a benchmark with no official split, so the split is carved here by
-``video_id`` — several questions share one clip, and splitting per row would leak the same
-video into both sides.
-
-Example:
-    python datasets/daily_omni_av/convert_daily_omni_dataset_format_to_unirl.py \
-      --qa-json /path/to/Daily-Omni/qa.json \
-      --out-dir datasets/daily_omni_av
-"""
+"""Convert Daily-Omni audio/video MCQA data to UniRL JSONL."""
 
 from __future__ import annotations
 

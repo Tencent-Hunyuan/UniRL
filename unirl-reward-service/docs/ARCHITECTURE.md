@@ -78,7 +78,7 @@ One diagram for the entire process structure:
 | ScorerActor | `reward_service/workers/actor.py` | `@ray.remote` thin shell: constructs the scorer, forwards `score()` |
 | BaseScorer | `reward_service/scorers/base.py` | The abstract contract: `score(items) -> list[dict]` + `sub_metric_names` |
 | Registry | `reward_service/scorers/registry.py` | `register(name, cls)` + optional-dep tolerance (`_try_import`) |
-| Concrete scorers | `reward_service/scorers/{clip,pickscore,imagereward,hpsv2_scorer,hpsv3_scorer,unified_reward,geneval2,geneval,ocr,wise,videoalign}.py` (+ vendored `_videoalign/`) | One module per reward; each ends with `register("name", Cls)` |
+| Concrete scorers | `reward_service/scorers/{clip,pickscore,imagereward,hpsv2_scorer,hpsv3_scorer,unified_reward,geneval2,geneval,ocr,wise,editscore,videoalign}.py` (+ vendored `_videoalign/`) | One module per reward; each ends with `register("name", Cls)` |
 
 ---
 
@@ -299,6 +299,25 @@ Request `0` asked for `clip + hpsv2`; `clip` failed → only `hpsv2` has a score
 - A client can safely pack unrelated rewards into the same batch — **they will not drag each other down**.
 - A client must **read both `results[i]` and `errors[i]`** — looking only at `results` would silently miss a failed reward.
 
+### 4.4 Rank-affine direct scorer server
+
+`reward_service.direct_server` is a lighter deployment for one managed image
+scorer. It does not create a nested Ray runtime: the parent UniRL reward worker
+launches it with an explicit Python interpreter and an inherited listening socket.
+The server:
+
+- owns exactly one registered scorer;
+- accepts image/image-edit histories only in the initial protocol;
+- serializes scoring and lifecycle transitions;
+- echoes request/sample/group/policy/scorer identity;
+- caches idempotency keys for safe retries;
+- rejects non-finite outputs;
+- exposes `GET /health` plus explicit `onload`, `offload`, `drain`, and
+  `shutdown` lifecycle operations.
+
+The full gateway remains the multi-reward, multi-replica deployment. The direct
+server is a rank-local process/environment boundary, not a replacement for it.
+
 ---
 
 ## 5. Extension Points
@@ -418,6 +437,8 @@ For **vLLM-style scorers** (`unified_reward` / `geneval2` / `wise`), the `dtype 
 ```
 reward_service/
 ├── server.py            # HTTP gateway — /score /health /rewards
+├── direct_server.py     # one managed scorer — /score + lifecycle
+├── wire.py              # shared image/video wire decoding
 ├── __main__.py          # CLI entry — argparse + uvicorn.run
 ├── config.py            # YAML → ServiceCfg / RewardModelCfg
 ├── schemas.py           # Pydantic HTTP schemas
@@ -441,7 +462,8 @@ reward_service/
     ├── ocr.py           # ─┘
     ├── unified_reward.py# ─┐
     ├── geneval2.py      #  │ vLLM-style
-    ├── wise.py          # ─┘
+    ├── wise.py          #  │
+    ├── editscore.py     # ─┘ image-editing judge (LoRA on a VLM)
     ├── geneval.py       #  mmdet/mmcv-style (disabled by default)
     └── videoalign.py    #  T2V reward (vendored _videoalign/)
 ```

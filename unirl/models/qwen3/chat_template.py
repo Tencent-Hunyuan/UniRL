@@ -1,17 +1,4 @@
-"""Qwen3ChatTemplateStage — conversations or batched text → AR conditions.
-
-Implements ``EmbedStage[List[Turn] | Texts, Qwen3ARConditions]`` from
-:mod:`unirl.models.types.embedding`. Renders the role-tagged trajectory
-(:meth:`Sample.text_conditioning`) into one chat conversation per frontier sample
-and applies the bundle tokenizer's chat template (with
-``add_generation_prompt=True``) so the AR stage starts from the canonical
-assistant-turn prefix the model was trained against.
-
-An optional ``system_instruction`` string is prepended as a ``system``
-message — callers that need byte-for-byte parity with an SFT template
-(e.g. Qwen3's ``qwen3_nothink`` recipe) pass the exact string here. The
-stage does not interpret it.
-"""
+"""Qwen3ChatTemplateStage — conversations or batched text → AR conditions."""
 
 from __future__ import annotations
 
@@ -48,13 +35,7 @@ class Qwen3ChatTemplateStage(EmbedStage[Qwen3ChatInput, Qwen3ARConditions]):
         self.enable_thinking = bool(enable_thinking)
 
     def embed(self, value: Qwen3ChatInput) -> Qwen3ARConditions:
-        """Render one chat conversation per row and pack it into AR conditions.
-
-        A ``List[Turn]`` comes from :meth:`Sample.text_conditioning` and retains
-        full role-aware history. ``Texts`` is the supervised single-turn seam and
-        is normalized to one ``user`` turn before the same rendering/tokenization
-        path, keeping SFT and rollout prompts byte-identical.
-        """
+        """Render one chat conversation per row and pack it into AR conditions."""
         turns = [Turn(role="user", content=value)] if isinstance(value, Texts) else value
         if not turns:
             raise ValueError("Qwen3ChatTemplateStage.embed: expected at least one conversation turn.")
@@ -66,12 +47,7 @@ class Qwen3ChatTemplateStage(EmbedStage[Qwen3ChatInput, Qwen3ARConditions]):
         *,
         tools: Optional[Sequence[Optional[Sequence[Dict[str, Any]]]]] = None,
     ) -> Qwen3ARConditions:
-        """Render OpenAI-style histories and pack them as generation conditions.
-
-        Agent SFT passes each conversation without its final target assistant
-        turn. Long histories are cropped from the left after templating so the
-        latest user/tool interaction and assistant generation prefix survive.
-        """
+        """Render OpenAI-style histories and pack them as generation conditions."""
         if not conversations:
             raise ValueError("Qwen3ChatTemplateStage.embed_messages: empty conversation batch.")
         if tools is None:

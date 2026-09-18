@@ -1,9 +1,4 @@
-"""Generation drivers: t2i via diffusers, text via an OpenAI-compatible endpoint.
-
-Deterministic image naming is the contract between stages — no manifest file:
-``images/p{prompt_idx:05d}_s{sample_idx}.png`` with seed ``base + 1000*p + s``.
-Both drivers resume by skipping outputs that already exist.
-"""
+"""Generation drivers: t2i via diffusers, text via an OpenAI-compatible endpoint."""
 
 from __future__ import annotations
 
@@ -35,9 +30,7 @@ def image_path(images_dir: Path, prompt_idx: int, sample_idx: int) -> Path:
 def t2i_jobs(
     prompts: List[str], images_dir: Path, samples_per_prompt: int, shard: Tuple[int, int] = (0, 1)
 ) -> List[Tuple[int, int]]:
-    """Missing (prompt, sample) jobs for this shard. The full deterministic grid is
-    partitioned BEFORE the exists() filter, so each job is owned by exactly one shard
-    no matter when each shard scans the directory."""
+    """Missing (prompt, sample) jobs for this shard."""
     grid = [(p, s) for p in range(len(prompts)) for s in range(samples_per_prompt)]
     return [(p, s) for p, s in grid[shard[0] :: shard[1]] if not image_path(images_dir, p, s).exists()]
 
@@ -138,9 +131,7 @@ def run_text(
     gen: Dict,
     concurrency: int = 8,
 ) -> None:
-    """Sample ``samples_per_prompt`` completions per item from an OpenAI-compatible
-    server (``sglang serve`` / ``vllm serve``), appending jsonl rows
-    ``{id, sample, response}`` to ``out_file``."""
+    """Sample ``samples_per_prompt`` completions per item from an OpenAI-compatible server into ``out_file``."""
     done = {(row["id"], row["sample"]) for row in read_completions(out_file)} if out_file.exists() else set()
     jobs = [(item, s) for item in items for s in range(samples_per_prompt) if (item["id"], s) not in done]
     if not jobs:

@@ -1,14 +1,4 @@
-"""TensorTransport — the backend-agnostic storage/retrieval contract.
-
-The ABC every backend implements: per-tensor ``put`` / ``get`` (+ optional
-batched overrides), the tree-walking ``dehydrate`` / ``hydrate`` boundary, a
-``session`` context for cross-object batching, and a generic ``transform`` for
-remote compute. Worker-resident backends add their machinery via
-``unirl.distributed.tensor.worker_local.WorkerLocalTransport``;
-``TensorTransportRuntime`` is the per-process singleton call sites reach at
-runtime. The ``TensorRef`` / ``TensorSpan`` data model lives in
-``unirl.distributed.tensor.ref``.
-"""
+"""TensorTransport — the backend-agnostic storage/retrieval contract."""
 
 from __future__ import annotations
 
@@ -34,19 +24,7 @@ def _collect_leaves(
     setters: Dict[str, Callable[[Any], None]],
     filter_fn: Optional[Callable[[str], bool]] = None,
 ) -> None:
-    """Walk *value* recursively, collect leaves of *leaf_type*.
-
-    For each leaf found, stores the value in *collected* keyed by its
-    dotted path, and a setter closure in *setters* that can write a
-    replacement back into the original structure.
-
-    Dispatch:
-      - ``Batch``  -> recurse into ``dataclasses.fields``
-      - ``dict``   -> recurse into values
-      - ``list``   -> recurse into elements
-      - leaf_type  -> collect
-      - else       -> skip
-    """
+    """Walk *value* recursively, collect leaves of *leaf_type*."""
     if isinstance(value, leaf_type):
         if filter_fn is None or filter_fn(prefix):
             collected[prefix] = value
@@ -125,13 +103,7 @@ def _collect_list(
 
 
 class TensorTransport(abc.ABC):
-    """Backend-agnostic tensor transport — the universal contract.
-
-    Store/fetch refs (``put``/``get``/``is_ref``), the batched + tree-walking
-    boundary helpers (``put_batch``/``get_batch``/``dehydrate``/``hydrate``/
-    ``session``), and the compute proxy (``transform``). Worker-resident
-    backends add storage-engine machinery via :class:`WorkerLocalTransport`.
-    """
+    """Backend-agnostic tensor transport — the universal contract."""
 
     @abc.abstractmethod
     def put(self, tensor: torch.Tensor) -> Any:
@@ -140,14 +112,7 @@ class TensorTransport(abc.ABC):
 
     @abc.abstractmethod
     def _resolve_handles(self, handles: List[Any]) -> List[torch.Tensor]:
-        """Resolve each handle to its full dim-0 base tensor, aligned to *handles*.
-
-        The single backend-specific resolution primitive. Backends batch and dedup
-        internally (gpu: one ``batch_borrow`` + IPC-view cache; tq: one ``_fetch``
-        per put-group; colocate: per-tensor ``store.get``). ``get`` / ``get_batch``
-        below slice each span's ``[start:stop)`` rows off these bases — the slice is
-        universal, so it lives on the base, not in the backends.
-        """
+        """Resolve each handle to its full dim-0 base tensor, aligned to *handles*."""
         ...
 
     def get(self, spans: List[Any]) -> torch.Tensor:
@@ -177,12 +142,7 @@ class TensorTransport(abc.ABC):
         return result
 
     def get_batch(self, metas: Dict[str, TensorRef]) -> Dict[str, torch.Tensor]:
-        """Fetch multiple named tensors, batching handle resolution across ALL keys.
-
-        Flatten every key's spans into one ``_resolve_handles`` call (one borrow /
-        fetch for the whole object), then slice + cat per key. An empty per-key span
-        list yields ``cat_rows([]) -> empty(0)``.
-        """
+        """Fetch multiple named tensors, batching handle resolution across ALL keys."""
         flat: List[Any] = []
         owners: List[str] = []
         for k, m in metas.items():
@@ -196,12 +156,7 @@ class TensorTransport(abc.ABC):
         return {k: cat_rows(parts[k]) for k in metas}
 
     def transform(self, meta: TensorRef, fn: Callable[[torch.Tensor], torch.Tensor]) -> TensorRef:
-        """Apply fn to the remote tensor, return new TensorRef.
-
-        Default: hydrate -> apply fn -> dehydrate (round-trip through local
-        memory). Backends with remote compute (TensorStore) can override to
-        execute on the worker without moving data.
-        """
+        """Apply fn to the remote tensor, return new TensorRef."""
         tensor = self.get(meta.spans)
         result = fn(tensor)
         ref = self.put(result)
@@ -215,22 +170,11 @@ class TensorTransport(abc.ABC):
 
     @classmethod
     def localize(cls, shards: list, pool: Any, device_ids: list, worker_ids: list) -> list:
-        """Make every ref in each shard resolvable on its target worker.
-
-        Base (GLOBAL) backends: identity — a ref resolves from any process, so no
-        controller-orchestrated transfer is needed. WorkerLocalTransport overrides
-        with the NCCL/IPC routing skeleton. ``pool`` (topology) and the per-shard
-        ``device_ids``/``worker_ids`` (dst identity) are unused here.
-        """
+        """Make every ref in each shard resolvable on its target worker."""
         return shards
 
     def dehydrate(self, value: Any) -> Any:
-        """Replace tensors with ``TensorRef`` refs.
-
-        - ``torch.Tensor`` -> returns ``TensorRef``
-        - ``Batch`` / ``dict`` / ``list`` -> mutates in place, returns *value*
-        - anything else -> returns *value* unchanged
-        """
+        """Replace tensors with ``TensorRef`` refs."""
         if isinstance(value, torch.Tensor):
             ref = self.put(value)
             bs = int(value.shape[0]) if value.dim() > 0 else 1
@@ -253,15 +197,7 @@ class TensorTransport(abc.ABC):
         return value
 
     def hydrate(self, value: Any, fields: Optional[Set[str]] = None) -> Any:
-        """Replace ``TensorRef`` refs with tensors.
-
-        - ``TensorRef`` -> returns ``torch.Tensor``
-        - ``Batch`` / ``dict`` / ``list`` -> mutates in place, returns *value*
-        - anything else -> returns *value* unchanged
-
-        If *fields* is given, only dotted-path keys matching a prefix in
-        *fields* are hydrated; the rest stay as ``TensorRef``.
-        """
+        """Replace ``TensorRef`` refs with tensors."""
         if isinstance(value, TensorRef):
             return value.materialize(backend=self)
 
@@ -285,12 +221,7 @@ class TensorTransport(abc.ABC):
 
     @contextmanager
     def session(self) -> Iterator["TransportSession"]:
-        """Batched dehydrate context.
-
-        Collects tensors across multiple ``dehydrate()`` calls and flushes
-        via ``put_batch`` per object on ``__exit__``.  Hydrate is immediate
-        (no batching benefit from deferring).
-        """
+        """Batched dehydrate context."""
         sess = TransportSession(self)
         try:
             yield sess
@@ -306,12 +237,7 @@ class TransportSession:
         self._pending: List[Tuple[Dict[str, torch.Tensor], Dict[str, Callable[[Any], None]]]] = []
 
     def dehydrate(self, value: Any) -> Any:
-        """Replace tensors with ``TensorRef`` refs (deferred flush).
-
-        Bare ``torch.Tensor`` is handled immediately (caller needs return
-        value). ``Batch`` / ``dict`` / ``list`` are collected; the actual
-        ``put_batch`` happens when the session closes.
-        """
+        """Replace tensors with ``TensorRef`` refs (deferred flush)."""
         if isinstance(value, torch.Tensor):
             return self._backend.dehydrate(value)
 

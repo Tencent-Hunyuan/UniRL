@@ -1,11 +1,4 @@
-"""Qwen2.5-VL vision-language pipeline on the typed stage/pipeline architecture.
-
-AR-only VLM pipeline: text+images in, text out. Supports GRPO training via
-ARStage.autoregress + ARStage.replay.
-
-Importing this package re-exports its bundle / pipeline / config classes;
-recipes wire them by ``_target_`` dotpath.
-"""
+"""Qwen2.5-VL vision-language pipeline on the typed stage/pipeline architecture."""
 
 from unirl.models.qwen_vl.ar import (
     QwenVLARParams,

@@ -1,15 +1,4 @@
-"""Text conditioning types.
-
-``TextEmbedCondition`` carries the output of a frozen text encoder (token-level
-hidden states + optional pooled vector + attention mask). For dual-encoder
-diffusion models (SD3, Flux) where text is pre-encoded into ``[B, T, hidden]``
-before reaching the diffusion transformer.
-
-``TextTokenCondition`` carries pre-encoder token IDs ready for an in-model
-embedding lookup. For unified-vocab multimodal models (HunyuanImage 3.0, Janus,
-Chameleon, …) where the diffusion / AR transformer owns its own embedding
-table and consumes ``input_ids`` directly.
-"""
+"""Text conditioning types — pre-encoded ``[B, T, hidden]`` embeds for diffusion, raw ids for AR."""
 
 from __future__ import annotations
 
@@ -47,13 +36,7 @@ class TextEmbedCondition(Condition):
 
     @classmethod
     def concat(cls, items: Sequence["TextEmbedCondition"]) -> "TextEmbedCondition":
-        """Concat text embeddings, padding variable token lengths with zeros.
-
-        Qwen-Image encodes each request chunk to that chunk's max prompt length,
-        so different rollout shards can carry different sequence lengths. The
-        generic batch concat uses plain ``torch.cat(dim=0)``; pad dim 1 first
-        so shard merges preserve attention-mask semantics.
-        """
+        """Concat text embeddings, padding variable token lengths with zeros."""
         if not items or len(items) == 1:
             return Batch.concat.__func__(cls, items)
 
@@ -80,12 +63,7 @@ class TextEmbedCondition(Condition):
 
 @dataclass
 class TextTokenCondition(Condition):
-    """Pre-encoder text conditioning carried as token IDs.
-
-    For unified-vocab multimodal models where the transformer owns its own
-    embedding table — the receiving stage looks ``input_ids`` up in that
-    shared table rather than receiving pre-computed embeddings.
-    """
+    """Pre-encoder text conditioning carried as token IDs."""
 
     modality: ClassVar[Modality] = Modality.TEXT
 
@@ -94,15 +72,7 @@ class TextTokenCondition(Condition):
 
     @classmethod
     def concat(cls, items: Sequence["TextTokenCondition"]) -> "TextTokenCondition":
-        """Concat token-id conditions, right-padding variable lengths first.
-
-        SGLang's per-shard condition packing right-pads prompt ``input_ids``
-        to that shard's in-batch max, so different rollout
-        actors carry different sequence lengths. The generic batch concat
-        uses plain ``torch.cat(dim=0)``; pad dim 1 to the global max with
-        zeros (attention_mask zeros the same positions out, so the pad
-        token value is masked at attend-time and the receiver is unaffected).
-        """
+        """Concat token-id conditions, right-padding variable lengths first."""
         if not items or len(items) == 1:
             return Batch.concat.__func__(cls, items)
 

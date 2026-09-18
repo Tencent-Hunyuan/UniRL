@@ -14,11 +14,7 @@ if TYPE_CHECKING:
 
 @dataclass
 class SimpleBackendConfig:
-    """In-memory async storage backend configuration.
-
-    Defaults are sized for typical SD3-GRPO single-step volume; override only
-    if you've measured a need. For production-tunable sizing, use Mooncake.
-    """
+    """In-memory async storage backend configuration."""
 
     num_units: int = 16  # in-process Ray storage actors
     unit_size: int = 1024  # per-unit item capacity

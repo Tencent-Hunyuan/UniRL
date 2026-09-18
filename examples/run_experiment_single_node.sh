@@ -9,12 +9,7 @@
 #   train_sft                  examples/sft/ (qwen3, qwen_vl, BAGEL, SD3)
 #   train_pe                   examples/pe/ (prompt-enhancement joint diffusion+AR)
 #   train_unified_model        examples/unified_model/ (HunyuanImage3, unified AR+diffusion)
-#   train_agentic              examples/deep_research/ (barrier, answer-graded reward)
-#   train_agentic_partial      examples/deep_research/ (colocated partial rollout)
-#   train_agentic_async        examples/deep_research/ (disaggregated asynchronous rollout)
-#   train_agentic_env          examples/alfworld/ (barrier, environment-sourced reward)
-#   train_agentic_env_partial  examples/alfworld/ (colocated partial rollout)
-#   train_agentic_env_async    examples/alfworld/ (disaggregated asynchronous rollout)
+#   train_agentic              examples/deep_research/ (colocated barrier, service-scored reward)
 #
 # The first positional arg is the examples/ config name, domain-qualified
 # (passed to Hydra as --config-name); any extra args are forwarded verbatim as Hydra overrides.

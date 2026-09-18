@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import torch
 
@@ -50,6 +50,10 @@ def _tensor_stats(prefix: str, tensor: Optional[torch.Tensor]) -> Dict[str, floa
     if tensor is None or (not torch.is_tensor(tensor)) or tensor.numel() == 0:
         return {}
     flat = tensor.detach().to(dtype=torch.float32).reshape(-1).cpu()
+    # Non-finite marks "not scored" rows (per-domain component rewards use NaN).
+    flat = flat[torch.isfinite(flat)]
+    if flat.numel() == 0:
+        return {}
     return {
         f"{prefix}_mean": float(flat.mean().item()),
         f"{prefix}_std": float(flat.std(unbiased=False).item()),
@@ -84,28 +88,7 @@ def _zero_std_group_counts_from_ids(
 
 
 def compute_rollout_sample_metrics(*, sample: Any, trunc_len: Optional[int] = None) -> Dict[str, float]:
-    """Build rollout metrics directly from a :class:`Sample`.
-
-    Walks the **gen Parts** of ``sample`` (those with ``sampling_params``
-    set) and emits per-part metrics under the ``rollout/`` prefix:
-
-    - ``num_samples`` (the sample's ``batch_size``)
-    - For each gen Part: ``reward_{mean,std,min,max}``,
-      ``advantage_{mean,std,min,max}``,
-      ``reward_<component>_{mean,std,min,max}`` per
-      ``part.component_rewards`` entry (``/`` flattened to ``_``),
-      ``group_count``, ``zero_std_group_ratio``,
-      ``zero_std_group_count`` when the part's ``group_ids`` is
-      populated.
-
-    Each gen Part is named ``"ar"`` when its ``sampling_params`` is an
-    :class:`ARSamplingParams`, else ``"image"`` (matching
-    ``BaseTrainer._drop_decoded``). For a single gen-part sample (the
-    common case today: one diffusion or one AR part) keys are emitted
-    unprefixed. With multiple gen Parts each part's metrics are
-    namespaced under its derived name (e.g. ``image_reward_mean``,
-    ``ar_reward_mean``).
-    """
+    """Build rollout metrics directly from a :class:`Sample`."""
     from unirl.types.sampling import ARSamplingParams
 
     metrics: Dict[str, float] = {}
@@ -160,6 +143,29 @@ def compute_rollout_sample_metrics(*, sample: Any, trunc_len: Optional[int] = No
                 cat = tensor.detach().to(dtype=torch.float32).reshape(-1).cpu()
                 metrics.update(_tensor_stats(f"{prefix}reward_{safe_name}", cat))
 
+    return metrics
+
+
+def pooled_window_reward_metrics(parts: Sequence[Any]) -> Dict[str, float]:
+    """Reward metrics pooled over an accumulation window's gen Parts."""
+    metrics: Dict[str, float] = {"num_samples": float(sum(int(p.batch_size) for p in parts))}
+    rewards = [getattr(p, "rewards", None) for p in parts]
+    if all(torch.is_tensor(r) and r.numel() > 0 for r in rewards):
+        pooled = torch.cat([r.detach().to(dtype=torch.float32).reshape(-1).cpu() for r in rewards])
+        metrics.update(_tensor_stats("reward", pooled))
+        group_ids = [g for p in parts for g in (getattr(p, "group_ids", None) or [])]
+        zero_cnt, group_cnt = _zero_std_group_counts_from_ids(pooled, group_ids)
+        if group_cnt > 0:
+            metrics["zero_std_group_ratio"] = float(zero_cnt) / float(group_cnt)
+            metrics["zero_std_group_count"] = float(zero_cnt)
+            metrics["group_count"] = float(group_cnt)
+    components = [getattr(p, "component_rewards", None) for p in parts]
+    if components and all(isinstance(c, dict) for c in components):
+        for cname in sorted(set.intersection(*(set(c) for c in components))):
+            tensors = [c[cname] for c in components]
+            if all(torch.is_tensor(t) and t.numel() > 0 for t in tensors):
+                pooled_c = torch.cat([t.detach().to(dtype=torch.float32).reshape(-1).cpu() for t in tensors])
+                metrics.update(_tensor_stats(f"reward_{str(cname).replace('/', '_')}", pooled_c))
     return metrics
 
 

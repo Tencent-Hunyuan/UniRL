@@ -1,19 +1,4 @@
-"""VisitTool — read webpage(s) and summarize toward a goal (LIN-519, hardened).
-
-A concrete :class:`~unirl.rollout.env.tools.base.Tool` for the deep-research
-agent: fetch a URL's content with the Jina reader (needs ``$JINA_API_KEYS``) and
-summarize the parts relevant to a stated goal with an OpenAI-compatible LLM
-(hosted out-of-band; ``$SUMMARY_URL`` / ``$SUMMARY_MODEL`` or the constructor
-args — the same endpoint the judge uses). ``execute`` is synchronous and
-thread-safe so it runs on concurrent trajectory threads (:meth:`ToolEnvironment.step`) across
-concurrent trajectories. If no summarizer is configured it returns the truncated
-raw page content, so the tool is usable without a summarizer for smoke tests.
-
-Hardened toward AReaL's tongyi_deepresearch ``tool_visit.py``: Jina reads and the
-summarizer call retry on transient failures, and the summarizer returns a
-structured ``evidence`` / ``summary`` extraction (JSON-tolerant parse) rather than
-free text — higher-signal observations for the policy.
-"""
+"""VisitTool — read webpage(s) and summarize toward a goal."""
 
 from __future__ import annotations
 
@@ -57,9 +42,7 @@ def _extract_json(raw: str) -> Optional[dict]:
 
 
 class VisitTool(Tool):
-    """Visit URL(s) via the Jina reader and summarize the content toward a goal.
-    Requires ``$JINA_API_KEYS``; the summarizer endpoint comes from ``$SUMMARY_URL``
-    / ``$SUMMARY_MODEL`` or the constructor args."""
+    """Visit URL(s) via the Jina reader and summarize the content toward a goal."""
 
     name = "visit"
 
@@ -120,8 +103,7 @@ class VisitTool(Tool):
         return f"The useful information in {url} for goal {goal}:\n{summary}"
 
     def _read(self, url: str) -> str:
-        """Fetch page text via Jina, retrying on transient failures. Errors are
-        returned as ``[visit] ...`` text (surfaced to the model), never raised."""
+        """Fetch page text via Jina, retrying on transient failures."""
         key = os.environ.get("JINA_API_KEYS", "")
         headers = {"Authorization": f"Bearer {key}"} if key else {}
         last = f"[visit] failed to read {url}"
@@ -139,9 +121,7 @@ class VisitTool(Tool):
         return last
 
     def _summarize(self, content: str, goal: str) -> str:
-        """Summarize toward the goal via the out-of-band LLM into a structured
-        evidence/summary block. No endpoint -> raw (truncated) content. On repeated
-        failure -> raw content, so a dead summarizer degrades rather than crashes."""
+        """Summarize toward the goal via the out-of-band LLM into a structured evidence/summary block."""
         endpoint = os.environ.get("SUMMARY_URL", self._endpoint)
         model = os.environ.get("SUMMARY_MODEL", self._model)
         if not endpoint:

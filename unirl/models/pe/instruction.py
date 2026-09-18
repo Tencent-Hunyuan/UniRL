@@ -1,30 +1,21 @@
-"""Shared PE (Prompt Enhancement) text post-processing helpers.
-
-The LLM rewriter emits free-form chat text; both the sglang
-:class:`~unirl.rollout.engine.composed.engine.ComposedRolloutEngine` and the
-trainside :class:`~unirl.models.pe.pipeline.PEPipeline` must turn that raw
-output into the clean rewritten prompt the diffusion child conditions on. These
-two helpers are the single source of truth for that extraction so the two PE
-paths stay byte-identical.
-
-Lives under ``unirl/models/pe/`` (not the rollout engine) so the trainside
-pipeline can import it without a ``models -> rollout`` dependency edge — the
-dependency only ever runs ``rollout -> models``.
-"""
+"""Shared PE (Prompt Enhancement) text post-processing helpers."""
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+
+def ar_child_control(control: Dict[str, Any], *, system_instruction: Optional[str]) -> Dict[str, Any]:
+    """Copy parent ``chat``/``ar`` bags for an AR child Part, optionally injecting a system instruction."""
+    child: Dict[str, Any] = {key: dict(control[key]) for key in ("chat", "ar") if key in control}
+    if system_instruction:
+        for key in ("ar", "chat"):
+            child.setdefault(key, {})["system_instruction"] = system_instruction
+    return child
 
 
 def extract_pe_text(raw_text: str, marker: str) -> str:
-    """Return the substring after the LAST occurrence of ``marker``.
-
-    Pre-strips an optional ``<think>...</think>`` reasoning preamble (Qwen3
-    chat output), then takes everything after the last ``marker`` and
-    removes a wrapping pair of quotes. Returns ``""`` when the marker is
-    absent so the caller can fall back to the original user prompt.
-    """
+    """Return the substring after the LAST occurrence of ``marker``."""
     text = (raw_text or "").strip()
     if not text:
         return ""
@@ -53,14 +44,7 @@ def postprocess_pe_texts(
     marker: str,
     max_chars: Optional[int] = None,
 ) -> Tuple[List[str], Dict[str, int]]:
-    """Run marker extraction + truncation + empty-fallback over PE outputs.
-
-    ``raw_texts`` is PE-major over ``[P*N]``; the user prompt for slot
-    ``k`` is ``user_prompts[k // samples_per_prompt]``. Off-format / empty
-    outputs fall back to the original user prompt so the diffusion child
-    never conditions on blank text. Returns ``(cleaned_texts, stats)`` where
-    ``stats`` counts ``empty`` / ``truncated`` / ``fallback`` slots.
-    """
+    """Run marker extraction + truncation + empty-fallback over PE outputs."""
     cleaned: List[str] = []
     stats = {"empty": 0, "truncated": 0, "fallback": 0}
     for k, raw in enumerate(raw_texts):

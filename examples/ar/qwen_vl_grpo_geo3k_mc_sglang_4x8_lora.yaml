@@ -10,7 +10,7 @@
 # (set_lora_from_tensors -> /load_lora_adapter_from_tensors, {name}_v{N}).
 #
 # Data prep + paths: same as qwen_vl_grpo_geo3k_mc_4x8.yaml — build the local
-# jsonl once with `python -m unirl.utils.prepare_geo3k_mc --out-dir data/geo3k_mc`,
+# jsonl once with `python datasets/geo3k_mc/prepare_geo3k_mc.py --out-dir data/geo3k_mc`,
 # then set DATA_PATH=data/geo3k_mc/train.jsonl (QWEN_VL_PATH defaults to the HF id).
 
 num_devices: 32
@@ -94,9 +94,6 @@ rollout:
     tp_size: 1
     samples_pre_expanded: true
     image_token: "<|vision_start|><|image_pad|><|vision_end|>"
-    max_new_tokens: 512
-    temperature: 0.7
-    top_p: 0.9
     concurrency: 8
     engine_kwargs:
       mem_fraction_static: 0.3
@@ -137,7 +134,7 @@ algorithm:
   conditions_cls:
     _target_: hydra.utils.get_class
     path: unirl.models.qwen_vl.conditions.QwenVLARConditions
-  sampling_temperature: 0.7
+  sampling_temperature: ${sampling.temperature}
 
 stack:
   _target_: unirl.train.stack.TrainStack
@@ -148,7 +145,7 @@ data_source:
   _target_: unirl.data.data_source.MultimodalRLDataSource
   args:
     run:
-      data_path: ${oc.env:DATA_PATH}            # local jsonl; build with unirl/utils/prepare_geo3k_mc.py
+      data_path: ${oc.env:DATA_PATH}            # local jsonl; build with datasets/geo3k_mc/prepare_geo3k_mc.py
       eval_data_path: ${oc.env:EVAL_DATA_PATH,${oc.env:DATA_PATH}}
       seed: 42
     algorithm:

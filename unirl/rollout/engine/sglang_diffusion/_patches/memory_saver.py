@@ -1,12 +1,4 @@
-"""Memory saver utilities for zero-copy GPU sleep/wake via CUDA virtual memory.
-
-Encapsulates per-component region management, CPU backup stashing, and
-dirty-module tracking. Used by GPUWorker to delegate memory_saver operations.
-
-Copied verbatim from the sglang-drl fork
-(``sglang/multimodal_gen/runtime/utils/memory_saver.py``) for the LIN-365
-migration; its imports all resolve against stock upstream sglang.
-"""
+"""Memory saver utilities for zero-copy GPU sleep/wake via CUDA virtual memory."""
 
 from __future__ import annotations
 
@@ -145,11 +137,7 @@ class MemorySaverHandler:
         return obj
 
     def stash_tag(self, tag: str) -> None:
-        """Clone entire module state (params + buffers + unregistered tensors) to CPU.
-
-        Uses pinned memory and non_blocking copies when ``_pin_cpu_memory`` is True.
-        Caller must call ``torch.cuda.synchronize()`` after all stash_tag calls.
-        """
+        """Clone entire module state (params + buffers + unregistered tensors) to CPU."""
         state: dict = {"params_and_buffers": {}, "unregistered": {}}
         for name, m in self.modules_for_tag(tag).items():
             saved: dict[str, torch.Tensor] = {}
@@ -170,11 +158,7 @@ class MemorySaverHandler:
         self._stashed_states[tag] = state
 
     def restore_tag(self, tag: str) -> None:
-        """Restore stashed state for a tag after resume.
-
-        Uses non_blocking copies when stashed tensors are in pinned memory.
-        Caller must call ``torch.cuda.synchronize()`` after all restore_tag calls.
-        """
+        """Restore stashed state for a tag after resume."""
         state = self._stashed_states.pop(tag, None)
         if state is None:
             return
@@ -209,10 +193,7 @@ class MemorySaverHandler:
         tags: list[str] | None = None,
         cpu_backup_tags: list[str] | None = None,
     ) -> dict:
-        """Pause memory_saver regions and optionally stash CPU backups.
-
-        Returns a result dict with ``success``, ``sleeping``, ``message`` keys.
-        """
+        """Pause memory_saver regions and optionally stash CPU backups."""
         try:
             t_start = time.monotonic()
             all_tags = tags if tags is not None else list(_ALL_REGION_TAGS)
@@ -280,10 +261,7 @@ class MemorySaverHandler:
             }
 
     def resume(self, tags: list[str] | None = None) -> dict:
-        """Resume memory_saver regions and restore CPU backups.
-
-        Returns a result dict with ``success``, ``sleeping``, ``message`` keys.
-        """
+        """Resume memory_saver regions and restore CPU backups."""
         try:
             t_start = time.monotonic()
             tags_to_resume = set(tags) if tags is not None else set(self._paused_tags)

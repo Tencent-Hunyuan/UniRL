@@ -1,21 +1,4 @@
-"""HunyuanImage3VitEncodeStage — Images → vision-tower features.
-
-Two complementary paths:
-
-- :meth:`encode` — bare ViT pass. Returns
-  :class:`ImageEmbedCondition` ``(embeds=[B, num_patches, hidden],
-  attn_mask=[B, num_patches])``. Used by reward heads and any caller
-  that wants the raw SigLIP2 patch grid.
-
-- :meth:`encode_for_cond_vit` — canonical i2t / it2i input prep. Wraps
-  upstream ``image_processor.preprocess`` to produce ``JointImageInfo``
-  per sample, then assembles the cond_vit tensors and ``vit_kwargs``
-  in the shape the unified-MM forward expects (mirrors
-  ``HunyuanImage3ForCausalMM._encode_cond_image`` at
-  ``hunyuan.py:2145``). Returns the joint info objects plus the cond
-  tensors so callers can also assemble ``batch_message_list`` entries
-  for the chat-template wrapper.
-"""
+"""HunyuanImage3VitEncodeStage — Images → vision-tower features."""
 
 from __future__ import annotations
 
@@ -37,17 +20,16 @@ class HunyuanImage3VitEncodeStage(EncodeStage[Images, ImageEmbedCondition]):
         self.bundle = bundle
 
     def encode(self, p: Images) -> ImageEmbedCondition:
-        """Encode pixel images into ViT patch embeddings.
-
-        Pixel input convention: ``[B, C, H, W]`` in ``[0, 1]``. SigLIP2
-        normalizes internally; we pass through after a ``[0,1] → [-1, 1]``
-        rescale to match the upstream ``image_processor`` convention
-        (``HunyuanImage-3.0/hunyuan_image_3/image_processor.py``).
-        """
-        if p.pixels is None:
-            raise ValueError("HunyuanImage3VitEncodeStage.encode: pixels is None")
-
-        x = p.pixels.to(self.bundle.device).to(self.bundle.dtype)
+        """Encode pixel images into ViT patch embeddings."""
+        try:
+            x = p.to_dense()
+        except ValueError as exc:
+            raise ValueError(
+                "HunyuanImage3VitEncodeStage.encode requires uniform image shapes; "
+                "use encode_for_cond_vit for native mixed-resolution inputs"
+            ) from exc
+        x = x.to(self.bundle.device).to(self.bundle.dtype)
+        # [0, 1] → [-1, 1] mirroring upstream image_processor.
         x = x * 2.0 - 1.0
 
         with torch.no_grad():
@@ -61,45 +43,12 @@ class HunyuanImage3VitEncodeStage(EncodeStage[Images, ImageEmbedCondition]):
         attn_mask = torch.ones(embeds.shape[:2], dtype=torch.long, device=embeds.device)
         return ImageEmbedCondition(embeds=embeds, attn_mask=attn_mask)
 
+    # ------------------------------------------------------------------
+    # Chat-template-driven input prep -- canonical i2t / it2i entry point.
+    # ------------------------------------------------------------------
+
     def encode_for_cond_vit(self, p: Images) -> Dict[str, Any]:
-        """Prep cond-image features for the unified MM forward.
-
-        Mirrors ``HunyuanImage3ForCausalMM._encode_cond_image``
-        (``hunyuan.py:2145``) for the *vision-only* path used by i2t and
-        the comprehension half of it2i. Runs the upstream
-        ``image_processor.preprocess`` per-sample (it expects PIL
-        ``RGB``), unpacks the resulting ``JointImageInfo`` into the
-        cond_vit tensors and the ``vit_kwargs`` dict shape SigLIP2 needs.
-
-        Args:
-            p: ``Images`` primitive carrying ``pixels: [B, 3, H, W]``
-                float in ``[0, 1]``.
-
-        Returns:
-            Dict with the following keys (let ``B = p.pixels.shape[0]``,
-            ``S_b`` = SigLIP2 patch count for sample b, ``D`` = ViT
-            hidden width):
-
-                joint_image_info  : list[list[JointImageInfo]] of length B,
-                                    each inner list of length 1 -- one cond
-                                    image per sample. Forwarded by
-                                    ``modes/i2t.generate`` /
-                                    ``modes/it2i.generate`` as
-                                    ``batch_cond_image_info`` to the chat
-                                    template.
-                cond_vit_images   : list[Tensor [S_b, D]] of length B
-                                    (per-sample ViT pixel tensors -- the
-                                    upstream forward instantiates patch
-                                    embeddings at ``<img>`` positions via
-                                    ``instantiate_vit_image_tokens``).
-                vit_kwargs        : {"spatial_shapes": list[Tensor [2]],
-                                     "attention_mask": list[Tensor [S_b]]}
-                                    -- per-sample SigLIP2 sizing info.
-        """
-        if p.pixels is None:
-            raise ValueError("HunyuanImage3VitEncodeStage.encode_for_cond_vit: pixels is None")
-        from torchvision.transforms.functional import to_pil_image
-
+        """Prep cond-image features for the unified MM forward."""
         transformer = self.bundle.transformer
         image_processor = getattr(transformer, "image_processor", None)
         if image_processor is None:
@@ -108,19 +57,11 @@ class HunyuanImage3VitEncodeStage(EncodeStage[Images, ImageEmbedCondition]):
                 "transformer has no .image_processor (unloaded checkpoint?)."
             )
 
-        pixels = p.pixels
-        if pixels.dim() != 4 or pixels.shape[1] != 3:
-            raise ValueError(
-                f"HunyuanImage3VitEncodeStage.encode_for_cond_vit: pixels must "
-                f"be [B, 3, H, W], got {tuple(pixels.shape)}"
-            )
-
         joint_image_info: List[List[Any]] = []
         cond_vit_images: List[torch.Tensor] = []
         spatial_shapes_list: List[torch.Tensor] = []
         attn_mask_list: List[torch.Tensor] = []
-        for b in range(int(pixels.shape[0])):
-            pil_image = to_pil_image(pixels[b].clamp(0.0, 1.0).float().cpu())
+        for pil_image in p.to_pils():
             if pil_image.mode != "RGB":
                 pil_image = pil_image.convert("RGB")
             if hasattr(image_processor, "preprocess"):

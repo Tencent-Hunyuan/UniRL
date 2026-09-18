@@ -25,8 +25,8 @@
 #     false for Edit text-only: same edit chat template / drop-64, no vision
 #     tokens (upstream image=None) — not base Qwen-Image's drop-34 stage.
 #   - data_source → datasets/image_edit (JSONL with prompt + media[image,role=condition]).
-#     MultimodalRLDataSource emits primitives["image"]: Images, which the
-#     Edit-Plus pipeline requires at generate(req) (fail-fast if absent).
+#     MultimodalRLDataSource emits packed primitives["image"]: Images, preserving
+#     each source image's native aspect ratio until the Edit-Plus VAE processor.
 #   - reward → PickScore (V1). V2 will swap in EditReward for instruction
 #     following — the local PickScore scorer doesn't read the source image,
 #     only the edited output, so it's a reasonable cold-start signal.
@@ -169,14 +169,14 @@ algorithm:
   params: ${sampling}
   # DiffusionNFT loss hyperparameters (v1 algorithm.algorithms.diffusion block).
   beta: 1.0
-  adv_clip_max: 5.0
+  adv_std_saturate: 5.0
   adv_mode: raw
   use_adaptive_weight: true
   train_timestep_mode: all
   shuffle_train_timesteps: true
   apply_time_shift_in_loss: false
   training_timestep_fraction: 0.2
-  kl_coef: 0.0
+  ref_deviation_coef: 0.0
 
 stack:
   _target_: unirl.train.stack.TrainStack
@@ -204,7 +204,7 @@ sampling:
   seed: 42
   init_same_noise: false
   scheduler:
-    _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+    _target_: unirl.sde.index_schedule.AllSDEScheduler
     num_timesteps: ${..num_inference_steps}
     num_sde_steps: 0            # DiffusionNFT forward-process: no SDE steps recorded
 

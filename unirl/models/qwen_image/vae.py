@@ -1,20 +1,4 @@
-"""QwenImageVAEDecodeStage — LatentSegment → Images via VAE decode.
-
-Implements ``DecodeStage[LatentSegment, Images]``. Reads the final
-stored position from ``LatentSegment.latents[:, -1]``
-(``QwenImageDiffusionStage`` always stores position ``T``, the clean
-latent), runs the per-channel un-normalization Qwen-Image's VAE
-expects, lifts the spatial latent into the VAE's 5D
-``[B, C, T=1, H, W]`` input shape, decodes in fp32, then normalizes
-the output pixels from ``[-1, 1]`` to ``[0, 1]``.
-
-No ``QwenImageVAEEncodeStage`` here — PR #104 supports only t2i
-(``models/qwen_image.py:367-370`` rejects ``image=`` and ``video=``
-inputs); the encoder is unused. Add when img2img / SDEdit /
-ControlNet lands.
-
-Per-channel normalization math mirrors PR #104's ``decode_latents``.
-"""
+"""QwenImageVAEDecodeStage — LatentSegment → Images via VAE decode."""
 
 from __future__ import annotations
 
@@ -36,21 +20,7 @@ class QwenImageVAEDecodeStage(DecodeStage[LatentSegment, Images]):
         self.bundle = bundle
 
     def decode(self, s: LatentSegment, *, grad: bool = False, activation_checkpoint: bool = False) -> Images:
-        """Decode the final-step latents in *s* into pixel images.
-
-        Reads ``s.latents[:, -1]`` (the final stored position, which is
-        ``T`` — the clean latent ``x_0`` in spatial shape
-        ``[B, C, H, W]``). Lifts to 5D for the video VAE, applies the
-        per-channel un-normalization from ``vae.config.latents_mean`` /
-        ``latents_std``, decodes in fp32, then normalizes pixels to
-        ``[0, 1]``.
-
-        ``grad=False`` (default) keeps the rollout path under ``torch.no_grad()``.
-        ``grad=True`` (ReFL direct-reward backprop) runs the decode WITH grad so it
-        flows from the reward through the frozen VAE into ``clean``; the VAE has no
-        trainable params, so only ``clean``'s graph is extended. ``activation_checkpoint``
-        (grad only) recomputes the decode in backward to trade compute for memory.
-        """
+        """Decode the final-step latents in *s* into pixel images."""
         if self.bundle.vae is None:
             raise RuntimeError(
                 "QwenImageVAEDecodeStage.decode: no VAE loaded "
@@ -91,7 +61,7 @@ class QwenImageVAEDecodeStage(DecodeStage[LatentSegment, Images]):
             else:
                 decoded = _decode(clean)
         pixels = ((decoded[:, :, 0] + 1.0) / 2.0).clamp(0.0, 1.0)
-        return Images(pixels=pixels)
+        return Images.from_dense(pixels)
 
 
 __all__ = ["QwenImageVAEDecodeStage"]

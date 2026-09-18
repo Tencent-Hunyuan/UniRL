@@ -1,11 +1,4 @@
-"""Construction config for the LTX-2 / LTX-2.3 T2V / I2V / T2AV pipeline.
-
-LTX-2 supports text-to-video (T2V) and image-to-video (I2V).
-LTX-2.3 extends with text-to-audio-video (T2AV) joint generation.
-
-The pipeline auto-detects which capabilities are available from the
-checkpoint (audio components present → LTX-2.3 mode enabled).
-"""
+"""Construction config for the LTX-2 / LTX-2.3 T2V / I2V / T2AV pipeline."""
 
 from __future__ import annotations
 
@@ -21,12 +14,7 @@ LTX2_LATENT_CHANNELS = 128
 
 @dataclass
 class LTX2PipelineConfig:
-    """Construction args for ``LTX2Pipeline.from_config``.
-
-    Covers both LTX-2 (video-only) and LTX-2.3 (video+audio).
-    Audio components are loaded only when ``enable_audio=True`` and the
-    checkpoint contains audio VAE + vocoder weights.
-    """
+    """Construction args for ``LTX2Pipeline.from_config``."""
 
     pretrained_model_ckpt_path: str
     vae_ckpt_path: Optional[str] = None

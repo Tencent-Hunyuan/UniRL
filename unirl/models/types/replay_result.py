@@ -1,16 +1,4 @@
-"""Structured return type for trainable-stage replay.
-
-A stage's ``replay`` recomputes log-probs (and, for diffusion, the per-step
-``prev_sample_mean`` used by KL penalties) for the transitions stored in a
-prior rollout's segment. The values come from the same kernel call that
-sampling used, so callers can rely on them lining up with the rollout's
-stored ``segment.sde_logp`` (or its slice when ``step_indices`` subsets).
-
-Diffusion stages populate ``log_probs`` and ``prev_sample_means`` (the
-mean of the SDE Gaussian — μ_θ — used as the second moment in the KL
-penalty). AR stages return a plain ``Tensor`` for policy-only replay, or
-a :class:`ReplayResult` when optional critic ``values`` are requested.
-"""
+"""Structured return type for trainable-stage replay."""
 
 from __future__ import annotations
 
@@ -22,8 +10,7 @@ import torch
 
 @dataclass
 class ReplayResult:
-    """Per-stage replay output. ``log_probs`` is always populated; the
-    others are stage-specific and may be ``None``."""
+    """Per-stage replay output."""
 
     log_probs: torch.Tensor
     """Aligned with ``segment.sde_logp`` (or its slice when ``step_indices``
@@ -32,7 +19,8 @@ class ReplayResult:
     prev_sample_means: Optional[torch.Tensor] = None
     """The SDE transition's mean μ_θ at each replayed step. Shape
     ``[B, S', *latent_shape]`` for diffusion. Used by GRPO's KL penalty.
-    ``None`` when the stage doesn't produce it."""
+    Kept at the SDE kernel's native fp32; see Gotchas in
+    ``unirl/sde/README.md``. ``None`` when the stage doesn't produce it."""
 
     logits: Optional[torch.Tensor] = None
     """Per-step token logits at each replayed position. Shape

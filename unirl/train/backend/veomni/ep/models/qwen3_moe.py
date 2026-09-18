@@ -1,10 +1,4 @@
-"""Qwen3-MoE expert checkpoint layout.
-
-This is UniRL's single runtime copy of VeOmni's
-``Qwen3MoeCheckpointTensorConverter`` semantics. I/O and collectives stay in
-their callers; this module owns only key naming and pure HF ↔ fused tensor
-conversion so load and rollout sync cannot drift independently.
-"""
+"""Qwen3-MoE expert checkpoint layout."""
 
 from __future__ import annotations
 
@@ -62,11 +56,7 @@ def build_local_fused_block(
     available_keys: Set[str],
     get_tensor: Callable[[str], torch.Tensor],
 ) -> torch.Tensor | None:
-    """Build this EP rank's fused block from HF per-expert checkpoint keys.
-
-    Returns ``None`` only when the checkpoint contains none of the relevant HF
-    keys. Any partial projection/expert set is corruption and raises.
-    """
+    """Build this EP rank's fused block from HF per-expert checkpoint keys."""
     kind = fused_expert_kind(fused_param_name)
     if kind is None:
         return None

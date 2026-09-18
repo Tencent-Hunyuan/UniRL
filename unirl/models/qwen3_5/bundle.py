@@ -1,16 +1,4 @@
-"""Qwen3_5Bundle — concrete weights+processor+tokenizer holder for Qwen3.5 VL.
-
-Mirror of :class:`unirl.models.qwen_vl.QwenVLBundle` (vision tower freeze,
-meta-init, AutoProcessor) but branches on ``model_type``:
-
-* ``qwen3_5``      -> ``Qwen3_5ForConditionalGeneration``      (dense)
-* ``qwen3_5_moe``  -> ``Qwen3_5MoeForConditionalGeneration``   (MoE)
-
-Also applies the ``fast_pos_embed_interpolate`` device-fix patch (borrowed
-from verl) on the vision tower, which is needed when
-``meta_init_transformer=True`` + FSDP2 cpu_offload would otherwise leave
-``self.pos_embed`` on CPU while ``grid_thw`` is on GPU.
-"""
+"""Qwen3_5Bundle — concrete weights+processor+tokenizer holder for Qwen3.5 VL."""
 
 from __future__ import annotations
 
@@ -22,7 +10,7 @@ import torch.nn as nn
 from packaging.version import Version
 
 from unirl.models.types.bundle import Bundle
-from unirl.models.types.meta_init import build_meta_init_transformer, capture_init_state
+from unirl.models.types.meta_init import build_meta_init_transformer, capture_init_state, resolve_meta_init_weights
 from unirl.utils.dtypes import parse_torch_dtype
 
 from .config import Qwen3_5PipelineConfig
@@ -31,15 +19,7 @@ logger = logging.getLogger(__name__)
 
 
 def _patch_fast_pos_embed_interpolate(visual_module: nn.Module) -> None:
-    """Bind verl's ``fast_pos_embed_interpolate`` onto the vision tower.
-
-    The upstream implementation reads ``self.pos_embed.weight.device`` for
-    the output device; under FSDP2 cpu_offload ``self.pos_embed`` is still
-    on CPU after materialization while the caller passes a CUDA ``grid_thw``,
-    producing a device-mismatch crash. verl's fix takes the device from
-    ``grid_thw`` instead. We bind the function as a method so ``self`` is
-    the vision module.
-    """
+    """Bind verl's ``fast_pos_embed_interpolate`` onto the vision tower."""
     import types
 
     def fast_pos_embed_interpolate(self, grid_thw):  # noqa: D401
@@ -159,6 +139,8 @@ class Qwen3_5Bundle(Bundle):
             device = torch.device(device)
 
         dtype = parse_torch_dtype(config.model_precision, field_name="model_precision")
+        if config.meta_init_transformer:
+            transformer_weights_path = resolve_meta_init_weights(path)
 
         hf_config = AutoConfig.from_pretrained(path, trust_remote_code=bool(config.trust_remote_code))
         model_type = hf_config.model_type
@@ -266,7 +248,7 @@ class Qwen3_5Bundle(Bundle):
             pretrained_path=path,
         )
         if config.meta_init_transformer:
-            bundle._transformer_weights_path = path
+            bundle._transformer_weights_path = transformer_weights_path
             bundle._meta_init_state = meta_init_state
         return bundle
 

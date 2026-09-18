@@ -1,23 +1,4 @@
-"""Runtime patch making ``vllm.model_executor.utils.get_moe_expert_mapping``
-tolerate HI3's 2-tuple ``get_expert_mapping`` return shape.
-
-vllm 0.20 expects the model's ``get_expert_mapping`` to return a flat
-``list[tuple[str, str, int, str]]``. HI3 (vllm-omni's
-``HunyuanImage3ForCausalMM``) returns a 2-tuple
-``(expert_params_mapping, expert_weights_remapping)`` so its own
-``load_weights`` can use the second element. The mismatch causes
-``vllm/lora/utils.py:process_packed_modules_mapping`` to do::
-
-    for _, weight_name, _, _ in moe_packed_mapping  # iterates (list, dict)
-
-and trip ``ValueError: too many values to unpack (expected 4)`` at boot
-when ``enable_lora=True``.
-
-Workaround: patch ``vllm.model_executor.utils.get_moe_expert_mapping``
-so that if a model returns ``(seq, dict)`` we hand vllm just ``seq``.
-Idempotent via a sentinel attribute. Required only when AR-stage
-``enable_lora`` is on; harmless otherwise.
-"""
+"""Runtime patch making ``get_moe_expert_mapping`` tolerate HI3's 2-tuple ``get_expert_mapping`` shape."""
 
 from __future__ import annotations
 
@@ -25,14 +6,7 @@ _INSTALLED = False
 
 
 def install() -> None:
-    """Patch ``get_moe_expert_mapping`` everywhere it's used so HI3's
-    2-tuple return is unwrapped to the flat list vllm 0.20 expects.
-
-    ``vllm/lora/utils.py`` does ``from vllm.model_executor.utils import
-    get_moe_expert_mapping``, which captures a local reference at import
-    time. Patching only the source module misses the cached reference in
-    consumers, so we patch every known consumer's local symbol too.
-    """
+    """Patch ``get_moe_expert_mapping`` everywhere it's used, unwrapping HI3's 2-tuple to vllm 0.20's flat list."""
     global _INSTALLED
     if _INSTALLED:
         return

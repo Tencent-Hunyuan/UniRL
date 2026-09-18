@@ -1,45 +1,4 @@
-"""Re-host the ``sglang-drl`` fork's ``WeightsUpdater`` in-memory-tensor path.
-
-Stock upstream ``WeightsUpdater`` (``runtime/loader/weights_updater.py``) only
-updates weights from disk (``update_weights_from_disk``). The fork added an
-in-memory named-tensor path so the RL trainer can push freshly-optimized weights
-straight into the live pipeline (no disk round-trip), used by
-``GPUWorker.update_weights_from_tensor`` / ``update_weights_from_distributed``
-(installed by ``patch_gpu_worker``).
-
-This patch ports that WITHOUT editing sglang source:
-
-  * ``setattr`` the 6 net-new ``WeightsUpdater`` methods (bodies verbatim from
-    the fork diff): ``update_weights_from_named_tensors``,
-    ``_normalize_named_tensors``, ``_split_named_tensors_by_module``,
-    ``_flush_module_runtime_cache``, ``_post_update_cleanup``,
-    ``_apply_named_tensor_weights``. These reuse upstream's ``_collect_modules``
-    / ``_rollback`` (unchanged) and upstream's module-global
-    ``_load_weights_into_module`` (the fork's offload mixin differs, so we KEEP
-    upstream's per the task).
-  * REPLACE the module-level ``load_weights_into_model`` with the fork's version
-    (adds a bidirectional ``.base_layer.`` LoRA name-remap) and ``setattr`` the
-    fork-new ``_build_lora_name_remap`` at module level. Upstream's
-    ``_load_weights_into_module`` calls ``load_weights_into_model`` by module
-    global, so it picks up the replacement automatically.
-
-Re-homing notes:
-  * The verbatim method bodies are nested fns here, so their free globals
-    (``gc``, ``torch``, ``defaultdict``, ``Iterable``, ``TeaCacheMixin``,
-    ``_load_weights_into_module``) resolve via THIS module's scope (LEGB), not
-    sglang's. We bind/import each below so behaviour is identical.
-  * ``_post_update_cleanup`` calls ``self.pipeline.handle_weight_sync(...)``
-    guarded by ``hasattr`` -- upstream pipeline lacks ``handle_weight_sync``;
-    ``patch_lora_tensors`` adds it to ``LoRAPipeline``. The hasattr guard is kept
-    regardless (other pipelines have no such method). See RISK in the PR notes.
-  * ``FlattenedTensorBucket`` is imported lazily inside
-    ``_normalize_named_tensors`` (only on ``load_format='flattened_bucket'``),
-    with the fork's try/except fallback; both import sites exist upstream
-    (``sglang.srt.weight_sync.tensor_bucket`` and
-    ``sglang.srt.model_executor.model_runner``).
-
-Idempotent via sentinel guards. Import-safe (sglang imported inside the fn).
-"""
+"""Re-host the ``sglang-drl`` fork's ``WeightsUpdater`` in-memory-tensor path."""
 
 from __future__ import annotations
 
@@ -58,17 +17,7 @@ _log = logging.getLogger(__name__)
 
 
 def _resolve_param_names_mapping(module) -> dict:
-    """Return the model's ``param_names_mapping`` dict, or ``{}``.
-
-    SGLang models that FUSE projections (Z-Image's ``ZImageTransformer2DModel``
-    maps ``to_q/to_k/to_v`` -> ``to_qkv`` and ``feed_forward.w1/w3`` -> ``w13``)
-    carry a class-level ``param_names_mapping`` of
-    ``{regex: (replacement, shard_id, num_shards)}`` (the same dict the checkpoint
-    loader applies). The in-memory named-tensor update path does NOT apply it, so
-    without this the trainer's separate-projection tensors match no fused param and
-    are silently dropped — the bug behind a flat reward curve on fused-attention
-    models like Z-Image.
-    """
+    """Return the model's ``param_names_mapping`` dict, or ``{}``."""
     mapping = getattr(type(module), "param_names_mapping", None)
     if not isinstance(mapping, dict):
         mapping = getattr(module, "param_names_mapping", None)
@@ -76,27 +25,7 @@ def _resolve_param_names_mapping(module) -> dict:
 
 
 def _write_fused_shard(param: torch.Tensor, tensor: torch.Tensor, shard_id: int, num_shards: int) -> None:
-    """Write ``tensor`` into the ``shard_id``-th slice (dim 0) of a fused param.
-
-    SGLang fused projections pack ``[shard_0 | shard_1 | … | shard_{n-1}]``
-    contiguously along dim 0 in shard-id order. Two layouts occur:
-
-    * **all-equal** — ``q==k==v`` (Z-Image ``to_qkv``), ``w1==w3`` (``w13``): each
-      slice is ``shard_id * size``.
-    * **trailing-unequal** — HunyuanVideo single-block ``linear1 = [q, k, v, mlp]``
-      packs three ``H``-sized attention shards + one ``4H``-sized MLP shard. The
-      leading shards are equal (``shard_id * size``); the LAST shard is larger and
-      sits at the tail (``dim0 - size``).
-
-    Placing the trailing shard at the tail (rather than the legacy ``dim0 //
-    num_shards`` equal split, which slices four ``1.75H`` chunks for ``linear1`` and
-    crashes writing an ``H`` tensor into a ``1.75H`` slot) is exact for both layouts
-    and needs no sibling shards — so it is robust to the sender's bucketing (a
-    block's q/k/v/mlp may arrive in different buckets). It deliberately does NOT
-    support an unequal MIDDLE shard (no SGLang fused param has one). The param's own
-    ``weight_loader`` is tried first when it accepts a shard id (TP-correct); plain
-    ``ReplicatedLinear`` (``tp_size=1``) takes no shard id, so it falls through here.
-    """
+    """Write ``tensor`` into the ``shard_id``-th slice (dim 0) of a fused param."""
     wl = getattr(param, "weight_loader", None)
     if wl is not None:
         try:
@@ -116,29 +45,7 @@ def _write_fused_shard(param: torch.Tensor, tensor: torch.Tensor, shard_id: int,
 
 
 def _apply_fused_param_mapping(module, named_tensors):
-    """Apply the model's ``param_names_mapping`` to the incoming named tensors.
-
-    A model's ``param_names_mapping`` (the same dict its checkpoint loader applies)
-    has two entry kinds; a model may use either or both:
-
-    * **fused projections** — ``{regex: (replacement, shard_id, num_shards)}`` —
-      write the trainer's separate-projection tensor into a dim-0 slice of the
-      model's fused param (Z-Image ``to_q/k/v -> to_qkv``, ``w1/w3 -> w13``).
-    * **plain renames** — ``{regex: replacement_str}`` — the model simply renamed
-      a param vs the checkpoint. WAN's mapping is entirely of this kind
-      (``patch_embedding.* -> patch_embedding.proj.*``,
-      ``blocks.N.attn1.to_q.* -> blocks.N.to_q.*``,
-      ``ffn.net.0.proj -> ffn.fc_in``, …). An EMPTY replacement means the model
-      dropped that param (e.g. WAN ``attn2.norm_added_q``) — the tensor is discarded.
-
-    Returns the leftover ``(name, tensor)`` list (renamed where applicable) for the
-    exact-match loader. No-op when the module declares no mapping.
-
-    Before this handled the rename kind, simple-rename models (WAN) matched NOTHING
-    in the in-memory update path → 112/113 transformer tensors silently skipped →
-    the rollout engine ran stale base weights → flat reward curve (cross-engine
-    divergence), exactly the fused-model bug one step removed.
-    """
+    """Apply the model's ``param_names_mapping`` to the incoming named tensors."""
     mapping = _resolve_param_names_mapping(module)
     if not mapping:
         return list(named_tensors)
@@ -207,13 +114,7 @@ def patch_weights_updater() -> None:
         from torch.distributed.tensor import DTensor, distribute_tensor
 
         def _build_lora_name_remap(model_params: dict) -> dict:
-            """Build bidirectional remap for LoRA-wrapped param names.
-
-            After LoRA wrapping, some layers have .base_layer. in their names.
-            Callers may send names with or without it. This remap handles both:
-              xxx.weight → xxx.base_layer.weight  (caller stripped .base_layer.)
-              xxx.base_layer.weight → xxx.weight  (caller kept .base_layer. but model didn't wrap)
-            """
+            """Build bidirectional remap for LoRA-wrapped param names."""
             remap = {}
             for param_name in model_params:
                 if ".base_layer." in param_name:
@@ -280,17 +181,7 @@ def patch_weights_updater() -> None:
         load_format: str | None = None,
         flush_cache: bool = True,
     ) -> tuple[bool, str]:
-        """Update module weights from in-memory named tensors.
-
-        Args:
-            named_tensors: Tensor payload. Supported:
-                - list[(name, tensor)] / tuple[(name, tensor)]
-                - dict[name, tensor]
-                - flattened bucket dict when ``load_format='flattened_bucket'``
-            target_modules: Restrict update to these modules.
-            load_format: Optional payload format (e.g., ``flattened_bucket``).
-            flush_cache: Whether to reset TeaCache state for updated modules.
-        """
+        """Update module weights from in-memory named tensors."""
         if named_tensors is None:
             return False, "named_tensors is required"
 
@@ -426,12 +317,7 @@ def patch_weights_updater() -> None:
         flush_cache: bool,
         modules_to_update: list[tuple[str, torch.nn.Module]],
     ) -> None:
-        """Post weight-update cleanup aligned with LLM methodology.
-
-        On failure: gc.collect() to free dangling refs from partial loads.
-        On success + flush_cache: reset TeaCache state, then empty CUDA cache.
-        On success + no flush_cache: no cleanup.
-        """
+        """Post weight-update cleanup aligned with LLM methodology."""
         if not success:
             gc.collect()
             return

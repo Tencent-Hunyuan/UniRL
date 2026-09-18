@@ -1,12 +1,4 @@
-"""Add ``TorchMemorySaverAdapter.is_available()`` to stock-upstream srt.
-
-The fork added a 5-line ``is_available()`` staticmethod to
-``srt/utils/torch_memory_saver_adapter.py`` (the only fork edit to ``srt`` that
-matters; the ``common.py`` one-liner is cosmetic whitespace). ``MemorySaverHandler``
-and the sleep/wake server-arg auto-enable path consult it to decide whether the
-torch-memory-saver backend is importable. Idempotent; no-op if upstream already
-defines it.
-"""
+"""Add ``TorchMemorySaverAdapter.is_available()`` to stock-upstream srt."""
 
 from __future__ import annotations
 

@@ -1,21 +1,4 @@
-"""Recipe-local WAN 2.1 T2V step + stage + pipeline for REFL BPTT.
-
-Mirrors ``experimental.refl.models.wan22`` but targets the WAN 2.1 T2V
-single-DiT stack. The REFL-specific pieces live here:
-
-- :class:`Wan21ReflDiffusionStep` — strict recipe-local single-branch
-  CFG predictor used only by REFL BPTT.
-- :class:`Wan21ReflDiffusionStage` — subclass of the mainline
-  :class:`WAN21DiffusionStage` with an extra :meth:`diffuse_with_grad`
-  method implementing single-branch CFG + BPTT windowing (mid/final
-  timestep) + optional per-step KL against the LoRA-disabled reference.
-- :class:`Wan21ReflPipeline` — subclass of the mainline
-  :class:`WAN21Pipeline` that post-swaps ``self.diffusion`` for the REFL
-  variant above, keeping every other stage (text/vae/scheduler) intact.
-
-The mainline WAN 2.1 code path is unchanged. REFL-specific single-branch
-CFG prediction lives in recipe-local :class:`Wan21ReflDiffusionStep`.
-"""
+"""Recipe-local WAN 2.1 T2V step + stage + pipeline for REFL BPTT."""
 
 from __future__ import annotations
 
@@ -103,15 +86,7 @@ class Wan21ReflDiffusionStep(WAN21DiffusionStep):
 
 
 class Wan21ReflDiffusionStage(WAN21DiffusionStage):
-    """WAN 2.1 T2V diffusion stage + REFL BPTT sampling override.
-
-    Adds ``diffuse_with_grad`` that keeps the autograd graph alive on the
-    returned final latent, honouring the REFL-specific BPTT knobs
-    (``mid_timestep`` / ``final_timestep`` / ``kl_weight``) via
-    ``params.sampler_kwargs``. Everything else is inherited from the
-    mainline stage — ``diffuse`` / ``replay`` / ``predict_noise`` /
-    ``trainable_module`` are untouched.
-    """
+    """WAN 2.1 T2V diffusion stage + REFL BPTT sampling override."""
 
     def generate_latents(
         self,
@@ -121,18 +96,7 @@ class Wan21ReflDiffusionStage(WAN21DiffusionStage):
         dtype: torch.dtype = torch.float32,
         base_seed: Optional[int] = None,
     ) -> torch.Tensor:
-        """
-        High-level function for generating initial latents.
-
-        Args:
-            batch_size: Total number of samples
-            latent_shape: Shape of a single latent (C, H, W) or (C, T, H, W)
-            device: Device for the tensor
-            dtype: Data type for the tensor
-
-        Returns:
-            Latent tensor [batch_size, *latent_shape]
-        """
+        """High-level function for generating initial latents."""
         if base_seed is not None:
             generator = torch.Generator(device=device)
             generator.manual_seed(int(base_seed) % (MAX_TORCH_SEED + 1))
@@ -158,29 +122,7 @@ class Wan21ReflDiffusionStage(WAN21DiffusionStage):
         params: DiffusionSamplingParams,
         initial_latents: Optional[torch.Tensor] = None,
     ) -> DiffuseWithGradResult:
-        """Differentiable WAN 2.1 T2V sampling for REFL-style BPTT training.
-
-        Returns :class:`DiffuseWithGradResult` with the live-grad
-        ``z_final`` + per-sample ``kl_loss`` ``[B]``.
-
-        BPTT knobs (read from ``params.sampler_kwargs``):
-
-        - ``mid_timestep`` (int, default 0): step index at which the forward
-          switches from ``torch.no_grad`` to grad-enabled — implements
-          truncated BPTT (only the last ``T - mid_timestep`` steps
-          participate in backward). DRaFT-1 sets ``mid_timestep = T - 1``.
-        - ``final_timestep`` (int, default ``num_inference_steps - 1``):
-          early stop. The loop breaks once ``i >= final_timestep``.
-        - ``kl_weight`` (float, default 0.0): when non-zero, per-step KL
-          ``(pred - ref_pred)**2 / (2 * sigma**2)`` is reduced per sample
-          and accumulated into the ``[B]`` ``kl_loss``. Per-sample (not a
-          scalar) so DP_SCATTER merge/re-shard round-trips each shard's own
-          KL. The actor multiplies it by its ``kl_weight`` at the loss site.
-
-        ``initial_latents`` follows the same contract as :meth:`diffuse`:
-        when provided, used verbatim and the internal RNG path is
-        bypassed.
-        """
+        """Differentiable WAN 2.1 T2V sampling for REFL-style BPTT training."""
         if conditions.text is None or conditions.text.embeds is None:
             raise ValueError("Wan21ReflDiffusionStage.diffuse_with_grad: conditions.text.embeds is None")
         prompt_embeds = conditions.text.embeds
@@ -333,15 +275,7 @@ class Wan21ReflDiffusionStage(WAN21DiffusionStage):
 
 
 class Wan21ReflPipeline(WAN21Pipeline):
-    """WAN 2.1 T2V pipeline for the REFL recipe.
-
-    Reuses the mainline :class:`WAN21Pipeline` construction (text encode /
-    condition build / VAE decode / schedule) and post-swaps
-    ``self.diffusion`` for the REFL-flavoured stage. The parent already
-    validates every constructor argument and wires the strategy / step /
-    precision policy through — we only need to rebuild the diffusion
-    stage with the same underlying components.
-    """
+    """WAN 2.1 T2V pipeline for the REFL recipe."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -365,14 +299,7 @@ class Wan21ReflPipeline(WAN21Pipeline):
         images: Optional[Images] = None,
         params: DiffusionSamplingParams,
     ) -> WAN21Conditions:
-        """Full REFL conditioning: text + CFG negative + optional I2V image.
-
-        Mirrors the condition assembly of :meth:`WAN21Pipeline.generate`
-        (text via the public ``build_conditions``, image slots attached with
-        the diffusion geometry from ``params``), plus the REFL convention
-        that an explicit negative prompt rides
-        ``params.sampler_kwargs['negative_prompt']``.
-        """
+        """Full REFL conditioning: text + CFG negative + optional I2V image."""
         guidance = float(params.guidance_scale)
         negative_prompt = (params.sampler_kwargs or {}).get("negative_prompt")
         negatives = (
@@ -381,10 +308,9 @@ class Wan21ReflPipeline(WAN21Pipeline):
         conds = self.build_conditions(texts, negatives=negatives, guidance_scale=guidance)
 
         if images is not None:
-            if images.pixels is None or int(images.pixels.shape[0]) != len(texts.texts):
+            if len(images) != len(texts.texts):
                 raise ValueError(
-                    f"Wan21ReflPipeline.build_refl_conditions: image count "
-                    f"{None if images.pixels is None else int(images.pixels.shape[0])} "
+                    f"Wan21ReflPipeline.build_refl_conditions: image count {len(images)} "
                     f"!= text count {len(texts.texts)}"
                 )
             image_latent = WAN21ImageLatentEncodeStage(

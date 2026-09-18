@@ -1,27 +1,4 @@
-"""RL-aware HunyuanVideo-1.5 pipeline subclass.
-
-``forward`` follows the RL interception protocol (see
-``pipelines/_shared/interception.py``): **install** (once) → **arm** (every
-request) → run (upstream) → **harvest**. The interceptions, mapped to
-upstream's stages
-(``vllm_omni/diffusion/models/hunyuan_video/pipeline_hunyuan_video_1_5.py``):
-
-- SDE scheduler swap (behavior policy + dense-trajectory recorder) in place
-  of the upstream scheduler; installed regardless of eta — at eta=0 the SDE
-  math is dormant but the per-step ``prev_sample`` capture still fires
-  (``resp_to_samples`` requires ``segment.latents``).
-- A conditioning **tap** on ``encode_prompt``: captures the dual
-  text-encoder embeddings (Qwen2.5-VL MLLM + ByT5 glyph, 8 tensors) for the
-  trainer-side ``HunyuanVideo15Conditions`` reconstruction.
-- An initial-noise **injection** through the ``prepare_latents`` override
-  (driver-authored x_T slice or recipe row replaces upstream's RNG draw).
-- A σ-schedule **workaround**: upstream HV1.5 ignores
-  ``req.sampling_params.sigmas`` (see :meth:`_sigma_override`).
-
-This class is loaded inside vLLM-Omni's worker subprocess via
-``custom_pipeline_args.pipeline_class`` injected from
-``stage_configs/hunyuan_video15_t2v_rl.yaml``.
-"""
+"""RL-aware HunyuanVideo-1.5 pipeline subclass."""
 
 from __future__ import annotations
 
@@ -34,6 +11,7 @@ from vllm_omni.diffusion.models.hunyuan_video.pipeline_hunyuan_video_1_5 import 
     HunyuanVideo15Pipeline,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 from unirl.rollout.engine.vllm_omni.pipelines._shared.flow_match_sde_scheduler import (
     FlowMatchSDEDiscreteScheduler,
@@ -44,7 +22,9 @@ from unirl.rollout.engine.vllm_omni.pipelines._shared.interception import (
     inject_latents,
     make_sde_scheduler,
     resolve_request_noise,
-    stamp_custom_output,
+    single_request,
+    slice_request_denoise_seed_keys,
+    stamp_capture,
 )
 
 
@@ -59,20 +39,13 @@ class RLHunyuanVideo15Pipeline(HunyuanVideo15Pipeline):
         self._pending_initial_noise: Optional[torch.Tensor] = None
 
     def _install_sde_scheduler(self) -> None:
-        """Swap in the trajectory-capturing SDE scheduler (from_config keeps
-        the upstream schedule parameters). Per-request eta rides ``_arm_sde``."""
+        """Swap in the trajectory-capturing SDE scheduler (from_config keeps the upstream schedule parameters)."""
         if isinstance(self.scheduler, FlowMatchSDEDiscreteScheduler):
             return
         self.scheduler = make_sde_scheduler(self._upstream_scheduler.config)
 
     def _install_conditioning_tap(self) -> None:
-        """Wrap ``encode_prompt`` to capture the dual text-encoder embeddings.
-
-        HunyuanVideo-1.5 returns 8 values from ``encode_prompt``:
-        ``(prompt_embeds, prompt_embeds_mask, prompt_embeds_2,
-        prompt_embeds_mask_2, negative_*, …)``. First-call-only per request
-        (the buffer is re-armed each ``forward``).
-        """
+        """Wrap ``encode_prompt`` to capture the dual text-encoder embeddings."""
         if self._conditioning_tap_installed:
             return
 
@@ -111,7 +84,16 @@ class RLHunyuanVideo15Pipeline(HunyuanVideo15Pipeline):
         """This request's SDE strength + sparse step gate."""
         eta = float(getattr(req.sampling_params, "eta", 0.0) or 0.0)
         extra = getattr(req.sampling_params, "extra_args", None) or {}
-        self.scheduler.arm(eta=eta, sde_indices=extra.get("sde_indices"))
+        denoise_seed_keys = slice_request_denoise_seed_keys(
+            req,
+            caller="RLHunyuanVideo15Pipeline._arm_sde",
+        )
+        self.scheduler.arm(
+            eta=eta,
+            sde_indices=extra.get("sde_indices"),
+            denoise_seed_keys=denoise_seed_keys,
+            denoise_base_seed=int(extra.get("denoise_base_seed", 0)),
+        )
 
     def _arm_initial_noise(self, req: OmniDiffusionRequest) -> None:
         """This request's driver-authored x_T (batch slice or recipe row)."""
@@ -122,33 +104,17 @@ class RLHunyuanVideo15Pipeline(HunyuanVideo15Pipeline):
         self._captured_conditioning = None
 
     def prepare_latents(self, *args, **kwargs):  # type: ignore[override]
-        """Initial-noise injection point (consume-once; upstream signature:
-        ``(batch_size, height, width, num_frames, dtype, device, generator,
-        latents)`` — same dtype@4/device@5/latents@7 slots as SD3)."""
+        """Initial-noise injection point: bypass upstream RNG when the driver supplied an x_T."""
+        upstream = super().prepare_latents
         noise = self._pending_initial_noise
         if noise is not None:
-            args, kwargs = inject_latents(args, kwargs, noise)
+            args, kwargs = inject_latents(upstream, args, kwargs, noise)
             self._pending_initial_noise = None
-        return super().prepare_latents(*args, **kwargs)
+        return upstream(*args, **kwargs)
 
     @contextmanager
     def _sigma_override(self, req: OmniDiffusionRequest) -> Iterator[None]:
-        """WORKAROUND: make upstream pick up the engine's σ schedule.
-
-        Upstream HunyuanVideo15Pipeline hardcodes
-        ``sigmas = np.linspace(1.0, 0.0, num_steps + 1)[:-1]`` before its
-        single ``scheduler.set_timesteps(sigmas=sigmas, ...)`` call, ignoring
-        ``req.sampling_params.sigmas`` (every other vllm-omni model does
-        ``sigmas = req.sampling_params.sigmas or sigmas`` — see qwen_image,
-        sd3, flux*, z_image — HV1.5 is the outlier). Without this the worker
-        runs an unshifted linear σ schedule while the engine sent a shift=5.0
-        flow-match schedule, tripping ``sigma_verify`` (max-abs-diff ~0.38)
-        and aborting rollout.
-
-        Patches the scheduler's ``set_timesteps`` for the duration of ONE
-        ``forward`` and always restores — the closure must never leak across
-        requests. Delete once upstream honors the request sigmas.
-        """
+        """WORKAROUND: make upstream pick up the engine's σ schedule."""
         engine_sigmas = getattr(req.sampling_params, "sigmas", None)
         if engine_sigmas is None:
             yield
@@ -173,22 +139,24 @@ class RLHunyuanVideo15Pipeline(HunyuanVideo15Pipeline):
 
     def _harvest_conditioning(self, out: DiffusionOutput) -> None:
         if self._captured_conditioning is not None:
-            stamp_custom_output(out, "text_capture", self._captured_conditioning)
+            stamp_capture(out, "text_capture", self._captured_conditioning)
 
-    def forward(self, req: OmniDiffusionRequest, **kwargs) -> DiffusionOutput:
+    def forward(self, req: DiffusionRequestBatch, **kwargs) -> DiffusionOutput:
+        """Single-request batch in, single output out — see ``single_request``."""
+        one = single_request(req, caller="RLHunyuanVideo15Pipeline.forward")
         self._install_sde_scheduler()
         self._install_conditioning_tap()
 
-        self._arm_sde(req)
-        self._arm_initial_noise(req)
+        self._arm_sde(one)
+        self._arm_initial_noise(one)
         self._arm_conditioning_tap()
 
-        with self._sigma_override(req):
+        with self._sigma_override(one):
             out = super().forward(req, **kwargs)
 
         decoded = getattr(out, "output", None)
         if decoded is not None:
-            stamp_custom_output(out, "rl_decoded_video", detach_cpu(decoded))
+            stamp_capture(out, "rl_decoded_video", detach_cpu(decoded))
 
         self._harvest_trajectory(out)
         self._harvest_conditioning(out)

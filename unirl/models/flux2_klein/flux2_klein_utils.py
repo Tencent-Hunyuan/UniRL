@@ -1,17 +1,4 @@
-"""FLUX.2 Klein helpers aligned with the official diffusers pipeline.
-
-Pure-math helpers for the FLUX.2-klein-9B pipeline: empirical-mu schedule
-construction, 2x2 patchify/unpatchify, packing utilities for the
-transformer's token-level input layout, RoPE position-id construction
-matching diffusers' 4-axis ``(T, H, W, L)`` form, and the
-``vae.bn`` patchified-latent (de)normalization required by the
-official Klein VAE.
-
-Verbatim port of ``main_flux_bundle/unirl/models/flux2_klein_utils.py``.
-The new-design path does NOT import legacy code, so these helpers live
-inside the typed pipeline package and must stay in spec sync with the
-diffusers reference via review/tests.
-"""
+"""FLUX.2 Klein helpers aligned with the official diffusers pipeline."""
 
 from __future__ import annotations
 
@@ -24,14 +11,7 @@ logger = logging.getLogger(__name__)
 
 
 def compute_empirical_mu(image_seq_len: int, num_steps: int) -> float:
-    """Mirror ``Flux2KleinPipeline.compute_empirical_mu`` from diffusers.
-
-    Klein's official inference path derives a per-request mu for
-    FlowMatch shifting from the packed image-token count and the number
-    of inference steps. The mapping is piecewise linear with a knee at
-    ``image_seq_len > 4300``; below that, an additional linear blend
-    between the 10-step and 200-step lines is applied.
-    """
+    """Mirror ``Flux2KleinPipeline.compute_empirical_mu`` from diffusers."""
 
     a1, b1 = 8.73809524e-05, 1.89833333
     a2, b2 = 0.00016927, 0.45666666
@@ -47,14 +27,7 @@ def compute_empirical_mu(image_seq_len: int, num_steps: int) -> float:
 
 
 def prepare_text_ids(prompt_embeds: torch.Tensor) -> torch.Tensor:
-    """Build official FLUX.2 text RoPE ids ``(T=0, H=0, W=0, L=token_idx)``.
-
-    Shape ``[B, L, 4]``: matches diffusers' ``Flux2KleinPipeline``
-    text-token id layout. ``Flux2Transformer2DModel`` configures
-    ``axes_dims_rope=[32, 32, 32, 32]`` so feeding ``[L, 3]`` (FLUX.1
-    layout) crashes inside ``FluxPosEmbed`` with
-    ``IndexError: index 3 is out of bounds``.
-    """
+    """Build official FLUX.2 text RoPE ids ``(T=0, H=0, W=0, L=token_idx)``."""
 
     if prompt_embeds.dim() != 3:
         raise ValueError(f"prompt_embeds must be [B, L, D], got {tuple(prompt_embeds.shape)}")
@@ -68,13 +41,7 @@ def prepare_text_ids(prompt_embeds: torch.Tensor) -> torch.Tensor:
 
 
 def prepare_latent_ids(latents: torch.Tensor) -> torch.Tensor:
-    """Build official FLUX.2 latent RoPE ids for patchified ``[B, C, H, W]``.
-
-    Returns ``[B, H*W, 4]`` with ``(T=0, h_idx, w_idx, L=0)``. The
-    ``H, W`` here are the **patchified** spatial dims, i.e. after the
-    ``[B, 32, H_pix/8, W_pix/8] -> [B, 128, H_pix/16, W_pix/16]``
-    transform.
-    """
+    """Build official FLUX.2 latent RoPE ids for patchified ``[B, C, H, W]``."""
 
     if latents.dim() != 4:
         raise ValueError(f"latents must be [B, C, H, W], got {tuple(latents.shape)}")
@@ -124,11 +91,7 @@ def unpack_latents(tokens: torch.Tensor, height: int, width: int) -> torch.Tenso
 
 
 def unpack_latents_with_ids(tokens: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
-    """Scatter packed latent tokens back to ``[B, C, H, W]`` using official ids.
-
-    Used when only the ids are available and the patchified ``(H, W)``
-    isn't carried on the segment.
-    """
+    """Scatter packed latent tokens back to ``[B, C, H, W]`` using official ids."""
 
     if ids.dim() == 2:
         ids = ids.unsqueeze(0).expand(tokens.shape[0], -1, -1)
@@ -147,13 +110,7 @@ def unpack_latents_with_ids(tokens: torch.Tensor, ids: torch.Tensor) -> torch.Te
 
 
 def vae_bn_stats(vae: Any, *, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """Return FLUX.2 VAE BN mean/std, or ``None`` when the VAE lacks BN stats.
-
-    The official Klein VAE (``AutoencoderKLFlux2``) carries a final
-    ``BatchNorm`` head; patchified latents from sampling must be
-    normalized by the BN mean/var before being passed back through the
-    decoder (and de-normalized in the inverse direction for sampling).
-    """
+    """Return FLUX.2 VAE BN mean/std, or ``None`` when the VAE lacks BN stats."""
 
     bn = getattr(vae, "bn", None)
     if bn is None or not hasattr(bn, "running_mean") or not hasattr(bn, "running_var"):

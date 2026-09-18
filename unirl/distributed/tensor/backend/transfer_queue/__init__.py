@@ -1,10 +1,4 @@
-"""TransferQueue subsystem: typed config + driver bootstrap + actor bridge.
-
-Each backend variant registers a dataclass under Hydra group ``transfer_queue``
-whose ``_target_`` points at a ``Backend`` subclass; ``TransferQueueRuntime.init``
-instantiates it via ``hydra.utils.instantiate(cfg.transfer_queue)``. Disabled =
-``cfg.transfer_queue`` is absent (no defaults entry).
-"""
+"""TransferQueue subsystem: typed config + driver bootstrap + actor bridge."""
 
 from unirl.distributed.tensor.backend.transfer_queue.base import Backend
 from unirl.distributed.tensor.backend.transfer_queue.mooncake import (

@@ -14,16 +14,16 @@ from .bundle import Qwen3OmniBundle
 from .chat_template import Qwen3OmniChatTemplateStage
 from .conditions import Qwen3OmniARConditions
 from .config import Qwen3OmniPipelineConfig
+from .media import build_omni_messages
 
 
 class Qwen3OmniPipeline(Pipeline):
-    """Qwen3-Omni thinker generation pipeline: ``Sample → Sample``.
+    """Qwen3-Omni thinker generation pipeline: ``Sample → Sample``."""
 
-    The input Sample carries a pre-forked AR frontier. Role-aware text and one
-    optional persistent source-video turn are rendered from the frontier's
-    ancestor chain. The generated text, behavior log-probs, and exact processor
-    conditions are written back to that frontier for per-turn replay.
-    """
+    # URI-backed MediaRefs are an Omni prompt-input channel; the AR trainers
+    # read this declaration (unirl.trainer.ar.ar_preflight) instead of
+    # special-casing the model.
+    extra_input_primitives = ("media",)
 
     def __init__(
         self,
@@ -52,6 +52,7 @@ class Qwen3OmniPipeline(Pipeline):
         *,
         system_instruction: Optional[str] = None,
         max_prompt_length: int = 4096,
+        image_max_pixels: Optional[int] = None,
         video_fps: float = 1.0,
         video_max_frames: Optional[int] = None,
         video_max_pixels: Optional[int] = None,
@@ -65,6 +66,7 @@ class Qwen3OmniPipeline(Pipeline):
             bundle,
             system_instruction=system_instruction,
             max_prompt_length=max_prompt_length,
+            image_max_pixels=image_max_pixels,
             video_fps=video_fps,
             video_max_frames=video_max_frames,
             video_max_pixels=video_max_pixels,
@@ -87,6 +89,7 @@ class Qwen3OmniPipeline(Pipeline):
             bundle,
             system_instruction=config.system_instruction,
             max_prompt_length=config.max_prompt_length,
+            image_max_pixels=config.image_max_pixels,
             video_fps=config.video_fps,
             video_max_frames=config.video_max_frames,
             video_max_pixels=config.video_max_pixels,
@@ -103,10 +106,10 @@ class Qwen3OmniPipeline(Pipeline):
     def _conditions_for(
         self,
         turns: List[Turn],
-        control: Optional[Dict[str, Any]] = None,
+        control: Dict[str, Any],
     ) -> Qwen3OmniARConditions:
         """Render the trajectory using config plus root-Part chat overrides."""
-        chat_overrides: Dict[str, Any] = dict((control or {}).get("chat") or {})
+        chat_overrides: Dict[str, Any] = dict(control.get("chat") or {})
         system_instruction = chat_overrides.get(
             "system_instruction",
             self.chat_template.system_instruction,
@@ -122,6 +125,7 @@ class Qwen3OmniPipeline(Pipeline):
                 system_instruction=system_instruction,
                 max_prompt_length=self.chat_template.max_prompt_length,
                 pad_to_max_length=self.chat_template.pad_to_max_length,
+                image_max_pixels=self.chat_template.image_max_pixels,
                 video_fps=self.chat_template.video_fps,
                 video_max_frames=self.chat_template.video_max_frames,
                 video_max_pixels=self.chat_template.video_max_pixels,
@@ -130,7 +134,11 @@ class Qwen3OmniPipeline(Pipeline):
             )
         else:
             chat_stage = self.chat_template
-        return chat_stage.embed(turns)
+        conversations = build_omni_messages(
+            turns,
+            system_instruction,
+        )
+        return chat_stage.embed_messages(conversations)
 
     def generate(self, sample: Sample) -> Sample:
         """Generate one Qwen3-Omni assistant turn and fill the AR frontier."""

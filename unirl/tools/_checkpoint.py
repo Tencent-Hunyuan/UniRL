@@ -1,11 +1,4 @@
-"""Offline reader for the two checkpoint flavors ``BaseFSDP2Backend.save`` writes.
-
-Both export tools (:mod:`unirl.tools.export_full`, :mod:`unirl.tools.export_adapter`)
-consume a checkpoint as a flat dict with ``policy_state_dict`` (plus
-``lora_config`` / ``step`` / ``save_mode`` when present). The legacy ``torch``
-format already is that dict; the sharded ``dcp`` format is reassembled here in a
-single process — no distributed group, since the export tools run on one host.
-"""
+"""Offline reader for the two checkpoint flavors ``BaseFSDP2Backend.save`` writes."""
 
 from __future__ import annotations
 
@@ -17,13 +10,7 @@ import torch
 
 
 def load_training_checkpoint(path: str) -> Dict[str, object]:
-    """Load a UniRL checkpoint (``torch`` or ``dcp``) into the legacy dict shape.
-
-    ``path`` is the ``checkpoint-<step>`` directory (either format) or, for the
-    ``torch`` format, the ``checkpoint.pt`` file itself. A directory holding a
-    DCP ``.metadata`` is read as sharded; anything else falls back to the legacy
-    single-file pickle.
-    """
+    """Load a UniRL checkpoint (``torch`` or ``dcp``) into the legacy dict shape."""
     if os.path.isdir(path):
         dcp_metadata = os.path.join(path, ".metadata")
         app_metadata = os.path.join(path, "metadata.pt")

@@ -1,27 +1,4 @@
-"""Make sglang's Merged/QKV-parallel LoRA B slicers tolerate 2-D tensors (LIN-365).
-
-sglang's ``MergedColumnParallelLinearWithLoRA.slice_lora_b_weights`` expects a
-3-D ``[N, out_dim, rank]`` LoRA B tensor (fork's stacked format for split-fused
-params; see ``patch_lora_tensors._register_lora_state_dict`` merge_index branch).
-For models where diffusers PEFT delivers ``ff.linear_in`` / ``to_qkv_mlp_proj``
-as a SINGLE 2-D ``[total_out, rank]`` LoRA B (the gate/up or qkv/mlp split is
-internal to the weight matrix, not separate adapter keys), the 3-D slicer
-crashes ``IndexError: too many indices for tensor of dimension 2``. Hit by
-FLUX.2-Klein's ``Flux2FeedForward.linear_in`` on the 2nd rollout (after the 1st
-weight-sync pushes the trainer LoRA tensors).
-
-This patch makes ``MergedColumnParallelLinearWithLoRA.slice_lora_b_weights``
-tolerant of both shapes:
-  * 3-D ``[N, out_dim, rank]``: keep upstream behaviour (slice axis-1 by TP).
-  * 2-D ``[total_out, rank]``: slice axis-0 by TP, identical to plain
-    ``ColumnParallelLinearWithLoRA``. The downstream forward math
-    (``input @ A.T @ B.T``) works the same for both shapes when TP=1.
-
-For TP>1 the 2-D path treats the merged output dim as a single contiguous
-shard (same as ColumnParallel). This matches diffusers' PEFT semantics. Rollout
-runs TP=1 per worker (one GPU per actor), so this is sound for the LIN-365
-flux2_klein path.
-"""
+"""Let sglang's LoRA B slicers take 2-D ``[total_out, rank]`` as well as 3-D ``[N, out_dim, rank]``."""
 
 from __future__ import annotations
 

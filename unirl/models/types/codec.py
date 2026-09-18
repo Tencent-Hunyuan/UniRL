@@ -1,11 +1,4 @@
-"""Latent/media codec interfaces — typed pipeline stages between Primitive and Condition/Segment.
-
-``EncodeStage[P, C]``: ``Primitive → Condition``. e.g. VAE encoder for an
-image-conditioning slot.
-
-``DecodeStage[S, P]``: ``Segment → Primitive``. e.g. VAE decoder turning a
-``LatentSegment`` back into an ``Image``.
-"""
+"""Latent/media codec interfaces — typed pipeline stages between Primitive and Condition/Segment."""
 
 from __future__ import annotations
 

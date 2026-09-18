@@ -1,18 +1,5 @@
 #!/usr/bin/env python
-"""UniRL v2 AR (autoregressive) training entry point (Hydra-native).
-
-Thin wrapper around :class:`unirl.trainer.ar.ARTrainer` — the AR path's
-sibling of ``train_diffusion.py`` (which drives the diffusion ``DiffusionTrainer``).
-Kept separate so the AR path never routes through diffusion / SDE code.
-
-Launch (per node, SPMD; rank 0 owns the driver):
-  QWEN_VL_PATH=/path/to/Qwen2.5-VL-7B-Instruct DATA_PATH=/path/to/train.jsonl \
-  python -m unirl.train_ar --config-name=ar/qwen_vl_grpo_geo3k_mc_4x8
-
-This AR entrypoint serves both vision-language (``qwen_vl``) and pure-LLM
-(``qwen3``) recipes under ``examples/ar/``
-(e.g. ``--config-name=ar/qwen3_drpo_4b_base_dapo_sglang``).
-"""
+"""UniRL v2 AR (autoregressive) training entry point (Hydra-native)."""
 
 from __future__ import annotations
 
@@ -39,7 +26,7 @@ def main(cfg: DictConfig) -> None:
             pipeline_cfg=cfg.pipeline,
             backend_cfg=cfg.backend,
             rollout_cfg=cfg.rollout,
-            reward_cfg=cfg.reward,
+            reward_cfg=cfg.get("reward"),
             algorithm_cfg=cfg.algorithm,
             stack_cfg=cfg.stack,
             data_source_cfg=cfg.data_source,

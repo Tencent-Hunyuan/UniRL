@@ -1,35 +1,14 @@
-"""The HTTP ``Backend`` impl — SGLang SRT server subprocess + sync HTTP client.
-
-The ONLY module that imports the SGLang runtime or does I/O — including the
-spawn. :meth:`HTTPBackend.boot` filters the config-spelled intent against the
-real ``ServerArgs`` fields (the only place that knows them), quarantines the env
-the SRT subprocess needs at the spawn boundary, launches the server, and polls
-``/health_generate``. Everything is plain blocking ``urllib`` — no event loop:
-generation concurrency comes from the CALLERS' threads (the agentic drain runs
-one thread per trajectory; the batch path fans out on its own pool), bounded by
-one ``threading.Semaphore``, and the SRT server batches the in-flight POSTs
-together. Weight/memory verbs keep the long weight-op timeout tier.
-
-Control-plane payloads (weight sync, memory, LoRA) are constructed from the
-installed runtime's own ``io_struct`` request dataclasses rather than hand-built
-dicts: the actor and the SRT subprocess share one install, so the payloads are
-version-matched to the server by construction — a field-name drift fails loudly
-at construction instead of as an opaque HTTP 422 mid-training.
-
-Because the SGLang import is lazy (only :func:`_import_sglang_runtime`, called
-from :meth:`boot`), the module imports on CPU — the rest of the package is
-exercisable without a GPU, and :func:`parse_generate_response` (the
-``/generate`` JSON → :class:`RawResult` deserialization) is a pure module-level
-function.
-"""
+"""The HTTP ``Backend`` impl — SGLang SRT server subprocess + sync HTTP client."""
 
 from __future__ import annotations
 
+import base64
 import dataclasses
 import json
 import logging
 import multiprocessing
 import os
+import pickle
 import signal
 import threading
 import time
@@ -50,14 +29,7 @@ _TIERED_TIMEOUT: Any = object()
 
 
 def _signal_process_tree(pid: int, sig: signal.Signals) -> None:
-    """Signal ``pid``'s owned process group, or only ``pid`` before ``setsid``.
-
-    The parent may observe a boot failure before the spawned child has executed
-    :func:`os.setsid`.  In that race the child still belongs to the Ray
-    worker/trainer's process group, so signaling that inherited group would
-    terminate the launcher too.  A session leader owns a group whose id equals
-    its pid; only that group is safe to fan out to.
-    """
+    """Signal ``pid``'s owned process group, or only ``pid`` before ``setsid``."""
     try:
         pgid = os.getpgid(pid)
     except ProcessLookupError:
@@ -135,12 +107,7 @@ def wait_server_healthy(
 
 
 def _import_sglang_runtime() -> Dict[str, Any]:
-    """Lazy import of the server entrypoints + the io_struct request types.
-
-    Only called from :meth:`HTTPBackend.boot`, so the module imports on CPU.
-    The verbs construct these installed-runtime request dataclasses instead of
-    hand-built dicts (see the module docstring for why).
-    """
+    """Lazy import of the server entrypoints + the io_struct request types."""
     from sglang.srt.entrypoints.http_server import launch_server
     from sglang.srt.managers.io_struct import (
         DestroyWeightsUpdateGroupReqInput,
@@ -149,6 +116,7 @@ def _import_sglang_runtime() -> Dict[str, Any]:
         ReleaseMemoryOccupationReqInput,
         ResumeMemoryOccupationReqInput,
         UpdateWeightsFromDistributedReqInput,
+        UpdateWeightsFromIPCReqInput,
         UpdateWeightsFromTensorReqInput,
     )
     from sglang.srt.server_args import ServerArgs
@@ -160,6 +128,7 @@ def _import_sglang_runtime() -> Dict[str, Any]:
         "MultiprocessingSerializer": MultiprocessingSerializer,
         "UpdateWeightsFromTensorReqInput": UpdateWeightsFromTensorReqInput,
         "UpdateWeightsFromDistributedReqInput": UpdateWeightsFromDistributedReqInput,
+        "UpdateWeightsFromIPCReqInput": UpdateWeightsFromIPCReqInput,
         "InitWeightsUpdateGroupReqInput": InitWeightsUpdateGroupReqInput,
         "DestroyWeightsUpdateGroupReqInput": DestroyWeightsUpdateGroupReqInput,
         "LoadLoRAAdapterFromTensorsReqInput": LoadLoRAAdapterFromTensorsReqInput,
@@ -180,14 +149,19 @@ def _launch_server_with_env(server_args: Any, env_overrides: Dict[str, str]) -> 
     return launch_server(server_args)
 
 
+# TODO(sglang-upgrade): Once the pinned release and deployment image use the
+# same io_struct representation, replace this compatibility serializer with
+# that version's native conversion API.
 def asdict_drop_none(req: Any) -> Dict[str, Any]:
-    """The wire view of an io_struct request: its fields minus the ``None``s.
-
-    Unset Optionals (incl. ``BaseReq``'s ``rid`` / ``http_worker_ipc``) drop;
-    ``False`` / ``0`` / empty containers survive (``flush_cache=False`` must
-    reach the server).
-    """
-    return {k: v for k, v in dataclasses.asdict(req).items() if v is not None}
+    """The wire view of an io_struct request: its fields minus the ``None``s."""
+    if dataclasses.is_dataclass(req) and not isinstance(req, type):
+        items = dataclasses.asdict(req).items()
+    elif hasattr(req, "__struct_fields__"):
+        # Newer SGLang builds use msgspec.Struct for io_struct payloads.
+        items = ((name, getattr(req, name)) for name in req.__struct_fields__)
+    else:
+        raise TypeError(f"asdict_drop_none expected dataclass or msgspec.Struct; got {type(req)!r}")
+    return {k: v for k, v in items if v is not None}
 
 
 @dataclass(frozen=True)
@@ -201,15 +175,7 @@ class _HTTPRawResult:
 
 
 def parse_generate_response(response: Any) -> List[_HTTPRawResult]:
-    """Parse one SRT ``/generate`` response into per-candidate results.
-
-    SGLang returns a single dict for ``n=1`` and a list of dicts for ``n>1``;
-    both normalize to a list here (the per-prompt candidate order is SRT's).
-    Token ids and log-probs both ride the ``output_token_logprobs``
-    ``(logprob, token_id[, token_text])`` items — the runtime's only source of
-    generated token ids — so the two lists are length-aligned by construction;
-    ``finish_reason`` arrives as a dict or a bare string.
-    """
+    """Parse one SRT ``/generate`` response into per-candidate results."""
     if isinstance(response, list):
         candidates = response
     elif isinstance(response, dict):
@@ -257,11 +223,13 @@ class HTTPBackend:
         base_url: str,
         *,
         concurrency: int,
+        tp_size: int,
         runtime: Dict[str, Any],
     ) -> None:
         self._server_process: Optional[multiprocessing.Process] = server_process
         self._base_url = base_url
         self._concurrency = int(concurrency)
+        self._tp_size = int(tp_size)
         self._rt = runtime
         self._sem = threading.Semaphore(int(concurrency))
         self._logged_first_response = False
@@ -276,15 +244,7 @@ class HTTPBackend:
         health_timeout_s: float = 300.0,
         cuda_visible_devices: Optional[Sequence[str]] = None,
     ) -> "HTTPBackend":
-        """Filter intent against ServerArgs, spawn the SRT server, await health.
-
-        ``server_intent`` is the config-spelled ServerArgs intent (reserved
-        ports already overlaid as ``port`` / ``nccl_port`` — real ServerArgs
-        fields, so no port env manipulation happens anywhere). We filter it to
-        the real ServerArgs fields here (the only place that knows them).
-        Non-ServerArgs escape-hatch keys drop harmlessly; explicitly requested
-        UniRL correctness flags fail closed if the installed runtime lacks them.
-        """
+        """Filter intent against ServerArgs, spawn the SRT server, await health."""
         rt = _import_sglang_runtime()
 
         allowed = {f.name for f in dataclasses.fields(rt["ServerArgs"])}
@@ -318,7 +278,6 @@ class HTTPBackend:
         )
 
         multiprocessing.set_start_method("spawn", force=True)
-        server_args = rt["ServerArgs"](**server_kwargs)
 
         tp_size = int(server_kwargs.get("tp_size", 1))
         visible_devices = _normalize_cuda_visible_devices(
@@ -327,8 +286,11 @@ class HTTPBackend:
         )
         env_overrides: Dict[str, str] = {}
         if visible_devices is not None:
-            server_args.base_gpu_id = 0
+            # Some SGLang builds freeze ServerArgs after construction.
+            server_kwargs["base_gpu_id"] = 0
             env_overrides["CUDA_VISIBLE_DEVICES"] = ",".join(visible_devices)
+
+        server_args = rt["ServerArgs"](**server_kwargs)
         process = multiprocessing.Process(
             target=_launch_server_with_env,
             args=(server_args, env_overrides),
@@ -352,17 +314,10 @@ class HTTPBackend:
             getattr(server_args, "nccl_port", None),
             getattr(server_args, "host", None),
         )
-        return cls(process, base_url, concurrency=concurrency, runtime=rt)
+        return cls(process, base_url, concurrency=concurrency, tp_size=tp_size, runtime=rt)
 
     def generate(self, requests: List[Dict[str, Any]]) -> List[_HTTPRawResult]:
-        """POST the per-prompt payloads concurrently; flatten prompt-major.
-
-        Safe for concurrent callers: each POST blocks its own thread while the
-        SRT server batches the in-flight requests. A length-1 wire (the agentic
-        per-turn path) posts on the calling thread — no pool, no per-batch INFO
-        log; longer wires fan out on a throwaway pool (``executor.map`` keeps
-        prompt order).
-        """
+        """POST the per-prompt payloads concurrently; flatten prompt-major."""
         if not requests:
             return []
         if len(requests) == 1:
@@ -400,12 +355,7 @@ class HTTPBackend:
         return parsed
 
     def _post_generate(self, payload: Dict[str, Any], max_retries: int = 60) -> Any:
-        """POST /generate with retry. Mirrors slime/utils/http_utils.py:165-198.
-
-        ``timeout=None``: a long decode must never be killed client-side (the
-        old async client ran with no timeout — same semantics: bounded retry
-        against a dead server, indefinite block on a wedged-but-alive one).
-        """
+        """POST /generate with retry. Mirrors slime/utils/http_utils.py:165-198."""
         url = f"{self._base_url}/generate"
         for attempt in range(max_retries):
             try:
@@ -428,22 +378,14 @@ class HTTPBackend:
         self._post_best_effort("/continue_generation", {})
 
     def _post_best_effort(self, path: str, payload: Dict[str, Any]) -> None:
-        """One bounded attempt; the server may lack the endpoint (best-effort).
-
-        The 10s bound matters: these fire while /generate POSTs are in flight,
-        and the old path bounded them with the control runner's 10s wait.
-        """
+        """One bounded attempt; the server may lack the endpoint (best-effort)."""
         try:
             self._post(path, payload, timeout=10)
         except Exception as exc:
             logger.warning("sglang HTTPBackend: %s failed (best-effort): %s", path, exc)
 
     def _post(self, path: str, payload: Dict[str, Any], *, timeout: Any = _TIERED_TIMEOUT) -> Any:
-        """Synchronous POST JSON to the SRT server.
-
-        Default timeout is tiered by path; pass an explicit value (or ``None``
-        for no timeout) to override.
-        """
+        """Synchronous POST JSON to the SRT server."""
         url = f"{self._base_url}{path}"
         if timeout is _TIERED_TIMEOUT:
             # Use the long timeout for weight updates and LoRA reloads.
@@ -467,9 +409,16 @@ class HTTPBackend:
                 pass
             raise RuntimeError(f"SGLang SRT HTTP {exc.code} for {url}: {error_body}") from exc
 
-    def _post_struct(self, path: str, req: Any, operation: str) -> None:
+    def _post_struct(
+        self,
+        path: str,
+        req: Any,
+        operation: str,
+        *,
+        timeout: Any = _TIERED_TIMEOUT,
+    ) -> None:
         """POST a typed io_struct request (its non-``None`` fields) and check."""
-        resp = self._post(path, asdict_drop_none(req))
+        resp = self._post(path, asdict_drop_none(req), timeout=timeout)
         self._check_update_response(resp, operation)
 
     @staticmethod
@@ -484,12 +433,7 @@ class HTTPBackend:
             raise RuntimeError(f"Cannot {operation}: SRT server is not alive.")
 
     def flush_cache(self) -> None:
-        """Flush the sglang scheduler cache; retry until 200.
-
-        Mirrors slime's flush_cache: /flush_cache returns non-200 while
-        pending requests exist; retry up to 60 × 1s. Precondition for
-        sleep so /release_memory_occupation actually frees the KV pool.
-        """
+        """Flush the sglang scheduler cache; retry until 200."""
         url = f"{self._base_url}/flush_cache"
         last_err: Optional[Exception] = None
         for _ in range(60):
@@ -621,6 +565,23 @@ class HTTPBackend:
             "destroy_weights_group",
         )
 
+    def update_from_checkpoint_engine_ipc(
+        self,
+        *,
+        zmq_handles: Dict[str, str],
+        flush_cache: bool,
+        timeout_s: float,
+    ) -> None:
+        self._post_struct(
+            "/update_weights_from_ipc",
+            self._rt["UpdateWeightsFromIPCReqInput"](
+                zmq_handles=zmq_handles,
+                flush_cache=flush_cache,
+            ),
+            "update_from_checkpoint_engine_ipc",
+            timeout=timeout_s,
+        )
+
     def set_lora(
         self,
         *,
@@ -628,13 +589,11 @@ class HTTPBackend:
         lora_tensors: Dict[str, Any],
         config_dict: Optional[dict] = None,
     ) -> None:
-        """Serialize the LoRA tensor bag and hot-load it on the SRT server.
-
-        SGLang SRT exposes ``POST /load_lora_adapter_from_tensors`` which
-        accepts serialized LoRA tensors + a PEFT config dict and hot-loads the
-        adapter on all TP workers internally.
-        """
-        serialized = self._rt["MultiprocessingSerializer"].serialize(lora_tensors, output_str=True)
+        """Serialize the LoRA tensor bag and hot-load it on the SRT server."""
+        if self._tp_size == 1:
+            serialized = self._rt["MultiprocessingSerializer"].serialize(lora_tensors, output_str=True)
+        else:
+            serialized = base64.b64encode(pickle.dumps(lora_tensors)).decode("utf-8")
         self._post_struct(
             "/load_lora_adapter_from_tensors",
             self._rt["LoadLoRAAdapterFromTensorsReqInput"](

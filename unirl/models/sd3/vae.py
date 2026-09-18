@@ -1,20 +1,4 @@
-"""SD3 VAE codec stages — LatentSegment ↔ Images.
-
-``SD3VAEDecodeStage`` implements ``DecodeStage[LatentSegment, Images]``:
-reads the final stored position from ``LatentSegment.latents[:, -1]``
-(``SD3DiffusionStage`` always stores position ``T``, the clean latent), runs
-VAE decode in fp32 (bf16 is unsupported by most VAE implementations), and
-normalizes the output from ``[-1, 1]`` to ``[0, 1]`` before wrapping in
-``Images``.
-
-``SD3VAEEncodeStage`` implements ``EncodeStage[Images, ImageLatentCondition]``
-as the STRICT INVERSE of the decode math (deterministic ``.mode()``, then
-``(z - shift_factor) * scaling_factor``) — first consumer is diffusion SFT's
-target-image encoding; img2img / SDEdit conditioning can reuse it.
-
-Decode math copied from ``models/sd3.py:533-550`` and
-``samplers/fsdp/base_sampler.py:162-180`` (do NOT import legacy code).
-"""
+"""SD3 VAE codec stages — LatentSegment ↔ Images."""
 
 from __future__ import annotations
 
@@ -37,18 +21,7 @@ class SD3VAEDecodeStage(DecodeStage[LatentSegment, Images]):
         self.bundle = bundle
 
     def decode(self, s: LatentSegment, *, grad: bool = False, activation_checkpoint: bool = False) -> Images:
-        """Decode the final-step latents in *s* into pixel images.
-
-        Reads ``s.latents[:, -1]`` (the final stored position, which is ``T`` —
-        the clean latent ``x_0``). VAE forward runs in fp32; output is clamped to
-        ``[0, 1]`` before being wrapped in ``Images``.
-
-        ``grad=False`` (default) keeps the rollout path under ``torch.no_grad()``.
-        ``grad=True`` (ReFL direct-reward backprop) runs the decode WITH grad so it
-        flows from the reward through the frozen VAE into ``clean``; the VAE has no
-        trainable params, so only ``clean``'s graph is extended. ``activation_checkpoint``
-        (grad only) recomputes the decode in backward to trade compute for memory.
-        """
+        """Decode the final-step latents in *s* into pixel images."""
         if self.bundle.vae is None:
             raise RuntimeError(
                 "SD3VAEDecodeStage.decode: no VAE loaded (load_vae=False). "
@@ -81,19 +54,11 @@ class SD3VAEDecodeStage(DecodeStage[LatentSegment, Images]):
             else:
                 decoded = _decode(clean)
         pixels = ((decoded + 1.0) / 2.0).clamp(0.0, 1.0)
-        return Images(pixels=pixels)
+        return Images.from_dense(pixels)
 
 
 class SD3VAEEncodeStage(EncodeStage[Images, ImageLatentCondition]):
-    """SD3 VAE encode stage — the strict inverse of :class:`SD3VAEDecodeStage`.
-
-    ``pixels ∈ [0, 1] → [-1, 1] → vae.encode(·).latent_dist.mode() →
-    (z - shift_factor) * scaling_factor``. Deterministic ``.mode()`` (not
-    ``.sample()`` — posterior sampling would make the stored latent drift from
-    what decode reproduces); normalization constants read from ``vae.config``
-    at call time (SD3.5 ships ≈1.5305 / ≈0.0609 — never hardcode). Runs in
-    fp32 under ``no_grad``, matching decode's precision policy.
-    """
+    """SD3 VAE encode stage — the strict inverse of :class:`SD3VAEDecodeStage`."""
 
     def __init__(self, bundle: SD3Bundle) -> None:
         self.bundle = bundle
@@ -107,7 +72,12 @@ class SD3VAEEncodeStage(EncodeStage[Images, ImageLatentCondition]):
                 "configuration — separate-engine recipes encode in the "
                 "rollout engine; trainside / SFT paths require load_vae=True."
             )
-        pixels = p.pixels
+        try:
+            pixels = p.to_dense()
+        except ValueError as exc:
+            raise ValueError(
+                f"SD3VAEEncodeStage.encode requires a non-empty batch with uniform image shapes; {exc}"
+            ) from exc
         if not isinstance(pixels, torch.Tensor) or pixels.ndim != 4 or pixels.shape[1] != 3:
             raise ValueError(
                 f"SD3VAEEncodeStage.encode: expected pixels [B, 3, H, W], got "

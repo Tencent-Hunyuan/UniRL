@@ -19,26 +19,7 @@ from unirl.distributed.tensor.transport import TensorTransport, TensorTransportR
 
 @dataclass
 class TQTensorHandle:
-    """One tensor stored in the TransferQueue: the upstream row-metadata, the
-    field name it occupies in its originating put, and its original shape.
-
-    Wrapping the upstream meta (rather than dropping it straight into
-    ``TensorRef.spans``) keeps three contracts that worker-local handles satisfy
-    for free:
-
-    * **Uniform ref interface.** Every ``TensorRef.spans`` element exposes
-      ``.local()``, so driver-side hydration (``hydrate``) resolves a
-      worker-local ``TensorHandle`` and a global TQ ref the same way.
-    * **Field identity travels with the ref.** ``Worker.call`` keys put/get by
-      *positional* index, so a producer's output ``'0'`` is a consumer's input
-      ``'2'``. The TransferQueue stores the tensor under the producer's field
-      name; carrying that name here lets the consumer fetch the right column no
-      matter what positional key it later assigns.
-    * **Shape survives the byte round-trip.** Mooncake's zero-copy path takes a
-      ``tensor.view(torch.uint8)``, which is illegal on a 0-dim tensor — so 0-dim
-      tensors are reshaped to ``(1,)`` on put and restored to ``orig_shape`` on
-      fetch.
-    """
+    """One TransferQueue tensor: its upstream row-metadata, the field name it occupied on put, and its shape."""
 
     meta: Any  # Upstream SampleMeta or BatchMeta.
     field: str  # the field name the tensor occupies in its put's TensorDict
@@ -56,15 +37,7 @@ class TQTensorHandle:
 
 
 def _store_shape(t: torch.Tensor) -> torch.Tensor:
-    """Pad to >=2 dims so every per-row slice is >=1-dim.
-
-    TransferQueue stores row-wise (the leading dim is the batch); the per-row
-    slice drops that dim, so a 1-dim field ``(N,)`` becomes a 0-dim scalar per
-    row, and a 0-dim field is scalar outright — both of which mooncake's
-    zero-copy ``tensor.view(torch.uint8)`` rejects ("dim() cannot be 0"). A
-    trailing singleton keeps every per-row slice >=1-dim; ``_restore`` undoes it
-    via the recorded ``orig_shape``.
-    """
+    """Pad to >=2 dims so every per-row slice is >=1-dim."""
     if t.dim() == 0:
         return t.reshape(1, 1)
     if t.dim() == 1:
@@ -73,8 +46,7 @@ def _store_shape(t: torch.Tensor) -> torch.Tensor:
 
 
 def _restore(val: Any, orig_shape: Optional[Tuple[int, ...]]) -> Any:
-    """Reshape a fetched tensor back to the shape it was put with (a no-op unless
-    the backend altered it — e.g. the 0-dim → (1,) reshape on put)."""
+    """Reshape a fetched tensor back to the shape it was put with (no-op unless the backend altered it)."""
     if orig_shape is not None and isinstance(val, torch.Tensor) and val.shape != orig_shape:
         return val.reshape(orig_shape)
     return val
@@ -88,12 +60,7 @@ def _extract(td: Any, field: str) -> Any:
 
 
 class TQTransport(TensorTransport):
-    """Transfer Queue backend — batches named tensors into single round-trips.
-
-    A plain (global) TensorTransport: refs resolve from any process, so there is
-    no controller-orchestrated NCCL routing and no per-ref ref-counting — it
-    implements only the universal put/get/batch surface.
-    """
+    """Transfer Queue backend — batches named tensors into single round-trips."""
 
     def __init__(
         self,
@@ -108,14 +75,7 @@ class TQTransport(TensorTransport):
         return self._runtime.client
 
     async def _fetch(self, handles: List[TQTensorHandle]) -> List[torch.Tensor]:
-        """Resolve handles to tensors, parallel to the input order.
-
-        Handles from the same put share ``global_indexes``; column-union them so
-        each put is one ``async_get_data`` round-trip, then pull each handle's own
-        field out of the returned TensorDict and restore its original shape.
-        Handles from different puts have disjoint ``global_indexes`` (cross-union
-        raises) and are fetched in separate gets.
-        """
+        """Resolve handles to tensors, parallel to the input order."""
         groups: Dict[tuple, List[TQTensorHandle]] = {}
         order: List[tuple] = []
         for h in handles:

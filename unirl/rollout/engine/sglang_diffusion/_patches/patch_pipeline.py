@@ -1,22 +1,4 @@
-"""Pipeline-level fixes for stock-upstream sglang colocate rollout (LIN-365).
-
-**Grouped-path component_residency_manager.** Upstream
-``ComposedPipelineBase.forward`` (the single-request path) sets
-``self.executor.component_residency_manager = get_global_component_residency_manager(...)``
-before executing (composed_pipeline_base.py:922-926). But the grouped path
-``forward_batch`` (used when a request expands to ``num_outputs_per_prompt>1`` --
-UniRL GRPO collapses K identical samples per prompt into one nopp=K request)
-goes straight to ``executor.execute_group_with_profiling`` WITHOUT that setup, so
-``PipelineExecutor.begin_component_residency_request`` dereferences a ``None``
-manager -> ``AttributeError: 'NoneType' object has no attribute 'begin_request'``.
-
-The fork never hit this (``component_residency_manager`` is a post-fork upstream
-addition). Fix: AROUND-wrap ``forward_batch`` to mirror ``forward``'s manager
-setup for the grouped (len>1) case. (len==1 delegates to ``forward``, which sets
-it itself, so we only need the len>1 branch.) Surfaced by the SD3 GRPO e2e.
-
-Idempotent; AROUND-wrap only -- no sglang source edits.
-"""
+"""Pipeline-level fixes for stock-upstream sglang colocate rollout."""
 
 from __future__ import annotations
 

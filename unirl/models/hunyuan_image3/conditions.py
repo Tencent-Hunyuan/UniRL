@@ -1,76 +1,24 @@
-"""HunyuanImage3 typed conditions containers.
-
-Two containers, one per Stage. Both compose generic primitives
-(``FusedMultimodalCondition`` subclass + ``ImageLatentCondition`` /
-``ImageEmbedCondition``) plus a small number of Hunyuan-specific flat
-fields.
-
-- ``HunyuanImage3FusedMultimodalCondition`` — subclass of
-  ``FusedMultimodalCondition``. Inherits the 4 sequence-level fields
-  (``input_ids`` / ``attention_mask`` / ``position_ids`` / ``rope_cache``)
-  and adds 5 scatter-layout fields that pin Hunyuan's roles into the
-  fused sequence (``gen_image_mask``, ``gen_timestep_scatter_index``,
-  ``cond_vae_image_mask``, ``cond_vit_image_mask``,
-  ``cond_timestep_scatter_index``). Used by both diffusion (uses all 5)
-  and AR (uses only ``cond_vit_image_mask``).
-
-- ``HunyuanImage3DiffusionConditions`` — what the DiT-mode forward
-  consumes. Composes the fused condition + ``cond_vae`` (it2i) +
-  ``cond_vit`` (it2i) + per-cond ``cond_timestep`` values + opaque
-  ``tokenizer_output`` for the KV-cache gather on step 0.
-
-- ``HunyuanImage3ARConditions`` — what the AR-mode forward consumes
-  (t2t / i2t / and the prefix passes inside t2i / it2i). Composes the
-  fused condition + ``cond_vit`` (i2t / it2i) + opaque
-  ``tokenizer_output`` for the AR ``real_pos`` derivation on step 0.
-
-Pairs ``from_dict`` / ``to_dict`` for round-tripping between the typed
-form (used inside the pipeline at stage call sites) and the generic
-generic ``Dict[str, Condition]`` shape on a ``Part``.
-"""
+"""HunyuanImage3 typed conditions containers."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, ClassVar, Dict, Optional
 
 import torch
 
-from unirl.distributed.tensor.batch import Batch, FieldKind, field
+from unirl.distributed.tensor.batch import Batch, FieldKind, concat_field, field
 from unirl.types.conditions import (
+    Condition,
     FusedMultimodalCondition,
     ImageEmbedCondition,
-    ImageLatentCondition,
+    Modality,
 )
 
 
 @dataclass
 class HunyuanImage3FusedMultimodalCondition(FusedMultimodalCondition):
-    """Hunyuan's fused-sequence layout.
-
-    Inherits the 4 sequence-level fields from ``FusedMultimodalCondition``
-    and adds 5 scatter-layout fields that describe where each Hunyuan-
-    specific role's encoded content lands in the fused sequence.
-
-    Used by both diffusion (``mode="gen_image"``, uses all 5 scatter
-    fields) and AR (``mode="gen_text"``, uses only
-    ``cond_vit_image_mask``). Unused scatter fields stay ``None`` per
-    mode/path.
-
-    Field shapes (let ``B = batch``, ``L = fused sequence length``, ``K``
-    typically 1):
-
-        gen_image_mask              : [B, L] bool — generated-image patch slots
-        gen_timestep_scatter_index  : [B, K] long — gen timestep token slot
-        cond_vae_image_mask         : [B, L] bool — cond VAE latent slots (it2i)
-        cond_vit_image_mask         : [B, L] bool — cond ViT patch-embed slots (i2t/it2i)
-        cond_timestep_scatter_index : [B, K] long — cond timestep token slot (it2i)
-
-    ``gen_image_mask`` is dual-use: it both scatters the noisy latent
-    into ``inputs_embeds`` on every diffusion step *and* identifies the
-    positions where the diffusion head reads predicted noise on the way
-    out.
-    """
+    """Hunyuan's fused-sequence layout."""
 
     # Store RoPE as a CONCAT tensor so DP transport preserves per-sample rows.
     rope_cache: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)  # [B, 2, L, D]
@@ -132,20 +80,7 @@ class HunyuanImage3FusedMultimodalCondition(FusedMultimodalCondition):
 
     @classmethod
     def concat(cls, items: list) -> "HunyuanImage3FusedMultimodalCondition":
-        """Override ``Batch.concat`` to pad variable-length L dims before cat.
-
-        In think_recaption mode, different prompts produce different AR token
-        counts → different fused sequence lengths L. The base ``Batch.concat``
-        does a plain ``torch.cat(dim=0)`` on CONCAT fields, which fails when L
-        differs across items (e.g. cross-actor merge).
-
-        This override pads all items to ``max_L`` on the L dimension before
-        delegating to the base concat. It also MATERIALIZES any lazy
-        ``TensorRef`` L-fields (they can arrive as refs during a DP-merge)
-        before padding, so the delegated base concat only ever sees homogeneous
-        real tensors — the generic ``Batch.concat`` / ``_concat_value`` needs no
-        tuple- or ref-specific special-casing for hi3's ragged-L path.
-        """
+        """Override ``Batch.concat`` to pad variable-length L dims before cat."""
         if not items or len(items) <= 1:
             from unirl.distributed.tensor.batch import Batch
 
@@ -217,30 +152,23 @@ class HunyuanImage3FusedMultimodalCondition(FusedMultimodalCondition):
 
 
 @dataclass
+class HunyuanImage3VAECondition(Condition):
+    """Per-sample VAE payloads emitted by HI3's private image encoder."""
+
+    modality: ClassVar[Modality] = Modality.IMAGE
+    latents: list[torch.Tensor] = concat_field(default_factory=list)
+
+
+@dataclass
 class HunyuanImage3DiffusionConditions(Batch):
-    """Typed conditions container for HunyuanImage3 DiT-mode diffusion.
-
-    Composes the fused condition + cond-image primitives (it2i) + a few
-    Hunyuan-specific flat fields.
-
-        fused           : HunyuanImage3FusedMultimodalCondition
-                          carries input_ids, 4D attention_mask, position_ids,
-                          rope_cache, plus all 5 scatter masks/indices
-        cond_vae        : ImageLatentCondition — cond VAE latents (it2i)
-        cond_vit        : ImageEmbedCondition — cond ViT patch embeds + attn
-                          mask + spatial_shapes (it2i)
-        cond_timestep   : Tensor — per-cond t values being scattered (it2i;
-                          data, not a destination index)
-        tokenizer_output: opaque upstream apply_chat_template output, used
-                          on step 0 to drive the KV-cache gather-down
-    """
+    """Typed conditions container for HunyuanImage3 DiT-mode diffusion."""
 
     fused: Optional[HunyuanImage3FusedMultimodalCondition] = field(kind=FieldKind.SHARED, default=None)
     # Store CFG's unconditional branch separately so B-sample transport preserves it.
     fused_uncond: Optional[HunyuanImage3FusedMultimodalCondition] = field(kind=FieldKind.SHARED, default=None)
-    cond_vae: Optional[ImageLatentCondition] = field(kind=FieldKind.CONCAT, default=None)
+    cond_vae: Optional[HunyuanImage3VAECondition] = field(kind=FieldKind.CONCAT, default=None)
     cond_vit: Optional[ImageEmbedCondition] = field(kind=FieldKind.CONCAT, default=None)
-    cond_timestep: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
+    cond_timestep: Optional[torch.Tensor | list[torch.Tensor]] = field(kind=FieldKind.CONCAT, default=None)
     tokenizer_output: Optional[Any] = field(kind=FieldKind.SHARED, default=None)
 
     @classmethod
@@ -259,10 +187,10 @@ class HunyuanImage3DiffusionConditions(Batch):
                 "is required for the diffusion stage to consume."
             )
         cond_vae = d.get("cond_vae")
-        if cond_vae is not None and not isinstance(cond_vae, ImageLatentCondition):
+        if cond_vae is not None and not isinstance(cond_vae, HunyuanImage3VAECondition):
             raise TypeError(
                 f"HunyuanImage3DiffusionConditions.from_dict: expected d['cond_vae'] "
-                f"to be an ImageLatentCondition or absent, "
+                f"to be a HunyuanImage3VAECondition or absent, "
                 f"got {type(cond_vae).__name__}"
             )
         cond_vit = d.get("cond_vit")
@@ -311,32 +239,12 @@ class HunyuanImage3DiffusionConditions(Batch):
 
 @dataclass
 class HunyuanImage3ARConditions(Batch):
-    """Typed conditions container for HunyuanImage3 AR-mode autoregress.
-
-    Used by t2t / i2t / and the prefix passes inside t2i / it2i.
-
-        fused           : HunyuanImage3FusedMultimodalCondition
-                          carries input_ids, 4D attention_mask, position_ids,
-                          rope_cache, plus cond_vae_image_mask /
-                          cond_vit_image_mask / cond_timestep_scatter_index (i2t/it2i)
-        cond_vae        : ImageLatentCondition — cond VAE latents (i2t/it2i).
-                          HI3-Instruct represents a cond image as VAE + ViT
-                          tokens, so comprehension needs BOTH halves scattered
-                          (ViT-only leaves the VAE <img> slots as bare
-                          embeddings → garbage comprehension).
-        cond_vit        : ImageEmbedCondition — cond ViT patch embeds + attn
-                          mask + spatial_shapes (i2t/it2i)
-        cond_timestep   : Tensor — per-cond t values for the VAE-latent scatter
-                          (clean cond image → t≈0)
-        tokenizer_output: opaque upstream apply_chat_template output, used
-                          on step 0 to derive position_ids from real_pos
-                          for right-padded batches
-    """
+    """Typed conditions container for HunyuanImage3 AR-mode autoregress."""
 
     fused: Optional[HunyuanImage3FusedMultimodalCondition] = field(kind=FieldKind.SHARED, default=None)
-    cond_vae: Optional[ImageLatentCondition] = field(kind=FieldKind.CONCAT, default=None)
+    cond_vae: Optional[HunyuanImage3VAECondition] = field(kind=FieldKind.CONCAT, default=None)
     cond_vit: Optional[ImageEmbedCondition] = field(kind=FieldKind.CONCAT, default=None)
-    cond_timestep: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
+    cond_timestep: Optional[torch.Tensor | list[torch.Tensor]] = field(kind=FieldKind.CONCAT, default=None)
     tokenizer_output: Optional[Any] = field(kind=FieldKind.SHARED, default=None)
 
     @classmethod
@@ -353,10 +261,10 @@ class HunyuanImage3ARConditions(Batch):
                 "HunyuanImage3ARConditions.from_dict: 'fused.input_ids' is required for the AR stage to consume."
             )
         cond_vae = d.get("cond_vae")
-        if cond_vae is not None and not isinstance(cond_vae, ImageLatentCondition):
+        if cond_vae is not None and not isinstance(cond_vae, HunyuanImage3VAECondition):
             raise TypeError(
                 f"HunyuanImage3ARConditions.from_dict: expected d['cond_vae'] "
-                f"to be an ImageLatentCondition or absent, "
+                f"to be a HunyuanImage3VAECondition or absent, "
                 f"got {type(cond_vae).__name__}"
             )
         cond_vit = d.get("cond_vit")
@@ -395,4 +303,5 @@ __all__ = [
     "HunyuanImage3ARConditions",
     "HunyuanImage3DiffusionConditions",
     "HunyuanImage3FusedMultimodalCondition",
+    "HunyuanImage3VAECondition",
 ]

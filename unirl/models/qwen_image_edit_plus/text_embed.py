@@ -1,21 +1,4 @@
-"""QwenImageEditPlusTextEmbedStage — edit chat-template text (+ optional image) → TextEmbedCondition.
-
-Mirrors upstream diffusers ``QwenImageEditPlusPipeline._get_qwen_prompt_embeds``
-(``pipeline_qwenimage_edit_plus.py``) and the SGLang rollout path:
-
-- Always uses the **edit** chat template (``prompt_template_encode_start_idx = 64``),
-  not base Qwen-Image's template (drop 34).
-- When ``images`` is provided: prefixes
-  ``"Picture 1: <|vision_start|><|image_pad|><|vision_end|>"``, runs the
-  Qwen2.5-VL processor with ``pixel_values`` / ``image_grid_thw`` (source
-  resized to the ≈384² condition grid), then drops the 64-token system prefix.
-- When ``images`` is ``None``: same edit template with an empty image prefix
-  (upstream ``base_img_prompt = ""``) — text-only Edit-Plus encoding, **not**
-  a switch to :class:`~unirl.models.qwen_image.QwenImageTextEmbedStage`.
-
-``use_condition_image_prompt=False`` on the pipeline/config means "call this
-stage with ``images=None``", i.e. Edit text-only, aligned with upstream.
-"""
+"""QwenImageEditPlusTextEmbedStage — edit chat-template text (+ optional image) → TextEmbedCondition."""
 
 from __future__ import annotations
 
@@ -46,10 +29,7 @@ _SIZE_ALIGN = 32
 
 
 def _condition_size_for_aspect(width: int, height: int) -> Tuple[int, int]:
-    """Aspect-preserving ``(w, h)`` at ≈``CONDITION_IMAGE_AREA``, 32-aligned.
-
-    Mirrors upstream ``calculate_dimensions(CONDITION_IMAGE_SIZE, w / h)``.
-    """
+    """Aspect-preserving ``(w, h)`` at ≈``CONDITION_IMAGE_AREA``, 32-aligned."""
     ratio = float(width) / float(height)
     cond_w = math.sqrt(CONDITION_IMAGE_AREA * ratio)
     cond_h = cond_w / ratio
@@ -59,12 +39,7 @@ def _condition_size_for_aspect(width: int, height: int) -> Tuple[int, int]:
 
 
 class QwenImageEditPlusTextEmbedStage(ImageConditionedEmbedStage[Texts, Images, TextEmbedCondition]):
-    """Edit-template text (+ optional source images) → ``TextEmbedCondition``.
-
-    Both CFG branches pass the *same* source images when multimodal (matching
-    upstream ``encode_prompt(image=...)``). Pass ``images=None`` for Edit
-    text-only (upstream ``image is None`` → empty ``base_img_prompt``).
-    """
+    """Edit-template text (+ optional source images) → ``TextEmbedCondition``."""
 
     def __init__(
         self,
@@ -99,9 +74,7 @@ class QwenImageEditPlusTextEmbedStage(ImageConditionedEmbedStage[Texts, Images, 
         )
 
     def _condition_pils(self, images: Images):
-        """Convert source ``Images`` to per-sample PILs resized to the
-        condition grid (≈384², aspect-preserving), mirroring upstream's
-        ``image_processor.resize`` before the VL processor."""
+        """Convert source images to per-sample PILs resized to the"""
         import PIL.Image
 
         pils = images.to_pils()

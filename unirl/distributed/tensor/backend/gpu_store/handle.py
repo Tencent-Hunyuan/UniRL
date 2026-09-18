@@ -1,10 +1,4 @@
-"""GPUTensorHandle — tensor reference for the Single Controller.
-
-A reference-counted handle to a single tensor stored in a worker. It manages its
-own GC via weakref.finalize and flows between worker and controller via Ray RPC
-(pickle). This is the canonical handle shared by the gpu_store and colocate_store
-backends.
-"""
+"""GPUTensorHandle — tensor reference for the Single Controller."""
 
 from __future__ import annotations
 
@@ -20,16 +14,7 @@ logger = logging.getLogger(__name__)
 
 
 class GPUTensorHandle:
-    """Handle to a single tensor stored in a worker.
-
-    Two phases of life:
-      1. Worker side (after put()): pure data, NO worker_handle.
-      2. Controller side (after rebind()): worker_handle set, finalize registered.
-
-    source_id identifies the worker/device that owns the tensor. worker_handle
-    points to the worker actor; the GC finalizer relays a decref into the
-    worker's transport via worker_handle.transport_op.remote("decref", store_key).
-    """
+    """Handle to a single tensor stored in a worker."""
 
     __slots__ = (
         "store_key",
@@ -54,15 +39,7 @@ class GPUTensorHandle:
         self.object_ref = object_ref  # Ray ObjectRef for CPU tensors in plasma store
 
     def rebind(self, worker_handle) -> None:
-        """Attach worker actor handle and register release finalizer.
-
-        Must only be called once. Calling rebind on an already-bound handle
-        indicates a bug (e.g. double-processing in _rebind_tree).
-
-        CPU tensors (object_ref is not None): worker_handle is recorded but no
-        finalizer registered — lifecycle managed by ObjectRef Python refcount,
-        no decref RPC needed.
-        """
+        """Attach worker actor handle and register release finalizer."""
         assert not self._finalized, (
             f"GPUTensorHandle {self.store_key!r} is already bound. rebind() must only be called once."
         )
@@ -126,11 +103,7 @@ class GPUTensorHandle:
 
     @staticmethod
     def _release(worker_handle, store_key: str) -> None:
-        """GC callback: tell the worker to decref this tensor.
-
-        Skipped if Ray is not initialized — happens during interpreter shutdown
-        when module-scoped fixtures have already called ray.shutdown().
-        """
+        """GC callback: tell the worker to decref this tensor."""
         try:
             if not ray.is_initialized():
                 return

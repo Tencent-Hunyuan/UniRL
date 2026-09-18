@@ -1,23 +1,4 @@
-"""Qwen-Image image adapter — packed sequence trajectory, generic schedule.
-
-Qwen-Image's transformer is a packed-token model like FLUX.2-Klein: SGLang's
-denoising loop carries ``[B, S, C*4]`` tokens (2×2 patchify over a 16-channel
-VAE latent), so the trajectory arrives packed ``[B, T+1, S, 64]`` and
-``build_segment`` unpacks it before assembly. Unlike Klein (which keeps
-packed channels at patch resolution), the unpack target is the **true**
-channel form ``[B, T+1, 16, latent_h, latent_w]`` — exactly what the
-trainside replay consumes (``models/qwen_image/diffusion.py`` stores segments
-unpacked and packs only at the transformer boundary), so segments are
-interchangeable between the trainside and sglang engines.
-
-Everything else is the default path: the generic schedule policy reads
-``use_dynamic_shifting`` / ``dynamic_shift_overrides`` / ``shift_terminal``
-off the model config (no Klein-style factory needed — Qwen's μ is the linear
-``calculate_dynamic_mu`` form), the ``transformer.`` LoRA prefix and
-``text`` / ``negative_text`` condition fusion come from ``ImageAdapter``,
-and CFG stays on ``guidance_scale`` (the server's qwen pipeline applies the
-same norm-preserving true-CFG blend as the trainside replay).
-"""
+"""Qwen-Image image adapter — packed sequence trajectory, generic schedule."""
 
 from __future__ import annotations
 
@@ -46,14 +27,7 @@ class QwenImageAdapter(ImageAdapter):
         sde_indices: Optional[List[int]],
         emit_native_logprob: bool,
     ):
-        """Collect, unpack Qwen's packed ``[B, T, S, C*4]`` to true channels, assemble.
-
-        Depatchifies 2×2 to the true 16-channel latent grid. Grid arithmetic is
-        the canonical ``latent_h = 2 * (height // 16)`` (mirrors
-        ``QwenImagePipeline.latent_shape`` / the server's ``prepare_latent_shape``),
-        NOT ``height // 8`` — the two differ for dims that are multiples of 8 but
-        not of 16. 5-D arrivals (image-form) skip the unpack.
-        """
+        """Collect, unpack Qwen's packed ``[B, T, S, C*4]`` to true channels, assemble."""
         diffusion = sample.frontier_gen_part(DiffusionSamplingParams).sampling_params
         traj = utils.collect_trajectory_latents(results)
         if traj.ndim != 5:

@@ -1,26 +1,4 @@
-"""v2 full-weight IPC sync (COLOCATE, same-node).
-
-Bucketed CUDA-IPC over ZMQ. Full-weight analogue of v1
-``distributed/weight_sync/ipc.py`` expressed for the v2 colocate sibling
-model: the rollout engine is a LOCAL sibling, so the v1 ``actor.*.remote(...)``
-spawn becomes an in-process ``self._rollout.update_weights_from_ipc(...)``.
-
-That call is *blocking* (the engine ``collective_rpc``s into the Omni
-subprocess workers, which park in ``BucketedWeightReceiver.receive_weights`` on
-the ZMQ socket). v1 got sender/receiver overlap for free from a non-blocking
-Ray ``.remote()``; here we recreate it with a ``threading.Thread`` that fires
-the receiver while the main thread runs the ``BucketedWeightSender`` pump, then
-``thread.join()`` (which is the per-call barrier — no ``dist.barrier`` needed).
-
-CUDA-IPC is same-node only, so this is colocate-only. Per-Worker socket
-uniqueness: each colocate engine gets a distinct ``replica_rank`` = this train
-rank (the Omni subprocess spawns before any per-Worker env can be set, so we
-pass ``replica_rank`` explicitly to the engine instead of relying on
-``DIFFRL_REPLICA_RANK``).
-
-Scope: single-node, TP=1, single-stage (SD3). All torch / vllm-omni imports are
-deferred so the driver can import this module for ``remote(...)``.
-"""
+"""v2 full-weight IPC sync (COLOCATE, same-node)."""
 
 from __future__ import annotations
 
@@ -64,11 +42,7 @@ class IPCWeightSync(FullWeightSync):
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def sync(self) -> None:
-        """Pump full weights to the co-located engine over per-stage sockets.
-
-        Runs on every train rank. Spawns the engine receiver in a thread (so it
-        overlaps the sender pump), pumps each stage's socket, then joins.
-        """
+        """Pump full weights to the co-located engine over per-stage sockets."""
         rank_info = getattr(self, "rank_info", None)
         if int(getattr(rank_info, "tp_size", 1) or 1) > 1:
             raise NotImplementedError(
@@ -127,7 +101,6 @@ class IPCWeightSync(FullWeightSync):
             thread.join()
         if "exc" in recv_error:
             raise RuntimeError("IPCWeightSync: rollout receiver failed") from recv_error["exc"]
-        self.weight_version += 1
 
 
 __all__ = ["IPCWeightSync"]

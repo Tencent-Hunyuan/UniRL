@@ -1,23 +1,4 @@
-"""Checkpoint loader for VideoAlign reward checkpoints.
-
-Supports both layouts produced by the upstream trainer:
-
-1. **Full state dict** (``save_full_model=True``) — ``checkpoint-K/model.pth``.
-   Loaded directly into the freshly-constructed
-   :class:`Qwen2VLRewardModelBT`.
-
-2. **LoRA split** (the default for the published VideoAlign release) —
-   ``checkpoint-K/adapter_model.safetensors`` (LoRA weights) plus
-   ``checkpoint-K/non_lora_state_dict.pth`` (rm_head + special-token
-   embeddings + any other ``requires_grad`` non-LoRA tensor). Both pieces
-   are merged into the PEFT-wrapped model.
-
-Includes the transformers>=5 compatibility shim
-``base_model.model.model.*`` → ``base_model.model.model.language_model.*``
-when the target model uses the new Qwen2-VL submodule layout but the
-checkpoint was saved against the old one. The remap is a no-op when both
-sides agree.
-"""
+"""Checkpoint loader for VideoAlign reward checkpoints."""
 
 from __future__ import annotations
 
@@ -54,11 +35,7 @@ def _insert_adapter_name_into_state_dict(
 
 
 def _pick_checkpoint_dir(checkpoint_dir: str, checkpoint_step: Optional[int]) -> str:
-    """Return the absolute path of the ``checkpoint-<step>`` subdir to load.
-
-    ``checkpoint_step is None`` or ``-1`` selects the largest step found.
-    A specific step falls back to the latest with a warning if missing.
-    """
+    """Return the absolute path of the ``checkpoint-<step>`` subdir to load."""
     candidates = glob.glob(os.path.join(checkpoint_dir, "checkpoint-*"))
     if not candidates:
         raise FileNotFoundError(
@@ -92,18 +69,7 @@ def load_model_from_checkpoint(
     checkpoint_dir: str,
     checkpoint_step: Optional[int],
 ) -> Tuple[torch.nn.Module, str]:
-    """Load VideoAlign weights into ``model`` from a ``checkpoint-K`` subdir.
-
-    Args:
-        model: an already-constructed reward model (PEFT-wrapped or not).
-        checkpoint_dir: parent dir containing ``checkpoint-*`` subdirs.
-        checkpoint_step: which step to load; ``None`` / ``-1`` → latest.
-
-    Returns:
-        ``(model, step_str)`` — the same model object (mutated in place by
-        ``load_state_dict``) and the step number of the loaded checkpoint
-        as a string (e.g. ``"3000"``), for downstream logging.
-    """
+    """Load VideoAlign weights into ``model`` from a ``checkpoint-K`` subdir."""
     checkpoint_path = _pick_checkpoint_dir(checkpoint_dir, checkpoint_step)
     loaded_step = checkpoint_path.split("checkpoint-")[-1].split("/")[0]
 

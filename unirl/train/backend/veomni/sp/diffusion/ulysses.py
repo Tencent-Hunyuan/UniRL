@@ -1,28 +1,4 @@
-"""Ulysses SP for diffusers transformers.
-
-Two attention-SP mechanisms (auto-detected per model), plus a small per-model
-boundary spec (slice the sequence-carrying inputs + RoPE in, gather hidden out):
-
-* **dispatch-patch** (newer models that route attention through
-  ``dispatch_attention_fn`` — qwen-image / flux2 / wan): wrap that kernel call
-  with the Ulysses all-to-all (gather seq / scatter heads -> attention ->
-  scatter seq / gather heads). Model-agnostic — the model's own processor still
-  does projection / QK-norm / RoPE / stream-concat on the sliced streams, and
-  full (non-causal) attention is order-invariant over the gathered set, so the
-  joint all-to-all is correct (RoPE is applied before the kernel). Cross-attention
-  (Wan text branch: sliced image query vs full text K/V) is detected by unequal
-  q/k seq length and skipped.
-
-* **processor-injection** (older models whose processor calls SDPA directly,
-  e.g. SD3's ``JointAttnProcessor2_0``): replace the attention processor with
-  :class:`SPAttentionProcessor` (port of mmrl), which does the per-stream
-  all-to-all itself.
-
-Built on VeOmni primitives + the folded mesh (no sp_size grad compensation;
-docs/usp-derisk/sp_fsdp.py). v1 requires each stream's sequence divisible by
-sp_size (no padding — full attention can't tolerate unmasked padding).
-Validated: qwen-image (dispatch) relerr 2e-7.
-"""
+"""Ulysses SP for diffusers transformers."""
 
 from __future__ import annotations
 
@@ -38,8 +14,7 @@ logger = logging.getLogger(__name__)
 
 
 class _SP(NamedTuple):
-    """Named VeOmni SP handles (see :func:`_sp`) -- attribute access instead of
-    positional unpacking, so call sites read ``sp.slice_input_tensor`` not ``_, _, _``."""
+    """Named VeOmni SP handles — attribute access instead of positional unpacking at call sites."""
 
     get_parallel_state: Callable
     slice_input_tensor: Callable
@@ -101,15 +76,7 @@ def _make_ulysses_dispatch(orig_dispatch: Callable) -> Callable:
 
 
 def _patch_attention_dispatch(model: nn.Module) -> bool:
-    """Wrap the model module's ``dispatch_attention_fn`` with the Ulysses all-to-all.
-
-    Newer diffusers transformers route EVERY attention call through a single
-    module-level ``dispatch_attention_fn(q, k, v, ...)`` indirection, so replacing
-    that one global intercepts all attention in the model without touching any
-    submodule. Returns False if the model's module has no such global (older models,
-    e.g. SD3 -> caller falls back to processor injection). Idempotent via the
-    ``_unirl_sp_patched`` flag on the wrapper.
-    """
+    """Wrap the model module's ``dispatch_attention_fn`` with the Ulysses all-to-all."""
     module = sys.modules.get(type(model).__module__)
     if module is None or not hasattr(module, "dispatch_attention_fn"):
         return False
@@ -120,8 +87,7 @@ def _patch_attention_dispatch(model: nn.Module) -> bool:
 
 
 def apply_rotary_emb(x: Tensor, freqs_cis: tuple[Tensor, Tensor]) -> Tensor:
-    """RoPE for diffusers Q/K, ``(B, S, H, D_h)``. Flux: cos/sin ``(S, D_h)`` (2D);
-    Wan: ``(1, S, 1, D_h)`` (4D interleaved). Ported from mmrl."""
+    """RoPE for diffusers Q/K, ``(B, S, H, D_h)``."""
     cos, sin = freqs_cis
     cos, sin = cos.to(x.device), sin.to(x.device)
     if cos.ndim == 2:
@@ -145,12 +111,7 @@ def _sdpa(q: Tensor, k: Tensor, v: Tensor, scale: float, attn_mask: Tensor | Non
 
 
 class SPAttentionProcessor:
-    """SP-aware diffusers attention processor (Ulysses), port of mmrl.
-
-    dual-stream joint (``add_q_proj``): all-to-all each [encoder, image] stream,
-    re-cat in the original processor's order, attend, inverse; cross-attention:
-    skip all-to-all; self-attention: full all-to-all.
-    """
+    """SP-aware diffusers attention processor (Ulysses), port of mmrl."""
 
     def __init__(self, sp_group: Any, original_processor: Any = None):
         self.sp_group = sp_group
@@ -197,8 +158,7 @@ class SPAttentionProcessor:
         return self._single_stream_attend(attn, query, key, value, is_cross, scale, attention_mask, b, inner)
 
     def _project_qkv(self, attn, hidden_states, kv_in, b):
-        """Project Q/K/V and apply QK-norm before or after the head-reshape, matching the
-        processor's ``normalized_shape`` (``(inner,)`` -> before view, ``(hd,)`` -> after)."""
+        """Project Q/K/V and apply QK-norm before or after the head-reshape, matching ``normalized_shape``."""
         query = attn.to_q(hidden_states)
         key, value = attn.to_k(kv_in), attn.to_v(kv_in)
         inner = query.shape[-1]
@@ -236,9 +196,7 @@ class SPAttentionProcessor:
         return torch.cat([enc_q, query], 1), torch.cat([enc_k, key], 1), torch.cat([enc_v, value], 1)
 
     def _dual_stream_attend(self, attn, query, key, value, enc_len, scale, attention_mask, b, inner):
-        """Joint streams [encoder|image] (or [image|encoder] for JointAttnProcessor2_0):
-        split, all-to-all each stream, attend over the joint set in the processor's order,
-        invert, split back into image/encoder outputs."""
+        """Joint streams: split, all-to-all each, attend in the processor's order, invert, then split back."""
         encoder_first = type(self.original_processor).__name__ != "JointAttnProcessor2_0"
         enc_q, img_q = query[:, :enc_len], query[:, enc_len:]
         enc_k, img_k = key[:, :enc_len], key[:, enc_len:]
@@ -297,16 +255,7 @@ def inject_sp_processors(model: nn.Module, sp_group: Any) -> int:
 
 
 def _assert_seq_divisible(length: int, sp_size: int, what: str) -> None:
-    """Fail fast if a to-be-sharded stream length is not a multiple of ``sp_size``.
-
-    Diffusion SP v1 shards the sequence with no padded/masked attention path:
-    ``slice_input_tensor`` zero-pads a non-divisible sequence on the right, and full
-    (non-causal) joint attention then attends to that pad, silently corrupting every
-    real token's output (the post-gather truncation at ``norm_out`` cannot undo it).
-    Refuse instead of corrupting. The *text/encoder* stream is the usual offender
-    (SD3's fixed 77+256=333; qwen-image's variable prompt length); keeping it
-    un-sharded is the planned latent-only-sharding follow-up.
-    """
+    """Fail fast if a to-be-sharded stream length is not a multiple of ``sp_size``."""
     if length % sp_size != 0:
         raise ValueError(
             f"diffusion SP: {what} length {length} is not divisible by sp_size={sp_size}. "
@@ -319,10 +268,7 @@ def _assert_seq_divisible(length: int, sp_size: int, what: str) -> None:
 def _install_boundary_hooks(
     model, sp_group, blocks_attr, norm_out_attr, rope_hook=None, rope_attr="pos_embed", slice_encoder=True
 ):
-    """Slice the image (+ optionally text) stream at the first block, gather the
-    image stream at the output norm. ``slice_encoder=False`` keeps the text full
-    (Wan cross-attention). Handles kwargs (qwen/sd3) and positional (wan) calls.
-    """
+    """Slice the image (+ optionally text) stream at the first block, gather the image stream at the output norm."""
     sp = _sp()
     get_parallel_state, slice_input_tensor, gather_outputs = (
         sp.get_parallel_state,
@@ -373,9 +319,7 @@ def _install_boundary_hooks(
 
 
 def _make_rope_slice_hook(sp_group, dim: int):
-    """Slice RoPE freqs across SP ranks (each rank keeps its stream's slice). Handles a
-    single freqs tensor or a (cos, sin)/(vid, txt) tuple. pos_embed runs full (before
-    slicing), so the freqs arriving here are full-length."""
+    """Slice RoPE freqs across SP ranks (each rank keeps its stream's slice)."""
     sp = _sp()
     get_parallel_state, slice_input_tensor = sp.get_parallel_state, sp.slice_input_tensor
 
@@ -393,11 +337,7 @@ FORWARD_WRAPPERS: Dict[str, Callable[[nn.Module, Any], None]] = {}
 
 
 def register(class_name: str) -> Callable[[Callable], Callable]:
-    """Register a per-model boundary wrapper under its diffusers class name.
-
-    Used as a decorator in ``models/<name>.py``; the populated registry is consumed by
-    :func:`apply_diffusion_sequence_parallelism`, which MRO-walks it by class name.
-    """
+    """Register a per-model boundary wrapper under its diffusers class name."""
 
     def deco(fn: Callable) -> Callable:
         FORWARD_WRAPPERS[class_name] = fn

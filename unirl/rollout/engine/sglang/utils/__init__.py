@@ -1,9 +1,4 @@
-"""Pure helpers the adapter's conversion methods call.
-
-No engine state, no runtime, no I/O — everything here unit-tests with canned
-data. The conversion *logic* lives on the base adapter (:mod:`..adapters.text`);
-these are the generic mechanics it leans on.
-"""
+"""Pure helpers the adapter's conversion methods call."""
 
 from unirl.rollout.engine.sglang.utils.conditions import pack_prompt_condition
 from unirl.rollout.engine.sglang.utils.conversations import (
@@ -12,13 +7,18 @@ from unirl.rollout.engine.sglang.utils.conversations import (
     unique_group_indices,
 )
 from unirl.rollout.engine.sglang.utils.images import pil_to_base64
-from unirl.rollout.engine.sglang.utils.sampling import ResolvedSampling, resolve_sampling
+from unirl.rollout.engine.sglang.utils.sampling import (
+    ResolvedSampling,
+    deterministic_inference_enabled,
+    resolve_sampling,
+)
 from unirl.rollout.engine.sglang.utils.thinking import split_thinking_tags
 
 __all__ = [
     "ResolvedSampling",
     "build_text_conversations",
     "build_vision_conversations",
+    "deterministic_inference_enabled",
     "pack_prompt_condition",
     "pil_to_base64",
     "resolve_sampling",

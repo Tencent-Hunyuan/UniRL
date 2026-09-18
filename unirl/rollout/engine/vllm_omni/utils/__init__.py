@@ -1,10 +1,4 @@
-"""Pure helpers the adapters' conversion steps call (role 3).
-
-No engine state, no runtime imports, no I/O — everything here unit-tests
-with canned wire data (``SimpleNamespace`` fakes of the seam's
-``OmniRawResult`` protocol). Conversion *logic* lives on the adapters'
-input/output sub-adapters; these are the mechanics they lean on.
-"""
+"""Pure helpers the adapters' conversion steps call (role 3)."""
 
 from unirl.rollout.engine.vllm_omni.utils.diff_kwargs import core_diff_kwargs, sde_extra_args
 from unirl.rollout.engine.vllm_omni.utils.noise import pack_initial_noise_extra_args

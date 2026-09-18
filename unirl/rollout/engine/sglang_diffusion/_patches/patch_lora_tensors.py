@@ -1,74 +1,4 @@
-"""Re-host the ``sglang-drl`` fork's in-memory LoRA path on stock upstream.
-
-This is the heaviest patch. The fork let the RL trainer push freshly-optimized
-LoRA tensors straight into the live ``LoRAPipeline`` (no safetensors round-trip)
-and keep them UNMERGED so the forward pass computes ``base + A@B`` on the fly --
-required because the adapter weights change every training step and a weight-sync
-overwrites the base weights underneath them.
-
-THREE-WAY DIVERGENCE (important). At the fork point ``e9b570654`` the pipeline's
-LoRA merge policy was a simple always-merge. The fork added a 2-value
-``lora_merge_mode`` (``"merge"`` = bake into base weights, ``"online"`` = compute
-on-the-fly) with ``self.auto_merge = (mode == "merge")``. INDEPENDENTLY, upstream
-evolved a *different* 3-value policy (``LORA_MERGE_MODES = ("auto","merge",
-"dynamic")``) with ``_resolve_lora_merge_mode`` / ``_should_merge_lora_for_layers``
-and ``merge_weights`` / ``merge_mode`` params threaded through ``set_lora`` ->
-``_apply_lora_to_layers`` -> ``set_lora_weights``. So the fork's ``set_lora`` body
-and upstream's are structurally incompatible -- a blanket REPLACE would destroy
-upstream's merge-mode system. We therefore re-home the fork's *semantics* onto
-upstream's plumbing rather than copying its ``set_lora``:
-
-  (a) Register ``"online"`` as a valid merge mode (extend ``LORA_MERGE_MODES``)
-      and make ``_should_merge_lora_for_layers`` treat it as no-merge. Upstream
-      then drives ``merge_weights=False`` down to ``set_lora_weights`` for the
-      RL path -- exactly what the fork's ``auto_merge=False`` did, via upstream's
-      own machinery. This is why we do NOT need to patch ``auto_merge`` onto
-      ``BaseLayerWithLoRA.__init__`` / ``wrap_with_lora_layer`` /
-      ``convert_module_lora_layers``: upstream's ``merge_weights`` plumbing (which
-      did not exist at the fork point) supersedes the fork's ``auto_merge`` flag.
-
-  (b) AROUND-wrap ``__init__`` to set ``self.lora_merge_mode`` / ``self.auto_merge``
-      and, in ``"online"`` mode with no ``lora_path``, eagerly wrap layers
-      (``convert_to_lora_layers``) so weight-sync targets exist before any LoRA
-      arrives (the fork's ``elif lora_merge_mode == "online"`` branch).
-
-  (c) ``setattr`` the fork-new ``_register_lora_state_dict`` (verbatim) and
-      ``load_lora_adapter_from_tensors`` (verbatim). We KEEP upstream's diverged
-      ``load_lora_adapter`` (it reads ``adapter_config.json`` + tracks
-      ``loaded_adapter_alphas`` + takes ``weight_name`` -- the fork lacks all
-      that); only the in-memory entry point is new.
-
-  (d) AROUND-wrap ``set_lora`` to accept ``lora_tensors=None``. When tensors are
-      supplied: register them via ``load_lora_adapter_from_tensors`` and
-      invalidate the cached per-module config (so upstream's
-      ``_check_lora_config_matches`` does not short-circuit -- LoRA weights change
-      every step and MUST be re-applied), then delegate to upstream ``set_lora``
-      with ``lora_path=None``. Upstream finds the adapter already in
-      ``self.lora_adapters`` (so its ``path is None`` guard does not raise) and
-      applies it under the resolved (online=no-merge) mode.
-
-  (e) ``setattr`` the fork-new ``handle_weight_sync`` (verbatim) -- called by
-      ``WeightsUpdater._post_update_cleanup`` (``patch_weights_updater``) after a
-      weight-sync to mark layers unmerged + refresh the ``cpu_weight`` snapshot.
-
-  (f) ``setattr`` the fork-new ``BaseLayerWithLoRA.update_base_weight_snapshot``
-      (used by ``handle_weight_sync``) and REPLACE ``LinearWithLoRA.forward`` to
-      apply the fork's two changes (drop ``@torch.compile`` -- the compiled graph
-      goes stale when online LoRA weights change every step; drop the
-      ``delta.reshape`` -- ``nn.Linear`` preserves input dims) WHILE keeping
-      upstream's dtype-casting (which did not exist at the fork point).
-
-Idempotent via sentinel guards. Import-safe (sglang imported inside the fn).
-
-RISKS / non-cleanly-rehomable pieces -- see PR notes:
-  * ``"online"`` is NOT an upstream merge mode; (a) registers it. If upstream
-    later adds its own ``"online"`` with different semantics this collides.
-  * The fork's ``auto_merge`` ctor thread is intentionally NOT ported (superseded
-    by upstream ``merge_weights``); this is a behavioural mapping, not a verbatim
-    copy. Pinned only by UniRL's own LoRA weight-sync tests.
-  * ``LinearWithLoRA.forward`` is a behavioural REPLACE that re-vendors upstream's
-    body; an upstream bump to that forward needs a re-sync.
-"""
+"""Re-host the ``sglang-drl`` fork's in-memory LoRA path on stock upstream."""
 
 from __future__ import annotations
 
@@ -139,15 +69,7 @@ def patch_lora_tensors() -> None:
             rank: int,
             adapter_alpha=None,
         ) -> None:
-            """Shared logic: normalize names, merge fused params, store in lora_adapters.
-
-            ``adapter_alpha`` (optional) is one alpha for the whole adapter, stored
-            once under ``_ADAPTER_ALPHA_KEY`` and consumed by the fork's
-            ``_apply_lora_to_layers`` as the scale (alpha / rank) for every layer.
-            This is the rename-robust path: unlike a per-layer ``<layer>.alpha`` key
-            (whose name must survive param-renaming to line up with its weight), one
-            adapter-level value needs no name alignment at all.
-            """
+            """Shared logic: normalize names, merge fused params, store in lora_adapters."""
             if lora_nickname in self.lora_adapters:
                 self.lora_adapters[lora_nickname].clear()
 
@@ -200,18 +122,7 @@ def patch_lora_tensors() -> None:
             self._register_lora_state_dict(lora_state_dict, lora_nickname, None, rank, adapter_alpha=adapter_alpha)
 
         def handle_weight_sync(self, updated_module_names: set) -> None:
-            """Handle LoRA state after ALL weight sync buckets have been applied.
-
-            Called once after all buckets/dtypes are done (gated by flush_cache in
-            the weight updater). At this point base_layer.weight, lora_A, and
-            lora_B have all been overwritten by the sync with new raw values.
-
-            We must NOT unmerge (that would restore OLD base from cpu_weight,
-            overwriting the new sync values). Instead:
-            1. Mark layers as unmerged (weight sync replaced merged weights with raw)
-            2. Refresh cpu_weight snapshot from the new raw base weights
-            3. Leave LoRA unmerged — forward computes LoRA on-the-fly
-            """
+            """Handle LoRA state after ALL weight sync buckets have been applied."""
             if not self.lora_initialized:
                 return
 
@@ -265,18 +176,7 @@ def patch_lora_tensors() -> None:
             lora_tensors=None,
             lora_alpha=None,
         ):
-            """Upstream ``set_lora`` + a fork ``lora_tensors=`` in-memory branch.
-
-            When ``lora_tensors`` is given (RL weight-sync path), register the
-            tensors as ``lora_nickname`` and invalidate the cached per-module
-            config so upstream re-applies them (LoRA weights change every step),
-            then delegate to upstream ``set_lora`` with ``lora_path=None``.
-            Otherwise behaviour is byte-for-byte upstream.
-
-            ``lora_alpha`` (optional) is the adapter-level alpha for the in-memory
-            path; it is stored once per adapter and used as the scale source by
-            ``_apply_lora_to_layers``. ``None`` leaves the scale at alpha == rank.
-            """
+            """Upstream ``set_lora`` + a fork ``lora_tensors=`` in-memory branch."""
             if lora_tensors is not None:
                 rank = self._distributed_rank()
                 nickname = lora_nickname[0] if isinstance(lora_nickname, list) else lora_nickname
@@ -341,14 +241,7 @@ def patch_lora_tensors() -> None:
 
 
 def _patch_lora_linear() -> None:
-    """Port the fork's ``layers/lora/linear.py`` changes onto upstream.
-
-    Two pieces:
-      * ``BaseLayerWithLoRA.update_base_weight_snapshot`` (fork-new; used by
-        ``handle_weight_sync``) -- additive setattr.
-      * ``LinearWithLoRA.forward`` -- behavioural REPLACE re-vendoring upstream's
-        body minus ``@torch.compile`` and minus the ``delta.reshape``.
-    """
+    """Port the fork's ``layers/lora/linear.py`` changes onto upstream."""
     import sglang.multimodal_gen.runtime.layers.lora.linear as ll
     import torch
     from torch.distributed.tensor import DTensor

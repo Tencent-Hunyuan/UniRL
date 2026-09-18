@@ -1,22 +1,4 @@
-"""Weight sync — the canonical sync ops + LoRA lifecycle, owned by one component.
-
-``WeightSync`` is a plain object the engine constructs over the seam: it takes the
-backend and the LoRA spec explicitly and owns all sync/LoRA state
-(``_lora_loaded`` / ``_active_adapter``). Method names mirror
-the frozen ``synchronous.py`` surface minus ``track_prefix`` (the engine's forwards absorb
-that, along with the per-worker ``Worker.call`` dispatch concern), so a grep for a
-trainer-side entry point lands here.
-
-The transports declared are exactly what SGLang supports: tensor-bag, NCCL
-(init/transfer/destroy), LoRA-from-tensors, and the checksum query. There is no
-IPC method — the engine simply doesn't define ``update_weights_from_ipc``, so it
-inherits ``BaseRolloutEngine``'s ``NotImplementedError`` (SGLang has no IPC
-receiver).
-
-The "weights released" event: the engine's ``sleep()`` calls
-:meth:`mark_weights_released` after releasing memory (the released tags include the
-transformer weights), so ``lora_dirty`` flips and the next sync re-pushes.
-"""
+"""Weight sync — the canonical sync ops + LoRA lifecycle, owned by one component."""
 
 from __future__ import annotations
 
@@ -116,16 +98,7 @@ class WeightSync:
         *,
         peft_config: Optional[dict] = None,
     ) -> None:
-        """Push a LoRA adapter from in-memory tensors.
-
-        The nickname is ``adapter_name`` verbatim on every push: SGLang's
-        diffusion ``_register_lora_state_dict`` clears and replaces the registry
-        entry for a re-used nickname and ``set_lora`` always reloads from
-        tensors, so same-name pushes serve fresh weights. Versioned nicknames
-        (the ``sglang`` rotation) leak here instead — the diffusion
-        ``lora_adapters`` registry never evicts other nicknames, so each sync
-        would strand one GPU-resident adapter copy (~34 MB/sync measured).
-        """
+        """Push a LoRA adapter from in-memory tensors."""
         stripped = adapt_lora_for_sglang(
             lora_tensors,
             pipeline_prefix=self._pipeline_prefix,

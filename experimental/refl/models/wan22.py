@@ -106,18 +106,7 @@ class Wan22ReflDiffusionStage(WAN22DiffusionStage):
         dtype: torch.dtype = torch.float32,
         base_seed: Optional[int] = None,
     ) -> torch.Tensor:
-        """
-        High-level function for generating initial latents.
-
-        Args:
-            batch_size: Total number of samples
-            latent_shape: Shape of a single latent (C, H, W) or (C, T, H, W)
-            device: Device for the tensor
-            dtype: Data type for the tensor
-
-        Returns:
-            Latent tensor [batch_size, *latent_shape]
-        """
+        """High-level function for generating initial latents."""
         if base_seed is not None:
             generator = torch.Generator(device=device)
             generator.manual_seed(int(base_seed) % (MAX_TORCH_SEED + 1))
@@ -143,11 +132,7 @@ class Wan22ReflDiffusionStage(WAN22DiffusionStage):
         params: DiffusionSamplingParams,
         initial_latents: Optional[torch.Tensor] = None,
     ) -> DiffuseWithGradResult:
-        """Differentiable WAN 2.2 sampling for REFL-style BPTT training.
-
-        Returns :class:`DiffuseWithGradResult` with the live-grad
-        ``z_final`` + per-sample ``kl_loss`` ``[B]``.
-        """
+        """Differentiable WAN 2.2 sampling for REFL-style BPTT training."""
 
         if conditions.text is None or conditions.text.embeds is None:
             raise ValueError("Wan22ReflDiffusionStage.diffuse_with_grad: conditions.text.embeds is None")
@@ -340,15 +325,7 @@ class Wan22ReflPipeline(WAN22Pipeline):
         images: Optional[Images] = None,
         params: DiffusionSamplingParams,
     ) -> WAN21Conditions:
-        """Full REFL conditioning: text + CFG negative + optional I2V image.
-
-        Mirrors the condition assembly of :meth:`WAN22Pipeline.generate` —
-        the negative branch is encoded against the **effective** guidance
-        ``max(guidance_scale, guidance_scale_2)`` (WAN22 routes CFG by sigma
-        across the low/high-noise DiTs), and image slots are attached with
-        the diffusion geometry from ``params``. An explicit negative prompt
-        rides ``params.sampler_kwargs['negative_prompt']``.
-        """
+        """Full REFL conditioning: text + CFG negative + optional I2V image."""
         primary_g = float(params.guidance_scale)
         low_g = float(params.guidance_scale_2) if params.guidance_scale_2 is not None else primary_g
         effective_guidance = max(primary_g, low_g)
@@ -361,10 +338,9 @@ class Wan22ReflPipeline(WAN22Pipeline):
         conds = self.build_conditions(texts, negatives=negatives, guidance_scale=effective_guidance)
 
         if images is not None:
-            if images.pixels is None or int(images.pixels.shape[0]) != len(texts.texts):
+            if len(images) != len(texts.texts):
                 raise ValueError(
-                    f"Wan22ReflPipeline.build_refl_conditions: image count "
-                    f"{None if images.pixels is None else int(images.pixels.shape[0])} "
+                    f"Wan22ReflPipeline.build_refl_conditions: image count {len(images)} "
                     f"!= text count {len(texts.texts)}"
                 )
             image_latent = WAN21ImageLatentEncodeStage(

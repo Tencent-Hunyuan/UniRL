@@ -1,31 +1,4 @@
-"""Driver-authoritative ``initial_noise`` batch expansion + packed-latents
-parity for the provided-latents branch (gap #3 / packed-model gap, LIN-365).
-
-UniRL's NoiseRecipe (#208) makes x_T driver-authoritative; the engine
-ships it as ``batch.latents`` (via ``patch_sampling_io`` -> ``Req.latents``).
-Stock upstream ``LatentPreparationStage.forward`` handles provided latents with
-just ``latents = latents.to(device)`` -- it does NOT (a) expand a ``[1, ...]``
-or ``[num_prompts, ...]`` tensor to the per-sample ``[batch_size, ...]``, NOR
-(b) run the packing / latent-ids prep that the randn branch performs via
-``pipeline_config.maybe_pack_latents`` and ``maybe_prepare_latent_ids``.
-
-The fork did both. Without (a), a group-shared or single-seed initial noise
-crashes or mis-shapes the rollout. Without (b), packed models (FLUX.2-Klein /
-M3) leave ``batch.latent_ids = None``, and ``DenoisingStage._prepare_denoising_loop
--> Flux2PipelineConfig.prepare_pos_cond_kwargs -> get_freqs_cis`` then dies on
-``batch.latent_ids.ndim`` (AttributeError: NoneType). The randn branch in
-upstream does exactly the right thing: order is
-``maybe_prepare_latent_ids(unpacked) -> set batch.latent_ids -> maybe_pack_latents``,
-and we mirror that here for the provided-latents path.
-
-This REPLACES ``forward``'s provided-latents branch and delegates the
-``latents is None`` (randn) branch back to upstream's ``forward``. Pure SD3
-remains a no-op because SD3's ``maybe_prepare_latent_ids`` returns ``None`` and
-``maybe_pack_latents`` returns the latents unchanged. The grouped path
-(``run_grouped_requests``) already delegates to ``forward`` per-batch whenever
-any ``batch.latents is not None``, so wrapping ``forward`` alone covers
-rollout-with-initial_noise on both the single and grouped paths.
-"""
+"""Expand driver ``initial_noise`` from ``[1, ...]`` to per-sample ``[batch_size, ...]`` and pack the latents."""
 
 from __future__ import annotations
 
@@ -41,12 +14,7 @@ _DEBUG = os.environ.get("UNIRL_DEBUG_LATENT_SHAPE") == "1"
 
 
 def _expand_initial_noise(latents: torch.Tensor, batch_size: int, num_outputs_per_prompt: int) -> torch.Tensor:
-    """Expand provided initial noise to ``batch_size`` (fork's rule).
-
-    shape[0] == 1            -> broadcast to all samples
-    shape[0] == num_prompts  -> repeat_interleave per num_outputs_per_prompt
-    shape[0] == batch_size   -> use as-is
-    """
+    """Expand provided initial noise to ``batch_size`` (fork's rule)."""
     n = int(latents.shape[0])
     if n == batch_size:
         return latents
@@ -128,18 +96,7 @@ def patch_latent_prep() -> None:
 
 
 def _patch_grouped_initial_noise_slice() -> None:
-    """Slice driver ``initial_noise`` per output index in the grouped forward.
-
-    The scheduler expands a ``num_outputs_per_prompt=K`` request into K per-output
-    Reqs (worker grouped path, ``GPUWorker._execute_forward_batch(batch: list[Req])``),
-    but each carries the FULL driver noise ``[K, ...]`` rather than its own
-    ``[i:i+1]`` slice -- so ``LatentPreparationStage`` sees ``batch_size=1`` with
-    ``initial_noise`` dim K and raises. (The fork ran the whole group as one
-    ``batch_size=K`` forward, so ``[K]`` matched.) Slice each per-output Req's
-    latents to its index right before the grouped forward; the i-th expanded Req
-    is the i-th output (scheduler expands in ``range(nopp)`` order), and the driver
-    ships noise in sample order, so position i -> ``noise[i]``.
-    """
+    """Slice the full driver noise ``[K, ...]`` to each per-output Req's own ``[i:i+1]`` in the grouped forward."""
     from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 
     orig = GPUWorker.__dict__.get("_execute_forward_batch")

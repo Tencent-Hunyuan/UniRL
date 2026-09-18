@@ -1,23 +1,11 @@
-"""Composed rollout-engine configuration.
-
-Registered under ``rollout/engine: composed_pe`` with ``_target_`` pointing at
-:class:`ComposedRolloutEngine`. The composed engine holds two child engines
-(``ar`` and ``diffusion``) and orchestrates the prompt-enhancement (PE)
-serial flow internally — it is a peer of the existing ``sglang``,
-``sglang``, ``vllm_omni``, and ``trainside`` engines as far as the
-actor / pipeline layer is concerned.
-
-Each child (``ar`` / ``diffusion``) is a rollout engine config carrying its
-own ``_target_``; the worker walker constructs it from the recipe and
-``ComposedRolloutEngine`` builds the engine via ``config.<child>.make_engine``.
-"""
+"""Composed rollout-engine configuration."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from unirl.rollout.engine.synchronous import BaseEngineConfig
+from unirl.rollout.engine.base import BaseEngineConfig
 
 
 @dataclass

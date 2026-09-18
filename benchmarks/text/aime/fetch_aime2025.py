@@ -1,9 +1,4 @@
-"""Fetch AIME 2025 into ``data/aime2025.jsonl``.
-
-AIME 2024 (MIT-tagged upstream) is vendored next to this script; the AIME 2025
-dataset card (yentinglin/aime_2025) declares no license, so that file is fetched
-on demand instead of being committed: ``python benchmarks/text/aime/fetch_aime2025.py``.
-"""
+"""Fetch AIME 2025 into ``data/aime2025.jsonl``."""
 
 from __future__ import annotations
 

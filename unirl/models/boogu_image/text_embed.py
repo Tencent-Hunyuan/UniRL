@@ -1,31 +1,4 @@
-"""BooguImageTextEmbedStage — Qwen3-VL chat-template text → TextEmbedCondition.
-
-Implements ``EmbedStage[Texts, TextEmbedCondition]``. Mirrors the reference
-``BooguImagePipeline._get_instruction_feature_embeds`` /
-``_apply_chat_template`` (T2I path, no images) at the spec level:
-
-- **Single multimodal LLM encoder** (the lm_head-stripped ``Qwen3VLModel``
-  from the checkpoint's ``mllm/`` subfolder). Each prompt becomes a chat
-  message list ``[system, user(text)]`` and the paired ``Qwen3VLProcessor``
-  templates + tokenizes it in one ``apply_chat_template`` call
-  (``padding="longest"``, ``padding_side="right"``, truncation off — the
-  reference passes ``truncate_instruction_sequence=False``).
-- **Adaptive system prompt** (reference ``_apply_chat_template`` with its
-  ``system_prompt_follows_task_type=False`` default): a non-empty prompt
-  gets the fixed T2I system prompt; an **empty/whitespace prompt — which is
-  exactly what the CFG negative ``""`` is — gets the DROP system prompt**
-  ("dataset logic"). Reproducing this switch is required for CFG parity
-  with the reference pipeline.
-- **Last hidden layer, full sequence, no repacking** (unlike z_image's
-  pad-drop repack and qwen_image's fixed-prefix strip): the checkpoint's
-  ``instruction_feature_configs`` selects 1 layer with mean-reduce ==
-  identity, and the transformer consumes the right-padded embeds plus the
-  processor's attention mask directly (its ``rope_embedder`` /
-  context-refiner run variable-length attention off that mask).
-
-No ``pooled`` vector is produced — the DiT accepts token-level hidden
-states only. ``TextEmbedCondition.pooled`` is left as ``None``.
-"""
+"""BooguImageTextEmbedStage — Qwen3-VL chat-template text → TextEmbedCondition."""
 
 from __future__ import annotations
 
@@ -75,12 +48,7 @@ class BooguImageTextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
 
     @staticmethod
     def _messages(prompt: str) -> List[dict]:
-        """Build the reference chat-message list for one T2I prompt.
-
-        Empty/whitespace prompts (the CFG negative ``""``) switch to the
-        DROP system prompt, mirroring the reference adaptive branch
-        (``_apply_chat_template``, pipeline_boogu.py:1594-1612).
-        """
+        """Build the reference chat-message list for one T2I prompt."""
         system_prompt = SYSTEM_PROMPT_T2I if prompt and prompt.strip() else SYSTEM_PROMPT_DROP
         return [
             {"role": "system", "content": [{"type": "text", "text": system_prompt}]},

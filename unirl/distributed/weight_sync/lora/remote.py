@@ -1,21 +1,4 @@
-"""Cross-process LoRA weight-sync: rank-0 Ray push to non-sibling engines.
-
-For any layout where the engine lives on a different Worker than the FSDP backend
-— ``DiffusionTrainer`` separate slabs (one engine, possibly DP-replicated) and
-HI3's two-engine trainer (AR + DiT on a disjoint GPU partition). Cross-slab
-``HandleRef`` resolution raises, so the driver hands rank 0 the rollout Workers'
-actor handles once (:meth:`set_rollout_targets`, like ``NCCLWeightSync``); then
-:meth:`sync` (or the :meth:`extract` / :meth:`push` phases) gathers the adapter (a
-train-mesh collective) and, on rank 0, pushes it to each engine via a plain Ray RPC
-onto the engine's ``set_lora_from_tensors``. The adapter payload and the push
-transport never leave the handler.
-
-The extract gathers the full FSDP model (``state_dict()``), so a colocate trainer
-whose engines share the cards (HI3) must split :meth:`extract` (run while the
-engines are asleep, base onloaded) from :meth:`push` (run after offloading the base
-and waking the engines); :meth:`sync` fuses both for separate slabs where there is
-no contention. This handler does NO memory management — the trainer owns it.
-"""
+"""Cross-process LoRA weight-sync: rank-0 Ray push to non-sibling engines."""
 
 from __future__ import annotations
 
@@ -29,14 +12,7 @@ logger = logging.getLogger(__name__)
 
 
 class RemoteLoraWeightSync(LoraWeightSyncBase):
-    """Cross-process LoRA push to engine(s) that are NOT same-Worker siblings.
-
-    ``copy=True`` routes the push through the engine's byte-copy receiver
-    (``set_lora_from_tensors_copy``), required for TP>1 stages where the zero-copy
-    handle's one-shot ``file_descriptor`` breaks the ``collective_rpc`` broadcast to
-    ranks 2..N (HI3); leave it False for TP=1 engines (SD3 separate slabs).
-    ``verify`` (``loaded_lora_checksums`` read-back) is vLLM-Omni-only.
-    """
+    """Cross-process LoRA push to engine(s) that are NOT same-Worker siblings."""
 
     def __init__(
         self,
@@ -61,48 +37,22 @@ class RemoteLoraWeightSync(LoraWeightSyncBase):
 
     @distributed(dispatch_mode=Dispatch.BROADCAST, execute_mode=Execute.RANK_ZERO)
     def set_rollout_targets(self, targets: List[tuple]) -> None:
-        """Rank 0 caches the rollout engines' ``(role_name, worker_handles)`` pairs.
-
-        Handles are plain picklable Ray actor handles (NOT a cross-slab
-        ``HandleRef``), so they survive the ``Worker.call`` arg path. One pair for a
-        single-engine trainer (separate slabs); two for HI3 (AR + DiT). Mirrors
-        ``NCCLWeightSync.set_rollout_targets``; only rank 0 pushes in ``push``.
-        """
+        """Rank 0 caches the rollout engines' ``(role_name, worker_handles)`` pairs."""
         self._targets = [(str(role), list(workers)) for role, workers in targets]
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def extract(self) -> None:
-        """Gather the trained LoRA adapter and cache it on rank 0 (returns nothing).
-
-        Runs on every train rank (``BROADCAST``): the extract is a train-mesh
-        collective whose ``state_dict()`` gathers the full FSDP model to GPU, so a
-        memory-constrained colocate trainer (HI3) MUST call this while its engines
-        are asleep (base onloaded). The adapter stays inside the handler — cached on
-        rank 0 for the matching :meth:`push`. Separate-slab trainers can just call
-        :meth:`sync`.
-        """
+        """Gather the trained LoRA adapter and cache it on rank 0 (returns nothing)."""
         self._extract_to_cache()
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def push(self) -> None:
-        """Ship the adapter cached by :meth:`extract` to every rollout engine.
-
-        Rank 0 only (ranks >= 1 no-op): pushes the (full, CPU) adapter to each engine
-        Worker via a plain Ray RPC onto ``set_lora_from_tensors`` (or
-        ``set_lora_from_tensors_copy`` when ``copy``). PRECONDITION: the engines are
-        awake (the trainer wakes them after offloading the base).
-        """
+        """Ship the adapter cached by :meth:`extract` to every rollout engine."""
         self._push_from_cache()
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def sync(self) -> None:
-        """:meth:`extract` + :meth:`push` in one dispatch — for the no-dance case.
-
-        Use this when the engines can stay awake during the extract (separate slabs:
-        train + rollout are on different GPUs, no memory contention). Colocate /
-        memory-constrained trainers must split into :meth:`extract` / :meth:`push`
-        around their own base-offload + engine-wake.
-        """
+        """:meth:`extract` + :meth:`push` in one dispatch — for the no-dance case."""
         self._extract_to_cache()
         self._push_from_cache()
 
@@ -146,11 +96,7 @@ class RemoteLoraWeightSync(LoraWeightSyncBase):
             self._verify_loaded(lora_tensors, peft_config)
 
     def _verify_loaded(self, lora_tensors, peft_config) -> None:
-        """Assert each rollout engine's loaded LoRA matches what we just pushed.
-
-        Queried cross-slab via ``loaded_lora_checksums`` on each target Worker.
-        vLLM-Omni-only (SGLang has no ``loaded_lora_checksums``).
-        """
+        """Assert each rollout engine's loaded LoRA matches what we just pushed."""
         import ray
 
         from unirl.distributed.weight_sync.transfer.ipc_dispatch import (

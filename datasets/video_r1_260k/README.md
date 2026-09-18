@@ -1,13 +1,15 @@
-# Video-R1-260k Video MCQA RL Dataset
+# Video-R1-260k Image/Video MCQA RL Dataset
 
-Video-only multiple-choice QA prompts for RL training of Qwen3-Omni Thinker (no audio
-conditioning). Each sample is one video plus a 4-way A/B/C/D question answered in
-`<answer>X</answer>` form.
+Image or video multiple-choice QA prompts for RL training of Qwen3-Omni Thinker (no audio
+conditioning). Each sample contains exactly one image or one video plus a 4-way A/B/C/D
+question answered in `<answer>X</answer>` form. The source annotation interleaves image and
+video rows; it does not attach both modalities to the same sample.
 
 Used by:
 
 - `examples/ar/qwen3_omni_video_r1_gspo_lora_vllm_omni_1x8.yaml`
 - `examples/ar/qwen3_omni_video_r1_gspo_lora_vllm_omni_1x4.yaml`
+- `examples/ar/qwen3_omni_image_video_r1_gspo_lora_vllm_omni_1x4.yaml`
 
 ## Source
 
@@ -92,14 +94,28 @@ non-multiple-choice rows, and option prefixes are inconsistent across sources (`
 python datasets/video_r1_260k/convert_video_r1_260k_to_unirl.py \
   --data-root "$ROOT" \
   --out-dir datasets/video_r1_260k \
+  --modality video \
   --sources CLEVRER,STAR,NeXT-QA,PerceptionTest \
   --max-total 20000 --val-count 200
 ```
 
-Useful flags: `--max-per-source` caps each folder (keeps a big source from dominating),
-`--seed` fixes the shuffle so the train/val split is reproducible, `--keep-missing` emits rows
-whose MP4 is not on disk yet. The script prints kept/missing counts per source; if everything
-lands under `missing:`, the zips are not extracted yet.
+To cook the image subset:
+
+```bash
+python datasets/video_r1_260k/convert_video_r1_260k_to_unirl.py \
+  --data-root "$ROOT" \
+  --out-dir datasets/video_r1_260k_image \
+  --modality image \
+  --sources Chart,General,Knowledge,Math,OCR,Spatial \
+  --val-count 1000
+```
+
+`--modality all` emits a heterogeneous dataset whose rows may alternate between image and
+video, while each row still carries exactly one media reference. Useful flags:
+`--max-per-source` caps each folder (keeps a big source from dominating), `--seed` fixes the
+shuffle so the train/val split is reproducible, and `--keep-missing` emits rows whose media
+file is not on disk yet. The script prints kept/missing counts per source; if everything lands
+under `missing:`, the zips are not extracted yet.
 
 ## Format
 
@@ -109,25 +125,25 @@ Each output line:
 {
   "prompt": "What happens after the green cube collides with the sphere?\nA) ...\nB) ...\nC) ...\nD) ...\nFirst reason step by step about which option is correct. Then output the final answer letter (A, B, C, or D) on its own in the exact format:\n<answer>X</answer>",
   "prompt_id": "video_r1_260k:CLEVRER:42",
-  "media_refs": [{"modality": "video", "role": "prompt", "uri": "/abs/path/video_00042.mp4"}],
+  "media_refs": [{"modality": "image", "role": "prompt", "uri": "/abs/path/figure.jpg"}],
   "metadata": {"answer": "D"}
 }
 ```
 
 ## Why cook it this way
 
-- **Video multiple-choice rows only.** The converter keeps `data_type == "video"` and
-  `problem_type == "multiple choice"`, dropping ~57% of the file. Both filters are hard
-  requirements, not preferences:
-  - `MultimodalRLDataSource` accepts `(image, condition)`, `(video, condition)` and
-    `(video, prompt)` and raises `NotImplementedError` on anything else. Image rows would need
-    `(image, condition)`, which is the diffusion I2V path, not an AR prompt image — and a batch
-    may not mix condition and prompt media anyway.
+- **Image/video multiple-choice rows.** `--modality image` keeps image rows,
+  `--modality video` keeps video rows, and `--modality all` keeps both. Image and video are
+  represented as `(image, prompt)` and `(video, prompt)` MediaRefs respectively. The
+  conversation builder inserts the corresponding media block into the user turn, and
+  heterogeneous batches can contain image-only and video-only samples together.
+- **A-D multiple choice only.** `problem_type` must be `multiple choice`, and the converter
+  validates that `solution` resolves to A, B, C, or D:
   - `MCExactMatchRewardScorer` only compares A–D letters. Free-form, numerical, OCR and
     regression rows would score 0.0 forever under it.
-- **`role: "prompt"`, not `"condition"`.** `(video, condition)` decodes the clip into a frame
-  tensor for diffusion V2V; `(video, prompt)` hands the URI to the Qwen3-Omni conversation
-  builder, which is what an AR prompt video needs.
+- **`role: "prompt"`, not `"condition"`.** Prompt media is consumed by the Qwen3-Omni
+  conversation builder for AR reasoning. `condition` is reserved for diffusion generation
+  paths and is not appropriate for these QA rows.
 - **The `<answer>X</answer>` instruction is appended to every prompt.** The 1x4 recipe uses
   strict `require_answer_tag: true`; the 1x8 recipe uses `graded_format_reward: true`, which
   gives 1.0 for a correct tag and 0.5 for a correct answer in another recognized format.
@@ -167,6 +183,72 @@ EVAL_DATA_PATH=datasets/video_r1_260k/val.jsonl \
 ENTRY=train_ar bash examples/run_experiment_single_node.sh \
   ar/qwen3_omni_video_r1_gspo_lora_vllm_omni_1x8
 ```
+
+For an image-only dataset cooked into `datasets/video_r1_260k_image`:
+
+```bash
+QWEN3_OMNI_PATH=/path/to/Qwen3-Omni-30B-A3B-Instruct \
+DATA_PATH=datasets/video_r1_260k_image/train.jsonl \
+EVAL_DATA_PATH=datasets/video_r1_260k_image/val.jsonl \
+PYTHONPATH=$(pwd) python -m unirl.train_ar \
+  --config-name=ar/qwen3_omni_image_video_r1_gspo_lora_vllm_omni_1x4
+```
+
+## Recommended: pre-filter all-zero-reward groups
+
+GRPO/GSPO advantages are group-normalized (`Part.compute_advantages`, `scope="group"`):
+
+```
+adv_i = (r_i - mean(r_group)) / (std(r_group) + 1e-8)
+```
+
+When every sample in a group scores the same, `r_i - mean = 0` and the advantage is
+**exactly 0** — with or without `normalize_adv_by_std`. That group still costs a full rollout
+(8 samples × up to 64 decoded frames through the vision tower, plus up to 8k generated tokens)
+and contributes no gradient. Two cases produce it:
+
+- **all-zero groups** — the question is beyond the model, or it never emits a well-formed
+  `<answer>X</answer>` tag;
+- **all-one groups** — the question is saturated and there is nothing left to learn.
+
+UniRL has no DAPO-style dynamic sampling: nothing resamples or skips these at runtime. It only
+*reports* them, as `rollout/zero_std_group_ratio` and `rollout/zero_std_group_count` in W&B.
+Watch those first; if the ratio is high, filter offline.
+
+The procedure: roll out K samples per prompt with **the exact model you are about to train**
+(same checkpoint/adapter, same prompt text, same `temperature`/`top_p`/`max_new_tokens` as the
+`sampling:` block), score them with the same `MCExactMatchSpec` settings the recipe uses, and
+drop prompts whose K rewards are all identical.
+
+```python
+import json
+
+K_LO, K_HI = 1, 7   # keep prompts with 1..7 correct out of K=8
+keep = {pid for pid, rs in json.load(open("passrate.json")).items() if K_LO <= sum(rs) <= K_HI}
+
+with open("train.jsonl", encoding="utf-8") as src, \
+     open("train.filtered.jsonl", "w", encoding="utf-8") as dst:
+    for line in src:
+        if json.loads(line)["prompt_id"] in keep:
+            dst.write(line)
+```
+
+This dataset is the right place to be aggressive about it: with 20k+ candidate prompts you can
+afford to drop both tails and still have plenty of rows, and the per-prompt cost of a wasted
+video rollout is high. Two things to keep in mind:
+
+- Score with the *same* reward config as training. A prompt looks all-zero under
+  `require_answer_tag: true` (1x4) while being half-correct under `graded_format_reward: true`
+  (1x8), since the latter still pays 0.5 for an untagged correct answer. Filtering with the
+  wrong scorer throws away learnable prompts.
+- The filter is a snapshot of one checkpoint. Previously all-zero prompts become learnable as
+  the policy improves and mixed ones saturate, so re-estimate every few hundred rollouts, or
+  keep a held-out slice of the discarded hard prompts to re-admit later.
+
+Cheaper variants when a full K-sample pass is too expensive: filter on a smaller K (K=4 already
+separates the tails well), estimate pass rates on a random subsample and drop whole sources
+whose accuracy is pinned at 0 or 1, or use `--max-per-source` to rebalance instead of filtering
+per prompt.
 
 ## Notes
 

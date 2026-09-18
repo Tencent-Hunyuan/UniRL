@@ -156,8 +156,7 @@ data_source:
 sampling:
   _target_: unirl.models.bagel.diffusion.BagelDiffusionParams
   num_inference_steps: 14              # STEPS (σ schedule = steps+1 = 15 points; == old 15-point bagel schedule, 14 stepped)
-  guidance_scale: 1.0                  # cfg=1 (bagel uses cfg_text_scale below; kept consistent)
-  cfg_text_scale: 1.0                  # cfg=1 → single-forward "No CFG" path in _forward_flow
+  guidance_scale: 1.0                  # cfg=1 → single-forward "No CFG" path in _forward_flow
   cfg_img_scale: 1.0
   cfg_interval: [0.0, 1.0]
   cfg_renorm_min: 0.0
@@ -176,7 +175,7 @@ sampling:
   # diffuse/replay are index-set-based (unirl.types.sampling.compute_trajectory_positions
   # stores x_t before+after each SDE step independently), so non-contiguous is fully supported.
   scheduler:
-    _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+    _target_: unirl.sde.index_schedule.AllSDEScheduler
     num_timesteps: ${..num_inference_steps}
     timestep_fraction: [0.0, 0.5]
     num_sde_steps: 2

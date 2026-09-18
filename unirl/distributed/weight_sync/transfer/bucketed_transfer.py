@@ -1,19 +1,4 @@
-"""Bucketed weight transfer via ZMQ + IPC (or shared memory fallback).
-
-Lifted from upstream ``verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py``
-with two adjustments to drop verl-internal dependencies:
-
-- Replace ``verl.utils.device.{get_device_id,get_device_name,get_torch_device}``
-  with plain ``torch.cuda`` calls. The original abstraction layer existed to
-  support NPU/CPU backends; we run CUDA-only here.
-- Inline ``ensure_async_iterator`` (was ``verl.workers.rollout.utils``).
-
-Same algorithm verified by verl-omni in production: one pre-allocated
-fixed-size buffer (default 2 GB) shared via CUDA IPC, tensors copied
-into the buffer in sender-side chunks, per-bucket metadata sent over a
-ZMQ REQ/REP socket. Receiver reconstructs tensor views into the shared
-buffer and hands each bucket to a callback.
-"""
+"""Bucketed weight transfer via ZMQ + IPC (or shared memory fallback)."""
 
 from __future__ import annotations
 
@@ -30,6 +15,9 @@ from torch.multiprocessing.reductions import reduce_tensor
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
+_ZMQ_TIMEOUT_S = 600
+_ZMQ_TIMEOUT_MS = _ZMQ_TIMEOUT_S * 1000
+
 
 class TensorMetadata(TypedDict):
     name: str
@@ -40,12 +28,7 @@ class TensorMetadata(TypedDict):
 
 # From https://github.com/vllm-project/vllm/blob/main/examples/offline_inference/rlhf_utils.py
 def rebuild_ipc(handle: tuple[Callable, tuple], device_id: int | None = None) -> torch.Tensor:
-    """Rebuild a CUDA tensor from an IPC handle, optionally rewriting the device id.
-
-    The trainer and worker may have different ``CUDA_VISIBLE_DEVICES``, so
-    the same logical tensor lives at a different ``cuda:i`` on each side.
-    Pass the receiver-side ``device_id`` to swap the encoded id out.
-    """
+    """Rebuild a CUDA tensor from an IPC handle, optionally rewriting the device id."""
     func, args = handle
     list_args = list(args)
     if device_id is not None:
@@ -81,17 +64,15 @@ async def _ensure_async_iterator(iterable: Any):
             yield item
 
 
+def _zmq_call(operation: str, func: Callable, *args):
+    try:
+        return func(*args)
+    except zmq.Again as exc:
+        raise TimeoutError(f"ZeroMQ {operation} timed out after {_ZMQ_TIMEOUT_S}s") from exc
+
+
 class BucketedWeightSender:
-    """Send model weights via bucketed IPC transfer over ZMQ.
-
-    Packs weight tensors into a fixed-size communication buffer and sends them
-    in buckets to the receiver. Supports CUDA IPC and shared memory fallback.
-
-    Args:
-        zmq_handle: ZMQ IPC socket path (e.g., "ipc:///tmp/diffrl-zmq-...sock")
-        bucket_size_mb: Communication buffer size in MB
-        use_shm: Use shared memory instead of CUDA IPC (for NPU compatibility)
-    """
+    """Send model weights via bucketed IPC transfer over ZMQ."""
 
     def __init__(
         self,
@@ -110,11 +91,7 @@ class BucketedWeightSender:
         self.shm = None
 
     async def async_send_weights(self, weights) -> None:
-        """Send weights to the receiver. Accepts a sync generator or async iterator.
-
-        Args:
-            weights: Generator or async iterator yielding (name, tensor) pairs
-        """
+        """Send weights to the receiver. Accepts a sync generator or async iterator."""
         try:
             self._init_socket()
             self._init_buffer()
@@ -124,8 +101,10 @@ class BucketedWeightSender:
             async for name, weight in _ensure_async_iterator(weights):
                 if offset + weight.nbytes > self.bucket_size:
                     torch.cuda.synchronize()
-                    self.socket.send_pyobj({"bucket_meta": bucket_meta, "is_last": False})
-                    self.socket.recv()
+                    _zmq_call(
+                        "bucket metadata send", self.socket.send_pyobj, {"bucket_meta": bucket_meta, "is_last": False}
+                    )
+                    _zmq_call("bucket acknowledgement receive", self.socket.recv)
                     bucket_meta = {}
                     offset = 0
 
@@ -144,8 +123,10 @@ class BucketedWeightSender:
                 offset += weight.nbytes
 
             torch.cuda.synchronize()
-            self.socket.send_pyobj({"bucket_meta": bucket_meta, "is_last": True})
-            self.socket.recv()
+            _zmq_call(
+                "final bucket metadata send", self.socket.send_pyobj, {"bucket_meta": bucket_meta, "is_last": True}
+            )
+            _zmq_call("final bucket acknowledgement receive", self.socket.recv)
         finally:
             self._cleanup()
 
@@ -158,6 +139,8 @@ class BucketedWeightSender:
             except OSError:
                 pass
         self.socket = self.zmq_context.socket(zmq.REQ)
+        self.socket.setsockopt(zmq.RCVTIMEO, _ZMQ_TIMEOUT_MS)
+        self.socket.setsockopt(zmq.SNDTIMEO, _ZMQ_TIMEOUT_MS)
         self.socket.bind(self.zmq_handle)
 
     def _init_buffer(self) -> None:
@@ -169,25 +152,26 @@ class BucketedWeightSender:
                 dtype=torch.uint8,
                 device=f"cuda:{torch.cuda.current_device()}",
             )
+            self.buffer = buffer
             handle = reduce_tensor(buffer)
-            self.socket.send_pyobj(handle)
+            _zmq_call("CUDA IPC metadata send", self.socket.send_pyobj, handle)
         else:
             import uuid
 
             shm_name = f"diffrl_weights_{uuid.uuid4().hex}"
             shm = create_shared_memory(self.bucket_size, shm_name)
             buffer = torch.frombuffer(shm.buf, dtype=torch.uint8)
+            self.buffer = buffer
+            self.shm = shm
 
             comm_metadata = {"name": shm_name, "size": self.bucket_size}
-            self.socket.send_pyobj(comm_metadata)
+            _zmq_call("shared-memory metadata send", self.socket.send_pyobj, comm_metadata)
 
-        self.socket.recv()
-        self.buffer = buffer
-        self.shm = shm
+        _zmq_call("buffer initialization acknowledgement receive", self.socket.recv)
 
     def _cleanup(self) -> None:
         if self.socket is not None:
-            self.socket.close()
+            self.socket.close(linger=0)
             self.socket = None
         if self.zmq_handle.startswith("ipc://"):
             ipc_path = self.zmq_handle[len("ipc://") :]
@@ -209,16 +193,7 @@ class BucketedWeightSender:
 
 
 class BucketedWeightReceiver:
-    """Receive model weights via bucketed IPC transfer over ZMQ.
-
-    Receives weight tensors from BucketedWeightSender and passes each
-    bucket to a callback for processing (e.g., loading into the model).
-
-    Args:
-        zmq_handle: ZMQ IPC socket path (must match sender)
-        device: Target device for received tensors
-        use_shm: Use shared memory instead of CUDA IPC
-    """
+    """Receive model weights via bucketed IPC transfer over ZMQ."""
 
     def __init__(
         self,
@@ -234,21 +209,16 @@ class BucketedWeightReceiver:
         self.socket = None
         self.buffer = None
         self.shm = None
+        self._completed = False
 
     def receive_weights(self, on_bucket_received: Callable[[list], None]) -> None:
-        """Receive weights from sender and process each bucket via callback.
-
-        Args:
-            on_bucket_received: Callback called per bucket with a list of
-                ``(name, tensor)`` tuples. Tensors are views into the shared
-                buffer; consume immediately (next bucket overwrites).
-        """
+        """Receive weights from sender and process each bucket via callback."""
         try:
             self._init_socket()
             self._init_buffer()
 
             while True:
-                metadata = self.socket.recv_pyobj()
+                metadata = _zmq_call("bucket metadata receive", self.socket.recv_pyobj)
                 weights, tensor = [], None
                 for name, meta in metadata["bucket_meta"].items():
                     shape, dtype, offset = meta["shape"], meta["dtype"], meta["offset"]
@@ -259,9 +229,10 @@ class BucketedWeightReceiver:
                     weights.append((name, tensor))
                 on_bucket_received(weights)
                 torch.cuda.synchronize()
-                self.socket.send(b"")
+                _zmq_call("bucket acknowledgement send", self.socket.send, b"")
                 del weights, tensor
                 if metadata["is_last"]:
+                    self._completed = True
                     break
         finally:
             self._cleanup()
@@ -269,11 +240,13 @@ class BucketedWeightReceiver:
     def _init_socket(self) -> None:
         """Initialize ZMQ REP socket and connect."""
         self.socket = self.zmq_context.socket(zmq.REP)
+        self.socket.setsockopt(zmq.RCVTIMEO, _ZMQ_TIMEOUT_MS)
+        self.socket.setsockopt(zmq.SNDTIMEO, _ZMQ_TIMEOUT_MS)
         self.socket.connect(self.zmq_handle)
 
     def _init_buffer(self) -> None:
         """Receive and rebuild communication buffer from sender."""
-        comm_metadata = self.socket.recv_pyobj()
+        comm_metadata = _zmq_call("buffer initialization metadata receive", self.socket.recv_pyobj)
         buffer, shm = None, None
         if not self.use_shm:
             handle = comm_metadata
@@ -283,13 +256,13 @@ class BucketedWeightReceiver:
             shm_name = comm_metadata["name"]
             shm_size = comm_metadata["size"]
             buffer, shm = rebuild_shared_memory(shm_name, shm_size, dtype=torch.uint8)
-        self.socket.send(b"")
         self.buffer = buffer
         self.shm = shm
+        _zmq_call("buffer initialization acknowledgement send", self.socket.send, b"")
 
     def _cleanup(self) -> None:
         if self.socket is not None:
-            self.socket.close()
+            self.socket.close(linger=_ZMQ_TIMEOUT_MS if self._completed else 0)
             self.socket = None
         if torch.cuda.is_available():
             torch.cuda.synchronize()

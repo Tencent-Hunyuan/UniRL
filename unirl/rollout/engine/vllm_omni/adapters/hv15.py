@@ -1,11 +1,4 @@
-"""HunyuanVideo-1.5 family: input/output sub-adapters + the ``t2v`` modality class.
-
-Single diffusion stage, TP=1, no AR prelude. The request side derives from
-the shared :class:`~.dit.DitInputAdapter` adding the video-only
-``num_frames`` knob; the response side derives from
-:class:`~.dit.DitOutputAdapter` packing per-prompt PIL frame groupings into
-``Videos`` and the dual-stream HV1.5 text conditions.
-"""
+"""HunyuanVideo-1.5 family: input/output sub-adapters + the ``t2v`` modality class."""
 
 from __future__ import annotations
 
@@ -16,6 +9,7 @@ import torch
 from unirl.rollout.engine.vllm_omni.adapters.base import ModelAdapter, register_adapter
 from unirl.rollout.engine.vllm_omni.adapters.dit import DitInputAdapter, DitOutputAdapter
 from unirl.rollout.engine.vllm_omni.backends import GenerateCall, OmniRawResult, StageSampling
+from unirl.rollout.engine.vllm_omni.pipelines._shared.interception import read_captures
 from unirl.rollout.engine.vllm_omni.utils import (
     collect_dit_outputs,
     grouped_pils_to_videos,
@@ -30,12 +24,7 @@ def _num_frames(sample: Sample) -> int:
 
 
 class Hv15InputAdapter(DitInputAdapter):
-    """SD3-style request side + the video-only ``num_frames`` knob.
-
-    ``num_frames`` rides both the per-prompt dict (read by
-    ``RLHunyuanVideo15Pipeline.forward``) and the diffusion kwargs — one
-    ``super()``-extend override per side.
-    """
+    """SD3-style request side + the video-only ``num_frames`` knob."""
 
     def build_prompts(self, sample: Sample) -> List[Any]:
         prompts = super().build_prompts(sample)
@@ -47,6 +36,11 @@ class Hv15InputAdapter(DitInputAdapter):
     def build_sampling(self, sample: Sample) -> List[StageSampling]:
         sampling = super().build_sampling(sample)
         sampling[0].kwargs["num_frames"] = _num_frames(sample)
+        frontier = sample.frontier_gen_part(DiffusionSamplingParams)
+        diff_params = frontier.sampling_params
+        extra_args = sampling[0].kwargs.setdefault("extra_args", {})
+        extra_args["denoise_seed_keys"] = [str(sample_id) for sample_id in frontier.sample_ids]
+        extra_args["denoise_base_seed"] = int(diff_params.seed) if diff_params.seed is not None else 0
         return sampling
 
 
@@ -57,7 +51,7 @@ class Hv15VideoOutputAdapter(DitOutputAdapter):
 
     _MISSING_CAPTURE_MSG = (
         "build_response: HV1.5 t2v rollout returned no 'text_capture' "
-        "on DiffusionOutput.custom_output (or it lacked the dual-stream "
+        "on the output envelope's unirl metadata (or it lacked the dual-stream "
         "text_mllm/text_glyph embeds). Check that "
         "RLHunyuanVideo15Pipeline's encode_prompt hook ran in every DiT "
         "worker — verify custom_pipeline_args.pipeline_class in the stage "
@@ -72,21 +66,13 @@ class Hv15VideoOutputAdapter(DitOutputAdapter):
         return grouped_pils_to_videos(frame_groups)
 
     def build_conditions(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
-        """Unpack the per-request HV1.5 dual-stream text conditions.
-
-        Written by ``RLHunyuanVideo15Pipeline`` after intercepting
-        ``encode_prompt`` — 8 tensors from the dual text encoder (Qwen2.5-VL
-        MLLM + ByT5 glyph), mapped to ``text_mllm`` / ``text_glyph``
-        (+ negatives). Returns the conditions *dict* (keys aligned with
-        ``HunyuanVideo15Conditions.from_dict``), NOT the typed wrapper — the
-        trainer runs ``from_dict(part.conditions)`` itself.
-        """
+        """Unpack the per-request HV1.5 dual-stream text conditions."""
         del sample
         diff_outputs, _, _ = collect_dit_outputs(
             per_request, final_output_type=self.final_output_type, stage_id=self.stage_id, modality=self.modality
         )
 
-        captures = [(getattr(d, "custom_output", None) or {}).get("text_capture") for d in diff_outputs]
+        captures = [read_captures(d).get("text_capture") for d in diff_outputs]
         if any(c is None for c in captures):
             raise RuntimeError(self._MISSING_CAPTURE_MSG)
 

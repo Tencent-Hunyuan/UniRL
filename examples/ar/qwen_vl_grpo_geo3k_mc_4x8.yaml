@@ -11,7 +11,7 @@
 #
 # Data prep (one-time) — build the local Geometry3K-MC jsonl + images from the
 # public xyliu6/geometry3k dataset (no private cache needed):
-#   python -m unirl.utils.prepare_geo3k_mc --out-dir data/geo3k_mc
+#   python datasets/geo3k_mc/prepare_geo3k_mc.py --out-dir data/geo3k_mc
 #   → data/geo3k_mc/{train.jsonl, val.jsonl} (+ images/)
 #
 # Launch (per node, SPMD; rank 0 owns the driver). The model defaults to the HF id
@@ -148,7 +148,7 @@ data_source:
   _target_: unirl.data.data_source.MultimodalRLDataSource
   args:
     run:
-      data_path: ${oc.env:DATA_PATH}            # local jsonl; build with unirl/utils/prepare_geo3k_mc.py
+      data_path: ${oc.env:DATA_PATH}            # local jsonl; build with datasets/geo3k_mc/prepare_geo3k_mc.py
       eval_data_path: ${oc.env:EVAL_DATA_PATH,${oc.env:DATA_PATH}}
       seed: 42
     algorithm:

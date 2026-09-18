@@ -7,7 +7,7 @@
 # it into the base and pushes the merged FULL weights via TensorWeightSync
 # (lora_merged=true) through the fused-shard-aware updater. sglang serves a plain
 # (full) transformer (model_config.use_lora=false). Mirrors
-# hunyuan_video_t2v_sglang_loramerge on the LTX-2 ~19B AV DiT + video_pickscore.
+# hunyuan_video10_t2v_sglang on the LTX-2 ~19B AV DiT + video_pickscore.
 #
 #   bash examples/run_experiment_single_node.sh diffusion/ltx2/ltx2_t2v_sglang_loramerge
 
@@ -23,7 +23,6 @@ eval_interval: 20
 eval_num_prompts: 16
 eval_samples_per_prompt: 4
 eval_chunk_prompts: 8
-eval_cfg_text_scale: 1.0
 eval_eta: 0.7
 save_interval: 20
 save_dir: ${oc.env:SAVE_DIR,checkpoints/ltx2_t2v_sglang_loramerge}
@@ -183,7 +182,7 @@ sampling:
   trajectory_precision: fp32
   logprob_precision: fp32
   scheduler:
-    _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+    _target_: unirl.sde.index_schedule.AllSDEScheduler
     num_timesteps: ${..num_inference_steps}
     num_sde_steps: 5
     timestep_fraction: [0.0, 0.5]

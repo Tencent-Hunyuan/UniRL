@@ -1,30 +1,4 @@
-"""ZImageBundle — concrete weights+params holder for Z-Image.
-
-Loads either variant (architecture-identical): the base
-``Tongyi-MAI/Z-Image`` (CFG, ``shift: 6.0``) or the distilled
-``Z-Image-Turbo`` (no CFG, ``shift: 3.0``). Implements the empty
-:class:`Bundle` Protocol. Pure container of the modules Z-Image ships with:
-1× ``ZImageTransformer2DModel`` (the S3-DiT single-stream backbone), 1×
-``AutoencoderKL`` (the 16-channel flux-style 2D VAE), 1× Qwen3 text encoder
-(loaded via ``AutoModel``) + matching tokenizer, 1×
-``FlowMatchEulerDiscreteScheduler``.
-
-Diverges from :class:`unirl.models.qwen_image.QwenImageBundle` in two ways:
-
-- **Standard 2D VAE** (``AutoencoderKL``, 4D latents ``[B, C, H, W]``)
-  rather than Qwen-Image's video VAE — so the decode stage is the plain
-  SD3-style ``scaling_factor`` / ``shift_factor`` round trip, no temporal
-  squeeze/expand.
-- **Qwen3 text encoder** (a pure causal LM, ``Qwen3Model``) consumed via a
-  chat template, taking ``hidden_states[-2]`` (the second-to-last layer);
-  no fixed-prefix strip and no pooled vector.
-
-No LoRA injection, FSDP wrap, adapter switching, autocast helpers, or
-weight-sync logic — those are lifecycle concerns owned outside the bundle
-(``cfg.training.policies``).
-
-Use :meth:`ZImageBundle.from_config` to load a checkpoint.
-"""
+"""ZImageBundle — weights+params for Z-Image; a standard 2D ``AutoencoderKL``, latents ``[B, C, H, W]``."""
 
 from __future__ import annotations
 
@@ -66,13 +40,7 @@ class ZImageBundle(Bundle):
 
     @classmethod
     def from_config(cls, config: ZImagePipelineConfig) -> "ZImageBundle":
-        """Load all Z-Image components from a HuggingFace-layout checkpoint.
-
-        Honors per-component path overrides (``vae_ckpt_path`` /
-        ``text_encoder_ckpt_path``) so fine-tuning recipes can swap in
-        alternate VAE / text-encoder checkpoints without re-downloading
-        the transformer. Both default to ``pretrained_model_ckpt_path``.
-        """
+        """Load all Z-Image components from a HuggingFace-layout checkpoint."""
         from diffusers import AutoencoderKL, ZImageTransformer2DModel
         from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
         from transformers import AutoModel, AutoTokenizer

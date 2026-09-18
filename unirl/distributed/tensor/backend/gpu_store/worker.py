@@ -1,28 +1,4 @@
-"""TensorWorker — per-GPU tensor storage, IPC, and NCCL actor.
-
-Hidden Ray actor: one per GPU, created by DevicePool, never exposed to user code.
-All role Workers on the same GPU share this single TensorWorker.
-
-Responsibilities:
-  - Tensor storage with reference counting (_store, _ref_counts)
-  - IPC handle management (_share_cuda_() only called here, never in Worker)
-  - NCCL cross-GPU transfers (global ProcessGroup)
-  - tensor_op / get_tensor_cpu for GPUTensorHandle remote operations
-
-Put path (Worker → TW):
-  1. Worker calls batch_allocate([(shape, dtype), ...]) → [(store_key, ipc_h, stride), ...]
-  2. Worker IPC-writes tensors into TW buffers via the returned ipc handles
-  3. Worker calls batch_write_done([store_key, ...]) → buf moves _pending → _store
-
-Borrow path (TW → Worker):
-  1. Worker calls batch_borrow([store_key, ...]) → [(ipc_h, shape, stride), ...]
-  2. Worker opens IPC views (zero-copy read), offset always 0 (TW stores contiguous)
-  3. IPC views release by refcount when the resolved tensors aliasing them drop
-
-GC:
-  controller weakref.finalize → tw.decref.remote(store_key)
-  decref: ref_count → 0 → del buf → ipc_collect() cleans Limbo (counter=0 ≤ 0)
-"""
+"""TensorWorker — per-GPU tensor storage, IPC, and NCCL actor."""
 
 from __future__ import annotations
 
@@ -40,19 +16,7 @@ from unirl.distributed.tensor.backend.gpu_store.handle import GPUTensorHandle
 
 
 class TensorWorker:
-    """Per-GPU tensor storage, IPC, and NCCL Ray actor.
-
-    Hidden: created by DevicePool, device_id maps to global GPU index.
-    Workers on the same GPU hold a Ray handle to this actor.
-
-    _share_cuda_() is called once per batch_allocate (for Worker to write into)
-    and once per batch_borrow (for Worker to read). Each call produces an
-    independent counter slot. ipc_collect() in decref cleans all counter=0 Limbo
-    entries — no _release_ipc_counter_cuda needed.
-
-    All allocations use expandable_segments:False so _share_cuda_() always
-    produces a portable cudaMalloc-backed IPC handle.
-    """
+    """Per-GPU tensor storage, IPC, and NCCL Ray actor."""
 
     def __init__(self, device_id: int):
         self.device_id = device_id
@@ -77,15 +41,7 @@ class TensorWorker:
         self._ipc_collect_bytes: int = int(os.environ.get("MMRL_IPC_COLLECT_BYTES", str(1 << 30)))
 
     def batch_allocate(self, requests: List[Tuple[tuple, torch.dtype]]) -> List[Tuple[str, tuple, tuple]]:
-        """Batch-allocate buffers, return [(store_key, ipc_h, stride), ...].
-
-        stride: contiguous stride of the buf — Worker uses it directly, no
-        computation needed. offset is always 0 (torch.empty, contiguous).
-        Bufs go into _pending; visible for borrow only after batch_write_done.
-
-        _share_cuda_() called inside lock so buf hold and IPC handle creation
-        are atomic (TW is Ray single-threaded, lock is a safety net).
-        """
+        """Batch-allocate buffers, return [(store_key, ipc_h, stride), ...]."""
         results = []
         with self._lock:
             for shape, dtype in requests:
@@ -98,11 +54,7 @@ class TensorWorker:
         return results
 
     def batch_write_done(self, store_keys: List[str]) -> None:
-        """Move bufs from _pending into _store after Worker finishes writing.
-
-        Must be called synchronously (ray.get) before returning GPUTensorHandle to
-        controller — otherwise a concurrent borrow would KeyError on the key.
-        """
+        """Move bufs from _pending into _store after Worker finishes writing."""
         with self._lock:
             for key in store_keys:
                 buf = self._pending.pop(key)
@@ -110,15 +62,7 @@ class TensorWorker:
                 self._ref_counts[key] = 1
 
     def batch_borrow(self, store_keys: List[str]) -> List[Tuple[tuple, tuple, tuple]]:
-        """Batch-create IPC handles for reading, return [(ipc_h, shape, stride), ...].
-
-        shape/stride come from _store buf — Worker uses them directly.
-        offset is always 0. Each key gets an independent counter slot.
-        Dedup is the caller's responsibility (same key must appear only once).
-
-        _share_cuda_() inside lock: atomic with respect to concurrent decref
-        (TW is single-threaded but lock documents the invariant).
-        """
+        """Batch-create IPC handles for reading, return [(ipc_h, shape, stride), ...]."""
         with self._lock:
             return [
                 (self._store[k].untyped_storage()._share_cuda_(), tuple(self._store[k].shape), self._store[k].stride())
@@ -133,11 +77,7 @@ class TensorWorker:
             self._ref_counts[key] += 1
 
     def batch_incref(self, keys: List[str]) -> None:
-        """Batch-increment reference counts for multiple keys (1 RPC instead of N).
-
-        Used by _pack_outputs when the same tensor object appears multiple times
-        in the output tree — collects all extra-occurrence keys and fires one RPC.
-        """
+        """Batch-increment reference counts for multiple keys (1 RPC instead of N)."""
         with self._lock:
             for key in keys:
                 if key not in self._ref_counts:
@@ -145,17 +85,7 @@ class TensorWorker:
                 self._ref_counts[key] += 1
 
     def decref(self, key: str) -> None:
-        """Decrement reference count. If zero, release the storage.
-
-        Called by GPUTensorHandle._release (GC finalizer on controller side).
-
-        ipc_collect() is triggered lazily: only after _ipc_collect_count tensors
-        freed OR _ipc_collect_bytes of cumulative VRAM freed, whichever comes first.
-        In the normal flow the consumer (Worker) closes its IPC view before the
-        controller GC fires decref, so del buf alone is sufficient and ipc_collect
-        is a safety net for late-closing consumers.
-        buf.nbytes is recorded before del buf — pure Python, no synchronize needed.
-        """
+        """Decrement reference count. If zero, release the storage."""
         do_collect = False
         with self._lock:
             if key not in self._ref_counts:
@@ -182,10 +112,7 @@ class TensorWorker:
             return self._ref_counts[key]
 
     def tensor_op(self, handle: GPUTensorHandle, op: str, *op_args) -> GPUTensorHandle:
-        """Execute a tensor operation directly in _store (no IPC needed).
-
-        Returns a new unbound GPUTensorHandle (caller must rebind).
-        """
+        """Execute a tensor operation directly in _store (no IPC needed)."""
         if handle.object_ref is not None:
             t = ray.get(handle.object_ref)
         else:
@@ -231,11 +158,7 @@ class TensorWorker:
         return 0
 
     def empty_cache(self) -> None:
-        """Clean up remaining IPC Limbo entries and release PyTorch allocator cache.
-
-        Handles any Limbo entries that haven't yet hit the decref thresholds,
-        then returns the allocator's cached blocks to CUDA.
-        """
+        """Clean up remaining IPC Limbo entries and release PyTorch allocator cache."""
         if torch.cuda.is_available():
             torch.cuda.synchronize()
             torch.cuda.ipc_collect()
@@ -245,11 +168,7 @@ class TensorWorker:
                 self._limbo_bytes = 0
 
     def setup_global_pg(self, global_rank: int, global_world_size: int) -> None:
-        """Initialize the global ProcessGroup for cross-GPU NCCL transfers.
-
-        Uses ProcessGroupNCCL via TCPStore. MASTER_ADDR and MASTER_PORT must be
-        set in the environment (injected by DevicePool via runtime_env).
-        """
+        """Initialize the global ProcessGroup for cross-GPU NCCL transfers."""
         store = dist.TCPStore(
             host_name=os.environ["MASTER_ADDR"],
             port=int(os.environ["MASTER_PORT"]),
@@ -262,12 +181,7 @@ class TensorWorker:
         self._global_pg.eager_connect_single_device(torch.device(self.device))
 
     def _nccl_send(self, dst_rank: int, items: List) -> None:
-        """Send stored tensors (or row ranges of them) to dst_rank via NCCL.
-
-        Each item is ``(store_key, start, end)`` — a ``TensorSpan`` routing copy
-        ships only its ``[start:end)`` rows; ``(key, None, None)`` sends the whole
-        block. Bare ``str`` items are accepted for backward compatibility.
-        """
+        """Send stored tensors (or row ranges of them) to dst_rank via NCCL."""
         assert self._global_pg is not None, "Global PG not initialized."
         for item in items:
             key, start, end = (item, None, None) if isinstance(item, str) else item
@@ -278,10 +192,7 @@ class TensorWorker:
             self._global_pg.send([tensor.contiguous()], dst_rank, 0).wait()
 
     def _nccl_recv(self, src_rank: int, shapes: List[tuple], dtypes: List[torch.dtype]) -> List[GPUTensorHandle]:
-        """Receive tensors from src_rank via NCCL, store in _store.
-
-        Returns unbound TensorHandles (caller must rebind to this TW).
-        """
+        """Receive tensors from src_rank via NCCL, store in _store."""
         assert self._global_pg is not None, "Global PG not initialized."
         handles = []
         for shape, dtype in zip(shapes, dtypes):

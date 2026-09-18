@@ -1,13 +1,4 @@
-"""Built-in reward scorer / spec registry.
-
-Two parallel maps keyed by ``model_name``:
-
-- ``_BUILTIN_SCORERS`` — model_name → scorer class. Used by composite scorers
-  (e.g. ``VideoRewardScorer``) that need to instantiate an inner frame scorer.
-- ``_BUILTIN_SPECS`` — model_name → spec dataclass. Same composite case needs
-  to materialize a default inner Spec to feed the scorer's
-  ``__init__(*, config, base_device)`` entry point.
-"""
+"""Built-in reward scorer / spec registry."""
 
 from __future__ import annotations
 
@@ -33,6 +24,7 @@ _BUILTIN_SCORERS: Dict[str, Tuple[str, str]] = {
     "clap": ("unirl.reward.local.clap", "CLAPRewardScorer"),
     "imagebind": ("unirl.reward.local.imagebind", "ImageBindRewardScorer"),
     "t2av_composite": ("unirl.reward.local.t2av_composite", "T2AVCompositeScorer"),
+    "per_domain": ("unirl.reward.local.per_domain", "PerDomainRewardScorer"),
 }
 
 _BUILTIN_SPECS: Dict[str, Tuple[str, str]] = {
@@ -52,6 +44,7 @@ _BUILTIN_SPECS: Dict[str, Tuple[str, str]] = {
     "clap": ("unirl.reward.local.clap", "CLAPSpec"),
     "imagebind": ("unirl.reward.local.imagebind", "ImageBindSpec"),
     "t2av_composite": ("unirl.reward.local.t2av_composite", "T2AVCompositeSpec"),
+    "per_domain": ("unirl.reward.local.per_domain", "PerDomainSpec"),
 }
 
 

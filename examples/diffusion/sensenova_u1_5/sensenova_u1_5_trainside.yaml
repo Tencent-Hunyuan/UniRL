@@ -1,0 +1,139 @@
+# @package _global_
+# SenseNova-U1.5-8B-MoT-Preview pixel-flow GRPO with trainside rollout.
+#
+# Launch:
+#   SENSENOVA_U1_PATH=/path/to/SenseNova-U1.5-8B-MoT-Preview \
+#   python -m unirl.train_diffusion --config-name diffusion/sensenova_u1_5/sensenova_u1_5_trainside
+
+num_devices: 8
+batch_size: 8
+adv_use_global_std: true
+num_rollouts: 10000
+
+logging:
+  report_to_wandb: false
+  project_name: unirl
+  run_name: sensenova-u1.5-grpo
+  entity: null
+  tags: [sensenova-u1.5, pixel-flow, trainside, fullft]
+
+bundle:
+  _target_: unirl.models.sensenova_u1.bundle.SenseNovaU1Bundle.from_config
+  config:
+    _target_: unirl.models.sensenova_u1.config.SenseNovaU1PipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:SENSENOVA_U1_PATH,sensenova/SenseNova-U1.5-8B-MoT-Preview}
+    # Qwen3DecoderLayer interleaves frozen und and trainable gen parameters.
+    # FSDP2 requires one original dtype per shard group, so keep the complete
+    # model in fp32 masters and use bf16 only through mixed-precision compute.
+    model_precision: fp32
+    autocast_precision: bf16
+    trajectory_precision: bf16
+    logprob_precision: fp32
+    timestep_shift: 3.0
+    # Pin SDPA: the pristine vendor's flash path targets Flash-Attention 2,
+    # while the supported UniRL engine stack ships Flash-Attention 4.
+    attention_backend: sdpa
+    # Matches the released U1.5 pretraining recipe: freeze the shared /
+    # understanding path, train fm_modules + every *_mot_gen branch.
+    full_finetune_generation: true
+
+pipeline:
+  _target_: unirl.models.sensenova_u1.pipeline.SenseNovaU1Pipeline
+  shift: ${bundle.config.timestep_shift}
+  autocast_precision: ${bundle.config.autocast_precision}
+  trajectory_precision: ${bundle.config.trajectory_precision}
+  logprob_precision: ${bundle.config.logprob_precision}
+  strategy:
+    _target_: unirl.sde.kernels.FlowSDEStrategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["Qwen3DecoderLayer", "NEOVisionModel"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    master_dtype: fp32
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true
+    use_torch_compile: false
+    # The trainable fm_modules tree is outside the decoder blocks.
+    root_wrap: true
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 2.0e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: ${num_rollouts}
+
+rollout:
+  _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
+  stage_attrs: [diffusion]
+  # Prefix KV caches and pixel-flow trajectories are intentionally per-sample.
+  forward_batch_size: 1
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.local.pickscore.PickScoreRewardScorer
+    base_device: cuda
+    config:
+      _target_: unirl.reward.local.pickscore.PickScoreSpec
+      batch_size: 4
+      device: auto
+      processor_id: laion/CLIP-ViT-H-14-laion2B-s32B-b79K
+      model_id: yuvalkirstain/PickScore_v1
+
+algorithm:
+  _target_: unirl.algorithms.flowgrpo.FlowGRPO
+  stage_attr: diffusion
+  clip_range: 1.0e-4
+  clip_schedule: constant
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.sensenova_u1.conditions.SenseNovaU1Conditions
+  params: ${sampling}
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 2
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: datasets/pickscore/train.txt
+      eval_data_path: datasets/pickscore/test.txt
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.models.sensenova_u1.diffusion.SenseNovaU1DiffusionParams
+  num_inference_steps: 20
+  guidance_scale: 4.0
+  cfg_norm: global
+  cfg_interval: [0.0, 1.0]
+  t_eps: 0.02
+  height: 512
+  width: 512
+  eta: 0.7
+  samples_per_prompt: 4
+  seed: 42
+  init_same_noise: false
+  scheduler:
+    _target_: unirl.sde.index_schedule.AllSDEScheduler
+    num_timesteps: ${..num_inference_steps}
+    num_sde_steps: 3
+    timestep_fraction: [0.0, 0.5]

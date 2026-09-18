@@ -1,28 +1,5 @@
 #!/usr/bin/env python3
-"""Static guard for the experimental-tier boundaries.
-
-Three rules, all enforceable without importing anything (pure ``ast`` +
-text, same spirit as ``check_recipe_targets.py``):
-
-1. **Core never imports experimental.** ``unirl/`` must not reference the
-   ``experimental`` namespace — the dependency arrow points one way.
-2. **Experimental packages never import each other.** ``experimental/<a>``
-   may import ``unirl`` and its own package only — in any spelling:
-   absolute, ``from experimental import <b>``, bare ``import experimental``,
-   or a relative import that climbs past the package root. Top-level
-   ``experimental/*.py`` files are not a shared space and may not import
-   the tier at all.
-3. **Recipe requirements are additive-only.** Reward and actor share one
-   Python process, so an ``experimental/**/requirements*.txt`` cannot
-   version-"isolate" anything: any requirement whose (normalized) name the
-   locked core stack already governs — ``[project.dependencies]``, every
-   ``[project.optional-dependencies]`` extra, or a ``[tool.uv]`` override
-   pin — would mutate that stack on install and is rejected, as are pip
-   option/include lines and URL requirements the name parser cannot vet.
-
-Run by the ``check-experimental-boundaries`` pre-commit hook. Exits
-non-zero listing each violation.
-"""
+"""Static guard for the experimental-tier boundaries."""
 
 from __future__ import annotations
 
@@ -48,13 +25,7 @@ def _py_files(base: Path):
 
 
 def _imports(path: Path):
-    """Yield ``(module, from_names)`` per import statement in ``path``.
-
-    ``import a.b`` → ``("a.b", ())``; ``from a import b, c`` → ``("a", ("b", "c"))``.
-    Relative imports are resolved against the file's package (its directory
-    chain under ROOT) before yielding; a level that climbs out of the tree
-    yields nothing.
-    """
+    """Yield ``(module, from_names)`` per import statement in ``path``."""
     try:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     except (OSError, SyntaxError):

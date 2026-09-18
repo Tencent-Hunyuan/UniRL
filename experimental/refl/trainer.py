@@ -1,20 +1,4 @@
-"""REFLTrainer — recipe driver for WAN REFL/BPTT (video reward backprop).
-
-Two roles, always — a :class:`experimental.refl.roles.ReflActorRole` (FSDP WAN +
-grad BPTT sampling + optimizer) and a frozen differentiable video reward
-(:class:`unirl.reward.service.RewardService`), colocated on the same worker
-slab so decoded video never leaves the GPU. Each step runs, under the
-distributed ``enable_grad()`` context::
-
-    gen = actor.generate_samples(texts, images, params)   # grad through BPTT window + VAE
-    rew = reward.score_differentiable(gen.decoded, prompts, records)
-    actor.forward_backward_loss(rewards=rew, kl_loss=gen.kl_loss)
-    # ctx exit → grads route reward → decode → DiT LoRA params
-    actor.step(max_grad_norm)
-
-No advantages / replay / ratio / rollout-engine / weight-sync — REFL is not a
-PG-RL loop. Success signal: the reward curve rises.
-"""
+"""REFLTrainer — recipe driver for WAN REFL/BPTT (video reward backprop)."""
 
 from __future__ import annotations
 
@@ -29,10 +13,10 @@ from omegaconf import DictConfig
 from unirl.distributed.group.placement import placement
 from unirl.distributed.tensor.grad_context import enable_grad
 from unirl.trainer.base import BaseTrainer, build_sampling_dict
+from unirl.trainer.hydra import remote_hydra
 from unirl.types.primitives import Images, Texts
 from unirl.types.sample import Sample
 from unirl.types.sampling import DiffusionSamplingParams, total_samples_per_prompt
-from unirl.utils.hydra import remote_hydra
 
 logger = logging.getLogger(__name__)
 
@@ -45,13 +29,26 @@ def _text_inputs(inputs: Sample) -> Texts:
     return prompts
 
 
-def _image_inputs(inputs: Sample) -> Optional[Images]:
-    """Read the optional I2V first-frame conditioning (a chained input Part)."""
-    for part in inputs.parts[1:]:
-        image = part.primitives.get("image")
-        if isinstance(image, Images):
-            return image
-    return None
+def _image_inputs(inputs: Sample, *, text_count: int) -> Optional[Images]:
+    """Read and validate the optional packed I2V first-frame conditioning."""
+    image_inputs: List[Images] = []
+    for part_index, part in enumerate(inputs.parts[1:], start=1):
+        if "image" not in part.primitives:
+            continue
+        image = part.primitives["image"]
+        if not isinstance(image, Images):
+            raise TypeError(f"REFL I2V condition at part {part_index} requires Images, got {type(image).__name__}.")
+        image_inputs.append(image)
+
+    if not image_inputs:
+        return None
+    if len(image_inputs) != 1:
+        raise ValueError(f"REFL supports exactly one I2V image condition batch, got {len(image_inputs)}.")
+
+    images = image_inputs[0]
+    if len(images) != text_count:
+        raise ValueError(f"REFL I2V image count {len(images)} != text count {text_count}.")
+    return images
 
 
 def _records(inputs: Sample) -> Optional[List[Optional[Dict[str, Any]]]]:
@@ -101,7 +98,7 @@ class REFLTrainer(BaseTrainer):
         """One enable_grad() generate → score → backward, then optimizer step."""
         t0 = time.perf_counter()
         texts = _text_inputs(inputs)
-        images = _image_inputs(inputs)
+        images = _image_inputs(inputs, text_count=len(texts))
         records = _records(inputs)
         with enable_grad():
             gen = self.actor.generate_samples(

@@ -56,9 +56,50 @@ never mutates the input Sample — it returns a fresh one. Per call it:
 
 A backend is just `compute_rewards(request) -> RewardResponse`. Local scorers
 (`local/`) subclass `LocalRewardBackend` and implement `_compute_model_rewards`;
-the remote backend (`remote.py`) sends one `POST /score` per scoring call, packing
-the whole batch and multiplexing every requested reward in one round trip, and
-derives success from the response.
+the remote backend (`remote.py`) sends one or more bounded `POST /score` calls,
+multiplexes every requested reward in each item, and derives success from the
+merged response.
+
+### Managed image scorers
+
+`ManagedScorerProcessBackend` is the environment-isolated, rank-affine middle
+ground between local and externally deployed rewards. Each reward worker launches
+one scorer child with an explicit Python executable; the child inherits that
+worker's single visible GPU and serves only its local prompt-tree shard over
+loopback HTTP. The initial capability is deliberately limited to image and
+image-edit histories.
+
+Its config separates process ownership, scorer construction, and remote-client
+semantics:
+
+```yaml
+backend:
+  _target_: unirl.reward.managed_process.ManagedScorerProcessBackend
+  base_device: cpu
+  config:
+    _target_: unirl.reward.managed_process.ManagedScorerProcessSpec
+    process:
+      _target_: unirl.reward.managed_process.ManagedProcessConfig
+      python_executable: /venvs/reward/bin/python
+      service_root: /workspace/UniRL/unirl-reward-service
+    scorer:
+      _target_: unirl.reward.managed_process.ManagedScorerConfig
+      name: editreward
+      history_kind: image_edit
+      params: {device: cuda, checkpoint_path: /models/EditReward}
+    client:
+      _target_: unirl.reward.remote.RemoteRewardSpec
+      base_url: managed://rank-affine
+      required_rewards: [editreward]
+      input_kind: image
+      request_batch_size: 8
+    gpu_residency: resident
+```
+
+`request_batch_size` bounds transport/scorer calls independently from the DP
+shard size. Identity echo is required for managed children. The parent manages
+GPU residency through the child's `onload`, `offload`, and `shutdown` endpoints;
+`drain` remains available for explicit synchronization.
 
 **Extending it:** a new local scorer is usually a file in `local/` subclassing
 `LocalRewardBackend` (set `canonical_model_name`, implement `_load_model` +
@@ -76,5 +117,16 @@ new remote reward needs no UniRL code — add it to the server and list its name
 - **`input_kind` must match the media** (`image`/`video`/`text`) — it picks which
   decoded key the backend sees. Remote allows only `image`/`video`; local scorers
   may be `text`.
+- **`math_verify` grades each batch in a `forkserver` child.** Its
+  `signal.alarm` timeouts require the main thread, which threaded Ray actors do not
+  provide. The forkserver preloads `math_verify` and the scorer module, avoiding
+  repeated imports without inheriting the worker's threaded process state. The parent
+  waits on both the result pipe and child sentinel; keep `proc.start()` inside the
+  cleanup boundary so startup failures also release resources. Per-operation timeout
+  is `UNIRL_MATHVERIFY_TIMEOUT_S` (default 10s), with a hard batch cap of
+  `3 * timeout * jobs + 60s`. Wrong or unparsable answers return 0.0, while child,
+  IPC, and batch-timeout failures raise. Teardown uses `SIGKILL` plus a bounded join;
+  do not replace it with `multiprocessing.Pool.terminate()`, whose worker join is
+  unbounded.
 - **`base_device` is ignored by the remote backend** (it's HTTP-only); local
   scorers honor it, falling back to CPU with a warning if CUDA is unavailable.

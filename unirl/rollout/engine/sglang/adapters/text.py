@@ -1,17 +1,9 @@
-"""``TextLMAdapter`` — the per-shape base adapter for a packed-text generation Part.
-
-Holds the conversion logic once: chat-template encoding into per-prompt
-``/generate`` payloads (``build_inputs``) and the predecessor's
-``build_response`` packing fanned out per ``Part`` field
-(``build_response`` is the template; ``build_segment`` /
-``build_decoded`` / ``build_conditions`` each derive one field from
-``(req, prepared, raw)``). The VLM adapter overrides the steps that differ.
-"""
+"""``TextLMAdapter`` — the per-shape base adapter for a packed-text generation Part."""
 
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -27,6 +19,7 @@ from unirl.rollout.engine.sglang.utils import (
     build_text_conversations,
     pack_prompt_condition,
 )
+from unirl.rollout.engine.sglang.utils.sampling import derive_sampling_seed
 from unirl.types.primitives import Texts
 from unirl.types.sample import Sample
 from unirl.types.segments.base import SegmentStatus
@@ -80,20 +73,27 @@ class TextLMAdapter(ModelAdapter):
         if use_template:
             conversations, k = build_text_conversations(sample, sampling.system_instruction)
             require(
-                k == sampling.n,
+                k == sampling.fanout,
                 f"{type(self).__name__}.build_inputs: de-expanded fan-out k={k} != "
-                f"resolved n={sampling.n}; conversation grouping and the sampling block "
+                f"resolved fanout={sampling.fanout}; conversation grouping and the sampling block "
                 "disagree on the gen branch.",
             )
-            for messages in conversations:
-                payload = self.base_payload(sampling)
+            if sampling.base_seed is not None:
+                conversations = [messages for messages in conversations for _ in range(k)]
+            sample_ids = self._wire_seed_identities(sample, sampling, expected=len(conversations))
+            for messages, sample_id in zip(conversations, sample_ids):
+                payload = self.base_payload(sampling, sample_id=sample_id)
                 ids = self.apply_chat_template(messages)
                 payload["input_ids"] = ids
                 prompt_token_ids.append(list(ids))
                 wire.append(payload)
         else:
-            for prompt in self.extract_prompts(sample):
-                payload = self.base_payload(sampling)
+            prompts = self.extract_prompts(sample)
+            if sampling.base_seed is not None:
+                prompts = [prompt for prompt in prompts for _ in range(sampling.fanout)]
+            sample_ids = self._wire_seed_identities(sample, sampling, expected=len(prompts))
+            for prompt, sample_id in zip(prompts, sample_ids):
+                payload = self.base_payload(sampling, sample_id=sample_id)
                 payload["text"] = prompt
                 ids = list(self._tokenizer.encode(prompt))
                 prompt_token_ids.append(list(ids))
@@ -113,7 +113,31 @@ class TextLMAdapter(ModelAdapter):
         )
         return list(text_primitive.texts)
 
-    def base_payload(self, sampling: ResolvedSampling) -> Dict[str, Any]:
+    @staticmethod
+    def _wire_seed_identities(
+        sample: Sample,
+        sampling: ResolvedSampling,
+        *,
+        expected: int,
+    ) -> List[Optional[str]]:
+        """Return sample IDs aligned to wire requests, or ``None`` when no wire seed is needed."""
+        if sampling.base_seed is None:
+            return [None] * expected
+
+        identities = sample.parts[-1].validated_sample_ids(context="SGLang per-request seed derivation")
+        require(
+            len(identities) == expected,
+            "SGLang per-request seed derivation requires one stable sample_id per wire request; "
+            f"got {len(identities)} ids for {expected} requests",
+        )
+        return identities
+
+    def base_payload(
+        self,
+        sampling: ResolvedSampling,
+        *,
+        sample_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """The sampling fields every ``/generate`` payload carries."""
         block = dict(sampling.block)
         if self._response_forbidden_token_ids:
@@ -121,20 +145,17 @@ class TextLMAdapter(ModelAdapter):
             for token_id in self._response_forbidden_token_ids:
                 logit_bias[str(token_id)] = -1.0e9
             block["logit_bias"] = logit_bias
-        return {
+        payload = {
             "sampling_params": block,
             "return_logprob": sampling.return_logprob,
         }
+        if sampling.base_seed is not None:
+            require(sample_id is not None, "SGLang per-request seed derivation requires a stable sample_id")
+            payload["sampling_params"]["sampling_seed"] = derive_sampling_seed(sampling.base_seed, sample_id)
+        return payload
 
     def apply_chat_template(self, messages: List[Dict[str, Any]]) -> List[int]:
-        """Tokenize a chat conversation into ``input_ids`` via the chat template.
-
-        Only called in templated mode (``_has_chat_template``). ``messages`` is the
-        role-tagged conversation :func:`build_text_conversations` assembled (system
-        prefix + one message per turn). A failure raises: a set-but-broken template
-        (bad ``chat_template_kwargs``, jinja error) is a config bug — silently
-        switching the run's prompt format would corrupt training.
-        """
+        """Tokenize a chat conversation into ``input_ids`` via the chat template."""
         template_kwargs: Dict[str, Any] = {
             "add_generation_prompt": True,
             "tokenize": True,
@@ -151,14 +172,7 @@ class TextLMAdapter(ModelAdapter):
         return [int(t) for t in ids]
 
     def build_response(self, sample: Sample, prepared: PreparedInputs, raw: List[RawResult]) -> Sample:
-        """Fill the frontier gen ``Part`` from the seam's per-candidate results.
-
-        ``raw`` is in prompt-major order: candidate ``k`` of prompt ``i`` is at
-        index ``i * n + k`` (the seam's ordering contract) — the same group-by-
-        parent order the gen shell was forked in, so row ``j`` of the gen part
-        maps to ``raw[j]``. Each stage derives its field from ``(sample, prepared,
-        raw)`` independently in that shared order.
-        """
+        """Fill the frontier gen ``Part`` from the seam's per-candidate results."""
         gen_part = sample.parts[-1]
         n = int(prepared.resolved_n)
         n_prompts = len(prepared.prompt_token_ids)
@@ -190,32 +204,18 @@ class TextLMAdapter(ModelAdapter):
 
     @staticmethod
     def build_status(raw: List[RawResult]) -> torch.Tensor:
-        """Per-candidate terminal status (LIN-531) from the seam's ``finish_reason``:
-        ``stop`` → COMPLETED, ``length`` → TRUNCATED, ``abort`` → ABORTED, else PENDING.
-        A ``[n_candidates]`` long tensor (one ``SegmentStatus`` value per row)."""
+        """Per-candidate terminal status from the seam's ``finish_reason``, as a ``[n_candidates]`` long tensor."""
         return torch.tensor(
             [int(_FINISH_TO_STATUS.get(str(r.finish_reason), SegmentStatus.PENDING)) for r in raw],
             dtype=torch.long,
         )
 
     def build_decoded(self, sample: Sample, prepared: PreparedInputs, raw: List[RawResult]) -> Texts:
-        """Emit the RAW sampler text per candidate (verl-reference parity).
-
-        Reward grading scores the full decoded response. The predecessor's
-        think-stripping (``content or text``) silently dropped boxed answers
-        living inside think markup — Qwen3-Base emits it organically on math —
-        depressing MathBoxed rewards ~3x (observed: LIN-381 e2e #1/#2 flat at
-        ~0.035 vs the b182a511-lineage v1 references at 0.09-0.25).
-        """
+        """Emit the RAW sampler text per candidate (verl-reference parity)."""
         return Texts(texts=[r.text or "" for r in raw])
 
     def build_conditions(self, sample: Sample, prepared: PreparedInputs, raw: List[RawResult]) -> Dict[str, Any]:
-        """The replay conditions — the prompt ids the server saw, per sample.
-
-        Each prompt's ids are replicated across its ``n`` siblings (every
-        sibling was generated under the identical prompt). Overridden by the
-        VLM adapter to add the multimodal conditions.
-        """
+        """The replay conditions — the prompt ids the server saw, per sample."""
         per_sample, _ = self.replicate_per_sample(prepared)
         conditions: Dict[str, Any] = {}
         prompt_condition = pack_prompt_condition(per_sample, pad_token_id=self.pad_token_id())

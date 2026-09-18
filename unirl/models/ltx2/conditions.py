@@ -13,15 +13,7 @@ from unirl.types.conditions import TextEmbedCondition
 
 @dataclass
 class LTX2Conditions(Batch):
-    """Conditions passed to the LTX2 diffusion stage.
-
-    Slots:
-        text: Gemma3 text embeddings (via connector projection for video).
-        audio_text: Gemma3 text embeddings projected for audio (T2AV only).
-        negative_text: Negative prompt embeddings for CFG.
-        negative_audio_text: Negative audio embeddings for CFG.
-        image_latent: VAE-encoded first frame for I2V conditioning.
-    """
+    """Conditions passed to the LTX2 diffusion stage."""
 
     text: Optional[TextEmbedCondition] = concat_field(default=None)
 

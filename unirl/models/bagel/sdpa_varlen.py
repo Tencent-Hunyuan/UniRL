@@ -1,26 +1,4 @@
-"""SDPA-based ``flash_attn_varlen_func`` drop-in for the vendored BAGEL modeling.
-
-The vendored BAGEL transformer (``vendor/modeling/bagel/{qwen2_navit,siglip_navit}.py``)
-calls ``flash_attn_varlen_func`` in its GENERATION / inference attention path
-(``PackedAttention(MoT).forward_inference`` and the SigLIP vision encoder). The
-flash-attn build that exports that symbol is not always installed — e.g. an sglang
-stack that ships ``flash-attn-4`` (whose API differs and has no
-``flash_attn_varlen_func``). This module reimplements the exact varlen contract
-those call sites rely on on top of
-:func:`torch.nn.functional.scaled_dot_product_attention`, so BAGEL runs with **no
-flash-attn dependency**. (The training / replay attention path already uses SDPA /
-``flex_attention`` directly and does NOT route through this function.)
-
-Only the subset of the flash-attn signature the BAGEL call sites use is implemented:
-packed varlen q/k/v indexed by ``cu_seqlens``, grouped-query attention (q has more
-heads than k/v), and ``causal`` with **bottom-right** alignment — so a KV-cache
-decode step (``Lq=1, Lk=N``) correctly attends to all N keys.
-``F.sdpa(is_causal=True)`` top-left-aligns and would be wrong for ``Lq != Lk``, so
-the causal mask is always built explicitly.
-
-Correctness-first: the per-sequence Python loop is slower than a fused flash kernel
-for autoregressive generation. A batched block-diagonal mask is a possible follow-up.
-"""
+"""SDPA-based ``flash_attn_varlen_func`` drop-in for the vendored BAGEL modeling."""
 
 from __future__ import annotations
 
@@ -49,23 +27,7 @@ def flash_attn_varlen_func(
     causal: bool = False,
     **_: object,
 ) -> torch.Tensor:
-    """Varlen scaled-dot-product attention over packed sequences (flash-attn API).
-
-    Args mirror ``flash_attn.flash_attn_varlen_func`` for the subset BAGEL uses:
-
-    - ``q``: ``(total_q, num_heads, head_dim)`` — all query tokens, concatenated.
-    - ``k`` / ``v``: ``(total_k, num_kv_heads, head_dim)`` — all key / value tokens.
-      ``num_kv_heads`` may be ``< num_heads`` (GQA); KV heads are expanded so query
-      head ``h`` attends KV head ``h // (num_heads // num_kv_heads)``.
-    - ``cu_seqlens_q`` / ``cu_seqlens_k``: ``(batch + 1,)`` cumulative token offsets
-      segmenting the packed q / k|v into per-sequence blocks.
-    - ``causal``: bottom-right-aligned causal mask within each sequence.
-    - ``softmax_scale``: attention scale; ``None`` -> SDPA default ``1/sqrt(head_dim)``
-      (matches flash-attn's default). ``max_seqlen_*`` are accepted for API parity.
-
-    Returns ``(total_q, num_heads, head_dim)`` in ``q``'s dtype — the layout the call
-    sites then ``.reshape(-1, hidden)``.
-    """
+    """Varlen scaled-dot-product attention over packed sequences (flash-attn API)."""
     num_heads = q.shape[1]
     num_kv_heads = k.shape[1]
     head_dim = q.shape[2]

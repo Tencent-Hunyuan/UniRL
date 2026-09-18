@@ -27,13 +27,7 @@ def make_tag(ckpt: str, lora: Optional[str]) -> str:
 
 
 def resolve(ckpt: str, lora: Optional[str], work_dir: Path) -> ResolvedCkpt:
-    """``ckpt`` is the base model (HF id or local path). ``lora`` is either a PEFT
-    adapter dir or a UniRL checkpoint (``checkpoint-<step>`` dir / ``checkpoint.pt``);
-    the latter is exported once to ``work_dir/<tag>/adapter`` via
-    ``unirl.tools.export_adapter`` (works on both adapter- and full-mode saves).
-    A ``.source`` marker pins the export to its origin checkpoint, so a tag collision
-    fails loudly instead of silently evaluating another run's adapter.
-    """
+    """``ckpt`` is the base model (HF id or local path)."""
     tag = make_tag(ckpt, lora)
     if not lora:
         return ResolvedCkpt(base=ckpt, adapter=None, tag=tag)

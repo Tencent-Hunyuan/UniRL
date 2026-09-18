@@ -1,31 +1,16 @@
-"""Remote reward backend: an HTTP client for the RewardService server.
-
-Bridges the UniRL reward interface (flat images + prompts) with the
-RewardService wire format (history turns + required_rewards). One client
-handles *all* requested reward models in a single HTTP round trip because the
-server multiplexes them via ``required_rewards``.
-
-Configured as the backend on :class:`~unirl.reward.service.RewardService`::
-
-    reward:
-      _target_: unirl.reward.service.RewardService
-      backend:
-        _target_: unirl.reward.remote.RemoteRewardBackend
-        base_device: cpu
-        config:
-          _target_: unirl.reward.remote.RemoteRewardSpec
-          base_url: http://reward-server:8080
-          required_rewards: [hpsv2, clip]
-          reward_weights: {hpsv2: 0.6, clip: 0.4}
-"""
+"""Remote reward backend: an HTTP client for the RewardService server."""
 
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
+import json
 import logging
 import math
+import os
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -41,12 +26,7 @@ logger = logging.getLogger(__name__)
 
 
 def _pil_from_tensor(tensor: torch.Tensor) -> Image.Image:
-    """Convert a CHW float or uint8 tensor to a PIL RGB image.
-
-    Float tensors are clamped to ``[0, 1]`` (the producer-side contract on
-    ``RolloutSamples.decoded_images``); ``to_pil_image`` then handles the
-    uint8 conversion. Always moves to CPU before conversion.
-    """
+    """Convert a CHW float or uint8 tensor to a PIL RGB image."""
     from torchvision.transforms.functional import to_pil_image
 
     tensor = tensor.detach().cpu()
@@ -78,11 +58,7 @@ def _encode_video_b64(
     video: torch.Tensor,
     fps: int = 8,
 ) -> str:
-    """Encode a video tensor ``(C, T, H, W)`` to a base64 mp4 string.
-
-    Uses ``diffusers.utils.export_to_video`` for frame encoding, then reads
-    the bytes and base64-encodes them for HTTP transmission.
-    """
+    """Encode a video tensor ``(C, T, H, W)`` to a base64 mp4 string."""
     import tempfile
 
     from diffusers.utils import export_to_video
@@ -121,22 +97,64 @@ def _encode_video_b64(
     return base64.b64encode(video_bytes).decode("ascii")
 
 
+def _optional_rank() -> Optional[int]:
+    raw = os.environ.get("RANK")
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _payload_fingerprint(*, media_fingerprint: str, prompt: str, metadata: Any) -> str:
+    digest = hashlib.sha256()
+    digest.update(media_fingerprint.encode("ascii"))
+    digest.update(b"\0")
+    digest.update(prompt.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(json.dumps(metadata, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _wire_identity(
+    request: RewardRequest,
+    index: int,
+    *,
+    required_rewards: List[str],
+    expected_scorer_version: Optional[str],
+    payload_fingerprint: str,
+) -> Dict[str, Any]:
+    sample_id = request.sample_ids[index] if request.sample_ids and index < len(request.sample_ids) else None
+    group_id = request.group_ids[index] if request.group_ids and index < len(request.group_ids) else None
+    metadata = request.metadata[index] if request.metadata and index < len(request.metadata) else None
+    policy_version = metadata.get("policy_version") if isinstance(metadata, dict) else None
+    request_id = str(sample_id or uuid.uuid4())
+    digest_input = json.dumps(
+        {
+            "protocol": "1",
+            "request_id": request_id,
+            "required_rewards": required_rewards,
+            "policy_version": policy_version,
+            "scorer_version": expected_scorer_version,
+            "payload_fingerprint": payload_fingerprint,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return {
+        "request_id": request_id,
+        "sample_id": sample_id,
+        "group_id": group_id,
+        "source_rank": _optional_rank(),
+        "policy_version": policy_version if isinstance(policy_version, int) else None,
+        "scorer_version": expected_scorer_version,
+        "idempotency_key": hashlib.sha256(digest_input.encode("utf-8")).hexdigest(),
+    }
+
+
 class RemoteRewardBackend(RewardBackend):
-    """HTTP client backend for the remote RewardService ``POST /score`` endpoint.
-
-    Converts UniRL's ``RewardRequest`` (flat images + prompts) into
-    the RewardService wire format (list of per-sample history-turn requests),
-    calls the service, and converts the nested response back into a flat
-    ``RewardResponse``.
-
-    One instance handles all ``required_rewards`` in a single HTTP call,
-    because the RewardService server multiplexes multiple reward models
-    via the ``required_rewards`` field per request.
-
-    Constructed by ``_target_`` with a :class:`RemoteRewardSpec` config;
-    ``base_device`` is accepted for backend-interface uniformity but ignored
-    (the backend is HTTP-only).
-    """
+    """HTTP client backend for the remote RewardService ``POST /score`` endpoint."""
 
     _REDUCE_STRATEGIES = {"first", "mean", "max"}
     _AGGREGATION_METHODS = {"weighted_sum", "mean", "min", "max"}
@@ -153,6 +171,9 @@ class RemoteRewardBackend(RewardBackend):
         self.reward_weights = dict(config.reward_weights or {})
         self.max_retries = config.max_retries
         self.retry_delay = config.retry_delay
+        self.request_batch_size = config.request_batch_size
+        self.require_identity_echo = config.require_identity_echo
+        self.expected_scorer_version = config.expected_scorer_version
         self.sub_metric_reduce = config.sub_metric_reduce
         self.image_format = config.image_format
         self.image_quality = config.image_quality
@@ -167,23 +188,7 @@ class RemoteRewardBackend(RewardBackend):
         self._session.trust_env = False
 
     def compute_rewards(self, request: RewardRequest) -> RewardResponse:
-        """Convert a UniRL request, call the remote service, and
-        convert the response back.
-
-        Video requests are rejected explicitly: this executor only knows the
-        image-history wire format, and silently falling through would yield
-        all-zero rewards that corrupt downstream advantage computation.
-
-        By default (``raise_on_failure=True``) HTTP errors and malformed
-        responses are propagated as exceptions so that corrupted zero-rewards
-        never silently enter the training loop.  Set ``raise_on_failure=False``
-        for a degraded mode that returns zeroed rewards on failure.
-
-        Returns:
-            A ``RewardResponse`` with ``rewards`` (one float per sample —
-            the weighted aggregation of all required_rewards), and
-            ``component_rewards`` keyed by reward name.
-        """
+        """Convert a UniRL request, call the remote service, and"""
         start = time.time()
         if request.is_video:
             return self._compute_video_rewards(request, start)
@@ -191,7 +196,7 @@ class RemoteRewardBackend(RewardBackend):
         bs = request.batch_size
         try:
             payload = self._build_score_payload(request)
-            raw = self._post_score(payload)
+            raw = self._post_score_requests(payload["requests"])
             return self._parse_score_response(raw, bs, time.time() - start)
         except Exception:
             if self.raise_on_failure:
@@ -205,12 +210,7 @@ class RemoteRewardBackend(RewardBackend):
             )
 
     def is_available(self) -> bool:
-        """Ping ``/health``; ``True`` iff the server is reachable.
-
-        On the first successful ping also runs roster validation
-        (see ``_validate_required_rewards_once``); transport errors and
-        non-200 still return ``False``.
-        """
+        """Ping ``/health``; ``True`` iff the server is reachable."""
         try:
             resp = self._session.get(
                 f"{self.base_url}/health",
@@ -224,13 +224,7 @@ class RemoteRewardBackend(RewardBackend):
         return True
 
     def _validate_required_rewards_once(self, health_resp: http_requests.Response) -> None:
-        """One-shot: ``raise ValueError`` if any required reward is not in the
-        ``/health`` roster (catches component-name typos at startup, not at
-        first ``/score`` call); log the full roster at INFO on success.
-
-        Expected ``/health`` body shape:
-        ``{"status": "ok", "rewards": {<name>: [<readiness>, ...], ...}}``.
-        """
+        """One-shot: ``raise ValueError`` if any required reward is not in the"""
         if self._remote_rewards_validated:
             return
 
@@ -268,22 +262,7 @@ class RemoteRewardBackend(RewardBackend):
         self._session.close()
 
     def _build_score_payload(self, request: RewardRequest) -> Dict[str, Any]:
-        """Convert a UniRL ``RewardRequest`` into the RewardService
-        ``ScoreRequest`` JSON payload.
-
-        Each sample ``(images[i], prompts[i])`` becomes one entry in the
-        wire-format ``requests`` list, with
-        ``history = [{"text": prompt, "image_b64": ...}]`` and
-        ``required_rewards`` set to ``self.required_rewards``.
-
-        When the request carries condition images in ``primitives["image"]``
-        (e.g. image-editing pipelines), a two-turn history is built:
-            history[0] = {"text": prompt, "image_b64": condition_image}
-            history[1] = {"text": prompt, "image_b64": generated_image}
-        This matches the EditReward scorer's input convention.
-
-        Per-sample metadata from ``request.metadata`` is forwarded when present.
-        """
+        """Convert a UniRL ``RewardRequest`` into the RewardService"""
         images = request.images or []
         prompts = request.prompts
         metadata_list = request.metadata
@@ -312,37 +291,52 @@ class RemoteRewardBackend(RewardBackend):
                     {"text": prompt, "image_b64": condition_b64},
                     {"text": prompt, "image_b64": image_b64},
                 ]
+                media_fingerprint = hashlib.sha256(f"{condition_b64}:{image_b64}".encode("ascii")).hexdigest()
             else:
                 history = [{"text": prompt, "image_b64": image_b64}]
+                media_fingerprint = hashlib.sha256(image_b64.encode("ascii")).hexdigest()
 
+            identity = _wire_identity(
+                request,
+                idx,
+                required_rewards=self.required_rewards,
+                expected_scorer_version=self.expected_scorer_version,
+                payload_fingerprint=_payload_fingerprint(
+                    media_fingerprint=media_fingerprint,
+                    prompt=prompt,
+                    metadata=sample_metadata,
+                ),
+            )
             wire_requests.append(
                 {
                     "history": history,
                     "required_rewards": list(self.required_rewards),
                     "metadata": sample_metadata,
+                    **identity,
                 }
             )
 
-        return {"requests": wire_requests}
+        return {"protocol_version": "1", "requests": wire_requests}
 
     def _get_condition_images(self, request: RewardRequest) -> Optional[List[Union[Image.Image, torch.Tensor]]]:
-        """Extract per-sample condition images from request primitives.
-
-        Returns None if no condition images are present (pure T2I case).
-        """
+        """Extract per-sample condition images from request primitives."""
         prim_image = request.primitives.get("image")
         if prim_image is None:
             return None
+        from unirl.types.primitives import Images
+
+        if not isinstance(prim_image, Images):
+            raise TypeError(f"request.primitives['image'] must be Images, got {type(prim_image).__name__}")
         from unirl.utils.media import tensor_frame_to_pil
 
-        return [tensor_frame_to_pil(img) for img in prim_image.pixels.unbind(0)]
+        return [tensor_frame_to_pil(image.pixels) for image in prim_image.to_list()]
 
     def _compute_video_rewards(self, request: RewardRequest, start: float) -> RewardResponse:
         """Send video tensors to the remote service and parse the response."""
         bs = request.batch_size
         try:
             payload = self._build_video_score_payload(request)
-            raw = self._post_score(payload)
+            raw = self._post_score_requests(payload["requests"])
             return self._parse_score_response(raw, bs, time.time() - start)
         except Exception:
             if self.raise_on_failure:
@@ -356,18 +350,7 @@ class RemoteRewardBackend(RewardBackend):
             )
 
     def _build_video_score_payload(self, request: RewardRequest) -> Dict[str, Any]:
-        """Convert a video ``RewardRequest`` into the RewardService ``ScoreRequest``
-        JSON payload.
-
-        Mirrors :meth:`_build_score_payload`: each sample ``(videos[i],
-        prompts[i])`` becomes one wire request whose single history turn carries
-        ``{"text": prompt, "video_b64": ...}``. The server's ``HistoryTurn``
-        schema requires a history list — a flat ``{"video_b64", "prompt"}`` body
-        is rejected with HTTP 422 — so video and image payloads share the same
-        history-turn shape.
-
-        Per-sample metadata from ``request.metadata`` is forwarded when present.
-        """
+        """Convert a video ``RewardRequest`` into the RewardService ``ScoreRequest``"""
         videos = request.videos or []
         prompts = request.prompts
         metadata_list = request.metadata
@@ -379,22 +362,86 @@ class RemoteRewardBackend(RewardBackend):
             sample_metadata = None
             if metadata_list is not None and idx < len(metadata_list):
                 sample_metadata = metadata_list[idx]
+            identity = _wire_identity(
+                request,
+                idx,
+                required_rewards=self.required_rewards,
+                expected_scorer_version=self.expected_scorer_version,
+                payload_fingerprint=_payload_fingerprint(
+                    media_fingerprint=hashlib.sha256(video_b64.encode("ascii")).hexdigest(),
+                    prompt=prompt,
+                    metadata=sample_metadata,
+                ),
+            )
             wire_requests.append(
                 {
                     "history": [{"text": prompt, "video_b64": video_b64}],
                     "required_rewards": list(self.required_rewards),
                     "metadata": sample_metadata,
+                    **identity,
                 }
             )
 
-        return {"requests": wire_requests}
+        return {"protocol_version": "1", "requests": wire_requests}
+
+    def _post_score_requests(self, wire_requests: List[Dict[str, Any]]) -> Dict[str, Any]:
+        if not wire_requests:
+            return {"protocol_version": "1", "results": [], "errors": []}
+        request_batch_size = self.request_batch_size or len(wire_requests)
+        merged_results: List[Dict[str, Dict[str, float]]] = []
+        merged_errors: List[Dict[str, str]] = []
+
+        for start in range(0, len(wire_requests), request_batch_size):
+            chunk = wire_requests[start : start + request_batch_size]
+            raw = self._post_score({"protocol_version": "1", "requests": chunk})
+            response_version = raw.get("protocol_version")
+            if response_version is not None and response_version != "1":
+                raise ValueError(f"RewardService protocol_version={response_version!r}, expected '1'")
+            results = list(raw.get("results") or [])
+            errors = list(raw.get("errors") or [])
+            identities = list(raw.get("identities") or [])
+            if len(results) > len(chunk) or len(errors) > len(chunk):
+                raise ValueError(
+                    f"RewardService returned more rows than requested for chunk {start}: "
+                    f"results={len(results)} errors={len(errors)} requested={len(chunk)}"
+                )
+            results.extend({} for _ in range(len(chunk) - len(results)))
+            errors.extend({} for _ in range(len(chunk) - len(errors)))
+
+            if identities:
+                if len(identities) != len(chunk):
+                    raise ValueError(
+                        f"RewardService identity count {len(identities)} != requested chunk size {len(chunk)}"
+                    )
+                for expected, actual in zip(chunk, identities, strict=True):
+                    self._validate_identity_echo(expected, actual)
+            elif self.require_identity_echo:
+                raise ValueError("RewardService response omitted required item identities")
+
+            merged_results.extend(results)
+            merged_errors.extend(errors)
+
+        return {
+            "protocol_version": "1",
+            "results": merged_results,
+            "errors": merged_errors,
+        }
+
+    def _validate_identity_echo(self, expected: Dict[str, Any], actual: Dict[str, Any]) -> None:
+        for key in ("request_id", "sample_id", "group_id", "source_rank", "policy_version", "idempotency_key"):
+            if actual.get(key) != expected.get(key):
+                raise ValueError(
+                    f"RewardService identity mismatch for {key}: expected {expected.get(key)!r}, "
+                    f"got {actual.get(key)!r}"
+                )
+        if self.expected_scorer_version is not None and actual.get("scorer_version") != self.expected_scorer_version:
+            raise ValueError(
+                f"RewardService scorer_version={actual.get('scorer_version')!r} "
+                f"!= expected {self.expected_scorer_version!r}"
+            )
 
     def _post_score(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """POST to ``/score`` with retry logic.
-
-        Raises ``RuntimeError`` chained from the last underlying exception
-        if all retries are exhausted.
-        """
+        """POST to ``/score`` with retry logic."""
         url = f"{self.base_url}/score"
         last_exc: Optional[BaseException] = None
 
@@ -411,6 +458,9 @@ class RemoteRewardBackend(RewardBackend):
                     self.max_retries,
                 )
             except http_requests.exceptions.RequestException as e:
+                response = getattr(e, "response", None)
+                if response is not None and 400 <= response.status_code < 500 and response.status_code != 429:
+                    raise
                 last_exc = e
                 logger.warning(
                     "RemoteRewardBackend: %s (attempt %d/%d)",
@@ -430,18 +480,7 @@ class RemoteRewardBackend(RewardBackend):
         batch_size: int,
         compute_time: float,
     ) -> RewardResponse:
-        """Convert the RewardService ``ScoreResponse`` JSON into a UniRL
-        ``RewardResponse``.
-
-        For each sample *i*:
-
-        1. Extract ``results[i][reward_name] → {sub_metric: float}``.
-        2. Reduce sub-metrics to one float per reward via
-           ``_reduce_sub_metrics``.
-        3. Store per-reward scores in ``component_rewards``.
-        4. Aggregate across rewards → ``rewards[i]`` using
-           ``self.aggregation_method``.
-        """
+        """Convert the RewardService ``ScoreResponse`` JSON into a UniRL"""
         results: List[Dict[str, Dict[str, float]]] = raw.get("results", [])
         errors_list: List[Dict[str, str]] = raw.get("errors", [])
 
@@ -504,14 +543,7 @@ class RemoteRewardBackend(RewardBackend):
         )
 
     def _aggregate_scores(self, scores: List[float], weights: List[float]) -> float:
-        """Aggregate per-reward scores for one sample.
-
-        Strategies:
-            ``"weighted_sum"``: ``Σ(score_k * w_k) / Σ(w_k)``.
-            ``"mean"``: arithmetic mean (ignores weights).
-            ``"min"``: minimum score across rewards.
-            ``"max"``: maximum score across rewards.
-        """
+        """Aggregate per-reward scores for one sample."""
         if not scores:
             return 0.0
         if self.aggregation_method == "weighted_sum":
@@ -525,14 +557,7 @@ class RemoteRewardBackend(RewardBackend):
 
     @staticmethod
     def _first_non_finite(sub_metrics: Dict[str, float]) -> Optional[Tuple[str, Any]]:
-        """Return the first ``(name, value)`` whose value is not a finite number.
-
-        Catches ``None`` (a server-side NaN that serialized to JSON ``null``),
-        ``NaN`` / ``inf`` floats, booleans, and non-numeric junk. Returns
-        ``None`` when every value is a finite number. Used to convert an
-        unusable reward into a sample failure before it reaches advantage
-        computation.
-        """
+        """Return the first ``(name, value)`` whose value is not a finite number."""
         for name, value in sub_metrics.items():
             if (
                 value is None
@@ -544,16 +569,9 @@ class RemoteRewardBackend(RewardBackend):
         return None
 
     def _reduce_sub_metrics(self, sub_metrics: Dict[str, float]) -> float:
-        """Collapse a reward's sub-metric dict into a single float.
-
-        Strategies:
-            ``"first"``: value of the first sub-metric
-                (stable iteration order in Python 3.7+).
-            ``"mean"``: arithmetic mean of all sub-metric values.
-            ``"max"``: maximum sub-metric value.
-        """
+        """Collapse a reward's sub-metric dict into a single float."""
         if not sub_metrics:
-            return 0.0
+            raise ValueError("RewardService returned an empty sub-metric mapping")
         values = list(sub_metrics.values())
         if self.sub_metric_reduce == "first":
             return float(values[0])
@@ -564,11 +582,7 @@ class RemoteRewardBackend(RewardBackend):
 
 @dataclass
 class RemoteRewardSpec(BaseRewardComponentSpec):
-    """Typed config for the remote RewardService backend.
-
-    Registered as a polymorphic ``reward/component``; one instance multiplexes
-    all ``required_rewards`` in a single HTTP round-trip to ``base_url``.
-    """
+    """Typed config for the remote RewardService backend."""
 
     base_url: str = ""
     required_rewards: Tuple[str, ...] = ()
@@ -577,6 +591,12 @@ class RemoteRewardSpec(BaseRewardComponentSpec):
     timeout: float = 300.0
     max_retries: int = 3
     retry_delay: float = 1.0
+    # Transport chunking is independent from scorer/model micro-batching.
+    # None preserves the legacy one-POST-per-DP-shard behavior.
+    request_batch_size: Optional[int] = None
+    require_identity_echo: bool = False
+    # Managed/direct single-scorer servers only; the multi-reward gateway rejects a pin.
+    expected_scorer_version: Optional[str] = None
     sub_metric_reduce: str = "first"
     aggregation_method: str = "weighted_sum"
     image_format: str = "JPEG"
@@ -601,6 +621,10 @@ class RemoteRewardSpec(BaseRewardComponentSpec):
         require(
             self.retry_delay >= 0,
             f"RemoteRewardSpec.retry_delay must be >= 0; got {self.retry_delay!r}",
+        )
+        require(
+            self.request_batch_size is None or self.request_batch_size >= 1,
+            f"RemoteRewardSpec.request_batch_size must be None or >= 1; got {self.request_batch_size!r}",
         )
         require(
             self.sub_metric_reduce in {"first", "mean", "max"},

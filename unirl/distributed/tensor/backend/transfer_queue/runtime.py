@@ -1,17 +1,4 @@
-"""Driver- and actor-side TransferQueue lifecycle.
-
-``TransferQueueRuntime`` owns the per-process state — the TQ client plus the
-driver-only ``Backend`` and ``TransferQueueController`` anchors — and exposes
-it as instance methods. Exactly one runtime is "current" per process; the
-``TQTransport`` wraps the client for the ``TensorTransport`` interface.
-
-The driver instantiates one runtime, calls ``install()`` to bind it as
-current, then ``init(cfg)`` to spawn the controller and bootstrap the
-backend. ``init`` returns the *(controller_handoff, actor_handoff)* tuple
-that flows over Ray RPC; both sides ultimately feed their handoff to
-``create_client``. Disabled = ``cfg.transfer_queue`` is absent — ``init``
-returns ``None`` and the runtime stays empty.
-"""
+"""Driver- and actor-side TransferQueue lifecycle."""
 
 from __future__ import annotations
 
@@ -45,11 +32,7 @@ def _get_local_ip() -> str:
 
 
 def _run_async_in_temp_loop(async_func: Callable[..., Any], *args, **kwargs) -> Any:
-    """Run a coroutine on a fresh background event loop.
-
-    Needed because the calling context (server mode) may already own an event
-    loop, and we can't reuse it for synchronous bridging.
-    """
+    """Run a coroutine on a fresh background event loop."""
     tmp_event_loop = asyncio.new_event_loop()
     thread = threading.Thread(
         target=tmp_event_loop.run_forever,
@@ -75,13 +58,7 @@ def _run_async_in_temp_loop(async_func: Callable[..., Any], *args, **kwargs) -> 
 
 
 class TransferQueueRuntime:
-    """Per-process owner of the TransferQueue client + driver-side anchors.
-
-    Exactly one runtime is "current" per process. ``current()`` returns it,
-    ``install()`` binds ``self`` as current, ``clear_current()`` unbinds.
-    On actors, ``backend`` and ``controller`` stay ``None``; on the driver,
-    ``init()`` populates them.
-    """
+    """Per-process owner of the TransferQueue client + driver-side anchors."""
 
     _current: "TransferQueueRuntime | None" = None
 
@@ -108,10 +85,7 @@ class TransferQueueRuntime:
         cls._current = None
 
     def init(self, cfg: DictConfig) -> "tuple[dict, dict] | None":
-        """Spawn controller + backend-side actors; return ``(controller, actor)`` handoffs.
-
-        Returns ``None`` when ``cfg.transfer_queue`` is absent (TQ disabled).
-        """
+        """Spawn controller + backend-side actors; return ``(controller, actor)`` handoffs."""
         tq_cfg = cfg.get("transfer_queue")
         if tq_cfg is None:
             return None

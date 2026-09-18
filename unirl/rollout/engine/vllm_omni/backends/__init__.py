@@ -1,11 +1,4 @@
-"""The backend seam — the stable public import surface.
-
-Consumers import from this package (``from ...backends import Backend,
-VLLMOmniBackend``); the inner layout stays private so impl additions are
-consumer-invisible. ``base`` is runtime-free; ``native`` lazy-imports the
-vllm-omni runtime only inside ``boot`` and the verbs, so this package imports
-on CPU.
-"""
+"""The backend seam — the stable public import surface."""
 
 from unirl.rollout.engine.vllm_omni.backends.base import (
     STAGE_KIND_AR,

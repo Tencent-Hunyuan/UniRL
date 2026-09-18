@@ -1,9 +1,4 @@
-"""Construction config for the typed SD3 pipeline.
-
-Weights + params only — LoRA injection, FSDP wrapping, adapter switching,
-gradient checkpointing, and offload control live outside the bundle (in
-the training / rollout actors).
-"""
+"""Construction config for the typed SD3 pipeline."""
 
 from __future__ import annotations
 
@@ -15,12 +10,7 @@ from unirl.config.validation import validate_precision_type
 
 @dataclass
 class SD3PipelineConfig:
-    """Construction args for ``SD3Pipeline.from_config``.
-
-    ``device`` may be runtime‑injected by the actor after compose; the
-    other fields are set at compose time and read once during pipeline
-    construction.
-    """
+    """Construction args for ``SD3Pipeline.from_config``."""
 
     pretrained_model_ckpt_path: str
     vae_ckpt_path: Optional[str] = None

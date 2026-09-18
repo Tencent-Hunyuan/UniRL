@@ -1,19 +1,4 @@
-"""TensorStore — worker-local tensor registry with ref-counting.
-
-Each worker holds one TensorStore instance. Tensors stay on the worker's
-device; only lightweight ColocateTensorHandle refs cross the Ray RPC boundary.
-
-Single-slot per device (DevicePool enforces ``workers_per_device == 1`` for the
-colocate backend), so the store never shares tensors across processes — no CUDA-IPC,
-no IPC reclaim. Cross-device moves go through NCCL. Colocated multi-slot is gpu_store's
-job.
-
-Lifecycle:
-  put(tensor) → ColocateTensorHandle (ref_count=1)
-  incref(key) → ref_count += 1  (called by ColocateTensorHandle.__copy__ on controller)
-  decref(key) → ref_count -= 1  (called by ColocateTensorHandle._release on controller GC)
-                if ref_count == 0 → storage freed
-"""
+"""TensorStore — worker-local tensor registry with ref-counting."""
 
 from __future__ import annotations
 
@@ -31,11 +16,7 @@ from unirl.distributed.tensor.backend.colocate_store.handle import ColocateTenso
 
 
 class TensorStore:
-    """Worker-local GPU tensor registry with reference counting.
-
-    Thread-safe: all mutations protected by a lock for concurrent
-    put/get/incref/decref from Ray async calls.
-    """
+    """Worker-local GPU tensor registry with reference counting."""
 
     def __init__(
         self,
@@ -57,12 +38,7 @@ class TensorStore:
         self._global_pg = None
 
     def put(self, tensor: Tensor) -> ColocateTensorHandle:
-        """Store a tensor and return a lightweight ColocateTensorHandle.
-
-        CUDA tensors: a contiguous copy is stored under a fresh key.
-        CPU tensors: stored in Ray plasma store via ray.put(); not tracked here.
-          Lifecycle managed by ObjectRef Python refcount (no decref RPC needed).
-        """
+        """Store a tensor and return a lightweight ColocateTensorHandle."""
         if not tensor.is_cuda:
             return ColocateTensorHandle(
                 store_key=None,
@@ -89,11 +65,7 @@ class TensorStore:
         )
 
     def get(self, handle: ColocateTensorHandle) -> Tensor:
-        """Return the stored tensor for this handle.
-
-        This is the only safe public API for retrieving a stored tensor.
-        Always use this — never access the store by key directly.
-        """
+        """Return the stored tensor for this handle."""
         with self._lock:
             if handle.store_key not in self._store:
                 raise KeyError(f"TensorStore: key '{handle.store_key}' not found")
@@ -114,10 +86,7 @@ class TensorStore:
             self._ref_counts[key] += 1
 
     def decref(self, key: str) -> None:
-        """Decrement reference count. If zero, release the storage.
-
-        Called by ColocateTensorHandle._release (GC finalizer on controller side).
-        """
+        """Decrement reference count. If zero, release the storage."""
         with self._lock:
             if key not in self._ref_counts:
                 raise KeyError(f"TensorStore: cannot decref unknown key '{key}'")
@@ -127,15 +96,7 @@ class TensorStore:
                 del self._ref_counts[key]
 
     def setup_global_pg(self, global_rank: int, global_world_size: int) -> None:
-        """Initialize the global ProcessGroup for cross-worker NCCL transfers.
-
-        Always uses ProcessGroupNCCL directly via TCPStore so the global dist
-        state (init_process_group) is never touched — each Role group manages
-        its own dist process group without interference.
-
-        MASTER_ADDR and MASTER_PORT must be set in the environment (injected by
-        DevicePool via Worker runtime_env).
-        """
+        """Initialize the global ProcessGroup for cross-worker NCCL transfers."""
         self.global_rank = global_rank
         self.global_world_size = global_world_size
 
@@ -150,15 +111,7 @@ class TensorStore:
         self._global_pg.eager_connect_single_device(torch.device(self.device))
 
     def _nccl_send(self, dst_rank: int, items: List) -> None:
-        """Send stored tensors (or row ranges of them) to dst_rank via NCCL.
-
-        Each item is ``(store_key, start, stop)`` — a span ships only its
-        ``[start:stop)`` rows (exact-row routing); ``(key, None, None)`` sends the
-        whole block. Uses ProcessGroupNCCL.send() natively so a privately-created
-        PG (not registered in the global dist world) works; each tensor is sent
-        separately so send/recv stay in sync. Single-slot per device, so every
-        key is in this worker's own store.
-        """
+        """Send stored tensors (or row ranges of them) to dst_rank via NCCL."""
         assert self._global_pg is not None, "Global PG not initialized. Call setup_global_pg first."
         for item in items:
             key, start, stop = (item, None, None) if isinstance(item, str) else item

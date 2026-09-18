@@ -1,13 +1,4 @@
-"""``VLMAdapter`` — the narrowest VLM overrides on the text base.
-
-Differs from :class:`TextLMAdapter` in exactly the steps the modality forces:
-``build_inputs`` processor-encodes each ``(prompt, image)`` pair (the
-chat-templated TEXT with a single placeholder + base64 ``image_data`` go to SRT,
-which re-expands it server-side; the processor's EXPANDED ids become the replay
-prompt), and ``build_conditions`` adds the per-sample ``pixel_values`` /
-``image_grid_thw`` so the replay teacher-forces over the IDENTICAL multimodal
-input — the importance ratio stays consistent.
-"""
+"""``VLMAdapter`` — the narrowest VLM overrides on the text base."""
 
 from __future__ import annotations
 
@@ -47,19 +38,20 @@ class VLMAdapter(TextLMAdapter):
     def build_inputs(self, sample: Sample, *, sampling: ResolvedSampling) -> PreparedInputs:
         conversations, images_list, k = build_vision_conversations(sample, sampling.system_instruction)
         require(
-            k == sampling.n,
+            k == sampling.fanout,
             f"{type(self).__name__}.build_inputs: de-expanded fan-out k={k} != "
-            f"resolved n={sampling.n}; conversation grouping and the sampling block "
+            f"resolved fanout={sampling.fanout}; conversation grouping and the sampling block "
             "disagree on the gen branch.",
         )
 
         wire: List[Dict[str, Any]] = []
         prompt_token_ids: List[List[int]] = []
-        mm_encs: List[MMEncoding] = []
-        for messages, images in zip(conversations, images_list):
-            mm = self.encode_mm(messages, images)
-            mm_encs.append(mm)
-            payload = self.base_payload(sampling)
+        mm_encs = [self.encode_mm(messages, images) for messages, images in zip(conversations, images_list)]
+        if sampling.base_seed is not None:
+            mm_encs = [mm for mm in mm_encs for _ in range(k)]
+        sample_ids = self._wire_seed_identities(sample, sampling, expected=len(mm_encs))
+        for mm, sample_id in zip(mm_encs, sample_ids):
+            payload = self.base_payload(sampling, sample_id=sample_id)
             payload["text"] = mm.text
             payload["image_data"] = pil_to_base64(mm.image)
             wire.append(payload)
@@ -73,19 +65,7 @@ class VLMAdapter(TextLMAdapter):
         )
 
     def encode_mm(self, messages: List[Dict[str, Any]], images: List[Any]) -> MMEncoding:
-        """Processor-encode one conversation + its image(s) into the native layout.
-
-        ``messages`` is the fused chat conversation :func:`build_vision_conversations`
-        assembled (image placeholder before text in the user message); ``images``
-        are its PILs in placeholder order. Returns a fully-populated
-        :class:`MMEncoding`: ``input_ids`` already has the placeholder expanded to
-        the per-image vision-token count — the SAME encoding the trainside replay
-        teacher-forces over (``input_ids`` + ``pixel_values``), so rollout and
-        replay are token-for-token identical.
-
-        One image per request (``image_data`` / ``MMEncoding.image`` carry a single
-        PIL); multi-image conversations are out of scope.
-        """
+        """Processor-encode one conversation + its image(s) into the native layout."""
         require(
             len(images) == 1,
             f"{type(self).__name__}.encode_mm: expected exactly one image per request, "
@@ -118,13 +98,7 @@ class VLMAdapter(TextLMAdapter):
         )
 
     def build_conditions(self, sample: Sample, prepared: PreparedInputs, raw: List[RawResult]) -> Dict[str, Any]:
-        """Add per-sample ``pixel_values`` / ``image_grid_thw`` to the base.
-
-        Replicated from the prompt-level processor encoding so each sibling
-        sample carries the image condition its rollout was generated under
-        (per-sample lists with FieldKind.CONCAT semantics — they survive the
-        DP split/merge and reach the replay aligned with ``prompt``).
-        """
+        """Add per-sample ``pixel_values`` / ``image_grid_thw`` to the base."""
         conditions = super().build_conditions(sample, prepared, raw)
         if prepared.mm:
             _, prompt_index = self.replicate_per_sample(prepared)

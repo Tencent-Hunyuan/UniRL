@@ -1,11 +1,4 @@
-"""Full base-weight sync handlers for the v2 trainer.
-
-- ``NCCLWeightSync``   — separate slabs (cross-node capable).
-- ``TensorWeightSync`` — colocate, serialized-tensor handoff.
-- ``IPCWeightSync``    — colocate, bucketed CUDA-IPC over ZMQ (same-node).
-
-All subclass ``FullWeightSync`` and are referenced from configs via ``_target_``.
-"""
+"""Full base-weight sync handlers for the v2 trainer."""
 
 from unirl.distributed.weight_sync.full.base import FullWeightSync
 from unirl.distributed.weight_sync.full.ipc import IPCWeightSync

@@ -1,11 +1,4 @@
-"""SD3.5 family: output sub-adapter + the ``sd35_t2i`` modality class.
-
-Single diffusion stage, TP=1. The request side is the shared
-:class:`~.dit.DitInputAdapter` skeleton used directly (prompt dicts are the
-``{"prompt", "negative_prompt"}`` shape ``StableDiffusion3Pipeline.forward``
-accepts); the response side derives from :class:`~.dit.DitOutputAdapter`
-with conditions from the ``encode_prompt`` text capture.
-"""
+"""SD3.5 family: output sub-adapter + the ``sd35_t2i`` modality class."""
 
 from __future__ import annotations
 
@@ -21,6 +14,7 @@ from unirl.rollout.engine.vllm_omni.adapters.dit import (
     _negative_prompt_from_params,
 )
 from unirl.rollout.engine.vllm_omni.backends import GenerateCall, OmniRawResult, StageSampling
+from unirl.rollout.engine.vllm_omni.pipelines._shared.interception import read_captures
 from unirl.rollout.engine.vllm_omni.utils import collect_dit_outputs
 from unirl.types.conditions.text import TextEmbedCondition
 from unirl.types.sample import Sample
@@ -53,22 +47,16 @@ class Sd3OutputAdapter(DitOutputAdapter):
     """Single diffusion-Part response with SD3 text-capture conditions."""
 
     def build_conditions(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
-        """Concat the per-request SD3 ``text_capture`` dicts into one condition.
-
-        Written by ``RLStableDiffusion3Pipeline`` after intercepting
-        ``encode_prompt``. All per-request encodes share the same ``L`` (T5
-        padding to ``max_sequence_length`` is fixed), so a plain dim-0 concat
-        suffices.
-        """
+        """Concat the per-request SD3 ``text_capture`` dicts into one condition."""
         diff_outputs, _, _ = collect_dit_outputs(
             per_request, final_output_type=self.final_output_type, stage_id=self.stage_id, modality=self.modality
         )
 
-        captures = [(getattr(d, "custom_output", None) or {}).get("text_capture") for d in diff_outputs]
+        captures = [read_captures(d).get("text_capture") for d in diff_outputs]
         if any(c is None for c in captures):
             raise RuntimeError(
                 "build_response: SD3 rollout returned no 'text_capture' on "
-                "DiffusionOutput.custom_output. Check that "
+                "the output envelope's unirl metadata. Check that "
                 "RLStableDiffusion3Pipeline._install_encode_prompt_hook ran "
                 "in every DiT worker — the subclass swap may not have taken "
                 "effect (verify custom_pipeline_args.pipeline_class in the "

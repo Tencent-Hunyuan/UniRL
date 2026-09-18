@@ -1,11 +1,4 @@
-"""Prompt templates for the VideoAlign reward model.
-
-Verbatim port of ``mmrl/recipes/rewards/videoalign/vendor/videoalign/prompt_template.py``.
-The string constants are part of the *training contract* of the published
-checkpoints — changing them would silently shift the reward distribution
-(the Qwen2-VL chat template was fed exactly these strings during reward-model
-training). Do not edit unless you are retraining from scratch.
-"""
+"""Prompt templates for the VideoAlign reward model."""
 
 from __future__ import annotations
 
@@ -127,23 +120,7 @@ def build_prompt(
     dimension: Union[str, List[str]],
     template_type: str,
 ) -> str:
-    """Render the user-message text for the Qwen2-VL chat template.
-
-    Args:
-        prompt: the text-to-video user prompt that produced the candidate
-            generation. May be ``""`` for the ``"none"`` template (then the
-            user message is empty — the model still reads the video frames).
-        dimension: ``"VQ"`` / ``"MQ"`` / ``"TA"`` / ``"Overall"`` (or a list
-            for multi-dim prompts). Drives the ``{dimension_name}`` /
-            ``{dimension_description}`` placeholders.
-        template_type: must match what the checkpoint was trained with. Read
-            this from ``model_config.json::data_config.prompt_template_type``.
-            One of ``"none"`` / ``"simple"`` / ``"video_score"`` /
-            ``"detailed_special"`` / ``"detailed"``.
-
-    Returns:
-        The fully rendered user message string.
-    """
+    """Render the user-message text for the Qwen2-VL chat template."""
     if isinstance(dimension, list) and len(dimension) > 1:
         dimension_name = ", ".join(DIMENSION_DESCRIPTIONS[d][0] for d in dimension)
         dimension_name = f"overall performance({dimension_name})"

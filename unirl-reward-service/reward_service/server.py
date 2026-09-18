@@ -14,81 +14,19 @@ return scores. The per-reward deadline is `server.score_timeout_s`.
 from __future__ import annotations
 
 import asyncio
-import base64
-import io
 from collections import defaultdict
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
-from PIL import Image
 
 from reward_service.config import ServiceCfg
 from reward_service.logging_utils import get_logger
-from reward_service.schemas import HistoryTurn, RewardRequest, ScoreRequest, ScoreResponse
+from reward_service.schemas import PROTOCOL_VERSION, RewardRequest, ScoreRequest, ScoreResponse
 from reward_service.scorers import ScoreItem
+from reward_service.wire import request_to_item
 from reward_service.workers.pool import WorkerPool
 
 logger = get_logger(__name__)
-
-
-def _decode_image(b64: str) -> Image.Image:
-    try:
-        raw = base64.b64decode(b64)
-        return Image.open(io.BytesIO(raw)).convert("RGB")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"invalid image_b64: {e}") from e
-
-
-def _resolve_video(turn: HistoryTurn) -> bytes | str | None:
-    """Return the video source for a turn, in the form scorers expect.
-
-    Three branches, kept zero-copy when possible:
-
-    * ``video_path`` set → return the path string after a stat check.
-      The scorer (e.g. videoalign / decord) opens it directly on the
-      shared filesystem, no bytes round-trip.
-    * ``video_b64`` set → base64-decode and return the raw bytes; the
-      scorer is responsible for spilling to a tempfile if its decoder
-      needs a path.
-    * Neither set → ``None`` (turn has no video, e.g. an image-only
-      request that happens to ride alongside a video request in the
-      same batch).
-    """
-    if turn.video_path is not None:
-        p = Path(turn.video_path)
-        if not p.is_file():
-            raise HTTPException(
-                status_code=400,
-                detail=f"video_path does not exist or is not a regular file: {turn.video_path}",
-            )
-        return str(p)
-    if turn.video_b64 is not None:
-        try:
-            return base64.b64decode(turn.video_b64)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"invalid video_b64: {e}") from e
-    return None
-
-
-def _request_to_item(req: RewardRequest) -> ScoreItem:
-    if not req.history:
-        raise HTTPException(status_code=400, detail="history must not be empty")
-    history: list[tuple[str, Image.Image | None]] = []
-    videos: list[bytes | str | None] = []
-    any_video = False
-    for turn in req.history:
-        image = _decode_image(turn.image_b64) if turn.image_b64 is not None else None
-        history.append((turn.text, image))
-        video = _resolve_video(turn)
-        if video is not None:
-            any_video = True
-        videos.append(video)
-    return ScoreItem(
-        history=history,
-        videos=tuple(videos) if any_video else None,
-        metadata=req.metadata,
-    )
 
 
 def _bucket_by_reward(
@@ -172,23 +110,31 @@ def create_app(cfg: ServiceCfg) -> FastAPI:
     @app.post("/score", response_model=ScoreResponse)
     async def score(body: ScoreRequest) -> ScoreResponse:
         pool: WorkerPool = app.state.pool
+        if body.protocol_version != PROTOCOL_VERSION:
+            raise HTTPException(status_code=400, detail=f"unsupported protocol_version={body.protocol_version!r}")
+        if any(request.scorer_version is not None for request in body.requests):
+            # One gateway request may name several rewards and the pool reports no
+            # per-scorer version, so this identity field can never be filled in
+            # truthfully here. Say so instead of echoing None and making the client
+            # reject every response as a version mismatch.
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "scorer_version pinning is not supported by the multi-reward gateway; "
+                    "omit the scorer_version pin (expected_scorer_version in RemoteRewardSpec) "
+                    "or point the client at a managed single-scorer child"
+                ),
+            )
         if not body.requests:
             return ScoreResponse(results=[], errors=[])
 
-        items = await asyncio.to_thread(
-            lambda: [_request_to_item(r) for r in body.requests]
-        )
+        items = await asyncio.to_thread(lambda: [request_to_item(r) for r in body.requests])
         buckets = _bucket_by_reward(body.requests, items, pool)
 
         timeout_s = cfg.server.score_timeout_s
-        name_to_ref = {
-            name: pool.dispatch(name, bucket_items)
-            for name, (_, bucket_items) in buckets.items()
-        }
+        name_to_ref = {name: pool.dispatch(name, bucket_items) for name, (_, bucket_items) in buckets.items()}
         gathered = dict(
-            await asyncio.gather(
-                *(_await_ref(pool, name, ref, timeout_s) for name, ref in name_to_ref.items())
-            )
+            await asyncio.gather(*(_await_ref(pool, name, ref, timeout_s) for name, ref in name_to_ref.items()))
         )
 
         results: list[dict[str, dict[str, float]]] = [dict() for _ in body.requests]
@@ -202,6 +148,10 @@ def create_app(cfg: ServiceCfg) -> FastAPI:
                 continue
             for i, sub_metrics in zip(indices, bucket_scores):
                 results[i][name] = sub_metrics
-        return ScoreResponse(results=results, errors=errors)
+        return ScoreResponse(
+            results=results,
+            errors=errors,
+            identities=[request.identity() for request in body.requests],
+        )
 
     return app

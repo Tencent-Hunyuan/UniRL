@@ -1,35 +1,4 @@
-"""Driver-side GPU memory monitoring — verl-parity observability for UniRL.
-
-Reuses the ``install_phase_timing`` pattern (wandb_logger.py): monkey-patch the
-step collaborators' methods once at startup so every trainer gets memory
-probes at the train/rollout hand-off boundaries with zero per-trainer edits.
-Where the timing wrapper adds a stopwatch, this one brackets each phase with a
-``Remote.get_memory_stats`` BROADCAST probe (remote.py) — UniRL's trainers run
-on a CUDA-less Ray driver, so readings must come from the workers.
-
-Outputs (granularity mirrors verl):
-
-* wandb, once per step via :meth:`MemoryMonitor.step_summary` (consumed by
-  ``log_rollout_step``): ``perf/max_memory_allocated_gb`` /
-  ``perf/max_memory_reserved_gb`` / ``perf/cpu_memory_used_gb`` (verl's trio)
-  plus ``perf/device_memory_used_gb`` — the device-level view that still sees
-  a colocated SGLang server process the workers' allocators cannot.
-* logs, per phase begin/end, only when ``logging.memory.log_boundaries`` is
-  on: one aggregated ``[mem]`` driver line + per-rank worker lines (the verl
-  ``log_gpu_memory_usage("After switch ...")`` equivalent).
-
-Peak-counter protocol: torch keeps ONE high-water mark per process. Phase
-wrappers own the reset chain — reset on phase entry, read on exit — so each
-phase's ``max_allocated`` is its own peak. Phases are serial (handle dispatch
-is a blocking barrier), so resets never interleave. Step-level peaks are the
-driver-side max over all probe readings; the closing probe in
-:meth:`step_summary` re-arms the counter for the next step. On paths with no
-wrapped phases (async_ar) the closing probe alone still spans the whole step.
-
-Behaviour-neutral by design: ``logging.memory.enabled=false`` (or
-``UNIRL_MEM_MONITOR=0``) installs nothing; ``empty_cache_at`` is empty by
-default so no cleanup is ever triggered by monitoring.
-"""
+"""Driver-side GPU memory monitoring — verl-parity observability for UniRL."""
 
 from __future__ import annotations
 
@@ -175,13 +144,7 @@ class MemoryMonitor:
             setattr(handle, method, self._wrap(handle, fn, phase))
 
     def install(self, trainer: Any) -> None:
-        """Register with the live logger now; defer collaborator wrapping to step 1.
-
-        Called from ``BaseTrainer._init_wandb``. Wrapping is deferred until after
-        the first ``train_step`` so it lands OUTSIDE ``install_phase_timing``'s
-        wrappers (which install lazily on step 1) — the memory probes then stay
-        out of ``perf/<phase>_time_s`` (step 1 itself is unmonitored).
-        """
+        """Register with the live logger now; defer collaborator wrapping to step 1."""
         if self._installed:
             return
         for attr in ("stack", "backend"):
@@ -241,15 +204,7 @@ class MemoryMonitor:
 
 
 def install_memory_monitoring(trainer: Any) -> Optional[MemoryMonitor]:
-    """Build a monitor from the trainer's ``logging.memory`` block (or env override).
-
-    Returns None when disabled — nothing is wrapped and the tree is unpatched.
-    Disabled by default (opt-in): even the folding path spends two blocking
-    BROADCAST probes per wrapped phase. ``UNIRL_MEM_MONITOR=0/1`` overrides
-    ``logging.memory.enabled``. ``UNIRL_MEMSNAP=1`` force-enables the monitor
-    (snapshots dump only through its closing probe), unless ``UNIRL_MEM_MONITOR=0``
-    explicitly wins.
-    """
+    """Build a monitor from the trainer's ``logging.memory`` block (or env override)."""
     logging_cfg = getattr(trainer, "logging_cfg", None) or {}
     mem_cfg = logging_cfg.get("memory") if hasattr(logging_cfg, "get") else None
     mem_cfg = mem_cfg or {}

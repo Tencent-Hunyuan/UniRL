@@ -1,26 +1,4 @@
-"""SandboxTool — a persistent Python-REPL subprocess tool (LIN-533).
-
-The first out-of-process :class:`~unirl.rollout.env.tools.base.StatefulTool`: each session owns a
-long-lived ``python`` subprocess whose global namespace **persists across turns**, so ``x = 40`` on
-one turn and ``x + 2`` on the next returns ``42`` — the cross-turn capability a stateless
-:class:`~unirl.rollout.env.tools.base.Tool` cannot express.
-
-Lifecycle (all off the shared event loop — ``execute_session``/``session_end`` run in
-``ToolEnvironment``'s executor):
-
-- ``session_start`` records the session; it does **no** I/O (no subprocess spawned yet).
-- ``execute_session`` opens the subprocess **lazily** on first use (so an unused session never
-  spawns one), pipes the code as one JSON line, and reads one framed JSON response.
-- ``session_end`` kills the subprocess. Idempotent, never raises.
-
-The subprocess is killed (not pooled) on ``session_end``: a live interpreter cannot be safely reset
-between trajectories, and spawning a fresh one is cheap (tens of ms, paid lazily in the executor).
-Bad code, exceptions, and timeouts are returned as **text** for the model to recover from, never
-raised.
-
-Note: uses ``select`` on the child's stdout pipe for the per-call timeout — Unix (Linux/macOS),
-which is where UniRL rollouts run.
-"""
+"""SandboxTool — a persistent Python-REPL subprocess tool."""
 
 from __future__ import annotations
 

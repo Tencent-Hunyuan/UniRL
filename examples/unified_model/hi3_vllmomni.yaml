@@ -23,16 +23,9 @@ batch_size: 2                 # prompts per rollout; each expands to samples_per
 
 weight_sync_interval: 1
 
-# Stage-pipelined rollout (UnifiedModelTrainer._run_rollout_pipelined). The AR
-# engine owns GPUs 0-3 and the DiT engine 4-7 and both stay awake for the whole
-# rollout, so running the stages serially idles half the node. >1 splits the
-# prompt-tree batch into that many chunks, letting chunk i+1's AR overlap chunk
-# i's DiT; 1 keeps the serial path. Left at 1 here because the measured profile
-# below used batch_size=8, and chunking a batch_size=2 rollout would starve each
-# engine of batch parallelism. Validated on 8xH20, batch_size=8, 3 replicates per
-# arm, commit-matched: N=2 gives -13.6% step time, N=4 gives -21.1%
-# (CI [-21.7%, -20.5%], p=9e-07) with reward, gradients and peak memory unchanged.
-# Re-validate for your batch size before raising it.
+# >1 overlaps adjacent prompt-tree chunks across the AR and DiT engines, with
+# one pending call per engine. Keep 1 until the target batch shape is measured:
+# splitting this batch_size=2 recipe may reduce per-engine batch throughput.
 rollout_pipeline_chunks: 1
 
 # Intrusive debug dump (UnifiedModelTrainer._dump_rollout): per rollout, dump original
@@ -96,6 +89,7 @@ backend:
     fsdp_mode: full
     reshard_after_forward: true
     activation_checkpointing: true
+    ac_wrap_order: outside            # keep FSDP gather/cast outside HI3's dtype-sensitive AC region
     use_torch_compile: false
     # trainable_attr resolves to the HF wrapper that carries frozen mixed-dtype
     # VAE / ViT sibling sub-models; a root fully_shard would shard them too.
@@ -244,7 +238,7 @@ sampling:
     scheduler:
       # Sparse SDE (mirrors sd3_vllmomni / sd3_dancegrpo): record SDE log-probs at
       # only a few steps, ODE elsewhere -> lower-variance GRPO gradient. null = all-SDE.
-      _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+      _target_: unirl.sde.index_schedule.AllSDEScheduler
       num_timesteps: ${..num_inference_steps}
       num_sde_steps: 3               # sparse subset (sd3.5 uses 3)
       timestep_fraction: [0, 0.5]    # SDE steps drawn from the first-half high-σ steps

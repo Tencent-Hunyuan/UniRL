@@ -23,7 +23,7 @@
 #   - FlowMatch Euler Discrete scheduler
 #
 # Launch (1 node × 8 GPUs):
-#   bash examples/run_experiment_multinode_taiji.sh diffusion/ltx2/ltx2_3_t2av_trainside
+#   bash examples/run_experiment_multinode.sh diffusion/ltx2/ltx2_3_t2av_trainside
 
 num_devices: 8
 batch_size: 8
@@ -173,7 +173,7 @@ sampling:
   trajectory_precision: fp16
   logprob_precision: fp32
   scheduler:
-    _target_: unirl.utils.scheduler_utils.AllSDEScheduler
+    _target_: unirl.sde.index_schedule.AllSDEScheduler
     num_timesteps: ${..num_inference_steps}
     num_sde_steps: 5
     timestep_fraction: [0, 0.5]

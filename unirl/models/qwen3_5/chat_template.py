@@ -1,12 +1,4 @@
-"""Qwen3_5ChatTemplateStage — text/image conversations → AR conditions.
-
-Applies the bundle processor's chat template (with
-``add_generation_prompt=True`` and ``enable_thinking``) so the AR stage
-starts from the canonical assistant-turn prefix. Mirrors
-:class:`unirl.models.qwen_vl.QwenVLChatTemplateStage`'s per-sample
-processor call (to extract ``pixel_values`` / ``image_grid_thw``) plus
-Qwen3's ``enable_thinking`` switch.
-"""
+"""Qwen3_5ChatTemplateStage — text/image conversations → AR conditions."""
 
 from __future__ import annotations
 
@@ -49,11 +41,7 @@ class Qwen3_5ChatTemplateStage:
         value: Qwen3_5ChatInput,
         images: Optional[List[Optional[Any]]] = None,
     ) -> Qwen3_5ARConditions:
-        """Render Sample-native turns or supervised text/image rows.
-
-        The rollout path carries images inside ``Turn`` objects. ``Texts`` plus
-        a separate image list remains the supervised single-turn seam.
-        """
+        """Render Sample-native turns or supervised text/image rows."""
         if isinstance(value, Texts):
             batch_size = len(value)
             if batch_size == 0:
@@ -97,12 +85,13 @@ class Qwen3_5ChatTemplateStage:
                 raise ValueError(
                     f"Qwen3_5ChatTemplateStage.embed: only text and image turns are supported; got {unsupported}."
                 )
+            image_turn_count = sum(isinstance(turn.content, Images) for turn in turns)
             require(
-                sum(isinstance(turn.content, Images) for turn in turns) <= 1,
+                image_turn_count <= 1,
                 "Qwen3_5ChatTemplateStage.embed: at most one image turn per request "
                 "is supported (multi-image trajectories are out of scope).",
             )
-            if any(isinstance(turn.content, Images) for turn in turns):
+            if image_turn_count:
                 conversations = build_vision_messages(turns, self.system_instruction)
             else:
                 conversations = build_text_messages(turns, self.system_instruction)

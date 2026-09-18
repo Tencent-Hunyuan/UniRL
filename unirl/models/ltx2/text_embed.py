@@ -14,11 +14,7 @@ if TYPE_CHECKING:
 
 
 class LTX2TextEmbedStage:
-    """Encode text prompts via Gemma3 + optional connector projection.
-
-    For LTX-2.3 with connectors: Gemma3 → connector → (video_embeds, audio_embeds).
-    For LTX-2.0 without connectors: Gemma3 → caption_projection on transformer.
-    """
+    """Encode text prompts via Gemma3 + optional connector projection."""
 
     def __init__(self, bundle: "LTX2Bundle") -> None:
         self.text_encoder = bundle.text_encoder
@@ -34,13 +30,7 @@ class LTX2TextEmbedStage:
         texts: Texts,
         negative_texts: Optional[Texts] = None,
     ) -> dict:
-        """Encode prompts → TextEmbedCondition for video (and audio).
-
-        LTX-2.0 ALWAYS routes Gemma hidden states through the text connectors
-        (the DiT was trained on connector outputs, not raw Gemma). Returns a
-        dict with keys: 'text', 'audio_text', optionally 'negative_text',
-        'negative_audio_text'.
-        """
+        """Encode prompts → TextEmbedCondition for video (and audio)."""
         if self.connectors is None:
             raise RuntimeError(
                 "LTX2TextEmbedStage: bundle.connectors is None. LTX-2.0 requires "
@@ -125,12 +115,7 @@ class LTX2TextEmbedStage:
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Route packed Gemma hidden states through LTX2TextConnectors.
-
-        ``LTX2TextConnectors.forward(text_encoder_hidden_states, attention_mask,
-        padding_side="left")`` returns a 3-tuple
-        ``(video_text_embedding, audio_text_embedding, binary_attn_mask)``.
-        """
+        """Route packed Gemma hidden states through LTX2TextConnectors."""
         import inspect
 
         params = inspect.signature(self.connectors.forward).parameters

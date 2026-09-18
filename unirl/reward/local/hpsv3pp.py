@@ -18,33 +18,7 @@ from .base import LocalRewardBackend
 
 
 class HPSv3PPRewardScorer(LocalRewardBackend):
-    """HPSv3++ capability- and RL-iteration-aware reward (Qwen3-VL-8B + FiLM).
-
-    HPSv3++ (``model_type: film_hybrid``) scores (prompt, image) pairs with a
-    Qwen3-VL-8B-Instruct backbone, a Capability Encoder (model capability is
-    inferred from the image, not passed in), a FiLM head fed an explicit
-    RL-iteration scalar, and a 3-layer RankNet head that outputs ``[mu, sigma]``
-    per image. We use ``mu`` (index 0) as the scalar reward.
-
-    Unlike the original HPSv3 (PyPI ``hpsv3``, Qwen2-VL-7B), v3++ is run from
-    the source repo (no PyPI package). Point ``repo_path`` at a checkout of
-    https://github.com/PlantPotatoOnMoon/HPSv3-PlusPlus (prepended to
-    ``sys.path`` so its ``hpsv3`` package wins over any PyPI ``hpsv3``),
-    ``config_path`` at its ``hpsv3/config/train_stage2.yaml`` (the film_hybrid
-    config; defaults to ``<repo_path>/hpsv3/config/train_stage2.yaml``), and
-    ``checkpoint_path`` at ``hpsv3++.pth`` (empty auto-downloads
-    ``Junjun2333/HPSv3-PlusPlus``).
-
-    ``rl_iteration`` is the explicit RL-iteration condition, a normalized scalar
-    in ``[0, 1]``. Use ``0.0`` (the default) for preference scoring / ranking.
-    As the reward inside T2I RL fine-tuning the paper ramps it linearly from
-    0.3 -> 1.0 over training; this scorer applies a fixed value, so set it to
-    the desired constant (per-step ramping would need training-step plumbing
-    into the reward backend).
-
-    Reference: HPSv3++: Scaling Reward Models Across the Full Spectrum of
-    Diffusion Model Capabilities.
-    """
+    """HPSv3++ reward (Qwen3-VL-8B + FiLM) — the RankNet head outputs ``[mu, sigma]``."""
 
     canonical_model_name = "hpsv3pp"
 
@@ -132,20 +106,7 @@ class HPSv3PPRewardScorer(LocalRewardBackend):
 
 @dataclass
 class HPSv3PPSpec(BaseRewardComponentSpec):
-    """Typed config for the HPSv3++ reward component.
-
-    HPSv3++ runs from the HPSv3-PlusPlus source repo (no PyPI package), so set
-    ``repo_path`` to that checkout. ``config_path`` defaults to
-    ``<repo_path>/hpsv3/config/train_stage2.yaml``; empty ``checkpoint_path``
-    auto-downloads ``Junjun2333/HPSv3-PlusPlus/hpsv3++.pth``.
-
-    ``score_scale`` is a *divisor* applied to the raw mu (which is ~7-11): the
-    reward is ``mu / score_scale``. GRPO normalizes advantages by
-    ``(reward - mean) / std``, so a global scale cancels and training is
-    invariant to this value; the default 1.0 keeps the raw mu, which is
-    directly comparable to scores reported in the paper / HPSv3 benchmark.
-    Set it only to rescale what gets logged.
-    """
+    """Typed config for the HPSv3++ reward component."""
 
     batch_size: int = 8
     device: str = "auto"

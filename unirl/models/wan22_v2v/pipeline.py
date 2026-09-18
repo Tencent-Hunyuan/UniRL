@@ -65,19 +65,7 @@ class WAN22V2VPipeline(Pipeline):
 
     @staticmethod
     def _sde_indices_in_trimmed_frame(sde_indices: Any, *, t_full: int, t_eff: int) -> list:
-        """Remap SDE step indices from the full-schedule frame to the trimmed V2V frame.
-
-        ``params.sde_indices`` is resolved by the trainer over the *full*
-        ``num_inference_steps`` (``AllSDEScheduler(num_timesteps=num_inference_steps)``),
-        but V2V only denoises the trimmed tail of ``t_eff`` steps. So a
-        ``timestep_fraction`` window must be re-expressed in the trimmed frame,
-        otherwise it lands on the wrong steps (the old code reinterpreted
-        full-frame indices as trimmed-frame ones, which only happened to work when
-        the fraction started at 0). Map each index by its fractional position
-        ``round(i * t_eff / t_full)`` so "first 20% of denoising" stays "first 20%
-        of the *denoised* tail" for any fraction. Empty in -> empty out (the
-        deterministic forward-process path).
-        """
+        """Remap SDE step indices from the full-schedule frame to the trimmed V2V frame."""
         if not sde_indices or int(t_full) <= 0:
             return []
         remapped = {min(int(t_eff) - 1, max(0, round(int(i) * int(t_eff) / int(t_full)))) for i in sde_indices}

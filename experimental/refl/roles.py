@@ -1,20 +1,4 @@
-"""ReflActorRole — family-agnostic REFL/BPTT actor Remote for the refl recipe.
-
-The family-agnostic REFL actor:
-a **config-chosen** ``Pipeline`` (``pipeline_target`` + ``model_config``, no
-per-family imports), FSDP-wrapped in place via ``FSDPBackend``, driven by three
-driver RPCs per step under the distributed ``enable_grad()`` context::
-
-    gen = actor.generate_samples(texts=…, images=…, params=…)      # grad BPTT sample + VAE decode
-    rew = reward.score_differentiable(gen.decoded, prompts, records)
-    actor.forward_backward_loss(rewards=rew, kl_loss=gen.kl_loss)  # loss seed → local backward
-    actor.step(max_grad_norm=…)                                    # ctx exit routed grads → optimizer
-
-The pipeline named by ``pipeline_target`` must expose the recipe contract
-(see ``experimental.refl.models``): ``build_refl_conditions(texts, images=…,
-params=…)`` plus a ``diffusion`` stage with ``diffuse_with_grad`` and a
-``vae_decode`` stage with ``decode_with_grad``.
-"""
+"""ReflActorRole — family-agnostic REFL/BPTT actor Remote for the refl recipe."""
 
 from __future__ import annotations
 
@@ -24,7 +8,6 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
-import torch.distributed as dist
 from hydra.utils import get_class
 
 from unirl.distributed.group.dispatch import Dispatch, Execute, distributed
@@ -42,13 +25,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class REFLGenerated(Batch):
-    """Generated BPTT payload: live-grad decoded pixels + per-sample KL.
-
-    Both fields are batch-aligned concat fields (``decoded`` ``[B, …]``,
-    ``kl_loss`` ``[B]``) so DP_SCATTER merge/re-shard keeps each DP shard's
-    own values — the KL fed back into ``forward_backward_loss`` is the KL
-    that shard actually accumulated.
-    """
+    """REFL rollout output — ``decoded`` and ``kl_loss`` are batch-aligned concat fields ``[B, …]``."""
 
     decoded: torch.Tensor = concat_field(default_factory=lambda: torch.empty(0))
     kl_loss: torch.Tensor = concat_field(default_factory=lambda: torch.empty(0))
@@ -99,13 +76,7 @@ class ReflActorRole(Remote):
 
     def initialize(self) -> None:
         torch.cuda.set_device(self.device)
-        if self.rank_info is not None and int(self.rank_info.world_size) > 1 and not dist.is_initialized():
-            dist.init_process_group(backend="nccl")
-
-        try:
-            self._model_config.device = self.device
-        except Exception:
-            pass
+        self._model_config.device = self.device
 
         pipeline_cls = get_class(self._pipeline_target)
         self.pipeline = pipeline_cls.from_config(self._model_config, strategy=self._strategy)
@@ -131,7 +102,7 @@ class ReflActorRole(Remote):
             optimizer_cfg=self._optimizer_cfg,
             scheduler_cfg=self._scheduler_cfg,
             device=self.device,
-            rank=int(self.rank_info.rank) if self.rank_info is not None else 0,
+            rank=int(self.rank_info.rank),
             lora_cfg=self._lora_cfg,
         )
         logger.info(
@@ -149,13 +120,7 @@ class ReflActorRole(Remote):
         images: Optional[Images] = None,
         params: DiffusionSamplingParams,
     ) -> REFLGenerated:
-        """Grad-enabled BPTT sampling + in-graph VAE decode.
-
-        ``texts`` / ``images`` are the data-source conditioning primitives
-        (``images`` is the I2V first frame; ``None`` for T2V). Negative
-        prompts ride ``params.sampler_kwargs['negative_prompt']`` and are
-        expanded by the pipeline's ``build_refl_conditions``.
-        """
+        """Grad-enabled BPTT sampling + in-graph VAE decode."""
         self.backend.model.train()
         self.backend.zero_grad()
 
@@ -172,7 +137,7 @@ class ReflActorRole(Remote):
         conditions = self.pipeline.build_refl_conditions(texts, images=images, params=params)
         schedule = get_sigma_schedule(
             int(params.num_inference_steps),
-            shift=float(getattr(self.pipeline, "shift", 5.0)),
+            shift=float(self.pipeline.shift),
             device=self.pipeline.bundle.device,
         )
         result = self.pipeline.diffusion.diffuse_with_grad(conditions, schedule=schedule, params=params)
@@ -186,12 +151,7 @@ class ReflActorRole(Remote):
         rewards: torch.Tensor,
         kl_loss: Optional[torch.Tensor] = None,
     ) -> REFLLossMetrics:
-        """Assemble the REFL loss and backward on this shard's actor graph.
-
-        ``rewards`` and ``kl_loss`` are RPC inputs marked as grad leaves by the
-        framework; on ``enable_grad()`` exit their grads route back through the
-        reward / generate calls into the sampling graph in ONE backward pass.
-        """
+        """Assemble the REFL loss and backward on this shard's actor graph."""
         reward = rewards.to(dtype=torch.bfloat16)
         reward_loss = (-(reward - self.reward_baseline) / self.reward_scale * self.reward_weight).mean()
         if kl_loss is not None and self.kl_weight != 0.0:
@@ -212,7 +172,7 @@ class ReflActorRole(Remote):
         """Clip + one optimizer step; returns grad_norm and current lr."""
         grad_norm = float(self.backend.optimizer_step(max_grad_norm=float(max_grad_norm)))
         lr = 0.0
-        sched = getattr(self.backend, "scheduler", None)
+        sched = self.backend.scheduler
         if sched is not None:
             last = sched.get_last_lr()
             lr = float(last[0]) if last else 0.0

@@ -1,31 +1,4 @@
-"""QwenImageEditPlusPipeline — ``Sample → Sample`` for Edit-Plus.
-
-Text+image → image editing flow::
-
-    Texts ──text_embed──▶ ┐
-                         ├─▶ QwenImageEditPlusConditions ──diffuse──▶ LatentSegment
-    Images ──vae_encode──▶ ┘                                              │
-                                                                         ▼
-                                                                     vae_decode
-                                                                         │
-                                                                         ▼
-                                                                       Images
-
-The text-embed stage is always :class:`QwenImageEditPlusTextEmbedStage` (edit
-chat template, drop 64). With ``use_condition_image_prompt=True`` (default) it
-also feeds the source image into Qwen2.5-VL; with ``False`` it keeps the edit
-template but omits vision tokens — matching upstream
-``_get_qwen_prompt_embeds(..., image=None)``, **not** base Qwen-Image's
-text-only stage. The VAE-decode stage is reused from
-:mod:`unirl.models.qwen_image`; the VAE-encode stage and the diffusion
-step/stage are Edit-Plus-specific.
-
-σ schedule contract: identical to :class:`QwenImagePipeline` — the hosting
-engine pins the frontier sampling params' ``sigmas`` before calling ``generate(sample)``. The schedule's
-``image_seq_len`` is derived from the **noise** latent shape only
-(boundary condition #3): the source-image concat happens inside
-``predict_noise`` after the schedule is fixed.
-"""
+"""QwenImageEditPlusPipeline — ``Sample → Sample`` for Edit-Plus."""
 
 from __future__ import annotations
 
@@ -51,27 +24,7 @@ from .vae import QwenImageEditPlusVAEEncodeStage
 
 
 class QwenImageEditPlusPipeline(Pipeline):
-    """Qwen-Image-Edit-Plus generate pipeline.
-
-    Reads from the conditioning ancestors:
-
-    - ``primitives["text"]: Texts`` — required edit instructions.
-    - ``primitives["image"]: Images`` — **required** source images (Edit-Plus
-      is edit-only; raises ``TypeError`` if absent — fail-fast, constraint #27).
-      The source remains required for VAE latent concatenation even when
-      ``use_condition_image_prompt=False``; that switch only controls whether
-      the text encoder also sees the source image.
-    - CFG negatives are accepted by ``build_conditions`` for direct callers,
-      but are not transported as Sample conditioning Parts.
-    - The frontier ``sampling_params.sigmas`` schedule is required.
-
-    Fills the frontier Part:
-
-    - ``conditions["text"]``; plus ``conditions["negative_text"]`` when
-      negatives supplied and ``conditions["image_latent"]`` always.
-    - ``segment: LatentSegment``.
-    - ``primitives["image"]: Images``.
-    """
+    """Qwen-Image-Edit-Plus generate pipeline."""
 
     def __init__(
         self,
@@ -89,6 +42,7 @@ class QwenImageEditPlusPipeline(Pipeline):
         max_sequence_length: int = 512,
         use_condition_image_prompt: bool = True,
         processor_path: Optional[str] = None,
+        batch_replay_steps: bool = False,
     ) -> None:
         super().__init__()
         self.bundle = bundle
@@ -108,6 +62,7 @@ class QwenImageEditPlusPipeline(Pipeline):
                 autocast_precision=autocast_precision,
                 trajectory_precision=trajectory_precision,
                 logprob_precision=logprob_precision,
+                batch_replay_steps=batch_replay_steps,
             )
         self.diffusion = diffusion
         self.vae_encode = vae_encode if vae_encode is not None else QwenImageEditPlusVAEEncodeStage(bundle)
@@ -115,13 +70,7 @@ class QwenImageEditPlusPipeline(Pipeline):
         self.shift = shift
 
     def build_schedule_policy(self):
-        """Build the FlowMatchSchedulePolicy — identical to base Qwen-Image.
-
-        The shift is derived from the noise latent's ``image_seq_len``
-        (boundary condition #3); the source-image concat happens inside
-        ``predict_noise`` and never enters the schedule. Reuses the base
-        pipeline's canonical dynamic overrides.
-        """
+        """Build the FlowMatchSchedulePolicy — identical to base Qwen-Image."""
         from unirl.models.qwen_image.config import _qwen_image_dynamic_overrides
         from unirl.sde.runtime import FlowMatchSchedulePolicy
 
@@ -134,10 +83,7 @@ class QwenImageEditPlusPipeline(Pipeline):
 
     @classmethod
     def latent_shape(cls, *, model_config: Any, sampling_spec: Any) -> tuple:
-        """Per-sample latent shape ``(C, H_lat, W_lat)`` for driver-side
-        noise pre-computation. Identical to base Qwen-Image: the noise
-        latent is 16-channel, 8× VAE downsample + 2× patchify rounding.
-        """
+        """Per-sample latent shape ``(C, H_lat, W_lat)`` for driver-side"""
         height = int(sampling_spec.height)
         width = int(sampling_spec.width)
         vae_scale_factor = 8
@@ -169,6 +115,7 @@ class QwenImageEditPlusPipeline(Pipeline):
             autocast_precision=config.autocast_precision,
             trajectory_precision=config.trajectory_precision,
             logprob_precision=config.logprob_precision,
+            batch_replay_steps=config.batch_replay_steps,
         )
         vae_encode = QwenImageEditPlusVAEEncodeStage(bundle)
         vae_decode = QwenImageVAEDecodeStage(bundle)
@@ -192,11 +139,7 @@ class QwenImageEditPlusPipeline(Pipeline):
         images: Optional[Images] = None,
         guidance_scale: float = 1.0,
     ) -> QwenImageEditPlusConditions:
-        """Build the text side of Edit-Plus conditions.
-
-        The source-image latent depends on the generation geometry and is attached
-        by generate. Qwen's canonical CFG default is one space.
-        """
+        """Build the text side of Edit-Plus conditions."""
         if negatives is not None and len(negatives.texts) != len(texts.texts):
             raise ValueError(
                 f"QwenImageEditPlusPipeline.build_conditions: negative_text length "
@@ -228,6 +171,11 @@ class QwenImageEditPlusPipeline(Pipeline):
                 "QwenImageEditPlusPipeline.generate: frontier sampling_params.sigmas is None; "
                 "the hosting engine must pin the schedule before pipeline.generate."
             )
+        if int(params.height) % 16 or int(params.width) % 16:
+            raise ValueError(
+                f"QwenImageEditPlusPipeline.generate: height ({params.height}) and width "
+                f"({params.width}) must be divisible by 16"
+            )
 
         conditioning = sample.conditioning()
         text_inputs = [value for value in conditioning if isinstance(value, Texts)]
@@ -243,11 +191,9 @@ class QwenImageEditPlusPipeline(Pipeline):
                 f"primitive (Edit-Plus is edit-only), got {len(image_inputs)}"
             )
         texts, images = text_inputs[0], image_inputs[0]
-        if images.pixels is None or int(images.pixels.shape[0]) != len(texts.texts):
+        if len(images) != len(texts.texts):
             raise ValueError(
-                f"QwenImageEditPlusPipeline.generate: image batch "
-                f"{None if images.pixels is None else int(images.pixels.shape[0])} "
-                f"!= text batch {len(texts.texts)}"
+                f"QwenImageEditPlusPipeline.generate: image batch {len(images)} != text batch {len(texts.texts)}"
             )
 
         edit_conds = self.build_conditions(
@@ -255,11 +201,7 @@ class QwenImageEditPlusPipeline(Pipeline):
             images=images,
             guidance_scale=float(params.guidance_scale),
         )
-        image_latent = self.vae_encode.encode(
-            images,
-            height=int(params.height),
-            width=int(params.width),
-        )
+        image_latent = self.vae_encode.encode(images)
         edit_conds.image_latent = image_latent
 
         schedule = params.sigmas.to(self.bundle.device)

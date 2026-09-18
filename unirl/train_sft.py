@@ -1,12 +1,5 @@
 #!/usr/bin/env python
-"""UniRL SFT training entry point (Hydra-native).
-
-Thin wrapper around :class:`unirl.trainer.sft.SFTTrainer` — supervised
-finetuning for any bundled model family (AR cross-entropy / diffusion
-flow-matching), selected entirely by the recipe's ``_target_`` dotpaths.
-Pairs with ``examples/sft/*.yaml``. Like the other entrypoints, the Ray
-cluster is started by the launcher (``ray start --head`` + ``RAY_ADDRESS=auto``).
-"""
+"""UniRL SFT training entry point (Hydra-native)."""
 
 from __future__ import annotations
 
@@ -32,6 +25,7 @@ def main(cfg: DictConfig) -> None:
         eval_interval=int(cfg.get("eval_interval", 0)),
         eval_batch_size=int(cfg.get("eval_batch_size", 8)),
         eval_num_samples=int(cfg.get("eval_num_samples", -1)),
+        prefetch_next_batch=cfg.get("prefetch_next_batch", False),
     )
     trainer.train(
         num_steps=int(cfg.get("num_steps", 100)),

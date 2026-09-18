@@ -1,17 +1,4 @@
-"""Boogu-Image model package — Base (T2I) RL support.
-
-Recipes wire the classes by ``_target_`` dotpath:
-
-- ``unirl.models.boogu_image.BooguImageBundle.from_config`` (+ nested
-  ``unirl.models.boogu_image.BooguImagePipelineConfig``)
-- ``unirl.models.boogu_image.BooguImagePipeline``
-- ``unirl.models.boogu_image.conditions.BooguImageConditions``
-  (``algorithm.conditions_cls``)
-
-The DiT architecture is vendored under ``vendor/`` (pinned upstream commit —
-see ``vendor/VENDOR_COMMIT.txt``); the Edit (TI2I) and Turbo (DMD few-step)
-variants are follow-ups.
-"""
+"""Boogu-Image model package — Base (T2I) RL support."""
 
 from .bundle import BooguImageBundle
 from .conditions import BooguImageConditions

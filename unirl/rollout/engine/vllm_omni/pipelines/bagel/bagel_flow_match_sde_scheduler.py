@@ -1,57 +1,4 @@
-"""Trajectory-capturing SDE flow-match scheduler for BAGEL's ``generate_image``.
-
-BAGEL is the odd one out among the vLLM-Omni RL pipelines. SD3 / Qwen-Image run
-diffusers ``FlowMatchEulerDiscreteScheduler`` loops and call
-``scheduler.step(noise_pred, t, latents, return_dict=False)[0]`` — so their RL
-subclass swaps in :class:`...flow_match_sde_scheduler.FlowMatchSDEDiscreteScheduler`
-(a diffusers ``SchedulerMixin`` subclass with the ``set_timesteps(sigmas=...)`` /
-``[0]`` conventions). BAGEL's vendored ``Bagel.generate_image``
-(``vllm_omni/diffusion/models/bagel/bagel_transformer.py``) is a hand-rolled loop
-with a DIFFERENT scheduler contract::
-
-    out = scheduler.step(v_t, timesteps[i], x_t, dts[i], **scheduler_kwargs)
-    x_t = out.prev_sample
-    if out.log_prob is not None: trajectory_log_probs.append(out.log_prob)
-
-i.e. the step takes ``(model_output, timestep, sample, dt)`` POSITIONALLY (no σ
-schedule managed inside the scheduler, no diffusers ``step_index`` lifecycle, dt
-handed in per step) and returns an object with ``.prev_sample`` + ``.log_prob``.
-The diffusers ``FlowMatchSDEDiscreteScheduler`` cannot satisfy that signature, so
-BAGEL gets its own scheduler — this file.
-
-The SDE math is byte-identical to the trainside path
-(:class:`unirl.sde.kernels.FlowSDEStrategy`, ``unirl/sde/kernels.py:253``) so the
-GRPO on-policy invariant holds: under identical weights, replay's ``new_logp``
-matches the rollout's emitted ``old_logp`` and the PPO ratio ``exp(new-old) ≈ 1``.
-Concretely the per-step transition is::
-
-    dt               = sigma_next - sigma                      (< 0, decreasing schedule)
-    std_dev_t        = sqrt(sigma / (1 - clamp(sigma))) * eta   (clamp: σ==1 → sigma_max)
-    prev_sample_mean = sample   * (1 + std_dev_t² / (2σ) · dt)
-                     + v_t      * (1 + std_dev_t² (1-σ) / (2σ) · dt)
-    prev_sample      = prev_sample_mean + std_dev_t · sqrt(-dt) · randn         (SDE step)
-                     = prev_sample_mean                                         (ODE step, eta gate off)
-    std_var          = std_dev_t · sqrt(-dt)
-    log_prob         = mean[ -(prev_sample.detach() - prev_sample_mean)² / (2 std_var²)
-                             - log(std_var) - ½ log(2π) ]                       (over all elems)
-
-The dtype round-trip on ``prev_sample`` before the log-prob (cast to the stored
-trajectory dtype, then back to fp32) mirrors ``FlowSDEStrategy._finalize_logp`` —
-the rollout records ``logp(stored x_{t+1} | μ)`` so replay (reading the SAME stored
-latent) lands on the same density.
-
-Per-step SDE vs ODE is gated on ``_sde_indices`` (the sparse step set the driver
-resolved, shared across the GRPO group). Latents/timesteps are captured DENSELY
-(every step) so trainer-side replay has ``x_t`` at every storage slot; log-probs
-are captured SPARSELY (only the SDE steps). The capturing mirrors
-``BagelDiffusionStage.diffuse`` (``unirl/models/bagel/diffusion.py``), which stores
-the step boundaries + final clean latent.
-
-This scheduler is NOT a diffusers ``SchedulerMixin`` — it is a plain object whose
-only consumer is BAGEL's ``generate_image``. ``set_for_request`` (re-armed every
-``forward``) sets eta / sde_indices / the full σ schedule; ``drain_trajectory``
-exports the captured triple after the loop.
-"""
+"""Trajectory-capturing SDE flow-match scheduler for BAGEL's ``generate_image``."""
 
 from __future__ import annotations
 
@@ -66,11 +13,7 @@ from diffusers.utils.torch_utils import randn_tensor
 
 @dataclass
 class BagelSDEStepOutput:
-    """Return payload for :meth:`BagelFlowSDEScheduler.step`.
-
-    ``generate_image`` reads ``.prev_sample`` (always) and ``.log_prob``
-    (appended to ``trajectory_log_probs`` only when not ``None``).
-    """
+    """Return payload for :meth:`BagelFlowSDEScheduler.step`."""
 
     prev_sample: torch.Tensor
     log_prob: Optional[torch.Tensor]
@@ -78,14 +21,7 @@ class BagelSDEStepOutput:
 
 
 class BagelFlowSDEScheduler:
-    """SDE flow-match step for BAGEL ``generate_image`` with trajectory capture.
-
-    One instance lives for the pipeline's lifetime (a worker singleton);
-    :meth:`set_for_request` re-arms it per request and clears the capture
-    buffers. ``step`` matches the positional ``(model_output, timestep, sample,
-    dt)`` contract BAGEL's loop uses and records the dense latent trajectory +
-    sparse SDE log-probs.
-    """
+    """SDE flow-match step for BAGEL ``generate_image`` with trajectory capture."""
 
     def __init__(self, *, eta: float = 1.0, sigma_max: float = 0.99) -> None:
         if eta < 0.0:
@@ -113,29 +49,7 @@ class BagelFlowSDEScheduler:
         trajectory_dtype: torch.dtype = torch.float32,
         image_token_sizes: Optional[List[int]] = None,
     ) -> None:
-        """Arm this request: SDE strength, sparse step gate, σ_max, trajectory dtype.
-
-        MUST fire on every pipeline ``forward`` — the scheduler is a long-lived
-        worker singleton and stale state would silently mis-gate SDE steps.
-        ``sde_indices=None`` disarms the SDE gate (pure Euler ODE; dense latent
-        capture still runs — the trainer's clean-latents replay needs a
-        non-empty trajectory regardless).
-
-        ``sigma_max`` is the value that replaces σ==1 in the ``std_dev_t``
-        denominator ``sqrt(σ/(1-σ))`` on the first step (σ_0 == 1.0 would divide
-        by zero). It MUST equal the trainside ``BagelDiffusionStage``'s choice —
-        ``schedule[1]`` (the second σ point) — or the first SDE step's std_dev_t /
-        log-prob diverges and the GRPO ratio drifts off 1 (a hardcoded 0.99 gave
-        ratio ≈ 0.8). The adapter passes ``sampling_params.sigmas[1]``; ``None`` keeps the
-        prior instance value (smoke tests without an engine-pinned schedule).
-
-        The σ schedule itself is NOT passed: BAGEL's ``generate_image`` builds it
-        internally from ``(num_timesteps, timestep_shift)``, and this scheduler
-        reconstructs the echo from the σ the loop visits (see
-        :meth:`drain_trajectory`). The adapter is responsible for sending
-        ``num_inference_steps = trainside_steps + 1`` and the matching shift so
-        BAGEL's internal schedule equals the diffusion Part's pinned sigmas.
-        """
+        """Arm this request: SDE strength, sparse step gate, σ_max, trajectory dtype."""
         if eta < 0.0:
             raise ValueError(f"BagelFlowSDEScheduler.set_for_request: eta must be >= 0; got {eta!r}.")
         self._eta = float(eta)
@@ -163,21 +77,7 @@ class BagelFlowSDEScheduler:
         dt: torch.Tensor,
         **_unused,
     ) -> BagelSDEStepOutput:
-        """One SDE flow-match transition. Positional contract == BAGEL's loop.
-
-        ``model_output`` is the CFG-combined velocity ``v_t``; ``timestep`` is the
-        current σ (BAGEL's ``timesteps[i]``, a [0,1] flow-match σ, NOT a 1000-scale
-        index); ``sample`` is ``x_t``; ``dt`` is BAGEL's ``dts[i] = timesteps[i] -
-        timesteps[i+1]`` — a POSITIVE step size (σ decreases), the NEGATION of the
-        trainside convention ``dt = sigma_next - sigma`` used by
-        :class:`unirl.sde.kernels.FlowSDEStrategy`.
-
-        We flip the sign once here so all downstream math matches the trainside
-        kernel exactly (its ``dt`` is negative; ``sqrt(-dt)`` is the real SDE noise
-        scale). ``sigma_next = sigma + dt`` then recovers ``timesteps[i+1]``.
-        Sanity: the ODE branch's ``sample + v_t·dt`` equals BAGEL's
-        no-scheduler ``x_t - v_t·dts[i]`` (since ``dt == -dts[i]``).
-        """
+        """One SDE flow-match transition; ``timesteps[i]`` is a ``[0, 1]`` σ, NOT a 1000-scale timestep."""
         sigma = timestep if torch.is_tensor(timestep) else torch.as_tensor(float(timestep))
         sigma = sigma.to(device=sample.device, dtype=torch.float32).reshape(())
         dt_passed = dt if torch.is_tensor(dt) else torch.as_tensor(float(dt))
@@ -264,22 +164,7 @@ class BagelFlowSDEScheduler:
     def drain_trajectory(
         self,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
-        """Return ``(latents [N,T+1,seq,C], sigmas [T+1], timesteps [1,T+1], log_probs [N,K])`` or ``None``.
-
-        Latents/timesteps are dense (length ``T+1``): position-0 is the input
-        x_T captured on the first ``step`` plus ``T`` post-step states. Log-probs
-        are length ``K = len(last_sde_step_indices)`` (``K == 0`` for the
-        no-SDE / forward-process path → ``[N, 0]``). ``N`` is 1 for the plain
-        request path or ``num_outputs_per_prompt`` for packed T2I; the latter is
-        split back out of BAGEL's packed token axis before returning.
-
-        ``sigmas`` is reconstructed from the σ the loop actually visited
-        (position-0 ``sigma`` = full[0]; each step's ``sigma_next`` = full[1..T]),
-        so it is a GENUINE echo of the worker's schedule — the response layer's
-        ``verify_engine_used_sigmas`` then asserts it matches the engine-pinned
-        the diffusion Part's pinned sigmas (BAGEL builds σ internally, so a divergent
-        num_inference_steps / shift surfaces here rather than de-syncing replay).
-        """
+        """Return ``(latents [N,T+1,seq,C], sigmas [T+1], timesteps [1,T+1], log_probs [N,K])`` or ``None``."""
         if not self._traj_latents:
             return None
         post_latents = torch.stack(self._traj_latents, dim=0)

@@ -1,27 +1,4 @@
-"""Shared NCCL-broadcast receive mixin for HI3 worker-extension classes.
-
-Mirrors the SGLang-style ``init_weights_update_group`` +
-``update_weights_from_distributed`` pair used on the rollout weight-sync
-receive path.
-
-Trainer-side counterpart is
-:class:`unirl.distributed.weight_sync.full.nccl.NCCLWeightSync`.
-The trainer brings up an external process group (rank 0) and broadcasts
-each tensor; this mixin's ``update_weights_from_distributed`` allocates
-the matching receive-side process group, receives each named tensor in
-order, then forwards the bag to ``self.load_weights``.
-
-Why an extension mixin and not upstream ``WeightTransferEngine``: the
-DiT worker (``vllm_omni.diffusion.worker.diffusion_worker.DiffusionWorker``)
-doesn't subclass upstream ``vllm.v1.worker.gpu_worker.Worker``, so it
-doesn't have the ``weight_transfer_engine`` slot or the
-``init_weight_transfer_engine`` / ``update_weights(update_info)`` methods
-upstream provides. Re-implementing the SLIME-style raw-NCCL broadcast
-here keeps the change scoped to our extension class (no upstream patch)
-and matches the contract the trainer's ``NCCLWeightSync``
-already drives via ``init_weights_update_group`` /
-``update_weights_from_distributed``.
-"""
+"""Shared NCCL-broadcast receive mixin for HI3 worker-extension classes."""
 
 from __future__ import annotations
 
@@ -58,8 +35,7 @@ def _resolve_dtype(name: str) -> torch.dtype:
 
 
 class NcclBroadcastReceiveMixin:
-    """Adds ``init_weights_update_group`` + ``update_weights_from_distributed``
-    to a vllm-omni worker via multiple inheritance."""
+    """Adds ``init_weights_update_group`` + ``update_weights_from_distributed`` to a worker by inheritance."""
 
     _diffrl_weight_groups: Dict[str, "dist.ProcessGroup"] = {}
 
@@ -73,20 +49,7 @@ class NcclBroadcastReceiveMixin:
         group_name: str,
         backend: str = "nccl",
     ) -> None:
-        """Join the trainer-coordinated process group as the receiver.
-
-        Trainer calls this on each worker (one per rank in the rollout
-        stage). Our rank within the broader group is ``rank_offset +
-        local_rank``; rank 0 is the trainer's broadcaster.
-
-        The worker already has a default torch.distributed process group
-        (its TP/PP world). ``dist.init_process_group`` would clobber it,
-        and ``dist.new_group(ranks=list(range(world_size)))`` would trip
-        ``world_size > default_pg.world_size``. So we use unirl's
-        :func:`init_process_group` (which calls ``_new_process_group_helper``
-        directly) to create a *separate* main-style group via TCPStore
-        rendezvous, leaving the worker's default TP group alone.
-        """
+        """Join the trainer-coordinated process group as the receiver."""
         from unirl.utils.distributed_utils import (
             init_process_group as _diffrl_init_pg,
         )
@@ -113,12 +76,7 @@ class NcclBroadcastReceiveMixin:
         )
 
     def destroy_weights_update_group(self, *, group_name: str) -> None:
-        """Drop the named group's handle. Counterpart to ``init_weights_update_group``.
-
-        The underlying ``ProcessGroup`` cannot be destroyed cleanly via
-        a public torch API; dropping the reference is good enough — the
-        trainer-side teardown is what actually frees the NCCL comms.
-        """
+        """Drop the named group's handle. Counterpart to ``init_weights_update_group``."""
         type(self)._diffrl_weight_groups.pop(group_name, None)
 
     def update_weights_from_distributed(
@@ -131,9 +89,7 @@ class NcclBroadcastReceiveMixin:
         target_modules: Optional[List[str]] = None,
         flush_cache: bool = True,
     ) -> None:
-        """Receive a bucket of named tensors via ``dist.broadcast`` from rank 0,
-        then forward to ``self.load_weights``.
-        """
+        """Receive a bucket of named tensors by ``dist.broadcast`` from rank 0, then call ``self.load_weights``."""
         del target_modules, flush_cache  # accepted for SGLang-shape parity
         group = type(self)._diffrl_weight_groups.get(group_name)
         if group is None:

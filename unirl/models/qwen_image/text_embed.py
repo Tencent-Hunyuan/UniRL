@@ -1,29 +1,4 @@
-"""QwenImageTextEmbedStage — Qwen-VL chat-template text → TextEmbedCondition.
-
-Implements ``EmbedStage[Texts, TextEmbedCondition]``. Diverges from
-:class:`unirl.models.sd3.SD3TextEmbedStage` in three ways:
-
-- **Single multimodal LLM encoder** (vs SD3's CLIP1 + CLIP2 + T5 stack).
-  Qwen-Image wraps prompts in a chat template before tokenizing and
-  forwards through a ``Qwen2_5_VLForConditionalGeneration`` model.
-- **System prefix stripping**. The chat template prefix
-  (``PROMPT_TEMPLATE_START_IDX = 34`` tokens) is identical across every
-  prompt and is discarded after the encoder forward — only the
-  per-prompt portion of the last hidden state participates in
-  conditioning.
-- **Variable-length token output**. After prefix stripping each prompt
-  has a different residual length; the stage pads to the batch-max with
-  zero embeddings and emits a parallel ``attn_mask`` so the diffusion
-  transformer (and any CFG concatenation downstream) sees real-vs-pad
-  positions explicitly.
-
-No ``pooled`` vector is produced — Qwen-Image's transformer accepts
-token-level hidden states only. ``TextEmbedCondition.pooled`` is left
-as ``None``.
-
-Math mirrors PR #104's ``_get_qwen_prompt_embeds`` / ``encode_prompt``
-byte-for-byte at the spec level.
-"""
+"""QwenImageTextEmbedStage — Qwen-VL chat-template text → TextEmbedCondition."""
 
 from __future__ import annotations
 

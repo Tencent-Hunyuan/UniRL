@@ -76,9 +76,9 @@ stage_args:
     runtime:
       process: true
       devices: "4,5,6,7"
-      max_batch_size: 1
     engine_args:
       model_stage: diffusion
+      max_num_seqs: 1
       enforce_eager: true
       distributed_executor_backend: "mp"
       vae_use_slicing: false

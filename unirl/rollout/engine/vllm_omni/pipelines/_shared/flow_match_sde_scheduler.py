@@ -1,13 +1,4 @@
-"""Trajectory-capturing SDE flow-match scheduler.
-
-Port of ``vllm-omni/tests/e2e/offline_inference/custom_pipeline/flow_match_sde_scheduler.py``
-keeping the ``sde`` branch only. Used by both the HunyuanImage-3 and
-SD3.5 RL pipeline subclasses — their denoise loops both call
-``self.scheduler.step(pred, t, latents, **_extra, return_dict=False)[0]``,
-so we hijack ``step`` to do SDE math and stash a per-step
-``(prev_sample, timestep, log_prob)`` triple on the instance for the
-calling pipeline to drain after the loop.
-"""
+"""Trajectory-capturing SDE flow-match scheduler."""
 
 from __future__ import annotations
 
@@ -19,6 +10,8 @@ import torch
 from diffusers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils import BaseOutput
 from diffusers.utils.torch_utils import randn_tensor
+
+from unirl.sde.noise import make_denoise_step_generators
 
 
 @dataclass
@@ -32,31 +25,7 @@ class FlowMatchSDESchedulerOutput(BaseOutput):
 
 
 class FlowMatchSDEDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
-    """SDE flow-match scheduler with on-instance trajectory capture.
-
-    Math (closed-form Gaussian transition for the standard flow-matching SDE)::
-
-        std_dev_t        = sqrt(σ / (1 - σ_max_clamp(σ))) * eta
-        prev_sample_mean = sample * (1 + std_dev_t² / (2σ) * dt)
-                         + model_output * (1 + std_dev_t² * (1-σ) / (2σ)) * dt
-        prev_sample      = prev_sample_mean + std_dev_t * sqrt(-dt) * randn
-        log_prob         = -((prev_sample.detach() - prev_sample_mean)²) /
-                            (2 * (std_dev_t * sqrt(-dt))²)
-                         - log(std_dev_t * sqrt(-dt))
-                         - log(sqrt(2π))
-
-    where ``dt = sigma_prev - sigma`` is negative on a decreasing schedule
-    so ``sqrt(-dt)`` is real.
-
-    The ``log_prob`` is mean-reduced across all non-batch dims so it ends up
-    shape ``[B]`` per step. After the full denoise loop, calling code reads
-    ``self._traj_latents``, ``self._traj_timesteps``, ``self._traj_log_probs``
-    (each a list of per-step tensors) and stacks along ``dim=1`` to get
-    ``[B, T, ...]`` trajectories.
-
-    ``set_timesteps`` clears the trajectory buffers — that's the natural
-    "new request" boundary in the calling pipeline.
-    """
+    """SDE flow-match scheduler with on-instance trajectory capture."""
 
     _traj_latents: List[torch.Tensor]
     _traj_timesteps: List[torch.Tensor]
@@ -75,20 +44,24 @@ class FlowMatchSDEDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
         self._initial_latent: Optional[torch.Tensor] = None
         self._initial_timestep: Optional[torch.Tensor] = None
         self._sde_indices_set: Optional[frozenset] = None
+        self._denoise_seed_keys: Optional[List[str]] = None
+        self._denoise_base_seed: int = 0
 
-    def arm(self, *, eta: float, sde_indices: Optional[List[int]] = None) -> None:
-        """Per-request arming: SDE strength + the sparse step gate.
-
-        MUST re-fire on every pipeline ``forward`` — the gate is per-request
-        state on a long-lived scheduler, and a stale set from a previous
-        request would silently mis-gate SDE steps. ``sde_indices=None``
-        disarms the gate (pure ODE; dense trajectory capture still runs).
-        Counterpart of :meth:`drain_trajectory` on the harvest side.
-        """
+    def arm(
+        self,
+        *,
+        eta: float,
+        sde_indices: Optional[List[int]] = None,
+        denoise_seed_keys: Optional[List[str]] = None,
+        denoise_base_seed: int = 0,
+    ) -> None:
+        """Per-request arming: SDE strength, sparse step gate, and sample-keyed noise."""
         if eta < 0.0:
             raise ValueError(f"FlowMatchSDEDiscreteScheduler.arm: eta must be >= 0; got eta={eta!r}.")
         self._eta = float(eta)
         self._sde_indices_set = frozenset(int(i) for i in sde_indices) if sde_indices is not None else None
+        self._denoise_seed_keys = list(denoise_seed_keys) if denoise_seed_keys is not None else None
+        self._denoise_base_seed = int(denoise_base_seed)
 
     def set_timesteps(
         self,
@@ -98,49 +71,7 @@ class FlowMatchSDEDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
         mu=None,
         timesteps=None,
     ):  # type: ignore[override]
-        """Reset trajectory buffers; build σ schedule with the upstream
-        static-shift double-application bug neutralized.
-
-        Diffusers' ``FlowMatchEulerDiscreteScheduler.set_timesteps``
-        applies the time shift in step 2 unconditionally — even when
-        the caller passes ``sigmas`` externally (see issue #13243 / PR
-        #13246 unmerged as of 2026-05). For UniRL we treat
-        ``sigmas`` as **final values** computed main-side via
-        :meth:`unirl.sde.runtime.FlowMatchSchedulePolicy.compute_sigma`,
-        so any further shift on the worker would double-apply.
-
-        Cross-repo precedent
-        --------------------
-        The same fix exists in the celve/sglang fork at commit
-        ``2c5a2ecec`` "Support external sigma schedules for unirl
-        alignment" (`github.com/celve/sglang@diffusionrl`,
-        ``python/sglang/multimodal_gen/runtime/models/schedulers/
-        scheduling_flow_match_euler_discrete.py:347-360``). That fork
-        guards step 2 with ``if sigmas is None:`` at the source.
-
-        **Upstream ``sgl-project/sglang`` does NOT have this fix** —
-        we cannot rely on it. Our pyproject pins
-        ``sglang @ git+https://github.com/celve/sglang.git@diffusionrl``
-        so the sglang rollout path is fine; the vllm-omni rollout path
-        falls under this scheduler subclass, hence this in-repo patch.
-
-        Implementation
-        --------------
-        When ``sigmas`` is provided externally, transiently swap
-        ``self._internal_dict`` to one with ``use_dynamic_shifting=False``
-        AND set ``self._shift = 1.0`` (note: ``self.shift`` is a
-        ``@property`` over ``_shift``, NOT a FrozenDict entry) so step
-        2's two branches both collapse to identity, AND null
-        ``shift_terminal`` (step 3's whole-schedule stretch — e.g.
-        Qwen-Image-2512 ships ``shift_terminal: 0.02``) — then restore
-        via ``finally``. This is the smallest patch that's stable
-        against future diffusers refactors (we don't reimplement the
-        remaining steps).
-
-        ``_sde_indices_set`` is intentionally NOT reset here — the
-        calling pipeline installs it per-request right before driving
-        the denoise loop; resetting would silently revert to "no SDE".
-        """
+        """Reset trajectory buffers and build the sigma schedule with upstream's double static shift neutralized."""
         if sigmas is not None:
             from diffusers.configuration_utils import FrozenDict
 
@@ -188,11 +119,7 @@ class FlowMatchSDEDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
         return_dict: bool = False,
         **_unused,
     ) -> Union[FlowMatchSDESchedulerOutput, Tuple[torch.Tensor, ...]]:
-        """SDE Flow-Match transition with trajectory capture.
-
-        Calling denoise loops index ``[0]`` on the return value to extract
-        ``prev_sample``; both the dataclass and tuple branches honor that.
-        """
+        """SDE Flow-Match transition with trajectory capture."""
         if isinstance(timestep, (int, torch.IntTensor, torch.LongTensor)):
             raise ValueError(
                 "FlowMatchSDEDiscreteScheduler.step expects a float-typed timestep "
@@ -238,6 +165,18 @@ class FlowMatchSDEDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
                 sample_f32 * (1 + std_dev_t**2 / (2 * sigma) * dt)
                 + model_output_f32 * (1 + std_dev_t**2 * (1 - sigma) / (2 * sigma)) * dt
             )
+
+            if generator is None and self._denoise_seed_keys is not None:
+                if len(self._denoise_seed_keys) != int(model_output_f32.shape[0]):
+                    raise RuntimeError(
+                        "FlowMatchSDEDiscreteScheduler.step: denoise_seed_keys length "
+                        f"{len(self._denoise_seed_keys)} != batch size {int(model_output_f32.shape[0])}."
+                    )
+                generator = make_denoise_step_generators(
+                    base_seed=self._denoise_base_seed,
+                    step_index=int(sigma_idx),
+                    sample_ids=self._denoise_seed_keys,
+                )
 
             variance_noise = randn_tensor(
                 model_output_f32.shape,
@@ -286,50 +225,13 @@ class FlowMatchSDEDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
 
     @property
     def last_sde_step_indices(self) -> List[int]:
-        """Return the list of step indices that ran SDE on the most recent denoise loop.
-
-        ``[]`` when no SDE step recorded (either ``_sde_indices_set`` was
-        ``None`` / empty, or ``step()`` simply wasn't called). Otherwise
-        it's the subset of ``range(T)`` the caller requested, in actual
-        evaluation order (monotonically increasing under normal scheduler
-        usage).
-        """
+        """Return the list of step indices that ran SDE on the most recent denoise loop."""
         return list(self._traj_sde_step_indices)
 
     def drain_trajectory(
         self,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
-        """Return ``(latents [B,T+1,...], sigmas [T+1], timesteps [B,T+1], log_probs [B,K])`` or ``None``.
-
-        Latents / timesteps are dense — length ``T+1`` — regardless of SDE
-        vs ODE gating: position-0 is the input ``sample`` captured on the
-        first ``step()`` call (the x_T), plus ``T`` post-step states. This
-        is required by the trainer-side clean-latents replay path
-        (``resp_to_samples`` raises when ``segment.latents`` is empty),
-        which is why the pipeline subclasses install this scheduler
-        unconditionally (see ``RLStableDiffusion3Pipeline._ensure_scheduler_for_eta``).
-
-        Log-probs length ``K = len(last_sde_step_indices)``:
-        - ``K == T`` when ``_sde_indices_set`` covers every step
-        - ``K < T`` for any sparse subset
-        - ``K == 0`` when ``_sde_indices_set`` is ``None`` or empty
-          (forward-process / NFT path; no SDE step fires, no log_prob
-          captured). Returned as ``[B, 0]`` so downstream tensor ops
-          have a real-but-empty tensor to consume — response.py then
-          collapses this to ``segment.sde_logp = None``.
-
-        Sigmas come straight from the parent's canonical
-        ``self.sigmas`` schedule — 1D ``[T+1]`` in [0, 1], unbatched.
-        Replay reads ``segment.sigmas[step_idx]`` directly so the segment
-        is self-contained — no external schedule reconstruction needed.
-        To recover which step IDs the K log_probs correspond to, read
-        :attr:`last_sde_step_indices` AFTER calling this method.
-
-        Returns ``None`` if no steps were recorded since the last
-        ``set_timesteps`` call. Does not clear the buffers — the next
-        ``set_timesteps`` call does that, so re-reads of the same
-        trajectory are idempotent.
-        """
+        """Return ``(latents [B,T+1,...], sigmas [T+1], timesteps [B,T+1], log_probs [B,K])`` or ``None``."""
         if not self._traj_latents:
             return None
         post_latents = torch.stack(self._traj_latents, dim=1)

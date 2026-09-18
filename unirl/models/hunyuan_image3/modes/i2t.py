@@ -1,18 +1,4 @@
-"""i2t — image-to-text autoregressive generation.
-
-Reads ``primitives["text"]: Texts`` (the prompt) and
-``primitives["image"]: Images`` (the image to caption / answer about),
-plus ``stage_params["ar"]: dict`` (optional). Builds chat-templated
-``input_ids`` with embedded ``<img>`` markers via the chat-template
-wrapper, then runs ``HunyuanImage3ARStage.autoregress`` against the
-backbone in ``mode="gen_text"`` -- the unified MM forward scatters
-ViT patch embeddings into the prompt's ``<img>`` slots via
-``instantiate_vit_image_tokens``.
-
-Conditions on the response carry the chat-templated ``input_ids`` plus
-the ``cond_vit_*`` / ``vit_kwargs`` tensors that drove the ViT-tokens
-scatter.
-"""
+"""i2t — image-to-text autoregressive generation."""
 
 from __future__ import annotations
 
@@ -21,12 +7,12 @@ from typing import TYPE_CHECKING, Any, Dict, List
 import torch
 
 from unirl.models.types.ar import ARSamplingParams
-from unirl.types.conditions import ImageEmbedCondition, ImageLatentCondition
+from unirl.types.conditions import ImageEmbedCondition
 from unirl.types.primitives import Images, Texts
 from unirl.types.sample import Sample
 
 from ..ar import HunyuanImage3ARParams
-from ..conditions import HunyuanImage3ARConditions
+from ..conditions import HunyuanImage3ARConditions, HunyuanImage3VAECondition
 from .t2t import _resolve_system_prompt, _stop_tokens_for_bot_task, _tokenizer_bot_task
 
 if TYPE_CHECKING:
@@ -52,7 +38,7 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
             "HunyuanImage3Pipeline.generate (i2t): expected a chained Images input in sample.conditioning(), found none"
         )
 
-    model_cfg: Dict[str, Any] = dict((sample.parts[0].control or {}).get("ar") or {})
+    model_cfg: Dict[str, Any] = dict(sample.parts[0].control.get("ar") or {})
     ar_params = HunyuanImage3ARParams(
         max_tokens=ar.max_new_tokens if ar is not None else model_cfg.get("max_tokens", 2048),
         temperature=ar.temperature if ar is not None else model_cfg.get("temperature", 0.6),
@@ -80,14 +66,17 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
         vit["joint_image_info"], cfg_factor=1
     )
 
-    def _cast_floats(x: Any) -> Any:
-        if isinstance(x, torch.Tensor):
-            return x.to(dtype=pipeline.bundle.dtype) if x.is_floating_point() else x
-        if isinstance(x, (list, tuple)):
-            return type(x)(_cast_floats(e) for e in x)
-        return x
+    def _as_sample_batches(value):
+        return list(value.split(1, dim=0)) if isinstance(value, torch.Tensor) else list(value)
 
-    cond_vae_images = _cast_floats(cond_vae_images)
+    cond_vae_images = _as_sample_batches(cond_vae_images)
+    cond_timestep = _as_sample_batches(cond_timestep)
+    if cond_vit_images is not None:
+        cond_vit_images = _as_sample_batches(cond_vit_images)
+
+    cond_vae_images = [
+        value.to(dtype=pipeline.bundle.dtype) if value.is_floating_point() else value for value in cond_vae_images
+    ]
 
     mm = pipeline.text_embed.embed_for_ar(
         texts,
@@ -97,7 +86,7 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
         batch_cond_image_info=vit["joint_image_info"],
     )
 
-    cond_vae = ImageLatentCondition(latents=cond_vae_images)
+    cond_vae = HunyuanImage3VAECondition(latents=cond_vae_images)
     cond_vit = ImageEmbedCondition(
         embeds=cond_vit_images,
         attn_mask=vit["vit_kwargs"]["attention_mask"],

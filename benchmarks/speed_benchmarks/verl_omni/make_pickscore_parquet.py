@@ -1,12 +1,4 @@
-"""Convert this repo's ``datasets/pickscore/{train,test}.txt`` into verl-omni parquet.
-
-Both sides of the speed pair must consume the same prompts; verl-omni's loader
-wants verl's parquet schema (mirrors its ``examples/flowgrpo_trainer/data_process/``).
-For the PickScore reward, ``reward_model.ground_truth`` carries the prompt text —
-``compute_score_pickscore`` scores (ground_truth, image) pairs.
-
-    python benchmarks/speed_benchmarks/verl_omni/make_pickscore_parquet.py [--out ~/data/pickscore_sd3]
-"""
+"""Convert this repo's ``datasets/pickscore/{train,test}.txt`` into verl-omni parquet."""
 
 import argparse
 from pathlib import Path

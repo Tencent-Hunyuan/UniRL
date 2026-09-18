@@ -1,16 +1,4 @@
-"""GPUStoreTransport — TensorTransport over a per-GPU TensorWorker actor.
-
-Tensors live in a separate per-GPU ``TensorWorker`` Ray actor; the Worker reaches
-it over a handle (``tw``) and moves data via batched CUDA IPC:
-
-  resolve (_resolve_handles):  one ``batch_borrow`` RPC → open zero-copy IPC views.
-  pack    (put_batch):         one ``batch_allocate`` RPC → IPC-write → ``batch_write_done``.
-
-A borrowed IPC view is kept alive by the resolved tensor that aliases it (PyTorch
-storage refcount): the mapping closes itself once the last slice off it is dropped,
-so there is no per-call release step. A WORKER_LOCAL backend: lifecycle / NCCL /
-remote-compute delegate to the TensorWorker.
-"""
+"""GPUStoreTransport — TensorTransport over a per-GPU TensorWorker actor."""
 
 from __future__ import annotations
 
@@ -41,11 +29,7 @@ class GPUStoreTransport(WorkerLocalTransport):
         return isinstance(value, TensorRef)
 
     def _batch_borrow(self, handles: List[GPUTensorHandle]) -> Dict[str, tuple]:
-        """One ``batch_borrow`` RPC for all not-yet-open CUDA store_keys.
-
-        Borrowing is block-level: callers pass span handles, so N spans of one
-        block dedup (``dict.fromkeys``) to a single IPC open.
-        """
+        """One ``batch_borrow`` RPC for all not-yet-open CUDA store_keys."""
         unique = list(dict.fromkeys(h.store_key for h in handles if h.object_ref is None))
         if not unique:
             return {}

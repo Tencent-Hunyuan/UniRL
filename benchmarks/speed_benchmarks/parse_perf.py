@@ -1,4 +1,14 @@
-"""Extract per-step wall-clock from UniRL training logs into a throughput table.
+"""Extract per-step wall-clock from UniRL training logs into a throughput table."""
+
+from __future__ import annotations
+
+import argparse
+import re
+import statistics
+from datetime import datetime
+from pathlib import Path
+
+_HELP = """Extract per-step wall-clock from UniRL training logs into a throughput table.
 
 UniRL logs one line per training step (``rollout N/M  reward=...``); deltas
 between consecutive line timestamps give the end-to-end step time (generate +
@@ -9,14 +19,6 @@ reward + train + weight sync). For the per-phase breakdown use the wandb
     python benchmarks/speed_benchmarks/parse_perf.py a.log b.log \\
         --samples-per-step 48 --gpus 8
 """
-
-from __future__ import annotations
-
-import argparse
-import re
-import statistics
-from datetime import datetime
-from pathlib import Path
 
 _STEP_LINE = re.compile(r"^\[?(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+\]?.* - rollout (\d+)/\d+\s+reward=")
 
@@ -33,7 +35,7 @@ def step_deltas(log_path: Path, skip: int) -> list[float]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(description=_HELP, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("logs", nargs="+", type=Path)
     parser.add_argument("--skip", type=int, default=2, help="warmup steps to drop (default: %(default)s)")
     parser.add_argument("--samples-per-step", type=int, help="rollout samples per step (batch_size × group size)")

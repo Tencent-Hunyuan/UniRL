@@ -1,16 +1,4 @@
-"""The backend seam contract — the ``Backend`` protocol + the wire types.
-
-Every ``sglang_diffusion`` collaborator reaches the runtime through this protocol;
-the real implementations live beside it (``native.py`` — in-process ``DiffGenerator``
-/ ZMQ scheduler client; an HTTP-server impl would land as ``http.py``). This module
-holds no runtime code at all, so it is trivially CPU-importable.
-
-**No RL types cross this seam.** ``generate`` takes a plain ``dict`` of SGLang
-sampling kwargs and returns ``list[RawResult]`` (a structural view of SGLang's
-``GenerationResult``); the engine core + adapters do the ``Sample``↔wire
-translation. Implementations absorb their transport asymmetries (in-process tensors
-vs. HTTP-serialized payloads) behind these signatures.
-"""
+"""The backend seam contract — the ``Backend`` protocol + the wire types."""
 
 from __future__ import annotations
 
@@ -37,17 +25,7 @@ MediaPayload = Union["torch.Tensor", "np.ndarray", "PILImage", tuple, list, None
 
 
 class RawResult(Protocol):
-    """Structural view of SGLang's ``GenerationResult`` — the wire fields this
-    engine consumes. Implementations return objects satisfying this protocol
-    structurally (the native impl passes ``GenerationResult`` through; an HTTP impl
-    deserializes into the same shape; test fakes stand in), which keeps
-    adapters/utils SGLang-free while still naming the contract.
-
-    Population follows the request: ``trajectory_latents`` /
-    ``trajectory_timesteps`` / ``prompt_embeds`` are always requested;
-    ``trajectory_log_probs`` only in native-logprob mode; the ``negative_*``
-    triple only under CFG.
-    """
+    """Structural view of SGLang's ``GenerationResult`` — the wire fields this engine consumes."""
 
     trajectory_latents: Optional["torch.Tensor"]
     trajectory_timesteps: Optional["torch.Tensor"]

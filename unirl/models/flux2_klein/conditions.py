@@ -1,24 +1,4 @@
-"""Flux2KleinConditions — typed conditions container for the Klein diffusion stage.
-
-Concrete instantiation of the ``DiffusionStage[C]`` type parameter.
-Mirrors :class:`unirl.models.sd3.SD3Conditions` and
-:class:`unirl.models.qwen_image.QwenImageConditions`: text +
-optional ``negative_text``, both as :class:`TextEmbedCondition`
-instances. FLUX.2-klein's text encoder is the single Qwen3 LLM (no
-CLIP-style pooled output is consumed by the transformer, but the
-encoder still produces a pooled vector for API symmetry with FLUX.2-dev;
-the Klein transformer ignores ``pooled_projections`` entirely).
-
-The CFG negative branch is split into a sibling ``negative_text``
-field (rather than nested under ``text.negative``) so the schema is
-honest about which slots travel on the wire — a reader of
-``Part.conditions`` sees ``"text"`` and ``"negative_text"`` as
-two equal-status entries.
-
-Pairs ``from_dict`` / ``to_dict`` for round-tripping between the typed
-form (used inside the pipeline at stage call sites) and the generic
-generic ``Dict[str, Condition]`` shape on a ``Part``.
-"""
+"""Flux2KleinConditions — typed conditions container for the Klein diffusion stage."""
 
 from __future__ import annotations
 
@@ -42,17 +22,7 @@ class Flux2KleinConditions(Batch):
 
     @classmethod
     def from_dict(cls, d: Dict[str, Condition]) -> "Flux2KleinConditions":
-        """Build from the generic ``Conditions`` dict shape.
-
-        Validates that the ``"text"`` slot is present and is a
-        :class:`TextEmbedCondition`. The ``"negative_text"`` slot is
-        optional; when absent the result has ``negative_text=None``
-        (CFG-off, the canonical Klein recipe with
-        ``guidance_scale=1.0``). The ``"image_latent"`` slot is optional —
-        present only for image-edit rollouts; it carries the packed
-        condition tokens (``ImageLatentCondition.latents``) and ids
-        (``.image_latent_ids`` via the dedicated key).
-        """
+        """Build from the generic ``Conditions`` dict shape."""
         text = d.get("text")
         if not isinstance(text, TextEmbedCondition):
             raise TypeError(
@@ -86,13 +56,7 @@ class Flux2KleinConditions(Batch):
         )
 
     def to_dict(self) -> Dict[str, Condition]:
-        """Convert back to the generic ``Conditions`` dict shape for
-        packing into ``Part.conditions``.
-
-        Emits ``"negative_text"`` only when ``negative_text is not None``
-        and the image-edit slots only when an image condition is present,
-        so the dict shape stays minimal for CFG-off T2I rollouts.
-        """
+        """Convert back to the generic ``Conditions`` dict shape for packing into ``Part.conditions``."""
         if self.text is None:
             raise ValueError("Flux2KleinConditions.to_dict: text field is None")
         out: Dict[str, Condition] = {"text": self.text}
