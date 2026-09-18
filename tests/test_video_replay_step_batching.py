@@ -16,8 +16,6 @@ from unirl.models.ltx2.diffusion import LTX2DiffusionStage
 from unirl.models.types.batched_replay import BatchedStepReplayMixin
 from unirl.models.wan21.conditions import WAN21Conditions
 from unirl.models.wan21.diffusion import WAN21DiffusionStage, WAN21DiffusionStep
-from unirl.models.wan22.diffusion import WAN22DiffusionStage, WAN22DiffusionStep
-from unirl.models.wan22_v2v.pipeline import WAN22V2VPipeline
 from unirl.sde.kernels import FlowSDEStrategy
 from unirl.types.conditions import ImageEmbedCondition, ImageLatentCondition, TextEmbedCondition
 from unirl.types.sampling import DiffusionSamplingParams
@@ -101,16 +99,6 @@ class _LTXTransformer(torch.nn.Module):
             video * self.scale + timestep + 0.01 * video_context,
             audio * self.scale + timestep + 0.01 * audio_context,
         )
-
-
-class _DualTransformer(_VideoTransformer):
-    def __init__(self) -> None:
-        super().__init__()
-        self.routes: list[tuple[bool, int]] = []
-
-    def forward(self, *, use_high_noise: bool, **kwargs):
-        self.routes.append((bool(use_high_noise), int(kwargs["hidden_states"].shape[0])))
-        return super().forward(**kwargs)
 
 
 class _GenericStep:
@@ -340,56 +328,6 @@ def test_hunyuan_video15_grouped_replay_preserves_cfg_batch_order() -> None:
         params=_params(guidance_scale=2.0),
         target=[2, 0],
     )
-
-
-def test_wan22_splits_grouped_replay_at_expert_boundary() -> None:
-    conditions = WAN21Conditions(text=_text())
-    route_sigmas = torch.tensor([0.9, 0.7, 0.4, 0.2, 0.1], dtype=torch.float32)
-
-    def stage_factory(grouped: bool):
-        bundle = SimpleNamespace(
-            transformer=_DualTransformer(),
-            vae=SimpleNamespace(config=SimpleNamespace(z_dim=CHANNELS)),
-            device=torch.device("cpu"),
-            boundary_ratio=0.5,
-            guidance_scale_2=None,
-        )
-        return WAN22DiffusionStage(
-            model=bundle,
-            step=WAN22DiffusionStep(),
-            strategy=FlowSDEStrategy(),
-            batch_replay_steps=grouped,
-        )
-
-    segment = LatentSegment(
-        latents=torch.randn(BATCH, 5, CHANNELS, 2, 2, 2, generator=torch.Generator().manual_seed(321)).requires_grad_(
-            True
-        ),
-        sigmas=route_sigmas,
-        indices=torch.arange(5),
-        sde_indices=torch.tensor([0, 1, 2, 3]),
-    )
-    serial_segment = segment
-    grouped_segment = _clone_segment(segment)
-    serial = stage_factory(False)
-    grouped = stage_factory(True)
-    target = [0, 1, 2, 3]
-    params = DiffusionSamplingParams(num_inference_steps=4, guidance_scale=1.0, eta=0.7)
-    serial_result = serial.replay(conditions, segment=serial_segment, params=params, step_indices=target)
-    grouped_result = grouped.replay(conditions, segment=grouped_segment, params=params, step_indices=target)
-
-    torch.testing.assert_close(grouped_result.log_probs, serial_result.log_probs)
-    torch.testing.assert_close(grouped_result.prev_sample_means, serial_result.prev_sample_means)
-    assert grouped.model.transformer.routes == [(True, BATCH * 2), (False, BATCH * 2)]
-
-
-def test_wan22_v2v_trimmed_schedule_keeps_groupable_step_indices() -> None:
-    remapped = WAN22V2VPipeline._sde_indices_in_trimmed_frame(
-        [0, 2, 5, 9],
-        t_full=10,
-        t_eff=4,
-    )
-    assert remapped == [0, 1, 2, 3]
 
 
 @pytest.mark.parametrize(("audio_joint_sde", "guidance_scale"), [(True, 1.0), (False, 1.0), (True, 2.0)])

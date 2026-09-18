@@ -38,7 +38,6 @@ class WAN22Pipeline(Pipeline):
         trajectory_precision: str = "fp16",
         logprob_precision: str = "fp32",
         max_sequence_length: int = 512,
-        batch_replay_steps: bool = False,
     ) -> None:
         super().__init__()
         self.bundle = bundle
@@ -55,7 +54,6 @@ class WAN22Pipeline(Pipeline):
                 autocast_precision=autocast_precision,
                 trajectory_precision=trajectory_precision,
                 logprob_precision=logprob_precision,
-                batch_replay_steps=batch_replay_steps,
             )
         self.diffusion = diffusion
         self.vae_decode = vae_decode if vae_decode is not None else WAN21VAEDecodeStage(bundle)
@@ -95,7 +93,6 @@ class WAN22Pipeline(Pipeline):
             autocast_precision=config.autocast_precision,
             trajectory_precision=config.trajectory_precision,
             logprob_precision=config.logprob_precision,
-            batch_replay_steps=config.batch_replay_steps,
         )
         vae_decode = WAN21VAEDecodeStage(bundle)
         return cls(
