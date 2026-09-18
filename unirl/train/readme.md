@@ -68,6 +68,9 @@ in `backend/base.py`; a multi-update-capable algorithm sets
 - **`optimizer_step` silently *skips* (does not crash) on a non-finite grad norm**
   and zeroes grads — a flat loss curve with a logged warning means grads went
   non-finite.
+- **Checkpointing preserves a never-stepped AdamW** — DCP materializes empty
+  optimizer state with a dummy step; UniRL resets it so the first real update
+  remains step 1.
 - **`master_dtype` defaults to `None`, so the optimizer master follows `param_dtype`** —
   a bf16-loaded base then keeps a bf16 LoRA master and the ~1e-6 AdamW steps round
   away (the policy drifts into a degenerate reward-hack). An fp32-loaded model gets an

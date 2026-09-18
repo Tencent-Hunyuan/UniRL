@@ -70,6 +70,19 @@ class RawResult(Protocol):
 
 
 @runtime_checkable
+class CheckpointEngineIPCBackend(Protocol):
+    """Optional SGLang backend capability for checkpoint-engine IPC."""
+
+    def update_from_checkpoint_engine_ipc(
+        self,
+        *,
+        zmq_handles: Dict[str, str],
+        flush_cache: bool,
+        timeout_s: float,
+    ) -> None: ...
+
+
+@runtime_checkable
 class Backend(Protocol):
     """The seam every ``sglang`` collaborator reaches the runtime through."""
 
@@ -118,4 +131,4 @@ class Backend(Protocol):
     ) -> None: ...
 
 
-__all__ = ["Backend", "RawResult"]
+__all__ = ["Backend", "CheckpointEngineIPCBackend", "RawResult"]
