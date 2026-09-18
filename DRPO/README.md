@@ -35,8 +35,9 @@ The reward here is **rule-based**: `MathVerifyRewardScorer`
 ([`unirl/reward/local/mathverify.py`](../unirl/reward/local/mathverify.py)) grades the
 parsed final answer against the DAPO-Math ground truth with HuggingFace
 `math-verify` — the paper's grader (Appendix D), not a learned reward model. Unlike a
-`\boxed{}`-requiring matcher it also extracts answers from free-form text, so
-correct-but-unboxed generations (common for Qwen3-Base + thinking) are not under-counted.
+`\boxed{}`-requiring matcher, it can also extract answers from free-form text. Extraction
+is heuristic: recognized final-answer markers take priority; otherwise `math-verify` may
+fall back to the rightmost parseable expression.
 
 ![drpo overview: the prompt to SGLang rollout (behavior policy mu) to group advantage to replay for new logp pi to ratio r and TV shift |pi - mu| to reweighted REINFORCE pipeline (single update), with the centerpiece contrast between DPPO's hard-mask step (full gradient, then a cliff to 0 at the threshold delta) and the paper's smooth, bounded DRPO weight that ramps down and crosses zero into a corrective region past delta.](../assets/drpo_overview.png)
 
