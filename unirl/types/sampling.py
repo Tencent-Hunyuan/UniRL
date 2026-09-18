@@ -16,10 +16,9 @@ if TYPE_CHECKING:
     from unirl.sde.index_schedule import TimestepScheduler
 
 
-def _coerce(
+def _coerce_type(
     value: Any,
     target: type[int] | type[float] | type[bool],
-    *,
     name: str,
     optional: bool = False,
 ) -> int | float | bool | None:
@@ -62,11 +61,7 @@ class BaseSamplingParams(ABC):
     samples_per_prompt: int = 1
 
     def __post_init__(self) -> None:
-        self.samples_per_prompt = _coerce(
-            self.samples_per_prompt,
-            int,
-            name=f"{type(self).__name__}.samples_per_prompt",
-        )
+        self.samples_per_prompt = _coerce_type(self.samples_per_prompt, int, "samples_per_prompt")
 
 
 def _is_param_dict(sampling: Any) -> bool:
@@ -137,72 +132,43 @@ class DiffusionSamplingParams(BaseSamplingParams):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        prefix = type(self).__name__
-        self.num_inference_steps = _coerce(
-            self.num_inference_steps,
-            int,
-            name=f"{prefix}.num_inference_steps",
-        )
-        self.guidance_scale = _coerce(self.guidance_scale, float, name=f"{prefix}.guidance_scale")
-        self.height = _coerce(self.height, int, name=f"{prefix}.height")
-        self.width = _coerce(self.width, int, name=f"{prefix}.width")
-        self.num_frames = _coerce(self.num_frames, int, name=f"{prefix}.num_frames")
-        self.seed = _coerce(self.seed, int, name=f"{prefix}.seed", optional=True)
-        self.init_same_noise = _coerce(self.init_same_noise, bool, name=f"{prefix}.init_same_noise")
-        self.disable_driver_xt = _coerce(self.disable_driver_xt, bool, name=f"{prefix}.disable_driver_xt")
-        self.eta = _coerce(self.eta, float, name=f"{prefix}.eta")
-        self.max_sequence_length = _coerce(
-            self.max_sequence_length,
-            int,
-            name=f"{prefix}.max_sequence_length",
-            optional=True,
-        )
-        self.taylor_cache_interval = _coerce(
-            self.taylor_cache_interval,
-            int,
-            name=f"{prefix}.taylor_cache_interval",
-            optional=True,
-        )
-        self.taylor_cache_order = _coerce(
-            self.taylor_cache_order,
-            int,
-            name=f"{prefix}.taylor_cache_order",
-            optional=True,
-        )
-        self.distilled_guidance_scale = _coerce(
-            self.distilled_guidance_scale,
-            float,
-            name=f"{prefix}.distilled_guidance_scale",
-            optional=True,
-        )
-        self.guidance_scale_2 = _coerce(
-            self.guidance_scale_2,
-            float,
-            name=f"{prefix}.guidance_scale_2",
-            optional=True,
-        )
-        self.strength = _coerce(self.strength, float, name=f"{prefix}.strength", optional=True)
+        self.num_inference_steps = _coerce_type(self.num_inference_steps, int, "num_inference_steps")
+        self.guidance_scale = _coerce_type(self.guidance_scale, float, "guidance_scale")
+        self.height = _coerce_type(self.height, int, "height")
+        self.width = _coerce_type(self.width, int, "width")
+        self.num_frames = _coerce_type(self.num_frames, int, "num_frames")
+        self.seed = _coerce_type(self.seed, int, "seed", True)
+        self.init_same_noise = _coerce_type(self.init_same_noise, bool, "init_same_noise")
+        self.disable_driver_xt = _coerce_type(self.disable_driver_xt, bool, "disable_driver_xt")
+        self.eta = _coerce_type(self.eta, float, "eta")
+        self.max_sequence_length = _coerce_type(self.max_sequence_length, int, "max_sequence_length", True)
+        self.taylor_cache_interval = _coerce_type(self.taylor_cache_interval, int, "taylor_cache_interval", True)
+        self.taylor_cache_order = _coerce_type(self.taylor_cache_order, int, "taylor_cache_order", True)
+        name = "distilled_guidance_scale"
+        self.distilled_guidance_scale = _coerce_type(self.distilled_guidance_scale, float, name, True)
+        self.guidance_scale_2 = _coerce_type(self.guidance_scale_2, float, "guidance_scale_2", True)
+        self.strength = _coerce_type(self.strength, float, "strength", True)
         if self.init_noise_latent_shape is not None:
-            name = f"{prefix}.init_noise_latent_shape"
+            name = "init_noise_latent_shape"
             if isinstance(self.init_noise_latent_shape, (str, bytes)) or not isinstance(
                 self.init_noise_latent_shape, Sequence
             ):
                 raise TypeError(f"{name} must be a sequence of integers, got {self.init_noise_latent_shape!r}")
             self.init_noise_latent_shape = [
-                _coerce(item, int, name=f"{name}[{index}]") for index, item in enumerate(self.init_noise_latent_shape)
+                _coerce_type(item, int, f"{name}[{index}]") for index, item in enumerate(self.init_noise_latent_shape)
             ]
         if self.sde_indices is not None:
-            name = f"{prefix}.sde_indices"
+            name = "sde_indices"
             if isinstance(self.sde_indices, (str, bytes)) or not isinstance(self.sde_indices, Sequence):
                 raise TypeError(f"{name} must be a sequence of integers, got {self.sde_indices!r}")
             self.sde_indices = [
-                _coerce(item, int, name=f"{name}[{index}]") for index, item in enumerate(self.sde_indices)
+                _coerce_type(item, int, f"{name}[{index}]") for index, item in enumerate(self.sde_indices)
             ]
         reserved = {f.name for f in fields(self) if f.name != "sampler_kwargs"}
         shadowed = reserved & set(self.sampler_kwargs)
         require(
             not shadowed,
-            f"{prefix}.sampler_kwargs cannot contain reserved keys {sorted(shadowed)}; set them as fields instead",
+            f"{type(self).__name__}.sampler_kwargs cannot contain reserved keys {sorted(shadowed)}; set them as fields instead",
         )
 
     def resolve_sde_indices(self, rollout_id: int) -> List[int]:
@@ -230,10 +196,9 @@ class ARSamplingParams(BaseSamplingParams):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        prefix = type(self).__name__
-        self.temperature = _coerce(self.temperature, float, name=f"{prefix}.temperature")
-        self.max_new_tokens = _coerce(self.max_new_tokens, int, name=f"{prefix}.max_new_tokens")
-        self.top_p = _coerce(self.top_p, float, name=f"{prefix}.top_p")
-        self.top_k = _coerce(self.top_k, int, name=f"{prefix}.top_k")
-        self.stop_token_id = _coerce(self.stop_token_id, int, name=f"{prefix}.stop_token_id", optional=True)
-        self.seed = _coerce(self.seed, int, name=f"{prefix}.seed", optional=True)
+        self.temperature = _coerce_type(self.temperature, float, "temperature")
+        self.max_new_tokens = _coerce_type(self.max_new_tokens, int, "max_new_tokens")
+        self.top_p = _coerce_type(self.top_p, float, "top_p")
+        self.top_k = _coerce_type(self.top_k, int, "top_k")
+        self.stop_token_id = _coerce_type(self.stop_token_id, int, "stop_token_id", True)
+        self.seed = _coerce_type(self.seed, int, "seed", True)
