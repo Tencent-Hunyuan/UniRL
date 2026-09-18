@@ -11,6 +11,9 @@ export PIP_INDEX_URL=https://mirrors.cloud.tencent.com/pypi/simple
 export PIP_TRUSTED_HOST=mirrors.cloud.tencent.com
 
 python3 -m pip install --no-deps --force-reinstall "sglang==0.5.19"
+if [ "$mode" = "tp_sync" ]; then
+  python3 -m pip install --no-deps "peft==0.21.0"
+fi
 python3 -m pip install --no-build-isolation --no-deps -e .
 
 exec python3 scripts/sglang_0519_alignment.py \
