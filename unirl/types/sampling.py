@@ -144,8 +144,12 @@ class DiffusionSamplingParams(BaseSamplingParams):
         self.max_sequence_length = _coerce_type(self.max_sequence_length, int, "max_sequence_length", True)
         self.taylor_cache_interval = _coerce_type(self.taylor_cache_interval, int, "taylor_cache_interval", True)
         self.taylor_cache_order = _coerce_type(self.taylor_cache_order, int, "taylor_cache_order", True)
-        name = "distilled_guidance_scale"
-        self.distilled_guidance_scale = _coerce_type(self.distilled_guidance_scale, float, name, True)
+        self.distilled_guidance_scale = _coerce_type(
+            self.distilled_guidance_scale,
+            float,
+            "distilled_guidance_scale",
+            True,
+        )
         self.guidance_scale_2 = _coerce_type(self.guidance_scale_2, float, "guidance_scale_2", True)
         self.strength = _coerce_type(self.strength, float, "strength", True)
         if self.init_noise_latent_shape is not None:
