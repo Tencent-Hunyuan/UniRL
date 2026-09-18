@@ -15,57 +15,54 @@ if TYPE_CHECKING:
 
     from unirl.sde.index_schedule import TimestepScheduler
 
-_BOOL_TRUE = {"true", "1"}
-_BOOL_FALSE = {"false", "0"}
 
+def _coerce(
+    value: Any,
+    target: type[int] | type[float] | type[bool],
+    *,
+    name: str,
+    optional: bool = False,
+) -> int | float | bool | None:
+    """Coerce a scalar config value to ``target``, preserving optional ``None``."""
+    if target is int:
+        expected = "an integer"
+    elif target is float:
+        expected = "a finite float"
+    elif target is bool:
+        expected = "a boolean"
+    else:
+        raise ValueError(f"unsupported coercion target {target!r}")
 
-def _coerce_int(value: Any, *, name: str, optional: bool = False) -> int | None:
-    """Coerce ``value`` to ``int``, or ``None`` when ``optional``."""
     if value is None:
         if optional:
             return None
-        raise TypeError(f"{name} must be an integer, got None")
-    if type(value) is int:
-        return value
-    if isinstance(value, str):
+        raise TypeError(f"{name} must be {expected}, got None")
+
+    if target is int:
+        if type(value) is int:
+            return value
+        if isinstance(value, str):
+            try:
+                return int(value.strip(), 10)
+            except ValueError as exc:
+                raise TypeError(f"{name} must be {expected}, got {value!r}") from exc
+    elif target is float and (type(value) in (int, float) or isinstance(value, str)):
         try:
-            return int(value.strip(), 10)
-        except ValueError as exc:
-            raise TypeError(f"{name} must be an integer, got {value!r}") from exc
-    raise TypeError(f"{name} must be an integer, got {value!r}")
-
-
-def _coerce_float(value: Any, *, name: str, optional: bool = False) -> float | None:
-    """Coerce ``value`` to a finite ``float``, or ``None`` when ``optional``."""
-    if value is None:
-        if optional:
-            return None
-        raise TypeError(f"{name} must be a finite float, got None")
-    if type(value) not in (int, float) and not isinstance(value, str):
-        raise TypeError(f"{name} must be a finite float, got {value!r}")
-    if isinstance(value, str):
-        value = value.strip()
-    try:
-        number = float(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise TypeError(f"{name} must be a finite float, got {value!r}") from exc
-    if not math.isfinite(number):
-        raise ValueError(f"{name} must be a finite float, got {value!r}")
-    return number
-
-
-def _coerce_bool(value: Any, *, name: str) -> bool:
-    """Coerce ``value`` to ``bool`` without treating nonempty strings as true."""
-    if isinstance(value, bool):
+            number = float(value.strip() if isinstance(value, str) else value)
+        except (ValueError, OverflowError) as exc:
+            raise TypeError(f"{name} must be {expected}, got {value!r}") from exc
+        if not math.isfinite(number):
+            raise ValueError(f"{name} must be {expected}, got {value!r}")
+        return number
+    elif target is bool and type(value) is bool:
         return value
-    if isinstance(value, str):
+    elif target is bool and isinstance(value, str):
         key = value.strip().lower()
-        if key in _BOOL_TRUE:
+        if key == "true":
             return True
-        if key in _BOOL_FALSE:
+        if key == "false":
             return False
-        raise TypeError(f"{name} must be a boolean, got {value!r}")
-    raise TypeError(f"{name} must be a boolean, got {value!r}")
+    raise TypeError(f"{name} must be {expected}, got {value!r}")
 
 
 @dataclass
@@ -75,8 +72,9 @@ class BaseSamplingParams(ABC):
     samples_per_prompt: int = 1
 
     def __post_init__(self) -> None:
-        self.samples_per_prompt = _coerce_int(
+        self.samples_per_prompt = _coerce(
             self.samples_per_prompt,
+            int,
             name=f"{type(self).__name__}.samples_per_prompt",
         )
 
@@ -150,41 +148,50 @@ class DiffusionSamplingParams(BaseSamplingParams):
     def __post_init__(self) -> None:
         super().__post_init__()
         prefix = type(self).__name__
-        self.num_inference_steps = _coerce_int(self.num_inference_steps, name=f"{prefix}.num_inference_steps")
-        self.guidance_scale = _coerce_float(self.guidance_scale, name=f"{prefix}.guidance_scale")
-        self.height = _coerce_int(self.height, name=f"{prefix}.height")
-        self.width = _coerce_int(self.width, name=f"{prefix}.width")
-        self.num_frames = _coerce_int(self.num_frames, name=f"{prefix}.num_frames")
-        self.seed = _coerce_int(self.seed, name=f"{prefix}.seed", optional=True)
-        self.init_same_noise = _coerce_bool(self.init_same_noise, name=f"{prefix}.init_same_noise")
-        self.disable_driver_xt = _coerce_bool(self.disable_driver_xt, name=f"{prefix}.disable_driver_xt")
-        self.eta = _coerce_float(self.eta, name=f"{prefix}.eta")
-        self.max_sequence_length = _coerce_int(
+        self.num_inference_steps = _coerce(
+            self.num_inference_steps,
+            int,
+            name=f"{prefix}.num_inference_steps",
+        )
+        self.guidance_scale = _coerce(self.guidance_scale, float, name=f"{prefix}.guidance_scale")
+        self.height = _coerce(self.height, int, name=f"{prefix}.height")
+        self.width = _coerce(self.width, int, name=f"{prefix}.width")
+        self.num_frames = _coerce(self.num_frames, int, name=f"{prefix}.num_frames")
+        self.seed = _coerce(self.seed, int, name=f"{prefix}.seed", optional=True)
+        self.init_same_noise = _coerce(self.init_same_noise, bool, name=f"{prefix}.init_same_noise")
+        self.disable_driver_xt = _coerce(self.disable_driver_xt, bool, name=f"{prefix}.disable_driver_xt")
+        self.eta = _coerce(self.eta, float, name=f"{prefix}.eta")
+        self.max_sequence_length = _coerce(
             self.max_sequence_length,
+            int,
             name=f"{prefix}.max_sequence_length",
             optional=True,
         )
-        self.taylor_cache_interval = _coerce_int(
+        self.taylor_cache_interval = _coerce(
             self.taylor_cache_interval,
+            int,
             name=f"{prefix}.taylor_cache_interval",
             optional=True,
         )
-        self.taylor_cache_order = _coerce_int(
+        self.taylor_cache_order = _coerce(
             self.taylor_cache_order,
+            int,
             name=f"{prefix}.taylor_cache_order",
             optional=True,
         )
-        self.distilled_guidance_scale = _coerce_float(
+        self.distilled_guidance_scale = _coerce(
             self.distilled_guidance_scale,
+            float,
             name=f"{prefix}.distilled_guidance_scale",
             optional=True,
         )
-        self.guidance_scale_2 = _coerce_float(
+        self.guidance_scale_2 = _coerce(
             self.guidance_scale_2,
+            float,
             name=f"{prefix}.guidance_scale_2",
             optional=True,
         )
-        self.strength = _coerce_float(self.strength, name=f"{prefix}.strength", optional=True)
+        self.strength = _coerce(self.strength, float, name=f"{prefix}.strength", optional=True)
         if self.init_noise_latent_shape is not None:
             name = f"{prefix}.init_noise_latent_shape"
             if isinstance(self.init_noise_latent_shape, (str, bytes)) or not isinstance(
@@ -192,14 +199,14 @@ class DiffusionSamplingParams(BaseSamplingParams):
             ):
                 raise TypeError(f"{name} must be a sequence of integers, got {self.init_noise_latent_shape!r}")
             self.init_noise_latent_shape = [
-                _coerce_int(item, name=f"{name}[{index}]") for index, item in enumerate(self.init_noise_latent_shape)
+                _coerce(item, int, name=f"{name}[{index}]") for index, item in enumerate(self.init_noise_latent_shape)
             ]
         if self.sde_indices is not None:
             name = f"{prefix}.sde_indices"
             if isinstance(self.sde_indices, (str, bytes)) or not isinstance(self.sde_indices, Sequence):
                 raise TypeError(f"{name} must be a sequence of integers, got {self.sde_indices!r}")
             self.sde_indices = [
-                _coerce_int(item, name=f"{name}[{index}]") for index, item in enumerate(self.sde_indices)
+                _coerce(item, int, name=f"{name}[{index}]") for index, item in enumerate(self.sde_indices)
             ]
         reserved = {f.name for f in fields(self) if f.name != "sampler_kwargs"}
         shadowed = reserved & set(self.sampler_kwargs)
@@ -234,9 +241,9 @@ class ARSamplingParams(BaseSamplingParams):
     def __post_init__(self) -> None:
         super().__post_init__()
         prefix = type(self).__name__
-        self.temperature = _coerce_float(self.temperature, name=f"{prefix}.temperature")
-        self.max_new_tokens = _coerce_int(self.max_new_tokens, name=f"{prefix}.max_new_tokens")
-        self.top_p = _coerce_float(self.top_p, name=f"{prefix}.top_p")
-        self.top_k = _coerce_int(self.top_k, name=f"{prefix}.top_k")
-        self.stop_token_id = _coerce_int(self.stop_token_id, name=f"{prefix}.stop_token_id", optional=True)
-        self.seed = _coerce_int(self.seed, name=f"{prefix}.seed", optional=True)
+        self.temperature = _coerce(self.temperature, float, name=f"{prefix}.temperature")
+        self.max_new_tokens = _coerce(self.max_new_tokens, int, name=f"{prefix}.max_new_tokens")
+        self.top_p = _coerce(self.top_p, float, name=f"{prefix}.top_p")
+        self.top_k = _coerce(self.top_k, int, name=f"{prefix}.top_k")
+        self.stop_token_id = _coerce(self.stop_token_id, int, name=f"{prefix}.stop_token_id", optional=True)
+        self.seed = _coerce(self.seed, int, name=f"{prefix}.seed", optional=True)
