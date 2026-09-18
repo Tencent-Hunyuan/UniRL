@@ -128,7 +128,7 @@ rollout:
       disable_cuda_graph: false
       # Graph capture only has to cover this recipe's rollout concurrency; the
       # SGLang default captures far larger batches and wastes the headroom.
-      cuda_graph_max_bs: 64
+      cuda_graph_max_bs_decode: 64
       # SGLang LoRA-pool settings.  LocalLoraWeightSync uploads a new versioned
       # adapter after each rollout; old versions are evicted by this LRU pool.
       enable_lora: true

@@ -110,12 +110,9 @@ _GEN_SENTINEL = "_unirl_diff_gen_index"
 
 def _wrap_diff_generator_generate() -> None:
     """AROUND-wrap ``DiffGenerator.generate`` to index ``condition_image`` per prompt."""
-    try:
-        from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import (
-            DiffGenerator,
-        )
-    except Exception:  # pragma: no cover - environment dependent
-        return
+    from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import (
+        DiffGenerator,
+    )
 
     orig = DiffGenerator.__dict__.get("generate")
     if orig is None:
@@ -147,17 +144,16 @@ _IVL_SENTINEL = "_unirl_ivl_cond_img"
 
 def _wrap_input_validation_condition_image() -> None:
     """AROUND-wrap ``InputValidationStage.forward`` to preprocess ``condition_image`` when ``image_path`` is None."""
-    try:
-        import sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation as ivl_mod
-    except ImportError:
-        return  # pragma: no cover - upstream module missing
+    import sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation as ivl_mod
 
     IVL = getattr(ivl_mod, "InputValidationStage", None)
     if IVL is None:
-        return  # pragma: no cover
+        raise AttributeError("InputValidationStage missing upstream")
 
     orig_forward = IVL.__dict__.get("forward")
-    if orig_forward is None or getattr(orig_forward, _IVL_SENTINEL, False):
+    if orig_forward is None:
+        raise AttributeError("InputValidationStage.forward missing upstream")
+    if getattr(orig_forward, _IVL_SENTINEL, False):
         return
 
     def forward(self, batch, server_args, __orig=orig_forward):
@@ -209,13 +205,13 @@ def _iter_subclasses(cls):
 
 
 def _install_sampling_params_fields(SamplingParams) -> None:
-    """Register the four fields on SamplingParams and every live subclass."""
+    """Register UniRL fields on SamplingParams and every live subclass."""
     for cls in _iter_subclasses(SamplingParams):
         _register_and_wrap_init(cls)
 
 
 def _register_and_wrap_init(cls) -> None:
-    """Add the four fields to ``cls`` and wrap its ``__init__`` to accept them."""
+    """Add UniRL fields to ``cls`` and wrap its ``__init__`` to accept them."""
     own_fields = cls.__dict__.get("__dataclass_fields__")
     if own_fields is None:
         own_fields = dict(getattr(cls, "__dataclass_fields__", {}))
@@ -276,7 +272,7 @@ def _install_req_denoise_seeds(sb_mod) -> None:
 
 
 def _wrap_prepare_request(utils_mod, SamplingParams) -> None:
-    """AROUND-wrap ``prepare_request`` to copy the four IO fields onto the Req."""
+    """AROUND-wrap ``prepare_request`` to lower driver-only IO onto the Req."""
     orig = utils_mod.prepare_request
     if getattr(orig, _PREP_SENTINEL, False):
         return
@@ -305,10 +301,6 @@ def _wrap_prepare_request(utils_mod, SamplingParams) -> None:
         denoise_seeds = getattr(sampling_params, "denoise_seeds", None)
         if denoise_seeds is not None:
             req.denoise_seeds = denoise_seeds
-
-        max_sequence_length = getattr(sampling_params, "max_sequence_length", None)
-        if max_sequence_length is not None:
-            req.max_sequence_length = int(max_sequence_length)
 
         condition_image = getattr(sampling_params, "condition_image", None)
         if condition_image is not None:

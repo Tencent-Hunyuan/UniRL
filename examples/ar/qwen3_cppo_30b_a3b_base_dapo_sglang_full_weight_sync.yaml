@@ -115,7 +115,7 @@ rollout:
       mem_fraction_static: 0.15
       attention_backend: triton
       disable_cuda_graph: false
-      cuda_graph_max_bs: 64
+      cuda_graph_max_bs_decode: 64
       enable_lora: false
 
 reward:

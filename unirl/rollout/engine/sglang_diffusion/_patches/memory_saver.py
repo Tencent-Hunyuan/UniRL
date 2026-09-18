@@ -7,7 +7,9 @@ import time
 from typing import TYPE_CHECKING, Iterable
 
 import torch
-from sglang.multimodal_gen.runtime.loader.weights_updater import get_updatable_modules
+from sglang.multimodal_gen.runtime.post_training.weights_updater import (
+    get_updatable_modules,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 if TYPE_CHECKING:
@@ -238,7 +240,7 @@ class MemorySaverHandler:
 
             # Modules in non-backup tags are dirty (garbage until weight sync)
             non_backup_tags = set(all_tags) - backup_set
-            self.dirty_modules = set()
+            self.dirty_modules.clear()
             for tag in non_backup_tags:
                 self.dirty_modules.update(self.modules_for_tag(tag).keys())
 

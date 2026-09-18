@@ -88,7 +88,7 @@ rollout:
       skip_server_warmup: true
       attention_backend: triton
       disable_cuda_graph: false
-      cuda_graph_max_bs: 16
+      cuda_graph_max_bs_decode: 16
       enable_lora: false
 
 reward:

@@ -238,6 +238,10 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
         )
         self._version += 1
 
+    def normalize_tensor_weight_name(self, name: str) -> str:
+        """Normalize trainer-side tensor names for SGLang's module-relative loader."""
+        return self._weight_sync.normalize_tensor_weight_name(name)
+
     def init_weights_update_group(
         self,
         *,
