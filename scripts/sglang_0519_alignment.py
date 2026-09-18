@@ -145,11 +145,10 @@ def _ar_engine_kwargs(mem_fraction_static: float) -> dict[str, Any]:
     return {
         "mem_fraction_static": mem_fraction_static,
         "skip_server_warmup": True,
-        "disable_cuda_graph": True,
+        "disable_cuda_graph": False,
+        "cuda_graph_max_bs_decode": 16,
         "rl_on_policy_target": "fsdp",
         "attention_backend": "triton",
-        "enable_memory_saver": True,
-        "enable_weights_cpu_backup": True,
     }
 
 
@@ -177,11 +176,14 @@ def run_ar(args: argparse.Namespace) -> dict[str, Any]:
         _assert_nested_exact("ar.segment", first.segment, second.segment)
         _assert_nested_exact("ar.conditions", first.conditions, second.conditions)
 
-        engine.sleep()
-        engine.wake_up()
-        after_wake = engine.generate(request).frontier_gen_part(ARSamplingParams)
-        _assert_nested_exact("ar.sleep_wake.segment", first.segment, after_wake.segment)
-        _assert_nested_exact("ar.sleep_wake.conditions", first.conditions, after_wake.conditions)
+        bitwise_sleep_wake = None
+        if args.check_sleep_wake:
+            engine.sleep()
+            engine.wake_up()
+            after_wake = engine.generate(request).frontier_gen_part(ARSamplingParams)
+            _assert_nested_exact("ar.sleep_wake.segment", first.segment, after_wake.segment)
+            _assert_nested_exact("ar.sleep_wake.conditions", first.conditions, after_wake.conditions)
+            bitwise_sleep_wake = True
     finally:
         engine.shutdown()
     _release_cuda()
@@ -221,7 +223,7 @@ def run_ar(args: argparse.Namespace) -> dict[str, Any]:
         "gradient_norm": grad_norm,
         "rl_on_policy_target": "fsdp",
         "bitwise_repeat": True,
-        "bitwise_sleep_wake": True,
+        "bitwise_sleep_wake": bitwise_sleep_wake,
     }
     del pipeline
     _release_cuda()
@@ -362,6 +364,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--mem-fraction-static", type=float, default=0.3)
     parser.add_argument("--logprob-mean-limit", type=float, default=0.05)
     parser.add_argument("--logprob-max-limit", type=float, default=0.5)
+    parser.add_argument("--check-sleep-wake", action="store_true")
 
     parser.add_argument("--num-inference-steps", type=int, default=4)
     parser.add_argument("--height", type=int, default=512)

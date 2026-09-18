@@ -22,6 +22,9 @@ def test_ar_alignment_uses_production_fsdp_target():
 
     assert engine_kwargs["rl_on_policy_target"] == "fsdp"
     assert engine_kwargs["attention_backend"] == "triton"
+    assert engine_kwargs["disable_cuda_graph"] is False
+    assert engine_kwargs["cuda_graph_max_bs_decode"] == 16
+    assert "enable_memory_saver" not in engine_kwargs
     assert "enable_deterministic_inference" not in engine_kwargs
 
 
