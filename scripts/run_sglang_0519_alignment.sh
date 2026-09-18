@@ -19,4 +19,5 @@ python3 -m pip install --no-build-isolation --no-deps -e .
 exec python3 scripts/sglang_0519_alignment.py \
   "$mode" \
   --model "$model_path" \
-  --output "$output_json"
+  --output "$output_json" \
+  --mem-fraction-static "${MEM_FRACTION_STATIC:-0.3}"
