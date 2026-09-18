@@ -34,8 +34,8 @@ class HPSv2RewardScorer(LocalRewardBackend):
         except ImportError:
             raise ImportError("hpsv2 is required for HPSv2 reward")
 
-        open_clip_path = self.model_kwargs.get("open_clip_path", "./hps_ckpt/open_clip_pytorch_model.bin")
-        checkpoint_path = self.model_kwargs.get("checkpoint_path", "./hps_ckpt/HPS_v2.1_compressed.pt")
+        open_clip_path = self.model_kwargs["open_clip_path"]
+        checkpoint_path = self.model_kwargs["checkpoint_path"]
 
         model, _, preprocess_val = create_model_and_transforms(
             "ViT-H-14",
@@ -67,36 +67,48 @@ class HPSv2RewardScorer(LocalRewardBackend):
     def _compute_model_rewards(self, request: RewardRequest) -> List[float]:
         images = request.images
         prompts = request.prompts
+        if images is None:
+            raise ValueError("HPSv2 requires generated images.")
+        if len(images) != len(prompts):
+            raise ValueError(
+                f"HPSv2 requires one prompt per image; got {len(prompts)} prompts for {len(images)} images."
+            )
         all_rewards: List[float] = []
 
         for i in range(0, len(images), self.batch_size):
             batch_images = images[i : i + self.batch_size]
             batch_prompts = prompts[i : i + self.batch_size]
+            try:
+                pil_images = [
+                    image.convert("RGB") if isinstance(image, Image.Image) else Image.fromarray(image).convert("RGB")
+                    for image in batch_images
+                ]
+                image_input = torch.stack(
+                    [self._hpsv2_preprocess_val(image) for image in pil_images],
+                    dim=0,
+                ).to(device=self.device, non_blocking=True)
+                text_input = self._hpsv2_tokenizer(list(batch_prompts)).to(
+                    device=self.device,
+                    non_blocking=True,
+                )
 
-            for j, (img, prompt) in enumerate(zip(batch_images, batch_prompts)):
-                try:
-                    if isinstance(img, Image.Image):
-                        img_pil = img.convert("RGB")
-                    else:
-                        img_pil = Image.fromarray(img).convert("RGB")
-
-                    image_input = (
-                        self._hpsv2_preprocess_val(img_pil).unsqueeze(0).to(device=self.device, non_blocking=True)
-                    )
-                    text_input = self._hpsv2_tokenizer([prompt]).to(device=self.device, non_blocking=True)
-
-                    with torch.no_grad():
-                        with torch.amp.autocast("cuda"):
-                            outputs = self.model(image_input, text_input)
-                            image_features = outputs["image_features"]
-                            text_features = outputs["text_features"]
-                            logits_per_image = image_features @ text_features.T
-                            hps_score = torch.diagonal(logits_per_image)
-
-                    all_rewards.append(float(hps_score.item()))
-                except Exception as exc:
-                    sample_idx = i + j
-                    raise RuntimeError(f"HPSv2 reward scoring failed for sample {sample_idx}.") from exc
+                device_type = torch.device(self.device).type
+                with (
+                    torch.no_grad(),
+                    torch.amp.autocast(
+                        device_type,
+                        enabled=device_type == "cuda",
+                    ),
+                ):
+                    outputs = self.model(image_input, text_input)
+                    image_features = outputs["image_features"]
+                    text_features = outputs["text_features"]
+                    hps_scores = torch.diagonal(image_features @ text_features.T)
+                all_rewards.extend(float(value) for value in hps_scores.float().cpu().tolist())
+            except Exception as exc:
+                raise RuntimeError(
+                    f"HPSv2 reward scoring failed for batch rows [{i}:{i + len(batch_images)}]."
+                ) from exc
 
         return all_rewards
 
@@ -109,3 +121,11 @@ class HPSv2Spec(BaseRewardComponentSpec):
     device: str = "auto"
     open_clip_path: str = "./hps_ckpt/open_clip_pytorch_model.bin"
     checkpoint_path: str = "./hps_ckpt/HPS_v2.1_compressed.pt"
+
+    def __post_init__(self) -> None:
+        if isinstance(self.batch_size, bool) or not isinstance(self.batch_size, int) or self.batch_size < 1:
+            raise ValueError(f"HPSv2Spec.batch_size must be a positive integer, got {self.batch_size!r}.")
+        for name in ("device", "open_clip_path", "checkpoint_path"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value:
+                raise TypeError(f"HPSv2Spec.{name} must be a non-empty string, got {value!r}.")
