@@ -23,11 +23,160 @@ _PIXEL_MEAN = (0.485, 0.456, 0.406)
 _PIXEL_STD = (0.229, 0.224, 0.225)
 
 
+def _sp_decode_group():
+    """Return the Ulysses SP process group when sharded decode is usable, else None."""
+    import torch.distributed as dist
+
+    if not dist.is_available() or not dist.is_initialized():
+        return None
+    from unirl.train.backend.veomni import _compat
+
+    _compat.ensure_installed()
+    from veomni.distributed.parallel_state import get_parallel_state
+
+    # The backend only calls initialize_sequence_parallel_state() when sp_size > 1, so
+    # at sp_size == 1 there is no VeOmni parallel state to read: probing it raises
+    # "The product of parallel sizes should be equal to the world size." Treat an
+    # uninitialized state as "no SP" rather than as an error.
+    try:
+        state = get_parallel_state()
+    except ValueError as exc:
+        if str(exc) != "The product of parallel sizes should be equal to the world size.":
+            raise
+        return None
+    sp_size = int(state.sp_size)
+    if sp_size <= 1:
+        return None
+    group = state.sp_group
+    if group is None:
+        raise RuntimeError(f"MiniMax-H3 sharded decode requires an SP process group for sp_size={sp_size}")
+    if dist.get_world_size(group) != sp_size or dist.get_rank(group) != int(state.sp_rank):
+        raise RuntimeError("MiniMax-H3 sharded decode found an inconsistent VeOmni parallel state")
+    return group
+
+
+def _sharded_decode_clips(vae, z: torch.Tensor, num_chunks: int, group) -> list[torch.Tensor]:
+    """Run ``_decode_clip`` for ``num_chunks`` clips spread over the SP group, then all-gather."""
+    import torch.distributed as dist
+
+    world = dist.get_world_size(group)
+    rank = dist.get_rank(group)
+    # Round-robin, so ranks share the same per-chunk cost and the gather order is chunk order.
+    # A local failure must not skip the collectives below, or the peers deadlock: record it,
+    # exchange status in the fixed-size probe, and raise only after everyone has agreed.
+    local: list[torch.Tensor] = []
+    error: BaseException | None = None
+    try:
+        local = [
+            vae._decode_clip(
+                z[
+                    :,
+                    :,
+                    i * vae.tokens_chunk_size : i * vae.tokens_chunk_size + vae.tokens_chunk_size + vae.token_overlap,
+                ]
+            )
+            for i in range(rank, num_chunks, world)
+        ]
+        if any(clip.ndim != 5 for clip in local):
+            raise RuntimeError("MiniMax-H3 sharded decode expected 5-D [B, C, T, H, W] clips")
+        if any(clip.shape != local[0].shape or clip.dtype != z.dtype for clip in local):
+            raise RuntimeError("MiniMax-H3 sharded decode produced ragged clips on one rank")
+    except BaseException as exc:  # re-raised below, after the status exchange
+        error = exc
+        local = []
+
+    # probe[0]=ok, probe[1]=has-clip, probe[2:7]=clip shape. Fixed size so a failed rank
+    # still participates with the same payload shape. Every decision below is a pure
+    # function of `probes`, so all ranks raise together instead of stranding peers in
+    # the gather (an all_gather shape mismatch is an 1800s NCCL timeout, not an error).
+    probe = torch.zeros(7, dtype=torch.int64, device=z.device)
+    probe[0] = int(error is None)
+    if error is None and local:
+        probe[1] = 1
+        probe[2:] = torch.tensor(local[0].shape, dtype=torch.int64, device=z.device)
+    probes = [torch.empty_like(probe) for _ in range(world)]
+    dist.all_gather(probes, probe, group=group)
+    if not all(int(p[0]) for p in probes):
+        if error is not None:
+            raise error
+        raise RuntimeError("MiniMax-H3 sharded decode failed on another SP rank")
+
+    shapes = {tuple(int(v) for v in p[2:]) for p in probes if int(p[1])}
+    if len(shapes) != 1:
+        raise RuntimeError(
+            f"MiniMax-H3 sharded decode saw disagreeing clip shapes across the SP group: {sorted(shapes)}"
+        )
+    ref = shapes.pop()
+    per_rank = (num_chunks + world - 1) // world
+    slab = torch.zeros((per_rank, *ref), dtype=z.dtype, device=z.device)
+    for index, clip in enumerate(local):
+        slab[index] = clip
+    gathered = [torch.empty_like(slab) for _ in range(world)]
+    dist.all_gather(gathered, slab.contiguous(), group=group)
+    # Undo the round-robin: rank r held chunks r, r+world, r+2*world, ...
+    clips: list[torch.Tensor | None] = [None] * num_chunks
+    for r in range(world):
+        for slot, i in enumerate(range(r, num_chunks, world)):
+            clips[i] = gathered[r][slot]
+    if any(clip is None for clip in clips):
+        raise RuntimeError("MiniMax-H3 sharded decode did not recover every clip")
+    return clips
+
+
+def _decode_video_latents(vae, z: torch.Tensor, *, shard_across_sp: bool) -> torch.Tensor:
+    """``AutoencoderKLMiniMaxH3._decode`` with the clip loop optionally sharded across SP ranks."""
+    group = _sp_decode_group() if shard_across_sp else None
+    if group is None:
+        return vae.decode(z, return_dict=False)[0]
+
+    tokens_chunk_size = vae.tokens_chunk_size
+    token_drop = vae.config.token_drop
+    temporal_ratio = vae.temporal_compression_ratio
+    chunk_num_frames = tokens_chunk_size * temporal_ratio
+
+    num_tokens = z.shape[2] + token_drop
+    pad_tokens = (-num_tokens) % tokens_chunk_size
+    num_chunks = (num_tokens + pad_tokens) // tokens_chunk_size - int(token_drop > 0)
+    if pad_tokens > 0:
+        z = torch.cat([z, z[:, :, -1:].repeat(1, 1, pad_tokens, 1, 1)], dim=2)
+
+    clips = _sharded_decode_clips(vae, z, num_chunks, group)
+
+    # Identical to the vendor post-loop: only the clip forwards were distributed.
+    decoded_chunks = []
+    overlap = None
+    for clip in clips:
+        for j in range(int(token_drop > 0) + 1):
+            frame_start = j * chunk_num_frames
+            chunk = clip[:, :, frame_start : frame_start + chunk_num_frames]
+            chunk = chunk[:, :, vae.frame_pre_padding :]
+            if j == 0:
+                if overlap is not None:
+                    chunk = vae._blend(overlap, chunk, vae.frame_overlap, dim=-3)
+                decoded_chunks.append(chunk)
+            else:
+                overlap = chunk
+    if overlap is not None:
+        decoded_chunks.append(overlap)
+
+    dec = torch.cat(decoded_chunks, dim=2)
+    if pad_tokens > 0:
+        intra_tail = vae.config.clip_length % temporal_ratio
+        num_tokens_before_pad = z.shape[2] - pad_tokens
+        pad_frames = sum(
+            intra_tail if intra_tail and (num_tokens_before_pad + k) % tokens_chunk_size == 0 else temporal_ratio
+            for k in range(pad_tokens)
+        )
+        dec = dec[:, :, :-pad_frames]
+    return dec
+
+
 class MiniMaxH3VideoDecodeStage:
     """Packed video rows -> ``Videos``."""
 
-    def __init__(self, bundle: "MiniMaxH3Bundle") -> None:
+    def __init__(self, bundle: "MiniMaxH3Bundle", *, shard_across_sp: bool = False) -> None:
         self.vae = bundle.vae
+        self.shard_across_sp = bool(shard_across_sp)
 
     @torch.no_grad()
     def decode(self, rows: torch.Tensor, geometry: MiniMaxH3Geometry) -> Videos:
@@ -45,7 +194,7 @@ class MiniMaxH3VideoDecodeStage:
         std = torch.tensor(self.vae.config.latents_std, device=device).view(1, -1, 1, 1, 1)
         latents = latents * std + mean
 
-        video = self.vae.decode(latents.to(dtype), return_dict=False)[0]
+        video = _decode_video_latents(self.vae, latents.to(dtype), shard_across_sp=self.shard_across_sp)
         pixel_mean = torch.tensor(_PIXEL_MEAN, device=device).view(1, -1, 1, 1, 1)
         pixel_std = torch.tensor(_PIXEL_STD, device=device).view(1, -1, 1, 1, 1)
         video = (video.float() * pixel_std + pixel_mean).clamp(0, 1)

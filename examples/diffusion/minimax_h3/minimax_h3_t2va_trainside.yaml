@@ -63,6 +63,11 @@ bundle:
     # CPU takes MINUTES per sample — it would dominate a rollout that spends
     # ~2 minutes denoising.
     vae_components_on_cpu: false
+    # With Ulysses SP every rank decodes the same video and only sp_rank 0's
+    # copy is kept. Opt in to spread the decoder's temporal chunks over the SP
+    # group instead — bit-identical output, and decode stops scaling with
+    # sp_size. No effect when sp_size == 1.
+    video_decode_shard_across_sp: false
     # 33B eager-loads ~66 GB per rank. Meta-init defers materialization until
     # after sharding; the bundle hands the fp32 pin list through so the
     # mixed-dtype layout survives `to_empty`.
