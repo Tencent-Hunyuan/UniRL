@@ -156,6 +156,7 @@ def _ep_engine_kwargs(mem_fraction_static: float) -> dict[str, Any]:
     """Match UniRL's production Qwen3-MoE rollout settings."""
     engine_kwargs = _ar_engine_kwargs(mem_fraction_static)
     engine_kwargs.pop("rl_on_policy_target")
+    engine_kwargs["enable_deterministic_inference"] = True
     return engine_kwargs
 
 

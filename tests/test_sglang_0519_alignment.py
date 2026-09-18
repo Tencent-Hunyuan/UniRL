@@ -39,6 +39,7 @@ def test_ep_alignment_matches_production_moe_without_fsdp_target():
 
     assert engine_kwargs["mem_fraction_static"] == 0.4
     assert engine_kwargs["attention_backend"] == "triton"
+    assert engine_kwargs["enable_deterministic_inference"] is True
     assert "rl_on_policy_target" not in engine_kwargs
 
 
