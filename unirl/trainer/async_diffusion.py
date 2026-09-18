@@ -29,8 +29,12 @@ class AsyncDiffusionTrainer(AsyncRolloutTrainerMixin, DiffusionTrainer):
         max_inflight: int = 1,
         per_worker_inflight: int = 1,
         weight_sync_interval: int = 1,
+        buffer_max_staleness: Optional[int] = None,
+        async_reward: bool = False,
+        reward_client_on_driver: bool = False,
         **diffusion_kwargs: Any,
     ) -> None:
+        self._reward_client_on_driver = bool(reward_client_on_driver)
         layout = diffusion_kwargs.setdefault("layout", "separate")
         if layout != "separate":
             raise ValueError(f"AsyncDiffusionTrainer requires layout='separate', got {layout!r}.")
@@ -72,14 +76,27 @@ class AsyncDiffusionTrainer(AsyncRolloutTrainerMixin, DiffusionTrainer):
             )
 
         self._max_inflight = max_inflight
+        self._async_reward = bool(async_reward)
+        if self._async_reward and not self._reward_client_on_driver:
+            raise ValueError(
+                "async_reward=true currently requires reward_client_on_driver=true "
+                "(only the driver reward client serves launch_nowait)"
+            )
         self._require_single_generation = True
         self._per_worker_inflight = per_worker_inflight
         self._max_inflight_prompts = self._max_inflight * self.batch_size
         self._weight_sync_interval = int(weight_sync_interval)
-        self._max_staleness = self._weight_sync_interval - 1
+        self._max_staleness = (
+            self._weight_sync_interval - 1 if buffer_max_staleness is None else int(buffer_max_staleness)
+        )
         self._num_updates_per_batch = int(diffusion_kwargs["stack_cfg"].get("num_updates_per_batch", 1))
         if self._weight_sync_interval < 1:
             raise ValueError(f"weight_sync_interval must be >= 1, got {self._weight_sync_interval}")
+        min_staleness = self._weight_sync_interval - 1
+        if self._max_staleness < min_staleness:
+            raise ValueError(
+                f"buffer_max_staleness must be >= weight_sync_interval - 1; got {self._max_staleness} < {min_staleness}"
+            )
         if self._num_updates_per_batch < 1:
             raise ValueError(f"num_updates_per_batch must be >= 1, got {self._num_updates_per_batch}")
         self._train_version = 0
@@ -146,7 +163,11 @@ class AsyncDiffusionTrainer(AsyncRolloutTrainerMixin, DiffusionTrainer):
         )
 
     def _async_wandb_extra(self) -> Dict[str, object]:
-        return {"train_fraction": self._train_fraction}
+        return {
+            "train_fraction": self._train_fraction,
+            "async_reward": self._async_reward,
+            "reward_client_on_driver": self._reward_client_on_driver,
+        }
 
     def _boundary_evaluate(self, rollout_id: int, *, initial: bool) -> None:
         self.evaluate(rollout_id if initial else rollout_id + 1, sync_weights=False, sleep_after=False)
