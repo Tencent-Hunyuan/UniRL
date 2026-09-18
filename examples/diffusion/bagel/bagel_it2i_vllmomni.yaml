@@ -159,7 +159,7 @@ rollout:
     # Required; same checkpoint the bundle loads.
     model_path: ${oc.env:BAGEL_PATH,ByteDance-Seed/BAGEL-7B-MoT}
     # BAGEL single-stage editing modality (registers BagelIt2iAdapter + boots
-    # stage_configs/bagel_t2i_rl.yaml — one YAML serves both image-out modalities —
+    # deploy_configs/bagel_t2i_rl.yaml — one YAML serves both image-out modalities —
     # with RLBagelPipeline).
     modality: bagel_it2i
     # Required for colocate: the trainer calls sleep()/wake_up() around the train

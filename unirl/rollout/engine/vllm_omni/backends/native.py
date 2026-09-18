@@ -54,12 +54,12 @@ def _import_omni_runtime() -> Dict[str, Any]:
     }
 
 
-def _resolve_stage_yaml(name: str) -> str:
-    """Return the absolute path of the local stage-config YAML asset."""
+def _resolve_deploy_config(name: str) -> str:
+    """Return the absolute path of the local deploy-config YAML asset."""
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    path = os.path.join(here, "stage_configs", name)
+    path = os.path.join(here, "deploy_configs", name)
     if not os.path.exists(path):
-        raise FileNotFoundError(f"_resolve_stage_yaml: YAML not found at {path}")
+        raise FileNotFoundError(f"_resolve_deploy_config: YAML not found at {path}")
     return path
 
 
@@ -141,9 +141,11 @@ class VLLMOmniBackend:
         # colocated train actor's state; spawned workers initialize their own.
         with _preserve_cudnn_sdp_state():
             from unirl.rollout.engine.vllm_omni.patches import install as install_patches
+            from unirl.rollout.engine.vllm_omni.plugin import register_unirl_runtime
 
             install_patches()
             rt = _import_omni_runtime()
+            register_unirl_runtime()
 
         if intent.get("clear_cuda_visible"):
             os.environ.pop("CUDA_VISIBLE_DEVICES", None)
@@ -159,7 +161,7 @@ class VLLMOmniBackend:
         except Exception:  # noqa: BLE001 - belt and braces; never block a boot
             pass
 
-        yaml_path = _resolve_stage_yaml(str(intent["stage_yaml"]))
+        deploy_config_path = _resolve_deploy_config(str(intent["deploy_config"]))
         omni_kwargs = _assemble_omni_kwargs(intent)
         ports = intent.get("ports")
         boot_master_port = int(ports.master_port) if ports is not None else None
@@ -168,7 +170,7 @@ class VLLMOmniBackend:
             pformat(
                 {
                     **intent,
-                    "stage_yaml_path": yaml_path,
+                    "deploy_config_path": deploy_config_path,
                     "assembled_omni_kwargs": omni_kwargs,
                     "boot_master_port": boot_master_port,
                 },
@@ -185,7 +187,7 @@ class VLLMOmniBackend:
                 with _master_port_env(boot_master_port):
                     omni = rt["Omni"](
                         model=str(intent["model_path"]),
-                        stage_configs_path=yaml_path,
+                        deploy_config=deploy_config_path,
                         **omni_kwargs,
                     )
             finally:
@@ -196,12 +198,13 @@ class VLLMOmniBackend:
             try:
                 from omegaconf import OmegaConf
 
+                stage_configs = omni.engine.stage_configs
                 resolved_stage_configs = OmegaConf.to_container(
-                    OmegaConf.create(omni.stage_configs),
+                    OmegaConf.create(stage_configs),
                     resolve=True,
                 )
             except Exception:  # noqa: BLE001 - config logging must never block boot
-                resolved_stage_configs = omni.stage_configs
+                resolved_stage_configs = omni.engine.stage_configs
             logger.info(
                 "VLLM-Omni resolved runtime stage configs (after all overrides):\n%s",
                 pformat(resolved_stage_configs, sort_dicts=True),
@@ -215,7 +218,7 @@ class VLLMOmniBackend:
                 omni,
                 rt,
                 tokenizer=tokenizer,
-                tp_per_stage=_tp_from_stage_configs(omni.stage_configs),
+                tp_per_stage=_tp_from_stage_configs(omni.engine.stage_configs),
             )
         except BaseException:
             logger.exception("VLLM-Omni boot failed; tearing down any engine processes")
@@ -289,7 +292,7 @@ class VLLMOmniBackend:
             build_prompt_tokens,
         )
 
-        # vllm-omni 0.27 returns a PromptTokensResult here, not a bare id list.
+        # vLLM-Omni returns a PromptTokensResult here, not a bare id list.
         return list(build_prompt_tokens(text, self._tokenizer, task=task, sys_type=sys_type).token_ids)
 
     def num_stages(self) -> int:
@@ -300,6 +303,60 @@ class VLLMOmniBackend:
 
     def _stage_ids(self) -> List[int]:
         return list(range(self.num_stages()))
+
+    def _stage_type(self, stage_id: int) -> str:
+        metadata = self._require_omni().engine.get_stage_metadata(stage_id)
+        return str(metadata.stage_type)
+
+    @staticmethod
+    def _require_rpc_success(
+        action: str,
+        stage_id: int,
+        results: object,
+        *,
+        allow_false: bool = False,
+    ) -> None:
+        """Fail closed when a stage or replica reports an unsupported/failed RPC."""
+
+        def validate(result: object) -> None:
+            if result is None:
+                return
+            if isinstance(result, (list, tuple)):
+                for item in result:
+                    validate(item)
+                return
+            if isinstance(result, bool):
+                if not result and not allow_false:
+                    raise RuntimeError(f"vllm-omni {action} returned False on stage {stage_id}")
+                return
+            if not isinstance(result, Mapping):
+                raise RuntimeError(f"vllm-omni {action} returned an unexpected result on stage {stage_id}: {result!r}")
+
+            status = result.get("status")
+            error = result.get("error")
+            if result.get("supported") is False or error or (status is not None and status != "SUCCESS"):
+                reason = result.get("reason") or result.get("error_msg") or error or status
+                raise RuntimeError(f"vllm-omni {action} failed on stage {stage_id}: {reason!r}")
+
+        validate(results)
+
+    def _collective_rpc(
+        self,
+        stage_id: int,
+        method: str,
+        *,
+        args: tuple = (),
+        kwargs: Optional[dict] = None,
+        allow_false: bool = False,
+    ) -> List[Any]:
+        results = self._require_omni().engine.collective_rpc(
+            method=method,
+            args=args,
+            kwargs=kwargs,
+            stage_ids=[stage_id],
+        )
+        self._require_rpc_success(method, stage_id, results, allow_false=allow_false)
+        return results
 
     @staticmethod
     def _require_ack_success(action: str, stage_id: int, task_id: str, acks: object) -> None:
@@ -351,11 +408,14 @@ class VLLMOmniBackend:
             raise RuntimeError(f"vllm-omni {action} returned no successful ACK for stage {stage_id}")
 
     def sleep_task(self) -> None:
-        """Fan ``handle_sleep_task`` to every stage's workers (level 1)."""
+        """Sleep AR stages through EngineCore and diffusion stages through worker RPC."""
         import uuid
 
         omni = self._require_omni()
         for sid in self._stage_ids():
+            if self._stage_type(sid) != "diffusion":
+                self._collective_rpc(sid, "sleep", args=(1, "abort"))
+                continue
             task_id = str(uuid.uuid4())
             acks = omni.engine.collective_rpc(
                 method="handle_sleep_task",
@@ -365,13 +425,17 @@ class VLLMOmniBackend:
             self._require_ack_success("sleep", int(sid), task_id, acks)
 
     def wake_task(self) -> None:
-        """Fan ``handle_wake_task`` to every stage's workers + sync CUDA."""
+        """Wake AR stages through EngineCore and diffusion stages through worker RPC."""
         import uuid
 
         import torch
 
         omni = self._require_omni()
         for sid in self._stage_ids():
+            if self._stage_type(sid) != "diffusion":
+                # ``None`` wakes every tag, including UniRL's MoE workspace tag.
+                self._collective_rpc(sid, "wake_up", kwargs={"tags": None})
+                continue
             task_id = str(uuid.uuid4())
             acks = omni.engine.collective_rpc(
                 method="handle_wake_task",
@@ -407,7 +471,6 @@ class VLLMOmniBackend:
         replica_rank: Optional[int],
     ) -> None:
         """Fan a bucketed CUDA-IPC state-dict update out to per-stage workers."""
-        omni = self._require_omni()
         kwargs = {
             "peft_config": peft_config,
             "base_sync_done": base_sync_done,
@@ -415,11 +478,10 @@ class VLLMOmniBackend:
             "replica_rank": replica_rank,
         }
         for sid in self._stage_ids():
-            omni.engine.collective_rpc(
-                method="update_weights_from_ipc",
-                args=(),
+            self._collective_rpc(
+                sid,
+                "update_weights_from_ipc",
                 kwargs={**kwargs, "stage_id": int(sid)},
-                stage_ids=[int(sid)],
             )
 
     def init_weights_group(
@@ -432,7 +494,6 @@ class VLLMOmniBackend:
         group_name: str,
         backend: str,
     ) -> None:
-        omni = self._require_omni()
         kwargs = {
             "master_address": str(master_address),
             "master_port": int(master_port),
@@ -442,11 +503,10 @@ class VLLMOmniBackend:
             "backend": str(backend),
         }
         for sid in self._stage_ids():
-            omni.engine.collective_rpc(
-                method="init_weights_update_group",
-                args=(),
+            self._collective_rpc(
+                sid,
+                "init_weights_update_group",
                 kwargs=kwargs,
-                stage_ids=[int(sid)],
             )
 
     def update_from_distributed(
@@ -459,7 +519,6 @@ class VLLMOmniBackend:
         target_modules: Optional[List[str]],
         flush_cache: bool,
     ) -> None:
-        omni = self._require_omni()
         kwargs = {
             "names": list(names),
             "dtypes": list(dtypes),
@@ -469,22 +528,20 @@ class VLLMOmniBackend:
             "flush_cache": bool(flush_cache),
         }
         for sid in self._stage_ids():
-            omni.engine.collective_rpc(
-                method="update_weights_from_distributed",
-                args=(),
+            self._collective_rpc(
+                sid,
+                "update_weights_from_distributed",
                 kwargs=kwargs,
-                stage_ids=[int(sid)],
             )
 
     def destroy_weights_group(self, *, group_name: str) -> None:
         if self._omni is None:
             return
         for sid in self._stage_ids():
-            self._omni.engine.collective_rpc(
-                method="destroy_weights_update_group",
-                args=(),
+            self._collective_rpc(
+                sid,
+                "destroy_weights_update_group",
                 kwargs={"group_name": str(group_name)},
-                stage_ids=[int(sid)],
             )
 
     def update_from_tensor(
@@ -496,7 +553,6 @@ class VLLMOmniBackend:
         flush_cache: bool,
     ) -> None:
         """Fan a SGLang-shape tensor payload to per-stage workers."""
-        omni = self._require_omni()
         kwargs = {
             "serialized_named_tensors": list(serialized_named_tensors),
             "target_modules": list(target_modules) if target_modules else None,
@@ -504,11 +560,10 @@ class VLLMOmniBackend:
             "flush_cache": bool(flush_cache),
         }
         for sid in self._stage_ids():
-            omni.engine.collective_rpc(
-                method="update_weights_from_tensor",
-                args=(),
+            self._collective_rpc(
+                sid,
+                "update_weights_from_tensor",
                 kwargs=kwargs,
-                stage_ids=[int(sid)],
             )
 
     def set_lora_handle(
@@ -527,7 +582,6 @@ class VLLMOmniBackend:
             DIFFRL_LORA_PATH,
         )
 
-        omni = self._require_omni()
         lora_tensors = self._wrap_peft_envelope(lora_tensors)
         self._remove_existing_lora(int(DIFFRL_LORA_INT_ID))
 
@@ -540,8 +594,9 @@ class VLLMOmniBackend:
                 name: t.detach().clone() if isinstance(t, torch.Tensor) else t for name, t in lora_tensors.items()
             }
             serialized = MultiprocessingSerializer.serialize(cloned, output_str=True)
-            omni.engine.collective_rpc(
-                method="set_lora_from_tensor_dict",
+            self._collective_rpc(
+                sid,
+                "set_lora_from_tensor_dict",
                 args=(
                     str(adapter_name) or DIFFRL_LORA_NAME,
                     int(DIFFRL_LORA_INT_ID),
@@ -549,7 +604,6 @@ class VLLMOmniBackend:
                     dict(peft_config or {}),
                     serialized,
                 ),
-                stage_ids=[int(sid)],
             )
 
     def set_lora_copy(
@@ -571,7 +625,6 @@ class VLLMOmniBackend:
             DIFFRL_LORA_PATH,
         )
 
-        omni = self._require_omni()
         lora_tensors = self._wrap_peft_envelope(lora_tensors)
         self._remove_existing_lora(int(DIFFRL_LORA_INT_ID))
 
@@ -583,8 +636,9 @@ class VLLMOmniBackend:
         serialized = base64.b64encode(buf.getvalue()).decode("ascii")
 
         for sid in self._stage_ids():
-            omni.engine.collective_rpc(
-                method="set_lora_from_tensor_dict_copy",
+            self._collective_rpc(
+                sid,
+                "set_lora_from_tensor_dict_copy",
                 args=(
                     str(adapter_name) or DIFFRL_LORA_NAME,
                     int(DIFFRL_LORA_INT_ID),
@@ -592,7 +646,6 @@ class VLLMOmniBackend:
                     dict(peft_config or {}),
                     serialized,
                 ),
-                stage_ids=[int(sid)],
             )
 
     @staticmethod
@@ -607,39 +660,34 @@ class VLLMOmniBackend:
 
     def _remove_existing_lora(self, adapter_id: int) -> None:
         """Drop the existing adapter on every stage before re-adding."""
-        omni = self._require_omni()
         for sid in self._stage_ids():
-            try:
-                omni.engine.collective_rpc(
-                    method="remove_lora",
-                    args=(int(adapter_id),),
-                    stage_ids=[int(sid)],
-                )
-            except Exception:
-                pass
+            self._collective_rpc(
+                sid,
+                "remove_lora",
+                args=(int(adapter_id),),
+                allow_false=True,
+            )
 
     def param_checksums(self, *, names: List[str]) -> dict:
         """Fan ``_diffrl_loaded_param_checksums`` across stages and ranks."""
-        omni = self._require_omni()
         out: dict = {}
         for sid in self._stage_ids():
-            results = omni.engine.collective_rpc(
-                method="_diffrl_loaded_param_checksums",
+            results = self._collective_rpc(
+                sid,
+                "_diffrl_loaded_param_checksums",
                 args=(list(names),),
-                stage_ids=[int(sid)],
             )
             out[int(sid)] = results[0] if isinstance(results, list) and results else results
         return out
 
     def lora_checksums(self, *, adapter_id: int, names: Optional[List[str]]) -> dict:
         """Fan ``_diffrl_loaded_lora_checksums`` across stages and ranks."""
-        omni = self._require_omni()
         out: dict = {}
         for sid in self._stage_ids():
-            results = omni.engine.collective_rpc(
-                method="_diffrl_loaded_lora_checksums",
+            results = self._collective_rpc(
+                sid,
+                "_diffrl_loaded_lora_checksums",
                 args=(int(adapter_id), list(names) if names else None),
-                stage_ids=[int(sid)],
             )
             out[int(sid)] = results[0] if isinstance(results, list) and results else results
         return out
