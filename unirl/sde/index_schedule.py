@@ -1,9 +1,12 @@
 """Index schedulers used by GRPO-style algorithms."""
 
+import bisect
+import math
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import List, Literal, Optional, Set, Tuple, Union
+from itertools import accumulate
+from typing import Callable, List, Literal, Optional, Set, Tuple, Union
 
 import numpy as np
 
@@ -106,6 +109,8 @@ class WindowScheduler(TimestepScheduler):
         "all": None,
         "progressive": "_resolve_progressive",
         "random": "_resolve_random",
+        "decay": "_resolve_decay",
+        "exp_decay": "_resolve_exp_decay",
     }
 
     def __init__(self, num_timesteps: int, config: WindowConfig):
@@ -116,6 +121,12 @@ class WindowScheduler(TimestepScheduler):
                 f"Bad strategy configuration for WindowScheduler: {self.config.strategy}. "
                 f"Available options: {set(self.WINDOW_STRATEGY_TO_METHOD_NAME.keys())}"
             )
+        if self.config.strategy == "decay":
+            lo, hi = self.config.min_iters_per_window, self.config.max_iters_per_window
+            if lo is None or hi is None or lo < 1 or hi < lo:
+                raise ValueError(
+                    f"WindowScheduler(decay) requires 1 <= min_iters_per_window <= max_iters_per_window, got ({lo}, {hi})"
+                )
 
     def get_sde_indices(self, step: Optional[int] = None) -> Set[int]:
         if self.config.strategy == "all":
@@ -144,3 +155,40 @@ class WindowScheduler(TimestepScheduler):
         max_start = max(0, self.num_timesteps - self.config.window_size)
         cur_timestep = int(rng.integers(0, max_start + 1))
         return set(range(cur_timestep, cur_timestep + self.config.window_size))
+
+    def _window_starts(self) -> List[int]:
+        """Start index of every window in one progressive sweep, in visiting order."""
+        stride = self.config.window_size - self.config.overlap_size
+        remaining = self.num_timesteps - self.config.init_timestep - self.config.window_size
+        count = max(1, remaining // stride + 1)
+        return [self.config.init_timestep + i * stride for i in range(count)]
+
+    def _decay_iters(self, cur_timestep: int) -> int:
+        """MixGRPO linear decay: lerp max->min iters over cur_timestep / num_timesteps."""
+        progress = cur_timestep / self.num_timesteps
+        iters = int(self.config.max_iters_per_window * (1.0 - progress) + self.config.min_iters_per_window * progress)
+        return max(self.config.min_iters_per_window, iters)
+
+    def _exp_decay_iters(self, cur_timestep: int) -> int:
+        """MixGRPO-Flash: ceil(iters_per_window * exp(-k * relu(cur_timestep - threshold)))."""
+        relu = max(0, cur_timestep - self.config.exp_decay_threshold)
+        return int(math.ceil(self.config.iters_per_window * math.exp(-self.config.exp_decay_k * relu)))
+
+    def _resolve_variable_dwell(self, step: int, iters_for: Callable[[int], int]) -> Set[int]:
+        """Stateless walk over windows whose dwell (iters) depends on their start index."""
+        starts = self._window_starts()
+        dwell = [iters_for(start) for start in starts]
+        total = sum(dwell)
+        if step >= total:
+            if not self.config.roll_back:
+                cur = starts[-1]
+                return set(range(cur, cur + self.config.window_size))
+            step = step % total
+        cur = starts[bisect.bisect_right(list(accumulate(dwell)), step)]
+        return set(range(cur, cur + self.config.window_size))
+
+    def _resolve_decay(self, step: int) -> Set[int]:
+        return self._resolve_variable_dwell(step, self._decay_iters)
+
+    def _resolve_exp_decay(self, step: int) -> Set[int]:
+        return self._resolve_variable_dwell(step, self._exp_decay_iters)
