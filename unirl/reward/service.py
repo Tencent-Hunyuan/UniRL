@@ -49,6 +49,11 @@ def _build_reward_request(sample: Sample, preferred_input_kind: str) -> RewardRe
     )
 
 
+def _score_reads(sample: Sample) -> list:
+    """Select decoded output, input context, and root metadata tensors read by scoring."""
+    return [sample.parts[-1].primitives, sample.conditioning(), sample.root_metadata(-1)]
+
+
 class RewardService(Remote):
     """Actor-side reward entry: one backend, scores a Sample's frontier Part in place."""
 
@@ -101,7 +106,7 @@ class RewardService(Remote):
             )
         return self.backend.compute_rewards_differentiable(media_tensor, list(prompts), records=records)
 
-    @distributed(dispatch_mode=Dispatch.DP_SCATTER)
+    @distributed(dispatch_mode=Dispatch.DP_SCATTER, reads=_score_reads)
     def score_and_attach(self, sample: Sample) -> Sample:
         """Score the frontier (last) Part's generated media and return the updated Sample."""
         frontier = sample.parts[-1]

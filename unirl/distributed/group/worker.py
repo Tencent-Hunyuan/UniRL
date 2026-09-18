@@ -5,15 +5,21 @@ from __future__ import annotations
 import logging
 import os
 import socket
-from typing import Dict, Optional
+from typing import Any, Dict, Optional, Set
 
 import ray
 import torch
 from torch import Tensor
 
 from unirl.distributed.group.remote import RankInfo, Remote
-from unirl.distributed.tensor import TensorRef, TensorTransport, TensorTransportRuntime, map_tree
+from unirl.distributed.tensor import (
+    TensorRef,
+    TensorTransport,
+    TensorTransportRuntime,
+    map_tree,
+)
 from unirl.distributed.tensor.factory import build_transport
+from unirl.distributed.tensor.ref import ref_is_required
 from unirl.distributed.utils import collect_leaves
 
 logger = logging.getLogger(__name__)
@@ -172,16 +178,30 @@ class Worker:
         """Read back rank_info (may have been modified by initialize)."""
         return self._roles[role_name].rank_info
 
-    def call(self, role_name: str, method_name: str, args: tuple, kwargs: dict, grad_mode: bool = False, call_id=None):
-        """Generic RPC entry point."""
+    def call(
+        self,
+        role_name: str,
+        method_name: str,
+        args: tuple,
+        kwargs: dict,
+        grad_mode: bool = False,
+        call_id=None,
+        required: Optional[Set[Any]] = None,
+    ):
+        """Resolve selected tensor inputs, invoke one role method, and pack tensor outputs."""
         role = self._roles[role_name]
 
-        in_metas = self._collect(args, TensorRef) + self._collect(kwargs, TensorRef)
+        # Resolve: collect the TensorRef leaves this call needs (tree order),
+        # batch-fetch, substitute. Keys are positional indices so get_batch
+        # results align with the walk.
+        in_metas = [
+            m for m in self._collect(args, TensorRef) + self._collect(kwargs, TensorRef) if ref_is_required(m, required)
+        ]
         fetched = self.transport.get_batch({str(i): m for i, m in enumerate(in_metas)})
         in_iter = iter(fetched[str(i)] for i in range(len(in_metas)))
 
         def resolve(o):
-            return next(in_iter) if isinstance(o, TensorRef) else o
+            return next(in_iter) if isinstance(o, TensorRef) and ref_is_required(o, required) else o
 
         resolved_args = map_tree(args, resolve)
         resolved_kwargs = map_tree(kwargs, resolve)

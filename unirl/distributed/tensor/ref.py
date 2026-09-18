@@ -76,6 +76,30 @@ class TensorSpan(Generic[T]):
         return f"TensorSpan({self.handle!r}[{self.start}:{self.stop}])"
 
 
+def ref_store_keys(ref: "TensorRef") -> set:
+    """Return stable storage identities shared by a ref and its row views."""
+    keys = set()
+    for span in ref.spans:
+        handle = span.handle
+        store_key = getattr(handle, "store_key", None)
+        if store_key is not None:
+            keys.add(store_key)
+            continue
+        object_ref = getattr(handle, "object_ref", None)
+        if object_ref is not None:
+            binary = getattr(object_ref, "binary", None)
+            keys.add(("object_ref", binary() if callable(binary) else object_ref))
+    return keys
+
+
+def ref_is_required(ref: "TensorRef", required: Optional[set]) -> bool:
+    """Return whether the worker must resolve this whole ref under a storage-key mask."""
+    if required is None:
+        return True
+    keys = ref_store_keys(ref)
+    return not keys or bool(keys & required)
+
+
 def cat_rows(parts: List[torch.Tensor]) -> torch.Tensor:
     """Concatenate per-ref tensors along dim 0 — the single assembly funnel."""
     if not parts:

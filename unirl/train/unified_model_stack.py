@@ -24,6 +24,11 @@ from unirl.utils.metrics import aggregate_numeric_metrics
 logger = logging.getLogger(__name__)
 
 
+def _lineage_skips(sample: Sample, **_) -> list:
+    """Select decoded payloads that whole-lineage training never reads."""
+    return [part.primitives for part in sample.parts]
+
+
 class UnifiedModelTrainStack(Remote):
     """Single-backbone, multi-algorithm train stack."""
 
@@ -209,7 +214,7 @@ class UnifiedModelTrainStack(Remote):
             self._profiler_cache = cached
         return cached
 
-    @distributed(dispatch_mode=Dispatch.DP_SCATTER)
+    @distributed(dispatch_mode=Dispatch.DP_SCATTER, skips=_lineage_skips)
     def train_track(
         self,
         sample: Sample,
