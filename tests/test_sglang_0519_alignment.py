@@ -74,6 +74,14 @@ def test_output_difference_checks_tokens_and_log_probs():
     assert alignment._outputs_differ(baseline, changed_logp)
 
 
+def test_nested_difference_reports_exact_and_changed_values():
+    exact = {"nested": [torch.tensor([1.0, 2.0])]}
+    changed = {"nested": [torch.tensor([1.0, 3.0])]}
+
+    assert not alignment._nested_differs("exact", exact, exact)
+    assert alignment._nested_differs("changed", exact, changed)
+
+
 def test_signed_backward_requires_and_produces_nonzero_gradient():
     module = torch.nn.Linear(2, 2, bias=False)
     inputs = torch.tensor([[1.0, 2.0], [3.0, 4.0]])

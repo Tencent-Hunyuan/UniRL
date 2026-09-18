@@ -307,6 +307,14 @@ def _outputs_differ(left, right) -> bool:
     )
 
 
+def _nested_differs(label: str, left: Any, right: Any) -> bool:
+    try:
+        _assert_nested_exact(label, left, right)
+    except AssertionError:
+        return True
+    return False
+
+
 def run_tp_sync(args: argparse.Namespace) -> dict[str, Any]:
     """Exercise TP2 generation plus real full-weight and LoRA hot updates."""
     from peft import LoraConfig, get_peft_model
@@ -437,6 +445,154 @@ def run_tp_sync(args: argparse.Namespace) -> dict[str, Any]:
             "baseline_tokens_sha256": _tensor_digest(baseline.segment.tokens),
             "full_mutation_tokens_sha256": _tensor_digest(changed_full.segment.tokens),
             "lora_mutation_tokens_sha256": _tensor_digest(changed_lora.segment.tokens),
+        }
+    finally:
+        engine.shutdown()
+        _release_cuda()
+
+
+def run_sd3_sync(args: argparse.Namespace) -> dict[str, Any]:
+    """Exercise real full-weight and LoRA hot updates on the SD3 engine."""
+    from unirl.distributed.weight_sync.full.tensor import TensorWeightSync
+    from unirl.distributed.weight_sync.lora.local import LocalLoraWeightSync
+    from unirl.models.sd3.config import SD3PipelineConfig
+    from unirl.models.sd3.pipeline import SD3Pipeline
+    from unirl.rollout.engine.sglang_diffusion.config import SGLangDiffusionEngineConfig
+    from unirl.rollout.engine.sglang_diffusion.engine import SGLangDiffusionRolloutEngine
+    from unirl.sde.kernels import FlowSDEStrategy
+    from unirl.train.lora import inject_lora
+
+    lora_targets = (
+        "attn.add_k_proj",
+        "attn.add_q_proj",
+        "attn.add_v_proj",
+        "attn.to_add_out",
+        "attn.to_k",
+        "attn.to_out.0",
+        "attn.to_q",
+        "attn.to_v",
+    )
+    model_config = SD3PipelineConfig(
+        pretrained_model_ckpt_path=args.model,
+        model_precision="bf16",
+        autocast_precision="bf16",
+        trajectory_precision="bf16",
+        logprob_precision="fp32",
+        shift=3.0,
+        load_vae=False,
+        use_lora=True,
+        lora_target_modules=list(lora_targets),
+        device=torch.device("cuda:0"),
+    )
+    strategy = FlowSDEStrategy()
+    engine = SGLangDiffusionRolloutEngine(
+        config=SGLangDiffusionEngineConfig(
+            sampling=None,
+            model_family="sd3",
+            populate_conditions=True,
+            num_gpus=1,
+            tp_size=1,
+            local_mode=True,
+            target_modules=lora_targets,
+            lora_merge_mode="dynamic",
+            engine_kwargs={
+                "model_type": "sd3",
+                "disable_cuda_graph": True,
+                "skip_server_warmup": True,
+            },
+        ),
+        model_config=model_config,
+        strategy=strategy,
+        device=torch.device("cuda:0"),
+    )
+    request, _ = _sd3_request(args)
+    try:
+        baseline = engine.generate(request).frontier_gen_part(DiffusionSamplingParams)
+        repeated = engine.generate(request).frontier_gen_part(DiffusionSamplingParams)
+        _assert_nested_exact("sd3_sync.repeat.segment", baseline.segment, repeated.segment)
+
+        pipeline = SD3Pipeline.from_config(model_config, strategy=strategy)
+        inject_lora(
+            pipeline.bundle.transformer,
+            rank=2,
+            alpha=2,
+            target_modules=lora_targets,
+            task_type="FEATURE_EXTRACTION",
+        )
+        backend = _PlainSyncBackend(pipeline.bundle.transformer)
+
+        full_sync = TensorWeightSync(
+            backend=backend,
+            rollout=engine,
+            bucket_size_mb=256,
+            name_remap={"*": "transformer.*"},
+            wire_dtype="bf16",
+        )
+        full_sync.sync()
+        unchanged_full = engine.generate(request).frontier_gen_part(DiffusionSamplingParams)
+        _assert_nested_exact(
+            "sd3_sync.unchanged_full.segment",
+            baseline.segment,
+            unchanged_full.segment,
+        )
+
+        base_parameter = next(
+            parameter
+            for name, parameter in pipeline.bundle.transformer.named_parameters()
+            if name.endswith("pos_embed.proj.weight")
+        )
+        with torch.no_grad():
+            base_parameter.add_(0.05)
+        full_sync.sync()
+        changed_full = engine.generate(request).frontier_gen_part(DiffusionSamplingParams)
+        if not _nested_differs(
+            "sd3_sync.full_mutation.segment",
+            unchanged_full.segment,
+            changed_full.segment,
+        ):
+            raise AssertionError("real SD3 full-weight mutation did not change rollout")
+
+        lora_sync = LocalLoraWeightSync(
+            backend=backend,
+            rollout=engine,
+            param_prefix="transformer.",
+            adapter_name="default",
+            verify=False,
+        )
+        lora_sync.sync()
+        zero_lora = engine.generate(request).frontier_gen_part(DiffusionSamplingParams)
+        _assert_nested_exact(
+            "sd3_sync.zero_lora.segment",
+            changed_full.segment,
+            zero_lora.segment,
+        )
+
+        mutated_lora = False
+        with torch.no_grad():
+            for name, parameter in pipeline.bundle.transformer.named_parameters():
+                if ".lora_B." in name:
+                    parameter.fill_(0.01)
+                    mutated_lora = True
+        if not mutated_lora:
+            raise AssertionError("SD3 PEFT model exposed no lora_B parameters")
+        lora_sync.sync()
+        changed_lora = engine.generate(request).frontier_gen_part(DiffusionSamplingParams)
+        if not _nested_differs(
+            "sd3_sync.lora_mutation.segment",
+            zero_lora.segment,
+            changed_lora.segment,
+        ):
+            raise AssertionError("real SD3 LoRA mutation did not change rollout")
+
+        return {
+            "mode": "sd3_sync",
+            "model": args.model,
+            "bitwise_repeat": True,
+            "unchanged_full_sync_bitwise": True,
+            "full_mutation_changed_output": True,
+            "zero_lora_bitwise": True,
+            "lora_mutation_changed_output": True,
+            "num_steps": int(changed_lora.segment.latents.shape[1] - 1),
         }
     finally:
         engine.shutdown()
@@ -608,7 +764,7 @@ def run_sd3(args: argparse.Namespace) -> dict[str, Any]:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=("ar", "sd3", "tp_sync", "ep"))
+    parser.add_argument("mode", choices=("ar", "sd3", "tp_sync", "sd3_sync", "ep"))
     parser.add_argument("--model", required=True)
     parser.add_argument("--output")
     parser.add_argument("--seed", type=int, default=1234)
@@ -637,6 +793,7 @@ def main() -> None:
         "ar": run_ar,
         "sd3": run_sd3,
         "tp_sync": run_tp_sync,
+        "sd3_sync": run_sd3_sync,
         "ep": run_ep,
     }
     report = runners[args.mode](args)
