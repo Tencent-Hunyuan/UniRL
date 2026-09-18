@@ -38,6 +38,16 @@ class HistoryTurn(BaseModel):
         default=None,
         description="Base64-encoded image bytes (any PIL-readable format)",
     )
+    image_ipc: str | None = Field(
+        default=None,
+        description=(
+            "CUDA-IPC handle blob for a float image tensor [C,H,W] in [0,1] "
+            "(see tensor_ipc.encode_tensor). Negotiated data plane only: valid "
+            "after a successful /handshake, same-device loopback deployments. "
+            "Lossless and zero-copy; the sender keeps the tensor alive until "
+            "the response arrives."
+        ),
+    )
     video_b64: str | None = Field(
         default=None,
         description="Base64-encoded video file bytes (e.g. mp4); decoded server-side to a tempfile",
@@ -51,8 +61,17 @@ class HistoryTurn(BaseModel):
     def _check_media(self) -> "HistoryTurn":
         if self.video_b64 is not None and self.video_path is not None:
             raise ValueError("video_b64 and video_path are mutually exclusive")
-        if self.image_b64 is None and self.video_b64 is None and self.video_path is None:
-            raise ValueError("HistoryTurn must include at least one of image_b64, video_b64, or video_path")
+        if self.image_b64 is not None and self.image_ipc is not None:
+            raise ValueError("image_b64 and image_ipc are mutually exclusive")
+        if (
+            self.image_b64 is None
+            and self.image_ipc is None
+            and self.video_b64 is None
+            and self.video_path is None
+        ):
+            raise ValueError(
+                "HistoryTurn must include at least one of image_b64, image_ipc, video_b64, or video_path"
+            )
         return self
 
 
@@ -99,6 +118,52 @@ class ScoreRequest(BaseModel):
 
     protocol_version: str = PROTOCOL_VERSION
     requests: list[RewardRequest]
+    grad_mode: bool = Field(
+        default=False,
+        description=(
+            "Differentiable scoring: the scorer forward runs under grad and the "
+            "server retains the subgraph keyed by call_id until /backward or a "
+            "lifecycle release. Requires image_ipc inputs and a scorer with "
+            "supports_grad. grad_mode batches bypass the idempotency cache — "
+            "a retained graph is stateful, not a pure function."
+        ),
+    )
+    call_id: str | None = Field(
+        default=None,
+        description="Caller-chosen key for the retained subgraph; required when grad_mode",
+    )
+
+
+class HandshakeRequest(BaseModel):
+    """Parent's IPC fingerprint + proposed data plane."""
+
+    fingerprint: dict[str, str]
+    proposed_transport: str = "cuda_ipc"
+
+
+class HandshakeResponse(BaseModel):
+    """Child's fingerprint and the transport it accepted."""
+
+    fingerprint: dict[str, str]
+    accepted_transport: str
+    reason: str = ""
+
+
+class BackwardRequest(BaseModel):
+    """Second half of a grad_mode score: seed grads for the retained subgraph.
+
+    ``grad_scores[i]`` is dL/dr for request i's scalar reward (the upstream
+    grads are tiny — plain JSON floats). The response's image grads are
+    full-size tensors and travel back as IPC handles.
+    """
+
+    call_id: str
+    grad_scores: list[float]
+
+
+class BackwardResponse(BaseModel):
+    grad_ipc: list[str | None]
+    protocol_version: str = PROTOCOL_VERSION
 
 
 class ScoreResponse(BaseModel):

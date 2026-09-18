@@ -63,6 +63,11 @@ class BaseScorer(ABC):
     version: str = "1"
     input_kind: str = "image"
     supports_offload: bool = False
+    #: True when :meth:`score_tensors` exists and its forward is autograd-clean
+    #: end to end (torch-native preprocessing only — any PIL/numpy hop breaks
+    #: the graph silently). Engine-backed scorers (vLLM) are inference-only and
+    #: must leave this False regardless of transport.
+    supports_grad: bool = False
     sub_metric_names: tuple[str, ...] = ()
 
     @abstractmethod
@@ -86,6 +91,20 @@ class BaseScorer(ABC):
           ``errors[i][reward]`` for every item in the batch.
         """
 
+    def score_tensors(self, images, prompts):  # -> torch.Tensor of shape (B,)
+        """Differentiable twin of :meth:`score` for tensor-native inputs.
+
+        ``images`` is a float tensor [B, C, H, W] in [0, 1] on the scorer's
+        device; ``prompts`` a parallel list of strings. Returns one scalar
+        reward per item as a (B,) tensor. Whether a graph is built is the
+        CALLER'S choice (grad or no_grad context) — implementations must not
+        wrap the forward in ``torch.no_grad``/``inference_mode`` and must keep
+        every image-touching op torch-native so gradients can flow from the
+        returned scores back to ``images``. Only meaningful when
+        ``supports_grad`` is True.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not implement score_tensors")
+
     def close(self) -> None:
         """Release heavy resources (model, vLLM engine). Default is a no-op."""
 
@@ -104,4 +123,5 @@ class BaseScorer(ABC):
             "version": self.version,
             "input_kind": self.input_kind,
             "supports_offload": self.supports_offload,
+            "supports_grad": self.supports_grad,
         }

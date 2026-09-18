@@ -22,9 +22,23 @@ from typing import Any
 from fastapi import FastAPI, HTTPException
 
 from reward_service.logging_utils import get_logger
-from reward_service.schemas import PROTOCOL_VERSION, RewardIdentity, ScoreRequest, ScoreResponse
+from reward_service.schemas import (
+    PROTOCOL_VERSION,
+    BackwardRequest,
+    BackwardResponse,
+    HandshakeRequest,
+    HandshakeResponse,
+    RewardIdentity,
+    ScoreRequest,
+    ScoreResponse,
+)
 from reward_service.scorers.registry import SCORER_MODULES, get_scorer_cls
 from reward_service.wire import request_to_item
+
+#: Retained differentiable subgraphs a child will hold at once. Each entry pins
+#: the forward activations of one grad_mode batch — this is a leak guard, not a
+#: throughput knob; the parent should backward (or release) promptly.
+_GRAD_STORE_LIMIT = 4
 
 logger = get_logger(__name__)
 
@@ -162,6 +176,13 @@ def create_direct_app(
         app.state.scorer = scorer
         app.state.score_lock = asyncio.Lock()
         app.state.result_cache = OrderedDict()
+        # Negotiated data plane (see /handshake) and the retained-subgraph
+        # store for grad_mode scoring: call_id -> {images leaf, scores, ...}.
+        # grad_keepalive pins returned gradient tensors until the parent has
+        # materialized them (next backward or lifecycle release frees them).
+        app.state.ipc_ready = False
+        app.state.grad_store = OrderedDict()
+        app.state.grad_keepalive = OrderedDict()
         if boot_offloaded:
             # per_call boot protocol: leave the GPU BEFORE the parent can see us
             # ready. Waiting for the parent's first /lifecycle/offload would keep
@@ -202,6 +223,75 @@ def create_direct_app(
     async def rewards() -> dict:
         return {"rewards": [scorer_name]}
 
+    @app.post("/handshake", response_model=HandshakeResponse)
+    async def handshake(body: HandshakeRequest) -> HandshakeResponse:
+        """Negotiate the data plane: cuda_ipc when both fingerprints allow it.
+
+        Any failed check falls back to http/b64 silently — the parent treats
+        the accepted transport as authoritative. Re-negotiation is allowed
+        (e.g. after the parent restarts); flipping to http also drops any
+        retained grad state, which cannot survive a transport change.
+        """
+        from reward_service.tensor_ipc import ipc_compatible, ipc_fingerprint
+
+        mine = {k: str(v) for k, v in ipc_fingerprint().items()}
+        if body.proposed_transport != "cuda_ipc":
+            accepted, reason = "http", "parent proposed http"
+        else:
+            ok, reason = ipc_compatible(mine, dict(body.fingerprint))
+            accepted = "cuda_ipc" if ok else "http"
+        async with app.state.score_lock:
+            app.state.ipc_ready = accepted == "cuda_ipc"
+            if not app.state.ipc_ready:
+                app.state.grad_store.clear()
+                app.state.grad_keepalive.clear()
+        logger.info("handshake: accepted_transport=%s (%s)", accepted, reason)
+        return HandshakeResponse(fingerprint=mine, accepted_transport=accepted, reason=reason)
+
+    @app.post("/backward", response_model=BackwardResponse)
+    async def backward(body: BackwardRequest) -> BackwardResponse:
+        """Second half of a grad_mode score: chain-rule relay (mmrl pattern).
+
+        Seeds the retained subgraph with dL/dr, runs backward on THIS
+        process's segment, and returns per-item dL/dimage as IPC handles.
+        The graph is consumed — one backward per call_id.
+        """
+        import torch
+
+        async with app.state.score_lock:
+            entry = app.state.grad_store.pop(body.call_id, None)
+            if entry is None:
+                raise HTTPException(status_code=404, detail=f"no retained graph for call_id {body.call_id!r}")
+            if len(body.grad_scores) != int(entry["scores"].shape[0]):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"grad_scores has {len(body.grad_scores)} entries for a batch of {int(entry['scores'].shape[0])}",
+                )
+
+            def run() -> list[str]:
+                from reward_service.tensor_ipc import encode_tensor
+
+                scores, images = entry["scores"], entry["images"]
+                seed = torch.tensor(body.grad_scores, device=scores.device, dtype=scores.dtype)
+                torch.autograd.backward(scores, seed)
+                grads = images.grad
+                if grads is None:
+                    raise HTTPException(
+                        status_code=500,
+                        detail="backward produced no image gradient — the scorer forward broke the graph",
+                    )
+                blobs = [encode_tensor(grads[i]) for i in range(grads.shape[0])]
+                # Pin the gradient storage until the parent has cloned it; the
+                # next backward (or a lifecycle release) lets it go.
+                app.state.grad_keepalive[body.call_id] = grads
+                while len(app.state.grad_keepalive) > _GRAD_STORE_LIMIT:
+                    app.state.grad_keepalive.popitem(last=False)
+                torch.cuda.empty_cache()
+                return blobs
+
+            blobs = await asyncio.to_thread(run)
+        return BackwardResponse(grad_ipc=blobs)
+
     @app.post("/score", response_model=ScoreResponse)
     async def score(body: ScoreRequest) -> ScoreResponse:
         if body.protocol_version != PROTOCOL_VERSION:
@@ -214,6 +304,9 @@ def create_direct_app(
                 raise HTTPException(status_code=400, detail=f"unknown rewards for this worker: {unknown}")
             if history_kind == "image_edit" and len(request.history) < 2:
                 raise HTTPException(status_code=400, detail="image_edit requests require source and edited turns")
+
+        if body.grad_mode:
+            return await _score_grad_mode(body)
 
         # Fingerprinting (and the decode below) is CPU work proportional to the b64
         # media in the chunk. Run on the event loop it stalls /health and the
@@ -307,6 +400,90 @@ def create_direct_app(
 
         return ScoreResponse(results=results, errors=errors, identities=identities)
 
+    async def _score_grad_mode(body: ScoreRequest) -> ScoreResponse:
+        """Differentiable scoring: forward under grad, retain the subgraph.
+
+        Deliberately a separate, simpler path than scalar scoring: no
+        idempotency cache and no per-item soft failure — a retained graph is
+        stateful and a partial batch has no usable gradient, so any error
+        fails the whole call (the caller crashes rather than trains on a
+        half-differentiable reward). Requires the negotiated cuda_ipc data
+        plane, image_ipc inputs of uniform shape, and a supports_grad scorer.
+        """
+        import torch
+
+        if not body.call_id:
+            raise HTTPException(status_code=400, detail="grad_mode requires call_id")
+        async with app.state.score_lock:
+            if app.state.lifecycle_state != "resident":
+                raise HTTPException(
+                    status_code=409, detail=f"scorer is not resident (state={app.state.lifecycle_state})"
+                )
+            scorer = app.state.scorer
+            if not scorer.supports_grad:
+                raise HTTPException(
+                    status_code=409, detail=f"scorer {scorer_name!r} does not support grad_mode"
+                )
+            if not app.state.ipc_ready:
+                raise HTTPException(
+                    status_code=409, detail="grad_mode requires a successful cuda_ipc handshake"
+                )
+            if body.call_id in app.state.grad_store:
+                raise HTTPException(status_code=409, detail=f"call_id {body.call_id!r} already retained")
+            if len(app.state.grad_store) >= _GRAD_STORE_LIMIT:
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"{_GRAD_STORE_LIMIT} retained graphs outstanding; backward or release them first",
+                )
+            prompts: list[str] = []
+            blobs: list[str] = []
+            for request in body.requests:
+                turn = request.history[-1]
+                if turn.image_ipc is None:
+                    raise HTTPException(status_code=400, detail="grad_mode turns must carry image_ipc")
+                prompts.append(turn.text)
+                blobs.append(turn.image_ipc)
+
+            def run() -> list[float]:
+                from reward_service.tensor_ipc import decode_tensor
+
+                views = [decode_tensor(blob) for blob in blobs]
+                shapes = {tuple(v.shape) for v in views}
+                if len(shapes) != 1:
+                    raise HTTPException(
+                        status_code=400, detail=f"grad_mode batch needs uniform image shapes, got {sorted(shapes)}"
+                    )
+                # torch.stack copies out of the parent's shared storage, so the
+                # leaf below is owned by this process; the views may be released
+                # by the parent as soon as the response lands.
+                images = torch.stack([v.detach().float() for v in views])
+                images.requires_grad_(True)
+                with torch.enable_grad():
+                    scores = scorer.score_tensors(images, prompts)
+                if not (torch.is_tensor(scores) and scores.shape == (len(views),)):
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"score_tensors must return a ({len(views)},) tensor, got {getattr(scores, 'shape', type(scores))}",
+                    )
+                if scores.grad_fn is None:
+                    raise HTTPException(
+                        status_code=500,
+                        detail="score_tensors returned a tensor with no grad_fn — the forward broke the graph",
+                    )
+                app.state.grad_store[body.call_id] = {"images": images, "scores": scores}
+                return [float(v) for v in scores.detach().cpu()]
+
+            values = await asyncio.to_thread(run)
+            metric = scorer.sub_metric_names[0]
+            identities = [
+                request.identity(actual_scorer_version=scorer.version) for request in body.requests
+            ]
+        return ScoreResponse(
+            results=[{scorer_name: {metric: value}} for value in values],
+            errors=[{} for _ in values],
+            identities=identities,
+        )
+
     @app.post("/lifecycle/{action}")
     async def lifecycle(action: str) -> dict:
         if action not in {"onload", "offload", "drain", "shutdown"}:
@@ -340,6 +517,12 @@ def create_direct_app(
                     raise HTTPException(status_code=409, detail=f"scorer {scorer_name!r} does not support offload")
                 if app.state.lifecycle_state != "offloaded":
                     app.state.lifecycle_state = "draining"
+                    # Retained differentiable subgraphs cannot survive an offload —
+                    # their activations live on the device being vacated. Dropping
+                    # them here (rather than erroring) matches the per_call window
+                    # contract: forward+backward pairs complete before offload.
+                    app.state.grad_store.clear()
+                    app.state.grad_keepalive.clear()
                     try:
                         await asyncio.to_thread(scorer.drain)
                         await asyncio.to_thread(scorer.offload)

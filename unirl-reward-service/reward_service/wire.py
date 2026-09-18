@@ -21,6 +21,25 @@ def decode_image(image_b64: str) -> Image.Image:
         raise HTTPException(status_code=400, detail=f"invalid image_b64: {exc}") from exc
 
 
+def decode_ipc_image(blob: str) -> Image.Image:
+    """Materialize an IPC-shared [C,H,W] float tensor as a PIL image.
+
+    Classic scorers consume PIL (inherently 8-bit); the lossless float path
+    is ``score_tensors``. This hop still skips the JPEG/PNG encode-decode
+    round trip and is exact for tensors that came from 8-bit sources.
+    """
+    try:
+        from reward_service.tensor_ipc import decode_tensor
+
+        tensor = decode_tensor(blob)
+        tensor = tensor.detach().clamp(0, 1).mul(255).round().to("cpu").byte()
+        return Image.fromarray(tensor.permute(1, 2, 0).numpy())
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"invalid image_ipc handle: {exc}") from exc
+
+
 def resolve_video(turn: HistoryTurn) -> bytes | str | None:
     if turn.video_path is not None:
         path = Path(turn.video_path)
@@ -45,7 +64,12 @@ def request_to_item(request: RewardRequest, *, allow_video: bool = True) -> Scor
     videos: list[bytes | str | None] = []
     any_video = False
     for turn in request.history:
-        image = decode_image(turn.image_b64) if turn.image_b64 is not None else None
+        if turn.image_b64 is not None:
+            image = decode_image(turn.image_b64)
+        elif turn.image_ipc is not None:
+            image = decode_ipc_image(turn.image_ipc)
+        else:
+            image = None
         history.append((turn.text, image))
         video = resolve_video(turn)
         if video is not None and not allow_video:
