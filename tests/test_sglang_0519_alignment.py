@@ -1,5 +1,6 @@
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -53,6 +54,24 @@ def test_drift_reports_mean_and_max():
     expected = torch.tensor([0.5, 1.0])
 
     assert alignment._drift(actual, expected) == {"mean": 0.75, "max": 1.0}
+
+
+def test_output_difference_checks_tokens_and_log_probs():
+    baseline = SimpleNamespace(
+        segment=SimpleNamespace(
+            tokens=torch.tensor([1, 2]),
+            log_probs=torch.tensor([-1.0, -2.0]),
+        )
+    )
+    changed_logp = SimpleNamespace(
+        segment=SimpleNamespace(
+            tokens=torch.tensor([1, 2]),
+            log_probs=torch.tensor([-1.0, -2.1]),
+        )
+    )
+
+    assert not alignment._outputs_differ(baseline, baseline)
+    assert alignment._outputs_differ(baseline, changed_logp)
 
 
 def test_signed_backward_requires_and_produces_nonzero_gradient():

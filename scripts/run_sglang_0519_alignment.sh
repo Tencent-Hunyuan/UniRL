@@ -3,7 +3,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-mode="${1:?usage: run_sglang_0519_alignment.sh ar|sd3 MODEL_PATH OUTPUT_JSON}"
+mode="${1:?usage: run_sglang_0519_alignment.sh ar|sd3|tp_sync|ep MODEL_PATH OUTPUT_JSON}"
 model_path="${2:?model path is required}"
 output_json="${3:?output JSON path is required}"
 

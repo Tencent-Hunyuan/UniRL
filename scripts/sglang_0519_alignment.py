@@ -287,6 +287,203 @@ def run_ar(args: argparse.Namespace) -> dict[str, Any]:
     return report
 
 
+class _PlainSyncBackend:
+    """Minimal training-backend seam consumed by weight-sync helpers."""
+
+    rollout_adapter_name = "default"
+    weight_sync_dtype = torch.bfloat16
+
+    def __init__(self, model: torch.nn.Module) -> None:
+        self.model = model
+
+    @staticmethod
+    def expert_weight_export_transform():
+        return None
+
+
+def _outputs_differ(left, right) -> bool:
+    return not torch.equal(left.segment.tokens, right.segment.tokens) or not torch.equal(
+        left.segment.log_probs, right.segment.log_probs
+    )
+
+
+def run_tp_sync(args: argparse.Namespace) -> dict[str, Any]:
+    """Exercise TP2 generation plus real full-weight and LoRA hot updates."""
+    from peft import LoraConfig, get_peft_model
+
+    from unirl.distributed.group.remote import RankInfo
+    from unirl.distributed.weight_sync.full.tensor import TensorWeightSync
+    from unirl.distributed.weight_sync.lora.local import LocalLoraWeightSync
+    from unirl.models.qwen3.config import Qwen3PipelineConfig
+    from unirl.models.qwen3.pipeline import Qwen3Pipeline
+    from unirl.rollout.engine.sglang.config import SGLangEngineConfig
+    from unirl.rollout.engine.sglang.engine import SGLangRolloutEngine
+
+    request = _ar_request(args)
+    engine_kwargs = _ar_engine_kwargs(args.mem_fraction_static)
+    engine_kwargs.update(
+        {
+            "enable_lora": True,
+            "max_lora_rank": 8,
+        }
+    )
+    config = SGLangEngineConfig(
+        pretrained_model_ckpt_path=args.model,
+        model_family="text",
+        backend="http",
+        tp_size=2,
+        concurrency=1,
+        samples_pre_expanded=True,
+        chat_template_kwargs={"enable_thinking": True},
+        engine_kwargs=engine_kwargs,
+    )
+    engine = SGLangRolloutEngine(
+        config=config,
+        tp_size=2,
+        tp_visible_devices=["0", "1"],
+    )
+    try:
+        baseline = engine.generate(request).frontier_gen_part(ARSamplingParams)
+        repeated = engine.generate(request).frontier_gen_part(ARSamplingParams)
+        _assert_nested_exact("tp2.repeat.segment", baseline.segment, repeated.segment)
+
+        pipeline = Qwen3Pipeline.from_config(
+            Qwen3PipelineConfig(
+                pretrained_model_ckpt_path=args.model,
+                model_precision="bf16",
+                attn_implementation="sdpa",
+                device=torch.device("cuda:0"),
+                autocast_precision="bf16",
+                logprob_precision="fp32",
+            )
+        )
+        pipeline.bundle.transformer = get_peft_model(
+            pipeline.bundle.transformer,
+            LoraConfig(
+                r=2,
+                lora_alpha=2,
+                lora_dropout=0.0,
+                bias="none",
+                task_type="CAUSAL_LM",
+                target_modules=["q_proj"],
+            ),
+        )
+        backend = _PlainSyncBackend(pipeline.bundle.transformer)
+
+        full_sync = TensorWeightSync(
+            backend=backend,
+            rollout=engine,
+            bucket_size_mb=256,
+            wire_dtype="bf16",
+        )
+        full_sync.rank_info = RankInfo(tp_size=2)
+        full_sync.sync()
+        unchanged_full = engine.generate(request).frontier_gen_part(ARSamplingParams)
+        _assert_nested_exact(
+            "tp2.unchanged_full_sync.segment",
+            baseline.segment,
+            unchanged_full.segment,
+        )
+
+        base_parameter = next(
+            parameter
+            for name, parameter in pipeline.bundle.transformer.named_parameters()
+            if "model.layers.0.input_layernorm.weight" in name
+        )
+        with torch.no_grad():
+            base_parameter.add_(0.05)
+        full_sync.sync()
+        changed_full = engine.generate(request).frontier_gen_part(ARSamplingParams)
+        if not _outputs_differ(unchanged_full, changed_full):
+            raise AssertionError("real full-weight mutation did not change TP2 rollout")
+
+        lora_sync = LocalLoraWeightSync(
+            backend=backend,
+            rollout=engine,
+            adapter_name="default",
+            verify=False,
+        )
+        lora_sync.sync()
+        zero_lora = engine.generate(request).frontier_gen_part(ARSamplingParams)
+        _assert_nested_exact(
+            "tp2.zero_lora.segment",
+            changed_full.segment,
+            zero_lora.segment,
+        )
+
+        mutated_lora = False
+        with torch.no_grad():
+            for name, parameter in pipeline.bundle.transformer.named_parameters():
+                if ".lora_B." in name:
+                    parameter.fill_(0.01)
+                    mutated_lora = True
+        if not mutated_lora:
+            raise AssertionError("PEFT model exposed no lora_B parameters")
+        lora_sync.sync()
+        changed_lora = engine.generate(request).frontier_gen_part(ARSamplingParams)
+        if not _outputs_differ(zero_lora, changed_lora):
+            raise AssertionError("real LoRA mutation did not change TP2 rollout")
+
+        return {
+            "mode": "tp_sync",
+            "model": args.model,
+            "tp_size": 2,
+            "bitwise_repeat": True,
+            "unchanged_full_sync_bitwise": True,
+            "full_mutation_changed_output": True,
+            "zero_lora_bitwise": True,
+            "lora_mutation_changed_output": True,
+            "baseline_tokens_sha256": _tensor_digest(baseline.segment.tokens),
+            "full_mutation_tokens_sha256": _tensor_digest(changed_full.segment.tokens),
+            "lora_mutation_tokens_sha256": _tensor_digest(changed_lora.segment.tokens),
+        }
+    finally:
+        engine.shutdown()
+        _release_cuda()
+
+
+def run_ep(args: argparse.Namespace) -> dict[str, Any]:
+    """Boot and deterministically exercise a two-rank Qwen3-MoE EP topology."""
+    from unirl.rollout.engine.sglang.config import SGLangEngineConfig
+    from unirl.rollout.engine.sglang.engine import SGLangRolloutEngine
+
+    request = _ar_request(args)
+    config = SGLangEngineConfig(
+        pretrained_model_ckpt_path=args.model,
+        model_family="text",
+        backend="http",
+        tp_size=2,
+        ep_size=2,
+        concurrency=1,
+        samples_pre_expanded=True,
+        chat_template_kwargs={"enable_thinking": True},
+        engine_kwargs=_ar_engine_kwargs(args.mem_fraction_static),
+    )
+    engine = SGLangRolloutEngine(
+        config=config,
+        tp_size=2,
+        ep_size=2,
+        tp_visible_devices=["0", "1"],
+    )
+    try:
+        first = engine.generate(request).frontier_gen_part(ARSamplingParams)
+        second = engine.generate(request).frontier_gen_part(ARSamplingParams)
+        _assert_nested_exact("ep2.repeat.segment", first.segment, second.segment)
+        return {
+            "mode": "ep",
+            "model": args.model,
+            "tp_size": 2,
+            "ep_size": 2,
+            "bitwise_repeat": True,
+            "num_tokens": int(first.segment.tokens.numel()),
+            "tokens_sha256": _tensor_digest(first.segment.tokens),
+            "log_probs_sha256": _tensor_digest(first.segment.log_probs),
+        }
+    finally:
+        engine.shutdown()
+        _release_cuda()
+
+
 def _sd3_request(args: argparse.Namespace) -> tuple[Sample, DiffusionSamplingParams]:
     from unirl.sde.kernels import FlowSDEStrategy
 
@@ -410,7 +607,7 @@ def run_sd3(args: argparse.Namespace) -> dict[str, Any]:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=("ar", "sd3"))
+    parser.add_argument("mode", choices=("ar", "sd3", "tp_sync", "ep"))
     parser.add_argument("--model", required=True)
     parser.add_argument("--output")
     parser.add_argument("--seed", type=int, default=1234)
@@ -435,7 +632,13 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("alignment validation requires CUDA")
     torch.manual_seed(args.seed)
-    report = run_ar(args) if args.mode == "ar" else run_sd3(args)
+    runners = {
+        "ar": run_ar,
+        "sd3": run_sd3,
+        "tp_sync": run_tp_sync,
+        "ep": run_ep,
+    }
+    report = runners[args.mode](args)
     _write_report(args.output, report)
 
 
