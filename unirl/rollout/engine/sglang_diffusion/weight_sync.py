@@ -101,13 +101,21 @@ class WeightSync:
         if not names:
             raise ValueError("names must be non-empty for distributed update")
         self._backend.update_from_distributed(
-            names=list(names),
+            names=[self.normalize_tensor_weight_name(name) for name in names],
             dtypes=list(dtypes),
             shapes=[list(shape) for shape in shapes],
             group_name=str(group_name),
             target_modules=list(target_modules or self._target_modules),
             flush_cache=flush_cache,
         )
+
+    def normalize_tensor_weight_name(self, name: str) -> str:
+        """Make old pipeline-qualified names relative to upstream target modules."""
+        for target_module in sorted(self._target_modules, key=len, reverse=True):
+            prefix = f"{target_module}."
+            if name.startswith(prefix):
+                return name[len(prefix) :]
+        return name
 
     def destroy_weights_update_group(self, *, group_name: str) -> None:
         self._backend.destroy_weights_group(group_name=str(group_name))

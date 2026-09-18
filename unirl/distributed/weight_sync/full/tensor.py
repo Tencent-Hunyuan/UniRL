@@ -8,6 +8,14 @@ from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.weight_sync.full.base import FullWeightSync
 
 
+def _normalize_bucket_names(bucket, receiver):
+    """Apply a rollout-specific wire-name normalizer before serialization."""
+    normalize_name = getattr(receiver, "normalize_tensor_weight_name", None)
+    if not callable(normalize_name):
+        return bucket
+    return [(normalize_name(name), tensor) for name, tensor in bucket]
+
+
 class TensorWeightSync(FullWeightSync):
     """Colocate full-weight sync via serialized tensor payloads."""
 
@@ -69,8 +77,8 @@ class TensorWeightSync(FullWeightSync):
         monkey_patch_torch_reductions()
 
         dist_ready = self._dist_ready()
-
         for bucket, is_last in self._iter_buckets():
+            bucket = _normalize_bucket_names(bucket, receiver)
             by_dtype: dict = {}
             for name, tensor in bucket:
                 by_dtype.setdefault(tensor.dtype, []).append((name, tensor))
