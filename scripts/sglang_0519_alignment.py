@@ -152,6 +152,13 @@ def _ar_engine_kwargs(mem_fraction_static: float) -> dict[str, Any]:
     }
 
 
+def _ep_engine_kwargs(mem_fraction_static: float) -> dict[str, Any]:
+    """Match UniRL's production Qwen3-MoE rollout settings."""
+    engine_kwargs = _ar_engine_kwargs(mem_fraction_static)
+    engine_kwargs.pop("rl_on_policy_target")
+    return engine_kwargs
+
+
 def _ar_replay_kwargs() -> dict[str, Any]:
     """Production Qwen3 trainer-side replay settings."""
     return {
@@ -605,6 +612,10 @@ def run_ep(args: argparse.Namespace) -> dict[str, Any]:
     from unirl.rollout.engine.sglang.engine import SGLangRolloutEngine
 
     request = _ar_request(args)
+    # SGLang's FSDP on-policy target is intentionally absent: that unsupported
+    # upstream combination forces native RoPE while the MoE model still
+    # requests fused KV writes.
+    engine_kwargs = _ep_engine_kwargs(args.mem_fraction_static)
     config = SGLangEngineConfig(
         pretrained_model_ckpt_path=args.model,
         model_family="text",
@@ -614,7 +625,7 @@ def run_ep(args: argparse.Namespace) -> dict[str, Any]:
         concurrency=1,
         samples_pre_expanded=True,
         chat_template_kwargs={"enable_thinking": True},
-        engine_kwargs=_ar_engine_kwargs(args.mem_fraction_static),
+        engine_kwargs=engine_kwargs,
     )
     engine = SGLangRolloutEngine(
         config=config,

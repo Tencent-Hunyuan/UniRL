@@ -34,6 +34,14 @@ def test_ar_alignment_uses_production_fsdp_target():
     assert replay_kwargs["logprob_precision"] == "fp32"
 
 
+def test_ep_alignment_matches_production_moe_without_fsdp_target():
+    engine_kwargs = alignment._ep_engine_kwargs(0.4)
+
+    assert engine_kwargs["mem_fraction_static"] == 0.4
+    assert engine_kwargs["attention_backend"] == "triton"
+    assert "rl_on_policy_target" not in engine_kwargs
+
+
 def test_tensor_digest_is_bitwise_and_dtype_sensitive():
     values = torch.tensor([1.0, 2.0], dtype=torch.float32)
 
