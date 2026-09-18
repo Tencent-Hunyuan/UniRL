@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import os
 from typing import Optional, Tuple
 
 import torch
 
+from unirl.config.require import require
 from unirl.models.types.bundle import Bundle
 from unirl.models.types.post_materialize import apply_deferred_ops
 from unirl.train.backend.base import LrSchedulerConfig, OptimizerConfig, resolve_trainable_module
@@ -24,6 +26,7 @@ from unirl.train.configs import (
     EmaLoraConfig,
     FSDPConfig,
     LoraConfig,
+    normalize_fsdp_mode,
 )
 from unirl.utils.distributed_utils import ensure_dist_initialized
 from unirl.utils.dtypes import parse_torch_dtype
@@ -54,7 +57,41 @@ class FSDPBackend(BaseFSDP2Backend):
         self._bundle = bundle
         self._rank = int(rank)
         self._device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        ensure_dist_initialized()
+        if fsdp_cfg.copy_engine_all_gather:
+            require(
+                normalize_fsdp_mode(fsdp_cfg.fsdp_mode) != "no_shard",
+                "FSDP copy-engine all-gather is invalid with fsdp_mode='no_shard'.",
+            )
+            require(self._device.type == "cuda", "FSDP copy-engine all-gather requires a CUDA device.")
+            nccl_version = torch.cuda.nccl.version()
+            require(
+                tuple(nccl_version[:2]) >= (2, 28),
+                f"FSDP copy-engine all-gather requires NCCL >= 2.28, got {nccl_version}.",
+            )
+            policy = os.environ.get("NCCL_CTA_POLICY")
+            require(
+                policy in {None, "2"},
+                "FSDP copy-engine all-gather sets zero-CTA on the default NCCL group, but "
+                f"NCCL_CTA_POLICY={policy!r} would override it. Unset NCCL_CTA_POLICY or set it to '2'.",
+            )
+            pg_device = self._device
+            if pg_device.index is None:
+                pg_device = torch.device("cuda", torch.cuda.current_device())
+            torch.cuda.set_device(pg_device)
+            process_group_nccl = torch.distributed.ProcessGroupNCCL
+            options = process_group_nccl.Options()
+            options.config.cta_policy = process_group_nccl.NCCL_CTA_POLICY_ZERO
+            timeout = torch.distributed.constants.default_pg_timeout
+            options._timeout = timeout
+            # device_id without backend would narrow WORLD to NCCL; keep the default pair.
+            torch.distributed.init_process_group(
+                backend="cpu:gloo,cuda:nccl",
+                pg_options=options,
+                device_id=pg_device,
+                timeout=timeout,
+            )
+        else:
+            ensure_dist_initialized()
 
         self._weight_sync_dtype: torch.dtype = parse_torch_dtype(
             fsdp_cfg.param_dtype, field_name="training.fsdp.param_dtype"
@@ -86,6 +123,7 @@ class FSDPBackend(BaseFSDP2Backend):
             master_dtype=getattr(fsdp_cfg, "master_dtype", None),
             master_params=tuple(shd for _, shd in shadow.iter_pairs()) if shadow is not None else (),
             root_wrap=getattr(fsdp_cfg, "root_wrap", True),
+            copy_engine_all_gather=fsdp_cfg.copy_engine_all_gather,
         )
 
         load_trainable_weights(

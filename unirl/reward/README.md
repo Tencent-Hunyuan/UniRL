@@ -117,5 +117,16 @@ new remote reward needs no UniRL code — add it to the server and list its name
 - **`input_kind` must match the media** (`image`/`video`/`text`) — it picks which
   decoded key the backend sees. Remote allows only `image`/`video`; local scorers
   may be `text`.
+- **`math_verify` grades each batch in a `forkserver` child.** Its
+  `signal.alarm` timeouts require the main thread, which threaded Ray actors do not
+  provide. The forkserver preloads `math_verify` and the scorer module, avoiding
+  repeated imports without inheriting the worker's threaded process state. The parent
+  waits on both the result pipe and child sentinel; keep `proc.start()` inside the
+  cleanup boundary so startup failures also release resources. Per-operation timeout
+  is `UNIRL_MATHVERIFY_TIMEOUT_S` (default 10s), with a hard batch cap of
+  `3 * timeout * jobs + 60s`. Wrong or unparsable answers return 0.0, while child,
+  IPC, and batch-timeout failures raise. Teardown uses `SIGKILL` plus a bounded join;
+  do not replace it with `multiprocessing.Pool.terminate()`, whose worker join is
+  unbounded.
 - **`base_device` is ignored by the remote backend** (it's HTTP-only); local
   scorers honor it, falling back to CPU with a warning if CUDA is unavailable.
