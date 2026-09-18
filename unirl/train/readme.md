@@ -68,6 +68,9 @@ in `backend/base.py`; a multi-update-capable algorithm sets
 - **`optimizer_step` silently *skips* (does not crash) on a non-finite grad norm**
   and zeroes grads — a flat loss curve with a logged warning means grads went
   non-finite.
+- **Checkpointing preserves a never-stepped AdamW** — DCP materializes empty
+  optimizer state with a dummy step; UniRL resets it so the first real update
+  remains step 1.
 - **`master_dtype` defaults to `None`, so the optimizer master follows `param_dtype`** —
   a bf16-loaded base then keeps a bf16 LoRA master and the ~1e-6 AdamW steps round
   away (the policy drifts into a degenerate reward-hack). An fp32-loaded model gets an
@@ -122,6 +125,18 @@ in `backend/base.py`; a multi-update-capable algorithm sets
   the model whenever `param_dtype` upcasts (fp32 compute over a bf16 checkpoint), so
   leave it `true` unless that copy is cheap. `defer_grad_sync: true` then gives one
   all-reduce per optimizer step. VeOmni only supports `full`.
+- **`copy_engine_all_gather: true` takes the FSDP all-gather off the SMs** — FSDPBackend
+  creates the default NCCL group with the zero-CTA policy and every `fully_shard` group
+  allocates its all-gather buffer from NCCL symmetric memory, so the gather runs on the
+  copy engines (`cudaMemcpyBatchAsync`) instead of an `ncclDevKernel_AllGather` kernel.
+  Needs PyTorch >= 2.13, NCCL >= 2.28, and a shard group that stays on one node over
+  NVLink (`full` on a single node, or `hybrid` with `hsdp_shard_size:
+  devices_per_node`); `no_shard` and VeOmni reject it. FSDPBackend must be what brings
+  up `torch.distributed` (it binds WORLD to the rank's CUDA device so DeviceMesh splits
+  the shard group from it and the policy is inherited), and
+  `NCCL_CTA_POLICY` must stay unset or `2`. WORLD keeps the usual `cpu:gloo,cuda:nccl`
+  pair, so in `hybrid` mode torch logs one `ProcessGroupGloo::split ... Falling back to
+  default options` warning per process while splitting the gloo half; it is expected.
 
 ## Profiling → Perfetto
 
