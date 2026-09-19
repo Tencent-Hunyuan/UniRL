@@ -61,6 +61,7 @@ class BagelPipeline(Pipeline):
         logprob_precision: str = "fp32",
         shift: float = 3.0,
         replay_mode: str = "train",
+        replay_attention_backend: str = "sdpa",
         max_prompt_length: int = 8192,
         cache_t2i_contexts: Optional[bool] = None,
         context_cache_size: Optional[int] = None,
@@ -84,6 +85,7 @@ class BagelPipeline(Pipeline):
             autocast_precision=autocast_precision,
             logprob_precision=logprob_precision,
             replay_mode=replay_mode,
+            replay_attention_backend=replay_attention_backend,
         )
         self.autocast_precision = autocast_precision
         self.shift = shift
