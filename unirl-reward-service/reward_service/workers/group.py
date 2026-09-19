@@ -75,13 +75,35 @@ def _build_runtime_env(requirements_path: str) -> dict[str, Any]:
     return {"pip": pip_cfg}
 
 
-def _actor_options(cfg: RewardModelCfg) -> dict[str, Any]:
+def _actor_options(
+    cfg: RewardModelCfg,
+    *,
+    mps_pipe_directory: str | None = None,
+) -> dict[str, Any]:
     """Build the dict passed to ``ScorerActor.options(...)``."""
+    runtime_env = _build_runtime_env(cfg.runtime_env)
+    if cfg.mps is not None:
+        if not mps_pipe_directory:
+            raise RuntimeError(
+                f"WorkerGroup[{cfg.name}] enables MPS but the node runtime "
+                "did not provide a pipe directory"
+            )
+        env_vars = {
+            "CUDA_MPS_PIPE_DIRECTORY": mps_pipe_directory,
+            "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE": str(
+                cfg.mps.active_thread_percentage
+            ),
+        }
+        if cfg.mps.device_memory_limit_env is not None:
+            env_vars["CUDA_MPS_PINNED_DEVICE_MEM_LIMIT"] = (
+                cfg.mps.device_memory_limit_env
+            )
+        runtime_env["env_vars"] = env_vars
     options: dict[str, Any] = {
         "num_gpus": cfg.num_gpus,
         "num_cpus": cfg.num_cpus,
         "max_concurrency": cfg.max_concurrency,
-        "runtime_env": _build_runtime_env(cfg.runtime_env),
+        "runtime_env": runtime_env,
     }
     if cfg.scheduling == "spread":
         options["scheduling_strategy"] = _SPREAD_STRATEGY
@@ -89,13 +111,22 @@ def _actor_options(cfg: RewardModelCfg) -> dict[str, Any]:
 
 
 class WorkerGroup:
-    def __init__(self, cfg: RewardModelCfg) -> None:
+    def __init__(
+        self,
+        cfg: RewardModelCfg,
+        *,
+        mps_pipe_directory: str | None = None,
+    ) -> None:
         self.cfg = cfg
+        self._mps_pipe_directory = mps_pipe_directory
         self.actors = self._spawn_actors()
         self._rr = itertools.cycle(range(len(self.actors)))
 
     def _spawn_actors(self) -> list[Any]:
-        options = _actor_options(self.cfg)
+        options = _actor_options(
+            self.cfg,
+            mps_pipe_directory=self._mps_pipe_directory,
+        )
         pip_cfg = options.get("runtime_env", {}).get("pip", {})
         logger.info(
             "WorkerGroup[%s] runtime_env packages=%s pip_options=%s",
@@ -130,6 +161,17 @@ class WorkerGroup:
         return ray.get([a.ping.remote() for a in self.actors])
 
     def shutdown(self) -> None:
-        for a in self.actors:
-            ray.kill(a)
-        self.actors = []
+        actors, self.actors = self.actors, []
+        if not actors:
+            return
+        logger.info("WorkerGroup[%s] draining %d actors", self.cfg.name, len(actors))
+        try:
+            ray.get([actor.shutdown.remote() for actor in actors], timeout=30)
+        except Exception:
+            logger.exception(
+                "WorkerGroup[%s] graceful drain failed; forcing actor cleanup",
+                self.cfg.name,
+            )
+        finally:
+            for actor in actors:
+                ray.kill(actor, no_restart=True)

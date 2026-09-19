@@ -1,6 +1,6 @@
 # Reward Service
 
-A unified T2I reward inference service: a FastAPI gateway in front of Ray worker groups. Each reward model owns its own GPU(s) and is resource-isolated from the others.
+A unified T2I reward inference service: a FastAPI gateway in front of Ray worker groups. Rewards use exclusive GPUs by default; qualified small scorers may opt into Ray fractional placement plus NVIDIA MPS.
 
 ## Supported reward models
 
@@ -28,7 +28,8 @@ Client ──HTTP──▶ FastAPI Gateway ──Ray actor call──▶ WorkerG
 ```
 
 - Each reward is one `WorkerGroup` that holds a configurable number of Ray actors (replicas).
-- Each actor reserves N GPUs exclusively via Ray's `num_gpus=N`; it never shares them with another reward.
+- By default each actor reserves N GPUs exclusively via Ray's `num_gpus=N`.
+- Qualified actors may use fractional `num_gpus` plus an explicit `mps:` client block. They keep separate Python processes but share a physical GPU and its GPU fault domain.
 - Routing fans each request out by `required_rewards` to the matching group, picking an actor round-robin.
 
 The full architecture document (topology, sequence, abstraction layers, extension points) lives in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
@@ -82,6 +83,20 @@ python -m reward_service --config configs/service.yaml
 
 (The console-script entry point `unirl-reward-service --config configs/service.yaml` is equivalent to `python -m reward_service`.)
 
+### CUDA MPS capacity mode
+
+MPS is opt-in. The H20 example colocates qualified CLIP and PickScore actors:
+
+```bash
+cp configs/service.mps-h20.example.yaml configs/service.yaml
+python -m reward_service --config configs/service.yaml
+```
+
+`mps.mode: managed` starts MPS before local Ray; `external` connects to a
+daemon started by the platform. Actor limits are injected before CUDA
+initialization. Only CLIP and PickScore are currently qualified, and FP16 CLIP
+requires `active_thread_percentage: 100` on the tested H20 stack.
+
 ### Multi-host deployment
 
 ```bash
@@ -93,6 +108,11 @@ bash scripts/ray_stop.sh
 ```
 
 Going multi-host only requires adding a `cluster.ray_address` field to the YAML; see the comments in `configs/service.cluster.example.yaml`.
+
+For MPS on every node, set `ENABLE_MPS=1` for both scripts and configure
+`mps.mode: external` with `pipe_directory: /tmp/unirl-mps-$USER`. The launch
+script starts every daemon before Ray and the stop script drains the service,
+stops Ray, then stops MPS.
 
 ## Calling the service
 
@@ -189,7 +209,7 @@ Response:
 
 Other endpoints:
 
-- `GET /health` → `{"status": "ok", "rewards": {name: [replica_states...]}}`
+- `GET /health` → reward states plus MPS ownership/server/fault-domain metadata when enabled
 - `GET /rewards` → `{"rewards": [...]}`
 
 ## Tests

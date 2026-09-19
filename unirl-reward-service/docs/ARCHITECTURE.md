@@ -55,15 +55,16 @@ One diagram for the entire process structure:
 │                 ▼                ▼▼          ▼                           │
 │            [ CUDA ctx ]   [ CUDA ctx × 2 ]   [ CUDA ctx × 2 ]            │
 │                                                                          │
-│              GPUs are owned exclusively, never shared across rewards     │
+│       GPUs are exclusive by default; qualified actors may share via MPS  │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
 **Key properties**:
 
 - **1 FastAPI process** · **N WorkerGroups** · **Σ num_replicas ScorerActors** (Ray subprocesses).
-- Ray allocates GPUs to an actor as an **integer resource** via `ScorerActor.options(num_gpus=N, num_cpus=C)` — a GPU belongs to exactly one actor at a time.
+- Ray allocates integer GPUs by default. Qualified MPS clients may request a fractional GPU so Ray packs independent actors on one physical card.
 - For a vLLM-style scorer with TP=N, the actor's `num_gpus=N` must match vLLM's `tensor_parallel_size=N` (both set in YAML).
+- MPS daemon ownership stays in the launch layer. `WorkerGroup` injects the pipe and validated client limits through Ray `runtime_env` before actor CUDA initialization.
 - Multi-host extension point: just add `cluster.ray_address` to the YAML; the architecture is unchanged. See §5.3.
 
 **Components and their source files**:
@@ -73,6 +74,7 @@ One diagram for the entire process structure:
 | HTTP gateway | `reward_service/server.py` | The `/score` `/health` `/rewards` endpoints; bucket / dispatch / gather logic |
 | Schema | `reward_service/schemas.py` | Pydantic: `ScoreRequest` / `RewardRequest` / `HistoryTurn` / `ScoreResponse` |
 | Config | `reward_service/config.py` | YAML → `ServiceCfg` + `RewardModelCfg` dataclasses; validates `num_replicas≥1`, `num_gpus≥0`, unique names |
+| MPS runtime | `reward_service/mps.py` | Optional node daemon capability check, status, ownership, and cleanup |
 | WorkerPool | `reward_service/workers/pool.py` | Ray runtime lifecycle + group registry + dispatch by name |
 | WorkerGroup | `reward_service/workers/group.py` | N actors + round-robin dispatch (`itertools.cycle`) |
 | ScorerActor | `reward_service/workers/actor.py` | `@ray.remote` thin shell: constructs the scorer, forwards `score()` |
@@ -235,9 +237,14 @@ The Reward Service's two hard guarantees:
 
 ### 4.1 Resource isolation
 
-**Guarantee**: a GPU belongs to exactly one reward group at any moment.
+**Default guarantee**: without an `mps` client block, a GPU belongs to exactly
+one reward group at any moment.
 
-**Mechanism**: `WorkerGroup._spawn_actors()` uses `ScorerActor.options(num_gpus=self.cfg.num_gpus)`, so Ray allocates GPUs as an **integer resource**; two actors are never scheduled onto the same card.
+**Mechanism**: `WorkerGroup._spawn_actors()` uses
+`ScorerActor.options(num_gpus=self.cfg.num_gpus)`. Integer requests retain
+exclusive placement. Fractional requests may share a card; when explicitly
+paired with the typed MPS client config, their independent CUDA contexts connect
+to the launch layer's node-local MPS daemon.
 
 **Reflected in YAML**:
 ```yaml
@@ -254,11 +261,22 @@ The Reward Service's two hard guarantees:
 
 **Validated in `config.py`**: `num_gpus < 0` and `num_replicas < 1` are rejected at load time (with a reward-named error message). `tensor_parallel_size > num_gpus` is also rejected up front, because vLLM's Ray executor would otherwise crash at actor init.
 
+Shared-MPS validation additionally rejects non-finite/out-of-range fractions,
+TP>1, invalid thread/memory limits, overlapping vLLM-style memory budgets, and
+unqualified scorers. The allocation limit is a cap, not a memory partition.
+
 **Over-budget consequence**: `ray.init()` succeeds but some actor hangs or reports insufficient resources during GPU allocation — a Ray-level error that shows up on `/health` (that group's `ping()` does not return).
 
 ### 4.2 Error isolation
 
 **Guarantee**: a single reward's failure (OOM / parse error / actor crash / timeout) does not make the whole batch return 500. The failed reward writes its exception into `ScoreResponse.errors[i][reward_name]`, while the other rewards return scores as usual.
+
+**MPS qualification**: that guarantee covers ordinary Python and scorer
+failures. MPS clients on one physical GPU share a GPU fault domain; a fatal CUDA
+or daemon fault may require restarting every actor on that card. `/health`
+reports this shared fault-domain status. Shutdown reverses startup order:
+admission stops, actors drain and synchronize CUDA, actor processes exit, then
+the daemon stops.
 
 **Mechanism**: in `server.py`, each reward's Ray ref is awaited independently via `_await_ref`, and the per-reward results are collected with `asyncio.gather`:
 
@@ -416,12 +434,18 @@ server:                                ServerCfg
   host: 0.0.0.0                          .host
   port: 8080                             .port                                     ( used when uvicorn starts )
 
+mps:                                   MpsRuntimeCfg
+  mode: managed                          .mode             ─► MpsRuntime.start/stop
+
 rewards:                               list[RewardModelCfg]
   - name: clip                           .name             ─► WorkerPool._groups[.name]
     scorer: clip                         .scorer           ─► get_scorer_cls(.scorer)   ClipScorer
     num_replicas: 1                      .num_replicas     ─► len(WorkerGroup.actors)
-    num_gpus: 1                          .num_gpus         ─► ScorerActor.options(num_gpus=.)
+    num_gpus: 0.5                        .num_gpus         ─► ScorerActor.options(num_gpus=.)
     num_cpus: 2                          .num_cpus         ─► ScorerActor.options(num_cpus=.)
+    mps:                                 .mps              ─► runtime_env.env_vars
+      active_thread_percentage: 100
+      device_memory_limit: 20GiB
     params:                              .params (dict)    ─► ScorerActor.remote(.scorer, .params)
       model_name: openai/…                                    → ClipScorer(**.params)
       weights_path: /path/to/…                      → resolved by resolve_model_path
