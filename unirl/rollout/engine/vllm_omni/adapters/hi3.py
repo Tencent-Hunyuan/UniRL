@@ -24,7 +24,7 @@ from unirl.rollout.engine.vllm_omni.utils import (
     seed_from_sample_id,
 )
 from unirl.rollout.engine.vllm_omni.utils.diff_kwargs import core_diff_kwargs, sde_extra_args
-from unirl.types.primitives import Texts
+from unirl.types.primitives import Texts, require_single_images
 from unirl.types.sample import Part, Sample
 from unirl.types.sampling import ARSamplingParams, DiffusionSamplingParams
 
@@ -231,8 +231,10 @@ class Hi3InputAdapter:
 
         if self.image_input:
             turns, images = sample.vision_conditioning()
+            if len(images) != 1:
+                raise ValueError(f"{self.modality}: expected exactly one image conditioning batch, got {len(images)}")
             texts = next(t.content for t in turns if isinstance(t.content, Texts))
-            pil_images = images[0].to_pils()
+            pil_images = require_single_images(images[0], context=self.modality).to_pils()
         else:
             texts = sample.text_conditioning()[0].content
             pil_images = []

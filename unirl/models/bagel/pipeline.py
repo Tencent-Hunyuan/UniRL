@@ -14,7 +14,7 @@ from unirl.models.types.pipeline import Pipeline
 from unirl.sde.kernels import FlowSDEStrategy, StepStrategy
 from unirl.sde.runtime import FlowMatchSchedulePolicy
 from unirl.types.noise_recipe import NoiseRecipe
-from unirl.types.primitives import Images, Texts
+from unirl.types.primitives import Images, ImageSets, Texts, require_single_images
 from unirl.types.sample import Sample
 from unirl.types.sampling import ARSamplingParams, DiffusionSamplingParams
 from unirl.types.segments.latent import LatentSegment
@@ -136,11 +136,16 @@ class BagelPipeline(Pipeline):
 
     def _extract_input_images(self, conditioning: List[Any], task: str, *, n_prompts: Optional[int]) -> List[Any]:
         """Validated per-sample input PILs for image-input tasks (it2i / i2t / it2t)."""
-        images_prim = next((c for c in conditioning if isinstance(c, Images)), None)
-        if not isinstance(images_prim, Images):
+        image_inputs = [c for c in conditioning if isinstance(c, (Images, ImageSets))]
+        if len(image_inputs) != 1:
             raise TypeError(
-                f"BagelPipeline.generate ({task}): expected an Images input in sample.conditioning(), found none"
+                f"BagelPipeline.generate ({task}): expected exactly one image input in "
+                f"sample.conditioning(), got {len(image_inputs)}"
             )
+        images_prim = require_single_images(
+            image_inputs[0],
+            context=f"BagelPipeline.generate ({task})",
+        )
         if getattr(self.bundle.model, "vit_model", None) is None:
             raise ValueError(
                 f"BagelPipeline.generate ({task}): the bundle was built without the und ViT; "

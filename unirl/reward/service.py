@@ -9,7 +9,7 @@ import torch
 
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
-from unirl.types.primitives import PrimitiveValue, primitive_modality_key
+from unirl.types.primitives import Images, ImageSets, PrimitiveValue, primitive_modality_key
 from unirl.types.reward import RewardRequest, RewardResponse
 from unirl.types.sample import Sample, _part_with_field
 from unirl.types.sampling import ARSamplingParams
@@ -22,9 +22,13 @@ logger = logging.getLogger(__name__)
 def _build_reward_request(sample: Sample, preferred_input_kind: str) -> RewardRequest:
     """Assemble a :class:`RewardRequest` from a response ``Sample``."""
     frontier = sample.parts[-1]
+    turns = sample.turns()
     primitives: Dict[str, PrimitiveValue] = {}
-    for prim in sample.conditioning():
-        primitives[primitive_modality_key(prim)] = prim
+    for turn in turns:
+        primitives[primitive_modality_key(turn.content)] = turn.content
+    image_references = [
+        turn.content for turn in turns if turn.role == "user" and isinstance(turn.content, (Images, ImageSets))
+    ]
 
     if preferred_input_kind not in frontier.primitives:
         raise ValueError(
@@ -41,6 +45,7 @@ def _build_reward_request(sample: Sample, preferred_input_kind: str) -> RewardRe
     return RewardRequest(
         primitives=primitives,
         generated=generated,
+        image_references=image_references,
         audio_sample_rate=audio_sample_rate,
         prompt_ids=[str(sid) for sid in frontier.sample_ids],
         sample_ids=list(frontier.sample_ids),

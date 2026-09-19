@@ -73,6 +73,11 @@ handler in `../../distributed/weight_sync`.
   deterministic fan-out as `n=1` requests each carrying one derived
   `sampling_seed`. Re-check both halves on a SGLang bump: dropping either one
   restores the clone, silently.
+- **SGLang VLM `image_data` changes shape when `sampling_params.n > 1`.** With
+  the pinned 0.5.12.post1 runtime, one prompt with multiple images uses a flat
+  image list for `n=1`, but a one-row nested list for `n>1`; SGLang converts
+  parallel sampling into a batch-of-one before it normalizes multimodal data.
+  Re-check this contract on every SGLang bump.
 - **SGLang request sampling lives on the Sample, not the engine config.** Direct
   callers must `fork(..., sampling_params=ARSamplingParams(...))` before
   `generate`. Missing or non-`ARSamplingParams` frontiers now error; in-tree

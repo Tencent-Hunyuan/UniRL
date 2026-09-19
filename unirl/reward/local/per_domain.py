@@ -37,6 +37,7 @@ def _select_request(request: RewardRequest, indices: List[int]) -> RewardRequest
     return RewardRequest(
         primitives={k: _select_rows(v, idx) for k, v in request.primitives.items()},
         generated={k: _select_rows(v, idx) for k, v in request.generated.items()},
+        image_references=[_select_rows(value, idx) for value in request.image_references],
         metadata=_pick(request.metadata),
         prompt_ids=_pick(request.prompt_ids),
         sample_ids=_pick(request.sample_ids),

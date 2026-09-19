@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any, List, Optional
 import torch
 
 from unirl.distributed.tensor.batch import Batch, concat_field
-from unirl.types.primitives import Audios, Images, Videos
+from unirl.types.primitives import Audios, Images, ImageSets, Videos
 
 if TYPE_CHECKING:
     from unirl.types.sample import Part
@@ -94,7 +94,7 @@ def build_media_preview_for_part(
     part: "Part",
     max_items: int,
     prompts: Optional[List[str]] = None,
-    input_image: Optional[Images] = None,
+    input_image: Optional[Images | ImageSets] = None,
 ) -> Optional[MediaPreview]:
     """Build a wandb-bound :class:`MediaPreview` from one gen Part's decoded media."""
     decoded = part.primitives.get("image")
@@ -127,6 +127,8 @@ def build_media_preview_for_part(
         if not per_sample:
             return None
         input_pixels: Optional[List[Any]] = None
+        if isinstance(input_image, ImageSets):
+            input_image = input_image.primary_images(context="media preview input")
         if isinstance(input_image, Images):
             input_image = map_tree(input_image, hydrate)
             input_pixels = [image.pixels for image in input_image.to_list()]
