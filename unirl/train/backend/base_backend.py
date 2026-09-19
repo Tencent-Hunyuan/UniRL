@@ -308,6 +308,8 @@ class BaseFSDP2Backend(Remote):
         if self.ema is not None:
             self.ema.step(self._optimizer_step_count)
         self._optimizer_step_count += 1
+        # Release consumed grads before train-state offload.
+        self.optimizer.zero_grad(set_to_none=True)
         return grad_norm
 
     def on_rollout_end(self) -> None:
@@ -564,13 +566,7 @@ class BaseFSDP2Backend(Remote):
         optimizer: bool = True,
         clear_gradients: bool = False,
     ) -> None:
-        """Move selected train state to CPU while preserving legacy defaults.
-
-        Direct GPU-streaming weight sync keeps the FSDP parameter shards on
-        device while vLLM receives weights.  It can therefore discard consumed
-        gradients and offload only optimizer state before the sync, then
-        offload the model after the publication commits.
-        """
+        """Move selected train state to CPU while preserving legacy defaults."""
         if clear_gradients:
             self.optimizer.zero_grad(set_to_none=True)
         if model:

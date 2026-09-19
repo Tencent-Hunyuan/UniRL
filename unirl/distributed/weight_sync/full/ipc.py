@@ -363,12 +363,7 @@ class IPCWeightSync(FullWeightSync):
         self._sync_with_legacy_zmq()
 
     def _sync_with_vllm_native_engine(self) -> None:
-        """Publish through vLLM's native packed-IPC weight-transfer engine.
-
-        UniRL retains only lazy canonical export, rank consensus, manifests,
-        and fail-stop publication. vLLM owns CUDA IPC routing, TP slicing,
-        model-specific fusion, and the layerwise ``load_weights`` lifecycle.
-        """
+        """Publish through vLLM's native packed-IPC weight-transfer engine."""
         import torch
         from vllm.distributed.weight_transfer import ParamMeta
 

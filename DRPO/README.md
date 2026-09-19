@@ -31,10 +31,13 @@ that preserves the same Binary-TV trust-region geometry while providing continuo
 reweighting — attenuating diverging updates and providing corrective signals beyond the
 boundary.
 
-The reward here is **rule-based**: `MathBoxedRewardScorer`
-([`unirl/reward/local/math_boxed.py`](../unirl/reward/local/math_boxed.py)) checks the
-`\boxed{}` answer against the DAPO-Math ground truth — exactly the verifiable reward the
-paper trains on, not a learned reward model.
+The reward here is **rule-based**: `MathVerifyRewardScorer`
+([`unirl/reward/local/mathverify.py`](../unirl/reward/local/mathverify.py)) grades the
+parsed final answer against the DAPO-Math ground truth with HuggingFace
+`math-verify` — the paper's grader (Appendix D), not a learned reward model. Unlike a
+`\boxed{}`-requiring matcher, it can also extract answers from free-form text. Extraction
+is heuristic: recognized final-answer markers take priority; otherwise `math-verify` may
+fall back to the rightmost parseable expression.
 
 ![drpo overview: the prompt to SGLang rollout (behavior policy mu) to group advantage to replay for new logp pi to ratio r and TV shift |pi - mu| to reweighted REINFORCE pipeline (single update), with the centerpiece contrast between DPPO's hard-mask step (full gradient, then a cliff to 0 at the threshold delta) and the paper's smooth, bounded DRPO weight that ramps down and crosses zero into a corrective region past delta.](../assets/drpo_overview.png)
 
@@ -127,7 +130,7 @@ The practical consequence:
 1. `unirl.train_ar` builds `ARTrainer` for the text-only Qwen3 recipe.
 2. `SGLangRolloutEngine` samples completions and fills the AR `Part` with packed
    `TextSegment.tokens`, `log_probs`, `lengths`, and masks.
-3. `MathBoxedRewardScorer` scores each completion correct/incorrect.
+3. `MathVerifyRewardScorer` scores each completion correct/incorrect.
 4. `Part.compute_advantages(normalize=False, scope="group")` mean-centers rewards
    within each prompt group; the recipe sets `normalize_adv_by_std: false`, so there is **no
    std division**.
@@ -146,20 +149,20 @@ Unlike FlowGRPO/FlowDPPO, `DRPO` does **not** freeze a train-side `old_logp` in
 | Knob | Meaning |
 |---|---|
 | `drpo_epsilon` | Regularization threshold `ε` (code) / `δ` (paper). Default `12.5` (paper §4). Larger ⇒ weaker regularization; per-token trust region is `ε_t = ε / µ`. |
-| `sampling_temperature` | **MUST equal `sampling.temperature`** (and the rollout engine's). Replay tempers logits so `π` and `µ` share a distribution (`ratio_mean ≈ 1`). |
+| `sampling_temperature` | **MUST equal `sampling.temperature`**. Replay tempers logits so `π` and `µ` share a distribution (`ratio_mean ≈ 1`). |
 | `loss_agg_mode` | `token-mean`, or the recipe's `seq-mean-token-sum-norm`. |
-| `horizon` | Fixed normalizer for `seq-mean-token-sum-norm`; recipe `8192`. |
+| `horizon` | Fixed normalizer for `seq-mean-token-sum-norm`; the recipe derives it from `${sampling.max_new_tokens}`. |
 | `normalize_adv_by_std` | Recipe `false` → mean-center only (no std division). |
 
 ## Debug checklist
 
 | Symptom | First files / variables to check |
 |---|---|
-| `ratio_mean` far from 1 at first update | `sampling_temperature` vs. `sampling.temperature` vs. rollout `temperature`; SGLang logprob config |
+| `ratio_mean` far from 1 at first update | `sampling_temperature` vs. `sampling.temperature`; SGLang logprob config |
 | Large `rollout_replay_logp_absdiff_mean` | train/rollout mismatch, weight sync, tokenization/chat-template mismatch |
 | No gradient on many tokens | `segment.loss_mask`; zero advantages from all-correct/all-wrong groups |
 | `drpo_penalty_mean` very large | `drpo_epsilon` too small for the model's off-policy gap |
-| Completion misses the boxed answer | chat template `/no_think` + `enable_thinking: false` (Qwen3 overruns on `<think>`) |
+| Completion never reaches a final answer | truncation at `sampling.max_new_tokens` (Qwen3 overruns on `<think>`) — an unboxed answer is *not* the problem, `math-verify` reads free-form text. Disabling thinking departs from the paper setup and must flip `enable_thinking` in **both** the pipeline and rollout chat templates or the prompts diverge |
 | SGLang serves stale weights | `LocalLoraWeightSync`, adapter name `default`, rollout wake/sleep logs |
 
 Metric source: `ratio_mean`, `ratio_max`, `approx_kl`, `drpo_penalty_mean`,

@@ -100,10 +100,10 @@ reward:
   _target_: unirl.reward.service.RewardService
   truncated_reward: keep
   backend:
-    _target_: unirl.reward.local.gsm8k_exact_match.GSM8KExactMatchRewardScorer
+    _target_: unirl.reward.local.mathverify.MathVerifyRewardScorer
     base_device: cpu
     config:
-      _target_: unirl.reward.local.gsm8k_exact_match.GSM8KExactMatchSpec
+      _target_: unirl.reward.local.mathverify.MathVerifySpec
 
 algorithm:
   _target_: unirl.algorithms.grpo.GRPO

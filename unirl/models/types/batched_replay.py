@@ -67,7 +67,7 @@ class BatchedStepReplayMixin:
         means_t = None
         if prev_mean_all is not None:
             tail = prev_mean_all.shape[1:]
-            means_t = prev_mean_all.view(S, B, *tail).transpose(0, 1).contiguous().to(dtype=self.trajectory_dtype)
+            means_t = prev_mean_all.view(S, B, *tail).transpose(0, 1).contiguous()
         return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
 
 

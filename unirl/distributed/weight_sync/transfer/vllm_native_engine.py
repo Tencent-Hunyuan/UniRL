@@ -1,10 +1,4 @@
-"""Thin adapters around vLLM 0.27's native packed-IPC weight-transfer engine.
-
-UniRL supplies a lazy FSDP weight source, spawned-runtime control client, and
-fail-stop rank consensus. vLLM continues to own CUDA IPC handle exchange,
-physical-GPU routing, packed-buffer consumption, TP slicing, model-specific
-fusion, and the layerwise ``load_weights`` lifecycle.
-"""
+"""Thin adapters around vLLM 0.27's native packed-IPC weight-transfer engine."""
 
 from __future__ import annotations
 
@@ -93,13 +87,7 @@ class VLLMNativeWeightSyncClient(VLLMWeightSyncClient):
 
 
 class VLLMNativeIPCTrainerEngine(IPCTrainerWeightTransferEngine):
-    """Bounded wrapper over vLLM's native packed-IPC trainer engine.
-
-    vLLM 0.27's packed producer reads one tensor beyond the configured byte
-    boundary before flushing. Planning chunks from metadata first preserves
-    strict bounded lazy materialization without replacing vLLM's receiver,
-    handle routing, layerwise reload, or ``load_weights`` implementation.
-    """
+    """Bounded wrapper over vLLM's native packed-IPC trainer engine."""
 
     def __init__(
         self,

@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import math
 from abc import ABC
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, fields
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Set
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Set
 
 from unirl.config.require import require
 
@@ -15,11 +16,53 @@ if TYPE_CHECKING:
     from unirl.sde.index_schedule import TimestepScheduler
 
 
+def _coerce_type(
+    value: Any,
+    target: type[int] | type[float] | type[bool],
+    name: str,
+    optional: bool = False,
+) -> int | float | bool | None:
+    """Coerce a scalar config value to ``target``, preserving optional ``None``."""
+    expected = "finite float" if target is float else target.__name__
+    message = f"{name} must be {expected}, got {value!r}"
+    if value is None:
+        if optional:
+            return None
+        raise TypeError(message)
+
+    if type(value) is target:
+        if target is float and not math.isfinite(value):
+            raise ValueError(message)
+        return value
+    if target is float and (type(value) is int or isinstance(value, str)):
+        try:
+            number = float(value)
+        except (ValueError, OverflowError) as exc:
+            raise TypeError(message) from exc
+        if not math.isfinite(number):
+            raise ValueError(message)
+        return number
+    if target is int and isinstance(value, str):
+        try:
+            return int(value.strip(), 10)
+        except ValueError as exc:
+            raise TypeError(message) from exc
+    if target is bool and isinstance(value, str):
+        key = value.strip().lower()
+        if key in ("true", "false"):
+            return key == "true"
+    raise TypeError(message)
+
+
 @dataclass
 class BaseSamplingParams(ABC):
     """Marker base for all sampling config dataclasses."""
 
     samples_per_prompt: int = 1
+
+    def __post_init__(self) -> None:
+        cls = type(self).__name__
+        self.samples_per_prompt = _coerce_type(self.samples_per_prompt, int, f"{cls}.samples_per_prompt")
 
 
 def _is_param_dict(sampling: Any) -> bool:
@@ -88,19 +131,55 @@ class DiffusionSamplingParams(BaseSamplingParams):
     guidance_scale_2: Optional[float] = None
     strength: Optional[float] = None
 
-    num_samples_per_prompt: int = 1
-
     def __post_init__(self) -> None:
-        if self.num_samples_per_prompt != 1 and self.samples_per_prompt == 1:
-            object.__setattr__(self, "samples_per_prompt", self.num_samples_per_prompt)
-        elif self.samples_per_prompt != 1 and self.num_samples_per_prompt == 1:
-            object.__setattr__(self, "num_samples_per_prompt", self.samples_per_prompt)
-
+        super().__post_init__()
+        cls = type(self).__name__
+        self.num_inference_steps = _coerce_type(self.num_inference_steps, int, f"{cls}.num_inference_steps")
+        self.guidance_scale = _coerce_type(self.guidance_scale, float, f"{cls}.guidance_scale")
+        self.height = _coerce_type(self.height, int, f"{cls}.height")
+        self.width = _coerce_type(self.width, int, f"{cls}.width")
+        self.num_frames = _coerce_type(self.num_frames, int, f"{cls}.num_frames")
+        self.seed = _coerce_type(self.seed, int, f"{cls}.seed", True)
+        self.init_same_noise = _coerce_type(self.init_same_noise, bool, f"{cls}.init_same_noise")
+        self.disable_driver_xt = _coerce_type(self.disable_driver_xt, bool, f"{cls}.disable_driver_xt")
+        self.eta = _coerce_type(self.eta, float, f"{cls}.eta")
+        self.max_sequence_length = _coerce_type(self.max_sequence_length, int, f"{cls}.max_sequence_length", True)
+        self.taylor_cache_interval = _coerce_type(
+            self.taylor_cache_interval,
+            int,
+            f"{cls}.taylor_cache_interval",
+            True,
+        )
+        self.taylor_cache_order = _coerce_type(self.taylor_cache_order, int, f"{cls}.taylor_cache_order", True)
+        self.distilled_guidance_scale = _coerce_type(
+            self.distilled_guidance_scale,
+            float,
+            f"{cls}.distilled_guidance_scale",
+            True,
+        )
+        self.guidance_scale_2 = _coerce_type(self.guidance_scale_2, float, f"{cls}.guidance_scale_2", True)
+        self.strength = _coerce_type(self.strength, float, f"{cls}.strength", True)
+        if self.init_noise_latent_shape is not None:
+            name = f"{cls}.init_noise_latent_shape"
+            if isinstance(self.init_noise_latent_shape, (str, bytes)) or not isinstance(
+                self.init_noise_latent_shape, Sequence
+            ):
+                raise TypeError(f"{name} must be a sequence of integers, got {self.init_noise_latent_shape!r}")
+            self.init_noise_latent_shape = [
+                _coerce_type(item, int, f"{name}[{index}]") for index, item in enumerate(self.init_noise_latent_shape)
+            ]
+        if self.sde_indices is not None:
+            name = f"{cls}.sde_indices"
+            if isinstance(self.sde_indices, (str, bytes)) or not isinstance(self.sde_indices, Sequence):
+                raise TypeError(f"{name} must be a sequence of integers, got {self.sde_indices!r}")
+            self.sde_indices = [
+                _coerce_type(item, int, f"{name}[{index}]") for index, item in enumerate(self.sde_indices)
+            ]
         reserved = {f.name for f in fields(self) if f.name != "sampler_kwargs"}
         shadowed = reserved & set(self.sampler_kwargs)
         require(
             not shadowed,
-            f"DiffusionSamplingParams.sampler_kwargs cannot contain reserved keys {sorted(shadowed)}; set them as fields instead",
+            f"{cls}.sampler_kwargs cannot contain reserved keys {sorted(shadowed)}; set them as fields instead",
         )
 
     def resolve_sde_indices(self, rollout_id: int) -> List[int]:
@@ -117,9 +196,21 @@ class DiffusionSamplingParams(BaseSamplingParams):
 class ARSamplingParams(BaseSamplingParams):
     """AR (autoregressive) sampling parameters for LLM-based PE generation."""
 
+    emits_fixed_length: ClassVar[bool] = False
+
     temperature: float = 0.7
     max_new_tokens: int = 512
     top_p: float = 0.9
     top_k: int = 0
     stop_token_id: int | None = None
     seed: Optional[int] = None  # engines with per-request seeded sampling derive child seeds from this + sample_id
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        cls = type(self).__name__
+        self.temperature = _coerce_type(self.temperature, float, f"{cls}.temperature")
+        self.max_new_tokens = _coerce_type(self.max_new_tokens, int, f"{cls}.max_new_tokens")
+        self.top_p = _coerce_type(self.top_p, float, f"{cls}.top_p")
+        self.top_k = _coerce_type(self.top_k, int, f"{cls}.top_k")
+        self.stop_token_id = _coerce_type(self.stop_token_id, int, f"{cls}.stop_token_id", True)
+        self.seed = _coerce_type(self.seed, int, f"{cls}.seed", True)

@@ -190,8 +190,7 @@ class DiffusionOPD(StageAlgorithm):
             )
 
         teacher_means = gather_sde_field(segment.sde_means, segment.sde_indices, target_steps, field_name="sde_means")
-        # fp32 before squaring: bf16 loses the shrinking teacher-student delta.
-        student_f32 = student_means.float()
+        # Replay means are fp32 by contract; align the stored teacher anchor before squaring.
         teacher_f32 = teacher_means.to(device=student_means.device, dtype=torch.float32)
 
         sigma_t = _transition_sigma(
@@ -202,7 +201,7 @@ class DiffusionOPD(StageAlgorithm):
             device=student_means.device,
             add_coefficient=self.add_kl_coefficient,
         )
-        kl_per_elem = _gaussian_kl_div(student_f32, teacher_f32, sigma_t)
+        kl_per_elem = _gaussian_kl_div(student_means, teacher_f32, sigma_t)
         kl_per_sample_step = kl_per_elem.mean(dim=tuple(range(2, kl_per_elem.ndim)))  # [B, S']
         loss = kl_per_sample_step.mean()
 
