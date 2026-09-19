@@ -671,6 +671,34 @@ def patch_per_request_ar_seed() -> None:
     AsyncOmniEngine.add_request = _patched
 
 
+def patch_diffusion_worker_sleep_cache_clear() -> None:
+    """Clear prompt-embedding cache before DiffusionWorker sleeps to avoid GPU memory leaks."""
+    try:
+        from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
+    except (ImportError, AttributeError):
+        return
+
+    _orig_sleep = getattr(DiffusionWorker, "sleep", None)
+    if _orig_sleep is None or getattr(_orig_sleep, "_unirl_prompt_cache_clear", False):
+        return
+
+    def _patched_sleep(self, level: int = 1, *args, _orig=_orig_sleep, **kwargs):
+        runner = getattr(self, "model_runner", None)
+        if runner is not None:
+            cache = getattr(runner, "prompt_embed_cache", None)
+            if cache is not None and callable(getattr(cache, "clear", None)):
+                cache.clear()
+            pipe = getattr(runner, "pipeline", None)
+            if pipe is not None:
+                pipe_cache = getattr(pipe, "_prompt_embed_cache", None)
+                if pipe_cache is not None and callable(getattr(pipe_cache, "clear", None)):
+                    pipe_cache.clear()
+        return _orig(self, level, *args, **kwargs)
+
+    _patched_sleep._unirl_prompt_cache_clear = True  # type: ignore[attr-defined]
+    DiffusionWorker.sleep = _patched_sleep
+
+
 class VLLMOmniHijack:
     """Monkey-patches vllm-omni internals to support in-memory LoRA tensors."""
 
@@ -694,11 +722,13 @@ class VLLMOmniHijack:
         patch_per_request_ar_seed()
         patch_sigmas_passthrough()
         patch_moe_workspace_pool()
+        patch_diffusion_worker_sleep_cache_clear()
 
 
 __all__ = [
     "OmniTensorLoRARequest",
     "VLLMOmniHijack",
+    "patch_diffusion_worker_sleep_cache_clear",
     "patch_hv15_packed_lora_mapping",
     "patch_hv15_refiner_torch_linear_lora",
     "patch_per_request_ar_seed",

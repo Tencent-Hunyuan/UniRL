@@ -80,6 +80,12 @@ class RLHunyuanVideo15Pipeline(HunyuanVideo15Pipeline):
         self.encode_prompt = tapped  # type: ignore[assignment]
         self._conditioning_tap_installed = True
 
+    def invalidate_prompt_cache(self) -> None:
+        """Clear the upstream prompt-embedding cache if installed."""
+        cache = getattr(self, "_prompt_embed_cache", None)
+        if cache is not None and callable(getattr(cache, "clear", None)):
+            cache.clear()
+
     def _arm_sde(self, req: OmniDiffusionRequest) -> None:
         """This request's SDE strength + sparse step gate."""
         eta = float(getattr(req.sampling_params, "eta", 0.0) or 0.0)
