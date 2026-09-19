@@ -234,6 +234,29 @@ python3 scripts/bench_concurrent.py \
 
 The output reports each request's min / mean / max latency plus p50/p90/p95/p99, throughput, transport errors, and server-side per-reward failure counts. The sweep and per-reward modes end with a side-by-side comparison table.
 
+For the CUDA MPS experiment proposed in
+[#463](https://github.com/Tencent-Hunyuan/UniRL/issues/463), run the same
+workload repeatedly against each independently launched deployment and label
+the result explicitly:
+
+```bash
+python3 scripts/bench_concurrent.py \
+    --url http://localhost:8080 --sweep 1 4 16 --total 100 \
+    --batch-sweep 1 4 8 --repetitions 3 --warmup-requests 2 \
+    --rewards clip,hpsv2,pickscore \
+    --deployment-mode dedicated --physical-gpu GPU-... --gpu-count 3 \
+    --gpu-sample-interval 0.5 \
+    --output outputs/benchmark/dedicated.json
+
+# Repeat with the other deployment labels after launching each topology.
+```
+
+`--deployment-mode` records experiment metadata; it does not alter Ray
+placement or start MPS. JSON output includes environment, failures, score
+vectors, throughput, latency, and GPU samples.
+The H20 four-way result and the FP16 CLIP active-thread caveat are published in
+[`docs/benchmarks/H20_MPS_BASELINE.md`](docs/benchmarks/H20_MPS_BASELINE.md).
+
 ## Design conventions
 
 - `history` is a `list[(text, image)]`; T2I scorers look only at the last pair.
