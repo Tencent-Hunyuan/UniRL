@@ -163,7 +163,7 @@ class PETrainer(BaseTrainer):
             rollout_id,
             allowed_primitives={"text"},
             caller="PETrainer._build_request_sample",
-            root_control={"ar": {}, "chat": {}},
+            control={"ar": {}, "chat": {}},
             require_single_input_part=True,
         )
         return request.fork(ar_params.samples_per_prompt, sampling_params=ar_params).fork(

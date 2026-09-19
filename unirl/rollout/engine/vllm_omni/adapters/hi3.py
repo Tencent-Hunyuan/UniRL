@@ -193,10 +193,10 @@ class Hi3InputAdapter:
         self.vanilla_task = vanilla_task
         self.sys_type = sys_type
 
-    def _resolve_task(self, task_config: Dict[str, Any]) -> Tuple[str, str]:
-        """Resolve ``(task_key, sys_type)`` with the ``task_config`` overrides."""
-        sys_type = task_config.get("sys_type") or self.sys_type
-        bot_task = task_config.get("bot_task")
+    def _resolve_task(self, control: Dict[str, Any]) -> Tuple[str, str]:
+        """Resolve ``(task_key, sys_type)`` with the root ``Part.control`` overrides."""
+        sys_type = control.get("sys_type") or self.sys_type
+        bot_task = control.get("bot_task")
         if self.bot_task_base and bot_task:
             if bot_task == "vanilla" and self.vanilla_task is not None:
                 return self.vanilla_task
@@ -227,7 +227,7 @@ class Hi3InputAdapter:
 
     def build_prompts(self, sample: Sample) -> List[Dict[str, Any]]:
         """The HI3 chat-templated per-prompt entries (+ the image gates)."""
-        task, sys_type = self._resolve_task(sample.parts[0].control or {})
+        task, sys_type = self._resolve_task(sample.parts[0].control)
 
         if self.image_input:
             turns, images = sample.vision_conditioning()
@@ -367,7 +367,7 @@ class Hi3DitRecaptionInputAdapter:
         cot = turns[1].content
         gen_part = sample.frontier_gen_part(DiffusionSamplingParams)
         diff_params = gen_part.sampling_params
-        sys_type = (sample.parts[0].control or {}).get("sys_type") or self.sys_type
+        sys_type = sample.parts[0].control.get("sys_type") or self.sys_type
 
         base_kwargs = core_diff_kwargs(diff_params)
         height = int(base_kwargs["height"])

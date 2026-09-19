@@ -66,7 +66,7 @@ workers_per_device: 1
 
 # Pin the it2i edit task: every sample MUST carry a source image (dataset media
 # role: condition). HunyuanImage3Pipeline.generate routes task=it2i -> modes/it2i.
-task_config:
+control:
   task: it2i
   bot_task: image              # direct edit, no CoT (template flag for embed_for_gen_image)
 
