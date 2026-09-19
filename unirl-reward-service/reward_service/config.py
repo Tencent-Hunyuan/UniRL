@@ -3,7 +3,8 @@
 One RewardModelCfg per reward (e.g. hpsv2, clip, unified_reward). The
 scorer field selects which BaseScorer subclass to instantiate; params is
 forwarded to its constructor verbatim. num_gpus and replicas control how
-many Ray actors start and how many GPUs each one owns exclusively.
+many Ray actors start and which integer or opt-in fractional resources they
+reserve.
 
 For multi-host deployments, ClusterCfg tells the WorkerPool to
 ``ray.init(address=...)`` against an externally-managed Ray cluster
@@ -13,6 +14,9 @@ the matching pdsh bootstrap.
 
 from __future__ import annotations
 
+import math
+import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -29,6 +33,38 @@ _DEFAULT_SCORE_TIMEOUT_S = 120.0
 # before spilling to the next). "spread" asks Ray to distribute this
 # group's actors across nodes — a soft hint, not a hard placement group.
 _VALID_SCHEDULING = ("pack", "spread")
+_VALID_MPS_MODES = ("disabled", "managed", "external")
+_MEMORY_RE = re.compile(r"^([1-9][0-9]*)\s*(M|MB|MiB|G|GB|GiB)$", re.IGNORECASE)
+# Keep this conservative: each entry needs same-card correctness, limit, and
+# cleanup qualification before it can join a production MPS fault domain.
+_MPS_QUALIFIED_SCORERS = ("clip", "pickscore")
+
+
+@dataclass(frozen=True)
+class MpsRuntimeCfg:
+    """Node-level MPS daemon ownership and shared client endpoints."""
+
+    mode: str = "disabled"
+    pipe_directory: str | None = None
+    log_directory: str | None = None
+
+    @property
+    def enabled(self) -> bool:
+        return self.mode != "disabled"
+
+
+@dataclass(frozen=True)
+class MpsClientCfg:
+    """Limits applied by CUDA when an actor creates its first MPS context."""
+
+    active_thread_percentage: int = 100
+    device_memory_limit_mib: int | None = None
+
+    @property
+    def device_memory_limit_env(self) -> str | None:
+        if self.device_memory_limit_mib is None:
+            return None
+        return f"0={self.device_memory_limit_mib}M"
 
 
 @dataclass(frozen=True)
@@ -54,6 +90,7 @@ class RewardModelCfg:
     # cluster with num_replicas > 1. Single-replica groups ignore this.
     scheduling: str = "pack"
     params: dict[str, Any] = field(default_factory=dict)
+    mps: MpsClientCfg | None = None
 
 
 @dataclass(frozen=True)
@@ -91,6 +128,7 @@ class ServiceCfg:
     server: ServerCfg
     rewards: list[RewardModelCfg]
     cluster: ClusterCfg = field(default_factory=ClusterCfg)
+    mps: MpsRuntimeCfg = field(default_factory=MpsRuntimeCfg)
 
     def reward_names(self) -> list[str]:
         return [r.name for r in self.rewards]
@@ -135,6 +173,107 @@ def _parse_cluster_cfg(raw: dict | None) -> ClusterCfg:
     return ClusterCfg(ray_address=_opt_str("ray_address"), namespace=_opt_str("namespace"))
 
 
+def _parse_mps_runtime_cfg(raw: dict | None) -> MpsRuntimeCfg:
+    if raw is None:
+        return MpsRuntimeCfg()
+    if not isinstance(raw, dict):
+        raise ValueError(f"`mps` must be a mapping, got {type(raw).__name__}")
+    mode = str(raw.get("mode", "disabled")).lower()
+    if mode not in _VALID_MPS_MODES:
+        raise ValueError(f"mps.mode must be one of {_VALID_MPS_MODES}, got {mode!r}")
+
+    def _path(key: str) -> str | None:
+        value = raw.get(key)
+        if value is None:
+            return None
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"mps.{key} must be a non-empty absolute path")
+        value = os.path.abspath(os.path.expandvars(os.path.expanduser(value)))
+        if len(value) > 80:
+            raise ValueError(
+                f"mps.{key} is too long for MPS Unix sockets ({len(value)} > 80)"
+            )
+        return value
+
+    pipe_directory = _path("pipe_directory")
+    log_directory = _path("log_directory")
+    if mode == "disabled" and (pipe_directory or log_directory):
+        raise ValueError("MPS directories require mps.mode=managed or external")
+    if mode == "external" and pipe_directory is None:
+        raise ValueError("mps.mode=external requires mps.pipe_directory")
+    return MpsRuntimeCfg(
+        mode=mode,
+        pipe_directory=pipe_directory,
+        log_directory=log_directory,
+    )
+
+
+def _parse_memory_mib(value: Any, context: str) -> int:
+    if not isinstance(value, str):
+        raise ValueError(f"{context} must be a size such as 12GiB")
+    match = _MEMORY_RE.fullmatch(value.strip())
+    if match is None:
+        raise ValueError(f"{context} must use M/MiB/G/GiB units, got {value!r}")
+    amount = int(match.group(1))
+    unit = match.group(2).lower()
+    return amount * 1024 if unit in {"g", "gb", "gib"} else amount
+
+
+def _parse_mps_client_cfg(
+    raw: Any,
+    *,
+    context: str,
+    scorer: str,
+    params: dict[str, Any],
+    num_gpus: float,
+    runtime: MpsRuntimeCfg,
+) -> MpsClientCfg | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError(f"{context} mps must be a mapping")
+    if not runtime.enabled:
+        raise ValueError(f"{context} configures an MPS client but node MPS is disabled")
+    if not 0 < num_gpus < 1:
+        raise ValueError(f"{context} MPS requires 0 < num_gpus < 1, got {num_gpus}")
+
+    active = raw.get("active_thread_percentage", 100)
+    if isinstance(active, bool) or not isinstance(active, int) or not 1 <= active <= 100:
+        raise ValueError(
+            f"{context} mps.active_thread_percentage must be an integer in [1, 100]"
+        )
+    memory = raw.get("device_memory_limit")
+    memory_mib = (
+        _parse_memory_mib(memory, f"{context} mps.device_memory_limit")
+        if memory is not None
+        else None
+    )
+
+    tp = params.get("tensor_parallel_size", 1)
+    try:
+        tp = int(tp)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{context} params.tensor_parallel_size must be an int") from exc
+    if tp > 1:
+        raise ValueError(f"{context} shared MPS does not support tensor_parallel_size>1")
+
+    if scorer not in _MPS_QUALIFIED_SCORERS:
+        raise ValueError(
+            f"{context} scorer {scorer!r} is not MPS-qualified; "
+            f"qualified scorers: {_MPS_QUALIFIED_SCORERS}"
+        )
+    dtype = str(params.get("dtype", "")).lower()
+    if scorer == "clip" and dtype in {"float16", "fp16", "half"} and active < 100:
+        raise ValueError(
+            f"{context} float16 CLIP is only qualified with "
+            "mps.active_thread_percentage=100"
+        )
+    return MpsClientCfg(
+        active_thread_percentage=active,
+        device_memory_limit_mib=memory_mib,
+    )
+
+
 def load_config(path: str | Path) -> ServiceCfg:
     """Parse YAML into ServiceCfg, validating required fields and name uniqueness."""
     path = Path(path)
@@ -158,6 +297,7 @@ def load_config(path: str | Path) -> ServiceCfg:
     )
 
     cluster = _parse_cluster_cfg(raw.get("cluster"))
+    mps_runtime = _parse_mps_runtime_cfg(raw.get("mps"))
 
     rewards_raw = raw.get("rewards") or []
     if not isinstance(rewards_raw, list):
@@ -195,6 +335,8 @@ def load_config(path: str | Path) -> ServiceCfg:
             entry, "num_gpus", 1.0, caster=float, min_value=0,
             context=f"{ctx} num_gpus",
         )
+        if not math.isfinite(num_gpus):
+            raise ValueError(f"{ctx} num_gpus must be finite, got {num_gpus}")
         max_concurrency = _parse_bounded_number(
             entry, "max_concurrency", 1, caster=int, min_value=1,
             context=f"{ctx} max_concurrency",
@@ -205,6 +347,14 @@ def load_config(path: str | Path) -> ServiceCfg:
                 f"{ctx} scheduling must be one of {_VALID_SCHEDULING}, got {scheduling!r}"
             )
         params = dict(entry.get("params") or {})
+        mps_client = _parse_mps_client_cfg(
+            entry.get("mps"),
+            context=ctx,
+            scorer=str(scorer),
+            params=params,
+            num_gpus=num_gpus,
+            runtime=mps_runtime,
+        )
         # vLLM scorers place `tensor_parallel_size` N GPUs inside one Ray
         # actor via `ScorerActor.options(num_gpus=...)`. If the actor was
         # allocated fewer than N GPUs, vLLM's initialize_ray_cluster can't
@@ -236,10 +386,25 @@ def load_config(path: str | Path) -> ServiceCfg:
                 max_concurrency=max_concurrency,
                 scheduling=scheduling,
                 params=params,
+                mps=mps_client,
             )
         )
 
     if not rewards:
         raise ValueError("at least one reward must be configured")
 
-    return ServiceCfg(server=server, rewards=rewards, cluster=cluster)
+    if mps_runtime.enabled:
+        if not any(reward.mps for reward in rewards):
+            raise ValueError("node MPS is enabled but no reward configures an MPS client")
+        if cluster.ray_address and mps_runtime.mode == "managed":
+            raise ValueError(
+                "managed MPS is single-node only; for an external Ray cluster, "
+                "start one daemon per node and use mps.mode=external"
+            )
+
+    return ServiceCfg(
+        server=server,
+        rewards=rewards,
+        cluster=cluster,
+        mps=mps_runtime,
+    )

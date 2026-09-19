@@ -22,7 +22,7 @@ from reward_service.workers.group import WorkerGroup
 logger = get_logger(__name__)
 
 
-def _init_ray(cluster: ClusterCfg) -> None:
+def _init_ray(cluster: ClusterCfg) -> bool:
     """Bring Ray up according to ClusterCfg, logging which mode we took.
 
     Three mutually exclusive cases:
@@ -38,7 +38,7 @@ def _init_ray(cluster: ClusterCfg) -> None:
     if ray.is_initialized():
         gcs = ray.get_runtime_context().gcs_address
         logger.info("reusing existing Ray runtime; gcs_address=%s", gcs)
-        return
+        return False
 
     if cluster.ray_address:
         init_kwargs: dict[str, Any] = {"address": cluster.ray_address}
@@ -50,19 +50,28 @@ def _init_ray(cluster: ClusterCfg) -> None:
             "connected to Ray cluster at %s (namespace=%s); gcs_address=%s",
             cluster.ray_address, cluster.namespace, gcs,
         )
-        return
+        return False
 
     ray.init()
     logger.info("initialized new local Ray runtime")
+    return True
 
 
 class WorkerPool:
-    def __init__(self, cfg: ServiceCfg) -> None:
+    def __init__(
+        self,
+        cfg: ServiceCfg,
+        *,
+        mps_pipe_directory: str | None = None,
+    ) -> None:
         self.cfg = cfg
-        _init_ray(cfg.cluster)
+        self._owns_local_ray = _init_ray(cfg.cluster)
         self._groups: dict[str, WorkerGroup] = {}
         for reward_cfg in cfg.rewards:
-            self._groups[reward_cfg.name] = WorkerGroup(reward_cfg)
+            self._groups[reward_cfg.name] = WorkerGroup(
+                reward_cfg,
+                mps_pipe_directory=mps_pipe_directory,
+            )
         self._wait_until_all_actors_ready()
 
     def _wait_until_all_actors_ready(self) -> None:
@@ -131,3 +140,5 @@ class WorkerPool:
         for group in self._groups.values():
             group.shutdown()
         self._groups.clear()
+        if self._owns_local_ray:
+            ray.shutdown()

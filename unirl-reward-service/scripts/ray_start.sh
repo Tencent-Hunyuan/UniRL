@@ -15,6 +15,8 @@
 #                  short enough for plasma_store's AF_UNIX socket to fit in
 #                  the kernel's 107-byte limit; see docs/DEVELOPMENT_LOG
 #                  §12.10 for the math.
+#   ENABLE_MPS      set to 1 to start one job-scoped MPS daemon per node
+#                  before any Ray process can initialize CUDA.
 #
 # Assumptions (per resume-prompt & user confirmation):
 #   - Same conda env and repo path on every node; pdsh can reach them over SSH
@@ -53,6 +55,10 @@ for tool in pdsh ray; do
 done
 
 resolve_cluster_nodes   # exports HEAD_NODE / WORKER_NODES / NODES
+
+if [[ "${ENABLE_MPS:-0}" == "1" ]]; then
+  "$(dirname "$0")/mps.sh" start
+fi
 
 echo ">>> ray_start: head=${HEAD_NODE}, workers=[${WORKER_NODES}], port=${RAY_PORT}, gpus/node=${NUM_GPUS}"
 echo ">>> ray_tmpdir=${RAY_TMPDIR} (per-host, under /tmp to keep AF_UNIX socket paths short)"
