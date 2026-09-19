@@ -63,6 +63,7 @@ needs a `.gitignore` line, which keeps that decision explicit.
 
 | Folder | What |
 |---|---|
+| [`audiocaps/`](audiocaps/README.md) | AudioCaps captions for LTX-2.3 CLAP audio-reward RL |
 | [`arxivqa_mc/`](arxivqa_mc/README.md) | ArxivQA scientific-figure multiple-choice (BAGEL GRPO) |
 | [`asearcher/`](asearcher/README.md) | ASearcher deep-research prompts (agentic RL) |
 | [`daily_omni_av/`](daily_omni_av/README.md) | Daily-Omni audio-video QA |

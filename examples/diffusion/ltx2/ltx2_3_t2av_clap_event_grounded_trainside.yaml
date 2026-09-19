@@ -1,0 +1,31 @@
+# @package _global_
+# LTX-Video-2.3 T2AV Flow-GRPO with loudness-invariant, event-grounded CLAP reward.
+#
+# Cook AudioCaps with official AudioSet segment metadata before launching:
+#   python datasets/audiocaps/prepare_audiocaps.py \
+#     --out-dir data/audiocaps-event-grounded \
+#     --audioset-metadata-dir /path/to/audioset-metadata
+#
+# Launch (1 node x 8 GPUs):
+#   DATA_PATH=data/audiocaps-event-grounded/train.jsonl \
+#   EVAL_DATA_PATH=data/audiocaps-event-grounded/eval.jsonl \
+#     bash examples/run_experiment_single_node.sh \
+#       diffusion/ltx2/ltx2_3_t2av_clap_event_grounded_trainside
+
+defaults:
+  - ltx2_3_t2av_clap_trainside
+  - _self_
+
+save_dir: ${oc.env:SAVE_DIR,checkpoints/ltx2_3_t2av_clap_event_grounded_trainside}
+
+logging:
+  tags: [ltx2.3, t2av, flowgrpo, trainside, audio, clap, event-grounded, rms-normalized]
+
+reward:
+  backend:
+    config:
+      event_prompts_metadata_key: audio_event_labels
+      event_coverage_weight: 1.0
+      audio_normalization: rms
+      target_rms_dbfs: -20.0
+      peak_limit: 0.95

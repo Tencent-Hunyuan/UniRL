@@ -36,6 +36,7 @@ class LTX2PipelineConfig:
     enable_audio: bool = False
 
     audio_joint_sde: bool = True
+    audio_policy_logp_weight: Optional[float] = None
 
     default_height: int = 512
     default_width: int = 768
@@ -51,6 +52,13 @@ class LTX2PipelineConfig:
 
     def __post_init__(self) -> None:
         validate_precision_type(self.model_precision, field="LTX2PipelineConfig.model_precision")
+        if self.audio_policy_logp_weight is not None:
+            self.audio_policy_logp_weight = float(self.audio_policy_logp_weight)
+            if not 0.0 <= self.audio_policy_logp_weight <= 1.0:
+                raise ValueError(
+                    "LTX2PipelineConfig.audio_policy_logp_weight must be in [0, 1], "
+                    f"got {self.audio_policy_logp_weight}."
+                )
 
 
 __all__ = ["LTX2PipelineConfig"]

@@ -106,7 +106,7 @@ class LTX2Bundle(Bundle):
         if config.enable_audio:
             try:
                 from diffusers import AutoencoderKLLTX2Audio
-                from diffusers.pipelines.ltx2.vocoder import LTX2Vocoder
+                from diffusers.pipelines.ltx2.vocoder import LTX2Vocoder, LTX2VocoderWithBWE
 
                 audio_vae = (
                     AutoencoderKLLTX2Audio.from_pretrained(
@@ -117,8 +117,16 @@ class LTX2Bundle(Bundle):
                 )
                 audio_vae.requires_grad_(False)
 
+                vocoder_config = LTX2Vocoder.load_config(path, subfolder="vocoder")
+                vocoder_class_name = vocoder_config.get("_class_name", "LTX2Vocoder")
+                vocoder_cls = {
+                    "LTX2Vocoder": LTX2Vocoder,
+                    "LTX2VocoderWithBWE": LTX2VocoderWithBWE,
+                }.get(vocoder_class_name)
+                if vocoder_cls is None:
+                    raise ValueError(f"LTX2Bundle: unsupported vocoder class {vocoder_class_name!r}.")
                 vocoder = (
-                    LTX2Vocoder.from_pretrained(path, subfolder="vocoder", torch_dtype=dtype, low_cpu_mem_usage=False)
+                    vocoder_cls.from_pretrained(path, subfolder="vocoder", torch_dtype=dtype, low_cpu_mem_usage=False)
                     .to(device)
                     .eval()
                 )
