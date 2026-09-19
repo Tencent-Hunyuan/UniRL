@@ -34,15 +34,16 @@ across multimodal model families.
   <img src="assets/UniRL_arch_new.png" alt="UniRL architecture" width="900">
 </div>
 
-UniRL is a layered, composable system. Each **entrypoint** (`train_diffusion`,
-`train_ar`, `train_pe`, `train_unified_model`) loads a **Hydra example config**
-covering model, algorithm, rollout, reward, placement, and sync, then creates the
-matching domain **trainer** (`DiffusionTrainer`, `ARTrainer`, `PETrainer`,
-`UnifiedModelTrainer`). The trainer coordinates the RL loop across pluggable
+UniRL is a layered, composable system. Each **training entrypoint** loads a
+**Hydra example config** and creates the matching domain **trainer**. RL trainers
+coordinate generation, scoring, and updates across pluggable
 **rollout engines**, **algorithms**, **model bundles**, **reward services**, and
 the shared **distributed runtime**: Ray `DevicePool`, FSDP, Transfer
-Queue (TQ), and LoRA/full-weight sync. See [`unirl/README.md`](unirl/README.md) for the
-runtime loop, deployment modes, and module map.
+Queue (TQ), and LoRA/full-weight sync. SFT consumes supervised manifests, while
+the async AR and diffusion entrypoints overlap rollout with training on separate
+GPU slabs. See [`examples/README.md`](examples/README.md#domains--entrypoints)
+for all entrypoints and [`unirl/README.md`](unirl/README.md) for the runtime loop,
+deployment modes, and module map.
 
 The agentic entrypoint extends the AR path with multi-turn tool interaction. It
 preserves each turn as a `Sample` lineage, scores terminal answers through a
@@ -94,21 +95,26 @@ dimension; all listed models are supported (✅).
 
 </div>
 
-Each model maps to a domain entrypoint (`train_diffusion`, `train_ar`, `train_pe`,
-`train_unified_model`); see **Getting Started** below to run any of them.
+Choose the entrypoint that matches the selected recipe; see **Training Modes**
+below and the [launch guide](examples/README.md#running-a-recipe).
 
 ## Training Modes 🧩
 
-UniRL unifies four training modes, one Hydra example bucket and entrypoint each.
-Examples are self-contained YAML files selected with
-`--config-name=<domain>/<example>`:
+Select a recipe with `--config-name=<path-within-examples>` (without `.yaml`),
+including model subdirectories such as `diffusion/sd3/`. Each entrypoint has one
+built-in default, selected when `--config-name` is omitted. Defaults still require
+the recipe's model weights, data, dependencies, and GPU resources.
 
-| Domain | Trains | Entrypoint | Example |
+| Training path | Trains | Entrypoint | Built-in default recipe |
 |---|---|---|---|
-| `diffusion/` | Image / video diffusion models | `train_diffusion` | `diffusion/sd3/sd3_sglang_rollout_colocate` |
-| `ar/` | Autoregressive models — vision-language (VLM) + text-only (LLM) | `train_ar` | `ar/qwen_vl_grpo_geo3k_mc_4x8`, `ar/qwen3_drpo_4b_base_dapo_sglang` |
-| `pe/` | Prompt-enhancer (AR rewriter + diffusion reward) | `train_pe` | `pe/pe_sglang_full_pickscore` |
-| `unified_model/` | Unified AR + diffusion models | `train_unified_model` | `unified_model/hi3_vllmomni` |
+| Diffusion RL | Image / video diffusion models | `train_diffusion` | [`diffusion/sd3/sd3_trainside`](examples/diffusion/sd3/sd3_trainside.yaml) |
+| AR RL | Vision-language (VLM) + text-only (LLM) models | `train_ar` | [`ar/qwen_vl_grpo_geo3k_mc_4x8`](examples/ar/qwen_vl_grpo_geo3k_mc_4x8.yaml) |
+| SFT | Supervised text, multimodal, and diffusion models | `train_sft` | [`sft/qwen3_sft`](examples/sft/qwen3_sft.yaml) |
+| Prompt enhancement | AR rewriter + diffusion reward | `train_pe` | [`pe/pe_trainside_pickscore`](examples/pe/pe_trainside_pickscore.yaml) |
+| Unified RL | Unified AR + diffusion models | `train_unified_model` | [`unified_model/hi3_vllmomni`](examples/unified_model/hi3_vllmomni.yaml) |
+| Agentic RL | Service-scored multi-turn tool use | `train_agentic` | [`deep_research/deep_research_search_judge`](examples/deep_research/deep_research_search_judge.yaml) |
+| Async AR RL | AR models with separate train / rollout workers | `train_async_ar` | [`ar/qwen3_grpo_4b_base_dapo_sglang_async`](examples/ar/qwen3_grpo_4b_base_dapo_sglang_async.yaml) |
+| Async diffusion RL | Diffusion models with separate train / rollout workers | `train_async_diffusion` | [`diffusion/bagel/bagel_vllmomni_async`](examples/diffusion/bagel/bagel_vllmomni_async.yaml) |
 
 See [`examples/README.md`](examples/README.md) for the full launch guide, naming
 schema, and how to add a recipe.
