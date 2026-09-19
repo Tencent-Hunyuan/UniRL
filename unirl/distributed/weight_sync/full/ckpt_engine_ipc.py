@@ -9,6 +9,7 @@ import threading
 import zlib
 from typing import Any, Dict, Optional
 
+from unirl.config.contracts import validate_checkpoint_engine_ipc_options
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.weight_sync.full.base import FullWeightSync
 from unirl.distributed.weight_sync.transfer.ckpt_engine_transfer import (
@@ -130,14 +131,11 @@ class CkptEngineIPCWeightSync(FullWeightSync):
             )
         cfg = self._rollout.cfg
         engine_kwargs = cfg.engine_kwargs
-        server_dp = cfg.dp_size if cfg.dp_size is not None else engine_kwargs.get("dp_size", 1)
-        if server_dp != 1:
-            raise NotImplementedError("CkptEngineIPCWeightSync does not support SGLang server-level dp_size>1")
-        if any(
-            key.startswith("speculative") and value and (not isinstance(value, str) or value.strip().lower() != "none")
-            for key, value in engine_kwargs.items()
-        ):
-            raise NotImplementedError("CkptEngineIPCWeightSync does not support SGLang speculative decoding workers")
+        validate_checkpoint_engine_ipc_options(
+            backend=cfg.backend,
+            dp_size=cfg.dp_size,
+            engine_kwargs=engine_kwargs,
+        )
 
     def _validate_rollout_capability(self) -> None:
         """Require the dedicated checkpoint-engine rollout contract."""

@@ -6,12 +6,14 @@ from __future__ import annotations
 import hydra
 from omegaconf import DictConfig
 
+from unirl.config.contracts import validate_recipe
 from unirl.trainer.agentic import AgenticTrainer
 from unirl.utils.graceful_shutdown import GracefulShutdown
 
 
 @hydra.main(version_base=None, config_path="../examples", config_name="deep_research/deep_research_search_judge")
 def main(cfg: DictConfig) -> None:
+    validate_recipe(cfg, entrypoint="train_agentic")
     trainer = None
 
     def teardown() -> None:
