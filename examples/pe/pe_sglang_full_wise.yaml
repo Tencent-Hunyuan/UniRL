@@ -267,9 +267,10 @@ reward:
   # WISE reward via remote RewardService: one HTTP POST /score per rollout.
   # The `wise` scorer (Qwen3.5-VL judge) returns wiscore=(0.7C+0.2R+0.1A)/2 as its
   # first sub-metric; sub_metric_reduce="first" trains on that headline score.
-  # The judge sees the ORIGINAL user prompt (req.primitives['text'], not the AR
+  # The judge sees the ORIGINAL user prompt (conditioning_source: input, not the AR
   # rewrite), replicated N*M → scores image-vs-original-intent.
   _target_: unirl.reward.service.RewardService
+  conditioning_source: input             # score the image against the user's prompt, not the rewrite
   backend:
     _target_: unirl.reward.remote.RemoteRewardBackend
     base_device: cpu                       # HTTP-only; device ignored
