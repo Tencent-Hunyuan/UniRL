@@ -54,6 +54,14 @@ class ImageBindRewardScorer(LocalRewardBackend):
         self._mode = config.mode
         if self._mode not in _IMAGEBIND_MODES:
             raise ValueError(f"ImageBindSpec.mode must be one of {_IMAGEBIND_MODES}; got {config.mode!r}.")
+        if self._mode == "audio_video" and not config.allow_prompt_blind:
+            raise ValueError(
+                "ImageBindSpec.mode='audio_video' scores cos(generated audio, generated video) "
+                "with no prompt, so collapsing both streams together increases the score. "
+                "For a training reward use mode='all' or mode='text_video'. "
+                "To measure AV sync without using it as an optimisation target, put this "
+                "scorer under eval_rewards with allow_prompt_blind=true."
+            )
         self._weights = dict(config.weights or _IMAGEBIND_DEFAULT_WEIGHTS)
         if self._mode == "all":
             if set(self._weights) != set(_IMAGEBIND_DEFAULT_WEIGHTS):
@@ -259,4 +267,5 @@ class ImageBindSpec(BaseRewardComponentSpec):
     batch_size: int = 8
     device: str = "auto"
     mode: str = "audio_video"
+    allow_prompt_blind: bool = False
     weights: Optional[Dict[str, float]] = None
