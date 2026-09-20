@@ -28,21 +28,13 @@ class RewardRequest:
     audio_sample_rate: Optional[int] = None
 
     def __post_init__(self) -> None:
-        if self.original_prompt is not None and not isinstance(self.original_prompt, Texts):
-            raise TypeError(
-                f"RewardRequest.original_prompt must be Texts or None, got {type(self.original_prompt).__name__}."
-            )
-        if self.generation_prompt is not None and not isinstance(self.generation_prompt, Texts):
-            raise TypeError(
-                f"RewardRequest.generation_prompt must be Texts or None, got {type(self.generation_prompt).__name__}."
-            )
         if "text" in self.conditioning:
             raise ValueError(
                 "RewardRequest.conditioning must contain only non-text condition media; "
                 "use original_prompt/generation_prompt for text."
             )
 
-        aligned: List[tuple[str, int]] = []
+        batch_sizes: Dict[str, int] = {}
         for owner, values in (("generated", self.generated), ("conditioning", self.conditioning)):
             for key, value in values.items():
                 actual_key = primitive_modality_key(value)
@@ -51,26 +43,20 @@ class RewardRequest:
                         f"RewardRequest.{owner}[{key!r}] contains {type(value).__name__}, "
                         f"whose canonical modality key is {actual_key!r}."
                     )
-                aligned.append((f"{owner}[{key!r}]", len(value)))
-        if self.original_prompt is not None:
-            aligned.append(("original_prompt", len(self.original_prompt)))
-        if self.generation_prompt is not None:
-            aligned.append(("generation_prompt", len(self.generation_prompt)))
-        if self.metadata is not None:
-            aligned.append(("metadata", len(self.metadata)))
-        if self.sample_ids is not None:
-            aligned.append(("sample_ids", len(self.sample_ids)))
-        if self.group_ids is not None:
-            aligned.append(("group_ids", len(self.group_ids)))
+                batch_sizes[f"{owner}[{key!r}]"] = len(value)
+        for name, value in (
+            ("original_prompt", self.original_prompt),
+            ("generation_prompt", self.generation_prompt),
+            ("metadata", self.metadata),
+            ("sample_ids", self.sample_ids),
+            ("group_ids", self.group_ids),
+        ):
+            if value is not None:
+                batch_sizes[name] = len(value)
 
-        if aligned:
-            expected = aligned[0][1]
-            mismatched = [f"{name}={size}" for name, size in aligned[1:] if size != expected]
-            if mismatched:
-                raise ValueError(
-                    f"RewardRequest fields must share one batch size; {aligned[0][0]}={expected}, "
-                    f"mismatched {', '.join(mismatched)}."
-                )
+        if len(set(batch_sizes.values())) > 1:
+            details = ", ".join(f"{name}={size}" for name, size in batch_sizes.items())
+            raise ValueError(f"RewardRequest fields must share one batch size; got {details}.")
 
     @property
     def images(self) -> Optional[List[Union[Image.Image, torch.Tensor]]]:
