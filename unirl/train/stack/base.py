@@ -94,8 +94,7 @@ def _prepare_segment_anchors(
             value = getattr(micro.segment, field, None)
             if value is None:
                 raise RuntimeError(
-                    f"{caller}: {type(algorithm).__name__} declares "
-                    f"anchor field {field!r} but a micro produced None."
+                    f"{caller}: {type(algorithm).__name__} declares anchor field {field!r} but a micro produced None."
                 )
             collected[field].append(value)
     for field, tensors in collected.items():
