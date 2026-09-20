@@ -432,6 +432,11 @@ class DiffusionTrainer(BaseTrainer):
                 "has no `reward:` block — drop reward_fraction or configure a reward."
             )
         self._reward_is_separate = reward_separate
+        if rewardstack_cfg is not None and reward_cfg is None:
+            raise ValueError(
+                "rewardstack requires a `reward:` block: the stack scores every micro through the reward "
+                "sibling on the same Worker, so without one there is nothing to call. Drop the `rewardstack:` block."
+            )
 
         _preflight_trainside_geometry(
             num_devices=int(self.num_devices),
@@ -474,6 +479,13 @@ class DiffusionTrainer(BaseTrainer):
                             f"rewardstack dp_size={self.reward_stack.dp_size} != rollout dp_size="
                             f"{self.rollout.dp_size}: the stack must shard the batch exactly as the engine does, "
                             "or each micro reaches an engine rank expecting different rows."
+                        )
+                    if int(self.reward_stack.sp_size) != 1:
+                        raise ValueError(
+                            f"rewardstack is not supported with sp_size={self.reward_stack.sp_size}: the stack "
+                            "inherits the engine's SP layout, so every rank of an SP group receives the same shard "
+                            "and scores all of it, multiplying reward cost by sp_size. Drop the `rewardstack:` "
+                            "block on SP recipes."
                         )
                 if sync_cfg is not None:
                     self.weight_sync = remote_hydra(sync_cfg, backend=self.backend, rollout=self.rollout)
