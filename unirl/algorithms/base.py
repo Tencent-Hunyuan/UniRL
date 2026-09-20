@@ -152,6 +152,7 @@ def _grpo_clip_loss(
 
 def _gaussian_kl_div(p: torch.Tensor, q: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
     """Per-element Gaussian KL between means at shared variance: ``(p-q)^2 / (2 sigma^2)``."""
+    sigma = sigma.reshape(1, -1, *([1] * (p.ndim - 2)))
     return (p - q) ** 2 / (2 * sigma**2)
 
 
@@ -164,9 +165,9 @@ def _transition_sigma(
     device: torch.device,
     add_coefficient: bool = True,
 ) -> torch.Tensor:
-    """Per-step SDE transition std ``sigma_t`` for KL normalization, shape ``[1, S', 1, 1, 1]``."""
+    """Per-step SDE transition std ``sigma_t`` ``[S']``; ``_gaussian_kl_div`` broadcasts it against the means."""
     if not add_coefficient:
-        return torch.ones(1, len(target_steps), 1, 1, 1, device=device)
+        return torch.ones(len(target_steps), device=device)
     if segment.sigmas is None:
         raise ValueError("_transition_sigma requires segment.sigmas (add_coefficient=True).")
     sigmas = segment.sigmas.to(device=device, dtype=torch.float32)
@@ -174,8 +175,7 @@ def _transition_sigma(
     s = sigmas[idx]
     s_next = sigmas[idx + 1]
     sigma_max = sigmas[1] if int(sigmas.shape[0]) > 1 else torch.tensor(0.99, device=device, dtype=sigmas.dtype)
-    sigma_t = stage.strategy.transition_std(sigma=s, sigma_next=s_next, eta=float(eta), sigma_max=sigma_max)
-    return sigma_t.reshape(1, -1, 1, 1, 1)
+    return stage.strategy.transition_std(sigma=s, sigma_next=s_next, eta=float(eta), sigma_max=sigma_max)
 
 
 def _reference_replay_means(
