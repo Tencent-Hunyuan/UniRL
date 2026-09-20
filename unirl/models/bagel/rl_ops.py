@@ -16,11 +16,14 @@ __all__ = [
     "build_image_transforms",
     "clone_context",
     "decode_text",
+    "decode_text_batched",
     "disable_inference_cache",
+    "fork_sampling_generators",
     "forward_flow",
     "init_und_context",
     "pack_und_forward_inputs",
     "inference_dispatch_scope",
+    "prefill_text_batched",
     "prefill_text_split",
     "prefill_vit_split",
     "require_inference_dispatch",
@@ -105,6 +108,20 @@ def _pack_text_ids(text_ids: torch.Tensor, *, kv_len: int, rope_start: int) -> D
 def _to_device(d: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
     """Move every tensor value onto ``device`` (non-tensors pass through)."""
     return {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in d.items()}
+
+
+def fork_sampling_generators(device: torch.device, count: int) -> List[torch.Generator]:
+    """Fork independent RNG streams from the current device generator."""
+    count = int(count)
+    if count < 1:
+        raise ValueError(f"fork_sampling_generators: count must be >= 1; got {count}.")
+    seeds = torch.randint(0, (1 << 63) - 1, (count,), dtype=torch.int64, device=device)
+    generators: List[torch.Generator] = []
+    for seed in seeds.cpu().tolist():
+        generator = torch.Generator(device=device)
+        generator.manual_seed(int(seed))
+        generators.append(generator)
+    return generators
 
 
 @contextmanager
@@ -255,6 +272,41 @@ def prefill_text_split(
     return {"kv_lens": [kv_len + n], "ropes": [rope + n], "past_key_values": past}
 
 
+def prefill_text_batched(
+    model: Any,
+    id_lists: List[torch.Tensor],
+    *,
+    device: torch.device,
+) -> Dict[str, Any]:
+    """Prefill text-only prompts into one block-diagonal KV context."""
+    if not id_lists:
+        raise ValueError("prefill_text_batched: id_lists must be non-empty.")
+
+    text_token_lens = [int(ids.numel()) for ids in id_lists]
+    if any(length == 0 for length in text_token_lens):
+        raise ValueError("prefill_text_batched: prompt id lists must be non-empty.")
+    packed_text_ids = torch.cat([ids.reshape(-1).to(dtype=torch.long) for ids in id_lists])
+    inputs = _to_device(
+        {
+            "text_token_lens": torch.tensor(text_token_lens, dtype=torch.int),
+            "packed_text_ids": packed_text_ids,
+            "packed_text_position_ids": torch.cat(
+                [torch.arange(length, dtype=torch.long) for length in text_token_lens]
+            ),
+            "packed_text_indexes": torch.arange(packed_text_ids.numel(), dtype=torch.long),
+            "packed_key_value_indexes": torch.zeros(0, dtype=torch.long),
+            "key_values_lens": torch.zeros(len(id_lists), dtype=torch.int),
+        },
+        device,
+    )
+    past = _raw(type(model).forward_cache_update_text)(
+        model,
+        init_und_context(model)["past_key_values"],
+        **inputs,
+    )
+    return {"kv_lens": text_token_lens, "ropes": list(text_token_lens), "past_key_values": past}
+
+
 def prefill_vit_split(
     model: Any,
     ctx: Dict[str, Any],
@@ -327,6 +379,76 @@ def decode_text(
             if tid in stop_set:
                 done = True
         curr = token_id.to(device=device, dtype=torch.long).reshape(1)
+    return tokens, logps
+
+
+def decode_text_batched(
+    model: Any,
+    ctx: Dict[str, Any],
+    *,
+    start_token_id: int,
+    sample_fn: Callable[[torch.Tensor], Tuple[torch.Tensor, torch.Tensor]],
+    max_new_tokens: int,
+    stop_ids: List[int],
+    device: torch.device,
+) -> Tuple[List[List[int]], List[List[float]]]:
+    """Decode a text-only batch with block-diagonal KV indexing."""
+    require_inference_dispatch(model)
+    disable_inference_cache(model)
+    lm = model.language_model
+    batch_size = len(ctx["kv_lens"])
+    if batch_size < 1:
+        raise ValueError("decode_text_batched: empty context batch.")
+
+    kv_lens = torch.tensor(ctx["kv_lens"], dtype=torch.int, device=device)
+    positions = torch.tensor(ctx["ropes"], dtype=torch.long, device=device)
+    packed_kv_indexes = torch.arange(int(kv_lens.sum().item()), dtype=torch.long, device=device)
+    past = ctx["past_key_values"]
+    stop_set = {int(token) for token in stop_ids}
+
+    current = torch.full((batch_size,), int(start_token_id), dtype=torch.long, device=device)
+    tokens: List[List[int]] = [[] for _ in range(batch_size)]
+    logps: List[List[float]] = [[] for _ in range(batch_size)]
+    done = [False] * batch_size
+
+    for _ in range(int(max_new_tokens)):
+        query_indexes = torch.cumsum(kv_lens, dim=0) + torch.arange(
+            batch_size,
+            dtype=kv_lens.dtype,
+            device=device,
+        )
+        blocks = packed_kv_indexes.split(kv_lens.tolist())
+        shifted_kv_indexes = torch.cat([block + row for row, block in enumerate(blocks)])
+        out = lm.forward_inference(
+            packed_query_sequence=lm.model.embed_tokens(current),
+            query_lens=torch.ones(batch_size, dtype=torch.int, device=device),
+            packed_query_position_ids=positions,
+            packed_query_indexes=query_indexes,
+            past_key_values=past,
+            key_values_lens=kv_lens,
+            packed_key_value_indexes=shifted_kv_indexes,
+            update_past_key_values=True,
+            is_causal=True,
+            mode="und",
+        )
+        past = out.past_key_values
+        token_ids, token_logps = sample_fn(lm.lm_head(out.packed_query_sequence))
+
+        for row in range(batch_size):
+            if done[row]:
+                continue
+            token = int(token_ids[row].item())
+            tokens[row].append(token)
+            logps[row].append(float(token_logps[row].item()))
+            if token in stop_set:
+                done[row] = True
+
+        current = token_ids.to(device=device, dtype=torch.long).reshape(batch_size)
+        old_blocks = shifted_kv_indexes.split(kv_lens.tolist())
+        packed_kv_indexes = torch.cat([torch.cat([block, block[-1:] + 1]) for block in old_blocks])
+        kv_lens = kv_lens + 1
+        positions = positions + 1
+
     return tokens, logps
 
 

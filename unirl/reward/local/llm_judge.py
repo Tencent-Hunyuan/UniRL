@@ -10,7 +10,7 @@ from typing import List
 
 import requests
 
-from unirl.reward.base import BaseRewardComponentSpec
+from unirl.reward.base import PromptRewardComponentSpec
 from unirl.types.reward import RewardRequest
 
 from .base import LocalRewardBackend
@@ -53,7 +53,7 @@ class LLMJudgeRewardScorer(LocalRewardBackend):
     def __init__(self, *, config: "LLMJudgeSpec", base_device: str) -> None:
         del base_device
         self._spec = config
-        super().__init__()
+        super().__init__(prompt_source=config.prompt_source)
 
     def _load_model(self) -> None:
         self.model = "llm_judge"
@@ -96,7 +96,7 @@ class LLMJudgeRewardScorer(LocalRewardBackend):
         predictions = request.texts
         if predictions is None:
             raise ValueError("LLMJudgeRewardScorer requires request.texts (predicted answers).")
-        prompts = request.prompts or [""] * len(predictions)
+        prompts = self.prompts(request) or [""] * len(predictions)
         metadata_list = request.metadata or [None] * len(predictions)
         rewards: List[float] = []
         for question, prediction, meta in zip(prompts, predictions, metadata_list):
@@ -108,7 +108,7 @@ class LLMJudgeRewardScorer(LocalRewardBackend):
 
 
 @dataclass
-class LLMJudgeSpec(BaseRewardComponentSpec):
+class LLMJudgeSpec(PromptRewardComponentSpec):
     """Config for the LLM-as-judge scorer."""
 
     endpoint: str = ""

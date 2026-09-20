@@ -9,7 +9,7 @@ from typing import List, Optional
 import torch
 
 from unirl.reward.base import RewardBackend
-from unirl.types.reward import RewardRequest, RewardResponse
+from unirl.types.reward import DEFAULT_PROMPT_SOURCE, PromptSource, RewardRequest, RewardResponse
 
 
 class LocalRewardBackend(RewardBackend):
@@ -24,6 +24,7 @@ class LocalRewardBackend(RewardBackend):
         dtype: torch.dtype = torch.float16,
         batch_size: int = 8,
         timeout: float = 60.0,
+        prompt_source: PromptSource = DEFAULT_PROMPT_SOURCE,
         **model_kwargs,
     ) -> None:
         resolved_model_name = self._resolve_model_name(model_name)
@@ -31,6 +32,7 @@ class LocalRewardBackend(RewardBackend):
             model_name=resolved_model_name or "",
             batch_size=batch_size,
             timeout=timeout,
+            prompt_source=prompt_source,
         )
         self.device = device
         self.dtype = dtype
