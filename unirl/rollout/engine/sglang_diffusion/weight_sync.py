@@ -30,8 +30,17 @@ def _partition_lora_tensors(
                 target = candidate
                 normalized_key = key[len(prefix) :]
                 break
+        else:
+            if len(target_modules) > 1:
+                raise ValueError(
+                    f"LoRA tensor {key!r} has no component prefix; expected one of {tuple(prefixed_targets)!r}"
+                )
         groups[target][normalized_key] = tensor
-    return {name: values for name, values in groups.items() if values}
+    populated = {name: values for name, values in groups.items() if values}
+    if len(target_modules) > 1 and set(populated) != set(target_modules):
+        missing = sorted(set(target_modules) - set(populated))
+        raise ValueError(f"LoRA update is missing component tensors for {missing}")
+    return populated
 
 
 class WeightSync:
@@ -63,9 +72,13 @@ class WeightSync:
     ) -> None:
         if not serialized_named_tensors:
             raise ValueError("serialized_named_tensors must be non-empty")
+        update_targets = self._single_update_target(
+            target_modules,
+            operation="tensor weight update",
+        )
         self._backend.update_from_tensor(
             serialized_named_tensors=serialized_named_tensors,
-            target_modules=list(target_modules or self._target_modules),
+            target_modules=update_targets,
             load_format=load_format,
             flush_cache=flush_cache,
         )
@@ -101,22 +114,32 @@ class WeightSync:
     ) -> None:
         if not names:
             raise ValueError("names must be non-empty for distributed update")
+        update_targets = self._single_update_target(
+            target_modules,
+            operation="distributed weight update",
+        )
         self._backend.update_from_distributed(
-            names=[self.normalize_tensor_weight_name(name) for name in names],
+            names=list(names),
             dtypes=list(dtypes),
             shapes=[list(shape) for shape in shapes],
             group_name=str(group_name),
-            target_modules=list(target_modules or self._target_modules),
+            target_modules=update_targets,
             flush_cache=flush_cache,
         )
 
-    def normalize_tensor_weight_name(self, name: str) -> str:
-        """Make old pipeline-qualified names relative to upstream target modules."""
-        for target_module in sorted(self._target_modules, key=len, reverse=True):
-            prefix = f"{target_module}."
-            if name.startswith(prefix):
-                return name[len(prefix) :]
-        return name
+    def _single_update_target(
+        self,
+        target_modules: Optional[List[str]],
+        *,
+        operation: str,
+    ) -> List[str]:
+        targets = list(target_modules or self._target_modules)
+        if len(targets) != 1:
+            raise NotImplementedError(
+                f"SGLang diffusion {operation} supports exactly one pipeline component; "
+                f"got {targets!r}. Use component-specific syncs for dual-transformer models."
+            )
+        return targets
 
     def destroy_weights_update_group(self, *, group_name: str) -> None:
         self._backend.destroy_weights_group(group_name=str(group_name))

@@ -181,9 +181,3 @@ sync:
   lora_merged: true
   bucket_size_mb: 512
   flush_cache: true
-  # Ordered first-match-wins name rewrite (see FullWeightSync._apply_name_remap):
-  # backend.model is the bare SD3 transformer (merged_state_dict yields
-  # transformer_blocks.* etc.), so the "*" catch-all nests every key under the
-  # receiver's transformer.* namespace. Applied on both the merged
-  # (lora_merged=true) and raw paths.
-  name_remap: {"*": "transformer.*"}

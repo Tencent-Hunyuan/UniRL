@@ -69,11 +69,8 @@ class TensorWeightSync(FullWeightSync):
         monkey_patch_torch_reductions()
 
         dist_ready = self._dist_ready()
-        normalize_name = getattr(receiver, "normalize_tensor_weight_name", None)
         fanout = int(getattr(receiver, "weight_payload_fanout", tp_size))
         for bucket, is_last in self._iter_buckets():
-            if callable(normalize_name):
-                bucket = [(normalize_name(name), tensor) for name, tensor in bucket]
             by_dtype: dict = {}
             for name, tensor in bucket:
                 by_dtype.setdefault(tensor.dtype, []).append((name, tensor))

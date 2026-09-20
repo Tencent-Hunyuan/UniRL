@@ -49,11 +49,43 @@ def _patch_memory_occupation_controller() -> None:
     if getattr(controller._move_modules, "_unirl_atomic_rollback", False):
         return
 
-    move_unregistered = moc._move_unregistered_tensors
-
     def _move_unregistered_tensors(module, device: str) -> None:
+        memo = {}
+
+        def move_value(value):
+            if id(value) in memo:
+                return memo[id(value)]
+            if torch.is_tensor(value):
+                moved = value.to(device)
+            elif isinstance(value, dict):
+                items = {key: move_value(child) for key, child in value.items()}
+                moved = value if all(items[key] is value[key] for key in value) else items
+            elif isinstance(value, list):
+                items = [move_value(child) for child in value]
+                moved = value if all(new is old for new, old in zip(items, value)) else items
+            elif isinstance(value, tuple):
+                items = tuple(move_value(child) for child in value)
+                if all(new is old for new, old in zip(items, value)):
+                    moved = value
+                elif hasattr(value, "_fields"):
+                    moved = type(value)(*items)
+                else:
+                    try:
+                        moved = type(value)(items)
+                    except TypeError:
+                        moved = items
+            else:
+                moved = value
+            memo[id(value)] = moved
+            return moved
+
         for submodule in module.modules():
-            move_unregistered(submodule, device)
+            for attr_name, attr_value in list(submodule.__dict__.items()):
+                if attr_name in {"_parameters", "_buffers", "_modules"}:
+                    continue
+                moved_value = move_value(attr_value)
+                if moved_value is not attr_value:
+                    submodule.__dict__[attr_name] = moved_value
 
     def _move_modules(self, names: list[str], device: str) -> None:
         modules = moc.get_updatable_modules(self.pipeline)

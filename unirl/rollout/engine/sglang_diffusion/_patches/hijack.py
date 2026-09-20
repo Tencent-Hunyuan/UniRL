@@ -90,8 +90,12 @@ def _apply(patch_fn) -> None:
 class SglangDiffusionHijack:
     """Installs all UniRL sglang patches. Mirrors ``VLLMOmniHijack``."""
 
+    _installed = False
+
     @staticmethod
     def hijack() -> None:
+        if SglangDiffusionHijack._installed:
+            return
         # Spawn shim MUST run first so the scheduler/worker child re-installs.
         wrap_mp_process_for_children()
 
@@ -149,3 +153,4 @@ class SglangDiffusionHijack:
             patch_safe_unpickler,
         ):
             _apply(patch)
+        SglangDiffusionHijack._installed = True

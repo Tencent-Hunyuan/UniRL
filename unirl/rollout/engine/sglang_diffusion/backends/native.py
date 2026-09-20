@@ -130,6 +130,16 @@ class SGLangBackend:
                 "SGLang generator returned None — full-batch failure (see DiffGenerator.generate docstring)."
             )
         results = list(raw) if isinstance(raw, list) else [raw]
+        prompt = sampling_kwargs.get("prompt")
+        if prompt is not None:
+            num_prompts = len(prompt) if isinstance(prompt, list) else 1
+            outputs_per_prompt = int(sampling_kwargs.get("num_outputs_per_prompt", 1))
+            expected = num_prompts * outputs_per_prompt
+            if len(results) != expected:
+                raise RuntimeError(
+                    f"SGLang returned {len(results)} result(s), expected {expected} "
+                    f"for {num_prompts} prompt(s) x {outputs_per_prompt} output(s)"
+                )
         return [_RawResultView(result) for result in results]
 
     def prepare_latent_shape(self, *, height: int, width: int, num_frames: int, batch_size: int) -> tuple:
