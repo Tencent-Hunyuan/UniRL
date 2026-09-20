@@ -151,7 +151,7 @@ def _grpo_clip_loss(
 
 
 def _gaussian_kl_div(p: torch.Tensor, q: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
-    """Per-element Gaussian KL between means at shared variance: ``(p-q)^2 / (2 sigma^2)``."""
+    """Per-element Gaussian KL ``(p-q)^2 / (2 sigma^2)``; ``sigma`` ``[S']`` broadcasts over ``[B, S', *latent]``."""
     sigma = sigma.reshape(1, -1, *([1] * (p.ndim - 2)))
     return (p - q) ** 2 / (2 * sigma**2)
 
