@@ -106,10 +106,10 @@ rollout:
       model_type: sd3
     # SGLang colocate time-shares the GPU via release_memory_occupation /
     # resume_memory_occupation (engine.sleep()/wake_up()); no sleep-mode knob.
-    # NOTE: SGLang enables torch_memory_saver, which forces all CPU-offload flags
-    # off, and its memory pool reabsorbs any freed space — so the DiT-forward
-    # activation is bounded by forward_batch_size (above). batch_size is reduced
-    # (top of file) so train shard + engine + activation fit on one H20.
+    # The native 0.5.19 controller offloads active modules to pinned CPU memory
+    # and restores them on wake. DiT-forward activation is bounded by
+    # forward_batch_size (above); batch_size is reduced (top of file) so train
+    # shard + engine + activation fit on one H20.
 
 reward:
   _target_: unirl.reward.service.RewardService

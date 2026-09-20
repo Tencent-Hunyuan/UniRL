@@ -1,4 +1,4 @@
-"""Add UniRL-only distributed sync and tagged CUDA-VM sleep to GPUWorker."""
+"""Add UniRL-only distributed sync and tensor-update cache reset to GPUWorker."""
 
 from __future__ import annotations
 
@@ -16,25 +16,7 @@ def patch_gpu_worker() -> None:
 
         def __init__(self, *args, **kwargs):
             orig_init(self, *args, **kwargs)
-
-            from sglang.srt.utils.torch_memory_saver_adapter import (
-                TorchMemorySaverAdapter,
-            )
-
-            from unirl.rollout.engine.sglang_diffusion._patches.memory_saver import (
-                MemorySaverHandler,
-            )
-
-            enable_memory_saver = bool(getattr(self.server_args, "enable_memory_saver", False))
-            pin_cpu_memory = bool(getattr(self.server_args, "pin_cpu_memory", True))
             self._weights_update_groups: dict = {}
-            self._memory_saver = MemorySaverHandler(
-                adapter=TorchMemorySaverAdapter.create(enable=enable_memory_saver),
-                pipeline=self.pipeline,
-                local_rank=self.local_rank,
-                pin_cpu_memory=pin_cpu_memory,
-            )
-            self._dirty_modules = self._memory_saver.dirty_modules
 
         __init__._unirl_gpu_worker = True  # type: ignore[attr-defined]
         GPUWorker.__init__ = __init__
@@ -42,41 +24,7 @@ def patch_gpu_worker() -> None:
     if getattr(GPUWorker, "_unirl_gpu_worker_methods", False):
         return
 
-    orig_is_sleeping = GPUWorker.is_sleeping
-    orig_release_memory = GPUWorker.release_memory_occupation
-    orig_resume_memory = GPUWorker.resume_memory_occupation
     orig_update_from_tensor = GPUWorker.update_weights_from_tensor
-
-    def is_sleeping(self) -> bool:
-        if self._memory_saver.enabled:
-            return self._memory_saver.is_sleeping
-        return orig_is_sleeping(self)
-
-    def release_memory_occupation(
-        self,
-        tags: list[str] | None = None,
-        cpu_backup_tags: list[str] | None = None,
-    ) -> dict:
-        if not self._memory_saver.enabled:
-            return orig_release_memory(self)
-        if self._memory_saver.is_sleeping:
-            return {
-                "success": True,
-                "sleeping": True,
-                "message": "already sleeping",
-            }
-        return self._memory_saver.release(tags, cpu_backup_tags)
-
-    def resume_memory_occupation(self, tags: list[str] | None = None) -> dict:
-        if not self._memory_saver.enabled:
-            return orig_resume_memory(self)
-        if not self._memory_saver.is_sleeping:
-            return {
-                "success": True,
-                "sleeping": False,
-                "message": "already awake",
-            }
-        return self._memory_saver.resume(tags)
 
     def update_weights_from_tensor(self, req) -> tuple[bool, str]:
         success, message = orig_update_from_tensor(self, req)
@@ -84,13 +32,10 @@ def patch_gpu_worker() -> None:
             _reset_teacache(self.pipeline, req.target_modules)
         return success, message
 
-    GPUWorker.is_sleeping = is_sleeping
     GPUWorker.init_weights_update_group = _init_weights_update_group
     GPUWorker.destroy_weights_update_group = _destroy_weights_update_group
     GPUWorker.update_weights_from_tensor = update_weights_from_tensor
     GPUWorker.update_weights_from_distributed = _update_weights_from_distributed
-    GPUWorker.release_memory_occupation = release_memory_occupation
-    GPUWorker.resume_memory_occupation = resume_memory_occupation
     GPUWorker._unirl_gpu_worker_methods = True
 
 
@@ -172,16 +117,6 @@ def _destroy_weights_update_group(
         return False, f"Failed to destroy custom process group: {exc}"
 
 
-def _to_torch_dtype(dtype: str | torch.dtype) -> torch.dtype:
-    if isinstance(dtype, torch.dtype):
-        return dtype
-    normalized = str(dtype).removeprefix("torch.")
-    value = getattr(torch, normalized, None)
-    if not isinstance(value, torch.dtype):
-        raise ValueError(f"Unsupported dtype: {dtype}")
-    return value
-
-
 def _reset_teacache(pipeline, target_modules: list[str] | None) -> None:
     from sglang.multimodal_gen.runtime.cache.teacache import TeaCacheMixin
     from sglang.multimodal_gen.runtime.post_training.weights_updater import (
@@ -224,10 +159,11 @@ def _update_weights_from_distributed(
         handles = []
         process_group = self._weights_update_groups[group_name]
         device = torch.device("cuda", torch.cuda.current_device())
+        updater = WeightsUpdater(self.pipeline)
         for name, dtype, shape in zip(names, dtypes, shapes):
             tensor = torch.empty(
                 shape,
-                dtype=_to_torch_dtype(dtype),
+                dtype=updater._normalize_torch_dtype(dtype),
                 device=device,
             )
             received.append((name, tensor))
@@ -235,7 +171,6 @@ def _update_weights_from_distributed(
         for handle in handles:
             handle.wait()
 
-        updater = WeightsUpdater(self.pipeline)
         success, message = updater.update_weights_from_tensor(
             named_tensors=received,
             target_modules=target_modules,

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional
 
 import torch
 
@@ -35,6 +35,8 @@ def _import_sglang_runtime() -> Dict[str, Any]:
     )
     from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
         GetWeightsChecksumReqInput,
+        ReleaseMemoryOccupationReqInput,
+        ResumeMemoryOccupationReqInput,
         UpdateWeightFromTensorReqInput,
     )
     from sglang.multimodal_gen.runtime.scheduler_client import sync_scheduler_client
@@ -44,8 +46,6 @@ def _import_sglang_runtime() -> Dict[str, Any]:
     from unirl.rollout.engine.sglang_diffusion._patches.io_struct import (
         DestroyWeightsUpdateGroupReqInput,
         InitWeightsUpdateGroupReqInput,
-        ReleaseMemoryOccupationReqInput,
-        ResumeMemoryOccupationReqInput,
         UpdateWeightsFromDistributedReqInput,
     )
 
@@ -146,18 +146,15 @@ class SGLangBackend:
         full_shape = pcfg.prepare_latent_shape(batch_stub, batch_size, num_frames)
         return tuple(full_shape[1:])
 
-    def release_memory(self, *, tags: Sequence[str], cpu_backup_tags: Optional[Sequence[str]] = None) -> None:
+    def release_memory(self) -> None:
         self._forward(
-            self._rt["ReleaseMemoryOccupationReqInput"](
-                tags=list(tags),
-                cpu_backup_tags=(list(cpu_backup_tags) if cpu_backup_tags is not None else None),
-            ),
+            self._rt["ReleaseMemoryOccupationReqInput"](),
             op="release_memory_occupation",
         )
 
-    def resume_memory(self, *, tags: Sequence[str]) -> None:
+    def resume_memory(self) -> None:
         self._forward(
-            self._rt["ResumeMemoryOccupationReqInput"](tags=list(tags)),
+            self._rt["ResumeMemoryOccupationReqInput"](),
             op="resume_memory_occupation",
         )
 

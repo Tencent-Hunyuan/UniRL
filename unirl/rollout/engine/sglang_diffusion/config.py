@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from dataclasses import field as dc_field
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 from omegaconf import SI
 
@@ -47,10 +47,6 @@ class SGLangDiffusionEngineConfig(BaseEngineConfig):
     disable_autocast: bool = False
 
     forward_batch_size: Optional[int] = None
-
-    target_modules: Optional[Tuple[str, ...]] = None
-
-    lora_merge_mode: Optional[str] = None
 
     host: Optional[str] = None
     port: Optional[int] = None
@@ -117,12 +113,9 @@ class SGLangDiffusionEngineConfig(BaseEngineConfig):
             intent["sp_degree"] = int(self.sp_degree)
         intent["disable_autocast"] = bool(self.disable_autocast)
 
-        if self.lora_merge_mode is not None:
-            intent["lora_merge_mode"] = self.lora_merge_mode
-        elif model_config.use_lora:
-            intent.setdefault("lora_merge_mode", "dynamic")
         if model_config.use_lora:
-            lora_targets = self.target_modules or model_config.lora_target_modules
+            intent.setdefault("lora_merge_mode", "dynamic")
+            lora_targets = model_config.lora_target_modules
             if lora_targets is not None:
                 intent["lora_target_modules"] = list(lora_targets)
 

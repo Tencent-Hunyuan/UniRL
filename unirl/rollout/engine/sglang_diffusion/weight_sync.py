@@ -45,6 +45,8 @@ class WeightSync:
         target_modules: List[str],
         uses_lora: bool,
     ) -> None:
+        if not target_modules:
+            raise ValueError("SGLang diffusion weight sync requires at least one target module")
         self._backend = backend
         self._pipeline_prefix = pipeline_prefix
         self._target_modules = list(target_modules)
@@ -131,6 +133,8 @@ class WeightSync:
             lora_tensors,
             pipeline_prefix=self._pipeline_prefix,
         )
+        if not stripped:
+            raise ValueError("SGLang LoRA update contains no tensors after name adaptation")
         adapter_alpha = None
         adapter_rank = None
         if peft_config is not None:
@@ -140,14 +144,25 @@ class WeightSync:
             raise ValueError(f"SGLang requires integral lora_alpha; got {adapter_alpha!r}")
         if adapter_rank is not None and int(adapter_rank) != adapter_rank:
             raise ValueError(f"SGLang requires integral LoRA rank; got {adapter_rank!r}")
+        lora_alpha = int(adapter_alpha) if adapter_alpha is not None else None
+        lora_rank = int(adapter_rank) if adapter_rank is not None else None
         grouped = _partition_lora_tensors(stripped, self._target_modules)
-        for target_module, target_tensors in grouped.items():
-            self._backend.set_lora(
-                lora_tensors=target_tensors,
-                target_module=target_module,
-                lora_alpha=(int(adapter_alpha) if adapter_alpha is not None else None),
-                lora_rank=(int(adapter_rank) if adapter_rank is not None else None),
-            )
+        self._lora_loaded = False
+        group_count = len(grouped)
+        for index, (target_module, target_tensors) in enumerate(grouped.items()):
+            try:
+                self._backend.set_lora(
+                    lora_tensors=target_tensors,
+                    target_module=target_module,
+                    lora_alpha=lora_alpha,
+                    lora_rank=lora_rank,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "SGLang LoRA update failed for component "
+                    f"{target_module!r} after {index}/{group_count} component updates; "
+                    "the backend may be partially updated, so retry the complete adapter update"
+                ) from exc
         self._lora_loaded = True
 
         layer_names = set()

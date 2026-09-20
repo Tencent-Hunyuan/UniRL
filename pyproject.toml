@@ -76,8 +76,8 @@ sglang = [
   # (3 GDN + 1 full per 4). Without it, transformers falls back to the torch
   # implementation ("The fast path is not available because one of the required
   # library is not installed"). The [conv1d] extra pulls causal-conv1d, the
-  # [tilelang] extra is already satisfied transitively. Pin to the version
-  # retained from the 0.5.12 stack pending the 0.5.19 H20 smoke.
+  # [tilelang] extra is already satisfied transitively. Keep the version
+  # validated by the 0.5.19 H20 package/import smoke.
   "flash-linear-attention[conv1d]==0.5.1 ; sys_platform == 'linux'",
   "av>=14.2,<19 ; sys_platform == 'linux'",
 ]

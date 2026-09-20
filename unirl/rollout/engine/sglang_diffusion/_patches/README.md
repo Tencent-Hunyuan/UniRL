@@ -10,18 +10,17 @@
 ## What it is
 
 13 patches are installed by one idempotent `SglangDiffusionHijack.hijack()`
-(`hijack.py`), backed by 2 support modules (`io_struct.py` and
-`memory_saver.py`). Every patch is `setattr`, dataclass-field injection, or an
-AROUND-wrap — **no sglang source is edited**, so a version bump is a re-pin, not
-a re-merge.
+(`hijack.py`), backed by the request definitions in `io_struct.py`. Every patch
+is `setattr`, dataclass-field injection, or an AROUND-wrap — **no sglang source
+is edited**, so a version bump is a re-pin, not a re-merge.
 
 ## Why it exists
 
 The fork (`sglang-drl`) added rollout behavior that stock sglang still does not
 fully provide: driver-pinned σ, driver-authoritative `x_T`, per-sample SDE noise,
-tagged CUDA-VM sleep/wake, distributed weight push, and conditions emission.
-Depending on the fork means re-merging it on every upstream release. Re-homing
-only the missing semantics as patches keeps each upstream upgrade reviewable.
+distributed weight push, and conditions emission. Depending on the fork means
+re-merging it on every upstream release. Re-homing only the missing semantics as
+patches keeps each upstream upgrade reviewable.
 
 ## How it works
 
@@ -37,7 +36,7 @@ before `from_pretrained` spawns the scheduler. Idempotent; safe from parent and
 child. Patch installation is fail-closed: an incompatible pinned SGLang layout
 aborts engine boot instead of silently running without the rollout contract.
 
-**Extending it:** a new patch is a module here with an idempotent `install()`
+**Extending it:** a new patch is a module here with an idempotent `patch_*()`
 called from `hijack.py`, plus a row below. Prefer AROUND-wrap over REPLACE — a
 REPLACE re-vendors upstream source and must be hand-re-synced on every bump.
 
@@ -49,15 +48,14 @@ identity:
 
 | Module | What it defines |
 | --- | --- |
-| `io_struct.py` | The 5 UniRL-only distributed-sync and tagged sleep/wake request structs |
-| `memory_saver.py` | Tagged CUDA-VM sleep/wake helper layered over `torch_memory_saver` |
+| `io_struct.py` | The 3 UniRL-only distributed-sync request structs |
 
 Re-homed fork surface:
 
 | Module | What stock upstream does wrong | DELETE-WHEN |
 | --- | --- | --- |
-| `patch_gpu_worker.py` | Upstream owns tensor/LoRA updates and ordinary CPU sleep/wake; UniRL adds external-process-group broadcasts plus tagged CUDA-VM sleep/wake | upstream accepts external distributed broadcasts and tagged memory-saver regions |
-| `patch_scheduler.py` | Registers those UniRL-only verbs and blocks generation while resumed CUDA-VM regions contain disposable weights | same |
+| `patch_gpu_worker.py` | Upstream owns tensor/LoRA updates and CPU sleep/wake; UniRL adds external-process-group broadcasts, flattened-bucket payload support, and TeaCache reset after tensor updates | upstream accepts external distributed broadcasts and UniRL's flattened payload |
+| `patch_scheduler.py` | Registers the UniRL-only distributed-group verbs | upstream accepts external distributed broadcasts |
 | `patch_safe_unpickler.py` | sglang's `SafeUnpickler` (CVE-2025-10164 mitigation) allowlists `builtins`/`torch`/… but **not** `unirl.`, so the first full-weight push dies. Must be installed **in every process that deserializes** | upstream allowlists are configurable |
 
 Driver-authoritative rollout contract — these are what keep the GRPO ratio honest:

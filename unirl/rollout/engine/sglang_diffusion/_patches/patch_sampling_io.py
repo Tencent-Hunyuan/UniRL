@@ -3,11 +3,8 @@
 from __future__ import annotations
 
 import dataclasses
-import logging
 import threading
 from dataclasses import field
-
-logger = logging.getLogger(__name__)
 
 _local = threading.local()
 
@@ -43,7 +40,7 @@ def patch_sampling_io() -> None:
 
     _install_req_denoise_seeds(sb_mod)
 
-    _wrap_prepare_request(utils_mod, SamplingParams)
+    _wrap_prepare_request(utils_mod)
 
     _install_json_safe_tensor_guard(sp_mod)
 
@@ -61,8 +58,8 @@ def _install_json_safe_tensor_guard(sp_mod) -> None:
     """Make ``sampling_params._json_safe`` tolerate ``torch.Tensor`` values."""
     import torch
 
-    orig = getattr(sp_mod, "_json_safe", None)
-    if orig is None or getattr(orig, "_unirl_tensor_safe", False):
+    orig = sp_mod._json_safe
+    if getattr(orig, "_unirl_tensor_safe", False):
         return
 
     def _json_safe(obj):
@@ -87,7 +84,7 @@ def _wrap_validate_with_pipeline_config(SamplingParams) -> None:
     """AROUND-wrap ``_validate_with_pipeline_config`` so ``condition_image`` satisfies the I2I ``image_path`` need."""
     orig = SamplingParams.__dict__.get("_validate_with_pipeline_config")
     if orig is None:
-        return  # pragma: no cover - upstream method missing
+        raise AttributeError("SamplingParams._validate_with_pipeline_config missing upstream")
     if getattr(orig, _VALIDATE_SENTINEL, False):
         return
 
@@ -116,7 +113,7 @@ def _wrap_diff_generator_generate() -> None:
 
     orig = DiffGenerator.__dict__.get("generate")
     if orig is None:
-        return
+        raise AttributeError("DiffGenerator.generate missing upstream")
     if getattr(orig, _GEN_SENTINEL, False):
         return
 
@@ -260,18 +257,18 @@ def _install_req_denoise_seeds(sb_mod) -> None:
     """Add ``denoise_seeds`` as a first-class field on upstream ``Req``."""
     Req = sb_mod.Req
     own_fields = Req.__dict__.get("__dataclass_fields__")
-    if own_fields is None:  # pragma: no cover - Req is a dataclass, always present
-        own_fields = dict(getattr(Req, "__dataclass_fields__", {}))
-        Req.__dataclass_fields__ = own_fields
+    if own_fields is None:
+        raise TypeError("sglang schedule_batch.Req must be a dataclass")
     if _REQ_FIELD not in own_fields:
         own_fields[_REQ_FIELD] = _make_dataclass_field(_REQ_FIELD, None, "list[str] | None")
 
-    spf = getattr(sb_mod, "SAMPLING_PARAMS_FIELDS", None)
-    if isinstance(spf, set):
-        spf.update(_SP_INJECT_FIELDS)
+    spf = sb_mod.SAMPLING_PARAMS_FIELDS
+    if not isinstance(spf, set):
+        raise TypeError("sglang schedule_batch.SAMPLING_PARAMS_FIELDS must be a set")
+    spf.update(_SP_INJECT_FIELDS)
 
 
-def _wrap_prepare_request(utils_mod, SamplingParams) -> None:
+def _wrap_prepare_request(utils_mod) -> None:
     """AROUND-wrap ``prepare_request`` to lower driver-only IO onto the Req."""
     orig = utils_mod.prepare_request
     if getattr(orig, _PREP_SENTINEL, False):

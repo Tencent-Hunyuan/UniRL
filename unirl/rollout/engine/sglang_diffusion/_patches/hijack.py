@@ -33,10 +33,7 @@ class _DiffrlPatchedTarget:
                 _os.environ.pop(_k, None)
 
         _os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-        try:
-            import sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline as _lp  # noqa: F401
-        except Exception:
-            pass
+        import sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline as _lp  # noqa: F401
 
         SglangDiffusionHijack.hijack()
         return self._target(*args, **kwargs)
