@@ -15,7 +15,7 @@ from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
 from unirl.train.backend.fsdp import FSDPBackend
 from unirl.train.stack import TrainStepResult, _build_micro_batch_slices
-from unirl.train.stack.base import _aggregate_update_results, _validate_anchor_contract
+from unirl.train.stack.base import _aggregate_update_results, _prepare_segment_anchors, _validate_anchor_contract
 from unirl.train.stack.planner.types import _positive_int, _update_ranges
 from unirl.types.sample import Part, Sample
 from unirl.types.sampling import ARSamplingParams, DiffusionSamplingParams
@@ -78,29 +78,15 @@ class UnifiedModelTrainStack(Remote):
 
     def prepare_segment(self, algorithm: StageAlgorithm, part: Part) -> None:
         """Freeze one algorithm's π_old anchor once, before the multi-update loop."""
-        if part.segment is None:
-            return
-        if not algorithm.recomputes_anchor:
-            algorithm.prepare_segment(conditions=part.conditions, segment=part.segment)
-            return
-        micro_slices = [sl for step in self._optimizer_step_slices(int(part.batch_size)) for sl in step]
-        if len(micro_slices) == 1:
-            algorithm.prepare_segment(conditions=part.conditions, segment=part.segment)
-            return
-        collected: Dict[str, List[torch.Tensor]] = {field: [] for field in algorithm.anchor_fields}
-        for start, end in micro_slices:
-            micro = part.slice(start, end)
-            algorithm.prepare_segment(conditions=micro.conditions, segment=micro.segment)
-            for field in collected:
-                value = getattr(micro.segment, field, None)
-                if value is None:
-                    raise RuntimeError(
-                        f"UnifiedModelTrainStack.prepare_segment: {type(algorithm).__name__} declares "
-                        f"anchor field {field!r} but a micro-slice produced None."
-                    )
-                collected[field].append(value)
-        for field, parts in collected.items():
-            setattr(part.segment, field, torch.cat(parts, dim=0))
+        micro_slices: List[Tuple[int, int]] = []
+        if part.segment is not None and algorithm.recomputes_anchor:
+            micro_slices = [sl for step in self._optimizer_step_slices(int(part.batch_size)) for sl in step]
+        _prepare_segment_anchors(
+            algorithm,
+            part,
+            micro_slices,
+            caller="UnifiedModelTrainStack.prepare_segment",
+        )
 
     def _backward_part(
         self,
