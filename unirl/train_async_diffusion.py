@@ -6,11 +6,13 @@ from __future__ import annotations
 import hydra
 from omegaconf import DictConfig
 
+from unirl.config.contracts import validate_recipe
 from unirl.trainer.async_diffusion import AsyncDiffusionTrainer
 
 
 @hydra.main(version_base=None, config_path="../examples", config_name="diffusion/bagel/bagel_vllmomni_async")
 def main(cfg: DictConfig) -> None:
+    validate_recipe(cfg, entrypoint="train_async_diffusion")
     trainer = AsyncDiffusionTrainer(
         cfg=cfg,
         batch_size=cfg.batch_size,
@@ -25,7 +27,6 @@ def main(cfg: DictConfig) -> None:
         sampling_cfg=cfg.sampling,
         sync_cfg=cfg.get("sync"),
         logging_cfg=cfg.get("logging"),
-        layout="separate",
         train_fraction=cfg.get("train_fraction", 0.5),
         reward_fraction=cfg.get("reward_fraction", 0.0),
         # Forwarded so the trainer can reject it — async scores at reap time outside
