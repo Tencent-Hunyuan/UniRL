@@ -29,7 +29,6 @@ class VideoRewardScorer(RewardBackend):
         super().__init__(
             model_name=inner_model,
             batch_size=config.batch_size,
-            prompt_source=config.prompt_source,
         )
         self.temporal_weight = config.temporal_weight
         self.alignment_weight = config.alignment_weight
