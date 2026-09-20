@@ -28,14 +28,12 @@ def _embeds(output: object) -> torch.Tensor:
     if isinstance(output, torch.Tensor):
         return output
     pooled = getattr(output, "pooler_output", None)
-    if pooled is not None:
+    if isinstance(pooled, torch.Tensor):
         return pooled
-    hidden = getattr(output, "last_hidden_state", None)
-    if hidden is not None:
-        return hidden[:, 0]
-    if isinstance(output, (tuple, list)):
-        return output[0]
-    raise TypeError(f"PickScoreScorer: unexpected CLIP feature output {type(output)}")
+    raise TypeError(
+        f"PickScoreScorer: unexpected CLIP feature output {type(output)}; expected a projected-feature "
+        "Tensor or a ModelOutput whose pooler_output holds it"
+    )
 
 
 class PickScoreScorer(BaseScorer):
