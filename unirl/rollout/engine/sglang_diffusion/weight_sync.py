@@ -159,16 +159,11 @@ class WeightSync:
         if not stripped:
             raise ValueError("SGLang LoRA update contains no tensors after name adaptation")
         adapter_alpha = None
-        adapter_rank = None
         if peft_config is not None:
             adapter_alpha = peft_config.get("lora_alpha")
-            adapter_rank = peft_config.get("r")
         if adapter_alpha is not None and int(adapter_alpha) != adapter_alpha:
             raise ValueError(f"SGLang requires integral lora_alpha; got {adapter_alpha!r}")
-        if adapter_rank is not None and int(adapter_rank) != adapter_rank:
-            raise ValueError(f"SGLang requires integral LoRA rank; got {adapter_rank!r}")
         lora_alpha = int(adapter_alpha) if adapter_alpha is not None else None
-        lora_rank = int(adapter_rank) if adapter_rank is not None else None
         grouped = _partition_lora_tensors(stripped, self._target_modules)
         self._lora_loaded = False
         group_count = len(grouped)
@@ -178,7 +173,6 @@ class WeightSync:
                     lora_tensors=target_tensors,
                     target_module=target_module,
                     lora_alpha=lora_alpha,
-                    lora_rank=lora_rank,
                 )
             except Exception as exc:
                 raise RuntimeError(

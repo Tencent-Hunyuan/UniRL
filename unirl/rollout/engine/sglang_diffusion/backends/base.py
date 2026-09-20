@@ -86,7 +86,6 @@ class Backend(Protocol):
         lora_tensors: Dict[str, Any],
         target_module: str,
         lora_alpha: Optional[int] = None,
-        lora_rank: Optional[int] = None,
     ) -> None: ...
     def weights_checksum(self, *, module_names: List[str]) -> dict: ...
 

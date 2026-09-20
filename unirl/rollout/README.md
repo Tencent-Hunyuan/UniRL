@@ -152,7 +152,9 @@ pool knobs. This is the exception to the full-FT `enable_lora: false` receive pa
 `nccl_port` values by binding temporary sockets on the engine's node, then
 closes those sockets so SGLang can bind (the usual bind-to-zero TOCTOU gap
 remains). Do not set `port` / `nccl_port` in `engine_kwargs` — the selected
-values overwrite them.
+values overwrite them. The retired 35535 cap is unnecessary on 0.5.19:
+SGLang derives `grpc_port = port + 10000` only when gRPC mode is explicitly
+enabled, which UniRL's rollout backend does not do.
 
 ## Gotchas
 

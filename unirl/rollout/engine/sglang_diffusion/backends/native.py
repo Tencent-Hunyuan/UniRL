@@ -260,7 +260,6 @@ class SGLangBackend:
         lora_tensors: Dict[str, Any],
         target_module: str,
         lora_alpha: Optional[int] = None,
-        lora_rank: Optional[int] = None,
     ) -> None:
         ipc_tensors = _stage_lora_tensors_for_ipc(lora_tensors)
         serialized = self._rt["MultiprocessingSerializer"].serialize(list(ipc_tensors.items()))
@@ -269,7 +268,6 @@ class SGLangBackend:
             target_modules=[target_module],
             weight_update_mode="lora_merge",
             lora_alpha=lora_alpha,
-            lora_rank=lora_rank,
         )
         self._forward(request, op="set_lora_from_tensors")
 

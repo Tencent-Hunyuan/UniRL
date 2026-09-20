@@ -83,8 +83,7 @@ Version-window and environment bridges:
 - **`patch_dance` is the only REPLACE** — every other patch is additive. On an
   sglang bump, re-sync its re-vendored `flow_sde_sampling` body by hand first.
 - **Install order matters.** `hijack.py` must run before `DiffGenerator` is
-  imported; `patch_wan_scheduler` requires `patch_set_timesteps`;
-  `patch_scheduler` requires `patch_gpu_worker`.
+  imported; `patch_wan_scheduler` requires `patch_set_timesteps`.
 - **Patched bodies copied verbatim from the fork are nested functions**, so their
   free globals resolve in *this* package's scope, not sglang's — re-bind every
   name locally or the patch fails at call time, not at install time.
