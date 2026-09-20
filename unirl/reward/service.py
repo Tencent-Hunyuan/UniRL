@@ -9,7 +9,7 @@ import torch
 
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
-from unirl.types.primitives import PrimitiveValue, primitive_modality_key
+from unirl.types.primitives import PrimitiveValue, Texts, primitive_modality_key
 from unirl.types.reward import RewardRequest, RewardResponse
 from unirl.types.sample import Sample, _part_with_field
 from unirl.types.sampling import ARSamplingParams
@@ -19,35 +19,35 @@ from .base import DifferentiableReward, RewardBackend
 logger = logging.getLogger(__name__)
 
 
-_CONDITIONING_SOURCES = ("nearest", "input")
+def _original_prompt(sample: Sample) -> Optional[Texts]:
+    """Align the root user prompt to the frontier by sample lineage."""
+    if not sample.parts:
+        return None
+    root = sample.parts[0]
+    prompt = root.primitives.get("text")
+    if prompt is None:
+        return None
+    if not isinstance(prompt, Texts):
+        raise TypeError(f"Root Part primitives['text'] must be Texts, got {type(prompt).__name__}.")
+    row_by_id = {sample_id: row for row, sample_id in enumerate(root.sample_ids)}
+    root_ids = sample.root_group_ids(-1)
+    missing = [sample_id for sample_id in root_ids if sample_id not in row_by_id]
+    if missing:
+        raise ValueError(f"Reward prompt lineage refers to unknown root sample ids: {missing[:3]!r}.")
+    rows = torch.tensor([row_by_id[sample_id] for sample_id in root_ids], dtype=torch.long)
+    return prompt.select(rows)
 
 
-def _input_conditioning(sample: Sample) -> List[PrimitiveValue]:
-    """Non-generated conditioning, repeated to the frontier's rows by the uniform fan-out."""
-    first_gen = next((i for i, part in enumerate(sample.parts) if part.is_gen), None)
-    if first_gen is None or first_gen == 0:
-        return sample.conditioning()
-    input_rows = sample.parts[first_gen].batch_size
-    frontier_rows = sample.parts[-1].batch_size
-    if input_rows == 0 or frontier_rows % input_rows:
-        raise ValueError(
-            f"conditioning_source='input' needs a uniform fan-out; got {frontier_rows} frontier rows "
-            f"for {input_rows} input-aligned rows."
-        )
-    factor = frontier_rows // input_rows
-    conditioning = sample.conditioning_at(first_gen)
-    return conditioning if factor == 1 else [prim.repeat_interleave(factor) for prim in conditioning]
-
-
-def _build_reward_request(
-    sample: Sample, preferred_input_kind: str, conditioning_source: str = "nearest"
-) -> RewardRequest:
+def _build_reward_request(sample: Sample, preferred_input_kind: str) -> RewardRequest:
     """Assemble a :class:`RewardRequest` from a response ``Sample``."""
     frontier = sample.parts[-1]
-    primitives: Dict[str, PrimitiveValue] = {}
-    conditioning = sample.conditioning() if conditioning_source == "nearest" else _input_conditioning(sample)
-    for prim in conditioning:
-        primitives[primitive_modality_key(prim)] = prim
+    generation_prompt: Optional[Texts] = None
+    conditioning: Dict[str, PrimitiveValue] = {}
+    for prim in sample.conditioning():
+        if isinstance(prim, Texts):
+            generation_prompt = prim
+        else:
+            conditioning[primitive_modality_key(prim)] = prim
 
     if preferred_input_kind not in frontier.primitives:
         raise ValueError(
@@ -62,10 +62,11 @@ def _build_reward_request(
     if "audio" in generated and audio_metadata.get("sample_rate") is not None:
         audio_sample_rate = int(audio_metadata["sample_rate"])
     return RewardRequest(
-        primitives=primitives,
         generated=generated,
+        conditioning=conditioning,
+        original_prompt=_original_prompt(sample),
+        generation_prompt=generation_prompt,
         audio_sample_rate=audio_sample_rate,
-        prompt_ids=[str(sid) for sid in frontier.sample_ids],
         sample_ids=list(frontier.sample_ids),
         group_ids=list(frontier.group_ids),
         metadata=(metadata if any(m is not None for m in metadata) else None),
@@ -81,25 +82,18 @@ class RewardService(Remote):
         truncated_reward: str = "zero",
         overlong_buffer_len: int = 4096,
         overlong_penalty_factor: float = 1.0,
-        conditioning_source: str = "nearest",
     ) -> None:
         super().__init__()
         self.backend = backend
         self.truncated_reward = str(truncated_reward)
         self.overlong_buffer_len = int(overlong_buffer_len)
         self.overlong_penalty_factor = float(overlong_penalty_factor)
-        self.conditioning_source = str(conditioning_source)
         if self.truncated_reward not in ("zero", "keep", "soft"):
             raise ValueError(f"truncated_reward must be zero|keep|soft, got {self.truncated_reward!r}")
-        if self.conditioning_source not in _CONDITIONING_SOURCES:
-            raise ValueError(
-                f"conditioning_source must be {'|'.join(_CONDITIONING_SOURCES)}, got {self.conditioning_source!r}"
-            )
         logger.info(
-            "RewardService initialized with backend=%s, truncated_reward=%s, conditioning_source=%s",
+            "RewardService initialized with backend=%s, truncated_reward=%s",
             backend.get_model_name() or type(backend).__name__,
             self.truncated_reward,
-            self.conditioning_source,
         )
 
     @property
@@ -140,7 +134,7 @@ class RewardService(Remote):
         if not frontier.primitives:
             raise ValueError("RewardService.score_and_attach: frontier Part has no generated primitives to score.")
 
-        request = _build_reward_request(sample, self.preferred_input_kind, self.conditioning_source)
+        request = _build_reward_request(sample, self.preferred_input_kind)
         reward_response = self.compute_rewards(request)
 
         failed = [(i, e) for i, (ok, e) in enumerate(zip(reward_response.successes, reward_response.errors)) if not ok]

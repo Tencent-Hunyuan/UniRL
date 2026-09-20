@@ -19,7 +19,7 @@ import torch
 from PIL import Image
 
 from unirl.config.require import require
-from unirl.reward.base import BaseRewardComponentSpec, RewardBackend
+from unirl.reward.base import PromptRewardComponentSpec, RewardBackend
 from unirl.types.reward import RewardRequest, RewardResponse
 
 logger = logging.getLogger(__name__)
@@ -165,6 +165,7 @@ class RemoteRewardBackend(RewardBackend):
             model_name="reward_service",
             batch_size=config.batch_size,
             timeout=config.timeout,
+            prompt_source=config.prompt_source,
         )
         self.base_url = config.base_url.rstrip("/")
         self.required_rewards = list(config.required_rewards)
@@ -264,7 +265,7 @@ class RemoteRewardBackend(RewardBackend):
     def _build_score_payload(self, request: RewardRequest) -> Dict[str, Any]:
         """Convert a UniRL ``RewardRequest`` into the RewardService"""
         images = request.images or []
-        prompts = request.prompts
+        prompts = self.prompts(request)
         metadata_list = request.metadata
         wire_requests: List[Dict[str, Any]] = []
 
@@ -319,14 +320,14 @@ class RemoteRewardBackend(RewardBackend):
         return {"protocol_version": "1", "requests": wire_requests}
 
     def _get_condition_images(self, request: RewardRequest) -> Optional[List[Union[Image.Image, torch.Tensor]]]:
-        """Extract per-sample condition images from request primitives."""
-        prim_image = request.primitives.get("image")
+        """Extract per-sample condition images from request conditioning."""
+        prim_image = request.conditioning.get("image")
         if prim_image is None:
             return None
         from unirl.types.primitives import Images
 
         if not isinstance(prim_image, Images):
-            raise TypeError(f"request.primitives['image'] must be Images, got {type(prim_image).__name__}")
+            raise TypeError(f"request.conditioning['image'] must be Images, got {type(prim_image).__name__}")
         from unirl.utils.media import tensor_frame_to_pil
 
         return [tensor_frame_to_pil(image.pixels) for image in prim_image.to_list()]
@@ -352,7 +353,7 @@ class RemoteRewardBackend(RewardBackend):
     def _build_video_score_payload(self, request: RewardRequest) -> Dict[str, Any]:
         """Convert a video ``RewardRequest`` into the RewardService ``ScoreRequest``"""
         videos = request.videos or []
-        prompts = request.prompts
+        prompts = self.prompts(request)
         metadata_list = request.metadata
         wire_requests: List[Dict[str, Any]] = []
 
@@ -581,7 +582,7 @@ class RemoteRewardBackend(RewardBackend):
 
 
 @dataclass
-class RemoteRewardSpec(BaseRewardComponentSpec):
+class RemoteRewardSpec(PromptRewardComponentSpec):
     """Typed config for the remote RewardService backend."""
 
     base_url: str = ""
