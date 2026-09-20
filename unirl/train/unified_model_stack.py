@@ -15,14 +15,13 @@ from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
 from unirl.train.backend.fsdp import FSDPBackend
 from unirl.train.stack import TrainStepResult
-from unirl.train.stack.base import _aggregate_update_results, _validate_anchor_contract
+from unirl.train.stack.base import _aggregate_update_results, _prepare_segment_anchors, _validate_anchor_contract
 from unirl.train.stack.planner import (
     CountPlanner,
     Plan,
     UpdatePlanner,
     _positive_int,
     arranged_slice,
-    restore_row_order,
 )
 from unirl.types.sample import Part, Sample
 from unirl.types.sampling import ARSamplingParams, DiffusionSamplingParams
@@ -80,33 +79,13 @@ class UnifiedModelTrainStack(Remote):
         self, algorithm: StageAlgorithm, part: Part, *, plans: Plan, order: Optional[torch.Tensor]
     ) -> None:
         """Freeze one algorithm's π_old anchor once, before the multi-update loop."""
-        if part.segment is None:
-            return
-        if not algorithm.recomputes_anchor:
-            algorithm.prepare_segment(conditions=part.conditions, segment=part.segment)
-            return
-        micro_slices = [micro_slice for update in plans for micro_slice in update]
-        if len(micro_slices) == 1:
-            algorithm.prepare_segment(conditions=part.conditions, segment=part.segment)
-            return
-        collected: Dict[str, List[torch.Tensor]] = {field: [] for field in algorithm.anchor_fields}
-        for start, end in micro_slices:
-            micro = arranged_slice(part, order, start, end)
-            algorithm.prepare_segment(conditions=micro.conditions, segment=micro.segment)
-            for field in collected:
-                value = getattr(micro.segment, field, None)
-                if value is None:
-                    raise RuntimeError(
-                        f"UnifiedModelTrainStack.prepare_segment: {type(algorithm).__name__} declares "
-                        f"anchor field {field!r} but a micro-slice produced None."
-                    )
-                collected[field].append(value)
-        for field, parts in collected.items():
-            setattr(
-                part.segment,
-                field,
-                restore_row_order(torch.cat(parts, dim=0), order, segment=part.segment, field=field),
-            )
+        _prepare_segment_anchors(
+            algorithm,
+            part,
+            [micro_slice for update in plans for micro_slice in update],
+            order,
+            caller="UnifiedModelTrainStack.prepare_segment",
+        )
 
     def _backward_part(
         self,
