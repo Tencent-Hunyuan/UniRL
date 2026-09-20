@@ -70,6 +70,7 @@ class TensorWeightSync(FullWeightSync):
 
         dist_ready = self._dist_ready()
         normalize_name = getattr(receiver, "normalize_tensor_weight_name", None)
+        fanout = int(getattr(receiver, "weight_payload_fanout", tp_size))
         for bucket, is_last in self._iter_buckets():
             if callable(normalize_name):
                 bucket = [(normalize_name(name), tensor) for name, tensor in bucket]
@@ -78,7 +79,6 @@ class TensorWeightSync(FullWeightSync):
                 by_dtype.setdefault(tensor.dtype, []).append((name, tensor))
             del name, tensor
 
-            fanout = int(getattr(receiver, "weight_payload_fanout", tp_size))
             sglang_tp_fanout = use_sglang and fanout > 1
             participates_in_sglang_tp = sglang_tp_fanout and dist_ready
 

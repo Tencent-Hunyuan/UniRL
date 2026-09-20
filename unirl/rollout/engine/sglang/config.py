@@ -147,13 +147,6 @@ class SGLangEngineConfig(BaseEngineConfig):
         intent: Dict[str, Any] = {}
 
         intent.update(self.engine_kwargs or {})
-        if "cuda_graph_max_bs" in intent:
-            require(
-                "cuda_graph_max_bs_decode" not in intent,
-                "SGLangEngineConfig.engine_kwargs cannot set both the retired "
-                "cuda_graph_max_bs alias and cuda_graph_max_bs_decode",
-            )
-            intent["cuda_graph_max_bs_decode"] = intent.pop("cuda_graph_max_bs")
 
         intent["model_path"] = self.pretrained_model_ckpt_path
         if self.tp_size is not None:
