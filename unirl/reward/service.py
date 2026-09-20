@@ -19,32 +19,17 @@ from .base import DifferentiableReward, RewardBackend
 logger = logging.getLogger(__name__)
 
 
-def _original_prompt(sample: Sample) -> Optional[Texts]:
-    """Align the root user prompt to the frontier by sample lineage."""
-    if not sample.parts:
-        return None
-    root = sample.parts[0]
-    prompt = root.primitives.get("text")
-    if prompt is None:
-        return None
-    if not isinstance(prompt, Texts):
-        raise TypeError(f"Root Part primitives['text'] must be Texts, got {type(prompt).__name__}.")
-    row_by_id = {sample_id: row for row, sample_id in enumerate(root.sample_ids)}
-    root_ids = sample.root_group_ids(-1)
-    missing = [sample_id for sample_id in root_ids if sample_id not in row_by_id]
-    if missing:
-        raise ValueError(f"Reward prompt lineage refers to unknown root sample ids: {missing[:3]!r}.")
-    rows = torch.tensor([row_by_id[sample_id] for sample_id in root_ids], dtype=torch.long)
-    return prompt.select(rows)
-
-
 def _build_reward_request(sample: Sample, preferred_input_kind: str) -> RewardRequest:
     """Assemble a :class:`RewardRequest` from a response ``Sample``."""
     frontier = sample.parts[-1]
+    original_prompt: Optional[Texts] = None
     generation_prompt: Optional[Texts] = None
     conditioning: Dict[str, PrimitiveValue] = {}
-    for prim in sample.conditioning():
+    for turn in sample.turns():
+        prim = turn.content
         if isinstance(prim, Texts):
+            if original_prompt is None:
+                original_prompt = prim
             generation_prompt = prim
         else:
             conditioning[primitive_modality_key(prim)] = prim
@@ -64,7 +49,7 @@ def _build_reward_request(sample: Sample, preferred_input_kind: str) -> RewardRe
     return RewardRequest(
         generated=generated,
         conditioning=conditioning,
-        original_prompt=_original_prompt(sample),
+        original_prompt=original_prompt,
         generation_prompt=generation_prompt,
         audio_sample_rate=audio_sample_rate,
         sample_ids=list(frontier.sample_ids),
