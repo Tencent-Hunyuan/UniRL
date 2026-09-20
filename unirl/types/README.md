@@ -28,10 +28,6 @@ breaking API change: there are no compatibility aliases for the retired types.
   and the role-aware `turns()`, `text_conditioning()`, and
   `vision_conditioning()` views align those ancestors to the frontier. Encoded
   conditions used for replay live on the generated `Part.conditions`.
-- Reward construction preserves both text meanings instead of collapsing them:
-  `RewardRequest.original_prompt` is root-aligned by sample ID,
-  `generation_prompt` is the nearest frontier conditioning text, and
-  `conditioning` carries only non-text source media.
 
 ## Construction mapping
 

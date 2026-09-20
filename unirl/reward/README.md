@@ -44,10 +44,8 @@ never mutates the input Sample — it returns a fresh one. Per call it:
 
 1. **Refuses precomputed rewards** — raises if the frontier Part already has
    `rewards` (actor-side scoring is the only writer).
-2. **Builds an explicit request** — `original_prompt` is aligned from the root by
-   sample lineage, `generation_prompt` is the nearest text that conditioned the
-   frontier, non-text source media goes in `conditioning`, and frontier media goes
-   in `generated`.
+2. **Builds the request** — pairs the frontier's generated media with its aligned
+   prompts and non-text conditioning.
 3. **Scores** — hands a typed `RewardRequest` to `backend.compute_rewards`, getting
    back rewards, per-component rewards, and per-sample success flags.
 4. **Fails fast** — raises and names the sample if any failed.
@@ -132,11 +130,5 @@ new remote reward needs no UniRL code — add it to the server and list its name
   unbounded.
 - **`base_device` is ignored by the remote backend** (it's HTTP-only); local
   scorers honor it, falling back to CPU with a warning if CUDA is unavailable.
-- **Prompt semantics are explicit on `RewardRequest`.** `original_prompt` is the
-  root user prompt; `generation_prompt` is the nearest text used to generate the
-  scored frontier. Backends declare `prompt_source: original|generation`, defaulting
-  to `generation` for compatibility. Intent judges such as the WISE PE recipe select
-  `original`; alignment scorers normally keep `generation`. `conditioning` contains
-  only non-text source media, such as the input image for EditReward or input video
-  for VideoCLIPDelta. All fields are aligned to final outputs by sample lineage, so
-  non-uniform fan-out does not require batch-ratio inference.
+- **Prompt-based rewards use the generation prompt by default.** Set
+  `prompt_source: original` to score against the original user prompt instead.
