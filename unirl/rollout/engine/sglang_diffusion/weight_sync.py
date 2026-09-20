@@ -185,10 +185,6 @@ class WeightSync:
         output = self._backend.weights_checksum(module_names=list(names))
         return {0: [{str(k): str(v) for k, v in output.items()}]}
 
-    def mark_weights_released(self) -> None:
-        """The engine released the runtime weights — the loaded LoRA pool is gone."""
-        self._lora_loaded = False
-
     @property
     def lora_dirty(self) -> bool:
         """True when LoRA is in use but the adapter must be (re)pushed before generate."""

@@ -11,11 +11,12 @@ _RESULT_SENTINEL = "_unirl_rtd_slice"
 def _rl_dataclasses():
     from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
         RolloutDebugTensors,
+        RolloutDenoisingEnv,
         RolloutDitTrajectory,
         RolloutTrajectoryData,
     )
 
-    return RolloutTrajectoryData, RolloutDitTrajectory, RolloutDebugTensors
+    return RolloutTrajectoryData, RolloutDitTrajectory, RolloutDebugTensors, RolloutDenoisingEnv
 
 
 def _require_uniform_presence(values: list, *, field: str) -> list | None:
@@ -52,9 +53,106 @@ def _shared_tensor(values: list, *, field: str) -> object:
     return first
 
 
+def _merge_env_tree(values: list, *, field: str, current_key: str | None = None):
+    """Merge per-output denoising metadata while preserving nested alignment."""
+    present = _require_uniform_presence(values, field=field)
+    if present is None:
+        return None
+    first = present[0]
+    if isinstance(first, torch.Tensor):
+        return _cat0(present, field=field)
+    if isinstance(first, dict):
+        keys = set(first)
+        if any(not isinstance(value, dict) or set(value) != keys for value in present):
+            raise ValueError(f"Grouped rollout field {field!r} has mismatched dict keys")
+        return {
+            key: _merge_env_tree(
+                [value[key] for value in present],
+                field=f"{field}.{key}",
+                current_key=key,
+            )
+            for key in first
+        }
+    if isinstance(first, list):
+        if any(not isinstance(value, list) for value in present):
+            raise TypeError(f"Grouped rollout field {field!r} has mixed container types")
+        if current_key == "img_shapes":
+            return [item for value in present for item in value]
+        if any(len(value) != len(first) for value in present):
+            raise ValueError(f"Grouped rollout field {field!r} has mismatched list lengths")
+        return [
+            _merge_env_tree(
+                [value[index] for value in present],
+                field=f"{field}[{index}]",
+                current_key=current_key,
+            )
+            for index in range(len(first))
+        ]
+    if isinstance(first, tuple):
+        if any(not isinstance(value, tuple) or len(value) != len(first) for value in present):
+            raise ValueError(f"Grouped rollout field {field!r} has mismatched tuples")
+        return tuple(
+            _merge_env_tree(
+                [value[index] for value in present],
+                field=f"{field}[{index}]",
+                current_key=current_key,
+            )
+            for index in range(len(first))
+        )
+    if any(value != first for value in present[1:]):
+        raise ValueError(f"Grouped rollout field {field!r} differs across outputs")
+    return first
+
+
+def _slice_env_tree(value, idx: int, batch_size: int, *, field: str, current_key: str | None = None):
+    """Slice one output from nested denoising metadata, keeping tensor batch dims."""
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        if value.dim() >= 1 and int(value.shape[0]) == batch_size:
+            return value[idx : idx + 1].contiguous()
+        return value
+    if isinstance(value, dict):
+        return {
+            key: _slice_env_tree(
+                child,
+                idx,
+                batch_size,
+                field=f"{field}.{key}",
+                current_key=key,
+            )
+            for key, child in value.items()
+        }
+    if isinstance(value, list):
+        if current_key == "img_shapes" and len(value) == batch_size:
+            return [value[idx]]
+        return [
+            _slice_env_tree(
+                child,
+                idx,
+                batch_size,
+                field=f"{field}[{index}]",
+                current_key=current_key,
+            )
+            for index, child in enumerate(value)
+        ]
+    if isinstance(value, tuple):
+        return tuple(
+            _slice_env_tree(
+                child,
+                idx,
+                batch_size,
+                field=f"{field}[{index}]",
+                current_key=current_key,
+            )
+            for index, child in enumerate(value)
+        )
+    return value
+
+
 def _concat_rollout_trajectory_data(output_batches: list):
     """Build ONE ``RolloutTrajectoryData`` concatenated across the per-output batches."""
-    RolloutTrajectoryData, RolloutDitTrajectory, RolloutDebugTensors = _rl_dataclasses()
+    RolloutTrajectoryData, RolloutDitTrajectory, RolloutDebugTensors, RolloutDenoisingEnv = _rl_dataclasses()
 
     rtds = _require_uniform_presence(
         [getattr(ob, "rollout_trajectory_data", None) for ob in output_batches],
@@ -64,8 +162,6 @@ def _concat_rollout_trajectory_data(output_batches: list):
         return None
     if len(rtds) == 1:
         return rtds[0]
-
-    first = rtds[0]
 
     new_dit = None
     dit_trajectories = _require_uniform_presence(
@@ -114,13 +210,38 @@ def _concat_rollout_trajectory_data(output_batches: list):
             rollout_model_outputs=_dbg("rollout_model_outputs"),
         )
 
+    new_env = None
+    denoising_envs = _require_uniform_presence(
+        [rtd.denoising_env for rtd in rtds],
+        field="denoising_env",
+    )
+    if denoising_envs is not None:
+        new_env = RolloutDenoisingEnv(
+            image_kwargs=_merge_env_tree(
+                [env.image_kwargs for env in denoising_envs],
+                field="denoising_env.image_kwargs",
+            ),
+            pos_cond_kwargs=_merge_env_tree(
+                [env.pos_cond_kwargs for env in denoising_envs],
+                field="denoising_env.pos_cond_kwargs",
+            ),
+            neg_cond_kwargs=_merge_env_tree(
+                [env.neg_cond_kwargs for env in denoising_envs],
+                field="denoising_env.neg_cond_kwargs",
+            ),
+            guidance=_merge_env_tree(
+                [env.guidance for env in denoising_envs],
+                field="denoising_env.guidance",
+            ),
+        )
+
     return RolloutTrajectoryData(
         rollout_log_probs=_cat0(
             [rtd.rollout_log_probs for rtd in rtds],
             field="rollout_log_probs",
         ),
         rollout_debug_tensors=new_debug,
-        denoising_env=first.denoising_env,
+        denoising_env=new_env,
         dit_trajectory=new_dit,
     )
 
@@ -138,11 +259,56 @@ def _slice_row_keepdim(t, idx: int):
     return t[idx : idx + 1].contiguous()
 
 
+def _first_tensor_batch_size(value) -> int | None:
+    if isinstance(value, torch.Tensor) and value.dim() >= 1:
+        return int(value.shape[0])
+    if isinstance(value, dict):
+        children = value.values()
+    elif isinstance(value, (list, tuple)):
+        children = value
+    else:
+        return None
+    for child in children:
+        size = _first_tensor_batch_size(child)
+        if size is not None:
+            return size
+    return None
+
+
+def _trajectory_batch_size(rtd) -> int:
+    candidates = [rtd.rollout_log_probs]
+    if rtd.dit_trajectory is not None:
+        candidates.append(rtd.dit_trajectory.latents)
+    if rtd.rollout_debug_tensors is not None:
+        candidates.extend(
+            [
+                rtd.rollout_debug_tensors.rollout_variance_noises,
+                rtd.rollout_debug_tensors.rollout_prev_sample_means,
+                rtd.rollout_debug_tensors.rollout_noise_std_devs,
+                rtd.rollout_debug_tensors.rollout_model_outputs,
+            ]
+        )
+    if rtd.denoising_env is not None:
+        candidates.extend(
+            [
+                rtd.denoising_env.guidance,
+                rtd.denoising_env.image_kwargs,
+                rtd.denoising_env.pos_cond_kwargs,
+                rtd.denoising_env.neg_cond_kwargs,
+            ]
+        )
+    for candidate in candidates:
+        size = _first_tensor_batch_size(candidate)
+        if size is not None:
+            return size
+    raise ValueError("Grouped rollout data has no batched tensor to determine output count")
+
+
 def _slice_rollout_trajectory_keepdim(rtd, idx: int):
     """Per-output slice of a concatenated ``[K, ...]`` trajectory, keep-dim."""
     if rtd is None:
         return None
-    RolloutTrajectoryData, RolloutDitTrajectory, RolloutDebugTensors = _rl_dataclasses()
+    RolloutTrajectoryData, RolloutDitTrajectory, RolloutDebugTensors, RolloutDenoisingEnv = _rl_dataclasses()
 
     new_dit = None
     if rtd.dit_trajectory is not None:
@@ -165,10 +331,41 @@ def _slice_rollout_trajectory_keepdim(rtd, idx: int):
             rollout_model_outputs=_slice_row_keepdim(d.rollout_model_outputs, idx),
         )
 
+    new_env = None
+    if rtd.denoising_env is not None:
+        env = rtd.denoising_env
+        batch_size = _trajectory_batch_size(rtd)
+        new_env = RolloutDenoisingEnv(
+            image_kwargs=_slice_env_tree(
+                env.image_kwargs,
+                idx,
+                batch_size,
+                field="denoising_env.image_kwargs",
+            ),
+            pos_cond_kwargs=_slice_env_tree(
+                env.pos_cond_kwargs,
+                idx,
+                batch_size,
+                field="denoising_env.pos_cond_kwargs",
+            ),
+            neg_cond_kwargs=_slice_env_tree(
+                env.neg_cond_kwargs,
+                idx,
+                batch_size,
+                field="denoising_env.neg_cond_kwargs",
+            ),
+            guidance=_slice_env_tree(
+                env.guidance,
+                idx,
+                batch_size,
+                field="denoising_env.guidance",
+            ),
+        )
+
     return RolloutTrajectoryData(
         rollout_log_probs=_slice_row_keepdim(rtd.rollout_log_probs, idx),
         rollout_debug_tensors=new_debug,
-        denoising_env=rtd.denoising_env,
+        denoising_env=new_env,
         dit_trajectory=new_dit,
     )
 

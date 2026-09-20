@@ -186,7 +186,6 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
             return
         self._backend.release_memory()
         self._is_offloaded = True
-        self._weight_sync.mark_weights_released()
         logger.info("sglang_diffusion engine slept (release_memory_occupation).")
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
