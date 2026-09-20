@@ -142,6 +142,22 @@ in `backend/base.py`; a multi-update-capable algorithm sets
   `NCCL_CTA_POLICY` must stay unset or `2`. WORLD keeps the usual `cpu:gloo,cuda:nccl`
   pair, so in `hybrid` mode torch logs one `ProcessGroupGloo::split ... Falling back to
   default options` warning per process while splitting the gloo half; it is expected.
+- **`frozen_adapters` (OPD teachers) load their weights *after* materialization, not at
+  injection** — `inject_frozen_adapter` only builds the adapter structure pre-wrap (meta-safe,
+  so VeOmni meta-init bundles work) and registers a `defer_after_materialize` op that reads
+  the peft checkpoint on every rank, maps `base_model.model.<m>.lora_A.weight` to
+  `<m>.lora_A.<name>.weight`, refuses unexpected / missing / mis-shaped tensors, and
+  reshards via `set_model_state_dict(full_state_dict=True)`. Anything that reads teacher
+  weights before `apply_deferred_ops` gets something other than the checkpoint: peft's random
+  `lora_A` over a zeroed `lora_B` (a null teacher) on an eager bundle, and *uninitialized*
+  storage on a meta-init one, because `to_empty` wipes whatever peft wrote. `inject_lora`
+  defers `_reset_adapter` for the trainable adapter for exactly the same reason.
+- **Adapter checkpoints hold only the trainable adapter(s); frozen adapters are excluded on
+  save *and* load** — they are re-created from `frozen_adapters` paths at build time, so
+  loading them back would silently pin an old teacher over a changed recipe. The checkpoint
+  records each frozen adapter's weight sha256 under `lora_config.frozen_adapters`, and
+  `load` raises when the live set or any hash differs (checkpoints written before this
+  field exist load without the check).
 
 ## Profiling → Perfetto
 

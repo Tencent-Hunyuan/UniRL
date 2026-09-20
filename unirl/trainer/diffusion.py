@@ -1007,8 +1007,8 @@ class DiffusionTrainer(BaseTrainer):
                 )
         for _ in range(start_rollout):
             self.data_source.get_samples(self.batch_size)
-        self._init_wandb(num_rollouts=num_rollouts)
         try:
+            self._init_wandb(num_rollouts=num_rollouts)
             if self.eval_interval > 0:
                 self.evaluate(start_rollout)
             for window_start in range(start_rollout, num_rollouts, acc):
@@ -1027,4 +1027,8 @@ class DiffusionTrainer(BaseTrainer):
                     final_id, num_rollouts, save_interval=save_interval, save_dir=save_dir, save_mode=save_mode
                 )
         finally:
-            self._finish_wandb()
+            cleanup_steps: List[Tuple[str, Callable[[], None]]] = [("wandb", self._finish_wandb)]
+            algorithm_shutdown = getattr(self.algorithm, "shutdown", None)
+            if callable(algorithm_shutdown):
+                cleanup_steps.insert(0, ("algorithm", algorithm_shutdown))
+            _run_cleanup_steps(cleanup_steps)

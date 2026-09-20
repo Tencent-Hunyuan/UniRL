@@ -88,6 +88,27 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   so `stage.replay` still emits log-probs) **with `add_kl_coefficient=false`**. Never pair a
   near-zero `eta` with `add_kl_coefficient=true` — the KL divides by a transition std that
   scales with `eta` (the algorithm raises at init on `eta == 0`, but cannot judge "too small").
+- **`_transition_sigma` is `[1, S']`; `_gaussian_kl_div` broadcasts it to the means' rank** —
+  image means are `[B, S', C, H, W]` and video means `[B, S', C, T, H, W]`. The old fixed
+  `[1, S', 1, 1, 1]` right-aligned `S'` onto the channel axis for video: a raise when
+  `C != S'`, a silently mis-scaled per-step KL when `C == S'`. Never reshape sigma to a
+  hardcoded rank in a new consumer; pass the `[1, S']` tensor through `_gaussian_kl_div`.
+- **`DiffusionTeacherProvider` contract, lifecycle, and isolation** — `DiffusionOPD`
+  delegates teacher replay to a `DiffusionTeacherProvider`. Replay always runs under
+  `torch.no_grad()` and returns detached means `[B, S', *latent]`, never leaking teacher
+  gradients or entering the student optimizer/checkpoint (`assert_isolation`).
+  `FullModelTeacherProvider` provides explicit device placement and CPU offload/wake
+  management (`offload_to_cpu: true`); its `teardown_on_failure` contract ensures any
+  associated remote role or pinned GPU memory is cleaned up if replay raises.
+- **Full-model teacher ownership** — pass a teacher-owned `stage`, a teacher `model`
+  to bind to a copy of the student's stage, or both with `model is stage.model`.
+  Explicit mismatches fail before freezing or moving parameters. Stage-only providers
+  use `stage.model` for freezing, isolation, placement, and replay. When the student's
+  stage consumes a bundle, supply a compatible teacher bundle including its replay
+  configuration; a bare transformer is rejected rather than wrapped with missing
+  attributes. Placement manages the replay transformer, not auxiliary encoders/decoders.
+  D3 targets synchronous same-family SD3.5-M teachers; other-family end-to-end
+  validation remains D4 work.
 - **AR `sampling_temperature` must equal the rollout `sampling.temperature`** —
   `ARStage.replay` rescales logits by it (`log_softmax(logits / T)`) to match SGLang's
   distribution; when unset it silently falls back to the `ARSamplingParams` default,
