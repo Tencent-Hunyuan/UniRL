@@ -10,8 +10,6 @@ _HANDLERS_SENTINEL = "_unirl_rl_handlers"
 
 def patch_scheduler() -> None:
     """Add distributed sync while preserving v0.5.19 handlers."""
-    _patch_scheduler_client_fanout()
-
     from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
     from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 
@@ -92,28 +90,3 @@ def patch_scheduler() -> None:
 
         __init__._unirl_request_handlers = True  # type: ignore[attr-defined]
         Scheduler.__init__ = __init__
-
-
-def _patch_scheduler_client_fanout() -> None:
-    """Treat any DP replica's explicit failure payload as a fanout failure."""
-    import sglang.multimodal_gen.runtime.scheduler_client as scheduler_client
-    from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
-
-    orig = scheduler_client._merge_fanout_results
-    if getattr(orig, "_unirl_failure_payload", False):
-        return
-
-    def _merge_fanout_results(results):
-        for result in results:
-            if not isinstance(result, OutputBatch):
-                continue
-            if result.error:
-                return result
-            output = result.output
-            if isinstance(output, dict) and not bool(output.get("success", True)):
-                message = str(output.get("message", "replica operation failed"))
-                return OutputBatch(output=output, error=message)
-        return orig(results)
-
-    _merge_fanout_results._unirl_failure_payload = True  # type: ignore[attr-defined]
-    scheduler_client._merge_fanout_results = _merge_fanout_results

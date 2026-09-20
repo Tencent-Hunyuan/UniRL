@@ -54,15 +54,15 @@ Re-homed fork surface:
 
 | Module | What stock upstream does wrong | DELETE-WHEN |
 | --- | --- | --- |
-| `patch_gpu_worker.py` | Upstream owns tensor/LoRA updates and CPU sleep/wake; UniRL adds external-process-group broadcasts, flattened-bucket payload support, TeaCache reset, atomic native-sleep rollback including nested tensor attributes, and rank-wide failure aggregation | upstream accepts external distributed broadcasts/UniRL's flattened payload and makes native sleep rollback + rank status atomic |
-| `patch_scheduler.py` | Registers the UniRL-only distributed-group verbs and propagates explicit DP-replica failure payloads | upstream accepts external distributed broadcasts and merges failure payloads across replicas |
+| `patch_gpu_worker.py` | Upstream owns tensor/LoRA updates and CPU sleep/wake; UniRL adds external-process-group broadcasts, flattened-bucket payload support, TeaCache reset, and atomic native-sleep rollback including nested tensor attributes | upstream accepts external distributed broadcasts/UniRL's flattened payload and makes native sleep rollback atomic |
+| `patch_scheduler.py` | Registers the UniRL-only distributed-group verbs | upstream accepts external distributed broadcasts |
 | `patch_safe_unpickler.py` | sglang's `SafeUnpickler` (CVE-2025-10164 mitigation) allowlists `builtins`/`torch`/… but **not** `unirl.`, so the first full-weight push dies. Must be installed **in every process that deserializes** | upstream allowlists are configurable |
 
 Driver-authoritative rollout contract — these are what keep the GRPO ratio honest:
 
 | Module | What stock upstream does wrong | DELETE-WHEN |
 | --- | --- | --- |
-| `patch_rollout_trajectory.py` | **The gradient-killer.** `_merge_expanded_singletons` keeps only output 0's trajectory/denoising metadata, so grouped requests can reuse another output's policy data → advantages cancel or replay conditions misalign. The patch concatenates and re-slices every batched field and fails closed on partial/mismatched metadata | upstream merges per-output trajectories and denoising environments |
+| `patch_rollout_trajectory.py` | **The gradient-killer.** `_merge_expanded_singletons` keeps only output 0's trajectory, so grouped requests can reuse another output's policy data → advantages cancel. The patch concatenates/re-slices typed trajectory fields and fails closed on partial/mismatched or unbatchable denoising metadata | upstream merges per-output trajectories with explicit batch metadata |
 | `patch_set_timesteps.py` | `FlowMatchEulerDiscreteScheduler.set_timesteps` **always** shifts provided sigmas, double-shifting the driver's already-final schedule (`sigma_verify` then fails). Three mutation paths must all be neutralized — the old `mu = 0.0` trick is identity only for `exponential` and **zeroes the schedule** under `linear` | upstream honours provided σ verbatim |
 | `patch_sampling_io.py` | `SamplingParams` rejects the driver fields. They must be injected as **real dataclass fields**, because upstream `generate` runs `dataclasses.replace` per prompt and would silently drop plain attributes. Multi-prompt driver noise/audio/seeds must also be partitioned first by prompt and then by expanded output | upstream carries and correctly partitions the fields |
 | `patch_latent_prep.py` | The provided-latents branch is only `latents.to(device)`: it neither expands `[1, …]` to per-sample `[batch_size, …]` nor runs packing, so packed models (FLUX.2-Klein / M3) leave `batch.latent_ids = None` → `AttributeError` in `get_freqs_cis` | upstream mirrors the randn branch |

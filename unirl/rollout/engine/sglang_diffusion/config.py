@@ -67,14 +67,17 @@ class SGLangDiffusionEngineConfig(BaseEngineConfig):
             f"SGLangDiffusionEngineConfig.model_family must be one of {set(valid_families)}; got {self.model_family!r}",
         )
 
-        require(self.num_gpus >= 1, f"num_gpus must be >= 1; got {self.num_gpus!r}")
         require(
-            self.tp_size is None or self.tp_size >= 1,
-            f"tp_size must be >= 1 when set; got {self.tp_size!r}",
+            self.num_gpus == 1,
+            f"SGLang diffusion supports one GPU per UniRL rollout worker; got num_gpus={self.num_gpus!r}",
         )
         require(
-            self.sp_degree is None or self.sp_degree >= 1,
-            f"sp_degree must be >= 1 when set; got {self.sp_degree!r}",
+            self.tp_size in (None, 1),
+            f"SGLang diffusion internal TP is unsupported; got tp_size={self.tp_size!r}",
+        )
+        require(
+            self.sp_degree in (None, 1),
+            f"SGLang diffusion internal SP is unsupported; got sp_degree={self.sp_degree!r}",
         )
         require(
             self.forward_batch_size is None or self.forward_batch_size >= 1,
@@ -124,6 +127,13 @@ class SGLangDiffusionEngineConfig(BaseEngineConfig):
 
         if extra:
             intent.update(extra)
+
+        for key in ("num_gpus", "tp_size", "sp_degree", "dp_size"):
+            require(
+                int(intent.get(key, 1)) == 1,
+                f"SGLang diffusion {key} must be 1 because UniRL runs one GPU per rollout worker; "
+                f"got {intent.get(key)!r}",
+            )
 
         if ports is not None:
             intent["port"] = ports.server_port
