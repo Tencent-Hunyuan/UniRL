@@ -9,10 +9,11 @@
 
 ## What it is
 
-17 modules installed by one idempotent `SglangDiffusionHijack.hijack()`
-(`hijack.py`). Every patch is `setattr`, dataclass-field injection, or an
-AROUND-wrap — **no sglang source is edited**, so a version bump is a re-pin, not a
-re-merge.
+13 patches are installed by one idempotent `SglangDiffusionHijack.hijack()`
+(`hijack.py`), backed by 2 support modules (`io_struct.py` and
+`memory_saver.py`). Every patch is `setattr`, dataclass-field injection, or an
+AROUND-wrap — **no sglang source is edited**, so a version bump is a re-pin, not
+a re-merge.
 
 ## Why it exists
 

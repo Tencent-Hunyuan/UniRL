@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import socket
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -21,43 +20,12 @@ _LOAD_BEARING_SERVER_ARGS = frozenset(
 )
 
 
-def _bind_tcp_port(port: int) -> socket.socket:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        sock.bind(("", int(port)))
-    except Exception:
-        sock.close()
-        raise
-    return sock
-
-
 @dataclass(frozen=True)
 class SGLangPorts(ReservedPorts):
     """The ports one SRT server spawn consumes."""
 
     server_port: int
     nccl_port: int
-
-    def __post_init__(self) -> None:
-        super().__post_init__()
-
-    @classmethod
-    def reserve(cls) -> "SGLangPorts":
-        """Reserve SGLang HTTP and NCCL ports on this node."""
-        socks = []
-        try:
-            server_sock = _bind_tcp_port(0)
-            socks.append(server_sock)
-            nccl_sock = _bind_tcp_port(0)
-            socks.append(nccl_sock)
-            return cls(
-                server_port=server_sock.getsockname()[1],
-                nccl_port=nccl_sock.getsockname()[1],
-            )
-        finally:
-            for sock in socks:
-                sock.close()
 
 
 @dataclass

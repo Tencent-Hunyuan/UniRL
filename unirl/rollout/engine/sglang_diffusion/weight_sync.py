@@ -49,7 +49,6 @@ class WeightSync:
         self._pipeline_prefix = pipeline_prefix
         self._target_modules = list(target_modules)
         self._uses_lora = uses_lora
-        self._active_adapter: Optional[str] = None
         self._lora_loaded = False
 
     def update_weights_from_tensor(
@@ -149,7 +148,6 @@ class WeightSync:
                 lora_alpha=(int(adapter_alpha) if adapter_alpha is not None else None),
                 lora_rank=(int(adapter_rank) if adapter_rank is not None else None),
             )
-        self._active_adapter = adapter_name
         self._lora_loaded = True
 
         layer_names = set()

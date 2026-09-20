@@ -12,13 +12,12 @@ from unirl.rollout.engine.sglang_diffusion.backends.base import RawResult
 logger = logging.getLogger(__name__)
 
 
-def _stage_lora_tensors_for_ipc(lora_tensors: Dict[str, Any], *, device: Optional[torch.device] = None):
+def _stage_lora_tensors_for_ipc(lora_tensors: Dict[str, Any]):
     """Move CPU adapter tensors onto CUDA before the UUID-aware reduction hook."""
     has_cpu_tensor = any(torch.is_tensor(tensor) and tensor.device.type == "cpu" for tensor in lora_tensors.values())
     if not has_cpu_tensor:
         return lora_tensors
-    if device is None:
-        device = torch.device("cuda", torch.cuda.current_device())
+    device = torch.device("cuda", torch.cuda.current_device())
     return {
         name: tensor.to(device) if torch.is_tensor(tensor) and tensor.device.type == "cpu" else tensor
         for name, tensor in lora_tensors.items()

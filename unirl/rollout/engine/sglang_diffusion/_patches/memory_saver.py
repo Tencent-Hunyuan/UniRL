@@ -68,6 +68,10 @@ class MemorySaverHandler:
     def enabled(self) -> bool:
         return self.adapter.enabled
 
+    @property
+    def is_sleeping(self) -> bool:
+        return bool(self._paused_tags)
+
     def modules_for_tag(self, tag: str) -> dict[str, torch.nn.Module]:
         """Return pipeline modules belonging to a given region tag."""
         modules = get_updatable_modules(self.pipeline)

@@ -5,14 +5,6 @@ from __future__ import annotations
 import torch
 
 
-def _memory_saver_options(server_args) -> tuple[bool, bool]:
-    """Read memory-saver knobs that are optional on diffusion ServerArgs."""
-    return (
-        bool(getattr(server_args, "enable_memory_saver", False)),
-        bool(getattr(server_args, "pin_cpu_memory", True)),
-    )
-
-
 def patch_gpu_worker() -> None:
     """Extend the v0.5.19 worker without replacing its native post-training API."""
     from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
@@ -33,7 +25,8 @@ def patch_gpu_worker() -> None:
                 MemorySaverHandler,
             )
 
-            enable_memory_saver, pin_cpu_memory = _memory_saver_options(self.server_args)
+            enable_memory_saver = bool(getattr(self.server_args, "enable_memory_saver", False))
+            pin_cpu_memory = bool(getattr(self.server_args, "pin_cpu_memory", True))
             self._weights_update_groups: dict = {}
             self._memory_saver = MemorySaverHandler(
                 adapter=TorchMemorySaverAdapter.create(enable=enable_memory_saver),
@@ -41,7 +34,6 @@ def patch_gpu_worker() -> None:
                 local_rank=self.local_rank,
                 pin_cpu_memory=pin_cpu_memory,
             )
-            self._memory_saver_sleeping = False
             self._dirty_modules = self._memory_saver.dirty_modules
 
         __init__._unirl_gpu_worker = True  # type: ignore[attr-defined]
@@ -57,7 +49,7 @@ def patch_gpu_worker() -> None:
 
     def is_sleeping(self) -> bool:
         if self._memory_saver.enabled:
-            return self._memory_saver_sleeping
+            return self._memory_saver.is_sleeping
         return orig_is_sleeping(self)
 
     def release_memory_occupation(
@@ -67,28 +59,24 @@ def patch_gpu_worker() -> None:
     ) -> dict:
         if not self._memory_saver.enabled:
             return orig_release_memory(self)
-        if self._memory_saver_sleeping:
+        if self._memory_saver.is_sleeping:
             return {
                 "success": True,
                 "sleeping": True,
                 "message": "already sleeping",
             }
-        result = self._memory_saver.release(tags, cpu_backup_tags)
-        self._memory_saver_sleeping = bool(result.get("sleeping", False))
-        return result
+        return self._memory_saver.release(tags, cpu_backup_tags)
 
     def resume_memory_occupation(self, tags: list[str] | None = None) -> dict:
         if not self._memory_saver.enabled:
             return orig_resume_memory(self)
-        if not self._memory_saver_sleeping:
+        if not self._memory_saver.is_sleeping:
             return {
                 "success": True,
                 "sleeping": False,
                 "message": "already awake",
             }
-        result = self._memory_saver.resume(tags)
-        self._memory_saver_sleeping = bool(result.get("sleeping", False))
-        return result
+        return self._memory_saver.resume(tags)
 
     def update_weights_from_tensor(self, req) -> tuple[bool, str]:
         success, message = orig_update_from_tensor(self, req)
