@@ -29,11 +29,26 @@ class WindowConfig:
     exp_decay_k: float = 0.1
 
     def __post_init__(self) -> None:
+        if self.strategy != "all" and self.window_size < 1:
+            raise ValueError(f"WindowConfig requires window_size >= 1, got {self.window_size}")
+        if self.strategy in ("progressive", "decay", "exp_decay"):
+            if not 0 <= self.overlap_size < self.window_size:
+                raise ValueError(
+                    f"WindowConfig({self.strategy}) requires 0 <= overlap_size < window_size, "
+                    f"got overlap_size={self.overlap_size}, window_size={self.window_size}"
+                )
+            if self.iters_per_window < 1:
+                raise ValueError(f"WindowConfig requires iters_per_window >= 1, got {self.iters_per_window}")
         if self.strategy == "decay":
             if self.max_iters_per_window is None:
                 self.max_iters_per_window = self.iters_per_window
             if self.min_iters_per_window is None:
                 self.min_iters_per_window = max(1, self.iters_per_window // 4)
+            lo, hi = self.min_iters_per_window, self.max_iters_per_window
+            if lo is None or hi is None or lo < 1 or hi < lo:
+                raise ValueError(
+                    f"WindowConfig(decay) requires 1 <= min_iters_per_window <= max_iters_per_window, got ({lo}, {hi})"
+                )
 
 
 class TimestepScheduler(ABC):
@@ -121,12 +136,6 @@ class WindowScheduler(TimestepScheduler):
                 f"Bad strategy configuration for WindowScheduler: {self.config.strategy}. "
                 f"Available options: {set(self.WINDOW_STRATEGY_TO_METHOD_NAME.keys())}"
             )
-        if self.config.strategy == "decay":
-            lo, hi = self.config.min_iters_per_window, self.config.max_iters_per_window
-            if lo is None or hi is None or lo < 1 or hi < lo:
-                raise ValueError(
-                    f"WindowScheduler(decay) requires 1 <= min_iters_per_window <= max_iters_per_window, got ({lo}, {hi})"
-                )
 
     def get_sde_indices(self, step: Optional[int] = None) -> Set[int]:
         if self.config.strategy == "all":
