@@ -158,6 +158,11 @@ enabled, which UniRL's rollout backend does not do.
 
 ## Gotchas
 
+- **SGLang diffusion tensor LoRA accepts standard PEFT LoRA only.** A global
+  `lora_alpha` is supported; rsLoRA, DoRA, per-layer alpha patterns, and PEFT
+  auxiliary features fail closed. Adapter-only and full-weight sync are
+  mutually exclusive for one engine lifetime because dynamic LoRA replaces
+  DiT linear modules with wrappers whose base-weight names differ.
 - **Never recompute σ inside an engine** — the generated Part's pinned sigmas are
   the single source of truth; `engine/sigma_verify.py` checks the backend echo (it
   guards the GRPO log-prob ratio).

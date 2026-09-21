@@ -61,6 +61,7 @@ class WeightSync:
         self._target_modules = list(target_modules)
         self._uses_lora = uses_lora
         self._lora_loaded = False
+        self._lora_initialized = False
 
     def update_weights_from_tensor(
         self,
@@ -72,6 +73,7 @@ class WeightSync:
     ) -> None:
         if not serialized_named_tensors:
             raise ValueError("serialized_named_tensors must be non-empty")
+        self._require_full_update_allowed("tensor weight update")
         update_targets = self._single_update_target(
             target_modules,
             operation="tensor weight update",
@@ -114,6 +116,7 @@ class WeightSync:
     ) -> None:
         if not names:
             raise ValueError("names must be non-empty for distributed update")
+        self._require_full_update_allowed("distributed weight update")
         update_targets = self._single_update_target(
             target_modules,
             operation="distributed weight update",
@@ -126,6 +129,14 @@ class WeightSync:
             target_modules=update_targets,
             flush_cache=flush_cache,
         )
+
+    def _require_full_update_allowed(self, operation: str) -> None:
+        if self._lora_initialized:
+            raise RuntimeError(
+                f"SGLang diffusion {operation} is unsafe after dynamic LoRA initialization: "
+                "SGLang replaces DiT linear modules with LoRA wrappers, so later base-weight "
+                "names are skipped. Use one sync mode for the engine lifetime or restart the engine."
+            )
 
     def _single_update_target(
         self,
@@ -152,6 +163,32 @@ class WeightSync:
         peft_config: Optional[dict] = None,
     ) -> None:
         """Push a LoRA adapter from in-memory tensors."""
+        if peft_config is not None:
+            unsupported = {
+                field
+                for field in (
+                    "alora_invocation_tokens",
+                    "alpha_pattern",
+                    "fan_in_fan_out",
+                    "layer_replication",
+                    "lora_bias",
+                    "modules_to_save",
+                    "target_parameters",
+                    "trainable_token_indices",
+                    "use_bdlora",
+                    "use_dora",
+                    "use_qalora",
+                    "use_rslora",
+                )
+                if peft_config.get(field)
+            }
+            if peft_config.get("bias") not in (None, "none"):
+                unsupported.add("bias")
+            if unsupported:
+                raise ValueError(
+                    "SGLang diffusion tensor LoRA sync supports standard PEFT LoRA only; "
+                    f"unsupported config fields: {sorted(unsupported)}"
+                )
         stripped = adapt_lora_for_sglang(
             lora_tensors,
             pipeline_prefix=self._pipeline_prefix,
@@ -166,6 +203,9 @@ class WeightSync:
         lora_alpha = int(adapter_alpha) if adapter_alpha is not None else None
         grouped = _partition_lora_tensors(stripped, self._target_modules)
         self._lora_loaded = False
+        # Conversion may happen before a backend error is returned. From this point,
+        # conservatively forbid base/full updates for the lifetime of the engine.
+        self._lora_initialized = True
         group_count = len(grouped)
         for index, (target_module, target_tensors) in enumerate(grouped.items()):
             try:
