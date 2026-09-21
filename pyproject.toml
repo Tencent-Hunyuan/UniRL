@@ -59,6 +59,8 @@ unirl_runtime = "unirl.rollout.engine.vllm_omni.plugin:register_unirl_runtime"
 # (upgrade pending; verified meanwhile via a 2.34-prefixed python).
 sglang = [
   "sglang[diffusion]==0.5.12.post1 ; sys_platform == 'linux'",
+  # Required by SGLang's update_weights_from_ipc implementation.
+  "checkpoint-engine==0.4.2 ; sys_platform == 'linux'",
   # sglang leaves kernels unpinned; transformers 5.6.0 requires its 0.12 API.
   # The vllm extra conflicts with this extra and resolves its own 0.14.1 pin.
   "kernels>=0.12,<0.13 ; sys_platform == 'linux'",

@@ -61,6 +61,12 @@ handler in `../../distributed/weight_sync`.
 - **An engine that will serve as an agentic inner must make `generate` safe for
   concurrent callers** — the agentic coordinator drives one trajectory per drain
   thread.
+- **Unknown SGLang `engine_kwargs` are dropped at boot.** HTTP/native backends
+  filter intent against live `ServerArgs`. Typos used to fail silently; they now
+  warn, or raise if `UNIRL_SGLANG_STRICT_SERVER_ARGS=1`. UniRL-only keys
+  (`concurrency`, `advertise_host`, `health_timeout_s`) are expected drops.
+  Recipe-facing colocate/async knobs live in [`../README.md`](../README.md)
+  (SGLang AR knobs).
 - **SGLang LoRA serialization is topology-sensitive.** TP1 keeps
   `MultiprocessingSerializer` and requires the server to inherit the sender's
   multiprocessing authkey. TP>1 cannot broadcast its one-shot file descriptors, so
