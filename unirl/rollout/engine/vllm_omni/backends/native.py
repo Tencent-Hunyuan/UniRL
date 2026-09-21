@@ -63,34 +63,18 @@ def _resolve_deploy_config(name: str) -> str:
     return path
 
 
-def _cfg_get(cfg: Any, key: str, default: Any = None) -> Any:
-    """Mapping/OmegaConf/attr-tolerant getter (``None`` coerces to default)."""
-    if cfg is None:
-        return default
-    getter = getattr(cfg, "get", None)
-    value = getter(key, default) if callable(getter) else getattr(cfg, key, default)
-    return default if value is None else value
-
-
 def _tp_from_stage_configs(stage_configs: Sequence[Any]) -> Dict[int, int]:
     """Extract ``{stage_id: tensor_parallel_size}`` from the runtime's configs."""
     tp_map: Dict[int, int] = {}
     for entry in stage_configs:
-        sid = int(_cfg_get(entry, "stage_id", len(tp_map)))
-        ea = _cfg_get(entry, "engine_args", {})
-        tp = _cfg_get(ea, "tensor_parallel_size")
+        engine_args = entry.engine_args
+        tp = engine_args.get("tensor_parallel_size")
         if tp is None:
-            tp = _cfg_get(_cfg_get(ea, "parallel_config", {}), "tensor_parallel_size")
-        tp_map[sid] = int(tp) if tp is not None else 1
+            parallel_config = engine_args.get("parallel_config")
+            if parallel_config is not None:
+                tp = parallel_config.get("tensor_parallel_size")
+        tp_map[int(entry.stage_id)] = int(tp) if tp is not None else 1
     return tp_map
-
-
-def _assemble_omni_kwargs(intent: Dict[str, Any]) -> Dict[str, Any]:
-    """Spell the boot intent into ``Omni`` ctor kwargs."""
-    omni_kwargs = dict(intent.get("omni_kwargs") or {})
-    if intent.get("enable_sleep_mode"):
-        omni_kwargs["enable_sleep_mode"] = True
-    return omni_kwargs
 
 
 @contextmanager
@@ -162,7 +146,9 @@ class VLLMOmniBackend:
             pass
 
         deploy_config_path = _resolve_deploy_config(str(intent["deploy_config"]))
-        omni_kwargs = _assemble_omni_kwargs(intent)
+        omni_kwargs = dict(intent.get("omni_kwargs") or {})
+        if intent.get("enable_sleep_mode"):
+            omni_kwargs["enable_sleep_mode"] = True
         ports = intent.get("ports")
         boot_master_port = int(ports.master_port) if ports is not None else None
         logger.info(
@@ -369,9 +355,6 @@ class VLLMOmniBackend:
         def ack_field(ack: object, name: str, default: object = None) -> object:
             return ack.get(name, default) if isinstance(ack, Mapping) else getattr(ack, name, default)
 
-        def ack_error(ack: object) -> object:
-            return ack_field(ack, "error_msg", ack_field(ack, "error"))
-
         def validate_result(result: object) -> None:
             nonlocal success_count
             if result is None:
@@ -387,10 +370,11 @@ class VLLMOmniBackend:
             if status is None:
                 raise RuntimeError(f"vllm-omni {action} returned no ACK status for stage {stage_id}: result={result!r}")
             if status != "SUCCESS":
+                error = ack_field(result, "error_msg", ack_field(result, "error"))
                 raise RuntimeError(
                     f"vllm-omni {action} failed on stage {stage_id}: worker rank "
                     f"{ack_field(result, 'rank', '?')} answered status={status!r} "
-                    f"error={ack_error(result)!r}"
+                    f"error={error!r}"
                 )
             ack_stage_id = ack_field(result, "stage_id")
             ack_task_id = ack_field(result, "task_id")
