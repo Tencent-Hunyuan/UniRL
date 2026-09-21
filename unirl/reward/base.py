@@ -44,7 +44,13 @@ class RewardBackend(ABC):
     def prompts(self, request: RewardRequest) -> List[str]:
         """Return the prompt semantics declared by this backend."""
         prompt = request.original_prompt if self.prompt_source == "original" else request.generation_prompt
-        return [] if prompt is None else list(prompt.texts)
+        if prompt is None:
+            raise ValueError(
+                f"{type(self).__name__} requires prompt_source={self.prompt_source!r}, "
+                "but the selected prompt is absent from RewardRequest. "
+                "Ensure the scored Sample has a text ancestor."
+            )
+        return list(prompt.texts)
 
     @abstractmethod
     def compute_rewards(self, request: RewardRequest) -> RewardResponse:
