@@ -123,3 +123,10 @@ MixGRPO keeps `FlowSDEStrategy` and adds a `WindowScheduler` under
   *disabled*, not "stretch to zero" — normalize falsy values to `None`.
 - **`compute_mu` is the single per-model μ override point.** FLUX.2-klein's μ depends
   on **both** `image_seq_len` and `num_inference_steps`, unlike the base formula.
+- **`WindowScheduler` indexes UniRL's step loop, not MixGRPO's sample dict.** `num_timesteps`
+  is the full step count and only full windows are visited, so the trailing
+  `(num_timesteps - window_size) mod stride` indices never get an SDE kernel (`stride =
+  window_size - overlap_size`). MixGRPO's `max_timesteps = sampling_steps - 2` is the length
+  of *its* `T-1`-entry sample dict (inherited from DanceGRPO, which drops the last transition
+  that Flow-GRPO keeps), so it is not a spec to copy — mirroring it would also change
+  `progressive`, which every shipped mixgrpo recipe runs.
