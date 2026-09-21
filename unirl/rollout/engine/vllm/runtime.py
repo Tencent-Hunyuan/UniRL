@@ -8,7 +8,7 @@ from multiprocessing.connection import Connection
 from typing import Any, Dict, List
 
 _PROTOCOL_VERSION = 1
-_SUPPORTED_VLLM_VERSION = "0.27.0"
+_SUPPORTED_VLLM_VERSION = "0.28.0"
 
 
 class _ProtocolError(RuntimeError):
