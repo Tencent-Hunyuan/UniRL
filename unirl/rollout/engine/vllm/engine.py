@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from unirl.config.require import require
-from unirl.distributed.group.dispatch import Dispatch, distributed
+from unirl.distributed.group.dispatch import Dispatch, Execute, distributed
 from unirl.rollout.engine.base import BaseRolloutEngine
 from unirl.rollout.engine.sglang.adapters.text import TextLMAdapter
 from unirl.rollout.engine.vllm.config import VLLMEngineConfig
@@ -105,6 +105,7 @@ class VLLMRolloutEngine(BaseRolloutEngine):
         self._next_request_id = 1
         self._pending_native_publication = None
         self._ipc_worker_device_uuids: List[str] = []
+        self._worker_capabilities: List[Dict[str, Any]] = []
         self.adapter = None
 
         if not self._is_tp_zero:
@@ -162,13 +163,14 @@ class VLLMRolloutEngine(BaseRolloutEngine):
             if not isinstance(ready, dict) or ready.get("event") != "ready":
                 raise _ProtocolError(f"vLLM returned invalid startup result: {ready!r}")
             self._validate_runtime_manifest(ready)
-            self._ipc_worker_device_uuids = [
-                str(item["cuda_device_uuid"])
+            self._worker_capabilities = [
+                dict(item)
                 for item in sorted(
                     ready["worker_capabilities"],
                     key=lambda capability: int(capability["tp_rank"]),
                 )
             ]
+            self._ipc_worker_device_uuids = [str(item["cuda_device_uuid"]) for item in self._worker_capabilities]
             self._process_group_id = int(ready["process_group_id"])
         except BaseException:
             child.close()
@@ -189,6 +191,11 @@ class VLLMRolloutEngine(BaseRolloutEngine):
     @property
     def ipc_worker_device_uuids(self) -> List[str]:
         return list(self._ipc_worker_device_uuids)
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST, execute_mode=Execute.RANK_ZERO)
+    def runtime_capabilities(self) -> List[Dict[str, Any]]:
+        """Return startup capabilities reported by every native vLLM worker."""
+        return [dict(item) for item in self._worker_capabilities]
 
     @property
     def connection_state(self) -> VLLMConnectionState:
