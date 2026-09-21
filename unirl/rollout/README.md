@@ -145,6 +145,17 @@ the reserved sockets overwrite them.
 
 ## Gotchas
 
+- **One engine per replica owns the whole TP x PP topology.** For `tp_size=T,
+  pp_size=P` only `tp_rank==0 && pp_rank==0` boots a live SGLang engine; the other
+  `T*P-1` ranks are no-op shells, and SGLang shards internally. The Handle therefore
+  hands that head the replica's `T*P` CUDA tokens, and each replica must fit on one
+  node because SGLang spawns its scheduler subprocesses locally.
+- **SGLang enumerates a replica's devices PP-major, TP-minor.** Its
+  `compute_local_gpu_id` is `base_gpu_id + pp_rank * tp_size_per_node + tp_rank *
+  gpu_id_step`, so the head's `CUDA_VISIBLE_DEVICES` list must be ordered
+  `pp_rank * tp_size + tp_rank` — which is what the contiguous rank layout already
+  produces. `gpu_id_step` stays 1; `base_gpu_id` stays 0 because
+  `CUDA_VISIBLE_DEVICES` re-indexes from zero.
 - **Never recompute σ inside an engine** — the generated Part's pinned sigmas are
   the single source of truth; `engine/sigma_verify.py` checks the backend echo (it
   guards the GRPO log-prob ratio).

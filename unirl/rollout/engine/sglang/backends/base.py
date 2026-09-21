@@ -72,16 +72,16 @@ def _filter_server_args_or_raise(
 def _normalize_cuda_visible_devices(
     cuda_visible_devices: Optional[Sequence[str]],
     *,
-    tp_size: int,
+    replica_size: int,
 ) -> Optional[List[str]]:
     """Validate explicit scheduler CUDA tokens without interpreting them."""
     if cuda_visible_devices is None:
         return None
     tokens = [str(token).strip() for token in cuda_visible_devices]
-    if len(tokens) != int(tp_size):
+    if len(tokens) != int(replica_size):
         raise ValueError(
-            "SGLang scheduler CUDA visibility must contain exactly tp_size "
-            f"tokens; got tp_size={tp_size}, tokens={tokens!r}"
+            "SGLang scheduler CUDA visibility must contain exactly tp_size*pp_size "
+            f"tokens; got replica_size={replica_size}, tokens={tokens!r}"
         )
     if any(not token for token in tokens):
         raise ValueError(f"SGLang scheduler CUDA visibility contains an empty token: {tokens!r}")

@@ -142,15 +142,6 @@ class SGLangEngineConfig(BaseEngineConfig):
             f"SGLangEngineConfig.pp_size must be >= 1 when set; got {self.pp_size!r}",
         )
         require(
-            self.pp_size is None or self.pp_size == 1,
-            "SGLangEngineConfig.pp_size>1 is not supported yet: UniRL Handle "
-            "would spawn one engine per pp_rank while SGLang Engine also spawns "
-            "its own PP scheduler subprocesses, double-booking the GPUs. Set "
-            "pp_size=1 (or leave it unset) for now; per-stage rank_offset "
-            "routing and single-engine PP fan-out are future work "
-            f"(got pp_size={self.pp_size!r}).",
-        )
-        require(
             self.ep_size is None or self.ep_size >= 1,
             f"SGLangEngineConfig.ep_size must be >= 1 when set; got {self.ep_size!r}",
         )

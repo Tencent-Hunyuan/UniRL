@@ -72,17 +72,19 @@ class SGLangRolloutEngine(BaseRolloutEngine):
             self._tp_visible_devices = [str(token) for token in tp_visible_devices]
         else:
             self._tp_visible_devices = None
-        self._is_tp_zero = self._tp_rank == 0
+        self._is_engine_head = self._tp_rank == 0 and self._pp_rank == 0
 
-        if not self._is_tp_zero:
+        if not self._is_engine_head:
             self.adapter = None
             self._backend = None
             self._weight_sync = None
             logger.info(
-                "SGLangRolloutEngine: tp_rank=%d/%d is a no-op shell (rank=%s); "
-                "SGLang server hosted by tp_rank=0 of this TP group",
+                "SGLangRolloutEngine: tp_rank=%d/%d pp_rank=%d/%d is a no-op shell (rank=%s); "
+                "SGLang server hosted by the tp_rank=0, pp_rank=0 head of this replica",
                 self._tp_rank,
                 self._tp_size,
+                self._pp_rank,
+                self._pp_size,
                 rank,
             )
             return
@@ -120,8 +122,10 @@ class SGLangRolloutEngine(BaseRolloutEngine):
             ports = SGLangPorts.reserve()
 
         runtime_overrides: Dict[str, Any] = {}
-        if self._tp_size > 1:
+        if self._tp_size > 1 or self._pp_size > 1:
+            # Device order/stride contract: see unirl/rollout/README.md Gotchas.
             runtime_overrides["tp_size"] = self._tp_size
+            runtime_overrides["pp_size"] = self._pp_size
             runtime_overrides["gpu_id_step"] = 1
 
         intent = config.server_intent(
@@ -180,7 +184,7 @@ class SGLangRolloutEngine(BaseRolloutEngine):
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
     def generate(self, sample: Sample) -> Sample:
         """Generate one whole Sample synchronously through the backend seam."""
-        if not self._is_tp_zero:
+        if not self._is_engine_head:
             return None
         if self._checkpoint_engine_sync_error is not None:
             raise RuntimeError(
@@ -194,22 +198,22 @@ class SGLangRolloutEngine(BaseRolloutEngine):
     def abort(self, ids: Optional[List[str]] = None) -> List[Sample]:
         """Abort in-flight generation (best-effort). Partials surface via the"""
         del ids
-        if self._is_tp_zero:
+        if self._is_engine_head:
             self._backend.abort(abort_all=True)
         return []
 
     def pause(self) -> None:
-        if self._is_tp_zero:
+        if self._is_engine_head:
             self._backend.pause()
 
     def resume(self) -> None:
-        if self._is_tp_zero:
+        if self._is_engine_head:
             self._backend.resume()
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def sleep(self, tags: Optional[List[str]] = None) -> None:
         """Release GPU memory (offload)."""
-        if not self._is_tp_zero:
+        if not self._is_engine_head:
             return
         release_tags = None if tags is None or len(tags) == 0 else list(tags)
         if release_tags is None and self._is_offloaded:
@@ -227,7 +231,7 @@ class SGLangRolloutEngine(BaseRolloutEngine):
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def wake_up(self, tags: Optional[List[str]] = None) -> None:
         """Resume GPU memory."""
-        if not self._is_tp_zero:
+        if not self._is_engine_head:
             return
         full_wake = tags is None or len(tags) == 0
         resume_tags = None if full_wake else list(tags)
@@ -246,7 +250,7 @@ class SGLangRolloutEngine(BaseRolloutEngine):
     def onload_weights(self, *, track_prefix: str = "") -> None:
         """Resume only model weights so tensor/NCCL sync can update them."""
         del track_prefix
-        if not self._is_tp_zero:
+        if not self._is_engine_head:
             return
         if not self._is_offloaded:
             return
@@ -260,7 +264,7 @@ class SGLangRolloutEngine(BaseRolloutEngine):
         return self._is_offloaded
 
     def health_check(self) -> bool:
-        if not self._is_tp_zero:
+        if not self._is_engine_head:
             return True
         if self._checkpoint_engine_sync_error is not None:
             return False
@@ -269,7 +273,7 @@ class SGLangRolloutEngine(BaseRolloutEngine):
         return self._backend.ping()
 
     def shutdown(self) -> None:
-        if not self._is_tp_zero or self._backend is None:
+        if not self._is_engine_head or self._backend is None:
             return
         self._backend.shutdown()
 
@@ -290,7 +294,7 @@ class SGLangRolloutEngine(BaseRolloutEngine):
     ) -> None:
         """Update weights from serialized tensors via the seam."""
         del target_modules, track_prefix
-        if not self._is_tp_zero:
+        if not self._is_engine_head:
             return
         self._weight_sync.update_weights_from_tensor(
             serialized_named_tensors=serialized_named_tensors,
@@ -311,7 +315,7 @@ class SGLangRolloutEngine(BaseRolloutEngine):
         track_prefix: str = "",
     ) -> None:
         del track_prefix
-        if not self._is_tp_zero:
+        if not self._is_engine_head:
             return
         self._weight_sync.init_weights_update_group(
             master_address=master_address,
@@ -335,7 +339,7 @@ class SGLangRolloutEngine(BaseRolloutEngine):
     ) -> None:
         """Receive weights via NCCL broadcast from training actors."""
         del target_modules, track_prefix
-        if not self._is_tp_zero:
+        if not self._is_engine_head:
             return
         self._weight_sync.update_weights_from_distributed(
             names=names,
@@ -353,7 +357,7 @@ class SGLangRolloutEngine(BaseRolloutEngine):
         track_prefix: str = "",
     ) -> None:
         del track_prefix
-        if not self._is_tp_zero:
+        if not self._is_engine_head:
             return
         self._weight_sync.destroy_weights_update_group(group_name=group_name)
 
@@ -364,14 +368,14 @@ class SGLangRolloutEngine(BaseRolloutEngine):
         *,
         peft_config: Optional[dict] = None,
     ) -> None:
-        if not self._is_tp_zero:
+        if not self._is_engine_head:
             return
         self._weight_sync.set_lora_from_tensors(adapter_name, lora_tensors, peft_config=peft_config)
 
     @property
     def lora_dirty(self) -> bool:
         """True when LoRA is in use but the adapter must be (re)pushed before generate."""
-        if not self._is_tp_zero or self._weight_sync is None:
+        if not self._is_engine_head or self._weight_sync is None:
             return False
         return self._weight_sync.lora_dirty
 
@@ -383,7 +387,7 @@ class SGLangRolloutEngine(BaseRolloutEngine):
         timeout_s: float,
     ) -> None:
         """Update weights via ZMQ + CUDA IPC (checkpoint_engine protocol)."""
-        if not self._is_tp_zero:
+        if not self._is_engine_head:
             return
         if self._checkpoint_engine_sync_error is not None:
             raise RuntimeError(

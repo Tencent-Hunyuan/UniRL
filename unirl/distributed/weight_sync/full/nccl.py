@@ -70,13 +70,22 @@ class NCCLWeightSync(FullWeightSync):
         if self._rollout_role is None:
             raise RuntimeError("NCCLWeightSync.connect: call set_rollout_targets() first")
 
-        if pp_size > 1:
-            raise NotImplementedError(
-                "NCCLWeightSync.connect: rollout pp_size>1 is not implemented "
-                f"(got pp_size={pp_size}); only tp_size/dp_size are supported."
-            )
-
         tp = max(1, int(tp_size))
+        pp = max(1, int(pp_size))
+        if pp > 1:
+            # SGLang builds one TP group per pipeline stage
+            # (parallel_state.py: contiguous chunks of tp_size), so each stage reports
+            # the same stage-local tp_rank, and weight_updater.py computes its group
+            # rank as `rank_offset + self.tp_rank`. Every stage therefore joins with the
+            # same rank: measured on 4xL4 with pp_size=2, both stages logged
+            # `rank_offset=1, rank=1, world_size=3`. NCCL still forms the group and the
+            # run exits 0, so the mis-sync is silent rather than fatal — fail closed
+            # instead of broadcasting into a group with duplicate ranks.
+            raise NotImplementedError(
+                "NCCLWeightSync.connect: rollout pp_size>1 is not supported; SGLang "
+                "derives its weight-sync group rank from the stage-local tp_rank, so "
+                "pipeline stages collide. Only tp_size/dp_size are supported."
+            )
         world = int(num_rollout_gpus) + 1
         refs = [
             handle.call.remote(

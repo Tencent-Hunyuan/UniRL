@@ -161,61 +161,80 @@ def _build_rank_infos(
     ]
 
 
-def _build_tp_visible_device_map(
+def _build_replica_visible_device_map(
     rank_infos: Sequence[RankInfo],
     *,
     node_ips: Sequence[str],
     cuda_visible_devices: Sequence[str],
 ) -> Dict[int, List[str]]:
-    """Map each TP worker index to its node-local Ray CUDA token list."""
+    """Map each TP x PP replica's ranks to its node-local Ray CUDA token list."""
     size = len(rank_infos)
     if len(node_ips) != size or len(cuda_visible_devices) != size:
         raise ValueError(
-            "TP worker metadata length mismatch: "
+            "TP x PP worker metadata length mismatch: "
             f"rank_infos={size}, node_ips={len(node_ips)}, "
             f"cuda_visible_devices={len(cuda_visible_devices)}"
         )
 
-    groups: Dict[Tuple[int, int], List[int]] = {}
+    groups: Dict[int, List[int]] = {}
     for index, rank_info in enumerate(rank_infos):
-        if int(rank_info.tp_size) > 1:
-            groups.setdefault((int(rank_info.dp_rank), int(rank_info.pp_rank)), []).append(index)
+        if int(rank_info.tp_size) * int(rank_info.pp_size) > 1:
+            groups.setdefault(int(rank_info.dp_rank), []).append(index)
 
     result: Dict[int, List[str]] = {}
-    for group_key, indices in groups.items():
-        ordered = sorted(indices, key=lambda index: int(rank_infos[index].tp_rank))
-        tp_size = int(rank_infos[ordered[0]].tp_size)
-        tp_ranks = [int(rank_infos[index].tp_rank) for index in ordered]
-        if len(ordered) != tp_size or tp_ranks != list(range(tp_size)):
-            raise ValueError(f"incomplete TP group {group_key}: expected ranks 0..{tp_size - 1}, got {tp_ranks}")
+    for dp_rank, indices in groups.items():
+        sample = rank_infos[indices[0]]
+        tp_size = int(sample.tp_size)
+        pp_size = int(sample.pp_size)
+        # Token order follows SGLang's PP-major device enumeration (rollout README).
+        ordered = sorted(indices, key=lambda index: (int(rank_infos[index].pp_rank), int(rank_infos[index].tp_rank)))
+        expected = [(pp_rank, tp_rank) for pp_rank in range(pp_size) for tp_rank in range(tp_size)]
+        actual = [(int(rank_infos[index].pp_rank), int(rank_infos[index].tp_rank)) for index in ordered]
+        if actual != expected:
+            raise ValueError(f"incomplete TP x PP replica dp={dp_rank}: expected {expected}, got {actual}")
 
-        group_nodes = [str(node_ips[index]).strip() for index in ordered]
-        if any(not node for node in group_nodes) or len(set(group_nodes)) != 1:
+        replica_nodes = [str(node_ips[index]).strip() for index in ordered]
+        if any(not node for node in replica_nodes) or len(set(replica_nodes)) != 1:
             raise ValueError(
-                f"each rollout TP group must be placed on a single node; group={group_key}, nodes={group_nodes}"
+                f"each rollout TP x PP replica must be placed on a single node; dp={dp_rank}, nodes={replica_nodes}"
             )
 
         tokens: List[str] = []
         for index in ordered:
             raw = str(cuda_visible_devices[index]).strip()
             if not raw:
-                raise ValueError(f"SGLang TP worker {index} has an empty CUDA_VISIBLE_DEVICES token")
+                raise ValueError(f"SGLang TP x PP worker {index} has an empty CUDA_VISIBLE_DEVICES token")
             split = [token.strip() for token in raw.split(",") if token.strip()]
             if len(split) != 1:
                 raise ValueError(
-                    "each rollout TP worker must expose exactly one CUDA_VISIBLE_DEVICES "
+                    "each rollout TP x PP worker must expose exactly one CUDA_VISIBLE_DEVICES "
                     f"token; worker={index}, value={raw!r}"
                 )
             tokens.append(split[0])
         if len(set(tokens)) != len(tokens):
             raise ValueError(
-                "CUDA_VISIBLE_DEVICES tokens within an SGLang TP group must be unique; "
-                f"group={group_key}, tokens={tokens}"
+                "CUDA_VISIBLE_DEVICES tokens within an SGLang TP x PP replica must be unique; "
+                f"dp={dp_rank}, tokens={tokens}"
             )
 
         for index in ordered:
             result[index] = list(tokens)
     return result
+
+
+def _require_single_node_replicas(device_ids: Sequence[int], devices_per_node: int, inner: int) -> None:
+    """Reject replica layouts that straddle nodes (SGLang spawns local schedulers)."""
+    if inner <= 1 or devices_per_node <= 0 or len(device_ids) % inner != 0:
+        return
+    for dp_rank in range(len(device_ids) // inner):
+        replica = device_ids[dp_rank * inner : (dp_rank + 1) * inner]
+        nodes = {int(device) // devices_per_node for device in replica}
+        if len(nodes) != 1:
+            raise ValueError(
+                f"rollout replica {dp_rank} spans nodes {sorted(nodes)} "
+                f"(tp_size*pp_size={inner}, devices_per_node={devices_per_node}); "
+                "each TP x PP replica must fit on a single node"
+            )
 
 
 @dataclass(frozen=True)
@@ -446,8 +465,10 @@ class Handle:
             self.rank_infos[0].ep_size,
         )
         is_tp_engine = _accepts_rollout_tp_role(role_cls)
-        tp_visible_device_map: Dict[int, List[str]] = {}
-        if is_tp_engine and any(rank_info.tp_size > 1 for rank_info in self.rank_infos):
+        if is_tp_engine:
+            _require_single_node_replicas(self.device_ids, int(pool.devices_per_node), tp_size * pp_size)
+        replica_visible_device_map: Dict[int, List[str]] = {}
+        if is_tp_engine and any(rank_info.tp_size * rank_info.pp_size > 1 for rank_info in self.rank_infos):
             node_ips = get_actor_results(
                 [worker.get_node_ip.remote() for worker in self.workers],
                 pool=self.pool,
@@ -460,7 +481,7 @@ class Handle:
                 role_name=self.role_name,
                 method_name="get_cuda_visible_devices",
             )
-            tp_visible_device_map = _build_tp_visible_device_map(
+            replica_visible_device_map = _build_replica_visible_device_map(
                 self.rank_infos,
                 node_ips=node_ips,
                 cuda_visible_devices=cuda_visible_devices,
@@ -484,8 +505,9 @@ class Handle:
                     "ep_size": ri.ep_size,
                 }
             )
-            if ri.tp_size > 1:
-                kwargs["tp_visible_devices"] = tp_visible_device_map[i]
+            # Carries the whole replica's token list; vLLM shares this kwarg name.
+            if ri.tp_size * ri.pp_size > 1:
+                kwargs["tp_visible_devices"] = replica_visible_device_map[i]
             return kwargs
 
         get_actor_results(
@@ -556,9 +578,9 @@ class Handle:
         return self.rank_infos[0].ep_size if self.rank_infos else 1
 
     @property
-    def tp_zero_workers(self) -> List[Any]:
-        """Worker actor handles that host a SGLang engine (tp_rank==0)."""
-        return [w for w, ri in zip(self.workers, self.rank_infos) if ri.tp_rank == 0]
+    def engine_head_workers(self) -> List[Any]:
+        """Worker actor handles that host a live engine (tp_rank=0, pp_rank=0)."""
+        return [w for w, ri in zip(self.workers, self.rank_infos) if ri.tp_rank == 0 and ri.pp_rank == 0]
 
     def initialize(self, *args, **kwargs) -> None:
         """Call role.initialize(*args, **kwargs) on all workers."""

@@ -280,9 +280,10 @@ class HTTPBackend:
         multiprocessing.set_start_method("spawn", force=True)
 
         tp_size = int(server_kwargs.get("tp_size", 1))
+        pp_size = int(server_kwargs.get("pp_size", 1) or 1)
         visible_devices = _normalize_cuda_visible_devices(
             cuda_visible_devices,
-            tp_size=tp_size,
+            replica_size=tp_size * pp_size,
         )
         env_overrides: Dict[str, str] = {}
         if visible_devices is not None:

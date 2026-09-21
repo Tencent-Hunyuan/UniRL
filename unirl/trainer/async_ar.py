@@ -183,7 +183,7 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
         addr, port = self.weight_sync.pick_master()[0]
         tp_size = self.rollout.tp_size
         pp_size = self.rollout.pp_size
-        targets = self.rollout.tp_zero_workers
+        targets = self.rollout.engine_head_workers
         self.weight_sync.set_rollout_targets(targets, self.rollout.role_name)
         self.weight_sync.connect(
             master_addr=addr,

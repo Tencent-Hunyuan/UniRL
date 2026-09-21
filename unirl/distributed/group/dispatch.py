@@ -140,10 +140,18 @@ def _collect_passthrough(wg, results: List) -> List:
 
 def _collect_dp_merge(wg, results: List) -> Any:
     """Collect only DP-head results per DP group, then merge."""
+    # Lazy import: handle.py imports this module at load time.
+    from unirl.distributed.group.handle import _accepts_rollout_tp_role
+
+    # A delegated rollout engine emits at pp_rank=0; a PP model at its last stage.
+    delegated = _accepts_rollout_tp_role(wg.role_cls)
     dp_results = []
     for i in range(len(results)):
         ri = wg.rank_infos[i]
-        if ri.tp_rank == 0 and ri.is_pipeline_last_stage and ri.sp_rank == 0:
+        if ri.tp_rank != 0 or ri.sp_rank != 0:
+            continue
+        owns_output = _is_dp_head(ri) if delegated else ri.is_pipeline_last_stage
+        if owns_output:
             dp_results.append(results[i])
 
     if not dp_results:

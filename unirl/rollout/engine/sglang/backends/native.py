@@ -180,10 +180,14 @@ class NativeBackend:
             backend_name="native",
         )
         tp_size = int(engine_kwargs.get("tp_size", 1) or 1)
-        if tp_size > 1:
+        pp_size = int(engine_kwargs.get("pp_size", 1) or 1)
+        # The in-process engine cannot take a multi-device replica: it would need the
+        # head's CUDA_VISIBLE_DEVICES list, which only HTTPBackend sets. Without this
+        # guard a pp_size>1 engine reaches SGLang and dies on "invalid device ordinal".
+        if tp_size > 1 or pp_size > 1:
             raise NotImplementedError(
-                "SGLang native backend does not support rollout tp_size>1 in UniRL yet; "
-                "use backend='http' for rollout TP/EP."
+                "SGLang native backend does not support rollout tp_size>1 or pp_size>1 in UniRL yet; "
+                "use backend='http' for rollout TP/EP/PP."
             )
         engine_kwargs.setdefault("log_level", "info")
 
