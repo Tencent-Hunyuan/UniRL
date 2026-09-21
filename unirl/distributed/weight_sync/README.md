@@ -62,6 +62,17 @@ matching receiver on the engine side (`../../rollout/engine/`).
 
 ## Gotchas
 
+- **A `pp_size>1` rollout cannot be weight-synced through `TensorWeightSync`** — SGLang
+  deserializes `serialized_named_tensors[ps.tp_rank]`, a *stage-local* index, so every
+  pipeline stage reads the same slots, and a CUDA-IPC payload is only openable on the GPU
+  that produced it: stage `P-1` reading stage 0's handle dies on `cudaErrorInvalidValue`
+  and takes the server with it. Sending CPU tensors instead is not an escape — SGLang's
+  reduction patch rewrites the reduce args at index 6, which a CPU tensor's args do not
+  have, so `ForkingPickler.dump` raises `IndexError`. `sync()` therefore fails closed on a
+  PP layout; PP weight sync needs a rank-addressable mechanism (the checkpoint-engine IPC
+  route, whose own guard says stage-local socket routing is required). Note the
+  separate-slab `NCCLWeightSync` path has a *different* PP blocker (its group rank
+  collides) and is guarded too.
 - **`sync()` is a train-mesh collective** — the FSDP→full materialization runs on
   *every* train rank; never gate it behind `if rank == 0`. The rollout receiver owns
   routing after materialization: SGLang TP performs the push only on each group's

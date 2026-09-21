@@ -42,6 +42,16 @@ class TensorWeightSync(FullWeightSync):
         import torch
 
         ri = self.rank_info
+        if ri is not None and int(ri.pp_size) > 1:
+            # SGLang indexes the payload list by the stage-local tp_rank, so every pipeline
+            # stage reads the same slots; and its serializer is CUDA-only (the reduction
+            # patch indexes a device argument CPU tensors do not carry), so a payload
+            # cannot be made portable. See the weight_sync README Gotchas.
+            raise NotImplementedError(
+                "TensorWeightSync: rollout pp_size>1 is not supported; SGLang reads the "
+                "payload list by stage-local tp_rank and its serializer cannot carry "
+                "portable tensors, so each pipeline stage cannot receive its own shard."
+            )
         tp_size = int(ri.tp_size) if ri is not None else 1
         is_tp_zero = ri is None or ri.tp_rank == 0
 
