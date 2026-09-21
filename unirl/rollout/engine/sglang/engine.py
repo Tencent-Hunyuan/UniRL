@@ -399,7 +399,7 @@ class SGLangRolloutEngine(BaseRolloutEngine):
         except BaseException as exc:
             self.mark_checkpoint_engine_sync_failed(str(exc))
             raise
-        self._version += 1
+        self._weight_update_calls += 1
 
     def mark_checkpoint_engine_sync_failed(self, error: str) -> None:
         """Poison this rollout after a possibly partial live-weight update."""
