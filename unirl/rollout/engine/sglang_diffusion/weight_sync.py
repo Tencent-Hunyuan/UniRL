@@ -61,7 +61,6 @@ class WeightSync:
         self._target_modules = list(target_modules)
         self._uses_lora = uses_lora
         self._lora_loaded = False
-        self._lora_initialized = False
 
     def update_weights_from_tensor(
         self,
@@ -131,11 +130,10 @@ class WeightSync:
         )
 
     def _require_full_update_allowed(self, operation: str) -> None:
-        if self._lora_initialized:
+        if self._uses_lora:
             raise RuntimeError(
-                f"SGLang diffusion {operation} is unsafe after dynamic LoRA initialization: "
-                "SGLang replaces DiT linear modules with LoRA wrappers, so later base-weight "
-                "names are skipped. Use one sync mode for the engine lifetime or restart the engine."
+                f"SGLang diffusion {operation} is incompatible with a LoRA-configured engine. "
+                "Use adapter sync, or configure use_lora=false and push LoRA-merged full weights."
             )
 
     def _single_update_target(
@@ -203,9 +201,6 @@ class WeightSync:
         lora_alpha = int(adapter_alpha) if adapter_alpha is not None else None
         grouped = _partition_lora_tensors(stripped, self._target_modules)
         self._lora_loaded = False
-        # Conversion may happen before a backend error is returned. From this point,
-        # conservatively forbid base/full updates for the lifetime of the engine.
-        self._lora_initialized = True
         group_count = len(grouped)
         for index, (target_module, target_tensors) in enumerate(grouped.items()):
             try:
