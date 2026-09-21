@@ -96,7 +96,7 @@ class LLMJudgeRewardScorer(LocalRewardBackend):
         predictions = request.texts
         if predictions is None:
             raise ValueError("LLMJudgeRewardScorer requires request.texts (predicted answers).")
-        prompts = self.prompts(request) or [""] * len(predictions)
+        prompts = self.prompts(request)
         metadata_list = request.metadata or [None] * len(predictions)
         rewards: List[float] = []
         for question, prediction, meta in zip(prompts, predictions, metadata_list):

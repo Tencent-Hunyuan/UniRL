@@ -132,3 +132,4 @@ new remote reward needs no UniRL code — add it to the server and list its name
   scorers honor it, falling back to CPU with a warning if CUDA is unavailable.
 - **Prompt-based rewards use the generation prompt by default.** Set
   `prompt_source: original` to score against the original user prompt instead.
+  A prompt-aware backend raises if the selected prompt is absent rather than silently continuing without one.
