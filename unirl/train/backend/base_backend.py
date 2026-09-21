@@ -308,6 +308,8 @@ class BaseFSDP2Backend(Remote):
         if self.ema is not None:
             self.ema.step(self._optimizer_step_count)
         self._optimizer_step_count += 1
+        # Release consumed grads before train-state offload.
+        self.optimizer.zero_grad(set_to_none=True)
         return grad_norm
 
     def on_rollout_end(self) -> None:
@@ -557,10 +559,20 @@ class BaseFSDP2Backend(Remote):
         move_optimizer_state(self.optimizer, self._device)
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
-    def offload(self) -> None:
-        """Move the train state (params + grads + optimizer) to CPU."""
-        self._offload_model()
-        move_optimizer_state(self.optimizer, "cpu")
+    def offload(
+        self,
+        *,
+        model: bool = True,
+        optimizer: bool = True,
+        clear_gradients: bool = False,
+    ) -> None:
+        """Move selected train state to CPU while preserving legacy defaults."""
+        if clear_gradients:
+            self.optimizer.zero_grad(set_to_none=True)
+        if model:
+            self._offload_model()
+        if optimizer:
+            move_optimizer_state(self.optimizer, "cpu")
         torch.cuda.empty_cache()
 
     def gradient_average_world_size(self) -> int:
