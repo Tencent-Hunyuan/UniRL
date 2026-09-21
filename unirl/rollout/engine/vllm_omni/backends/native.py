@@ -63,20 +63,6 @@ def _resolve_deploy_config(name: str) -> str:
     return path
 
 
-def _tp_from_stage_configs(stage_configs: Sequence[Any]) -> Dict[int, int]:
-    """Extract ``{stage_id: tensor_parallel_size}`` from the runtime's configs."""
-    tp_map: Dict[int, int] = {}
-    for entry in stage_configs:
-        engine_args = entry.engine_args
-        tp = engine_args.get("tensor_parallel_size")
-        if tp is None:
-            parallel_config = engine_args.get("parallel_config")
-            if parallel_config is not None:
-                tp = parallel_config.get("tensor_parallel_size")
-        tp_map[int(entry.stage_id)] = int(tp) if tp is not None else 1
-    return tp_map
-
-
 @contextmanager
 def _master_port_env(port: Optional[int]):
     """Pin ``MASTER_PORT`` to the reserved engine port for the duration of ``Omni()``."""
@@ -104,12 +90,10 @@ class VLLMOmniBackend:
         runtime: Dict[str, Any],
         *,
         tokenizer: Optional[Any],
-        tp_per_stage: Dict[int, int],
     ) -> None:
         self._omni: Optional[Any] = omni
         self._rt = runtime
         self._tokenizer = tokenizer
-        self._tp_per_stage = dict(tp_per_stage)
 
     @classmethod
     def boot(cls, intent: Dict[str, Any]) -> "VLLMOmniBackend":
@@ -204,15 +188,12 @@ class VLLMOmniBackend:
                 omni,
                 rt,
                 tokenizer=tokenizer,
-                tp_per_stage=_tp_from_stage_configs(omni.engine.stage_configs),
             )
         except BaseException:
             logger.exception("VLLM-Omni boot failed; tearing down any engine processes")
             if omni is not None:
                 try:
-                    close = getattr(omni, "close", None)
-                    if callable(close):
-                        close()
+                    omni.close()
                 except Exception:
                     logger.exception("Failed to close the half-booted vLLM-Omni engine")
             terminate_descendants(os.getpid(), name_prefix=_ENGINE_PROC_PREFIX)
@@ -285,7 +266,16 @@ class VLLMOmniBackend:
         return int(self._require_omni().engine.num_stages)
 
     def tp_per_stage(self) -> Dict[int, int]:
-        return dict(self._tp_per_stage)
+        tp_map: Dict[int, int] = {}
+        for entry in self._require_omni().engine.stage_configs:
+            engine_args = entry.engine_args
+            tp = engine_args.get("tensor_parallel_size")
+            if tp is None:
+                parallel_config = engine_args.get("parallel_config")
+                if parallel_config is not None:
+                    tp = parallel_config.get("tensor_parallel_size")
+            tp_map[int(entry.stage_id)] = int(tp) if tp is not None else 1
+        return tp_map
 
     def _stage_ids(self) -> List[int]:
         return list(range(self.num_stages()))
@@ -431,14 +421,19 @@ class VLLMOmniBackend:
             torch.cuda.synchronize()
 
     def ping(self) -> bool:
-        return self._omni is not None
+        omni = self._omni
+        if omni is None:
+            return False
+        try:
+            return bool(omni.is_running)
+        except Exception:
+            logger.exception("vLLM-Omni health check failed")
+            return False
 
     def shutdown(self) -> None:
         if self._omni is not None:
             try:
-                close = getattr(self._omni, "close", None)
-                if callable(close):
-                    close()
+                self._omni.close()
             finally:
                 self._omni = None
 
@@ -565,8 +560,9 @@ class VLLMOmniBackend:
             DIFFRL_LORA_NAME,
             DIFFRL_LORA_PATH,
         )
+        from unirl.utils.peft_merge import adapt_lora_for_vllm
 
-        lora_tensors = self._wrap_peft_envelope(lora_tensors)
+        lora_tensors = adapt_lora_for_vllm(lora_tensors)
         self._remove_existing_lora(int(DIFFRL_LORA_INT_ID))
 
         from unirl.distributed.weight_sync.transfer.sgl_compat import (
@@ -608,8 +604,9 @@ class VLLMOmniBackend:
             DIFFRL_LORA_NAME,
             DIFFRL_LORA_PATH,
         )
+        from unirl.utils.peft_merge import adapt_lora_for_vllm
 
-        lora_tensors = self._wrap_peft_envelope(lora_tensors)
+        lora_tensors = adapt_lora_for_vllm(lora_tensors)
         self._remove_existing_lora(int(DIFFRL_LORA_INT_ID))
 
         cpu_tensors = {
@@ -631,16 +628,6 @@ class VLLMOmniBackend:
                     serialized,
                 ),
             )
-
-    @staticmethod
-    def _wrap_peft_envelope(lora_tensors: Dict[str, Any]) -> Dict[str, Any]:
-        """Wrap canonical wire keys in the PEFT envelope vllm-omni expects."""
-        from unirl.utils.peft_merge import adapt_lora_for_vllm
-
-        first_key = next(iter(lora_tensors), "")
-        if lora_tensors and not first_key.startswith("base_model.model."):
-            return adapt_lora_for_vllm(lora_tensors)
-        return lora_tensors
 
     def _remove_existing_lora(self, adapter_id: int) -> None:
         """Drop the existing adapter on every stage before re-adding."""
@@ -681,15 +668,19 @@ def _group_by_request(flat_outputs: Sequence[Any], n: int) -> List[List[Any]]:
     """Group ``Omni.generate``'s flat output list into per-request lists."""
     grouped: List[List[Any]] = [[] for _ in range(n)]
     for out in flat_outputs:
-        rid = getattr(out, "request_id", "") or ""
-        if "_" in rid:
-            idx_part = rid.split("_", 1)[0]
-            try:
-                idx = int(idx_part)
-            except ValueError:
-                continue
-            if 0 <= idx < n:
-                grouped[idx].append(out)
+        try:
+            rid = out.request_id
+            idx_part, suffix = rid.split("_", 1)
+            if not suffix:
+                raise ValueError("empty request-id suffix")
+            idx = int(idx_part)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"vllm-omni returned an invalid request_id: {getattr(out, 'request_id', None)!r}"
+            ) from exc
+        if not 0 <= idx < n:
+            raise RuntimeError(f"vllm-omni request_id index {idx} is outside the prompt batch of size {n}")
+        grouped[idx].append(out)
     return grouped
 
 
