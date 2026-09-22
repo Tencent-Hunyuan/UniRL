@@ -34,6 +34,11 @@ logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 MINIMAX_H3_MODALITY_NUM = 3
 
 
+def _select_rows(table: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+    selected = table.index_select(0, indices.reshape(-1))
+    return selected.reshape(*indices.shape, table.shape[-1])
+
+
 @dataclass
 class MiniMaxH3TransformerOutput(BaseOutput):
     r"""
@@ -147,7 +152,7 @@ class MiniMaxH3AdaLayerNormOut(nn.Module):
         shift, scale = self.linear(nn.functional.silu(temb).to(self.linear.weight.dtype)).chunk(2, dim=-1)
         # The modulation itself stays at the block stack's precision; `forward` casts to the output heads' dtype.
         hidden_states = self.norm(hidden_states)
-        return hidden_states * (1.0 + scale.index_select(0, timestep_indices)) + shift.index_select(0, timestep_indices)
+        return hidden_states * (1.0 + _select_rows(scale, timestep_indices)) + _select_rows(shift, timestep_indices)
 
 
 class MiniMaxH3AttnProcessor:
@@ -350,19 +355,19 @@ class MiniMaxH3TransformerBlock(nn.Module):
 
         residual = hidden_states
         norm_hidden_states = self.norm1(hidden_states)
-        norm_hidden_states = norm_hidden_states * (
-            1.0 + scale_msa.index_select(0, adaln_indices)
-        ) + shift_msa.index_select(0, adaln_indices)
+        norm_hidden_states = norm_hidden_states * (1.0 + _select_rows(scale_msa, adaln_indices)) + _select_rows(
+            shift_msa, adaln_indices
+        )
         attn_output = self.attn(norm_hidden_states, rotary_emb, attention_mask)
-        hidden_states = residual + gate_msa.index_select(0, adaln_indices) * attn_output
+        hidden_states = residual + _select_rows(gate_msa, adaln_indices) * attn_output
 
         residual = hidden_states
         norm_hidden_states = self.norm2(hidden_states)
-        norm_hidden_states = norm_hidden_states * (
-            1.0 + scale_mlp.index_select(0, adaln_indices)
-        ) + shift_mlp.index_select(0, adaln_indices)
+        norm_hidden_states = norm_hidden_states * (1.0 + _select_rows(scale_mlp, adaln_indices)) + _select_rows(
+            shift_mlp, adaln_indices
+        )
         ff_output = self.ff(norm_hidden_states)
-        hidden_states = residual + gate_mlp.index_select(0, adaln_indices) * ff_output
+        hidden_states = residual + _select_rows(gate_mlp, adaln_indices) * ff_output
 
         return hidden_states
 
@@ -382,9 +387,8 @@ class MiniMaxH3Transformer3DModel(ModelMixin, ConfigMixin, AttentionMixin, PeftA
     multiple of 64 for FlashAttention with `cu_seqlens = [0, used, S]`. Prefer dropping them — a padless sequence
     needs no attention mask, keeping the unmasked attention backends available.
 
-    The batch axis is a pure replication axis: the structural arguments (`timestep`, `timestep_indices`, `token_tags`,
-    `position_ids` and the three index tensors) describe one packed layout that every batch item shares, and each item
-    is a single attention document.
+    The batch axis is a pure replication axis: every item shares one packed layout and remains a separate attention
+    document. `timestep_indices` may provide either one shared row mapping or one mapping per batch item.
 
     Args:
         num_attention_heads (`int`, defaults to `56`):
@@ -550,8 +554,8 @@ class MiniMaxH3Transformer3DModel(ModelMixin, ConfigMixin, AttentionMixin, PeftA
             timestep (`torch.Tensor` of shape `(num_timesteps,)`):
                 The *distinct* timestep values present in the packed sequence, in `[0, 1]` and unscaled. One forward
                 serves rows at different noise levels (target video, target audio, conditioning rows).
-            timestep_indices (`torch.Tensor` of shape `(seq_len,)`):
-                For every row of the packed sequence, the index of its timestep in `timestep`.
+            timestep_indices (`torch.Tensor` of shape `(seq_len,)` or `(batch_size, seq_len)`):
+                For every row of the packed sequence, the index of its timestep in `timestep`, shared or per item.
             token_tags (`torch.Tensor` of shape `(seq_len,)`):
                 For every row of the packed sequence, its modality: `0` video, `1` text, `2` audio, `-1` padding.
                 Padding rows form their own attention document and never reach the outputs.
@@ -578,10 +582,13 @@ class MiniMaxH3Transformer3DModel(ModelMixin, ConfigMixin, AttentionMixin, PeftA
         if position_ids.ndim != 2 or position_ids.shape[-1] != 3:
             raise ValueError(f"`position_ids` must be a `(seq_len, 3)` tensor, got {list(position_ids.shape)}.")
         sequence_length = position_ids.shape[0]
-        if token_tags.shape != (sequence_length,) or timestep_indices.shape != (sequence_length,):
+        timestep_indices_shapes = ((sequence_length,), (hidden_states.shape[0], sequence_length))
+        if token_tags.shape != (sequence_length,) or timestep_indices.shape not in timestep_indices_shapes:
             raise ValueError(
-                "`token_tags` and `timestep_indices` must both be `(seq_len,)` tensors matching `position_ids`, got "
-                f"{list(token_tags.shape)} and {list(timestep_indices.shape)} for seq_len={sequence_length}."
+                "`token_tags` must be `(seq_len,)` and `timestep_indices` must be `(seq_len,)` or "
+                "`(batch_size, seq_len)` matching `position_ids`, got "
+                f"{list(token_tags.shape)} and {list(timestep_indices.shape)} for batch_size={hidden_states.shape[0]} "
+                f"and seq_len={sequence_length}."
             )
 
         rotary_emb = self.rope(position_ids)
