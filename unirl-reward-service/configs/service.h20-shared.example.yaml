@@ -6,7 +6,7 @@ server:
 rewards:
   - name: clip
     scorer: clip
-    runtime_env: envs/benchmark-base.txt
+    runtime_env: envs/clip.txt
     num_replicas: 1
     num_gpus: 0.5
     num_cpus: 2
@@ -18,7 +18,7 @@ rewards:
 
   - name: pickscore
     scorer: pickscore
-    runtime_env: envs/benchmark-base.txt
+    runtime_env: envs/pickscore.txt
     num_replicas: 1
     num_gpus: 0.5
     num_cpus: 2

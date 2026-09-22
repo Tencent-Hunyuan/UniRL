@@ -234,28 +234,23 @@ python3 scripts/bench_concurrent.py \
 
 The output reports each request's min / mean / max latency plus p50/p90/p95/p99, throughput, transport errors, and server-side per-reward failure counts. The sweep and per-reward modes end with a side-by-side comparison table.
 
-For the CUDA MPS experiment proposed in
-[#463](https://github.com/Tencent-Hunyuan/UniRL/issues/463), run the same
-workload repeatedly against each independently launched deployment and label
-the result explicitly:
+For the CUDA MPS experiment in
+[#463](https://github.com/Tencent-Hunyuan/UniRL/issues/463), launch
+[`configs/service.h20-dedicated.example.yaml`](configs/service.h20-dedicated.example.yaml)
+or [`configs/service.h20-shared.example.yaml`](configs/service.h20-shared.example.yaml)
+and label each independently started topology:
 
 ```bash
 python3 scripts/bench_concurrent.py \
-    --url http://localhost:8080 --sweep 1 4 16 --total 100 \
-    --batch-sweep 1 4 8 --repetitions 3 --warmup-requests 2 \
-    --rewards clip,hpsv2,pickscore \
-    --deployment-mode dedicated --physical-gpu GPU-... --gpu-count 3 \
-    --gpu-sample-interval 0.5 \
-    --output outputs/benchmark/dedicated.json
-
-# Repeat with the other deployment labels after launching each topology.
+    --url http://localhost:8080 --sweep 1 4 16 --batch-sweep 1 4 8 \
+    --total 60 --repetitions 3 --rewards clip,pickscore \
+    --deployment-mode dedicated --gpu-count 2 \
+    --gpu-sample-interval 0.5 --output dedicated.json
 ```
 
-`--deployment-mode` records experiment metadata; it does not alter Ray
-placement or start MPS. JSON output includes environment, failures, score
-vectors, throughput, latency, and GPU samples.
-The H20 four-way result and the FP16 CLIP active-thread caveat are published in
-[`docs/benchmarks/H20_MPS_BASELINE.md`](docs/benchmarks/H20_MPS_BASELINE.md).
+`--deployment-mode` only labels the JSON; it does not start MPS or change
+Ray placement. Qualify `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE` per scorer and
+dtype before using a sub-100% limit.
 
 ## Design conventions
 

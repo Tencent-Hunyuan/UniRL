@@ -1,1 +1,0 @@
-# Benchmark-only: use the packages already installed in the service image.
