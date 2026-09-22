@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Any, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
@@ -32,19 +33,41 @@ class RewardStack(Remote):
         self.reward = reward
         self.micro_batch_size = int(micro_batch_size)
         self.overlap = bool(overlap)
+        self._rows = 0
+        self._micros = 0
+        self._generate_s = 0.0
+        self._score_s = 0.0
+        self._wall_s = 0.0
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
     def rollout_and_score(self, sample: Sample) -> Sample:
         """Fill this shard's frontier Part micro by micro and return it with rewards attached."""
         gen = sample.parts[-1]
         total = int(gen.batch_size)
-        if total <= self.micro_batch_size:
-            return self._score(self.rollout.generate(sample))
-        bounds = [
-            (start, min(start + self.micro_batch_size, total)) for start in range(0, total, self.micro_batch_size)
-        ]
-        parts = self._overlapped(sample, gen, bounds) if self.overlap else self._serial(sample, gen, bounds)
-        return sample.replace_frontier(Part.concat(parts))
+        self._rows, self._micros, self._generate_s, self._score_s = total, 1, 0.0, 0.0
+        started = time.perf_counter()
+        try:
+            if total <= self.micro_batch_size:
+                return self._score(self._generate(sample, gen, 0, total))
+            bounds = [
+                (start, min(start + self.micro_batch_size, total)) for start in range(0, total, self.micro_batch_size)
+            ]
+            self._micros = len(bounds)
+            parts = self._overlapped(sample, gen, bounds) if self.overlap else self._serial(sample, gen, bounds)
+            return sample.replace_frontier(Part.concat(parts))
+        finally:
+            self._wall_s = time.perf_counter() - started
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def timing(self) -> Dict[str, float]:
+        """Shape and generate/score/wall seconds of this rank's last rollout_and_score call."""
+        return {
+            "rows": float(self._rows),
+            "micros": float(self._micros),
+            "generate_s": self._generate_s,
+            "score_s": self._score_s,
+            "wall_s": self._wall_s,
+        }
 
     def _serial(self, sample: Sample, gen: Part, bounds: Sequence[Tuple[int, int]]) -> List[Part]:
         """Generate then score each micro in turn — the default path; see the reward README."""
@@ -65,10 +88,17 @@ class RewardStack(Remote):
         return parts
 
     def _generate(self, sample: Sample, gen: Part, start: int, end: int) -> Sample:
-        return self.rollout.generate(sample.replace_frontier(gen.slice(start, end)))
+        micro = sample if start == 0 and end == int(gen.batch_size) else sample.replace_frontier(gen.slice(start, end))
+        t0 = time.perf_counter()
+        generated = self.rollout.generate(micro)
+        self._generate_s += time.perf_counter() - t0
+        return generated
 
     def _score(self, generated: Sample) -> Sample:
-        return self.reward.score_and_attach(generated)
+        t0 = time.perf_counter()
+        scored = self.reward.score_and_attach(generated)
+        self._score_s += time.perf_counter() - t0
+        return scored
 
     def _score_part(self, generated: Sample) -> Part:
         return self._score(generated).parts[-1]

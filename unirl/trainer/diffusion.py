@@ -805,6 +805,8 @@ class DiffusionTrainer(BaseTrainer):
             # The stack owns the micro-batch loop, so its scoring runs inside this
             # residency window instead of the driver's separate _reward_phase().
             result = self.reward_stack.rollout_and_score(sample) if score_inline else self.rollout.generate(sample)
+            if score_inline:
+                self._log_reward_stack_timing()
             generation_succeeded = True
             return result
         finally:
@@ -817,6 +819,30 @@ class DiffusionTrainer(BaseTrainer):
             # step, which is the only point that needs it.
             if sleep_rollout or not generation_succeeded:
                 self._residency.set(Role.ROLLOUT, False)
+
+    def _log_reward_stack_timing(self) -> None:
+        """Surface the stack's per-rank generate/score split on the driver, where worker logs do not reach."""
+        per_rank = self.reward_stack.timing()
+        keys = ("generate_s", "score_s", "wall_s")
+        peak = {k: max(float(t[k]) for t in per_rank) for k in keys}
+        mean = {k: sum(float(t[k]) for t in per_rank) / len(per_rank) for k in keys}
+        logger.info(
+            "reward stack timing: ranks=%d rows=%d micros=%d generate_s=%.2f/%.2f score_s=%.2f/%.2f "
+            "wall_s=%.2f/%.2f (max/mean)",
+            len(per_rank),
+            int(per_rank[0]["rows"]),
+            int(per_rank[0]["micros"]),
+            peak["generate_s"],
+            mean["generate_s"],
+            peak["score_s"],
+            mean["score_s"],
+            peak["wall_s"],
+            mean["wall_s"],
+        )
+        timer = getattr(self, "_step_timer", None)
+        if timer is not None:
+            timer.phases["stack_generate"] = timer.phases.get("stack_generate", 0.0) + peak["generate_s"]
+            timer.phases["stack_score"] = timer.phases.get("stack_score", 0.0) + peak["score_s"]
 
     def _generate_for_training(self, sample: Sample, *, sync_weights: bool) -> Sample:
         return self._generate_with_residency(
