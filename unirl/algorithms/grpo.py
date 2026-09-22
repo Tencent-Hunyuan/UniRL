@@ -117,10 +117,40 @@ class GRPO(StageAlgorithm):
         new_logp = self.stage.replay(
             typed_conds, segment=segment, temperature=self.sampling_temperature
         )  # [total_tokens]
-        # old_logp = the frozen π_old anchor established by prepare_segment:
-        # the rollout log-prob by default, or a train-side replay under
-        # old_logp_source='replay'. Either way it stays frozen across all
-        # num_updates_per_batch steps (see the supports_multi_update comment).
+        loss, clip_range, ratio_metrics = self._build_policy_loss(
+            segment=segment,
+            new_logp=new_logp,
+            advantages=advantages,
+            training_progress=training_progress,
+        )
+        (loss * loss_scale).backward()
+
+        rollout_logp = (segment.rollout_log_probs if segment.rollout_log_probs is not None else segment.log_probs).to(
+            dtype=new_logp.dtype, device=new_logp.device
+        )
+        metrics: Dict[str, Any] = {
+            "policy_loss": float(loss.detach().item()),
+            "clip_range": float(clip_range),
+            **rollout_replay_logp_absdiff(new_logp, rollout_logp),
+            **rollout_replay_k3(new_logp, rollout_logp),
+            **{k: float(v.item()) for k, v in ratio_metrics.items()},
+        }
+        return AlgorithmStepResult(
+            loss=float(loss.detach().item()),
+            metrics=metrics,
+            num_steps_or_tokens=int(new_logp.shape[0]),
+            has_backward=True,
+        )
+
+    def _build_policy_loss(
+        self,
+        *,
+        segment: "TextSegment",
+        new_logp: torch.Tensor,
+        advantages: torch.Tensor,
+        training_progress: float,
+    ) -> tuple[torch.Tensor, float, Dict[str, torch.Tensor]]:
+        """Build the clipped loss against the frozen anchor without running replay or backward."""
         old_logp = segment.log_probs.to(dtype=new_logp.dtype, device=new_logp.device)
         adv_per_token = self._expand_advantages_to_tokens(
             advantages, segment.lengths, dtype=new_logp.dtype, device=new_logp.device
@@ -164,24 +194,7 @@ class GRPO(StageAlgorithm):
             loss = loss_per_elem.mean()
         else:
             loss = loss_per_elem.sum() / mask.sum().clamp(min=1)
-        (loss * loss_scale).backward()
-
-        rollout_logp = (segment.rollout_log_probs if segment.rollout_log_probs is not None else segment.log_probs).to(
-            dtype=new_logp.dtype, device=new_logp.device
-        )
-        metrics: Dict[str, Any] = {
-            "policy_loss": float(loss.detach().item()),
-            "clip_range": float(clip_range),
-            **rollout_replay_logp_absdiff(new_logp, rollout_logp),
-            **rollout_replay_k3(new_logp, rollout_logp),
-            **{k: float(v.item()) for k, v in ratio_metrics.items()},
-        }
-        return AlgorithmStepResult(
-            loss=float(loss.detach().item()),
-            metrics=metrics,
-            num_steps_or_tokens=int(new_logp.shape[0]),
-            has_backward=True,
-        )
+        return loss, clip_range, ratio_metrics
 
     @staticmethod
     def _expand_advantages_to_tokens(
