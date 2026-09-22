@@ -9,19 +9,40 @@ import torch.nn as nn
 
 from ...common.providers import linear
 
+_PARITY_O_PROJECTION_CLASSES: dict[type, type] = {}
 
-def _column_weight_loader(rank: int, world: int):
-    def load(parameter, loaded_weight):
-        rows = int(loaded_weight.shape[0])
-        shard = rows // world
-        parameter.data.copy_(
-            loaded_weight.narrow(0, rank * shard, shard).to(
-                device=parameter.device,
-                dtype=parameter.dtype,
-            )
-        )
 
-    return load
+def _use_direct_layerwise_reload(layer) -> None:
+    """Keep the custom o-proj storage live and load it without meta staging.
+
+    The parity projection replaces vLLM's row-parallel parameter with a
+    column-parallel one of equal element count but different shape. vLLM's
+    generic meta-staged reload cannot infer that custom layout and copied the
+    local q-projection shard into this storage. Skipping meta staging lets the
+    bound loader write the canonical full o-proj directly into its CuMem
+    weights-pool allocation.
+    """
+    from vllm.model_executor.model_loader.reload.meta import SKIP_MODULES
+
+    base_class = type(layer)
+    parity_class = _PARITY_O_PROJECTION_CLASSES.get(base_class)
+    if parity_class is None:
+        parity_class = type("UniRLParityOProjection", (base_class,), {})
+        _PARITY_O_PROJECTION_CLASSES[base_class] = parity_class
+    layer.__class__ = parity_class
+    SKIP_MODULES.add(parity_class.__name__)
+
+
+def _column_weight_loader(self, parameter, loaded_weight):
+    rank = int(self._unirl_parity_tp_rank)
+    world = int(self._unirl_parity_tp_world)
+    rows = int(loaded_weight.shape[0])
+    shard = rows // world
+    loaded_shard = loaded_weight.narrow(0, rank * shard, shard).to(
+        device=parameter.device,
+        dtype=parameter.dtype,
+    )
+    parameter.data.copy_(loaded_shard)
 
 
 def _reshape_row_to_column(layer) -> None:
@@ -32,6 +53,7 @@ def _reshape_row_to_column(layer) -> None:
 
     rank = get_tensor_model_parallel_rank()
     world = get_tensor_model_parallel_world_size()
+    _use_direct_layerwise_reload(layer)
     old = layer.weight
     replacement = nn.Parameter(
         torch.empty(
@@ -42,7 +64,12 @@ def _reshape_row_to_column(layer) -> None:
         ),
         requires_grad=False,
     )
-    replacement.weight_loader = _column_weight_loader(rank, world)
+    from vllm.model_executor.utils import set_weight_attrs
+
+    layer._unirl_parity_tp_rank = int(rank)
+    layer._unirl_parity_tp_world = int(world)
+    loader = types.MethodType(_column_weight_loader, layer)
+    set_weight_attrs(replacement, {"weight_loader": loader})
     layer.weight = replacement
     layer._unirl_parity_output_size = layer.output_size
 

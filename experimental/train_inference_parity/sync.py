@@ -9,6 +9,18 @@ from typing import Any, Optional
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.weight_sync.full.ipc import IPCWeightSync
 
+# Prefer shards that a 1e-6 BF16 AdamW step is likely to change. Sampling the
+# smallest RMSNorms first produced false "no actor shard changed" failures.
+_FINGERPRINT_NAME_SUFFIXES = (
+    "embed_tokens.weight",
+    "lm_head.weight",
+    "self_attn.q_proj.weight",
+    "self_attn.o_proj.weight",
+    "mlp.gate.weight",
+    "mlp.experts.gate_up_proj",
+    "mlp.experts.down_proj",
+)
+
 
 class ParityIPCWeightSync(IPCWeightSync):
     """Record actor-change and native publication evidence without owning transport."""
@@ -32,6 +44,28 @@ class ParityIPCWeightSync(IPCWeightSync):
         self._actor_update_pending = False
         self._publication_history: list[dict[str, Any]] = []
 
+    def _select_fingerprint_parameters(self, candidates: list[tuple[str, Any]]) -> list[tuple[str, Any]]:
+        """Pick large structural shards instead of the smallest RMSNorms."""
+        selected: list[tuple[str, Any]] = []
+        seen: set[str] = set()
+        for suffix in _FINGERPRINT_NAME_SUFFIXES:
+            for name, parameter in candidates:
+                if name.endswith(suffix) and name not in seen:
+                    selected.append((name, parameter))
+                    seen.add(name)
+                    break
+        remaining = sorted(
+            ((name, parameter) for name, parameter in candidates if name not in seen),
+            key=lambda item: (-int(item[1].numel()), item[0]),
+        )
+        for name, parameter in remaining:
+            if len(selected) >= self._fingerprint_param_samples:
+                break
+            selected.append((name, parameter))
+            seen.add(name)
+        selected.sort(key=lambda item: item[0])
+        return selected[: self._fingerprint_param_samples]
+
     def _capture_local_shard_fingerprints(self, phase: str) -> dict[str, str]:
         fingerprints: dict[str, str] = {}
         error: Optional[BaseException] = None
@@ -44,8 +78,7 @@ class ParityIPCWeightSync(IPCWeightSync):
                 for name, parameter in self._backend.model.named_parameters()
                 if parameter.requires_grad and not parameter.is_meta
             ]
-            candidates.sort(key=lambda item: (int(item[1].numel()), item[0]))
-            for name, parameter in candidates[: self._fingerprint_param_samples]:
+            for name, parameter in self._select_fingerprint_parameters(candidates):
                 local = parameter.detach()
                 if isinstance(local, DTensor):
                     local = local.to_local()

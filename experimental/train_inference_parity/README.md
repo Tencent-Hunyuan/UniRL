@@ -123,7 +123,8 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 uv run python -m experimental.train_inference_parit
 Defaults:
 
 - W&B disabled; opt in with `logging.report_to_wandb=true`
-- vLLM native packed-IPC sync with a 640 MiB bucket and 2 GiB GPU safety margin
+- vLLM native packed-IPC sync with a 640 MiB bucket, 2 GiB GPU safety margin,
+  and a Gloo control timeout (2400s) that outlives the 1800s weight-update RPC
 - atomic JSON artifact:
   `outputs/train_inference_parity/qwen3-moe-tp4.json` (override
   `UNIRL_PARITY_ARTIFACT_PATH`)
@@ -154,15 +155,25 @@ The canonical metric names are `token_count`, `torch_equal_fp32`,
 1. Keep the recipe on `ParityIPCWeightSync`, which subclasses the production
    `IPCWeightSync` data plane and adds evidence only.
 2. Preserve `record_initial_actor_fingerprint()`, `mark_actor_updated()`, and
-   `verification_receipts()` on the parity sync adapter. Each publication must
-   include the native structural manifest, one receipt for every TP rank,
-   matching publication/model identities, unique CUDA UUIDs,
-   `parameter_changed: true`, and `prefix_cache_reset: true`.
-3. Keep actor and direct-vLLM prompt handling suffix-preserving at the same
+   `verification_receipts()` on the parity sync adapter. Actor-change evidence
+   samples large structural shards (embed, Q/O, MoE, LM head), not the smallest
+   RMSNorms. Each publication must include the native structural manifest, one
+   receipt for every TP rank, matching publication/model identities, unique CUDA
+   UUIDs, `parameter_changed: true`, and `prefix_cache_reset: true`.
+3. `TrainInferenceParityGRPO` must reach a pre-replay error barrier before any
+   rank enters FSDP/vLLM collectives, then the exact log-prob gate after replay.
+4. Preserve the plugin's reload lifecycle: clear the derived MoE column cache
+   before vLLM sleep, leave the stock expert Parameter loaders unobstructed, and
+   load the custom column-parallel `o_proj` directly into its CuMem allocation
+   instead of passing it through vLLM's generic meta-staged reload.
+5. Keep actor and direct-vLLM prompt handling suffix-preserving at the same
    configured `max_prompt_length`; do not re-enable tokenizer-default
    chat-template truncation before the shared engine limit.
-4. Run from a clean tracked worktree on the frozen matrix and publish the
-   resulting artifact before changing this status to PASS.
+6. Each phase must observe `batch_size × samples_per_prompt × max_new_tokens`
+   replay tokens (`4 × 8 × 1024 = 32768` on the frozen recipe).
+7. Run from a clean source worktree on the frozen matrix and publish the
+   resulting artifact before changing this status to PASS. Generated `outputs/`
+   and plugin egg-info do not count as dirty source.
 
 ## Package boundaries
 

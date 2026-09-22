@@ -145,7 +145,7 @@ sync:
   bucket_size_mb: 640
   flush_cache: true
   gpu_memory_headroom_mb: 2048
-  control_timeout_s: 900
+  control_timeout_s: 2400
 
 stack:
   _target_: unirl.train.stack.TrainStack

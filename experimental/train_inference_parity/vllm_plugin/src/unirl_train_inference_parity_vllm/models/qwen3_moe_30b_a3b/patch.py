@@ -66,6 +66,30 @@ def _install_rope() -> tuple[SymbolResult, ...]:
     )
 
 
+def _install_sleep_cache_invalidation() -> SymbolResult:
+    """Drop parity-owned CUDA caches before vLLM releases their allocations."""
+    import vllm.v1.worker.gpu_worker as gpu_worker
+
+    original_sleep = gpu_worker.Worker.sleep
+
+    def sleep(self, level: int = 1) -> None:
+        model = getattr(getattr(self, "model_runner", None), "model", None)
+        if model is not None:
+            for module in model.modules():
+                before_sleep = getattr(module, "_unirl_before_sleep", None)
+                if callable(before_sleep):
+                    before_sleep()
+        original_sleep(self, level=level)
+
+    gpu_worker.Worker.sleep = sleep
+    return symbol_result(
+        "vllm.v1.worker.gpu_worker.Worker.sleep",
+        sleep,
+        before=original_sleep,
+        actual=gpu_worker.Worker.sleep,
+    )
+
+
 def preflight_qwen3_moe_patch(strict: bool) -> None:
     preflight_providers(strict=strict)
     contracts = (
@@ -205,6 +229,12 @@ def preflight_qwen3_moe_patch(strict: bool) -> None:
             ),
             ("vllm.model_executor.layers.fused_moe.router.fused_topk_router.FusedTopKRouter._compute_routing"),
         ),
+        (
+            "vllm.v1.worker.gpu_worker",
+            "Worker.sleep",
+            (("self", "<required>"), ("level", "1")),
+            "vllm.v1.worker.gpu_worker.Worker.sleep",
+        ),
     )
     for module, symbol, parameters, origin in contracts:
         require_symbol(
@@ -231,6 +261,7 @@ def install_qwen3_moe_patch(*, strict: bool) -> PatchResult:
     attention = make_attention(original_attention)
     logits_processor = make_logits_processor(original_logits_processor)
     rope_results = _install_rope()
+    sleep_result = _install_sleep_cache_invalidation()
     module.Qwen3MoeSparseMoeBlock = moe_block
     module.Qwen3MoeAttention = attention
     module.LogitsProcessor = logits_processor
@@ -240,6 +271,7 @@ def install_qwen3_moe_patch(*, strict: bool) -> PatchResult:
         name="qwen3_moe_30b_a3b",
         symbols=(
             *rope_results,
+            sleep_result,
             symbol_result(
                 ("vllm.model_executor.models.qwen3_moe.Qwen3MoeSparseMoeBlock"),
                 moe_block,

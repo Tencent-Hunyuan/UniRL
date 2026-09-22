@@ -80,8 +80,10 @@ def _validate_gsm8k_jsonl(path: Path, *, min_rows: int) -> list[str]:
                 prompt_id = row.get("prompt_id")
                 prompt = row.get("prompt")
                 metadata = row.get("metadata")
-                if not isinstance(prompt_id, str) or not prompt_id.startswith("gsm8k-"):
-                    errors.append(f"{path}:{line_number} has non-GSM8K prompt_id={prompt_id!r}")
+                if prompt_id is None:
+                    prompt_id = f"{path}:{line_number}"
+                elif not isinstance(prompt_id, str) or not prompt_id.strip():
+                    errors.append(f"{path}:{line_number} has an empty prompt_id")
                     break
                 if prompt_id in prompt_ids:
                     errors.append(f"{path}:{line_number} duplicates prompt_id={prompt_id!r}")
@@ -159,6 +161,13 @@ class ParityRuntimeContract:
             "num_updates_per_batch": _select(self.cfg, "stack.num_updates_per_batch"),
             "data_shuffle": _select(self.cfg, "data_source.args.run.shuffle"),
             "data_seed": _select(self.cfg, "data_source.args.run.seed"),
+            "batch_size": _select(self.cfg, "batch_size"),
+            "samples_per_prompt": _select(self.cfg, "sampling.samples_per_prompt"),
+            "expected_token_count": (
+                _int(_select(self.cfg, "batch_size", 0))
+                * _int(_select(self.cfg, "sampling.samples_per_prompt", 0))
+                * self.max_new_tokens
+            ),
             "ignore_eos": _select(self.cfg, "rollout.config.ignore_eos"),
             "enable_prefix_caching": _select(self.cfg, "rollout.config.enable_prefix_caching"),
             "enable_chunked_prefill": _select(self.cfg, "rollout.config.enable_chunked_prefill"),
@@ -224,6 +233,7 @@ class ParityRuntimeContract:
         expect("rollout.config.moe_backend", "triton")
         expect("rollout.config.enable_prefix_caching", False)
         expect("rollout.config.enable_chunked_prefill", False)
+        expect("rollout.config.ignore_eos", True)
         expect("rollout.config.startup_timeout_s", 300)
         expect("rollout.config.generate_timeout_s", 7200)
         expect("rollout.config.weight_update_timeout_s", 1800)
@@ -269,7 +279,14 @@ class ParityRuntimeContract:
         expect("sync.flush_cache", True)
         expect("sync.bucket_size_mb", 640)
         expect("sync.gpu_memory_headroom_mb", 2048)
-        expect("sync.control_timeout_s", 900)
+        expect("sync.control_timeout_s", 2400)
+        weight_timeout = float(_select(self.cfg, "rollout.config.weight_update_timeout_s") or 0)
+        control_timeout = float(_select(self.cfg, "sync.control_timeout_s") or 0)
+        if control_timeout < weight_timeout + 300.0:
+            errors.append(
+                "sync.control_timeout_s must exceed rollout.config.weight_update_timeout_s "
+                f"by at least 300s; got control={control_timeout}, weight_update={weight_timeout}"
+            )
         expect("backend.fsdp_cfg.activation_checkpointing", True)
         expect("bundle.config.use_gradient_checkpointing", True)
         expect("bundle.config.attn_implementation", "flash_attention_3")

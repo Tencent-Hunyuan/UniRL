@@ -153,9 +153,17 @@ def local_gate_status(
 def _collective_device(new_logp: Optional[torch.Tensor]) -> torch.device:
     if isinstance(new_logp, torch.Tensor) and new_logp.is_cuda:
         return new_logp.device
-    backend = str(dist.get_backend()).lower()
-    if "nccl" in backend:
-        return torch.device("cuda", torch.cuda.current_device())
+    # A multi-backend default group may report itself as ``undefined`` even
+    # though its CUDA backend is NCCL. Query that device backend directly:
+    # NCCL rejects CPU status rows, while a Gloo-only test should stay on CPU.
+    if torch.cuda.is_available() and dist.is_available() and dist.is_initialized():
+        try:
+            group = dist.distributed_c10d._get_default_group()
+            cuda_backend = group._get_backend(torch.device("cuda"))
+            if "nccl" in type(cuda_backend).__name__.lower():
+                return torch.device("cuda", torch.cuda.current_device())
+        except RuntimeError:
+            pass
     return torch.device("cpu")
 
 
@@ -223,4 +231,30 @@ def exact_parity_gate(
     return collective_fail_closed(local, collective_tensor=new_logp)
 
 
-__all__ = ["collective_fail_closed", "exact_parity_gate", "local_gate_status"]
+def collective_error_barrier(local_error: Optional[str], *, phase: str) -> None:
+    """Synchronize a rank-local setup error before every rank enters the next collective.
+
+    Replay and FSDP forwards perform their own collectives. A rank that raises
+    before those calls never reaches the later exact gate, so the remaining
+    ranks hang. This barrier is the pre-replay meeting point.
+    """
+    local = _LocalStatus(
+        shape_ok=local_error is None,
+        dtype_ok=local_error is None,
+        finite_ok=local_error is None,
+        mismatch_count=0 if local_error is None else 1,
+        max_absdiff_fp32=0.0 if local_error is None else math.inf,
+        token_count=0,
+        k3_sum=0.0 if local_error is None else math.inf,
+        k3_max=0.0 if local_error is None else math.inf,
+        diagnostic={"phase": str(phase), "error": None if local_error is None else str(local_error)},
+    )
+    collective_fail_closed(local)
+
+
+__all__ = [
+    "collective_error_barrier",
+    "collective_fail_closed",
+    "exact_parity_gate",
+    "local_gate_status",
+]

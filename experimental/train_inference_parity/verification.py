@@ -100,22 +100,56 @@ def _run_git(*args: str) -> str:
     return result.stdout.strip()
 
 
+_GIT_DIRTY_ALLOWLIST_PREFIXES = (
+    "outputs/",
+    "experimental/train_inference_parity/vllm_plugin/src/unirl_train_inference_parity_vllm.egg-info/",
+)
+_GIT_DIRTY_ALLOWLIST_SUFFIXES = (".egg-info", ".egg-info/")
+
+
+def _git_path_from_porcelain(line: str) -> str:
+    path = line[3:] if len(line) > 3 else line
+    if " -> " in path:
+        path = path.split(" -> ", 1)[1]
+    return path.strip()
+
+
+def _git_path_is_allowlisted(path: str) -> bool:
+    normalized = path.replace("\\", "/").lstrip("./")
+    if any(normalized.startswith(prefix) for prefix in _GIT_DIRTY_ALLOWLIST_PREFIXES):
+        return True
+    return any(
+        normalized.endswith(suffix) or f"{normalized}/".endswith(suffix) for suffix in _GIT_DIRTY_ALLOWLIST_SUFFIXES
+    )
+
+
 def _git_state() -> Dict[str, Any]:
     try:
         commit = _run_git("rev-parse", "HEAD")
-        # Generated artifacts and unrelated untracked inputs do not make tracked
-        # source dirty; every tracked modification still does.
-        tracked_status = _run_git("status", "--porcelain", "--untracked-files=no")
+        # Tracked edits always count. Untracked generated outputs are ignored;
+        # untracked Python/source next to the experiment still makes the tree dirty.
+        porcelain = _run_git("status", "--porcelain")
+        dirty_lines = []
+        for line in porcelain.splitlines():
+            if not line.strip():
+                continue
+            path = _git_path_from_porcelain(line)
+            if line.startswith("??") and _git_path_is_allowlisted(path):
+                continue
+            if line.startswith("??") and not path.endswith((".py", ".yaml", ".yml", ".toml", ".json")):
+                continue
+            dirty_lines.append(line)
         return {
             "commit": commit,
-            "dirty": bool(tracked_status),
-            "dirty_scope": "tracked_files",
+            "dirty": bool(dirty_lines),
+            "dirty_scope": "tracked_and_untracked_source",
+            "dirty_paths": dirty_lines,
         }
     except (FileNotFoundError, subprocess.SubprocessError) as error:
         return {
             "commit": None,
             "dirty": None,
-            "dirty_scope": "tracked_files",
+            "dirty_scope": "tracked_and_untracked_source",
             "error": f"{type(error).__name__}: {error}",
         }
 
@@ -507,8 +541,14 @@ class ParityVerification:
                     f"aggregated token_count={reported_token_count} does not match per-rank total={token_count}"
                 )
             canonical["token_count"] = token_count
+            expected_tokens = int(self.contract.flags().get("expected_token_count") or 0)
             if token_count <= 0:
                 raise RuntimeError(f"{phase_name} recorded no replay tokens")
+            if expected_tokens > 0 and token_count != expected_tokens:
+                raise RuntimeError(
+                    f"{phase_name} token_count={token_count}; expected {expected_tokens} "
+                    "(batch_size × samples_per_prompt × max_new_tokens with ignore_eos)"
+                )
 
             receipts: list[Dict[str, Any]] = []
             parameter_changed: Optional[bool] = None
@@ -652,7 +692,7 @@ class ParityVerification:
         failures = [reason for phase in phases for reason in phase.get("failure_reasons", [])]
         git_state = self._document["git"]
         if git_state.get("dirty") is not False:
-            failures.append("git tracked-files state is dirty or unknown")
+            failures.append("git source tree is dirty or unknown")
         if complete and not failures and all(phase.get("status") == "PASS" for phase in phases):
             self._document["status"] = "PASS"
             self._document["failure_reasons"] = []

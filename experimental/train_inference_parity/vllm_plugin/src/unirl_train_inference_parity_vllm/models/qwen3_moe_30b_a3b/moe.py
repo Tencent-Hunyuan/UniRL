@@ -120,18 +120,10 @@ def _install_reload_invalidation(experts) -> None:
 
     load_weights._unirl_parity_wrapper = True
     experts.load_weights = types.MethodType(load_weights, experts)
-    routed_experts = _routed_experts(experts)
-    for parameter in (routed_experts.w13_weight, routed_experts.w2_weight):
-        parameter_loader = parameter.weight_loader
-        if getattr(parameter_loader, "_unirl_parity_wrapper", False):
-            continue
-
-        def weight_loader(*args, _loader=parameter_loader, **kwargs):
-            experts._unirl_parity_w2_column = None
-            return _loader(*args, **kwargs)
-
-        weight_loader._unirl_parity_wrapper = True
-        parameter.weight_loader = weight_loader
+    # Do not wrap w13/w2 Parameter loaders. vLLM's layerwise WTE reload
+    # introspects and replays those exact loaders; a variadic invalidation
+    # wrapper caused all 96 expert tensors to be reconstructed incorrectly.
+    # The module hook above and the worker pre-sleep hook cover cache lifetime.
 
 
 def _expert_forward(block, hidden_states: torch.Tensor) -> torch.Tensor:
