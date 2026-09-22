@@ -1,43 +1,62 @@
 """Shared reward data types."""
 
 from dataclasses import dataclass, field
-from enum import Enum
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 import torch
 from PIL import Image
 
 from unirl.distributed.tensor.batch import Batch, concat_field, max_field
+from unirl.types.primitives import PrimitiveValue, Texts, primitive_modality_key
 
-
-class RewardType(Enum):
-    """Types of reward computation."""
-
-    IMAGE_TEXT_ALIGNMENT = "image_text_alignment"
-    AESTHETIC = "aesthetic"
-    CUSTOM = "custom"
+PromptSource = Literal["original", "generation"]
+PROMPT_SOURCES: tuple[PromptSource, ...] = ("original", "generation")
+DEFAULT_PROMPT_SOURCE: PromptSource = "generation"
 
 
 @dataclass
 class RewardRequest:
     """Request for reward computation."""
 
-    primitives: Dict[str, Any] = field(default_factory=dict)
-    generated: Dict[str, Any] = field(default_factory=dict)
+    generated: Dict[str, PrimitiveValue] = field(default_factory=dict)
+    conditioning: Dict[str, PrimitiveValue] = field(default_factory=dict)
+    original_prompt: Optional[Texts] = None
+    generation_prompt: Optional[Texts] = None
     metadata: Optional[List[Optional[Dict[str, Any]]]] = None
-    prompt_ids: Optional[List[str]] = None
     sample_ids: Optional[List[str]] = None
     group_ids: Optional[List[str]] = None
-    reward_types: List[RewardType] = field(default_factory=lambda: [RewardType.IMAGE_TEXT_ALIGNMENT])
-    return_components: bool = False
     audio_sample_rate: Optional[int] = None
 
-    @property
-    def prompts(self) -> List[str]:
-        prim = self.primitives.get("text")
-        if prim is None:
-            return []
-        return list(prim.texts)
+    def __post_init__(self) -> None:
+        if "text" in self.conditioning:
+            raise ValueError(
+                "RewardRequest.conditioning must contain only non-text condition media; "
+                "use original_prompt/generation_prompt for text."
+            )
+
+        batch_sizes: Dict[str, int] = {}
+        for owner, values in (("generated", self.generated), ("conditioning", self.conditioning)):
+            for key, value in values.items():
+                actual_key = primitive_modality_key(value)
+                if key != actual_key:
+                    raise ValueError(
+                        f"RewardRequest.{owner}[{key!r}] contains {type(value).__name__}, "
+                        f"whose canonical modality key is {actual_key!r}."
+                    )
+                batch_sizes[f"{owner}[{key!r}]"] = len(value)
+        for name, value in (
+            ("original_prompt", self.original_prompt),
+            ("generation_prompt", self.generation_prompt),
+            ("metadata", self.metadata),
+            ("sample_ids", self.sample_ids),
+            ("group_ids", self.group_ids),
+        ):
+            if value is not None:
+                batch_sizes[name] = len(value)
+
+        if len(set(batch_sizes.values())) > 1:
+            details = ", ".join(f"{name}={size}" for name, size in batch_sizes.items())
+            raise ValueError(f"RewardRequest fields must share one batch size; got {details}.")
 
     @property
     def images(self) -> Optional[List[Union[Image.Image, torch.Tensor]]]:
@@ -75,7 +94,10 @@ class RewardRequest:
         for v in self.generated.values():
             if v is not None:
                 return len(v)
-        for v in self.primitives.values():
+        for v in (self.original_prompt, self.generation_prompt):
+            if v is not None:
+                return len(v)
+        for v in self.conditioning.values():
             if v is not None:
                 return len(v)
         return 0
@@ -105,7 +127,9 @@ class RewardResponse(Batch):
 
 
 __all__ = [
+    "DEFAULT_PROMPT_SOURCE",
+    "PROMPT_SOURCES",
+    "PromptSource",
     "RewardRequest",
     "RewardResponse",
-    "RewardType",
 ]
