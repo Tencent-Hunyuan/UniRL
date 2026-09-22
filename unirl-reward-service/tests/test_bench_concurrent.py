@@ -41,7 +41,7 @@ def test_run_record_keeps_scores_and_throughput() -> None:
             bench._Outcome(ok=False, latency_s=0.2, err="TimeoutError: late"),
         ],
     )
-    record = bench._run_record(stats, ["clip"], batch_size=2, repetition=1)
+    record = bench._run_record(stats, ["clip"], batch_size=2)
     assert record["successful_requests"] == 1
     assert record["failed_requests"] == 1
     assert record["items_per_second"] == 4.0

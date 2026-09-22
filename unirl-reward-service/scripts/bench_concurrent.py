@@ -101,14 +101,6 @@ def _get_client(url: str, timeout: float | None, trust_env: bool) -> RewardClien
     return client
 
 
-def _valid_score(value: object) -> bool:
-    return (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and math.isfinite(value)
-    )
-
-
 def _fire_once(
     url: str,
     timeout: float | None,
@@ -136,17 +128,24 @@ def _fire_once(
     else:
         elapsed = time.perf_counter() - t0
 
-    # Missing, empty, or non-finite scores are request failures. The client
-    # strips body["errors"], so a missing key is the only signal we get.
+    # Server-side per-reward failures come back as missing keys in the
+    # result dict. We don't have direct access to body["errors"] here
+    # (the client strips it), so missing = failed.
     reward_errs: Counter = Counter()
     score_values: dict[str, list[float]] = {}
     for result in results:
         for name in rewards:
             reward_result = result.get(name) if isinstance(result, dict) else None
-            if not isinstance(reward_result, dict) or not reward_result:
-                reward_errs[name] += 1
-                continue
-            if any(not _valid_score(value) for value in reward_result.values()):
+            if (
+                not isinstance(reward_result, dict)
+                or not reward_result
+                or any(
+                    not isinstance(value, (int, float))
+                    or isinstance(value, bool)
+                    or not math.isfinite(value)
+                    for value in reward_result.values()
+                )
+            ):
                 reward_errs[name] += 1
                 continue
             for metric, value in reward_result.items():
@@ -204,40 +203,14 @@ class _RunStats:
         return agg
 
 
-def _run_record(stats: _RunStats, rewards: list[str], batch_size: int, repetition: int) -> dict[str, Any]:
-    scores = {}
-    for name, values in sorted(stats.score_values.items()):
-        if values:
-            scores[name] = {
-                "count": len(values),
-                "mean": statistics.fmean(values),
-                "values": sorted(values),
-            }
-    return {
-        "repetition": repetition,
-        "rewards": rewards,
-        "concurrency": stats.concurrency,
-        "batch_size": batch_size,
-        "successful_requests": stats.ok,
-        "failed_requests": stats.fail,
-        "items_per_second": stats.qps * batch_size,
-        "scores": scores,
-    }
-
-
 def _run_one(
     args: argparse.Namespace,
     image: Image.Image,
     rewards: list[str],
     concurrency: int,
-    batch_size: int,
 ) -> _RunStats:
     total = args.total
-    print(
-        f"\n=== concurrency={concurrency}  batch_size={batch_size}  "
-        f"total={total} ===",
-        flush=True,
-    )
+    print(f"\n=== concurrency={concurrency}  total={total} ===", flush=True)
 
     outcomes: list[_Outcome] = []
     progress_step = max(total // 10, 1)
@@ -255,7 +228,7 @@ def _run_one(
                 args.prompt,
                 image,
                 rewards,
-                batch_size,
+                args.batch_size,
             )
             for _ in range(total)
         ]
@@ -275,8 +248,32 @@ def _run_one(
     wall = time.perf_counter() - t0
 
     stats = _RunStats(concurrency=concurrency, total=total, wall_s=wall, outcomes=outcomes)
-    _print_stats(stats, batch_size=batch_size)
+    _print_stats(stats, batch_size=args.batch_size)
+    recorded = getattr(args, "_recorded", None)
+    if recorded is not None:
+        recorded.append(_run_record(stats, rewards, args.batch_size))
     return stats
+
+
+def _run_record(stats: _RunStats, rewards: list[str], batch_size: int) -> dict[str, Any]:
+    scores = {
+        name: {
+            "count": len(values),
+            "mean": statistics.fmean(values),
+            "values": sorted(values),
+        }
+        for name, values in sorted(stats.score_values.items())
+        if values
+    }
+    return {
+        "rewards": rewards,
+        "concurrency": stats.concurrency,
+        "batch_size": batch_size,
+        "successful_requests": stats.ok,
+        "failed_requests": stats.fail,
+        "items_per_second": stats.qps * batch_size,
+        "scores": scores,
+    }
 
 
 def _print_stats(s: _RunStats, batch_size: int) -> None:
@@ -436,8 +433,6 @@ def main() -> int:
         ap.error("either --concurrency or --sweep is required")
     if args.total <= 0:
         ap.error("--total must be positive")
-    if args.batch_size <= 0:
-        ap.error("--batch-size must be positive")
     if args.batch_sweep is not None and any(size <= 0 for size in args.batch_sweep):
         ap.error("--batch-sweep values must be positive")
     if args.repetitions <= 0:
@@ -477,34 +472,54 @@ def main() -> int:
         )
         return 1
 
-    levels = args.sweep if args.sweep is not None else [args.concurrency]
-    batch_sizes = args.batch_sweep if args.batch_sweep is not None else [args.batch_size]
-    reward_sets = [[name] for name in rewards] if args.per_reward_isolated else [rewards]
     print(
-        f"url={args.url}  rewards={rewards}  batch_sizes={batch_sizes}  "
+        f"url={args.url}  rewards={rewards}  batch_size={args.batch_size}  "
         f"image={image_path.name} size={image.size}"
     )
 
-    completed: list[tuple[str, _RunStats]] = []
+    levels = args.sweep if args.sweep is not None else [args.concurrency]
     recorded: list[dict[str, Any]] = []
-    for repetition in range(1, args.repetitions + 1):
-        for batch_size in batch_sizes:
-            for reward_set in reward_sets:
-                stats_list = [
-                    _run_one(args, image, reward_set, level, batch_size)
-                    for level in levels
-                ]
-                for stats in stats_list:
-                    recorded.append(
-                        _run_record(stats, reward_set, batch_size, repetition)
-                    )
-                    name = reward_set[0] if args.per_reward_isolated else ",".join(reward_set)
-                    completed.append((f"{name}@b{batch_size}#{repetition}", stats))
-                if len(stats_list) > 1:
-                    _print_sweep_summary(stats_list)
+    args._recorded = recorded if args.output is not None else None
+    batch_sizes = args.batch_sweep if args.batch_sweep is not None else [args.batch_size]
+    exit_code = 0
 
-    if args.per_reward_isolated and len(levels) == 1:
-        _print_per_reward_summary(completed)
+    # Three modes:
+    #   - sweep (levels > 1) + isolated: for each reward, run the sweep.
+    #     Prints one sweep summary per reward. Probably overkill; included
+    #     for completeness.
+    #   - single level + isolated: run each reward alone at one concurrency,
+    #     print one per-reward comparison table. This is the common case.
+    #   - not isolated: original behaviour — all rewards together.
+    for _ in range(args.repetitions):
+        for batch_size in batch_sizes:
+            args.batch_size = batch_size
+            if args.per_reward_isolated:
+                if len(levels) == 1:
+                    concurrency = levels[0]
+                    named: list[tuple[str, _RunStats]] = []
+                    for name in rewards:
+                        print(f"\n--- isolated: reward={name} ---", flush=True)
+                        stats = _run_one(args, image, [name], concurrency)
+                        named.append((name, stats))
+                    _print_per_reward_summary(named)
+                    if any(s.fail != 0 for _, s in named):
+                        exit_code = 3
+                else:
+                    # Sweep + isolated: nested loop.
+                    for name in rewards:
+                        print(f"\n########  reward={name}  ########", flush=True)
+                        per_level = [_run_one(args, image, [name], c) for c in levels]
+                        _print_sweep_summary(per_level)
+                        if any(s.fail != 0 for s in per_level):
+                            exit_code = 3
+            else:
+                all_stats = [_run_one(args, image, rewards, c) for c in levels]
+
+                if len(all_stats) > 1:
+                    _print_sweep_summary(all_stats)
+                if any(s.fail != 0 for s in all_stats):
+                    exit_code = 3
+
     if args.output is not None:
         args.output.write_text(
             json.dumps({"rewards": rewards, "runs": recorded}, indent=2) + "\n",
@@ -513,7 +528,7 @@ def main() -> int:
         print(f"\nwrote benchmark JSON: {args.output}")
 
     # Non-zero exit if anything failed — makes CI / scripted use easier.
-    return 0 if all(stats.fail == 0 for _, stats in completed) else 3
+    return exit_code
 
 
 if __name__ == "__main__":
