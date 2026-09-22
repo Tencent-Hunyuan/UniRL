@@ -238,19 +238,18 @@ For the CUDA MPS experiment in
 [#463](https://github.com/Tencent-Hunyuan/UniRL/issues/463), launch
 [`configs/service.h20-dedicated.example.yaml`](configs/service.h20-dedicated.example.yaml)
 or [`configs/service.h20-shared.example.yaml`](configs/service.h20-shared.example.yaml)
-and label each independently started topology:
+and run the same client workload against each topology:
 
 ```bash
 python3 scripts/bench_concurrent.py \
     --url http://localhost:8080 --sweep 1 4 16 --batch-sweep 1 4 8 \
     --total 60 --repetitions 3 --rewards clip,pickscore \
-    --deployment-mode dedicated --gpu-count 2 \
-    --gpu-sample-interval 0.5 --output dedicated.json
+    --output dedicated.json
 ```
 
-`--deployment-mode` only labels the JSON; it does not start MPS or change
-Ray placement. Qualify `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE` per scorer and
-dtype before using a sub-100% limit.
+Missing or non-finite scores count as request failures. Qualify
+`CUDA_MPS_ACTIVE_THREAD_PERCENTAGE` per scorer and dtype before using a
+sub-100% limit.
 
 ## Design conventions
 
