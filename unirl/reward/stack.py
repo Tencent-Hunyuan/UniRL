@@ -44,19 +44,30 @@ class RewardStack(Remote):
         """Fill this shard's frontier Part micro by micro and return it with rewards attached."""
         gen = sample.parts[-1]
         total = int(gen.batch_size)
-        self._rows, self._micros, self._generate_s, self._score_s = total, 1, 0.0, 0.0
+        bounds = self._bounds(gen)
+        self._rows, self._micros, self._generate_s, self._score_s = total, len(bounds), 0.0, 0.0
         started = time.perf_counter()
         try:
-            if total <= self.micro_batch_size:
+            if len(bounds) == 1:
                 return self._score(self._generate(sample, gen, 0, total))
-            bounds = [
-                (start, min(start + self.micro_batch_size, total)) for start in range(0, total, self.micro_batch_size)
-            ]
-            self._micros = len(bounds)
             parts = self._overlapped(sample, gen, bounds) if self.overlap else self._serial(sample, gen, bounds)
             return sample.replace_frontier(Part.concat(parts))
         finally:
             self._wall_s = time.perf_counter() - started
+
+    def _bounds(self, gen: Part) -> List[Tuple[int, int]]:
+        """Micro slices of at least micro_batch_size rows, each extended to the end of the group it would split."""
+        total = int(gen.batch_size)
+        groups = gen.group_ids
+        bounds: List[Tuple[int, int]] = []
+        start = 0
+        while start < total:
+            end = min(start + self.micro_batch_size, total)
+            while end < total and groups[end] == groups[end - 1]:
+                end += 1
+            bounds.append((start, end))
+            start = end
+        return bounds
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def timing(self) -> Dict[str, float]:

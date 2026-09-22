@@ -63,9 +63,13 @@ merged response.
 ### Micro-batching the reward, and optionally overlapping it
 
 `RewardStack` (`stack.py`) is the optional worker-side scheduler for the diffusion
-training path. It receives one DP shard, slices the frontier Part into
-`micro_batch_size` rows at a time, calls the rollout engine per micro, scores that micro,
-and `Part.concat`s the results back into one Sample. Both the engine and the
+training path. It receives one DP shard, slices the frontier Part into micros of at
+least `micro_batch_size` rows, calls the rollout engine per micro, scores that micro,
+and `Part.concat`s the results back into one Sample. A micro never splits a generation
+group: it is extended to the end of the group it would otherwise cut, because the
+group-batched engines (the vLLM-Omni and SGLang DiT adapters) reject a request that
+holds part of a `samples_per_prompt` group, and the per-row trainside engine does not
+care either way. Both the engine and the
 `RewardService` arrive as sibling roles resolved on the same Worker, so every call is
 in-process: no dispatch, hence no `batch_size % dp_size` constraint on a micro.
 
