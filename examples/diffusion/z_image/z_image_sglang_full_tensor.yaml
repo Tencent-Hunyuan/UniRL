@@ -14,9 +14,9 @@
 # ZImageTransformer2DModel uses SEPARATE to_q/to_k/to_v + w1/w3. We still TRAIN LoRA
 # (backend.lora_cfg), but each sync folds the LoRA delta into the base weights
 # (sync.lora_merged: true) and pushes the MERGED full model. The engine's weight
-# updater applies the model's ``param_names_mapping`` so the separate q/k/v + w1/w3
-# tensors land in the fused to_qkv / w13 shards (see
-# sglang_diffusion/_patches/patch_weights_updater.py:_apply_fused_param_mapping).
+# SGLang 0.5.19 native post-training updater applies the model's
+# ``param_names_mapping`` and routes the separate q/k/v + w1/w3 tensors into the
+# fused to_qkv / w13 parameters through their weight loaders.
 #
 # CFG OFF (guidance_scale=0): SGLang gates CFG on guidance_scale>1, so 0 keeps it
 # off; trainer-side replay also runs CFG-free (no negative_text emitted).

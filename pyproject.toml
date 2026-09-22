@@ -89,8 +89,8 @@ vllm = [
   "vllm-omni==0.27.0rc1 ; sys_platform == 'linux'",
   "torch==2.13.0+cu130 ; sys_platform == 'linux'",
   "torchvision==0.28.0+cu130 ; sys_platform == 'linux'",
-  # torchaudio 2.11.0+cu130 is ABI-built against torch 2.11; there is no
-  # torchaudio >=2.12 on the cu130 index, so this extra does not pin it.
+  # torchaudio is not required directly by the vLLM backend, so this extra
+  # leaves it unpinned instead of installing an otherwise optional dependency.
   "av>=14.2,<19 ; sys_platform == 'linux'",
 ]
 # Exact upstream source snapshot that the fail-closed FastVideo patch package is
