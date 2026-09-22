@@ -437,6 +437,12 @@ class DiffusionTrainer(BaseTrainer):
                 "rewardstack requires a `reward:` block: the stack scores every micro through the reward "
                 "sibling on the same Worker, so without one there is nothing to call. Drop the `rewardstack:` block."
             )
+        if rewardstack_cfg is not None and not reward_resident:
+            raise ValueError(
+                "rewardstack is not supported with reward_resident=false: the stack scores inside the generation "
+                "window, outside _reward_phase(), so the planner would park the reward to wake the rollout and "
+                "never bring it back before the stack calls it. Drop the key or the `rewardstack:` block."
+            )
 
         _preflight_trainside_geometry(
             num_devices=int(self.num_devices),
@@ -480,12 +486,13 @@ class DiffusionTrainer(BaseTrainer):
                             f"{self.rollout.dp_size}: the stack must shard the batch exactly as the engine does, "
                             "or each micro reaches an engine rank expecting different rows."
                         )
-                    if int(self.reward_stack.sp_size) != 1:
+                    if int(self.reward_stack.sp_size) != 1 or int(self.reward_stack.tp_size) != 1:
                         raise ValueError(
-                            f"rewardstack is not supported with sp_size={self.reward_stack.sp_size}: the stack "
-                            "inherits the engine's SP layout, so every rank of an SP group receives the same shard "
-                            "and scores all of it, multiplying reward cost by sp_size. Drop the `rewardstack:` "
-                            "block on SP recipes."
+                            f"rewardstack is not supported with sp_size={self.reward_stack.sp_size} / "
+                            f"tp_size={self.reward_stack.tp_size}: the stack inherits the engine's layout and calls "
+                            "generate and score_and_attach in-process on every rank of a group, so an SP group "
+                            "scores the same shard sp_size times and a TP engine's non-leader shells return "
+                            "nothing to score. Drop the `rewardstack:` block on SP/TP recipes."
                         )
                 if sync_cfg is not None:
                     self.weight_sync = remote_hydra(sync_cfg, backend=self.backend, rollout=self.rollout)

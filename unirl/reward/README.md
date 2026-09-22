@@ -139,20 +139,24 @@ new remote reward needs no UniRL code — add it to the server and list its name
 
 ## Gotchas
 
-- **`rewardstack:` is colocate-only, `sp_size: 1` only, and it takes over two
-  driver-side facts** — `RewardStack` resolves the engine and the service as
-  siblings on one Worker, so `layout: separate` or `reward_fraction > 0` place them
-  in different placement scopes and the trainer rejects the block. The stack also
-  inherits the engine's SP layout, so with `sp_size > 1` every rank of an SP group
-  would receive the same shard and score all of it; the trainer rejects that too.
-  It scores inside the generation window, so `offload_train_during_reward` is
-  rejected alongside it, a local GPU scorer now shares its peak with the awake
-  engine instead of running after `rollout.sleep()`, and the driver-side
-  `perf/generate_time_s` / `perf/reward_time_s` timers stop firing because those
-  patch the Handle attributes the stack no longer routes through; the stack logs
-  its own `generate_s` / `score_s` split per call instead. Set `micro_batch_size`
-  equal to `rollout.forward_batch_size` to keep chunk boundaries — and the per-step
-  SDE noise draw order — identical to the serial path.
+- **`rewardstack:` is colocate-only, DP-only, and it takes over two driver-side
+  facts** — `RewardStack` resolves the engine and the service as siblings on one
+  Worker, so `layout: separate` or `reward_fraction > 0` place them in different
+  placement scopes and the trainer rejects the block. The stack also inherits the
+  engine's SP/TP layout and calls both siblings in-process on every rank of a
+  group, so `sp_size > 1` would score the same shard sp_size times and a TP
+  engine's non-leader shells would hand it nothing to score; the trainer rejects
+  both. It scores inside the generation window, outside `_reward_phase()`, so
+  `reward_resident: false` is rejected alongside it (the planner would park the
+  reward to wake the rollout and never bring it back), a local GPU scorer shares
+  its peak with the awake engine exactly as under `rollout_resident: true`, the
+  trainer stays parked through scoring when `train_resident: false`, and the
+  driver-side `perf/generate_time_s` / `perf/reward_time_s` timers stop firing
+  because those patch the Handle attributes the stack no longer routes through;
+  the driver logs the stack's per-rank `generate_s` / `score_s` split after each
+  rollout and adds it to the perf phases as `stack_generate` / `stack_score`. Set
+  `micro_batch_size` equal to `rollout.forward_batch_size` to keep chunk
+  boundaries — and the per-step SDE noise draw order — identical to the serial path.
 - **No scorer that draws from the global RNG may run under `overlap: true`** — SD3's
   per-step SDE noise comes from the shared global CUDA generator
   (`sde/kernels.py:300`, `generator=None`, and no model threads one), so a scorer
