@@ -200,7 +200,7 @@ class UnifiedModelTrainer(BaseTrainer):
         base = sampling if sampling is not None else self.sampling_params
         diff_params = base.get("diffusion")
         ar_params = base.get("ar")
-        sde_indices = diff_params.resolve_sde_indices(rollout_id)
+        sde_indices = diff_params.get_sde_indices(rollout_id)
         disable_xt = bool(os.environ.get("DISABLE_DRIVER_XT")) or bool(getattr(diff_params, "disable_driver_xt", False))
         diffusion = dataclasses.replace(
             diff_params, sde_indices=sde_indices, scheduler=None, disable_driver_xt=disable_xt
