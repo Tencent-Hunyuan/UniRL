@@ -58,7 +58,7 @@ uv pip install -e ".[sglang,train,infer]"
 | `sglang` | `sglang[diffusion]`, `checkpoint-engine`, `flash-attn-4`, `flash-linear-attention[conv1d]`, torch +cu130 stack, PyAV | SGLang-based AR/VLM and diffusion recipes |
 | `fastvideo` | FastVideo pinned to an upstream Git commit | WAN 2.1 / 2.2 rollout; [the extra does not currently resolve](#fastvideo-installation-blocker) |
 | `train` | `wandb`, `aiohttp`, `math-verify` | Training runs and local math-answer scoring |
-| `cosmos3` | `diffusers>=0.39` | [Cosmos3 SFT](unirl/models/cosmos3/README.md); apply the [version constraint](#cosmos3-version-prerequisite) |
+| `cosmos3` | `diffusers>=0.39` | [Cosmos3 SFT](unirl/models/cosmos3/README.md); uv's `diffusers==0.40.0` override already satisfies this extra |
 | `infer` | `accelerate`, `timm` | HunyuanImage3, Janus-Pro, and similar models |
 | `eval` | `torchvision`, `paddlepaddle`, `paddleocr`, `python-Levenshtein` | OCR-based reward components |
 | `veomni` | `veomni` | Recipes using the [VeOmni training backend](unirl/train/backend/veomni/) |
@@ -89,24 +89,19 @@ Prefer these extras over the legacy [`requirements.txt`](requirements.txt) and
 The `fastvideo` extra pins
 [hao-ai-lab/FastVideo@2095477](https://github.com/hao-ai-lab/FastVideo/blob/2095477eac7e289c7a7ab13acb367ca60687c304/pyproject.toml),
 which requires `transformers==4.57.3` and `wandb>=0.21.0`. The transformers pin
-conflicts with UniRL's `transformers>=5.6,<5.7`, so `.[fastvideo]` does not
+conflicts with UniRL's `transformers>=5.6,<5.13`, so `.[fastvideo]` does not
 resolve — a separate venv does not help, because UniRL's base deps still apply.
 Adding `train` also conflicts on `wandb`. Use `$FASTVIDEO_PATH` as in the
 [FastVideo engine README](unirl/rollout/engine/fastvideo/README.md) until the extra
 is solvable.
 
-### Cosmos3 version prerequisite
+### Cosmos3
 
-`cosmos3` asks for `diffusers>=0.39`, but uv's override `diffusers>=0.38.0`
-[replaces](https://docs.astral.sh/uv/concepts/resolution/#dependency-overrides)
-that floor instead of intersecting with it. Include `cosmos3` in the extras and
-pass `--constraint` when installing:
+`cosmos3` asks for `diffusers>=0.39`. The uv override pins `diffusers==0.40.0`,
+which already satisfies that floor, so install it as a normal extra:
 
 ```bash
-COSMOS3_CONSTRAINTS="$(mktemp)"
-printf '%s\n' 'diffusers>=0.39' > "$COSMOS3_CONSTRAINTS"
-uv pip install -e ".[vllm,train,infer,cosmos3]" \
-    --constraint "$COSMOS3_CONSTRAINTS"
+uv pip install -e ".[vllm,train,infer,cosmos3]"
 ```
 
 ## Environment
