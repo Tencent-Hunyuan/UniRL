@@ -28,15 +28,6 @@ _UNIRL_ONLY_INTENT_KEYS = frozenset(
 )
 
 
-def _strict_dropped_server_args() -> bool:
-    return os.environ.get(_STRICT_SERVER_ARGS_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _unknown_server_arg_keys(server_intent: Dict[str, Any], allowed: set[str]) -> List[str]:
-    """Intent keys that are neither live ``ServerArgs`` fields nor UniRL-only."""
-    return sorted(key for key in server_intent if key not in allowed and key not in _UNIRL_ONLY_INTENT_KEYS)
-
-
 def _filter_server_args_or_raise(
     server_intent: Dict[str, Any],
     *,
@@ -56,14 +47,15 @@ def _filter_server_args_or_raise(
             "Upgrade SGLang to a build that supports these fields, or remove the explicit UniRL "
             "rollout config that depends on them."
         )
-    dropped = _unknown_server_arg_keys(server_intent, allowed)
+    dropped = sorted(key for key in server_intent if key not in allowed and key not in _UNIRL_ONLY_INTENT_KEYS)
     if dropped:
         message = (
             f"SGLang {backend_name} backend dropping unknown ServerArgs keys: {dropped}. "
             "They are not fields on the installed SGLang ServerArgs (typo or version skew). "
             f"Set {_STRICT_SERVER_ARGS_ENV}=1 to fail closed."
         )
-        if _strict_dropped_server_args():
+        strict = os.environ.get(_STRICT_SERVER_ARGS_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+        if strict:
             raise RuntimeError(message)
         logger.warning(message)
     return {k: v for k, v in server_intent.items() if k != _REQUIRED_SERVER_ARGS_METADATA_KEY and k in allowed}

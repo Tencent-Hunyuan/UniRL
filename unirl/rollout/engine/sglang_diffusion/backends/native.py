@@ -3,11 +3,25 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional
+
+import torch
 
 from unirl.rollout.engine.sglang_diffusion.backends.base import RawResult
 
 logger = logging.getLogger(__name__)
+
+
+def _stage_lora_tensors_for_ipc(lora_tensors: Dict[str, Any]):
+    """Move CPU adapter tensors onto CUDA before the UUID-aware reduction hook."""
+    has_cpu_tensor = any(torch.is_tensor(tensor) and tensor.device.type == "cpu" for tensor in lora_tensors.values())
+    if not has_cpu_tensor:
+        return lora_tensors
+    device = torch.device("cuda", torch.cuda.current_device())
+    return {
+        name: tensor.to(device) if torch.is_tensor(tensor) and tensor.device.type == "cpu" else tensor
+        for name, tensor in lora_tensors.items()
+    }
 
 
 def _import_sglang_runtime() -> Dict[str, Any]:
@@ -21,19 +35,19 @@ def _import_sglang_runtime() -> Dict[str, Any]:
     )
     from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
         GetWeightsChecksumReqInput,
+        ReleaseMemoryOccupationReqInput,
+        ResumeMemoryOccupationReqInput,
+        UpdateWeightFromTensorReqInput,
     )
     from sglang.multimodal_gen.runtime.scheduler_client import sync_scheduler_client
     from sglang.multimodal_gen.runtime.server_args import ServerArgs
+    from sglang.srt.utils import MultiprocessingSerializer
 
     from unirl.rollout.engine.sglang_diffusion._patches.io_struct import (
         DestroyWeightsUpdateGroupReqInput,
         InitWeightsUpdateGroupReqInput,
-        ReleaseMemoryOccupationReqInput,
-        ResumeMemoryOccupationReqInput,
         UpdateWeightsFromDistributedReqInput,
-        UpdateWeightsFromTensorReqInput,
     )
-    from unirl.rollout.engine.sglang_diffusion._patches.lora_req import SetLoraFromTensorsReq
 
     return {
         "DiffGenerator": DiffGenerator,
@@ -42,10 +56,10 @@ def _import_sglang_runtime() -> Dict[str, Any]:
         "InitWeightsUpdateGroupReqInput": InitWeightsUpdateGroupReqInput,
         "DestroyWeightsUpdateGroupReqInput": DestroyWeightsUpdateGroupReqInput,
         "UpdateWeightsFromDistributedReqInput": UpdateWeightsFromDistributedReqInput,
-        "UpdateWeightsFromTensorReqInput": UpdateWeightsFromTensorReqInput,
+        "UpdateWeightFromTensorReqInput": UpdateWeightFromTensorReqInput,
         "ReleaseMemoryOccupationReqInput": ReleaseMemoryOccupationReqInput,
         "ResumeMemoryOccupationReqInput": ResumeMemoryOccupationReqInput,
-        "SetLoraFromTensorsReq": SetLoraFromTensorsReq,
+        "MultiprocessingSerializer": MultiprocessingSerializer,
         "sync_scheduler_client": sync_scheduler_client,
     }
 
@@ -116,6 +130,16 @@ class SGLangBackend:
                 "SGLang generator returned None — full-batch failure (see DiffGenerator.generate docstring)."
             )
         results = list(raw) if isinstance(raw, list) else [raw]
+        prompt = sampling_kwargs.get("prompt")
+        if prompt is not None:
+            num_prompts = len(prompt) if isinstance(prompt, list) else 1
+            outputs_per_prompt = int(sampling_kwargs.get("num_outputs_per_prompt", 1))
+            expected = num_prompts * outputs_per_prompt
+            if len(results) != expected:
+                raise RuntimeError(
+                    f"SGLang returned {len(results)} result(s), expected {expected} "
+                    f"for {num_prompts} prompt(s) x {outputs_per_prompt} output(s)"
+                )
         return [_RawResultView(result) for result in results]
 
     def prepare_latent_shape(self, *, height: int, width: int, num_frames: int, batch_size: int) -> tuple:
@@ -132,18 +156,15 @@ class SGLangBackend:
         full_shape = pcfg.prepare_latent_shape(batch_stub, batch_size, num_frames)
         return tuple(full_shape[1:])
 
-    def release_memory(self, *, tags: Sequence[str], cpu_backup_tags: Optional[Sequence[str]] = None) -> None:
+    def release_memory(self) -> None:
         self._forward(
-            self._rt["ReleaseMemoryOccupationReqInput"](
-                tags=list(tags),
-                cpu_backup_tags=(list(cpu_backup_tags) if cpu_backup_tags is not None else None),
-            ),
+            self._rt["ReleaseMemoryOccupationReqInput"](),
             op="release_memory_occupation",
         )
 
-    def resume_memory(self, *, tags: Sequence[str]) -> None:
+    def resume_memory(self) -> None:
         self._forward(
-            self._rt["ResumeMemoryOccupationReqInput"](tags=list(tags)),
+            self._rt["ResumeMemoryOccupationReqInput"](),
             op="resume_memory_occupation",
         )
 
@@ -172,13 +193,14 @@ class SGLangBackend:
         load_format: Optional[str],
         flush_cache: bool,
     ) -> None:
+        request = self._rt["UpdateWeightFromTensorReqInput"](
+            serialized_named_tensors=serialized_named_tensors,
+            target_modules=list(target_modules),
+            load_format=load_format,
+        )
+        request.flush_cache = flush_cache
         self._forward(
-            self._rt["UpdateWeightsFromTensorReqInput"](
-                serialized_named_tensors=serialized_named_tensors,
-                target_modules=list(target_modules),
-                load_format=load_format,
-                flush_cache=flush_cache,
-            ),
+            request,
             op="update_weights_from_tensor",
         )
 
@@ -235,23 +257,19 @@ class SGLangBackend:
     def set_lora(
         self,
         *,
-        lora_nickname: str,
         lora_tensors: Dict[str, Any],
-        target: str = "all",
-        strength: float = 1.0,
-        lora_alpha: Optional[float] = None,
+        target_module: str,
+        lora_alpha: Optional[int] = None,
     ) -> None:
-        request = self._rt["SetLoraFromTensorsReq"](
-            lora_nickname=str(lora_nickname),
-            lora_tensors=lora_tensors,
-            target=target,
-            strength=strength,
+        ipc_tensors = _stage_lora_tensors_for_ipc(lora_tensors)
+        serialized = self._rt["MultiprocessingSerializer"].serialize(list(ipc_tensors.items()))
+        request = self._rt["UpdateWeightFromTensorReqInput"](
+            serialized_named_tensors=[serialized],
+            target_modules=[target_module],
+            weight_update_mode="lora_merge",
             lora_alpha=lora_alpha,
         )
-        response = self._rt["sync_scheduler_client"].forward(request)
-        error = getattr(response, "error", None)
-        if error is not None:
-            raise RuntimeError(f"set_lora_from_tensors failed: {error}")
+        self._forward(request, op="set_lora_from_tensors")
 
     def weights_checksum(self, *, module_names: List[str]) -> dict:
         response = self._rt["sync_scheduler_client"].forward(

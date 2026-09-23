@@ -103,15 +103,6 @@ rollout:
     num_gpus: 1
     tp_size: 1
     local_mode: true
-    target_modules:
-      - attn.add_k_proj
-      - attn.add_q_proj
-      - attn.add_v_proj
-      - attn.to_add_out
-      - attn.to_k
-      - attn.to_out.0
-      - attn.to_q
-      - attn.to_v
     engine_kwargs:
       model_type: sd3
   # SGLang reads ckpt/LoRA off model_config and sde_label off strategy.

@@ -150,7 +150,6 @@ rollout:
     num_gpus: 1
     tp_size: 1
     local_mode: true
-    target_modules: *lora_targets
     engine_kwargs:
       model_type: flux2_klein
 

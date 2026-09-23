@@ -113,38 +113,56 @@ change surface:
 
 ## SGLang AR knobs
 
-Qwen3 AR recipes (`examples/ar/qwen3_*_sglang*.yaml`) share one **colocate
-full-FT** `engine_kwargs` preset. Async/separate and larger-model recipes keep
-the same keys and change the memory numbers. Typed `SGLangEngineConfig` fields
-overlay `engine_kwargs`; reserved ports always win. Keys that are not live
-SGLang `ServerArgs` fields warn at boot (or raise if
-`UNIRL_SGLANG_STRICT_SERVER_ARGS=1`) — see [`engine/README.md`](engine/README.md).
+The 4B dense Qwen3 AR recipes (`examples/ar/qwen3_*_sglang*.yaml`) share a
+**colocate full-FT** `engine_kwargs` baseline. Async/separate, larger-model,
+MoE, and LoRA recipes deliberately deviate as described below and in their
+inline comments. Typed `SGLangEngineConfig` fields overlay `engine_kwargs`;
+reserved ports always win. Keys that are not live SGLang `ServerArgs` fields
+warn at boot (or raise if `UNIRL_SGLANG_STRICT_SERVER_ARGS=1`) — see
+[`engine/README.md`](engine/README.md).
 
-**Colocate full-FT preset** (FSDP train shard time-shares the GPU; TensorWeightSync):
+**4B dense colocate full-FT baseline** (FSDP train shard time-shares the GPU;
+TensorWeightSync):
 
 | Knob | Preset | Why |
 |---|---|---|
 | `mem_fraction_static` | `0.3` | Lower SRT KV reservation so FSDP can all-gather full dense weights. `server_intent()` defaults to `0.88` if omitted — too high for colocate. |
 | `enable_lora` | `false` | TensorWeightSync pushes full dense weights; a LoRA pool would be the wrong receive path. |
-| `cuda_graph_max_bs` | `16` | CUDA graph stays on (`disable_cuda_graph: false`); SGLang's default `256` captures buffers that fight the weight push. |
-| `skip_server_warmup` | `true` | Skip SRT warmup on every colocated boot/wake. |
+| `cuda_graph_max_bs_decode` | `16` | CUDA graph stays on (`disable_cuda_graph: false`); SGLang otherwise auto-tunes the capture cap from GPU memory and TP size, often reserving much larger buffers that fight the weight push. |
+| `skip_server_warmup` | `true` | Skip SRT startup warmup on the 4B colocate path; this knob does not control `wake_up()`. |
 | `attention_backend` | `triton` | Matches the in-tree 4B full-FT recipes. |
 
+**Larger / MoE colocate:** memory and graph settings are recipe-specific
+(`mem_fraction_static` ranges from `0.15` to `0.5`; graph caps include `64` and
+`128`, and one VLM MoE recipe disables graphs). Several MoE/CPPO recipes set the
+typed `skip_server_warmup: false`, which wins over `engine_kwargs`, so startup
+warmup runs. The VLM MoE geo3k recipe also leaves `attention_backend` to
+SGLang's platform selection.
+
 **Async / separate** (`*_sglang_async.yaml`): the engine owns the GPU (no colocated
-FSDP shard). Raise `mem_fraction_static` to `0.8` and leave the other preset keys
-as-is; keep headroom for NCCL weight-receive buffers. Sync is `NCCLWeightSync`.
+FSDP shard). Raise `mem_fraction_static` to `0.8` and leave the other 4B baseline
+keys as-is; keep headroom for NCCL weight-receive buffers. Sync is
+`NCCLWeightSync`.
 
 **LoRA colocate** (`*_sglang_lora.yaml`): `enable_lora: true` plus the SGLang LoRA
 pool knobs. This is the exception to the full-FT `enable_lora: false` receive path
 (`LocalLoraWeightSync` instead of TensorWeightSync). Memory numbers are recipe-specific.
 
-**Reserved ports:** `SGLangPorts.reserve()` binds HTTP `port` and `nccl_port` on
-the engine's node. Server port is capped at 35535 because SGLang derives
-`grpc_port = port + 30000`. Do not set `port` / `nccl_port` in `engine_kwargs` —
-the reserved sockets overwrite them.
+**Reserved ports:** `SGLangPorts.reserve()` selects candidate HTTP `port` and
+`nccl_port` values by binding temporary sockets on the engine's node, then
+closes those sockets so SGLang can bind (the usual bind-to-zero TOCTOU gap
+remains). Do not set `port` / `nccl_port` in `engine_kwargs` — the selected
+values overwrite them. The retired 35535 cap is unnecessary on 0.5.19:
+SGLang derives `grpc_port = port + 10000` only when gRPC mode is explicitly
+enabled, which UniRL's rollout backend does not do.
 
 ## Gotchas
 
+- **SGLang diffusion tensor LoRA accepts standard PEFT LoRA only.** A global
+  `lora_alpha` is supported; rsLoRA, DoRA, per-layer alpha patterns, and PEFT
+  auxiliary features fail closed. `use_lora=true` selects adapter-only sync for
+  the engine lifetime. Full-weight sync requires `use_lora=false`; a trainer
+  using LoRA must merge the adapter before pushing those full weights.
 - **Never recompute σ inside an engine** — the generated Part's pinned sigmas are
   the single source of truth; `engine/sigma_verify.py` checks the backend echo (it
   guards the GRPO log-prob ratio).
