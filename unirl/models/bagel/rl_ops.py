@@ -590,20 +590,18 @@ def score_response_with_prompt(
 
 
 def _build_und_attention_mask(
-    model: Any,
     *,
-    sample_lens: List[int],
     split_lens: List[int],
     attn_modes: List[str],
     device: torch.device,
     attention_backend: Literal["sdpa", "flex"],
 ) -> Any:
-    """Build the train-replay mask; ``attention_backend`` is validated by ``BagelARStage``."""
+    """Build the single-sample train-replay mask; ``attention_backend`` is validated by ``BagelARStage``."""
     if attention_backend == "flex":
         from .vendor.data.data_utils import create_sparse_mask
 
-        seqlen = sum(sample_lens)
-        mask_mod = create_sparse_mask(sample_lens, split_lens, attn_modes, device)
+        seqlen = sum(split_lens)
+        mask_mod = create_sparse_mask([seqlen], split_lens, attn_modes, device)
         return _get_create_block_mask()(
             mask_mod,
             B=1,
@@ -685,8 +683,6 @@ def pack_und_forward_inputs(
 
     seqlen = pos
     attention_mask = _build_und_attention_mask(
-        model,
-        sample_lens=[seqlen],
         split_lens=split_lens,
         attn_modes=attn_modes,
         device=device,
