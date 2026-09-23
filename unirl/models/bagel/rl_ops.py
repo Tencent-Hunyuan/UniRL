@@ -28,7 +28,6 @@ __all__ = [
     "prefill_vit_split",
     "require_inference_dispatch",
     "resize_input_image",
-    "score_response",
     "score_response_with_prompt",
     "und_replay_logits",
     "update_context_image",
@@ -73,11 +72,6 @@ def _raw(fn: Callable) -> Callable:
     return getattr(fn, "__wrapped__", fn)
 
 
-def _raw_forward_flow(model: Any):
-    """The undecorated ``Bagel._forward_flow`` (bypasses upstream ``@torch.no_grad``)."""
-    return _raw(type(model)._forward_flow)
-
-
 def forward_flow(model: Any, **kwargs: Any) -> Any:
     """Velocity prediction via the pristine vendored ``Bagel._forward_flow``."""
     lm = model.language_model
@@ -86,7 +80,7 @@ def forward_flow(model: Any, **kwargs: Any) -> Any:
     if was_training:
         lm.eval()
     try:
-        return _raw_forward_flow(model)(model, **kwargs)
+        return _raw(type(model)._forward_flow)(model, **kwargs)
     finally:
         if was_training and not grad_enabled:
             lm.train()
@@ -476,61 +470,6 @@ def decode_text_batched(
     return tokens, logps
 
 
-def score_response(
-    model: Any,
-    ctx: Dict[str, Any],
-    *,
-    response_ids: torch.Tensor,
-    start_token_id: int,
-    temperature: float = 1.0,
-    logprob_chunk: int = 1024,
-    device: torch.device,
-) -> torch.Tensor:
-    """Teacher-forced per-token log-probs of ``response_ids``, chunked lm_head, grad-capable; returns fp32 ``[n]``."""
-    require_inference_dispatch(model)
-    disable_inference_cache(model)
-    lm = model.language_model
-    kv_len, pos = int(ctx["kv_lens"][0]), int(ctx["ropes"][0])
-    n = int(response_ids.numel())
-    if n == 0:
-        return torch.zeros(0, dtype=torch.float32, device=device)
-
-    response_ids = response_ids.to(device=device, dtype=torch.long)
-    start = torch.tensor([int(start_token_id)], dtype=torch.long, device=device)
-    query_ids = torch.cat([start, response_ids[:-1]], dim=0)
-
-    emb = lm.model.embed_tokens(query_ids)
-    out = lm.forward_inference(
-        packed_query_sequence=emb,
-        query_lens=torch.tensor([n], dtype=torch.int, device=device),
-        packed_query_position_ids=torch.arange(pos, pos + n, dtype=torch.long, device=device),
-        packed_query_indexes=torch.arange(kv_len, kv_len + n, dtype=torch.long, device=device),
-        past_key_values=ctx["past_key_values"],
-        key_values_lens=torch.tensor([kv_len], dtype=torch.int, device=device),
-        packed_key_value_indexes=torch.arange(kv_len, dtype=torch.long, device=device),
-        update_past_key_values=False,
-        is_causal=True,
-        mode="und",
-    )
-    hidden = out.packed_query_sequence
-
-    temp = float(temperature) if float(temperature) > 0.0 else 1.0
-
-    def _chunk_logp(h: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
-        logits = lm.lm_head(h).float() / temp
-        return logits.gather(-1, tgt.unsqueeze(-1)).squeeze(-1) - torch.logsumexp(logits, dim=-1)
-
-    use_ckpt = torch.is_grad_enabled() and hidden.requires_grad
-    parts: List[torch.Tensor] = []
-    for s in range(0, n, int(logprob_chunk)):
-        h, tgt = hidden[s : s + int(logprob_chunk)], response_ids[s : s + int(logprob_chunk)]
-        if use_ckpt:
-            parts.append(checkpoint(_chunk_logp, h, tgt, use_reentrant=False))
-        else:
-            parts.append(_chunk_logp(h, tgt))
-    return torch.cat(parts, dim=0)
-
-
 def score_response_with_prompt(
     model: Any,
     ctx: Dict[str, Any],
@@ -624,7 +563,6 @@ def pack_und_forward_inputs(
     response_input: torch.Tensor,
     device: torch.device,
     attention_backend: Literal["sdpa", "flex"] = "sdpa",
-    vit_transform: Callable[[Any], Any] = lambda x: x,
 ) -> Dict[str, Any]:
     """Pack one und sample and build either the baseline dense mask or Flex BlockMask."""
     text_ids: List[int] = []
@@ -657,7 +595,7 @@ def pack_und_forward_inputs(
                 curr_kvlens=[0],
                 curr_rope=[rope],
                 images=[sp["image"]],
-                transforms=vit_transform,
+                transforms=lambda x: x,
                 new_token_ids=new_token_ids,
             )
             img_block_len = int(vit_input["packed_seqlens"][0].item())
