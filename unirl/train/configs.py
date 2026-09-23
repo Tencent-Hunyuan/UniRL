@@ -45,6 +45,9 @@ class LoraConfig:
     rank: int = 8
     alpha: int = 16
     target_modules: Any = ("q_proj", "k_proj", "v_proj", "o_proj")
+    # nn.Parameter targets for packed MoE experts, which are not nn.Linear (e.g.
+    # ``gate_up_proj``/``down_proj``); see ``README.md`` Gotchas.
+    target_parameters: Any = None
     exclude_modules: Any = None
     module_prefix: str = ""
     dropout: float = 0.0

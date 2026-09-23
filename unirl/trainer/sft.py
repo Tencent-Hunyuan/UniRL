@@ -7,7 +7,7 @@ import logging
 import os
 from typing import Any, Dict, List, Optional
 
-from hydra.utils import instantiate
+from hydra.utils import get_class, instantiate
 from omegaconf import DictConfig
 
 from unirl.distributed.group.placement import placement
@@ -48,14 +48,9 @@ class SFTTrainer(BaseTrainer):
         self.eval_interval = eval_interval
         self.eval_batch_size = max(1, eval_batch_size)
         self.eval_num_samples = -1 if eval_num_samples < 0 else eval_num_samples
-        num_updates_per_batch = int(stack_cfg.get("num_updates_per_batch", 1))
-        if num_updates_per_batch != 1:
-            raise ValueError(
-                "SFTTrainer requires stack.num_updates_per_batch=1: its num_steps, logging, "
-                "checkpoint cadence, and resume cursor each count one optimizer update per "
-                "dataset batch. Multi-update SFT is supported by TrainStack but not yet by "
-                "this trainer's outer-step accounting."
-            )
+        self.num_updates_per_batch = int(stack_cfg.get("num_updates_per_batch", 1))
+        if self.num_updates_per_batch < 1:
+            raise ValueError(f"SFTTrainer: stack.num_updates_per_batch must be >= 1; got {self.num_updates_per_batch}.")
         if not isinstance(prefetch_next_batch, bool):
             raise TypeError(
                 f"SFTTrainer: prefetch_next_batch must be a bool; got {type(prefetch_next_batch).__name__}."
@@ -63,6 +58,8 @@ class SFTTrainer(BaseTrainer):
         self.prefetch_next_batch = prefetch_next_batch
 
         self.data_source = instantiate(data_source_cfg)
+        # The LR schedule counts optimizer steps, which is num_steps x updates_per_batch here.
+        self._scheduler_total = int((backend_cfg.get("scheduler_cfg") or {}).get("total_steps", 0) or 0)
         if self.eval_interval > 0 and not self.data_source.has_eval_data:
             logger.warning(
                 "SFTTrainer: eval_interval=%d but no eval manifest is configured; validation is disabled.",
@@ -81,7 +78,9 @@ class SFTTrainer(BaseTrainer):
             self.bundle = remote_hydra(bundle_cfg)
             self.pipeline = remote_hydra(pipeline_cfg, bundle=self.bundle)
             self.backend = remote_hydra(backend_cfg, bundle=self.bundle)
-            self.algorithm = remote_hydra(algorithm_cfg, pipeline=self.pipeline)
+            algo_cls = get_class(str(algorithm_cfg.get("_target_", "")))
+            algo_extra = {"backend": self.backend} if getattr(algo_cls, "requires_backend", False) else {}
+            self.algorithm = remote_hydra(algorithm_cfg, pipeline=self.pipeline, **algo_extra)
             self.stack = remote_hydra(stack_cfg, fsdp_backend=self.backend, algorithm=self.algorithm)
             self.track_builder = remote_hydra(track_builder_cfg, pipeline=self.pipeline)
 
@@ -90,13 +89,47 @@ class SFTTrainer(BaseTrainer):
         self.dp_size = self.stack.dp_size
         if self.batch_size % self.dp_size:
             raise ValueError(f"SFTTrainer: batch_size={self.batch_size} must be divisible by dp={self.dp_size}")
-        logger.info("SFTTrainer ready: dp=%d batch=%d", self.dp_size, self.batch_size)
+        # A preference builder emits 2 rows per record, so the pair must not straddle a rank or micro slice.
+        track_builder_cls = get_class(str(track_builder_cfg.get("_target_", "")))
+        self.rows_per_record = int(getattr(track_builder_cls, "rows_per_record", 1))
+        if self.rows_per_record > 1:
+            micro = int(stack_cfg.get("micro_batch_size", 1))
+            if micro % self.rows_per_record:
+                raise ValueError(
+                    f"SFTTrainer: stack.micro_batch_size={micro} must be a multiple of "
+                    f"rows_per_record={self.rows_per_record}, or a record's rows are split across "
+                    f"forwards and the pairwise loss cannot be formed."
+                )
+        rows_per_rank = self.batch_size * self.rows_per_record // self.dp_size
+        if rows_per_rank % self.num_updates_per_batch:
+            raise ValueError(
+                f"SFTTrainer: num_updates_per_batch={self.num_updates_per_batch} must evenly divide "
+                f"the per-rank shard ({rows_per_rank} rows = batch_size {self.batch_size} x "
+                f"rows_per_record {self.rows_per_record} / dp {self.dp_size})."
+            )
+        if self.rows_per_record > 1 and (rows_per_rank // self.num_updates_per_batch) % self.rows_per_record:
+            raise ValueError(
+                f"SFTTrainer: each of the {self.num_updates_per_batch} updates gets "
+                f"{rows_per_rank // self.num_updates_per_batch} rows/rank, which must stay a multiple of "
+                f"rows_per_record={self.rows_per_record} so no preference pair is split across updates."
+            )
+        logger.info(
+            "SFTTrainer ready: dp=%d batch=%d rows_per_record=%d updates_per_batch=%d",
+            self.dp_size,
+            self.batch_size,
+            self.rows_per_record,
+            self.num_updates_per_batch,
+        )
 
     def _build_part(self, records: List[Dict[str, Any]], timer: PhaseTimer) -> Part:
         with timer.phase("build"):
             part = self.track_builder.build(records)
-        if part.batch_size != len(records):
-            raise RuntimeError(f"SFTTrainer: Part builder built {part.batch_size} rows from {len(records)} records.")
+        expected_rows = len(records) * self.rows_per_record
+        if part.batch_size != expected_rows:
+            raise RuntimeError(
+                f"SFTTrainer: Part builder built {part.batch_size} rows from {len(records)} records "
+                f"(expected {expected_rows} at rows_per_record={self.rows_per_record})."
+            )
         return part
 
     def train_step(
@@ -119,13 +152,18 @@ class SFTTrainer(BaseTrainer):
         weight_sum = 0.0
         batches = 0
         timer = PhaseTimer()
+        extra_sums: Dict[str, float] = {}
         for records in self.data_source.iter_eval_batches(self.eval_batch_size, eval_num_samples=self.eval_num_samples):
             records = self._pad_to_dp(records)
             part = self._build_part(records, timer)
             with timer.phase("forward"):
                 metrics = self.stack.eval_track(part)
-            loss_sum += float(metrics["loss"]) * float(metrics["weight"])
-            weight_sum += float(metrics["weight"])
+            weight = float(metrics["weight"])
+            loss_sum += float(metrics["loss"]) * weight
+            for key, value in metrics.items():
+                if key not in ("loss", "weight"):
+                    extra_sums[key] = extra_sums.get(key, 0.0) + float(value) * weight
+            weight_sum += weight
             batches += 1
         if weight_sum <= 0.0:
             logger.warning("SFTTrainer.evaluate: no eval data (eval_num_samples=%s).", self.eval_num_samples)
@@ -149,6 +187,8 @@ class SFTTrainer(BaseTrainer):
                 "loss": eval_loss,
                 "time_s": eval_time,
                 **{f"{name}_time_s": seconds for name, seconds in timer.phases.items()},
+                # Algorithm-declared eval metrics (e.g. DPO's reward_accuracy), weight-averaged.
+                **{k: v / weight_sum for k, v in extra_sums.items()},
             },
         )
         return eval_loss
@@ -207,7 +247,19 @@ class SFTTrainer(BaseTrainer):
         load_dir: Optional[str] = None,
         save_mode: str = "auto",
     ) -> None:
-        """``num_steps`` optimizer steps of ``records → build → train_track``."""
+        """``num_steps`` data batches, each ``num_updates_per_batch`` optimizer steps."""
+        expected_total = num_steps * self.num_updates_per_batch
+        if self.num_updates_per_batch > 1 and self._scheduler_total and self._scheduler_total != expected_total:
+            logger.warning(
+                "SFTTrainer: backend.scheduler_cfg.total_steps=%d but this run performs %d optimizer "
+                "steps (%d batches x %d updates). The LR schedule counts optimizer steps, so set "
+                "total_steps=%d or the schedule ends early.",
+                self._scheduler_total,
+                expected_total,
+                num_steps,
+                self.num_updates_per_batch,
+                expected_total,
+            )
         start_step = self.maybe_load_checkpoint(load_dir, num_rollouts=num_steps)
         self._load_data_state(load_dir, start_step)
         self._init_wandb(num_rollouts=num_steps)
@@ -233,7 +285,7 @@ class SFTTrainer(BaseTrainer):
                 timer.phases.update(self._step_timer.phases)
                 dt = timer.total()
                 logger.info(
-                    "step %d/%d  loss=%.5f grad_norm=%.4f lr=%.2e epoch=%.3f  "
+                    "step %d/%d  loss=%.5f grad_norm=%.4f lr=%.2e epoch=%.3f updates=%d  "
                     "%.1fs (data=%.3fs build=%.3fs prefetch=%.3fs train=%.3fs)",
                     step + 1,
                     num_steps,
@@ -241,6 +293,7 @@ class SFTTrainer(BaseTrainer):
                     result.grad_norm,
                     result.lr,
                     self.data_source.epoch,
+                    result.optimizer_updates,
                     dt,
                     timer.phases["data"],
                     timer.phases["build"],

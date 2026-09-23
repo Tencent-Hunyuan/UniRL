@@ -169,6 +169,7 @@ class BaseFSDP2Backend(Remote):
                 alpha=lora_cfg.alpha,
                 target_modules=lora_cfg.target_modules,
                 module_prefix=lora_cfg.module_prefix,
+                target_parameters=getattr(lora_cfg, "target_parameters", None),
                 exclude_modules=lora_cfg.exclude_modules,
                 dropout=lora_cfg.dropout,
                 bias=lora_cfg.bias,
@@ -241,6 +242,9 @@ class BaseFSDP2Backend(Remote):
                 "rank": active_lora.rank,
                 "alpha": active_lora.alpha,
                 "target_modules": recorded_target_modules,
+                # Omitting this would rebuild an attention-only adapter on resume/export,
+                # silently dropping every packed-expert tensor the checkpoint carries.
+                "target_parameters": getattr(active_lora, "target_parameters", None),
                 "exclude_modules": active_lora.exclude_modules,
                 "dropout": active_lora.dropout,
                 "bias": active_lora.bias,

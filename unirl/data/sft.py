@@ -27,6 +27,8 @@ _SUPERVISED_EXCLUDED_KEYS = {
     "prompt",
     "caption",
     "response",
+    "chosen",
+    "rejected",
     "messages",
     "tools",
     "media",
@@ -105,6 +107,8 @@ def normalize_supervised_example(
     if messages is not None:
         if "prompt" in item or "caption" in item or "response" in item:
             raise ValueError("Agent supervised examples use 'messages' and may not also set prompt/response fields.")
+        if "chosen" in item or "rejected" in item:
+            raise ValueError("Preference examples use 'prompt' with 'chosen'/'rejected' and may not set 'messages'.")
         if not isinstance(messages, list) or len(messages) < 2:
             raise ValueError("Agent supervised example 'messages' must be a list with at least two turns.")
         normalized_messages: List[Dict[str, Any]] = []
@@ -155,6 +159,18 @@ def normalize_supervised_example(
                     f"Supervised example 'response' must be a non-empty string, got {type(response).__name__}."
                 )
             record["response"] = response
+
+        has_preference = "chosen" in item or "rejected" in item
+        if has_preference:
+            if response is not None:
+                raise ValueError("Supervised example may not set both 'response' and 'chosen'/'rejected'.")
+            for key in ("chosen", "rejected"):
+                branch = item.get(key)
+                if not isinstance(branch, str) or not branch:
+                    raise ValueError(
+                        f"Preference example {key!r} must be a non-empty string, got {type(branch).__name__}."
+                    )
+                record[key] = branch
 
     media_refs = _normalize_media_refs(item.get("media_refs", item.get("media")), base_dir=base_dir)
     if media_refs:
@@ -223,12 +239,16 @@ class SupervisedDataSource:
         eval_manifest_path: Optional[str] = None,
         seed: int = 42,
         shuffle: bool = True,
+        group_by_modality: int = 0,
     ) -> None:
         self.dataset = SupervisedDataset(train_manifest_path)
         self._manifest_fingerprint: Optional[str] = None
         self.eval_dataset = SupervisedDataset(eval_manifest_path) if eval_manifest_path else None
         self.seed = seed
         self.shuffle = shuffle
+        self.group_by_modality = int(group_by_modality)
+        if self.group_by_modality < 0:
+            raise ValueError(f"SupervisedDataSource: group_by_modality must be >= 0; got {group_by_modality}.")
         self._epoch = 0
         self._pos = 0
         self._order = self._make_order()
@@ -238,7 +258,30 @@ class SupervisedDataSource:
         order = list(range(len(self.dataset)))
         if self.shuffle:
             random.Random(self.seed + self._epoch).shuffle(order)
+        if self.group_by_modality:
+            order = self._group_by_modality(order, self.group_by_modality)
         return order
+
+    def _group_by_modality(self, order: List[int], chunk: int) -> List[int]:
+        """Reorder so every ``chunk``-sized batch holds one modality; see ``README.md`` Gotchas."""
+        buckets: Dict[str, List[int]] = {}
+        for index in order:
+            key = str((self.dataset[index].get("metadata") or {}).get("modality", ""))
+            buckets.setdefault(key, []).append(index)
+        blocks: List[List[int]] = []
+        for key in sorted(buckets):
+            indices = buckets[key]
+            # A trailing partial block would let the next modality share a batch, so drop it.
+            usable = len(indices) - len(indices) % chunk
+            blocks.extend(indices[start : start + chunk] for start in range(0, usable, chunk))
+            if usable < len(indices):
+                logger.info(
+                    "SupervisedDataSource: dropped %d %r rows this epoch to keep batches single-modality.",
+                    len(indices) - usable,
+                    key,
+                )
+        random.Random(self.seed + self._epoch).shuffle(blocks)
+        return [index for block in blocks for index in block]
 
     def get_samples(self, batch_size: int) -> List[Dict[str, Any]]:
         if self._pending_batch is not None:
@@ -340,8 +383,19 @@ class SupervisedDataSource:
         pool = self.eval_dataset
         n = len(pool)
         limit = n if eval_num_samples < 0 else min(eval_num_samples, n)
-        for start in range(0, limit, batch_size):
-            yield [pool[i] for i in range(start, min(start + batch_size, limit))]
+        if not self.group_by_modality:
+            for start in range(0, limit, batch_size):
+                yield [pool[i] for i in range(start, min(start + batch_size, limit))]
+            return
+        # Mixed-modality eval batches break Batch.slice the same way training ones do.
+        buckets: Dict[str, List[int]] = {}
+        for i in range(limit):
+            key = str((pool[i].get("metadata") or {}).get("modality", ""))
+            buckets.setdefault(key, []).append(i)
+        for key in sorted(buckets):
+            indices = buckets[key]
+            for start in range(0, len(indices), batch_size):
+                yield [pool[i] for i in indices[start : start + batch_size]]
 
 
 __all__ = [

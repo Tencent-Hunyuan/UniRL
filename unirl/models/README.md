@@ -84,6 +84,14 @@ it is the authoritative bundle / pipeline / stage / conditions contract.
   it's `None`; never build the σ tensor inside `generate`.
 - **CFG empty-negative differs per model** (SD3 `""`, Qwen-Image `" "`) — use the
   model's canonical upstream value or the rollout/replay ratio drifts off 1.0.
+- **Qwen3-Omni's `mm_kwargs` carries both `images_kwargs` and `videos_kwargs`, so it
+  must be merged whenever either medium is present.** Merging it only under the video
+  branch makes `image_max_pixels` inert for image-only rows: the recipe value is
+  accepted, `omni_processor_media_kwargs` builds the `images_kwargs` cap, and the
+  processor then never receives it, so images are encoded at the checkpoint's own
+  12845056-pixel `longest_edge`. The failure is silent and survives an
+  end-to-end run — two evals of one checkpoint at 262144 and 602112 returned image
+  reward margins identical to seven decimals, which is what exposed it.
 - **HunyuanVideo-1.5 prompt-template whitespace is tokenizer state.** Keep
   `PROMPT_TEMPLATE_SYSTEM_MESSAGE` byte-identical to upstream because
   `mllm_crop_start=108` is tied to that exact prefix length; collapsing its
