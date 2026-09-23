@@ -14,6 +14,7 @@ return scores. The per-reward deadline is `server.score_timeout_s`.
 from __future__ import annotations
 
 import asyncio
+import os
 from collections import defaultdict
 from contextlib import asynccontextmanager
 
@@ -21,6 +22,7 @@ from fastapi import FastAPI, HTTPException
 
 from reward_service.config import ServiceCfg
 from reward_service.logging_utils import get_logger
+from reward_service.mps import MpsRuntime
 from reward_service.schemas import PROTOCOL_VERSION, RewardRequest, ScoreRequest, ScoreResponse
 from reward_service.scorers import ScoreItem
 from reward_service.wire import request_to_item
@@ -77,22 +79,28 @@ async def _await_ref(
 
 
 def create_app(cfg: ServiceCfg) -> FastAPI:
+    mps_runtime = MpsRuntime(cfg.mps)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        # WorkerPool() blocks until every actor's __init__ has finished
-        # loading its model, so uvicorn only starts accepting requests
-        # after the service is truly ready (readiness-probe semantics).
-        app.state.pool = await asyncio.to_thread(WorkerPool, cfg)
-        logger.info(
-            "reward service ready on %s:%d — rewards=%s",
-            cfg.server.host,
-            cfg.server.port,
-            app.state.pool.reward_names(),
-        )
+        await asyncio.to_thread(mps_runtime.start)
+        if mps_runtime.enabled:
+            os.environ["UNIRL_MPS_PIPE_DIRECTORY"] = str(mps_runtime.pipe_directory)
         try:
+            # WorkerPool blocks until every actor has loaded its model.
+            app.state.pool = await asyncio.to_thread(WorkerPool, cfg)
+            logger.info(
+                "reward service ready on %s:%d — rewards=%s",
+                cfg.server.host,
+                cfg.server.port,
+                app.state.pool.reward_names(),
+            )
             yield
         finally:
-            app.state.pool.shutdown()
+            if hasattr(app.state, "pool"):
+                await asyncio.to_thread(app.state.pool.shutdown)
+            os.environ.pop("UNIRL_MPS_PIPE_DIRECTORY", None)
+            await asyncio.to_thread(mps_runtime.stop)
 
     app = FastAPI(title="Reward Service", lifespan=lifespan)
 
@@ -100,7 +108,13 @@ def create_app(cfg: ServiceCfg) -> FastAPI:
     async def health() -> dict:
         pool: WorkerPool = app.state.pool
         health_info = await asyncio.to_thread(pool.health)
-        return {"status": "ok", "rewards": health_info}
+        payload = {"status": "ok", "rewards": health_info}
+        if mps_runtime.enabled:
+            mps_status = await asyncio.to_thread(mps_runtime.status)
+            payload["mps"] = mps_status
+            if not mps_status.get("enabled"):
+                payload["status"] = "degraded"
+        return payload
 
     @app.get("/rewards")
     async def list_rewards() -> dict:

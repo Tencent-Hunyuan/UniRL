@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import itertools
+import os
 from pathlib import Path
 from typing import Any
 
@@ -75,13 +76,36 @@ def _build_runtime_env(requirements_path: str) -> dict[str, Any]:
     return {"pip": pip_cfg}
 
 
-def _actor_options(cfg: RewardModelCfg) -> dict[str, Any]:
+def _actor_options(
+    cfg: RewardModelCfg,
+    *,
+    mps_pipe_directory: str | None = None,
+) -> dict[str, Any]:
     """Build the dict passed to ``ScorerActor.options(...)``."""
+    runtime_env = _build_runtime_env(cfg.runtime_env)
+    if cfg.mps is not None:
+        pipe = mps_pipe_directory or os.environ.get("UNIRL_MPS_PIPE_DIRECTORY")
+        if not pipe:
+            raise RuntimeError(
+                f"WorkerGroup[{cfg.name}] enables MPS but the node runtime "
+                "did not provide a pipe directory"
+            )
+        env_vars = {
+            "CUDA_MPS_PIPE_DIRECTORY": pipe,
+            "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE": str(
+                cfg.mps.active_thread_percentage
+            ),
+        }
+        if cfg.mps.device_memory_limit_env is not None:
+            env_vars["CUDA_MPS_PINNED_DEVICE_MEM_LIMIT"] = (
+                cfg.mps.device_memory_limit_env
+            )
+        runtime_env["env_vars"] = env_vars
     options: dict[str, Any] = {
         "num_gpus": cfg.num_gpus,
         "num_cpus": cfg.num_cpus,
         "max_concurrency": cfg.max_concurrency,
-        "runtime_env": _build_runtime_env(cfg.runtime_env),
+        "runtime_env": runtime_env,
     }
     if cfg.scheduling == "spread":
         options["scheduling_strategy"] = _SPREAD_STRATEGY
@@ -130,6 +154,17 @@ class WorkerGroup:
         return ray.get([a.ping.remote() for a in self.actors])
 
     def shutdown(self) -> None:
-        for a in self.actors:
-            ray.kill(a)
-        self.actors = []
+        actors, self.actors = self.actors, []
+        if not actors:
+            return
+        logger.info("WorkerGroup[%s] draining %d actors", self.cfg.name, len(actors))
+        try:
+            ray.get([actor.shutdown.remote() for actor in actors], timeout=30)
+        except Exception:
+            logger.exception(
+                "WorkerGroup[%s] graceful drain failed; forcing actor cleanup",
+                self.cfg.name,
+            )
+        finally:
+            for actor in actors:
+                ray.kill(actor, no_restart=True)

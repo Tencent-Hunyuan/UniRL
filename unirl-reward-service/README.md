@@ -82,6 +82,16 @@ python -m reward_service --config configs/service.yaml
 
 (The console-script entry point `unirl-reward-service --config configs/service.yaml` is equivalent to `python -m reward_service`.)
 
+### CUDA MPS (opt-in)
+
+Qualified CLIP and PickScore actors can share one GPU via NVIDIA MPS.
+`mps.mode: managed` starts the daemon before local Ray. Only those two
+scorers are qualified; FP16 CLIP needs `active_thread_percentage: 100`.
+
+```bash
+python -m reward_service --config configs/service.mps-h20.example.yaml
+```
+
 ### Multi-host deployment
 
 ```bash
@@ -195,7 +205,7 @@ Other endpoints:
 ## Tests
 
 ```bash
-pytest scripts/test_bench_concurrent.py
+pytest scripts/test_bench_concurrent.py scripts/test_mps.py
 ```
 
 ## Venv check
