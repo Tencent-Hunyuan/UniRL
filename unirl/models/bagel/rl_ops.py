@@ -6,7 +6,7 @@ import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Literal, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -615,15 +615,14 @@ def _build_und_attention_mask(
     split_lens: List[int],
     attn_modes: List[str],
     device: torch.device,
-    attention_backend: str,
+    attention_backend: Literal["sdpa", "flex"],
 ) -> Any:
     """Build the train-replay mask while preserving identical visibility rules."""
-    backend = str(attention_backend).strip().lower()
-    if backend == "sdpa":
+    if attention_backend == "sdpa":
         from .vendor.data.data_utils import prepare_attention_mask_per_sample
 
         return [prepare_attention_mask_per_sample(split_lens, attn_modes, device=device)]
-    if backend == "flex":
+    if attention_backend == "flex":
         from .vendor.data.data_utils import create_sparse_mask
 
         seqlen = sum(sample_lens)
@@ -647,7 +646,7 @@ def pack_und_forward_inputs(
     splits: List[Dict[str, Any]],
     response_input: torch.Tensor,
     device: torch.device,
-    attention_backend: str = "sdpa",
+    attention_backend: Literal["sdpa", "flex"] = "sdpa",
     vit_transform: Callable[[Any], Any] = lambda x: x,
 ) -> Dict[str, Any]:
     """Pack one und sample and build either the baseline dense mask or Flex BlockMask."""
