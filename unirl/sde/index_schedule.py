@@ -6,7 +6,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from dataclasses import dataclass
 from itertools import accumulate
-from typing import Callable, List, Literal, Optional, Set, Tuple, Union
+from typing import List, Literal, Optional, Set, Tuple, Union
 
 import numpy as np
 
@@ -37,18 +37,21 @@ class WindowConfig:
                     f"WindowConfig({self.strategy}) requires 0 <= overlap_size < window_size, "
                     f"got overlap_size={self.overlap_size}, window_size={self.window_size}"
                 )
-            if self.iters_per_window < 1:
-                raise ValueError(f"WindowConfig requires iters_per_window >= 1, got {self.iters_per_window}")
+            if not math.isfinite(self.iters_per_window) or self.iters_per_window < 1:
+                raise ValueError(f"WindowConfig requires a finite iters_per_window >= 1, got {self.iters_per_window}")
         if self.strategy == "decay":
             if self.max_iters_per_window is None:
                 self.max_iters_per_window = self.iters_per_window
             if self.min_iters_per_window is None:
                 self.min_iters_per_window = max(1, self.iters_per_window // 4)
             lo, hi = self.min_iters_per_window, self.max_iters_per_window
-            if lo is None or hi is None or lo < 1 or hi < lo:
+            if not math.isfinite(lo) or not math.isfinite(hi) or lo < 1 or hi < lo:
                 raise ValueError(
-                    f"WindowConfig(decay) requires 1 <= min_iters_per_window <= max_iters_per_window, got ({lo}, {hi})"
+                    "WindowConfig(decay) requires finite bounds with "
+                    f"1 <= min_iters_per_window <= max_iters_per_window, got ({lo}, {hi})"
                 )
+        if self.strategy == "exp_decay" and not math.isfinite(self.exp_decay_k):
+            raise ValueError(f"WindowConfig(exp_decay) requires a finite exp_decay_k, got {self.exp_decay_k}")
 
 
 class TimestepScheduler(ABC):
@@ -124,8 +127,8 @@ class WindowScheduler(TimestepScheduler):
         "all": None,
         "progressive": "_resolve_progressive",
         "random": "_resolve_random",
-        "decay": "_resolve_decay",
-        "exp_decay": "_resolve_exp_decay",
+        "decay": "_resolve_sliding",
+        "exp_decay": "_resolve_sliding",
     }
 
     def __init__(self, num_timesteps: int, config: WindowConfig):
@@ -147,17 +150,14 @@ class WindowScheduler(TimestepScheduler):
         return resolve_method(0 if step is None else int(step))
 
     def _resolve_progressive(self, step: int) -> Set[int]:
+        starts = self._window_starts()
         window_step = step // self.config.iters_per_window
-        stride = self.config.window_size - self.config.overlap_size
-        remaining = self.num_timesteps - self.config.init_timestep - self.config.window_size
-        num_one_round_window_steps = max(1, remaining // stride + 1)
-        if window_step >= num_one_round_window_steps and not self.config.roll_back:
-            window_step = num_one_round_window_steps - 1
-            return self._resolve_progressive(window_step * self.config.iters_per_window)
-
-        window_step = window_step % num_one_round_window_steps
-        cur_timestep = self.config.init_timestep + window_step * stride
-        return set(range(cur_timestep, cur_timestep + self.config.window_size))
+        if window_step >= len(starts) and not self.config.roll_back:
+            window_step = len(starts) - 1
+        else:
+            window_step = window_step % len(starts)
+        cur = starts[window_step]
+        return set(range(cur, cur + self.config.window_size))
 
     def _resolve_random(self, step: int) -> Set[int]:
         rng = np.random.default_rng(step)
@@ -166,27 +166,27 @@ class WindowScheduler(TimestepScheduler):
         return set(range(cur_timestep, cur_timestep + self.config.window_size))
 
     def _window_starts(self) -> List[int]:
-        """Start index of every window in one progressive sweep, in visiting order."""
+        """Start index of every full window in one sweep, in visiting order."""
         stride = self.config.window_size - self.config.overlap_size
         remaining = self.num_timesteps - self.config.init_timestep - self.config.window_size
         count = max(1, remaining // stride + 1)
         return [self.config.init_timestep + i * stride for i in range(count)]
 
-    def _decay_iters(self, cur_timestep: int) -> int:
-        """MixGRPO linear decay: lerp max->min iters over cur_timestep / num_timesteps."""
-        progress = cur_timestep / self.num_timesteps
-        iters = int(self.config.max_iters_per_window * (1.0 - progress) + self.config.min_iters_per_window * progress)
-        return max(self.config.min_iters_per_window, iters)
-
-    def _exp_decay_iters(self, cur_timestep: int) -> int:
-        """MixGRPO-Flash: ceil(iters_per_window * exp(-k * relu(cur_timestep - threshold)))."""
-        relu = max(0, cur_timestep - self.config.exp_decay_threshold)
-        return int(math.ceil(self.config.iters_per_window * math.exp(-self.config.exp_decay_k * relu)))
-
-    def _resolve_variable_dwell(self, step: int, iters_for: Callable[[int], int]) -> Set[int]:
-        """Stateless walk over windows whose dwell (iters) depends on their start index."""
+    def _resolve_sliding(self, step: int) -> Set[int]:
+        """Walk full windows whose dwell is the decay or exp_decay value at each start."""
         starts = self._window_starts()
-        dwell = [iters_for(start) for start in starts]
+        if self.config.strategy == "decay":
+            lo = self.config.min_iters_per_window
+            hi = self.config.max_iters_per_window
+            dwell = []
+            for start in starts:
+                progress = start / self.num_timesteps
+                dwell.append(max(lo, int(hi * (1.0 - progress) + lo * progress)))
+        else:
+            base = self.config.iters_per_window
+            k = self.config.exp_decay_k
+            threshold = self.config.exp_decay_threshold
+            dwell = [int(math.ceil(base * math.exp(-k * max(0, start - threshold)))) for start in starts]
         total = sum(dwell)
         if step >= total:
             if not self.config.roll_back:
@@ -195,9 +195,3 @@ class WindowScheduler(TimestepScheduler):
             step = step % total
         cur = starts[bisect.bisect_right(list(accumulate(dwell)), step)]
         return set(range(cur, cur + self.config.window_size))
-
-    def _resolve_decay(self, step: int) -> Set[int]:
-        return self._resolve_variable_dwell(step, self._decay_iters)
-
-    def _resolve_exp_decay(self, step: int) -> Set[int]:
-        return self._resolve_variable_dwell(step, self._exp_decay_iters)

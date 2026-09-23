@@ -130,3 +130,8 @@ MixGRPO keeps `FlowSDEStrategy` and adds a `WindowScheduler` under
   of *its* `T-1`-entry sample dict (inherited from DanceGRPO, which drops the last transition
   that Flow-GRPO keeps), so it is not a spec to copy — mirroring it would also change
   `progressive`, which every shipped mixgrpo recipe runs.
+- **`exp_decay_threshold` defaults to 13**, MixGRPO's value for a 25-step schedule. Decay
+  starts only after a window start passes that threshold. Shipped mixgrpo starts are
+  `0, 3, 6` (sd3, qwen_image), `0, 3, 6, 9` (wan21), and `0, 3, 6, 9, 12, 15` (wan22),
+  so `strategy=exp_decay` stays flat at `iters_per_window` on the first three until the
+  threshold is lowered. wan22 decays only its last window (25 → 21 at the default `k=0.1`).
