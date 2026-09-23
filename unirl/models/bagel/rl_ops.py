@@ -617,11 +617,7 @@ def _build_und_attention_mask(
     device: torch.device,
     attention_backend: Literal["sdpa", "flex"],
 ) -> Any:
-    """Build the train-replay mask while preserving identical visibility rules."""
-    if attention_backend == "sdpa":
-        from .vendor.data.data_utils import prepare_attention_mask_per_sample
-
-        return [prepare_attention_mask_per_sample(split_lens, attn_modes, device=device)]
+    """Build the train-replay mask; ``attention_backend`` is validated by ``BagelARStage``."""
     if attention_backend == "flex":
         from .vendor.data.data_utils import create_sparse_mask
 
@@ -636,7 +632,9 @@ def _build_und_attention_mask(
             device=device,
             BLOCK_SIZE=128,
         )
-    raise ValueError(f"pack_und_forward_inputs: attention_backend must be 'sdpa' or 'flex'; got {attention_backend!r}.")
+    from .vendor.data.data_utils import prepare_attention_mask_per_sample
+
+    return [prepare_attention_mask_per_sample(split_lens, attn_modes, device=device)]
 
 
 def pack_und_forward_inputs(
