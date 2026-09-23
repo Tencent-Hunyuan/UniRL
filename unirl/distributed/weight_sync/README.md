@@ -73,6 +73,12 @@ matching receiver on the engine side (`../../rollout/engine/`).
   route, whose own guard says stage-local socket routing is required). Note the
   separate-slab `NCCLWeightSync` path has a *different* PP blocker (its group rank
   collides) and is guarded too.
+- **A delegated rollout target occupies `tp_size * pp_size` group ranks** — one engine per
+  DP replica owns that replica's whole TP x PP rank set, so `NCCLWeightSync.connect`
+  requires `num_rollout_gpus == num_targets * tp_size * pp_size` and offsets target `i` by
+  `i * tp_size * pp_size`. Counting `num_targets * tp_size` (TP only) under-sizes the
+  group by `num_targets * tp_size * (pp_size - 1)`; the check exists because the
+  single-engine fan-out made exactly that drift reachable.
 - **`sync()` is a train-mesh collective** — the FSDP→full materialization runs on
   *every* train rank; never gate it behind `if rank == 0`. The rollout receiver owns
   routing after materialization: SGLang TP performs the push only on each group's

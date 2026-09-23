@@ -188,7 +188,8 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
         self.weight_sync.connect(
             master_addr=addr,
             master_port=port,
-            num_rollout_gpus=len(targets) * tp_size,
+            # A delegated engine head owns the replica's whole TP x PP rank set.
+            num_rollout_gpus=len(targets) * tp_size * pp_size,
             tp_size=tp_size,
             pp_size=pp_size,
         )

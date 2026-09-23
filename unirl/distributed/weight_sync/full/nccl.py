@@ -72,19 +72,19 @@ class NCCLWeightSync(FullWeightSync):
 
         tp = max(1, int(tp_size))
         pp = max(1, int(pp_size))
+        ranks_per_target = tp * pp  # [slots] one delegated engine owns the replica's TP x PP set
+        expected_gpus = len(self._rollout_targets) * ranks_per_target
+        if int(num_rollout_gpus) != expected_gpus:
+            raise ValueError(
+                f"NCCLWeightSync.connect: num_rollout_gpus={int(num_rollout_gpus)} != "
+                f"num_targets({len(self._rollout_targets)}) * tp_size({tp}) * pp_size({pp}) "
+                f"= {expected_gpus}; see the weight_sync README Gotchas."
+            )
         if pp > 1:
-            # SGLang builds one TP group per pipeline stage
-            # (parallel_state.py: contiguous chunks of tp_size), so each stage reports
-            # the same stage-local tp_rank, and weight_updater.py computes its group
-            # rank as `rank_offset + self.tp_rank`. Every stage therefore joins with the
-            # same rank: measured on 4xL4 with pp_size=2, both stages logged
-            # `rank_offset=1, rank=1, world_size=3`. NCCL still forms the group and the
-            # run exits 0, so the mis-sync is silent rather than fatal — fail closed
-            # instead of broadcasting into a group with duplicate ranks.
             raise NotImplementedError(
-                "NCCLWeightSync.connect: rollout pp_size>1 is not supported; SGLang "
-                "derives its weight-sync group rank from the stage-local tp_rank, so "
-                "pipeline stages collide. Only tp_size/dp_size are supported."
+                "NCCLWeightSync.connect: rollout pp_size>1 is not supported; SGLang derives "
+                "its group rank from the stage-local tp_rank, so pipeline stages collide "
+                "(see the weight_sync README Gotchas)."
             )
         world = int(num_rollout_gpus) + 1
         refs = [
@@ -95,7 +95,7 @@ class NCCLWeightSync(FullWeightSync):
                 {
                     "master_address": master_addr,
                     "master_port": int(master_port),
-                    "rank_offset": i * tp + 1,
+                    "rank_offset": i * ranks_per_target + 1,
                     "world_size": world,
                     "group_name": self._group_name,
                     "backend": "nccl",
