@@ -692,7 +692,7 @@ class DiffusionTrainer(BaseTrainer):
         sp = sampling if sampling is not None else self.sampling_params
         noise_latent_shape = self._eval_noise_latent_shape if sampling is not None else self._noise_latent_shape
         diffusion = sp.get("diffusion")
-        sde_indices = diffusion.resolve_sde_indices(rollout_id)
+        sde_indices = diffusion.get_sde_indices(rollout_id)
         diffusion = dataclasses.replace(
             diffusion, sde_indices=sde_indices, scheduler=None, init_noise_latent_shape=noise_latent_shape
         )

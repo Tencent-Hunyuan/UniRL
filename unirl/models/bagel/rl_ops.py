@@ -6,7 +6,7 @@ import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Literal, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -28,12 +28,35 @@ __all__ = [
     "prefill_vit_split",
     "require_inference_dispatch",
     "resize_input_image",
-    "score_response",
     "score_response_with_prompt",
     "und_replay_logits",
     "update_context_image",
     "update_context_text",
 ]
+
+_CREATE_BLOCK_MASK: Any = None
+
+
+def _get_create_block_mask() -> Callable[..., Any]:
+    """Prefer a cached ``torch.compile`` builder; fall back to eager on compile failure."""
+    global _CREATE_BLOCK_MASK
+    if _CREATE_BLOCK_MASK is not None:
+        return _CREATE_BLOCK_MASK
+
+    from torch.nn.attention.flex_attention import create_block_mask as eager
+
+    compiled = torch.compile(eager)
+
+    def _create_block_mask_with_fallback(*args: Any, **kwargs: Any) -> Any:
+        global _CREATE_BLOCK_MASK
+        try:
+            return compiled(*args, **kwargs)
+        except Exception:
+            _CREATE_BLOCK_MASK = eager
+            return eager(*args, **kwargs)
+
+    _CREATE_BLOCK_MASK = _create_block_mask_with_fallback
+    return _CREATE_BLOCK_MASK
 
 
 def disable_inference_cache(model: Any) -> None:
@@ -49,11 +72,6 @@ def _raw(fn: Callable) -> Callable:
     return getattr(fn, "__wrapped__", fn)
 
 
-def _raw_forward_flow(model: Any):
-    """The undecorated ``Bagel._forward_flow`` (bypasses upstream ``@torch.no_grad``)."""
-    return _raw(type(model)._forward_flow)
-
-
 def forward_flow(model: Any, **kwargs: Any) -> Any:
     """Velocity prediction via the pristine vendored ``Bagel._forward_flow``."""
     lm = model.language_model
@@ -62,7 +80,7 @@ def forward_flow(model: Any, **kwargs: Any) -> Any:
     if was_training:
         lm.eval()
     try:
-        return _raw_forward_flow(model)(model, **kwargs)
+        return _raw(type(model)._forward_flow)(model, **kwargs)
     finally:
         if was_training and not grad_enabled:
             lm.train()
@@ -452,61 +470,6 @@ def decode_text_batched(
     return tokens, logps
 
 
-def score_response(
-    model: Any,
-    ctx: Dict[str, Any],
-    *,
-    response_ids: torch.Tensor,
-    start_token_id: int,
-    temperature: float = 1.0,
-    logprob_chunk: int = 1024,
-    device: torch.device,
-) -> torch.Tensor:
-    """Teacher-forced per-token log-probs of ``response_ids``, chunked lm_head, grad-capable; returns fp32 ``[n]``."""
-    require_inference_dispatch(model)
-    disable_inference_cache(model)
-    lm = model.language_model
-    kv_len, pos = int(ctx["kv_lens"][0]), int(ctx["ropes"][0])
-    n = int(response_ids.numel())
-    if n == 0:
-        return torch.zeros(0, dtype=torch.float32, device=device)
-
-    response_ids = response_ids.to(device=device, dtype=torch.long)
-    start = torch.tensor([int(start_token_id)], dtype=torch.long, device=device)
-    query_ids = torch.cat([start, response_ids[:-1]], dim=0)
-
-    emb = lm.model.embed_tokens(query_ids)
-    out = lm.forward_inference(
-        packed_query_sequence=emb,
-        query_lens=torch.tensor([n], dtype=torch.int, device=device),
-        packed_query_position_ids=torch.arange(pos, pos + n, dtype=torch.long, device=device),
-        packed_query_indexes=torch.arange(kv_len, kv_len + n, dtype=torch.long, device=device),
-        past_key_values=ctx["past_key_values"],
-        key_values_lens=torch.tensor([kv_len], dtype=torch.int, device=device),
-        packed_key_value_indexes=torch.arange(kv_len, dtype=torch.long, device=device),
-        update_past_key_values=False,
-        is_causal=True,
-        mode="und",
-    )
-    hidden = out.packed_query_sequence
-
-    temp = float(temperature) if float(temperature) > 0.0 else 1.0
-
-    def _chunk_logp(h: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
-        logits = lm.lm_head(h).float() / temp
-        return logits.gather(-1, tgt.unsqueeze(-1)).squeeze(-1) - torch.logsumexp(logits, dim=-1)
-
-    use_ckpt = torch.is_grad_enabled() and hidden.requires_grad
-    parts: List[torch.Tensor] = []
-    for s in range(0, n, int(logprob_chunk)):
-        h, tgt = hidden[s : s + int(logprob_chunk)], response_ids[s : s + int(logprob_chunk)]
-        if use_ckpt:
-            parts.append(checkpoint(_chunk_logp, h, tgt, use_reentrant=False))
-        else:
-            parts.append(_chunk_logp(h, tgt))
-    return torch.cat(parts, dim=0)
-
-
 def score_response_with_prompt(
     model: Any,
     ctx: Dict[str, Any],
@@ -565,6 +528,33 @@ def score_response_with_prompt(
     return torch.cat(parts, dim=0)
 
 
+def _build_und_attention_mask(
+    *,
+    split_lens: List[int],
+    attn_modes: List[str],
+    device: torch.device,
+    attention_backend: Literal["sdpa", "flex"],
+) -> Any:
+    """Build the single-sample train-replay mask; ``attention_backend`` is validated by ``BagelARStage``."""
+    if attention_backend == "flex":
+        from .vendor.data.data_utils import create_sparse_mask
+
+        seqlen = sum(split_lens)
+        mask_mod = create_sparse_mask([seqlen], split_lens, attn_modes, device)
+        return _get_create_block_mask()(
+            mask_mod,
+            B=1,
+            H=None,
+            Q_LEN=seqlen,
+            KV_LEN=seqlen,
+            device=device,
+            BLOCK_SIZE=128,
+        )
+    from .vendor.data.data_utils import prepare_attention_mask_per_sample
+
+    return [prepare_attention_mask_per_sample(split_lens, attn_modes, device=device)]
+
+
 def pack_und_forward_inputs(
     model: Any,
     *,
@@ -572,11 +562,9 @@ def pack_und_forward_inputs(
     splits: List[Dict[str, Any]],
     response_input: torch.Tensor,
     device: torch.device,
-    vit_transform: Callable[[Any], Any] = lambda x: x,
+    attention_backend: Literal["sdpa", "flex"] = "sdpa",
 ) -> Dict[str, Any]:
-    """Train-mode packing: one und sample ``[*ordered splits | response_input]`` with a nested attention mask."""
-    from .vendor.data.data_utils import prepare_attention_mask_per_sample
-
+    """Pack one und sample and build either the baseline dense mask or Flex BlockMask."""
     text_ids: List[int] = []
     text_indexes: List[int] = []
     position_ids: List[int] = []
@@ -607,7 +595,7 @@ def pack_und_forward_inputs(
                 curr_kvlens=[0],
                 curr_rope=[rope],
                 images=[sp["image"]],
-                transforms=vit_transform,
+                transforms=lambda x: x,
                 new_token_ids=new_token_ids,
             )
             img_block_len = int(vit_input["packed_seqlens"][0].item())
@@ -632,7 +620,12 @@ def pack_und_forward_inputs(
     ce_loss_indexes = list(range(resp_start, resp_start + int(response_input.shape[0])))
 
     seqlen = pos
-    nested_mask = prepare_attention_mask_per_sample(split_lens, attn_modes, device=device)
+    attention_mask = _build_und_attention_mask(
+        split_lens=split_lens,
+        attn_modes=attn_modes,
+        device=device,
+        attention_backend=attention_backend,
+    )
 
     return {
         "seqlen": seqlen,
@@ -640,7 +633,9 @@ def pack_und_forward_inputs(
         "packed_text_ids": torch.tensor(text_ids, dtype=torch.long, device=device),
         "packed_text_indexes": torch.tensor(text_indexes, dtype=torch.long, device=device),
         "packed_position_ids": torch.tensor(position_ids, dtype=torch.long, device=device),
-        "nested_attention_masks": [nested_mask],
+        # The vendored Navit attention dispatches List[Tensor] to SDPA and
+        # BlockMask to FlexAttention; retain the key for compatibility.
+        "nested_attention_masks": attention_mask,
         "packed_vit_tokens": (
             torch.cat(vit_tokens_parts, dim=0).to(device=device, dtype=model.dtype) if vit_tokens_parts else None
         ),
