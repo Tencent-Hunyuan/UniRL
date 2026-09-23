@@ -36,22 +36,6 @@ __all__ = [
 ]
 
 _CREATE_BLOCK_MASK: Any = None
-_CREATE_BLOCK_MASK_EAGER: Any = None
-
-
-def _require_create_block_mask() -> Callable[..., Any]:
-    """Import FlexAttention's BlockMask builder, or raise a clear missing-API error."""
-    global _CREATE_BLOCK_MASK_EAGER
-    if _CREATE_BLOCK_MASK_EAGER is None:
-        try:
-            from torch.nn.attention.flex_attention import create_block_mask
-        except ImportError as exc:
-            raise RuntimeError(
-                "pack_und_forward_inputs: attention_backend='flex' requires PyTorch >= 2.5 "
-                "with torch.nn.attention.flex_attention."
-            ) from exc
-        _CREATE_BLOCK_MASK_EAGER = create_block_mask
-    return _CREATE_BLOCK_MASK_EAGER
 
 
 def _get_create_block_mask() -> Callable[..., Any]:
@@ -60,12 +44,9 @@ def _get_create_block_mask() -> Callable[..., Any]:
     if _CREATE_BLOCK_MASK is not None:
         return _CREATE_BLOCK_MASK
 
-    eager = _require_create_block_mask()
-    try:
-        compiled = torch.compile(eager)
-    except Exception:
-        _CREATE_BLOCK_MASK = eager
-        return _CREATE_BLOCK_MASK
+    from torch.nn.attention.flex_attention import create_block_mask as eager
+
+    compiled = torch.compile(eager)
 
     def _create_block_mask_with_fallback(*args: Any, **kwargs: Any) -> Any:
         global _CREATE_BLOCK_MASK

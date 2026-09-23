@@ -17,6 +17,7 @@ from typing import List, Optional, Tuple
 import torch
 from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
+from torch.nn.attention.flex_attention import BlockMask, flex_attention
 from torch.nn.functional import scaled_dot_product_attention
 from transformers.utils import ModelOutput
 
@@ -35,37 +36,11 @@ from unirl.models.bagel.vendor.modeling.cache_utils.taylorseer import (
     cal_type, taylor_cache_init, derivative_approximation, taylor_formula,
 )
 
-try:
-    from torch.nn.attention.flex_attention import BlockMask, flex_attention as _flex_attention_fn
-except ImportError:  # pragma: no cover - optional FlexAttention dependency
-    BlockMask = None
-    _flex_attention_fn = None
-
 
 torch._dynamo.config.cache_size_limit = 512
 torch._dynamo.config.accumulated_cache_size_limit = 4096
-
-_COMPILED_FLEX_ATTENTION = None
-
-
-def _get_flex_attention():
-    """Lazily compile FlexAttention; keep SDPA importable without the optional API."""
-    global _COMPILED_FLEX_ATTENTION
-    if _flex_attention_fn is None:
-        raise RuntimeError(
-            "PackedAttention FlexAttention path requires PyTorch >= 2.5 "
-            "with torch.nn.attention.flex_attention."
-        )
-    if _COMPILED_FLEX_ATTENTION is None:
-        try:
-            _COMPILED_FLEX_ATTENTION = torch.compile(_flex_attention_fn)
-        except Exception:
-            _COMPILED_FLEX_ATTENTION = _flex_attention_fn
-    return _COMPILED_FLEX_ATTENTION
-
-
-def _is_block_mask(attention_mask) -> bool:
-    return BlockMask is not None and isinstance(attention_mask, BlockMask)
+# flex_attention = torch.compile(flex_attention) # , dynamic=True, mode='max-autotune'
+flex_attention = torch.compile(flex_attention)
 
 
 class Qwen2Config(_Qwen2Config):
@@ -315,12 +290,12 @@ class PackedAttention(Qwen2Attention):
                     )
                 upacked_attn_output.append(attn_output.squeeze(0))
             packed_attn_output = torch.cat(upacked_attn_output, dim=1)
-        elif _is_block_mask(attention_mask):
+        elif isinstance(attention_mask, BlockMask):
             pad_size = sum(sample_lens) - packed_query_states.shape[0]
             packed_query_states = pad_sequence(packed_query_states.permute(1, 0, 2), pad_size)
             packed_key_states = pad_sequence(packed_key_states.permute(1, 0, 2), pad_size)
             packed_value_states = pad_sequence(packed_value_states.permute(1, 0, 2), pad_size)
-            packed_attn_output = _get_flex_attention()(
+            packed_attn_output = flex_attention(
                 packed_query_states.unsqueeze(0), 
                 packed_key_states.unsqueeze(0), 
                 packed_value_states.unsqueeze(0), 
@@ -504,12 +479,12 @@ class PackedAttentionMoT(Qwen2Attention):
                     )
                 upacked_attn_output.append(attn_output.squeeze(0))
             packed_attn_output = torch.cat(upacked_attn_output, dim=1)
-        elif _is_block_mask(attention_mask):
+        elif isinstance(attention_mask, BlockMask):
             pad_size = sum(sample_lens) - packed_query_states.shape[0]
             packed_query_states_ = pad_sequence(packed_query_states_.permute(1, 0, 2), pad_size)
             packed_key_states_ = pad_sequence(packed_key_states_.permute(1, 0, 2), pad_size)
             packed_value_states = pad_sequence(packed_value_states.permute(1, 0, 2), pad_size)
-            packed_attn_output = _get_flex_attention()(
+            packed_attn_output = flex_attention(
                 packed_query_states_.unsqueeze(0), # 1, num_head, L, head_dim
                 packed_key_states_.unsqueeze(0), 
                 packed_value_states.unsqueeze(0), 
