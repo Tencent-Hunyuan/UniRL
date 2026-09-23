@@ -35,13 +35,14 @@ __all__ = [
     "update_context_text",
 ]
 
-_COMPILED_CREATE_BLOCK_MASK: Any = None
+_CREATE_BLOCK_MASK: Any = None
+_CREATE_BLOCK_MASK_EAGER: Any = None
 
 
-def _get_compiled_create_block_mask() -> Callable[..., Any]:
-    """Lazily compile and cache FlexAttention's BlockMask builder."""
-    global _COMPILED_CREATE_BLOCK_MASK
-    if _COMPILED_CREATE_BLOCK_MASK is None:
+def _require_create_block_mask() -> Callable[..., Any]:
+    """Import FlexAttention's BlockMask builder, or raise a clear missing-API error."""
+    global _CREATE_BLOCK_MASK_EAGER
+    if _CREATE_BLOCK_MASK_EAGER is None:
         try:
             from torch.nn.attention.flex_attention import create_block_mask
         except ImportError as exc:
@@ -49,8 +50,33 @@ def _get_compiled_create_block_mask() -> Callable[..., Any]:
                 "pack_und_forward_inputs: attention_backend='flex' requires PyTorch >= 2.5 "
                 "with torch.nn.attention.flex_attention."
             ) from exc
-        _COMPILED_CREATE_BLOCK_MASK = torch.compile(create_block_mask)
-    return _COMPILED_CREATE_BLOCK_MASK
+        _CREATE_BLOCK_MASK_EAGER = create_block_mask
+    return _CREATE_BLOCK_MASK_EAGER
+
+
+def _get_create_block_mask() -> Callable[..., Any]:
+    """Prefer a cached ``torch.compile`` builder; fall back to eager on compile failure."""
+    global _CREATE_BLOCK_MASK
+    if _CREATE_BLOCK_MASK is not None:
+        return _CREATE_BLOCK_MASK
+
+    eager = _require_create_block_mask()
+    try:
+        compiled = torch.compile(eager)
+    except Exception:
+        _CREATE_BLOCK_MASK = eager
+        return _CREATE_BLOCK_MASK
+
+    def _create_block_mask_with_fallback(*args: Any, **kwargs: Any) -> Any:
+        global _CREATE_BLOCK_MASK
+        try:
+            return compiled(*args, **kwargs)
+        except Exception:
+            _CREATE_BLOCK_MASK = eager
+            return eager(*args, **kwargs)
+
+    _CREATE_BLOCK_MASK = _create_block_mask_with_fallback
+    return _CREATE_BLOCK_MASK
 
 
 def disable_inference_cache(model: Any) -> None:
@@ -602,7 +628,7 @@ def _build_und_attention_mask(
 
         seqlen = sum(sample_lens)
         mask_mod = create_sparse_mask(sample_lens, split_lens, attn_modes, device)
-        return _get_compiled_create_block_mask()(
+        return _get_create_block_mask()(
             mask_mod,
             B=1,
             H=None,

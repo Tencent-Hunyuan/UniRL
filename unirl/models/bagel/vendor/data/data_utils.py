@@ -7,10 +7,16 @@ import random
 from PIL import Image
 
 import torch
-from torch.nn.attention.flex_attention import or_masks, and_masks
 
 
 def create_sparse_mask(document_lens, split_lens, attn_modes, device):
+    try:
+        from torch.nn.attention.flex_attention import and_masks, or_masks
+    except ImportError as exc:
+        raise RuntimeError(
+            "create_sparse_mask requires PyTorch >= 2.5 with torch.nn.attention.flex_attention."
+        ) from exc
+
     def causal_mask(b, h, q_idx, kv_idx):
         return q_idx >= kv_idx
 

@@ -7,7 +7,6 @@ from typing import List, Tuple, Optional, Dict, Any
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch.nn.attention.flex_attention import create_block_mask
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_utils import PreTrainedModel
 
@@ -153,6 +152,13 @@ class Bagel(PreTrainedModel):
         packed_sequence[packed_text_indexes] = packed_text_embedding
 
         if nested_attention_masks is None:
+            try:
+                from torch.nn.attention.flex_attention import create_block_mask
+            except ImportError as exc:
+                raise RuntimeError(
+                    "Bagel.forward: nested_attention_masks=None requires PyTorch >= 2.5 "
+                    "with torch.nn.attention.flex_attention."
+                ) from exc
             sparse_mask = create_sparse_mask(sample_lens, split_lens, attn_modes, packed_text_embedding.device)
             seqlen = sum(sample_lens)
             block_mask = create_block_mask(
