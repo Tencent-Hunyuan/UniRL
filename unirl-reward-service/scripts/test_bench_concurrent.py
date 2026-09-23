@@ -7,7 +7,7 @@ from pathlib import Path
 
 from PIL import Image
 
-_SCRIPT = Path(__file__).parents[1] / "scripts" / "bench_concurrent.py"
+_SCRIPT = Path(__file__).with_name("bench_concurrent.py")
 _SPEC = importlib.util.spec_from_file_location("bench_concurrent", _SCRIPT)
 assert _SPEC is not None and _SPEC.loader is not None
 bench = importlib.util.module_from_spec(_SPEC)
