@@ -256,8 +256,8 @@ rollout:
       # so sglang bounds its DiT-forward / VAE-decode peak memory.
       forward_batch_size: 4
       engine_kwargs:
-        # multimodal_gen sglang has torch_memory_saver on by default → its sleep
-        # already frees; no knob needed here.
+        # SGLang 0.5.19's native sleep path offloads active modules to pinned
+        # CPU memory; no additional memory-saver knob is needed here.
         mem_fraction_static: 0
         skip_server_warmup: true
         disable_cuda_graph: true

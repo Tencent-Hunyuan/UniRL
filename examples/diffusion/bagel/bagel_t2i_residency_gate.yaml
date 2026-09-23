@@ -1,0 +1,57 @@
+# @package _global_
+# Residency gate: BAGEL-7B-MoT t2i x PickScore x LoRA on 1x8, all roles parked.
+#
+# Exercises ResidencyPlanner rather than training anything, so it is the
+# mainline t2i recipe with only the knobs that make the planner observable. An
+# overlay and not a copy on purpose: a standalone duplicate silently drifts from
+# the recipe it claims to mirror, which is how this file came to carry a
+# `cfg_text_scale` that `BagelDiffusionParams` had already renamed.
+#
+# What the inherited shape buys, none of which a different base would give:
+#   - layout: colocate with an EXTERNAL vLLM-Omni rollout. Trainside generation
+#     reads the very weights that would be parked, so it is not tracked at all.
+#   - A colocated PickScore, so reward_resident: false is a real transition. On a
+#     separate reward_fraction slab it would be untracked.
+#   - weight_sync_interval: 1, so the run crosses a LoRA push with the trainer
+#     parked -- which is what forces the extract/push split over a single sync().
+#
+# Expected: six transitions per rollout, in this order, and nothing else --
+#   train offload, rollout onload, rollout offload,
+#   reward onload, reward offload, train onload
+# Running it with train_resident=true reward_resident=true (the defaults every
+# other recipe uses) must instead emit only the rollout pair.
+#
+# Launch:
+#   PYTHONPATH=$PWD python -m unirl.train_diffusion \
+#     --config-name diffusion/bagel/bagel_t2i_residency_gate
+
+defaults:
+  - bagel_vllmomni
+  - _self_
+
+# Park all three. Parking only one would leave the planner's whole job --
+# sequencing them without moving memory twice -- untested.
+train_resident: false
+rollout_resident: false
+reward_resident: false
+
+# Two rollouts is enough to show the cycle repeats and to cross one weight sync;
+# the mainline count is deliberately open-ended.
+num_rollouts: 2
+
+# Both are the trainer's own defaults, spelled out so the eval and checkpoint
+# arms this gate exists for can be selected with a plain override instead of
+# Hydra's append syntax.
+eval_interval: 0
+save_interval: 0
+
+# 8 prompts x 2 samples = 16 rows, 2 per rank. Small enough that the gate is
+# dominated by the transitions it measures rather than by generation.
+batch_size: 8
+sampling:
+  samples_per_prompt: 2
+
+sync:
+  # The checksum read-back is a separate concern from residency, and it costs a
+  # collective per push; the gate asserts on the transition log instead.
+  verify: false

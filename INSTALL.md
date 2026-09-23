@@ -11,7 +11,7 @@ virtualenv, never `--all-extras`. `train` and `infer` do not pull a rollout engi
 | Engine extra | PyTorch | CUDA |
 |---|---|---|
 | `vllm` (vLLM + vLLM-Omni) | `2.13.0+cu130` | 13.0 |
-| `sglang` | `2.11.0+cu130` | 13.0 |
+| `sglang` | `2.13.0+cu130` | 13.0 |
 
 SGLang's wheel needs glibc >= 2.34. Put NVIDIA's CUDA 13 forward-compat
 libraries on `LD_LIBRARY_PATH` before launch; the launchers do not do this.
@@ -89,7 +89,7 @@ Prefer these extras over the legacy [`requirements.txt`](requirements.txt) and
 The `fastvideo` extra pins
 [hao-ai-lab/FastVideo@2095477](https://github.com/hao-ai-lab/FastVideo/blob/2095477eac7e289c7a7ab13acb367ca60687c304/pyproject.toml),
 which requires `transformers==4.57.3` and `wandb>=0.21.0`. The transformers pin
-conflicts with UniRL's `transformers>=5.6,<5.13`, so `.[fastvideo]` does not
+conflicts with UniRL's `transformers>=5.12,<5.13`, so `.[fastvideo]` does not
 resolve — a separate venv does not help, because UniRL's base deps still apply.
 Adding `train` also conflicts on `wandb`. Use `$FASTVIDEO_PATH` as in the
 [FastVideo engine README](unirl/rollout/engine/fastvideo/README.md) until the extra

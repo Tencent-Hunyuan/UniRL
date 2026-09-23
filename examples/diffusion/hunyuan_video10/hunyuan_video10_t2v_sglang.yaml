@@ -192,4 +192,3 @@ sync:
   adapter_name: default
   bucket_size_mb: 512
   flush_cache: true
-  name_remap: {"*": "transformer.*"}

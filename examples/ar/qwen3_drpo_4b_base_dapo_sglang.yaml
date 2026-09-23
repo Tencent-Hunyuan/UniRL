@@ -134,8 +134,7 @@ rollout:
       # SGLang's FSDP on-policy mode is part of the rollout/replay contract,
       # not merely a performance switch. It selects deterministic PyTorch
       # sampling/log-softmax and native activations/layernorms that match the
-      # FSDP trainer. Without it, rollout logprobs drift from replay and
-      # SGLang 0.5.12.post1 also tries to JIT an incompatible activation kernel.
+      # FSDP trainer. Without it, rollout logprobs drift from replay.
       # It further forces deterministic sampling, so the engine sends this recipe's
       # 8 samples/prompt as 8 seeded n=1 requests (see unirl/rollout/engine/README.md).
       rl_on_policy_target: fsdp
@@ -143,13 +142,13 @@ rollout:
       # FULL fine-tuning: lower the SRT KV reservation to give FSDP headroom for
       # the per-rollout full-weight all-gather. No LoRA pool — full dense weights
       # pushed via TensorWeightSync. CUDA graph ON for decode speed, but capped at
-      # cuda_graph_max_bs=16 so its captured buffers stay small (the default 256
-      # would balloon server memory + compete with the weight push).
+      # cuda_graph_max_bs_decode=16 so its captured buffers stay small (the
+      # auto-tuned default can be much larger and compete with the weight push).
       mem_fraction_static: 0.3
       skip_server_warmup: true
       attention_backend: triton
       disable_cuda_graph: false
-      cuda_graph_max_bs: 16
+      cuda_graph_max_bs_decode: 16
       enable_lora: false
 
 reward:
