@@ -267,7 +267,7 @@ reward:
   # WISE reward via remote RewardService: one HTTP POST /score per rollout.
   # The `wise` scorer (Qwen3.5-VL judge) returns wiscore=(0.7C+0.2R+0.1A)/2 as its
   # first sub-metric; sub_metric_reduce="first" trains on that headline score.
-  # The judge sees the ORIGINAL user prompt (req.primitives['text'], not the AR
+  # The judge sees the ORIGINAL user prompt (prompt_source: original, not the AR
   # rewrite), replicated N*M → scores image-vs-original-intent.
   _target_: unirl.reward.service.RewardService
   backend:
@@ -282,6 +282,7 @@ reward:
       batch_size: 8
       timeout: 900.0                       # > RewardService score_timeout_s; covers VLM cold start
       input_kind: image
+      prompt_source: original              # score against the user's prompt, not the rewrite
       raise_on_failure: true
 
 data_source:
