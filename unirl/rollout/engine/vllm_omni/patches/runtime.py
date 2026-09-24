@@ -68,7 +68,7 @@ def install_fate_sharing(anchor_pid: int, *, arm_pdeathsig: bool) -> None:
     threading.Thread(target=_watch, daemon=True, name="unirl-fate-watchdog").start()
 
 
-class _DiffrlPatchedTarget:
+class _UnirlPatchedTarget:
     """Pickleable top-level wrapper that installs patches in the child first."""
 
     def __init__(self, target):
@@ -85,7 +85,7 @@ class _DiffrlPatchedTarget:
         return self._target(*args, **kwargs)
 
 
-_WRAP_SENTINEL = "_diffrl_target_wrapped"
+_WRAP_SENTINEL = "_unirl_target_wrapped"
 
 
 def wrap_mp_process_for_children() -> None:
@@ -106,8 +106,8 @@ def wrap_mp_process_for_children() -> None:
         *,
         daemon=None,
     ):
-        if target is not None and not isinstance(target, _DiffrlPatchedTarget):
-            target = _DiffrlPatchedTarget(target)
+        if target is not None and not isinstance(target, _UnirlPatchedTarget):
+            target = _UnirlPatchedTarget(target)
         orig_init(
             self,
             group=group,
@@ -120,7 +120,7 @@ def wrap_mp_process_for_children() -> None:
 
     def start(self):
         target = getattr(self, "_target", None)
-        if isinstance(target, _DiffrlPatchedTarget):
+        if isinstance(target, _UnirlPatchedTarget):
             target._arm_pdeathsig = threading.current_thread() is threading.main_thread()
         return orig_start(self)
 
@@ -132,7 +132,7 @@ def wrap_mp_process_for_children() -> None:
 def patch_dit_lora_loader() -> None:
     """Patch ``DiffusionLoRAManager._load_adapter`` (DiT stage) to support in-memory tensors."""
     original = DiffusionLoRAManager._load_adapter
-    if getattr(original, "_diffrl_tensor_lora_loader", False):
+    if getattr(original, "_unirl_tensor_lora_loader", False):
         return
 
     def hijack__load_adapter(
@@ -178,7 +178,7 @@ def patch_dit_lora_loader() -> None:
 
         return lora_model, peft_helper
 
-    hijack__load_adapter._diffrl_tensor_lora_loader = True  # type: ignore[attr-defined]
+    hijack__load_adapter._unirl_tensor_lora_loader = True  # type: ignore[attr-defined]
     setattr(DiffusionLoRAManager, "_load_adapter", hijack__load_adapter)
 
 
@@ -217,7 +217,7 @@ def patch_dit_hi3_lora_weights() -> None:
         return
 
     original = DiffusionLoRAManager._get_lora_weights
-    if getattr(original, "_diffrl_hi3_lora_weights", False):
+    if getattr(original, "_unirl_hi3_lora_weights", False):
         return
 
     def wrapped(self, lora_model, full_module_name, _orig=original):
@@ -270,7 +270,7 @@ def patch_dit_hi3_lora_weights() -> None:
             scaling=[1.0, 1.0, 1.0],
         )
 
-    wrapped._diffrl_hi3_lora_weights = True
+    wrapped._unirl_hi3_lora_weights = True
     DiffusionLoRAManager._get_lora_weights = wrapped
 
 
@@ -282,7 +282,7 @@ def patch_ar_lora_loader() -> None:
         return
 
     _orig_ar_load_adapter = WorkerLoRAManager._load_adapter
-    if getattr(_orig_ar_load_adapter, "_diffrl_hijacked", False):
+    if getattr(_orig_ar_load_adapter, "_unirl_hijacked", False):
         return
 
     def hijack_ar__load_adapter(self, lora_request, _orig=_orig_ar_load_adapter) -> LoRAModel:
@@ -309,7 +309,7 @@ def patch_ar_lora_loader() -> None:
         )
         return lora
 
-    hijack_ar__load_adapter._diffrl_hijacked = True  # type: ignore[attr-defined]
+    hijack_ar__load_adapter._unirl_hijacked = True  # type: ignore[attr-defined]
     setattr(WorkerLoRAManager, "_load_adapter", hijack_ar__load_adapter)
 
 
@@ -331,7 +331,7 @@ def patch_ar_merged_lora_fused_tensor() -> None:
                         lora_a = [lora_a] * self.n_slices
             return _orig(self, index, lora_a, lora_b, *args, **kwargs)
 
-        _set_lora._diffrl_fused_merged_tolerant = True  # type: ignore[attr-defined]
+        _set_lora._unirl_fused_merged_tolerant = True  # type: ignore[attr-defined]
         return _set_lora
 
     for _name in (
@@ -342,7 +342,7 @@ def patch_ar_merged_lora_fused_tensor() -> None:
         if cls is None or "set_lora" not in cls.__dict__:
             continue
         orig = cls.__dict__["set_lora"]
-        if getattr(orig, "_diffrl_fused_merged_tolerant", False):
+        if getattr(orig, "_unirl_fused_merged_tolerant", False):
             continue
         cls.set_lora = _make(orig)
 
@@ -356,7 +356,7 @@ def patch_fp32_skip() -> None:
         return
 
     _orig_from_layer = _lora_utils.from_layer
-    if getattr(_orig_from_layer, "_diffrl_fp32_skip", False):
+    if getattr(_orig_from_layer, "_unirl_fp32_skip", False):
         return
 
     def _patched_from_layer(
@@ -374,7 +374,7 @@ def patch_fp32_skip() -> None:
             return layer
         return _orig(layer, max_loras, lora_config, packed_modules_list, model_config)
 
-    _patched_from_layer._diffrl_fp32_skip = True  # type: ignore[attr-defined]
+    _patched_from_layer._unirl_fp32_skip = True  # type: ignore[attr-defined]
     _lora_utils.from_layer = _patched_from_layer
 
     # Rebind modules that imported from_layer before this patch ran.
@@ -402,7 +402,7 @@ def patch_hv15_packed_lora_mapping() -> None:
     except (ImportError, AttributeError):
         return
 
-    sentinel = "_diffrl_hv15_packed_lora_mapping"
+    sentinel = "_unirl_hv15_packed_lora_mapping"
     if getattr(HunyuanVideo15Transformer3DModel, sentinel, False):
         return
     if not getattr(HunyuanVideo15Transformer3DModel, "stacked_params_mapping", None):
@@ -482,7 +482,7 @@ def patch_hv15_refiner_torch_linear_lora() -> None:
         return
 
     original_replace = DiffusionLoRAManager._replace_layers_with_lora
-    if getattr(original_replace, "_diffrl_hv15_refiner_torch_linear_lora", False):
+    if getattr(original_replace, "_unirl_hv15_refiner_torch_linear_lora", False):
         return
 
     @wraps(original_replace)
@@ -534,7 +534,7 @@ def patch_hv15_refiner_torch_linear_lora() -> None:
                 newly_wrapped,
             )
 
-    _patched_replace._diffrl_hv15_refiner_torch_linear_lora = True
+    _patched_replace._unirl_hv15_refiner_torch_linear_lora = True
     DiffusionLoRAManager._replace_layers_with_lora = _patched_replace
 
 
@@ -547,15 +547,15 @@ def patch_lora_request_passthrough() -> None:
         return
 
     _orig_omni_generate = Omni.generate
-    if not getattr(_orig_omni_generate, "_diffrl_lora_request_passthrough", False):
+    if not getattr(_orig_omni_generate, "_unirl_lora_request_passthrough", False):
 
         def _patched_omni_generate(self, *args, lora_request=None, _orig=_orig_omni_generate, **kwargs):
-            self.engine._diffrl_pending_lora_request = lora_request
+            self.engine._unirl_pending_lora_request = lora_request
             py_generator = kwargs.get("py_generator", False)
             try:
                 result = _orig(self, *args, **kwargs)
             except Exception:
-                self.engine._diffrl_pending_lora_request = None
+                self.engine._unirl_pending_lora_request = None
                 raise
             if py_generator:
 
@@ -563,24 +563,24 @@ def patch_lora_request_passthrough() -> None:
                     try:
                         yield from gen
                     finally:
-                        engine._diffrl_pending_lora_request = None
+                        engine._unirl_pending_lora_request = None
 
                 return _wrapped(result, self.engine)
-            self.engine._diffrl_pending_lora_request = None
+            self.engine._unirl_pending_lora_request = None
             return result
 
-        _patched_omni_generate._diffrl_lora_request_passthrough = True  # type: ignore[attr-defined]
+        _patched_omni_generate._unirl_lora_request_passthrough = True  # type: ignore[attr-defined]
         Omni.generate = _patched_omni_generate
 
     _orig_add_request = AsyncOmniEngine.add_request
-    if not getattr(_orig_add_request, "_diffrl_lora_request_passthrough", False):
+    if not getattr(_orig_add_request, "_unirl_lora_request_passthrough", False):
 
         def _patched_add_request(self, *args, lora_request=None, _orig=_orig_add_request, **kwargs):
             if lora_request is None:
-                lora_request = getattr(self, "_diffrl_pending_lora_request", None)
+                lora_request = getattr(self, "_unirl_pending_lora_request", None)
             return _orig(self, *args, lora_request=lora_request, **kwargs)
 
-        _patched_add_request._diffrl_lora_request_passthrough = True  # type: ignore[attr-defined]
+        _patched_add_request._unirl_lora_request_passthrough = True  # type: ignore[attr-defined]
         AsyncOmniEngine.add_request = _patched_add_request
 
 
@@ -593,7 +593,7 @@ def patch_sigmas_passthrough() -> None:
         )
 
         _orig_outer_forward = HunyuanImage3Pipeline.forward
-        if not getattr(_orig_outer_forward, "_diffrl_sigmas_passthrough", False):
+        if not getattr(_orig_outer_forward, "_unirl_sigmas_passthrough", False):
 
             def _patched_outer_forward(self, req, *args, _orig=_orig_outer_forward, **kwargs):
                 sigmas = getattr(getattr(req, "sampling_params", None), "sigmas", None)
@@ -603,11 +603,11 @@ def patch_sigmas_passthrough() -> None:
                 finally:
                     self.unirl_sigmas = None
 
-            _patched_outer_forward._diffrl_sigmas_passthrough = True  # type: ignore[attr-defined]
+            _patched_outer_forward._unirl_sigmas_passthrough = True  # type: ignore[attr-defined]
             HunyuanImage3Pipeline.forward = _patched_outer_forward
 
         _orig_inner_call = HunyuanImage3Text2ImagePipeline.__call__
-        if not getattr(_orig_inner_call, "_diffrl_sigmas_passthrough", False):
+        if not getattr(_orig_inner_call, "_unirl_sigmas_passthrough", False):
 
             def _patched_inner_call(self, *args, _orig=_orig_inner_call, **kwargs):
                 outer = getattr(self, "model", None)
@@ -616,7 +616,7 @@ def patch_sigmas_passthrough() -> None:
                     kwargs["sigmas"] = sigmas
                 return _orig(self, *args, **kwargs)
 
-            _patched_inner_call._diffrl_sigmas_passthrough = True  # type: ignore[attr-defined]
+            _patched_inner_call._unirl_sigmas_passthrough = True  # type: ignore[attr-defined]
             HunyuanImage3Text2ImagePipeline.__call__ = _patched_inner_call
     except (ImportError, AttributeError):
         pass
@@ -632,7 +632,7 @@ def patch_per_request_ar_seed() -> None:
         return
 
     _orig = AsyncOmniEngine.add_request
-    if getattr(_orig, "_diffrl_per_request_ar_seed", False):
+    if getattr(_orig, "_unirl_per_request_ar_seed", False):
         return
 
     import os as _os
@@ -647,7 +647,7 @@ def patch_per_request_ar_seed() -> None:
             ]
         return _orig(self, *args, sampling_params_list=sampling_params_list, **kwargs)
 
-    _patched._diffrl_per_request_ar_seed = True  # type: ignore[attr-defined]
+    _patched._unirl_per_request_ar_seed = True  # type: ignore[attr-defined]
     AsyncOmniEngine.add_request = _patched
 
 

@@ -77,12 +77,12 @@ class LocalLoraWeightSync(LoraWeightSyncBase):
     def _verify_loaded(self, lora_tensors, peft_config) -> None:
         """Assert the sibling engine's loaded LoRA matches what we just pushed."""
         from unirl.distributed.weight_sync.transfer.ipc_dispatch import (
-            DIFFRL_LORA_INT_ID,
+            UNIRL_LORA_INT_ID,
         )
 
         exp_a, exp_b = self._expected_checksums(lora_tensors, peft_config)
         topology = self._rollout.tp_per_stage()
-        loaded = self._rollout.loaded_lora_checksums(adapter_id=int(DIFFRL_LORA_INT_ID))
+        loaded = self._rollout.loaded_lora_checksums(adapter_id=UNIRL_LORA_INT_ID)
         rank = self.rank_info.rank if self.rank_info is not None else 0
         self._assert_loaded(
             exp_a,

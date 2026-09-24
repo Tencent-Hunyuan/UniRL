@@ -126,14 +126,12 @@ class Backend(Protocol):
     def set_lora_handle(
         self,
         *,
-        adapter_name: str,
         lora_tensors: Dict[str, Any],
         peft_config: Optional[dict],
     ) -> None: ...
     def set_lora_copy(
         self,
         *,
-        adapter_name: str,
         lora_tensors: Dict[str, Any],
         peft_config: Optional[dict],
     ) -> None: ...

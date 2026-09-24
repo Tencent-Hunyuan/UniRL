@@ -102,7 +102,7 @@ class RemoteLoraWeightSync(LoraWeightSyncBase):
         import ray
 
         from unirl.distributed.weight_sync.transfer.ipc_dispatch import (
-            DIFFRL_LORA_INT_ID,
+            UNIRL_LORA_INT_ID,
         )
 
         exp_a, exp_b = self._expected_checksums(lora_tensors, peft_config)
@@ -110,7 +110,7 @@ class RemoteLoraWeightSync(LoraWeightSyncBase):
             (
                 role,
                 worker.call.remote(role, "tp_per_stage", (), {}),
-                worker.call.remote(role, "loaded_lora_checksums", (), {"adapter_id": int(DIFFRL_LORA_INT_ID)}),
+                worker.call.remote(role, "loaded_lora_checksums", (), {"adapter_id": UNIRL_LORA_INT_ID}),
             )
             for role, workers in self._targets
             for worker in workers

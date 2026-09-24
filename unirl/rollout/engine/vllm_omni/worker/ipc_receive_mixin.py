@@ -11,9 +11,9 @@ from unirl.distributed.weight_sync.transfer.bucketed_transfer import (
     BucketedWeightReceiver,
 )
 from unirl.distributed.weight_sync.transfer.ipc_dispatch import (
-    DIFFRL_LORA_INT_ID,
-    DIFFRL_LORA_NAME,
-    DIFFRL_LORA_PATH,
+    UNIRL_LORA_INT_ID,
+    UNIRL_LORA_NAME,
+    UNIRL_LORA_PATH,
     replica_rank_from_env,
     zmq_handle,
 )
@@ -48,12 +48,12 @@ class BucketedIPCReceiveMixin:
         """Receive a state dict over the per-rank ZMQ socket."""
         if peft_config and base_sync_done:
             try:
-                self.remove_lora(DIFFRL_LORA_INT_ID)
+                self.remove_lora(UNIRL_LORA_INT_ID)
             except Exception as exc:
                 logger.warning(
                     "%s.remove_lora(%d) failed: %s",
                     type(self).__name__,
-                    DIFFRL_LORA_INT_ID,
+                    UNIRL_LORA_INT_ID,
                     exc,
                 )
 
@@ -74,12 +74,12 @@ class BucketedIPCReceiveMixin:
             use_shm=use_shm,
         )
         receiver.receive_weights(
-            on_bucket_received=lambda weights: self._diffrl_load_bucket(
+            on_bucket_received=lambda weights: self._unirl_load_bucket(
                 weights, peft_config=peft_config, base_sync_done=base_sync_done
             )
         )
 
-    def _diffrl_load_bucket(
+    def _unirl_load_bucket(
         self,
         weights: list[tuple[str, torch.Tensor]],
         peft_config: Optional[dict],
@@ -88,9 +88,9 @@ class BucketedIPCReceiveMixin:
         if peft_config and base_sync_done:
             tensors = dict(weights)
             lora_request = OmniTensorLoRARequest(
-                lora_name=DIFFRL_LORA_NAME,
-                lora_int_id=DIFFRL_LORA_INT_ID,
-                lora_path=DIFFRL_LORA_PATH,
+                lora_name=UNIRL_LORA_NAME,
+                lora_int_id=UNIRL_LORA_INT_ID,
+                lora_path=UNIRL_LORA_PATH,
                 peft_config=peft_config,
                 lora_tensors=tensors,
             )
@@ -99,13 +99,13 @@ class BucketedIPCReceiveMixin:
                 "%s: LoRA bucket loaded (%d tensors, adapter id=%d)",
                 type(self).__name__,
                 len(tensors),
-                DIFFRL_LORA_INT_ID,
+                UNIRL_LORA_INT_ID,
             )
         else:
             logger.debug("%s: bucket loaded (%d tensors)", type(self).__name__, len(weights))
-            self._diffrl_load_weights(weights)
+            self._unirl_load_weights(weights)
 
-    def _diffrl_load_weights(self, weights: list[tuple[str, torch.Tensor]]) -> None:
+    def _unirl_load_weights(self, weights: list[tuple[str, torch.Tensor]]) -> None:
         """Forward weights to whichever loader the underlying worker exposes."""
         loader = getattr(self, "load_weights", None)
         if callable(loader):
@@ -153,7 +153,7 @@ class BucketedIPCReceiveMixin:
             metadata=payload["metadata"],
         )
         named_tensors = bucket.reconstruct_tensors()
-        self._diffrl_load_weights(named_tensors)
+        self._unirl_load_weights(named_tensors)
         logger.info(
             "%s: tensor-payload loaded (%d tensors, load_format=%r)",
             type(self).__name__,
@@ -226,8 +226,16 @@ class BucketedIPCReceiveMixin:
         )
         return self.add_lora(request)
 
-    def _diffrl_parameter_source(self):
-        """Return the loaded module behind AR or diffusion runner wrappers."""
+    def _unirl_loaded_param_checksums(
+        self,
+        names: Optional[list] = None,
+    ) -> dict:
+        """Full-byte SHA-256 of the worker's loaded parameters."""
+        from unirl.distributed.weight_sync.transfer.checksum import (
+            fingerprint_tensor,
+        )
+
+        parameter_module = None
         queue = [self]
         seen: set[int] = set()
         while queue:
@@ -236,13 +244,9 @@ class BucketedIPCReceiveMixin:
                 continue
             seen.add(id(obj))
             named_parameters = getattr(obj, "named_parameters", None)
-            if callable(named_parameters):
-                try:
-                    next(iter(named_parameters()))
-                except StopIteration:
-                    pass
-                else:
-                    return obj
+            if callable(named_parameters) and next(iter(named_parameters()), None) is not None:
+                parameter_module = obj
+                break
             queue.extend(
                 getattr(obj, attr, None)
                 for attr in (
@@ -255,77 +259,18 @@ class BucketedIPCReceiveMixin:
                     "bagel",
                 )
             )
-        return None
-
-    def _diffrl_describe_params(
-        self,
-        names: Optional[list] = None,
-    ) -> dict:
-        """Return ``{name: (shape_tuple, dtype_str)}`` for the worker's loaded model."""
-        param_source = self._diffrl_parameter_source()
-        if param_source is None:
+        if parameter_module is None:
             return {}
 
         target = set(names) if names else None
         out: dict = {}
-        for name, p in param_source.named_parameters():
-            if target is not None and name not in target:
-                continue
-            out[name] = (tuple(p.shape), str(p.dtype))
-        return out
-
-    def _diffrl_param_checksums(
-        self,
-        names: Optional[list] = None,
-    ) -> dict:
-        """Return ``{name: short_sha256_hex}`` for the worker's loaded model."""
-        import hashlib
-
-        param_source = self._diffrl_parameter_source()
-        if param_source is None:
-            return {}
-
-        target = set(names) if names else None
-        out: dict = {}
-        for name, p in param_source.named_parameters():
-            if target is not None and name not in target:
-                continue
-            data = p.detach().contiguous()
-            hasher = hashlib.sha256()
-            hasher.update(str(data.dtype).encode())
-            hasher.update(str(tuple(data.shape)).encode())
-            flat = data.view(torch.uint8).flatten()
-            n = flat.numel()
-            head = flat[: min(256, n)].cpu().numpy().tobytes()
-            tail = flat[max(0, n - 256) :].cpu().numpy().tobytes()
-            hasher.update(head)
-            hasher.update(tail)
-            hasher.update(str(n).encode())
-            out[name] = hasher.hexdigest()[:16]
-        return out
-
-    def _diffrl_loaded_param_checksums(
-        self,
-        names: Optional[list] = None,
-    ) -> dict:
-        """Full-byte SHA-256 of the worker's loaded parameters."""
-        from unirl.distributed.weight_sync.transfer.checksum import (
-            fingerprint_tensor,
-        )
-
-        param_source = self._diffrl_parameter_source()
-        if param_source is None:
-            return {}
-
-        target = set(names) if names else None
-        out: dict = {}
-        for name, p in param_source.named_parameters():
+        for name, p in parameter_module.named_parameters():
             if target is not None and name not in target:
                 continue
             out[name] = fingerprint_tensor(p)
         return out
 
-    def _diffrl_loaded_lora_checksums(
+    def _unirl_loaded_lora_checksums(
         self,
         adapter_id: int,
         names: Optional[list] = None,

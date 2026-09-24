@@ -8,7 +8,7 @@ import torch
 
 
 def patch_vae_decode_safe() -> None:
-    if os.environ.get("UNIRL_DISABLE_CUDNN") != "1" and os.environ.get("DIFFRL_DISABLE_CUDNN") != "1":
+    if os.environ.get("UNIRL_DISABLE_CUDNN") != "1":
         return
 
     from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (

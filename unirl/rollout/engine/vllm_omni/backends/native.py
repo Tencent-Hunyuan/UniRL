@@ -147,8 +147,8 @@ class VLLMOmniBackend:
                 sort_dicts=True,
             ),
         )
-        serialize = os.environ.get("DIFFRL_OMNI_BOOT_SERIALIZE", "1") != "0"
-        lock_file = open("/tmp/diffrl_omni_boot.lock", "a+") if serialize else None
+        serialize = os.environ.get("UNIRL_OMNI_BOOT_SERIALIZE", "1") != "0"
+        lock_file = open("/tmp/unirl_omni_boot.lock", "a+") if serialize else None
         omni = None
         try:
             try:
@@ -237,15 +237,15 @@ class VLLMOmniBackend:
 
     def _lora_request(self) -> Any:
         from unirl.distributed.weight_sync.transfer.ipc_dispatch import (
-            DIFFRL_LORA_INT_ID,
-            DIFFRL_LORA_NAME,
-            DIFFRL_LORA_PATH,
+            UNIRL_LORA_INT_ID,
+            UNIRL_LORA_NAME,
+            UNIRL_LORA_PATH,
         )
 
         return self._rt["OmniLoRARequest"](
-            lora_name=DIFFRL_LORA_NAME,
-            lora_int_id=int(DIFFRL_LORA_INT_ID),
-            lora_path=DIFFRL_LORA_PATH,
+            lora_name=UNIRL_LORA_NAME,
+            lora_int_id=UNIRL_LORA_INT_ID,
+            lora_path=UNIRL_LORA_PATH,
         )
 
     def tokenize_prompt(self, text: str, *, task: str, sys_type: str) -> List[int]:
@@ -547,7 +547,6 @@ class VLLMOmniBackend:
     def set_lora_handle(
         self,
         *,
-        adapter_name: str,
         lora_tensors: Dict[str, Any],
         peft_config: Optional[dict],
     ) -> None:
@@ -555,14 +554,14 @@ class VLLMOmniBackend:
         import torch
 
         from unirl.distributed.weight_sync.transfer.ipc_dispatch import (
-            DIFFRL_LORA_INT_ID,
-            DIFFRL_LORA_NAME,
-            DIFFRL_LORA_PATH,
+            UNIRL_LORA_INT_ID,
+            UNIRL_LORA_NAME,
+            UNIRL_LORA_PATH,
         )
         from unirl.utils.peft_merge import adapt_lora_for_vllm
 
         lora_tensors = adapt_lora_for_vllm(lora_tensors)
-        self._remove_existing_lora(int(DIFFRL_LORA_INT_ID))
+        self._remove_existing_lora(UNIRL_LORA_INT_ID)
 
         from unirl.distributed.weight_sync.transfer.sgl_compat import (
             MultiprocessingSerializer,
@@ -577,9 +576,9 @@ class VLLMOmniBackend:
                 sid,
                 "set_lora_from_tensor_dict",
                 args=(
-                    str(adapter_name) or DIFFRL_LORA_NAME,
-                    int(DIFFRL_LORA_INT_ID),
-                    DIFFRL_LORA_PATH,
+                    UNIRL_LORA_NAME,
+                    UNIRL_LORA_INT_ID,
+                    UNIRL_LORA_PATH,
                     dict(peft_config or {}),
                     serialized,
                 ),
@@ -588,7 +587,6 @@ class VLLMOmniBackend:
     def set_lora_copy(
         self,
         *,
-        adapter_name: str,
         lora_tensors: Dict[str, Any],
         peft_config: Optional[dict],
     ) -> None:
@@ -599,14 +597,14 @@ class VLLMOmniBackend:
         import torch
 
         from unirl.distributed.weight_sync.transfer.ipc_dispatch import (
-            DIFFRL_LORA_INT_ID,
-            DIFFRL_LORA_NAME,
-            DIFFRL_LORA_PATH,
+            UNIRL_LORA_INT_ID,
+            UNIRL_LORA_NAME,
+            UNIRL_LORA_PATH,
         )
         from unirl.utils.peft_merge import adapt_lora_for_vllm
 
         lora_tensors = adapt_lora_for_vllm(lora_tensors)
-        self._remove_existing_lora(int(DIFFRL_LORA_INT_ID))
+        self._remove_existing_lora(UNIRL_LORA_INT_ID)
 
         cpu_tensors = {
             name: t.detach().to("cpu") if isinstance(t, torch.Tensor) else t for name, t in lora_tensors.items()
@@ -620,9 +618,9 @@ class VLLMOmniBackend:
                 sid,
                 "set_lora_from_tensor_dict_copy",
                 args=(
-                    str(adapter_name) or DIFFRL_LORA_NAME,
-                    int(DIFFRL_LORA_INT_ID),
-                    DIFFRL_LORA_PATH,
+                    UNIRL_LORA_NAME,
+                    UNIRL_LORA_INT_ID,
+                    UNIRL_LORA_PATH,
                     dict(peft_config or {}),
                     serialized,
                 ),
@@ -634,29 +632,29 @@ class VLLMOmniBackend:
             self._collective_rpc(
                 sid,
                 "remove_lora",
-                args=(int(adapter_id),),
+                args=(adapter_id,),
                 allow_false=True,
             )
 
     def param_checksums(self, *, names: List[str]) -> dict:
-        """Fan ``_diffrl_loaded_param_checksums`` across stages and ranks."""
+        """Fan ``_unirl_loaded_param_checksums`` across stages and ranks."""
         out: dict = {}
         for sid in self._stage_ids():
             results = self._collective_rpc(
                 sid,
-                "_diffrl_loaded_param_checksums",
+                "_unirl_loaded_param_checksums",
                 args=(list(names),),
             )
             out[int(sid)] = results[0] if isinstance(results, list) and results else results
         return out
 
     def lora_checksums(self, *, adapter_id: int, names: Optional[List[str]]) -> dict:
-        """Fan ``_diffrl_loaded_lora_checksums`` across stages and ranks."""
+        """Fan ``_unirl_loaded_lora_checksums`` across stages and ranks."""
         out: dict = {}
         for sid in self._stage_ids():
             results = self._collective_rpc(
                 sid,
-                "_diffrl_loaded_lora_checksums",
+                "_unirl_loaded_lora_checksums",
                 args=(int(adapter_id), list(names) if names else None),
             )
             out[int(sid)] = results[0] if isinstance(results, list) and results else results
