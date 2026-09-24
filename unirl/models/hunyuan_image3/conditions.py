@@ -118,6 +118,17 @@ class HunyuanImage3FusedMultimodalCondition(FusedMultimodalCondition):
             pad_spec[pad_idx + 1] = pad_size
             return torch.nn.functional.pad(t, pad_spec, value=value)
 
+        def _pad_positions(t):
+            # position_ids are the KV-cache write indices; a constant pad would collide on slot 0.
+            t = _materialize(t)
+            if t is None:
+                return None
+            cur = t.shape[-1]
+            if cur >= max_L:
+                return t
+            tail = torch.arange(cur, max_L, dtype=t.dtype, device=t.device)
+            return torch.cat([t, tail.expand(*t.shape[:-1], max_L - cur)], dim=-1)
+
         def _pad_attn(mask):
             mask = _materialize(mask)
             if mask is None:
@@ -134,7 +145,7 @@ class HunyuanImage3FusedMultimodalCondition(FusedMultimodalCondition):
             cls(
                 input_ids=_pad_seq(item.input_ids, dim=-1, value=0),
                 attention_mask=_pad_attn(item.attention_mask),
-                position_ids=_pad_seq(item.position_ids, dim=-1, value=0),
+                position_ids=_pad_positions(item.position_ids),
                 rope_cache=_pad_seq(item.rope_cache, dim=-2, value=0.0),
                 gen_image_mask=_pad_seq(item.gen_image_mask, dim=-1, value=False),
                 gen_timestep_scatter_index=item.gen_timestep_scatter_index,
