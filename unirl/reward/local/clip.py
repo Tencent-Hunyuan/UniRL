@@ -7,7 +7,7 @@ from typing import List
 
 import torch
 
-from unirl.reward.base import BaseRewardComponentSpec
+from unirl.reward.base import PromptRewardComponentSpec
 from unirl.reward.local.device import resolve_device
 from unirl.types.reward import RewardRequest
 
@@ -23,6 +23,7 @@ class ClipRewardScorer(LocalRewardBackend):
         super().__init__(
             device=resolve_device(config.device, base_device),
             batch_size=config.batch_size,
+            prompt_source=config.prompt_source,
             model_id=config.model_id,
         )
 
@@ -66,7 +67,7 @@ class ClipRewardScorer(LocalRewardBackend):
         import numpy as np
 
         images = request.images
-        prompts = request.prompts
+        prompts = self.prompts(request)
         all_rewards: List[float] = []
 
         for i in range(0, len(images), self.batch_size):
@@ -94,7 +95,7 @@ class ClipRewardScorer(LocalRewardBackend):
 
 
 @dataclass
-class ClipSpec(BaseRewardComponentSpec):
+class ClipSpec(PromptRewardComponentSpec):
     """Typed config for the CLIP similarity reward component."""
 
     batch_size: int = 8

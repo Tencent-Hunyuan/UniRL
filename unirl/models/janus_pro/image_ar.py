@@ -42,6 +42,7 @@ class JanusProImageARSamplingParams(ARSamplingParams):
     height: Optional[int] = None
 
     def __post_init__(self) -> None:
+        super().__post_init__()
         self.cfg_weight = _finite_cfg_weight(
             self.cfg_weight,
             where="JanusProImageARSamplingParams.cfg_weight",

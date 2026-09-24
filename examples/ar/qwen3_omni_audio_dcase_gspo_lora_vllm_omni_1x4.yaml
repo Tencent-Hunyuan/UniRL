@@ -114,7 +114,7 @@ rollout:
     _target_: unirl.rollout.engine.vllm_omni.config.VLLMOmniEngineConfig
     model_path: ${oc.env:QWEN3_OMNI_PATH,/path/to/Qwen3-Omni-30B-A3B-Instruct}
     modality: qwen3_omni_thinker
-    stage_yaml_override: qwen3_omni_thinker_only_rl_1x4.yaml
+    deploy_config_override: qwen3_omni_thinker_only_rl_1x4.yaml
     enable_sleep_mode: true
     max_prompt_length: 16384
     video_fps: 2.0

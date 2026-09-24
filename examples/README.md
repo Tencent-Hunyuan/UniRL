@@ -4,67 +4,85 @@ Self-contained Hydra recipes — one YAML per experiment. A recipe is the single
 source of truth for a run: model, algorithm, rollout engine, placement, reward,
 weight sync, and batch geometry, each instantiated directly by `_target_` (no
 Hydra config-group overrides). Recipes are grouped by trainer domain or agentic
-workflow; select one with `--config-name=<group>/<recipe>` (drop the `.yaml`).
+workflow. Select one with `--config-name` set to its path under `examples/`,
+without `.yaml`. Keep every directory — `diffusion/sd3/sd3_trainside`, not
+`sd3_trainside`.
 
 > This directory replaces the old top-level `recipes/` tree.
 
 ## Domains & entrypoints
 
-Each core domain maps to one entrypoint. The **default recipe** is that
-entrypoint's built-in `config_name` — a safe place to start.
+The **default recipe** is used when `--config-name` is omitted
+(`@hydra.main(config_name=...)` on the entrypoint). Async AR and diffusion have
+their own entrypoints; those recipes still live next to the sync ones.
 
-| Domain | Entrypoint | Default recipe (start here) | Models |
-|---|---|---|---|
-| [`diffusion/`](diffusion/) | `python -m unirl.train_diffusion` | `diffusion/sd3/sd3_trainside` | `sd3`, `qwen_image`, `flux2_klein`, `sensenova_u1_5`, `wan21`, `wan22`, `hunyuan_video10`, `hunyuan_video15` |
-| [`ar/`](ar/) | `python -m unirl.train_ar` | `ar/qwen_vl_grpo_geo3k_mc_4x8`, `ar/qwen3_drpo_4b_base_dapo_sglang` | `qwen_vl` (vision-language), `qwen3` (text-only) |
-| [`sft/`](sft/) | `python -m unirl.train_sft` | `sft/qwen3_sft` | `qwen3`, `qwen_vl`, `bagel`, `sd3`, `cosmos3`, `wan21` |
-| [`pe/`](pe/) | `python -m unirl.train_pe` | `pe/pe_trainside_pickscore` | `pe` (Qwen3 rewriter + SD3, PickScore/WISE reward) |
-| [`unified_model/`](unified_model/) | `python -m unirl.train_unified_model` | `unified_model/hi3_vllmomni` | `hi3` (HunyuanImage3, unified AR + diffusion) |
-
-Agentic training has one service-scored, colocated barrier workflow:
-
-| Workflow | Entrypoint | Recipe |
+| Training path | Entrypoint | Built-in default recipe |
 |---|---|---|
-| Multi-turn tool use with a graded terminal answer | `python -m unirl.train_agentic` | [`deep_research/deep_research_search_judge`](deep_research/deep_research_search_judge.yaml) |
+| Diffusion RL | [`python -m unirl.train_diffusion`](../unirl/train_diffusion.py) | [`diffusion/sd3/sd3_trainside`](diffusion/sd3/sd3_trainside.yaml) |
+| AR RL | [`python -m unirl.train_ar`](../unirl/train_ar.py) | [`ar/qwen_vl_grpo_geo3k_mc_4x8`](ar/qwen_vl_grpo_geo3k_mc_4x8.yaml) |
+| SFT | [`python -m unirl.train_sft`](../unirl/train_sft.py) | [`sft/qwen3_sft`](sft/qwen3_sft.yaml) |
+| Prompt enhancement | [`python -m unirl.train_pe`](../unirl/train_pe.py) | [`pe/pe_trainside_pickscore`](pe/pe_trainside_pickscore.yaml) |
+| Unified RL | [`python -m unirl.train_unified_model`](../unirl/train_unified_model.py) | [`unified_model/hi3_vllmomni`](unified_model/hi3_vllmomni.yaml) |
+| Agentic RL | [`python -m unirl.train_agentic`](../unirl/train_agentic.py) | [`deep_research/deep_research_search_judge`](deep_research/deep_research_search_judge.yaml) |
+| Async AR RL | [`python -m unirl.train_async_ar`](../unirl/train_async_ar.py) | [`ar/qwen3_grpo_4b_base_dapo_sglang_async`](ar/qwen3_grpo_4b_base_dapo_sglang_async.yaml) |
+| Async diffusion RL | [`python -m unirl.train_async_diffusion`](../unirl/train_async_diffusion.py) | [`diffusion/bagel/bagel_vllmomni_async`](diffusion/bagel/bagel_vllmomni_async.yaml) |
+
+The AR default is written for 4×8 (32 GPUs) and requires `DATA_PATH`. Launchers
+override `num_devices` from the node GPU count. Engine extras are in
+[INSTALL.md](../INSTALL.md).
 
 ## Running a recipe
 
-The bash launchers live in this directory. The first argument is the
-domain-qualified recipe name (passed to Hydra as `--config-name`); any extra args
-are forwarded verbatim as Hydra overrides. `ENTRY` selects a non-diffusion
-entrypoint (`train_ar`, `train_sft`, `train_pe`, `train_unified_model`, or
-`train_agentic`); the default is `train_diffusion`.
+Launchers live in this directory. The first argument is the recipe path under
+`examples/`, without `.yaml`. Extra args are Hydra overrides.
+`ENTRY` is the module name from the table (`train_sft`, `train_async_ar`, …)
+and defaults to `train_diffusion`; it is not inferred from the recipe path.
+
+Run from the repository root in the engine environment from INSTALL.md.
+Launchers run `pip install --no-deps -e .` and will not install missing
+dependencies.
 
 ```bash
-# 0. Compose-check first — verifies the config composes and every ${oc.env:...} resolves
+# Compose-check (no training). Pair the entrypoint with the recipe.
 python -m unirl.train_diffusion --config-name=diffusion/sd3/sd3_trainside --cfg job --resolve
+```
 
-# 1. Single node
+```bash
+# Single node
 bash examples/run_experiment_single_node.sh diffusion/sd3/sd3_trainside
 ENTRY=train_ar bash examples/run_experiment_single_node.sh ar/qwen_vl_grpo_geo3k_mc_4x8
-ENTRY=train_sft bash examples/run_experiment_single_node.sh sft/qwen3_agent_sft_lora
+# SFT: set SFT_DATA to the training manifest.
+ENTRY=train_sft bash examples/run_experiment_single_node.sh sft/qwen3_sft
 ENTRY=train_pe  bash examples/run_experiment_single_node.sh pe/pe_trainside_pickscore
+ENTRY=train_unified_model bash examples/run_experiment_single_node.sh unified_model/hi3_vllmomni
 ENTRY=train_agentic bash examples/run_experiment_single_node.sh deep_research/deep_research_search_judge
+# Async AR: SGLang environment; set DATA_PATH to the training data.
+ENTRY=train_async_ar bash examples/run_experiment_single_node.sh ar/qwen3_grpo_4b_base_dapo_sglang_async
+# Async diffusion: vLLM-Omni environment; set BAGEL_PATH to the model checkpoint.
+ENTRY=train_async_diffusion bash examples/run_experiment_single_node.sh diffusion/bagel/bagel_vllmomni_async
 
-# 2. Multi-node
+# Multi-node
 bash examples/run_experiment_multinode.sh diffusion/sd3/sd3_sglang_rollout_colocate
 
-# 3. Or invoke an entrypoint directly, without the launchers
+# Direct entrypoint, without the launchers
 python -m unirl.train_diffusion --config-name=diffusion/sd3/sd3_trainside num_devices=8
 ```
 
-Pass cluster-local paths and W&B identity through env vars (`PRETRAINED_MODEL`,
-`DATA_PATH`, `EVAL_DATA_PATH`, `SFT_DATA`, `SFT_EVAL_DATA`, `REPORT_TO_WANDB`,
-`WANDB_PROJECT`, `WANDB_ENTITY`).
-The mooncake-backed recipe (`*_tq_mooncake`) needs its metadata server up first —
-start it on the head node with `bash examples/mooncake_master.sh start` before launching.
+`DRY_RUN=1` prints the launcher command and skips compose and execution.
+Launchers set `num_devices` from the GPU count; the recipe's batch and
+train/rollout splits still have to fit.
 
-To save and resume checkpoints and export them to Hugging Face, append the
-`+save_interval` / `+save_dir` / `+load_dir` overrides
-(diffusion/ar/sft/pe/unified/agentic trainers; the hi3 meta-init recipe is not
-yet supported) — the full
-train → resume → export → upload lifecycle is in
-[Checkpointing](../unirl/trainer/README.md#checkpointing).
+Cluster paths and W&B identity come from `${oc.env:...}` in the selected YAML
+(see [INSTALL.md](../INSTALL.md#environment)). Fields without that interpolation
+need a Hydra override, for example `logging.report_to_wandb=true` on
+`pe/pe_trainside_pickscore`. Start the mooncake metadata server before
+`*_tq_mooncake` recipes: `bash examples/mooncake_master.sh start`.
+
+To save: `++save_interval=100 ++save_dir=checkpoints`. To resume:
+`++load_dir=<checkpoint-dir>`. Use `++` so Hydra can add or override keys
+(SFT recipes already define `save_interval`). HI3 meta-init, including
+[`unified_model/hi3_vllmomni`](unified_model/hi3_vllmomni.yaml), needs DCP —
+see [Checkpointing](../unirl/trainer/README.md#checkpointing).
 
 ## WAN2.1 UCF-101 full-transformer SFT
 
@@ -139,7 +157,7 @@ with `${oc.env:...}`.
 
 ```bash
 # Compose the recipe and print the resolved config
-python -m unirl.train_<entry> --config-name=<domain>/<recipe> --cfg job --resolve
+python -m unirl.train_<entry> --config-name=<recipe-path> --cfg job --resolve
 
 # Python syntax check
 python -m compileall -q unirl

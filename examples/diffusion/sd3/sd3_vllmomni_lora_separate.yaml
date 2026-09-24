@@ -6,7 +6,7 @@
 #   - LoRA training (lora_cfg kept), pushed as the bare ADAPTER each sync
 #     (RemoteLoraWeightSync ships lora_A/lora_B to the engine's set_lora_from_tensors).
 #   - No NCCL group / merged-model broadcast: rank 0 ships the few-MB adapter over a
-#     plain Ray RPC to each rollout Worker. The vLLM-Omni sd35_t2i stage config
+#     plain Ray RPC to each rollout Worker. The vLLM-Omni sd35_t2i deploy config
 #     enables LoRA (enable_lora: true, max_lora_rank: 32), so the engine accepts it.
 
 num_devices: 8
@@ -87,7 +87,7 @@ rollout:
   config:
     _target_: unirl.rollout.engine.vllm_omni.config.VLLMOmniEngineConfig
     model_path: ${oc.env:PRETRAINED_MODEL,stabilityai/stable-diffusion-3.5-medium}
-    # sd35_t2i stage config enables LoRA (enable_lora: true, max_lora_rank: 32),
+    # sd35_t2i deploy config enables LoRA (enable_lora: true, max_lora_rank: 32),
     # so the engine accepts the adapter pushed by RemoteLoraWeightSync.
     modality: sd3_t2i
     # Separate slabs do not time-share GPUs, so sleep/wake is unnecessary.
