@@ -219,23 +219,14 @@ class HunyuanImage3ARStep(ARStep[HunyuanImage3Bundle, HunyuanImage3ARConditions,
         """Pre-build a ``HunyuanStaticCache`` for the AR loop."""
         import sys as _sys
 
-        upstream_mod = _sys.modules.get(type(transformer).__module__)
-        cache_cls = getattr(upstream_mod, "HunyuanStaticCache", None)
-        if cache_cls is None:
-            return None
-        config = getattr(transformer, "config", None)
-        if config is None:
-            return None
-        try:
-            return cache_cls(
-                config=config,
-                batch_size=batch_size,
-                max_cache_len=max_cache_len,
-                dtype=torch.bfloat16,
-                dynamic=True,
-            )
-        except Exception:  # noqa: BLE001 -- fall back to HF default cache
-            return None
+        cache_cls = _sys.modules[type(transformer).__module__].HunyuanStaticCache
+        return cache_cls(
+            config=transformer.config,
+            batch_size=batch_size,
+            max_cache_len=max_cache_len,
+            dtype=torch.bfloat16,
+            dynamic=True,
+        )
 
 
 class HunyuanImage3ARStage(ARStage[HunyuanImage3ARConditions]):
