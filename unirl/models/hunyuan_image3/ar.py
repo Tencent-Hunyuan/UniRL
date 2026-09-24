@@ -100,8 +100,13 @@ class HunyuanImage3ARStep(ARStep[HunyuanImage3Bundle, HunyuanImage3ARConditions,
         batch_size = int(input_ids.shape[0])
 
         prompt_len = int(input_ids.shape[1])
-        past_kv_initial = self._build_kv_cache(
-            transformer, batch_size=batch_size, max_cache_len=prompt_len + int(max_new_tokens)
+        cache_cls = sys.modules[type(transformer).__module__].HunyuanStaticCache
+        past_kv_initial = cache_cls(
+            config=transformer.config,
+            batch_size=batch_size,
+            max_cache_len=prompt_len + int(max_new_tokens),
+            dtype=torch.bfloat16,
+            dynamic=True,
         )
 
         cond_vit = conditions.cond_vit
@@ -214,18 +219,6 @@ class HunyuanImage3ARStep(ARStep[HunyuanImage3Bundle, HunyuanImage3ARConditions,
         state.step_idx += 1
 
         return token_id, log_prob, state
-
-    @staticmethod
-    def _build_kv_cache(transformer, *, batch_size: int, max_cache_len: int):
-        """Pre-build a ``HunyuanStaticCache`` for the AR loop."""
-        cache_cls = sys.modules[type(transformer).__module__].HunyuanStaticCache
-        return cache_cls(
-            config=transformer.config,
-            batch_size=batch_size,
-            max_cache_len=max_cache_len,
-            dtype=torch.bfloat16,
-            dynamic=True,
-        )
 
 
 class HunyuanImage3ARStage(ARStage[HunyuanImage3ARConditions]):
