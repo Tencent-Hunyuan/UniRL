@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from dataclasses import field as dc_field
 from typing import Any, Dict, List, Optional, Tuple
@@ -217,9 +218,7 @@ class HunyuanImage3ARStep(ARStep[HunyuanImage3Bundle, HunyuanImage3ARConditions,
     @staticmethod
     def _build_kv_cache(transformer, *, batch_size: int, max_cache_len: int):
         """Pre-build a ``HunyuanStaticCache`` for the AR loop."""
-        import sys as _sys
-
-        cache_cls = _sys.modules[type(transformer).__module__].HunyuanStaticCache
+        cache_cls = sys.modules[type(transformer).__module__].HunyuanStaticCache
         return cache_cls(
             config=transformer.config,
             batch_size=batch_size,
