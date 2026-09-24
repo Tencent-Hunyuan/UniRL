@@ -1,6 +1,7 @@
 # HunyuanImage-3 multimodal AR deployment for the i2t adapter.
 pipeline: unirl_hi3_ar_multimodal_text
 async_chunk: false
+distributed_executor_backend: mp
 
 stages:
   - stage_id: 0
@@ -15,7 +16,6 @@ stages:
     max_num_batched_tokens: 32768
     tensor_parallel_size: 4
     pipeline_parallel_size: 1
-    distributed_executor_backend: mp
     hf_overrides:
       rope_parameters:
         mrope_section: [0, 32, 32]

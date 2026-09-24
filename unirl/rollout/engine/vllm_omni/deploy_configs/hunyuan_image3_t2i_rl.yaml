@@ -1,6 +1,7 @@
 # HunyuanImage-3 text-to-image deployment with UniRL worker extensions.
 pipeline: hunyuan_image_3_moe
 async_chunk: false
+distributed_executor_backend: mp
 
 stages:
   - stage_id: 0
@@ -15,7 +16,6 @@ stages:
     max_num_batched_tokens: 32768
     tensor_parallel_size: 4
     pipeline_parallel_size: 1
-    distributed_executor_backend: mp
     hf_overrides:
       rope_parameters:
         mrope_section: [0, 32, 32]
@@ -35,7 +35,6 @@ stages:
     devices: "4,5,6,7"
     max_num_seqs: 1
     enforce_eager: true
-    distributed_executor_backend: mp
     vae_use_slicing: false
     vae_use_tiling: false
     cache_backend: null

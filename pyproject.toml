@@ -86,8 +86,7 @@ vllm = [
   "vllm==0.28.0 ; sys_platform == 'linux'",
   "vllm-omni==0.28.0 ; sys_platform == 'linux'",
   # vllm-omni 0.28 needs >=5.10.1,<5.15 (5.10.0 is yanked, 5.15 has a known
-  # construction regression); exact because there is no uv.lock to hold it, and
-  # 5.12.1 is what sglang 0.5.15+ pins, so unifying later is a bump not a port.
+  # construction regression); exact because there is no uv.lock to hold it.
   "transformers==5.12.1 ; sys_platform == 'linux'",
   "torch==2.13.0+cu130 ; sys_platform == 'linux'",
   "torchvision==0.28.0+cu130 ; sys_platform == 'linux'",

@@ -137,7 +137,7 @@ backend:
     total_steps: 100000
   lora_cfg:
     _target_: unirl.train.configs.LoraConfig
-    rank: 64                           # must be <= the stage YAML's max_lora_rank (64)
+    rank: 64                           # must be <= the deploy config's max_lora_rank (64)
     alpha: 128
     dropout: 0.0
     bias: none

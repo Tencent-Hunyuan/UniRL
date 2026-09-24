@@ -165,16 +165,16 @@ class VLLMOmniBackend:
                     fcntl.flock(lock_file, fcntl.LOCK_UN)
                     lock_file.close()
 
+            stage_configs = omni.engine.stage_configs
             try:
                 from omegaconf import OmegaConf
 
-                stage_configs = omni.engine.stage_configs
                 resolved_stage_configs = OmegaConf.to_container(
                     OmegaConf.create(stage_configs),
                     resolve=True,
                 )
             except Exception:  # noqa: BLE001 - config logging must never block boot
-                resolved_stage_configs = omni.engine.stage_configs
+                resolved_stage_configs = stage_configs
             logger.info(
                 "VLLM-Omni resolved runtime stage configs (after all overrides):\n%s",
                 pformat(resolved_stage_configs, sort_dicts=True),
@@ -281,8 +281,7 @@ class VLLMOmniBackend:
         return list(range(self.num_stages()))
 
     def _stage_type(self, stage_id: int) -> str:
-        metadata = self._require_omni().engine.get_stage_metadata(stage_id)
-        return str(metadata.stage_type)
+        return self._require_omni().engine.get_stage_metadata(stage_id).stage_type
 
     @staticmethod
     def _require_rpc_success(

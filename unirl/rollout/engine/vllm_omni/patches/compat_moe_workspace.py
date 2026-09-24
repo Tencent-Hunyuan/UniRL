@@ -105,23 +105,18 @@ def patch_moe_workspace_pool() -> None:
     try:
         from vllm.device_allocator.cumem import CuMemAllocator
         from vllm.v1.worker.ubatching import dbo_current_ubatch_id
-        from vllm.v1.worker.workspace import WorkspaceManager
+        from vllm.v1.worker.workspace import WorkspaceManager, _workspace_lane
 
         WorkspaceManager._ensure_workspace_size
     except (ImportError, AttributeError):
         return
 
-    try:
-        from vllm.v1.worker.workspace import _workspace_lane
-    except ImportError:
-        _workspace_lane = None
-
     def workspace_id_provider(manager: Any) -> int | None:
         # Delegate invalid lanes before indexing. A lane can otherwise flatten
         # onto the next ubatch's valid slot and release an unrelated workspace.
-        lane = 0 if _workspace_lane is None else _workspace_lane.get()
-        num_lanes = getattr(manager, "_num_lanes", 1)
-        if lane < 0 or lane >= num_lanes:
+        lane = _workspace_lane.get()
+        num_lanes = manager._num_lanes
+        if lane >= num_lanes:
             return None
         return dbo_current_ubatch_id() * num_lanes + lane
 
