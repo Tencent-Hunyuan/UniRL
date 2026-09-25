@@ -6,7 +6,7 @@ import logging
 import math
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
-from typing import Dict, List, Mapping, Optional, Tuple, Union
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -73,6 +73,34 @@ def _validate_anchor_contract(algorithm: StageAlgorithm) -> None:
         raise ValueError(f"{type(algorithm).__name__} recomputes its anchor but declares no anchor_fields.")
 
 
+def _prepare_segment_anchors(
+    algorithm: StageAlgorithm,
+    part: Part,
+    micro_slices: Sequence[Tuple[int, int]],
+    *,
+    caller: str,
+) -> None:
+    """Freeze declared anchors over planned micros and write them back onto ``part``."""
+    if part.segment is None:
+        return
+    if not algorithm.recomputes_anchor or len(micro_slices) == 1:
+        algorithm.prepare_segment(conditions=part.conditions, segment=part.segment)
+        return
+    collected: Dict[str, List[torch.Tensor]] = {field: [] for field in algorithm.anchor_fields}
+    for start, end in micro_slices:
+        micro = part.slice(start, end)
+        algorithm.prepare_segment(conditions=micro.conditions, segment=micro.segment)
+        for field in collected:
+            value = getattr(micro.segment, field, None)
+            if value is None:
+                raise RuntimeError(
+                    f"{caller}: {type(algorithm).__name__} declares anchor field {field!r} but a micro produced None."
+                )
+            collected[field].append(value)
+    for field, tensors in collected.items():
+        setattr(part.segment, field, torch.cat(tensors, dim=0))
+
+
 class TrainStack(Remote):
     """Single-stage stage-driven train stack — family-agnostic."""
 
@@ -111,30 +139,12 @@ class TrainStack(Remote):
 
     def prepare_segment(self, part: Part, *, plans: Plan) -> None:
         """Freeze the π_old anchor once, before the ``num_updates_per_batch`` loop."""
-        if part.segment is None:
-            return
-        algorithm = self.algorithm
-        if not algorithm.recomputes_anchor:
-            algorithm.prepare_segment(conditions=part.conditions, segment=part.segment)
-            return
-        micro_slices = [r for update in plans for r in update]
-        if len(micro_slices) == 1:
-            algorithm.prepare_segment(conditions=part.conditions, segment=part.segment)
-            return
-        collected: Dict[str, List[torch.Tensor]] = {field: [] for field in algorithm.anchor_fields}
-        for start, end in micro_slices:
-            micro = part.slice(start, end)
-            algorithm.prepare_segment(conditions=micro.conditions, segment=micro.segment)
-            for field in collected:
-                value = getattr(micro.segment, field, None)
-                if value is None:
-                    raise RuntimeError(
-                        f"{type(self).__name__}.prepare_segment: {type(algorithm).__name__} declares "
-                        f"anchor field {field!r} but a micro produced None."
-                    )
-                collected[field].append(value)
-        for field, parts in collected.items():
-            setattr(part.segment, field, torch.cat(parts, dim=0))
+        _prepare_segment_anchors(
+            self.algorithm,
+            part,
+            [r for update in plans for r in update],
+            caller=f"{type(self).__name__}.prepare_segment",
+        )
 
     def _run_update(
         self,
