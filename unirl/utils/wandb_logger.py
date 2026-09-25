@@ -303,6 +303,7 @@ class UniRLWandBLogger:
             wandb.define_metric("train/image/*", step_metric="train/step")
             wandb.define_metric("rollout/step")
             wandb.define_metric("rollout/*", step_metric="rollout/step")
+            wandb.define_metric("rollout/async/*", step_metric="rollout/step")
             wandb.define_metric("perf/*", step_metric="rollout/step")
             wandb.define_metric("sync/*", step_metric="rollout/step")
             wandb.define_metric("buffer/*", step_metric="rollout/step")
