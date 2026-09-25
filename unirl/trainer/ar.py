@@ -5,7 +5,7 @@ import logging
 import math
 import time
 from contextlib import contextmanager, nullcontext
-from typing import Dict, Iterator, Optional, Set, Tuple
+from typing import Callable, Dict, Iterator, Optional, Set, Tuple
 
 import torch
 from hydra.utils import get_class, get_object, instantiate
@@ -677,6 +677,7 @@ class ARTrainer(BaseTrainer):
         save_dir: Optional[str] = None,
         load_dir: Optional[str] = None,
         save_mode: str = "auto",
+        on_rollout_complete: Optional[Callable[..., None]] = None,
     ) -> None:
         """Minimal training loop: ``num_rollouts`` iterations of ``train_step``."""
         interval = max(1, weight_sync_interval)
@@ -720,6 +721,13 @@ class ARTrainer(BaseTrainer):
                     preserve_rollout_weights=preserve_rollout_weights,
                 )
                 self.wandb_logger.log_progress(rollout_id, num_rollouts, result, mean_reward, logger=logger)
+                if on_rollout_complete is not None:
+                    on_rollout_complete(
+                        rollout_id=rollout_id,
+                        result=result,
+                        mean_reward=mean_reward,
+                        sync_weights=sync_weights,
+                    )
                 if self.eval_interval > 0 and (rollout_id + 1) % self.eval_interval == 0:
                     next_rollout_syncs = next_rollout_id < num_rollouts and next_rollout_id % interval == 0
                     self.evaluate(

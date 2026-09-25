@@ -60,7 +60,9 @@ def _validate_safetensors(weights_path: str, checkpoint_path: str, expected: str
         )
 
 
-def resolve_meta_init_weights(checkpoint_path: str, *, component: Optional[str] = None) -> str:
+def resolve_meta_init_weights(
+    checkpoint_path: str, *, component: Optional[str] = None, revision: Optional[str] = None
+) -> str:
     """Resolve and validate the local safetensors directory for a meta-init bundle."""
     snapshot_path = checkpoint_path
     expected = os.path.join(component, "*.safetensors") if component else "*.safetensors"
@@ -70,6 +72,7 @@ def resolve_meta_init_weights(checkpoint_path: str, *, component: Optional[str] 
         try:
             snapshot_path = snapshot_download(
                 repo_id=checkpoint_path,
+                revision=revision,
                 allow_patterns=[expected, f"{expected}.index.json"],
             )
         except Exception as exc:
