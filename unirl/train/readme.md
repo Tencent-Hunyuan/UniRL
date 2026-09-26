@@ -68,6 +68,9 @@ in `backend/base.py`; a multi-update-capable algorithm sets
 - **`optimizer_step` silently *skips* (does not crash) on a non-finite grad norm**
   and zeroes grads — a flat loss curve with a logged warning means grads went
   non-finite.
+- **Checkpointing preserves a never-stepped AdamW** — DCP materializes empty
+  optimizer state with a dummy step; UniRL resets it so the first real update
+  remains step 1.
 - **`master_dtype` defaults to `None`, so the optimizer master follows `param_dtype`** —
   a bf16-loaded base then keeps a bf16 LoRA master and the ~1e-6 AdamW steps round
   away (the policy drifts into a degenerate reward-hack). An fp32-loaded model gets an
@@ -88,6 +91,11 @@ in `backend/base.py`; a multi-update-capable algorithm sets
 - **Advantages are not computed here** — `train` raises if
   `part.advantages is None`; the trainer must call `compute_advantages` on the
   full shard first.
+- **Selective offload supports direct GPU-streaming weight sync.** The trainer
+  keeps FSDP parameter shards on device while vLLM receives weights, clears
+  consumed gradients and offloads optimizer state before publication, then
+  offloads the model after publication commits. Calling `offload()` without
+  arguments retains the legacy full-state behavior.
 - **`fsdp_wrap` wraps *nothing* when no block class is discovered** — the warning
   says "root-only wrap" but `_enumerate_block_instances` returns `()`, so the
   shard/cast loops are no-ops and the model trains **unsharded and un-cast**. Pass

@@ -54,18 +54,10 @@ def load_model_state_dict(
 
 
 def gather_optimizer_state_dict(model: nn.Module, optimizer: torch.optim.Optimizer) -> StateDict:
-    """Rank-0 DCP gather of optimizer state.  Full state on rank 0, empty on others."""
-    from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
-
+    """Rank-0 DCP optimizer gather; preserves cold AdamW state."""
     options = _build_state_dict_options(full_state_dict=True, cpu_offload=True)
-    try:
-        full = dict(get_optimizer_state_dict(model, optimizer, options=options))
-    except TypeError:
-        full = dict(get_optimizer_state_dict(model, optimizer))
-
-    if _current_rank() != 0:
-        return {}
-    return full
+    full = _export_optimizer_state_dict(model, optimizer, options=options)
+    return full if _current_rank() == 0 else {}
 
 
 def gather_lora_state_dict(model: nn.Module, keep: Callable[[str], bool]) -> StateDict:
@@ -119,14 +111,9 @@ def sharded_model_state_dict(model: nn.Module) -> StateDict:
 
 
 def sharded_optimizer_state_dict(model: nn.Module, optimizer: torch.optim.Optimizer) -> StateDict:
-    """Per-rank sharded optimizer state for DCP (symmetric with"""
-    from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
-
+    """Per-rank sharded optimizer state for DCP; preserves cold AdamW state."""
     options = _build_state_dict_options(full_state_dict=False)
-    try:
-        return dict(get_optimizer_state_dict(model, optimizer, options=options))
-    except TypeError:
-        return dict(get_optimizer_state_dict(model, optimizer))
+    return _export_optimizer_state_dict(model, optimizer, options=options)
 
 
 def load_sharded_model_state_dict(model: nn.Module, state_dict: StateDict, *, strict: bool = True) -> None:
@@ -165,11 +152,14 @@ def drop_meta_entries(state_dict: StateDict) -> StateDict:
 
 
 def move_optimizer_state(optimizer: torch.optim.Optimizer, device: object) -> None:
-    """Move every tensor in the optimizer state to ``device`` (the on/offload loop)."""
-    for state in optimizer.state.values():
-        for k, v in state.items():
-            if isinstance(v, torch.Tensor):
-                state[k] = v.to(device)
+    """Move optimizer state to ``device``; non-fused/capturable ``step`` stays on CPU as it is read via ``.item()``."""
+    for group in optimizer.param_groups:
+        step_device = device if group.get("capturable", False) or group.get("fused", False) else "cpu"
+        for param in group["params"]:
+            state = optimizer.state.get(param, {})
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.to(step_device if k == "step" else device)
 
 
 def lora_state_dict(
@@ -280,6 +270,32 @@ def _to_cpu_state_dict(state_dict: StateDict) -> StateDict:
         else:
             converted[key] = tensor_or_obj
     return converted
+
+
+def _export_optimizer_state_dict(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    *,
+    options: object,
+) -> StateDict:
+    """Export without advancing a cold AdamW clock."""
+    from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
+
+    cold = (
+        isinstance(optimizer, torch.optim.AdamW)
+        and not optimizer.state
+        and all(param.grad is None for group in optimizer.param_groups for param in group["params"])
+    )
+    try:
+        exported = get_optimizer_state_dict(model, optimizer, options=options)
+        if cold:
+            for entry in exported.get("state", {}).values():
+                entry["step"] = torch.zeros_like(entry["step"])
+        return exported
+    finally:
+        if cold:
+            optimizer.state.clear()
+            optimizer.zero_grad(set_to_none=True)
 
 
 __all__ = [

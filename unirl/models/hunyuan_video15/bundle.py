@@ -87,6 +87,7 @@ class HunyuanVideo15Bundle(Bundle):
                 path, subfolder="transformer", torch_dtype=dtype
             )
             transformer = transformer.to(device=device, dtype=dtype)
+        transformer.set_attention_backend(config.attention_backend)
         if bool(getattr(getattr(transformer, "config", None), "use_meanflow", False)):
             raise NotImplementedError(
                 "HunyuanVideo15Bundle does not support transformers with "

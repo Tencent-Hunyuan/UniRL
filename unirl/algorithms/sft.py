@@ -9,12 +9,11 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Type
 import torch
 
 from unirl.types.conditions import Condition
+from unirl.types.loss_agg import LossAggMode, parse_loss_agg_mode
 from unirl.types.segments.latent import LatentSegment
 from unirl.types.segments.text import TextSegment
 
 from .base import AlgorithmStepResult, StageAlgorithm, typed_conditions
-
-_LOSS_AGG_MODES = ("token-mean", "seq-mean-token-mean", "seq-mean-token-sum-norm")
 
 
 class SFT(StageAlgorithm):
@@ -38,13 +37,11 @@ class SFT(StageAlgorithm):
             raise ValueError("SFT: either `stage` or `pipeline` must be provided")
         if stage is None:
             stage = getattr(pipeline, stage_attr)
-        if loss_agg_mode not in _LOSS_AGG_MODES:
-            raise ValueError(f"SFT: loss_agg_mode must be one of {_LOSS_AGG_MODES}; got {loss_agg_mode!r}.")
+        mode = parse_loss_agg_mode(loss_agg_mode, owner="SFT")
         self.stage = stage
-        self.loss_agg_mode = loss_agg_mode
+        self.loss_agg_mode = mode.value
         self.horizon = horizon
         self.conditions_cls = conditions_cls
-        self.loss_weighting = "token" if self.loss_agg_mode == "token-mean" else "sample"
 
     def compute_loss_and_backward(
         self,
@@ -111,9 +108,11 @@ class SFT(StageAlgorithm):
             tokens = float(nll.numel())
         ce_sum = nll.sum()
 
-        if self.loss_agg_mode == "token-mean":
+        mode = LossAggMode(self.loss_agg_mode)
+        if mode is LossAggMode.TOKEN_MEAN:
             objective_sum = ce_sum
             objective_weight = tokens
+            train_denominator = tokens
         else:
             parts = torch.split(nll, segment.lengths.tolist())
             if mask is not None:
@@ -123,14 +122,19 @@ class SFT(StageAlgorithm):
                 token_weights = [float(p.numel()) for p in parts]
 
             valid_parts = [(p, weight) for p, weight in zip(parts, token_weights) if weight > 0.0]
-            if self.loss_agg_mode == "seq-mean-token-sum-norm":
+            if mode is LossAggMode.SEQ_MEAN_TOKEN_SUM_NORM:
                 per_seq = [p.sum() / self.horizon for p, _ in valid_parts]
-            else:
+            elif mode is LossAggMode.SEQ_MEAN_TOKEN_MEAN:
                 per_seq = [p.sum() / weight for p, weight in valid_parts]
+            else:
+                raise ValueError(f"SFT: no reduction implemented for {mode!r}")
             objective_sum = torch.stack(per_seq).sum() if per_seq else ce_sum * 0.0
+            # Eval reduces Σsum / Σweight globally, so DP pad rows must stay out of the weight. Training
+            # weights micros by sample share, so fully-masked rows must stay in the per-micro mean.
             objective_weight = float(len(per_seq))
+            train_denominator = float(len(parts))
 
-        loss = objective_sum / max(objective_weight, 1.0)
+        loss = objective_sum / max(train_denominator, 1.0)
 
         token_mean = float((ce_sum / max(tokens, 1.0)).detach().item())
         if not math.isfinite(token_mean):
@@ -149,7 +153,6 @@ class FlowMatchSFT(StageAlgorithm):
 
     supports_multi_update = True
     requires_advantages = False
-    loss_weighting = "sample"
 
     def __init__(
         self,

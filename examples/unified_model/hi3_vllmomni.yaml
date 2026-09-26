@@ -118,7 +118,7 @@ backend:
 # texts per prompt; the DiT engine (modality dit_recaption, single diffusion
 # stage, GPUs 4-7) renders M distinct-noise images per recaption. UnifiedModelTrainer
 # wires both with remote() in the shared placement; each engine clears
-# CUDA_VISIBLE_DEVICES for its multi-GPU HI3 modality and its stage YAML's
+# CUDA_VISIBLE_DEVICES for its multi-GPU HI3 modality and its deploy config's
 # runtime.devices pins the physical cards (a real partition, NOT anchor+pop).
 # Both run enable_sleep_mode so the trainer can sleep/wake them around the
 # colocate train phase. The two engines share ONE backbone/LoRA via sync.

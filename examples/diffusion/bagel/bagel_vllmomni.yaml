@@ -119,7 +119,7 @@ rollout:
     # Required; same checkpoint the bundle loads.
     model_path: ${oc.env:BAGEL_PATH,/root/hf_model/BAGEL-7B-MoT}
     # BAGEL single-stage T2I diffusion modality (registers BagelT2iAdapter +
-    # boots stage_configs/bagel_t2i_rl.yaml with RLBagelPipeline).
+    # boots deploy_configs/bagel_t2i_rl.yaml with RLBagelPipeline).
     modality: bagel_t2i
     # Required for colocate: trainer calls sleep()/wake_up() around the train
     # phase, a no-op unless CuMemAllocator is enabled at vLLM-Omni init time.

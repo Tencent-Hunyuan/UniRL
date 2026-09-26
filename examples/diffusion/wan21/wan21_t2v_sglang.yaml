@@ -119,12 +119,6 @@ rollout:
     num_gpus: 1
     tp_size: 1
     local_mode: true
-    # SGLANG leaf names (see model_config.lora_target_modules above).
-    target_modules:
-      - to_q
-      - to_k
-      - to_v
-      - to_out
   # SGLang reads ckpt/LoRA off model_config and sde_label off strategy.
   model_config: ${model_config}
   strategy: ${strategy}

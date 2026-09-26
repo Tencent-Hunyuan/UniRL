@@ -26,12 +26,9 @@
 # Full fine-tuning: the MoT decoder experts are trained directly (no LoRA). FSDP
 # shards params + grads + optimizer states across all ranks.
 #
-# NOTE (rebased onto main): the rollout is per-sample navit bs=1 (the branch's
-# pack-B / forward_batch_size rollout packing is dropped here — it conflicts with
-# main's KV-in-conditions diffusion design; re-add as a follow-up if rollout
-# throughput matters). With bs=1 the rollout and replay geometry match, so the
-# image side uses old_logp_source=rollout (the on-policy ratio is 1 without a
-# pre-update replay).
+# Rollout packing is opt-in. forward_batch_size=1 preserves the per-sample path;
+# larger values block-diagonally pack text-only thinking chains and same-shape
+# diffusion images while conditions continue to hold per-sample KV contexts.
 #
 # Launch (multi-node; the launcher sets num_devices = NUM_NODES * GPUS_PER_NODE):
 #   PYTHONPATH=$PWD python -m unirl.train_unified_model \
@@ -83,6 +80,9 @@ pipeline:
   trajectory_precision: fp32
   logprob_precision: fp32
   shift: 3.0
+  # Pack at most B thinking chains / images into each navit forward. Keep 1 as
+  # the conservative default; tune per GPU after parity and memory validation.
+  forward_batch_size: ${oc.env:BAGEL_FWD_BS,1}
   strategy:
     _target_: unirl.sde.kernels.FlowSDEStrategy
 
@@ -127,7 +127,7 @@ backend:
   # transformer (the decoder blocks the bundle unfroze).
 
 # Single TRAINSIDE rollout (the M=1 / UniGRPO mode). stage_attrs eval-scopes BOTH
-# trainable stages (the same shared transformer). Per-sample navit bs=1.
+# trainable stages (the same shared transformer).
 rollout:
   _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
   stage_attrs: [diffusion, ar]
@@ -167,15 +167,14 @@ algorithm:
     clip_range: 1.0e-6                 # flow trust region (clip range)
     clip_schedule: constant
     # Rollout anchor: μ_old (sde_means) and π_old (sde_logp) are the rollout's own
-    # per-SDE-step recordings. Valid because the rollout is per-sample navit bs=1 — the
-    # same geometry as the bs=1 train replay — so on-policy μ_old == μ_θ → ratio = 1.
-    # (Replay anchor would only be needed if rollout ran a different geometry, e.g. pack-B.)
+    # per-SDE-step recordings. Block-diagonal packing isolates every sequence, so
+    # each row retains the same replay geometry and on-policy ratio semantics.
     old_logp_source: rollout
     mse_weight: 1.5e-5                 # velocity-MSE weight (replaces the latent KL)
     # GRPO-Guard RatioNorm: per-SDE-step normalize the flow ratio (it is otherwise
     # left-shifted, mean < 1, so clipping never engages). Only bites on the off-policy
     # update(s), i.e. needs num_updates_per_batch >= 2. μ_old comes from segment.sde_means
-    # as recorded by the rollout (bs=1, matching the bs=1 replay geometry).
+    # as recorded by the rollout.
     ratio_norm: true
     grad_reweight: false              # GRPO-Guard's optional 2nd part (x 1/dt); off by default
     conditions_cls:
