@@ -165,22 +165,14 @@ def drop_meta_entries(state_dict: StateDict) -> StateDict:
 
 
 def move_optimizer_state(optimizer: torch.optim.Optimizer, device: object) -> None:
-    """Move optimizer state to ``device`` for on/offload; eager Adam ``step`` stays on CPU."""
-    eager_adam = isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW))
+    """Move optimizer state to ``device``; non-fused/capturable ``step`` stays on CPU as it is read via ``.item()``."""
     for group in optimizer.param_groups:
-        host_step = eager_adam and not group.get("capturable", False) and not group.get("fused")
+        step_device = device if group.get("capturable", False) or group.get("fused", False) else "cpu"
         for param in group["params"]:
-            state = optimizer.state.get(param)
-            if not state:
-                continue
+            state = optimizer.state.get(param, {})
             for k, v in state.items():
-                if not isinstance(v, torch.Tensor):
-                    continue
-                # Eager Adam reads `step` via .item() every update; upstream hosts it on CPU to avoid device syncs.
-                if host_step and k == "step":
-                    state[k] = v.cpu()
-                else:
-                    state[k] = v.to(device)
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.to(step_device if k == "step" else device)
 
 
 def lora_state_dict(
