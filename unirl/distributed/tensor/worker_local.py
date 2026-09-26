@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable, ClassVar, Dict, List, Optional, Tuple
+from typing import Any, Callable, ClassVar, Dict, List, Optional, Set, Tuple
 
 import ray
 import torch
 
-from unirl.distributed.tensor.ref import TensorRef, TensorSpan, map_tree
+from unirl.distributed.tensor.ref import TensorRef, TensorSpan, map_tree, ref_is_required
 from unirl.distributed.tensor.transport import TensorTransport
 from unirl.distributed.utils import collect_leaves
 
@@ -96,13 +96,23 @@ class WorkerLocalTransport(TensorTransport):
         return moved
 
     @classmethod
-    def localize(cls, shards: list, pool: Any, device_ids: List[int], worker_ids: List[str]) -> list:
-        """Make every ref resolvable on its dst worker — FIND (pure) / MOVE (NCCL) / REPLACE (pure)."""
+    def localize(
+        cls,
+        shards: list,
+        pool: Any,
+        device_ids: List[int],
+        worker_ids: List[str],
+        required: Optional[List[Optional[Set[Any]]]] = None,
+    ) -> list:
+        """Make selected refs resolvable on each destination worker."""
         dsts = list(zip(worker_ids, device_ids))
+        masks = required if required is not None else [None] * len(shards)
 
         to_move: Dict[tuple, Any] = {}
-        for (s_args, s_kwargs), dst in zip(shards, dsts):
+        for (s_args, s_kwargs), dst, mask in zip(shards, dsts, masks):
             for ref in collect_leaves(s_args, TensorRef) + collect_leaves(s_kwargs, TensorRef):
+                if not ref_is_required(ref, mask):
+                    continue
                 for s in ref.spans:
                     key = cls._move_key(s, dst, pool)
                     if key is not None:
