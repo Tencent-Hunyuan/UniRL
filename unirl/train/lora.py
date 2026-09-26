@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import os
 import re
 from contextlib import contextmanager
 from functools import partial
-from typing import Any, Dict, Iterator, Optional, Sequence, Union
+from typing import Any, Dict, Iterator, Optional, Sequence, Tuple, Union
 
 import torch
 from torch import nn
@@ -186,37 +185,17 @@ def adapter_active(model: nn.Module, name: str, *, trainable: str = "default") -
         _set_adapter_requires_grad(model, name, False)
 
 
-def _resolve_adapter_checkpoint(path: str) -> tuple:
-    """Resolve a peft adapter checkpoint to local ``(config_path, weight_path)``."""
+def _resolve_adapter_checkpoint(path: str) -> Tuple[str, Optional[str]]:
+    """Split a peft adapter location into ``(model_id, subfolder)``: a local directory or ``org/repo[/subfolder]``."""
     if os.path.isdir(path):
-        config_path = os.path.join(path, "adapter_config.json")
-        weight_path = os.path.join(path, "adapter_model.safetensors")
-        if not os.path.exists(weight_path):
-            weight_path = os.path.join(path, "adapter_model.bin")
-        if not os.path.exists(config_path) or not os.path.exists(weight_path):
-            raise FileNotFoundError(
-                f"_resolve_adapter_checkpoint: {path!r} is a directory but lacks "
-                "adapter_config.json + adapter_model.safetensors/.bin."
-            )
-        return config_path, weight_path
-
-    from huggingface_hub import hf_hub_download
-
+        return path, None
     parts = path.split("/")
     if len(parts) < 2:
         raise ValueError(
             f"_resolve_adapter_checkpoint: {path!r} is neither a local directory nor an "
             "HF repo id ('org/repo' or 'org/repo/subfolder')."
         )
-    dl_kwargs = {"repo_id": "/".join(parts[:2])}
-    if len(parts) > 2:
-        dl_kwargs["subfolder"] = "/".join(parts[2:])
-    config_path = hf_hub_download(filename="adapter_config.json", **dl_kwargs)
-    try:
-        weight_path = hf_hub_download(filename="adapter_model.safetensors", **dl_kwargs)
-    except Exception:
-        weight_path = hf_hub_download(filename="adapter_model.bin", **dl_kwargs)
-    return config_path, weight_path
+    return "/".join(parts[:2]), "/".join(parts[2:]) or None
 
 
 def _inject_frozen_adapter(
@@ -228,21 +207,15 @@ def _inject_frozen_adapter(
     """Inject a frozen LoRA adapter now, load its weights after materialization; returns its content sha256."""
     from peft import LoraConfig, inject_adapter_in_model
     from peft.tuners.lora import LoraLayer
+    from peft.utils import load_peft_weights
 
     if name in adapter_names(model):
         raise ValueError(f"inject_frozen_adapter: adapter {name!r} already exists on the model.")
 
-    config_path, weight_path = _resolve_adapter_checkpoint(path)
-    with open(config_path) as f:
-        adapter_cfg = json.load(f)
-
-    peft_cfg = LoraConfig(
-        r=int(adapter_cfg["r"]),
-        lora_alpha=int(adapter_cfg.get("lora_alpha", adapter_cfg["r"])),
-        target_modules=adapter_cfg.get("target_modules") or [],
-        lora_dropout=0.0,
-        bias=str(adapter_cfg.get("bias", "none")),
-    )
+    model_id, subfolder = _resolve_adapter_checkpoint(path)
+    # The full saved config: scaling depends on use_rslora / alpha_pattern / rank_pattern, not just r and alpha.
+    peft_cfg = LoraConfig.from_pretrained(model_id, subfolder=subfolder)
+    peft_cfg.lora_dropout = 0.0
     inject_adapter_in_model(peft_cfg, model, adapter_name=name)
 
     covered = [m for m in model.modules() if isinstance(m, LoraLayer) and name in getattr(m, "lora_A", {})]
@@ -261,12 +234,7 @@ def _inject_frozen_adapter(
     if hasattr(model, "_hf_peft_config_loaded"):
         model._hf_peft_config_loaded = True
 
-    if weight_path.endswith(".safetensors"):
-        from safetensors.torch import load_file
-
-        raw = load_file(weight_path, device="cpu")
-    else:
-        raw = torch.load(weight_path, map_location="cpu", weights_only=True)
+    raw = load_peft_weights(model_id, device="cpu", subfolder=subfolder)
     # peft ``base_model.model.<m>.lora_A.weight`` -> model ``<m>.lora_A.<name>.weight``.
     weights = {
         _LORA_BANK_RE.sub(lambda m: f"{m.group(0)}.{name}", _strip_peft_prefix(k), count=1): v for k, v in raw.items()
@@ -275,7 +243,7 @@ def _inject_frozen_adapter(
     # Weights need real (sharded) storage: FSDP/VeOmni materialize after injection.
     defer_after_materialize(
         model,
-        partial(_load_frozen_adapter, name=name, weights=weights, weight_path=weight_path),
+        partial(_load_frozen_adapter, name=name, weights=weights, path=path),
     )
 
     if _current_rank() == 0:
@@ -303,7 +271,7 @@ def _adapter_of_lora_key(key: str) -> Optional[str]:
     return match.group(1) if match else None
 
 
-def _load_frozen_adapter(model: nn.Module, *, name: str, weights: Dict[str, torch.Tensor], weight_path: str) -> None:
+def _load_frozen_adapter(model: nn.Module, *, name: str, weights: Dict[str, torch.Tensor], path: str) -> None:
     """Post-materialize op: load ``weights`` into the (already frozen) adapter ``name`` on every rank."""
     from unirl.train.backend.sharded_state import load_model_state_dict
 
@@ -312,7 +280,7 @@ def _load_frozen_adapter(model: nn.Module, *, name: str, weights: Dict[str, torc
     unexpected = sorted(set(weights) - expected)
     if unexpected:
         raise ValueError(
-            f"inject_frozen_adapter: {len(unexpected)} tensor(s) in {weight_path!r} matched no "
+            f"inject_frozen_adapter: {len(unexpected)} tensor(s) in {path!r} matched no "
             f"parameter of adapter {name!r} (first: {unexpected[:3]}). The checkpoint does not "
             "line up with this model — refusing a silently partial teacher."
         )
@@ -321,13 +289,13 @@ def _load_frozen_adapter(model: nn.Module, *, name: str, weights: Dict[str, torc
     if missing:
         raise ValueError(
             f"inject_frozen_adapter: {len(missing)} tensor(s) of adapter {name!r} are absent from "
-            f"{weight_path!r} (first: {missing[:3]}) — refusing a partial teacher."
+            f"{path!r} (first: {missing[:3]}) — refusing a partial teacher."
         )
     for key, value in weights.items():
         want = model_sd[key].shape
         if tuple(value.shape) != tuple(want):
             raise ValueError(
-                f"inject_frozen_adapter: {key!r} has shape {tuple(value.shape)} in {weight_path!r}, "
+                f"inject_frozen_adapter: {key!r} has shape {tuple(value.shape)} in {path!r}, "
                 f"model expects {tuple(want)} (adapter rank mismatch?)."
             )
     # Every rank holds the full (small) adapter dict; DCP slices each rank's own shard.
@@ -335,7 +303,7 @@ def _load_frozen_adapter(model: nn.Module, *, name: str, weights: Dict[str, torc
     load_model_state_dict(model, dict(weights), strict=False, broadcast_from_rank0=False)
 
     if _current_rank() == 0:
-        logger.info("_load_frozen_adapter(%r): %d tensor(s) from %s", name, len(weights), weight_path)
+        logger.info("_load_frozen_adapter(%r): %d tensor(s) from %s", name, len(weights), path)
 
 
 def _weights_sha256(weights: Dict[str, torch.Tensor]) -> str:
