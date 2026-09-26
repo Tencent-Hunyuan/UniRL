@@ -95,6 +95,11 @@ class MiniMaxH3PipelineConfig:
     # it, and expect decode to become the bottleneck.
     vae_components_on_cpu: bool = False
 
+    # Under Ulysses SP every rank holds the same gathered latents and decodes the
+    # same video, so the video VAE runs sp_size times for one kept result. Spread
+    # the decoder's temporal chunks over the SP group instead. See README Gotchas.
+    video_decode_shard_across_sp: bool = False
+
     weight_sync_param_name_prefix: str = "transformer."
 
     use_lora: bool = False

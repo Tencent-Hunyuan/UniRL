@@ -102,6 +102,17 @@ it is the authoritative bundle / pipeline / stage / conditions contract.
   wrapper's state-dict hooks strip it). Any match between module params and
   checkpoint keys goes through `canonical_param_name`, exported beside the
   deferred-op pair in `types/post_materialize.py`.
+- **Sequence parallelism does not shard the VAE, so decode is replicated.** SP
+  wraps only the trainable transformer, and the SP hooks gather at `norm_out`,
+  so every rank finishes denoise holding identical latents and decodes the whole
+  video; `Dispatch.DP_SCATTER`'s collect then keeps only `sp_rank == 0`. At
+  MiniMax-H3 768×768×124/SP8 that replicated decode was 73.7% of per-sample cost
+  and 8× redundant. `video_decode_shard_across_sp` (opt-in) spreads the video
+  VAE's temporal chunks over the SP group instead — verified bit-identical
+  (`max_ulp == 0` against the stock path on real weights). **Do not "fix" this by
+  giving each rank a different sample:** SP attention all-to-alls in every block
+  force the group to enter each denoise in lockstep, so a rank that skips work
+  just blocks in the next collective and saves nothing.
 
 
 ## Conversation composition
