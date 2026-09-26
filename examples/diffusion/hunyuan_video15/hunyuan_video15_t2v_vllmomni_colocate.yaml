@@ -121,7 +121,6 @@ rollout:
     _target_: unirl.rollout.engine.vllm_omni.config.VLLMOmniEngineConfig
     model_path: ${oc.env:PRETRAINED_MODEL,hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v}
     modality: hv15_t2v
-    diffusion_attention_backend: FLASH_ATTN
     # Colocate time-shares the GPU: the engine sleeps (releases GPU memory)
     # while the trainer runs and wakes to generate.
     enable_sleep_mode: true
@@ -130,6 +129,8 @@ rollout:
     omni_extra:
       init_timeout: 3600
       stage_init_timeout: 1800
+      # Overrides the deploy config's TORCH_SDPA; keep paired with bundle.config.attention_backend.
+      diffusion_attention_backend: FLASH_ATTN
       # Reuse text-encoder outputs across GRPO siblings; size >= distinct prompts in flight per worker.
       # enable_prompt_embed_cache: true
       # prompt_embed_cache_size: 32
