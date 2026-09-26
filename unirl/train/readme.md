@@ -144,10 +144,13 @@ in `backend/base.py`; a multi-update-capable algorithm sets
   default options` warning per process while splitting the gloo half; it is expected.
 - **`frozen_adapters` (OPD teachers) load their weights *after* materialization, not at
   injection** — `FrozenAdapters.inject` builds the adapter structure pre-wrap (meta-safe,
-  so VeOmni meta-init bundles work), reads the peft checkpoint on every rank, maps
-  `base_model.model.<m>.lora_A.weight` to `<m>.lora_A.<name>.weight`, and registers a
-  `defer_after_materialize` op that refuses unexpected / missing / mis-shaped tensors and
-  reshards via `set_model_state_dict(full_state_dict=True)`. Anything that reads teacher
+  so VeOmni meta-init bundles work) from the full saved peft config, reads the checkpoint on
+  every rank, maps `base_model.model.<m>.lora_A.weight` to `<m>.lora_A.<name>.weight`, and
+  refuses unexpected / missing / mis-shaped tensors right there, before the base weights
+  load. Teachers must be plain LoRA deltas: base-rewriting inits (pissa / olora / ...,
+  unless converted), `modules_to_save`, `layer_replication`, `trainable_token_indices`,
+  DoRA, and `bias != "none"` are rejected. A `defer_after_materialize` op then reshards the
+  weights via `set_model_state_dict(full_state_dict=True)`. Anything that reads teacher
   weights before `apply_deferred_ops` gets something other than the checkpoint: peft's random
   `lora_A` over a zeroed `lora_B` (a null teacher) on an eager bundle, and *uninitialized*
   storage on a meta-init one, because `to_empty` wipes whatever peft wrote. `inject_lora`

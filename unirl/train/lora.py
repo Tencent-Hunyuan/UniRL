@@ -224,6 +224,20 @@ def _inject_frozen_adapter(
             "a modified base model. Re-save it with save_pretrained(path_initial_model_for_weight_conversion=...) "
             "to convert it to a plain LoRA delta."
         )
+    # peft applies these at inject time to the shared student modules (or, for DoRA, adds magnitude tensors
+    # this loader does not map); a frozen teacher may only add a LoRA delta.
+    unsupported = {
+        field: getattr(peft_cfg, field)
+        for field in ("modules_to_save", "layer_replication", "trainable_token_indices", "use_dora")
+        if getattr(peft_cfg, field)
+    }
+    if peft_cfg.bias != "none":
+        unsupported["bias"] = peft_cfg.bias
+    if unsupported:
+        raise ValueError(
+            f"inject_frozen_adapter: {path!r} sets {unsupported}; frozen teachers support plain LoRA "
+            "(no modules_to_save / layer_replication / trainable_token_indices / DoRA, bias='none')."
+        )
     peft_cfg.lora_dropout = 0.0
     inject_adapter_in_model(peft_cfg, model, adapter_name=name)
 
@@ -248,6 +262,31 @@ def _inject_frozen_adapter(
     weights = {
         _LORA_BANK_RE.sub(lambda m: f"{m.group(0)}.{name}", _strip_peft_prefix(k), count=1): v for k, v in raw.items()
     }
+
+    # Validate against the injected (possibly meta) structure now, before the base weights load.
+    model_sd = model.state_dict()
+    expected = {k for k in model_sd if _adapter_of_lora_key(k) == name}
+    unexpected = sorted(set(weights) - expected)
+    if unexpected:
+        raise ValueError(
+            f"inject_frozen_adapter: {len(unexpected)} tensor(s) in {path!r} matched no "
+            f"parameter of adapter {name!r} (first: {unexpected[:3]}). The checkpoint does not "
+            "line up with this model — refusing a silently partial teacher."
+        )
+    # peft zero-inits ``lora_B``: a missing tensor would silently null the teacher on that layer.
+    missing = sorted(expected - set(weights))
+    if missing:
+        raise ValueError(
+            f"inject_frozen_adapter: {len(missing)} tensor(s) of adapter {name!r} are absent from "
+            f"{path!r} (first: {missing[:3]}) — refusing a partial teacher."
+        )
+    for key, value in weights.items():
+        want = model_sd[key].shape
+        if tuple(value.shape) != tuple(want):
+            raise ValueError(
+                f"inject_frozen_adapter: {key!r} has shape {tuple(value.shape)} in {path!r}, "
+                f"model expects {tuple(want)} (adapter rank mismatch?)."
+            )
 
     # Weights need real (sharded) storage: FSDP/VeOmni materialize after injection.
     defer_after_materialize(
@@ -282,35 +321,18 @@ def _adapter_of_lora_key(key: str) -> Optional[str]:
 
 
 def _load_frozen_adapter(model: nn.Module, *, name: str, weights: Dict[str, torch.Tensor], path: str) -> None:
-    """Post-materialize op: load ``weights`` into the (already frozen) adapter ``name`` on every rank."""
+    """Post-materialize op: reshard the validated ``weights`` into the frozen adapter ``name`` on every rank."""
     from unirl.train.backend.sharded_state import load_model_state_dict
 
-    model_sd = model.state_dict()
-    expected = {k for k in model_sd if _adapter_of_lora_key(k) == name}
-    unexpected = sorted(set(weights) - expected)
-    if unexpected:
-        raise ValueError(
-            f"inject_frozen_adapter: {len(unexpected)} tensor(s) in {path!r} matched no "
-            f"parameter of adapter {name!r} (first: {unexpected[:3]}). The checkpoint does not "
-            "line up with this model — refusing a silently partial teacher."
-        )
-    # peft zero-inits ``lora_B``: a missing tensor would silently null the teacher on that layer.
-    missing = sorted(expected - set(weights))
-    if missing:
-        raise ValueError(
-            f"inject_frozen_adapter: {len(missing)} tensor(s) of adapter {name!r} are absent from "
-            f"{path!r} (first: {missing[:3]}) — refusing a partial teacher."
-        )
-    for key, value in weights.items():
-        want = model_sd[key].shape
-        if tuple(value.shape) != tuple(want):
-            raise ValueError(
-                f"inject_frozen_adapter: {key!r} has shape {tuple(value.shape)} in {path!r}, "
-                f"model expects {tuple(want)} (adapter rank mismatch?)."
-            )
     # Every rank holds the full (small) adapter dict; DCP slices each rank's own shard.
     # set_model_state_dict fills its input with every model entry, hence the copy.
-    load_model_state_dict(model, dict(weights), strict=False, broadcast_from_rank0=False)
+    result = load_model_state_dict(model, dict(weights), strict=False, broadcast_from_rank0=False)
+    # Keys were checked pre-wrap; a wrapper that renamed FQNs would otherwise skip the teacher silently.
+    if result.unexpected_keys:
+        raise RuntimeError(
+            f"inject_frozen_adapter: {len(result.unexpected_keys)} tensor(s) of adapter {name!r} from {path!r} "
+            f"no longer match the wrapped model (first: {sorted(result.unexpected_keys)[:3]})."
+        )
 
     if _current_rank() == 0:
         logger.info("_load_frozen_adapter(%r): %d tensor(s) from %s", name, len(weights), path)

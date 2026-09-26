@@ -37,8 +37,8 @@ def load_model_state_dict(
     *,
     strict: bool = True,
     broadcast_from_rank0: bool = True,
-) -> None:
-    """Load a full state dict and reshard it into ``model``."""
+) -> object:
+    """Load a full state dict and reshard it into ``model``; returns torch's ``(missing_keys, unexpected_keys)``."""
     from torch.distributed.checkpoint.state_dict import set_model_state_dict
 
     options = _build_state_dict_options(
@@ -48,9 +48,9 @@ def load_model_state_dict(
         strict=strict,
     )
     try:
-        set_model_state_dict(model, state_dict, options=options)
+        return set_model_state_dict(model, state_dict, options=options)
     except TypeError:
-        set_model_state_dict(model, state_dict)
+        return set_model_state_dict(model, state_dict)
 
 
 def gather_optimizer_state_dict(model: nn.Module, optimizer: torch.optim.Optimizer) -> StateDict:
