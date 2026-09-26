@@ -1,4 +1,4 @@
-"""Plain LoRA adapter injection."""
+"""LoRA adapter injection, switching, and frozen sibling adapters."""
 
 from __future__ import annotations
 
