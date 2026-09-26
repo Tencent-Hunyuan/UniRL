@@ -63,9 +63,9 @@ needs a `.gitignore` line, which keeps that decision explicit.
 
 | Folder | What |
 |---|---|
-| [`audiocaps/`](audiocaps/README.md) | AudioCaps captions for LTX-2.3 CLAP audio-reward RL |
 | [`arxivqa_mc/`](arxivqa_mc/README.md) | ArxivQA scientific-figure multiple-choice (BAGEL GRPO) |
 | [`asearcher/`](asearcher/README.md) | ASearcher deep-research prompts (agentic RL) |
+| [`audiocaps/`](audiocaps/README.md) | AudioCaps captions for LTX-2.3 CLAP audio-reward RL |
 | [`daily_omni_av/`](daily_omni_av/README.md) | Daily-Omni audio-video QA |
 | [`dapo_math/`](dapo_math/README.md) | DAPO-Math-17k + AIME 2024/2025 (AR math RL) |
 | [`dcase2025_audio_qa/`](dcase2025_audio_qa/README.md) | DCASE 2025 audio QA |

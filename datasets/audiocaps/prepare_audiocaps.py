@@ -9,7 +9,7 @@ import json
 import os
 import random
 import urllib.request
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 DEFAULT_SOURCE = "https://raw.githubusercontent.com/cdjkim/audiocaps/d004db3ea1b01cf4fd0347dd8d27db90cadc8809"
 AudioSetKey = Tuple[str, int]
@@ -139,11 +139,6 @@ def _write_split(
     print(f"wrote {len(rows)} records -> {out_path}")
 
 
-def _iter_specs(args: argparse.Namespace) -> Iterable[tuple[str, str, int, int, bool]]:
-    yield args.train_split, "train.jsonl", args.train_limit, args.seed, False
-    yield args.eval_split, "eval.jsonl", args.eval_limit, args.seed + 1, not args.keep_all_eval_captions
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", default=DEFAULT_SOURCE, help="AudioCaps repo URL or local directory")
@@ -170,7 +165,11 @@ def main() -> None:
 
     audioset_labels = _read_audioset_labels(args.audioset_metadata_dir) if args.audioset_metadata_dir else None
 
-    for source_split, filename, limit, seed, one_caption_per_clip in _iter_specs(args):
+    split_specs = (
+        (args.train_split, "train.jsonl", args.train_limit, args.seed, False),
+        (args.eval_split, "eval.jsonl", args.eval_limit, args.seed + 1, not args.keep_all_eval_captions),
+    )
+    for source_split, filename, limit, seed, one_caption_per_clip in split_specs:
         source_rows = _read_rows(args.source, source_split)
         selected_rows = _select_rows(
             source_rows,

@@ -406,7 +406,7 @@ class UniRLWandBLogger:
         *,
         key: str = "rollout/generated_media",
         video_key: Optional[str] = None,
-        video_fps: Optional[float] = None,
+        video_fps: int = 8,
         step_key: str = "rollout/step",
     ) -> None:
         """Log rollout media preview payload produced by the rollout pipeline."""
@@ -418,22 +418,14 @@ class UniRLWandBLogger:
             videos = media_preview.get("videos")
             prompts = media_preview.get("prompts")
             rewards = media_preview.get("rewards")
+            preview_fps = media_preview.get("video_fps")
         else:
             images = getattr(media_preview, "images", None)
             videos = getattr(media_preview, "videos", None)
             prompts = getattr(media_preview, "prompts", None)
             rewards = getattr(media_preview, "rewards", None)
-
-        preview_video_fps = (
-            media_preview.get("video_fps")
-            if isinstance(media_preview, dict)
-            else getattr(media_preview, "video_fps", None)
-        )
-        resolved_video_fps = float(
-            video_fps if video_fps is not None else (preview_video_fps if preview_video_fps is not None else 8)
-        )
-        if resolved_video_fps <= 0.0:
-            raise ValueError(f"log_generated_media: video_fps must be > 0, got {resolved_video_fps}")
+            preview_fps = getattr(media_preview, "video_fps", None)
+        fps = int(round(preview_fps)) if preview_fps is not None else video_fps
 
         has_images = isinstance(images, list) and bool(images)
         has_videos = isinstance(videos, list) and bool(videos)
@@ -512,13 +504,11 @@ class UniRLWandBLogger:
                     audio_wf = audios[idx] if idx < len(audios) else None
                     if audio_wf is not None and audio_sr is not None and torch.is_tensor(audio_wf):
                         arr_hwc = arr.transpose(0, 2, 3, 1)  # (T, C, H, W) -> (T, H, W, C)
-                        path = _write_video_with_audio(arr_hwc, int(round(resolved_video_fps)), audio_wf, int(audio_sr))
+                        path = _write_video_with_audio(arr_hwc, fps, audio_wf, int(audio_sr))
                         _muxed_paths.append(path)
                         wandb_videos.append(wandb.Video(path, caption=_caption_for(idx), format="mp4"))
                     else:
-                        wandb_videos.append(
-                            wandb.Video(arr, caption=_caption_for(idx), fps=int(round(resolved_video_fps)))
-                        )
+                        wandb_videos.append(wandb.Video(arr, caption=_caption_for(idx), fps=fps))
                 if wandb_videos:
                     payload[video_key] = wandb_videos
 

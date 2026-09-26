@@ -195,10 +195,6 @@ class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
         self.trajectory_dtype = parse_torch_dtype(trajectory_precision, field_name="trajectory_precision")
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="logprob_precision")
         self.audio_joint_sde = bool(audio_joint_sde)
-        if audio_policy_logp_weight is not None:
-            audio_policy_logp_weight = float(audio_policy_logp_weight)
-            if not 0.0 <= audio_policy_logp_weight <= 1.0:
-                raise ValueError(f"audio_policy_logp_weight must be in [0, 1], got {audio_policy_logp_weight}.")
         self.audio_policy_logp_weight = audio_policy_logp_weight
         self._audio_in_policy = self.audio_joint_sde and bool(getattr(bundle, "has_audio", False))
 

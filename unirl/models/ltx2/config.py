@@ -53,6 +53,11 @@ class LTX2PipelineConfig:
     def __post_init__(self) -> None:
         validate_precision_type(self.model_precision, field="LTX2PipelineConfig.model_precision")
         if self.audio_policy_logp_weight is not None:
+            if not (self.enable_audio and self.audio_joint_sde):
+                raise ValueError(
+                    "LTX2PipelineConfig.audio_policy_logp_weight requires enable_audio=True and audio_joint_sde=True; "
+                    "otherwise the audio trajectory is not part of the policy log-prob."
+                )
             self.audio_policy_logp_weight = float(self.audio_policy_logp_weight)
             if not 0.0 <= self.audio_policy_logp_weight <= 1.0:
                 raise ValueError(
