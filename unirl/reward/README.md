@@ -132,3 +132,8 @@ new remote reward needs no UniRL code — add it to the server and list its name
   scorers honor it, falling back to CPU with a warning if CUDA is unavailable.
 - **Prompt-based rewards use the generation prompt by default.** Set
   `prompt_source: original` to score against the original user prompt instead.
+- **A training `reward:` must relate the prompt to the video.** `RewardService`
+  rejects a backend whose `covers_prompt_video()` is false — e.g. imagebind
+  `mode: audio_video`, which scores generated audio against generated video and is
+  maximised by collapsing both. `eval_rewards` suites are exempt, so such a score
+  can still be measured there; set `require_prompt_video: false` to train on it anyway.
