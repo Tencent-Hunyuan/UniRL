@@ -112,9 +112,6 @@ rollout:
     backend: native
     pretrained_model_ckpt_path: ${oc.env:QWEN3_PATH,Qwen/Qwen3-4B-Base}
     tp_size: 1
-    max_new_tokens: 8192
-    temperature: 1.0
-    top_p: 1.0
     concurrency: 16
     # ARTrainer pre-expands the req by samples_per_prompt, so the engine emits
     # one completion per entry (n=1); else samples double-count.
@@ -124,29 +121,33 @@ rollout:
     chat_template_kwargs:
       enable_thinking: true
     engine_kwargs:
+      # Colocate full-FT preset — see unirl/rollout/README.md (SGLang AR knobs).
       # FULL fine-tuning: lower the SRT KV reservation to give FSDP headroom for
       # the per-rollout full-weight all-gather. No LoRA pool — full dense weights
       # pushed via TensorWeightSync. CUDA graph ON for decode speed, but capped at
-      # cuda_graph_max_bs=16 so its captured buffers stay small (the default 256
-      # would balloon server memory + compete with the weight push).
+      # cuda_graph_max_bs_decode=16 so its captured buffers stay small (the
+      # auto-tuned default can be much larger and compete with the weight push).
       mem_fraction_static: 0.3
       skip_server_warmup: true
       attention_backend: triton
       disable_cuda_graph: false
-      cuda_graph_max_bs: 16
+      cuda_graph_max_bs_decode: 16
       enable_lora: false
 
 reward:
   # math-verify (the paper's grader, Appendix D). 1.0 if the parsed answer matches
-  # the ground truth else 0.0. Unlike MathBoxed it extracts the final answer even
-  # without \boxed{} (Qwen3-Base + thinking often reasons to the answer unboxed),
-  # so it does not under-count correct generations / inflate zero-advantage groups.
+  # the ground truth else 0.0. Unlike a `\boxed{}`-only matcher, it can extract
+  # answers from free-form text even without \boxed{} (Qwen3-Base + thinking
+  # often reasons to the answer unboxed).
   _target_: unirl.reward.service.RewardService
   # keep = score the partial text of truncated (length-capped) traces instead of
   # forcing 0, matching verl's dapo reward manager with overlong_buffer disabled.
   # As responses lengthen and truncation approaches 100%, the default "zero" would
   # collapse reward_mean; "keep" stays flat (verl parity). Use "soft" for verl's
   # graded overlong penalty, or "zero" to restore the anti-ramble hard zeroing.
+  # Caveat: recognized final-answer markers take priority; without one, math-verify
+  # may fall back to the rightmost parseable expression. A trace truncated
+  # mid-derivation can therefore score 1.0 off an intermediate value.
   truncated_reward: keep
   backend:
     _target_: unirl.reward.local.mathverify.MathVerifyRewardScorer
@@ -174,10 +175,10 @@ algorithm:
   clip_range_high: null # symmetric clip — standard Dr.GRPO (the vanilla baseline uses 0.28)
   clip_schedule: constant
   loss_agg_mode: seq-mean-token-sum-norm # per-seq token-sum / horizon, mean over seqs
-  horizon: 8192 # fixed length normalizer for seq-mean-token-sum-norm (= max_new_tokens)
+  horizon: ${sampling.max_new_tokens} # fixed length normalizer for seq-mean-token-sum-norm (= max_new_tokens)
   # 1.0 — must equal sampling.temperature below so replay's log_softmax(logits/T)
   # matches the SGLang sampler's tempered output_token_logprobs (ratio_mean ≈ 1).
-  sampling_temperature: 1.0
+  sampling_temperature: ${sampling.temperature}
   conditions_cls:
     _target_: hydra.utils.get_class
     path: unirl.models.qwen3.conditions.Qwen3ARConditions

@@ -94,9 +94,6 @@ rollout:
     pretrained_model_ckpt_path: ${oc.env:QWEN3_5_MOE_PATH}
     tp_size: 8
     ep_size: 8
-    max_new_tokens: 8192
-    temperature: 1.0
-    top_p: 1.0
     concurrency: 64
     samples_pre_expanded: true
     response_forbidden_tokens: ["<|image_pad|>", "<|video_pad|>"]
@@ -106,10 +103,12 @@ rollout:
     chat_template_kwargs:
       enable_thinking: true
     engine_kwargs:
+      # Colocate MoE: tighter KV than the 4B dense preset (0.15 vs 0.3) and
+      # cuda_graph_max_bs=64. See unirl/rollout/README.md (SGLang AR knobs).
       mem_fraction_static: 0.15
       attention_backend: triton
       disable_cuda_graph: false
-      cuda_graph_max_bs: 64
+      cuda_graph_max_bs_decode: 64
       enable_lora: false
 
 reward:
@@ -128,8 +127,8 @@ algorithm:
   clip_range_high: null
   clip_schedule: constant
   loss_agg_mode: seq-mean-token-mean
-  horizon: 8192
-  sampling_temperature: 1.0
+  horizon: ${sampling.max_new_tokens}
+  sampling_temperature: ${sampling.temperature}
   conditions_cls:
     _target_: hydra.utils.get_class
     path: unirl.models.qwen3_5.conditions.Qwen3_5ARConditions

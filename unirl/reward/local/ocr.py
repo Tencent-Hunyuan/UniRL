@@ -14,7 +14,7 @@ from typing import List
 from PIL import Image
 from tqdm import tqdm
 
-from unirl.reward.base import BaseRewardComponentSpec
+from unirl.reward.base import PromptRewardComponentSpec
 from unirl.types.reward import RewardRequest, RewardResponse
 
 from .base import LocalRewardBackend
@@ -29,7 +29,7 @@ class OCRRewardScorer(LocalRewardBackend):
 
     def __init__(self, *, config: "OCRSpec", base_device: str) -> None:
         del base_device
-        super().__init__(lang=config.lang)
+        super().__init__(lang=config.lang, prompt_source=config.prompt_source)
 
     def _load_model(self) -> None:
         self._levenshtein_distance = None
@@ -87,7 +87,7 @@ class OCRRewardScorer(LocalRewardBackend):
             raise ValueError("OCR reward requires generated images")
 
         prompts: List[str] = []
-        for idx, raw_prompt in enumerate(request.prompts):
+        for idx, raw_prompt in enumerate(self.prompts(request)):
             target_text = self._extract_target_text(raw_prompt)
             if not target_text:
                 raise ValueError(f"OCR reward prompt at index {idx} has empty quoted target text.")
@@ -227,7 +227,7 @@ class OCRRewardScorer(LocalRewardBackend):
 
 
 @dataclass
-class OCRSpec(BaseRewardComponentSpec):
+class OCRSpec(PromptRewardComponentSpec):
     """Typed config for the OCR (PaddleOCR) reward component."""
 
     lang: str = "en"

@@ -68,7 +68,7 @@ def _cfg_get(cfg: Any, key: str, default: int) -> int:
     return int(val or default)
 
 
-def _is_sglang_rollout_role(role_cls: Type[Remote]) -> bool:
+def _accepts_rollout_tp_role(role_cls: Type[Remote]) -> bool:
     """True if ``role_cls`` opts into per-rank rollout-TP kwargs."""
     cls = _owning_class(role_cls)
     return getattr(cls, "_accepts_rollout_tp_kwargs", False) is True
@@ -94,7 +94,7 @@ def _parallel_shape_from_init_kwargs(
     pp = int(init_kwargs.get("pp_size") or 1)
     ep = int(init_kwargs.get("ep_size") or 1)
 
-    if _is_sglang_rollout_role(role_cls):
+    if _accepts_rollout_tp_role(role_cls):
         cfg = init_kwargs.get("config")
         if cfg is not None:
             tp = max(tp, _cfg_get(cfg, "tp_size", 1))
@@ -192,7 +192,7 @@ def _build_tp_visible_device_map(
         group_nodes = [str(node_ips[index]).strip() for index in ordered]
         if any(not node for node in group_nodes) or len(set(group_nodes)) != 1:
             raise ValueError(
-                f"each SGLang TP group must be placed on a single node; group={group_key}, nodes={group_nodes}"
+                f"each rollout TP group must be placed on a single node; group={group_key}, nodes={group_nodes}"
             )
 
         tokens: List[str] = []
@@ -203,7 +203,7 @@ def _build_tp_visible_device_map(
             split = [token.strip() for token in raw.split(",") if token.strip()]
             if len(split) != 1:
                 raise ValueError(
-                    "each SGLang TP Worker must expose exactly one CUDA_VISIBLE_DEVICES "
+                    "each rollout TP worker must expose exactly one CUDA_VISIBLE_DEVICES "
                     f"token; worker={index}, value={raw!r}"
                 )
             tokens.append(split[0])
@@ -445,7 +445,7 @@ class Handle:
             self.rank_infos[0].pp_size,
             self.rank_infos[0].ep_size,
         )
-        is_tp_engine = _is_sglang_rollout_role(role_cls)
+        is_tp_engine = _accepts_rollout_tp_role(role_cls)
         tp_visible_device_map: Dict[int, List[str]] = {}
         if is_tp_engine and any(rank_info.tp_size > 1 for rank_info in self.rank_infos):
             node_ips = get_actor_results(

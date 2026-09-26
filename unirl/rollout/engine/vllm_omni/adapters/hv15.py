@@ -54,8 +54,8 @@ class Hv15VideoOutputAdapter(DitOutputAdapter):
         "on the output envelope's unirl metadata (or it lacked the dual-stream "
         "text_mllm/text_glyph embeds). Check that "
         "RLHunyuanVideo15Pipeline's encode_prompt hook ran in every DiT "
-        "worker — verify custom_pipeline_args.pipeline_class in the stage "
-        "YAML."
+        "worker — verify custom_pipeline_args.pipeline_class in the deploy "
+        "config."
     )
 
     def build_decoded(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Any:
@@ -116,14 +116,8 @@ class Hv15VideoOutputAdapter(DitOutputAdapter):
 class Hv15T2vAdapter(ModelAdapter):
     """HunyuanVideo-1.5 text → video (single diffusion stage, TP=1)."""
 
-    stage_yaml = "hunyuan_video15_t2v_rl.yaml"
+    deploy_config = "hunyuan_video15_t2v_rl.yaml"
     needs_driver_tokenizer = False
-
-    def boot_kwargs(self) -> Dict[str, Any]:
-        """Select the rollout diffusion attention backend."""
-        kwargs = super().boot_kwargs()
-        kwargs["diffusion_attention_backend"] = self.cfg.diffusion_attention_backend or "TORCH_SDPA"
-        return kwargs
 
     def __init__(self, config: Any, model_config: Any, *, strategy: Any = None, tokenize_fn: Any = None) -> None:
         super().__init__(config, model_config, strategy=strategy, tokenize_fn=tokenize_fn)

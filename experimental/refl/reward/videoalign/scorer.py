@@ -38,7 +38,6 @@ class VideoAlignRewardScorer(LocalRewardBackend):
             w_vq=config.w_vq,
             w_mq=config.w_mq,
             w_ta=config.w_ta,
-            differentiable=config.differentiable,
         )
 
     def _load_model(self) -> None:
@@ -55,7 +54,6 @@ class VideoAlignRewardScorer(LocalRewardBackend):
         self._w_ta = float(self.model_kwargs["w_ta"])
         self._use_norm = bool(self.model_kwargs["use_norm"])
         self._reward_num_frames = int(self.model_kwargs["reward_num_frames"])
-        self._differentiable = bool(self.model_kwargs["differentiable"])
 
         logger.info(
             "VideoAlignRewardScorer: loading VideoRewardWrapper from %s",
@@ -107,8 +105,7 @@ class VideoAlignRewardScorer(LocalRewardBackend):
                 ds.append(v)
             per_sample_videos = ds
 
-        autograd_ctx = torch.enable_grad if self._differentiable else torch.no_grad
-        with autograd_ctx():
+        with torch.enable_grad():
             scores = self.model.forward_scores(
                 per_sample_videos,
                 prompts,
@@ -119,16 +116,11 @@ class VideoAlignRewardScorer(LocalRewardBackend):
         return reward.float()
 
     def offload(self) -> None:
-        if self.model is not None and getattr(self.model, "model", None) is not None:
-            self.model.model.cpu()
-            torch.cuda.empty_cache()
+        self.model.model.cpu()
+        torch.cuda.empty_cache()
 
     def onload(self) -> None:
-        if self.model is not None and getattr(self.model, "model", None) is not None:
-            self.model.model.to(self.device)
-
-    def is_available(self) -> bool:
-        return bool(self._is_loaded)
+        self.model.model.to(self.device)
 
     def dispose(self) -> None:
         self.offload()
@@ -152,8 +144,6 @@ class VideoAlignSpec(BaseRewardComponentSpec):
     w_vq: float = 1.0
     w_mq: float = 1.0
     w_ta: float = 1.0
-
-    differentiable: bool = True
 
 
 __all__ = [

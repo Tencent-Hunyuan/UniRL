@@ -61,8 +61,27 @@ handler in `../../distributed/weight_sync`.
 - **An engine that will serve as an agentic inner must make `generate` safe for
   concurrent callers** — the agentic coordinator drives one trajectory per drain
   thread.
+- **Unknown SGLang `engine_kwargs` are dropped at boot.** HTTP/native backends
+  filter intent against live `ServerArgs`. Typos used to fail silently; they now
+  warn, or raise if `UNIRL_SGLANG_STRICT_SERVER_ARGS=1`. UniRL-only keys
+  (`concurrency`, `advertise_host`, `health_timeout_s`) are expected drops.
+  Recipe-facing colocate/async knobs live in [`../README.md`](../README.md)
+  (SGLang AR knobs).
 - **SGLang LoRA serialization is topology-sensitive.** TP1 keeps
   `MultiprocessingSerializer` and requires the server to inherit the sender's
   multiprocessing authkey. TP>1 cannot broadcast its one-shot file descriptors, so
   `sglang/backends/http.py` sends inlined base64 pickle bytes instead. Re-check the
   `SafeUnpickler` allowlist and broadcast semantics on a SGLang bump.
+- **`rl_on_policy_target` silently switches on deterministic sampling.** SGLang
+  0.5.19 derives `enable_deterministic_inference` from it, and every request
+  that carries no `sampling_seed` then defaults to seed 42 — so one `n=8` request
+  comes back as eight token-identical completions. The adapters therefore send
+  deterministic fan-out as `n=1` requests each carrying one derived
+  `sampling_seed`. Re-check both halves on a SGLang bump: dropping either one
+  restores the clone, silently.
+- **SGLang request sampling lives on the Sample, not the engine config.** Direct
+  callers must `fork(..., sampling_params=ARSamplingParams(...))` before
+  `generate`. Missing or non-`ARSamplingParams` frontiers now error; in-tree
+  trainer, PE, and agentic paths already stamp this. `temperature` / `top_p` /
+  `top_k` / `max_new_tokens` are gone from `SGLangEngineConfig` — there is no
+  engine-config fallback.

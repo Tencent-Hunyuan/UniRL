@@ -60,7 +60,8 @@ class HunyuanVideo10DiffusionStep(DiffusionStep[HunyuanVideo10Bundle, HunyuanVid
             timestep = sigma.expand(batch_size)
         else:
             timestep = sigma
-        timestep = timestep.to(device=device, dtype=dtype) * self.TIMESTEP_SCALE
+        # Match Diffusers/SGLang: keep the scaled timestep in fp32 through the sinusoidal embedding.
+        timestep = timestep.to(device=device, dtype=torch.float32) * self.TIMESTEP_SCALE
 
         guidance = torch.full((batch_size,), guidance_scale, device=device, dtype=dtype)
 
@@ -435,7 +436,7 @@ class HunyuanVideo10DiffusionStage(DiffusionStage[HunyuanVideo10Conditions]):
                     prev_sample_means.append(prev_mean)
 
         log_probs_t = torch.stack(log_probs, dim=1).to(dtype=self.logprob_dtype)
-        means_t = torch.stack(prev_sample_means, dim=1).to(dtype=self.trajectory_dtype) if prev_sample_means else None
+        means_t = torch.stack(prev_sample_means, dim=1) if prev_sample_means else None
         return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
 
     def predict_noise_at_step(

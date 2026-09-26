@@ -9,7 +9,7 @@ import torch
 
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
-from unirl.types.primitives import PrimitiveValue, primitive_modality_key
+from unirl.types.primitives import PrimitiveValue, Texts, primitive_modality_key
 from unirl.types.reward import RewardRequest, RewardResponse
 from unirl.types.sample import Sample, _part_with_field
 from unirl.types.sampling import ARSamplingParams
@@ -22,9 +22,17 @@ logger = logging.getLogger(__name__)
 def _build_reward_request(sample: Sample, preferred_input_kind: str) -> RewardRequest:
     """Assemble a :class:`RewardRequest` from a response ``Sample``."""
     frontier = sample.parts[-1]
-    primitives: Dict[str, PrimitiveValue] = {}
-    for prim in sample.conditioning():
-        primitives[primitive_modality_key(prim)] = prim
+    original_prompt: Optional[Texts] = None
+    generation_prompt: Optional[Texts] = None
+    conditioning: Dict[str, PrimitiveValue] = {}
+    for turn in sample.turns():
+        prim = turn.content
+        if isinstance(prim, Texts):
+            if original_prompt is None:
+                original_prompt = prim
+            generation_prompt = prim
+        else:
+            conditioning[primitive_modality_key(prim)] = prim
 
     if preferred_input_kind not in frontier.primitives:
         raise ValueError(
@@ -39,10 +47,11 @@ def _build_reward_request(sample: Sample, preferred_input_kind: str) -> RewardRe
     if "audio" in generated and audio_metadata.get("sample_rate") is not None:
         audio_sample_rate = int(audio_metadata["sample_rate"])
     return RewardRequest(
-        primitives=primitives,
         generated=generated,
+        conditioning=conditioning,
+        original_prompt=original_prompt,
+        generation_prompt=generation_prompt,
         audio_sample_rate=audio_sample_rate,
-        prompt_ids=[str(sid) for sid in frontier.sample_ids],
         sample_ids=list(frontier.sample_ids),
         group_ids=list(frontier.group_ids),
         metadata=(metadata if any(m is not None for m in metadata) else None),
@@ -122,17 +131,24 @@ class RewardService(Remote):
 
         rewards = torch.tensor(reward_response.rewards, dtype=torch.float32)
 
-        sp = frontier.sampling_params
-        if self.truncated_reward != "keep" and isinstance(sp, ARSamplingParams) and frontier.segment is not None:
+        # Hitting max_new_tokens means truncated text, but fixed-length AR media
+        # reaches that length by construction and must keep its reward.
+        sampling_params = frontier.sampling_params
+        if (
+            self.truncated_reward != "keep"
+            and isinstance(sampling_params, ARSamplingParams)
+            and not sampling_params.emits_fixed_length
+            and frontier.segment is not None
+        ):
             seg_lengths = getattr(frontier.segment, "lengths", None)
             if seg_lengths is not None and seg_lengths.numel() == rewards.numel():
                 seg_lengths = seg_lengths.to(rewards.device).float()
-                max_len = float(int(sp.max_new_tokens))
+                max_len = sampling_params.max_new_tokens
                 if self.truncated_reward == "zero":
                     truncated = seg_lengths >= max_len
                     rewards = torch.where(truncated, torch.zeros_like(rewards), rewards)
                 else:
-                    buf = float(self.overlong_buffer_len)
+                    buf = self.overlong_buffer_len
                     exceed = seg_lengths - (max_len - buf)
                     penalty = torch.clamp(-exceed / buf * self.overlong_penalty_factor, max=0.0)
                     rewards = rewards + penalty
@@ -148,9 +164,15 @@ class RewardService(Remote):
     def is_available(self) -> bool:
         return self.backend.is_available()
 
+    # Broadcast, not scatter: every reward worker holds its own copy of the
+    # scorer, so each has to move its own weights. Undecorated, these were
+    # unreachable through the role's Handle, which is why nothing had ever
+    # driven reward residency from the training loop.
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
     def offload(self) -> None:
         self.backend.offload()
 
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
     def onload(self) -> None:
         self.backend.onload()
 

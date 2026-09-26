@@ -84,7 +84,7 @@ def hi3_fused_conditions(diff_outputs: List[OmniRawResult], *, modality: str) ->
             "Check that RLHunyuanImage3Pipeline.prepare_inputs_for_generation "
             "hook ran in every DiT worker — the subclass swap may not have "
             "taken effect (verify custom_pipeline_args.pipeline_class in "
-            "the stage YAML)."
+            "the deploy config)."
         )
 
     sequence_lengths = [int(c["input_ids"].shape[-1]) for c in captures]
@@ -193,10 +193,10 @@ class Hi3InputAdapter:
         self.vanilla_task = vanilla_task
         self.sys_type = sys_type
 
-    def _resolve_task(self, task_config: Dict[str, Any]) -> Tuple[str, str]:
-        """Resolve ``(task_key, sys_type)`` with the ``task_config`` overrides."""
-        sys_type = task_config.get("sys_type") or self.sys_type
-        bot_task = task_config.get("bot_task")
+    def _resolve_task(self, control: Dict[str, Any]) -> Tuple[str, str]:
+        """Resolve ``(task_key, sys_type)`` with the root ``Part.control`` overrides."""
+        sys_type = control.get("sys_type") or self.sys_type
+        bot_task = control.get("bot_task")
         if self.bot_task_base and bot_task:
             if bot_task == "vanilla" and self.vanilla_task is not None:
                 return self.vanilla_task
@@ -227,7 +227,7 @@ class Hi3InputAdapter:
 
     def build_prompts(self, sample: Sample) -> List[Dict[str, Any]]:
         """The HI3 chat-templated per-prompt entries (+ the image gates)."""
-        task, sys_type = self._resolve_task(sample.parts[0].control or {})
+        task, sys_type = self._resolve_task(sample.parts[0].control)
 
         if self.image_input:
             turns, images = sample.vision_conditioning()
@@ -367,7 +367,7 @@ class Hi3DitRecaptionInputAdapter:
         cot = turns[1].content
         gen_part = sample.frontier_gen_part(DiffusionSamplingParams)
         diff_params = gen_part.sampling_params
-        sys_type = (sample.parts[0].control or {}).get("sys_type") or self.sys_type
+        sys_type = sample.parts[0].control.get("sys_type") or self.sys_type
 
         base_kwargs = core_diff_kwargs(diff_params)
         height = int(base_kwargs["height"])
@@ -512,7 +512,7 @@ class Hi3DitRecaptionOutputAdapter(DitOutputAdapter):
 class Hi3T2iAdapter(ModelAdapter):
     """HI3 text → AR think → DiT image."""
 
-    stage_yaml = "hunyuan_image3_t2i_rl.yaml"
+    deploy_config = "hunyuan_image3_t2i_rl.yaml"
     omni_mode = "text-to-image"
     ar_lora_passthrough = True
     clear_cuda_visible = True
@@ -548,7 +548,7 @@ class Hi3T2iAdapter(ModelAdapter):
 class Hi3It2iAdapter(ModelAdapter):
     """HI3 image+text → AR recaption → DiT edited image."""
 
-    stage_yaml = "hunyuan_image3_it2i_rl.yaml"
+    deploy_config = "hunyuan_image3_it2i_rl.yaml"
     omni_mode = "text-to-image"
     ar_lora_passthrough = True
     clear_cuda_visible = True
@@ -582,9 +582,9 @@ class Hi3It2iAdapter(ModelAdapter):
 
 @register_adapter("hi3_i2t")
 class Hi3I2tAdapter(ModelAdapter):
-    """HI3 image+text → AR text (vendored comprehension YAML)."""
+    """HI3 image+text → AR text."""
 
-    stage_yaml = "hunyuan_image3_i2t.yaml"
+    deploy_config = "hunyuan_image3_i2t_rl.yaml"
     needs_sigmas = False
     ar_lora_passthrough = True
     clear_cuda_visible = True
@@ -617,9 +617,9 @@ class Hi3I2tAdapter(ModelAdapter):
 
 @register_adapter("hi3_t2t")
 class Hi3T2tAdapter(ModelAdapter):
-    """HI3 text → AR text (vendored comprehension YAML)."""
+    """HI3 text → AR text."""
 
-    stage_yaml = "hunyuan_image3_t2t.yaml"
+    deploy_config = "hunyuan_image3_ar_rl.yaml"
     needs_sigmas = False
     ar_lora_passthrough = True
     clear_cuda_visible = True
@@ -652,7 +652,7 @@ class Hi3T2tAdapter(ModelAdapter):
 class Hi3ArRecaptionAdapter(ModelAdapter):
     """Two-engine trainer's AR think/recaption producer."""
 
-    stage_yaml = "hunyuan_image3_ar_recaption_rl.yaml"
+    deploy_config = "hunyuan_image3_ar_recaption_rl.yaml"
     needs_sigmas = False
     ar_lora_passthrough = True
     clear_cuda_visible = True
@@ -681,7 +681,7 @@ class Hi3ArRecaptionAdapter(ModelAdapter):
 class Hi3DitRecaptionAdapter(ModelAdapter):
     """Standalone HI3 DiT — the two-engine trainer's image half."""
 
-    stage_yaml = "hunyuan_image3_dit_recaption_rl.yaml"
+    deploy_config = "hunyuan_image3_dit_recaption_rl.yaml"
     omni_mode = "text-to-image"
     clear_cuda_visible = True
     # HI3 two-engine stages are TP>1 — wake-time LoRA re-push must use the byte-copy transport.

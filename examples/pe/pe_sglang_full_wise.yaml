@@ -187,6 +187,7 @@ ar:
     stage_attr: ar
     clip_range: 1.0e-2 # AR track — diffusion track above keeps 1e-4
     clip_schedule: constant
+    sampling_temperature: ${sampling.ar.temperature}
     conditions_cls:
       _target_: hydra.utils.get_class
       path: unirl.models.qwen3.conditions.Qwen3ARConditions
@@ -227,9 +228,6 @@ rollout:
       backend: native
       pretrained_model_ckpt_path: ${oc.env:LLM_MODEL,Qwen/Qwen3-0.6B}
       tp_size: 1
-      max_new_tokens: 1024          # headroom for Qwen3 <think> + the revised prompt
-      temperature: 0.7
-      top_p: 0.9
       concurrency: 4
       engine_kwargs:
         mem_fraction_static: 0.25
@@ -258,8 +256,8 @@ rollout:
       # so sglang bounds its DiT-forward / VAE-decode peak memory.
       forward_batch_size: 4
       engine_kwargs:
-        # multimodal_gen sglang has torch_memory_saver on by default → its sleep
-        # already frees; no knob needed here.
+        # SGLang 0.5.19's native sleep path offloads active modules to pinned
+        # CPU memory; no additional memory-saver knob is needed here.
         mem_fraction_static: 0
         skip_server_warmup: true
         disable_cuda_graph: true
@@ -269,7 +267,7 @@ reward:
   # WISE reward via remote RewardService: one HTTP POST /score per rollout.
   # The `wise` scorer (Qwen3.5-VL judge) returns wiscore=(0.7C+0.2R+0.1A)/2 as its
   # first sub-metric; sub_metric_reduce="first" trains on that headline score.
-  # The judge sees the ORIGINAL user prompt (req.primitives['text'], not the AR
+  # The judge sees the ORIGINAL user prompt (prompt_source: original, not the AR
   # rewrite), replicated N*M → scores image-vs-original-intent.
   _target_: unirl.reward.service.RewardService
   backend:
@@ -284,6 +282,7 @@ reward:
       batch_size: 8
       timeout: 900.0                       # > RewardService score_timeout_s; covers VLM cold start
       input_kind: image
+      prompt_source: original              # score against the user's prompt, not the rewrite
       raise_on_failure: true
 
 data_source:

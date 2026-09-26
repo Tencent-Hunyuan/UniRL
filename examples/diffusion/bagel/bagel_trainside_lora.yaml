@@ -156,8 +156,7 @@ data_source:
 sampling:
   _target_: unirl.models.bagel.diffusion.BagelDiffusionParams
   num_inference_steps: 14              # STEPS (σ schedule = steps+1 = 15 points; == old 15-point bagel schedule, 14 stepped)
-  guidance_scale: 1.0                  # cfg=1 (bagel uses cfg_text_scale below; kept consistent)
-  cfg_text_scale: 1.0                  # cfg=1 → single-forward "No CFG" path in _forward_flow
+  guidance_scale: 1.0                  # cfg=1 → single-forward "No CFG" path in _forward_flow
   cfg_img_scale: 1.0
   cfg_interval: [0.0, 1.0]
   cfg_renorm_min: 0.0
@@ -169,7 +168,7 @@ sampling:
   seed: 42
   init_same_noise: false               # per-sample x_T (NoiseRecipe r{rollout}:{sample}); diverse GRPO groups
   # SDE steps: 2 random steps drawn from the early half [0, 7) of the 14-step schedule,
-  # resolved PER ROLLOUT via AllSDEScheduler → resolve_sde_indices (shared across the
+  # resolved PER ROLLOUT via AllSDEScheduler → get_sde_indices (shared across the
   # GRPO group, seeded by rollout_id). Uses UniRL's NATIVE timestep_fraction (early-half
   # restriction) + num_sde_steps (random-k) — zero framework change. Differs from
   # flow_grpo only in that the 2 SDE steps are SCATTERED, not a contiguous window;
