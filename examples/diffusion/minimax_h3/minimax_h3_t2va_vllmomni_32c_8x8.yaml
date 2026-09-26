@@ -1,0 +1,49 @@
+# @package _global_
+# MiniMax-H3 t2va on vLLM-Omni — 4 nodes x 8 GPUs, two-rollout lifecycle gate.
+#   8 root prompts x 8 samples = 64 rows
+#   rollout DP8 x 4 GPUs, resident reward DP32 (2 rows/rank),
+#   trainer HSDP shard8 x replicate4 (2 rows/rank, micro_batch_size=1).
+# The long-run recipe raises num_inference_steps and the SDE window only after
+# this lifecycle gate (LoRA sync, rollout, reward, replay, step, sleep) passes.
+
+defaults:
+  - minimax_h3_t2va_vllmomni_2x4_timeshare
+  - _self_
+
+num_devices: 32
+batch_size: 8
+num_rollouts: 2
+# Reward DP32 exceeds the 8 prompt trees, so reward scatters generated rows.
+reward_dispatch: row
+
+backend:
+  fsdp_cfg:
+    fsdp_mode: hybrid
+
+logging:
+  report_to_wandb: true
+  log_media: true
+  media_max_items: 2
+  run_name: h3-8p8s-vllmomni-hsdp8x4-rmdp32
+  tags: [minimax-h3, vllm-omni, 8p8s, hsdp8x4, rm-dp32]
+
+reward:
+  backend:
+    config:
+      scorers:
+        videopickscore:
+          config:
+            batch_size: 2
+        clap:
+          config:
+            batch_size: 2
+
+stack:
+  micro_batch_size: 1
+  num_updates_per_batch: 1
+
+sampling:
+  num_inference_steps: 2
+  # One replay transition for the first 8x8 memory/backward gate.
+  sde_indices: [0]
+  samples_per_prompt: 8

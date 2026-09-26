@@ -88,6 +88,11 @@ class T2AVCompositeScorer(RewardBackend):
                 if resp.successes and not all(resp.successes):
                     error = next((error for error in (resp.errors or []) if error), "unknown inner error")
                     raise RuntimeError(f"T2AVCompositeScorer: inner scorer {name!r} failed: {error}")
+                if not torch.isfinite(comp).all():
+                    bad = (~torch.isfinite(comp)).nonzero(as_tuple=False).flatten().tolist()
+                    raise RuntimeError(
+                        f"T2AVCompositeScorer: inner scorer {name!r} returned non-finite rewards at indices {bad[:8]}"
+                    )
                 component_rewards[name] = comp.tolist()
                 total = total + self.weights[name] * comp
 

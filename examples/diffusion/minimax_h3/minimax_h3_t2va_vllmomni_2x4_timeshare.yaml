@@ -1,0 +1,88 @@
+# @package _global_
+# MiniMax-H3 t2va Flow-GRPO on vLLM-Omni rollout — 1 node x 8 GPUs.
+#
+# Three roles time-share the same eight GPUs: an FSDP8 trainer, two four-GPU
+# rollout replicas (deploy_configs/minimax_h3_t2va_rl.yaml: HSDP4 x Ulysses4,
+# text encoder TP4), and a reward service at DP8. Everything else — model,
+# mixed-dtype, LoRA, CPS kernel, replay — is inherited from the trainside recipe.
+#
+# Launch:
+#   bash examples/run_experiment_multinode_taiji.sh diffusion/minimax_h3/minimax_h3_t2va_vllmomni_2x4_timeshare
+
+defaults:
+  - minimax_h3_t2va_trainside
+  - _self_
+
+num_devices: 8
+devices_per_node: 8
+batch_size: 8
+num_rollouts: 1
+layout: colocate
+reward_fraction: 0.0
+# The trainer parks on CPU while rollout and reward own the GPUs.
+train_resident: false
+eval_interval: 0
+
+logging:
+  report_to_wandb: false
+  log_media: false
+  run_name: h3-fsdp8-vllmomni-2x4-rmdp8
+  tags: [minimax-h3, t2va, flowgrpo, vllm-omni, audio, stereo]
+
+bundle:
+  config:
+    # The rollout re-pushes the trained adapter after every sleep/wake.
+    use_lora: true
+
+# The trainside base configures an in-process rollout whose keys this engine
+# does not take. Interpolating the whole node replaces it instead of merging
+# into it; later recipes still merge their overrides into `rollout:`.
+rollout: ${vllm_omni_rollout}
+vllm_omni_rollout:
+  _target_: unirl.rollout.engine.vllm_omni.engine.VLLMOmniRolloutEngine
+  model_config: ${bundle.config}
+  config:
+    _target_: unirl.rollout.engine.vllm_omni.config.VLLMOmniEngineConfig
+    model_path: ${bundle.config.pretrained_model_ckpt_path}
+    modality: minimax_h3_t2va
+    enable_sleep_mode: true
+    # GPUs per engine replica; the deploy config's stage devices must match.
+    tp_size: 4
+
+sync:
+  _target_: unirl.distributed.weight_sync.lora.LocalLoraWeightSync
+  param_prefix: "transformer."
+  adapter_name: default
+  # One engine hands the adapter to four worker processes.
+  copy: true
+  # The rollout renames and splits the adapter into the serving layout, so the
+  # trainer-side checksum comparison does not apply. The rollout pipeline
+  # rejects any LoRA module that fails to bind instead.
+  verify: false
+
+reward:
+  backend:
+    config:
+      scorers:
+        videopickscore:
+          base_device: cuda
+          config:
+            batch_size: 8
+            device: auto
+        clap:
+          base_device: cuda
+          config:
+            batch_size: 8
+            device: auto
+
+data_source:
+  args:
+    run:
+      data_path: ${oc.env:H3_PROMPT_FILE,examples/diffusion/minimax_h3/smoke_prompts.txt}
+      eval_data_path: ${oc.env:H3_PROMPT_FILE,examples/diffusion/minimax_h3/smoke_prompts.txt}
+
+sampling:
+  # Measured peak with one replay transition is already 92,188 MiB on a
+  # 97,871-MiB H20. Keep the default runnable until replay can backward one
+  # timestep at a time instead of retaining all selected steps in one graph.
+  sde_indices: [6]

@@ -45,6 +45,7 @@ def main(cfg: DictConfig) -> None:
         eval_sampling_cfg=cfg.get("eval_sampling"),
         eval_rewards_cfg=cfg.get("eval_rewards"),
         control=cfg.get("control"),
+        reward_dispatch=cfg.get("reward_dispatch", "prompt_tree"),
     )
     trainer.train(
         num_rollouts=cfg.get("num_rollouts", 100),

@@ -30,6 +30,9 @@ class VLLMOmniEngineConfig(BaseEngineConfig):
     modality: str = "hi3_t2i"
 
     enable_sleep_mode: bool = True
+    # Rollout ranks (GPUs) per engine replica; the deploy config's stage devices
+    # must match. Not the DiT tensor-parallel degree, which the deploy config owns.
+    tp_size: int = 1
 
     deploy_config_override: Optional[str] = None
 
@@ -44,6 +47,7 @@ class VLLMOmniEngineConfig(BaseEngineConfig):
 
     def __post_init__(self) -> None:
         self.modality = str(self.modality or "").strip().lower()
+        require(self.tp_size >= 1, f"VLLMOmniEngineConfig.tp_size must be >= 1; got {self.tp_size}")
         from unirl.rollout.engine.vllm_omni.adapters import registered_adapters
 
         valid = registered_adapters()

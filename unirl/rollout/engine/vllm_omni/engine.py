@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
-from typing import Any, Dict, List, Optional
+from contextlib import contextmanager
+from typing import Any, Dict, Iterator, List, Optional
 
 import torch
 
@@ -21,10 +23,31 @@ from unirl.types.sample import Sample
 logger = logging.getLogger(__name__)
 
 
+@contextmanager
+def _cuda_visible_devices(devices: Optional[List[str]]) -> Iterator[None]:
+    """Expose one TP group's devices to the engine subprocesses spawned inside the block."""
+    if devices is None:
+        yield
+        return
+    previous = os.environ.get("CUDA_VISIBLE_DEVICES")
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(devices)
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = previous
+
+
 class VLLMOmniRolloutEngine(BaseRolloutEngine):
     """Rollout engine backed by vllm-omni's ``Omni`` orchestrator (v2 layout)."""
 
     _component_name = "vllm_omni"
+
+    # ``config.tp_size > 1`` groups that many ranks into one engine replica:
+    # tp_rank 0 boots ``Omni`` over the group's devices, the others are no-op shells.
+    _accepts_rollout_tp_kwargs = True
 
     def __init__(
         self,
@@ -35,7 +58,19 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
         rank: Optional[int] = None,
         model_config: Any = None,
         ports: Optional[VLLMOmniPorts] = None,
+        tp_rank: int = 0,
+        tp_size: int = 1,
+        tp_visible_devices: Optional[List[str]] = None,
+        pp_rank: int = 0,
+        pp_size: int = 1,
+        ep_rank: int = 0,
+        ep_size: int = 1,
     ) -> None:
+        del pp_rank, ep_rank
+        require(
+            pp_size == 1 and ep_size == 1,
+            f"VLLMOmniRolloutEngine groups replicas by tp_size only; got pp_size={pp_size}, ep_size={ep_size}",
+        )
         self.cfg = config
         self._version = 0
         self._generate_lock = threading.Lock()
@@ -51,9 +86,23 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
         # engine partially awake/asleep. Normalize through sleep before another
         # wake; generate refuses until residency is consistent again.
         self._transition_failed = False
+        self._is_tp_zero = tp_rank == 0
+        if not self._is_tp_zero:
+            self.adapter = None
+            self._backend = None
+            self._weight_sync = None
+            logger.info(
+                "VLLMOmniRolloutEngine: tp_rank=%d/%d is a no-op shell (rank=%s); the engine is hosted by tp_rank=0",
+                tp_rank,
+                tp_size,
+                rank,
+            )
+            return
         logger.info(
-            "VLLM-Omni engine config (complete typed config): %s; model_config_available=%s model_config=%s",
+            "VLLM-Omni engine config (complete typed config): %s; tp_group=%s model_config_available=%s "
+            "model_config=%s",
             config,
+            tp_visible_devices,
             model_config is not None,
             model_config,
         )
@@ -72,7 +121,8 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
             ports=ports,
             extra=self.adapter.boot_kwargs(),
         )
-        self._backend = VLLMOmniBackend.boot(intent)
+        with _cuda_visible_devices(tp_visible_devices):
+            self._backend = VLLMOmniBackend.boot(intent)
 
         self._weight_sync = WeightSync(
             self._backend,
@@ -87,6 +137,8 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
     def generate(self, sample: Sample) -> Sample:
         """Generate one whole DP shard synchronously."""
+        if not self._is_tp_zero:
+            return None
         return self._generate_locked(sample)
 
     def _generate_locked(self, sample: Sample) -> Sample:
@@ -130,6 +182,8 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def sleep(self) -> None:
         """Sleep every stage at level 1 (AR via EngineCore, diffusion via worker task)."""
+        if not self._is_tp_zero:
+            return
         if self._is_offloaded and not self._transition_failed:
             return
         try:
@@ -146,6 +200,8 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def wake_up(self) -> None:
         """Wake every stage (AR via EngineCore, diffusion via worker task) + restore LoRA."""
+        if not self._is_tp_zero:
+            return
         if self._transition_failed:
             # Recover an unknown partial stage state to one known boundary
             # before attempting another wake. If this retry fails, retain the
@@ -206,6 +262,8 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
         return self._is_offloaded
 
     def health_check(self) -> bool:
+        if not self._is_tp_zero:
+            return True
         return self._backend.ping()
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
@@ -238,6 +296,8 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
 
     def tp_per_stage(self) -> Dict[int, int]:
         """``{stage_id: tensor_parallel_size}`` per stage (parsed from the"""
+        if not self._is_tp_zero:
+            return {}
         return self._backend.tp_per_stage()
 
     def update_weights_from_ipc(
@@ -335,6 +395,9 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
         *,
         peft_config: Optional[dict] = None,
     ) -> None:
+        if not self._is_tp_zero:
+            return
+        lora_tensors, peft_config = self.adapter.serving_lora(lora_tensors, peft_config)
         self._weight_sync.set_lora_from_tensors(adapter_name, lora_tensors, peft_config=peft_config)
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
@@ -345,7 +408,10 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
         *,
         peft_config: Optional[dict] = None,
     ) -> None:
-        """Byte-copy LoRA push for the HI3 two-engine trainer."""
+        """Byte-copy LoRA push for engines whose workers cannot share one CUDA-IPC handle."""
+        if not self._is_tp_zero:
+            return
+        lora_tensors, peft_config = self.adapter.serving_lora(lora_tensors, peft_config)
         self._weight_sync.set_lora_from_tensors_copy(adapter_name, lora_tensors, peft_config=peft_config)
 
     def loaded_param_checksums(self, *, names: List[str]) -> dict:
@@ -357,6 +423,8 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
     @property
     def lora_dirty(self) -> bool:
         """True when LoRA is in use but the adapter must be (re)pushed."""
+        if not self._is_tp_zero:
+            return False
         return self._weight_sync.lora_dirty
 
 
