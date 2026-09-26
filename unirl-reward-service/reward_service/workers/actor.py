@@ -1,14 +1,15 @@
 """Ray actor wrapping a single scorer instance.
 
-Each actor owns its GPU(s) exclusively (num_gpus set at actor options
-from the reward config). The actor is a thin forwarder: it instantiates
-the scorer on first use, then delegates score() calls. Scorer classes
-live outside Ray and are pickled by name to avoid serializing heavy
-model state.
+Each actor owns its Ray GPU allocation (integer and exclusive by default,
+or fractional for an explicitly configured MPS client). The actor is a thin
+forwarder: it instantiates the scorer on first use, then delegates score()
+calls. Scorer classes live outside Ray and are pickled by name to avoid
+serializing heavy model state.
 """
 
 from __future__ import annotations
 
+import gc
 import os
 from typing import Any
 
@@ -59,6 +60,7 @@ class ScorerActor:
         logger.info("ScorerActor initializing scorer=%s params=%s", scorer_name, params)
         self.scorer = cls(**params)
         self.scorer_name = scorer_name
+        self._shutting_down = False
 
     @staticmethod
     def _log_venv_info(scorer_name: str) -> None:
@@ -82,6 +84,8 @@ class ScorerActor:
                 pass
 
     def score(self, items: list[ScoreItem]) -> list[dict[str, float]]:
+        if self._shutting_down:
+            raise RuntimeError(f"ScorerActor[{self.scorer_name}] is shutting down")
         return self.scorer.score(items)
 
     def sub_metric_names(self) -> tuple[str, ...]:
@@ -89,3 +93,26 @@ class ScorerActor:
 
     def ping(self) -> str:
         return f"{self.scorer_name}:ready"
+
+    def shutdown(self) -> str:
+        if self._shutting_down:
+            return f"{self.scorer_name}:already-shutting-down"
+        self._shutting_down = True
+        self.scorer.drain()
+        try:
+            import torch
+
+            cuda_initialized = torch.cuda.is_available() and torch.cuda.is_initialized()
+            if cuda_initialized:
+                torch.cuda.synchronize()
+        except ImportError:
+            torch = None
+            cuda_initialized = False
+
+        self.scorer.close()
+        del self.scorer
+        gc.collect()
+        if cuda_initialized and torch is not None:
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        return f"{self.scorer_name}:drained"

@@ -1,0 +1,29 @@
+server:
+  host: 127.0.0.1
+  port: 8080
+  score_timeout_s: 300.0
+
+rewards:
+  - name: clip
+    scorer: clip
+    runtime_env: envs/clip.txt
+    num_replicas: 1
+    num_gpus: 0.5
+    num_cpus: 2
+    max_concurrency: 4
+    params:
+      model_name: local-pickscore-clip
+      weights_path: /path/to/PickScore_v1
+      dtype: float16
+
+  - name: pickscore
+    scorer: pickscore
+    runtime_env: envs/pickscore.txt
+    num_replicas: 1
+    num_gpus: 0.5
+    num_cpus: 2
+    max_concurrency: 4
+    params:
+      model_name: local-pickscore
+      weights_path: /path/to/PickScore_v1
+      dtype: float16

@@ -1,0 +1,42 @@
+server:
+  host: 0.0.0.0
+  port: 8080
+  score_timeout_s: 120
+
+# Managed mode is single-node and starts MPS before Ray. For a Ray cluster,
+# run `scripts/mps.sh start` on every node and use mode: external with the same
+# pipe_directory.
+mps:
+  mode: managed
+
+rewards:
+  - name: clip
+    scorer: clip
+    runtime_env: envs/clip.txt
+    num_replicas: 1
+    num_gpus: 0.5
+    num_cpus: 2
+    max_concurrency: 4
+    mps:
+      # FP16 CLIP was correct on H20 only at 100% on the qualified stack.
+      active_thread_percentage: 100
+      device_memory_limit: 20GiB
+    params:
+      model_name: openai/clip-vit-large-patch14
+      weights_path: /path/to/RewardModel/CLIP-ViT-L-14
+      dtype: float16
+
+  - name: pickscore
+    scorer: pickscore
+    runtime_env: envs/pickscore.txt
+    num_replicas: 1
+    num_gpus: 0.5
+    num_cpus: 2
+    max_concurrency: 4
+    mps:
+      active_thread_percentage: 100
+      device_memory_limit: 20GiB
+    params:
+      model_name: yuvalkirstain/PickScore_v1
+      weights_path: /path/to/RewardModel/PickScore_v1
+      dtype: float16

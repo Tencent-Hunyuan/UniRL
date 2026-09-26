@@ -82,6 +82,16 @@ python -m reward_service --config configs/service.yaml
 
 (The console-script entry point `unirl-reward-service --config configs/service.yaml` is equivalent to `python -m reward_service`.)
 
+### CUDA MPS (opt-in)
+
+Qualified CLIP and PickScore actors can share one GPU via NVIDIA MPS.
+`mps.mode: managed` starts the daemon before local Ray. Only those two
+scorers are qualified; FP16 CLIP needs `active_thread_percentage: 100`.
+
+```bash
+python -m reward_service --config configs/service.mps-h20.example.yaml
+```
+
 ### Multi-host deployment
 
 ```bash
@@ -195,9 +205,7 @@ Other endpoints:
 ## Tests
 
 ```bash
-pytest -m "not gpu and not slow and not integration"   # CPU-only unit tests
-pytest tests/integration/ -m integration -v            # venv-install integration tests (need Ray + network)
-pytest                                                 # full suite (needs GPU)
+pytest scripts/test_bench_concurrent.py scripts/test_mps.py
 ```
 
 ## Venv check
@@ -233,6 +241,23 @@ python3 scripts/bench_concurrent.py \
 ```
 
 The output reports each request's min / mean / max latency plus p50/p90/p95/p99, throughput, transport errors, and server-side per-reward failure counts. The sweep and per-reward modes end with a side-by-side comparison table.
+
+For the CUDA MPS experiment in
+[#463](https://github.com/Tencent-Hunyuan/UniRL/issues/463), launch
+[`configs/service.h20-dedicated.example.yaml`](configs/service.h20-dedicated.example.yaml)
+or [`configs/service.h20-shared.example.yaml`](configs/service.h20-shared.example.yaml)
+and run the same client workload against each topology:
+
+```bash
+python3 scripts/bench_concurrent.py \
+    --url http://localhost:8080 --sweep 1 4 16 --batch-sweep 1 4 8 \
+    --total 60 --repetitions 3 --rewards clip,pickscore \
+    --output dedicated.json
+```
+
+Missing or non-finite scores count as request failures. Qualify
+`CUDA_MPS_ACTIVE_THREAD_PERCENTAGE` per scorer and dtype before using a
+sub-100% limit.
 
 ## Design conventions
 
