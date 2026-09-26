@@ -20,7 +20,7 @@
 #     sync (sd3/qwen v2 use it). Pushes the trained LoRA adapter into the
 #     co-located sibling engine in-process; the engine runs base + adapter,
 #     which is mathematically the merged model the separate recipe pushed.
-#     hv15's stage config sets enable_lora/max_lora_rank=64 so the adapter
+#     hv15's deploy config sets enable_lora/max_lora_rank=64 so the adapter
 #     actually applies. This avoids the CUDA-IPC path's SGLang dependency,
 #     which the vllm-omni-only venv (two-venv image) does not provide.
 #
@@ -128,6 +128,9 @@ rollout:
     omni_extra:
       init_timeout: 3600
       stage_init_timeout: 1800
+      # Reuse text-encoder outputs across GRPO siblings; size >= distinct prompts in flight per worker.
+      # enable_prompt_embed_cache: true
+      # prompt_embed_cache_size: 32
 
 reward:
   _target_: unirl.reward.service.RewardService

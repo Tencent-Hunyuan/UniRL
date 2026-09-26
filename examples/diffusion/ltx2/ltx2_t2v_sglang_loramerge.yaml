@@ -195,7 +195,6 @@ sync:
   adapter_name: default
   bucket_size_mb: 512
   flush_cache: true
-  name_remap: {"*": "transformer.*"}
 
 logging:
   report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,true}}

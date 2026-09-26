@@ -11,7 +11,6 @@
 
 # --- build, packaging, CI ---------------------------------------------------
 /pyproject.toml                         @CjhHa1 @celve
-/setup.py                               @CjhHa1 @celve
 /requirements.txt                       @CjhHa1 @celve
 /.pre-commit-config.yaml                @haonan3 @celve
 /.github/                               @celve @haonan3

@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional
 import torch
 import torch.nn.functional as F
 
-from unirl.reward.base import BaseRewardComponentSpec
+from unirl.reward.base import PromptRewardComponentSpec
 from unirl.reward.local.device import resolve_device
 from unirl.types.reward import RewardRequest, RewardResponse
 
@@ -82,6 +82,7 @@ class CLAPRewardScorer(LocalRewardBackend):
         super().__init__(
             device=resolve_device(config.device, base_device),
             batch_size=config.batch_size,
+            prompt_source=config.prompt_source,
             model_id=config.model_id,
         )
 
@@ -263,7 +264,7 @@ class CLAPRewardScorer(LocalRewardBackend):
         return torch.stack(scores)
 
     def _reward_prompts(self, request: RewardRequest) -> List[str]:
-        prompts = request.prompts
+        prompts = self.prompts(request)
         if self.prompt_metadata_key is None:
             return prompts
 
@@ -311,7 +312,7 @@ class CLAPRewardScorer(LocalRewardBackend):
 
         metadata = request.metadata or []
         resolved: List[List[str]] = []
-        for index in range(len(request.prompts)):
+        for index in range(len(self.prompts(request))):
             row = metadata[index] if index < len(metadata) else None
             candidates = row.get(self.event_prompts_metadata_key) if isinstance(row, dict) else None
             if not isinstance(candidates, (list, tuple)):
@@ -527,7 +528,7 @@ class CLAPRewardScorer(LocalRewardBackend):
 
 
 @dataclass
-class CLAPSpec(BaseRewardComponentSpec):
+class CLAPSpec(PromptRewardComponentSpec):
     """Typed config for the CLAP audio-text reward component."""
 
     batch_size: int = 8

@@ -457,8 +457,7 @@ class Qwen3OmniThinkerOutputAdapter(Hi3TextOutputAdapter):
         values: List[int] = []
         for group in per_request:
             output = cls._stage0(group)
-            request_output = getattr(output, "request_output", None)
-            completions = getattr(request_output, "outputs", None) or []
+            completions = getattr(output, "outputs", None) or []
             finish_reason = getattr(completions[0], "finish_reason", None) if completions else None
             values.append(int(mapping.get(str(finish_reason), SegmentStatus.PENDING)))
         return torch.tensor(values, dtype=torch.long)
@@ -495,7 +494,7 @@ class Qwen3OmniThinkerOutputAdapter(Hi3TextOutputAdapter):
 class Qwen3OmniThinkerAdapter(ModelAdapter):
     """Qwen3-Omni Thinker — text/video → AR text (single stage, TP>1, LoRA)."""
 
-    stage_yaml = "qwen3_omni_thinker_only_rl_1x4.yaml"
+    deploy_config = "qwen3_omni_thinker_only_rl_1x4.yaml"
     omni_mode = None
     needs_sigmas = False
     needs_driver_tokenizer = False

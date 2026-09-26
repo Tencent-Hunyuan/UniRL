@@ -44,8 +44,8 @@ never mutates the input Sample — it returns a fresh one. Per call it:
 
 1. **Refuses precomputed rewards** — raises if the frontier Part already has
    `rewards` (actor-side scoring is the only writer).
-2. **Pairs input with output** — the conditioning (`Sample.conditioning`) with the
-   media in the frontier Part's `primitive`, already row-aligned (no expansion).
+2. **Builds the request** — pairs the frontier's generated media with its aligned
+   prompts and non-text conditioning.
 3. **Scores** — hands a typed `RewardRequest` to `backend.compute_rewards`, getting
    back rewards, per-component rewards, and per-sample success flags.
 4. **Fails fast** — raises and names the sample if any failed.
@@ -130,3 +130,5 @@ new remote reward needs no UniRL code — add it to the server and list its name
   unbounded.
 - **`base_device` is ignored by the remote backend** (it's HTTP-only); local
   scorers honor it, falling back to CPU with a warning if CUDA is unavailable.
+- **Prompt-based rewards use the generation prompt by default.** Set
+  `prompt_source: original` to score against the original user prompt instead.

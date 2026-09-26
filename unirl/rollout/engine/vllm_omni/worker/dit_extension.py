@@ -19,7 +19,11 @@ class DiTWeightSyncExtension(
 ):
     """Receive-side extension for the HI3 DiT stage."""
 
-    pass
+    def sleep(self, level: int = 1) -> int:
+        """Drop cached prompt embeddings first: they live outside the CuMem pools that ``allocator.sleep`` frees."""
+        if self.model_runner is not None:
+            self.model_runner.clear_prompt_embed_cache()
+        return super().sleep(level)
 
 
 __all__ = ["DiTWeightSyncExtension"]

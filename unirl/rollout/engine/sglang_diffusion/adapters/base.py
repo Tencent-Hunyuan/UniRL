@@ -88,8 +88,7 @@ class ModelAdapter(ABC):
 
     def lora_spec(self) -> Tuple[str, List[str]]:
         prefix = str(self.model_config.weight_sync_param_name_prefix or "")
-        target_modules = list(self.cfg.target_modules or ("transformer",))
-        return prefix, target_modules
+        return prefix, ["transformer"]
 
     def validate(self) -> None:
         mc = self.model_config

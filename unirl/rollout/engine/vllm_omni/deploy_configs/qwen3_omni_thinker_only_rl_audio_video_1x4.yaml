@@ -1,0 +1,30 @@
+# Qwen3-Omni Thinker-only audio-in-video deployment, TP=4.
+pipeline: unirl_qwen3_omni_thinker
+async_chunk: false
+distributed_executor_backend: mp
+dtype: bfloat16
+trust_remote_code: true
+enable_prefix_caching: false
+enable_chunked_prefill: true
+
+stages:
+  - stage_id: 0
+    devices: "0,1,2,3"
+    tensor_parallel_size: 4
+    gpu_memory_utilization: 0.35
+    max_num_seqs: 1
+    max_num_batched_tokens: 32768
+    limit_mm_per_prompt:
+      audio: 1
+      video: 1
+      image: 0
+    mm_processor_cache_gb: 0
+    load_format: safetensors
+    enforce_eager: false
+    enable_lora: true
+    max_lora_rank: 64
+    max_loras: 1
+    worker_extension_cls: unirl.rollout.engine.vllm_omni.worker.qwen3_omni_ar_extension.Qwen3OmniARWeightSyncExtension
+    enable_sleep_mode: true
+    logprobs_mode: processed_logprobs
+    disable_log_stats: true
