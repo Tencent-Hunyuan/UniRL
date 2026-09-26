@@ -539,10 +539,10 @@ class BaseFSDP2Backend(Remote):
         return adapter_of_lora_key(key) not in self._frozen_adapters
 
     def _check_frozen_adapters(self, lora_config: Optional[Dict[str, object]]) -> None:
-        """Refuse to resume when the checkpoint's recorded frozen adapters differ from the live ones."""
+        """Refuse to resume a checkpoint trained against teachers with a different teacher set."""
         recorded = (lora_config or {}).get("frozen_adapters")
         live = self._frozen_adapters
-        if recorded is None or recorded == live:
+        if not recorded or recorded == live:
             return
         added = sorted(set(live) - set(recorded))
         removed = sorted(set(recorded) - set(live))

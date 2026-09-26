@@ -9,8 +9,9 @@ import os
 import re
 from contextlib import contextmanager
 from functools import partial
-from typing import Iterator, Optional, Sequence, Union
+from typing import Dict, Iterator, Optional, Sequence, Union
 
+import torch
 from torch import nn
 
 from unirl.models.types.post_materialize import defer_after_materialize
@@ -223,7 +224,7 @@ def inject_frozen_adapter(
     path: str,
     trainable_adapter: str = "default",
 ) -> str:
-    """Inject a frozen LoRA adapter now, load its weights after materialization; returns the weight sha256."""
+    """Inject a frozen LoRA adapter now, load its weights after materialization; returns its content sha256."""
     from peft import LoraConfig, inject_adapter_in_model
     from peft.tuners.lora import LoraLayer
 
@@ -264,10 +265,18 @@ def inject_frozen_adapter(
     if hasattr(model, "_hf_peft_config_loaded"):
         model._hf_peft_config_loaded = True
 
+    if weight_path.endswith(".safetensors"):
+        from safetensors.torch import load_file
+
+        raw = load_file(weight_path, device="cpu")
+    else:
+        raw = torch.load(weight_path, map_location="cpu", weights_only=True)
+    weights = {_to_model_lora_key(k, name): v for k, v in raw.items()}
+
     # Weights need real (sharded) storage: FSDP/VeOmni materialize after injection.
     defer_after_materialize(
         model,
-        partial(_load_frozen_adapter, name=name, weight_path=weight_path),
+        partial(_load_frozen_adapter, name=name, weights=weights, weight_path=weight_path),
     )
 
     if _current_rank() == 0:
@@ -282,7 +291,7 @@ def inject_frozen_adapter(
             total,
             n_params,
         )
-    return _file_sha256(weight_path)
+    return _weights_sha256(weights)
 
 
 _LORA_BANKS = ("lora_A", "lora_B", "lora_embedding_A", "lora_embedding_B")
@@ -314,23 +323,13 @@ def _to_model_lora_key(key: str, name: str) -> str:
     return ".".join(parts[: idx + 1] + [name] + parts[idx + 1 :])
 
 
-def _load_frozen_adapter(model: nn.Module, *, name: str, weight_path: str) -> None:
-    """Post-materialize op: load ``weight_path`` into the (already frozen) adapter ``name`` on every rank."""
+def _load_frozen_adapter(model: nn.Module, *, name: str, weights: Dict[str, torch.Tensor], weight_path: str) -> None:
+    """Post-materialize op: load ``weights`` into the (already frozen) adapter ``name`` on every rank."""
     from unirl.train.backend.sharded_state import load_model_state_dict
-
-    if weight_path.endswith(".safetensors"):
-        from safetensors.torch import load_file
-
-        raw = load_file(weight_path, device="cpu")
-    else:
-        import torch
-
-        raw = torch.load(weight_path, map_location="cpu", weights_only=True)
 
     model_sd = model.state_dict()
     expected = {k for k in model_sd if adapter_of_lora_key(k) == name}
-    mapped = {_to_model_lora_key(k, name): v for k, v in raw.items()}
-    unexpected = sorted(set(mapped) - expected)
+    unexpected = sorted(set(weights) - expected)
     if unexpected:
         raise ValueError(
             f"inject_frozen_adapter: {len(unexpected)} tensor(s) in {weight_path!r} matched no "
@@ -338,13 +337,13 @@ def _load_frozen_adapter(model: nn.Module, *, name: str, weight_path: str) -> No
             "line up with this model — refusing a silently partial teacher."
         )
     # peft zero-inits ``lora_B``: a missing tensor would silently null the teacher on that layer.
-    missing = sorted(expected - set(mapped))
+    missing = sorted(expected - set(weights))
     if missing:
         raise ValueError(
             f"inject_frozen_adapter: {len(missing)} tensor(s) of adapter {name!r} are absent from "
             f"{weight_path!r} (first: {missing[:3]}) — refusing a partial teacher."
         )
-    for key, value in mapped.items():
+    for key, value in weights.items():
         want = model_sd[key].shape
         if tuple(value.shape) != tuple(want):
             raise ValueError(
@@ -352,17 +351,20 @@ def _load_frozen_adapter(model: nn.Module, *, name: str, weight_path: str) -> No
                 f"model expects {tuple(want)} (adapter rank mismatch?)."
             )
     # Every rank holds the full (small) adapter dict; DCP slices each rank's own shard.
-    load_model_state_dict(model, mapped, strict=False, broadcast_from_rank0=False)
+    # set_model_state_dict fills its input with every model entry, hence the copy.
+    load_model_state_dict(model, dict(weights), strict=False, broadcast_from_rank0=False)
 
     if _current_rank() == 0:
-        logger.info("_load_frozen_adapter(%r): %d tensor(s) from %s", name, len(mapped), weight_path)
+        logger.info("_load_frozen_adapter(%r): %d tensor(s) from %s", name, len(weights), weight_path)
 
 
-def _file_sha256(path: str) -> str:
+def _weights_sha256(weights: Dict[str, torch.Tensor]) -> str:
+    """Content hash over sorted ``(key, dtype, shape, bytes)``; independent of file format and metadata."""
     digest = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            digest.update(chunk)
+    for key in sorted(weights):
+        tensor = weights[key].detach().cpu().contiguous()
+        digest.update(f"{key}|{tensor.dtype}|{tuple(tensor.shape)}|".encode())
+        digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
     return digest.hexdigest()
 
 
