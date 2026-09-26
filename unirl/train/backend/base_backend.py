@@ -29,9 +29,9 @@ from unirl.train.backend.sharded_state import (
     sharded_optimizer_state_dict,
     trainable_params,
 )
-from unirl.train.configs import EmaFullConfig, EmaLoraConfig, FSDPConfig, LoraConfig, normalize_frozen_adapters
+from unirl.train.configs import EmaFullConfig, EmaLoraConfig, FSDPConfig, LoraConfig
 from unirl.train.ema import EMA, Shadow, inject_mirror, inject_nft, make_decay_fn
-from unirl.train.lora import adapter_of_lora_key, inject_frozen_adapter, inject_lora, resolve_target_modules_pattern
+from unirl.train.lora import FrozenAdapters, inject_lora, resolve_target_modules_pattern
 from unirl.train.optim import build_lr_scheduler, build_optimizer
 from unirl.utils.distributed_utils import find_dtensor_mesh, init_gloo_group
 
@@ -123,7 +123,7 @@ class BaseFSDP2Backend(Remote):
     _optimizer_step_count: int
     _eval_ema_active: bool
     _lora_meta: Optional[Dict[str, object]]
-    _frozen_adapters: Dict[str, str]  # name -> weight sha256
+    _frozen_adapters: FrozenAdapters
     _rollout_adapter_name: str
     _defer_grad_sync: bool
     _grad_sync_enabled: bool
@@ -149,7 +149,7 @@ class BaseFSDP2Backend(Remote):
         ema_cfg: Optional[EmaFullConfig],
     ) -> Optional[Shadow]:
         """Structural injection on the (possibly meta) trainable module."""
-        self._frozen_adapters = {}
+        self._frozen_adapters = FrozenAdapters()
         shadow: Optional[Shadow] = None
         if ema_lora_cfg is not None:
             shadow = inject_nft(
@@ -177,8 +177,7 @@ class BaseFSDP2Backend(Remote):
                 task_type=lora_cfg.task_type,
             )
             # Frozen sibling adapters (e.g. OPD teachers) — see ../readme.md Gotchas.
-            for spec in normalize_frozen_adapters(getattr(lora_cfg, "frozen_adapters", None)):
-                self._frozen_adapters[spec.name] = inject_frozen_adapter(model, name=spec.name, path=spec.path)
+            self._frozen_adapters = FrozenAdapters.inject(model, getattr(lora_cfg, "frozen_adapters", None))
         if ema_cfg is not None:
             shadow = inject_mirror(model, prefix=ema_cfg.shadow_prefix)
         return shadow
@@ -245,7 +244,7 @@ class BaseFSDP2Backend(Remote):
                 "dropout": active_lora.dropout,
                 "bias": active_lora.bias,
                 "task_type": active_lora.task_type,
-                "frozen_adapters": dict(self._frozen_adapters),
+                "frozen_adapters": dict(self._frozen_adapters.shas),
             }
             if active_lora is not None
             else None
@@ -399,7 +398,7 @@ class BaseFSDP2Backend(Remote):
         self._reject_meta(operation="save", checkpoint_format="dcp", mode=mode)
         model_sd = drop_meta_entries(sharded_model_state_dict(self.model))
         if mode == "adapter":
-            model_sd = {k: v for k, v in model_sd.items() if self._is_student_lora_key(k)}
+            model_sd = {k: v for k, v in model_sd.items() if self._frozen_adapters.is_trainable_lora_key(k)}
         sharded_state: Dict[str, object] = {
             "model": model_sd,
             "optim": sharded_optimizer_state_dict(self.model, self.optimizer),
@@ -484,10 +483,10 @@ class BaseFSDP2Backend(Remote):
         mode = checkpoint.get("save_mode", "full")
         strict = mode == "full"
         self._reject_meta(operation="load", checkpoint_format="torch", mode=mode)
-        self._check_frozen_adapters(checkpoint.get("lora_config"))
+        self._frozen_adapters.check_resume((checkpoint.get("lora_config") or {}).get("frozen_adapters"))
         policy_state = checkpoint["policy_state_dict"]
         if mode == "adapter":
-            policy_state = {k: v for k, v in policy_state.items() if self._is_student_lora_key(k)}
+            policy_state = {k: v for k, v in policy_state.items() if self._frozen_adapters.is_trainable_lora_key(k)}
         self._load_model_state(policy_state, strict=strict)
         self._load_optimizer_state(checkpoint["optimizer_state_dict"])
         if self.scheduler is not None and "scheduler_state_dict" in checkpoint:
@@ -514,10 +513,10 @@ class BaseFSDP2Backend(Remote):
         has_meta_params = any(p.is_meta for p in self.model.parameters())
         strict = mode == "full" and not has_meta_params
 
-        self._check_frozen_adapters(meta.get("lora_config"))
+        self._frozen_adapters.check_resume((meta.get("lora_config") or {}).get("frozen_adapters"))
         model_sd = drop_meta_entries(sharded_model_state_dict(self.model))
         if mode == "adapter":
-            model_sd = {k: v for k, v in model_sd.items() if self._is_student_lora_key(k)}
+            model_sd = {k: v for k, v in model_sd.items() if self._frozen_adapters.is_trainable_lora_key(k)}
         sharded_state: Dict[str, object] = {
             "model": model_sd,
             "optim": sharded_optimizer_state_dict(self.model, self.optimizer),
@@ -531,31 +530,6 @@ class BaseFSDP2Backend(Remote):
         if meta.get("optimizer_step_count") is not None:
             self._optimizer_step_count = int(meta["optimizer_step_count"])
         return int(meta.get("step") or 0)
-
-    def _is_student_lora_key(self, key: str) -> bool:
-        """True for LoRA keys of a non-frozen adapter (frozen teachers never enter adapter checkpoints)."""
-        if "lora_A" not in key and "lora_B" not in key:
-            return False
-        return adapter_of_lora_key(key) not in self._frozen_adapters
-
-    def _check_frozen_adapters(self, lora_config: Optional[Dict[str, object]]) -> None:
-        """Refuse to resume a checkpoint trained against teachers with a different teacher set."""
-        recorded = (lora_config or {}).get("frozen_adapters")
-        live = self._frozen_adapters
-        if not recorded or recorded == live:
-            return
-        added = sorted(set(live) - set(recorded))
-        removed = sorted(set(recorded) - set(live))
-        changed = sorted(
-            f"{name} ({recorded[name][:12]}... -> {live[name][:12]}...)"
-            for name in set(recorded) & set(live)
-            if recorded[name] != live[name]
-        )
-        raise RuntimeError(
-            f"{type(self).__name__}.load: frozen_adapters differ from the checkpoint's "
-            f"(added: {added}, removed: {removed}, weights changed: {changed}). "
-            "Resume with the same teacher checkpoints or start a new run."
-        )
 
     def _reject_meta(
         self,
@@ -685,7 +659,7 @@ class BaseFSDP2Backend(Remote):
     def _gather_model_state(self, mode: str) -> StateDict:
         """Rank-0 model state for the single-file checkpoint."""
         if mode == "adapter":
-            return gather_lora_state_dict(self.model, keep=self._is_student_lora_key)
+            return gather_lora_state_dict(self.model, keep=self._frozen_adapters.is_trainable_lora_key)
         return gather_state_dict(self.model)
 
     def _load_model_state(self, model_state: StateDict, *, strict: bool) -> None:

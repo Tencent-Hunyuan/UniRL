@@ -9,12 +9,13 @@ import os
 import re
 from contextlib import contextmanager
 from functools import partial
-from typing import Dict, Iterator, Optional, Sequence, Union
+from typing import Any, Dict, Iterator, Optional, Sequence, Union
 
 import torch
 from torch import nn
 
 from unirl.models.types.post_materialize import defer_after_materialize
+from unirl.train.configs import normalize_frozen_adapters
 from unirl.utils.peft_merge import _strip_peft_prefix
 
 logger = logging.getLogger(__name__)
@@ -302,7 +303,7 @@ _LORA_BANK_RE = re.compile(r"\.lora_(?:embedding_)?[AB](?=\.|$)")
 _LORA_ADAPTER_RE = re.compile(r"\.lora_(?:embedding_)?[AB]\.([^.]+)")
 
 
-def adapter_of_lora_key(key: str) -> Optional[str]:
+def _adapter_of_lora_key(key: str) -> Optional[str]:
     """Adapter name of a model state-dict LoRA key (``...lora_A.<adapter>.weight``), else None."""
     match = _LORA_ADAPTER_RE.search(key)
     return match.group(1) if match else None
@@ -313,7 +314,7 @@ def _load_frozen_adapter(model: nn.Module, *, name: str, weights: Dict[str, torc
     from unirl.train.backend.sharded_state import load_model_state_dict
 
     model_sd = model.state_dict()
-    expected = {k for k in model_sd if adapter_of_lora_key(k) == name}
+    expected = {k for k in model_sd if _adapter_of_lora_key(k) == name}
     unexpected = sorted(set(weights) - expected)
     if unexpected:
         raise ValueError(
@@ -353,6 +354,41 @@ def _weights_sha256(weights: Dict[str, torch.Tensor]) -> str:
     return digest.hexdigest()
 
 
+class FrozenAdapters:
+    """Frozen sibling LoRA adapters: kept out of adapter checkpoints and pinned by content sha256 on resume."""
+
+    def __init__(self, shas: Optional[Dict[str, str]] = None) -> None:
+        self.shas: Dict[str, str] = dict(shas or {})  # name -> content sha256
+
+    @classmethod
+    def inject(cls, model: nn.Module, specs: Any) -> FrozenAdapters:
+        """Inject every ``lora_cfg.frozen_adapters`` entry: structure now, weights after materialization."""
+        return cls(
+            {s.name: inject_frozen_adapter(model, name=s.name, path=s.path) for s in normalize_frozen_adapters(specs)}
+        )
+
+    def is_trainable_lora_key(self, key: str) -> bool:
+        """True for ``lora_A`` / ``lora_B`` keys of a non-frozen adapter — what adapter checkpoints hold."""
+        return ("lora_A" in key or "lora_B" in key) and _adapter_of_lora_key(key) not in self.shas
+
+    def check_resume(self, recorded: Optional[Dict[str, str]]) -> None:
+        """Refuse a checkpoint that recorded a different frozen set; an empty or absent record imposes nothing."""
+        live = self.shas
+        if not recorded or recorded == live:
+            return
+        added = sorted(set(live) - set(recorded))
+        removed = sorted(set(recorded) - set(live))
+        changed = sorted(
+            f"{name} ({recorded[name][:12]}... -> {live[name][:12]}...)"
+            for name in set(recorded) & set(live)
+            if recorded[name] != live[name]
+        )
+        raise RuntimeError(
+            f"resume: frozen_adapters differ from the checkpoint's (added: {added}, removed: {removed}, "
+            f"weights changed: {changed}). Resume with the same frozen adapter checkpoints or start a new run."
+        )
+
+
 @contextmanager
 def adapters_disabled(model: nn.Module) -> Iterator[None]:
     """Temporarily route every PEFT LoRA layer through its frozen base weights."""
@@ -378,10 +414,10 @@ def _current_rank() -> int:
 
 
 __all__ = [
+    "FrozenAdapters",
     "ModuleSelection",
     "adapter_active",
     "adapter_names",
-    "adapter_of_lora_key",
     "adapters_disabled",
     "inject_frozen_adapter",
     "inject_lora",
