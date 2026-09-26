@@ -21,6 +21,7 @@ class MediaPreview(Batch):
     images: List[Any] = concat_field(default_factory=list)
     videos: List[Any] = concat_field(default_factory=list)
     audios: List[Any] = concat_field(default_factory=list)
+    video_fps: Optional[float] = None
     audio_sample_rate: Optional[int] = None
     prompts: List[str] = concat_field(default_factory=list)
     rewards: List[float] = concat_field(default_factory=list)
@@ -157,7 +158,14 @@ def build_media_preview_for_part(
         return None
 
     audios_out: List[Any] = []
+    video_fps: Optional[float] = None
     audio_sr: Optional[int] = None
+    if videos:
+        raw_video_fps = part.primitive_metadata.get("video", {}).get("fps")
+        if raw_video_fps is not None:
+            video_fps = float(raw_video_fps)
+            if video_fps <= 0.0:
+                raise ValueError(f"Video preview fps must be > 0, got {video_fps}")
     decoded_audio = part.primitives.get("audio")
     if isinstance(decoded_audio, Audios):
         from unirl.distributed.tensor import hydrate, map_tree
@@ -180,6 +188,7 @@ def build_media_preview_for_part(
         images=images,
         videos=videos,
         audios=audios_out,
+        video_fps=video_fps,
         audio_sample_rate=int(audio_sr) if audio_sr is not None else None,
         prompts=prompts_out,
         rewards=reward_values,

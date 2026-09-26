@@ -22,7 +22,7 @@ from .config import (
     LTX2_TEMPORAL_COMPRESSION,
     LTX2PipelineConfig,
 )
-from .diffusion import LTX2DiffusionStage, audio_latent_shape
+from .diffusion import _LTX2_FRAME_RATE, LTX2DiffusionStage, _audio_num_frames, audio_latent_shape
 from .schedule import build_ltx2_schedule_policy
 from .text_embed import LTX2TextEmbedStage
 from .vae import LTX2AudioDecodeStage, LTX2VAEDecodeStage, LTX2VAEEncodeStage
@@ -90,6 +90,7 @@ class LTX2Pipeline(Pipeline):
             trajectory_precision=config.trajectory_precision,
             logprob_precision=config.logprob_precision,
             audio_joint_sde=config.audio_joint_sde,
+            audio_policy_logp_weight=config.audio_policy_logp_weight,
         )
         vae_decode = LTX2VAEDecodeStage(bundle)
         vae_encode = LTX2VAEEncodeStage(bundle)
@@ -227,6 +228,7 @@ class LTX2Pipeline(Pipeline):
         )
 
         sde_indices = list(params.sde_indices) if params.sde_indices is not None else None
+        denoise_seed_keys = list(frontier.init_noise_group_ids or frontier.sample_ids)
         segment = self.diffusion.generate(
             conditions,
             params=params,
@@ -234,7 +236,7 @@ class LTX2Pipeline(Pipeline):
             initial_latents=initial_latents,
             initial_audio_latents=initial_audio_latents,
             sde_indices=sde_indices,
-            denoise_seed_keys=[str(sample_id) for sample_id in sample.sample_ids],
+            denoise_seed_keys=[str(seed_key) for seed_key in denoise_seed_keys],
             denoise_base_seed=int(params.seed) if params.seed is not None else 0,
         )
 
@@ -247,8 +249,6 @@ class LTX2Pipeline(Pipeline):
         decoded_audio = None
         audio_sample_rate = None
         if self.audio_decode is not None and segment.aux_latents is not None:
-            from .diffusion import _LTX2_FRAME_RATE, _audio_num_frames
-
             audio_t = _audio_num_frames(int(params.num_frames), _LTX2_FRAME_RATE)
             final_audio = segment.aux_latents_at(int(params.num_inference_steps))
             waveforms = self.audio_decode.decode(final_audio, audio_latent_length=audio_t)
@@ -263,7 +263,7 @@ class LTX2Pipeline(Pipeline):
             audio_sample_rate = int(self.bundle.vocoder.config.output_sampling_rate)
 
         primitives = {"video": decoded}
-        primitive_metadata = {}
+        primitive_metadata = {"video": {"fps": _LTX2_FRAME_RATE}}
         if decoded_audio is not None:
             primitives["audio"] = decoded_audio
             primitive_metadata["audio"] = {"sample_rate": audio_sample_rate}

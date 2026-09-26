@@ -418,11 +418,14 @@ class UniRLWandBLogger:
             videos = media_preview.get("videos")
             prompts = media_preview.get("prompts")
             rewards = media_preview.get("rewards")
+            preview_fps = media_preview.get("video_fps")
         else:
             images = getattr(media_preview, "images", None)
             videos = getattr(media_preview, "videos", None)
             prompts = getattr(media_preview, "prompts", None)
             rewards = getattr(media_preview, "rewards", None)
+            preview_fps = getattr(media_preview, "video_fps", None)
+        fps = int(round(preview_fps)) if preview_fps is not None else video_fps
 
         has_images = isinstance(images, list) and bool(images)
         has_videos = isinstance(videos, list) and bool(videos)
@@ -501,11 +504,11 @@ class UniRLWandBLogger:
                     audio_wf = audios[idx] if idx < len(audios) else None
                     if audio_wf is not None and audio_sr is not None and torch.is_tensor(audio_wf):
                         arr_hwc = arr.transpose(0, 2, 3, 1)  # (T, C, H, W) -> (T, H, W, C)
-                        path = _write_video_with_audio(arr_hwc, int(video_fps), audio_wf, int(audio_sr))
+                        path = _write_video_with_audio(arr_hwc, fps, audio_wf, int(audio_sr))
                         _muxed_paths.append(path)
                         wandb_videos.append(wandb.Video(path, caption=_caption_for(idx), format="mp4"))
                     else:
-                        wandb_videos.append(wandb.Video(arr, caption=_caption_for(idx), fps=int(video_fps)))
+                        wandb_videos.append(wandb.Video(arr, caption=_caption_for(idx), fps=fps))
                 if wandb_videos:
                     payload[video_key] = wandb_videos
 
