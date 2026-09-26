@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from dataclasses import field as dc_field
 from typing import Any, Dict, List, Mapping, Optional, Type
@@ -24,6 +25,7 @@ from .base import (
     _resolve_reference_model,
     _transition_sigma,
     gather_sde_field,
+    rollout_replay_logp_absdiff,
     typed_conditions,
 )
 
@@ -36,6 +38,7 @@ class FlowGRPOConfig(BaseAlgorithmConfig):
     clip_schedule: str = "constant"
     beta: float = 0.0
     old_logp_source: str = "rollout"
+    max_rollout_replay_logp_absdiff: Optional[float] = None
     params: Any = dc_field(default=None)
 
 
@@ -61,6 +64,7 @@ class FlowGRPO(StageAlgorithm):
         clip_schedule: str = "constant",
         beta: float = 0.0,
         old_logp_source: str = "rollout",
+        max_rollout_replay_logp_absdiff: Optional[float] = None,
         backend: Any = None,
         conditions_cls: Optional[Type[Any]] = None,
     ) -> None:
@@ -80,6 +84,18 @@ class FlowGRPO(StageAlgorithm):
             self.old_logp_source in ("rollout", "replay"),
             f"FlowGRPO: old_logp_source must be 'rollout' or 'replay'; got {old_logp_source!r}",
         )
+        self.max_rollout_replay_logp_absdiff = max_rollout_replay_logp_absdiff
+        if max_rollout_replay_logp_absdiff is not None:
+            require(
+                math.isfinite(max_rollout_replay_logp_absdiff) and max_rollout_replay_logp_absdiff >= 0.0,
+                "FlowGRPO: max_rollout_replay_logp_absdiff must be finite and non-negative; "
+                f"got {max_rollout_replay_logp_absdiff!r}",
+            )
+            require(
+                self.old_logp_source == "rollout",
+                "FlowGRPO: max_rollout_replay_logp_absdiff gates rollout log-probs against a pre-update "
+                "replay, so it requires old_logp_source='rollout'",
+            )
         _require_replay_anchor_for_batched_replay(self.stage, self.old_logp_source, algo="FlowGRPO")
         self.conditions_cls = conditions_cls
 
@@ -103,11 +119,39 @@ class FlowGRPO(StageAlgorithm):
                     "None). Pin a rollout build that emits trajectory log-probs, or set "
                     "old_logp_source='replay'."
                 )
+            if self.max_rollout_replay_logp_absdiff is not None:
+                self._check_rollout_replay_parity(conditions=conditions, segment=segment, target_steps=target_steps)
             return
         typed_conds = typed_conditions(conditions, self.conditions_cls)
         with torch.no_grad():
             result = self.stage.replay(typed_conds, segment=segment, params=self.params, step_indices=target_steps)
         segment.sde_logp = result.log_probs.detach().cpu()
+
+    def _check_rollout_replay_parity(
+        self,
+        *,
+        conditions: Mapping[str, "Condition"],
+        segment: "LatentSegment",
+        target_steps: List[int],
+    ) -> None:
+        """Raise when pre-update replay disagrees with the rollout engine's log-probs."""
+        typed_conds = typed_conditions(conditions, self.conditions_cls)
+        with torch.no_grad():
+            replay_logp = self.stage.replay(
+                typed_conds, segment=segment, params=self.params, step_indices=target_steps
+            ).log_probs
+            rollout_logp = gather_sde_field(
+                segment.sde_logp, segment.sde_indices, target_steps, field_name="sde_logp"
+            ).to(dtype=replay_logp.dtype, device=replay_logp.device)
+            per_step_max = (replay_logp - rollout_logp).abs().amax(dim=0).tolist()
+        worst = max(per_step_max)
+        if worst > self.max_rollout_replay_logp_absdiff:
+            detail = ", ".join(f"{step}:{value:.3g}" for step, value in zip(target_steps, per_step_max, strict=True))
+            raise RuntimeError(
+                f"FlowGRPO rollout/replay parity failed before the update: max |Δlogp|={worst:.3g} exceeds "
+                f"max_rollout_replay_logp_absdiff={self.max_rollout_replay_logp_absdiff:.3g}; "
+                f"per-step max [{detail}]. The rollout engine and the trainer replay disagree on the policy."
+            )
 
     def compute_loss_and_backward(
         self,
@@ -153,6 +197,8 @@ class FlowGRPO(StageAlgorithm):
             "clip_range": float(clip_range),
             **{k: float(v.item()) for k, v in ratio_metrics.items()},
         }
+        if self.old_logp_source == "rollout":
+            metrics.update(rollout_replay_logp_absdiff(new_logp, old_logp))
 
         if self.beta > 0.0:
             if new_means is None:

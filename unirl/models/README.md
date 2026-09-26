@@ -167,10 +167,6 @@ external engines with a UniRL adapter (see
 
 ### Video diffusion
 
-<!-- minimax_h3 is trainside-only until the vLLM-Omni rollout backend (#378 / #420)
-     lands; update its engines, recipes, and restrictions (and the root README row)
-     when it merges. -->
-
 | Package | Model (recipe default) | Modality | Entrypoints | Engines with a recipe | Recipes | Restrictions | Status |
 |---|---|---|---|---|---|---|---|
 | [`wan21/`](wan21/) | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers`, `Wan-AI/Wan2.1-I2V-14B-720P-Diffusers` (I2V) | Text → Video; Image → Video | `train_diffusion`, `train_sft` | trainside, sglang_diffusion, fastvideo | [`wan21_t2v`](../../examples/diffusion/wan21/wan21_t2v.yaml), [`wan21_i2v`](../../examples/diffusion/wan21/wan21_i2v.yaml), [`wan21_t2v_sglang`](../../examples/diffusion/wan21/wan21_t2v_sglang.yaml), [`wan21_t2v_dancegrpo_fastvideo`](../../examples/diffusion/wan21/wan21_t2v_dancegrpo_fastvideo.yaml), [`sft/wan21_t2v_ucf101_full`](../../examples/sft/wan21_t2v_ucf101_full.yaml) | `wan21_t2v_videoalign_dancegrpo`: scorer-dependent; fastvideo needs the `[fastvideo]` extra | ✅ |
@@ -180,7 +176,7 @@ external engines with a UniRL adapter (see
 | [`hunyuan_video15/`](hunyuan_video15/) | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v` | Text → Video | `train_diffusion` | trainside, vllm_omni | [`hunyuan_video15_t2v_dancegrpo_trainside`](../../examples/diffusion/hunyuan_video15/hunyuan_video15_t2v_dancegrpo_trainside.yaml), [`hunyuan_video15_t2v_vllmomni_colocate`](../../examples/diffusion/hunyuan_video15/hunyuan_video15_t2v_vllmomni_colocate.yaml) | engine-specific (no sglang_diffusion adapter) | ✅ |
 | [`ltx2/`](ltx2/) | `Lightricks/LTX-2` | Text → Video | `train_diffusion` | trainside, sglang_diffusion | [`ltx2_t2v_trainside`](../../examples/diffusion/ltx2/ltx2_t2v_trainside.yaml), [`ltx2_t2v_sglang_loramerge`](../../examples/diffusion/ltx2/ltx2_t2v_sglang_loramerge.yaml) | engine-specific; I2V is in the config but has no recipe (not claimed) | ✅ |
 | [`ltx2/`](ltx2/) | `dg845/LTX-2.3-Diffusers` | Text → Audio + Video | `train_diffusion` | trainside | [`ltx2_3_t2av_trainside`](../../examples/diffusion/ltx2/ltx2_3_t2av_trainside.yaml), [`ltx2_3_t2av_audioreward_trainside`](../../examples/diffusion/ltx2/ltx2_3_t2av_audioreward_trainside.yaml) | engine-specific (trainside only); `*_audioreward*`: `t2av_composite` (`videopickscore` + `clap`), `imagebind` opt-in (scorer-dependent) | ✅ |
-| [`minimax_h3/`](minimax_h3/) | `PRETRAINED_MODEL` (no default) → MiniMax-H3 (33B dense) Hub id or local snapshot | Text → Video + Audio | `train_diffusion` | trainside | [`minimax_h3_t2va_trainside`](../../examples/diffusion/minimax_h3/minimax_h3_t2va_trainside.yaml), [`minimax_h3_t2va_nft`](../../examples/diffusion/minimax_h3/minimax_h3_t2va_nft.yaml) | engine-specific (trainside only — no vllm_omni adapter on `main`); checkpoint-path-required; 768px short edge only (minimum 768×768 × 124 frames), 1 node × 8 GPUs minimum; reward is `t2av_composite` (`videopickscore` + `clap`), `imagebind` opt-in (scorer-dependent) | ✅ |
+| [`minimax_h3/`](minimax_h3/) | `PRETRAINED_MODEL` (no default) → MiniMax-H3 (33B dense) Hub id or local snapshot | Text → Video + Audio | `train_diffusion` | trainside, vllm_omni | [`minimax_h3_t2va_trainside`](../../examples/diffusion/minimax_h3/minimax_h3_t2va_trainside.yaml), [`minimax_h3_t2va_nft`](../../examples/diffusion/minimax_h3/minimax_h3_t2va_nft.yaml), [`minimax_h3_t2va_vllmomni_2x4_timeshare`](../../examples/diffusion/minimax_h3/minimax_h3_t2va_vllmomni_2x4_timeshare.yaml) | engine-specific (no sglang_diffusion adapter); vllm_omni rollout uses four-GPU engine replicas; checkpoint-path-required; 1 node × 8 GPUs minimum; reward is `t2av_composite` (`videopickscore` + `clap`), `imagebind` opt-in (scorer-dependent) | ✅ |
 
 ### Unified and multimodal generators
 

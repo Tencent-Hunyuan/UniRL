@@ -20,7 +20,8 @@ from unirl.trainer.eval_suites import EvalRewardSuite, build_eval_suites
 from unirl.trainer.hydra import parse_hydra_cfg, remote_hydra
 from unirl.trainer.residency import DEFAULT_RESIDENCY_POLICY, ResidencyPlanner, ResidencyPolicy, Role
 from unirl.types.primitives import Texts
-from unirl.types.sample import Sample
+from unirl.types.sample import Part, Sample
+from unirl.types.sample_id import ancestor_id
 from unirl.types.sampling import BaseSamplingParams, total_samples_per_prompt
 from unirl.utils.wandb_metrics import pooled_window_reward_metrics
 
@@ -42,22 +43,64 @@ def _run_cleanup_steps(steps: List[Tuple[str, Callable[[], None]]]) -> None:
         raise first_error
 
 
+_REWARD_DISPATCH_MODES = ("prompt_tree", "row")
+
+
+def _reward_row_view(sample: Sample) -> Sample:
+    """Re-root every frontier row as its own prompt tree so reward DP can scatter single rows."""
+    leaf_ids = sample.parts[-1].validated_sample_ids(context="reward row dispatch")
+    parts: List[Part] = []
+    for part in sample.parts:
+        depth = part.sample_ids[0].count("/")
+        row_of = {sid: row for row, sid in enumerate(part.sample_ids)}
+        rows = torch.tensor([row_of[ancestor_id(leaf, depth)] for leaf in leaf_ids], dtype=torch.long)
+        # The whole leaf path becomes the root id, so every row is a distinct
+        # root while each deeper Part stays a branch-1 child of it.
+        ids = [leaf.replace("/", ":") + "/0" * depth for leaf in leaf_ids]
+        parts.append(dataclasses.replace(part.select(rows), sample_ids=ids))
+    parts[0].validated_sample_ids(context="reward row dispatch root")
+    return sample.with_parts(parts)
+
+
+def _attach_row_rewards(sample: Sample, scored_rows: Sample) -> Sample:
+    """Copy rewards scored on :func:`_reward_row_view` back onto the original frontier."""
+    frontier = sample.parts[-1]
+    scored = scored_rows.parts[-1]
+    expected = [leaf.replace("/", ":") + "/0" * leaf.count("/") for leaf in frontier.sample_ids]
+    if list(scored.sample_ids) != expected:
+        raise RuntimeError("reward row dispatch: RewardService changed the order or identity of scored rows")
+    return sample.replace_frontier(
+        dataclasses.replace(frontier, rewards=scored.rewards, component_rewards=scored.component_rewards)
+    )
+
+
 def _validate_prompt_tree_dp_geometry(
     *,
     batch_size: int,
+    samples_per_prompt: int,
     rollout_dp_size: Optional[int],
     reward_dp_size: int,
+    reward_dispatch: str,
     context: str,
 ) -> None:
-    roles = [("reward", reward_dp_size)]
-    if rollout_dp_size is not None:
-        roles.insert(0, ("rollout", rollout_dp_size))
-    for role, dp_size in roles:
-        if batch_size % dp_size:
+    if rollout_dp_size is not None and batch_size % rollout_dp_size:
+        raise ValueError(
+            f"{context}: rollout dp_size={rollout_dp_size} must divide batch_size={batch_size} "
+            "root prompt trees; DP_SCATTER preserves each prompt's whole subtree."
+        )
+    if reward_dispatch == "row":
+        rows = batch_size * samples_per_prompt
+        if rows % reward_dp_size:
             raise ValueError(
-                f"{context}: {role} dp_size={dp_size} must divide batch_size={batch_size} "
-                "root prompt trees; DP_SCATTER preserves each prompt's whole subtree."
+                f"{context}: reward dp_size={reward_dp_size} must divide batch_size({batch_size}) * "
+                f"samples_per_prompt({samples_per_prompt}) = {rows} rows under reward_dispatch='row'."
             )
+    elif batch_size % reward_dp_size:
+        raise ValueError(
+            f"{context}: reward dp_size={reward_dp_size} must divide batch_size={batch_size} "
+            "root prompt trees; DP_SCATTER preserves each prompt's whole subtree "
+            "(reward_dispatch='row' scatters generated rows instead)."
+        )
 
 
 def _validate_dp_geometry(
@@ -68,6 +111,7 @@ def _validate_dp_geometry(
     rollout_dp_size: int,
     reward_dp_size: int,
     train_dp_size: int,
+    reward_dispatch: str,
     require_rollout_dp_divisibility: bool = True,
 ) -> None:
     """Validate prompt-tree dispatch separately from generated-sample training."""
@@ -85,8 +129,10 @@ def _validate_dp_geometry(
 
     _validate_prompt_tree_dp_geometry(
         batch_size=batch_size,
+        samples_per_prompt=samples_per_prompt,
         rollout_dp_size=rollout_dp_size if require_rollout_dp_divisibility else None,
         reward_dp_size=reward_dp_size,
+        reward_dispatch=reward_dispatch,
         context="training",
     )
 
@@ -114,6 +160,7 @@ def _preflight_trainside_geometry(
     num_updates_per_batch: int,
     prompt_local_rollout: bool,
     has_reward: bool,
+    reward_dispatch: str,
     backend_cfg: DictConfig,
     rollout_cfg: DictConfig,
 ) -> None:
@@ -169,6 +216,7 @@ def _preflight_trainside_geometry(
         rollout_dp_size=shared_dp_size,
         reward_dp_size=reward_dp_size,
         train_dp_size=shared_dp_size,
+        reward_dispatch=reward_dispatch,
         require_rollout_dp_divisibility=not prompt_local_rollout,
     )
 
@@ -326,6 +374,7 @@ class DiffusionTrainer(BaseTrainer):
         eval_sampling_cfg: Optional[Any] = None,
         eval_rewards_cfg: Optional[Any] = None,
         control: Optional[Dict[str, Any]] = None,
+        reward_dispatch: str = "prompt_tree",
     ) -> None:
         super().__init__(
             cfg=cfg,
@@ -334,6 +383,12 @@ class DiffusionTrainer(BaseTrainer):
         )
         reject_retired_eval_keys(cfg)
         reject_retired_residency_keys(cfg)
+        if reward_dispatch not in _REWARD_DISPATCH_MODES:
+            raise ValueError(f"reward_dispatch must be one of {_REWARD_DISPATCH_MODES}, got {reward_dispatch!r}")
+        # "row" gives each generated row its own reward request lineage, so
+        # reward DP can exceed the prompt count; scorers then see per-row
+        # sample/group ids instead of the prompt-tree ones.
+        self._reward_dispatch = reward_dispatch
         self.batch_size = batch_size
         self._layout = str(layout)
         self._train_fraction = float(train_fraction)
@@ -440,6 +495,7 @@ class DiffusionTrainer(BaseTrainer):
             num_updates_per_batch=int(stack_cfg.get("num_updates_per_batch", 1)),
             prompt_local_rollout=self._prompt_local_rollout,
             has_reward=reward_cfg is not None,
+            reward_dispatch=self._reward_dispatch,
             backend_cfg=backend_cfg,
             rollout_cfg=rollout_cfg,
         )
@@ -487,8 +543,15 @@ class DiffusionTrainer(BaseTrainer):
             rollout_dp_size=int(self.rollout.dp_size),
             reward_dp_size=int(self.reward.dp_size) if self.reward is not None else 1,
             train_dp_size=int(self.stack.dp_size),
+            reward_dispatch=self._reward_dispatch,
             require_rollout_dp_divisibility=not self._prompt_local_rollout,
         )
+
+    def _score(self, reward: Any, sample: Sample) -> Sample:
+        """Score ``sample``'s frontier under the configured reward dispatch."""
+        if self._reward_dispatch == "row":
+            return _attach_row_rewards(sample, reward.score_and_attach(_reward_row_view(sample)))
+        return reward.score_and_attach(sample)
 
     def _validate_reward_config(self) -> None:
         """A missing ``reward:`` block is legal only for requires_advantages=False algorithms."""
@@ -817,7 +880,7 @@ class DiffusionTrainer(BaseTrainer):
         # With no reward configured, ``part.rewards`` stays None and the block below no-ops.
         if self.reward is not None:
             with self._reward_phase():
-                sample = self.reward.score_and_attach(sample)
+                sample = self._score(self.reward, sample)
 
         part = sample.parts[-1]
         mean_reward = 0.0
@@ -1005,8 +1068,10 @@ class DiffusionTrainer(BaseTrainer):
             sub = all_inputs.slice(start, min(start + chunk, n_prompts))
             _validate_prompt_tree_dp_geometry(
                 batch_size=int(sub.batch_size),
+                samples_per_prompt=total_samples_per_prompt(eval_sp),
                 rollout_dp_size=int(self.rollout.dp_size),
                 reward_dp_size=int(self.reward.dp_size),
+                reward_dispatch=self._reward_dispatch,
                 context=f"evaluation chunk [{start}:{start + sub.batch_size}]",
             )
             request = self._build_request_sample(sub, step, sampling=eval_sp)
@@ -1021,7 +1086,7 @@ class DiffusionTrainer(BaseTrainer):
             first_scored: Optional[Sample] = None
             with self._reward_phase(preserve_rollout=not sleep_rollout):
                 for name, reward in scorers:
-                    scored = reward.score_and_attach(generated)
+                    scored = self._score(reward, generated)
                     if first_scored is None:
                         first_scored = scored
                     part = scored.parts[-1]
