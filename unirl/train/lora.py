@@ -215,6 +215,15 @@ def _inject_frozen_adapter(
     model_id, subfolder = _resolve_adapter_checkpoint(path)
     # The full saved config: scaling depends on use_rslora / alpha_pattern / rank_pattern, not just r and alpha.
     peft_cfg = LoraConfig.from_pretrained(model_id, subfolder=subfolder)
+    init = peft_cfg.init_lora_weights
+    if isinstance(init, str) and init not in _DELTA_INITS:
+        # pissa / olora / corda / loftq / mica / lora_ga rewrite the (shared) base weight at inject time, and an
+        # unconverted adapter of that kind is only valid on top of that rewritten base.
+        raise ValueError(
+            f"inject_frozen_adapter: {path!r} was saved with init_lora_weights={init!r}, so its weights assume "
+            "a modified base model. Re-save it with save_pretrained(path_initial_model_for_weight_conversion=...) "
+            "to convert it to a plain LoRA delta."
+        )
     peft_cfg.lora_dropout = 0.0
     inject_adapter_in_model(peft_cfg, model, adapter_name=name)
 
@@ -261,6 +270,7 @@ def _inject_frozen_adapter(
     return _weights_sha256(weights)
 
 
+_DELTA_INITS = ("gaussian", "eva", "orthogonal")
 _LORA_BANK_RE = re.compile(r"\.lora_(?:embedding_)?[AB](?=\.|$)")
 _LORA_ADAPTER_RE = re.compile(r"\.lora_(?:embedding_)?[AB]\.([^.]+)")
 
