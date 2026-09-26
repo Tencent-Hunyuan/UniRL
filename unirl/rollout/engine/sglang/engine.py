@@ -160,7 +160,6 @@ class SGLangRolloutEngine(BaseRolloutEngine):
         )
 
         self._version = 0
-        self._weight_update_calls = 0
 
     def _prepare_generation(self, sample: Sample) -> Any:
         sampling = resolve_sampling(self.cfg, sample)
@@ -298,7 +297,6 @@ class SGLangRolloutEngine(BaseRolloutEngine):
             load_format=load_format,
             flush_cache=flush_cache,
         )
-        self._weight_update_calls += 1
 
     def init_weights_update_group(
         self,
@@ -345,7 +343,6 @@ class SGLangRolloutEngine(BaseRolloutEngine):
             group_name=group_name,
             flush_cache=flush_cache,
         )
-        self._weight_update_calls += 1
 
     def destroy_weights_update_group(
         self,
@@ -399,7 +396,6 @@ class SGLangRolloutEngine(BaseRolloutEngine):
         except BaseException as exc:
             self.mark_checkpoint_engine_sync_failed(str(exc))
             raise
-        self._weight_update_calls += 1
 
     def mark_checkpoint_engine_sync_failed(self, error: str) -> None:
         """Poison this rollout after a possibly partial live-weight update."""
