@@ -70,9 +70,6 @@ dimension: each row links one runnable recipe. Full matrix — package, every re
 rollout engine, and restriction per model — in
 [`unirl/models/README.md`](unirl/models/README.md#support-matrix).
 
-<!-- MiniMax-H3 is trainside-only until the vLLM-Omni rollout backend (#378 / #420)
-     lands; update its row here and in unirl/models/README.md when it merges. -->
-
 <div align="center">
 
 | Model | Category | Modality | Recipe | Status |
@@ -90,7 +87,7 @@ rollout engine, and restriction per model — in
 | HunyuanVideo 1.5 | Video diffusion | Text → Video | [`hunyuan_video15_t2v_dancegrpo_trainside`](examples/diffusion/hunyuan_video15/hunyuan_video15_t2v_dancegrpo_trainside.yaml) | ✅ |
 | LTX-2 | Video diffusion | Text → Video | [`ltx2_t2v_trainside`](examples/diffusion/ltx2/ltx2_t2v_trainside.yaml) | ✅ |
 | LTX-2.3 | Video diffusion | Text → Audio + Video | [`ltx2_3_t2av_trainside`](examples/diffusion/ltx2/ltx2_3_t2av_trainside.yaml) | ✅ trainside only |
-| MiniMax-H3 | Video diffusion | Text → Video + Audio | [`minimax_h3_t2va_trainside`](examples/diffusion/minimax_h3/minimax_h3_t2va_trainside.yaml) | ✅ trainside only |
+| MiniMax-H3 | Video diffusion | Text → Video + Audio | [`minimax_h3_t2va_trainside`](examples/diffusion/minimax_h3/minimax_h3_t2va_trainside.yaml) | ✅ |
 | HunyuanImage 3.0 | Unified AR + diffusion | Text / Text + Image → Image | [`hi3_trainside_t2i`](examples/unified_model/hi3_trainside_t2i.yaml) | ✅ |
 | BAGEL-7B-MoT | Unified AR + diffusion | Text / Text + Image → Image; Text + Image → Text | [`bagel_trainside_lora`](examples/diffusion/bagel/bagel_trainside_lora.yaml) | ✅ |
 | SenseNova-U1.5 | Unified MoT pixel flow | Text → Image | [`sensenova_u1_5_trainside`](examples/diffusion/sensenova_u1_5/sensenova_u1_5_trainside.yaml) | ✅ trainside only |

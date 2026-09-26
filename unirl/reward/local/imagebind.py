@@ -66,6 +66,7 @@ class ImageBindRewardScorer(LocalRewardBackend):
             ):
                 raise ValueError("ImageBindSpec.weights values must be finite numbers.")
             self._weights = {name: float(weight) for name, weight in self._weights.items()}
+        self._model_path = config.model_path
         super().__init__(
             device=resolve_device(config.device, base_device),
             batch_size=config.batch_size,
@@ -82,7 +83,12 @@ class ImageBindRewardScorer(LocalRewardBackend):
         except ImportError as e:
             raise ImportError(_IMAGEBIND_INSTALL_MSG) from e
 
-        self.model = imagebind_model.imagebind_huge(pretrained=True).to(self.device).eval()
+        if self._model_path:
+            self.model = imagebind_model.imagebind_huge(pretrained=False)
+            self.model.load_state_dict(torch.load(self._model_path, map_location="cpu", weights_only=True))
+        else:
+            self.model = imagebind_model.imagebind_huge(pretrained=True)
+        self.model = self.model.to(self.device).eval()
 
     def _preprocess_audio_to_melspec(self, audio_list: List[torch.Tensor], src_sample_rate: int) -> torch.Tensor:
         import torch.nn.functional as Fn
@@ -259,5 +265,7 @@ class ImageBindSpec(PromptRewardComponentSpec):
 
     batch_size: int = 8
     device: str = "auto"
+    # Local imagebind_huge state dict; None downloads the pretrained weights.
+    model_path: Optional[str] = None
     mode: str = "audio_video"
     weights: Optional[Dict[str, float]] = None

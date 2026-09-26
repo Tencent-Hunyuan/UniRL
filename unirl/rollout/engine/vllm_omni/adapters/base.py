@@ -85,6 +85,12 @@ class ModelAdapter(ABC):
             kwargs["mode"] = self.omni_mode
         return kwargs
 
+    def serving_lora(
+        self, lora_tensors: Dict[str, Any], peft_config: Optional[dict]
+    ) -> Tuple[Dict[str, Any], Optional[dict]]:
+        """Translate a trainer-layout LoRA into the serving model's module layout (identity by default)."""
+        return lora_tensors, peft_config
+
     def schedule_policy(self) -> Any:
         from unirl.sde.runtime import FlowMatchSchedulePolicy
 
