@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import List, Protocol, Tuple, runtime_checkable
 
-from unirl.algorithms.base import StageAlgorithm
 from unirl.types.sample import Part
 
 Range = Tuple[int, int]
@@ -55,5 +54,3 @@ class MicroPlanner(Protocol):
     """How an update's samples are grouped into micro-batches."""
 
     def arrange(self, part: Part, *, num_updates: int, micro_batch_size: int) -> Tuple[Part, Plan]: ...
-
-    def validate(self, algorithm: StageAlgorithm) -> None: ...

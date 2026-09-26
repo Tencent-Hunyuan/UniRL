@@ -23,7 +23,6 @@ class Cosmos3JointFlowMatchSFT(StageAlgorithm):
 
     supports_multi_update = True
     requires_advantages = False
-    loss_weighting = "sample"
 
     def __init__(
         self,

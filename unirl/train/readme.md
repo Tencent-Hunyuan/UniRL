@@ -91,6 +91,11 @@ in `backend/base.py`; a multi-update-capable algorithm sets
 - **Advantages are not computed here** — `train` raises if
   `part.advantages is None`; the trainer must call `compute_advantages` on the
   full shard first.
+- **Selective offload supports direct GPU-streaming weight sync.** The trainer
+  keeps FSDP parameter shards on device while vLLM receives weights, clears
+  consumed gradients and offloads optimizer state before publication, then
+  offloads the model after publication commits. Calling `offload()` without
+  arguments retains the legacy full-state behavior.
 - **`fsdp_wrap` wraps *nothing* when no block class is discovered** — the warning
   says "root-only wrap" but `_enumerate_block_instances` returns `()`, so the
   shard/cast loops are no-ops and the model trains **unsharded and un-cast**. Pass

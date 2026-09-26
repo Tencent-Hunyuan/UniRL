@@ -129,7 +129,7 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def sleep(self) -> None:
-        """Fan ``handle_sleep_task`` to every stage's workers (level 1)."""
+        """Sleep every stage at level 1 (AR via EngineCore, diffusion via worker task)."""
         if self._is_offloaded and not self._transition_failed:
             return
         try:
@@ -145,7 +145,7 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def wake_up(self) -> None:
-        """Fan ``handle_wake_task`` to every stage's workers + restore LoRA."""
+        """Wake every stage (AR via EngineCore, diffusion via worker task) + restore LoRA."""
         if self._transition_failed:
             # Recover an unknown partial stage state to one known boundary
             # before attempting another wake. If this retry fails, retain the

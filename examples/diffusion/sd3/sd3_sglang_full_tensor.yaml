@@ -106,10 +106,10 @@ rollout:
       model_type: sd3
     # SGLang colocate time-shares the GPU via release_memory_occupation /
     # resume_memory_occupation (engine.sleep()/wake_up()); no sleep-mode knob.
-    # NOTE: SGLang enables torch_memory_saver, which forces all CPU-offload flags
-    # off, and its memory pool reabsorbs any freed space — so the DiT-forward
-    # activation is bounded by forward_batch_size (above). batch_size is reduced
-    # (top of file) so train shard + engine + activation fit on one H20.
+    # The native 0.5.19 controller offloads active modules to pinned CPU memory
+    # and restores them on wake. DiT-forward activation is bounded by
+    # forward_batch_size (above); batch_size is reduced (top of file) so train
+    # shard + engine + activation fit on one H20.
 
 reward:
   _target_: unirl.reward.service.RewardService
@@ -181,9 +181,3 @@ sync:
   lora_merged: true
   bucket_size_mb: 512
   flush_cache: true
-  # Ordered first-match-wins name rewrite (see FullWeightSync._apply_name_remap):
-  # backend.model is the bare SD3 transformer (merged_state_dict yields
-  # transformer_blocks.* etc.), so the "*" catch-all nests every key under the
-  # receiver's transformer.* namespace. Applied on both the merged
-  # (lora_merged=true) and raw paths.
-  name_remap: {"*": "transformer.*"}

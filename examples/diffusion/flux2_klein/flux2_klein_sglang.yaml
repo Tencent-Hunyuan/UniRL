@@ -42,11 +42,8 @@ model_config:
   # shifting (build_schedule_policy) and this value is ignored at runtime.
   shift: 1.0
   load_vae: false
-  # SGLang builds its LoRA ServerArgs from these fields. This list MUST stay in
-  # lockstep with backend.lora_cfg.target_modules and rollout.config.target_modules
-  # below — three independent consumers (PEFT injection, weight-sync bucket
-  # layout, SGLang ServerArgs.lora_target_modules) each read the names from their
-  # own field. See backend.lora_cfg.target_modules below for the full rationale.
+  # SGLang builds its LoRA ServerArgs from these fields. Keep this list aligned
+  # with backend.lora_cfg.target_modules, which owns trainside PEFT injection.
   use_lora: true
   lora_target_modules:
     # DUAL block (Flux2TransformerBlock × 8) — full attention + FFN coverage:
@@ -177,25 +174,6 @@ rollout:
     num_gpus: 1
     tp_size: 1
     local_mode: true
-    # MUST stay in sync with model_config.lora_target_modules and
-    # backend.lora_cfg.target_modules above. SGLang reads these for its
-    # ServerArgs.lora_target_modules (controls which modules SGLang pre-allocates
-    # LoRA buffers for); PEFT/backend reads its own copy for the trainside
-    # injection. Drift between the three causes silent LoRA-key drops at sync.
-    target_modules:
-      - to_q
-      - to_k
-      - to_v
-      - to_out.0
-      - add_q_proj
-      - add_k_proj
-      - add_v_proj
-      - to_add_out
-      - ff.linear_in
-      - ff.linear_out
-      - ff_context.linear_in
-      - ff_context.linear_out
-      - to_qkv_mlp_proj
     engine_kwargs:
       model_type: flux2_klein
   # SGLang reads ckpt/LoRA off model_config and sde_label off strategy.

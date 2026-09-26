@@ -10,7 +10,7 @@ from typing import Dict, List, Optional
 import torch
 import torch.nn.functional as F
 
-from unirl.reward.base import BaseRewardComponentSpec
+from unirl.reward.base import PromptRewardComponentSpec
 from unirl.reward.local.device import resolve_device
 from unirl.types.reward import RewardRequest
 
@@ -77,6 +77,7 @@ class ImageBindRewardScorer(LocalRewardBackend):
         super().__init__(
             device=resolve_device(config.device, base_device),
             batch_size=config.batch_size,
+            prompt_source=config.prompt_source,
         )
 
     def covers_prompt_video(self) -> bool:
@@ -217,7 +218,7 @@ class ImageBindRewardScorer(LocalRewardBackend):
 
         audio = request.audio
         videos = request.videos
-        prompts = request.prompts
+        prompts = self.prompts(request)
 
         need_text = self._mode in ("text_audio", "text_video", "all")
         need_audio = self._mode in ("audio_video", "text_audio", "all")
@@ -261,7 +262,7 @@ class ImageBindRewardScorer(LocalRewardBackend):
 
 
 @dataclass
-class ImageBindSpec(BaseRewardComponentSpec):
+class ImageBindSpec(PromptRewardComponentSpec):
     """Typed config for the ImageBind audio-video reward component (NonCommercial)."""
 
     batch_size: int = 8

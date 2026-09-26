@@ -132,16 +132,17 @@ rollout:
     chat_template_kwargs:
       enable_thinking: true
     engine_kwargs:
+      # Colocate full-FT preset — see unirl/rollout/README.md (SGLang AR knobs).
       # FULL fine-tuning: lower the SRT KV reservation to give FSDP headroom for
       # the per-rollout full-weight all-gather. No LoRA pool — full dense weights
       # pushed via TensorWeightSync. CUDA graph ON for decode speed, but capped at
-      # cuda_graph_max_bs=16 so its captured buffers stay small (the default 256
-      # would balloon server memory + compete with the weight push).
+      # cuda_graph_max_bs_decode=16 so its captured buffers stay small (the
+      # auto-tuned default can be much larger and compete with the weight push).
       mem_fraction_static: 0.3
       skip_server_warmup: true
       attention_backend: triton
       disable_cuda_graph: false
-      cuda_graph_max_bs: 16
+      cuda_graph_max_bs_decode: 16
       enable_lora: false
 
 reward:

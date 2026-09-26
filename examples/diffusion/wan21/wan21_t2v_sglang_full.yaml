@@ -150,9 +150,6 @@ sync:
   lora_merged: false
   bucket_size_mb: 512
   flush_cache: true
-  # backend.model is the bare WAN transformer; nest every key under the
-  # receiver's transformer.* namespace.
-  name_remap: {"*": "transformer.*"}
 
 logging:
   report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,true}}

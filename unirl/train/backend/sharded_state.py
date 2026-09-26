@@ -152,11 +152,14 @@ def drop_meta_entries(state_dict: StateDict) -> StateDict:
 
 
 def move_optimizer_state(optimizer: torch.optim.Optimizer, device: object) -> None:
-    """Move every tensor in the optimizer state to ``device`` (the on/offload loop)."""
-    for state in optimizer.state.values():
-        for k, v in state.items():
-            if isinstance(v, torch.Tensor):
-                state[k] = v.to(device)
+    """Move optimizer state to ``device``; non-fused/capturable ``step`` stays on CPU as it is read via ``.item()``."""
+    for group in optimizer.param_groups:
+        step_device = device if group.get("capturable", False) or group.get("fused", False) else "cpu"
+        for param in group["params"]:
+            state = optimizer.state.get(param, {})
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.to(step_device if k == "step" else device)
 
 
 def lora_state_dict(
