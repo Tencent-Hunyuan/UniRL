@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Dict, Iterator, Optional
+from typing import Callable, Dict, Iterator, Optional
 
 import torch
 from torch import nn
@@ -68,11 +68,11 @@ def gather_optimizer_state_dict(model: nn.Module, optimizer: torch.optim.Optimiz
     return full
 
 
-def gather_lora_state_dict(model: nn.Module) -> StateDict:
-    """Gather every adapter's LoRA tensors, preserving the model state-dict key format."""
+def gather_lora_state_dict(model: nn.Module, keep: Callable[[str], bool]) -> StateDict:
+    """Gather the LoRA tensors whose keys pass ``keep``, preserving the model state-dict key format."""
     gathered: StateDict = {}
     for key, value in model.state_dict().items():
-        if "lora_A" not in key and "lora_B" not in key:
+        if not keep(key):
             continue
         if isinstance(value, torch.Tensor) and value.is_meta:
             raise RuntimeError(f"gather_lora_state_dict: LoRA tensor {key!r} is still on meta")

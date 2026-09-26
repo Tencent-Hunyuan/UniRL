@@ -89,10 +89,10 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   near-zero `eta` with `add_kl_coefficient=true` — the KL divides by a transition std that
   scales with `eta` (the algorithm raises at init on `eta == 0`, but cannot judge "too small").
 - **`_transition_sigma` is `[1, S']`; `_gaussian_kl_div` broadcasts it to the means' rank** —
-  image means are `[B, S', C, H, W]` and video means `[B, S', C, T, H, W]`. The old fixed
-  `[1, S', 1, 1, 1]` right-aligned `S'` onto the channel axis for video: a raise when
-  `C != S'`, a silently mis-scaled per-step KL when `C == S'`. Never reshape sigma to a
-  hardcoded rank in a new consumer; pass the `[1, S']` tensor through `_gaussian_kl_div`.
+  image means are `[B, S', C, H, W]` and video means `[B, S', C, T, H, W]`. A hardcoded-rank
+  reshape (e.g. `[1, S', 1, 1, 1]`) right-aligns `S'` onto the channel axis for video — a raise
+  when `C != S'`, a silently mis-scaled per-step KL when `C == S'` — so pass the `[1, S']`
+  tensor through `_gaussian_kl_div` instead.
 - **AR `sampling_temperature` must equal the rollout `sampling.temperature`** —
   `ARStage.replay` rescales logits by it (`log_softmax(logits / T)`) to match SGLang's
   distribution; when unset it silently falls back to the `ARSamplingParams` default,

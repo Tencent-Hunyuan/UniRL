@@ -123,6 +123,7 @@ class BaseFSDP2Backend(Remote):
     _optimizer_step_count: int
     _eval_ema_active: bool
     _lora_meta: Optional[Dict[str, object]]
+    _frozen_adapters: Dict[str, str]  # name -> weight sha256
     _rollout_adapter_name: str
     _defer_grad_sync: bool
     _grad_sync_enabled: bool
@@ -148,7 +149,7 @@ class BaseFSDP2Backend(Remote):
         ema_cfg: Optional[EmaFullConfig],
     ) -> Optional[Shadow]:
         """Structural injection on the (possibly meta) trainable module."""
-        self._frozen_adapters: Dict[str, str] = {}  # name -> weight sha256
+        self._frozen_adapters = {}
         shadow: Optional[Shadow] = None
         if ema_lora_cfg is not None:
             shadow = inject_nft(
@@ -537,15 +538,12 @@ class BaseFSDP2Backend(Remote):
             return False
         return adapter_of_lora_key(key) not in self._frozen_adapters
 
-    def _check_frozen_adapters(self, lora_config: object) -> None:
+    def _check_frozen_adapters(self, lora_config: Optional[Dict[str, object]]) -> None:
         """Refuse to resume when the checkpoint's recorded frozen adapters differ from the live ones."""
-        recorded = (lora_config or {}).get("frozen_adapters") if isinstance(lora_config, dict) else None
-        if recorded is None:
-            return
-        recorded = dict(recorded)
-        if recorded == self._frozen_adapters:
-            return
+        recorded = (lora_config or {}).get("frozen_adapters")
         live = self._frozen_adapters
+        if recorded is None or recorded == live:
+            return
         added = sorted(set(live) - set(recorded))
         removed = sorted(set(recorded) - set(live))
         changed = sorted(
@@ -687,7 +685,7 @@ class BaseFSDP2Backend(Remote):
     def _gather_model_state(self, mode: str) -> StateDict:
         """Rank-0 model state for the single-file checkpoint."""
         if mode == "adapter":
-            return {k: v for k, v in gather_lora_state_dict(self.model).items() if self._is_student_lora_key(k)}
+            return gather_lora_state_dict(self.model, keep=self._is_student_lora_key)
         return gather_state_dict(self.model)
 
     def _load_model_state(self, model_state: StateDict, *, strict: bool) -> None:

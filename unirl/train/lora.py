@@ -267,7 +267,7 @@ def inject_frozen_adapter(
     # Weights need real (sharded) storage: FSDP/VeOmni materialize after injection.
     defer_after_materialize(
         model,
-        partial(_load_frozen_adapter, name=name, weight_path=weight_path, trainable_adapter=trainable_adapter),
+        partial(_load_frozen_adapter, name=name, weight_path=weight_path),
     )
 
     if _current_rank() == 0:
@@ -289,14 +289,18 @@ _LORA_BANKS = ("lora_A", "lora_B", "lora_embedding_A", "lora_embedding_B")
 _PEFT_PREFIX = "base_model.model."
 
 
+def _bank_index(parts: Sequence[str]) -> Optional[int]:
+    for bank in _LORA_BANKS:
+        if bank in parts:
+            return parts.index(bank)
+    return None
+
+
 def adapter_of_lora_key(key: str) -> Optional[str]:
     """Adapter name of a model state-dict LoRA key (``...lora_A.<adapter>.weight``), else None."""
     parts = key.split(".")
-    for bank in _LORA_BANKS:
-        if bank in parts:
-            idx = parts.index(bank)
-            return parts[idx + 1] if idx + 1 < len(parts) else None
-    return None
+    idx = _bank_index(parts)
+    return parts[idx + 1] if idx is not None and idx + 1 < len(parts) else None
 
 
 def _to_model_lora_key(key: str, name: str) -> str:
@@ -304,15 +308,14 @@ def _to_model_lora_key(key: str, name: str) -> str:
     if key.startswith(_PEFT_PREFIX):
         key = key[len(_PEFT_PREFIX) :]
     parts = key.split(".")
-    for bank in _LORA_BANKS:
-        if bank in parts:
-            idx = parts.index(bank)
-            return ".".join(parts[: idx + 1] + [name] + parts[idx + 1 :])
-    return key
+    idx = _bank_index(parts)
+    if idx is None:
+        return key
+    return ".".join(parts[: idx + 1] + [name] + parts[idx + 1 :])
 
 
-def _load_frozen_adapter(model: nn.Module, *, name: str, weight_path: str, trainable_adapter: str) -> None:
-    """Post-materialize op: load ``weight_path`` into adapter ``name`` on every rank and re-freeze it."""
+def _load_frozen_adapter(model: nn.Module, *, name: str, weight_path: str) -> None:
+    """Post-materialize op: load ``weight_path`` into the (already frozen) adapter ``name`` on every rank."""
     from unirl.train.backend.sharded_state import load_model_state_dict
 
     if weight_path.endswith(".safetensors"):
@@ -351,9 +354,6 @@ def _load_frozen_adapter(model: nn.Module, *, name: str, weight_path: str, train
     # Every rank holds the full (small) adapter dict; DCP slices each rank's own shard.
     load_model_state_dict(model, mapped, strict=False, broadcast_from_rank0=False)
 
-    _set_adapter_requires_grad(model, name, False)
-    _activate(model, trainable_adapter)
-    _set_adapter_requires_grad(model, trainable_adapter, True)
     if _current_rank() == 0:
         logger.info("_load_frozen_adapter(%r): %d tensor(s) from %s", name, len(mapped), weight_path)
 
