@@ -219,22 +219,16 @@ def _resolve_adapter_checkpoint(path: str) -> tuple:
     return config_path, weight_path
 
 
-def inject_frozen_adapter(
+def _inject_frozen_adapter(
     model: nn.Module,
     *,
     name: str,
     path: str,
-    trainable_adapter: str = "default",
 ) -> str:
     """Inject a frozen LoRA adapter now, load its weights after materialization; returns its content sha256."""
     from peft import LoraConfig, inject_adapter_in_model
     from peft.tuners.lora import LoraLayer
 
-    if not name or name == trainable_adapter:
-        raise ValueError(
-            f"inject_frozen_adapter: adapter name must be non-empty and differ from "
-            f"the trainable adapter {trainable_adapter!r}; got {name!r}."
-        )
     if name in adapter_names(model):
         raise ValueError(f"inject_frozen_adapter: adapter {name!r} already exists on the model.")
 
@@ -261,8 +255,8 @@ def inject_frozen_adapter(
 
     _set_adapter_requires_grad(model, name, False)
     # peft's inject path flips other adapters' requires_grad; restore the resting state.
-    _activate(model, trainable_adapter)
-    _set_adapter_requires_grad(model, trainable_adapter, True)
+    _activate(model, "default")
+    _set_adapter_requires_grad(model, "default", True)
     # Mirror inject_nft: keep diffusers' PeftAdapterMixin bookkeeping consistent.
     if hasattr(model, "_hf_peft_config_loaded"):
         model._hf_peft_config_loaded = True
@@ -364,24 +358,26 @@ class FrozenAdapters:
     def inject(cls, model: nn.Module, specs: Any) -> FrozenAdapters:
         """Inject every ``lora_cfg.frozen_adapters`` entry: structure now, weights after materialization."""
         return cls(
-            {s.name: inject_frozen_adapter(model, name=s.name, path=s.path) for s in normalize_frozen_adapters(specs)}
+            {s.name: _inject_frozen_adapter(model, name=s.name, path=s.path) for s in normalize_frozen_adapters(specs)}
         )
 
     def is_trainable_lora_key(self, key: str) -> bool:
         """True for ``lora_A`` / ``lora_B`` keys of a non-frozen adapter — what adapter checkpoints hold."""
-        return ("lora_A" in key or "lora_B" in key) and _adapter_of_lora_key(key) not in self.shas
+        if "lora_A" not in key and "lora_B" not in key:
+            return False
+        return not self.shas or _adapter_of_lora_key(key) not in self.shas
 
-    def check_resume(self, recorded: Optional[Dict[str, str]]) -> None:
+    def check_resume(self, lora_config: Optional[Dict[str, object]]) -> None:
         """Refuse a checkpoint that recorded a different frozen set; an empty or absent record imposes nothing."""
-        live = self.shas
-        if not recorded or recorded == live:
+        recorded = (lora_config or {}).get("frozen_adapters")
+        if not recorded or recorded == self.shas:
             return
-        added = sorted(set(live) - set(recorded))
-        removed = sorted(set(recorded) - set(live))
+        added = sorted(set(self.shas) - set(recorded))
+        removed = sorted(set(recorded) - set(self.shas))
         changed = sorted(
-            f"{name} ({recorded[name][:12]}... -> {live[name][:12]}...)"
-            for name in set(recorded) & set(live)
-            if recorded[name] != live[name]
+            f"{name} ({recorded[name][:12]}... -> {self.shas[name][:12]}...)"
+            for name in set(recorded) & set(self.shas)
+            if recorded[name] != self.shas[name]
         )
         raise RuntimeError(
             f"resume: frozen_adapters differ from the checkpoint's (added: {added}, removed: {removed}, "
@@ -419,7 +415,6 @@ __all__ = [
     "adapter_active",
     "adapter_names",
     "adapters_disabled",
-    "inject_frozen_adapter",
     "inject_lora",
     "normalize_module_selection",
     "normalize_optional_module_selection",

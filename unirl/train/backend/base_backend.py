@@ -177,7 +177,7 @@ class BaseFSDP2Backend(Remote):
                 task_type=lora_cfg.task_type,
             )
             # Frozen sibling adapters (e.g. OPD teachers) — see ../readme.md Gotchas.
-            self._frozen_adapters = FrozenAdapters.inject(model, getattr(lora_cfg, "frozen_adapters", None))
+            self._frozen_adapters = FrozenAdapters.inject(model, lora_cfg.frozen_adapters)
         if ema_cfg is not None:
             shadow = inject_mirror(model, prefix=ema_cfg.shadow_prefix)
         return shadow
@@ -483,7 +483,7 @@ class BaseFSDP2Backend(Remote):
         mode = checkpoint.get("save_mode", "full")
         strict = mode == "full"
         self._reject_meta(operation="load", checkpoint_format="torch", mode=mode)
-        self._frozen_adapters.check_resume((checkpoint.get("lora_config") or {}).get("frozen_adapters"))
+        self._frozen_adapters.check_resume(checkpoint.get("lora_config"))
         policy_state = checkpoint["policy_state_dict"]
         if mode == "adapter":
             policy_state = {k: v for k, v in policy_state.items() if self._frozen_adapters.is_trainable_lora_key(k)}
@@ -513,7 +513,7 @@ class BaseFSDP2Backend(Remote):
         has_meta_params = any(p.is_meta for p in self.model.parameters())
         strict = mode == "full" and not has_meta_params
 
-        self._frozen_adapters.check_resume((meta.get("lora_config") or {}).get("frozen_adapters"))
+        self._frozen_adapters.check_resume(meta.get("lora_config"))
         model_sd = drop_meta_entries(sharded_model_state_dict(self.model))
         if mode == "adapter":
             model_sd = {k: v for k, v in model_sd.items() if self._frozen_adapters.is_trainable_lora_key(k)}

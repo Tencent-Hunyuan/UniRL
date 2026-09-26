@@ -135,7 +135,7 @@ in `backend/base.py`; a multi-update-capable algorithm sets
   pair, so in `hybrid` mode torch logs one `ProcessGroupGloo::split ... Falling back to
   default options` warning per process while splitting the gloo half; it is expected.
 - **`frozen_adapters` (OPD teachers) load their weights *after* materialization, not at
-  injection** — `inject_frozen_adapter` builds the adapter structure pre-wrap (meta-safe,
+  injection** — `FrozenAdapters.inject` builds the adapter structure pre-wrap (meta-safe,
   so VeOmni meta-init bundles work), reads the peft checkpoint on every rank, maps
   `base_model.model.<m>.lora_A.weight` to `<m>.lora_A.<name>.weight`, and registers a
   `defer_after_materialize` op that refuses unexpected / missing / mis-shaped tensors and
