@@ -15,6 +15,7 @@ import torch
 from torch import nn
 
 from unirl.models.types.post_materialize import defer_after_materialize
+from unirl.utils.peft_merge import _strip_peft_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -271,7 +272,10 @@ def inject_frozen_adapter(
         raw = load_file(weight_path, device="cpu")
     else:
         raw = torch.load(weight_path, map_location="cpu", weights_only=True)
-    weights = {_to_model_lora_key(k, name): v for k, v in raw.items()}
+    # peft ``base_model.model.<m>.lora_A.weight`` -> model ``<m>.lora_A.<name>.weight``.
+    weights = {
+        _LORA_BANK_RE.sub(lambda m: f"{m.group(0)}.{name}", _strip_peft_prefix(k), count=1): v for k, v in raw.items()
+    }
 
     # Weights need real (sharded) storage: FSDP/VeOmni materialize after injection.
     defer_after_materialize(
@@ -294,33 +298,14 @@ def inject_frozen_adapter(
     return _weights_sha256(weights)
 
 
-_LORA_BANKS = ("lora_A", "lora_B", "lora_embedding_A", "lora_embedding_B")
-_PEFT_PREFIX = "base_model.model."
-
-
-def _bank_index(parts: Sequence[str]) -> Optional[int]:
-    for bank in _LORA_BANKS:
-        if bank in parts:
-            return parts.index(bank)
-    return None
+_LORA_BANK_RE = re.compile(r"\.lora_(?:embedding_)?[AB](?=\.|$)")
+_LORA_ADAPTER_RE = re.compile(r"\.lora_(?:embedding_)?[AB]\.([^.]+)")
 
 
 def adapter_of_lora_key(key: str) -> Optional[str]:
     """Adapter name of a model state-dict LoRA key (``...lora_A.<adapter>.weight``), else None."""
-    parts = key.split(".")
-    idx = _bank_index(parts)
-    return parts[idx + 1] if idx is not None and idx + 1 < len(parts) else None
-
-
-def _to_model_lora_key(key: str, name: str) -> str:
-    """Map a peft checkpoint key (``base_model.model.<m>.lora_A.weight``) to ``<m>.lora_A.<name>.weight``."""
-    if key.startswith(_PEFT_PREFIX):
-        key = key[len(_PEFT_PREFIX) :]
-    parts = key.split(".")
-    idx = _bank_index(parts)
-    if idx is None:
-        return key
-    return ".".join(parts[: idx + 1] + [name] + parts[idx + 1 :])
+    match = _LORA_ADAPTER_RE.search(key)
+    return match.group(1) if match else None
 
 
 def _load_frozen_adapter(model: nn.Module, *, name: str, weights: Dict[str, torch.Tensor], weight_path: str) -> None:
