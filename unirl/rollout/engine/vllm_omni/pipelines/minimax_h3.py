@@ -350,17 +350,24 @@ class MiniMaxH3RLPipeline(MiniMaxH3Pipeline):
         try:
             output = super().forward(request)
             video, audio = output.output
-            reward_num_frames = min(max(1, int(extra.get("reward_num_frames", 9))), int(video.shape[2]))
+            # Upstream already quantized the frames to uint8 (B, T, H, W, C), the
+            # layout its post-process requires; keep it for output.output.
+            if video.dtype != torch.uint8 or video.ndim != 5 or int(video.shape[-1]) not in (3, 4):
+                raise RuntimeError(
+                    f"MiniMax-H3 expected uint8 (B, T, H, W, C) frames, got {tuple(video.shape)} {video.dtype}"
+                )
+            num_frames = int(video.shape[1])
+            reward_num_frames = min(max(1, int(extra.get("reward_num_frames", 9))), num_frames)
             reward_indices = (
-                torch.linspace(0, int(video.shape[2]) - 1, steps=reward_num_frames, device=video.device).round().long()
+                torch.linspace(0, num_frames - 1, steps=reward_num_frames, device=video.device).round().long()
             )
-            reward_video = video.index_select(2, reward_indices).detach().to("cpu")
+            reward_video = video.index_select(1, reward_indices).detach().to("cpu")
             reward_audio = audio[0].transpose(0, 1).contiguous().detach().to(device="cpu", dtype=torch.float32)
             # vLLM-Omni serializes only declared DiffusionOutput fields; its
             # trajectory fields accept dictionaries, so the joint H3 replay
             # payload travels there rather than on an undeclared attribute.
             payload = {
-                "reward_video": reward_video.clamp(0, 1).mul(255).round().to(torch.uint8),
+                "reward_video": reward_video.permute(0, 4, 1, 2, 3).contiguous(),
                 "reward_audio": reward_audio,
             }
             if self._rl_sde_indices:
