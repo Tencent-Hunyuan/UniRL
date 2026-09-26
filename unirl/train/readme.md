@@ -142,26 +142,16 @@ in `backend/base.py`; a multi-update-capable algorithm sets
   `NCCL_CTA_POLICY` must stay unset or `2`. WORLD keeps the usual `cpu:gloo,cuda:nccl`
   pair, so in `hybrid` mode torch logs one `ProcessGroupGloo::split ... Falling back to
   default options` warning per process while splitting the gloo half; it is expected.
-- **`frozen_adapters` (OPD teachers) load their weights *after* materialization, not at
-  injection** — `FrozenAdapters.inject` builds the adapter structure pre-wrap (meta-safe,
-  so VeOmni meta-init bundles work) from the full saved peft config, reads the checkpoint on
-  every rank, maps `base_model.model.<m>.lora_A.weight` to `<m>.lora_A.<name>.weight`, and
-  refuses unexpected / missing / mis-shaped tensors right there, before the base weights
-  load. Teachers must be plain LoRA deltas: base-rewriting inits (pissa / olora / ...,
-  unless converted), `modules_to_save`, `layer_replication`, `trainable_token_indices`,
-  DoRA, and `bias != "none"` are rejected. A `defer_after_materialize` op then reshards the
-  weights via `set_model_state_dict(full_state_dict=True)`. Anything that reads teacher
-  weights before `apply_deferred_ops` gets something other than the checkpoint: peft's random
-  `lora_A` over a zeroed `lora_B` (a null teacher) on an eager bundle, and *uninitialized*
-  storage on a meta-init one, because `to_empty` wipes whatever peft wrote. `inject_lora`
-  defers `_reset_adapter` for the trainable adapter for exactly the same reason.
-- **Adapter checkpoints hold only the trainable adapter(s); frozen adapters are excluded on
-  save *and* load** — they are re-created from `frozen_adapters` paths at build time, so
-  loading them back would silently pin an old teacher over a changed recipe. The checkpoint
-  records each frozen adapter's content sha256 (sorted key / dtype / shape / bytes, so
-  re-serializing the same weights keeps it) under `lora_config.frozen_adapters`. When that
-  record is non-empty, `load` raises if the live set or any hash differs; a checkpoint
-  trained without teachers (or written before this field existed) resumes into any teacher set.
+- **`lora_cfg.frozen_adapters` (OPD teachers) have real weights only after
+  `apply_deferred_ops`** — the adapter is injected pre-wrap so meta-init bundles work, but
+  its weights load after materialization; reading a teacher earlier sees a null or
+  uninitialized adapter. Teachers must be plain LoRA deltas: unconverted base-rewriting
+  inits (pissa, olora, ...), `modules_to_save`, `layer_replication`,
+  `trainable_token_indices`, DoRA, and `bias != "none"` are rejected at startup.
+- **Adapter checkpoints exclude frozen teachers, and resume requires the same teachers** —
+  teachers reload from their paths and the checkpoint pins each by a content sha256, so a
+  different teacher set or different weights raises on `load`. A checkpoint trained without
+  teachers resumes into any teacher set.
 
 ## Profiling → Perfetto
 
