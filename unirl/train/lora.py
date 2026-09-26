@@ -217,8 +217,8 @@ def _inject_frozen_adapter(
     peft_cfg = LoraConfig.from_pretrained(model_id, subfolder=subfolder)
     init = peft_cfg.init_lora_weights
     if isinstance(init, str) and init not in _DELTA_INITS:
-        # pissa / olora / corda / loftq / mica / lora_ga rewrite the (shared) base weight at inject time, and an
-        # unconverted adapter of that kind is only valid on top of that rewritten base.
+        # pissa / olora / corda / loftq / lora_ga rewrite the base weight when they initialize (pissa / olora
+        # do so here, on the shared student base), so an unconverted adapter only fits that rewritten base.
         raise ValueError(
             f"inject_frozen_adapter: {path!r} was saved with init_lora_weights={init!r}, so its weights assume "
             "a modified base model. Re-save it with save_pretrained(path_initial_model_for_weight_conversion=...) "
@@ -239,6 +239,9 @@ def _inject_frozen_adapter(
             "(no modules_to_save / layer_replication / trainable_token_indices / DoRA, bias='none')."
         )
     peft_cfg.lora_dropout = 0.0
+    # The checkpoint overwrites the weights after materialization; skip peft's init (MiCA / orthogonal run an SVD
+    # of the base weight, which breaks on meta-init bases). The remaining delta inits share the plain LoRA forward.
+    peft_cfg.init_lora_weights = True
     inject_adapter_in_model(peft_cfg, model, adapter_name=name)
 
     covered = [m for m in model.modules() if isinstance(m, LoraLayer) and name in getattr(m, "lora_A", {})]
@@ -309,7 +312,7 @@ def _inject_frozen_adapter(
     return _weights_sha256(weights)
 
 
-_DELTA_INITS = ("gaussian", "eva", "orthogonal")
+_DELTA_INITS = ("gaussian", "eva", "orthogonal", "mica")
 _LORA_BANK_RE = re.compile(r"\.lora_(?:embedding_)?[AB](?=\.|$)")
 _LORA_ADAPTER_RE = re.compile(r"\.lora_(?:embedding_)?[AB]\.([^.]+)")
 
