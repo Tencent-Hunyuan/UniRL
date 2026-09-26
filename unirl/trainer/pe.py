@@ -156,14 +156,14 @@ class PETrainer(BaseTrainer):
         base = sampling if sampling is not None else self.sampling_params
         diff_params = base.get("diffusion")
         ar_params = base.get("ar")
-        sde_indices = diff_params.resolve_sde_indices(rollout_id)
+        sde_indices = diff_params.get_sde_indices(rollout_id)
         diffusion = dataclasses.replace(diff_params, sde_indices=sde_indices, scheduler=None)
         request = prepare_input_sample(
             inputs,
             rollout_id,
             allowed_primitives={"text"},
             caller="PETrainer._build_request_sample",
-            root_control={"ar": {}, "chat": {}},
+            control={"ar": {}, "chat": {}},
             require_single_input_part=True,
         )
         return request.fork(ar_params.samples_per_prompt, sampling_params=ar_params).fork(

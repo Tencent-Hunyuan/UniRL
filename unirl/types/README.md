@@ -52,7 +52,6 @@ it is not inferred from `sampling_params.samples_per_prompt`.
 | `primitives` | Input `Part.primitives`, keyed by canonical modality (`text`, `image`, `video`, `audio`, or sparse URI container `media`) |
 | `request_conditions` | No single request-level replacement. Keep raw inputs on ancestor `Part.primitives`; the generated part stores the encoded replay inputs in `Part.conditions`. Precomputed diffusion `initial_latents` belong on the generated `LatentSegment.initial_latents` |
 | `sampling_params` | One typed `Part.sampling_params` per generated stage. Composed rollouts use one fork per stage |
-| `stage_config` | Root input `Part.control` |
 | `sigmas` | `DiffusionSamplingParams.sigmas` on the diffusion generation part |
 | `metadata` | Root input `Part.metadata`; use `Sample.root_metadata(part_index)` to align it with descendants |
 | `init_noise_group_ids` | Derived from generated `sample_ids` / `group_ids` by `NoiseRecipe.from_sample(...)`; deterministic eval may override them on the gen `Part` |
@@ -123,13 +122,12 @@ request = RolloutReq(
     group_ids=["prompt-0"],
     primitives={"text": Texts(texts=["Write a caption"])},
     sampling_params={"ar": ar},
-    stage_config={"ar": {"system_instruction": "Be concise"}},
 )
 response = engine.generate(request)
 text_track = response.tracks["ar"]
 ```
 
-After:
+After. Root-input overlays (task, bot_task, chat, ar) live on `Part.control`:
 
 ```python
 from unirl.types.sample import Part, Sample

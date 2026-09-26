@@ -8,14 +8,16 @@ from contextlib import contextmanager, nullcontext
 from typing import Dict, Iterator, Optional, Set, Tuple
 
 import torch
-from hydra.utils import get_object, instantiate
+from hydra.utils import get_class, get_object, instantiate
 from omegaconf import DictConfig
 
 from unirl.distributed.group.placement import placement, remote
+from unirl.distributed.group.results import rank_zero_bool
 from unirl.distributed.tensor import hydrate
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample
 from unirl.trainer.hydra import parse_hydra_cfg, remote_hydra
+from unirl.trainer.rollout_sleep import must_preserve_rollout_weights
 from unirl.types.sample import Sample
 from unirl.types.sampling import BaseSamplingParams, total_samples_per_prompt
 from unirl.utils.graceful_shutdown import run_with_timeout
@@ -66,7 +68,7 @@ class ARTrainer(BaseTrainer):
         pipeline_cfg: DictConfig,
         backend_cfg: DictConfig,
         rollout_cfg: DictConfig,
-        reward_cfg: DictConfig,
+        reward_cfg: Optional[DictConfig],
         algorithm_cfg: DictConfig,
         stack_cfg: DictConfig,
         data_source_cfg: DictConfig,
@@ -91,6 +93,25 @@ class ARTrainer(BaseTrainer):
             rollout_cfg=rollout_cfg,
             stack_cfg=stack_cfg,
         )
+        # Teacher-anchored algorithms declare requires_backend / requires_advantages=False
+        # (mirrors DiffusionTrainer._build_train_side); validate before building anything so a
+        # misconfigured recipe fails fast without a half-constructed device pool or actors.
+        algorithm_cls = get_class(algorithm_cfg["_target_"])
+        self._algorithm_requires_advantages = algorithm_cls.requires_advantages
+        eval_interval = int(eval_interval)
+        if reward_cfg is None:
+            if self._algorithm_requires_advantages:
+                raise ValueError(
+                    "The recipe has no `reward:` block, but the algorithm requires advantages "
+                    "(requires_advantages=True) — RL training cannot run without a reward model. "
+                    "Only supervised/teacher-anchored algorithms may omit `reward:`."
+                )
+            if eval_interval > 0:
+                raise ValueError(
+                    f"eval_interval={eval_interval} needs a reward to score eval generations, "
+                    "but the recipe has no `reward:` block. Set eval_interval: 0 or configure a "
+                    "(monitoring-only) reward."
+                )
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
         self.batch_size = batch_size
         self.adv_normalization_scope = adv_normalization_scope
@@ -99,7 +120,7 @@ class ARTrainer(BaseTrainer):
         if self.advantage_mode not in ("grpo", "gae"):
             raise ValueError(f"ARTrainer: advantage_mode must be 'grpo' or 'gae', got {advantage_mode!r}")
         self.balance_shards = bool(balance_shards)
-        self.eval_interval = int(eval_interval)
+        self.eval_interval = eval_interval
         _num = int(eval_num_prompts)
         self.eval_num_prompts = -1 if _num < 0 else _num
         self.eval_batch_size = max(1, int(eval_batch_size))
@@ -118,6 +139,8 @@ class ARTrainer(BaseTrainer):
         self.sampling_params: Dict[str, BaseSamplingParams] = build_sampling_dict(sampling_cfg)
 
         self.weight_sync = None
+        self._gpu_streaming_sync = False
+        self.reward = None
         self._supports_staged_wake = False
 
         with placement(self.pool, fraction=1.0, shared_workers=True):
@@ -125,8 +148,10 @@ class ARTrainer(BaseTrainer):
             self.pipeline = remote_hydra(pipeline_cfg, bundle=self.bundle)
             self.backend = remote_hydra(backend_cfg, bundle=self.bundle)
 
-            self.reward = remote_hydra(reward_cfg)
-            self.algorithm = remote_hydra(algorithm_cfg, pipeline=self.pipeline)
+            if reward_cfg is not None:
+                self.reward = remote_hydra(reward_cfg)
+            algo_extra = {"backend": self.backend} if algorithm_cls.requires_backend else {}
+            self.algorithm = remote_hydra(algorithm_cfg, pipeline=self.pipeline, **algo_extra)
             self.stack = remote_hydra(stack_cfg, fsdp_backend=self.backend, algorithm=self.algorithm)
 
             rollout_parsed = parse_hydra_cfg(rollout_cfg)
@@ -204,6 +229,14 @@ class ARTrainer(BaseTrainer):
                     self.weight_sync = remote_hydra(sync_cfg, backend=self.backend)
                     self.weight_sync.set_rollout_targets([(self.rollout.role_name, self.rollout.workers)])
 
+        if self.weight_sync is not None:
+            uses_gpu_streaming = getattr(self.weight_sync, "uses_gpu_streaming", None)
+            if callable(uses_gpu_streaming):
+                self._gpu_streaming_sync = rank_zero_bool(
+                    uses_gpu_streaming(),
+                    name="weight_sync.uses_gpu_streaming",
+                )
+
     def _ensure_anchored_backend_loaded(self) -> None:
         if not self._enable_fsdp_offload or self._anchored_backend_offloaded is False:
             return
@@ -236,6 +269,24 @@ class ARTrainer(BaseTrainer):
         self.rollout.sleep()
         self._anchored_rollout_awake = False
 
+    def _uses_gpu_streaming_weight_sync(self) -> bool:
+        return self._gpu_streaming_sync
+
+    def _preserve_rollout_weights_for_next_sleep(self) -> None:
+        if not self._uses_gpu_streaming_weight_sync():
+            return
+        preserve = getattr(self.rollout, "preserve_weights_for_next_sleep", None)
+        if not callable(preserve):
+            raise RuntimeError("GPU-streaming weight sync requires rollout sleep-preservation support")
+        preserve()
+
+    def _must_preserve_rollout_weights(self, *, next_phase_syncs: bool, has_next_phase: bool) -> bool:
+        return must_preserve_rollout_weights(
+            uses_gpu_streaming=self._uses_gpu_streaming_weight_sync(),
+            next_phase_syncs=next_phase_syncs,
+            has_next_phase=has_next_phase,
+        )
+
     @contextmanager
     def _anchored_rollout_session(
         self,
@@ -247,6 +298,11 @@ class ARTrainer(BaseTrainer):
         original_error: Optional[BaseException] = None
         try:
             if sync_weights and self.weight_sync is not None:
+                if self._uses_gpu_streaming_weight_sync():
+                    raise RuntimeError(
+                        "vLLM native IPC weight sync requires the SPMD one-Actor-rank-per-TP-rank "
+                        "layout and does not support rollout_anchor_device"
+                    )
                 self._ensure_anchored_backend_loaded()
                 self.weight_sync.extract()
             self._ensure_anchored_backend_offloaded()
@@ -294,14 +350,31 @@ class ARTrainer(BaseTrainer):
         do_sync = sync_weights and self.weight_sync is not None
         train_state_maybe_offloaded = False
         full_wake_after_train_offload_in_progress = False
+        gpu_streaming_sync = bool(do_sync and self._uses_gpu_streaming_weight_sync())
+        if gpu_streaming_sync and not do_offload:
+            raise RuntimeError(
+                "vLLM native IPC weight sync requires enable_fsdp_offload=true "
+                "so optimizer/model state can be released around rollout"
+            )
 
         try:
             if do_sync and do_offload and self._supports_staged_wake:
-                self.rollout.wake_up(tags=["weights"])
-                self.weight_sync.sync()
-                train_state_maybe_offloaded = True
-                self.backend.offload()
-                full_wake_after_train_offload_in_progress = True
+                if gpu_streaming_sync:
+                    # Keep only the FSDP local parameter shard resident.  The
+                    # optimizer is not needed by weight export and gradients
+                    # have already been consumed by the preceding step.
+                    self.backend.offload(model=False, optimizer=True, clear_gradients=True)
+                    train_state_maybe_offloaded = True
+                    full_wake_after_train_offload_in_progress = True
+                    self.rollout.wake_up(tags=["weights"])
+                    self.weight_sync.sync()
+                    self.backend.offload(model=True, optimizer=False)
+                else:
+                    self.rollout.wake_up(tags=["weights"])
+                    self.weight_sync.sync()
+                    train_state_maybe_offloaded = True
+                    self.backend.offload()
+                    full_wake_after_train_offload_in_progress = True
                 self.rollout.wake_up()
                 full_wake_after_train_offload_in_progress = False
             elif do_sync:
@@ -357,6 +430,7 @@ class ARTrainer(BaseTrainer):
         training_progress: float = 0.0,
         sync_weights: bool = False,
         rollout_id: int = 0,
+        preserve_rollout_weights: bool = False,
     ) -> Tuple[TrainStepResult, float]:
         """One ``rollout → reward → advantage → optimizer step`` pass."""
         t0 = time.perf_counter()
@@ -364,17 +438,22 @@ class ARTrainer(BaseTrainer):
         if not anchored:
             train_state_offloaded = self._prepare_rollout(sync_weights=sync_weights)
             try:
+                if preserve_rollout_weights:
+                    self._preserve_rollout_weights_for_next_sleep()
                 sample = self.rollout.generate(sample)
             finally:
                 self._finish_rollout(train_state_offloaded=train_state_offloaded)
         else:
             with self._anchored_rollout_session(sync_weights=sync_weights, restore_backend=False):
+                if preserve_rollout_weights:
+                    self._preserve_rollout_weights_for_next_sleep()
                 sample = self.rollout.generate(sample)
                 from unirl.trainer.unified_model import deep_hydrate
 
                 sample = deep_hydrate(sample)
 
-        sample = self.reward.score_and_attach(sample)
+        if self.reward is not None:
+            sample = self.reward.score_and_attach(sample)
 
         part = sample.parts[-1]
         mean_reward = 0.0
@@ -383,12 +462,19 @@ class ARTrainer(BaseTrainer):
             if isinstance(part.component_rewards, dict):
                 part.component_rewards = {name: hydrate(value) for name, value in part.component_rewards.items()}
             mean_reward = float(part.rewards.to(torch.float32).mean().item())
-            if self.advantage_mode == "grpo":
+            if self._algorithm_requires_advantages and self.advantage_mode == "grpo":
                 part = part.compute_advantages(
                     normalize=self.normalize_adv_by_std,
                     scope=self.adv_normalization_scope,
                 )
-            sample = sample.with_parts([*sample.parts[:-1], part])
+                sample = sample.with_parts([*sample.parts[:-1], part])
+
+        # Project root-Part metadata onto the gen Part's rows; only ever fills an empty field.
+        gen_part = sample.parts[-1]
+        if not gen_part.metadata:
+            root_md = sample.root_metadata(-1)
+            if any(root_md):
+                gen_part.metadata = [dict(md) if md else {} for md in root_md]
 
         self._dump_rollout_samples(sample, rollout_id)
         self._drop_decoded(sample, rollout_id=rollout_id)
@@ -411,8 +497,13 @@ class ARTrainer(BaseTrainer):
         )
         return result, mean_reward
 
-    def evaluate(self, rollout_id: int) -> float:
+    def evaluate(self, rollout_id: int, *, preserve_rollout_weights: bool = False) -> float:
         """Periodic eval — ``avg@k`` accuracy on the eval prompt set."""
+        if self.reward is None:
+            raise RuntimeError(
+                "ARTrainer.evaluate: no reward configured (the recipe has no `reward:` "
+                "block) — evaluation scores generations and needs one."
+            )
         import dataclasses
 
         eval_ar = dataclasses.replace(
@@ -451,6 +542,8 @@ class ARTrainer(BaseTrainer):
         )
         try:
             with eval_session:
+                if preserve_rollout_weights:
+                    self._preserve_rollout_weights_for_next_sleep()
                 for eval_inputs in eval_batches:
                     batch_n += 1
                     real_prompt_n = eval_inputs.batch_size
@@ -597,7 +690,14 @@ class ARTrainer(BaseTrainer):
         )
         try:
             if self.eval_interval > 0:
-                self.evaluate(rollout_id=-1)
+                first_rollout_syncs = resumed and start_rollout < num_rollouts
+                self.evaluate(
+                    rollout_id=-1,
+                    preserve_rollout_weights=self._must_preserve_rollout_weights(
+                        has_next_phase=start_rollout < num_rollouts,
+                        next_phase_syncs=first_rollout_syncs,
+                    ),
+                )
             for rollout_id in range(start_rollout, num_rollouts):
                 training_progress = rollout_id / max(1, num_rollouts - 1)
                 inputs = self.data_source.get_samples(self.batch_size)
@@ -605,15 +705,30 @@ class ARTrainer(BaseTrainer):
                 sync_weights = (rollout_id > 0 and rollout_id % interval == 0) or (
                     resumed and rollout_id == start_rollout
                 )
+                next_rollout_id = rollout_id + 1
+                periodic_eval_follows = self.eval_interval > 0 and next_rollout_id % self.eval_interval == 0
+                next_rollout_syncs = next_rollout_id < num_rollouts and next_rollout_id % interval == 0
+                preserve_rollout_weights = self._must_preserve_rollout_weights(
+                    has_next_phase=next_rollout_id < num_rollouts,
+                    next_phase_syncs=periodic_eval_follows or next_rollout_syncs,
+                )
                 result, mean_reward = self.train_step(
                     sample,
                     training_progress=training_progress,
                     sync_weights=sync_weights,
                     rollout_id=rollout_id,
+                    preserve_rollout_weights=preserve_rollout_weights,
                 )
                 self.wandb_logger.log_progress(rollout_id, num_rollouts, result, mean_reward, logger=logger)
                 if self.eval_interval > 0 and (rollout_id + 1) % self.eval_interval == 0:
-                    self.evaluate(rollout_id=rollout_id)
+                    next_rollout_syncs = next_rollout_id < num_rollouts and next_rollout_id % interval == 0
+                    self.evaluate(
+                        rollout_id=rollout_id,
+                        preserve_rollout_weights=self._must_preserve_rollout_weights(
+                            has_next_phase=next_rollout_id < num_rollouts,
+                            next_phase_syncs=next_rollout_syncs,
+                        ),
+                    )
                 self.maybe_save_checkpoint(
                     rollout_id, num_rollouts, save_interval=save_interval, save_dir=save_dir, save_mode=save_mode
                 )

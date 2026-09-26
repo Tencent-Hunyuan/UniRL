@@ -104,16 +104,15 @@ reward:
       w_vq: 1.0
       w_mq: 1.0
       w_ta: 1.0
-      differentiable: true        # REFL requires grad through the reward forward
 
 data_source:
   _target_: unirl.data.data_source.MultimodalRLDataSource
   args:
     run:
-      data_path: ${oc.env:DATA_PATH}
-      eval_data_path: ${oc.env:EVAL_DATA_PATH,${oc.env:DATA_PATH}}
+      data_path: ${oc.env:DATA_PATH,datasets/refl_videoalign/train.txt}
+      eval_data_path: ${oc.env:EVAL_DATA_PATH,${oc.env:DATA_PATH,datasets/refl_videoalign/test.txt}}
       seed: 42
-      shuffle: false
+      shuffle: true
     algorithm:
       prompts_per_rollout: ${batch_size}
 

@@ -168,7 +168,7 @@ sampling:
   seed: 42
   init_same_noise: false               # per-sample x_T (NoiseRecipe r{rollout}:{sample}); diverse GRPO groups
   # SDE steps: 2 random steps drawn from the early half [0, 7) of the 14-step schedule,
-  # resolved PER ROLLOUT via AllSDEScheduler → resolve_sde_indices (shared across the
+  # resolved PER ROLLOUT via AllSDEScheduler → get_sde_indices (shared across the
   # GRPO group, seeded by rollout_id). Uses UniRL's NATIVE timestep_fraction (early-half
   # restriction) + num_sde_steps (random-k) — zero framework change. Differs from
   # flow_grpo only in that the 2 SDE steps are SCATTERED, not a contiguous window;

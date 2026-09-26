@@ -16,6 +16,7 @@ from unirl.distributed.group.remote import Remote
 from unirl.distributed.tensor.batch import _move_value
 from unirl.train.backend.fsdp import FSDPBackend
 from unirl.train.stack.planner import CountPlanner, MicroPlanner, Plan, UpdatePlan, _positive_int
+from unirl.types.loss_agg import LossAggMode
 from unirl.types.sample import Part
 from unirl.utils.metrics import aggregate_numeric_metrics
 
@@ -107,7 +108,6 @@ class TrainStack(Remote):
         self.max_grad_norm = float(max_grad_norm)
         self.micro_planner: MicroPlanner = micro_planner if micro_planner is not None else CountPlanner()
         _validate_anchor_contract(algorithm)
-        self.micro_planner.validate(algorithm)
 
     def prepare_segment(self, part: Part, *, plans: Plan) -> None:
         """Freeze the π_old anchor once, before the ``num_updates_per_batch`` loop."""
@@ -250,20 +250,15 @@ class TrainStack(Remote):
         self.fsdp_backend.on_rollout_end()
 
     def _resolve_loss_scales(self, part: Part, *, micros: UpdatePlan) -> Tuple[List[float], Optional[float]]:
-        """Per-micro ``loss_scale`` factors for one optimizer step."""
-        weighting = str(getattr(self.algorithm, "loss_weighting", "sample"))
-        if weighting == "sample":
+        """Per-micro ``loss_scale``: valid-token share for ``token-mean``, else sample share (grouping-invariant)."""
+        if getattr(self.algorithm, "loss_agg_mode", None) != LossAggMode.TOKEN_MEAN:
             update_total = sum(end - start for start, end in micros)
             return [(end - start) / update_total for start, end in micros], None
-        if weighting != "token":
-            raise ValueError(
-                f"{type(self).__name__}: unknown algorithm.loss_weighting={weighting!r}; expected 'sample' or 'token'."
-            )
         rank_info = getattr(self, "rank_info", None)
         if rank_info is not None and rank_info.sp_size > 1:
             # Reject sequence parallelism until loss denominators include the SP dimension.
             raise ValueError(
-                f"{type(self).__name__}: loss_weighting='token' is not validated under "
+                f"{type(self).__name__}: loss_agg_mode='token-mean' is not validated under "
                 f"sequence parallelism (sp_size={rank_info.sp_size}); use sp_size=1."
             )
         weights = [self._micro_loss_weight(part, start, end) for start, end in micros]
@@ -282,7 +277,7 @@ class TrainStack(Remote):
         """Valid-token count of one contiguous micro range (loss_mask-aware)."""
         segment = part.segment
         if segment is None:
-            raise ValueError(f"{type(self).__name__}: loss_weighting='token' requires a segment.")
+            raise ValueError(f"{type(self).__name__}: loss_agg_mode='token-mean' requires a segment.")
         cu = segment.cu_seqlens
         loss_mask = getattr(segment, "loss_mask", None)
         if loss_mask is not None and cu is not None:
@@ -290,7 +285,7 @@ class TrainStack(Remote):
         if segment.lengths is not None:
             return float(segment.lengths[start:end].sum().item())
         raise ValueError(
-            f"{type(self).__name__}: loss_weighting='token' requires a packed segment "
+            f"{type(self).__name__}: loss_agg_mode='token-mean' requires a packed segment "
             "(cu_seqlens/lengths) — build it via TextSegment.pack(...)."
         )
 

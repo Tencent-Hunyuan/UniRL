@@ -8,13 +8,17 @@ from typing import Any, Dict, Mapping, Optional, Tuple, Type
 import torch
 
 from unirl.types.conditions import Condition
+from unirl.types.loss_agg import parse_loss_agg_mode
 from unirl.types.segments.text import TextSegment
 
 from .base import (
     AlgorithmStepResult,
     BaseAlgorithmConfig,
     StageAlgorithm,
+    _prepare_ar_logp_anchor,
+    aggregate_token_losses,
     rollout_replay_logp_absdiff,
+    select_active_tokens,
     typed_conditions,
 )
 from .grpo import GRPO
@@ -58,6 +62,7 @@ def _dppo_loss(
     old_logp: torch.Tensor,
     advantages: torch.Tensor,
     delta: float,
+    mask: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """DPPO per-token loss over packed-varlen ``[total_tokens]`` (paper §3; uniform Binary-TV hard mask)."""
     log_diff = torch.clamp(new_logp - old_logp, min=-20.0, max=20.0)
@@ -74,6 +79,7 @@ def _dppo_loss(
         )
 
     pg_losses = -adv * ratio * keep
+    ratio, log_diff, keep = select_active_tokens(mask, ratio, log_diff, keep)
     metrics = {
         "ratio_mean": ratio.mean().detach(),
         "ratio_max": ratio.max().detach(),
@@ -87,7 +93,7 @@ class DPPO(StageAlgorithm):
     """DPPO for AR token-level policies — the foundational Binary-TV trust region."""
 
     supports_multi_update = True
-    anchor_fields = ("log_probs",)
+    anchor_fields = ("log_probs", "rollout_log_probs")
 
     @property
     def recomputes_anchor(self) -> bool:
@@ -115,7 +121,7 @@ class DPPO(StageAlgorithm):
         self.dppo_delta = float(dppo_delta)
         if self.dppo_delta <= 0.0:
             raise ValueError(f"DPPO: dppo_delta must be > 0; got {self.dppo_delta}")
-        self.loss_agg_mode = str(loss_agg_mode)
+        self.loss_agg_mode = parse_loss_agg_mode(loss_agg_mode, owner="DPPO").value
         self.horizon = int(horizon)
         if sampling_temperature is None:
             from unirl.types.sampling import ARSamplingParams
@@ -134,14 +140,14 @@ class DPPO(StageAlgorithm):
         segment: "TextSegment",
     ) -> None:
         """Freeze the ``pi_old`` / ``mu`` anchor before the ``num_updates_per_batch`` loop, per ``old_logp_source``."""
-        if self.old_logp_source != "replay":
-            return
-        if segment.tokens is None or segment.log_probs is None or int(segment.tokens.shape[0]) == 0:
-            return
-        typed_conds = typed_conditions(conditions, self.conditions_cls)
-        with torch.no_grad():
-            frozen = self.stage.replay(typed_conds, segment=segment, temperature=self.sampling_temperature)
-        segment.log_probs = frozen.detach().cpu()
+        _prepare_ar_logp_anchor(
+            stage=self.stage,
+            conditions=conditions,
+            segment=segment,
+            conditions_cls=self.conditions_cls,
+            old_logp_source=self.old_logp_source,
+            sampling_temperature=self.sampling_temperature,
+        )
 
     def compute_loss_and_backward(
         self,
@@ -170,23 +176,25 @@ class DPPO(StageAlgorithm):
             old_logp=old_logp,
             advantages=adv_per_token,
             delta=self.dppo_delta,
+            mask=segment.loss_mask,
         )
 
-        if segment.loss_mask is not None:
-            mask = segment.loss_mask.to(dtype=loss_per_elem.dtype, device=loss_per_elem.device)
-            loss_per_elem = loss_per_elem * mask
-
-        if self.loss_agg_mode == "seq-mean-token-sum-norm" and segment.lengths is not None:
-            parts = torch.split(loss_per_elem, segment.lengths.tolist())
-            loss = torch.stack([p.sum() for p in parts]).mean() / float(self.horizon)
-        else:
-            loss = loss_per_elem.mean()
+        loss = aggregate_token_losses(
+            loss_per_elem,
+            lengths=segment.lengths,
+            loss_mask=segment.loss_mask,
+            loss_agg_mode=self.loss_agg_mode,
+            horizon=self.horizon,
+        )
         (loss * loss_scale).backward()
 
+        rollout_logp = (segment.rollout_log_probs if segment.rollout_log_probs is not None else segment.log_probs).to(
+            dtype=new_logp.dtype, device=new_logp.device
+        )
         metrics: Dict[str, Any] = {
             "policy_loss": float(loss.detach().item()),
             "dppo_delta": self.dppo_delta,
-            **rollout_replay_logp_absdiff(new_logp, old_logp),
+            **rollout_replay_logp_absdiff(new_logp, rollout_logp, segment.loss_mask),
             **{k: float(v.item()) for k, v in ratio_metrics.items()},
         }
         return AlgorithmStepResult(
