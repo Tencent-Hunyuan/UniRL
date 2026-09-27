@@ -16,6 +16,7 @@ from unirl.distributed.group.remote import Remote
 from unirl.distributed.tensor.batch import _move_value
 from unirl.train.backend.fsdp import FSDPBackend
 from unirl.train.stack.planner import CountPlanner, MicroPlanner, Plan, UpdatePlan, UpdatePlanner, _positive_int
+from unirl.train.stack.planner.update import Arrangement, _micro_part, _restore_row_order
 from unirl.types.loss_agg import LossAggMode
 from unirl.types.sample import Part
 from unirl.utils.metrics import aggregate_numeric_metrics
@@ -65,13 +66,6 @@ def _align_track_to_model(part: Part, *, device: torch.device) -> None:
         part.advantages = part.advantages.to(device=device)
 
 
-def _release_reordered_track_inputs(part: Part) -> None:
-    """Drop device-heavy fields after a planner has produced an independent reordered Part."""
-    part.segment = None
-    part.conditions = {}
-    part.advantages = None
-
-
 def _validate_anchor_contract(algorithm: StageAlgorithm) -> None:
     """Reject anchor declarations whose per-micro outputs would be discarded."""
     recomputes_anchor = algorithm.recomputes_anchor
@@ -94,7 +88,7 @@ class TrainStack(Remote):
         num_updates_per_batch: int = 1,
         micro_planner: Optional[MicroPlanner] = None,
         shuffle_updates: bool = False,
-        shuffle_seed: Optional[int] = None,
+        shuffle_seed: int = 0,
     ) -> None:
         super().__init__()
         cls = type(self).__name__
@@ -123,7 +117,7 @@ class TrainStack(Remote):
         )
         _validate_anchor_contract(algorithm)
 
-    def prepare_segment(self, part: Part, *, plans: Plan) -> None:
+    def prepare_segment(self, part: Part, *, plans: Plan, order: Optional[torch.Tensor]) -> None:
         """Freeze the π_old anchor once, before the ``num_updates_per_batch`` loop."""
         if part.segment is None:
             return
@@ -137,7 +131,7 @@ class TrainStack(Remote):
             return
         collected: Dict[str, List[torch.Tensor]] = {field: [] for field in algorithm.anchor_fields}
         for start, end in micro_slices:
-            micro = part.slice(start, end)
+            micro = _micro_part(part, order, start, end)
             algorithm.prepare_segment(conditions=micro.conditions, segment=micro.segment)
             for field in collected:
                 value = getattr(micro.segment, field, None)
@@ -148,13 +142,14 @@ class TrainStack(Remote):
                     )
                 collected[field].append(value)
         for field, parts in collected.items():
-            setattr(part.segment, field, torch.cat(parts, dim=0))
+            setattr(part.segment, field, _restore_row_order(torch.cat(parts, dim=0), order, field=field))
 
     def _run_update(
         self,
         part: Part,
         *,
         micros: UpdatePlan,
+        order: Optional[torch.Tensor],
         training_progress: float,
         zero_grad: bool = True,
         do_optimizer_step: bool = True,
@@ -175,7 +170,7 @@ class TrainStack(Remote):
         if zero_grad:
             self.fsdp_backend.zero_grad()
 
-        loss_scales, global_weight = self._resolve_loss_scales(part, micros=micros)
+        loss_scales, global_weight = self._resolve_loss_scales(part, micros=micros, order=order)
         micro_results: List[AlgorithmStepResult] = []
         total_loss = 0.0
         weighted_loss_sum = 0.0
@@ -186,7 +181,7 @@ class TrainStack(Remote):
         for i, (start, end) in enumerate(micros):
             # Defer gradient reduce-scatter until the stepping rollout's final microbatch.
             self.fsdp_backend.set_grad_sync(do_optimizer_step and i == last_micro)
-            micro_part = part if single_micro else part.slice(start, end)
+            micro_part = part if single_micro else _micro_part(part, order, start, end)
             result = self.algorithm.compute_loss_and_backward(
                 conditions=micro_part.conditions,
                 segment=micro_part.segment,
@@ -199,7 +194,7 @@ class TrainStack(Remote):
             if global_weight is None:
                 total_loss += result.loss * loss_scales[i]
             else:
-                weighted_loss_sum += result.loss * self._micro_loss_weight(part, start, end)
+                weighted_loss_sum += result.loss * self._micro_loss_weight(part, start, end, order=order)
             has_backward = has_backward or result.has_backward
 
         aggregated_metrics: Mapping[str, object] = aggregate_numeric_metrics(
@@ -263,7 +258,9 @@ class TrainStack(Remote):
         """Per-rollout-boundary hook — delegates to the FSDPBackend's EMA."""
         self.fsdp_backend.on_rollout_end()
 
-    def _resolve_loss_scales(self, part: Part, *, micros: UpdatePlan) -> Tuple[List[float], Optional[float]]:
+    def _resolve_loss_scales(
+        self, part: Part, *, micros: UpdatePlan, order: Optional[torch.Tensor]
+    ) -> Tuple[List[float], Optional[float]]:
         """Per-micro ``loss_scale``: valid-token share for ``token-mean``, else sample share (grouping-invariant)."""
         if getattr(self.algorithm, "loss_agg_mode", None) != LossAggMode.TOKEN_MEAN:
             update_total = sum(end - start for start, end in micros)
@@ -275,7 +272,7 @@ class TrainStack(Remote):
                 f"{type(self).__name__}: loss_agg_mode='token-mean' is not validated under "
                 f"sequence parallelism (sp_size={rank_info.sp_size}); use sp_size=1."
             )
-        weights = [self._micro_loss_weight(part, start, end) for start, end in micros]
+        weights = [self._micro_loss_weight(part, start, end, order=order) for start, end in micros]
         local_total = sum(weights)
         (global_total,) = self._all_reduce_sums([local_total])
         if global_total <= 0.0:
@@ -287,8 +284,10 @@ class TrainStack(Remote):
         dp_world = self._loss_weight_world()
         return [w * dp_world / global_total for w in weights], global_total
 
-    def _micro_loss_weight(self, part: Part, start: int, end: int) -> float:
-        """Valid-token count of one contiguous micro range (loss_mask-aware)."""
+    def _micro_loss_weight(self, part: Part, start: int, end: int, *, order: Optional[torch.Tensor]) -> float:
+        """Valid-token count of arranged positions ``[start, end)`` (loss_mask-aware)."""
+        if order is not None:
+            return sum(self._micro_loss_weight(part, row, row + 1, order=None) for row in order[start:end].tolist())
         segment = part.segment
         if segment is None:
             raise ValueError(f"{type(self).__name__}: loss_agg_mode='token-mean' requires a segment.")
@@ -366,26 +365,24 @@ class TrainStack(Remote):
                 "optimizer steps inside the window would re-step on partial gradients."
             )
         arranged = []
-        for input_part in window:
-            part, plans = self.update_planner.arrange(
-                input_part,
-                num_updates=self.num_updates_per_batch,
-                micro_batch_size=self.micro_batch_size,
-                shuffle_step=rollout_id,
-            )
-            if part is not input_part:
-                _release_reordered_track_inputs(input_part)
+        for part in window:
             self._align_track_inputs(part)
-            arranged.append((part, plans))
-        del input_part, parts, window
+            arranged.append(
+                self.update_planner.arrange(
+                    part,
+                    num_updates=self.num_updates_per_batch,
+                    micro_batch_size=self.micro_batch_size,
+                    shuffle_step=rollout_id,
+                )
+            )
         from unirl.utils.profiling import profile_mode
 
         profiler = self._train_step_profiler() if profile_mode() == "train" else None
         with profiler.record("train_track") if profiler is not None else nullcontext():
             if len(arranged) == 1:
-                part, plans = arranged[0]
-                part = self._prepare_for_training(part, plans=plans)
-                result = self._run_updates(part, plans=plans, training_progress=float(training_progress))
+                part, plans, order = arranged[0]
+                part = self._prepare_for_training(part, plans=plans, order=order)
+                result = self._run_updates(part, plans=plans, order=order, training_progress=float(training_progress))
             else:
                 result = self._run_window(arranged, training_progress=float(training_progress))
         if profiler is not None:
@@ -393,26 +390,27 @@ class TrainStack(Remote):
         self.on_rollout_end()
         return result
 
-    def _prepare_for_training(self, part: Part, *, plans: Plan) -> Part:
+    def _prepare_for_training(self, part: Part, *, plans: Plan, order: Optional[torch.Tensor]) -> Part:
         """Freeze this part's anchor in eval mode, then return the model to train mode."""
         self.fsdp_backend.model.eval()
-        self.prepare_segment(part, plans=plans)
+        self.prepare_segment(part, plans=plans, order=order)
         part = self.algorithm.prepare_part(part)
         self.fsdp_backend.model.train()
         return part
 
-    def _run_window(self, arranged: List[Tuple[Part, Plan]], *, training_progress: float) -> TrainStepResult:
+    def _run_window(self, arranged: List[Arrangement], *, training_progress: float) -> TrainStepResult:
         """One optimizer step over an accumulation window of single-update parts."""
         m = len(arranged)
         self.fsdp_backend.zero_grad()
         results: List[TrainStepResult] = []
         prior_backward = False
-        for w, (part, plans) in enumerate(arranged):
-            part = self._prepare_for_training(part, plans=plans)
+        for w, (part, plans, order) in enumerate(arranged):
+            part = self._prepare_for_training(part, plans=plans, order=order)
             (micros,) = plans  # window parts are single-update (validated in train_track)
             result = self._run_update(
                 part,
                 micros=micros,
+                order=order,
                 training_progress=training_progress,
                 zero_grad=False,
                 do_optimizer_step=(w == m - 1),
@@ -439,6 +437,7 @@ class TrainStack(Remote):
         part: Part,
         *,
         plans: Plan,
+        order: Optional[torch.Tensor],
         training_progress: float,
     ) -> TrainStepResult:
         """Run ``num_updates_per_batch`` optimizer steps over disjoint updates."""
@@ -453,7 +452,7 @@ class TrainStack(Remote):
                 else nullcontext()
             )
             with cm:
-                results.append(self._run_update(part, micros=micros, training_progress=training_progress))
+                results.append(self._run_update(part, micros=micros, order=order, training_progress=training_progress))
         if len(results) == 1:
             return results[0]
         aggregated = _aggregate_update_results(results)
