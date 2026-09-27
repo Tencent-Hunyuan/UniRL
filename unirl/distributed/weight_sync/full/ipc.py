@@ -61,13 +61,25 @@ class IPCWeightSync(FullWeightSync):
         )
         if int(gpu_memory_headroom_mb) < 0:
             raise ValueError("gpu_memory_headroom_mb must be >= 0")
-        if float(control_timeout_s) <= 0:
+        control_timeout_s = float(control_timeout_s)
+        if control_timeout_s <= 0:
             raise ValueError("control_timeout_s must be > 0")
         self._rollout = rollout
         self._use_shm = bool(use_shm)
         self._weight_sync_engine = self._resolve_weight_sync_engine()
+        if self._weight_sync_engine is _IPCWeightSyncEngine.VLLM_NATIVE_WTE:
+            receiver = getattr(self._rollout, "tensor_weight_sync_target", self._rollout)
+            timeout_for = getattr(getattr(receiver, "cfg", None), "timeout_for", None)
+            if not callable(timeout_for):
+                raise RuntimeError("vLLM native IPC sync requires rollout command timeouts")
+            weight_update_timeout_s = float(timeout_for("update_native_weights"))
+            if control_timeout_s <= weight_update_timeout_s:
+                raise ValueError(
+                    "control_timeout_s must exceed the vLLM weight-update timeout so non-sender "
+                    f"ranks cannot time out first; got {control_timeout_s} <= {weight_update_timeout_s}"
+                )
         self._gpu_memory_headroom = int(gpu_memory_headroom_mb) << 20
-        self._control_timeout = timedelta(seconds=float(control_timeout_s))
+        self._control_timeout = timedelta(seconds=control_timeout_s)
         self._control_group = None
         self._next_model_version = 1
 
@@ -318,7 +330,11 @@ class IPCWeightSync(FullWeightSync):
                 ]
             else:
                 outputs = [(name, shape)]
-            metadata.extend(self._shape_metadata(out_name, out_shape, dtype) for out_name, out_shape in outputs)
+            planned = [self._shape_metadata(out_name, out_shape, dtype) for out_name, out_shape in outputs]
+            # All canonical outputs from one state-dict entry share one FSDP
+            # materialization; gate failures before advancing to the next entry.
+            planned[-1]["_materialization_boundary"] = True
+            metadata.extend(planned)
 
         names = {str(item["name"]) for item in metadata}
         required = {"model.embed_tokens.weight", "model.norm.weight"}
@@ -424,6 +440,9 @@ class IPCWeightSync(FullWeightSync):
             rank=self._global_rank,
             packed_buffer_size_bytes=self._bucket_bytes,
             consensus=self._consensus,
+            materialization_boundaries=[
+                index for index, item in enumerate(expected_metadata) if item.get("_materialization_boundary") is True
+            ],
         )
 
         def _verify_actor_source() -> None:

@@ -97,6 +97,7 @@ class VLLMNativeIPCTrainerEngine(IPCTrainerWeightTransferEngine):
         rank: int,
         packed_buffer_size_bytes: int,
         consensus: ConsensusFn,
+        materialization_boundaries: Sequence[int],
     ) -> None:
         super().__init__(
             client=client,
@@ -106,6 +107,7 @@ class VLLMNativeIPCTrainerEngine(IPCTrainerWeightTransferEngine):
             packed_buffer_size_bytes=int(packed_buffer_size_bytes),
         )
         self._consensus = consensus
+        self._materialization_boundaries = frozenset(int(index) for index in materialization_boundaries)
 
     def initialize(self) -> None:
         error: Optional[BaseException] = None
@@ -154,12 +156,24 @@ class VLLMNativeIPCTrainerEngine(IPCTrainerWeightTransferEngine):
         metadata = self.source.metadata()
         plans = self._plan_chunks(metadata, self.packed_buffer_size_bytes)
         source_iter = iter(self.source)
-        ipc_buffer = torch.empty(
-            self.packed_buffer_size_bytes,
-            dtype=torch.uint8,
-            device=f"cuda:{self.device_index}",
+        expected_boundaries = self._validate_materialization_boundaries(
+            self._materialization_boundaries,
+            tensor_count=len(metadata),
         )
-        _, ipc_args = reduce_tensor(ipc_buffer)
+        ipc_buffer = None
+        ipc_args = None
+        allocation_error: Optional[BaseException] = None
+        try:
+            ipc_buffer = torch.empty(
+                self.packed_buffer_size_bytes,
+                dtype=torch.uint8,
+                device=f"cuda:{self.device_index}",
+            )
+            _, ipc_args = reduce_tensor(ipc_buffer)
+        except BaseException as exc:
+            allocation_error = exc
+        self._consensus(allocation_error, "vllm-native-buffer-allocation")
+        assert ipc_buffer is not None and ipc_args is not None
 
         consumed = 0
         for chunk_index, chunk in enumerate(plans):
@@ -168,24 +182,59 @@ class VLLMNativeIPCTrainerEngine(IPCTrainerWeightTransferEngine):
             dtype_names: list[str] = []
             tensor_sizes: list[int] = []
             offset = 0
-            materialize_error: Optional[BaseException] = None
-            try:
-                for expected in chunk:
+            chunk_end = consumed + len(chunk) - 1
+            for expected in chunk:
+                tensor_index = consumed
+                tensor = None
+                flat = None
+                tensor_info: Optional[tuple[str, list[int], str, int]] = None
+                materialize_error: Optional[BaseException] = None
+                try:
                     name, tensor = next(source_iter)
                     self._validate_tensor(expected, name, tensor)
                     flat = tensor.detach().contiguous().view(torch.uint8).view(-1)
                     size = int(flat.numel())
                     ipc_buffer[offset : offset + size].copy_(flat, non_blocking=True)
-                    names.append(str(name))
-                    shapes.append([int(dim) for dim in tensor.shape])
-                    dtype_names.append(str(tensor.dtype).removeprefix("torch."))
-                    tensor_sizes.append(size)
-                    offset += size
-                    consumed += 1
-                torch.cuda.current_stream().synchronize()
-            except BaseException as exc:
-                materialize_error = exc
-            self._consensus(materialize_error, f"vllm-native-materialize-{chunk_index}")
+                    tensor_info = (
+                        str(name),
+                        [int(dim) for dim in tensor.shape],
+                        str(tensor.dtype).removeprefix("torch."),
+                        size,
+                    )
+                except BaseException as exc:
+                    materialize_error = exc
+                finally:
+                    # Do not retain one completed full tensor while the source
+                    # enters the next FSDP materialization collective.
+                    del flat
+                    del tensor
+
+                is_source_boundary = tensor_index in expected_boundaries
+                is_chunk_boundary = tensor_index == chunk_end
+                if materialize_error is not None or is_source_boundary or is_chunk_boundary:
+                    # A source boundary precedes the next FSDP collective; a
+                    # chunk boundary precedes the default-group handle gather.
+                    # Every rank must report local failure before either gate.
+                    if materialize_error is None:
+                        try:
+                            torch.cuda.current_stream().synchronize()
+                        except BaseException as exc:
+                            materialize_error = exc
+                    next_gate = self._next_consensus_gate(
+                        tensor_index,
+                        source_boundaries=expected_boundaries,
+                        chunk_end=chunk_end,
+                    )
+                    self._consensus(materialize_error, f"vllm-native-materialize-{next_gate}")
+
+                assert tensor_info is not None
+                name, shape, dtype_name, size = tensor_info
+                names.append(name)
+                shapes.append(shape)
+                dtype_names.append(dtype_name)
+                tensor_sizes.append(size)
+                offset += size
+                consumed += 1
 
             merged_handle = self._all_gather_and_merge_handles([{self.gpu_uuid: ipc_args}])[0]
             transfer_error: Optional[BaseException] = None
@@ -203,6 +252,30 @@ class VLLMNativeIPCTrainerEngine(IPCTrainerWeightTransferEngine):
 
         if consumed != len(metadata):
             raise RuntimeError(f"vLLM native IPC source consumed {consumed} tensors, expected {len(metadata)}")
+
+    @staticmethod
+    def _validate_materialization_boundaries(boundaries: frozenset[int], *, tensor_count: int) -> frozenset[int]:
+        if tensor_count <= 0:
+            raise RuntimeError("vLLM native IPC weight source contains no tensors")
+        if not boundaries or max(boundaries) != tensor_count - 1 or min(boundaries) < 0:
+            raise ValueError(
+                "vLLM native IPC materialization boundaries must include the final tensor "
+                f"{tensor_count - 1}, got {sorted(boundaries)!r}"
+            )
+        if any(index >= tensor_count for index in boundaries):
+            raise ValueError(
+                f"vLLM native IPC materialization boundary exceeds tensor count {tensor_count}: {sorted(boundaries)!r}"
+            )
+        return boundaries
+
+    @staticmethod
+    def _next_consensus_gate(
+        tensor_index: int,
+        *,
+        source_boundaries: frozenset[int],
+        chunk_end: int,
+    ) -> int:
+        return min([chunk_end, *(index for index in source_boundaries if index >= tensor_index)])
 
     @staticmethod
     def _plan_chunks(
