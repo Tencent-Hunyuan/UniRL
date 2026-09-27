@@ -118,9 +118,8 @@ class TrainStack(Remote):
         self.algorithm = algorithm
         self.micro_batch_size = int(micro_batch_size)
         self.max_grad_norm = float(max_grad_norm)
-        self.micro_planner: MicroPlanner = micro_planner if micro_planner is not None else CountPlanner()
         self.update_planner = UpdatePlanner(
-            self.micro_planner,
+            micro_planner if micro_planner is not None else CountPlanner(),
             shuffle_updates=shuffle_updates,
             shuffle_seed=shuffle_seed,
         )
@@ -151,7 +150,11 @@ class TrainStack(Remote):
                     )
                 collected[field].append(value)
         for field, parts in collected.items():
-            setattr(part.segment, field, restore_row_order(torch.cat(parts, dim=0), order, field=field))
+            setattr(
+                part.segment,
+                field,
+                restore_row_order(torch.cat(parts, dim=0), order, segment=part.segment, field=field),
+            )
 
     def _run_update(
         self,

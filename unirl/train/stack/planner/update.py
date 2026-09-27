@@ -9,6 +9,7 @@ import torch
 from unirl.train.stack.planner.count import CountPlanner, _count_plan
 from unirl.train.stack.planner.types import MicroPlanner, Plan
 from unirl.types.sample import Part
+from unirl.types.segments.base import Segment
 
 # ``order[i]`` is the source row at arranged position ``i``; ``None`` means identity.
 Arrangement = Tuple[Part, Plan, Optional[torch.Tensor]]
@@ -19,14 +20,16 @@ def arranged_slice(part: Part, order: Optional[torch.Tensor], start: int, end: i
     return part.slice(start, end) if order is None else part.select(order[start:end])
 
 
-def restore_row_order(anchor: torch.Tensor, order: Optional[torch.Tensor], *, field: str) -> torch.Tensor:
-    """Map an anchor concatenated in arranged order back to the Part's source row order."""
+def restore_row_order(
+    anchor: torch.Tensor, order: Optional[torch.Tensor], *, segment: Segment, field: str
+) -> torch.Tensor:
+    """Map an anchor concatenated in arranged order back to ``segment``'s source row order."""
     if order is None:
         return anchor
-    if int(anchor.shape[0]) != int(order.numel()):
+    if segment.cu_seqlens is not None or int(anchor.shape[0]) != int(order.numel()):
         raise ValueError(
-            f"shuffle_updates cannot restore anchor field {field!r}: expected one row per sample "
-            f"({order.numel()}), got leading dim {anchor.shape[0]} (packed per-token anchors are unsupported)."
+            f"shuffle_updates cannot restore anchor field {field!r}: it needs one row per sample, but the "
+            f"segment is packed or the anchor's leading dim {anchor.shape[0]} != {order.numel()} samples."
         )
     return anchor[torch.argsort(order).to(anchor.device)]
 

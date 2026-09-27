@@ -102,7 +102,11 @@ class UnifiedModelTrainStack(Remote):
                     )
                 collected[field].append(value)
         for field, parts in collected.items():
-            setattr(part.segment, field, restore_row_order(torch.cat(parts, dim=0), order, field=field))
+            setattr(
+                part.segment,
+                field,
+                restore_row_order(torch.cat(parts, dim=0), order, segment=part.segment, field=field),
+            )
 
     def _backward_part(
         self,
