@@ -16,8 +16,14 @@ from unirl.distributed.group.remote import Remote
 from unirl.train.backend.fsdp import FSDPBackend
 from unirl.train.stack import TrainStepResult
 from unirl.train.stack.base import _aggregate_update_results, _validate_anchor_contract
-from unirl.train.stack.planner import CountPlanner, Plan, UpdatePlanner, _positive_int
-from unirl.train.stack.planner.update import _micro_part, _restore_row_order
+from unirl.train.stack.planner import (
+    CountPlanner,
+    Plan,
+    UpdatePlanner,
+    _positive_int,
+    arranged_slice,
+    restore_row_order,
+)
 from unirl.types.sample import Part, Sample
 from unirl.types.sampling import ARSamplingParams, DiffusionSamplingParams
 from unirl.utils.metrics import aggregate_numeric_metrics
@@ -85,7 +91,7 @@ class UnifiedModelTrainStack(Remote):
             return
         collected: Dict[str, List[torch.Tensor]] = {field: [] for field in algorithm.anchor_fields}
         for start, end in micro_slices:
-            micro = _micro_part(part, order, start, end)
+            micro = arranged_slice(part, order, start, end)
             algorithm.prepare_segment(conditions=micro.conditions, segment=micro.segment)
             for field in collected:
                 value = getattr(micro.segment, field, None)
@@ -96,7 +102,7 @@ class UnifiedModelTrainStack(Remote):
                     )
                 collected[field].append(value)
         for field, parts in collected.items():
-            setattr(part.segment, field, _restore_row_order(torch.cat(parts, dim=0), order, field=field))
+            setattr(part.segment, field, restore_row_order(torch.cat(parts, dim=0), order, field=field))
 
     def _backward_part(
         self,
@@ -124,7 +130,7 @@ class UnifiedModelTrainStack(Remote):
 
         single_micro = len(micro_slices) == 1 and micro_slices[0] == (0, bs)
         for start, end in micro_slices:
-            micro_track = part if single_micro else _micro_part(part, order, start, end)
+            micro_track = part if single_micro else arranged_slice(part, order, start, end)
             loss_scale = (end - start) / float(update_total)
             result = algorithm.compute_loss_and_backward(
                 conditions=micro_track.conditions,

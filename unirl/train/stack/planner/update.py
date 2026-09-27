@@ -14,12 +14,12 @@ from unirl.types.sample import Part
 Arrangement = Tuple[Part, Plan, Optional[torch.Tensor]]
 
 
-def _micro_part(part: Part, order: Optional[torch.Tensor], start: int, end: int) -> Part:
+def arranged_slice(part: Part, order: Optional[torch.Tensor], start: int, end: int) -> Part:
     """Gather arranged positions ``[start, end)`` without materializing the full arranged Part."""
     return part.slice(start, end) if order is None else part.select(order[start:end])
 
 
-def _restore_row_order(anchor: torch.Tensor, order: Optional[torch.Tensor], *, field: str) -> torch.Tensor:
+def restore_row_order(anchor: torch.Tensor, order: Optional[torch.Tensor], *, field: str) -> torch.Tensor:
     """Map an anchor concatenated in arranged order back to the Part's source row order."""
     if order is None:
         return anchor

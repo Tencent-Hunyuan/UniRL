@@ -15,8 +15,17 @@ from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
 from unirl.distributed.tensor.batch import _move_value
 from unirl.train.backend.fsdp import FSDPBackend
-from unirl.train.stack.planner import CountPlanner, MicroPlanner, Plan, UpdatePlan, UpdatePlanner, _positive_int
-from unirl.train.stack.planner.update import Arrangement, _micro_part, _restore_row_order
+from unirl.train.stack.planner import (
+    Arrangement,
+    CountPlanner,
+    MicroPlanner,
+    Plan,
+    UpdatePlan,
+    UpdatePlanner,
+    _positive_int,
+    arranged_slice,
+    restore_row_order,
+)
 from unirl.types.loss_agg import LossAggMode
 from unirl.types.sample import Part
 from unirl.utils.metrics import aggregate_numeric_metrics
@@ -131,7 +140,7 @@ class TrainStack(Remote):
             return
         collected: Dict[str, List[torch.Tensor]] = {field: [] for field in algorithm.anchor_fields}
         for start, end in micro_slices:
-            micro = _micro_part(part, order, start, end)
+            micro = arranged_slice(part, order, start, end)
             algorithm.prepare_segment(conditions=micro.conditions, segment=micro.segment)
             for field in collected:
                 value = getattr(micro.segment, field, None)
@@ -142,7 +151,7 @@ class TrainStack(Remote):
                     )
                 collected[field].append(value)
         for field, parts in collected.items():
-            setattr(part.segment, field, _restore_row_order(torch.cat(parts, dim=0), order, field=field))
+            setattr(part.segment, field, restore_row_order(torch.cat(parts, dim=0), order, field=field))
 
     def _run_update(
         self,
@@ -181,7 +190,7 @@ class TrainStack(Remote):
         for i, (start, end) in enumerate(micros):
             # Defer gradient reduce-scatter until the stepping rollout's final microbatch.
             self.fsdp_backend.set_grad_sync(do_optimizer_step and i == last_micro)
-            micro_part = part if single_micro else _micro_part(part, order, start, end)
+            micro_part = part if single_micro else arranged_slice(part, order, start, end)
             result = self.algorithm.compute_loss_and_backward(
                 conditions=micro_part.conditions,
                 segment=micro_part.segment,
