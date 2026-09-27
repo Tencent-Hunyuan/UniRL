@@ -130,14 +130,8 @@ def finalize_output(out: Any) -> None:
         out.output = payload["video"]
 
 
-def resolve_request_noise(req: Any, *, caller: str) -> Optional[torch.Tensor]:
-    """This request's driver x_T, sliced from ``[B, ...]`` by Omni's ``f'{i}_{uuid}'`` id."""
-    extra = getattr(req.sampling_params, "extra_args", None) or {}
-    noise_batch = extra.get("initial_noise_batch")
-    recipe_gids = extra.get("init_noise_group_ids")
-    if noise_batch is None and not recipe_gids:
-        return None
-
+def _request_sample_span(req: Any, *, total: int, caller: str) -> Tuple[int, int]:
+    """Locate this Omni request's rows inside a driver-authored sample batch."""
     rid = str(getattr(req, "request_id", "") or "")
     try:
         idx = int(rid.split("_", 1)[0])
@@ -148,9 +142,21 @@ def resolve_request_noise(req: Any, *, caller: str) -> Optional[torch.Tensor]:
 
     spp = int(getattr(req.sampling_params, "num_outputs_per_prompt", 1) or 1)
     start, end = idx * spp, (idx + 1) * spp
-    n = int(noise_batch.shape[0]) if noise_batch is not None else len(recipe_gids)
-    if spp < 1 or not 0 <= start < end <= n:
-        raise IndexError(f"{caller}: grouped slice [{start}:{end}) out of bounds for length {n} (spp={spp}).")
+    if spp < 1 or not 0 <= start < end <= total:
+        raise IndexError(f"{caller}: grouped slice [{start}:{end}) out of bounds for length {total} (spp={spp}).")
+    return start, end
+
+
+def resolve_request_noise(req: Any, *, caller: str) -> Optional[torch.Tensor]:
+    """This request's driver x_T, sliced from ``[B, ...]`` by Omni's ``f'{i}_{uuid}'`` id."""
+    extra = getattr(req.sampling_params, "extra_args", None) or {}
+    noise_batch = extra.get("initial_noise_batch")
+    recipe_gids = extra.get("init_noise_group_ids")
+    if noise_batch is None and not recipe_gids:
+        return None
+
+    total = int(noise_batch.shape[0]) if noise_batch is not None else len(recipe_gids)
+    start, end = _request_sample_span(req, total=total, caller=caller)
     if noise_batch is not None:
         return noise_batch[start:end].clone()
     return NoiseRecipe(
@@ -158,6 +164,17 @@ def resolve_request_noise(req: Any, *, caller: str) -> Optional[torch.Tensor]:
         base_seed=int(extra.get("init_noise_seed", 0)),
         latent_shape=tuple(extra["init_noise_latent_shape"]),
     ).resolve()
+
+
+def slice_request_denoise_seed_keys(req: Any, *, caller: str) -> Optional[list[str]]:
+    """Slice this request's per-sample SDE-noise keys from the driver batch."""
+    extra = getattr(req.sampling_params, "extra_args", None) or {}
+    denoise_seed_keys = extra.get("denoise_seed_keys")
+    if denoise_seed_keys is None:
+        return None
+
+    start, end = _request_sample_span(req, total=len(denoise_seed_keys), caller=caller)
+    return [str(seed_key) for seed_key in denoise_seed_keys[start:end]]
 
 
 def inject_latents(
@@ -208,5 +225,6 @@ __all__ = [
     "resolve_request_noise",
     "set_payload",
     "single_request",
+    "slice_request_denoise_seed_keys",
     "stamp_capture",
 ]

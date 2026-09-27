@@ -117,16 +117,6 @@ rollout:
     # / VAE-decode peak memory (it runs the whole batch in one forward otherwise),
     # without shrinking the logical batch. Mirrors sd3_trainside.
     forward_batch_size: 16
-    # LoRA target modules for the adapter sync (matches the colocate recipe).
-    target_modules:
-      - attn.add_k_proj
-      - attn.add_q_proj
-      - attn.add_v_proj
-      - attn.to_add_out
-      - attn.to_k
-      - attn.to_out.0
-      - attn.to_q
-      - attn.to_v
     engine_kwargs:
       model_type: sd3
     # Separate slabs do not time-share GPUs, so no sleep/wake is issued.

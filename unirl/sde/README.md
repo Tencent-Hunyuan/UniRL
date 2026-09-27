@@ -45,7 +45,7 @@ adapter's private choice.
   match SGLang).
 - **SDE indices own the policy-gradient density.** The selection is a
   `TimestepScheduler` (`index_schedule.py`) wired under `sampling.scheduler`, which
-  `DiffusionSamplingParams.resolve_sde_indices` asks once per rollout id. Selected
+  `DiffusionSamplingParams.get_sde_indices` asks once per rollout id. Selected
   `sde_indices` get a stochastic transition with a real per-step Gaussian log-prob
   (→ `LatentSegment.sde_logp`). Trainside loops collapse the same SDE kernel to
   Euler with `eta=0`; the FastVideo adapter instead implements the model
@@ -109,6 +109,13 @@ MixGRPO keeps `FlowSDEStrategy` and adds a `WindowScheduler` under
 - **The dtype round-trip in `_finalize_logp` is not a no-op cast.** It simulates
   trajectory *storage* precision so replay-time log-prob matches sampling-time
   log-prob. Delete it as dead code and the ratio drifts. Skipped for `eta<1e-7`.
+- **`prev_sample_means` leave replay at the kernel's native fp32 — don't narrow
+  them to `trajectory_precision`.** Log-prob scores the fp32 mean; FlowDPPO's
+  Gaussian-KL mask (`(Δmean)²/(2σ²)` vs the 1e-5 threshold) scores whatever
+  replay returns, so a bf16 round-trip re-scores a *different* distribution:
+  ULP-scale rounding dwarfs the threshold, and sub-ULP policy deltas collapse to
+  KL=0. `log_probs` keeps its explicit `logprob_dtype` cast; only the mean must
+  not follow the trajectory dtype.
 - **`ensure_sample_sigmas` takes height/width/steps with no defaults, on purpose** —
   a silent `1024×1024` mis-derives μ for dynamic-shift models rendering at anything
   else (e.g. WAN T2V at 480×832).
@@ -116,3 +123,9 @@ MixGRPO keeps `FlowSDEStrategy` and adds a `WindowScheduler` under
   *disabled*, not "stretch to zero" — normalize falsy values to `None`.
 - **`compute_mu` is the single per-model μ override point.** FLUX.2-klein's μ depends
   on **both** `image_seq_len` and `num_inference_steps`, unlike the base formula.
+- **`WindowScheduler` indexes the denoising loop.** `num_timesteps` is the full step count
+  and only full windows are visited. MixGRPO's `max_timesteps = sampling_steps - 2` indexes
+  that repo's sample dict, a different coordinate space.
+- **`exp_decay_threshold` defaults to 13.** Decay starts only once a window start passes it.
+  Shipped mixgrpo schedules are shorter, so `strategy=exp_decay` stays at `iters_per_window`
+  until the threshold is lowered.

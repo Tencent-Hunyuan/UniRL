@@ -17,6 +17,7 @@ from unirl.distributed.group.dispatch import (
     Execute,
     resolve_backward_dispatch_mode,
 )
+from unirl.distributed.group.ray_utils import get_actor_results, inspect_ready_actor_results
 from unirl.distributed.group.remote import RankInfo, Remote
 from unirl.distributed.tensor import TensorRef, WorkerLocalTransport, map_tree
 from unirl.distributed.tensor.backend.gpu_store.handle import GPUTensorHandle
@@ -67,7 +68,7 @@ def _cfg_get(cfg: Any, key: str, default: int) -> int:
     return int(val or default)
 
 
-def _is_sglang_rollout_role(role_cls: Type[Remote]) -> bool:
+def _accepts_rollout_tp_role(role_cls: Type[Remote]) -> bool:
     """True if ``role_cls`` opts into per-rank rollout-TP kwargs."""
     cls = _owning_class(role_cls)
     return getattr(cls, "_accepts_rollout_tp_kwargs", False) is True
@@ -93,7 +94,7 @@ def _parallel_shape_from_init_kwargs(
     pp = int(init_kwargs.get("pp_size") or 1)
     ep = int(init_kwargs.get("ep_size") or 1)
 
-    if _is_sglang_rollout_role(role_cls):
+    if _accepts_rollout_tp_role(role_cls):
         cfg = init_kwargs.get("config")
         if cfg is not None:
             tp = max(tp, _cfg_get(cfg, "tp_size", 1))
@@ -191,7 +192,7 @@ def _build_tp_visible_device_map(
         group_nodes = [str(node_ips[index]).strip() for index in ordered]
         if any(not node for node in group_nodes) or len(set(group_nodes)) != 1:
             raise ValueError(
-                f"each SGLang TP group must be placed on a single node; group={group_key}, nodes={group_nodes}"
+                f"each rollout TP group must be placed on a single node; group={group_key}, nodes={group_nodes}"
             )
 
         tokens: List[str] = []
@@ -202,7 +203,7 @@ def _build_tp_visible_device_map(
             split = [token.strip() for token in raw.split(",") if token.strip()]
             if len(split) != 1:
                 raise ValueError(
-                    "each SGLang TP Worker must expose exactly one CUDA_VISIBLE_DEVICES "
+                    "each rollout TP worker must expose exactly one CUDA_VISIBLE_DEVICES "
                     f"token; worker={index}, value={raw!r}"
                 )
             tokens.append(split[0])
@@ -254,9 +255,13 @@ class PendingHandleCall:
         self._discard_futures: Optional[List[Any]] = None
 
     def ready(self) -> bool:
-        """True once every worker's ref is resolved (non-blocking probe)."""
-        done, _ = ray.wait(self._refs, num_returns=len(self._refs), timeout=0)
-        return len(done) == len(self._refs)
+        """True when every rank succeeded; raise immediately on a ready rank-local error."""
+        return inspect_ready_actor_results(
+            self._refs,
+            pool=self._handle.pool,
+            role_name=self._handle.role_name,
+            method_name=self._method_name,
+        )
 
     def wait(self) -> None:
         """Block until completion and safely discard the collected return value."""
@@ -314,6 +319,7 @@ class PendingHandleCall:
                 self._refs,
                 worker_local=self._worker_local,
                 targets=self._targets,
+                method_name=self._method_name,
             )
         finally:
             self._release_leases()
@@ -347,6 +353,7 @@ class Slot:
     def launch(self, method_name: str, *args, **kwargs) -> PendingHandleCall:
         """Launch an undecorated role method on this worker."""
         handle = self._handle
+        handle.pool.assert_usable()
         if method_name in handle._method_configs:
             raise AttributeError(f"{method_name!r} is distributed; call it on the Handle")
         if not hasattr(_owning_class(handle.role_cls), method_name):
@@ -392,6 +399,7 @@ class Handle:
         init_kwargs: Optional[Dict[str, Any]] = None,
         slot_id: int = 0,
     ) -> None:  # noqa: D107 (args documented in class docstring)
+        pool.assert_usable()
         self.role_cls = role_cls
         self.pool = pool
         self.role_name = role_name or _make_role_name(role_cls)
@@ -437,11 +445,21 @@ class Handle:
             self.rank_infos[0].pp_size,
             self.rank_infos[0].ep_size,
         )
-        is_tp_engine = _is_sglang_rollout_role(role_cls)
+        is_tp_engine = _accepts_rollout_tp_role(role_cls)
         tp_visible_device_map: Dict[int, List[str]] = {}
         if is_tp_engine and any(rank_info.tp_size > 1 for rank_info in self.rank_infos):
-            node_ips = ray.get([worker.get_node_ip.remote() for worker in self.workers])
-            cuda_visible_devices = ray.get([worker.get_cuda_visible_devices.remote() for worker in self.workers])
+            node_ips = get_actor_results(
+                [worker.get_node_ip.remote() for worker in self.workers],
+                pool=self.pool,
+                role_name=self.role_name,
+                method_name="get_node_ip",
+            )
+            cuda_visible_devices = get_actor_results(
+                [worker.get_cuda_visible_devices.remote() for worker in self.workers],
+                pool=self.pool,
+                role_name=self.role_name,
+                method_name="get_cuda_visible_devices",
+            )
             tp_visible_device_map = _build_tp_visible_device_map(
                 self.rank_infos,
                 node_ips=node_ips,
@@ -470,7 +488,7 @@ class Handle:
                 kwargs["tp_visible_devices"] = tp_visible_device_map[i]
             return kwargs
 
-        ray.get(
+        get_actor_results(
             [
                 w.add_remote.remote(
                     self.role_name,
@@ -480,7 +498,10 @@ class Handle:
                     dist_env={"RANK": str(i), **self._dist_env_base},
                 )
                 for i, w in enumerate(self.workers)
-            ]
+            ],
+            pool=self.pool,
+            role_name=self.role_name,
+            method_name="add_remote",
         )
 
         self._method_configs: Dict[str, tuple] = {}
@@ -541,11 +562,22 @@ class Handle:
 
     def initialize(self, *args, **kwargs) -> None:
         """Call role.initialize(*args, **kwargs) on all workers."""
+        self.pool.assert_usable()
         ray.get(self.workers[0]._release_port.remote(self._group_port))
 
-        ray.get([w.call.remote(self.role_name, "initialize", args, kwargs) for w in self.workers])
+        get_actor_results(
+            [w.call.remote(self.role_name, "initialize", args, kwargs) for w in self.workers],
+            pool=self.pool,
+            role_name=self.role_name,
+            method_name="initialize",
+        )
 
-        self.rank_infos = ray.get([w.get_rank_info.remote(self.role_name) for w in self.workers])
+        self.rank_infos = get_actor_results(
+            [w.get_rank_info.remote(self.role_name) for w in self.workers],
+            pool=self.pool,
+            role_name=self.role_name,
+            method_name="get_rank_info",
+        )
 
     def _bind_methods(self, role_cls) -> None:
         """Scan role_cls for @distributed methods and create handle functions."""
@@ -611,6 +643,7 @@ class Handle:
                     refs,
                     worker_local=worker_local,
                     ray_get_timeout=ray_get_timeout,
+                    method_name=method_name,
                 )
             finally:
                 leases.clear()
@@ -646,6 +679,7 @@ class Handle:
         call_id: Optional[str],
     ) -> Tuple[List, bool, List]:
         """Launch a distributed call and retain localized argument leases."""
+        self.pool.assert_usable()
         batch_size = infer_batch_size(args, kwargs)
         if (
             dispatch_mode in (Dispatch.DP_SCATTER, Dispatch.DP_SCATTER_HEAD)
@@ -669,9 +703,16 @@ class Handle:
         worker_local: bool,
         ray_get_timeout: Optional[float] = None,
         targets: Optional[List[Any]] = None,
+        method_name: str = "call",
     ):
         """Resolve a launched call into its collected method return value."""
-        results = ray.get(refs, timeout=ray_get_timeout)
+        results = get_actor_results(
+            refs,
+            pool=self.pool,
+            role_name=self.role_name,
+            method_name=method_name,
+            timeout=ray_get_timeout,
+        )
         workers = self.workers if targets is None else targets
         results = [self._rebind_tree(r, workers[i], worker_local=worker_local) for i, r in enumerate(results)]
         return collect_fn(self, results)

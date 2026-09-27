@@ -6,7 +6,6 @@ from typing import Sequence, Tuple
 
 import torch
 
-from unirl.algorithms.base import StageAlgorithm
 from unirl.train.stack.planner.types import MicroPlanner, Plan
 from unirl.types.sample import Part
 from unirl.types.sample_id import parent_id
@@ -27,9 +26,6 @@ class UpdatePlanner:
         self.micro_planner = micro_planner
         self.shuffle_updates = bool(shuffle_updates)
         self.shuffle_seed = int(shuffle_seed) if shuffle_seed is not None else 0
-
-    def validate(self, algorithm: StageAlgorithm) -> None:
-        self.micro_planner.validate(algorithm)
 
     def arrange(
         self,

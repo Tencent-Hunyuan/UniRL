@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, List
 
 import torch
 
-from unirl.reward.base import BaseRewardComponentSpec
+from unirl.reward.base import PromptRewardComponentSpec
 from unirl.types.reward import RewardRequest
 from unirl.utils.media import tensor_frame_to_pil
 
@@ -30,6 +30,9 @@ class VideoCLIPDeltaScorer(PickScoreRewardScorer):
         self.num_score_frames = max(1, int(getattr(config, "num_score_frames", 3)))
         self.source_sim_floor = float(getattr(config, "source_sim_floor", 0.3))
         super().__init__(config=config, base_device=base_device)
+
+    def covers_prompt_video(self) -> bool:
+        return True
 
     @staticmethod
     def _sample_frames_pil(video: "Video", k: int) -> list["Image.Image"]:
@@ -72,14 +75,14 @@ class VideoCLIPDeltaScorer(PickScoreRewardScorer):
             raise ValueError(
                 "VideoCLIPDeltaScorer: request.generated['video'] is missing; this scorer needs input_kind='video'."
             )
-        source = request.primitives.get("video")
+        source = request.conditioning.get("video")
         if source is None:
             raise ValueError(
-                "VideoCLIPDeltaScorer: request.primitives['video'] is missing — the V2V condition video must reach "
+                "VideoCLIPDeltaScorer: request.conditioning['video'] is missing — the V2V condition video must reach "
                 "the reward (only V2V recipes provide it). Use a V2V recipe, or switch back to VideoPickScoreScorer."
             )
 
-        prompts = request.prompts
+        prompts = self.prompts(request)
         edited_videos = edited.to_list()
         source_videos = source.to_list()
         n = len(edited_videos)
@@ -118,7 +121,7 @@ class VideoCLIPDeltaScorer(PickScoreRewardScorer):
 
 
 @dataclass
-class VideoCLIPDeltaSpec(BaseRewardComponentSpec):
+class VideoCLIPDeltaSpec(PromptRewardComponentSpec):
     """Typed config for the VideoCLIPDelta reward component."""
 
     batch_size: int = 8

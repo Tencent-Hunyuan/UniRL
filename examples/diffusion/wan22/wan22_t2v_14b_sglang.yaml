@@ -126,12 +126,6 @@ rollout:
       dit_offload_prefetch_size: 2.0
       text_encoder_cpu_offload: true
       vae_cpu_offload: true
-    # SGLANG leaf names (see model_config.lora_target_modules above).
-    target_modules:
-      - to_q
-      - to_k
-      - to_v
-      - to_out
   model_config: ${model_config}
   strategy: ${strategy}
 

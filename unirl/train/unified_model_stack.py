@@ -15,7 +15,7 @@ from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
 from unirl.train.backend.fsdp import FSDPBackend
 from unirl.train.stack import TrainStepResult
-from unirl.train.stack.base import _aggregate_update_results, _release_reordered_track_inputs
+from unirl.train.stack.base import _aggregate_update_results, _release_reordered_track_inputs, _validate_anchor_contract
 from unirl.train.stack.planner import CountPlanner, Plan, UpdatePlanner, _positive_int
 from unirl.types.sample import Part, Sample
 from unirl.types.sampling import ARSamplingParams, DiffusionSamplingParams
@@ -52,9 +52,11 @@ class UnifiedModelTrainStack(Remote):
         self.num_updates_per_batch = _positive_int(
             name="UnifiedModelTrainStack.num_updates_per_batch", value=num_updates_per_batch
         )
+        _validate_anchor_contract(self.ar_algorithm)
+        _validate_anchor_contract(self.image_algorithm)
         if self.num_updates_per_batch > 1:
             for name, algo in (("ar", self.ar_algorithm), ("image", self.image_algorithm)):
-                if not getattr(algo, "supports_multi_update", False):
+                if not algo.supports_multi_update:
                     raise ValueError(
                         f"num_updates_per_batch={self.num_updates_per_batch} requires every algorithm's "
                         f"π_old anchor to stay frozen across the N optimizer steps, but the {name!r} "
@@ -66,29 +68,22 @@ class UnifiedModelTrainStack(Remote):
             shuffle_updates=shuffle_updates,
             shuffle_seed=shuffle_seed,
         )
-        self.update_planner.validate(self.ar_algorithm)
-        self.update_planner.validate(self.image_algorithm)
 
     def prepare_segment(self, algorithm: StageAlgorithm, part: Part, *, plans: Plan) -> None:
         """Freeze one algorithm's π_old anchor once, before the multi-update loop."""
         if part.segment is None:
             return
-        prepare = getattr(algorithm, "prepare_segment", None)
-        if prepare is None:
-            return
-        recomputes = getattr(algorithm, "recomputes_anchor", None)
-        if recomputes is None or not recomputes():
-            prepare(conditions=part.conditions, segment=part.segment)
+        if not algorithm.recomputes_anchor:
+            algorithm.prepare_segment(conditions=part.conditions, segment=part.segment)
             return
         micro_slices = [micro_slice for update in plans for micro_slice in update]
         if len(micro_slices) == 1:
-            prepare(conditions=part.conditions, segment=part.segment)
+            algorithm.prepare_segment(conditions=part.conditions, segment=part.segment)
             return
-        anchor_fields = getattr(algorithm, "anchor_fields", ())
-        collected: Dict[str, List[torch.Tensor]] = {field: [] for field in anchor_fields}
+        collected: Dict[str, List[torch.Tensor]] = {field: [] for field in algorithm.anchor_fields}
         for start, end in micro_slices:
             micro = part.slice(start, end)
-            prepare(conditions=micro.conditions, segment=micro.segment)
+            algorithm.prepare_segment(conditions=micro.conditions, segment=micro.segment)
             for field in collected:
                 value = getattr(micro.segment, field, None)
                 if value is None:

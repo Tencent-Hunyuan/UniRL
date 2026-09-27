@@ -5,7 +5,7 @@ import time
 from typing import Dict, Optional, Tuple
 
 import torch
-from hydra.utils import instantiate
+from hydra.utils import get_class, instantiate
 from omegaconf import DictConfig
 
 from unirl.distributed.group.placement import placement, remote
@@ -35,7 +35,7 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
         pipeline_cfg: DictConfig,
         backend_cfg: DictConfig,
         rollout_cfg: DictConfig,
-        reward_cfg: DictConfig,
+        reward_cfg: Optional[DictConfig],
         algorithm_cfg: DictConfig,
         stack_cfg: DictConfig,
         data_source_cfg: DictConfig,
@@ -63,6 +63,18 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
             rollout_cfg=rollout_cfg,
             stack_cfg=stack_cfg,
         )
+        algorithm_cls = get_class(algorithm_cfg["_target_"])
+        if algorithm_cls.requires_backend or not algorithm_cls.requires_advantages:
+            raise ValueError(
+                f"AsyncARTrainer does not support teacher-anchored algorithms ({algorithm_cls.__name__} sets "
+                "requires_backend or requires_advantages=False). Use the synchronous ARTrainer; async "
+                "teacher-anchored training is not implemented."
+            )
+        if reward_cfg is None:
+            raise ValueError(
+                "AsyncARTrainer requires a `reward:` block. Reward-free AR training is supported "
+                "only by the synchronous ARTrainer."
+            )
         per_worker_inflight = int(per_worker_inflight)
         self._train_fraction = float(train_fraction)
         configured_concurrency = cfg.get("worker_max_concurrency")

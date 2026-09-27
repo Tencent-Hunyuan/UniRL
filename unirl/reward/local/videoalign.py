@@ -17,7 +17,7 @@ import torch
 import torch.nn as nn
 from torchvision.transforms import InterpolationMode
 
-from unirl.reward.base import BaseRewardComponentSpec
+from unirl.reward.base import PromptRewardComponentSpec
 from unirl.reward.local.device import resolve_device
 from unirl.types.reward import RewardRequest, RewardResponse
 
@@ -601,11 +601,15 @@ class VideoAlignRewardScorer(LocalRewardBackend):
             device=resolve_device(config.device, base_device),
             dtype=dtype,
             batch_size=config.batch_size,
+            prompt_source=config.prompt_source,
             checkpoint_path=config.checkpoint_path,
         )
         self._vq_coef = float(getattr(config, "vq_coef", 1.0))
         self._mq_coef = float(getattr(config, "mq_coef", 1.0))
         self._ta_coef = float(getattr(config, "ta_coef", 1.0))
+
+    def covers_prompt_video(self) -> bool:
+        return self._ta_coef > 0.0
 
     def _load_model(self) -> None:
         os.environ.setdefault("FORCE_QWENVL_VIDEO_READER", "decord")
@@ -663,7 +667,7 @@ class VideoAlignRewardScorer(LocalRewardBackend):
 
         all_rewards: List[float] = []
         components: Dict[str, List[float]] = {"vq": [], "mq": [], "ta": [], "overall": []}
-        prompts = list(request.prompts)
+        prompts = self.prompts(request)
 
         with tempfile.TemporaryDirectory(prefix="unirl_videoalign_") as tmpdir:
             video_paths = []
@@ -708,7 +712,7 @@ def _export_tensor_video(video: torch.Tensor, path: str) -> None:
 
 
 @dataclass
-class VideoAlignSpec(BaseRewardComponentSpec):
+class VideoAlignSpec(PromptRewardComponentSpec):
     """Typed config for the VideoAlign reward component."""
 
     weight: float = 1.0

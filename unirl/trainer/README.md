@@ -40,9 +40,12 @@ stay swappable by `_target_`.
   disjoint `placement` slabs and runs a one-time cross-slab handshake for weight sync.
 - **The Sample-native loop** (`train_step`) is the conductor sequence, one
   rollout per call: `wake_up` → (sync weights, if due) →
-  `rollout.generate(sample)` → `reward.score_and_attach(sample)` →
-  `part.compute_advantages(...)` → drop reward-only decoded media →
-  `stack.train_track(...)`. The driver builds a request `Sample` whose Parts
+  `rollout.generate(sample)` → (if configured) `reward.score_and_attach(sample)` →
+  (if required) `part.compute_advantages(...)` → drop reward-only decoded media →
+  `stack.train_track(...)`. On synchronous `ARTrainer`, `requires_advantages=False`
+  algorithms (supervised / teacher-anchored, e.g. the planned AR OPD) may omit the
+  `reward:` block; a configured reward is retained for monitoring only. The driver
+  builds a request `Sample` whose Parts
   preserve prompt lineage and carry sampling parameters. A single-stage stack
   receives the trainable frontier `Part`; `UnifiedModelTrainStack` receives the
   whole `Sample` so AR and image Parts are sharded by the same prompt trees.
@@ -52,17 +55,42 @@ stay swappable by `_target_`.
   Parts for training. (ReFL — which differentiates
   directly through decoded media and uses no rollout Samples or advantages —
   lives outside core as `experimental/refl`.)
-- **Diffusion role residency is opt-in.** `rollout_sleep_after_generate=true`
-  preserves phase-based rollout sleep (the default; the async entry point
-  defaults it to `false` — its dedicated rollout slab stays resident); `false`
-  keeps an external engine's weights resident across rollout/reward/train. Train-state policies are
-  independent: `enable_fsdp_offload` lets an external rollout borrow train memory
-  during generation, while `offload_train_during_reward` lets a reward sharing the
-  train slab borrow it during scoring. A reward on a separate `reward_fraction`
-  slab never triggers train offload. `offload_train_during_reward` is rejected at
-  startup with EMA/DiffusionNFT algorithms (unvalidated against `backend.ema`
-  state) and with `AsyncDiffusionTrainer` (async scoring runs outside
-  `_reward_phase()`), rather than being silently ignored.
+- **Diffusion residency is one choice per role, not per phase.** `train_resident`,
+  `rollout_resident` and `reward_resident` each say whether that role keeps its
+  weights on the GPU while it is idle; only weights move, never a role's process.
+  Synchronous defaults (`true`/`false`/`true`) reproduce the historical behaviour.
+  Async defaults (`true`/`true`/`true`) keep its dedicated rollout slab resident;
+  direct `AsyncDiffusionTrainer` construction and the async entry point use the
+  same policy. `ResidencyPlanner`
+  turns a phase's needs into transitions and issues only the ones that change
+  something, so a reward phase inherits an already-parked trainer instead of
+  re-offloading it, and the trainer returns once per optimizer step rather than
+  once per rollout. Roles that do not share the slab — a reward behind
+  `reward_fraction`, or the trainer behind `layout: separate` or a trainside
+  rollout — are not tracked, so nothing moves memory the active role could not
+  use — and asking to park one of them is rejected rather than ignored. The
+  startup rejections are: `train_resident=false` where there is nothing to park
+  (`layout: separate`, or a trainside rollout, whose generation reads the very
+  weights that would go), with a full-weight sync whose single `sync()` reads the
+  trainer and loads the rollout in one call, or with EMA/DiffusionNFT plus an
+  external colocated rollout (unvalidated against `backend.ema` state); and under
+  `AsyncDiffusionTrainer`, `reward_resident=false` (async scoring runs outside
+  `_reward_phase()`) and `rollout_resident=false` (the engine owns a dedicated slab
+  and is never idle, so parking it at an evaluation or checkpoint boundary would
+  sleep an engine the loop is about to use).
+
+  Both the optimizer step and checkpointing consume the trainer, so it is made
+  resident before each; the checkpoint one sits behind
+  `maybe_save_checkpoint`'s own due-or-not predicate, so a window that evaluates
+  without saving keeps the trainer parked. A LoRA sync holds its extracted adapter
+  past the push and until the next optimizer step, so an accumulate window and an
+  eval's later chunks reuse it instead of onloading the trainer to read weights
+  that cannot have changed. A no-sync eval preserves an unpinned rollout while
+  scoring between chunks because sleeping engines such as SGLang would discard
+  the adapter that the caller deliberately did not repush. A pinned rollout
+  (`rollout_resident: true`) is not
+  slept even when generation raises: the policy says its weights stay put, and the
+  caller that set it owns the peak.
 
 The current trainer surface is:
 
@@ -295,11 +323,17 @@ logging:
   log_media: true         # also uploads the eval panel (below)
 ```
 
+`eval_samples_per_prompt` is a real override whenever it differs from the
+rollout's `samples_per_prompt`; the retired alias previously caused the
+rollout fan-out to win silently. Diffusion sampling now has one field per
+value: `samples_per_prompt` controls fan-out and `guidance_scale` controls
+text CFG, including for BAGEL. The retired `num_samples_per_prompt` and
+`cfg_text_scale` fields are not accepted.
+
 CFG has no eval knob of its own: leave `guidance_scale` unmentioned and eval
 runs at the training guidance (a CFG-off run cannot silently evaluate with CFG
-on); name it in `eval_sampling:` to decouple the two. BAGEL-family params
-consume `cfg_text_scale`, and passing the inert `guidance_scale` there raises.
-Unknown overlay fields raise, and the retired per-field knobs
+on); name it in `eval_sampling:` to decouple the two. Unknown overlay fields
+raise, and the retired per-field knobs
 (`eval_cfg_text_scale`, `eval_num_inference_steps`, ...) fail fast with a
 migration hint. Dynamic-shift models re-derive μ from the eval
 steps/resolution, so a decoupled eval stays on the model's official schedule;

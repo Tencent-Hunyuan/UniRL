@@ -181,7 +181,7 @@ class AgenticTrainer(BaseTrainer):
             rollout_id,
             allowed_primitives={"text"},
             caller="AgenticTrainer._build_request_sample",
-            root_control={"ar": {"stop": list(self._stop)}},
+            control={"ar": {"stop": list(self._stop)}},
         )
 
     def _collect_groups(self, requests: Sample) -> List[List[Sample]]:
