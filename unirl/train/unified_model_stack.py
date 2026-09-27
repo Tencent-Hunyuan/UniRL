@@ -14,11 +14,10 @@ from unirl.algorithms.base import AlgorithmStepResult, StageAlgorithm
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
 from unirl.train.backend.fsdp import FSDPBackend
-from unirl.train.stack import TrainStepResult
-from unirl.train.stack.base import _aggregate_update_results, _prepare_segment_anchors, _validate_anchor_contract
+from unirl.train.stack import TrainStepResult, prepare_segment_anchors, validate_anchor_contract
+from unirl.train.stack.base import _aggregate_update_results
 from unirl.train.stack.planner import (
     CountPlanner,
-    Plan,
     UpdatePlanner,
     _positive_int,
     arranged_slice,
@@ -58,8 +57,8 @@ class UnifiedModelTrainStack(Remote):
         self.num_updates_per_batch = _positive_int(
             name="UnifiedModelTrainStack.num_updates_per_batch", value=num_updates_per_batch
         )
-        _validate_anchor_contract(self.ar_algorithm)
-        _validate_anchor_contract(self.image_algorithm)
+        validate_anchor_contract(self.ar_algorithm)
+        validate_anchor_contract(self.image_algorithm)
         if self.num_updates_per_batch > 1:
             for name, algo in (("ar", self.ar_algorithm), ("image", self.image_algorithm)):
                 if not algo.supports_multi_update:
@@ -73,18 +72,6 @@ class UnifiedModelTrainStack(Remote):
             CountPlanner(),
             shuffle_updates=shuffle_updates,
             shuffle_seed=shuffle_seed,
-        )
-
-    def prepare_segment(
-        self, algorithm: StageAlgorithm, part: Part, *, plans: Plan, order: Optional[torch.Tensor]
-    ) -> None:
-        """Freeze one algorithm's π_old anchor once, before the multi-update loop."""
-        _prepare_segment_anchors(
-            algorithm,
-            part,
-            [micro_slice for update in plans for micro_slice in update],
-            order,
-            caller="UnifiedModelTrainStack.prepare_segment",
         )
 
     def _backward_part(
@@ -229,8 +216,8 @@ class UnifiedModelTrainStack(Remote):
             )
         profiler = self._train_step_profiler() if scope == "train" else None
         with profiler.record("train_track") if profiler is not None else nullcontext():
-            self.prepare_segment(self.ar_algorithm, ar_part, plans=ar_steps, order=ar_order)
-            self.prepare_segment(self.image_algorithm, image_part, plans=image_steps, order=image_order)
+            prepare_segment_anchors(self.ar_algorithm, ar_part, ar_steps, order=ar_order)
+            prepare_segment_anchors(self.image_algorithm, image_part, image_steps, order=image_order)
 
             per_update: List[Dict[str, TrainStepResult]] = []
             for u in range(self.num_updates_per_batch):

@@ -131,7 +131,7 @@ algorithm:
   # bf16 forwards are batch-shape sensitive, so the on-policy ratio is exactly 1 only
   # when pi_old is recomputed at the train micro-geometry. `replay` does that (the
   # train stack drives prepare_segment over the same slices it trains on; see
-  # TrainStack.prepare_segment). Recipes that already sample and train at the same
+  # unirl.train.stack.prepare_segment_anchors). Recipes that already sample and train at the same
   # batch (forward_batch_size == micro_batch_size) can keep the default `rollout`.
   old_logp_source: replay
   conditions_cls:

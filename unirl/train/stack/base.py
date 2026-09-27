@@ -6,7 +6,7 @@ import logging
 import math
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Dict, List, Mapping, Optional, Tuple, Union
 
 import torch
 
@@ -15,6 +15,7 @@ from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
 from unirl.distributed.tensor.batch import _move_value
 from unirl.train.backend.fsdp import FSDPBackend
+from unirl.train.stack.anchor import prepare_segment_anchors, validate_anchor_contract
 from unirl.train.stack.planner import (
     Arrangement,
     CountPlanner,
@@ -24,7 +25,6 @@ from unirl.train.stack.planner import (
     UpdatePlanner,
     _positive_int,
     arranged_slice,
-    restore_row_order,
 )
 from unirl.types.loss_agg import LossAggMode
 from unirl.types.sample import Part
@@ -75,48 +75,6 @@ def _align_track_to_model(part: Part, *, device: torch.device) -> None:
         part.advantages = part.advantages.to(device=device)
 
 
-def _validate_anchor_contract(algorithm: StageAlgorithm) -> None:
-    """Reject anchor declarations whose per-micro outputs would be discarded."""
-    recomputes_anchor = algorithm.recomputes_anchor
-    if not isinstance(recomputes_anchor, bool):
-        raise TypeError(f"{type(algorithm).__name__}.recomputes_anchor must be a bool attribute.")
-    if recomputes_anchor and not algorithm.anchor_fields:
-        raise ValueError(f"{type(algorithm).__name__} recomputes its anchor but declares no anchor_fields.")
-
-
-def _prepare_segment_anchors(
-    algorithm: StageAlgorithm,
-    part: Part,
-    micro_slices: Sequence[Tuple[int, int]],
-    order: Optional[torch.Tensor],
-    *,
-    caller: str,
-) -> None:
-    """Freeze declared anchors over planned micros and write them back onto ``part``."""
-    if part.segment is None:
-        return
-    if not algorithm.recomputes_anchor or len(micro_slices) == 1:
-        algorithm.prepare_segment(conditions=part.conditions, segment=part.segment)
-        return
-    collected: Dict[str, List[torch.Tensor]] = {field: [] for field in algorithm.anchor_fields}
-    for start, end in micro_slices:
-        micro = arranged_slice(part, order, start, end)
-        algorithm.prepare_segment(conditions=micro.conditions, segment=micro.segment)
-        for field in collected:
-            value = getattr(micro.segment, field, None)
-            if value is None:
-                raise RuntimeError(
-                    f"{caller}: {type(algorithm).__name__} declares anchor field {field!r} but a micro produced None."
-                )
-            collected[field].append(value)
-    for field, tensors in collected.items():
-        setattr(
-            part.segment,
-            field,
-            restore_row_order(torch.cat(tensors, dim=0), order, segment=part.segment, field=field),
-        )
-
-
 class TrainStack(Remote):
     """Single-stage stage-driven train stack — family-agnostic."""
 
@@ -156,17 +114,7 @@ class TrainStack(Remote):
             shuffle_updates=shuffle_updates,
             shuffle_seed=shuffle_seed,
         )
-        _validate_anchor_contract(algorithm)
-
-    def prepare_segment(self, part: Part, *, plans: Plan, order: Optional[torch.Tensor]) -> None:
-        """Freeze the π_old anchor once, before the ``num_updates_per_batch`` loop."""
-        _prepare_segment_anchors(
-            self.algorithm,
-            part,
-            [r for update in plans for r in update],
-            order,
-            caller=f"{type(self).__name__}.prepare_segment",
-        )
+        validate_anchor_contract(algorithm)
 
     def _run_update(
         self,
@@ -414,7 +362,7 @@ class TrainStack(Remote):
     def _prepare_for_training(self, part: Part, *, plans: Plan, order: Optional[torch.Tensor]) -> Part:
         """Freeze this part's anchor in eval mode, then return the model to train mode."""
         self.fsdp_backend.model.eval()
-        self.prepare_segment(part, plans=plans, order=order)
+        prepare_segment_anchors(self.algorithm, part, plans, order=order)
         part = self.algorithm.prepare_part(part)
         self.fsdp_backend.model.train()
         return part
