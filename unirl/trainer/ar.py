@@ -426,7 +426,7 @@ class ARTrainer(BaseTrainer):
             eval_num_prompts=self.eval_num_prompts,
         )
         reward_sum, reward_n, prompt_n, batch_n = 0.0, 0, 0, 0
-        # Rollout and reward each DP-split the request, so every batch must divide both DP sizes.
+        # Rollout and reward each DP-split the request, so every dispatched batch is a multiple of both DP sizes.
         pad_multiple = math.lcm(
             max(1, int(getattr(self.rollout, "dp_size", 1))),
             max(1, int(getattr(self.reward, "dp_size", 1))),

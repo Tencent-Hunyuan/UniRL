@@ -63,30 +63,16 @@ def prepare_input_sample(
 
 
 def pad_eval_inputs(inputs: Sample, multiple: int) -> Sample:
-    """Append replicated prompt rows until ``multiple`` divides the root count."""
+    """Append copies of the last prompt tree under ``:eval-pad:`` roots until ``multiple`` divides the root count."""
     n = inputs.batch_size
     if n % multiple == 0:
         return inputs
     source = inputs.slice(n - 1, n)
-    source_root_id = source.parts[0].sample_ids[0]
-    used_root_ids = set(inputs.parts[0].sample_ids)
-    padded: list[Sample] = []
-    for i in range((-n) % multiple):
-        candidate = f"{source_root_id}:eval-pad:{i}"
-        while candidate in used_root_ids:
-            candidate += ":pad"
-        used_root_ids.add(candidate)
-
-        def replace_root(sample_id: str, *, new_root: str = candidate) -> str:
-            root, separator, suffix = sample_id.partition("/")
-            if root != source_root_id:
-                raise ValueError(
-                    f"pad_eval_inputs: selected pad tree contains unexpected root {root!r}; "
-                    f"expected {source_root_id!r}."
-                )
-            return new_root + (f"/{suffix}" if separator else "")
-
-        padded.append(source.map_sample_ids(replace_root))
+    root = source.parts[0].sample_ids[0]
+    padded = [
+        source.map_sample_ids(lambda sid, pad_root=f"{root}:eval-pad:{i}": pad_root + sid[len(root) :])
+        for i in range((-n) % multiple)
+    ]
     return Sample.concat([inputs, *padded])
 
 
