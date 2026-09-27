@@ -14,15 +14,13 @@ from unirl.algorithms.base import AlgorithmStepResult, StageAlgorithm
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
 from unirl.train.backend.fsdp import FSDPBackend
-from unirl.train.stack import TrainStepResult
-from unirl.train.stack.base import _aggregate_update_results, _validate_anchor_contract
+from unirl.train.stack import TrainStepResult, prepare_segment_anchors, validate_anchor_contract
+from unirl.train.stack.base import _aggregate_update_results
 from unirl.train.stack.planner import (
     CountPlanner,
-    Plan,
     UpdatePlanner,
     _positive_int,
     arranged_slice,
-    restore_row_order,
 )
 from unirl.types.sample import Part, Sample
 from unirl.types.sampling import ARSamplingParams, DiffusionSamplingParams
@@ -59,8 +57,8 @@ class UnifiedModelTrainStack(Remote):
         self.num_updates_per_batch = _positive_int(
             name="UnifiedModelTrainStack.num_updates_per_batch", value=num_updates_per_batch
         )
-        _validate_anchor_contract(self.ar_algorithm)
-        _validate_anchor_contract(self.image_algorithm)
+        validate_anchor_contract(self.ar_algorithm)
+        validate_anchor_contract(self.image_algorithm)
         if self.num_updates_per_batch > 1:
             for name, algo in (("ar", self.ar_algorithm), ("image", self.image_algorithm)):
                 if not algo.supports_multi_update:
@@ -75,38 +73,6 @@ class UnifiedModelTrainStack(Remote):
             shuffle_updates=shuffle_updates,
             shuffle_seed=shuffle_seed,
         )
-
-    def prepare_segment(
-        self, algorithm: StageAlgorithm, part: Part, *, plans: Plan, order: Optional[torch.Tensor]
-    ) -> None:
-        """Freeze one algorithm's π_old anchor once, before the multi-update loop."""
-        if part.segment is None:
-            return
-        if not algorithm.recomputes_anchor:
-            algorithm.prepare_segment(conditions=part.conditions, segment=part.segment)
-            return
-        micro_slices = [micro_slice for update in plans for micro_slice in update]
-        if len(micro_slices) == 1:
-            algorithm.prepare_segment(conditions=part.conditions, segment=part.segment)
-            return
-        collected: Dict[str, List[torch.Tensor]] = {field: [] for field in algorithm.anchor_fields}
-        for start, end in micro_slices:
-            micro = arranged_slice(part, order, start, end)
-            algorithm.prepare_segment(conditions=micro.conditions, segment=micro.segment)
-            for field in collected:
-                value = getattr(micro.segment, field, None)
-                if value is None:
-                    raise RuntimeError(
-                        f"UnifiedModelTrainStack.prepare_segment: {type(algorithm).__name__} declares "
-                        f"anchor field {field!r} but a micro-slice produced None."
-                    )
-                collected[field].append(value)
-        for field, parts in collected.items():
-            setattr(
-                part.segment,
-                field,
-                restore_row_order(torch.cat(parts, dim=0), order, segment=part.segment, field=field),
-            )
 
     def _backward_part(
         self,
@@ -250,8 +216,8 @@ class UnifiedModelTrainStack(Remote):
             )
         profiler = self._train_step_profiler() if scope == "train" else None
         with profiler.record("train_track") if profiler is not None else nullcontext():
-            self.prepare_segment(self.ar_algorithm, ar_part, plans=ar_steps, order=ar_order)
-            self.prepare_segment(self.image_algorithm, image_part, plans=image_steps, order=image_order)
+            prepare_segment_anchors(self.ar_algorithm, ar_part, ar_steps, order=ar_order)
+            prepare_segment_anchors(self.image_algorithm, image_part, image_steps, order=image_order)
 
             per_update: List[Dict[str, TrainStepResult]] = []
             for u in range(self.num_updates_per_batch):

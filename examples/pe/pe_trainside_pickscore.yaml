@@ -118,7 +118,7 @@ diffusion:
     # Rollout samples the whole shard in one forward (no forward_batch_size set)
     # but trains at micro_batch_size=1; bf16 GEMMs are batch-shape sensitive, so
     # the on-policy ratio is exactly 1 only when pi_old is replayed at the train
-    # micro-geometry. See sd3_trainside.yaml / TrainStack.prepare_segment.
+    # micro-geometry. See sd3_trainside.yaml / unirl.train.stack.prepare_segment_anchors.
     old_logp_source: replay
     conditions_cls:
       _target_: hydra.utils.get_class
