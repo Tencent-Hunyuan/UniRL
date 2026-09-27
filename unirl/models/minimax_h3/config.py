@@ -95,6 +95,11 @@ class MiniMaxH3PipelineConfig:
     # it, and expect decode to become the bottleneck.
     vae_components_on_cpu: bool = False
 
+    # Directory of ``index.json`` + sharded ``.safetensors`` from
+    # ``python -m unirl.tools.precompute_minimax_h3``. When set, the bundle
+    # skips the 32B Qwen3-VL load and generate reads embeddings from the store.
+    text_embed_cache_path: Optional[str] = None
+
     weight_sync_param_name_prefix: str = "transformer."
 
     use_lora: bool = False

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Dict, Iterator, Optional
+from typing import Callable, Dict, Iterator, Optional
 
 import torch
 from torch import nn
@@ -37,8 +37,8 @@ def load_model_state_dict(
     *,
     strict: bool = True,
     broadcast_from_rank0: bool = True,
-) -> None:
-    """Load a full state dict and reshard it into ``model``."""
+) -> object:
+    """Load a full state dict and reshard it into ``model``; returns torch's ``(missing_keys, unexpected_keys)``."""
     from torch.distributed.checkpoint.state_dict import set_model_state_dict
 
     options = _build_state_dict_options(
@@ -48,9 +48,9 @@ def load_model_state_dict(
         strict=strict,
     )
     try:
-        set_model_state_dict(model, state_dict, options=options)
+        return set_model_state_dict(model, state_dict, options=options)
     except TypeError:
-        set_model_state_dict(model, state_dict)
+        return set_model_state_dict(model, state_dict)
 
 
 def gather_optimizer_state_dict(model: nn.Module, optimizer: torch.optim.Optimizer) -> StateDict:
@@ -60,11 +60,11 @@ def gather_optimizer_state_dict(model: nn.Module, optimizer: torch.optim.Optimiz
     return full if _current_rank() == 0 else {}
 
 
-def gather_lora_state_dict(model: nn.Module) -> StateDict:
-    """Gather every adapter's LoRA tensors, preserving the model state-dict key format."""
+def gather_lora_state_dict(model: nn.Module, keep: Callable[[str], bool]) -> StateDict:
+    """Gather the LoRA tensors whose keys pass ``keep``, preserving the model state-dict key format."""
     gathered: StateDict = {}
     for key, value in model.state_dict().items():
-        if "lora_A" not in key and "lora_B" not in key:
+        if not keep(key):
             continue
         if isinstance(value, torch.Tensor) and value.is_meta:
             raise RuntimeError(f"gather_lora_state_dict: LoRA tensor {key!r} is still on meta")

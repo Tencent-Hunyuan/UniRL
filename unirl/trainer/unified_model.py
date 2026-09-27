@@ -387,6 +387,7 @@ class UnifiedModelTrainer(BaseTrainer):
         results: Dict[str, TrainStepResult] = self.stack.train_track(
             sample,
             training_progress=float(training_progress),
+            rollout_id=rollout_id,
         )
         self.wandb_logger.log_rollout_step(
             rollout_id,

@@ -873,7 +873,9 @@ class DiffusionTrainer(BaseTrainer):
         if self._staged_weight_sync:
             self.weight_sync.invalidate()
         result = self.stack.train_track(
-            parts if len(parts) > 1 else parts[0], training_progress=float(training_progress)
+            parts if len(parts) > 1 else parts[0],
+            training_progress=float(training_progress),
+            rollout_id=final_id,
         )
         # Reward stats must cover the whole window: with per-domain scorers each
         # rollout is NaN outside its own domain, so the final sample alone would
