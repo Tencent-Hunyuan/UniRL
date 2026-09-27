@@ -364,17 +364,14 @@ class TrainStack(Remote):
                 f"requires num_updates_per_batch == 1 (got {self.num_updates_per_batch}) — extra "
                 "optimizer steps inside the window would re-step on partial gradients."
             )
-        arranged = []
         for part in window:
             self._align_track_inputs(part)
-            arranged.append(
-                self.update_planner.arrange(
-                    part,
-                    num_updates=self.num_updates_per_batch,
-                    micro_batch_size=self.micro_batch_size,
-                    shuffle_step=rollout_id,
-                )
-            )
+        arranged = self.update_planner.arrange_many(
+            window,
+            num_updates=self.num_updates_per_batch,
+            micro_batch_size=self.micro_batch_size,
+            shuffle_step=rollout_id,
+        )
         from unirl.utils.profiling import profile_mode
 
         profiler = self._train_step_profiler() if profile_mode() == "train" else None
@@ -398,7 +395,7 @@ class TrainStack(Remote):
         self.fsdp_backend.model.train()
         return part
 
-    def _run_window(self, arranged: List[Arrangement], *, training_progress: float) -> TrainStepResult:
+    def _run_window(self, arranged: Tuple[Arrangement, ...], *, training_progress: float) -> TrainStepResult:
         """One optimizer step over an accumulation window of single-update parts."""
         m = len(arranged)
         self.fsdp_backend.zero_grad()
