@@ -21,7 +21,6 @@ def register_unirl_runtime() -> None:
 
     logger.info("Registering UniRL inverse-CDF deterministic sampler")
     import torch
-    from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
     from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
     @torch.compile(dynamic=True)
@@ -30,11 +29,18 @@ def register_unirl_runtime() -> None:
         seeds: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
-        hashes = murmur_hash32(
-            seeds.to(torch.uint64),
-            positions,
-            torch.zeros(1, device=logprobs.device, dtype=torch.int64),
-        )[:, 0]
+        # Keep the counter hash visible to Inductor. Calling SGLang's custom
+        # Triton Murmur op inside torch.compile can expose its output before the
+        # opaque mutation is ordered, which makes identical calls intermittent.
+        mask = 0xFFFFFFFF
+        hashes = seeds.to(torch.int64)
+        hashes = (hashes & mask) ^ ((hashes >> 32) & mask)
+        hashes = hashes ^ ((positions.to(torch.int64) * 0x9E3779B9) & mask)
+        hashes = hashes ^ (hashes >> 16)
+        hashes = (hashes * 0x85EBCA6B) & mask
+        hashes = hashes ^ (hashes >> 13)
+        hashes = (hashes * 0xC2B2AE35) & mask
+        hashes = hashes ^ (hashes >> 16)
         uniforms = (hashes.to(torch.float64) + 0.5) * (2.0**-32)
         cumulative = torch.cumsum(logprobs.float().exp(), dim=-1)
         totals = cumulative[:, -1]
