@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
@@ -12,7 +12,7 @@ from unirl.types.sample import Part, Sample
 
 
 class RewardStack(Remote):
-    """Generate one DP shard in micro-batches and overlap each micro's scoring with the next micro's generation."""
+    """Generate one DP shard in micro-batches; with overlap, score each micro on a thread while generation goes on."""
 
     def __init__(
         self,
@@ -85,18 +85,20 @@ class RewardStack(Remote):
         return [self._score(self._generate(sample, gen, start, end)).parts[-1] for start, end in bounds]
 
     def _overlapped(self, sample: Sample, gen: Part, bounds: Sequence[Tuple[int, int]]) -> List[Part]:
-        """Keep one scoring call in flight while the next micro generates; a scorer raise surfaces here."""
-        parts: List[Part] = []
+        """Queue every micro's scoring on one thread and never make generation wait; a scorer raise surfaces early."""
+        futures: List[Future] = []
         with ThreadPoolExecutor(max_workers=1, thread_name_prefix="reward-stack") as pool:
-            inflight: Optional[Future] = None
             for start, end in bounds:
                 generated = self._generate(sample, gen, start, end)
-                if inflight is not None:
-                    parts.append(inflight.result())
-                inflight = pool.submit(self._score_part, generated)
-            if inflight is not None:
-                parts.append(inflight.result())
-        return parts
+                self._raise_if_failed(futures)
+                futures.append(pool.submit(self._score_part, generated))
+            return [future.result() for future in futures]
+
+    @staticmethod
+    def _raise_if_failed(futures: Sequence[Future]) -> None:
+        for future in futures:
+            if future.done():
+                future.result()
 
     def _generate(self, sample: Sample, gen: Part, start: int, end: int) -> Sample:
         micro = sample if start == 0 and end == int(gen.batch_size) else sample.replace_frontier(gen.slice(start, end))

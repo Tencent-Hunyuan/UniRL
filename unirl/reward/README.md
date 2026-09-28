@@ -82,8 +82,9 @@ step and the stack returns 0.15 s. With the same scorer moved behind HTTP onto i
 GPU (`sd3_trainside_http`), reward is 15.97 s of a 157.2 s step, and the micro loop alone
 takes generate+reward from 62.58 s to 52.40 s and step time from 157.2 s to 144.7 s.
 
-`overlap: true` additionally runs each micro's scoring on a one-thread pool while the
-next micro generates. It is **off by default and opt-in**: it improved the phase it
+`overlap: true` additionally hands each micro's scoring to a one-thread pool and keeps
+generating: scoring calls queue on that thread in micro order and generation never waits
+for a score, so a slow or saturated scorer delays only the final gather, not the engine. It is **off by default and opt-in**: it improved the phase it
 targets by 2.79 s, but step time did not follow, and one run per arm cannot separate that
 from noise. Turn it on only with several runs per arm to check it.
 
@@ -174,8 +175,8 @@ new remote reward needs no UniRL code — add it to the server and list its name
 - **Two smaller consequences of the stack owning the micro loop** — the engine's own
   chunk loop goes inert, so `sglang_diffusion`'s per-chunk `torch.cuda.empty_cache()`
   (`engine.py:136`) stops firing and peak *reserved* memory can shift on those
-  recipes; and a generate failure surfaces up to one scoring call late, because the
-  executor drains before the exception leaves the step.
+  recipes; and a scorer failure surfaces after the next micro generates (finished
+  futures are checked between micros) rather than at the call that failed.
 - **A non-finite/missing reward fails the whole step, by design** — fix the scorer.
   `raise_on_failure=False` (remote only) does *not* let training continue on it: the
   backend returns zeros with `successes=[False]`, and `score_and_attach`'s fail-fast
