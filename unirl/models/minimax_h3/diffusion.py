@@ -10,7 +10,7 @@ import torch
 from unirl.config.require import require
 from unirl.models.types.diffusion import DiffusionStage, DiffusionStep
 from unirl.models.types.replay_result import ReplayResult
-from unirl.sde.kernels import StepStrategy
+from unirl.sde.kernels import SDEStrategy, StepStrategy
 from unirl.sde.noise import make_denoise_step_generators
 from unirl.sde.runtime import get_sigma_schedule
 from unirl.types.sampling import DiffusionSamplingParams, compute_trajectory_positions
@@ -111,6 +111,7 @@ class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
         audio_joint_sde: bool = True,
         trajectory_precision: str = "fp16",
         logprob_precision: str = "fp32",
+        batch_replay_steps: bool = False,
     ) -> None:
         self.bundle = bundle
         self.step = MiniMaxH3DiffusionStep(bundle)
@@ -122,6 +123,7 @@ class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
         self.audio_joint_sde = bool(audio_joint_sde)
         self.trajectory_dtype = parse_torch_dtype(trajectory_precision, field_name="trajectory_precision")
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="logprob_precision")
+        self.batch_replay_steps = bool(batch_replay_steps)
 
     def trainable_module(self) -> torch.nn.Module:
         return self.bundle.transformer
@@ -311,6 +313,19 @@ class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
         stored = [int(i) for i in segment.sde_indices.tolist()]
         targets = [int(i) for i in (step_indices if step_indices is not None else stored)]
 
+        if self.batch_replay_steps and len(targets) > 1 and isinstance(self.video_strategy, SDEStrategy):
+            return self._replay_batched_steps(
+                conditions,
+                segment=segment,
+                params=params,
+                targets=targets,
+                sigmas=sigmas,
+                audio_sigmas=audio_sigmas,
+                video_sigma_max=video_sigma_max,
+                audio_sigma_max=audio_sigma_max,
+                layout=layout,
+            )
+
         log_probs: List[torch.Tensor] = []
         means: List[torch.Tensor] = []
         for step_idx in targets:
@@ -359,6 +374,83 @@ class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
             log_probs=torch.stack(log_probs, dim=1),
             prev_sample_means=torch.stack(means, dim=1) if means else None,
         )
+
+    def _replay_batched_steps(
+        self,
+        conditions: MiniMaxH3Conditions,
+        *,
+        segment: LatentSegment,
+        params: DiffusionSamplingParams,
+        targets: List[int],
+        sigmas: torch.Tensor,
+        audio_sigmas: torch.Tensor,
+        video_sigma_max: float,
+        audio_sigma_max: float,
+        layout,
+    ) -> ReplayResult:
+        """Replay joint video/audio transitions in one step-major batch."""
+        steps = len(targets)
+        device = self.bundle.device
+        video_sample = torch.cat([segment.latents_at(i).to(device) for i in targets], dim=0)
+        audio_sample = torch.cat([segment.aux_latents_at(i).to(device) for i in targets], dim=0)
+        prev_video = torch.cat([segment.latents_at(i + 1).to(device) for i in targets], dim=0)
+        prev_audio = torch.cat([segment.aux_latents_at(i + 1).to(device) for i in targets], dim=0)
+        batch_size = video_sample.shape[0] // steps
+
+        video_sigma = torch.cat([sigmas[i].to(torch.float32).expand(batch_size) for i in targets])
+        video_sigma_next = torch.cat([sigmas[i + 1].to(torch.float32).expand(batch_size) for i in targets])
+        audio_sigma = torch.cat([audio_sigmas[i].to(torch.float32).expand(batch_size) for i in targets])
+        audio_sigma_next = torch.cat([audio_sigmas[i + 1].to(torch.float32).expand(batch_size) for i in targets])
+        tiled_conditions = type(conditions).concat([conditions] * steps)
+
+        video_pred, audio_pred = self.step.predict_noise(
+            tiled_conditions,
+            video_sample=video_sample,
+            audio_sample=audio_sample,
+            video_sigma=video_sigma,
+            audio_sigma=audio_sigma,
+            layout=layout,
+        )
+        _, log_prob, mean = self.video_strategy.denoise(
+            noise_pred=video_pred,
+            sample=video_sample,
+            sigma=video_sigma,
+            sigma_next=video_sigma_next,
+            eta=float(params.eta),
+            prev_sample=prev_video,
+            sigma_max=video_sigma_max,
+            step_index=int(targets[0]),
+        )
+        if log_prob is None:
+            raise RuntimeError(
+                "MiniMaxH3DiffusionStage._replay_batched_steps: strategy returned None log-prob; "
+                "batched replay requires a stochastic SDE strategy."
+            )
+
+        if self.audio_joint_sde:
+            _, audio_log_prob, _ = self.audio_strategy.denoise(
+                noise_pred=audio_pred,
+                sample=audio_sample,
+                sigma=audio_sigma,
+                sigma_next=audio_sigma_next,
+                eta=float(params.eta),
+                prev_sample=prev_audio,
+                sigma_max=audio_sigma_max,
+                step_index=int(targets[0]),
+            )
+            if audio_log_prob is not None:
+                log_prob = _combine_modality_logp(
+                    log_prob,
+                    audio_log_prob,
+                    n_video=video_sample[0].numel(),
+                    n_audio=audio_sample[0].numel(),
+                )
+
+        log_probs = log_prob.view(steps, batch_size).transpose(0, 1).contiguous().to(self.logprob_dtype)
+        means = None
+        if mean is not None:
+            means = mean.view(steps, batch_size, *mean.shape[1:]).transpose(0, 1).contiguous()
+        return ReplayResult(log_probs=log_probs, prev_sample_means=means)
 
     def nft_clean_latents(self, segment: LatentSegment) -> torch.Tensor:
         """The clean ``x0`` a forward-process algorithm should train on."""

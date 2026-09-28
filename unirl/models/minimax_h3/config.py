@@ -44,6 +44,7 @@ class MiniMaxH3PipelineConfig:
     # Stage-level precision / numerical policy.
     trajectory_precision: str = "fp16"
     logprob_precision: str = "fp32"
+    batch_replay_steps: bool = False
 
     # Per-modality rectified-flow shifts. These are the released inference
     # values; they are NOT free parameters -- the model was distilled against
