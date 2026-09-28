@@ -148,12 +148,17 @@ keys as-is; keep headroom for NCCL weight-receive buffers. Sync is
 pool knobs. This is the exception to the full-FT `enable_lora: false` receive path
 (`LocalLoraWeightSync` instead of TensorWeightSync). Memory numbers are recipe-specific.
 
-**Deterministic sampler:** `SGLangEngineConfig.deterministic_sampler=inverse_cdf`
-keeps SGLang's per-request seed and FSDP on-policy log-softmax/model kernels, but
-draws the categorical sample from a seeded inverse CDF instead of allocating
+**Native versus strict on-policy rollout:** the Qwen3 DRPO recipe leaves
+`rl_on_policy_target` unset, matching the reference VERL comparison's native
+rollout path and keeping SGLang's optimized sampler/model kernels. To diagnose
+strict rollout-versus-FSDP replay parity, launch with
+`+rollout.config.engine_kwargs.rl_on_policy_target=fsdp` and
+`rollout.config.deterministic_sampler=inverse_cdf`. The latter keeps SGLang's
+per-request seed and FSDP on-policy log-softmax/model kernels, but draws the
+categorical sample from a seeded inverse CDF instead of allocating
 full-vocabulary FP64 Gumbel noise. It is batch-order independent and changes the
 seed-to-token mapping, not the target distribution. The default `sglang` value
-retains upstream behavior; the Qwen3 DRPO recipe opts into the faster path.
+retains upstream behavior.
 
 **Reserved ports:** `SGLangPorts.reserve()` selects candidate HTTP `port` and
 `nccl_port` values by binding temporary sockets on the engine's node, then
