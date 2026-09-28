@@ -132,8 +132,7 @@ def _flow_sde_sampling_with_dance(
     else:
         raise ValueError(f"Unsupported sde_type: {sde_type}")
 
-    stochastic = effective_sde_type != "ode"
-    if stochastic:
+    if effective_sde_type != "ode":
         prev_sample = prev_sample.to(dtype=emitted_dtype)
         log_prob_no_const_val = -((prev_sample.float() - prev_sample_mean) ** 2)
 
@@ -149,14 +148,6 @@ def _flow_sde_sampling_with_dance(
         log_prob_local_sum = (
             log_prob_no_const_val / (2 * (noise_std_dev**2)) - torch.log(noise_std_dev) - _LOG_SQRT_2PI
         ).sum(dim=list(range(1, len(log_prob_no_const_val.shape))))
-
-    if stochastic:
-        from sglang.multimodal_gen.runtime.distributed.communication_op import sequence_model_parallel_all_reduce
-        from sglang.multimodal_gen.runtime.post_training.sp_utils import should_do_sp_collective
-
-        if should_do_sp_collective(batch):
-            stats = sequence_model_parallel_all_reduce(torch.stack((log_prob_local_sum, local_elem_count)))
-            log_prob_local_sum, local_elem_count = stats.unbind(0)
 
     if debug_mode:
         self.append_local_rollout_debug_tensors(
