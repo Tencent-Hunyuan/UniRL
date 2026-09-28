@@ -24,8 +24,7 @@ def main(cfg: DictConfig) -> None:
         reward_cfg=cfg.get("reward"),
         algorithm_cfg=cfg.algorithm,
         stack_cfg=cfg.stack,
-        # Optional: opts the training path into micro-batched rollout with overlapped scoring.
-        rewardstack_cfg=cfg.get("rewardstack"),
+        reward_stack_cfg=cfg.get("reward_stack"),
         data_source_cfg=cfg.data_source,
         sampling_cfg=cfg.sampling,
         sync_cfg=cfg.get("sync"),

@@ -308,7 +308,7 @@ class DiffusionTrainer(BaseTrainer):
         data_source_cfg: DictConfig,
         sampling_cfg: DictConfig,
         sync_cfg: Optional[DictConfig] = None,
-        rewardstack_cfg: Optional[DictConfig] = None,
+        reward_stack_cfg: Optional[DictConfig] = None,
         logging_cfg: Optional[DictConfig] = None,
         layout: str = "colocate",
         train_fraction: float = 0.5,
@@ -432,16 +432,11 @@ class DiffusionTrainer(BaseTrainer):
                 "has no `reward:` block — drop reward_fraction or configure a reward."
             )
         self._reward_is_separate = reward_separate
-        if rewardstack_cfg is not None and reward_cfg is None:
-            raise ValueError(
-                "rewardstack requires a `reward:` block: the stack scores every micro through the reward "
-                "sibling on the same Worker, so without one there is nothing to call. Drop the `rewardstack:` block."
-            )
-        if rewardstack_cfg is not None and not reward_resident:
-            raise ValueError(
-                "rewardstack is not supported with reward_resident=false: the stack scores inside the generation "
-                "window, outside _reward_phase(), so the planner would park the reward to wake the rollout and "
-                "never bring it back before the stack calls it. Drop the key or the `rewardstack:` block."
+        if reward_stack_cfg is not None:
+            self._check_reward_stack_layout(
+                has_reward=reward_cfg is not None,
+                reward_resident=reward_resident,
+                reward_fraction=reward_fraction,
             )
 
         _preflight_trainside_geometry(
@@ -478,31 +473,10 @@ class DiffusionTrainer(BaseTrainer):
             with placement(self.pool, fraction=1.0 - reward_fraction, shared_workers=True):
                 self._build_train_side(**train_cfgs)
                 self.rollout = self._build_rollout(rollout_cfg, allow_pipeline=True)
-                if rewardstack_cfg is not None and not reward_separate:
-                    self.reward_stack = remote_hydra(rewardstack_cfg, rollout=self.rollout, reward=self.reward)
-                    if int(self.reward_stack.dp_size) != int(self.rollout.dp_size):
-                        raise ValueError(
-                            f"rewardstack dp_size={self.reward_stack.dp_size} != rollout dp_size="
-                            f"{self.rollout.dp_size}: the stack must shard the batch exactly as the engine does, "
-                            "or each micro reaches an engine rank expecting different rows."
-                        )
-                    if int(self.reward_stack.sp_size) != 1 or int(self.reward_stack.tp_size) != 1:
-                        raise ValueError(
-                            f"rewardstack is not supported with sp_size={self.reward_stack.sp_size} / "
-                            f"tp_size={self.reward_stack.tp_size}: the stack inherits the engine's layout and calls "
-                            "generate and score_and_attach in-process on every rank of a group, so an SP group "
-                            "scores the same shard sp_size times and a TP engine's non-leader shells return "
-                            "nothing to score. Drop the `rewardstack:` block on SP/TP recipes."
-                        )
+                if reward_stack_cfg is not None:
+                    self.reward_stack = self._build_reward_stack(reward_stack_cfg)
                 if sync_cfg is not None:
                     self.weight_sync = remote_hydra(sync_cfg, backend=self.backend, rollout=self.rollout)
-
-        if rewardstack_cfg is not None and self.reward_stack is None:
-            raise ValueError(
-                "rewardstack requires layout='colocate' with reward_fraction=0: the stack resolves rollout and "
-                f"reward as siblings on one Worker, which layout={self._layout!r} / reward_fraction="
-                f"{reward_fraction} place in separate placement scopes. Drop the `rewardstack:` block."
-            )
 
         if reward_separate:
             with placement(self.pool, fraction=reward_fraction, shared_workers=True):
@@ -791,6 +765,33 @@ class DiffusionTrainer(BaseTrainer):
         self._residency.enter(Role.REWARD, preserve=preserve)
         yield
 
+    def _check_reward_stack_layout(self, *, has_reward: bool, reward_resident: bool, reward_fraction: float) -> None:
+        """Reject the layouts in which the stack could not reach the engine and the reward as in-process siblings."""
+        if not has_reward:
+            raise ValueError("reward_stack needs a `reward:` block: it scores every micro through that sibling.")
+        if self._layout != "colocate" or reward_fraction > 0.0:
+            raise ValueError(
+                "reward_stack needs layout='colocate' with reward_fraction=0, so the engine and the reward share a "
+                f"Worker; got layout={self._layout!r}, reward_fraction={reward_fraction}."
+            )
+        if not reward_resident:
+            raise ValueError(
+                "reward_stack needs reward_resident=true: it scores inside the rollout window, where a parked "
+                "reward is never woken."
+            )
+
+    def _build_reward_stack(self, reward_stack_cfg: DictConfig) -> Any:
+        """Build the stack beside the engine it wraps and reject the SP/TP layouts it inherits but cannot serve."""
+        stack = remote_hydra(reward_stack_cfg, rollout=self.rollout, reward=self.reward)
+        if int(stack.dp_size) != int(self.rollout.dp_size):
+            raise ValueError(f"reward_stack dp_size={stack.dp_size} must equal rollout dp_size={self.rollout.dp_size}.")
+        if int(stack.sp_size) != 1 or int(stack.tp_size) != 1:
+            raise ValueError(
+                f"reward_stack needs sp_size=1 and tp_size=1, got sp_size={stack.sp_size}, tp_size={stack.tp_size}: "
+                "every rank of an SP or TP group would score the same shard, or nothing."
+            )
+        return stack
+
     def _generate_with_residency(
         self,
         sample: Sample,
@@ -821,8 +822,6 @@ class DiffusionTrainer(BaseTrainer):
             if should_swap_ema:
                 ema_apply_attempted = True
                 self.backend.apply_eval_ema()
-            # The stack owns the micro-batch loop, so its scoring runs inside this
-            # residency window instead of the driver's separate _reward_phase().
             result = self.reward_stack.rollout_and_score(sample) if score_inline else self.rollout.generate(sample)
             if score_inline:
                 self._log_reward_stack_timing()
