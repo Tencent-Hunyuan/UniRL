@@ -2,7 +2,7 @@
 
 Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-specific instructions as needed.
 
-Default code agent guidance lives here. Agents that do not read `AGENTS.md` natively, such as Claude Code, include it through a one-line `@AGENTS.md` file like `CLAUDE.md`; do not copy this body into such files.
+Default code agent guidance lives here; Cursor, Codex, and Claude Code (v2.1.281+) read it natively. Do not add a `CLAUDE.md`: Claude Code reads it instead of this file.
 
 **Tradeoff:** These guidelines bias toward caution over speed. For trivial tasks, use judgment.
 
