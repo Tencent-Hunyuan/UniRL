@@ -78,3 +78,9 @@ matching receiver on the engine side (`../../rollout/engine/`).
   `copy=True` for any TP>1 stage; `copy=False` is only safe for a TP=1 separate slab (SD3).
 - **`CheckpointWeightSync.version` is a filename sequence**, not a receiver
   idempotency key. Other transports carry no independent version ledger.
+- **Direct vLLM IPC deliberately delegates transfer mechanics to vLLM 0.27.**
+  UniRL supplies lazy canonical FSDP export, rank consensus, manifests, and
+  fail-stop publication; vLLM owns CUDA IPC handle routing, TP slicing,
+  model-specific fusion, and layerwise `load_weights`. Its packed producer reads
+  one tensor beyond the configured byte boundary before flushing, so UniRL plans
+  metadata chunks first to keep lazy materialization bounded.

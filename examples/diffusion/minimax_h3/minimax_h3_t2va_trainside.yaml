@@ -67,6 +67,12 @@ bundle:
     # after sharding; the bundle hands the fp32 pin list through so the
     # mixed-dtype layout survives `to_empty`.
     meta_init_transformer: true
+    # Offline Qwen3-VL embeddings (RFC #450). Default off — uncomment to skip the 32B load.
+    # The store must cover the train AND eval prompts; a miss raises mid-run:
+    #   python -m unirl.tools.precompute_minimax_h3 --model-path $PRETRAINED_MODEL \
+    #     --data-path datasets/pickscore/train.txt datasets/pickscore/test.txt \
+    #     --output-dir $TEXT_EMBED_CACHE_PATH
+    # text_embed_cache_path: ${oc.env:TEXT_EMBED_CACHE_PATH}
 
 pipeline:
   _target_: unirl.models.minimax_h3.pipeline.MiniMaxH3Pipeline.from_bundle

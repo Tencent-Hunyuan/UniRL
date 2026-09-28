@@ -721,7 +721,6 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
             require(self._generator is not None, "fastvideo engine is offloaded/not initialized")
             self._generator.update_transformer_weights_from_path(checkpoint_path)
             self._last_weights_path = checkpoint_path
-            self._version += 1
             logger.info("fastvideo transformer weights updated from %s", checkpoint_path)
 
 

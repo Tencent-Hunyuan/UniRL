@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, List
 
 import torch
 
-from unirl.reward.base import BaseRewardComponentSpec
+from unirl.reward.base import PromptRewardComponentSpec
 from unirl.types.reward import RewardRequest
 from unirl.utils.media import tensor_frame_to_pil
 
@@ -81,20 +81,19 @@ class VideoPickScoreScorer(PickScoreRewardScorer):
             pil_frames = [self._extract_frame(v, self.frame_selection) for v in request.videos]
             frame_pixels = torch.stack([to_tensor(f) for f in pil_frames])
             request = RewardRequest(
-                primitives=dict(request.primitives),
                 generated={"image": Images.from_dense(frame_pixels)},
-                prompt_ids=request.prompt_ids,
+                conditioning=dict(request.conditioning),
+                original_prompt=request.original_prompt,
+                generation_prompt=request.generation_prompt,
                 sample_ids=request.sample_ids,
                 group_ids=request.group_ids,
                 metadata=request.metadata,
-                reward_types=request.reward_types,
-                return_components=request.return_components,
             )
         return super()._compute_model_rewards(request)
 
 
 @dataclass
-class VideoPickScoreSpec(BaseRewardComponentSpec):
+class VideoPickScoreSpec(PromptRewardComponentSpec):
     """Typed config for the VideoPickScore reward component."""
 
     batch_size: int = 8
