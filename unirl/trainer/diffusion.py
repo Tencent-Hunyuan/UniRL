@@ -824,6 +824,7 @@ class DiffusionTrainer(BaseTrainer):
                 self.backend.apply_eval_ema()
             result = self.reward_stack.rollout_and_score(sample) if score_inline else self.rollout.generate(sample)
             if score_inline:
+                self.reward_stack.collect_garbage()
                 self._log_reward_stack_timing()
             generation_succeeded = True
             return result

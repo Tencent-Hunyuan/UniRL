@@ -92,7 +92,11 @@ waits for a score. It adds to the serial loop only while the scorer has headroom
 111.6 s to 106.8 s); a saturated scorer (72B) bounds the step by its throughput however
 the calls are scheduled. A scorer that fails raises after the next micro generates.
 
-The driver logs each rollout's
+Once the shard has left the worker the driver has the stack collect garbage (the memory
+monitor's `gc.collect` + `empty_cache` loop): the micro loop leaves enough Python garbage
+behind that the next train phase otherwise ran 5-8% slower, 191.8 s against 177.5 s with
+the remote judge and 59.5 s against 54.3 s with local PickScore, both now below the
+no-stack path; `gc.collect` alone recovers it, `empty_cache` alone does not. The driver logs each rollout's
 per-rank split (`reward stack timing: ... generate_s=<max>/<mean> score_s=... wall_s=...`)
 and adds `stack_generate` / `stack_score` to the perf phases; the driver-side `generate`
 and `reward` timers do not fire under the stack.

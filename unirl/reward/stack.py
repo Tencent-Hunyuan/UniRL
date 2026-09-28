@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Sequence, Tuple
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
 from unirl.types.sample import Part, Sample
+from unirl.utils.memory_utils import aggressive_empty_cache
 
 
 class RewardStack(Remote):
@@ -49,11 +50,18 @@ class RewardStack(Remote):
         started = time.perf_counter()
         try:
             if len(bounds) == 1:
-                return self._score(self._generate(sample, gen, 0, total))
-            parts = self._overlapped(sample, gen, bounds) if self.overlap else self._serial(sample, gen, bounds)
-            return sample.replace_frontier(Part.concat(parts))
+                scored = self._score(self._generate(sample, gen, 0, total))
+            else:
+                run = self._overlapped if self.overlap else self._serial
+                scored = sample.replace_frontier(Part.concat(run(sample, gen, bounds)))
         finally:
             self._wall_s = time.perf_counter() - started
+        return scored
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def collect_garbage(self) -> None:
+        """Collect the micro loop's garbage once the shard has left the worker; training ran 5-8% slower on it."""
+        aggressive_empty_cache()
 
     def _bounds(self, gen: Part) -> List[Tuple[int, int]]:
         """Micro slices of at least micro_batch_size rows, each extended to the end of the group it would split."""
@@ -71,10 +79,10 @@ class RewardStack(Remote):
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def timing(self) -> Dict[str, float]:
-        """Shape and generate/score/wall seconds of this rank's last rollout_and_score call."""
+        """Rows, micros and generate/score/wall seconds of this rank's last rollout_and_score call."""
         return {
-            "rows": float(self._rows),
-            "micros": float(self._micros),
+            "rows": self._rows,
+            "micros": self._micros,
             "generate_s": self._generate_s,
             "score_s": self._score_s,
             "wall_s": self._wall_s,
