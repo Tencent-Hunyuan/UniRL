@@ -128,7 +128,7 @@ TensorWeightSync):
 |---|---|---|
 | `mem_fraction_static` | `0.3` | Lower SRT KV reservation so FSDP can all-gather full dense weights. `server_intent()` defaults to `0.88` if omitted — too high for colocate. |
 | `enable_lora` | `false` | TensorWeightSync pushes full dense weights; a LoRA pool would be the wrong receive path. |
-| `cuda_graph_max_bs_decode` | `16` | CUDA graph stays on (`disable_cuda_graph: false`); SGLang otherwise auto-tunes the capture cap from GPU memory and TP size, often reserving much larger buffers that fight the weight push. |
+| `cuda_graph_max_bs_decode` | `16` (`32` for Qwen3 DRPO) | CUDA graph stays on (`disable_cuda_graph: false`); the DRPO recipe captures its 16-GPU comparison batch, while SGLang's auto-tuned cap can reserve much larger buffers that fight the weight push. |
 | `skip_server_warmup` | `true` | Skip SRT startup warmup on the 4B colocate path; this knob does not control `wake_up()`. |
 | `attention_backend` | `triton` | Matches the in-tree 4B full-FT recipes. |
 
@@ -147,6 +147,13 @@ keys as-is; keep headroom for NCCL weight-receive buffers. Sync is
 **LoRA colocate** (`*_sglang_lora.yaml`): `enable_lora: true` plus the SGLang LoRA
 pool knobs. This is the exception to the full-FT `enable_lora: false` receive path
 (`LocalLoraWeightSync` instead of TensorWeightSync). Memory numbers are recipe-specific.
+
+**Deterministic sampler:** `SGLangEngineConfig.deterministic_sampler=inverse_cdf`
+keeps SGLang's per-request seed and FSDP on-policy log-softmax/model kernels, but
+draws the categorical sample from a seeded inverse CDF instead of allocating
+full-vocabulary FP64 Gumbel noise. It is batch-order independent and changes the
+seed-to-token mapping, not the target distribution. The default `sglang` value
+retains upstream behavior; the Qwen3 DRPO recipe opts into the faster path.
 
 **Reserved ports:** `SGLangPorts.reserve()` selects candidate HTTP `port` and
 `nccl_port` values by binding temporary sockets on the engine's node, then

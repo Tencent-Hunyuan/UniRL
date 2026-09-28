@@ -79,6 +79,11 @@ handler in `../../distributed/weight_sync`.
   deterministic fan-out as `n=1` requests each carrying one derived
   `sampling_seed`. Re-check both halves on a SGLang bump: dropping either one
   restores the clone, silently.
+- **The inverse-CDF deterministic sampler is opt-in.** Set
+  `SGLangEngineConfig.deterministic_sampler=inverse_cdf` to replace SGLang's
+  full-vocabulary FP64 Gumbel draw while retaining its per-sample seed and
+  on-policy log-softmax. The `sglang.srt.plugins` entry point applies the hook
+  inside every scheduler process; the default `sglang` value is unmodified.
 - **SGLang request sampling lives on the Sample, not the engine config.** Direct
   callers must `fork(..., sampling_params=ARSamplingParams(...))` before
   `generate`. Missing or non-`ARSamplingParams` frontiers now error; in-tree
