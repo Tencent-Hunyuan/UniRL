@@ -10,7 +10,7 @@ _LOG_SQRT_2PI = math.log(math.sqrt(2 * math.pi))
 
 
 def patch_dance() -> None:
-    """Add ``dance`` to the rollout sde-type whitelist and to ``flow_sde_sampling``."""
+    """Add ``dance`` to the rollout sde-type whitelist and install the emitted-dtype ``flow_sde_sampling``."""
     import sglang.multimodal_gen.configs.post_training.rl_rollout as rl_rollout
     import sglang.multimodal_gen.runtime.post_training.scheduler_rl_mixin as srm
 
