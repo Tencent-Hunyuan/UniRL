@@ -143,12 +143,6 @@ class AgenticTrainer(BaseTrainer):
             worker_max_concurrency=worker_max_concurrency,
             engine_concurrency=None,
         )
-        if sync_cfg is None:
-            raise ValueError("AgenticTrainer requires colocated TensorWeightSync")
-        sync_target = str(sync_cfg.get("_target_", ""))
-        if not sync_target.endswith("TensorWeightSync"):
-            raise ValueError(f"AgenticTrainer requires colocated TensorWeightSync; got {sync_target!r}")
-
         episode = rollout_cfg.get("config", {}).get("episode_sampling")
         if episode is None:
             raise ValueError("rollout.config.episode_sampling is required")

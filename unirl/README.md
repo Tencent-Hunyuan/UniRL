@@ -39,7 +39,7 @@ As source, the package falls into four groups:
 |---|---|
 | `train_*.py` | Hydra entrypoints for diffusion, AR, prompt enhancement, unified models, and service-scored barrier agentic training |
 | `trainer/` | Training lifecycle (`base.py` plus domain trainers and `AgenticTrainer`): owns placement, builds workers, and runs the rollout→reward→advantage→train loop |
-| `config/` | `require` + `validate_*` cross-component validators over the flat Hydra recipe (instantiation itself is `_target_`-driven, not in this module) |
+| `config/` | `require` + per-field validators, and `validate_recipe` — the cross-component contract gate every entrypoint runs over the flat Hydra recipe |
 | `distributed/` | Ray worker base (`Remote`) + placement/dispatch (`group/`), tensor transport (`tensor/`), and weight sync (`weight_sync/`) |
 | `rollout/` | Rollout engine contracts and implementations (`engine/`: trainside, sglang, sglang_diffusion, vllm_omni, fastvideo, composed, agentic) |
 | `train/` | Train stack: `TrainStack`, FSDP backend, LoRA/DiffusionNFT/mirror injection, EMA shadow, optimizer/lr |

@@ -201,12 +201,6 @@ class ARTrainer(BaseTrainer):
                         pass
                     raise
             else:
-                if sync_cfg is not None and self._rollout_anchor_device == 0:
-                    raise ValueError(
-                        "rollout_anchor_device=0 would colocate the TP engine with "
-                        "the rank-0 RemoteLoraWeightSync sender and self-deadlock; "
-                        "use a nonzero anchor device."
-                    )
                 if self._enable_fsdp_offload:
                     self._anchored_backend_offloaded = None
                     self.backend.offload()
@@ -275,10 +269,7 @@ class ARTrainer(BaseTrainer):
     def _preserve_rollout_weights_for_next_sleep(self) -> None:
         if not self._uses_gpu_streaming_weight_sync():
             return
-        preserve = getattr(self.rollout, "preserve_weights_for_next_sleep", None)
-        if not callable(preserve):
-            raise RuntimeError("GPU-streaming weight sync requires rollout sleep-preservation support")
-        preserve()
+        self.rollout.preserve_weights_for_next_sleep()
 
     def _must_preserve_rollout_weights(self, *, next_phase_syncs: bool, has_next_phase: bool) -> bool:
         return must_preserve_rollout_weights(
@@ -298,11 +289,6 @@ class ARTrainer(BaseTrainer):
         original_error: Optional[BaseException] = None
         try:
             if sync_weights and self.weight_sync is not None:
-                if self._uses_gpu_streaming_weight_sync():
-                    raise RuntimeError(
-                        "vLLM native IPC weight sync requires the SPMD one-Actor-rank-per-TP-rank "
-                        "layout and does not support rollout_anchor_device"
-                    )
                 self._ensure_anchored_backend_loaded()
                 self.weight_sync.extract()
             self._ensure_anchored_backend_offloaded()
@@ -351,11 +337,6 @@ class ARTrainer(BaseTrainer):
         train_state_maybe_offloaded = False
         full_wake_after_train_offload_in_progress = False
         gpu_streaming_sync = bool(do_sync and self._uses_gpu_streaming_weight_sync())
-        if gpu_streaming_sync and not do_offload:
-            raise RuntimeError(
-                "vLLM native IPC weight sync requires enable_fsdp_offload=true "
-                "so optimizer/model state can be released around rollout"
-            )
 
         try:
             if do_sync and do_offload and self._supports_staged_wake:

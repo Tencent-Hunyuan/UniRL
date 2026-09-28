@@ -6,12 +6,14 @@ from __future__ import annotations
 import hydra
 from omegaconf import DictConfig
 
+from unirl.config.contracts import validate_recipe
 from unirl.trainer.diffusion import DiffusionTrainer
 from unirl.trainer.residency import DEFAULT_RESIDENCY_POLICY
 
 
 @hydra.main(version_base=None, config_path="../examples", config_name="diffusion/sd3/sd3_trainside")
 def main(cfg: DictConfig) -> None:
+    validate_recipe(cfg, entrypoint="train_diffusion")
     trainer = DiffusionTrainer(
         cfg=cfg,
         batch_size=cfg.batch_size,

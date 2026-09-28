@@ -318,13 +318,7 @@ class ComposedRolloutEngine(BaseRolloutEngine):
         """Resolve the tensor-payload track routing hint to child engines."""
         if not track_prefix:
             return list(self._child_by_name.values())
-        child = self._child_by_name.get(track_prefix)
-        if child is None:
-            raise ValueError(
-                f"ComposedRolloutEngine: unknown track_prefix {track_prefix!r}; "
-                f"expected one of {sorted(self._child_by_name)}."
-            )
-        return [child]
+        return [self._child_by_name[track_prefix]]
 
     def update_weights_from_ipc(
         self,
@@ -336,17 +330,12 @@ class ComposedRolloutEngine(BaseRolloutEngine):
         track_prefix: str = "",
     ) -> None:
         """Route a bucketed-IPC weight push to one child via ``track_prefix``."""
-        if not track_prefix:
-            raise ValueError(
-                "ComposedRolloutEngine.update_weights_from_ipc requires track_prefix "
-                f"so the update can be routed to one child; expected one of {sorted(self._child_by_name)}."
-            )
-        for child in self._children_for_track_prefix(track_prefix):
-            child.update_weights_from_ipc(
-                peft_config=peft_config,
-                base_sync_done=base_sync_done,
-                use_shm=use_shm,
-            )
+        child = self._child_by_name[track_prefix]
+        child.update_weights_from_ipc(
+            peft_config=peft_config,
+            base_sync_done=base_sync_done,
+            use_shm=use_shm,
+        )
 
     def init_weights_update_group(
         self,
@@ -360,20 +349,15 @@ class ComposedRolloutEngine(BaseRolloutEngine):
         track_prefix: str = "",
     ) -> None:
         """Route NCCL group setup to one child via ``track_prefix``."""
-        if not track_prefix:
-            raise ValueError(
-                "ComposedRolloutEngine.init_weights_update_group requires track_prefix "
-                f"so the group can be routed to one child; expected one of {sorted(self._child_by_name)}."
-            )
-        for child in self._children_for_track_prefix(track_prefix):
-            child.init_weights_update_group(
-                master_address=master_address,
-                master_port=master_port,
-                rank_offset=rank_offset,
-                world_size=world_size,
-                group_name=group_name,
-                backend=backend,
-            )
+        child = self._child_by_name[track_prefix]
+        child.init_weights_update_group(
+            master_address=master_address,
+            master_port=master_port,
+            rank_offset=rank_offset,
+            world_size=world_size,
+            group_name=group_name,
+            backend=backend,
+        )
 
     def update_weights_from_distributed(
         self,
@@ -387,20 +371,15 @@ class ComposedRolloutEngine(BaseRolloutEngine):
         track_prefix: str = "",
     ) -> None:
         """Route a NCCL-broadcast weight push to one child via ``track_prefix``."""
-        if not track_prefix:
-            raise ValueError(
-                "ComposedRolloutEngine.update_weights_from_distributed requires track_prefix "
-                f"so the update can be routed to one child; expected one of {sorted(self._child_by_name)}."
-            )
-        for child in self._children_for_track_prefix(track_prefix):
-            child.update_weights_from_distributed(
-                names=names,
-                dtypes=dtypes,
-                shapes=shapes,
-                group_name=group_name,
-                target_modules=target_modules,
-                flush_cache=flush_cache,
-            )
+        child = self._child_by_name[track_prefix]
+        child.update_weights_from_distributed(
+            names=names,
+            dtypes=dtypes,
+            shapes=shapes,
+            group_name=group_name,
+            target_modules=target_modules,
+            flush_cache=flush_cache,
+        )
 
     def destroy_weights_update_group(
         self,
@@ -409,13 +388,8 @@ class ComposedRolloutEngine(BaseRolloutEngine):
         track_prefix: str = "",
     ) -> None:
         """Route NCCL group teardown to one child via ``track_prefix``."""
-        if not track_prefix:
-            raise ValueError(
-                "ComposedRolloutEngine.destroy_weights_update_group requires track_prefix "
-                f"so the teardown can be routed to one child; expected one of {sorted(self._child_by_name)}."
-            )
-        for child in self._children_for_track_prefix(track_prefix):
-            child.destroy_weights_update_group(group_name=group_name)
+        child = self._child_by_name[track_prefix]
+        child.destroy_weights_update_group(group_name=group_name)
 
     def set_lora_from_tensors(
         self,
@@ -450,19 +424,13 @@ class ComposedRolloutEngine(BaseRolloutEngine):
         flush_cache: bool = True,
         track_prefix: str = "",
     ) -> None:
-        if not track_prefix:
-            raise ValueError(
-                "ComposedRolloutEngine.update_weights_from_tensor requires track_prefix "
-                f"so the update can be routed to one child; expected one of {sorted(self._child_by_name)}."
-            )
-        children = self._children_for_track_prefix(track_prefix)
-        for child in children:
-            child.update_weights_from_tensor(
-                serialized_named_tensors=serialized_named_tensors,
-                target_modules=target_modules,
-                load_format=load_format,
-                flush_cache=flush_cache,
-            )
+        child = self._child_by_name[track_prefix]
+        child.update_weights_from_tensor(
+            serialized_named_tensors=serialized_named_tensors,
+            target_modules=target_modules,
+            load_format=load_format,
+            flush_cache=flush_cache,
+        )
 
 
 __all__ = ["ComposedRolloutEngine"]

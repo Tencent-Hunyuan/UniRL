@@ -65,7 +65,6 @@ class CkptEngineIPCWeightSync(FullWeightSync):
             if tp_size < 1:
                 raise ValueError(f"CkptEngineIPCWeightSync requires tp_size>=1; got {tp_size}")
             self._validate_topology(tp_size)
-            self._validate_rollout_capability()
             local_uuid = self._get_current_gpu_uuid()
         except BaseException as exc:
             preflight_error = exc
@@ -128,32 +127,6 @@ class CkptEngineIPCWeightSync(FullWeightSync):
                 f"CkptEngineIPCWeightSync: RankInfo tp_size={ri.tp_size} does not match "
                 f"the colocated rollout tp_size={tp_size}."
             )
-        cfg = self._rollout.cfg
-        engine_kwargs = cfg.engine_kwargs
-        server_dp = cfg.dp_size if cfg.dp_size is not None else engine_kwargs.get("dp_size", 1)
-        if server_dp != 1:
-            raise NotImplementedError("CkptEngineIPCWeightSync does not support SGLang server-level dp_size>1")
-        if any(
-            key.startswith("speculative") and value and (not isinstance(value, str) or value.strip().lower() != "none")
-            for key, value in engine_kwargs.items()
-        ):
-            raise NotImplementedError("CkptEngineIPCWeightSync does not support SGLang speculative decoding workers")
-
-    def _validate_rollout_capability(self) -> None:
-        """Require the dedicated checkpoint-engine rollout contract."""
-        required = (
-            "update_weights_from_checkpoint_engine_ipc",
-            "mark_checkpoint_engine_sync_failed",
-            "shutdown",
-        )
-        missing = [name for name in required if not callable(getattr(self._rollout, name, None))]
-        if missing:
-            raise TypeError(f"CkptEngineIPCWeightSync rollout is missing required capabilities: {missing}")
-        ri = self.rank_info
-        if ri is None or ri.tp_rank == 0:
-            backend = getattr(self._rollout, "_backend", None)
-            if backend is None or not callable(getattr(backend, "update_from_checkpoint_engine_ipc", None)):
-                raise TypeError("CkptEngineIPCWeightSync currently supports only the SGLang HTTP backend")
 
     def _prepare_sender(
         self,

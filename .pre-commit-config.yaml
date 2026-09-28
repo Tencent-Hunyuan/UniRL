@@ -84,6 +84,17 @@ repos:
         language: python
         pass_filenames: false
         always_run: true
+
+      # Static guard that every recipe satisfies the cross-component contracts
+      # (entrypoint, sampling, engine <-> sync, layout) and that the
+      # engine-family table those contracts read still matches the engine classes.
+      - id: check-recipe-contracts
+        name: recipe cross-component contracts hold
+        entry: python lint/check_recipe_contracts.py
+        language: python
+        additional_dependencies: [pyyaml]
+        pass_filenames: false
+        always_run: true
       # Every docstring is one physical line, within the ruff line-length. Detail that
       # doesn't fit — what stock upstream does wrong and what breaks on a version bump,
       # numerical/bit-identity constraints, implementer contracts — belongs in the

@@ -6,12 +6,14 @@ from __future__ import annotations
 import hydra
 from omegaconf import DictConfig
 
+from unirl.config.contracts import validate_recipe
 from unirl.trainer.ar import ARTrainer
 from unirl.utils.graceful_shutdown import GracefulShutdown
 
 
 @hydra.main(version_base=None, config_path="../examples", config_name="ar/qwen_vl_grpo_geo3k_mc_4x8")
 def main(cfg: DictConfig) -> None:
+    validate_recipe(cfg, entrypoint="train_ar")
     trainer = None
 
     def teardown() -> None:

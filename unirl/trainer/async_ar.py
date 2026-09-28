@@ -1,6 +1,5 @@
 """Async autoregressive RL over separate train and rollout GPU slabs."""
 
-import inspect
 import time
 from typing import Dict, Optional, Tuple
 
@@ -111,12 +110,6 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
         self.sampling_params: Dict[str, BaseSamplingParams] = build_sampling_dict(sampling_cfg)
         self.weight_sync = None
         rollout_parsed = parse_hydra_cfg(rollout_cfg)
-        if "pipeline" in inspect.signature(rollout_parsed["role_cls"]).parameters:
-            raise ValueError(
-                "AsyncARTrainer needs a dedicated-rollout engine (vllm/sglang) on the "
-                "separate slab; the trainside direct-sampling engine needs the pipeline "
-                "as a local sibling and cannot live cross-slab."
-            )
         self._rollout_anchor_device = None
 
         self._max_inflight = max(1, int(max_inflight))
@@ -152,14 +145,11 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
             self.reward = remote_hydra(reward_cfg)
             self.algorithm = remote_hydra(algorithm_cfg, pipeline=self.pipeline)
             self.stack = remote_hydra(stack_cfg, fsdp_backend=self.backend, algorithm=self.algorithm)
-            if sync_cfg is not None:
-                self.weight_sync = remote_hydra(sync_cfg, backend=self.backend)
+            self.weight_sync = remote_hydra(sync_cfg, backend=self.backend)
         with placement(self.pool, fraction=1.0 - self._train_fraction, shared_workers=True):
             self.rollout = remote(**rollout_parsed)
 
-        if self.weight_sync is None:
-            raise ValueError("AsyncARTrainer requires a cross-slab weight sync; add a `sync:` block.")
-        self._connect_separate(sync_cfg)
+        self._connect_separate()
 
     def _prepare_rollout(self, *, sync_weights: bool) -> bool:
         """Sync a resident separate-slab engine without colocate handoffs."""
@@ -172,14 +162,8 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
         if train_state_offloaded:
             raise RuntimeError("AsyncARTrainer cannot offload its disjoint training slab during rollout")
 
-    def _connect_separate(self, sync_cfg: DictConfig) -> None:
+    def _connect_separate(self) -> None:
         """One-time cross-slab handshake (NCCL branch of diffusion.py:191-208)."""
-        target = str(sync_cfg.get("_target_", ""))
-        if not target.endswith("NCCLWeightSync"):
-            raise ValueError(
-                f"AsyncARTrainer (separate slabs) requires a cross-slab weight sync "
-                f"(NCCLWeightSync); got sync._target_={target!r}."
-            )
         addr, port = self.weight_sync.pick_master()[0]
         tp_size = self.rollout.tp_size
         pp_size = self.rollout.pp_size

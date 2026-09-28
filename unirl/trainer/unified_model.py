@@ -143,12 +143,6 @@ class UnifiedModelTrainer(BaseTrainer):
                     self.rollout = remote(**rollout_parsed)
                 return
 
-            if ar_rollout_cfg is None or dit_rollout_cfg is None:
-                raise ValueError(
-                    "UnifiedModelTrainer: two-engine mode needs ar_rollout_cfg + dit_rollout_cfg; "
-                    "pass a single rollout_cfg for single-engine (M=1 / UniGRPO) mode."
-                )
-
             # Offload the frozen base before engine boot to avoid colocated OOMs.
             if self._enable_fsdp_offload:
                 self.backend.offload()

@@ -458,13 +458,13 @@ class DiffusionTrainer(BaseTrainer):
                 if sync_cfg is not None:
                     self.weight_sync = remote_hydra(sync_cfg, backend=self.backend)
             with placement(self.pool, fraction=1.0 - train_fraction - reward_fraction, shared_workers=True):
-                self.rollout = self._build_rollout(rollout_cfg, allow_pipeline=False)
+                self.rollout = self._build_rollout(rollout_cfg)
             if self.weight_sync is not None:
                 self._connect_separate(sync_cfg)
         else:
             with placement(self.pool, fraction=1.0 - reward_fraction, shared_workers=True):
                 self._build_train_side(**train_cfgs)
-                self.rollout = self._build_rollout(rollout_cfg, allow_pipeline=True)
+                self.rollout = self._build_rollout(rollout_cfg)
                 if sync_cfg is not None:
                     self.weight_sync = remote_hydra(sync_cfg, backend=self.backend, rollout=self.rollout)
 
@@ -634,17 +634,10 @@ class DiffusionTrainer(BaseTrainer):
             run_steps=_run_cleanup_steps,
         )
 
-    def _build_rollout(self, rollout_cfg, *, allow_pipeline: bool):
+    def _build_rollout(self, rollout_cfg):
         """Build the rollout remote in the currently active placement scope."""
         rollout_parsed = parse_hydra_cfg(rollout_cfg)
         if "pipeline" in inspect.signature(rollout_parsed["role_cls"]).parameters:
-            if not allow_pipeline:
-                raise ValueError(
-                    "layout='separate' requires a dedicated-rollout engine "
-                    "(vllm/sglang); the trainside direct-sampling engine needs "
-                    "the pipeline as a local sibling and cannot live on a "
-                    "separate slab."
-                )
             self._rollout_is_trainside = True
             # Shard trainside rollout over model DP to preserve SP prompt alignment.
             return remote(**rollout_parsed, pipeline=self.pipeline, sp_size=self.backend.sp_size)
