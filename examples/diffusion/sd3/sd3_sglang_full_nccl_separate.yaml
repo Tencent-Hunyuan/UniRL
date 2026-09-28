@@ -137,6 +137,7 @@ stack:
   micro_batch_size: 1
   max_grad_norm: 1.0
   num_updates_per_batch: 2      # PPO mini-batches per rollout (π_old frozen once); v1 parity
+  shuffle_updates: true
 
 data_source:
   # Real prompts loaded from file: MultimodalRLDataSource reads TXT/JSON/JSONL
@@ -182,8 +183,3 @@ sync:
   group_name: weight_sync
   bucket_size_mb: 512
   flush_cache: true
-  # Ordered first-match-wins name rewrite (see FullWeightSync._apply_name_remap):
-  # backend.model is the bare SD3 transformer, so the "*" catch-all nests every
-  # key under the receiver's transformer.* namespace. Applied on both the merged
-  # (lora_merged=true) and raw paths.
-  name_remap: {"*": "transformer.*"}

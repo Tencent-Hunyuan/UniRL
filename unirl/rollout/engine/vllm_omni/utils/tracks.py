@@ -8,6 +8,7 @@ from typing import Any, List, Optional, Sequence, Tuple
 import torch
 
 from unirl.rollout.engine.sigma_verify import verify_engine_used_sigmas
+from unirl.rollout.engine.vllm_omni.pipelines._shared.interception import read_captures
 from unirl.types.primitives import Image, Images, Text, Texts, Video, Videos
 from unirl.types.segments.latent import make_image_segment
 
@@ -66,10 +67,9 @@ def pick_stage_output(
 _VIDEO_PROCESSOR = None
 
 
-def _video_frames_from_custom_output(diff_out: Any) -> List[Any]:
-    """Recover a video sample's PIL frames from the decoded-video tensor the RL"""
-    co = getattr(diff_out, "custom_output", None) or {}
-    vid = co.get("rl_decoded_video")
+def _video_frames_from_captures(diff_out: Any) -> List[Any]:
+    """Recover a video sample's PIL frames from the captured ``rl_decoded_video`` tensor."""
+    vid = read_captures(diff_out).get("rl_decoded_video")
     if vid is None or not torch.is_tensor(vid):
         return []
     global _VIDEO_PROCESSOR
@@ -104,7 +104,7 @@ def collect_dit_outputs(
         diff_outputs.append(diff_out)
         imgs = getattr(diff_out, "images", None) or []
         if not imgs and final_output_type == "video":
-            imgs = _video_frames_from_custom_output(diff_out)
+            imgs = _video_frames_from_captures(diff_out)
         pil_frames_per_prompt.append(list(imgs))
         pil_images.extend(imgs)
     if not pil_images:
@@ -140,8 +140,7 @@ def build_image_segment(
         expected=expected_sigmas,
         engine_name="vllm-omni",
     )
-    head_custom = getattr(head, "custom_output", None) or {}
-    sde_step_indices_raw = head_custom.get("sde_step_indices")
+    sde_step_indices_raw = read_captures(head).get("sde_step_indices")
 
     indices: Optional[torch.Tensor] = None
     sde_indices: Optional[torch.Tensor] = None
@@ -164,7 +163,7 @@ def build_image_segment(
                 raise RuntimeError(
                     "build_image_segment: trajectory log_probs has K="
                     f"{K} but latents has T={T} steps and worker did not "
-                    "expose ``custom_output['sde_step_indices']``. Update "
+                    "expose ``sde_step_indices`` on the unirl metadata group. Update "
                     "the pipeline subclass to echo last_sde_step_indices."
                 )
             sde_indices = torch.arange(K, dtype=torch.long)
@@ -190,11 +189,9 @@ def decoded_text_from_ar(per_request: Sequence[Sequence[Any]]) -> Texts:
         ar = pick_stage_output(outputs, final_output_type="text", stage_id=0)
         text_str = ""
         if ar is not None:
-            ro = getattr(ar, "request_output", None)
-            if ro is not None:
-                completions = getattr(ro, "outputs", None) or []
-                if completions:
-                    text_str = getattr(completions[0], "text", "") or ""
+            completions = getattr(ar, "outputs", None) or []
+            if completions:
+                text_str = getattr(completions[0], "text", "") or ""
         texts.append(Text(text=text_str))
     return Texts.from_list(texts)
 
@@ -230,10 +227,7 @@ def _flatten_logprobs(logprobs: Any, fallback_len: int) -> Optional[torch.Tensor
 
 def _extract_completion(out: Any) -> Tuple[List[int], Optional[torch.Tensor]]:
     """Pull ``(token_ids, per_token_logp)`` out of a Stage-0 result."""
-    request_output = getattr(out, "request_output", None)
-    if request_output is None:
-        return [], None
-    completions = getattr(request_output, "outputs", None) or []
+    completions = getattr(out, "outputs", None) or []
     if not completions:
         return [], None
     completion = completions[0]

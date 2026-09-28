@@ -83,7 +83,6 @@ class FaceRewardScorer(LocalRewardBackend):
             image_size=config.image_size,
             ref_max_frames=config.ref_max_frames,
             ref_max_pixels=config.ref_max_pixels,
-            differentiable=config.differentiable,
         )
 
     def _load_model(self) -> None:
@@ -92,7 +91,6 @@ class FaceRewardScorer(LocalRewardBackend):
         self._image_size = int(self.model_kwargs.get("image_size", 112))
         self._ref_max_frames = int(self.model_kwargs.get("ref_max_frames", 81))
         self._ref_max_pixels = int(self.model_kwargs.get("ref_max_pixels", 480 * 480))
-        self._differentiable = bool(self.model_kwargs.get("differentiable", True))
         self._ref_cache: OrderedDict[str, tuple[torch.Tensor, torch.Tensor]] = OrderedDict()
 
     def _compute_model_rewards(self, request: RewardRequest) -> List[float]:
@@ -192,7 +190,7 @@ class FaceRewardScorer(LocalRewardBackend):
             ref_emb, ref_mask = self._get_ref_embeddings(str(ref_path))
 
             gen_video = torch.clamp(media_tensor[i], -1, 1).to(self.device)
-            gen_emb, gen_mask = self._extract_face_embeddings(gen_video, with_grad=self._differentiable)
+            gen_emb, gen_mask = self._extract_face_embeddings(gen_video, with_grad=True)
 
             if int(gen_mask.sum().item()) == 0:
                 rewards.append(gen_video.sum() * 0.0)
@@ -209,22 +207,13 @@ class FaceRewardScorer(LocalRewardBackend):
 
     def offload(self) -> None:
         self._ref_cache.clear()
-        fa = self.model
-        if fa is not None:
-            for sub in (fa.detection_model, fa.landmark_model, fa.arcface_model):
-                if sub is not None and hasattr(sub.torch_model, "cpu"):
-                    sub.torch_model.cpu()
-            torch.cuda.empty_cache()
+        for sub in (self.model.detection_model, self.model.landmark_model, self.model.arcface_model):
+            sub.torch_model.cpu()
+        torch.cuda.empty_cache()
 
     def onload(self) -> None:
-        fa = self.model
-        if fa is not None:
-            for sub in (fa.detection_model, fa.landmark_model, fa.arcface_model):
-                if sub is not None and hasattr(sub.torch_model, "to"):
-                    sub.torch_model.to(self.device)
-
-    def is_available(self) -> bool:
-        return bool(self._is_loaded)
+        for sub in (self.model.detection_model, self.model.landmark_model, self.model.arcface_model):
+            sub.torch_model.to(self.device)
 
     def dispose(self) -> None:
         self.offload()
@@ -240,7 +229,6 @@ class FaceRewardSpec(BaseRewardComponentSpec):
     image_size: int = 112
     ref_max_frames: int = 81
     ref_max_pixels: int = 480 * 480
-    differentiable: bool = True
 
 
 __all__ = [

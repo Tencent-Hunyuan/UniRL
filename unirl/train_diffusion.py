@@ -3,25 +3,11 @@
 
 from __future__ import annotations
 
-import warnings
-
 import hydra
 from omegaconf import DictConfig
 
 from unirl.trainer.diffusion import DiffusionTrainer
-
-
-def _resolve_task_config(cfg: DictConfig):
-    if "stage_config" not in cfg:
-        return cfg.get("task_config")
-    if "task_config" in cfg:
-        raise ValueError("Specify only task_config; do not set deprecated stage_config alongside it")
-    warnings.warn(
-        "`stage_config` is deprecated; rename the recipe key to `task_config`",
-        FutureWarning,
-        stacklevel=2,
-    )
-    return cfg.get("stage_config")
+from unirl.trainer.residency import DEFAULT_RESIDENCY_POLICY
 
 
 @hydra.main(version_base=None, config_path="../examples", config_name="diffusion/sd3/sd3_trainside")
@@ -45,9 +31,9 @@ def main(cfg: DictConfig) -> None:
         layout=cfg.get("layout", "colocate"),
         train_fraction=cfg.get("train_fraction", 0.5),
         reward_fraction=cfg.get("reward_fraction", 0.0),
-        enable_fsdp_offload=cfg.get("enable_fsdp_offload", False),
-        offload_train_during_reward=cfg.get("offload_train_during_reward", False),
-        rollout_sleep_after_generate=cfg.get("rollout_sleep_after_generate", True),
+        train_resident=cfg.get("train_resident", DEFAULT_RESIDENCY_POLICY.train_resident),
+        rollout_resident=cfg.get("rollout_resident", DEFAULT_RESIDENCY_POLICY.rollout_resident),
+        reward_resident=cfg.get("reward_resident", DEFAULT_RESIDENCY_POLICY.reward_resident),
         adv_use_global_std=cfg.get("adv_use_global_std", False),
         accumulate_rollouts=cfg.get("accumulate_rollouts", 1),
         eval_interval=cfg.get("eval_interval", 0),
@@ -58,7 +44,7 @@ def main(cfg: DictConfig) -> None:
         # Any DiffusionSamplingParams field; everything it omits inherits `sampling`.
         eval_sampling_cfg=cfg.get("eval_sampling"),
         eval_rewards_cfg=cfg.get("eval_rewards"),
-        task_config=_resolve_task_config(cfg),
+        control=cfg.get("control"),
     )
     trainer.train(
         num_rollouts=cfg.get("num_rollouts", 100),

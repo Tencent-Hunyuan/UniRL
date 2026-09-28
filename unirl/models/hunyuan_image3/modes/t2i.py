@@ -57,7 +57,7 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
         f"got {type(texts).__name__ if texts is not None else 'None'}",
     )
 
-    control = sample.parts[0].control or {}
+    control = sample.parts[0].control
     bot_task: str = str(control.get("bot_task", "image"))
     sys_type = control.get("sys_type")
     sequence_template = control.get("sequence_template")

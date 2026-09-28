@@ -97,7 +97,6 @@ reward:
       image_size: 112
       ref_max_frames: 81
       ref_max_pixels: 230400
-      differentiable: true
 
 data_source:
   _target_: unirl.data.data_source.MultimodalRLDataSource

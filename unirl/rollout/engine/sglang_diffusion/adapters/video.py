@@ -60,13 +60,13 @@ class MochiAdapter(ImageAdapter):
     squeeze_single_frame_4d = False
 
 
-@register_adapter("hunyuan_video")
-class HunyuanVideoAdapter(VideoAdapter):
+@register_adapter("hunyuan_video10")
+class HunyuanVideo10Adapter(VideoAdapter):
     """HunyuanVideo-1.0 T2V with video output and dual text conditions."""
 
     def build_condition(self, results: List[RawResult]) -> Dict[str, Any]:
-        """Keep HunyuanVideo's LLaMA and pooled-CLIP streams separate."""
-        require(bool(results), "HunyuanVideo: cannot build conditions from empty results")
+        """Keep HunyuanVideo-1.0's LLaMA and pooled-CLIP streams separate."""
+        require(bool(results), "HunyuanVideo-1.0: cannot build conditions from empty results")
 
         llama_conditions: List[TextEmbedCondition] = []
         clip_list: List[torch.Tensor] = []
@@ -75,22 +75,22 @@ class HunyuanVideoAdapter(VideoAdapter):
             prompt_embeds = result.prompt_embeds
             require(
                 isinstance(prompt_embeds, (list, tuple)) and len(prompt_embeds) >= 2,
-                "HunyuanVideo: expected prompt_embeds=[LLaMA, CLIP-pooled]; got "
+                "HunyuanVideo-1.0: expected prompt_embeds=[LLaMA, CLIP-pooled]; got "
                 f"{type(prompt_embeds).__name__} with "
                 f"{len(prompt_embeds) if isinstance(prompt_embeds, (list, tuple)) else 'n/a'} entries",
             )
             llama, clip = prompt_embeds[:2]
             require(
                 torch.is_tensor(llama) and llama.ndim == 3,
-                "HunyuanVideo: LLaMA prompt embed must be [B, seq, hidden]",
+                "HunyuanVideo-1.0: LLaMA prompt embed must be [B, seq, hidden]",
             )
             require(
                 torch.is_tensor(clip) and clip.ndim in (2, 3),
-                "HunyuanVideo: pooled CLIP embed must be [B, hidden] or [B, 1, hidden]",
+                "HunyuanVideo-1.0: pooled CLIP embed must be [B, hidden] or [B, 1, hidden]",
             )
             require(
                 int(llama.shape[0]) == int(clip.shape[0]),
-                "HunyuanVideo: LLaMA and CLIP prompt embed batch sizes must match",
+                "HunyuanVideo-1.0: LLaMA and CLIP prompt embed batch sizes must match",
             )
 
             attention_mask = None
@@ -101,7 +101,7 @@ class HunyuanVideoAdapter(VideoAdapter):
                     torch.is_tensor(attention_mask)
                     and attention_mask.ndim == 2
                     and tuple(attention_mask.shape) == tuple(llama.shape[:2]),
-                    "HunyuanVideo: LLaMA attention mask must match [B, seq]",
+                    "HunyuanVideo-1.0: LLaMA attention mask must match [B, seq]",
                 )
 
             mask_presence.append(attention_mask is not None)
@@ -115,7 +115,7 @@ class HunyuanVideoAdapter(VideoAdapter):
 
         require(
             all(mask_presence) or not any(mask_presence),
-            "HunyuanVideo: LLaMA attention masks must be present for every result or none",
+            "HunyuanVideo-1.0: LLaMA attention masks must be present for every result or none",
         )
         return {
             "text_llama": TextEmbedCondition.concat(llama_conditions),
@@ -126,6 +126,10 @@ class HunyuanVideoAdapter(VideoAdapter):
 @register_adapter("wan22")
 class Wan22T2VAdapter(VideoAdapter):
     """WAN 2.2-A14B T2V — DUAL-EXPERT (high-noise / low-noise) MoE."""
+
+    def lora_spec(self) -> tuple[str, List[str]]:
+        prefix, _ = super().lora_spec()
+        return prefix, ["transformer", "transformer_2"]
 
     def build_sampling(self, sample: Sample, *, diffusion: Any) -> Dict[str, Any]:
         kwargs = super().build_sampling(sample, diffusion=diffusion)
@@ -232,7 +236,7 @@ class Ltx2T2VAdapter(VideoAdapter):
 __all__ = [
     "VideoAdapter",
     "MochiAdapter",
-    "HunyuanVideoAdapter",
+    "HunyuanVideo10Adapter",
     "Wan21T2VAdapter",
     "Wan22T2VAdapter",
     "Ltx2T2VAdapter",

@@ -16,7 +16,8 @@
 # Env:
 #   BAGEL_PATH      HF id or local ckpt (default ByteDance-Seed/BAGEL-7B-MoT)
 #   SFT_DATA        train manifest (searchgen prepare_sft train.jsonl)
-#   SFT_EVAL_DATA   eval manifest (defaults to SFT_DATA — supply a real split!)
+#   SFT_EVAL_DATA   optional eval manifest (validation is disabled when unset)
+#   BAGEL_REPLAY_ATTENTION_BACKEND  sdpa (baseline) or flex (default: flex)
 #
 # Download/cook guide: datasets/searchgen/README.md (manifests shared with qwen_vl_agent_sft).
 #
@@ -69,6 +70,7 @@ pipeline:
   shift: 3.0
   max_prompt_length: 24576
   replay_mode: train                 # full-grad und replay (interleaved packed forward_train)
+  replay_attention_backend: ${oc.env:BAGEL_REPLAY_ATTENTION_BACKEND,flex}
   strategy:
     _target_: unirl.sde.kernels.FlowSDEStrategy
 
@@ -135,6 +137,6 @@ track_builder:
 
 data_source:
   _target_: unirl.data.sft.SupervisedDataSource
-  manifest_path: ${oc.env:SFT_DATA}
-  eval_manifest_path: ${oc.env:SFT_EVAL_DATA,${oc.env:SFT_DATA}}
+  train_manifest_path: ${oc.env:SFT_DATA}
+  eval_manifest_path: ${oc.env:SFT_EVAL_DATA,null}
   seed: 42

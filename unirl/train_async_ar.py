@@ -18,7 +18,7 @@ def main(cfg: DictConfig) -> None:
         pipeline_cfg=cfg.pipeline,
         backend_cfg=cfg.backend,
         rollout_cfg=cfg.rollout,
-        reward_cfg=cfg.reward,
+        reward_cfg=cfg.get("reward"),
         algorithm_cfg=cfg.algorithm,
         stack_cfg=cfg.stack,
         data_source_cfg=cfg.data_source,

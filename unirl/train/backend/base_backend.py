@@ -14,7 +14,7 @@ from torch import nn
 
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
-from unirl.train.backend.base import LrSchedulerConfig, OptimizerConfig
+from unirl.train.backend.base import ExpertWeightExportTransform, LrSchedulerConfig, OptimizerConfig
 from unirl.train.backend.sharded_state import (
     StateDict,
     _current_rank,
@@ -29,10 +29,11 @@ from unirl.train.backend.sharded_state import (
     sharded_optimizer_state_dict,
     trainable_params,
 )
-from unirl.train.configs import EmaFullConfig, EmaLoraConfig, FSDPConfig, LoraConfig, normalize_frozen_adapters
+from unirl.train.configs import EmaFullConfig, EmaLoraConfig, FSDPConfig, LoraConfig
 from unirl.train.ema import EMA, Shadow, inject_mirror, inject_nft, make_decay_fn
-from unirl.train.lora import inject_frozen_adapter, inject_lora, resolve_target_modules_pattern
+from unirl.train.lora import FrozenAdapters, inject_lora, resolve_target_modules_pattern
 from unirl.train.optim import build_lr_scheduler, build_optimizer
+from unirl.utils.distributed_utils import find_dtensor_mesh, init_gloo_group
 
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
@@ -122,6 +123,7 @@ class BaseFSDP2Backend(Remote):
     _optimizer_step_count: int
     _eval_ema_active: bool
     _lora_meta: Optional[Dict[str, object]]
+    _frozen_adapters: FrozenAdapters
     _rollout_adapter_name: str
     _defer_grad_sync: bool
     _grad_sync_enabled: bool
@@ -147,6 +149,7 @@ class BaseFSDP2Backend(Remote):
         ema_cfg: Optional[EmaFullConfig],
     ) -> Optional[Shadow]:
         """Structural injection on the (possibly meta) trainable module."""
+        self._frozen_adapters = FrozenAdapters()
         shadow: Optional[Shadow] = None
         if ema_lora_cfg is not None:
             shadow = inject_nft(
@@ -173,11 +176,8 @@ class BaseFSDP2Backend(Remote):
                 bias=lora_cfg.bias,
                 task_type=lora_cfg.task_type,
             )
-            # Frozen sibling adapters (e.g. OPD teachers): injected pre-wrap so FSDP
-            # shards them and checkpoints stay symmetric; requires_grad=False keeps
-            # them out of the optimizer and weight sync.
-            for spec in normalize_frozen_adapters(getattr(lora_cfg, "frozen_adapters", None)):
-                inject_frozen_adapter(model, name=spec.name, path=spec.path)
+            # Frozen sibling adapters (e.g. OPD teachers) — see ../readme.md Gotchas.
+            self._frozen_adapters = FrozenAdapters.inject(model, lora_cfg.frozen_adapters)
         if ema_cfg is not None:
             shadow = inject_mirror(model, prefix=ema_cfg.shadow_prefix)
         return shadow
@@ -196,7 +196,7 @@ class BaseFSDP2Backend(Remote):
     ) -> None:
         """Build EMA / optimizer / scheduler and set the shared train state."""
         self.model = model
-        self._loss_reduction_mesh = self._find_loss_reduction_mesh(model)
+        self._loss_reduction_mesh = find_dtensor_mesh(model)
 
         self.ema = None
         if shadow is not None:
@@ -244,6 +244,7 @@ class BaseFSDP2Backend(Remote):
                 "dropout": active_lora.dropout,
                 "bias": active_lora.bias,
                 "task_type": active_lora.task_type,
+                "frozen_adapters": dict(self._frozen_adapters.shas),
             }
             if active_lora is not None
             else None
@@ -307,6 +308,8 @@ class BaseFSDP2Backend(Remote):
         if self.ema is not None:
             self.ema.step(self._optimizer_step_count)
         self._optimizer_step_count += 1
+        # Release consumed grads before train-state offload.
+        self.optimizer.zero_grad(set_to_none=True)
         return grad_norm
 
     def on_rollout_end(self) -> None:
@@ -395,7 +398,7 @@ class BaseFSDP2Backend(Remote):
         self._reject_meta(operation="save", checkpoint_format="dcp", mode=mode)
         model_sd = drop_meta_entries(sharded_model_state_dict(self.model))
         if mode == "adapter":
-            model_sd = {k: v for k, v in model_sd.items() if "lora_A" in k or "lora_B" in k}
+            model_sd = {k: v for k, v in model_sd.items() if self._frozen_adapters.is_trainable_lora_key(k)}
         sharded_state: Dict[str, object] = {
             "model": model_sd,
             "optim": sharded_optimizer_state_dict(self.model, self.optimizer),
@@ -413,8 +416,6 @@ class BaseFSDP2Backend(Remote):
         if self._checkpoint_async:
             # Async DCP saves require a CPU-capable process group.
             if dist.is_available() and dist.is_initialized():
-                from unirl.utils.distributed_utils import init_gloo_group
-
                 pg = init_gloo_group()
         _prepare_dcp_directory(path, meta, process_group=pg)
 
@@ -482,7 +483,11 @@ class BaseFSDP2Backend(Remote):
         mode = checkpoint.get("save_mode", "full")
         strict = mode == "full"
         self._reject_meta(operation="load", checkpoint_format="torch", mode=mode)
-        self._load_model_state(checkpoint["policy_state_dict"], strict=strict)
+        self._frozen_adapters.check_resume(checkpoint.get("lora_config"))
+        policy_state = checkpoint["policy_state_dict"]
+        if mode == "adapter":
+            policy_state = {k: v for k, v in policy_state.items() if self._frozen_adapters.is_trainable_lora_key(k)}
+        self._load_model_state(policy_state, strict=strict)
         self._load_optimizer_state(checkpoint["optimizer_state_dict"])
         if self.scheduler is not None and "scheduler_state_dict" in checkpoint:
             self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
@@ -508,9 +513,10 @@ class BaseFSDP2Backend(Remote):
         has_meta_params = any(p.is_meta for p in self.model.parameters())
         strict = mode == "full" and not has_meta_params
 
+        self._frozen_adapters.check_resume(meta.get("lora_config"))
         model_sd = drop_meta_entries(sharded_model_state_dict(self.model))
         if mode == "adapter":
-            model_sd = {k: v for k, v in model_sd.items() if "lora_A" in k or "lora_B" in k}
+            model_sd = {k: v for k, v in model_sd.items() if self._frozen_adapters.is_trainable_lora_key(k)}
         sharded_state: Dict[str, object] = {
             "model": model_sd,
             "optim": sharded_optimizer_state_dict(self.model, self.optimizer),
@@ -558,21 +564,21 @@ class BaseFSDP2Backend(Remote):
         move_optimizer_state(self.optimizer, self._device)
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
-    def offload(self) -> None:
-        """Move the train state (params + grads + optimizer) to CPU."""
-        self._offload_model()
-        move_optimizer_state(self.optimizer, "cpu")
+    def offload(
+        self,
+        *,
+        model: bool = True,
+        optimizer: bool = True,
+        clear_gradients: bool = False,
+    ) -> None:
+        """Move selected train state to CPU while preserving legacy defaults."""
+        if clear_gradients:
+            self.optimizer.zero_grad(set_to_none=True)
+        if model:
+            self._offload_model()
+        if optimizer:
+            move_optimizer_state(self.optimizer, "cpu")
         torch.cuda.empty_cache()
-
-    @staticmethod
-    def _find_loss_reduction_mesh(model: nn.Module) -> Optional["DeviceMesh"]:
-        """Return the primary FSDP mesh from the model's DTensor parameters."""
-        from torch.distributed.tensor import DTensor
-
-        for param in model.parameters():
-            if isinstance(param, DTensor):
-                return param.device_mesh
-        return None
 
     def gradient_average_world_size(self) -> int:
         """Ranks in the FSDP mesh whose gradient averaging loss scaling cancels."""
@@ -663,7 +669,7 @@ class BaseFSDP2Backend(Remote):
     def _gather_model_state(self, mode: str) -> StateDict:
         """Rank-0 model state for the single-file checkpoint."""
         if mode == "adapter":
-            return gather_lora_state_dict(self.model)
+            return gather_lora_state_dict(self.model, keep=self._frozen_adapters.is_trainable_lora_key)
         return gather_state_dict(self.model)
 
     def _load_model_state(self, model_state: StateDict, *, strict: bool) -> None:
@@ -673,6 +679,10 @@ class BaseFSDP2Backend(Remote):
     def _torch_checkpoint_metadata(self) -> Dict[str, object]:
         """Backend-specific metadata added to a single-file checkpoint."""
         return {}
+
+    def expert_weight_export_transform(self) -> Optional[ExpertWeightExportTransform]:
+        """Return this backend's expert-weight export transform, if one is required."""
+        return None
 
     def _gather_optimizer_state(self) -> StateDict:
         """Rank-0 optimizer state for the checkpoint (collective for DCP backends)."""

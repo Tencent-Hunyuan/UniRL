@@ -23,7 +23,6 @@ class TextSegment(Segment):
     log_probs: Optional[torch.Tensor] = packed_field(default=None)
     rollout_log_probs: Optional[torch.Tensor] = packed_field(default=None)
     loss_mask: Optional[torch.Tensor] = packed_field(default=None)
-    rollout_log_probs: Optional[torch.Tensor] = packed_field(default=None)
     values: Optional[torch.Tensor] = packed_field(default=None)
     returns: Optional[torch.Tensor] = packed_field(default=None)
     token_advantages: Optional[torch.Tensor] = packed_field(default=None)

@@ -7,7 +7,9 @@ from typing import Any, Dict, List, Mapping, Optional, Type
 
 import torch
 
+from unirl.config.require import require
 from unirl.types.conditions import Condition
+from unirl.types.loss_agg import parse_loss_agg_mode
 from unirl.types.segments.text import TextSegment
 
 from .base import (
@@ -15,7 +17,10 @@ from .base import (
     BaseAlgorithmConfig,
     StageAlgorithm,
     _grpo_clip_loss,
+    _prepare_ar_logp_anchor,
     _resolve_clip_range_from_schedule,
+    aggregate_token_losses,
+    rollout_replay_k3,
     rollout_replay_logp_absdiff,
     typed_conditions,
 )
@@ -27,12 +32,20 @@ class GRPOConfig(BaseAlgorithmConfig):
     conditions_cls: str = ""
     clip_range: float = 1e-4
     clip_schedule: str = "constant"
+    old_logp_source: str = "rollout"
 
 
 class GRPO(StageAlgorithm):
     """GRPO over an AR ``TextSegment`` via ``ARStage.replay``."""
 
+    # Freeze π_old across updates, sourced from rollout or train-side replay.
     supports_multi_update = True
+    # Preserve rollout values separately so engine-drift metrics remain valid.
+    anchor_fields = ("log_probs", "rollout_log_probs")
+
+    @property
+    def recomputes_anchor(self) -> bool:
+        return self.old_logp_source == "replay"
 
     def __init__(
         self,
@@ -46,6 +59,7 @@ class GRPO(StageAlgorithm):
         loss_agg_mode: str = "token-mean",
         horizon: int = 8192,
         conditions_cls: Optional[Type[Any]] = None,
+        old_logp_source: str = "rollout",
         sampling_temperature: Optional[float] = None,
     ) -> None:
         super().__init__()
@@ -54,10 +68,15 @@ class GRPO(StageAlgorithm):
         if stage is None:
             stage = getattr(pipeline, stage_attr)
         self.stage = stage
+        self.old_logp_source = str(old_logp_source).strip().lower()
+        require(
+            self.old_logp_source in ("rollout", "replay"),
+            f"GRPO: old_logp_source must be 'rollout' or 'replay'; got {old_logp_source!r}",
+        )
         self.clip_range = float(clip_range)
         self.clip_range_high = None if clip_range_high is None else float(clip_range_high)
         self.clip_schedule = str(clip_schedule)
-        self.loss_agg_mode = str(loss_agg_mode)
+        self.loss_agg_mode = parse_loss_agg_mode(loss_agg_mode, owner="GRPO").value
         self.horizon = int(horizon)
         self.conditions_cls = conditions_cls
         if sampling_temperature is None:
@@ -65,6 +84,22 @@ class GRPO(StageAlgorithm):
 
             sampling_temperature = ARSamplingParams.__dataclass_fields__["temperature"].default
         self.sampling_temperature = float(sampling_temperature)
+
+    def prepare_segment(
+        self,
+        *,
+        conditions: Mapping[str, Condition],
+        segment: "TextSegment",
+    ) -> None:
+        """Freeze the selected rollout- or replay-sourced old-policy anchor."""
+        _prepare_ar_logp_anchor(
+            stage=self.stage,
+            conditions=conditions,
+            segment=segment,
+            conditions_cls=self.conditions_cls,
+            old_logp_source=self.old_logp_source,
+            sampling_temperature=self.sampling_temperature,
+        )
 
     def compute_loss_and_backward(
         self,
@@ -81,7 +116,13 @@ class GRPO(StageAlgorithm):
             return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
 
         typed_conds = typed_conditions(conditions, self.conditions_cls)
-        new_logp = self.stage.replay(typed_conds, segment=segment, temperature=self.sampling_temperature)
+        new_logp = self.stage.replay(
+            typed_conds, segment=segment, temperature=self.sampling_temperature
+        )  # [total_tokens]
+        # old_logp = the frozen π_old anchor established by prepare_segment:
+        # the rollout log-prob by default, or a train-side replay under
+        # old_logp_source='replay'. Either way it stays frozen across all
+        # num_updates_per_batch steps (see the supports_multi_update comment).
         old_logp = segment.log_probs.to(dtype=new_logp.dtype, device=new_logp.device)
         adv_per_token = self._expand_advantages_to_tokens(
             advantages, segment.lengths, dtype=new_logp.dtype, device=new_logp.device
@@ -99,22 +140,26 @@ class GRPO(StageAlgorithm):
             advantages=adv_per_token,
             clip_range=clip_range,
             clip_range_high=clip_high,
+            mask=segment.loss_mask,
         )
 
-        if self.loss_agg_mode in ("seq-mean-token-sum-norm", "seq-mean-token-mean") and segment.lengths is not None:
-            parts = torch.split(loss_per_elem, segment.lengths.tolist())
-            if self.loss_agg_mode == "seq-mean-token-sum-norm":
-                loss = torch.stack([p.sum() for p in parts]).mean() / float(self.horizon)
-            else:  # seq-mean-token-mean — guard 0-length responses (mean of empty = NaN)
-                loss = torch.stack([p.mean() if p.numel() else p.new_zeros(()) for p in parts]).mean()
-        else:
-            loss = loss_per_elem.mean()
+        loss = aggregate_token_losses(
+            loss_per_elem,
+            lengths=segment.lengths,
+            loss_mask=segment.loss_mask,
+            loss_agg_mode=self.loss_agg_mode,
+            horizon=self.horizon,
+        )
         (loss * loss_scale).backward()
 
+        rollout_logp = (segment.rollout_log_probs if segment.rollout_log_probs is not None else segment.log_probs).to(
+            dtype=new_logp.dtype, device=new_logp.device
+        )
         metrics: Dict[str, Any] = {
             "policy_loss": float(loss.detach().item()),
             "clip_range": float(clip_range),
-            **rollout_replay_logp_absdiff(new_logp, old_logp),
+            **rollout_replay_logp_absdiff(new_logp, rollout_logp, segment.loss_mask),
+            **rollout_replay_k3(new_logp, rollout_logp, segment.loss_mask),
             **{k: float(v.item()) for k, v in ratio_metrics.items()},
         }
         return AlgorithmStepResult(

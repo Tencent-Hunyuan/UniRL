@@ -181,7 +181,7 @@ class AgenticTrainer(BaseTrainer):
             rollout_id,
             allowed_primitives={"text"},
             caller="AgenticTrainer._build_request_sample",
-            root_control={"ar": {"stop": list(self._stop)}},
+            control={"ar": {"stop": list(self._stop)}},
         )
 
     def _collect_groups(self, requests: Sample) -> List[List[Sample]]:
@@ -345,7 +345,11 @@ class AgenticTrainer(BaseTrainer):
         )
         if train_parts:
             train_part = self._pad_to_dp_multiple(Part.concat(train_parts))
-            result = self.stack.train_track(train_part, training_progress=float(training_progress))
+            result = self.stack.train_track(
+                train_part,
+                training_progress=float(training_progress),
+                rollout_id=rollout_id,
+            )
             train_rows = int(train_part.batch_size)
         else:
             result = TrainStepResult(0.0, 0.0, 0.0, False, [], {}, optimizer_updates=0)

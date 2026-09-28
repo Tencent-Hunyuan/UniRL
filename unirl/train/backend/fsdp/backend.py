@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import os
 from typing import Optional, Tuple
 
 import torch
 
+from unirl.config.require import require
 from unirl.models.types.bundle import Bundle
 from unirl.models.types.post_materialize import apply_deferred_ops
 from unirl.train.backend.base import LrSchedulerConfig, OptimizerConfig, resolve_trainable_module
@@ -24,7 +26,9 @@ from unirl.train.configs import (
     EmaLoraConfig,
     FSDPConfig,
     LoraConfig,
+    normalize_fsdp_mode,
 )
+from unirl.utils.distributed_utils import ensure_dist_initialized
 from unirl.utils.dtypes import parse_torch_dtype
 
 
@@ -53,12 +57,53 @@ class FSDPBackend(BaseFSDP2Backend):
         self._bundle = bundle
         self._rank = int(rank)
         self._device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if fsdp_cfg.copy_engine_all_gather:
+            require(
+                normalize_fsdp_mode(fsdp_cfg.fsdp_mode) != "no_shard",
+                "FSDP copy-engine all-gather is invalid with fsdp_mode='no_shard'.",
+            )
+            require(self._device.type == "cuda", "FSDP copy-engine all-gather requires a CUDA device.")
+            nccl_version = torch.cuda.nccl.version()
+            require(
+                tuple(nccl_version[:2]) >= (2, 28),
+                f"FSDP copy-engine all-gather requires NCCL >= 2.28, got {nccl_version}.",
+            )
+            policy = os.environ.get("NCCL_CTA_POLICY")
+            require(
+                policy in {None, "2"},
+                "FSDP copy-engine all-gather sets zero-CTA on the default NCCL group, but "
+                f"NCCL_CTA_POLICY={policy!r} would override it. Unset NCCL_CTA_POLICY or set it to '2'.",
+            )
+            pg_device = self._device
+            if pg_device.index is None:
+                pg_device = torch.device("cuda", torch.cuda.current_device())
+            torch.cuda.set_device(pg_device)
+            process_group_nccl = torch.distributed.ProcessGroupNCCL
+            options = process_group_nccl.Options()
+            options.config.cta_policy = process_group_nccl.NCCL_CTA_POLICY_ZERO
+            timeout = torch.distributed.constants.default_pg_timeout
+            options._timeout = timeout
+            # device_id without backend would narrow WORLD to NCCL; keep the default pair.
+            torch.distributed.init_process_group(
+                backend="cpu:gloo,cuda:nccl",
+                pg_options=options,
+                device_id=pg_device,
+                timeout=timeout,
+            )
+        else:
+            ensure_dist_initialized()
 
         self._weight_sync_dtype: torch.dtype = parse_torch_dtype(
             fsdp_cfg.param_dtype, field_name="training.fsdp.param_dtype"
         )
 
         model = resolve_trainable_module(bundle, trainable_attr)
+        if getattr(bundle, "requires_unwrapped_trainable_root", False) and fsdp_cfg.root_wrap:
+            raise ValueError(
+                f"{type(bundle).__name__} requires fsdp_cfg.root_wrap=false because its stages call replicated "
+                "trainable-root children directly; root wrapping would expose sharded DTensors outside the root "
+                "forward."
+            )
         shadow = self._inject_structural(model, lora_cfg, ema_lora_cfg, ema_cfg)
 
         fsdp_wrap(
@@ -67,14 +112,18 @@ class FSDPBackend(BaseFSDP2Backend):
             param_dtype=fsdp_cfg.param_dtype,
             cpu_offload=fsdp_cfg.cpu_offload,
             mixed_precision=fsdp_cfg.mixed_precision,
+            cast_forward_inputs=fsdp_cfg.cast_forward_inputs,
             fsdp_mode=fsdp_cfg.fsdp_mode,
+            hsdp_shard_size=fsdp_cfg.hsdp_shard_size,
             reshard_after_forward=fsdp_cfg.reshard_after_forward,
             forward_prefetch=fsdp_cfg.forward_prefetch,
             activation_checkpointing=fsdp_cfg.activation_checkpointing,
             ac_wrap_order=getattr(fsdp_cfg, "ac_wrap_order", "outside"),
             use_torch_compile=fsdp_cfg.use_torch_compile,
             master_dtype=getattr(fsdp_cfg, "master_dtype", None),
+            master_params=tuple(shd for _, shd in shadow.iter_pairs()) if shadow is not None else (),
             root_wrap=getattr(fsdp_cfg, "root_wrap", True),
+            copy_engine_all_gather=fsdp_cfg.copy_engine_all_gather,
         )
 
         load_trainable_weights(

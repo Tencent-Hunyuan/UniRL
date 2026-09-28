@@ -156,6 +156,7 @@ diffusion:
     micro_batch_size: 1
     max_grad_norm: 1.0
     num_updates_per_batch: 2      # diffusion-side PPO mini-batches; ar stays 1 (ARGRPO is single-update only)
+    shuffle_updates: true
 
 # ── AR side (Qwen3) — copied from pe_trainside_pickscore.yaml ────────────────────────
 ar:
@@ -207,6 +208,7 @@ ar:
     stage_attr: ar
     clip_range: 1.0e-2
     clip_schedule: constant
+    sampling_temperature: ${sampling.ar.temperature}
     conditions_cls:
       _target_: hydra.utils.get_class
       path: unirl.models.qwen3.conditions.Qwen3ARConditions
@@ -251,9 +253,6 @@ rollout:
       _target_: unirl.rollout.engine.sglang.config.SGLangEngineConfig
       pretrained_model_ckpt_path: ${oc.env:LLM_MODEL,Qwen/Qwen3-0.6B}
       tp_size: 1
-      max_new_tokens: 512
-      temperature: 0.7
-      top_p: 0.9
       # Transport: in-process sglang.Engine (native). Use "http" (separate SRT
       # server subprocess) only if a native issue needs the HTTP fallback.
       backend: native

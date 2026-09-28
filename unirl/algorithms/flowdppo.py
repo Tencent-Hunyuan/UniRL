@@ -95,10 +95,8 @@ class FlowDPPO(StageAlgorithm):
 
     supports_multi_update = True
     requires_backend = True
+    recomputes_anchor = True
     anchor_fields = ("sde_logp", "sde_means")
-
-    def recomputes_anchor(self) -> bool:
-        return True
 
     def __init__(
         self,
@@ -265,7 +263,7 @@ class FlowDPPO(StageAlgorithm):
         target_steps: List[int],
         device: torch.device,
     ) -> torch.Tensor:
-        """Per-step KL-normalization sigma_t ``[1, S', 1, 1, 1]``; ones when ``add_kl_coefficient=False``."""
+        """Per-step KL-normalization sigma_t ``[S']``; ones when ``add_kl_coefficient=False``."""
         return _transition_sigma(
             self.stage,
             segment=segment,

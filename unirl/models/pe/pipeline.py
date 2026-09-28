@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional
+from typing import Optional
 
 from unirl.models.types.pipeline import Pipeline
 from unirl.types.primitives import Texts
@@ -11,7 +11,7 @@ from unirl.types.sample import Part, Sample
 from unirl.types.sampling import ARSamplingParams, DiffusionSamplingParams
 
 from .bundle import PEBundle
-from .instruction import postprocess_pe_texts
+from .instruction import ar_child_control, postprocess_pe_texts
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +89,7 @@ class PEPipeline(Pipeline):
         ar_input = Part.input(
             sample_ids=list(input_part.sample_ids),
             primitives={"text": prompts},
-            control=self._ar_control(input_part.control or {}),
+            control=ar_child_control(input_part.control, system_instruction=self.pe_instruction),
         )
         ar_out = self.llm_pipeline.generate(Sample(parts=[ar_input, ar_shell]))
         ar_part = ar_out.parts[-1]
@@ -149,14 +149,6 @@ class PEPipeline(Pipeline):
         if not isinstance(diff_shell.sampling_params, DiffusionSamplingParams):
             raise ValueError("PEPipeline.generate: requires a diffusion gen-shell Part (DiffusionSamplingParams)")
         return input_part, ar_shell, diff_shell
-
-    def _ar_control(self, control: Dict[str, Any]) -> Dict[str, Any]:
-        """The LLM child input Part's ``control``: the parent's chat + ar subsets with pe_instruction injected."""
-        ar_control: Dict[str, Any] = {key: dict(control[key]) for key in ("chat", "ar") if key in control}
-        if self.pe_instruction:
-            for key in ("ar", "chat"):
-                ar_control.setdefault(key, {})["system_instruction"] = self.pe_instruction
-        return ar_control
 
     def _extract_pe(self, pe_texts: Texts, user_prompts: Texts, samples_per_prompt: int) -> Texts:
         """Optional marker-based PE extraction; off-format outputs fall back to the original user prompt."""

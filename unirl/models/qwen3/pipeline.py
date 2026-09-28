@@ -85,9 +85,9 @@ class Qwen3Pipeline(Pipeline):
         )
         return cls(bundle=bundle, chat_template=chat_template, ar=ar)
 
-    def _conditions_for(self, turns: List[Turn], control: Optional[Dict[str, Any]] = None) -> Qwen3ARConditions:
+    def _conditions_for(self, turns: List[Turn], control: Dict[str, Any]) -> Qwen3ARConditions:
         """Chat-template + tokenize the trajectory ``turns`` → :class:`Qwen3ARConditions`."""
-        chat_overrides: Dict[str, Any] = dict((control or {}).get("chat") or {})
+        chat_overrides: Dict[str, Any] = dict(control.get("chat") or {})
         if "system_instruction" in chat_overrides:
             chat_stage = Qwen3ChatTemplateStage(
                 self.bundle,

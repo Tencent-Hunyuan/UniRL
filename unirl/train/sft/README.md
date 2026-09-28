@@ -50,3 +50,11 @@ supports. There is no base class and no `isinstance` check:
   image-bearing prompt desyncs pixel grids from the remaining pad tokens, and
   cutting a text prompt severs the prompt→target seam. Filter during manifest
   preparation instead.
+- **Encoder caches are namespaced by the frozen encoder, not by `cache_fingerprint`.**
+  Text-condition and VAE-latent cache entries are only valid while the code that
+  wrote them would write them again. An operator revision string cannot be trusted
+  to track a checkpoint, dtype or max-length change — reusing one across models
+  silently trains on stale latents — so the namespace is derived from the frozen
+  weights (structure plus sampled values) and the encode stage's scalar config
+  (e.g. SD3's `max_sequence_length`). `cache_fingerprint` is only an optional salt
+  for isolating caches by hand.

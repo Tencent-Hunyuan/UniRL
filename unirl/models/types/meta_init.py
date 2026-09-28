@@ -2,13 +2,84 @@
 
 from __future__ import annotations
 
+import glob
+import json
 import logging
-from typing import Callable, Optional, Tuple
+import os
+import re
+from typing import Callable, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_safetensors(weights_path: str, checkpoint_path: str, expected: str) -> None:
+    paths = glob.glob(os.path.join(glob.escape(weights_path), "*.safetensors"))
+    shards = {os.path.basename(path) for path in paths if os.path.isfile(path)}
+    if not os.path.isdir(weights_path) or not shards:
+        raise ValueError(f"Meta-init checkpoint {checkpoint_path!r} does not contain expected {expected!r}.")
+
+    incomplete_index = None
+    for index_path in glob.glob(os.path.join(glob.escape(weights_path), "*.safetensors.index.json")):
+        try:
+            with open(index_path) as handle:
+                weight_map = json.load(handle)["weight_map"]
+            if (
+                not isinstance(weight_map, dict)
+                or not weight_map
+                or not all(isinstance(name, str) for name in weight_map.values())
+            ):
+                raise TypeError("weight_map must be a non-empty string mapping")
+            referenced = {os.path.basename(name) for name in weight_map.values()}
+        except (OSError, KeyError, TypeError, AttributeError, ValueError):
+            continue
+        if referenced <= shards:
+            return
+        if referenced & shards:
+            incomplete_index = referenced
+
+    numbered: dict[tuple[str, int], set[int]] = {}
+    for shard in shards:
+        match = re.match(r"^(.*)-(\d+)-of-(\d+)\.safetensors$", shard)
+        if not match:
+            return
+        numbered.setdefault((match.group(1), int(match.group(3))), set()).add(int(match.group(2)))
+
+    if any(present == set(range(1, total + 1)) for (_, total), present in numbered.items()):
+        return
+    if incomplete_index is not None:
+        missing = sorted(incomplete_index - shards)
+        raise ValueError(f"Meta-init checkpoint {checkpoint_path!r} is incomplete; missing shard(s): {missing[:8]}.")
+    if numbered:
+        (_, total), present = max(numbered.items(), key=lambda item: len(item[1]))
+        missing = sorted(set(range(1, total + 1)) - present)
+        raise ValueError(
+            f"Meta-init checkpoint {checkpoint_path!r} is incomplete; missing numbered shard(s): {missing[:8]}."
+        )
+
+
+def resolve_meta_init_weights(checkpoint_path: str, *, component: Optional[str] = None) -> str:
+    """Resolve and validate the local safetensors directory for a meta-init bundle."""
+    snapshot_path = checkpoint_path
+    expected = os.path.join(component, "*.safetensors") if component else "*.safetensors"
+    if not os.path.isdir(snapshot_path):
+        from huggingface_hub import snapshot_download
+
+        try:
+            snapshot_path = snapshot_download(
+                repo_id=checkpoint_path,
+                allow_patterns=[expected, f"{expected}.index.json"],
+            )
+        except Exception as exc:
+            raise ValueError(
+                f"Meta-init checkpoint {checkpoint_path!r} could not be resolved; expected {expected!r}: {exc}"
+            ) from exc
+
+    weights_path = os.path.join(snapshot_path, component) if component else snapshot_path
+    _validate_safetensors(weights_path, checkpoint_path, expected)
+    return weights_path
 
 
 def capture_init_state(model: nn.Module) -> dict:
@@ -34,74 +105,19 @@ def capture_init_state(model: nn.Module) -> dict:
     return {"buffers": buffers, "attrs": attrs}
 
 
-def _canonical_named_modules(model: nn.Module) -> dict[str, nn.Module]:
-    """Index modules by names from before activation-checkpoint wrapping."""
-    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
-
-    def unwrap(module: nn.Module) -> nn.Module:
-        seen = set()
-        while id(module) not in seen:
-            seen.add(id(module))
-            if isinstance(module, CheckpointWrapper):
-                module = module._checkpoint_wrapped_module
-                continue
-            get_base_layer = getattr(module, "get_base_layer", None)
-            if callable(get_base_layer):
-                base_layer = get_base_layer()
-                if isinstance(base_layer, nn.Module) and base_layer is not module:
-                    module = base_layer
-                    continue
-            break
-        return module
-
-    modules: dict[str, nn.Module] = {}
-    visited = set()
-
-    def visit(module: nn.Module, name: str) -> None:
-        module = unwrap(module)
-        if id(module) in visited:
-            return
-        visited.add(id(module))
-        modules[name] = module
-        for child_name, child in module.named_children():
-            child_fqn = f"{name}.{child_name}" if name else child_name
-            visit(child, child_fqn)
-
-    visit(model, "")
-    return modules
-
-
 def restore_init_state(model: nn.Module, captured: Optional[dict]) -> int:
     """Copy a :func:`capture_init_state` snapshot back onto a materialized module."""
     if not captured:
         return 0
     buffers = captured.get("buffers", {})
     attrs = captured.get("attrs", {})
-    modules = _canonical_named_modules(model)
-    buffer_targets = []
-    attr_targets = []
-    missing = []
+    modules = dict(model.named_modules())
     for fqn, value in buffers.items():
         mod_name, _, buf_name = fqn.rpartition(".")
-        owner = modules.get(mod_name)
+        owner = modules.get(mod_name) if mod_name else model
         if owner is None or not hasattr(owner, buf_name):
-            missing.append(fqn)
             continue
         live = getattr(owner, buf_name)
-        buffer_targets.append((fqn, live, value))
-    for (mod_name, attr), value in attrs.items():
-        owner = modules.get(mod_name)
-        if owner is None or attr not in vars(owner):
-            missing.append(f"{mod_name}.{attr}" if mod_name else attr)
-            continue
-        attr_targets.append((owner, attr, value))
-    if missing:
-        raise RuntimeError(
-            "restore_init_state: could not resolve captured tensor owner(s) after model wrapping; "
-            f"missing {len(missing)} entry(s): {missing[:8]}"
-        )
-
-    for fqn, live, value in buffer_targets:
         tgt = live.to_local() if hasattr(live, "to_local") else live
         src = value.to(device=tgt.device, dtype=tgt.dtype)
         if tuple(tgt.shape) != tuple(src.shape):
@@ -110,9 +126,11 @@ def restore_init_state(model: nn.Module, captured: Optional[dict]) -> int:
                 f"does not match live local shape {tuple(tgt.shape)}."
             )
         tgt.copy_(src)
-    for owner, attr, value in attr_targets:
-        owner.__dict__[attr] = value
-    n = len(buffer_targets) + len(attr_targets)
+    for (mod_name, attr), value in attrs.items():
+        owner = modules.get(mod_name)
+        if owner is not None:
+            owner.__dict__[attr] = value
+    n = len(buffers) + len(attrs)
     if n:
         logger.info("restore_init_state: recovered %d non-persistent buffer(s) + plain attr(s)", n)
     return n
@@ -175,11 +193,35 @@ def recover_rope_inv_freq(model: nn.Module) -> int:
     return n
 
 
-def finalize_meta_init(transformer: nn.Module, *, dtype: torch.dtype) -> nn.Module:
+def _pin_fp32(transformer: nn.Module, keep_in_fp32: Sequence[str]) -> int:
+    """Re-cast params/buffers whose name matches ``keep_in_fp32`` back to fp32."""
+    patterns = tuple(keep_in_fp32)
+    matched = 0
+    for name, tensor in list(transformer.named_parameters()) + list(transformer.named_buffers()):
+        if not tensor.dtype.is_floating_point or not any(pattern in name for pattern in patterns):
+            continue
+        matched += 1
+        if tensor.dtype != torch.float32:
+            tensor.data = tensor.data.to(torch.float32)
+    return matched
+
+
+def finalize_meta_init(
+    transformer: nn.Module,
+    *,
+    dtype: torch.dtype,
+    keep_in_fp32: Optional[Sequence[str]] = None,
+) -> nn.Module:
     """Apply the shared post-build contract for a meta transformer."""
     if not any(param.is_meta for param in transformer.parameters()):
         raise ValueError("finalize_meta_init requires a transformer with meta parameters.")
     transformer = transformer.to(dtype)
+    if keep_in_fp32:
+        pinned = _pin_fp32(transformer, keep_in_fp32)
+        if pinned == 0:
+            raise ValueError(
+                f"finalize_meta_init: keep_in_fp32={tuple(keep_in_fp32)!r} matched no floating parameters or buffers"
+            )
     transformer.init_weights = lambda: None
     return transformer
 
@@ -188,6 +230,7 @@ def build_meta_init_transformer(
     factory: Callable[[], nn.Module],
     *,
     dtype: torch.dtype,
+    keep_in_fp32: Optional[Sequence[str]] = None,
 ) -> Tuple[nn.Module, dict]:
     """Build ``factory()`` on meta, capturing init-computed non-persistent state."""
     from accelerate import init_empty_weights
@@ -195,11 +238,12 @@ def build_meta_init_transformer(
     with init_empty_weights(include_buffers=False):
         transformer = factory()
     captured = capture_init_state(transformer)
-    transformer = finalize_meta_init(transformer, dtype=dtype)
+    transformer = finalize_meta_init(transformer, dtype=dtype, keep_in_fp32=keep_in_fp32)
     return transformer, captured
 
 
 __all__ = [
+    "resolve_meta_init_weights",
     "capture_init_state",
     "restore_init_state",
     "recover_rope_inv_freq",
