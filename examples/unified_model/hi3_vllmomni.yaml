@@ -23,6 +23,11 @@ batch_size: 2                 # prompts per rollout; each expands to samples_per
 
 weight_sync_interval: 1
 
+# >1 overlaps adjacent prompt-tree chunks across the AR and DiT engines, with
+# one pending call per engine. Keep 1 until the target batch shape is measured:
+# splitting this batch_size=2 recipe may reduce per-engine batch throughput.
+rollout_pipeline_chunks: 1
+
 # Intrusive debug dump (UnifiedModelTrainer._dump_rollout): per rollout, dump original
 # prompt + AR output text (the think/recaption fed into DiT) + decoded images +
 # image rewards. null = disabled (default); set to a writable path to enable.
