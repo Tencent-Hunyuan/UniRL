@@ -107,6 +107,8 @@ class ImageAdapter(ModelAdapter):
             )
             kwargs["rollout_sde_type"] = self._sde_label
             kwargs["rollout_noise_level"] = float(diffusion.eta)
+            # Rollout log-prob must use the strategy's convention (#533).
+            kwargs["rollout_log_prob_no_const"] = self._sde_log_prob_no_const
             kwargs["rollout_sde_step_indices"] = sde_indices
 
         return kwargs

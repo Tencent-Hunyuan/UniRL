@@ -49,6 +49,7 @@ class ModelAdapter(ABC):
         self.cfg = config
         self.model_config = model_config
         self._sde_label = self.resolve_sde_label(strategy)
+        self._sde_log_prob_no_const = bool(getattr(strategy, "log_prob_no_const", False))
         self.validate()
 
     @staticmethod
