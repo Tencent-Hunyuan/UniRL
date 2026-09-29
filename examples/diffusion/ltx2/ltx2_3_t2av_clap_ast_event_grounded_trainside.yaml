@@ -1,0 +1,19 @@
+# @package _global_
+# LTX-Video-2.3 T2AV Flow-GRPO with CLAP alignment plus an independent
+# AudioSet AST event classifier. The AST term closes the gap where CLAP score
+# rises while a concrete event such as applause becomes less audible.
+
+defaults:
+  - ltx2_3_t2av_clap_event_grounded_trainside
+  - _self_
+
+save_dir: ${oc.env:SAVE_DIR,checkpoints/ltx2_3_t2av_clap_ast_event_grounded_trainside}
+
+logging:
+  tags: [ltx2.3, t2av, flowgrpo, trainside, audio, clap, ast, event-grounded, rms-normalized]
+
+reward:
+  backend:
+    config:
+      ast_event_weight: 1.0
+      ast_model_id: MIT/ast-finetuned-audioset-10-10-0.4593

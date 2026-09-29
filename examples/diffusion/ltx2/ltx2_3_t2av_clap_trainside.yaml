@@ -1,0 +1,185 @@
+# @package _global_
+# LTX-Video-2.3 T2AV Flow-GRPO with audio-text reward only.
+#
+# The generated video remains the primary rollout output, while CLAP reads the
+# decoded audio waveform carried alongside it in the reward request. Prepare the
+# official AudioCaps captions first; each caption is both the generation prompt
+# and CLAP target. Per-record distractor captions provide retrieval diagnostics
+# without introducing a hand-written class vocabulary.
+#
+# Prepare data:
+#   python datasets/audiocaps/prepare_audiocaps.py --out-dir data/audiocaps
+#
+# Launch (1 node x 8 GPUs):
+#   DATA_PATH=data/audiocaps/train.jsonl EVAL_DATA_PATH=data/audiocaps/eval.jsonl \
+#     bash examples/run_experiment_single_node.sh diffusion/ltx2/ltx2_3_t2av_clap_trainside
+
+num_devices: 8
+batch_size: 8
+adv_use_global_std: false
+num_rollouts: 100
+eval_interval: 20
+eval_num_prompts: 8
+eval_samples_per_prompt: 1
+eval_chunk_prompts: 8
+eval_eta: 0.0
+eval_sampling:
+  init_same_noise: false
+  num_inference_steps: 30
+  guidance_scale: 3.0
+  height: 512
+  width: 768
+save_interval: 20
+save_dir: ${oc.env:SAVE_DIR,checkpoints/ltx2_3_t2av_clap_trainside}
+save_mode: adapter
+
+logging:
+  report_to_wandb: true
+  project_name: ${oc.env:WANDB_PROJECT,unirl-ltx2.3-t2av-clap}
+  run_name: null
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: [ltx2.3, t2av, flowgrpo, trainside, audio, clap]
+  log_media: true
+  media_max_items: 4
+  media_log_interval: 500
+
+bundle:
+  _target_: unirl.models.ltx2.bundle.LTX2Bundle.from_config
+  config:
+    _target_: unirl.models.ltx2.config.LTX2PipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,dg845/LTX-2.3-Diffusers}
+    model_precision: bf16
+    autocast_precision: bf16
+    trajectory_precision: fp16
+    logprob_precision: fp32
+    shift: 1.0
+    max_sequence_length: 512
+    enable_audio: true
+    audio_joint_sde: true
+    audio_policy_logp_weight: 1.0
+    default_height: 512
+    default_width: 768
+    default_num_frames: 49
+    default_frame_rate: 24.0
+
+pipeline:
+  _target_: unirl.models.ltx2.pipeline.LTX2Pipeline.from_bundle
+  config: ${bundle.config}
+  strategy:
+    _target_: unirl.sde.kernels.FlowSDEStrategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["LTX2VideoTransformerBlock"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 1.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 10000
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 32
+    alpha: 256
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    target_modules:
+      - audio_proj_in
+      - audio_proj_out
+      - audio_attn1.to_q
+      - audio_attn1.to_k
+      - audio_attn1.to_v
+      - audio_attn1.to_out.0
+      - audio_attn2.to_q
+      - audio_attn2.to_k
+      - audio_attn2.to_v
+      - audio_attn2.to_out.0
+      - video_to_audio_attn.to_q
+      - video_to_audio_attn.to_k
+      - video_to_audio_attn.to_v
+      - video_to_audio_attn.to_out.0
+      - audio_ff.net.0.proj
+      - audio_ff.net.2
+
+rollout:
+  _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
+  stage_attrs: [diffusion]
+  forward_batch_size: 1
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.local.clap.CLAPRewardScorer
+    base_device: cuda
+    config:
+      _target_: unirl.reward.local.clap.CLAPSpec
+      batch_size: 2
+      device: auto
+      negative_prompts_metadata_key: negative_audio_captions
+      matched_cosine_weight: 1.0
+      retrieval_margin_weight: 1.0
+
+algorithm:
+  _target_: unirl.algorithms.flowgrpo.FlowGRPO
+  stage_attr: diffusion
+  clip_range: 5.0e-3
+  clip_schedule: constant
+  old_logp_source: replay
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.ltx2.conditions.LTX2Conditions
+  params: ${sampling}
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 2
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: ${oc.env:DATA_PATH,data/audiocaps/train.jsonl}
+      eval_data_path: ${oc.env:EVAL_DATA_PATH,data/audiocaps/eval.jsonl}
+      seed: 42
+      shuffle: true
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  num_inference_steps: 10
+  guidance_scale: 1.0
+  height: 256
+  width: 384
+  num_frames: 49
+  eta: 0.7
+  samples_per_prompt: 8
+  seed: 42
+  init_same_noise: false
+  autocast_precision: bf16
+  trajectory_precision: fp16
+  logprob_precision: fp32
+  scheduler:
+    _target_: unirl.sde.index_schedule.AllSDEScheduler
+    num_timesteps: ${..num_inference_steps}
+    num_sde_steps: 2
+    timestep_fraction: [0, 0.5]
