@@ -80,6 +80,8 @@ def _replay_aware_forward(
     autocast_ctx = (
         torch.autocast("cuda", autocast_dtype) if autocast_dtype in (torch.float16, torch.bfloat16) else nullcontext()
     )
+    if packed_predict_index is None and getattr(self.config, "_attn_implementation", None) == "flex_attention":
+        kw["kernel_options"] = {"FORCE_USE_FLEX_ATTENTION": True}
     with autocast_ctx:
         hidden = self.model(**kw, use_cache=False, return_dict=True).last_hidden_state
 
