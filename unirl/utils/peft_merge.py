@@ -346,7 +346,12 @@ def extract_lora_tensors(
 
 
 def adapt_lora_for_vllm(tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    """Wrap canonical-format LoRA keys in the vllm-omni PEFT envelope."""
+    """Idempotently wrap canonical LoRA keys in the vllm-omni PEFT envelope."""
+    enveloped = [name.startswith(_PEFT_PREFIX) for name in tensors]
+    if all(enveloped):
+        return tensors
+    if any(enveloped):
+        raise ValueError("LoRA tensors mix canonical and PEFT-enveloped keys")
     return {f"{_PEFT_PREFIX}{k}": v for k, v in tensors.items()}
 
 

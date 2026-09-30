@@ -27,9 +27,6 @@ from unirl.utils.dtypes import parse_torch_dtype
 
 logger = logging.getLogger(__name__)
 
-_OFFLOAD_TAGS = ("transformer", "vae", "text_encoder")
-_CPU_BACKUP_TAGS = ("vae", "text_encoder")
-
 
 class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
     """Rollout engine backed by ``sglang.multimodal_gen.DiffGenerator`` (v2 layout)."""
@@ -187,7 +184,7 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
         # Skip duplicate sleep calls because memory release is not idempotent.
         if self._is_offloaded:
             return
-        self._backend.release_memory(tags=_OFFLOAD_TAGS, cpu_backup_tags=_CPU_BACKUP_TAGS)
+        self._backend.release_memory()
         self._is_offloaded = True
         self._weight_sync.mark_weights_released()
         logger.info("sglang_diffusion engine slept (release_memory_occupation).")
@@ -196,7 +193,7 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
     def wake_up(self) -> None:
         if not self._is_offloaded:
             return
-        self._backend.resume_memory(tags=_OFFLOAD_TAGS)
+        self._backend.resume_memory()
         self._is_offloaded = False
 
     @property
@@ -236,7 +233,6 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
             load_format=load_format,
             flush_cache=flush_cache,
         )
-        self._version += 1
 
     def init_weights_update_group(
         self,
@@ -279,7 +275,6 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
             target_modules=target_modules,
             flush_cache=flush_cache,
         )
-        self._version += 1
 
     def destroy_weights_update_group(
         self,

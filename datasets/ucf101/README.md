@@ -18,7 +18,7 @@ training environment can be installed with:
 ```bash
 uv venv --python 3.12 --seed .venv
 source .venv/bin/activate
-uv pip install -e ".[vllm,train,infer]" --prerelease=allow
+uv pip install -e ".[vllm,train,infer]"
 ```
 
 Both supported engine extras (`vllm` and `sglang`) install PyAV for raw video

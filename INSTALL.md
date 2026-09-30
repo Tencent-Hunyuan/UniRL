@@ -11,7 +11,7 @@ virtualenv, never `--all-extras`. `train` and `infer` do not pull a rollout engi
 | Engine extra | PyTorch | CUDA |
 |---|---|---|
 | `vllm` (vLLM + vLLM-Omni) | `2.13.0+cu130` | 13.0 |
-| `sglang` | `2.11.0+cu130` | 13.0 |
+| `sglang` | `2.13.0+cu130` | 13.0 |
 
 SGLang's wheel needs glibc >= 2.34. Put NVIDIA's CUDA 13 forward-compat
 libraries on `LD_LIBRARY_PATH` before launch; the launchers do not do this.
@@ -20,7 +20,14 @@ libraries on `LD_LIBRARY_PATH` before launch; the launchers do not do this.
 
 ```bash
 uv venv --python 3.12 --seed .venv && source .venv/bin/activate
-uv pip install -e ".[vllm,train,infer]" --prerelease=allow
+uv pip install -e ".[vllm,train,infer]"
+```
+
+To use a Diffusers FlashAttention backend (for example `flash_varlen`) in
+diffusion training:
+
+```bash
+MAX_JOBS=8 uv pip install -e ".[flash-attn]" --no-build-isolation
 ```
 
 ## sglang
@@ -47,7 +54,7 @@ Limit build parallelism with `MAX_JOBS` if host RAM is constrained, then install
 the SGLang extra:
 
 ```bash
-uv pip install -e ".[sglang,train,infer]" --prerelease=allow
+uv pip install -e ".[sglang,train,infer]"
 ```
 
 ## Extras
@@ -55,10 +62,11 @@ uv pip install -e ".[sglang,train,infer]" --prerelease=allow
 | Extra | Adds | Use when |
 |---|---|---|
 | `vllm` | `vllm`, `vllm-omni`, torch +cu130 stack, PyAV | vLLM and vLLM-Omni recipes |
+| `flash-attn` | FlashAttention 2 | Diffusers `flash*` attention backends in diffusion training |
 | `sglang` | `sglang[diffusion]`, `checkpoint-engine`, `flash-attn-4`, `flash-linear-attention[conv1d]`, torch +cu130 stack, PyAV | SGLang-based AR/VLM and diffusion recipes |
 | `fastvideo` | FastVideo pinned to an upstream Git commit | WAN 2.1 / 2.2 rollout; [the extra does not currently resolve](#fastvideo-installation-blocker) |
 | `train` | `wandb`, `aiohttp`, `math-verify` | Training runs and local math-answer scoring |
-| `cosmos3` | `diffusers>=0.39` | [Cosmos3 SFT](unirl/models/cosmos3/README.md); apply the [version constraint](#cosmos3-version-prerequisite) |
+| `cosmos3` | `diffusers>=0.39` | [Cosmos3 SFT](unirl/models/cosmos3/README.md); uv's `diffusers==0.40.0` override already satisfies this extra |
 | `infer` | `accelerate`, `timm` | HunyuanImage3, Janus-Pro, and similar models |
 | `eval` | `torchvision`, `paddlepaddle`, `paddleocr`, `python-Levenshtein` | OCR-based reward components |
 | `veomni` | `veomni` | Recipes using the [VeOmni training backend](unirl/train/backend/veomni/) |
@@ -76,9 +84,9 @@ engine extras; install it when you need OCR rewards.
 For development tools (lint and tests):
 
 ```bash
-uv pip install -e ".[vllm,train,infer,eval,dev]" --prerelease=allow
+uv pip install -e ".[vllm,train,infer,eval,dev]"
 # or, for the sglang engine:
-uv pip install -e ".[sglang,train,infer,eval,dev]" --prerelease=allow
+uv pip install -e ".[sglang,train,infer,eval,dev]"
 ```
 
 Prefer these extras over the legacy [`requirements.txt`](requirements.txt) and
@@ -89,24 +97,19 @@ Prefer these extras over the legacy [`requirements.txt`](requirements.txt) and
 The `fastvideo` extra pins
 [hao-ai-lab/FastVideo@2095477](https://github.com/hao-ai-lab/FastVideo/blob/2095477eac7e289c7a7ab13acb367ca60687c304/pyproject.toml),
 which requires `transformers==4.57.3` and `wandb>=0.21.0`. The transformers pin
-conflicts with UniRL's `transformers>=5.6,<5.7`, so `.[fastvideo]` does not
+conflicts with UniRL's `transformers>=5.12,<5.13`, so `.[fastvideo]` does not
 resolve — a separate venv does not help, because UniRL's base deps still apply.
 Adding `train` also conflicts on `wandb`. Use `$FASTVIDEO_PATH` as in the
 [FastVideo engine README](unirl/rollout/engine/fastvideo/README.md) until the extra
 is solvable.
 
-### Cosmos3 version prerequisite
+### Cosmos3
 
-`cosmos3` asks for `diffusers>=0.39`, but uv's override `diffusers>=0.38.0`
-[replaces](https://docs.astral.sh/uv/concepts/resolution/#dependency-overrides)
-that floor instead of intersecting with it. Include `cosmos3` in the extras and
-pass `--constraint` when installing:
+`cosmos3` asks for `diffusers>=0.39`. The uv override pins `diffusers==0.40.0`,
+which already satisfies that floor, so install it as a normal extra:
 
 ```bash
-COSMOS3_CONSTRAINTS="$(mktemp)"
-printf '%s\n' 'diffusers>=0.39' > "$COSMOS3_CONSTRAINTS"
-uv pip install -e ".[vllm,train,infer,cosmos3]" --prerelease=allow \
-    --constraint "$COSMOS3_CONSTRAINTS"
+uv pip install -e ".[vllm,train,infer,cosmos3]"
 ```
 
 ## Environment

@@ -245,7 +245,7 @@ class BagelOutputAdapter(DitOutputAdapter):
 class BagelAdapter(ModelAdapter):
     """Bind BAGEL t2i and it2i to one single-stage DiT worker."""
 
-    stage_yaml = "bagel_t2i_rl.yaml"
+    deploy_config = "bagel_t2i_rl.yaml"
     omni_mode = "text-to-image"
     needs_driver_tokenizer = False
     image_input: bool = False  # Whether the modality requires an edit-source image.

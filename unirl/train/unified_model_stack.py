@@ -6,7 +6,7 @@ import logging
 import math
 from contextlib import nullcontext
 from dataclasses import replace
-from typing import Dict, List, Mapping, Tuple
+from typing import Dict, List, Mapping, Optional, Tuple
 
 import torch
 
@@ -14,9 +14,14 @@ from unirl.algorithms.base import AlgorithmStepResult, StageAlgorithm
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
 from unirl.train.backend.fsdp import FSDPBackend
-from unirl.train.stack import TrainStepResult, _build_micro_batch_slices
-from unirl.train.stack.base import _aggregate_update_results, _validate_anchor_contract
-from unirl.train.stack.planner.types import _positive_int, _update_ranges
+from unirl.train.stack import TrainStepResult, prepare_segment_anchors, validate_anchor_contract
+from unirl.train.stack.base import _aggregate_update_results
+from unirl.train.stack.planner import (
+    CountPlanner,
+    UpdatePlanner,
+    _positive_int,
+    arranged_slice,
+)
 from unirl.types.sample import Part, Sample
 from unirl.types.sampling import ARSamplingParams, DiffusionSamplingParams
 from unirl.utils.metrics import aggregate_numeric_metrics
@@ -36,6 +41,8 @@ class UnifiedModelTrainStack(Remote):
         micro_batch_size: int,
         max_grad_norm: float,
         num_updates_per_batch: int = 1,
+        shuffle_updates: bool = False,
+        shuffle_seed: int = 0,
     ) -> None:
         super().__init__()
         if int(micro_batch_size) < 1:
@@ -50,8 +57,8 @@ class UnifiedModelTrainStack(Remote):
         self.num_updates_per_batch = _positive_int(
             name="UnifiedModelTrainStack.num_updates_per_batch", value=num_updates_per_batch
         )
-        _validate_anchor_contract(self.ar_algorithm)
-        _validate_anchor_contract(self.image_algorithm)
+        validate_anchor_contract(self.ar_algorithm)
+        validate_anchor_contract(self.image_algorithm)
         if self.num_updates_per_batch > 1:
             for name, algo in (("ar", self.ar_algorithm), ("image", self.image_algorithm)):
                 if not algo.supports_multi_update:
@@ -61,46 +68,11 @@ class UnifiedModelTrainStack(Remote):
                         f"algorithm ({type(algo).__name__}) sets supports_multi_update=False. Set "
                         f"num_updates_per_batch=1."
                     )
-
-    def _optimizer_step_slices(self, total: int) -> List[List[Tuple[int, int]]]:
-        """Per-optimizer-step lists of absolute ``(start, end)`` micro-batch slices."""
-        steps: List[List[Tuple[int, int]]] = []
-        for mini_start, mini_end in _update_ranges(total_size=total, num_updates=self.num_updates_per_batch):
-            steps.append(
-                [
-                    (mini_start + ms, mini_start + me)
-                    for ms, me in _build_micro_batch_slices(
-                        total_size=mini_end - mini_start, micro_batch_size=self.micro_batch_size
-                    )
-                ]
-            )
-        return steps
-
-    def prepare_segment(self, algorithm: StageAlgorithm, part: Part) -> None:
-        """Freeze one algorithm's π_old anchor once, before the multi-update loop."""
-        if part.segment is None:
-            return
-        if not algorithm.recomputes_anchor:
-            algorithm.prepare_segment(conditions=part.conditions, segment=part.segment)
-            return
-        micro_slices = [sl for step in self._optimizer_step_slices(int(part.batch_size)) for sl in step]
-        if len(micro_slices) == 1:
-            algorithm.prepare_segment(conditions=part.conditions, segment=part.segment)
-            return
-        collected: Dict[str, List[torch.Tensor]] = {field: [] for field in algorithm.anchor_fields}
-        for start, end in micro_slices:
-            micro = part.slice(start, end)
-            algorithm.prepare_segment(conditions=micro.conditions, segment=micro.segment)
-            for field in collected:
-                value = getattr(micro.segment, field, None)
-                if value is None:
-                    raise RuntimeError(
-                        f"UnifiedModelTrainStack.prepare_segment: {type(algorithm).__name__} declares "
-                        f"anchor field {field!r} but a micro-slice produced None."
-                    )
-                collected[field].append(value)
-        for field, parts in collected.items():
-            setattr(part.segment, field, torch.cat(parts, dim=0))
+        self.update_planner = UpdatePlanner(
+            CountPlanner(),
+            shuffle_updates=shuffle_updates,
+            shuffle_seed=shuffle_seed,
+        )
 
     def _backward_part(
         self,
@@ -108,6 +80,7 @@ class UnifiedModelTrainStack(Remote):
         part: Part,
         micro_slices: List[Tuple[int, int]],
         *,
+        order: Optional[torch.Tensor],
         training_progress: float,
     ) -> tuple[TrainStepResult, bool]:
         """Backward one algorithm's Part over the given absolute ``micro_slices``"""
@@ -127,7 +100,7 @@ class UnifiedModelTrainStack(Remote):
 
         single_micro = len(micro_slices) == 1 and micro_slices[0] == (0, bs)
         for start, end in micro_slices:
-            micro_track = part if single_micro else part.slice(start, end)
+            micro_track = part if single_micro else arranged_slice(part, order, start, end)
             loss_scale = (end - start) / float(update_total)
             result = algorithm.compute_loss_and_backward(
                 conditions=micro_track.conditions,
@@ -159,15 +132,17 @@ class UnifiedModelTrainStack(Remote):
         *,
         ar_slices: List[Tuple[int, int]],
         image_slices: List[Tuple[int, int]],
+        ar_order: Optional[torch.Tensor],
+        image_order: Optional[torch.Tensor],
         training_progress: float,
     ) -> Dict[str, TrainStepResult]:
         """One optimizer step: zero_grad → backward BOTH Parts over their mini-batch"""
         self.fsdp_backend.zero_grad()
         ar_result, ar_backward = self._backward_part(
-            self.ar_algorithm, ar_part, ar_slices, training_progress=training_progress
+            self.ar_algorithm, ar_part, ar_slices, order=ar_order, training_progress=training_progress
         )
         image_result, image_backward = self._backward_part(
-            self.image_algorithm, image_part, image_slices, training_progress=training_progress
+            self.image_algorithm, image_part, image_slices, order=image_order, training_progress=training_progress
         )
         results: Dict[str, TrainStepResult] = {"ar": ar_result, "image": image_result}
         any_backward = ar_backward or image_backward
@@ -215,6 +190,7 @@ class UnifiedModelTrainStack(Remote):
         sample: Sample,
         *,
         training_progress: float,
+        rollout_id: int | None = None,
     ) -> Dict[str, TrainStepResult]:
         """Driver-callable: prepare → backward(ar) + backward(image) → ONE step."""
         ar_part = sample.gen_part(ARSamplingParams)
@@ -222,6 +198,12 @@ class UnifiedModelTrainStack(Remote):
         device = self.fsdp_backend._device
         ar_part = ar_part.to_device(device)
         image_part = image_part.to_device(device)
+        (_, ar_steps, ar_order), (_, image_steps, image_order) = self.update_planner.arrange_many(
+            (ar_part, image_part),
+            num_updates=self.num_updates_per_batch,
+            micro_batch_size=self.micro_batch_size,
+            shuffle_step=rollout_id,
+        )
 
         from unirl.utils.profiling import profile_mode
 
@@ -234,11 +216,9 @@ class UnifiedModelTrainStack(Remote):
             )
         profiler = self._train_step_profiler() if scope == "train" else None
         with profiler.record("train_track") if profiler is not None else nullcontext():
-            self.prepare_segment(self.ar_algorithm, ar_part)
-            self.prepare_segment(self.image_algorithm, image_part)
+            prepare_segment_anchors(self.ar_algorithm, ar_part, ar_steps, order=ar_order)
+            prepare_segment_anchors(self.image_algorithm, image_part, image_steps, order=image_order)
 
-            ar_steps = self._optimizer_step_slices(int(ar_part.batch_size))
-            image_steps = self._optimizer_step_slices(int(image_part.batch_size))
             per_update: List[Dict[str, TrainStepResult]] = []
             for u in range(self.num_updates_per_batch):
                 per_update.append(
@@ -247,6 +227,8 @@ class UnifiedModelTrainStack(Remote):
                         image_part,
                         ar_slices=ar_steps[u],
                         image_slices=image_steps[u],
+                        ar_order=ar_order,
+                        image_order=image_order,
                         training_progress=float(training_progress),
                     )
                 )

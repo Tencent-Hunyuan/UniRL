@@ -226,20 +226,43 @@ class BucketedIPCReceiveMixin:
         )
         return self.add_lora(request)
 
+    def _diffrl_parameter_source(self):
+        """Return the loaded module behind AR or diffusion runner wrappers."""
+        queue = [self]
+        seen: set[int] = set()
+        while queue:
+            obj = queue.pop(0)
+            if obj is None or id(obj) in seen:
+                continue
+            seen.add(id(obj))
+            named_parameters = getattr(obj, "named_parameters", None)
+            if callable(named_parameters):
+                try:
+                    next(iter(named_parameters()))
+                except StopIteration:
+                    pass
+                else:
+                    return obj
+            queue.extend(
+                getattr(obj, attr, None)
+                for attr in (
+                    "worker",
+                    "model_runner",
+                    "runner",
+                    "pipeline",
+                    "transformer",
+                    "model",
+                    "bagel",
+                )
+            )
+        return None
+
     def _diffrl_describe_params(
         self,
         names: Optional[list] = None,
     ) -> dict:
         """Return ``{name: (shape_tuple, dtype_str)}`` for the worker's loaded model."""
-        runner = getattr(self, "model_runner", None)
-        if runner is None:
-            return {}
-        param_source = None
-        for attr in ("pipeline", "model"):
-            obj = getattr(runner, attr, None)
-            if obj is not None and hasattr(obj, "named_parameters"):
-                param_source = obj
-                break
+        param_source = self._diffrl_parameter_source()
         if param_source is None:
             return {}
 
@@ -258,15 +281,7 @@ class BucketedIPCReceiveMixin:
         """Return ``{name: short_sha256_hex}`` for the worker's loaded model."""
         import hashlib
 
-        runner = getattr(self, "model_runner", None)
-        if runner is None:
-            return {}
-        param_source = None
-        for attr in ("pipeline", "model"):
-            obj = getattr(runner, attr, None)
-            if obj is not None and hasattr(obj, "named_parameters"):
-                param_source = obj
-                break
+        param_source = self._diffrl_parameter_source()
         if param_source is None:
             return {}
 
@@ -298,15 +313,7 @@ class BucketedIPCReceiveMixin:
             fingerprint_tensor,
         )
 
-        runner = getattr(self, "model_runner", None)
-        if runner is None:
-            return {}
-        param_source = None
-        for attr in ("pipeline", "model"):
-            obj = getattr(runner, attr, None)
-            if obj is not None and hasattr(obj, "named_parameters"):
-                param_source = obj
-                break
+        param_source = self._diffrl_parameter_source()
         if param_source is None:
             return {}
 

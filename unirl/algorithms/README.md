@@ -88,6 +88,13 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   so `stage.replay` still emits log-probs) **with `add_kl_coefficient=false`**. Never pair a
   near-zero `eta` with `add_kl_coefficient=true` — the KL divides by a transition std that
   scales with `eta` (the algorithm raises at init on `eta == 0`, but cannot judge "too small").
+- **AR `loss_agg_mode` is one of `token-mean` | `seq-mean-token-mean` | `seq-mean-token-sum-norm`**
+  (`unirl.types.loss_agg.LossAggMode`; anything else raises at `__init__`). `token-mean` is the
+  optimizer step's global token mean and requires `sp_size: 1`; the `seq-mean-*` modes average
+  per-sequence values. `loss_mask`-inactive tokens never enter a denominator, and a fully-masked
+  sequence still counts as one sequence that contributes 0. GSPO is sequence-level and takes no
+  `loss_agg_mode`. `UnifiedModelTrainStack` weights micro-batches by sample share only, so its
+  `token-mean` is not a global token mean.
 - **AR `sampling_temperature` must equal the rollout `sampling.temperature`** —
   `ARStage.replay` rescales logits by it (`log_softmax(logits / T)`) to match SGLang's
   distribution; when unset it silently falls back to the `ARSamplingParams` default,

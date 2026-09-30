@@ -136,6 +136,7 @@ diffusion:
     micro_batch_size: 1
     max_grad_norm: 1.0
     num_updates_per_batch: 2      # diffusion-side PPO mini-batches; ar stays 1 (GRPO is single-update only)
+    shuffle_updates: true
 
 # ── AR side (Qwen3) — copied from pe_trainside_pickscore.yaml ────────────────────────
 ar:
@@ -256,8 +257,8 @@ rollout:
       # so sglang bounds its DiT-forward / VAE-decode peak memory.
       forward_batch_size: 4
       engine_kwargs:
-        # multimodal_gen sglang has torch_memory_saver on by default → its sleep
-        # already frees; no knob needed here.
+        # SGLang 0.5.19's native sleep path offloads active modules to pinned
+        # CPU memory; no additional memory-saver knob is needed here.
         mem_fraction_static: 0
         skip_server_warmup: true
         disable_cuda_graph: true

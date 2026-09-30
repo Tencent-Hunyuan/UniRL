@@ -14,7 +14,7 @@ from unirl.types.reward import RewardRequest, RewardResponse
 from unirl.types.sample import Sample, _part_with_field
 from unirl.types.sampling import ARSamplingParams
 
-from .base import DifferentiableReward, RewardBackend
+from .base import DifferentiableReward, PromptVideoReward, RewardBackend
 
 logger = logging.getLogger(__name__)
 
@@ -67,8 +67,18 @@ class RewardService(Remote):
         truncated_reward: str = "zero",
         overlong_buffer_len: int = 4096,
         overlong_penalty_factor: float = 1.0,
+        require_prompt_video: bool = True,
     ) -> None:
         super().__init__()
+        if require_prompt_video and isinstance(backend, PromptVideoReward) and not backend.covers_prompt_video():
+            raise ValueError(
+                f"RewardService: backend {type(backend).__name__} gives prompt-to-video alignment no positive "
+                "weight, so a policy trained on it can raise the score without following the prompt "
+                "(imagebind mode='audio_video' collapses both streams together). Use imagebind "
+                "mode='text_video' or 'all', or a T2AVCompositeScorer with a prompt-video term; score it "
+                "under eval_rewards to measure it without training on it; or set "
+                "require_prompt_video: false to train on it anyway."
+            )
         self.backend = backend
         self.truncated_reward = str(truncated_reward)
         self.overlong_buffer_len = int(overlong_buffer_len)
