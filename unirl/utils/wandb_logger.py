@@ -114,6 +114,7 @@ class PhaseTimer:
 
     def __init__(self) -> None:
         self._t0 = time.perf_counter()
+        self._elapsed: Optional[float] = None
         self.phases: Dict[str, float] = {}
 
     @contextmanager
@@ -126,8 +127,13 @@ class PhaseTimer:
             self.phases[name] = self.phases.get(name, 0.0) + (time.perf_counter() - t)
 
     def total(self) -> float:
-        """Wall-clock seconds since construction (the whole step)."""
-        return time.perf_counter() - self._t0
+        """Wall-clock seconds since construction (the whole step), frozen once stopped."""
+        return time.perf_counter() - self._t0 if self._elapsed is None else self._elapsed
+
+    def stop(self) -> None:
+        """Freeze total wall-clock seconds at the current step boundary."""
+        if self._elapsed is None:
+            self._elapsed = time.perf_counter() - self._t0
 
 
 _STEP_PHASE_SPECS = (
@@ -140,9 +146,30 @@ _STEP_PHASE_SPECS = (
     ("stack", "train_track", "train"),
 )
 
+_ASYNC_PHASE_SPECS = (
+    ("_rollout_manager", "collect", "rollout_collect_wait"),
+    ("reward", "score_and_attach", "reward"),
+    ("stack", "train_track", "train"),
+    ("_rollout_manager", "quiesce", "quiesce"),
+    ("_rollout_manager", "finish", "carry_finish"),
+    ("_rollout_manager", "sync_weights", "weight_sync"),
+)
+
+
+@contextmanager
+def async_step_timing(trainer: Any) -> Iterator[PhaseTimer]:
+    """Time one async iteration through required weight publication."""
+    _wrap_phase_methods(trainer, _ASYNC_PHASE_SPECS)
+    timer = trainer._step_timer = PhaseTimer()
+    try:
+        yield timer
+    finally:
+        timer.stop()
+        trainer._step_timer = None
+
 
 def install_phase_timing(trainer: Any) -> None:
-    """Attribute every train step into ``perf/<phase>_time_s`` — no trainer edits."""
+    """Attribute every synchronous train step into ``perf/<phase>_time_s`` — no trainer edits."""
     inner = getattr(trainer, "train_step", None)
     if not callable(inner):
         return
@@ -155,7 +182,8 @@ def install_phase_timing(trainer: Any) -> None:
     @functools.wraps(inner)
     def _first_step(*args, **kwargs):
         trainer._step_timer = PhaseTimer()
-        _wrap_step_collaborators(trainer)
+        _wrap_phase_methods(trainer, _STEP_PHASE_SPECS)
+        _wrap_step_logger(trainer)
         trainer.train_step = _steady_step
         return inner(*args, **kwargs)
 
@@ -165,30 +193,40 @@ def install_phase_timing(trainer: Any) -> None:
 
 def _timed_call(trainer: Any, fn, phase: str):
     """Return ``fn`` wrapped to accumulate its wall-clock under ``phase``."""
+    if getattr(fn, "_unirl_phase_timing_owner", None) is trainer:
+        return fn
 
     @functools.wraps(fn)
     def _timed(*args, **kwargs):
-        with trainer._step_timer.phase(phase):
+        timer = trainer._step_timer
+        if timer is None:
+            return fn(*args, **kwargs)
+        with timer.phase(phase):
             return fn(*args, **kwargs)
 
+    _timed._unirl_phase_timing_owner = trainer
     return _timed
 
 
-def _wrap_step_collaborators(trainer: Any) -> None:
-    """Time each present collaborator method, and teach the logger to emit phases."""
-    for handle_attr, method, phase in _STEP_PHASE_SPECS:
+def _wrap_phase_methods(trainer: Any, specs: tuple[tuple[str, str, str], ...]) -> None:
+    """Time each present collaborator method once per trainer."""
+    for handle_attr, method, phase in specs:
         handle = getattr(trainer, handle_attr, None)
         fn = getattr(handle, method, None)
         if not callable(fn):
             continue
         setattr(handle, method, _timed_call(trainer, fn, phase))
 
+
+def _wrap_step_logger(trainer: Any) -> None:
+    """Teach the logger to emit synchronous phase times."""
     log_inner = trainer.wandb_logger.log_rollout_step
 
     @functools.wraps(log_inner)
     def _log_with_phases(*args, **kwargs):
-        if kwargs.get("phase_times") is None and trainer._step_timer.phases:
-            kwargs["phase_times"] = dict(trainer._step_timer.phases)
+        timer = trainer._step_timer
+        if kwargs.get("phase_times") is None and timer is not None and timer.phases:
+            kwargs["phase_times"] = dict(timer.phases)
         return log_inner(*args, **kwargs)
 
     trainer.wandb_logger.log_rollout_step = _log_with_phases
