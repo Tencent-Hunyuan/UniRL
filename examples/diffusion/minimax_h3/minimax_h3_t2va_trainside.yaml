@@ -133,21 +133,15 @@ reward:
           config:
             _target_: unirl.reward.local.imagebind.ImageBindSpec
             batch_size: 2
-            device: auto
             # audio_video alone has no prompt->video term and rewards the measured
             # black/silent collapse.
             mode: all
-            weights:
-              audio_video: 0.5
-              text_audio: 0.25
-              text_video: 0.25
         clap:
           _target_: unirl.reward.local.clap.CLAPRewardScorer
           base_device: cuda
           config:
             _target_: unirl.reward.local.clap.CLAPSpec
             batch_size: 2
-            device: auto
 
 algorithm:
   _target_: unirl.algorithms.flowgrpo.FlowGRPO
