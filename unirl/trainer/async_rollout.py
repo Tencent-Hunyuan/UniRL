@@ -106,15 +106,14 @@ def rollout_version_metrics(
     *,
     train_version: int,
     output_version: int,
-    num_updates_per_batch: int,
-) -> dict[str, float]:
+) -> dict[str, int]:
     staleness = train_version - output_version
     if staleness < 0:
         raise ValueError(f"rollout batch has future output version {output_version} > train version {train_version}")
     return {
-        "async/output_version": output_version,
+        "async/selected_output_version": output_version,
+        "async/consumer_train_version": train_version,
         "async/staleness_updates": staleness,
-        "async/staleness_batches": staleness / num_updates_per_batch,
     }
 
 
@@ -126,11 +125,11 @@ def training_version_metrics(
     batches_since_sync: int,
 ) -> dict[str, int]:
     return {
-        "async/train_version": train_version,
-        "async/published_version": published_version,
-        "async/publish_lag": train_version - published_version,
+        "async/train_version_after": train_version,
+        "async/published_version_after": published_version,
+        "async/publish_lag_after": train_version - published_version,
         "async/optimizer_updates": optimizer_updates,
-        "async/batches_since_sync": batches_since_sync,
+        "async/batches_since_sync_after": batches_since_sync,
     }
 
 
@@ -258,20 +257,28 @@ class AsyncRolloutTrainerMixin:
                     hard_boundary=hard_boundary,
                 )
                 training_progress = rollout_id / max(1, num_rollouts - 1)
+                version_metrics = rollout_version_metrics(
+                    train_version=self._train_version,
+                    output_version=output_version,
+                )
                 result, mean_reward = self._advantage_and_train(
                     sample,
                     training_progress=training_progress,
                     rollout_id=rollout_id,
                     t0=t0,
-                    extra_metrics=rollout_version_metrics(
-                        train_version=self._train_version,
-                        output_version=output_version,
-                        num_updates_per_batch=self._num_updates_per_batch,
-                    ),
                 )
+                step = rollout_id + 1
+                version_metrics.update(
+                    training_version_metrics(
+                        train_version=self._train_version,
+                        published_version=self._rollout_manager.published_version,
+                        optimizer_updates=result.optimizer_updates,
+                        batches_since_sync=self._batches_since_sync,
+                    )
+                )
+                self.wandb_logger.log_rollout(step, version_metrics)
                 self.wandb_logger.log_progress(rollout_id, num_rollouts, result, mean_reward, logger=logger)
 
-                step = rollout_id + 1
                 eval_due = self.eval_interval > 0 and step % self.eval_interval == 0
                 save_due = save_interval > 0 and (step % save_interval == 0 or step >= num_rollouts)
                 sync_due = step < num_rollouts and self._batches_since_sync >= self._weight_sync_interval

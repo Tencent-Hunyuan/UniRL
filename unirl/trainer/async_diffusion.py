@@ -13,7 +13,6 @@ from unirl.train.stack import TrainStepResult
 from unirl.trainer.async_rollout import (
     AsyncRolloutTrainerMixin,
     resolve_separate_worker_concurrency,
-    training_version_metrics,
 )
 from unirl.trainer.diffusion import DiffusionTrainer
 from unirl.trainer.residency import DEFAULT_RESIDENCY_POLICY
@@ -104,7 +103,6 @@ class AsyncDiffusionTrainer(AsyncRolloutTrainerMixin, DiffusionTrainer):
         training_progress: float,
         rollout_id: int,
         t0: Optional[float] = None,
-        extra_metrics: Optional[dict[str, float]] = None,
     ) -> Tuple[TrainStepResult, float]:
         """Advantage + optimizer updates for a scored ``Sample`` (rewards already attached)."""
         if t0 is None:
@@ -125,21 +123,11 @@ class AsyncDiffusionTrainer(AsyncRolloutTrainerMixin, DiffusionTrainer):
         )
         self._train_version += result.optimizer_updates
         self._batches_since_sync += 1
-        if extra_metrics is not None:
-            extra_metrics.update(
-                training_version_metrics(
-                    train_version=self._train_version,
-                    published_version=self._rollout_manager.published_version,
-                    optimizer_updates=result.optimizer_updates,
-                    batches_since_sync=self._batches_since_sync,
-                )
-            )
         self.wandb_logger.log_rollout_step(
             rollout_id,
             result,
             sample,
             step_time_s=time.perf_counter() - t0,
-            extra_metrics=extra_metrics,
         )
         self._reset_transport_buffers()
         return result, mean_reward
