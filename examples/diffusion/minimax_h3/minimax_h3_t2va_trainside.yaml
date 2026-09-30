@@ -63,8 +63,13 @@ backend:
   fsdp_cfg:
     _target_: unirl.train.configs.FSDPConfig
     param_dtype: bf16
+    # bf16 masters round a ~1e-4 Adam step to zero once |w| > 2^-5.
+    master_dtype: fp32
     cpu_offload: false
     mixed_precision: true
+    # Keep the fp32 timestep embedding intact until each block casts the
+    # post-SiLU value to its bf16 AdaLN projection.
+    cast_forward_inputs: false
     fsdp_mode: full
     reshard_after_forward: true
     activation_checkpointing: true
