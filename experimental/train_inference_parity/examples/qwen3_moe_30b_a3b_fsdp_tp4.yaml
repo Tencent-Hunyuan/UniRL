@@ -1,0 +1,173 @@
+# @package _global_
+
+parity:
+  profile: public_reference
+  train_tp: 4
+  max_prompt_length: 256
+  max_new_tokens: 1024
+  artifact_path: ${oc.env:UNIRL_PARITY_ARTIFACT_PATH,outputs/train_inference_parity/qwen3-moe-tp4.json}
+
+num_devices: 4
+devices_per_node: 4
+batch_size: 4
+num_rollouts: 2
+weight_sync_interval: 1
+eval_interval: 0
+enable_fsdp_offload: true
+adv_normalization_scope: group
+normalize_adv_by_std: true
+
+logging:
+  report_to_wandb: false
+  project_name: unirl-qwen3-moe-parity
+  run_name: qwen3-30b-a3b-tp4-bitwise-n8-r1024
+  entity: null
+  tags: [experimental, qwen3-moe, bitwise, tp4, gsm8k, n8, response-1024]
+
+bundle:
+  _target_: unirl.models.qwen3.bundle.Qwen3Bundle.from_config
+  config:
+    _target_: unirl.models.qwen3.config.Qwen3PipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:QWEN3_MOE_PATH,/dev/shm/Qwen3-30B-A3B}
+    model_revision: ${oc.env:QWEN3_MOE_REVISION,ad44e777bcd18fa416d9da3bd8f70d33ebb85d39}
+    trust_remote_code: true
+    meta_init_transformer: true
+    model_precision: bf16
+    attn_implementation: flash_attention_3
+    autocast_precision: bf16
+    logprob_precision: fp32
+    exact_actor_logprobs: true
+    external_libs:
+      - experimental.train_inference_parity.models.qwen3_moe_30b_a3b.fsdp
+    use_gradient_checkpointing: true
+    max_prompt_length: 256
+
+pipeline:
+  _target_: experimental.train_inference_parity.models.qwen3_moe_30b_a3b.actor.ParityQwen3Pipeline.from_bundle
+  enable_thinking: true
+  max_prompt_length: 256
+  autocast_precision: bf16
+  logprob_precision: fp32
+  exact_actor_logprobs: true
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["Qwen3MoeDecoderLayer"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true
+    use_torch_compile: false
+    forward_prefetch: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 1.0e-6
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.01
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 200
+
+rollout:
+  _target_: unirl.rollout.engine.vllm.engine.VLLMRolloutEngine
+  config:
+    _target_: unirl.rollout.engine.vllm.config.VLLMEngineConfig
+    pretrained_model_ckpt_path: ${oc.env:QWEN3_MOE_PATH,/dev/shm/Qwen3-30B-A3B}
+    model_revision: ${oc.env:QWEN3_MOE_REVISION,ad44e777bcd18fa416d9da3bd8f70d33ebb85d39}
+    tp_size: 4
+    trust_remote_code: true
+    dtype: bfloat16
+    moe_backend: triton
+    quantization: null
+    enforce_eager: true
+    enable_prefix_caching: false
+    enable_chunked_prefill: false
+    logprobs_mode: processed_logprobs
+    max_prompt_length: ${parity.max_prompt_length}
+    request_timeout_s: 7200
+    startup_timeout_s: 300
+    generate_timeout_s: 7200
+    weight_update_timeout_s: 1800
+    health_timeout_s: 60
+    sleep_timeout_s: 180
+    wake_up_timeout_s: 180
+    shutdown_timeout_s: 120
+    max_new_tokens: 1024
+    temperature: 1.0
+    top_p: 1.0
+    top_k: 0
+    # Verification-only: fixed-length responses avoid the EOS boundary. This is
+    # not a recommended general-purpose RL training default.
+    ignore_eos: true
+    chat_template_kwargs:
+      enable_thinking: true
+    engine_kwargs:
+      max_model_len: 1280
+      max_num_batched_tokens: 1280
+      max_num_seqs: 16
+      gpu_memory_utilization: 0.6
+      disable_log_stats: true
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  truncated_reward: keep
+  backend:
+    _target_: unirl.reward.local.mathverify.MathVerifyRewardScorer
+    base_device: cpu
+    config:
+      _target_: unirl.reward.local.mathverify.MathVerifySpec
+
+algorithm:
+  _target_: experimental.train_inference_parity.algorithm.TrainInferenceParityGRPO
+  stage_attr: ar
+  clip_range: 0.2
+  clip_range_high: 0.28
+  clip_schedule: constant
+  loss_agg_mode: seq-mean-token-sum-norm
+  horizon: 1024
+  sampling_temperature: 1.0
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.qwen3.conditions.Qwen3ARConditions
+
+sync:
+  _target_: experimental.train_inference_parity.sync.ParityIPCWeightSync
+  lora_merged: false
+  bucket_size_mb: 640
+  flush_cache: true
+  gpu_memory_headroom_mb: 2048
+  control_timeout_s: 2400
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 1
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: ${oc.env:DATA_PATH}
+      eval_data_path: ${oc.env:EVAL_DATA_PATH}
+      seed: null
+      shuffle: true
+    algorithm:
+      prompts_per_rollout: 4
+
+sampling:
+  _target_: unirl.types.sampling.ARSamplingParams
+  samples_per_prompt: 8
+  temperature: 1.0
+  top_p: 1.0
+  top_k: 0
+  max_new_tokens: 1024

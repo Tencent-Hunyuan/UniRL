@@ -15,6 +15,7 @@ class Qwen3PipelineConfig:
     pretrained_model_ckpt_path: str
     tokenizer_ckpt_path: Optional[str] = None
     trust_remote_code: bool = True
+    model_revision: Optional[str] = None
 
     model_precision: Any = "bf16"
     attn_implementation: Optional[str] = None
@@ -22,6 +23,7 @@ class Qwen3PipelineConfig:
 
     autocast_precision: str = "bf16"
     logprob_precision: str = "fp32"
+    exact_actor_logprobs: bool = False
 
     use_gradient_checkpointing: bool = False
 
@@ -33,6 +35,7 @@ class Qwen3PipelineConfig:
     lora_target_modules: Optional[List[str]] = None
 
     use_value_head: bool = False
+    external_libs: Optional[List[str]] = None
 
     system_instruction: Optional[str] = None
     enable_thinking: bool = False
@@ -40,6 +43,8 @@ class Qwen3PipelineConfig:
 
     def __post_init__(self) -> None:
         validate_precision_type(self.model_precision, field="Qwen3PipelineConfig.model_precision")
+        if self.model_revision is not None and not str(self.model_revision).strip():
+            raise ValueError("Qwen3PipelineConfig.model_revision must be non-empty when set")
 
 
 __all__ = ["Qwen3PipelineConfig"]

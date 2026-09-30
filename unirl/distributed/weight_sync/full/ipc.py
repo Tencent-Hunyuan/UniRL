@@ -354,6 +354,15 @@ class IPCWeightSync(FullWeightSync):
         except BaseException:
             logger.exception("Failed to poison vLLM native IPC runtime")
 
+    def _on_native_publication_committed(
+        self,
+        *,
+        header: dict[str, Any],
+        result: dict[str, Any],
+    ) -> None:
+        """Optional subclass hook after native publication validation."""
+        del header, result
+
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def sync(self) -> None:
         """Select the IPC protocol from the concrete rollout engine."""
@@ -457,6 +466,7 @@ class IPCWeightSync(FullWeightSync):
                 fanout=tp_world_size,
                 flush_cache=self._flush_cache,
             )
+            self._on_native_publication_committed(header=header, result=result)
             self._next_model_version += 1
             success = True
             logger.info(
