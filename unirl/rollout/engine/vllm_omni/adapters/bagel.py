@@ -18,6 +18,7 @@ from unirl.rollout.engine.vllm_omni.backends import (
     OmniRawResult,
     StageSampling,
 )
+from unirl.rollout.engine.vllm_omni.pipelines._shared.interception import read_captures
 from unirl.rollout.engine.vllm_omni.utils import (
     build_image_segment,
     collect_dit_outputs,
@@ -224,8 +225,10 @@ class BagelOutputAdapter(DitOutputAdapter):
         return pils_to_images(pil_images)
 
     def build_conditions(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
-        """Ship raw prompt, shape, and optional source image for trainer-side KV rebuild."""
-        del per_request
+        """Ship raw prompt, shape, optional source image and the worker's token layout for trainer-side KV rebuild."""
+        diff_outputs, frame_groups, _ = collect_dit_outputs(
+            per_request, final_output_type=self.final_output_type, stage_id=self.stage_id, modality=self.modality
+        )
         prompts, input_images = _conditioning_rows(
             sample,
             image_input=self.image_input,
@@ -238,6 +241,7 @@ class BagelOutputAdapter(DitOutputAdapter):
             prompts=prompts,
             input_images=input_images,
             image_shapes=[image_shape] * len(prompts),
+            layouts=[read_captures(out)["layout"] for out, frames in zip(diff_outputs, frame_groups) for _ in frames],
         )
         return conditions.to_dict()
 

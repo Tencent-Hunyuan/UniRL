@@ -159,6 +159,16 @@ in `backend/base.py`; a multi-update-capable algorithm sets
   teachers reload from their paths and the checkpoint pins each by a content sha256, so a
   different teacher set or different weights raises on `load`. A checkpoint trained without
   teachers resumes into any teacher set.
+- **`first_update_ratio_tol` checks the on-policy ratio before the first optimizer
+  step.** Every micro of a rollout's first update is evaluated before the policy
+  moves, so its importance ratio against the algorithm's π_old anchor is 1 up to
+  numerical noise: against the rollout's log-probs when the rollout came from the
+  current weights (`weight_sync_interval: 1`, synchronous trainer), or against the
+  trainer's own replay when the anchor is recomputed (`old_logp_source: replay`).
+  With the key set on the stack, each rank logs a warning when the largest
+  `|ratio - 1|` over those micros passes the tolerance, and DP rank 0's value is
+  reported as `first_update_ratio_dev`; unset, nothing is computed. An algorithm
+  that reports no `ratio_min` / `ratio_max` is rejected at its first update.
 
 ## Profiling → Perfetto
 

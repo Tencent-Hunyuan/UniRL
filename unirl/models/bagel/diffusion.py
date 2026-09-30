@@ -308,6 +308,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
                 input_image,
                 differentiable=True,
             )
+            self._require_rollout_layout(conditions, gen, image_shape)
             return gen, cfg_text, cfg_img, image_shape
         if conditions.has_contexts() and not force_rebuild:
             return conditions.single()
@@ -317,7 +318,21 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
             input_image,
             differentiable=differentiable,
         )
+        self._require_rollout_layout(conditions, gen, image_shape)
         return gen, cfg_text, cfg_img, image_shape
+
+    @staticmethod
+    def _require_rollout_layout(conditions: BagelDiffusionConditions, gen: Any, image_shape: Tuple[int, int]) -> None:
+        """Fail when the rebuilt gen context differs from the layout the rollout worker generated with."""
+        if not conditions.layouts:
+            return
+        height, width = image_shape
+        rebuilt = {"kv_len": int(gen["kv_lens"][0]), "rope": int(gen["ropes"][0]), "height": height, "width": width}
+        require(
+            rebuilt == conditions.layouts[0],
+            "BagelDiffusionStage: rollout and replay built different token layouts for this sample: "
+            f"worker {conditions.layouts[0]}, trainer {rebuilt}.",
+        )
 
     def _build_generation_inputs(
         self,
