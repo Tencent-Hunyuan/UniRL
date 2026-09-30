@@ -253,7 +253,7 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
         self.model = model
         self.autocast_dtype = parse_torch_dtype(autocast_precision, field_name="Qwen3ARStage.autocast_precision")
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="Qwen3ARStage.logprob_precision")
-        self.replay_kernel_options = dict(replay_kernel_options) if replay_kernel_options is not None else None
+        self.replay_kernel_options = replay_kernel_options
         transformer = model.transformer
         if getattr(transformer.forward, "__func__", None) is not _replay_aware_forward:
             transformer.forward = MethodType(_replay_aware_forward, transformer)
