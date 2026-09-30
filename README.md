@@ -80,6 +80,7 @@ rollout engine, and restriction per model — in
 | Stable Diffusion 3.5 | Image diffusion | Text → Image | [`sd3_trainside`](examples/diffusion/sd3/sd3_trainside.yaml) | ✅ |
 | Qwen-Image | Image diffusion | Text → Image | [`qwen_image_trainside`](examples/diffusion/qwen_image/qwen_image_trainside.yaml) | ✅ |
 | Qwen-Image-Edit-2511 | Image diffusion | Text + Image → Image | [`qwen_image_edit_plus_nft`](examples/diffusion/qwen_image_edit_plus/qwen_image_edit_plus_nft.yaml) | ✅ |
+| Qwen-Image-2.1 | Image diffusion | Text → Image | [`qwen_image21_trainside`](examples/diffusion/qwen_image21/qwen_image21_trainside.yaml) | ✅ trainside only |
 | FLUX.2-Klein (4B / 9B) | Image diffusion | Text → Image / Text + Image → Image | [`flux2_klein_trainside`](examples/diffusion/flux2_klein/flux2_klein_trainside.yaml) | ✅ |
 | Z-Image | Image diffusion | Text → Image | [`z_image_trainside`](examples/diffusion/z_image/z_image_trainside.yaml) | ✅ |
 | Boogu-Image-0.1 | Image diffusion | Text → Image | [`boogu_image_trainside`](examples/diffusion/boogu_image/boogu_image_trainside.yaml) | ✅ trainside only |
