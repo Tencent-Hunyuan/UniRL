@@ -106,7 +106,7 @@ class StepStrategy(ABC):
 class SDEStrategy(StepStrategy, ABC):
     """Base class for SDE log probability computation strategies."""
 
-    # True when compute_log_prob drops the Gaussian normalisation terms.
+    # True when compute_log_prob returns the unscaled -(x - mean)**2 (SGLang's rollout_log_prob_no_const).
     log_prob_no_const: ClassVar[bool] = False
 
     @abstractmethod
