@@ -308,6 +308,7 @@ class DiffusionTrainer(BaseTrainer):
         data_source_cfg: DictConfig,
         sampling_cfg: DictConfig,
         sync_cfg: Optional[DictConfig] = None,
+        reward_stack_cfg: Optional[DictConfig] = None,
         logging_cfg: Optional[DictConfig] = None,
         layout: str = "colocate",
         train_fraction: float = 0.5,
@@ -414,6 +415,7 @@ class DiffusionTrainer(BaseTrainer):
         self.weight_sync = None
         # None when the recipe has no ``reward:`` block (validated below).
         self.reward = None
+        self.reward_stack = None
 
         reward_fraction = float(reward_fraction)
         if not 0.0 <= reward_fraction < 1.0:
@@ -430,6 +432,12 @@ class DiffusionTrainer(BaseTrainer):
                 "has no `reward:` block — drop reward_fraction or configure a reward."
             )
         self._reward_is_separate = reward_separate
+        if reward_stack_cfg is not None:
+            self._check_reward_stack_layout(
+                has_reward=reward_cfg is not None,
+                reward_resident=reward_resident,
+                reward_fraction=reward_fraction,
+            )
 
         _preflight_trainside_geometry(
             num_devices=int(self.num_devices),
@@ -465,6 +473,8 @@ class DiffusionTrainer(BaseTrainer):
             with placement(self.pool, fraction=1.0 - reward_fraction, shared_workers=True):
                 self._build_train_side(**train_cfgs)
                 self.rollout = self._build_rollout(rollout_cfg, allow_pipeline=True)
+                if reward_stack_cfg is not None:
+                    self.reward_stack = self._build_reward_stack(reward_stack_cfg)
                 if sync_cfg is not None:
                     self.weight_sync = remote_hydra(sync_cfg, backend=self.backend, rollout=self.rollout)
 
@@ -755,12 +765,40 @@ class DiffusionTrainer(BaseTrainer):
         self._residency.enter(Role.REWARD, preserve=preserve)
         yield
 
+    def _check_reward_stack_layout(self, *, has_reward: bool, reward_resident: bool, reward_fraction: float) -> None:
+        """Reject the layouts in which the stack could not reach the engine and the reward as in-process siblings."""
+        if not has_reward:
+            raise ValueError("reward_stack needs a `reward:` block: it scores every micro through that sibling.")
+        if self._layout != "colocate" or reward_fraction > 0.0:
+            raise ValueError(
+                "reward_stack needs layout='colocate' with reward_fraction=0, so the engine and the reward share a "
+                f"Worker; got layout={self._layout!r}, reward_fraction={reward_fraction}."
+            )
+        if not reward_resident:
+            raise ValueError(
+                "reward_stack needs reward_resident=true: it scores inside the rollout window, where a parked "
+                "reward is never woken."
+            )
+
+    def _build_reward_stack(self, reward_stack_cfg: DictConfig) -> Any:
+        """Build the stack beside the engine it wraps and reject the SP/TP layouts it inherits but cannot serve."""
+        stack = remote_hydra(reward_stack_cfg, rollout=self.rollout, reward=self.reward)
+        if int(stack.dp_size) != int(self.rollout.dp_size):
+            raise ValueError(f"reward_stack dp_size={stack.dp_size} must equal rollout dp_size={self.rollout.dp_size}.")
+        if int(stack.sp_size) != 1 or int(stack.tp_size) != 1:
+            raise ValueError(
+                f"reward_stack needs sp_size=1 and tp_size=1, got sp_size={stack.sp_size}, tp_size={stack.tp_size}: "
+                "every rank of an SP or TP group would score the same shard, or nothing."
+            )
+        return stack
+
     def _generate_with_residency(
         self,
         sample: Sample,
         *,
         sync_weights: bool,
         sleep_rollout: bool,
+        score_inline: bool = False,
     ) -> Sample:
         """Generate with exception-safe EMA and residency cleanup."""
         # No EMA term: _build_residency_planner already rejected the EMA x
@@ -784,7 +822,10 @@ class DiffusionTrainer(BaseTrainer):
             if should_swap_ema:
                 ema_apply_attempted = True
                 self.backend.apply_eval_ema()
-            result = self.rollout.generate(sample)
+            result = self.reward_stack.rollout_and_score(sample) if score_inline else self.rollout.generate(sample)
+            if score_inline:
+                self.reward_stack.collect_garbage()
+                self._log_reward_stack_timing()
             generation_succeeded = True
             return result
         finally:
@@ -798,11 +839,36 @@ class DiffusionTrainer(BaseTrainer):
             if sleep_rollout or not generation_succeeded:
                 self._residency.set(Role.ROLLOUT, False)
 
+    def _log_reward_stack_timing(self) -> None:
+        """Surface the stack's per-rank generate/score split on the driver, where worker logs do not reach."""
+        per_rank = self.reward_stack.timing()
+        keys = ("generate_s", "score_s", "wall_s")
+        peak = {k: max(float(t[k]) for t in per_rank) for k in keys}
+        mean = {k: sum(float(t[k]) for t in per_rank) / len(per_rank) for k in keys}
+        logger.info(
+            "reward stack timing: ranks=%d rows=%d micros=%d generate_s=%.2f/%.2f score_s=%.2f/%.2f "
+            "wall_s=%.2f/%.2f (max/mean)",
+            len(per_rank),
+            int(per_rank[0]["rows"]),
+            int(per_rank[0]["micros"]),
+            peak["generate_s"],
+            mean["generate_s"],
+            peak["score_s"],
+            mean["score_s"],
+            peak["wall_s"],
+            mean["wall_s"],
+        )
+        timer = getattr(self, "_step_timer", None)
+        if timer is not None:
+            timer.phases["stack_generate"] = timer.phases.get("stack_generate", 0.0) + peak["generate_s"]
+            timer.phases["stack_score"] = timer.phases.get("stack_score", 0.0) + peak["score_s"]
+
     def _generate_for_training(self, sample: Sample, *, sync_weights: bool) -> Sample:
         return self._generate_with_residency(
             sample,
             sync_weights=sync_weights,
             sleep_rollout=not self._residency.policy.rollout_resident,
+            score_inline=self.reward_stack is not None,
         )
 
     def _rollout_and_score(
@@ -815,7 +881,7 @@ class DiffusionTrainer(BaseTrainer):
         """One ``rollout → reward → advantage`` pass; training happens per window."""
         sample = self._generate_for_training(sample, sync_weights=sync_weights)
         # With no reward configured, ``part.rewards`` stays None and the block below no-ops.
-        if self.reward is not None:
+        if self.reward is not None and self.reward_stack is None:
             with self._reward_phase():
                 sample = self.reward.score_and_attach(sample)
 

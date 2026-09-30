@@ -76,7 +76,7 @@ class BagelInputAdapter(DitInputAdapter):
             raise ValueError(f"{self.modality}: samples_per_prompt must be >= 1, got {spp}")
         return spp
 
-    def _is_packable_t2i(self, sample: Sample) -> bool:
+    def packs_groups(self, sample: Sample) -> bool:
         """Collapse spp samples into one ``num_outputs_per_prompt=spp`` request."""
         if self.image_input:
             return False
@@ -111,7 +111,7 @@ class BagelInputAdapter(DitInputAdapter):
                 f"({grouped_spp} from grouping, {spp} from diffusion params)."
             )
 
-        pack = self._is_packable_t2i(sample)
+        pack = self.packs_groups(sample)
         if pack:
             prompt_texts = grouped_texts
             num_outputs_per_prompt = spp
@@ -131,7 +131,7 @@ class BagelInputAdapter(DitInputAdapter):
         spp = self._spp(sample)
         gen_part = sample.frontier_gen_part(BagelDiffusionParams)
         diff_params = gen_part.sampling_params
-        pack = self._is_packable_t2i(sample)
+        pack = self.packs_groups(sample)
 
         n_samples = len(gen_part.sample_ids)
         if self.image_input:
@@ -254,6 +254,9 @@ class BagelAdapter(ModelAdapter):
         super().__init__(config, model_config, strategy=strategy, tokenize_fn=tokenize_fn)
         self.input_adapter = BagelInputAdapter(self.modality, image_input=self.image_input)
         self.output_adapter = BagelOutputAdapter(self.modality, image_input=self.image_input)
+
+    def packs_groups(self, sample: Sample) -> bool:
+        return self.input_adapter.packs_groups(sample)
 
     def schedule_policy(self) -> FlowMatchSchedulePolicy:
         """Static-shift FlowMatch σ policy (BAGEL uses no dynamic shifting)."""

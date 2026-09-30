@@ -106,6 +106,10 @@ class ModelAdapter(ABC):
                 f"(e.g. ``sd3``, ``wan21``, ``wan22``, ``hunyuan_image3``).",
             )
 
+    def packs_groups(self, sample: Sample) -> bool:
+        """Whether build_inputs collapses each samples_per_prompt group into one prompt."""
+        return False
+
     def validate_request(self, sample: Sample) -> None:
         """Modality-specific request gate; default accepts everything."""
 

@@ -105,8 +105,13 @@ class ImageAdapter(ModelAdapter):
                 self._sde_label is not None,
                 "build_inputs: SDE mode requires an sde_label (resolved from the strategy)",
             )
+            require(
+                float(diffusion.eta) > 0.0,
+                f"build_inputs: SDE steps {sde_indices} require eta > 0; got eta={diffusion.eta!r}.",
+            )
             kwargs["rollout_sde_type"] = self._sde_label
             kwargs["rollout_noise_level"] = float(diffusion.eta)
+            kwargs["rollout_log_prob_no_const"] = self._sde_log_prob_no_const
             kwargs["rollout_sde_step_indices"] = sde_indices
 
         return kwargs
