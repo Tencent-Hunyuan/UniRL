@@ -147,6 +147,9 @@ class QwenImageT2iAdapter(ModelAdapter):
         self.input_adapter = QwenImageGroupedInputAdapter(self.modality, model_config=model_config)
         self.output_adapter = QwenImageOutputAdapter(self.modality)
 
+    def packs_groups(self, sample: Sample) -> bool:
+        return True
+
     def validate_request(self, sample: Sample) -> None:
         if sample.has_image_input():
             raise ValueError(

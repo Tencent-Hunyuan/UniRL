@@ -64,8 +64,7 @@ merged response.
 
 `RewardStack` (`stack.py`) is an optional role for the diffusion training path, built
 beside the rollout engine on the same Worker. Given one DP shard it slices the frontier
-Part into micros of at least `micro_batch_size` rows, never splitting a generation group
-(the group-batched DiT engines refuse a partial `samples_per_prompt` group), generates
+Part into micros of `micro_batch_size` rows, generates
 and scores each micro in-process through its rollout and reward siblings, and
 concatenates the scored Parts back into one Sample. The driver then skips
 `_reward_phase()`.
@@ -73,9 +72,15 @@ concatenates the scored Parts back into one Sample. The driver then skips
 ```yaml
 reward_stack:
   _target_: unirl.reward.stack.RewardStack
-  micro_batch_size: 8      # rows per micro, extended to the end of the group it would split
+  micro_batch_size: 8      # rows per micro; a micro can be one row unless the engine packs whole groups
   overlap: false           # true: score each micro on a thread while the next ones generate
 ```
+
+A micro can be as small as one row. The exception is an engine that packs a whole
+`samples_per_prompt` group into one request (the vLLM-Omni t2i adapters: SD3, Qwen-Image
+and BAGEL t2i), which the engine reports through `packs_groups(sample)`; there a micro is
+extended to the end of the group it would otherwise split, so the group is the floor.
+BAGEL it2i, SGLang and the trainside engine take micros of any size.
 
 It pays for a reward that costs real time relative to generation, which in practice
 means one served from other GPUs: colocated with PickScore the stack recovers 0.15 s of a

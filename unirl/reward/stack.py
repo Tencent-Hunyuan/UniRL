@@ -45,7 +45,7 @@ class RewardStack(Remote):
         """Fill this shard's frontier Part micro by micro and return it with rewards attached."""
         gen = sample.parts[-1]
         total = int(gen.batch_size)
-        bounds = self._bounds(gen)
+        bounds = self._bounds(gen, whole_groups=self.rollout.packs_groups(sample))
         self._rows, self._micros, self._generate_s, self._score_s = total, len(bounds), 0.0, 0.0
         started = time.perf_counter()
         try:
@@ -63,15 +63,15 @@ class RewardStack(Remote):
         """Collect the micro loop's garbage once the shard has left the worker; training ran 5-8% slower on it."""
         aggressive_empty_cache()
 
-    def _bounds(self, gen: Part) -> List[Tuple[int, int]]:
-        """Micro slices of at least micro_batch_size rows, each extended to the end of the group it would split."""
+    def _bounds(self, gen: Part, *, whole_groups: bool) -> List[Tuple[int, int]]:
+        """Micro slices of micro_batch_size rows, run to the end of a group they would split when whole_groups."""
         total = int(gen.batch_size)
         groups = gen.group_ids
         bounds: List[Tuple[int, int]] = []
         start = 0
         while start < total:
             end = min(start + self.micro_batch_size, total)
-            while end < total and groups[end] == groups[end - 1]:
+            while whole_groups and end < total and groups[end] == groups[end - 1]:
                 end += 1
             bounds.append((start, end))
             start = end
