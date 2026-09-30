@@ -103,3 +103,10 @@ handler in `../../distributed/weight_sync`.
   (`DiffusionNFT`) sees the padding, so both still need one canvas per rollout.
   The adapter sends one call per contiguous run of same-canvas rows; every other
   engine rejects the field by name.
+- **vLLM-Omni BAGEL packs sibling runs, t2i and it2i alike.** With `guidance_scale`
+  and `cfg_img_scale` at 1 or below, each contiguous run of rows from one prompt
+  group is one worker request with `num_outputs_per_prompt` set to the run length:
+  the prompt (and for it2i the source image) is prefilled once and its KV is
+  replicated per sibling. x_T is keyed per row, so a run may be any contiguous
+  part of a group and a `RewardStack` micro may cut a group. Above 1 every row is
+  its own request.

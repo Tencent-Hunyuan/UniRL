@@ -247,7 +247,7 @@ class RLBagelPipeline(BagelPipeline):
         if not isinstance(image, PIL.Image.Image):
             raise TypeError(
                 "RLBagelPipeline: multi_modal_data['image'] must be ONE PIL image "
-                f"(BagelInputAdapter ships one per sample); got {type(image).__name__}."
+                f"(BagelInputAdapter ships one per request); got {type(image).__name__}."
             )
         return image
 
@@ -341,14 +341,12 @@ class RLBagelPipeline(BagelPipeline):
         """Overwrite upstream's trajectory capture with the SDE scheduler's — the ``build_image_segment`` wire."""
         drain_trajectory_into(out, self._sde_scheduler)
 
-    def _is_batchable_t2i(self, req: OmniDiffusionRequest) -> bool:
-        """Packed DiT batching: pure text→image at cfg=1 only. Expects the unwrapped request."""
+    def _is_batchable(self, req: OmniDiffusionRequest) -> bool:
+        """Packed DiT batching: image output at cfg=1 only. Expects the unwrapped request."""
         fp = req.prompt
         if isinstance(fp, dict):
             modalities = fp.get("modalities") or []
             if "text" in modalities:
-                return False
-            if (fp.get("multi_modal_data") or {}).get("image") is not None:
                 return False
         extra = getattr(req.sampling_params, "extra_args", None) or {}
         if "cfg_text_scale" not in extra or "cfg_img_scale" not in extra:
@@ -364,23 +362,23 @@ class RLBagelPipeline(BagelPipeline):
         self._install_rmsnorm_fp32()
         self._pending_layout = None
 
+        # it2i: build the conditioning ourselves (trainside-identical) and inject it,
+        # so upstream's own img2img prefill never runs. No-op for t2i.
+        image = self._source_image(one)
+        if image is not None:
+            self._inject_it2i_contexts(one, image)
+
         spp = getattr(one.sampling_params, "num_outputs_per_prompt", 1)
         if spp > 1:
-            if not self._is_batchable_t2i(one):
+            if not self._is_batchable(one):
                 raise RuntimeError(
-                    f"RLBagelPipeline: num_outputs_per_prompt={spp} requires pure t2i "
+                    f"RLBagelPipeline: num_outputs_per_prompt={spp} requires image output "
                     f"with cfg_text_scale<=1 and cfg_img_scale<=1 present in "
                     f"sampling_params.extra_args. BagelInputAdapter should leave "
                     f"num_outputs_per_prompt=1 (sample-level layout) when packing "
                     f"is disabled."
                 )
             return self._forward_batched(req, spp, **kwargs)
-
-        # it2i: build the conditioning ourselves (trainside-identical) and inject it,
-        # so upstream's own img2img prefill never runs. No-op for t2i.
-        image = self._source_image(one)
-        if image is not None:
-            self._inject_it2i_contexts(one, image)
 
         self._arm_sde(one)
         self._arm_initial_noise(one)

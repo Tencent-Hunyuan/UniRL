@@ -108,7 +108,7 @@ class ModelAdapter(ABC):
             )
 
     def packs_groups(self, sample: Sample) -> bool:
-        """Whether build_inputs collapses each samples_per_prompt group into one prompt."""
+        """Whether build_inputs needs whole samples_per_prompt groups in a request."""
         return False
 
     def validate_request(self, sample: Sample) -> None:

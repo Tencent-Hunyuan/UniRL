@@ -11,11 +11,7 @@ from unirl.models.bagel.conditions import BagelDiffusionConditions
 from unirl.models.bagel.diffusion import BagelDiffusionParams
 from unirl.models.bagel.pipeline import BagelPipeline
 from unirl.rollout.engine.vllm_omni.adapters.base import ModelAdapter, register_adapter
-from unirl.rollout.engine.vllm_omni.adapters.dit import (
-    DitInputAdapter,
-    DitOutputAdapter,
-    _grouped_texts_from_sample,
-)
+from unirl.rollout.engine.vllm_omni.adapters.dit import DitOutputAdapter
 from unirl.rollout.engine.vllm_omni.backends import (
     STAGE_KIND_DIFFUSION,
     GenerateCall,
@@ -66,11 +62,11 @@ def _conditioning_rows(
     return prompt_rows, image_rows
 
 
-class BagelInputAdapter(DitInputAdapter):
+class BagelInputAdapter:
     """Build BAGEL prompt dictionaries and diffusion-stage sampling intent."""
 
     def __init__(self, modality: str, *, image_input: bool = False, model_config: Any) -> None:
-        super().__init__(modality)
+        self.modality = modality
         self.image_input = bool(image_input)
         self.model_config = model_config
 
@@ -90,106 +86,36 @@ class BagelInputAdapter(DitInputAdapter):
         return dataclasses.replace(params, height=height, width=width, init_noise_latent_shape=noise_shape)
 
     def build(self, sample: Sample) -> List[GenerateCall]:
-        """One call per contiguous run of frontier rows that share a canvas."""
+        """One request per sibling run, one call per contiguous requests of equal canvas and size; see the README."""
         gen_part = sample.frontier_gen_part(BagelDiffusionParams)
+        params = gen_part.sampling_params
+        texts, images = _conditioning_rows(sample, image_input=self.image_input, caller=f"{self.modality}.build")
         canvases = sample.canvases()
+        packs = params.guidance_scale <= 1.0 and params.cfg_img_scale <= 1.0
+        owners = gen_part.group_ids if packs else gen_part.sample_ids
+        starts = [row for row in range(len(owners)) if row == 0 or owners[row] != owners[row - 1]]
+        requests = list(zip(starts, starts[1:] + [len(owners)]))
+        shapes = [(canvases[start], end - start) for start, end in requests]
         calls: List[GenerateCall] = []
-        start = 0
-        for end in range(1, len(canvases) + 1):
-            if end < len(canvases) and canvases[end] == canvases[start]:
+        first = 0
+        for last in range(1, len(requests) + 1):
+            if last < len(requests) and shapes[last] == shapes[first]:
                 continue
-            run_params = self._canvas_params(gen_part.sampling_params, *canvases[start])
-            run = sample.replace_frontier(dataclasses.replace(gen_part.slice(start, end), sampling_params=run_params))
-            calls.append(GenerateCall(prompts=self.build_prompts(run), sampling=self.build_sampling(run)))
-            start = end
+            canvas, outputs = shapes[first]
+            rows = gen_part.slice(requests[first][0], requests[last - 1][1])
+            prompts = [
+                {"prompt": texts[start], "multi_modal_data": {"image": images[start]}}
+                if self.image_input
+                else {"prompt": texts[start]}
+                for start, _ in requests[first:last]
+            ]
+            sampling = self._sampling(rows, self._canvas_params(params, *canvas), outputs)
+            calls.append(GenerateCall(prompts=prompts, sampling=sampling))
+            first = last
         return calls
 
-    def _spp(self, sample: Sample) -> int:
-        """``samples_per_prompt`` — the GRPO group size; 1 disables packing."""
-        diff_params = sample.frontier_gen_part(BagelDiffusionParams).sampling_params
-        spp = int(diff_params.samples_per_prompt)
-        if spp < 1:
-            raise ValueError(f"{self.modality}: samples_per_prompt must be >= 1, got {spp}")
-        return spp
-
-    def packs_groups(self, sample: Sample) -> bool:
-        """Collapse spp samples into one ``num_outputs_per_prompt=spp`` request."""
-        if self.image_input:
-            return False
-        if self._spp(sample) <= 1:
-            return False
-        diff_params = sample.frontier_gen_part(BagelDiffusionParams).sampling_params
-        return float(diff_params.guidance_scale) <= 1.0 and float(diff_params.cfg_img_scale) <= 1.0
-
-    def build_prompts(self, sample: Sample) -> List[Any]:
-        """Plain ``{"prompt": text}`` dicts (no ``modalities`` → image path)."""
-        caller = f"{self.modality}.build_prompts"
-        prompt_rows, pil_images = _conditioning_rows(
-            sample,
-            image_input=self.image_input,
-            caller=caller,
-        )
-        gen_part = sample.frontier_gen_part(BagelDiffusionParams)
-        n_samples = len(gen_part.sample_ids)
-        if self.image_input:
-            return [
-                {"prompt": text, "multi_modal_data": {"image": image}}
-                for text, image in zip(prompt_rows, pil_images, strict=True)
-            ]
-        spp = self._spp(sample)
-        grouped_texts, grouped_spp = _grouped_texts_from_sample(
-            sample,
-            caller=caller,
-        )
-        if grouped_spp != spp:
-            raise RuntimeError(
-                f"{self.modality}.build_prompts: inconsistent samples_per_prompt "
-                f"({grouped_spp} from grouping, {spp} from diffusion params)."
-            )
-
-        pack = self.packs_groups(sample)
-        if pack:
-            prompt_texts = grouped_texts
-            num_outputs_per_prompt = spp
-        else:
-            prompt_texts = prompt_rows
-            num_outputs_per_prompt = 1
-
-        if len(prompt_texts) * num_outputs_per_prompt != n_samples:
-            raise RuntimeError(
-                f"{self.modality}.build_prompts: prompt count {len(prompt_texts)} * "
-                f"num_outputs_per_prompt={num_outputs_per_prompt} != diffusion sample count {n_samples}."
-            )
-        return [{"prompt": text} for text in prompt_texts]
-
-    def build_sampling(self, sample: Sample) -> List[StageSampling]:
-        """One diffusion-stage intent with the BAGEL-specific kwargs."""
-        spp = self._spp(sample)
-        gen_part = sample.frontier_gen_part(BagelDiffusionParams)
-        diff_params = gen_part.sampling_params
-        pack = self.packs_groups(sample)
-
-        n_samples = len(gen_part.sample_ids)
-        if self.image_input:
-            n_prompts = n_samples
-        else:
-            grouped_texts, grouped_spp = _grouped_texts_from_sample(
-                sample,
-                caller=f"{self.modality}.build_sampling",
-            )
-            if grouped_spp != spp:
-                raise RuntimeError(
-                    f"{self.modality}.build_sampling: inconsistent samples_per_prompt "
-                    f"({grouped_spp} from grouping, {spp} from diffusion params)."
-                )
-            n_prompts = len(grouped_texts) if pack else n_samples
-        num_outputs_per_prompt = spp if pack else 1
-        if n_prompts * num_outputs_per_prompt != n_samples:
-            raise RuntimeError(
-                f"{self.modality}.build_sampling: prompt count {n_prompts} * "
-                f"num_outputs_per_prompt={num_outputs_per_prompt} != diffusion sample count {n_samples}."
-            )
-
+    def _sampling(self, gen_part: Any, diff_params: BagelDiffusionParams, outputs: int) -> List[StageSampling]:
+        """One diffusion-stage intent with the BAGEL-specific kwargs; ``outputs`` images per request."""
         num_steps = int(diff_params.num_inference_steps)
         diff_kwargs: Dict[str, Any] = dict(
             height=int(diff_params.height),
@@ -199,7 +125,7 @@ class BagelInputAdapter(DitInputAdapter):
             eta=float(diff_params.eta),
             return_trajectory_latents=True,
             return_trajectory_decoded=False,
-            num_outputs_per_prompt=num_outputs_per_prompt,
+            num_outputs_per_prompt=outputs,
         )
         seed = diff_params.seed
         if seed is not None:
@@ -293,9 +219,6 @@ class BagelAdapter(ModelAdapter):
         super().__init__(config, model_config, strategy=strategy, tokenize_fn=tokenize_fn)
         self.input_adapter = BagelInputAdapter(self.modality, image_input=self.image_input, model_config=model_config)
         self.output_adapter = BagelOutputAdapter(self.modality, image_input=self.image_input, model_config=model_config)
-
-    def packs_groups(self, sample: Sample) -> bool:
-        return self.input_adapter.packs_groups(sample)
 
     def schedule_policy(self) -> FlowMatchSchedulePolicy:
         """Static-shift FlowMatch σ policy (BAGEL uses no dynamic shifting)."""
