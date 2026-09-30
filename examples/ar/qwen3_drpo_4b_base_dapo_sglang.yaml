@@ -79,6 +79,8 @@ pipeline:
   # per-update drift signal, and ~1/3 of the measured rollout↔replay absdiff
   # 0.018→0.0135). verl stores fp32 (flash-attn xentropy) — parity. Run uhaufzac.
   logprob_precision: fp32
+  replay_kernel_options:
+    BACKEND: TRITON
 
 backend:
   _target_: unirl.train.backend.fsdp.FSDPBackend
@@ -135,8 +137,8 @@ rollout:
     engine_kwargs:
       # Leave rl_on_policy_target unset for the reference VERL-comparison path:
       # this keeps SGLang's native sampler/model kernels. For strict rollout vs
-      # FSDP replay diagnostics, add rl_on_policy_target=fsdp and select the
-      # inverse_cdf deterministic sampler; see unirl/rollout/README.md.
+      # FSDP replay diagnostics, add rl_on_policy_target=fsdp;
+      # see unirl/rollout/README.md.
       # Colocate full-FT preset — see unirl/rollout/README.md (SGLang AR knobs).
       # FULL fine-tuning: lower the SRT KV reservation to give FSDP headroom for
       # the per-rollout full-weight all-gather. No LoRA pool — full dense weights

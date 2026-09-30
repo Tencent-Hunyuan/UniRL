@@ -52,8 +52,6 @@ class SGLangEngineConfig(BaseEngineConfig):
 
     concurrency: int = 8
 
-    deterministic_sampler: str = "sglang"
-
     enable_memory_saver: Optional[bool] = None
     enable_weights_cpu_backup: Optional[bool] = None
     skip_server_warmup: Optional[bool] = None
@@ -119,13 +117,6 @@ class SGLangEngineConfig(BaseEngineConfig):
         require(
             self.concurrency >= 1,
             f"SGLangEngineConfig.concurrency must be >= 1; got {self.concurrency!r}",
-        )
-
-        self.deterministic_sampler = str(self.deterministic_sampler).strip().lower()
-        require(
-            self.deterministic_sampler in ("sglang", "inverse_cdf"),
-            "SGLangEngineConfig.deterministic_sampler must be 'sglang' or "
-            f"'inverse_cdf'; got {self.deterministic_sampler!r}",
         )
 
         self.backend = str(self.backend).strip().lower()

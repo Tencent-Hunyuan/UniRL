@@ -27,6 +27,7 @@ class Qwen3Pipeline(Pipeline):
         ar: Optional[Qwen3ARStage] = None,
         autocast_precision: str = "bf16",
         logprob_precision: str = "fp32",
+        replay_kernel_options: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__()
         self.bundle = bundle
@@ -34,7 +35,12 @@ class Qwen3Pipeline(Pipeline):
         self.ar = (
             ar
             if ar is not None
-            else Qwen3ARStage(model=bundle, autocast_precision=autocast_precision, logprob_precision=logprob_precision)
+            else Qwen3ARStage(
+                model=bundle,
+                autocast_precision=autocast_precision,
+                logprob_precision=logprob_precision,
+                replay_kernel_options=replay_kernel_options,
+            )
         )
 
     @classmethod
@@ -45,6 +51,7 @@ class Qwen3Pipeline(Pipeline):
         system_instruction: Optional[str] = None,
         autocast_precision: str = "bf16",
         logprob_precision: str = "fp32",
+        replay_kernel_options: Optional[Dict[str, Any]] = None,
         enable_thinking: bool = False,
         max_prompt_length: int = 4096,
     ) -> "Qwen3Pipeline":
@@ -59,6 +66,7 @@ class Qwen3Pipeline(Pipeline):
             model=bundle,
             autocast_precision=autocast_precision,
             logprob_precision=logprob_precision,
+            replay_kernel_options=replay_kernel_options,
         )
         return cls(
             bundle=bundle,
@@ -82,6 +90,7 @@ class Qwen3Pipeline(Pipeline):
             model=bundle,
             autocast_precision=config.autocast_precision,
             logprob_precision=config.logprob_precision,
+            replay_kernel_options=config.replay_kernel_options,
         )
         return cls(bundle=bundle, chat_template=chat_template, ar=ar)
 

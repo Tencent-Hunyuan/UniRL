@@ -71,6 +71,10 @@ it is the authoritative bundle / pipeline / stage / conditions contract.
 
 ## Gotchas
 
+- **Qwen3 replay kernel options are recipe-owned.**
+  `pipeline.replay_kernel_options` is forwarded only to replay model calls.
+  The DRPO recipe selects `BACKEND: TRITON` on PyTorch 2.13 to avoid flex-decoding
+  selection for short padded queries; revalidate this choice on a PyTorch upgrade.
 - **`trainable_module()` is on the stage, not the bundle.** The backend reaches the
   model via `getattr(bundle, trainable_attr)`; engines via
   `getattr(pipeline, stage_attr).trainable_module()`. Keep both pointing at the same

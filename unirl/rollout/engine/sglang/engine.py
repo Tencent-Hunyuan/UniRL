@@ -13,7 +13,6 @@ from unirl.rollout.engine.base import BaseRolloutEngine
 from unirl.rollout.engine.sglang.adapters import get_adapter
 from unirl.rollout.engine.sglang.backends import HTTPBackend, NativeBackend
 from unirl.rollout.engine.sglang.config import SGLangEngineConfig, SGLangPorts
-from unirl.rollout.engine.sglang.plugin import configure_deterministic_sampler
 from unirl.rollout.engine.sglang.utils import deterministic_inference_enabled, resolve_sampling
 from unirl.rollout.engine.sglang.weight_sync import WeightSync
 from unirl.types.sample import Sample
@@ -89,7 +88,6 @@ class SGLangRolloutEngine(BaseRolloutEngine):
             return
 
         engine_kwargs: Dict[str, Any] = dict(config.engine_kwargs or {})
-        configure_deterministic_sampler(config.deterministic_sampler)
 
         from transformers import AutoTokenizer
 

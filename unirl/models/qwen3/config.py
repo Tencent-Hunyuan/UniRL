@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 from unirl.config.validation import validate_precision_type
 
@@ -22,6 +22,7 @@ class Qwen3PipelineConfig:
 
     autocast_precision: str = "bf16"
     logprob_precision: str = "fp32"
+    replay_kernel_options: Optional[Dict[str, Any]] = None
 
     use_gradient_checkpointing: bool = False
 

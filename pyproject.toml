@@ -45,10 +45,6 @@ dependencies = [
 [project.entry-points."vllm_omni.general_plugins"]
 unirl_runtime = "unirl.rollout.engine.vllm_omni.plugin:register_unirl_runtime"
 
-# SGLang loads this in the parent and every spawned scheduler process.
-[project.entry-points."sglang.srt.plugins"]
-unirl_runtime = "unirl.rollout.engine.sglang.plugin:register_unirl_runtime"
-
 [project.optional-dependencies]
 # sglang pinned to the upstream release the UniRL sglang patch package
 # (unirl/rollout/engine/sglang_diffusion/_patches/) targets. sglang >=0.5.11 is
