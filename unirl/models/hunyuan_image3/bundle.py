@@ -354,12 +354,23 @@ class HunyuanImage3Bundle(Bundle):
                 logger.info("expert-parallel: hooked root params for direct all-gather: %d", n_hooked)
 
         if _current_rank() == 0:
-            _bl_checked, _bl_bad = 0, 0
+            _bl_checked, _bl_bad, _bl_cpu_offloaded = 0, 0, 0
             for name, p in self.transformer.named_parameters(remove_duplicate=False):
                 if ".base_layer." not in name:
                     continue
                 _bl_checked += 1
-                if p.is_meta or not p.data.isfinite().all():
+                if p.is_meta:
+                    _bl_bad += 1
+                    continue
+                # FSDP2's CPU offload splits DTensor storage mid-construction; the state-dict load already checked them.
+                try:
+                    is_finite = bool(p.data.isfinite().all())
+                except RuntimeError as exc:
+                    if "storage on different device" not in str(exc):
+                        raise
+                    _bl_cpu_offloaded += 1
+                    continue
+                if not is_finite:
                     _bl_bad += 1
             if _bl_checked > 0:
                 if _bl_bad > 0:
@@ -370,8 +381,9 @@ class HunyuanImage3Bundle(Bundle):
                     )
                 print(
                     f"[Bug B fix] HunyuanImage3Bundle.materialize: "
-                    f"verified {_bl_checked} LoRA base_layer params loaded "
-                    f"finite ✓",
+                    f"verified {_bl_checked - _bl_cpu_offloaded} LoRA base_layer "
+                    f"params loaded finite; deferred {_bl_cpu_offloaded} "
+                    f"CPU-offloaded shard(s) ✓",
                     flush=True,
                 )
 

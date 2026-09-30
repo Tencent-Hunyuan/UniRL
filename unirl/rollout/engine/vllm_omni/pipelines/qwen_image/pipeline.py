@@ -12,6 +12,7 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image import QwenImagePipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.size_utils import normalize_min_aligned_size
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 from unirl.rollout.engine.vllm_omni.pipelines._shared.flow_match_sde_scheduler import (
     FlowMatchSDEDiscreteScheduler,
@@ -19,15 +20,20 @@ from unirl.rollout.engine.vllm_omni.pipelines._shared.flow_match_sde_scheduler i
 from unirl.rollout.engine.vllm_omni.pipelines._shared.interception import (
     detach_cpu,
     drain_trajectory_into,
+    finalize_output,
     inject_latents,
     make_sde_scheduler,
     resolve_request_noise,
-    stamp_custom_output,
+    single_request,
+    stamp_capture,
 )
 
 
 class RLQwenImagePipeline(QwenImagePipeline):
     """Qwen-Image pipeline with the RL interception protocol installed."""
+
+    # Upstream opts into request batching; RL rollout does not — see ``single_request``.
+    supports_request_batch = False
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         super().__init__(od_config=od_config, prefix=prefix)
@@ -85,11 +91,12 @@ class RLQwenImagePipeline(QwenImagePipeline):
 
     def prepare_latents(self, *args, **kwargs):  # type: ignore[override]
         """Initial-noise injection: the driver's ``[B, C, H, W]`` x_T is packed to ``[B, S, C*4]``. Consume-once."""
+        upstream = super().prepare_latents
         noise = self._pending_initial_noise
         if noise is not None:
             self._pending_initial_noise = None
-            args, kwargs = inject_latents(args, kwargs, self._pack_pending_noise(noise, args))
-        return super().prepare_latents(*args, **kwargs)
+            args, kwargs = inject_latents(upstream, args, kwargs, self._pack_pending_noise(noise, args))
+        return upstream(*args, **kwargs)
 
     def _pack_pending_noise(self, noise: torch.Tensor, args: tuple) -> torch.Tensor:
         """Spatial ``[B, C, h, w]`` x_T → packed ``[B, S, C*4]``, validated against the call site's grid geometry."""
@@ -132,25 +139,29 @@ class RLQwenImagePipeline(QwenImagePipeline):
 
     def _harvest_conditioning(self, out: DiffusionOutput) -> None:
         if self._captured_conditioning:
-            stamp_custom_output(out, "text_capture", self._captured_conditioning)
+            stamp_capture(out, "text_capture", self._captured_conditioning)
 
-    def forward(self, req: OmniDiffusionRequest, **kwargs) -> DiffusionOutput:
+    def forward(self, req: DiffusionRequestBatch, **kwargs) -> list[DiffusionOutput]:
+        """Single-request batch in, one-element list out — see ``single_request``."""
+        one = single_request(req, caller="RLQwenImagePipeline.forward")
         self._install_sde_scheduler()
         self._install_conditioning_tap()
 
-        self._arm_sde(req)
-        self._arm_initial_noise(req)
+        self._arm_sde(one)
+        self._arm_initial_noise(one)
         self._arm_conditioning_tap()
-        height = req.sampling_params.height or self.default_sample_size * self.vae_scale_factor
-        width = req.sampling_params.width or self.default_sample_size * self.vae_scale_factor
+        height = one.sampling_params.height or self.default_sample_size * self.vae_scale_factor
+        width = one.sampling_params.width or self.default_sample_size * self.vae_scale_factor
         height, width = normalize_min_aligned_size(height, width, self.vae_scale_factor * 2)
         self._harvest_hw = (int(height), int(width))
 
-        out = super().forward(req, **kwargs)
+        outs = super().forward(req, **kwargs)
 
+        out = outs[0]
         self._harvest_trajectory(out)
         self._harvest_conditioning(out)
-        return out
+        finalize_output(out)
+        return outs
 
 
 __all__ = ["RLQwenImagePipeline"]

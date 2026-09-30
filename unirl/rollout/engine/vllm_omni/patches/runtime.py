@@ -2,24 +2,18 @@
 
 from __future__ import annotations
 
-import importlib.util
 import os
 import signal
 import threading
 import time
+from functools import wraps
 from multiprocessing.process import BaseProcess as _MpBaseProcess
 
 import torch
 from msgspec import field
-
-try:
-    from vllm.lora.lora_model import LoRAModel
-except ImportError:
-    from vllm.lora.models import LoRAModel  # type: ignore[no-redef]
-
+from vllm.lora.lora_model import LoRAModel
 from vllm.lora.lora_weights import LoRALayerWeights, PackedLoRALayerWeights
 from vllm.lora.peft_helper import PEFTHelper
-from vllm.lora.utils import get_adapter_absolute_path
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager, logger
 from vllm_omni.lora.request import LoRARequest as OmniLoRARequest
 
@@ -135,52 +129,25 @@ def wrap_mp_process_for_children() -> None:
     setattr(_MpBaseProcess, _WRAP_SENTINEL, True)
 
 
-def patch_qwen3_omni_thinker_lora() -> None:
-    """Backport Qwen3-Omni Thinker LoRA support to vLLM-Omni 0.20."""
-    module_name = "vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker"
-    if importlib.util.find_spec(module_name) is None:
-        return
-
-    from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
-        Qwen3OmniMoeThinkerForConditionalGeneration,
-        Qwen3OmniMoeThinkerMultiModalProcessor,
-    )
-
-    from unirl.rollout.engine.vllm_omni.patches.compat_qwen3_omni import (
-        patch_qwen3_omni_audio_truncation,
-        patch_qwen3_omni_audio_video_mrope,
-        patch_qwen3_omni_thinker_class,
-    )
-
-    patch_qwen3_omni_thinker_class(Qwen3OmniMoeThinkerForConditionalGeneration)
-    patch_qwen3_omni_audio_video_mrope(Qwen3OmniMoeThinkerForConditionalGeneration)
-    patch_qwen3_omni_audio_truncation(Qwen3OmniMoeThinkerMultiModalProcessor)
-
-
 def patch_dit_lora_loader() -> None:
     """Patch ``DiffusionLoRAManager._load_adapter`` (DiT stage) to support in-memory tensors."""
+    original = DiffusionLoRAManager._load_adapter
+    if getattr(original, "_diffrl_tensor_lora_loader", False):
+        return
 
-    def hijack__load_adapter(self, lora_request: OmniTensorLoRARequest) -> tuple[LoRAModel, PEFTHelper]:
+    def hijack__load_adapter(
+        self,
+        lora_request: OmniTensorLoRARequest,
+        _orig=original,
+    ) -> tuple[LoRAModel, PEFTHelper]:
+        if not isinstance(lora_request, OmniTensorLoRARequest):
+            return _orig(self, lora_request)
         if not self._expected_lora_modules:
             raise ValueError("No supported LoRA modules found in the diffusion pipeline.")
 
         logger.debug("Supported LoRA modules: %s", self._expected_lora_modules)
 
-        lora_tensors = None
-
-        if isinstance(lora_request, OmniTensorLoRARequest):
-            peft_config = lora_request.peft_config
-            lora_tensors = lora_request.lora_tensors
-            peft_helper = PEFTHelper.from_dict(peft_config)
-        else:
-            lora_path = get_adapter_absolute_path(lora_request.lora_path)
-            logger.debug("Resolved LoRA path: %s", lora_path)
-
-            peft_helper = PEFTHelper.from_local_dir(
-                lora_path,
-                max_position_embeddings=None,
-                tensorizer_config_dict=lora_request.tensorizer_config_dict,
-            )
+        peft_helper = PEFTHelper.from_dict(lora_request.peft_config or {})
 
         logger.info(
             "Loaded PEFT config: r=%d, lora_alpha=%d, target_modules=%s",
@@ -189,28 +156,15 @@ def patch_dit_lora_loader() -> None:
             peft_helper.target_modules,
         )
 
-        if isinstance(lora_request, OmniTensorLoRARequest):
-            lora_model = LoRAModel.from_lora_tensors(
-                tensors=lora_tensors,
-                peft_helper=peft_helper,
-                lora_model_id=lora_request.lora_int_id,
-                device="cpu",
-                dtype=self.dtype,
-                model_vocab_size=None,
-                weights_mapper=None,
-            )
-        else:
-            lora_model = LoRAModel.from_local_checkpoint(
-                lora_path,
-                expected_lora_modules=self._expected_lora_modules,
-                peft_helper=peft_helper,
-                lora_model_id=lora_request.lora_int_id,
-                device="cpu",
-                dtype=self.dtype,
-                model_vocab_size=None,
-                tensorizer_config_dict=lora_request.tensorizer_config_dict,
-                weights_mapper=None,
-            )
+        lora_model = LoRAModel.from_lora_tensors(
+            tensors=lora_request.lora_tensors or {},
+            peft_helper=peft_helper,
+            lora_model_id=lora_request.lora_int_id,
+            device="cpu",
+            dtype=self.dtype,
+            model_vocab_size=None,
+            weights_mapper=None,
+        )
 
         logger.info(
             "Loaded LoRA model: id=%d, num_modules=%d, modules=%s",
@@ -224,6 +178,7 @@ def patch_dit_lora_loader() -> None:
 
         return lora_model, peft_helper
 
+    hijack__load_adapter._diffrl_tensor_lora_loader = True  # type: ignore[attr-defined]
     setattr(DiffusionLoRAManager, "_load_adapter", hijack__load_adapter)
 
 
@@ -339,6 +294,9 @@ def patch_ar_lora_loader() -> None:
 
         model = self._adapter_manager.model
         hf_to_vllm_mapper = getattr(model, "hf_to_vllm_mapper", None)
+        if hf_to_vllm_mapper is not None:
+            hf_to_vllm_mapper = hf_to_vllm_mapper.get_unstacked_mapper()
+        lora_skip_prefixes = getattr(model, "lora_skip_prefixes", None)
         lora = self._lora_model_cls.from_lora_tensors(
             tensors=lora_request.lora_tensors or {},
             peft_helper=peft_helper,
@@ -347,6 +305,7 @@ def patch_ar_lora_loader() -> None:
             dtype=self.lora_config.lora_dtype,
             model_vocab_size=self.vocab_size,
             weights_mapper=hf_to_vllm_mapper,
+            skip_prefixes=lora_skip_prefixes,
         )
         return lora
 
@@ -423,7 +382,6 @@ def patch_fp32_skip() -> None:
 
     for _modname in (
         "vllm.lora.lora_model",
-        "vllm.lora.models",
         "vllm.lora.model_manager",
         "vllm.lora.worker_manager",
     ):
@@ -433,6 +391,151 @@ def patch_fp32_skip() -> None:
             continue
         if getattr(_mod, "from_layer", None) is _orig_from_layer:
             _mod.from_layer = _patched_from_layer
+
+
+def patch_hv15_packed_lora_mapping() -> None:
+    """Expose HV1.5's packed QKV mapping to the diffusion LoRA manager."""
+    try:
+        from vllm_omni.diffusion.models.hunyuan_video.hunyuan_video_15_transformer import (
+            HunyuanVideo15Transformer3DModel,
+        )
+    except (ImportError, AttributeError):
+        return
+
+    sentinel = "_diffrl_hv15_packed_lora_mapping"
+    if getattr(HunyuanVideo15Transformer3DModel, sentinel, False):
+        return
+    if not getattr(HunyuanVideo15Transformer3DModel, "stacked_params_mapping", None):
+        HunyuanVideo15Transformer3DModel.stacked_params_mapping = (
+            (".to_qkv", ".to_q", "q"),
+            (".to_qkv", ".to_k", "k"),
+            (".to_qkv", ".to_v", "v"),
+            (".add_kv_proj", ".add_q_proj", "q"),
+            (".add_kv_proj", ".add_k_proj", "k"),
+            (".add_kv_proj", ".add_v_proj", "v"),
+        )
+    setattr(HunyuanVideo15Transformer3DModel, sentinel, True)
+
+
+class _HV15TorchLinearWithLoRA(torch.nn.Module):
+    """Apply one in-memory LoRA adapter to an ordinary HV1.5 ``nn.Linear``."""
+
+    n_slices = 1
+
+    def __init__(self, base_layer: torch.nn.Linear) -> None:
+        super().__init__()
+        self.base_layer = base_layer
+        self.register_buffer("_lora_a", None, persistent=False)
+        self.register_buffer("_lora_b", None, persistent=False)
+
+    def create_lora_weights(self, *_args, **_kwargs) -> None:
+        """Match the manager's layer protocol when its rank buffer grows."""
+        self.reset_lora(0)
+
+    def reset_lora(self, index: int) -> None:
+        if index != 0:
+            raise IndexError(f"HV1.5 torch-linear LoRA only supports adapter slot 0, got {index}")
+        self._lora_a = None
+        self._lora_b = None
+
+    def set_lora(
+        self,
+        index: int,
+        lora_a: torch.Tensor,
+        lora_b: torch.Tensor,
+    ) -> None:
+        if index != 0:
+            raise IndexError(f"HV1.5 torch-linear LoRA only supports adapter slot 0, got {index}")
+        if not (
+            lora_a.ndim == lora_b.ndim == 2
+            and lora_a.shape[1] == self.base_layer.in_features
+            and lora_b.shape == (self.base_layer.out_features, lora_a.shape[0])
+        ):
+            raise ValueError(
+                "HV1.5 torch-linear LoRA shape mismatch: "
+                f"A={tuple(lora_a.shape)}, B={tuple(lora_b.shape)}; expected "
+                f"A=[rank, {self.base_layer.in_features}], "
+                f"B=[{self.base_layer.out_features}, rank]"
+            )
+        self._lora_a = lora_a.detach().to(self.base_layer.weight)
+        self._lora_b = lora_b.detach().to(self.base_layer.weight)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        result = self.base_layer(hidden_states)
+        if self._lora_a is None or self._lora_b is None:
+            return result
+        lora_input = hidden_states.to(self._lora_a.dtype)
+        lora_hidden = torch.nn.functional.linear(lora_input, self._lora_a)
+        return result + torch.nn.functional.linear(lora_hidden, self._lora_b)
+
+
+def patch_hv15_refiner_torch_linear_lora() -> None:
+    """Include HV1.5 token-refiner ``nn.Linear`` layers in vLLM's LoRA policy."""
+    try:
+        from vllm.lora.layers import BaseLayerWithLoRA
+        from vllm.lora.utils import replace_submodule
+        from vllm_omni.diffusion.lora.utils import _match_target_modules
+        from vllm_omni.diffusion.models.hunyuan_video.hunyuan_video_15_transformer import (
+            HunyuanVideo15Transformer3DModel,
+        )
+    except (ImportError, AttributeError):
+        return
+
+    original_replace = DiffusionLoRAManager._replace_layers_with_lora
+    if getattr(original_replace, "_diffrl_hv15_refiner_torch_linear_lora", False):
+        return
+
+    @wraps(original_replace)
+    def _patched_replace(self, peft_helper):
+        original_replace(self, peft_helper)
+        transformer = getattr(self.pipeline, "transformer", None)
+        if not isinstance(transformer, HunyuanVideo15Transformer3DModel):
+            return
+
+        blocks = transformer.context_embedder.token_refiner.refiner_blocks
+        prefix = "context_embedder.token_refiner.refiner_blocks"
+        target_modules = getattr(peft_helper, "target_modules", None)
+        target_pattern = target_modules if isinstance(target_modules, str) and target_modules else None
+        target_list = target_modules if isinstance(target_modules, list) and target_modules else None
+
+        def _matches_target(module_name: str) -> bool:
+            if target_pattern is not None:
+                import regex as re
+
+                return re.search(target_pattern, module_name) is not None
+            return target_list is None or _match_target_modules(module_name, target_list)
+
+        matched = []
+        for block_index, block in enumerate(blocks):
+            for target_path, module in block.named_modules(remove_duplicate=False):
+                module_name = f"{prefix}.{block_index}.{target_path}"
+                full_module_name = f"transformer.{module_name}"
+                if (
+                    target_path
+                    and _matches_target(full_module_name)
+                    and isinstance(
+                        module,
+                        (torch.nn.Linear, _HV15TorchLinearWithLoRA, BaseLayerWithLoRA),
+                    )
+                ):
+                    matched.append((module_name, full_module_name, module))
+
+        newly_wrapped = 0
+        for module_name, full_module_name, module in matched:
+            if isinstance(module, torch.nn.Linear):
+                module = _HV15TorchLinearWithLoRA(module)
+                replace_submodule(transformer, module_name, module)
+                newly_wrapped += 1
+            self._lora_modules[full_module_name] = module
+
+        if newly_wrapped:
+            logger.info(
+                "Wrapped %d HV1.5 token-refiner nn.Linear layers for online LoRA",
+                newly_wrapped,
+            )
+
+    _patched_replace._diffrl_hv15_refiner_torch_linear_lora = True
+    DiffusionLoRAManager._replace_layers_with_lora = _patched_replace
 
 
 def patch_lora_request_passthrough() -> None:
@@ -519,136 +622,6 @@ def patch_sigmas_passthrough() -> None:
         pass
 
 
-def patch_per_request_ar_seed() -> None:
-    """Stamp a fresh os.urandom seed onto every AR SamplingParams in add_request's sampling_params_list."""
-    try:
-        import msgspec as _msgspec
-        from vllm import SamplingParams as VLLMSamplingParams
-        from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
-    except (ImportError, AttributeError):
-        return
-
-    _orig = AsyncOmniEngine.add_request
-    if getattr(_orig, "_diffrl_per_request_ar_seed", False):
-        return
-
-    import os as _os
-
-    def _patched(self, *args, sampling_params_list=None, _orig=_orig, **kwargs):
-        if sampling_params_list is not None:
-            sampling_params_list = [
-                _msgspec.structs.replace(sp, seed=int.from_bytes(_os.urandom(4), "big"))
-                if isinstance(sp, VLLMSamplingParams) and getattr(sp, "seed", None) is None
-                else sp
-                for sp in sampling_params_list
-            ]
-        return _orig(self, *args, sampling_params_list=sampling_params_list, **kwargs)
-
-    _patched._diffrl_per_request_ar_seed = True  # type: ignore[attr-defined]
-    AsyncOmniEngine.add_request = _patched
-
-
-def patch_master_port_unstrip() -> None:
-    """Keep ``master_port`` alive through ``AsyncOmniEngine._strip_single_engine_args``."""
-    try:
-        from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
-
-        _orig = AsyncOmniEngine._strip_single_engine_args
-        if getattr(_orig, "_diffrl_master_port_unstrip", False):
-            return
-
-        def _patched_strip(kwargs, _orig=_orig):
-            out = _orig(kwargs)
-            if isinstance(kwargs, dict):
-                master_port = kwargs.get("master_port")
-                if master_port is not None:
-                    out["master_port"] = master_port
-            return out
-
-        _patched_strip._diffrl_master_port_unstrip = True  # type: ignore[attr-defined]
-        AsyncOmniEngine._strip_single_engine_args = staticmethod(_patched_strip)
-    except (ImportError, AttributeError):
-        pass
-
-
-def patch_hi3_flow_alignment() -> None:
-    """Port of vllm-omni eed27812 to v0.20.0's older KV-cache API; silent skip on any other version."""
-    try:
-        from vllm_omni.diffusion.models.hunyuan_image3 import (
-            hunyuan_image3_transformer as _trans,
-        )
-    except (ImportError, AttributeError):
-        return
-
-    _ImageKVCacheManager = _trans.ImageKVCacheManager
-    _DecoderLayer = _trans.HunyuanImage3DecoderLayer
-
-    if not hasattr(_ImageKVCacheManager, "_save_image_kv_caches"):
-        return
-
-    import threading as _threading
-
-    _tls = _threading.local()
-
-    _orig_save = _ImageKVCacheManager._save_image_kv_caches
-    if not getattr(_orig_save, "_diffrl_hi3_flow_aligned", False):
-
-        def _patched_save_image_kv_caches(self, key, value, seq_len):
-            assert key.shape[1] == seq_len, f"first-step q_len({key.shape[1]}) != seq_len({seq_len})"
-            self.image_kv_cache_map = (key.contiguous(), value.contiguous())
-
-        _patched_save_image_kv_caches._diffrl_hi3_flow_aligned = True  # type: ignore[attr-defined]
-        _ImageKVCacheManager._save_image_kv_caches = _patched_save_image_kv_caches
-
-    _orig_update = _ImageKVCacheManager._update_image_kv_caches
-    if not getattr(_orig_update, "_diffrl_hi3_flow_aligned", False):
-
-        def _patched_update_image_kv_caches(self, key, value, seq_len, position_ids=None):
-            cached_key, cached_value = self.image_kv_cache_map
-            bs, q_len = key.shape[0], key.shape[1]
-            if position_ids is None:
-                position_ids = getattr(_tls, "position_ids", None)
-            assert cached_key.dim() == 4, (
-                f"patch_hi3_flow_alignment expects a 4-D cache from the patched "
-                f"_save_image_kv_caches; got dim={cached_key.dim()}."
-            )
-            assert position_ids is not None and position_ids.shape == (bs, q_len), (
-                f"position_ids missing or wrong shape: {None if position_ids is None else tuple(position_ids.shape)} "
-                f"!= ({bs}, {q_len})"
-            )
-            result_k = cached_key.clone()
-            result_v = cached_value.clone()
-            for b in range(bs):
-                result_k[b].index_copy_(0, position_ids[b], key[b])
-                result_v[b].index_copy_(0, position_ids[b], value[b])
-            return result_k.contiguous(), result_v.contiguous()
-
-        _patched_update_image_kv_caches._diffrl_hi3_flow_aligned = True  # type: ignore[attr-defined]
-        _ImageKVCacheManager._update_image_kv_caches = _patched_update_image_kv_caches
-
-    _orig_decoder = _DecoderLayer.forward
-    if not getattr(_orig_decoder, "_diffrl_hi3_flow_aligned", False):
-
-        def _patched_decoder_forward(
-            self,
-            hidden_states,
-            attention_mask=None,
-            position_ids=None,
-            *args,
-            _orig=_orig_decoder,
-            **kwargs,
-        ):
-            _prev = getattr(_tls, "position_ids", None)
-            _tls.position_ids = position_ids
-            try:
-                return _orig(self, hidden_states, attention_mask, position_ids, *args, **kwargs)
-            finally:
-                _tls.position_ids = _prev
-
-        _patched_decoder_forward._diffrl_hi3_flow_aligned = True  # type: ignore[attr-defined]
-        _DecoderLayer.forward = _patched_decoder_forward
-
-
 class VLLMOmniHijack:
     """Monkey-patches vllm-omni internals to support in-memory LoRA tensors."""
 
@@ -656,24 +629,22 @@ class VLLMOmniHijack:
     def hijack() -> None:
         wrap_mp_process_for_children()
 
-        patch_qwen3_omni_thinker_lora()
         patch_dit_lora_loader()
         patch_dit_hi3_lora_weights()
         patch_ar_lora_loader()
         patch_ar_merged_lora_fused_tensor()
         patch_fp32_skip()
+        patch_hv15_packed_lora_mapping()
+        patch_hv15_refiner_torch_linear_lora()
         patch_lora_request_passthrough()
-        patch_per_request_ar_seed()
         patch_sigmas_passthrough()
-        patch_hi3_flow_alignment()
-        patch_master_port_unstrip()
         patch_moe_workspace_pool()
 
 
 __all__ = [
     "OmniTensorLoRARequest",
     "VLLMOmniHijack",
-    "patch_hi3_flow_alignment",
-    "patch_per_request_ar_seed",
+    "patch_hv15_packed_lora_mapping",
+    "patch_hv15_refiner_torch_linear_lora",
     "patch_sigmas_passthrough",
 ]

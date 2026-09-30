@@ -11,7 +11,6 @@ from typing import (
     Optional,
     Protocol,
     Sequence,
-    runtime_checkable,
 )
 
 if TYPE_CHECKING:
@@ -61,16 +60,15 @@ class OmniRawResult(Protocol):
     request_id: str
     stage_id: Optional[int]
     final_output_type: Optional[str]
-    request_output: Optional[Any]
+    outputs: Sequence[Any]
     prompt_token_ids: Optional[Sequence[int]]
     images: Optional[Sequence[Any]]
     trajectory_latents: Optional["torch.Tensor"]
     trajectory_timesteps: Optional["torch.Tensor"]
     trajectory_log_probs: Optional["torch.Tensor"]
-    custom_output: Optional[dict]
+    multimodal_output: Optional[dict]
 
 
-@runtime_checkable
 class Backend(Protocol):
     """The seam every ``vllm_omni`` collaborator reaches the runtime through."""
 

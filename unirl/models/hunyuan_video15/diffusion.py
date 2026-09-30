@@ -9,7 +9,8 @@ import torch
 
 from unirl.models.types.diffusion import DiffusionStage, DiffusionStep
 from unirl.models.types.replay_result import ReplayResult
-from unirl.sde.kernels import StepStrategy
+from unirl.sde.kernels import GeneratorLike, StepStrategy
+from unirl.sde.noise import make_denoise_step_generators
 from unirl.types.sampling import DiffusionSamplingParams, compute_trajectory_positions
 from unirl.types.segments.latent import LatentSegment, make_video_segment
 from unirl.utils.dtypes import parse_torch_dtype
@@ -78,7 +79,8 @@ class HunyuanVideo15DiffusionStep(DiffusionStep[HunyuanVideo15Bundle, HunyuanVid
             timestep = sigma.expand(batch_size)
         else:
             timestep = sigma
-        timestep = timestep.to(device=device, dtype=dtype) * self.TIMESTEP_SCALE
+        # Match Diffusers/vLLM: scale fp32 sigma before casting to the transformer dtype.
+        timestep = (timestep.to(device=device, dtype=torch.float32) * self.TIMESTEP_SCALE).to(dtype=dtype)
 
         latent_model_input = torch.cat([sample_cast, cond_latents, cond_mask], dim=1)
 
@@ -139,6 +141,7 @@ class HunyuanVideo15DiffusionStep(DiffusionStep[HunyuanVideo15Bundle, HunyuanVid
         sigma: torch.Tensor,
         sigma_next: torch.Tensor,
         prev_sample: Optional[torch.Tensor] = None,
+        generator: GeneratorLike = None,
         sigma_max: float = 0.99,
         eta: float = 1.0,
         step_index: int = 0,
@@ -151,6 +154,7 @@ class HunyuanVideo15DiffusionStep(DiffusionStep[HunyuanVideo15Bundle, HunyuanVid
             sigma_next=sigma_next,
             eta=eta,
             prev_sample=prev_sample,
+            generator=generator,
             sigma_max=sigma_max,
             step_index=step_index,
         )
@@ -166,6 +170,7 @@ class HunyuanVideo15DiffusionStep(DiffusionStep[HunyuanVideo15Bundle, HunyuanVid
         sigma_next: torch.Tensor,
         guidance_scale: float,
         prev_sample: Optional[torch.Tensor] = None,
+        generator: GeneratorLike = None,
         sigma_max: float = 0.99,
         eta: float = 1.0,
         step_index: int = 0,
@@ -189,6 +194,7 @@ class HunyuanVideo15DiffusionStep(DiffusionStep[HunyuanVideo15Bundle, HunyuanVid
             sigma=sigma,
             sigma_next=sigma_next,
             prev_sample=prev_sample,
+            generator=generator,
             sigma_max=sigma_max,
             eta=eta,
             step_index=step_index,
@@ -205,6 +211,7 @@ class HunyuanVideo15DiffusionStep(DiffusionStep[HunyuanVideo15Bundle, HunyuanVid
         sigma_next: torch.Tensor,
         guidance_scale: float,
         prev_sample: Optional[torch.Tensor] = None,
+        generator: GeneratorLike = None,
         sigma_max: float = 0.99,
         eta: float = 1.0,
         step_index: int = 0,
@@ -221,6 +228,7 @@ class HunyuanVideo15DiffusionStep(DiffusionStep[HunyuanVideo15Bundle, HunyuanVid
             sigma_next=sigma_next,
             guidance_scale=guidance_scale,
             prev_sample=prev_sample,
+            generator=generator,
             sigma_max=sigma_max,
             eta=eta,
             step_index=step_index,
@@ -305,6 +313,8 @@ class HunyuanVideo15DiffusionStage(DiffusionStage[HunyuanVideo15Conditions]):
         schedule: torch.Tensor,
         params: DiffusionSamplingParams,
         initial_latents: Optional[torch.Tensor] = None,
+        denoise_seed_keys: Optional[List[str]] = None,
+        denoise_base_seed: int = 0,
     ) -> LatentSegment:
         """Run full HunyuanVideo-1.5 T2V sampling."""
         from unirl.sde.noise import generate_latents
@@ -314,6 +324,11 @@ class HunyuanVideo15DiffusionStage(DiffusionStage[HunyuanVideo15Conditions]):
         prompt_embeds = conditions.text_mllm.embeds
         device = prompt_embeds.device
         batch_size = int(prompt_embeds.shape[0])
+        if denoise_seed_keys is not None and len(denoise_seed_keys) != batch_size:
+            raise ValueError(
+                "HunyuanVideo15DiffusionStage.diffuse: denoise_seed_keys length "
+                f"{len(denoise_seed_keys)} != batch_size={batch_size}."
+            )
         T = int(params.num_inference_steps)
         if int(schedule.shape[0]) != T + 1:
             raise ValueError(
@@ -379,6 +394,15 @@ class HunyuanVideo15DiffusionStage(DiffusionStage[HunyuanVideo15Conditions]):
             sigma = schedule[i].to(device)
             sigma_next = schedule[i + 1].to(device)
             step_eta = float(params.eta) if i in sde_set else 0.0
+            step_generators = (
+                make_denoise_step_generators(
+                    base_seed=int(denoise_base_seed),
+                    step_index=i,
+                    sample_ids=denoise_seed_keys,
+                )
+                if step_eta > 0.0 and denoise_seed_keys is not None
+                else None
+            )
 
             with torch.no_grad(), autocast_ctx:
                 new_latents, log_prob, _ = self.step.step_with_logp(
@@ -390,6 +414,7 @@ class HunyuanVideo15DiffusionStage(DiffusionStage[HunyuanVideo15Conditions]):
                     sigma_next=sigma_next,
                     guidance_scale=float(params.guidance_scale),
                     eta=step_eta,
+                    generator=step_generators,
                     sigma_max=sigma_max,
                     step_index=i,
                     **step_kwargs,
@@ -497,7 +522,7 @@ class HunyuanVideo15DiffusionStage(DiffusionStage[HunyuanVideo15Conditions]):
                     prev_sample_means.append(prev_mean)
 
         log_probs_t = torch.stack(log_probs, dim=1).to(dtype=self.logprob_dtype)
-        means_t = torch.stack(prev_sample_means, dim=1).to(dtype=self.trajectory_dtype) if prev_sample_means else None
+        means_t = torch.stack(prev_sample_means, dim=1) if prev_sample_means else None
         return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
 
     def predict_noise_at_step(

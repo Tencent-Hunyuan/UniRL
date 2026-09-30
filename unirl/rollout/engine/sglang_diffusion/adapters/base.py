@@ -49,6 +49,7 @@ class ModelAdapter(ABC):
         self.cfg = config
         self.model_config = model_config
         self._sde_label = self.resolve_sde_label(strategy)
+        self._sde_log_prob_no_const = strategy is not None and strategy.log_prob_no_const
         self.validate()
 
     @staticmethod
@@ -88,8 +89,7 @@ class ModelAdapter(ABC):
 
     def lora_spec(self) -> Tuple[str, List[str]]:
         prefix = str(self.model_config.weight_sync_param_name_prefix or "")
-        target_modules = list(self.cfg.target_modules or ("transformer",))
-        return prefix, target_modules
+        return prefix, ["transformer"]
 
     def validate(self) -> None:
         mc = self.model_config

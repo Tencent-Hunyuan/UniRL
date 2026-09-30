@@ -21,6 +21,7 @@ class HunyuanVideo15PipelineConfig:
     text_encoder_dtype: Any = None
     model_precision: Any = "bf16"
     device: Any = None
+    attention_backend: str = "native"
 
     autocast_precision: str = "bf16"
     trajectory_precision: str = "fp16"

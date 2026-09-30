@@ -31,7 +31,7 @@ class VLLMOmniEngineConfig(BaseEngineConfig):
 
     enable_sleep_mode: bool = True
 
-    stage_yaml_override: Optional[str] = None
+    deploy_config_override: Optional[str] = None
 
     omni_extra: Dict[str, Any] = field(default_factory=dict)
 
@@ -71,8 +71,8 @@ class VLLMOmniEngineConfig(BaseEngineConfig):
         }
         intent.update(extra)
 
-        if self.stage_yaml_override:
-            intent["stage_yaml"] = str(self.stage_yaml_override)
+        if self.deploy_config_override:
+            intent["deploy_config"] = str(self.deploy_config_override)
 
         omni_kwargs: Dict[str, Any] = dict(
             stage_init_timeout=1200,

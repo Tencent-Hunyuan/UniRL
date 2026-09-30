@@ -46,6 +46,7 @@ class FlowGRPO(StageAlgorithm):
     requires_backend = True
     anchor_fields = ("sde_logp",)
 
+    @property
     def recomputes_anchor(self) -> bool:
         return self.old_logp_source == "replay"
 

@@ -320,6 +320,7 @@ class Qwen3_5ARStage(ARStage[Qwen3_5ARConditions]):
                     "mm_token_type_ids": model_kwargs.get("mm_token_type_ids"),
                     "next_sequence_length": next_sequence_length,
                     "use_cache": True,
+                    "logits_to_keep": 1,
                 }
                 if is_first_step:
                     if pv is not None:
@@ -336,6 +337,7 @@ class Qwen3_5ARStage(ARStage[Qwen3_5ARConditions]):
                     "input_ids": cur_input_ids,
                     "attention_mask": model_kwargs["attention_mask"],
                     "use_cache": False,
+                    "logits_to_keep": 1,
                 }
                 if pv is not None:
                     model_inputs["pixel_values"] = pv

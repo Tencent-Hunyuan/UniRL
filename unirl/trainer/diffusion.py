@@ -13,10 +13,12 @@ from omegaconf import DictConfig, OmegaConf
 
 from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
+from unirl.train.configs import FSDPConfig, resolve_fsdp_mesh_shape
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample
 from unirl.trainer.eval_suites import EvalRewardSuite, build_eval_suites
 from unirl.trainer.hydra import parse_hydra_cfg, remote_hydra
+from unirl.trainer.residency import DEFAULT_RESIDENCY_POLICY, ResidencyPlanner, ResidencyPolicy, Role
 from unirl.types.primitives import Texts
 from unirl.types.sample import Sample
 from unirl.types.sampling import BaseSamplingParams, total_samples_per_prompt
@@ -58,7 +60,7 @@ def _validate_prompt_tree_dp_geometry(
             )
 
 
-def _validate_diffusion_dp_geometry(
+def _validate_dp_geometry(
     *,
     batch_size: int,
     samples_per_prompt: int,
@@ -102,15 +104,98 @@ def _validate_diffusion_dp_geometry(
         )
 
 
+def _preflight_trainside_geometry(
+    *,
+    num_devices: int,
+    layout: str,
+    reward_fraction: float,
+    batch_size: int,
+    samples_per_prompt: int,
+    num_updates_per_batch: int,
+    prompt_local_rollout: bool,
+    has_reward: bool,
+    backend_cfg: DictConfig,
+    rollout_cfg: DictConfig,
+) -> None:
+    """Reject statically-known trainside DP geometry before constructing heavy model roles."""
+    rollout_target = str(rollout_cfg.get("_target_", ""))
+    if not rollout_target.endswith(".TrainsideRolloutEngine") or layout == "separate":
+        return
+
+    shared_devices_f = (1.0 - reward_fraction) * num_devices
+    shared_devices = int(round(shared_devices_f))
+    if abs(shared_devices_f - shared_devices) > 1e-9:
+        raise ValueError(
+            f"Static trainside geometry: reward_fraction={reward_fraction} of num_devices={num_devices} "
+            f"leaves {shared_devices_f} shared train/rollout devices, not an integer."
+        )
+
+    # The recipe carries a raw DictConfig, so unset keys fall back to the one
+    # place the defaults live rather than to literals repeated here.
+    fsdp_cfg = backend_cfg.get("fsdp_cfg", {})
+    sp_size = int(fsdp_cfg.get("sp_size", None) or FSDPConfig.sp_size)
+    if shared_devices % sp_size:
+        raise ValueError(
+            f"Static trainside geometry: {shared_devices} shared devices are not divisible by sp_size={sp_size}."
+        )
+    # Called for its validation: raises when the shared world cannot form the
+    # configured mesh, while the wrap-time call owns the real world size.
+    resolve_fsdp_mesh_shape(
+        fsdp_cfg.get("fsdp_mode", FSDPConfig.fsdp_mode),
+        world_size=shared_devices,
+        hsdp_shard_size=int(fsdp_cfg.get("hsdp_shard_size", None) or FSDPConfig.hsdp_shard_size),
+    )
+    shared_dp_size = shared_devices // sp_size
+
+    # Mirror the runtime call below, which reads self.reward.dp_size. A reward
+    # Handle carries no sp/tp/pp, so its dp_size is its slab width: the reward
+    # slab when reward_fraction carves one, else the shared devices it colocates
+    # on. Only a recipe with no reward: block at all scores with dp_size 1.
+    if reward_fraction > 0.0:
+        reward_devices_f = reward_fraction * num_devices
+        reward_dp_size = int(round(reward_devices_f))
+        if abs(reward_devices_f - reward_dp_size) > 1e-9:
+            raise ValueError(
+                f"Static trainside geometry: reward_fraction={reward_fraction} of num_devices={num_devices} "
+                f"requests {reward_devices_f} reward devices, not an integer."
+            )
+    else:
+        reward_dp_size = shared_devices if has_reward else 1
+
+    _validate_dp_geometry(
+        batch_size=batch_size,
+        samples_per_prompt=samples_per_prompt,
+        num_updates_per_batch=num_updates_per_batch,
+        rollout_dp_size=shared_dp_size,
+        reward_dp_size=reward_dp_size,
+        train_dp_size=shared_dp_size,
+        require_rollout_dp_divisibility=not prompt_local_rollout,
+    )
+
+
 # Per-field eval knobs the overlay replaced (or dropped), and what to write instead.
 _RETIRED_EVAL_KEYS = {
-    "eval_cfg_text_scale": "eval_sampling: {guidance_scale: X}   (BAGEL family: cfg_text_scale)",
+    "eval_cfg_text_scale": "eval_sampling: {guidance_scale: X}",
     "eval_num_inference_steps": "eval_sampling: {num_inference_steps: X}",
     "eval_height": "eval_sampling: {height: X}",
     "eval_width": "eval_sampling: {width: X}",
     "eval_media_max_items": "logging: {log_media: true, media_max_items: X}",
     "eval_shift": "no equivalent: the per-request time-shift override was dropped (static-shift models keep their checkpoint shift)",
     "eval_mu": "not needed: dynamic-shift μ re-derives from the eval steps/resolution",
+}
+
+_RETIRED_RESIDENCY_KEYS = {
+    "enable_fsdp_offload": (
+        "train_resident: <inverted>   (true offloaded the trainer, so it becomes false; "
+        "the one key now covers every idle phase, not just generation)"
+    ),
+    "offload_train_during_reward": (
+        "train_resident: <inverted>   (true offloaded the trainer, so it becomes false; "
+        "the same one key covers generation as well)"
+    ),
+    "rollout_sleep_after_generate": (
+        "rollout_resident: <inverted>   (true was sleep-after-generate, so it becomes false)"
+    ),
 }
 
 # Engine/driver-owned object fields the overlay cannot carry: overrides come from
@@ -122,10 +207,17 @@ _UNSUPPORTED_OVERLAY_FIELDS = frozenset(
 )
 
 
-def cfg_scale_of(params: Any) -> float:
-    """The CFG scale a diffusion params object will actually be sampled with."""
-    scale = getattr(params, "cfg_text_scale", None)
-    return float(params.guidance_scale if scale is None else scale)
+def reject_retired_residency_keys(cfg: Any) -> None:
+    """Fail fast on the phase-scoped offload flags that per-role residency replaced."""
+    present = sorted(key for key in _RETIRED_RESIDENCY_KEYS if cfg is not None and cfg.get(key) is not None)
+    if not present:
+        return
+    moves = "\n".join(f"  {key}: X   ->   {_RETIRED_RESIDENCY_KEYS[key]}" for key in present)
+    raise ValueError(
+        "These per-phase offload flags are not supported. Residency is now one choice per role, "
+        "held for as long as the role is idle, which is what lets the loop skip the offload/onload "
+        f"round trip they forced between generation and scoring:\n{moves}"
+    )
 
 
 def reject_retired_eval_keys(cfg: Any) -> None:
@@ -157,15 +249,6 @@ def build_eval_sampling(
     if samples_per_prompt is not None:
         updates["samples_per_prompt"] = int(samples_per_prompt)
     updates.update(_resolve_overrides(overrides, field_names))
-
-    # Only the cfg_text_scale families declare both; elsewhere the sibling is not a
-    # field at all and _resolve_overrides already rejected it.
-    if "cfg_text_scale" in field_names and "guidance_scale" in updates:
-        raise ValueError(
-            f"eval_sampling sets `guidance_scale`, which {type(base).__name__} declares but its "
-            "pipeline discards — the eval would silently run at the training CFG. "
-            "Set `cfg_text_scale` instead."
-        )
 
     steps = int(updates.get("num_inference_steps", base.num_inference_steps))
     if float(updates["eta"]) <= 0.0:
@@ -225,14 +308,15 @@ class DiffusionTrainer(BaseTrainer):
         data_source_cfg: DictConfig,
         sampling_cfg: DictConfig,
         sync_cfg: Optional[DictConfig] = None,
+        reward_stack_cfg: Optional[DictConfig] = None,
         logging_cfg: Optional[DictConfig] = None,
         layout: str = "colocate",
         train_fraction: float = 0.5,
         worker_max_concurrency: Optional[int | Sequence[int]] = None,
         reward_fraction: float = 0.0,
-        enable_fsdp_offload: bool = False,
-        offload_train_during_reward: bool = False,
-        rollout_sleep_after_generate: bool = True,
+        train_resident: bool = DEFAULT_RESIDENCY_POLICY.train_resident,
+        rollout_resident: bool = DEFAULT_RESIDENCY_POLICY.rollout_resident,
+        reward_resident: bool = DEFAULT_RESIDENCY_POLICY.reward_resident,
         adv_use_global_std: bool = False,
         accumulate_rollouts: int = 1,
         eval_interval: int = 0,
@@ -242,7 +326,7 @@ class DiffusionTrainer(BaseTrainer):
         eval_eta: float = 0.0,
         eval_sampling_cfg: Optional[Any] = None,
         eval_rewards_cfg: Optional[Any] = None,
-        task_config: Optional[Dict[str, Any]] = None,
+        control: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__(
             cfg=cfg,
@@ -250,17 +334,19 @@ class DiffusionTrainer(BaseTrainer):
             worker_max_concurrency=worker_max_concurrency,
         )
         reject_retired_eval_keys(cfg)
+        reject_retired_residency_keys(cfg)
         self.batch_size = batch_size
         self._layout = str(layout)
         self._train_fraction = float(train_fraction)
-        self._enable_fsdp_offload = bool(enable_fsdp_offload)
-        # Independent from generate-time offload: when enabled, a reward that
-        # shares the train slab may borrow its GPU after generation completes.
-        self._offload_train_during_reward = bool(offload_train_during_reward)
-        # Process lifetime is independent from weight residency. False keeps an
-        # external rollout engine's weights resident after generate/eval; the
-        # default preserves the historical phase-sleep behavior.
-        self._rollout_sleep_after_generate = bool(rollout_sleep_after_generate)
+        # Residency is per role and phase-independent: `true` keeps a role's
+        # weights on the GPU while it is idle, `false` parks them on CPU. No
+        # value here ever stops a role's process; only its weights move.
+        self._residency_policy = ResidencyPolicy(
+            train_resident=train_resident,
+            rollout_resident=rollout_resident,
+            reward_resident=reward_resident,
+        )
+        self._residency: Optional[ResidencyPlanner] = None
         self._adv_use_global_std = bool(adv_use_global_std)
         self.eval_interval = int(eval_interval)
         self.eval_num_prompts = int(eval_num_prompts)
@@ -269,9 +355,11 @@ class DiffusionTrainer(BaseTrainer):
         self.eval_eta = float(eval_eta)
         self._eval_rewards_cfg = eval_rewards_cfg
         self._eval_suites: List[EvalRewardSuite] = []
-        self._task_config: Dict[str, Any] = dict(task_config) if task_config else {}
+        self._control: Dict[str, Any] = dict(control) if control else {}
         self._rollout_is_trainside = False
         self._uses_ema = False
+        # Set from the built weight_sync's capabilities in _build_residency_planner.
+        self._staged_weight_sync = False
 
         self.data_source = instantiate(data_source_cfg)
         self._data_source_cfg = data_source_cfg
@@ -327,6 +415,7 @@ class DiffusionTrainer(BaseTrainer):
         self.weight_sync = None
         # None when the recipe has no ``reward:`` block (validated below).
         self.reward = None
+        self.reward_stack = None
 
         reward_fraction = float(reward_fraction)
         if not 0.0 <= reward_fraction < 1.0:
@@ -343,6 +432,25 @@ class DiffusionTrainer(BaseTrainer):
                 "has no `reward:` block — drop reward_fraction or configure a reward."
             )
         self._reward_is_separate = reward_separate
+        if reward_stack_cfg is not None:
+            self._check_reward_stack_layout(
+                has_reward=reward_cfg is not None,
+                reward_resident=reward_resident,
+                reward_fraction=reward_fraction,
+            )
+
+        _preflight_trainside_geometry(
+            num_devices=int(self.num_devices),
+            layout=self._layout,
+            reward_fraction=reward_fraction,
+            batch_size=int(batch_size),
+            samples_per_prompt=total_samples_per_prompt(self.sampling_params),
+            num_updates_per_batch=int(stack_cfg.get("num_updates_per_batch", 1)),
+            prompt_local_rollout=self._prompt_local_rollout,
+            has_reward=reward_cfg is not None,
+            backend_cfg=backend_cfg,
+            rollout_cfg=rollout_cfg,
+        )
 
         train_cfgs = dict(
             bundle_cfg=bundle_cfg,
@@ -365,6 +473,8 @@ class DiffusionTrainer(BaseTrainer):
             with placement(self.pool, fraction=1.0 - reward_fraction, shared_workers=True):
                 self._build_train_side(**train_cfgs)
                 self.rollout = self._build_rollout(rollout_cfg, allow_pipeline=True)
+                if reward_stack_cfg is not None:
+                    self.reward_stack = self._build_reward_stack(reward_stack_cfg)
                 if sync_cfg is not None:
                     self.weight_sync = remote_hydra(sync_cfg, backend=self.backend, rollout=self.rollout)
 
@@ -379,8 +489,8 @@ class DiffusionTrainer(BaseTrainer):
         self.accumulate_rollouts = int(accumulate_rollouts)
         self._validate_accumulation(stack_cfg)
 
-        self._validate_residency_config()
-        _validate_diffusion_dp_geometry(
+        self._build_residency_planner()
+        _validate_dp_geometry(
             batch_size=int(batch_size),
             samples_per_prompt=total_samples_per_prompt(self.sampling_params),
             num_updates_per_batch=int(stack_cfg.get("num_updates_per_batch", 1)),
@@ -473,37 +583,66 @@ class DiffusionTrainer(BaseTrainer):
         self._uses_ema = getattr(algo_cls, "requires_ema_rollout", False)
         # requires_advantages=False algorithms keep rewards for monitoring only.
         self._algo_requires_advantages = getattr(algo_cls, "requires_advantages", True)
-        if self._uses_ema and self._offload_train_during_reward:
-            raise ValueError(
-                "offload_train_during_reward is not supported with EMA/DiffusionNFT algorithms "
-                f"({algo_cls.__name__} sets requires_ema_rollout): the reward-phase offload has "
-                "not been validated against backend.ema state. Disable one of the two instead of "
-                "having the trainer silently ignore the requested policy."
-            )
         needs_backend = self._uses_ema or getattr(algo_cls, "requires_backend", False)
         algo_extra = {"backend": self.backend} if needs_backend else {}
         self.algorithm = remote_hydra(algorithm_cfg, pipeline=self.pipeline, **algo_extra)
         self.stack = remote_hydra(stack_cfg, fsdp_backend=self.backend, algorithm=self.algorithm)
 
-    def _validate_residency_config(self) -> None:
-        """Reject requested residency policies that the selected topology drops."""
-        if self._offload_train_during_reward and self.reward is None:
-            raise ValueError(
-                "offload_train_during_reward requires a configured reward: this run has no reward phase "
-                "to borrow train memory. Disable the unused policy or configure a reward."
-            )
-        if (
-            self._uses_ema
-            and self._enable_fsdp_offload
-            and self._layout != "separate"
-            and not self._rollout_is_trainside
-        ):
-            raise ValueError(
-                "enable_fsdp_offload is not supported with EMA/DiffusionNFT algorithms and an "
-                "external colocated rollout: generation-time train offload has not been validated "
-                "against backend.ema state. Disable one of the two instead of having the trainer "
-                "silently ignore the requested policy."
-            )
+    def _build_residency_planner(self) -> None:
+        """Wire the residency planner to the roles that actually share this slab."""
+        policy = self._residency_policy
+        # Capability, not class name: a parked trainer needs the push split into a
+        # read (weights resident) and a load (rollout awake), which only the LoRA
+        # syncs expose. Probe the built object so a new implementation is picked up
+        # by having the methods rather than by being named.
+        staged_methods = ("extract", "push", "has_staged_adapter", "invalidate")
+        self._staged_weight_sync = self.weight_sync is not None and all(
+            hasattr(self.weight_sync, name) for name in staged_methods
+        )
+        # Train is parkable only where parking frees something the active role can
+        # use: not on a separate slab, and not behind a trainside rollout, whose
+        # generation reads the very weights that would be parked.
+        train_parkable = self._layout != "separate" and not self._rollout_is_trainside
+        if not policy.train_resident:
+            # Order matters: an unparkable trainer is the more basic reason, and
+            # reporting the sync instead would send the reader after the wrong knob.
+            if not train_parkable:
+                reason = (
+                    f"layout: {self._layout} puts the trainer on its own slab"
+                    if self._layout == "separate"
+                    else "a trainside rollout generates from the trainer's own weights"
+                )
+                raise ValueError(
+                    f"train_resident=false has nothing to park here: {reason}, so parking would "
+                    "move memory no other role can use. Drop the key instead of having the trainer "
+                    "silently ignore the requested policy."
+                )
+            if self.weight_sync is not None and not self._staged_weight_sync:
+                raise ValueError(
+                    "train_resident=false is not supported with this weight sync: "
+                    f"{type(self.weight_sync).__name__} exposes sync() alone, which reads the "
+                    "trainer's weights and loads them into the rollout in one call, so it cannot "
+                    "run with the trainer parked. Use a LoRA sync, or set train_resident=true "
+                    "instead of having the trainer silently ignore the requested policy."
+                )
+            if self._uses_ema and not self._rollout_is_trainside:
+                raise ValueError(
+                    "train_resident=false is not supported with EMA/DiffusionNFT algorithms and an "
+                    "external colocated rollout: parking the trainer has not been validated against "
+                    "backend.ema state, which the contrastive branch reads. Set train_resident=true "
+                    "instead of having the trainer silently ignore the requested policy."
+                )
+        self._residency = ResidencyPlanner(
+            policy,
+            train=(self.backend.onload, self.backend.offload) if train_parkable else None,
+            rollout=(self.rollout.wake_up, self.rollout.sleep),
+            reward=(
+                (self.reward.onload, self.reward.offload)
+                if self.reward is not None and not self._reward_is_separate
+                else None
+            ),
+            run_steps=_run_cleanup_steps,
+        )
 
     def _build_rollout(self, rollout_cfg, *, allow_pipeline: bool):
         """Build the rollout remote in the currently active placement scope."""
@@ -563,7 +702,7 @@ class DiffusionTrainer(BaseTrainer):
         sp = sampling if sampling is not None else self.sampling_params
         noise_latent_shape = self._eval_noise_latent_shape if sampling is not None else self._noise_latent_shape
         diffusion = sp.get("diffusion")
-        sde_indices = diffusion.resolve_sde_indices(rollout_id)
+        sde_indices = diffusion.get_sde_indices(rollout_id)
         diffusion = dataclasses.replace(
             diffusion, sde_indices=sde_indices, scheduler=None, init_noise_latent_shape=noise_latent_shape
         )
@@ -572,7 +711,7 @@ class DiffusionTrainer(BaseTrainer):
             rollout_id,
             allowed_primitives={"text", "image", "video"},
             caller="DiffusionTrainer._build_request_sample",
-            root_control=dict(self._task_config),
+            control=self._control,
         )
         samples_per_prompt = total_samples_per_prompt(sp)
         request = request.fork(samples_per_prompt, sampling_params=diffusion)
@@ -595,26 +734,63 @@ class DiffusionTrainer(BaseTrainer):
             request = request.with_parts([*request.parts[:-1], frontier])
         return request
 
-    def _offload_for_reward_phase(self) -> bool:
-        """Whether a colocated reward may temporarily borrow the train cards."""
-        return self._offload_train_during_reward and not self._reward_is_separate
+    def _prepare_for_save(self) -> None:
+        """Checkpointing reads the trainer's weights, and evaluate() may have parked them."""
+        self._residency.enter(Role.TRAIN)
+
+    def _cache_adapter_for_push(self) -> bool:
+        """Read the adapter while the trainer is resident; True if a later push can use it."""
+        if self.weight_sync is None or not self._staged_weight_sync:
+            return False
+        if not self.weight_sync.has_staged_adapter()[0]:
+            # enter() rather than set(): the read must not put the trainer on the
+            # slab beside a reward that the rollout phase has not parked yet.
+            self._residency.enter(Role.TRAIN)
+            self.weight_sync.extract()
+        return True
+
+    def _push_or_sync(self, *, staged: bool) -> None:
+        """Load the adapter into an awake rollout, from cache when one was taken."""
+        if self.weight_sync is None:
+            return
+        if staged:
+            self.weight_sync.push()
+        else:
+            self.weight_sync.sync()
 
     @contextmanager
-    def _reward_phase(self) -> Iterator[None]:
-        """Temporarily offload FSDP state while a colocated reward is active."""
-        should_offload = self._offload_for_reward_phase()
-        try:
-            if should_offload:
-                self.backend.offload()
-            yield
-        finally:
-            if should_offload:
-                _run_cleanup_steps([("reward train onload", self.backend.onload)])
+    def _reward_phase(self, *, preserve_rollout: bool = False) -> Iterator[None]:
+        """Give the reward the slab, leaving the trainer parked if it already is."""
+        preserve = (Role.ROLLOUT,) if preserve_rollout else ()
+        self._residency.enter(Role.REWARD, preserve=preserve)
+        yield
 
-    def _sleep_rollout_then_onload_train(self) -> None:
-        """Restore train state only after the colocated rollout is safely asleep."""
-        self.rollout.sleep()
-        self.backend.onload()
+    def _check_reward_stack_layout(self, *, has_reward: bool, reward_resident: bool, reward_fraction: float) -> None:
+        """Reject the layouts in which the stack could not reach the engine and the reward as in-process siblings."""
+        if not has_reward:
+            raise ValueError("reward_stack needs a `reward:` block: it scores every micro through that sibling.")
+        if self._layout != "colocate" or reward_fraction > 0.0:
+            raise ValueError(
+                "reward_stack needs layout='colocate' with reward_fraction=0, so the engine and the reward share a "
+                f"Worker; got layout={self._layout!r}, reward_fraction={reward_fraction}."
+            )
+        if not reward_resident:
+            raise ValueError(
+                "reward_stack needs reward_resident=true: it scores inside the rollout window, where a parked "
+                "reward is never woken."
+            )
+
+    def _build_reward_stack(self, reward_stack_cfg: DictConfig) -> Any:
+        """Build the stack beside the engine it wraps and reject the SP/TP layouts it inherits but cannot serve."""
+        stack = remote_hydra(reward_stack_cfg, rollout=self.rollout, reward=self.reward)
+        if int(stack.dp_size) != int(self.rollout.dp_size):
+            raise ValueError(f"reward_stack dp_size={stack.dp_size} must equal rollout dp_size={self.rollout.dp_size}.")
+        if int(stack.sp_size) != 1 or int(stack.tp_size) != 1:
+            raise ValueError(
+                f"reward_stack needs sp_size=1 and tp_size=1, got sp_size={stack.sp_size}, tp_size={stack.tp_size}: "
+                "every rank of an SP or TP group would score the same shard, or nothing."
+            )
+        return stack
 
     def _generate_with_residency(
         self,
@@ -622,56 +798,77 @@ class DiffusionTrainer(BaseTrainer):
         *,
         sync_weights: bool,
         sleep_rollout: bool,
+        score_inline: bool = False,
     ) -> Sample:
-        """Generate with exception-safe EMA, rollout, and FSDP lifecycle cleanup."""
-        # No EMA term: _validate_residency_config already rejected the EMA x
-        # offload x colocated-external combination at startup, fail-fast
-        # instead of silently skipping the requested offload here.
-        should_offload_train = (
-            self._enable_fsdp_offload and self._layout != "separate" and not self._rollout_is_trainside
-        )
+        """Generate with exception-safe EMA and residency cleanup."""
+        # No EMA term: _build_residency_planner already rejected the EMA x
+        # parked-train x colocated-external combination at startup, fail-fast
+        # instead of silently skipping the requested policy.
+        will_park_train = not self._residency.policy.train_resident and self._residency.parkable(Role.TRAIN)
         # Swap EMA weights only for trainside rollout; remote engines receive
         # them through weight sync.
         should_swap_ema = self._uses_ema and self._rollout_is_trainside
-        train_offload_attempted = False
+        staged_sync = False
         ema_apply_attempted = False
         generation_succeeded = False
         try:
-            self.rollout.wake_up()
-            if sync_weights and self.weight_sync is not None:
-                self.weight_sync.sync()
-            if should_offload_train:
-                train_offload_attempted = True
-                self.backend.offload()
+            if sync_weights and will_park_train:
+                staged_sync = self._cache_adapter_for_push()
+            # Parks the trainer (and a non-resident reward) before waking the
+            # rollout, so the peak never holds two roles at once.
+            self._residency.enter(Role.ROLLOUT)
+            if sync_weights:
+                self._push_or_sync(staged=staged_sync)
             if should_swap_ema:
                 ema_apply_attempted = True
                 self.backend.apply_eval_ema()
-            result = self.rollout.generate(sample)
+            result = self.reward_stack.rollout_and_score(sample) if score_inline else self.rollout.generate(sample)
+            if score_inline:
+                self.reward_stack.collect_garbage()
+                self._log_reward_stack_timing()
             generation_succeeded = True
             return result
         finally:
             cleanup_steps: List[Tuple[str, Callable[[], None]]] = []
             if ema_apply_attempted:
                 cleanup_steps.append(("EMA restore", self.backend.restore_from_eval))
-            should_sleep_rollout = sleep_rollout or not generation_succeeded
-            if should_sleep_rollout and train_offload_attempted:
-                # These operations are dependent: if sleep fails, loading FSDP
-                # into a still-resident rollout can turn the original error into
-                # a second OOM and leave both roles partially initialized.
-                cleanup_steps.append(
-                    ("rollout sleep before generate train onload", self._sleep_rollout_then_onload_train)
-                )
-            elif should_sleep_rollout:
-                cleanup_steps.append(("rollout sleep", self.rollout.sleep))
-            elif train_offload_attempted:
-                cleanup_steps.append(("generate train onload", self.backend.onload))
             _run_cleanup_steps(cleanup_steps)
+            # The trainer is deliberately not reloaded here. It stays parked
+            # through the reward phase and comes back once, before the optimizer
+            # step, which is the only point that needs it.
+            if sleep_rollout or not generation_succeeded:
+                self._residency.set(Role.ROLLOUT, False)
+
+    def _log_reward_stack_timing(self) -> None:
+        """Surface the stack's per-rank generate/score split on the driver, where worker logs do not reach."""
+        per_rank = self.reward_stack.timing()
+        keys = ("generate_s", "score_s", "wall_s")
+        peak = {k: max(float(t[k]) for t in per_rank) for k in keys}
+        mean = {k: sum(float(t[k]) for t in per_rank) / len(per_rank) for k in keys}
+        logger.info(
+            "reward stack timing: ranks=%d rows=%d micros=%d generate_s=%.2f/%.2f score_s=%.2f/%.2f "
+            "wall_s=%.2f/%.2f (max/mean)",
+            len(per_rank),
+            int(per_rank[0]["rows"]),
+            int(per_rank[0]["micros"]),
+            peak["generate_s"],
+            mean["generate_s"],
+            peak["score_s"],
+            mean["score_s"],
+            peak["wall_s"],
+            mean["wall_s"],
+        )
+        timer = getattr(self, "_step_timer", None)
+        if timer is not None:
+            timer.phases["stack_generate"] = timer.phases.get("stack_generate", 0.0) + peak["generate_s"]
+            timer.phases["stack_score"] = timer.phases.get("stack_score", 0.0) + peak["score_s"]
 
     def _generate_for_training(self, sample: Sample, *, sync_weights: bool) -> Sample:
         return self._generate_with_residency(
             sample,
             sync_weights=sync_weights,
-            sleep_rollout=self._rollout_sleep_after_generate,
+            sleep_rollout=not self._residency.policy.rollout_resident,
+            score_inline=self.reward_stack is not None,
         )
 
     def _rollout_and_score(
@@ -684,7 +881,7 @@ class DiffusionTrainer(BaseTrainer):
         """One ``rollout → reward → advantage`` pass; training happens per window."""
         sample = self._generate_for_training(sample, sync_weights=sync_weights)
         # With no reward configured, ``part.rewards`` stays None and the block below no-ops.
-        if self.reward is not None:
+        if self.reward is not None and self.reward_stack is None:
             with self._reward_phase():
                 sample = self.reward.score_and_attach(sample)
 
@@ -732,8 +929,19 @@ class DiffusionTrainer(BaseTrainer):
         final_id = window_ids[-1]
         training_progress = final_id / max(1, num_rollouts - 1)
         parts = tuple(sample.parts[-1] for sample in samples)
+        # First point in the window that needs the trainer on the GPU. With
+        # accumulate_rollouts > 1 it stayed parked across every rollout and
+        # reward above, so this is one onload per optimizer step rather than one
+        # per rollout.
+        self._residency.enter(Role.TRAIN)
+        # Invalidate before the step, not after: once it has begun the weights can
+        # change, so a step that raises must not leave the cache looking current.
+        if self._staged_weight_sync:
+            self.weight_sync.invalidate()
         result = self.stack.train_track(
-            parts if len(parts) > 1 else parts[0], training_progress=float(training_progress)
+            parts if len(parts) > 1 else parts[0],
+            training_progress=float(training_progress),
+            rollout_id=final_id,
         )
         # Reward stats must cover the whole window: with per-domain scorers each
         # rollout is NaN outside its own domain, so the final sample alone would
@@ -761,7 +969,7 @@ class DiffusionTrainer(BaseTrainer):
         eval_sp = self._eval_sampling_params
         eval_diffusion = eval_sp.get("diffusion")
         sync_requested = bool(sync_weights)
-        sleep_requested = sleep_after and self._rollout_sleep_after_generate
+        sleep_requested = sleep_after and not self._residency.policy.rollout_resident
         # A no-sync evaluation must preserve the already-resident adapter.
         # Engines such as SGLang discard their LoRA pool on sleep and cannot
         # reconstruct it without a push, so keep them awake across chunks and
@@ -807,11 +1015,11 @@ class DiffusionTrainer(BaseTrainer):
             if not generated_any:
                 self._prepare_empty_evaluation(sync_weights=sync_pending, sleep_rollout=sleep_requested)
             elif sleep_at_end:
-                self.rollout.sleep()
+                self._residency.set(Role.ROLLOUT, False)
             evaluation_succeeded = True
         finally:
             if not evaluation_succeeded:
-                _run_cleanup_steps([("evaluation rollout sleep", self.rollout.sleep)])
+                _run_cleanup_steps([("evaluation rollout sleep", lambda: self._residency.set(Role.ROLLOUT, False))])
         logger.info(
             "EVAL step %d  (%d samples/prompt, %d steps, %dx%d, cfg=%.1f eta=%.1f)  %s",
             step,
@@ -819,7 +1027,7 @@ class DiffusionTrainer(BaseTrainer):
             int(eval_diffusion.num_inference_steps),
             int(eval_diffusion.height),
             int(eval_diffusion.width),
-            cfg_scale_of(eval_diffusion),
+            float(eval_diffusion.guidance_scale),
             float(eval_diffusion.eta),
             "  ".join(f"{k}={v:.4f}" for k, v in metrics.items()),
         )
@@ -830,13 +1038,16 @@ class DiffusionTrainer(BaseTrainer):
         """Preserve evaluation wake/sync/sleep semantics when every set is empty."""
         prepare_succeeded = False
         try:
-            self.rollout.wake_up()
-            if sync_weights and self.weight_sync is not None:
-                self.weight_sync.sync()
+            staged = self._cache_adapter_for_push() if sync_weights else False
+            self._residency.enter(Role.ROLLOUT)
+            if sync_weights:
+                self._push_or_sync(staged=staged)
             prepare_succeeded = True
         finally:
             if sleep_rollout or not prepare_succeeded:
-                _run_cleanup_steps([("empty evaluation rollout sleep", self.rollout.sleep)])
+                _run_cleanup_steps(
+                    [("empty evaluation rollout sleep", lambda: self._residency.set(Role.ROLLOUT, False))]
+                )
 
     def _eval_pass(
         self,
@@ -876,24 +1087,34 @@ class DiffusionTrainer(BaseTrainer):
             )
             sync_pending = False
             first_scored: Optional[Sample] = None
-            with self._reward_phase():
+            with self._reward_phase(preserve_rollout=not sleep_rollout):
                 for name, reward in scorers:
                     scored = reward.score_and_attach(generated)
                     if first_scored is None:
                         first_scored = scored
-                    rewards = scored.parts[-1].rewards
+                    part = scored.parts[-1]
+                    rewards = part.rewards
                     if rewards is not None:
                         r = hydrate(rewards).to(torch.float32)
                         if scored is first_scored:
                             # Captions read part.rewards, which remote scoring returns dehydrated.
-                            scored.parts[-1].rewards = r
+                            part.rewards = r
                         sums[name] += float(r.sum().item())
                         counts[name] += int(r.numel())
+                    components = part.component_rewards
+                    if isinstance(components, dict):
+                        for component_name, component_values in components.items():
+                            component = hydrate(component_values).to(torch.float32)
+                            metric_name = f"{name}_{str(component_name).replace('/', '_')}"
+                            sums.setdefault(metric_name, 0.0)
+                            counts.setdefault(metric_name, 0)
+                            sums[metric_name] += float(component.sum().item())
+                            counts[metric_name] += int(component.numel())
             # Outside _reward_phase: the driver-side media upload must not hold
             # the train-offload window open.
             if media_prefix and start == 0 and first_scored is not None:
                 self._log_eval_media(first_scored, step, prefix=media_prefix)
-        metrics = {name: sums[name] / max(1, counts[name]) for name, _ in scorers}
+        metrics = {name: total / max(1, counts[name]) for name, total in sums.items()}
         return metrics, sync_pending, n_prompts > 0
 
     def train(

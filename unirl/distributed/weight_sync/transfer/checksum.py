@@ -14,7 +14,7 @@ def fingerprint_tensor(t: torch.Tensor) -> str:
     h = hashlib.sha256()
     h.update(str(data.dtype).encode())
     h.update(str(tuple(data.shape)).encode())
-    h.update(data.view(torch.uint8).flatten().numpy().tobytes())
+    h.update(data.reshape(-1).view(torch.uint8).numpy().tobytes())
     return h.hexdigest()[:16]
 
 

@@ -1,18 +1,21 @@
-"""Plain LoRA adapter injection."""
+"""LoRA adapter injection, switching, and frozen sibling adapters."""
 
 from __future__ import annotations
 
-import json
+import hashlib
 import logging
 import os
 import re
 from contextlib import contextmanager
 from functools import partial
-from typing import Iterator, Optional, Sequence, Union
+from typing import Any, Dict, Iterator, Optional, Sequence, Tuple, Union
 
+import torch
 from torch import nn
 
 from unirl.models.types.post_materialize import defer_after_materialize
+from unirl.train.configs import normalize_frozen_adapters
+from unirl.utils.peft_merge import _strip_peft_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -182,74 +185,63 @@ def adapter_active(model: nn.Module, name: str, *, trainable: str = "default") -
         _set_adapter_requires_grad(model, name, False)
 
 
-def _resolve_adapter_checkpoint(path: str) -> tuple:
-    """Resolve a peft adapter checkpoint to local ``(config_path, weight_path)``."""
+def _resolve_adapter_checkpoint(path: str) -> Tuple[str, Optional[str]]:
+    """Split a peft adapter location into ``(model_id, subfolder)``: a local directory or ``org/repo[/subfolder]``."""
     if os.path.isdir(path):
-        config_path = os.path.join(path, "adapter_config.json")
-        weight_path = os.path.join(path, "adapter_model.safetensors")
-        if not os.path.exists(weight_path):
-            weight_path = os.path.join(path, "adapter_model.bin")
-        if not os.path.exists(config_path) or not os.path.exists(weight_path):
-            raise FileNotFoundError(
-                f"_resolve_adapter_checkpoint: {path!r} is a directory but lacks "
-                "adapter_config.json + adapter_model.safetensors/.bin."
-            )
-        return config_path, weight_path
-
-    from huggingface_hub import hf_hub_download
-
+        return path, None
     parts = path.split("/")
     if len(parts) < 2:
         raise ValueError(
             f"_resolve_adapter_checkpoint: {path!r} is neither a local directory nor an "
             "HF repo id ('org/repo' or 'org/repo/subfolder')."
         )
-    dl_kwargs = {"repo_id": "/".join(parts[:2])}
-    if len(parts) > 2:
-        dl_kwargs["subfolder"] = "/".join(parts[2:])
-    config_path = hf_hub_download(filename="adapter_config.json", **dl_kwargs)
-    try:
-        weight_path = hf_hub_download(filename="adapter_model.safetensors", **dl_kwargs)
-    except Exception:
-        weight_path = hf_hub_download(filename="adapter_model.bin", **dl_kwargs)
-    return config_path, weight_path
+    return "/".join(parts[:2]), "/".join(parts[2:]) or None
 
 
-def inject_frozen_adapter(
+def _inject_frozen_adapter(
     model: nn.Module,
     *,
     name: str,
     path: str,
-    trainable_adapter: str = "default",
-) -> None:
-    """Inject a frozen, inference-only LoRA adapter with weights from ``path``."""
-    from peft import LoraConfig, inject_adapter_in_model, set_peft_model_state_dict
+) -> str:
+    """Inject a frozen LoRA adapter now, load its weights after materialization; returns its content sha256."""
+    from peft import LoraConfig, inject_adapter_in_model
     from peft.tuners.lora import LoraLayer
+    from peft.utils import load_peft_weights
 
-    if not name or name == trainable_adapter:
-        raise ValueError(
-            f"inject_frozen_adapter: adapter name must be non-empty and differ from "
-            f"the trainable adapter {trainable_adapter!r}; got {name!r}."
-        )
-    if any(p.is_meta for p in model.parameters()):
-        raise NotImplementedError(
-            "inject_frozen_adapter: the trainable module is meta-initialized; frozen "
-            "adapters load real weights at injection time and require an eager bundle."
-        )
     if name in adapter_names(model):
         raise ValueError(f"inject_frozen_adapter: adapter {name!r} already exists on the model.")
 
-    config_path, weight_path = _resolve_adapter_checkpoint(path)
-    with open(config_path) as f:
-        adapter_cfg = json.load(f)
-
-    peft_cfg = LoraConfig(
-        r=int(adapter_cfg["r"]),
-        lora_alpha=int(adapter_cfg.get("lora_alpha", adapter_cfg["r"])),
-        target_modules=adapter_cfg.get("target_modules") or [],
-        lora_dropout=0.0,
-        bias=str(adapter_cfg.get("bias", "none")),
-    )
+    model_id, subfolder = _resolve_adapter_checkpoint(path)
+    # The full saved config: scaling depends on use_rslora / alpha_pattern / rank_pattern, not just r and alpha.
+    peft_cfg = LoraConfig.from_pretrained(model_id, subfolder=subfolder)
+    init = peft_cfg.init_lora_weights
+    if isinstance(init, str) and init not in _DELTA_INITS:
+        # pissa / olora / corda / loftq / lora_ga rewrite the base weight when they initialize (pissa / olora
+        # do so here, on the shared student base), so an unconverted adapter only fits that rewritten base.
+        raise ValueError(
+            f"inject_frozen_adapter: {path!r} was saved with init_lora_weights={init!r}, so its weights assume "
+            "a modified base model. Re-save it with save_pretrained(path_initial_model_for_weight_conversion=...) "
+            "to convert it to a plain LoRA delta."
+        )
+    # peft applies these at inject time to the shared student modules (or, for DoRA, adds magnitude tensors
+    # this loader does not map); a frozen teacher may only add a LoRA delta.
+    unsupported = {
+        field: getattr(peft_cfg, field)
+        for field in ("modules_to_save", "layer_replication", "trainable_token_indices", "use_dora")
+        if getattr(peft_cfg, field)
+    }
+    if peft_cfg.bias != "none":
+        unsupported["bias"] = peft_cfg.bias
+    if unsupported:
+        raise ValueError(
+            f"inject_frozen_adapter: {path!r} sets {unsupported}; frozen teachers support plain LoRA "
+            "(no modules_to_save / layer_replication / trainable_token_indices / DoRA, bias='none')."
+        )
+    peft_cfg.lora_dropout = 0.0
+    # The checkpoint overwrites the weights after materialization; skip peft's init (MiCA / orthogonal run an SVD
+    # of the base weight, which breaks on meta-init bases). The remaining delta inits share the plain LoRA forward.
+    peft_cfg.init_lora_weights = True
     inject_adapter_in_model(peft_cfg, model, adapter_name=name)
 
     covered = [m for m in model.modules() if isinstance(m, LoraLayer) and name in getattr(m, "lora_A", {})]
@@ -260,60 +252,137 @@ def inject_frozen_adapter(
             "Wrong checkpoint for this architecture?"
         )
 
-    if weight_path.endswith(".safetensors"):
-        from safetensors.torch import load_file as _load_weights
-    else:
-        import torch
-
-        def _load_weights(p):
-            return torch.load(p, map_location="cpu", weights_only=True)
-
-    load_result = set_peft_model_state_dict(model, _load_weights(weight_path), adapter_name=name)
-    unexpected = list(getattr(load_result, "unexpected_keys", []) or [])
-    if unexpected:
-        raise ValueError(
-            f"inject_frozen_adapter: {len(unexpected)} tensor(s) in {weight_path!r} matched no "
-            f"parameter of adapter {name!r} (first: {unexpected[:3]}). The checkpoint does not "
-            "line up with this model — refusing a silently partial teacher."
-        )
-    # strict=False ``missing_keys`` spans the whole model; only THIS adapter's lora
-    # banks indicate a truncated checkpoint (peft zero-inits ``lora_B`` -> a missing
-    # tensor silently nulls the teacher on that layer).
-    missing: list = []
-    for key in getattr(load_result, "missing_keys", None) or []:
-        parts = key.split(".")
-        for bank in ("lora_A", "lora_B", "lora_embedding_A", "lora_embedding_B"):
-            if bank in parts:
-                bank_idx = parts.index(bank)
-                if bank_idx + 1 < len(parts) and parts[bank_idx + 1] == name:
-                    missing.append(key)
-                break
-    if missing:
-        raise ValueError(
-            f"inject_frozen_adapter: {len(missing)} tensor(s) of adapter {name!r} are absent from "
-            f"{weight_path!r} (first: {missing[:3]}). peft zero-initializes the missing side, which "
-            "would silently disable the teacher on those layers — refusing a partial teacher."
-        )
-
     _set_adapter_requires_grad(model, name, False)
-    # peft's inject/set paths flip other adapters' requires_grad; restore the resting state.
-    _activate(model, trainable_adapter)
-    _set_adapter_requires_grad(model, trainable_adapter, True)
+    # peft's inject path flips other adapters' requires_grad; restore the resting state.
+    _activate(model, "default")
+    _set_adapter_requires_grad(model, "default", True)
     # Mirror inject_nft: keep diffusers' PeftAdapterMixin bookkeeping consistent.
     if hasattr(model, "_hf_peft_config_loaded"):
         model._hf_peft_config_loaded = True
+
+    raw = load_peft_weights(model_id, device="cpu", subfolder=subfolder)
+    # peft ``base_model.model.<m>.lora_A.weight`` -> model ``<m>.lora_A.<name>.weight``.
+    weights = {
+        _LORA_BANK_RE.sub(lambda m: f"{m.group(0)}.{name}", _strip_peft_prefix(k), count=1): v for k, v in raw.items()
+    }
+
+    # Validate against the injected (possibly meta) structure now, before the base weights load.
+    model_sd = model.state_dict()
+    expected = {k for k in model_sd if _adapter_of_lora_key(k) == name}
+    unexpected = sorted(set(weights) - expected)
+    if unexpected:
+        raise ValueError(
+            f"inject_frozen_adapter: {len(unexpected)} tensor(s) in {path!r} matched no "
+            f"parameter of adapter {name!r} (first: {unexpected[:3]}). The checkpoint does not "
+            "line up with this model — refusing a silently partial teacher."
+        )
+    # peft zero-inits ``lora_B``: a missing tensor would silently null the teacher on that layer.
+    missing = sorted(expected - set(weights))
+    if missing:
+        raise ValueError(
+            f"inject_frozen_adapter: {len(missing)} tensor(s) of adapter {name!r} are absent from "
+            f"{path!r} (first: {missing[:3]}) — refusing a partial teacher."
+        )
+    for key, value in weights.items():
+        want = model_sd[key].shape
+        if tuple(value.shape) != tuple(want):
+            raise ValueError(
+                f"inject_frozen_adapter: {key!r} has shape {tuple(value.shape)} in {path!r}, "
+                f"model expects {tuple(want)} (adapter rank mismatch?)."
+            )
+
+    # Weights need real (sharded) storage: FSDP/VeOmni materialize after injection.
+    defer_after_materialize(
+        model,
+        partial(_load_frozen_adapter, name=name, weights=weights, path=path),
+    )
 
     if _current_rank() == 0:
         total = sum(1 for m in model.modules() if isinstance(m, LoraLayer))
         n_params = sum(p.numel() for m in covered for p in (m.lora_A[name].weight, m.lora_B[name].weight))
         logger.info(
-            "inject_frozen_adapter: %r from %s — rank=%d, %d/%d LoraLayer(s) covered, %d params (frozen)",
+            "inject_frozen_adapter: %r from %s — rank=%d, %d/%d LoraLayer(s) covered, %d params (frozen, deferred load)",
             name,
             path,
             peft_cfg.r,
             len(covered),
             total,
             n_params,
+        )
+    return _weights_sha256(weights)
+
+
+_DELTA_INITS = ("gaussian", "eva", "orthogonal", "mica")
+_LORA_BANK_RE = re.compile(r"\.lora_(?:embedding_)?[AB](?=\.|$)")
+_LORA_ADAPTER_RE = re.compile(r"\.lora_(?:embedding_)?[AB]\.([^.]+)")
+
+
+def _adapter_of_lora_key(key: str) -> Optional[str]:
+    """Adapter name of a model state-dict LoRA key (``...lora_A.<adapter>.weight``), else None."""
+    match = _LORA_ADAPTER_RE.search(key)
+    return match.group(1) if match else None
+
+
+def _load_frozen_adapter(model: nn.Module, *, name: str, weights: Dict[str, torch.Tensor], path: str) -> None:
+    """Post-materialize op: reshard the validated ``weights`` into the frozen adapter ``name`` on every rank."""
+    from unirl.train.backend.sharded_state import load_model_state_dict
+
+    # Every rank holds the full (small) adapter dict; DCP slices each rank's own shard.
+    # set_model_state_dict fills its input with every model entry, hence the copy.
+    result = load_model_state_dict(model, dict(weights), strict=False, broadcast_from_rank0=False)
+    # Keys were checked pre-wrap; a wrapper that renamed FQNs would otherwise skip the teacher silently.
+    if result.unexpected_keys:
+        raise RuntimeError(
+            f"inject_frozen_adapter: {len(result.unexpected_keys)} tensor(s) of adapter {name!r} from {path!r} "
+            f"no longer match the wrapped model (first: {sorted(result.unexpected_keys)[:3]})."
+        )
+
+    if _current_rank() == 0:
+        logger.info("_load_frozen_adapter(%r): %d tensor(s) from %s", name, len(weights), path)
+
+
+def _weights_sha256(weights: Dict[str, torch.Tensor]) -> str:
+    """Content hash over sorted ``(key, dtype, shape, bytes)``; independent of file format and metadata."""
+    digest = hashlib.sha256()
+    for key in sorted(weights):
+        tensor = weights[key].detach().cpu().contiguous()
+        digest.update(f"{key}|{tensor.dtype}|{tuple(tensor.shape)}|".encode())
+        digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
+
+
+class FrozenAdapters:
+    """Frozen sibling LoRA adapters: kept out of adapter checkpoints and pinned by content sha256 on resume."""
+
+    def __init__(self, shas: Optional[Dict[str, str]] = None) -> None:
+        self.shas: Dict[str, str] = dict(shas or {})  # name -> content sha256
+
+    @classmethod
+    def inject(cls, model: nn.Module, specs: Any) -> FrozenAdapters:
+        """Inject every ``lora_cfg.frozen_adapters`` entry: structure now, weights after materialization."""
+        return cls(
+            {s.name: _inject_frozen_adapter(model, name=s.name, path=s.path) for s in normalize_frozen_adapters(specs)}
+        )
+
+    def is_trainable_lora_key(self, key: str) -> bool:
+        """True for ``lora_A`` / ``lora_B`` keys of a non-frozen adapter — what adapter checkpoints hold."""
+        return ("lora_A" in key or "lora_B" in key) and _adapter_of_lora_key(key) not in self.shas
+
+    def check_resume(self, lora_config: Optional[Dict[str, object]]) -> None:
+        """Refuse a checkpoint that recorded a different frozen set; an empty or absent record imposes nothing."""
+        recorded = (lora_config or {}).get("frozen_adapters")
+        if not recorded or recorded == self.shas:
+            return
+        added = sorted(set(self.shas) - set(recorded))
+        removed = sorted(set(recorded) - set(self.shas))
+        changed = sorted(
+            f"{name} ({recorded[name][:12]}... -> {self.shas[name][:12]}...)"
+            for name in set(recorded) & set(self.shas)
+            if recorded[name] != self.shas[name]
+        )
+        raise RuntimeError(
+            f"resume: frozen_adapters differ from the checkpoint's (added: {added}, removed: {removed}, "
+            f"weights changed: {changed}). Resume with the same frozen adapter checkpoints or start a new run."
         )
 
 
@@ -342,11 +411,11 @@ def _current_rank() -> int:
 
 
 __all__ = [
+    "FrozenAdapters",
     "ModuleSelection",
     "adapter_active",
     "adapter_names",
     "adapters_disabled",
-    "inject_frozen_adapter",
     "inject_lora",
     "normalize_module_selection",
     "normalize_optional_module_selection",

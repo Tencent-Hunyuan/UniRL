@@ -24,8 +24,8 @@
 #   logprob_precision   = fp32         (PPO ratio stability)
 #   trajectory_precision = fp16        (rollout cache fits per actor)
 #
-# Launch (4 nodes x 8 GPUs, taiji SPMD):
-#   bash examples/run_experiment_multinode_taiji.sh diffusion/flux2_klein/flux2_klein_trainside
+# Launch (4 nodes x 8 GPUs, SPMD):
+#   bash examples/run_experiment_multinode.sh diffusion/flux2_klein/flux2_klein_trainside
 
 num_devices: 8                # launcher auto-overrides via NUM_NODES * GPUS_PER_NODE
 batch_size: 64                # prompts_per_rollout (64 x 16 samples = 1024 global)

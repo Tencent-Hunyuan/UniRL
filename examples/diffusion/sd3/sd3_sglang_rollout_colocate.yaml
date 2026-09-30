@@ -4,7 +4,7 @@
 #   - rollout engine target points at SGLangDiffusionRolloutEngine via v2 builder
 #   - LoRA reuses the existing sglang weight-sync bridge (set_lora_from_tensors)
 #
-#   2x8:  bash examples/run_experiment_multinode_taiji.sh diffusion/sd3/sd3_sglang_rollout_colocate
+#   2x8:  bash examples/run_experiment_multinode.sh diffusion/sd3/sd3_sglang_rollout_colocate
 
 num_devices: 16               # 2 nodes x 8 GPUs; launcher auto-overrides via NUM_NODES*GPUS_PER_NODE
 batch_size: 96                # prompts_per_rollout, matches v1 reference 2x8 baseline
@@ -103,15 +103,6 @@ rollout:
     num_gpus: 1
     tp_size: 1
     local_mode: true
-    target_modules:
-      - attn.add_k_proj
-      - attn.add_q_proj
-      - attn.add_v_proj
-      - attn.to_add_out
-      - attn.to_k
-      - attn.to_out.0
-      - attn.to_q
-      - attn.to_v
     engine_kwargs:
       model_type: sd3
   # SGLang reads ckpt/LoRA off model_config and sde_label off strategy.
@@ -149,6 +140,7 @@ stack:
   micro_batch_size: 1
   max_grad_norm: 1.0
   num_updates_per_batch: 2      # PPO mini-batches per rollout (π_old frozen once); v1 parity
+  shuffle_updates: true
 
 data_source:
   # Real prompts loaded from file: MultimodalRLDataSource reads TXT/JSON/JSONL
