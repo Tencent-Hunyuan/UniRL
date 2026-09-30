@@ -26,6 +26,7 @@ from unirl.rollout.engine.vllm_omni.pipelines._shared.interception import (
     resolve_request_noise,
     set_payload,
     single_request,
+    stamp_capture,
 )
 from unirl.rollout.engine.vllm_omni.pipelines.bagel.bagel_flow_match_sde_scheduler import (
     BagelFlowSDEScheduler,
@@ -47,6 +48,7 @@ class RLBagelPipeline(BagelPipeline):
         self._rope_fp32_patched = False
         self._rmsnorm_fp32_patched = False
         self._pending_initial_noise: Optional[torch.Tensor] = None
+        self._pending_layout: Optional[Dict[str, Any]] = None
         self._pending_spp: int = 1
         self._pending_batched_latents: Optional[list] = None
         self._trajectory_dtype: torch.dtype = torch.float32
@@ -150,6 +152,13 @@ class RLBagelPipeline(BagelPipeline):
                 kw["image_sizes"] = list(kw["image_sizes"]) * spp
                 kw["curr_kvlens"] = list(kw["curr_kvlens"]) * spp
                 kw["curr_rope"] = list(kw["curr_rope"]) * spp
+            height, width = kw["image_sizes"][0]
+            pipeline_self._pending_layout = {
+                "kv_len": int(kw["curr_kvlens"][0]),
+                "rope": int(kw["curr_rope"][0]),
+                "height": int(height),
+                "width": int(width),
+            }
             out = orig(*args, **kw)
             noise = pipeline_self._pending_initial_noise
             if noise is not None:
@@ -353,6 +362,7 @@ class RLBagelPipeline(BagelPipeline):
         self._install_noise_tap()
         self._install_rope_fp32()
         self._install_rmsnorm_fp32()
+        self._pending_layout = None
 
         spp = getattr(one.sampling_params, "num_outputs_per_prompt", 1)
         if spp > 1:
@@ -378,6 +388,7 @@ class RLBagelPipeline(BagelPipeline):
         out = super().forward(req, **kwargs)
 
         self._harvest_trajectory(out)
+        stamp_capture(out, "layout", self._pending_layout)
         finalize_output(out)
         return out
 
@@ -394,6 +405,7 @@ class RLBagelPipeline(BagelPipeline):
         try:
             out = super().forward(req, **kwargs)
             self._harvest_trajectory(out)
+            stamp_capture(out, "layout", self._pending_layout)
             finalize_output(out)
             lats = self._pending_batched_latents
             if not lats or len(lats) != spp:
