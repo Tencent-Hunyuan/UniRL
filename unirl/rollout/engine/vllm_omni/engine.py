@@ -90,7 +90,7 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
         return self._generate_locked(sample)
 
     def packs_groups(self, sample: Sample) -> bool:
-        """The adapter answers: packed t2i collapses a group into one prompt, per-row modalities do not."""
+        """The adapter answers whether its requests need whole samples_per_prompt groups."""
         return self.adapter.packs_groups(sample)
 
     def _generate_locked(self, sample: Sample) -> Sample:
