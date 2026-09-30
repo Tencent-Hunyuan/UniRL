@@ -1,10 +1,12 @@
 # @package _global_
 # MiniMax-H3 t2va (text -> video + stereo audio) Flow-GRPO — trainside FSDP.
 #
-# Reward rises at this canvas, +0.00234/step over two seeds. WARNING: nothing in
-# this reward relates the prompt to the video, and the NFT sibling on it decoded
-# to luma 2/255 while imagebind peaked — check frames before trusting the number.
-# For 768x768, restore height/width and pin `sde_indices: [0, 3, 6, 9]`.
+# Reward rose +0.00234/step over two seeds at this canvas, but with imagebind
+# mode=audio_video and neither master_dtype nor cast_forward_inputs set; this
+# file is not that configuration. Neither reward term scores artifacts — check frames.
+# For 768x768, restore height/width, pin `sde_indices: [0, 3, 6]` and set
+# `samples_per_prompt: 4`: replay holds ~12 GB/step there, and host RAM scales
+# with packed rows.
 #
 # Launch (1 node x 8 GPUs):
 #   bash examples/run_experiment_multinode_taiji.sh diffusion/minimax_h3/minimax_h3_t2va_trainside
