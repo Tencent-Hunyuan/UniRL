@@ -142,6 +142,7 @@ _STEP_PHASE_SPECS = (
     ("rollout", "sleep", "sleep"),
     ("weight_sync", "sync", "weight_sync"),
     ("reward", "score_and_attach", "reward"),
+    ("reward_stack", "rollout_and_score", "rollout_score"),
     ("stack", "train_track", "train"),
 )
 

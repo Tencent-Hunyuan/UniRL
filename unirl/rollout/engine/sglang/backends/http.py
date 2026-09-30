@@ -599,7 +599,7 @@ class HTTPBackend:
             self._rt["LoadLoRAAdapterFromTensorsReqInput"](
                 lora_name=str(lora_name),
                 config_dict=dict(config_dict or {}),
-                serialized_tensors=serialized,
+                serialized_named_tensors=[serialized] * self._tp_size,
             ),
             "set_lora",
         )

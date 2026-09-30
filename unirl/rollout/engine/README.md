@@ -73,7 +73,7 @@ handler in `../../distributed/weight_sync`.
   `sglang/backends/http.py` sends inlined base64 pickle bytes instead. Re-check the
   `SafeUnpickler` allowlist and broadcast semantics on a SGLang bump.
 - **`rl_on_policy_target` silently switches on deterministic sampling.** SGLang
-  0.5.12.post1 derives `enable_deterministic_inference` from it, and every request
+  0.5.19 derives `enable_deterministic_inference` from it, and every request
   that carries no `sampling_seed` then defaults to seed 42 — so one `n=8` request
   comes back as eight token-identical completions. The adapters therefore send
   deterministic fan-out as `n=1` requests each carrying one derived

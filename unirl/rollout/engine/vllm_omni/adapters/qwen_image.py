@@ -97,7 +97,7 @@ class QwenImageOutputAdapter(DitOutputAdapter):
         "the output envelope's unirl metadata. Check that RLQwenImagePipeline's "
         "encode_prompt tap ran in every DiT worker — the subclass swap may "
         "not have taken effect (verify custom_pipeline_args.pipeline_class "
-        "in the stage YAML)."
+        "in the deploy config)."
     )
 
     def build_conditions(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
@@ -138,7 +138,7 @@ class QwenImageOutputAdapter(DitOutputAdapter):
 class QwenImageT2iAdapter(ModelAdapter):
     """Qwen-Image text → image (single diffusion stage, TP=1)."""
 
-    stage_yaml = "qwen_image_t2i_rl.yaml"
+    deploy_config = "qwen_image_t2i_rl.yaml"
     omni_mode = "text-to-image"
     needs_driver_tokenizer = False
 
@@ -146,6 +146,9 @@ class QwenImageT2iAdapter(ModelAdapter):
         super().__init__(config, model_config, strategy=strategy, tokenize_fn=tokenize_fn)
         self.input_adapter = QwenImageGroupedInputAdapter(self.modality, model_config=model_config)
         self.output_adapter = QwenImageOutputAdapter(self.modality)
+
+    def packs_groups(self, sample: Sample) -> bool:
+        return True
 
     def validate_request(self, sample: Sample) -> None:
         if sample.has_image_input():

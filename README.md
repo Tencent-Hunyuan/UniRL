@@ -66,30 +66,50 @@ Model and algorithm support are **two independent dimensions** that compose with
 a domain: any diffusion algorithm (see above) runs on a diffusion
 model, AR algorithms on AR models — so UniRL covers many more model × algorithm
 combinations than the shipped example recipes alone. The table below is the model
-dimension; all listed models are supported (✅).
+dimension: each row links one runnable recipe. Full matrix — package, every recipe,
+rollout engine, and restriction per model — in
+[`unirl/models/README.md`](unirl/models/README.md#support-matrix).
+
+<!-- MiniMax-H3 is trainside-only until the vLLM-Omni rollout backend (#378 / #420)
+     lands; update its row here and in unirl/models/README.md when it merges. -->
 
 <div align="center">
 
-| Model | Category | Modality | Status |
-|---|---|---|---|
-| Stable Diffusion 3 / 3.5 | Image diffusion | Text → Image | ✅ |
-| Qwen-Image | Image diffusion | Text → Image | ✅ |
-| FLUX.2-Klein | Image diffusion | Text → Image / Text + Image → Image | ✅ |
-| Z-Image | Image diffusion | Text → Image | ✅ |
-| WAN 2.1 | Video diffusion | Text / Image → Video | ✅ |
-| WAN 2.2 | Video diffusion | Text / Image → Video | ✅ |
-| HunyuanVideo 1.0 / 1.5 | Video diffusion | Text → Video | ✅ |
-| LTX-Video-2 | Video diffusion | Text → Video | ✅ |
-| LTX-Video-2.3 | Video diffusion | Text → Audio + Video | ✅ |
-| Qwen-VL | Vision-language AR | Text + Image → Text | ✅ |
-| Qwen3 | LLM AR | Text → Text | ✅ |
-| Qwen3-Omni Thinker | Omni-modality | Text/Image/Audio/Video → Text | ✅ |
-| Prompt-Enhancer | LLM + diffusion | Text → Text → Image | ✅ |
-| HunyuanImage3 | Unified AR + diffusion | Text → Image | ✅ |
-| Bagel | Unified AR + diffusion | Text / Text + Image → Image | ✅ |
-| SenseNova-U1.5 | Unified MoT pixel flow | Text → Image | ✅ |
+| Model | Category | Modality | Recipe | Status |
+|---|---|---|---|---|
+| Stable Diffusion 3.5 | Image diffusion | Text → Image | [`sd3_trainside`](examples/diffusion/sd3/sd3_trainside.yaml) | ✅ |
+| Qwen-Image | Image diffusion | Text → Image | [`qwen_image_trainside`](examples/diffusion/qwen_image/qwen_image_trainside.yaml) | ✅ |
+| Qwen-Image-Edit-2511 | Image diffusion | Text + Image → Image | [`qwen_image_edit_plus_nft`](examples/diffusion/qwen_image_edit_plus/qwen_image_edit_plus_nft.yaml) | ✅ |
+| FLUX.2-Klein (4B / 9B) | Image diffusion | Text → Image / Text + Image → Image | [`flux2_klein_trainside`](examples/diffusion/flux2_klein/flux2_klein_trainside.yaml) | ✅ |
+| Z-Image | Image diffusion | Text → Image | [`z_image_trainside`](examples/diffusion/z_image/z_image_trainside.yaml) | ✅ |
+| Boogu-Image-0.1 | Image diffusion | Text → Image | [`boogu_image_trainside`](examples/diffusion/boogu_image/boogu_image_trainside.yaml) | ✅ trainside only |
+| WAN 2.1 | Video diffusion | Text / Image → Video | [`wan21_t2v`](examples/diffusion/wan21/wan21_t2v.yaml) | ✅ |
+| WAN 2.2 (A14B) | Video diffusion | Text / Image → Video | [`wan22_t2v_14b`](examples/diffusion/wan22/wan22_t2v_14b.yaml) | ✅ |
+| WAN 2.2 V2V | Video diffusion | Video → Video | [`wan22_v2v_14b`](examples/diffusion/wan22_v2v/wan22_v2v_14b.yaml) | ✅ trainside only |
+| HunyuanVideo 1.0 | Video diffusion | Text → Video | [`hunyuan_video10_t2v_trainside`](examples/diffusion/hunyuan_video10/hunyuan_video10_t2v_trainside.yaml) | ✅ |
+| HunyuanVideo 1.5 | Video diffusion | Text → Video | [`hunyuan_video15_t2v_dancegrpo_trainside`](examples/diffusion/hunyuan_video15/hunyuan_video15_t2v_dancegrpo_trainside.yaml) | ✅ |
+| LTX-2 | Video diffusion | Text → Video | [`ltx2_t2v_trainside`](examples/diffusion/ltx2/ltx2_t2v_trainside.yaml) | ✅ |
+| LTX-2.3 | Video diffusion | Text → Audio + Video | [`ltx2_3_t2av_trainside`](examples/diffusion/ltx2/ltx2_3_t2av_trainside.yaml) | ✅ trainside only |
+| MiniMax-H3 | Video diffusion | Text → Video + Audio | [`minimax_h3_t2va_trainside`](examples/diffusion/minimax_h3/minimax_h3_t2va_trainside.yaml) | ✅ trainside only |
+| HunyuanImage 3.0 | Unified AR + diffusion | Text / Text + Image → Image | [`hi3_trainside_t2i`](examples/unified_model/hi3_trainside_t2i.yaml) | ✅ |
+| BAGEL-7B-MoT | Unified AR + diffusion | Text / Text + Image → Image; Text + Image → Text | [`bagel_trainside_lora`](examples/diffusion/bagel/bagel_trainside_lora.yaml) | ✅ |
+| SenseNova-U1.5 | Unified MoT pixel flow | Text → Image | [`sensenova_u1_5_trainside`](examples/diffusion/sensenova_u1_5/sensenova_u1_5_trainside.yaml) | ✅ trainside only |
+| Janus-Pro | Unified AR | Text → Image; Text + Image → Text | [`janus_pro_grpo_t2i_lora`](examples/ar/janus_pro_grpo_t2i_lora.yaml) | ✅ trainside only |
+| Qwen3 | LLM AR | Text → Text | [`qwen3_grpo_4b_base_dapo_sglang`](examples/ar/qwen3_grpo_4b_base_dapo_sglang.yaml) | ✅ |
+| Qwen3-MoE (VeOmni EP) | LLM AR | Text → Text | [`qwen3_moe_grpo_30b_a3b_veomni_ep_sglang`](examples/ar/qwen3_moe_grpo_30b_a3b_veomni_ep_sglang.yaml) | 🧩 bundle-only |
+| Qwen3.5 (9B / 35B-A3B) | VLM AR | Text / Text + Image → Text | [`qwen3_5_grpo_9b_base_dapo_sglang`](examples/ar/qwen3_5_grpo_9b_base_dapo_sglang.yaml) | ✅ sglang only |
+| Qwen2.5-VL | VLM AR | Text + Image → Text | [`qwen_vl_grpo_geo3k_mc_4x8`](examples/ar/qwen_vl_grpo_geo3k_mc_4x8.yaml) | ✅ |
+| Qwen3-Omni Thinker | Omni-modality AR | Text / Image / Audio / Video → Text | [`qwen3_omni_video_r1_gspo_lora_vllm_omni_1x4`](examples/ar/qwen3_omni_video_r1_gspo_lora_vllm_omni_1x4.yaml) | ✅ vllm_omni only |
+| Cosmos3-Nano | World model | Video (+ action) prediction | [`sft/cosmos3_droid100_videopred`](examples/sft/cosmos3_droid100_videopred.yaml) | 🧪 SFT-only |
+| Prompt-Enhancer | LLM + diffusion (composed) | Text → Text → Image | [`pe_trainside_pickscore`](examples/pe/pe_trainside_pickscore.yaml) | 🔗 composed |
 
 </div>
+
+✅ runnable end-to-end with the linked recipe (a qualifier names the only rollout
+engine that has a recipe) · 🧩 bundle-only (no pipeline of its own; runs under
+another package's pipeline) · 🧪 SFT-only (no rollout path) · 🔗 composed from other
+rows. SFT, async, agentic, and scorer-service requirements per model are in the
+[full matrix](unirl/models/README.md#support-matrix).
 
 ## Training Modes 🧩
 
