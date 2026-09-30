@@ -96,6 +96,9 @@ The included tools are:
   a `failed` outcome; the trainer excludes failed trajectories from GRPO statistics. A slot RPC
   failure poisons the manager and fails the training step. Teardown failures are logged and
   suppressed.
+- A trajectory that runs out of token budget is an `overflow` outcome: the next prompt reaches the
+  SGLang server's input limit under `context_length`, or the final turn is cut at `max_new_tokens`
+  (clamped to the context left). It is scored like a completed trajectory.
 - `max_turns` is the hard engine bound. When an environment also exposes
   `max_turns`, the production engine requires it to match. `ToolEnvironment`
   also terminates when no row calls a tool.

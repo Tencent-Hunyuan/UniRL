@@ -27,6 +27,18 @@ logger = logging.getLogger(__name__)
 
 _TIERED_TIMEOUT: Any = object()
 
+# 408/409/425/429 are the 4xx the server may answer differently on a retry; the rest are
+# deterministic in the payload, so retrying them just burns max_retries seconds.
+_RETRYABLE_4XX = frozenset({408, 409, 425, 429})
+
+
+class SRTHTTPError(RuntimeError):
+    """An SRT HTTP error carrying the status code the retry policy keys on."""
+
+    def __init__(self, message: str, *, code: int) -> None:
+        super().__init__(message)
+        self.code = code
+
 
 def _signal_process_tree(pid: int, sig: signal.Signals) -> None:
     """Signal ``pid``'s owned process group, or only ``pid`` before ``setsid``."""
@@ -361,6 +373,8 @@ class HTTPBackend:
             try:
                 return self._post("/generate", payload, timeout=None)
             except Exception as exc:
+                if isinstance(exc, SRTHTTPError) and 400 <= exc.code < 500 and exc.code not in _RETRYABLE_4XX:
+                    raise
                 if attempt >= max_retries - 1:
                     raise RuntimeError(f"SGLang SRT POST {url} failed after {max_retries} retries: {exc}") from exc
                 logger.debug("SGLang SRT POST %s attempt %d/%d failed: %s", url, attempt + 1, max_retries, exc)
@@ -407,7 +421,7 @@ class HTTPBackend:
                 error_body = exc.read().decode("utf-8")[:1000]
             except Exception:
                 pass
-            raise RuntimeError(f"SGLang SRT HTTP {exc.code} for {url}: {error_body}") from exc
+            raise SRTHTTPError(f"SGLang SRT HTTP {exc.code} for {url}: {error_body}", code=exc.code) from exc
 
     def _post_struct(
         self,
