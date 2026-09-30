@@ -10,7 +10,7 @@ import torch
 
 from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, distributed
-from unirl.rollout.engine.base import BaseRolloutEngine
+from unirl.rollout.engine.base import BaseRolloutEngine, reject_row_canvases
 from unirl.rollout.engine.sglang_diffusion.adapters import get_adapter
 from unirl.rollout.engine.sglang_diffusion.backends import SGLangBackend
 from unirl.rollout.engine.sglang_diffusion.config import (
@@ -113,6 +113,7 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
 
     def _generate_core(self, sample: Sample) -> Sample:
         """Synchronous generation for one whole ``Sample``."""
+        reject_row_canvases(sample, engine="SGLangDiffusionRolloutEngine")
         gen = sample.frontier_gen_part(DiffusionSamplingParams)
         require(
             int(gen.batch_size) > 0,

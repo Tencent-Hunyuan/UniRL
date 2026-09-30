@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from dataclasses import fields as dc_fields
-from typing import Any, Callable, Dict, List, Literal, Optional, Sequence
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple
 
 import torch
 
@@ -511,6 +511,17 @@ class Sample(Batch):
             return [None] * n
         by_root_id = dict(zip(root.sample_ids, root.metadata))
         return [by_root_id.get(rgid) for rgid in self.root_group_ids(part_index)]
+
+    def canvases(self) -> List[Tuple[int, int]]:
+        """Output canvas ``(H, W)`` per frontier row: the root row's ``metadata["canvas"]``, else the sampling one."""
+        params = self.parts[-1].sampling_params
+        default = (params.height, params.width)
+        canvases = [meta["canvas"] if meta and "canvas" in meta else default for meta in self.root_metadata()]
+        for canvas in canvases:
+            is_pair = isinstance(canvas, (list, tuple)) and len(canvas) == 2
+            if not is_pair or not all(type(side) is int and side > 0 for side in canvas):
+                raise ValueError(f"metadata['canvas'] must be [height, width] in positive pixels; got {canvas!r}.")
+        return [tuple(canvas) for canvas in canvases]
 
     def gen_parts(self) -> List[Part]:
         """The generated (non-input) Parts — those with :attr:`Part.is_gen`."""
