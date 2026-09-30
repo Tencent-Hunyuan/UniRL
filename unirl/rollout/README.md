@@ -128,7 +128,7 @@ TensorWeightSync):
 |---|---|---|
 | `mem_fraction_static` | `0.3` | Lower SRT KV reservation so FSDP can all-gather full dense weights. `server_intent()` defaults to `0.88` if omitted — too high for colocate. |
 | `enable_lora` | `false` | TensorWeightSync pushes full dense weights; a LoRA pool would be the wrong receive path. |
-| `cuda_graph_max_bs_decode` | `16` (`32` for Qwen3 DRPO) | CUDA graph stays on (`disable_cuda_graph: false`); the DRPO recipe captures its 16-GPU comparison batch, while SGLang's auto-tuned cap can reserve much larger buffers that fight the weight push. |
+| `cuda_graph_max_bs_decode` | `16` | CUDA graph stays on (`disable_cuda_graph: false`); SGLang otherwise auto-tunes the capture cap from GPU memory and TP size, often reserving much larger buffers that fight the weight push. |
 | `skip_server_warmup` | `true` | Skip SRT startup warmup on the 4B colocate path; this knob does not control `wake_up()`. |
 | `attention_backend` | `triton` | Matches the in-tree 4B full-FT recipes. |
 
@@ -147,13 +147,6 @@ keys as-is; keep headroom for NCCL weight-receive buffers. Sync is
 **LoRA colocate** (`*_sglang_lora.yaml`): `enable_lora: true` plus the SGLang LoRA
 pool knobs. This is the exception to the full-FT `enable_lora: false` receive path
 (`LocalLoraWeightSync` instead of TensorWeightSync). Memory numbers are recipe-specific.
-
-**Native versus strict on-policy rollout:** the Qwen3 DRPO recipe leaves
-`rl_on_policy_target` unset, matching the reference VERL comparison's native
-rollout path and keeping SGLang's optimized sampler/model kernels. To diagnose
-strict rollout-versus-FSDP replay parity, launch with
-`+rollout.config.engine_kwargs.rl_on_policy_target=fsdp`. This retains SGLang's
-upstream deterministic sampler and FSDP on-policy log-softmax/model kernels.
 
 **Reserved ports:** `SGLangPorts.reserve()` selects candidate HTTP `port` and
 `nccl_port` values by binding temporary sockets on the engine's node, then

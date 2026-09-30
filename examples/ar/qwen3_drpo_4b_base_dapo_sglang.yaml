@@ -80,6 +80,7 @@ pipeline:
   # 0.018→0.0135). verl stores fp32 (flash-attn xentropy) — parity. Run uhaufzac.
   logprob_precision: fp32
   replay_kernel_options:
+    # PyTorch 2.13: avoid flex-decoding for short padded replay.
     BACKEND: TRITON
 
 backend:
@@ -135,10 +136,8 @@ rollout:
     chat_template_kwargs:
       enable_thinking: true
     engine_kwargs:
-      # Leave rl_on_policy_target unset for the reference VERL-comparison path:
-      # this keeps SGLang's native sampler/model kernels. For strict rollout vs
-      # FSDP replay diagnostics, add rl_on_policy_target=fsdp;
-      # see unirl/rollout/README.md.
+      # Native kernels for the VERL comparison; strict FSDP replay diagnostics:
+      # +rollout.config.engine_kwargs.rl_on_policy_target=fsdp
       # Colocate full-FT preset — see unirl/rollout/README.md (SGLang AR knobs).
       # FULL fine-tuning: lower the SRT KV reservation to give FSDP headroom for
       # the per-rollout full-weight all-gather. No LoRA pool — full dense weights
