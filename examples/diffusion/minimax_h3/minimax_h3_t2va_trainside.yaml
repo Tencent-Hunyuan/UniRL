@@ -34,12 +34,10 @@ bundle:
     # The audio VAE emits ~20 dB too quiet in bf16.
     vae_dtype: fp32
     audio_vae_dtype: fp32
-    autocast_precision: bf16
     trajectory_precision: fp16
     logprob_precision: fp32
     video_shift: 12.0
     audio_shift: 3.0
-    text_encoder_hidden_layer: 50
     audio_joint_sde: true
     aux_components_on_cpu: true
     vae_components_on_cpu: false
