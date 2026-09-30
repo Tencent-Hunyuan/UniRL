@@ -11,7 +11,7 @@ import torch
 from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.models.pe.instruction import ar_child_control, postprocess_pe_texts
-from unirl.rollout.engine.base import BaseRolloutEngine
+from unirl.rollout.engine.base import BaseRolloutEngine, reject_row_canvases
 from unirl.rollout.engine.composed.config import ComposedRolloutEngineConfig
 from unirl.types.primitives import Texts
 from unirl.types.sample import Part, Sample
@@ -166,6 +166,7 @@ class ComposedRolloutEngine(BaseRolloutEngine):
 
     def _generate_core(self, sample: Sample) -> Sample:
         """Run the PE serial flow for a whole ``Sample`` → filled 3-part output."""
+        reject_row_canvases(sample, engine="ComposedRolloutEngine")
         input_part, ar_shell, diffusion_shell = self._unpack_request(sample)
 
         P = len(input_part.sample_ids)

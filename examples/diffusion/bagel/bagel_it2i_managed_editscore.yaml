@@ -266,8 +266,8 @@ sampling:
   cfg_renorm_type: text_channel        # CFG renorm; only active when guidance_scale>1
   eta: 1.0                             # SDE noise scale (per-step stochasticity = GRPO exploration)
   samples_per_prompt: 8                # GRPO group size; it2i sends one worker request per sample
-  height: 512                          # the OUTPUT canvas. Fixed square: the driver's x_T recipe carries ONE
-  width: 512                           # shape for the whole request, and the worker honors it via kv_metadata
+  height: 512                          # the default OUTPUT canvas and the bound for a row's metadata.canvas;
+  width: 512                           # the worker honors each request's shape via kv_metadata
   seed: 42
   init_same_noise: true                # siblings share x_T; in-group diversity comes from the SDE noise (eta>0)
   trajectory_precision: fp32           # forwarded to the worker scheduler's SDE log-prob storage round-trip

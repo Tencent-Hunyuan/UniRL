@@ -15,7 +15,7 @@ import torch
 
 from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, distributed
-from unirl.rollout.engine.base import BaseRolloutEngine
+from unirl.rollout.engine.base import BaseRolloutEngine, reject_row_canvases
 from unirl.rollout.engine.fastvideo._patches import FastVideoUniPCPlan, patch_fastvideo
 from unirl.rollout.engine.fastvideo.config import FastVideoEngineConfig, FastVideoPorts
 from unirl.rollout.engine.sigma_verify import verify_engine_used_sigmas
@@ -345,6 +345,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
 
     def _generate_core(self, sample: Sample) -> Sample:
         """Generate and fill the frontier diffusion Part."""
+        reject_row_canvases(sample, engine="FastVideoRolloutEngine")
         require(
             not self._is_offloaded and self._generator is not None,
             "FastVideoRolloutEngine.generate: engine is offloaded (wake_up first).",
