@@ -31,7 +31,7 @@ bundle:
   config:
     _target_: unirl.models.minimax_h3.config.MiniMaxH3PipelineConfig
     # Accepts a Hub ID or local snapshot; meta-init resolves transformer shards locally.
-    pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,MiniMaxAI/MiniMax-H3}
+    pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL}
     model_precision: bf16
     # The audio VAE emits ~20 dB too quiet in bf16.
     vae_dtype: fp32
@@ -76,8 +76,8 @@ backend:
     reshard_after_forward: true
     activation_checkpointing: true
     use_torch_compile: false
-    # Keeps the fp32-pinned modules unsharded: H3 conditions on t = 1 - sigma, and
-    # a bf16 timestep MLP costs ~40% relative error on sigma near t=1.
+    # Keeps the fp32-pinned modules (patch projections, timestep MLP, output heads,
+    # rope) outside every fully_shard group, so they run at checkpoint precision.
     root_wrap: false
   optimizer_cfg:
     _target_: unirl.train.backend.base.OptimizerConfig
@@ -92,7 +92,7 @@ backend:
     _target_: unirl.train.backend.base.LrSchedulerConfig
     type: constant
     warmup_steps: 0
-    total_steps: 1000
+    total_steps: ${num_rollouts}
   lora_cfg:
     _target_: unirl.train.configs.LoraConfig
     rank: 32
@@ -158,7 +158,6 @@ stack:
   _target_: unirl.train.stack.TrainStack
   micro_batch_size: 1
   max_grad_norm: 1.0
-  num_updates_per_batch: 1
 
 data_source:
   _target_: unirl.data.data_source.MultimodalRLDataSource
@@ -186,7 +185,6 @@ sampling:
   # Keep total samples near 128: 512 per step exhausted a 2.2 TB host in scoring.
   samples_per_prompt: 16
   seed: 42
-  init_same_noise: false
   autocast_precision: bf16
   trajectory_precision: fp16
   logprob_precision: fp32
