@@ -23,6 +23,7 @@ class LocalLoraWeightSync(LoraWeightSyncBase):
         adapter_name: Optional[str] = None,
         verify: bool = False,
         track_prefix: str = "",
+        copy: bool = False,
     ) -> None:
         super().__init__(
             backend=backend,
@@ -32,6 +33,7 @@ class LocalLoraWeightSync(LoraWeightSyncBase):
             track_prefix=track_prefix,
         )
         self._rollout = rollout
+        self._copy = bool(copy)
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def extract(self) -> None:
@@ -62,12 +64,14 @@ class LocalLoraWeightSync(LoraWeightSyncBase):
         # -- an accumulate window, or an eval's later chunks -- can reuse it
         # instead of onloading the trainer just to read identical weights.
         lora_tensors, peft_config = self._cached
-        self._rollout.set_lora_from_tensors(self._adapter_name, lora_tensors, peft_config=peft_config)
+        setter = self._rollout.set_lora_from_tensors_copy if self._copy else self._rollout.set_lora_from_tensors
+        setter(self._adapter_name, lora_tensors, peft_config=peft_config)
         rank = self.rank_info.rank if self.rank_info is not None else 0
         logger.info(
-            "[LoRA-SYNC] rank %s: dispatched %d LoRA tensors to local rollout receiver (adapter=%s, track=%s)",
+            "[LoRA-SYNC] rank %s: dispatched %d LoRA tensors to local rollout receiver via %s (adapter=%s, track=%s)",
             rank,
             len(lora_tensors),
+            "copy" if self._copy else "handle",
             self._adapter_name,
             self._track_prefix or "<single>",
         )
