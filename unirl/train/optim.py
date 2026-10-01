@@ -1,31 +1,14 @@
-"""Optimizer / LR-scheduler factories and their duck-typed protocols."""
+"""Optimizer and LR-scheduler factories."""
 
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, Iterable, List, Optional, Protocol, Tuple, runtime_checkable
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
+from torch.distributed.tensor import DTensor
 
 from unirl.train.backend.base import LrSchedulerConfig, OptimizerConfig
-
-
-@runtime_checkable
-class OptimizerProtocol(Protocol):
-    state: Dict[Any, Dict[str, Any]]
-
-    def step(self) -> None: ...
-    def zero_grad(self) -> None: ...
-    def state_dict(self) -> Dict[str, Any]: ...
-    def load_state_dict(self, state_dict: Dict[str, Any]) -> None: ...
-
-
-@runtime_checkable
-class LRSchedulerProtocol(Protocol):
-    def step(self) -> None: ...
-    def state_dict(self) -> Dict[str, Any]: ...
-    def load_state_dict(self, state_dict: Dict[str, Any]) -> None: ...
-    def get_last_lr(self) -> List[float]: ...
 
 
 def _build_named_param_groups(
@@ -55,52 +38,38 @@ def build_optimizer(
     config: OptimizerConfig,
     *,
     params: Iterable[torch.nn.Parameter],
-    backend: Any = None,
-    actor: Any = None,
     named_params: Optional[Iterable[Tuple[str, torch.nn.Parameter]]] = None,
-) -> OptimizerProtocol:
-    """Build an optimizer from a typed :class:`OptimizerConfig`."""
-    del actor
-    if backend is not None:
-        backend_optimizer = backend.build_optimizer(config)
-        if backend_optimizer is not None:
-            return backend_optimizer
-
-    adam_kwargs = dict(
-        betas=(float(config.adam_beta1), float(config.adam_beta2)),
-        eps=float(config.adam_epsilon),
-        weight_decay=float(config.weight_decay),
-        foreach=False,
-    )
-
-    param_group_lrs = config.param_group_lrs
-    if param_group_lrs and named_params is not None:
+) -> torch.optim.AdamW:
+    """Build an AdamW optimizer from a typed :class:`OptimizerConfig`."""
+    if config.param_group_lrs and named_params is not None:
         groups = _build_named_param_groups(
             named_params,
             base_lr=float(config.learning_rate),
-            group_lrs=dict(param_group_lrs),
+            group_lrs=dict(config.param_group_lrs),
         )
-        if groups:
-            return torch.optim.AdamW(groups, lr=float(config.learning_rate), **adam_kwargs)
-
-    trainable = [p for p in params if p.requires_grad]
-    return torch.optim.AdamW(trainable, lr=float(config.learning_rate), **adam_kwargs)
+    else:
+        groups = []
+    if not groups:
+        groups = [{"params": [p for p in params if p.requires_grad]}]
+    for group in groups:
+        wrapped = [isinstance(p, DTensor) for p in group["params"]]
+        if any(wrapped) and not all(wrapped):
+            group["foreach"] = False
+    return torch.optim.AdamW(
+        groups,
+        lr=float(config.learning_rate),
+        betas=(float(config.adam_beta1), float(config.adam_beta2)),
+        eps=float(config.adam_epsilon),
+        weight_decay=float(config.weight_decay),
+    )
 
 
 def build_lr_scheduler(
     config: LrSchedulerConfig,
     *,
-    optimizer: OptimizerProtocol,
-    backend: Any = None,
-    actor: Any = None,
-) -> Optional[LRSchedulerProtocol]:
+    optimizer: torch.optim.Optimizer,
+) -> Optional[torch.optim.lr_scheduler.LRScheduler]:
     """Build an LR scheduler from a typed :class:`LrSchedulerConfig`."""
-    del actor
-    if backend is not None:
-        backend_scheduler = backend.build_scheduler(config, optimizer)
-        if backend_scheduler is not None:
-            return backend_scheduler
-
     scheduler_type = str(config.type)
     warmup_steps = int(config.warmup_steps)
     total_steps = int(config.total_steps)
@@ -163,4 +132,4 @@ def build_lr_scheduler(
     return None
 
 
-__all__ = ["build_lr_scheduler", "build_optimizer", "OptimizerProtocol", "LRSchedulerProtocol"]
+__all__ = ["build_lr_scheduler", "build_optimizer"]

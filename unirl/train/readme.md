@@ -23,7 +23,7 @@ across ranks and the grad-norm would be wrong — so `fsdp_wrap` claims them int
 root `fully_shard` group by default (`root_wrap`) and fails fast when a multi-rank
 run leaves a trainable param outside every group. The uniform wrap also keeps the
 optimizer an all-`DTensor` param bag (a mixed `Tensor` + `DTensor` bag forces
-`foreach=False` or AdamW's fused kernel raises). Centralizing wrap + step here lets
+`foreach=False` or AdamW's multi-tensor kernel raises). Centralizing wrap + step here lets
 every algorithm inherit these invariants for free; the loss module legitimately
 knows nothing about DTensor sharding or wrap topology.
 
@@ -191,8 +191,10 @@ use LoRA adapter mode. Formats and export live in
   root `fully_shard` group by default** (`root_wrap`, on) — the root group never
   reshards after forward. Set `root_wrap: false` for models whose stages call
   submodules of the wrapped object directly (bagel) or that wrap frozen mixed-dtype
-  siblings (hunyuan_image3); a multi-rank run with a trainable param left outside
-  every group then fails fast.
+  siblings (hunyuan_image3); a trainable param left outside every group fails fast
+  at `world_size > 1`, and on a single rank forces `foreach=False` on its optimizer
+  param group (`optim.py`) and explicit norm reduction in `clip_grad_norm`
+  (`backend/fsdp/state.py`) because `_foreach_*` rejects mixed `Tensor` and `DTensor`.
 - **`defer_grad_sync` needs the last micro-batch of an optimizer step to run a
   backward** — the deferred reduce-scatter only fires inside it. If that micro
   skips backward (an all-empty micro) while earlier ones ran, `TrainStack.train`
