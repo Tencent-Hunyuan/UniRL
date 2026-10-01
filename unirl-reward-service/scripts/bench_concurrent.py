@@ -39,6 +39,8 @@ Notes:
 from __future__ import annotations
 
 import argparse
+import json
+import math
 import statistics
 import sys
 import threading
@@ -47,6 +49,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from PIL import Image
 
@@ -70,6 +73,7 @@ class _Outcome:
     # Per-reward failures reported in body["errors"] — counted separately
     # from transport failures (HTTP errors, timeouts) which go in ``err``.
     per_reward_errs: Counter = field(default_factory=Counter)
+    score_values: dict[str, list[float]] = field(default_factory=dict)
 
 
 def _split_rewards(tokens: list[str]) -> list[str]:
@@ -128,12 +132,31 @@ def _fire_once(
     # result dict. We don't have direct access to body["errors"] here
     # (the client strips it), so missing = failed.
     reward_errs: Counter = Counter()
-    for r in results:
+    score_values: dict[str, list[float]] = {}
+    for result in results:
         for name in rewards:
-            if name not in r:
+            reward_result = result.get(name) if isinstance(result, dict) else None
+            if (
+                not isinstance(reward_result, dict)
+                or not reward_result
+                or any(
+                    not isinstance(value, (int, float))
+                    or isinstance(value, bool)
+                    or not math.isfinite(value)
+                    for value in reward_result.values()
+                )
+            ):
                 reward_errs[name] += 1
+                continue
+            for metric, value in reward_result.items():
+                score_values.setdefault(f"{name}.{metric}", []).append(float(value))
 
-    return _Outcome(ok=True, latency_s=elapsed, per_reward_errs=reward_errs)
+    return _Outcome(
+        ok=not reward_errs,
+        latency_s=elapsed,
+        per_reward_errs=reward_errs,
+        score_values=score_values,
+    )
 
 
 @dataclass
@@ -169,6 +192,14 @@ class _RunStats:
         agg: Counter = Counter()
         for o in self.outcomes:
             agg.update(o.per_reward_errs)
+        return agg
+
+    @property
+    def score_values(self) -> dict[str, list[float]]:
+        agg: dict[str, list[float]] = {}
+        for outcome in self.outcomes:
+            for name, values in outcome.score_values.items():
+                agg.setdefault(name, []).extend(values)
         return agg
 
 
@@ -218,7 +249,31 @@ def _run_one(
 
     stats = _RunStats(concurrency=concurrency, total=total, wall_s=wall, outcomes=outcomes)
     _print_stats(stats, batch_size=args.batch_size)
+    recorded = getattr(args, "_recorded", None)
+    if recorded is not None:
+        recorded.append(_run_record(stats, rewards, args.batch_size))
     return stats
+
+
+def _run_record(stats: _RunStats, rewards: list[str], batch_size: int) -> dict[str, Any]:
+    scores = {
+        name: {
+            "count": len(values),
+            "mean": statistics.fmean(values),
+            "values": sorted(values),
+        }
+        for name, values in sorted(stats.score_values.items())
+        if values
+    }
+    return {
+        "rewards": rewards,
+        "concurrency": stats.concurrency,
+        "batch_size": batch_size,
+        "successful_requests": stats.ok,
+        "failed_requests": stats.fail,
+        "items_per_second": stats.qps * batch_size,
+        "scores": scores,
+    }
 
 
 def _print_stats(s: _RunStats, batch_size: int) -> None:
@@ -324,6 +379,26 @@ def main() -> int:
         "--batch-size", type=int, default=1,
         help="Items per /score request (same image reused). Default 1.",
     )
+    ap.add_argument(
+        "--batch-sweep",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Run each concurrency at every listed request batch size. "
+             "Overrides --batch-size.",
+    )
+    ap.add_argument(
+        "--repetitions",
+        type=int,
+        default=1,
+        help="Repeat every workload point this many times. Default: 1.",
+    )
+    ap.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Write a compact JSON summary of each run.",
+    )
     ap.add_argument("--prompt", default="a cute dog running in the park")
     ap.add_argument(
         "--image", type=Path, default=None,
@@ -358,6 +433,10 @@ def main() -> int:
         ap.error("either --concurrency or --sweep is required")
     if args.total <= 0:
         ap.error("--total must be positive")
+    if args.batch_sweep is not None and any(size <= 0 for size in args.batch_sweep):
+        ap.error("--batch-sweep values must be positive")
+    if args.repetitions <= 0:
+        ap.error("--repetitions must be positive")
 
     rewards = _split_rewards(args.rewards)
     if not rewards:
@@ -399,6 +478,10 @@ def main() -> int:
     )
 
     levels = args.sweep if args.sweep is not None else [args.concurrency]
+    recorded: list[dict[str, Any]] = []
+    args._recorded = recorded if args.output is not None else None
+    batch_sizes = args.batch_sweep if args.batch_sweep is not None else [args.batch_size]
+    exit_code = 0
 
     # Three modes:
     #   - sweep (levels > 1) + isolated: for each reward, run the sweep.
@@ -407,33 +490,45 @@ def main() -> int:
     #   - single level + isolated: run each reward alone at one concurrency,
     #     print one per-reward comparison table. This is the common case.
     #   - not isolated: original behaviour — all rewards together.
-    if args.per_reward_isolated:
-        if len(levels) == 1:
-            concurrency = levels[0]
-            named: list[tuple[str, _RunStats]] = []
-            for name in rewards:
-                print(f"\n--- isolated: reward={name} ---", flush=True)
-                stats = _run_one(args, image, [name], concurrency)
-                named.append((name, stats))
-            _print_per_reward_summary(named)
-            return 0 if all(s.fail == 0 for _, s in named) else 3
+    for _ in range(args.repetitions):
+        for batch_size in batch_sizes:
+            args.batch_size = batch_size
+            if args.per_reward_isolated:
+                if len(levels) == 1:
+                    concurrency = levels[0]
+                    named: list[tuple[str, _RunStats]] = []
+                    for name in rewards:
+                        print(f"\n--- isolated: reward={name} ---", flush=True)
+                        stats = _run_one(args, image, [name], concurrency)
+                        named.append((name, stats))
+                    _print_per_reward_summary(named)
+                    if any(s.fail != 0 for _, s in named):
+                        exit_code = 3
+                else:
+                    # Sweep + isolated: nested loop.
+                    for name in rewards:
+                        print(f"\n########  reward={name}  ########", flush=True)
+                        per_level = [_run_one(args, image, [name], c) for c in levels]
+                        _print_sweep_summary(per_level)
+                        if any(s.fail != 0 for s in per_level):
+                            exit_code = 3
+            else:
+                all_stats = [_run_one(args, image, rewards, c) for c in levels]
 
-        # sweep + isolated: nested loop.
-        ok = True
-        for name in rewards:
-            print(f"\n########  reward={name}  ########", flush=True)
-            per_level = [_run_one(args, image, [name], c) for c in levels]
-            _print_sweep_summary(per_level)
-            ok = ok and all(s.fail == 0 for s in per_level)
-        return 0 if ok else 3
+                if len(all_stats) > 1:
+                    _print_sweep_summary(all_stats)
+                if any(s.fail != 0 for s in all_stats):
+                    exit_code = 3
 
-    all_stats = [_run_one(args, image, rewards, c) for c in levels]
-
-    if len(all_stats) > 1:
-        _print_sweep_summary(all_stats)
+    if args.output is not None:
+        args.output.write_text(
+            json.dumps({"rewards": rewards, "runs": recorded}, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        print(f"\nwrote benchmark JSON: {args.output}")
 
     # Non-zero exit if anything failed — makes CI / scripted use easier.
-    return 0 if all(s.fail == 0 for s in all_stats) else 3
+    return exit_code
 
 
 if __name__ == "__main__":
