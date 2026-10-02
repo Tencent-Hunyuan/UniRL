@@ -19,16 +19,17 @@ server:
 rewards:
   - name: geneval
     scorer: geneval
-    runtime_env: envs/geneval.txt   # empty file; deps come from the host env
+    # Scorer dependencies; the Ray cluster must still use Python 3.10.
+    runtime_env: envs/geneval.txt
     num_replicas: 1
     num_gpus: 1
     num_cpus: 4
     max_concurrency: 1
     params:
-      # Empty paths keep the scorer's fallback discovery/download behavior
-      # (mmdet-shipped config + ~155MB Swin-S checkpoint to its cache dir).
-      mmdet_config: ""
-      mmdet_checkpoint: ""
+      # Clone open-mmlab/mmdetection at branch 2.x for the config, then download
+      # the checkpoint with djghosh13/geneval/evaluation/download_models.sh.
+      mmdet_config: /path/to/mmdetection/configs/mask2former/mask2former_swin-s-p4-w7-224_lsj_8x2_50e_coco.py
+      mmdet_checkpoint: /path/to/detector/mask2former_swin-s-p4-w7-224_lsj_8x2_50e_coco.pth
       clip_arch: ViT-L-14
       clip_pretrained: openai
       score_type: score            # continuous reward, mirrors the paper's _evaluate_reward
