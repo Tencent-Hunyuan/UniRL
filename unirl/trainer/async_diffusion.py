@@ -7,6 +7,7 @@ from dataclasses import replace
 from typing import Any, Dict, Optional, Tuple
 
 import torch
+from hydra.utils import get_class
 
 from unirl.distributed.tensor import hydrate
 from unirl.train.stack import TrainStepResult
@@ -60,6 +61,12 @@ class AsyncDiffusionTrainer(AsyncRolloutTrainerMixin, DiffusionTrainer):
                 "evaluation and checkpoint boundaries, so parking it there would sleep an engine "
                 "that is about to be asked to generate. Drop the key or use the synchronous "
                 "trainer."
+            )
+        algo_cls = get_class(str(diffusion_kwargs["algorithm_cfg"].get("_target_", "")))
+        if getattr(algo_cls, "requires_per_sample_sde_index", False):
+            raise ValueError(
+                f"AsyncDiffusionTrainer does not stratify per-prompt SDE steps, which {algo_cls.__name__} "
+                "requires; use the synchronous DiffusionTrainer."
             )
         per_worker_inflight = int(per_worker_inflight)
         cfg = diffusion_kwargs["cfg"]

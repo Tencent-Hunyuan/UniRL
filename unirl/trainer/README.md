@@ -366,3 +366,35 @@ without driver-authored x_T. `media_log_interval` does not apply
   (it reuses the train model) and for DiffusionNFT (its EMA swap touches the backend around `generate`).
 - **The bundle must be shared, not rebuilt** — the trainer injects one bundle into both
   pipeline and backend; a second `from_config` would silently desync replay. See [`../models/README.md`](../models/README.md).
+- **FlashGRPO assigns one SDE step per prompt, by stratification.** `requires_per_sample_sde_index`
+  makes the trainer put prompt `i` in stratum `i % pool_size`, issue one `generate` per step group,
+  stamp `segment.sde_index_per_sample`, and concatenate the groups into one track *inside a single
+  residency window*. Flash-GRPO wants exactly this granularity: the paper assigns one timestep per
+  prompt with all of that prompt's rollouts sharing it, and asks for stratified assignment so the
+  whole candidate pool is covered each rollout. Per-trajectory timesteps are not required.
+- **The FlashGRPO batch must satisfy `batch_size % (pool_size * rollout dp_size) == 0`.** Each step
+  group is one DP-scattered `generate`, and the handle rejects a call whose root-prompt count is not
+  a multiple of `dp_size`; equal counts per step (stratification) then forces the product to divide
+  the batch. At `batch_size=48` with `dp_size=8` the candidate pool can hold at most 6 steps, so the
+  scheduler's `timestep_fraction` must be narrowed to match. The trainer checks this at startup, once
+  the rollout is built, rather than letting a group of 1-5 prompts reach the handle.
+- **The FlashGRPO groups merge before advantages.** The concatenation must happen before
+  `compute_advantages`, because advantage normalization is batch-wide over the merged track. Each
+  prompt's own rollouts already share one step, so the merged track still compares like with like.
+- **FlashGRPO needs one root group per root row.** The per-prompt step draw indexes
+  `Sample.split()`, the same list `Sample.select` gathers from. `split()` groups by root id,
+  so duplicate root ids or an empty root part yield fewer groups than rows and would silently
+  collapse the whole batch onto one request and one sigma. The trainer compares the two counts
+  and raises instead.
+- **A merged FlashGRPO track's shared fields are not per-sample truth.** `Segment.concat` keeps each
+  `shared_field` from the first group, so `sde_indices` and `indices` on the merged track name one
+  group's steps only. `sde_index_per_sample` (a `CONCAT` field) is the authoritative per-sample step;
+  replay that reads it must index fixed latent slots, not `latents_at()`.
+- **The SDE candidate pool must not reach the final denoising step.** Step `T-1` stores two trajectory
+  latents where earlier steps store three, and `torch.cat` cannot merge different `K`. The trainer
+  raises at build time rather than failing mid-rollout. Keep the scheduler's `timestep_fraction` end
+  below `(num_inference_steps - 1) / num_inference_steps`.
+- **`rectification_indices` must equal the scheduler's candidate pool.** The per-sample rectification
+  weight normalizes each sample's coefficient by the mean over `rectification_indices` while the step
+  itself is drawn from `sde_candidate_pool()`; the two live in different config blocks, and a mismatch
+  silently rescales the loss. The trainer fails fast instead.
