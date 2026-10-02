@@ -1,23 +1,35 @@
 # Reward Service
 
-A unified T2I reward inference service: a FastAPI gateway in front of Ray worker groups. Each reward model owns its own GPU(s) and is resource-isolated from the others.
+A multimodal reward inference service: a FastAPI gateway in front of Ray worker groups. Each reward model owns its own GPU(s) and is resource-isolated from the others.
 
-## Supported reward models
+## Scorer registry and deployment status
 
-| Name | Framework | Notes |
-|---|---|---|
-| `clip` | transformers | openai/clip-vit-large-patch14, cosine similarity |
-| `pickscore` | transformers | yuvalkirstain/PickScore_v1 |
-| `imagereward` | official `image-reward` pip package | ImageReward-v1.0 |
-| `hpsv2` | official `hpsv2` pip package | supports v2.0 / v2.1 |
-| `hpsv3` | official `hpsv3` pip package | built on Qwen2-VL |
-| `unified_reward` | vLLM | UnifiedReward VLM family (model set in YAML); parses the generated text into Alignment / Coherence / Style |
-| `geneval2` | vLLM | VQAScore via Qwen3-VL-8B-Instruct (Soft-TIFA multi-question scoring when `dataset_path` is set; falls back to a single-question template otherwise) |
-| `ocr` | transformers | GOT-OCR-2.0-hf; reward = edit-distance similarity between the recognized text and the target span in the prompt |
-| `wise` | vLLM | A MoE VLM (e.g. Qwen3.5-35B-A3B) used as a generic WISE-rubric reward judge. Default sub-metrics: a derived `wiscore` headline plus Consistency / Realism / Aesthetic Quality (template overridable in YAML) |
-| `editscore` | vLLM | EditScore judge (Qwen3-VL / Qwen2.5-VL backbone + LoRA) for instruction-guided image **editing**: scores Prompt Following / Consistency / Perceptual Quality and a derived `overall`. Takes a source + edited image pair (`history_kind: image_edit`); supports vLLM sleep mode, so it can run `gpu_residency: per_call` as a managed child |
-| `geneval` | mmdet / mmcv | Compositional GenEval (Mask2Former detection + CLIP color classification). **Disabled by default** — its stack needs Python 3.10 and cannot run under this service's Python-3.13 Ray cluster (see `envs/geneval.txt`) |
-| `videoalign` | transformers (vendored `_videoalign/`) | T2V reward: scores generated **videos** along Overall / VQ / MQ / TA. Requires a video (`video_b64` or `video_path`) on the request. **Disabled by default** in the example config |
+The canonical scorer names are the keys in
+[`reward_service/scorers/registry.py`](reward_service/scorers/registry.py).
+Registration means the service can resolve a scorer module; it does not mean
+that a deployment config allocates resources for it.
+
+| Registry name | Framework | Example deployment | Notes |
+|---|---|---|---|
+| `clip` | transformers | enabled | openai/clip-vit-large-patch14 cosine similarity. |
+| `pickscore` | transformers | enabled | yuvalkirstain/PickScore_v1. |
+| `imagereward` | `image-reward` | enabled | ImageReward-v1.0. |
+| `hpsv2` | `hpsv2` | enabled | Supports v2.0/v2.1. |
+| `hpsv3` | `hpsv3` | enabled | Qwen2-VL-based HPSv3. |
+| `unified_reward` | vLLM | enabled | Parses Alignment / Coherence / Style from a configured UnifiedReward VLM. |
+| `geneval2` | vLLM | enabled | Qwen3-VL VQAScore; `dataset_path` enables multi-question Soft-TIFA, otherwise it uses a single-question fallback. |
+| `ocr` | transformers | enabled | GOT-OCR-2.0-hf edit-distance similarity to the prompt's target span. |
+| `editreward` | transformers | enabled | Qwen2.5-VL-based scorer for source + edited image history; output columns depend on the checkpoint config, and checked-in recipes consume the first score channel. |
+| `editscore` | vLLM | commented | Image-editing VLM judge; the checked-in training recipes normally launch it as a managed rank-affine child. |
+| `geneval` | mmdet/mmcv | separate config | Official Mask2Former + CLIP GenEval. Its Python 3.10 stack cannot join the example Python 3.13 Ray cluster through `runtime_env`. |
+| `videoalign` | transformers, vendored model | commented | T2V Overall / VQ / MQ / TA; requests require `video_b64` or a service-readable `video_path`. |
+| `wise` | vLLM | commented, dedicated host | Generic WISE-rubric VLM judge; the example reserves an entire 8-GPU host. |
+
+“Enabled” above means an active entry in
+[`configs/service.example.yaml`](configs/service.example.yaml); edit weight paths
+and remove groups that do not fit the deployment's GPU budget. `geneval`,
+`videoalign`, `wise`, and `editscore` remain registered even though that example
+does not start them.
 
 ## Architecture
 
@@ -32,6 +44,15 @@ Client ──HTTP──▶ FastAPI Gateway ──Ray actor call──▶ WorkerG
 - Routing fans each request out by `required_rewards` to the matching group, picking an actor round-robin.
 
 The full architecture document (topology, sequence, abstraction layers, extension points) lives in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
+### Documentation map
+
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) is the user/developer design reference.
+- [`CHANGELOG.md`](CHANGELOG.md) records released behavior changes.
+- [`docs/DEVELOPMENT_LOG.md`](docs/DEVELOPMENT_LOG.md) and
+  [`docs/RESUME_PROMPT.md`](docs/RESUME_PROMPT.md) are maintainer handoff records.
+  They preserve historical investigation and session-resume context; they are
+  not setup instructions or user-facing sources of truth.
 
 ## Installation
 
