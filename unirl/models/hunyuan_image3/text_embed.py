@@ -145,6 +145,15 @@ class HunyuanImage3TextEmbedStage:
             drop_think=gen_config.drop_think,
             **{_cond_kw: batch_cond_image_info},
         )
+        n_samples = len(batch_prompt if batch_prompt is not None else batch_message_list)
+        expected_rows = n_samples * int(cfg_factor)
+        rows = int(out["output"].tokens.shape[0])
+        if rows != expected_rows:
+            raise ValueError(
+                f"HunyuanImage3TextEmbedStage: chat template returned {rows} row(s) for "
+                f"{n_samples} prompt(s) at cfg_factor={cfg_factor}, expected {expected_rows}. "
+                "This checkpoint cannot batch prompts here; use rollout.forward_batch_size: 1."
+            )
         return out["output"], out["sections"]
 
     def _fused_common(
