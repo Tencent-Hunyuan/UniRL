@@ -146,16 +146,20 @@ def _activate(model: nn.Module, adapter_name: str) -> None:
             m.set_adapter(adapter_name)
 
 
+def _adapter_banks(layer: nn.Module) -> Iterator[Any]:
+    for key in layer.adapter_layer_names:
+        yield getattr(layer, key, {})
+
+
 def _set_adapter_requires_grad(model: nn.Module, name: str, requires_grad: bool) -> None:
     from peft.tuners.lora import LoraLayer
 
     for m in model.modules():
         if not isinstance(m, LoraLayer):
             continue
-        for key in ("lora_A", "lora_B"):
-            bank = getattr(m, key, {})
+        for bank in _adapter_banks(m):
             if name in bank:
-                bank[name].weight.requires_grad = requires_grad
+                bank[name].requires_grad_(requires_grad)
 
 
 def adapter_names(model: nn.Module) -> set:
@@ -165,24 +169,35 @@ def adapter_names(model: nn.Module) -> set:
     names: set = set()
     for m in model.modules():
         if isinstance(m, LoraLayer):
-            names.update(getattr(m, "lora_A", {}).keys())
+            for bank in _adapter_banks(m):
+                names.update(bank)
     return names
 
 
 @contextmanager
 def adapter_active(model: nn.Module, name: str, *, trainable: str = "default") -> Iterator[None]:
-    """Temporarily route every LoraLayer through the frozen adapter ``name``."""
+    """Route a frozen teacher and restore the caller's adapter state; see train/readme.md Gotchas."""
+    from peft.tuners.lora import LoraLayer
+
     if name == trainable:
         raise ValueError(f"adapter_active: {name!r} is the trainable adapter; only frozen adapters can be routed.")
-    _activate(model, name)
-    _set_adapter_requires_grad(model, trainable, True)
-    _set_adapter_requires_grad(model, name, False)
+    if name not in adapter_names(model):
+        raise ValueError(f"adapter_active: frozen adapter {name!r} is not present on the model.")
+    active = [(layer, list(layer.active_adapters)) for layer in model.modules() if isinstance(layer, LoraLayer)]
+    grad_flags = [(param, param.requires_grad) for param in model.parameters()]
     try:
+        _activate(model, name)
+        for param, requires_grad in grad_flags:
+            param.requires_grad = requires_grad
+        _set_adapter_requires_grad(model, name, False)
         yield
     finally:
-        _activate(model, trainable)
-        _set_adapter_requires_grad(model, trainable, True)
-        _set_adapter_requires_grad(model, name, False)
+        try:
+            for layer, adapters in active:
+                layer.set_adapter(adapters)
+        finally:
+            for param, requires_grad in grad_flags:
+                param.requires_grad = requires_grad
 
 
 def _resolve_adapter_checkpoint(path: str) -> Tuple[str, Optional[str]]:

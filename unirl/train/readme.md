@@ -62,6 +62,19 @@ in `backend/base.py`; a multi-update-capable algorithm sets
 
 ## Gotchas
 
+- **`adapter_active` restores the caller's per-layer adapter selection and parameter
+  trainability, including when switching fails partway through** — PEFT's
+  `set_adapter` changes `requires_grad` as well as routing. Teacher replay keeps
+  the selected teacher frozen across Linear and Embedding LoRA banks without
+  unfreezing a partially frozen student, and
+  nested contexts return to the outer selection rather than always to `default`.
+  This routing fix does not extend the D1 checkpoint loader to embedding-only
+  frozen teachers; that loader still requires a Linear LoRA target.
+  The caller still owns `torch.no_grad()` and must finish teacher replay before
+  student forward/backward or activation-checkpoint recomputation. Do not run
+  concurrent work or change model structure inside the context. This state
+  transaction alone does not make arbitrary interleaved checkpoint recomputation,
+  FSDP wrapping orders, or backend combinations safe.
 - **`num_updates_per_batch > 1` needs `supports_multi_update` *and* must evenly
   divide the per-worker batch** — otherwise the ctor or `_build_mini_batch_slices`
   raises (a ragged mini-batch would silently drop samples and desync grad-accum
