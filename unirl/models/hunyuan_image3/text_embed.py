@@ -57,6 +57,30 @@ def _optional_output_tensor(output: Any, names: Tuple[str, ...], device: torch.d
     return None
 
 
+def _concat_tokenizer_outputs(outputs: List[Any], pad_token_id: int) -> Any:
+    """Stack per-row ``B=1`` tokenizer outputs, right-padding ``tokens`` / masks; lists concatenate per sample."""
+    keys = list(outputs[0].keys())
+    if any(list(output.keys()) != keys for output in outputs):
+        raise ValueError(f"_concat_tokenizer_outputs: rows carry different fields {[list(o.keys()) for o in outputs]}")
+    merged: Dict[str, Any] = {}
+    for key in keys:
+        values = [output[key] for output in outputs]
+        if isinstance(values[0], torch.Tensor):
+            if key == "tokens" or "mask" in key:
+                width = max(v.shape[-1] for v in values)
+                pad = pad_token_id if key == "tokens" else 0
+                values = [torch.nn.functional.pad(v, (0, width - v.shape[-1]), value=pad) for v in values]
+            shapes = {tuple(v.shape[1:]) for v in values}
+            if len(shapes) > 1:
+                raise ValueError(f"_concat_tokenizer_outputs: {key} is ragged across rows {shapes}")
+            merged[key] = torch.cat(values, dim=0)
+        elif isinstance(values[0], list):
+            merged[key] = [item for v in values for item in v]
+        else:
+            raise TypeError(f"_concat_tokenizer_outputs: unsupported {key}={type(values[0]).__name__}")
+    return type(outputs[0])(merged)
+
+
 class HunyuanImage3TextEmbedStage:
     """HunyuanImage3 chat-template-driven input-prep stage (AR + diffusion)."""
 
@@ -145,6 +169,15 @@ class HunyuanImage3TextEmbedStage:
             drop_think=gen_config.drop_think,
             **{_cond_kw: batch_cond_image_info},
         )
+        n_samples = len(batch_prompt if batch_prompt is not None else batch_message_list)
+        expected_rows = n_samples * int(cfg_factor)
+        rows = int(out["output"].tokens.shape[0])
+        if rows != expected_rows:
+            raise ValueError(
+                f"HunyuanImage3TextEmbedStage: chat template returned {rows} row(s) for "
+                f"{n_samples} prompt(s) at cfg_factor={cfg_factor}, expected {expected_rows}. "
+                "This checkpoint cannot batch prompts here; use rollout.forward_batch_size: 1."
+            )
         return out["output"], out["sections"]
 
     def _fused_common(
@@ -206,28 +239,44 @@ class HunyuanImage3TextEmbedStage:
         batch_message_list: Optional[Any] = None,
         batch_cond_image_info: Optional[Any] = None,
     ) -> Dict[str, Any]:
-        """Build the unified-MM input tensors for ``mode="gen_text"``."""
+        """Build ``mode="gen_text"`` input tensors, one template call per row (README ``## Gotchas``)."""
         gen_config = self.bundle.transformer.generation_config
 
         prompts = list(p.texts) if batch_message_list is None else None
+        n = len(prompts) if prompts is not None else len(batch_message_list)
 
-        output, sections = self._apply_chat_template(
-            mode="gen_text",
-            batch_prompt=prompts,
-            bot_task=bot_task,
-            cfg_factor=1,
-            batch_message_list=batch_message_list,
-            batch_gen_image_info=None,
-            batch_system_prompt=system_prompt,
-            batch_cot_text=cot_text,
-            max_length=max_length,
-            batch_cond_image_info=batch_cond_image_info,
-        )
+        def row(values: Optional[Any], i: int) -> Optional[Any]:
+            return None if values is None else values[i : i + 1]
 
-        prompt_len = int(output.tokens.shape[1])
+        rows = [
+            self._apply_chat_template(
+                mode="gen_text",
+                batch_prompt=row(prompts, i),
+                bot_task=bot_task,
+                cfg_factor=1,
+                batch_message_list=row(batch_message_list, i),
+                batch_gen_image_info=None,
+                batch_system_prompt=row(system_prompt, i),
+                batch_cot_text=row(cot_text, i),
+                max_length=max_length,
+                batch_cond_image_info=row(batch_cond_image_info, i),
+            )
+            for i in range(n)
+        ]
+
+        prompt_len = max(int(output.tokens.shape[1]) for output, _ in rows)
         rope_seq_len = int(getattr(gen_config, "max_length", prompt_len))
         rope_seq_len = max(rope_seq_len, prompt_len)
 
+        fused = [self._fused_for_ar(output, sections, rope_seq_len) for output, sections in rows]
+        if n == 1:
+            return {"fused": fused[0], "tokenizer_output": rows[0][0]}
+        tkw = getattr(self.bundle.transformer, "_tkwrapper", None) or self.bundle.transformer._tokenizer
+        tokenizer_output = _concat_tokenizer_outputs([output for output, _ in rows], tkw.pad_token_id)
+        return {"fused": HunyuanImage3FusedMultimodalCondition.concat(fused), "tokenizer_output": tokenizer_output}
+
+    def _fused_for_ar(self, output: Any, sections: Any, rope_seq_len: int) -> HunyuanImage3FusedMultimodalCondition:
+        """One template output → its ``gen_text`` fused condition."""
         _device, input_ids, attention_mask, position_ids, rope_cache, cond_vit_image_mask = self._fused_common(
             output, sections, rope_seq_len=rope_seq_len
         )
@@ -243,7 +292,7 @@ class HunyuanImage3TextEmbedStage:
                 rp = rp[:, -1]
             prompt_lengths = rp.reshape(-1)
 
-        fused = HunyuanImage3FusedMultimodalCondition(
+        return HunyuanImage3FusedMultimodalCondition(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -253,7 +302,6 @@ class HunyuanImage3TextEmbedStage:
             cond_timestep_scatter_index=cond_timestep_scatter_index,
             prompt_lengths=prompt_lengths,
         )
-        return {"fused": fused, "tokenizer_output": output}
 
     def embed_for_gen_image(
         self,

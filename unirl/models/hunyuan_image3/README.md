@@ -20,3 +20,15 @@ Re-check these when the checkpoint revision moves:
 - `position_ids` are also the KV-cache write indices (`cache_position`), so
   `HunyuanImage3FusedMultimodalCondition.concat` pads them with continuing indices; a `0` pad
   would overwrite the first real token's KV.
+- The checkpoint's batched chat-template path encodes only the first sample:
+  `apply_general_template(batchify=True)` passes a one-element `prompt_list` to `batch_gen_infer`
+  and `zip`s it against the per-sample kwargs, so `apply_chat_template(batch_prompt=[...])`
+  returns `cfg_factor` rows instead of `len(prompts) * cfg_factor`. `_apply_chat_template` raises
+  on that mismatch, which otherwise surfaces as a `Part.fill` count mismatch on the AR path or a
+  `fused.input_ids` shape mismatch on the diffusion path. `embed_for_ar` therefore encodes one
+  row per call, `concat`s the fused rows, and rebuilds the batched `tokenizer_output` itself:
+  upstream decode reads `real_pos` (`[B, 1]`, equal to `fused.prompt_lengths`) and the
+  attention-mask builder reads the per-sample image slices. `embed_for_gen_image` still takes the
+  batched call, so the gen_image recipes keep `rollout.forward_batch_size: 1` until the ragged
+  diffusion concat (fully masked pad query rows, zero-padded `rope_cache`) is checked on the real
+  model (issue #520).
