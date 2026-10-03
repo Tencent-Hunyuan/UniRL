@@ -102,6 +102,9 @@ class Sd3T2iAdapter(ModelAdapter):
         self.input_adapter = Sd3InputAdapter(self.modality)
         self.output_adapter = Sd3OutputAdapter(self.modality)
 
+    def packs_groups(self, sample: Sample) -> bool:
+        return True
+
     def validate_request(self, sample: Sample) -> None:
         if sample.has_image_input():
             raise ValueError(

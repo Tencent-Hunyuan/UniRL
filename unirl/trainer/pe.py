@@ -225,7 +225,9 @@ class PETrainer(BaseTrainer):
         self._drop_decoded(sample, rollout_id=rollout_id)
         results: Dict[str, TrainStepResult] = {
             name: getattr(self, name).stack.train_track(
-                sample.parts[parts_by_name[name]], training_progress=float(training_progress)
+                sample.parts[parts_by_name[name]],
+                training_progress=float(training_progress),
+                rollout_id=rollout_id,
             )
             for name in self._train_tracks
         }

@@ -37,11 +37,12 @@ knows nothing about DTensor sharding or wrap topology.
   **skips the whole step on a non-finite grad norm** (stepping would scale every
   parameter by the bad norm and poison the next rollout).
 - **`TrainStack`** (`stack/base.py`) takes one backend + one `StageAlgorithm` and runs
-  `train_track`: move the segment onto device → `prepare_segment` (freeze π_old
-  once) → `num_updates_per_batch` optimizer steps over disjoint mini-batches, each a
-  micro-batch loop of `compute_loss_and_backward`. The mini/micro slicing comes from
-  one source — the injected `micro_planner` (`stack/planner/`; `CountPlanner` by
-  default, `TokenBudgetPlanner` for token packing) — shared with `prepare_segment`,
+  `train_track`: move the segment onto device → `prepare_segment_anchors` (freeze
+  π_old once) → `num_updates_per_batch` optimizer steps over disjoint mini-batches,
+  each a micro-batch loop of `compute_loss_and_backward`. The mini/micro slicing comes
+  from one source — the injected `micro_planner` (`stack/planner/`; `CountPlanner` by
+  default, `TokenBudgetPlanner` for token packing) — shared with
+  `prepare_segment_anchors` (`stack/anchor.py`, also used by `UnifiedModelTrainStack`),
   so when an algorithm replays its anchor, it's recomputed at the *exact* geometry
   training uses, which is what pins the on-policy PPO ratio to 1 under bf16's
   batch-shape sensitivity. `AgenticTrainer` uses the same interface after
@@ -78,6 +79,12 @@ in `backend/base.py`; a multi-update-capable algorithm sets
   divide the per-worker batch** — otherwise the ctor or `_build_mini_batch_slices`
   raises (a ragged mini-batch would silently drop samples and desync grad-accum
   across DP ranks).
+- **Multi-update membership is contiguous by default.** Set `shuffle_updates: true`
+  on the stack to shuffle the full per-worker batch before it is partitioned into
+  optimizer updates; `shuffle_seed` (default 0) is combined with the rollout id so
+  the per-rollout ordering is reproducible across checkpoint resume. It is a no-op
+  at `num_updates_per_batch: 1`, requires the default `CountPlanner`, and gathers
+  each micro-batch lazily, so it adds no full-track copy.
 - **`optimizer_step` silently *skips* (does not crash) on a non-finite grad norm**
   and zeroes grads — a flat loss curve with a logged warning means grads went
   non-finite.

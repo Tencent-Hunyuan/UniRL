@@ -158,7 +158,7 @@ class BucketedWeightSender:
         else:
             import uuid
 
-            shm_name = f"diffrl_weights_{uuid.uuid4().hex}"
+            shm_name = f"unirl_weights_{uuid.uuid4().hex}"
             shm = create_shared_memory(self.bucket_size, shm_name)
             buffer = torch.frombuffer(shm.buf, dtype=torch.uint8)
             self.buffer = buffer

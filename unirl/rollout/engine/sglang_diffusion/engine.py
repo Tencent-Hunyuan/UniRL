@@ -233,7 +233,6 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
             load_format=load_format,
             flush_cache=flush_cache,
         )
-        self._version += 1
 
     def init_weights_update_group(
         self,
@@ -276,7 +275,6 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
             target_modules=target_modules,
             flush_cache=flush_cache,
         )
-        self._version += 1
 
     def destroy_weights_update_group(
         self,
