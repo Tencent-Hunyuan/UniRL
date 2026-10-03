@@ -25,6 +25,10 @@ Re-check these when the checkpoint revision moves:
   and `zip`s it against the per-sample kwargs, so `apply_chat_template(batch_prompt=[...])`
   returns `cfg_factor` rows instead of `len(prompts) * cfg_factor`. `_apply_chat_template` raises
   on that mismatch, which otherwise surfaces as a `Part.fill` count mismatch on the AR path or a
-  `fused.input_ids` shape mismatch on the diffusion path. The shipped recipes avoid it with
-  `rollout.forward_batch_size: 1`; batch > 1 needs one call per prompt plus `concat`, and the
-  batched call also pads the wrong dim before stacking (issue #520).
+  `fused.input_ids` shape mismatch on the diffusion path. `embed_for_ar` therefore encodes one
+  row per call, `concat`s the fused rows, and rebuilds the batched `tokenizer_output` itself:
+  upstream decode reads `real_pos` (`[B, 1]`, equal to `fused.prompt_lengths`) and the
+  attention-mask builder reads the per-sample image slices. `embed_for_gen_image` still takes the
+  batched call, so the gen_image recipes keep `rollout.forward_batch_size: 1` until the ragged
+  diffusion concat (fully masked pad query rows, zero-padded `rope_cache`) is checked on the real
+  model (issue #520).
