@@ -547,6 +547,79 @@ class DPM2Strategy(StepStrategy):
         return result, None, None
 
 
+class PostWindowDPMStrategy(StepStrategy):
+    """Base strategy through ``window_end``, then deterministic DPM-Solver++ warm-started from its x0 (README)."""
+
+    def __init__(self, base: StepStrategy, *, window_end: int, order: int = 2) -> None:
+        if order not in (1, 2):
+            raise ValueError(f"PostWindowDPMStrategy: order must be 1 or 2, got {order}.")
+        self.base = base
+        self.window_end = window_end
+        self.order = order
+        self._state = _DPMState(order=self.order)
+        self._sigmas: Optional[torch.Tensor] = None
+
+    def init_schedule(self, sigmas: torch.Tensor) -> None:
+        self._sigmas = sigmas
+        self._state = _DPMState(order=self.order)
+        self.base.init_schedule(sigmas)
+
+    def denoise(
+        self,
+        noise_pred: torch.Tensor,
+        sample: torch.Tensor,
+        sigma: torch.Tensor,
+        sigma_next: torch.Tensor,
+        *,
+        eta: float = 1.0,
+        prev_sample: Optional[torch.Tensor] = None,
+        generator: GeneratorLike = None,
+        sigma_max: float = 0.99,
+        step_index: int = 0,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if self._sigmas is None:
+            raise RuntimeError("PostWindowDPMStrategy requires init_schedule() before stepping.")
+        if step_index <= self.window_end:
+            x0 = _convert_model_output(noise_pred.float(), sample.float(), self._sigmas, step_index)
+            self._state.update(x0)
+            self._state.update_lower_order()
+            return self.base.denoise(
+                noise_pred,
+                sample,
+                sigma,
+                sigma_next,
+                eta=eta,
+                prev_sample=prev_sample,
+                generator=generator,
+                sigma_max=sigma_max,
+                step_index=step_index,
+            )
+        return self.step(noise_pred, sample, sigma, sigma_next, step_index=step_index)
+
+    def step(
+        self,
+        noise_pred: torch.Tensor,
+        sample: torch.Tensor,
+        sigma: torch.Tensor,
+        sigma_next: torch.Tensor,
+        eta: float = 1.0,
+        prev_sample: Optional[torch.Tensor] = None,
+        generator: GeneratorLike = None,
+        sigma_max: float = 0.99,
+        step_index: int = 0,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        prev = _dpm_step(
+            order=self.order,
+            model_output=noise_pred.float(),
+            sample=sample.float(),
+            step_index=step_index,
+            timesteps=self._sigmas[:-1],
+            sigmas=self._sigmas,
+            dpm_state=self._state,
+        )
+        return prev.to(sample.dtype), None, None
+
+
 @dataclass
 class FlowSpec:
     """Empty Spec: FlowSDEStrategy has no per-strategy config fields."""
@@ -574,6 +647,7 @@ __all__ = [
     "CPSSDEStrategy",
     "DanceSDEStrategy",
     "DPM2Strategy",
+    "PostWindowDPMStrategy",
     "FlowSpec",
     "CPSSpec",
     "DanceSpec",

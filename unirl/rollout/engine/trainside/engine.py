@@ -42,6 +42,7 @@ class TrainsideRolloutEngine(BaseRolloutEngine):
                 f"TrainsideRolloutEngine.forward_batch_size must be >= 1 when set; got {forward_batch_size!r}"
             )
         self.forward_batch_size = forward_batch_size
+        self._allow_post_window = all(s.supports_post_window_ode for s in stages if isinstance(s, DiffusionStage))
         if any(isinstance(s, DiffusionStage) for s in stages):
             if hasattr(pipeline, "build_schedule_policy"):
                 self.schedule_policy = pipeline.build_schedule_policy()
@@ -109,7 +110,7 @@ class TrainsideRolloutEngine(BaseRolloutEngine):
 
     def _ensure_sample_sigmas(self, sample: Sample) -> None:
         """Pin the σ schedule onto the gen part's ``DiffusionSamplingParams.sigmas``."""
-        ensure_sample_sigmas(sample, self.schedule_policy)
+        ensure_sample_sigmas(sample, self.schedule_policy, allow_post_window=self._allow_post_window)
 
     def shutdown(self) -> None:
         with self._shutdown_lock:

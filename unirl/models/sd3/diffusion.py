@@ -10,7 +10,7 @@ import torch
 from unirl.models.types.batched_replay import BatchedStepReplayMixin
 from unirl.models.types.diffusion import DiffusionStage, DiffusionStep
 from unirl.models.types.replay_result import ReplayResult
-from unirl.sde.kernels import SDEStrategy, StepStrategy
+from unirl.sde.kernels import PostWindowDPMStrategy, SDEStrategy, StepStrategy
 from unirl.types.conditions import TextEmbedCondition
 from unirl.types.sampling import DiffusionSamplingParams, compute_trajectory_positions
 from unirl.types.segments.latent import LatentSegment
@@ -182,6 +182,8 @@ class SD3DiffusionStep(DiffusionStep[SD3Bundle, SD3Conditions]):
 class SD3DiffusionStage(BatchedStepReplayMixin, DiffusionStage[SD3Conditions]):
     """SD3 rollout-level diffusion stage."""
 
+    supports_post_window_ode = True
+
     _no_split_modules: ClassVar[Tuple[str, ...]] = ("JointTransformerBlock",)
 
     def __init__(
@@ -223,11 +225,24 @@ class SD3DiffusionStage(BatchedStepReplayMixin, DiffusionStage[SD3Conditions]):
         prompt_embeds = conditions.text.embeds
         device = prompt_embeds.device
         batch_size = int(prompt_embeds.shape[0])
-        T = int(params.num_inference_steps)
+        sde_set: Set[int] = set(int(i) for i in (params.sde_indices or []))
+        sde_sorted: List[int] = sorted(sde_set)
+        # A post-window ODE compresses the schedule after max(sde_indices); T counts its steps.
+        post = params.post_window_ode if sde_set else None
+        T = (
+            int(params.num_inference_steps)
+            if post is None
+            else post.num_steps(params.num_inference_steps, sde_sorted[-1])
+        )
         if int(schedule.shape[0]) != T + 1:
             raise ValueError(f"SD3DiffusionStage.diffuse: schedule length {schedule.shape[0]} != T+1={T + 1}")
         schedule = schedule.to(device)
-        self.strategy.init_schedule(schedule)
+        strategy = (
+            self.strategy
+            if post is None
+            else PostWindowDPMStrategy(self.strategy, window_end=sde_sorted[-1], order=post.order)
+        )
+        strategy.init_schedule(schedule)
 
         latent_h = int(params.height) // int(self.vae_scale_factor)
         latent_w = int(params.width) // int(self.vae_scale_factor)
@@ -257,9 +272,6 @@ class SD3DiffusionStage(BatchedStepReplayMixin, DiffusionStage[SD3Conditions]):
                 base_seed=int(params.seed),
             )
 
-        sde_set: Set[int] = set(int(i) for i in (params.sde_indices or []))
-        sde_sorted: List[int] = sorted(sde_set)
-
         needed: Set[int] = set(compute_trajectory_positions(sde_set, T))
         needed.add(T)
 
@@ -284,7 +296,7 @@ class SD3DiffusionStage(BatchedStepReplayMixin, DiffusionStage[SD3Conditions]):
                 new_latents, log_prob, _ = self.step.step_with_logp(
                     self.model,
                     conditions,
-                    strategy=self.strategy,
+                    strategy=strategy,
                     sample=latents,
                     sigma=sigma,
                     sigma_next=sigma_next,
