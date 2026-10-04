@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import sys
+from contextlib import contextmanager
 from dataclasses import dataclass
 from dataclasses import field as dc_field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -15,6 +16,17 @@ from unirl.types.segments import TextSegment
 
 from .bundle import HunyuanImage3Bundle
 from .conditions import HunyuanImage3ARConditions
+
+
+@contextmanager
+def _rope_mode(transformer: Any, *, training: bool) -> Iterator[None]:
+    """Set only the wrapper flag that sizes upstream RoPE, then restore it (README)."""
+    previous = transformer.training
+    transformer.training = training
+    try:
+        yield
+    finally:
+        transformer.training = previous
 
 
 @dataclass
@@ -284,18 +296,20 @@ class HunyuanImage3ARStage(ARStage[HunyuanImage3ARConditions]):
         per_token_logps: List[List[float]] = [[] for _ in range(batch_size)]
         finished = [False] * batch_size
 
-        for _ in range(max_new):
-            token_id, log_prob, state = step.step(self.model, conditions, state)
-            for b in range(batch_size):
-                if finished[b]:
-                    continue
-                tid = int(token_id[b].item())
-                generated_tokens[b].append(tid)
-                per_token_logps[b].append(float(log_prob[b].item()))
-                if tid in stop_ids:
-                    finished[b] = True
-            if all(finished):
-                break
+        # Decode gathers RoPE at real_pos + step, so it needs the full-length table.
+        with _rope_mode(self.model.transformer, training=False):
+            for _ in range(max_new):
+                token_id, log_prob, state = step.step(self.model, conditions, state)
+                for b in range(batch_size):
+                    if finished[b]:
+                        continue
+                    tid = int(token_id[b].item())
+                    generated_tokens[b].append(tid)
+                    per_token_logps[b].append(float(log_prob[b].item()))
+                    if tid in stop_ids:
+                        finished[b] = True
+                if all(finished):
+                    break
 
         return _pack_text_segment(generated_tokens, per_token_logps, device=device)
 
@@ -359,45 +373,47 @@ class HunyuanImage3ARStage(ARStage[HunyuanImage3ARConditions]):
         neg_inf = torch.finfo(param_dtype).min
 
         flat: List[torch.Tensor] = []
-        for b in range(batch_size):
-            rl = resp_lengths[b]
-            if rl == 0:
-                continue
-            pl = prompt_lengths[b]
-            prompt_b = prompt_ids_padded[b, :pl].to(device=device, dtype=torch.long)
-            resp_b = segment.tokens[cu[b] : cu[b] + rl].to(device=device, dtype=torch.long)
-            full_ids = torch.cat([prompt_b, resp_b], dim=0).unsqueeze(0)
-            L_full = pl + rl
+        # Teacher forcing passes no position_ids, so RoPE must be sized to this sequence.
+        with _rope_mode(transformer, training=True):
+            for b in range(batch_size):
+                rl = resp_lengths[b]
+                if rl == 0:
+                    continue
+                pl = prompt_lengths[b]
+                prompt_b = prompt_ids_padded[b, :pl].to(device=device, dtype=torch.long)
+                resp_b = segment.tokens[cu[b] : cu[b] + rl].to(device=device, dtype=torch.long)
+                full_ids = torch.cat([prompt_b, resp_b], dim=0).unsqueeze(0)
+                L_full = pl + rl
 
-            causal = torch.tril(torch.ones((L_full, L_full), dtype=torch.bool, device=device))
-            mask_4d = torch.full((1, 1, L_full, L_full), neg_inf, dtype=param_dtype, device=device)
-            mask_4d.masked_fill_(causal.unsqueeze(0).unsqueeze(0), 0.0)
+                causal = torch.tril(torch.ones((L_full, L_full), dtype=torch.bool, device=device))
+                mask_4d = torch.full((1, 1, L_full, L_full), neg_inf, dtype=param_dtype, device=device)
+                mask_4d.masked_fill_(causal.unsqueeze(0).unsqueeze(0), 0.0)
 
-            # Reset image RoPE state before text-only AR forwards.
-            transformer.post_token_len = None
-            transformer.num_special_tokens = None
-            transformer.num_image_tokens = 0
-            transformer.use_taylor_cache = False
-            if hasattr(transformer, "cached_rope") and transformer.cached_rope is not None:
-                for _rope_attr in ("seq_len", "rope_image_info", "cos_cache", "sin_cache"):
-                    if hasattr(transformer.cached_rope, _rope_attr):
-                        setattr(transformer.cached_rope, _rope_attr, None)
+                # Reset image RoPE state before text-only AR forwards.
+                transformer.post_token_len = None
+                transformer.num_special_tokens = None
+                transformer.num_image_tokens = 0
+                transformer.use_taylor_cache = False
+                if hasattr(transformer, "cached_rope") and transformer.cached_rope is not None:
+                    for _rope_attr in ("seq_len", "rope_image_info", "cos_cache", "sin_cache"):
+                        if hasattr(transformer.cached_rope, _rope_attr):
+                            setattr(transformer.cached_rope, _rope_attr, None)
 
-            out = transformer(
-                input_ids=full_ids,
-                attention_mask=mask_4d,
-                mode="gen_text",
-                past_key_values=None,
-                use_cache=False,
-                return_dict=True,
-            )
-            logits = getattr(out, "logits", None)
-            if logits is None:
-                raise RuntimeError("HunyuanImage3ARStage.replay: model output has no .logits")
+                out = transformer(
+                    input_ids=full_ids,
+                    attention_mask=mask_4d,
+                    mode="gen_text",
+                    past_key_values=None,
+                    use_cache=False,
+                    return_dict=True,
+                )
+                logits = getattr(out, "logits", None)
+                if logits is None:
+                    raise RuntimeError("HunyuanImage3ARStage.replay: model output has no .logits")
 
-            raw_logits = logits[0, pl - 1 : pl - 1 + rl, :].float()
-            log_probs_full = F.log_softmax(raw_logits, dim=-1)
-            flat.append(log_probs_full.gather(-1, resp_b.unsqueeze(-1)).squeeze(-1))
+                raw_logits = logits[0, pl - 1 : pl - 1 + rl, :].float()
+                log_probs_full = F.log_softmax(raw_logits, dim=-1)
+                flat.append(log_probs_full.gather(-1, resp_b.unsqueeze(-1)).squeeze(-1))
 
         if not flat:
             return torch.zeros(0, dtype=torch.float32, device=device)
