@@ -63,10 +63,10 @@ class AsyncDiffusionTrainer(AsyncRolloutTrainerMixin, DiffusionTrainer):
                 "trainer."
             )
         algo_cls = get_class(str(diffusion_kwargs["algorithm_cfg"].get("_target_", "")))
-        if getattr(algo_cls, "requires_per_sample_sde_index", False):
+        if getattr(algo_cls, "per_sample_sde_layout", ""):
             raise ValueError(
-                f"AsyncDiffusionTrainer does not stratify per-prompt SDE steps, which {algo_cls.__name__} "
-                "requires; use the synchronous DiffusionTrainer."
+                f"AsyncDiffusionTrainer does not split rollouts into per-step SDE groups, which "
+                f"{algo_cls.__name__} requires; use the synchronous DiffusionTrainer."
             )
         per_worker_inflight = int(per_worker_inflight)
         cfg = diffusion_kwargs["cfg"]

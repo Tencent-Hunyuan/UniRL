@@ -61,8 +61,10 @@ not just three-tensor arithmetic.
   with a different SDE strategy or a windowed index scheduler. Add a class only when
   the loss math itself changes. `FlashGRPO` clears that bar: it changes the loss by
   multiplying the clipped ratio by a temporal-gradient-rectification coefficient, and
-  declares `requires_per_sample_sde_index` so the trainer gives each prompt its own
-  stratified SDE step instead of one shared step per rollout.
+  declares `per_sample_sde_layout = "stratified"` so the trainer gives each prompt its own
+  stratified SDE step instead of one shared step per rollout. `TempFlowGRPO` shares that
+  per-row loss (`PerSampleStepGRPO`) with a noise-aware weight instead, and branches every
+  prompt at every chosen step.
 
 **Extending it:** a new diffusion loss subclasses `StageAlgorithm`, calls
 `stage.replay(...)`, computes a per-element loss, and `(loss * loss_scale).backward()`;
@@ -170,3 +172,7 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   because a collapsed reward spread drives `|adv|` arbitrarily high through the global-std
   denominator. `adv_clip_fraction` in the metrics is the fraction of samples that hit the clamp:
   a run that regresses while that climbs is being driven by reward outliers.
+- **`TempFlowGRPO`'s weight is `weight_scale * transition_std` of `FlowSDEStrategy`.** Upstream
+  multiplies the clipped objective by `2.25 * std_dev_t * sqrt(-dt)` with `std_dev_t` from the
+  Flow-GRPO SDE, which is exactly `FlowSDEStrategy.transition_std`; another strategy would change
+  what the weight means, so construction rejects it. Like `FlashGRPO` it requires `beta: 0`.

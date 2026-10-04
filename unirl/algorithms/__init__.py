@@ -27,6 +27,8 @@ _EXPORTS = (
     ("FlowGRPOConfig", "flowgrpo"),
     ("FlashGRPO", "flashgrpo"),
     ("FlashGRPOConfig", "flashgrpo"),
+    ("TempFlowGRPO", "tempflowgrpo"),
+    ("TempFlowGRPOConfig", "tempflowgrpo"),
     ("DiffusionNFT", "diffusionnft"),
     ("DiffusionNFTConfig", "diffusionnft"),
     ("DiffusionOPD", "diffusionopd"),
