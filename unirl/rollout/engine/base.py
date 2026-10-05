@@ -7,9 +7,19 @@ from typing import Any, Dict, List, Optional
 
 import torch
 
+from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
 from unirl.types.sample import Sample
+
+
+def reject_row_canvases(sample: Sample, *, engine: str) -> None:
+    """Raise when dataset rows ask for their own canvas on an engine that renders one canvas per request."""
+    require(
+        not any(meta and "canvas" in meta for meta in sample.root_metadata()),
+        f"{engine}: dataset rows carry metadata['canvas'], but this engine renders every row at "
+        "sampling.height/width; per-row canvases need the vLLM-Omni BAGEL engine.",
+    )
 
 
 class BaseEngineConfig(ABC):
@@ -182,4 +192,4 @@ class BaseRolloutEngine(Remote, ABC):
         return sample.with_parts([*sample.parts[:-1], gen])
 
 
-__all__ = ["BaseRolloutEngine"]
+__all__ = ["BaseRolloutEngine", "reject_row_canvases"]

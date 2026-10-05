@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import dataclasses
+from types import SimpleNamespace
 from typing import Any, Dict, List
 
+from unirl.config.require import require
 from unirl.models.bagel.conditions import BagelDiffusionConditions
 from unirl.models.bagel.diffusion import BagelDiffusionParams
+from unirl.models.bagel.pipeline import BagelPipeline
 from unirl.rollout.engine.vllm_omni.adapters.base import ModelAdapter, register_adapter
 from unirl.rollout.engine.vllm_omni.adapters.dit import (
     DitInputAdapter,
@@ -18,6 +22,7 @@ from unirl.rollout.engine.vllm_omni.backends import (
     OmniRawResult,
     StageSampling,
 )
+from unirl.rollout.engine.vllm_omni.pipelines._shared.interception import read_captures
 from unirl.rollout.engine.vllm_omni.utils import (
     build_image_segment,
     collect_dit_outputs,
@@ -64,9 +69,40 @@ def _conditioning_rows(
 class BagelInputAdapter(DitInputAdapter):
     """Build BAGEL prompt dictionaries and diffusion-stage sampling intent."""
 
-    def __init__(self, modality: str, *, image_input: bool = False) -> None:
+    def __init__(self, modality: str, *, image_input: bool = False, model_config: Any) -> None:
         super().__init__(modality)
         self.image_input = bool(image_input)
+        self.model_config = model_config
+
+    def _canvas_params(self, params: BagelDiffusionParams, height: int, width: int) -> BagelDiffusionParams:
+        """The request's params re-targeted at a row canvas, x_T shape included; the default canvas returns them."""
+        if (height, width) == (params.height, params.width):
+            return params
+        shape = BagelPipeline.latent_shape(
+            model_config=self.model_config, sampling_spec=SimpleNamespace(height=height, width=width)
+        )
+        require(
+            0 < shape[0] <= BagelPipeline.latent_shape(model_config=self.model_config, sampling_spec=params)[0],
+            f"{self.modality}: row canvas {height}x{width} must hold at least one token and no more than "
+            f"sampling.height/width ({params.height}x{params.width}), which bounds the stored trajectory.",
+        )
+        noise_shape = None if params.init_noise_latent_shape is None else list(shape)
+        return dataclasses.replace(params, height=height, width=width, init_noise_latent_shape=noise_shape)
+
+    def build(self, sample: Sample) -> List[GenerateCall]:
+        """One call per contiguous run of frontier rows that share a canvas."""
+        gen_part = sample.frontier_gen_part(BagelDiffusionParams)
+        canvases = sample.canvases()
+        calls: List[GenerateCall] = []
+        start = 0
+        for end in range(1, len(canvases) + 1):
+            if end < len(canvases) and canvases[end] == canvases[start]:
+                continue
+            run_params = self._canvas_params(gen_part.sampling_params, *canvases[start])
+            run = sample.replace_frontier(dataclasses.replace(gen_part.slice(start, end), sampling_params=run_params))
+            calls.append(GenerateCall(prompts=self.build_prompts(run), sampling=self.build_sampling(run)))
+            start = end
+        return calls
 
     def _spp(self, sample: Sample) -> int:
         """``samples_per_prompt`` — the GRPO group size; 1 disables packing."""
@@ -204,17 +240,19 @@ class BagelInputAdapter(DitInputAdapter):
 class BagelOutputAdapter(DitOutputAdapter):
     """Build one image Part with deferred BAGEL replay conditions."""
 
-    def __init__(self, modality: str, *, image_input: bool = False) -> None:
+    def __init__(self, modality: str, *, image_input: bool = False, model_config: Any) -> None:
         super().__init__(modality)
         self.image_input = bool(image_input)
+        self.model_config = model_config
 
     def build_segment(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Any:
-        """The DiT trajectory segment (asserts the σ echo)."""
+        """The DiT trajectory segment (asserts the σ echo), smaller canvases padded to the default's token count."""
         diff_outputs, _, _ = collect_dit_outputs(
             per_request, final_output_type=self.final_output_type, stage_id=self.stage_id, modality=self.modality
         )
         diff_params = sample.frontier_gen_part(BagelDiffusionParams).sampling_params
-        return build_image_segment(diff_outputs, expected_sigmas=diff_params.sigmas)
+        max_tokens = BagelPipeline.latent_shape(model_config=self.model_config, sampling_spec=diff_params)[0]
+        return build_image_segment(diff_outputs, expected_sigmas=diff_params.sigmas, pad_tokens_to=max_tokens)
 
     def build_decoded(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Any:
         del sample
@@ -224,20 +262,20 @@ class BagelOutputAdapter(DitOutputAdapter):
         return pils_to_images(pil_images)
 
     def build_conditions(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
-        """Ship raw prompt, shape, and optional source image for trainer-side KV rebuild."""
-        del per_request
+        """Ship raw prompt, shape, optional source image and the worker's token layout for trainer-side KV rebuild."""
+        diff_outputs, frame_groups, _ = collect_dit_outputs(
+            per_request, final_output_type=self.final_output_type, stage_id=self.stage_id, modality=self.modality
+        )
         prompts, input_images = _conditioning_rows(
             sample,
             image_input=self.image_input,
             caller=f"{self.modality}.build_conditions",
         )
-        gen_part = sample.frontier_gen_part(BagelDiffusionParams)
-        diff_params = gen_part.sampling_params
-        image_shape = (int(diff_params.height), int(diff_params.width))
         conditions = BagelDiffusionConditions(
             prompts=prompts,
             input_images=input_images,
-            image_shapes=[image_shape] * len(prompts),
+            image_shapes=sample.canvases(),
+            layouts=[read_captures(out)["layout"] for out, frames in zip(diff_outputs, frame_groups) for _ in frames],
         )
         return conditions.to_dict()
 
@@ -249,11 +287,12 @@ class BagelAdapter(ModelAdapter):
     omni_mode = "text-to-image"
     needs_driver_tokenizer = False
     image_input: bool = False  # Whether the modality requires an edit-source image.
+    supports_row_canvas = True
 
     def __init__(self, config: Any, model_config: Any, *, strategy: Any = None, tokenize_fn: Any = None) -> None:
         super().__init__(config, model_config, strategy=strategy, tokenize_fn=tokenize_fn)
-        self.input_adapter = BagelInputAdapter(self.modality, image_input=self.image_input)
-        self.output_adapter = BagelOutputAdapter(self.modality, image_input=self.image_input)
+        self.input_adapter = BagelInputAdapter(self.modality, image_input=self.image_input, model_config=model_config)
+        self.output_adapter = BagelOutputAdapter(self.modality, image_input=self.image_input, model_config=model_config)
 
     def packs_groups(self, sample: Sample) -> bool:
         return self.input_adapter.packs_groups(sample)

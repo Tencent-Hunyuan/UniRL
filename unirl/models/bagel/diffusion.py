@@ -308,6 +308,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
                 input_image,
                 differentiable=True,
             )
+            self._require_rollout_layout(conditions, gen, image_shape)
             return gen, cfg_text, cfg_img, image_shape
         if conditions.has_contexts() and not force_rebuild:
             return conditions.single()
@@ -317,7 +318,21 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
             input_image,
             differentiable=differentiable,
         )
+        self._require_rollout_layout(conditions, gen, image_shape)
         return gen, cfg_text, cfg_img, image_shape
+
+    @staticmethod
+    def _require_rollout_layout(conditions: BagelDiffusionConditions, gen: Any, image_shape: Tuple[int, int]) -> None:
+        """Fail when the rebuilt gen context differs from the layout the rollout worker generated with."""
+        if not conditions.layouts:
+            return
+        height, width = image_shape
+        rebuilt = {"kv_len": int(gen["kv_lens"][0]), "rope": int(gen["ropes"][0]), "height": height, "width": width}
+        require(
+            rebuilt == conditions.layouts[0],
+            "BagelDiffusionStage: rollout and replay built different token layouts for this sample: "
+            f"worker {conditions.layouts[0]}, trainer {rebuilt}.",
+        )
 
     def _build_generation_inputs(
         self,
@@ -663,6 +678,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
             device=device,
         )
         forward_kwargs = self._forward_kwargs(gen, cfg_text, cfg_img, gi, gi_cfg_text, gi_cfg_img, params)
+        num_tokens = gi["packed_vae_token_indexes"].numel()
 
         log_probs: List[torch.Tensor] = []
         prev_sample_means: List[torch.Tensor] = []
@@ -671,8 +687,8 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
                 t_cur = schedule[step_idx]
                 t_next = schedule[step_idx + 1]
                 cfg_text_scale, cfg_img_scale = self._gated_cfg_scales(float(t_cur.item()), params)
-                x_t = segment.latents_at(step_idx)[0].to(device)
-                prev_sample = segment.latents_at(step_idx + 1)[0].to(device)
+                x_t = segment.latents_at(step_idx)[0][:num_tokens].to(device)
+                prev_sample = segment.latents_at(step_idx + 1)[0][:num_tokens].to(device)
                 _, log_prob, prev_mean = self.step.step_with_logp(
                     bagel,
                     self.strategy,
@@ -737,6 +753,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         sample = sample.to(device)
         if sample.dim() == 3:
             sample = sample[0]
+        sample = sample[: forward_kwargs["packed_vae_token_indexes"].numel()]
         with self._autocast_ctx(device):
             return self.step.predict_velocity(
                 bagel,

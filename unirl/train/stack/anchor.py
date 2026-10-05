@@ -42,6 +42,12 @@ def prepare_segment_anchors(
                 )
             collected[field].append(value)
     for field, tensors in collected.items():
+        shapes = {tuple(tensor.shape[1:]) for tensor in tensors}
+        if len(shapes) != 1:
+            raise RuntimeError(
+                f"{type(algorithm).__name__} anchor field {field!r} differs in shape across micros ({sorted(shapes)}); "
+                "an anchor stored per token needs one output canvas per rollout."
+            )
         setattr(
             part.segment,
             field,

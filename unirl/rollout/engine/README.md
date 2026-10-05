@@ -85,3 +85,21 @@ handler in `../../distributed/weight_sync`.
   trainer, PE, and agentic paths already stamp this. `temperature` / `top_p` /
   `top_k` / `max_new_tokens` are gone from `SGLangEngineConfig` — there is no
   engine-config fallback.
+- **vLLM-Omni BAGEL ships the worker's token layout with every row.** The worker
+  pipeline records the KV length, RoPE offset and canvas it generated with, and
+  `BagelDiffusionStage` raises when the context the trainer rebuilds differs, so
+  a prompt or source-image preprocessing change on either side fails the first
+  replay instead of training against a different sequence.
+- **A dataset row may set its own output canvas on vLLM-Omni BAGEL.** `metadata:
+  {"canvas": [H, W]}` on a row renders that prompt group at `H x W`; rows without
+  it use `sampling.height/width`. A row canvas may not have more tokens than that
+  default, because `LatentSegment.latents` stays dense: a smaller canvas's
+  trajectory is right-padded to the default's token count, and
+  `BagelDiffusionStage.replay` / `predict_velocity_at` trim their latent input
+  back to the canvas's tokens, so their outputs are the trimmed length. `FlowGRPO`
+  is the algorithm this supports. Replay anchors that are stored per token
+  (`sde_means`: `BagelFlowUniGRPO` with RatioNorm, `FlowDPPO`) are concatenated
+  across micros, and an algorithm that reads `segment.latents` itself
+  (`DiffusionNFT`) sees the padding, so both still need one canvas per rollout.
+  The adapter sends one call per contiguous run of same-canvas rows; every other
+  engine rejects the field by name.
