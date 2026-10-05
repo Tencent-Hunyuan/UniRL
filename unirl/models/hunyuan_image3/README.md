@@ -20,15 +20,24 @@ Re-check these when the checkpoint revision moves:
 - `position_ids` are also the KV-cache write indices (`cache_position`), so
   `HunyuanImage3FusedMultimodalCondition.concat` pads them with continuing indices; a `0` pad
   would overwrite the first real token's KV.
-- The checkpoint's batched chat-template path encodes only the first sample:
-  `apply_general_template(batchify=True)` passes a one-element `prompt_list` to `batch_gen_infer`
-  and `zip`s it against the per-sample kwargs, so `apply_chat_template(batch_prompt=[...])`
-  returns `cfg_factor` rows instead of `len(prompts) * cfg_factor`. `_apply_chat_template` raises
-  on that mismatch, which otherwise surfaces as a `Part.fill` count mismatch on the AR path or a
-  `fused.input_ids` shape mismatch on the diffusion path. `embed_for_ar` therefore encodes one
-  row per call, `concat`s the fused rows, and rebuilds the batched `tokenizer_output` itself:
-  upstream decode reads `real_pos` (`[B, 1]`, equal to `fused.prompt_lengths`) and the
-  attention-mask builder reads the per-sample image slices. `embed_for_gen_image` still takes the
-  batched call, so the gen_image recipes keep `rollout.forward_batch_size: 1` until the ragged
-  diffusion concat (fully masked pad query rows, zero-padded `rope_cache`) is checked on the real
-  model (issue #520).
+- The Instruct checkpoint tokenizer at revision `2ec2c78bee7d4b94157341fba86c4c2c7b1858b2`
+  passes `prompt_list=[[]]` in `apply_general_template(batchify=True)`, so the `zip` in
+  `batch_gen_infer` drops all but the first sample. `repair_hi3_tokenizer_batchify` installs
+  an instance-local, idempotent wrapper that supplies one empty prompt per message list.
+  Non-batched calls and the checkpoint's CFG ordering, `make_batch` padding, image slices,
+  and `real_pos` (`[B, 1]`) remain upstream-owned. Both AR and diffusion use this repair
+  before building their attention masks over the full padded batch.
+  Recheck this shim when the checkpoint changes and remove it once upstream fixes the bug;
+  the returned-row-count check remains a tripwire. Shipped recipes still use
+  `rollout.forward_batch_size: 1` pending real-checkpoint GPU validation.
+
+## Tokenizer regression check
+
+Run `python -m pytest -q tests/test_hi3_tokenizer_batchify.py` with PyTorch,
+transformers, diffusers, huggingface-hub and pytest installed. The first run downloads
+only tokenizer code/config/assets from the pinned Instruct revision above (no model
+weights). Set `HI3_TOKENIZER_PATH` to a local copy of those three files to run offline.
+The tests reproduce truncation before the repair and compare every output field with
+the upstream source with only `prompt_list` corrected, covering ragged text, image
+conditioning, image generation, B=1/B=3, and CFG factors 1/2/3. They do not validate
+model generation, log-probabilities, or GPU attention backends.
