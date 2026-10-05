@@ -103,7 +103,7 @@ The current trainer surface is:
 | `AsyncDiffusionTrainer` | FIFO diffusion generation batch → one `TrainStack` | The same update-versioned manager loop for DiT. Requires `max_inflight=1` and resolves and scores each intact batch before launching its replacement, so cross-slab transfer never queues behind fresh generation. |
 | `PETrainer` | `ar` + `diffusion` Parts → two `TrainStack`s | Composed prompt-rewrite/image rollout; image rewards propagate to AR rewrites. `freeze_llm=true` trains and checkpoints diffusion only. |
 | `UnifiedModelTrainer` | whole `Sample` → one `UnifiedModelTrainStack` | AR and image losses accumulate into shared-backbone optimizer steps while prompt-tree lineage remains intact during DP scatter. |
-| `AgenticTrainer` | variable-depth `List[Sample]` → concatenated turn `Part` | Colocated barrier multi-turn tool use. It syncs every step, waits for complete groups, scores terminal answers through `RewardService`, and excludes failed trajectories. Overflow trajectories are scored like completed ones; `mask_overflow_loss=true` keeps them in the group baseline but drops their gradient. |
+| `AgenticTrainer` | variable-depth `List[Sample]` → concatenated turn `Part` | Colocated multi-turn tool use, with optional bounded partial-rollout windows. It syncs every step, waits for complete groups, scores terminal answers through `RewardService`, and excludes failed trajectories. Overflow trajectories are scored like completed ones; `mask_overflow_loss=true` keeps them in the group baseline but drops their gradient. |
 
 All async variants use the driver-local `RolloutManager`. Batch trainers provide
 one slab-wide launcher and keep completed batches intact; the agentic trainer
@@ -115,8 +115,8 @@ maximum accepted update-version lag.
 Async batch trainers own optimizer progress, publication cadence, hard boundaries,
 scoring order, and training policy directly. The manager owns published rollout
 state and applies its configured filter against the trainer-supplied current
-version. The barrier-only `AgenticTrainer` does not expose tail, staleness, or
-cross-step buffering policies.
+version. `AgenticTrainer` instead bounds cross-step carry with `rollout_window_size`;
+it does not use the async batch trainers' staleness filter.
 
 **Extending it:** a new domain is a new `<Domain>Trainer(BaseTrainer)` that builds its
 remotes inside a `placement(...)` scope and implements `train_step` + `train`; the
@@ -366,3 +366,12 @@ without driver-authored x_T. `media_log_interval` does not apply
   (it reuses the train model) and for DiffusionNFT (its EMA swap touches the backend around `generate`).
 - **The bundle must be shared, not rebuilt** — the trainer injects one bundle into both
   pipeline and backend; a second `from_config` would silently desync replay. See [`../models/README.md`](../models/README.md).
+
+### Agentic partial rollout
+
+Set `rollout_window_size: 2` in the deep-research recipe to admit two batches at a time.
+After each batch of sibling groups completes, unfinished trajectories pause between turns.
+The trainer updates, publishes weights with cache flushing, and resumes from stored history.
+Windows drain before checkpoints and at the end of training. The default `1` retains the
+barrier behavior. See [environment contracts](../rollout/env/README.md#gotchas) for supported
+environments, per-turn provenance, and behavior log-prob requirements.
