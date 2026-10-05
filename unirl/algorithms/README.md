@@ -175,7 +175,8 @@ The shared metrics reducer sums them across microbatches and optimizer updates.
 `TrainStack` sums the statistics across the backend's loss-reduction mesh before
 returning to the driver, which retains the first rank's result. Only DP heads
 contribute, so TP/SP replicas do not multiply token counts. Detached entropy sums
-stay on device until microbatch aggregation. The reducer derives
+stay on device until microbatch aggregation, then two batched scalar transfers
+materialize the per-micro statistics for the CPU driver. The reducer derives
 `policy_entropy = sum / count` from those global statistics. Thus the mean is
 weighted by valid token observations, independent of `loss_agg_mode`, sequence
 length, or microbatch partitioning. Repeated optimizer updates count each policy

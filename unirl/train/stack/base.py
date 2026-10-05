@@ -169,11 +169,29 @@ class TrainStack(Remote):
                 weighted_loss_sum += result.loss * self._micro_loss_weight(part, start, end, order=order)
             has_backward = has_backward or result.has_backward
 
+        monitor_entropy = getattr(self.algorithm, "monitor_entropy", False)
+        if monitor_entropy:
+            entropy_indices = [i for i, r in enumerate(micro_results) if "policy_entropy_sum" in r.metrics]
+            if entropy_indices:
+                sums = torch.stack([micro_results[i].metrics["policy_entropy_sum"] for i in entropy_indices]).tolist()
+                counts = torch.stack(
+                    [micro_results[i].metrics["policy_entropy_count"] for i in entropy_indices]
+                ).tolist()
+                for i, total, count in zip(entropy_indices, sums, counts):
+                    micro_results[i] = replace(
+                        micro_results[i],
+                        metrics={
+                            **micro_results[i].metrics,
+                            "policy_entropy_sum": total,
+                            "policy_entropy_count": count,
+                            "policy_entropy": total / count if count else 0.0,
+                        },
+                    )
         aggregated_metrics: Mapping[str, object] = aggregate_numeric_metrics(
             [r.metrics for r in micro_results if r.metrics]
         )
 
-        if getattr(self.algorithm, "monitor_entropy", False):
+        if monitor_entropy:
             local_entropy = [
                 aggregated_metrics.get("policy_entropy_sum", 0.0),
                 aggregated_metrics.get("policy_entropy_count", 0.0),
