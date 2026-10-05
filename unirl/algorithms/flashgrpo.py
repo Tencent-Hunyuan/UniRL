@@ -199,13 +199,8 @@ class FlashGRPO(FlowGRPO):
         eta = float(self.params.eta)
         if eta <= 0.0:
             raise ValueError("FlashGRPO requires params.eta > 0 on trained SDE steps.")
-        T = int(sigmas.shape[0]) - 1
-        out_of_range = (idx < 0) | (idx >= T)
-        if bool(out_of_range.any()):
-            raise ValueError(f"FlashGRPO rectification indices out of range [0, {T}): {idx[out_of_range].tolist()}")
-
-        sigma = sigmas[idx]
-        sigma_next = sigmas[idx + 1]
+        sigma = sigmas[:-1].index_select(0, idx)
+        sigma_next = sigmas[1:].index_select(0, idx)
         sqrt_neg_dt = torch.sqrt((sigma - sigma_next).clamp_min(torch.finfo(torch.float32).eps))
         sigma_max = sigmas[1] if int(sigmas.shape[0]) > 1 else torch.tensor(0.99, device=device, dtype=sigmas.dtype)
         sigma_min = sigmas[-1]
