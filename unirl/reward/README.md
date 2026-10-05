@@ -33,7 +33,7 @@ listed scorer classes directly with Hydra `_target_`.
 |---|---|---|
 | `aesthetic` | image | Registered placeholder; model loading and scoring are not implemented. |
 | `clip` | image | CLIP prompt-image similarity. |
-| `geneval2` | image + evaluation questions | Local Qwen3-VL Soft-TIFA scorer; `vqa_list` comes from row metadata or a configured dataset file. |
+| `geneval2` | image + evaluation questions | Local Qwen3-VL Soft-TIFA scorer; `vqa_list` comes from row metadata or a configured dataset file; rows with neither score 0. |
 | `hpsv2` | image | HPS v2 prompt-image preference. |
 | `hpsv3` | image | HPS v3 prompt-image preference. |
 | `hpsv3pp` | image | HPSv3++ scorer; requires its source checkout/config and accepts a local or Hugging Face-hosted checkpoint. |

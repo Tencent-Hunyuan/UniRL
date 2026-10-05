@@ -26,8 +26,10 @@ rewards:
     num_cpus: 4
     max_concurrency: 1
     params:
-      # Clone open-mmlab/mmdetection at tag v2.28.2 for the config, then download
-      # the checkpoint with djghosh13/geneval/evaluation/download_models.sh.
+      # Clone open-mmlab/mmdetection at tag v2.28.2 for the config. From a
+      # djghosh13/geneval checkout, `bash evaluation/download_models.sh
+      # /path/to/detector` writes the checkpoint; without a directory argument
+      # the script downloads nothing.
       mmdet_config: /path/to/mmdetection/configs/mask2former/mask2former_swin-s-p4-w7-224_lsj_8x2_50e_coco.py
       mmdet_checkpoint: /path/to/detector/mask2former_swin-s-p4-w7-224_lsj_8x2_50e_coco.pth
       clip_arch: ViT-L-14
