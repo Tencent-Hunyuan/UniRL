@@ -97,8 +97,12 @@ class TrainStack(Remote):
             raise ValueError(f"{cls}.micro_batch_size must be >= 1; got {micro_batch_size}.")
         if float(max_grad_norm) <= 0.0:
             raise ValueError(f"{cls}.max_grad_norm must be > 0; got {max_grad_norm}.")
-        if first_update_ratio_tol is not None and not first_update_ratio_tol > 0.0:
-            raise ValueError(f"{cls}.first_update_ratio_tol must be > 0 when set; got {first_update_ratio_tol}.")
+        if first_update_ratio_tol is not None and not (
+            math.isfinite(first_update_ratio_tol) and first_update_ratio_tol > 0.0
+        ):
+            raise ValueError(
+                f"{cls}.first_update_ratio_tol must be finite and > 0 when set; got {first_update_ratio_tol}."
+            )
         self.num_updates_per_batch = _positive_int(name=f"{cls}.num_updates_per_batch", value=num_updates_per_batch)
         if self.num_updates_per_batch > 1 and not algorithm.supports_multi_update:
             raise ValueError(
