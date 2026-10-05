@@ -45,6 +45,7 @@ class Qwen3Pipeline(Pipeline):
         system_instruction: Optional[str] = None,
         autocast_precision: str = "bf16",
         logprob_precision: str = "fp32",
+        replay_kernel_options: Optional[Dict[str, Any]] = None,
         enable_thinking: bool = False,
         max_prompt_length: int = 4096,
     ) -> "Qwen3Pipeline":
@@ -59,6 +60,7 @@ class Qwen3Pipeline(Pipeline):
             model=bundle,
             autocast_precision=autocast_precision,
             logprob_precision=logprob_precision,
+            replay_kernel_options=replay_kernel_options,
         )
         return cls(
             bundle=bundle,
