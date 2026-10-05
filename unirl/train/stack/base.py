@@ -89,6 +89,7 @@ class TrainStack(Remote):
         micro_planner: Optional[MicroPlanner] = None,
         shuffle_updates: bool = False,
         shuffle_seed: int = 0,
+        first_update_ratio_tol: Optional[float] = None,
     ) -> None:
         super().__init__()
         cls = type(self).__name__
@@ -96,6 +97,12 @@ class TrainStack(Remote):
             raise ValueError(f"{cls}.micro_batch_size must be >= 1; got {micro_batch_size}.")
         if float(max_grad_norm) <= 0.0:
             raise ValueError(f"{cls}.max_grad_norm must be > 0; got {max_grad_norm}.")
+        if first_update_ratio_tol is not None and not (
+            math.isfinite(first_update_ratio_tol) and first_update_ratio_tol > 0.0
+        ):
+            raise ValueError(
+                f"{cls}.first_update_ratio_tol must be finite and > 0 when set; got {first_update_ratio_tol}."
+            )
         self.num_updates_per_batch = _positive_int(name=f"{cls}.num_updates_per_batch", value=num_updates_per_batch)
         if self.num_updates_per_batch > 1 and not algorithm.supports_multi_update:
             raise ValueError(
@@ -109,6 +116,7 @@ class TrainStack(Remote):
         self.algorithm = algorithm
         self.micro_batch_size = int(micro_batch_size)
         self.max_grad_norm = float(max_grad_norm)
+        self.first_update_ratio_tol = first_update_ratio_tol
         self.update_planner = UpdatePlanner(
             micro_planner if micro_planner is not None else CountPlanner(),
             shuffle_updates=shuffle_updates,
@@ -389,7 +397,35 @@ class TrainStack(Remote):
             prior_backward = prior_backward or result.has_backward
             results.append(result)
         # The window is one optimizer step: its grad_norm is the stepping call's.
-        return replace(_aggregate_update_results(results), grad_norm=results[-1].grad_norm)
+        window = replace(_aggregate_update_results(results), grad_norm=results[-1].grad_norm)
+        return self._guard_first_update_ratio(window)
+
+    def _guard_first_update_ratio(self, result: TrainStepResult) -> TrainStepResult:
+        """Report the pre-step importance ratio's distance from 1 and warn past ``first_update_ratio_tol``."""
+        if self.first_update_ratio_tol is None:
+            return result
+        deviations = [
+            float(max(1.0 - m.metrics["ratio_min"], m.metrics["ratio_max"] - 1.0))
+            for m in result.micros
+            if "ratio_min" in m.metrics
+        ]
+        if not deviations:
+            if result.has_backward:
+                raise ValueError(
+                    f"{type(self).__name__}.first_update_ratio_tol is set, but "
+                    f"{type(self.algorithm).__name__} reports no ratio_min / ratio_max to check."
+                )
+            return result
+        worst = math.nan if any(math.isnan(deviation) for deviation in deviations) else max(deviations)
+        if not worst <= self.first_update_ratio_tol:
+            logger.warning(
+                "%s: importance ratio is %.4g away from 1 before any optimizer step (tolerance %.4g); "
+                "the algorithm's pi_old anchor does not match the policy being trained.",
+                type(self).__name__,
+                worst,
+                self.first_update_ratio_tol,
+            )
+        return replace(result, metrics={**result.metrics, "first_update_ratio_dev": worst})
 
     def _train_step_profiler(self):
         """Lazily build the per-worker train-step profiler (None unless UNIRL_PROFILE)."""
@@ -422,6 +458,7 @@ class TrainStack(Remote):
             )
             with cm:
                 results.append(self._run_update(part, micros=micros, order=order, training_progress=training_progress))
+        results[0] = self._guard_first_update_ratio(results[0])
         if len(results) == 1:
             return results[0]
         aggregated = _aggregate_update_results(results)

@@ -85,3 +85,8 @@ handler in `../../distributed/weight_sync`.
   trainer, PE, and agentic paths already stamp this. `temperature` / `top_p` /
   `top_k` / `max_new_tokens` are gone from `SGLangEngineConfig` — there is no
   engine-config fallback.
+- **vLLM-Omni BAGEL ships the worker's token layout with every row.** The worker
+  pipeline records the KV length, RoPE offset and canvas it generated with, and
+  `BagelDiffusionStage` raises when the context the trainer rebuilds differs, so
+  a prompt or source-image preprocessing change on either side fails the first
+  replay instead of training against a different sequence.
