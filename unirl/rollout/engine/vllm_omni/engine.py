@@ -10,7 +10,7 @@ import torch
 
 from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, distributed
-from unirl.rollout.engine.base import BaseRolloutEngine
+from unirl.rollout.engine.base import BaseRolloutEngine, reject_row_canvases
 from unirl.rollout.engine.vllm_omni.adapters import get_adapter
 from unirl.rollout.engine.vllm_omni.backends import VLLMOmniBackend
 from unirl.rollout.engine.vllm_omni.config import VLLMOmniEngineConfig, VLLMOmniPorts
@@ -90,7 +90,7 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
         return self._generate_locked(sample)
 
     def packs_groups(self, sample: Sample) -> bool:
-        """The adapter answers: packed t2i collapses a group into one prompt, per-row modalities do not."""
+        """The adapter answers whether its requests need whole samples_per_prompt groups."""
         return self.adapter.packs_groups(sample)
 
     def _generate_locked(self, sample: Sample) -> Sample:
@@ -109,6 +109,8 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
             "VLLMOmniRolloutEngine.generate: engine is offloaded or its last lifecycle transition failed "
             "(wake_up first).",
         )
+        if not self.adapter.supports_row_canvas:
+            reject_row_canvases(sample, engine=f"VLLMOmniRolloutEngine[{self.cfg.modality}]")
         self.adapter.validate_request(sample)
         if self.adapter.needs_sigmas:
             require(self.schedule_policy is not None, f"{type(self.adapter).__name__} has no sigma schedule policy")

@@ -2,22 +2,23 @@
 
 from __future__ import annotations
 
+import dataclasses
+from types import SimpleNamespace
 from typing import Any, Dict, List
 
+from unirl.config.require import require
 from unirl.models.bagel.conditions import BagelDiffusionConditions
 from unirl.models.bagel.diffusion import BagelDiffusionParams
+from unirl.models.bagel.pipeline import BagelPipeline
 from unirl.rollout.engine.vllm_omni.adapters.base import ModelAdapter, register_adapter
-from unirl.rollout.engine.vllm_omni.adapters.dit import (
-    DitInputAdapter,
-    DitOutputAdapter,
-    _grouped_texts_from_sample,
-)
+from unirl.rollout.engine.vllm_omni.adapters.dit import DitOutputAdapter
 from unirl.rollout.engine.vllm_omni.backends import (
     STAGE_KIND_DIFFUSION,
     GenerateCall,
     OmniRawResult,
     StageSampling,
 )
+from unirl.rollout.engine.vllm_omni.pipelines._shared.interception import read_captures
 from unirl.rollout.engine.vllm_omni.utils import (
     build_image_segment,
     collect_dit_outputs,
@@ -61,99 +62,60 @@ def _conditioning_rows(
     return prompt_rows, image_rows
 
 
-class BagelInputAdapter(DitInputAdapter):
+class BagelInputAdapter:
     """Build BAGEL prompt dictionaries and diffusion-stage sampling intent."""
 
-    def __init__(self, modality: str, *, image_input: bool = False) -> None:
-        super().__init__(modality)
+    def __init__(self, modality: str, *, image_input: bool = False, model_config: Any) -> None:
+        self.modality = modality
         self.image_input = bool(image_input)
+        self.model_config = model_config
 
-    def _spp(self, sample: Sample) -> int:
-        """``samples_per_prompt`` — the GRPO group size; 1 disables packing."""
-        diff_params = sample.frontier_gen_part(BagelDiffusionParams).sampling_params
-        spp = int(diff_params.samples_per_prompt)
-        if spp < 1:
-            raise ValueError(f"{self.modality}: samples_per_prompt must be >= 1, got {spp}")
-        return spp
-
-    def packs_groups(self, sample: Sample) -> bool:
-        """Collapse spp samples into one ``num_outputs_per_prompt=spp`` request."""
-        if self.image_input:
-            return False
-        if self._spp(sample) <= 1:
-            return False
-        diff_params = sample.frontier_gen_part(BagelDiffusionParams).sampling_params
-        return float(diff_params.guidance_scale) <= 1.0 and float(diff_params.cfg_img_scale) <= 1.0
-
-    def build_prompts(self, sample: Sample) -> List[Any]:
-        """Plain ``{"prompt": text}`` dicts (no ``modalities`` → image path)."""
-        caller = f"{self.modality}.build_prompts"
-        prompt_rows, pil_images = _conditioning_rows(
-            sample,
-            image_input=self.image_input,
-            caller=caller,
+    def _canvas_params(self, params: BagelDiffusionParams, height: int, width: int) -> BagelDiffusionParams:
+        """The request's params re-targeted at a row canvas, x_T shape included; the default canvas returns them."""
+        if (height, width) == (params.height, params.width):
+            return params
+        shape = BagelPipeline.latent_shape(
+            model_config=self.model_config, sampling_spec=SimpleNamespace(height=height, width=width)
         )
+        require(
+            0 < shape[0] <= BagelPipeline.latent_shape(model_config=self.model_config, sampling_spec=params)[0],
+            f"{self.modality}: row canvas {height}x{width} must hold at least one token and no more than "
+            f"sampling.height/width ({params.height}x{params.width}), which bounds the stored trajectory.",
+        )
+        noise_shape = None if params.init_noise_latent_shape is None else list(shape)
+        return dataclasses.replace(params, height=height, width=width, init_noise_latent_shape=noise_shape)
+
+    def build(self, sample: Sample) -> List[GenerateCall]:
+        """One request per sibling run, one call per contiguous requests of equal canvas and size; see the README."""
         gen_part = sample.frontier_gen_part(BagelDiffusionParams)
-        n_samples = len(gen_part.sample_ids)
-        if self.image_input:
-            return [
-                {"prompt": text, "multi_modal_data": {"image": image}}
-                for text, image in zip(prompt_rows, pil_images, strict=True)
+        params = gen_part.sampling_params
+        texts, images = _conditioning_rows(sample, image_input=self.image_input, caller=f"{self.modality}.build")
+        canvases = sample.canvases()
+        packs = params.guidance_scale <= 1.0 and params.cfg_img_scale <= 1.0
+        owners = gen_part.group_ids if packs else gen_part.sample_ids
+        starts = [row for row in range(len(owners)) if row == 0 or owners[row] != owners[row - 1]]
+        requests = list(zip(starts, starts[1:] + [len(owners)]))
+        shapes = [(canvases[start], end - start) for start, end in requests]
+        calls: List[GenerateCall] = []
+        first = 0
+        for last in range(1, len(requests) + 1):
+            if last < len(requests) and shapes[last] == shapes[first]:
+                continue
+            canvas, outputs = shapes[first]
+            rows = gen_part.slice(requests[first][0], requests[last - 1][1])
+            prompts = [
+                {"prompt": texts[start], "multi_modal_data": {"image": images[start]}}
+                if self.image_input
+                else {"prompt": texts[start]}
+                for start, _ in requests[first:last]
             ]
-        spp = self._spp(sample)
-        grouped_texts, grouped_spp = _grouped_texts_from_sample(
-            sample,
-            caller=caller,
-        )
-        if grouped_spp != spp:
-            raise RuntimeError(
-                f"{self.modality}.build_prompts: inconsistent samples_per_prompt "
-                f"({grouped_spp} from grouping, {spp} from diffusion params)."
-            )
+            sampling = self._sampling(rows, self._canvas_params(params, *canvas), outputs)
+            calls.append(GenerateCall(prompts=prompts, sampling=sampling))
+            first = last
+        return calls
 
-        pack = self.packs_groups(sample)
-        if pack:
-            prompt_texts = grouped_texts
-            num_outputs_per_prompt = spp
-        else:
-            prompt_texts = prompt_rows
-            num_outputs_per_prompt = 1
-
-        if len(prompt_texts) * num_outputs_per_prompt != n_samples:
-            raise RuntimeError(
-                f"{self.modality}.build_prompts: prompt count {len(prompt_texts)} * "
-                f"num_outputs_per_prompt={num_outputs_per_prompt} != diffusion sample count {n_samples}."
-            )
-        return [{"prompt": text} for text in prompt_texts]
-
-    def build_sampling(self, sample: Sample) -> List[StageSampling]:
-        """One diffusion-stage intent with the BAGEL-specific kwargs."""
-        spp = self._spp(sample)
-        gen_part = sample.frontier_gen_part(BagelDiffusionParams)
-        diff_params = gen_part.sampling_params
-        pack = self.packs_groups(sample)
-
-        n_samples = len(gen_part.sample_ids)
-        if self.image_input:
-            n_prompts = n_samples
-        else:
-            grouped_texts, grouped_spp = _grouped_texts_from_sample(
-                sample,
-                caller=f"{self.modality}.build_sampling",
-            )
-            if grouped_spp != spp:
-                raise RuntimeError(
-                    f"{self.modality}.build_sampling: inconsistent samples_per_prompt "
-                    f"({grouped_spp} from grouping, {spp} from diffusion params)."
-                )
-            n_prompts = len(grouped_texts) if pack else n_samples
-        num_outputs_per_prompt = spp if pack else 1
-        if n_prompts * num_outputs_per_prompt != n_samples:
-            raise RuntimeError(
-                f"{self.modality}.build_sampling: prompt count {n_prompts} * "
-                f"num_outputs_per_prompt={num_outputs_per_prompt} != diffusion sample count {n_samples}."
-            )
-
+    def _sampling(self, gen_part: Any, diff_params: BagelDiffusionParams, outputs: int) -> List[StageSampling]:
+        """One diffusion-stage intent with the BAGEL-specific kwargs; ``outputs`` images per request."""
         num_steps = int(diff_params.num_inference_steps)
         diff_kwargs: Dict[str, Any] = dict(
             height=int(diff_params.height),
@@ -163,7 +125,7 @@ class BagelInputAdapter(DitInputAdapter):
             eta=float(diff_params.eta),
             return_trajectory_latents=True,
             return_trajectory_decoded=False,
-            num_outputs_per_prompt=num_outputs_per_prompt,
+            num_outputs_per_prompt=outputs,
         )
         seed = diff_params.seed
         if seed is not None:
@@ -204,17 +166,19 @@ class BagelInputAdapter(DitInputAdapter):
 class BagelOutputAdapter(DitOutputAdapter):
     """Build one image Part with deferred BAGEL replay conditions."""
 
-    def __init__(self, modality: str, *, image_input: bool = False) -> None:
+    def __init__(self, modality: str, *, image_input: bool = False, model_config: Any) -> None:
         super().__init__(modality)
         self.image_input = bool(image_input)
+        self.model_config = model_config
 
     def build_segment(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Any:
-        """The DiT trajectory segment (asserts the σ echo)."""
+        """The DiT trajectory segment (asserts the σ echo), smaller canvases padded to the default's token count."""
         diff_outputs, _, _ = collect_dit_outputs(
             per_request, final_output_type=self.final_output_type, stage_id=self.stage_id, modality=self.modality
         )
         diff_params = sample.frontier_gen_part(BagelDiffusionParams).sampling_params
-        return build_image_segment(diff_outputs, expected_sigmas=diff_params.sigmas)
+        max_tokens = BagelPipeline.latent_shape(model_config=self.model_config, sampling_spec=diff_params)[0]
+        return build_image_segment(diff_outputs, expected_sigmas=diff_params.sigmas, pad_tokens_to=max_tokens)
 
     def build_decoded(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Any:
         del sample
@@ -224,20 +188,20 @@ class BagelOutputAdapter(DitOutputAdapter):
         return pils_to_images(pil_images)
 
     def build_conditions(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
-        """Ship raw prompt, shape, and optional source image for trainer-side KV rebuild."""
-        del per_request
+        """Ship raw prompt, shape, optional source image and the worker's token layout for trainer-side KV rebuild."""
+        diff_outputs, frame_groups, _ = collect_dit_outputs(
+            per_request, final_output_type=self.final_output_type, stage_id=self.stage_id, modality=self.modality
+        )
         prompts, input_images = _conditioning_rows(
             sample,
             image_input=self.image_input,
             caller=f"{self.modality}.build_conditions",
         )
-        gen_part = sample.frontier_gen_part(BagelDiffusionParams)
-        diff_params = gen_part.sampling_params
-        image_shape = (int(diff_params.height), int(diff_params.width))
         conditions = BagelDiffusionConditions(
             prompts=prompts,
             input_images=input_images,
-            image_shapes=[image_shape] * len(prompts),
+            image_shapes=sample.canvases(),
+            layouts=[read_captures(out)["layout"] for out, frames in zip(diff_outputs, frame_groups) for _ in frames],
         )
         return conditions.to_dict()
 
@@ -249,14 +213,12 @@ class BagelAdapter(ModelAdapter):
     omni_mode = "text-to-image"
     needs_driver_tokenizer = False
     image_input: bool = False  # Whether the modality requires an edit-source image.
+    supports_row_canvas = True
 
     def __init__(self, config: Any, model_config: Any, *, strategy: Any = None, tokenize_fn: Any = None) -> None:
         super().__init__(config, model_config, strategy=strategy, tokenize_fn=tokenize_fn)
-        self.input_adapter = BagelInputAdapter(self.modality, image_input=self.image_input)
-        self.output_adapter = BagelOutputAdapter(self.modality, image_input=self.image_input)
-
-    def packs_groups(self, sample: Sample) -> bool:
-        return self.input_adapter.packs_groups(sample)
+        self.input_adapter = BagelInputAdapter(self.modality, image_input=self.image_input, model_config=model_config)
+        self.output_adapter = BagelOutputAdapter(self.modality, image_input=self.image_input, model_config=model_config)
 
     def schedule_policy(self) -> FlowMatchSchedulePolicy:
         """Static-shift FlowMatch σ policy (BAGEL uses no dynamic shifting)."""

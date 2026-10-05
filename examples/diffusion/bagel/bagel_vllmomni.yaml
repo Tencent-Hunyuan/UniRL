@@ -157,6 +157,7 @@ stack:
   max_grad_norm: 1.0
   num_updates_per_batch: 2             # 2 optimizer updates/rollout (disjoint mini-batches)
   shuffle_updates: true
+  first_update_ratio_tol: 1.0e-4       # warn when |ratio - 1| before the first step passes this; healthy rollouts measure ~1e-5
 
 data_source:
   _target_: unirl.data.data_source.MultimodalRLDataSource

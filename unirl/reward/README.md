@@ -77,15 +77,16 @@ reward_stack:
 ```
 
 A micro can be as small as one row. The exception is an engine that packs a whole
-`samples_per_prompt` group into one request (the vLLM-Omni t2i adapters: SD3, Qwen-Image
-and BAGEL t2i), which the engine reports through `packs_groups(sample)`; there a micro is
+`samples_per_prompt` group into one request (the vLLM-Omni SD3 and Qwen-Image t2i
+adapters), which the engine reports through `packs_groups(sample)`; there a micro is
 extended to the end of the group it would otherwise split, so the group is the floor.
-BAGEL it2i, SGLang and the trainside engine take micros of any size.
+vLLM-Omni BAGEL packs whatever contiguous siblings a micro holds, so it, SGLang and the
+trainside engine take micros of any size.
 
 It pays for a reward that costs real time relative to generation, which in practice
 means one served from other GPUs: colocated with PickScore the stack recovers 0.15 s of a
-108.8 s step. Measured with one 8-GPU training node (BAGEL it2i, 256 rows per rollout,
-4 micros per rank) and EditScore behind `reward_service.direct_server` on another node,
+108.8 s step. Measured with one 8-GPU training node (BAGEL it2i at one request per
+sample, 256 rows per rollout, 4 micros per rank) and EditScore behind `reward_service.direct_server` on another node,
 the serial micro loop takes generate+reward from 127.5 s to 111.6 s with an 8B judge and
 from 180.1 s to 144.7 s with a 72B one. Two things change: each rank's micros reach the
 scorer as they finish instead of every rank arriving together after the whole shard, and
