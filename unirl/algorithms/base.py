@@ -30,21 +30,26 @@ def typed_conditions(
     return conditions_cls.from_dict(dict(conditions))
 
 
-def policy_entropy_metrics(replay: ReplayResult, loss_mask: Optional[torch.Tensor]) -> Dict[str, float]:
+def policy_entropy_metrics(replay: ReplayResult, loss_mask: Optional[torch.Tensor]) -> Dict[str, Any]:
     """Token-weighted entropy statistics in nats; see README Gotchas for mask and aggregation semantics."""
     if not isinstance(replay, ReplayResult) or replay.entropy is None:
         raise TypeError("monitor_entropy=True requires replay to return ReplayResult.entropy")
     entropy = replay.entropy.detach()
     if entropy.shape != replay.log_probs.shape:
         raise ValueError("replay entropy must have the same packed shape as log_probs")
-    if loss_mask is not None:
-        entropy = entropy[loss_mask.to(device=entropy.device, dtype=torch.bool)]
-    total = float(entropy.sum().item())
-    count = entropy.numel()
+    if loss_mask is None:
+        count = entropy.new_tensor(entropy.numel(), dtype=torch.int64)
+    else:
+        if loss_mask.shape != entropy.shape:
+            raise ValueError("loss_mask must have the same packed shape as entropy")
+        active = loss_mask.to(device=entropy.device, dtype=torch.bool)
+        entropy = entropy.masked_fill(~active, 0.0)
+        count = active.sum()
+    total = entropy.sum()
     return {
-        "policy_entropy": total / count if count else 0.0,
+        "policy_entropy": total / count.clamp_min(1),
         "policy_entropy_sum": total,
-        "policy_entropy_count": float(count),
+        "policy_entropy_count": count,
     }
 
 

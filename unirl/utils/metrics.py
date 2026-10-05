@@ -16,6 +16,12 @@ def aggregate_numeric_metrics(metrics_list: List[Dict[str, Any]]) -> Dict[str, f
         all_keys.update(metrics.keys())
 
     for key in all_keys:
+        if key == "policy_entropy" and "policy_entropy_count" in all_keys:
+            continue
+        if key in ("policy_entropy_sum", "policy_entropy_count"):
+            total = sum(metrics[key] for metrics in metrics_list if key in metrics)
+            aggregated[key] = float(total)
+            continue
         values: List[float] = []
         for metrics in metrics_list:
             if key not in metrics:
@@ -28,10 +34,7 @@ def aggregate_numeric_metrics(metrics_list: List[Dict[str, Any]]) -> Dict[str, f
             elif isinstance(value, (int, float)):
                 values.append(float(value))
         if values:
-            if key in ("policy_entropy_sum", "policy_entropy_count"):
-                aggregated[key] = sum(values)
-            else:
-                aggregated[key] = sum(values) / len(values)
+            aggregated[key] = sum(values) / len(values)
 
     if "policy_entropy_count" in aggregated:
         count = aggregated["policy_entropy_count"]

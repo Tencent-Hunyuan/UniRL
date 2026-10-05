@@ -174,9 +174,16 @@ class TrainStack(Remote):
         )
 
         if getattr(self.algorithm, "monitor_entropy", False):
-            entropy_sum, entropy_count = self._all_reduce_sums(
-                [aggregated_metrics.get("policy_entropy_sum", 0.0), aggregated_metrics.get("policy_entropy_count", 0.0)]
-            )
+            local_entropy = [
+                aggregated_metrics.get("policy_entropy_sum", 0.0),
+                aggregated_metrics.get("policy_entropy_count", 0.0),
+            ]
+            rank_info = self.rank_info
+            if rank_info is not None and (
+                rank_info.tp_rank != 0 or rank_info.sp_rank != 0 or not rank_info.is_pipeline_last_stage
+            ):
+                local_entropy = [0.0, 0.0]
+            entropy_sum, entropy_count = self._all_reduce_sums(local_entropy)
             aggregated_metrics = {
                 **aggregated_metrics,
                 "policy_entropy_sum": entropy_sum,
