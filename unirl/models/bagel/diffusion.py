@@ -327,7 +327,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         if not conditions.layouts:
             return
         height, width = image_shape
-        rebuilt = {"kv_len": int(gen["kv_lens"][0]), "rope": int(gen["ropes"][0]), "height": height, "width": width}
+        rebuilt = {"kv_len": gen["kv_lens"][0], "rope": gen["ropes"][0], "height": height, "width": width}
         require(
             rebuilt == conditions.layouts[0],
             "BagelDiffusionStage: rollout and replay built different token layouts for this sample: "
