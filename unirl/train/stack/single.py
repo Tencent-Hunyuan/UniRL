@@ -54,9 +54,12 @@ class TrainStack(BaseTrainStack):
             max_grad_norm=max_grad_norm,
             num_updates_per_batch=num_updates_per_batch,
         )
-        if first_update_ratio_tol is not None and not first_update_ratio_tol > 0.0:
+        if first_update_ratio_tol is not None and not (
+            math.isfinite(first_update_ratio_tol) and first_update_ratio_tol > 0.0
+        ):
             raise ValueError(
-                f"{type(self).__name__}.first_update_ratio_tol must be > 0 when set; got {first_update_ratio_tol}."
+                f"{type(self).__name__}.first_update_ratio_tol must be finite and > 0 when set; "
+                f"got {first_update_ratio_tol}."
             )
         self.algorithm = algorithm
         self.first_update_ratio_tol = first_update_ratio_tol
