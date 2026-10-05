@@ -27,7 +27,7 @@
 # Boot note: colocate 1x8 lands all 8 hv15 engine replicas on ONE node — the
 # worst-case parallel-boot memcg burst (each loads ~30GB DiT + Qwen2.5-VL TE +
 # ByT5 + fp32 VAE). The engine's flock boot-serializer
-# (DIFFRL_OMNI_BOOT_SERIALIZE=1, default) single-files the loads, and the ckpt
+# (UNIRL_OMNI_BOOT_SERIALIZE=1, default) single-files the loads, and the ckpt
 # MUST be pod-local (point PRETRAINED_MODEL at a local path) — serialized cephfs
 # loads would be 8x28min and blow init_timeout.
 #

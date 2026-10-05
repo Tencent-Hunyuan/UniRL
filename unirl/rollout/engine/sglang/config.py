@@ -12,6 +12,7 @@ from unirl.rollout.engine.ports import ReservedPorts
 _REQUIRED_SERVER_ARGS_METADATA_KEY = "_unirl_required_server_args"
 _LOAD_BEARING_SERVER_ARGS = frozenset(
     {
+        "context_length",
         "ep_size",
         "enable_memory_saver",
         "enable_weights_cpu_backup",
@@ -51,6 +52,8 @@ class SGLangEngineConfig(BaseEngineConfig):
     backend: str = "http"
 
     concurrency: int = 8
+
+    context_length: Optional[int] = None  # server context window; also caps each request's max_new_tokens
 
     enable_memory_saver: Optional[bool] = None
     enable_weights_cpu_backup: Optional[bool] = None
@@ -118,6 +121,15 @@ class SGLangEngineConfig(BaseEngineConfig):
             self.concurrency >= 1,
             f"SGLangEngineConfig.concurrency must be >= 1; got {self.concurrency!r}",
         )
+        require(
+            self.context_length is None or self.context_length >= 1,
+            f"SGLangEngineConfig.context_length must be >= 1 when set; got {self.context_length!r}",
+        )
+        require(
+            "context_length" not in self.engine_kwargs,
+            "SGLangEngineConfig.engine_kwargs must not set context_length; set the context_length field, "
+            "which the client also clamps each request's max_new_tokens against",
+        )
 
         self.backend = str(self.backend).strip().lower()
         require(
@@ -157,6 +169,8 @@ class SGLangEngineConfig(BaseEngineConfig):
             intent["ep_size"] = int(self.ep_size)
         if self.dp_size is not None:
             intent["dp_size"] = int(self.dp_size)
+        if self.context_length is not None:
+            intent["context_length"] = int(self.context_length)
         if self.enable_memory_saver is not None:
             intent["enable_memory_saver"] = bool(self.enable_memory_saver)
         if self.enable_weights_cpu_backup is not None:

@@ -163,6 +163,19 @@ enabled, which UniRL's rollout backend does not do.
   auxiliary features fail closed. `use_lora=true` selects adapter-only sync for
   the engine lifetime. Full-weight sync requires `use_lora=false`; a trainer
   using LoRA must merge the adapter before pushing those full weights.
+- **A colocated SGLang engine needs `enable_memory_saver`.** Without it SGLang
+  installs a no-op `TorchMemorySaverAdapter`: `release_memory_occupation` reports
+  success and frees nothing. Add `enable_weights_cpu_backup: true` to move weights
+  to host across the sleep. `AgenticTrainer` rejects a colocated engine without the
+  flag; `ARTrainer` warns.
+- **Size `mem_fraction_static` from the wake peak, not the rollout peak.** In
+  `AgenticTrainer` the engine wakes before `backend.offload()` releases the train
+  state, and `torch_memory_saver`'s `resume()` cannot reuse blocks held by torch's
+  caching allocator. Take the peak over several rollouts; turn counts vary run to run.
+- **KV offload (HiCache, Mooncake) only helps above the radix-cache knee.** With
+  `R = concurrency × per-trajectory context / KV pool`, prefix reuse stays flat up
+  to `R ≈ 1` and drops beyond it; below that a host tier has nothing to recover.
+  Raising `mem_fraction_static` lowers `R`, so re-measure it before adding a tier.
 - **Never recompute σ inside an engine** — the generated Part's pinned sigmas are
   the single source of truth; `engine/sigma_verify.py` checks the backend echo (it
   guards the GRPO log-prob ratio).
