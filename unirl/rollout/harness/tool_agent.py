@@ -5,7 +5,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
-from unirl.rollout.harness.protocol import HarnessContext, HarnessOutcome
+from unirl.rollout.harness.protocol import ContextOverflowError, HarnessContext, HarnessOutcome
+from unirl.types.segments.base import SegmentStatus
 
 if TYPE_CHECKING:
     from unirl.rollout.env.protocol import Environment
@@ -35,10 +36,17 @@ class ToolAgentHarness:
                 sample = context.generate(self.ENGINE, sample.fork(1, sampling_params=self.sampling))
                 observation, done, _ = self.env.step(sample)
                 if done:
-                    return HarnessOutcome(sample, "completed")
+                    # A final turn cut at a token budget (context or max_new_tokens) never reached EOS.
+                    status = sample.gen_parts()[-1].status
+                    cut_off = status is not None and bool((status == SegmentStatus.TRUNCATED).any())
+                    return HarnessOutcome(sample, "overflow" if cut_off else "completed")
                 if observation is not None:
                     sample = sample.observe(observation)
             return HarnessOutcome(sample, "completed")
+        except ContextOverflowError as exc:
+            logger.warning("ToolAgentHarness: trajectory overflowed the context window: %s", exc)
+            # A prompt that overflows before any turn leaves nothing to score or train.
+            return HarnessOutcome(sample, "overflow" if sample.gen_parts() else "failed")
         except Exception as exc:  # noqa: BLE001 — isolate: one bad trajectory must not sink the drain
             logger.warning("ToolAgentHarness: trajectory failed: %s", exc, exc_info=True)
             return HarnessOutcome(sample, "failed")
