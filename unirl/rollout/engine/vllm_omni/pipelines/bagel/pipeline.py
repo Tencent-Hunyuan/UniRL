@@ -147,7 +147,7 @@ class RLBagelPipeline(BagelPipeline):
 
         def tapped(*args: Any, **kw: Any) -> Any:
             spp = pipeline_self._pending_spp
-            if spp > 1 and "image_sizes" in kw and len(kw["image_sizes"]) == 1:
+            if spp > 1:
                 kw = dict(kw)
                 kw["image_sizes"] = list(kw["image_sizes"]) * spp
                 kw["curr_kvlens"] = list(kw["curr_kvlens"]) * spp
