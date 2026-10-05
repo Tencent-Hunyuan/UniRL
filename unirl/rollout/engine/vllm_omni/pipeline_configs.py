@@ -22,6 +22,19 @@ UNIRL_RL_IMAGE_DIFFUSION = PipelineConfig(
     ),
 )
 
+UNIRL_RL_VIDEO_DIFFUSION = PipelineConfig(
+    model_type="unirl_rl_video_diffusion",
+    stages=(
+        StagePipelineConfig(
+            stage_id=0,
+            model_stage="diffusion",
+            execution_type=StageExecutionType.DIFFUSION,
+            final_output=True,
+            final_output_type="video",
+        ),
+    ),
+)
+
 _HI3_MODEL_ARCH = "HunyuanImage3ForCausalMM"
 
 
@@ -91,6 +104,7 @@ def register_unirl_pipeline_configs() -> None:
     """Register UniRL's custom topologies once, rejecting key collisions."""
     for pipeline in (
         UNIRL_RL_IMAGE_DIFFUSION,
+        UNIRL_RL_VIDEO_DIFFUSION,
         UNIRL_HI3_AR_TEXT,
         UNIRL_HI3_AR_MULTIMODAL_TEXT,
         UNIRL_HI3_AR_RECAPTION,
@@ -112,5 +126,6 @@ __all__ = [
     "UNIRL_HI3_AR_TEXT",
     "UNIRL_QWEN3_OMNI_THINKER",
     "UNIRL_RL_IMAGE_DIFFUSION",
+    "UNIRL_RL_VIDEO_DIFFUSION",
     "register_unirl_pipeline_configs",
 ]
