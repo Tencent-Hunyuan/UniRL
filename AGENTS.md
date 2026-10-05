@@ -105,6 +105,13 @@ Local skills currently in this repo:
 | --- | --- | --- |
 | Model bundles | `.claude/skills/development/add-model-bundle/SKILL.md` | Adding or updating diffusion or autoregressive model pipelines, model config dataclasses, Bundle/Pipeline/Stage/Conditions implementations, LoRA targets, FSDP wrapping hints, Sample/Part plumbing, or multimodal text/image/video/audio conditioning. |
 | Pull requests | `.claude/skills/development/pr-workflow/SKILL.md` | Creating or updating PRs, editing PR bodies, handling PR Body or Semantic Pull Request CI failures, or running `gh pr create`. |
+| PR review | `.claude/skills/development/pr-review/SKILL.md` | Pushing or opening a PR for a substantive code or config change, or reviewing a diff for correctness, hot-path cost, and redundancy. |
+
+## 7. Pre-PR Review Gate
+
+**No push without a reviewed diff.**
+
+Before `git push` or `gh pr create` on a substantive code or config change, complete the PR review skill and do not push until its record for that commit says `Status: pass`.
 
 ---
 

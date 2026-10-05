@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from typing import Any, Callable, Iterator
 
 MOE_WORKSPACE_TAG = "moe_workspace"
-_WORKSPACE_MANAGER_MARKER = "_diffrl_moe_workspace_pool_installed"
+_WORKSPACE_MANAGER_MARKER = "_unirl_moe_workspace_pool_installed"
 
 
 def _workspace_pool_key(workspace_id: int) -> str:

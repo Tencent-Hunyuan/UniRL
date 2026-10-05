@@ -35,9 +35,9 @@ def _resolve_dtype(name: str) -> torch.dtype:
 
 
 class NcclBroadcastReceiveMixin:
-    """Adds ``init_weights_update_group`` + ``update_weights_from_distributed`` to a worker by inheritance."""
+    """Adds NCCL weight receive to a worker; requires ``BucketedIPCReceiveMixin`` for ``_unirl_load_weights``."""
 
-    _diffrl_weight_groups: Dict[str, "dist.ProcessGroup"] = {}
+    _unirl_weight_groups: Dict[str, "dist.ProcessGroup"] = {}
 
     def init_weights_update_group(
         self,
@@ -50,20 +50,18 @@ class NcclBroadcastReceiveMixin:
         backend: str = "nccl",
     ) -> None:
         """Join the trainer-coordinated process group as the receiver."""
-        from unirl.utils.distributed_utils import (
-            init_process_group as _diffrl_init_pg,
-        )
+        from unirl.utils.distributed_utils import init_process_group
 
         local_rank = int(getattr(self, "local_rank", 0))
         global_rank = int(rank_offset) + local_rank
-        new_group = _diffrl_init_pg(
+        new_group = init_process_group(
             backend=backend,
             init_method=f"tcp://{master_address}:{int(master_port)}",
             world_size=int(world_size),
             rank=global_rank,
             group_name=group_name,
         )
-        type(self)._diffrl_weight_groups[group_name] = new_group
+        type(self)._unirl_weight_groups[group_name] = new_group
         logger.info(
             "%s.init_weights_update_group: joined %r at global_rank=%d/%d (master=%s:%d, backend=%s)",
             type(self).__name__,
@@ -77,7 +75,7 @@ class NcclBroadcastReceiveMixin:
 
     def destroy_weights_update_group(self, *, group_name: str) -> None:
         """Drop the named group's handle. Counterpart to ``init_weights_update_group``."""
-        type(self)._diffrl_weight_groups.pop(group_name, None)
+        type(self)._unirl_weight_groups.pop(group_name, None)
 
     def update_weights_from_distributed(
         self,
@@ -89,9 +87,9 @@ class NcclBroadcastReceiveMixin:
         target_modules: Optional[List[str]] = None,
         flush_cache: bool = True,
     ) -> None:
-        """Receive a bucket of named tensors by ``dist.broadcast`` from rank 0, then call ``self.load_weights``."""
+        """Receive a bucket of named tensors by ``dist.broadcast`` from rank 0, then load them into the worker."""
         del target_modules, flush_cache  # accepted for SGLang-shape parity
-        group = type(self)._diffrl_weight_groups.get(group_name)
+        group = type(self)._unirl_weight_groups.get(group_name)
         if group is None:
             raise RuntimeError(
                 f"{type(self).__name__}.update_weights_from_distributed: no "
@@ -112,11 +110,7 @@ class NcclBroadcastReceiveMixin:
             dist.broadcast(tensor, src=0, group=group)
             bucket.append((str(name), tensor))
 
-        loader = getattr(self, "_diffrl_load_weights", None)
-        if loader is None:
-            self.load_weights(bucket)
-        else:
-            loader(bucket)
+        self._unirl_load_weights(bucket)
         logger.debug(
             "%s.update_weights_from_distributed: received %d tensors via group %r",
             type(self).__name__,
