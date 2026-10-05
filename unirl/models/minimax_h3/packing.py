@@ -147,15 +147,28 @@ def row_timestep_plan(
     audio_sigma: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """``(unique_timesteps, timestep_indices)`` for one denoising step."""
-    video_t = float(1.0 - float(video_sigma))
-    audio_t = float(1.0 - float(audio_sigma))
-    return build_row_timesteps(
-        layout,
-        video_timestep=video_t,
-        audio_timestep=audio_t,
-        condition_video_timestep=video_t,
-        condition_audio_timestep=video_t,
-    )
+    if video_sigma.numel() == 1 and audio_sigma.numel() == 1:
+        video_t = float(1.0 - float(video_sigma))
+        audio_t = float(1.0 - float(audio_sigma))
+        return build_row_timesteps(
+            layout,
+            video_timestep=video_t,
+            audio_timestep=audio_t,
+            condition_video_timestep=video_t,
+            condition_audio_timestep=video_t,
+        )
+
+    video_t = (1.0 - video_sigma.detach().reshape(-1).to(device="cpu", dtype=torch.float64)).to(torch.float32)
+    audio_t = (1.0 - audio_sigma.detach().reshape(-1).to(device="cpu", dtype=torch.float64)).to(torch.float32)
+    if video_t.shape != audio_t.shape:
+        raise ValueError(
+            "row_timestep_plan: video_sigma and audio_sigma must have matching batch shapes, got "
+            f"{tuple(video_sigma.shape)} and {tuple(audio_sigma.shape)}"
+        )
+
+    row_timesteps = video_t[:, None].expand(-1, layout.sequence_length).clone()
+    row_timesteps[:, layout.audio_indices[layout.num_condition_audio_rows :]] = audio_t[:, None]
+    return torch.unique(row_timesteps, sorted=True, return_inverse=True)
 
 
 __all__ = [
