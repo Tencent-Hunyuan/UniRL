@@ -1,17 +1,19 @@
 # Configuration for the reward service.
 #
-# Every reward (except geneval, see bottom) is enabled by default and points
-# at the locally-staged weights under
+# The image rewards below are enabled by default and point at the
+# locally-staged weights under
 # /path/to/RewardModel/. Each reward group
 # owns its GPUs exclusively (resource isolation); total GPU budget =
 # sum of (num_gpus * num_replicas). With the defaults below:
 #   CLIP / PickScore / ImageReward / HPSv2 / HPSv3 / UnifiedReward → 1 GPU each (6)
 #   ocr (GOT-OCR-2.0) → 1 GPU
 #   GenEval2 (Qwen3-VL-8B, TP=2) → 2 GPUs
-# = 9 GPUs; drop entries or fractionally share GPUs to fit your card count.
+#   EditReward (Qwen2.5-VL-7B) → 1 GPU
+# = 10 GPUs; drop entries or fractionally share GPUs to fit your card count.
 #
-# geneval is commented out at the bottom: its mmdet/mmcv stack needs
-# Python 3.10 and cannot run under this service's Python-3.13 Ray cluster
+# editscore, geneval, videoalign, and wise are commented out at the bottom;
+# each section explains why. geneval in particular needs Python 3.10 for its
+# mmdet/mmcv stack and cannot run under this service's Python-3.13 Ray cluster
 # via runtime_env (see envs/geneval.txt for the full rationale).
 
 server:

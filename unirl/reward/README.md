@@ -25,9 +25,9 @@ Turning rewards into advantages is the trainer's job
 ## Local scorer registry
 
 The canonical built-in names are the keys in
-[`local/registry.py`](local/registry.py). The registry is used by wrappers such
-as `VideoRewardScorer`; ordinary recipes may also instantiate the listed scorer
-classes directly with Hydra `_target_`.
+[`local/registry.py`](local/registry.py). `VideoRewardScorer` resolves its
+`inner_model_name` through the registry; recipes otherwise instantiate the
+listed scorer classes directly with Hydra `_target_`.
 
 | Registry key | Input | Purpose and restrictions |
 |---|---|---|
@@ -43,9 +43,9 @@ classes directly with Hydra `_target_`.
 | `videopickscore` | video | PickScore on one configured representative frame. |
 | `videoclipdelta` | video + condition video | Prompt alignment minus similarity to the source video; V2V only. |
 | `videoalign` | video | Vendored VideoAlign prompt-video scorer. |
-| `mc_exact_match` | text + metadata | Multiple-choice answer match; each row needs `metadata.answer`. |
+| `mc_exact_match` | text + metadata | Multiple-choice answer match against `metadata.answer`; rows without it score 0 rather than raising. |
 | `clap` | generated audio/video | CLAP prompt-audio alignment for T2AV output; requires the generated audio and its sample rate. |
-| `imagebind` | generated audio/video | ImageBind audio/video/text alignment; noncommercial upstream license. Training requires a positive prompt-video term. |
+| `imagebind` | generated audio/video | ImageBind audio/video/text alignment; noncommercial upstream license. `RewardService` rejects it for training unless `mode` is `text_video` or `all` with a positive `text_video` weight (override with `require_prompt_video: false`). |
 | `t2av_composite` | generated audio/video | Weighted composition of video-capable inner scorers; rejects a mix without a positive prompt-video term. |
 | `per_domain` | image + metadata | Routes rows by `metadata.domain` to configured inner scorers. |
 
@@ -83,9 +83,13 @@ never mutates the input Sample — it returns a fresh one. Per call it:
 3. **Scores** — hands a typed `RewardRequest` to `backend.compute_rewards`, getting
    back rewards, per-component rewards, and per-sample success flags.
 4. **Fails fast** — raises and names the sample if any failed.
-5. **Applies the configured AR truncation policy** — `zero` assigns reward 0 to
-   a trace that hit `max_new_tokens`, `keep` preserves the scorer result, and
-   `soft` adds the configured overlong penalty.
+5. **Applies the AR truncation policy** — only when the scored Part is a
+   variable-length AR generation (fixed-length AR media such as Janus-Pro image
+   tokens always reaches `max_new_tokens` and keeps its reward).
+   `truncated_reward: zero` (default) assigns reward 0 to a trace that hit
+   `max_new_tokens`, `keep` preserves the scorer result, and `soft` adds a
+   penalty that grows linearly over the last `overlong_buffer_len` tokens,
+   scaled by `overlong_penalty_factor`.
 6. **Attaches** `rewards` + `component_rewards` and returns the Sample.
 
 A backend is just `compute_rewards(request) -> RewardResponse`. Local scorers

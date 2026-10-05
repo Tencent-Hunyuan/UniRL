@@ -20,8 +20,8 @@ that a deployment config allocates resources for it.
 | `geneval2` | vLLM | enabled | Qwen3-VL VQAScore; `dataset_path` enables multi-question Soft-TIFA, otherwise it uses a single-question fallback. |
 | `ocr` | transformers | enabled | GOT-OCR-2.0-hf edit-distance similarity to the prompt's target span. |
 | `editreward` | transformers | enabled | Qwen2.5-VL-based scorer for source + edited image history; output columns depend on the checkpoint config, and checked-in recipes consume the first score channel. |
-| `editscore` | vLLM | commented | Image-editing VLM judge; the checked-in training recipes normally launch it as a managed rank-affine child. |
-| `geneval` | mmdet/mmcv | separate config | Official Mask2Former + CLIP GenEval. Its Python 3.10 stack cannot join the example Python 3.13 Ray cluster through `runtime_env`. |
+| `editscore` | vLLM | commented | Image-editing VLM judge over a source + edited image pair. The checked-in training recipes launch it as a managed rank-affine child with `scorer.history_kind: image_edit`; `params.enable_sleep_mode: true` lets that child run with `gpu_residency: per_call`. |
+| `geneval` | mmdet/mmcv | [separate config](configs/geneval_service.yaml) | Official Mask2Former + CLIP GenEval. Its Python 3.10 stack cannot join the example Python 3.13 Ray cluster through `runtime_env`. |
 | `videoalign` | transformers, vendored model | commented | T2V Overall / VQ / MQ / TA; requests require `video_b64` or a service-readable `video_path`. |
 | `wise` | vLLM | commented, dedicated host | Generic WISE-rubric VLM judge; the example reserves an entire 8-GPU host. |
 
