@@ -366,3 +366,50 @@ without driver-authored x_T. `media_log_interval` does not apply
   (it reuses the train model) and for DiffusionNFT (its EMA swap touches the backend around `generate`).
 - **The bundle must be shared, not rebuilt** — the trainer injects one bundle into both
   pipeline and backend; a second `from_config` would silently desync replay. See [`../models/README.md`](../models/README.md).
+
+## DAPO dynamic sampling (synchronous AR)
+
+Run `python -m unirl.train_ar --config-name=ar/qwen3_grpo_dynamic_sampling_sglang`
+for the opt-in recipe, or set `+dynamic_sampling_max_batches=8` on a synchronous
+AR GRPO recipe. Zero (the default) retains the existing single-batch path. A
+positive integer bounds the total generated batches per optimizer batch,
+including the initial batch. `batch_size` remains both the generated prompt
+batch size and the target number of retained prompt groups.
+
+Each batch is scored before filtering. Whole groups with identical final rewards
+are discarded; groups containing NaN or infinity are discarded and counted
+separately. New data-source batches fill the deficit under the same rollout
+weights. The first `batch_size` valid groups are trained; surplus valid groups
+are discarded rather than carried across updates. Exhausting the budget raises
+before training an undersized batch. This slice requires group-relative AR GRPO,
+at least two siblings, and one input Part; async, agentic and diffusion trainers
+are outside its scope. The filter uses the final reward after truncation policy.
+
+`dynamic_sampling/generated_batches`, `generated_groups`, `valid_group_fraction`,
+`nonfinite_groups`, `discarded_surplus_groups`, `unfiltered_reward_mean`, and
+`retained_tokens` expose the sampling cost and selection. The unfiltered mean
+covers finite rewards across **all** generated groups; normal reward metrics
+cover only retained groups. Compare held-out evaluation against GPU time, not
+filtered training reward against the unfiltered baseline. No convergence or
+throughput benefit is assumed, especially for continuous reward models.
+
+### Gotchas
+
+- Extra batches consume the data source. `trainer_state.json` stores the consumed
+  batch count and batch size when enabled. Resume fast-forwards the same seeded
+  stream; dynamic sampling must remain enabled with the same batch size. It does
+  not promise identical stochastic model generations after restarting.
+- Refill request IDs are namespaced by the consumed batch count, so revisiting a
+  dataset row cannot merge separate sampled groups. Advantages are computed only
+  after selecting the final complete training batch.
+- Each refill uses the existing generate/score residency boundary and preserves
+  rollout weights across intermediate sleeps. This incurs extra transitions;
+  generation efficiency must be measured on the target engine.
+- LoRA refills re-push the staged adapter after waking the engine; they do not
+  extract newer training weights. SGLang releases loaded adapters on sleep.
+- Selected remote tensor slices can retain a whole generated batch's backing
+  storage until training finishes. The batch budget therefore bounds memory
+  retention as well as sampling attempts; size it for the target deployment.
+- With SGLang memory saver enabled, dynamic sampling requires
+  `enable_weights_cpu_backup=true`; otherwise sleep discards the weights needed
+  by the next refill. This is checked before allocating trainer workers.

@@ -11,6 +11,7 @@ import torch
 from hydra.utils import get_class, get_object, instantiate
 from omegaconf import DictConfig
 
+from unirl.algorithms.grpo import GRPO
 from unirl.config.validation import validate_memory_saver_contract
 from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.group.results import rank_zero_bool
@@ -80,6 +81,7 @@ class ARTrainer(BaseTrainer):
         normalize_adv_by_std: bool = True,
         advantage_mode: str = "grpo",
         balance_shards: bool = False,
+        dynamic_sampling_max_batches: int = 0,
         eval_interval: int = 0,
         eval_num_prompts: int = -1,
         eval_batch_size: int = 8,
@@ -99,6 +101,20 @@ class ARTrainer(BaseTrainer):
         # misconfigured recipe fails fast without a half-constructed device pool or actors.
         algorithm_cls = get_class(algorithm_cfg["_target_"])
         self._algorithm_requires_advantages = algorithm_cls.requires_advantages
+        if type(dynamic_sampling_max_batches) is not int or dynamic_sampling_max_batches < 0:
+            raise ValueError("dynamic_sampling_max_batches must be an integer >= 0 (0 disables DAPO sampling).")
+        self.dynamic_sampling_max_batches = dynamic_sampling_max_batches
+        self._data_batches_consumed = 0
+        if dynamic_sampling_max_batches:
+            if (
+                not issubclass(algorithm_cls, GRPO)
+                or str(advantage_mode).strip().lower() != "grpo"
+                or adv_normalization_scope != "group"
+            ):
+                raise ValueError("DAPO dynamic sampling requires synchronous AR GRPO with group advantages.")
+            sampling = build_sampling_dict(sampling_cfg)
+            if set(sampling) != {"ar"} or total_samples_per_prompt(sampling) < 2:
+                raise ValueError("DAPO dynamic sampling requires AR sampling with at least two siblings per prompt.")
         eval_interval = int(eval_interval)
         if reward_cfg is None:
             if self._algorithm_requires_advantages:
@@ -113,6 +129,11 @@ class ARTrainer(BaseTrainer):
                     "but the recipe has no `reward:` block. Set eval_interval: 0 or configure a "
                     "(monitoring-only) reward."
                 )
+        rollout_sleeps = sync_cfg is not None if rollout_anchor_device is None else enable_fsdp_offload
+        if rollout_sleeps:
+            validate_memory_saver_contract(
+                rollout_cfg, strict=False, require_weight_backup=bool(dynamic_sampling_max_batches)
+            )
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
         self.batch_size = batch_size
         self.adv_normalization_scope = adv_normalization_scope
@@ -132,9 +153,6 @@ class ARTrainer(BaseTrainer):
             int(rollout_anchor_device) if rollout_anchor_device is not None else None
         )
         self._enable_fsdp_offload = bool(enable_fsdp_offload)
-        rollout_sleeps = sync_cfg is not None if self._rollout_anchor_device is None else self._enable_fsdp_offload
-        if rollout_sleeps:
-            validate_memory_saver_contract(rollout_cfg, strict=False)
         self._anchored_backend_offloaded: Optional[bool] = False
         self._anchored_rollout_awake: Optional[bool] = None
 
@@ -427,6 +445,97 @@ class ARTrainer(BaseTrainer):
         )
         return request.fork(total_samples_per_prompt(sp), sampling_params=sp.get("ar"))
 
+    def _generate_and_score(self, sample: Sample, *, sync_weights: bool, preserve_rollout_weights: bool) -> Sample:
+        """Generate and score one batch within the existing residency boundary."""
+        staged_adapter = None
+        if self.dynamic_sampling_max_batches and not sync_weights:
+            staged_adapter = getattr(self.weight_sync, "has_staged_adapter", None)
+        repush_adapter = callable(staged_adapter) and rank_zero_bool(
+            staged_adapter(), name="weight_sync.has_staged_adapter"
+        )
+        anchored = self._rollout_anchor_device is not None
+        if not anchored:
+            train_state_offloaded = self._prepare_rollout(sync_weights=sync_weights)
+            try:
+                if repush_adapter:
+                    self.weight_sync.push()
+                if preserve_rollout_weights:
+                    self._preserve_rollout_weights_for_next_sleep()
+                sample = self.rollout.generate(sample)
+            finally:
+                self._finish_rollout(train_state_offloaded=train_state_offloaded)
+        else:
+            with self._anchored_rollout_session(sync_weights=sync_weights, restore_backend=False):
+                if repush_adapter:
+                    self.weight_sync.push()
+                if preserve_rollout_weights:
+                    self._preserve_rollout_weights_for_next_sleep()
+                sample = self.rollout.generate(sample)
+                from unirl.trainer.unified_model import deep_hydrate
+
+                sample = deep_hydrate(sample)
+
+        if self.reward is not None:
+            sample = self.reward.score_and_attach(sample)
+
+        return sample
+
+    def _sample_dynamic_batch(
+        self, sample: Sample, *, sync_weights: bool, rollout_id: int, preserve_rollout_weights: bool
+    ) -> Tuple[Sample, Dict[str, float]]:
+        """Collect a full batch of finite, nonconstant reward groups; see README.md."""
+        kept = []
+        generated_groups = valid_groups = invalid_groups = 0
+        reward_sum = 0.0
+        reward_count = 0
+        for attempt in range(self.dynamic_sampling_max_batches):
+            if len(sample.parts) != 2 or sample.batch_size != self.batch_size:
+                raise ValueError("DAPO sampling requires one input Part and batch_size complete prompt groups.")
+            sample = self._generate_and_score(
+                sample,
+                sync_weights=sync_weights and attempt == 0,
+                preserve_rollout_weights=preserve_rollout_weights or attempt + 1 < self.dynamic_sampling_max_batches,
+            )
+            part = sample.parts[-1]
+            if part.rewards is None:
+                raise ValueError("DAPO dynamic sampling requires rewards on every generated batch.")
+            part.rewards = hydrate(part.rewards).cpu()
+            for group in sample.split():
+                rewards = group.parts[-1].rewards
+                if rewards.numel() != total_samples_per_prompt(self.sampling_params):
+                    raise ValueError("DAPO sampling received an incomplete prompt group.")
+                generated_groups += 1
+                finite = torch.isfinite(rewards)
+                reward_sum += float(rewards[finite].double().sum())
+                reward_count += int(finite.sum())
+                if not bool(finite.all()):
+                    invalid_groups += 1
+                elif rewards.numel() > 1 and bool((rewards != rewards[0]).any()):
+                    valid_groups += 1
+                    if len(kept) < self.batch_size:
+                        kept.append(group)
+            if len(kept) == self.batch_size:
+                result = Sample.concat(kept)
+                metrics = {
+                    "dynamic_sampling/generated_batches": attempt + 1,
+                    "dynamic_sampling/generated_groups": generated_groups,
+                    "dynamic_sampling/valid_group_fraction": valid_groups / generated_groups,
+                    "dynamic_sampling/nonfinite_groups": invalid_groups,
+                    "dynamic_sampling/discarded_surplus_groups": valid_groups - len(kept),
+                    "dynamic_sampling/unfiltered_reward_mean": reward_sum / max(1, reward_count),
+                    "dynamic_sampling/retained_tokens": int(hydrate(result.parts[-1].segment.lengths).sum()),
+                }
+                return result, metrics
+            if attempt + 1 < self.dynamic_sampling_max_batches:
+                inputs = self.data_source.get_samples(self.batch_size)
+                self._data_batches_consumed += 1
+                inputs = inputs.map_sample_ids(lambda sid: f"d{self._data_batches_consumed}:{sid}")
+                sample = self._build_request_sample(inputs, rollout_id)
+        raise RuntimeError(
+            f"DAPO sampling exhausted {self.dynamic_sampling_max_batches} batches: "
+            f"retained {len(kept)}/{self.batch_size} groups; {invalid_groups} had nonfinite rewards."
+        )
+
     def train_step(
         self,
         sample: Sample,
@@ -439,25 +548,18 @@ class ARTrainer(BaseTrainer):
         """One ``rollout → reward → advantage → optimizer step`` pass."""
         t0 = time.perf_counter()
         anchored = self._rollout_anchor_device is not None
-        if not anchored:
-            train_state_offloaded = self._prepare_rollout(sync_weights=sync_weights)
-            try:
-                if preserve_rollout_weights:
-                    self._preserve_rollout_weights_for_next_sleep()
-                sample = self.rollout.generate(sample)
-            finally:
-                self._finish_rollout(train_state_offloaded=train_state_offloaded)
+        sampling_metrics = None
+        if self.dynamic_sampling_max_batches:
+            sample, sampling_metrics = self._sample_dynamic_batch(
+                sample,
+                sync_weights=sync_weights,
+                rollout_id=rollout_id,
+                preserve_rollout_weights=preserve_rollout_weights,
+            )
         else:
-            with self._anchored_rollout_session(sync_weights=sync_weights, restore_backend=False):
-                if preserve_rollout_weights:
-                    self._preserve_rollout_weights_for_next_sleep()
-                sample = self.rollout.generate(sample)
-                from unirl.trainer.unified_model import deep_hydrate
-
-                sample = deep_hydrate(sample)
-
-        if self.reward is not None:
-            sample = self.reward.score_and_attach(sample)
+            sample = self._generate_and_score(
+                sample, sync_weights=sync_weights, preserve_rollout_weights=preserve_rollout_weights
+            )
 
         part = sample.parts[-1]
         mean_reward = 0.0
@@ -502,6 +604,7 @@ class ARTrainer(BaseTrainer):
             sample,
             step_time_s=time.perf_counter() - t0,
             trunc_len=getattr(self.sampling_params.get("ar"), "max_new_tokens", None),
+            extra_metrics=sampling_metrics,
         )
         return result, mean_reward
 
@@ -676,6 +779,13 @@ class ARTrainer(BaseTrainer):
         except Exception as exc:  # debug path — never let it kill training
             logger.warning("rollout sample dump failed: %s", exc)
 
+    def _checkpoint_state(self) -> dict:
+        """Persist the dynamic sampling data cursor alongside the normal trainer state."""
+        state = super()._checkpoint_state()
+        if self.dynamic_sampling_max_batches:
+            state["dynamic_sampling"] = {"data_batches": self._data_batches_consumed, "batch_size": self.batch_size}
+        return state
+
     def train(
         self,
         *,
@@ -690,7 +800,11 @@ class ARTrainer(BaseTrainer):
         interval = max(1, weight_sync_interval)
         start_rollout = self.maybe_load_checkpoint(load_dir, num_rollouts=num_rollouts)
         resumed = bool(load_dir)
-        for _ in range(start_rollout):
+        cursor = self._resume_state.get("dynamic_sampling")
+        if cursor is not None and (not self.dynamic_sampling_max_batches or cursor["batch_size"] != self.batch_size):
+            raise ValueError("Resuming DAPO sampling requires it to stay enabled with the same batch_size.")
+        self._data_batches_consumed = start_rollout if cursor is None else int(cursor["data_batches"])
+        for _ in range(self._data_batches_consumed):
             self.data_source.get_samples(self.batch_size)
         self._init_wandb(
             num_rollouts=num_rollouts,
@@ -709,6 +823,7 @@ class ARTrainer(BaseTrainer):
             for rollout_id in range(start_rollout, num_rollouts):
                 training_progress = rollout_id / max(1, num_rollouts - 1)
                 inputs = self.data_source.get_samples(self.batch_size)
+                self._data_batches_consumed += 1
                 sample = self._build_request_sample(inputs, rollout_id)
                 sync_weights = (rollout_id > 0 and rollout_id % interval == 0) or (
                     resumed and rollout_id == start_rollout
