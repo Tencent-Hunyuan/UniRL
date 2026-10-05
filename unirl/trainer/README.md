@@ -103,7 +103,7 @@ The current trainer surface is:
 | `AsyncDiffusionTrainer` | FIFO diffusion generation batch → one `TrainStack` | The same update-versioned manager loop for DiT. Requires `max_inflight=1` and resolves and scores each intact batch before launching its replacement, so cross-slab transfer never queues behind fresh generation. |
 | `PETrainer` | `ar` + `diffusion` Parts → two `TrainStack`s | Composed prompt-rewrite/image rollout; image rewards propagate to AR rewrites. `freeze_llm=true` trains and checkpoints diffusion only. |
 | `UnifiedModelTrainer` | whole `Sample` → one `UnifiedModelTrainStack` | AR and image losses accumulate into shared-backbone optimizer steps while prompt-tree lineage remains intact during DP scatter. |
-| `AgenticTrainer` | variable-depth `List[Sample]` → concatenated turn `Part` | Colocated multi-turn tool use, with optional bounded partial-rollout windows. It syncs every step, waits for complete groups, scores terminal answers through `RewardService`, and excludes failed trajectories. Overflow trajectories are scored like completed ones; `mask_overflow_loss=true` keeps them in the group baseline but drops their gradient. |
+| `AgenticTrainer` | variable-depth `List[Sample]` → concatenated turn `Part` | Multi-turn tool use on colocated or separate GPU slabs, with optional bounded partial-rollout windows. It syncs every step, waits for complete groups, scores terminal answers through `RewardService`, and excludes failed trajectories. Overflow trajectories are scored like completed ones; `mask_overflow_loss=true` keeps them in the group baseline but drops their gradient. |
 
 All async variants use the driver-local `RolloutManager`. Batch trainers provide
 one slab-wide launcher and keep completed batches intact; the agentic trainer
@@ -370,8 +370,32 @@ without driver-authored x_T. `media_log_interval` does not apply
 ### Agentic partial rollout
 
 Set `rollout_window_size: 2` in the deep-research recipe to admit two batches at a time.
-After each batch of sibling groups completes, unfinished trajectories pause between turns.
+In colocated mode, after each batch of sibling groups completes, unfinished trajectories pause between turns.
 The trainer updates, publishes weights with cache flushing, and resumes from stored history.
 Windows drain before checkpoints and at the end of training. The default `1` retains the
 barrier behavior. See [environment contracts](../rollout/env/README.md#gotchas) for supported
 environments, per-turn provenance, and behavior log-prob requirements.
+
+### Separate agentic rollout and training
+
+`deep_research/deep_research_async` sets `train_fraction: 0.5` and
+`rollout_window_size: 2`. Training and generation occupy disjoint GPU slabs.
+The trainer consumes complete sibling groups while the rollout manager continues
+running the remaining trajectories. Before the next weight publication, it waits
+for active turns to finish, pauses unfinished trajectories, publishes through
+`NCCLWeightSync`, and resumes from stored observations with the new weights.
+Each generated turn keeps its original behavior log-probs and policy version.
+
+The bounded window limits admitted prompts to `batch_size * rollout_window_size`.
+It drains before opening another window or saving a checkpoint; transport buffers
+are reclaimed only after the drained window finishes training. This leaves a
+barrier between windows; it is not an unbounded streaming scheduler. A long single
+turn or tool call can still delay synchronization. No token-level interruption or
+worker-local stateful tool resumption is supported.
+
+Omitting `train_fraction` retains colocated execution with `TensorWeightSync`.
+Separate placement requires at least one device on each slab, `NCCLWeightSync`,
+and a training batch divisible by the training slab size. Both slabs remain
+resident, so rollout sleep and training offload are not used. Enable overlap with
+`rollout_window_size > 1`; a window of one keeps the batch barrier even on separate
+slabs. The shared NCCL connection and device-allocation helpers also serve async AR.

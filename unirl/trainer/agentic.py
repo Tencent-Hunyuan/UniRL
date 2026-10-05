@@ -17,7 +17,11 @@ from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
 from unirl.rollout.manager import RolloutManager, required_worker_concurrency, validate_worker_inflight
 from unirl.train.stack import TrainStepResult
-from unirl.trainer.async_rollout import next_hard_boundary
+from unirl.trainer.async_rollout import (
+    connect_separate_rollout,
+    next_hard_boundary,
+    resolve_separate_worker_concurrency,
+)
 from unirl.trainer.base import (
     BaseTrainer,
     build_sampling_dict,
@@ -71,6 +75,7 @@ class AgenticTrainer(BaseTrainer):
         per_worker_inflight: int = 8,
         mask_overflow_loss: bool = False,
         rollout_window_size: int = 1,
+        train_fraction: Optional[float] = None,
     ) -> None:
         if not isinstance(rollout_window_size, int) or rollout_window_size < 1:
             raise ValueError("rollout_window_size must be a positive integer")
@@ -90,8 +95,16 @@ class AgenticTrainer(BaseTrainer):
             if configured_concurrency is None
             else int(configured_concurrency)
         )
+        train_devices = int(cfg.num_devices)
+        if train_fraction is not None:
+            train_devices, worker_max_concurrency = resolve_separate_worker_concurrency(
+                num_devices=int(cfg.num_devices),
+                train_fraction=train_fraction,
+                per_worker_inflight=per_worker_inflight,
+                configured_concurrency=configured_concurrency,
+                engine_concurrency=rollout_cfg.get("config", {}).get("inner", {}).get("concurrency"),
+            )
         self._validate_config(
-            cfg=cfg,
             batch_size=batch_size,
             rollout_cfg=rollout_cfg,
             sampling_cfg=sampling_cfg,
@@ -99,6 +112,8 @@ class AgenticTrainer(BaseTrainer):
             sync_cfg=sync_cfg,
             per_worker_inflight=per_worker_inflight,
             worker_max_concurrency=worker_max_concurrency,
+            train_devices=train_devices,
+            separate=train_fraction is not None,
         )
         super().__init__(
             cfg=cfg,
@@ -107,6 +122,7 @@ class AgenticTrainer(BaseTrainer):
         )
 
         try:
+            self._train_fraction = train_fraction
             self._rollout_window_size = rollout_window_size
             self._carried: List[Sample] = []
             self.batch_size = int(batch_size)
@@ -117,14 +133,22 @@ class AgenticTrainer(BaseTrainer):
             self._per_worker_inflight = per_worker_inflight
             self._mask_overflow_loss = mask_overflow_loss
 
-            with placement(self.pool, fraction=1.0, shared_workers=True):
+            with placement(self.pool, fraction=1.0 if train_fraction is None else train_fraction, shared_workers=True):
                 self.bundle = remote_hydra(bundle_cfg)
                 self.pipeline = remote_hydra(pipeline_cfg, bundle=self.bundle)
                 self.backend = remote_hydra(backend_cfg, bundle=self.bundle)
                 self.reward = remote_hydra(reward_cfg)
                 self.algorithm = remote_hydra(algorithm_cfg, pipeline=self.pipeline)
                 self.stack = remote_hydra(stack_cfg, fsdp_backend=self.backend, algorithm=self.algorithm)
-                self._build_colocated_rollout(rollout_cfg, sync_cfg)
+                if train_fraction is None:
+                    self._build_colocated_rollout(rollout_cfg, sync_cfg)
+                else:
+                    self.weight_sync = remote_hydra(sync_cfg, backend=self.backend)
+
+            if train_fraction is not None:
+                with placement(self.pool, fraction=1.0 - train_fraction, shared_workers=True):
+                    self.rollout = remote(**parse_hydra_cfg(rollout_cfg))
+                connect_separate_rollout(self.weight_sync, self.rollout)
 
             if self._rollout_window_size > 1:
                 self.rollout.validate_turn_resumption()
@@ -147,28 +171,30 @@ class AgenticTrainer(BaseTrainer):
     @staticmethod
     def _validate_config(
         *,
-        cfg: DictConfig,
         batch_size: int,
         rollout_cfg: DictConfig,
         sampling_cfg: DictConfig,
         algorithm_cfg: DictConfig,
         sync_cfg: Optional[DictConfig],
         per_worker_inflight: int,
-        worker_max_concurrency: int,
+        worker_max_concurrency: int | List[int],
+        train_devices: int,
+        separate: bool,
     ) -> None:
         if int(batch_size) <= 0:
             raise ValueError(f"batch_size must be positive; got {batch_size}")
         validate_worker_inflight(
             per_worker_inflight,
-            worker_max_concurrency=worker_max_concurrency,
+            worker_max_concurrency=(
+                worker_max_concurrency[-1] if isinstance(worker_max_concurrency, list) else worker_max_concurrency
+            ),
             engine_concurrency=None,
         )
-        if sync_cfg is None:
-            raise ValueError("AgenticTrainer requires colocated TensorWeightSync")
-        sync_target = str(sync_cfg.get("_target_", ""))
-        if not sync_target.endswith("TensorWeightSync"):
-            raise ValueError(f"AgenticTrainer requires colocated TensorWeightSync; got {sync_target!r}")
-        validate_memory_saver_contract(rollout_cfg, strict=True)
+        sync_name = "NCCLWeightSync" if separate else "TensorWeightSync"
+        if sync_cfg is None or not str(sync_cfg.get("_target_", "")).endswith(sync_name):
+            raise ValueError(f"AgenticTrainer requires {sync_name} for the selected placement")
+        if not separate:
+            validate_memory_saver_contract(rollout_cfg, strict=True)
 
         episode = rollout_cfg.get("config", {}).get("episode_sampling")
         if episode is None:
@@ -186,8 +212,8 @@ class AgenticTrainer(BaseTrainer):
             raise ValueError("sampling.temperature must equal rollout episode temperature")
         if abs(sampling_temperature - algorithm_temperature) > 1e-9:
             raise ValueError("sampling.temperature must equal algorithm.sampling_temperature")
-        if (int(batch_size) * group_size) % int(cfg.num_devices) != 0:
-            raise ValueError("batch_size*samples_per_prompt must be divisible by num_devices")
+        if (int(batch_size) * group_size) % train_devices != 0:
+            raise ValueError("batch_size*samples_per_prompt must be divisible by the number of training devices")
 
     def _build_colocated_rollout(self, rollout_cfg: DictConfig, sync_cfg: DictConfig) -> None:
         self.backend.offload()
@@ -206,21 +232,26 @@ class AgenticTrainer(BaseTrainer):
         )
 
     def _collect_groups(self, requests: List[Sample], *, allow_carry: bool = False) -> List[List[Sample]]:
-        self.rollout.wake_up()
+        if self._train_fraction is None:
+            self.rollout.wake_up()
+        else:
+            self._carried = self._rollout_manager.quiesce(current_version=self._train_version)
         self._rollout_manager.sync_weights(self.weight_sync, output_version=self._train_version)
-        self.backend.offload()
+        if self._train_fraction is None:
+            self.backend.offload()
 
         tasks = [prompt for request in requests for prompt in request.split() for _ in range(self._group_size)]
         self._rollout_manager.submit([*self._carried, *tasks])
         self._carried = []
         groups = self._rollout_manager.collect(self.batch_size, current_version=self._train_version)
-        if allow_carry:
+        if allow_carry and self._train_fraction is None:
             self._carried = self._rollout_manager.quiesce(current_version=self._train_version)
-        elif not self._rollout_manager.empty:
+        elif not allow_carry and not self._rollout_manager.empty:
             raise RuntimeError("agentic barrier rollout must leave RolloutManager empty")
 
-        self.rollout.sleep()
-        self.backend.onload()
+        if self._train_fraction is None:
+            self.rollout.sleep()
+            self.backend.onload()
         return groups
 
     def train_step(
@@ -525,6 +556,8 @@ class AgenticTrainer(BaseTrainer):
                     result, mean_reward = self._train_groups(
                         groups, training_progress=training_progress, rollout_id=rollout_id, t0=t0
                     )
+                    if rollout_id + 1 == window_end:
+                        self._reset_transport_buffers()
                 self.wandb_logger.log_progress(rollout_id, num_rollouts, result, mean_reward, logger=logger)
                 self.maybe_save_checkpoint(
                     rollout_id,
