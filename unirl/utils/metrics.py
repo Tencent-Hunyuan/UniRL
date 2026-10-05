@@ -1,4 +1,4 @@
-"""Average numeric metrics across repeated metric dictionaries."""
+"""Reduce numeric metrics, preserving additive policy entropy statistics."""
 
 from typing import Any, Dict, List
 
@@ -6,7 +6,7 @@ import torch
 
 
 def aggregate_numeric_metrics(metrics_list: List[Dict[str, Any]]) -> Dict[str, float]:
-    """Average numeric metric keys across repeated metric dictionaries."""
+    """Average numeric keys; sum entropy statistics before computing their token-weighted mean."""
     aggregated: Dict[str, float] = {}
     if not metrics_list:
         return aggregated
@@ -28,6 +28,12 @@ def aggregate_numeric_metrics(metrics_list: List[Dict[str, Any]]) -> Dict[str, f
             elif isinstance(value, (int, float)):
                 values.append(float(value))
         if values:
-            aggregated[key] = sum(values) / len(values)
+            if key in ("policy_entropy_sum", "policy_entropy_count"):
+                aggregated[key] = sum(values)
+            else:
+                aggregated[key] = sum(values) / len(values)
 
+    if "policy_entropy_count" in aggregated:
+        count = aggregated["policy_entropy_count"]
+        aggregated["policy_entropy"] = aggregated["policy_entropy_sum"] / count if count else 0.0
     return aggregated

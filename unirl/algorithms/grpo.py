@@ -20,6 +20,7 @@ from .base import (
     _prepare_ar_logp_anchor,
     _resolve_clip_range_from_schedule,
     aggregate_token_losses,
+    policy_entropy_metrics,
     rollout_replay_k3,
     rollout_replay_logp_absdiff,
     typed_conditions,
@@ -28,6 +29,7 @@ from .base import (
 
 @dataclass
 class GRPOConfig(BaseAlgorithmConfig):
+    monitor_entropy: bool = False
     stage_attr: str = "ar"
     conditions_cls: str = ""
     clip_range: float = 1e-4
@@ -61,6 +63,7 @@ class GRPO(StageAlgorithm):
         conditions_cls: Optional[Type[Any]] = None,
         old_logp_source: str = "rollout",
         sampling_temperature: Optional[float] = None,
+        monitor_entropy: bool = False,
     ) -> None:
         super().__init__()
         if stage is None and pipeline is None:
@@ -84,6 +87,7 @@ class GRPO(StageAlgorithm):
 
             sampling_temperature = ARSamplingParams.__dataclass_fields__["temperature"].default
         self.sampling_temperature = float(sampling_temperature)
+        self.monitor_entropy = monitor_entropy
 
     def prepare_segment(
         self,
@@ -116,9 +120,14 @@ class GRPO(StageAlgorithm):
             return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
 
         typed_conds = typed_conditions(conditions, self.conditions_cls)
-        new_logp = self.stage.replay(
-            typed_conds, segment=segment, temperature=self.sampling_temperature
-        )  # [total_tokens]
+        replay = self.stage.replay(
+            typed_conds,
+            segment=segment,
+            temperature=self.sampling_temperature,
+            **({"return_entropy": True} if self.monitor_entropy else {}),
+        )
+        entropy_metrics = policy_entropy_metrics(replay, segment.loss_mask) if self.monitor_entropy else {}
+        new_logp = replay.log_probs if self.monitor_entropy else replay
         # old_logp = the frozen π_old anchor established by prepare_segment:
         # the rollout log-prob by default, or a train-side replay under
         # old_logp_source='replay'. Either way it stays frozen across all
@@ -156,6 +165,7 @@ class GRPO(StageAlgorithm):
             dtype=new_logp.dtype, device=new_logp.device
         )
         metrics: Dict[str, Any] = {
+            **entropy_metrics,
             "policy_loss": float(loss.detach().item()),
             "clip_range": float(clip_range),
             **rollout_replay_logp_absdiff(new_logp, rollout_logp, segment.loss_mask),

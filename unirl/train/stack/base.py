@@ -173,6 +173,17 @@ class TrainStack(Remote):
             [r.metrics for r in micro_results if r.metrics]
         )
 
+        if getattr(self.algorithm, "monitor_entropy", False):
+            entropy_sum, entropy_count = self._all_reduce_sums(
+                [aggregated_metrics.get("policy_entropy_sum", 0.0), aggregated_metrics.get("policy_entropy_count", 0.0)]
+            )
+            aggregated_metrics = {
+                **aggregated_metrics,
+                "policy_entropy_sum": entropy_sum,
+                "policy_entropy_count": entropy_count,
+                "policy_entropy": entropy_sum / entropy_count if entropy_count else 0.0,
+            }
+
         window_backward = prior_backward or has_backward
         # The stepping backward must run when deferred gradient sync is enabled.
         if (

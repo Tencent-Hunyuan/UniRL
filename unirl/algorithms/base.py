@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple, Typ
 import torch
 
 from unirl.distributed.group.remote import Remote
+from unirl.models.types.replay_result import ReplayResult
 from unirl.types.loss_agg import LossAggMode, parse_loss_agg_mode
 
 if TYPE_CHECKING:
@@ -27,6 +28,24 @@ def typed_conditions(
     if conditions_cls is None:
         return conditions
     return conditions_cls.from_dict(dict(conditions))
+
+
+def policy_entropy_metrics(replay: ReplayResult, loss_mask: Optional[torch.Tensor]) -> Dict[str, float]:
+    """Token-weighted entropy statistics in nats; see README Gotchas for mask and aggregation semantics."""
+    if not isinstance(replay, ReplayResult) or replay.entropy is None:
+        raise TypeError("monitor_entropy=True requires replay to return ReplayResult.entropy")
+    entropy = replay.entropy.detach()
+    if entropy.shape != replay.log_probs.shape:
+        raise ValueError("replay entropy must have the same packed shape as log_probs")
+    if loss_mask is not None:
+        entropy = entropy[loss_mask.to(device=entropy.device, dtype=torch.bool)]
+    total = float(entropy.sum().item())
+    count = entropy.numel()
+    return {
+        "policy_entropy": total / count if count else 0.0,
+        "policy_entropy_sum": total,
+        "policy_entropy_count": float(count),
+    }
 
 
 def _prepare_ar_logp_anchor(

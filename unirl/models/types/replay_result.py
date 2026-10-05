@@ -32,5 +32,7 @@ class ReplayResult:
     """Per-token critic predictions ``V_t``. Packed ``[total_tokens]`` for AR.
     ``None`` when replay did not request a value head."""
 
+    entropy: Optional[torch.Tensor] = None  # Detached fp32 AR entropy, packed [total_tokens], in nats.
+
 
 __all__ = ["ReplayResult"]
