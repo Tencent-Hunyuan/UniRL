@@ -75,12 +75,7 @@ def _build_prompt_entries(
 
 
 def hi3_fused_conditions(diff_outputs: List[OmniRawResult], *, modality: str) -> Dict[str, Any]:
-    """The HI3 DiT replay conditions — concat the ``fused_mm_capture`` dicts.
-
-    Ragged-``L`` padding lives in ``HunyuanImage3FusedMultimodalCondition.concat``,
-    which pads ``position_ids`` with continuing indices. Those ids are upstream's
-    KV-cache write slots, so a constant ``0`` pad would overwrite slot 0.
-    """
+    """The HI3 DiT replay conditions — concat the ``fused_mm_capture`` dicts."""
     captures = [read_captures(d).get("fused_mm_capture") for d in diff_outputs]
     if any(c is None for c in captures):
         raise RuntimeError(
