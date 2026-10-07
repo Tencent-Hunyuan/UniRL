@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from enum import Enum, auto
 from functools import wraps
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, TypeAlias
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, TypeAlias
 
 from unirl.distributed.tensor.pytree import pytree_cat, pytree_chunk
-from unirl.distributed.utils import Broadcast
+from unirl.distributed.tensor.ref import TensorRef, ref_is_required, ref_store_keys
+from unirl.distributed.utils import Broadcast, collect_leaves
 
 if TYPE_CHECKING:
     from unirl.distributed.group.handle import Handle
@@ -186,6 +188,65 @@ def resolve_backward_dispatch_mode(
     return Dispatch.DP_SCATTER
 
 
+# ── Partial localization (``reads=`` / ``skips=``) ──
+
+
+def required_store_keys(config: Dict[str, Any], args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Set[Any]:
+    """Return the storage keys one shard must resolve under ``config``'s ``reads=`` / ``skips=``."""
+    if not args and not kwargs:
+        return set()
+    reads_fn, skips_fn = config["reads"], config["skips"]
+    if reads_fn is not None:
+        keys: Set[Any] = set()
+        for ref in collect_leaves(reads_fn(*args, **kwargs), TensorRef):
+            keys |= ref_store_keys(ref)
+        return keys
+
+    # Blacklist. Identity plus occurrence counts decides which refs are inside the
+    # skipped subtrees. A selector that hands back a VIEW instead of the tree's own
+    # ref matches nothing and degrades to full localization. If one ref object is
+    # aliased both inside and outside the skipped subtree, the unmatched occurrence
+    # keeps its key required.
+    all_refs = collect_leaves(args, TensorRef) + collect_leaves(kwargs, TensorRef)
+    skipped_refs = collect_leaves(skips_fn(*args, **kwargs), TensorRef)
+    all_counts = Counter(id(ref) for ref in all_refs)
+    skipped_counts = Counter(id(ref) for ref in skipped_refs)
+    everything: Set[Any] = set()
+    skipped: Set[Any] = set()
+    claimed_elsewhere: Set[Any] = set()
+    for ref in all_refs:
+        keys = ref_store_keys(ref)
+        everything |= keys
+        ref_id = id(ref)
+        if skipped_counts[ref_id]:
+            skipped |= keys
+        if all_counts[ref_id] > skipped_counts[ref_id]:
+            claimed_elsewhere |= keys
+    return everything - (skipped - claimed_elsewhere)
+
+
+def remap_required_store_keys(
+    required: Set[Any],
+    before_args: Tuple[Any, ...],
+    before_kwargs: Dict[str, Any],
+    after_args: Tuple[Any, ...],
+    after_kwargs: Dict[str, Any],
+) -> Set[Any]:
+    """Translate a pre-localization mask onto structurally identical localized refs."""
+    before_refs = collect_leaves(before_args, TensorRef) + collect_leaves(before_kwargs, TensorRef)
+    after_refs = collect_leaves(after_args, TensorRef) + collect_leaves(after_kwargs, TensorRef)
+    if len(before_refs) != len(after_refs):
+        raise RuntimeError("TensorTransport.localize changed the TensorRef tree structure")
+
+    remapped: Set[Any] = set()
+    for before, after in zip(before_refs, after_refs):
+        if ref_is_required(before, required):
+            remapped |= ref_store_keys(after)
+    return remapped
+
+
+# ── @distributed decorator ──
+
 DISTRIBUTED_CONFIG_ATTR = "_distributed_config"
 
 
@@ -194,8 +255,12 @@ def distributed(
     *,
     dispatch_mode: Dispatch = Dispatch.DP_SCATTER,
     execute_mode: Execute = Execute.ALL,
+    reads: Optional[Callable] = None,
+    skips: Optional[Callable] = None,
 ) -> Callable:
-    """Declare SPMD dispatch/execute mode on a Role method."""
+    """Declare SPMD dispatch/execute mode and optional tensor-read selectors on a Role method."""
+    if reads is not None and skips is not None:
+        raise ValueError("@distributed takes reads= or skips=, not both: the mask would be ambiguous.")
 
     def decorator(func: Callable) -> Callable:
         @wraps(func)
@@ -208,6 +273,8 @@ def distributed(
             {
                 "dispatch_mode": dispatch_mode,
                 "execute_mode": execute_mode,
+                "reads": reads,
+                "skips": skips,
             },
         )
         return wrapper
