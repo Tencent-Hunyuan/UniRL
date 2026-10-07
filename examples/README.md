@@ -31,6 +31,23 @@ The AR default is written for 4×8 (32 GPUs) and requires `DATA_PATH`. Launchers
 override `num_devices` from the node GPU count. Engine extras are in
 [INSTALL.md](../INSTALL.md).
 
+Two variants sit **below** the entrypoint level — they are backend/topology
+selections a recipe carries, not separate entrypoints. Pick the domain
+entrypoint above plus a recipe that makes the selection:
+
+| Variant | Selected by | Checked-in recipes |
+|---|---|---|
+| HSDP (hybrid sharding) | `fsdp_mode: hybrid` + `hsdp_shard_size` on `FSDPBackend` | [`diffusion/minimax_h3/minimax_h3_t2va_trainside_hsdp_2x8_validation`](diffusion/minimax_h3/minimax_h3_t2va_trainside_hsdp_2x8_validation.yaml) · [`ar/bagel_grpo_arxivqa_mc_2x8_lora`](ar/bagel_grpo_arxivqa_mc_2x8_lora.yaml) |
+| VeOmni train backend | `backend._target_: unirl.train.backend.veomni.backend.VeOmniBackend` | [`diffusion/sd3_trainside_veomni`](diffusion/sd3_trainside_veomni.yaml) · [`ar/qwen3_grpo_4b_veomni_sp_sglang`](ar/qwen3_grpo_4b_veomni_sp_sglang.yaml) · [`unified_model/hi3_vllmomni_veomni_ep`](unified_model/hi3_vllmomni_veomni_ep.yaml) |
+
+When to choose each: [Choosing HSDP](../unirl/train/readme.md#choosing-hsdp-hybrid-sharding)
+and [Choosing the VeOmni backend](../unirl/train/readme.md#choosing-the-veomni-backend)
+in the train-stack README.
+
+End-to-end walkthroughs — data/config through checkpoint and resume — live in
+the trainer README: [run supervised fine-tuning](../unirl/trainer/README.md#run-supervised-fine-tuning)
+and [run async AR or async diffusion training](../unirl/trainer/README.md#run-async-ar-or-async-diffusion-training).
+
 ## Running a recipe
 
 Launchers live in this directory. The first argument is the recipe path under
@@ -51,15 +68,18 @@ python -m unirl.train_diffusion --config-name=diffusion/sd3/sd3_trainside --cfg 
 # Single node
 bash examples/run_experiment_single_node.sh diffusion/sd3/sd3_trainside
 ENTRY=train_ar bash examples/run_experiment_single_node.sh ar/qwen_vl_grpo_geo3k_mc_4x8
-# SFT: set SFT_DATA to the training manifest.
-ENTRY=train_sft bash examples/run_experiment_single_node.sh sft/qwen3_sft
+# SFT: SFT_DATA is the train manifest (required); SFT_EVAL_DATA adds validation.
+SFT_DATA=data/sft_alpaca/train.jsonl SFT_EVAL_DATA=data/sft_alpaca/val.jsonl \
+  ENTRY=train_sft bash examples/run_experiment_single_node.sh sft/qwen3_sft
 ENTRY=train_pe  bash examples/run_experiment_single_node.sh pe/pe_trainside_pickscore
 ENTRY=train_unified_model bash examples/run_experiment_single_node.sh unified_model/hi3_vllmomni
 ENTRY=train_agentic bash examples/run_experiment_single_node.sh deep_research/deep_research_search_judge
-# Async AR: SGLang environment; set DATA_PATH to the training data.
-ENTRY=train_async_ar bash examples/run_experiment_single_node.sh ar/qwen3_grpo_4b_base_dapo_sglang_async
-# Async diffusion: vLLM-Omni environment; set BAGEL_PATH to the model checkpoint.
-ENTRY=train_async_diffusion bash examples/run_experiment_single_node.sh diffusion/bagel/bagel_vllmomni_async
+# Async AR: SGLang environment; DATA_PATH is the train prompt file, EVAL_DATA_PATH the eval set.
+DATA_PATH=data/dapo_math/train.jsonl EVAL_DATA_PATH=data/dapo_math/aime_eval.jsonl \
+  ENTRY=train_async_ar bash examples/run_experiment_single_node.sh ar/qwen3_grpo_4b_base_dapo_sglang_async
+# Async diffusion: vLLM-Omni environment; BAGEL_PATH is the model checkpoint.
+BAGEL_PATH=/path/to/BAGEL-7B-MoT \
+  ENTRY=train_async_diffusion bash examples/run_experiment_single_node.sh diffusion/bagel/bagel_vllmomni_async
 
 # Multi-node
 bash examples/run_experiment_multinode.sh diffusion/sd3/sd3_sglang_rollout_colocate
