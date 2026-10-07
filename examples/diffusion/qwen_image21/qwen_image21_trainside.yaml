@@ -1,0 +1,135 @@
+# @package _global_
+# Qwen-Image-2.1 + trainside (FSDP) colocate, v2 trainer, FlowGRPO, text-to-image.
+#
+# Trainside = rollout runs in-process on the FSDP-wrapped training pipeline
+# (no separate rollout actor, no weight sync). Qwen-Image-2.1 samples without
+# CFG, so guidance_scale must stay 1.0. See unirl/models/qwen_image21/README.md.
+
+num_devices: 8
+batch_size: 48                # prompts_per_rollout
+adv_use_global_std: true
+num_rollouts: 10000
+
+logging:
+  report_to_wandb: false
+  project_name: unirl
+  run_name: null
+  entity: null
+  tags: null
+
+bundle:
+  _target_: unirl.models.qwen_image21.bundle.QwenImage21Bundle.from_config
+  config:
+    _target_: unirl.models.qwen_image21.config.QwenImage21PipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:QWEN_IMAGE21_PATH,Qwen/Qwen-Image-2.1}
+    model_precision: bf16
+
+# The trainer auto-injects `bundle=self.bundle`; stages are built from it.
+pipeline:
+  _target_: unirl.models.qwen_image21.pipeline.QwenImage21Pipeline
+  autocast_precision: bf16
+  trajectory_precision: bf16
+  logprob_precision: fp32
+  strategy:
+    _target_: unirl.sde.kernels.FlowSDEStrategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["QwenImage21TransformerBlock"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 3.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 10000
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 64
+    alpha: 128
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    # Single-stream block: attention projections + SwiGLU (no add_* text-stream projections).
+    target_modules:
+      - attn.to_q
+      - attn.to_k
+      - attn.to_v
+      - attn.to_out.0
+      - img_mlp.gate_layer
+      - img_mlp.proj
+      - img_mlp.out
+
+rollout:
+  _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
+  stage_attrs: [diffusion]
+  forward_batch_size: 4
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.local.pickscore.PickScoreRewardScorer
+    base_device: cuda
+    config:
+      _target_: unirl.reward.local.pickscore.PickScoreSpec
+      batch_size: 8
+      device: auto
+      processor_id: laion/CLIP-ViT-H-14-laion2B-s32B-b79K
+      model_id: yuvalkirstain/PickScore_v1
+
+algorithm:
+  _target_: unirl.algorithms.flowgrpo.FlowGRPO
+  stage_attr: diffusion
+  clip_range: 1.0e-4
+  clip_schedule: constant
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.qwen_image.conditions.QwenImageConditions
+  params: ${sampling}
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 2
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: datasets/pickscore/train.txt
+      eval_data_path: datasets/pickscore/test.txt
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  num_inference_steps: 16
+  guidance_scale: 1.0
+  height: 512
+  width: 512
+  eta: 0.7
+  samples_per_prompt: 16
+  seed: 42
+  init_same_noise: false
+  scheduler:
+    _target_: unirl.sde.index_schedule.AllSDEScheduler
+    num_timesteps: ${..num_inference_steps}
+    num_sde_steps: 3
+    timestep_fraction: [0, 0.5]
