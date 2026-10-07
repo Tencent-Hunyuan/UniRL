@@ -8,14 +8,18 @@ import os
 import re
 from contextlib import contextmanager
 from functools import partial
-from typing import Any, Dict, Iterator, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterator, Optional, Sequence, Tuple, Union
 
 import torch
+import torch.distributed as dist
 from torch import nn
 
 from unirl.models.types.post_materialize import defer_after_materialize
 from unirl.train.configs import normalize_frozen_adapters
 from unirl.utils.peft_merge import _strip_peft_prefix
+
+if TYPE_CHECKING:
+    from peft import LoraConfig as PeftLoraConfig
 
 logger = logging.getLogger(__name__)
 
@@ -203,18 +207,16 @@ def _inject_frozen_adapter(
     *,
     name: str,
     path: str,
+    peft_cfg: PeftLoraConfig,
+    raw: Dict[str, torch.Tensor],
 ) -> str:
     """Inject a frozen LoRA adapter now, load its weights after materialization; returns its content sha256."""
-    from peft import LoraConfig, inject_adapter_in_model
+    from peft import inject_adapter_in_model
     from peft.tuners.lora import LoraLayer
-    from peft.utils import load_peft_weights
 
     if name in adapter_names(model):
         raise ValueError(f"inject_frozen_adapter: adapter {name!r} already exists on the model.")
 
-    model_id, subfolder = _resolve_adapter_checkpoint(path)
-    # The full saved config: scaling depends on use_rslora / alpha_pattern / rank_pattern, not just r and alpha.
-    peft_cfg = LoraConfig.from_pretrained(model_id, subfolder=subfolder)
     init = peft_cfg.init_lora_weights
     if isinstance(init, str) and init not in _DELTA_INITS:
         # pissa / olora / corda / loftq / lora_ga rewrite the base weight when they initialize (pissa / olora
@@ -260,7 +262,6 @@ def _inject_frozen_adapter(
     if hasattr(model, "_hf_peft_config_loaded"):
         model._hf_peft_config_loaded = True
 
-    raw = load_peft_weights(model_id, device="cpu", subfolder=subfolder)
     # peft ``base_model.model.<m>.lora_A.weight`` -> model ``<m>.lora_A.<name>.weight``.
     weights = {
         _LORA_BANK_RE.sub(lambda m: f"{m.group(0)}.{name}", _strip_peft_prefix(k), count=1): v for k, v in raw.items()
@@ -360,9 +361,64 @@ class FrozenAdapters:
     @classmethod
     def inject(cls, model: nn.Module, specs: Any) -> FrozenAdapters:
         """Inject every ``lora_cfg.frozen_adapters`` entry: structure now, weights after materialization."""
-        return cls(
-            {s.name: _inject_frozen_adapter(model, name=s.name, path=s.path) for s in normalize_frozen_adapters(specs)}
-        )
+        specs = normalize_frozen_adapters(specs)
+        if not specs:
+            return cls()
+
+        from peft import LoraConfig
+        from peft.utils import load_peft_weights
+
+        prepared = []
+        local_errors = []
+        local_exc: Optional[Exception] = None
+        for spec in specs:
+            try:
+                model_id, subfolder = _resolve_adapter_checkpoint(spec.path)
+                peft_cfg = LoraConfig.from_pretrained(model_id, subfolder=subfolder)
+                raw = load_peft_weights(model_id, device="cpu", subfolder=subfolder)
+                prepared.append((spec, peft_cfg, raw))
+            except Exception as exc:
+                local_exc = exc
+                local_errors.append(f"adapter {spec.name!r} from {spec.path!r}: {type(exc).__name__}: {exc}")
+
+        if dist.is_available() and dist.is_initialized():
+            errors = [None] * dist.get_world_size()
+            dist.all_gather_object(errors, local_errors)
+        else:
+            errors = [local_errors]
+        failures = [f"rank {rank}: {error}" for rank, rank_errors in enumerate(errors) for error in rank_errors]
+        if failures:
+            raise RuntimeError("Failed to read frozen adapters:\n" + "\n".join(failures)) from local_exc
+
+        shas = {}
+        for spec, peft_cfg, raw in prepared:
+            local_exc = None
+            local_error = None
+            local_state = None
+            try:
+                config = peft_cfg.to_dict()
+                sha = _inject_frozen_adapter(model, name=spec.name, path=spec.path, peft_cfg=peft_cfg, raw=raw)
+                local_state = (config, sha)
+            except Exception as exc:
+                local_exc = exc
+                local_error = f"adapter {spec.name!r} from {spec.path!r}: {type(exc).__name__}: {exc}"
+
+            if dist.is_available() and dist.is_initialized():
+                results = [None] * dist.get_world_size()
+                dist.all_gather_object(results, (local_error, local_state))
+            else:
+                results = [(local_error, local_state)]
+            failures = [f"rank {rank}: {error}" for rank, (error, _) in enumerate(results) if error]
+            if failures:
+                raise RuntimeError("Failed to inject frozen adapters:\n" + "\n".join(failures)) from local_exc
+            mismatched = [rank for rank, (_, state) in enumerate(results) if state != results[0][1]]
+            if mismatched:
+                raise RuntimeError(
+                    f"Frozen adapter {spec.name!r} from {spec.path!r} has different config or weights "
+                    f"on rank(s) {mismatched} than on rank 0."
+                )
+            shas[spec.name] = sha
+        return cls(shas)
 
     def is_trainable_lora_key(self, key: str) -> bool:
         """True for ``lora_A`` / ``lora_B`` keys of a non-frozen adapter — what adapter checkpoints hold."""
