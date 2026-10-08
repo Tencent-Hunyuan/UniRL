@@ -516,8 +516,6 @@ class VLLMRolloutEngine(BaseRolloutEngine):
 
     def _validate_runtime_manifest(self, ready: Dict[str, Any]) -> None:
         """Validate the vLLM runtime and TP worker capabilities."""
-        if ready.get("vllm_version") != "0.27.0":
-            raise RuntimeError(f"vLLM rollout requires vllm==0.27.0; got {ready.get('vllm_version')!r}")
         if ready.get("model_type") != "qwen3_moe":
             raise RuntimeError(f"vLLM native IPC sync currently supports qwen3_moe; got {ready.get('model_type')!r}")
         if int(ready.get("process_group_id", -1)) != int(self._process.pid):
@@ -537,8 +535,6 @@ class VLLMRolloutEngine(BaseRolloutEngine):
             or len(set(device_uuids)) != self._tp_size
         ):
             raise RuntimeError(f"vLLM worker CUDA UUIDs are invalid: {device_uuids!r}")
-        if not all(item.get("vllm_version") == "0.27.0" for item in capabilities):
-            raise RuntimeError(f"vLLM worker versions are incompatible: {capabilities!r}")
         logger.info("vLLM runtime manifest validated: vllm=%s", ready["vllm_version"])
 
     def _require_connection(self):
