@@ -26,6 +26,19 @@ python benchmarks/speed_benchmarks/parse_perf.py train.log --samples-per-step <b
 prints steps, median/mean/p90 s/step, samples/s and samples/GPU-hour (first `--skip 2`
 steps dropped as warmup).
 
+## Smoke schema check
+
+Run the CPU-only synthetic benchmark without arguments:
+
+```bash
+python benchmarks/speed_benchmarks/benchmark_smoke.py
+```
+
+It writes one schema-v1 JSON object to `outputs/benchmark/`; this output is a contract
+check and is not a UniRL performance measurement. Use `--samples`,
+`--warmup-iterations`, `--measured-iterations`, and `--out` to override the defaults.
+See [#414](https://github.com/Tencent-Hunyuan/UniRL/issues/414) and [#25](https://github.com/Tencent-Hunyuan/UniRL/issues/25).
+
 ## Fair-comparison protocol
 
 Pin on both sides, and publish the full configs next to any number you report:
