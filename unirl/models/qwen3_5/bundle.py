@@ -7,7 +7,6 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from packaging.version import Version
 
 from unirl.models.types.bundle import Bundle
 from unirl.models.types.meta_init import build_meta_init_transformer, capture_init_state, resolve_meta_init_weights
@@ -89,14 +88,6 @@ def _patch_fast_pos_embed_interpolate(visual_module: nn.Module) -> None:
 
 def _model_class_for(model_type: str):
     """Return the HF ``ForConditionalGeneration`` class for ``model_type``."""
-    import transformers
-
-    version = Version(transformers.__version__)
-    if version < Version("5.0.0"):
-        raise RuntimeError(
-            f"Qwen3_5Bundle requires transformers >= 5.0 (got {transformers.__version__}); "
-            "Qwen3.5 is natively supported only from 5.0 onward."
-        )
     if model_type == "qwen3_5":
         from transformers import Qwen3_5ForConditionalGeneration as Cls
     elif model_type == "qwen3_5_moe":
