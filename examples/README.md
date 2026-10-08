@@ -38,7 +38,7 @@ entrypoint above plus a recipe that makes the selection:
 | Variant | Selected by | Checked-in recipes |
 |---|---|---|
 | HSDP (hybrid sharding) | `fsdp_mode: hybrid` + `hsdp_shard_size` on `FSDPBackend` | [`diffusion/minimax_h3/minimax_h3_t2va_trainside_hsdp_2x8_validation`](diffusion/minimax_h3/minimax_h3_t2va_trainside_hsdp_2x8_validation.yaml) · [`ar/bagel_grpo_arxivqa_mc_2x8_lora`](ar/bagel_grpo_arxivqa_mc_2x8_lora.yaml) |
-| VeOmni train backend | `backend._target_: unirl.train.backend.veomni.backend.VeOmniBackend` | [`diffusion/sd3_trainside_veomni`](diffusion/sd3_trainside_veomni.yaml) · [`ar/qwen3_grpo_4b_veomni_sp_sglang`](ar/qwen3_grpo_4b_veomni_sp_sglang.yaml) · [`unified_model/hi3_vllmomni_veomni_ep`](unified_model/hi3_vllmomni_veomni_ep.yaml) |
+| VeOmni train backend | `backend._target_: unirl.train.backend.veomni.backend.VeOmniBackend` | [`diffusion/sd3_trainside_veomni`](diffusion/sd3_trainside_veomni.yaml) · [`diffusion/qwen_image_trainside_veomni`](diffusion/qwen_image_trainside_veomni.yaml) · [`ar/qwen3_grpo_4b_veomni_sp_sglang`](ar/qwen3_grpo_4b_veomni_sp_sglang.yaml) · [`unified_model/hi3_vllmomni_veomni_ep`](unified_model/hi3_vllmomni_veomni_ep.yaml) |
 
 When to choose each: [Choosing HSDP](../unirl/train/readme.md#choosing-hsdp-hybrid-sharding)
 and [Choosing the VeOmni backend](../unirl/train/readme.md#choosing-the-veomni-backend)
