@@ -11,11 +11,13 @@ from typing import Any
 _SCHEMA_VERSION = 1
 
 
-def _validate_number(value: int | float, name: str, *, strictly_positive: bool = False) -> None:
+def _validate_number(value: int | float, name: str, *, integer: bool = False, strictly_positive: bool = False) -> None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise TypeError(f"{name} must be an int or float")
     if not math.isfinite(value):
         raise ValueError(f"{name} must be finite")
+    if integer and not isinstance(value, int):
+        raise TypeError(f"{name} must be an integer")
     if value < 0 or (strictly_positive and value == 0):
         requirement = "strictly positive" if strictly_positive else "non-negative"
         raise ValueError(f"{name} must be {requirement}")
@@ -31,7 +33,7 @@ class Environment:
     world_size: int
 
     def to_dict(self) -> dict[str, Any]:
-        _validate_number(self.world_size, "world_size")
+        _validate_number(self.world_size, "world_size", integer=True)
         return {
             "python": self.python,
             "torch": self.torch,
@@ -54,7 +56,7 @@ class Workload:
             ("warmup_iterations", self.warmup_iterations),
             ("measured_iterations", self.measured_iterations),
         ):
-            _validate_number(value, name)
+            _validate_number(value, name, integer=True)
         return {
             "samples": self.samples,
             "warmup_iterations": self.warmup_iterations,
@@ -70,7 +72,7 @@ class Metrics:
     peak_memory_bytes: int | None = None
     phases_s: dict[str, float] | None = None
 
-    def to_dict(self, measured_samples: int) -> dict[str, Any]:
+    def to_dict(self, samples: int) -> dict[str, Any]:
         _validate_number(self.wall_clock_s, "wall_clock_s", strictly_positive=True)
         if self.peak_memory_bytes is not None:
             _validate_number(self.peak_memory_bytes, "peak_memory_bytes")
@@ -79,7 +81,7 @@ class Metrics:
                 _validate_number(value, f"phases_s[{name!r}]")
         result: dict[str, Any] = {
             "wall_clock_s": self.wall_clock_s,
-            "samples_per_second": measured_samples / self.wall_clock_s,
+            "samples_per_second": samples / self.wall_clock_s,
         }
         if self.peak_memory_bytes is not None:
             result["peak_memory_bytes"] = self.peak_memory_bytes
@@ -111,7 +113,7 @@ class BenchmarkResult:
             "started_at": self.started_at,
             "environment": self.environment.to_dict(),
             "workload": workload,
-            "metrics": self.metrics.to_dict(workload["samples"] * workload["measured_iterations"]),
+            "metrics": self.metrics.to_dict(workload["samples"]),
         }
 
 

@@ -38,8 +38,8 @@ def main() -> None:
     parser.add_argument("--measured-iterations", type=int, default=_DEFAULT_MEASURED_ITERATIONS)
     parser.add_argument("--out", type=Path, default=_DEFAULT_OUT)
     args = parser.parse_args()
-    if min(args.samples, args.warmup_iterations, args.measured_iterations) < 0:
-        parser.error("--samples and iteration counts must be non-negative")
+    if args.samples < 1 or args.warmup_iterations < 0 or args.measured_iterations < 1:
+        parser.error("--samples must be positive; iterations must be warmup >= 0 and measured >= 1")
 
     for _ in range(args.warmup_iterations):
         _run_iteration(args.samples)
@@ -55,9 +55,7 @@ def main() -> None:
             benchmark="smoke-synthetic",
             run_id=run_id,
             started_at=started_at,
-            environment=Environment(
-                python=platform.python_version(), torch="unavailable", device="cpu", world_size=1
-            ),
+            environment=Environment(python=platform.python_version(), torch="unavailable", device="cpu", world_size=1),
             workload=Workload(
                 samples=args.samples,
                 warmup_iterations=args.warmup_iterations,
