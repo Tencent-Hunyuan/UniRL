@@ -6,7 +6,7 @@ from __future__ import annotations
 import hydra
 from omegaconf import DictConfig
 
-from unirl.trainer.async_diffusion import AsyncDiffusionTrainer
+from unirl.trainer.async_diffusion import ASYNC_RESIDENCY_POLICY, AsyncDiffusionTrainer
 
 
 @hydra.main(version_base=None, config_path="../examples", config_name="diffusion/bagel/bagel_vllmomni_async")
@@ -30,10 +30,11 @@ def main(cfg: DictConfig) -> None:
         reward_fraction=cfg.get("reward_fraction", 0.0),
         # Forwarded so the trainer can reject it — async scores at reap time outside
         # _reward_phase(), and dropping the key here would silently ignore the policy.
-        offload_train_during_reward=cfg.get("offload_train_during_reward", False),
-        # Async default False (sync entry defaults True): the dedicated rollout
-        # slab stays resident; evaluate() also passes sleep_after=False here.
-        rollout_sleep_after_generate=cfg.get("rollout_sleep_after_generate", False),
+        reward_resident=cfg.get("reward_resident", ASYNC_RESIDENCY_POLICY.reward_resident),
+        # Async keeps the rollout resident by default (the sync entry parks it):
+        # it owns a dedicated slab, and evaluate() also passes sleep_after=False.
+        rollout_resident=cfg.get("rollout_resident", ASYNC_RESIDENCY_POLICY.rollout_resident),
+        train_resident=cfg.get("train_resident", ASYNC_RESIDENCY_POLICY.train_resident),
         adv_use_global_std=cfg.get("adv_use_global_std", False),
         eval_interval=cfg.get("eval_interval", 0),
         eval_num_prompts=cfg.get("eval_num_prompts", 64),
@@ -43,7 +44,7 @@ def main(cfg: DictConfig) -> None:
         # Any DiffusionSamplingParams field; everything it omits inherits `sampling`.
         eval_sampling_cfg=cfg.get("eval_sampling"),
         eval_rewards_cfg=cfg.get("eval_rewards"),
-        task_config=cfg.get("task_config"),
+        control=cfg.get("control"),
         max_inflight=int(cfg.get("max_inflight", 1)),
         per_worker_inflight=int(cfg.get("per_worker_inflight", 1)),
         weight_sync_interval=int(cfg.get("weight_sync_interval", 1)),

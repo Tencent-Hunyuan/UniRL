@@ -36,6 +36,11 @@ class Hv15InputAdapter(DitInputAdapter):
     def build_sampling(self, sample: Sample) -> List[StageSampling]:
         sampling = super().build_sampling(sample)
         sampling[0].kwargs["num_frames"] = _num_frames(sample)
+        frontier = sample.frontier_gen_part(DiffusionSamplingParams)
+        diff_params = frontier.sampling_params
+        extra_args = sampling[0].kwargs.setdefault("extra_args", {})
+        extra_args["denoise_seed_keys"] = [str(sample_id) for sample_id in frontier.sample_ids]
+        extra_args["denoise_base_seed"] = int(diff_params.seed) if diff_params.seed is not None else 0
         return sampling
 
 
@@ -49,8 +54,8 @@ class Hv15VideoOutputAdapter(DitOutputAdapter):
         "on the output envelope's unirl metadata (or it lacked the dual-stream "
         "text_mllm/text_glyph embeds). Check that "
         "RLHunyuanVideo15Pipeline's encode_prompt hook ran in every DiT "
-        "worker — verify custom_pipeline_args.pipeline_class in the stage "
-        "YAML."
+        "worker — verify custom_pipeline_args.pipeline_class in the deploy "
+        "config."
     )
 
     def build_decoded(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Any:
@@ -111,7 +116,7 @@ class Hv15VideoOutputAdapter(DitOutputAdapter):
 class Hv15T2vAdapter(ModelAdapter):
     """HunyuanVideo-1.5 text → video (single diffusion stage, TP=1)."""
 
-    stage_yaml = "hunyuan_video15_t2v_rl.yaml"
+    deploy_config = "hunyuan_video15_t2v_rl.yaml"
     needs_driver_tokenizer = False
 
     def __init__(self, config: Any, model_config: Any, *, strategy: Any = None, tokenize_fn: Any = None) -> None:

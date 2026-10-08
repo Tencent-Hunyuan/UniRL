@@ -7,7 +7,6 @@ from typing import Callable, List, NamedTuple, Optional, Tuple
 
 import torch
 
-from unirl.algorithms.base import StageAlgorithm
 from unirl.train.stack.planner.count import _count_plan
 from unirl.train.stack.planner.types import Plan, UpdatePlan, _positive_int, _update_ranges
 from unirl.types.sample import Part
@@ -174,18 +173,3 @@ class TokenBudgetPlanner:
             samples, num_updates=num_updates, token_budget=self.token_budget, cost_model=self.cost_model
         )
         return part.select(perm), plan
-
-    def validate(self, algorithm: StageAlgorithm) -> None:
-        """Require a grouping-invariant loss-weighting contract."""
-        if getattr(algorithm, "loss_weighting", "sample") == "token":
-            return
-        mode = getattr(algorithm, "loss_agg_mode", None)
-        if mode is None or not str(mode).startswith("seq-mean"):
-            raise ValueError(
-                f"{type(self).__name__}: token-budget packing requires a sequence-mean loss "
-                f"aggregation (loss_agg_mode starting with 'seq-mean'), because micro losses are "
-                f"weighted by sample share. {type(algorithm).__name__} has loss_agg_mode={mode!r}, "
-                f"which is not grouping-invariant under packing — the update gradient would change. "
-                f"Use loss_agg_mode='seq-mean-token-sum-norm' (or 'seq-mean-token-mean'), or use a "
-                f"CountPlanner (omit micro_planner) for count-based micro-batching."
-            )

@@ -10,11 +10,13 @@ from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple, Typ
 import torch
 
 from unirl.distributed.group.remote import Remote
+from unirl.types.loss_agg import LossAggMode, parse_loss_agg_mode
 
 if TYPE_CHECKING:
     from unirl.types.conditions import Condition
     from unirl.types.sample import Part
     from unirl.types.segments.base import Segment
+    from unirl.types.segments.text import TextSegment
 
 
 def typed_conditions(
@@ -25,6 +27,30 @@ def typed_conditions(
     if conditions_cls is None:
         return conditions
     return conditions_cls.from_dict(dict(conditions))
+
+
+def _prepare_ar_logp_anchor(
+    *,
+    stage: Any,
+    conditions: Mapping[str, "Condition"],
+    segment: "TextSegment",
+    conditions_cls: Optional[Type[Any]],
+    old_logp_source: str,
+    sampling_temperature: float,
+) -> None:
+    """Freeze an AR rollout- or replay-sourced log-prob anchor."""
+    if segment.log_probs is None:
+        return
+    if old_logp_source != "replay":
+        return
+    if segment.rollout_log_probs is None:
+        segment.rollout_log_probs = segment.log_probs.detach().cpu().clone()
+    if segment.tokens is None or segment.tokens.shape[0] == 0:
+        return
+    typed_conds = typed_conditions(conditions, conditions_cls)
+    with torch.no_grad():
+        frozen = stage.replay(typed_conds, segment=segment, temperature=sampling_temperature)
+    segment.log_probs = frozen.detach().cpu()
 
 
 def gather_sde_field(
@@ -54,9 +80,65 @@ def gather_sde_field(
     return tensor[:, positions.tolist()]
 
 
-def rollout_replay_logp_absdiff(new_logp: torch.Tensor, old_logp: torch.Tensor) -> Dict[str, float]:
+def select_active_tokens(mask: Optional[torch.Tensor], *tensors: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+    """Detached ``loss_mask``-active elements for metrics; all elements when none are active (``max`` never empty)."""
+    detached = tuple(t.detach() for t in tensors)
+    if mask is None:
+        return detached
+    active = mask.to(device=detached[0].device) > 0
+    if not bool(active.any()):
+        return detached
+    return tuple(t[active] for t in detached)
+
+
+def aggregate_token_losses(
+    loss_per_elem: torch.Tensor,
+    *,
+    lengths: torch.Tensor,
+    loss_mask: Optional[torch.Tensor],
+    loss_agg_mode: str,
+    horizon: int,
+) -> torch.Tensor:
+    """Reduce packed ``[total_tokens]`` losses per :class:`LossAggMode`; raises ``ValueError`` on an unknown mode."""
+    mode = parse_loss_agg_mode(loss_agg_mode, owner="aggregate_token_losses")
+    mask: Optional[torch.Tensor] = None
+    if loss_mask is not None:
+        mask = loss_mask.to(dtype=loss_per_elem.dtype, device=loss_per_elem.device)
+        loss_per_elem = loss_per_elem * mask
+
+    if mode is LossAggMode.TOKEN_MEAN:
+        # Σ ℓ·m / Σ m over the whole micro.
+        if mask is None:
+            return loss_per_elem.mean()
+        return loss_per_elem.sum() / mask.sum().clamp(min=1)
+
+    split_sizes = lengths.tolist()
+    seq_losses = torch.split(loss_per_elem, split_sizes)
+
+    if mode is LossAggMode.SEQ_MEAN_TOKEN_SUM_NORM:
+        # mean_s(Σ_t ℓ·m) / horizon; a fully-masked sequence contributes 0 and still counts in mean_s.
+        return torch.stack([s.sum() for s in seq_losses]).mean() / float(horizon)
+
+    if mode is LossAggMode.SEQ_MEAN_TOKEN_MEAN:
+        # mean_s(Σ_t ℓ·m / max(Σ_t m, 1)); a fully-masked sequence contributes 0 and still counts in mean_s.
+        if mask is None:
+            seq_means = [s.mean() if s.numel() else s.new_zeros(()) for s in seq_losses]
+        else:
+            seq_mask_sums = [m.sum().clamp(min=1) for m in torch.split(mask, split_sizes)]
+            seq_means = [s.sum() / n for s, n in zip(seq_losses, seq_mask_sums)]
+        return torch.stack(seq_means).mean()
+
+    raise ValueError(f"aggregate_token_losses: no reduction implemented for {mode!r}")
+
+
+def rollout_replay_logp_absdiff(
+    new_logp: torch.Tensor,
+    old_logp: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+) -> Dict[str, float]:
     """Per-token |Δlogp| between rollout and replay — AR train-rollout drift gauge."""
     with torch.no_grad():
+        new_logp, old_logp = select_active_tokens(mask, new_logp, old_logp)
         absdiff = (new_logp - old_logp).abs()
     return {
         "rollout_replay_logp_absdiff_mean": float(absdiff.mean()),
@@ -64,9 +146,14 @@ def rollout_replay_logp_absdiff(new_logp: torch.Tensor, old_logp: torch.Tensor) 
     }
 
 
-def rollout_replay_k3(new_logp: torch.Tensor, old_logp: torch.Tensor) -> Dict[str, float]:
+def rollout_replay_k3(
+    new_logp: torch.Tensor,
+    old_logp: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+) -> Dict[str, float]:
     """Per-token K3 KL estimator between rollout and replay log-probs."""
     with torch.no_grad():
+        new_logp, old_logp = select_active_tokens(mask, new_logp, old_logp)
         log_r = (new_logp.float() - old_logp.float()).clamp(min=-20.0, max=20.0)
         k3 = torch.expm1(log_r) - log_r
         out = {
@@ -96,6 +183,7 @@ def _grpo_clip_loss(
     advantages: torch.Tensor,
     clip_range: float,
     clip_range_high: Optional[float] = None,
+    mask: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """PPO-style clipped objective. Element-wise; reduction is the caller's job."""
     high = clip_range if clip_range_high is None else clip_range_high
@@ -106,6 +194,7 @@ def _grpo_clip_loss(
     clipped = -adv * torch.clamp(ratio, 1.0 - clip_range, 1.0 + high)
     loss_per_elem = torch.maximum(unclipped, clipped)
 
+    ratio, log_diff = select_active_tokens(mask, ratio, log_diff)
     if ratio.numel() > 1:
         ratio_std = ratio.std()
     else:
@@ -126,7 +215,8 @@ def _grpo_clip_loss(
 
 
 def _gaussian_kl_div(p: torch.Tensor, q: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
-    """Per-element Gaussian KL between means at shared variance: ``(p-q)^2 / (2 sigma^2)``."""
+    """Per-element Gaussian KL ``(p-q)^2 / (2 sigma^2)``; ``sigma`` ``[S']`` broadcasts over ``[B, S', *latent]``."""
+    sigma = sigma.reshape(1, -1, *([1] * (p.ndim - 2)))
     return (p - q) ** 2 / (2 * sigma**2)
 
 
@@ -139,9 +229,9 @@ def _transition_sigma(
     device: torch.device,
     add_coefficient: bool = True,
 ) -> torch.Tensor:
-    """Per-step SDE transition std ``sigma_t`` for KL normalization, shape ``[1, S', 1, 1, 1]``."""
+    """Per-step SDE transition std ``sigma_t`` ``[S']``; ``_gaussian_kl_div`` broadcasts it against the means."""
     if not add_coefficient:
-        return torch.ones(1, len(target_steps), 1, 1, 1, device=device)
+        return torch.ones(len(target_steps), device=device)
     if segment.sigmas is None:
         raise ValueError("_transition_sigma requires segment.sigmas (add_coefficient=True).")
     sigmas = segment.sigmas.to(device=device, dtype=torch.float32)
@@ -149,8 +239,7 @@ def _transition_sigma(
     s = sigmas[idx]
     s_next = sigmas[idx + 1]
     sigma_max = sigmas[1] if int(sigmas.shape[0]) > 1 else torch.tensor(0.99, device=device, dtype=sigmas.dtype)
-    sigma_t = stage.strategy.transition_std(sigma=s, sigma_next=s_next, eta=float(eta), sigma_max=sigma_max)
-    return sigma_t.reshape(1, -1, 1, 1, 1)
+    return stage.strategy.transition_std(sigma=s, sigma_next=s_next, eta=float(eta), sigma_max=sigma_max)
 
 
 def _reference_replay_means(
@@ -244,12 +333,8 @@ class StageAlgorithm(Remote, ABC):
     supports_multi_update: bool = False
     requires_backend: bool = False
     requires_advantages: bool = True
-    loss_weighting: str = "sample"
+    recomputes_anchor: bool = False
     anchor_fields: Tuple[str, ...] = ()
-
-    def recomputes_anchor(self) -> bool:
-        """Whether the anchor must be recomputed at the exact ``(mini, micro)`` geometry training uses."""
-        return False
 
     def prepare_segment(
         self,
@@ -281,8 +366,10 @@ class StageAlgorithm(Remote, ABC):
 __all__ = [
     "AlgorithmStepResult",
     "StageAlgorithm",
+    "aggregate_token_losses",
     "gather_sde_field",
     "rollout_replay_logp_absdiff",
     "rollout_replay_k3",
+    "select_active_tokens",
     "typed_conditions",
 ]

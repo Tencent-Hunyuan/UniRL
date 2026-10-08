@@ -91,7 +91,7 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
         f"!= AR sample count {len(ar_part.sample_ids)}",
     )
 
-    control = sample.parts[0].control or {}
+    control = sample.parts[0].control
     ar_cfg: Dict[str, Any] = dict(control.get("ar") or {})
     require(
         "bot_task" not in ar_cfg,

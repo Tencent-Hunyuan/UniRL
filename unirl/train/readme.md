@@ -37,11 +37,12 @@ knows nothing about DTensor sharding or wrap topology.
   **skips the whole step on a non-finite grad norm** (stepping would scale every
   parameter by the bad norm and poison the next rollout).
 - **`TrainStack`** (`stack/base.py`) takes one backend + one `StageAlgorithm` and runs
-  `train_track`: move the segment onto device → `prepare_segment` (freeze π_old
-  once) → `num_updates_per_batch` optimizer steps over disjoint mini-batches, each a
-  micro-batch loop of `compute_loss_and_backward`. The mini/micro slicing comes from
-  one source — the injected `micro_planner` (`stack/planner/`; `CountPlanner` by
-  default, `TokenBudgetPlanner` for token packing) — shared with `prepare_segment`,
+  `train_track`: move the segment onto device → `prepare_segment_anchors` (freeze
+  π_old once) → `num_updates_per_batch` optimizer steps over disjoint mini-batches,
+  each a micro-batch loop of `compute_loss_and_backward`. The mini/micro slicing comes
+  from one source — the injected `micro_planner` (`stack/planner/`; `CountPlanner` by
+  default, `TokenBudgetPlanner` for token packing) — shared with
+  `prepare_segment_anchors` (`stack/anchor.py`, also used by `UnifiedModelTrainStack`),
   so when an algorithm replays its anchor, it's recomputed at the *exact* geometry
   training uses, which is what pins the on-policy PPO ratio to 1 under bf16's
   batch-shape sensitivity. `AgenticTrainer` uses the same interface after
@@ -55,7 +56,8 @@ knows nothing about DTensor sharding or wrap topology.
 before `fsdp_wrap`, plus a config in `configs.py`; a new optimizer or LR schedule
 is a branch in `optim.py` plus fields on `OptimizerConfig` / `LrSchedulerConfig`
 in `backend/base.py`; a multi-update-capable algorithm sets
-`supports_multi_update = True` and declares `anchor_fields` (see
+`supports_multi_update = True`, declares `anchor_fields`, and exposes
+`recomputes_anchor` when its anchor must follow the planned micro geometry (see
 `../algorithms/README.md`).
 
 ## Gotchas
@@ -64,9 +66,18 @@ in `backend/base.py`; a multi-update-capable algorithm sets
   divide the per-worker batch** — otherwise the ctor or `_build_mini_batch_slices`
   raises (a ragged mini-batch would silently drop samples and desync grad-accum
   across DP ranks).
+- **Multi-update membership is contiguous by default.** Set `shuffle_updates: true`
+  on the stack to shuffle the full per-worker batch before it is partitioned into
+  optimizer updates; `shuffle_seed` (default 0) is combined with the rollout id so
+  the per-rollout ordering is reproducible across checkpoint resume. It is a no-op
+  at `num_updates_per_batch: 1`, requires the default `CountPlanner`, and gathers
+  each micro-batch lazily, so it adds no full-track copy.
 - **`optimizer_step` silently *skips* (does not crash) on a non-finite grad norm**
   and zeroes grads — a flat loss curve with a logged warning means grads went
   non-finite.
+- **Checkpointing preserves a never-stepped AdamW** — DCP materializes empty
+  optimizer state with a dummy step; UniRL resets it so the first real update
+  remains step 1.
 - **`master_dtype` defaults to `None`, so the optimizer master follows `param_dtype`** —
   a bf16-loaded base then keeps a bf16 LoRA master and the ~1e-6 AdamW steps round
   away (the policy drifts into a degenerate reward-hack). An fp32-loaded model gets an
@@ -87,6 +98,11 @@ in `backend/base.py`; a multi-update-capable algorithm sets
 - **Advantages are not computed here** — `train` raises if
   `part.advantages is None`; the trainer must call `compute_advantages` on the
   full shard first.
+- **Selective offload supports direct GPU-streaming weight sync.** The trainer
+  keeps FSDP parameter shards on device while vLLM receives weights, clears
+  consumed gradients and offloads optimizer state before publication, then
+  offloads the model after publication commits. Calling `offload()` without
+  arguments retains the legacy full-state behavior.
 - **`fsdp_wrap` wraps *nothing* when no block class is discovered** — the warning
   says "root-only wrap" but `_enumerate_block_instances` returns `()`, so the
   shard/cast loops are no-ops and the model trains **unsharded and un-cast**. Pass
@@ -102,6 +118,15 @@ in `backend/base.py`; a multi-update-capable algorithm sets
   skips backward (an all-empty micro) while earlier ones ran, `TrainStack.train`
   raises instead of silently stepping on never-synced grads (which would also
   leak the stale accumulation into the next step's reduce-scatter).
+- **`fsdp_mode: hybrid` makes the HSDP shard group explicit** —
+  `hsdp_shard_size` is the number of contiguous ranks that shard parameters;
+  the remaining `world_size / hsdp_shard_size` dimension holds replicated
+  model copies and synchronizes their gradients. Set it to `devices_per_node`
+  for the usual intra-node FSDP + inter-node replication layout (for example,
+  world 16 with shard 8 gives a `(2, 8)` mesh). Larger groups such as shard 32
+  are supported when the world is a larger divisible multiple. Hybrid fails
+  fast when the shard size does not divide the world or leaves only one replica
+  group; use `full` for that one-group case.
 - **`fsdp_mode: no_shard` trades memory for the all-gather** — a `(world, 1)` mesh
   leaves the full model on every rank, so no parameter bytes cross ranks and only
   gradients are all-reduced (DDP). It pays off where the re-gathered bytes dwarf the
@@ -112,6 +137,28 @@ in `backend/base.py`; a multi-update-capable algorithm sets
   the model whenever `param_dtype` upcasts (fp32 compute over a bf16 checkpoint), so
   leave it `true` unless that copy is cheap. `defer_grad_sync: true` then gives one
   all-reduce per optimizer step. VeOmni only supports `full`.
+- **`copy_engine_all_gather: true` takes the FSDP all-gather off the SMs** — FSDPBackend
+  creates the default NCCL group with the zero-CTA policy and every `fully_shard` group
+  allocates its all-gather buffer from NCCL symmetric memory, so the gather runs on the
+  copy engines (`cudaMemcpyBatchAsync`) instead of an `ncclDevKernel_AllGather` kernel.
+  Needs PyTorch >= 2.13, NCCL >= 2.28, and a shard group that stays on one node over
+  NVLink (`full` on a single node, or `hybrid` with `hsdp_shard_size:
+  devices_per_node`); `no_shard` and VeOmni reject it. FSDPBackend must be what brings
+  up `torch.distributed` (it binds WORLD to the rank's CUDA device so DeviceMesh splits
+  the shard group from it and the policy is inherited), and
+  `NCCL_CTA_POLICY` must stay unset or `2`. WORLD keeps the usual `cpu:gloo,cuda:nccl`
+  pair, so in `hybrid` mode torch logs one `ProcessGroupGloo::split ... Falling back to
+  default options` warning per process while splitting the gloo half; it is expected.
+- **`lora_cfg.frozen_adapters` (OPD teachers) have real weights only after
+  `apply_deferred_ops`** — the adapter is injected pre-wrap so meta-init bundles work, but
+  its weights load after materialization; reading a teacher earlier sees a null or
+  uninitialized adapter. Teachers must be plain LoRA deltas: unconverted base-rewriting
+  inits (pissa, olora, ...), `modules_to_save`, `layer_replication`,
+  `trainable_token_indices`, DoRA, and `bias != "none"` are rejected at startup.
+- **Adapter checkpoints exclude frozen teachers, and resume requires the same teachers** —
+  teachers reload from their paths and the checkpoint pins each by a content sha256, so a
+  different teacher set or different weights raises on `load`. A checkpoint trained without
+  teachers resumes into any teacher set.
 
 ## Profiling → Perfetto
 

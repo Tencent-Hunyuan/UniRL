@@ -1,0 +1,20 @@
+# @package _global_
+# Checkpoint-engine IPC transport variant of the Qwen3-30B full-weight recipe.
+#
+# Run:
+#   ENTRY=train_ar bash examples/run_experiment_single_node.sh \
+#     ar/qwen3_cppo_30b_a3b_base_dapo_sglang_ckpt_engine_ipc
+
+defaults:
+  - qwen3_cppo_30b_a3b_base_dapo_sglang_full_weight_sync
+  - _self_
+
+sync:
+  _target_: unirl.distributed.weight_sync.full.ckpt_engine_ipc.CkptEngineIPCWeightSync
+  # Qwen3-30B's bf16 embedding is about 594 MiB and one tensor cannot span
+  # checkpoint-engine buckets.
+  bucket_size_mb: 640
+
+logging:
+  run_name: cppo_qwen3-30b-a3b-base_dapo_sglang_ckpt_engine_ipc
+  tags: [cppo, qwen3, 30b-a3b-base, dapo, sglang, full-weight-sync, checkpoint-engine]

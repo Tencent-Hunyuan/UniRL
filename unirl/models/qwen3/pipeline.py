@@ -45,6 +45,7 @@ class Qwen3Pipeline(Pipeline):
         system_instruction: Optional[str] = None,
         autocast_precision: str = "bf16",
         logprob_precision: str = "fp32",
+        replay_kernel_options: Optional[Dict[str, Any]] = None,
         enable_thinking: bool = False,
         max_prompt_length: int = 4096,
     ) -> "Qwen3Pipeline":
@@ -59,6 +60,7 @@ class Qwen3Pipeline(Pipeline):
             model=bundle,
             autocast_precision=autocast_precision,
             logprob_precision=logprob_precision,
+            replay_kernel_options=replay_kernel_options,
         )
         return cls(
             bundle=bundle,
@@ -85,9 +87,9 @@ class Qwen3Pipeline(Pipeline):
         )
         return cls(bundle=bundle, chat_template=chat_template, ar=ar)
 
-    def _conditions_for(self, turns: List[Turn], control: Optional[Dict[str, Any]] = None) -> Qwen3ARConditions:
+    def _conditions_for(self, turns: List[Turn], control: Dict[str, Any]) -> Qwen3ARConditions:
         """Chat-template + tokenize the trajectory ``turns`` → :class:`Qwen3ARConditions`."""
-        chat_overrides: Dict[str, Any] = dict((control or {}).get("chat") or {})
+        chat_overrides: Dict[str, Any] = dict(control.get("chat") or {})
         if "system_instruction" in chat_overrides:
             chat_stage = Qwen3ChatTemplateStage(
                 self.bundle,

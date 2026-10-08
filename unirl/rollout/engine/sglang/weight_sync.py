@@ -8,6 +8,7 @@ from typing import Dict, List, Optional
 import torch
 
 from unirl.rollout.engine.sglang.backends import Backend
+from unirl.rollout.engine.sglang.backends.base import CheckpointEngineIPCBackend
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +79,24 @@ class WeightSync:
 
     def destroy_weights_update_group(self, *, group_name: str) -> None:
         self._backend.destroy_weights_group(group_name=str(group_name))
+
+    def update_weights_from_checkpoint_engine_ipc(
+        self,
+        *,
+        zmq_handles: Dict[str, str],
+        flush_cache: bool,
+        timeout_s: float,
+    ) -> None:
+        """Push full weights via ZMQ + CUDA IPC (checkpoint-engine protocol)."""
+        if not zmq_handles:
+            raise ValueError("zmq_handles must be non-empty for IPC update")
+        if not isinstance(self._backend, CheckpointEngineIPCBackend):
+            raise TypeError("SGLang backend does not support checkpoint-engine IPC")
+        self._backend.update_from_checkpoint_engine_ipc(
+            zmq_handles=zmq_handles,
+            flush_cache=flush_cache,
+            timeout_s=timeout_s,
+        )
 
     def set_lora_from_tensors(
         self,

@@ -99,9 +99,6 @@ rollout:
     ep_size: 8
     # SGLang enables MoE expert parallelism through ep_size; the pinned
     # ServerArgs has no separate enable_expert_parallel boolean.
-    max_new_tokens: 4096
-    temperature: 1.0
-    top_p: 1.0
     concurrency: 64
     samples_pre_expanded: true
     # The trainer sleeps SGLang before restoring FSDP onto the same GPUs.
@@ -113,12 +110,14 @@ rollout:
     chat_template_kwargs:
       enable_thinking: true
     engine_kwargs:
-      # Leaves room for FSDP offload/onload and staged SGLang wake on this
-      # 8-GPU 30B MoE recipe; retune when changing the model or TP layout.
+      # Colocate 30B MoE: tighter than the 4B dense preset (0.15 / cuda_graph_max_bs
+      # 64 vs 0.3 / 16) to leave room for FSDP offload/onload and staged SGLang
+      # wake. Retune when changing the model or TP layout.
+      # See unirl/rollout/README.md (SGLang AR knobs).
       mem_fraction_static: 0.15
       attention_backend: triton
       disable_cuda_graph: false
-      cuda_graph_max_bs: 64
+      cuda_graph_max_bs_decode: 64
       enable_lora: false
 
 reward:
@@ -137,8 +136,8 @@ algorithm:
   cppo_w_min: 0.8
   cppo_delta_b: 0.02
   loss_agg_mode: seq-mean-token-sum-norm
-  horizon: 4096
-  sampling_temperature: 1.0
+  horizon: ${sampling.max_new_tokens}
+  sampling_temperature: ${sampling.temperature}
   old_logp_source: rollout
   conditions_cls:
     _target_: hydra.utils.get_class

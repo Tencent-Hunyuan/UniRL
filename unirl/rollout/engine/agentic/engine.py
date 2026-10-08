@@ -82,7 +82,7 @@ class AgenticRolloutEngine(BaseRolloutEngine):
     def generate(self, sample: Sample) -> Sample:
         try:
             outcome = self._harness.run(sample, self._harness_ctx)
-            if outcome.status not in ("completed", "suspended", "failed"):
+            if outcome.status not in ("completed", "suspended", "failed", "overflow"):
                 raise ValueError(f"unknown harness outcome status: {outcome.status!r}")
             return self._stamp_outcome(outcome.sample, outcome.status)
         except Exception:  # noqa: BLE001 — last-resort net: a harness bug fails one trajectory, not the run

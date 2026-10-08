@@ -14,7 +14,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-from unirl.models.types.ar import ARSamplingParams, ARStage, ARStep, left_pad_prompt
+from unirl.models.types.ar import ARSamplingParams, ARStage, ARStep, left_pad_prompt, select_last_lm_head_row
 from unirl.types.segments import TextSegment
 from unirl.utils.dtypes import parse_torch_dtype
 
@@ -500,7 +500,8 @@ class Qwen3OmniARStage(ARStage[Qwen3OmniARConditions]):
                     prep_kwargs["use_audio_in_video"] = model_kwargs["use_audio_in_video"]
 
             model_inputs = transformer.prepare_inputs_for_generation(cur_input_ids, **prep_kwargs)
-            with torch.no_grad():
+            logits_ctx = select_last_lm_head_row(transformer.lm_head) if is_first_step else nullcontext()
+            with torch.no_grad(), logits_ctx:
                 out = transformer(**model_inputs, return_dict=True)
             logits = out.logits
             next_logits = logits[:, -1, :]

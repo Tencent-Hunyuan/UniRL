@@ -75,4 +75,5 @@ needs a `.gitignore` line, which keeps that decision explicit.
 | [`ucf101/`](ucf101/README.md) | UCF101 T2V SFT |
 | [`video_r1_260k/`](video_r1_260k/README.md) | Video-R1-260k video reasoning |
 | [`image_edit/`](image_edit/README.md) | Instruction-guided image-editing prompts for EditReward RL (committed jsonl) |
+| [`refl_videoalign/`](refl_videoalign/README.md) | T2V prompts for the ReFL VideoAlign experiment (committed txt) |
 | `geneval/`, `geneval2/`, `ocr/`, `pickscore/` | Committed prompt sets, no converter in-tree |

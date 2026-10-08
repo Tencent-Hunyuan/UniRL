@@ -8,7 +8,7 @@ from typing import List
 import torch
 import torch.nn.functional as F
 
-from unirl.reward.base import BaseRewardComponentSpec
+from unirl.reward.base import PromptRewardComponentSpec
 from unirl.reward.local.device import resolve_device
 from unirl.types.reward import RewardRequest
 
@@ -26,6 +26,7 @@ class CLAPRewardScorer(LocalRewardBackend):
         super().__init__(
             device=resolve_device(config.device, base_device),
             batch_size=config.batch_size,
+            prompt_source=config.prompt_source,
             model_id=config.model_id,
         )
 
@@ -67,7 +68,7 @@ class CLAPRewardScorer(LocalRewardBackend):
 
     def _compute_model_rewards(self, request: RewardRequest) -> List[float]:
         audio = request.audio
-        prompts = request.prompts
+        prompts = self.prompts(request)
         if audio is None:
             raise ValueError(
                 "CLAPRewardScorer requires audio in the reward request "
@@ -108,7 +109,7 @@ class CLAPRewardScorer(LocalRewardBackend):
 
 
 @dataclass
-class CLAPSpec(BaseRewardComponentSpec):
+class CLAPSpec(PromptRewardComponentSpec):
     """Typed config for the CLAP audio-text reward component."""
 
     batch_size: int = 8

@@ -60,7 +60,7 @@ class Sd3OutputAdapter(DitOutputAdapter):
                 "RLStableDiffusion3Pipeline._install_encode_prompt_hook ran "
                 "in every DiT worker — the subclass swap may not have taken "
                 "effect (verify custom_pipeline_args.pipeline_class in the "
-                "stage YAML)."
+                "deploy config)."
             )
 
         embeds = torch.cat([c["prompt_embeds"] for c in captures], dim=0)
@@ -93,7 +93,7 @@ class Sd3OutputAdapter(DitOutputAdapter):
 class Sd3T2iAdapter(ModelAdapter):
     """SD3.5-medium text → image (single diffusion stage, TP=1)."""
 
-    stage_yaml = "sd35_t2i_rl.yaml"
+    deploy_config = "sd35_t2i_rl.yaml"
     omni_mode = "text-to-image"
     needs_driver_tokenizer = False
 
@@ -101,6 +101,9 @@ class Sd3T2iAdapter(ModelAdapter):
         super().__init__(config, model_config, strategy=strategy, tokenize_fn=tokenize_fn)
         self.input_adapter = Sd3InputAdapter(self.modality)
         self.output_adapter = Sd3OutputAdapter(self.modality)
+
+    def packs_groups(self, sample: Sample) -> bool:
+        return True
 
     def validate_request(self, sample: Sample) -> None:
         if sample.has_image_input():

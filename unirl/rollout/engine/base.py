@@ -23,6 +23,13 @@ class BaseEngineConfig(ABC):
 class BaseRolloutEngine(Remote, ABC):
     """Rollout engine ABC: fill and return one ``Sample``; ``generate`` may be called concurrently."""
 
+    _component_name = "base"
+
+    @classmethod
+    def component_name(cls) -> str:
+        """Return the stable framework identifier for this engine type."""
+        return cls._component_name
+
     @abstractmethod
     def shutdown(self) -> None:
         """Release worker subprocesses and any other engine-owned resources."""
@@ -83,6 +90,10 @@ class BaseRolloutEngine(Remote, ABC):
             return value
 
         return map_tree(result, export_to_cpu)
+
+    def packs_groups(self, sample: Sample) -> bool:
+        """Whether a request must hold whole samples_per_prompt groups; RewardStack then aligns its micros to them."""
+        return False
 
     def abort(self, ids: Optional[List[str]] = None) -> List[Sample]:
         """Best-effort cancel of in-flight generation; return any partials. Default no-op."""

@@ -1,4 +1,4 @@
-"""Runtime patch making ``get_moe_expert_mapping`` tolerate HI3's 2-tuple ``get_expert_mapping`` shape."""
+"""Make vLLM's MoE LoRA mapping accept HI3's mapping-plus-replacements tuple."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ _INSTALLED = False
 
 
 def install() -> None:
-    """Patch ``get_moe_expert_mapping`` everywhere it's used, unwrapping HI3's 2-tuple to vllm 0.20's flat list."""
+    """Unwrap HI3's ``(expert_mapping, replacements)`` result for vLLM LoRA."""
     global _INSTALLED
     if _INSTALLED:
         return
@@ -19,7 +19,7 @@ def install() -> None:
     if original is None:
         _INSTALLED = True
         return
-    if getattr(original, "_diffrl_hi3_unwrap", False):
+    if getattr(original, "_unirl_hi3_unwrap", False):
         _INSTALLED = True
         return
 
@@ -35,7 +35,7 @@ def install() -> None:
             return result[0]
         return result
 
-    _patched._diffrl_hi3_unwrap = True  # type: ignore[attr-defined]
+    _patched._unirl_hi3_unwrap = True  # type: ignore[attr-defined]
     vllm_mu.get_moe_expert_mapping = _patched
 
     try:

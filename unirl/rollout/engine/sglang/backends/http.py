@@ -27,6 +27,18 @@ logger = logging.getLogger(__name__)
 
 _TIERED_TIMEOUT: Any = object()
 
+# 408/409/425/429 are the 4xx the server may answer differently on a retry; the rest are
+# deterministic in the payload, so retrying them just burns max_retries seconds.
+_RETRYABLE_4XX = frozenset({408, 409, 425, 429})
+
+
+class SRTHTTPError(RuntimeError):
+    """An SRT HTTP error carrying the status code the retry policy keys on."""
+
+    def __init__(self, message: str, *, code: int) -> None:
+        super().__init__(message)
+        self.code = code
+
 
 def _signal_process_tree(pid: int, sig: signal.Signals) -> None:
     """Signal ``pid``'s owned process group, or only ``pid`` before ``setsid``."""
@@ -116,6 +128,7 @@ def _import_sglang_runtime() -> Dict[str, Any]:
         ReleaseMemoryOccupationReqInput,
         ResumeMemoryOccupationReqInput,
         UpdateWeightsFromDistributedReqInput,
+        UpdateWeightsFromIPCReqInput,
         UpdateWeightsFromTensorReqInput,
     )
     from sglang.srt.server_args import ServerArgs
@@ -127,6 +140,7 @@ def _import_sglang_runtime() -> Dict[str, Any]:
         "MultiprocessingSerializer": MultiprocessingSerializer,
         "UpdateWeightsFromTensorReqInput": UpdateWeightsFromTensorReqInput,
         "UpdateWeightsFromDistributedReqInput": UpdateWeightsFromDistributedReqInput,
+        "UpdateWeightsFromIPCReqInput": UpdateWeightsFromIPCReqInput,
         "InitWeightsUpdateGroupReqInput": InitWeightsUpdateGroupReqInput,
         "DestroyWeightsUpdateGroupReqInput": DestroyWeightsUpdateGroupReqInput,
         "LoadLoRAAdapterFromTensorsReqInput": LoadLoRAAdapterFromTensorsReqInput,
@@ -147,9 +161,19 @@ def _launch_server_with_env(server_args: Any, env_overrides: Dict[str, str]) -> 
     return launch_server(server_args)
 
 
+# TODO(sglang-upgrade): Once the pinned release and deployment image use the
+# same io_struct representation, replace this compatibility serializer with
+# that version's native conversion API.
 def asdict_drop_none(req: Any) -> Dict[str, Any]:
     """The wire view of an io_struct request: its fields minus the ``None``s."""
-    return {k: v for k, v in dataclasses.asdict(req).items() if v is not None}
+    if dataclasses.is_dataclass(req) and not isinstance(req, type):
+        items = dataclasses.asdict(req).items()
+    elif hasattr(req, "__struct_fields__"):
+        # Newer SGLang builds use msgspec.Struct for io_struct payloads.
+        items = ((name, getattr(req, name)) for name in req.__struct_fields__)
+    else:
+        raise TypeError(f"asdict_drop_none expected dataclass or msgspec.Struct; got {type(req)!r}")
+    return {k: v for k, v in items if v is not None}
 
 
 @dataclass(frozen=True)
@@ -266,7 +290,6 @@ class HTTPBackend:
         )
 
         multiprocessing.set_start_method("spawn", force=True)
-        server_args = rt["ServerArgs"](**server_kwargs)
 
         tp_size = int(server_kwargs.get("tp_size", 1))
         visible_devices = _normalize_cuda_visible_devices(
@@ -275,8 +298,11 @@ class HTTPBackend:
         )
         env_overrides: Dict[str, str] = {}
         if visible_devices is not None:
-            server_args.base_gpu_id = 0
+            # Some SGLang builds freeze ServerArgs after construction.
+            server_kwargs["base_gpu_id"] = 0
             env_overrides["CUDA_VISIBLE_DEVICES"] = ",".join(visible_devices)
+
+        server_args = rt["ServerArgs"](**server_kwargs)
         process = multiprocessing.Process(
             target=_launch_server_with_env,
             args=(server_args, env_overrides),
@@ -347,6 +373,8 @@ class HTTPBackend:
             try:
                 return self._post("/generate", payload, timeout=None)
             except Exception as exc:
+                if isinstance(exc, SRTHTTPError) and 400 <= exc.code < 500 and exc.code not in _RETRYABLE_4XX:
+                    raise
                 if attempt >= max_retries - 1:
                     raise RuntimeError(f"SGLang SRT POST {url} failed after {max_retries} retries: {exc}") from exc
                 logger.debug("SGLang SRT POST %s attempt %d/%d failed: %s", url, attempt + 1, max_retries, exc)
@@ -393,11 +421,18 @@ class HTTPBackend:
                 error_body = exc.read().decode("utf-8")[:1000]
             except Exception:
                 pass
-            raise RuntimeError(f"SGLang SRT HTTP {exc.code} for {url}: {error_body}") from exc
+            raise SRTHTTPError(f"SGLang SRT HTTP {exc.code} for {url}: {error_body}", code=exc.code) from exc
 
-    def _post_struct(self, path: str, req: Any, operation: str) -> None:
+    def _post_struct(
+        self,
+        path: str,
+        req: Any,
+        operation: str,
+        *,
+        timeout: Any = _TIERED_TIMEOUT,
+    ) -> None:
         """POST a typed io_struct request (its non-``None`` fields) and check."""
-        resp = self._post(path, asdict_drop_none(req))
+        resp = self._post(path, asdict_drop_none(req), timeout=timeout)
         self._check_update_response(resp, operation)
 
     @staticmethod
@@ -544,6 +579,23 @@ class HTTPBackend:
             "destroy_weights_group",
         )
 
+    def update_from_checkpoint_engine_ipc(
+        self,
+        *,
+        zmq_handles: Dict[str, str],
+        flush_cache: bool,
+        timeout_s: float,
+    ) -> None:
+        self._post_struct(
+            "/update_weights_from_ipc",
+            self._rt["UpdateWeightsFromIPCReqInput"](
+                zmq_handles=zmq_handles,
+                flush_cache=flush_cache,
+            ),
+            "update_from_checkpoint_engine_ipc",
+            timeout=timeout_s,
+        )
+
     def set_lora(
         self,
         *,
@@ -561,7 +613,7 @@ class HTTPBackend:
             self._rt["LoadLoRAAdapterFromTensorsReqInput"](
                 lora_name=str(lora_name),
                 config_dict=dict(config_dict or {}),
-                serialized_tensors=serialized,
+                serialized_named_tensors=[serialized] * self._tp_size,
             ),
             "set_lora",
         )

@@ -13,11 +13,15 @@ from unirl.rollout.engine.base import BaseRolloutEngine
 from unirl.rollout.engine.sglang.adapters import get_adapter
 from unirl.rollout.engine.sglang.backends import HTTPBackend, NativeBackend
 from unirl.rollout.engine.sglang.config import SGLangEngineConfig, SGLangPorts
-from unirl.rollout.engine.sglang.utils import resolve_sampling
+from unirl.rollout.engine.sglang.utils import deterministic_inference_enabled, resolve_sampling
 from unirl.rollout.engine.sglang.weight_sync import WeightSync
+from unirl.rollout.harness.protocol import ContextOverflowError
 from unirl.types.sample import Sample
 
 logger = logging.getLogger(__name__)
+
+# SGLang's scheduler rejects prompts at max_req_input_len = context_len - 1 - 5 tokens.
+_SERVER_INPUT_MARGIN = 6
 
 
 class SGLangRolloutEngine(BaseRolloutEngine):
@@ -60,6 +64,7 @@ class SGLangRolloutEngine(BaseRolloutEngine):
         self._device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._is_offloaded = False
         self._weights_onloaded_for_sync = False
+        self._checkpoint_engine_sync_error: Optional[str] = None
 
         self._tp_rank = int(tp_rank)
         self._tp_size = int(tp_size)
@@ -108,6 +113,13 @@ class SGLangRolloutEngine(BaseRolloutEngine):
             self._tp_visible_devices,
         )
 
+        if deterministic_inference_enabled(engine_kwargs):
+            logger.warning(
+                "SGLangRolloutEngine: deterministic inference is on (rl_on_policy_target=%s) — every sample "
+                "is sent as its own seeded n=1 request, not one n>1 request per prompt",
+                engine_kwargs.get("rl_on_policy_target"),
+            )
+
         if ports is None:
             ports = SGLangPorts.reserve()
 
@@ -154,12 +166,22 @@ class SGLangRolloutEngine(BaseRolloutEngine):
         self._version = 0
 
     def _prepare_generation(self, sample: Sample) -> Any:
+        sampling = resolve_sampling(self.cfg, sample)
         require(
             int(sample.parts[-1].batch_size) > 0,
             "SGLangRolloutEngine.generate requires a non-empty Sample (gen batch_size > 0)",
         )
-        sampling = resolve_sampling(self.cfg, sample)
         prepared = self.adapter.build_inputs(sample, sampling=sampling)
+        budget = self.cfg.context_length
+        if budget is not None:
+            for payload, ids in zip(prepared.wire, prepared.prompt_token_ids, strict=True):
+                if len(ids) >= budget - _SERVER_INPUT_MARGIN:
+                    raise ContextOverflowError(
+                        f"prompt is {len(ids)} tokens, at the server's input limit under "
+                        f"context_length={budget}: clip tool observations or raise context_length"
+                    )
+                sampling_params = payload["sampling_params"]
+                sampling_params["max_new_tokens"] = min(sampling_params["max_new_tokens"], budget - len(ids))
         active_adapter = self._weight_sync.active_adapter
         if active_adapter:
             for payload in prepared.wire:
@@ -174,6 +196,11 @@ class SGLangRolloutEngine(BaseRolloutEngine):
         """Generate one whole Sample synchronously through the backend seam."""
         if not self._is_tp_zero:
             return None
+        if self._checkpoint_engine_sync_error is not None:
+            raise RuntimeError(
+                "SGLang rollout is unhealthy after a failed checkpoint-engine update: "
+                f"{self._checkpoint_engine_sync_error}"
+            )
         prepared = self._prepare_generation(sample)
         raw = self._backend.generate(prepared.wire)
         return self._finish_generation(sample, prepared, raw)
@@ -249,6 +276,8 @@ class SGLangRolloutEngine(BaseRolloutEngine):
     def health_check(self) -> bool:
         if not self._is_tp_zero:
             return True
+        if self._checkpoint_engine_sync_error is not None:
+            return False
         if self._is_offloaded:
             return True
         return self._backend.ping()
@@ -282,7 +311,6 @@ class SGLangRolloutEngine(BaseRolloutEngine):
             load_format=load_format,
             flush_cache=flush_cache,
         )
-        self._version += 1
 
     def init_weights_update_group(
         self,
@@ -329,7 +357,6 @@ class SGLangRolloutEngine(BaseRolloutEngine):
             group_name=group_name,
             flush_cache=flush_cache,
         )
-        self._version += 1
 
     def destroy_weights_update_group(
         self,
@@ -359,6 +386,34 @@ class SGLangRolloutEngine(BaseRolloutEngine):
         if not self._is_tp_zero or self._weight_sync is None:
             return False
         return self._weight_sync.lora_dirty
+
+    def update_weights_from_checkpoint_engine_ipc(
+        self,
+        *,
+        zmq_handles: Dict[str, str],
+        flush_cache: bool,
+        timeout_s: float,
+    ) -> None:
+        """Update weights via ZMQ + CUDA IPC (checkpoint_engine protocol)."""
+        if not self._is_tp_zero:
+            return
+        if self._checkpoint_engine_sync_error is not None:
+            raise RuntimeError(
+                "SGLang rollout cannot retry checkpoint-engine IPC after a failed update; restart the rollout backend"
+            )
+        try:
+            self._weight_sync.update_weights_from_checkpoint_engine_ipc(
+                zmq_handles=zmq_handles,
+                flush_cache=flush_cache,
+                timeout_s=timeout_s,
+            )
+        except BaseException as exc:
+            self.mark_checkpoint_engine_sync_failed(str(exc))
+            raise
+
+    def mark_checkpoint_engine_sync_failed(self, error: str) -> None:
+        """Poison this rollout after a possibly partial live-weight update."""
+        self._checkpoint_engine_sync_error = error
 
 
 __all__ = ["SGLangRolloutEngine"]

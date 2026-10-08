@@ -99,9 +99,6 @@ rollout:
     # which collapses the GRPO group size and the reward never learns.
     samples_pre_expanded: true
     image_token: "<|vision_start|><|image_pad|><|vision_end|>"
-    max_new_tokens: 512
-    temperature: 0.7
-    top_p: 0.9
     concurrency: 8
     engine_kwargs:
       # Colocate on 95GB H20: sglang server + FSDP train share the GPU. The 4x8
@@ -152,7 +149,7 @@ algorithm:
   conditions_cls:
     _target_: hydra.utils.get_class
     path: unirl.models.qwen_vl.conditions.QwenVLARConditions
-  sampling_temperature: 0.7
+  sampling_temperature: ${sampling.temperature}
 
 stack:
   _target_: unirl.train.stack.TrainStack

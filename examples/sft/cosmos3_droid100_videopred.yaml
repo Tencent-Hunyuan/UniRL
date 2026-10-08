@@ -107,6 +107,6 @@ track_builder:
 
 data_source:
   _target_: unirl.data.sft.SupervisedDataSource
-  manifest_path: ${oc.env:SFT_DATA,datasets/droid100_debug/manifest.jsonl}
+  train_manifest_path: ${oc.env:SFT_DATA,datasets/droid100_debug/manifest.jsonl}
   eval_manifest_path: ${oc.env:SFT_EVAL_DATA,datasets/droid100_debug/eval_manifest.jsonl}
   seed: 42

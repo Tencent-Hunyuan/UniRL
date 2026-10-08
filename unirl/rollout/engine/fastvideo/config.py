@@ -57,8 +57,8 @@ class FastVideoEngineConfig(BaseEngineConfig):
             self.engine_kwargs = {}
         self.model_family = str(self.model_family or "").strip().lower()
         require(
-            self.model_family in {"wan2.1", "wan21"},
-            f"FastVideoEngineConfig.model_family currently supports only 'wan2.1'; got {self.model_family!r}",
+            self.model_family in {"wan2.1", "wan21", "wan2.2", "wan22"},
+            f"FastVideoEngineConfig.model_family supports 'wan2.1' and 'wan2.2'; got {self.model_family!r}",
         )
         require(self.num_gpus >= 1, f"num_gpus must be >= 1; got {self.num_gpus!r}")
         require(

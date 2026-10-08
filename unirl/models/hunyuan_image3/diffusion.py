@@ -159,8 +159,6 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
                     image_mask_in = torch.gather(image_mask_in, dim=1, index=position_ids_in)
         # Seed CachedRoPE from rollout state to preserve sampling/replay parity.
         if fused.rope_cache is not None:
-            # Set only the wrapper flag; recursive train() would affect frozen encoders.
-            transformer.training = True
             _cr = transformer.cached_rope
             _rope = fused.rope_cache
             _cr.cos_cache = _rope[:, 0].to(device=input_ids_in.device)
@@ -220,7 +218,9 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
         transformer.num_image_tokens = n_img
         transformer.num_special_tokens = None if is_first else (int(input_ids_in.shape[1]) - n_img)
 
-        output = transformer(**model_inputs, first_step=is_first)
+        # The seeded table is hit only at input length; otherwise gather from the full table.
+        with model.rope_mode(training=fused.rope_cache is not None):
+            output = transformer(**model_inputs, first_step=is_first)
 
         if _orig_check is not None:
             transformer._check_inputs = _orig_check
@@ -713,7 +713,7 @@ class HunyuanImage3DiffusionStage(DiffusionStage[HunyuanImage3DiffusionCondition
                     prev_sample_means.append(prev_mean)
 
         log_probs_t = torch.stack(log_probs, dim=1).to(dtype=self.logprob_dtype)
-        means_t = torch.stack(prev_sample_means, dim=1).to(dtype=self.trajectory_dtype) if prev_sample_means else None
+        means_t = torch.stack(prev_sample_means, dim=1) if prev_sample_means else None
         return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
 
     def predict_noise_at_step(

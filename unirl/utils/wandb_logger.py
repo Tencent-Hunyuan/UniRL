@@ -136,6 +136,7 @@ _STEP_PHASE_SPECS = (
     ("rollout", "sleep", "sleep"),
     ("weight_sync", "sync", "weight_sync"),
     ("reward", "score_and_attach", "reward"),
+    ("reward_stack", "rollout_and_score", "rollout_score"),
     ("stack", "train_track", "train"),
 )
 
@@ -554,6 +555,8 @@ class UniRLWandBLogger:
         """Log one rollout's metrics to wandb. No-op when disabled."""
         mem_summary = self.memory_monitor.step_summary(step=rollout_id + 1) if self.memory_monitor is not None else None
         if not self.enabled or not self._initialized:
+            # Keep the checkpointed train axis independent of telemetry; log_step is a no-op here.
+            self._log_train(results)
             return
         from unirl.utils.wandb_metrics import compute_rollout_sample_metrics
 
@@ -579,9 +582,7 @@ class UniRLWandBLogger:
         self,
         results: Union["TrainStepResult", Dict[str, "TrainStepResult"]],
     ) -> None:
-        """Emit ``train/*`` points, one per optimizer update, single- and multi-track."""
-        if not self.enabled or not self._initialized:
-            return
+        """Advance the train axis and emit enabled ``train/*`` points."""
 
         if isinstance(results, dict):
             per_track_updates: Dict[str, List[Dict[str, Any]]] = {}
