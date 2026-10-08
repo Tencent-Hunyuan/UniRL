@@ -20,3 +20,11 @@ Re-check these when the checkpoint revision moves:
 - `position_ids` are also the KV-cache write indices (`cache_position`), so
   `HunyuanImage3FusedMultimodalCondition.concat` pads them with continuing indices; a `0` pad
   would overwrite the first real token's KV.
+- The checkpoint's batched chat-template path encodes only the first sample:
+  `apply_general_template(batchify=True)` passes a one-element `prompt_list` to `batch_gen_infer`
+  and `zip`s it against the per-sample kwargs, so `apply_chat_template(batch_prompt=[...])`
+  returns `cfg_factor` rows instead of `len(prompts) * cfg_factor`. `_apply_chat_template` raises
+  on that mismatch, which otherwise surfaces as a `Part.fill` count mismatch on the AR path or a
+  `fused.input_ids` shape mismatch on the diffusion path. The shipped recipes avoid it with
+  `rollout.forward_batch_size: 1`; batch > 1 needs one call per prompt plus `concat`, and the
+  batched call also pads the wrong dim before stacking (issue #520).
