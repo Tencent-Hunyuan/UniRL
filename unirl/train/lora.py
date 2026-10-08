@@ -191,11 +191,13 @@ def adapter_active(model: nn.Module, name: str, *, trainable: str = "default") -
 
 def _resolve_adapter_checkpoint(path: str) -> Tuple[str, Optional[str]]:
     """Return ``(directory, None)`` or ``(org/repo, subfolder)``; a missing local path is ``FileNotFoundError``."""
+    path = os.path.expanduser(path)
     if os.path.isdir(path):
         return path, None
-    if os.path.isabs(path) or path.startswith("."):
-        raise FileNotFoundError(f"_resolve_adapter_checkpoint: {path!r} is not an existing local adapter directory.")
     parts = path.split("/")
+    # An existing first component is a local directory prefix, not a Hub org name.
+    if os.path.isabs(path) or path.startswith(".") or (parts[0] and os.path.exists(parts[0])):
+        raise FileNotFoundError(f"_resolve_adapter_checkpoint: {path!r} is not an existing local adapter directory.")
     if len(parts) < 2 or not all(parts[:2]):
         raise ValueError(
             f"_resolve_adapter_checkpoint: {path!r} is neither a local directory nor an "
@@ -215,9 +217,6 @@ def _inject_frozen_adapter(
     """Inject a frozen LoRA adapter now, load its weights after materialization; returns its content sha256."""
     from peft import inject_adapter_in_model
     from peft.tuners.lora import LoraLayer
-
-    if name in adapter_names(model):
-        raise ValueError(f"inject_frozen_adapter: adapter {name!r} already exists on the model.")
 
     init = peft_cfg.init_lora_weights
     if isinstance(init, str) and init not in _DELTA_INITS:
@@ -345,18 +344,14 @@ def _load_frozen_adapter(model: nn.Module, *, name: str, weights: Dict[str, torc
 
 
 def _gather_by_rank(local: object) -> list:
-    """One object per rank, in rank order. Without a process group this is ``[local]``."""
-    if not (dist.is_available() and dist.is_initialized()):
-        return [local]
+    """One object per rank, in rank order."""
     gathered: list = [None] * dist.get_world_size()
     dist.all_gather_object(gathered, local)
     return gathered
 
 
 def _frozen_adapter_mismatch(name: str, path: str, results: Sequence[Tuple[Optional[str], object]]) -> str:
-    """Describe config-field and weight-sha differences against rank 0. Empty when any rank failed or all agree."""
-    if any(state is None for _, state in results):
-        return ""
+    """Config fields and weight shas that differ from rank 0; empty when every rank agrees."""
     reference_config, reference_sha = results[0][1]
     pieces = []
     for rank, (_, state) in enumerate(results):
@@ -410,7 +405,7 @@ class FrozenAdapters:
         for spec in specs:
             try:
                 if spec.name in adapter_names(model):
-                    raise ValueError(f"inject_frozen_adapter: adapter {spec.name!r} already exists on the model.")
+                    raise ValueError(f"adapter {spec.name!r} already exists on the model.")
                 model_id, subfolder = _resolve_adapter_checkpoint(spec.path)
                 peft_cfg = LoraConfig.from_pretrained(model_id, subfolder=subfolder)
                 raw = load_peft_weights(model_id, device="cpu", subfolder=subfolder)
