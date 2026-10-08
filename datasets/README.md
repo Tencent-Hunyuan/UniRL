@@ -1,18 +1,19 @@
 # Datasets
 
-Offline data preparation: one folder per dataset, each holding its converter CLI, a README
-with the source and the exact commands, and any prompt set small enough to commit.
+Offline data preparation and committed prompt sets: one folder per dataset, with converter CLIs
+and READMEs where available, and any prompt set small enough to commit.
 
 **Nothing here is imported by the framework.** These are standalone scripts you run once,
 before training, to turn a public dataset into the local jsonl/manifest layout the runtime
 readers consume. The runtime side — data sources, dataset readers, the supervised manifest
-contract — lives in [`unirl/data/`](../unirl/data) and is the only half that ships in the
+contract — lives in [`unirl/data/`](../unirl/data/README.md) and is the only half that ships in the
 package.
 
 | Kind | Home |
 |---|---|
-| One-off dataset download/conversion CLI | `datasets/<dataset>/` |
-| Runtime data source / reader / manifest contract | `unirl/data/` |
+| Offline dataset conversion / committed prompt sets | `datasets/<dataset>/` |
+| Runtime data source / reader / manifest contract | [`unirl/data/`](../unirl/data/README.md) |
+| Standalone benchmark generation / scoring | [`benchmarks/`](../benchmarks/README.md) |
 | Downloaded snapshots and generated manifests | local only — never committed |
 
 ## Install
@@ -76,4 +77,7 @@ needs a `.gitignore` line, which keeps that decision explicit.
 | [`video_r1_260k/`](video_r1_260k/README.md) | Video-R1-260k video reasoning |
 | [`image_edit/`](image_edit/README.md) | Instruction-guided image-editing prompts for EditReward RL (committed jsonl) |
 | [`refl_videoalign/`](refl_videoalign/README.md) | T2V prompts for the ReFL VideoAlign experiment (committed txt) |
-| `geneval/`, `geneval2/`, `ocr/`, `pickscore/` | Committed prompt sets, no converter in-tree |
+| [`geneval/`](geneval/) | Committed composition prompts (jsonl), no converter in-tree |
+| [`geneval2/`](geneval2/) | Committed composition prompts (jsonl), no converter in-tree |
+| [`ocr/`](ocr/README.md) | Committed text-rendering prompts (txt), no converter in-tree |
+| [`pickscore/`](pickscore/) | Committed prompts (txt); legacy [`prpocess.py`](pickscore/prpocess.py) |
