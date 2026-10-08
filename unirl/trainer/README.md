@@ -222,6 +222,103 @@ fingerprint (a changed `train.jsonl` raises) and the `(seed, shuffle)` pair. A
 legacy checkpoint without `sft_data_state.json` falls back to fast-forwarding
 `start_step` batches through the seeded order, with a warning.
 
+## Run async AR or async diffusion training
+
+The async paths disaggregate the loop: training and the rollout engine own
+**disjoint GPU slabs** (`layout: separate`, split by `train_fraction`), so
+generation overlaps scoring and training instead of time-sharing each GPU.
+Both are FIFO batch trainers driven by one shared loop
+([`async_rollout.py`](async_rollout.py)); they differ in engine, weight-sync
+handler, and what they pin down.
+
+| Path | Entrypoint | Default recipe | Engine · sync |
+| --- | --- | --- | --- |
+| Async AR | [`unirl/train_async_ar.py`](../train_async_ar.py) | [`ar/qwen3_grpo_4b_base_dapo_sglang_async`](../../examples/ar/qwen3_grpo_4b_base_dapo_sglang_async.yaml) | SGLang · `NCCLWeightSync` (full dense) |
+| Async diffusion | [`unirl/train_async_diffusion.py`](../train_async_diffusion.py) | [`diffusion/bagel/bagel_vllmomni_async`](../../examples/diffusion/bagel/bagel_vllmomni_async.yaml) | vLLM-Omni · `RemoteLoraWeightSync` |
+
+```bash
+# Compose-check (no training). DATA_PATH is required; EVAL_DATA_PATH defaults to DATA_PATH.
+DATA_PATH=data/dapo_math/train.jsonl \
+  python -m unirl.train_async_ar --config-name=ar/qwen3_grpo_4b_base_dapo_sglang_async --cfg job --resolve
+
+# Compose-check the async diffusion default (vLLM-Omni environment; BAGEL_PATH names the checkpoint).
+BAGEL_PATH=/path/to/BAGEL-7B-MoT \
+  python -m unirl.train_async_diffusion --config-name=diffusion/bagel/bagel_vllmomni_async --cfg job --resolve
+```
+
+Launcher forms and the engine environments are in
+[`examples/README.md · Running a recipe`](../../examples/README.md#running-a-recipe)
+and [INSTALL.md](../../INSTALL.md).
+
+### The shared lifecycle
+
+Three versions drive everything (logged as `async/*` metrics):
+
+- **train version** — the optimizer step count; one unit is one optimizer update.
+- **published version** — the train version whose weights the engine serves.
+- **output version** — stamped on every generated `Part`: the published version
+  it was generated under.
+
+Admission is bounded: `max_inflight` batch-equivalents globally,
+`per_worker_inflight` prompt trees per rollout worker, and every launch is
+clipped to the freshness horizon and to the next hard boundary. A training
+batch may mix carry from an older published version up to the lag budget — at
+most `(weight_sync_interval - 1) * num_updates_per_batch` optimizer updates,
+the formula from [How it works](#how-it-works). Async AR may raise the
+batch-side budget with `buffer_max_staleness` (in batches; must stay
+`>= weight_sync_interval - 1`); async diffusion fixes it at
+`weight_sync_interval - 1`.
+
+Publication fires once `weight_sync_interval` batches are trained, or earlier
+at an eval/save boundary:
+
+1. **Quiesce.** The manager pauses dispatch and drains the engine; suspended
+   and undispatched prompts are kept or discarded **atomically per prompt
+   root** by the lag filter.
+2. **Batch-align the carry.** Partially generated batches finish in full — a
+   publication never splits one training batch across behavior-policy
+   versions — and a carried prefix tops the ready buffer up to a whole batch.
+3. **Publish.** Weights cross to the engine (which requires no in-flight work
+   and a monotone version), carried prompts are resubmitted, and
+   `published_version` becomes the `train_version`.
+
+**Hard boundaries** — every `eval_interval`, every `save_interval`, and the
+final rollout — require an *empty* manager: no carry crosses them, and the
+final one raises if anything is still in flight. Async AR refills the engine
+immediately after collecting a batch, so the next generation overlaps scoring
+and training. Evaluation behavior at boundaries is per trainer in
+[Evaluation cadence](#evaluation-cadence); the residency policy (async keeps
+the rollout slab resident, and async diffusion rejects
+`reward_resident=false` / `rollout_resident=false`) is in
+[How it works](#how-it-works).
+
+### Variant constraints (fail fast at startup)
+
+| Constraint | Async AR | Async diffusion |
+| --- | --- | --- |
+| Algorithm | must require advantages — teacher-anchored or supervised objectives are rejected; use the synchronous `ARTrainer` | no extra check beyond the sync diffusion path |
+| `reward:` block | required (reward-free AR training is sync-only) | scored at reap time, outside `_reward_phase()` |
+| `sync:` block | required, and must be `NCCLWeightSync` — full dense weights cross the slab | required (the BAGEL default pushes LoRA via `RemoteLoraWeightSync`) |
+| Engine | dedicated engine (vLLM/SGLang) on the rollout slab; the trainside direct-sampling engine cannot live cross-slab | dedicated vLLM-Omni rollout slab |
+| Geometry / inflight | `train_fraction * num_devices` integral; `batch_size * samples_per_prompt` divisible by the train-slab size | all of the AR geometry rules, plus `layout: separate` and `max_inflight = 1` are enforced |
+
+`max_inflight = 1` on async diffusion is structural, not a tuning knob: queued
+generations could block reap-time cross-slab transfer, and dynamically
+completed prompts must retain one rollout id and one SDE schedule per training
+batch.
+
+### Resume
+
+`load_dir` restores the backend checkpoint; the restored **optimizer step
+count becomes the train version**; the deterministic input stream fast-forwards
+`start_rollout` batches; and a forced, empty-manager publication pushes the
+restored weights into the freshly started engine before the first batch
+(startup eval, when enabled, runs after that sync). Checkpoint formats and
+budget semantics are the generic ones in [Checkpointing](#checkpointing).
+Engine internals are owned by [`rollout/engine`](../rollout/engine/README.md)
+and cross-slab weight sync by
+[`distributed/weight_sync`](../distributed/weight_sync/README.md).
+
 ## Checkpointing
 
 Available for the single-backend trainers (including diffusion, AR, unified-model,
