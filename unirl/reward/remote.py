@@ -9,6 +9,7 @@ import json
 import logging
 import math
 import os
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -185,8 +186,11 @@ class RemoteRewardBackend(RewardBackend):
 
         self._remote_rewards_validated = False
 
-        self._session = http_requests.Session()
-        self._session.trust_env = False
+        # requests.Session is not thread-safe. The driver client scores several
+        # groups at once, so each calling thread keeps its own session.
+        self._sessions: List[http_requests.Session] = []
+        self._sessions_guard = threading.Lock()
+        self._thread_session = threading.local()
 
     def compute_rewards(self, request: RewardRequest) -> RewardResponse:
         """Convert a UniRL request, call the remote service, and"""
@@ -213,7 +217,7 @@ class RemoteRewardBackend(RewardBackend):
     def is_available(self) -> bool:
         """Ping ``/health``; ``True`` iff the server is reachable."""
         try:
-            resp = self._session.get(
+            resp = self._http().get(
                 f"{self.base_url}/health",
                 timeout=5.0,
             )
@@ -258,9 +262,26 @@ class RemoteRewardBackend(RewardBackend):
         )
         self._remote_rewards_validated = True
 
+    def _http(self) -> http_requests.Session:
+        """Return this thread's session, opening one on first use."""
+        session = getattr(self._thread_session, "session", None)
+        if session is not None:
+            return session
+        session = http_requests.Session()
+        session.trust_env = False
+        with self._sessions_guard:
+            self._sessions.append(session)
+        self._thread_session.session = session
+        return session
+
     def dispose(self) -> None:
-        """Close the HTTP session."""
-        self._session.close()
+        """Close every per-thread HTTP session."""
+        with self._sessions_guard:
+            sessions = list(self._sessions)
+            self._sessions.clear()
+        for session in sessions:
+            session.close()
+        self._thread_session.session = None
 
     def _build_score_payload(self, request: RewardRequest) -> Dict[str, Any]:
         """Convert a UniRL ``RewardRequest`` into the RewardService"""
@@ -444,7 +465,7 @@ class RemoteRewardBackend(RewardBackend):
 
         for attempt in range(self.max_retries):
             try:
-                resp = self._session.post(url, json=payload, timeout=self.timeout)
+                resp = self._http().post(url, json=payload, timeout=self.timeout)
                 resp.raise_for_status()
                 return resp.json()
             except http_requests.exceptions.Timeout as e:

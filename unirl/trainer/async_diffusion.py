@@ -39,6 +39,20 @@ class AsyncDiffusionTrainer(AsyncRolloutTrainerMixin, DiffusionTrainer):
         **diffusion_kwargs: Any,
     ) -> None:
         self._reward_client_on_driver = bool(reward_client_on_driver)
+        self._async_reward = bool(async_reward)
+        if self._async_reward and not self._reward_client_on_driver:
+            raise ValueError(
+                "async_reward=true requires reward_client_on_driver=true: scoring is chained off the "
+                "rollout lane on the driver. A GPU reward worker is not on that path, and with "
+                "reward_fraction=0 it would be placed on the train slab and contend with training."
+            )
+        reward_fraction = float(diffusion_kwargs.get("reward_fraction", 0.0))
+        if self._reward_client_on_driver and reward_fraction > 0.0:
+            raise ValueError(
+                "reward_client_on_driver=true keeps the HTTP client on the driver and allocates no "
+                f"reward GPU; reward_fraction must be 0, got {reward_fraction}. Drop reward_fraction "
+                "or the flag."
+            )
         layout = diffusion_kwargs.setdefault("layout", "separate")
         if layout != "separate":
             raise ValueError(f"AsyncDiffusionTrainer requires layout='separate', got {layout!r}.")
@@ -88,12 +102,6 @@ class AsyncDiffusionTrainer(AsyncRolloutTrainerMixin, DiffusionTrainer):
             )
 
         self._max_inflight = max_inflight
-        self._async_reward = bool(async_reward)
-        if self._async_reward and not self._reward_client_on_driver:
-            raise ValueError(
-                "async_reward=true currently requires reward_client_on_driver=true "
-                "(only the driver reward client serves launch_nowait)"
-            )
         self._require_single_generation = True
         self._per_worker_inflight = per_worker_inflight
         self._max_inflight_prompts = self._max_inflight * self.batch_size
@@ -135,11 +143,13 @@ class AsyncDiffusionTrainer(AsyncRolloutTrainerMixin, DiffusionTrainer):
             mean_reward = float(part.rewards.to(torch.float32).mean().item())
         part = part.compute_advantages(normalize=True, use_global_std=self._adv_use_global_std)
         sample = sample.replace_frontier(part)
+        train_started = time.perf_counter()
         result = self.stack.train_track(
             sample.parts[-1],
             training_progress=float(training_progress),
             rollout_id=rollout_id,
         )
+        train_s = time.perf_counter() - train_started
         self._train_version += result.optimizer_updates
         self._batches_since_sync += 1
         if extra_metrics is not None:
@@ -156,6 +166,7 @@ class AsyncDiffusionTrainer(AsyncRolloutTrainerMixin, DiffusionTrainer):
             result,
             sample,
             step_time_s=time.perf_counter() - t0,
+            phase_times=self._async_perf_phases(train_s=train_s),
             extra_metrics=extra_metrics,
         )
         self._reset_transport_buffers()

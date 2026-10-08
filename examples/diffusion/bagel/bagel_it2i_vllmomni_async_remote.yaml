@@ -29,7 +29,7 @@
 #     only), so every GRPO sibling is its own worker request.
 #
 # Deploy:
-#   reward node: cd /path/to/unirl-reward-service && \
+#   reward node: cd unirl-reward-service && \
 #     python -m reward_service --config configs/editreward_service.yaml
 #   train node:  export REWARD_SERVICE_URL=http://<reward_node_ip>:8080
 #                export BAGEL_PATH=/path/to/BAGEL-7B-MoT
@@ -67,20 +67,22 @@ reward_fraction: 0.0           # EditReward is external; allocate no local rewar
 max_inflight: 1                # protects cross-slab transfer and one SDE schedule per batch
 per_worker_inflight: 1         # concurrent prompt units per rollout-engine worker
 weight_sync_interval: 1        # publish the freshly-trained adapter every trained batch
-buffer_max_staleness: 2        # reject rollout groups more than two weight versions old
+buffer_max_staleness: 2        # reject groups more than two weight versions old
+# This bound is the off-policy limit. old_logp_source: replay makes the first
+# update's ratio 1 for every group, including stale ones.
 
 # Score each completed prompt group immediately through the driver's HTTP client.
 async_reward: true
 reward_client_on_driver: true
 
-# Separate train/rollout slabs and the external reward service remain resident.
-enable_fsdp_offload: false
-offload_train_during_reward: false
-rollout_sleep_after_generate: false
+# All three roles stay resident. Async scoring runs outside the phase planner,
+# and the rollout slab is never idle.
+train_resident: true
+rollout_resident: true
+reward_resident: true
 
-# NB: no `task_config.task: it2i` here. On the trainside recipe that pin is what
-# makes a source-image-less dataset fail loudly; on this path the modality does it —
-# BagelIt2iAdapter.validate_request rejects a Sample without image conditioning.
+# No control pin: BagelIt2iAdapter.validate_request rejects a Sample that has no
+# source image, which is what a source-image-less dataset fails on.
 
 logging:
   report_to_wandb: true

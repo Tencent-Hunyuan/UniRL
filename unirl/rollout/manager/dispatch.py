@@ -88,9 +88,12 @@ class RolloutPool:
             self._completed.clear()
             return completed
 
-    def drain(self) -> List[_PendingUnit]:
+    def drain(self, *, wait_for_released: bool = True) -> List[_PendingUnit]:
+        """Wait until generation is idle. Released reward calls are included unless asked not to."""
         with self._condition:
-            while (self._running or self._released or any(self._reserved)) and self._failure is None:
+            while (
+                self._running or any(self._reserved) or (self._released if wait_for_released else ())
+            ) and self._failure is None:
                 self._condition.wait()
             self._raise_if_failed()
             completed = list(self._completed)
@@ -115,6 +118,18 @@ class RolloutPool:
             completed = list(self._completed)
             self._completed.clear()
             return completed
+
+    def has_engine_work(self) -> bool:
+        """True while a launcher still holds queued, running, or reserved generation."""
+        with self._condition:
+            self._raise_if_failed()
+            return bool(self._queue or self._running or any(self._reserved))
+
+    def released_count(self) -> int:
+        """Pending calls whose generation finished and whose reward is still running."""
+        with self._condition:
+            self._raise_if_failed()
+            return len(self._released)
 
     @property
     def live(self) -> bool:
