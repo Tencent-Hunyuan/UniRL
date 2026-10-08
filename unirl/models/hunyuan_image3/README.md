@@ -21,8 +21,9 @@ Re-check these when the checkpoint revision moves:
   `HunyuanImage3FusedMultimodalCondition.concat` pads them with continuing indices; a `0` pad
   would overwrite the first real token's KV.
 - Upstream sizes RoPE by the wrapper's `training` flag: `True` builds a table as long as the
-  input, `False` builds `max_position_embeddings` and gathers it by `position_ids`. Teacher-forced
-  `replay` passes no `position_ids` and needs `True`; decode gathers at `real_pos + step` and needs
-  `False`. `from_pretrained` leaves the flag `False` and `from_meta_config` leaves it `True`, so
-  `ar.py` sets it per call and restores it, touching only the flag (`.train()` would recurse
-  into the frozen VAE / ViT).
+  input, `False` builds `max_position_embeddings` and gathers it by `position_ids`. Its resting
+  value depends on the builder (`from_config` leaves `False`, `from_meta_config` `True`), so every
+  wrapper forward runs inside `HunyuanImage3Bundle.rope_mode`: `replay` pins `True` (no
+  `position_ids`), AR decode `False` (gathers at `real_pos + step`), and diffusion `True` only
+  when it seeds `cached_rope` at input length. Only the attribute is set; `.train()` / `.eval()`
+  would also flip the backend-owned `transformer.model` and the frozen VAE / ViT.

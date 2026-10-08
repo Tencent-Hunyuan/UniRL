@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from contextlib import contextmanager
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -57,6 +58,16 @@ class HunyuanImage3Bundle(Bundle):
     def trainable_module(self) -> nn.Module:
         """The sharded trainable subtree the backend wraps: the bare decoder"""
         return self.transformer.model
+
+    @contextmanager
+    def rope_mode(self, *, training: bool) -> Iterator[None]:
+        """Pin the wrapper ``training`` flag that sizes upstream RoPE around one forward (README ``## Gotchas``)."""
+        previous = self.transformer.training
+        self.transformer.training = training
+        try:
+            yield
+        finally:
+            self.transformer.training = previous
 
     def prepare_for_expert_parallel(self) -> None:
         """Make the decoder expert-parallel-ready (backend hook; called only when"""
