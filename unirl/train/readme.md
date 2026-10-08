@@ -155,13 +155,14 @@ in `backend/base.py`; a multi-update-capable algorithm sets
   uninitialized adapter. Teachers must be plain LoRA deltas: unconverted base-rewriting
   inits (pissa, olora, ...), `modules_to_save`, `layer_replication`,
   `trainable_token_indices`, DoRA, and `bias != "none"` are rejected at startup.
-- **Frozen teacher reads must succeed on every rank before injection** — every rank
-  reads all teacher configs and weights, then gathers read errors before FSDP/VeOmni
-  wrapping or weight-loading collectives. A failed read raises the same error on every
-  rank, naming the failed ranks, adapters, and paths. Injection reuses the in-memory
-  configs and CPU weights; do not re-read checkpoints after this agreement. Injection
-  errors are also gathered, and ranks reject different configs or weight content before
-  wrapping. All ranks must call with the same teacher specs; process loss is not handled.
+- **A frozen teacher must be readable and identical on every rank before wrap** — every rank
+  reads each teacher's config and CPU weights, then one gather compares the `(name, path)`
+  list and any read errors. A missing local directory, an unreadable checkpoint, or an
+  injection/validation failure raises the same error on every rank before FSDP/VeOmni
+  wrapping, naming the ranks, adapters, and paths. Different configs or weight bytes are
+  rejected the same way, naming the ranks and the config fields or weight hashes that differ.
+  Every rank must pass the same teacher list. A process that never enters this call, or that
+  dies during the read, is not covered.
 - **Adapter checkpoints exclude frozen teachers, and resume requires the same teachers** —
   teachers reload from their paths and the checkpoint pins each by a content sha256, so a
   different teacher set or different weights raises on `load`. A checkpoint trained without
