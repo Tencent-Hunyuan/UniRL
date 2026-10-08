@@ -33,7 +33,7 @@ def _run_iteration(samples: int) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=_HELP, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--samples", type=int, default=_DEFAULT_SAMPLES)
+    parser.add_argument("--samples", type=int, default=_DEFAULT_SAMPLES, help="dummy samples per iteration")
     parser.add_argument("--warmup-iterations", type=int, default=_DEFAULT_WARMUP_ITERATIONS)
     parser.add_argument("--measured-iterations", type=int, default=_DEFAULT_MEASURED_ITERATIONS)
     parser.add_argument("--out", type=Path, default=_DEFAULT_OUT)
@@ -57,7 +57,7 @@ def main() -> None:
             started_at=started_at,
             environment=Environment(python=platform.python_version(), torch="unavailable", device="cpu", world_size=1),
             workload=Workload(
-                samples=args.samples,
+                samples=args.samples * args.measured_iterations,
                 warmup_iterations=args.warmup_iterations,
                 measured_iterations=args.measured_iterations,
             ),

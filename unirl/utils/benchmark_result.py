@@ -44,7 +44,7 @@ class Environment:
 
 @dataclass(frozen=True)
 class Workload:
-    """Describe sample and iteration counts for a benchmark run."""
+    """Describe total measured samples and warmup/measured iteration counts."""
 
     samples: int
     warmup_iterations: int
@@ -75,7 +75,7 @@ class Metrics:
     def to_dict(self, samples: int) -> dict[str, Any]:
         _validate_number(self.wall_clock_s, "wall_clock_s", strictly_positive=True)
         if self.peak_memory_bytes is not None:
-            _validate_number(self.peak_memory_bytes, "peak_memory_bytes")
+            _validate_number(self.peak_memory_bytes, "peak_memory_bytes", integer=True)
         if self.phases_s is not None:
             for name, value in self.phases_s.items():
                 _validate_number(value, f"phases_s[{name!r}]")
@@ -83,6 +83,7 @@ class Metrics:
             "wall_clock_s": self.wall_clock_s,
             "samples_per_second": samples / self.wall_clock_s,
         }
+        _validate_number(result["samples_per_second"], "samples_per_second")
         if self.peak_memory_bytes is not None:
             result["peak_memory_bytes"] = self.peak_memory_bytes
         if self.phases_s is not None:

@@ -37,6 +37,16 @@ python benchmarks/speed_benchmarks/benchmark_smoke.py
 It writes one schema-v1 JSON object to `outputs/benchmark/`; this output is a contract
 check and is not a UniRL performance measurement. Use `--samples`,
 `--warmup-iterations`, `--measured-iterations`, and `--out` to override the defaults.
+`--samples` counts dummy samples per iteration (default: 128); warmup defaults to 2
+iterations and measurement to 10. `workload.samples` records the total measured
+samples, excluding warmup; the writer derives `samples_per_second` as that count
+divided by `wall_clock_s`, which must be finite and strictly positive.
+Unavailable memory and phases are omitted; `environment.torch` is `"unavailable"`
+because this command does not inspect or import torch.
+Rollout, reward, and train producers can use `BenchmarkResult` and `write_result`
+from `unirl.utils.benchmark_result` with total measured samples and their measured
+window duration; runtime adapters belong beside their owning `unirl` components,
+and offline parsers belong in `benchmarks/speed_benchmarks/`.
 See [#414](https://github.com/Tencent-Hunyuan/UniRL/issues/414) and [#25](https://github.com/Tencent-Hunyuan/UniRL/issues/25).
 
 ## Fair-comparison protocol
