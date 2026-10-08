@@ -22,6 +22,8 @@ class _PendingUnit:
     launcher: int
     task: "Sample"
     pending: Any
+    # None when the call frees its lane only at ready(); resolved once at launch.
+    capacity_released: Optional[Callable[[], bool]] = None
 
 
 class RolloutPool:
@@ -101,11 +103,13 @@ class RolloutPool:
             return completed
 
     def run_to_completion(self, tasks: List["Sample"]) -> List[_PendingUnit]:
-        """Run an isolated task prefix to completion while the pool is otherwise idle."""
+        """Run tasks to completion. Released rewards may still be scoring; they are joined too."""
         with self._condition:
             self._raise_if_unavailable()
-            if self._queue or self._running or self._released or self._completed or any(self._reserved):
-                raise RuntimeError("run_to_completion requires an idle RolloutPool")
+            # Released rewards already left the engine. finish() may run while
+            # they are still scoring; waiting below joins them with the new tasks.
+            if self._queue or self._running or any(self._reserved):
+                raise RuntimeError("run_to_completion requires no queued or in-flight generation")
             for task in tasks:
                 self._queue.append((self._next_sequence, task))
                 self._next_sequence += 1
@@ -125,11 +129,12 @@ class RolloutPool:
             self._raise_if_failed()
             return bool(self._queue or self._running or any(self._reserved))
 
-    def released_count(self) -> int:
-        """Pending calls whose generation finished and whose reward is still running."""
+    def progress_counts(self) -> tuple[int, int, int]:
+        """Engine work, released rewards, and completed calls, under one lock."""
         with self._condition:
             self._raise_if_failed()
-            return len(self._released)
+            engine = len(self._queue) + len(self._running) + sum(self._reserved)
+            return engine, len(self._released), len(self._completed)
 
     @property
     def live(self) -> bool:
@@ -194,11 +199,10 @@ class RolloutPool:
                 released = []
                 ready = []
                 for unit in running:
-                    capacity_probe = getattr(unit.pending, "is_capacity_released", None)
-                    if capacity_probe is None:
+                    if unit.capacity_released is None:
                         if unit.pending.ready():
                             ready.append(unit)
-                    elif capacity_probe():
+                    elif unit.capacity_released():
                         if unit.pending.ready():
                             ready.append(unit)
                         else:
@@ -258,7 +262,15 @@ class RolloutPool:
             except BaseException as exc:
                 failure = exc
                 break
-            launched.append(_PendingUnit(sequence, index, task, pending))
+            launched.append(
+                _PendingUnit(
+                    sequence,
+                    index,
+                    task,
+                    pending,
+                    getattr(pending, "is_capacity_released", None),
+                )
+            )
 
         with self._condition:
             for unit in launched:

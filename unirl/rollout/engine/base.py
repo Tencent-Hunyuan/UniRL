@@ -76,7 +76,7 @@ class BaseRolloutEngine(Remote, ABC):
         """Synchronously fill and return one request ``Sample``; each concrete contract owns its dispatch mode."""
 
     def generate_on_slot(self, sample: Sample, *, export_outputs_to_cpu: bool = False) -> Sample:
-        """Generate on one engine slot and optionally export outputs to CPU."""
+        """Generate on one slot. ``export_outputs_to_cpu`` moves the latent segment off the GPU with the lane."""
         result = self.generate(sample)
         if not export_outputs_to_cpu:
             return result

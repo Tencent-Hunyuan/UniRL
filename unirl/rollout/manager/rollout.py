@@ -144,10 +144,11 @@ class RolloutManager:
     def published_version(self) -> int:
         return self._published_version
 
-    def released_count(self) -> int:
-        """Groups whose generation finished and whose reward has not joined the buffer."""
+    def progress_counts(self) -> tuple[int, int, int]:
+        """Engine work, released rewards, and ready groups, read together."""
         self._raise_if_failed()
-        return self._pool.released_count()
+        engine, released, pool_completed = self._pool.progress_counts()
+        return engine, released, pool_completed + self._complete.group_count
 
     @property
     def counts(self) -> tuple[int, int]:

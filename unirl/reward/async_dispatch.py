@@ -51,21 +51,15 @@ class _DriverFutureCall:
         return self._future.result()
 
 
-def _materialize_except_conditions(sample: Any) -> Any:
-    """Fetch TensorRefs for scoring, leaving trajectory ``conditions`` as transport refs."""
+def _materialize_primitives(sample: Any) -> Any:
+    """Fetch primitive TensorRefs for the scorer; trajectory segment and conditions stay refs."""
     from unirl.distributed.tensor.ref import TensorRef, map_tree
     from unirl.types.sample import Part
 
     def leaf(value: Any) -> Any:
         if isinstance(value, Part):
-            rebuilt = {
-                field.name: (
-                    getattr(value, field.name)
-                    if field.name == "conditions"
-                    else map_tree(getattr(value, field.name), leaf)
-                )
-                for field in dc_fields(value)
-            }
+            rebuilt = {field.name: getattr(value, field.name) for field in dc_fields(value)}
+            rebuilt["primitives"] = map_tree(value.primitives, leaf)
             return type(value)(**rebuilt)
         if isinstance(value, TensorRef):
             return value.materialize(backend=None)
@@ -97,7 +91,7 @@ class DriverRewardClient:
         # original so its trajectory TensorRefs stay on the rollout transport.
         from unirl.types.sample import _part_with_field
 
-        scored = self._service.score_and_attach(_materialize_except_conditions(sample))
+        scored = self._service.score_and_attach(_materialize_primitives(sample))
         frontier = _part_with_field(sample.parts[-1], "rewards", scored.parts[-1].rewards)
         frontier = _part_with_field(frontier, "component_rewards", scored.parts[-1].component_rewards)
         return sample.with_parts([*sample.parts[:-1], frontier])

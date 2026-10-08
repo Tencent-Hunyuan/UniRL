@@ -582,10 +582,17 @@ class DiffusionTrainer(BaseTrainer):
         self.backend = remote_hydra(backend_cfg, bundle=self.bundle)
         if reward_cfg is not None:
             if self._reward_client_on_driver:
-                # The remote scorer model lives outside this pool. Keep only its
-                # thin HTTP client on the driver, with no GPU worker or slab.
+                # Reject a local scorer before instantiate(); its constructor loads weights.
                 from unirl.reward.async_dispatch import DriverRewardClient
 
+                backend_cfg = reward_cfg.get("backend")
+                backend_target = None if backend_cfg is None else backend_cfg.get("_target_")
+                if backend_target != "unirl.reward.remote.RemoteRewardBackend":
+                    raise TypeError(
+                        "reward_client_on_driver requires reward.backend._target_ = "
+                        "unirl.reward.remote.RemoteRewardBackend so the scorer is not constructed "
+                        f"on the driver; got {backend_target!r}."
+                    )
                 self.reward = DriverRewardClient(instantiate(reward_cfg))
             else:
                 self.reward = remote_hydra(reward_cfg)
