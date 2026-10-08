@@ -138,8 +138,9 @@ related recipes sort together.
 | `size` | after task | `4b`, `14b` | only one size in the family |
 | `algorithm` | middle | `dancegrpo`, `mixgrpo`, `nft`, `flowdppo`, `grpo`, `drpo` | plain FlowGRPO (diffusion default); GRPO (AR default) |
 | `engine` | after algorithm | `trainside`, `sglang`, `vllmomni` | — |
+| `backend` | after algorithm or engine | `veomni` (the VeOmni train backend) | `FSDPBackend` (the implicit default) |
 | `adapter` | after engine | `full`, `lora` | unambiguous from the rest |
-| `topology` | last | placement `colocate`/`separate`; sync `nccl`/`tensor`/`ipc`; engine mode `rollout`/`replay` | single-slab colocate default |
+| `topology` | last | placement `colocate`/`separate`; sync `nccl`/`tensor`/`ipc`; engine mode `rollout`/`replay`; sharding `hsdp`; parallel degree `sp`/`ep`; cluster `<N>x<G>` | single-slab colocate default |
 
 Worked examples:
 
@@ -152,6 +153,9 @@ Worked examples:
 | `hunyuan_video10_t2v_trainside` | HunyuanVideo-1.0 · text-to-video · trainside engine |
 | `hunyuan_video15_t2v_dancegrpo_trainside` | HunyuanVideo-1.5 · text-to-video · DanceGRPO · trainside engine |
 | `sd3_vllmomni_full_nccl_separate` | SD3 · vLLM-Omni engine · full-weight · NCCL sync · separate slabs |
+| `sd3_trainside_veomni` | SD3 · trainside engine · VeOmni train backend |
+| `qwen3_moe_grpo_30b_a3b_veomni_ep_sglang` | Qwen3-30B-A3B MoE · GRPO · VeOmni backend · expert parallel · SGLang |
+| `minimax_h3_t2va_trainside_hsdp_2x8_validation` | MiniMax-H3 · text-to-video · trainside engine · HSDP · 2 nodes × 8 GPUs · validation recipe |
 | `qwen_vl_grpo_geo3k_mc_4x8` | Qwen-VL · GRPO · geo3k multiple-choice · 4 nodes × 8 GPUs |
 
 Domain-specific trailing qualifiers extend the chain:

@@ -131,7 +131,7 @@ sync. A manifest feeds `SFTTrainer`, which reuses the RL consumer side
 workers, and the algorithm is anchor-free cross-entropy. Entrypoint:
 [`unirl/train_sft.py`](../train_sft.py); recipes under
 [`examples/sft/`](../../examples/README.md); builder contracts in
-[`train/sft/README.md`](sft/README.md).
+[`train/sft/README.md`](../train/sft/README.md).
 
 ### 1. Prepare a local manifest
 
@@ -321,7 +321,7 @@ and cross-slab weight sync by
 
 ## Checkpointing
 
-Available for the single-backend trainers (including diffusion, AR, unified-model,
+Available for the single-backend trainers (including diffusion, AR, SFT, unified-model,
 ReFL, async, and agentic training) and for every trained side of `PETrainer`. A
 single-backend checkpoint bundles model state (`save_mode=auto`: LoRA-only when
 LoRA is active, otherwise full; `save_mode=full`: the whole model state;
