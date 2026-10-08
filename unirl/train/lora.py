@@ -148,7 +148,7 @@ def _activate(model: nn.Module, adapter_name: str) -> None:
 
 def _adapter_banks(layer: nn.Module) -> Iterator[Any]:
     for key in layer.adapter_layer_names:
-        yield getattr(layer, key, {})
+        yield getattr(layer, key)
 
 
 def _set_adapter_requires_grad(model: nn.Module, name: str, requires_grad: bool) -> None:
@@ -175,21 +175,25 @@ def adapter_names(model: nn.Module) -> set:
 
 
 @contextmanager
-def adapter_active(model: nn.Module, name: str, *, trainable: str = "default") -> Iterator[None]:
+def adapter_active(model: nn.Module, name: str) -> Iterator[None]:
     """Route a frozen teacher and restore the caller's adapter state; see train/readme.md Gotchas."""
     from peft.tuners.lora import LoraLayer
 
-    if name == trainable:
+    if name == "default":
         raise ValueError(f"adapter_active: {name!r} is the trainable adapter; only frozen adapters can be routed.")
     if name not in adapter_names(model):
         raise ValueError(f"adapter_active: frozen adapter {name!r} is not present on the model.")
+    if any(
+        _adapter_of_lora_key(param_name) == name and param.requires_grad
+        for param_name, param in model.named_parameters()
+    ):
+        raise ValueError(f"adapter_active: frozen adapter {name!r} has trainable parameters.")
     active = [(layer, list(layer.active_adapters)) for layer in model.modules() if isinstance(layer, LoraLayer)]
     grad_flags = [(param, param.requires_grad) for param in model.parameters()]
     try:
         _activate(model, name)
         for param, requires_grad in grad_flags:
             param.requires_grad = requires_grad
-        _set_adapter_requires_grad(model, name, False)
         yield
     finally:
         try:
