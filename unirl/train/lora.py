@@ -190,11 +190,7 @@ def adapter_active(model: nn.Module, name: str, *, trainable: str = "default") -
 
 
 def _resolve_adapter_checkpoint(path: str) -> Tuple[str, Optional[str]]:
-    """Split a peft adapter location into ``(model_id, subfolder)``.
-
-    An existing local directory returns ``(path, None)``. ``org/repo[/subfolder]`` is a Hub id.
-    An absolute or dot-relative path that is not a directory is a missing local mount, not a Hub id.
-    """
+    """Return ``(directory, None)`` or ``(org/repo, subfolder)``; a missing local path is ``FileNotFoundError``."""
     if os.path.isdir(path):
         return path, None
     if os.path.isabs(path) or path.startswith("."):
@@ -348,31 +344,6 @@ def _load_frozen_adapter(model: nn.Module, *, name: str, weights: Dict[str, torc
         logger.info("_load_frozen_adapter(%r): %d tensor(s) from %s", name, len(weights), path)
 
 
-def _discard_frozen_adapter(model: nn.Module, name: str) -> None:
-    """Drop an adapter this inject call added, including its deferred load, so the module can be retried."""
-    from peft.tuners.lora import LoraLayer
-
-    removed = False
-    for module in model.modules():
-        if isinstance(module, LoraLayer) and name in getattr(module, "lora_A", {}):
-            module.delete_adapter(name)
-            removed = True
-    configs = getattr(model, "peft_config", None)
-    if isinstance(configs, dict):
-        configs.pop(name, None)
-    ops = getattr(model, "_deferred_ops", None)
-    if ops:
-        model._deferred_ops = [
-            op
-            for op in ops
-            if not (isinstance(op, partial) and op.func is _load_frozen_adapter and op.keywords.get("name") == name)
-        ]
-    # peft's delete_adapter selects a new active adapter and can flip requires_grad.
-    if removed and "default" in adapter_names(model):
-        _activate(model, "default")
-        _set_adapter_requires_grad(model, "default", True)
-
-
 def _gather_by_rank(local: object) -> list:
     """One object per rank, in rank order. Without a process group this is ``[local]``."""
     if not (dist.is_available() and dist.is_initialized()):
@@ -422,46 +393,42 @@ class FrozenAdapters:
 
     @classmethod
     def inject(cls, model: nn.Module, specs: Any) -> FrozenAdapters:
-        """Inject every ``lora_cfg.frozen_adapters`` entry: structure now, weights after materialization.
-
-        Each rank reads every teacher once. Injection and the deferred load reuse those in-memory configs
-        and CPU weights; a later run, including resume, reads the paths again. Read errors and the
-        ``(name, path)`` list are gathered before any rank mutates the model. On failure, adapters this
-        call added are removed so the same module can be retried.
-        """
-        specs = normalize_frozen_adapters(specs)
-        # An empty list still has to reach the gather when other ranks may have teachers.
-        if not specs and not (dist.is_available() and dist.is_initialized()):
-            return cls()
-
-        prepared = []
+        """Inject every ``lora_cfg.frozen_adapters`` entry: structure now, weights after materialization."""
         local_errors: list[str] = []
         local_exc: Optional[Exception] = None
-        if specs:
-            from peft import LoraConfig
-            from peft.utils import load_peft_weights
+        try:
+            specs = normalize_frozen_adapters(specs)
+        except Exception as exc:
+            local_exc = exc
+            specs = []
+            local_errors.append(f"frozen_adapters: {type(exc).__name__}: {exc}")
 
-            for spec in specs:
-                try:
-                    model_id, subfolder = _resolve_adapter_checkpoint(spec.path)
-                    peft_cfg = LoraConfig.from_pretrained(model_id, subfolder=subfolder)
-                    raw = load_peft_weights(model_id, device="cpu", subfolder=subfolder)
-                    prepared.append((spec, peft_cfg, raw))
-                except Exception as exc:
-                    local_exc = exc
-                    local_errors.append(f"adapter {spec.name!r} from {spec.path!r}: {type(exc).__name__}: {exc}")
+        from peft import LoraConfig
+        from peft.utils import load_peft_weights
+
+        prepared = []
+        for spec in specs:
+            try:
+                if spec.name in adapter_names(model):
+                    raise ValueError(f"inject_frozen_adapter: adapter {spec.name!r} already exists on the model.")
+                model_id, subfolder = _resolve_adapter_checkpoint(spec.path)
+                peft_cfg = LoraConfig.from_pretrained(model_id, subfolder=subfolder)
+                raw = load_peft_weights(model_id, device="cpu", subfolder=subfolder)
+                prepared.append((spec, peft_cfg, raw))
+            except Exception as exc:
+                local_exc = exc
+                local_errors.append(f"adapter {spec.name!r} from {spec.path!r}: {type(exc).__name__}: {exc}")
 
         reports = _gather_by_rank(([(spec.name, spec.path) for spec in specs], local_errors))
         spec_lists = [pairs for pairs, _ in reports]
-        if any(pairs != spec_lists[0] for pairs in spec_lists):
-            rendered = "\n".join(f"rank {rank}: {pairs!r}" for rank, pairs in enumerate(spec_lists))
-            raise RuntimeError("Frozen adapter specs differ across ranks:\n" + rendered)
         failures = [f"rank {rank}: {error}" for rank, (_, rank_errors) in enumerate(reports) for error in rank_errors]
         if failures:
             raise RuntimeError("Failed to read frozen adapters:\n" + "\n".join(failures)) from local_exc
+        if any(pairs != spec_lists[0] for pairs in spec_lists):
+            rendered = "\n".join(f"rank {rank}: {pairs!r}" for rank, pairs in enumerate(spec_lists))
+            raise RuntimeError("Frozen adapter specs differ across ranks:\n" + rendered)
 
         shas: Dict[str, str] = {}
-        injected: list[str] = []
         for spec, peft_cfg, raw in prepared:
             local_exc = None
             local_error = None
@@ -470,19 +437,16 @@ class FrozenAdapters:
                 config = peft_cfg.to_dict()
                 sha = _inject_frozen_adapter(model, name=spec.name, path=spec.path, peft_cfg=peft_cfg, raw=raw)
                 local_state = (config, sha)
-                injected.append(spec.name)
             except Exception as exc:
                 local_exc = exc
                 local_error = f"adapter {spec.name!r} from {spec.path!r}: {type(exc).__name__}: {exc}"
 
             results = _gather_by_rank((local_error, local_state))
             failures = [f"rank {rank}: {error}" for rank, (error, _) in enumerate(results) if error]
+            if failures:
+                raise RuntimeError("Failed to inject frozen adapters:\n" + "\n".join(failures)) from local_exc
             mismatch = _frozen_adapter_mismatch(spec.name, spec.path, results)
-            if failures or mismatch:
-                for name in list(dict.fromkeys([*injected, spec.name])):
-                    _discard_frozen_adapter(model, name)
-                if failures:
-                    raise RuntimeError("Failed to inject frozen adapters:\n" + "\n".join(failures)) from local_exc
+            if mismatch:
                 raise RuntimeError(mismatch)
             shas[spec.name] = sha
         return cls(shas)
