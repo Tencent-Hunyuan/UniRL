@@ -122,6 +122,106 @@ cross-step buffering policies.
 remotes inside a `placement(...)` scope and implements `train_step` + `train`; the
 matching `../train_<domain>.py` entrypoint composes the recipe and calls it.
 
+## Run supervised fine-tuning
+
+The SFT path swaps the loop's producer: no rollout engine, no reward, no weight
+sync. A manifest feeds `SFTTrainer`, which reuses the RL consumer side
+(bundle → pipeline → backend → stack) verbatim; only the producer changes —
+`track_builder` turns dataset records into a standalone training `Part` on the
+workers, and the algorithm is anchor-free cross-entropy. Entrypoint:
+[`unirl/train_sft.py`](../train_sft.py); recipes under
+[`examples/sft/`](../../examples/README.md); builder contracts in
+[`train/sft/README.md`](sft/README.md).
+
+### 1. Prepare a local manifest
+
+SFT recipes read local JSONL manifests, not HF dataset ids. The four generic
+converters in [`datasets/sft_manifests/`](../../datasets/sft_manifests/README.md)
+cook any compatible HF dataset (text, VLM, T2I, agent trajectories):
+
+```bash
+pip install -e '.[dataset-prep]'
+python datasets/sft_manifests/prepare_sft_text.py --out-dir data/sft_alpaca
+# → data/sft_alpaca/train.jsonl + val.jsonl
+```
+
+Row schemas (`prompt`/`response`, agent `messages`, media refs) are owned by
+the [manifest guide](../../datasets/sft_manifests/README.md).
+
+### 2. Launch the canonical recipe
+
+```bash
+# Compose-check first (no training). SFT_DATA has no default, so set it even here.
+SFT_DATA=data/sft_alpaca/train.jsonl \
+  python -m unirl.train_sft --config-name=sft/qwen3_sft --cfg job --resolve
+
+# Train. SFT_EVAL_DATA enables validation; without it validation is skipped.
+SFT_DATA=data/sft_alpaca/train.jsonl SFT_EVAL_DATA=data/sft_alpaca/val.jsonl \
+  ENTRY=train_sft bash examples/run_experiment_single_node.sh sft/qwen3_sft
+```
+
+`QWEN3_PATH` overrides the base checkpoint (default `Qwen/Qwen3-4B-Base`).
+Sibling recipes in `examples/sft/` cover LoRA, VLM, agent-trajectory, T2I, and
+video — same entrypoint, a different `track_builder` and manifest modality.
+
+### 3. What runs each step
+
+```text
+train.jsonl
+  │  SupervisedDataSource (driver): epoch-aware cursor, seeded shuffle, optional prefetch
+  ▼
+records — opaque on the driver; media never crosses the driver boundary
+  │  SFTTrainer.train_step
+  ▼
+track_builder.build(records) — on the training workers, using the pipeline's own
+  │  stages (tokenize / chat template / VAE encode), so SFT trains on exactly the
+  │  token sequence inference would render
+  ▼
+training Part
+  │  TrainStack.train_track — FSDPBackend · SFT cross-entropy (no advantages)
+  ▼
+one optimizer step
+```
+
+Two geometry constraints, enforced in `SFTTrainer.__init__`:
+`stack.num_updates_per_batch` must be `1` — step, eval, checkpoint, and resume
+accounting each count one optimizer update per dataset batch — and `batch_size`
+must be divisible by the train world size (`dp`).
+
+Evaluation iterates the full validation set in bounded batches (a partial final
+batch is padded to a `dp` multiple with zero-weight rows) and reports a weighted
+mean loss; it never moves the training cursor.
+
+### 4. Save and resume
+
+SFT saves on the generic cadence and in the generic formats from
+[Checkpointing](#checkpointing). Beside the backend checkpoint, each
+`checkpoint-<step>/` carries two driver-side JSON files:
+
+| File | Written by | Contents |
+| --- | --- | --- |
+| `trainer_state.json` | every trainer | W&B run id, optimizer step |
+| `sft_data_state.json` | `SFTTrainer` only | dataset cursor: `epoch`, `position`, `seed`, `shuffle`, and the train manifest's SHA-256 fingerprint |
+
+```bash
+# Resume. num_steps stays the TOTAL budget; checkpoint numbering continues.
+SFT_DATA=data/sft_alpaca/train.jsonl SFT_EVAL_DATA=data/sft_alpaca/val.jsonl \
+  ENTRY=train_sft bash examples/run_experiment_single_node.sh sft/qwen3_sft \
+  num_steps=400 save_interval=100 \
+  +save_dir=checkpoints/qwen3_sft \
+  +load_dir=checkpoints/qwen3_sft/checkpoint-200
+```
+
+Resume restores model / optimizer / scheduler from the backend checkpoint and
+the dataset cursor from `sft_data_state.json` (written on the same cadence as
+the checkpoints, atomically). The cursor is not a serialized sampler: the
+shuffle order is replayed deterministically from `seed` + `epoch`, and
+`position` indexes into that replayed order. Two guards refuse a mismatched
+resume rather than silently training on different data: the manifest
+fingerprint (a changed `train.jsonl` raises) and the `(seed, shuffle)` pair. A
+legacy checkpoint without `sft_data_state.json` falls back to fast-forwarding
+`start_step` batches through the seeded order, with a warning.
+
 ## Checkpointing
 
 Available for the single-backend trainers (including diffusion, AR, unified-model,

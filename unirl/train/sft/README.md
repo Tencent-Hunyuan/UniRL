@@ -7,13 +7,24 @@
 *Records stay opaque driver-side; media loading, tokenization and VAE encode all
 happen here, on the training workers.*
 
+**Running SFT?** The end-to-end path — manifest prep, entrypoint, per-step
+flow, and checkpoint/resume — lives in
+[`trainer/README.md · Run supervised fine-tuning`](../../trainer/README.md#run-supervised-fine-tuning).
+Manifest row schemas are owned by the
+[manifest guide](../../../datasets/sft_manifests/README.md); this page owns the
+builder contracts only.
+
 ## What it is
 
-`ARSupervisedTrackBuilder` (LLM / VLM / agent), `DiffusionSupervisedTrackBuilder`
-and `VideoDiffusionSupervisedTrackBuilder`. Each turns one shard of records into
-the `Part` its algorithm consumes, using the pipeline's own stages — the prompt
-side is whatever rollout would render, so SFT trains on the token sequence
-inference will see.
+| Builder | Consumes | Produces |
+| --- | --- | --- |
+| `ARSupervisedTrackBuilder` | text / VLM / agent rows | AR `Part` — chat-template tokens, loss on targets |
+| `DiffusionSupervisedTrackBuilder` | T2I rows | diffusion `Part` with an x0-only segment (text conditions + VAE latents) |
+| `VideoDiffusionSupervisedTrackBuilder` | T2V rows | video-diffusion `Part` with a clean x0 latent |
+
+Each turns one shard of records into the `Part` its algorithm consumes, using
+the pipeline's own stages — the prompt side is whatever rollout would render,
+so SFT trains on the token sequence inference will see.
 
 ## Agent chat-stage contract
 
