@@ -66,7 +66,7 @@ class RolloutManager:
             self._poison(exc)
             raise
 
-    def quiesce(self, *, current_version: int) -> List["Sample"]:
+    def quiesce(self, *, current_version: int, wait_for_released: bool = True) -> List["Sample"]:
         self._ensure_open()
         current_version = int(current_version)
         if current_version < 0:
@@ -74,7 +74,7 @@ class RolloutManager:
         try:
             undispatched = self._pool.pause()
             self._rollout.set_stopping(True)
-            completed = self._resolve(self._pool.drain())
+            completed = self._resolve(self._pool.drain(wait_for_released=wait_for_released))
             self._rollout.set_stopping(False)
 
             suspended = self._route(completed, allow_suspended=True)
@@ -130,8 +130,8 @@ class RolloutManager:
             )
         try:
             self._route(self._resolve(self._pool.take_completed(block=False)), allow_suspended=False)
-            if self._pool.live:
-                raise RuntimeError("sync_weights requires no queued or in-flight rollout work")
+            if self._pool.has_engine_work():
+                raise RuntimeError("sync_weights requires no queued or in-flight generation")
             weight_sync.sync()
             self._rollout.set_version(next_version)
             self._published_version = next_version
@@ -143,6 +143,12 @@ class RolloutManager:
     @property
     def published_version(self) -> int:
         return self._published_version
+
+    def progress_counts(self) -> tuple[int, int, int]:
+        """Engine work, released rewards, and ready groups, read together."""
+        self._raise_if_failed()
+        engine, released, pool_completed = self._pool.progress_counts()
+        return engine, released, pool_completed + self._complete.group_count
 
     @property
     def counts(self) -> tuple[int, int]:

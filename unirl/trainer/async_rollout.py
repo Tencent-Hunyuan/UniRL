@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
+from unirl.reward.async_dispatch import ChainedRewardCall, RewardTimings
 from unirl.rollout.manager import (
     RolloutManager,
     keep_within_lag,
@@ -177,6 +178,8 @@ class AsyncRolloutTrainerMixin:
     """One async batch loop shared by ``AsyncARTrainer`` and ``AsyncDiffusionTrainer``."""
 
     _require_single_generation = False
+    _async_reward = False
+    _reward_client_on_driver = False
 
     def _async_wandb_extra(self) -> Dict[str, object]:
         """Trainer-specific keys merged into the wandb run config."""
@@ -190,7 +193,19 @@ class AsyncRolloutTrainerMixin:
         """Run the trainer's evaluation at a synced, empty rollout boundary."""
         raise NotImplementedError
 
+    def _async_perf_phases(self, *, train_s: float) -> Dict[str, float]:
+        """Collect, generate, reward, and train seconds for this async step."""
+        phases: Dict[str, float] = {"collect": self._last_collect_s, "train": float(train_s)}
+        if self._step_reward_peak is not None:
+            phases["generate"], phases["reward"] = self._step_reward_peak
+        return phases
+
     def _score_completed(self, rollout_id: int, completed: "Sample") -> "Sample":
+        if self._async_reward:
+            if completed.parts[-1].rewards is None:
+                raise RuntimeError("async reward pipeline returned a completed group without attached rewards")
+            self._drop_decoded(completed, rollout_id=rollout_id)
+            return completed
         scored = self.reward.score_and_attach(completed)
         self._drop_decoded(scored, rollout_id=rollout_id)
         return scored
@@ -229,8 +244,26 @@ class AsyncRolloutTrainerMixin:
         )
 
         self._next_generation_id = start_rollout
+        self._reward_timings = RewardTimings()
+        self._step_reward_peak = None
+        self._last_collect_s = 0.0
+        self._async_log_step = start_rollout
         engine_slots = self.rollout.engine_slots
-        launchers = [lambda sample, slot=slot: slot.launch("generate_on_slot", sample) for slot in engine_slots]
+        if self._async_reward and self.reward is None:
+            raise ValueError("async_reward=true requires a configured `reward:` service")
+        export_outputs_to_cpu = self._reward_client_on_driver
+
+        def _launch(sample: "Sample", slot: Any) -> Any:
+            call = slot.launch(
+                "generate_on_slot",
+                sample,
+                export_outputs_to_cpu=export_outputs_to_cpu,
+            )
+            if not self._async_reward:
+                return call
+            return ChainedRewardCall(call, self.reward, self._reward_timings)
+
+        launchers = [lambda sample, slot=slot: _launch(sample, slot) for slot in engine_slots]
         self._rollout_manager = RolloutManager(
             self.rollout,
             launchers=launchers,
@@ -239,12 +272,11 @@ class AsyncRolloutTrainerMixin:
             filter_fn=keep_within_lag(staleness_budget),
         )
 
-        if resumed or self.eval_interval > 0:
-            self._sync_rollout(force=True, require_empty=True)
-        if self.eval_interval > 0:
-            self._boundary_evaluate(start_rollout, initial=True)
-
         try:
+            if resumed or self.eval_interval > 0:
+                self._sync_rollout(force=True, require_empty=True)
+            if self.eval_interval > 0:
+                self._boundary_evaluate(start_rollout, initial=True)
             for rollout_id in range(start_rollout, num_rollouts):
                 t0 = time.perf_counter()
                 hard_boundary = next_hard_boundary(
@@ -257,6 +289,7 @@ class AsyncRolloutTrainerMixin:
                     rollout_id,
                     hard_boundary=hard_boundary,
                 )
+                self._last_collect_s = time.perf_counter() - t0
                 training_progress = rollout_id / max(1, num_rollouts - 1)
                 result, mean_reward = self._advantage_and_train(
                     sample,
@@ -276,6 +309,7 @@ class AsyncRolloutTrainerMixin:
                 save_due = save_interval > 0 and (step % save_interval == 0 or step >= num_rollouts)
                 sync_due = step < num_rollouts and self._batches_since_sync >= self._weight_sync_interval
                 if eval_due or save_due or sync_due:
+                    self._async_log_step = step
                     self._sync_rollout(require_empty=eval_due or save_due)
 
                 if step >= num_rollouts and not self._rollout_manager.empty:
@@ -295,7 +329,11 @@ class AsyncRolloutTrainerMixin:
             try:
                 self._rollout_manager.close()
             finally:
-                self._finish_wandb()
+                try:
+                    if self._reward_client_on_driver and self.reward is not None:
+                        self.reward.shutdown()
+                finally:
+                    self._finish_wandb()
 
     def _sync_rollout(self, *, force: bool = False, require_empty: bool = False) -> None:
         manager = self._rollout_manager
@@ -309,7 +347,13 @@ class AsyncRolloutTrainerMixin:
         # Quiesce engine work before weight publication, but keep completed
         # groups in the manager. The lag filter decides whether buffered work
         # remains trainable after publication, matching continuous prompt carry.
-        carried = manager.quiesce(current_version=self._train_version)
+        # Eval and checkpoint boundaries join released rewards first. A plain
+        # weight publication overlaps them: generation has already stamped
+        # output_version, and the same lag filter applies when they complete.
+        carried = manager.quiesce(
+            current_version=self._train_version,
+            wait_for_released=require_empty,
+        )
         if require_empty and (carried or not manager.empty):
             raise RuntimeError("eval/checkpoint boundary requires an empty RolloutManager")
         if not require_empty:
@@ -324,24 +368,31 @@ class AsyncRolloutTrainerMixin:
             if started:
                 manager.finish(carried, current_version=self._train_version)
                 carried = []
-            _, ready_count = manager.counts
-            prompts_to_finish = (-ready_count) % self.batch_size
+            _engine, released, ready_count = manager.progress_counts()
+            # Released calls already finished generation on this policy version.
+            # They join the ready buffer when scoring returns, so they count
+            # toward alignment and do not have to block the publication.
+            prompts_to_finish = (-(ready_count + released)) % self.batch_size
             if prompts_to_finish:
                 if len(carried) < prompts_to_finish:
                     raise RuntimeError(
                         "cannot batch-align rollout carry before weight publication: "
-                        f"ready={ready_count}, carried={len(carried)}, batch_size={self.batch_size}"
+                        f"ready={ready_count}, released={released}, carried={len(carried)}, "
+                        f"batch_size={self.batch_size}"
                     )
                 finishing = carried[:prompts_to_finish]
                 carried = carried[prompts_to_finish:]
                 manager.finish(finishing, current_version=self._train_version)
-            inflight_count, ready_count = manager.counts
-            if inflight_count or ready_count % self.batch_size:
+            engine, released, ready_count = manager.progress_counts()
+            if engine or (ready_count + released) % self.batch_size:
                 raise RuntimeError(
                     "rollout carry remained unaligned after completing the publication prefix: "
-                    f"inflight={inflight_count}, ready={ready_count}, batch_size={self.batch_size}"
+                    f"engine={engine}, released={released}, ready={ready_count}, "
+                    f"batch_size={self.batch_size}"
                 )
+        sync_started = time.perf_counter()
         manager.sync_weights(self.weight_sync, output_version=self._train_version)
+        self.wandb_logger.log_perf(self._async_log_step, {"weight_sync_time_s": time.perf_counter() - sync_started})
         if carried:
             manager.submit(carried)
         self._batches_since_sync = 0
@@ -363,6 +414,8 @@ class AsyncRolloutTrainerMixin:
             self.batch_size,
             current_version=self._train_version,
         )
+        # Take this batch's scores before admitting the next one, which records its own.
+        self._step_reward_peak = self._reward_timings.consume_max()
         completed, output_version = combine_rollout_prompts(
             groups,
             require_single_rollout_id=self._require_single_generation,

@@ -293,6 +293,10 @@ class DiffusionTrainer(BaseTrainer):
 
     _prompt_local_rollout = False
 
+    # Async per-prompt subclasses may place an HTTP reward client on the driver
+    # instead of allocating a GPU worker for the client. See _build_train_side.
+    _reward_client_on_driver: bool = False
+
     def __init__(
         self,
         *,
@@ -577,7 +581,21 @@ class DiffusionTrainer(BaseTrainer):
         self.pipeline = remote_hydra(pipeline_cfg, bundle=self.bundle)
         self.backend = remote_hydra(backend_cfg, bundle=self.bundle)
         if reward_cfg is not None:
-            self.reward = remote_hydra(reward_cfg)
+            if self._reward_client_on_driver:
+                # Reject a local scorer before instantiate(); its constructor loads weights.
+                from unirl.reward.async_dispatch import DriverRewardClient
+
+                backend_cfg = reward_cfg.get("backend")
+                backend_target = None if backend_cfg is None else backend_cfg.get("_target_")
+                if backend_target != "unirl.reward.remote.RemoteRewardBackend":
+                    raise TypeError(
+                        "reward_client_on_driver requires reward.backend._target_ = "
+                        "unirl.reward.remote.RemoteRewardBackend so the scorer is not constructed "
+                        f"on the driver; got {backend_target!r}."
+                    )
+                self.reward = DriverRewardClient(instantiate(reward_cfg))
+            else:
+                self.reward = remote_hydra(reward_cfg)
             self._wire_eval_suites()
         algo_cls = get_class(str(algorithm_cfg.get("_target_", "")))
         self._uses_ema = getattr(algo_cls, "requires_ema_rollout", False)

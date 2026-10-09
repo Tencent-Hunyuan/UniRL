@@ -219,11 +219,13 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
         train_part = part
         if self.balance_shards:
             train_part = part.balance_shards(self._train_devices)
+        train_started = time.perf_counter()
         result = self.stack.train_track(
             train_part,
             training_progress=float(training_progress),
             rollout_id=rollout_id,
         )
+        train_s = time.perf_counter() - train_started
         self._train_version += result.optimizer_updates
         self._batches_since_sync += 1
         if extra_metrics is not None:
@@ -240,6 +242,7 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
             result,
             sample,
             step_time_s=time.perf_counter() - t0,
+            phase_times=self._async_perf_phases(train_s=train_s),
             trunc_len=getattr(self.sampling_params.get("ar"), "max_new_tokens", None),
             extra_metrics=extra_metrics,
         )
