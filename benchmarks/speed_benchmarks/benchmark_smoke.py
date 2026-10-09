@@ -15,6 +15,7 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from unirl.utils.benchmark_result import BenchmarkResult, Environment, Metrics, Workload, write_result
+from unirl.utils.run_id import resolve_run_id
 
 _HELP = """Run a CPU-only synthetic benchmark and write one schema-v1 result.
 
@@ -48,7 +49,7 @@ def main() -> None:
     for _ in range(args.measured_iterations):
         _run_iteration(args.samples)
     wall_clock_s = time.perf_counter() - start
-    run_id = f"smoke-{int(time.time())}-{uuid4().hex[:6]}"
+    run_id = resolve_run_id(f"smoke-{int(time.time())}-{uuid4().hex[:6]}")
     result_path = args.out / f"{run_id}.json"
     write_result(
         BenchmarkResult(
