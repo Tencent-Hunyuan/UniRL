@@ -38,7 +38,7 @@ entrypoint above plus a recipe that makes the selection:
 | Variant | Selected by | Checked-in recipes |
 |---|---|---|
 | HSDP (hybrid sharding) | `fsdp_mode: hybrid` + `hsdp_shard_size` on `FSDPBackend` | [`diffusion/minimax_h3/minimax_h3_t2va_trainside_hsdp_2x8_validation`](diffusion/minimax_h3/minimax_h3_t2va_trainside_hsdp_2x8_validation.yaml) · [`ar/bagel_grpo_arxivqa_mc_2x8_lora`](ar/bagel_grpo_arxivqa_mc_2x8_lora.yaml) |
-| VeOmni train backend | `backend._target_: unirl.train.backend.veomni.backend.VeOmniBackend` | [`diffusion/sd3_trainside_veomni`](diffusion/sd3_trainside_veomni.yaml) · [`diffusion/qwen_image_trainside_veomni`](diffusion/qwen_image_trainside_veomni.yaml) · [`ar/qwen3_grpo_4b_veomni_sp_sglang`](ar/qwen3_grpo_4b_veomni_sp_sglang.yaml) · [`unified_model/hi3_vllmomni_veomni_ep`](unified_model/hi3_vllmomni_veomni_ep.yaml) |
+| VeOmni train backend | `backend._target_: unirl.train.backend.veomni.backend.VeOmniBackend` | [`diffusion/sd3_trainside_veomni`](diffusion/sd3_trainside_veomni.yaml) · [`diffusion/qwen_image_trainside_veomni`](diffusion/qwen_image_trainside_veomni.yaml) · [`ar/qwen3_grpo_4b_veomni_sp_sglang`](ar/qwen3_grpo_4b_veomni_sp_sglang.yaml) · [`ar/qwen3_drpo_4b_veomni_sp_sglang`](ar/qwen3_drpo_4b_veomni_sp_sglang.yaml) · [`ar/qwen3_moe_grpo_30b_a3b_veomni_ep_sglang`](ar/qwen3_moe_grpo_30b_a3b_veomni_ep_sglang.yaml) · [`ar/qwen3_5_moe_grpo_35b_a3b_base_dapo_sglang`](ar/qwen3_5_moe_grpo_35b_a3b_base_dapo_sglang.yaml) · [`ar/qwen3_5_moe_grpo_35b_a3b_geo3k_mc_sglang`](ar/qwen3_5_moe_grpo_35b_a3b_geo3k_mc_sglang.yaml) · [`unified_model/hi3_vllmomni_veomni_ep`](unified_model/hi3_vllmomni_veomni_ep.yaml) |
 
 When to choose each: [Choosing HSDP](../unirl/train/readme.md#choosing-hsdp-hybrid-sharding)
 and [Choosing the VeOmni backend](../unirl/train/readme.md#choosing-the-veomni-backend)
@@ -128,17 +128,17 @@ apply** — so a name carries only what distinguishes it from its siblings, and
 related recipes sort together.
 
 ```
-<model>[_<task>][_<size>][_<algorithm>][_<engine>][_<adapter>][_<topology>]
+<model>[_<task>][_<size>][_<algorithm>][_<engine>][_<backend>][_<adapter>][_<topology>]
 ```
 
 | Segment | Position | Values (examples) | Omit when |
 |---|---|---|---|
 | `model` | required, first | `sd3`, `qwen_image`, `flux2_klein`, `sensenova_u1_5`, `wan21`, `wan22`, `hunyuan_video10`, `hunyuan_video15`, `qwen_vl`, `qwen3`, `hi3` | never |
-| `task` | after model | `t2v`, `i2v` | text-to-image (the implicit default) |
+| `task` | after model | `t2v`, `i2v`, `t2va` (text-to-video + audio) | text-to-image (the implicit default) |
 | `size` | after task | `4b`, `14b` | only one size in the family |
 | `algorithm` | middle | `dancegrpo`, `mixgrpo`, `nft`, `flowdppo`, `grpo`, `drpo` | plain FlowGRPO (diffusion default); GRPO (AR default) |
 | `engine` | after algorithm | `trainside`, `sglang`, `vllmomni` | — |
-| `backend` | after algorithm or engine | `veomni` (the VeOmni train backend) | `FSDPBackend` (the implicit default) |
+| `backend` | after engine | `veomni` (the VeOmni train backend) | `FSDPBackend` (the implicit default) |
 | `adapter` | after engine | `full`, `lora` | unambiguous from the rest |
 | `topology` | last | placement `colocate`/`separate`; sync `nccl`/`tensor`/`ipc`; engine mode `rollout`/`replay`; sharding `hsdp`; parallel degree `sp`/`ep`; cluster `<N>x<G>` | single-slab colocate default |
 
@@ -154,8 +154,8 @@ Worked examples:
 | `hunyuan_video15_t2v_dancegrpo_trainside` | HunyuanVideo-1.5 · text-to-video · DanceGRPO · trainside engine |
 | `sd3_vllmomni_full_nccl_separate` | SD3 · vLLM-Omni engine · full-weight · NCCL sync · separate slabs |
 | `sd3_trainside_veomni` | SD3 · trainside engine · VeOmni train backend |
-| `qwen3_moe_grpo_30b_a3b_veomni_ep_sglang` | Qwen3-30B-A3B MoE · GRPO · VeOmni backend · expert parallel · SGLang |
-| `minimax_h3_t2va_trainside_hsdp_2x8_validation` | MiniMax-H3 · text-to-video · trainside engine · HSDP · 2 nodes × 8 GPUs · validation recipe |
+| `hi3_vllmomni_veomni_ep` | HI3 · vLLM-Omni engine · VeOmni train backend · expert parallel |
+| `minimax_h3_t2va_trainside_hsdp_2x8_validation` | MiniMax-H3 · text-to-video + audio · trainside engine · HSDP · 2 nodes × 8 GPUs · validation recipe |
 | `qwen_vl_grpo_geo3k_mc_4x8` | Qwen-VL · GRPO · geo3k multiple-choice · 4 nodes × 8 GPUs |
 
 Domain-specific trailing qualifiers extend the chain:
@@ -163,6 +163,13 @@ Domain-specific trailing qualifiers extend the chain:
 - **`pe/`** appends the reward: `pe_sglang_full_pickscore`, `pe_sglang_full_wise`.
 - **`ar/`** (vision-language) appends dataset + task: `qwen_vl_grpo_geo3k_mc_4x8` (`geo3k` · multiple-choice).
 - AR recipes (`ar/`) append the cluster shape `<N>x<G>` (nodes × GPUs): `..._4x8`.
+
+AR recipes also reorder the middle of the chain: `size` follows the algorithm,
+and the VeOmni backend and its parallel degree precede the engine —
+`qwen3_moe_grpo_30b_a3b_veomni_ep_sglang` reads Qwen3-30B-A3B MoE · GRPO ·
+VeOmni backend · expert parallel · SGLang. The `qwen3_5_moe_*` recipes select
+VeOmniBackend without a `veomni` segment; check `backend._target_` rather than
+the name.
 
 ## Adding or editing a recipe
 

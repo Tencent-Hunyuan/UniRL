@@ -122,7 +122,7 @@ siblings' model subdirectories):
 
 | Step | Recipe | Exercises |
 | --- | --- | --- |
-| 1 | [`diffusion/sd3_trainside_veomni`](../../examples/diffusion/sd3_trainside_veomni.yaml) | byte-twin of `sd3_trainside` on VeOmniBackend (`sp_size: 1`) — backend parity |
+| 1 | [`diffusion/sd3_trainside_veomni`](../../examples/diffusion/sd3_trainside_veomni.yaml) | parity twin of `sd3/sd3_trainside` on VeOmniBackend (`sp_size: 1`) — backend parity |
 | 2 | [`ar/qwen3_grpo_4b_veomni_sp_sglang`](../../examples/ar/qwen3_grpo_4b_veomni_sp_sglang.yaml) | Ulysses SP (`sp_size: 2`) + SGLang; a DRPO sibling sits next to it |
 | 3 | [`ar/qwen3_moe_grpo_30b_a3b_veomni_ep_sglang`](../../examples/ar/qwen3_moe_grpo_30b_a3b_veomni_ep_sglang.yaml) | expert parallelism (`ep_size: 8`) on a 30B-A3B MoE |
 | 4 | [`diffusion/qwen_image_trainside_veomni`](../../examples/diffusion/qwen_image_trainside_veomni.yaml), [`unified_model/hi3_vllmomni_veomni_ep`](../../examples/unified_model/hi3_vllmomni_veomni_ep.yaml) | Qwen-Image parity twin; HI3 unified model with EP |
