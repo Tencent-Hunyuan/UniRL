@@ -75,10 +75,14 @@ Choose `hybrid` when a shard group that fits one node over NVLink is a cheaper
 all-gather domain than the whole world. Set `hsdp_shard_size` to
 `devices_per_node` for the usual intra-node FSDP + inter-node replication
 layout (world 16, shard 8 → a `(2, 8)` mesh); larger groups work when the world
-divides evenly. Geometry is validated fail-fast in `resolve_fsdp_mesh_shape`
-([`configs.py`](configs.py)): the shard size must be `>= 2`, the world must be
-strictly larger (at least two replica groups — a one-group world is `full`),
-and divisible by the shard size.
+divides evenly. The trade is memory: each replica group shards parameters and
+optimizer state over only `hsdp_shard_size` ranks, so per-rank weight +
+optimizer memory is `world_size / hsdp_shard_size` times the `full`-mode
+footprint (with `no_shard` as the degenerate whole-copy case), and gradients
+additionally synchronize across replica groups. Geometry is validated
+fail-fast in `resolve_fsdp_mesh_shape` ([`configs.py`](configs.py)): the shard
+size must be `>= 2`, the world must be strictly larger (at least two replica
+groups — a one-group world is `full`), and divisible by the shard size.
 
 Checked-in recipes:
 [`diffusion/minimax_h3/minimax_h3_t2va_trainside_hsdp_2x8_validation`](../../examples/diffusion/minimax_h3/minimax_h3_t2va_trainside_hsdp_2x8_validation.yaml)

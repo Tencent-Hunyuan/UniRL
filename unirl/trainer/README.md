@@ -205,11 +205,13 @@ SFT saves on the generic cadence and in the generic formats from
 
 ```bash
 # Resume. num_steps stays the TOTAL budget; checkpoint numbering continues.
+# ++ adds or overrides a key, so the same form works whether the recipe
+# defines it (num_steps, save_interval) or not (save_dir, load_dir).
 SFT_DATA=data/sft_alpaca/train.jsonl SFT_EVAL_DATA=data/sft_alpaca/val.jsonl \
   ENTRY=train_sft bash examples/run_experiment_single_node.sh sft/qwen3_sft \
-  num_steps=400 save_interval=100 \
-  +save_dir=checkpoints/qwen3_sft \
-  +load_dir=checkpoints/qwen3_sft/checkpoint-200
+  ++num_steps=400 ++save_interval=100 \
+  ++save_dir=checkpoints/qwen3_sft \
+  ++load_dir=checkpoints/qwen3_sft/checkpoint-200
 ```
 
 Resume restores model / optimizer / scheduler from the backend checkpoint and
@@ -224,9 +226,10 @@ legacy checkpoint without `sft_data_state.json` falls back to fast-forwarding
 
 ## Run async AR or async diffusion training
 
-The async paths disaggregate the loop: training and the rollout engine own
-**disjoint GPU slabs** (`layout: separate`, split by `train_fraction`), so
-generation overlaps scoring and training instead of time-sharing each GPU.
+The async paths disaggregate the loop: training and the rollout engine each
+own a **slab** — a disjoint `placement` scope over a subset of the GPU pool
+(`layout: separate`, split by `train_fraction`) — so generation overlaps
+scoring and training instead of time-sharing each GPU.
 Both are FIFO batch trainers driven by one shared loop
 ([`async_rollout.py`](async_rollout.py)); they differ in engine, weight-sync
 handler, and what they pin down.
@@ -248,7 +251,9 @@ BAGEL_PATH=/path/to/BAGEL-7B-MoT \
 
 Launcher forms and the engine environments are in
 [`examples/README.md · Running a recipe`](../../examples/README.md#running-a-recipe)
-and [INSTALL.md](../../INSTALL.md).
+and [INSTALL.md](../../INSTALL.md). Each async recipe's header comment carries
+a concrete launch line for small pools — the AR default downscales to 4 GPUs
+with `num_devices=4 batch_size=8 sampling.samples_per_prompt=4`.
 
 ### The shared lifecycle
 
