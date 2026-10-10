@@ -133,38 +133,14 @@ workers, and the algorithm is anchor-free cross-entropy. Entrypoint:
 [`examples/sft/`](../../examples/README.md); builder contracts in
 [`train/sft/README.md`](../train/sft/README.md).
 
-### 1. Prepare a local manifest
+SFT recipes read local JSONL manifests, not HF dataset ids. The
+[manifest guide](../../datasets/sft_manifests/README.md) owns the converters,
+row schemas, and the prepare → launch commands. `SFT_DATA` is required;
+`SFT_EVAL_DATA` enables validation. Sibling recipes in `examples/sft/` cover
+LoRA, VLM, agent-trajectory, T2I, and video — same entrypoint, a different
+`track_builder` and manifest modality.
 
-SFT recipes read local JSONL manifests, not HF dataset ids. The four generic
-converters in [`datasets/sft_manifests/`](../../datasets/sft_manifests/README.md)
-cook any compatible HF dataset (text, VLM, T2I, agent trajectories):
-
-```bash
-pip install -e '.[dataset-prep]'
-python datasets/sft_manifests/prepare_sft_text.py --out-dir data/sft_alpaca
-# → data/sft_alpaca/train.jsonl + val.jsonl
-```
-
-Row schemas (`prompt`/`response`, agent `messages`, media refs) are owned by
-the [manifest guide](../../datasets/sft_manifests/README.md).
-
-### 2. Launch the canonical recipe
-
-```bash
-# Compose-check first (no training). SFT_DATA has no default, so set it even here.
-SFT_DATA=data/sft_alpaca/train.jsonl \
-  python -m unirl.train_sft --config-name=sft/qwen3_sft --cfg job --resolve
-
-# Train. SFT_EVAL_DATA enables validation; without it validation is skipped.
-SFT_DATA=data/sft_alpaca/train.jsonl SFT_EVAL_DATA=data/sft_alpaca/val.jsonl \
-  ENTRY=train_sft bash examples/run_experiment_single_node.sh sft/qwen3_sft
-```
-
-`QWEN3_PATH` overrides the base checkpoint (default `Qwen/Qwen3-4B-Base`).
-Sibling recipes in `examples/sft/` cover LoRA, VLM, agent-trajectory, T2I, and
-video — same entrypoint, a different `track_builder` and manifest modality.
-
-### 3. What runs each step
+### What runs each step
 
 ```text
 train.jsonl
@@ -192,21 +168,15 @@ Evaluation iterates the full validation set in bounded batches (a partial final
 batch is padded to a `dp` multiple with zero-weight rows) and reports a weighted
 mean loss; it never moves the training cursor.
 
-### 4. Save and resume
+### Save and resume
 
 SFT saves on the generic cadence and in the generic formats from
-[Checkpointing](#checkpointing). Beside the backend checkpoint, each
-`checkpoint-<step>/` carries two driver-side JSON files:
-
-| File | Written by | Contents |
-| --- | --- | --- |
-| `trainer_state.json` | every trainer | W&B run id, optimizer step |
-| `sft_data_state.json` | `SFTTrainer` only | dataset cursor: `epoch`, `position`, `seed`, `shuffle`, and the train manifest's SHA-256 fingerprint |
+[Checkpointing](#checkpointing). Each `checkpoint-<step>/` additionally carries
+`sft_data_state.json`: the dataset cursor (`epoch`, `position`, `seed`,
+`shuffle`) and the train manifest's SHA-256 fingerprint.
 
 ```bash
-# Resume. num_steps stays the TOTAL budget; checkpoint numbering continues.
-# ++ adds or overrides a key, so the same form works whether the recipe
-# defines it (num_steps, save_interval) or not (save_dir, load_dir).
+# num_steps stays the TOTAL budget; ++ works whether or not the recipe defines the key.
 SFT_DATA=data/sft_alpaca/train.jsonl SFT_EVAL_DATA=data/sft_alpaca/val.jsonl \
   ENTRY=train_sft bash examples/run_experiment_single_node.sh sft/qwen3_sft \
   ++num_steps=400 ++save_interval=100 \
@@ -239,40 +209,21 @@ handler, and what they pin down.
 | Async AR | [`unirl/train_async_ar.py`](../train_async_ar.py) | [`ar/qwen3_grpo_4b_base_dapo_sglang_async`](../../examples/ar/qwen3_grpo_4b_base_dapo_sglang_async.yaml) | SGLang · `NCCLWeightSync` (full dense) |
 | Async diffusion | [`unirl/train_async_diffusion.py`](../train_async_diffusion.py) | [`diffusion/bagel/bagel_vllmomni_async`](../../examples/diffusion/bagel/bagel_vllmomni_async.yaml) | vLLM-Omni · `RemoteLoraWeightSync` |
 
-```bash
-# Compose-check (no training). DATA_PATH is required; EVAL_DATA_PATH defaults to DATA_PATH.
-DATA_PATH=data/dapo_math/train.jsonl \
-  python -m unirl.train_async_ar --config-name=ar/qwen3_grpo_4b_base_dapo_sglang_async --cfg job --resolve
-
-# Compose-check the async diffusion default (vLLM-Omni environment; BAGEL_PATH names the checkpoint).
-BAGEL_PATH=/path/to/BAGEL-7B-MoT \
-  python -m unirl.train_async_diffusion --config-name=diffusion/bagel/bagel_vllmomni_async --cfg job --resolve
-```
-
-Launcher forms and the engine environments are in
-[`examples/README.md · Running a recipe`](../../examples/README.md#running-a-recipe)
-and [INSTALL.md](../../INSTALL.md). Each async recipe's header comment carries
-a concrete launch line for small pools — the AR default downscales to 4 GPUs
-with `num_devices=4 batch_size=8 sampling.samples_per_prompt=4`.
+Launch lines and required env vars are in
+[`examples/README.md · Running a recipe`](../../examples/README.md#running-a-recipe);
+each async recipe's header comment also carries a small-pool launch line.
 
 ### The shared lifecycle
 
-Three versions drive everything (logged as `async/*` metrics):
-
-- **train version** — the optimizer step count; one unit is one optimizer update.
-- **published version** — the train version whose weights the engine serves.
-- **output version** — stamped on every generated `Part`: the published version
-  it was generated under.
-
-Admission is bounded: `max_inflight` batch-equivalents globally,
+The **train version** counts optimizer updates, the **published version** is
+the train version the engine serves, and every generated `Part` is stamped with
+the **output version** it was generated under (all logged as `async/*`).
+Admission is bounded by `max_inflight` batch-equivalents globally and
 `per_worker_inflight` prompt trees per rollout worker, and every launch is
-clipped to the freshness horizon and to the next hard boundary. A training
-batch may mix carry from an older published version up to the lag budget — at
-most `(weight_sync_interval - 1) * num_updates_per_batch` optimizer updates,
-the formula from [How it works](#how-it-works). Async AR may raise the
-batch-side budget with `buffer_max_staleness` (in batches; must stay
-`>= weight_sync_interval - 1`); async diffusion fixes it at
-`weight_sync_interval - 1`.
+clipped to the lag budget from [How it works](#how-it-works) and to the next
+hard boundary. Async AR may raise the batch-side budget with
+`buffer_max_staleness` (in batches; must stay `>= weight_sync_interval - 1`);
+async diffusion fixes it at `weight_sync_interval - 1`.
 
 Publication fires once `weight_sync_interval` batches are trained, or earlier
 at an eval/save boundary:
@@ -289,12 +240,8 @@ at an eval/save boundary:
 
 **Hard boundaries** — every `eval_interval`, every `save_interval`, and the
 final rollout — require an *empty* manager: no carry crosses them, and the
-final one raises if anything is still in flight. Async AR refills the engine
-immediately after collecting a batch, so the next generation overlaps scoring
-and training. Evaluation behavior at boundaries is per trainer in
-[Evaluation cadence](#evaluation-cadence); the residency policy (async keeps
-the rollout slab resident, and async diffusion rejects
-`reward_resident=false` / `rollout_resident=false`) is in
+final one raises if anything is still in flight. Per-trainer eval behavior is
+in [Evaluation cadence](#evaluation-cadence); residency rules are in
 [How it works](#how-it-works).
 
 ### Variant constraints (fail fast at startup)

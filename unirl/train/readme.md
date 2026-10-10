@@ -62,35 +62,22 @@ in `backend/base.py`; a multi-update-capable algorithm sets
 
 ## Choosing HSDP (hybrid sharding)
 
-`FSDPConfig.fsdp_mode` selects the parameter-sharding topology of
-`FSDPBackend`:
-
-| `fsdp_mode` | Device mesh | Meaning |
-| --- | --- | --- |
-| `full` (default) | whole world, one shard group | every parameter sharded across all ranks |
-| `hybrid` | `(world / hsdp_shard_size, hsdp_shard_size)` — replicate × shard | parameters shard within each `hsdp_shard_size` group; groups hold replicated copies and all-reduce their gradients (HSDP) |
-| `no_shard` | `(world, 1)` | DDP — the full model on every rank, gradients only (gotcha below) |
-
-Choose `hybrid` when a shard group that fits one node over NVLink is a cheaper
-all-gather domain than the whole world. Set `hsdp_shard_size` to
-`devices_per_node` for the usual intra-node FSDP + inter-node replication
-layout (world 16, shard 8 → a `(2, 8)` mesh); larger groups work when the world
-divides evenly. The trade is memory: each replica group shards parameters and
-optimizer state over only `hsdp_shard_size` ranks, so per-rank weight +
-optimizer memory is `world_size / hsdp_shard_size` times the `full`-mode
-footprint (with `no_shard` as the degenerate whole-copy case), and gradients
-additionally synchronize across replica groups. Geometry is validated
-fail-fast in `resolve_fsdp_mesh_shape` ([`configs.py`](configs.py)): the shard
-size must be `>= 2`, the world must be strictly larger (at least two replica
-groups — a one-group world is `full`), and divisible by the shard size.
+`fsdp_mode: hybrid` on `FSDPBackend` builds a
+`(world / hsdp_shard_size, hsdp_shard_size)` replicate × shard mesh: parameters
+shard within each `hsdp_shard_size` group, and the groups hold replicated copies
+whose gradients are all-reduced. Choose it when a shard group that fits one node
+over NVLink is a cheaper all-gather domain than the whole world;
+`hsdp_shard_size: devices_per_node` is the usual layout (world 16, shard 8 → a
+`(2, 8)` mesh). The trade is memory: per-rank weight + optimizer memory is
+`world_size / hsdp_shard_size` times the `full`-mode footprint.
+`resolve_fsdp_mesh_shape` ([`configs.py`](configs.py)) fails fast unless the
+shard size is `>= 2`, the world is strictly larger (a one-group world is
+`full`), and the world divides by the shard size.
 
 Checked-in recipes:
 [`diffusion/minimax_h3/minimax_h3_t2va_trainside_hsdp_2x8_validation`](../../examples/diffusion/minimax_h3/minimax_h3_t2va_trainside_hsdp_2x8_validation.yaml)
 — a 2×8 **validation/smoke** recipe, not a production default — and
 [`ar/bagel_grpo_arxivqa_mc_2x8_lora`](../../examples/ar/bagel_grpo_arxivqa_mc_2x8_lora.yaml).
-Hybrid with `hsdp_shard_size: devices_per_node` is also one of the two
-`copy_engine_all_gather` layouts (gotcha below). HSDP stays on `FSDPBackend` —
-the VeOmni backend supports `full` only.
 
 ## Choosing the VeOmni backend
 
@@ -116,15 +103,14 @@ grouped-GEMM). The VeOmni bundles build the transformer on the **meta device**
 after sharding — so a bundle without meta-init support cannot run on this
 backend.
 
-Climb the ladder from a parity twin before the parallel variants (the two
-diffusion twins sit at the top of `examples/diffusion/`, next to their FSDP
-siblings' model subdirectories):
+Climb the ladder from a parity twin before the parallel variants; it lists
+every checked-in VeOmni recipe:
 
 | Step | Recipe | Exercises |
 | --- | --- | --- |
 | 1 | [`diffusion/sd3_trainside_veomni`](../../examples/diffusion/sd3_trainside_veomni.yaml) | parity twin of `sd3/sd3_trainside` on VeOmniBackend (`sp_size: 1`) — backend parity |
-| 2 | [`ar/qwen3_grpo_4b_veomni_sp_sglang`](../../examples/ar/qwen3_grpo_4b_veomni_sp_sglang.yaml) | Ulysses SP (`sp_size: 2`) + SGLang; a DRPO sibling sits next to it |
-| 3 | [`ar/qwen3_moe_grpo_30b_a3b_veomni_ep_sglang`](../../examples/ar/qwen3_moe_grpo_30b_a3b_veomni_ep_sglang.yaml) | expert parallelism (`ep_size: 8`) on a 30B-A3B MoE |
+| 2 | [`ar/qwen3_grpo_4b_veomni_sp_sglang`](../../examples/ar/qwen3_grpo_4b_veomni_sp_sglang.yaml), [`ar/qwen3_drpo_4b_veomni_sp_sglang`](../../examples/ar/qwen3_drpo_4b_veomni_sp_sglang.yaml) | Ulysses SP (`sp_size: 2`) + SGLang, GRPO and DRPO |
+| 3 | [`ar/qwen3_moe_grpo_30b_a3b_veomni_ep_sglang`](../../examples/ar/qwen3_moe_grpo_30b_a3b_veomni_ep_sglang.yaml), [`ar/qwen3_5_moe_grpo_35b_a3b_base_dapo_sglang`](../../examples/ar/qwen3_5_moe_grpo_35b_a3b_base_dapo_sglang.yaml), [`ar/qwen3_5_moe_grpo_35b_a3b_geo3k_mc_sglang`](../../examples/ar/qwen3_5_moe_grpo_35b_a3b_geo3k_mc_sglang.yaml) | expert parallelism (`ep_size: 8`) on 30B-A3B / 35B-A3B MoE |
 | 4 | [`diffusion/qwen_image_trainside_veomni`](../../examples/diffusion/qwen_image_trainside_veomni.yaml), [`unified_model/hi3_vllmomni_veomni_ep`](../../examples/unified_model/hi3_vllmomni_veomni_ep.yaml) | Qwen-Image parity twin; HI3 unified model with EP |
 
 v1 restrictions, all validated fail-fast in `_validate_fsdp_cfg`:

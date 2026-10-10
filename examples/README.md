@@ -32,17 +32,13 @@ override `num_devices` from the node GPU count. Engine extras are in
 [INSTALL.md](../INSTALL.md).
 
 Two variants sit **below** the entrypoint level — they are backend/topology
-selections a recipe carries, not separate entrypoints. Pick the domain
-entrypoint above plus a recipe that makes the selection:
+selections a recipe carries, not separate entrypoints:
 
-| Variant | Selected by | Checked-in recipes |
-|---|---|---|
-| HSDP (hybrid sharding) | `fsdp_mode: hybrid` + `hsdp_shard_size` on `FSDPBackend` | [`diffusion/minimax_h3/minimax_h3_t2va_trainside_hsdp_2x8_validation`](diffusion/minimax_h3/minimax_h3_t2va_trainside_hsdp_2x8_validation.yaml) · [`ar/bagel_grpo_arxivqa_mc_2x8_lora`](ar/bagel_grpo_arxivqa_mc_2x8_lora.yaml) |
-| VeOmni train backend | `backend._target_: unirl.train.backend.veomni.backend.VeOmniBackend` | [`diffusion/sd3_trainside_veomni`](diffusion/sd3_trainside_veomni.yaml) · [`diffusion/qwen_image_trainside_veomni`](diffusion/qwen_image_trainside_veomni.yaml) · [`ar/qwen3_grpo_4b_veomni_sp_sglang`](ar/qwen3_grpo_4b_veomni_sp_sglang.yaml) · [`ar/qwen3_drpo_4b_veomni_sp_sglang`](ar/qwen3_drpo_4b_veomni_sp_sglang.yaml) · [`ar/qwen3_moe_grpo_30b_a3b_veomni_ep_sglang`](ar/qwen3_moe_grpo_30b_a3b_veomni_ep_sglang.yaml) · [`ar/qwen3_5_moe_grpo_35b_a3b_base_dapo_sglang`](ar/qwen3_5_moe_grpo_35b_a3b_base_dapo_sglang.yaml) · [`ar/qwen3_5_moe_grpo_35b_a3b_geo3k_mc_sglang`](ar/qwen3_5_moe_grpo_35b_a3b_geo3k_mc_sglang.yaml) · [`unified_model/hi3_vllmomni_veomni_ep`](unified_model/hi3_vllmomni_veomni_ep.yaml) |
-
-When to choose each: [Choosing HSDP](../unirl/train/readme.md#choosing-hsdp-hybrid-sharding)
-and [Choosing the VeOmni backend](../unirl/train/readme.md#choosing-the-veomni-backend)
-in the train-stack README.
+- **HSDP** — `fsdp_mode: hybrid` + `hsdp_shard_size` on `FSDPBackend`; see
+  [Choosing HSDP](../unirl/train/readme.md#choosing-hsdp-hybrid-sharding).
+- **VeOmni train backend** — `backend._target_: unirl.train.backend.veomni.backend.VeOmniBackend`;
+  see [Choosing the VeOmni backend](../unirl/train/readme.md#choosing-the-veomni-backend),
+  which lists every VeOmni recipe.
 
 End-to-end walkthroughs — data/config through checkpoint and resume — live in
 the trainer README: [run supervised fine-tuning](../unirl/trainer/README.md#run-supervised-fine-tuning)
