@@ -24,7 +24,7 @@ builder contracts only.
 
 Each turns one shard of records into the `Part` its algorithm consumes, using
 the pipeline's own stages — the prompt side is whatever rollout would render,
-so SFT trains on the token sequence inference will see.
+so SFT trains on the inputs inference will see.
 
 ## Agent chat-stage contract
 

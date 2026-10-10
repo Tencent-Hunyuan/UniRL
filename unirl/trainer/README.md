@@ -128,7 +128,9 @@ The SFT path swaps the loop's producer: no rollout engine, no reward, no weight
 sync. A manifest feeds `SFTTrainer`, which reuses the RL consumer side
 (bundle → pipeline → backend → stack) verbatim; only the producer changes —
 `track_builder` turns dataset records into a standalone training `Part` on the
-workers, and the algorithm is anchor-free cross-entropy. Entrypoint:
+workers, and the algorithm is anchor-free (`requires_advantages=False`):
+token cross-entropy (`SFT`) for text / VLM / agent, flow-matching on latents
+(`FlowMatchSFT`, Cosmos's `Cosmos3JointFlowMatchSFT`) for T2I / video. Entrypoint:
 [`unirl/train_sft.py`](../train_sft.py); recipes under
 [`examples/sft/`](../../examples/README.md); builder contracts in
 [`train/sft/README.md`](../train/sft/README.md).
@@ -150,11 +152,11 @@ records — opaque on the driver; media never crosses the driver boundary
   │  SFTTrainer.train_step
   ▼
 track_builder.build(records) — on the training workers, using the pipeline's own
-  │  stages (tokenize / chat template / VAE encode), so SFT trains on exactly the
-  │  token sequence inference would render
+  │  stages (tokenize / chat template / VAE encode), so SFT conditions on exactly
+  │  what inference would render
   ▼
 training Part
-  │  TrainStack.train_track — FSDPBackend · SFT cross-entropy (no advantages)
+  │  TrainStack.train_track — SFT / FlowMatchSFT loss (no advantages)
   ▼
 one optimizer step
 ```
@@ -176,7 +178,8 @@ SFT saves on the generic cadence and in the generic formats from
 `shuffle`) and the train manifest's SHA-256 fingerprint.
 
 ```bash
-# num_steps stays the TOTAL budget; ++ works whether or not the recipe defines the key.
+# Resume from an existing checkpoint-200. num_steps stays the TOTAL budget;
+# ++ works whether or not the recipe defines the key.
 SFT_DATA=data/sft_alpaca/train.jsonl SFT_EVAL_DATA=data/sft_alpaca/val.jsonl \
   ENTRY=train_sft bash examples/run_experiment_single_node.sh sft/qwen3_sft \
   ++num_steps=400 ++save_interval=100 \
@@ -197,12 +200,13 @@ legacy checkpoint without `sft_data_state.json` falls back to fast-forwarding
 ## Run async AR or async diffusion training
 
 The async paths disaggregate the loop: training and the rollout engine each
-own a **slab** — a disjoint `placement` scope over a subset of the GPU pool
-(`layout: separate`, split by `train_fraction`) — so generation overlaps
-scoring and training instead of time-sharing each GPU.
-Both are FIFO batch trainers driven by one shared loop
-([`async_rollout.py`](async_rollout.py)); they differ in engine, weight-sync
-handler, and what they pin down.
+own a **slab** — a disjoint `placement` scope over a subset of the GPU pool,
+split by `train_fraction` — instead of time-sharing each GPU. Async AR launches
+the next batch before scoring, so generation overlaps scoring and training;
+async diffusion scores each intact batch before launching its replacement, so
+generation overlaps training only. Both are FIFO batch trainers driven by one
+shared loop ([`async_rollout.py`](async_rollout.py)); they differ in engine,
+weight-sync handler, and what they pin down.
 
 | Path | Entrypoint | Default recipe | Engine · sync |
 | --- | --- | --- | --- |
@@ -231,27 +235,28 @@ at an eval/save boundary:
 1. **Quiesce.** The manager pauses dispatch and drains the engine; suspended
    and undispatched prompts are kept or discarded **atomically per prompt
    root** by the lag filter.
-2. **Batch-align the carry.** Partially generated batches finish in full — a
-   publication never splits one training batch across behavior-policy
-   versions — and a carried prefix tops the ready buffer up to a whole batch.
+2. **Batch-align the carry**, so a publication never splits one training batch
+   across behavior-policy versions: if any carried prompt has started, the
+   whole carry finishes under the old weights; otherwise only the prefix needed
+   to top the ready buffer up to a whole batch finishes.
 3. **Publish.** Weights cross to the engine (which requires no in-flight work
-   and a monotone version), carried prompts are resubmitted, and
-   `published_version` becomes the `train_version`.
+   and a monotone version), the unstarted remainder of the carry is
+   resubmitted, and `published_version` becomes the `train_version`.
 
 **Hard boundaries** — every `eval_interval`, every `save_interval`, and the
-final rollout — require an *empty* manager: no carry crosses them, and the
-final one raises if anything is still in flight. Per-trainer eval behavior is
+final rollout — require an *empty* manager: no carry crosses them, and each one
+raises if work remains after quiescing. Per-trainer eval behavior is
 in [Evaluation cadence](#evaluation-cadence); residency rules are in
 [How it works](#how-it-works).
 
-### Variant constraints (fail fast at startup)
+### Variant constraints
 
 | Constraint | Async AR | Async diffusion |
 | --- | --- | --- |
 | Algorithm | must require advantages — teacher-anchored or supervised objectives are rejected; use the synchronous `ARTrainer` | no extra check beyond the sync diffusion path |
-| `reward:` block | required (reward-free AR training is sync-only) | scored at reap time, outside `_reward_phase()` |
+| `reward:` block | required (reward-free AR training is sync-only) | required: every batch is scored at reap time, outside `_reward_phase()`. Not checked at startup, so a missing block fails on the first batch |
 | `sync:` block | required, and must be `NCCLWeightSync` — full dense weights cross the slab | required (the BAGEL default pushes LoRA via `RemoteLoraWeightSync`) |
-| Engine | dedicated engine (vLLM/SGLang) on the rollout slab; the trainside direct-sampling engine cannot live cross-slab | dedicated vLLM-Omni rollout slab |
+| Engine | dedicated engine (vLLM/SGLang) on the rollout slab; the trainside direct-sampling engine cannot live cross-slab | dedicated engine (vLLM-Omni — the BAGEL default — or SGLang diffusion); trainside is rejected |
 | Geometry / inflight | `train_fraction * num_devices` integral; `batch_size * samples_per_prompt` divisible by the train-slab size | all of the AR geometry rules, plus `layout: separate` and `max_inflight = 1` are enforced |
 
 `max_inflight = 1` on async diffusion is structural, not a tuning knob: queued

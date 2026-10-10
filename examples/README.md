@@ -135,7 +135,7 @@ related recipes sort together.
 | `algorithm` | middle | `dancegrpo`, `mixgrpo`, `nft`, `flowdppo`, `grpo`, `drpo` | plain FlowGRPO (diffusion default); GRPO (AR default) |
 | `engine` | after algorithm | `trainside`, `sglang`, `vllmomni` | — |
 | `backend` | after engine | `veomni` (the VeOmni train backend) | `FSDPBackend` (the implicit default) |
-| `adapter` | after engine | `full`, `lora` | unambiguous from the rest |
+| `adapter` | after backend (after engine when backend is omitted) | `full`, `lora` | unambiguous from the rest |
 | `topology` | last | placement `colocate`/`separate`; sync `nccl`/`tensor`/`ipc`; engine mode `rollout`/`replay`; sharding `hsdp`; parallel degree `sp`/`ep`; cluster `<N>x<G>` | single-slab colocate default |
 
 Worked examples:
