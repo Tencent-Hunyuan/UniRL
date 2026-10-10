@@ -14,7 +14,7 @@ from unirl.types.loss_agg import LossAggMode
 from unirl.types.sample import Part
 
 
-def _row_token_counts(part: Part, *, owner: str) -> List[int]:
+def _row_token_counts(part: Part, *, owner: str) -> List[float]:
     """Valid-token count of every row (loss_mask-aware), read back in one host transfer."""
     segment = part.segment
     if segment is None:
@@ -22,8 +22,7 @@ def _row_token_counts(part: Part, *, owner: str) -> List[int]:
     cu = segment.cu_seqlens
     loss_mask = getattr(segment, "loss_mask", None)
     if loss_mask is not None and cu is not None:
-        csum = torch.nn.functional.pad(loss_mask.cumsum(0), (1, 0))
-        cu = cu.long()
+        csum = torch.nn.functional.pad(loss_mask.cumsum(0, dtype=torch.float64), (1, 0))
         return (csum[cu[1:]] - csum[cu[:-1]]).tolist()
     if segment.lengths is not None:
         return segment.lengths.tolist()
