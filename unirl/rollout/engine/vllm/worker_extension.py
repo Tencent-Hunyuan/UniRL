@@ -10,7 +10,6 @@ class UniRLWeightSyncExtension:
 
     def unirl_weight_sync_capabilities(self) -> dict[str, Any]:
         import torch
-        from vllm import __version__ as vllm_version
         from vllm.distributed import (
             get_tensor_model_parallel_rank,
             get_tensor_model_parallel_world_size,
@@ -20,7 +19,6 @@ class UniRLWeightSyncExtension:
             "tp_rank": int(get_tensor_model_parallel_rank()),
             "tp_world_size": int(get_tensor_model_parallel_world_size()),
             "cuda_device_uuid": str(torch.cuda.get_device_properties(torch.cuda.current_device()).uuid),
-            "vllm_version": str(vllm_version),
         }
 
     def unirl_native_weight_sync_receipt(self, *, header: Mapping[str, Any]) -> dict[str, Any]:

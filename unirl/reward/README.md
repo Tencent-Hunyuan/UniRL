@@ -22,6 +22,40 @@ thin HTTP client for the standalone server in `unirl-reward-service/`.
 Turning rewards into advantages is the trainer's job
 (`Part.compute_advantages`); generating the media is the rollout engine's.
 
+## Local scorer registry
+
+The canonical built-in names are the keys in
+[`local/registry.py`](local/registry.py). `VideoRewardScorer` resolves its
+`inner_model_name` through the registry; recipes otherwise instantiate the
+listed scorer classes directly with Hydra `_target_`.
+
+| Registry key | Input | Purpose and restrictions |
+|---|---|---|
+| `aesthetic` | image | Registered placeholder; model loading and scoring are not implemented. |
+| `clip` | image | CLIP prompt-image similarity. |
+| `geneval2` | image + evaluation questions | Local Qwen3-VL Soft-TIFA scorer; `vqa_list` comes from row metadata or a configured dataset file; rows with neither score 0. |
+| `hpsv2` | image | HPS v2 prompt-image preference. |
+| `hpsv3` | image | HPS v3 prompt-image preference. |
+| `hpsv3pp` | image | HPSv3++ scorer; requires its source checkout/config and accepts a local or Hugging Face-hosted checkpoint. |
+| `image_reward` | image | ImageReward prompt-image preference. |
+| `ocr` | image | OCR similarity against the quoted target span in the prompt. |
+| `pickscore` | image | PickScore prompt-image preference. |
+| `videopickscore` | video | PickScore on one configured representative frame. |
+| `videoclipdelta` | video + condition video | Prompt alignment minus similarity to the source video; V2V only. |
+| `videoalign` | video | Vendored VideoAlign prompt-video scorer. |
+| `mc_exact_match` | text + metadata | Multiple-choice answer match against `metadata.answer`; rows without it score 0 rather than raising. |
+| `clap` | generated audio/video | CLAP prompt-audio alignment for T2AV output; requires the generated audio and its sample rate. |
+| `imagebind` | generated audio/video | ImageBind audio/video/text alignment; noncommercial upstream license. `RewardService` rejects it for training unless `mode` is `text_video` or `all` with a positive `text_video` weight (override with `require_prompt_video: false`). |
+| `t2av_composite` | generated audio/video | Weighted composition of video-capable inner scorers; rejects a mix without a positive prompt-video term. |
+| `per_domain` | image + metadata | Routes rows by `metadata.domain` to configured inner scorers. |
+
+`MathVerifyRewardScorer` (`math_verify`) and `LLMJudgeRewardScorer`
+(`llm_judge`) are valid direct recipe targets but are not entries in the
+built-in registry. `VideoRewardScorer` is a wrapper whose
+`inner_model_name` must resolve through the registry; it is not a registry key
+itself. The standalone HTTP service has a separate registry and deployment
+matrix in [`../../unirl-reward-service/README.md`](../../unirl-reward-service/README.md).
+
 ## Why it exists
 
 RL is only as good as its reward signal, and two things about that signal are
@@ -49,9 +83,13 @@ never mutates the input Sample — it returns a fresh one. Per call it:
 3. **Scores** — hands a typed `RewardRequest` to `backend.compute_rewards`, getting
    back rewards, per-component rewards, and per-sample success flags.
 4. **Fails fast** — raises and names the sample if any failed.
-5. **Zeroes runaway AR traces** — when the scored Part is itself an AR generation,
-   one that hit `max_new_tokens` (never terminated) gets reward 0, so training
-   doesn't learn to ramble to the cap.
+5. **Applies the AR truncation policy** — only when the scored Part is a
+   variable-length AR generation (fixed-length AR media such as Janus-Pro image
+   tokens always reaches `max_new_tokens` and keeps its reward).
+   `truncated_reward: zero` (default) assigns reward 0 to a trace that hit
+   `max_new_tokens`, `keep` preserves the scorer result, and `soft` adds a
+   penalty that grows linearly over the last `overlong_buffer_len` tokens,
+   scaled by `overlong_penalty_factor`.
 6. **Attaches** `rewards` + `component_rewards` and returns the Sample.
 
 A backend is just `compute_rewards(request) -> RewardResponse`. Local scorers

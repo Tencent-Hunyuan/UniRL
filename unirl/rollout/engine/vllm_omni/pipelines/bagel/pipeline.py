@@ -222,14 +222,14 @@ class RLBagelPipeline(BagelPipeline):
 
     @staticmethod
     def _prompt_text(req: OmniDiffusionRequest) -> str:
-        """The request's prompt string (upstream's own extraction, pipeline_bagel:327)."""
-        prompt = req.prompts[0]
+        """The request's prompt string, extracted the way upstream does."""
+        prompt = req.prompt
         return prompt if isinstance(prompt, str) else (prompt.get("prompt") or "")
 
     @staticmethod
     def _source_image(req: OmniDiffusionRequest) -> Optional[PIL.Image.Image]:
         """The it2i source PIL off the prompt dict; ``None`` on the t2i path."""
-        prompt = req.prompts[0] if getattr(req, "prompts", None) else None
+        prompt = req.prompt
         if not isinstance(prompt, dict):
             return None
         image = (prompt.get("multi_modal_data") or {}).get("image")
@@ -334,7 +334,7 @@ class RLBagelPipeline(BagelPipeline):
 
     def _is_batchable_t2i(self, req: OmniDiffusionRequest) -> bool:
         """Packed DiT batching: pure text→image at cfg=1 only. Expects the unwrapped request."""
-        fp = req.prompts[0] if getattr(req, "prompts", None) else None
+        fp = req.prompt
         if isinstance(fp, dict):
             modalities = fp.get("modalities") or []
             if "text" in modalities:

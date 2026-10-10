@@ -103,7 +103,7 @@ The current trainer surface is:
 | `AsyncDiffusionTrainer` | FIFO diffusion generation batch → one `TrainStack` | The same update-versioned manager loop for DiT. Requires `max_inflight=1` and resolves and scores each intact batch before launching its replacement, so cross-slab transfer never queues behind fresh generation. |
 | `PETrainer` | `ar` + `diffusion` Parts → two `TrainStack`s | Composed prompt-rewrite/image rollout; image rewards propagate to AR rewrites. `freeze_llm=true` trains and checkpoints diffusion only. |
 | `UnifiedModelTrainer` | whole `Sample` → one `UnifiedModelTrainStack` | AR and image losses accumulate into shared-backbone optimizer steps while prompt-tree lineage remains intact during DP scatter. |
-| `AgenticTrainer` | variable-depth `List[Sample]` → concatenated turn `Part` | Colocated barrier multi-turn tool use. It syncs every step, waits for complete groups, scores terminal answers through `RewardService`, and excludes failed trajectories. |
+| `AgenticTrainer` | variable-depth `List[Sample]` → concatenated turn `Part` | Colocated barrier multi-turn tool use. It syncs every step, waits for complete groups, scores terminal answers through `RewardService`, and excludes failed trajectories. Overflow trajectories are scored like completed ones; `mask_overflow_loss=true` keeps them in the group baseline but drops their gradient. |
 
 All async variants use the driver-local `RolloutManager`. Batch trainers provide
 one slab-wide launcher and keep completed batches intact; the agentic trainer
