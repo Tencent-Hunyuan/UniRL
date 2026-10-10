@@ -208,6 +208,20 @@ use LoRA adapter mode. Formats and export live in
   teachers reload from their paths and the checkpoint pins each by a content sha256, so a
   different teacher set or different weights raises on `load`. A checkpoint trained without
   teachers resumes into any teacher set.
+- **AdamW takes the single-tensor path only for a *mixed* `Tensor`/`DTensor` param bag** —
+  `build_optimizer` sets `foreach=False` only for the params it actually hands to AdamW, and
+  only when those mix FSDP-wrapped `DTensor`s with plain `Tensor`s; every all-`DTensor`
+  configuration keeps torch's default (multi-tensor on CUDA, single-tensor on CPU) instead of
+  the per-parameter loop. In the FSDP backend that mix needs `training.fsdp.root_wrap=false` on
+  a **single** rank: the stray-param guard in `fsdp_wrap` runs at `world_size > 1` only, so on
+  one rank an unfrozen leftover (full FT of the fp32-pinned `proj_in` / `time_embedder` that
+  the LoRA recipes ship frozen) puts a plain `Tensor` into a `DTensor` list and the
+  multi-tensor kernels reject it with `RuntimeError: aten._foreach_lerp_.Scalar got mixed
+  torch.Tensor and DTensor`. The VeOmni backend parallelizes through `parallelize_model_fsdp2`
+  instead, which carries no equivalent guard — its param mix is not assumed here. Params under
+  `cpu_offload` report `device.type == "cpu"`, so torch's own device gate keeps them on the
+  single-tensor path, and `clip_grad_norm` catches the same mixed bag by message in
+  `backend/fsdp/state.py`.
 
 ## Profiling → Perfetto
 

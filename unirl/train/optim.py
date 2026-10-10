@@ -51,6 +51,21 @@ def _build_named_param_groups(
     return groups
 
 
+def _adam_kwargs(config: OptimizerConfig, params: Iterable[torch.nn.Parameter]) -> dict:
+    """AdamW kwargs; single-tensor only for a mixed Tensor/DTensor bag (see unirl/train/readme.md)."""
+    from torch.distributed.tensor import DTensor
+
+    wrapped = [isinstance(p, DTensor) for p in params]
+    kwargs = dict(
+        betas=(float(config.adam_beta1), float(config.adam_beta2)),
+        eps=float(config.adam_epsilon),
+        weight_decay=float(config.weight_decay),
+    )
+    if any(wrapped) and not all(wrapped):
+        kwargs["foreach"] = False
+    return kwargs
+
+
 def build_optimizer(
     config: OptimizerConfig,
     *,
@@ -66,13 +81,6 @@ def build_optimizer(
         if backend_optimizer is not None:
             return backend_optimizer
 
-    adam_kwargs = dict(
-        betas=(float(config.adam_beta1), float(config.adam_beta2)),
-        eps=float(config.adam_epsilon),
-        weight_decay=float(config.weight_decay),
-        foreach=False,
-    )
-
     param_group_lrs = getattr(config, "param_group_lrs", None)
     if param_group_lrs and named_params is not None:
         groups = _build_named_param_groups(
@@ -81,10 +89,11 @@ def build_optimizer(
             group_lrs=dict(param_group_lrs),
         )
         if groups:
-            return torch.optim.AdamW(groups, lr=float(config.learning_rate), **adam_kwargs)
+            grouped = [p for group in groups for p in group["params"]]
+            return torch.optim.AdamW(groups, lr=float(config.learning_rate), **_adam_kwargs(config, grouped))
 
     trainable = [p for p in params if p.requires_grad]
-    return torch.optim.AdamW(trainable, lr=float(config.learning_rate), **adam_kwargs)
+    return torch.optim.AdamW(trainable, lr=float(config.learning_rate), **_adam_kwargs(config, trainable))
 
 
 def build_lr_scheduler(
