@@ -34,10 +34,8 @@ the file starts over. Evaluation reads `eval_data_path` in order and keeps the
 last partial batch. If `eval_data_path` is unset, evaluation reuses the training
 prompts, so it is not a held-out score.
 
-For a worked example, [DAPO-Math preparation](../../datasets/dapo_math/README.md)
-builds the file that the
-[Qwen3 DRPO recipe](../../examples/ar/qwen3_drpo_4b_base_dapo_sglang.yaml) reads
-through `DATA_PATH`.
+[DAPO-Math preparation](../../datasets/dapo_math/README.md) builds such a file for
+the [Qwen3 DRPO recipe](../../examples/ar/qwen3_drpo_4b_base_dapo_sglang.yaml).
 
 ## SFT manifests
 
@@ -66,15 +64,10 @@ through `SFT_DATA` and `SFT_EVAL_DATA`.
 
 ## Media
 
-Both formats list media in a `media` (or `media_refs`) field. Each entry has
-exactly these three keys:
-
-```json
-{"modality":"image","role":"condition","uri":"images/0001.png"}
-```
-
-A relative `uri` is resolved against the folder that contains the data file.
-Nothing is downloaded. The `role` decides what happens to the file:
+Both formats list media in a `media` (or `media_refs`) field, as in the SFT
+example above. Each entry has exactly `modality`, `role`, and `uri`. A relative
+`uri` is resolved against the folder that contains the data file, and nothing is
+downloaded. The `role` decides what happens to the file:
 
 | `role` | Modalities | What happens |
 | --- | --- | --- |
@@ -99,15 +92,14 @@ The multi-domain RL source accepts no media at all.
 - **Media does not go in `metadata`.** RL rejects `metadata["_media_refs"]`; use
   the `media` field.
 
-## Code map
+## Code
 
-| Class | File | Role |
-| --- | --- | --- |
-| `TextPromptDataset` | [`datasets.py`](datasets.py) | Reads one RL prompt file |
-| `MultimodalRLDataSource` | [`data_source.py`](data_source.py) | RL batches from one prompt file |
-| `MultiDomainRLDataSource` | [`data_source.py`](data_source.py) | RL batches from several prompt files, one domain per batch in turn, tagged `metadata["domain"]`; text only |
-| `SupervisedDataset`, `SupervisedDataSource` | [`sft.py`](sft.py) | SFT manifest reader and batch iterator, including resume state |
-| `DefaultDataSource` | [`data_source.py`](data_source.py) | Eight hardcoded prompts; no checked-in recipe uses it |
+`TextPromptDataset` ([`datasets.py`](datasets.py)) reads RL prompt files and
+`MultimodalRLDataSource` ([`data_source.py`](data_source.py)) batches them;
+`MultiDomainRLDataSource` in the same file takes several text-only prompt files
+and serves one domain per batch in turn. `SupervisedDataset` and
+`SupervisedDataSource` ([`sft.py`](sft.py)) read and batch SFT manifests and hold
+the resume state.
 
 To read another RL file layout, subclass `MultimodalRLDataSource` and return your
 own `PromptExampleDataset` from `_build_dataset`. A new media type or target also
