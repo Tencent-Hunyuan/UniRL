@@ -138,9 +138,10 @@ use LoRA adapter mode. Formats and export live in
 - **`optimizer_step` silently *skips* (does not crash) on a non-finite grad norm**
   and zeroes grads — a flat loss curve with a logged warning means grads went
   non-finite.
-- **Checkpointing preserves a never-stepped AdamW** — DCP materializes empty
-  optimizer state with a dummy step; UniRL resets it so the first real update
-  remains step 1.
+- **Checkpointing preserves never-updated AdamW params** — export writes a param
+  without state (or a never-stepped AdamW) as the step-0 zero state its first
+  update would create, so torch and DCP checkpoints stay dense; load drops step-0
+  entries back to lazy init. Torch-format checkpoints that omitted them still load.
 - **`master_dtype` defaults to `None`, so the optimizer master follows `param_dtype`** —
   a bf16-loaded base then keeps a bf16 LoRA master and the ~1e-6 AdamW steps round
   away (the policy drifts into a degenerate reward-hack). An fp32-loaded model gets an
