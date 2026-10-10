@@ -60,6 +60,63 @@ in `backend/base.py`; a multi-update-capable algorithm sets
 `recomputes_anchor` when its anchor must follow the planned micro geometry (see
 `../algorithms/README.md`).
 
+## Choosing HSDP (hybrid sharding)
+
+`fsdp_mode: hybrid` on `FSDPBackend` builds a
+`(world / hsdp_shard_size, hsdp_shard_size)` replicate × shard mesh: parameters
+shard within each `hsdp_shard_size` group, and the groups hold replicated copies
+whose gradients are all-reduced. Choose it when a shard group that fits one node
+over NVLink is a cheaper all-gather domain than the whole world;
+`hsdp_shard_size: devices_per_node` is the usual layout (world 16, shard 8 → a
+`(2, 8)` mesh). The trade is memory: per-rank weight + optimizer memory is
+`world_size / hsdp_shard_size` times the `full`-mode footprint.
+`resolve_fsdp_mesh_shape` ([`configs.py`](configs.py)) fails fast unless the
+shard size is `>= 2`, the world is strictly larger (a one-group world is
+`full`), and the world divides by the shard size.
+
+Checked-in recipes:
+[`diffusion/minimax_h3/minimax_h3_t2va_trainside_hsdp_2x8_validation`](../../examples/diffusion/minimax_h3/minimax_h3_t2va_trainside_hsdp_2x8_validation.yaml)
+— a 2×8 **validation/smoke** recipe, not a production default — and
+[`ar/bagel_grpo_arxivqa_mc_2x8_lora`](../../examples/ar/bagel_grpo_arxivqa_mc_2x8_lora.yaml).
+
+## Choosing the VeOmni backend
+
+`VeOmniBackend` ([`backend/veomni/backend.py`](backend/veomni/backend.py)) is a
+per-recipe alternative to `FSDPBackend`, selected by
+`backend._target_: unirl.train.backend.veomni.backend.VeOmniBackend`. It subclasses the same base, so the checkpoint/save/resume formats, the
+optimizer, and the `TrainStack` contract are unchanged. Install with the
+`veomni` extra (`pip install -e '.[veomni]'`; extras table in
+[INSTALL.md](../../INSTALL.md)).
+
+What it adds: Ulysses sequence parallelism (`fsdp_cfg.sp_size` — must divide
+`world_size`, and the model's attention heads) and MoE expert parallelism
+(`fsdp_cfg.ep_size` — must divide `world_size` and the expert count; each rank
+owns `num_experts / ep_size` experts, tokens routed all-to-all into fused
+grouped-GEMM). The VeOmni bundles build the transformer on the **meta device**
+— VeOmni's parallelize asserts meta init, and the backend loads real weights
+after sharding — so a bundle without meta-init support cannot run on this
+backend.
+
+Climb the ladder from a parity twin before the parallel variants; it lists
+every checked-in VeOmni recipe:
+
+| Step | Recipe | Exercises |
+| --- | --- | --- |
+| 1 | [`diffusion/sd3_trainside_veomni`](../../examples/diffusion/sd3_trainside_veomni.yaml) | parity twin of `sd3/sd3_trainside` on VeOmniBackend (`sp_size: 1`) — backend parity |
+| 2 | [`ar/qwen3_grpo_4b_veomni_sp_sglang`](../../examples/ar/qwen3_grpo_4b_veomni_sp_sglang.yaml), [`ar/qwen3_drpo_4b_veomni_sp_sglang`](../../examples/ar/qwen3_drpo_4b_veomni_sp_sglang.yaml) | Ulysses SP (`sp_size: 2`) + SGLang, GRPO and DRPO |
+| 3 | [`ar/qwen3_moe_grpo_30b_a3b_veomni_ep_sglang`](../../examples/ar/qwen3_moe_grpo_30b_a3b_veomni_ep_sglang.yaml), [`ar/qwen3_5_moe_grpo_35b_a3b_base_dapo_sglang`](../../examples/ar/qwen3_5_moe_grpo_35b_a3b_base_dapo_sglang.yaml), [`ar/qwen3_5_moe_grpo_35b_a3b_geo3k_mc_sglang`](../../examples/ar/qwen3_5_moe_grpo_35b_a3b_geo3k_mc_sglang.yaml) | expert parallelism (`ep_size: 8`) on 30B-A3B / 35B-A3B MoE |
+| 4 | [`diffusion/qwen_image_trainside_veomni`](../../examples/diffusion/qwen_image_trainside_veomni.yaml), [`unified_model/hi3_vllmomni_veomni_ep`](../../examples/unified_model/hi3_vllmomni_veomni_ep.yaml) | Qwen-Image parity twin; HI3 unified model with EP |
+
+v1 restrictions, all validated fail-fast in `_validate_fsdp_cfg`:
+`fsdp_mode='full'` only (HSDP stays on `FSDPBackend`), `mixed_precision` must
+stay enabled, and `cpu_offload` / `copy_engine_all_gather` are unsupported.
+Separately, with `ep_size > 1`, full **DCP** checkpoints are rejected — the
+expert split is not encoded in the DTensor placements. This is checked at save
+and load time, not at startup, so a run with `checkpoint_format: dcp` fails at
+its first checkpoint; keep the default `checkpoint_format: torch` (EP-aware) or
+use LoRA adapter mode. Formats and export live in
+[`trainer/README.md · Checkpointing`](../trainer/README.md#checkpointing).
+
 ## Gotchas
 
 - **`num_updates_per_batch > 1` needs `supports_multi_update` *and* must evenly
@@ -75,9 +132,10 @@ in `backend/base.py`; a multi-update-capable algorithm sets
 - **`optimizer_step` silently *skips* (does not crash) on a non-finite grad norm**
   and zeroes grads — a flat loss curve with a logged warning means grads went
   non-finite.
-- **Checkpointing preserves a never-stepped AdamW** — DCP materializes empty
-  optimizer state with a dummy step; UniRL resets it so the first real update
-  remains step 1.
+- **Checkpointing preserves never-updated AdamW params** — export writes a param
+  without state (or a never-stepped AdamW) as the step-0 zero state its first
+  update would create, so torch and DCP checkpoints stay dense; load drops step-0
+  entries back to lazy init. Torch-format checkpoints that omitted them still load.
 - **`master_dtype` defaults to `None`, so the optimizer master follows `param_dtype`** —
   a bf16-loaded base then keeps a bf16 LoRA master and the ~1e-6 AdamW steps round
   away (the policy drifts into a degenerate reward-hack). An fp32-loaded model gets an
@@ -118,15 +176,6 @@ in `backend/base.py`; a multi-update-capable algorithm sets
   skips backward (an all-empty micro) while earlier ones ran, `TrainStack.train`
   raises instead of silently stepping on never-synced grads (which would also
   leak the stale accumulation into the next step's reduce-scatter).
-- **`fsdp_mode: hybrid` makes the HSDP shard group explicit** —
-  `hsdp_shard_size` is the number of contiguous ranks that shard parameters;
-  the remaining `world_size / hsdp_shard_size` dimension holds replicated
-  model copies and synchronizes their gradients. Set it to `devices_per_node`
-  for the usual intra-node FSDP + inter-node replication layout (for example,
-  world 16 with shard 8 gives a `(2, 8)` mesh). Larger groups such as shard 32
-  are supported when the world is a larger divisible multiple. Hybrid fails
-  fast when the shard size does not divide the world or leaves only one replica
-  group; use `full` for that one-group case.
 - **`fsdp_mode: no_shard` trades memory for the all-gather** — a `(world, 1)` mesh
   leaves the full model on every rank, so no parameter bytes cross ranks and only
   gradients are all-reduced (DDP). It pays off where the re-gathered bytes dwarf the
