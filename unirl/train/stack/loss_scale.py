@@ -14,10 +14,10 @@ from unirl.types.loss_agg import LossAggMode
 from unirl.types.sample import Part
 
 
-def micro_token_count(part: Part, start: int, end: int, *, order: Optional[torch.Tensor], owner: str) -> float:
+def _micro_token_count(part: Part, start: int, end: int, *, order: Optional[torch.Tensor], owner: str) -> float:
     """Valid-token count of arranged positions ``[start, end)`` (loss_mask-aware)."""
     if order is not None:
-        return sum(micro_token_count(part, row, row + 1, order=None, owner=owner) for row in order[start:end].tolist())
+        return sum(_micro_token_count(part, row, row + 1, order=None, owner=owner) for row in order[start:end].tolist())
     segment = part.segment
     if segment is None:
         raise ValueError(f"{owner}: loss_agg_mode='token-mean' requires a segment.")
@@ -53,7 +53,7 @@ def resolve_loss_scales(
             f"{owner}: loss_agg_mode='token-mean' is not validated under "
             f"sequence parallelism (sp_size={rank_info.sp_size}); use sp_size=1."
         )
-    weights = [micro_token_count(part, start, end, order=order, owner=owner) for start, end in micros]
+    weights = [_micro_token_count(part, start, end, order=order, owner=owner) for start, end in micros]
     (global_total,) = backend.all_reduce_loss_sums([sum(weights)])
     if global_total <= 0.0:
         return [0.0] * len(weights), global_total
@@ -61,4 +61,4 @@ def resolve_loss_scales(
     return [w * dp_world / global_total for w in weights], global_total
 
 
-__all__ = ["micro_token_count", "resolve_loss_scales"]
+__all__ = ["resolve_loss_scales"]

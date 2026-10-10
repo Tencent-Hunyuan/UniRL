@@ -16,7 +16,7 @@ from unirl.distributed.group.remote import Remote
 from unirl.distributed.tensor.batch import _move_value
 from unirl.train.backend.fsdp import FSDPBackend
 from unirl.train.stack.anchor import prepare_segment_anchors, validate_anchor_contract
-from unirl.train.stack.loss_scale import micro_token_count, resolve_loss_scales
+from unirl.train.stack.loss_scale import resolve_loss_scales
 from unirl.train.stack.planner import (
     Arrangement,
     CountPlanner,
@@ -160,7 +160,6 @@ class TrainStack(Remote):
             )
         micro_results: List[AlgorithmStepResult] = []
         total_loss = 0.0
-        weighted_loss_sum = 0.0
         has_backward = False
 
         single_micro = len(micros) == 1 and micros[0] == (0, bs)
@@ -178,10 +177,7 @@ class TrainStack(Remote):
                 loss_scale=loss_scales[i] * loss_weight,
             )
             micro_results.append(result)
-            if global_weight is None:
-                total_loss += result.loss * loss_scales[i]
-            else:
-                weighted_loss_sum += result.loss * micro_token_count(part, start, end, order=order, owner=cls)
+            total_loss += result.loss * loss_scales[i]
             has_backward = has_backward or result.has_backward
 
         aggregated_metrics: Mapping[str, object] = aggregate_numeric_metrics(
@@ -223,12 +219,9 @@ class TrainStack(Remote):
                 "cuda_reserved_gb": torch.cuda.memory_reserved() / 2**30,
             }
 
-        if global_weight is None:
-            (global_loss_sum,) = self._all_reduce_sums([total_loss])
-            total_loss = global_loss_sum / self.fsdp_backend.gradient_average_world_size()
-        else:
-            (global_loss_sum,) = self._all_reduce_sums([weighted_loss_sum])
-            total_loss = global_loss_sum / global_weight
+        (global_loss_sum,) = self._all_reduce_sums([total_loss])
+        total_loss = global_loss_sum / self.fsdp_backend.gradient_average_world_size()
+        if global_weight is not None:
             aggregated_metrics = {**dict(aggregated_metrics), "global_loss_weight": global_weight}
 
         return TrainStepResult(

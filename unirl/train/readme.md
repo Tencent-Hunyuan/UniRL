@@ -103,14 +103,11 @@ in `backend/base.py`; a multi-update-capable algorithm sets
   image track use sample share. Both stacks report the DP-global loss and, under
   `token-mean`, `global_loss_weight`; zero valid tokens across DP raises in `TrainStack`.
 - **A zero-valid-token AR track in `UnifiedModelTrainStack` still backwards** —
-  masked-but-present tokens backward at `loss_scale` 0, so AR-only params get zero
-  grads that AdamW still decays and steps; skipping those micros would leave `None`
-  grads, which AdamW skips. A micro with no AR tokens is skipped by the algorithm
-  itself (`has_backward=False`, `None` grads); under FSDP2 that is only safe when every
-  DP rank skips the same micro, as when all responses are empty. The image track still
-  steps and a warning is logged. Each update's AR metrics carry `global_loss_weight` and
-  `has_zero_valid_tokens` (1.0 or 0.0); rollout-level metrics average over updates, so
-  the flag reads as the fraction of zero-token updates.
+  masked micros backward at `loss_scale` 0, so AR-only params get zero grads that AdamW
+  still decays and steps (skipping them would leave `None` grads, which AdamW skips). The
+  image track steps, a warning is logged, and the update's `has_zero_valid_tokens` is 1.0
+  (a rollout-level mean over updates). A micro with no AR tokens at all is skipped by the
+  algorithm, which FSDP2 tolerates only when every DP rank skips it.
 - **Advantages are not computed here** — `train` raises if
   `part.advantages is None`; the trainer must call `compute_advantages` on the
   full shard first.
