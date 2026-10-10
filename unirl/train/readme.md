@@ -116,9 +116,11 @@ every checked-in VeOmni recipe:
 v1 restrictions, all validated fail-fast in `_validate_fsdp_cfg`:
 `fsdp_mode='full'` only (HSDP stays on `FSDPBackend`), `mixed_precision` must
 stay enabled, and `cpu_offload` / `copy_engine_all_gather` are unsupported.
-With `ep_size > 1`, full **DCP** checkpoints are rejected — the expert split is
-not encoded in the DTensor placements — so use `checkpoint_format: torch`
-(EP-aware) or LoRA adapter mode; formats and export live in
+Separately, with `ep_size > 1`, full **DCP** checkpoints are rejected — the
+expert split is not encoded in the DTensor placements. This is checked at save
+and load time, not at startup, so a run with `checkpoint_format: dcp` fails at
+its first checkpoint; keep the default `checkpoint_format: torch` (EP-aware) or
+use LoRA adapter mode. Formats and export live in
 [`trainer/README.md · Checkpointing`](../trainer/README.md#checkpointing).
 
 ## Gotchas
