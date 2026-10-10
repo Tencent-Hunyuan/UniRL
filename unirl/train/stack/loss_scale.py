@@ -14,19 +14,19 @@ from unirl.types.loss_agg import LossAggMode
 from unirl.types.sample import Part
 
 
-def _micro_token_count(part: Part, start: int, end: int, *, order: Optional[torch.Tensor], owner: str) -> float:
-    """Valid-token count of arranged positions ``[start, end)`` (loss_mask-aware)."""
-    if order is not None:
-        return sum(_micro_token_count(part, row, row + 1, order=None, owner=owner) for row in order[start:end].tolist())
+def _row_token_counts(part: Part, *, owner: str) -> List[int]:
+    """Valid-token count of every row (loss_mask-aware), read back in one host transfer."""
     segment = part.segment
     if segment is None:
         raise ValueError(f"{owner}: loss_agg_mode='token-mean' requires a segment.")
     cu = segment.cu_seqlens
     loss_mask = getattr(segment, "loss_mask", None)
     if loss_mask is not None and cu is not None:
-        return float(loss_mask[int(cu[start]) : int(cu[end])].sum().item())
+        csum = torch.nn.functional.pad(loss_mask.cumsum(0), (1, 0))
+        cu = cu.long()
+        return (csum[cu[1:]] - csum[cu[:-1]]).tolist()
     if segment.lengths is not None:
-        return float(segment.lengths[start:end].sum().item())
+        return segment.lengths.tolist()
     raise ValueError(
         f"{owner}: loss_agg_mode='token-mean' requires a packed segment "
         "(cu_seqlens/lengths) — build it via TextSegment.pack(...)."
@@ -53,7 +53,9 @@ def resolve_loss_scales(
             f"{owner}: loss_agg_mode='token-mean' is not validated under "
             f"sequence parallelism (sp_size={rank_info.sp_size}); use sp_size=1."
         )
-    weights = [_micro_token_count(part, start, end, order=order, owner=owner) for start, end in micros]
+    counts = _row_token_counts(part, owner=owner)
+    rows = order.tolist() if order is not None else range(len(counts))
+    weights = [float(sum(counts[row] for row in rows[start:end])) for start, end in micros]
     (global_total,) = backend.all_reduce_loss_sums([sum(weights)])
     if global_total <= 0.0:
         return [0.0] * len(weights), global_total
