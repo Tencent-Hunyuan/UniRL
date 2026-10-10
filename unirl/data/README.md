@@ -5,8 +5,9 @@
 > for RL, or normalized record batches for SFT.
 > Full map: [`../README.md`](../README.md).
 
-*Readers normalize raw text, media references, and metadata; downstream model
-and rollout consumers own tokenization and encoding.*
+*Readers normalize raw text, media references, and metadata; RL collation decodes
+local condition images and videos. Downstream model and rollout consumers own
+tokenization and encoding.*
 
 ## What it is
 
@@ -41,7 +42,9 @@ SFT records carry explicit text or media targets for the track builder.
 ```
 
 `metadata` carries dataset/reward information; the receiving scorer defines
-label keys such as `answer`. An explicit metadata dictionary is authoritative.
+label keys such as `answer`. Without a `metadata` field, unrecognized top-level
+keys become metadata, so `{"prompt": ..., "answer": "4"}` is equivalent. With a
+`metadata` field, other top-level keys are dropped rather than merged.
 See [DAPO-Math preparation](../../datasets/dapo_math/README.md) and the
 [Qwen3 DRPO recipe](../../examples/ar/qwen3_drpo_4b_base_dapo_sglang.yaml)
 for matching local data and `DATA_PATH` configuration.
@@ -65,10 +68,20 @@ See [manifest converters](../../datasets/sft_manifests/README.md) and the
 ### Media references
 
 - **Media uses typed references.** Put `modality`, `role`, and `uri` in each
-  `media`/`media_refs` entry. Readers check media references and resolve relative
-  paths. They do not download remote files. The selected
-  [recipe](../../examples/README.md) must support loading and using the referenced
-  media. See [`MediaRef`](../types/media.py) and [RL collation](data_source.py).
+  `media`/`media_refs` entry. Readers check these fields and resolve relative
+  paths against the manifest directory; they do not download remote files. See
+  [`MediaRef`](../types/media.py).
+- **RL collation decodes condition media on the driver.** `(image, condition)` and
+  `(video, condition)` refs become `Image`/`Video` primitives when the batch is
+  built, so their URIs must be local or shared-storage paths; remote URIs fail at
+  collation. `role="prompt"` refs (image, video, audio) pass through as `MediaRefs`
+  for the rollout engine. Other `(modality, role)` pairs are rejected; see
+  `_SUPPORTED_MEDIA_REF_ROLES` in [`data_source.py`](data_source.py).
+- **Condition media must be uniform within a batch.** Each prompt has at most one
+  condition image or video, and either every prompt in a batch has one or none
+  does. A batch cannot mix `(video, condition)` and `(video, prompt)` refs.
+  `MultiDomainRLDataSource` rejects media entirely. The selected
+  [recipe](../../examples/README.md) must also support the media it receives.
 
 ### Batch iteration
 
@@ -77,9 +90,10 @@ See [manifest converters](../../datasets/sft_manifests/README.md) and the
   Its evaluation iterator retains the tail; unset `eval_data_path` falls back to
   training prompts, which is not a held-out split. See
   [`MultimodalRLDataSource`](data_source.py) for selection rules.
-- **SFT batches can cross epochs.** The source fills the requested batch size and
-  requires `eval_manifest_path` for evaluation. Iteration and resume contracts
-  are defined in [`SupervisedDataSource`](sft.py).
+- **SFT batches can cross epochs.** The source fills the requested batch size.
+  Evaluation reads only `eval_manifest_path`; when it is unset, `SFTTrainer` logs a
+  warning and disables validation. Iteration and resume contracts are defined in
+  [`SupervisedDataSource`](sft.py).
 
 **Extending it:** subclass `PromptExampleDataset` and override
 `MultimodalRLDataSource._build_dataset` for another prompt storage layout.
@@ -88,6 +102,11 @@ track builder; changing the reader alone does not add model support.
 
 ## Gotchas
 
+- **The RL reader skips malformed rows; the SFT reader fails.** `TextPromptDataset`
+  logs a warning and drops rows with invalid JSON, no `prompt`/`caption`, or a
+  non-dict `metadata`; rows that declare media raise instead. A misnamed prompt field such as
+  `question` therefore loses data silently. `SupervisedDataset` raises on the first
+  invalid row.
 - **Prompt manifests carry raw data.** Readers reject top-level fields listed in
   [`_LEGACY_EMBEDDING_FIELDS`](datasets.py), such as `prompt_embeds` and `text_ids`;
   leave tokenization and encoding to downstream consumers.
