@@ -41,6 +41,7 @@ class HunyuanVideo15Pipeline(Pipeline):
         mllm_crop_start: int = 108,
         mllm_skip_layers: int = 2,
         byt5_max_length: int = 256,
+        text_embed_cache_size: int = 8,
         vision_num_semantic_tokens: int = 729,
         vision_states_dim: int = 1152,
         latent_channels: Optional[int] = None,
@@ -56,6 +57,7 @@ class HunyuanVideo15Pipeline(Pipeline):
                 mllm_crop_start=mllm_crop_start,
                 mllm_skip_layers=mllm_skip_layers,
                 byt5_max_length=byt5_max_length,
+                cache_size=text_embed_cache_size,
             )
         )
         if diffusion is None:
@@ -73,6 +75,10 @@ class HunyuanVideo15Pipeline(Pipeline):
         self.diffusion = diffusion
         self.vae_decode = vae_decode if vae_decode is not None else HunyuanVideo15VAEDecodeStage(bundle)
         self.shift = shift
+
+    def clear_prompt_cache(self) -> None:
+        """Clear both MLLM and ByT5 prompt-embedding caches in the text-embed stage."""
+        self.text_embed.clear_cache()
 
     @classmethod
     def latent_shape(cls, *, model_config: Any, sampling_spec: Any) -> tuple:
@@ -108,6 +114,7 @@ class HunyuanVideo15Pipeline(Pipeline):
             mllm_crop_start=config.mllm_crop_start,
             mllm_skip_layers=config.mllm_skip_layers,
             byt5_max_length=config.byt5_max_length,
+            cache_size=config.text_embed_cache_size,
         )
         step = HunyuanVideo15DiffusionStep()
         diffusion = HunyuanVideo15DiffusionStage(

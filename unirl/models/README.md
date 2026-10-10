@@ -88,6 +88,11 @@ it is the authoritative bundle / pipeline / stage / conditions contract.
   `PROMPT_TEMPLATE_SYSTEM_MESSAGE` byte-identical to upstream because
   `mllm_crop_start=108` is tied to that exact prefix length; collapsing its
   indentation drops user-prompt tokens.
+- **Trainside text-embedding deduplication and caching.** Models with frozen
+  conditioners (e.g. HunyuanVideo 1.5, MiniMax-H3, SD3) implement in-batch
+  deduplication and cross-call bounded LRU caching so sibling microbatches across
+  sequential `forward_batch_size=1` steps do not repeat multi-modal LLM conditioner
+  forward passes. Cached embeddings stay CPU-resident to guarantee zero GPU VRAM residue.
 - **Work that needs real storage goes through `types/post_materialize.py`.** A
   bundle or a structural injector (LoRA / NFT / mirror) may run while the module
   is still on the meta device, where writing a tensor is a no-op. Register such

@@ -39,6 +39,7 @@ class HunyuanVideo15PipelineConfig:
     mllm_crop_start: int = 108
     mllm_skip_layers: int = 2
     byt5_max_length: int = 256
+    text_embed_cache_size: int = 8
 
     vision_num_semantic_tokens: int = 729
     vision_states_dim: int = 1152
