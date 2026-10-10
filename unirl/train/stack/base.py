@@ -169,9 +169,45 @@ class TrainStack(Remote):
                 weighted_loss_sum += result.loss * self._micro_loss_weight(part, start, end, order=order)
             has_backward = has_backward or result.has_backward
 
+        monitor_entropy = getattr(self.algorithm, "monitor_entropy", False)
+        if monitor_entropy:
+            entropy_indices = [i for i, r in enumerate(micro_results) if "policy_entropy_sum" in r.metrics]
+            if entropy_indices:
+                sums = torch.stack([micro_results[i].metrics["policy_entropy_sum"] for i in entropy_indices]).tolist()
+                counts = torch.stack(
+                    [micro_results[i].metrics["policy_entropy_count"] for i in entropy_indices]
+                ).tolist()
+                for i, total, count in zip(entropy_indices, sums, counts):
+                    micro_results[i] = replace(
+                        micro_results[i],
+                        metrics={
+                            **micro_results[i].metrics,
+                            "policy_entropy_sum": total,
+                            "policy_entropy_count": count,
+                            "policy_entropy": total / count if count else 0.0,
+                        },
+                    )
         aggregated_metrics: Mapping[str, object] = aggregate_numeric_metrics(
             [r.metrics for r in micro_results if r.metrics]
         )
+
+        if monitor_entropy:
+            local_entropy = [
+                aggregated_metrics.get("policy_entropy_sum", 0.0),
+                aggregated_metrics.get("policy_entropy_count", 0.0),
+            ]
+            rank_info = self.rank_info
+            if rank_info is not None and (
+                rank_info.tp_rank != 0 or rank_info.sp_rank != 0 or not rank_info.is_pipeline_last_stage
+            ):
+                local_entropy = [0.0, 0.0]
+            entropy_sum, entropy_count = self._all_reduce_sums(local_entropy)
+            aggregated_metrics = {
+                **aggregated_metrics,
+                "policy_entropy_sum": entropy_sum,
+                "policy_entropy_count": entropy_count,
+                "policy_entropy": entropy_sum / entropy_count if entropy_count else 0.0,
+            }
 
         window_backward = prior_backward or has_backward
         # The stepping backward must run when deferred gradient sync is enabled.

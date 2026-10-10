@@ -154,3 +154,30 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   this: the operands are already rounded when the forward returns them. DiffusionOPD's
   `fp32 before squaring` is not the same situation — it upcasts scheduler-computed
   `prev_sample_means`, not raw network output.
+
+### Optional AR policy entropy monitoring
+
+Set `monitor_entropy: true` in the GRPO, GSPO, DPPO, DRPO, CPPO, or PPO algorithm
+configuration. The default is `false`; it does not request or compute entropy.
+Currently supported by Qwen3 replay, including MoE bundles using that stage;
+other stages reject the unsupported replay keyword when enabled.
+
+`policy_entropy` is the current policy's full-vocabulary conditional entropy in
+nats, using `sampling_temperature` (positive T, otherwise 1) before top-k/top-p.
+See [Qwen3 replay](../models/qwen3/README.md). No entropy term is added to the loss.
+Only packed response tokens with a true `loss_mask` entry contribute; no mask
+means all response tokens, including EOS when present. An all-false mask contributes
+zero sum and count, with mean reported as 0. Prompt, padding, and masked tool tokens
+never enter the denominator.
+
+`policy_entropy_sum` and `policy_entropy_count` are additive sufficient statistics.
+The shared metrics reducer sums them across microbatches and optimizer updates.
+`TrainStack` sums the statistics across the backend's loss-reduction mesh before
+returning to the driver, which retains the first rank's result. Only DP heads
+contribute, so TP/SP replicas do not multiply token counts. Detached entropy sums
+stay on device until microbatch aggregation, then two batched scalar transfers
+materialize the per-micro statistics for the CPU driver. The reducer derives
+`policy_entropy = sum / count` from those global statistics. Thus the mean is
+weighted by valid token observations, independent of `loss_agg_mode`, sequence
+length, or microbatch partitioning. Repeated optimizer updates count each policy
+observation once; the summary is not an entropy of averaged policies.
