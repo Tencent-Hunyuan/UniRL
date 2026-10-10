@@ -9,7 +9,7 @@ import torch
 from unirl.config.require import require
 from unirl.models.types.conversations import build_text_messages, build_vision_messages
 from unirl.types.conditions import TextTokenCondition
-from unirl.types.primitives import Images, Texts
+from unirl.types.primitives import Images, ImageSets, Texts
 from unirl.types.sample import Turn
 
 from .bundle import Qwen3_5Bundle
@@ -79,17 +79,19 @@ class Qwen3_5ChatTemplateStage:
             if not turns:
                 raise ValueError("Qwen3_5ChatTemplateStage.embed: expected at least one conversation turn.")
             unsupported = [
-                type(turn.content).__name__ for turn in turns if not isinstance(turn.content, (Texts, Images))
+                type(turn.content).__name__
+                for turn in turns
+                if not isinstance(turn.content, (Texts, Images, ImageSets))
             ]
             if unsupported:
                 raise ValueError(
                     f"Qwen3_5ChatTemplateStage.embed: only text and image turns are supported; got {unsupported}."
                 )
-            image_turn_count = sum(isinstance(turn.content, Images) for turn in turns)
+            image_turn_count = sum(isinstance(turn.content, (Images, ImageSets)) for turn in turns)
             require(
                 image_turn_count <= 1,
                 "Qwen3_5ChatTemplateStage.embed: at most one image turn per request "
-                "is supported (multi-image trajectories are out of scope).",
+                "is supported; one ImageSets turn may contain multiple ordered attachments.",
             )
             if image_turn_count:
                 conversations = build_vision_messages(turns, self.system_instruction)

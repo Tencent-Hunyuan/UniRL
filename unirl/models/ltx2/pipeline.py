@@ -11,7 +11,7 @@ from unirl.models.types.pipeline import Pipeline
 from unirl.sde.kernels import StepStrategy
 from unirl.sde.runtime import get_sigma_schedule
 from unirl.types.noise_recipe import NoiseRecipe
-from unirl.types.primitives import Audio, Audios, Images, Texts
+from unirl.types.primitives import Audio, Audios, Images, ImageSets, Texts
 from unirl.types.sample import Sample
 
 from .bundle import LTX2Bundle
@@ -192,7 +192,7 @@ class LTX2Pipeline(Pipeline):
                 f"got {type(texts).__name__ if texts is not None else 'None'}"
             )
 
-        if any(isinstance(c, Images) for c in conditioning[1:]):
+        if any(isinstance(c, (Images, ImageSets)) for c in conditioning[1:]):
             raise NotImplementedError(
                 "LTX2Pipeline: I2V (a chained image input) is not supported yet — "
                 "the diffusion stage does not consume conditions.image_latent. "

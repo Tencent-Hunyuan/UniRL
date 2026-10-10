@@ -44,6 +44,7 @@ def normalize_frozen_adapters(specs: Any) -> List[FrozenAdapterSpec]:
 class LoraConfig:
     rank: int = 8
     alpha: int = 16
+    initial_adapter_path: Optional[str] = None
     target_modules: Any = ("q_proj", "k_proj", "v_proj", "o_proj")
     exclude_modules: Any = None
     module_prefix: str = ""

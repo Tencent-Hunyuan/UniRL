@@ -1,0 +1,218 @@
+# @package _global_
+# DyRef stage II: Qwen-Image-Edit-2511 multi-reference RL with DRS + DAR.
+#
+# One GPU is reserved for SigLIPv2 + CSD and seven colocated train/SGLang
+# workers process complete prompt groups. CSD_CHECKPOINT must point at the
+# official CSD ViT-L pytorch_model.bin. SFT_ADAPTER_PATH must point at the
+# PEFT folder exported from stage I with `python -m unirl.tools.export_adapter`.
+
+num_devices: 8
+batch_size: 7
+reward_fraction: 0.125
+enable_fsdp_offload: true
+num_rollouts: 10000
+weight_sync_interval: 1
+save_interval: 100
+save_dir: ${oc.env:SAVE_DIR,checkpoints/qwen_image_edit_2511_dyref_rl}
+save_mode: adapter
+eval_interval: 0
+adv_use_global_std: false
+
+model_config:
+  _target_: unirl.models.qwen_image_edit_plus.config.QwenImageEditPlusPipelineConfig
+  pretrained_model_ckpt_path: ${oc.env:QWEN_IMAGE_EDIT_PLUS_PATH,Qwen/Qwen-Image-Edit-2511}
+  model_precision: bf16
+  max_sequence_length: 1024
+  load_text_encoder: false
+  load_vae: false
+  shift: 3.0
+  use_lora: true
+  lora_target_modules:
+    - attn.add_k_proj
+    - attn.add_q_proj
+    - attn.add_v_proj
+    - attn.to_add_out
+    - attn.to_k
+    - attn.to_out.0
+    - attn.to_q
+    - attn.to_v
+    - img_mlp.net.2
+    - img_mod.1
+    - txt_mlp.net.2
+    - txt_mod.1
+
+strategy:
+  _target_: unirl.sde.kernels.FlowSDEStrategy
+
+bundle:
+  _target_: unirl.models.qwen_image_edit_plus.bundle.QwenImageEditPlusBundle.from_config
+  config: ${model_config}
+
+pipeline:
+  _target_: unirl.models.qwen_image_edit_plus.pipeline.QwenImageEditPlusPipeline
+  shift: 3.0
+  autocast_precision: bf16
+  trajectory_precision: bf16
+  logprob_precision: fp32
+  max_sequence_length: 1024
+  strategy: ${strategy}
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["QwenImageTransformerBlock"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    master_dtype: fp32
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 3.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 1.0e-4
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: ${num_rollouts}
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 64
+    alpha: 64
+    initial_adapter_path: ${oc.env:SFT_ADAPTER_PATH}
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    target_modules:
+      - attn.add_k_proj
+      - attn.add_q_proj
+      - attn.add_v_proj
+      - attn.to_add_out
+      - attn.to_k
+      - attn.to_out.0
+      - attn.to_q
+      - attn.to_v
+      - img_mlp.net.2
+      - img_mod.1
+      - txt_mlp.net.2
+      - txt_mod.1
+
+rollout:
+  _target_: unirl.rollout.engine.sglang_diffusion.engine.SGLangDiffusionRolloutEngine
+  model_config: ${model_config}
+  strategy: ${strategy}
+  config:
+    _target_: unirl.rollout.engine.sglang_diffusion.config.SGLangDiffusionEngineConfig
+    model_family: qwen_image_edit_plus
+    populate_conditions: true
+    init_same_noise: ${sampling.init_same_noise}
+    forward_batch_size: 8
+    num_gpus: 1
+    tp_size: 1
+    local_mode: true
+    target_modules: ${model_config.lora_target_modules}
+    engine_kwargs:
+      model_id: Qwen-Image-Edit-2511
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.local.dyref.DyRefRewardScorer
+    base_device: cuda
+    config:
+      _target_: unirl.reward.local.dyref.DyRefRewardSpec
+      semantic:
+        _target_: unirl.reward.local.dyref.SigLIPSimilaritySpec
+        batch_size: 8
+        device: auto
+        dtype: bf16
+        model_id: ${oc.env:SIGLIP2_PATH,google/siglip2-base-patch16-384}
+        feature_mode: flat
+        apply_drs: true
+        drs_threshold: 0.65
+        drs_k1: 10.0
+        drs_k2: 3.0
+        drs_min_references: 2
+      style:
+        _target_: unirl.reward.local.dyref.CSDStyleSpec
+        batch_size: 8
+        device: auto
+        checkpoint_path: ${oc.env:CSD_CHECKPOINT}
+        clip_download_root: ${oc.env:CSD_CLIP_CACHE,null}
+      semantic_weight: 1.0
+      style_weight: 0.8
+      dar_gamma: 2.0
+      dar_min_weight: 0.01
+      dar_max_weight: 5.0
+
+algorithm:
+  _target_: unirl.algorithms.flowgrpo.DyRefFlowGRPO
+  stage_attr: diffusion
+  clip_range: 1.0e-4
+  clip_schedule: constant
+  beta: 0.04
+  old_logp_source: replay
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.qwen_image_edit_plus.conditions.QwenImageEditPlusConditions
+  params: ${sampling}
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 2
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: ${oc.env:DATA_PATH,data/dyref/train.jsonl}
+      eval_data_path: ${oc.env:EVAL_DATA_PATH,data/dyref/val.jsonl}
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  num_inference_steps: 10
+  guidance_scale: 4.0
+  height: 512
+  width: 512
+  eta: 1.0
+  samples_per_prompt: 24
+  seed: 42
+  init_same_noise: false
+  autocast_precision: bf16
+  sampler_kwargs:
+    negative_prompt: " "
+    return_negative_prompt_embeds: true
+  scheduler:
+    _target_: unirl.sde.index_schedule.AllSDEScheduler
+    num_timesteps: ${..num_inference_steps}
+    num_sde_steps: 1
+    timestep_fraction: [0.1, 0.4]
+
+sync:
+  _target_: unirl.distributed.weight_sync.lora.LocalLoraWeightSync
+  verify: false
+  param_prefix: "transformer."
+  adapter_name: default
+
+logging:
+  report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,false}}
+  project_name: ${oc.env:WANDB_PROJECT,unirl-dyref}
+  run_name: ${oc.env:WANDB_RUN_NAME,qwen_image_edit_2511_dyref_rl}
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: [dyref, qwen-image-edit-2511, flowgrpo, drs, dar, csd, siglip2]
+  log_media: true
+  media_max_items: 8
+  media_log_interval: 1

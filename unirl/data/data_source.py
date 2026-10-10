@@ -4,13 +4,14 @@ import logging
 import os
 from collections import Counter
 from functools import partial
-from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, cast
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
 import torch
 from torch.utils.data import DataLoader
 
 from unirl.types.media import MediaRef, MediaRefs
-from unirl.types.primitives import Image, Images, Texts, Videos
+from unirl.types.primitives import Image, ImageSet, ImageSets, Texts, Videos
+from unirl.types.reward import REWARD_MEDIA_METADATA_KEY
 from unirl.types.sample import Part, PrimitiveMap, Sample
 from unirl.utils.video import load_video
 
@@ -19,14 +20,14 @@ from .datasets import PromptExampleDataset, TextPromptDataset, normalize_prompt_
 logger = logging.getLogger(__name__)
 
 
-def _load_condition_images(media_refs: List[Any]) -> Optional[List[Image]]:
-    """Load ``(modality="image", role="condition")`` media refs into ``Image``."""
+def _load_condition_images(media_refs: List[Any]) -> Optional[ImageSets]:
+    """Load ordered ``(image, condition)`` refs into one row-aligned image-set batch."""
     if not media_refs or not any(media_refs):
         return None
     import PIL.Image
     import torchvision.transforms.functional as TF
 
-    images_per_prompt: List[Optional[Image]] = []
+    rows: List[ImageSet] = []
     any_loaded = False
     for refs in media_refs:
         selected = [
@@ -34,25 +35,18 @@ def _load_condition_images(media_refs: List[Any]) -> Optional[List[Image]]:
             for r in (refs or [])
             if getattr(r, "modality", None) == "image" and getattr(r, "role", None) == "condition"
         ]
-        if not selected:
-            images_per_prompt.append(None)
-            continue
-        if len(selected) > 1:
-            raise ValueError(f"Expected at most one condition image per prompt, got {len(selected)}")
-        pil = PIL.Image.open(selected[0].uri).convert("RGB")
-        tensor = TF.to_tensor(pil)
-        images_per_prompt.append(Image(pixels=tensor))
-        any_loaded = True
+        references = []
+        metadata = []
+        for ref in selected:
+            with PIL.Image.open(ref.uri) as pil:
+                references.append(Image(pixels=TF.to_tensor(pil.convert("RGB"))))
+            metadata.append({"modality": ref.modality, "role": ref.role, "uri": ref.uri})
+        rows.append(ImageSet.from_list(references, metadata=metadata))
+        any_loaded = any_loaded or bool(references)
 
     if not any_loaded:
         return None
-    missing = [index for index, image in enumerate(images_per_prompt) if image is None]
-    if missing:
-        raise ValueError(
-            f"Condition-image batch is incomplete: {len(missing)}/{len(images_per_prompt)} "
-            f"prompts are missing an image (e.g. prompt index {missing[0]})."
-        )
-    return cast(List[Image], images_per_prompt)
+    return ImageSets(rows=rows)
 
 
 def _load_condition_videos(media_refs: List[Any]) -> Optional[List[Any]]:
@@ -109,6 +103,7 @@ def _validate_homogeneous_videos(videos: List[Any]) -> None:
 _SUPPORTED_MEDIA_REF_ROLES: Set[Tuple[str, str]] = {
     ("image", "condition"),
     ("image", "prompt"),
+    ("image", "target"),
     ("video", "condition"),
     ("audio", "prompt"),
     ("video", "prompt"),
@@ -125,7 +120,20 @@ def _dataset_metadata(items: List[Dict[str, Any]], *, context: str) -> List[Opti
                 f"{context}: metadata['_media_refs'] is no longer a model-input channel "
                 f"(row {row}); use the dataset media/media_refs field."
             )
-        values.append(metadata)
+        if isinstance(metadata, dict) and REWARD_MEDIA_METADATA_KEY in metadata:
+            raise ValueError(
+                f"{context}: metadata[{REWARD_MEDIA_METADATA_KEY!r}] is reserved for data-source reward inputs "
+                f"(row {row})."
+            )
+        value = dict(metadata or {})
+        target_refs = [
+            ref for ref in (item.get("media_refs") or []) if isinstance(ref, MediaRef) and ref.role == "target"
+        ]
+        if target_refs:
+            value[REWARD_MEDIA_METADATA_KEY] = [
+                {"modality": ref.modality, "role": ref.role, "uri": ref.uri} for ref in target_refs
+            ]
+        values.append(value or None)
     return values
 
 
@@ -330,7 +338,7 @@ class MultimodalRLDataSource:
         primitives: Dict[str, Any] = {"text": Texts(texts=prompts)}
         images = _load_condition_images(media_refs)
         if images is not None:
-            primitives["image"] = Images.from_list(images)
+            primitives["image"] = images
         condition_videos = _load_condition_videos(media_refs)
         if condition_videos is not None:
             _validate_homogeneous_videos(condition_videos)
@@ -365,7 +373,7 @@ class MultimodalRLDataSource:
         primitives: Dict[str, Any] = {"text": Texts(texts=prompts)}
         images = _load_condition_images(media_refs)
         if images is not None:
-            primitives["image"] = Images.from_list(images)
+            primitives["image"] = images
         condition_videos = _load_condition_videos(media_refs)
         if condition_videos is not None:
             _validate_homogeneous_videos(condition_videos)

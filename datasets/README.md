@@ -66,6 +66,7 @@ needs a `.gitignore` line, which keeps that decision explicit.
 | [`arxivqa_mc/`](arxivqa_mc/README.md) | ArxivQA scientific-figure multiple-choice (BAGEL GRPO) |
 | [`asearcher/`](asearcher/README.md) | ASearcher deep-research prompts (agentic RL) |
 | [`daily_omni_av/`](daily_omni_av/README.md) | Daily-Omni audio-video QA |
+| [`dyref/`](dyref/README.md) | DyRef ordered multi-reference image generation |
 | [`dapo_math/`](dapo_math/README.md) | DAPO-Math-17k + AIME 2024/2025 (AR math RL) |
 | [`dcase2025_audio_qa/`](dcase2025_audio_qa/README.md) | DCASE 2025 audio QA |
 | [`droid100/`](droid100/README.md) | LeRobot DROID-100 → Cosmos3 SFT debug samples |

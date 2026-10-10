@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Union
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 import PIL.Image
 import torch
@@ -180,6 +180,142 @@ class Images(Batch):
 
 
 @dataclass
+class ImageSet(Batch):
+    """One logical row's ordered image attachments, backed by an inner ``Images`` batch."""
+
+    images: Optional[Images] = concat_field(default=None)
+    metadata: List[Dict[str, Any]] = concat_field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        count = len(self.images) if self.images is not None else 0
+        if not self.metadata and count:
+            self.metadata = [{} for _ in range(count)]
+        if len(self.metadata) != count:
+            raise ValueError(f"ImageSet metadata count {len(self.metadata)} != image count {count}")
+
+    @classmethod
+    def from_images(
+        cls,
+        images: Images,
+        *,
+        metadata: Optional[Sequence[Dict[str, Any]]] = None,
+    ) -> "ImageSet":
+        values = [{} for _ in range(len(images))] if metadata is None else [dict(item) for item in metadata]
+        return cls(images=images, metadata=values)
+
+    @classmethod
+    def from_list(
+        cls,
+        items: Sequence[Image],
+        *,
+        metadata: Optional[Sequence[Dict[str, Any]]] = None,
+    ) -> "ImageSet":
+        values = list(items)
+        if not values:
+            return cls(metadata=[] if metadata is None else [dict(item) for item in metadata])
+        return cls.from_images(Images.from_list(values), metadata=metadata)
+
+    def to_list(self) -> List[Image]:
+        return [] if self.images is None else self.images.to_list()
+
+    def to_pils(self) -> List[PIL.Image.Image]:
+        return [] if self.images is None else self.images.to_pils()
+
+    def __len__(self) -> int:
+        return 0 if self.images is None else len(self.images)
+
+
+@dataclass
+class ImageSets(Batch):
+    """Batch-aligned ordered image sets with variable attachment counts per row."""
+
+    rows: List[ImageSet] = concat_field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        invalid = [type(row).__name__ for row in self.rows if not isinstance(row, ImageSet)]
+        if invalid:
+            raise TypeError(f"ImageSets rows must contain ImageSet values, got {invalid}")
+
+    @classmethod
+    def from_rows(
+        cls,
+        rows: Sequence[Union[ImageSet, Images, Sequence[Image]]],
+    ) -> "ImageSets":
+        normalized: List[ImageSet] = []
+        for row in rows:
+            if isinstance(row, ImageSet):
+                normalized.append(row)
+            elif isinstance(row, Images):
+                normalized.append(ImageSet.from_images(row))
+            else:
+                normalized.append(ImageSet.from_list(list(row)))
+        return cls(rows=normalized)
+
+    @classmethod
+    def from_images(cls, images: Images) -> "ImageSets":
+        return cls(rows=[ImageSet.from_images(images.slice(index, index + 1)) for index in range(len(images))])
+
+    @property
+    def counts(self) -> torch.Tensor:
+        return torch.tensor([len(row) for row in self.rows], dtype=torch.long)
+
+    def require_exactly_one(self, *, context: str = "ImageSets") -> Images:
+        if not self.rows:
+            raise ValueError(f"{context} requires a non-empty image-set batch")
+        bad = [index for index, row in enumerate(self.rows) if len(row) != 1]
+        if bad:
+            counts = sorted({len(row) for row in self.rows})
+            raise ValueError(f"{context} requires exactly one image per row; counts={counts}, first bad row={bad[0]}")
+        return Images.concat([row.images for row in self.rows if row.images is not None])
+
+    def primary_images(self, *, context: str = "ImageSets") -> Images:
+        if not self.rows:
+            raise ValueError(f"{context} requires a non-empty image-set batch")
+        missing = [index for index, row in enumerate(self.rows) if not row]
+        if missing:
+            raise ValueError(f"{context} requires at least one image per row; first empty row={missing[0]}")
+        return Images.concat([row.images.slice(0, 1) for row in self.rows if row.images is not None])
+
+    def to_slots(self, *, context: str = "ImageSets") -> List[Images]:
+        counts = sorted({len(row) for row in self.rows})
+        if not counts or counts == [0]:
+            return []
+        if len(counts) != 1:
+            raise ValueError(f"{context} requires uniform image counts for dense slots; counts={counts}")
+        return [
+            Images.concat([row.images.slice(slot, slot + 1) for row in self.rows if row.images is not None])
+            for slot in range(counts[0])
+        ]
+
+    def flatten(self) -> tuple[Optional[Images], torch.Tensor]:
+        populated = [row.images for row in self.rows if row.images is not None]
+        owners = torch.tensor(
+            [row for row, image_set in enumerate(self.rows) for _ in range(len(image_set))],
+            dtype=torch.long,
+        )
+        return (Images.concat(populated) if populated else None), owners
+
+    def to_pil_rows(self) -> List[List[PIL.Image.Image]]:
+        return [row.to_pils() for row in self.rows]
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+
+ImagePrimitive = Union[Images, ImageSets]
+
+
+def as_image_sets(value: ImagePrimitive) -> ImageSets:
+    """Normalize legacy singleton-row ``Images`` into the multi-image row contract."""
+    return value if isinstance(value, ImageSets) else ImageSets.from_images(value)
+
+
+def require_single_images(value: ImagePrimitive, *, context: str) -> Images:
+    """Return one image per row, rejecting multi-image or empty rows."""
+    return value if isinstance(value, Images) else value.require_exactly_one(context=context)
+
+
+@dataclass
 class Videos(Batch):
     """Batch videos with ragged time dim, packed varlen along T."""
 
@@ -262,7 +398,7 @@ def _cumsum(values: List[int]) -> List[int]:
     return out
 
 
-PrimitiveValue = Union[Texts, Images, Videos, Audios, MediaRefs]
+PrimitiveValue = Union[Texts, ImagePrimitive, Videos, Audios, MediaRefs]
 
 
 def primitive_modality_key(prim: PrimitiveValue) -> str:
@@ -270,6 +406,8 @@ def primitive_modality_key(prim: PrimitiveValue) -> str:
     if isinstance(prim, Texts):
         return "text"
     if isinstance(prim, Images):
+        return "image"
+    if isinstance(prim, ImageSets):
         return "image"
     if isinstance(prim, Videos):
         return "video"
@@ -285,7 +423,10 @@ __all__ = [
     "Audios",
     "Embedding",
     "Image",
+    "ImagePrimitive",
     "Images",
+    "ImageSet",
+    "ImageSets",
     "MediaRefs",
     "Text",
     "TextAndImage",
@@ -294,5 +435,7 @@ __all__ = [
     "PrimitiveValue",
     "Video",
     "Videos",
+    "as_image_sets",
     "primitive_modality_key",
+    "require_single_images",
 ]

@@ -23,6 +23,8 @@ _EXPORTS = (
     ("DRPOConfig", "drpo"),
     ("AlgorithmStepResult", "base"),
     ("BagelFlowUniGRPO", "bagel_flow_unigrpo"),
+    ("DyRefFlowGRPO", "flowgrpo"),
+    ("DyRefFlowGRPOConfig", "flowgrpo"),
     ("FlowGRPO", "flowgrpo"),
     ("FlowGRPOConfig", "flowgrpo"),
     ("DiffusionNFT", "diffusionnft"),

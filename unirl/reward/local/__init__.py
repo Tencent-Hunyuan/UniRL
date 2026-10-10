@@ -4,6 +4,7 @@ from .aesthetic import AestheticRewardScorer
 from .base import LocalRewardBackend
 from .clap import CLAPRewardScorer
 from .clip import ClipRewardScorer
+from .dyref import CSDStyleRewardScorer, DyRefRewardScorer, SigLIPSimilarityRewardScorer
 from .geneval2 import GenEval2RewardScorer
 from .hpsv2 import HPSv2RewardScorer
 from .hpsv3 import HPSv3RewardScorer
@@ -26,6 +27,8 @@ __all__ = [
     "LocalRewardBackend",
     "CLAPRewardScorer",
     "ClipRewardScorer",
+    "CSDStyleRewardScorer",
+    "DyRefRewardScorer",
     "GenEval2RewardScorer",
     "HPSv2RewardScorer",
     "HPSv3RewardScorer",
@@ -36,6 +39,7 @@ __all__ = [
     "OCRRewardScorer",
     "PerDomainRewardScorer",
     "PickScoreRewardScorer",
+    "SigLIPSimilarityRewardScorer",
     "T2AVCompositeScorer",
     "VideoCLIPDeltaScorer",
     "VideoAlignRewardScorer",

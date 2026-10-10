@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from dataclasses import field as dc_field
 from typing import Any, Dict, List, Mapping, Optional, Type
 
 import torch
 
 from unirl.config.require import require
+from unirl.distributed.tensor import hydrate
 from unirl.types.conditions import Condition
+from unirl.types.sample import Part
 from unirl.types.segments.latent import LatentSegment
 
 from .base import (
@@ -197,4 +199,43 @@ class FlowGRPO(StageAlgorithm):
         return [int(i) for i in segment.sde_indices.tolist()]
 
 
-__all__ = ["FlowGRPO", "FlowGRPOConfig"]
+@dataclass
+class DyRefFlowGRPOConfig(FlowGRPOConfig):
+    """FlowGRPO config whose advantages carry DyRef DAR group weights."""
+
+    dar_component: str = "dar_weight"
+
+
+class DyRefFlowGRPO(FlowGRPO):
+    """FlowGRPO with paper-equation DAR applied after group normalization."""
+
+    def __init__(self, *args, dar_component: str = "dar_weight", **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.dar_component = str(dar_component)
+
+    def prepare_part(self, part: Part) -> Part:
+        """Multiply normalized advantages by scorer-authored DAR weights once."""
+        if part.advantages is None:
+            raise ValueError("DyRefFlowGRPO.prepare_part requires normalized advantages.")
+        components = part.component_rewards
+        if not isinstance(components, dict) or self.dar_component not in components:
+            available = sorted(components) if isinstance(components, dict) else []
+            raise ValueError(
+                f"DyRefFlowGRPO requires component_rewards[{self.dar_component!r}]; available={available}. "
+                "Use DyRefRewardScorer so DAR is computed from raw SigLIPv2 group rewards."
+            )
+        weights = hydrate(components[self.dar_component]).to(
+            device=part.advantages.device,
+            dtype=part.advantages.dtype,
+        )
+        if weights.shape != part.advantages.shape:
+            raise ValueError(
+                f"DyRefFlowGRPO DAR weight shape {tuple(weights.shape)} "
+                f"!= advantage shape {tuple(part.advantages.shape)}."
+            )
+        if not torch.isfinite(weights).all() or bool((weights <= 0).any()):
+            raise ValueError("DyRefFlowGRPO DAR weights must be finite and positive.")
+        return replace(part, advantages=part.advantages * weights)
+
+
+__all__ = ["DyRefFlowGRPO", "DyRefFlowGRPOConfig", "FlowGRPO", "FlowGRPOConfig"]

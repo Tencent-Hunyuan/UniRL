@@ -46,7 +46,7 @@ def registered_adapters() -> Tuple[str, ...]:
 class MMEncoding:
     """One VLM sample's multimodal input for the SRT rollout."""
 
-    image: Any = None
+    images: List[Any] = field(default_factory=list)
     text: Optional[str] = None
     input_ids: Optional[List[int]] = None
     pixel_values: Any = None
