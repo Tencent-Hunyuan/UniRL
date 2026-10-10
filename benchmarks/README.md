@@ -47,6 +47,7 @@ Video (VBench) is generated and scored with the official toolkit — see
 ## Conventions
 
 - Results: `benchmarks_results/<ckpt-tag>/<benchmark>/{images/ | completions.jsonl, scores.jsonl, summary.json}`.
+- Speed benchmark results: `outputs/benchmark/`; they do not enter the evaluation `benchmarks_results/` tree.
 - Images are `p{prompt:05d}_s{k}.png` with seed `--seed + 1000*prompt + k` — the naming
   is the only state shared between stages.
 - Generation uses each pipeline's own defaults (steps/guidance/resolution) unless
