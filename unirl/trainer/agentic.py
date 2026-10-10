@@ -1,4 +1,4 @@
-"""Service-scored multi-turn RL over the driver-side rollout manager."""
+"""Service-scored multi-turn RL with optional turn-boundary carry across updates."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from collections import Counter
 from typing import Dict, List, Optional, Tuple
 
 import torch
-from hydra.utils import instantiate
+from hydra.utils import get_class, instantiate
 from omegaconf import DictConfig
 
 from unirl.config.validation import validate_memory_saver_contract
@@ -17,6 +17,11 @@ from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
 from unirl.rollout.manager import RolloutManager, required_worker_concurrency, validate_worker_inflight
 from unirl.train.stack import TrainStepResult
+from unirl.trainer.async_rollout import (
+    connect_separate_rollout,
+    next_hard_boundary,
+    resolve_separate_worker_concurrency,
+)
 from unirl.trainer.base import (
     BaseTrainer,
     build_sampling_dict,
@@ -48,7 +53,7 @@ def _is_failed(trajectory: Sample) -> bool:
 
 
 class AgenticTrainer(BaseTrainer):
-    """One barrier agentic trainer with terminal-answer reward-service scoring."""
+    """Agentic trainer with bounded rollout windows and terminal-answer reward-service scoring."""
 
     def __init__(
         self,
@@ -69,7 +74,20 @@ class AgenticTrainer(BaseTrainer):
         stop: Optional[List[str]] = None,
         per_worker_inflight: int = 8,
         mask_overflow_loss: bool = False,
+        rollout_window_size: int = 1,
+        train_fraction: Optional[float] = None,
     ) -> None:
+        if not isinstance(rollout_window_size, int) or rollout_window_size < 1:
+            raise ValueError("rollout_window_size must be a positive integer")
+        if rollout_window_size > 1:
+            from unirl.algorithms.grpo import GRPO
+
+            if get_class(algorithm_cfg["_target_"]) is not GRPO:
+                raise ValueError("partial agentic rollout currently requires GRPO")
+            if algorithm_cfg.get("old_logp_source", "rollout") != "rollout":
+                raise ValueError("partial agentic rollout requires old_logp_source=rollout")
+            if sync_cfg is not None and not sync_cfg.get("flush_cache", True):
+                raise ValueError("partial agentic rollout requires sync.flush_cache=true")
         per_worker_inflight = int(per_worker_inflight)
         configured_concurrency = cfg.get("worker_max_concurrency")
         worker_max_concurrency = (
@@ -77,8 +95,16 @@ class AgenticTrainer(BaseTrainer):
             if configured_concurrency is None
             else int(configured_concurrency)
         )
+        train_devices = int(cfg.num_devices)
+        if train_fraction is not None:
+            train_devices, worker_max_concurrency = resolve_separate_worker_concurrency(
+                num_devices=int(cfg.num_devices),
+                train_fraction=train_fraction,
+                per_worker_inflight=per_worker_inflight,
+                configured_concurrency=configured_concurrency,
+                engine_concurrency=rollout_cfg.get("config", {}).get("inner", {}).get("concurrency"),
+            )
         self._validate_config(
-            cfg=cfg,
             batch_size=batch_size,
             rollout_cfg=rollout_cfg,
             sampling_cfg=sampling_cfg,
@@ -86,6 +112,8 @@ class AgenticTrainer(BaseTrainer):
             sync_cfg=sync_cfg,
             per_worker_inflight=per_worker_inflight,
             worker_max_concurrency=worker_max_concurrency,
+            train_devices=train_devices,
+            separate=train_fraction is not None,
         )
         super().__init__(
             cfg=cfg,
@@ -94,6 +122,9 @@ class AgenticTrainer(BaseTrainer):
         )
 
         try:
+            self._train_fraction = train_fraction
+            self._rollout_window_size = rollout_window_size
+            self._carried: List[Sample] = []
             self.batch_size = int(batch_size)
             self.data_source = instantiate(data_source_cfg)
             self.sampling_params: Dict[str, BaseSamplingParams] = build_sampling_dict(sampling_cfg)
@@ -102,15 +133,25 @@ class AgenticTrainer(BaseTrainer):
             self._per_worker_inflight = per_worker_inflight
             self._mask_overflow_loss = mask_overflow_loss
 
-            with placement(self.pool, fraction=1.0, shared_workers=True):
+            with placement(self.pool, fraction=1.0 if train_fraction is None else train_fraction, shared_workers=True):
                 self.bundle = remote_hydra(bundle_cfg)
                 self.pipeline = remote_hydra(pipeline_cfg, bundle=self.bundle)
                 self.backend = remote_hydra(backend_cfg, bundle=self.bundle)
                 self.reward = remote_hydra(reward_cfg)
                 self.algorithm = remote_hydra(algorithm_cfg, pipeline=self.pipeline)
                 self.stack = remote_hydra(stack_cfg, fsdp_backend=self.backend, algorithm=self.algorithm)
-                self._build_colocated_rollout(rollout_cfg, sync_cfg)
+                if train_fraction is None:
+                    self._build_colocated_rollout(rollout_cfg, sync_cfg)
+                else:
+                    self.weight_sync = remote_hydra(sync_cfg, backend=self.backend)
 
+            if train_fraction is not None:
+                with placement(self.pool, fraction=1.0 - train_fraction, shared_workers=True):
+                    self.rollout = remote(**parse_hydra_cfg(rollout_cfg))
+                connect_separate_rollout(self.weight_sync, self.rollout)
+
+            if self._rollout_window_size > 1:
+                self.rollout.validate_turn_resumption()
             slots = self.rollout.engine_slots
             launchers = [lambda sample, slot=slot: slot.launch("generate", sample) for slot in slots]
             self._rollout_manager = RolloutManager(
@@ -130,28 +171,30 @@ class AgenticTrainer(BaseTrainer):
     @staticmethod
     def _validate_config(
         *,
-        cfg: DictConfig,
         batch_size: int,
         rollout_cfg: DictConfig,
         sampling_cfg: DictConfig,
         algorithm_cfg: DictConfig,
         sync_cfg: Optional[DictConfig],
         per_worker_inflight: int,
-        worker_max_concurrency: int,
+        worker_max_concurrency: int | List[int],
+        train_devices: int,
+        separate: bool,
     ) -> None:
         if int(batch_size) <= 0:
             raise ValueError(f"batch_size must be positive; got {batch_size}")
         validate_worker_inflight(
             per_worker_inflight,
-            worker_max_concurrency=worker_max_concurrency,
+            worker_max_concurrency=(
+                worker_max_concurrency[-1] if isinstance(worker_max_concurrency, list) else worker_max_concurrency
+            ),
             engine_concurrency=None,
         )
-        if sync_cfg is None:
-            raise ValueError("AgenticTrainer requires colocated TensorWeightSync")
-        sync_target = str(sync_cfg.get("_target_", ""))
-        if not sync_target.endswith("TensorWeightSync"):
-            raise ValueError(f"AgenticTrainer requires colocated TensorWeightSync; got {sync_target!r}")
-        validate_memory_saver_contract(rollout_cfg, strict=True)
+        sync_name = "NCCLWeightSync" if separate else "TensorWeightSync"
+        if sync_cfg is None or not str(sync_cfg.get("_target_", "")).endswith(sync_name):
+            raise ValueError(f"AgenticTrainer requires {sync_name} for the selected placement")
+        if not separate:
+            validate_memory_saver_contract(rollout_cfg, strict=True)
 
         episode = rollout_cfg.get("config", {}).get("episode_sampling")
         if episode is None:
@@ -169,8 +212,8 @@ class AgenticTrainer(BaseTrainer):
             raise ValueError("sampling.temperature must equal rollout episode temperature")
         if abs(sampling_temperature - algorithm_temperature) > 1e-9:
             raise ValueError("sampling.temperature must equal algorithm.sampling_temperature")
-        if (int(batch_size) * group_size) % int(cfg.num_devices) != 0:
-            raise ValueError("batch_size*samples_per_prompt must be divisible by num_devices")
+        if (int(batch_size) * group_size) % train_devices != 0:
+            raise ValueError("batch_size*samples_per_prompt must be divisible by the number of training devices")
 
     def _build_colocated_rollout(self, rollout_cfg: DictConfig, sync_cfg: DictConfig) -> None:
         self.backend.offload()
@@ -188,19 +231,27 @@ class AgenticTrainer(BaseTrainer):
             control={"ar": {"stop": list(self._stop)}},
         )
 
-    def _collect_groups(self, requests: Sample) -> List[List[Sample]]:
-        self.rollout.wake_up()
+    def _collect_groups(self, requests: List[Sample], *, allow_carry: bool = False) -> List[List[Sample]]:
+        if self._train_fraction is None:
+            self.rollout.wake_up()
+        else:
+            self._carried = self._rollout_manager.quiesce(current_version=self._train_version)
         self._rollout_manager.sync_weights(self.weight_sync, output_version=self._train_version)
-        self.backend.offload()
+        if self._train_fraction is None:
+            self.backend.offload()
 
-        tasks = [prompt for prompt in requests.split() for _ in range(self._group_size)]
-        self._rollout_manager.submit(tasks)
+        tasks = [prompt for request in requests for prompt in request.split() for _ in range(self._group_size)]
+        self._rollout_manager.submit([*self._carried, *tasks])
+        self._carried = []
         groups = self._rollout_manager.collect(self.batch_size, current_version=self._train_version)
-        if not self._rollout_manager.empty:
+        if allow_carry and self._train_fraction is None:
+            self._carried = self._rollout_manager.quiesce(current_version=self._train_version)
+        elif not allow_carry and not self._rollout_manager.empty:
             raise RuntimeError("agentic barrier rollout must leave RolloutManager empty")
 
-        self.rollout.sleep()
-        self.backend.onload()
+        if self._train_fraction is None:
+            self.rollout.sleep()
+            self.backend.onload()
         return groups
 
     def train_step(
@@ -212,7 +263,18 @@ class AgenticTrainer(BaseTrainer):
     ) -> Tuple[TrainStepResult, float]:
         t0 = time.perf_counter()
         requests = self._build_request_sample(inputs, rollout_id)
-        groups = self._collect_groups(requests)
+        groups = self._collect_groups([requests])
+        return self._train_groups(groups, training_progress=training_progress, rollout_id=rollout_id, t0=t0)
+
+    def _train_groups(
+        self,
+        groups: List[List[Sample]],
+        *,
+        training_progress: float,
+        rollout_id: int,
+        t0: float,
+    ) -> Tuple[TrainStepResult, float]:
+        """Train completed sibling groups using the log-probs recorded by each turn's policy."""
         trajectories = [trajectory for group in groups for trajectory in group]
         rewards = self._score_trajectories(trajectories, rollout_id)
         advantages = self._group_advantages(groups, rewards)
@@ -328,6 +390,18 @@ class AgenticTrainer(BaseTrainer):
                 continue
             advantage = float(advantages[i].item())
             for generated in trajectory.gen_parts():
+                if self._rollout_window_size > 1:
+                    if generated.output_version is None or not 0 <= generated.output_version <= self._train_version:
+                        raise RuntimeError("partial rollout requires a valid behavior version on every turn")
+                    if generated.segment is None or generated.segment.log_probs is None:
+                        raise RuntimeError("partial rollout requires behavior log-probs on every turn")
+                    metadata = generated.metadata or [{} for _ in generated.sample_ids]
+                    generated = _part_with_field(
+                        generated,
+                        "metadata",
+                        [{**(row or {}), "behavior_version": generated.output_version} for row in metadata],
+                    )
+                    generated = _part_with_field(generated, "output_version", None)
                 generated = _part_with_field(
                     generated,
                     "advantages",
@@ -364,6 +438,18 @@ class AgenticTrainer(BaseTrainer):
             result = TrainStepResult(0.0, 0.0, 0.0, False, [], {}, optimizer_updates=0)
             train_rows = 0
 
+        versions = [part.output_version for trajectory in trajectories for part in trajectory.gen_parts()]
+        version_metrics = {}
+        if self._rollout_window_size > 1 and versions:
+            version_metrics = {
+                "agent/oldest_behavior_version": min(versions),
+                "agent/newest_behavior_version": max(versions),
+                "agent/max_behavior_lag": self._train_version - min(versions),
+                "agent/mixed_version_trajectories": sum(
+                    len({part.output_version for part in trajectory.gen_parts()}) > 1 for trajectory in trajectories
+                ),
+                "agent/carried_trajectories": len(self._carried),
+            }
         log_sample = self._build_log_sample(trajectories, rewards, advantages, rollout_id)
         self.wandb_logger.log_rollout_step(
             rollout_id,
@@ -376,6 +462,7 @@ class AgenticTrainer(BaseTrainer):
                 "agent/failed_trajectories": int((~finite).sum().item()),
                 "agent/overflow_trajectories": statuses["overflow"],
                 "agent/train_rows": train_rows,
+                **version_metrics,
             },
         )
         return result, mean_reward
@@ -436,16 +523,41 @@ class AgenticTrainer(BaseTrainer):
             )
             for _ in range(start_rollout):
                 self.data_source.get_samples(self.batch_size)
-            self._init_wandb(num_rollouts=num_rollouts, extra={"agentic_execution": "barrier"})
+            self._init_wandb(
+                num_rollouts=num_rollouts,
+                extra={"agentic_execution": "partial" if self._rollout_window_size > 1 else "barrier"},
+            )
+            next_generation = start_rollout
+            window_end = start_rollout
 
             for rollout_id in range(start_rollout, num_rollouts):
-                inputs = self.data_source.get_samples(self.batch_size)
                 training_progress = rollout_id / max(1, num_rollouts - 1)
-                result, mean_reward = self.train_step(
-                    inputs,
-                    training_progress=training_progress,
-                    rollout_id=rollout_id,
-                )
+                if self._rollout_window_size == 1:
+                    result, mean_reward = self.train_step(
+                        self.data_source.get_samples(self.batch_size),
+                        training_progress=training_progress,
+                        rollout_id=rollout_id,
+                    )
+                else:
+                    t0 = time.perf_counter()
+                    if rollout_id == window_end:
+                        window_end = min(
+                            rollout_id + self._rollout_window_size,
+                            next_hard_boundary(rollout_id, num_rollouts=num_rollouts, save_interval=save_interval),
+                        )
+                    requests = [
+                        self._build_request_sample(self.data_source.get_samples(self.batch_size), generation_id)
+                        for generation_id in range(next_generation, window_end)
+                    ]
+                    next_generation = window_end
+                    groups = self._collect_groups(requests, allow_carry=True)
+                    if rollout_id + 1 == window_end and (self._carried or not self._rollout_manager.empty):
+                        raise RuntimeError("agentic rollout window must be empty before its final update")
+                    result, mean_reward = self._train_groups(
+                        groups, training_progress=training_progress, rollout_id=rollout_id, t0=t0
+                    )
+                    if rollout_id + 1 == window_end:
+                        self._reset_transport_buffers()
                 self.wandb_logger.log_progress(rollout_id, num_rollouts, result, mean_reward, logger=logger)
                 self.maybe_save_checkpoint(
                     rollout_id,

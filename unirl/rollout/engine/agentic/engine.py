@@ -99,6 +99,12 @@ class AgenticRolloutEngine(BaseRolloutEngine):
         return sample.with_parts([*sample.parts[:-1], last])
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def validate_turn_resumption(self) -> None:
+        """Require an environment whose state survives turn-boundary handoff in the Sample."""
+        if not getattr(self._env, "supports_turn_resumption", False):
+            raise ValueError("partial rollout requires an environment supporting turn resumption without worker state")
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
     def set_stopping(self, stopping: bool = True) -> None:
         self._stopping = bool(stopping)
 

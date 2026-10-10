@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Service-scored barrier agentic training entry point."""
+"""Service-scored agentic training with optional turn-boundary partial rollout."""
 
 from __future__ import annotations
 
@@ -36,6 +36,8 @@ def main(cfg: DictConfig) -> None:
             stop=cfg.get("stop"),
             per_worker_inflight=cfg.get("per_worker_inflight", 8),
             mask_overflow_loss=cfg.get("mask_overflow_loss", False),
+            rollout_window_size=cfg.get("rollout_window_size", 1),
+            train_fraction=cfg.get("train_fraction"),
         )
         guard.claim_signals()
         trainer.train(
