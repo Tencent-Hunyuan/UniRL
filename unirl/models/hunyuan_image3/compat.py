@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import inspect
+from functools import wraps
 from typing import Any
 
 
@@ -58,4 +60,42 @@ def repair_hi3_tokenizer_backend(tokenizer: Any, pretrained_path: Any) -> bool:
         tokenizer._tokenizer = _RustTokenizer.from_file(tok_json)
     except Exception:  # noqa: BLE001 — best-effort; leave the tokenizer untouched on failure
         return False
+    return True
+
+
+def repair_hi3_tokenizer_batchify(tokenizer: Any) -> bool:
+    """Repair the checkpoint's truncated batchify path; see README ``## Gotchas``."""
+    original = getattr(tokenizer, "apply_general_template", None)
+    if not callable(original) or not callable(getattr(tokenizer, "batch_gen_infer", None)):
+        return False
+    if getattr(original, "_hi3_batchify_compat", False):
+        return False
+    signature = inspect.signature(original)
+    if not {"message_list", "batchify", "cfg_factor", "uncond_p"}.issubset(signature.parameters):
+        return False
+
+    @wraps(original)
+    def apply_general_template(*args, **kwargs):
+        bound = signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        if not bound.arguments["batchify"]:
+            return original(*args, **kwargs)
+        options = bound.arguments
+        messages = options.pop("message_list")
+        options.pop("batchify")
+        cfg_factor = options.pop("cfg_factor")
+        options.pop("uncond_p")
+        if not messages or not all(isinstance(message, list) for message in messages):
+            raise ValueError("HI3 batchify expects a non-empty list of message lists")
+        return tokenizer.batch_gen_infer(
+            infer_fn=original,
+            prompt_list=[[] for _ in messages],
+            infer_fn_kwargs_list=[dict(options, message_list=message) for message in messages],
+            do_classifier_free_guidance=cfg_factor > 1,
+            condition_repeat_times=1,
+            uncondition_repeat_times=cfg_factor - 1,
+        )
+
+    apply_general_template._hi3_batchify_compat = True
+    tokenizer.apply_general_template = apply_general_template
     return True
