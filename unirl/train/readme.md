@@ -62,6 +62,9 @@ in `backend/base.py`; a multi-update-capable algorithm sets
 
 ## Gotchas
 
+- **`adapter_active` requires an already frozen teacher and restores adapter selection
+  and parameter trainability even if switching fails.** PEFT's `set_adapter` also
+  changes `requires_grad`; the caller owns `torch.no_grad()` around teacher replay.
 - **`num_updates_per_batch > 1` needs `supports_multi_update` *and* must evenly
   divide the per-worker batch** — otherwise the ctor or `_build_mini_batch_slices`
   raises (a ragged mini-batch would silently drop samples and desync grad-accum
