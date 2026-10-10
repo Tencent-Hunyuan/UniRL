@@ -186,6 +186,10 @@ class WAN21DiffusionStage(DiffusionStage[WAN21Conditions]):
 
     _no_split_modules: ClassVar[Tuple[str, ...]] = ("WanTransformerBlock",)
 
+    # FlashGRPO's per-sample SDE-index replay needs `replay` to honour
+    # `segment.sde_index_per_sample`; only this stage implements it.
+    supports_per_sample_sde_index: ClassVar[bool] = True
+
     _SPATIAL_DOWNSAMPLE: ClassVar[int] = 8
     _TEMPORAL_DOWNSAMPLE: ClassVar[int] = 4
     _DEFAULT_LATENT_CHANNELS: ClassVar[int] = 16
@@ -345,6 +349,8 @@ class WAN21DiffusionStage(DiffusionStage[WAN21Conditions]):
         step_indices: Optional[List[int]] = None,
     ) -> ReplayResult:
         """Log-prob replay: ``log_probs [B, len(target)]``, means ``[B, len(target), C, T_lat, H_lat, W_lat]``."""
+        if segment.sde_index_per_sample is not None:
+            return self._replay_per_sample(conditions, segment=segment, params=params)
         if segment.sde_indices is None or segment.latents is None:
             raise ValueError("WAN21DiffusionStage.replay: segment.sde_indices / latents missing")
         if segment.sigmas is None:
@@ -404,6 +410,71 @@ class WAN21DiffusionStage(DiffusionStage[WAN21Conditions]):
 
         log_probs_t = torch.stack(log_probs, dim=1).to(dtype=self.logprob_dtype)
         means_t = torch.stack(prev_sample_means, dim=1) if prev_sample_means else None
+        return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
+
+    def _replay_per_sample(
+        self,
+        conditions: WAN21Conditions,
+        *,
+        segment: LatentSegment,
+        params: DiffusionSamplingParams,
+    ) -> ReplayResult:
+        """Replay FlashGRPO's single per-sample SDE transition; ``log_probs [N, 1]``."""
+        if segment.sigmas is None or segment.latents is None:
+            raise ValueError("WAN21DiffusionStage._replay_per_sample: segment.sigmas / latents missing")
+        num_samples = int(segment.latents.shape[0])
+        if int(segment.latents.shape[1]) < 2:
+            raise ValueError(
+                "WAN21DiffusionStage._replay_per_sample: expected latents with a "
+                f"[before, after, ...] slot layout (K >= 2); got K={int(segment.latents.shape[1])}."
+            )
+
+        device = segment.latents.device
+        sigmas = segment.sigmas.to(device)
+        step_idx = segment.sde_index_per_sample.to(device=device, dtype=torch.long)
+        if int(step_idx.shape[0]) != num_samples:
+            raise ValueError(
+                "WAN21DiffusionStage._replay_per_sample: sde_index_per_sample length "
+                f"{int(step_idx.shape[0])} != sample count {num_samples}."
+            )
+        # Pin the strategy's schedule here: only the generation path calls
+        # init_schedule, so a remote-engine run that replays from a segment has no
+        # generate on this rank and the Flash coefficient's sigma_min would be unset.
+        self.strategy.init_schedule(sigmas)
+        sigma = sigmas[step_idx].to(dtype=torch.float32)
+        sigma_next = sigmas[step_idx + 1].to(dtype=torch.float32)
+        sigma_max = float(sigmas[1].item()) if int(sigmas.shape[0]) > 1 else 0.99
+        # Fixed slots, not latents_at(): after the per-step groups merge, the shared
+        # ``indices`` map holds one group's steps and is not per-sample valid.
+        sample = segment.latents[:, 0]
+        prev_sample = segment.latents[:, 1]
+
+        autocast_ctx = (
+            torch.autocast("cuda", self.autocast_dtype)
+            if device.type == "cuda" and self.autocast_dtype in (torch.float16, torch.bfloat16)
+            else nullcontext()
+        )
+        with autocast_ctx:
+            _, log_prob, prev_mean = self.step.step_with_logp(
+                self.model,
+                conditions,
+                strategy=self.strategy,
+                sample=sample,
+                prev_sample=prev_sample,
+                sigma=sigma,
+                sigma_next=sigma_next,
+                guidance_scale=float(params.guidance_scale),
+                eta=float(params.eta),
+                sigma_max=sigma_max,
+                step_index=0,
+            )
+        if log_prob is None:
+            raise RuntimeError(
+                "WAN21DiffusionStage._replay_per_sample: strategy returned None log-prob "
+                "(deterministic mode); FlashGRPO replay requires a stochastic SDE strategy."
+            )
+        log_probs_t = log_prob.reshape(num_samples, 1).to(dtype=self.logprob_dtype)
+        means_t = prev_mean.reshape(num_samples, 1, *prev_mean.shape[1:]) if prev_mean is not None else None
         return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
 
     def predict_noise_at_step(
