@@ -3,9 +3,9 @@
 Offline data preparation and committed prompt sets: one folder per dataset, with converter CLIs
 and READMEs where available, and any prompt set small enough to commit.
 
-**Nothing here is imported by the framework.** These are standalone scripts you run once,
-before training, to turn a public dataset into the local jsonl/manifest layout the runtime
-readers consume. The runtime side — data sources, dataset readers, the supervised manifest
+**Nothing here is imported by the framework.** Converters are standalone scripts you run
+once, before training, to turn a public dataset into the local jsonl/manifest layout the
+runtime readers consume; committed prompt sets are already in that layout. The runtime side — data sources, dataset readers, the supervised manifest
 contract — lives in [`unirl/data/`](../unirl/data/README.md) and is the only half that ships in the
 package.
 
@@ -74,7 +74,7 @@ needs a `.gitignore` line, which keeps that decision explicit.
 | [`searchgen/`](searchgen/README.md) | SearchGen interleaved image/text agent SFT |
 | [`sft_manifests/`](sft_manifests/README.md) | Generic text / VLM / T2I / agent SFT manifest builders |
 | [`ucf101/`](ucf101/README.md) | UCF101 T2V SFT |
-| [`video_r1_260k/`](video_r1_260k/README.md) | Video-R1-260k video reasoning |
+| [`video_r1_260k/`](video_r1_260k/README.md) | Video-R1-260k image/video multiple-choice QA |
 | [`image_edit/`](image_edit/README.md) | Instruction-guided image-editing prompts for EditReward RL (committed jsonl) |
 | [`refl_videoalign/`](refl_videoalign/README.md) | T2V prompts for the ReFL VideoAlign experiment (committed txt) |
 | [`geneval/`](geneval/) | Committed composition prompts (jsonl), no converter in-tree |

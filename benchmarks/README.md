@@ -37,13 +37,13 @@ Names and defaults follow [`core/registry.py`](core/registry.py).
 
 | name | prompts (license) | protocol | scored by |
 |---|---|---|---|
-| [`image/geneval2`](image/geneval2/README.md) | 800, in-repo `datasets/geneval2` | 1 img/prompt | local Qwen3-VL or reward service `geneval2` (VQAScore soft-TIFA) |
+| [`image/geneval2`](image/geneval2/README.md) | 800, in-repo `datasets/geneval2/synthetic/test.jsonl` | 1 img/prompt | local Qwen3-VL or reward service `geneval2` (VQAScore soft-TIFA) |
 | [`image/geneval`](image/geneval/README.md) | 553, vendored (MIT) | 4 img/prompt, official [GenEval](https://github.com/djghosh13/geneval) | reward service `geneval` (Mask2Former+CLIP, off by default) |
 | [`image/dpg_bench`](image/dpg_bench/README.md) | 1065, `fetch.sh` (Apache-2.0) | 4 img/prompt | external: official [ELLA](https://github.com/TencentQQGYLab/ELLA) mPLUG script |
 | [`image/preference`](image/preference/README.md) | 1632 PartiPrompts, vendored (Apache-2.0) | 1 img/prompt | reward service `hpsv3`, `pickscore`, `imagereward` |
 | [`text/aime24`](text/aime/README.md) / [`text/aime25`](text/aime/README.md) | 30+30 (MIT / fetch script) | avg@16, temp 0.6 | local `math-verify` |
 | [`text/math500`](text/math500/README.md) | 500, vendored (MIT) | avg@4, temp 0.6 | local `math-verify` |
-| [`text/gpqa`](text/gpqa/README.md) | 198 Diamond, gated — `fetch.py` | avg@4, MC letter | local letter match |
+| [`text/gpqa`](text/gpqa/README.md) | 198 Diamond, gated — `fetch.py` | avg@4, temp 0.6, MC letter | local letter match |
 
 Video (VBench) is generated and scored with the official toolkit, outside `benchmarks.run` —
 see [`video/vbench/`](video/vbench/README.md). Framework speed comparisons live in
@@ -51,9 +51,11 @@ see [`video/vbench/`](video/vbench/README.md). Framework speed comparisons live 
 
 ## Conventions
 
-- Results: `benchmarks_results/<ckpt-tag>/<benchmark>/{images/ | completions.jsonl, scores.jsonl, summary.json}`.
-- Images are `p{prompt:05d}_s{k}.png` with seed `--seed + 1000*prompt + k` — the naming
-  is the only state shared between stages.
+- Results: `benchmarks_results/<ckpt-tag>/<name>/{images/ | completions.jsonl, scores.jsonl, summary.json}`,
+  where `<name>` is the registry name with `/` replaced by `_` (e.g. `image_geneval2`).
+- Images are `p{prompt:05d}_s{k}.png` with seed `--seed + 1000*prompt + k`; specs with
+  `t2i_prompt_seed` (`image/geneval2`) seed from a hash of the prompt text instead. The
+  naming is the only state shared between stages.
 - Generation uses each pipeline's own defaults (steps/guidance/resolution) unless
   overridden — record any override next to reported numbers. Distilled/turbo
   checkpoints (e.g. Z-Image-Turbo) ship base-schedule pipeline defaults: pass the
