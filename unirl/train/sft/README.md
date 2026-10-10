@@ -7,12 +7,9 @@
 *Records stay opaque driver-side; media loading, tokenization and VAE encode all
 happen here, on the training workers.*
 
-**Running SFT?** The end-to-end path — manifest prep, entrypoint, per-step
-flow, and checkpoint/resume — lives in
-[`trainer/README.md · Run supervised fine-tuning`](../../trainer/README.md#run-supervised-fine-tuning).
-Manifest row schemas are owned by the
-[manifest guide](../../../datasets/sft_manifests/README.md); this page owns the
-builder contracts only.
+**Running SFT?** See [Run supervised fine-tuning](../../trainer/README.md#run-supervised-fine-tuning)
+and the [manifest guide](../../../datasets/sft_manifests/README.md); this page
+owns the builder contracts only.
 
 ## What it is
 

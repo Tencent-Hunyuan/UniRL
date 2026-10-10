@@ -82,14 +82,8 @@ Checked-in recipes:
 ## Choosing the VeOmni backend
 
 `VeOmniBackend` ([`backend/veomni/backend.py`](backend/veomni/backend.py)) is a
-per-recipe alternative to `FSDPBackend`, selected by the backend `_target_`:
-
-```yaml
-backend:
-  _target_: unirl.train.backend.veomni.backend.VeOmniBackend
-```
-
-It subclasses the same base, so the checkpoint/save/resume formats, the
+per-recipe alternative to `FSDPBackend`, selected by
+`backend._target_: unirl.train.backend.veomni.backend.VeOmniBackend`. It subclasses the same base, so the checkpoint/save/resume formats, the
 optimizer, and the `TrainStack` contract are unchanged. Install with the
 `veomni` extra (`pip install -e '.[veomni]'`; extras table in
 [INSTALL.md](../../INSTALL.md)).
@@ -182,10 +176,6 @@ use LoRA adapter mode. Formats and export live in
   skips backward (an all-empty micro) while earlier ones ran, `TrainStack.train`
   raises instead of silently stepping on never-synced grads (which would also
   leak the stale accumulation into the next step's reduce-scatter).
-- **`fsdp_mode: hybrid` makes the HSDP shard group explicit** — mesh
-  derivation, sizing guidance, and checked-in recipes are in
-  [Choosing HSDP](#choosing-hsdp-hybrid-sharding); the startup checks live in
-  `resolve_fsdp_mesh_shape`.
 - **`fsdp_mode: no_shard` trades memory for the all-gather** — a `(world, 1)` mesh
   leaves the full model on every rank, so no parameter bytes cross ranks and only
   gradients are all-reduced (DDP). It pays off where the re-gathered bytes dwarf the

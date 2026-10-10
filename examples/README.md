@@ -31,18 +31,12 @@ The AR default is written for 4×8 (32 GPUs) and requires `DATA_PATH`. Launchers
 override `num_devices` from the node GPU count. Engine extras are in
 [INSTALL.md](../INSTALL.md).
 
-Two variants sit **below** the entrypoint level — they are backend/topology
-selections a recipe carries, not separate entrypoints:
-
-- **HSDP** — `fsdp_mode: hybrid` + `hsdp_shard_size` on `FSDPBackend`; see
-  [Choosing HSDP](../unirl/train/readme.md#choosing-hsdp-hybrid-sharding).
-- **VeOmni train backend** — `backend._target_: unirl.train.backend.veomni.backend.VeOmniBackend`;
-  see [Choosing the VeOmni backend](../unirl/train/readme.md#choosing-the-veomni-backend),
-  which lists every VeOmni recipe.
-
-End-to-end walkthroughs — data/config through checkpoint and resume — live in
-the trainer README: [run supervised fine-tuning](../unirl/trainer/README.md#run-supervised-fine-tuning)
-and [run async AR or async diffusion training](../unirl/trainer/README.md#run-async-ar-or-async-diffusion-training).
+HSDP and the VeOmni train backend are recipe-level selections, not entrypoints:
+see [Choosing HSDP](../unirl/train/readme.md#choosing-hsdp-hybrid-sharding) and
+[Choosing the VeOmni backend](../unirl/train/readme.md#choosing-the-veomni-backend)
+(which lists every VeOmni recipe). End-to-end walkthroughs:
+[SFT](../unirl/trainer/README.md#run-supervised-fine-tuning) and
+[async AR / diffusion](../unirl/trainer/README.md#run-async-ar-or-async-diffusion-training).
 
 ## Running a recipe
 

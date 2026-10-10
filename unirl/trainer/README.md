@@ -131,8 +131,7 @@ sync. A manifest feeds `SFTTrainer`, which reuses the RL consumer side
 workers, and the algorithm is anchor-free (`requires_advantages=False`):
 token cross-entropy (`SFT`) for text / VLM / agent, flow-matching on latents
 (`FlowMatchSFT`, Cosmos's `Cosmos3JointFlowMatchSFT`) for T2I / video. Entrypoint:
-[`unirl/train_sft.py`](../train_sft.py); recipes under
-[`examples/sft/`](../../examples/README.md); builder contracts in
+[`unirl/train_sft.py`](../train_sft.py); builder contracts in
 [`train/sft/README.md`](../train/sft/README.md).
 
 SFT recipes read local JSONL manifests, not HF dataset ids. The
@@ -144,22 +143,10 @@ LoRA, VLM, agent-trajectory, T2I, and video — same entrypoint, a different
 
 ### What runs each step
 
-```text
-train.jsonl
-  │  SupervisedDataSource (driver): epoch-aware cursor, seeded shuffle, optional prefetch
-  ▼
-records — opaque on the driver; media never crosses the driver boundary
-  │  SFTTrainer.train_step
-  ▼
-track_builder.build(records) — on the training workers, using the pipeline's own
-  │  stages (tokenize / chat template / VAE encode), so SFT conditions on exactly
-  │  what inference would render
-  ▼
-training Part
-  │  TrainStack.train_track — SFT / FlowMatchSFT loss (no advantages)
-  ▼
-one optimizer step
-```
+`SupervisedDataSource` on the driver yields a batch of records (epoch-aware
+cursor, seeded shuffle, optional prefetch); `track_builder.build` turns them into
+a training `Part` on the workers; `TrainStack.train_track` takes one optimizer
+step on that loss.
 
 Two geometry constraints, enforced in `SFTTrainer.__init__`:
 `stack.num_updates_per_batch` must be `1` — step, eval, checkpoint, and resume
@@ -201,12 +188,9 @@ legacy checkpoint without `sft_data_state.json` falls back to fast-forwarding
 
 The async paths disaggregate the loop: training and the rollout engine each
 own a **slab** — a disjoint `placement` scope over a subset of the GPU pool,
-split by `train_fraction` — instead of time-sharing each GPU. Async AR launches
-the next batch before scoring, so generation overlaps scoring and training;
-async diffusion scores each intact batch before launching its replacement, so
-generation overlaps training only. Both are FIFO batch trainers driven by one
-shared loop ([`async_rollout.py`](async_rollout.py)); they differ in engine,
-weight-sync handler, and what they pin down.
+split by `train_fraction` — instead of time-sharing each GPU. Both are FIFO batch
+trainers driven by one shared loop ([`async_rollout.py`](async_rollout.py)); how
+each overlaps generation is in the trainer table under [How it works](#how-it-works).
 
 | Path | Entrypoint | Default recipe | Engine · sync |
 | --- | --- | --- | --- |
@@ -230,24 +214,15 @@ hard boundary. Async AR may raise the batch-side budget with
 async diffusion fixes it at `weight_sync_interval - 1`.
 
 Publication fires once `weight_sync_interval` batches are trained, or earlier
-at an eval/save boundary:
-
-1. **Quiesce.** The manager pauses dispatch and drains the engine; suspended
-   and undispatched prompts are kept or discarded **atomically per prompt
-   root** by the lag filter.
-2. **Batch-align the carry**, so a publication never splits one training batch
-   across behavior-policy versions: if any carried prompt has started, the
-   whole carry finishes under the old weights; otherwise only the prefix needed
-   to top the ready buffer up to a whole batch finishes.
-3. **Publish.** Weights cross to the engine (which requires no in-flight work
-   and a monotone version), the unstarted remainder of the carry is
-   resubmitted, and `published_version` becomes the `train_version`.
-
-**Hard boundaries** — every `eval_interval`, every `save_interval`, and the
-final rollout — require an *empty* manager: no carry crosses them, and each one
-raises if work remains after quiescing. Per-trainer eval behavior is
-in [Evaluation cadence](#evaluation-cadence); residency rules are in
-[How it works](#how-it-works).
+at an eval/save boundary, and quiesces the manager first
+([rollout Gotchas](../rollout/README.md#gotchas)). Before publishing, the trainer
+batch-aligns the carry so a publication never splits one training batch across
+behavior-policy versions: if any carried prompt has started, the whole carry
+finishes under the old weights; otherwise only the prefix needed to top the
+ready buffer up to a whole batch finishes, and the rest is resubmitted after
+publication. **Hard boundaries** — every `eval_interval`, every
+`save_interval`, and the final rollout — admit no carry, and each raises if
+work remains after quiescing.
 
 ### Variant constraints
 
@@ -259,11 +234,6 @@ in [Evaluation cadence](#evaluation-cadence); residency rules are in
 | Engine | dedicated engine (vLLM/SGLang) on the rollout slab; the trainside direct-sampling engine cannot live cross-slab | dedicated engine (vLLM-Omni — the BAGEL default — or SGLang diffusion); trainside is rejected |
 | Geometry / inflight | `train_fraction * num_devices` integral; `batch_size * samples_per_prompt` divisible by the train-slab size | all of the AR geometry rules, plus `layout: separate` and `max_inflight = 1` are enforced |
 
-`max_inflight = 1` on async diffusion is structural, not a tuning knob: queued
-generations could block reap-time cross-slab transfer, and dynamically
-completed prompts must retain one rollout id and one SDE schedule per training
-batch.
-
 ### Resume
 
 `load_dir` restores the backend checkpoint; the restored **optimizer step
@@ -272,9 +242,6 @@ count becomes the train version**; the deterministic input stream fast-forwards
 restored weights into the freshly started engine before the first batch
 (startup eval, when enabled, runs after that sync). Checkpoint formats and
 budget semantics are the generic ones in [Checkpointing](#checkpointing).
-Engine internals are owned by [`rollout/engine`](../rollout/engine/README.md)
-and cross-slab weight sync by
-[`distributed/weight_sync`](../distributed/weight_sync/README.md).
 
 ## Checkpointing
 
