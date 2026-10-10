@@ -150,6 +150,51 @@ class FlowMatchSchedulePolicy:
             shift_terminal=self.shift_terminal,
         )
 
+    def compute_post_window_sigma(
+        self,
+        *,
+        num_inference_steps: int,
+        height: int,
+        width: int,
+        window_end: int,
+        num_steps: int,
+        device: Optional[torch.device] = None,
+    ) -> torch.Tensor:
+        """σ[:window_end+1] unchanged + a tail resampled to end at step ``num_steps`` (MixGRPO-Flash, README)."""
+        T = int(num_inference_steps)
+        full = self.compute_sigma(num_inference_steps=T, height=height, width=width)
+        if window_end == T - 1:
+            return full if device is None else full.to(device)
+        num_post = num_steps - window_end
+        if not self.use_dynamic_shifting:
+            t0 = torch.linspace(1.0, 0.0, T + 1)[window_end + 1].item()
+            t = torch.linspace(t0, 0.0, num_post)
+            tail = (self.shift * t) / (1 + (self.shift - 1) * t)
+        else:
+            from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
+
+            latent_h = int(height) // int(self.vae_scale_factor)
+            latent_w = int(width) // int(self.vae_scale_factor)
+            mu = self.compute_mu((latent_h // int(self.patch_size)) * (latent_w // int(self.patch_size)), T)
+            t0 = float(np.linspace(1.0, 1.0 / T, T)[window_end + 1])
+            scheduler = FlowMatchEulerDiscreteScheduler(
+                num_train_timesteps=1000,
+                use_dynamic_shifting=True,
+                time_shift_type=self.time_shift_type,
+                shift_terminal=self.shift_terminal,
+            )
+            base = np.linspace(t0, 0.0, num_post)[:-1]
+            scheduler.set_timesteps(num_inference_steps=len(base), sigmas=base, mu=mu)
+            tail = scheduler.sigmas
+        tail = tail.to(dtype=full.dtype)
+        if not torch.allclose(tail[0], full[window_end + 1], atol=1e-5):
+            raise ValueError(
+                f"compute_post_window_sigma: rebuilt tail starts at {float(tail[0])}, "
+                f"not σ[{window_end + 1}]={float(full[window_end + 1])}; the window prefix would shift."
+            )
+        sigmas = torch.cat([full[: window_end + 1], tail])
+        return sigmas if device is None else sigmas.to(device)
+
     @classmethod
     def static_only(cls, shift: float) -> "FlowMatchSchedulePolicy":
         """Build a static-shift-only policy."""
@@ -245,7 +290,7 @@ class FlowMatchSchedulePolicy:
         )
 
 
-def ensure_sample_sigmas(sample: Any, policy: FlowMatchSchedulePolicy) -> None:
+def ensure_sample_sigmas(sample: Any, policy: FlowMatchSchedulePolicy, *, allow_post_window: bool = False) -> None:
     """Compute and pin σ onto a Sample's diffusion generation parameters."""
     from unirl.types.sampling import DiffusionSamplingParams
 
@@ -253,7 +298,23 @@ def ensure_sample_sigmas(sample: Any, policy: FlowMatchSchedulePolicy) -> None:
         return
     gen_part = sample.frontier_gen_part(DiffusionSamplingParams)
     diffusion = gen_part.sampling_params
+    post = diffusion.post_window_ode
+    if post is not None and not allow_post_window:
+        raise NotImplementedError(
+            "sampling.post_window_ode (MixGRPO-Flash) needs a trainside stage that supports it; this "
+            "rollout engine's sampler walks its own full-length schedule."
+        )
     if diffusion.sigmas is not None:
+        return
+    if post is not None and diffusion.sde_indices:
+        window_end = max(diffusion.sde_indices)
+        diffusion.sigmas = policy.compute_post_window_sigma(
+            num_inference_steps=int(diffusion.num_inference_steps),
+            height=int(diffusion.height),
+            width=int(diffusion.width),
+            window_end=window_end,
+            num_steps=post.num_steps(diffusion.num_inference_steps, window_end),
+        )
         return
     diffusion.sigmas = policy.compute_sigma(
         num_inference_steps=int(diffusion.num_inference_steps),
