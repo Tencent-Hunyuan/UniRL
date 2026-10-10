@@ -148,7 +148,9 @@ _NO_MEMORY_SAVER_MESSAGE = (
 )
 
 
-def validate_memory_saver_contract(rollout_cfg: DictConfig, *, strict: bool) -> None:
+def validate_memory_saver_contract(
+    rollout_cfg: DictConfig, *, strict: bool, require_weight_backup: bool = False
+) -> None:
     """A colocated engine that sleeps must enable the memory saver, or sleep frees nothing."""
     engine_cfg = rollout_cfg.get("config")
     while isinstance(engine_cfg, DictConfig) and not (engine_cfg.get("_target_") or "").endswith("SGLangEngineConfig"):
@@ -160,6 +162,15 @@ def validate_memory_saver_contract(rollout_cfg: DictConfig, *, strict: bool) -> 
     if enabled is None:
         enabled = (engine_cfg.get("engine_kwargs") or {}).get("enable_memory_saver")
     if enabled:
+        if require_weight_backup:
+            backup = engine_cfg.get("enable_weights_cpu_backup")
+            if backup is None:
+                backup = (engine_cfg.get("engine_kwargs") or {}).get("enable_weights_cpu_backup")
+            require(
+                bool(backup),
+                "DAPO refill with SGLang memory saver requires enable_weights_cpu_backup=true "
+                "to preserve the sampling policy across sleeps.",
+            )
         return
     if strict:
         raise ValueError(_NO_MEMORY_SAVER_MESSAGE)
