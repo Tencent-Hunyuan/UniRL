@@ -271,6 +271,7 @@ class Part(Batch):
         scope: str = "group",
         use_global_std: bool = False,
         group_layer: Optional[int] = None,
+        group_size: Optional[int] = None,
     ) -> "Part":
         """GRPO per-group advantage ``(reward - group_mean) / (group_std + eps)``."""
         if self.rewards is None:
@@ -292,8 +293,13 @@ class Part(Batch):
                 adv_g = centered
             return _part_with_field(self, "advantages", adv_g)
 
-        layer = group_layer if group_layer is not None else max(self.sample_ids[0].count("/") - 1, 0)
-        group_labels = [ancestor_id(sid, layer) for sid in self.sample_ids]
+        if group_size is not None:
+            if group_size < 1 or n % group_size:
+                raise ValueError(f"compute_advantages: group_size={group_size} must divide n={n}.")
+            group_labels = [str(i // group_size) for i in range(n)]
+        else:
+            layer = group_layer if group_layer is not None else max(self.sample_ids[0].count("/") - 1, 0)
+            group_labels = [ancestor_id(sid, layer) for sid in self.sample_ids]
 
         unique_pids = list(dict.fromkeys(group_labels))
         n_groups = len(unique_pids)

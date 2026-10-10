@@ -8,6 +8,7 @@ from typing import Any, ClassVar, Dict, List, Optional, Set, Tuple
 import torch
 
 from unirl.models.types.diffusion import DiffusionStage, DiffusionStep
+from unirl.models.types.per_sample_replay import PerSampleStepReplayMixin
 from unirl.models.types.replay_result import ReplayResult
 from unirl.sde.kernels import StepStrategy
 from unirl.types.sampling import DiffusionSamplingParams, compute_trajectory_positions
@@ -181,7 +182,7 @@ class WAN21DiffusionStep(DiffusionStep[WAN21Bundle, WAN21Conditions]):
         )
 
 
-class WAN21DiffusionStage(DiffusionStage[WAN21Conditions]):
+class WAN21DiffusionStage(PerSampleStepReplayMixin, DiffusionStage[WAN21Conditions]):
     """WAN 2.1 T2V rollout-level diffusion stage."""
 
     _no_split_modules: ClassVar[Tuple[str, ...]] = ("WanTransformerBlock",)
@@ -345,6 +346,8 @@ class WAN21DiffusionStage(DiffusionStage[WAN21Conditions]):
         step_indices: Optional[List[int]] = None,
     ) -> ReplayResult:
         """Log-prob replay: ``log_probs [B, len(target)]``, means ``[B, len(target), C, T_lat, H_lat, W_lat]``."""
+        if segment.sde_index_per_sample is not None:
+            return self._replay_per_sample(conditions, segment=segment, params=params, device=segment.latents.device)
         if segment.sde_indices is None or segment.latents is None:
             raise ValueError("WAN21DiffusionStage.replay: segment.sde_indices / latents missing")
         if segment.sigmas is None:

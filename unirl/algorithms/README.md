@@ -59,7 +59,12 @@ not just three-tensor arithmetic.
   the *exact same* mini/micro slices it will train on. No hardcoded field names.
 - **Variants are recipes, not classes.** DanceGRPO and MixGRPO are `FlowGRPO`
   with a different SDE strategy or a windowed index scheduler. Add a class only when
-  the loss math itself changes.
+  the loss math itself changes. `FlashGRPO` clears that bar: it changes the loss by
+  multiplying the clipped ratio by a temporal-gradient-rectification coefficient, and
+  declares `per_sample_sde_layout = "stratified"` so the trainer gives each prompt its own
+  stratified SDE step instead of one shared step per rollout. `TempFlowGRPO` shares that
+  per-row loss (`PerSampleStepGRPO`) with a noise-aware weight instead, and branches every
+  prompt at every chosen step.
 
 **Extending it:** a new diffusion loss subclasses `StageAlgorithm`, calls
 `stage.replay(...)`, computes a per-element loss, and `(loss * loss_scale).backward()`;
@@ -154,3 +159,20 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   this: the operands are already rounded when the forward returns them. DiffusionOPD's
   `fp32 before squaring` is not the same situation — it upcasts scheduler-computed
   `prev_sample_means`, not raw network output.
+- **`FlashGRPO`'s `rectification_indices` is a normalizer, not a target list.** Upstream
+  normalizes each step's coefficient by the mean over the gradient-accumulation window; UniRL's
+  rollout records one step, so the recipe supplies the candidate pool instead. Normalizing by
+  the trained steps alone collapses every weight to ~1, which is the zero-diversity failure the
+  per-sample path exists to fix, so the per-sample path *requires* the field and raises without it.
+- **`FlashGRPO` runs only the per-sample path, with `beta: 0`.** It raises at construction on
+  `beta > 0` (a KL against one group's means would be wrong) or a non-`FlashSDEStrategy` stage, and
+  at the first step on a segment without `sde_index_per_sample`, which means the trainer never
+  stratified the rollout (the async trainer refuses FlashGRPO for that reason).
+- **`adv_clip_max` defaults to `5.0`, copying upstream.** Advantages are clamped before the ratio
+  because a collapsed reward spread drives `|adv|` arbitrarily high through the global-std
+  denominator. `adv_clip_fraction` in the metrics is the fraction of samples that hit the clamp:
+  a run that regresses while that climbs is being driven by reward outliers.
+- **`TempFlowGRPO`'s weight is `weight_scale * transition_std` of `FlowSDEStrategy`.** Upstream
+  multiplies the clipped objective by `2.25 * std_dev_t * sqrt(-dt)` with `std_dev_t` from the
+  Flow-GRPO SDE, which is exactly `FlowSDEStrategy.transition_std`; another strategy would change
+  what the weight means, so construction rejects it. Like `FlashGRPO` it requires `beta: 0`.
