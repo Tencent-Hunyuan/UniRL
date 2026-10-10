@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -25,21 +26,15 @@ def _validate_number(value: int | float, name: str, *, integer: bool = False, st
 
 @dataclass(frozen=True)
 class Environment:
-    """Describe the runtime that produced a benchmark result."""
+    """Describe the runtime; ``device`` is ``cpu`` or the accelerator model (e.g. ``NVIDIA H20``)."""
 
     python: str
-    torch: str
+    torch: str | None
     device: str
     world_size: int
 
-    def to_dict(self) -> dict[str, Any]:
-        _validate_number(self.world_size, "world_size", integer=True)
-        return {
-            "python": self.python,
-            "torch": self.torch,
-            "device": self.device,
-            "world_size": self.world_size,
-        }
+    def __post_init__(self) -> None:
+        _validate_number(self.world_size, "world_size", integer=True, strictly_positive=True)
 
 
 @dataclass(frozen=True)
@@ -50,18 +45,10 @@ class Workload:
     warmup_iterations: int
     measured_iterations: int
 
-    def to_dict(self) -> dict[str, int]:
-        for name, value in (
-            ("samples", self.samples),
-            ("warmup_iterations", self.warmup_iterations),
-            ("measured_iterations", self.measured_iterations),
-        ):
-            _validate_number(value, name, integer=True)
-        return {
-            "samples": self.samples,
-            "warmup_iterations": self.warmup_iterations,
-            "measured_iterations": self.measured_iterations,
-        }
+    def __post_init__(self) -> None:
+        _validate_number(self.samples, "samples", integer=True)
+        _validate_number(self.warmup_iterations, "warmup_iterations", integer=True)
+        _validate_number(self.measured_iterations, "measured_iterations", integer=True, strictly_positive=True)
 
 
 @dataclass(frozen=True)
@@ -72,23 +59,14 @@ class Metrics:
     peak_memory_bytes: int | None = None
     phases_s: dict[str, float] | None = None
 
-    def to_dict(self, samples: int) -> dict[str, Any]:
+    def __post_init__(self) -> None:
         _validate_number(self.wall_clock_s, "wall_clock_s", strictly_positive=True)
         if self.peak_memory_bytes is not None:
             _validate_number(self.peak_memory_bytes, "peak_memory_bytes", integer=True)
-        if self.phases_s is not None:
-            for name, value in self.phases_s.items():
-                _validate_number(value, f"phases_s[{name!r}]")
-        result: dict[str, Any] = {
-            "wall_clock_s": self.wall_clock_s,
-            "samples_per_second": samples / self.wall_clock_s,
-        }
-        _validate_number(result["samples_per_second"], "samples_per_second")
-        if self.peak_memory_bytes is not None:
-            result["peak_memory_bytes"] = self.peak_memory_bytes
-        if self.phases_s is not None:
-            result["phases_s"] = {name: self.phases_s[name] for name in sorted(self.phases_s)}
-        return result
+        for name, value in (self.phases_s or {}).items():
+            if not isinstance(name, str):
+                raise TypeError(f"phases_s keys must be str, got {name!r}")
+            _validate_number(value, f"phases_s[{name!r}]")
 
 
 @dataclass(frozen=True)
@@ -97,30 +75,38 @@ class BenchmarkResult:
 
     benchmark: str
     run_id: str
-    started_at: str
+    started_at: datetime
     environment: Environment
     workload: Workload
     metrics: Metrics
-    schema_version: int = _SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.started_at, datetime) or self.started_at.utcoffset() is None:
+            raise ValueError("started_at must be a timezone-aware datetime")
 
     def to_dict(self) -> dict[str, Any]:
-        if self.schema_version != _SCHEMA_VERSION:
-            raise ValueError(f"schema_version must be {_SCHEMA_VERSION}")
-        workload = self.workload.to_dict()
+        metrics: dict[str, Any] = {
+            "wall_clock_s": self.metrics.wall_clock_s,
+            "samples_per_second": self.workload.samples / self.metrics.wall_clock_s,
+        }
+        if self.metrics.peak_memory_bytes is not None:
+            metrics["peak_memory_bytes"] = self.metrics.peak_memory_bytes
+        if self.metrics.phases_s is not None:
+            metrics["phases_s"] = dict(sorted(self.metrics.phases_s.items()))
         return {
-            "schema_version": self.schema_version,
+            "schema_version": _SCHEMA_VERSION,
             "benchmark": self.benchmark,
             "run_id": self.run_id,
-            "started_at": self.started_at,
-            "environment": self.environment.to_dict(),
-            "workload": workload,
-            "metrics": self.metrics.to_dict(workload["samples"]),
+            "started_at": self.started_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "environment": {name: value for name, value in asdict(self.environment).items() if value is not None},
+            "workload": asdict(self.workload),
+            "metrics": metrics,
         }
 
 
 def write_result(result: BenchmarkResult, path: Path) -> None:
-    """Validate and write one benchmark result as deterministic JSON."""
+    """Write one benchmark result as deterministic JSON."""
 
     payload = result.to_dict()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=False, allow_nan=False) + "\n")
+    path.write_text(json.dumps(payload, indent=2, allow_nan=False) + "\n")

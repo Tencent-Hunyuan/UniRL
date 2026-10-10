@@ -28,25 +28,18 @@ steps dropped as warmup).
 
 ## Smoke schema check
 
-Run the CPU-only synthetic benchmark without arguments:
-
 ```bash
-python benchmarks/speed_benchmarks/benchmark_smoke.py
+python -m benchmarks.speed_benchmarks.benchmark_smoke
 ```
 
-It writes one schema-v1 JSON object to `outputs/benchmark/`; this output is a contract
-check and is not a UniRL performance measurement. Use `--samples`,
-`--warmup-iterations`, `--measured-iterations`, and `--out` to override the defaults.
-`--samples` counts dummy samples per iteration (default: 128); warmup defaults to 2
-iterations and measurement to 10. `workload.samples` records the total measured
-samples, excluding warmup; the writer derives `samples_per_second` as that count
-divided by `wall_clock_s`, which must be finite and strictly positive.
-Unavailable memory and phases are omitted; `environment.torch` is `"unavailable"`
-because this command does not inspect or import torch.
-Rollout, reward, and train producers can use `BenchmarkResult` and `write_result`
-from `unirl.utils.benchmark_result` with total measured samples and their measured
-window duration; runtime adapters belong beside their owning `unirl` components,
-and offline parsers belong in `benchmarks/speed_benchmarks/`.
+writes one schema-v1 JSON result to `outputs/benchmark/` from a CPU-only synthetic loop;
+it checks the result contract and is not a UniRL performance measurement (`--help`
+for options; `UNIRL_RUN_ID` overrides the generated run id).
+Rollout, reward, and train producers build a `BenchmarkResult` from
+`unirl.utils.benchmark_result` with the total samples and wall-clock of their measured
+window, and call `write_result`; throughput is derived, and unavailable memory, phases,
+or torch version are omitted. Runtime adapters belong beside their owning `unirl`
+components, offline parsers in `benchmarks/speed_benchmarks/`.
 See [#414](https://github.com/Tencent-Hunyuan/UniRL/issues/414) and [#25](https://github.com/Tencent-Hunyuan/UniRL/issues/25).
 
 ## Fair-comparison protocol
