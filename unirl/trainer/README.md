@@ -476,6 +476,9 @@ without driver-authored x_T. `media_log_interval` does not apply
 - **Multi-update means disjoint optimizer mini-batches, not repeated full-batch
   epochs.** See [Multiple optimizer updates per rollout](#multiple-optimizer-updates-per-rollout)
   for the algorithm and divisibility constraints.
+- **Async AR/DiT versions count committed optimizer updates.**
+  Sample staleness is measured before training; `*_after` metrics describe
+  the state after training, before weight synchronization.
 - **Agentic evaluation remains deferred.** `AgenticTrainer` has no evaluation
   phase; its recipe configures training only.
 - **`layout` only branches on `"separate"`** (`"colocate"` == `"colocated"`). The
