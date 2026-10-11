@@ -104,8 +104,10 @@ layout is a `placement(…)` wiring in the trainer (`trainer/diffusion.py`).
   per-call value in `Broadcast(...)` to send it whole to every rank.
 - **`Batch.concat` rejects shards that disagree.** `SHARED` fields must be equal
   across items (a `TensorRef` compares by shape and dtype only), a non-batched tensor
-  in a `CONCAT` field must be identical, and a `CONCAT`/`PACKED` field may be `None`
-  only in zero-row items. A producer that drops a condition key when its call has no
+  in a `CONCAT` field must be identical, a `TensorRef` in a `CONCAT` field must have one
+  row per sample, and a `CONCAT`/`PACKED` field may be `None` only in zero-row items.
+  A shared mismatch names the first differing path and values, e.g.
+  `Part.sampling_params.sde_indices[1]: 1 != 2`. A producer that drops a condition key when its call has no
   such media breaks DP merge; emit the key with a `None` per row instead.
 - **`transport_kind` is a cluster-wide choice.** `colocate_store` assumes one worker
   per GPU; multi-slot colocate needs `gpu_store`; cross-node production wants

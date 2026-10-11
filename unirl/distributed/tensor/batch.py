@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import inspect as _inspect
+import reprlib
 import uuid as _uuid
 from dataclasses import field as _dc_field
 from dataclasses import fields as dc_fields
@@ -22,6 +23,7 @@ from typing import (
     Union,
 )
 
+import numpy as np
 import torch
 
 T = TypeVar("T", bound="Batch")
@@ -152,31 +154,55 @@ def _reduce_value(values: List[Any], kind: FieldKind) -> Any:
     raise ValueError(f"Unsupported reduction kind: {kind}")
 
 
-def _values_equal(a: Any, b: Any) -> bool:
-    """Structural equality; tensor proxies compare by shape and dtype since their rows live in the transport."""
+def _first_difference(a: Any, b: Any, path: str) -> Optional[str]:
+    """Describe the first structural difference, or ``None``; tensor proxies compare by shape and dtype only."""
     if a is b:
-        return True
+        return None
     if type(a) is not type(b):
-        return False
-    if isinstance(a, torch.Tensor):
-        return a.shape == b.shape and a.dtype == b.dtype and torch.equal(a, b.to(a.device))
+        return f"{path}: {type(a).__name__} != {type(b).__name__}"
+    if isinstance(a, (torch.Tensor, np.ndarray)):
+        if a.shape != b.shape or a.dtype != b.dtype:
+            return f"{path}: {tuple(a.shape)} {a.dtype} != {tuple(b.shape)} {b.dtype}"
+        if isinstance(a, torch.Tensor):
+            b = b.to(a.device)
+            if torch.equal(a, b):
+                return None
+            index = int((a != b).reshape(-1).nonzero()[0])
+        else:
+            if np.array_equal(a, b):
+                return None
+            index = int(np.flatnonzero(a != b)[0])
+        return f"{path}.flat[{index}]: {a.reshape(-1)[index].item()} != {b.reshape(-1)[index].item()}"
     if isinstance(a, Batch) and a._is_tensor_proxy:
-        return a.shape == b.shape and a.dtype == b.dtype
+        if a.shape != b.shape or a.dtype != b.dtype:
+            return f"{path}: {a.shape} {a.dtype} != {b.shape} {b.dtype}"
+        return None
     if isinstance(a, dict):
-        return a.keys() == b.keys() and all(_values_equal(a[k], b[k]) for k in a)
-    if isinstance(a, (list, tuple)):
-        return len(a) == len(b) and all(_values_equal(x, y) for x, y in zip(a, b))
-    if is_dataclass(a):
-        return all(_values_equal(getattr(a, f.name), getattr(b, f.name)) for f in dc_fields(a))
-    return a == b
+        if a.keys() != b.keys():
+            return f"{path}: keys {sorted(a, key=repr)} != {sorted(b, key=repr)}"
+        children = ((f"{path}[{k!r}]", a[k], b[k]) for k in a)
+    elif isinstance(a, (list, tuple)):
+        if len(a) != len(b):
+            return f"{path}: length {len(a)} != {len(b)}"
+        children = ((f"{path}[{i}]", x, y) for i, (x, y) in enumerate(zip(a, b)))
+    elif is_dataclass(a):
+        children = ((f"{path}.{f.name}", getattr(a, f.name), getattr(b, f.name)) for f in dc_fields(a) if f.compare)
+    else:
+        return None if a == b else f"{path}: {reprlib.repr(a)} != {reprlib.repr(b)}"
+    for child_path, x, y in children:
+        difference = _first_difference(x, y, child_path)
+        if difference is not None:
+            return difference
+    return None
 
 
 def _shared_value(values: List[Any], name: str) -> Any:
-    """Return the value every item agrees on, or raise."""
+    """Return the value every item agrees on, or raise naming the first difference."""
     first = values[0]
-    mismatched = [i for i, v in enumerate(values[1:], start=1) if not _values_equal(first, v)]
-    if mismatched:
-        raise ValueError(f"{name}: shared value differs across concatenated items {mismatched}")
+    for i, value in enumerate(values[1:], start=1):
+        difference = _first_difference(first, value, name)
+        if difference is not None:
+            raise ValueError(f"shared value differs between concatenated items 0 and {i}: {difference}")
     return first
 
 
@@ -197,19 +223,21 @@ def _concat_value(values: List[Any], batch_sizes: List[int], name: str) -> Any:
     items = [(v, bs) for v, bs in zip(values, batch_sizes) if v is not None]
     non_none = [v for v, _ in items]
 
-    if all(isinstance(v, torch.Tensor) or (isinstance(v, Batch) and v._is_tensor_proxy) for v in non_none):
-        is_batched = [
-            v.dim() > 0 and v.shape[0] == bs if isinstance(v, torch.Tensor) else v.batch_size == bs for v, bs in items
-        ]
-        if not any(is_batched):
-            return _shared_value(non_none, name)
-        if not all(is_batched):
-            raise ValueError(f"{name}: mixed batched / non-batched tensors")
-        if all(isinstance(v, torch.Tensor) for v in non_none):
+    if all(isinstance(v, torch.Tensor) for v in non_none):
+        is_batched = [v.dim() > 0 and v.shape[0] == bs for v, bs in items]
+        if all(is_batched):
             return torch.cat(non_none, dim=0)
-        if not any(isinstance(v, torch.Tensor) for v in non_none):
-            return type(non_none[0]).concat(non_none)
-        raise ValueError(f"{name}: cannot concat tensors with tensor references")
+        if any(is_batched):
+            raise ValueError(f"{name}: mixed batched / non-batched tensors")
+        return _shared_value(non_none, name)
+
+    if all(isinstance(v, Batch) and v._is_tensor_proxy for v in non_none):
+        rows = [v.batch_size for v in non_none]
+        sizes = [bs for _, bs in items]
+        if rows != sizes:
+            # A proxy's rows live in the transport, so a non-batched value cannot be checked for equality here.
+            raise ValueError(f"{name}: tensor reference rows {rows} do not match item batch sizes {sizes}")
+        return type(non_none[0]).concat(non_none)
 
     seq_type = type(non_none[0])
     if seq_type in (list, tuple) and all(type(v) is seq_type and len(v) == bs for v, bs in items):
@@ -229,8 +257,7 @@ def _concat_value(values: List[Any], batch_sizes: List[int], name: str) -> Any:
     if all(isinstance(v, Batch) for v in non_none):
         return type(non_none[0]).concat(non_none)
 
-    shared = _shared_value(non_none, name)
-    return shared if torch.is_tensor(shared) else copy.deepcopy(shared)
+    return copy.deepcopy(_shared_value(non_none, name))
 
 
 def _to_index_list(indices: Union[torch.Tensor, Sequence[int]]) -> List[int]:
