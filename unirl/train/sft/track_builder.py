@@ -21,7 +21,7 @@ from unirl.models.types.codec import EncodeStage
 from unirl.models.types.conversations import tokenize_agent_target
 from unirl.types.conditions import ImageLatentCondition
 from unirl.types.media import MediaRef, MediaRefs
-from unirl.types.primitives import Images, Texts, Video, Videos
+from unirl.types.primitives import Image, Images, ImageSet, ImageSets, Texts, Video, Videos
 from unirl.types.sample import Part
 from unirl.types.segments.latent import make_image_segment, make_video_segment
 from unirl.types.segments.text import TextSegment
@@ -271,6 +271,20 @@ def _sample_ids(records: Sequence[Record]) -> List[str]:
 
 def _pad_flags(records: Sequence[Record]) -> List[bool]:
     return [bool(r.get("_eval_pad", False)) for r in records]
+
+
+def _load_condition_image_sets(records: Sequence[Record]) -> Optional[ImageSets]:
+    """Load ordered condition-image refs into row-aligned image sets."""
+    import torchvision.transforms.functional as TF
+
+    rows: List[ImageSet] = []
+    any_images = False
+    for record in records:
+        uris = _media_uris(record, role="condition", modality="image")
+        images = [Image(pixels=TF.to_tensor(_load_pil_image(uri))) for uri in uris]
+        rows.append(ImageSet.from_list(images))
+        any_images = any_images or bool(images)
+    return ImageSets(rows=rows) if any_images else None
 
 
 class SupervisedTrackBuilder(Remote):
@@ -620,6 +634,7 @@ class DiffusionSupervisedTrackBuilder(SupervisedTrackBuilder):
                 "add one (every diffusion pipeline exposes it) so SFT encodes prompts exactly "
                 "like rollout does."
             )
+        self._build_conditions_accepts_images = "images" in inspect.signature(build_conditions).parameters
         self._conditions_kwargs: Dict[str, Any] = {"guidance_scale": self.guidance_scale}
         if "image_shape" in inspect.signature(build_conditions).parameters:
             self._conditions_kwargs["image_shape"] = (self.height, self.width)
@@ -706,6 +721,7 @@ class DiffusionSupervisedTrackBuilder(SupervisedTrackBuilder):
             {
                 "prompt": str(record["prompt"]),
                 "conditions": self._conditions_kwargs,
+                "condition_images": _media_uris(record, role="condition", modality="image"),
             }
         )
 
@@ -719,17 +735,32 @@ class DiffusionSupervisedTrackBuilder(SupervisedTrackBuilder):
             }
         )
 
+    def _condition_kwargs(self, records: Sequence[Record]) -> Dict[str, Any]:
+        """Pipeline build_conditions kwargs, including ordered condition images when the manifest has them."""
+        kwargs = dict(self._conditions_kwargs)
+        references = _load_condition_image_sets(records)
+        if references is None:
+            return kwargs
+        if not self._build_conditions_accepts_images:
+            raise ValueError(
+                "DiffusionSupervisedTrackBuilder: manifest carries role='condition' images, but "
+                f"{type(self.pipeline).__name__}.build_conditions has no images parameter."
+            )
+        kwargs["images"] = references
+        return kwargs
+
     def _build_conditions(self, records: Sequence[Record]) -> Any:
         if self._text_cache is None:
             texts = Texts(texts=[str(record["prompt"]) for record in records])
-            return self.pipeline.build_conditions(texts, **self._conditions_kwargs)
+            return self.pipeline.build_conditions(texts, **self._condition_kwargs(records))
 
         keys = [self._text_cache_key(record) for record in records]
         items: List[Optional[Any]] = [self._text_cache.get(key) for key in keys]
         missing = [index for index, item in enumerate(items) if item is None]
         if missing:
-            texts = Texts(texts=[str(records[index]["prompt"]) for index in missing])
-            encoded = self.pipeline.build_conditions(texts, **self._conditions_kwargs)
+            missing_records = [records[index] for index in missing]
+            texts = Texts(texts=[str(record["prompt"]) for record in missing_records])
+            encoded = self.pipeline.build_conditions(texts, **self._condition_kwargs(missing_records))
             for encoded_index, record_index in enumerate(missing):
                 item = encoded.slice(encoded_index, encoded_index + 1)
                 self._text_cache.put(keys[record_index], item.to_device("cpu"))

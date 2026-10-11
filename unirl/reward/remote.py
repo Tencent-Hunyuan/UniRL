@@ -320,10 +320,18 @@ class RemoteRewardBackend(RewardBackend):
         return {"protocol_version": "1", "requests": wire_requests}
 
     def _get_condition_images(self, request: RewardRequest) -> Optional[List[Union[Image.Image, torch.Tensor]]]:
-        """Extract per-sample condition images from request conditioning."""
+        """Extract one condition image per sample; an image set contributes its primary image."""
         prim_image = request.conditioning.get("image")
         if prim_image is None:
             return None
+        from unirl.types.primitives import Images, ImageSets
+
+        if isinstance(prim_image, ImageSets):
+            prim_image = prim_image.primary_images(context="request.conditioning['image']")
+        if not isinstance(prim_image, Images):
+            raise TypeError(
+                f"request.conditioning['image'] must be Images or ImageSets, got {type(prim_image).__name__}"
+            )
         from unirl.utils.media import tensor_frame_to_pil
 
         return [tensor_frame_to_pil(image.pixels) for image in prim_image.to_list()]

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from unirl.rollout.engine.sglang_diffusion import utils
 from unirl.rollout.engine.sglang_diffusion.adapters.base import register_adapter
@@ -17,6 +17,14 @@ _QWEN_DOWNSAMPLE = 16
 @register_adapter("qwen_image")
 class QwenImageAdapter(ImageAdapter):
     """Qwen-Image — packed sequence-style trajectory unpacked to true channels."""
+
+    def build_sampling(self, sample: Sample, *, diffusion: Any) -> Dict[str, Any]:
+        """Send the Qwen text-context limit with the common sampling fields."""
+        kwargs = super().build_sampling(sample, diffusion=diffusion)
+        max_length = diffusion.max_sequence_length or getattr(self.model_config, "max_sequence_length", None)
+        if max_length is not None:
+            kwargs["max_sequence_length"] = int(max_length)
+        return kwargs
 
     def build_segment(
         self,

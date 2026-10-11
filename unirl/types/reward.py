@@ -9,6 +9,8 @@ from PIL import Image
 from unirl.distributed.tensor.batch import Batch, concat_field, max_field
 from unirl.types.primitives import PrimitiveValue, Texts, primitive_modality_key
 
+REWARD_MEDIA_METADATA_KEY = "_reward_media"
+
 PromptSource = Literal["original", "generation"]
 PROMPT_SOURCES: tuple[PromptSource, ...] = ("original", "generation")
 DEFAULT_PROMPT_SOURCE: PromptSource = "generation"
@@ -130,6 +132,7 @@ __all__ = [
     "DEFAULT_PROMPT_SOURCE",
     "PROMPT_SOURCES",
     "PromptSource",
+    "REWARD_MEDIA_METADATA_KEY",
     "RewardRequest",
     "RewardResponse",
 ]

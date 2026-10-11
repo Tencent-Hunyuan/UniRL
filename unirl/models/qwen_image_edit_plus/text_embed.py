@@ -10,7 +10,7 @@ import torch
 from unirl.models.qwen_image.text_embed import extract_masked_hidden
 from unirl.models.types.embedding import ImageConditionedEmbedStage
 from unirl.types.conditions import TextEmbedCondition
-from unirl.types.primitives import Images, Texts
+from unirl.types.primitives import ImagePrimitive, Texts, as_image_sets
 
 from .bundle import QwenImageEditPlusBundle
 
@@ -38,7 +38,7 @@ def _condition_size_for_aspect(width: int, height: int) -> Tuple[int, int]:
     return int(cond_w), int(cond_h)
 
 
-class QwenImageEditPlusTextEmbedStage(ImageConditionedEmbedStage[Texts, Images, TextEmbedCondition]):
+class QwenImageEditPlusTextEmbedStage(ImageConditionedEmbedStage[Texts, ImagePrimitive, TextEmbedCondition]):
     """Edit-template text (+ optional source images) → ``TextEmbedCondition``."""
 
     def __init__(
@@ -64,7 +64,7 @@ class QwenImageEditPlusTextEmbedStage(ImageConditionedEmbedStage[Texts, Images, 
 
         return Qwen2VLProcessor.from_pretrained(path, subfolder="processor")
 
-    def embed(self, p: Texts, images: Optional[Images] = None) -> TextEmbedCondition:
+    def embed(self, p: Texts, images: Optional[ImagePrimitive] = None) -> TextEmbedCondition:
         """Encode prompts; optionally condition on source images."""
         prompt_embeds, prompt_embeds_mask = self._encode(list(p.texts), images)
         return TextEmbedCondition(
@@ -73,37 +73,47 @@ class QwenImageEditPlusTextEmbedStage(ImageConditionedEmbedStage[Texts, Images, 
             pooled=None,
         )
 
-    def _condition_pils(self, images: Images):
-        """Convert source images to per-sample PILs resized to the"""
+    def _condition_pil_rows(self, images: ImagePrimitive):
+        """Convert ordered source rows to resized PIL images."""
         import PIL.Image
 
-        pils = images.to_pils()
-        resized = []
-        for pil in pils:
-            cond_w, cond_h = _condition_size_for_aspect(pil.width, pil.height)
-            if pil.width != cond_w or pil.height != cond_h:
-                pil = pil.resize((cond_w, cond_h), PIL.Image.LANCZOS)
-            resized.append(pil)
-        return resized
+        rows = []
+        for source_row in as_image_sets(images).to_pil_rows():
+            resized = []
+            for pil in source_row:
+                cond_w, cond_h = _condition_size_for_aspect(pil.width, pil.height)
+                if pil.width != cond_w or pil.height != cond_h:
+                    pil = pil.resize((cond_w, cond_h), PIL.Image.LANCZOS)
+                resized.append(pil)
+            rows.append(resized)
+        return rows
 
-    def _encode(self, prompts: List[str], images: Optional[Images]) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _encode(self, prompts: List[str], images: Optional[ImagePrimitive]) -> Tuple[torch.Tensor, torch.Tensor]:
         bundle = self.bundle
         device = bundle.device
         dtype = next(bundle.text_encoder.parameters()).dtype
 
         condition_pils = None
         if images is not None:
-            condition_pils = self._condition_pils(images)
-            if len(condition_pils) != len(prompts):
+            image_rows = self._condition_pil_rows(images)
+            if len(image_rows) != len(prompts):
                 raise ValueError(
-                    f"QwenImageEditPlusTextEmbedStage._encode: image count {len(condition_pils)} "
+                    f"QwenImageEditPlusTextEmbedStage._encode: image row count {len(image_rows)} "
                     f"!= prompt count {len(prompts)}"
                 )
-            base_img_prompt = IMG_PROMPT_TEMPLATE.format(1)
+            counts = [len(row) for row in image_rows]
+            if any(count < 1 for count in counts):
+                raise ValueError(
+                    f"QwenImageEditPlusTextEmbedStage._encode requires at least one image per row; counts={counts}."
+                )
+            base_img_prompts = [
+                "".join(IMG_PROMPT_TEMPLATE.format(index + 1) for index in range(len(row))) for row in image_rows
+            ]
+            condition_pils = [image for row in image_rows for image in row]
         else:
-            base_img_prompt = ""
+            base_img_prompts = [""] * len(prompts)
 
-        txt = [PROMPT_TEMPLATE.format(base_img_prompt + e) for e in prompts]
+        txt = [PROMPT_TEMPLATE.format(prefix + prompt) for prefix, prompt in zip(base_img_prompts, prompts)]
 
         model_inputs = self.processor(
             text=txt,
@@ -130,6 +140,16 @@ class QwenImageEditPlusTextEmbedStage(ImageConditionedEmbedStage[Texts, Images, 
 
         split_hidden_states = extract_masked_hidden(hidden_states, model_inputs.attention_mask)
         split_hidden_states = [item[PROMPT_TEMPLATE_START_IDX:] for item in split_hidden_states]
+        if images is not None and any(count > 1 for count in counts):
+            overlong = [
+                index for index, item in enumerate(split_hidden_states) if item.size(0) > self.max_sequence_length
+            ]
+            if overlong:
+                raise ValueError(
+                    "QwenImageEditPlusTextEmbedStage: multi-reference prompt exceeds max_sequence_length="
+                    f"{self.max_sequence_length}; first overlong row={overlong[0]}, "
+                    f"length={split_hidden_states[overlong[0]].size(0)}. Raise max_sequence_length or use fewer refs."
+                )
         attn_mask_list = [
             torch.ones(item.size(0), dtype=torch.long, device=item.device) for item in split_hidden_states
         ]

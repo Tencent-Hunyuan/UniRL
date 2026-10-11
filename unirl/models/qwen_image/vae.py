@@ -6,7 +6,8 @@ from contextlib import nullcontext
 
 import torch
 
-from unirl.models.types.codec import DecodeStage
+from unirl.models.types.codec import DecodeStage, EncodeStage
+from unirl.types.conditions import ImageLatentCondition
 from unirl.types.primitives import Images
 from unirl.types.segments import LatentSegment
 
@@ -64,4 +65,28 @@ class QwenImageVAEDecodeStage(DecodeStage[LatentSegment, Images]):
         return Images.from_dense(pixels)
 
 
-__all__ = ["QwenImageVAEDecodeStage"]
+class QwenImageVAEEncodeStage(EncodeStage[Images, ImageLatentCondition]):
+    """Encode clean target pixels into normalized Qwen image latents."""
+
+    def __init__(self, bundle: QwenImageBundle) -> None:
+        self.bundle = bundle
+
+    @torch.no_grad()
+    def encode(self, images: Images) -> ImageLatentCondition:
+        """Encode a uniform target batch ``[B,3,H,W]`` into ``[B,C,H/8,W/8]``."""
+        if self.bundle.vae is None:
+            raise RuntimeError("QwenImageVAEEncodeStage.encode requires a loaded VAE.")
+        pixels = images.to_dense().to(device=self.bundle.device, dtype=torch.float32)
+        if pixels.shape[1] != 3:
+            raise ValueError(f"QwenImageVAEEncodeStage.encode expects RGB images, got shape {tuple(pixels.shape)}.")
+
+        vae = self.bundle.vae.to(torch.float32)
+        latents = vae.encode((pixels * 2.0 - 1.0).unsqueeze(2)).latent_dist.mode()
+        z_dim = int(vae.config.z_dim)
+        mean = torch.tensor(vae.config.latents_mean, device=latents.device, dtype=torch.float32).view(1, z_dim, 1, 1, 1)
+        std = torch.tensor(vae.config.latents_std, device=latents.device, dtype=torch.float32).view(1, z_dim, 1, 1, 1)
+        normalized = ((latents - mean) / std)[:, :, 0]
+        return ImageLatentCondition(latents=normalized)
+
+
+__all__ = ["QwenImageVAEDecodeStage", "QwenImageVAEEncodeStage"]

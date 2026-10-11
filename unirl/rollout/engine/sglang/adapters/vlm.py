@@ -20,6 +20,16 @@ from unirl.rollout.engine.sglang.utils import (
 from unirl.types.sample import Sample
 
 
+def _wire_image_data(images: List[Any], *, parallel_samples: int) -> str | List[str] | List[List[str]]:
+    """Encode one prompt's images using SGLang's parallel-sampling wire shape."""
+    require(images, "VLMAdapter requires at least one image per request")
+    require(parallel_samples >= 1, f"VLMAdapter parallel_samples must be >= 1, got {parallel_samples}")
+    encoded = [pil_to_base64(image) for image in images]
+    if len(encoded) == 1:
+        return encoded[0]
+    return encoded if parallel_samples == 1 else [encoded]
+
+
 @register_adapter("vlm")
 class VLMAdapter(TextLMAdapter):
     """VLM conversion (e.g. Qwen2.5-VL): processor-encoded multimodal prompts."""
@@ -53,7 +63,7 @@ class VLMAdapter(TextLMAdapter):
         for mm, sample_id in zip(mm_encs, sample_ids):
             payload = self.base_payload(sampling, sample_id=sample_id)
             payload["text"] = mm.text
-            payload["image_data"] = pil_to_base64(mm.image)
+            payload["image_data"] = _wire_image_data(mm.images, parallel_samples=sampling.n)
             wire.append(payload)
             prompt_token_ids.append(list(mm.input_ids))
 
@@ -67,9 +77,8 @@ class VLMAdapter(TextLMAdapter):
     def encode_mm(self, messages: List[Dict[str, Any]], images: List[Any]) -> MMEncoding:
         """Processor-encode one conversation + its image(s) into the native layout."""
         require(
-            len(images) == 1,
-            f"{type(self).__name__}.encode_mm: expected exactly one image per request, "
-            f"got {len(images)} (multi-image conversations are unsupported).",
+            len(images) >= 1,
+            f"{type(self).__name__}.encode_mm: expected at least one image per request, got {len(images)}.",
         )
         template_kwargs: Dict[str, Any] = {
             "add_generation_prompt": True,
@@ -90,7 +99,7 @@ class VLMAdapter(TextLMAdapter):
         text = self._processor.apply_chat_template(processor_messages, **template_kwargs)
         enc = self._processor(text=[text], images=images, return_tensors="pt")
         return MMEncoding(
-            image=images[0],
+            images=list(images),
             text=text,
             input_ids=enc["input_ids"][0].tolist(),
             pixel_values=enc["pixel_values"],

@@ -13,10 +13,26 @@ from unirl.types.conditions import Condition, Modality, TextEmbedCondition
 
 @dataclass
 class QwenImageEditPlusLatentCondition(Condition):
-    """Per-sample ``[C, H_i, W_i]`` source latents at Qwen's native grids."""
+    """Per-sample ordered ``[C, H_i, W_i]`` source-latent rows."""
 
     modality: ClassVar[Modality] = Modality.IMAGE
-    latents: list[torch.Tensor] = concat_field(default_factory=list)
+    latents: list[list[torch.Tensor]] = concat_field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        normalized = []
+        for row, value in enumerate(self.latents):
+            if isinstance(value, torch.Tensor):
+                values = [value]
+            elif isinstance(value, (list, tuple)):
+                values = list(value)
+            else:
+                raise TypeError(
+                    f"QwenImageEditPlusLatentCondition.latents[{row}] must be a tensor row, got {type(value).__name__}."
+                )
+            if any(not isinstance(latent, torch.Tensor) for latent in values):
+                raise TypeError(f"QwenImageEditPlusLatentCondition.latents[{row}] must contain tensors.")
+            normalized.append(values)
+        self.latents = normalized
 
     def __len__(self) -> int:
         return len(self.latents)

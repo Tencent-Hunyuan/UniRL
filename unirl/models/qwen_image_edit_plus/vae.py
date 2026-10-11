@@ -8,7 +8,7 @@ from typing import Dict, List
 import torch
 
 from unirl.models.types.codec import EncodeStage
-from unirl.types.primitives import Images
+from unirl.types.primitives import ImagePrimitive, as_image_sets
 
 from .bundle import QwenImageEditPlusBundle
 from .conditions import QwenImageEditPlusLatentCondition
@@ -28,15 +28,15 @@ def _vae_size_for_aspect(width: int, height: int) -> tuple[int, int]:
     return int(vae_width), int(vae_height)
 
 
-class QwenImageEditPlusVAEEncodeStage(EncodeStage[Images, QwenImageEditPlusLatentCondition]):
-    """Encode a source image into a VAE-latent condition for token concat."""
+class QwenImageEditPlusVAEEncodeStage(EncodeStage[ImagePrimitive, QwenImageEditPlusLatentCondition]):
+    """Encode ordered source-image rows into VAE-latent conditions."""
 
     def __init__(self, bundle: QwenImageEditPlusBundle) -> None:
         self.bundle = bundle
 
     @torch.no_grad()
-    def encode(self, images: Images) -> QwenImageEditPlusLatentCondition:
-        """Encode source pixels into a ragged latent condition."""
+    def encode(self, images: ImagePrimitive) -> QwenImageEditPlusLatentCondition:
+        """Encode source pixels into row-aligned ragged latent conditions."""
         if self.bundle.vae is None:
             raise RuntimeError(
                 "QwenImageEditPlusVAEEncodeStage.encode: no VAE loaded "
@@ -45,11 +45,16 @@ class QwenImageEditPlusVAEEncodeStage(EncodeStage[Images, QwenImageEditPlusLaten
                 "recipes encode in the rollout engine (image_latent arrives "
                 "captured); trainside rollout requires load_vae=True."
             )
-        if not isinstance(images, Images):
-            raise TypeError(f"QwenImageEditPlusVAEEncodeStage.encode: expected Images, got {type(images).__name__}")
-        source_pils = images.to_pils()
-        if not source_pils:
-            raise ValueError("QwenImageEditPlusVAEEncodeStage.encode: empty image batch")
+        image_sets = as_image_sets(images)
+        counts = image_sets.counts.tolist()
+        if not counts or any(int(count) < 1 for count in counts):
+            raise ValueError(
+                f"QwenImageEditPlusVAEEncodeStage.encode requires at least one source image per row; counts={counts}."
+            )
+        flattened, owners = image_sets.flatten()
+        if flattened is None:
+            raise ValueError("QwenImageEditPlusVAEEncodeStage.encode: empty image-set batch")
+        source_pils = flattened.to_pils()
 
         vae = self.bundle.vae
         device = self.bundle.device
@@ -90,7 +95,10 @@ class QwenImageEditPlusVAEEncodeStage(EncodeStage[Images, QwenImageEditPlusLaten
             for local_index, source_index in enumerate(indices):
                 by_index[source_index] = image_latents[local_index]
 
-        return QwenImageEditPlusLatentCondition(latents=[by_index[index] for index in range(len(source_pils))])
+        rows: List[List[torch.Tensor]] = [[] for _ in image_sets.rows]
+        for index, owner in enumerate(owners.tolist()):
+            rows[int(owner)].append(by_index[index])
+        return QwenImageEditPlusLatentCondition(latents=rows)
 
 
 __all__ = ["QwenImageEditPlusVAEEncodeStage"]
