@@ -75,7 +75,10 @@ per-model σ override subclasses `FlowMatchSchedulePolicy` and overrides only
 (`index_schedule.py`), wired under `sampling.scheduler`. DanceGRPO/MixGRPO
 add no kernel: DanceGRPO swaps in `DanceSDEStrategy` under `pipeline.strategy`,
 MixGRPO keeps `FlowSDEStrategy` and adds a `WindowScheduler` under
-`sampling.scheduler`.
+`sampling.scheduler`. Flash-GRPO swaps in `FlashSDEStrategy` under
+`pipeline.strategy`; its per-prompt step draw needs
+`AllSDEScheduler.sde_candidate_pool()`, which reports the candidate set
+independently of how many steps `num_sde_steps` draws per rollout.
 
 ## Gotchas
 
@@ -129,3 +132,17 @@ MixGRPO keeps `FlowSDEStrategy` and adds a `WindowScheduler` under
 - **`exp_decay_threshold` defaults to 13.** Decay starts only once a window start passes it.
   Shipped mixgrpo schedules are shorter, so `strategy=exp_decay` stays at `iters_per_window`
   until the threshold is lowered.
+- **`FlashSDEStrategy`'s coefficient is a ported upstream formula, not a UniRL invention.**
+  It follows `Shredded-Pork/Flash-GRPO@bd6051f`, where
+  `std_dev_t = sigma_min + (sigma_max - sigma_min) * sigma` with `sigma_max = sigmas[1]` and
+  `sigma_min` captured by `init_schedule` (normally `0` for a FlowMatch schedule). That same
+  expression is duplicated in the SGLang rollout patch, the train-side rectification weight,
+  and `WAN21DiffusionStage._replay_per_sample`; the three must move together or rollout and
+  replay score different transitions. `eta` multiplies it so `eta=0` still gives the
+  deterministic Euler step.
+- **`init_schedule` is not only a generation-path call.** `FlashSDEStrategy._std_dev_t` raises
+  without it rather than defaulting `sigma_min` to 0, matching `UniPCStrategy`'s convention.
+  `diffuse` pins the schedule, but a remote rollout engine means the trainer rank never
+  generates, so `WAN21DiffusionStage._replay_per_sample` pins it from `segment.sigmas` itself.
+  Any new replay path that reads this coefficient must do the same: a silent 0 default would be
+  correct only while every schedule's terminal σ happens to be 0.
