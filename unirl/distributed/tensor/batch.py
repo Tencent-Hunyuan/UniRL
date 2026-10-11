@@ -186,7 +186,7 @@ def _first_difference(a: Any, b: Any, path: str) -> Optional[str]:
             return f"{path}: length {len(a)} != {len(b)}"
         children = ((f"{path}[{i}]", x, y) for i, (x, y) in enumerate(zip(a, b)))
     elif is_dataclass(a):
-        children = ((f"{path}.{f.name}", getattr(a, f.name), getattr(b, f.name)) for f in dc_fields(a) if f.compare)
+        children = ((f"{path}.{f.name}", getattr(a, f.name), getattr(b, f.name)) for f in dc_fields(a))
     else:
         return None if a == b else f"{path}: {reprlib.repr(a)} != {reprlib.repr(b)}"
     for child_path, x, y in children:

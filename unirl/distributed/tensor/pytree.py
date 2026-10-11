@@ -90,14 +90,9 @@ def pytree_chunk(value, dp_size: int, batch_size: int) -> list:
         return [tuple(split_elems[j][i] for j in range(len(value))) for i in range(dp_size)]
 
     elif isinstance(value, Batch):
-        if value.batch_size == batch_size:
-            return value.chunk(dp_size)
-        if isinstance(value, TensorRef):
+        if value.batch_size != batch_size:
             return [value] * dp_size
-        raise ValueError(
-            f"{type(value).__name__} has batch_size={value.batch_size} but the call is split by "
-            f"batch_size={batch_size}; wrap it in Broadcast(...) to send it whole to every rank"
-        )
+        return value.chunk(dp_size)
 
     else:
         return [value] * dp_size
