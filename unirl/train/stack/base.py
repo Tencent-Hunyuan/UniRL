@@ -16,6 +16,7 @@ from unirl.distributed.group.remote import Remote
 from unirl.distributed.tensor.batch import _move_value
 from unirl.train.backend.fsdp import FSDPBackend
 from unirl.train.stack.anchor import prepare_segment_anchors, validate_anchor_contract
+from unirl.train.stack.loss_scale import resolve_loss_scales
 from unirl.train.stack.planner import (
     Arrangement,
     CountPlanner,
@@ -26,7 +27,6 @@ from unirl.train.stack.planner import (
     _positive_int,
     arranged_slice,
 )
-from unirl.types.loss_agg import LossAggMode
 from unirl.types.sample import Part
 from unirl.utils.metrics import aggregate_numeric_metrics
 
@@ -142,10 +142,24 @@ class TrainStack(Remote):
         if zero_grad:
             self.fsdp_backend.zero_grad()
 
-        loss_scales, global_weight = self._resolve_loss_scales(part, micros=micros, order=order)
+        cls = type(self).__name__
+        loss_scales, global_weight = resolve_loss_scales(
+            self.algorithm,
+            part,
+            micros=micros,
+            order=order,
+            backend=self.fsdp_backend,
+            rank_info=self.rank_info,
+            owner=cls,
+        )
+        if global_weight is not None and global_weight <= 0.0:
+            raise ValueError(
+                f"{cls}: zero valid tokens in this optimizer step "
+                "(fully-masked batch?) — the data source must not emit steps with no "
+                "supervision (0/0 loss NaNs destroyed checkpoints in verl #785)."
+            )
         micro_results: List[AlgorithmStepResult] = []
         total_loss = 0.0
-        weighted_loss_sum = 0.0
         has_backward = False
 
         single_micro = len(micros) == 1 and micros[0] == (0, bs)
@@ -163,10 +177,7 @@ class TrainStack(Remote):
                 loss_scale=loss_scales[i] * loss_weight,
             )
             micro_results.append(result)
-            if global_weight is None:
-                total_loss += result.loss * loss_scales[i]
-            else:
-                weighted_loss_sum += result.loss * self._micro_loss_weight(part, start, end, order=order)
+            total_loss += result.loss * loss_scales[i]
             has_backward = has_backward or result.has_backward
 
         aggregated_metrics: Mapping[str, object] = aggregate_numeric_metrics(
@@ -208,12 +219,9 @@ class TrainStack(Remote):
                 "cuda_reserved_gb": torch.cuda.memory_reserved() / 2**30,
             }
 
-        if global_weight is None:
-            (global_loss_sum,) = self._all_reduce_sums([total_loss])
-            total_loss = global_loss_sum / self._loss_weight_world()
-        else:
-            (global_loss_sum,) = self._all_reduce_sums([weighted_loss_sum])
-            total_loss = global_loss_sum / global_weight
+        (global_loss_sum,) = self._all_reduce_sums([total_loss])
+        total_loss = global_loss_sum / self.fsdp_backend.gradient_average_world_size()
+        if global_weight is not None:
             aggregated_metrics = {**dict(aggregated_metrics), "global_loss_weight": global_weight}
 
         return TrainStepResult(
@@ -229,54 +237,6 @@ class TrainStack(Remote):
     def on_rollout_end(self) -> None:
         """Per-rollout-boundary hook — delegates to the FSDPBackend's EMA."""
         self.fsdp_backend.on_rollout_end()
-
-    def _resolve_loss_scales(
-        self, part: Part, *, micros: UpdatePlan, order: Optional[torch.Tensor]
-    ) -> Tuple[List[float], Optional[float]]:
-        """Per-micro ``loss_scale``: valid-token share for ``token-mean``, else sample share (grouping-invariant)."""
-        if getattr(self.algorithm, "loss_agg_mode", None) != LossAggMode.TOKEN_MEAN:
-            update_total = sum(end - start for start, end in micros)
-            return [(end - start) / update_total for start, end in micros], None
-        rank_info = getattr(self, "rank_info", None)
-        if rank_info is not None and rank_info.sp_size > 1:
-            # Reject sequence parallelism until loss denominators include the SP dimension.
-            raise ValueError(
-                f"{type(self).__name__}: loss_agg_mode='token-mean' is not validated under "
-                f"sequence parallelism (sp_size={rank_info.sp_size}); use sp_size=1."
-            )
-        weights = [self._micro_loss_weight(part, start, end, order=order) for start, end in micros]
-        local_total = sum(weights)
-        (global_total,) = self._all_reduce_sums([local_total])
-        if global_total <= 0.0:
-            raise ValueError(
-                f"{type(self).__name__}: zero valid tokens in this optimizer step "
-                "(fully-masked batch?) — the data source must not emit steps with no "
-                "supervision (0/0 loss NaNs destroyed checkpoints in verl #785)."
-            )
-        dp_world = self._loss_weight_world()
-        return [w * dp_world / global_total for w in weights], global_total
-
-    def _micro_loss_weight(self, part: Part, start: int, end: int, *, order: Optional[torch.Tensor]) -> float:
-        """Valid-token count of arranged positions ``[start, end)`` (loss_mask-aware)."""
-        if order is not None:
-            return sum(self._micro_loss_weight(part, row, row + 1, order=None) for row in order[start:end].tolist())
-        segment = part.segment
-        if segment is None:
-            raise ValueError(f"{type(self).__name__}: loss_agg_mode='token-mean' requires a segment.")
-        cu = segment.cu_seqlens
-        loss_mask = getattr(segment, "loss_mask", None)
-        if loss_mask is not None and cu is not None:
-            return float(loss_mask[int(cu[start]) : int(cu[end])].sum().item())
-        if segment.lengths is not None:
-            return float(segment.lengths[start:end].sum().item())
-        raise ValueError(
-            f"{type(self).__name__}: loss_agg_mode='token-mean' requires a packed segment "
-            "(cu_seqlens/lengths) — build it via TextSegment.pack(...)."
-        )
-
-    def _loss_weight_world(self) -> int:
-        """World size whose gradient averaging the token weighting must cancel."""
-        return self.fsdp_backend.gradient_average_world_size()
 
     def _all_reduce_sums(self, values: List[float]) -> List[float]:
         """SUM scalars over the backend's FSDP mesh (no-op single-rank)."""

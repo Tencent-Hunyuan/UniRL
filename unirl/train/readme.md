@@ -153,6 +153,19 @@ use LoRA adapter mode. Formats and export live in
   Consumers outside `train/` take the transform from
   `backend.expert_weight_export_transform()` — `distributed/weight_sync/` must not
   import the layout (the core-dependency guard rejects it).
+- **`token-mean` loss scales come from DP-global valid tokens** (`stack/loss_scale.py`) —
+  a micro's `loss_scale` is its valid tokens × the gradient-averaging world / the valid
+  tokens all-reduced over one `TrainStack._run_update` or one unified `_train_one_step`
+  track. A `TrainStack` accumulation window resolves each part on its own and scales it
+  by 1/M, so its step averages the per-part token means. Other modes and the unified
+  image track use sample share. Both stacks report the DP-global loss and, under
+  `token-mean`, `global_loss_weight`; zero valid tokens across DP raises in `TrainStack`.
+- **A zero-valid-token AR track in `UnifiedModelTrainStack` still backwards** —
+  masked micros backward at `loss_scale` 0, so AR-only params get zero grads that AdamW
+  still decays and steps (skipping them would leave `None` grads, which AdamW skips). The
+  image track steps, a warning is logged, and the update's `has_zero_valid_tokens` is 1.0
+  (a rollout-level mean over updates). A micro with no AR tokens at all is skipped by the
+  algorithm, which FSDP2 tolerates only when every DP rank skips it.
 - **Advantages are not computed here** — `train` raises if
   `part.advantages is None`; the trainer must call `compute_advantages` on the
   full shard first.
