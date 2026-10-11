@@ -204,6 +204,16 @@ use LoRA adapter mode. Formats and export live in
   uninitialized adapter. Teachers must be plain LoRA deltas: unconverted base-rewriting
   inits (pissa, olora, ...), `modules_to_save`, `layer_replication`,
   `trainable_token_indices`, DoRA, and `bias != "none"` are rejected at startup.
+- **A frozen teacher must be readable and identical on every rank before wrap** — every rank
+  reads each teacher's config and CPU weights, then one gather compares the `(name, path)`
+  list and any read errors. A missing absolute or `~` path, or a missing relative path whose
+  first component exists, plus an unreadable checkpoint or an injection/validation failure,
+  raises the same error on every rank before FSDP/VeOmni wrapping, naming the ranks, adapters,
+  and paths. Different configs or weight bytes are rejected the same way, naming the ranks and
+  the config fields or weight hashes that differ. Every rank must pass the same teacher list.
+  This call reads each teacher once and reuses those CPU weights for injection and the deferred
+  load; the next run, including resume, reads the paths again. A process that never enters
+  this call, or that dies during the read, is not covered.
 - **Adapter checkpoints exclude frozen teachers, and resume requires the same teachers** —
   teachers reload from their paths and the checkpoint pins each by a content sha256, so a
   different teacher set or different weights raises on `load`. A checkpoint trained without
