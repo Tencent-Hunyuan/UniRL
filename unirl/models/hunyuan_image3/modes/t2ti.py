@@ -11,7 +11,7 @@ from unirl.types.sample import Sample
 from unirl.types.sampling import DiffusionSamplingParams
 
 from ..ar import HunyuanImage3ARParams
-from ..conditions import HunyuanImage3ARConditions, HunyuanImage3DiffusionConditions
+from ..conditions import HunyuanImage3ARConditions, HunyuanImage3DiffusionConditions, split_cfg_fused
 from .t2t import _resolve_system_prompt, _stop_tokens_for_bot_task, _tokenizer_bot_task
 
 if TYPE_CHECKING:
@@ -169,17 +169,20 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
 
     schedule = diff_sp.sigmas.to(pipeline.bundle.device)
 
+    cfg = float(diff_sp.guidance_scale) > 1.0
     mm2 = pipeline.text_embed.embed_for_gen_image(
         image_prompts,
-        cfg=float(diff_sp.guidance_scale) > 1.0,
+        cfg=cfg,
         height=int(diff_sp.height),
         width=int(diff_sp.width),
         bot_task=tok_bot_task,
         cot_text=image_cots,
         system_prompt=image_system_prompts,
     )
+    fused, fused_uncond = split_cfg_fused(mm2["fused"], n_images, cfg=cfg)
     diff_conds = HunyuanImage3DiffusionConditions(
-        fused=mm2["fused"],
+        fused=fused,
+        fused_uncond=fused_uncond,
         tokenizer_output=mm2["tokenizer_output"],
     )
 
