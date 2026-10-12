@@ -452,9 +452,6 @@ class ARTrainer(BaseTrainer):
                 if preserve_rollout_weights:
                     self._preserve_rollout_weights_for_next_sleep()
                 sample = self.rollout.generate(sample)
-                from unirl.trainer.unified_model import deep_hydrate
-
-                sample = deep_hydrate(sample)
 
         if self.reward is not None:
             sample = self.reward.score_and_attach(sample)
@@ -558,13 +555,7 @@ class ARTrainer(BaseTrainer):
                     prompt_n += real_prompt_n
                     dispatch_inputs = self._pad_eval_inputs(eval_inputs)
                     sample = self._build_request_sample(dispatch_inputs, rollout_id, sampling=eval_sp)
-                    if anchored:
-                        generated = self.rollout.generate(sample)
-                        from unirl.trainer.unified_model import deep_hydrate
-
-                        generated = deep_hydrate(generated)
-                    else:
-                        generated = self.rollout.generate(sample)
+                    generated = self.rollout.generate(sample)
                     scored = self.reward.score_and_attach(generated)
                     rewards = scored.parts[-1].rewards
                     if rewards is not None:

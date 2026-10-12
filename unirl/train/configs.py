@@ -89,6 +89,8 @@ class FSDPConfig:
     mixed_precision: bool = True
     # NCCL zero-CTA on WORLD so FSDP all-gather uses copy engines (communicator-wide).
     copy_engine_all_gather: bool = False
+    # Switch the worker's CUDA caching allocator to expandable segments (process-wide).
+    expandable_segments: bool = False
     # Match FSDP2's default: cast floating block inputs to param_dtype.
     cast_forward_inputs: bool = True
     # Shard degree: full = the whole world, hybrid = hsdp_shard_size ranks

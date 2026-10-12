@@ -14,7 +14,7 @@ from unirl.algorithms.base import AlgorithmStepResult, StageAlgorithm
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
 from unirl.train.backend.fsdp import FSDPBackend
-from unirl.train.stack import TrainStepResult, prepare_segment_anchors, validate_anchor_contract
+from unirl.train.stack import TrainStepResult, prepare_segment_anchors, resolve_loss_scales, validate_anchor_contract
 from unirl.train.stack.base import _aggregate_update_results
 from unirl.train.stack.planner import (
     CountPlanner,
@@ -83,7 +83,7 @@ class UnifiedModelTrainStack(Remote):
         order: Optional[torch.Tensor],
         training_progress: float,
     ) -> tuple[TrainStepResult, bool]:
-        """Backward one algorithm's Part over the given absolute ``micro_slices``"""
+        """Backward one algorithm's Part over absolute ``micro_slices``; loss scales: see ``readme.md`` Gotchas."""
         if part.advantages is None:
             raise ValueError(
                 f"UnifiedModelTrainStack.train: {type(algorithm).__name__} Part has advantages=None; "
@@ -93,15 +93,22 @@ class UnifiedModelTrainStack(Remote):
             raise ValueError(f"UnifiedModelTrainStack.train: empty micro_slices for {type(algorithm).__name__} Part.")
 
         bs = int(part.batch_size)
-        update_total = sum(end - start for start, end in micro_slices)
+        loss_scales, global_weight = resolve_loss_scales(
+            algorithm,
+            part,
+            micros=micro_slices,
+            order=order,
+            backend=self.fsdp_backend,
+            rank_info=self.rank_info,
+            owner="UnifiedModelTrainStack",
+        )
         micros: List[AlgorithmStepResult] = []
         total_loss = 0.0
         has_backward = False
 
         single_micro = len(micro_slices) == 1 and micro_slices[0] == (0, bs)
-        for start, end in micro_slices:
+        for (start, end), loss_scale in zip(micro_slices, loss_scales):
             micro_track = part if single_micro else arranged_slice(part, order, start, end)
-            loss_scale = (end - start) / float(update_total)
             result = algorithm.compute_loss_and_backward(
                 conditions=micro_track.conditions,
                 segment=micro_track.segment,
@@ -114,6 +121,19 @@ class UnifiedModelTrainStack(Remote):
             has_backward = has_backward or result.has_backward
 
         aggregated: Mapping[str, object] = aggregate_numeric_metrics([r.metrics for r in micros if r.metrics])
+        if global_weight is not None:
+            has_zero_valid_tokens = global_weight <= 0.0
+            if has_zero_valid_tokens:
+                logger.warning(
+                    "UnifiedModelTrainStack: %s has zero valid tokens across DP in this optimizer step; "
+                    "its loss_scale is 0 and only the other track contributes gradient.",
+                    type(algorithm).__name__,
+                )
+            aggregated = {
+                **aggregated,
+                "global_loss_weight": global_weight,
+                "has_zero_valid_tokens": float(has_zero_valid_tokens),
+            }
         partial = TrainStepResult(
             loss=total_loss,
             grad_norm=0.0,
@@ -158,9 +178,12 @@ class UnifiedModelTrainStack(Remote):
 
         lr = self._current_lr()
         optimizer_updates = 1 if any_backward and math.isfinite(grad_norm) else 0
-        for name, r in list(results.items()):
+        # Each track's local sum(loss * loss_scale) averages to its DP-global loss over the gradient world.
+        loss_sums = self.fsdp_backend.all_reduce_loss_sums([r.loss for r in results.values()])
+        dp_world = self.fsdp_backend.gradient_average_world_size()
+        for (name, r), loss_sum in zip(list(results.items()), loss_sums):
             results[name] = TrainStepResult(
-                loss=r.loss,
+                loss=loss_sum / dp_world,
                 grad_norm=grad_norm,
                 lr=lr,
                 has_backward=r.has_backward,
