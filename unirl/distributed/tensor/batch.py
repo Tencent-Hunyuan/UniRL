@@ -23,7 +23,6 @@ from typing import (
     Union,
 )
 
-import numpy as np
 import torch
 
 T = TypeVar("T", bound="Batch")
@@ -160,18 +159,13 @@ def _first_difference(a: Any, b: Any, path: str) -> Optional[str]:
         return None
     if type(a) is not type(b):
         return f"{path}: {type(a).__name__} != {type(b).__name__}"
-    if isinstance(a, (torch.Tensor, np.ndarray)):
+    if isinstance(a, torch.Tensor):
         if a.shape != b.shape or a.dtype != b.dtype:
             return f"{path}: {tuple(a.shape)} {a.dtype} != {tuple(b.shape)} {b.dtype}"
-        if isinstance(a, torch.Tensor):
-            b = b.to(a.device)
-            if torch.equal(a, b):
-                return None
-            index = int((a != b).reshape(-1).nonzero()[0])
-        else:
-            if np.array_equal(a, b):
-                return None
-            index = int(np.flatnonzero(a != b)[0])
+        b = b.to(a.device)
+        if torch.equal(a, b):
+            return None
+        index = int((a != b).reshape(-1).nonzero()[0])
         return f"{path}.flat[{index}]: {a.reshape(-1)[index].item()} != {b.reshape(-1)[index].item()}"
     if isinstance(a, Batch) and a._is_tensor_proxy:
         if a.shape != b.shape or a.dtype != b.dtype:
@@ -229,13 +223,13 @@ def _concat_value(values: List[Any], batch_sizes: List[int], name: str) -> Any:
             return torch.cat(non_none, dim=0)
         if any(is_batched):
             raise ValueError(f"{name}: mixed batched / non-batched tensors")
-        return _shared_value(non_none, name)
+        return non_none[0]
 
     if all(isinstance(v, Batch) and v._is_tensor_proxy for v in non_none):
         rows = [v.batch_size for v in non_none]
         sizes = [bs for _, bs in items]
         if rows != sizes:
-            # A proxy's rows live in the transport, so a non-batched value cannot be checked for equality here.
+            # TensorRef.concat joins spans regardless of row count, which would misalign the merged rows.
             raise ValueError(f"{name}: tensor reference rows {rows} do not match item batch sizes {sizes}")
         return type(non_none[0]).concat(non_none)
 
