@@ -19,5 +19,7 @@ and clipping need measurements before a learning comparison.
   and trainable parameter count when comparing against LoRA.
 - **The original mixed precision layout is retained.** Keep `root_wrap: false` and
   `cast_forward_inputs: false`; frozen timestep and projection modules remain outside FSDP groups.
-- **Original-checkpoint memory and learning remain unverified.** Small-model CPU/CUDA probes
-  do not establish whether the 33B checkpoint fits or learns. Measure the first optimizer step.
+- **The 8-H100 run without expandable allocator segments fails during backward.** With Torch 2.13,
+  full sharding, fp32 masters, resident VAEs and 10 replay steps at 256x384 with 124 frames,
+  the original checkpoint loads and generates but does not reach the first Adam update.
+  Expandable segments, more shards or offloading need validation; learning remains unverified.
