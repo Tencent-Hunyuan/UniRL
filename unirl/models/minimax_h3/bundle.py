@@ -104,6 +104,10 @@ class MiniMaxH3Bundle(Bundle):
                 path, subfolder="transformer", torch_dtype=dtype
             ).to(device)
 
+        if config.full_finetune_blocks:
+            transformer.requires_grad_(False)
+            transformer.transformer_blocks.requires_grad_(True)
+
         # Video VAE (frozen, fp32).
         vae = AutoencoderKLMiniMaxH3.from_pretrained(vae_path, subfolder="vae", torch_dtype=vae_dtype)
         vae = vae.to(vae_device).eval()
