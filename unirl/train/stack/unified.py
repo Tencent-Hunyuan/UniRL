@@ -19,7 +19,7 @@ from unirl.train.stack import (
     resolve_loss_scales,
     validate_anchor_contract,
 )
-from unirl.train.stack.common import BaseTrainStack
+from unirl.train.stack.base import BaseTrainStack
 from unirl.train.stack.planner import (
     CountPlanner,
     UpdatePlanner,

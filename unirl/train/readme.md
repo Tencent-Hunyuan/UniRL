@@ -50,7 +50,7 @@ knows nothing about DTensor sharding or wrap topology.
 - **`UnifiedModelTrainStack`** (`stack/unified.py`) drives two algorithms
   (`ar` + `image`) backward-accumulating into one shared optimizer step on one
   shared backbone (HunyuanImage3).
-- **`BaseTrainStack`** (`stack/common.py`) is the base of both: it validates the
+- **`BaseTrainStack`** (`stack/base.py`) is the base of both: it validates the
   shared constructor arguments and owns the backend lifecycle, lazy profiler
   cache, and LR lookup.
 
