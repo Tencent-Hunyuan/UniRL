@@ -14,6 +14,7 @@ from unirl.train.stack import TrainStepResult
 from unirl.trainer.ar import ARTrainer, ar_preflight
 from unirl.trainer.async_rollout import (
     AsyncRolloutTrainerMixin,
+    connect_separate_rollout,
     resolve_separate_worker_concurrency,
     training_version_metrics,
 )
@@ -180,18 +181,7 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
                 f"AsyncARTrainer (separate slabs) requires a cross-slab weight sync "
                 f"(NCCLWeightSync); got sync._target_={target!r}."
             )
-        addr, port = self.weight_sync.pick_master()[0]
-        tp_size = self.rollout.tp_size
-        pp_size = self.rollout.pp_size
-        targets = self.rollout.tp_zero_workers
-        self.weight_sync.set_rollout_targets(targets, self.rollout.role_name)
-        self.weight_sync.connect(
-            master_addr=addr,
-            master_port=port,
-            num_rollout_gpus=len(targets) * tp_size,
-            tp_size=tp_size,
-            pp_size=pp_size,
-        )
+        connect_separate_rollout(self.weight_sync, self.rollout)
 
     def _advantage_and_train(
         self,
