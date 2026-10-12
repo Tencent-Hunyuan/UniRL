@@ -12,10 +12,11 @@ import torch
 
 from unirl.algorithms.base import AlgorithmStepResult, StageAlgorithm
 from unirl.distributed.group.dispatch import Dispatch, distributed
-from unirl.distributed.group.remote import Remote
 from unirl.distributed.tensor.batch import _move_value
 from unirl.train.backend.fsdp import FSDPBackend
 from unirl.train.stack.anchor import prepare_segment_anchors, validate_anchor_contract
+from unirl.train.stack.common import BaseTrainStack
+from unirl.train.stack.loss_scale import resolve_loss_scales
 from unirl.train.stack.planner import (
     Arrangement,
     CountPlanner,
@@ -23,10 +24,8 @@ from unirl.train.stack.planner import (
     Plan,
     UpdatePlan,
     UpdatePlanner,
-    _positive_int,
     arranged_slice,
 )
-from unirl.types.loss_agg import LossAggMode
 from unirl.types.sample import Part
 from unirl.utils.metrics import aggregate_numeric_metrics
 
@@ -48,14 +47,16 @@ class TrainStepResult:
     per_update: Tuple[Mapping[str, object], ...] = ()
 
 
-def _aggregate_update_results(results: List["TrainStepResult"]) -> "TrainStepResult":
+def aggregate_update_results(
+    results: List["TrainStepResult"], *, include_per_update: bool = False
+) -> "TrainStepResult":
     """Collapse one rollout's per-update results into a single summary."""
     if len(results) == 1:
         return results[0]
     n = len(results)
     micros: List[AlgorithmStepResult] = [m for r in results for m in r.micros]
-    metrics = aggregate_numeric_metrics([dict(r.metrics) for r in results if r.metrics])
-    return TrainStepResult(
+    metrics = aggregate_numeric_metrics([r.metrics for r in results if r.metrics])
+    aggregated = TrainStepResult(
         loss=sum(r.loss for r in results) / n,
         grad_norm=sum(r.grad_norm for r in results) / n,
         lr=results[-1].lr,
@@ -64,6 +65,21 @@ def _aggregate_update_results(results: List["TrainStepResult"]) -> "TrainStepRes
         metrics=metrics,
         optimizer_updates=sum(r.optimizer_updates for r in results),
     )
+    if include_per_update:
+        aggregated = replace(
+            aggregated,
+            per_update=tuple(
+                {
+                    **r.metrics,
+                    "loss": r.loss,
+                    "grad_norm": r.grad_norm,
+                    "lr": r.lr,
+                    "optimizer_updates": r.optimizer_updates,
+                }
+                for r in results
+            ),
+        )
+    return aggregated
 
 
 def _align_track_to_model(part: Part, *, device: torch.device) -> None:
@@ -75,7 +91,7 @@ def _align_track_to_model(part: Part, *, device: torch.device) -> None:
         part.advantages = part.advantages.to(device=device)
 
 
-class TrainStack(Remote):
+class TrainStack(BaseTrainStack):
     """Single-stage stage-driven train stack — family-agnostic."""
 
     def __init__(
@@ -90,25 +106,14 @@ class TrainStack(Remote):
         shuffle_updates: bool = False,
         shuffle_seed: int = 0,
     ) -> None:
-        super().__init__()
-        cls = type(self).__name__
-        if int(micro_batch_size) < 1:
-            raise ValueError(f"{cls}.micro_batch_size must be >= 1; got {micro_batch_size}.")
-        if float(max_grad_norm) <= 0.0:
-            raise ValueError(f"{cls}.max_grad_norm must be > 0; got {max_grad_norm}.")
-        self.num_updates_per_batch = _positive_int(name=f"{cls}.num_updates_per_batch", value=num_updates_per_batch)
-        if self.num_updates_per_batch > 1 and not algorithm.supports_multi_update:
-            raise ValueError(
-                f"num_updates_per_batch={self.num_updates_per_batch} requires an algorithm whose "
-                f"old_logp anchor stays frozen across the N optimizer steps "
-                f"(FlowGRPO / FlowDPPO / GRPO / DRPO). "
-                f"{type(algorithm).__name__} sets supports_multi_update=False, so >1 optimizer "
-                f"step would train against a moving anchor. Set num_updates_per_batch=1."
-            )
-        self.fsdp_backend = fsdp_backend
+        super().__init__(
+            fsdp_backend=fsdp_backend,
+            algorithms=(algorithm,),
+            micro_batch_size=micro_batch_size,
+            max_grad_norm=max_grad_norm,
+            num_updates_per_batch=num_updates_per_batch,
+        )
         self.algorithm = algorithm
-        self.micro_batch_size = int(micro_batch_size)
-        self.max_grad_norm = float(max_grad_norm)
         self.update_planner = UpdatePlanner(
             micro_planner if micro_planner is not None else CountPlanner(),
             shuffle_updates=shuffle_updates,
@@ -129,7 +134,7 @@ class TrainStack(Remote):
         prior_backward: bool = False,
     ) -> TrainStepResult:
         """Run the micro ranges of a single update; step unless mid-window."""
-        if part.advantages is None and getattr(self.algorithm, "requires_advantages", True):
+        if part.advantages is None and self.algorithm.requires_advantages:
             raise ValueError(
                 f"{type(self).__name__}._run_update: part.advantages is None; "
                 "upstream advantage pipeline must populate it before training. "
@@ -138,14 +143,28 @@ class TrainStack(Remote):
         if not micros:
             raise ValueError(f"{type(self).__name__}._run_update: empty micros.")
 
-        bs = int(part.batch_size)
+        bs = part.batch_size
         if zero_grad:
             self.fsdp_backend.zero_grad()
 
-        loss_scales, global_weight = self._resolve_loss_scales(part, micros=micros, order=order)
+        cls = type(self).__name__
+        loss_scales, global_weight = resolve_loss_scales(
+            self.algorithm,
+            part,
+            micros=micros,
+            order=order,
+            backend=self.fsdp_backend,
+            rank_info=self.rank_info,
+            owner=cls,
+        )
+        if global_weight is not None and global_weight <= 0.0:
+            raise ValueError(
+                f"{cls}: zero valid tokens in this optimizer step "
+                "(fully-masked batch?) — the data source must not emit steps with no "
+                "supervision (0/0 loss NaNs destroyed checkpoints in verl #785)."
+            )
         micro_results: List[AlgorithmStepResult] = []
         total_loss = 0.0
-        weighted_loss_sum = 0.0
         has_backward = False
 
         single_micro = len(micros) == 1 and micros[0] == (0, bs)
@@ -163,10 +182,7 @@ class TrainStack(Remote):
                 loss_scale=loss_scales[i] * loss_weight,
             )
             micro_results.append(result)
-            if global_weight is None:
-                total_loss += result.loss * loss_scales[i]
-            else:
-                weighted_loss_sum += result.loss * self._micro_loss_weight(part, start, end, order=order)
+            total_loss += result.loss * loss_scales[i]
             has_backward = has_backward or result.has_backward
 
         aggregated_metrics: Mapping[str, object] = aggregate_numeric_metrics(
@@ -193,7 +209,7 @@ class TrainStack(Remote):
             # Accumulation-only part: the window's final part steps.
             grad_norm = 0.0
         elif window_backward:
-            grad_norm = float(self.fsdp_backend.optimizer_step(max_grad_norm=float(self.max_grad_norm)))
+            grad_norm = self.fsdp_backend.optimizer_step(max_grad_norm=self.max_grad_norm)
         else:
             grad_norm = 0.0
             logger.warning(
@@ -203,18 +219,15 @@ class TrainStack(Remote):
         if torch.cuda.is_available():
             # CUDA memory footprint per optimizer step (leak diagnosis: tp2 path showed progressive OOM).
             aggregated_metrics = {
-                **dict(aggregated_metrics),
+                **aggregated_metrics,
                 "cuda_alloc_gb": torch.cuda.memory_allocated() / 2**30,
                 "cuda_reserved_gb": torch.cuda.memory_reserved() / 2**30,
             }
 
-        if global_weight is None:
-            (global_loss_sum,) = self._all_reduce_sums([total_loss])
-            total_loss = global_loss_sum / self._loss_weight_world()
-        else:
-            (global_loss_sum,) = self._all_reduce_sums([weighted_loss_sum])
-            total_loss = global_loss_sum / global_weight
-            aggregated_metrics = {**dict(aggregated_metrics), "global_loss_weight": global_weight}
+        (global_loss_sum,) = self._all_reduce_sums([total_loss])
+        total_loss = global_loss_sum / self.fsdp_backend.gradient_average_world_size()
+        if global_weight is not None:
+            aggregated_metrics = {**aggregated_metrics, "global_loss_weight": global_weight}
 
         return TrainStepResult(
             loss=total_loss,
@@ -225,58 +238,6 @@ class TrainStack(Remote):
             metrics=aggregated_metrics,
             optimizer_updates=1 if has_backward and math.isfinite(grad_norm) else 0,
         )
-
-    def on_rollout_end(self) -> None:
-        """Per-rollout-boundary hook — delegates to the FSDPBackend's EMA."""
-        self.fsdp_backend.on_rollout_end()
-
-    def _resolve_loss_scales(
-        self, part: Part, *, micros: UpdatePlan, order: Optional[torch.Tensor]
-    ) -> Tuple[List[float], Optional[float]]:
-        """Per-micro ``loss_scale``: valid-token share for ``token-mean``, else sample share (grouping-invariant)."""
-        if getattr(self.algorithm, "loss_agg_mode", None) != LossAggMode.TOKEN_MEAN:
-            update_total = sum(end - start for start, end in micros)
-            return [(end - start) / update_total for start, end in micros], None
-        rank_info = getattr(self, "rank_info", None)
-        if rank_info is not None and rank_info.sp_size > 1:
-            # Reject sequence parallelism until loss denominators include the SP dimension.
-            raise ValueError(
-                f"{type(self).__name__}: loss_agg_mode='token-mean' is not validated under "
-                f"sequence parallelism (sp_size={rank_info.sp_size}); use sp_size=1."
-            )
-        weights = [self._micro_loss_weight(part, start, end, order=order) for start, end in micros]
-        local_total = sum(weights)
-        (global_total,) = self._all_reduce_sums([local_total])
-        if global_total <= 0.0:
-            raise ValueError(
-                f"{type(self).__name__}: zero valid tokens in this optimizer step "
-                "(fully-masked batch?) — the data source must not emit steps with no "
-                "supervision (0/0 loss NaNs destroyed checkpoints in verl #785)."
-            )
-        dp_world = self._loss_weight_world()
-        return [w * dp_world / global_total for w in weights], global_total
-
-    def _micro_loss_weight(self, part: Part, start: int, end: int, *, order: Optional[torch.Tensor]) -> float:
-        """Valid-token count of arranged positions ``[start, end)`` (loss_mask-aware)."""
-        if order is not None:
-            return sum(self._micro_loss_weight(part, row, row + 1, order=None) for row in order[start:end].tolist())
-        segment = part.segment
-        if segment is None:
-            raise ValueError(f"{type(self).__name__}: loss_agg_mode='token-mean' requires a segment.")
-        cu = segment.cu_seqlens
-        loss_mask = getattr(segment, "loss_mask", None)
-        if loss_mask is not None and cu is not None:
-            return float(loss_mask[int(cu[start]) : int(cu[end])].sum().item())
-        if segment.lengths is not None:
-            return float(segment.lengths[start:end].sum().item())
-        raise ValueError(
-            f"{type(self).__name__}: loss_agg_mode='token-mean' requires a packed segment "
-            "(cu_seqlens/lengths) — build it via TextSegment.pack(...)."
-        )
-
-    def _loss_weight_world(self) -> int:
-        """World size whose gradient averaging the token weighting must cancel."""
-        return self.fsdp_backend.gradient_average_world_size()
 
     def _all_reduce_sums(self, values: List[float]) -> List[float]:
         """SUM scalars over the backend's FSDP mesh (no-op single-rank)."""
@@ -307,10 +268,10 @@ class TrainStack(Remote):
                     s, w = eval_fn(
                         conditions=micro.conditions,
                         segment=micro.segment,
-                        sample_ids=list(micro.sample_ids) if micro.sample_ids else None,
+                        sample_ids=micro.sample_ids or None,
                     )
-                    loss_sum += float(s)
-                    weight_sum += float(w)
+                    loss_sum += s
+                    weight_sum += w
         finally:
             model.train(was_training)
         global_loss, global_weight = self._all_reduce_sums([loss_sum, weight_sum])
@@ -346,14 +307,14 @@ class TrainStack(Remote):
         )
         from unirl.utils.profiling import profile_mode
 
-        profiler = self._train_step_profiler() if profile_mode() == "train" else None
+        profiler = self._train_step_profiler if profile_mode() == "train" else None
         with profiler.record("train_track") if profiler is not None else nullcontext():
             if len(arranged) == 1:
                 part, plans, order = arranged[0]
                 part = self._prepare_for_training(part, plans=plans, order=order)
-                result = self._run_updates(part, plans=plans, order=order, training_progress=float(training_progress))
+                result = self._run_updates(part, plans=plans, order=order, training_progress=training_progress)
             else:
-                result = self._run_window(arranged, training_progress=float(training_progress))
+                result = self._run_window(arranged, training_progress=training_progress)
         if profiler is not None:
             profiler.step()
         self.on_rollout_end()
@@ -389,17 +350,7 @@ class TrainStack(Remote):
             prior_backward = prior_backward or result.has_backward
             results.append(result)
         # The window is one optimizer step: its grad_norm is the stepping call's.
-        return replace(_aggregate_update_results(results), grad_norm=results[-1].grad_norm)
-
-    def _train_step_profiler(self):
-        """Lazily build the per-worker train-step profiler (None unless UNIRL_PROFILE)."""
-        cached = getattr(self, "_profiler_cache", "unset")
-        if cached == "unset":
-            from unirl.utils.profiling import maybe_build_train_profiler
-
-            cached = maybe_build_train_profiler(int(getattr(self.fsdp_backend, "_rank", 0)))
-            self._profiler_cache = cached
-        return cached
+        return replace(aggregate_update_results(results), grad_norm=results[-1].grad_norm)
 
     def _run_updates(
         self,
@@ -415,41 +366,12 @@ class TrainStack(Remote):
         scope_update = profile_mode() == "one-update"
         results = []
         for micros in plans:
-            cm = (
-                maybe_profile_update(self, int(getattr(self.fsdp_backend, "_rank", 0)))
-                if scope_update
-                else nullcontext()
-            )
+            cm = maybe_profile_update(self, self.fsdp_backend._rank) if scope_update else nullcontext()
             with cm:
                 results.append(self._run_update(part, micros=micros, order=order, training_progress=training_progress))
-        if len(results) == 1:
-            return results[0]
-        aggregated = _aggregate_update_results(results)
-        per_update = tuple(
-            {
-                **r.metrics,
-                "loss": r.loss,
-                "grad_norm": r.grad_norm,
-                "lr": r.lr,
-                "optimizer_updates": r.optimizer_updates,
-            }
-            for r in results
-        )
-        return replace(aggregated, per_update=per_update)
+        return aggregate_update_results(results, include_per_update=True)
 
     def _align_track_inputs(self, part: Part) -> None:
         """Move the track onto the model's device; see :func:`_align_track_to_model`."""
         device = next(self.fsdp_backend.trainable_module().parameters()).device
         _align_track_to_model(part, device=device)
-
-    def _current_lr(self) -> float:
-        optimizer = self.fsdp_backend.optimizer
-        param_groups = getattr(optimizer, "param_groups", None)
-        if isinstance(param_groups, list) and param_groups:
-            return float(param_groups[0]["lr"])
-        scheduler = self.fsdp_backend.scheduler
-        if scheduler is not None and hasattr(scheduler, "get_last_lr"):
-            last = scheduler.get_last_lr()
-            if isinstance(last, list) and last:
-                return float(last[0])
-        return 0.0

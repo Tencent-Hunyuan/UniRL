@@ -57,6 +57,11 @@ class FSDPBackend(BaseFSDP2Backend):
         self._bundle = bundle
         self._rank = int(rank)
         self._device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if fsdp_cfg.expandable_segments:
+            require(self._device.type == "cuda", "FSDP expandable_segments requires a CUDA device.")
+            # Setting the allocator re-parses the whole config, resetting keys it omits.
+            launch_cfg = os.environ.get("PYTORCH_CUDA_ALLOC_CONF") or os.environ.get("PYTORCH_ALLOC_CONF")
+            torch.cuda.memory._set_allocator_settings(",".join(filter(None, (launch_cfg, "expandable_segments:True"))))
         if fsdp_cfg.copy_engine_all_gather:
             require(
                 normalize_fsdp_mode(fsdp_cfg.fsdp_mode) != "no_shard",

@@ -178,8 +178,6 @@ class Qwen3OmniChatTemplateStage:
         batch_size = len(conversations)
 
         per_sample_inputs: List[Dict[str, Any]] = []
-        has_image_by_row: List[bool] = []
-        has_video_by_row: List[bool] = []
         audio_in_video_by_row: List[bool] = []
         for messages in conversations:
             (
@@ -234,8 +232,6 @@ class Qwen3OmniChatTemplateStage:
                 inputs["input_ids"] = inputs["input_ids"][..., -self.max_prompt_length :]
                 inputs["attention_mask"] = inputs["attention_mask"][..., -self.max_prompt_length :]
             per_sample_inputs.append(inputs)
-            has_image_by_row.append(image is not None)
-            has_video_by_row.append(video_frames is not None)
             audio_in_video_by_row.append(audio_in_video)
 
         if self.pad_to_max_length:
@@ -288,19 +284,16 @@ class Qwen3OmniChatTemplateStage:
             input_features.append(ivf.to(device=device, dtype=dtype) if ivf is not None else None)
             feature_attention_mask.append(fam.to(device=device) if fam is not None else None)
 
-        has_audio = any(a is not None for a in input_features)
-        has_image = any(has_image_by_row)
-        has_video = any(has_video_by_row)
         return Qwen3OmniARConditions(
             prompt=TextTokenCondition(input_ids=input_ids, attention_mask=attention_mask),
-            pixel_values=pixel_values if has_image else None,
-            image_grid_thw=image_grid_thw if has_image else None,
-            pixel_values_videos=pixel_values_videos if has_video else None,
-            video_grid_thw=video_grid_thw if has_video else None,
-            video_second_per_grid=video_second_per_grid if has_video else None,
-            input_features=input_features if has_audio else None,
-            feature_attention_mask=feature_attention_mask if has_audio else None,
-            use_audio_in_video=audio_in_video_by_row if has_audio else None,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            pixel_values_videos=pixel_values_videos,
+            video_grid_thw=video_grid_thw,
+            video_second_per_grid=video_second_per_grid,
+            input_features=input_features,
+            feature_attention_mask=feature_attention_mask,
+            use_audio_in_video=audio_in_video_by_row,
         )
 
 

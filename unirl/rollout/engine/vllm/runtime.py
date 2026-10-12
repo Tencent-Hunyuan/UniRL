@@ -7,7 +7,6 @@ import traceback
 from multiprocessing.connection import Connection
 from typing import Any, Dict, List
 
-_PROTOCOL_VERSION = 1
 _SUPPORTED_VLLM_VERSION = "0.28.0"
 
 
@@ -19,10 +18,6 @@ def _recv_request(connection: Connection, *, last_request_id: int) -> Dict[str, 
     message = connection.recv()
     if not isinstance(message, dict):
         raise _ProtocolError(f"request must be a mapping, got {type(message).__name__}")
-    if message.get("protocol_version") != _PROTOCOL_VERSION:
-        raise _ProtocolError(
-            f"request protocol_version={message.get('protocol_version')!r}, expected {_PROTOCOL_VERSION}"
-        )
     request_id = message.get("request_id")
     if type(request_id) is not int or request_id != last_request_id + 1:
         raise _ProtocolError(f"request_id={request_id!r}, expected the next monotonic id {last_request_id + 1}")
@@ -41,7 +36,6 @@ def _send_response(
     error: BaseException | None = None,
 ) -> None:
     response = {
-        "protocol_version": _PROTOCOL_VERSION,
         "request_id": request["request_id"],
         "command": request["command"],
         "ok": bool(ok),
