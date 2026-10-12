@@ -224,9 +224,8 @@ def _wrap_step_logger(trainer: Any) -> None:
 
     @functools.wraps(log_inner)
     def _log_with_phases(*args, **kwargs):
-        timer = trainer._step_timer
-        if kwargs.get("phase_times") is None and timer is not None and timer.phases:
-            kwargs["phase_times"] = dict(timer.phases)
+        if kwargs.get("phase_times") is None and trainer._step_timer.phases:
+            kwargs["phase_times"] = dict(trainer._step_timer.phases)
         return log_inner(*args, **kwargs)
 
     trainer.wandb_logger.log_rollout_step = _log_with_phases

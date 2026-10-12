@@ -9,8 +9,12 @@ SD3.5+FlowGRPO pair, and first measured rows).
 
 Every trainer logs per step to wandb: `perf/step_time_s` (end-to-end wall clock;
 `perf/rollout_time_s` on older runs), `perf/<phase>_time_s` (generate / reward / train /
-weight-sync attribution), `perf/max_memory_*`. Without wandb access, the console log is
-enough — one `rollout N/M reward=…` line per step:
+weight-sync attribution), `perf/max_memory_*`.
+Async `perf/step_time_s` includes metric logging and memory-monitoring overhead within
+the iteration, whereas synchronous timing stops before `log_rollout_step`; the final
+async timing-log submission is excluded.
+
+Without wandb access, the console log is enough — one `rollout N/M reward=…` line per step:
 
 ```bash
 python benchmarks/speed_benchmarks/parse_perf.py train.log --samples-per-step <batch×group> --gpus 8
