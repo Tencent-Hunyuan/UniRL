@@ -114,7 +114,6 @@ class PhaseTimer:
 
     def __init__(self) -> None:
         self._t0 = time.perf_counter()
-        self._elapsed: Optional[float] = None
         self.phases: Dict[str, float] = {}
 
     @contextmanager
@@ -127,13 +126,8 @@ class PhaseTimer:
             self.phases[name] = self.phases.get(name, 0.0) + (time.perf_counter() - t)
 
     def total(self) -> float:
-        """Wall-clock seconds since construction (the whole step), frozen once stopped."""
-        return time.perf_counter() - self._t0 if self._elapsed is None else self._elapsed
-
-    def stop(self) -> None:
-        """Freeze total wall-clock seconds at the current step boundary."""
-        if self._elapsed is None:
-            self._elapsed = time.perf_counter() - self._t0
+        """Wall-clock seconds since construction (the whole step)."""
+        return time.perf_counter() - self._t0
 
 
 _STEP_PHASE_SPECS = (
@@ -156,15 +150,19 @@ _ASYNC_PHASE_SPECS = (
 )
 
 
+def install_async_phase_timing(trainer: Any) -> None:
+    """Attribute async collaborator calls to the active :func:`async_step_timing` window."""
+    _wrap_phase_methods(trainer, _ASYNC_PHASE_SPECS)
+    trainer._step_timer = None
+
+
 @contextmanager
 def async_step_timing(trainer: Any) -> Iterator[PhaseTimer]:
     """Time one async iteration through required weight publication."""
-    _wrap_phase_methods(trainer, _ASYNC_PHASE_SPECS)
     timer = trainer._step_timer = PhaseTimer()
     try:
         yield timer
     finally:
-        timer.stop()
         trainer._step_timer = None
 
 
@@ -193,8 +191,6 @@ def install_phase_timing(trainer: Any) -> None:
 
 def _timed_call(trainer: Any, fn, phase: str):
     """Return ``fn`` wrapped to accumulate its wall-clock under ``phase``."""
-    if getattr(fn, "_unirl_phase_timing_owner", None) is trainer:
-        return fn
 
     @functools.wraps(fn)
     def _timed(*args, **kwargs):
@@ -204,12 +200,11 @@ def _timed_call(trainer: Any, fn, phase: str):
         with timer.phase(phase):
             return fn(*args, **kwargs)
 
-    _timed._unirl_phase_timing_owner = trainer
     return _timed
 
 
 def _wrap_phase_methods(trainer: Any, specs: tuple[tuple[str, str, str], ...]) -> None:
-    """Time each present collaborator method once per trainer."""
+    """Time each present collaborator method."""
     for handle_attr, method, phase in specs:
         handle = getattr(trainer, handle_attr, None)
         fn = getattr(handle, method, None)

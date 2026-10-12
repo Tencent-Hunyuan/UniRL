@@ -13,7 +13,7 @@ from unirl.rollout.manager import (
 )
 from unirl.trainer.base import unwrap_replicated_int
 from unirl.types.sampling import total_samples_per_prompt
-from unirl.utils.wandb_logger import async_step_timing
+from unirl.utils.wandb_logger import async_step_timing, install_async_phase_timing
 
 if TYPE_CHECKING:
     from unirl.types.sample import Sample
@@ -244,6 +244,7 @@ class AsyncRolloutTrainerMixin:
         if self.eval_interval > 0:
             self._boundary_evaluate(start_rollout, initial=True)
 
+        install_async_phase_timing(self)
         try:
             for rollout_id in range(start_rollout, num_rollouts):
                 with async_step_timing(self) as timing:

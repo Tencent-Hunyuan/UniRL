@@ -8,11 +8,14 @@ SD3.5+FlowGRPO pair, and first measured rows).
 ## Measuring UniRL
 
 Every trainer logs per step to wandb: `perf/step_time_s` (end-to-end wall clock;
-`perf/rollout_time_s` on older runs), `perf/<phase>_time_s` (generate / reward / train /
-weight-sync attribution), `perf/max_memory_*`.
-Async `perf/step_time_s` includes metric logging and memory-monitoring overhead within
-the iteration, whereas synchronous timing stops before `log_rollout_step`; the final
-async timing-log submission is excluded.
+`perf/rollout_time_s` on older runs), `perf/<phase>_time_s` (phase attribution),
+`perf/max_memory_*`. Step time excludes evaluation and checkpointing.
+
+Synchronous trainers time `train_step` up to `log_rollout_step`, with phases such as
+`generate` / `reward` / `train` / `weight_sync`. Async trainers time the whole loop iteration, including
+metric logging and any required weight publication, and break out only
+`rollout_collect_wait` / `reward` / `train` / `quiesce` / `carry_finish` / `weight_sync`;
+there is no `generate` phase because generation overlaps training.
 
 Without wandb access, the console log is enough — one `rollout N/M reward=…` line per step:
 
