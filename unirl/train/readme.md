@@ -36,7 +36,7 @@ knows nothing about DTensor sharding or wrap topology.
   `optimizer_step` is the single chokepoint: clip → step → schedule → EMA, and it
   **skips the whole step on a non-finite grad norm** (stepping would scale every
   parameter by the bad norm and poison the next rollout).
-- **`TrainStack`** (`stack/base.py`) takes one backend + one `StageAlgorithm` and runs
+- **`TrainStack`** (`stack/single.py`) takes one backend + one `StageAlgorithm` and runs
   `train_track`: move the segment onto device → `prepare_segment_anchors` (freeze
   π_old once) → `num_updates_per_batch` optimizer steps over disjoint mini-batches,
   each a micro-batch loop of `compute_loss_and_backward`. The mini/micro slicing comes
@@ -47,7 +47,7 @@ knows nothing about DTensor sharding or wrap topology.
   training uses, which is what pins the on-policy PPO ratio to 1 under bf16's
   batch-shape sensitivity. `AgenticTrainer` uses the same interface after
   concatenating every successful trajectory's generated assistant turns.
-- **`UnifiedModelTrainStack`** (`unified_model_stack.py`) drives two algorithms
+- **`UnifiedModelTrainStack`** (`stack/unified.py`) drives two algorithms
   (`ar` + `image`) backward-accumulating into one shared optimizer step on one
   shared backbone (HunyuanImage3).
 - **`BaseTrainStack`** (`stack/common.py`) is the base of both: it validates the
