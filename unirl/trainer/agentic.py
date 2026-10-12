@@ -12,6 +12,7 @@ import torch
 from hydra.utils import instantiate
 from omegaconf import DictConfig
 
+from unirl.config.validation import validate_memory_saver_contract
 from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
 from unirl.rollout.manager import RolloutManager, required_worker_concurrency, validate_worker_inflight
@@ -67,6 +68,7 @@ class AgenticTrainer(BaseTrainer):
         logging_cfg: Optional[DictConfig] = None,
         stop: Optional[List[str]] = None,
         per_worker_inflight: int = 8,
+        mask_overflow_loss: bool = False,
     ) -> None:
         per_worker_inflight = int(per_worker_inflight)
         configured_concurrency = cfg.get("worker_max_concurrency")
@@ -98,6 +100,7 @@ class AgenticTrainer(BaseTrainer):
             self._group_size = total_samples_per_prompt(self.sampling_params)
             self._stop = list(stop) if stop else ["</tool_call>"]
             self._per_worker_inflight = per_worker_inflight
+            self._mask_overflow_loss = mask_overflow_loss
 
             with placement(self.pool, fraction=1.0, shared_workers=True):
                 self.bundle = remote_hydra(bundle_cfg)
@@ -148,6 +151,7 @@ class AgenticTrainer(BaseTrainer):
         sync_target = str(sync_cfg.get("_target_", ""))
         if not sync_target.endswith("TensorWeightSync"):
             raise ValueError(f"AgenticTrainer requires colocated TensorWeightSync; got {sync_target!r}")
+        validate_memory_saver_contract(rollout_cfg, strict=True)
 
         episode = rollout_cfg.get("config", {}).get("episode_sampling")
         if episode is None:
@@ -319,6 +323,9 @@ class AgenticTrainer(BaseTrainer):
         for i, trajectory in enumerate(trajectories):
             if not bool(finite[i]):
                 continue
+            # A masked overflow trajectory stays in its group's baseline; only its gradient is dropped.
+            if self._mask_overflow_loss and trajectory.parts[-1].harness_status == "overflow":
+                continue
             advantage = float(advantages[i].item())
             for generated in trajectory.gen_parts():
                 generated = _part_with_field(
@@ -334,14 +341,16 @@ class AgenticTrainer(BaseTrainer):
                 train_parts.append(generated)
 
         depths = [len(trajectory.gen_parts()) for trajectory in trajectories]
+        statuses = Counter(t.parts[-1].harness_status for t in trajectories)
         logger.info(
-            "rollout %d trajectory turns: n=%d mean=%.2f min=%d max=%d hist=%s",
+            "rollout %d trajectory turns: n=%d mean=%.2f min=%d max=%d hist=%s status=%s",
             rollout_id,
             len(depths),
             (sum(depths) / len(depths)) if depths else 0.0,
             min(depths, default=0),
             max(depths, default=0),
             dict(sorted(Counter(depths).items())),
+            dict(sorted(statuses.items())),
         )
         if train_parts:
             train_part = self._pad_to_dp_multiple(Part.concat(train_parts))
@@ -365,6 +374,7 @@ class AgenticTrainer(BaseTrainer):
                 "agent/mean_turns": (sum(depths) / len(depths)) if depths else 0.0,
                 "agent/max_turns": max(depths) if depths else 0,
                 "agent/failed_trajectories": int((~finite).sum().item()),
+                "agent/overflow_trajectories": statuses["overflow"],
                 "agent/train_rows": train_rows,
             },
         )

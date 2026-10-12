@@ -191,7 +191,8 @@ class HunyuanImage3ARStep(ARStep[HunyuanImage3Bundle, HunyuanImage3ARConditions,
             use_cache=True,
             **cond_kwargs,
         )
-        with torch.no_grad():
+        # Decode gathers RoPE at real_pos + step, so it needs the full-length table.
+        with torch.no_grad(), model.rope_mode(training=False):
             out = transformer(**model_inputs, first_step=(state.step_idx == 0))
         logits = getattr(out, "logits", None)
         if logits is None and isinstance(out, dict):
@@ -383,14 +384,16 @@ class HunyuanImage3ARStage(ARStage[HunyuanImage3ARConditions]):
                     if hasattr(transformer.cached_rope, _rope_attr):
                         setattr(transformer.cached_rope, _rope_attr, None)
 
-            out = transformer(
-                input_ids=full_ids,
-                attention_mask=mask_4d,
-                mode="gen_text",
-                past_key_values=None,
-                use_cache=False,
-                return_dict=True,
-            )
+            # Teacher forcing passes no position_ids, so RoPE must be sized to this sequence.
+            with self.model.rope_mode(training=True):
+                out = transformer(
+                    input_ids=full_ids,
+                    attention_mask=mask_4d,
+                    mode="gen_text",
+                    past_key_values=None,
+                    use_cache=False,
+                    return_dict=True,
+                )
             logits = getattr(out, "logits", None)
             if logits is None:
                 raise RuntimeError("HunyuanImage3ARStage.replay: model output has no .logits")
