@@ -19,6 +19,7 @@ from .base import (
     StageAlgorithm,
     _grpo_clip_loss,
     _resolve_clip_range_from_schedule,
+    policy_entropy_metrics,
     rollout_replay_logp_absdiff,
     typed_conditions,
 )
@@ -26,6 +27,7 @@ from .base import (
 
 @dataclass
 class PPOConfig(BaseAlgorithmConfig):
+    monitor_entropy: bool = False
     stage_attr: str = "ar"
     conditions_cls: str = ""
     clip_range: float = 0.2
@@ -104,6 +106,7 @@ class PPO(StageAlgorithm):
         horizon: int = 8192,
         conditions_cls: Optional[Type[Any]] = None,
         sampling_temperature: Optional[float] = None,
+        monitor_entropy: bool = False,
     ) -> None:
         super().__init__()
         if stage is None and pipeline is None:
@@ -136,6 +139,7 @@ class PPO(StageAlgorithm):
 
             sampling_temperature = ARSamplingParams.__dataclass_fields__["temperature"].default
         self.sampling_temperature = float(sampling_temperature)
+        self.monitor_entropy = monitor_entropy
 
     def prepare_segment(
         self,
@@ -192,9 +196,11 @@ class PPO(StageAlgorithm):
             segment=segment,
             temperature=self.sampling_temperature,
             return_values=True,
+            **({"return_entropy": True} if self.monitor_entropy else {}),
         )
         if not isinstance(replay, ReplayResult):
             raise TypeError("PPO: replay with return_values=True must return ReplayResult")
+        entropy_metrics = policy_entropy_metrics(replay, segment.loss_mask) if self.monitor_entropy else {}
         new_logp = replay.log_probs
         new_values = _replay_values(replay)
 
@@ -225,7 +231,7 @@ class PPO(StageAlgorithm):
                 )
         active_count = int(active.sum().item())
         if active_count == 0:
-            return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
+            return AlgorithmStepResult(loss=0.0, metrics=entropy_metrics, num_steps_or_tokens=0, has_backward=False)
 
         clip_range = _resolve_clip_range_from_schedule(self.clip_range, self.clip_schedule, training_progress)
         clip_high = (
@@ -276,6 +282,7 @@ class PPO(StageAlgorithm):
         )
         value_clip_fraction = ((active_values - old_values[active].float()).abs() > self.cliprange_value).float().mean()
         metrics: Dict[str, Any] = {
+            **entropy_metrics,
             "policy_loss": float(policy_loss.detach()),
             "value_loss": float(value_loss.detach()),
             "value_mean": float(active_values.detach().mean()),

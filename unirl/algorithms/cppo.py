@@ -17,6 +17,7 @@ from .base import (
     StageAlgorithm,
     _prepare_ar_logp_anchor,
     aggregate_token_losses,
+    policy_entropy_metrics,
     rollout_replay_logp_absdiff,
     select_active_tokens,
     typed_conditions,
@@ -28,6 +29,7 @@ from .grpo import GRPO
 class CPPOConfig(BaseAlgorithmConfig):
     """Config for :class:`CPPO` (the paper's CPPO Binary-TV method)."""
 
+    monitor_entropy: bool = False
     stage_attr: str = "ar"
     conditions_cls: str = ""
     cppo_delta: float = 0.2
@@ -148,6 +150,7 @@ class CPPO(StageAlgorithm):
         loss_agg_mode: str = "token-mean",
         horizon: int = 8192,
         sampling_temperature: Optional[float] = None,
+        monitor_entropy: bool = False,
         old_logp_source: str = "rollout",
         conditions_cls: Optional[Type[Any]] = None,
     ) -> None:
@@ -171,6 +174,7 @@ class CPPO(StageAlgorithm):
 
             sampling_temperature = ARSamplingParams.__dataclass_fields__["temperature"].default
         self.sampling_temperature = float(sampling_temperature)
+        self.monitor_entropy = monitor_entropy
         self.conditions_cls = conditions_cls
         self.old_logp_source = str(old_logp_source).strip().lower()
         if self.old_logp_source not in ("rollout", "replay"):
@@ -207,7 +211,14 @@ class CPPO(StageAlgorithm):
             return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
 
         typed_conds = typed_conditions(conditions, self.conditions_cls)
-        new_logp = self.stage.replay(typed_conds, segment=segment, temperature=self.sampling_temperature)
+        replay = self.stage.replay(
+            typed_conds,
+            segment=segment,
+            temperature=self.sampling_temperature,
+            **({"return_entropy": True} if self.monitor_entropy else {}),
+        )
+        entropy_metrics = policy_entropy_metrics(replay, segment.loss_mask) if self.monitor_entropy else {}
+        new_logp = replay.log_probs if self.monitor_entropy else replay
         old_logp = segment.log_probs.to(dtype=new_logp.dtype, device=new_logp.device)
 
         adv_per_token = GRPO._expand_advantages_to_tokens(
@@ -239,6 +250,7 @@ class CPPO(StageAlgorithm):
             dtype=new_logp.dtype, device=new_logp.device
         )
         metrics: Dict[str, Any] = {
+            **entropy_metrics,
             "policy_loss": float(loss.detach().item()),
             "cppo_delta": self.cppo_delta,
             **rollout_replay_logp_absdiff(new_logp, rollout_logp, segment.loss_mask),

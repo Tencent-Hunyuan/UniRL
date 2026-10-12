@@ -61,6 +61,7 @@ def _replay_aware_forward(
     autocast_dtype: Optional[torch.dtype] = None,
     packed_predict_index: Optional[torch.Tensor] = None,
     return_values: bool = False,
+    return_entropy: bool = False,
     **kw: Any,
 ) -> Any:
     """Dual-mode ``forward``: padded ``[B, T_max]`` fp32 log-probs, chunked so ``[B, L, vocab]`` never materializes."""
@@ -90,11 +91,16 @@ def _replay_aware_forward(
         h_pred = hidden[0].index_select(0, packed_predict_index)
         targets = response_tokens
 
-        def _flat_logp_chunk(h: torch.Tensor, tok: torch.Tensor) -> torch.Tensor:
+        def _flat_logp_chunk(
+            h: torch.Tensor, tok: torch.Tensor
+        ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
             lf = self.lm_head(h).float() / T
-            return lf.gather(-1, tok.unsqueeze(-1)).squeeze(-1) - torch.logsumexp(lf, dim=-1)
+            logp = lf.gather(-1, tok.unsqueeze(-1)).squeeze(-1) - torch.logsumexp(lf, dim=-1)
+            if return_entropy:
+                return logp, _categorical_entropy(lf)
+            return logp
 
-        flat_parts: List[torch.Tensor] = []
+        flat_parts = []
         flat_chunk = 2048
         for s in range(0, int(h_pred.size(0)), flat_chunk):
             h = h_pred[s : s + flat_chunk]
@@ -105,26 +111,38 @@ def _replay_aware_forward(
                 flat_parts.append(_flat_logp_chunk(h, tok))
         if not flat_parts:
             empty = hidden.new_zeros((0,), dtype=torch.float32)
-            if value_head is None:
+            if value_head is None and not return_entropy:
                 return empty
-            return ReplayResult(log_probs=empty, values=empty)
+            return ReplayResult(
+                log_probs=empty, values=empty if return_values else None, entropy=empty if return_entropy else None
+            )
+        entropy = None
+        if return_entropy:
+            logp_parts, entropy_parts = zip(*flat_parts)
+            flat_parts = logp_parts
+            entropy = torch.cat(entropy_parts, dim=0)
         log_probs = torch.cat(flat_parts, dim=0)
-        if value_head is None:
+        if value_head is None and not return_entropy:
             return log_probs
-        value_parts = [value_head(h_pred[s : s + flat_chunk]) for s in range(0, int(h_pred.size(0)), flat_chunk)]
-        values = torch.cat(value_parts, dim=0) if value_parts else log_probs.new_zeros(0)
-        return ReplayResult(log_probs=log_probs, values=values)
+        values = None
+        if value_head is not None:
+            value_parts = [value_head(h_pred[s : s + flat_chunk]) for s in range(0, int(h_pred.size(0)), flat_chunk)]
+            values = torch.cat(value_parts, dim=0)
+        return ReplayResult(log_probs=log_probs, values=values, entropy=entropy)
     T_max = int(response_tokens.size(1))
     resp_hidden = hidden[:, prompt_len - 1 : prompt_len - 1 + T_max, :]
 
-    def _logp_chunk(h: torch.Tensor, tok: torch.Tensor) -> torch.Tensor:
+    def _logp_chunk(h: torch.Tensor, tok: torch.Tensor) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         lf = self.lm_head(h).float() / T
         chosen = lf.gather(-1, tok.unsqueeze(-1)).squeeze(-1)
-        return chosen - torch.logsumexp(lf, dim=-1)
+        logp = chosen - torch.logsumexp(lf, dim=-1)
+        if return_entropy:
+            return logp, _categorical_entropy(lf)
+        return logp
 
     bsz = resp_hidden.size(0)
     chunk = max(64, 2048 // max(1, bsz))
-    parts: List[torch.Tensor] = []
+    parts = []
     for s in range(0, T_max, chunk):
         h = resp_hidden[:, s : s + chunk, :]
         tok = response_tokens[:, s : s + chunk]
@@ -134,15 +152,30 @@ def _replay_aware_forward(
             parts.append(_logp_chunk(h, tok))
     if not parts:
         empty = resp_hidden.new_zeros((bsz, 0), dtype=torch.float32)
-        if value_head is None:
+        if value_head is None and not return_entropy:
             return empty
-        return ReplayResult(log_probs=empty, values=empty)
+        return ReplayResult(
+            log_probs=empty, values=empty if return_values else None, entropy=empty if return_entropy else None
+        )
+    entropy = None
+    if return_entropy:
+        logp_parts, entropy_parts = zip(*parts)
+        parts = logp_parts
+        entropy = torch.cat(entropy_parts, dim=1)
     log_probs = torch.cat(parts, dim=1)
-    if value_head is None:
+    if value_head is None and not return_entropy:
         return log_probs
-    value_parts = [value_head(resp_hidden[:, s : s + chunk, :]) for s in range(0, T_max, chunk)]
-    values = torch.cat(value_parts, dim=1) if value_parts else log_probs.new_zeros((bsz, 0))
-    return ReplayResult(log_probs=log_probs, values=values)
+    values = None
+    if value_head is not None:
+        value_parts = [value_head(resp_hidden[:, s : s + chunk, :]) for s in range(0, T_max, chunk)]
+        values = torch.cat(value_parts, dim=1)
+    return ReplayResult(log_probs=log_probs, values=values, entropy=entropy)
+
+
+@torch.no_grad()
+def _categorical_entropy(logits: torch.Tensor) -> torch.Tensor:
+    """Full-vocabulary conditional entropy in nats, fp32 [...]; see README Gotchas."""
+    return torch.special.entr(torch.softmax(logits, dim=-1)).sum(dim=-1)
 
 
 def _require_value_head_for_replay(model: Any, return_values: bool) -> None:
@@ -166,18 +199,21 @@ def _finalize_replay_output(
         return out.to(dtype=logprob_dtype)
 
     log_probs = out.log_probs.to(dtype=logprob_dtype)
-    if not return_values:
-        return log_probs
-    if out.values is None:
+    if return_values and out.values is None:
         raise ValueError("Qwen3ARStage.replay: return_values=True but critic returned no values")
-    if log_probs.ndim == 1:
-        return ReplayResult(log_probs=log_probs, values=out.values.float())
-    if segment.lengths is None:
-        raise ValueError("Qwen3ARStage.replay: segment requires lengths to flatten critic values")
-
-    flat_values = [out.values[b, : int(length)] for b, length in enumerate(segment.lengths.tolist()) if int(length) > 0]
-    values = torch.cat(flat_values, dim=0) if flat_values else out.values.new_zeros(0)
-    return ReplayResult(log_probs=log_probs, values=values.float())
+    values = out.values.float() if out.values is not None else None
+    entropy = out.entropy
+    if log_probs.ndim != 1:
+        if segment.lengths is None:
+            raise ValueError("Qwen3ARStage.replay: segment requires lengths to flatten replay output")
+        lengths = segment.lengths.tolist()
+        if values is not None:
+            parts = [values[b, :n] for b, n in enumerate(lengths) if n > 0]
+            values = torch.cat(parts) if parts else values.new_zeros(0)
+        if entropy is not None:
+            parts = [entropy[b, :n] for b, n in enumerate(lengths) if n > 0]
+            entropy = torch.cat(parts) if parts else entropy.new_zeros(0)
+    return ReplayResult(log_probs=log_probs, values=values, entropy=entropy)
 
 
 @dataclass
@@ -357,6 +393,7 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
         segment: TextSegment,
         temperature: float = 1.0,
         return_values: bool = False,
+        return_entropy: bool = False,
     ) -> Union[torch.Tensor, ReplayResult]:
         """Per-token log-prob replay; falls back to the dense ``[B, P_max + T_max]`` :meth:`padding_replay`."""
         _require_value_head_for_replay(self.model.transformer, return_values)
@@ -367,6 +404,7 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
                 segment=segment,
                 temperature=temperature,
                 return_values=return_values,
+                return_entropy=return_entropy,
             )
             if packed is not None:
                 return packed
@@ -375,6 +413,7 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
             segment=segment,
             temperature=temperature,
             return_values=return_values,
+            return_entropy=return_entropy,
         )
 
     def packed_replay(
@@ -384,6 +423,7 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
         segment: TextSegment,
         temperature: float = 1.0,
         return_values: bool = False,
+        return_entropy: bool = False,
     ) -> Optional[Union[torch.Tensor, ReplayResult]]:
         """Packed-varlen replay (B > 1): zero padding anywhere."""
         if conditions.prompt is None or conditions.prompt.input_ids is None or conditions.prompt.attention_mask is None:
@@ -442,6 +482,7 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
             prompt_len=0,
             temperature=temperature,
             return_values=return_values,
+            return_entropy=return_entropy,
             autocast_dtype=(self.autocast_dtype if device.type == "cuda" else None),
         )
         return _finalize_replay_output(
@@ -458,6 +499,7 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
         segment: TextSegment,
         temperature: float = 1.0,
         return_values: bool = False,
+        return_entropy: bool = False,
     ) -> Union[torch.Tensor, ReplayResult]:
         """Dense ``[B, P_max + T_max]`` padded replay — the default / fallback path."""
         if conditions.prompt is None or conditions.prompt.input_ids is None:
@@ -528,6 +570,7 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
             prompt_len=prompt_len,
             temperature=temperature,
             return_values=return_values,
+            return_entropy=return_entropy,
             autocast_dtype=(self.autocast_dtype if device.type == "cuda" else None),
         )
 
@@ -540,9 +583,11 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
         if isinstance(finalized, ReplayResult):
             per_token = finalized.log_probs
             values = finalized.values
+            entropy = finalized.entropy
         else:
             per_token = finalized
             values = None
+            entropy = None
 
         flat_log_probs: List[torch.Tensor] = []
         for b, n in enumerate(lengths):
@@ -553,11 +598,11 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
             if flat_log_probs
             else torch.zeros(0, dtype=self.logprob_dtype, device=device)
         )
-        if not return_values:
+        if not return_values and not return_entropy:
             return log_probs
-        if values is None:
+        if return_values and values is None:
             raise ValueError("Qwen3ARStage.replay: return_values=True but critic returned no values")
-        return ReplayResult(log_probs=log_probs, values=values)
+        return ReplayResult(log_probs=log_probs, values=values, entropy=entropy)
 
     def _resolve_stop_ids(
         self,
