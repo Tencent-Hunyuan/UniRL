@@ -1,16 +1,69 @@
-"""Shared constructor validation and backend lifecycle for train stacks."""
+"""Shared train-stack base class, step result type, and per-update aggregation."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass, replace
 from functools import cached_property
-from typing import TYPE_CHECKING, Sequence
+from typing import TYPE_CHECKING, List, Mapping, Sequence, Tuple
 
+from unirl.algorithms.base import AlgorithmStepResult
 from unirl.distributed.group.remote import Remote
 from unirl.train.stack.planner import _positive_int
+from unirl.utils.metrics import aggregate_numeric_metrics
 
 if TYPE_CHECKING:
     from unirl.algorithms.base import StageAlgorithm
     from unirl.train.backend.fsdp import FSDPBackend
+
+
+@dataclass(frozen=True)
+class TrainStepResult:
+    """Result of one ``train_track`` call, possibly spanning multiple optimizer updates."""
+
+    loss: float
+    grad_norm: float
+    lr: float
+    has_backward: bool
+    micros: List[AlgorithmStepResult]
+    metrics: Mapping[str, object]
+    # Steps that committed; a no-backward or non-finite grad norm contributes 0.
+    optimizer_updates: int
+    per_update: Tuple[Mapping[str, object], ...] = ()
+
+
+def aggregate_update_results(
+    results: List["TrainStepResult"], *, include_per_update: bool = False
+) -> "TrainStepResult":
+    """Collapse one rollout's per-update results into a single summary."""
+    if len(results) == 1:
+        return results[0]
+    n = len(results)
+    micros: List[AlgorithmStepResult] = [m for r in results for m in r.micros]
+    metrics = aggregate_numeric_metrics([r.metrics for r in results if r.metrics])
+    aggregated = TrainStepResult(
+        loss=sum(r.loss for r in results) / n,
+        grad_norm=sum(r.grad_norm for r in results) / n,
+        lr=results[-1].lr,
+        has_backward=any(r.has_backward for r in results),
+        micros=micros,
+        metrics=metrics,
+        optimizer_updates=sum(r.optimizer_updates for r in results),
+    )
+    if include_per_update:
+        aggregated = replace(
+            aggregated,
+            per_update=tuple(
+                {
+                    **r.metrics,
+                    "loss": r.loss,
+                    "grad_norm": r.grad_norm,
+                    "lr": r.lr,
+                    "optimizer_updates": r.optimizer_updates,
+                }
+                for r in results
+            ),
+        )
+    return aggregated
 
 
 class BaseTrainStack(Remote):

@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import math
 from contextlib import nullcontext
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from typing import Dict, List, Mapping, Optional, Tuple, Union
 
 import torch
@@ -15,7 +15,7 @@ from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.tensor.batch import _move_value
 from unirl.train.backend.fsdp import FSDPBackend
 from unirl.train.stack.anchor import prepare_segment_anchors, validate_anchor_contract
-from unirl.train.stack.base import BaseTrainStack
+from unirl.train.stack.base import BaseTrainStack, TrainStepResult, aggregate_update_results
 from unirl.train.stack.loss_scale import resolve_loss_scales
 from unirl.train.stack.planner import (
     Arrangement,
@@ -30,56 +30,6 @@ from unirl.types.sample import Part
 from unirl.utils.metrics import aggregate_numeric_metrics
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class TrainStepResult:
-    """Result of one ``train_track`` call, possibly spanning multiple optimizer updates."""
-
-    loss: float
-    grad_norm: float
-    lr: float
-    has_backward: bool
-    micros: List[AlgorithmStepResult]
-    metrics: Mapping[str, object]
-    # Steps that committed; a no-backward or non-finite grad norm contributes 0.
-    optimizer_updates: int
-    per_update: Tuple[Mapping[str, object], ...] = ()
-
-
-def aggregate_update_results(
-    results: List["TrainStepResult"], *, include_per_update: bool = False
-) -> "TrainStepResult":
-    """Collapse one rollout's per-update results into a single summary."""
-    if len(results) == 1:
-        return results[0]
-    n = len(results)
-    micros: List[AlgorithmStepResult] = [m for r in results for m in r.micros]
-    metrics = aggregate_numeric_metrics([r.metrics for r in results if r.metrics])
-    aggregated = TrainStepResult(
-        loss=sum(r.loss for r in results) / n,
-        grad_norm=sum(r.grad_norm for r in results) / n,
-        lr=results[-1].lr,
-        has_backward=any(r.has_backward for r in results),
-        micros=micros,
-        metrics=metrics,
-        optimizer_updates=sum(r.optimizer_updates for r in results),
-    )
-    if include_per_update:
-        aggregated = replace(
-            aggregated,
-            per_update=tuple(
-                {
-                    **r.metrics,
-                    "loss": r.loss,
-                    "grad_norm": r.grad_norm,
-                    "lr": r.lr,
-                    "optimizer_updates": r.optimizer_updates,
-                }
-                for r in results
-            ),
-        )
-    return aggregated
 
 
 def _align_track_to_model(part: Part, *, device: torch.device) -> None:
