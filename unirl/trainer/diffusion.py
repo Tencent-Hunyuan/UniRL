@@ -904,7 +904,7 @@ class DiffusionTrainer(BaseTrainer):
             if any(md for md in root_md):
                 gen_part.metadata = [dict(md) if md else {} for md in root_md]
 
-        self._drop_decoded(sample, rollout_id=rollout_id)
+        self._observe_samples(sample, step=rollout_id + 1, phase="rollout")
         return sample, mean_reward
 
     def train_step(
@@ -1113,7 +1113,7 @@ class DiffusionTrainer(BaseTrainer):
             # Outside _reward_phase: the driver-side media upload must not hold
             # the train-offload window open.
             if media_prefix and start == 0 and first_scored is not None:
-                self._log_eval_media(first_scored, step, prefix=media_prefix)
+                self._observe_samples(first_scored, step=step, phase=media_prefix)
         metrics = {name: total / max(1, counts[name]) for name, total in sums.items()}
         return metrics, sync_pending, n_prompts > 0
 

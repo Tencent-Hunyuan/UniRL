@@ -166,7 +166,7 @@ class AsyncRolloutTrainerMixin:
 
     def _score_completed(self, rollout_id: int, completed: "Sample") -> "Sample":
         scored = self.reward.score_and_attach(completed)
-        self._drop_decoded(scored, rollout_id=rollout_id)
+        self._observe_samples(scored, step=rollout_id + 1, phase="rollout")
         return scored
 
     def _train_async_loop(

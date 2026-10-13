@@ -471,6 +471,55 @@ vary by noise too; the trainer warns at startup then, as it does for pipelines
 without driver-authored x_T. `media_log_interval` does not apply
 (`eval_interval` already paces the panel).
 
+## Sample observation
+
+`BaseTrainer._observe_samples` observes scored generations in diffusion, AR, PE,
+unified-model, and async trainers, during training and evaluation. Agentic
+multi-turn trajectories are not included. Both sinks consume the same first
+`media_max_items` rows per generated Part; observation leaves rewards, conditions,
+and segments unchanged, then releases decoded primitives after training rollouts.
+
+```yaml
+logging:
+  log_media: false
+  media_max_items: 8
+  media_log_interval: 1
+  sample_dump_dir: null
+```
+
+`log_media` enables W&B media panels and `<phase>/<track>/samples` tables when a
+W&B run is initialized. Existing media keys and prompt/reward captions are retained.
+`sample_dump_dir` independently enables local output, including with
+`report_to_wandb: false`. Both sinks use `media_log_interval` for training
+(step 1, then every interval); eval observes the first scored chunk in each eval
+set, paced by `eval_interval`. All observation defaults remain off. For a recipe
+without the new key, use `+logging.sample_dump_dir=/shared/samples`.
+
+Local output is `<sample_dump_dir>/<phase>/step_<n:06d>/samples.jsonl` plus
+`<track>_<row>.png`, `.mp4`, or `.wav`. Phases are `rollout`, `eval`, and
+`eval/<suite>` for suites with their own data. Media paths in JSONL are relative
+to that index; video uses 8 frames/s, matching the W&B panel, and paired audio is
+saved as a separate WAV with its sample rate. Use a shared filesystem on
+multi-node runs. Re-observing a step replaces its index.
+
+Each record carries `sample_id`, `group_id`, `root_id`, root `prompt`, ancestor
+`context_texts` (including HI3 recaptions), `output_text`, media paths, reward,
+component rewards, and generated-row metadata. `Sample.conditioning_at` supplies
+row alignment, including reordered branches. A malformed lineage warns and drops
+prompt/context; a record-building or sink failure warns and training continues.
+Local text is stored in full.
+
+The driver hydrates the smallest media prefix ending on a TensorRef boundary that
+contains the selected rows, including input images and audio. A block containing
+K may also contain unselected rows; the cap limits records, and transport block
+size determines the extra materialization. Hydration rebuilds selected primitives
+without replacing the worker references in the training Sample.
+
+The retired top-level `dump_dir` (when non-null) and `ROLLOUT_DUMP_DIR` /
+`ROLLOUT_DUMP_N` environment variables fail before worker creation with a migration
+hint. Use `logging.sample_dump_dir` and `logging.media_max_items`; HI3 local
+observation now respects the cap instead of exporting every image.
+
 ## Gotchas
 
 - **Multi-update means disjoint optimizer mini-batches, not repeated full-batch

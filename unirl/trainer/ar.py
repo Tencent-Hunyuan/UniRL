@@ -477,8 +477,7 @@ class ARTrainer(BaseTrainer):
             if any(root_md):
                 gen_part.metadata = [dict(md) if md else {} for md in root_md]
 
-        self._dump_rollout_samples(sample, rollout_id)
-        self._drop_decoded(sample, rollout_id=rollout_id)
+        self._observe_samples(sample, step=rollout_id + 1, phase="rollout")
         train_part = sample.parts[-1]
         if self.balance_shards:
             train_part = train_part.balance_shards(int(self.num_devices))
@@ -568,9 +567,12 @@ class ARTrainer(BaseTrainer):
                                 f"dispatch prompts {dispatch_inputs.batch_size} * fanout {fanout} "
                                 f"({expected_total})."
                             )
+                        scored.parts[-1].rewards = rewards
                         rewards = rewards[: real_prompt_n * fanout]
                         reward_sum += float(rewards.sum().item())
                         reward_n += int(rewards.numel())
+                    if batch_n == 1:
+                        self._observe_samples(scored.slice(0, real_prompt_n), step=rollout_id + 1, phase="eval")
                     logger.info(
                         "EVAL rollout %d progress: batch=%d prompts=%d samples=%d",
                         rollout_id + 1,
@@ -628,44 +630,6 @@ class ARTrainer(BaseTrainer):
 
             padded.append(source.map_sample_ids(replace_root))
         return Sample.concat([inputs, *padded])
-
-    def _dump_rollout_samples(self, sample, rollout_id: int) -> None:
-        """Debug dump of the first N (prompt, output, reward) triples per rollout."""
-        import json
-        import os
-
-        out_dir = os.environ.get("ROLLOUT_DUMP_DIR", "")
-        if not out_dir:
-            return
-        try:
-            from unirl.types.primitives import Texts
-
-            n = int(os.environ.get("ROLLOUT_DUMP_N", "4"))
-            cond = sample.conditioning()
-            prompts = next((list(c.texts) for c in cond if isinstance(c, Texts)), [])
-            part = sample.parts[-1]
-            outputs = getattr(part.primitives.get("text"), "texts", None) or []
-            rewards = part.rewards.to(torch.float32).tolist() if part.rewards is not None else []
-            os.makedirs(out_dir, exist_ok=True)
-            path = os.path.join(out_dir, f"rollout_{int(rollout_id):04d}.jsonl")
-            with open(path, "w", encoding="utf-8") as f:
-                for i in range(min(n, len(outputs))):
-                    f.write(
-                        json.dumps(
-                            {
-                                "rollout": int(rollout_id),
-                                "sample": i,
-                                "prompt": prompts[i] if i < len(prompts) else None,
-                                "output": outputs[i],
-                                "output_chars": len(outputs[i] or ""),
-                                "reward": rewards[i] if i < len(rewards) else None,
-                            },
-                            ensure_ascii=False,
-                        )
-                        + "\n"
-                    )
-        except Exception as exc:  # debug path — never let it kill training
-            logger.warning("rollout sample dump failed: %s", exc)
 
     def train(
         self,

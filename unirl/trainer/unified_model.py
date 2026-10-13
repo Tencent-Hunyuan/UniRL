@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import dataclasses
 import inspect
-import json
 import logging
 import os
 import time
@@ -15,42 +14,16 @@ from hydra.utils import instantiate
 from omegaconf import DictConfig
 
 from unirl.distributed.group.placement import placement, remote
-from unirl.distributed.tensor import TensorRef, hydrate
-from unirl.distributed.tensor.batch import Batch
+from unirl.distributed.tensor import hydrate
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample
 from unirl.trainer.eval_suites import build_eval_suites
 from unirl.trainer.hydra import parse_hydra_cfg, remote_hydra
-from unirl.types.primitives import Images, Texts
+from unirl.types.primitives import Texts
 from unirl.types.sample import Part, Sample
 from unirl.types.sampling import ARSamplingParams, BaseSamplingParams, DiffusionSamplingParams
 
 logger = logging.getLogger(__name__)
-
-
-def deep_hydrate(obj: Any) -> Any:
-    """Materialize every ``TensorRef`` leaf in ``obj`` to a real tensor, in place."""
-    if isinstance(obj, TensorRef):
-        return hydrate(obj)
-    if isinstance(obj, Batch):
-        for f in dataclasses.fields(obj):
-            v = getattr(obj, f.name)
-            if v is not None:
-                new = deep_hydrate(v)
-                if new is not v:
-                    setattr(obj, f.name, new)
-        return obj
-    if isinstance(obj, dict):
-        for k in list(obj.keys()):
-            obj[k] = deep_hydrate(obj[k])
-        return obj
-    if isinstance(obj, list):
-        for i in range(len(obj)):
-            obj[i] = deep_hydrate(obj[i])
-        return obj
-    if isinstance(obj, tuple):
-        return tuple(deep_hydrate(x) for x in obj)
-    return obj
 
 
 class UnifiedModelTrainer(BaseTrainer):
@@ -75,7 +48,6 @@ class UnifiedModelTrainer(BaseTrainer):
         dit_rollout_cfg: Optional[DictConfig] = None,
         rollout_cfg: Optional[DictConfig] = None,
         sync_cfg: Optional[DictConfig] = None,
-        dump_dir: Optional[str] = None,
         logging_cfg: Optional[DictConfig] = None,
         enable_fsdp_offload: bool = True,
         eval_interval: int = 0,
@@ -93,10 +65,7 @@ class UnifiedModelTrainer(BaseTrainer):
         self.eval_cfg_text_scale = float(eval_cfg_text_scale)
         self.eval_eta = float(eval_eta)
 
-        self.dump_dir = str(dump_dir) if dump_dir else None
-        self._dump_rollout_id = 0
-        if self.dump_dir:
-            os.makedirs(self.dump_dir, exist_ok=True)
+        self._rollout_id = 0
 
         self.data_source = instantiate(data_source_cfg)
 
@@ -259,7 +228,7 @@ class UnifiedModelTrainer(BaseTrainer):
             raise TypeError("UnifiedModelTrainer.run_rollout: input Part must contain a 'text' Texts primitive.")
         n_rec = ar_shell.sampling_params.samples_per_prompt
         n_img = image_shell.sampling_params.samples_per_prompt
-        rid = self._dump_rollout_id
+        rid = self._rollout_id
 
         ar_texts = Texts(texts=[t for t in prompts.texts for _ in range(n_rec)])
         n_ar = len(ar_texts.texts)
@@ -363,9 +332,6 @@ class UnifiedModelTrainer(BaseTrainer):
         if di_rewards is not None:
             mean_reward = float(hydrate(di_rewards).to(torch.float32).mean().item())
 
-        if self.dump_dir:
-            self._dump_rollout(self._dump_rollout_id, sample)
-
         new_parts = list(sample.parts)
         new_parts[ar_idx] = new_parts[ar_idx].compute_advantages(normalize=True)
         if self._shared_advantage:
@@ -379,7 +345,7 @@ class UnifiedModelTrainer(BaseTrainer):
             new_parts[img_idx] = new_parts[img_idx].compute_advantages(normalize=True)
         sample = sample.with_parts(new_parts)
 
-        self._drop_decoded(sample, rollout_id=rollout_id)
+        self._observe_samples(sample, step=rollout_id + 1, phase="rollout")
         results: Dict[str, TrainStepResult] = self.stack.train_track(
             sample,
             training_progress=float(training_progress),
@@ -396,68 +362,6 @@ class UnifiedModelTrainer(BaseTrainer):
         if self._enable_fsdp_offload and not self._single_engine:
             self.backend.offload()
         return results, mean_reward
-
-    def _dump_rollout(self, rollout_id: int, sample: Any) -> None:
-        """Best-effort intrusive dump of one rollout to ``self.dump_dir``."""
-        try:
-            out_dir = os.path.join(self.dump_dir, f"rollout_{rollout_id}")
-            os.makedirs(out_dir, exist_ok=True)
-
-            prompts_obj = sample.parts[0].primitives.get("text")
-            prompts = list(prompts_obj.texts) if isinstance(prompts_obj, Texts) else []
-
-            ar_part = next((p for p in sample.parts[1:] if isinstance(p.sampling_params, ARSamplingParams)), None)
-            ar_decoded = ar_part.primitives.get("text") if ar_part is not None else None
-            ar_texts = list(ar_decoded.texts) if isinstance(ar_decoded, Texts) else []
-
-            image_part = next(
-                (p for p in sample.parts[1:] if isinstance(p.sampling_params, DiffusionSamplingParams)), None
-            )
-            img_decoded = image_part.primitives.get("image") if image_part is not None else None
-            sample_ids = list(image_part.sample_ids) if image_part is not None else []
-            parent_ids = list(image_part.group_ids) if image_part is not None else []
-
-            rewards = None
-            if image_part is not None and image_part.rewards is not None:
-                rewards = hydrate(image_part.rewards).to(torch.float32).tolist()
-
-            n_imgs = 0
-            if isinstance(img_decoded, Images):
-                from torchvision.utils import save_image
-
-                img_decoded = deep_hydrate(img_decoded)
-                images = img_decoded.to_list()
-                n_imgs = len(images)
-                for k, image in enumerate(images):
-                    pixels = image.pixels.detach().to(torch.float32).clamp(0, 1).cpu()
-                    save_image(pixels, os.path.join(out_dir, f"img_{k}.png"))
-
-            ar_params = self.sampling_params.get("ar")
-            diff_params = self.sampling_params.get("diffusion")
-            n_rec = int(ar_params.samples_per_prompt) if ar_params is not None else 1
-            n_img = max(1, int(diff_params.samples_per_prompt))
-            n = max(len(sample_ids), n_imgs)
-            with open(os.path.join(out_dir, "samples.jsonl"), "w") as f:
-                for k in range(n):
-                    p_idx = k // (n_rec * n_img)
-                    a_idx = k // n_img
-                    f.write(
-                        json.dumps(
-                            {
-                                "sample_id": sample_ids[k] if k < len(sample_ids) else None,
-                                "parent_id": parent_ids[k] if k < len(parent_ids) else None,
-                                "prompt": prompts[p_idx] if p_idx < len(prompts) else None,
-                                "ar_text_fed_to_dit": ar_texts[a_idx] if a_idx < len(ar_texts) else None,
-                                "image_reward": rewards[k] if (rewards is not None and k < len(rewards)) else None,
-                                "image_file": f"img_{k}.png" if k < n_imgs else None,
-                            },
-                            ensure_ascii=False,
-                        )
-                        + "\n"
-                    )
-            logger.info("[HI3-DUMP] rollout %d → %s (%d samples, %d images)", rollout_id, out_dir, n, n_imgs)
-        except Exception as exc:  # noqa: BLE001 — dump must never break training
-            logger.warning("[HI3-DUMP] rollout %d dump failed (non-fatal): %s", rollout_id, exc)
 
     def evaluate(self, step: int) -> float:
         """Periodic eval on the eval set (no training); returns the mean image reward."""
@@ -486,7 +390,11 @@ class UnifiedModelTrainer(BaseTrainer):
         for suite in self._eval_suites:
             if suite.data_source is not None:
                 n = suite.num_prompts or self.eval_num_prompts
-                metrics.update(self._eval_pass(suite.data_source, n, [(suite.name, suite.reward)], eval_sp, step))
+                metrics.update(
+                    self._eval_pass(
+                        suite.data_source, n, [(suite.name, suite.reward)], eval_sp, step, phase=f"eval/{suite.name}"
+                    )
+                )
         logger.info(
             "EVAL step %d  (cfg=%.1f eta=%.1f)  %s",
             step,
@@ -504,6 +412,8 @@ class UnifiedModelTrainer(BaseTrainer):
         scorers: List[Tuple[str, Any]],
         eval_sp: Dict[str, BaseSamplingParams],
         step: int,
+        *,
+        phase: str = "eval",
     ) -> Dict[str, float]:
         """One generate→score sweep over one eval set; returns each scorer's mean."""
         all_inputs = data_source.get_eval_samples(num_prompts)
@@ -525,13 +435,19 @@ class UnifiedModelTrainer(BaseTrainer):
                 finally:
                     for eng in self.ar_rollouts + self.dit_rollouts:
                         eng.sleep()
+            first_scored = None
             for name, reward in scorers:
                 scored = reward.score_and_attach(generated)
+                if first_scored is None:
+                    first_scored = scored
                 rewards = scored.parts[-1].rewards
                 if rewards is not None:
                     r = hydrate(rewards).to(torch.float32)
+                    scored.parts[-1].rewards = r
                     sums[name] += float(r.sum().item())
                     counts[name] += int(r.numel())
+            if start == 0 and first_scored is not None:
+                self._observe_samples(first_scored, step=step, phase=phase)
         return {name: sums[name] / max(1, counts[name]) for name, _ in scorers}
 
     def train(
@@ -556,7 +472,7 @@ class UnifiedModelTrainer(BaseTrainer):
                 self.evaluate(start_rollout)
             for rollout_id in range(start_rollout, num_rollouts):
                 training_progress = rollout_id / max(1, num_rollouts - 1)
-                self._dump_rollout_id = rollout_id
+                self._rollout_id = rollout_id
                 inputs = self.data_source.get_samples(self.batch_size)
                 sample = self._build_request_sample(inputs, rollout_id)
                 force_sync = (resumed and rollout_id == start_rollout) or (

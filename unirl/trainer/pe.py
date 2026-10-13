@@ -222,7 +222,7 @@ class PETrainer(BaseTrainer):
             new_parts[idx] = new_parts[idx].compute_advantages(normalize=True, group_layer=layer)
         sample = sample.with_parts(new_parts)
 
-        self._drop_decoded(sample, rollout_id=rollout_id)
+        self._observe_samples(sample, step=rollout_id + 1, phase="rollout")
         results: Dict[str, TrainStepResult] = {
             name: getattr(self, name).stack.train_track(
                 sample.parts[parts_by_name[name]],
@@ -256,7 +256,16 @@ class PETrainer(BaseTrainer):
             for suite in self._eval_suites:
                 if suite.data_source is not None:
                     n = suite.num_prompts or self.eval_num_prompts
-                    metrics.update(self._eval_pass(suite.data_source, n, [(suite.name, suite.reward)], eval_sp, step))
+                    metrics.update(
+                        self._eval_pass(
+                            suite.data_source,
+                            n,
+                            [(suite.name, suite.reward)],
+                            eval_sp,
+                            step,
+                            phase=f"eval/{suite.name}",
+                        )
+                    )
         finally:
             self.rollout.sleep()
         logger.info(
@@ -276,6 +285,8 @@ class PETrainer(BaseTrainer):
         scorers: List[Tuple[str, Any]],
         eval_sp: Dict[str, BaseSamplingParams],
         step: int,
+        *,
+        phase: str = "eval",
     ) -> Dict[str, float]:
         """One generate→score sweep over one eval set; returns each scorer's mean."""
         all_inputs = data_source.get_eval_samples(num_prompts)
@@ -288,13 +299,19 @@ class PETrainer(BaseTrainer):
             sub = all_inputs.slice(start, min(start + chunk, n_prompts))
             request = self._build_request_sample(sub, step, sampling=eval_sp)
             generated = self.rollout.generate(request)
+            first_scored = None
             for name, reward in scorers:
                 scored = reward.score_and_attach(generated)
+                if first_scored is None:
+                    first_scored = scored
                 rewards = scored.parts[-1].rewards
                 if rewards is not None:
                     r = hydrate(rewards).to(torch.float32)
+                    scored.parts[-1].rewards = r
                     sums[name] += float(r.sum().item())
                     counts[name] += int(r.numel())
+            if start == 0 and first_scored is not None:
+                self._observe_samples(first_scored, step=step, phase=phase)
         return {name: sums[name] / max(1, counts[name]) for name, _ in scorers}
 
     def _ckpt_sides(self):
