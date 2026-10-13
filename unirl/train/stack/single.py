@@ -12,7 +12,6 @@ import torch
 
 from unirl.algorithms.base import AlgorithmStepResult, StageAlgorithm
 from unirl.distributed.group.dispatch import Dispatch, distributed
-from unirl.distributed.tensor.batch import _move_value
 from unirl.train.backend.fsdp import FSDPBackend
 from unirl.train.stack.anchor import prepare_segment_anchors, validate_anchor_contract
 from unirl.train.stack.base import BaseTrainStack, TrainStepResult, aggregate_update_results
@@ -30,15 +29,6 @@ from unirl.types.sample import Part
 from unirl.utils.metrics import aggregate_numeric_metrics
 
 logger = logging.getLogger(__name__)
-
-
-def _align_track_to_model(part: Part, *, device: torch.device) -> None:
-    """Move a track's training inputs onto the model's device — SGLang returns them"""
-    if part.segment is not None:
-        part.segment = part.segment.to_device(device)
-    part.conditions = {k: _move_value(v, device) for k, v in part.conditions.items()}
-    if part.advantages is not None:
-        part.advantages = part.advantages.to(device=device)
 
 
 class TrainStack(BaseTrainStack):
@@ -320,8 +310,3 @@ class TrainStack(BaseTrainStack):
             with cm:
                 results.append(self._run_update(part, micros=micros, order=order, training_progress=training_progress))
         return aggregate_update_results(results, include_per_update=True)
-
-    def _align_track_inputs(self, part: Part) -> None:
-        """Move the track onto the model's device; see :func:`_align_track_to_model`."""
-        device = next(self.fsdp_backend.trainable_module().parameters()).device
-        _align_track_to_model(part, device=device)

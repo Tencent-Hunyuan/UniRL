@@ -194,9 +194,8 @@ class UnifiedModelTrainStack(BaseTrainStack):
         """Driver-callable: prepare → backward(ar) + backward(image) → ONE step."""
         ar_part = sample.gen_part(ARSamplingParams)
         image_part = sample.gen_part(DiffusionSamplingParams)
-        device = self.fsdp_backend._device
-        ar_part = ar_part.to_device(device)
-        image_part = image_part.to_device(device)
+        self._align_track_inputs(ar_part)
+        self._align_track_inputs(image_part)
         (_, ar_steps, ar_order), (_, image_steps, image_order) = self.update_planner.arrange_many(
             (ar_part, image_part),
             num_updates=self.num_updates_per_batch,

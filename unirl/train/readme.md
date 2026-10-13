@@ -52,8 +52,9 @@ knows nothing about DTensor sharding or wrap topology.
   shared backbone (HunyuanImage3).
 - **`BaseTrainStack`** (`stack/base.py`) is the base of both: it validates the
   shared constructor arguments and owns the backend lifecycle, lazy profiler
-  cache, and LR lookup. The same module defines the shared `TrainStepResult` and
-  `aggregate_update_results`.
+  cache, LR lookup, and track input placement: only the segment, conditions, and
+  advantages move to the backend's device, so media payloads stay on the host. The
+  same module defines the shared `TrainStepResult` and `aggregate_update_results`.
 
 **Extending it:** a new structural injection mode is an `inject_<mode>` alongside
 `inject_lora` (`lora.py`) and `inject_nft` / `inject_mirror` (`ema.py`), called
