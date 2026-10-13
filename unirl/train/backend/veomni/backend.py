@@ -234,6 +234,8 @@ def _validate_fsdp_cfg(fsdp_cfg: FSDPConfig) -> None:
             "VeOmniBackend: copy_engine_all_gather=true is unsupported; use FSDPBackend for NCCL symmetric-memory "
             "all-gather."
         )
+    if fsdp_cfg.expandable_segments:
+        raise ValueError("VeOmniBackend: expandable_segments=true has not been validated here; use FSDPBackend.")
     if normalize_fsdp_mode(fsdp_cfg.fsdp_mode) != "full":
         raise ValueError(
             f"VeOmniBackend: fsdp_mode={fsdp_cfg.fsdp_mode!r} unsupported (v1 supports 'full'; "

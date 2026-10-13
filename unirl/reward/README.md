@@ -135,6 +135,11 @@ waits for a score. It adds to the serial loop only while the scorer has headroom
 111.6 s to 106.8 s); a saturated scorer (72B) bounds the step by its throughput however
 the calls are scheduled. A scorer that fails raises after the next micro generates.
 
+The BAGEL it2i times above predate #547: the vLLM-Omni rollout then ran upstream's own
+img2img prefill (a 4902-token ViT prefix at 512x512) instead of the trainside contexts
+(1227 tokens), and it2i generation has taken about a quarter less time since. They have
+not been re-measured.
+
 Once the shard has left the worker the driver has the stack collect garbage (the memory
 monitor's `gc.collect` + `empty_cache` loop): the micro loop leaves enough Python garbage
 behind that the next train phase otherwise ran 5-8% slower, 191.8 s against 177.5 s with
