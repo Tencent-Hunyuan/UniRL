@@ -78,7 +78,7 @@ class UnifiedModelTrainer(BaseTrainer):
         dump_dir: Optional[str] = None,
         logging_cfg: Optional[DictConfig] = None,
         enable_fsdp_offload: bool = True,
-        rollout_pipeline_chunks: int = 1,
+        rollout_pipeline_chunks: int,
         eval_interval: int = 0,
         eval_num_prompts: int = 32,
         eval_cfg_text_scale: float = 4.0,
@@ -88,10 +88,19 @@ class UnifiedModelTrainer(BaseTrainer):
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
         self.batch_size = batch_size
         self._enable_fsdp_offload = bool(enable_fsdp_offload)
-        self._rollout_pipeline_chunks = int(rollout_pipeline_chunks)
-        if self._rollout_pipeline_chunks < 1:
+        if (
+            isinstance(rollout_pipeline_chunks, bool)
+            or not isinstance(rollout_pipeline_chunks, int)
+            or rollout_pipeline_chunks < 1
+        ):
             raise ValueError(
-                f"UnifiedModelTrainer.rollout_pipeline_chunks must be >= 1; got {rollout_pipeline_chunks}."
+                f"UnifiedModelTrainer.rollout_pipeline_chunks must be an int >= 1; got {rollout_pipeline_chunks!r}."
+            )
+        self._rollout_pipeline_chunks = rollout_pipeline_chunks
+        if rollout_pipeline_chunks > 1 and rollout_cfg is not None:
+            raise ValueError(
+                "UnifiedModelTrainer.rollout_pipeline_chunks > 1 requires the two-engine "
+                "ar_rollout_cfg/dit_rollout_cfg rollout; the single-engine rollout_cfg path does not pipeline."
             )
 
         self.eval_interval = int(eval_interval)
@@ -255,23 +264,16 @@ class UnifiedModelTrainer(BaseTrainer):
             shards.append(self._run_rollout_pipelined(self.ar_rollouts[r], self.dit_rollouts[r], sub))
         return Sample.concat(shards)
 
-    def _pipeline_chunk_bounds(self, n_prompts: int) -> List[Tuple[int, int]]:
-        """Return contiguous prompt-tree ranges, or [] for the serial path."""
-        chunks = int(self._rollout_pipeline_chunks)
-        if chunks <= 1 or n_prompts <= 1:
-            return []
-        chunks = min(chunks, n_prompts)
-        bounds = [(n_prompts * i) // chunks for i in range(chunks + 1)]
-        return [(bounds[i], bounds[i + 1]) for i in range(chunks) if bounds[i] < bounds[i + 1]]
-
     def _run_rollout_pipelined(self, ar_engine: Any, dit_engine: Any, sample: Sample) -> Sample:
         """Overlap AR and DiT on adjacent chunks with one pending call per engine."""
-        spans = self._pipeline_chunk_bounds(int(sample.parts[0].batch_size))
-        if not spans:
+        n = sample.parts[0].batch_size
+        n_chunks = min(self._rollout_pipeline_chunks, n)
+        if n_chunks <= 1:
             return self._run_rollout_one(ar_engine, dit_engine, sample)
 
         groups = sample.split()
-        chunks = [Sample.concat(groups[lo:hi]) for lo, hi in spans]
+        bounds = [(n * i) // n_chunks for i in range(n_chunks + 1)]
+        chunks = [Sample.concat(groups[lo:hi]) for lo, hi in zip(bounds, bounds[1:])]
         pending_ar = None
         pending_dit = None
         previous = None
@@ -302,8 +304,8 @@ class UnifiedModelTrainer(BaseTrainer):
                 if pending is not None:
                     try:
                         pending.wait()
-                    except BaseException:
-                        pass
+                    except Exception:
+                        logger.debug("UnifiedModelTrainer: pending rollout call failed while draining", exc_info=True)
             raise
         return Sample.concat(filled)
 
@@ -331,21 +333,18 @@ class UnifiedModelTrainer(BaseTrainer):
             primitives={"text": ar_texts},
             control=input_part.control,
         )
-        ar_request = (
+        return (
             Sample.request(ar_input)
             .fork(1, sampling_params=image_shell.sampling_params)
             .fork(1, sampling_params=ar_shell.sampling_params)
         )
-        return ar_request
 
     def _build_dit_request(self, sample: Sample, ar_out: Sample) -> Tuple[Sample, Part]:
         """Fill the AR shell and build its dependent flat DiT request."""
         input_part = sample.parts[0]
         ar_shell = sample.gen_part(ARSamplingParams)
         image_shell = sample.gen_part(DiffusionSamplingParams)
-        prompts = input_part.primitives.get("text")
-        if not isinstance(prompts, Texts):
-            raise TypeError("UnifiedModelTrainer.run_rollout: input Part must contain a 'text' Texts primitive.")
+        prompts = input_part.primitives["text"]
         n_rec = ar_shell.sampling_params.samples_per_prompt
         n_img = image_shell.sampling_params.samples_per_prompt
         n_ar = len(prompts.texts) * n_rec
