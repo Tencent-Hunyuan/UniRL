@@ -342,33 +342,6 @@ def _load_frozen_adapter(model: nn.Module, *, name: str, weights: Dict[str, torc
         logger.info("_load_frozen_adapter(%r): %d tensor(s) from %s", name, len(weights), path)
 
 
-def _gather_by_rank(local: object) -> list:
-    """One object per rank, in rank order."""
-    gathered: list = [None] * dist.get_world_size()
-    dist.all_gather_object(gathered, local)
-    return gathered
-
-
-def _frozen_adapter_mismatch(name: str, path: str, results: Sequence[Tuple[Optional[str], object]]) -> str:
-    """Config fields and weight shas that differ from rank 0; empty when every rank agrees."""
-    reference_config, reference_sha = results[0][1]
-    pieces = []
-    for rank, (_, state) in enumerate(results):
-        config, sha = state
-        if config != reference_config:
-            fields = sorted(
-                key
-                for key in set(reference_config) | set(config)
-                if key not in reference_config or key not in config or reference_config[key] != config[key]
-            )
-            pieces.append(f"rank {rank} config differs in {fields}")
-        if sha != reference_sha:
-            pieces.append(f"rank {rank} weights sha {sha[:12]} != rank 0 {reference_sha[:12]}")
-    if not pieces:
-        return ""
-    return f"Frozen adapter {name!r} from {path!r} differs across ranks: " + "; ".join(pieces) + "."
-
-
 def _weights_sha256(weights: Dict[str, torch.Tensor]) -> str:
     """Content hash over sorted ``(key, dtype, shape, bytes)``; independent of file format and metadata."""
     digest = hashlib.sha256()
@@ -414,7 +387,8 @@ class FrozenAdapters:
                 local_exc = exc
                 local_errors.append(f"adapter {spec.name!r} from {spec.path!r}: {type(exc).__name__}: {exc}")
 
-        reports = _gather_by_rank(([(spec.name, spec.path) for spec in specs], local_errors))
+        reports: list = [None] * dist.get_world_size()
+        dist.all_gather_object(reports, ([(spec.name, spec.path) for spec in specs], local_errors))
         spec_lists = [pairs for pairs, _ in reports]
         failures = [f"rank {rank}: {error}" for rank, (_, rank_errors) in enumerate(reports) for error in rank_errors]
         if failures:
@@ -436,13 +410,29 @@ class FrozenAdapters:
                 local_exc = exc
                 local_error = f"adapter {spec.name!r} from {spec.path!r}: {type(exc).__name__}: {exc}"
 
-            results = _gather_by_rank((local_error, local_state))
+            results: list = [None] * dist.get_world_size()
+            dist.all_gather_object(results, (local_error, local_state))
             failures = [f"rank {rank}: {error}" for rank, (error, _) in enumerate(results) if error]
             if failures:
                 raise RuntimeError("Failed to inject frozen adapters:\n" + "\n".join(failures)) from local_exc
-            mismatch = _frozen_adapter_mismatch(spec.name, spec.path, results)
-            if mismatch:
-                raise RuntimeError(mismatch)
+            reference_config, reference_sha = results[0][1]
+            mismatches = []
+            for rank, (_, (rank_config, rank_sha)) in enumerate(results):
+                fields = sorted(
+                    k
+                    for k in reference_config.keys() | rank_config.keys()
+                    if reference_config.get(k) != rank_config.get(k)
+                )
+                if fields:
+                    mismatches.append(f"rank {rank} config differs in {fields}")
+                if rank_sha != reference_sha:
+                    mismatches.append(f"rank {rank} weights sha {rank_sha[:12]} != rank 0 {reference_sha[:12]}")
+            if mismatches:
+                raise RuntimeError(
+                    f"Frozen adapter {spec.name!r} from {spec.path!r} differs across ranks: "
+                    + "; ".join(mismatches)
+                    + "."
+                )
             shas[spec.name] = sha
         return cls(shas)
 
