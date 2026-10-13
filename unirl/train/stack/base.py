@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING, List, Mapping, Sequence, Tuple
 from unirl.algorithms.base import AlgorithmStepResult
 from unirl.distributed.group.remote import Remote
 from unirl.distributed.tensor.batch import _move_value
-from unirl.train.stack.planner import _positive_int
 from unirl.utils.metrics import aggregate_numeric_metrics
 
 if TYPE_CHECKING:
@@ -82,25 +81,23 @@ class BaseTrainStack(Remote):
     ) -> None:
         super().__init__()
         owner = type(self).__name__
-        micro_size = int(micro_batch_size)
-        if micro_size < 1:
-            raise ValueError(f"{owner}.micro_batch_size must be >= 1; got {micro_batch_size}.")
-        grad_norm = float(max_grad_norm)
-        if not grad_norm > 0.0:
-            raise ValueError(f"{owner}.max_grad_norm must be > 0; got {max_grad_norm}.")
-        num_updates = _positive_int(name=f"{owner}.num_updates_per_batch", value=num_updates_per_batch)
-        if num_updates > 1:
+        for name, value in (("micro_batch_size", micro_batch_size), ("num_updates_per_batch", num_updates_per_batch)):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{owner}.{name} must be an int >= 1; got {value!r}.")
+        if isinstance(max_grad_norm, bool) or not isinstance(max_grad_norm, (int, float)) or not max_grad_norm > 0.0:
+            raise ValueError(f"{owner}.max_grad_norm must be a number > 0; got {max_grad_norm!r}.")
+        if num_updates_per_batch > 1:
             for algorithm in algorithms:
                 if not algorithm.supports_multi_update:
                     raise ValueError(
-                        f"num_updates_per_batch={num_updates} requires the old-logp anchor to stay frozen "
-                        f"across the N optimizer steps, but {type(algorithm).__name__} sets "
+                        f"num_updates_per_batch={num_updates_per_batch} requires the old-logp anchor to stay "
+                        f"frozen across the N optimizer steps, but {type(algorithm).__name__} sets "
                         "supports_multi_update=False. Set num_updates_per_batch=1."
                     )
         self.fsdp_backend = fsdp_backend
-        self.micro_batch_size = micro_size
-        self.max_grad_norm = grad_norm
-        self.num_updates_per_batch = num_updates
+        self.micro_batch_size = micro_batch_size
+        self.max_grad_norm = max_grad_norm
+        self.num_updates_per_batch = num_updates_per_batch
 
     def on_rollout_end(self) -> None:
         """Delegate the rollout boundary to the backend's EMA."""
