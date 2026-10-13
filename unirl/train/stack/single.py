@@ -238,7 +238,7 @@ class TrainStack(BaseTrainStack):
                 "optimizer steps inside the window would re-step on partial gradients."
             )
         for part in window:
-            self._align_track_inputs(part)
+            self._align_track_inputs(part, training=True)
         arranged = self.update_planner.arrange_many(
             window,
             num_updates=self.num_updates_per_batch,

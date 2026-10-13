@@ -125,7 +125,8 @@ class GSPO(StageAlgorithm):
             loss_mask=segment.loss_mask,
         )
         if not bool(valid.any()):
-            return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
+            (new_logp.sum() * 0.0).backward()
+            return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=True)
 
         log_ratio = (seq_new - seq_old).clamp(max=self._MAX_LOG_RATIO)
         loss_per_seq, ratio_metrics = _grpo_clip_loss(

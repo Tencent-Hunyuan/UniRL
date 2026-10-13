@@ -201,7 +201,7 @@ class UnifiedModelTrainStack(BaseTrainStack):
         """Driver-callable: prepare → backward(ar) + backward(image) → ONE step."""
         ar_part = sample.gen_part(ARSamplingParams)
         image_part = sample.gen_part(DiffusionSamplingParams)
-        self._align_track_inputs(ar_part)
+        self._align_track_inputs(ar_part, training=True)
         self._align_track_inputs(image_part)
         (_, ar_steps, ar_order), (_, image_steps, image_order) = self.update_planner.arrange_many(
             (ar_part, image_part),

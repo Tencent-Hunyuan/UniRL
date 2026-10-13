@@ -173,8 +173,13 @@ use LoRA adapter mode. Formats and export live in
   masked micros backward at `loss_scale` 0, so AR-only params get zero grads that AdamW
   still decays and steps (skipping them would leave `None` grads, which AdamW skips). The
   image track steps, a warning is logged, and the update's `has_zero_valid_tokens` is 1.0
-  (a rollout-level mean over updates). A micro with no AR tokens at all is skipped by the
-  algorithm, which FSDP2 tolerates only when every DP rank skips it.
+  (a rollout-level mean over updates). Before device alignment and anchor preparation,
+  both stacks insert token 0 with `loss_mask=0` into each zero-length AR row. All ranks
+  therefore run replay and backward, including the final micro under `defer_grad_sync`.
+  The placeholder contributes no loss or normalization units; sample counts stay unchanged.
+  Training-side response lengths include the placeholder, but rollout outputs are unchanged.
+  An all-empty GSPO update now creates zero gradients and steps the optimizer, including
+  AdamW decay, instead of skipping the update.
 - **Advantages are not computed here** — `train` raises if
   `part.advantages is None`; the trainer must call `compute_advantages` on the
   full shard first.
