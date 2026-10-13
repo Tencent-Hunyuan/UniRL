@@ -444,7 +444,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         )
         if self._batch_replay_steps and len(target) > 1:
             require(
-                float(params.cfg_text_scale) == 1.0 and float(params.cfg_img_scale) == 1.0,
+                float(params.guidance_scale) == 1.0 and float(params.cfg_img_scale) == 1.0,
                 "Bagel packed replay only supports the FlowGRPO no-CFG path",
             )
             repeats = len(target)
