@@ -134,3 +134,15 @@ def init_process_group(
 
     _world.pg_group_ranks[pg] = {i: i for i in range(world_size)}
     return pg
+
+
+def eager_connect_process_group(group, device) -> None:
+    """Eagerly initialize the device backend hidden by PyTorch's generic ProcessGroup wrapper."""
+    eager_connect = getattr(group, "eager_connect_single_device", None)
+    if not callable(eager_connect):
+        get_backend = getattr(group, "_get_backend", None)
+        backend = get_backend(device) if callable(get_backend) else None
+        eager_connect = getattr(backend, "eager_connect_single_device", None)
+    if not callable(eager_connect):
+        raise RuntimeError(f"Process group backend does not support eager device connection for {device}.")
+    eager_connect(device)

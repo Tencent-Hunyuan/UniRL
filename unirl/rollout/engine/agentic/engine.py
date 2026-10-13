@@ -10,7 +10,7 @@ import torch
 from unirl.config.require import require
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.rollout.engine.agentic.config import AgenticRolloutEngineConfig
-from unirl.rollout.engine.base import BaseRolloutEngine
+from unirl.rollout.engine.base import BaseRolloutEngine, TransactionalWeightReceiver
 from unirl.rollout.harness.protocol import HarnessContext, RolloutHarness
 from unirl.rollout.harness.tool_agent import ToolAgentHarness
 from unirl.types.sample import Sample, _part_with_field
@@ -144,10 +144,27 @@ class AgenticRolloutEngine(BaseRolloutEngine):
         self._inner.set_version(train_version)
 
     def init_weights_update_group(self, **kwargs: Any) -> None:
+        if not isinstance(self._inner, TransactionalWeightReceiver):
+            kwargs.pop("timeout_s", None)
         self._inner.init_weights_update_group(**kwargs)
+
+    def begin_weights_update(self, **kwargs: Any) -> None:
+        if not isinstance(self._inner, TransactionalWeightReceiver):
+            raise RuntimeError("Agentic rollout inner engine does not support transactional weight publication.")
+        self._inner.begin_weights_update(**kwargs)
+
+    def prepare_weights_update(self, **kwargs: Any) -> None:
+        if not isinstance(self._inner, TransactionalWeightReceiver):
+            raise RuntimeError("Agentic rollout inner engine does not support transactional weight publication.")
+        self._inner.prepare_weights_update(**kwargs)
 
     def update_weights_from_distributed(self, **kwargs: Any) -> None:
         self._inner.update_weights_from_distributed(**kwargs)
+
+    def finish_weights_update(self, **kwargs: Any) -> None:
+        if not isinstance(self._inner, TransactionalWeightReceiver):
+            raise RuntimeError("Agentic rollout inner engine does not support transactional weight publication.")
+        self._inner.finish_weights_update(**kwargs)
 
     def destroy_weights_update_group(self, **kwargs: Any) -> None:
         self._inner.destroy_weights_update_group(**kwargs)
