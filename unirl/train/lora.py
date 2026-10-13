@@ -190,13 +190,12 @@ def adapter_active(model: nn.Module, name: str, *, trainable: str = "default") -
 
 
 def _resolve_adapter_checkpoint(path: str) -> Tuple[str, Optional[str]]:
-    """Return ``(directory, None)`` or ``(org/repo, subfolder)``; a missing local path is ``FileNotFoundError``."""
+    """Return ``(directory, None)`` or ``(org/repo, subfolder)``; a missing ``/``, ``~``, or ``.`` path raises."""
     path = os.path.expanduser(path)
     if os.path.isdir(path):
         return path, None
     parts = path.split("/")
-    # An existing first component is a local directory prefix, not a Hub org name.
-    if os.path.isabs(path) or path.startswith(".") or (parts[0] and os.path.exists(parts[0])):
+    if os.path.isabs(path) or path.startswith("."):
         raise FileNotFoundError(f"_resolve_adapter_checkpoint: {path!r} is not an existing local adapter directory.")
     if len(parts) < 2 or not all(parts[:2]):
         raise ValueError(
@@ -401,10 +400,11 @@ class FrozenAdapters:
         from peft import LoraConfig
         from peft.utils import load_peft_weights
 
+        existing = adapter_names(model)
         prepared = []
         for spec in specs:
             try:
-                if spec.name in adapter_names(model):
+                if spec.name in existing:
                     raise ValueError(f"adapter {spec.name!r} already exists on the model.")
                 model_id, subfolder = _resolve_adapter_checkpoint(spec.path)
                 peft_cfg = LoraConfig.from_pretrained(model_id, subfolder=subfolder)

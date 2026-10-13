@@ -157,8 +157,9 @@ in `backend/base.py`; a multi-update-capable algorithm sets
   `trainable_token_indices`, DoRA, and `bias != "none"` are rejected at startup.
 - **A frozen teacher must be readable and identical on every rank before wrap** — every rank
   reads each teacher's config and CPU weights, then one gather compares the `(name, path)`
-  list and any read errors. A missing absolute or `~` path, or a missing relative path whose
-  first component exists, plus an unreadable checkpoint or an injection/validation failure,
+  list and any read errors. A path that is not an existing directory is local only when it is
+  absolute or starts with `~` or `.`; any other path is read as a Hub id `org/repo[/subfolder]`.
+  A missing local path, an unreadable checkpoint, or an injection/validation failure
   raises the same error on every rank before FSDP/VeOmni wrapping, naming the ranks, adapters,
   and paths. Different configs or weight bytes are rejected the same way, naming the ranks and
   the config fields or weight hashes that differ. Every rank must pass the same teacher list.
