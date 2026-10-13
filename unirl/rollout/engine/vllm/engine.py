@@ -25,7 +25,6 @@ from unirl.types.sample import Sample
 
 logger = logging.getLogger(__name__)
 
-_PROTOCOL_VERSION = 1
 _PROCESS_STOP_GRACE_S = 5.0
 
 
@@ -383,7 +382,7 @@ class VLLMRolloutEngine(BaseRolloutEngine):
                 raise RuntimeError(
                     f"vLLM connection is {self._connection_state.value}; cannot start command {command!r}"
                 )
-            reserved = {"protocol_version", "request_id", "command"}.intersection(payload)
+            reserved = {"request_id", "command"}.intersection(payload)
             if reserved:
                 raise ValueError(f"vLLM payload uses reserved protocol fields: {sorted(reserved)}")
             request_id = self._next_request_id
@@ -391,7 +390,6 @@ class VLLMRolloutEngine(BaseRolloutEngine):
             self._connection_state = VLLMConnectionState.INFLIGHT
             request = {
                 **payload,
-                "protocol_version": _PROTOCOL_VERSION,
                 "request_id": request_id,
                 "command": command,
             }
@@ -459,10 +457,6 @@ class VLLMRolloutEngine(BaseRolloutEngine):
             raise EOFError("vLLM closed the response pipe") from error
         if not isinstance(message, dict):
             raise _ProtocolError(f"response must be a mapping, got {type(message).__name__}")
-        if message.get("protocol_version") != _PROTOCOL_VERSION:
-            raise _ProtocolError(
-                f"response protocol_version={message.get('protocol_version')!r}, expected {_PROTOCOL_VERSION}"
-            )
         request_id = message.get("request_id")
         if type(request_id) is not int or request_id < 1:
             raise _ProtocolError(f"response has invalid request_id={request_id!r}")

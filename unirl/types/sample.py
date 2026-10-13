@@ -112,19 +112,6 @@ class Part(Batch):
             )
 
     @classmethod
-    def concat(cls, items: Sequence["Part"]) -> "Part":
-        """Concat batch rows while requiring identical shared primitive metadata."""
-        if items:
-            expected = items[0].primitive_metadata
-            mismatched = [i for i, item in enumerate(items[1:], start=1) if item.primitive_metadata != expected]
-            if mismatched:
-                raise ValueError(
-                    "Part.concat: primitive_metadata must be identical across shards; "
-                    f"mismatched item indices {mismatched}."
-                )
-        return super().concat(items)
-
-    @classmethod
     def input(
         cls,
         sample_ids: List[str],
@@ -165,14 +152,6 @@ class Part(Batch):
         if self.sample_ids:
             return len(self.sample_ids)
         return super().batch_size
-
-    def validated_sample_ids(self, *, context: str) -> List[str]:
-        """Return non-empty unique sample identities or raise."""
-        if not all(isinstance(sample_id, str) and sample_id.strip() for sample_id in self.sample_ids):
-            raise ValueError(f"{context} requires non-empty string sample_ids")
-        if len(set(self.sample_ids)) != len(self.sample_ids):
-            raise ValueError(f"{context} requires globally unique sample_ids")
-        return self.sample_ids
 
     @property
     def is_root(self) -> bool:
@@ -228,7 +207,6 @@ class Part(Batch):
             raise ValueError("Part.fork: parent has no sample_ids")
         if branch < 1:
             raise ValueError(f"Part.fork: branch must be >= 1, got {branch}")
-        self.validated_sample_ids(context="Part.fork")
 
         child_sample_ids = [child_id(pid, j) for pid in self.sample_ids for j in range(branch)]
 
@@ -423,6 +401,10 @@ class Sample(Batch):
         for i, p in enumerate(self.parts):
             if len(p.sample_ids) == 0:
                 continue
+            if not all(isinstance(sid, str) and sid.strip() for sid in p.sample_ids):
+                raise ValueError(f"Sample.parts[{i}] requires non-empty string sample_ids")
+            if len(set(p.sample_ids)) != len(p.sample_ids):
+                raise ValueError(f"Sample.parts[{i}] has duplicate sample_ids")
             if p.is_root:
                 if i != 0:
                     raise ValueError(

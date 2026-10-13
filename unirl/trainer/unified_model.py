@@ -313,10 +313,6 @@ class UnifiedModelTrainer(BaseTrainer):
             media_preview=img_gen.media_preview,
             output_version=img_gen.output_version,
         )
-
-        # Materialize engine outputs before DP reshards a single transport handle.
-        deep_hydrate(ar_part)
-        deep_hydrate(image_part)
         return Sample(parts=[input_part, ar_part, image_part])
 
     def train_step(

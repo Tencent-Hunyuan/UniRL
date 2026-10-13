@@ -183,7 +183,7 @@ algorithm:
 
 # One stack: single backend + both algorithms → one optimizer step.
 stack:
-  _target_: unirl.train.unified_model_stack.UnifiedModelTrainStack
+  _target_: unirl.train.stack.unified.UnifiedModelTrainStack
   micro_batch_size: 1
   max_grad_norm: 1.0
 

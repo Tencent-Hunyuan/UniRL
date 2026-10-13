@@ -334,6 +334,7 @@ class AgenticTrainer(BaseTrainer):
                     torch.full((generated.batch_size,), advantage, dtype=torch.float32),
                 )
                 generated = _part_with_field(generated, "primitive_metadata", {})
+                generated = _part_with_field(generated, "harness_status", None)
                 generated = _part_with_field(generated, "media_preview", None)
                 generated = _part_with_field(generated, "primitives", {})
                 generated = _part_with_field(generated, "rewards", None)
