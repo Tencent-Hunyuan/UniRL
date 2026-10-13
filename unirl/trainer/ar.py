@@ -572,7 +572,12 @@ class ARTrainer(BaseTrainer):
                         reward_sum += float(rewards.sum().item())
                         reward_n += int(rewards.numel())
                     if batch_n == 1:
-                        self._observe_samples(scored.slice(0, real_prompt_n), step=rollout_id + 1, phase="eval")
+                        self._observe_samples(
+                            scored,
+                            step=rollout_id + 1,
+                            phase="eval",
+                            max_items=real_prompt_n * total_samples_per_prompt(eval_sp),
+                        )
                     logger.info(
                         "EVAL rollout %d progress: batch=%d prompts=%d samples=%d",
                         rollout_id + 1,

@@ -116,7 +116,7 @@ def build_media_preview_for_part(
     prompt_texts: List[str] = [str(p) for p in prompts] if prompts is not None else []
     rewards_flat: List[float] = []
     if part.rewards is not None and torch.is_tensor(part.rewards):
-        rewards_flat = [float(v) for v in part.rewards.detach().cpu().reshape(-1).tolist()]
+        rewards_flat = [float(v) for v in part.rewards[:limit].detach().cpu().reshape(-1).tolist()]
 
     images: List[Any] = []
     videos: List[Any] = []

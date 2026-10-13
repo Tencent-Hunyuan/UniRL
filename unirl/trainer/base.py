@@ -219,11 +219,8 @@ class BaseTrainer:
         if self._memory_monitor is not None:
             self._memory_monitor.install(self)
 
-    def _observe_samples(self, sample: Sample, *, step: int, phase: str) -> None:
+    def _observe_samples(self, sample: Sample, *, step: int, phase: str, max_items: Optional[int] = None) -> None:
         """Send bounded scored rows to both sinks and release rollout decoded payloads."""
-        from unirl.types.sample_record import build_sample_records
-        from unirl.utils.sample_dump import dump_sample_records
-
         wb = self.wandb_logger
         cfg = self.logging_cfg or {}
         dump_dir = cfg.get("sample_dump_dir")
@@ -232,15 +229,17 @@ class BaseTrainer:
         try:
             if not due or (not dump_dir and not log_wandb):
                 return
+            from unirl.types.sample_record import build_sample_records
+            from unirl.utils.sample_dump import dump_sample_records
+
+            limit = wb.media_max_items if max_items is None else min(wb.media_max_items, max_items)
             records = []
             for index, part in enumerate(sample.parts):
                 if not part.is_gen:
                     continue
                 try:
                     records.extend(
-                        build_sample_records(
-                            sample, part_index=index, step=step, phase=phase, max_items=wb.media_max_items
-                        )
+                        build_sample_records(sample, part_index=index, step=step, phase=phase, max_items=limit)
                     )
                 except Exception as exc:
                     logger.warning("Sample observation failed for Part %d: %s", index, exc)

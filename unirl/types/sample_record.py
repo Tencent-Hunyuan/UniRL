@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional
 from unirl.distributed.tensor import hydrate
 from unirl.types.media_preview import build_media_preview_for_part
 from unirl.types.primitives import Images, Texts
-from unirl.types.sample import Sample
+from unirl.types.sample import Part, Sample
 from unirl.types.sample_id import ancestor_id
 from unirl.types.sampling import ARSamplingParams
 
@@ -54,7 +54,13 @@ def build_sample_records(
     if limit <= 0:
         return []
     try:
-        conditioning = sample.conditioning_at(part_index)
+        selected = Sample(
+            parts=[
+                *sample.parts[:part_index],
+                Part(sample_ids=part.sample_ids[:limit], sampling_params=part.sampling_params),
+            ]
+        )
+        conditioning = selected.conditioning_at(part_index)
     except (ValueError, IndexError) as exc:
         logger.warning("Sample observation has malformed lineage: %s", exc)
         conditioning = []
