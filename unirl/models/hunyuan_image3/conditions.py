@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Any, ClassVar, Dict, Optional
+from typing import Any, ClassVar, Dict, Optional, Tuple
 
 import torch
 
@@ -182,7 +182,6 @@ class HunyuanImage3DiffusionConditions(Batch):
             cond_vae=cond_vae,
             cond_vit=cond_vit,
             cond_timestep=d.get("cond_timestep"),
-            tokenizer_output=d.get("tokenizer_output"),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -201,9 +200,23 @@ class HunyuanImage3DiffusionConditions(Batch):
             out["cond_vit"] = self.cond_vit
         if self.cond_timestep is not None:
             out["cond_timestep"] = self.cond_timestep
-        if self.tokenizer_output is not None:
-            out["tokenizer_output"] = self.tokenizer_output
+        # tokenizer_output stays off the wire: only the sampling KV cache reads it, and under CFG it has 2*B rows.
         return out
+
+
+def split_cfg_fused(
+    fused: HunyuanImage3FusedMultimodalCondition, batch_size: int, *, cfg: bool
+) -> Tuple[HunyuanImage3FusedMultimodalCondition, Optional[HunyuanImage3FusedMultimodalCondition]]:
+    """Split the tokenizer's guided ``[cond; uncond]`` fused batch into B-row ``(fused, fused_uncond)``."""
+    expected = batch_size * (2 if cfg else 1)
+    actual = int(fused.input_ids.shape[0])
+    if actual != expected:
+        raise ValueError(
+            f"HunyuanImage3 tokenizer batch mismatch: expected {expected} fused rows for B={batch_size}, got {actual}."
+        )
+    if not cfg:
+        return fused, None
+    return fused.slice(0, batch_size), fused.slice(batch_size, 2 * batch_size)
 
 
 @dataclass
@@ -273,4 +286,5 @@ __all__ = [
     "HunyuanImage3DiffusionConditions",
     "HunyuanImage3FusedMultimodalCondition",
     "HunyuanImage3VAECondition",
+    "split_cfg_fused",
 ]

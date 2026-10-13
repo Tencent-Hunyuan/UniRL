@@ -1,9 +1,9 @@
 # @package _global_
 # MiniMax-H3 t2va (text -> video + stereo audio) DiffusionNFT — trainside FSDP.
 #
-# Against the sibling `minimax_h3_t2va_trainside.yaml` (Flow-GRPO, 768x768):
-# a forward-process objective, 256x384, all 10 transitions trained, and a reward
-# that scores audio/video agreement plus prompt alignment rather than one frame.
+# Against the sibling `minimax_h3_t2va_trainside.yaml` (Flow-GRPO on the same
+# canvas and reward): a forward-process objective, so rollouts are pure ODE at
+# eta 0.0 and record no SDE log-probs.
 #
 # Launch (1 node x 8 GPUs):
 #   bash examples/run_experiment_multinode_taiji.sh diffusion/minimax_h3/minimax_h3_t2va_nft

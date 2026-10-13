@@ -20,6 +20,7 @@
 
 ## News 🚀
 
+- **[2026-10]** **UniRL v0.2.0** released — 12 new model packages, SFT / agentic / async training modes, and SGLang 0.5.19 + vLLM-Omni 0.28 rollout stacks ([release notes](https://github.com/Tencent-Hunyuan/UniRL/releases/tag/v0.2.0)).
 - **[2026-06]** **DRPO** released — *"Rethinking the Divergence Regularization in LLM RL"* ([arXiv](https://arxiv.org/abs/2606.09821)).
 - **[2026-06]** **Flow-DPPO** released — *"FlowDPPO: Divergence Proximal Policy Optimization for Flow Matching Models"* ([arXiv](https://arxiv.org/abs/2606.11025)).
 - **[2026-06]** **CPPO** released — *"Beyond Uniform Token-Level Trust Region in LLM Reinforcement Learning"* ([arXiv](https://arxiv.org/abs/2606.10968)).

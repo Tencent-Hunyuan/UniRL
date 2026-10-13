@@ -11,6 +11,7 @@ import torch
 from hydra.utils import get_class, get_object, instantiate
 from omegaconf import DictConfig
 
+from unirl.config.validation import validate_memory_saver_contract
 from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.group.results import rank_zero_bool
 from unirl.distributed.tensor import hydrate
@@ -131,6 +132,9 @@ class ARTrainer(BaseTrainer):
             int(rollout_anchor_device) if rollout_anchor_device is not None else None
         )
         self._enable_fsdp_offload = bool(enable_fsdp_offload)
+        rollout_sleeps = sync_cfg is not None if self._rollout_anchor_device is None else self._enable_fsdp_offload
+        if rollout_sleeps:
+            validate_memory_saver_contract(rollout_cfg, strict=False)
         self._anchored_backend_offloaded: Optional[bool] = False
         self._anchored_rollout_awake: Optional[bool] = None
 
@@ -448,9 +452,6 @@ class ARTrainer(BaseTrainer):
                 if preserve_rollout_weights:
                     self._preserve_rollout_weights_for_next_sleep()
                 sample = self.rollout.generate(sample)
-                from unirl.trainer.unified_model import deep_hydrate
-
-                sample = deep_hydrate(sample)
 
         if self.reward is not None:
             sample = self.reward.score_and_attach(sample)
@@ -554,13 +555,7 @@ class ARTrainer(BaseTrainer):
                     prompt_n += real_prompt_n
                     dispatch_inputs = self._pad_eval_inputs(eval_inputs)
                     sample = self._build_request_sample(dispatch_inputs, rollout_id, sampling=eval_sp)
-                    if anchored:
-                        generated = self.rollout.generate(sample)
-                        from unirl.trainer.unified_model import deep_hydrate
-
-                        generated = deep_hydrate(generated)
-                    else:
-                        generated = self.rollout.generate(sample)
+                    generated = self.rollout.generate(sample)
                     scored = self.reward.score_and_attach(generated)
                     rewards = scored.parts[-1].rewards
                     if rewards is not None:
