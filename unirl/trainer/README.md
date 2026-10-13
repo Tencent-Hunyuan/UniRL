@@ -488,7 +488,8 @@ logging:
 ```
 
 `log_media` enables W&B media panels and `<phase>/<track>/samples` tables when a
-W&B run is initialized. Existing media keys and prompt/reward captions are retained.
+W&B run is initialized. Standalone audio panels require `soundfile`, included in
+the `train` extra and `requirements.txt`. Existing media keys and prompt/reward captions are retained.
 `sample_dump_dir` independently enables local output, including with
 `report_to_wandb: false`. Both sinks use `media_log_interval` for training
 (step 1, then every interval); eval observes the first scored chunk in each eval
