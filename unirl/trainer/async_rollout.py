@@ -102,7 +102,6 @@ def _rollout_manager_metrics(
     train_version: int,
     phase: Literal["pre_sync", "step_end"],
 ) -> Dict[str, Optional[float]]:
-    """Map a native batch snapshot to fixed-cardinality prompt gauges; see README.md."""
     pool = snapshot.pool
     oldest = snapshot.oldest_ready_output_version
     metrics = {
