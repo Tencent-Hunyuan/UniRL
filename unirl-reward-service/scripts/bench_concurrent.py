@@ -201,14 +201,6 @@ class _RunStats:
             agg.update(o.per_reward_errs)
         return agg
 
-    @property
-    def score_values(self) -> dict[str, list[float]]:
-        agg: dict[str, list[float]] = {}
-        for outcome in self.outcomes:
-            for name, values in outcome.score_values.items():
-                agg.setdefault(name, []).extend(values)
-        return agg
-
 
 def _run_one(
     args: argparse.Namespace,
@@ -258,29 +250,30 @@ def _run_one(
     stats = _RunStats(concurrency=concurrency, total=total, wall_s=wall, outcomes=outcomes)
     _print_stats(stats, batch_size=args.batch_size)
     if recorded is not None:
-        recorded.append(_run_record(stats, rewards, args.batch_size))
+        score_values: dict[str, list[float]] = {}
+        for outcome in outcomes:
+            for name, values in outcome.score_values.items():
+                score_values.setdefault(name, []).extend(values)
+        recorded.append(
+            {
+                "rewards": rewards,
+                "concurrency": stats.concurrency,
+                "batch_size": args.batch_size,
+                "successful_requests": stats.ok,
+                "failed_requests": stats.fail,
+                "items_per_second": stats.qps * args.batch_size,
+                "scores": {
+                    name: {
+                        "count": len(values),
+                        "mean": statistics.fmean(values),
+                        "values": sorted(values),
+                    }
+                    for name, values in sorted(score_values.items())
+                    if values
+                },
+            }
+        )
     return stats
-
-
-def _run_record(stats: _RunStats, rewards: list[str], batch_size: int) -> dict[str, Any]:
-    scores = {
-        name: {
-            "count": len(values),
-            "mean": statistics.fmean(values),
-            "values": sorted(values),
-        }
-        for name, values in sorted(stats.score_values.items())
-        if values
-    }
-    return {
-        "rewards": rewards,
-        "concurrency": stats.concurrency,
-        "batch_size": batch_size,
-        "successful_requests": stats.ok,
-        "failed_requests": stats.fail,
-        "items_per_second": stats.qps * batch_size,
-        "scores": scores,
-    }
 
 
 def _print_stats(s: _RunStats, batch_size: int) -> None:

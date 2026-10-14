@@ -60,12 +60,6 @@ class MpsClientCfg:
     active_thread_percentage: int = 100
     device_memory_limit_mib: int | None = None
 
-    @property
-    def device_memory_limit_env(self) -> str | None:
-        if self.device_memory_limit_mib is None:
-            return None
-        return f"0={self.device_memory_limit_mib}M"
-
 
 @dataclass(frozen=True)
 class RewardModelCfg:
@@ -176,96 +170,6 @@ def _parse_cluster_cfg(raw: dict | None) -> ClusterCfg:
     return ClusterCfg(ray_address=_opt_str("ray_address"), namespace=_opt_str("namespace"))
 
 
-def _parse_mps_runtime_cfg(raw: dict | None) -> MpsRuntimeCfg:
-    if raw is None:
-        return MpsRuntimeCfg()
-    if not isinstance(raw, dict):
-        raise ValueError(f"`mps` must be a mapping, got {type(raw).__name__}")
-    mode = str(raw.get("mode", "disabled")).lower()
-    if mode not in _VALID_MPS_MODES:
-        raise ValueError(f"mps.mode must be one of {_VALID_MPS_MODES}, got {mode!r}")
-
-    def _path(key: str) -> str | None:
-        value = raw.get(key)
-        if value is None:
-            return None
-        if not isinstance(value, str) or not value.strip():
-            raise ValueError(f"mps.{key} must be a non-empty path")
-        return os.path.abspath(os.path.expandvars(os.path.expanduser(value)))
-
-    pipe_directory = _path("pipe_directory")
-    log_directory = _path("log_directory")
-    if mode == "disabled" and (pipe_directory or log_directory):
-        raise ValueError("MPS directories require mps.mode=managed or external")
-    if mode == "external" and pipe_directory is None:
-        raise ValueError("mps.mode=external requires mps.pipe_directory")
-    return MpsRuntimeCfg(
-        mode=mode,
-        pipe_directory=pipe_directory,
-        log_directory=log_directory,
-    )
-
-
-def _parse_memory_mib(value: Any, context: str) -> int:
-    if not isinstance(value, str):
-        raise ValueError(f"{context} must be a size such as 12GiB")
-    match = _MEMORY_RE.fullmatch(value.strip())
-    if match is None:
-        raise ValueError(f"{context} must use M/MiB/G/GiB units, got {value!r}")
-    amount = int(match.group(1))
-    unit = match.group(2).lower()
-    return amount * 1024 if unit in {"g", "gb", "gib"} else amount
-
-
-def _parse_mps_client_cfg(
-    raw: Any,
-    *,
-    context: str,
-    scorer: str,
-    params: dict[str, Any],
-    num_gpus: float,
-    runtime: MpsRuntimeCfg,
-) -> MpsClientCfg | None:
-    if raw is None:
-        return None
-    if not isinstance(raw, dict):
-        raise ValueError(f"{context} mps must be a mapping")
-    if not runtime.enabled:
-        raise ValueError(f"{context} configures an MPS client but node MPS is disabled")
-    if not 0 < num_gpus < 1:
-        raise ValueError(f"{context} MPS requires 0 < num_gpus < 1, got {num_gpus}")
-
-    active = raw.get("active_thread_percentage", 100)
-    if isinstance(active, bool) or not isinstance(active, int) or not 1 <= active <= 100:
-        raise ValueError(
-            f"{context} mps.active_thread_percentage must be an integer in [1, 100]"
-        )
-    memory = raw.get("device_memory_limit")
-    memory_mib = (
-        _parse_memory_mib(memory, f"{context} mps.device_memory_limit")
-        if memory is not None
-        else None
-    )
-
-    if scorer not in _MPS_QUALIFIED_SCORERS:
-        raise ValueError(
-            f"{context} scorer {scorer!r} is not MPS-qualified; "
-            f"qualified scorers: {_MPS_QUALIFIED_SCORERS}"
-        )
-    dtype = str(params.get("dtype", "float32")).lower()
-    # On the qualified H20 stack, float16/bfloat16 GEMMs under a partial MPS
-    # limit return wrong values (sometimes finite, sometimes NaN).
-    if active < 100 and dtype != "float32":
-        raise ValueError(
-            f"{context} {dtype} is only qualified with "
-            "mps.active_thread_percentage=100"
-        )
-    return MpsClientCfg(
-        active_thread_percentage=active,
-        device_memory_limit_mib=memory_mib,
-    )
-
-
 def load_config(path: str | Path) -> ServiceCfg:
     """Parse YAML into ServiceCfg, validating required fields and name uniqueness."""
     path = Path(path)
@@ -289,7 +193,34 @@ def load_config(path: str | Path) -> ServiceCfg:
     )
 
     cluster = _parse_cluster_cfg(raw.get("cluster"))
-    mps_runtime = _parse_mps_runtime_cfg(raw.get("mps"))
+
+    mps_raw = raw.get("mps")
+    if mps_raw is None:
+        mps_runtime = MpsRuntimeCfg()
+    else:
+        if not isinstance(mps_raw, dict):
+            raise ValueError(f"`mps` must be a mapping, got {type(mps_raw).__name__}")
+        mps_mode = str(mps_raw.get("mode", "disabled")).lower()
+        if mps_mode not in _VALID_MPS_MODES:
+            raise ValueError(f"mps.mode must be one of {_VALID_MPS_MODES}, got {mps_mode!r}")
+        mps_dirs: dict[str, str | None] = {}
+        for key in ("pipe_directory", "log_directory"):
+            val = mps_raw.get(key)
+            if val is None:
+                mps_dirs[key] = None
+            elif not isinstance(val, str) or not val.strip():
+                raise ValueError(f"mps.{key} must be a non-empty path")
+            else:
+                mps_dirs[key] = os.path.abspath(os.path.expandvars(os.path.expanduser(val)))
+        if mps_mode == "disabled" and any(mps_dirs.values()):
+            raise ValueError("MPS directories require mps.mode=managed or external")
+        if mps_mode == "external" and mps_dirs["pipe_directory"] is None:
+            raise ValueError("mps.mode=external requires mps.pipe_directory")
+        mps_runtime = MpsRuntimeCfg(
+            mode=mps_mode,
+            pipe_directory=mps_dirs["pipe_directory"],
+            log_directory=mps_dirs["log_directory"],
+        )
 
     rewards_raw = raw.get("rewards") or []
     if not isinstance(rewards_raw, list):
@@ -337,14 +268,49 @@ def load_config(path: str | Path) -> ServiceCfg:
                 f"{ctx} scheduling must be one of {_VALID_SCHEDULING}, got {scheduling!r}"
             )
         params = dict(entry.get("params") or {})
-        mps_client = _parse_mps_client_cfg(
-            entry.get("mps"),
-            context=ctx,
-            scorer=str(scorer),
-            params=params,
-            num_gpus=num_gpus,
-            runtime=mps_runtime,
-        )
+        mps_entry = entry.get("mps")
+        if mps_entry is None:
+            mps_client = None
+        else:
+            if not isinstance(mps_entry, dict):
+                raise ValueError(f"{ctx} mps must be a mapping")
+            if not mps_runtime.enabled:
+                raise ValueError(f"{ctx} configures an MPS client but node MPS is disabled")
+            if not 0 < num_gpus < 1:
+                raise ValueError(f"{ctx} MPS requires 0 < num_gpus < 1, got {num_gpus}")
+            if scorer not in _MPS_QUALIFIED_SCORERS:
+                raise ValueError(
+                    f"{ctx} scorer {scorer!r} is not MPS-qualified; "
+                    f"qualified scorers: {_MPS_QUALIFIED_SCORERS}"
+                )
+            active = mps_entry.get("active_thread_percentage", 100)
+            if isinstance(active, bool) or not isinstance(active, int) or not 1 <= active <= 100:
+                raise ValueError(
+                    f"{ctx} mps.active_thread_percentage must be an integer in [1, 100]"
+                )
+            dtype = str(params.get("dtype", "float32")).lower()
+            # On the qualified H20 stack, float16/bfloat16 GEMMs under a partial MPS
+            # limit return wrong values (sometimes finite, sometimes NaN).
+            if active < 100 and dtype != "float32":
+                raise ValueError(
+                    f"{ctx} {dtype} is only qualified with "
+                    "mps.active_thread_percentage=100"
+                )
+            memory = mps_entry.get("device_memory_limit")
+            if memory is None:
+                memory_mib = None
+            else:
+                match = _MEMORY_RE.fullmatch(memory.strip()) if isinstance(memory, str) else None
+                if match is None:
+                    raise ValueError(
+                        f"{ctx} mps.device_memory_limit must use M/MiB/G/GiB units, got {memory!r}"
+                    )
+                amount = int(match.group(1))
+                memory_mib = amount * 1024 if match.group(2).lower().startswith("g") else amount
+            mps_client = MpsClientCfg(
+                active_thread_percentage=active,
+                device_memory_limit_mib=memory_mib,
+            )
         # vLLM scorers place `tensor_parallel_size` N GPUs inside one Ray
         # actor via `ScorerActor.options(num_gpus=...)`. If the actor was
         # allocated fewer than N GPUs, vLLM's initialize_ray_cluster can't

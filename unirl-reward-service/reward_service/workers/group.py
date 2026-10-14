@@ -94,9 +94,9 @@ def _actor_options(
                 cfg.mps.active_thread_percentage
             ),
         }
-        if cfg.mps.device_memory_limit_env is not None:
+        if cfg.mps.device_memory_limit_mib is not None:
             env_vars["CUDA_MPS_PINNED_DEVICE_MEM_LIMIT"] = (
-                cfg.mps.device_memory_limit_env
+                f"0={cfg.mps.device_memory_limit_mib}M"
             )
         runtime_env["env_vars"] = env_vars
     options: dict[str, Any] = {
@@ -157,21 +157,6 @@ class WorkerGroup:
         return ray.get([a.ping.remote() for a in self.actors])
 
     def shutdown(self) -> None:
-        actors, self.actors = self.actors, []
-        if not actors:
-            return
-        if self.cfg.mps is None:
-            for actor in actors:
-                ray.kill(actor)
-            return
-        logger.info("WorkerGroup[%s] draining %d MPS actors", self.cfg.name, len(actors))
-        try:
-            ray.get([actor.shutdown.remote() for actor in actors], timeout=30)
-        except Exception:
-            logger.exception(
-                "WorkerGroup[%s] graceful drain failed; forcing actor cleanup",
-                self.cfg.name,
-            )
-        finally:
-            for actor in actors:
-                ray.kill(actor, no_restart=True)
+        for a in self.actors:
+            ray.kill(a)
+        self.actors = []

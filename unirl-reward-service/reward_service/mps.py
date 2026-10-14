@@ -54,7 +54,6 @@ class MpsRuntime:
             )
         )
         self._started = False
-        self._owned_directories: list[Path] = []
         self._saved_environment: dict[str, str] = {}
         self._watchdog: subprocess.Popen | None = None
 
@@ -62,71 +61,63 @@ class MpsRuntime:
     def enabled(self) -> bool:
         return self.cfg.enabled
 
-    def _environment(self) -> dict[str, str]:
-        env = {
-            k: v
-            for k, v in os.environ.items()
-            if k not in _CLIENT_ENV
-        }
+    def _run_control(
+        self,
+        *args: str,
+        input_cmd: str | None = None,
+        check: bool = True,
+    ) -> str:
+        if self.binary is None:
+            raise RuntimeError("nvidia-cuda-mps-control is not available")
+        env = {k: v for k, v in os.environ.items() if k not in _CLIENT_ENV}
         env["CUDA_MPS_PIPE_DIRECTORY"] = str(self.pipe_directory)
         if self.log_directory is not None:
             env["CUDA_MPS_LOG_DIRECTORY"] = str(self.log_directory)
-        return env
-
-    def _control(self, command: str, *, check: bool = True) -> str:
-        if self.binary is None:
-            raise RuntimeError("nvidia-cuda-mps-control is not available")
         result = subprocess.run(
-            [self.binary],
-            input=f"{command}\n",
+            [self.binary, *args],
+            input=input_cmd,
             text=True,
             capture_output=True,
-            env=self._environment(),
+            env=env,
             timeout=10,
         )
         if check and result.returncode:
             detail = result.stderr.strip() or result.stdout.strip()
-            raise RuntimeError(f"MPS command {command!r} failed: {detail}")
+            label = input_cmd.strip() if input_cmd else " ".join(args)
+            raise RuntimeError(f"MPS command {label!r} failed: {detail}")
         return result.stdout.strip()
-
-    def _make_directory(self, path: Path) -> None:
-        if path.exists() or path.is_symlink():
-            raise RuntimeError(f"refusing to replace existing MPS path: {path}")
-        path.mkdir(parents=True, mode=0o700)
-        self._owned_directories.append(path)
 
     def start(self) -> None:
         if not self.enabled or self._started:
             return
         if self.binary is None:
             raise RuntimeError("MPS requested but nvidia-cuda-mps-control is unavailable")
+        if self.cfg.mode == "managed":
+            assert self.log_directory is not None
+            for path in (self.pipe_directory, self.log_directory):
+                if path.exists() or path.is_symlink():
+                    raise RuntimeError(f"refusing to replace existing MPS path: {path}")
+        elif not self.pipe_directory.is_dir():
+            raise RuntimeError(f"external MPS pipe does not exist: {self.pipe_directory}")
+
         daemon_started = False
         try:
             if self.cfg.mode == "managed":
-                self._make_directory(self.pipe_directory)
-                self._make_directory(self.log_directory)
-                result = subprocess.run(
-                    [self.binary, "-d"],
-                    text=True,
-                    capture_output=True,
-                    env=self._environment(),
-                    timeout=10,
-                )
-                if result.returncode:
-                    raise RuntimeError(
-                        f"failed to start MPS daemon: {result.stderr.strip()}"
-                    )
+                assert self.log_directory is not None
+                self.pipe_directory.mkdir(parents=True, mode=0o700)
+                self.log_directory.mkdir(parents=True, mode=0o700)
+                self._run_control("-d")
                 daemon_started = True
-            elif not self.pipe_directory.is_dir():
-                raise RuntimeError(
-                    f"external MPS pipe does not exist: {self.pipe_directory}"
-                )
-            self._control("get_server_list")
+            self._run_control(input_cmd="get_server_list\n")
         except Exception:
             if daemon_started:
-                self._control("quit", check=False)
-            self._cleanup()
+                self._run_control(input_cmd="quit\n", check=False)
+            if self.cfg.mode == "managed":
+                shutil.rmtree(self.pipe_directory, ignore_errors=True)
+                if self.log_directory is not None:
+                    shutil.rmtree(self.log_directory, ignore_errors=True)
             raise
+
         if daemon_started:
             self._watchdog = subprocess.Popen(
                 [
@@ -159,16 +150,11 @@ class MpsRuntime:
         if not self._started:
             return payload
         try:
-            payload["server_pids"] = self._control("get_server_list").splitlines()
+            payload["server_pids"] = self._run_control(input_cmd="get_server_list\n").splitlines()
             payload["enabled"] = True
         except Exception as exc:
             payload["error"] = str(exc)
         return payload
-
-    def _cleanup(self) -> None:
-        for path in reversed(self._owned_directories):
-            shutil.rmtree(path, ignore_errors=True)
-        self._owned_directories.clear()
 
     def stop(self) -> None:
         if not self._started:
@@ -183,9 +169,12 @@ class MpsRuntime:
                     self._watchdog.wait(timeout=5)
                 self._watchdog = None
             if self.cfg.mode == "managed":
-                self._control("quit", check=False)
+                self._run_control(input_cmd="quit\n", check=False)
         finally:
             os.environ.update(self._saved_environment)
             self._saved_environment.clear()
-            self._cleanup()
+            if self.cfg.mode == "managed":
+                shutil.rmtree(self.pipe_directory, ignore_errors=True)
+                if self.log_directory is not None:
+                    shutil.rmtree(self.log_directory, ignore_errors=True)
             self._started = False
