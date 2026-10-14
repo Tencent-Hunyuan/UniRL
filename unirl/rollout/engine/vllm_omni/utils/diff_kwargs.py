@@ -30,7 +30,7 @@ def core_diff_kwargs(diff_params: Any) -> Dict[str, Any]:
 def sde_extra_args(diff_params: Any) -> Dict[str, Any]:
     """Sparse SDE step indices, normalized for the ``extra_args`` channel."""
     extra_args: Dict[str, Any] = {}
-    sde_indices = getattr(diff_params, "sde_indices", None)
+    sde_indices = diff_params.sde_indices
     if sde_indices is not None:
         extra_args["sde_indices"] = sorted({int(i) for i in sde_indices})
     return extra_args

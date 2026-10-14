@@ -245,9 +245,7 @@ class Flux2KleinDiffusionStage(BatchedStepReplayMixin, DiffusionStage[Flux2Klein
         self.patchify_factor = int(patchify_factor)
         self.batch_replay_steps = bool(batch_replay_steps)
         if latent_channels is None:
-            tx_cfg = getattr(model.transformer, "config", None)
-            in_channels = getattr(tx_cfg, "in_channels", 128) if tx_cfg is not None else 128
-            latent_channels = int(in_channels)
+            latent_channels = int(model.transformer.config.in_channels)
         self.latent_channels = int(latent_channels)
 
     def _patchified_shape(self, height: int, width: int) -> Tuple[int, int, int]:

@@ -276,9 +276,7 @@ class QwenImageDiffusionStage(BatchedStepReplayMixin, DiffusionStage[QwenImageCo
         self.vae_scale_factor = vae_scale_factor
         self.batch_replay_steps = bool(batch_replay_steps)
         if latent_channels is None:
-            tx_cfg = getattr(model.transformer, "config", None)
-            in_channels = getattr(tx_cfg, "in_channels", 64) if tx_cfg is not None else 64
-            latent_channels = int(in_channels) // 4
+            latent_channels = int(model.transformer.config.in_channels) // 4
         self.latent_channels = int(latent_channels)
 
     def diffuse(
@@ -525,7 +523,7 @@ class QwenImageDiffusionStage(BatchedStepReplayMixin, DiffusionStage[QwenImageCo
             guidance_scale=float(params.guidance_scale),
             latent_h=int(sample.shape[-2]),
             latent_w=int(sample.shape[-1]),
-            distilled_guidance_scale=getattr(params, "distilled_guidance_scale", None),
+            distilled_guidance_scale=params.distilled_guidance_scale,
         )
 
     def trainable_module(self) -> "torch.nn.Module":

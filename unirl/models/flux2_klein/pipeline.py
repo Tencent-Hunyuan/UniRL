@@ -10,6 +10,7 @@ from unirl.sde.kernels import DanceSDEStrategy, StepStrategy
 from unirl.types.noise_recipe import NoiseRecipe
 from unirl.types.primitives import Images, Texts
 from unirl.types.sample import Sample
+from unirl.types.sampling import DiffusionSamplingParams
 
 from .bundle import Flux2KleinBundle
 from .conditions import Flux2KleinConditions
@@ -141,11 +142,9 @@ class Flux2KleinPipeline(Pipeline):
 
     def generate(self, sample: Sample) -> Sample:
         """Run FLUX.2-klein-9B t2i/edit end-to-end, filling the frontier (pre-forked) gen Part."""
-        frontier = sample.parts[-1]
+        frontier = sample.frontier_gen_part(DiffusionSamplingParams)
         sampling = frontier.sampling_params
-        if sampling is None:
-            raise TypeError("Flux2KleinPipeline.generate: frontier gen Part must carry DiffusionSamplingParams")
-        if getattr(sampling, "sigmas", None) is None:
+        if sampling.sigmas is None:
             raise ValueError(
                 "Flux2KleinPipeline.generate: gen part sampling_params.sigmas is None. The hosting "
                 "engine must pin σ before invoking pipeline.generate; see the σ ownership note "

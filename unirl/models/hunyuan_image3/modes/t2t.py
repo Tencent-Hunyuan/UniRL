@@ -108,23 +108,13 @@ def _resolve_system_prompt(
     bundle, bot_task: str, use_system_prompt: Optional[str], system_prompt: Optional[str]
 ) -> Optional[str]:
     """Mirror upstream ``get_system_prompt(sys_type, bot_task, system_prompt)``."""
-    import importlib
-    import sys
+    from ..text_embed import _resolve_get_system_prompt
 
-    transformer = bundle.transformer
-    gen_config = getattr(transformer, "generation_config", None)
+    gen_config = getattr(bundle.transformer, "generation_config", None)
     sys_type = use_system_prompt
     if sys_type is None and gen_config is not None:
         sys_type = getattr(gen_config, "use_system_prompt", None)
-
-    try:
-        transformer_mod = sys.modules[type(transformer).__module__]
-        package = transformer_mod.__package__ or transformer_mod.__name__.rsplit(".", 1)[0]
-        sp_mod = importlib.import_module(f"{package}.system_prompt")
-        return sp_mod.get_system_prompt(sys_type, bot_task, system_prompt)
-    except (AttributeError, ImportError, KeyError):
-        logger.debug("Could not resolve upstream HunyuanImage3 system_prompt module.", exc_info=True)
-        return system_prompt
+    return _resolve_get_system_prompt()(sys_type, bot_task, system_prompt)
 
 
 def _stop_tokens_for_bot_task(bundle, bot_task: str) -> List[int]:
