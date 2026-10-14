@@ -78,7 +78,7 @@ async def _await_ref(
 
 
 def create_app(cfg: ServiceCfg) -> FastAPI:
-    mps_runtime = MpsRuntime(cfg.mps)
+    mps_runtime = MpsRuntime(enabled=any(r.mps is not None for r in cfg.rewards))
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):

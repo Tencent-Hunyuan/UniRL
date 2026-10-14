@@ -9,7 +9,9 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from reward_service.config import MpsRuntimeCfg
+_SUFFIX = f"{os.getuid()}-{os.getpid()}"
+MPS_PIPE_DIRECTORY = Path(f"/tmp/unirl-mps-{_SUFFIX}")
+_MPS_LOG_DIRECTORY = Path(f"/tmp/unirl-mps-log-{_SUFFIX}")
 
 _CLIENT_ENV = (
     "CUDA_MPS_PIPE_DIRECTORY",
@@ -37,18 +39,14 @@ shutil.rmtree(log, ignore_errors=True)
 
 
 class MpsRuntime:
-    def __init__(self, cfg: MpsRuntimeCfg) -> None:
-        self.cfg = cfg
+    def __init__(self, *, enabled: bool) -> None:
+        self.enabled = enabled
         self.binary = shutil.which("nvidia-cuda-mps-control")
-        self.pipe_directory = Path(cfg.pipe_directory) if cfg.pipe_directory else None
-        self.log_directory = Path(cfg.log_directory) if cfg.log_directory else None
+        self.pipe_directory = MPS_PIPE_DIRECTORY
+        self.log_directory = _MPS_LOG_DIRECTORY
         self._started = False
         self._saved_environment: dict[str, str] = {}
         self._watchdog: subprocess.Popen | None = None
-
-    @property
-    def enabled(self) -> bool:
-        return self.cfg.enabled
 
     def _run_control(
         self,
@@ -58,8 +56,7 @@ class MpsRuntime:
     ) -> str:
         env = {k: v for k, v in os.environ.items() if k not in _CLIENT_ENV}
         env["CUDA_MPS_PIPE_DIRECTORY"] = str(self.pipe_directory)
-        if self.log_directory is not None:
-            env["CUDA_MPS_LOG_DIRECTORY"] = str(self.log_directory)
+        env["CUDA_MPS_LOG_DIRECTORY"] = str(self.log_directory)
         result = subprocess.run(
             [self.binary, *args],
             input=input_cmd,
@@ -79,47 +76,38 @@ class MpsRuntime:
             return
         if self.binary is None:
             raise RuntimeError("MPS requested but nvidia-cuda-mps-control is unavailable")
-        assert self.pipe_directory is not None
-        if self.cfg.mode == "managed":
-            assert self.log_directory is not None
-            for path in (self.pipe_directory, self.log_directory):
-                if path.exists() or path.is_symlink():
-                    raise RuntimeError(f"refusing to replace existing MPS path: {path}")
-        elif not self.pipe_directory.is_dir():
-            raise RuntimeError(f"external MPS pipe does not exist: {self.pipe_directory}")
+        for path in (self.pipe_directory, self.log_directory):
+            if path.exists() or path.is_symlink():
+                raise RuntimeError(f"refusing to replace existing MPS path: {path}")
 
         daemon_started = False
         try:
-            if self.cfg.mode == "managed":
-                assert self.log_directory is not None
-                self.pipe_directory.mkdir(parents=True, mode=0o700)
-                self.log_directory.mkdir(parents=True, mode=0o700)
-                self._run_control("-d")
-                daemon_started = True
+            self.pipe_directory.mkdir(parents=True, mode=0o700)
+            self.log_directory.mkdir(parents=True, mode=0o700)
+            self._run_control("-d")
+            daemon_started = True
             self._run_control(input_cmd="get_server_list\n")
         except Exception:
             if daemon_started:
                 self._run_control(input_cmd="quit\n", check=False)
-            if self.cfg.mode == "managed" and self.log_directory is not None:
-                shutil.rmtree(self.pipe_directory, ignore_errors=True)
-                shutil.rmtree(self.log_directory, ignore_errors=True)
+            shutil.rmtree(self.pipe_directory, ignore_errors=True)
+            shutil.rmtree(self.log_directory, ignore_errors=True)
             raise
 
-        if daemon_started:
-            self._watchdog = subprocess.Popen(
-                [
-                    sys.executable,
-                    "-c",
-                    _WATCHDOG,
-                    str(os.getpid()),
-                    self.binary,
-                    str(self.pipe_directory),
-                    str(self.log_directory),
-                ],
-                start_new_session=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+        self._watchdog = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                _WATCHDOG,
+                str(os.getpid()),
+                self.binary,
+                str(self.pipe_directory),
+                str(self.log_directory),
+            ],
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
 
         for name in _CLIENT_ENV:
             value = os.environ.pop(name, None)
@@ -130,7 +118,6 @@ class MpsRuntime:
     def status(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "enabled": False,
-            "mode": self.cfg.mode,
             "pipe_directory": str(self.pipe_directory),
             "shared_fault_domain": True,
         }
@@ -155,12 +142,10 @@ class MpsRuntime:
                     self._watchdog.kill()
                     self._watchdog.wait(timeout=5)
                 self._watchdog = None
-            if self.cfg.mode == "managed":
-                self._run_control(input_cmd="quit\n", check=False)
+            self._run_control(input_cmd="quit\n", check=False)
         finally:
             os.environ.update(self._saved_environment)
             self._saved_environment.clear()
-            if self.cfg.mode == "managed" and self.pipe_directory and self.log_directory:
-                shutil.rmtree(self.pipe_directory, ignore_errors=True)
-                shutil.rmtree(self.log_directory, ignore_errors=True)
+            shutil.rmtree(self.pipe_directory, ignore_errors=True)
+            shutil.rmtree(self.log_directory, ignore_errors=True)
             self._started = False

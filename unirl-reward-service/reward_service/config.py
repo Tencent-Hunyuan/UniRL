@@ -15,7 +15,6 @@ the matching pdsh bootstrap.
 from __future__ import annotations
 
 import math
-import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -33,28 +32,13 @@ _DEFAULT_SCORE_TIMEOUT_S = 120.0
 # before spilling to the next). "spread" asks Ray to distribute this
 # group's actors across nodes — a soft hint, not a hard placement group.
 _VALID_SCHEDULING = ("pack", "spread")
-_VALID_MPS_MODES = ("disabled", "managed", "external")
 _MEMORY_RE = re.compile(r"^([1-9][0-9]*)\s*(M|MB|MiB|G|GB|GiB)$", re.IGNORECASE)
-
-
-@dataclass(frozen=True)
-class MpsRuntimeCfg:
-    """Node-level MPS daemon ownership and shared client endpoints."""
-
-    mode: str = "disabled"
-    pipe_directory: str | None = None
-    log_directory: str | None = None
-
-    @property
-    def enabled(self) -> bool:
-        return self.mode != "disabled"
 
 
 @dataclass(frozen=True)
 class MpsClientCfg:
     """Limits applied by CUDA when an actor creates its first MPS context."""
 
-    pipe_directory: str
     active_thread_percentage: int = 100
     device_memory_limit_mib: int | None = None
 
@@ -120,7 +104,6 @@ class ServiceCfg:
     server: ServerCfg
     rewards: list[RewardModelCfg]
     cluster: ClusterCfg = field(default_factory=ClusterCfg)
-    mps: MpsRuntimeCfg = field(default_factory=MpsRuntimeCfg)
 
     def reward_names(self) -> list[str]:
         return [r.name for r in self.rewards]
@@ -192,38 +175,6 @@ def load_config(path: str | Path) -> ServiceCfg:
 
     cluster = _parse_cluster_cfg(raw.get("cluster"))
 
-    mps_raw = raw.get("mps")
-    if mps_raw is None:
-        mps_runtime = MpsRuntimeCfg()
-    else:
-        if not isinstance(mps_raw, dict):
-            raise ValueError(f"`mps` must be a mapping, got {type(mps_raw).__name__}")
-        mps_mode = str(mps_raw.get("mode", "disabled")).lower()
-        if mps_mode not in _VALID_MPS_MODES:
-            raise ValueError(f"mps.mode must be one of {_VALID_MPS_MODES}, got {mps_mode!r}")
-        mps_dirs: dict[str, str | None] = {}
-        for key in ("pipe_directory", "log_directory"):
-            val = mps_raw.get(key)
-            if val is None:
-                mps_dirs[key] = None
-            elif not isinstance(val, str) or not val.strip():
-                raise ValueError(f"mps.{key} must be a non-empty path")
-            else:
-                mps_dirs[key] = os.path.abspath(os.path.expandvars(os.path.expanduser(val)))
-        if mps_mode == "external" and mps_dirs["pipe_directory"] is None:
-            raise ValueError("mps.mode=external requires mps.pipe_directory")
-        if mps_mode != "disabled":
-            suffix = f"{os.getuid()}-{os.getpid()}"
-            if mps_dirs["pipe_directory"] is None:
-                mps_dirs["pipe_directory"] = f"/tmp/unirl-mps-{suffix}"
-            if mps_mode == "managed" and mps_dirs["log_directory"] is None:
-                mps_dirs["log_directory"] = f"/tmp/unirl-mps-log-{suffix}"
-        mps_runtime = MpsRuntimeCfg(
-            mode=mps_mode,
-            pipe_directory=mps_dirs["pipe_directory"],
-            log_directory=mps_dirs["log_directory"],
-        )
-
     rewards_raw = raw.get("rewards") or []
     if not isinstance(rewards_raw, list):
         raise ValueError("`rewards` must be a list")
@@ -276,8 +227,6 @@ def load_config(path: str | Path) -> ServiceCfg:
         else:
             if not isinstance(mps_entry, dict):
                 raise ValueError(f"{ctx} mps must be a mapping")
-            if not mps_runtime.enabled:
-                raise ValueError(f"{ctx} configures an MPS client but node MPS is disabled")
             if not 0 < num_gpus <= 1:
                 raise ValueError(f"{ctx} MPS requires 0 < num_gpus <= 1, got {num_gpus}")
             active = mps_entry.get("active_thread_percentage", 100)
@@ -296,9 +245,7 @@ def load_config(path: str | Path) -> ServiceCfg:
                     )
                 amount = int(match.group(1))
                 memory_mib = amount * 1024 if match.group(2).lower().startswith("g") else amount
-            assert mps_runtime.pipe_directory is not None
             mps_client = MpsClientCfg(
-                pipe_directory=mps_runtime.pipe_directory,
                 active_thread_percentage=active,
                 device_memory_limit_mib=memory_mib,
             )
@@ -340,15 +287,7 @@ def load_config(path: str | Path) -> ServiceCfg:
     if not rewards:
         raise ValueError("at least one reward must be configured")
 
-    if cluster.ray_address and mps_runtime.mode == "managed":
-        raise ValueError(
-            "managed MPS is single-node only; for an external Ray cluster, "
-            "start one daemon per node and use mps.mode=external"
-        )
+    if cluster.ray_address and any(reward.mps for reward in rewards):
+        raise ValueError("MPS is single-node only and cannot be used with cluster.ray_address")
 
-    return ServiceCfg(
-        server=server,
-        rewards=rewards,
-        cluster=cluster,
-        mps=mps_runtime,
-    )
+    return ServiceCfg(server=server, rewards=rewards, cluster=cluster)

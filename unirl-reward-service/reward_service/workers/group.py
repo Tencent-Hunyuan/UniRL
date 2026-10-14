@@ -10,6 +10,7 @@ import ray
 
 from reward_service.config import RewardModelCfg
 from reward_service.logging_utils import get_logger
+from reward_service.mps import MPS_PIPE_DIRECTORY
 from reward_service.scorers import ScoreItem
 from reward_service.workers.actor import ScorerActor
 
@@ -80,7 +81,7 @@ def _actor_options(cfg: RewardModelCfg) -> dict[str, Any]:
     runtime_env = _build_runtime_env(cfg.runtime_env)
     if cfg.mps is not None:
         env_vars = {
-            "CUDA_MPS_PIPE_DIRECTORY": cfg.mps.pipe_directory,
+            "CUDA_MPS_PIPE_DIRECTORY": str(MPS_PIPE_DIRECTORY),
             "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE": str(
                 cfg.mps.active_thread_percentage
             ),
