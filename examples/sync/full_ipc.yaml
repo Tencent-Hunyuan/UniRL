@@ -1,0 +1,7 @@
+# @package sync
+_target_: unirl.distributed.weight_sync.full.ipc.IPCWeightSync
+lora_merged: false
+bucket_size_mb: 2048
+use_shm: false
+flush_cache: true
+name_remap: {"*": "transformer.*"}

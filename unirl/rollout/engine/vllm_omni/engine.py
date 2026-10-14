@@ -25,6 +25,7 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
     """Rollout engine backed by vllm-omni's ``Omni`` orchestrator (v2 layout)."""
 
     _component_name = "vllm_omni"
+    rank_local_weight_transfer = True
 
     def __init__(
         self,
@@ -79,6 +80,11 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
             uses_lora=bool(getattr(model_config, "use_lora", False)),
             lora_copy_transport=self.adapter.lora_copy_transport,
         )
+
+    @property
+    def supports_native_weight_transfer(self) -> bool:
+        """Expose native WTE only when the deployed Omni stages enable it."""
+        return bool(self._backend.supports_native_weight_transfer)
 
     def _tokenize_prompt(self, text: str, *, task: str, sys_type: str) -> List[int]:
         """Late-bound bridge handed to the adapter as ``tokenize_fn``."""
@@ -243,6 +249,49 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
     def tp_per_stage(self) -> Dict[int, int]:
         """``{stage_id: tensor_parallel_size}`` per stage (parsed from the"""
         return self._backend.tp_per_stage()
+
+    @property
+    def weight_payload_fanout(self) -> int:
+        return self._backend.weight_payload_fanout
+
+    @property
+    def ipc_worker_device_uuids(self) -> List[str]:
+        return self._backend.ipc_worker_device_uuids
+
+    def set_weight_sync_sleep_level(self, level: int, *, preserve_next_sleep: bool = False) -> None:
+        self._backend.set_weight_sync_sleep_level(level, preserve_next_sleep=preserve_next_sleep)
+
+    def preserve_weights_for_next_sleep(self) -> None:
+        self._backend.preserve_weights_for_next_sleep()
+
+    def init_native_weight_transfer(self, *, init_info: Dict[str, Any]) -> None:
+        self._backend.init_native_weight_transfer(init_info=init_info)
+
+    def start_native_weight_update(self, *, header: Dict[str, Any]) -> None:
+        self._backend.start_native_weight_update(header=header)
+
+    def update_native_weights(self, *, update_info: Dict[str, Any]) -> None:
+        self._backend.update_native_weights(update_info=update_info)
+
+    def finish_native_weight_update(
+        self,
+        *,
+        header: Dict[str, Any],
+        flush_cache: bool,
+        weight_version: Optional[str] = None,
+    ) -> None:
+        self._backend.finish_native_weight_update(
+            header=header,
+            flush_cache=flush_cache,
+            weight_version=weight_version,
+        )
+
+    def release_native_ipc(self) -> None:
+        self._backend.release_native_ipc()
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def poison(self, reason: str = "") -> None:
+        self._backend.poison_native_weight_transfer(reason)
 
     def update_weights_from_ipc(
         self,

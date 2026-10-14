@@ -62,6 +62,22 @@ matching receiver on the engine side (`../../rollout/engine/`).
 
 ## Gotchas
 
+- **Omni's colocated rollout replicas each receive their own IPC publication.**
+  `VLLMOmniRolloutEngine.rank_local_weight_transfer` selects a TP1 receiver on
+  each training rank's GPU. All training ranks gather FSDP weights and IPC
+  handles, then each publishes to its local engine and waits for its update RPCs.
+  A failed publication stops every rank before advancing the version. Shared
+  vLLM TP receivers retain a single rank-zero publisher.
+
+- **Native Omni IPC currently targets one diffusion stage with `direct-load`.**
+  UniRL's `DiTWeightSyncExtension` supplies GPU identity through
+  `unirl_weight_sync_device_info`; Omni workers do not interpret UniRL publication
+  headers. Upstream WTE synchronizes CUDA before each update RPC returns, and
+  UniRL checks RPC errors before the training ranks agree to advance the version.
+  This confirms completion, not parameter-content equality. The ordinary vLLM
+  adapter retains its own receipt validation. AR native updates require separate
+  cache-invalidation support; diffusion does not use an AR prefix cache.
+
 - **`sync()` is a train-mesh collective** — the FSDP→full materialization runs on
   *every* train rank; never gate it behind `if rank == 0`. The rollout receiver owns
   routing after materialization: SGLang TP performs the push only on each group's

@@ -40,6 +40,23 @@ see [Choosing HSDP](../unirl/train/readme.md#choosing-hsdp-hybrid-sharding) and
 
 ## Running a recipe
 
+The single-GPU Qwen-Image native-IPC validation recipe is
+[`diffusion/qwen_image/qwen_image_grpo_vllmomni_full_ipc_1x1`](diffusion/qwen_image/qwen_image_grpo_vllmomni_full_ipc_1x1.yaml).
+It trains the full transformer with FlowGRPO and PickScore for three rollouts,
+exercising two publications through vLLM's IPC weight transfer engine.
+Defaults disable FSDP CPU offload and use learning rate `1e-5`, two images per prompt,
+256×256 images, four denoising steps, and two SDE steps. These short trajectories
+check integration; evaluate image quality and convergence with a longer run.
+Set `QWEN_IMAGE_PATH` to the full checkpoint and use a vLLM-Omni checkout with
+the diffusion IPC apply strategy. The full checkpoint requires sufficient training
+GPU memory; diffusion sleep level 1 requires host RAM for rollout weight backups.
+
+For two colocated GPUs, use
+[`diffusion/qwen_image/qwen_image_grpo_vllmomni_full_ipc_1x2`](diffusion/qwen_image/qwen_image_grpo_vllmomni_full_ipc_1x2.yaml).
+The trainer shards parameters across two FSDP ranks; each GPU hosts one
+independent TP1 rollout replica. Training CPU offload is disabled, training
+state remains resident, and each replica receives weights through same-GPU IPC.
+
 Launchers live in this directory. The first argument is the recipe path under
 `examples/`, without `.yaml`. Extra args are Hydra overrides.
 `ENTRY` is the module name from the table (`train_sft`, `train_async_ar`, …)

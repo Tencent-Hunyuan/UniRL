@@ -39,7 +39,11 @@ class Worker:
         self.transport_kind = transport_kind or "colocate_store"
 
         if torch.cuda.is_available():
-            torch.cuda.set_device(0)
+            # Do not eagerly initialize a CUDA context here.  Native
+            # vLLM-Omni launches its own CUDA diffusion subprocess from this
+            # Ray worker; creating the context before that spawn can make the
+            # child exit during startup.  Training and role setup select the
+            # logical device before issuing CUDA work.
             self.device = "cuda:0"
         else:
             self.device = "cpu"

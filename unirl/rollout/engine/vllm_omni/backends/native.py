@@ -21,6 +21,20 @@ logger = logging.getLogger(__name__)
 _ENGINE_PROC_PREFIX = "VLLM::"
 
 
+def _flatten_rpc_results(value: object) -> List[dict[str, Any]]:
+    """Flatten Omni's per-replica collective-RPC return envelope."""
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        flattened: List[dict[str, Any]] = []
+        for item in value:
+            flattened.extend(_flatten_rpc_results(item))
+        return flattened
+    if not isinstance(value, Mapping):
+        raise RuntimeError(f"vLLM-Omni native IPC worker returned {value!r}, expected a mapping")
+    return [dict(value)]
+
+
 @contextmanager
 def _preserve_cudnn_sdp_state():
     """Restore the process-wide cuDNN SDPA setting after vLLM imports."""
@@ -94,11 +108,18 @@ class VLLMOmniBackend:
         self._omni: Optional[Any] = omni
         self._rt = runtime
         self._tokenizer = tokenizer
+        self._weight_sync_sleep_level = 1
+        self._preserve_next_weight_sleep = False
+        self._pending_native_publication: Optional[tuple[str, int]] = None
 
     @classmethod
     def boot(cls, intent: Dict[str, Any]) -> "VLLMOmniBackend":
         """Spell the intent into ``Omni`` ctor kwargs and spawn."""
         import multiprocessing as mp
+
+        # Native IPC update payloads cross the Omni collective-RPC boundary as
+        # base64 encoded reducer args, matching vLLM's official HTTP client.
+        os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 
         try:
             mp.set_start_method("spawn", force=True)
@@ -267,15 +288,90 @@ class VLLMOmniBackend:
 
     def tp_per_stage(self) -> Dict[int, int]:
         tp_map: Dict[int, int] = {}
-        for entry in self._require_omni().engine.stage_configs:
-            engine_args = entry.engine_args
+        engine = self._require_omni().engine
+        entries = getattr(engine, "stage_configs", None)
+        if entries is not None:
+            stage_entries = [(int(entry.stage_id), entry.engine_args) for entry in entries]
+        else:
+            stage_entries = [
+                (index, getattr(pool, "stage_vllm_config", None))
+                for index, pool in enumerate(getattr(engine, "stage_pools", ()))
+            ]
+        for stage_id, engine_args in stage_entries:
+            if not isinstance(engine_args, Mapping):
+                engine_args = getattr(engine_args, "engine_args", engine_args)
+            if not isinstance(engine_args, Mapping):
+                engine_args = vars(engine_args) if hasattr(engine_args, "__dict__") else {}
             tp = engine_args.get("tensor_parallel_size")
             if tp is None:
                 parallel_config = engine_args.get("parallel_config")
                 if parallel_config is not None:
-                    tp = parallel_config.get("tensor_parallel_size")
-            tp_map[int(entry.stage_id)] = int(tp) if tp is not None else 1
+                    tp = (
+                        parallel_config.get("tensor_parallel_size")
+                        if isinstance(parallel_config, Mapping)
+                        else getattr(parallel_config, "tensor_parallel_size", None)
+                    )
+            tp_map[int(stage_id)] = int(tp) if tp is not None else 1
         return tp_map
+
+    def _weight_transfer_stage_ids(self) -> List[int]:
+        """Return stages whose workers were configured with a WTE backend."""
+        omni = self._require_omni()
+        ids: List[int] = []
+        for index, pool in enumerate(getattr(omni.engine, "stage_pools", ())):
+            cfg = getattr(pool, "stage_vllm_config", None)
+            if getattr(cfg, "weight_transfer_config", None) is not None:
+                ids.append(index)
+                continue
+            diffusion_cfg = getattr(cfg, "diffusion_config", None)
+            if getattr(diffusion_cfg, "weight_transfer_config", None) is not None:
+                ids.append(index)
+                continue
+            client = getattr(pool, "stage_client", None)
+            od_config = getattr(client, "od_config", None)
+            if od_config is None:
+                od_config = getattr(getattr(client, "proc_manager", None), "od_config", None)
+            if getattr(od_config, "weight_transfer_config", None) is not None:
+                ids.append(index)
+        if not ids:
+            for entry in getattr(omni.engine, "stage_configs", ()):
+                engine_args = entry.engine_args
+                if isinstance(engine_args, Mapping):
+                    configured = engine_args.get("weight_transfer_config")
+                else:
+                    configured = getattr(engine_args, "weight_transfer_config", None)
+                if configured is not None:
+                    ids.append(int(entry.stage_id))
+        return ids
+
+    def _native_stage_id(self) -> int:
+        ids = self._weight_transfer_stage_ids()
+        if not ids:
+            raise RuntimeError("vLLM-Omni has no stage with weight_transfer_config enabled")
+        if len(ids) != 1:
+            raise RuntimeError(
+                "vLLM native IPC sync currently requires exactly one configured Omni stage; "
+                f"got stages={ids}. Configure Qwen-Image with one diffusion WTE stage."
+            )
+        if self._stage_type(ids[0]) != "diffusion":
+            raise NotImplementedError("UniRL native Omni weight transfer currently supports diffusion stages only")
+        return ids[0]
+
+    @property
+    def weight_payload_fanout(self) -> int:
+        return int(self.tp_per_stage()[self._native_stage_id()])
+
+    @property
+    def ipc_worker_device_uuids(self) -> List[str]:
+        stage_id = self._native_stage_id()
+        results = self._collective_rpc(stage_id, "unirl_weight_sync_device_info")
+        infos = _flatten_rpc_results(results)
+        infos.sort(key=lambda item: int(item["tp_rank"]))
+        expected = list(range(self.weight_payload_fanout))
+        ranks = [int(item["tp_rank"]) for item in infos]
+        if ranks != expected:
+            raise RuntimeError(f"vLLM-Omni native IPC returned TP ranks {ranks}, expected {expected}")
+        return [str(item["device_uuid"]) for item in infos]
 
     def _stage_ids(self) -> List[int]:
         return list(range(self.num_stages()))
@@ -333,6 +429,15 @@ class VLLMOmniBackend:
         self._require_rpc_success(method, stage_id, results, allow_false=allow_false)
         return results
 
+    def set_weight_sync_sleep_level(self, level: int, *, preserve_next_sleep: bool = False) -> None:
+        if int(level) not in (1, 2):
+            raise ValueError(f"vLLM-Omni sleep level must be 1 or 2, got {level}")
+        self._weight_sync_sleep_level = int(level)
+        self._preserve_next_weight_sleep = bool(preserve_next_sleep)
+
+    def preserve_weights_for_next_sleep(self) -> None:
+        self._preserve_next_weight_sleep = True
+
     @staticmethod
     def _require_ack_success(action: str, stage_id: int, task_id: str, acks: object) -> None:
         # Worker handlers catch their own exceptions and answer
@@ -385,13 +490,16 @@ class VLLMOmniBackend:
         import uuid
 
         omni = self._require_omni()
+        level = 1 if self._preserve_next_weight_sleep else self._weight_sync_sleep_level
+        self._preserve_next_weight_sleep = False
         for sid in self._stage_ids():
             if self._stage_type(sid) != "diffusion":
-                self._collective_rpc(sid, "sleep", args=(1, "abort"))
+                self._collective_rpc(sid, "sleep", args=(level, "abort"))
                 continue
             task_id = str(uuid.uuid4())
             acks = omni.engine.collective_rpc(
                 method="handle_sleep_task",
+                # Diffusion sync updates the transformer; preserve the frozen encoder and VAE.
                 args=(self._rt["OmniSleepTask"](level=1, task_id=task_id),),
                 stage_ids=[int(sid)],
             )
@@ -418,6 +526,54 @@ class VLLMOmniBackend:
             self._require_ack_success("wake", int(sid), task_id, acks)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+
+    @property
+    def supports_native_weight_transfer(self) -> bool:
+        """Return whether at least one Omni stage has native WTE configured."""
+        return bool(self._weight_transfer_stage_ids())
+
+    def init_native_weight_transfer(self, *, init_info: Dict[str, Any]) -> None:
+        stage_id = self._native_stage_id()
+        self._collective_rpc(stage_id, "init_weight_transfer_engine", args=(dict(init_info),))
+
+    def start_native_weight_update(self, *, header: Dict[str, Any]) -> None:
+        if self._pending_native_publication is not None:
+            raise RuntimeError(f"vLLM-Omni native publication already pending: {self._pending_native_publication!r}")
+        stage_id = self._native_stage_id()
+        self._collective_rpc(stage_id, "start_weight_update")
+        self._pending_native_publication = (str(header["publication_id"]), int(header["model_version"]))
+
+    def update_native_weights(self, *, update_info: Dict[str, Any]) -> None:
+        if self._pending_native_publication is None:
+            raise RuntimeError("vLLM-Omni native weight update requires start first")
+        stage_id = self._native_stage_id()
+        self._collective_rpc(stage_id, "update_weights", args=(dict(update_info),))
+
+    def finish_native_weight_update(
+        self,
+        *,
+        header: Dict[str, Any],
+        flush_cache: bool,
+        weight_version: Optional[str] = None,
+    ) -> None:
+        del flush_cache, weight_version
+        identity = (str(header["publication_id"]), int(header["model_version"]))
+        if self._pending_native_publication != identity:
+            raise RuntimeError(
+                f"vLLM-Omni native finish {identity!r} does not match pending {self._pending_native_publication!r}"
+            )
+        self._collective_rpc(self._native_stage_id(), "finish_weight_update")
+        self._pending_native_publication = None
+
+    def release_native_ipc(self) -> None:
+        # The diffusion/AR workers close their PackedBufferImporter in
+        # finish_weight_update; this hook keeps the trainer-side protocol
+        # identical to vLLM's native client.
+        return
+
+    def poison_native_weight_transfer(self, reason: str = "") -> None:
+        logger.error("Poisoning vLLM-Omni native IPC runtime: %s", reason or "unspecified failure")
+        self._pending_native_publication = None
 
     def ping(self) -> bool:
         omni = self._omni

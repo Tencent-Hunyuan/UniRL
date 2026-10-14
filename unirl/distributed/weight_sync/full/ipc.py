@@ -14,12 +14,11 @@ from enum import Enum
 from typing import Any, Dict, Optional
 
 from unirl.distributed.group.dispatch import Dispatch, Execute, distributed
-from unirl.distributed.weight_sync.full.base import FullWeightSync
+from unirl.distributed.weight_sync.full.base import FullWeightSync, _apply_name_remap
 from unirl.distributed.weight_sync.transfer.vllm_native_protocol import (
     VLLM_NATIVE_PROTOCOL_VERSION,
     VLLM_NATIVE_TRANSPORT,
     structural_manifest,
-    validate_publication_result,
 )
 
 logger = logging.getLogger(__name__)
@@ -42,6 +41,8 @@ class IPCWeightSync(FullWeightSync):
         flush_cache: bool = True,
         lora_merged: bool = False,
         adapter_name: Optional[str] = None,
+        verify: Optional[bool] = None,
+        param_prefix: Optional[str] = None,
         use_shm: bool = False,
         name_remap: Optional[Dict[str, Optional[str]]] = None,
         track_prefix: str = "",
@@ -49,6 +50,7 @@ class IPCWeightSync(FullWeightSync):
         gpu_memory_headroom_mb: int = 2048,
         control_timeout_s: float = 900.0,
     ) -> None:
+        del verify, param_prefix
         super().__init__(
             backend=backend,
             bucket_size_mb=bucket_size_mb,
@@ -64,6 +66,7 @@ class IPCWeightSync(FullWeightSync):
         if float(control_timeout_s) <= 0:
             raise ValueError("control_timeout_s must be > 0")
         self._rollout = rollout
+        self._rank_local_receiver = bool(getattr(rollout, "rank_local_weight_transfer", False))
         self._use_shm = bool(use_shm)
         self._weight_sync_engine = self._resolve_weight_sync_engine()
         self._gpu_memory_headroom = int(gpu_memory_headroom_mb) << 20
@@ -76,7 +79,9 @@ class IPCWeightSync(FullWeightSync):
         return str(receiver.component_name())
 
     def _resolve_weight_sync_engine(self) -> _IPCWeightSyncEngine:
-        if self._receiver_component_name() == "vllm":
+        receiver = getattr(self._rollout, "tensor_weight_sync_target", self._rollout)
+        native_capability = getattr(receiver, "supports_native_weight_transfer", False)
+        if self._receiver_component_name() == "vllm" or bool(native_capability):
             return _IPCWeightSyncEngine.VLLM_NATIVE_WTE
         return _IPCWeightSyncEngine.LEGACY_ZMQ
 
@@ -166,7 +171,7 @@ class IPCWeightSync(FullWeightSync):
     def _target_topology(self) -> dict[str, Any]:
         target: Optional[dict[str, Any]] = None
         error: Optional[BaseException] = None
-        if self._global_rank == 0:
+        if self._rank_local_receiver or self._global_rank == 0:
             try:
                 receiver = getattr(self._rollout, "tensor_weight_sync_target", self._rollout)
                 fanout = int(getattr(receiver, "weight_payload_fanout", 0))
@@ -177,7 +182,7 @@ class IPCWeightSync(FullWeightSync):
             except BaseException as exc:
                 error = exc
         self._consensus(error, "topology-discovery")
-        return dict(self._broadcast_from_rank_zero(target))
+        return dict(target if self._rank_local_receiver else self._broadcast_from_rank_zero(target))
 
     def _run_preflight(
         self,
@@ -185,7 +190,7 @@ class IPCWeightSync(FullWeightSync):
         tp_world_size: int,
         worker_device_uuids: list[str],
         expected_metadata: list[dict[str, Any]],
-    ) -> list[str]:
+    ) -> None:
         import torch
 
         try:
@@ -210,8 +215,9 @@ class IPCWeightSync(FullWeightSync):
                 raise RuntimeError(f"rank {failures[0]['rank']}: {failures[0]['error']}")
             if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
                 raise RuntimeError("every Actor rank must see exactly one CUDA device")
-            if self._world_size != int(tp_world_size):
-                raise RuntimeError(f"Actor world size {self._world_size} != vLLM TP world {tp_world_size}")
+            expected_fanout = 1 if self._rank_local_receiver else self._world_size
+            if expected_fanout != int(tp_world_size):
+                raise RuntimeError(f"Expected receiver fanout {expected_fanout}, got vLLM TP world {tp_world_size}")
             visible = [
                 token.strip() for token in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if token.strip()
             ]
@@ -221,7 +227,8 @@ class IPCWeightSync(FullWeightSync):
             actor_uuids = [str(item["device_uuid"]) for item in topology]
             if len(set(hosts)) != 1:
                 raise RuntimeError(f"native CUDA IPC requires one node, got hosts={hosts!r}")
-            if actor_uuids != list(worker_device_uuids):
+            expected_uuids = [actor_uuids[self._global_rank]] if self._rank_local_receiver else actor_uuids
+            if expected_uuids != list(worker_device_uuids):
                 raise RuntimeError(
                     f"Actor/vLLM physical UUID mismatch: actors={actor_uuids!r}, workers={worker_device_uuids!r}"
                 )
@@ -262,7 +269,6 @@ class IPCWeightSync(FullWeightSync):
         except BaseException as exc:
             error = exc
         self._consensus(error, "topology-memory-preflight")
-        return [str(item["device_uuid"]) for item in topology]
 
     @staticmethod
     def _shape_metadata(name: str, shape: tuple[int, ...], dtype: Any) -> dict[str, Any]:
@@ -278,17 +284,32 @@ class IPCWeightSync(FullWeightSync):
         }
 
     def _expected_tensor_metadata(self) -> list[dict[str, Any]]:
-        """Build an independent canonical Qwen3-MoE export plan."""
+        """Build an export plan for fused-MoE or ordinary state-dict models."""
         model = self._backend.model
         if self._lora_merged or hasattr(model, "peft_config"):
             raise NotImplementedError("vLLM native IPC supports full fine-tuning only")
         if self._expert_weight_transform is not None:
             raise NotImplementedError("external expert export transforms are unsupported")
+        config = getattr(model, "config", None)
+        model_type = getattr(config, "model_type", None)
+
+        if model_type != "qwen3_moe":
+            metadata: list[dict[str, Any]] = []
+            for raw_name, tensor in model.state_dict().items():
+                name = _apply_name_remap(str(raw_name), self._name_remap)
+                if name is None:
+                    continue
+                dtype = (
+                    self._wire_dtype if self._wire_dtype is not None and tensor.is_floating_point() else tensor.dtype
+                )
+                metadata.append(self._shape_metadata(name, tuple(int(dim) for dim in tensor.shape), dtype))
+            if not metadata:
+                raise RuntimeError(f"native IPC model {model_type!r} has an empty state_dict")
+            structural_manifest(metadata)
+            return metadata
+
         if self._name_remap:
             raise NotImplementedError("Qwen3-MoE schema validation does not support name_remap")
-        config = getattr(model, "config", None)
-        if getattr(config, "model_type", None) != "qwen3_moe":
-            raise NotImplementedError("vLLM native IPC supports qwen3_moe only")
 
         skip_lm_head = bool(getattr(config, "tie_word_embeddings", False))
         metadata: list[dict[str, Any]] = []
@@ -386,7 +407,7 @@ class IPCWeightSync(FullWeightSync):
 
         target = self._target_topology()
         tp_world_size = int(target["tp_world_size"])
-        actor_uuids = self._run_preflight(
+        self._run_preflight(
             tp_world_size=tp_world_size,
             worker_device_uuids=list(target["device_uuids"]),
             expected_metadata=expected_metadata,
@@ -399,7 +420,7 @@ class IPCWeightSync(FullWeightSync):
             "model_version": int(self._next_model_version),
             "tp_world_size": tp_world_size,
             "expected_manifest": expected_manifest,
-            "device_uuids": actor_uuids,
+            "device_uuids": list(target["device_uuids"]),
         }
 
         source = VLLMNativeWeightSource(
@@ -421,7 +442,7 @@ class IPCWeightSync(FullWeightSync):
         engine = VLLMNativeIPCTrainerEngine(
             client=client,
             source=source,
-            rank=self._global_rank,
+            is_sender=self._rank_local_receiver or self._global_rank == 0,
             packed_buffer_size_bytes=self._bucket_bytes,
             consensus=self._consensus,
         )
@@ -443,20 +464,12 @@ class IPCWeightSync(FullWeightSync):
                 before_finish=_verify_actor_source,
             )
             release_error: Optional[BaseException] = None
-            if self._global_rank == 0:
+            if engine.is_sender:
                 try:
                     client.release_ipc_imports()
                 except BaseException as exc:
                     release_error = exc
             self._consensus(release_error, "native-ipc-release")
-            result = client.last_result if self._global_rank == 0 else None
-            result = self._broadcast_from_rank_zero(result)
-            validate_publication_result(
-                header,
-                result,
-                fanout=tp_world_size,
-                flush_cache=self._flush_cache,
-            )
             self._next_model_version += 1
             success = True
             logger.info(
@@ -468,7 +481,7 @@ class IPCWeightSync(FullWeightSync):
                 time.perf_counter() - started,
             )
         finally:
-            if not success and self._global_rank == 0:
+            if not success and engine.is_sender:
                 self._poison_rollout(f"vLLM native IPC publication {publication_id} failed")
             torch.cuda.ipc_collect()
             torch.cuda.empty_cache()
