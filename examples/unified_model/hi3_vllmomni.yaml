@@ -23,20 +23,16 @@ batch_size: 2                 # prompts per rollout; each expands to samples_per
 
 weight_sync_interval: 1
 
-# Intrusive debug dump (UnifiedModelTrainer._dump_rollout): per rollout, dump original
-# prompt + AR output text (the think/recaption fed into DiT) + decoded images +
-# image rewards. null = disabled (default); set to a writable path to enable.
-dump_dir: null
-
 # W&B reporting (UnifiedModelTrainer._init_wandb). Secrets stay in the env:
 # WANDB_API_KEY + WANDB_ENTITY (entity falls back to ${oc.env:WANDB_ENTITY}).
-# report_to_wandb=false → fully no-op. Override run_name per launch.
+# report_to_wandb=false disables W&B; sample_dump_dir still writes locally. Override run_name per launch.
 logging:
   report_to_wandb: true
   project_name: hi3-grpo
   run_name: null
   entity: ${oc.env:WANDB_ENTITY,null}
   logging_dir: null
+  sample_dump_dir: null
   tags: [hi3, two-engine, grpo]
   # Generated-image previews (off by default elsewhere; HI3 wants them).
   log_media: true
