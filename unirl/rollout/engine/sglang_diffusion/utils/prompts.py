@@ -35,6 +35,8 @@ def deexpand_prompts_from_groups(
     k = next(iter(k_values))
     if k <= 1:
         return list(prompts), 1
+    if any(idxs != list(range(idxs[0], idxs[0] + k)) for idxs in groups.values()):
+        return list(prompts), 1
 
     unique_prompts: List[str] = []
     for gid in order:

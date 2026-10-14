@@ -8,7 +8,7 @@ from typing import List
 import torch
 from PIL import Image
 
-from unirl.reward.base import BaseRewardComponentSpec
+from unirl.reward.base import PromptRewardComponentSpec
 from unirl.reward.local.device import resolve_device
 from unirl.types.reward import RewardRequest
 
@@ -24,6 +24,7 @@ class HPSv3RewardScorer(LocalRewardBackend):
         super().__init__(
             device=resolve_device(config.device, base_device),
             batch_size=config.batch_size,
+            prompt_source=config.prompt_source,
         )
 
     def _load_model(self) -> None:
@@ -39,7 +40,7 @@ class HPSv3RewardScorer(LocalRewardBackend):
 
     def _compute_model_rewards(self, request: RewardRequest) -> List[float]:
         images = request.images
-        prompts = request.prompts
+        prompts = self.prompts(request)
         all_rewards: List[float] = []
 
         for i in range(0, len(images), self.batch_size):
@@ -64,7 +65,7 @@ class HPSv3RewardScorer(LocalRewardBackend):
 
 
 @dataclass
-class HPSv3Spec(BaseRewardComponentSpec):
+class HPSv3Spec(PromptRewardComponentSpec):
     """Typed config for the HPSv3 reward component."""
 
     batch_size: int = 8

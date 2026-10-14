@@ -124,7 +124,7 @@ class TextLMAdapter(ModelAdapter):
         if sampling.base_seed is None:
             return [None] * expected
 
-        identities = sample.parts[-1].validated_sample_ids(context="SGLang per-request seed derivation")
+        identities = sample.parts[-1].sample_ids
         require(
             len(identities) == expected,
             "SGLang per-request seed derivation requires one stable sample_id per wire request; "

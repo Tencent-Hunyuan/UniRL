@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import os
 from typing import (
     Any,
     Dict,
@@ -12,7 +14,18 @@ from typing import (
     runtime_checkable,
 )
 
+logger = logging.getLogger(__name__)
+
 _REQUIRED_SERVER_ARGS_METADATA_KEY = "_unirl_required_server_args"
+_STRICT_SERVER_ARGS_ENV = "UNIRL_SGLANG_STRICT_SERVER_ARGS"
+_UNIRL_ONLY_INTENT_KEYS = frozenset(
+    {
+        _REQUIRED_SERVER_ARGS_METADATA_KEY,
+        "advertise_host",
+        "concurrency",
+        "health_timeout_s",
+    }
+)
 
 
 def _filter_server_args_or_raise(
@@ -21,7 +34,7 @@ def _filter_server_args_or_raise(
     allowed: set[str],
     backend_name: str,
 ) -> Dict[str, Any]:
-    """Filter ``server_intent`` against real SGLang ``ServerArgs`` fields."""
+    """Filter intent against live ServerArgs; unknown keys warn or raise — see ../../README.md."""
     raw_required = server_intent.get(_REQUIRED_SERVER_ARGS_METADATA_KEY, ())
     if isinstance(raw_required, str):
         required = [raw_required]
@@ -34,6 +47,17 @@ def _filter_server_args_or_raise(
             "Upgrade SGLang to a build that supports these fields, or remove the explicit UniRL "
             "rollout config that depends on them."
         )
+    dropped = sorted(key for key in server_intent if key not in allowed and key not in _UNIRL_ONLY_INTENT_KEYS)
+    if dropped:
+        message = (
+            f"SGLang {backend_name} backend dropping unknown ServerArgs keys: {dropped}. "
+            "They are not fields on the installed SGLang ServerArgs (typo or version skew). "
+            f"Set {_STRICT_SERVER_ARGS_ENV}=1 to fail closed."
+        )
+        strict = os.environ.get(_STRICT_SERVER_ARGS_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+        if strict:
+            raise RuntimeError(message)
+        logger.warning(message)
     return {k: v for k, v in server_intent.items() if k != _REQUIRED_SERVER_ARGS_METADATA_KEY and k in allowed}
 
 

@@ -127,9 +127,13 @@ class HunyuanVideo10Adapter(VideoAdapter):
 class Wan22T2VAdapter(VideoAdapter):
     """WAN 2.2-A14B T2V — DUAL-EXPERT (high-noise / low-noise) MoE."""
 
+    def lora_spec(self) -> tuple[str, List[str]]:
+        prefix, _ = super().lora_spec()
+        return prefix, ["transformer", "transformer_2"]
+
     def build_sampling(self, sample: Sample, *, diffusion: Any) -> Dict[str, Any]:
         kwargs = super().build_sampling(sample, diffusion=diffusion)
-        g2 = getattr(diffusion, "guidance_scale_2", None)
+        g2 = diffusion.guidance_scale_2
         if g2 is not None:
             kwargs["guidance_scale_2"] = float(g2)
         return kwargs

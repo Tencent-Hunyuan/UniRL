@@ -424,19 +424,16 @@ class Qwen3OmniThinkerOutputAdapter(Hi3TextOutputAdapter):
             feature_attention_mask.append(e.get("feature_attention_mask"))
             use_audio_in_video.append(bool(e.get("_unirl_audio_in_video", False)))
 
-        has_image = any(p is not None for p in pixel_values)
-        has_video = any(p is not None for p in pixel_values_videos)
-        has_audio = any(a is not None for a in input_features)
         cond = Qwen3OmniARConditions(
             prompt=TextTokenCondition(input_ids=input_ids, attention_mask=attention_mask),
-            pixel_values=pixel_values if has_image else None,
-            image_grid_thw=image_grid_thw if has_image else None,
-            pixel_values_videos=pixel_values_videos if has_video else None,
-            video_grid_thw=video_grid_thw if has_video else None,
-            video_second_per_grid=video_second_per_grid if has_video else None,
-            input_features=input_features if has_audio else None,
-            feature_attention_mask=feature_attention_mask if has_audio else None,
-            use_audio_in_video=use_audio_in_video if has_audio else None,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            pixel_values_videos=pixel_values_videos,
+            video_grid_thw=video_grid_thw,
+            video_second_per_grid=video_second_per_grid,
+            input_features=input_features,
+            feature_attention_mask=feature_attention_mask,
+            use_audio_in_video=use_audio_in_video,
         )
         return cond.to_dict()
 
@@ -457,8 +454,7 @@ class Qwen3OmniThinkerOutputAdapter(Hi3TextOutputAdapter):
         values: List[int] = []
         for group in per_request:
             output = cls._stage0(group)
-            request_output = getattr(output, "request_output", None)
-            completions = getattr(request_output, "outputs", None) or []
+            completions = getattr(output, "outputs", None) or []
             finish_reason = getattr(completions[0], "finish_reason", None) if completions else None
             values.append(int(mapping.get(str(finish_reason), SegmentStatus.PENDING)))
         return torch.tensor(values, dtype=torch.long)
@@ -495,7 +491,7 @@ class Qwen3OmniThinkerOutputAdapter(Hi3TextOutputAdapter):
 class Qwen3OmniThinkerAdapter(ModelAdapter):
     """Qwen3-Omni Thinker — text/video → AR text (single stage, TP>1, LoRA)."""
 
-    stage_yaml = "qwen3_omni_thinker_only_rl_1x4.yaml"
+    deploy_config = "qwen3_omni_thinker_only_rl_1x4.yaml"
     omni_mode = None
     needs_sigmas = False
     needs_driver_tokenizer = False

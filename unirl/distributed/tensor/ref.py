@@ -4,7 +4,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from dataclasses import fields as dc_fields
-from typing import TYPE_CHECKING, Any, Callable, Generic, List, Optional, Protocol, Tuple, TypeVar, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    ClassVar,
+    Generic,
+    List,
+    Optional,
+    Protocol,
+    Tuple,
+    TypeVar,
+    runtime_checkable,
+)
 
 import torch
 
@@ -99,6 +111,8 @@ def cat_rows(parts: List[torch.Tensor]) -> torch.Tensor:
 @dataclass
 class TensorRef(Batch):
     """The dehydrated-tensor proxy — an ordered list of row-window spans."""
+
+    _is_tensor_proxy: ClassVar[bool] = True
 
     spans: List[TensorSpan] = concat_field(default_factory=list)
     shape: Optional[Tuple[int, ...]] = shared_field(default=None)

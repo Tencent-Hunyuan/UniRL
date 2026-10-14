@@ -153,8 +153,8 @@ class SenseNovaU1Bundle(Bundle):
         """Load a local or Hub-format SenseNova-U1 checkpoint."""
         import fcntl
 
-        serialize = os.environ.get("DIFFRL_MODEL_LOAD_SERIALIZE", "1") != "0"
-        lock_file = open("/tmp/diffrl_model_load.lock", "a+") if serialize else None
+        serialize = os.environ.get("UNIRL_MODEL_LOAD_SERIALIZE", "1") != "0"
+        lock_file = open("/tmp/unirl_model_load.lock", "a+") if serialize else None
         if lock_file is not None:
             fcntl.flock(lock_file, fcntl.LOCK_EX)
         try:
@@ -180,10 +180,9 @@ class SenseNovaU1Bundle(Bundle):
         dtype = parse_torch_dtype(config.model_precision, field_name="model_precision")
 
         hf_config = AutoConfig.from_pretrained(path)
-        if getattr(hf_config, "model_type", None) != "neo_chat":
+        if hf_config.model_type != "neo_chat":
             raise ValueError(
-                f"SenseNovaU1Bundle expected model_type='neo_chat' at {path!r}, "
-                f"got {getattr(hf_config, 'model_type', None)!r}."
+                f"SenseNovaU1Bundle expected model_type='neo_chat' at {path!r}, got {hf_config.model_type!r}."
             )
         if not bool(getattr(hf_config, "use_pixel_head", False)):
             raise ValueError(

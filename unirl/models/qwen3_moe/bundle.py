@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 
 from unirl.models.types.bundle import Bundle
-from unirl.models.types.meta_init import finalize_meta_init, resolve_meta_init_weights
+from unirl.models.types.meta_init import capture_init_state, finalize_meta_init, resolve_meta_init_weights
 from unirl.utils.dtypes import canonical_torch_dtype_name, parse_torch_dtype
 
 
@@ -97,6 +97,7 @@ class Qwen3MoeBundle(Bundle):
             init_device="meta",
             ops_implementation=ops,
         )
+        meta_init_state = capture_init_state(transformer)
         transformer = finalize_meta_init(transformer, dtype=dtype)
 
         if tokenizer is None:
@@ -115,6 +116,7 @@ class Qwen3MoeBundle(Bundle):
             pretrained_path=pretrained_model_ckpt_path,
         )
         bundle._transformer_weights_path = transformer_weights_path
+        bundle._meta_init_state = meta_init_state
         return bundle
 
 

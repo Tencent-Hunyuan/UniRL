@@ -15,9 +15,13 @@ from unirl.rollout.engine.sglang.backends import HTTPBackend, NativeBackend
 from unirl.rollout.engine.sglang.config import SGLangEngineConfig, SGLangPorts
 from unirl.rollout.engine.sglang.utils import deterministic_inference_enabled, resolve_sampling
 from unirl.rollout.engine.sglang.weight_sync import WeightSync
+from unirl.rollout.harness.protocol import ContextOverflowError
 from unirl.types.sample import Sample
 
 logger = logging.getLogger(__name__)
+
+# SGLang's scheduler rejects prompts at max_req_input_len = context_len - 1 - 5 tokens.
+_SERVER_INPUT_MARGIN = 6
 
 
 class SGLangRolloutEngine(BaseRolloutEngine):
@@ -168,6 +172,16 @@ class SGLangRolloutEngine(BaseRolloutEngine):
             "SGLangRolloutEngine.generate requires a non-empty Sample (gen batch_size > 0)",
         )
         prepared = self.adapter.build_inputs(sample, sampling=sampling)
+        budget = self.cfg.context_length
+        if budget is not None:
+            for payload, ids in zip(prepared.wire, prepared.prompt_token_ids, strict=True):
+                if len(ids) >= budget - _SERVER_INPUT_MARGIN:
+                    raise ContextOverflowError(
+                        f"prompt is {len(ids)} tokens, at the server's input limit under "
+                        f"context_length={budget}: clip tool observations or raise context_length"
+                    )
+                sampling_params = payload["sampling_params"]
+                sampling_params["max_new_tokens"] = min(sampling_params["max_new_tokens"], budget - len(ids))
         active_adapter = self._weight_sync.active_adapter
         if active_adapter:
             for payload in prepared.wire:
@@ -297,7 +311,6 @@ class SGLangRolloutEngine(BaseRolloutEngine):
             load_format=load_format,
             flush_cache=flush_cache,
         )
-        self._version += 1
 
     def init_weights_update_group(
         self,
@@ -344,7 +357,6 @@ class SGLangRolloutEngine(BaseRolloutEngine):
             group_name=group_name,
             flush_cache=flush_cache,
         )
-        self._version += 1
 
     def destroy_weights_update_group(
         self,
@@ -398,7 +410,6 @@ class SGLangRolloutEngine(BaseRolloutEngine):
         except BaseException as exc:
             self.mark_checkpoint_engine_sync_failed(str(exc))
             raise
-        self._version += 1
 
     def mark_checkpoint_engine_sync_failed(self, error: str) -> None:
         """Poison this rollout after a possibly partial live-weight update."""

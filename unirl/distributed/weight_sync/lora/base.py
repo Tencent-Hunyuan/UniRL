@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional
 
+from unirl.distributed.group.dispatch import Dispatch, Execute, distributed
 from unirl.distributed.group.remote import Remote
 
 logger = logging.getLogger(__name__)
@@ -49,6 +50,17 @@ class LoraWeightSyncBase(Remote):
         self._adapter_name = str(adapter_name) if adapter_name is not None else str(backend.rollout_adapter_name)
         self._verify = bool(verify)
         self._track_prefix = str(track_prefix or "")
+        self._cached = None
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST, execute_mode=Execute.RANK_ZERO)
+    def has_staged_adapter(self) -> bool:
+        """Whether the current adapter is already staged for another push."""
+        return self._cached is not None
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def invalidate(self) -> None:
+        """Discard the staged adapter before an optimizer step can change it."""
+        self._cached = None
 
     def _extract(self):
         """Extract the canonical adapter (+ ``track_prefix``) and PEFT config."""

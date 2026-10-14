@@ -84,7 +84,7 @@ def hi3_fused_conditions(diff_outputs: List[OmniRawResult], *, modality: str) ->
             "Check that RLHunyuanImage3Pipeline.prepare_inputs_for_generation "
             "hook ran in every DiT worker — the subclass swap may not have "
             "taken effect (verify custom_pipeline_args.pipeline_class in "
-            "the stage YAML)."
+            "the deploy config)."
         )
 
     sequence_lengths = [int(c["input_ids"].shape[-1]) for c in captures]
@@ -265,10 +265,11 @@ class Hi3InputAdapter:
             return [GenerateCall(prompts=prompts, sampling=self.build_sampling(sample))]
 
         diff_params = diff_part.sampling_params
-        explicit_keys = list(diff_part.init_noise_group_ids or [])
-        share = bool(getattr(diff_params, "init_same_noise", False))
-        recipe_keys = explicit_keys or (diff_part.group_ids if share else list(diff_part.sample_ids))
-        if bool(getattr(diff_params, "disable_driver_xt", False)):
+        explicit_keys = list(diff_part.init_noise_group_ids)
+        recipe_keys = explicit_keys or (
+            diff_part.group_ids if diff_params.init_same_noise else list(diff_part.sample_ids)
+        )
+        if diff_params.disable_driver_xt:
             recipe_keys = []
         if not recipe_keys:
             return [GenerateCall(prompts=prompts, sampling=self.build_sampling(sample))]
@@ -322,7 +323,7 @@ class Hi3InputAdapter:
 
     def _dit_sampling(self, gen_part: Part, diff_params: Any) -> StageSampling:
         diff_kwargs = core_diff_kwargs(diff_params)
-        seed = getattr(diff_params, "seed", None)
+        seed = diff_params.seed
         if seed is not None:
             diff_kwargs["seed"] = int(seed)
 
@@ -338,10 +339,9 @@ class Hi3InputAdapter:
             )
 
         # Ship noise IDs and seed; the pipeline fills shape before regeneration.
-        explicit_keys = list(gen_part.init_noise_group_ids or [])
-        share = bool(getattr(diff_params, "init_same_noise", False))
-        keys = explicit_keys or (gen_part.group_ids if share else list(gen_part.sample_ids))
-        if keys and not bool(getattr(diff_params, "disable_driver_xt", False)):
+        explicit_keys = list(gen_part.init_noise_group_ids)
+        keys = explicit_keys or (gen_part.group_ids if diff_params.init_same_noise else list(gen_part.sample_ids))
+        if keys and not diff_params.disable_driver_xt:
             extra_args["init_noise_group_ids"] = [str(g) for g in keys]
             extra_args["init_noise_seed"] = int(seed) if seed is not None else 0
 
@@ -374,13 +374,10 @@ class Hi3DitRecaptionInputAdapter:
         width = int(base_kwargs["width"])
 
         base_extra = sde_extra_args(diff_params)
-        share = bool(getattr(diff_params, "init_same_noise", False))
-        recipe_gids = gen_part.group_ids if share else list(gen_part.sample_ids)
-        if recipe_gids and not bool(getattr(diff_params, "disable_driver_xt", False)):
+        recipe_gids = gen_part.group_ids if diff_params.init_same_noise else list(gen_part.sample_ids)
+        if recipe_gids and not diff_params.disable_driver_xt:
             base_extra["init_noise_group_ids"] = [str(g) for g in recipe_gids]
-            base_extra["init_noise_seed"] = (
-                int(diff_params.seed) if getattr(diff_params, "seed", None) is not None else 0
-            )
+            base_extra["init_noise_seed"] = int(diff_params.seed) if diff_params.seed is not None else 0
 
         calls: List[GenerateCall] = []
         for idx, (sample_id, text, recap) in enumerate(zip(gen_part.sample_ids, texts.texts, cot.texts)):
@@ -474,12 +471,7 @@ class Hi3ImageOutputAdapter(DitOutputAdapter):
         if ar_segment is None:
             return filled
 
-        ar_decoded = None
-        try:
-            ar_decoded = decoded_text_from_ar(per_request)
-        except Exception:
-            # Best-effort parity: a decoded-text failure must not lose the image rollout.
-            ar_decoded = None
+        ar_decoded = decoded_text_from_ar(per_request)
         ar_conditions = hi3_ar_fused_conditions(per_request)
         ar_part, _ = _trailing_gen_parts(
             filled,
@@ -491,7 +483,7 @@ class Hi3ImageOutputAdapter(DitOutputAdapter):
         parts = list(filled.parts)
         parts[idx] = ar_part.fill(
             segment=ar_segment,
-            primitives={"text": ar_decoded} if ar_decoded is not None else {},
+            primitives={"text": ar_decoded},
             conditions=dict(ar_conditions),
         )
         return filled.with_parts(parts)
@@ -512,7 +504,7 @@ class Hi3DitRecaptionOutputAdapter(DitOutputAdapter):
 class Hi3T2iAdapter(ModelAdapter):
     """HI3 text → AR think → DiT image."""
 
-    stage_yaml = "hunyuan_image3_t2i_rl.yaml"
+    deploy_config = "hunyuan_image3_t2i_rl.yaml"
     omni_mode = "text-to-image"
     ar_lora_passthrough = True
     clear_cuda_visible = True
@@ -548,7 +540,7 @@ class Hi3T2iAdapter(ModelAdapter):
 class Hi3It2iAdapter(ModelAdapter):
     """HI3 image+text → AR recaption → DiT edited image."""
 
-    stage_yaml = "hunyuan_image3_it2i_rl.yaml"
+    deploy_config = "hunyuan_image3_it2i_rl.yaml"
     omni_mode = "text-to-image"
     ar_lora_passthrough = True
     clear_cuda_visible = True
@@ -582,9 +574,9 @@ class Hi3It2iAdapter(ModelAdapter):
 
 @register_adapter("hi3_i2t")
 class Hi3I2tAdapter(ModelAdapter):
-    """HI3 image+text → AR text (vendored comprehension YAML)."""
+    """HI3 image+text → AR text."""
 
-    stage_yaml = "hunyuan_image3_i2t.yaml"
+    deploy_config = "hunyuan_image3_i2t_rl.yaml"
     needs_sigmas = False
     ar_lora_passthrough = True
     clear_cuda_visible = True
@@ -617,9 +609,9 @@ class Hi3I2tAdapter(ModelAdapter):
 
 @register_adapter("hi3_t2t")
 class Hi3T2tAdapter(ModelAdapter):
-    """HI3 text → AR text (vendored comprehension YAML)."""
+    """HI3 text → AR text."""
 
-    stage_yaml = "hunyuan_image3_t2t.yaml"
+    deploy_config = "hunyuan_image3_ar_rl.yaml"
     needs_sigmas = False
     ar_lora_passthrough = True
     clear_cuda_visible = True
@@ -652,7 +644,7 @@ class Hi3T2tAdapter(ModelAdapter):
 class Hi3ArRecaptionAdapter(ModelAdapter):
     """Two-engine trainer's AR think/recaption producer."""
 
-    stage_yaml = "hunyuan_image3_ar_recaption_rl.yaml"
+    deploy_config = "hunyuan_image3_ar_recaption_rl.yaml"
     needs_sigmas = False
     ar_lora_passthrough = True
     clear_cuda_visible = True
@@ -681,7 +673,7 @@ class Hi3ArRecaptionAdapter(ModelAdapter):
 class Hi3DitRecaptionAdapter(ModelAdapter):
     """Standalone HI3 DiT — the two-engine trainer's image half."""
 
-    stage_yaml = "hunyuan_image3_dit_recaption_rl.yaml"
+    deploy_config = "hunyuan_image3_dit_recaption_rl.yaml"
     omni_mode = "text-to-image"
     clear_cuda_visible = True
     # HI3 two-engine stages are TP>1 — wake-time LoRA re-push must use the byte-copy transport.

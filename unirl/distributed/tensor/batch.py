@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import copy
 import inspect as _inspect
+import reprlib
 import uuid as _uuid
 from dataclasses import field as _dc_field
 from dataclasses import fields as dc_fields
+from dataclasses import is_dataclass
 from enum import Enum, auto
 from typing import (
     Any,
     Callable,
+    ClassVar,
     Dict,
     List,
     Optional,
@@ -150,42 +153,97 @@ def _reduce_value(values: List[Any], kind: FieldKind) -> Any:
     raise ValueError(f"Unsupported reduction kind: {kind}")
 
 
-def _concat_value(values: List[Any], batch_sizes: List[int]) -> Any:
-    """Concatenate per-sample values along the batch axis."""
-    non_none = [v for v in values if v is not None]
-    if not non_none:
+def _first_difference(a: Any, b: Any, path: str) -> Optional[str]:
+    """Describe the first structural difference, or ``None``; tensor proxies compare by shape and dtype only."""
+    if a is b:
         return None
+    if type(a) is not type(b):
+        return f"{path}: {type(a).__name__} != {type(b).__name__}"
+    if isinstance(a, torch.Tensor):
+        if a.shape != b.shape or a.dtype != b.dtype:
+            return f"{path}: {tuple(a.shape)} {a.dtype} != {tuple(b.shape)} {b.dtype}"
+        b = b.to(a.device)
+        if torch.equal(a, b):
+            return None
+        index = int((a != b).reshape(-1).nonzero()[0])
+        return f"{path}.flat[{index}]: {a.reshape(-1)[index].item()} != {b.reshape(-1)[index].item()}"
+    if isinstance(a, Batch) and a._is_tensor_proxy:
+        if a.shape != b.shape or a.dtype != b.dtype:
+            return f"{path}: {a.shape} {a.dtype} != {b.shape} {b.dtype}"
+        return None
+    if isinstance(a, dict):
+        if a.keys() != b.keys():
+            return f"{path}: keys {sorted(a, key=repr)} != {sorted(b, key=repr)}"
+        children = ((f"{path}[{k!r}]", a[k], b[k]) for k in a)
+    elif isinstance(a, (list, tuple)):
+        if len(a) != len(b):
+            return f"{path}: length {len(a)} != {len(b)}"
+        children = ((f"{path}[{i}]", x, y) for i, (x, y) in enumerate(zip(a, b)))
+    elif is_dataclass(a):
+        children = ((f"{path}.{f.name}", getattr(a, f.name), getattr(b, f.name)) for f in dc_fields(a))
+    else:
+        return None if a == b else f"{path}: {reprlib.repr(a)} != {reprlib.repr(b)}"
+    for child_path, x, y in children:
+        difference = _first_difference(x, y, child_path)
+        if difference is not None:
+            return difference
+    return None
+
+
+def _shared_value(values: List[Any], name: str) -> Any:
+    """Return the value every item agrees on, or raise naming the first difference."""
+    first = values[0]
+    for i, value in enumerate(values[1:], start=1):
+        difference = _first_difference(first, value, name)
+        if difference is not None:
+            raise ValueError(f"shared value differs between concatenated items 0 and {i}: {difference}")
+    return first
+
+
+def _any_present(values: List[Any], batch_sizes: List[int], name: str) -> bool:
+    """Whether the field is set; only zero-row items may leave it ``None`` while others set it."""
+    if all(v is None for v in values):
+        return False
+    missing = [i for i, (v, bs) in enumerate(zip(values, batch_sizes)) if v is None and bs > 0]
+    if missing:
+        raise ValueError(f"{name}: per-sample value is missing in items {missing} but set in others")
+    return True
+
+
+def _concat_value(values: List[Any], batch_sizes: List[int], name: str) -> Any:
+    """Concatenate per-sample values along the batch axis."""
+    if not _any_present(values, batch_sizes, name):
+        return None
+    items = [(v, bs) for v, bs in zip(values, batch_sizes) if v is not None]
+    non_none = [v for v, _ in items]
 
     if all(isinstance(v, torch.Tensor) for v in non_none):
-        is_batched = [v.dim() > 0 and int(v.shape[0]) == bs for v, bs in zip(values, batch_sizes) if v is not None]
+        is_batched = [v.dim() > 0 and v.shape[0] == bs for v, bs in items]
         if all(is_batched):
             return torch.cat(non_none, dim=0)
-        if not any(is_batched):
-            return non_none[0]
-        raise ValueError("Mixed batched / non-batched tensors in concat field")
+        if any(is_batched):
+            raise ValueError(f"{name}: mixed batched / non-batched tensors")
+        return non_none[0]
 
-    if all(isinstance(v, list) for v in non_none):
-        is_batched = [len(v) == bs for v, bs in zip(values, batch_sizes) if v is not None]
-        if all(is_batched):
-            merged: List[Any] = []
-            for v in non_none:
-                merged.extend(v)
-            return merged
+    if all(isinstance(v, Batch) and v._is_tensor_proxy for v in non_none):
+        rows = [v.batch_size for v in non_none]
+        sizes = [bs for _, bs in items]
+        if rows != sizes:
+            # TensorRef.concat joins spans regardless of row count, which would misalign the merged rows.
+            raise ValueError(f"{name}: tensor reference rows {rows} do not match item batch sizes {sizes}")
+        return type(non_none[0]).concat(non_none)
 
-    if all(isinstance(v, tuple) for v in non_none):
-        is_batched = [len(v) == bs for v, bs in zip(values, batch_sizes) if v is not None]
-        if all(is_batched):
-            merged_t: List[Any] = []
-            for v in non_none:
-                merged_t.extend(v)
-            return tuple(merged_t)
+    seq_type = type(non_none[0])
+    if seq_type in (list, tuple) and all(type(v) is seq_type and len(v) == bs for v, bs in items):
+        return seq_type(x for v in non_none for x in v)
 
     if all(isinstance(v, dict) for v in non_none):
         keys = sorted({k for v in non_none for k in v})
         return {
             k: _concat_value(
                 [v.get(k) if isinstance(v, dict) else None for v in values],
-                batch_sizes=batch_sizes,
+                batch_sizes,
+                f"{name}[{k!r}]",
             )
             for k in keys
         }
@@ -193,17 +251,7 @@ def _concat_value(values: List[Any], batch_sizes: List[int]) -> Any:
     if all(isinstance(v, Batch) for v in non_none):
         return type(non_none[0]).concat(non_none)
 
-    first = non_none[0]
-    if torch.is_tensor(first):
-        if all(
-            torch.is_tensor(v) and v.shape == first.shape and torch.equal(v.to(first.device), first)
-            for v in non_none[1:]
-        ):
-            return first
-    elif all(v == first for v in non_none[1:]):
-        return copy.deepcopy(first)
-
-    raise ValueError(f"Cannot concat values: types={[type(v).__name__ for v in values]}, batch_sizes={batch_sizes}")
+    return copy.deepcopy(_shared_value(non_none, name))
 
 
 def _to_index_list(indices: Union[torch.Tensor, Sequence[int]]) -> List[int]:
@@ -315,11 +363,11 @@ def _clone_value(value: Any) -> Any:
     return copy.deepcopy(value)
 
 
-def _concat_cu_seqlens(cus: List[Optional[torch.Tensor]]) -> Optional[torch.Tensor]:
+def _concat_cu_seqlens(cus: List[Optional[torch.Tensor]], batch_sizes: List[int], name: str) -> Optional[torch.Tensor]:
     """Merge per-shard cu_seqlens with offset shift."""
-    non_none = [c for c in cus if c is not None]
-    if not non_none:
+    if not _any_present(cus, batch_sizes, name):
         return None
+    non_none = [c for c in cus if c is not None]
     parts: List[torch.Tensor] = [non_none[0]]
     running = int(non_none[0][-1].item())
     for cu in non_none[1:]:
@@ -345,11 +393,13 @@ def _select_cu_seqlens(cu: torch.Tensor, indices: List[int]) -> torch.Tensor:
     return torch.tensor(cu_list, dtype=cu.dtype, device=cu.device)
 
 
-def _concat_packed_data(values: List[Optional[torch.Tensor]]) -> Optional[torch.Tensor]:
+def _concat_packed_data(
+    values: List[Optional[torch.Tensor]], batch_sizes: List[int], name: str
+) -> Optional[torch.Tensor]:
     """Concat packed-data tensors along dim 0 (no shape-vs-batch_size check)."""
-    non_none = [v for v in values if v is not None]
-    if not non_none:
+    if not _any_present(values, batch_sizes, name):
         return None
+    non_none = [v for v in values if v is not None]
     if all(isinstance(v, Batch) for v in non_none):
         return type(non_none[0]).concat(non_none)
     return torch.cat(non_none, dim=0)
@@ -440,6 +490,7 @@ class Batch:
     """Mixin / base for ``@dataclass`` containers with concat/shared fields."""
 
     _packed_cu_seqlens: Optional[torch.Tensor] = None
+    _is_tensor_proxy: ClassVar[bool] = False
 
     @property
     def _eid(self) -> str:
@@ -539,21 +590,26 @@ class Batch:
             _field_kind(f) is FieldKind.PACKED
             for f in dc_fields(items[0])  # type: ignore[arg-type]
         )
-        merged_cu = _concat_cu_seqlens([item._packed_cu_seqlens for item in items]) if has_packed else None
-
         batch_sizes = [item.batch_size for item in items]
+        merged_cu = (
+            _concat_cu_seqlens([item._packed_cu_seqlens for item in items], batch_sizes, f"{cls.__name__}.cu_seqlens")
+            if has_packed
+            else None
+        )
+
         kwargs: Dict[str, Any] = {}
         for f in dc_fields(items[0]):  # type: ignore[arg-type]
             values = [getattr(item, f.name) for item in items]
             kind = _field_kind(f)
+            name = f"{cls.__name__}.{f.name}"
             if kind is FieldKind.CONCAT:
-                kwargs[f.name] = _concat_value(values, batch_sizes)
+                kwargs[f.name] = _concat_value(values, batch_sizes, name)
             elif kind is FieldKind.PACKED:
-                kwargs[f.name] = _concat_packed_data(values)
+                kwargs[f.name] = _concat_packed_data(values, batch_sizes, name)
             elif kind in _REDUCTION_KINDS:
                 kwargs[f.name] = _reduce_value(values, kind)
             else:
-                kwargs[f.name] = values[0]
+                kwargs[f.name] = _shared_value(values, name)
 
         instance = cls(**kwargs)
         if has_packed:

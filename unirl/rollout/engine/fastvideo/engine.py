@@ -345,6 +345,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
 
     def _generate_core(self, sample: Sample) -> Sample:
         """Generate and fill the frontier diffusion Part."""
+        sample.reject_row_canvases(engine="FastVideoRolloutEngine")
         require(
             not self._is_offloaded and self._generator is not None,
             "FastVideoRolloutEngine.generate: engine is offloaded (wake_up first).",
@@ -402,8 +403,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         base_seed = int(params.seed) if params.seed is not None else 0
         keys = NoiseRecipe.from_sample(sample).noise_group_ids
         if not (isinstance(keys, (list, tuple)) and len(keys) == bs):
-            same = bool(getattr(params, "init_same_noise", False))
-            keys = list(gen.group_ids) if same else list(gen.sample_ids)
+            keys = list(gen.group_ids) if params.init_same_noise else list(gen.sample_ids)
         if not (isinstance(keys, (list, tuple)) and len(keys) == bs):
             return [base_seed] * bs
         return [_derive_group_seed(base_seed, str(k)) for k in keys]
@@ -439,7 +439,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
 
         # ``None`` → all-steps SDE; an explicit empty list → fully deterministic (README Gotchas).
         resolved_sde_indices = _resolve_sde_window(
-            getattr(params, "sde_indices", None),
+            params.sde_indices,
             int(params.num_inference_steps),
         )
         step_plan = FastVideoUniPCPlan(
@@ -551,7 +551,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
 
     def _low_noise_guidance(self, params: Any) -> float:
         """Resolve the low-noise expert's CFG scale, falling back to the shared one."""
-        scale = getattr(params, "guidance_scale_2", None)
+        scale = params.guidance_scale_2
         if scale is None:
             scale = getattr(self.model_config, "guidance_scale_2", None)
         return float(scale) if scale is not None else float(params.guidance_scale)
@@ -613,7 +613,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         T = int(traj.shape[1]) - 1
         indices = torch.arange(traj.shape[1], dtype=torch.long, device=device)
 
-        sde_set = _resolve_sde_window(getattr(params, "sde_indices", None), T)
+        sde_set = _resolve_sde_window(params.sde_indices, T)
         sde_indices = torch.tensor(sde_set, dtype=torch.long, device=device) if sde_set else None
 
         sde_logp = None
@@ -721,7 +721,6 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
             require(self._generator is not None, "fastvideo engine is offloaded/not initialized")
             self._generator.update_transformer_weights_from_path(checkpoint_path)
             self._last_weights_path = checkpoint_path
-            self._version += 1
             logger.info("fastvideo transformer weights updated from %s", checkpoint_path)
 
 

@@ -89,6 +89,10 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
         """Generate one whole DP shard synchronously."""
         return self._generate_locked(sample)
 
+    def packs_groups(self, sample: Sample) -> bool:
+        """The adapter answers: packed t2i collapses a group into one prompt, per-row modalities do not."""
+        return self.adapter.packs_groups(sample)
+
     def _generate_locked(self, sample: Sample) -> Sample:
         with self._generate_lock:
             if self._shutdown_requested:
@@ -105,6 +109,8 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
             "VLLMOmniRolloutEngine.generate: engine is offloaded or its last lifecycle transition failed "
             "(wake_up first).",
         )
+        if not self.adapter.supports_row_canvas:
+            sample.reject_row_canvases(engine=f"VLLMOmniRolloutEngine[{self.cfg.modality}]")
         self.adapter.validate_request(sample)
         if self.adapter.needs_sigmas:
             require(self.schedule_policy is not None, f"{type(self.adapter).__name__} has no sigma schedule policy")
@@ -129,7 +135,7 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def sleep(self) -> None:
-        """Fan ``handle_sleep_task`` to every stage's workers (level 1)."""
+        """Sleep every stage at level 1 (AR via EngineCore, diffusion via worker task)."""
         if self._is_offloaded and not self._transition_failed:
             return
         try:
@@ -145,7 +151,7 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def wake_up(self) -> None:
-        """Fan ``handle_wake_task`` to every stage's workers + restore LoRA."""
+        """Wake every stage (AR via EngineCore, diffusion via worker task) + restore LoRA."""
         if self._transition_failed:
             # Recover an unknown partial stage state to one known boundary
             # before attempting another wake. If this retry fails, retain the
@@ -256,7 +262,6 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
             use_shm=use_shm,
             replica_rank=replica_rank,
         )
-        self._version += 1
 
     def init_weights_update_group(
         self,
@@ -299,7 +304,6 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
             target_modules=target_modules,
             flush_cache=flush_cache,
         )
-        self._version += 1
 
     def destroy_weights_update_group(
         self,
@@ -326,7 +330,6 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
             load_format=load_format,
             flush_cache=flush_cache,
         )
-        self._version += 1
 
     def set_lora_from_tensors(
         self,

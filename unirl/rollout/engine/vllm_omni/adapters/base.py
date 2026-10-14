@@ -45,13 +45,14 @@ class ModelAdapter(ABC):
 
     modality: str = ""
 
-    stage_yaml: str = ""
+    deploy_config: str = ""
     omni_mode: Optional[str] = None
     needs_sigmas: bool = True
     needs_driver_tokenizer: bool = True
     ar_lora_passthrough: bool = False
     clear_cuda_visible: bool = False
     lora_copy_transport: bool = False
+    supports_row_canvas: bool = False
 
     def __init__(
         self,
@@ -75,9 +76,9 @@ class ModelAdapter(ABC):
 
     def boot_kwargs(self) -> Dict[str, Any]:
         """Model-specific boot intent beyond the generic config spelling."""
-        require(bool(self.stage_yaml), f"{type(self).__name__} must set stage_yaml")
+        require(bool(self.deploy_config), f"{type(self).__name__} must set deploy_config")
         kwargs: Dict[str, Any] = {
-            "stage_yaml": self.stage_yaml,
+            "deploy_config": self.deploy_config,
             "needs_driver_tokenizer": bool(self.needs_driver_tokenizer),
             "clear_cuda_visible": bool(self.clear_cuda_visible),
         }
@@ -105,6 +106,10 @@ class ModelAdapter(ABC):
                 f"{type(mc).__name__}. Use a registered model preset "
                 f"(e.g. ``sd3``, ``wan21``, ``wan22``, ``hunyuan_image3``).",
             )
+
+    def packs_groups(self, sample: Sample) -> bool:
+        """Whether build_inputs collapses each samples_per_prompt group into one prompt."""
+        return False
 
     def validate_request(self, sample: Sample) -> None:
         """Modality-specific request gate; default accepts everything."""

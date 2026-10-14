@@ -11,7 +11,7 @@ from unirl.types.primitives import Texts
 from unirl.types.sample import Part, Sample
 from unirl.types.sampling import DiffusionSamplingParams
 
-from ..conditions import HunyuanImage3DiffusionConditions
+from ..conditions import HunyuanImage3DiffusionConditions, split_cfg_fused
 
 if TYPE_CHECKING:
     from ..pipeline import HunyuanImage3Pipeline
@@ -62,9 +62,10 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
     sys_type = control.get("sys_type")
     sequence_template = control.get("sequence_template")
 
+    cfg = float(params.guidance_scale) > 1.0
     mm = pipeline.text_embed.embed_for_gen_image(
         texts,
-        cfg=float(params.guidance_scale) > 1.0,
+        cfg=cfg,
         height=int(params.height),
         width=int(params.width),
         bot_task=bot_task,
@@ -72,10 +73,11 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
         sequence_template=None if sequence_template is None else str(sequence_template),
     )
 
+    fused, fused_uncond = split_cfg_fused(mm["fused"], frontier.batch_size, cfg=cfg)
     diff_conds = HunyuanImage3DiffusionConditions(
-        fused=mm["fused"],
-        # Unread with the cache off, and Part.concat cannot merge it across prompts.
-        tokenizer_output=mm["tokenizer_output"] if pipeline.diffusion.diffuse_kv_cache else None,
+        fused=fused,
+        fused_uncond=fused_uncond,
+        tokenizer_output=mm["tokenizer_output"],
     )
     schedule = params.sigmas.to(pipeline.bundle.device)
 

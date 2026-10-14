@@ -69,14 +69,13 @@ class TensorWeightSync(FullWeightSync):
         monkey_patch_torch_reductions()
 
         dist_ready = self._dist_ready()
-
+        fanout = int(getattr(receiver, "weight_payload_fanout", tp_size))
         for bucket, is_last in self._iter_buckets():
             by_dtype: dict = {}
             for name, tensor in bucket:
                 by_dtype.setdefault(tensor.dtype, []).append((name, tensor))
             del name, tensor
 
-            fanout = int(getattr(receiver, "weight_payload_fanout", tp_size))
             sglang_tp_fanout = use_sglang and fanout > 1
             participates_in_sglang_tp = sglang_tp_fanout and dist_ready
 

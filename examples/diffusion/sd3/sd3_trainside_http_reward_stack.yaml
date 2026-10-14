@@ -1,0 +1,22 @@
+# @package _global_
+# sd3_trainside_http with the reward stack: 6 train GPUs, PickScore served from GPU 6 over HTTP.
+# Each rank generates its 128 rows as 8 micros of 16 and scores every micro with its own POST, so
+# the ranks stop arriving at the scorer together and the driver's scoring dispatch disappears.
+# Measured on this pair: generate+reward 62.6 s -> 52.4 s, step 157.2 s -> 144.7 s.
+# `overlap: true` also scores on a thread so generation never waits for a score; it pays when the
+# scorer has headroom. Arms, same GPUs and +num_rollouts:
+#   diffusion/sd3/sd3_trainside_http
+#   diffusion/sd3/sd3_trainside_http_reward_stack
+#   diffusion/sd3/sd3_trainside_http_reward_stack reward_stack.overlap=true
+
+defaults:
+  - sd3_trainside_http
+  - _self_
+
+reward_stack:
+  _target_: unirl.reward.stack.RewardStack
+  micro_batch_size: 16
+  overlap: false
+
+logging:
+  tags: [sd3, flowgrpo, trainside, reward_stack, http]

@@ -91,34 +91,3 @@ def patch_latent_prep() -> None:
 
     forward._unirl_initial_noise_expand = True  # type: ignore[attr-defined]
     LatentPreparationStage.forward = forward
-
-    _patch_grouped_initial_noise_slice()
-
-
-def _patch_grouped_initial_noise_slice() -> None:
-    """Slice the full driver noise ``[K, ...]`` to each per-output Req's own ``[i:i+1]`` in the grouped forward."""
-    from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
-
-    orig = GPUWorker.__dict__.get("_execute_forward_batch")
-    if orig is None or getattr(orig, "_unirl_noise_slice", False):
-        return
-
-    def _execute_forward_batch(self, batch):
-        n = len(batch)
-        if n > 1:
-            for i, req in enumerate(batch):
-                lat = getattr(req, "latents", None)
-                shape = getattr(lat, "shape", None)
-                if lat is not None and shape is not None and len(shape) >= 1 and shape[0] == n:
-                    req.latents = lat[i : i + 1]
-                audio_lat = getattr(req, "audio_latents", None)
-                audio_shape = getattr(audio_lat, "shape", None)
-                if audio_lat is not None and audio_shape is not None and len(audio_shape) >= 1 and audio_shape[0] == n:
-                    req.audio_latents = audio_lat[i : i + 1]
-                seeds = getattr(req, "denoise_seeds", None)
-                if isinstance(seeds, (list, tuple)) and len(seeds) == n:
-                    req.denoise_seeds = [seeds[i]]
-        return orig(self, batch)
-
-    _execute_forward_batch._unirl_noise_slice = True  # type: ignore[attr-defined]
-    GPUWorker._execute_forward_batch = _execute_forward_batch

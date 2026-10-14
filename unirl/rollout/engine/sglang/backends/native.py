@@ -43,18 +43,18 @@ def _import_sglang_engine() -> Dict[str, Any]:
     """Lazy import of the Engine entrypoint + the io_struct request types."""
     from sglang.srt.entrypoints.engine import Engine
     from sglang.srt.managers.io_struct import (
-        LoadLoRAAdapterFromTensorsReqInput,
+        ContinueGenerationReqInput,
+        PauseGenerationReqInput,
         UpdateWeightsFromTensorReqInput,
     )
     from sglang.srt.server_args import ServerArgs
-    from sglang.srt.utils import MultiprocessingSerializer
 
     return {
         "Engine": Engine,
         "ServerArgs": ServerArgs,
-        "MultiprocessingSerializer": MultiprocessingSerializer,
+        "ContinueGenerationReqInput": ContinueGenerationReqInput,
+        "PauseGenerationReqInput": PauseGenerationReqInput,
         "UpdateWeightsFromTensorReqInput": UpdateWeightsFromTensorReqInput,
-        "LoadLoRAAdapterFromTensorsReqInput": LoadLoRAAdapterFromTensorsReqInput,
     }
 
 
@@ -269,35 +269,16 @@ class NativeBackend:
         self._lt.run_control(self._aresume())
 
     async def _aabort(self, *, abort_all: bool = True, rid: Optional[str] = None) -> None:
-        """Abort in-flight generation (best-effort across sglang versions)."""
-        tm = getattr(self._engine, "tokenizer_manager", None)
-        fn = getattr(tm, "abort_request", None)
-        if fn is None:
-            logger.warning("sglang NativeBackend: tokenizer_manager.abort_request unavailable; abort is a no-op")
-            return
-        try:
-            res = fn(rid=rid, abort_all=abort_all) if rid is not None else fn(abort_all=abort_all)
-        except TypeError:
-            res = fn(rid) if rid is not None else fn()
-        if asyncio.iscoroutine(res):
-            await res
+        """Abort in-flight generation through the pinned tokenizer-manager API."""
+        self._engine.tokenizer_manager.abort_request(rid=rid or "", abort_all=abort_all)
 
     async def _apause(self) -> None:
-        """Pause generation admission if the runtime supports it (best-effort)."""
-        await self._call_optional("pause_generation")
+        """Pause generation admission through the pinned tokenizer-manager API."""
+        await self._engine.tokenizer_manager.pause_generation(self._rt["PauseGenerationReqInput"]())
 
     async def _aresume(self) -> None:
-        """Resume generation admission if the runtime supports it (best-effort)."""
-        await self._call_optional("continue_generation")
-
-    async def _call_optional(self, name: str) -> None:
-        tm = getattr(self._engine, "tokenizer_manager", None)
-        fn = getattr(tm, name, None) or getattr(self._engine, name, None)
-        if fn is None:
-            return
-        res = fn()
-        if asyncio.iscoroutine(res):
-            await res
+        """Resume generation admission through the pinned tokenizer-manager API."""
+        await self._engine.tokenizer_manager.continue_generation(self._rt["ContinueGenerationReqInput"]())
 
     @staticmethod
     def _check_result(result: Any, operation: str) -> None:
@@ -464,17 +445,15 @@ class NativeBackend:
         lora_tensors: Dict[str, Any],
         config_dict: Optional[dict] = None,
     ) -> None:
-        """Serialize the LoRA tensor bag and hot-load it on the Engine."""
+        """Hot-load a LoRA tensor bag through the public Engine API."""
         self._require_alive("set_lora")
-        serialized = self._rt["MultiprocessingSerializer"].serialize(lora_tensors, output_str=True)
-        obj = self._rt["LoadLoRAAdapterFromTensorsReqInput"](
-            lora_name=str(lora_name),
-            config_dict=dict(config_dict or {}),
-            serialized_tensors=serialized,
-        )
         engine = self._engine
         result = self._lt.run_parked(
-            lambda: engine.loop.run_until_complete(engine.tokenizer_manager.load_lora_adapter_from_tensors(obj, None))
+            lambda: engine.load_lora_adapter_from_tensors(
+                lora_name=str(lora_name),
+                tensors=lora_tensors,
+                config_dict=dict(config_dict or {}),
+            )
         )
         self._check_result(result, "set_lora")
 
