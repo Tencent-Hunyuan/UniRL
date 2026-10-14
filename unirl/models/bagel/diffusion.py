@@ -249,7 +249,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         differentiable: bool = False,
     ) -> Tuple[Any, Any, Any]:
         """Rebuild the three KV contexts from raw prompt and optional source image."""
-        if image is not None and getattr(self.model.model, "vit_model", None) is None:
+        if image is not None and not self.model.model.config.visual_und:
             raise ValueError(
                 "BagelDiffusionStage: the conditions carry an it2i source image but the bundle "
                 "was built without the und ViT; set BagelPipelineConfig.enable_vit=true."

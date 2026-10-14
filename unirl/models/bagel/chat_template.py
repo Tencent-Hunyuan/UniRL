@@ -33,6 +33,10 @@ class BagelChatTemplateStage:
 
     def _vit_split(self, image: Any) -> Dict[str, Any]:
         """One ViT-only image split (inferencer.py:249 preproc: rgb → vae resize → vit_transform)."""
+        if not self.bundle.model.config.visual_und:
+            raise ValueError(
+                "BagelChatTemplateStage: image splits require the und ViT; set BagelPipelineConfig.enable_vit=true."
+            )
         from .vendor.data.data_utils import pil_img2rgb
 
         resized = self.bundle.vae_transform.resize_transform(pil_img2rgb(image))
@@ -42,7 +46,7 @@ class BagelChatTemplateStage:
         """Context length of one split (image block = patches + start/end markers)."""
         if split["kind"] == "text":
             return int(split["ids"].numel())
-        patch = int(getattr(self.bundle.model, "vit_patch_size", 14))
+        patch = int(self.bundle.model.vit_patch_size)
         _, h, w = split["image"].shape
         return (h // patch) * (w // patch) + 2
 

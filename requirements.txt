@@ -24,7 +24,7 @@ hydra-core>=1.3
 # python-Levenshtein is kept below because it is ~45 KB and pure tooling.
 numpy>=1.24,<3
 omegaconf>=2.3
-peft>=0.14.0
+peft>=0.20
 Pillow>=10
 psutil>=5.9
 python-Levenshtein>=0.27

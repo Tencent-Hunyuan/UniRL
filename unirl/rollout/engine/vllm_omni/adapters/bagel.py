@@ -260,8 +260,7 @@ class BagelAdapter(ModelAdapter):
 
     def schedule_policy(self) -> FlowMatchSchedulePolicy:
         """Static-shift FlowMatch σ policy (BAGEL uses no dynamic shifting)."""
-        shift = float(getattr(self.model_config, "shift", 3.0))
-        return FlowMatchSchedulePolicy.static_only(shift)
+        return FlowMatchSchedulePolicy.static_only(float(self.model_config.shift))
 
     def validate_request(self, sample: Sample) -> None:
         has_image = sample.has_image_input()

@@ -45,7 +45,6 @@ class RLBagelPipeline(BagelPipeline):
         self._noise_tap_installed = False
         self._generate_image_tap_installed = False
         self._rope_fp32_patched = False
-        self._rmsnorm_fp32_patched = False
         self._pending_initial_noise: Optional[torch.Tensor] = None
         self._pending_spp: int = 1
         self._pending_batched_latents: Optional[list] = None
@@ -65,13 +64,7 @@ class RLBagelPipeline(BagelPipeline):
         """Force the rotary cos/sin to fp32 to bit-match trainside — the worker rotary runs under unguarded autocast."""
         if self._rope_fp32_patched:
             return
-        try:
-            rotary = self.bagel.language_model.model.rotary_emb
-        except AttributeError:
-            # Topology changed (e.g. und-only build); skip rather than crash.
-            self._rope_fp32_patched = True
-            return
-
+        rotary = self.bagel.language_model.model.rotary_emb
         if getattr(rotary, "_unirl_fp32_forward", False):
             self._rope_fp32_patched = True
             return
@@ -99,41 +92,6 @@ class RLBagelPipeline(BagelPipeline):
         rotary._unirl_orig_forward = orig_forward  # type: ignore[attr-defined]
         logger.warning("[PATCH-INSTALLED] rope_fp32 modules=1 (rotary_emb)")
         self._rope_fp32_patched = True
-
-    def _install_rmsnorm_fp32(self) -> None:
-        """Make every worker RMSNorm bit-match trainside ``Qwen2RMSNorm`` — vLLM rounds the fp32 q/k-norm to bf16."""
-        if self._rmsnorm_fp32_patched:
-            return
-        try:
-            from vllm.model_executor.layers.layernorm import RMSNorm as _VllmRMSNorm
-        except Exception:
-            self._rmsnorm_fp32_patched = True
-            return
-
-        def _make_fp32_forward(module: Any):
-            eps = float(getattr(module, "variance_epsilon", getattr(module, "eps", 1e-6)))
-            orig = module.forward
-
-            def fp32_forward(x: torch.Tensor, residual: Optional[torch.Tensor] = None):
-                if residual is not None:
-                    return orig(x, residual)
-                input_dtype = x.dtype
-                h = x.to(torch.float32)
-                variance = h.pow(2).mean(-1, keepdim=True)
-                h = h * torch.rsqrt(variance + eps)
-                return module.weight * h.to(input_dtype)
-
-            return fp32_forward
-
-        patched = 0
-        for module in self.bagel.modules():
-            if isinstance(module, _VllmRMSNorm) and not getattr(module, "_unirl_fp32_rmsnorm", False):
-                module._unirl_orig_forward = module.forward  # type: ignore[attr-defined]
-                module.forward = _make_fp32_forward(module)  # type: ignore[assignment]
-                module._unirl_fp32_rmsnorm = True  # type: ignore[attr-defined]
-                patched += 1
-        logger.warning("[PATCH-INSTALLED] rmsnorm_fp32 modules=%d", patched)
-        self._rmsnorm_fp32_patched = True
 
     def _install_noise_tap(self) -> None:
         """Wrap ``bagel.prepare_vae_latent`` to swap the driver-authored x_T in for upstream's RNG-drawn noises."""
@@ -307,8 +265,8 @@ class RLBagelPipeline(BagelPipeline):
     def _arm_sde(self, req: OmniDiffusionRequest, image_token_sizes: Optional[list] = None) -> None:
         """This request's SDE strength + sparse step gate + σ_max + storage dtype."""
         sp = req.sampling_params
-        eta = float(getattr(sp, "eta", 0.0) or 0.0)
-        extra = getattr(sp, "extra_args", None) or {}
+        eta = float(sp.eta)
+        extra = sp.extra_args
         traj_dtype_name = extra.get("trajectory_precision")
         traj_dtype = (
             parse_torch_dtype(traj_dtype_name, field_name="trajectory_precision")
@@ -341,7 +299,7 @@ class RLBagelPipeline(BagelPipeline):
                 return False
             if (fp.get("multi_modal_data") or {}).get("image") is not None:
                 return False
-        extra = getattr(req.sampling_params, "extra_args", None) or {}
+        extra = req.sampling_params.extra_args
         if "cfg_text_scale" not in extra or "cfg_img_scale" not in extra:
             return False
         return extra["cfg_text_scale"] <= 1.0 and extra["cfg_img_scale"] <= 1.0
@@ -352,9 +310,8 @@ class RLBagelPipeline(BagelPipeline):
         self._install_sde_scheduler()
         self._install_noise_tap()
         self._install_rope_fp32()
-        self._install_rmsnorm_fp32()
 
-        spp = getattr(one.sampling_params, "num_outputs_per_prompt", 1)
+        spp = one.sampling_params.num_outputs_per_prompt
         if spp > 1:
             if not self._is_batchable_t2i(one):
                 raise RuntimeError(

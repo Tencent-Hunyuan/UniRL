@@ -24,6 +24,7 @@ from . import rl_ops
 from .ar import BagelARStage
 from .chat_template import BagelChatTemplateStage
 from .conditions import BagelARConditions, BagelDiffusionConditions
+from .config import BagelPipelineConfig
 from .diffusion import BagelDiffusionParams, BagelDiffusionStage, stack_latent_segments
 from .vae import BagelVAEDecodeStage, BagelVAEEncodeStage, bagel_latent_shape
 
@@ -38,11 +39,8 @@ def _cfg_get(cfg: Any, key: str, default: Any) -> Any:
     if cfg is None:
         return default
     if hasattr(cfg, "get"):
-        try:
-            val = cfg.get(key, default)
-            return default if val is None else val
-        except Exception:
-            return default
+        val = cfg.get(key, default)
+        return default if val is None else val
     return getattr(cfg, key, default)
 
 
@@ -95,13 +93,10 @@ class BagelPipeline(Pipeline):
         )
         self.autocast_precision = autocast_precision
         self.shift = shift
-        cache_config = getattr(bundle, "config", None)
-        cache_t2i_contexts = (
-            _cfg_get(cache_config, "cache_t2i_contexts", True) if cache_t2i_contexts is None else cache_t2i_contexts
-        )
-        context_cache_size = (
-            _cfg_get(cache_config, "context_cache_size", 32) if context_cache_size is None else context_cache_size
-        )
+        if cache_t2i_contexts is None:
+            cache_t2i_contexts = bundle.config.cache_t2i_contexts
+        if context_cache_size is None:
+            context_cache_size = bundle.config.context_cache_size
         self._cache_t2i_contexts = bool(cache_t2i_contexts)
         self._context_cache_size = max(1, int(context_cache_size))
         self._t2i_context_cache: "OrderedDict[str, Tuple[Any, Any, Any]]" = OrderedDict()
@@ -111,9 +106,9 @@ class BagelPipeline(Pipeline):
     def latent_shape(cls, *, model_config: Any, sampling_spec: Any) -> Tuple[int, ...]:
         """Packed per-sample x_T shape ``(seq, p²·z)`` for the driver NoiseRecipe."""
         cfg = _cfg_get(model_config, "config", model_config)
-        patch = int(_cfg_get(cfg, "latent_patch_size", 2))
-        vae_ds = int(_cfg_get(cfg, "vae_downsample", 8))
-        z = int(_cfg_get(cfg, "latent_channels", 16))
+        patch = int(_cfg_get(cfg, "latent_patch_size", BagelPipelineConfig.latent_patch_size))
+        vae_ds = int(_cfg_get(cfg, "vae_downsample", BagelPipelineConfig.vae_downsample))
+        z = int(_cfg_get(cfg, "latent_channels", BagelPipelineConfig.latent_channels))
         H, W = int(sampling_spec.height), int(sampling_spec.width)
         return bagel_latent_shape((H, W), latent_downsample=vae_ds * patch, latent_patch_size=patch, latent_channels=z)
 
@@ -149,7 +144,7 @@ class BagelPipeline(Pipeline):
             raise TypeError(
                 f"BagelPipeline.generate ({task}): expected an Images input in sample.conditioning(), found none"
             )
-        if getattr(self.bundle.model, "vit_model", None) is None:
+        if not self.bundle.model.config.visual_und:
             raise ValueError(
                 f"BagelPipeline.generate ({task}): the bundle was built without the und ViT; "
                 "set BagelPipelineConfig.enable_vit=true for image-input tasks."
@@ -185,12 +180,9 @@ class BagelPipeline(Pipeline):
         if not self._cache_t2i_contexts:
             return False
         if self._und_frozen is None:
-            try:
-                und_trainable = [
-                    n for n, p in self.bundle.transformer.named_parameters() if p.requires_grad and "moe_gen" not in n
-                ]
-            except Exception:  # pragma: no cover - be conservative if not introspectable
-                und_trainable = ["<introspection-failed>"]
+            und_trainable = [
+                n for n, p in self.bundle.transformer.named_parameters() if p.requires_grad and "moe_gen" not in n
+            ]
             self._und_frozen = not und_trainable
             if not self._und_frozen:
                 logger.warning(

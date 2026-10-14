@@ -61,10 +61,7 @@ def _get_create_block_mask() -> Callable[..., Any]:
 
 def disable_inference_cache(model: Any) -> None:
     """Turn off the TaylorSeer cache for the RL path (per-step determinism)."""
-    try:
-        model.language_model.model.enable_taylorseer = False
-    except AttributeError:
-        pass
+    model.language_model.model.enable_taylorseer = False
 
 
 def _raw(fn: Callable) -> Callable:
@@ -88,8 +85,7 @@ def forward_flow(model: Any, **kwargs: Any) -> Any:
 
 def require_inference_dispatch(model: Any) -> None:
     """Raise unless the MoT is in eval() mode (the navit forward-dispatch contract)."""
-    lm = getattr(model, "language_model", None)
-    if lm is not None and getattr(lm, "training", False):
+    if model.language_model.training:
         raise RuntimeError(
             "bagel.rl_ops: the MoT is in train() mode; the navit forward dispatches on "
             "self.training, so AR rollout/replay must run in eval() (with grads enabled "
@@ -176,11 +172,8 @@ def resize_input_image(bundle: Any, image: Any) -> Any:
 
 def _encode_vae_posterior_mean(vae: Any, x: torch.Tensor) -> torch.Tensor:
     """Encode with the deterministic posterior mean, never a Gaussian draw."""
-    reg = getattr(vae, "reg", None)
-    if reg is None or not hasattr(reg, "chunk_dim"):
-        raise RuntimeError("BAGEL VAE has no compatible diagonal-Gaussian regulator.")
     encoded = vae.encoder(x)
-    mean, _ = torch.chunk(encoded, 2, dim=int(reg.chunk_dim))
+    mean, _ = torch.chunk(encoded, 2, dim=int(vae.reg.chunk_dim))
     return vae.scale_factor * (mean - vae.shift_factor)
 
 
