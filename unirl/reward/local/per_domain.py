@@ -35,14 +35,13 @@ def _select_request(request: RewardRequest, indices: List[int]) -> RewardRequest
         return None if x is None else [x[i] for i in indices]
 
     return RewardRequest(
-        primitives={k: _select_rows(v, idx) for k, v in request.primitives.items()},
         generated={k: _select_rows(v, idx) for k, v in request.generated.items()},
+        conditioning={k: _select_rows(v, idx) for k, v in request.conditioning.items()},
+        original_prompt=_select_rows(request.original_prompt, idx),
+        generation_prompt=_select_rows(request.generation_prompt, idx),
         metadata=_pick(request.metadata),
-        prompt_ids=_pick(request.prompt_ids),
         sample_ids=_pick(request.sample_ids),
         group_ids=_pick(request.group_ids),
-        reward_types=list(request.reward_types),
-        return_components=request.return_components,
         audio_sample_rate=request.audio_sample_rate,
     )
 

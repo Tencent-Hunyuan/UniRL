@@ -182,8 +182,8 @@ class DiffusionSamplingParams(BaseSamplingParams):
             f"{cls}.sampler_kwargs cannot contain reserved keys {sorted(shadowed)}; set them as fields instead",
         )
 
-    def resolve_sde_indices(self, rollout_id: int) -> List[int]:
-        """Resolve which denoising steps record SDE log-probs for ``rollout_id``."""
+    def get_sde_indices(self, rollout_id: int) -> List[int]:
+        """SDE steps for ``rollout_id``: a preset list, else ``scheduler.get_sde_indices``, else every step."""
         if self.sde_indices is not None:
             return [int(i) for i in self.sde_indices]
         scheduler: Optional[TimestepScheduler] = self.scheduler

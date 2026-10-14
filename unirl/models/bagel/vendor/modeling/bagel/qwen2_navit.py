@@ -17,7 +17,7 @@ from typing import List, Optional, Tuple
 import torch
 from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
-from torch.nn.attention.flex_attention import flex_attention
+from torch.nn.attention.flex_attention import BlockMask, flex_attention
 from torch.nn.functional import scaled_dot_product_attention
 from transformers.utils import ModelOutput
 
@@ -268,7 +268,7 @@ class PackedAttention(Qwen2Attention):
             packed_query_states, packed_key_states, packed_cos, packed_sin, unsqueeze_dim=1
         )
 
-        if isinstance(attention_mask, List):
+        if isinstance(attention_mask, list):
             packed_key_states = packed_key_states[:, :, None, :].repeat(1, 1, self.num_key_value_groups, 1)
             packed_key_states = packed_key_states.reshape(-1, self.num_heads, self.head_dim)
             packed_value_states = packed_value_states[:, :, None, :].repeat(1, 1, self.num_key_value_groups, 1)
@@ -290,7 +290,7 @@ class PackedAttention(Qwen2Attention):
                     )
                 upacked_attn_output.append(attn_output.squeeze(0))
             packed_attn_output = torch.cat(upacked_attn_output, dim=1)
-        else:
+        elif isinstance(attention_mask, BlockMask):
             pad_size = sum(sample_lens) - packed_query_states.shape[0]
             packed_query_states = pad_sequence(packed_query_states.permute(1, 0, 2), pad_size)
             packed_key_states = pad_sequence(packed_key_states.permute(1, 0, 2), pad_size)
@@ -304,6 +304,11 @@ class PackedAttention(Qwen2Attention):
             )
             end_index = packed_attn_output.shape[2] - pad_size
             packed_attn_output = packed_attn_output[0, :, :end_index, :]
+        else:
+            raise TypeError(
+                f"PackedAttention.forward_train: attention_mask must be list or BlockMask; "
+                f"got {type(attention_mask).__name__}."
+            )
 
         packed_attn_output = packed_attn_output.transpose(0, 1).reshape(-1, self.hidden_size)
         packed_attn_output = self.o_proj(packed_attn_output)
@@ -452,7 +457,7 @@ class PackedAttentionMoT(Qwen2Attention):
             packed_query_states_, packed_key_states_, packed_cos, packed_sin, unsqueeze_dim=1
         )
 
-        if isinstance(attention_mask, List):
+        if isinstance(attention_mask, list):
             packed_key_states_ = packed_key_states_[:, :, None, :].repeat(1, 1, self.num_key_value_groups, 1)
             packed_key_states_ = packed_key_states_.reshape(-1, self.num_heads, self.head_dim)
             packed_value_states = packed_value_states[:, :, None, :].repeat(1, 1, self.num_key_value_groups, 1)
@@ -474,7 +479,7 @@ class PackedAttentionMoT(Qwen2Attention):
                     )
                 upacked_attn_output.append(attn_output.squeeze(0))
             packed_attn_output = torch.cat(upacked_attn_output, dim=1)
-        else:
+        elif isinstance(attention_mask, BlockMask):
             pad_size = sum(sample_lens) - packed_query_states.shape[0]
             packed_query_states_ = pad_sequence(packed_query_states_.permute(1, 0, 2), pad_size)
             packed_key_states_ = pad_sequence(packed_key_states_.permute(1, 0, 2), pad_size)
@@ -488,6 +493,11 @@ class PackedAttentionMoT(Qwen2Attention):
             )
             end_index = packed_attn_output.shape[2] - pad_size
             packed_attn_output = packed_attn_output[0, :, :end_index, :]
+        else:
+            raise TypeError(
+                f"PackedAttentionMoT.forward_train: attention_mask must be list or BlockMask; "
+                f"got {type(attention_mask).__name__}."
+            )
 
         packed_attn_output = packed_attn_output.transpose(0, 1).reshape(-1, self.num_heads * self.head_dim)
         packed_attn_output_ = packed_attn_output.new_zeros(packed_attn_output.shape)

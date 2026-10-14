@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional
 import torch
 from PIL import Image
 
-from unirl.reward.base import BaseRewardComponentSpec
+from unirl.reward.base import PromptRewardComponentSpec
 from unirl.reward.local.device import resolve_device
 from unirl.types.reward import RewardRequest
 
@@ -114,6 +114,7 @@ class GenEval2RewardScorer(LocalRewardBackend):
         super().__init__(
             device=resolve_device(config.device, base_device),
             batch_size=config.batch_size,
+            prompt_source=config.prompt_source,
         )
 
     def _load_model(self) -> None:
@@ -204,7 +205,7 @@ class GenEval2RewardScorer(LocalRewardBackend):
 
     def _compute_model_rewards(self, request: RewardRequest) -> List[float]:
         images = request.images
-        prompts = request.prompts
+        prompts = self.prompts(request)
         if images is None:
             raise ValueError("GenEval2RewardScorer requires generated images in RewardRequest.generated['image']")
         if len(images) != len(prompts):
@@ -234,7 +235,7 @@ class GenEval2RewardScorer(LocalRewardBackend):
 
 
 @dataclass
-class GenEval2Spec(BaseRewardComponentSpec):
+class GenEval2Spec(PromptRewardComponentSpec):
     """Typed config for the GenEval2 Soft-TIFA reward component."""
 
     batch_size: int = 1

@@ -189,11 +189,9 @@ def decoded_text_from_ar(per_request: Sequence[Sequence[Any]]) -> Texts:
         ar = pick_stage_output(outputs, final_output_type="text", stage_id=0)
         text_str = ""
         if ar is not None:
-            ro = getattr(ar, "request_output", None)
-            if ro is not None:
-                completions = getattr(ro, "outputs", None) or []
-                if completions:
-                    text_str = getattr(completions[0], "text", "") or ""
+            completions = getattr(ar, "outputs", None) or []
+            if completions:
+                text_str = getattr(completions[0], "text", "") or ""
         texts.append(Text(text=text_str))
     return Texts.from_list(texts)
 
@@ -229,10 +227,7 @@ def _flatten_logprobs(logprobs: Any, fallback_len: int) -> Optional[torch.Tensor
 
 def _extract_completion(out: Any) -> Tuple[List[int], Optional[torch.Tensor]]:
     """Pull ``(token_ids, per_token_logp)`` out of a Stage-0 result."""
-    request_output = getattr(out, "request_output", None)
-    if request_output is None:
-        return [], None
-    completions = getattr(request_output, "outputs", None) or []
+    completions = getattr(out, "outputs", None) or []
     if not completions:
         return [], None
     completion = completions[0]

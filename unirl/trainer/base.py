@@ -302,6 +302,9 @@ class BaseTrainer:
             if self.wandb_logger is not None:
                 self.wandb_logger.finish()
 
+    def _prepare_for_save(self) -> None:
+        """Make whatever ``backend.save`` reads reachable. Default no-op."""
+
     def maybe_save_checkpoint(
         self,
         rollout_id: int,
@@ -317,6 +320,7 @@ class BaseTrainer:
         step = rollout_id + 1
         if step % save_interval != 0 and step < num_rollouts:
             return
+        self._prepare_for_save()
         base_dir = os.path.abspath(save_dir) if save_dir else os.path.join(os.getcwd(), "checkpoints")
         path = os.path.join(base_dir, f"checkpoint-{step}")
         logger.info("Saving checkpoint at rollout %d/%d -> %s", step, num_rollouts, path)

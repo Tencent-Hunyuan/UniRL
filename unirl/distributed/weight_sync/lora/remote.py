@@ -33,7 +33,6 @@ class RemoteLoraWeightSync(LoraWeightSyncBase):
         )
         self._copy = bool(copy)
         self._targets: List[tuple] = []
-        self._cached = None
 
     @distributed(dispatch_mode=Dispatch.BROADCAST, execute_mode=Execute.RANK_ZERO)
     def set_rollout_targets(self, targets: List[tuple]) -> None:
@@ -64,7 +63,7 @@ class RemoteLoraWeightSync(LoraWeightSyncBase):
             self._cached = (lora_tensors, peft_config)
 
     def _push_from_cache(self) -> None:
-        """Rank 0 ships the cached adapter to the targets, then clears the cache."""
+        """Rank 0 ships the cached adapter to the targets, keeping the cache for reuse."""
         rank = self.rank_info.rank if self.rank_info is not None else 0
         if rank != 0:
             return
@@ -72,8 +71,11 @@ class RemoteLoraWeightSync(LoraWeightSyncBase):
             raise RuntimeError("RemoteLoraWeightSync.push: call extract() (or sync()) first")
         if not self._targets:
             raise RuntimeError("RemoteLoraWeightSync.push: call set_rollout_targets() first")
+        # Held past the push, like LocalLoraWeightSync: the adapter only changes
+        # when the optimizer steps, so a caller that pushes again before the next
+        # step reuses it rather than reading a parked trainer. The trainer tracks
+        # that with one flag for both implementations, so they have to agree.
         lora_tensors, peft_config = self._cached
-        self._cached = None
 
         import ray
 
@@ -100,7 +102,7 @@ class RemoteLoraWeightSync(LoraWeightSyncBase):
         import ray
 
         from unirl.distributed.weight_sync.transfer.ipc_dispatch import (
-            DIFFRL_LORA_INT_ID,
+            UNIRL_LORA_INT_ID,
         )
 
         exp_a, exp_b = self._expected_checksums(lora_tensors, peft_config)
@@ -108,7 +110,7 @@ class RemoteLoraWeightSync(LoraWeightSyncBase):
             (
                 role,
                 worker.call.remote(role, "tp_per_stage", (), {}),
-                worker.call.remote(role, "loaded_lora_checksums", (), {"adapter_id": int(DIFFRL_LORA_INT_ID)}),
+                worker.call.remote(role, "loaded_lora_checksums", (), {"adapter_id": UNIRL_LORA_INT_ID}),
             )
             for role, workers in self._targets
             for worker in workers

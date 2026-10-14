@@ -84,7 +84,7 @@ def hi3_fused_conditions(diff_outputs: List[OmniRawResult], *, modality: str) ->
             "Check that RLHunyuanImage3Pipeline.prepare_inputs_for_generation "
             "hook ran in every DiT worker — the subclass swap may not have "
             "taken effect (verify custom_pipeline_args.pipeline_class in "
-            "the stage YAML)."
+            "the deploy config)."
         )
 
     sequence_lengths = [int(c["input_ids"].shape[-1]) for c in captures]
@@ -512,7 +512,7 @@ class Hi3DitRecaptionOutputAdapter(DitOutputAdapter):
 class Hi3T2iAdapter(ModelAdapter):
     """HI3 text → AR think → DiT image."""
 
-    stage_yaml = "hunyuan_image3_t2i_rl.yaml"
+    deploy_config = "hunyuan_image3_t2i_rl.yaml"
     omni_mode = "text-to-image"
     ar_lora_passthrough = True
     clear_cuda_visible = True
@@ -548,7 +548,7 @@ class Hi3T2iAdapter(ModelAdapter):
 class Hi3It2iAdapter(ModelAdapter):
     """HI3 image+text → AR recaption → DiT edited image."""
 
-    stage_yaml = "hunyuan_image3_it2i_rl.yaml"
+    deploy_config = "hunyuan_image3_it2i_rl.yaml"
     omni_mode = "text-to-image"
     ar_lora_passthrough = True
     clear_cuda_visible = True
@@ -582,9 +582,9 @@ class Hi3It2iAdapter(ModelAdapter):
 
 @register_adapter("hi3_i2t")
 class Hi3I2tAdapter(ModelAdapter):
-    """HI3 image+text → AR text (vendored comprehension YAML)."""
+    """HI3 image+text → AR text."""
 
-    stage_yaml = "hunyuan_image3_i2t.yaml"
+    deploy_config = "hunyuan_image3_i2t_rl.yaml"
     needs_sigmas = False
     ar_lora_passthrough = True
     clear_cuda_visible = True
@@ -617,9 +617,9 @@ class Hi3I2tAdapter(ModelAdapter):
 
 @register_adapter("hi3_t2t")
 class Hi3T2tAdapter(ModelAdapter):
-    """HI3 text → AR text (vendored comprehension YAML)."""
+    """HI3 text → AR text."""
 
-    stage_yaml = "hunyuan_image3_t2t.yaml"
+    deploy_config = "hunyuan_image3_ar_rl.yaml"
     needs_sigmas = False
     ar_lora_passthrough = True
     clear_cuda_visible = True
@@ -652,7 +652,7 @@ class Hi3T2tAdapter(ModelAdapter):
 class Hi3ArRecaptionAdapter(ModelAdapter):
     """Two-engine trainer's AR think/recaption producer."""
 
-    stage_yaml = "hunyuan_image3_ar_recaption_rl.yaml"
+    deploy_config = "hunyuan_image3_ar_recaption_rl.yaml"
     needs_sigmas = False
     ar_lora_passthrough = True
     clear_cuda_visible = True
@@ -681,7 +681,7 @@ class Hi3ArRecaptionAdapter(ModelAdapter):
 class Hi3DitRecaptionAdapter(ModelAdapter):
     """Standalone HI3 DiT — the two-engine trainer's image half."""
 
-    stage_yaml = "hunyuan_image3_dit_recaption_rl.yaml"
+    deploy_config = "hunyuan_image3_dit_recaption_rl.yaml"
     omni_mode = "text-to-image"
     clear_cuda_visible = True
     # HI3 two-engine stages are TP>1 — wake-time LoRA re-push must use the byte-copy transport.

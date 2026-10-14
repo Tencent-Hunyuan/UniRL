@@ -11,7 +11,6 @@ import torch.nn as nn
 from unirl.models.types.bundle import Bundle
 from unirl.utils.dtypes import parse_torch_dtype
 
-from ._transformers_compat import install_transformers_flash_attention_compat
 from .config import Qwen3OmniPipelineConfig
 
 logger = logging.getLogger(__name__)
@@ -41,9 +40,6 @@ class Qwen3OmniBundle(Bundle):
     @classmethod
     def from_config(cls, config: Qwen3OmniPipelineConfig) -> "Qwen3OmniBundle":
         from transformers import AutoConfig, AutoProcessor
-
-        install_transformers_flash_attention_compat()
-
         from transformers.models.qwen3_omni_moe import Qwen3OmniMoeThinkerForConditionalGeneration
 
         path = config.pretrained_model_ckpt_path

@@ -153,8 +153,8 @@ class SenseNovaU1Bundle(Bundle):
         """Load a local or Hub-format SenseNova-U1 checkpoint."""
         import fcntl
 
-        serialize = os.environ.get("DIFFRL_MODEL_LOAD_SERIALIZE", "1") != "0"
-        lock_file = open("/tmp/diffrl_model_load.lock", "a+") if serialize else None
+        serialize = os.environ.get("UNIRL_MODEL_LOAD_SERIALIZE", "1") != "0"
+        lock_file = open("/tmp/unirl_model_load.lock", "a+") if serialize else None
         if lock_file is not None:
             fcntl.flock(lock_file, fcntl.LOCK_EX)
         try:

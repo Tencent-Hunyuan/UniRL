@@ -8,7 +8,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from dataclasses import field as dc_field
 from types import MethodType
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -248,10 +248,12 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
         model: Qwen3Bundle,
         autocast_precision: str = "bf16",
         logprob_precision: str = "fp32",
+        replay_kernel_options: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.model = model
         self.autocast_dtype = parse_torch_dtype(autocast_precision, field_name="Qwen3ARStage.autocast_precision")
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="Qwen3ARStage.logprob_precision")
+        self.replay_kernel_options = replay_kernel_options
         transformer = model.transformer
         if getattr(transformer.forward, "__func__", None) is not _replay_aware_forward:
             transformer.forward = MethodType(_replay_aware_forward, transformer)
@@ -436,6 +438,7 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
             position_ids=packed_pos,
             response_tokens=flat_resp,
             packed_predict_index=predict_index,
+            kernel_options=self.replay_kernel_options,
             prompt_len=0,
             temperature=temperature,
             return_values=return_values,
@@ -521,6 +524,7 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
             attention_mask=full_mask,
             position_ids=position_ids,
             response_tokens=response_tokens,
+            kernel_options=self.replay_kernel_options,
             prompt_len=prompt_len,
             temperature=temperature,
             return_values=return_values,

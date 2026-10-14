@@ -3,11 +3,8 @@
 from __future__ import annotations
 
 import dataclasses
-import logging
 import threading
 from dataclasses import field
-
-logger = logging.getLogger(__name__)
 
 _local = threading.local()
 
@@ -25,6 +22,7 @@ _SP_INJECT_FIELDS = {
 
 _SP_INIT_SENTINEL = "_unirl_sampling_io_init"
 _PREP_SENTINEL = "_unirl_sampling_io_prepare"
+_EXPAND_SENTINEL = "_unirl_sampling_io_expand"
 _VALIDATE_SENTINEL = "_unirl_sampling_io_validate"
 _REQ_FIELD = "denoise_seeds"
 
@@ -43,7 +41,8 @@ def patch_sampling_io() -> None:
 
     _install_req_denoise_seeds(sb_mod)
 
-    _wrap_prepare_request(utils_mod, SamplingParams)
+    _wrap_prepare_request(utils_mod)
+    _wrap_expand_request_outputs(utils_mod)
 
     _install_json_safe_tensor_guard(sp_mod)
 
@@ -61,8 +60,8 @@ def _install_json_safe_tensor_guard(sp_mod) -> None:
     """Make ``sampling_params._json_safe`` tolerate ``torch.Tensor`` values."""
     import torch
 
-    orig = getattr(sp_mod, "_json_safe", None)
-    if orig is None or getattr(orig, "_unirl_tensor_safe", False):
+    orig = sp_mod._json_safe
+    if getattr(orig, "_unirl_tensor_safe", False):
         return
 
     def _json_safe(obj):
@@ -87,7 +86,7 @@ def _wrap_validate_with_pipeline_config(SamplingParams) -> None:
     """AROUND-wrap ``_validate_with_pipeline_config`` so ``condition_image`` satisfies the I2I ``image_path`` need."""
     orig = SamplingParams.__dict__.get("_validate_with_pipeline_config")
     if orig is None:
-        return  # pragma: no cover - upstream method missing
+        raise AttributeError("SamplingParams._validate_with_pipeline_config missing upstream")
     if getattr(orig, _VALIDATE_SENTINEL, False):
         return
 
@@ -110,16 +109,13 @@ _GEN_SENTINEL = "_unirl_diff_gen_index"
 
 def _wrap_diff_generator_generate() -> None:
     """AROUND-wrap ``DiffGenerator.generate`` to index ``condition_image`` per prompt."""
-    try:
-        from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import (
-            DiffGenerator,
-        )
-    except Exception:  # pragma: no cover - environment dependent
-        return
+    from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import (
+        DiffGenerator,
+    )
 
     orig = DiffGenerator.__dict__.get("generate")
     if orig is None:
-        return
+        raise AttributeError("DiffGenerator.generate missing upstream")
     if getattr(orig, _GEN_SENTINEL, False):
         return
 
@@ -147,17 +143,16 @@ _IVL_SENTINEL = "_unirl_ivl_cond_img"
 
 def _wrap_input_validation_condition_image() -> None:
     """AROUND-wrap ``InputValidationStage.forward`` to preprocess ``condition_image`` when ``image_path`` is None."""
-    try:
-        import sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation as ivl_mod
-    except ImportError:
-        return  # pragma: no cover - upstream module missing
+    import sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation as ivl_mod
 
     IVL = getattr(ivl_mod, "InputValidationStage", None)
     if IVL is None:
-        return  # pragma: no cover
+        raise AttributeError("InputValidationStage missing upstream")
 
     orig_forward = IVL.__dict__.get("forward")
-    if orig_forward is None or getattr(orig_forward, _IVL_SENTINEL, False):
+    if orig_forward is None:
+        raise AttributeError("InputValidationStage.forward missing upstream")
+    if getattr(orig_forward, _IVL_SENTINEL, False):
         return
 
     def forward(self, batch, server_args, __orig=orig_forward):
@@ -209,13 +204,13 @@ def _iter_subclasses(cls):
 
 
 def _install_sampling_params_fields(SamplingParams) -> None:
-    """Register the four fields on SamplingParams and every live subclass."""
+    """Register UniRL fields on SamplingParams and every live subclass."""
     for cls in _iter_subclasses(SamplingParams):
         _register_and_wrap_init(cls)
 
 
 def _register_and_wrap_init(cls) -> None:
-    """Add the four fields to ``cls`` and wrap its ``__init__`` to accept them."""
+    """Add UniRL fields to ``cls`` and wrap its ``__init__`` to accept them."""
     own_fields = cls.__dict__.get("__dataclass_fields__")
     if own_fields is None:
         own_fields = dict(getattr(cls, "__dataclass_fields__", {}))
@@ -264,19 +259,19 @@ def _install_req_denoise_seeds(sb_mod) -> None:
     """Add ``denoise_seeds`` as a first-class field on upstream ``Req``."""
     Req = sb_mod.Req
     own_fields = Req.__dict__.get("__dataclass_fields__")
-    if own_fields is None:  # pragma: no cover - Req is a dataclass, always present
-        own_fields = dict(getattr(Req, "__dataclass_fields__", {}))
-        Req.__dataclass_fields__ = own_fields
+    if own_fields is None:
+        raise TypeError("sglang schedule_batch.Req must be a dataclass")
     if _REQ_FIELD not in own_fields:
         own_fields[_REQ_FIELD] = _make_dataclass_field(_REQ_FIELD, None, "list[str] | None")
 
-    spf = getattr(sb_mod, "SAMPLING_PARAMS_FIELDS", None)
-    if isinstance(spf, set):
-        spf.update(_SP_INJECT_FIELDS)
+    spf = sb_mod.SAMPLING_PARAMS_FIELDS
+    if not isinstance(spf, set):
+        raise TypeError("sglang schedule_batch.SAMPLING_PARAMS_FIELDS must be a set")
+    spf.update(_SP_INJECT_FIELDS)
 
 
-def _wrap_prepare_request(utils_mod, SamplingParams) -> None:
-    """AROUND-wrap ``prepare_request`` to copy the four IO fields onto the Req."""
+def _wrap_prepare_request(utils_mod) -> None:
+    """AROUND-wrap ``prepare_request`` to lower driver-only IO onto the Req."""
     orig = utils_mod.prepare_request
     if getattr(orig, _PREP_SENTINEL, False):
         return
@@ -306,10 +301,6 @@ def _wrap_prepare_request(utils_mod, SamplingParams) -> None:
         if denoise_seeds is not None:
             req.denoise_seeds = denoise_seeds
 
-        max_sequence_length = getattr(sampling_params, "max_sequence_length", None)
-        if max_sequence_length is not None:
-            req.max_sequence_length = int(max_sequence_length)
-
         condition_image = getattr(sampling_params, "condition_image", None)
         if condition_image is not None:
             stash = getattr(_local, "condition_image_per_prompt", None)
@@ -329,13 +320,136 @@ def _wrap_prepare_request(utils_mod, SamplingParams) -> None:
 
     setattr(prepare_request, _PREP_SENTINEL, True)
     utils_mod.prepare_request = prepare_request
+    _rebind_imported_aliases("prepare_request", orig, prepare_request)
 
-    # Rebind imported prepare_request aliases; patching the source module alone is ineffective.
+
+def _partition_prompt_tensor(value, *, prompt_index: int, num_prompts: int, num_outputs: int, field: str):
+    """Select one prompt's driver tensor before upstream expands its outputs."""
+    import torch
+
+    if value is None:
+        return None
+    if not torch.is_tensor(value) or value.dim() < 1:
+        raise TypeError(f"{field} must be a tensor with a batch dimension")
+    count = int(value.shape[0])
+    total = num_prompts * num_outputs
+    if count == 1:
+        return value
+    if count == total:
+        start = prompt_index * num_outputs
+        return value[start : start + num_outputs]
+    if count == num_prompts:
+        return value[prompt_index : prompt_index + 1]
+    raise ValueError(f"{field} batch dim {count} must be 1, num_prompts={num_prompts}, or total_outputs={total}")
+
+
+def _partition_prompt_seeds(value, *, prompt_index: int, num_prompts: int, num_outputs: int):
+    """Select one prompt's per-output denoising seeds."""
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)):
+        raise TypeError("denoise_seeds must be a list or tuple")
+    total = num_prompts * num_outputs
+    if len(value) != total:
+        raise ValueError(f"denoise_seeds length {len(value)} must equal total_outputs={total}")
+    start = prompt_index * num_outputs
+    return list(value[start : start + num_outputs])
+
+
+def _slice_output_tensor(value, *, output_index: int, num_outputs: int, field: str):
+    """Select one expanded output's driver tensor while preserving batch dim."""
+    import torch
+
+    if value is None:
+        return None
+    if not torch.is_tensor(value) or value.dim() < 1:
+        raise TypeError(f"{field} must be a tensor with a batch dimension")
+    if int(value.shape[0]) == 1:
+        return value
+    if int(value.shape[0]) != num_outputs:
+        raise ValueError(
+            f"{field} prompt batch dim {int(value.shape[0])} must be 1 or num_outputs_per_prompt={num_outputs}"
+        )
+    return value[output_index : output_index + 1]
+
+
+def _wrap_expand_request_outputs(utils_mod) -> None:
+    """Partition driver-owned payloads by prompt, then by expanded output."""
+    orig = utils_mod.expand_request_outputs
+    if getattr(orig, _EXPAND_SENTINEL, False):
+        return
+
+    def expand_request_outputs(req, *, num_prompts=1, prompt_index=0):
+        num_prompts = int(num_prompts)
+        prompt_index = int(prompt_index)
+        num_outputs = int(req.num_outputs_per_prompt)
+        if not 0 <= prompt_index < num_prompts:
+            raise IndexError(f"prompt_index={prompt_index} is outside num_prompts={num_prompts}")
+
+        req.latents = _partition_prompt_tensor(
+            getattr(req, "latents", None),
+            prompt_index=prompt_index,
+            num_prompts=num_prompts,
+            num_outputs=num_outputs,
+            field="initial_noise",
+        )
+        req.audio_latents = _partition_prompt_tensor(
+            getattr(req, "audio_latents", None),
+            prompt_index=prompt_index,
+            num_prompts=num_prompts,
+            num_outputs=num_outputs,
+            field="initial_audio_noise",
+        )
+        req.denoise_seeds = _partition_prompt_seeds(
+            getattr(req, "denoise_seeds", None),
+            prompt_index=prompt_index,
+            num_prompts=num_prompts,
+            num_outputs=num_outputs,
+        )
+
+        expanded = orig(
+            req,
+            num_prompts=num_prompts,
+            prompt_index=prompt_index,
+        )
+        for output_index, output_req in enumerate(expanded):
+            output_req.latents = _slice_output_tensor(
+                getattr(output_req, "latents", None),
+                output_index=output_index,
+                num_outputs=num_outputs,
+                field="initial_noise",
+            )
+            output_req.audio_latents = _slice_output_tensor(
+                getattr(output_req, "audio_latents", None),
+                output_index=output_index,
+                num_outputs=num_outputs,
+                field="initial_audio_noise",
+            )
+            seeds = getattr(output_req, "denoise_seeds", None)
+            if seeds is not None:
+                if len(seeds) != num_outputs:
+                    raise ValueError(
+                        f"denoise_seeds prompt length {len(seeds)} must equal num_outputs_per_prompt={num_outputs}"
+                    )
+                output_req.denoise_seeds = [seeds[output_index]]
+        return expanded
+
+    setattr(expand_request_outputs, _EXPAND_SENTINEL, True)
+    utils_mod.expand_request_outputs = expand_request_outputs
+    _rebind_imported_aliases(
+        "expand_request_outputs",
+        orig,
+        expand_request_outputs,
+    )
+
+
+def _rebind_imported_aliases(name: str, original, replacement) -> None:
+    """Replace live ``from utils import ...`` aliases of a wrapped function."""
     import sys
 
     for _mod in list(sys.modules.values()):
         try:
-            if getattr(_mod, "prepare_request", None) is orig:
-                _mod.prepare_request = prepare_request
+            if getattr(_mod, name, None) is original:
+                setattr(_mod, name, replacement)
         except Exception:  # pragma: no cover - defensive
             pass

@@ -9,12 +9,12 @@ import torch
 
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
-from unirl.types.primitives import PrimitiveValue, primitive_modality_key
+from unirl.types.primitives import PrimitiveValue, Texts, primitive_modality_key
 from unirl.types.reward import RewardRequest, RewardResponse
 from unirl.types.sample import Sample, _part_with_field
 from unirl.types.sampling import ARSamplingParams
 
-from .base import DifferentiableReward, RewardBackend
+from .base import DifferentiableReward, PromptVideoReward, RewardBackend
 
 logger = logging.getLogger(__name__)
 
@@ -22,9 +22,17 @@ logger = logging.getLogger(__name__)
 def _build_reward_request(sample: Sample, preferred_input_kind: str) -> RewardRequest:
     """Assemble a :class:`RewardRequest` from a response ``Sample``."""
     frontier = sample.parts[-1]
-    primitives: Dict[str, PrimitiveValue] = {}
-    for prim in sample.conditioning():
-        primitives[primitive_modality_key(prim)] = prim
+    original_prompt: Optional[Texts] = None
+    generation_prompt: Optional[Texts] = None
+    conditioning: Dict[str, PrimitiveValue] = {}
+    for turn in sample.turns():
+        prim = turn.content
+        if isinstance(prim, Texts):
+            if original_prompt is None:
+                original_prompt = prim
+            generation_prompt = prim
+        else:
+            conditioning[primitive_modality_key(prim)] = prim
 
     if preferred_input_kind not in frontier.primitives:
         raise ValueError(
@@ -39,10 +47,11 @@ def _build_reward_request(sample: Sample, preferred_input_kind: str) -> RewardRe
     if "audio" in generated and audio_metadata.get("sample_rate") is not None:
         audio_sample_rate = int(audio_metadata["sample_rate"])
     return RewardRequest(
-        primitives=primitives,
         generated=generated,
+        conditioning=conditioning,
+        original_prompt=original_prompt,
+        generation_prompt=generation_prompt,
         audio_sample_rate=audio_sample_rate,
-        prompt_ids=[str(sid) for sid in frontier.sample_ids],
         sample_ids=list(frontier.sample_ids),
         group_ids=list(frontier.group_ids),
         metadata=(metadata if any(m is not None for m in metadata) else None),
@@ -58,8 +67,18 @@ class RewardService(Remote):
         truncated_reward: str = "zero",
         overlong_buffer_len: int = 4096,
         overlong_penalty_factor: float = 1.0,
+        require_prompt_video: bool = True,
     ) -> None:
         super().__init__()
+        if require_prompt_video and isinstance(backend, PromptVideoReward) and not backend.covers_prompt_video():
+            raise ValueError(
+                f"RewardService: backend {type(backend).__name__} gives prompt-to-video alignment no positive "
+                "weight, so a policy trained on it can raise the score without following the prompt "
+                "(imagebind mode='audio_video' collapses both streams together). Use imagebind "
+                "mode='text_video' or 'all', or a T2AVCompositeScorer with a prompt-video term; score it "
+                "under eval_rewards to measure it without training on it; or set "
+                "require_prompt_video: false to train on it anyway."
+            )
         self.backend = backend
         self.truncated_reward = str(truncated_reward)
         self.overlong_buffer_len = int(overlong_buffer_len)
@@ -155,9 +174,15 @@ class RewardService(Remote):
     def is_available(self) -> bool:
         return self.backend.is_available()
 
+    # Broadcast, not scatter: every reward worker holds its own copy of the
+    # scorer, so each has to move its own weights. Undecorated, these were
+    # unreachable through the role's Handle, which is why nothing had ever
+    # driven reward residency from the training loop.
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
     def offload(self) -> None:
         self.backend.offload()
 
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
     def onload(self) -> None:
         self.backend.onload()
 

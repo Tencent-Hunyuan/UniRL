@@ -14,7 +14,7 @@ _SGLANG_ROLLOUT_SUFFIX = ".SGLangRolloutEngine"
 _MIN_TRANSFORMERS = Version("5.0.0")
 _MIN_SP_TRANSFORMERS = Version("5.9.0")
 _MIN_FLASH_LINEAR_ATTENTION = Version("0.4.2")
-_MIN_SGLANG = Version("0.5.12.post1")
+_MIN_SGLANG = Version("0.5.19")
 _MISSING = object()
 
 

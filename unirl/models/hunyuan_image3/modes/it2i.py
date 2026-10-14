@@ -14,7 +14,7 @@ from unirl.types.primitives import Images, Texts
 from unirl.types.sample import Part, Sample
 from unirl.types.sampling import DiffusionSamplingParams
 
-from ..conditions import HunyuanImage3DiffusionConditions, HunyuanImage3VAECondition
+from ..conditions import HunyuanImage3DiffusionConditions, HunyuanImage3VAECondition, split_cfg_fused
 from ..seed import make_cpu_generators
 
 if TYPE_CHECKING:
@@ -138,23 +138,7 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
         batch_cond_image_info=vit["joint_image_info"],
     )
 
-    # Store cond and uncond branches separately so transport preserves both.
-    fused_full = mm["fused"]
-    expected_fused_rows = frontier.batch_size * (2 if cfg else 1)
-    actual_fused_rows = int(fused_full.input_ids.shape[0])
-    if actual_fused_rows != expected_fused_rows:
-        raise ValueError(
-            "HunyuanImage3 it2i tokenizer batch mismatch: "
-            f"expected {expected_fused_rows} fused rows for B={frontier.batch_size}, "
-            f"got {actual_fused_rows}."
-        )
-    if cfg:
-        n = frontier.batch_size
-        fused_cond = fused_full.slice(0, n)
-        fused_uncond = fused_full.slice(n, 2 * n)
-    else:
-        fused_cond = fused_full
-        fused_uncond = None
+    fused_cond, fused_uncond = split_cfg_fused(mm["fused"], frontier.batch_size, cfg=cfg)
 
     cond_vae = HunyuanImage3VAECondition(latents=cond_vae_images)
     cond_vit = ImageEmbedCondition(

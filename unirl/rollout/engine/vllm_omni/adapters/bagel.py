@@ -18,6 +18,7 @@ from unirl.rollout.engine.vllm_omni.backends import (
     OmniRawResult,
     StageSampling,
 )
+from unirl.rollout.engine.vllm_omni.pipelines._shared.interception import read_captures
 from unirl.rollout.engine.vllm_omni.utils import (
     build_image_segment,
     collect_dit_outputs,
@@ -76,7 +77,7 @@ class BagelInputAdapter(DitInputAdapter):
             raise ValueError(f"{self.modality}: samples_per_prompt must be >= 1, got {spp}")
         return spp
 
-    def _is_packable_t2i(self, sample: Sample) -> bool:
+    def packs_groups(self, sample: Sample) -> bool:
         """Collapse spp samples into one ``num_outputs_per_prompt=spp`` request."""
         if self.image_input:
             return False
@@ -111,7 +112,7 @@ class BagelInputAdapter(DitInputAdapter):
                 f"({grouped_spp} from grouping, {spp} from diffusion params)."
             )
 
-        pack = self._is_packable_t2i(sample)
+        pack = self.packs_groups(sample)
         if pack:
             prompt_texts = grouped_texts
             num_outputs_per_prompt = spp
@@ -131,7 +132,7 @@ class BagelInputAdapter(DitInputAdapter):
         spp = self._spp(sample)
         gen_part = sample.frontier_gen_part(BagelDiffusionParams)
         diff_params = gen_part.sampling_params
-        pack = self._is_packable_t2i(sample)
+        pack = self.packs_groups(sample)
 
         n_samples = len(gen_part.sample_ids)
         if self.image_input:
@@ -224,8 +225,10 @@ class BagelOutputAdapter(DitOutputAdapter):
         return pils_to_images(pil_images)
 
     def build_conditions(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
-        """Ship raw prompt, shape, and optional source image for trainer-side KV rebuild."""
-        del per_request
+        """Ship raw prompt, shape, optional source image and the worker's token layout for trainer-side KV rebuild."""
+        diff_outputs, frame_groups, _ = collect_dit_outputs(
+            per_request, final_output_type=self.final_output_type, stage_id=self.stage_id, modality=self.modality
+        )
         prompts, input_images = _conditioning_rows(
             sample,
             image_input=self.image_input,
@@ -238,6 +241,7 @@ class BagelOutputAdapter(DitOutputAdapter):
             prompts=prompts,
             input_images=input_images,
             image_shapes=[image_shape] * len(prompts),
+            layouts=[read_captures(out)["layout"] for out, frames in zip(diff_outputs, frame_groups) for _ in frames],
         )
         return conditions.to_dict()
 
@@ -245,7 +249,7 @@ class BagelOutputAdapter(DitOutputAdapter):
 class BagelAdapter(ModelAdapter):
     """Bind BAGEL t2i and it2i to one single-stage DiT worker."""
 
-    stage_yaml = "bagel_t2i_rl.yaml"
+    deploy_config = "bagel_t2i_rl.yaml"
     omni_mode = "text-to-image"
     needs_driver_tokenizer = False
     image_input: bool = False  # Whether the modality requires an edit-source image.
@@ -255,10 +259,12 @@ class BagelAdapter(ModelAdapter):
         self.input_adapter = BagelInputAdapter(self.modality, image_input=self.image_input)
         self.output_adapter = BagelOutputAdapter(self.modality, image_input=self.image_input)
 
+    def packs_groups(self, sample: Sample) -> bool:
+        return self.input_adapter.packs_groups(sample)
+
     def schedule_policy(self) -> FlowMatchSchedulePolicy:
         """Static-shift FlowMatch σ policy (BAGEL uses no dynamic shifting)."""
-        shift = float(getattr(self.model_config, "shift", 3.0))
-        return FlowMatchSchedulePolicy.static_only(shift)
+        return FlowMatchSchedulePolicy.static_only(float(self.model_config.shift))
 
     def validate_request(self, sample: Sample) -> None:
         has_image = sample.has_image_input()

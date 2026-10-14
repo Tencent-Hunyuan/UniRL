@@ -7,7 +7,7 @@ from typing import List
 
 import torch
 
-from unirl.reward.base import BaseRewardComponentSpec
+from unirl.reward.base import PromptRewardComponentSpec
 from unirl.reward.local.device import resolve_device
 from unirl.types.reward import RewardRequest
 
@@ -23,6 +23,7 @@ class PickScoreRewardScorer(LocalRewardBackend):
         super().__init__(
             device=resolve_device(config.device, base_device),
             batch_size=config.batch_size,
+            prompt_source=config.prompt_source,
             processor_id=config.processor_id,
             model_id=config.model_id,
         )
@@ -65,7 +66,7 @@ class PickScoreRewardScorer(LocalRewardBackend):
 
     def _compute_model_rewards(self, request: RewardRequest) -> List[float]:
         images = request.images
-        prompts = request.prompts
+        prompts = self.prompts(request)
         all_rewards: List[float] = []
 
         def _extract_tensor(output):
@@ -171,7 +172,7 @@ class PickScoreRewardScorer(LocalRewardBackend):
 
 
 @dataclass
-class PickScoreSpec(BaseRewardComponentSpec):
+class PickScoreSpec(PromptRewardComponentSpec):
     """Typed config for the PickScore reward component."""
 
     batch_size: int = 8
