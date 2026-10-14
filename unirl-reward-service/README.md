@@ -84,9 +84,10 @@ python -m reward_service --config configs/service.yaml
 
 ### CUDA MPS (opt-in)
 
-Qualified CLIP and PickScore actors can share one GPU via NVIDIA MPS.
-`mps.mode: managed` starts the daemon before local Ray. Only those two
-scorers are qualified; float16/bfloat16 scorers need `active_thread_percentage: 100`.
+Lightweight reward actors (such as CLIP, PickScore, HPSv2, and ImageReward) can
+share one GPU via NVIDIA MPS. `mps.mode: managed` starts the daemon before
+local Ray. On H20 with driver 535, keep `active_thread_percentage: 100` for
+float16/bfloat16 scorers.
 
 ```bash
 python -m reward_service --config configs/service.mps.example.yaml

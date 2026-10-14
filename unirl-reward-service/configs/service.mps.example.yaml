@@ -19,7 +19,7 @@ rewards:
     num_cpus: 2
     max_concurrency: 4
     mps:
-      # float16/bfloat16 scores were correct on H20 only at 100% on the qualified stack.
+      # On H20 with driver 535, keep 100% for float16/bfloat16 scorers.
       active_thread_percentage: 100
       device_memory_limit: 20GiB
     params:

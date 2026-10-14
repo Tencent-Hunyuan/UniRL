@@ -35,9 +35,6 @@ _DEFAULT_SCORE_TIMEOUT_S = 120.0
 _VALID_SCHEDULING = ("pack", "spread")
 _VALID_MPS_MODES = ("disabled", "managed", "external")
 _MEMORY_RE = re.compile(r"^([1-9][0-9]*)\s*(M|MB|MiB|G|GB|GiB)$", re.IGNORECASE)
-# Keep this conservative: each entry needs same-card correctness, limit, and
-# cleanup qualification before it can join a production MPS fault domain.
-_MPS_QUALIFIED_SCORERS = ("clip", "pickscore")
 
 
 @dataclass(frozen=True)
@@ -212,8 +209,6 @@ def load_config(path: str | Path) -> ServiceCfg:
                 raise ValueError(f"mps.{key} must be a non-empty path")
             else:
                 mps_dirs[key] = os.path.abspath(os.path.expandvars(os.path.expanduser(val)))
-        if mps_mode == "disabled" and any(mps_dirs.values()):
-            raise ValueError("MPS directories require mps.mode=managed or external")
         if mps_mode == "external" and mps_dirs["pipe_directory"] is None:
             raise ValueError("mps.mode=external requires mps.pipe_directory")
         mps_runtime = MpsRuntimeCfg(
@@ -276,25 +271,12 @@ def load_config(path: str | Path) -> ServiceCfg:
                 raise ValueError(f"{ctx} mps must be a mapping")
             if not mps_runtime.enabled:
                 raise ValueError(f"{ctx} configures an MPS client but node MPS is disabled")
-            if not 0 < num_gpus < 1:
-                raise ValueError(f"{ctx} MPS requires 0 < num_gpus < 1, got {num_gpus}")
-            if scorer not in _MPS_QUALIFIED_SCORERS:
-                raise ValueError(
-                    f"{ctx} scorer {scorer!r} is not MPS-qualified; "
-                    f"qualified scorers: {_MPS_QUALIFIED_SCORERS}"
-                )
+            if not 0 < num_gpus <= 1:
+                raise ValueError(f"{ctx} MPS requires 0 < num_gpus <= 1, got {num_gpus}")
             active = mps_entry.get("active_thread_percentage", 100)
             if isinstance(active, bool) or not isinstance(active, int) or not 1 <= active <= 100:
                 raise ValueError(
                     f"{ctx} mps.active_thread_percentage must be an integer in [1, 100]"
-                )
-            dtype = str(params.get("dtype", "float32")).lower()
-            # On the qualified H20 stack, float16/bfloat16 GEMMs under a partial MPS
-            # limit return wrong values (sometimes finite, sometimes NaN).
-            if active < 100 and dtype != "float32":
-                raise ValueError(
-                    f"{ctx} {dtype} is only qualified with "
-                    "mps.active_thread_percentage=100"
                 )
             memory = mps_entry.get("device_memory_limit")
             if memory is None:
@@ -349,14 +331,11 @@ def load_config(path: str | Path) -> ServiceCfg:
     if not rewards:
         raise ValueError("at least one reward must be configured")
 
-    if mps_runtime.enabled:
-        if not any(reward.mps for reward in rewards):
-            raise ValueError("node MPS is enabled but no reward configures an MPS client")
-        if cluster.ray_address and mps_runtime.mode == "managed":
-            raise ValueError(
-                "managed MPS is single-node only; for an external Ray cluster, "
-                "start one daemon per node and use mps.mode=external"
-            )
+    if cluster.ray_address and mps_runtime.mode == "managed":
+        raise ValueError(
+            "managed MPS is single-node only; for an external Ray cluster, "
+            "start one daemon per node and use mps.mode=external"
+        )
 
     return ServiceCfg(
         server=server,

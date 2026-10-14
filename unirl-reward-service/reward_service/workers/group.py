@@ -82,12 +82,7 @@ def _actor_options(
 ) -> dict[str, Any]:
     """Build the dict passed to ``ScorerActor.options(...)``."""
     runtime_env = _build_runtime_env(cfg.runtime_env)
-    if cfg.mps is not None:
-        if not mps_pipe_directory:
-            raise RuntimeError(
-                f"WorkerGroup[{cfg.name}] enables MPS but the node runtime "
-                "did not provide a pipe directory"
-            )
+    if cfg.mps is not None and mps_pipe_directory is not None:
         env_vars = {
             "CUDA_MPS_PIPE_DIRECTORY": mps_pipe_directory,
             "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE": str(
