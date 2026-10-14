@@ -4,8 +4,9 @@ server:
   score_timeout_s: 120
 
 # Managed mode is single-node and starts MPS before Ray. For a Ray cluster,
-# run `scripts/mps.sh start` on every node and use mode: external with the same
-# pipe_directory.
+# start `nvidia-cuda-mps-control -d` on every node and use mode: external with
+# the shared pipe_directory. To compare non-MPS fractional sharing or dedicated
+# GPUs, omit the `mps:` blocks (and set `num_gpus: 1` for dedicated).
 mps:
   mode: managed
 

@@ -41,8 +41,14 @@ class MpsRuntime:
         self.pipe_directory = Path(
             cfg.pipe_directory or f"/tmp/unirl-mps-{suffix}"
         )
-        self.log_directory = Path(
-            cfg.log_directory or f"/tmp/unirl-mps-log-{suffix}"
+        self.log_directory = (
+            Path(cfg.log_directory)
+            if cfg.log_directory is not None
+            else (
+                Path(f"/tmp/unirl-mps-log-{suffix}")
+                if cfg.mode == "managed"
+                else None
+            )
         )
         self._started = False
         self._owned_directories: list[Path] = []
@@ -54,11 +60,15 @@ class MpsRuntime:
         return self.cfg.enabled
 
     def _environment(self) -> dict[str, str]:
-        return {
-            **os.environ,
-            "CUDA_MPS_PIPE_DIRECTORY": str(self.pipe_directory),
-            "CUDA_MPS_LOG_DIRECTORY": str(self.log_directory),
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if k not in _CLIENT_ENV
         }
+        env["CUDA_MPS_PIPE_DIRECTORY"] = str(self.pipe_directory)
+        if self.log_directory is not None:
+            env["CUDA_MPS_LOG_DIRECTORY"] = str(self.log_directory)
+        return env
 
     def _control(self, command: str, *, check: bool = True) -> str:
         if self.binary is None:

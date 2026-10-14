@@ -16,6 +16,7 @@ import ray
 
 from reward_service.config import ClusterCfg, ServiceCfg
 from reward_service.logging_utils import get_logger
+from reward_service.mps import MpsRuntime
 from reward_service.scorers import ScoreItem
 from reward_service.workers.group import WorkerGroup
 
@@ -59,11 +60,20 @@ def _init_ray(cluster: ClusterCfg) -> None:
 class WorkerPool:
     def __init__(self, cfg: ServiceCfg) -> None:
         self.cfg = cfg
-        _init_ray(cfg.cluster)
+        self.mps = MpsRuntime(cfg.mps)
+        self.mps.start()
         self._groups: dict[str, WorkerGroup] = {}
-        for reward_cfg in cfg.rewards:
-            self._groups[reward_cfg.name] = WorkerGroup(reward_cfg)
-        self._wait_until_all_actors_ready()
+        try:
+            _init_ray(cfg.cluster)
+            mps_pipe = str(self.mps.pipe_directory) if self.mps.enabled else None
+            for reward_cfg in cfg.rewards:
+                self._groups[reward_cfg.name] = WorkerGroup(
+                    reward_cfg, mps_pipe_directory=mps_pipe
+                )
+            self._wait_until_all_actors_ready()
+        except Exception:
+            self.shutdown()
+            raise
 
     def _wait_until_all_actors_ready(self) -> None:
         """Block until every actor's ``__init__`` has finished loading its model.
@@ -128,6 +138,9 @@ class WorkerPool:
         return {name: group.ping() for name, group in self._groups.items()}
 
     def shutdown(self) -> None:
-        for group in self._groups.values():
-            group.shutdown()
-        self._groups.clear()
+        try:
+            for group in self._groups.values():
+                group.shutdown()
+            self._groups.clear()
+        finally:
+            self.mps.stop()

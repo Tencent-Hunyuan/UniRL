@@ -112,7 +112,7 @@ class ScorerActor:
         self.scorer.close()
         del self.scorer
         gc.collect()
-        if cuda_initialized and torch is not None:
+        if cuda_initialized:
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
         return f"{self.scorer_name}:drained"

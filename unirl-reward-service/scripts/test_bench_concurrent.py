@@ -29,6 +29,8 @@ def test_invalid_server_output_is_counted_as_failure() -> None:
         del bench._thread_local.client
     assert not outcome.ok
     assert outcome.per_reward_errs == Counter({"clip": 1})
+    stats = bench._RunStats(concurrency=1, total=1, wall_s=0.1, outcomes=[outcome])
+    assert stats.err_kinds == Counter()
 
 
 def test_run_record_keeps_scores_and_throughput() -> None:

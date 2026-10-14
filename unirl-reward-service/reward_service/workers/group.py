@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import itertools
-import os
 from pathlib import Path
 from typing import Any
 
@@ -84,14 +83,13 @@ def _actor_options(
     """Build the dict passed to ``ScorerActor.options(...)``."""
     runtime_env = _build_runtime_env(cfg.runtime_env)
     if cfg.mps is not None:
-        pipe = mps_pipe_directory or os.environ.get("UNIRL_MPS_PIPE_DIRECTORY")
-        if not pipe:
+        if not mps_pipe_directory:
             raise RuntimeError(
                 f"WorkerGroup[{cfg.name}] enables MPS but the node runtime "
                 "did not provide a pipe directory"
             )
         env_vars = {
-            "CUDA_MPS_PIPE_DIRECTORY": pipe,
+            "CUDA_MPS_PIPE_DIRECTORY": mps_pipe_directory,
             "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE": str(
                 cfg.mps.active_thread_percentage
             ),
@@ -113,13 +111,18 @@ def _actor_options(
 
 
 class WorkerGroup:
-    def __init__(self, cfg: RewardModelCfg) -> None:
+    def __init__(
+        self,
+        cfg: RewardModelCfg,
+        *,
+        mps_pipe_directory: str | None = None,
+    ) -> None:
         self.cfg = cfg
-        self.actors = self._spawn_actors()
+        self.actors = self._spawn_actors(mps_pipe_directory=mps_pipe_directory)
         self._rr = itertools.cycle(range(len(self.actors)))
 
-    def _spawn_actors(self) -> list[Any]:
-        options = _actor_options(self.cfg)
+    def _spawn_actors(self, *, mps_pipe_directory: str | None = None) -> list[Any]:
+        options = _actor_options(self.cfg, mps_pipe_directory=mps_pipe_directory)
         pip_cfg = options.get("runtime_env", {}).get("pip", {})
         logger.info(
             "WorkerGroup[%s] runtime_env packages=%s pip_options=%s",

@@ -73,7 +73,7 @@ def test_requires_fractional_gpu(tmp_path: Path, num_gpus: object) -> None:
 
 
 def test_rejects_tensor_parallel_mps(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="tensor_parallel_size>1"):
+    with pytest.raises(ValueError, match="tensor_parallel_size=2 requires num_gpus>=2"):
         load_config(_config(tmp_path, params={"tensor_parallel_size": 2}))
 
 
@@ -231,7 +231,18 @@ def test_non_mps_actor_options_are_unchanged(tmp_path: Path) -> None:
     }
 
 
-def test_group_drains_before_kill_only_when_mps(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("mps", "expected"),
+    [
+        (MpsClientCfg(100), ["drain", "wait", "kill"]),
+        (None, ["kill"]),
+    ],
+)
+def test_group_drains_before_kill_only_when_mps(
+    monkeypatch: pytest.MonkeyPatch,
+    mps: MpsClientCfg | None,
+    expected: list[str],
+) -> None:
     events = []
     actor = SimpleNamespace(
         shutdown=SimpleNamespace(remote=lambda: events.append("drain") or object()),
@@ -245,31 +256,9 @@ def test_group_drains_before_kill_only_when_mps(monkeypatch) -> None:
         lambda actor, no_restart=False: events.append("kill"),
     )
     group = WorkerGroup.__new__(WorkerGroup)
-    group.cfg = SimpleNamespace(name="test", mps=MpsClientCfg(100))
+    group.cfg = SimpleNamespace(name="test", mps=mps)
     group.actors = [actor]
 
     group.shutdown()
 
-    assert events == ["drain", "wait", "kill"]
-
-
-def test_non_mps_group_kills_without_drain(monkeypatch) -> None:
-    events = []
-    actor = SimpleNamespace(
-        shutdown=SimpleNamespace(remote=lambda: events.append("drain") or object()),
-    )
-    monkeypatch.setattr(
-        "reward_service.workers.group.ray.get",
-        lambda refs, timeout: events.append("wait"),
-    )
-    monkeypatch.setattr(
-        "reward_service.workers.group.ray.kill",
-        lambda actor, no_restart=False: events.append("kill"),
-    )
-    group = WorkerGroup.__new__(WorkerGroup)
-    group.cfg = SimpleNamespace(name="test", mps=None)
-    group.actors = [actor]
-
-    group.shutdown()
-
-    assert events == ["kill"]
+    assert events == expected

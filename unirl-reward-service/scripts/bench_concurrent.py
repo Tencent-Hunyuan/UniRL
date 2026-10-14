@@ -185,7 +185,7 @@ class _RunStats:
 
     @property
     def err_kinds(self) -> Counter:
-        return Counter(o.err.split(":", 1)[0] for o in self.outcomes if not o.ok)
+        return Counter(o.err.split(":", 1)[0] for o in self.outcomes if o.err)
 
     @property
     def per_reward_errs(self) -> Counter:
@@ -208,6 +208,7 @@ def _run_one(
     image: Image.Image,
     rewards: list[str],
     concurrency: int,
+    recorded: list[dict[str, Any]] | None = None,
 ) -> _RunStats:
     total = args.total
     print(f"\n=== concurrency={concurrency}  total={total} ===", flush=True)
@@ -249,7 +250,6 @@ def _run_one(
 
     stats = _RunStats(concurrency=concurrency, total=total, wall_s=wall, outcomes=outcomes)
     _print_stats(stats, batch_size=args.batch_size)
-    recorded = getattr(args, "_recorded", None)
     if recorded is not None:
         recorded.append(_run_record(stats, rewards, args.batch_size))
     return stats
@@ -478,8 +478,7 @@ def main() -> int:
     )
 
     levels = args.sweep if args.sweep is not None else [args.concurrency]
-    recorded: list[dict[str, Any]] = []
-    args._recorded = recorded if args.output is not None else None
+    recorded: list[dict[str, Any]] | None = [] if args.output is not None else None
     batch_sizes = args.batch_sweep if args.batch_sweep is not None else [args.batch_size]
     exit_code = 0
 
@@ -499,7 +498,7 @@ def main() -> int:
                     named: list[tuple[str, _RunStats]] = []
                     for name in rewards:
                         print(f"\n--- isolated: reward={name} ---", flush=True)
-                        stats = _run_one(args, image, [name], concurrency)
+                        stats = _run_one(args, image, [name], concurrency, recorded)
                         named.append((name, stats))
                     _print_per_reward_summary(named)
                     if any(s.fail != 0 for _, s in named):
@@ -508,12 +507,16 @@ def main() -> int:
                     # Sweep + isolated: nested loop.
                     for name in rewards:
                         print(f"\n########  reward={name}  ########", flush=True)
-                        per_level = [_run_one(args, image, [name], c) for c in levels]
+                        per_level = [
+                            _run_one(args, image, [name], c, recorded) for c in levels
+                        ]
                         _print_sweep_summary(per_level)
                         if any(s.fail != 0 for s in per_level):
                             exit_code = 3
             else:
-                all_stats = [_run_one(args, image, rewards, c) for c in levels]
+                all_stats = [
+                    _run_one(args, image, rewards, c, recorded) for c in levels
+                ]
 
                 if len(all_stats) > 1:
                     _print_sweep_summary(all_stats)

@@ -139,12 +139,15 @@ def _parse_bounded_number(
 ):
     """Coerce ``raw[key]`` with ``caster`` and require ``value >= min_value``.
 
-    Used for the four numeric fields in a reward config that share the same
+    Used for the numeric fields in a reward config that share the same
     "coerce to type, check lower bound, raise with context" shape. Returns
     the validated value.
     """
-    value = caster(raw.get(key, default))
-    if value < min_value:
+    raw_value = raw.get(key, default)
+    if isinstance(raw_value, bool):
+        raise ValueError(f"{context} must be a number, got {raw_value!r}")
+    value = caster(raw_value)
+    if not math.isfinite(value) or value < min_value:
         raise ValueError(f"{context} must be >= {min_value}, got {value}")
     return value
 
@@ -187,13 +190,8 @@ def _parse_mps_runtime_cfg(raw: dict | None) -> MpsRuntimeCfg:
         if value is None:
             return None
         if not isinstance(value, str) or not value.strip():
-            raise ValueError(f"mps.{key} must be a non-empty absolute path")
-        value = os.path.abspath(os.path.expandvars(os.path.expanduser(value)))
-        if len(value) > 80:
-            raise ValueError(
-                f"mps.{key} is too long for MPS Unix sockets ({len(value)} > 80)"
-            )
-        return value
+            raise ValueError(f"mps.{key} must be a non-empty path")
+        return os.path.abspath(os.path.expandvars(os.path.expanduser(value)))
 
     pipe_directory = _path("pipe_directory")
     log_directory = _path("log_directory")
@@ -249,23 +247,15 @@ def _parse_mps_client_cfg(
         else None
     )
 
-    tp = params.get("tensor_parallel_size", 1)
-    try:
-        tp = int(tp)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{context} params.tensor_parallel_size must be an int") from exc
-    if tp > 1:
-        raise ValueError(f"{context} shared MPS does not support tensor_parallel_size>1")
-
     if scorer not in _MPS_QUALIFIED_SCORERS:
         raise ValueError(
             f"{context} scorer {scorer!r} is not MPS-qualified; "
             f"qualified scorers: {_MPS_QUALIFIED_SCORERS}"
         )
-    dtype = str(params.get("dtype", "")).lower()
+    dtype = str(params.get("dtype", "float32")).lower()
     # On the qualified H20 stack, float16/bfloat16 GEMMs under a partial MPS
     # limit return wrong values (sometimes finite, sometimes NaN).
-    if dtype in {"float16", "fp16", "half", "bfloat16", "bf16"} and active < 100:
+    if active < 100 and dtype != "float32":
         raise ValueError(
             f"{context} {dtype} is only qualified with "
             "mps.active_thread_percentage=100"
@@ -337,8 +327,6 @@ def load_config(path: str | Path) -> ServiceCfg:
             entry, "num_gpus", 1.0, caster=float, min_value=0,
             context=f"{ctx} num_gpus",
         )
-        if not math.isfinite(num_gpus):
-            raise ValueError(f"{ctx} num_gpus must be finite, got {num_gpus}")
         max_concurrency = _parse_bounded_number(
             entry, "max_concurrency", 1, caster=int, min_value=1,
             context=f"{ctx} max_concurrency",

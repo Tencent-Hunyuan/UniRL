@@ -244,8 +244,8 @@ The output reports each request's min / mean / max latency plus p50/p90/p95/p99,
 
 For the CUDA MPS experiment in
 [#463](https://github.com/Tencent-Hunyuan/UniRL/issues/463), launch
-[`configs/service.h20-dedicated.example.yaml`](configs/service.h20-dedicated.example.yaml)
-or [`configs/service.h20-shared.example.yaml`](configs/service.h20-shared.example.yaml)
+[`configs/service.mps-h20.example.yaml`](configs/service.mps-h20.example.yaml)
+(or omit `mps` / set `num_gpus: 1` for the shared and dedicated baselines)
 and run the same client workload against each topology:
 
 ```bash
