@@ -54,6 +54,7 @@ class MpsRuntimeCfg:
 class MpsClientCfg:
     """Limits applied by CUDA when an actor creates its first MPS context."""
 
+    pipe_directory: str
     active_thread_percentage: int = 100
     device_memory_limit_mib: int | None = None
 
@@ -211,6 +212,12 @@ def load_config(path: str | Path) -> ServiceCfg:
                 mps_dirs[key] = os.path.abspath(os.path.expandvars(os.path.expanduser(val)))
         if mps_mode == "external" and mps_dirs["pipe_directory"] is None:
             raise ValueError("mps.mode=external requires mps.pipe_directory")
+        if mps_mode != "disabled":
+            suffix = f"{os.getuid()}-{os.getpid()}"
+            if mps_dirs["pipe_directory"] is None:
+                mps_dirs["pipe_directory"] = f"/tmp/unirl-mps-{suffix}"
+            if mps_mode == "managed" and mps_dirs["log_directory"] is None:
+                mps_dirs["log_directory"] = f"/tmp/unirl-mps-log-{suffix}"
         mps_runtime = MpsRuntimeCfg(
             mode=mps_mode,
             pipe_directory=mps_dirs["pipe_directory"],
@@ -289,7 +296,9 @@ def load_config(path: str | Path) -> ServiceCfg:
                     )
                 amount = int(match.group(1))
                 memory_mib = amount * 1024 if match.group(2).lower().startswith("g") else amount
+            assert mps_runtime.pipe_directory is not None
             mps_client = MpsClientCfg(
+                pipe_directory=mps_runtime.pipe_directory,
                 active_thread_percentage=active,
                 device_memory_limit_mib=memory_mib,
             )

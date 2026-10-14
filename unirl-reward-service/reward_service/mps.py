@@ -40,9 +40,8 @@ class MpsRuntime:
     def __init__(self, cfg: MpsRuntimeCfg) -> None:
         self.cfg = cfg
         self.binary = shutil.which("nvidia-cuda-mps-control")
-        suffix = f"{os.getuid()}-{os.getpid()}"
-        self.pipe_directory = Path(cfg.pipe_directory or f"/tmp/unirl-mps-{suffix}")
-        self.log_directory = Path(cfg.log_directory or f"/tmp/unirl-mps-log-{suffix}")
+        self.pipe_directory = Path(cfg.pipe_directory) if cfg.pipe_directory else None
+        self.log_directory = Path(cfg.log_directory) if cfg.log_directory else None
         self._started = False
         self._saved_environment: dict[str, str] = {}
         self._watchdog: subprocess.Popen | None = None
@@ -59,7 +58,7 @@ class MpsRuntime:
     ) -> str:
         env = {k: v for k, v in os.environ.items() if k not in _CLIENT_ENV}
         env["CUDA_MPS_PIPE_DIRECTORY"] = str(self.pipe_directory)
-        if self.cfg.mode == "managed" or self.cfg.log_directory is not None:
+        if self.log_directory is not None:
             env["CUDA_MPS_LOG_DIRECTORY"] = str(self.log_directory)
         result = subprocess.run(
             [self.binary, *args],
@@ -80,7 +79,9 @@ class MpsRuntime:
             return
         if self.binary is None:
             raise RuntimeError("MPS requested but nvidia-cuda-mps-control is unavailable")
+        assert self.pipe_directory is not None
         if self.cfg.mode == "managed":
+            assert self.log_directory is not None
             for path in (self.pipe_directory, self.log_directory):
                 if path.exists() or path.is_symlink():
                     raise RuntimeError(f"refusing to replace existing MPS path: {path}")
@@ -90,6 +91,7 @@ class MpsRuntime:
         daemon_started = False
         try:
             if self.cfg.mode == "managed":
+                assert self.log_directory is not None
                 self.pipe_directory.mkdir(parents=True, mode=0o700)
                 self.log_directory.mkdir(parents=True, mode=0o700)
                 self._run_control("-d")
@@ -98,7 +100,7 @@ class MpsRuntime:
         except Exception:
             if daemon_started:
                 self._run_control(input_cmd="quit\n", check=False)
-            if self.cfg.mode == "managed":
+            if self.cfg.mode == "managed" and self.log_directory is not None:
                 shutil.rmtree(self.pipe_directory, ignore_errors=True)
                 shutil.rmtree(self.log_directory, ignore_errors=True)
             raise
@@ -158,7 +160,7 @@ class MpsRuntime:
         finally:
             os.environ.update(self._saved_environment)
             self._saved_environment.clear()
-            if self.cfg.mode == "managed":
+            if self.cfg.mode == "managed" and self.pipe_directory and self.log_directory:
                 shutil.rmtree(self.pipe_directory, ignore_errors=True)
                 shutil.rmtree(self.log_directory, ignore_errors=True)
             self._started = False

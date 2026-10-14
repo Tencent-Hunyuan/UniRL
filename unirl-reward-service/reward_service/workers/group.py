@@ -75,16 +75,12 @@ def _build_runtime_env(requirements_path: str) -> dict[str, Any]:
     return {"pip": pip_cfg}
 
 
-def _actor_options(
-    cfg: RewardModelCfg,
-    *,
-    mps_pipe_directory: str | None = None,
-) -> dict[str, Any]:
+def _actor_options(cfg: RewardModelCfg) -> dict[str, Any]:
     """Build the dict passed to ``ScorerActor.options(...)``."""
     runtime_env = _build_runtime_env(cfg.runtime_env)
-    if cfg.mps is not None and mps_pipe_directory is not None:
+    if cfg.mps is not None:
         env_vars = {
-            "CUDA_MPS_PIPE_DIRECTORY": mps_pipe_directory,
+            "CUDA_MPS_PIPE_DIRECTORY": cfg.mps.pipe_directory,
             "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE": str(
                 cfg.mps.active_thread_percentage
             ),
@@ -106,18 +102,13 @@ def _actor_options(
 
 
 class WorkerGroup:
-    def __init__(
-        self,
-        cfg: RewardModelCfg,
-        *,
-        mps_pipe_directory: str | None = None,
-    ) -> None:
+    def __init__(self, cfg: RewardModelCfg) -> None:
         self.cfg = cfg
-        self.actors = self._spawn_actors(mps_pipe_directory=mps_pipe_directory)
+        self.actors = self._spawn_actors()
         self._rr = itertools.cycle(range(len(self.actors)))
 
-    def _spawn_actors(self, *, mps_pipe_directory: str | None = None) -> list[Any]:
-        options = _actor_options(self.cfg, mps_pipe_directory=mps_pipe_directory)
+    def _spawn_actors(self) -> list[Any]:
+        options = _actor_options(self.cfg)
         pip_cfg = options.get("runtime_env", {}).get("pip", {})
         logger.info(
             "WorkerGroup[%s] runtime_env packages=%s pip_options=%s",
