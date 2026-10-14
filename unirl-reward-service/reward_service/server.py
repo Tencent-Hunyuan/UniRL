@@ -21,7 +21,7 @@ from fastapi import FastAPI, HTTPException
 
 from reward_service.config import ServiceCfg
 from reward_service.logging_utils import get_logger
-from reward_service.mps import MpsRuntime
+from reward_service.mps import mps_daemon
 from reward_service.schemas import PROTOCOL_VERSION, RewardRequest, ScoreRequest, ScoreResponse
 from reward_service.scorers import ScoreItem
 from reward_service.wire import request_to_item
@@ -78,12 +78,11 @@ async def _await_ref(
 
 
 def create_app(cfg: ServiceCfg) -> FastAPI:
-    mps_runtime = MpsRuntime(enabled=any(r.mps is not None for r in cfg.rewards))
+    mps_enabled = any(r.mps is not None for r in cfg.rewards)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        await asyncio.to_thread(mps_runtime.start)
-        try:
+        with mps_daemon(enabled=mps_enabled):
             # WorkerPool() blocks until every actor's __init__ has finished
             # loading its model, so uvicorn only starts accepting requests
             # after the service is truly ready (readiness-probe semantics).
@@ -94,11 +93,10 @@ def create_app(cfg: ServiceCfg) -> FastAPI:
                 cfg.server.port,
                 app.state.pool.reward_names(),
             )
-            yield
-        finally:
-            if hasattr(app.state, "pool"):
+            try:
+                yield
+            finally:
                 app.state.pool.shutdown()
-            await asyncio.to_thread(mps_runtime.stop)
 
     app = FastAPI(title="Reward Service", lifespan=lifespan)
 
@@ -106,13 +104,7 @@ def create_app(cfg: ServiceCfg) -> FastAPI:
     async def health() -> dict:
         pool: WorkerPool = app.state.pool
         health_info = await asyncio.to_thread(pool.health)
-        payload = {"status": "ok", "rewards": health_info}
-        if mps_runtime.enabled:
-            mps_status = await asyncio.to_thread(mps_runtime.status)
-            payload["mps"] = mps_status
-            if not mps_status.get("enabled"):
-                payload["status"] = "degraded"
-        return payload
+        return {"status": "ok", "rewards": health_info}
 
     @app.get("/rewards")
     async def list_rewards() -> dict:
