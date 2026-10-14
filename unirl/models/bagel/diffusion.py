@@ -249,7 +249,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         differentiable: bool = False,
     ) -> Tuple[Any, Any, Any]:
         """Rebuild the three KV contexts from raw prompt and optional source image."""
-        if image is not None and getattr(self.model.model, "vit_model", None) is None:
+        if image is not None and not self.model.model.config.visual_und:
             raise ValueError(
                 "BagelDiffusionStage: the conditions carry an it2i source image but the bundle "
                 "was built without the und ViT; set BagelPipelineConfig.enable_vit=true."
@@ -301,15 +301,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
                 "raw material; prompt-only stored contexts (t2i/t2ti) cannot be "
                 "reproduced from the bare prompt.",
             )
-        if differentiable and conditions.input_images:
-            prompt, input_image, image_shape = conditions.single_prompt()
-            gen, cfg_text, cfg_img = self._build_contexts_from_prompt(
-                prompt,
-                input_image,
-                differentiable=True,
-            )
-            return gen, cfg_text, cfg_img, image_shape
-        if conditions.has_contexts() and not force_rebuild:
+        if conditions.has_contexts() and not force_rebuild and not (differentiable and conditions.input_images):
             return conditions.single()
         prompt, input_image, image_shape = conditions.single_prompt()
         gen, cfg_text, cfg_img = self._build_contexts_from_prompt(
@@ -317,6 +309,14 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
             input_image,
             differentiable=differentiable,
         )
+        if conditions.layouts:
+            height, width = image_shape
+            rebuilt = {"kv_len": gen["kv_lens"][0], "rope": gen["ropes"][0], "height": height, "width": width}
+            require(
+                rebuilt == conditions.layouts[0],
+                "BagelDiffusionStage: rollout and replay built different token layouts for this sample: "
+                f"worker {conditions.layouts[0]}, trainer {rebuilt}.",
+            )
         return gen, cfg_text, cfg_img, image_shape
 
     def _build_generation_inputs(

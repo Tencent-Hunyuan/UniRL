@@ -9,7 +9,12 @@ import torch
 import torch.nn as nn
 
 from unirl.models.types.bundle import Bundle
-from unirl.models.types.meta_init import build_meta_init_transformer, capture_init_state, resolve_meta_init_weights
+from unirl.models.types.meta_init import (
+    build_meta_init_transformer,
+    capture_init_state,
+    finalize_meta_init,
+    resolve_meta_init_weights,
+)
 from unirl.utils.dtypes import parse_torch_dtype
 
 from .config import Qwen3_5PipelineConfig
@@ -179,8 +184,7 @@ class Qwen3_5Bundle(Bundle):
                     ops_implementation=ops,
                 )
                 meta_init_state = capture_init_state(transformer)
-                transformer = transformer.to(dtype)
-                transformer.init_weights = lambda: None
+                transformer = finalize_meta_init(transformer, dtype=dtype)
             else:
                 transformer, meta_init_state = build_meta_init_transformer(lambda: ModelCls(hf_config), dtype=dtype)
         else:

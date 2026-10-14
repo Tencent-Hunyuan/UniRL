@@ -147,11 +147,6 @@ class VeOmniBackend(BaseFSDP2Backend):
 
         apply_deferred_ops(model)
 
-        # Restore RoPE inv_freq after meta materialization.
-        from unirl.models.types.meta_init import recover_rope_inv_freq
-
-        recover_rope_inv_freq(model)
-
         self._finalize_construction(
             model,
             shadow,

@@ -45,6 +45,7 @@ class TrainStack(BaseTrainStack):
         micro_planner: Optional[MicroPlanner] = None,
         shuffle_updates: bool = False,
         shuffle_seed: int = 0,
+        first_update_ratio_tol: Optional[float] = None,
     ) -> None:
         super().__init__(
             fsdp_backend=fsdp_backend,
@@ -53,7 +54,15 @@ class TrainStack(BaseTrainStack):
             max_grad_norm=max_grad_norm,
             num_updates_per_batch=num_updates_per_batch,
         )
+        if first_update_ratio_tol is not None and not (
+            math.isfinite(first_update_ratio_tol) and first_update_ratio_tol > 0.0
+        ):
+            raise ValueError(
+                f"{type(self).__name__}.first_update_ratio_tol must be finite and > 0 when set; "
+                f"got {first_update_ratio_tol}."
+            )
         self.algorithm = algorithm
+        self.first_update_ratio_tol = first_update_ratio_tol
         self.update_planner = UpdatePlanner(
             micro_planner if micro_planner is not None else CountPlanner(),
             shuffle_updates=shuffle_updates,
@@ -290,7 +299,25 @@ class TrainStack(BaseTrainStack):
             prior_backward = prior_backward or result.has_backward
             results.append(result)
         # The window is one optimizer step: its grad_norm is the stepping call's.
-        return replace(aggregate_update_results(results), grad_norm=results[-1].grad_norm)
+        window = replace(aggregate_update_results(results), grad_norm=results[-1].grad_norm)
+        return self._guard_first_update_ratio(window)
+
+    def _guard_first_update_ratio(self, result: TrainStepResult) -> TrainStepResult:
+        """Report the pre-step importance ratio's distance from 1 and warn past ``first_update_ratio_tol``."""
+        if self.first_update_ratio_tol is None or not result.has_backward:
+            return result
+        worst = max(
+            max(1.0 - m.metrics["ratio_min"], m.metrics["ratio_max"] - 1.0) for m in result.micros if m.has_backward
+        )
+        if not worst <= self.first_update_ratio_tol:
+            logger.warning(
+                "%s: importance ratio is %.4g away from 1 before any optimizer step (tolerance %.4g); "
+                "the algorithm's pi_old anchor does not match the policy being trained.",
+                type(self).__name__,
+                worst,
+                self.first_update_ratio_tol,
+            )
+        return replace(result, metrics={**result.metrics, "first_update_ratio_dev": worst})
 
     def _run_updates(
         self,
@@ -309,4 +336,5 @@ class TrainStack(BaseTrainStack):
             cm = maybe_profile_update(self, self.fsdp_backend._rank) if scope_update else nullcontext()
             with cm:
                 results.append(self._run_update(part, micros=micros, order=order, training_progress=training_progress))
+        results[0] = self._guard_first_update_ratio(results[0])
         return aggregate_update_results(results, include_per_update=True)

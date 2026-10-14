@@ -11,6 +11,7 @@ from functools import partial
 from typing import Any, Dict, Iterator, Optional, Sequence, Tuple, Union
 
 import torch
+import torch.distributed as dist
 from torch import nn
 
 from unirl.models.types.post_materialize import defer_after_materialize
@@ -360,9 +361,17 @@ class FrozenAdapters:
     @classmethod
     def inject(cls, model: nn.Module, specs: Any) -> FrozenAdapters:
         """Inject every ``lora_cfg.frozen_adapters`` entry: structure now, weights after materialization."""
-        return cls(
-            {s.name: _inject_frozen_adapter(model, name=s.name, path=s.path) for s in normalize_frozen_adapters(specs)}
-        )
+        shas = {
+            s.name: _inject_frozen_adapter(model, name=s.name, path=s.path) for s in normalize_frozen_adapters(specs)
+        }
+        if shas:
+            # Each rank loads its own shard from its own copy, so differing copies would mix teacher versions.
+            gathered: list = [None] * dist.get_world_size()
+            dist.all_gather_object(gathered, shas)
+            if any(rank_shas != shas for rank_shas in gathered):
+                rendered = "\n".join(f"rank {rank}: {rank_shas}" for rank, rank_shas in enumerate(gathered))
+                raise RuntimeError("Frozen adapter weights differ across ranks:\n" + rendered)
+        return cls(shas)
 
     def is_trainable_lora_key(self, key: str) -> bool:
         """True for ``lora_A`` / ``lora_B`` keys of a non-frozen adapter — what adapter checkpoints hold."""

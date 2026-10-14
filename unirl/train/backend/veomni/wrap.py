@@ -36,7 +36,9 @@ def veomni_parallelize(
     master_t = (
         parse_torch_dtype(master_dtype, field_name="training.fsdp.master_dtype") if master_dtype else compute_dtype
     )
-    model.to(master_t)
+    for p in model.parameters():
+        if p.dtype.is_floating_point and p.dtype != master_t:
+            p.data = p.data.to(master_t)
 
     mixed_precision = MixedPrecisionConfig(
         enable=True,
