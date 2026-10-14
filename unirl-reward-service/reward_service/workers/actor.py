@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import gc
 import os
+import threading
 from typing import Any
 
 import ray
@@ -60,6 +61,8 @@ class ScorerActor:
         logger.info("ScorerActor initializing scorer=%s params=%s", scorer_name, params)
         self.scorer = cls(**params)
         self.scorer_name = scorer_name
+        self._cond = threading.Condition()
+        self._active_scores = 0
         self._shutting_down = False
 
     @staticmethod
@@ -84,9 +87,17 @@ class ScorerActor:
                 pass
 
     def score(self, items: list[ScoreItem]) -> list[dict[str, float]]:
-        if self._shutting_down:
-            raise RuntimeError(f"ScorerActor[{self.scorer_name}] is shutting down")
-        return self.scorer.score(items)
+        with self._cond:
+            if self._shutting_down:
+                raise RuntimeError(f"ScorerActor[{self.scorer_name}] is shutting down")
+            self._active_scores += 1
+        try:
+            return self.scorer.score(items)
+        finally:
+            with self._cond:
+                self._active_scores -= 1
+                if self._active_scores == 0:
+                    self._cond.notify_all()
 
     def sub_metric_names(self) -> tuple[str, ...]:
         return tuple(self.scorer.sub_metric_names)
@@ -95,9 +106,11 @@ class ScorerActor:
         return f"{self.scorer_name}:ready"
 
     def shutdown(self) -> str:
-        if self._shutting_down:
-            return f"{self.scorer_name}:already-shutting-down"
-        self._shutting_down = True
+        with self._cond:
+            if self._shutting_down:
+                return f"{self.scorer_name}:already-shutting-down"
+            self._shutting_down = True
+            self._cond.wait_for(lambda: self._active_scores == 0)
         self.scorer.drain()
         try:
             import torch

@@ -26,8 +26,11 @@ while True:
         break
     time.sleep(1)
 env = {**os.environ, "CUDA_MPS_PIPE_DIRECTORY": pipe, "CUDA_MPS_LOG_DIRECTORY": log}
-subprocess.run([binary], input="quit\n", text=True, env=env,
-               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+try:
+    subprocess.run([binary], input="quit\n", text=True, env=env, timeout=10,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+except subprocess.TimeoutExpired:
+    pass
 shutil.rmtree(pipe, ignore_errors=True)
 shutil.rmtree(log, ignore_errors=True)
 """
@@ -173,7 +176,11 @@ class MpsRuntime:
         try:
             if self._watchdog is not None:
                 self._watchdog.terminate()
-                self._watchdog.wait(timeout=5)
+                try:
+                    self._watchdog.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self._watchdog.kill()
+                    self._watchdog.wait(timeout=5)
                 self._watchdog = None
             if self.cfg.mode == "managed":
                 self._control("quit", check=False)

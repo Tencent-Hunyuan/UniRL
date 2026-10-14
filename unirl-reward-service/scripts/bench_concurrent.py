@@ -128,6 +128,13 @@ def _fire_once(
     else:
         elapsed = time.perf_counter() - t0
 
+    if len(results) != batch_size:
+        return _Outcome(
+            ok=False,
+            latency_s=elapsed,
+            err=f"ValueError: expected {batch_size} results, got {len(results)}",
+        )
+
     # Server-side per-reward failures come back as missing keys in the
     # result dict. We don't have direct access to body["errors"] here
     # (the client strips it), so missing = failed.
