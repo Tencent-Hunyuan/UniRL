@@ -112,10 +112,10 @@ class RLBagelPipeline(BagelPipeline):
                 kw["curr_rope"] = list(kw["curr_rope"]) * spp
             height, width = kw["image_sizes"][0]
             pipeline_self._pending_layout = {
-                "kv_len": int(kw["curr_kvlens"][0]),
-                "rope": int(kw["curr_rope"][0]),
-                "height": int(height),
-                "width": int(width),
+                "kv_len": kw["curr_kvlens"][0],
+                "rope": kw["curr_rope"][0],
+                "height": height,
+                "width": width,
             }
             out = orig(*args, **kw)
             noise = pipeline_self._pending_initial_noise

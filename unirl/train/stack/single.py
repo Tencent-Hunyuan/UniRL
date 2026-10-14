@@ -304,21 +304,11 @@ class TrainStack(BaseTrainStack):
 
     def _guard_first_update_ratio(self, result: TrainStepResult) -> TrainStepResult:
         """Report the pre-step importance ratio's distance from 1 and warn past ``first_update_ratio_tol``."""
-        if self.first_update_ratio_tol is None:
+        if self.first_update_ratio_tol is None or not result.has_backward:
             return result
-        deviations = [
-            float(max(1.0 - m.metrics["ratio_min"], m.metrics["ratio_max"] - 1.0))
-            for m in result.micros
-            if "ratio_min" in m.metrics
-        ]
-        if not deviations:
-            if result.has_backward:
-                raise ValueError(
-                    f"{type(self).__name__}.first_update_ratio_tol is set, but "
-                    f"{type(self.algorithm).__name__} reports no ratio_min / ratio_max to check."
-                )
-            return result
-        worst = math.nan if any(math.isnan(deviation) for deviation in deviations) else max(deviations)
+        worst = max(
+            max(1.0 - m.metrics["ratio_min"], m.metrics["ratio_max"] - 1.0) for m in result.micros if m.has_backward
+        )
         if not worst <= self.first_update_ratio_tol:
             logger.warning(
                 "%s: importance ratio is %.4g away from 1 before any optimizer step (tolerance %.4g); "
