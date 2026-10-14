@@ -89,7 +89,7 @@ Qualified CLIP and PickScore actors can share one GPU via NVIDIA MPS.
 scorers are qualified; float16/bfloat16 scorers need `active_thread_percentage: 100`.
 
 ```bash
-python -m reward_service --config configs/service.mps-h20.example.yaml
+python -m reward_service --config configs/service.mps.example.yaml
 ```
 
 ### Multi-host deployment
@@ -246,7 +246,7 @@ The output reports each request's min / mean / max latency plus p50/p90/p95/p99,
 
 For the CUDA MPS experiment in
 [#463](https://github.com/Tencent-Hunyuan/UniRL/issues/463), launch
-[`configs/service.mps-h20.example.yaml`](configs/service.mps-h20.example.yaml)
+[`configs/service.mps.example.yaml`](configs/service.mps.example.yaml)
 (or omit `mps` / set `num_gpus: 1` for the shared and dedicated baselines)
 and run the same client workload against each topology:
 
