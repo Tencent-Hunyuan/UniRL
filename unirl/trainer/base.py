@@ -62,6 +62,20 @@ def prepare_input_sample(
     return namespaced.with_parts([root, *namespaced.parts[1:]])
 
 
+def pad_eval_inputs(inputs: Sample, multiple: int) -> Sample:
+    """Append copies of the last prompt tree under ``:eval-pad:`` roots until ``multiple`` divides the root count."""
+    n = inputs.batch_size
+    if n % multiple == 0:
+        return inputs
+    source = inputs.slice(n - 1, n)
+    root = source.parts[0].sample_ids[0]
+    padded = [
+        source.map_sample_ids(lambda sid, pad_root=f"{root}:eval-pad:{i}": pad_root + sid[len(root) :])
+        for i in range((-n) % multiple)
+    ]
+    return Sample.concat([inputs, *padded])
+
+
 def build_sampling_dict(sampling_cfg: DictConfig) -> Dict[str, BaseSamplingParams]:
     """Instantiate a Hydra ``sampling`` config into the modality-keyed runtime dict."""
     if "_target_" in sampling_cfg:
