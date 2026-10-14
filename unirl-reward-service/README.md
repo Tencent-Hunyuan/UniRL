@@ -205,7 +205,9 @@ Other endpoints:
 ## Tests
 
 ```bash
-pytest scripts/test_bench_concurrent.py scripts/test_mps.py
+pytest -m "not gpu and not slow and not integration"   # CPU-only unit tests
+pytest tests/integration/ -m integration -v            # venv-install integration tests (need Ray + network)
+pytest                                                 # full suite (needs GPU)
 ```
 
 ## Venv check

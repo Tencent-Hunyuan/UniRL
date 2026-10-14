@@ -34,9 +34,9 @@ shutil.rmtree(log, ignore_errors=True)
 
 
 class MpsRuntime:
-    def __init__(self, cfg: MpsRuntimeCfg, *, binary: str | None = None) -> None:
+    def __init__(self, cfg: MpsRuntimeCfg) -> None:
         self.cfg = cfg
-        self.binary = binary or shutil.which("nvidia-cuda-mps-control")
+        self.binary = shutil.which("nvidia-cuda-mps-control")
         suffix = f"{os.getuid()}-{os.getpid()}"
         self.pipe_directory = Path(
             cfg.pipe_directory or f"/tmp/unirl-mps-{suffix}"
@@ -182,10 +182,3 @@ class MpsRuntime:
             self._saved_environment.clear()
             self._cleanup()
             self._started = False
-
-    def __enter__(self) -> MpsRuntime:
-        self.start()
-        return self
-
-    def __exit__(self, exc_type, exc, traceback) -> None:
-        self.stop()
