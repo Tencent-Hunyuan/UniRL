@@ -116,7 +116,7 @@ reward_stack:
 
 A micro can be as small as one row. The exception is an engine that packs a whole
 `samples_per_prompt` group into one request (the vLLM-Omni SD3 and Qwen-Image t2i
-adapters), which the engine reports through `packs_groups(sample)`; there a micro is
+adapters), which the engine reports through `packs_groups`; there a micro is
 extended to the end of the group it would otherwise split, so the group is the floor.
 vLLM-Omni BAGEL packs whatever contiguous siblings a micro holds, so it, SGLang and the
 trainside engine take micros of any size.

@@ -92,7 +92,7 @@ handler in `../../distributed/weight_sync`.
   instead of silently training against a different sequence.
 - **Per-row `metadata["canvas"]` is bounded by `sampling.height` / `sampling.width`
   and only valid for vLLM-Omni BAGEL with `FlowGRPO` (or `BagelFlowUniGRPO` with
-  `ratio_norm=False`).** `BagelInputAdapter.build` sends one call per contiguous
+  `ratio_norm=False`).** `BagelAdapter.build_inputs` sends one call per contiguous
   same-canvas run (`Sample.reject_row_canvases` rejects the key on every other
   engine), `build_image_segment` right-pads smaller trajectories on the token axis
   to the default canvas's token count so `LatentSegment.latents` stays dense, and

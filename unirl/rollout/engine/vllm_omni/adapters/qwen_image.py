@@ -141,14 +141,12 @@ class QwenImageT2iAdapter(ModelAdapter):
     deploy_config = "qwen_image_t2i_rl.yaml"
     omni_mode = "text-to-image"
     needs_driver_tokenizer = False
+    packs_groups = True
 
     def __init__(self, config: Any, model_config: Any, *, strategy: Any = None, tokenize_fn: Any = None) -> None:
         super().__init__(config, model_config, strategy=strategy, tokenize_fn=tokenize_fn)
         self.input_adapter = QwenImageGroupedInputAdapter(self.modality, model_config=model_config)
         self.output_adapter = QwenImageOutputAdapter(self.modality)
-
-    def packs_groups(self, sample: Sample) -> bool:
-        return True
 
     def validate_request(self, sample: Sample) -> None:
         if sample.has_image_input():
