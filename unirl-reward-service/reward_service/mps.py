@@ -13,6 +13,10 @@ from pathlib import Path
 _SUFFIX = f"{os.getuid()}-{os.getpid()}"
 MPS_PIPE_DIRECTORY = Path(f"/tmp/unirl-mps-{_SUFFIX}")
 _MPS_LOG_DIRECTORY = Path(f"/tmp/unirl-mps-log-{_SUFFIX}")
+_CLIENT_LIMIT_ENV = (
+    "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE",
+    "CUDA_MPS_PINNED_DEVICE_MEM_LIMIT",
+)
 
 _WATCHDOG = r"""
 import os, shutil, subprocess, sys, time
@@ -47,14 +51,17 @@ def mps_daemon(*, enabled: bool) -> Iterator[None]:
             raise RuntimeError(f"refusing to replace existing MPS path: {path}")
 
     env = {
-        **os.environ,
-        "CUDA_MPS_PIPE_DIRECTORY": str(MPS_PIPE_DIRECTORY),
-        "CUDA_MPS_LOG_DIRECTORY": str(_MPS_LOG_DIRECTORY),
+        k: v
+        for k, v in os.environ.items()
+        if k not in _CLIENT_LIMIT_ENV
     }
-    MPS_PIPE_DIRECTORY.mkdir(parents=True, mode=0o700)
-    _MPS_LOG_DIRECTORY.mkdir(parents=True, mode=0o700)
+    env["CUDA_MPS_PIPE_DIRECTORY"] = str(MPS_PIPE_DIRECTORY)
+    env["CUDA_MPS_LOG_DIRECTORY"] = str(_MPS_LOG_DIRECTORY)
     watchdog: subprocess.Popen | None = None
+    daemon_started = False
     try:
+        MPS_PIPE_DIRECTORY.mkdir(parents=True, mode=0o700)
+        _MPS_LOG_DIRECTORY.mkdir(parents=True, mode=0o700)
         result = subprocess.run(
             [binary, "-d"],
             text=True,
@@ -65,6 +72,7 @@ def mps_daemon(*, enabled: bool) -> Iterator[None]:
         if result.returncode:
             detail = result.stderr.strip() or result.stdout.strip()
             raise RuntimeError(f"failed to start MPS daemon: {detail}")
+        daemon_started = True
         watchdog = subprocess.Popen(
             [
                 sys.executable,
@@ -87,14 +95,18 @@ def mps_daemon(*, enabled: bool) -> Iterator[None]:
                 watchdog.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 watchdog.kill()
-                watchdog.wait(timeout=5)
-        subprocess.run(
-            [binary],
-            input="quit\n",
-            text=True,
-            capture_output=True,
-            env=env,
-            timeout=10,
-        )
+                watchdog.wait()
+        if daemon_started:
+            try:
+                subprocess.run(
+                    [binary],
+                    input="quit\n",
+                    text=True,
+                    capture_output=True,
+                    env=env,
+                    timeout=10,
+                )
+            except subprocess.TimeoutExpired:
+                pass
         shutil.rmtree(MPS_PIPE_DIRECTORY, ignore_errors=True)
         shutil.rmtree(_MPS_LOG_DIRECTORY, ignore_errors=True)

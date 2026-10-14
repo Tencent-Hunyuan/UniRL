@@ -32,14 +32,15 @@ _DEFAULT_SCORE_TIMEOUT_S = 120.0
 # before spilling to the next). "spread" asks Ray to distribute this
 # group's actors across nodes — a soft hint, not a hard placement group.
 _VALID_SCHEDULING = ("pack", "spread")
-_MEMORY_RE = re.compile(r"^([1-9][0-9]*)\s*(M|MB|MiB|G|GB|GiB)$", re.IGNORECASE)
+_MEMORY_RE = re.compile(r"^([1-9][0-9]*)\s*(M|MiB|G|GiB)$", re.IGNORECASE)
+_DEFAULT_MPS_ACTIVE_THREAD_PCT = 100
 
 
 @dataclass(frozen=True)
 class MpsClientCfg:
     """Limits applied by CUDA when an actor creates its first MPS context."""
 
-    active_thread_percentage: int = 100
+    active_thread_percentage: int = _DEFAULT_MPS_ACTIVE_THREAD_PCT
     device_memory_limit_mib: int | None = None
 
 
@@ -229,7 +230,9 @@ def load_config(path: str | Path) -> ServiceCfg:
                 raise ValueError(f"{ctx} mps must be a mapping")
             if not 0 < num_gpus <= 1:
                 raise ValueError(f"{ctx} MPS requires 0 < num_gpus <= 1, got {num_gpus}")
-            active = mps_entry.get("active_thread_percentage", 100)
+            active = mps_entry.get(
+                "active_thread_percentage", _DEFAULT_MPS_ACTIVE_THREAD_PCT
+            )
             if isinstance(active, bool) or not isinstance(active, int) or not 1 <= active <= 100:
                 raise ValueError(
                     f"{ctx} mps.active_thread_percentage must be an integer in [1, 100]"
