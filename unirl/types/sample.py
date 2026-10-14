@@ -505,6 +505,14 @@ class Sample(Batch):
                 raise ValueError(f"metadata['canvas'] must be [height, width] in positive pixels; got {canvas!r}.")
         return [tuple(canvas) for canvas in canvases]
 
+    def reject_row_canvases(self, *, engine: str) -> None:
+        """Raise when dataset rows ask for their own canvas on an engine that renders one canvas per request."""
+        if any(meta and "canvas" in meta for meta in self.root_metadata()):
+            raise ValueError(
+                f"{engine}: dataset rows carry metadata['canvas'], but this engine renders every row at "
+                "sampling.height/width; per-row canvases need the vLLM-Omni BAGEL engine."
+            )
+
     def gen_parts(self) -> List[Part]:
         """The generated (non-input) Parts — those with :attr:`Part.is_gen`."""
         return [p for p in self.parts if p.is_gen]

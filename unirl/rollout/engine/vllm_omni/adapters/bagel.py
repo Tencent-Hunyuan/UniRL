@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import dataclasses
-from types import SimpleNamespace
 from typing import Any, Dict, List
 
 from unirl.config.require import require
@@ -78,16 +77,16 @@ class BagelInputAdapter(DitInputAdapter):
         """The request's params re-targeted at a row canvas, x_T shape included; the default canvas returns them."""
         if (height, width) == (params.height, params.width):
             return params
-        shape = BagelPipeline.latent_shape(
-            model_config=self.model_config, sampling_spec=SimpleNamespace(height=height, width=width)
-        )
+        retargeted = dataclasses.replace(params, height=height, width=width)
+        shape = BagelPipeline.latent_shape(model_config=self.model_config, sampling_spec=retargeted)
         require(
             0 < shape[0] <= BagelPipeline.latent_shape(model_config=self.model_config, sampling_spec=params)[0],
             f"{self.modality}: row canvas {height}x{width} must hold at least one token and no more than "
             f"sampling.height/width ({params.height}x{params.width}), which bounds the stored trajectory.",
         )
-        noise_shape = None if params.init_noise_latent_shape is None else list(shape)
-        return dataclasses.replace(params, height=height, width=width, init_noise_latent_shape=noise_shape)
+        if params.init_noise_latent_shape is None:
+            return retargeted
+        return dataclasses.replace(retargeted, init_noise_latent_shape=list(shape))
 
     def build(self, sample: Sample) -> List[GenerateCall]:
         """One call per contiguous run of frontier rows that share a canvas."""

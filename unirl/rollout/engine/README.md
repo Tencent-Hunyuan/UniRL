@@ -90,16 +90,15 @@ handler in `../../distributed/weight_sync`.
   and `BagelDiffusionStage._resolve_single` raises when the rebuilt context differs, so
   a prompt or source-image preprocessing change on either side fails the first replay
   instead of silently training against a different sequence.
-- **A dataset row may set its own output canvas on vLLM-Omni BAGEL.** `metadata:
-  {"canvas": [H, W]}` on a row renders that prompt group at `H x W`; rows without
-  it use `sampling.height/width`. A row canvas may not have more tokens than that
-  default, because `LatentSegment.latents` stays dense: a smaller canvas's
-  trajectory is right-padded to the default's token count, and
-  `BagelDiffusionStage.replay` / `predict_velocity_at` trim their latent input
-  back to the canvas's tokens, so their outputs are the trimmed length. `FlowGRPO`
-  is the algorithm this supports. Replay anchors that are stored per token
-  (`sde_means`: `BagelFlowUniGRPO` with RatioNorm, `FlowDPPO`) are concatenated
-  across micros, and an algorithm that reads `segment.latents` itself
-  (`DiffusionNFT`) sees the padding, so both still need one canvas per rollout.
-  The adapter sends one call per contiguous run of same-canvas rows; every other
-  engine rejects the field by name.
+- **Per-row `metadata["canvas"]` is bounded by `sampling.height` / `sampling.width`
+  and only valid for vLLM-Omni BAGEL with `FlowGRPO` (or `BagelFlowUniGRPO` with
+  `ratio_norm=False`).** `BagelInputAdapter.build` sends one call per contiguous
+  same-canvas run (`Sample.reject_row_canvases` rejects the key on every other
+  engine), `build_image_segment` right-pads smaller trajectories on the token axis
+  to the default canvas's token count so `LatentSegment.latents` stays dense, and
+  `BagelDiffusionStage.replay` / `predict_velocity_at` trim back to
+  `packed_vae_token_indexes`. Per-token replay anchors (`sde_means` in `FlowDPPO`
+  and `BagelFlowUniGRPO` with `ratio_norm=True`) raise in
+  `prepare_segment_anchors` when micro shapes differ, and `DiffusionNFT` reads
+  `segment.latents[:, -1]` directly and would silently train on the right-padded
+  zeros.

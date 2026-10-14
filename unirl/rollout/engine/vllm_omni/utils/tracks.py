@@ -127,7 +127,7 @@ def build_image_segment(
     for diff_out in diff_outputs:
         traj_l = getattr(diff_out, "trajectory_latents", None)
         if traj_l is not None:
-            if pad_tokens_to is not None:
+            if pad_tokens_to is not None and traj_l.shape[-2] < pad_tokens_to:
                 traj_l = torch.nn.functional.pad(traj_l, (0, 0, 0, pad_tokens_to - traj_l.shape[-2]))  # [n, K, seq, C]
             per_latents.append(traj_l)
         traj_lp = getattr(diff_out, "trajectory_log_probs", None)
