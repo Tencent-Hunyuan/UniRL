@@ -148,7 +148,7 @@ class AgenticTrainer(BaseTrainer):
         )
         if sync_cfg is None:
             raise ValueError("AgenticTrainer requires colocated TensorWeightSync")
-        sync_target = str(sync_cfg["_target_"])
+        sync_target = sync_cfg["_target_"]
         if not sync_target.endswith("TensorWeightSync"):
             raise ValueError(f"AgenticTrainer requires colocated TensorWeightSync; got {sync_target!r}")
         validate_memory_saver_contract(rollout_cfg, strict=True)
@@ -240,23 +240,23 @@ class AgenticTrainer(BaseTrainer):
         for i in valid_indices:
             trajectory = trajectories[i]
             root = trajectory.parts[0]
-            metadata = root.metadata[0] if root.metadata else None
+            metadata = root.metadata[0] if root.metadata else {}
             prompt = root.primitives.get("text")
             questions.append(prompt.texts[0] if isinstance(prompt, Texts) and prompt.texts else "")
             terminal = trajectory.gen_parts()[-1].primitives.get("text")
             terminal_text = terminal.texts[0] if isinstance(terminal, Texts) and terminal.texts else ""
             predictions.append(_extract_answer(terminal_text))
-            answers.append(None if metadata is None else metadata.get("answer"))
+            answers.append((metadata or {}).get("answer"))
 
         score_count = len(valid_indices)
-        reward_dp_size = max(1, int(self.reward.dp_size))
+        reward_dp_size = self.reward.dp_size
         score_padding = (-score_count) % reward_dp_size
         if score_padding:
             questions.extend([questions[0]] * score_padding)
             predictions.extend([predictions[0]] * score_padding)
             answers.extend([answers[0]] * score_padding)
 
-        ar_sampling = self.sampling_params.get("ar")
+        ar_sampling = self.sampling_params["ar"]
         score_input = Part.input(
             [f"score{rollout_id}:{i}" for i in valid_indices]
             + [f"score{rollout_id}:padding{i}" for i in range(score_padding)],
@@ -360,7 +360,7 @@ class AgenticTrainer(BaseTrainer):
                 training_progress=float(training_progress),
                 rollout_id=rollout_id,
             )
-            train_rows = int(train_part.batch_size)
+            train_rows = train_part.batch_size
         else:
             result = TrainStepResult(0.0, 0.0, 0.0, False, [], {}, optimizer_updates=0)
             train_rows = 0
@@ -395,7 +395,7 @@ class AgenticTrainer(BaseTrainer):
         if count == 0:
             return Sample(parts=[])
 
-        ar_sampling = self.sampling_params.get("ar")
+        ar_sampling = self.sampling_params["ar"]
         root = Part.input(
             [f"log{rollout_id}:{i}" for i in range(count)],
             primitives={"text": Texts(texts=[""] * count)},
@@ -410,8 +410,8 @@ class AgenticTrainer(BaseTrainer):
         return sample.with_parts([*sample.parts[:-1], frontier])
 
     def _pad_to_dp_multiple(self, part: Part) -> Part:
-        dp_size = int(self.stack.dp_size)
-        pad = (-int(part.batch_size)) % dp_size
+        dp_size = self.stack.dp_size
+        pad = (-part.batch_size) % dp_size
         if pad == 0:
             return part
         lengths = part.segment.lengths if part.segment is not None else None

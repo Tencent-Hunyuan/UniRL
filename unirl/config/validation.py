@@ -70,7 +70,7 @@ _IPC_SYNC_SUFFIXES = frozenset({"UpdateWeightFromIPC"})
 
 def is_direct_sampling(cfg: DictConfig) -> bool:
     """Training-actor-sampling mode is derived from the selected engine."""
-    target = str(cfg.rollout.engine["_target_"])
+    target = str(cfg.rollout.engine.get("_target_") or "")
     return target.endswith(_DIRECT_SAMPLING_ENGINE_SUFFIXES)
 
 
@@ -80,7 +80,10 @@ def validate_dynamic_dotpaths(cfg: DictConfig) -> None:
     require(
         bool(dotpath), f"cfg.run.data_source_dotpath must be a non-empty dotpath; got {cfg.run.data_source_dotpath!r}"
     )
-    load_function(dotpath)
+    try:
+        load_function(dotpath)
+    except Exception as exc:
+        raise ValueError(f"cfg.run.data_source_dotpath={dotpath!r} failed to import: {exc}") from exc
 
 
 def validate_training_batch_geometry(cfg: DictConfig) -> None:
@@ -113,10 +116,10 @@ def validate_weight_sync_contract(cfg: DictConfig) -> None:
         "dedicated-rollout mode (rollout/engine=sglang or vllm_omni) requires a sync variant; got no sync section",
     )
     if has_sync:
-        sync_target = str(cfg.sync["_target_"])
+        sync_target = str(cfg.sync.get("_target_") or "")
         sync_name = sync_target.rsplit(".", 1)[-1]
         if sync_name in _IPC_SYNC_SUFFIXES:
-            engine_target = str(cfg.rollout.engine["_target_"])
+            engine_target = str(cfg.rollout.engine.get("_target_") or "")
             require(
                 engine_target.endswith(_VLLM_OMNI_ENGINE_TARGET_SUFFIX),
                 f"sync={sync_name} (bucketed CUDA-IPC) is only implemented by the "
@@ -128,7 +131,7 @@ def validate_rollout_layout(cfg: DictConfig) -> None:
     """Multi-GPU colocated rollout requires the sglang engine."""
     num_gpus_per_actor = int(cfg.placement.num_rollout_gpus_per_actor)
     if bool(cfg.placement.colocate) and num_gpus_per_actor > 1:
-        engine_target = str(cfg.rollout.engine["_target_"])
+        engine_target = str(cfg.rollout.engine.get("_target_") or "")
         require(
             engine_target.endswith(_SGLANG_ENGINE_TARGET_SUFFIX),
             f"multi-GPU colocated rollout (num_rollout_gpus_per_actor={num_gpus_per_actor}, colocate=True) requires the sglang_diffusion engine; got rollout.engine._target_={engine_target!r}",
@@ -155,8 +158,7 @@ def validate_memory_saver_contract(rollout_cfg: DictConfig, *, strict: bool) -> 
     # Same precedence as SGLangEngineConfig.server_intent: a set field overrides engine_kwargs.
     enabled = engine_cfg.get("enable_memory_saver")
     if enabled is None:
-        engine_kwargs = engine_cfg.get("engine_kwargs")
-        enabled = None if engine_kwargs is None else engine_kwargs.get("enable_memory_saver")
+        enabled = (engine_cfg.get("engine_kwargs") or {}).get("enable_memory_saver")
     if enabled:
         return
     if strict:
@@ -196,7 +198,7 @@ def validate_keep_local_contract(cfg: DictConfig) -> None:
     actor_count = cfg.training.topology.get("actor_count", None)
     if actor_count is not None:
         n = int(actor_count)
-        prompts = int(cfg.algorithm.prompts_per_rollout)
+        prompts = int(getattr(cfg.algorithm, "prompts_per_rollout", 1))
         require(
             n <= 0 or prompts % n == 0,
             "cfg.training.execution.keep_local=True requires "
@@ -215,14 +217,34 @@ def validate_lora_target_modules(cfg: DictConfig) -> None:
     if cfg.model.get("lora_target_modules") is not None:
         return
 
-    target_dotpath = str(cfg.model["_target_"])
-    model_cls = load_function(target_dotpath)
+    target_dotpath = str(cfg.model.get("_target_") or "")
+    if not target_dotpath:
+        return
+
+    try:
+        model_cls = load_function(target_dotpath)
+    except (ImportError, AttributeError, KeyError, ValueError) as exc:
+        logger.debug(
+            "Could not resolve model class %r for LoRA target lookup: %s",
+            target_dotpath,
+            exc,
+        )
+        return
 
     fn = getattr(model_cls, "default_lora_target_modules", None)
     if not callable(fn):
         return
 
-    resolved = fn()
+    try:
+        resolved = fn()
+    except (TypeError, NotImplementedError) as exc:
+        logger.warning(
+            "Model class %s.default_lora_target_modules() raised %s; "
+            "falling back to None (SGLang will wrap every linear layer).",
+            model_cls.__name__,
+            exc,
+        )
+        return
 
     if resolved is None:
         logger.warning(

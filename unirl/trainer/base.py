@@ -53,10 +53,10 @@ def prepare_input_sample(
 
     namespaced = inputs.map_sample_ids(lambda sample_id: f"r{rollout_id}:{sample_id}")
     root = namespaced.parts[0]
-    metadata = root.metadata if root.metadata else [{} for _ in root.sample_ids]
+    metadata = root.metadata or [{} for _ in root.sample_ids]
     if len(metadata) != len(root.sample_ids):
         raise ValueError(f"{caller}: root metadata has {len(metadata)} rows for {len(root.sample_ids)} root samples.")
-    root = replace(root, metadata=[{**({} if row is None else row), "rollout_id": int(rollout_id)} for row in metadata])
+    root = replace(root, metadata=[{**(row or {}), "rollout_id": int(rollout_id)} for row in metadata])
     if control is not None:
         root = replace(root, control={**root.control, **control})
     return namespaced.with_parts([root, *namespaced.parts[1:]])
@@ -171,7 +171,7 @@ class BaseTrainer:
         """Build the (rank-0/driver) wandb logger from the optional ``logging`` block."""
         from unirl.utils.wandb_logger import init_logger
 
-        cfg = {} if self.logging_cfg is None else self.logging_cfg
+        cfg = self.logging_cfg or {}
         report = bool(cfg.get("report_to_wandb", False)) and bool(cfg.get("project_name"))
 
         raw_tags = cfg.get("tags")
@@ -193,7 +193,6 @@ class BaseTrainer:
             run_config.update(extra)
 
         project = cfg.get("project_name")
-        raw_opt_step = self._resume_state.get("optimizer_step")
         self.wandb_logger = init_logger(
             project=str(project) if project else None,
             run_name=cfg.get("run_name"),
@@ -207,7 +206,7 @@ class BaseTrainer:
             media_log_interval=int(cfg.get("media_log_interval", 1)),
             enabled=report,
             run_id=self._resume_state.get("wandb_run_id"),
-            optimizer_step=0 if raw_opt_step is None else int(raw_opt_step),
+            optimizer_step=int(self._resume_state.get("optimizer_step") or 0),
         )
         if self.wandb_logger.initialized:
             logger.info("WandB initialized: project=%s run=%s", project, cfg.get("run_name"))
@@ -347,7 +346,7 @@ class BaseTrainer:
         result = self.backend.load(load_dir)
         if isinstance(result, list):
             result = result[0]
-        start = 0 if result is None else int(result)
+        start = int(result or 0)
         state_path = os.path.join(load_dir, "trainer_state.json")
         if os.path.exists(state_path):
             with open(state_path) as f:

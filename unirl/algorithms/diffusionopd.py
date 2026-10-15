@@ -25,8 +25,15 @@ DOMAIN_KEY = "domain"
 class TeacherSpec:
     """One distillation teacher."""
 
-    name: str
+    name: str = ""
     guidance_scale: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        if not self.name:
+            raise ValueError(f"DiffusionOPD: every teacher entry needs a 'name'; got {self!r}.")
+        self.name = str(self.name)
+        if self.guidance_scale is not None:
+            self.guidance_scale = float(self.guidance_scale)
 
 
 class DiffusionOPD(StageAlgorithm):
@@ -61,7 +68,7 @@ class DiffusionOPD(StageAlgorithm):
         self.params = params
         self.conditions_cls = conditions_cls
         self.add_kl_coefficient = bool(add_kl_coefficient)
-        if self.add_kl_coefficient and not float(params.eta) > 0.0:
+        if self.add_kl_coefficient and not params.eta > 0.0:
             raise ValueError(
                 "DiffusionOPD: add_kl_coefficient=True normalizes by the SDE transition std, "
                 f"which scales with sampling eta; got eta={params.eta!r}. "
@@ -69,15 +76,8 @@ class DiffusionOPD(StageAlgorithm):
             )
 
         self.teachers: Dict[str, TeacherSpec] = {}
-        for entry in () if teachers is None else teachers:
-            if isinstance(entry, TeacherSpec):
-                spec = entry
-            else:
-                name = entry.get("name")
-                if not name:
-                    raise ValueError(f"DiffusionOPD: every teacher entry needs a 'name'; got {entry!r}.")
-                gs = entry.get("guidance_scale")
-                spec = TeacherSpec(name=str(name), guidance_scale=None if gs is None else float(gs))
+        for entry in teachers or ():
+            spec = entry if isinstance(entry, TeacherSpec) else TeacherSpec(**entry)
             if spec.name in self.teachers:
                 raise ValueError(f"DiffusionOPD: duplicate teacher name {spec.name!r}.")
             self.teachers[spec.name] = spec
@@ -119,10 +119,7 @@ class DiffusionOPD(StageAlgorithm):
         if not target_steps:
             return part
 
-        domains = {
-            None if md is None else md.get(DOMAIN_KEY)
-            for md in (part.metadata if part.metadata else [None] * part.batch_size)
-        }
+        domains = {(md or {}).get(DOMAIN_KEY) for md in (part.metadata or [None] * part.batch_size)}
         if domains == {None}:
             raise RuntimeError(
                 "DiffusionOPD.prepare_part: no per-row metadata[{key!r}] on the train Part. "
@@ -199,7 +196,7 @@ class DiffusionOPD(StageAlgorithm):
             self.stage,
             segment=segment,
             target_steps=target_steps,
-            eta=float(self.params.eta),
+            eta=self.params.eta,
             device=student_means.device,
             add_coefficient=self.add_kl_coefficient,
         )

@@ -154,8 +154,8 @@ class PETrainer(BaseTrainer):
     ) -> Sample:
         """Turn a data-source batch of ``P`` prompts into the composed request ``Sample``."""
         base = sampling if sampling is not None else self.sampling_params
-        diff_params = base.get("diffusion")
-        ar_params = base.get("ar")
+        diff_params = base["diffusion"]
+        ar_params = base["ar"]
         sde_indices = diff_params.get_sde_indices(rollout_id)
         diffusion = dataclasses.replace(diff_params, sde_indices=sde_indices, scheduler=None)
         request = prepare_input_sample(
@@ -236,7 +236,7 @@ class PETrainer(BaseTrainer):
 
     def evaluate(self, step: int) -> float:
         """Periodic eval on the eval set (no training); returns the mean image reward."""
-        base_diffusion = self.sampling_params.get("diffusion")
+        base_diffusion = self.sampling_params["diffusion"]
         eval_diffusion = dataclasses.replace(
             base_diffusion,
             eta=self.eval_eta,
@@ -255,7 +255,7 @@ class PETrainer(BaseTrainer):
             metrics = self._eval_pass(self.data_source, self.eval_num_prompts, scorers, eval_sp, step)
             for suite in self._eval_suites:
                 if suite.data_source is not None:
-                    n = self.eval_num_prompts if suite.num_prompts is None else suite.num_prompts
+                    n = suite.num_prompts or self.eval_num_prompts
                     metrics.update(self._eval_pass(suite.data_source, n, [(suite.name, suite.reward)], eval_sp, step))
         finally:
             self.rollout.sleep()
@@ -281,8 +281,7 @@ class PETrainer(BaseTrainer):
         all_inputs = data_source.get_eval_samples(num_prompts)
         n_prompts = all_inputs.batch_size
         chunk = max(1, self.batch_size)
-        rem = n_prompts - n_prompts % chunk
-        usable = rem if rem > 0 else n_prompts
+        usable = n_prompts - n_prompts % chunk or n_prompts
         sums = {name: 0.0 for name, _ in scorers}
         counts = {name: 0 for name, _ in scorers}
         for start in range(0, usable, chunk):
@@ -352,7 +351,7 @@ class PETrainer(BaseTrainer):
             result = side.backend.load(os.path.join(load_dir, name))
             if isinstance(result, list):
                 result = result[0]
-            start = 0 if result is None else int(result)
+            start = int(result or 0)
         state_path = os.path.join(load_dir, "trainer_state.json")
         if os.path.exists(state_path):
             with open(state_path) as f:

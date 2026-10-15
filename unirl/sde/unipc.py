@@ -48,7 +48,7 @@ class UniPCStrategy(StepStrategy):
     canonical_name: ClassVar[str] = "unipc"
 
     def __init__(self, *, config: Optional[UniPCSpec] = None) -> None:
-        spec = UniPCSpec() if config is None else config
+        spec = config or UniPCSpec()
         self._order = spec.solver_order
         self._solver_type = spec.solver_type
         self._lower_order_final = spec.lower_order_final

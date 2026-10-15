@@ -131,9 +131,9 @@ class Part(Batch):
         return cls(
             sample_ids=list(sample_ids),
             segment=segment,
-            primitives={} if primitives is None else dict(primitives),
-            control={} if control is None else dict(control),
-            metadata=[] if metadata is None else list(metadata),
+            primitives=dict(primitives or {}),
+            control=dict(control) if control else {},
+            metadata=list(metadata) if metadata else [],
             role=role,
         )
 

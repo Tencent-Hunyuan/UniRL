@@ -239,7 +239,7 @@ def _transition_sigma(
     s = sigmas[idx]
     s_next = sigmas[idx + 1]
     sigma_max = sigmas[1] if int(sigmas.shape[0]) > 1 else torch.tensor(0.99, device=device, dtype=sigmas.dtype)
-    return stage.strategy.transition_std(sigma=s, sigma_next=s_next, eta=float(eta), sigma_max=sigma_max)
+    return stage.strategy.transition_std(sigma=s, sigma_next=s_next, eta=eta, sigma_max=sigma_max)
 
 
 def _reference_replay_means(

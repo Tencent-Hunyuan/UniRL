@@ -36,8 +36,7 @@ def ar_preflight(
     stack_cfg: DictConfig,
 ) -> Set[str]:
     """Model-blind pre-flight shared by :class:`ARTrainer` and ``AsyncARTrainer``."""
-    raw_target = pipeline_cfg.get("_target_")
-    target = "" if raw_target is None else str(raw_target)
+    target = str(pipeline_cfg.get("_target_", "") or "")
     parts = target.split(".")
     if target.startswith("unirl.models.") and len(parts) > 3:
         validation_module = f"unirl.models.{parts[2]}.validation"
@@ -426,7 +425,7 @@ class ARTrainer(BaseTrainer):
             allowed_primitives=self._allowed_input_primitives,
             caller="ARTrainer._build_request_sample",
         )
-        return request.fork(total_samples_per_prompt(sp), sampling_params=sp.get("ar"))
+        return request.fork(total_samples_per_prompt(sp), sampling_params=sp["ar"])
 
     def train_step(
         self,
@@ -601,9 +600,7 @@ class ARTrainer(BaseTrainer):
         n = inputs.batch_size
         if n == 0:
             return inputs
-        rollout_dp = max(1, int(self.rollout.dp_size))
-        reward_dp = max(1, int(self.reward.dp_size))
-        multiple = math.lcm(rollout_dp, reward_dp)
+        multiple = math.lcm(self.rollout.dp_size, self.reward.dp_size)
         pad_n = (-n) % multiple
         if pad_n == 0:
             return inputs
@@ -659,7 +656,7 @@ class ARTrainer(BaseTrainer):
                                 "sample": i,
                                 "prompt": prompts[i] if i < len(prompts) else None,
                                 "output": outputs[i],
-                                "output_chars": len("" if outputs[i] is None else outputs[i]),
+                                "output_chars": len(outputs[i] or ""),
                                 "reward": rewards[i] if i < len(rewards) else None,
                             },
                             ensure_ascii=False,

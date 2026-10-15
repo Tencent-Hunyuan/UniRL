@@ -1,7 +1,6 @@
 import dataclasses
 import inspect
 import logging
-import os
 import sys
 import time
 from contextlib import contextmanager
@@ -118,7 +117,7 @@ def _preflight_trainside_geometry(
     rollout_cfg: DictConfig,
 ) -> None:
     """Reject statically-known trainside DP geometry before constructing heavy model roles."""
-    rollout_target = str(rollout_cfg["_target_"])
+    rollout_target = rollout_cfg["_target_"]
     if not rollout_target.endswith(".TrainsideRolloutEngine") or layout == "separate":
         return
 
@@ -133,19 +132,17 @@ def _preflight_trainside_geometry(
     # The recipe carries a raw DictConfig, so unset keys fall back to the one
     # place the defaults live rather than to literals repeated here.
     fsdp_cfg = backend_cfg.get("fsdp_cfg", {})
-    raw_sp_size = fsdp_cfg.get("sp_size", None)
-    sp_size = FSDPConfig.sp_size if raw_sp_size is None else int(raw_sp_size)
+    sp_size = int(fsdp_cfg.get("sp_size", None) or FSDPConfig.sp_size)
     if shared_devices % sp_size:
         raise ValueError(
             f"Static trainside geometry: {shared_devices} shared devices are not divisible by sp_size={sp_size}."
         )
     # Called for its validation: raises when the shared world cannot form the
     # configured mesh, while the wrap-time call owns the real world size.
-    raw_hsdp_shard_size = fsdp_cfg.get("hsdp_shard_size", None)
     resolve_fsdp_mesh_shape(
         fsdp_cfg.get("fsdp_mode", FSDPConfig.fsdp_mode),
         world_size=shared_devices,
-        hsdp_shard_size=FSDPConfig.hsdp_shard_size if raw_hsdp_shard_size is None else int(raw_hsdp_shard_size),
+        hsdp_shard_size=int(fsdp_cfg.get("hsdp_shard_size", None) or FSDPConfig.hsdp_shard_size),
     )
     shared_dp_size = shared_devices // sp_size
 
@@ -256,7 +253,7 @@ def build_eval_sampling(
     if float(updates["eta"]) <= 0.0:
         updates["sde_indices"] = []
         updates["scheduler"] = None
-    elif steps != int(base.num_inference_steps):
+    elif steps != base.num_inference_steps:
         raise ValueError(
             f"eval eta={updates['eta']} leaves the SDE gate on, but eval_sampling.num_inference_steps"
             f"={steps} differs from the rollout's {base.num_inference_steps}: the gated step indices "
@@ -376,42 +373,34 @@ class DiffusionTrainer(BaseTrainer):
             overrides=eval_sampling_cfg,
         )
 
-        self._noise_latent_shape: Optional[list] = (
-            None
-            if os.environ.get("DISABLE_DRIVER_XT")
-            else self._resolve_noise_latent_shape(
-                pipeline_cfg=pipeline_cfg,
-                model_cfg=bundle_cfg,
-                sampling_spec=self.sampling_params.get("diffusion"),
-            )
+        self._noise_latent_shape: Optional[list] = self._resolve_noise_latent_shape(
+            pipeline_cfg=pipeline_cfg,
+            model_cfg=bundle_cfg,
+            sampling_spec=self.sampling_params["diffusion"],
         )
         # Eval may render at its own resolution, so the driver-authored x_T has to
         # match THAT geometry rather than the rollout's.
-        self._eval_noise_latent_shape: Optional[list] = (
-            None
-            if self._noise_latent_shape is None
-            else self._resolve_noise_latent_shape(
-                pipeline_cfg=pipeline_cfg,
-                model_cfg=bundle_cfg,
-                sampling_spec=self._eval_sampling_params.get("diffusion"),
-            )
+        self._eval_noise_latent_shape: Optional[list] = self._resolve_noise_latent_shape(
+            pipeline_cfg=pipeline_cfg,
+            model_cfg=bundle_cfg,
+            sampling_spec=self._eval_sampling_params["diffusion"],
         )
-        if self.eval_interval > 0 and self.logging_cfg is not None and bool(self.logging_cfg.get("log_media", False)):
+        if self.eval_interval > 0 and bool((self.logging_cfg or {}).get("log_media", False)):
             eval_diffusion = self._eval_sampling_params["diffusion"]
-            if self._eval_noise_latent_shape is None or bool(eval_diffusion.disable_driver_xt):
+            if self._eval_noise_latent_shape is None:
                 logger.warning(
                     "logging.log_media is on, but eval has no driver-authored x_T "
-                    "(DISABLE_DRIVER_XT / disable_driver_xt, or latent_shape() opted out), so "
+                    "(disable_driver_xt, or latent_shape() opted out), so "
                     "every eval draws fresh noise and the eval panel will not be comparable "
                     "across evals."
                 )
-            elif float(eval_diffusion.eta) > 0.0:
+            elif eval_diffusion.eta > 0.0:
                 logger.warning(
                     "logging.log_media is on with eval eta=%.2f > 0: x_T is prompt-keyed, but "
                     "per-step SDE noise is seeded from the eval step's sample ids, so eval "
                     "panels differ by noise as well as policy. Set eval_eta: 0 for a "
                     "like-for-like filmstrip.",
-                    float(eval_diffusion.eta),
+                    eval_diffusion.eta,
                 )
 
         self.weight_sync = None
@@ -496,9 +485,9 @@ class DiffusionTrainer(BaseTrainer):
             batch_size=int(batch_size),
             samples_per_prompt=total_samples_per_prompt(self.sampling_params),
             num_updates_per_batch=int(stack_cfg.get("num_updates_per_batch", 1)),
-            rollout_dp_size=int(self.rollout.dp_size),
-            reward_dp_size=int(self.reward.dp_size) if self.reward is not None else 1,
-            train_dp_size=int(self.stack.dp_size),
+            rollout_dp_size=self.rollout.dp_size,
+            reward_dp_size=self.reward.dp_size if self.reward is not None else 1,
+            train_dp_size=self.stack.dp_size,
             require_rollout_dp_divisibility=not self._prompt_local_rollout,
         )
 
@@ -526,8 +515,7 @@ class DiffusionTrainer(BaseTrainer):
             raise ValueError(f"accumulate_rollouts must be >= 1, got {acc}")
         if acc == 1:
             return
-        raw_updates = stack_cfg.get("num_updates_per_batch", 1)
-        n_updates = 1 if raw_updates is None else int(raw_updates)
+        n_updates = int(stack_cfg.get("num_updates_per_batch", 1) or 1)
         if n_updates != 1:
             raise ValueError(
                 f"accumulate_rollouts={acc} requires stack.num_updates_per_batch == 1 "
@@ -582,7 +570,7 @@ class DiffusionTrainer(BaseTrainer):
         if reward_cfg is not None:
             self.reward = remote_hydra(reward_cfg)
             self._wire_eval_suites()
-        algo_cls = get_class(str(algorithm_cfg["_target_"]))
+        algo_cls = get_class(algorithm_cfg["_target_"])
         self._uses_ema = algo_cls.requires_ema_rollout
         # requires_advantages=False algorithms keep rewards for monitoring only.
         self._algo_requires_advantages = algo_cls.requires_advantages
@@ -665,7 +653,7 @@ class DiffusionTrainer(BaseTrainer):
 
     def _connect_separate(self, sync_cfg: DictConfig) -> None:
         """One-time cross-slab handshake: hand rank 0 the rollout Worker handles."""
-        if str(sync_cfg["_target_"]).endswith("NCCLWeightSync"):
+        if sync_cfg["_target_"].endswith("NCCLWeightSync"):
             addr, port = self.weight_sync.pick_master()[0]
             self.weight_sync.set_rollout_targets(self.rollout.workers, self.rollout.role_name)
             self.weight_sync.connect(
@@ -680,6 +668,8 @@ class DiffusionTrainer(BaseTrainer):
         self, *, pipeline_cfg: DictConfig, model_cfg: DictConfig, sampling_spec: Any
     ) -> Optional[list]:
         """Per-sample latent shape for the driver-authored x_T recipe, or ``None``."""
+        if sampling_spec.disable_driver_xt:
+            return None
         target = pipeline_cfg.get("_target_")
         if not isinstance(target, str):
             return None
@@ -692,7 +682,7 @@ class DiffusionTrainer(BaseTrainer):
             shape = latent_shape_fn(model_config=model_cfg, sampling_spec=sampling_spec)
         except NotImplementedError:
             return None
-        return [int(x) for x in shape]
+        return list(shape)
 
     def _build_request_sample(
         self,
@@ -704,7 +694,7 @@ class DiffusionTrainer(BaseTrainer):
         """Turn a data source batch into a request :class:`Sample`."""
         sp = sampling if sampling is not None else self.sampling_params
         noise_latent_shape = self._eval_noise_latent_shape if sampling is not None else self._noise_latent_shape
-        diffusion = sp.get("diffusion")
+        diffusion = sp["diffusion"]
         sde_indices = diffusion.get_sde_indices(rollout_id)
         diffusion = dataclasses.replace(
             diffusion, sde_indices=sde_indices, scheduler=None, init_noise_latent_shape=noise_latent_shape
@@ -786,9 +776,9 @@ class DiffusionTrainer(BaseTrainer):
     def _build_reward_stack(self, reward_stack_cfg: DictConfig) -> Any:
         """Build the stack beside the engine it wraps and reject the SP/TP layouts it inherits but cannot serve."""
         stack = remote_hydra(reward_stack_cfg, rollout=self.rollout, reward=self.reward)
-        if int(stack.dp_size) != int(self.rollout.dp_size):
+        if stack.dp_size != self.rollout.dp_size:
             raise ValueError(f"reward_stack dp_size={stack.dp_size} must equal rollout dp_size={self.rollout.dp_size}.")
-        if int(stack.sp_size) != 1 or int(stack.tp_size) != 1:
+        if stack.sp_size != 1 or stack.tp_size != 1:
             raise ValueError(
                 f"reward_stack needs sp_size=1 and tp_size=1, got sp_size={stack.sp_size}, tp_size={stack.tp_size}: "
                 "every rank of an SP or TP group would score the same shard, or nothing."
@@ -970,7 +960,7 @@ class DiffusionTrainer(BaseTrainer):
                 "block) — evaluation scores generations and needs one."
             )
         eval_sp = self._eval_sampling_params
-        eval_diffusion = eval_sp.get("diffusion")
+        eval_diffusion = eval_sp["diffusion"]
         sync_requested = bool(sync_weights)
         sleep_requested = sleep_after and not self._residency.policy.rollout_resident
         # A no-sync evaluation must preserve the already-resident adapter.
@@ -1001,7 +991,7 @@ class DiffusionTrainer(BaseTrainer):
             generated_any = generated_any or pass_generated
             for suite in self._eval_suites:
                 if suite.data_source is not None:
-                    n = self.eval_num_prompts if suite.num_prompts is None else suite.num_prompts
+                    n = suite.num_prompts or self.eval_num_prompts
                     suite_metrics, sync_pending, pass_generated = self._eval_pass(
                         suite.data_source,
                         n,
@@ -1026,12 +1016,12 @@ class DiffusionTrainer(BaseTrainer):
         logger.info(
             "EVAL step %d  (%d samples/prompt, %d steps, %dx%d, cfg=%.1f eta=%.1f)  %s",
             step,
-            int(eval_diffusion.samples_per_prompt),
-            int(eval_diffusion.num_inference_steps),
-            int(eval_diffusion.height),
-            int(eval_diffusion.width),
-            float(eval_diffusion.guidance_scale),
-            float(eval_diffusion.eta),
+            eval_diffusion.samples_per_prompt,
+            eval_diffusion.num_inference_steps,
+            eval_diffusion.height,
+            eval_diffusion.width,
+            eval_diffusion.guidance_scale,
+            eval_diffusion.eta,
             "  ".join(f"{k}={v:.4f}" for k, v in metrics.items()),
         )
         self.wandb_logger.log_eval(step, metrics)
@@ -1075,9 +1065,9 @@ class DiffusionTrainer(BaseTrainer):
         for start in range(0, n_prompts, chunk):
             sub = all_inputs.slice(start, min(start + chunk, n_prompts))
             _validate_prompt_tree_dp_geometry(
-                batch_size=int(sub.batch_size),
-                rollout_dp_size=int(self.rollout.dp_size),
-                reward_dp_size=int(self.reward.dp_size),
+                batch_size=sub.batch_size,
+                rollout_dp_size=self.rollout.dp_size,
+                reward_dp_size=self.reward.dp_size,
                 context=f"evaluation chunk [{start}:{start + sub.batch_size}]",
             )
             request = self._build_request_sample(sub, step, sampling=eval_sp)
