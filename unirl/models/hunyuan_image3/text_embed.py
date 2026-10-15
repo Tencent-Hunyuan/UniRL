@@ -83,7 +83,7 @@ class HunyuanImage3TextEmbedStage:
         max_length: Optional[int] = None,
         batch_cond_image_info: Optional[Any] = None,
     ) -> Tuple[Any, Any]:
-        """Run the upstream tokenizer wrapper; returns ``(output, sections)``."""
+        """Run the upstream tokenizer wrapper and return ``(output, sections)`` (README ``## Gotchas``)."""
         transformer = self.bundle.transformer
         config = transformer.config
         gen_config = transformer.generation_config
