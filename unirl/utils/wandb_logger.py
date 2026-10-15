@@ -140,9 +140,34 @@ _STEP_PHASE_SPECS = (
     ("stack", "train_track", "train"),
 )
 
+_ASYNC_PHASE_SPECS = (
+    ("_rollout_manager", "collect", "rollout_collect_wait"),
+    ("reward", "score_and_attach", "reward"),
+    ("stack", "train_track", "train"),
+    ("_rollout_manager", "quiesce", "quiesce"),
+    ("_rollout_manager", "finish", "carry_finish"),
+    ("_rollout_manager", "sync_weights", "weight_sync"),
+)
+
+
+def install_async_phase_timing(trainer: Any) -> None:
+    """Attribute async collaborator calls to the active :func:`async_step_timing` window."""
+    _wrap_phase_methods(trainer, _ASYNC_PHASE_SPECS)
+    trainer._step_timer = None
+
+
+@contextmanager
+def async_step_timing(trainer: Any) -> Iterator[PhaseTimer]:
+    """Time one async iteration through required weight publication."""
+    timer = trainer._step_timer = PhaseTimer()
+    try:
+        yield timer
+    finally:
+        trainer._step_timer = None
+
 
 def install_phase_timing(trainer: Any) -> None:
-    """Attribute every train step into ``perf/<phase>_time_s`` — no trainer edits."""
+    """Attribute every synchronous train step into ``perf/<phase>_time_s`` — no trainer edits."""
     inner = getattr(trainer, "train_step", None)
     if not callable(inner):
         return
@@ -155,7 +180,8 @@ def install_phase_timing(trainer: Any) -> None:
     @functools.wraps(inner)
     def _first_step(*args, **kwargs):
         trainer._step_timer = PhaseTimer()
-        _wrap_step_collaborators(trainer)
+        _wrap_phase_methods(trainer, _STEP_PHASE_SPECS)
+        _wrap_step_logger(trainer)
         trainer.train_step = _steady_step
         return inner(*args, **kwargs)
 
@@ -168,21 +194,27 @@ def _timed_call(trainer: Any, fn, phase: str):
 
     @functools.wraps(fn)
     def _timed(*args, **kwargs):
-        with trainer._step_timer.phase(phase):
+        timer = trainer._step_timer
+        if timer is None:
+            return fn(*args, **kwargs)
+        with timer.phase(phase):
             return fn(*args, **kwargs)
 
     return _timed
 
 
-def _wrap_step_collaborators(trainer: Any) -> None:
-    """Time each present collaborator method, and teach the logger to emit phases."""
-    for handle_attr, method, phase in _STEP_PHASE_SPECS:
+def _wrap_phase_methods(trainer: Any, specs: tuple[tuple[str, str, str], ...]) -> None:
+    """Time each present collaborator method."""
+    for handle_attr, method, phase in specs:
         handle = getattr(trainer, handle_attr, None)
         fn = getattr(handle, method, None)
         if not callable(fn):
             continue
         setattr(handle, method, _timed_call(trainer, fn, phase))
 
+
+def _wrap_step_logger(trainer: Any) -> None:
+    """Teach the logger to emit synchronous phase times."""
     log_inner = trainer.wandb_logger.log_rollout_step
 
     @functools.wraps(log_inner)

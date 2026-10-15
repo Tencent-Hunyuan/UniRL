@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import time
 from dataclasses import replace
 from typing import Any, Dict, Optional, Tuple
 
@@ -102,12 +101,9 @@ class AsyncDiffusionTrainer(AsyncRolloutTrainerMixin, DiffusionTrainer):
         *,
         training_progress: float,
         rollout_id: int,
-        t0: Optional[float] = None,
         extra_metrics: Optional[dict[str, float]] = None,
     ) -> Tuple[TrainStepResult, float]:
         """Advantage + optimizer updates for a scored ``Sample`` (rewards already attached)."""
-        if t0 is None:
-            t0 = time.perf_counter()
         part = sample.parts[-1]
         mean_reward = 0.0
         if part.rewards is not None:
@@ -137,7 +133,6 @@ class AsyncDiffusionTrainer(AsyncRolloutTrainerMixin, DiffusionTrainer):
             rollout_id,
             result,
             sample,
-            step_time_s=time.perf_counter() - t0,
             extra_metrics=extra_metrics,
         )
         self._reset_transport_buffers()
