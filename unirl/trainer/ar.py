@@ -11,6 +11,7 @@ import torch
 from hydra.utils import get_class, get_object, instantiate
 from omegaconf import DictConfig
 
+from unirl.config.validation import validate_memory_saver_contract
 from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.group.results import rank_zero_bool
 from unirl.distributed.tensor import hydrate
@@ -35,7 +36,7 @@ def ar_preflight(
     stack_cfg: DictConfig,
 ) -> Set[str]:
     """Model-blind pre-flight shared by :class:`ARTrainer` and ``AsyncARTrainer``."""
-    target = str(pipeline_cfg.get("_target_", "") or "")
+    target = pipeline_cfg.get("_target_") or ""
     parts = target.split(".")
     if target.startswith("unirl.models.") and len(parts) > 3:
         validation_module = f"unirl.models.{parts[2]}.validation"
@@ -98,7 +99,6 @@ class ARTrainer(BaseTrainer):
         # misconfigured recipe fails fast without a half-constructed device pool or actors.
         algorithm_cls = get_class(algorithm_cfg["_target_"])
         self._algorithm_requires_advantages = algorithm_cls.requires_advantages
-        eval_interval = int(eval_interval)
         if reward_cfg is None:
             if self._algorithm_requires_advantages:
                 raise ValueError(
@@ -112,23 +112,44 @@ class ARTrainer(BaseTrainer):
                     "but the recipe has no `reward:` block. Set eval_interval: 0 or configure a "
                     "(monitoring-only) reward."
                 )
+        if advantage_mode not in ("grpo", "gae"):
+            raise ValueError(f"ARTrainer: advantage_mode must be 'grpo' or 'gae', got {advantage_mode!r}")
+        self.advantage_mode = advantage_mode
+        self._rollout_anchor_device = rollout_anchor_device
+        rollout_parsed = parse_hydra_cfg(rollout_cfg)
+        takes_pipeline = "pipeline" in inspect.signature(rollout_parsed["role_cls"]).parameters
+        if takes_pipeline:
+            if self._rollout_anchor_device is not None:
+                raise ValueError(
+                    "ARTrainer: rollout_anchor_device requires a dedicated rollout engine; "
+                    "the trainside direct-sampling engine samples on the train actors."
+                )
+            if sync_cfg is not None:
+                raise ValueError(
+                    "ARTrainer: trainside direct-sampling engine reads the live training weights and cannot use a `sync:` block."
+                )
+        elif sync_cfg is None:
+            raise ValueError("ARTrainer: dedicated rollout engine requires a `sync:` block.")
+        if self._rollout_anchor_device is not None and self._rollout_anchor_device <= 0:
+            raise ValueError(
+                "rollout_anchor_device<=0 would colocate the TP engine with "
+                "the rank-0 RemoteLoraWeightSync sender and self-deadlock; "
+                f"use a positive anchor device (got {self._rollout_anchor_device})."
+            )
+        self._enable_fsdp_offload = enable_fsdp_offload and not takes_pipeline
+        rollout_sleeps = not takes_pipeline if self._rollout_anchor_device is None else self._enable_fsdp_offload
+        if rollout_sleeps:
+            validate_memory_saver_contract(rollout_cfg, strict=False)
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
         self.batch_size = batch_size
         self.adv_normalization_scope = adv_normalization_scope
         self.normalize_adv_by_std = normalize_adv_by_std
-        self.advantage_mode = str(advantage_mode).strip().lower()
-        if self.advantage_mode not in ("grpo", "gae"):
-            raise ValueError(f"ARTrainer: advantage_mode must be 'grpo' or 'gae', got {advantage_mode!r}")
-        self.balance_shards = bool(balance_shards)
+        self.balance_shards = balance_shards
         self.eval_interval = eval_interval
-        _num = int(eval_num_prompts)
-        self.eval_num_prompts = -1 if _num < 0 else _num
-        self.eval_batch_size = max(1, int(eval_batch_size))
-        self.eval_samples_per_prompt = int(eval_samples_per_prompt)
-        self.eval_temperature = float(eval_temperature)
-
-        self._rollout_anchor_device: Optional[int] = rollout_anchor_device
-        self._enable_fsdp_offload = bool(enable_fsdp_offload)
+        self.eval_num_prompts = -1 if eval_num_prompts < 0 else eval_num_prompts
+        self.eval_batch_size = max(1, eval_batch_size)
+        self.eval_samples_per_prompt = eval_samples_per_prompt
+        self.eval_temperature = eval_temperature
         self._anchored_backend_offloaded: Optional[bool] = False
         self._anchored_rollout_awake: Optional[bool] = None
 
@@ -152,10 +173,9 @@ class ARTrainer(BaseTrainer):
             self.algorithm = remote_hydra(algorithm_cfg, pipeline=self.pipeline, **algo_extra)
             self.stack = remote_hydra(stack_cfg, fsdp_backend=self.backend, algorithm=self.algorithm)
 
-            rollout_parsed = parse_hydra_cfg(rollout_cfg)
             if self._rollout_anchor_device is None:
                 self._supports_staged_wake = "tags" in inspect.signature(rollout_parsed["role_cls"].wake_up).parameters
-                bootstrap_offload = sync_cfg is not None and self._enable_fsdp_offload
+                bootstrap_offload = self._enable_fsdp_offload
                 bootstrap_offloaded = False
                 rollout_boot_started = False
                 rollout_constructed = False
@@ -171,15 +191,13 @@ class ARTrainer(BaseTrainer):
                             raise
 
                     rollout_boot_started = True
-                    if "pipeline" in inspect.signature(rollout_parsed["role_cls"]).parameters:
+                    if takes_pipeline:
                         self.rollout = remote(**rollout_parsed, pipeline=self.pipeline)
+                        rollout_constructed = True
                     else:
                         self.rollout = remote(**rollout_parsed)
-                    rollout_constructed = True
-                    if sync_cfg is not None:
+                        rollout_constructed = True
                         self.weight_sync = remote_hydra(sync_cfg, backend=self.backend, rollout=self.rollout)
-
-                    if self.weight_sync is not None:
                         rollout_sleep_attempted = True
                         self.rollout.sleep()
                         rollout_memory_released = True
@@ -266,7 +284,10 @@ class ARTrainer(BaseTrainer):
     def _preserve_rollout_weights_for_next_sleep(self) -> None:
         if not self._uses_gpu_streaming_weight_sync():
             return
-        self.rollout.preserve_weights_for_next_sleep()
+        preserve = getattr(self.rollout, "preserve_weights_for_next_sleep", None)
+        if not callable(preserve):
+            raise RuntimeError("GPU-streaming weight sync requires rollout sleep-preservation support")
+        preserve()
 
     def _must_preserve_rollout_weights(self, *, next_phase_syncs: bool, has_next_phase: bool) -> bool:
         return must_preserve_rollout_weights(
@@ -286,6 +307,11 @@ class ARTrainer(BaseTrainer):
         original_error: Optional[BaseException] = None
         try:
             if sync_weights:
+                if self._uses_gpu_streaming_weight_sync():
+                    raise RuntimeError(
+                        "vLLM native IPC weight sync requires the SPMD one-Actor-rank-per-TP-rank "
+                        "layout and does not support rollout_anchor_device"
+                    )
                 self._ensure_anchored_backend_loaded()
                 self.weight_sync.extract()
             self._ensure_anchored_backend_offloaded()
@@ -329,11 +355,16 @@ class ARTrainer(BaseTrainer):
 
     def _prepare_rollout(self, *, sync_weights: bool) -> bool:
         """Wake/sync the SPMD rollout and optionally offload train state."""
-        do_offload = self._enable_fsdp_offload and self.weight_sync is not None
+        do_offload = self._enable_fsdp_offload
         do_sync = sync_weights and self.weight_sync is not None
         train_state_maybe_offloaded = False
         full_wake_after_train_offload_in_progress = False
         gpu_streaming_sync = bool(do_sync and self._uses_gpu_streaming_weight_sync())
+        if gpu_streaming_sync and not do_offload:
+            raise RuntimeError(
+                "vLLM native IPC weight sync requires enable_fsdp_offload=true "
+                "so optimizer/model state can be released around rollout"
+            )
 
         try:
             if do_sync and do_offload and self._supports_staged_wake:
@@ -513,7 +544,7 @@ class ARTrainer(BaseTrainer):
             train_state_offloaded = self._prepare_rollout(sync_weights=self.weight_sync is not None)
         eval_session = (
             self._anchored_rollout_session(
-                sync_weights=self.weight_sync is not None,
+                sync_weights=True,
                 restore_backend=False,
             )
             if anchored

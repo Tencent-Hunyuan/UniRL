@@ -98,7 +98,10 @@ class IPCWeightSync(FullWeightSync):
                 import torch.distributed as dist
 
                 self._control_group = dist.new_group(backend="gloo", timeout=self._control_timeout)
-            self._rollout.set_weight_sync_sleep_level(2, preserve_next_sleep=True)
+            configure_sleep = getattr(self._rollout, "set_weight_sync_sleep_level", None)
+            if not callable(configure_sleep):
+                raise RuntimeError("vLLM native IPC sync requires configurable sleep level")
+            configure_sleep(2, preserve_next_sleep=True)
 
     @staticmethod
     def _dist_ready() -> bool:

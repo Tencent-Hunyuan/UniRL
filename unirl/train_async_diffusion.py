@@ -6,13 +6,11 @@ from __future__ import annotations
 import hydra
 from omegaconf import DictConfig
 
-from unirl.config.contracts import validate_recipe
 from unirl.trainer.async_diffusion import ASYNC_RESIDENCY_POLICY, AsyncDiffusionTrainer
 
 
 @hydra.main(version_base=None, config_path="../examples", config_name="diffusion/bagel/bagel_vllmomni_async")
 def main(cfg: DictConfig) -> None:
-    validate_recipe(cfg, entrypoint="train_async_diffusion")
     trainer = AsyncDiffusionTrainer(
         cfg=cfg,
         batch_size=cfg.batch_size,
@@ -25,8 +23,9 @@ def main(cfg: DictConfig) -> None:
         stack_cfg=cfg.stack,
         data_source_cfg=cfg.data_source,
         sampling_cfg=cfg.sampling,
-        sync_cfg=cfg.sync,
+        sync_cfg=cfg.get("sync"),
         logging_cfg=cfg.get("logging"),
+        layout="separate",
         train_fraction=cfg.get("train_fraction", 0.5),
         reward_fraction=cfg.get("reward_fraction", 0.0),
         # Forwarded so the trainer can reject it — async scores at reap time outside
@@ -46,9 +45,9 @@ def main(cfg: DictConfig) -> None:
         eval_sampling_cfg=cfg.get("eval_sampling"),
         eval_rewards_cfg=cfg.get("eval_rewards"),
         control=cfg.get("control"),
-        max_inflight=int(cfg.get("max_inflight", 1)),
-        per_worker_inflight=int(cfg.get("per_worker_inflight", 1)),
-        weight_sync_interval=int(cfg.get("weight_sync_interval", 1)),
+        max_inflight=cfg.get("max_inflight", 1),
+        per_worker_inflight=cfg.get("per_worker_inflight", 1),
+        weight_sync_interval=cfg.get("weight_sync_interval", 1),
     )
     trainer.train(
         num_rollouts=cfg.get("num_rollouts", 100),

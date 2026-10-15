@@ -2,36 +2,32 @@
 
 > **Where it fits:** cross-cutting — not a box in the loop. Every box (rollout,
 > reward, train, sync) is built from a config dataclass whose field checks and
-> precision aliases this module provides, and the recipe wiring them together
-> has to pass this module's contracts first. Full map: [`../README.md`](../README.md).
+> precision aliases this module provides. Full map: [`../README.md`](../README.md).
 
 ## What it is
 
 `unirl.config` is the small shared toolkit behind UniRL's flat-recipe config flow.
 It owns **no** config dataclasses of its own — those live next to the components
-that consume them — just the three things every recipe leans on:
-
-| File | Role |
-| --- | --- |
-| `require.py` | `require(condition, message)` precondition helper. Stdlib-only. |
-| `validation.py` | Shared **per-field** validators (precision aliases). |
-| `contracts.py` | The **cross-component** contracts + `validate_recipe`, the driver-side gate. Stdlib-only. |
+that consume them — just the two things every dataclass leans on: a
+`require(condition, message)` precondition helper (`require.py`), and a
+`validation.py` of shared field validators (`validate_precision_type`) plus the
+colocated SGLang sleep check (`validate_memory_saver_contract`).
 
 ## Why it exists
 
-A recipe is a flat YAML wired entirely by `_target_` dotpaths. Most recipes are
+A recipe is one flat YAML wired entirely by `_target_` dotpaths. Most recipes are
 self-contained; a small number of derived recipes use local, string-only
 `defaults:` entries plus `_self_` to override a sibling recipe. There are no Hydra
-config groups, and Hydra type-checks neither form. This module is where invariants
-get enforced instead, at two scopes:
+config groups, and Hydra type-checks neither form. Component configs and trainers
+enforce invariants directly instead:
 
-- **Within a field** — each dataclass fails fast in `__post_init__` via
-  `require(...)`, with a clear `ValueError`. Every precision field accepts the
-  same aliases (`bf16`/`bfloat16`, `fp16`/…, `fp32`/…) through one shared
-  `validate_precision_type`, so the rules and error message are identical
-  everywhere.
-- **Across sections** — the rules relating one section to another live in
-  `contracts.py`, because no single dataclass can see both sides of them.
+- Each dataclass fails fast in `__post_init__` via `require(...)`, with a clear
+  `ValueError`.
+- Every precision field accepts the same aliases (`bf16`/`bfloat16`, `fp16`/…,
+  `fp32`/…) through one shared `validate_precision_type`, so the rules and error
+  message are identical everywhere.
+- Cross-component and topology preconditions are checked by the owning trainer or
+  weight-sync handler before spawning actors.
 
 ## How it works
 
@@ -48,85 +44,13 @@ Instantiation is a **driver-routes / worker-materializes** split:
   — deliberately **not** `hydra.utils.instantiate`, so already-built objects pass
   through unchanged and each is constructed in the worker's own CUDA context.
 
-### The cross-component gate
-
-Every `unirl/train_*.py` opens with one line:
-
-```python
-validate_recipe(cfg, entrypoint="train_diffusion")
-```
-
-It runs on the driver before the trainer is constructed — before Ray, before the
-engine's `_target_` is imported — so a contradictory recipe dies on the launching
-process in about a second instead of somewhere inside a half-built cluster. Today
-it enforces five contracts across the entrypoint, sampling, engine, sync,
-placement, and algorithm choices:
-
-| Contract | Rejects |
-| --- | --- |
-| `validate_sampling_contract` | AR/diffusion sampling-parameter types routed to the wrong entrypoint |
-| `validate_weight_sync_contract` | wrong engine family for an entrypoint or nested child; missing or extra sync/anchor fields; invalid anchor values; local/remote handler topology mismatches; unsupported receive/verification methods; incomplete or misrouted PE track maps; unsupported entrypoint-specific sync modes; vLLM native IPC without FSDP offload |
-| `validate_rollout_layout` | invalid layout values; separate direct sampling; layout fields on entrypoints that do not consume them |
-| `validate_algorithm_contract` | a `loss_agg_mode` the targeted algorithm does not accept or implement (`ALGORITHM_LOSS_AGG_MODES`) |
-| `validate_memory_saver_contract` | an agentic SGLang rollout without `enable_memory_saver: true` (warns on a sleeping `train_ar` SGLang engine) |
-
-**The gate is the only cross-component check.** A cross-section condition a contract
-enforces is not re-checked in a trainer, engine, or weight-sync handler `__init__`:
-runtime code assumes it (e.g. calls the capability method directly, indexes the PE
-child by `track_prefix`). Constructing those classes without `validate_recipe` is
-unsupported. Checks that depend on the run rather than the recipe (device counts,
-rank topology, tensor contents) stay where the fact is known.
-
-**Recipe shapes live in exactly one place.** Contracts never read a hard-coded
-dotpath; they read `RecipeFacts.from_cfg(cfg)`, which absorbs the per-entrypoint
-differences — `rollout` vs `ar_rollout` + `dit_rollout`, single vs modality-keyed
-sampling, a single `sync` block vs `train_pe`'s per-track map, nested
-composed/agentic child engines, and `train_sft` having no rollout engine at all.
-
-**Engines are identified by package, not class name.** `ENGINE_FAMILIES` maps
-`unirl.rollout.engine.<family>` to its valid entrypoints, whether it samples
-in-process, and the complete weight-sync protocol methods it implements, so a
-class rename cannot flip a recipe into the wrong mode.
-
 **Extending it:** a new component config is a plain `@dataclass` next to the
-component (not here), with `require(...)` checks in `__post_init__`. A new
-cross-component contract is a `validate_<thing>(cfg)` in `contracts.py` reading
-`RecipeFacts`, added to `CONTRACTS` — which is what makes it run. If it needs a
-recipe fact nobody has needed yet, add the field to `RecipeFacts` rather than
-reaching into `cfg` from the contract.
-
-## Verification
-
-`lint/check_recipe_contracts.py` (pre-commit hook `check-recipe-contracts`,
-so it rides the lint-only CI alongside `check-recipe-targets`) asserts five
-things on every run:
-
-1. Every runnable recipe under `examples/` satisfies every contract. Two
-   diffusion recipes currently stored under `examples/unified_model/` carry
-   explicit `train_diffusion` ownership overrides.
-2. `ENGINE_FAMILIES` still matches the engine classes: `direct_sampling` is read
-   back off each engine's `__init__` (does it take a `pipeline`? — the same
-   duck-typed test the trainers use), and `capabilities` off the protocol methods
-   the concrete class overrides. Adding an engine family without declaring it
-   fails here rather than silently skipping its contracts.
-3. Sync-handler local/remote metadata still matches whether its constructor owns
-   a local `rollout` sibling.
-4. Every `unirl/train_*.py` calls `validate_recipe` first, with its own entrypoint
-   name, so adding an entrypoint cannot silently bypass the gate.
-5. `ALGORITHM_LOSS_AGG_MODES` lists exactly the algorithm classes whose `__init__`
-   takes `loss_agg_mode`, and each constructor default is a listed mode.
-
-All five run with `ast` + `yaml` only, no torch — which is why `contracts.py`
-and `require.py` stay stdlib-only.
+component (not here), with `require(...)` checks in `__post_init__`.
 
 ## Gotchas
 
 - **`# @package _global_` on line 1 is mandatory** — omit it and Hydra nests the
   whole recipe under a bucket key, so `cfg.batch_size` won't resolve.
-- **Contracts see the recipe, not the run.** Anything that depends on resolved
-  runtime topology — `batch_size * samples_per_prompt` divisibility by the actual
-  rollout/reward `dp_size`, for instance — cannot be checked here and stays in
-  the trainer (`DiffusionTrainer.__init__`).
 - **`validate_precision_type` validates but does not normalize** — it *returns* the
   canonical alias (`bf16`), but every call site invokes it as a bare statement and
   discards the result. So `model_precision: bfloat16` stays the raw string in `cfg`;

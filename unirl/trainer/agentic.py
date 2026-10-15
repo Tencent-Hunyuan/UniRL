@@ -12,6 +12,7 @@ import torch
 from hydra.utils import instantiate
 from omegaconf import DictConfig
 
+from unirl.config.validation import validate_memory_saver_contract
 from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
 from unirl.rollout.manager import RolloutManager, required_worker_concurrency, validate_worker_inflight
@@ -69,12 +70,11 @@ class AgenticTrainer(BaseTrainer):
         per_worker_inflight: int = 8,
         mask_overflow_loss: bool = False,
     ) -> None:
-        per_worker_inflight = int(per_worker_inflight)
         configured_concurrency = cfg.get("worker_max_concurrency")
         worker_max_concurrency = (
             required_worker_concurrency(per_worker_inflight)
             if configured_concurrency is None
-            else int(configured_concurrency)
+            else configured_concurrency
         )
         self._validate_config(
             cfg=cfg,
@@ -82,6 +82,7 @@ class AgenticTrainer(BaseTrainer):
             rollout_cfg=rollout_cfg,
             sampling_cfg=sampling_cfg,
             algorithm_cfg=algorithm_cfg,
+            sync_cfg=sync_cfg,
             per_worker_inflight=per_worker_inflight,
             worker_max_concurrency=worker_max_concurrency,
         )
@@ -92,7 +93,7 @@ class AgenticTrainer(BaseTrainer):
         )
 
         try:
-            self.batch_size = int(batch_size)
+            self.batch_size = batch_size
             self.data_source = instantiate(data_source_cfg)
             self.sampling_params: Dict[str, BaseSamplingParams] = build_sampling_dict(sampling_cfg)
             self._group_size = total_samples_per_prompt(self.sampling_params)
@@ -133,33 +134,41 @@ class AgenticTrainer(BaseTrainer):
         rollout_cfg: DictConfig,
         sampling_cfg: DictConfig,
         algorithm_cfg: DictConfig,
+        sync_cfg: Optional[DictConfig],
         per_worker_inflight: int,
         worker_max_concurrency: int,
     ) -> None:
-        if int(batch_size) <= 0:
+        if batch_size <= 0:
             raise ValueError(f"batch_size must be positive; got {batch_size}")
         validate_worker_inflight(
             per_worker_inflight,
             worker_max_concurrency=worker_max_concurrency,
             engine_concurrency=None,
         )
+        if sync_cfg is None:
+            raise ValueError("AgenticTrainer requires colocated TensorWeightSync")
+        sync_target = sync_cfg.get("_target_", "")
+        if not sync_target.endswith("TensorWeightSync"):
+            raise ValueError(f"AgenticTrainer requires colocated TensorWeightSync; got {sync_target!r}")
+        validate_memory_saver_contract(rollout_cfg, strict=True)
+
         episode = rollout_cfg.get("config", {}).get("episode_sampling")
         if episode is None:
             raise ValueError("rollout.config.episode_sampling is required")
-        group_size = int(sampling_cfg.get("samples_per_prompt", 1))
-        episode_group_size = int(episode.get("samples_per_prompt", 1))
+        group_size = sampling_cfg.get("samples_per_prompt", 1)
+        episode_group_size = episode.get("samples_per_prompt", 1)
         if group_size != episode_group_size:
             raise ValueError(
                 "sampling.samples_per_prompt must equal rollout.config.episode_sampling.samples_per_prompt"
             )
-        sampling_temperature = float(sampling_cfg.get("temperature", 1.0))
-        episode_temperature = float(episode.get("temperature", 1.0))
-        algorithm_temperature = float(algorithm_cfg.get("sampling_temperature", 1.0))
+        sampling_temperature = sampling_cfg.get("temperature", 1.0)
+        episode_temperature = episode.get("temperature", 1.0)
+        algorithm_temperature = algorithm_cfg.get("sampling_temperature", 1.0)
         if abs(sampling_temperature - episode_temperature) > 1e-9:
             raise ValueError("sampling.temperature must equal rollout episode temperature")
         if abs(sampling_temperature - algorithm_temperature) > 1e-9:
             raise ValueError("sampling.temperature must equal algorithm.sampling_temperature")
-        if (int(batch_size) * group_size) % int(cfg.num_devices) != 0:
+        if (batch_size * group_size) % cfg.num_devices != 0:
             raise ValueError("batch_size*samples_per_prompt must be divisible by num_devices")
 
     def _build_colocated_rollout(self, rollout_cfg: DictConfig, sync_cfg: DictConfig) -> None:

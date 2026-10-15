@@ -6,13 +6,11 @@ from __future__ import annotations
 import hydra
 from omegaconf import DictConfig
 
-from unirl.config.contracts import validate_recipe
 from unirl.trainer.unified_model import UnifiedModelTrainer
 
 
 @hydra.main(version_base=None, config_path="../examples", config_name="unified_model/hi3_vllmomni")
 def main(cfg: DictConfig) -> None:
-    validate_recipe(cfg, entrypoint="train_unified_model")
     trainer = UnifiedModelTrainer(
         cfg=cfg,
         batch_size=cfg.batch_size,
@@ -36,8 +34,8 @@ def main(cfg: DictConfig) -> None:
         rollout_pipeline_chunks=cfg.get("rollout_pipeline_chunks", 1),
         eval_interval=cfg.get("eval_interval", 0),
         eval_num_prompts=cfg.get("eval_num_prompts", cfg.batch_size),
-        eval_cfg_text_scale=float(cfg.get("eval_cfg_text_scale", 4.0)),
-        eval_eta=float(cfg.get("eval_eta", 0.0)),
+        eval_cfg_text_scale=cfg.get("eval_cfg_text_scale", 4.0),
+        eval_eta=cfg.get("eval_eta", 0.0),
         eval_rewards_cfg=cfg.get("eval_rewards"),
     )
     trainer.train(

@@ -166,8 +166,8 @@ enabled, which UniRL's rollout backend does not do.
 - **A colocated SGLang engine needs `enable_memory_saver`.** Without it SGLang
   installs a no-op `TorchMemorySaverAdapter`: `release_memory_occupation` reports
   success and frees nothing. Add `enable_weights_cpu_backup: true` to move weights
-  to host across the sleep. `validate_recipe` rejects a `train_agentic` recipe
-  without the flag and warns on `train_ar`.
+  to host across the sleep. `AgenticTrainer` rejects a colocated engine without the
+  flag; `ARTrainer` warns.
 - **Size `mem_fraction_static` from the wake peak, not the rollout peak.** In
   `AgenticTrainer` the engine wakes before `backend.offload()` releases the train
   state, and `torch_memory_saver`'s `resume()` cannot reuse blocks held by torch's
@@ -182,8 +182,8 @@ enabled, which UniRL's rollout backend does not do.
 - **Batch `generate` must dispatch `DP_SCATTER`.** Agentic is the intentional
   exception: its undecorated method is reached through one `Handle.slot(...)`.
 - **Direct sampling forbids a `sync:` block; dedicated requires one.** The trainside
-  engine also can't live on a `layout: separate` slab. `validate_recipe`
-  (`unirl/config/contracts.py`) enforces all three before any actor starts.
+  engine also can't live on a `layout: separate` slab — the trainer `__init__` raises
+  before spawning actors.
 - **Quiesce before weight sync / eval / checkpoint on async paths** —
   `RolloutManager.quiesce()` pauses dispatch, drains batch work, and cooperatively
   suspends agentic trajectories at turn boundaries. `sync_weights()` rejects queued

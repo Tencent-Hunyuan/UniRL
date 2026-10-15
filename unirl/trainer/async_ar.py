@@ -1,5 +1,6 @@
 """Async autoregressive RL over separate train and rollout GPU slabs."""
 
+import inspect
 import time
 from typing import Dict, Optional, Tuple
 
@@ -39,7 +40,7 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
         stack_cfg: DictConfig,
         data_source_cfg: DictConfig,
         sampling_cfg: DictConfig,
-        sync_cfg: DictConfig,
+        sync_cfg: Optional[DictConfig] = None,
         logging_cfg: Optional[DictConfig] = None,
         adv_normalization_scope: str = "group",
         normalize_adv_by_std: bool = True,
@@ -74,12 +75,28 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
                 "AsyncARTrainer requires a `reward:` block. Reward-free AR training is supported "
                 "only by the synchronous ARTrainer."
             )
-        per_worker_inflight = int(per_worker_inflight)
-        self._train_fraction = float(train_fraction)
+        if sync_cfg is None:
+            raise ValueError("AsyncARTrainer requires a cross-slab weight sync; add a `sync:` block.")
+        sync_target = sync_cfg.get("_target_", "")
+        if not sync_target.endswith("NCCLWeightSync"):
+            raise ValueError(
+                f"AsyncARTrainer (separate slabs) requires a cross-slab weight sync "
+                f"(NCCLWeightSync); got sync._target_={sync_target!r}."
+            )
+        rollout_parsed = parse_hydra_cfg(rollout_cfg)
+        if "pipeline" in inspect.signature(rollout_parsed["role_cls"]).parameters:
+            raise ValueError(
+                "AsyncARTrainer needs a dedicated-rollout engine (vllm/sglang) on the "
+                "separate slab; the trainside direct-sampling engine needs the pipeline "
+                "as a local sibling and cannot live cross-slab."
+            )
+        if advantage_mode not in ("grpo", "gae"):
+            raise ValueError(f"AsyncARTrainer: advantage_mode must be 'grpo' or 'gae', got {advantage_mode!r}")
+        self.advantage_mode = advantage_mode
+        self._train_fraction = train_fraction
         configured_concurrency = cfg.get("worker_max_concurrency")
-        configured_concurrency = None if configured_concurrency is None else int(configured_concurrency)
         self._train_devices, worker_concurrency = resolve_separate_worker_concurrency(
-            num_devices=int(cfg.num_devices),
+            num_devices=cfg.num_devices,
             train_fraction=self._train_fraction,
             per_worker_inflight=per_worker_inflight,
             configured_concurrency=configured_concurrency,
@@ -96,31 +113,24 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
         self.batch_size = batch_size
         self.adv_normalization_scope = adv_normalization_scope
         self.normalize_adv_by_std = normalize_adv_by_std
-        self.advantage_mode = str(advantage_mode).strip().lower()
-        if self.advantage_mode not in ("grpo", "gae"):
-            raise ValueError(f"AsyncARTrainer: advantage_mode must be 'grpo' or 'gae', got {advantage_mode!r}")
-        self.balance_shards = bool(balance_shards)
-        self.eval_interval = int(eval_interval)
-        _num = int(eval_num_prompts)
-        self.eval_num_prompts = -1 if _num < 0 else _num
-        self.eval_batch_size = max(1, int(eval_batch_size))
-        self.eval_samples_per_prompt = int(eval_samples_per_prompt)
-        self.eval_temperature = float(eval_temperature)
+        self.balance_shards = balance_shards
+        self.eval_interval = eval_interval
+        self.eval_num_prompts = -1 if eval_num_prompts < 0 else eval_num_prompts
+        self.eval_batch_size = max(1, eval_batch_size)
+        self.eval_samples_per_prompt = eval_samples_per_prompt
+        self.eval_temperature = eval_temperature
         self.data_source = instantiate(data_source_cfg)
         self.sampling_params: Dict[str, BaseSamplingParams] = build_sampling_dict(sampling_cfg)
-        rollout_parsed = parse_hydra_cfg(rollout_cfg)
         self._rollout_anchor_device = None
 
-        self._max_inflight = max(1, int(max_inflight))
+        self._max_inflight = max(1, max_inflight)
         self._per_worker_inflight = per_worker_inflight
         self._max_inflight_prompts = self._max_inflight * self.batch_size
-        self._weight_sync_interval = int(weight_sync_interval)
-        self._num_updates_per_batch = int(stack_cfg.get("num_updates_per_batch", 1))
+        self._weight_sync_interval = weight_sync_interval
+        self._num_updates_per_batch = stack_cfg.get("num_updates_per_batch", 1)
         if self._weight_sync_interval < 1:
             raise ValueError(f"weight_sync_interval must be >= 1, got {self._weight_sync_interval}")
-        self._max_staleness = (
-            self._weight_sync_interval - 1 if buffer_max_staleness is None else int(buffer_max_staleness)
-        )
+        self._max_staleness = self._weight_sync_interval - 1 if buffer_max_staleness is None else buffer_max_staleness
         min_staleness = self._weight_sync_interval - 1
         if self._max_staleness < min_staleness:
             raise ValueError(
