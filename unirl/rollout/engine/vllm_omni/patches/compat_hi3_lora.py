@@ -19,7 +19,7 @@ def install() -> None:
     if original is None:
         _INSTALLED = True
         return
-    if getattr(original, "_diffrl_hi3_unwrap", False):
+    if getattr(original, "_unirl_hi3_unwrap", False):
         _INSTALLED = True
         return
 
@@ -35,7 +35,7 @@ def install() -> None:
             return result[0]
         return result
 
-    _patched._diffrl_hi3_unwrap = True  # type: ignore[attr-defined]
+    _patched._unirl_hi3_unwrap = True  # type: ignore[attr-defined]
     vllm_mu.get_moe_expert_mapping = _patched
 
     try:

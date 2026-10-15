@@ -1,4 +1,4 @@
-"""REPLACE ``SchedulerRLMixin.flow_sde_sampling`` to add the DanceGRPO objective."""
+"""REPLACE ``SchedulerRLMixin.flow_sde_sampling`` to add DanceGRPO and score the emitted transition."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ _LOG_SQRT_2PI = math.log(math.sqrt(2 * math.pi))
 
 
 def patch_dance() -> None:
-    """Add ``dance`` to the rollout sde-type whitelist and to ``flow_sde_sampling``."""
+    """Add ``dance`` to the rollout sde-type whitelist and install the emitted-dtype ``flow_sde_sampling``."""
     import sglang.multimodal_gen.configs.post_training.rl_rollout as rl_rollout
     import sglang.multimodal_gen.runtime.post_training.scheduler_rl_mixin as srm
 
@@ -31,12 +31,15 @@ def _flow_sde_sampling_with_dance(
     next_sigma: "torch.FloatTensor",
     generator: "torch.Generator",
 ) -> "torch.Tensor":
-    """Re-vendor of upstream ``SchedulerRLMixin.flow_sde_sampling`` + ``dance``."""
+    """Re-vendor of upstream ``SchedulerRLMixin.flow_sde_sampling`` + ``dance`` + emitted-dtype log-prob."""
     rollout_session_data = self._get_rollout_session_data(batch)
     sde_type = batch.rollout_sde_type
     noise_level = float(batch.rollout_noise_level)
     log_prob_no_const = batch.rollout_log_prob_no_const
     debug_mode = bool(getattr(batch, "rollout_debug_mode", False))
+    # ``FlowMatchEulerDiscreteScheduler.step`` casts the transition to this dtype
+    # before it is stored; trainside replay can only score that stored value.
+    emitted_dtype = model_output.dtype
 
     if not log_prob_no_const and sde_type != "ode":
         assert noise_level > 0, "True log-probability computation requires a non-zero noise level."
@@ -59,7 +62,6 @@ def _flow_sde_sampling_with_dance(
         model_output = model_output.float()
         sample = sample.float()
         variance_noise = self._rollout_variance_noise(batch, model_output, generator)
-        full_variance_noise = rollout_session_data.noise_buffer
         std_dev_t = (
             torch.sqrt(
                 current_sigma
@@ -82,13 +84,11 @@ def _flow_sde_sampling_with_dance(
 
         weighted_variance_noise = variance_noise * noise_std_dev
         prev_sample = prev_sample_mean + weighted_variance_noise
-        log_prob_no_const_val = -((full_variance_noise * noise_std_dev) ** 2)
 
     elif effective_sde_type == "cps":
         model_output = model_output.float()
         sample = sample.float()
         variance_noise = self._rollout_variance_noise(batch, model_output, generator)
-        full_variance_noise = rollout_session_data.noise_buffer
         std_dev_t = next_sigma * math.sin(noise_level * math.pi / 2)
         noise_std_dev = std_dev_t
         pred_original_sample = sample - current_sigma * model_output
@@ -99,13 +99,11 @@ def _flow_sde_sampling_with_dance(
 
         weighted_variance_noise = variance_noise * noise_std_dev
         prev_sample = prev_sample_mean + weighted_variance_noise
-        log_prob_no_const_val = -((full_variance_noise * noise_std_dev) ** 2)
 
     elif effective_sde_type == "dance":
         model_output = model_output.float()
         sample = sample.float()
         variance_noise = self._rollout_variance_noise(batch, model_output, generator)
-        full_variance_noise = rollout_session_data.noise_buffer
         std_dev_t = current_sigma.new_tensor(noise_level)
         noise_std_dev = std_dev_t * torch.sqrt(-1 * dt)
         prev_sample_mean = (
@@ -115,7 +113,6 @@ def _flow_sde_sampling_with_dance(
 
         weighted_variance_noise = variance_noise * noise_std_dev
         prev_sample = prev_sample_mean + weighted_variance_noise
-        log_prob_no_const_val = -((full_variance_noise * noise_std_dev) ** 2)
 
     elif effective_sde_type == "ode":
         prev_sample = sample + dt * model_output
@@ -134,6 +131,10 @@ def _flow_sde_sampling_with_dance(
 
     else:
         raise ValueError(f"Unsupported sde_type: {sde_type}")
+
+    if effective_sde_type != "ode":
+        prev_sample = prev_sample.to(dtype=emitted_dtype)
+        log_prob_no_const_val = -((prev_sample.float() - prev_sample_mean) ** 2)
 
     reduce_dims = list(range(1, len(log_prob_no_const_val.shape)))
     local_elem_count = log_prob_no_const_val.new_full(

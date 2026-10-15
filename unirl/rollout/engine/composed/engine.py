@@ -129,7 +129,8 @@ class ComposedRolloutEngine(BaseRolloutEngine):
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def onload_weights(self, *, track_prefix: str = "") -> None:
-        for child in self._children_for_track_prefix(track_prefix):
+        children = [self._child_by_name[track_prefix]] if track_prefix else self._child_by_name.values()
+        for child in children:
             child.onload_weights()
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
@@ -166,6 +167,7 @@ class ComposedRolloutEngine(BaseRolloutEngine):
 
     def _generate_core(self, sample: Sample) -> Sample:
         """Run the PE serial flow for a whole ``Sample`` → filled 3-part output."""
+        sample.reject_row_canvases(engine="ComposedRolloutEngine")
         input_part, ar_shell, diffusion_shell = self._unpack_request(sample)
 
         P = len(input_part.sample_ids)
@@ -313,12 +315,6 @@ class ComposedRolloutEngine(BaseRolloutEngine):
             if subset:
                 result[child_name] = subset
         return result
-
-    def _children_for_track_prefix(self, track_prefix: str) -> List[BaseRolloutEngine]:
-        """Resolve the tensor-payload track routing hint to child engines."""
-        if not track_prefix:
-            return list(self._child_by_name.values())
-        return [self._child_by_name[track_prefix]]
 
     def update_weights_from_ipc(
         self,

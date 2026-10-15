@@ -133,7 +133,7 @@ class Wan22T2VAdapter(VideoAdapter):
 
     def build_sampling(self, sample: Sample, *, diffusion: Any) -> Dict[str, Any]:
         kwargs = super().build_sampling(sample, diffusion=diffusion)
-        g2 = getattr(diffusion, "guidance_scale_2", None)
+        g2 = diffusion.guidance_scale_2
         if g2 is not None:
             kwargs["guidance_scale_2"] = float(g2)
         return kwargs

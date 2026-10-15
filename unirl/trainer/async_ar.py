@@ -39,7 +39,7 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
         stack_cfg: DictConfig,
         data_source_cfg: DictConfig,
         sampling_cfg: DictConfig,
-        sync_cfg: Optional[DictConfig] = None,
+        sync_cfg: DictConfig,
         logging_cfg: Optional[DictConfig] = None,
         adv_normalization_scope: str = "group",
         normalize_adv_by_std: bool = True,
@@ -108,7 +108,6 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
         self.eval_temperature = float(eval_temperature)
         self.data_source = instantiate(data_source_cfg)
         self.sampling_params: Dict[str, BaseSamplingParams] = build_sampling_dict(sampling_cfg)
-        self.weight_sync = None
         rollout_parsed = parse_hydra_cfg(rollout_cfg)
         self._rollout_anchor_device = None
 
@@ -203,7 +202,11 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
         train_part = part
         if self.balance_shards:
             train_part = part.balance_shards(self._train_devices)
-        result = self.stack.train_track(train_part, training_progress=float(training_progress))
+        result = self.stack.train_track(
+            train_part,
+            training_progress=float(training_progress),
+            rollout_id=rollout_id,
+        )
         self._train_version += result.optimizer_updates
         self._batches_since_sync += 1
         if extra_metrics is not None:

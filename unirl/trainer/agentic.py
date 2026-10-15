@@ -67,6 +67,7 @@ class AgenticTrainer(BaseTrainer):
         logging_cfg: Optional[DictConfig] = None,
         stop: Optional[List[str]] = None,
         per_worker_inflight: int = 8,
+        mask_overflow_loss: bool = False,
     ) -> None:
         per_worker_inflight = int(per_worker_inflight)
         configured_concurrency = cfg.get("worker_max_concurrency")
@@ -81,7 +82,6 @@ class AgenticTrainer(BaseTrainer):
             rollout_cfg=rollout_cfg,
             sampling_cfg=sampling_cfg,
             algorithm_cfg=algorithm_cfg,
-            sync_cfg=sync_cfg,
             per_worker_inflight=per_worker_inflight,
             worker_max_concurrency=worker_max_concurrency,
         )
@@ -98,6 +98,7 @@ class AgenticTrainer(BaseTrainer):
             self._group_size = total_samples_per_prompt(self.sampling_params)
             self._stop = list(stop) if stop else ["</tool_call>"]
             self._per_worker_inflight = per_worker_inflight
+            self._mask_overflow_loss = mask_overflow_loss
 
             with placement(self.pool, fraction=1.0, shared_workers=True):
                 self.bundle = remote_hydra(bundle_cfg)
@@ -132,7 +133,6 @@ class AgenticTrainer(BaseTrainer):
         rollout_cfg: DictConfig,
         sampling_cfg: DictConfig,
         algorithm_cfg: DictConfig,
-        sync_cfg: Optional[DictConfig],
         per_worker_inflight: int,
         worker_max_concurrency: int,
     ) -> None:
@@ -313,6 +313,9 @@ class AgenticTrainer(BaseTrainer):
         for i, trajectory in enumerate(trajectories):
             if not bool(finite[i]):
                 continue
+            # A masked overflow trajectory stays in its group's baseline; only its gradient is dropped.
+            if self._mask_overflow_loss and trajectory.parts[-1].harness_status == "overflow":
+                continue
             advantage = float(advantages[i].item())
             for generated in trajectory.gen_parts():
                 generated = _part_with_field(
@@ -321,6 +324,7 @@ class AgenticTrainer(BaseTrainer):
                     torch.full((generated.batch_size,), advantage, dtype=torch.float32),
                 )
                 generated = _part_with_field(generated, "primitive_metadata", {})
+                generated = _part_with_field(generated, "harness_status", None)
                 generated = _part_with_field(generated, "media_preview", None)
                 generated = _part_with_field(generated, "primitives", {})
                 generated = _part_with_field(generated, "rewards", None)
@@ -328,18 +332,24 @@ class AgenticTrainer(BaseTrainer):
                 train_parts.append(generated)
 
         depths = [len(trajectory.gen_parts()) for trajectory in trajectories]
+        statuses = Counter(t.parts[-1].harness_status for t in trajectories)
         logger.info(
-            "rollout %d trajectory turns: n=%d mean=%.2f min=%d max=%d hist=%s",
+            "rollout %d trajectory turns: n=%d mean=%.2f min=%d max=%d hist=%s status=%s",
             rollout_id,
             len(depths),
             (sum(depths) / len(depths)) if depths else 0.0,
             min(depths, default=0),
             max(depths, default=0),
             dict(sorted(Counter(depths).items())),
+            dict(sorted(statuses.items())),
         )
         if train_parts:
             train_part = self._pad_to_dp_multiple(Part.concat(train_parts))
-            result = self.stack.train_track(train_part, training_progress=float(training_progress))
+            result = self.stack.train_track(
+                train_part,
+                training_progress=float(training_progress),
+                rollout_id=rollout_id,
+            )
             train_rows = int(train_part.batch_size)
         else:
             result = TrainStepResult(0.0, 0.0, 0.0, False, [], {}, optimizer_updates=0)
@@ -355,6 +365,7 @@ class AgenticTrainer(BaseTrainer):
                 "agent/mean_turns": (sum(depths) / len(depths)) if depths else 0.0,
                 "agent/max_turns": max(depths) if depths else 0,
                 "agent/failed_trajectories": int((~finite).sum().item()),
+                "agent/overflow_trajectories": statuses["overflow"],
                 "agent/train_rows": train_rows,
             },
         )

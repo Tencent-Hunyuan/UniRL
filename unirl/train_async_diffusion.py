@@ -25,7 +25,7 @@ def main(cfg: DictConfig) -> None:
         stack_cfg=cfg.stack,
         data_source_cfg=cfg.data_source,
         sampling_cfg=cfg.sampling,
-        sync_cfg=cfg.get("sync"),
+        sync_cfg=cfg.sync,
         logging_cfg=cfg.get("logging"),
         train_fraction=cfg.get("train_fraction", 0.5),
         reward_fraction=cfg.get("reward_fraction", 0.0),

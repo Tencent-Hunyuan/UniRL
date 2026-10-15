@@ -59,20 +59,21 @@ validate_recipe(cfg, entrypoint="train_diffusion")
 It runs on the driver before the trainer is constructed — before Ray, before the
 engine's `_target_` is imported — so a contradictory recipe dies on the launching
 process in about a second instead of somewhere inside a half-built cluster. Today
-it enforces four contracts across the entrypoint, sampling, engine, sync,
+it enforces five contracts across the entrypoint, sampling, engine, sync,
 placement, and algorithm choices:
 
 | Contract | Rejects |
 | --- | --- |
 | `validate_sampling_contract` | AR/diffusion sampling-parameter types routed to the wrong entrypoint |
-| `validate_weight_sync_contract` | wrong engine family for an entrypoint; missing or extra sync/anchor fields; invalid anchor values; local/remote handler topology mismatches; unsupported receive/verification methods; incomplete or misrouted PE track maps; unsupported entrypoint-specific sync modes; vLLM native IPC without FSDP offload |
+| `validate_weight_sync_contract` | wrong engine family for an entrypoint or nested child; missing or extra sync/anchor fields; invalid anchor values; local/remote handler topology mismatches; unsupported receive/verification methods; incomplete or misrouted PE track maps; unsupported entrypoint-specific sync modes; vLLM native IPC without FSDP offload |
 | `validate_rollout_layout` | invalid layout values; separate direct sampling; layout fields on entrypoints that do not consume them |
-| `validate_algorithm_contract` | a `loss_agg_mode` the targeted algorithm does not implement (`ALGORITHM_LOSS_AGG_MODES`) |
+| `validate_algorithm_contract` | a `loss_agg_mode` the targeted algorithm does not accept or implement (`ALGORITHM_LOSS_AGG_MODES`) |
+| `validate_memory_saver_contract` | an agentic SGLang rollout without `enable_memory_saver: true` (warns on a sleeping `train_ar` SGLang engine) |
 
-**The gate is the only check.** A condition a contract enforces is not re-checked
-in a trainer, engine, weight-sync handler, or algorithm `__init__`: runtime code
-assumes it (e.g. calls the capability method directly, indexes the PE child by
-`track_prefix`). Constructing those classes without `validate_recipe` is
+**The gate is the only cross-component check.** A cross-section condition a contract
+enforces is not re-checked in a trainer, engine, or weight-sync handler `__init__`:
+runtime code assumes it (e.g. calls the capability method directly, indexes the PE
+child by `track_prefix`). Constructing those classes without `validate_recipe` is
 unsupported. Checks that depend on the run rather than the recipe (device counts,
 rank topology, tensor contents) stay where the fact is known.
 
@@ -124,15 +125,6 @@ and `require.py` stay stdlib-only.
 
 - **`# @package _global_` on line 1 is mandatory** — omit it and Hydra nests the
   whole recipe under a bucket key, so `cfg.batch_size` won't resolve.
-- **Out-of-tree engines are not gated.** A `rollout._target_` outside
-  `unirl.rollout.engine.*` has no known family, so the engine-dependent contracts
-  log and skip rather than guess a mode for it.
-- **Out-of-tree sampling classes are not guessed.** Recognized AR/diffusion
-  sampling class names must match their entrypoint or track; an unrecognized
-  target is left to runtime type validation.
-- **Static lint defers unresolved `${...}` values.** The runtime gate sees the
-  Hydra-resolved value and validates it normally; interpolations must therefore
-  resolve to the same type the owning component expects.
 - **Contracts see the recipe, not the run.** Anything that depends on resolved
   runtime topology — `batch_size * samples_per_prompt` divisibility by the actual
   rollout/reward `dp_size`, for instance — cannot be checked here and stays in

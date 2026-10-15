@@ -8,7 +8,7 @@ from multiprocessing.process import BaseProcess as _MpBaseProcess
 logger = logging.getLogger(__name__)
 
 
-class _DiffrlPatchedTarget:
+class _UnirlPatchedTarget:
     """Pickleable wrapper that installs sglang patches in a spawn child first."""
 
     def __init__(self, target):
@@ -59,8 +59,8 @@ def wrap_mp_process_for_children() -> None:
         *,
         daemon=None,
     ):
-        if target is not None and not isinstance(target, _DiffrlPatchedTarget):
-            target = _DiffrlPatchedTarget(target)
+        if target is not None and not isinstance(target, _UnirlPatchedTarget):
+            target = _UnirlPatchedTarget(target)
         orig_init(
             self,
             group=group,

@@ -63,7 +63,7 @@ def build_eval_suites(
         suites.append(
             EvalRewardSuite(
                 name=name,
-                reward=remote_hydra(reward_cfg),
+                reward=remote_hydra(reward_cfg, require_prompt_video=False),
                 data_source=suite_source,
                 num_prompts=None if entry.get("num_prompts") is None else int(entry.get("num_prompts")),
             )

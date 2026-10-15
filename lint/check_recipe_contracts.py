@@ -304,6 +304,7 @@ CHECKPOINT_SYNC = "unirl.distributed.weight_sync.full.checkpoint.CheckpointWeigh
 CKPT_ENGINE_IPC_SYNC = "unirl.distributed.weight_sync.full.ckpt_engine_ipc.CkptEngineIPCWeightSync"
 GRPO = "unirl.algorithms.grpo.GRPO"
 DRPO = "unirl.algorithms.drpo.DRPO"
+GSPO = "unirl.algorithms.gspo.GSPO"
 AR_SAMPLING = "unirl.types.sampling.ARSamplingParams"
 DIFFUSION_SAMPLING = "unirl.types.sampling.DiffusionSamplingParams"
 
@@ -314,6 +315,13 @@ CASE_SAMPLING_TARGETS = {
     "train_async_diffusion": DIFFUSION_SAMPLING,
     "train_agentic": AR_SAMPLING,
 }
+
+
+def _agentic_rollout(*, inner: str = SGLANG_CONFIG, enable_memory_saver: bool | None = True) -> dict:
+    inner_cfg: dict = {"_target_": inner}
+    if enable_memory_saver is not None:
+        inner_cfg["enable_memory_saver"] = enable_memory_saver
+    return {"_target_": AGENTIC, "config": {"inner": inner_cfg}}
 
 
 def _composed_rollout(
@@ -658,7 +666,7 @@ MUST_REJECT: dict[str, tuple[str, dict]] = {
     "agentic with non-Tensor handler": (
         "train_agentic",
         {
-            "rollout": {"_target_": AGENTIC, "config": {"inner": {"_target_": SGLANG_CONFIG}}},
+            "rollout": _agentic_rollout(),
             "sync": {"_target_": LOCAL_LORA_SYNC},
         },
     ),
@@ -666,7 +674,21 @@ MUST_REJECT: dict[str, tuple[str, dict]] = {
         "train_agentic",
         {
             "sampling": {"ar": {"_target_": AR_SAMPLING}},
-            "rollout": {"_target_": AGENTIC, "config": {"inner": {"_target_": SGLANG_CONFIG}}},
+            "rollout": _agentic_rollout(),
+            "sync": {"_target_": TENSOR_SYNC},
+        },
+    ),
+    "agentic SGLang without memory saver": (
+        "train_agentic",
+        {
+            "rollout": _agentic_rollout(enable_memory_saver=None),
+            "sync": {"_target_": TENSOR_SYNC},
+        },
+    ),
+    "agentic with diffusion inner engine": (
+        "train_agentic",
+        {
+            "rollout": _agentic_rollout(inner=SGLANG_DIFFUSION_CONFIG, enable_memory_saver=None),
             "sync": {"_target_": TENSOR_SYNC},
         },
     ),
@@ -717,14 +739,6 @@ MUST_REJECT: dict[str, tuple[str, dict]] = {
             "rollout_anchor_device": 1,
         },
     ),
-    "AR with dynamic dead layout": (
-        "train_ar",
-        {
-            "rollout": {"_target_": SGLANG},
-            "sync": {"_target_": TENSOR_SYNC},
-            "layout": "${oc.env:LAYOUT,colocate}",
-        },
-    ),
     "vLLM native IPC without FSDP offload": (
         "train_ar",
         {"rollout": {"_target_": VLLM}, "sync": {"_target_": IPC_SYNC}, "enable_fsdp_offload": False},
@@ -745,6 +759,10 @@ MUST_REJECT: dict[str, tuple[str, dict]] = {
         "train_ar",
         {"rollout": {"_target_": TRAINSIDE}, "algorithm": {"_target_": GRPO, "loss_agg_mode": "seq-mean"}},
     ),
+    "loss_agg_mode on GSPO": (
+        "train_ar",
+        {"rollout": {"_target_": TRAINSIDE}, "algorithm": {"_target_": GSPO, "loss_agg_mode": "seq-mean"}},
+    ),
     "unknown loss_agg_mode on a unified AR track": (
         "train_unified_model",
         {
@@ -755,15 +773,70 @@ MUST_REJECT: dict[str, tuple[str, dict]] = {
             },
         },
     ),
+    "unknown loss_agg_mode on a PE AR track": (
+        "train_pe",
+        {
+            "rollout": {"_target_": TRAINSIDE},
+            "ar": {"algorithm": {"_target_": GRPO, "loss_agg_mode": "token-sum"}},
+            "diffusion": {"algorithm": {"_target_": "unirl.algorithms.flowgrpo.FlowGRPO"}},
+        },
+    ),
+    "PE frozen LLM missing AR nested engine": (
+        "train_pe",
+        {
+            "rollout": {
+                "_target_": COMPOSED,
+                "config": {"diffusion": {"_target_": SGLANG_DIFFUSION_CONFIG}},
+            },
+            "freeze_llm": True,
+            "sync": {"diffusion": {"_target_": LOCAL_LORA_SYNC, "track_prefix": "diffusion"}},
+        },
+    ),
+    "PE swapped nested engine families": (
+        "train_pe",
+        {
+            "rollout": _composed_rollout(ar=SGLANG_DIFFUSION_CONFIG, diffusion=SGLANG_CONFIG),
+            "sync": {
+                "ar": {"_target_": TENSOR_SYNC, "track_prefix": "ar"},
+                "diffusion": {"_target_": LOCAL_LORA_SYNC, "track_prefix": "diffusion"},
+            },
+        },
+    ),
+    "non-boolean sync copy": (
+        "train_ar",
+        {
+            "rollout": {"_target_": VLLM_OMNI},
+            "sync": {"_target_": REMOTE_LORA_SYNC, "copy": "false"},
+            "rollout_anchor_device": 1,
+        },
+    ),
+    "non-boolean enable_fsdp_offload": (
+        "train_ar",
+        {"rollout": {"_target_": VLLM}, "sync": {"_target_": IPC_SYNC}, "enable_fsdp_offload": "false"},
+    ),
+    "unknown engine family": (
+        "train_diffusion",
+        {"rollout": {"_target_": "acme.engines.MyEngine"}},
+    ),
+    "unknown sync handler": (
+        "train_diffusion",
+        {
+            "rollout": {"_target_": SGLANG_DIFFUSION},
+            "sync": {"_target_": "acme.sync.CustomWeightSync"},
+        },
+    ),
+    "unknown sampling class": (
+        "train_diffusion",
+        {
+            "sampling": {"_target_": "acme.sampling.CustomSampler"},
+            "rollout": {"_target_": TRAINSIDE},
+        },
+    ),
 }
 
 MUST_ACCEPT: dict[str, tuple[str, dict]] = {
     "colocated direct sampling": ("train_diffusion", {"rollout": {"_target_": TRAINSIDE}}),
     "vLLM native IPC": ("train_ar", {"rollout": {"_target_": VLLM}, "sync": {"_target_": IPC_SYNC}}),
-    "interpolated loss_agg_mode": (
-        "train_ar",
-        {"rollout": {"_target_": TRAINSIDE}, "algorithm": {"_target_": GRPO, "loss_agg_mode": "${oc.env:AGG,x}"}},
-    ),
     "seq-mean-token-mean on DRPO": (
         "train_ar",
         {"rollout": {"_target_": TRAINSIDE}, "algorithm": {"_target_": DRPO, "loss_agg_mode": "seq-mean-token-mean"}},
@@ -814,14 +887,6 @@ MUST_ACCEPT: dict[str, tuple[str, dict]] = {
             "rollout_anchor_device": 1,
         },
     ),
-    "dynamic anchored AR remote LoRA": (
-        "train_ar",
-        {
-            "rollout": {"_target_": VLLM_OMNI},
-            "sync": {"_target_": REMOTE_LORA_SYNC},
-            "rollout_anchor_device": "${oc.env:ANCHOR,1}",
-        },
-    ),
     "async AR NCCL": (
         "train_async_ar",
         {"rollout": {"_target_": SGLANG}, "sync": {"_target_": NCCL_SYNC}},
@@ -846,45 +911,14 @@ MUST_ACCEPT: dict[str, tuple[str, dict]] = {
             "sync": {"_target_": TENSOR_SYNC},
         },
     ),
-    "dynamic diffusion layout": (
-        "train_diffusion",
-        {
-            "layout": "${oc.env:LAYOUT,colocate}",
-            "rollout": {"_target_": SGLANG_DIFFUSION},
-            "sync": {"_target_": TENSOR_SYNC},
-        },
-    ),
     "agentic Tensor sync": (
         "train_agentic",
         {
-            "rollout": {"_target_": AGENTIC, "config": {"inner": {"_target_": SGLANG_CONFIG}}},
+            "rollout": _agentic_rollout(),
             "sync": {"_target_": TENSOR_SYNC},
         },
     ),
     "supervised recipe": ("train_sft", {"bundle": {"_target_": "unirl.models.sd3.bundle.SD3Bundle"}}),
-    "out-of-tree direct engine": ("train_diffusion", {"rollout": {"_target_": "acme.engines.MyEngine"}}),
-    "out-of-tree dedicated engine": (
-        "train_diffusion",
-        {
-            "rollout": {"_target_": "acme.engines.MyDedicatedEngine"},
-            "sync": {"_target_": "acme.sync.CustomWeightSync"},
-        },
-    ),
-    "out-of-tree top-level sampling": (
-        "train_diffusion",
-        {
-            "sampling": {"_target_": "acme.sampling.CustomSampler"},
-            "rollout": {"_target_": TRAINSIDE},
-        },
-    ),
-    "out-of-tree namespaced sampling": (
-        "train_ar",
-        {
-            "sampling": {"ar": {"_target_": "acme.sampling.CustomSampler"}},
-            "rollout": {"_target_": SGLANG},
-            "sync": {"_target_": TENSOR_SYNC},
-        },
-    ),
 }
 
 EXPECTED_REJECT_MESSAGES = {
@@ -894,7 +928,18 @@ EXPECTED_REJECT_MESSAGES = {
     "vLLM under async AR": "does not support train_async_ar",
     "anchored vLLM native IPC": "anchored train_ar rollout supports only RemoteLoraWeightSync",
     "GSPO-style loss_agg_mode on GRPO": "cfg.algorithm.loss_agg_mode='seq-mean' is not implemented by GRPO",
+    "loss_agg_mode on GSPO": "does not accept loss_agg_mode",
     "unknown loss_agg_mode on a unified AR track": "cfg.algorithm.ar.loss_agg_mode='token-sum'",
+    "unknown loss_agg_mode on a PE AR track": "cfg.ar.algorithm.loss_agg_mode='token-sum'",
+    "PE frozen LLM missing AR nested engine": "cfg.rollout.config.ar must declare an engine config",
+    "PE swapped nested engine families": "cfg.rollout.config.ar._target_=",
+    "agentic SGLang without memory saver": "enable_memory_saver is unset",
+    "agentic with diffusion inner engine": "does not support inner rollout",
+    "non-boolean sync copy": "cfg.sync.copy must be a boolean",
+    "non-boolean enable_fsdp_offload": "cfg.enable_fsdp_offload must be a boolean",
+    "unknown engine family": "has no declared engine family",
+    "unknown sync handler": "is not a known weight-sync handler",
+    "unknown sampling class": "requires diffusion sampling parameters",
 }
 
 

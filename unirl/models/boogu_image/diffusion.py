@@ -229,9 +229,7 @@ class BooguImageDiffusionStage(DiffusionStage[BooguImageConditions]):
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="logprob_precision")
         self.vae_scale_factor = vae_scale_factor
         if latent_channels is None:
-            tx_cfg = getattr(model.transformer, "config", None)
-            in_channels = getattr(tx_cfg, "in_channels", 16) if tx_cfg is not None else 16
-            latent_channels = int(in_channels)
+            latent_channels = int(model.transformer.config.in_channels)
         self.latent_channels = int(latent_channels)
         self._freqs_cis: Optional[List[torch.Tensor]] = None
         self._freqs_cis_device: Optional[torch.device] = None

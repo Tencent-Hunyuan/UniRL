@@ -68,7 +68,7 @@ Driver-authoritative rollout contract — these are what keep the GRPO ratio hon
 | `patch_latent_prep.py` | The provided-latents branch is only `latents.to(device)`: it neither expands `[1, …]` to per-sample `[batch_size, …]` nor runs packing, so packed models (FLUX.2-Klein / M3) leave `batch.latent_ids = None` → `AttributeError` in `get_freqs_cis` | upstream mirrors the randn branch |
 | `patch_denoising.py` | One generator per request, reused across steps — every GRPO-group sample is a separate B=1 request reseeded to the same `batch.seed`, so all samples draw **byte-identical per-step `z_t`**; exploration freezes and reward regresses after ~100 rollouts. The blake2b derivation must match `make_step_generators`. Same root cause as the vLLM-Omni BAGEL fix (PR #89) | upstream keys noise per sample |
 | `patch_conditions.py` | `GenerationResult` / `OutputBatch` do not carry text-encoder embeds and `SamplingParams` rejects `return_prompt_embeds`, so `populate_conditions=true` recipes crash. Upstream's `TextEncodingStage` already populates the positive and (under CFG) negative batch fields, so this only **copies**, never re-encodes. Both `DecodingStage.forward` and `_req_to_output_batch` must be wrapped — the monolithic path bypasses the latter | upstream emits conditions |
-| `patch_dance.py` | Upstream supports only `sde`/`cps`/`ode`; FLUX.2-Klein's primary objective is `dance` (constant `std_dev_t = eta`). **The ONLY REPLACE patch** — it re-vendors upstream `flow_sde_sampling` with one extra `elif`, so it must be hand-re-synced on any bump. Parity with `unirl/sde/kernels.py:DanceSDEStrategy` is verified by hand only | upstream adds a `dance` branch |
+| `patch_dance.py` | Upstream supports only `sde`/`cps`/`ode`; FLUX.2-Klein's primary objective is `dance` (constant `std_dev_t = eta`). Upstream also scores the pre-cast fp32 transition, while `step()` stores `prev_sample.to(model_output.dtype)` and trainside replay (`SDEStrategy._finalize_logp`) and vLLM-Omni score that stored value — a systematic `E[δ²]/(2σ²)` log-prob gap on every `old_logp_source=rollout` recipe. **The ONLY REPLACE patch** — it re-vendors upstream `flow_sde_sampling` with a `dance` branch and emitted-dtype scoring, so it must be hand-re-synced on any bump. Parity with `unirl/sde/kernels.py:DanceSDEStrategy` is verified by hand only | upstream adds a `dance` branch and scores the emitted transition |
 | `patch_wan_scheduler.py` | `WanPipeline` hardcodes `FlowUniPCMultistepScheduler`, which has no `SchedulerRLMixin` — no SDE log-prob path, and `set_timesteps` rejects the pinned σ list. Hard dependency on `patch_set_timesteps` | upstream's WAN pipeline is RL-capable |
 | `patch_ltx2_rollout_sde.py` | LTX-2's stage overrides drop 6 pieces of the rollout contract the base stages provide | upstream's LTX-2 stages are rollout-complete |
 
@@ -81,7 +81,9 @@ Version-window and environment bridges:
 ## Gotchas
 
 - **`patch_dance` is the only REPLACE** — every other patch is additive. On an
-  sglang bump, re-sync its re-vendored `flow_sde_sampling` body by hand first.
+  sglang bump, re-sync its re-vendored `flow_sde_sampling` body by hand first,
+  keeping the `dance` branch and the emitted-dtype log-prob block that replaces
+  upstream's full-noise-buffer scoring.
 - **Install order matters.** `hijack.py` must run before `DiffGenerator` is
   imported; `patch_wan_scheduler` requires `patch_set_timesteps`.
 - **Patched bodies copied verbatim from the fork are nested functions**, so their

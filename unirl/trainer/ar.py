@@ -127,9 +127,7 @@ class ARTrainer(BaseTrainer):
         self.eval_samples_per_prompt = int(eval_samples_per_prompt)
         self.eval_temperature = float(eval_temperature)
 
-        self._rollout_anchor_device: Optional[int] = (
-            int(rollout_anchor_device) if rollout_anchor_device is not None else None
-        )
+        self._rollout_anchor_device: Optional[int] = rollout_anchor_device
         self._enable_fsdp_offload = bool(enable_fsdp_offload)
         self._anchored_backend_offloaded: Optional[bool] = False
         self._anchored_rollout_awake: Optional[bool] = None
@@ -219,9 +217,8 @@ class ARTrainer(BaseTrainer):
                 else:
                     self._anchored_rollout_awake = True
 
-                if sync_cfg is not None:
-                    self.weight_sync = remote_hydra(sync_cfg, backend=self.backend)
-                    self.weight_sync.set_rollout_targets([(self.rollout.role_name, self.rollout.workers)])
+                self.weight_sync = remote_hydra(sync_cfg, backend=self.backend)
+                self.weight_sync.set_rollout_targets([(self.rollout.role_name, self.rollout.workers)])
 
         if self.weight_sync is not None:
             uses_gpu_streaming = getattr(self.weight_sync, "uses_gpu_streaming", None)
@@ -288,12 +285,12 @@ class ARTrainer(BaseTrainer):
         """Run one anchored rollout phase and restore the requested steady state."""
         original_error: Optional[BaseException] = None
         try:
-            if sync_weights and self.weight_sync is not None:
+            if sync_weights:
                 self._ensure_anchored_backend_loaded()
                 self.weight_sync.extract()
             self._ensure_anchored_backend_offloaded()
             self._ensure_anchored_rollout_awake()
-            if sync_weights and self.weight_sync is not None:
+            if sync_weights:
                 self.weight_sync.push()
             yield
         except BaseException as exc:
@@ -429,9 +426,6 @@ class ARTrainer(BaseTrainer):
                 if preserve_rollout_weights:
                     self._preserve_rollout_weights_for_next_sleep()
                 sample = self.rollout.generate(sample)
-                from unirl.trainer.unified_model import deep_hydrate
-
-                sample = deep_hydrate(sample)
 
         if self.reward is not None:
             sample = self.reward.score_and_attach(sample)
@@ -465,7 +459,11 @@ class ARTrainer(BaseTrainer):
         if anchored:
             self._ensure_anchored_backend_loaded()
         try:
-            result = self.stack.train_track(train_part, training_progress=float(training_progress))
+            result = self.stack.train_track(
+                train_part,
+                training_progress=float(training_progress),
+                rollout_id=rollout_id,
+            )
         finally:
             if anchored:
                 self._ensure_anchored_backend_offloaded()
@@ -531,13 +529,7 @@ class ARTrainer(BaseTrainer):
                     prompt_n += real_prompt_n
                     dispatch_inputs = self._pad_eval_inputs(eval_inputs)
                     sample = self._build_request_sample(dispatch_inputs, rollout_id, sampling=eval_sp)
-                    if anchored:
-                        generated = self.rollout.generate(sample)
-                        from unirl.trainer.unified_model import deep_hydrate
-
-                        generated = deep_hydrate(generated)
-                    else:
-                        generated = self.rollout.generate(sample)
+                    generated = self.rollout.generate(sample)
                     scored = self.reward.score_and_attach(generated)
                     rewards = scored.parts[-1].rewards
                     if rewards is not None:

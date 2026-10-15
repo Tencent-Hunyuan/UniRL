@@ -82,8 +82,8 @@ class RLHunyuanVideo15Pipeline(HunyuanVideo15Pipeline):
 
     def _arm_sde(self, req: OmniDiffusionRequest) -> None:
         """This request's SDE strength + sparse step gate."""
-        eta = float(getattr(req.sampling_params, "eta", 0.0) or 0.0)
-        extra = getattr(req.sampling_params, "extra_args", None) or {}
+        eta = float(req.sampling_params.eta)
+        extra = req.sampling_params.extra_args
         denoise_seed_keys = slice_request_denoise_seed_keys(
             req,
             caller="RLHunyuanVideo15Pipeline._arm_sde",
@@ -115,7 +115,7 @@ class RLHunyuanVideo15Pipeline(HunyuanVideo15Pipeline):
     @contextmanager
     def _sigma_override(self, req: OmniDiffusionRequest) -> Iterator[None]:
         """WORKAROUND: make upstream pick up the engine's σ schedule."""
-        engine_sigmas = getattr(req.sampling_params, "sigmas", None)
+        engine_sigmas = req.sampling_params.sigmas
         if engine_sigmas is None:
             yield
             return

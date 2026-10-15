@@ -124,7 +124,7 @@ class WeightSync:
     ) -> None:
         """Hot-swap the adapter via the zero-copy shm-handle transport."""
         self._cache_lora(adapter_name, lora_tensors, peft_config)
-        self._backend.set_lora_handle(adapter_name=adapter_name, lora_tensors=lora_tensors, peft_config=peft_config)
+        self._backend.set_lora_handle(lora_tensors=lora_tensors, peft_config=peft_config)
         self._lora_loaded = True
         self._weights_released = False
 
@@ -137,7 +137,7 @@ class WeightSync:
     ) -> None:
         """Hot-swap the adapter via the TP>1-safe byte-copy transport."""
         self._cache_lora(adapter_name, lora_tensors, peft_config)
-        self._backend.set_lora_copy(adapter_name=adapter_name, lora_tensors=lora_tensors, peft_config=peft_config)
+        self._backend.set_lora_copy(lora_tensors=lora_tensors, peft_config=peft_config)
         self._lora_loaded = True
         self._weights_released = False
 
@@ -156,7 +156,7 @@ class WeightSync:
         return self._backend.param_checksums(names=list(names))
 
     def loaded_lora_checksums(self, *, adapter_id: int, names: Optional[List[str]] = None) -> dict:
-        return self._backend.lora_checksums(adapter_id=int(adapter_id), names=names)
+        return self._backend.lora_checksums(adapter_id=adapter_id, names=names)
 
     def mark_weights_released(self) -> None:
         """The engine released the runtime memory — the worker-side LoRA pool"""

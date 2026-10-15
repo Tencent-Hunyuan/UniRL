@@ -25,7 +25,7 @@ def main(cfg: DictConfig) -> None:
         stack_cfg=cfg.stack,
         data_source_cfg=cfg.data_source,
         sampling_cfg=cfg.sampling,
-        sync_cfg=cfg.get("sync"),
+        sync_cfg=cfg.sync,
         logging_cfg=cfg.get("logging"),
         adv_normalization_scope=cfg.get("adv_normalization_scope", "group"),
         normalize_adv_by_std=bool(cfg.get("normalize_adv_by_std", True)),

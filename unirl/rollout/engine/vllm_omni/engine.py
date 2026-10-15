@@ -61,6 +61,7 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
         self.adapter = get_adapter(config.modality)(
             config, model_config, strategy=strategy, tokenize_fn=self._tokenize_prompt
         )
+        self.packs_groups = self.adapter.packs_groups
 
         self.schedule_policy = self.adapter.schedule_policy() if self.adapter.needs_sigmas else None
 
@@ -105,6 +106,8 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
             "VLLMOmniRolloutEngine.generate: engine is offloaded or its last lifecycle transition failed "
             "(wake_up first).",
         )
+        if not self.adapter.supports_row_canvas:
+            sample.reject_row_canvases(engine=f"VLLMOmniRolloutEngine[{self.cfg.modality}]")
         self.adapter.validate_request(sample)
         if self.adapter.needs_sigmas:
             require(self.schedule_policy is not None, f"{type(self.adapter).__name__} has no sigma schedule policy")
@@ -256,7 +259,6 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
             use_shm=use_shm,
             replica_rank=replica_rank,
         )
-        self._version += 1
 
     def init_weights_update_group(
         self,
@@ -299,7 +301,6 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
             target_modules=target_modules,
             flush_cache=flush_cache,
         )
-        self._version += 1
 
     def destroy_weights_update_group(
         self,
@@ -326,7 +327,6 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
             load_format=load_format,
             flush_cache=flush_cache,
         )
-        self._version += 1
 
     def set_lora_from_tensors(
         self,

@@ -113,6 +113,7 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
 
     def _generate_core(self, sample: Sample) -> Sample:
         """Synchronous generation for one whole ``Sample``."""
+        sample.reject_row_canvases(engine="SGLangDiffusionRolloutEngine")
         gen = sample.frontier_gen_part(DiffusionSamplingParams)
         require(
             int(gen.batch_size) > 0,
@@ -147,7 +148,7 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
         """Driver-authoritative x_T → init_same_noise fallback → None. Model-agnostic."""
         gen = sample.frontier_gen_part(DiffusionSamplingParams)
         diffusion = gen.sampling_params
-        if diffusion is not None and bool(getattr(diffusion, "disable_driver_xt", False)):
+        if diffusion.disable_driver_xt:
             return None
         recipe = NoiseRecipe.from_sample(sample)
         xt = recipe.resolve()
@@ -157,7 +158,7 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
             return None
 
         require(
-            diffusion is not None and diffusion.seed is not None,
+            diffusion.seed is not None,
             "init_same_noise=True requires a diffusion seed",
         )
         batch_size = int(gen.batch_size)
@@ -233,7 +234,6 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
             load_format=load_format,
             flush_cache=flush_cache,
         )
-        self._version += 1
 
     def init_weights_update_group(
         self,
@@ -276,7 +276,6 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
             target_modules=target_modules,
             flush_cache=flush_cache,
         )
-        self._version += 1
 
     def destroy_weights_update_group(
         self,

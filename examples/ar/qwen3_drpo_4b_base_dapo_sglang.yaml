@@ -79,6 +79,9 @@ pipeline:
   # per-update drift signal, and ~1/3 of the measured rollout↔replay absdiff
   # 0.018→0.0135). verl stores fp32 (flash-attn xentropy) — parity. Run uhaufzac.
   logprob_precision: fp32
+  replay_kernel_options:
+    # PyTorch 2.13: avoid flex-decoding for short padded replay.
+    BACKEND: TRITON
 
 backend:
   _target_: unirl.train.backend.fsdp.FSDPBackend
@@ -122,6 +125,10 @@ rollout:
     backend: native
     pretrained_model_ckpt_path: ${oc.env:QWEN3_PATH,Qwen/Qwen3-4B-Base}
     tp_size: 1
+    # Each engine receives batch_size * samples_per_prompt / num_devices
+    # sequences (16 at 32 GPUs). At 16 GPUs, raise this and
+    # engine_kwargs.cuda_graph_max_bs_decode to 32 together, provided the KV
+    # pool (mem_fraction_static) holds 32 responses at max_new_tokens.
     concurrency: 16
     # ARTrainer pre-expands the req by samples_per_prompt, so the engine emits
     # one completion per entry (n=1); else samples double-count.
@@ -137,6 +144,9 @@ rollout:
       # FSDP trainer. Without it, rollout logprobs drift from replay.
       # It further forces deterministic sampling, so the engine sends this recipe's
       # 8 samples/prompt as 8 seeded n=1 requests (see unirl/rollout/engine/README.md).
+      # ~rollout.config.engine_kwargs.rl_on_policy_target selects SGLang's native
+      # kernels: faster generation, but a larger rollout↔replay logprob gap
+      # enters every ratio.
       rl_on_policy_target: fsdp
       # Colocate full-FT preset — see unirl/rollout/README.md (SGLang AR knobs).
       # FULL fine-tuning: lower the SRT KV reservation to give FSDP headroom for
