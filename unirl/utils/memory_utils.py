@@ -139,8 +139,7 @@ def _top_frame(frames: Optional[list]) -> str:
     if not frames:
         return "<no stack captured>"
     for fr in frames:
-        raw_fn = fr.get("filename")
-        fn = ("" if raw_fn is None else str(raw_fn)).replace("\\", "/")
+        fn = fr.get("filename", "").replace("\\", "/")
         if fn and "/torch/" not in fn:
             return f"{fn}:{fr.get('line', '?')}:{fr.get('name', '?')}"
     fr = frames[0]

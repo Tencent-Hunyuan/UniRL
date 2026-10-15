@@ -11,14 +11,14 @@ from torch import nn
 
 def has_ep_params(model: nn.Module) -> bool:
     """Whether ``model`` carries VeOmni's non-empty EP parameter group."""
-    groups = getattr(model, "_extra_parallel_param_groups", None)
-    return bool(groups and groups.get("ep"))
+    return hasattr(model, "_extra_parallel_param_groups")
 
 
 def ep_named_parameters(model: nn.Module) -> Tuple[Tuple[str, nn.Parameter], ...]:
     """Return EP parameters in deterministic model order."""
-    groups = getattr(model, "_extra_parallel_param_groups", None)
-    ep_params = () if groups is None else tuple(groups.get("ep", ()))
+    if not hasattr(model, "_extra_parallel_param_groups"):
+        return ()
+    ep_params = model._extra_parallel_param_groups["ep"]
     ep_ids = {id(param) for param in ep_params}
     named = tuple((name, param) for name, param in model.named_parameters() if id(param) in ep_ids)
     if len(named) != len(ep_params):
@@ -60,7 +60,6 @@ def gather_stacked_expert_block(
     if block.device.type == "cpu" and backend == "nccl":
         block = block.cuda()
 
-    # Keep the list path for legacy Gloo (requirements.txt still permits torch 2.1).
     if backend != "nccl":
         gathered = [torch.empty_like(block) for _ in range(ep_size)]
         dist.all_gather(gathered, block, group=ep_group)
@@ -69,10 +68,7 @@ def gather_stacked_expert_block(
     # Write rank-contiguous blocks directly into the final tensor, avoiding the
     # extra full-size allocation and copy made by list all_gather + torch.cat.
     stacked = block.new_empty((ep_size * block.shape[0], *block.shape[1:]))
-    gather_single = getattr(dist, "all_gather_single", None)  # PyTorch >= 2.13
-    if gather_single is None:
-        gather_single = dist.all_gather_into_tensor
-    gather_single(stacked, block, group=ep_group)
+    dist.all_gather_single(stacked, block, group=ep_group)
     return stacked
 
 

@@ -7,9 +7,8 @@ from typing import List
 
 import torch
 from torch import Tensor, nn
+from torch.distributed.tensor import DTensor
 from torch.nn.parameter import Parameter
-
-from unirl.train.backend.sharded_state import _maybe_dtensor_to_tensor
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +20,7 @@ def clip_grad_norm(
     """FSDP-safe gradient clipping."""
     try:
         result = torch.nn.utils.clip_grad_norm_(params, max_norm)
-        return _maybe_dtensor_to_tensor(result)
+        return result.full_tensor() if isinstance(result, DTensor) else result
     except RuntimeError as exc:
         msg = str(exc)
         fallback_triggers = (
@@ -77,8 +76,7 @@ def _global_clip_for_sharded_grads(
         if grad is None:
             continue
         local_grad = grad
-        to_local = getattr(local_grad, "to_local", None)
-        if callable(to_local):
+        if isinstance(local_grad, DTensor):
             if shard_group is None:
                 mesh = local_grad.device_mesh
                 placements = local_grad.placements
@@ -90,7 +88,7 @@ def _global_clip_for_sharded_grads(
                             f"got placements={placements!r}"
                         )
                     shard_group = mesh.get_group(shard_dims[0])
-            local_grad = to_local()
+            local_grad = local_grad.to_local()
         if not isinstance(local_grad, Tensor):
             continue
         local_sq_sum += float(torch.sum(local_grad.detach().float() ** 2).item())

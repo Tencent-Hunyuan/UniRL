@@ -75,15 +75,15 @@ def write_adapter_config(
 
     os.makedirs(output, exist_ok=True)
     config = LoraConfig(
-        r=int(r),
-        lora_alpha=int(lora_alpha),
+        r=r,
+        lora_alpha=lora_alpha,
         target_modules=target_modules,
         exclude_modules=exclude_modules,
-        lora_dropout=float(lora_dropout),
-        bias=str(bias),
-        task_type=str(task_type),
+        lora_dropout=lora_dropout,
+        bias=bias,
+        task_type=task_type,
     )
-    config.base_model_name_or_path = str(base)
+    config.base_model_name_or_path = base
     config.save_pretrained(output)
 
 
@@ -194,7 +194,7 @@ def main() -> None:
     adapter_state = export_adapter_state_dict(
         state_dict,
         adapter=args.adapter,
-        peft_prefix="" if args.peft_prefix is None else str(args.peft_prefix),
+        peft_prefix=args.peft_prefix,
     )
 
     os.makedirs(args.output, exist_ok=True)

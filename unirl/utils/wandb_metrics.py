@@ -7,45 +7,6 @@ from typing import Any, Dict, List, Optional, Sequence
 import torch
 
 
-def _coerce_scalar(value: Any) -> Optional[float]:
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        return float(value)
-    if isinstance(value, (int, float)):
-        return float(value)
-    if torch.is_tensor(value):
-        tensor = value.detach()
-        if tensor.numel() == 0:
-            return None
-        if tensor.numel() == 1:
-            return float(tensor.item())
-        return float(tensor.to(dtype=torch.float32).mean().item())
-    return None
-
-
-def flatten_numeric_metrics(
-    payload: Dict[str, Any],
-    *,
-    prefix: str = "",
-) -> Dict[str, float]:
-    """Flatten nested dict payload into numeric metrics only."""
-    output: Dict[str, float] = {}
-
-    def _walk(node: Dict[str, Any], node_prefix: str) -> None:
-        for key, value in node.items():
-            metric_key = f"{node_prefix}{key}" if node_prefix else str(key)
-            if isinstance(value, dict):
-                _walk(value, f"{metric_key}/")
-                continue
-            scalar = _coerce_scalar(value)
-            if scalar is not None:
-                output[metric_key] = scalar
-
-    _walk(payload, prefix)
-    return output
-
-
 def _tensor_stats(prefix: str, tensor: Optional[torch.Tensor]) -> Dict[str, float]:
     if tensor is None or (not torch.is_tensor(tensor)) or tensor.numel() == 0:
         return {}
@@ -93,11 +54,11 @@ def compute_rollout_sample_metrics(*, sample: Any, trunc_len: Optional[int] = No
 
     metrics: Dict[str, float] = {}
     if sample is None:
-        metrics["num_samples"] = 0.0
+        metrics["num_samples"] = 0
         return metrics
 
     gen_parts = sample.gen_parts()
-    metrics["num_samples"] = float(int(gen_parts[-1].batch_size)) if gen_parts else float(int(sample.batch_size))
+    metrics["num_samples"] = gen_parts[-1].batch_size if gen_parts else sample.batch_size
     multi = len(gen_parts) > 1
     for part in gen_parts:
         name = "ar" if isinstance(part.sampling_params, ARSamplingParams) else "diffusion"
@@ -144,7 +105,7 @@ def compute_rollout_sample_metrics(*, sample: Any, trunc_len: Optional[int] = No
 
 def pooled_window_reward_metrics(parts: Sequence[Any]) -> Dict[str, float]:
     """Reward metrics pooled over an accumulation window's gen Parts."""
-    metrics: Dict[str, float] = {"num_samples": float(sum(int(p.batch_size) for p in parts))}
+    metrics: Dict[str, float] = {"num_samples": sum(p.batch_size for p in parts)}
     rewards = [p.rewards for p in parts]
     if all(torch.is_tensor(r) and r.numel() > 0 for r in rewards):
         pooled = torch.cat([r.detach().to(dtype=torch.float32).reshape(-1).cpu() for r in rewards])
@@ -162,28 +123,4 @@ def pooled_window_reward_metrics(parts: Sequence[Any]) -> Dict[str, float]:
             if all(torch.is_tensor(t) and t.numel() > 0 for t in tensors):
                 pooled_c = torch.cat([t.detach().to(dtype=torch.float32).reshape(-1).cpu() for t in tensors])
                 metrics.update(_tensor_stats(f"reward_{str(cname).replace('/', '_')}", pooled_c))
-    return metrics
-
-
-def build_sync_metrics(
-    sync_result: Any,
-    prefix: str = "sync/",
-) -> Dict[str, float]:
-    """Flatten weight-sync result into numeric metrics."""
-    if sync_result is None:
-        return {}
-
-    metrics: Dict[str, float] = {}
-    for key, raw in (
-        ("elapsed_ms", sync_result.elapsed_ms),
-        ("version", sync_result.version),
-        ("rollout_id", sync_result.rollout_id),
-    ):
-        scalar = _coerce_scalar(raw)
-        if scalar is not None:
-            metrics[f"{prefix}{key}"] = scalar
-
-    extra = sync_result.extra
-    if isinstance(extra, dict):
-        metrics.update(flatten_numeric_metrics(extra, prefix=f"{prefix}extra/"))
     return metrics

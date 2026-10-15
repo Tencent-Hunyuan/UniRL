@@ -254,10 +254,9 @@ def _load_pil_images(uris: Sequence[Optional[str]], *, max_workers: int) -> List
 
 def _media_uris(record: Record, *, role: str, modality: Optional[str] = None) -> List[str]:
     """URIs of normalized media refs matching ``role`` and ``modality``."""
-    refs = record.get("media_refs")
     return [
         ref.uri
-        for ref in (() if refs is None else refs)
+        for ref in record.get("media_refs", ())
         if isinstance(ref, MediaRef) and ref.role == role and (modality is None or ref.modality == modality)
     ]
 
@@ -330,7 +329,7 @@ class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
             sample_ids=_sample_ids(records),
             conditions=conditions.to_dict(),
             segment=segment,
-            metadata=[{} if record.get("metadata") is None else dict(record["metadata"]) for record in records],
+            metadata=[dict(record.get("metadata", ())) for record in records],
         )
         if part.batch_size != len(records):
             raise RuntimeError(
@@ -418,11 +417,7 @@ class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
         texts = Texts(texts=[str(r["prompt"]) for r in records])
         # The data layer normalizes every manifest media entry to MediaRef, so no dict form here.
         prompt_media_rows: List[List[MediaRef]] = [
-            [
-                ref
-                for ref in (() if r.get("media_refs") is None else r["media_refs"])
-                if isinstance(ref, MediaRef) and ref.role == "prompt"
-            ]
+            [ref for ref in r.get("media_refs", ()) if isinstance(ref, MediaRef) and ref.role == "prompt"]
             for r in records
         ]
         if any(prompt_media_rows):
@@ -671,7 +666,7 @@ class DiffusionSupervisedTrackBuilder(SupervisedTrackBuilder):
             sample_ids=_sample_ids(records),
             conditions=conditions.to_dict(),
             segment=segment,
-            metadata=[{} if record.get("metadata") is None else dict(record["metadata"]) for record in records],
+            metadata=[dict(record.get("metadata", ())) for record in records],
         )
 
     def _resolve_cache_encoders(
@@ -840,7 +835,7 @@ class VideoDiffusionSupervisedTrackBuilder(SupervisedTrackBuilder):
             sample_ids=_sample_ids(records),
             conditions=conditions.to_dict(),
             segment=segment,
-            metadata=[{} if record.get("metadata") is None else dict(record["metadata"]) for record in records],
+            metadata=[dict(record.get("metadata", ())) for record in records],
         )
 
     def _load_target_videos(self, records: Sequence[Record]) -> Videos:

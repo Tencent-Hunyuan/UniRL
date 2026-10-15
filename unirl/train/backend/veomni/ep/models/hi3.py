@@ -16,12 +16,6 @@ _EP_PLAN = {
 }
 
 
-def _swap_gate_up_halves(gate_and_up: torch.Tensor) -> torch.Tensor:
-    """Swap the two output halves of a fused gate_and_up tensor ``[..., 2I, H]``."""
-    half = gate_and_up.shape[-2] // 2
-    return torch.cat([gate_and_up[..., half:, :], gate_and_up[..., :half, :]], dim=-2)
-
-
 def fuse_expert_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     """Stack per-expert weights into fused ``[E, ...]`` tensors (load-time converter)."""
     groups: Dict[tuple, Dict[int, torch.Tensor]] = {}
@@ -42,7 +36,8 @@ def fuse_expert_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, tor
             )
         stacked = torch.stack([per_idx[j] for j in indices], dim=0)
         if proj == "gate_and_up_proj":
-            stacked = _swap_gate_up_halves(stacked).contiguous()
+            half = stacked.shape[-2] // 2
+            stacked = torch.cat([stacked[..., half:, :], stacked[..., :half, :]], dim=-2).contiguous()
         out[f"{prefix}.{proj}"] = stacked
     return out
 

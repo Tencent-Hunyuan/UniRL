@@ -414,20 +414,12 @@ class UniRLWandBLogger:
         if media_preview is None:
             return
 
-        if isinstance(media_preview, dict):
-            images = media_preview.get("images")
-            videos = media_preview.get("videos")
-            prompts = media_preview.get("prompts")
-            rewards = media_preview.get("rewards")
-            audios_raw = media_preview.get("audios")
-            audio_sr = media_preview.get("audio_sample_rate")
-        else:
-            images = media_preview.images
-            videos = media_preview.videos
-            prompts = media_preview.prompts
-            rewards = media_preview.rewards
-            audios_raw = media_preview.audios
-            audio_sr = media_preview.audio_sample_rate
+        images = media_preview.images
+        videos = media_preview.videos
+        prompts = media_preview.prompts
+        rewards = media_preview.rewards
+        audios = media_preview.audios
+        audio_sr = media_preview.audio_sample_rate
 
         has_images = isinstance(images, list) and bool(images)
         has_videos = isinstance(videos, list) and bool(videos)
@@ -482,7 +474,6 @@ class UniRLWandBLogger:
 
             if has_videos:
                 wandb_videos: List[Any] = []
-                audios = [] if audios_raw is None else audios_raw
                 for idx in range(min(len(videos), n)):
                     vid = videos[idx]
                     if not torch.is_tensor(vid):

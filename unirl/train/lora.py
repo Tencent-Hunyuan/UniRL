@@ -400,7 +400,7 @@ def adapters_disabled(model: nn.Module) -> Iterator[None]:
     from peft.tuners.lora import LoraLayer
 
     layers = [m for m in model.modules() if isinstance(m, LoraLayer)]
-    prev = [bool(m._disable_adapters) for m in layers]
+    prev = [m._disable_adapters for m in layers]
     try:
         for m in layers:
             m._disable_adapters = True

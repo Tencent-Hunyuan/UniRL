@@ -69,7 +69,7 @@ class MemoryMonitor:
         empty_cache_at: Sequence[str] = (),
     ) -> None:
         self.log_boundaries = bool(log_boundaries)
-        self.empty_cache_at = () if empty_cache_at is None else tuple(empty_cache_at)
+        self.empty_cache_at = tuple(empty_cache_at)
         self._step_max: Dict[str, float] = {}
         self._fallback = None
         self._installed = False
@@ -206,8 +206,8 @@ class MemoryMonitor:
 
 def install_memory_monitoring(trainer: Any) -> Optional[MemoryMonitor]:
     """Build a monitor from the trainer's ``logging.memory`` block (or env override)."""
-    logging_cfg = getattr(trainer, "logging_cfg", None)
-    mem_cfg = logging_cfg.get("memory") if logging_cfg is not None and hasattr(logging_cfg, "get") else None
+    logging_cfg = trainer.logging_cfg
+    mem_cfg = logging_cfg.get("memory") if logging_cfg is not None else None
     if mem_cfg is None:
         mem_cfg = {}
     enabled = bool(mem_cfg.get("enabled", False))
