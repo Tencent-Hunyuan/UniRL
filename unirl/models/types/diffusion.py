@@ -100,5 +100,9 @@ class DiffusionStage(Protocol[C]):
         """Single ``(xt, sigma)`` model forward — no scheduler iteration."""
         ...
 
+    def nft_clean_latents(self, segment: LatentSegment) -> torch.Tensor:
+        """Clean ``x0`` for forward-process training (defaults to final trajectory latent)."""
+        return segment.latents[:, -1]
+
 
 __all__ = ["DiffusionStage", "DiffusionStep", "ReplayResult"]

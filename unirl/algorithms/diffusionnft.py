@@ -99,9 +99,6 @@ class DiffusionNFT(StageAlgorithm):
         self.params = params
         self.nft_lora_policy = nft_lora_policy
         self.conditions_cls = conditions_cls
-        # MiniMax-H3 overrides this to pack its audio stream in alongside video.
-        clean_latents_fn = getattr(self.stage, "nft_clean_latents", None)
-        self._clean_latents_fn = clean_latents_fn if callable(clean_latents_fn) else None
         # The reference is the LoRA-disabled base policy, not the EMA shadow: the
         # shadow tracks the policy, so it cannot anchor drift away from it. Resolved
         # after the scalar checks — it walks `named_parameters()` to find the adapter.
@@ -135,7 +132,7 @@ class DiffusionNFT(StageAlgorithm):
                 "the last trajectory position); got None. Forward-process "
                 "rollout must populate the dense latents path."
             )
-        x0 = self._clean_latents_fn(segment) if self._clean_latents_fn is not None else segment.latents[:, -1]
+        x0 = self.stage.nft_clean_latents(segment)
         if x0.numel() == 0:
             return AlgorithmStepResult(
                 loss=0.0,
