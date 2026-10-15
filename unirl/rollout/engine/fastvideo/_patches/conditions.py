@@ -117,7 +117,8 @@ def patch_conditions() -> None:
         if response.get("rl_data") is not None:
             kwargs["rl_data"] = response["rl_data"]
         result = ForwardBatch(**kwargs)
-        result.prompt_embeds = response.get("prompt_embeds") or []
+        prompt_embeds = response.get("prompt_embeds")
+        result.prompt_embeds = prompt_embeds if prompt_embeds is not None else []
         result.negative_prompt_embeds = response.get("negative_prompt_embeds")
         result.prompt_attention_mask = response.get("prompt_attention_mask")
         result.negative_attention_mask = response.get("negative_attention_mask")

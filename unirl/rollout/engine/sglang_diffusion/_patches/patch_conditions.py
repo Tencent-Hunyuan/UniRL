@@ -153,22 +153,22 @@ def _wrap_req_to_output_batch(GPUWorker) -> None:
 
 def _copy_conditions(src, output_batch) -> None:
     """Copy the gated conditions fields off ``src`` (a Req) onto ``output_batch``."""
-    if getattr(src, "return_prompt_embeds", False):
+    if src.return_prompt_embeds:
         _copy_mapped_conditions(src, output_batch, _POS_MAP)
-    if getattr(src, "return_negative_prompt_embeds", False):
+    if src.return_negative_prompt_embeds:
         _copy_mapped_conditions(src, output_batch, _NEG_MAP)
     # A request group contains replicas of one prompt, so its image latents
     # share one token grid and can remain a regular [B, S_img, C] tensor.
-    image_latent = getattr(src, "image_latent", None)
+    image_latent = src.image_latent
     if image_latent is not None:
         values = image_latent if isinstance(image_latent, (list, tuple)) else [image_latent]
         output_batch.image_latent = _to_cpu_embed_list(values)
 
-    vae_image_sizes = getattr(src, "vae_image_sizes", None)
+    vae_image_sizes = src.vae_image_sizes
     if vae_image_sizes is not None:
         output_batch.image_latent_sizes = [vae_image_sizes]
 
-    condition_image_latent_ids = getattr(src, "condition_image_latent_ids", None)
+    condition_image_latent_ids = src.condition_image_latent_ids
     if condition_image_latent_ids is not None:
         values = (
             condition_image_latent_ids
@@ -181,7 +181,7 @@ def _copy_conditions(src, output_batch) -> None:
 def _copy_mapped_conditions(src, output_batch, mapping) -> None:
     """Copy each ``dst <- srcattr`` field, normalizing un-batched token embeds so"""
     for dst, srcattr in mapping.items():
-        val = _to_cpu_embed_list(getattr(src, srcattr, None))
+        val = _to_cpu_embed_list(getattr(src, srcattr))
         if dst in _TOKEN_EMBED_DESTS:
             val = _ensure_batched_embed_list(val)
             val = _coalesce_duplicate_single_sample_encodes(val)
@@ -270,7 +270,7 @@ def _merge_conditions(merged, output_batches) -> None:
     import torch
 
     for name in _COND_FIELDS:
-        per_batch = [getattr(ob, name, None) for ob in output_batches]
+        per_batch = [getattr(ob, name) for ob in output_batches]
         if any(v is None for v in per_batch):
             continue
         if not per_batch:
@@ -306,7 +306,7 @@ def _wrap_result_common(DiffGenerator) -> None:
         common = raw(req, output_batch, generation_time, output_index)
         idx = 0 if output_index is None else int(output_index)
         for name in _COND_FIELDS:
-            val = getattr(output_batch, name, None)
+            val = getattr(output_batch, name)
             common[name] = val if name == "image_latent_sizes" else _slice_embed_list(val, idx)
         return common
 

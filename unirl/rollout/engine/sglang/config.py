@@ -73,6 +73,8 @@ class SGLangEngineConfig(BaseEngineConfig):
     def __post_init__(self) -> None:
         if self.engine_kwargs is None:
             self.engine_kwargs = {}
+        if self.chat_template_kwargs is None:
+            self.chat_template_kwargs = {}
         require(
             bool(self.pretrained_model_ckpt_path),
             "SGLangEngineConfig.pretrained_model_ckpt_path must be set",
@@ -158,7 +160,7 @@ class SGLangEngineConfig(BaseEngineConfig):
         """Spell this config (+ the reserved ports) as ServerArgs intent."""
         intent: Dict[str, Any] = {}
 
-        intent.update(self.engine_kwargs or {})
+        intent.update(self.engine_kwargs)
 
         intent["model_path"] = self.pretrained_model_ckpt_path
         if self.tp_size is not None:

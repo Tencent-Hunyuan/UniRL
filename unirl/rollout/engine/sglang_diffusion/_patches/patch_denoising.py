@@ -26,16 +26,16 @@ def _make_step_generators(
 
 
 def _resolve_base_seed(batch) -> int | None:
-    seed = getattr(batch, "seed", None)
-    if seed is None:
-        seed = getattr(getattr(batch, "sampling_params", None), "seed", None)
+    seed = batch.seed
+    if seed is None and batch.sampling_params is not None:
+        seed = batch.sampling_params.seed
     return int(seed) if seed is not None else None
 
 
 def _resolve_fallback_seed(batch) -> int:
     """Deterministic per-request seed for the single-``torch.Generator`` fallback."""
     base_seed = _resolve_base_seed(batch)
-    denoise_seeds = getattr(batch, "denoise_seeds", None)
+    denoise_seeds = batch.denoise_seeds
     sample_key = str(denoise_seeds[0]) if denoise_seeds else None
     if base_seed is not None and sample_key is not None:
         payload = (f"{int(base_seed)}::fallback::sample::{sample_key}").encode("utf-8")
@@ -54,8 +54,8 @@ def patch_denoising() -> None:
         return
 
     def _run_denoising_step(self, ctx, step, batch, server_args):
-        denoise_seeds = getattr(batch, "denoise_seeds", None)
-        if getattr(batch, "rollout", False) and denoise_seeds is not None:
+        denoise_seeds = batch.denoise_seeds
+        if batch.rollout and denoise_seeds is not None:
             base_seed = _resolve_base_seed(batch)
             if base_seed is not None:
                 ctx.extra_step_kwargs["generator"] = _make_step_generators(
@@ -105,7 +105,7 @@ def _patch_rollout_variance_noise_device() -> None:
         buffer = self._get_or_create_rollout_noise_buffer(rsd, rsd.latents_shape, device, dtype)
         for i in range(B):
             g = generator[i]
-            if g is not None and getattr(g, "device", None) is not None and g.device.type != buffer.device.type:
+            if g is not None and g.device.type != buffer.device.type:
                 tmp = torch.randn(rsd.latents_shape, generator=g, dtype=dtype, device=g.device)
                 buffer[i : i + 1].copy_(tmp)
             else:

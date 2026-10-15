@@ -57,7 +57,7 @@ def _concat_rollout_trajectory_data(output_batches: list):
     RolloutTrajectoryData, RolloutDitTrajectory, RolloutDebugTensors = _rl_dataclasses()
 
     rtds = _require_uniform_presence(
-        [getattr(ob, "rollout_trajectory_data", None) for ob in output_batches],
+        [ob.rollout_trajectory_data for ob in output_batches],
         field="rollout_trajectory_data",
     )
     if rtds is None:

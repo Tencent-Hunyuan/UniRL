@@ -161,7 +161,7 @@ class TextLMAdapter(ModelAdapter):
             "tokenize": True,
             "return_dict": False,
         }
-        template_kwargs.update(self.cfg.chat_template_kwargs or {})
+        template_kwargs.update(self.cfg.chat_template_kwargs)
         ids = self._tokenizer.apply_chat_template(messages, **template_kwargs)
         if hasattr(ids, "input_ids"):  # BatchEncoding (return_dict re-enabled)
             ids = ids["input_ids"]
@@ -198,8 +198,8 @@ class TextLMAdapter(ModelAdapter):
     def build_segment(self, sample: Sample, prepared: PreparedInputs, raw: List[RawResult]) -> TextSegment:
         """Pack the per-candidate tokens/logprobs, each row pointing at its own slot."""
         return TextSegment.pack(
-            tokens=[torch.tensor(list(r.token_ids or []), dtype=torch.long) for r in raw],
-            log_probs=[torch.tensor(list(r.logprobs or []), dtype=torch.float32) for r in raw],
+            tokens=[torch.tensor(list(r.token_ids), dtype=torch.long) for r in raw],
+            log_probs=[torch.tensor(list(r.logprobs), dtype=torch.float32) for r in raw],
         )
 
     @staticmethod
@@ -212,7 +212,7 @@ class TextLMAdapter(ModelAdapter):
 
     def build_decoded(self, sample: Sample, prepared: PreparedInputs, raw: List[RawResult]) -> Texts:
         """Emit the RAW sampler text per candidate (verl-reference parity)."""
-        return Texts(texts=[r.text or "" for r in raw])
+        return Texts(texts=[r.text for r in raw])
 
     def build_conditions(self, sample: Sample, prepared: PreparedInputs, raw: List[RawResult]) -> Dict[str, Any]:
         """The replay conditions — the prompt ids the server saw, per sample."""

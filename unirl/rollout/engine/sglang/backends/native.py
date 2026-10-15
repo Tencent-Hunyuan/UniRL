@@ -179,7 +179,7 @@ class NativeBackend:
             allowed=allowed,
             backend_name="native",
         )
-        tp_size = int(engine_kwargs.get("tp_size", 1) or 1)
+        tp_size = int(engine_kwargs.get("tp_size", 1))
         if tp_size > 1:
             raise NotImplementedError(
                 "SGLang native backend does not support rollout tp_size>1 in UniRL yet; "
@@ -207,11 +207,11 @@ class NativeBackend:
         multiprocessing.set_start_method("spawn", force=True)
         engine = rt["Engine"](**engine_kwargs)
 
-        settled = getattr(engine, "server_args", None)
+        settled = engine.server_args
         logger.info(
             "SGLang Engine ready (settled ServerArgs: port=%s nccl_port=%s)",
-            getattr(settled, "port", None),
-            getattr(settled, "nccl_port", None),
+            settled.port,
+            settled.nccl_port,
         )
         return cls(engine, concurrency=concurrency, runtime=rt)
 

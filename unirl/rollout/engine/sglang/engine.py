@@ -91,7 +91,7 @@ class SGLangRolloutEngine(BaseRolloutEngine):
             )
             return
 
-        engine_kwargs: Dict[str, Any] = dict(config.engine_kwargs or {})
+        engine_kwargs: Dict[str, Any] = dict(config.engine_kwargs)
 
         from transformers import AutoTokenizer
 

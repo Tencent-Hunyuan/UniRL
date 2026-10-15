@@ -210,7 +210,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
             lower_order_final=model_config.unipc_lower_order_final,
         )
         require(
-            strategy is not None and getattr(strategy, "canonical_name", None) is not None,
+            strategy is not None and strategy.canonical_name is not None,
             "FastVideoRolloutEngine requires an injected SDE strategy with a canonical_name; "
             "set the rollout node's `strategy:` in the recipe (a separate injection from pipeline.strategy)",
         )
@@ -218,7 +218,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         self._timestep_scale = _model_timestep_scale(config.model_family)
         self._is_dual_expert = config.model_family in {"wan2.2", "wan22"}
         if self._is_dual_expert:
-            boundary_ratio = float(getattr(model_config, "boundary_ratio", 0.0))
+            boundary_ratio = float(model_config.boundary_ratio)
             require(
                 0.0 < boundary_ratio < 1.0,
                 f"WAN 2.2 model_config.boundary_ratio must be in (0, 1); got {boundary_ratio}",
@@ -226,7 +226,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
             # FastVideo routes on t >= boundary_ratio * num_train_timesteps; UniRL routes on
             # sigma >= boundary_ratio. The two agree only at this scale (README: dual expert).
             require(
-                float(getattr(model_config, "num_train_timesteps", 0)) == self._timestep_scale,
+                float(model_config.num_train_timesteps) == self._timestep_scale,
                 "WAN 2.2 FastVideo rollout requires model_config.num_train_timesteps to equal the "
                 f"step kernel's TIMESTEP_SCALE ({self._timestep_scale:g})",
             )
@@ -278,7 +278,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         from fastvideo import VideoGenerator
         from fastvideo.fastvideo_args import FastVideoArgs
 
-        ekw = dict(self.cfg.engine_kwargs or {})
+        ekw = dict(self.cfg.engine_kwargs)
         fv_kwargs: Dict[str, Any] = {
             "model_path": self.model_config.pretrained_model_ckpt_path,
             "num_gpus": int(self.cfg.num_gpus),
@@ -296,7 +296,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         self._fastvideo_args = FastVideoArgs.from_kwargs(**fv_kwargs)
         if self._is_dual_expert:
             self._align_dual_expert_args(self._fastvideo_args)
-        backend = str(getattr(self._fastvideo_args, "distributed_executor_backend", "mp"))
+        backend = str(self._fastvideo_args.distributed_executor_backend)
         require(
             backend == "mp",
             f"FastVideo canonical UniPC patches only reach 'mp' executor workers; got "
@@ -490,7 +490,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
             out = self._generator.executor.execute_forward(batch, self._fastvideo_args)
             rl = out.rl_data
             verify_fastvideo_used_sigmas(
-                getattr(rl, "trajectory_timesteps", None) if rl is not None else None,
+                rl.trajectory_timesteps if rl is not None else None,
                 expected=sigmas,
                 sample_index=sample_index,
             )
@@ -501,7 +501,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
             if traj.dim() == 5:
                 traj = traj.unsqueeze(0)
             all_traj.append(traj.detach().cpu())
-            dec = getattr(out, "output", None)
+            dec = out.output
             require(torch.is_tensor(dec), "FastVideo returned no decoded output (batch.output)")
             if dec.dim() == 4:
                 dec = dec.unsqueeze(0)
@@ -553,7 +553,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         """Resolve the low-noise expert's CFG scale, falling back to the shared one."""
         scale = params.guidance_scale_2
         if scale is None:
-            scale = getattr(self.model_config, "guidance_scale_2", None)
+            scale = self.model_config.guidance_scale_2
         return float(scale) if scale is not None else float(params.guidance_scale)
 
     def _build_response(
@@ -573,9 +573,12 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
 
     def _build_conditions(self, raw: Dict[str, Any]) -> Dict[str, Any]:
         """Assemble the WAN21 ``conditions`` dict the trainer replays against."""
-        text_embeds: List[torch.Tensor] = raw.get("text_embeds") or []
+        text_embeds: List[torch.Tensor] = raw["text_embeds"]
         require(len(text_embeds) > 0, "fastvideo engine produced no text embeddings")
-        text_masks: List[Optional[torch.Tensor]] = raw.get("text_masks") or [None] * len(text_embeds)
+        raw_text_masks = raw.get("text_masks")
+        text_masks: List[Optional[torch.Tensor]] = (
+            raw_text_masks if raw_text_masks is not None else [None] * len(text_embeds)
+        )
 
         text = TextEmbedCondition.concat(
             [
@@ -585,9 +588,13 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         )
         conditions: Dict[str, Any] = {"text": text}
 
-        neg_embeds: List[torch.Tensor] = raw.get("neg_embeds") or []
+        raw_neg_embeds = raw.get("neg_embeds")
+        neg_embeds: List[torch.Tensor] = raw_neg_embeds if raw_neg_embeds is not None else []
         if len(neg_embeds) == len(text_embeds) and len(neg_embeds) > 0:
-            neg_masks: List[Optional[torch.Tensor]] = raw.get("neg_masks") or [None] * len(neg_embeds)
+            raw_neg_masks = raw.get("neg_masks")
+            neg_masks: List[Optional[torch.Tensor]] = (
+                raw_neg_masks if raw_neg_masks is not None else [None] * len(neg_embeds)
+            )
             conditions["negative_text"] = TextEmbedCondition.concat(
                 [
                     TextEmbedCondition(embeds=neg_embeds[i], pooled=None, attn_mask=neg_masks[i])

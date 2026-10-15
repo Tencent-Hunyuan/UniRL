@@ -123,7 +123,7 @@ def patch_denoising() -> None:
         # The stock loop gates its SDE branch on this flag; force it so replay mode also
         # walks the UniRL kernel, then drop the log-probs the caller did not ask for.
         rl_data.collect_log_probs = True
-        token = _CONTEXT.set(_TransitionContext(eta=float(batch.eta), sde_type=getattr(rl_data, "sde_type", "dance")))
+        token = _CONTEXT.set(_TransitionContext(eta=float(batch.eta), sde_type=rl_data.sde_type))
         try:
             result = original_forward(self, batch, fastvideo_args)
             if not collect and result.rl_data is not None:

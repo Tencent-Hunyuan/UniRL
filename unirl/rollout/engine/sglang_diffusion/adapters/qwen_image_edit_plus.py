@@ -59,8 +59,8 @@ class QwenImageEditPlusAdapter(QwenImageAdapter):
 
         tensors: List[torch.Tensor] = []
         for r in results:
-            packed_list = getattr(r, "image_latent", None)
-            sizes_list = getattr(r, "image_latent_sizes", None)
+            packed_list = r.image_latent
+            sizes_list = r.image_latent_sizes
             if not packed_list or not sizes_list:
                 raise RuntimeError(
                     "build_condition: Qwen-Image-Edit-Plus rollout returned no "

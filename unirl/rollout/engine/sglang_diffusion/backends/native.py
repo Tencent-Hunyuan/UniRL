@@ -74,24 +74,30 @@ class _RawResultView:
 
     @property
     def trajectory_latents(self) -> Any:
-        rtd = getattr(self._result, "rollout_trajectory_data", None)
-        return getattr(getattr(rtd, "dit_trajectory", None), "latents", None)
+        rtd = self._result.rollout_trajectory_data
+        if rtd is None or rtd.dit_trajectory is None:
+            return None
+        return rtd.dit_trajectory.latents
 
     @property
     def trajectory_timesteps(self) -> Any:
-        rtd = getattr(self._result, "rollout_trajectory_data", None)
-        return getattr(getattr(rtd, "dit_trajectory", None), "timesteps", None)
+        rtd = self._result.rollout_trajectory_data
+        if rtd is None or rtd.dit_trajectory is None:
+            return None
+        return rtd.dit_trajectory.timesteps
 
     @property
     def aux_trajectory_latents(self) -> Any:
         """LTX-2's co-denoised AUDIO trajectory ``[B, T+1, ...]``; ``None`` for models without one."""
-        rtd = getattr(self._result, "rollout_trajectory_data", None)
-        return getattr(getattr(rtd, "dit_trajectory", None), "audio_latents", None)
+        rtd = self._result.rollout_trajectory_data
+        if rtd is None or rtd.dit_trajectory is None:
+            return None
+        return getattr(rtd.dit_trajectory, "audio_latents", None)
 
     @property
     def trajectory_log_probs(self) -> Any:
-        rtd = getattr(self._result, "rollout_trajectory_data", None)
-        return getattr(rtd, "rollout_log_probs", None)
+        rtd = self._result.rollout_trajectory_data
+        return rtd.rollout_log_probs if rtd is not None else None
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._result, name)
@@ -275,7 +281,7 @@ class SGLangBackend:
         response = self._rt["sync_scheduler_client"].forward(
             self._rt["GetWeightsChecksumReqInput"](module_names=list(module_names))
         )
-        output = getattr(response, "output", None)
+        output = response.output
         if not (isinstance(output, dict) and output):
             raise RuntimeError(f"SGLang checksum query returned invalid payload: {output!r}")
         return output
@@ -289,7 +295,7 @@ class SGLangBackend:
 
     @staticmethod
     def _extract_update_status(response: Any, *, op: str) -> tuple:
-        output = getattr(response, "output", None)
+        output = response.output
         if not isinstance(output, dict):
             raise RuntimeError(f"Invalid SGLang response for {op}: {response}")
         return bool(output.get("success", False)), str(output.get("message", "Unknown status"))

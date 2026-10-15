@@ -77,7 +77,7 @@ def resolve_sampling(config: Any, sample: Sample) -> ResolvedSampling:
     n_parent = len(parent_part.sample_ids)
     fanout = (len(gen_part.sample_ids) // n_parent) if n_parent else 1
 
-    engine_kwargs = getattr(config, "engine_kwargs", None) or {}
+    engine_kwargs = config.engine_kwargs
     deterministic = deterministic_inference_enabled(engine_kwargs)
     configured_seed = _validated_base_seed(ar.seed) if ar.seed is not None else None
     if configured_seed is not None and not deterministic:
@@ -106,7 +106,11 @@ def resolve_sampling(config: Any, sample: Sample) -> ResolvedSampling:
         n=n,
         fanout=fanout,
         return_logprob=bool(control_ar.get("return_logprob", True)),
-        system_instruction=control_ar.get("system_instruction") or config.system_instruction,
+        system_instruction=(
+            control_ar["system_instruction"]
+            if control_ar.get("system_instruction") is not None
+            else config.system_instruction
+        ),
         block=block,
         base_seed=base_seed,
     )

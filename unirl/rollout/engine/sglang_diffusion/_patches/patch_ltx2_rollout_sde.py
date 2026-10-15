@@ -94,9 +94,9 @@ def _patch_sigma_alignment() -> None:
         return
 
     def forward(self, batch, server_args):
-        pinned = getattr(batch, "sigmas", None)
+        pinned = batch.sigmas
         result = orig(self, batch, server_args)
-        if getattr(batch, "rollout", False) and pinned:
+        if batch.rollout and pinned:
             result.sigmas = pinned
         return result
 
@@ -120,13 +120,13 @@ def _patch_av_decode_carry() -> None:
 
     def forward(self, batch, server_args):
         out = orig(self, batch, server_args)
-        rtd = getattr(out, "rollout_trajectory_data", None)
+        rtd = out.rollout_trajectory_data
         if rtd is None:
-            rtd = getattr(batch, "rollout_trajectory_data", None)
+            rtd = batch.rollout_trajectory_data
             if rtd is not None:
                 out.rollout_trajectory_data = rtd
-        audio_traj = getattr(batch, "trajectory_audio_latents", None)
-        dit_traj = getattr(rtd, "dit_trajectory", None)
+        audio_traj = batch.trajectory_audio_latents
+        dit_traj = rtd.dit_trajectory if rtd is not None else None
         if dit_traj is not None and audio_traj is not None and getattr(dit_traj, "audio_latents", None) is None:
             dit_traj.audio_latents = audio_traj.detach().cpu()
         _copy_conditions(batch, out)
@@ -148,11 +148,7 @@ def _patch_audio_trajectory_alignment() -> None:
 
     def _before_denoising_loop(self, ctx, batch, server_args):
         result = orig(self, ctx, batch, server_args)
-        if (
-            getattr(batch, "return_trajectory_latents", False)
-            and getattr(ctx, "audio_latents", None) is not None
-            and not getattr(ctx, "trajectory_audio_latents", None)
-        ):
+        if batch.return_trajectory_latents and ctx.audio_latents is not None and not ctx.trajectory_audio_latents:
             ctx.trajectory_audio_latents.append(ctx.audio_latents)
         return result
 
@@ -176,8 +172,8 @@ def _patch_sde_logprob_bridge() -> None:
 
         def _run_denoising_step(self, ctx, step, batch, server_args):
             original_generator = batch.generator
-            denoise_seeds = getattr(batch, "denoise_seeds", None)
-            if getattr(batch, "rollout", False) and denoise_seeds is not None:
+            denoise_seeds = batch.denoise_seeds
+            if batch.rollout and denoise_seeds is not None:
                 base_seed = _resolve_base_seed(batch)
                 if base_seed is not None:
                     batch.generator = _make_step_generators(

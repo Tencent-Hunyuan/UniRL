@@ -174,7 +174,7 @@ class Ltx2T2VAdapter(VideoAdapter):
     def _fuse_audio_condition(results: List[RawResult], field: str) -> Optional[TextEmbedCondition]:
         tensors = []
         for result in results:
-            value = utils.fuse_encoder_outputs(getattr(result, field, None))
+            value = utils.fuse_encoder_outputs(getattr(result, field))
             if value is not None:
                 tensors.append(value.detach().cpu())
         if not tensors:

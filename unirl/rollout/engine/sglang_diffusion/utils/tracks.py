@@ -33,7 +33,7 @@ def collect_trajectory_latents(results: Sequence[RawResult]) -> torch.Tensor:
 
 def collect_aux_trajectory_latents(results: Sequence[RawResult]) -> Optional[torch.Tensor]:
     """Concat per-result AUXILIARY trajectory latents (LTX-2 audio) on the batch dim."""
-    auxes = [getattr(r, "aux_trajectory_latents", None) for r in results]
+    auxes = [r.aux_trajectory_latents for r in results]
     present = [a is not None for a in auxes]
     if not any(present):
         return None

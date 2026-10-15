@@ -58,7 +58,7 @@ class SGLangDiffusionEngineConfig(BaseEngineConfig):
         if self.engine_kwargs is None:
             self.engine_kwargs = {}
 
-        self.model_family = str(self.model_family or "").strip().lower()
+        self.model_family = str(self.model_family).strip().lower()
         from unirl.rollout.engine.sglang_diffusion.adapters import registered_adapters
 
         valid_families = registered_adapters()
@@ -105,7 +105,7 @@ class SGLangDiffusionEngineConfig(BaseEngineConfig):
         """Spell this config (+ model config + reserved ports) as ServerArgs intent."""
         intent: Dict[str, Any] = {}
 
-        intent.update(self.engine_kwargs or {})
+        intent.update(self.engine_kwargs)
 
         if model_config.pretrained_model_ckpt_path:
             intent["model_path"] = model_config.pretrained_model_ckpt_path

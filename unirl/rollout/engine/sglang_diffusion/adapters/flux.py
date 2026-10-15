@@ -88,7 +88,7 @@ class Flux2KleinAdapter(ImageAdapter):
         """Concat a per-result single-tensor conditions field over dim 0."""
         tensors: List[torch.Tensor] = []
         for r in results:
-            value = getattr(r, name, None)
+            value = getattr(r, name)
             if not value:
                 continue
             tensors.append(value[0])

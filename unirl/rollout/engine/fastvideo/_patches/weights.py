@@ -20,10 +20,7 @@ def _strip_training_prefix(name: str) -> str:
 
 def _offloaded_blocks(module: Any) -> List[Tuple[str, Any, Any]]:
     """Return ``(prefix, child, hook)`` for every layerwise-offloaded block, outermost first."""
-    try:
-        from fastvideo.hooks.hooks import ModuleHookManager
-    except ImportError:
-        return []
+    from fastvideo.hooks.hooks import ModuleHookManager
 
     blocks: List[Tuple[str, Any, Any]] = []
     for module_name, child in module.named_modules():

@@ -52,7 +52,7 @@ class ImageAdapter(ModelAdapter):
             f"num_inference_steps+1 ({int(diffusion.num_inference_steps) + 1}).",
         )
 
-        sampler_kwargs: Dict[str, Any] = dict(diffusion.sampler_kwargs or {})
+        sampler_kwargs: Dict[str, Any] = dict(diffusion.sampler_kwargs)
 
         neg_prompt = sampler_kwargs.get("negative_prompt")
         return_neg_embeds = bool(sampler_kwargs.get("return_negative_prompt_embeds", False))

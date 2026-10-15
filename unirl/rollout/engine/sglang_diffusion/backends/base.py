@@ -30,6 +30,7 @@ class RawResult(Protocol):
     trajectory_latents: Optional["torch.Tensor"]
     trajectory_timesteps: Optional["torch.Tensor"]
     trajectory_log_probs: Optional["torch.Tensor"]
+    aux_trajectory_latents: Optional["torch.Tensor"]
     samples: MediaPayload
     prompt_embeds: EncoderOutputs
     audio_prompt_embeds: EncoderOutputs

@@ -88,13 +88,13 @@ class ModelAdapter(ABC):
         )
 
     def lora_spec(self) -> Tuple[str, List[str]]:
-        prefix = str(self.model_config.weight_sync_param_name_prefix or "")
-        return prefix, ["transformer"]
+        prefix = self.model_config.weight_sync_param_name_prefix
+        return (str(prefix) if prefix is not None else ""), ["transformer"]
 
     def validate(self) -> None:
         mc = self.model_config
         require(
-            mc is not None and bool(getattr(mc, "pretrained_model_ckpt_path", None)),
+            mc is not None and bool(mc.pretrained_model_ckpt_path),
             f"{type(self).__name__} requires model_config.pretrained_model_ckpt_path",
         )
         require(

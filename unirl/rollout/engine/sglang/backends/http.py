@@ -65,7 +65,7 @@ def kill_process_tree(pid: int) -> None:
 
 def _terminate_server_process(process: multiprocessing.Process, *, timeout_s: float = 10.0) -> None:
     """Best-effort bounded teardown for a started SRT server process tree."""
-    pid = getattr(process, "pid", None)
+    pid = process.pid
     if pid is None:
         return
 
@@ -322,9 +322,9 @@ class HTTPBackend:
         logger.info(
             "SGLang SRT server healthy at %s (settled ServerArgs: port=%s nccl_port=%s host=%s)",
             base_url,
-            getattr(server_args, "port", None),
-            getattr(server_args, "nccl_port", None),
-            getattr(server_args, "host", None),
+            server_args.port,
+            server_args.nccl_port,
+            server_args.host,
         )
         return cls(process, base_url, concurrency=concurrency, tp_size=tp_size, runtime=rt)
 

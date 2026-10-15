@@ -91,8 +91,8 @@ def _wrap_validate_with_pipeline_config(SamplingParams) -> None:
         return
 
     def _validate_with_pipeline_config(self, pipeline_config, __orig=orig):
-        condition_image = getattr(self, "condition_image", None)
-        if condition_image is None or getattr(self, "image_path", None) is not None:
+        condition_image = self.condition_image
+        if condition_image is None or self.image_path is not None:
             return __orig(self, pipeline_config)
         self.image_path = _CONDITION_IMAGE_PATH_SENTINEL
         try:
@@ -158,9 +158,9 @@ def _wrap_input_validation_condition_image() -> None:
     def forward(self, batch, server_args, __orig=orig_forward):
         batch = __orig(self, batch, server_args)
 
-        condition_image = getattr(batch, "condition_image", None)
-        image_path = getattr(batch, "image_path", None)
-        vae_image_sizes = getattr(batch, "vae_image_sizes", None)
+        condition_image = batch.condition_image
+        image_path = batch.image_path
+        vae_image_sizes = batch.vae_image_sizes
         if condition_image is None or image_path is not None or vae_image_sizes is not None:
             return batch
 
@@ -281,27 +281,27 @@ def _wrap_prepare_request(utils_mod) -> None:
 
         req = orig(server_args, sampling_params, *args, **kwargs)
 
-        sigmas = getattr(sampling_params, "sigmas", None)
+        sigmas = sampling_params.sigmas
         if sigmas is not None:
             req.sigmas = sigmas
 
-        timesteps = getattr(sampling_params, "timesteps", None)
+        timesteps = sampling_params.timesteps
         if timesteps is not None:
             req.timesteps = torch.as_tensor(timesteps, dtype=torch.float32)
 
-        initial_noise = getattr(sampling_params, "initial_noise", None)
+        initial_noise = sampling_params.initial_noise
         if initial_noise is not None:
             req.latents = initial_noise
 
-        initial_audio_noise = getattr(sampling_params, "initial_audio_noise", None)
+        initial_audio_noise = sampling_params.initial_audio_noise
         if initial_audio_noise is not None:
             req.audio_latents = initial_audio_noise
 
-        denoise_seeds = getattr(sampling_params, "denoise_seeds", None)
+        denoise_seeds = sampling_params.denoise_seeds
         if denoise_seeds is not None:
             req.denoise_seeds = denoise_seeds
 
-        condition_image = getattr(sampling_params, "condition_image", None)
+        condition_image = sampling_params.condition_image
         if condition_image is not None:
             stash = getattr(_local, "condition_image_per_prompt", None)
             if isinstance(stash, list) and len(stash) > 1:
@@ -387,21 +387,21 @@ def _wrap_expand_request_outputs(utils_mod) -> None:
             raise IndexError(f"prompt_index={prompt_index} is outside num_prompts={num_prompts}")
 
         req.latents = _partition_prompt_tensor(
-            getattr(req, "latents", None),
+            req.latents,
             prompt_index=prompt_index,
             num_prompts=num_prompts,
             num_outputs=num_outputs,
             field="initial_noise",
         )
         req.audio_latents = _partition_prompt_tensor(
-            getattr(req, "audio_latents", None),
+            req.audio_latents,
             prompt_index=prompt_index,
             num_prompts=num_prompts,
             num_outputs=num_outputs,
             field="initial_audio_noise",
         )
         req.denoise_seeds = _partition_prompt_seeds(
-            getattr(req, "denoise_seeds", None),
+            req.denoise_seeds,
             prompt_index=prompt_index,
             num_prompts=num_prompts,
             num_outputs=num_outputs,
@@ -414,18 +414,18 @@ def _wrap_expand_request_outputs(utils_mod) -> None:
         )
         for output_index, output_req in enumerate(expanded):
             output_req.latents = _slice_output_tensor(
-                getattr(output_req, "latents", None),
+                output_req.latents,
                 output_index=output_index,
                 num_outputs=num_outputs,
                 field="initial_noise",
             )
             output_req.audio_latents = _slice_output_tensor(
-                getattr(output_req, "audio_latents", None),
+                output_req.audio_latents,
                 output_index=output_index,
                 num_outputs=num_outputs,
                 field="initial_audio_noise",
             )
-            seeds = getattr(output_req, "denoise_seeds", None)
+            seeds = output_req.denoise_seeds
             if seeds is not None:
                 if len(seeds) != num_outputs:
                     raise ValueError(
