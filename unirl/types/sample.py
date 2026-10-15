@@ -356,7 +356,7 @@ class Part(Batch):
         segment_fields = {f.name: getattr(segment, f.name) for f in dc_fields(segment)}
         segment_fields["token_advantages"] = token_advantages
         segment_fields["returns"] = token_returns
-        updated_segment = segment._rebuild(segment_fields)
+        updated_segment = segment.rebuild(segment_fields)
 
         loss_mask = None
         if segment.loss_mask is not None:
