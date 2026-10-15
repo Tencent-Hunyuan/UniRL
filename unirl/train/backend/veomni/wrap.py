@@ -109,10 +109,7 @@ def _attach_extra_parallel_param_groups(model: nn.Module) -> None:
     if not getattr(ps, "any_extra_parallel_enabled", False):
         return
 
-    try:
-        from torch.distributed.tensor import DTensor
-    except Exception:  # pragma: no cover - older torch
-        from torch.distributed._tensor import DTensor
+    from torch.distributed.tensor import DTensor
 
     para_names = list(ps.extra_parallel_names)
     groups: dict = {para: [] for para in para_names}
@@ -120,8 +117,8 @@ def _attach_extra_parallel_param_groups(model: nn.Module) -> None:
     for _name, p in model.named_parameters():
         matched = False
         if isinstance(p, DTensor):
-            mesh = getattr(p, "device_mesh", None)
-            dim_names = getattr(mesh, "mesh_dim_names", ()) if mesh is not None else ()
+            mesh = p.device_mesh
+            dim_names = () if mesh.mesh_dim_names is None else mesh.mesh_dim_names
             for para in para_names:
                 if f"{para}_fsdp" in dim_names:
                     groups[para].append(p)

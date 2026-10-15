@@ -37,8 +37,6 @@ def load_training_checkpoint(path: str) -> Dict[str, object]:
 def _torch_load(file_path: str, *, allow_unsafe_fallback: bool = True) -> Dict[str, object]:
     try:
         return torch.load(file_path, map_location="cpu", weights_only=True)
-    except TypeError:
-        return torch.load(file_path, map_location="cpu")
     except pickle.UnpicklingError:
         if not allow_unsafe_fallback:
             raise

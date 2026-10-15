@@ -35,7 +35,7 @@ def prepare_segment_anchors(
         micro = arranged_slice(part, order, start, end)
         algorithm.prepare_segment(conditions=micro.conditions, segment=micro.segment)
         for field in collected:
-            value = getattr(micro.segment, field, None)
+            value = getattr(micro.segment, field)
             if value is None:
                 raise RuntimeError(
                     f"{type(algorithm).__name__} declares anchor field {field!r} but a micro produced None."

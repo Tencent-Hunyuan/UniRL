@@ -98,7 +98,7 @@ def _sp_b1_dense_forward(orig, args, kwargs, true_len, mask2d, ps, spg):
     real_idx = mask2d[0].nonzero(as_tuple=False).flatten()
     real_start, real_end = int(real_idx[0].item()), int(real_idx[-1].item()) + 1
     real_len = real_end - real_start
-    sp = max(1, int(getattr(ps, "ulysses_size", 1)))
+    sp = max(1, int(ps.ulysses_size))
     padded_len = ((real_len + sp - 1) // sp) * sp
     pad = padded_len - real_len
     ref = input_ids if input_ids is not None else inputs_embeds
@@ -130,12 +130,9 @@ def _set_attn_impl(cfg: Any, sp_attn_impl: str) -> None:
         cfg._attn_implementation = sp_attn_impl
     get_text = getattr(cfg, "get_text_config", None)
     if callable(get_text):
-        try:
-            tcfg = get_text()
-            if tcfg is not None and tcfg is not cfg and hasattr(tcfg, "_attn_implementation"):
-                tcfg._attn_implementation = sp_attn_impl
-        except Exception:  # noqa: BLE001 — best-effort; absence is fine
-            pass
+        tcfg = get_text()
+        if tcfg is not None and tcfg is not cfg and hasattr(tcfg, "_attn_implementation"):
+            tcfg._attn_implementation = sp_attn_impl
 
 
 def _sp_plain_forward(orig, args, kwargs, true_len, position_ids, spg):

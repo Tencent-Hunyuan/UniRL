@@ -67,10 +67,7 @@ def inject_model_dtype_kwarg(
     """Populate the correct dtype kwarg for a model bundle constructor if supported."""
     if dtype is None:
         return
-    try:
-        params = inspect.signature(model_cls.__init__).parameters
-    except Exception:
-        params = {}
+    params = inspect.signature(model_cls.__init__).parameters
 
     if "torch_dtype" in params:
         model_kwargs["torch_dtype"] = dtype

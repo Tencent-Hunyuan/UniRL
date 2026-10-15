@@ -219,13 +219,13 @@ class BaseFSDP2Backend(Remote):
 
         self._optimizer_step_count: int = 0
         self._eval_ema_active: bool = False
-        checkpoint_format = str(getattr(fsdp_cfg, "checkpoint_format", "torch"))
+        checkpoint_format = str(fsdp_cfg.checkpoint_format)
         if checkpoint_format not in ("torch", "dcp"):
             raise ValueError(
                 f"{type(self).__name__}: fsdp_cfg.checkpoint_format must be 'torch' or 'dcp', got {checkpoint_format!r}"
             )
         self._checkpoint_format: str = checkpoint_format
-        self._checkpoint_async: bool = bool(getattr(fsdp_cfg, "checkpoint_async", False))
+        self._checkpoint_async: bool = bool(fsdp_cfg.checkpoint_async)
         active_lora = lora_cfg or ema_lora_cfg
         recorded_target_modules = None
         if active_lora is not None:
@@ -277,7 +277,7 @@ class BaseFSDP2Backend(Remote):
     def optimizer_step(self, *, max_grad_norm: float) -> float:
         """Clip (via the engine hook), optimizer step, scheduler step, EMA step."""
         clipped = self._clip_grad_norm(float(max_grad_norm))
-        grad_norm = float(clipped.item()) if isinstance(clipped, torch.Tensor) else float(clipped or 0.0)
+        grad_norm = float(clipped.item()) if isinstance(clipped, torch.Tensor) else float(clipped)
 
         if not math.isfinite(grad_norm):
             bad_params = []
@@ -493,7 +493,8 @@ class BaseFSDP2Backend(Remote):
             self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         if checkpoint.get("optimizer_step_count") is not None:
             self._optimizer_step_count = int(checkpoint["optimizer_step_count"])
-        return int(checkpoint.get("step") or 0)
+        step = checkpoint.get("step")
+        return 0 if step is None else int(step)
 
     def _resolve_save_mode(self, mode: str) -> str:
         if mode == "auto":
@@ -529,7 +530,8 @@ class BaseFSDP2Backend(Remote):
             self.scheduler.load_state_dict(meta["scheduler_state_dict"])
         if meta.get("optimizer_step_count") is not None:
             self._optimizer_step_count = int(meta["optimizer_step_count"])
-        return int(meta.get("step") or 0)
+        step = meta.get("step")
+        return 0 if step is None else int(step)
 
     def _reject_meta(
         self,

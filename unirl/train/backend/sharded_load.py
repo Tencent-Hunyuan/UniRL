@@ -103,9 +103,9 @@ def _ep_shard_dims_from_plan(module: nn.Module) -> Dict[str, int]:
         return {}
 
     resolved: Dict[str, int] = {}
-    spec_by_fqn = getattr(module, "_fqn2spec_info", None) or {}
+    spec_by_fqn = getattr(module, "_fqn2spec_info", None)
     for name, param in named_ep.items():
-        spec = spec_by_fqn.get(name)
+        spec = spec_by_fqn.get(name) if spec_by_fqn is not None else None
         if spec is None or getattr(spec, "para_name", None) != "ep":
             continue
         dim = getattr(getattr(spec, "placement", None), "dim", None)
@@ -319,10 +319,7 @@ def _load_state_dict_sharded(
         cpu_offload=False,
         strict=strict,
     )
-    try:
-        set_model_state_dict(module, state_dict, options=options)
-    except TypeError:
-        set_model_state_dict(module, state_dict)
+    set_model_state_dict(module, state_dict, options=options)
 
 
 def _module_has_meta_param(module: nn.Module) -> bool:
@@ -352,7 +349,8 @@ def _qwen_moe_source_base_candidates(target: str, model: nn.Module) -> list[str]
     """Return checkpoint prefix candidates for one packed model parameter."""
     base = target.removesuffix(".gate_up_proj").removesuffix(".down_proj")
     candidates = [base]
-    prefix = str(getattr(model, "base_model_prefix", "") or "")
+    raw_prefix = getattr(model, "base_model_prefix", None)
+    prefix = "" if raw_prefix is None else str(raw_prefix)
     if prefix:
         dotted = f"{prefix}."
         candidates.append(base.removeprefix(dotted) if base.startswith(dotted) else f"{prefix}.{base}")
@@ -503,7 +501,7 @@ def _remap_hf_checkpoint_keys(state_dict: StateDict, model: nn.Module) -> StateD
         from transformers import PreTrainedModel
         from transformers.conversion_mapping import get_model_conversion_mapping
         from transformers.core_model_loading import WeightRenaming
-    except Exception as exc:
+    except ImportError as exc:
         logger.warning("sharded_load: HF key-renaming unavailable (%s); skipping", exc)
         return state_dict
 

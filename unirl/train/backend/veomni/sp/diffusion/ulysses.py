@@ -250,6 +250,10 @@ def inject_sp_processors(model: nn.Module, sp_group: Any) -> int:
                 )
             module.set_processor(SPAttentionProcessor(sp_group, original_processor=module.get_processor()))
             count += 1
+    if count == 0:
+        raise RuntimeError(
+            f"inject_sp_processors: found 0 attention modules with set_processor/get_processor on {type(model).__name__}"
+        )
     logger.info("diffusion SP: injected SPAttentionProcessor into %d attention modules", count)
     return count
 

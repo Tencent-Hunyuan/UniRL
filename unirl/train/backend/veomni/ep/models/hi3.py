@@ -49,7 +49,7 @@ def fuse_expert_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, tor
 
 def get_hi3_parallel_plan():
     """Return the VeOmni ``ParallelPlan`` for HI3 expert parallelism (Shard(0))."""
-    from torch.distributed._tensor import Shard
+    from torch.distributed.tensor import Shard
     from veomni.distributed.parallel_plan import ParallelPlan
 
     ep_plan = {fqn: Shard(dim) for fqn, dim in _EP_PLAN.items()}
@@ -119,8 +119,8 @@ def is_fused_expert_key(key: str) -> bool:
 def replace_hunyuan_moe_with_fused(decoder: nn.Module) -> int:
     """In-place: swap every ``HunyuanMoE`` mlp for a :class:`FusedHunyuanMoE` and attach ``get_parallel_plan``."""
     n = 0
-    for layer in getattr(decoder, "layers", []):
-        mlp = getattr(layer, "mlp", None)
+    for layer in decoder.layers:
+        mlp = layer.mlp
         if type(mlp).__name__ != "HunyuanMoE":
             continue
         w = mlp.experts[0].gate_and_up_proj.weight
@@ -135,6 +135,8 @@ def replace_hunyuan_moe_with_fused(decoder: nn.Module) -> int:
             device=w.device,
         )
         n += 1
+    if n == 0:
+        raise RuntimeError(f"replace_hunyuan_moe_with_fused: found 0 HunyuanMoE layers on {type(decoder).__name__}")
     decoder.get_parallel_plan = get_hi3_parallel_plan  # type: ignore[attr-defined]
     return n
 

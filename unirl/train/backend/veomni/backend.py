@@ -84,11 +84,11 @@ class VeOmniBackend(BaseFSDP2Backend):
         from veomni.distributed.parallel_state import init_parallel_state
 
         # Fold Ulysses into the FSDP shard mesh so gradients reduce-scatter across SP ranks.
-        self._sp_size = int(getattr(fsdp_cfg, "sp_size", 1) or 1)
-        if world % self._sp_size != 0:
+        self._sp_size = int(fsdp_cfg.sp_size)
+        if self._sp_size < 1 or world % self._sp_size != 0:
             raise ValueError(f"VeOmniBackend: world_size {world} not divisible by sp_size {self._sp_size}")
         # ep_size > 1 requires get_parallel_plan() for fused expert tensors.
-        self._ep_size = _validate_ep_size(getattr(fsdp_cfg, "ep_size", 1), world_size=world)
+        self._ep_size = _validate_ep_size(fsdp_cfg.ep_size, world_size=world)
         extra_parallel_kwargs = (
             {"extra_parallel_sizes": (self._ep_size,), "extra_parallel_names": ("ep",)} if self._ep_size > 1 else {}
         )
@@ -119,7 +119,7 @@ class VeOmniBackend(BaseFSDP2Backend):
             model,
             block_class_names=tuple(block_class_names),
             param_dtype=fsdp_cfg.param_dtype,
-            master_dtype=getattr(fsdp_cfg, "master_dtype", None),
+            master_dtype=fsdp_cfg.master_dtype,
             reshard_after_forward=fsdp_cfg.reshard_after_forward,
             activation_checkpointing=fsdp_cfg.activation_checkpointing,
             use_torch_compile=fsdp_cfg.use_torch_compile,

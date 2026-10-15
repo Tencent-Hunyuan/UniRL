@@ -22,10 +22,7 @@ def gather_state_dict(model: nn.Module) -> StateDict:
     from torch.distributed.checkpoint.state_dict import get_model_state_dict
 
     options = _build_state_dict_options(full_state_dict=True, cpu_offload=True)
-    try:
-        full = dict(get_model_state_dict(model, options=options))
-    except TypeError:
-        full = dict(get_model_state_dict(model))
+    full = dict(get_model_state_dict(model, options=options))
 
     if _current_rank() != 0:
         return {}
@@ -48,10 +45,7 @@ def load_model_state_dict(
         cpu_offload=False,
         strict=strict,
     )
-    try:
-        return set_model_state_dict(model, state_dict, options=options)
-    except TypeError:
-        return set_model_state_dict(model, state_dict)
+    return set_model_state_dict(model, state_dict, options=options)
 
 
 def gather_optimizer_state_dict(model: nn.Module, optimizer: torch.optim.Optimizer) -> StateDict:
@@ -102,10 +96,7 @@ def load_optimizer_state_dict(
         for group in state_dict["param_groups"]:
             for name in group["params"]:
                 state_dict["state"].setdefault(name, {"step": torch.tensor(0.0)})
-    try:
-        set_optimizer_state_dict(model, optimizer, optim_state_dict=state_dict, options=options)
-    except TypeError:
-        set_optimizer_state_dict(model, optimizer, optim_state_dict=state_dict)
+    set_optimizer_state_dict(model, optimizer, optim_state_dict=state_dict, options=options)
     _drop_fresh_adamw_state(optimizer)
 
 
@@ -114,10 +105,7 @@ def sharded_model_state_dict(model: nn.Module) -> StateDict:
     from torch.distributed.checkpoint.state_dict import get_model_state_dict
 
     options = _build_state_dict_options(full_state_dict=False)
-    try:
-        return dict(get_model_state_dict(model, options=options))
-    except TypeError:
-        return dict(get_model_state_dict(model))
+    return dict(get_model_state_dict(model, options=options))
 
 
 def sharded_optimizer_state_dict(model: nn.Module, optimizer: torch.optim.Optimizer) -> StateDict:
@@ -134,10 +122,7 @@ def load_sharded_model_state_dict(model: nn.Module, state_dict: StateDict, *, st
     from torch.distributed.checkpoint.state_dict import set_model_state_dict
 
     options = _build_state_dict_options(full_state_dict=False, strict=strict)
-    try:
-        set_model_state_dict(model, state_dict, options=options)
-    except TypeError:
-        set_model_state_dict(model, state_dict)
+    set_model_state_dict(model, state_dict, options=options)
 
 
 def load_sharded_optimizer_state_dict(
@@ -147,10 +132,7 @@ def load_sharded_optimizer_state_dict(
     from torch.distributed.checkpoint.state_dict import set_optimizer_state_dict
 
     options = _build_state_dict_options(full_state_dict=False)
-    try:
-        set_optimizer_state_dict(model, optimizer, optim_state_dict=state_dict, options=options)
-    except TypeError:
-        set_optimizer_state_dict(model, optimizer, optim_state_dict=state_dict)
+    set_optimizer_state_dict(model, optimizer, optim_state_dict=state_dict, options=options)
     _drop_fresh_adamw_state(optimizer)
 
 
@@ -225,42 +207,22 @@ def _current_rank() -> int:
 
 
 def _build_state_dict_options(**kwargs: object) -> object:
-    """Construct ``StateDictOptions`` degrading gracefully on older torch."""
+    """Construct ``StateDictOptions``."""
     from torch.distributed.checkpoint.state_dict import StateDictOptions
 
-    candidates = [
-        dict(kwargs),
-        {k: v for k, v in kwargs.items() if k != "strict"},
-        {k: v for k, v in kwargs.items() if k not in {"strict", "broadcast_from_rank0"}},
-        {k: v for k, v in kwargs.items() if k in {"full_state_dict", "cpu_offload"}},
-        {},
-    ]
-    for candidate in candidates:
-        try:
-            return StateDictOptions(**candidate)
-        except TypeError:
-            continue
-    return StateDictOptions()
+    return StateDictOptions(**kwargs)
 
 
 def _maybe_dtensor_to_tensor(value: object) -> object:
-    if hasattr(value, "full_tensor") and callable(getattr(value, "full_tensor")):
-        try:
-            return value.full_tensor()
-        except Exception:
-            return value
+    full_tensor = getattr(value, "full_tensor", None)
+    if callable(full_tensor):
+        return full_tensor()
     return value
 
 
 def _materialize_checkpoint_tensor(value: object) -> object:
-    if hasattr(value, "full_tensor") and callable(getattr(value, "full_tensor")):
-        device = getattr(value, "device", None)
-        if (
-            getattr(device, "type", None) == "cpu"
-            and torch.cuda.is_available()
-            and hasattr(value, "cuda")
-            and callable(getattr(value, "cuda"))
-        ):
+    if callable(getattr(value, "full_tensor", None)):
+        if isinstance(value, torch.Tensor) and value.device.type == "cpu" and torch.cuda.is_available():
             value = value.cuda()
     return _maybe_dtensor_to_tensor(value)
 

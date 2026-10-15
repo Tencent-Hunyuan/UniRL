@@ -92,40 +92,36 @@ def compute_rollout_sample_metrics(*, sample: Any, trunc_len: Optional[int] = No
     from unirl.types.sampling import ARSamplingParams
 
     metrics: Dict[str, float] = {}
-
-    parts = getattr(sample, "parts", None)
-    if not isinstance(parts, list):
-        metrics["num_samples"] = float(int(getattr(sample, "batch_size", 0)))
+    if sample is None:
+        metrics["num_samples"] = 0.0
         return metrics
 
-    gen_parts = [p for p in parts if getattr(p, "is_gen", False)]
-    metrics["num_samples"] = (
-        float(int(gen_parts[-1].batch_size)) if gen_parts else float(int(getattr(sample, "batch_size", 0)))
-    )
+    gen_parts = sample.gen_parts()
+    metrics["num_samples"] = float(int(gen_parts[-1].batch_size)) if gen_parts else float(int(sample.batch_size))
     multi = len(gen_parts) > 1
     for part in gen_parts:
         name = "ar" if isinstance(part.sampling_params, ARSamplingParams) else "diffusion"
         prefix = f"{name}_" if multi else ""
-        rewards = getattr(part, "rewards", None)
+        rewards = part.rewards
         if torch.is_tensor(rewards) and rewards.numel() > 0:
             rewards_f = rewards.detach().to(dtype=torch.float32).reshape(-1).cpu()
             metrics.update(_tensor_stats(f"{prefix}reward", rewards_f))
             zero_cnt, group_cnt = _zero_std_group_counts_from_ids(
                 rewards_f,
-                getattr(part, "group_ids", None),
+                part.group_ids,
             )
             if group_cnt > 0:
                 metrics[f"{prefix}zero_std_group_ratio"] = float(zero_cnt) / float(group_cnt)
                 metrics[f"{prefix}zero_std_group_count"] = float(zero_cnt)
                 metrics[f"{prefix}group_count"] = float(group_cnt)
 
-        advantages = getattr(part, "advantages", None)
+        advantages = part.advantages
         if torch.is_tensor(advantages) and advantages.numel() > 0:
             adv_f = advantages.detach().to(dtype=torch.float32).reshape(-1).cpu()
             metrics.update(_tensor_stats(f"{prefix}advantage", adv_f))
 
-        segment = getattr(part, "segment", None)
-        lengths = getattr(segment, "lengths", None) if segment is not None else None
+        segment = part.segment
+        lengths = segment.lengths if segment is not None else None
         if torch.is_tensor(lengths) and lengths.numel() > 0:
             len_f = lengths.detach().to(dtype=torch.float32).reshape(-1).cpu()
             metrics.update(_tensor_stats(f"{prefix}response_len", len_f))
@@ -134,7 +130,7 @@ def compute_rollout_sample_metrics(*, sample: Any, trunc_len: Optional[int] = No
                     (len_f >= float(int(trunc_len))).to(dtype=torch.float32).mean().item()
                 )
 
-        component_rewards = getattr(part, "component_rewards", None)
+        component_rewards = part.component_rewards
         if isinstance(component_rewards, dict):
             for cname, tensor in component_rewards.items():
                 if not torch.is_tensor(tensor) or tensor.numel() == 0:
@@ -149,17 +145,17 @@ def compute_rollout_sample_metrics(*, sample: Any, trunc_len: Optional[int] = No
 def pooled_window_reward_metrics(parts: Sequence[Any]) -> Dict[str, float]:
     """Reward metrics pooled over an accumulation window's gen Parts."""
     metrics: Dict[str, float] = {"num_samples": float(sum(int(p.batch_size) for p in parts))}
-    rewards = [getattr(p, "rewards", None) for p in parts]
+    rewards = [p.rewards for p in parts]
     if all(torch.is_tensor(r) and r.numel() > 0 for r in rewards):
         pooled = torch.cat([r.detach().to(dtype=torch.float32).reshape(-1).cpu() for r in rewards])
         metrics.update(_tensor_stats("reward", pooled))
-        group_ids = [g for p in parts for g in (getattr(p, "group_ids", None) or [])]
+        group_ids = [g for p in parts for g in p.group_ids]
         zero_cnt, group_cnt = _zero_std_group_counts_from_ids(pooled, group_ids)
         if group_cnt > 0:
             metrics["zero_std_group_ratio"] = float(zero_cnt) / float(group_cnt)
             metrics["zero_std_group_count"] = float(zero_cnt)
             metrics["group_count"] = float(group_cnt)
-    components = [getattr(p, "component_rewards", None) for p in parts]
+    components = [p.component_rewards for p in parts]
     if components and all(isinstance(c, dict) for c in components):
         for cname in sorted(set.intersection(*(set(c) for c in components))):
             tensors = [c[cname] for c in components]
@@ -178,12 +174,16 @@ def build_sync_metrics(
         return {}
 
     metrics: Dict[str, float] = {}
-    for key in ("elapsed_ms", "version", "rollout_id"):
-        scalar = _coerce_scalar(getattr(sync_result, key, None))
+    for key, raw in (
+        ("elapsed_ms", sync_result.elapsed_ms),
+        ("version", sync_result.version),
+        ("rollout_id", sync_result.rollout_id),
+    ):
+        scalar = _coerce_scalar(raw)
         if scalar is not None:
             metrics[f"{prefix}{key}"] = scalar
 
-    extra = getattr(sync_result, "extra", None)
+    extra = sync_result.extra
     if isinstance(extra, dict):
         metrics.update(flatten_numeric_metrics(extra, prefix=f"{prefix}extra/"))
     return metrics

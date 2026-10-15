@@ -17,8 +17,8 @@ def has_ep_params(model: nn.Module) -> bool:
 
 def ep_named_parameters(model: nn.Module) -> Tuple[Tuple[str, nn.Parameter], ...]:
     """Return EP parameters in deterministic model order."""
-    groups = getattr(model, "_extra_parallel_param_groups", None) or {}
-    ep_params = tuple(groups.get("ep", ()))
+    groups = getattr(model, "_extra_parallel_param_groups", None)
+    ep_params = () if groups is None else tuple(groups.get("ep", ()))
     ep_ids = {id(param) for param in ep_params}
     named = tuple((name, param) for name, param in model.named_parameters() if id(param) in ep_ids)
     if len(named) != len(ep_params):
@@ -31,14 +31,11 @@ def ep_named_parameters(model: nn.Module) -> Tuple[Tuple[str, nn.Parameter], ...
 
 def materialize_local_block(value: torch.Tensor) -> torch.Tensor:
     """Replicate a DTensor over its own mesh, preserving the outer EP block."""
-    try:
-        from torch.distributed.tensor import DTensor, Replicate
-    except ImportError:  # pragma: no cover - older torch
-        from torch.distributed._tensor import DTensor, Replicate
+    from torch.distributed.tensor import DTensor, Replicate
 
     if isinstance(value, DTensor):
         work = value
-        mesh_device = getattr(work.device_mesh, "device_type", None)
+        mesh_device = work.device_mesh.device_type
         if work.to_local().device.type == "cpu" and mesh_device != "cpu":
             if not torch.cuda.is_available():
                 raise RuntimeError("EP placement: cannot gather a CPU DTensor over an NCCL mesh without CUDA.")
@@ -81,10 +78,7 @@ def gather_stacked_expert_block(
 
 def assign_local_block(param: torch.Tensor, block: torch.Tensor) -> None:
     """Copy a full local EP block into a plain tensor or its DTensor shard."""
-    try:
-        from torch.distributed.tensor import DTensor, distribute_tensor
-    except ImportError:  # pragma: no cover - older torch
-        from torch.distributed._tensor import DTensor, distribute_tensor
+    from torch.distributed.tensor import DTensor, distribute_tensor
 
     with torch.no_grad():
         if isinstance(param, DTensor):

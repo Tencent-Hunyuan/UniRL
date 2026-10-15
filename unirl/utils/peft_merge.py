@@ -102,8 +102,8 @@ def _prepare_qwen_moe_dtensor(
 
 def _unpack_qwen_moe(model: torch.nn.Module) -> bool:
     """Whether this model uses a supported packed Qwen MoE checkpoint layout."""
-    parallel_groups = getattr(model, "_extra_parallel_param_groups", None) or {}
-    if parallel_groups.get("ep"):
+    parallel_groups = getattr(model, "_extra_parallel_param_groups", None)
+    if parallel_groups is not None and parallel_groups.get("ep"):
         return False
     model_type = getattr(getattr(model, "config", None), "model_type", None)
     return model_type in _PACKED_QWEN_MOE_MODEL_TYPES
@@ -315,7 +315,7 @@ def extract_lora_tensors(
 ) -> dict[str, torch.Tensor]:
     """Extract LoRA tensors in canonical wire format."""
     result: dict[str, torch.Tensor] = {}
-    prefix = str(param_prefix or "")
+    prefix = "" if param_prefix is None else str(param_prefix)
     for raw_name, param in model.state_dict().items():
         name = _strip_peft_prefix(raw_name)
         for marker, suffix in ((".lora_A.", "lora_A"), (".lora_B.", "lora_B")):
@@ -362,7 +362,7 @@ def adapt_lora_for_sglang(
     peft_config: dict | None = None,
 ) -> dict[str, torch.Tensor]:
     """Convert canonical-format LoRA tensors to SGLang's native key format."""
-    prefix = str(pipeline_prefix or "")
+    prefix = "" if pipeline_prefix is None else str(pipeline_prefix)
     result: dict[str, torch.Tensor] = {}
     for key, tensor in tensors.items():
         if prefix and key.startswith(prefix):

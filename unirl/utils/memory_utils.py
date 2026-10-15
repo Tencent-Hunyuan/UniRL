@@ -44,11 +44,11 @@ def _rank_enabled(rank: int, spec_env: str = "UNIRL_MEMSNAP_RANKS") -> bool:
 
 
 def _cpu_rss_gb() -> Optional[float]:
-    try:
-        import psutil
+    import psutil
 
+    try:
         return psutil.Process().memory_info().rss / _GB
-    except Exception:  # psutil missing or /proc unreadable — omit rather than fail
+    except (psutil.Error, OSError):  # /proc unreadable — omit rather than fail
         return None
 
 
@@ -139,7 +139,8 @@ def _top_frame(frames: Optional[list]) -> str:
     if not frames:
         return "<no stack captured>"
     for fr in frames:
-        fn = (fr.get("filename") or "").replace("\\", "/")
+        raw_fn = fr.get("filename")
+        fn = ("" if raw_fn is None else str(raw_fn)).replace("\\", "/")
         if fn and "/torch/" not in fn:
             return f"{fn}:{fr.get('line', '?')}:{fr.get('name', '?')}"
     fr = frames[0]
@@ -195,10 +196,7 @@ class MemorySnapshotSampler:
         if self._recording or not torch.cuda.is_available():
             return
         try:
-            try:
-                torch.cuda.memory._record_memory_history(max_entries=self.max_entries, context="all", stacks="python")
-            except TypeError:
-                torch.cuda.memory._record_memory_history(max_entries=self.max_entries)
+            torch.cuda.memory._record_memory_history(max_entries=self.max_entries, context="all", stacks="python")
             self._recording = True
             logger.info("memory: snapshot recording started (max_entries=%d)", self.max_entries)
         except Exception:
