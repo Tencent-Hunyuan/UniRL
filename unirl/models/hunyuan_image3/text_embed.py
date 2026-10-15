@@ -15,41 +15,19 @@ from .compat import repair_hi3_tokenizer_backend
 from .conditions import HunyuanImage3FusedMultimodalCondition
 
 
-def _resolve_build_batch_2d_rope():
-    """Locate the upstream ``build_batch_2d_rope`` rope helper."""
-    for _name, _mod in sys.modules.items():
-        if _name.startswith("transformers_modules.") and hasattr(_mod, "build_batch_2d_rope"):
-            return _mod.build_batch_2d_rope
+def _resolve_upstream_symbol(attr: str) -> Any:
+    """Locate ``attr`` on the loaded ``transformers_modules.*`` remote-code module."""
+    for name, mod in sys.modules.items():
+        if name.startswith("transformers_modules.") and hasattr(mod, attr):
+            return getattr(mod, attr)
     raise RuntimeError(
-        "HunyuanImage3TextEmbedStage: could not locate build_batch_2d_rope "
-        "in any transformers_modules.* — was AutoModelForCausalLM.from_pretrained "
-        "called with trust_remote_code=True before bundle construction?"
+        f"HunyuanImage3TextEmbedStage: could not locate {attr} in any transformers_modules.* — "
+        "was the checkpoint loaded with trust_remote_code=True?"
     )
-
-
-def _resolve_get_system_prompt():
-    """Locate the checkpoint's ``get_system_prompt``; FSDP2 can rebind ``__module__``."""
-    for _name, _mod in sys.modules.items():
-        if _name.startswith("transformers_modules.") and hasattr(_mod, "get_system_prompt"):
-            return _mod.get_system_prompt
-    raise RuntimeError(
-        "HunyuanImage3TextEmbedStage: could not locate get_system_prompt "
-        "in any transformers_modules.* — was the checkpoint loaded with "
-        "trust_remote_code=True?"
-    )
-
-
-def _resolve_system_prompt_preset(sys_type: str, bot_task: str) -> Optional[str]:
-    """Resolve a checkpoint system-prompt preset, stripped as upstream does."""
-    resolved = _resolve_get_system_prompt()(str(sys_type), str(bot_task))
-    if resolved is None:
-        return None
-    stripped = str(resolved).strip()
-    return stripped or None
 
 
 def _optional_output_tensor(output: Any, names: Tuple[str, ...], device: torch.device) -> Optional[torch.Tensor]:
-    """First non-None attribute of ``output`` among ``names``, moved to"""
+    """First non-None attribute of ``output`` among ``names``, moved to ``device``."""
     for name in names:
         t = getattr(output, name, None)
         if t is not None:
@@ -60,14 +38,8 @@ def _optional_output_tensor(output: Any, names: Tuple[str, ...], device: torch.d
 class HunyuanImage3TextEmbedStage:
     """HunyuanImage3 chat-template-driven input-prep stage (AR + diffusion)."""
 
-    def __init__(
-        self,
-        bundle: HunyuanImage3Bundle,
-        *,
-        max_sequence_length: int = 1024,
-    ) -> None:
+    def __init__(self, bundle: HunyuanImage3Bundle) -> None:
         self.bundle = bundle
-        self.max_sequence_length = max_sequence_length
 
     def _apply_chat_template(
         self,
@@ -80,7 +52,6 @@ class HunyuanImage3TextEmbedStage:
         batch_gen_image_info: Optional[Any] = None,
         batch_system_prompt: Optional[List[str]] = None,
         batch_cot_text: Optional[List[str]] = None,
-        max_length: Optional[int] = None,
         batch_cond_image_info: Optional[Any] = None,
     ) -> Tuple[Any, Any]:
         """Run the upstream tokenizer wrapper and return ``(output, sections)`` (README ``## Gotchas``)."""
@@ -96,15 +67,10 @@ class HunyuanImage3TextEmbedStage:
         tkw = getattr(transformer, "_tkwrapper", None) or getattr(transformer, "_tokenizer", None)
         repair_hi3_tokenizer_backend(tkw, self.bundle.pretrained_path)
 
-        effective_sequence_template = (
-            gen_config.sequence_template if sequence_template is None else str(sequence_template)
-        )
-
         # Two text sections tokenize independently; direct-T2I pretrain needs one BPE pass.
         if (
             mode == "gen_image"
-            and effective_sequence_template == "pretrain"
-            and sequence_template is not None
+            and sequence_template == "pretrain"
             and bot_task == "image"
             and cfg_factor == 1
             and batch_system_prompt is not None
@@ -133,10 +99,9 @@ class HunyuanImage3TextEmbedStage:
             batch_gen_image_info=batch_gen_image_info,
             batch_system_prompt=batch_system_prompt,
             batch_cot_text=batch_cot_text,
-            max_length=max_length,
             bot_task=bot_task,
             image_base_size=config.image_base_size,
-            sequence_template=effective_sequence_template,
+            sequence_template=gen_config.sequence_template if sequence_template is None else sequence_template,
             cfg_factor=cfg_factor,
             drop_think=gen_config.drop_think,
             **{_cond_kw: batch_cond_image_info},
@@ -170,11 +135,10 @@ class HunyuanImage3TextEmbedStage:
         device = transformer.model.wte.weight.device
 
         input_ids: torch.Tensor = output.tokens.to(device)
-        n, seq_len = int(input_ids.shape[0]), int(input_ids.shape[1])
+        n, seq_len = input_ids.shape
 
         rope_image_info = transformer.build_batch_rope_image_info(output, sections)
-        build_batch_2d_rope = _resolve_build_batch_2d_rope()
-        cos, sin = build_batch_2d_rope(
+        cos, sin = _resolve_upstream_symbol("build_batch_2d_rope")(
             image_infos=rope_image_info,
             seq_len=seq_len if rope_seq_len is None else rope_seq_len,
             n_elem=config.attention_head_dim,
@@ -203,7 +167,7 @@ class HunyuanImage3TextEmbedStage:
             cond_vae_image_mask=_optional_output_tensor(output, ("cond_vae_image_mask", "vae_image_mask"), device),
             cond_vit_image_mask=_optional_output_tensor(output, ("cond_vit_image_mask", "vit_image_mask"), device),
             cond_timestep_scatter_index=_optional_output_tensor(output, ("cond_timestep_scatter_index",), device),
-            prompt_lengths=None if prompt_lengths is None else prompt_lengths.to(device=device, dtype=torch.long),
+            prompt_lengths=None if prompt_lengths is None else prompt_lengths.to(device),
         )
 
     def embed_for_ar(
@@ -213,7 +177,6 @@ class HunyuanImage3TextEmbedStage:
         bot_task: str = "auto",
         system_prompt: Optional[List[str]] = None,
         cot_text: Optional[List[str]] = None,
-        max_length: Optional[int] = None,
         batch_cond_image_info: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Build the unified-MM input tensors for ``mode="gen_text"``."""
@@ -227,23 +190,14 @@ class HunyuanImage3TextEmbedStage:
             batch_gen_image_info=None,
             batch_system_prompt=system_prompt,
             batch_cot_text=cot_text,
-            max_length=max_length,
             batch_cond_image_info=batch_cond_image_info,
-        )
-
-        prompt_len = int(output.tokens.shape[1])
-        rope_seq_len = max(int(getattr(gen_config, "max_length", prompt_len)), prompt_len)
-
-        real_pos = getattr(output, "real_pos", None)
-        prompt_lengths = (
-            (real_pos[:, -1] if real_pos.dim() == 2 else real_pos).reshape(-1) if real_pos is not None else None
         )
 
         fused = self._build_fused(
             output,
             sections,
-            rope_seq_len=rope_seq_len,
-            prompt_lengths=prompt_lengths,
+            rope_seq_len=max(gen_config.max_length, output.tokens.shape[1]),
+            prompt_lengths=output.real_pos.reshape(-1),
         )
         return {"fused": fused, "tokenizer_output": output}
 
@@ -264,20 +218,21 @@ class HunyuanImage3TextEmbedStage:
         """Build the unified-MM input tensors for ``mode="gen_image"``."""
         transformer = self.bundle.transformer
 
-        prompts = list(p.texts)
+        prompts = p.texts
         if not prompts:
             raise ValueError("HunyuanImage3TextEmbedStage.embed_for_gen_image: prompts is empty")
         cfg_factor = 2 if cfg else 1
         if system_prompt is None and sys_type is not None:
-            resolved_system_prompt = _resolve_system_prompt_preset(str(sys_type), bot_task)
-            if resolved_system_prompt is not None:
-                system_prompt = [resolved_system_prompt] * len(prompts)
+            resolved = _resolve_upstream_symbol("get_system_prompt")(sys_type, bot_task)
+            if resolved is not None and (stripped := resolved.strip()):
+                system_prompt = [stripped] * len(prompts)
 
         ip = transformer.image_processor
+        image_size = f"{height}x{width}"
         if hasattr(ip, "build_image_info"):
-            image_info = ip.build_image_info(f"{int(height)}x{int(width)}")
+            image_info = ip.build_image_info(image_size)
         elif hasattr(ip, "build_gen_image_info"):
-            image_info = ip.build_gen_image_info(f"{int(height)}x{int(width)}")
+            image_info = ip.build_gen_image_info(image_size)
         else:
             raise AttributeError(
                 "HunyuanImage3 image_processor missing both 'build_image_info' and 'build_gen_image_info'."
