@@ -97,6 +97,33 @@ def compute_trajectory_positions(sde_indices: Set[int], num_steps: int) -> List[
 
 
 @dataclass
+class PostWindowODE:
+    """MixGRPO-Flash tail: DPM-Solver++ over a compressed σ schedule after the last SDE step (README)."""
+
+    order: int = 2
+    compress_ratio: float = 0.4
+
+    def __post_init__(self) -> None:
+        self.order = _coerce_type(self.order, int, "PostWindowODE.order")
+        require(self.order in (1, 2), f"PostWindowODE.order must be 1 or 2, got {self.order}")
+        self.compress_ratio = _coerce_type(self.compress_ratio, float, "PostWindowODE.compress_ratio")
+        require(
+            0.0 < self.compress_ratio <= 1.0,
+            f"PostWindowODE.compress_ratio must be in (0, 1], got {self.compress_ratio}",
+        )
+
+    def num_steps(self, num_inference_steps: int, window_end: int) -> int:
+        """Denoising steps after compressing the tail past ``window_end``; a 1-point tail keeps 2 (README)."""
+        require(
+            0 <= window_end < num_inference_steps,
+            f"PostWindowODE: window_end={window_end} outside [0, {num_inference_steps})",
+        )
+        if window_end == num_inference_steps - 1:
+            return num_inference_steps
+        return window_end + int(max((num_inference_steps - window_end) * self.compress_ratio, 2))
+
+
+@dataclass
 class DiffusionSamplingParams(BaseSamplingParams):
     """Canonical diffusion sampling params — single source of truth."""
 
@@ -117,6 +144,7 @@ class DiffusionSamplingParams(BaseSamplingParams):
     sde_strategy: Any = None
     scheduler: Any = None
     sde_indices: Optional[List[int]] = None
+    post_window_ode: Optional[PostWindowODE] = None
 
     sampler_kwargs: Dict[str, Any] = field(default_factory=dict)
 
@@ -175,6 +203,10 @@ class DiffusionSamplingParams(BaseSamplingParams):
             self.sde_indices = [
                 _coerce_type(item, int, f"{name}[{index}]") for index, item in enumerate(self.sde_indices)
             ]
+        require(
+            self.post_window_ode is None or isinstance(self.post_window_ode, PostWindowODE),
+            f"{cls}.post_window_ode must be a PostWindowODE or None, got {type(self.post_window_ode).__name__}",
+        )
         reserved = {f.name for f in fields(self) if f.name != "sampler_kwargs"}
         shadowed = reserved & set(self.sampler_kwargs)
         require(
