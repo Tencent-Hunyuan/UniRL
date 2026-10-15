@@ -291,7 +291,7 @@ class VLLMOmniBackend:
         engine = self._require_omni().engine
         entries = getattr(engine, "stage_configs", None)
         if entries is not None:
-            stage_entries = [(int(entry.stage_id), entry.engine_args) for entry in entries]
+            stage_entries = [(int(entry.stage_id), getattr(entry, "engine_args", entry)) for entry in entries]
         else:
             stage_entries = [
                 (index, getattr(pool, "stage_vllm_config", None))

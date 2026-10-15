@@ -139,7 +139,6 @@ class QwenImageT2iAdapter(ModelAdapter):
     """Qwen-Image text → image (single diffusion stage, TP=1)."""
 
     deploy_config = "qwen_image_t2i_rl.yaml"
-    omni_mode = "text-to-image"
     needs_driver_tokenizer = False
 
     def __init__(self, config: Any, model_config: Any, *, strategy: Any = None, tokenize_fn: Any = None) -> None:

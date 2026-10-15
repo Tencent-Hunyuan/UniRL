@@ -69,7 +69,7 @@ matching receiver on the engine side (`../../rollout/engine/`).
   A failed publication stops every rank before advancing the version. Shared
   vLLM TP receivers retain a single rank-zero publisher.
 
-- **Native Omni IPC currently targets one diffusion stage with `direct-load`.**
+- **Native Omni IPC targets one reload-enabled diffusion stage using upstream layerwise reload.**
   UniRL's `DiTWeightSyncExtension` supplies GPU identity through
   `unirl_weight_sync_device_info`; Omni workers do not interpret UniRL publication
   headers. Upstream WTE synchronizes CUDA before each update RPC returns, and

@@ -20,7 +20,6 @@ stages:
     # for diffusion workers to expose native IPC topology to UniRL.
     weight_transfer_config:
       backend: ipc
-    weight_transfer_apply_strategy: direct-load
     parallel_config:
       pipeline_parallel_size: 1
       data_parallel_size: 1

@@ -15,7 +15,6 @@ stages:
     cache_backend: null
     cache_config: null
     enable_cache_dit_summary: false
-    weight_transfer_apply_strategy: direct-load
     enable_lora: true
     max_lora_rank: 64
     parallel_config:
