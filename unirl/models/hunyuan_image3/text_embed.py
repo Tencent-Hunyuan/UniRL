@@ -15,17 +15,6 @@ from .compat import repair_hi3_tokenizer_backend
 from .conditions import HunyuanImage3FusedMultimodalCondition
 
 
-def _resolve_upstream_symbol(attr: str) -> Any:
-    """Locate ``attr`` on the loaded ``transformers_modules.*`` remote-code module."""
-    for name, mod in sys.modules.items():
-        if name.startswith("transformers_modules.") and hasattr(mod, attr):
-            return getattr(mod, attr)
-    raise RuntimeError(
-        f"HunyuanImage3TextEmbedStage: could not locate {attr} in any transformers_modules.* — "
-        "was the checkpoint loaded with trust_remote_code=True?"
-    )
-
-
 def _optional_output_tensor(output: Any, names: Tuple[str, ...], device: torch.device) -> Optional[torch.Tensor]:
     """First non-None attribute of ``output`` among ``names``, moved to ``device``."""
     for name in names:
@@ -138,7 +127,7 @@ class HunyuanImage3TextEmbedStage:
         n, seq_len = input_ids.shape
 
         rope_image_info = transformer.build_batch_rope_image_info(output, sections)
-        cos, sin = _resolve_upstream_symbol("build_batch_2d_rope")(
+        cos, sin = sys.modules[type(transformer).__module__].build_batch_2d_rope(
             image_infos=rope_image_info,
             seq_len=seq_len if rope_seq_len is None else rope_seq_len,
             n_elem=config.attention_head_dim,
@@ -223,7 +212,7 @@ class HunyuanImage3TextEmbedStage:
             raise ValueError("HunyuanImage3TextEmbedStage.embed_for_gen_image: prompts is empty")
         cfg_factor = 2 if cfg else 1
         if system_prompt is None and sys_type is not None:
-            resolved = _resolve_upstream_symbol("get_system_prompt")(sys_type, bot_task)
+            resolved = sys.modules[type(transformer).__module__].get_system_prompt(sys_type, bot_task)
             if resolved is not None and (stripped := resolved.strip()):
                 system_prompt = [stripped] * len(prompts)
 
