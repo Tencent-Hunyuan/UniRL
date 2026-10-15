@@ -174,7 +174,7 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
 
     def _connect_separate(self, sync_cfg: DictConfig) -> None:
         """One-time cross-slab handshake (NCCL branch of diffusion.py:191-208)."""
-        target = str(sync_cfg.get("_target_", ""))
+        target = str(sync_cfg["_target_"])
         if not target.endswith("NCCLWeightSync"):
             raise ValueError(
                 f"AsyncARTrainer (separate slabs) requires a cross-slab weight sync "
@@ -240,7 +240,7 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
             result,
             sample,
             step_time_s=time.perf_counter() - t0,
-            trunc_len=getattr(self.sampling_params.get("ar"), "max_new_tokens", None),
+            trunc_len=self.sampling_params["ar"].max_new_tokens,
             extra_metrics=extra_metrics,
         )
         self._reset_transport_buffers()

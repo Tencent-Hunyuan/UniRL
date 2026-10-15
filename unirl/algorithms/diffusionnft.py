@@ -14,7 +14,13 @@ from unirl.types.conditions import Condition
 from unirl.types.segments.latent import LatentSegment
 from unirl.utils.metrics import aggregate_numeric_metrics
 
-from .base import AlgorithmStepResult, BaseAlgorithmConfig, StageAlgorithm, _resolve_reference_model
+from .base import (
+    AlgorithmStepResult,
+    BaseAlgorithmConfig,
+    StageAlgorithm,
+    _resolve_reference_model,
+    typed_conditions,
+)
 
 
 @dataclass
@@ -62,7 +68,7 @@ class DiffusionNFT(StageAlgorithm):
         if stage is None:
             raise ValueError("DiffusionNFT: either `stage` or `pipeline` must be provided")
         if nft_lora_policy is None and backend is not None:
-            nft_lora_policy = getattr(backend, "ema", None)
+            nft_lora_policy = backend.ema
         if adv_mode != "raw":
             raise ValueError(f"DiffusionNFT: adv_mode={adv_mode!r} not supported (only 'raw' is wired).")
         if train_timestep_mode not in ("all", "random"):
@@ -93,6 +99,9 @@ class DiffusionNFT(StageAlgorithm):
         self.params = params
         self.nft_lora_policy = nft_lora_policy
         self.conditions_cls = conditions_cls
+        # MiniMax-H3 overrides this to pack its audio stream in alongside video.
+        clean_latents_fn = getattr(self.stage, "nft_clean_latents", None)
+        self._clean_latents_fn = clean_latents_fn if callable(clean_latents_fn) else None
         # The reference is the LoRA-disabled base policy, not the EMA shadow: the
         # shadow tracks the policy, so it cannot anchor drift away from it. Resolved
         # after the scalar checks — it walks `named_parameters()` to find the adapter.
@@ -126,9 +135,7 @@ class DiffusionNFT(StageAlgorithm):
                 "the last trajectory position); got None. Forward-process "
                 "rollout must populate the dense latents path."
             )
-        # MiniMax-H3 overrides this to pack its audio stream in alongside video.
-        clean_latents = getattr(self.stage, "nft_clean_latents", None)
-        x0 = clean_latents(segment) if callable(clean_latents) else segment.latents[:, -1]
+        x0 = self._clean_latents_fn(segment) if self._clean_latents_fn is not None else segment.latents[:, -1]
         if x0.numel() == 0:
             return AlgorithmStepResult(
                 loss=0.0,
@@ -156,7 +163,7 @@ class DiffusionNFT(StageAlgorithm):
                 has_backward=False,
             )
 
-        typed_conds = _typed_conditions(conditions, self.conditions_cls)
+        typed_conds = typed_conditions(conditions, self.conditions_cls)
         adv = advantages.detach().to(dtype=compute_dtype, device=device)
         sat = float(self.config.adv_std_saturate)
         adv_sat = torch.clamp(adv, -sat, sat)
@@ -355,16 +362,6 @@ class DiffusionNFT(StageAlgorithm):
         """fp32 timestep tensor — forward-diffusion arithmetic loses too much precision in bf16 near the endpoints."""
         del x0
         return torch.float32
-
-
-def _typed_conditions(
-    conditions: Mapping[str, Condition],
-    conditions_cls: Optional[Type[Any]],
-) -> Any:
-    """Wrap the conditions dict into the stage's typed container, or pass through when no class is given."""
-    if conditions_cls is None:
-        return conditions
-    return conditions_cls.from_dict(dict(conditions))
 
 
 __all__ = ["DiffusionNFT", "DiffusionNFTConfig"]

@@ -58,14 +58,14 @@ class NoiseRecipe:
         """Build a recipe from a request ``Sample`` (its gen frontier part)."""
         gen = sample.parts[-1]
         diffusion = gen.sampling_params
-        if bool(getattr(diffusion, "disable_driver_xt", False)):
+        if diffusion is not None and bool(diffusion.disable_driver_xt):
             return cls()
         seg = gen.segment
-        explicit_keys = list(getattr(gen, "init_noise_group_ids", None) or [])
-        share = bool(getattr(diffusion, "init_same_noise", False)) if diffusion is not None else False
-        keys = explicit_keys or (gen.group_ids if share else list(gen.sample_ids))
-        shape = getattr(diffusion, "init_noise_latent_shape", None) if diffusion is not None else None
-        seed = int(diffusion.seed) if diffusion is not None and getattr(diffusion, "seed", None) is not None else 0
+        explicit_keys = list(gen.init_noise_group_ids)
+        share = bool(diffusion.init_same_noise) if diffusion is not None else False
+        keys = explicit_keys if explicit_keys else (gen.group_ids if share else list(gen.sample_ids))
+        shape = diffusion.init_noise_latent_shape if diffusion is not None else None
+        seed = int(diffusion.seed) if diffusion is not None and diffusion.seed is not None else 0
         return cls(
             noise_group_ids=[str(k) for k in keys],
             base_seed=seed,

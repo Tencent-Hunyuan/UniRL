@@ -96,9 +96,10 @@ def _normalize_patch_size(value: Any, default: int) -> int:
 
 def _normalize_shift_terminal(value: Any) -> Optional[float]:
     """Coerce a raw ``shift_terminal`` config value to ``Optional[float]``."""
-    if not value:
+    if value is None or value == "":
         return None
-    return float(value)
+    val = float(value)
+    return val if val > 0.0 else None
 
 
 @dataclass
@@ -240,7 +241,7 @@ class FlowMatchSchedulePolicy:
             max_image_seq_len=int(sched.get("max_image_seq_len", defaults.max_image_seq_len)),
             time_shift_type=str(sched.get("time_shift_type", defaults.time_shift_type)),
             shift_terminal=_normalize_shift_terminal(sched.get("shift_terminal", defaults.shift_terminal)),
-            vae_scale_factor=int(vae_scale_factor or defaults.vae_scale_factor),
+            vae_scale_factor=defaults.vae_scale_factor if vae_scale_factor is None else int(vae_scale_factor),
             patch_size=_normalize_patch_size(trans.get("patch_size"), defaults.patch_size),
         )
 

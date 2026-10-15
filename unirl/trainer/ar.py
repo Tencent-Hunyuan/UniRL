@@ -36,7 +36,8 @@ def ar_preflight(
     stack_cfg: DictConfig,
 ) -> Set[str]:
     """Model-blind pre-flight shared by :class:`ARTrainer` and ``AsyncARTrainer``."""
-    target = str(pipeline_cfg.get("_target_", "") or "")
+    raw_target = pipeline_cfg.get("_target_")
+    target = "" if raw_target is None else str(raw_target)
     parts = target.split(".")
     if target.startswith("unirl.models.") and len(parts) > 3:
         validation_module = f"unirl.models.{parts[2]}.validation"
@@ -498,7 +499,7 @@ class ARTrainer(BaseTrainer):
             result,
             sample,
             step_time_s=time.perf_counter() - t0,
-            trunc_len=getattr(self.sampling_params.get("ar"), "max_new_tokens", None),
+            trunc_len=self.sampling_params["ar"].max_new_tokens,
         )
         return result, mean_reward
 
@@ -512,7 +513,7 @@ class ARTrainer(BaseTrainer):
         import dataclasses
 
         eval_ar = dataclasses.replace(
-            self.sampling_params.get("ar"),
+            self.sampling_params["ar"],
             samples_per_prompt=self.eval_samples_per_prompt,
             temperature=self.eval_temperature,
         )
@@ -600,8 +601,8 @@ class ARTrainer(BaseTrainer):
         n = inputs.batch_size
         if n == 0:
             return inputs
-        rollout_dp = max(1, int(getattr(self.rollout, "dp_size", 1)))
-        reward_dp = max(1, int(getattr(self.reward, "dp_size", 1)))
+        rollout_dp = max(1, int(self.rollout.dp_size))
+        reward_dp = max(1, int(self.reward.dp_size))
         multiple = math.lcm(rollout_dp, reward_dp)
         pad_n = (-n) % multiple
         if pad_n == 0:
@@ -644,7 +645,8 @@ class ARTrainer(BaseTrainer):
             cond = sample.conditioning()
             prompts = next((list(c.texts) for c in cond if isinstance(c, Texts)), [])
             part = sample.parts[-1]
-            outputs = getattr(part.primitives.get("text"), "texts", None) or []
+            text_prim = part.primitives.get("text")
+            outputs = list(text_prim.texts) if isinstance(text_prim, Texts) else []
             rewards = part.rewards.to(torch.float32).tolist() if part.rewards is not None else []
             os.makedirs(out_dir, exist_ok=True)
             path = os.path.join(out_dir, f"rollout_{int(rollout_id):04d}.jsonl")
@@ -657,7 +659,7 @@ class ARTrainer(BaseTrainer):
                                 "sample": i,
                                 "prompt": prompts[i] if i < len(prompts) else None,
                                 "output": outputs[i],
-                                "output_chars": len(outputs[i] or ""),
+                                "output_chars": len("" if outputs[i] is None else outputs[i]),
                                 "reward": rewards[i] if i < len(rewards) else None,
                             },
                             ensure_ascii=False,

@@ -118,7 +118,7 @@ def _preflight_trainside_geometry(
     rollout_cfg: DictConfig,
 ) -> None:
     """Reject statically-known trainside DP geometry before constructing heavy model roles."""
-    rollout_target = str(rollout_cfg.get("_target_", ""))
+    rollout_target = str(rollout_cfg["_target_"])
     if not rollout_target.endswith(".TrainsideRolloutEngine") or layout == "separate":
         return
 
@@ -133,17 +133,19 @@ def _preflight_trainside_geometry(
     # The recipe carries a raw DictConfig, so unset keys fall back to the one
     # place the defaults live rather than to literals repeated here.
     fsdp_cfg = backend_cfg.get("fsdp_cfg", {})
-    sp_size = int(fsdp_cfg.get("sp_size", None) or FSDPConfig.sp_size)
+    raw_sp_size = fsdp_cfg.get("sp_size", None)
+    sp_size = FSDPConfig.sp_size if raw_sp_size is None else int(raw_sp_size)
     if shared_devices % sp_size:
         raise ValueError(
             f"Static trainside geometry: {shared_devices} shared devices are not divisible by sp_size={sp_size}."
         )
     # Called for its validation: raises when the shared world cannot form the
     # configured mesh, while the wrap-time call owns the real world size.
+    raw_hsdp_shard_size = fsdp_cfg.get("hsdp_shard_size", None)
     resolve_fsdp_mesh_shape(
         fsdp_cfg.get("fsdp_mode", FSDPConfig.fsdp_mode),
         world_size=shared_devices,
-        hsdp_shard_size=int(fsdp_cfg.get("hsdp_shard_size", None) or FSDPConfig.hsdp_shard_size),
+        hsdp_shard_size=FSDPConfig.hsdp_shard_size if raw_hsdp_shard_size is None else int(raw_hsdp_shard_size),
     )
     shared_dp_size = shared_devices // sp_size
 
@@ -394,8 +396,8 @@ class DiffusionTrainer(BaseTrainer):
                 sampling_spec=self._eval_sampling_params.get("diffusion"),
             )
         )
-        if self.eval_interval > 0 and bool((self.logging_cfg or {}).get("log_media", False)):
-            eval_diffusion = self._eval_sampling_params.get("diffusion")
+        if self.eval_interval > 0 and self.logging_cfg is not None and bool(self.logging_cfg.get("log_media", False)):
+            eval_diffusion = self._eval_sampling_params["diffusion"]
             if self._eval_noise_latent_shape is None or bool(eval_diffusion.disable_driver_xt):
                 logger.warning(
                     "logging.log_media is on, but eval has no driver-authored x_T "
@@ -524,7 +526,8 @@ class DiffusionTrainer(BaseTrainer):
             raise ValueError(f"accumulate_rollouts must be >= 1, got {acc}")
         if acc == 1:
             return
-        n_updates = int(stack_cfg.get("num_updates_per_batch", 1) or 1)
+        raw_updates = stack_cfg.get("num_updates_per_batch", 1)
+        n_updates = 1 if raw_updates is None else int(raw_updates)
         if n_updates != 1:
             raise ValueError(
                 f"accumulate_rollouts={acc} requires stack.num_updates_per_batch == 1 "
@@ -579,11 +582,11 @@ class DiffusionTrainer(BaseTrainer):
         if reward_cfg is not None:
             self.reward = remote_hydra(reward_cfg)
             self._wire_eval_suites()
-        algo_cls = get_class(str(algorithm_cfg.get("_target_", "")))
-        self._uses_ema = getattr(algo_cls, "requires_ema_rollout", False)
+        algo_cls = get_class(str(algorithm_cfg["_target_"]))
+        self._uses_ema = algo_cls.requires_ema_rollout
         # requires_advantages=False algorithms keep rewards for monitoring only.
-        self._algo_requires_advantages = getattr(algo_cls, "requires_advantages", True)
-        needs_backend = self._uses_ema or getattr(algo_cls, "requires_backend", False)
+        self._algo_requires_advantages = algo_cls.requires_advantages
+        needs_backend = self._uses_ema or algo_cls.requires_backend
         algo_extra = {"backend": self.backend} if needs_backend else {}
         self.algorithm = remote_hydra(algorithm_cfg, pipeline=self.pipeline, **algo_extra)
         self.stack = remote_hydra(stack_cfg, fsdp_backend=self.backend, algorithm=self.algorithm)
@@ -662,7 +665,7 @@ class DiffusionTrainer(BaseTrainer):
 
     def _connect_separate(self, sync_cfg: DictConfig) -> None:
         """One-time cross-slab handshake: hand rank 0 the rollout Worker handles."""
-        if str(sync_cfg.get("_target_", "")).endswith("NCCLWeightSync"):
+        if str(sync_cfg["_target_"]).endswith("NCCLWeightSync"):
             addr, port = self.weight_sync.pick_master()[0]
             self.weight_sync.set_rollout_targets(self.rollout.workers, self.rollout.role_name)
             self.weight_sync.connect(
@@ -677,7 +680,7 @@ class DiffusionTrainer(BaseTrainer):
         self, *, pipeline_cfg: DictConfig, model_cfg: DictConfig, sampling_spec: Any
     ) -> Optional[list]:
         """Per-sample latent shape for the driver-authored x_T recipe, or ``None``."""
-        target = getattr(pipeline_cfg, "_target_", None)
+        target = pipeline_cfg.get("_target_")
         if not isinstance(target, str):
             return None
         resolved = get_object(target)
@@ -998,7 +1001,7 @@ class DiffusionTrainer(BaseTrainer):
             generated_any = generated_any or pass_generated
             for suite in self._eval_suites:
                 if suite.data_source is not None:
-                    n = suite.num_prompts or self.eval_num_prompts
+                    n = self.eval_num_prompts if suite.num_prompts is None else suite.num_prompts
                     suite_metrics, sync_pending, pass_generated = self._eval_pass(
                         suite.data_source,
                         n,

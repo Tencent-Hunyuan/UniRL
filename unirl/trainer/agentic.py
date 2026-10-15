@@ -148,7 +148,7 @@ class AgenticTrainer(BaseTrainer):
         )
         if sync_cfg is None:
             raise ValueError("AgenticTrainer requires colocated TensorWeightSync")
-        sync_target = str(sync_cfg.get("_target_", ""))
+        sync_target = str(sync_cfg["_target_"])
         if not sync_target.endswith("TensorWeightSync"):
             raise ValueError(f"AgenticTrainer requires colocated TensorWeightSync; got {sync_target!r}")
         validate_memory_saver_contract(rollout_cfg, strict=True)
@@ -240,13 +240,13 @@ class AgenticTrainer(BaseTrainer):
         for i in valid_indices:
             trajectory = trajectories[i]
             root = trajectory.parts[0]
-            metadata = root.metadata[0] if root.metadata else {}
+            metadata = root.metadata[0] if root.metadata else None
             prompt = root.primitives.get("text")
             questions.append(prompt.texts[0] if isinstance(prompt, Texts) and prompt.texts else "")
             terminal = trajectory.gen_parts()[-1].primitives.get("text")
             terminal_text = terminal.texts[0] if isinstance(terminal, Texts) and terminal.texts else ""
             predictions.append(_extract_answer(terminal_text))
-            answers.append((metadata or {}).get("answer"))
+            answers.append(None if metadata is None else metadata.get("answer"))
 
         score_count = len(valid_indices)
         reward_dp_size = max(1, int(self.reward.dp_size))
@@ -410,7 +410,7 @@ class AgenticTrainer(BaseTrainer):
         return sample.with_parts([*sample.parts[:-1], frontier])
 
     def _pad_to_dp_multiple(self, part: Part) -> Part:
-        dp_size = int(getattr(self.stack, "dp_size", self.num_devices))
+        dp_size = int(self.stack.dp_size)
         pad = (-int(part.batch_size)) % dp_size
         if pad == 0:
             return part

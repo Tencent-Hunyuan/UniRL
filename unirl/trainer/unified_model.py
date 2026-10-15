@@ -198,10 +198,10 @@ class UnifiedModelTrainer(BaseTrainer):
     ) -> Sample:
         """Turn a data-source batch of ``P`` prompts into the unified request ``Sample``."""
         base = sampling if sampling is not None else self.sampling_params
-        diff_params = base.get("diffusion")
-        ar_params = base.get("ar")
+        diff_params = base["diffusion"]
+        ar_params = base["ar"]
         sde_indices = diff_params.get_sde_indices(rollout_id)
-        disable_xt = bool(os.environ.get("DISABLE_DRIVER_XT")) or bool(getattr(diff_params, "disable_driver_xt", False))
+        disable_xt = bool(os.environ.get("DISABLE_DRIVER_XT")) or bool(diff_params.disable_driver_xt)
         diffusion = dataclasses.replace(
             diff_params, sde_indices=sde_indices, scheduler=None, disable_driver_xt=disable_xt
         )
@@ -485,7 +485,7 @@ class UnifiedModelTrainer(BaseTrainer):
         metrics = self._eval_pass(self.data_source, self.eval_num_prompts, scorers, eval_sp, step)
         for suite in self._eval_suites:
             if suite.data_source is not None:
-                n = suite.num_prompts or self.eval_num_prompts
+                n = self.eval_num_prompts if suite.num_prompts is None else suite.num_prompts
                 metrics.update(self._eval_pass(suite.data_source, n, [(suite.name, suite.reward)], eval_sp, step))
         logger.info(
             "EVAL step %d  (cfg=%.1f eta=%.1f)  %s",
@@ -509,7 +509,8 @@ class UnifiedModelTrainer(BaseTrainer):
         all_inputs = data_source.get_eval_samples(num_prompts)
         n_prompts = all_inputs.batch_size
         chunk = max(1, self.batch_size)
-        usable = n_prompts - n_prompts % chunk or n_prompts
+        rem = n_prompts - n_prompts % chunk
+        usable = rem if rem > 0 else n_prompts
         sums = {name: 0.0 for name, _ in scorers}
         counts = {name: 0 for name, _ in scorers}
         for start in range(0, usable, chunk):

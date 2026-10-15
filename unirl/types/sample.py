@@ -131,9 +131,9 @@ class Part(Batch):
         return cls(
             sample_ids=list(sample_ids),
             segment=segment,
-            primitives=dict(primitives or {}),
-            control=dict(control) if control else {},
-            metadata=list(metadata) if metadata else [],
+            primitives={} if primitives is None else dict(primitives),
+            control={} if control is None else dict(control),
+            metadata=[] if metadata is None else list(metadata),
             role=role,
         )
 
@@ -593,7 +593,7 @@ class Sample(Batch):
     def select(self, indices: "torch.Tensor") -> "Sample":
         """Gather whole root prompt-trees by index (shuffle / subsample), mirroring"""
         groups = self.split()
-        idx = indices.tolist() if hasattr(indices, "tolist") else list(indices)
+        idx = indices.tolist() if isinstance(indices, torch.Tensor) else list(indices)
         picked = [groups[int(i)] for i in idx]
         parts = Sample.concat(picked).parts if picked else []
         return type(self)(parts=parts, reward_compute_s=self.reward_compute_s)

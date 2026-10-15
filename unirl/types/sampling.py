@@ -77,9 +77,9 @@ def total_samples_per_prompt(sampling: Any) -> int:
     if _is_param_dict(sampling):
         total = 1
         for params in sampling.values():
-            total *= int(getattr(params, "samples_per_prompt", 1))
+            total *= 1 if params is None else int(params.samples_per_prompt)
         return total
-    return int(getattr(sampling, "samples_per_prompt", 1))
+    return int(sampling.samples_per_prompt)
 
 
 def is_forward_process(sde_indices: Optional[Sequence[int]]) -> bool:

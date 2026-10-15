@@ -19,7 +19,7 @@ from .datasets import PromptExampleDataset, TextPromptDataset, normalize_prompt_
 logger = logging.getLogger(__name__)
 
 
-def _load_condition_images(media_refs: List[Any]) -> Optional[List[Image]]:
+def _load_condition_images(media_refs: List[List[MediaRef]]) -> Optional[List[Image]]:
     """Load ``(modality="image", role="condition")`` media refs into ``Image``."""
     if not media_refs or not any(media_refs):
         return None
@@ -29,11 +29,7 @@ def _load_condition_images(media_refs: List[Any]) -> Optional[List[Image]]:
     images_per_prompt: List[Optional[Image]] = []
     any_loaded = False
     for refs in media_refs:
-        selected = [
-            r
-            for r in (refs or [])
-            if getattr(r, "modality", None) == "image" and getattr(r, "role", None) == "condition"
-        ]
+        selected = [r for r in refs if r.modality == "image" and r.role == "condition"]
         if not selected:
             images_per_prompt.append(None)
             continue
@@ -55,7 +51,7 @@ def _load_condition_images(media_refs: List[Any]) -> Optional[List[Image]]:
     return cast(List[Image], images_per_prompt)
 
 
-def _load_condition_videos(media_refs: List[Any]) -> Optional[List[Any]]:
+def _load_condition_videos(media_refs: List[List[MediaRef]]) -> Optional[List[Any]]:
     """Load ``(modality="video", role="condition")`` media refs into ``Video``."""
     if not media_refs or not any(media_refs):
         return None
@@ -64,11 +60,7 @@ def _load_condition_videos(media_refs: List[Any]) -> Optional[List[Any]]:
     videos_per_prompt: List[Any] = []
     any_loaded = False
     for refs in media_refs:
-        selected = [
-            r
-            for r in (refs or [])
-            if getattr(r, "modality", None) == "video" and getattr(r, "role", None) == "condition"
-        ]
+        selected = [r for r in refs if r.modality == "video" and r.role == "condition"]
         if not selected:
             videos_per_prompt.append(None)
             continue
@@ -83,13 +75,8 @@ def _load_condition_videos(media_refs: List[Any]) -> Optional[List[Any]]:
     return videos_per_prompt
 
 
-def _validate_video_media_roles(media_refs: List[Any]) -> None:
-    roles = {
-        getattr(ref, "role", None)
-        for refs in media_refs
-        for ref in (refs or [])
-        if getattr(ref, "modality", None) == "video"
-    }
+def _validate_video_media_roles(media_refs: List[List[MediaRef]]) -> None:
+    roles = {ref.role for refs in media_refs for ref in refs if ref.modality == "video"}
     if "condition" in roles and "prompt" in roles:
         raise ValueError("A batch cannot mix (video, condition) and (video, prompt) MediaRefs.")
 
@@ -130,28 +117,18 @@ def _dataset_metadata(items: List[Dict[str, Any]], *, context: str) -> List[Opti
 
 
 def _prompt_media_primitive(
-    media_refs: List[Any],
+    media_refs: List[List[MediaRef]],
     *,
     context: str,
 ) -> Optional[MediaRefs]:
     """Build a batch-aligned sparse prompt-media primitive."""
+    del context
     rows: List[List[MediaRef]] = []
     any_prompt_media = False
-    for row, refs in enumerate(media_refs):
-        selected = [ref for ref in (refs or []) if getattr(ref, "role", None) == "prompt"]
-        typed: List[MediaRef] = []
-        for ref in selected:
-            if isinstance(ref, MediaRef):
-                typed.append(ref)
-                continue
-            modality = getattr(ref, "modality", None)
-            uri = getattr(ref, "uri", None)
-            try:
-                typed.append(MediaRef(modality=modality, role="prompt", uri=uri))
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"{context}: prompt {row} invalid media ref: {exc}") from exc
-        rows.append(typed)
-        any_prompt_media = any_prompt_media or bool(typed)
+    for refs in media_refs:
+        selected = [ref for ref in refs if ref.role == "prompt"]
+        rows.append(selected)
+        any_prompt_media = any_prompt_media or bool(selected)
     return MediaRefs.from_rows(rows) if any_prompt_media else None
 
 
@@ -166,11 +143,9 @@ def _reject_unsupported_media_refs(batch: Dict[str, Any], *, context: str) -> No
         )
     _validate_video_media_roles(refs)
     bad: List[Tuple[int, Any]] = []
-    for i, per_prompt in enumerate(refs or []):
-        for r in per_prompt or []:
-            modality = getattr(r, "modality", None)
-            role = getattr(r, "role", None)
-            if (modality, role) not in _SUPPORTED_MEDIA_REF_ROLES:
+    for i, per_prompt in enumerate(refs):
+        for r in per_prompt:
+            if (r.modality, r.role) not in _SUPPORTED_MEDIA_REF_ROLES:
                 bad.append((i, r))
     if not bad:
         return
@@ -420,20 +395,13 @@ class MultimodalRLDataSource:
                 "Provide eval_data_path or a readable training data_path."
             )
 
-        get_prompt_example = getattr(self.eval_dataset, "get_prompt_example", None)
-        if not callable(get_prompt_example):
-            raise TypeError(
-                f"Evaluation dataset {type(self.eval_dataset).__name__} must implement "
-                "get_prompt_example(idx) -> {'prompt': ..., 'metadata': ...}."
-            )
-
         total = len(self.eval_dataset)
         limit = total if eval_num_prompts < 0 else min(eval_num_prompts, total)
         for start in range(0, limit, batch_size):
             end = min(start + batch_size, limit)
             prompt_examples = [
                 normalize_prompt_example(
-                    get_prompt_example(idx),
+                    self.eval_dataset.get_prompt_example(idx),
                     default_prompt_id=f"eval:{idx}",
                 )
                 for idx in range(start, end)
@@ -456,14 +424,14 @@ class MultiDomainRLDataSource:
 
     def __init__(self, args):
         run_cfg = args.run
-        entries = list(getattr(run_cfg, "domains", None) or [])
+        raw_domains = getattr(run_cfg, "domains", None)
+        entries = [] if raw_domains is None else list(raw_domains)
         if not entries:
             raise ValueError("MultiDomainRLDataSource requires args.run.domains (a non-empty list).")
 
         self.domains: List[Dict[str, Optional[str]]] = []
         for entry in entries:
-            get = entry.get if hasattr(entry, "get") else lambda k, d=None: getattr(entry, k, d)
-            name, data_path, eval_data_path = get("name"), get("data_path"), get("eval_data_path")
+            name, data_path, eval_data_path = entry.get("name"), entry.get("data_path"), entry.get("eval_data_path")
             if not name or not data_path:
                 raise ValueError(f"Each domain entry needs 'name' and 'data_path'; got {entry!r}.")
             if not os.path.exists(str(data_path)):
@@ -543,7 +511,8 @@ class MultiDomainRLDataSource:
         sample_ids = [f"prompt:{pid}:sample:0" for pid in prompt_ids]
         metadata_list: List[Optional[Dict[str, Any]]] = []
         for item in examples:
-            md = dict(item.get("metadata") or {})
+            raw_md = item.get("metadata")
+            md = {} if raw_md is None else dict(raw_md)
             md["domain"] = domain
             metadata_list.append(md)
         return _input_sample({"text": Texts(texts=prompts)}, sample_ids=sample_ids, metadata=metadata_list)
