@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import logging
+import sys
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from unirl.models.types.ar import ARSamplingParams
@@ -11,8 +11,6 @@ from unirl.types.sample import Sample
 
 from ..ar import HunyuanImage3ARParams
 from ..conditions import HunyuanImage3ARConditions
-
-logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from ..pipeline import HunyuanImage3Pipeline
@@ -108,23 +106,13 @@ def _resolve_system_prompt(
     bundle, bot_task: str, use_system_prompt: Optional[str], system_prompt: Optional[str]
 ) -> Optional[str]:
     """Mirror upstream ``get_system_prompt(sys_type, bot_task, system_prompt)``."""
-    import importlib
-    import sys
-
     transformer = bundle.transformer
-    gen_config = getattr(transformer, "generation_config", None)
-    sys_type = use_system_prompt
-    if sys_type is None and gen_config is not None:
-        sys_type = getattr(gen_config, "use_system_prompt", None)
-
-    try:
-        transformer_mod = sys.modules[type(transformer).__module__]
-        package = transformer_mod.__package__ or transformer_mod.__name__.rsplit(".", 1)[0]
-        sp_mod = importlib.import_module(f"{package}.system_prompt")
-        return sp_mod.get_system_prompt(sys_type, bot_task, system_prompt)
-    except (AttributeError, ImportError, KeyError):
-        logger.debug("Could not resolve upstream HunyuanImage3 system_prompt module.", exc_info=True)
-        return system_prompt
+    sys_type = (
+        use_system_prompt
+        if use_system_prompt is not None
+        else getattr(transformer.generation_config, "use_system_prompt", None)
+    )
+    return sys.modules[type(transformer).__module__].get_system_prompt(sys_type, bot_task, system_prompt)
 
 
 def _stop_tokens_for_bot_task(bundle, bot_task: str) -> List[int]:
