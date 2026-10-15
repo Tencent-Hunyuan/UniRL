@@ -73,11 +73,10 @@ class HunyuanImage3TextEmbedStage:
         self,
         *,
         mode: str,
-        batch_prompt: Optional[List[str]],
+        batch_prompt: List[str],
         bot_task: str,
         cfg_factor: int,
         sequence_template: Optional[str] = None,
-        batch_message_list: Optional[Any] = None,
         batch_gen_image_info: Optional[Any] = None,
         batch_system_prompt: Optional[List[str]] = None,
         batch_cot_text: Optional[List[str]] = None,
@@ -108,8 +107,6 @@ class HunyuanImage3TextEmbedStage:
             and sequence_template is not None
             and bot_task == "image"
             and cfg_factor == 1
-            and batch_message_list is None
-            and batch_prompt is not None
             and batch_system_prompt is not None
             and batch_cot_text is None
             and batch_cond_image_info is None
@@ -132,7 +129,6 @@ class HunyuanImage3TextEmbedStage:
         )
         out = tkw.apply_chat_template(
             batch_prompt=batch_prompt,
-            batch_message_list=batch_message_list,
             mode=mode,
             batch_gen_image_info=batch_gen_image_info,
             batch_system_prompt=batch_system_prompt,
@@ -145,9 +141,9 @@ class HunyuanImage3TextEmbedStage:
             drop_think=gen_config.drop_think,
             **{_cond_kw: batch_cond_image_info},
         )
-        n_samples = len(batch_prompt if batch_prompt is not None else batch_message_list)
+        n_samples = len(batch_prompt)
         expected_rows = n_samples * cfg_factor
-        rows = int(out["output"].tokens.shape[0])
+        rows = out["output"].tokens.shape[0]
         if rows != expected_rows:
             raise ValueError(
                 f"HunyuanImage3TextEmbedStage: chat template returned {rows} row(s) for "
@@ -212,20 +208,16 @@ class HunyuanImage3TextEmbedStage:
         system_prompt: Optional[List[str]] = None,
         cot_text: Optional[List[str]] = None,
         max_length: Optional[int] = None,
-        batch_message_list: Optional[Any] = None,
         batch_cond_image_info: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Build the unified-MM input tensors for ``mode="gen_text"``."""
         gen_config = self.bundle.transformer.generation_config
 
-        prompts = list(p.texts) if batch_message_list is None else None
-
         output, sections = self._apply_chat_template(
             mode="gen_text",
-            batch_prompt=prompts,
+            batch_prompt=p.texts,
             bot_task=bot_task,
             cfg_factor=1,
-            batch_message_list=batch_message_list,
             batch_gen_image_info=None,
             batch_system_prompt=system_prompt,
             batch_cot_text=cot_text,

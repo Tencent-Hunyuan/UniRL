@@ -31,5 +31,6 @@ Re-check these when the checkpoint revision moves:
   `apply_general_template(batchify=True)` passes a one-element `prompt_list` to `batch_gen_infer`
   and `zip`s it against the per-sample kwargs, so `apply_chat_template(batch_prompt=[...])`
   returns `cfg_factor` rows instead of `len(prompts) * cfg_factor`. `_apply_chat_template` raises
-  on that mismatch; otherwise the AR path fails later at `Part.fill` and the diffusion path at
-  `split_cfg_fused`. Shipped recipes pin `rollout.forward_batch_size: 1` (issue #520).
+  on that mismatch; otherwise the AR path fails later in `instantiate_continuous_tokens` (`i2t`)
+  or `Part.fill` (`t2t` / `t2ti`), and the diffusion path at `split_cfg_fused`. Shipped recipes
+  pin `rollout.forward_batch_size: 1` (issue #520).
