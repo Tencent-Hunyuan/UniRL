@@ -152,21 +152,17 @@ class HunyuanImage3TextEmbedStage:
             )
         return out["output"], out["sections"]
 
-    def _fused_common(
+    def _build_fused(
         self,
         output: Any,
         sections: Any,
         *,
         rope_seq_len: Optional[int] = None,
-    ) -> Tuple[
-        torch.device,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        Optional[torch.Tensor],
-    ]:
-        """Tensor prep shared by the AR and gen_image paths."""
+        prompt_lengths: Optional[torch.Tensor] = None,
+        gen_image_mask: Optional[torch.Tensor] = None,
+        gen_timestep_scatter_index: Optional[torch.Tensor] = None,
+    ) -> HunyuanImage3FusedMultimodalCondition:
+        """Build the ``HunyuanImage3FusedMultimodalCondition`` shared by AR and ``gen_image``."""
         transformer = self.bundle.transformer
         config = transformer.config
         gen_config = transformer.generation_config
@@ -194,11 +190,21 @@ class HunyuanImage3TextEmbedStage:
             model_kwargs={"tokenizer_output": output},
         ).to(device)
 
-        cond_vit_image_mask = _optional_output_tensor(output, ("cond_vit_image_mask", "vit_image_mask"), device)
-
-        # Stack RoPE so it travels as a per-sample CONCAT tensor.
-        rope_cache = torch.stack([cos, sin], dim=1)
-        return device, input_ids, attention_mask, position_ids, rope_cache, cond_vit_image_mask
+        return HunyuanImage3FusedMultimodalCondition(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            # Stack RoPE so it travels as a per-sample CONCAT tensor.
+            rope_cache=torch.stack([cos, sin], dim=1),
+            gen_image_mask=None if gen_image_mask is None else gen_image_mask.to(device),
+            gen_timestep_scatter_index=(
+                None if gen_timestep_scatter_index is None else gen_timestep_scatter_index.to(device)
+            ),
+            cond_vae_image_mask=_optional_output_tensor(output, ("cond_vae_image_mask", "vae_image_mask"), device),
+            cond_vit_image_mask=_optional_output_tensor(output, ("cond_vit_image_mask", "vit_image_mask"), device),
+            cond_timestep_scatter_index=_optional_output_tensor(output, ("cond_timestep_scatter_index",), device),
+            prompt_lengths=None if prompt_lengths is None else prompt_lengths.to(device=device, dtype=torch.long),
+        )
 
     def embed_for_ar(
         self,
@@ -226,32 +232,17 @@ class HunyuanImage3TextEmbedStage:
         )
 
         prompt_len = int(output.tokens.shape[1])
-        rope_seq_len = int(getattr(gen_config, "max_length", prompt_len))
-        rope_seq_len = max(rope_seq_len, prompt_len)
+        rope_seq_len = max(int(getattr(gen_config, "max_length", prompt_len)), prompt_len)
 
-        _device, input_ids, attention_mask, position_ids, rope_cache, cond_vit_image_mask = self._fused_common(
-            output, sections, rope_seq_len=rope_seq_len
+        real_pos = getattr(output, "real_pos", None)
+        prompt_lengths = (
+            (real_pos[:, -1] if real_pos.dim() == 2 else real_pos).reshape(-1) if real_pos is not None else None
         )
 
-        cond_vae_image_mask = _optional_output_tensor(output, ("cond_vae_image_mask", "vae_image_mask"), _device)
-        cond_timestep_scatter_index = _optional_output_tensor(output, ("cond_timestep_scatter_index",), _device)
-
-        prompt_lengths: Optional[torch.Tensor] = None
-        real_pos = getattr(output, "real_pos", None)
-        if real_pos is not None:
-            rp = real_pos.to(device=_device, dtype=torch.long)
-            if rp.dim() == 2:
-                rp = rp[:, -1]
-            prompt_lengths = rp.reshape(-1)
-
-        fused = HunyuanImage3FusedMultimodalCondition(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            rope_cache=rope_cache,
-            cond_vae_image_mask=cond_vae_image_mask,
-            cond_vit_image_mask=cond_vit_image_mask,
-            cond_timestep_scatter_index=cond_timestep_scatter_index,
+        fused = self._build_fused(
+            output,
+            sections,
+            rope_seq_len=rope_seq_len,
             prompt_lengths=prompt_lengths,
         )
         return {"fused": fused, "tokenizer_output": output}
@@ -305,26 +296,11 @@ class HunyuanImage3TextEmbedStage:
             batch_cond_image_info=batch_cond_image_info,
         )
 
-        device, input_ids, attention_mask, position_ids, rope_cache, cond_vit_image_mask = self._fused_common(
-            output, sections
-        )
-
-        gen_image_mask: torch.Tensor = output.gen_image_mask.to(device)
-        gen_timestep_scatter_index: torch.Tensor = output.gen_timestep_scatter_index.to(device)
-
-        cond_vae_image_mask = _optional_output_tensor(output, ("cond_vae_image_mask", "vae_image_mask"), device)
-        cond_timestep_scatter_index = _optional_output_tensor(output, ("cond_timestep_scatter_index",), device)
-
-        fused = HunyuanImage3FusedMultimodalCondition(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            rope_cache=rope_cache,
-            gen_image_mask=gen_image_mask,
-            gen_timestep_scatter_index=gen_timestep_scatter_index,
-            cond_vae_image_mask=cond_vae_image_mask,
-            cond_vit_image_mask=cond_vit_image_mask,
-            cond_timestep_scatter_index=cond_timestep_scatter_index,
+        fused = self._build_fused(
+            output,
+            sections,
+            gen_image_mask=output.gen_image_mask,
+            gen_timestep_scatter_index=output.gen_timestep_scatter_index,
         )
         return {"fused": fused, "tokenizer_output": output}
 
