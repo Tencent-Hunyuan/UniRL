@@ -166,7 +166,7 @@ class UnifiedModelTrainer(BaseTrainer):
                 image_algorithm=self.image_algorithm,
             )
 
-            diffusion_params = self.sampling_params.get("diffusion")
+            diffusion_params = self.sampling_params["diffusion"]
             self._shared_advantage = diffusion_params.samples_per_prompt == 1
             if single_engine:
                 self.rollout = remote(**rollout_parsed, pipeline=self.pipeline)
@@ -218,13 +218,10 @@ class UnifiedModelTrainer(BaseTrainer):
     ) -> Sample:
         """Turn a data-source batch of ``P`` prompts into the unified request ``Sample``."""
         base = sampling if sampling is not None else self.sampling_params
-        diff_params = base.get("diffusion")
-        ar_params = base.get("ar")
+        diff_params = base["diffusion"]
+        ar_params = base["ar"]
         sde_indices = diff_params.get_sde_indices(rollout_id)
-        disable_xt = bool(os.environ.get("DISABLE_DRIVER_XT")) or diff_params.disable_driver_xt
-        diffusion = dataclasses.replace(
-            diff_params, sde_indices=sde_indices, scheduler=None, disable_driver_xt=disable_xt
-        )
+        diffusion = dataclasses.replace(diff_params, sde_indices=sde_indices, scheduler=None)
         request = prepare_input_sample(
             inputs,
             rollout_id,
@@ -497,9 +494,9 @@ class UnifiedModelTrainer(BaseTrainer):
                     pixels = image.pixels.detach().to(torch.float32).clamp(0, 1).cpu()
                     save_image(pixels, os.path.join(out_dir, f"img_{k}.png"))
 
-            ar_params = self.sampling_params.get("ar")
-            diff_params = self.sampling_params.get("diffusion")
-            n_rec = ar_params.samples_per_prompt if ar_params is not None else 1
+            ar_params = self.sampling_params["ar"]
+            diff_params = self.sampling_params["diffusion"]
+            n_rec = ar_params.samples_per_prompt
             n_img = max(1, diff_params.samples_per_prompt)
             n = max(len(sample_ids), n_imgs)
             with open(os.path.join(out_dir, "samples.jsonl"), "w") as f:
@@ -526,7 +523,7 @@ class UnifiedModelTrainer(BaseTrainer):
 
     def evaluate(self, step: int) -> float:
         """Periodic eval on the eval set (no training); returns the mean image reward."""
-        base_diffusion = self.sampling_params.get("diffusion")
+        base_diffusion = self.sampling_params["diffusion"]
         eval_diffusion = dataclasses.replace(
             base_diffusion,
             eta=self.eval_eta,

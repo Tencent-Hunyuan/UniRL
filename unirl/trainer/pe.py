@@ -161,8 +161,8 @@ class PETrainer(BaseTrainer):
     ) -> Sample:
         """Turn a data-source batch of ``P`` prompts into the composed request ``Sample``."""
         base = sampling if sampling is not None else self.sampling_params
-        diff_params = base.get("diffusion")
-        ar_params = base.get("ar")
+        diff_params = base["diffusion"]
+        ar_params = base["ar"]
         sde_indices = diff_params.get_sde_indices(rollout_id)
         diffusion = dataclasses.replace(diff_params, sde_indices=sde_indices, scheduler=None)
         request = prepare_input_sample(
@@ -242,7 +242,7 @@ class PETrainer(BaseTrainer):
 
     def evaluate(self, step: int) -> float:
         """Periodic eval on the eval set (no training); returns the mean image reward."""
-        base_diffusion = self.sampling_params.get("diffusion")
+        base_diffusion = self.sampling_params["diffusion"]
         eval_diffusion = dataclasses.replace(
             base_diffusion,
             eta=self.eval_eta,

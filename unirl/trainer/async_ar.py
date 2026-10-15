@@ -77,7 +77,7 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
             )
         if sync_cfg is None:
             raise ValueError("AsyncARTrainer requires a cross-slab weight sync; add a `sync:` block.")
-        sync_target = sync_cfg.get("_target_", "")
+        sync_target = sync_cfg["_target_"]
         if not sync_target.endswith("NCCLWeightSync"):
             raise ValueError(
                 f"AsyncARTrainer (separate slabs) requires a cross-slab weight sync "
@@ -233,7 +233,7 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
             result,
             sample,
             step_time_s=time.perf_counter() - t0,
-            trunc_len=getattr(self.sampling_params.get("ar"), "max_new_tokens", None),
+            trunc_len=self.sampling_params["ar"].max_new_tokens,
             extra_metrics=extra_metrics,
         )
         self._reset_transport_buffers()

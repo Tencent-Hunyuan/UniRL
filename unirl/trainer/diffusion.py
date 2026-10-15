@@ -1,7 +1,6 @@
 import dataclasses
 import inspect
 import logging
-import os
 import sys
 import time
 from contextlib import contextmanager
@@ -424,32 +423,24 @@ class DiffusionTrainer(BaseTrainer):
             overrides=eval_sampling_cfg,
         )
 
-        self._noise_latent_shape: Optional[list] = (
-            None
-            if os.environ.get("DISABLE_DRIVER_XT")
-            else self._resolve_noise_latent_shape(
-                pipeline_cfg=pipeline_cfg,
-                model_cfg=bundle_cfg,
-                sampling_spec=self.sampling_params.get("diffusion"),
-            )
+        self._noise_latent_shape: Optional[list] = self._resolve_noise_latent_shape(
+            pipeline_cfg=pipeline_cfg,
+            model_cfg=bundle_cfg,
+            sampling_spec=self.sampling_params["diffusion"],
         )
         # Eval may render at its own resolution, so the driver-authored x_T has to
         # match THAT geometry rather than the rollout's.
-        self._eval_noise_latent_shape: Optional[list] = (
-            None
-            if self._noise_latent_shape is None
-            else self._resolve_noise_latent_shape(
-                pipeline_cfg=pipeline_cfg,
-                model_cfg=bundle_cfg,
-                sampling_spec=self._eval_sampling_params.get("diffusion"),
-            )
+        self._eval_noise_latent_shape: Optional[list] = self._resolve_noise_latent_shape(
+            pipeline_cfg=pipeline_cfg,
+            model_cfg=bundle_cfg,
+            sampling_spec=self._eval_sampling_params["diffusion"],
         )
         if self.eval_interval > 0 and bool((self.logging_cfg or {}).get("log_media", False)):
-            eval_diffusion = self._eval_sampling_params.get("diffusion")
-            if self._eval_noise_latent_shape is None or eval_diffusion.disable_driver_xt:
+            eval_diffusion = self._eval_sampling_params["diffusion"]
+            if self._eval_noise_latent_shape is None:
                 logger.warning(
                     "logging.log_media is on, but eval has no driver-authored x_T "
-                    "(DISABLE_DRIVER_XT / disable_driver_xt, or latent_shape() opted out), so "
+                    "(disable_driver_xt, or latent_shape() opted out), so "
                     "every eval draws fresh noise and the eval panel will not be comparable "
                     "across evals."
                 )
@@ -665,7 +656,7 @@ class DiffusionTrainer(BaseTrainer):
 
     def _connect_separate(self, sync_cfg: DictConfig) -> None:
         """One-time cross-slab handshake: hand rank 0 the rollout Worker handles."""
-        if sync_cfg.get("_target_", "").endswith("NCCLWeightSync"):
+        if sync_cfg["_target_"].endswith("NCCLWeightSync"):
             addr, port = self.weight_sync.pick_master()[0]
             self.weight_sync.set_rollout_targets(self.rollout.workers, self.rollout.role_name)
             self.weight_sync.connect(
@@ -680,10 +671,9 @@ class DiffusionTrainer(BaseTrainer):
         self, *, pipeline_cfg: DictConfig, model_cfg: DictConfig, sampling_spec: Any
     ) -> Optional[list]:
         """Per-sample latent shape for the driver-authored x_T recipe, or ``None``."""
-        target = pipeline_cfg.get("_target_")
-        if not isinstance(target, str):
+        if sampling_spec.disable_driver_xt:
             return None
-        resolved = get_object(target)
+        resolved = get_object(pipeline_cfg["_target_"])
         pipeline_cls = resolved if isinstance(resolved, type) else getattr(resolved, "__self__", None)
         latent_shape_fn = getattr(pipeline_cls, "latent_shape", None)
         if latent_shape_fn is None:
@@ -692,7 +682,7 @@ class DiffusionTrainer(BaseTrainer):
             shape = latent_shape_fn(model_config=model_cfg, sampling_spec=sampling_spec)
         except NotImplementedError:
             return None
-        return [int(x) for x in shape]
+        return list(shape)
 
     def _build_request_sample(
         self,
@@ -704,7 +694,7 @@ class DiffusionTrainer(BaseTrainer):
         """Turn a data source batch into a request :class:`Sample`."""
         sp = sampling if sampling is not None else self.sampling_params
         noise_latent_shape = self._eval_noise_latent_shape if sampling is not None else self._noise_latent_shape
-        diffusion = sp.get("diffusion")
+        diffusion = sp["diffusion"]
         sde_indices = diffusion.get_sde_indices(rollout_id)
         diffusion = dataclasses.replace(
             diffusion, sde_indices=sde_indices, scheduler=None, init_noise_latent_shape=noise_latent_shape
@@ -955,7 +945,7 @@ class DiffusionTrainer(BaseTrainer):
                 "block) — evaluation scores generations and needs one."
             )
         eval_sp = self._eval_sampling_params
-        eval_diffusion = eval_sp.get("diffusion")
+        eval_diffusion = eval_sp["diffusion"]
         sync_requested = bool(sync_weights)
         sleep_requested = sleep_after and not self._residency.policy.rollout_resident
         # A no-sync evaluation must preserve the already-resident adapter.
