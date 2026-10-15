@@ -84,6 +84,11 @@ class UnifiedModelTrainer(BaseTrainer):
         eval_eta: float = 0.0,
         eval_rewards_cfg: Optional[Any] = None,
     ) -> None:
+        if batch_size < 1 or batch_size % cfg.num_devices != 0:
+            raise ValueError(
+                f"UnifiedModelTrainer: batch_size ({batch_size}) must be a positive multiple of "
+                f"num_devices ({cfg.num_devices}); reward scoring and unified training scatter whole prompt trees."
+            )
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
         self.batch_size = batch_size
         self._enable_fsdp_offload = bool(enable_fsdp_offload)
