@@ -61,6 +61,7 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
         self.adapter = get_adapter(config.modality)(
             config, model_config, strategy=strategy, tokenize_fn=self._tokenize_prompt
         )
+        self.packs_groups = self.adapter.packs_groups
 
         self.schedule_policy = self.adapter.schedule_policy() if self.adapter.needs_sigmas else None
 
@@ -88,10 +89,6 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
     def generate(self, sample: Sample) -> Sample:
         """Generate one whole DP shard synchronously."""
         return self._generate_locked(sample)
-
-    def packs_groups(self, sample: Sample) -> bool:
-        """The adapter answers: packed t2i collapses a group into one prompt, per-row modalities do not."""
-        return self.adapter.packs_groups(sample)
 
     def _generate_locked(self, sample: Sample) -> Sample:
         with self._generate_lock:
