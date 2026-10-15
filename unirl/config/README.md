@@ -98,27 +98,25 @@ reaching into `cfg` from the contract.
 ## Verification
 
 `lint/check_recipe_contracts.py` (pre-commit hook `check-recipe-contracts`,
-so it rides the lint-only CI alongside `check-recipe-targets`) asserts six
+so it rides the lint-only CI alongside `check-recipe-targets`) asserts five
 things on every run:
 
 1. Every runnable recipe under `examples/` satisfies every contract. Two
    diffusion recipes currently stored under `examples/unified_model/` carry
    explicit `train_diffusion` ownership overrides.
-2. Every combination the contracts claim to reject **is** rejected, and the valid
-   shapes are not — so a contract that quietly became a no-op fails CI.
-3. `ENGINE_FAMILIES` still matches the engine classes: `direct_sampling` is read
+2. `ENGINE_FAMILIES` still matches the engine classes: `direct_sampling` is read
    back off each engine's `__init__` (does it take a `pipeline`? — the same
    duck-typed test the trainers use), and `capabilities` off the protocol methods
    the concrete class overrides. Adding an engine family without declaring it
    fails here rather than silently skipping its contracts.
-4. Sync-handler local/remote metadata still matches whether its constructor owns
+3. Sync-handler local/remote metadata still matches whether its constructor owns
    a local `rollout` sibling.
-5. Every `unirl/train_*.py` calls `validate_recipe` first, with its own entrypoint
+4. Every `unirl/train_*.py` calls `validate_recipe` first, with its own entrypoint
    name, so adding an entrypoint cannot silently bypass the gate.
-6. `ALGORITHM_LOSS_AGG_MODES` lists exactly the algorithm classes whose `__init__`
+5. `ALGORITHM_LOSS_AGG_MODES` lists exactly the algorithm classes whose `__init__`
    takes `loss_agg_mode`, and each constructor default is a listed mode.
 
-All six run with `ast` + `yaml` only, no torch — which is why `contracts.py`
+All five run with `ast` + `yaml` only, no torch — which is why `contracts.py`
 and `require.py` stay stdlib-only.
 
 ## Gotchas
