@@ -88,13 +88,9 @@ class UnifiedModelTrainer(BaseTrainer):
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
         self.batch_size = batch_size
         self._enable_fsdp_offload = bool(enable_fsdp_offload)
-        if (
-            isinstance(rollout_pipeline_chunks, bool)
-            or not isinstance(rollout_pipeline_chunks, int)
-            or rollout_pipeline_chunks < 1
-        ):
+        if rollout_pipeline_chunks < 1:
             raise ValueError(
-                f"UnifiedModelTrainer.rollout_pipeline_chunks must be an int >= 1; got {rollout_pipeline_chunks!r}."
+                f"UnifiedModelTrainer.rollout_pipeline_chunks must be >= 1; got {rollout_pipeline_chunks}."
             )
         self._rollout_pipeline_chunks = rollout_pipeline_chunks
         if rollout_pipeline_chunks > 1 and rollout_cfg is not None:
