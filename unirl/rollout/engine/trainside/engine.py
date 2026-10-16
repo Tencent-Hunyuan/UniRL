@@ -72,6 +72,7 @@ class TrainsideRolloutEngine(BaseRolloutEngine):
 
     def _generate_core(self, sample: Sample) -> Sample:
         """Synchronous pipeline forward for one whole ``Sample``."""
+        sample.reject_row_canvases(engine="TrainsideRolloutEngine")
         if self.forward_batch_size is not None:
             gen_parts = [p for p in sample.parts if p.is_gen]
             if len(gen_parts) > 1:

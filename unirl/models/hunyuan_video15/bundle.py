@@ -88,7 +88,7 @@ class HunyuanVideo15Bundle(Bundle):
             )
             transformer = transformer.to(device=device, dtype=dtype)
         transformer.set_attention_backend(config.attention_backend)
-        if bool(getattr(getattr(transformer, "config", None), "use_meanflow", False)):
+        if transformer.config.use_meanflow:
             raise NotImplementedError(
                 "HunyuanVideo15Bundle does not support transformers with "
                 "use_meanflow=True; timestep_r is not threaded through the "

@@ -73,7 +73,7 @@ def build_optimizer(
         foreach=False,
     )
 
-    param_group_lrs = getattr(config, "param_group_lrs", None)
+    param_group_lrs = config.param_group_lrs
     if param_group_lrs and named_params is not None:
         groups = _build_named_param_groups(
             named_params,

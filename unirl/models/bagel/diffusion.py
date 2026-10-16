@@ -249,7 +249,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         differentiable: bool = False,
     ) -> Tuple[Any, Any, Any]:
         """Rebuild the three KV contexts from raw prompt and optional source image."""
-        if image is not None and getattr(self.model.model, "vit_model", None) is None:
+        if image is not None and not self.model.model.config.visual_und:
             raise ValueError(
                 "BagelDiffusionStage: the conditions carry an it2i source image but the bundle "
                 "was built without the und ViT; set BagelPipelineConfig.enable_vit=true."
@@ -301,15 +301,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
                 "raw material; prompt-only stored contexts (t2i/t2ti) cannot be "
                 "reproduced from the bare prompt.",
             )
-        if differentiable and conditions.input_images:
-            prompt, input_image, image_shape = conditions.single_prompt()
-            gen, cfg_text, cfg_img = self._build_contexts_from_prompt(
-                prompt,
-                input_image,
-                differentiable=True,
-            )
-            return gen, cfg_text, cfg_img, image_shape
-        if conditions.has_contexts() and not force_rebuild:
+        if conditions.has_contexts() and not force_rebuild and not (differentiable and conditions.input_images):
             return conditions.single()
         prompt, input_image, image_shape = conditions.single_prompt()
         gen, cfg_text, cfg_img = self._build_contexts_from_prompt(
@@ -317,6 +309,14 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
             input_image,
             differentiable=differentiable,
         )
+        if conditions.layouts:
+            height, width = image_shape
+            rebuilt = {"kv_len": gen["kv_lens"][0], "rope": gen["ropes"][0], "height": height, "width": width}
+            require(
+                rebuilt == conditions.layouts[0],
+                "BagelDiffusionStage: rollout and replay built different token layouts for this sample: "
+                f"worker {conditions.layouts[0]}, trainer {rebuilt}.",
+            )
         return gen, cfg_text, cfg_img, image_shape
 
     def _build_generation_inputs(
@@ -663,6 +663,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
             device=device,
         )
         forward_kwargs = self._forward_kwargs(gen, cfg_text, cfg_img, gi, gi_cfg_text, gi_cfg_img, params)
+        num_tokens = gi["packed_vae_token_indexes"].numel()
 
         log_probs: List[torch.Tensor] = []
         prev_sample_means: List[torch.Tensor] = []
@@ -671,8 +672,8 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
                 t_cur = schedule[step_idx]
                 t_next = schedule[step_idx + 1]
                 cfg_text_scale, cfg_img_scale = self._gated_cfg_scales(float(t_cur.item()), params)
-                x_t = segment.latents_at(step_idx)[0].to(device)
-                prev_sample = segment.latents_at(step_idx + 1)[0].to(device)
+                x_t = segment.latents_at(step_idx)[0][:num_tokens].to(device)
+                prev_sample = segment.latents_at(step_idx + 1)[0][:num_tokens].to(device)
                 _, log_prob, prev_mean = self.step.step_with_logp(
                     bagel,
                     self.strategy,
@@ -737,6 +738,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         sample = sample.to(device)
         if sample.dim() == 3:
             sample = sample[0]
+        sample = sample[: forward_kwargs["packed_vae_token_indexes"].numel()]
         with self._autocast_ctx(device):
             return self.step.predict_velocity(
                 bagel,

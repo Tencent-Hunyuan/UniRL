@@ -465,7 +465,7 @@ class WAN22DiffusionStage(DiffusionStage[WAN21Conditions]):
             sigma,
             conditions,
             guidance_scale=float(params.guidance_scale),
-            guidance_scale_2=getattr(params, "guidance_scale_2", None),
+            guidance_scale_2=params.guidance_scale_2,
         )
 
     def trainable_module(self) -> "torch.nn.Module":

@@ -24,8 +24,7 @@ from unirl.types.sampling import DiffusionSamplingParams
 
 def _negative_prompt_from_params(diff_params: Any, *, default: str) -> str:
     """Read an engine negative prompt from the typed params' extension bag."""
-    sampler_kwargs = dict(getattr(diff_params, "sampler_kwargs", {}) or {})
-    value = sampler_kwargs.get("negative_prompt")
+    value = diff_params.sampler_kwargs.get("negative_prompt")
     return default if value is None else str(value)
 
 
@@ -33,7 +32,7 @@ def _grouped_texts_from_sample(sample: Sample, *, caller: str) -> tuple[List[str
     """Collapse a Sample's complete contiguous diffusion groups to engine prompts."""
     gen_part = sample.frontier_gen_part(DiffusionSamplingParams)
     diff_params = gen_part.sampling_params
-    spp = int(getattr(diff_params, "samples_per_prompt", 1) or 1)
+    spp = int(diff_params.samples_per_prompt)
     if spp < 1:
         raise ValueError(f"{caller}: samples_per_prompt must be >= 1, got {spp}")
 
@@ -91,10 +90,10 @@ class DitInputAdapter:
         diff_params = gen_part.sampling_params
 
         diff_kwargs = core_diff_kwargs(diff_params)
-        max_seq_len = getattr(diff_params, "max_sequence_length", None)
+        max_seq_len = diff_params.max_sequence_length
         if max_seq_len is not None:
             diff_kwargs["max_sequence_length"] = int(max_seq_len)
-        seed = getattr(diff_params, "seed", None)
+        seed = diff_params.seed
         if seed is not None:
             diff_kwargs["seed"] = int(seed)
 

@@ -128,13 +128,13 @@ class RLHunyuanImage3Pipeline(HunyuanImage3Pipeline):
 
     def _arm_sde(self, req: OmniDiffusionRequest) -> None:
         """This request's SDE strength + sparse step gate."""
-        eta = float(getattr(req.sampling_params, "eta", 0.0) or 0.0)
-        extra = getattr(req.sampling_params, "extra_args", None) or {}
+        eta = float(req.sampling_params.eta)
+        extra = req.sampling_params.extra_args
         self.scheduler.arm(eta=eta, sde_indices=extra.get("sde_indices"))
 
     def _arm_initial_noise(self, req: OmniDiffusionRequest) -> None:
         """This request's x_T RECIPE (seed + per-sample gids, no shape — AR-dynamic; the injector fills it later)."""
-        extra = getattr(req.sampling_params, "extra_args", None) or {}
+        extra = req.sampling_params.extra_args
         gids = extra.get("init_noise_group_ids")
         self._pending_initial_noise_recipe = (
             NoiseRecipe(noise_group_ids=[str(g) for g in gids], base_seed=int(extra.get("init_noise_seed", 0)))

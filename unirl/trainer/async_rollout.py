@@ -13,11 +13,11 @@ from unirl.rollout.manager import (
     validate_worker_inflight,
 )
 from unirl.trainer.base import unwrap_replicated_int
+from unirl.types.sample import Sample
 from unirl.types.sampling import total_samples_per_prompt
 
 if TYPE_CHECKING:
     from unirl.rollout.manager import RolloutSnapshot
-    from unirl.types.sample import Sample
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +40,6 @@ def resolve_separate_worker_concurrency(
     rollout_concurrency = (
         required_worker_concurrency(per_worker_inflight) if configured_concurrency is None else configured_concurrency
     )
-    engine_concurrency = None if engine_concurrency is None else int(engine_concurrency)
     validate_worker_inflight(
         per_worker_inflight,
         worker_max_concurrency=rollout_concurrency,
@@ -52,48 +51,6 @@ def resolve_separate_worker_concurrency(
         else rollout_concurrency
     )
     return train_devices, worker_concurrency
-
-
-def next_hard_boundary(
-    trained_batches: int,
-    *,
-    num_rollouts: int,
-    eval_interval: int = 0,
-    save_interval: int = 0,
-) -> int:
-    boundary = num_rollouts
-    for interval in (eval_interval, save_interval):
-        if interval > 0 and trained_batches < num_rollouts:
-            boundary = min(boundary, ((trained_batches // interval) + 1) * interval)
-    return boundary
-
-
-def _admission_headrooms(
-    *,
-    outstanding_prompts: int,
-    max_inflight_prompts: int,
-    batch_size: int,
-    trained_batches: int,
-    hard_boundary: int,
-    batches_since_sync: int,
-    max_staleness_batches: int,
-) -> tuple[int, int, int]:
-    """Capacity, freshness, and hard-boundary headroom in prompts, each non-negative."""
-    if outstanding_prompts % batch_size:
-        raise RuntimeError(
-            f"outstanding prompt count must stay batch-aligned to {batch_size}; got {outstanding_prompts}"
-        )
-    # A newly launched prompt uses the currently published weights. It may be
-    # consumed now (lag=batches_since_sync), then one batch later, and so on.
-    # Keep enough horizon for cross-publication carry when the configured lag
-    # budget permits it; unlike a sync boundary, eval/save/final remain hard.
-    freshness_batches = max(0, max_staleness_batches - batches_since_sync + 1)
-    remaining_batches = max(0, hard_boundary - trained_batches)
-    return (
-        max(0, max_inflight_prompts - outstanding_prompts),
-        max(0, freshness_batches * batch_size - outstanding_prompts),
-        max(0, remaining_batches * batch_size - outstanding_prompts),
-    )
 
 
 def _rollout_manager_metrics(
@@ -119,72 +76,18 @@ def _rollout_manager_metrics(
     return {f"async/{phase}_{key}": value for key, value in metrics.items()}
 
 
-def rollout_version_metrics(
-    *,
-    train_version: int,
-    output_version: int,
-    num_updates_per_batch: int,
-) -> dict[str, float]:
-    staleness = train_version - output_version
-    if staleness < 0:
-        raise ValueError(f"rollout batch has future output version {output_version} > train version {train_version}")
-    return {
-        "async/output_version": output_version,
-        "async/staleness_updates": staleness,
-        "async/staleness_batches": staleness / num_updates_per_batch,
-    }
-
-
-def training_version_metrics(
-    *,
-    train_version: int,
-    published_version: int,
-    optimizer_updates: int,
-    batches_since_sync: int,
-) -> dict[str, int]:
-    return {
-        "async/train_version": train_version,
-        "async/published_version": published_version,
-        "async/publish_lag": train_version - published_version,
-        "async/optimizer_updates": optimizer_updates,
-        "async/batches_since_sync": batches_since_sync,
-    }
-
-
-def combine_rollout_prompts(groups: List[List["Sample"]]) -> Tuple["Sample", int]:
-    """Combine dynamically completed prompt trees from one behavior-policy version."""
-    chunks = [sample for group in groups for sample in group]
-    if not chunks:
-        raise ValueError("cannot combine an empty rollout result")
-
-    from unirl.types.sample import Sample
-
-    combined = Sample.concat(chunks)
-    versions = {part.output_version for part in combined.gen_parts()}
-    if len(versions) != 1 or None in versions:
-        raise RuntimeError(f"rollout batch needs one output_version across its generated parts; got {versions}")
-    return combined, next(iter(versions))
-
-
 class AsyncRolloutTrainerMixin:
     """One async batch loop shared by ``AsyncARTrainer`` and ``AsyncDiffusionTrainer``."""
+
+    _refill_before_score = False
 
     def _async_wandb_extra(self) -> Dict[str, object]:
         """Trainer-specific keys merged into the wandb run config."""
         return {}
 
-    def _refill_before_score(self) -> bool:
-        """Whether replacement rollout work may start before reward scoring."""
-        return False
-
     def _boundary_evaluate(self, rollout_id: int, *, initial: bool) -> None:
         """Run the trainer's evaluation at a synced, empty rollout boundary."""
         raise NotImplementedError
-
-    def _score_completed(self, rollout_id: int, completed: "Sample") -> "Sample":
-        scored = self.reward.score_and_attach(completed)
-        self._drop_decoded(scored, rollout_id=rollout_id)
-        return scored
 
     def _train_async_loop(
         self,
@@ -209,7 +112,7 @@ class AsyncRolloutTrainerMixin:
             num_rollouts=num_rollouts,
             extra={
                 "max_inflight": self._max_inflight,
-                "max_inflight_prompts": self._max_inflight_prompts,
+                "max_inflight_prompts": self._max_inflight * self.batch_size,
                 "per_worker_inflight": self._per_worker_inflight,
                 "weight_sync_interval": self._weight_sync_interval,
                 "max_staleness": self._max_staleness,
@@ -235,34 +138,48 @@ class AsyncRolloutTrainerMixin:
         if self.eval_interval > 0:
             self._boundary_evaluate(start_rollout, initial=True)
 
+        ar_sampling = self.sampling_params.get("ar")
+        trunc_len = ar_sampling.max_new_tokens if ar_sampling is not None else None
         try:
             for rollout_id in range(start_rollout, num_rollouts):
                 t0 = time.perf_counter()
                 self._admitted_prompts_delta = 0
                 self._carry_resubmitted_prompts_delta = 0
                 self._rollout_metrics: Dict[str, Optional[float]] = {}
-                hard_boundary = next_hard_boundary(
-                    rollout_id,
-                    num_rollouts=num_rollouts,
-                    eval_interval=self.eval_interval,
-                    save_interval=save_interval,
-                )
+                hard_boundary = num_rollouts
+                for interval in (self.eval_interval, save_interval):
+                    if interval > 0:
+                        hard_boundary = min(hard_boundary, ((rollout_id // interval) + 1) * interval)
                 sample, output_version = self._next_rollout_batch(
                     rollout_id,
                     hard_boundary=hard_boundary,
                 )
+                staleness = self._train_version - output_version
                 training_progress = rollout_id / max(1, num_rollouts - 1)
-                result, mean_reward = self._advantage_and_train(
+                sample, result, mean_reward = self._advantage_and_train(
                     sample,
                     training_progress=training_progress,
                     rollout_id=rollout_id,
-                    t0=t0,
-                    extra_metrics=rollout_version_metrics(
-                        train_version=self._train_version,
-                        output_version=output_version,
-                        num_updates_per_batch=self._num_updates_per_batch,
-                    ),
                 )
+                self._train_version += result.optimizer_updates
+                self._batches_since_sync += 1
+                self.wandb_logger.log_rollout_step(
+                    rollout_id,
+                    result,
+                    sample,
+                    step_time_s=time.perf_counter() - t0,
+                    trunc_len=trunc_len,
+                    extra_metrics={
+                        "async/output_version": output_version,
+                        "async/staleness_updates": staleness,
+                        "async/train_version": self._train_version,
+                        "async/published_version": self._rollout_manager.published_version,
+                        "async/publish_lag": self._train_version - self._rollout_manager.published_version,
+                        "async/optimizer_updates": result.optimizer_updates,
+                        "async/batches_since_sync": self._batches_since_sync,
+                    },
+                )
+                self._reset_transport_buffers()
                 if self.wandb_logger.enabled:
                     self._rollout_metrics.update(
                         _rollout_manager_metrics(
@@ -371,7 +288,7 @@ class AsyncRolloutTrainerMixin:
         rollout_id: int,
         *,
         hard_boundary: int,
-    ) -> Tuple["Sample", int]:
+    ) -> Tuple[Sample, int]:
         self._admit_prompts(
             phase="collect",
             trained_batches=rollout_id,
@@ -379,28 +296,39 @@ class AsyncRolloutTrainerMixin:
             batches_since_sync=self._batches_since_sync,
         )
 
-        manager = self._rollout_manager
-        groups = manager.collect(
+        groups = self._rollout_manager.collect(
             self.batch_size,
             current_version=self._train_version,
         )
-        completed, output_version = combine_rollout_prompts(groups)
-
-        scored = None
-        if not self._refill_before_score():
-            scored = self._score_completed(rollout_id, completed)
+        chunks = [sample for group in groups for sample in group]
+        if not chunks:
+            raise ValueError("cannot combine an empty rollout result")
+        completed = Sample.concat(chunks)
+        versions = {part.output_version for part in completed.gen_parts()}
+        if len(versions) != 1 or None in versions:
+            raise RuntimeError(f"rollout batch needs one output_version across its generated parts; got {versions}")
+        output_version = next(iter(versions))
 
         # Consuming a batch releases capacity immediately. Refill before reward
-        # for AR and before training for trainers that require reap-time scoring.
-        self._admit_prompts(
-            phase="refill",
-            trained_batches=rollout_id + 1,
-            hard_boundary=hard_boundary,
-            batches_since_sync=self._batches_since_sync + 1,
-        )
+        # for AR and after scoring for trainers that require reap-time scoring.
+        if self._refill_before_score:
+            self._admit_prompts(
+                phase="refill",
+                trained_batches=rollout_id + 1,
+                hard_boundary=hard_boundary,
+                batches_since_sync=self._batches_since_sync + 1,
+            )
 
-        if scored is None:
-            scored = self._score_completed(rollout_id, completed)
+        scored = self.reward.score_and_attach(completed)
+        self._drop_decoded(scored, rollout_id=rollout_id)
+
+        if not self._refill_before_score:
+            self._admit_prompts(
+                phase="refill",
+                trained_batches=rollout_id + 1,
+                hard_boundary=hard_boundary,
+                batches_since_sync=self._batches_since_sync + 1,
+            )
 
         return scored, output_version
 
@@ -413,31 +341,24 @@ class AsyncRolloutTrainerMixin:
         batches_since_sync: int,
     ) -> None:
         inflight_count, ready_count = self._rollout_manager.counts
-        headrooms = _admission_headrooms(
-            outstanding_prompts=inflight_count + ready_count,
-            max_inflight_prompts=self._max_inflight_prompts,
-            batch_size=self.batch_size,
-            trained_batches=trained_batches,
-            hard_boundary=hard_boundary,
-            batches_since_sync=batches_since_sync,
-            max_staleness_batches=self._max_staleness,
-        )
-        prompts = min(headrooms)
-        self._submit_prompts(prompts)
-        if self.wandb_logger.enabled:
-            self._rollout_metrics.update(
-                {
-                    f"async/admission_{phase}_capacity_headroom_prompts": headrooms[0],
-                    f"async/admission_{phase}_freshness_headroom_prompts": headrooms[1],
-                    f"async/admission_{phase}_boundary_headroom_prompts": headrooms[2],
-                }
-            )
-
-    def _submit_prompts(self, count: int) -> None:
-        batch_count, remainder = divmod(count, self.batch_size)
+        outstanding_prompts = inflight_count + ready_count
+        outstanding_batches, remainder = divmod(outstanding_prompts, self.batch_size)
         if remainder:
-            raise RuntimeError(f"prompt admission must submit whole batches of {self.batch_size}; got {count} prompts")
-        for _ in range(batch_count):
+            raise RuntimeError(
+                f"outstanding prompt count must stay batch-aligned to {self.batch_size}; got {outstanding_prompts}"
+            )
+        # A newly launched prompt uses the currently published weights. It may be
+        # consumed now (lag=batches_since_sync), then one batch later, and so on.
+        # Keep enough horizon for cross-publication carry when the configured lag
+        # budget permits it; unlike a sync boundary, eval/save/final remain hard.
+        freshness_batches = max(0, self._max_staleness - batches_since_sync + 1)
+        remaining_batches = max(0, hard_boundary - trained_batches)
+        headrooms = (
+            max(0, self._max_inflight - outstanding_batches) * self.batch_size,
+            max(0, freshness_batches - outstanding_batches) * self.batch_size,
+            max(0, remaining_batches - outstanding_batches) * self.batch_size,
+        )
+        for _ in range(min(headrooms) // self.batch_size):
             request = self._build_request_sample(
                 self.data_source.get_samples(self.batch_size),
                 self._next_generation_id,
@@ -448,13 +369,17 @@ class AsyncRolloutTrainerMixin:
                 raise RuntimeError(f"request batch split into {len(prompts)} prompts; expected {self.batch_size}")
             self._rollout_manager.submit(prompts)
             self._admitted_prompts_delta += len(prompts)
+        if self.wandb_logger.enabled:
+            self._rollout_metrics.update(
+                {
+                    f"async/admission_{phase}_capacity_headroom_prompts": headrooms[0],
+                    f"async/admission_{phase}_freshness_headroom_prompts": headrooms[1],
+                    f"async/admission_{phase}_boundary_headroom_prompts": headrooms[2],
+                }
+            )
 
 
 __all__ = [
     "AsyncRolloutTrainerMixin",
-    "combine_rollout_prompts",
-    "next_hard_boundary",
     "resolve_separate_worker_concurrency",
-    "rollout_version_metrics",
-    "training_version_metrics",
 ]

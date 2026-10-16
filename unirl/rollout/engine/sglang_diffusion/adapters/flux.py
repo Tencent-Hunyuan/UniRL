@@ -55,14 +55,14 @@ class Flux2KleinAdapter(ImageAdapter):
                 f"got {len(text_turns)} text, {len(image_batches)} image."
             )
         gen_part = sample.frontier_gen_part(DiffusionSamplingParams)
-        prompts = list(text_turns[0].texts)
-        unique_prompts, k = utils.deexpand_prompts_from_groups(prompts, list(gen_part.group_ids))
+        prompts = text_turns[0].texts
+        unique_prompts, k = utils.deexpand_prompts_from_groups(prompts, gen_part.group_ids)
         pil_images = image_batches[0].to_pils()
-        unique_pils = utils.first_per_group(pil_images, list(gen_part.group_ids)) if k > 1 else pil_images
+        unique_pils = utils.first_per_group(pil_images, gen_part.group_ids) if k > 1 else pil_images
         unique_pils = resize_condition_pils(
             unique_pils,
-            height=int(gen_part.sampling_params.height),
-            width=int(gen_part.sampling_params.width),
+            height=gen_part.sampling_params.height,
+            width=gen_part.sampling_params.width,
         )
         out: Dict[str, Any] = {
             "prompt": unique_prompts if len(unique_prompts) > 1 else unique_prompts[0],
@@ -88,7 +88,7 @@ class Flux2KleinAdapter(ImageAdapter):
         """Concat a per-result single-tensor conditions field over dim 0."""
         tensors: List[torch.Tensor] = []
         for r in results:
-            value = getattr(r, name, None)
+            value = getattr(r, name)
             if not value:
                 continue
             tensors.append(value[0])
