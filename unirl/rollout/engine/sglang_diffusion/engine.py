@@ -82,14 +82,14 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
         )
         self._backend = SGLangBackend.boot(
             intent,
-            local_mode=bool(config.local_mode),
+            local_mode=config.local_mode,
         )
 
         self._weight_sync = WeightSync(
             self._backend,
             pipeline_prefix=pipeline_prefix,
             target_modules=target_modules,
-            uses_lora=bool(model_config.use_lora),
+            uses_lora=model_config.use_lora,
         )
 
         self.schedule_policy = self.adapter.schedule_policy()
@@ -103,9 +103,6 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
     def generate(self, sample: Sample) -> Sample:
         """Generate one whole DP shard synchronously."""
-        return self._generate_locked(sample)
-
-    def _generate_locked(self, sample: Sample) -> Sample:
         with self._generate_lock:
             if self._shutdown_requested:
                 raise RuntimeError("SGLangDiffusionRolloutEngine.generate called after shutdown")
@@ -116,13 +113,13 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
         sample.reject_row_canvases(engine="SGLangDiffusionRolloutEngine")
         gen = sample.frontier_gen_part(DiffusionSamplingParams)
         require(
-            int(gen.batch_size) > 0,
+            gen.batch_size > 0,
             "SGLangDiffusionRolloutEngine.generate requires a non-empty Sample (gen batch_size > 0)",
         )
-        self._ensure_sample_sigmas(sample)
+        ensure_sample_sigmas(sample, self.schedule_policy)
 
         fbs = self.cfg.forward_batch_size
-        bs = int(gen.batch_size)
+        bs = gen.batch_size
         if fbs is None or bs <= fbs:
             return self._generate_batch(sample)
 
@@ -133,10 +130,6 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
             gen_chunks.append(chunk.frontier_gen_part(DiffusionSamplingParams))
             torch.cuda.empty_cache()
         return sample.replace_frontier(Part.concat(gen_chunks))
-
-    def _ensure_sample_sigmas(self, sample: Sample) -> None:
-        """Pin the σ schedule onto the gen part's ``DiffusionSamplingParams.sigmas``."""
-        ensure_sample_sigmas(sample, self.schedule_policy)
 
     def _generate_batch(self, sample: Sample) -> Sample:
         initial_noise = self._resolve_initial_noise(sample)
@@ -154,18 +147,18 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
         xt = recipe.resolve()
         if xt is not None:
             return xt
-        if not bool(self.cfg.init_same_noise):
+        if not self.cfg.init_same_noise:
             return None
 
         require(
             diffusion.seed is not None,
             "init_same_noise=True requires a diffusion seed",
         )
-        batch_size = int(gen.batch_size)
+        batch_size = gen.batch_size
         latent_shape = self._backend.prepare_latent_shape(
-            height=int(diffusion.height),
-            width=int(diffusion.width),
-            num_frames=int(diffusion.num_frames),
+            height=diffusion.height,
+            width=diffusion.width,
+            num_frames=diffusion.num_frames,
             batch_size=batch_size,
         )
         dtype = parse_torch_dtype(diffusion.autocast_precision, field_name="autocast_precision")
@@ -175,9 +168,9 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
             device=self._device,
             dtype=dtype,
             init_same_noise=True,
-            samples_per_prompt=int(diffusion.samples_per_prompt),
-            noise_group_ids=[str(g) for g in gen.group_ids],
-            base_seed=int(diffusion.seed),
+            samples_per_prompt=diffusion.samples_per_prompt,
+            noise_group_ids=list(gen.group_ids),
+            base_seed=diffusion.seed,
         )
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
@@ -201,10 +194,6 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
     def is_offloaded(self) -> bool:
         return self._is_offloaded
 
-    def onload_weights(self, *, track_prefix: str = "") -> None:
-        del track_prefix
-        self.wake_up()
-
     def health_check(self) -> bool:
         return self._backend.ping()
 
@@ -214,7 +203,6 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
                 return
             with self._generate_lock:
                 self._shutdown_requested = True
-            with self._generate_lock:
                 self._backend.shutdown()
             self._shutdown_complete = True
 

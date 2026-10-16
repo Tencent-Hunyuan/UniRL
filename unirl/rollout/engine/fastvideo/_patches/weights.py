@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict
 
 import torch
 
@@ -18,31 +18,12 @@ def _strip_training_prefix(name: str) -> str:
     return name
 
 
-def _offloaded_blocks(module: Any) -> List[Tuple[str, Any, Any]]:
-    """Return ``(prefix, child, hook)`` for every layerwise-offloaded block, outermost first."""
-    try:
-        from fastvideo.hooks.hooks import ModuleHookManager
-    except ImportError:
-        return []
-
-    blocks: List[Tuple[str, Any, Any]] = []
-    for module_name, child in module.named_modules():
-        manager = ModuleHookManager.get_from(child)
-        if manager is None:
-            continue
-        hook = manager.get_forward_hook("LayerwiseOffloadHook")
-        if hook is None:
-            continue
-        blocks.append((f"{module_name}." if module_name else "", child, hook))
-    return blocks
-
-
 def _copy_into(targets: Dict[str, torch.Tensor], mapped: Dict[str, torch.Tensor], *, label: str) -> set[str]:
     """Copy ``mapped`` into the given already-materialized target tensors."""
     loaded: set[str] = set()
     for name, target in targets.items():
         source = mapped[name]
-        if tuple(source.shape) != tuple(target.shape):
+        if source.shape != target.shape:
             raise RuntimeError(
                 f"FastVideo {label} shape mismatch for {name}: "
                 f"source={tuple(source.shape)} target={tuple(target.shape)}"
@@ -56,6 +37,8 @@ def _copy_into(targets: Dict[str, torch.Tensor], mapped: Dict[str, torch.Tensor]
 
 def _load_transformer_state(module: Any, state_dict: Dict[str, torch.Tensor], *, label: str) -> Dict[str, Any]:
     """Copy a full state dict into one FastVideo transformer, failing closed on any key or shape drift."""
+    from fastvideo.hooks.hooks import ModuleHookManager
+
     target_state = module.state_dict()
     prepared = {str(name): tensor for name, tensor in state_dict.items() if torch.is_tensor(tensor)}
     if not prepared:
@@ -82,9 +65,15 @@ def _load_transformer_state(module: Any, state_dict: Dict[str, torch.Tensor], *,
 
     loaded: set[str] = set()
     with torch.no_grad():
-        offloaded = _offloaded_blocks(module)
         claimed: set[str] = set()
-        for prefix, child, hook in offloaded:
+        for module_name, child in module.named_modules():
+            manager = ModuleHookManager.get_from(child)
+            if manager is None:
+                continue
+            hook = manager.get_forward_hook("LayerwiseOffloadHook")
+            if hook is None:
+                continue
+            prefix = f"{module_name}." if module_name else ""
             names = {f"{prefix}{n}" for n, _ in child.named_parameters()} & matched
             claimed |= names
             if not names:
@@ -106,21 +95,6 @@ def _load_transformer_state(module: Any, state_dict: Dict[str, torch.Tensor], *,
     return {"label": label, "loaded": len(matched), "target": len(target_names), "coverage": coverage}
 
 
-def _split_experts(stripped: Dict[str, torch.Tensor]) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
-    """Split a WAN 2.2 checkpoint into its boundary-routed high-noise and low-noise experts."""
-    high = {name[len("high_noise.") :]: t for name, t in stripped.items() if name.startswith("high_noise.")}
-    low = {name[len("low_noise.") :]: t for name, t in stripped.items() if name.startswith("low_noise.")}
-    unrelated = sorted(
-        set(stripped) - {f"high_noise.{n}" for n in high} - {f"low_noise.{n}" for n in low},
-    )
-    if not high or not low or unrelated:
-        raise RuntimeError(
-            "FastVideo dual-transformer update requires only high_noise.* and low_noise.* checkpoint keys: "
-            f"high={len(high)}, low={len(low)}, unrelated={unrelated[:10]}"
-        )
-    return high, low
-
-
 def _worker_update_transformer_weights(self, state_dict: Dict[str, torch.Tensor]) -> Dict[str, Any]:
     transformer = self.pipeline.modules.get("transformer")
     if transformer is None:
@@ -132,16 +106,25 @@ def _worker_update_transformer_weights(self, state_dict: Dict[str, torch.Tensor]
         result = _load_transformer_state(transformer, stripped, label="transformer")
         return {"status": "transformer_weights_updated", **result}
 
-    high, low = _split_experts(stripped)
+    high = {name[len("high_noise.") :]: t for name, t in stripped.items() if name.startswith("high_noise.")}
+    low = {name[len("low_noise.") :]: t for name, t in stripped.items() if name.startswith("low_noise.")}
+    unrelated = sorted(
+        set(stripped) - {f"high_noise.{n}" for n in high} - {f"low_noise.{n}" for n in low},
+    )
+    if not high or not low or unrelated:
+        raise RuntimeError(
+            "FastVideo dual-transformer update requires only high_noise.* and low_noise.* checkpoint keys: "
+            f"high={len(high)}, low={len(low)}, unrelated={unrelated[:10]}"
+        )
     results = [
         _load_transformer_state(transformer, high, label="transformer/high_noise"),
         _load_transformer_state(transformer_2, low, label="transformer_2/low_noise"),
     ]
     return {
         "status": "transformer_weights_updated",
-        "loaded": sum(int(r["loaded"]) for r in results),
-        "target": sum(int(r["target"]) for r in results),
-        "coverage": min(float(r["coverage"]) for r in results),
+        "loaded": sum(r["loaded"] for r in results),
+        "target": sum(r["target"] for r in results),
+        "coverage": min(r["coverage"] for r in results),
         "modules": results,
     }
 
@@ -155,17 +138,6 @@ def _worker_update_transformer_weights_from_path(self, checkpoint_path: str) -> 
         return _worker_update_transformer_weights(self, state_dict)
     finally:
         del state_dict
-
-
-def _check_responses(responses: Any, world_size: int) -> None:
-    """Fail closed unless every worker reported a complete load."""
-    if len(responses) != int(world_size):
-        raise RuntimeError(f"FastVideo weight update returned {len(responses)} responses for world_size={world_size}")
-    for rank, response in enumerate(responses):
-        if not isinstance(response, dict) or response.get("status") != "transformer_weights_updated":
-            raise RuntimeError(f"FastVideo worker {rank} weight update failed: {response!r}")
-        if float(response.get("coverage", 0.0)) < _MIN_COVERAGE:
-            raise RuntimeError(f"FastVideo worker {rank} reported incomplete weight coverage: {response!r}")
 
 
 def patch_weights() -> None:
@@ -185,7 +157,15 @@ def patch_weights() -> None:
             "update_transformer_weights_from_path",
             kwargs={"checkpoint_path": checkpoint_path},
         )
-        _check_responses(responses, self.world_size)
+        if len(responses) != self.world_size:
+            raise RuntimeError(
+                f"FastVideo weight update returned {len(responses)} responses for world_size={self.world_size}"
+            )
+        for rank, response in enumerate(responses):
+            if not isinstance(response, dict) or response.get("status") != "transformer_weights_updated":
+                raise RuntimeError(f"FastVideo worker {rank} weight update failed: {response!r}")
+            if float(response.get("coverage", 0.0)) < _MIN_COVERAGE:
+                raise RuntimeError(f"FastVideo worker {rank} reported incomplete weight coverage: {response!r}")
 
     MultiprocExecutor.update_transformer_weights_from_path = executor_update_from_path
 

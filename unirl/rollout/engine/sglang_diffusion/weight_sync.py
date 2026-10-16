@@ -96,11 +96,11 @@ class WeightSync:
     ) -> None:
         self._backend.init_weights_group(
             master_address=master_address,
-            master_port=int(master_port),
-            rank_offset=int(rank_offset),
-            world_size=int(world_size),
-            group_name=str(group_name),
-            backend=str(backend),
+            master_port=master_port,
+            rank_offset=rank_offset,
+            world_size=world_size,
+            group_name=group_name,
+            backend=backend,
         )
 
     def update_weights_from_distributed(
@@ -121,10 +121,10 @@ class WeightSync:
             operation="distributed weight update",
         )
         self._backend.update_from_distributed(
-            names=list(names),
-            dtypes=list(dtypes),
-            shapes=[list(shape) for shape in shapes],
-            group_name=str(group_name),
+            names=names,
+            dtypes=dtypes,
+            shapes=shapes,
+            group_name=group_name,
             target_modules=update_targets,
             flush_cache=flush_cache,
         )
@@ -151,7 +151,7 @@ class WeightSync:
         return targets
 
     def destroy_weights_update_group(self, *, group_name: str) -> None:
-        self._backend.destroy_weights_group(group_name=str(group_name))
+        self._backend.destroy_weights_group(group_name=group_name)
 
     def set_lora_from_tensors(
         self,
