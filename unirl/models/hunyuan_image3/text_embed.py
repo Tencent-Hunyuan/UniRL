@@ -15,15 +15,6 @@ from .compat import repair_hi3_tokenizer_backend
 from .conditions import HunyuanImage3FusedMultimodalCondition
 
 
-def _optional_output_tensor(output: Any, names: Tuple[str, ...], device: torch.device) -> Optional[torch.Tensor]:
-    """First non-None attribute of ``output`` among ``names``, moved to ``device``."""
-    for name in names:
-        t = getattr(output, name, None)
-        if t is not None:
-            return t.to(device)
-    return None
-
-
 class HunyuanImage3TextEmbedStage:
     """HunyuanImage3 chat-template-driven input-prep stage (AR + diffusion)."""
 
@@ -126,8 +117,10 @@ class HunyuanImage3TextEmbedStage:
         input_ids: torch.Tensor = output.tokens.to(device)
         n, seq_len = input_ids.shape
 
+        upstream_mod = sys.modules[type(transformer).__module__]
+        to_device = upstream_mod.to_device
         rope_image_info = transformer.build_batch_rope_image_info(output, sections)
-        cos, sin = sys.modules[type(transformer).__module__].build_batch_2d_rope(
+        cos, sin = upstream_mod.build_batch_2d_rope(
             image_infos=rope_image_info,
             seq_len=seq_len if rope_seq_len is None else rope_seq_len,
             n_elem=config.attention_head_dim,
@@ -143,20 +136,24 @@ class HunyuanImage3TextEmbedStage:
             model_kwargs={"tokenizer_output": output},
         ).to(device)
 
+        vae_mask = getattr(output, "vae_image_mask", None)
+        vit_mask = getattr(output, "vit_image_mask", None)
         return HunyuanImage3FusedMultimodalCondition(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
             # Stack RoPE so it travels as a per-sample CONCAT tensor.
             rope_cache=torch.stack([cos, sin], dim=1),
-            gen_image_mask=None if gen_image_mask is None else gen_image_mask.to(device),
-            gen_timestep_scatter_index=(
-                None if gen_timestep_scatter_index is None else gen_timestep_scatter_index.to(device)
+            gen_image_mask=to_device(gen_image_mask, device),
+            gen_timestep_scatter_index=to_device(gen_timestep_scatter_index, device),
+            cond_vae_image_mask=to_device(
+                getattr(output, "cond_vae_image_mask", None) if vae_mask is None else vae_mask, device
             ),
-            cond_vae_image_mask=_optional_output_tensor(output, ("cond_vae_image_mask", "vae_image_mask"), device),
-            cond_vit_image_mask=_optional_output_tensor(output, ("cond_vit_image_mask", "vit_image_mask"), device),
-            cond_timestep_scatter_index=_optional_output_tensor(output, ("cond_timestep_scatter_index",), device),
-            prompt_lengths=None if prompt_lengths is None else prompt_lengths.to(device),
+            cond_vit_image_mask=to_device(
+                getattr(output, "cond_vit_image_mask", None) if vit_mask is None else vit_mask, device
+            ),
+            cond_timestep_scatter_index=to_device(output.cond_timestep_scatter_index, device),
+            prompt_lengths=to_device(prompt_lengths, device),
         )
 
     def embed_for_ar(
