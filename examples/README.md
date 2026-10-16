@@ -48,7 +48,7 @@ Defaults disable FSDP CPU offload and use learning rate `1e-5`, two images per p
 256×256 images, four denoising steps, and two SDE steps. These short trajectories
 check integration; evaluate image quality and convergence with a longer run.
 Set `QWEN_IMAGE_PATH` to the full checkpoint and use a vLLM-Omni checkout with
-the diffusion IPC apply strategy. The full checkpoint requires sufficient training
+upstream layerwise reload enabled for Qwen-Image. The full checkpoint requires sufficient training
 GPU memory; diffusion sleep level 1 requires host RAM for rollout weight backups.
 
 For two colocated GPUs, use

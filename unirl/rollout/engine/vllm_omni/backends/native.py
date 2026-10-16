@@ -574,6 +574,7 @@ class VLLMOmniBackend:
     def poison_native_weight_transfer(self, reason: str = "") -> None:
         logger.error("Poisoning vLLM-Omni native IPC runtime: %s", reason or "unspecified failure")
         self._pending_native_publication = None
+        self.shutdown()
 
     def ping(self) -> bool:
         omni = self._omni

@@ -66,7 +66,8 @@ matching receiver on the engine side (`../../rollout/engine/`).
   `VLLMOmniRolloutEngine.rank_local_weight_transfer` selects a TP1 receiver on
   each training rank's GPU. All training ranks gather FSDP weights and IPC
   handles, then each publishes to its local engine and waits for its update RPCs.
-  A failed publication stops every rank before advancing the version. Shared
+  A failed publication stops every rank before advancing the version and closes
+  the affected Omni runtimes; recreate them before generating again. Shared
   vLLM TP receivers retain a single rank-zero publisher.
 
 - **Native Omni IPC targets one reload-enabled diffusion stage using upstream layerwise reload.**
