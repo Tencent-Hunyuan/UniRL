@@ -43,8 +43,7 @@ class ImageAdapter(ModelAdapter):
 
         require(
             diffusion.sigmas is not None,
-            "build_inputs: diffusion.sigmas must be pinned by the engine before "
-            "conversion (see SGLangDiffusionRolloutEngine._ensure_sample_sigmas).",
+            "build_inputs: diffusion.sigmas must be pinned by the engine before conversion (see ensure_sample_sigmas).",
         )
         require(
             int(diffusion.sigmas.shape[0]) == int(diffusion.num_inference_steps) + 1,

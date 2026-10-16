@@ -23,7 +23,6 @@ from unirl.sde.noise import _derive_group_seed
 from unirl.sde.runtime import FlowMatchSchedulePolicy, ensure_sample_sigmas
 from unirl.sde.unipc import UniPCSpec
 from unirl.types.conditions import TextEmbedCondition
-from unirl.types.noise_recipe import NoiseRecipe
 from unirl.types.primitives import Texts, Video, Videos
 from unirl.types.sample import Part, Sample
 from unirl.types.sampling import DiffusionSamplingParams
@@ -32,36 +31,36 @@ from unirl.types.segments.latent import make_video_segment
 logger = logging.getLogger(__name__)
 
 
-def _verify_checkpoint_unipc_spec(ckpt_path: str, spec: UniPCSpec) -> None:
-    """Fail closed unless the checkpoint's scheduler_config.json declares the model-owned UniPC solver spec."""
+def _load_checkpoint_json(ckpt_path: str, filename: str, *, context: str, target: str) -> tuple[Path, dict]:
+    """Resolve and parse ``filename`` from a local checkpoint directory or Hugging Face repo."""
     checkpoint = Path(ckpt_path).expanduser()
     if checkpoint.is_dir():
-        path = checkpoint / "scheduler" / "scheduler_config.json"
+        path = checkpoint / filename
     else:
         try:
             from huggingface_hub import hf_hub_download
 
-            path = Path(
-                hf_hub_download(
-                    repo_id=ckpt_path,
-                    filename="scheduler/scheduler_config.json",
-                )
-            )
+            path = Path(hf_hub_download(repo_id=ckpt_path, filename=filename))
         except Exception as exc:
             raise RuntimeError(
-                "FastVideo canonical UniPC cannot resolve "
-                f"{ckpt_path!r}/scheduler/scheduler_config.json as either a local "
+                f"{context} cannot resolve {ckpt_path!r}/{filename} as either a local "
                 "diffusers-layout checkpoint or a Hugging Face model repo."
             ) from exc
     try:
         with path.open("r", encoding="utf-8") as f:
-            declared_cfg = json.load(f)
+            return path, json.load(f)
     except (OSError, json.JSONDecodeError) as exc:
-        raise RuntimeError(
-            f"FastVideo canonical UniPC cannot verify model_config.unipc_* without {path}; "
-            "use a diffusers-layout local checkpoint or Hugging Face model repo containing "
-            "scheduler/scheduler_config.json."
-        ) from exc
+        raise RuntimeError(f"{context} cannot verify {target} without {path}") from exc
+
+
+def _verify_checkpoint_unipc_spec(ckpt_path: str, spec: UniPCSpec) -> None:
+    """Fail closed unless the checkpoint's scheduler_config.json declares the model-owned UniPC solver spec."""
+    path, declared_cfg = _load_checkpoint_json(
+        ckpt_path,
+        "scheduler/scheduler_config.json",
+        context="FastVideo canonical UniPC",
+        target="model_config.unipc_*",
+    )
     class_name = str(declared_cfg.get("_class_name", ""))
     if "UniPC" not in class_name:
         raise RuntimeError(
@@ -85,74 +84,6 @@ def _verify_checkpoint_unipc_spec(ckpt_path: str, spec: UniPCSpec) -> None:
             f"Checkpoint scheduler {path} declares {declared}, but model_config.unipc_* spells "
             f"{spec}; align model_config.unipc_* with the checkpoint scheduler{hint}."
         )
-
-
-def _model_timestep_scale(model_family: str) -> float:
-    """Return the declared WAN step-kernel timestep scale for ``model_family``."""
-    if model_family in {"wan2.2", "wan22"}:
-        from unirl.models.wan22.diffusion import WAN22DiffusionStep
-
-        return float(WAN22DiffusionStep.TIMESTEP_SCALE)
-    from unirl.models.wan21.diffusion import WAN21DiffusionStep
-
-    return float(WAN21DiffusionStep.TIMESTEP_SCALE)
-
-
-def _verify_dual_expert_checkpoint(ckpt_path: str) -> None:
-    """Fail closed unless the A14B checkpoint declares both boundary-routed transformers."""
-    checkpoint = Path(ckpt_path).expanduser()
-    if checkpoint.is_dir():
-        path = checkpoint / "model_index.json"
-    else:
-        try:
-            from huggingface_hub import hf_hub_download
-
-            path = Path(hf_hub_download(repo_id=ckpt_path, filename="model_index.json"))
-        except Exception as exc:
-            raise RuntimeError(
-                f"FastVideo WAN 2.2 cannot resolve {ckpt_path!r}/model_index.json as either a local "
-                "diffusers-layout checkpoint or a Hugging Face model repo."
-            ) from exc
-    try:
-        with path.open("r", encoding="utf-8") as f:
-            payload = json.load(f)
-    except (OSError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"FastVideo WAN 2.2 cannot verify the dual-expert layout without {path}") from exc
-    missing = [name for name in ("transformer", "transformer_2") if name not in payload]
-    if missing:
-        raise RuntimeError(
-            f"Checkpoint {path} lacks {missing}; the WAN 2.2 A14B rollout requires both boundary-routed experts."
-        )
-
-
-def _resolve_sde_window(raw_indices: Any, num_steps: int) -> List[int]:
-    """Return sorted SDE step indices; ``None`` → all-steps SDE here but no-SDE trainside (README Gotchas)."""
-    if raw_indices is None:
-        return list(range(int(num_steps)))
-    selected = sorted({int(i) for i in raw_indices})
-    bad = [i for i in selected if i < 0 or i >= int(num_steps)]
-    if bad:
-        raise ValueError(f"FastVideo SDE indices out of range for num_steps={num_steps}: {bad}")
-    return selected
-
-
-def verify_fastvideo_used_sigmas(
-    actual: Any,
-    *,
-    expected: torch.Tensor,
-    sample_index: int,
-) -> None:
-    """Verify FastVideo's echoed timesteps against the canonical sigma schedule."""
-    actual_with_terminal = actual
-    if actual is not None:
-        actual_t = actual.detach().cpu() if torch.is_tensor(actual) else torch.as_tensor(actual)
-        if actual_t.ndim == 1 and int(actual_t.shape[0]) == int(expected.shape[0]) - 1:
-            actual_with_terminal = torch.cat([actual_t, torch.zeros(1, dtype=actual_t.dtype)])
-    verify_engine_used_sigmas(
-        actual_with_terminal,
-        expected=expected,
-        engine_name=f"fastvideo sample {sample_index}",
-    )
 
 
 class FastVideoRolloutEngine(BaseRolloutEngine):
@@ -192,7 +123,14 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
             ports = FastVideoPorts.reserve()
         self._ports = ports
 
-        self._ensure_fastvideo_importable()
+        try:
+            importlib.import_module("fastvideo")
+        except ModuleNotFoundError:
+            fv_path = self.cfg.fastvideo_path or os.getenv("FASTVIDEO_PATH", "")
+            require(bool(fv_path), "fastvideo not importable; set cfg.fastvideo_path or $FASTVIDEO_PATH")
+            if fv_path not in sys.path:
+                sys.path.insert(0, str(Path(fv_path).expanduser()))
+            importlib.import_module("fastvideo")
         require(
             os.getenv("FASTVIDEO_WAN_SCHEDULER", "unipc").strip().lower() == "unipc",
             "FastVideo canonical rollout requires FASTVIDEO_WAN_SCHEDULER=unipc; "
@@ -215,9 +153,11 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
             "set the rollout node's `strategy:` in the recipe (a separate injection from pipeline.strategy)",
         )
         self._sde_type = str(strategy.canonical_name)
-        self._timestep_scale = _model_timestep_scale(config.model_family)
         self._is_dual_expert = config.model_family in {"wan2.2", "wan22"}
         if self._is_dual_expert:
+            from unirl.models.wan22.diffusion import WAN22DiffusionStep
+
+            self._timestep_scale = float(WAN22DiffusionStep.TIMESTEP_SCALE)
             boundary_ratio = float(model_config.boundary_ratio)
             require(
                 0.0 < boundary_ratio < 1.0,
@@ -231,7 +171,21 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
                 f"step kernel's TIMESTEP_SCALE ({self._timestep_scale:g})",
             )
             self._boundary_ratio = boundary_ratio
-            _verify_dual_expert_checkpoint(model_config.pretrained_model_ckpt_path)
+            idx_path, payload = _load_checkpoint_json(
+                model_config.pretrained_model_ckpt_path,
+                "model_index.json",
+                context="FastVideo WAN 2.2",
+                target="the dual-expert layout",
+            )
+            missing = [name for name in ("transformer", "transformer_2") if name not in payload]
+            if missing:
+                raise RuntimeError(
+                    f"Checkpoint {idx_path} lacks {missing}; the WAN 2.2 A14B rollout requires both boundary-routed experts."
+                )
+        else:
+            from unirl.models.wan21.diffusion import WAN21DiffusionStep
+
+            self._timestep_scale = float(WAN21DiffusionStep.TIMESTEP_SCALE)
         # Probe plan so unsupported kernels (cps/dpm2) fail at init, not per request.
         FastVideoUniPCPlan(
             sde_type=self._sde_type,
@@ -260,23 +214,9 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         self._shutdown_requested = False
         self._shutdown_complete = False
 
-    def _ensure_fastvideo_importable(self) -> None:
-        try:
-            importlib.import_module("fastvideo")
-            return
-        except ModuleNotFoundError:
-            pass
-        path = self.cfg.fastvideo_path or os.getenv("FASTVIDEO_PATH", "")
-        require(bool(path), "fastvideo not importable; set cfg.fastvideo_path or $FASTVIDEO_PATH")
-        if path not in sys.path:
-            sys.path.insert(0, str(Path(path).expanduser()))
-        importlib.import_module("fastvideo")
-
     def _build_generator(self) -> None:
-        from fastvideo import VideoGenerator
         from fastvideo.fastvideo_args import FastVideoArgs
 
-        ekw = dict(self.cfg.engine_kwargs)
         fv_kwargs: Dict[str, Any] = {
             "model_path": self.model_config.pretrained_model_ckpt_path,
             "num_gpus": int(self.cfg.num_gpus),
@@ -290,52 +230,52 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
             "vae_cpu_offload": False,
             "master_port": int(self._ports.master_port),
         }
-        fv_kwargs.update(ekw)
+        fv_kwargs.update(self.cfg.engine_kwargs)
         self._fastvideo_args = FastVideoArgs.from_kwargs(**fv_kwargs)
         if self._is_dual_expert:
-            self._align_dual_expert_args(self._fastvideo_args)
+            pipeline_config = self._fastvideo_args.pipeline_config
+            dit_config = pipeline_config.dit_config
+            require(dit_config is not None, "WAN 2.2 FastVideo pipeline has no dit_config")
+            require(
+                hasattr(dit_config, "boundary_ratio"),
+                "WAN 2.2 FastVideo requires a dual-expert pipeline config with dit_config.boundary_ratio",
+            )
+            pipeline_config.boundary_ratio = self._boundary_ratio
+            dit_config.boundary_ratio = self._boundary_ratio
         backend = str(self._fastvideo_args.distributed_executor_backend)
         require(
             backend == "mp",
             f"FastVideo canonical UniPC patches only reach 'mp' executor workers; got "
             f"distributed_executor_backend={backend!r} (Ray actors would run unpatched)",
         )
+        self._spawn_generator(reserve_first=False)
+
+    def _spawn_generator(self, *, reserve_first: bool) -> None:
+        """Spawn ``VideoGenerator`` from ``self._fastvideo_args``, retrying on master-port collisions."""
+        from fastvideo import VideoGenerator
+
         max_port_attempts = 5
         for attempt in range(1, max_port_attempts + 1):
+            if reserve_first or attempt > 1:
+                self._ports = FastVideoPorts.reserve()
+                self._fastvideo_args.master_port = int(self._ports.master_port)
             try:
                 self._generator = VideoGenerator.from_fastvideo_args(self._fastvideo_args)
-                break
+                return
             except Exception as exc:  # noqa: BLE001
                 port_in_use = "EADDRINUSE" in str(exc) or "address already in use" in str(exc).lower()
                 if not port_in_use or attempt == max_port_attempts:
                     raise
-                self._ports = FastVideoPorts.reserve()
-                self._fastvideo_args.master_port = int(self._ports.master_port)
                 logger.warning(
-                    "fastvideo init: master port busy (attempt %d/%d); retrying with %s",
+                    "fastvideo master_port=%s busy (attempt %d/%d); retrying",
+                    self._ports.master_port,
                     attempt,
                     max_port_attempts,
-                    self._ports.master_port,
                 )
-
-    def _align_dual_expert_args(self, fastvideo_args: Any) -> None:
-        """Pin the boundary UniRL owns onto FastVideo's WAN 2.2 pipeline and dit configs."""
-        pipeline_config = fastvideo_args.pipeline_config
-        dit_config = getattr(pipeline_config, "dit_config", None)
-        require(dit_config is not None, "WAN 2.2 FastVideo pipeline has no dit_config")
-        require(
-            hasattr(dit_config, "boundary_ratio"),
-            "WAN 2.2 FastVideo requires a dual-expert pipeline config with dit_config.boundary_ratio",
-        )
-        pipeline_config.boundary_ratio = self._boundary_ratio
-        dit_config.boundary_ratio = self._boundary_ratio
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
     def generate(self, sample: Sample) -> Sample:
         """Generate one whole DP shard synchronously."""
-        return self._generate_locked(sample)
-
-    def _generate_locked(self, sample: Sample) -> Sample:
         with self._generate_lock:
             if self._shutdown_requested:
                 raise RuntimeError("FastVideoRolloutEngine.generate called after shutdown")
@@ -377,41 +317,47 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
             "fastvideo engine requires exactly one frontier-aligned text conditioning turn; "
             f"got {[type(turn.content).__name__ for turn in turns]}",
         )
-        text_primitive = turns[0].content
-        prompts = list(text_primitive.texts)
+        prompts = list(turns[0].content.texts)
         require(
             len(prompts) == int(gen.batch_size),
             "fastvideo engine expects frontier-aligned text of len gen.batch_size; "
             f"got {len(prompts)} vs {int(gen.batch_size)}",
         )
         params = gen.sampling_params
-        require(
-            isinstance(params, DiffusionSamplingParams),
-            "fastvideo engine requires DiffusionSamplingParams on the frontier gen Part",
-        )
-        require(params.sigmas is not None, "fastvideo engine requires engine-pinned diffusion.sigmas")
-        seeds = self._per_sample_seeds(sample, params)
-        raw = self._drive_fastvideo(prompts, params, params.sigmas, seeds)
-        return self._build_response(sample, params, raw)
-
-    def _per_sample_seeds(self, sample: Sample, params: DiffusionSamplingParams) -> List[int]:
-        """Per-sample seeds so sibling samples of one prompt diverge."""
-        gen = sample.frontier_gen_part(DiffusionSamplingParams)
-        bs = int(gen.batch_size)
         base_seed = int(params.seed) if params.seed is not None else 0
-        keys = NoiseRecipe.from_sample(sample).noise_group_ids
-        if not (isinstance(keys, (list, tuple)) and len(keys) == bs):
-            keys = list(gen.group_ids) if params.init_same_noise else list(gen.sample_ids)
-        if not (isinstance(keys, (list, tuple)) and len(keys) == bs):
-            return [base_seed] * bs
-        return [_derive_group_seed(base_seed, str(k)) for k in keys]
+        seed_keys = gen.init_noise_group_ids or (gen.group_ids if params.init_same_noise else gen.sample_ids)
+        seeds = [_derive_group_seed(base_seed, str(k)) for k in seed_keys]
+        num_steps = int(params.num_inference_steps)
+        if params.sde_indices is None:
+            sde_indices = list(range(num_steps))
+        else:
+            sde_indices = sorted({int(i) for i in params.sde_indices})
+            bad = [i for i in sde_indices if i < 0 or i >= num_steps]
+            if bad:
+                raise ValueError(f"FastVideo SDE indices out of range for num_steps={num_steps}: {bad}")
+        raw = self._drive_fastvideo(prompts, params, params.sigmas, seeds, sde_indices)
+        frames = raw["decoded"]
+        require(
+            torch.is_tensor(frames) and frames.dim() == 5,
+            f"fastvideo decoded must be [B, C, T, H, W]; got "
+            f"{tuple(frames.shape) if torch.is_tensor(frames) else type(frames).__name__}",
+        )
+        decoded = Videos.from_list(
+            [Video(frames=frames[i].permute(1, 0, 2, 3).contiguous()) for i in range(int(frames.shape[0]))]
+        )
+        return sample.with_filled_frontier(
+            segment=self._build_segment(params, raw, sde_indices),
+            primitives={"video": decoded},
+            conditions=self._build_conditions(raw),
+        )
 
     def _drive_fastvideo(
         self,
         prompts: List[str],
-        params: Any,
+        params: DiffusionSamplingParams,
         sigmas: torch.Tensor,
         seeds: List[int],
+        resolved_sde_indices: List[int],
     ) -> Dict[str, Any]:
         """PR #1222 native-logprob path via executor.execute_forward + RLData."""
         from copy import deepcopy
@@ -435,11 +381,6 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         # Canonical σ verbatim — already shifted; no engine-side transform (README: σ SSOT).
         sp.sigmas = [float(x) for x in sigmas.detach().cpu().to(torch.float32).tolist()[:-1]]
 
-        # ``None`` → all-steps SDE; an explicit empty list → fully deterministic (README Gotchas).
-        resolved_sde_indices = _resolve_sde_window(
-            params.sde_indices,
-            int(params.num_inference_steps),
-        )
         step_plan = FastVideoUniPCPlan(
             sde_type=self._sde_type,
             sde_indices=tuple(resolved_sde_indices),
@@ -484,13 +425,25 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
             )
             if self._is_dual_expert:
                 batch.boundary_ratio = self._boundary_ratio
-                batch.guidance_scale_2 = self._low_noise_guidance(params)
+                low_scale = (
+                    params.guidance_scale_2
+                    if params.guidance_scale_2 is not None
+                    else self.model_config.guidance_scale_2
+                )
+                batch.guidance_scale_2 = float(low_scale) if low_scale is not None else float(params.guidance_scale)
             out = self._generator.executor.execute_forward(batch, self._fastvideo_args)
             rl = out.rl_data
-            verify_fastvideo_used_sigmas(
-                rl.trajectory_timesteps if rl is not None else None,
+            actual_sigmas = rl.trajectory_timesteps if rl is not None else None
+            if actual_sigmas is not None:
+                actual_t = (
+                    actual_sigmas.detach().cpu() if torch.is_tensor(actual_sigmas) else torch.as_tensor(actual_sigmas)
+                )
+                if actual_t.ndim == 1 and int(actual_t.shape[0]) == int(sigmas.shape[0]) - 1:
+                    actual_sigmas = torch.cat([actual_t, torch.zeros(1, dtype=actual_t.dtype)])
+            verify_engine_used_sigmas(
+                actual_sigmas,
                 expected=sigmas,
-                sample_index=sample_index,
+                engine_name=f"fastvideo sample {sample_index}",
             )
             traj = rl.trajectory_latents if rl is not None else None
             if traj is None:
@@ -547,28 +500,6 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
             "neg_masks": all_neg_masks,
         }
 
-    def _low_noise_guidance(self, params: Any) -> float:
-        """Resolve the low-noise expert's CFG scale, falling back to the shared one."""
-        scale = params.guidance_scale_2
-        if scale is None:
-            scale = self.model_config.guidance_scale_2
-        return float(scale) if scale is not None else float(params.guidance_scale)
-
-    def _build_response(
-        self,
-        sample: Sample,
-        params: DiffusionSamplingParams,
-        raw: Dict[str, Any],
-    ) -> Sample:
-        segment = self._build_segment(params, raw)
-        decoded = self._build_decoded(raw)
-        conditions = self._build_conditions(raw)
-        return sample.with_filled_frontier(
-            segment=segment,
-            primitives={"video": decoded},
-            conditions=conditions,
-        )
-
     def _build_conditions(self, raw: Dict[str, Any]) -> Dict[str, Any]:
         """Assemble the WAN21 ``conditions`` dict the trainer replays against."""
         text_embeds: List[torch.Tensor] = raw["text_embeds"]
@@ -594,32 +525,18 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
             )
         return conditions
 
-    def _build_decoded(self, raw: Dict[str, Any]) -> Videos:
-        """Pack FastVideo's decoded output [B, C, T, H, W] into a ``Videos``."""
-        frames = raw["decoded"]
-        require(
-            torch.is_tensor(frames) and frames.dim() == 5,
-            f"fastvideo decoded must be [B, C, T, H, W]; got "
-            f"{tuple(frames.shape) if torch.is_tensor(frames) else type(frames).__name__}",
-        )
-        videos = [Video(frames=frames[i].permute(1, 0, 2, 3).contiguous()) for i in range(int(frames.shape[0]))]
-        return Videos.from_list(videos)
-
-    def _build_segment(self, params: DiffusionSamplingParams, raw: Dict[str, Any]):
+    def _build_segment(self, params: DiffusionSamplingParams, raw: Dict[str, Any], sde_set: List[int]):
         traj = raw["trajectory"]
         device = traj.device
         T = int(traj.shape[1]) - 1
         indices = torch.arange(traj.shape[1], dtype=torch.long, device=device)
-
-        sde_set = _resolve_sde_window(params.sde_indices, T)
         sde_indices = torch.tensor(sde_set, dtype=torch.long, device=device) if sde_set else None
 
         sde_logp = None
-        lp = raw.get("log_probs")
+        lp = raw["log_probs"]
         if lp is not None:
             if lp.shape[1] == T and len(sde_set) < T:
-                cols = [s for s in sde_set if 0 <= s < lp.shape[1]]
-                sde_logp = lp[:, cols].contiguous()
+                sde_logp = lp[:, sde_set].contiguous()
             else:
                 sde_logp = lp.contiguous()
 
@@ -649,53 +566,27 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         with self._generate_lock:
             if self._shutdown_requested:
                 raise RuntimeError("FastVideoRolloutEngine.wake_up called after shutdown")
-            self._wake_up_locked()
-
-    def _wake_up_locked(self) -> None:
-        """Rebuild and restore the generator while ``_generate_lock`` is held."""
-        if not self._is_offloaded:
-            return
-        from fastvideo import VideoGenerator
-
-        max_port_attempts = 5
-        for attempt in range(1, max_port_attempts + 1):
-            self._ports = FastVideoPorts.reserve()
-            self._fastvideo_args.master_port = int(self._ports.master_port)
+            if not self._is_offloaded:
+                return
+            self._spawn_generator(reserve_first=True)
             try:
-                self._generator = VideoGenerator.from_fastvideo_args(self._fastvideo_args)
-                break
-            except Exception as exc:  # noqa: BLE001
-                port_in_use = "EADDRINUSE" in str(exc) or "address already in use" in str(exc).lower()
-                if not port_in_use or attempt == max_port_attempts:
-                    raise
-                logger.warning(
-                    "fastvideo wake_up: master_port=%s busy (attempt %d/%d); retrying",
-                    self._ports.master_port,
-                    attempt,
-                    max_port_attempts,
-                )
-        try:
-            if self._last_weights_path is not None:
-                self._generator.update_transformer_weights_from_path(self._last_weights_path)
-                logger.info("fastvideo wake_up: re-applied synced weights from %s", self._last_weights_path)
-        except Exception:
-            try:
-                if self._generator is not None:
-                    self._generator.shutdown()
-            except Exception as cleanup_exc:  # noqa: BLE001
-                logger.warning("fastvideo wake_up cleanup after restore failure: %s", cleanup_exc)
-            self._generator = None
-            self._is_offloaded = True
-            raise
-        self._is_offloaded = False
+                if self._last_weights_path is not None:
+                    self._generator.update_transformer_weights_from_path(self._last_weights_path)
+                    logger.info("fastvideo wake_up: re-applied synced weights from %s", self._last_weights_path)
+            except Exception:
+                try:
+                    if self._generator is not None:
+                        self._generator.shutdown()
+                except Exception as cleanup_exc:  # noqa: BLE001
+                    logger.warning("fastvideo wake_up cleanup after restore failure: %s", cleanup_exc)
+                self._generator = None
+                self._is_offloaded = True
+                raise
+            self._is_offloaded = False
 
     @property
     def is_offloaded(self) -> bool:
         return self._is_offloaded
-
-    def onload_weights(self, *, track_prefix: str = "") -> None:
-        del track_prefix
-        self.wake_up()
 
     def shutdown(self) -> None:
         with self._shutdown_lock:
@@ -703,7 +594,6 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
                 return
             with self._generate_lock:
                 self._shutdown_requested = True
-            with self._generate_lock:
                 if self._generator is not None:
                     self._generator.shutdown()
                     self._generator = None

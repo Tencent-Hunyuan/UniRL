@@ -103,9 +103,6 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
     def generate(self, sample: Sample) -> Sample:
         """Generate one whole DP shard synchronously."""
-        return self._generate_locked(sample)
-
-    def _generate_locked(self, sample: Sample) -> Sample:
         with self._generate_lock:
             if self._shutdown_requested:
                 raise RuntimeError("SGLangDiffusionRolloutEngine.generate called after shutdown")
@@ -119,7 +116,7 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
             int(gen.batch_size) > 0,
             "SGLangDiffusionRolloutEngine.generate requires a non-empty Sample (gen batch_size > 0)",
         )
-        self._ensure_sample_sigmas(sample)
+        ensure_sample_sigmas(sample, self.schedule_policy)
 
         fbs = self.cfg.forward_batch_size
         bs = int(gen.batch_size)
@@ -133,10 +130,6 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
             gen_chunks.append(chunk.frontier_gen_part(DiffusionSamplingParams))
             torch.cuda.empty_cache()
         return sample.replace_frontier(Part.concat(gen_chunks))
-
-    def _ensure_sample_sigmas(self, sample: Sample) -> None:
-        """Pin the σ schedule onto the gen part's ``DiffusionSamplingParams.sigmas``."""
-        ensure_sample_sigmas(sample, self.schedule_policy)
 
     def _generate_batch(self, sample: Sample) -> Sample:
         initial_noise = self._resolve_initial_noise(sample)
@@ -201,10 +194,6 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
     def is_offloaded(self) -> bool:
         return self._is_offloaded
 
-    def onload_weights(self, *, track_prefix: str = "") -> None:
-        del track_prefix
-        self.wake_up()
-
     def health_check(self) -> bool:
         return self._backend.ping()
 
@@ -214,7 +203,6 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
                 return
             with self._generate_lock:
                 self._shutdown_requested = True
-            with self._generate_lock:
                 self._backend.shutdown()
             self._shutdown_complete = True
 
