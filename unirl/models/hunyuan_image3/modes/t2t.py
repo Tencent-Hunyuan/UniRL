@@ -11,7 +11,6 @@ from unirl.models.types.ar import ARSamplingParams
 from unirl.types.primitives import Texts
 from unirl.types.sample import Sample
 
-from ..ar import HunyuanImage3ARParams
 from ..conditions import HunyuanImage3ARConditions
 
 if TYPE_CHECKING:
@@ -67,11 +66,7 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
     )
 
     stop_ids = ar_cfg.get("stop_token_ids") or _stop_tokens_for_bot_task(pipeline.bundle, bot_task)
-    text_seg = pipeline.ar.autoregress(
-        ar_conds,
-        sampling_params=ar,
-        params=HunyuanImage3ARParams(stop_token_ids=stop_ids),
-    )
+    text_seg = pipeline.ar.autoregress(ar_conds, sampling_params=ar, stop_token_ids=stop_ids)
 
     decoded_texts = pipeline._detokenize_text_segment(text_seg)
 

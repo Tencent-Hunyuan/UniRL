@@ -169,9 +169,9 @@ class BagelBundle(Bundle):
             vae_dtype=vae_dtype,
             device=device,
             pretrained_path=model_dir,
-            latent_patch_size=int(model.latent_patch_size),
-            latent_channels=int(model.latent_channel),
-            latent_downsample=int(model.latent_downsample),
+            latent_patch_size=model.latent_patch_size,
+            latent_channels=model.latent_channel,
+            latent_downsample=model.latent_downsample,
             config=config,
         )
 

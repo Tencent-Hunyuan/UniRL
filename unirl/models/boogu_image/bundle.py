@@ -144,7 +144,7 @@ class BooguImageBundle(Bundle):
             wrapper = Qwen3VLForConditionalGeneration.from_pretrained(
                 text_encoder_path, subfolder="mllm", torch_dtype=te_dtype
             )
-            text_encoder = wrapper.model if hasattr(wrapper, "lm_head") else wrapper
+            text_encoder = wrapper.model
             del wrapper
             text_encoder = text_encoder.to(device).eval()
             text_encoder.requires_grad_(False)

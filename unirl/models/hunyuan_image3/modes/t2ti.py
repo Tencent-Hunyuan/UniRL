@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, List
 
 from unirl.config.require import require
 from unirl.models.types.ar import ARSamplingParams
@@ -10,32 +10,11 @@ from unirl.types.primitives import Texts
 from unirl.types.sample import Sample
 from unirl.types.sampling import DiffusionSamplingParams
 
-from ..ar import HunyuanImage3ARParams
 from ..conditions import HunyuanImage3ARConditions, HunyuanImage3DiffusionConditions, split_cfg_fused
 from .t2t import _resolve_system_prompt, _stop_tokens_for_bot_task, _tokenizer_bot_task
 
 if TYPE_CHECKING:
     from ..pipeline import HunyuanImage3Pipeline
-
-
-def _truncate_at_cot_end(text: str) -> str:
-    """Cut the AR output at the first ``</recaption>`` (else ``</think>``)."""
-    for marker in ("</recaption>", "</think>"):
-        idx = text.find(marker)
-        if idx != -1:
-            return text[: idx + len(marker)]
-    return text
-
-
-def _normalize_cot_text(cot: str) -> str:
-    """Re-add the opening CoT tag the AR trigger consumed."""
-    if not cot:
-        return cot
-    if "</think>" in cot and not cot.startswith("<think>"):
-        return "<think>" + cot
-    if "</recaption>" in cot and not cot.startswith("<recaption>"):
-        return "<recaption>" + cot
-    return cot
 
 
 def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
@@ -102,14 +81,22 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
     )
 
     stop_ids = ar_cfg.get("stop_token_ids") or _stop_tokens_for_bot_task(pipeline.bundle, bot_task)
-    text_seg = pipeline.ar.autoregress(
-        ar_conds,
-        sampling_params=ar_sp,
-        params=HunyuanImage3ARParams(stop_token_ids=stop_ids),
-    )
+    text_seg = pipeline.ar.autoregress(ar_conds, sampling_params=ar_sp, stop_token_ids=stop_ids)
 
     raw = pipeline._detokenize_text_segment(text_seg, skip_special_tokens=False)
-    cots = [_normalize_cot_text(_truncate_at_cot_end(t)) for t in raw.texts]
+    cots: List[str] = []
+    for text in raw.texts:
+        for marker in ("</recaption>", "</think>"):
+            idx = text.find(marker)
+            if idx != -1:
+                text = text[: idx + len(marker)]
+                break
+        if text:
+            if "</think>" in text and not text.startswith("<think>"):
+                text = "<think>" + text
+            elif "</recaption>" in text and not text.startswith("<recaption>"):
+                text = "<recaption>" + text
+        cots.append(text)
 
     new_parts = list(sample.parts)
     new_parts[ar_idx] = ar_part.fill(

@@ -1,7 +1,6 @@
 """Qwen3.5 VL (dense + MoE, hybrid Gated Delta Net attention) AR model package."""
 
 from unirl.models.qwen3_5.ar import (
-    Qwen3_5ARParams,
     Qwen3_5ARStage,
     Qwen3_5ARStep,
 )
@@ -13,7 +12,6 @@ from unirl.models.qwen3_5.pipeline import Qwen3_5Pipeline
 
 __all__ = [
     "Qwen3_5ARConditions",
-    "Qwen3_5ARParams",
     "Qwen3_5ARStage",
     "Qwen3_5ARStep",
     "Qwen3_5Bundle",

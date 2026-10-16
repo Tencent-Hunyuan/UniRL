@@ -7,7 +7,13 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from unirl.models.types.ar import ARSamplingParams, ARStage, ARStep, left_pad_prompt
+from unirl.models.types.ar import (
+    ARSamplingParams,
+    ARStage,
+    ARStep,
+    left_pad_prompt,
+    resolve_ar_stop_ids,
+)
 from unirl.types.conditions import TextTokenCondition
 from unirl.types.segments import TextSegment
 from unirl.utils.dtypes import parse_torch_dtype
@@ -102,10 +108,6 @@ def _keep_fsdp_params_unsharded(model: torch.nn.Module, *, enabled: bool):
                 module.set_reshard_after_forward(previous, recurse=False)
 
 
-def _replay_temperature(temperature: float) -> float:
-    return temperature if temperature > 0.0 else 1.0
-
-
 def _left_repack_token_condition(
     prompt: TextTokenCondition,
     *,
@@ -130,34 +132,6 @@ def _left_repack_token_condition(
     return left_pad_prompt(input_ids, attention_mask, pad_id)
 
 
-def _left_repack_prompt(
-    prompt: TextTokenCondition,
-    images_seq_mask: torch.Tensor,
-    *,
-    pad_id: int,
-    device: torch.device,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Right-align prompt tokens and their image-placeholder mask together."""
-    repacked_ids, repacked_mask = _left_repack_token_condition(prompt, pad_id=pad_id, device=device)
-
-    attention_mask = prompt.attention_mask.to(device=device, dtype=torch.long)
-    images_seq_mask = images_seq_mask.to(device=device, dtype=torch.bool)
-    if images_seq_mask.shape != attention_mask.shape:
-        raise ValueError(
-            "Janus-Pro AR requires images_seq_mask to match the prompt shape; "
-            f"got {tuple(images_seq_mask.shape)} and {tuple(attention_mask.shape)}."
-        )
-    max_len = repacked_ids.shape[1]
-    repacked_img_mask = torch.zeros_like(repacked_ids, dtype=torch.bool)
-    real_mask = attention_mask.bool()
-    for b in range(images_seq_mask.shape[0]):
-        real_img = images_seq_mask[b][real_mask[b]]
-        n = real_img.numel()
-        repacked_img_mask[b, max_len - n :] = real_img
-
-    return repacked_ids, repacked_mask, repacked_img_mask
-
-
 class JanusProARStage(ARStage[JanusProARConditions]):
     def __init__(
         self,
@@ -179,12 +153,24 @@ class JanusProARStage(ARStage[JanusProARConditions]):
         *,
         device: torch.device,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        input_ids, attention_mask, images_seq_mask = _left_repack_prompt(
+        input_ids, attention_mask = _left_repack_token_condition(
             conditions.prompt,
-            conditions.images_seq_mask,
             pad_id=self.model.pad_token_id,
             device=device,
         )
+        raw_mask = conditions.prompt.attention_mask.to(device=device, dtype=torch.long)
+        raw_img_mask = conditions.images_seq_mask.to(device=device, dtype=torch.bool)
+        if raw_img_mask.shape != raw_mask.shape:
+            raise ValueError(
+                "Janus-Pro AR requires images_seq_mask to match the prompt shape; "
+                f"got {tuple(raw_img_mask.shape)} and {tuple(raw_mask.shape)}."
+            )
+        max_len = input_ids.shape[1]
+        images_seq_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+        real_mask = raw_mask.bool()
+        for b in range(raw_img_mask.shape[0]):
+            real_img = raw_img_mask[b][real_mask[b]]
+            images_seq_mask[b, max_len - real_img.numel() :] = real_img
         images_emb_mask = conditions.images_emb_mask.to(device=device, dtype=torch.bool)
         pixel_values = conditions.pixel_values
         image_embeds = conditions.image_embeds
@@ -223,7 +209,7 @@ class JanusProARStage(ARStage[JanusProARConditions]):
             top_p=sampling_params.top_p,
             top_k=sampling_params.top_k,
         )
-        stop_ids = self._resolve_stop_ids(sampling_params)
+        stop_ids = resolve_ar_stop_ids(sampling_params, self.model.tokenizer)
         max_new = sampling_params.max_new_tokens
 
         with (
@@ -363,7 +349,7 @@ class JanusProARStage(ARStage[JanusProARConditions]):
                 "JanusProARStage.replay: unexpected teacher-forced length "
                 f"{hidden.shape[1]}, expected {prompt_len + t_max - 1}."
             )
-        temp = _replay_temperature(temperature)
+        temp = temperature if temperature > 0.0 else 1.0
         flat: List[torch.Tensor] = []
         for b, n in enumerate(lengths):
             if n == 0:
@@ -379,22 +365,6 @@ class JanusProARStage(ARStage[JanusProARConditions]):
             flat.append(log_probs_full.gather(-1, response_tokens[b, :n].unsqueeze(-1)).squeeze(-1))
 
         return torch.cat(flat, dim=0).to(dtype=self.logprob_dtype)
-
-    def _resolve_stop_ids(
-        self,
-        sampling_params: ARSamplingParams,
-    ) -> List[int]:
-        ids: List[int] = []
-        if sampling_params.stop_token_id is not None:
-            ids.append(sampling_params.stop_token_id)
-        eos = self.model.tokenizer.eos_token_id
-        if eos is not None:
-            if isinstance(eos, (list, tuple)):
-                ids.extend(int(t) for t in eos)
-            else:
-                ids.append(int(eos))
-
-        return list(dict.fromkeys(ids))
 
 
 __all__ = ["JanusProARStage", "JanusProARStep"]

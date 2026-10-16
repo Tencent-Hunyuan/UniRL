@@ -44,7 +44,7 @@ class HunyuanVideo15VAEDecodeStage(DecodeStage[LatentSegment, Videos]):
             )
 
         vae = self.bundle.vae
-        scaling_factor = float(getattr(vae.config, "scaling_factor", 1.0))
+        scaling_factor = vae.config.scaling_factor
 
         def _decode(lat: torch.Tensor) -> torch.Tensor:
             latents_f32 = lat.to(dtype=torch.float32) / scaling_factor

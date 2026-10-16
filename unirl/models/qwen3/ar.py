@@ -1,12 +1,10 @@
-"""Qwen3 AR stage: typed params + per-token kernel + rollout-level stage."""
+"""Qwen3 AR stage: per-token kernel + rollout-level stage."""
 
 from __future__ import annotations
 
 import functools
 import logging
 from contextlib import nullcontext
-from dataclasses import dataclass
-from dataclasses import field as dc_field
 from types import MethodType
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -15,7 +13,14 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-from unirl.models.types.ar import ARSamplingParams, ARStage, ARStep, left_pad_prompt
+from unirl.models.types.ar import (
+    ARSamplingParams,
+    ARStage,
+    ARStep,
+    left_pad_prompt,
+    pack_generated_text_segment,
+    resolve_ar_stop_ids,
+)
 from unirl.models.types.replay_result import ReplayResult
 from unirl.types.segments import TextSegment
 from unirl.utils.dtypes import parse_torch_dtype
@@ -176,17 +181,6 @@ def _finalize_replay_output(
     return ReplayResult(log_probs=log_probs, values=values.float())
 
 
-@dataclass
-class Qwen3ARParams:
-    """Per-request AR-mode knobs for Qwen3."""
-
-    max_tokens: int = 512
-    temperature: float = 0.7
-    top_p: float = 0.9
-    top_k: int = 0
-    stop_token_ids: List[int] = dc_field(default_factory=list)
-
-
 class Qwen3ARStep(ARStep):
     """Per-token sampling kernel."""
 
@@ -263,7 +257,6 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
         conditions: Qwen3ARConditions,
         *,
         sampling_params: ARSamplingParams,
-        params: Optional[Qwen3ARParams] = None,
         **_kwargs: Any,
     ) -> TextSegment:
         """Run AR generation. Returns a varlen-packed ``TextSegment``."""
@@ -283,17 +276,18 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
         attention_mask: torch.Tensor = conditions.prompt.attention_mask
         device = input_ids.device
 
-        pad_id = self.model.tokenizer.pad_token_id or 0
+        raw_pad_id = self.model.tokenizer.pad_token_id
+        pad_id = 0 if raw_pad_id is None else int(raw_pad_id)
         input_ids, attention_mask = left_pad_prompt(input_ids, attention_mask, pad_id)
         batch_size = int(input_ids.shape[0])
 
-        stop_ids = self._resolve_stop_ids(params, sampling_params)
+        stop_ids = resolve_ar_stop_ids(sampling_params, self.model.tokenizer)
         step = Qwen3ARStep(
-            temperature=float(sampling_params.temperature),
-            top_p=float(sampling_params.top_p),
-            top_k=int(sampling_params.top_k),
+            temperature=sampling_params.temperature,
+            top_p=sampling_params.top_p,
+            top_k=sampling_params.top_k,
         )
-        max_new = int(sampling_params.max_new_tokens)
+        max_new = sampling_params.max_new_tokens
 
         model_kwargs = {
             "attention_mask": attention_mask,
@@ -344,7 +338,7 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
             model_kwargs = transformer._update_model_kwargs_for_generation(out, model_kwargs)
             model_kwargs["use_cache"] = True
             next_sequence_length = 1
-        return _pack_text_segment(generated_tokens, per_token_logps, device=device)
+        return pack_generated_text_segment(generated_tokens, per_token_logps, device=device)
 
     def replay(
         self,
@@ -394,7 +388,8 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
             return None
 
         lengths = [int(n) for n in segment.lengths.tolist()]
-        pad_id = self.model.tokenizer.pad_token_id or 0
+        raw_pad_id = self.model.tokenizer.pad_token_id
+        pad_id = 0 if raw_pad_id is None else int(raw_pad_id)
         real_prompt_lens_p = prompt_mask.long().sum(dim=-1)
 
         cu_p = [int(c) for c in segment.cu_seqlens.tolist()]
@@ -474,7 +469,8 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
 
         lengths = [int(n) for n in segment.lengths.tolist()]
         T_max = max(lengths) if lengths else 0
-        pad_id = self.model.tokenizer.pad_token_id or 0
+        raw_pad_id = self.model.tokenizer.pad_token_id
+        pad_id = 0 if raw_pad_id is None else int(raw_pad_id)
 
         response_tokens = torch.full((batch_size, T_max), pad_id, dtype=torch.long, device=device)
         response_mask = torch.zeros((batch_size, T_max), dtype=torch.long, device=device)
@@ -555,42 +551,5 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
             raise ValueError("Qwen3ARStage.replay: return_values=True but critic returned no values")
         return ReplayResult(log_probs=log_probs, values=values)
 
-    def _resolve_stop_ids(
-        self,
-        params: Optional[Qwen3ARParams],
-        sampling_params: ARSamplingParams,
-    ) -> List[int]:
-        ids: List[int] = []
-        if params is not None and params.stop_token_ids:
-            ids.extend(int(t) for t in params.stop_token_ids)
-        if sampling_params.stop_token_id is not None:
-            ids.append(int(sampling_params.stop_token_id))
-        eos = self.model.tokenizer.eos_token_id
-        if eos is not None:
-            if isinstance(eos, (list, tuple)):
-                ids.extend(int(t) for t in eos)
-            else:
-                ids.append(int(eos))
-        seen: set = set()
-        out: List[int] = []
-        for t in ids:
-            if t not in seen:
-                seen.add(t)
-                out.append(t)
-        return out
 
-
-def _pack_text_segment(
-    generated_tokens: List[List[int]],
-    per_token_logps: List[List[float]],
-    *,
-    device: torch.device,
-) -> TextSegment:
-    """Pack per-sample lists of tokens / log-probs into a varlen ``TextSegment``."""
-    return TextSegment.pack(
-        tokens=[torch.tensor(toks, dtype=torch.long, device=device) for toks in generated_tokens],
-        log_probs=[torch.tensor(lps, dtype=torch.float32, device=device) for lps in per_token_logps],
-    )
-
-
-__all__ = ["Qwen3ARParams", "Qwen3ARStage", "Qwen3ARStep"]
+__all__ = ["Qwen3ARStage", "Qwen3ARStep"]

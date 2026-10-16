@@ -1,27 +1,19 @@
-"""HunyuanImage3 AR stage: typed params + per-token kernel + rollout-level stage."""
+"""HunyuanImage3 AR stage: per-token kernel + rollout-level stage."""
 
 from __future__ import annotations
 
 import sys
 from dataclasses import dataclass
-from dataclasses import field as dc_field
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 
-from unirl.models.types.ar import ARSamplingParams, ARStage, ARStep
+from unirl.models.types.ar import ARSamplingParams, ARStage, ARStep, pack_generated_text_segment
 from unirl.types.segments import TextSegment
 
 from .bundle import HunyuanImage3Bundle
 from .conditions import HunyuanImage3ARConditions
-
-
-@dataclass
-class HunyuanImage3ARParams:
-    """Per-request AR-mode stop-token overrides for HunyuanImage 3.0."""
-
-    stop_token_ids: List[int] = dc_field(default_factory=list)
 
 
 @dataclass
@@ -228,7 +220,7 @@ class HunyuanImage3ARStage(ARStage[HunyuanImage3ARConditions]):
         conditions: HunyuanImage3ARConditions,
         *,
         sampling_params: ARSamplingParams,
-        params: Optional[HunyuanImage3ARParams] = None,
+        stop_token_ids: Optional[List[int]] = None,
         **_kwargs: Any,
     ) -> TextSegment:
         """Run AR generation. Returns a varlen-packed ``TextSegment``."""
@@ -255,7 +247,11 @@ class HunyuanImage3ARStage(ARStage[HunyuanImage3ARConditions]):
         device = fused.input_ids.device
         batch_size = fused.input_ids.shape[0]
 
-        stop_ids = self._resolve_stop_ids(params, sampling_params)
+        stop_ids = (
+            list(stop_token_ids)
+            if stop_token_ids
+            else ([sampling_params.stop_token_id] if sampling_params.stop_token_id is not None else [])
+        )
         step = HunyuanImage3ARStep(
             temperature=sampling_params.temperature,
             top_p=sampling_params.top_p,
@@ -281,21 +277,7 @@ class HunyuanImage3ARStage(ARStage[HunyuanImage3ARConditions]):
             if all(finished):
                 break
 
-        return TextSegment.pack(
-            tokens=[torch.tensor(toks, dtype=torch.long, device=device) for toks in generated_tokens],
-            log_probs=[torch.tensor(lps, dtype=torch.float32, device=device) for lps in per_token_logps],
-        )
-
-    @staticmethod
-    def _resolve_stop_ids(
-        params: Optional[HunyuanImage3ARParams],
-        sampling_params: ARSamplingParams,
-    ) -> List[int]:
-        if params is not None and params.stop_token_ids:
-            return list(params.stop_token_ids)
-        if sampling_params.stop_token_id is not None:
-            return [sampling_params.stop_token_id]
-        return []
+        return pack_generated_text_segment(generated_tokens, per_token_logps, device=device)
 
     def replay(
         self,
@@ -387,4 +369,4 @@ class HunyuanImage3ARStage(ARStage[HunyuanImage3ARConditions]):
         return torch.cat(flat, dim=0)
 
 
-__all__ = ["HunyuanImage3ARParams", "HunyuanImage3ARStage", "HunyuanImage3ARState", "HunyuanImage3ARStep"]
+__all__ = ["HunyuanImage3ARStage", "HunyuanImage3ARState", "HunyuanImage3ARStep"]
