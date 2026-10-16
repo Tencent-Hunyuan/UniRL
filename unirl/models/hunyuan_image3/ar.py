@@ -19,21 +19,9 @@ from .conditions import HunyuanImage3ARConditions
 
 @dataclass
 class HunyuanImage3ARParams:
-    """Per-request AR-mode knobs for HunyuanImage 3.0."""
+    """Per-request AR-mode stop-token overrides for HunyuanImage 3.0."""
 
-    bot_task: str = "auto"
-    max_tokens: int = 2048
-    temperature: float = 0.6
-    top_p: float = 0.95
-    top_k: int = 1024
     stop_token_ids: List[int] = dc_field(default_factory=list)
-    cot_text: Optional[str] = None
-
-    system_prompt: Optional[str] = None
-    use_system_prompt: Optional[str] = None
-
-    taylor_cache_interval: Optional[int] = None
-    taylor_cache_order: Optional[int] = None
 
 
 @dataclass
@@ -298,7 +286,10 @@ class HunyuanImage3ARStage(ARStage[HunyuanImage3ARConditions]):
             if all(finished):
                 break
 
-        return _pack_text_segment(generated_tokens, per_token_logps, device=device)
+        return TextSegment.pack(
+            tokens=[torch.tensor(toks, dtype=torch.long, device=device) for toks in generated_tokens],
+            log_probs=[torch.tensor(lps, dtype=torch.float32, device=device) for lps in per_token_logps],
+        )
 
     @staticmethod
     def _resolve_stop_ids(
@@ -405,19 +396,6 @@ class HunyuanImage3ARStage(ARStage[HunyuanImage3ARConditions]):
         if not flat:
             return torch.zeros(0, dtype=torch.float32, device=device)
         return torch.cat(flat, dim=0)
-
-
-def _pack_text_segment(
-    generated_tokens: List[List[int]],
-    per_token_logps: List[List[float]],
-    *,
-    device: torch.device,
-) -> TextSegment:
-    """Pack per-sample lists of tokens / log-probs into a varlen ``TextSegment``."""
-    return TextSegment.pack(
-        tokens=[torch.tensor(toks, dtype=torch.long, device=device) for toks in generated_tokens],
-        log_probs=[torch.tensor(lps, dtype=torch.float32, device=device) for lps in per_token_logps],
-    )
 
 
 __all__ = ["HunyuanImage3ARParams", "HunyuanImage3ARStage", "HunyuanImage3ARState", "HunyuanImage3ARStep"]
