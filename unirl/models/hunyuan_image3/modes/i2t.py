@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING
 
 from unirl.models.types.ar import ARSamplingParams
 from unirl.types.conditions import ImageEmbedCondition
@@ -36,8 +36,8 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
             "HunyuanImage3Pipeline.generate (i2t): expected a chained Images input in sample.conditioning(), found none"
         )
 
-    ar_cfg = sample.parts[0].control.get("ar") or {}
-    bot_task = str(ar_cfg.get("bot_task", "auto"))
+    ar_cfg = sample.parts[0].control.get("ar", {})
+    bot_task = ar_cfg.get("bot_task", "auto")
     tok_bot_task = _tokenizer_bot_task(bot_task)
     cot_text = ar_cfg.get("cot_text")
 
@@ -84,20 +84,10 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
         tokenizer_output=mm["tokenizer_output"],
     )
 
-    stop_ids: List[int] = list(ar_cfg.get("stop_token_ids") or []) or _stop_tokens_for_bot_task(
-        pipeline.bundle, bot_task
-    )
-    sampling_params = ARSamplingParams(
-        max_new_tokens=ar.max_new_tokens,
-        temperature=ar.temperature,
-        top_p=ar.top_p,
-        top_k=ar.top_k,
-        stop_token_id=stop_ids[0] if stop_ids else None,
-    )
-
+    stop_ids = ar_cfg.get("stop_token_ids") or _stop_tokens_for_bot_task(pipeline.bundle, bot_task)
     text_seg = pipeline.ar.autoregress(
         ar_conds,
-        sampling_params=sampling_params,
+        sampling_params=ar,
         params=HunyuanImage3ARParams(stop_token_ids=stop_ids),
     )
 

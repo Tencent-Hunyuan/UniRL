@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING
 
 from unirl.config.require import require
 from unirl.models.types.ar import ARSamplingParams
@@ -75,13 +75,13 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
     )
 
     control = sample.parts[0].control
-    ar_cfg = control.get("ar") or {}
+    ar_cfg = control.get("ar", {})
     require(
         "bot_task" not in ar_cfg,
         "HunyuanImage3Pipeline.generate (t2ti): set the single top-level control['bot_task'] "
         "(the chain is one semantic mode); control['ar']['bot_task'] is not read.",
     )
-    bot_task = str(control.get("bot_task", "think_recaption"))
+    bot_task = control.get("bot_task", "think_recaption")
     tok_bot_task = _tokenizer_bot_task(bot_task)
     batch = len(texts.texts)
 
@@ -101,19 +101,10 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
         tokenizer_output=mm["tokenizer_output"],
     )
 
-    stop_ids: List[int] = list(ar_cfg.get("stop_token_ids") or []) or _stop_tokens_for_bot_task(
-        pipeline.bundle, bot_task
-    )
-    ar_sampling = ARSamplingParams(
-        max_new_tokens=ar_sp.max_new_tokens,
-        temperature=ar_sp.temperature,
-        top_p=ar_sp.top_p,
-        top_k=ar_sp.top_k,
-        stop_token_id=stop_ids[0] if stop_ids else None,
-    )
+    stop_ids = ar_cfg.get("stop_token_ids") or _stop_tokens_for_bot_task(pipeline.bundle, bot_task)
     text_seg = pipeline.ar.autoregress(
         ar_conds,
-        sampling_params=ar_sampling,
+        sampling_params=ar_sp,
         params=HunyuanImage3ARParams(stop_token_ids=stop_ids),
     )
 

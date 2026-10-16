@@ -103,13 +103,12 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
     )
     vit_kwargs = vit["vit_kwargs"]  # CFG duplication is deferred to the stage.
 
-    bot_task = str(sample.parts[0].control.get("bot_task", "image"))
     mm = pipeline.text_embed.embed_for_gen_image(
         texts,
         cfg=cfg,
         height=params.height,
         width=params.width,
-        bot_task=bot_task,
+        bot_task=sample.parts[0].control.get("bot_task", "image"),
         batch_cond_image_info=vit["joint_image_info"],
     )
 

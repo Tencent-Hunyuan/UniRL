@@ -36,19 +36,15 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
     )
 
     control = sample.parts[0].control
-    bot_task: str = str(control.get("bot_task", "image"))
-    sys_type = control.get("sys_type")
-    sequence_template = control.get("sequence_template")
-
     cfg = params.guidance_scale > 1.0
     mm = pipeline.text_embed.embed_for_gen_image(
         texts,
         cfg=cfg,
         height=params.height,
         width=params.width,
-        bot_task=bot_task,
-        sys_type=None if sys_type is None else str(sys_type),
-        sequence_template=None if sequence_template is None else str(sequence_template),
+        bot_task=control.get("bot_task", "image"),
+        sys_type=control.get("sys_type"),
+        sequence_template=control.get("sequence_template"),
     )
 
     fused, fused_uncond = split_cfg_fused(mm["fused"], frontier.batch_size, cfg=cfg)

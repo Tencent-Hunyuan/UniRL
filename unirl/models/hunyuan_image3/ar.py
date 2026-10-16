@@ -85,14 +85,13 @@ class HunyuanImage3ARStep(ARStep[HunyuanImage3Bundle, HunyuanImage3ARConditions,
         transformer = model.transformer
         fused = conditions.fused
         input_ids: torch.Tensor = fused.input_ids
-        batch_size = int(input_ids.shape[0])
+        batch_size, prompt_len = input_ids.shape
 
-        prompt_len = int(input_ids.shape[1])
         cache_cls = sys.modules[type(transformer).__module__].HunyuanStaticCache
         past_kv_initial = cache_cls(
             config=transformer.config,
             batch_size=batch_size,
-            max_cache_len=prompt_len + int(max_new_tokens),
+            max_cache_len=prompt_len + max_new_tokens,
             dtype=torch.bfloat16,
             dynamic=batch_size == 1,
         )
@@ -143,20 +142,20 @@ class HunyuanImage3ARStep(ARStep[HunyuanImage3Bundle, HunyuanImage3ARConditions,
         """One token transition: forward, ``sample``, state advance; returns ``(token_id [B], log_prob [B], state)``."""
         transformer = model.transformer
         device = state.input_ids.device
-        batch_size = int(state.input_ids.shape[0])
+        batch_size = state.input_ids.shape[0]
         model_kwargs = state.model_kwargs
         real_pos = conditions.fused.prompt_lengths
 
         cond_kwargs: Dict[str, Any] = {}
         if state.step_idx == 0:
             cond_kwargs = {
-                "cond_vit_images": model_kwargs.get("cond_vit_images"),
-                "cond_vit_image_mask": model_kwargs.get("cond_vit_image_mask"),
-                "cond_vit_image_kwargs": model_kwargs.get("vit_kwargs"),
-                "cond_vae_images": model_kwargs.get("cond_vae_images"),
-                "cond_vae_image_mask": model_kwargs.get("cond_vae_image_mask"),
-                "cond_timesteps": model_kwargs.get("cond_timesteps"),
-                "cond_timesteps_index": model_kwargs.get("cond_timesteps_index"),
+                "cond_vit_images": model_kwargs["cond_vit_images"],
+                "cond_vit_image_mask": model_kwargs["cond_vit_image_mask"],
+                "cond_vit_image_kwargs": model_kwargs["vit_kwargs"],
+                "cond_vae_images": model_kwargs["cond_vae_images"],
+                "cond_vae_image_mask": model_kwargs["cond_vae_image_mask"],
+                "cond_timesteps": model_kwargs["cond_timesteps"],
+                "cond_timesteps_index": model_kwargs["cond_timesteps_index"],
             }
         past_key_values = model_kwargs["past_key_values"]
         attention_mask = model_kwargs.get("attention_mask")
@@ -175,18 +174,14 @@ class HunyuanImage3ARStep(ARStep[HunyuanImage3Bundle, HunyuanImage3ARConditions,
             position_ids=model_kwargs["position_ids"],
             custom_pos_emb=model_kwargs["custom_pos_emb"],
             mode="gen_text",
-            rope_image_info=model_kwargs.get("rope_image_info"),
+            rope_image_info=model_kwargs["rope_image_info"],
             use_cache=True,
             **cond_kwargs,
         )
         # Decode gathers RoPE at real_pos + step, so it needs the full-length table.
         with torch.no_grad(), model.rope_mode(training=False):
             out = transformer(**model_inputs, first_step=(state.step_idx == 0))
-        logits = getattr(out, "logits", None)
-        if logits is None and isinstance(out, dict):
-            logits = out.get("logits")
-        if logits is None:
-            raise RuntimeError("HunyuanImage3ARStep.step: model output has no .logits in mode='gen_text'.")
+        logits = out.logits
 
         logits_device = logits.device
         if state.step_idx == 0:
@@ -258,15 +253,15 @@ class HunyuanImage3ARStage(ARStage[HunyuanImage3ARConditions]):
             )
 
         device = fused.input_ids.device
-        batch_size = int(fused.input_ids.shape[0])
+        batch_size = fused.input_ids.shape[0]
 
         stop_ids = self._resolve_stop_ids(params, sampling_params)
         step = HunyuanImage3ARStep(
-            temperature=float(sampling_params.temperature),
-            top_p=float(sampling_params.top_p),
-            top_k=int(sampling_params.top_k),
+            temperature=sampling_params.temperature,
+            top_p=sampling_params.top_p,
+            top_k=sampling_params.top_k,
         )
-        max_new = int(sampling_params.max_new_tokens)
+        max_new = sampling_params.max_new_tokens
         state = step.init_state(self.model, conditions, max_new_tokens=max_new)
 
         generated_tokens: List[List[int]] = [[] for _ in range(batch_size)]
@@ -299,7 +294,7 @@ class HunyuanImage3ARStage(ARStage[HunyuanImage3ARConditions]):
         if params is not None and params.stop_token_ids:
             return list(params.stop_token_ids)
         if sampling_params.stop_token_id is not None:
-            return [int(sampling_params.stop_token_id)]
+            return [sampling_params.stop_token_id]
         return []
 
     def replay(
@@ -329,7 +324,7 @@ class HunyuanImage3ARStage(ARStage[HunyuanImage3ARConditions]):
 
         prompt_ids_padded = fused.input_ids
         device = self.model.transformer.model.wte.weight.device
-        batch_size = int(prompt_ids_padded.shape[0])
+        batch_size = prompt_ids_padded.shape[0]
 
         # Require true prompt lengths; padded lengths corrupt per-token log probabilities.
         if fused.prompt_lengths is None:
@@ -341,10 +336,9 @@ class HunyuanImage3ARStage(ARStage[HunyuanImage3ARConditions]):
                 "it at rollout time — both the vLLM adapter (adapters/hi3.py) and the "
                 "in-process embed_for_ar derive it from the tokenizer's real_pos."
             )
-        prompt_lengths = [int(n) for n in fused.prompt_lengths.tolist()]
-
-        resp_lengths = [int(n) for n in segment.lengths.tolist()]
-        cu = [int(c) for c in segment.cu_seqlens.tolist()]
+        prompt_lengths = fused.prompt_lengths.tolist()
+        resp_lengths = segment.lengths.tolist()
+        cu = segment.cu_seqlens.tolist()
 
         transformer = self.model.transformer
         param_dtype = transformer.model.wte.weight.dtype
@@ -370,10 +364,8 @@ class HunyuanImage3ARStage(ARStage[HunyuanImage3ARConditions]):
             transformer.num_special_tokens = None
             transformer.num_image_tokens = 0
             transformer.use_taylor_cache = False
-            if hasattr(transformer, "cached_rope") and transformer.cached_rope is not None:
-                for _rope_attr in ("seq_len", "rope_image_info", "cos_cache", "sin_cache"):
-                    if hasattr(transformer.cached_rope, _rope_attr):
-                        setattr(transformer.cached_rope, _rope_attr, None)
+            if (cr := getattr(transformer, "cached_rope", None)) is not None:
+                cr.seq_len = cr.rope_image_info = cr.cos_cache = cr.sin_cache = None
 
             # Teacher forcing passes no position_ids, so RoPE must be sized to this sequence.
             with self.model.rope_mode(training=True):
@@ -385,11 +377,8 @@ class HunyuanImage3ARStage(ARStage[HunyuanImage3ARConditions]):
                     use_cache=False,
                     return_dict=True,
                 )
-            logits = getattr(out, "logits", None)
-            if logits is None:
-                raise RuntimeError("HunyuanImage3ARStage.replay: model output has no .logits")
 
-            raw_logits = logits[0, pl - 1 : pl - 1 + rl, :].float()
+            raw_logits = out.logits[0, pl - 1 : pl - 1 + rl, :].float()
             log_probs_full = F.log_softmax(raw_logits, dim=-1)
             flat.append(log_probs_full.gather(-1, resp_b.unsqueeze(-1)).squeeze(-1))
 

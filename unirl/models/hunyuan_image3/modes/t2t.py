@@ -43,8 +43,8 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
             f"got {type(texts).__name__ if texts is not None else 'None'}"
         )
 
-    ar_cfg = sample.parts[0].control.get("ar") or {}
-    bot_task = str(ar_cfg.get("bot_task", "auto"))
+    ar_cfg = sample.parts[0].control.get("ar", {})
+    bot_task = ar_cfg.get("bot_task", "auto")
     tok_bot_task = _tokenizer_bot_task(bot_task)
     cot_text = ar_cfg.get("cot_text")
 
@@ -66,19 +66,10 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
         tokenizer_output=mm["tokenizer_output"],
     )
 
-    stop_ids: List[int] = list(ar_cfg.get("stop_token_ids") or []) or _stop_tokens_for_bot_task(
-        pipeline.bundle, bot_task
-    )
-    sampling_params = ARSamplingParams(
-        max_new_tokens=ar.max_new_tokens,
-        temperature=ar.temperature,
-        top_p=ar.top_p,
-        top_k=ar.top_k,
-        stop_token_id=stop_ids[0] if stop_ids else None,
-    )
+    stop_ids = ar_cfg.get("stop_token_ids") or _stop_tokens_for_bot_task(pipeline.bundle, bot_task)
     text_seg = pipeline.ar.autoregress(
         ar_conds,
-        sampling_params=sampling_params,
+        sampling_params=ar,
         params=HunyuanImage3ARParams(stop_token_ids=stop_ids),
     )
 
@@ -93,47 +84,22 @@ def _resolve_system_prompt(
 ) -> Optional[str]:
     """Mirror upstream ``get_system_prompt(sys_type, bot_task, system_prompt)``."""
     transformer = bundle.transformer
-    sys_type = (
-        use_system_prompt
-        if use_system_prompt is not None
-        else getattr(transformer.generation_config, "use_system_prompt", None)
-    )
+    sys_type = use_system_prompt if use_system_prompt is not None else transformer.generation_config.use_system_prompt
     return sys.modules[type(transformer).__module__].get_system_prompt(sys_type, bot_task, system_prompt)
 
 
 def _stop_tokens_for_bot_task(bundle, bot_task: str) -> List[int]:
     """Mirror upstream's stop-token dict across Base and Instruct tokenizers."""
     transformer = bundle.transformer
-    tkw = getattr(transformer, "_tkwrapper", None) or getattr(transformer, "_tokenizer", None)
-    if tkw is None:
-        return []
-
-    eos = getattr(tkw, "eos_token_id", None)
-    boi = getattr(tkw, "boi_token_id", None)
-    special_map = getattr(tkw, "special_token_map", None) or getattr(tkw, "added_tokens_encoder", None) or {}
-    end_recap = special_map.get("</recaption>")
-    end_answer = special_map.get("</answer>")
-    end_think = special_map.get("</think>")
-
-    extra_auto_stops = [int(tid) for i in range(33) if (tid := special_map.get(f"<img_ratio_{i}>")) is not None]
-
+    tkw = getattr(transformer, "_tkwrapper", None) or transformer._tokenizer
+    special_map = getattr(tkw, "special_token_map", None) or tkw.added_tokens_encoder
+    ratio_stops = [special_map[f"<img_ratio_{i}>"] for i in range(33)]
     if bot_task == "auto":
-        return ([int(eos)] if eos is not None else []) + extra_auto_stops
-    if bot_task == "image":
-        return [int(eos)] if eos is not None else []
-    if bot_task in ("recaption", "think", "think_recaption"):
-        out: List[int] = []
-        if bot_task == "think" and end_think is not None:
-            out.append(int(end_think))
-        if end_recap is not None:
-            out.append(int(end_recap))
-        if end_answer is not None:
-            out.append(int(end_answer))
-        if eos is not None:
-            out.append(int(eos))
-        return out
+        return [tkw.eos_token_id, *ratio_stops]
     if bot_task == "img_ratio":
-        if extra_auto_stops:
-            return extra_auto_stops
-        return [int(boi)] if boi is not None else []
-    return [int(eos)] if eos is not None else []
+        return ratio_stops
+    if bot_task == "think":
+        return [special_map["</think>"], special_map["</recaption>"], special_map["</answer>"], tkw.eos_token_id]
+    if bot_task in ("recaption", "think_recaption"):
+        return [special_map["</recaption>"], special_map["</answer>"], tkw.eos_token_id]
+    return [tkw.eos_token_id]
