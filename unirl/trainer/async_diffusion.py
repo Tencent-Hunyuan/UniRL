@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import time
 from dataclasses import replace
 from typing import Any, Dict, Optional, Tuple
 
@@ -13,7 +12,6 @@ from unirl.train.stack import TrainStepResult
 from unirl.trainer.async_rollout import (
     AsyncRolloutTrainerMixin,
     resolve_separate_worker_concurrency,
-    training_version_metrics,
 )
 from unirl.trainer.diffusion import DiffusionTrainer
 from unirl.trainer.residency import DEFAULT_RESIDENCY_POLICY
@@ -77,7 +75,6 @@ class AsyncDiffusionTrainer(AsyncRolloutTrainerMixin, DiffusionTrainer):
 
         self._max_inflight = max_inflight
         self._per_worker_inflight = per_worker_inflight
-        self._max_inflight_prompts = self._max_inflight * self.batch_size
         self._weight_sync_interval = weight_sync_interval
         self._max_staleness = self._weight_sync_interval - 1
         self._num_updates_per_batch = diffusion_kwargs["stack_cfg"].get("num_updates_per_batch", 1)
@@ -94,12 +91,8 @@ class AsyncDiffusionTrainer(AsyncRolloutTrainerMixin, DiffusionTrainer):
         *,
         training_progress: float,
         rollout_id: int,
-        t0: Optional[float] = None,
-        extra_metrics: Optional[dict[str, float]] = None,
-    ) -> Tuple[TrainStepResult, float]:
+    ) -> Tuple[Sample, TrainStepResult, float]:
         """Advantage + optimizer updates for a scored ``Sample`` (rewards already attached)."""
-        if t0 is None:
-            t0 = time.perf_counter()
         part = sample.parts[-1]
         mean_reward = 0.0
         if part.rewards is not None:
@@ -114,26 +107,7 @@ class AsyncDiffusionTrainer(AsyncRolloutTrainerMixin, DiffusionTrainer):
             training_progress=float(training_progress),
             rollout_id=rollout_id,
         )
-        self._train_version += result.optimizer_updates
-        self._batches_since_sync += 1
-        if extra_metrics is not None:
-            extra_metrics.update(
-                training_version_metrics(
-                    train_version=self._train_version,
-                    published_version=self._rollout_manager.published_version,
-                    optimizer_updates=result.optimizer_updates,
-                    batches_since_sync=self._batches_since_sync,
-                )
-            )
-        self.wandb_logger.log_rollout_step(
-            rollout_id,
-            result,
-            sample,
-            step_time_s=time.perf_counter() - t0,
-            extra_metrics=extra_metrics,
-        )
-        self._reset_transport_buffers()
-        return result, mean_reward
+        return sample, result, mean_reward
 
     def train(
         self,

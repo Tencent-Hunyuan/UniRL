@@ -203,9 +203,13 @@ each async recipe's header comment also carries a small-pool launch line.
 
 ### The shared lifecycle
 
-The **train version** counts optimizer updates, the **published version** is
-the train version the engine serves, and every generated `Part` is stamped with
-the **output version** it was generated under (all logged as `async/*`).
+The **train version** counts committed optimizer updates, the **published
+version** is the train version the engine serves, and every generated `Part` is
+stamped with the **output version** it was generated under (all logged under
+`rollout/async/*`: `staleness_updates` measures `train_version - output_version`
+before the batch's optimizer updates, while `train_version`, `publish_lag`, and
+`batches_since_sync` are recorded after training, before weight
+synchronization).
 Admission is bounded by `max_inflight` batch-equivalents globally and
 `per_worker_inflight` prompt trees per rollout worker, and every launch is
 clipped to the lag budget from [How it works](#how-it-works) and to the next

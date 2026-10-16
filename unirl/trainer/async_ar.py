@@ -1,7 +1,6 @@
 """Async autoregressive RL over separate train and rollout GPU slabs."""
 
 import inspect
-import time
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -15,7 +14,6 @@ from unirl.trainer.ar import ARTrainer, ar_preflight
 from unirl.trainer.async_rollout import (
     AsyncRolloutTrainerMixin,
     resolve_separate_worker_concurrency,
-    training_version_metrics,
 )
 from unirl.trainer.base import BaseTrainer, build_sampling_dict
 from unirl.trainer.hydra import parse_hydra_cfg, remote_hydra
@@ -25,6 +23,8 @@ from unirl.types.sampling import BaseSamplingParams, total_samples_per_prompt
 
 class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
     """Disaggregated async AR trainer (two slabs, resident engine, NCCL sync)."""
+
+    _refill_before_score = True
 
     def __init__(
         self,
@@ -125,7 +125,6 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
 
         self._max_inflight = max(1, max_inflight)
         self._per_worker_inflight = per_worker_inflight
-        self._max_inflight_prompts = self._max_inflight * self.batch_size
         self._weight_sync_interval = weight_sync_interval
         self._num_updates_per_batch = stack_cfg.get("num_updates_per_batch", 1)
         if self._weight_sync_interval < 1:
@@ -192,12 +191,8 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
         *,
         training_progress: float,
         rollout_id: int,
-        t0: Optional[float] = None,
-        extra_metrics: Optional[Dict[str, float]] = None,
-    ) -> Tuple[TrainStepResult, float]:
+    ) -> Tuple[Sample, TrainStepResult, float]:
         """Advantage + optimizer updates for a scored ``Sample`` (rewards already attached)."""
-        if t0 is None:
-            t0 = time.perf_counter()
         part = sample.parts[-1]
         mean_reward = 0.0
         if part.rewards is not None:
@@ -217,27 +212,7 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
             training_progress=float(training_progress),
             rollout_id=rollout_id,
         )
-        self._train_version += result.optimizer_updates
-        self._batches_since_sync += 1
-        if extra_metrics is not None:
-            extra_metrics.update(
-                training_version_metrics(
-                    train_version=self._train_version,
-                    published_version=self._rollout_manager.published_version,
-                    optimizer_updates=result.optimizer_updates,
-                    batches_since_sync=self._batches_since_sync,
-                )
-            )
-        self.wandb_logger.log_rollout_step(
-            rollout_id,
-            result,
-            sample,
-            step_time_s=time.perf_counter() - t0,
-            trunc_len=self.sampling_params["ar"].max_new_tokens,
-            extra_metrics=extra_metrics,
-        )
-        self._reset_transport_buffers()
-        return result, mean_reward
+        return sample, result, mean_reward
 
     def train(
         self,
@@ -258,10 +233,6 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
 
     def _async_wandb_extra(self) -> Dict[str, object]:
         return {"adv_normalization_scope": self.adv_normalization_scope}
-
-    def _refill_before_score(self) -> bool:
-        """Overlap AR generation with reward scoring and training."""
-        return True
 
     def _boundary_evaluate(self, rollout_id: int, *, initial: bool) -> None:
         self.evaluate(rollout_id=-1 if initial else rollout_id)
