@@ -85,7 +85,7 @@ class TextLMAdapter(ModelAdapter):
                 payload = self.base_payload(sampling, sample_id=sample_id)
                 ids = self.apply_chat_template(messages)
                 payload["input_ids"] = ids
-                prompt_token_ids.append(ids)
+                prompt_token_ids.append(list(ids))
                 wire.append(payload)
         else:
             prompts = self.extract_prompts(sample)

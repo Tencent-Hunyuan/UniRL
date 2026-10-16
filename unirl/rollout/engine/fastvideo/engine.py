@@ -319,7 +319,11 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         )
         params = gen.sampling_params
         base_seed = params.seed if params.seed is not None else 0
-        seed_keys = gen.init_noise_group_ids or (gen.group_ids if params.init_same_noise else gen.sample_ids)
+        seed_keys = (
+            gen.init_noise_group_ids
+            if gen.init_noise_group_ids and not params.disable_driver_xt
+            else (gen.group_ids if params.init_same_noise else gen.sample_ids)
+        )
         seeds = [_derive_group_seed(base_seed, k) for k in seed_keys]
         num_steps = params.num_inference_steps
         if params.sde_indices is None:

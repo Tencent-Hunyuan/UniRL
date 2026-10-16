@@ -10,50 +10,31 @@ import torch
 from unirl.sde.noise import MAX_TORCH_SEED, make_denoise_step_generators
 
 
-def _resolve_fallback_seed(batch) -> int:
-    """Deterministic per-request seed for the single-``torch.Generator`` fallback."""
-    base_seed = batch.seed
-    denoise_seeds = batch.denoise_seeds
-    sample_key = str(denoise_seeds[0]) if denoise_seeds else None
-    if base_seed is not None and sample_key is not None:
-        payload = f"{base_seed}::fallback::sample::{sample_key}".encode("utf-8")
-        digest = hashlib.blake2b(payload, digest_size=8).digest()
-        return int.from_bytes(digest, byteorder="big", signed=False) % MAX_TORCH_SEED
-    return int.from_bytes(os.urandom(8), byteorder="big") % MAX_TORCH_SEED
-
-
 def patch_denoising() -> None:
     from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
         DenoisingStage,
     )
-
-    orig = DenoisingStage._run_denoising_step
-    if getattr(orig, "_unirl_denoise_seeds", False):
-        return
-
-    def _run_denoising_step(self, ctx, step, batch, server_args):
-        denoise_seeds = batch.denoise_seeds
-        if batch.rollout and denoise_seeds is not None:
-            base_seed = batch.seed
-            if base_seed is not None:
-                ctx.extra_step_kwargs["generator"] = make_denoise_step_generators(
-                    base_seed=base_seed,
-                    step_index=step.step_index,
-                    sample_ids=denoise_seeds,
-                )
-        return orig(self, ctx, step, batch, server_args)
-
-    _run_denoising_step._unirl_denoise_seeds = True  # type: ignore[attr-defined]
-    DenoisingStage._run_denoising_step = _run_denoising_step
-
-    _patch_rollout_variance_noise_device()
-
-
-def _patch_rollout_variance_noise_device() -> None:
-    """Make ``SchedulerRLMixin._rollout_variance_noise`` tolerate CPU generators."""
     from sglang.multimodal_gen.runtime.post_training.scheduler_rl_mixin import (
         SchedulerRLMixin,
     )
+
+    orig = DenoisingStage._run_denoising_step
+    if not getattr(orig, "_unirl_denoise_seeds", False):
+
+        def _run_denoising_step(self, ctx, step, batch, server_args):
+            denoise_seeds = batch.denoise_seeds
+            if batch.rollout and denoise_seeds is not None:
+                base_seed = batch.seed
+                if base_seed is not None:
+                    ctx.extra_step_kwargs["generator"] = make_denoise_step_generators(
+                        base_seed=base_seed,
+                        step_index=step.step_index,
+                        sample_ids=denoise_seeds,
+                    )
+            return orig(self, ctx, step, batch, server_args)
+
+        _run_denoising_step._unirl_denoise_seeds = True  # type: ignore[attr-defined]
+        DenoisingStage._run_denoising_step = _run_denoising_step
 
     if getattr(SchedulerRLMixin._rollout_variance_noise, "_unirl_dev", False):
         return
@@ -70,8 +51,16 @@ def _patch_rollout_variance_noise_device() -> None:
             assert B == 1, "Generator must be a list if batch size is not 1"
             gen = getattr(batch, "_unirl_noise_gen", None)
             if gen is None:
+                base_seed = batch.seed
+                denoise_seeds = batch.denoise_seeds
+                if base_seed is not None and denoise_seeds:
+                    payload = f"{base_seed}::fallback::sample::{denoise_seeds[0]}".encode("utf-8")
+                    digest = hashlib.blake2b(payload, digest_size=8).digest()
+                    fallback_seed = int.from_bytes(digest, byteorder="big", signed=False) % MAX_TORCH_SEED
+                else:
+                    fallback_seed = int.from_bytes(os.urandom(8), byteorder="big") % MAX_TORCH_SEED
                 gen = torch.Generator(device=device)
-                gen.manual_seed(_resolve_fallback_seed(batch))
+                gen.manual_seed(fallback_seed)
                 try:
                     batch._unirl_noise_gen = gen  # type: ignore[attr-defined]
                 except AttributeError:

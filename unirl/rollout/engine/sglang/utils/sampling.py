@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from numbers import Integral
 from typing import Any, Dict, Optional, cast
 
-from unirl.types.sample import Part, Sample
+from unirl.types.sample import Sample
 from unirl.types.sampling import ARSamplingParams
 
 _DEFAULT_SGLANG_SAMPLING_SEED = 42
@@ -53,10 +53,10 @@ def deterministic_inference_enabled(engine_kwargs: Dict[str, Any]) -> bool:
     )
 
 
-def _require_ar_frontier(sample: Sample) -> Part:
-    """Require ``ARSamplingParams`` on the request ``Sample`` frontier."""
+def resolve_sampling(config: Any, sample: Sample) -> ResolvedSampling:
+    """Resolve the SRT sampling block from the request Sample's ARSamplingParams."""
     try:
-        return sample.frontier_gen_part(ARSamplingParams)
+        gen_part = sample.frontier_gen_part(ARSamplingParams)
     except ValueError as exc:
         raise TypeError(
             "SGLang generation requires ARSamplingParams on the request Sample frontier. "
@@ -64,11 +64,6 @@ def _require_ar_frontier(sample: Sample) -> Part:
             "in-tree trainer, PE, and agentic paths already stamp this. Engine-config "
             "temperature / top_p / top_k / max_new_tokens is no longer a fallback."
         ) from exc
-
-
-def resolve_sampling(config: Any, sample: Sample) -> ResolvedSampling:
-    """Resolve the SRT sampling block from the request Sample's ARSamplingParams."""
-    gen_part = _require_ar_frontier(sample)
     ar = cast(ARSamplingParams, gen_part.sampling_params)
     input_part = sample.parts[0]
     control_ar: Dict[str, Any] = dict(input_part.control.get("ar") or {})

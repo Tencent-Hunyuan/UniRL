@@ -49,14 +49,9 @@ class QwenImageEditPlusAdapter(QwenImageAdapter):
 
     def build_condition(self, results: List[RawResult]) -> Dict[str, Any]:
         """T2I text-capture conditions + Edit-Plus ``image_latent``."""
-        cond_dict = super().build_condition(results)
-        cond_dict["image_latent"] = QwenImageEditPlusLatentCondition(latents=self._collect_image_latents(results))
-        return cond_dict
-
-    def _collect_image_latents(self, results: List[RawResult]) -> List[torch.Tensor]:
-        """Collect per-result image latents without forcing a shared grid."""
         from unirl.models.qwen_image.diffusion import _unpack_latents
 
+        cond_dict = super().build_condition(results)
         tensors: List[torch.Tensor] = []
         for r in results:
             packed_list = r.image_latent
@@ -76,11 +71,12 @@ class QwenImageEditPlusAdapter(QwenImageAdapter):
                     f"build_condition: multi-image Edit-Plus not supported (got {len(sizes)} source images per prompt)."
                 )
             vae_width, vae_height = sizes[0]
-            latent_h = int(vae_height) // _VAE_SCALE_FACTOR
-            latent_w = int(vae_width) // _VAE_SCALE_FACTOR
+            latent_h = vae_height // _VAE_SCALE_FACTOR
+            latent_w = vae_width // _VAE_SCALE_FACTOR
             spatial = _unpack_latents(packed, latent_h=latent_h, latent_w=latent_w)
             tensors.append(spatial.squeeze(0))
-        return tensors
+        cond_dict["image_latent"] = QwenImageEditPlusLatentCondition(latents=tensors)
+        return cond_dict
 
 
 __all__ = ["QwenImageEditPlusAdapter"]

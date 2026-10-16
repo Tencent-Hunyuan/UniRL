@@ -54,8 +54,8 @@ def validate_packed_trajectory(
         traj.ndim == 4,
         f"{family}: packed trajectory must be 4-D [B, T, S, C]; got rank {traj.ndim}, shape {tuple(traj.shape)}.",
     )
-    height = int(diffusion.height) if diffusion.height is not None else None
-    width = int(diffusion.width) if diffusion.width is not None else None
+    height = diffusion.height
+    width = diffusion.width
     require(
         height is not None and width is not None,
         f"{family}: need height/width from the diffusion sampling params to unpack the packed "
@@ -159,7 +159,26 @@ def build_latent_segment(
     )
     sde_logp: Optional[torch.Tensor] = None
     if emit_native_logprob:
-        sde_logp = _native_sde_logp(results, num_steps=num_steps, sde_indices=sde_indices)
+        per_result: List[Optional[torch.Tensor]] = [
+            result.trajectory_log_probs.detach().cpu() if result.trajectory_log_probs is not None else None
+            for result in results
+        ]
+        if not any(lp is None for lp in per_result):
+            log_prob_tensor = torch.cat([lp for lp in per_result if lp is not None], dim=0)
+            s_dim = log_prob_tensor.shape[1]
+            expected_s = len(sde_indices) if sde_indices is not None else num_steps
+            if s_dim == num_steps and sde_indices is not None and expected_s < num_steps:
+                keep_idx = torch.tensor(sde_indices, dtype=torch.long)
+                log_prob_tensor = log_prob_tensor.index_select(1, keep_idx)
+                s_dim = log_prob_tensor.shape[1]
+            require(
+                s_dim == expected_s,
+                f"SGLang trajectory_log_probs shape {tuple(log_prob_tensor.shape)} second "
+                f"dim={s_dim} does not match expected SDE-step count {expected_s}. "
+                f"sigma_schedule / num_inference_steps / sde_indices drift — fix the "
+                f"source rather than fall back to replay silently.",
+            )
+            sde_logp = log_prob_tensor
 
     return segment_factory(
         latents=trajectories_tensor,
@@ -169,36 +188,6 @@ def build_latent_segment(
         sde_indices=sde_indices_t,
         aux_latents=aux_trajectory,
     )
-
-
-def _native_sde_logp(
-    results: Sequence[RawResult],
-    *,
-    num_steps: int,
-    sde_indices: Optional[List[int]],
-) -> Optional[torch.Tensor]:
-    """Best-effort extract of SGLang's native ``trajectory_log_probs`` into ``[B, S]``."""
-    per_result: List[Optional[torch.Tensor]] = [
-        result.trajectory_log_probs.detach().cpu() if result.trajectory_log_probs is not None else None
-        for result in results
-    ]
-    if any(lp is None for lp in per_result):
-        return None
-    log_prob_tensor = torch.cat([lp for lp in per_result if lp is not None], dim=0)
-    s_dim = log_prob_tensor.shape[1]
-    expected_s = len(sde_indices) if sde_indices is not None else num_steps
-    if s_dim == num_steps and sde_indices is not None and expected_s < num_steps:
-        keep_idx = torch.tensor(sde_indices, dtype=torch.long)
-        log_prob_tensor = log_prob_tensor.index_select(1, keep_idx)
-        s_dim = log_prob_tensor.shape[1]
-    require(
-        s_dim == expected_s,
-        f"SGLang trajectory_log_probs shape {tuple(log_prob_tensor.shape)} second "
-        f"dim={s_dim} does not match expected SDE-step count {expected_s}. "
-        f"sigma_schedule / num_inference_steps / sde_indices drift — fix the "
-        f"source rather than fall back to replay silently.",
-    )
-    return log_prob_tensor
 
 
 def pack_decoded_images(
@@ -215,7 +204,7 @@ def pack_decoded_images(
             continue
         if canonical.dim() == 3:
             per_sample_tensors.append(canonical.to(torch.float32))
-        elif squeeze_single_frame_4d and canonical.dim() == 4 and int(canonical.shape[1]) == 1:
+        elif squeeze_single_frame_4d and canonical.dim() == 4 and canonical.shape[1] == 1:
             per_sample_tensors.append(canonical.squeeze(1).to(torch.float32))
         elif canonical.dim() == 4:
             skipped_video = True
