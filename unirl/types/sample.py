@@ -356,7 +356,7 @@ class Part(Batch):
         segment_fields = {f.name: getattr(segment, f.name) for f in dc_fields(segment)}
         segment_fields["token_advantages"] = token_advantages
         segment_fields["returns"] = token_returns
-        updated_segment = segment._rebuild(segment_fields)
+        updated_segment = segment.rebuild(segment_fields)
 
         loss_mask = None
         if segment.loss_mask is not None:
@@ -593,7 +593,7 @@ class Sample(Batch):
     def select(self, indices: "torch.Tensor") -> "Sample":
         """Gather whole root prompt-trees by index (shuffle / subsample), mirroring"""
         groups = self.split()
-        idx = indices.tolist() if hasattr(indices, "tolist") else list(indices)
+        idx = indices.tolist() if isinstance(indices, torch.Tensor) else list(indices)
         picked = [groups[int(i)] for i in idx]
         parts = Sample.concat(picked).parts if picked else []
         return type(self)(parts=parts, reward_compute_s=self.reward_compute_s)

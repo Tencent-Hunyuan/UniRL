@@ -34,7 +34,7 @@ safetensors>=0.4
 sglang[diffusion]==0.5.19
 tensordict>=0.5
 timm>=0.9.16
-torch>=2.1
-torchvision>=0.16
+torch>=2.13.0
+torchvision>=0.28.0
 transformers>=5.12,<5.13
 wandb>=0.16,<0.20

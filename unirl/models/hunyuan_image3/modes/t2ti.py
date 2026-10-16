@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Dict, List
+from typing import TYPE_CHECKING
 
 from unirl.config.require import require
 from unirl.models.types.ar import ARSamplingParams
@@ -38,19 +38,6 @@ def _normalize_cot_text(cot: str) -> str:
     return cot
 
 
-def _cot_stop_tokens(bundle, bot_task: str) -> List[int]:
-    """Stop tokens for the CoT AR pass with an explicit image size."""
-    stop_ids = _stop_tokens_for_bot_task(bundle, bot_task)
-    if bot_task == "think":
-        tkw = getattr(bundle.transformer, "_tkwrapper", None) or getattr(bundle.transformer, "_tokenizer", None)
-        end_think = getattr(tkw, "end_think_token_id", None) if tkw is not None else None
-        if end_think is None and tkw is not None:
-            end_think = (getattr(tkw, "special_token_map", {}) or {}).get("</think>")
-        if end_think is not None and int(end_think) not in stop_ids:
-            stop_ids = [int(end_think)] + stop_ids
-    return stop_ids
-
-
 def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
     """t2ti — AR CoT phase, then diffusion conditioned on the CoT."""
     if len(sample.parts) < 2:
@@ -68,10 +55,6 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
     )
     ar_sp = ar_part.sampling_params
     diff_sp = image_part.sampling_params
-    require(
-        isinstance(diff_sp, DiffusionSamplingParams),
-        "HunyuanImage3Pipeline.generate (t2ti): the diffusion gen Part must carry DiffusionSamplingParams.",
-    )
     if diff_sp.sigmas is None:
         raise ValueError(
             "HunyuanImage3 t2ti: diffusion gen part sigmas is None. The hosting engine must "
@@ -92,13 +75,13 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
     )
 
     control = sample.parts[0].control
-    ar_cfg: Dict[str, Any] = dict(control.get("ar") or {})
+    ar_cfg = control.get("ar", {})
     require(
         "bot_task" not in ar_cfg,
         "HunyuanImage3Pipeline.generate (t2ti): set the single top-level control['bot_task'] "
         "(the chain is one semantic mode); control['ar']['bot_task'] is not read.",
     )
-    bot_task = str(control.get("bot_task", "think_recaption"))
+    bot_task = control.get("bot_task", "think_recaption")
     tok_bot_task = _tokenizer_bot_task(bot_task)
     batch = len(texts.texts)
 
@@ -118,29 +101,12 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
         tokenizer_output=mm["tokenizer_output"],
     )
 
-    stop_ids: List[int] = list(ar_cfg.get("stop_token_ids") or [])
-    if not stop_ids:
-        stop_ids = _cot_stop_tokens(pipeline.bundle, bot_task)
-    ar_sampling = ARSamplingParams(
-        max_new_tokens=int(ar_sp.max_new_tokens),
-        temperature=float(ar_sp.temperature),
-        top_p=float(ar_sp.top_p),
-        top_k=int(ar_sp.top_k),
-        stop_token_id=stop_ids[0] if stop_ids else None,
+    stop_ids = ar_cfg.get("stop_token_ids") or _stop_tokens_for_bot_task(pipeline.bundle, bot_task)
+    text_seg = pipeline.ar.autoregress(
+        ar_conds,
+        sampling_params=ar_sp,
+        params=HunyuanImage3ARParams(stop_token_ids=stop_ids),
     )
-    ar_params = HunyuanImage3ARParams(
-        bot_task=bot_task,
-        max_tokens=int(ar_sp.max_new_tokens),
-        temperature=float(ar_sp.temperature),
-        top_p=float(ar_sp.top_p),
-        top_k=int(ar_sp.top_k),
-        stop_token_ids=stop_ids,
-        system_prompt=ar_cfg.get("system_prompt"),
-        use_system_prompt=use_sp,
-        taylor_cache_interval=ar_cfg.get("taylor_cache_interval"),
-        taylor_cache_order=ar_cfg.get("taylor_cache_order"),
-    )
-    text_seg = pipeline.ar.autoregress(ar_conds, sampling_params=ar_sampling, params=ar_params)
 
     raw = pipeline._detokenize_text_segment(text_seg, skip_special_tokens=False)
     cots = [_normalize_cot_text(_truncate_at_cot_end(t)) for t in raw.texts]
@@ -158,7 +124,7 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
         "original prompt and the generated CoT",
     )
     image_prompts = image_texts[0]
-    image_cots = list(image_texts[-1].texts)
+    image_cots = image_texts[-1].texts
     n_images = len(image_part.sample_ids)
     require(
         len(image_prompts.texts) == n_images and len(image_cots) == n_images,
@@ -169,12 +135,12 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
 
     schedule = diff_sp.sigmas.to(pipeline.bundle.device)
 
-    cfg = float(diff_sp.guidance_scale) > 1.0
+    cfg = diff_sp.guidance_scale > 1.0
     mm2 = pipeline.text_embed.embed_for_gen_image(
         image_prompts,
         cfg=cfg,
-        height=int(diff_sp.height),
-        width=int(diff_sp.width),
+        height=diff_sp.height,
+        width=diff_sp.width,
         bot_task=tok_bot_task,
         cot_text=image_cots,
         system_prompt=image_system_prompts,

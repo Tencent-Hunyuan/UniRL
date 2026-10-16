@@ -239,7 +239,7 @@ def _transition_sigma(
     s = sigmas[idx]
     s_next = sigmas[idx + 1]
     sigma_max = sigmas[1] if int(sigmas.shape[0]) > 1 else torch.tensor(0.99, device=device, dtype=sigmas.dtype)
-    return stage.strategy.transition_std(sigma=s, sigma_next=s_next, eta=float(eta), sigma_max=sigma_max)
+    return stage.strategy.transition_std(sigma=s, sigma_next=s_next, eta=eta, sigma_max=sigma_max)
 
 
 def _reference_replay_means(
@@ -282,13 +282,13 @@ def _resolve_reference_model(backend: Any, *, beta: float, algo: str, coef_name:
         raise ValueError(f"{algo}: {coef_name} must be finite and >= 0; got {beta!r}.")
     if coef == 0.0:
         return None
-    model = getattr(backend, "model", None) if backend is not None else None
-    if model is None:
+    if backend is None or backend.model is None:
         raise ValueError(
             f"{algo}: {coef_name}>0 needs the trainable model to define the reference policy, but "
             f"no `backend` was injected. The v2 DiffusionTrainer injects it when the "
             f"algorithm declares requires_backend=True or requires_ema_rollout=True."
         )
+    model = backend.model
     if not any("lora_" in name for name, _ in model.named_parameters()):
         raise ValueError(
             f"{algo}: {coef_name}>0 anchors the policy to the LoRA-disabled base model (reference "

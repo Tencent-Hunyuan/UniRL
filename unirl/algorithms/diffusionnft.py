@@ -14,7 +14,13 @@ from unirl.types.conditions import Condition
 from unirl.types.segments.latent import LatentSegment
 from unirl.utils.metrics import aggregate_numeric_metrics
 
-from .base import AlgorithmStepResult, BaseAlgorithmConfig, StageAlgorithm, _resolve_reference_model
+from .base import (
+    AlgorithmStepResult,
+    BaseAlgorithmConfig,
+    StageAlgorithm,
+    _resolve_reference_model,
+    typed_conditions,
+)
 
 
 @dataclass
@@ -62,7 +68,7 @@ class DiffusionNFT(StageAlgorithm):
         if stage is None:
             raise ValueError("DiffusionNFT: either `stage` or `pipeline` must be provided")
         if nft_lora_policy is None and backend is not None:
-            nft_lora_policy = getattr(backend, "ema", None)
+            nft_lora_policy = backend.ema
         if adv_mode != "raw":
             raise ValueError(f"DiffusionNFT: adv_mode={adv_mode!r} not supported (only 'raw' is wired).")
         if train_timestep_mode not in ("all", "random"):
@@ -126,9 +132,7 @@ class DiffusionNFT(StageAlgorithm):
                 "the last trajectory position); got None. Forward-process "
                 "rollout must populate the dense latents path."
             )
-        # MiniMax-H3 overrides this to pack its audio stream in alongside video.
-        clean_latents = getattr(self.stage, "nft_clean_latents", None)
-        x0 = clean_latents(segment) if callable(clean_latents) else segment.latents[:, -1]
+        x0 = self.stage.nft_clean_latents(segment)
         if x0.numel() == 0:
             return AlgorithmStepResult(
                 loss=0.0,
@@ -136,18 +140,19 @@ class DiffusionNFT(StageAlgorithm):
                 num_steps_or_tokens=0,
                 has_backward=False,
             )
-        B = int(x0.shape[0])
+        B = x0.shape[0]
         device = x0.device
-        compute_dtype = self._compute_dtype(x0)
+        # fp32 timestep tensor — forward-diffusion arithmetic loses too much precision in bf16 near the endpoints.
+        compute_dtype = torch.float32
 
-        if int(advantages.shape[0]) != B:
+        if advantages.shape[0] != B:
             raise ValueError(
-                f"DiffusionNFT: advantages batch size ({int(advantages.shape[0])}) "
+                f"DiffusionNFT: advantages batch size ({advantages.shape[0]}) "
                 f"does not match clean-latents batch size ({B})."
             )
 
         timesteps = self._resolve_timesteps(segment, B, device, compute_dtype)
-        K = int(timesteps.numel())
+        K = timesteps.numel()
         if K == 0:
             return AlgorithmStepResult(
                 loss=0.0,
@@ -156,9 +161,9 @@ class DiffusionNFT(StageAlgorithm):
                 has_backward=False,
             )
 
-        typed_conds = _typed_conditions(conditions, self.conditions_cls)
+        typed_conds = typed_conditions(conditions, self.conditions_cls)
         adv = advantages.detach().to(dtype=compute_dtype, device=device)
-        sat = float(self.config.adv_std_saturate)
+        sat = self.config.adv_std_saturate
         adv_sat = torch.clamp(adv, -sat, sat)
         r = (adv_sat / sat) / 2.0 + 0.5
         r = torch.clamp(r, 0.0, 1.0)
@@ -166,7 +171,7 @@ class DiffusionNFT(StageAlgorithm):
         per_iter_metrics: List[Dict[str, float]] = []
         total_loss = 0.0
         has_backward = False
-        iter_scale = float(loss_scale) / float(K)
+        iter_scale = float(loss_scale) / K
 
         for k in range(K):
             t_scalar = timesteps[k]
@@ -234,7 +239,7 @@ class DiffusionNFT(StageAlgorithm):
             )
         old_pred = old_pred.detach()
 
-        beta = float(self.config.beta)
+        beta = self.config.beta
         positive_pred = beta * new_pred + (1.0 - beta) * old_pred
         negative_pred = (1.0 + beta) * old_pred - beta * new_pred
         x0_pos = xt - t_exp * positive_pred
@@ -263,11 +268,11 @@ class DiffusionNFT(StageAlgorithm):
             neg_loss = ((x0_neg - x0_for_mse) ** 2).mean(dim=reduce_dims)
 
         policy_loss = (r * pos_loss / beta + (1.0 - r) * neg_loss / beta).mean()
-        total = policy_loss * float(self.config.adv_std_saturate)
+        total = policy_loss * self.config.adv_std_saturate
 
         ref_deviation = self._reference_deviation(conditions, xt=xt, t_batch=t_batch, new_pred=new_pred)
         if ref_deviation is not None:
-            total = total + float(self.config.ref_deviation_coef) * ref_deviation
+            total = total + self.config.ref_deviation_coef * ref_deviation
 
         metrics = {
             "policy_loss": float(policy_loss.detach().item()),
@@ -282,7 +287,7 @@ class DiffusionNFT(StageAlgorithm):
         }
         if ref_deviation is not None:
             metrics["ref_prediction_deviation"] = float(ref_deviation.detach().item())
-            metrics["ref_deviation_coef"] = float(self.config.ref_deviation_coef)
+            metrics["ref_deviation_coef"] = self.config.ref_deviation_coef
         return total, metrics
 
     def _reference_deviation(
@@ -314,7 +319,7 @@ class DiffusionNFT(StageAlgorithm):
     ) -> torch.Tensor:
         """Resolve the K scalar timesteps for the outer K-iteration loop."""
         mode = self.config.train_timestep_mode
-        frac = float(self.config.training_timestep_fraction)
+        frac = self.config.training_timestep_fraction
         if mode == "all":
             if segment.sigmas is None:
                 raise ValueError(
@@ -334,7 +339,7 @@ class DiffusionNFT(StageAlgorithm):
                 ts = ts[:-1]
             if ts.numel() > 0 and frac != 1.0:
                 start, end = normalize_timestep_fraction(frac)
-                n = int(ts.numel())
+                n = ts.numel()
                 eff_start = int(n * start)
                 eff_end = min(int(n * end), n)
                 ts = ts[eff_start:eff_end] if eff_start < eff_end else ts[:0]
@@ -345,26 +350,10 @@ class DiffusionNFT(StageAlgorithm):
         else:
             raise ValueError(f"DiffusionNFT: unsupported train_timestep_mode={mode!r}")
 
-        if bool(self.config.shuffle_train_timesteps):
-            perm = torch.randperm(int(ts.numel()), device=device)
+        if self.config.shuffle_train_timesteps:
+            perm = torch.randperm(ts.numel(), device=device)
             ts = ts[perm]
         return ts
-
-    @staticmethod
-    def _compute_dtype(x0: torch.Tensor) -> torch.dtype:
-        """fp32 timestep tensor — forward-diffusion arithmetic loses too much precision in bf16 near the endpoints."""
-        del x0
-        return torch.float32
-
-
-def _typed_conditions(
-    conditions: Mapping[str, Condition],
-    conditions_cls: Optional[Type[Any]],
-) -> Any:
-    """Wrap the conditions dict into the stage's typed container, or pass through when no class is given."""
-    if conditions_cls is None:
-        return conditions
-    return conditions_cls.from_dict(dict(conditions))
 
 
 __all__ = ["DiffusionNFT", "DiffusionNFTConfig"]
