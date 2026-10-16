@@ -104,9 +104,10 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
             past_kv_in = state.past_key_values
 
         if use_cache and is_first:
-            past_kv_in = sys.modules[type(transformer).__module__].HunyuanStaticCache(
+            cache_cls = sys.modules[type(transformer).__module__].HunyuanStaticCache
+            past_kv_in = cache_cls(
                 config=transformer.config,
-                batch_size=int(fused.input_ids.shape[0]),
+                batch_size=n_fused,
                 max_cache_len=int(fused.input_ids.shape[1]),
                 dtype=torch.bfloat16,
                 dynamic=False,

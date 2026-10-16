@@ -2,9 +2,7 @@
 
 from unirl.rollout.engine.vllm_omni.adapters.bagel import (
     BagelAdapter,
-    BagelInputAdapter,
     BagelIt2iAdapter,
-    BagelOutputAdapter,
     BagelT2iAdapter,
 )
 from unirl.rollout.engine.vllm_omni.adapters.base import (
@@ -49,9 +47,7 @@ __all__ = [
     "DitInputAdapter",
     "DitOutputAdapter",
     "BagelAdapter",
-    "BagelInputAdapter",
     "BagelIt2iAdapter",
-    "BagelOutputAdapter",
     "BagelT2iAdapter",
     "Hi3ArRecaptionAdapter",
     "Hi3ArRecaptionOutputAdapter",
