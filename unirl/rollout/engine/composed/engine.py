@@ -166,6 +166,7 @@ class ComposedRolloutEngine(BaseRolloutEngine):
 
     def _generate_core(self, sample: Sample) -> Sample:
         """Run the PE serial flow for a whole ``Sample`` → filled 3-part output."""
+        sample.reject_row_canvases(engine="ComposedRolloutEngine")
         input_part, ar_shell, diffusion_shell = self._unpack_request(sample)
 
         P = len(input_part.sample_ids)

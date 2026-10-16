@@ -25,8 +25,15 @@ DOMAIN_KEY = "domain"
 class TeacherSpec:
     """One distillation teacher."""
 
-    name: str
+    name: str = ""
     guidance_scale: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        if not self.name:
+            raise ValueError(f"DiffusionOPD: every teacher entry needs a 'name'; got {self!r}.")
+        self.name = str(self.name)
+        if self.guidance_scale is not None:
+            self.guidance_scale = float(self.guidance_scale)
 
 
 class DiffusionOPD(StageAlgorithm):
@@ -61,37 +68,29 @@ class DiffusionOPD(StageAlgorithm):
         self.params = params
         self.conditions_cls = conditions_cls
         self.add_kl_coefficient = bool(add_kl_coefficient)
-        if self.add_kl_coefficient and not float(getattr(params, "eta", 0.0)) > 0.0:
+        if self.add_kl_coefficient and not params.eta > 0.0:
             raise ValueError(
                 "DiffusionOPD: add_kl_coefficient=True normalizes by the SDE transition std, "
-                f"which scales with sampling eta; got eta={getattr(params, 'eta', None)!r}. "
+                f"which scales with sampling eta; got eta={params.eta!r}. "
                 "Use a noised rollout (eta > 0), or add_kl_coefficient=False for ODE mean-matching."
             )
 
         self.teachers: Dict[str, TeacherSpec] = {}
-        for entry in teachers or []:
-            if isinstance(entry, TeacherSpec):
-                spec = entry
-            else:
-                get = entry.get if hasattr(entry, "get") else lambda k, d=None: getattr(entry, k, d)
-                name = get("name")
-                if not name:
-                    raise ValueError(f"DiffusionOPD: every teacher entry needs a 'name'; got {entry!r}.")
-                gs = get("guidance_scale")
-                spec = TeacherSpec(name=str(name), guidance_scale=None if gs is None else float(gs))
+        for entry in teachers or ():
+            spec = entry if isinstance(entry, TeacherSpec) else TeacherSpec(**entry)
             if spec.name in self.teachers:
                 raise ValueError(f"DiffusionOPD: duplicate teacher name {spec.name!r}.")
             self.teachers[spec.name] = spec
         if not self.teachers:
             raise ValueError("DiffusionOPD: at least one teacher is required.")
 
-        model = getattr(backend, "model", None) if backend is not None else None
-        if model is None:
+        if backend is None or backend.model is None:
             raise ValueError(
                 "DiffusionOPD: no `backend` was injected — the teacher adapters live on the "
                 "trainable model. The v2 DiffusionTrainer injects it when the algorithm "
                 "declares requires_backend=True."
             )
+        model = backend.model
         self._model = model
         present = adapter_names(model)
         missing = sorted(set(self.teachers) - present)
@@ -197,7 +196,7 @@ class DiffusionOPD(StageAlgorithm):
             self.stage,
             segment=segment,
             target_steps=target_steps,
-            eta=float(getattr(self.params, "eta", 1.0)),
+            eta=self.params.eta,
             device=student_means.device,
             add_coefficient=self.add_kl_coefficient,
         )

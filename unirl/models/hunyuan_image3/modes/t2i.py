@@ -2,47 +2,25 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING
 
 from unirl.config.require import require
-from unirl.types.noise_recipe import NoiseRecipe
 from unirl.types.primitives import Texts
-from unirl.types.sample import Part, Sample
+from unirl.types.sample import Sample
 from unirl.types.sampling import DiffusionSamplingParams
 
 from ..conditions import HunyuanImage3DiffusionConditions, split_cfg_fused
+from ..seed import prepare_seeded_sampling
 
 if TYPE_CHECKING:
     from ..pipeline import HunyuanImage3Pipeline
-
-
-def _prepare_seeded_sampling(
-    sample: Sample,
-    frontier: Part,
-    params: DiffusionSamplingParams,
-) -> Tuple[DiffusionSamplingParams, Optional[List[str]]]:
-    """Prepare request-local RNG streams without touching global RNG state."""
-    recipe_ids = [str(key) for key in NoiseRecipe.from_sample(sample).noise_group_ids]
-    if params.seed is None or not recipe_ids:
-        return params, None
-    if len(recipe_ids) != frontier.batch_size:
-        raise ValueError(
-            "HunyuanImage3 t2i seeded sampling requires noise keys aligned with "
-            f"the frontier batch; got {len(recipe_ids)} for {frontier.batch_size}."
-        )
-
-    sample_ids = [str(sample_id) for sample_id in frontier.sample_ids]
-    seeded_params = replace(params, noise_group_ids=recipe_ids)
-    sde_sample_keys = [f"{recipe_id}:sample:{sample_id}" for recipe_id, sample_id in zip(recipe_ids, sample_ids)]
-    return seeded_params, sde_sample_keys
 
 
 def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
     """t2i — single-stage text-to-image, filling the frontier (pre-forked) gen Part."""
     frontier = sample.frontier_gen_part(DiffusionSamplingParams)
     params = frontier.sampling_params
-    params, sde_sample_keys = _prepare_seeded_sampling(sample, frontier, params)
+    params, sde_sample_keys = prepare_seeded_sampling(sample, frontier, params)
     if params.sigmas is None:
         raise ValueError(
             "HunyuanImage3 t2i: gen part sampling_params.sigmas is None. The hosting engine must "
@@ -58,19 +36,15 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
     )
 
     control = sample.parts[0].control
-    bot_task: str = str(control.get("bot_task", "image"))
-    sys_type = control.get("sys_type")
-    sequence_template = control.get("sequence_template")
-
-    cfg = float(params.guidance_scale) > 1.0
+    cfg = params.guidance_scale > 1.0
     mm = pipeline.text_embed.embed_for_gen_image(
         texts,
         cfg=cfg,
-        height=int(params.height),
-        width=int(params.width),
-        bot_task=bot_task,
-        sys_type=None if sys_type is None else str(sys_type),
-        sequence_template=None if sequence_template is None else str(sequence_template),
+        height=params.height,
+        width=params.width,
+        bot_task=control.get("bot_task", "image"),
+        sys_type=control.get("sys_type"),
+        sequence_template=control.get("sequence_template"),
     )
 
     fused, fused_uncond = split_cfg_fused(mm["fused"], frontier.batch_size, cfg=cfg)

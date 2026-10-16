@@ -114,9 +114,8 @@ class BagelARStage(ARStage[BagelARConditions]):
             self.replay_attention_backend in ("sdpa", "flex"),
             f"BagelARStage: replay_attention_backend must be 'sdpa' or 'flex'; got {replay_attention_backend!r}.",
         )
-        llm_cfg = getattr(getattr(getattr(model, "model", None), "config", None), "llm_config", None)
         require(
-            not getattr(llm_cfg, "freeze_und", False),
+            not model.model.config.llm_config.freeze_und,
             "BagelARStage: llm_config.freeze_und=True — this checkpoint's und path is frozen by design.",
         )
 

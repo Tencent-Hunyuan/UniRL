@@ -38,7 +38,6 @@ class AsyncDiffusionTrainer(AsyncRolloutTrainerMixin, DiffusionTrainer):
         layout = diffusion_kwargs.setdefault("layout", "separate")
         if layout != "separate":
             raise ValueError(f"AsyncDiffusionTrainer requires layout='separate', got {layout!r}.")
-        max_inflight = int(max_inflight)
         if max_inflight != 1:
             raise ValueError(
                 "AsyncDiffusionTrainer requires max_inflight=1: queued generations can block "
@@ -61,13 +60,11 @@ class AsyncDiffusionTrainer(AsyncRolloutTrainerMixin, DiffusionTrainer):
                 "that is about to be asked to generate. Drop the key or use the synchronous "
                 "trainer."
             )
-        per_worker_inflight = int(per_worker_inflight)
         cfg = diffusion_kwargs["cfg"]
-        train_fraction = float(diffusion_kwargs.get("train_fraction", 0.5))
+        train_fraction = diffusion_kwargs.get("train_fraction", 0.5)
         configured_concurrency = cfg.get("worker_max_concurrency")
-        configured_concurrency = None if configured_concurrency is None else int(configured_concurrency)
         _, worker_concurrency = resolve_separate_worker_concurrency(
-            num_devices=int(cfg.num_devices),
+            num_devices=cfg.num_devices,
             train_fraction=train_fraction,
             per_worker_inflight=per_worker_inflight,
             configured_concurrency=configured_concurrency,
@@ -78,17 +75,12 @@ class AsyncDiffusionTrainer(AsyncRolloutTrainerMixin, DiffusionTrainer):
             **diffusion_kwargs,
         )
 
-        if self.weight_sync is None:
-            raise ValueError(
-                "AsyncDiffusionTrainer requires a cross-slab weight sync; add a `sync:` block to the recipe."
-            )
-
         self._max_inflight = max_inflight
         self._per_worker_inflight = per_worker_inflight
         self._max_inflight_prompts = self._max_inflight * self.batch_size
-        self._weight_sync_interval = int(weight_sync_interval)
+        self._weight_sync_interval = weight_sync_interval
         self._max_staleness = self._weight_sync_interval - 1
-        self._num_updates_per_batch = int(diffusion_kwargs["stack_cfg"].get("num_updates_per_batch", 1))
+        self._num_updates_per_batch = diffusion_kwargs["stack_cfg"].get("num_updates_per_batch", 1)
         if self._weight_sync_interval < 1:
             raise ValueError(f"weight_sync_interval must be >= 1, got {self._weight_sync_interval}")
         if self._num_updates_per_batch < 1:

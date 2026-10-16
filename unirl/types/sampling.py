@@ -77,9 +77,9 @@ def total_samples_per_prompt(sampling: Any) -> int:
     if _is_param_dict(sampling):
         total = 1
         for params in sampling.values():
-            total *= int(getattr(params, "samples_per_prompt", 1))
+            total *= 1 if params is None else params.samples_per_prompt
         return total
-    return int(getattr(sampling, "samples_per_prompt", 1))
+    return sampling.samples_per_prompt
 
 
 def is_forward_process(sde_indices: Optional[Sequence[int]]) -> bool:
@@ -185,11 +185,11 @@ class DiffusionSamplingParams(BaseSamplingParams):
     def get_sde_indices(self, rollout_id: int) -> List[int]:
         """SDE steps for ``rollout_id``: a preset list, else ``scheduler.get_sde_indices``, else every step."""
         if self.sde_indices is not None:
-            return [int(i) for i in self.sde_indices]
+            return list(self.sde_indices)
         scheduler: Optional[TimestepScheduler] = self.scheduler
         if scheduler is not None:
             return sorted(scheduler.get_sde_indices(int(rollout_id)))
-        return list(range(int(self.num_inference_steps)))
+        return list(range(self.num_inference_steps))
 
 
 @dataclass

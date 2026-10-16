@@ -123,8 +123,8 @@ class RLStableDiffusion3Pipeline(StableDiffusion3Pipeline):
 
     def _arm_sde(self, req: OmniDiffusionRequest) -> None:
         """This request's SDE strength + sparse step gate."""
-        eta = float(getattr(req.sampling_params, "eta", 0.0) or 0.0)
-        extra = getattr(req.sampling_params, "extra_args", None) or {}
+        eta = float(req.sampling_params.eta)
+        extra = req.sampling_params.extra_args
         self.scheduler.arm(eta=eta, sde_indices=extra.get("sde_indices"))
 
     def _arm_initial_noise(self, req: OmniDiffusionRequest) -> None:

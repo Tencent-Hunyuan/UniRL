@@ -236,10 +236,20 @@ use LoRA adapter mode. Formats and export live in
   uninitialized adapter. Teachers must be plain LoRA deltas: unconverted base-rewriting
   inits (pissa, olora, ...), `modules_to_save`, `layer_replication`,
   `trainable_token_indices`, DoRA, and `bias != "none"` are rejected at startup.
+- **Every rank must read the same frozen teacher weights** — each rank loads its own shard
+  from its own copy of the path, so after injection the ranks compare each teacher's
+  content sha256 and raise on any difference instead of training against a mixed teacher.
 - **Adapter checkpoints exclude frozen teachers, and resume requires the same teachers** —
   teachers reload from their paths and the checkpoint pins each by a content sha256, so a
   different teacher set or different weights raises on `load`. A checkpoint trained without
   teachers resumes into any teacher set.
+- **`first_update_ratio_tol` on `TrainStack` requires an algorithm that emits
+  `ratio_min` and `ratio_max`.** When set, each rank checks the pre-step micros of a
+  rollout's first update (where the ratio against `old_logp_source: replay` or a
+  weight-synced `old_logp_source: rollout` is 1 up to numerical noise), warns past
+  the tolerance, and reports DP rank 0's worst `|ratio - 1|` as
+  `first_update_ratio_dev`. Algorithms that omit `ratio_min` (`DPPO`, `DRPO`,
+  `CPPO`, `DiffusionNFT`, `SFT`) raise `KeyError` on the first backward micro.
 
 ## Profiling → Perfetto
 

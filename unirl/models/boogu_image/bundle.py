@@ -124,9 +124,7 @@ class BooguImageBundle(Bundle):
                 path, subfolder="transformer", torch_dtype=dtype
             ).to(device)
 
-        if bool(getattr(transformer, "enable_teacache", False)) or bool(
-            getattr(transformer, "enable_taylorseer", False)
-        ):
+        if transformer.enable_teacache or transformer.enable_taylorseer:
             raise RuntimeError(
                 "BooguImageBundle: transformer loaded with TeaCache/TaylorSeer "
                 "enabled — RL rollout/replay must be cache-free."

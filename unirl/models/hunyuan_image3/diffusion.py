@@ -104,7 +104,14 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
             past_kv_in = state.past_key_values
 
         if use_cache and is_first:
-            past_kv_in = self._build_kv_cache(transformer, conditions)
+            cache_cls = sys.modules[type(transformer).__module__].HunyuanStaticCache
+            past_kv_in = cache_cls(
+                config=transformer.config,
+                batch_size=n_fused,
+                max_cache_len=int(fused.input_ids.shape[1]),
+                dtype=torch.bfloat16,
+                dynamic=False,
+            )
 
         if is_first:
             cond_vae = conditions.cond_vae
@@ -243,26 +250,6 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
             result = pred
 
         return result
-
-    @staticmethod
-    def _build_kv_cache(transformer, conditions: HunyuanImage3DiffusionConditions):
-        """Build a ``HunyuanStaticCache`` sized for the full sequence."""
-        fused = conditions.fused
-        if fused is None or fused.input_ids is None:
-            return None
-        upstream_mod = sys.modules[type(transformer).__module__]
-        cache_cls = getattr(upstream_mod, "HunyuanStaticCache", None)
-        if cache_cls is None:
-            return None
-        max_cache_len = int(fused.input_ids.shape[1])
-        batch_size = int(fused.input_ids.shape[0])
-        return cache_cls(
-            config=transformer.config,
-            batch_size=batch_size,
-            max_cache_len=max_cache_len,
-            dtype=torch.bfloat16,
-            dynamic=False,
-        )
 
     @staticmethod
     def _update_state(

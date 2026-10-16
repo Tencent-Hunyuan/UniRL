@@ -40,10 +40,6 @@ def _packed_replay_supported(attn_impl: Optional[str]) -> bool:
     if attn_impl not in _SPARSE_PACKED_ATTN:
         _warn_packed_disabled(str(attn_impl))
         return False
-    try:
-        from transformers.masking_utils import find_packed_sequence_indices  # noqa: F401
-    except Exception:
-        return False
     return True
 
 
@@ -256,7 +252,7 @@ class QwenVLARStage(ARStage[QwenVLARConditions]):
         temperature: float = 1.0,
     ) -> torch.Tensor:
         """Prefer :meth:`packed_replay` (B > 1), else :meth:`padding_replay`; returns varlen ``[total_tokens]``."""
-        attn_impl = getattr(getattr(self.model.transformer, "config", None), "_attn_implementation", None)
+        attn_impl = self.model.transformer.config._attn_implementation
         if _packed_replay_supported(attn_impl):
             packed = self.packed_replay(conditions, segment=segment, temperature=temperature)
             if packed is not None:

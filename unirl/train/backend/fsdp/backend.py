@@ -123,11 +123,11 @@ class FSDPBackend(BaseFSDP2Backend):
             reshard_after_forward=fsdp_cfg.reshard_after_forward,
             forward_prefetch=fsdp_cfg.forward_prefetch,
             activation_checkpointing=fsdp_cfg.activation_checkpointing,
-            ac_wrap_order=getattr(fsdp_cfg, "ac_wrap_order", "outside"),
+            ac_wrap_order=fsdp_cfg.ac_wrap_order,
             use_torch_compile=fsdp_cfg.use_torch_compile,
-            master_dtype=getattr(fsdp_cfg, "master_dtype", None),
+            master_dtype=fsdp_cfg.master_dtype,
             master_params=tuple(shd for _, shd in shadow.iter_pairs()) if shadow is not None else (),
-            root_wrap=getattr(fsdp_cfg, "root_wrap", True),
+            root_wrap=fsdp_cfg.root_wrap,
             copy_engine_all_gather=fsdp_cfg.copy_engine_all_gather,
         )
 
