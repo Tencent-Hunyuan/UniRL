@@ -21,8 +21,8 @@ from unirl.sde.unipc import UniPCSpec, UniPCStrategy
 
 def _scheduler_timestep_scale(scheduler: Any) -> float:
     """Return the live scheduler's own timestep scale, which ``index_for_timestep`` matches against."""
-    actual = getattr(scheduler.config, "num_train_timesteps", None)
-    if not isinstance(actual, (int, float)) or not float(actual) > 0.0:
+    actual = scheduler.config.num_train_timesteps
+    if not isinstance(actual, (int, float)) or not actual > 0:
         raise RuntimeError(f"FastVideo scheduler has no usable num_train_timesteps: {actual!r}")
     return float(actual)
 
@@ -37,7 +37,7 @@ class FastVideoUniPCPlan:
     timestep_scale: float = 0.0
 
     def __post_init__(self) -> None:
-        canonical = str(self.sde_type).strip().lower()
+        canonical = self.sde_type.strip().lower()
         if canonical not in {"flow", "dance"}:
             raise ValueError(f"FastVideo UniPC supports SDE type 'flow' or 'dance'; got {self.sde_type!r}")
         indices = tuple(int(i) for i in self.sde_indices)
@@ -58,14 +58,14 @@ class FastVideoUniPCPlan:
 def _strategy_from_plan(scheduler: Any, plan: FastVideoUniPCPlan) -> UniPCStrategy:
     """Build the canonical strategy from the plan spec after validating the live worker scheduler contract."""
     config = scheduler.config
-    prediction_type = str(getattr(config, "prediction_type", ""))
+    prediction_type = config.prediction_type
     if prediction_type != "flow_prediction":
         raise RuntimeError(f"FastVideo UniPC requires prediction_type='flow_prediction'; got {prediction_type!r}")
-    if not bool(getattr(scheduler, "predict_x0", True)):
+    if not scheduler.predict_x0:
         raise RuntimeError("FastVideo UniPC requires predict_x0=True")
-    if bool(getattr(config, "thresholding", False)):
+    if config.thresholding:
         raise RuntimeError("FastVideo UniPC does not support thresholding=True")
-    if getattr(scheduler, "solver_p", None) is not None:
+    if scheduler.solver_p is not None:
         raise RuntimeError("FastVideo UniPC does not support a nested solver_p")
     # The checkpoint solver spec is verified engine-side at init (README: Solver SSOT).
     return UniPCStrategy(config=plan.spec)
@@ -111,7 +111,7 @@ def _patch_scheduler_set_timesteps() -> None:
             self._unirl_device_sigmas = None
             return
 
-        if mu is not None or shift is not None or bool(use_karras_sigmas) or bool(use_kerras_sigma):
+        if mu is not None or shift is not None or use_karras_sigmas or use_kerras_sigma:
             raise ValueError(
                 "FastVideo received a canonical external sigma schedule together with a schedule transform"
             )
@@ -130,12 +130,12 @@ def _patch_scheduler_set_timesteps() -> None:
             )
         if external[-1] == 0.0:
             raise ValueError("FastVideo external sigmas must omit the terminal zero")
-        if num_inference_steps is not None and int(num_inference_steps) != int(external.size):
+        if num_inference_steps is not None and num_inference_steps != external.size:
             raise ValueError(
                 f"FastVideo num_inference_steps={num_inference_steps} does not match "
                 f"the external sigma count {external.size}"
             )
-        if str(getattr(self.config, "final_sigmas_type", "zero")) != "zero":
+        if self.config.final_sigmas_type != "zero":
             raise ValueError("FastVideo canonical UniPC requires final_sigmas_type='zero'")
 
         timestep_scale = _scheduler_timestep_scale(self)
@@ -145,7 +145,7 @@ def _patch_scheduler_set_timesteps() -> None:
         self.timesteps = torch.from_numpy(external * timestep_scale).to(device=device, dtype=torch.float32)
         self.num_inference_steps = int(external.size)
 
-        solver_order = int(self.config.solver_order)
+        solver_order = self.config.solver_order
         self.model_outputs = [None] * solver_order
         self.timestep_list = [None] * solver_order
         self.lower_order_nums = 0
@@ -241,14 +241,14 @@ def _patch_denoising_step() -> None:
             raise NotImplementedError("Pixel-level log prob is not supported for canonical UniPC")
 
         if strategy is None:
-            if not bool(getattr(scheduler, "_unirl_canonical_schedule", False)):
+            if not getattr(scheduler, "_unirl_canonical_schedule", False):
                 raise RuntimeError(
                     "FastVideo worker did not install the canonical UniPC schedule patch before denoising"
                 )
-            if float(getattr(scheduler, "_unirl_timestep_scale", 0.0)) != float(sde_type.timestep_scale):
+            if scheduler._unirl_timestep_scale != sde_type.timestep_scale:
                 raise RuntimeError(
                     "FastVideo scheduler was pinned with a different model timestep scale than this request's "
-                    f"plan: scheduler={getattr(scheduler, '_unirl_timestep_scale', None)!r}, "
+                    f"plan: scheduler={scheduler._unirl_timestep_scale!r}, "
                     f"plan={sde_type.timestep_scale!r}"
                 )
             strategy = _strategy_from_plan(scheduler, sde_type)

@@ -34,11 +34,11 @@ class QwenImageEditPlusAdapter(QwenImageAdapter):
                 f"image turn; got {len(text_turns)} text and {len(image_batches)} image."
             )
         gen_part = sample.frontier_gen_part(DiffusionSamplingParams)
-        prompts = list(text_turns[0].texts)
-        unique_prompts, k = utils.deexpand_prompts_from_groups(prompts, list(gen_part.group_ids))
+        prompts = text_turns[0].texts
+        unique_prompts, k = utils.deexpand_prompts_from_groups(prompts, gen_part.group_ids)
         images_prim = image_batches[0]
         pil_images = images_prim.to_pils()
-        unique_pils = utils.first_per_group(pil_images, list(gen_part.group_ids)) if k > 1 else pil_images
+        unique_pils = utils.first_per_group(pil_images, gen_part.group_ids) if k > 1 else pil_images
         out: Dict[str, Any] = {
             "prompt": unique_prompts if len(unique_prompts) > 1 else unique_prompts[0],
             "condition_image": unique_pils if len(unique_pils) > 1 else unique_pils[0],

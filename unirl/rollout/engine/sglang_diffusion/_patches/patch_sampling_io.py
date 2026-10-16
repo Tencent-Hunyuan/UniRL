@@ -331,7 +331,7 @@ def _partition_prompt_tensor(value, *, prompt_index: int, num_prompts: int, num_
         return None
     if not torch.is_tensor(value) or value.dim() < 1:
         raise TypeError(f"{field} must be a tensor with a batch dimension")
-    count = int(value.shape[0])
+    count = value.shape[0]
     total = num_prompts * num_outputs
     if count == 1:
         return value
@@ -364,12 +364,10 @@ def _slice_output_tensor(value, *, output_index: int, num_outputs: int, field: s
         return None
     if not torch.is_tensor(value) or value.dim() < 1:
         raise TypeError(f"{field} must be a tensor with a batch dimension")
-    if int(value.shape[0]) == 1:
+    if value.shape[0] == 1:
         return value
-    if int(value.shape[0]) != num_outputs:
-        raise ValueError(
-            f"{field} prompt batch dim {int(value.shape[0])} must be 1 or num_outputs_per_prompt={num_outputs}"
-        )
+    if value.shape[0] != num_outputs:
+        raise ValueError(f"{field} prompt batch dim {value.shape[0]} must be 1 or num_outputs_per_prompt={num_outputs}")
     return value[output_index : output_index + 1]
 
 
@@ -380,9 +378,7 @@ def _wrap_expand_request_outputs(utils_mod) -> None:
         return
 
     def expand_request_outputs(req, *, num_prompts=1, prompt_index=0):
-        num_prompts = int(num_prompts)
-        prompt_index = int(prompt_index)
-        num_outputs = int(req.num_outputs_per_prompt)
+        num_outputs = req.num_outputs_per_prompt
         if not 0 <= prompt_index < num_prompts:
             raise IndexError(f"prompt_index={prompt_index} is outside num_prompts={num_prompts}")
 

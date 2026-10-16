@@ -92,9 +92,9 @@ def resolve_sampling(config: Any, sample: Sample) -> ResolvedSampling:
 
     raw_top_k = ar.top_k
     block: Dict[str, Any] = {
-        "temperature": float(ar.temperature),
-        "max_new_tokens": int(ar.max_new_tokens),
-        "top_p": float(ar.top_p),
+        "temperature": ar.temperature,
+        "max_new_tokens": ar.max_new_tokens,
+        "top_p": ar.top_p,
         "top_k": raw_top_k if raw_top_k > 0 else -1,
         "n": n,
     }

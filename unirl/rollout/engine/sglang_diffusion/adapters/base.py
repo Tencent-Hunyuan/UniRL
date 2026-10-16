@@ -82,14 +82,14 @@ class ModelAdapter(ABC):
         mc = self.model_config
         return FlowMatchSchedulePolicy.from_pretrained(
             mc.pretrained_model_ckpt_path,
-            shift=float(mc.shift),
-            require_dynamic=bool(getattr(mc, "use_dynamic_shifting", False)),
+            shift=mc.shift,
+            require_dynamic=getattr(mc, "use_dynamic_shifting", False),
             dynamic_overrides=getattr(mc, "dynamic_shift_overrides", None),
         )
 
     def lora_spec(self) -> Tuple[str, List[str]]:
         prefix = self.model_config.weight_sync_param_name_prefix
-        return (str(prefix) if prefix is not None else ""), ["transformer"]
+        return (prefix if prefix is not None else ""), ["transformer"]
 
     def validate(self) -> None:
         mc = self.model_config

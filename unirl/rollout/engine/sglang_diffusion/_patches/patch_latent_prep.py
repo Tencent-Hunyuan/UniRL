@@ -12,10 +12,10 @@ _DEBUG = os.environ.get("UNIRL_DEBUG_LATENT_SHAPE") == "1"
 
 def _expand_initial_noise(latents: torch.Tensor, batch_size: int, num_outputs_per_prompt: int) -> torch.Tensor:
     """Expand provided initial noise to ``batch_size`` (fork's rule)."""
-    n = int(latents.shape[0])
+    n = latents.shape[0]
     if n == batch_size:
         return latents
-    nopp = max(1, int(num_outputs_per_prompt))
+    nopp = max(1, num_outputs_per_prompt)
     num_prompts = batch_size // nopp
     if n == 1:
         return latents.expand(batch_size, *latents.shape[1:]).contiguous()
@@ -45,18 +45,18 @@ def patch_latent_prep() -> None:
             return orig(self, batch, server_args)
 
         device = get_local_torch_device()
-        batch_size = int(batch.batch_size)
-        nopp = int(batch.num_outputs_per_prompt)
+        batch_size = batch.batch_size
+        nopp = batch.num_outputs_per_prompt
         pcfg = server_args.pipeline_config
 
         latents = _expand_initial_noise(latents, batch_size, nopp).to(device=device)
 
-        num_frames = int(batch.num_frames)
-        expected = tuple(int(d) for d in pcfg.prepare_latent_shape(batch, batch_size, num_frames))
+        num_frames = batch.num_frames
+        expected = tuple(pcfg.prepare_latent_shape(batch, batch_size, num_frames))
         if (
             latents.ndim == 4
             and len(expected) == 5
-            and expected[1] == int(latents.shape[1])
+            and expected[1] == latents.shape[1]
             and expected[2] == 1
             and latents.numel() == math.prod(expected)
         ):

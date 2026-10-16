@@ -69,9 +69,9 @@ def _terminate_server_process(process: multiprocessing.Process, *, timeout_s: fl
     if pid is None:
         return
 
-    kill_process_tree(int(pid))
+    kill_process_tree(pid)
     try:
-        process.join(timeout=float(timeout_s))
+        process.join(timeout=timeout_s)
     except Exception:
         logger.exception("Failed to join SGLang SRT server process pid=%s after SIGTERM", pid)
         return
@@ -85,7 +85,7 @@ def _terminate_server_process(process: multiprocessing.Process, *, timeout_s: fl
         return
 
     logger.warning("SGLang SRT server process pid=%s ignored SIGTERM; sending SIGKILL", pid)
-    _signal_process_tree(int(pid), signal.SIGKILL)
+    _signal_process_tree(pid, signal.SIGKILL)
     try:
         process.join(timeout=1.0)
     except Exception:
@@ -240,10 +240,10 @@ class HTTPBackend:
     ) -> None:
         self._server_process: Optional[multiprocessing.Process] = server_process
         self._base_url = base_url
-        self._concurrency = int(concurrency)
-        self._tp_size = int(tp_size)
+        self._concurrency = concurrency
+        self._tp_size = tp_size
         self._rt = runtime
-        self._sem = threading.Semaphore(int(concurrency))
+        self._sem = threading.Semaphore(concurrency)
         self._logged_first_response = False
 
     @classmethod
@@ -528,11 +528,11 @@ class HTTPBackend:
             "/init_weights_update_group",
             self._rt["InitWeightsUpdateGroupReqInput"](
                 master_address=master_address,
-                master_port=int(master_port),
-                rank_offset=int(rank_offset),
-                world_size=int(world_size),
-                group_name=str(group_name),
-                backend=str(backend),
+                master_port=master_port,
+                rank_offset=rank_offset,
+                world_size=world_size,
+                group_name=group_name,
+                backend=backend,
             ),
             "init_weights_group",
         )
@@ -563,10 +563,10 @@ class HTTPBackend:
         self._post_struct(
             "/update_weights_from_distributed",
             self._rt["UpdateWeightsFromDistributedReqInput"](
-                names=list(names),
-                dtypes=list(dtypes),
-                shapes=[list(s) for s in shapes],
-                group_name=str(group_name),
+                names=names,
+                dtypes=dtypes,
+                shapes=shapes,
+                group_name=group_name,
                 flush_cache=flush_cache,
             ),
             "update_from_distributed",
@@ -575,7 +575,7 @@ class HTTPBackend:
     def destroy_weights_group(self, *, group_name: str) -> None:
         self._post_struct(
             "/destroy_weights_update_group",
-            self._rt["DestroyWeightsUpdateGroupReqInput"](group_name=str(group_name)),
+            self._rt["DestroyWeightsUpdateGroupReqInput"](group_name=group_name),
             "destroy_weights_group",
         )
 

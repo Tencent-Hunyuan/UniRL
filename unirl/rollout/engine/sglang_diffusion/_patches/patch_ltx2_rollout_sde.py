@@ -162,10 +162,7 @@ def _patch_sde_logprob_bridge() -> None:
         LTX2DenoisingStage,
     )
 
-    from unirl.rollout.engine.sglang_diffusion._patches.patch_denoising import (
-        _make_step_generators,
-        _resolve_base_seed,
-    )
+    from unirl.sde.noise import make_denoise_step_generators
 
     orig_stage_step = LTX2DenoisingStage._run_denoising_step
     if not getattr(orig_stage_step, _SENTINEL, False):
@@ -174,10 +171,12 @@ def _patch_sde_logprob_bridge() -> None:
             original_generator = batch.generator
             denoise_seeds = batch.denoise_seeds
             if batch.rollout and denoise_seeds is not None:
-                base_seed = _resolve_base_seed(batch)
+                base_seed = batch.seed
                 if base_seed is not None:
-                    batch.generator = _make_step_generators(
-                        base_seed, int(step.step_index), ctx.latents.device, list(denoise_seeds)
+                    batch.generator = make_denoise_step_generators(
+                        base_seed=base_seed,
+                        step_index=step.step_index,
+                        sample_ids=denoise_seeds,
                     )
             try:
                 return orig_stage_step(self, ctx, step, batch, server_args)

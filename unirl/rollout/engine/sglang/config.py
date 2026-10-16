@@ -164,23 +164,23 @@ class SGLangEngineConfig(BaseEngineConfig):
 
         intent["model_path"] = self.pretrained_model_ckpt_path
         if self.tp_size is not None:
-            intent["tp_size"] = int(self.tp_size)
+            intent["tp_size"] = self.tp_size
         if self.pp_size is not None:
-            intent["pp_size"] = int(self.pp_size)
+            intent["pp_size"] = self.pp_size
         if self.ep_size is not None:
-            intent["ep_size"] = int(self.ep_size)
+            intent["ep_size"] = self.ep_size
         if self.dp_size is not None:
-            intent["dp_size"] = int(self.dp_size)
+            intent["dp_size"] = self.dp_size
         if self.context_length is not None:
-            intent["context_length"] = int(self.context_length)
+            intent["context_length"] = self.context_length
         if self.enable_memory_saver is not None:
-            intent["enable_memory_saver"] = bool(self.enable_memory_saver)
+            intent["enable_memory_saver"] = self.enable_memory_saver
         if self.enable_weights_cpu_backup is not None:
-            intent["enable_weights_cpu_backup"] = bool(self.enable_weights_cpu_backup)
+            intent["enable_weights_cpu_backup"] = self.enable_weights_cpu_backup
         if self.skip_server_warmup is not None:
-            intent["skip_server_warmup"] = bool(self.skip_server_warmup)
+            intent["skip_server_warmup"] = self.skip_server_warmup
         if self.host is not None:
-            intent["host"] = str(self.host)
+            intent["host"] = self.host
 
         if extra:
             intent.update(extra)

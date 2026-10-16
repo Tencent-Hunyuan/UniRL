@@ -36,7 +36,7 @@ def _flow_sde_sampling_with_dance(
     sde_type = batch.rollout_sde_type
     noise_level = float(batch.rollout_noise_level)
     log_prob_no_const = batch.rollout_log_prob_no_const
-    debug_mode = bool(batch.rollout_debug_mode)
+    debug_mode = batch.rollout_debug_mode
     # ``FlowMatchEulerDiscreteScheduler.step`` casts the transition to this dtype
     # before it is stored; trainside replay can only score that stored value.
     emitted_dtype = model_output.dtype

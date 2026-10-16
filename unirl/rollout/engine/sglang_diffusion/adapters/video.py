@@ -89,7 +89,7 @@ class HunyuanVideo10Adapter(VideoAdapter):
                 "HunyuanVideo-1.0: pooled CLIP embed must be [B, hidden] or [B, 1, hidden]",
             )
             require(
-                int(llama.shape[0]) == int(clip.shape[0]),
+                llama.shape[0] == clip.shape[0],
                 "HunyuanVideo-1.0: LLaMA and CLIP prompt embed batch sizes must match",
             )
 
@@ -111,7 +111,7 @@ class HunyuanVideo10Adapter(VideoAdapter):
                     attn_mask=attention_mask.detach().cpu() if attention_mask is not None else None,
                 )
             )
-            clip_list.append(clip.detach().cpu().reshape(int(clip.shape[0]), -1))
+            clip_list.append(clip.detach().cpu().reshape(clip.shape[0], -1))
 
         require(
             all(mask_presence) or not any(mask_presence),
@@ -135,7 +135,7 @@ class Wan22T2VAdapter(VideoAdapter):
         kwargs = super().build_sampling(sample, diffusion=diffusion)
         g2 = diffusion.guidance_scale_2
         if g2 is not None:
-            kwargs["guidance_scale_2"] = float(g2)
+            kwargs["guidance_scale_2"] = g2
         return kwargs
 
 
@@ -153,11 +153,11 @@ class Ltx2T2VAdapter(VideoAdapter):
     def schedule_policy(self):
         from unirl.models.ltx2.schedule import build_ltx2_schedule_policy
 
-        return build_ltx2_schedule_policy(float(self.model_config.shift))
+        return build_ltx2_schedule_policy(self.model_config.shift)
 
     def build_sampling(self, sample: Sample, *, diffusion: Any) -> Dict[str, Any]:
         kwargs = super().build_sampling(sample, diffusion=diffusion)
-        kwargs["max_sequence_length"] = int(self.model_config.max_sequence_length)
+        kwargs["max_sequence_length"] = self.model_config.max_sequence_length
 
         from unirl.models.ltx2.diffusion import audio_latent_shape
         from unirl.types.noise_recipe import NoiseRecipe

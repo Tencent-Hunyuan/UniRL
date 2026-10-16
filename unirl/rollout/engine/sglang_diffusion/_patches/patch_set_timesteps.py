@@ -31,7 +31,7 @@ def patch_set_timesteps() -> None:
             )
 
         cfg = self.config
-        dynamic = bool(cfg.use_dynamic_shifting)
+        dynamic = cfg.use_dynamic_shifting
         stretches = bool(cfg.shift_terminal)
         saved_shift = self.shift
         try:

@@ -54,7 +54,7 @@ class _ForwardResultPipe:
         cached = getattr(inner, "_unirl_last_forward_batch", None) if inner is not None else None
         if isinstance(payload, dict) and "output_batch" in payload and cached is not None:
             for name in _CARRIED:
-                payload.setdefault(name, _to_cpu(getattr(cached, name, None)))
+                payload.setdefault(name, _to_cpu(getattr(cached, name)))
             inner._unirl_last_forward_batch = None
         self._connection.send(_to_cpu(payload))
 

@@ -10,33 +10,13 @@ import torch
 from unirl.sde.noise import MAX_TORCH_SEED, make_denoise_step_generators
 
 
-def _make_step_generators(
-    base_seed: int,
-    step_index: int,
-    device: torch.device,
-    denoise_seeds: list[str],
-) -> list[torch.Generator]:
-    """Per-sample deterministic CPU generators for one SDE step."""
-    del device
-    return make_denoise_step_generators(
-        base_seed=int(base_seed),
-        step_index=int(step_index),
-        sample_ids=[str(seed_key) for seed_key in denoise_seeds],
-    )
-
-
-def _resolve_base_seed(batch) -> int | None:
-    seed = batch.seed
-    return int(seed) if seed is not None else None
-
-
 def _resolve_fallback_seed(batch) -> int:
     """Deterministic per-request seed for the single-``torch.Generator`` fallback."""
-    base_seed = _resolve_base_seed(batch)
+    base_seed = batch.seed
     denoise_seeds = batch.denoise_seeds
     sample_key = str(denoise_seeds[0]) if denoise_seeds else None
     if base_seed is not None and sample_key is not None:
-        payload = (f"{int(base_seed)}::fallback::sample::{sample_key}").encode("utf-8")
+        payload = f"{base_seed}::fallback::sample::{sample_key}".encode("utf-8")
         digest = hashlib.blake2b(payload, digest_size=8).digest()
         return int.from_bytes(digest, byteorder="big", signed=False) % MAX_TORCH_SEED
     return int.from_bytes(os.urandom(8), byteorder="big") % MAX_TORCH_SEED
@@ -54,13 +34,12 @@ def patch_denoising() -> None:
     def _run_denoising_step(self, ctx, step, batch, server_args):
         denoise_seeds = batch.denoise_seeds
         if batch.rollout and denoise_seeds is not None:
-            base_seed = _resolve_base_seed(batch)
+            base_seed = batch.seed
             if base_seed is not None:
-                ctx.extra_step_kwargs["generator"] = _make_step_generators(
-                    base_seed,
-                    int(step.step_index),
-                    ctx.latents.device,
-                    list(denoise_seeds),
+                ctx.extra_step_kwargs["generator"] = make_denoise_step_generators(
+                    base_seed=base_seed,
+                    step_index=step.step_index,
+                    sample_ids=denoise_seeds,
                 )
         return orig(self, ctx, step, batch, server_args)
 

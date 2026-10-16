@@ -85,7 +85,7 @@ class TextLMAdapter(ModelAdapter):
                 payload = self.base_payload(sampling, sample_id=sample_id)
                 ids = self.apply_chat_template(messages)
                 payload["input_ids"] = ids
-                prompt_token_ids.append(list(ids))
+                prompt_token_ids.append(ids)
                 wire.append(payload)
         else:
             prompts = self.extract_prompts(sample)
@@ -96,7 +96,7 @@ class TextLMAdapter(ModelAdapter):
                 payload = self.base_payload(sampling, sample_id=sample_id)
                 payload["text"] = prompt
                 ids = list(self._tokenizer.encode(prompt))
-                prompt_token_ids.append(list(ids))
+                prompt_token_ids.append(ids)
                 wire.append(payload)
 
         return PreparedInputs(
@@ -174,7 +174,7 @@ class TextLMAdapter(ModelAdapter):
     def build_response(self, sample: Sample, prepared: PreparedInputs, raw: List[RawResult]) -> Sample:
         """Fill the frontier gen ``Part`` from the seam's per-candidate results."""
         gen_part = sample.parts[-1]
-        n = int(prepared.resolved_n)
+        n = prepared.resolved_n
         n_prompts = len(prepared.prompt_token_ids)
         require(
             len(raw) == n_prompts * n,
@@ -198,15 +198,15 @@ class TextLMAdapter(ModelAdapter):
     def build_segment(self, sample: Sample, prepared: PreparedInputs, raw: List[RawResult]) -> TextSegment:
         """Pack the per-candidate tokens/logprobs, each row pointing at its own slot."""
         return TextSegment.pack(
-            tokens=[torch.tensor(list(r.token_ids), dtype=torch.long) for r in raw],
-            log_probs=[torch.tensor(list(r.logprobs), dtype=torch.float32) for r in raw],
+            tokens=[torch.tensor(r.token_ids, dtype=torch.long) for r in raw],
+            log_probs=[torch.tensor(r.logprobs, dtype=torch.float32) for r in raw],
         )
 
     @staticmethod
     def build_status(raw: List[RawResult]) -> torch.Tensor:
         """Per-candidate terminal status from the seam's ``finish_reason``, as a ``[n_candidates]`` long tensor."""
         return torch.tensor(
-            [int(_FINISH_TO_STATUS.get(str(r.finish_reason), SegmentStatus.PENDING)) for r in raw],
+            [_FINISH_TO_STATUS.get(r.finish_reason, SegmentStatus.PENDING) for r in raw],
             dtype=torch.long,
         )
 
@@ -226,7 +226,7 @@ class TextLMAdapter(ModelAdapter):
     @staticmethod
     def replicate_per_sample(prepared: PreparedInputs) -> Tuple[List[List[int]], List[int]]:
         """Replicate per-prompt values to per-sample rows (prompt-major order)."""
-        n = int(prepared.resolved_n)
+        n = prepared.resolved_n
         per_sample: List[List[int]] = []
         prompt_index: List[int] = []
         for i, ids in enumerate(prepared.prompt_token_ids):

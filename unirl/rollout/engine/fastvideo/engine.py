@@ -61,8 +61,8 @@ def _verify_checkpoint_unipc_spec(ckpt_path: str, spec: UniPCSpec) -> None:
         context="FastVideo canonical UniPC",
         target="model_config.unipc_*",
     )
-    class_name = str(declared_cfg.get("_class_name", ""))
-    if "UniPC" not in class_name:
+    class_name = declared_cfg.get("_class_name", "")
+    if "UniPC" not in str(class_name):
         raise RuntimeError(
             f"Checkpoint scheduler {path} declares _class_name={class_name!r}; the canonical "
             "FastVideo path requires the checkpoint's native solver to be a UniPC scheduler."
@@ -152,13 +152,13 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
             "FastVideoRolloutEngine requires an injected SDE strategy with a canonical_name; "
             "set the rollout node's `strategy:` in the recipe (a separate injection from pipeline.strategy)",
         )
-        self._sde_type = str(strategy.canonical_name)
+        self._sde_type = strategy.canonical_name
         self._is_dual_expert = config.model_family in {"wan2.2", "wan22"}
         if self._is_dual_expert:
             from unirl.models.wan22.diffusion import WAN22DiffusionStep
 
-            self._timestep_scale = float(WAN22DiffusionStep.TIMESTEP_SCALE)
-            boundary_ratio = float(model_config.boundary_ratio)
+            self._timestep_scale = WAN22DiffusionStep.TIMESTEP_SCALE
+            boundary_ratio = model_config.boundary_ratio
             require(
                 0.0 < boundary_ratio < 1.0,
                 f"WAN 2.2 model_config.boundary_ratio must be in (0, 1); got {boundary_ratio}",
@@ -166,7 +166,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
             # FastVideo routes on t >= boundary_ratio * num_train_timesteps; UniRL routes on
             # sigma >= boundary_ratio. The two agree only at this scale (README: dual expert).
             require(
-                float(model_config.num_train_timesteps) == self._timestep_scale,
+                model_config.num_train_timesteps == self._timestep_scale,
                 "WAN 2.2 FastVideo rollout requires model_config.num_train_timesteps to equal the "
                 f"step kernel's TIMESTEP_SCALE ({self._timestep_scale:g})",
             )
@@ -185,7 +185,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         else:
             from unirl.models.wan21.diffusion import WAN21DiffusionStep
 
-            self._timestep_scale = float(WAN21DiffusionStep.TIMESTEP_SCALE)
+            self._timestep_scale = WAN21DiffusionStep.TIMESTEP_SCALE
         # Probe plan so unsupported kernels (cps/dpm2) fail at init, not per request.
         FastVideoUniPCPlan(
             sde_type=self._sde_type,
@@ -199,7 +199,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
 
         self.schedule_policy = FlowMatchSchedulePolicy.from_pretrained(
             model_config.pretrained_model_ckpt_path,
-            shift=float(model_config.shift),
+            shift=model_config.shift,
         )
         logger.info(
             "Initialized fastvideo engine (rank=%s, native_logprob=%s, master_port=%s)",
@@ -219,30 +219,24 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
 
         fv_kwargs: Dict[str, Any] = {
             "model_path": self.model_config.pretrained_model_ckpt_path,
-            "num_gpus": int(self.cfg.num_gpus),
-            "tp_size": int(self.cfg.tp_size),
-            "sp_size": int(self.cfg.sp_size),
+            "num_gpus": self.cfg.num_gpus,
+            "tp_size": self.cfg.tp_size,
+            "sp_size": self.cfg.sp_size,
             "inference_mode": True,
             "output_type": "pt",
             "dit_cpu_offload": False,
             "dit_layerwise_offload": False,
             "text_encoder_cpu_offload": False,
             "vae_cpu_offload": False,
-            "master_port": int(self._ports.master_port),
+            "master_port": self._ports.master_port,
         }
         fv_kwargs.update(self.cfg.engine_kwargs)
         self._fastvideo_args = FastVideoArgs.from_kwargs(**fv_kwargs)
         if self._is_dual_expert:
             pipeline_config = self._fastvideo_args.pipeline_config
-            dit_config = pipeline_config.dit_config
-            require(dit_config is not None, "WAN 2.2 FastVideo pipeline has no dit_config")
-            require(
-                hasattr(dit_config, "boundary_ratio"),
-                "WAN 2.2 FastVideo requires a dual-expert pipeline config with dit_config.boundary_ratio",
-            )
             pipeline_config.boundary_ratio = self._boundary_ratio
-            dit_config.boundary_ratio = self._boundary_ratio
-        backend = str(self._fastvideo_args.distributed_executor_backend)
+            pipeline_config.dit_config.boundary_ratio = self._boundary_ratio
+        backend = self._fastvideo_args.distributed_executor_backend
         require(
             backend == "mp",
             f"FastVideo canonical UniPC patches only reach 'mp' executor workers; got "
@@ -258,7 +252,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         for attempt in range(1, max_port_attempts + 1):
             if reserve_first or attempt > 1:
                 self._ports = FastVideoPorts.reserve()
-                self._fastvideo_args.master_port = int(self._ports.master_port)
+                self._fastvideo_args.master_port = self._ports.master_port
             try:
                 self._generator = VideoGenerator.from_fastvideo_args(self._fastvideo_args)
                 return
@@ -290,13 +284,13 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         )
         gen = sample.frontier_gen_part(DiffusionSamplingParams)
         require(
-            int(gen.batch_size) > 0,
+            gen.batch_size > 0,
             "FastVideoRolloutEngine.generate requires a non-empty Sample (gen batch_size > 0)",
         )
         ensure_sample_sigmas(sample, self.schedule_policy)
 
         fbs = self.cfg.forward_batch_size
-        bs = int(gen.batch_size)
+        bs = gen.batch_size
         if fbs is None or bs <= fbs:
             return self._generate_batch(sample)
 
@@ -317,21 +311,21 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
             "fastvideo engine requires exactly one frontier-aligned text conditioning turn; "
             f"got {[type(turn.content).__name__ for turn in turns]}",
         )
-        prompts = list(turns[0].content.texts)
+        prompts = turns[0].content.texts
         require(
-            len(prompts) == int(gen.batch_size),
+            len(prompts) == gen.batch_size,
             "fastvideo engine expects frontier-aligned text of len gen.batch_size; "
-            f"got {len(prompts)} vs {int(gen.batch_size)}",
+            f"got {len(prompts)} vs {gen.batch_size}",
         )
         params = gen.sampling_params
-        base_seed = int(params.seed) if params.seed is not None else 0
+        base_seed = params.seed if params.seed is not None else 0
         seed_keys = gen.init_noise_group_ids or (gen.group_ids if params.init_same_noise else gen.sample_ids)
-        seeds = [_derive_group_seed(base_seed, str(k)) for k in seed_keys]
-        num_steps = int(params.num_inference_steps)
+        seeds = [_derive_group_seed(base_seed, k) for k in seed_keys]
+        num_steps = params.num_inference_steps
         if params.sde_indices is None:
             sde_indices = list(range(num_steps))
         else:
-            sde_indices = sorted({int(i) for i in params.sde_indices})
+            sde_indices = sorted(set(params.sde_indices))
             bad = [i for i in sde_indices if i < 0 or i >= num_steps]
             if bad:
                 raise ValueError(f"FastVideo SDE indices out of range for num_steps={num_steps}: {bad}")
@@ -343,7 +337,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
             f"{tuple(frames.shape) if torch.is_tensor(frames) else type(frames).__name__}",
         )
         decoded = Videos.from_list(
-            [Video(frames=frames[i].permute(1, 0, 2, 3).contiguous()) for i in range(int(frames.shape[0]))]
+            [Video(frames=frames[i].permute(1, 0, 2, 3).contiguous()) for i in range(frames.shape[0])]
         )
         return sample.with_filled_frontier(
             segment=self._build_segment(params, raw, sde_indices),
@@ -367,19 +361,19 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         from fastvideo.utils import shallow_asdict
 
         sp = SamplingParam()
-        sp.height = int(params.height)
-        sp.width = int(params.width)
-        sp.num_frames = int(params.num_frames)
-        sp.num_inference_steps = int(params.num_inference_steps)
-        sp.guidance_scale = float(params.guidance_scale)
-        sp.seed = int(params.seed) if params.seed is not None else 0
+        sp.height = params.height
+        sp.width = params.width
+        sp.num_frames = params.num_frames
+        sp.num_inference_steps = params.num_inference_steps
+        sp.guidance_scale = params.guidance_scale
+        sp.seed = params.seed if params.seed is not None else 0
         sp.num_videos_per_prompt = 1
         sp.save_video = False
         sp.return_frames = False
         sp.return_trajectory_latents = False
         sp.return_trajectory_decoded = False
         # Canonical σ verbatim — already shifted; no engine-side transform (README: σ SSOT).
-        sp.sigmas = [float(x) for x in sigmas.detach().cpu().to(torch.float32).tolist()[:-1]]
+        sp.sigmas = sigmas.detach().cpu().to(torch.float32).tolist()[:-1]
 
         step_plan = FastVideoUniPCPlan(
             sde_type=self._sde_type,
@@ -403,19 +397,19 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         for sample_index, (prompt, seed) in enumerate(zip(prompts, seeds)):
             one = deepcopy(sp)
             one.prompt = prompt
-            one.seed = int(seed)
+            one.seed = seed
             latents_size = [(one.num_frames - 1) // 4 + 1, one.height // 8, one.width // 8]
             n_tokens = latents_size[0] * latents_size[1] * latents_size[2]
             sp_dict = shallow_asdict(one)
             sp_dict.pop("eta", None)
             batch = ForwardBatch(
                 **sp_dict,
-                eta=float(params.eta),
+                eta=params.eta,
                 n_tokens=n_tokens,
                 VSA_sparsity=self._fastvideo_args.VSA_sparsity,
                 rl_data=ForwardBatch.RLData(
                     enabled=True,
-                    collect_log_probs=bool(self.cfg.native_logprob),
+                    collect_log_probs=self.cfg.native_logprob,
                     store_trajectory=True,
                     keep_trajectory_on_cpu=True,
                     # sde_step_indices=None routes every index through the patched helper (README: Solver SSOT).
@@ -430,7 +424,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
                     if params.guidance_scale_2 is not None
                     else self.model_config.guidance_scale_2
                 )
-                batch.guidance_scale_2 = float(low_scale) if low_scale is not None else float(params.guidance_scale)
+                batch.guidance_scale_2 = low_scale if low_scale is not None else params.guidance_scale
             out = self._generator.executor.execute_forward(batch, self._fastvideo_args)
             rl = out.rl_data
             actual_sigmas = rl.trajectory_timesteps if rl is not None else None
@@ -438,7 +432,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
                 actual_t = (
                     actual_sigmas.detach().cpu() if torch.is_tensor(actual_sigmas) else torch.as_tensor(actual_sigmas)
                 )
-                if actual_t.ndim == 1 and int(actual_t.shape[0]) == int(sigmas.shape[0]) - 1:
+                if actual_t.ndim == 1 and actual_t.shape[0] == sigmas.shape[0] - 1:
                     actual_sigmas = torch.cat([actual_t, torch.zeros(1, dtype=actual_t.dtype)])
             verify_engine_used_sigmas(
                 actual_sigmas,
@@ -528,7 +522,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
     def _build_segment(self, params: DiffusionSamplingParams, raw: Dict[str, Any], sde_set: List[int]):
         traj = raw["trajectory"]
         device = traj.device
-        T = int(traj.shape[1]) - 1
+        T = traj.shape[1] - 1
         indices = torch.arange(traj.shape[1], dtype=torch.long, device=device)
         sde_indices = torch.tensor(sde_set, dtype=torch.long, device=device) if sde_set else None
 

@@ -82,14 +82,14 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
         )
         self._backend = SGLangBackend.boot(
             intent,
-            local_mode=bool(config.local_mode),
+            local_mode=config.local_mode,
         )
 
         self._weight_sync = WeightSync(
             self._backend,
             pipeline_prefix=pipeline_prefix,
             target_modules=target_modules,
-            uses_lora=bool(model_config.use_lora),
+            uses_lora=model_config.use_lora,
         )
 
         self.schedule_policy = self.adapter.schedule_policy()
@@ -113,13 +113,13 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
         sample.reject_row_canvases(engine="SGLangDiffusionRolloutEngine")
         gen = sample.frontier_gen_part(DiffusionSamplingParams)
         require(
-            int(gen.batch_size) > 0,
+            gen.batch_size > 0,
             "SGLangDiffusionRolloutEngine.generate requires a non-empty Sample (gen batch_size > 0)",
         )
         ensure_sample_sigmas(sample, self.schedule_policy)
 
         fbs = self.cfg.forward_batch_size
-        bs = int(gen.batch_size)
+        bs = gen.batch_size
         if fbs is None or bs <= fbs:
             return self._generate_batch(sample)
 
@@ -147,18 +147,18 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
         xt = recipe.resolve()
         if xt is not None:
             return xt
-        if not bool(self.cfg.init_same_noise):
+        if not self.cfg.init_same_noise:
             return None
 
         require(
             diffusion.seed is not None,
             "init_same_noise=True requires a diffusion seed",
         )
-        batch_size = int(gen.batch_size)
+        batch_size = gen.batch_size
         latent_shape = self._backend.prepare_latent_shape(
-            height=int(diffusion.height),
-            width=int(diffusion.width),
-            num_frames=int(diffusion.num_frames),
+            height=diffusion.height,
+            width=diffusion.width,
+            num_frames=diffusion.num_frames,
             batch_size=batch_size,
         )
         dtype = parse_torch_dtype(diffusion.autocast_precision, field_name="autocast_precision")
@@ -168,9 +168,9 @@ class SGLangDiffusionRolloutEngine(BaseRolloutEngine):
             device=self._device,
             dtype=dtype,
             init_same_noise=True,
-            samples_per_prompt=int(diffusion.samples_per_prompt),
-            noise_group_ids=[str(g) for g in gen.group_ids],
-            base_seed=int(diffusion.seed),
+            samples_per_prompt=diffusion.samples_per_prompt,
+            noise_group_ids=list(gen.group_ids),
+            base_seed=diffusion.seed,
         )
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)

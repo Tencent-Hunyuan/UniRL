@@ -125,7 +125,7 @@ class SGLangBackend:
 
         generator = rt["DiffGenerator"].from_pretrained(
             server_args=server_args,
-            local_mode=bool(local_mode),
+            local_mode=local_mode,
         )
         return cls(generator, rt, server_args)
 
@@ -153,9 +153,8 @@ class SGLangBackend:
         from types import SimpleNamespace
 
         pcfg = self._server_args.pipeline_config
-        vae_cfg = getattr(pcfg, "vae_config", None)
-        arch = getattr(vae_cfg, "arch_config", None)
-        if arch is not None and not hasattr(arch, "vae_scale_factor") and hasattr(vae_cfg, "post_init"):
+        vae_cfg = pcfg.vae_config
+        if not hasattr(vae_cfg.arch_config, "vae_scale_factor"):
             vae_cfg.post_init()
 
         batch_stub = SimpleNamespace(height=height, width=width, num_frames=num_frames)
@@ -223,11 +222,11 @@ class SGLangBackend:
         self._forward(
             self._rt["InitWeightsUpdateGroupReqInput"](
                 master_address=master_address,
-                master_port=int(master_port),
-                rank_offset=int(rank_offset),
-                world_size=int(world_size),
-                group_name=str(group_name),
-                backend=str(backend),
+                master_port=master_port,
+                rank_offset=rank_offset,
+                world_size=world_size,
+                group_name=group_name,
+                backend=backend,
             ),
             op="init_weights_update_group",
         )
@@ -244,11 +243,11 @@ class SGLangBackend:
     ) -> None:
         self._forward(
             self._rt["UpdateWeightsFromDistributedReqInput"](
-                names=list(names),
-                dtypes=list(dtypes),
-                shapes=[list(shape) for shape in shapes],
-                group_name=str(group_name),
-                target_modules=list(target_modules),
+                names=names,
+                dtypes=dtypes,
+                shapes=shapes,
+                group_name=group_name,
+                target_modules=target_modules,
                 flush_cache=flush_cache,
             ),
             op="update_weights_from_distributed",
@@ -256,7 +255,7 @@ class SGLangBackend:
 
     def destroy_weights_group(self, *, group_name: str) -> None:
         self._forward(
-            self._rt["DestroyWeightsUpdateGroupReqInput"](group_name=str(group_name)),
+            self._rt["DestroyWeightsUpdateGroupReqInput"](group_name=group_name),
             op="destroy_weights_update_group",
         )
 

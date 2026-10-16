@@ -136,9 +136,9 @@ def _worker_update_transformer_weights(self, state_dict: Dict[str, torch.Tensor]
     ]
     return {
         "status": "transformer_weights_updated",
-        "loaded": sum(int(r["loaded"]) for r in results),
-        "target": sum(int(r["target"]) for r in results),
-        "coverage": min(float(r["coverage"]) for r in results),
+        "loaded": sum(r["loaded"] for r in results),
+        "target": sum(r["target"] for r in results),
+        "coverage": min(r["coverage"] for r in results),
         "modules": results,
     }
 
@@ -156,7 +156,7 @@ def _worker_update_transformer_weights_from_path(self, checkpoint_path: str) -> 
 
 def _check_responses(responses: Any, world_size: int) -> None:
     """Fail closed unless every worker reported a complete load."""
-    if len(responses) != int(world_size):
+    if len(responses) != world_size:
         raise RuntimeError(f"FastVideo weight update returned {len(responses)} responses for world_size={world_size}")
     for rank, response in enumerate(responses):
         if not isinstance(response, dict) or response.get("status") != "transformer_weights_updated":
