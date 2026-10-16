@@ -246,8 +246,6 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         self.schedule_policy = FlowMatchSchedulePolicy.from_pretrained(
             model_config.pretrained_model_ckpt_path,
             shift=float(model_config.shift),
-            require_dynamic=bool(getattr(model_config, "use_dynamic_shifting", False)),
-            dynamic_overrides=getattr(model_config, "dynamic_shift_overrides", None),
         )
         logger.info(
             "Initialized fastvideo engine (rank=%s, native_logprob=%s, master_port=%s)",
@@ -575,10 +573,7 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         """Assemble the WAN21 ``conditions`` dict the trainer replays against."""
         text_embeds: List[torch.Tensor] = raw["text_embeds"]
         require(len(text_embeds) > 0, "fastvideo engine produced no text embeddings")
-        raw_text_masks = raw.get("text_masks")
-        text_masks: List[Optional[torch.Tensor]] = (
-            raw_text_masks if raw_text_masks is not None else [None] * len(text_embeds)
-        )
+        text_masks: List[Optional[torch.Tensor]] = raw["text_masks"]
 
         text = TextEmbedCondition.concat(
             [
@@ -588,13 +583,9 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
         )
         conditions: Dict[str, Any] = {"text": text}
 
-        raw_neg_embeds = raw.get("neg_embeds")
-        neg_embeds: List[torch.Tensor] = raw_neg_embeds if raw_neg_embeds is not None else []
+        neg_embeds: List[torch.Tensor] = raw["neg_embeds"]
         if len(neg_embeds) == len(text_embeds) and len(neg_embeds) > 0:
-            raw_neg_masks = raw.get("neg_masks")
-            neg_masks: List[Optional[torch.Tensor]] = (
-                raw_neg_masks if raw_neg_masks is not None else [None] * len(neg_embeds)
-            )
+            neg_masks: List[Optional[torch.Tensor]] = raw["neg_masks"]
             conditions["negative_text"] = TextEmbedCondition.concat(
                 [
                     TextEmbedCondition(embeds=neg_embeds[i], pooled=None, attn_mask=neg_masks[i])

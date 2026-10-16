@@ -27,8 +27,6 @@ def _make_step_generators(
 
 def _resolve_base_seed(batch) -> int | None:
     seed = batch.seed
-    if seed is None and batch.sampling_params is not None:
-        seed = batch.sampling_params.seed
     return int(seed) if seed is not None else None
 
 

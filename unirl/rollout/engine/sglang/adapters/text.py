@@ -40,7 +40,7 @@ class TextLMAdapter(ModelAdapter):
 
     def validate(self) -> None:
         super().validate()
-        forbidden_tokens = list(getattr(self.cfg, "response_forbidden_tokens", None) or [])
+        forbidden_tokens = list(self.cfg.response_forbidden_tokens or [])
         self._response_forbidden_token_ids: Tuple[int, ...] = ()
         if forbidden_tokens:
             vocab = self._tokenizer.get_vocab()

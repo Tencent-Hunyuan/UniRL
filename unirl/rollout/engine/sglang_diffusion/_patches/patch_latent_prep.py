@@ -2,13 +2,10 @@
 
 from __future__ import annotations
 
-import logging
 import math
 import os
 
 import torch
-
-logger = logging.getLogger(__name__)
 
 _DEBUG = os.environ.get("UNIRL_DEBUG_LATENT_SHAPE") == "1"
 
