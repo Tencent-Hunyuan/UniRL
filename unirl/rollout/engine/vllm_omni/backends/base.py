@@ -11,7 +11,6 @@ from typing import (
     Optional,
     Protocol,
     Sequence,
-    runtime_checkable,
 )
 
 if TYPE_CHECKING:
@@ -61,7 +60,7 @@ class OmniRawResult(Protocol):
     request_id: str
     stage_id: Optional[int]
     final_output_type: Optional[str]
-    request_output: Optional[Any]
+    outputs: Sequence[Any]
     prompt_token_ids: Optional[Sequence[int]]
     images: Optional[Sequence[Any]]
     trajectory_latents: Optional["torch.Tensor"]
@@ -70,7 +69,6 @@ class OmniRawResult(Protocol):
     multimodal_output: Optional[dict]
 
 
-@runtime_checkable
 class Backend(Protocol):
     """The seam every ``vllm_omni`` collaborator reaches the runtime through."""
 
@@ -128,15 +126,13 @@ class Backend(Protocol):
     def set_lora_handle(
         self,
         *,
-        adapter_name: str,
-        lora_tensors: Dict[str, Any],
+        lora_tensors: Dict[str, "torch.Tensor"],
         peft_config: Optional[dict],
     ) -> None: ...
     def set_lora_copy(
         self,
         *,
-        adapter_name: str,
-        lora_tensors: Dict[str, Any],
+        lora_tensors: Dict[str, "torch.Tensor"],
         peft_config: Optional[dict],
     ) -> None: ...
     def param_checksums(self, *, names: List[str]) -> dict: ...

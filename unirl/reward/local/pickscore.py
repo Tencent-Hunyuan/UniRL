@@ -7,11 +7,23 @@ from typing import List
 
 import torch
 
-from unirl.reward.base import BaseRewardComponentSpec
+from unirl.reward.base import PromptRewardComponentSpec
 from unirl.reward.local.device import resolve_device
 from unirl.types.reward import RewardRequest
 
 from .base import LocalRewardBackend
+
+
+def _extract_tensor(output):
+    if isinstance(output, torch.Tensor):
+        return output
+    if hasattr(output, "pooler_output") and output.pooler_output is not None:
+        return output.pooler_output
+    if hasattr(output, "last_hidden_state") and output.last_hidden_state is not None:
+        return output.last_hidden_state[:, 0]
+    if isinstance(output, (tuple, list)):
+        return output[0]
+    raise TypeError(f"Unexpected output format: {type(output)}")
 
 
 class PickScoreRewardScorer(LocalRewardBackend):
@@ -23,22 +35,19 @@ class PickScoreRewardScorer(LocalRewardBackend):
         super().__init__(
             device=resolve_device(config.device, base_device),
             batch_size=config.batch_size,
+            prompt_source=config.prompt_source,
             processor_id=config.processor_id,
             model_id=config.model_id,
         )
 
     def _load_model(self) -> None:
-        try:
-            from transformers import CLIPModel, CLIPProcessor
-        except ImportError:
-            raise ImportError("transformers is required for PickScore")
+        from transformers import CLIPModel, CLIPProcessor
 
-        processor_path = self.model_kwargs.get("processor_id", "laion/CLIP-ViT-H-14-laion2B-s32B-b79K")
-        model_path = self.model_kwargs.get("model_id", "yuvalkirstain/PickScore_v1")
+        processor_path = self.model_kwargs["processor_id"]
+        model_path = self.model_kwargs["model_id"]
 
         self.processor = CLIPProcessor.from_pretrained(processor_path)
-        self.model = CLIPModel.from_pretrained(model_path).eval().to(self.device)
-        self.model = self.model.to(dtype=torch.float32)
+        self.model = CLIPModel.from_pretrained(model_path).eval().to(device=self.device, dtype=torch.float32)
 
         import torch.nn as nn
         import torchvision.transforms as T
@@ -65,54 +74,40 @@ class PickScoreRewardScorer(LocalRewardBackend):
 
     def _compute_model_rewards(self, request: RewardRequest) -> List[float]:
         images = request.images
-        prompts = request.prompts
+        prompts = self.prompts(request)
         all_rewards: List[float] = []
 
-        def _extract_tensor(output):
-            if isinstance(output, torch.Tensor):
-                return output
-            if hasattr(output, "pooler_output") and output.pooler_output is not None:
-                return output.pooler_output
-            if hasattr(output, "last_hidden_state") and output.last_hidden_state is not None:
-                return output.last_hidden_state[:, 0]
-            if isinstance(output, (tuple, list)):
-                return output[0]
-            raise TypeError(f"Unexpected output format: {type(output)}")
+        with torch.no_grad():
+            scale = self.model.logit_scale.exp() / 26.0
+            for i in range(0, len(images), self.batch_size):
+                batch_images = images[i : i + self.batch_size]
+                batch_prompts = prompts[i : i + self.batch_size]
 
-        for i in range(0, len(images), self.batch_size):
-            batch_images = images[i : i + self.batch_size]
-            batch_prompts = prompts[i : i + self.batch_size]
+                image_inputs = self.processor(
+                    images=batch_images,
+                    padding=True,
+                    truncation=True,
+                    max_length=77,
+                    return_tensors="pt",
+                )
+                image_inputs = {k: v.to(device=self.device) for k, v in image_inputs.items()}
 
-            image_inputs = self.processor(
-                images=batch_images,
-                padding=True,
-                truncation=True,
-                max_length=77,
-                return_tensors="pt",
-            )
-            image_inputs = {k: v.to(device=self.device) for k, v in image_inputs.items()}
+                text_inputs = self.processor(
+                    text=batch_prompts,
+                    padding=True,
+                    truncation=True,
+                    max_length=77,
+                    return_tensors="pt",
+                )
+                text_inputs = {k: v.to(device=self.device) for k, v in text_inputs.items()}
 
-            text_inputs = self.processor(
-                text=batch_prompts,
-                padding=True,
-                truncation=True,
-                max_length=77,
-                return_tensors="pt",
-            )
-            text_inputs = {k: v.to(device=self.device) for k, v in text_inputs.items()}
-
-            with torch.no_grad():
-                image_embs = self.model.get_image_features(**image_inputs)
-                image_embs = _extract_tensor(image_embs)
+                image_embs = _extract_tensor(self.model.get_image_features(**image_inputs))
                 image_embs = image_embs / image_embs.norm(p=2, dim=-1, keepdim=True)
 
-                text_embs = self.model.get_text_features(**text_inputs)
-                text_embs = _extract_tensor(text_embs)
+                text_embs = _extract_tensor(self.model.get_text_features(**text_inputs))
                 text_embs = text_embs / text_embs.norm(p=2, dim=-1, keepdim=True)
 
-                logit_scale = self.model.logit_scale.exp()
-                scores = logit_scale * (text_embs @ image_embs.T)
-                scores = scores.diag() / 26
+                scores = scale * (text_embs * image_embs).sum(dim=-1)
                 all_rewards.extend(scores.cpu().tolist())
 
         return all_rewards
@@ -124,18 +119,7 @@ class PickScoreRewardScorer(LocalRewardBackend):
         records=None,
     ) -> torch.Tensor:
         """Differentiable PickScore: image tensor ``[B, C, H, W]`` in ``[0, 1]`` → ``[B]`` reward with ``grad_fn``."""
-
-        def _extract_tensor(output):
-            if isinstance(output, torch.Tensor):
-                return output
-            if hasattr(output, "pooler_output") and output.pooler_output is not None:
-                return output.pooler_output
-            if hasattr(output, "last_hidden_state") and output.last_hidden_state is not None:
-                return output.last_hidden_state[:, 0]
-            if isinstance(output, (tuple, list)):
-                return output[0]
-            raise TypeError(f"Unexpected output format: {type(output)}")
-
+        del records
         if images_tensor.ndim != 4:
             raise ValueError(
                 f"PickScore.compute_rewards_differentiable: expected [B, C, H, W], got {tuple(images_tensor.shape)}"
@@ -144,6 +128,8 @@ class PickScoreRewardScorer(LocalRewardBackend):
         pixel_values = self._clip_tform(images_tensor)
 
         scores: List[torch.Tensor] = []
+        with torch.no_grad():
+            scale = self.model.logit_scale.exp() / 26.0
         for i in range(0, len(prompts), self.batch_size):
             px = pixel_values[i : i + self.batch_size]
             batch_prompts = prompts[i : i + self.batch_size]
@@ -162,16 +148,15 @@ class PickScoreRewardScorer(LocalRewardBackend):
             with torch.no_grad():
                 text_embs = _extract_tensor(self.model.get_text_features(**text_inputs))
                 text_embs = text_embs / text_embs.norm(p=2, dim=-1, keepdim=True)
-                logit_scale = self.model.logit_scale.exp()
 
-            batch_scores = logit_scale * (text_embs * image_embs).sum(dim=-1) / 26
+            batch_scores = scale * (text_embs * image_embs).sum(dim=-1)
             scores.append(batch_scores)
 
         return torch.cat(scores, dim=0)
 
 
 @dataclass
-class PickScoreSpec(BaseRewardComponentSpec):
+class PickScoreSpec(PromptRewardComponentSpec):
     """Typed config for the PickScore reward component."""
 
     batch_size: int = 8

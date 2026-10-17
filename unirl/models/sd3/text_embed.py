@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import List
-
 import torch
 
 from unirl.models.types.embedding import EmbedStage
@@ -40,21 +38,12 @@ class SD3TextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
                 index_of[s] = i
                 uniq.append(s)
             inverse.append(i)
-        cond = self._encode(uniq)
-        if len(uniq) == len(prompts):
-            return cond
-        inv = torch.tensor(inverse, device=cond.embeds.device)
-        return TextEmbedCondition(
-            embeds=cond.embeds.index_select(0, inv),
-            pooled=cond.pooled.index_select(0, inv),
-        )
 
-    def _encode(self, prompts: List[str]) -> TextEmbedCondition:
         bundle = self.bundle
         device = bundle.device
 
         clip1_inputs = bundle.tokenizer(
-            prompts,
+            uniq,
             padding="max_length",
             max_length=self.clip_max_length,
             truncation=True,
@@ -67,7 +56,7 @@ class SD3TextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
             clip1_hidden = clip1_out.hidden_states[-2]
 
         clip2_inputs = bundle.tokenizer_2(
-            prompts,
+            uniq,
             padding="max_length",
             max_length=self.clip_max_length,
             truncation=True,
@@ -82,7 +71,7 @@ class SD3TextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
         pooled = torch.cat([pooled_1, pooled_2], dim=-1)
 
         t5_inputs = bundle.tokenizer_3(
-            prompts,
+            uniq,
             padding="max_length",
             max_length=self.max_sequence_length,
             truncation=True,
@@ -97,10 +86,11 @@ class SD3TextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
         clip_merged = torch.nn.functional.pad(clip_merged, (0, t5_embeds.shape[-1] - clip_merged.shape[-1]))
         embeds = torch.cat([clip_merged, t5_embeds], dim=-2)
 
-        return TextEmbedCondition(
-            embeds=embeds,
-            pooled=pooled,
-        )
+        if len(uniq) != len(prompts):
+            inv = torch.tensor(inverse, device=embeds.device)
+            embeds = embeds.index_select(0, inv)
+            pooled = pooled.index_select(0, inv)
+        return TextEmbedCondition(embeds=embeds, pooled=pooled)
 
 
 __all__ = ["SD3TextEmbedStage"]

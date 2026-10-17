@@ -8,7 +8,7 @@ from typing import List
 import torch
 from PIL import Image
 
-from unirl.reward.base import BaseRewardComponentSpec
+from unirl.reward.base import PromptRewardComponentSpec
 from unirl.reward.local.device import resolve_device
 from unirl.types.reward import RewardRequest
 
@@ -23,6 +23,7 @@ class ImageRewardScorer(LocalRewardBackend):
     def __init__(self, *, config: "ImageRewardSpec", base_device: str) -> None:
         super().__init__(
             device=resolve_device(config.device, base_device),
+            prompt_source=config.prompt_source,
             model_version=config.model_version,
         )
 
@@ -39,7 +40,7 @@ class ImageRewardScorer(LocalRewardBackend):
 
     def _compute_model_rewards(self, request: RewardRequest) -> List[float]:
         images = request.images
-        prompts = request.prompts
+        prompts = self.prompts(request)
         all_rewards: List[float] = []
 
         for img, prompt in zip(images, prompts):
@@ -57,7 +58,7 @@ class ImageRewardScorer(LocalRewardBackend):
 
 
 @dataclass
-class ImageRewardSpec(BaseRewardComponentSpec):
+class ImageRewardSpec(PromptRewardComponentSpec):
     """Typed config for the ImageReward (BLIP-based, ~300M) reward component."""
 
     device: str = "auto"

@@ -14,7 +14,7 @@ from typing import List
 from PIL import Image
 from tqdm import tqdm
 
-from unirl.reward.base import BaseRewardComponentSpec
+from unirl.reward.base import PromptRewardComponentSpec
 from unirl.types.reward import RewardRequest, RewardResponse
 
 from .base import LocalRewardBackend
@@ -29,7 +29,7 @@ class OCRRewardScorer(LocalRewardBackend):
 
     def __init__(self, *, config: "OCRSpec", base_device: str) -> None:
         del base_device
-        super().__init__(lang=config.lang)
+        super().__init__(lang=config.lang, prompt_source=config.prompt_source)
 
     def _load_model(self) -> None:
         self._levenshtein_distance = None
@@ -52,17 +52,13 @@ class OCRRewardScorer(LocalRewardBackend):
             use_doc_orientation_classify=False,
             use_doc_unwarping=False,
             use_textline_orientation=False,
-            lang=self.model_kwargs.get("lang", "en"),
+            lang=self.model_kwargs["lang"],
         )
-        self.model = "ocr"
+        predict_fn = getattr(self._ocr_reader, "predict", None)
+        self._run_ocr = predict_fn if callable(predict_fn) else (lambda img: self._ocr_reader.ocr(img, cls=False))
 
     def compute_rewards(self, request: RewardRequest) -> RewardResponse:
         """Score OCR once and expose order-sensitive diagnostics for every sample."""
-        if not self._is_loaded:
-            raise RuntimeError(
-                f"{type(self).__name__}.compute_rewards called before _load_model "
-                f"completed (model_name={self.model_name!r}, batch_size={request.batch_size})."
-            )
         start = time.time()
         rewards, component_rewards, successes, errors = self._compute_rewards_and_components(request)
         return RewardResponse(
@@ -87,8 +83,11 @@ class OCRRewardScorer(LocalRewardBackend):
             raise ValueError("OCR reward requires generated images")
 
         prompts: List[str] = []
-        for idx, raw_prompt in enumerate(request.prompts):
-            target_text = self._extract_target_text(raw_prompt)
+        for idx, raw_prompt in enumerate(self.prompts(request)):
+            match = re.search(r'["“”]([^"“”]+)["“”]', str(raw_prompt))
+            if match is None:
+                raise ValueError("OCR reward prompt must contain quoted target text.")
+            target_text = self._normalize_text(match.group(1))
             if not target_text:
                 raise ValueError(f"OCR reward prompt at index {idx} has empty quoted target text.")
             prompts.append(target_text)
@@ -145,12 +144,6 @@ class OCRRewardScorer(LocalRewardBackend):
 
         return rewards, component_rewards, successes, errors
 
-    def _run_ocr(self, img):
-        predict_fn = getattr(self._ocr_reader, "predict", None)
-        if callable(predict_fn):
-            return predict_fn(img)
-        return self._ocr_reader.ocr(img, cls=False)
-
     def _extract_recognized_text(self, result) -> str:
         texts: List[str] = []
         if isinstance(result, list):
@@ -171,13 +164,6 @@ class OCRRewardScorer(LocalRewardBackend):
                         if isinstance(text, str) and text:
                             texts.append(text)
         return "".join(texts)
-
-    @classmethod
-    def _extract_target_text(cls, prompt: str) -> str:
-        match = re.search(r'["“”]([^"“”]+)["“”]', str(prompt))
-        if match is None:
-            raise ValueError("OCR reward prompt must contain quoted target text.")
-        return cls._normalize_text(match.group(1))
 
     @staticmethod
     def _normalize_text(text: str) -> str:
@@ -209,25 +195,24 @@ class OCRRewardScorer(LocalRewardBackend):
         if substring_match:
             edit_similarity = 1.0
         else:
-            distance_fn = self._levenshtein_distance or self._python_levenshtein_distance
+            distance_fn = (
+                self._python_levenshtein_distance if self._levenshtein_distance is None else self._levenshtein_distance
+            )
             distance = min(int(distance_fn(prediction, target)), len(target))
             edit_similarity = 1.0 - distance / len(target)
+        pred_counts, gold_counts = Counter(prediction), Counter(target)
+        union = sum((pred_counts | gold_counts).values())
+        counter_iou = float(sum((pred_counts & gold_counts).values()) / union) if union else 1.0
         return {
             "edit_similarity": float(edit_similarity),
             "substring_match": substring_match,
             "exact_match": exact_match,
-            "counter_iou": self._counter_iou(prediction, target),
+            "counter_iou": counter_iou,
         }
-
-    @staticmethod
-    def _counter_iou(prediction: str, target: str) -> float:
-        pred, gold = Counter(prediction), Counter(target)
-        union = sum((pred | gold).values())
-        return float(sum((pred & gold).values()) / union) if union else 1.0
 
 
 @dataclass
-class OCRSpec(BaseRewardComponentSpec):
+class OCRSpec(PromptRewardComponentSpec):
     """Typed config for the OCR (PaddleOCR) reward component."""
 
     lang: str = "en"

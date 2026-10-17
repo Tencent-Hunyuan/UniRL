@@ -65,8 +65,7 @@ class GradContext:
             for tm in node.input_metas + node.output_metas:
                 if id(tm) not in seen:
                     seen.add(id(tm))
-                    if not tm.retain_grad_flag:
-                        tm.grad = None
+                    tm.grad = None
 
 
 def enable_grad() -> GradContext:

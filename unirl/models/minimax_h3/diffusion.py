@@ -8,7 +8,7 @@ from typing import ClassVar, List, Optional, Tuple
 import torch
 
 from unirl.config.require import require
-from unirl.models.types.diffusion import DiffusionStage, DiffusionStep
+from unirl.models.types.diffusion import DiffusionStage, DiffusionStep, combine_modality_logp
 from unirl.models.types.replay_result import ReplayResult
 from unirl.sde.kernels import StepStrategy
 from unirl.sde.noise import make_denoise_step_generators
@@ -21,17 +21,6 @@ from .bundle import MiniMaxH3Bundle
 from .conditions import MiniMaxH3Conditions
 from .config import MINIMAX_H3_AUDIO_LATENT_CHANNELS
 from .packing import MiniMaxH3Geometry, build_t2va_layout, row_timestep_plan
-
-
-def _combine_modality_logp(
-    video_logp: torch.Tensor,
-    audio_logp: torch.Tensor,
-    n_video: int,
-    n_audio: int,
-) -> torch.Tensor:
-    """Element-weighted mean of the per-step video/audio log-probs."""
-    total = n_video + n_audio
-    return (video_logp * n_video + audio_logp * n_audio) / total
 
 
 def pack_dual_streams(video_rows: torch.Tensor, audio_rows: torch.Tensor) -> torch.Tensor:
@@ -161,7 +150,7 @@ class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
 
         num_steps = int(sigmas.shape[0]) - 1
         require(
-            num_steps == int(params.num_inference_steps),
+            num_steps == params.num_inference_steps,
             f"MiniMaxH3DiffusionStage: schedule holds {num_steps} transitions but params.num_inference_steps="
             f"{params.num_inference_steps}. UniRL counts model evaluations, so N steps require N+1 sigma points; "
             f"the vendored MiniMaxH3Scheduler counts those grid points and therefore uses set_timesteps(N+1).",
@@ -191,7 +180,7 @@ class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
 
         audio_in_policy = self.audio_joint_sde
         for step_idx in range(num_steps):
-            step_eta = float(params.eta) if step_idx in sde_set else 0.0
+            step_eta = params.eta if step_idx in sde_set else 0.0
             # Per-STEP generators: the seed tuple is (base_seed, step_index,
             # sample_id), so this must be rebuilt inside the loop. Hoisting
             # it out would make each step draw from a running stream instead
@@ -254,7 +243,7 @@ class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
                 stored_audio.append(a.detach().clone())
             if log_prob is not None:
                 if audio_in_policy and audio_log_prob is not None:
-                    log_prob = _combine_modality_logp(
+                    log_prob = combine_modality_logp(
                         log_prob, audio_log_prob, n_video=x[0].numel(), n_audio=a[0].numel()
                     )
                 sde_logp_list.append(log_prob.to(dtype=self.logprob_dtype))
@@ -308,8 +297,8 @@ class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
         num_text_tokens = int(conditions.text.embeds.shape[1])
         layout = build_t2va_layout(geometry, num_text_tokens)
 
-        stored = [int(i) for i in segment.sde_indices.tolist()]
-        targets = [int(i) for i in (step_indices if step_indices is not None else stored)]
+        stored = segment.sde_indices.tolist()
+        targets = list(step_indices) if step_indices is not None else stored
 
         log_probs: List[torch.Tensor] = []
         means: List[torch.Tensor] = []
@@ -332,7 +321,7 @@ class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
                 sample=x,
                 sigma=sigmas[step_idx],
                 sigma_next=sigmas[step_idx + 1],
-                eta=float(params.eta),
+                eta=params.eta,
                 prev_sample=prev_x,
                 sigma_max=video_sigma_max,
                 step_index=step_idx,
@@ -343,13 +332,13 @@ class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
                     sample=a,
                     sigma=audio_sigmas[step_idx],
                     sigma_next=audio_sigmas[step_idx + 1],
-                    eta=float(params.eta),
+                    eta=params.eta,
                     prev_sample=prev_a,
                     sigma_max=audio_sigma_max,
                     step_index=step_idx,
                 )
                 if audio_log_prob is not None:
-                    log_prob = _combine_modality_logp(
+                    log_prob = combine_modality_logp(
                         log_prob, audio_log_prob, n_video=x[0].numel(), n_audio=a[0].numel()
                     )
             log_probs.append(log_prob.to(dtype=self.logprob_dtype))

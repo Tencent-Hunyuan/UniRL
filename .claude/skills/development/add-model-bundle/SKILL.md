@@ -148,7 +148,7 @@ For causal-LM or multimodal AR paths:
 
 ## What To Verify
 
-Follow the `CLAUDE.md` verification-harness rule: run small, uncommitted CPU
+Follow the `AGENTS.md` verification-harness rule: run small, uncommitted CPU
 harnesses with fakes or monkeypatches and quote the commands and results in the
 PR's Test Plan.
 

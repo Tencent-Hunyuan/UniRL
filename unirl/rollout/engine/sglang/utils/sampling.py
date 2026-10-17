@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from numbers import Integral
 from typing import Any, Dict, Optional, cast
 
-from unirl.types.sample import Part, Sample
+from unirl.types.sample import Sample
 from unirl.types.sampling import ARSamplingParams
 
 _DEFAULT_SGLANG_SAMPLING_SEED = 42
@@ -53,10 +53,10 @@ def deterministic_inference_enabled(engine_kwargs: Dict[str, Any]) -> bool:
     )
 
 
-def _require_ar_frontier(sample: Sample) -> Part:
-    """Require ``ARSamplingParams`` on the request ``Sample`` frontier."""
+def resolve_sampling(config: Any, sample: Sample) -> ResolvedSampling:
+    """Resolve the SRT sampling block from the request Sample's ARSamplingParams."""
     try:
-        return sample.frontier_gen_part(ARSamplingParams)
+        gen_part = sample.frontier_gen_part(ARSamplingParams)
     except ValueError as exc:
         raise TypeError(
             "SGLang generation requires ARSamplingParams on the request Sample frontier. "
@@ -64,11 +64,6 @@ def _require_ar_frontier(sample: Sample) -> Part:
             "in-tree trainer, PE, and agentic paths already stamp this. Engine-config "
             "temperature / top_p / top_k / max_new_tokens is no longer a fallback."
         ) from exc
-
-
-def resolve_sampling(config: Any, sample: Sample) -> ResolvedSampling:
-    """Resolve the SRT sampling block from the request Sample's ARSamplingParams."""
-    gen_part = _require_ar_frontier(sample)
     ar = cast(ARSamplingParams, gen_part.sampling_params)
     input_part = sample.parts[0]
     control_ar: Dict[str, Any] = dict(input_part.control.get("ar") or {})
@@ -77,7 +72,7 @@ def resolve_sampling(config: Any, sample: Sample) -> ResolvedSampling:
     n_parent = len(parent_part.sample_ids)
     fanout = (len(gen_part.sample_ids) // n_parent) if n_parent else 1
 
-    engine_kwargs = getattr(config, "engine_kwargs", None) or {}
+    engine_kwargs = config.engine_kwargs
     deterministic = deterministic_inference_enabled(engine_kwargs)
     configured_seed = _validated_base_seed(ar.seed) if ar.seed is not None else None
     if configured_seed is not None and not deterministic:
@@ -92,9 +87,9 @@ def resolve_sampling(config: Any, sample: Sample) -> ResolvedSampling:
 
     raw_top_k = ar.top_k
     block: Dict[str, Any] = {
-        "temperature": float(ar.temperature),
-        "max_new_tokens": int(ar.max_new_tokens),
-        "top_p": float(ar.top_p),
+        "temperature": ar.temperature,
+        "max_new_tokens": ar.max_new_tokens,
+        "top_p": ar.top_p,
         "top_k": raw_top_k if raw_top_k > 0 else -1,
         "n": n,
     }
@@ -106,7 +101,11 @@ def resolve_sampling(config: Any, sample: Sample) -> ResolvedSampling:
         n=n,
         fanout=fanout,
         return_logprob=bool(control_ar.get("return_logprob", True)),
-        system_instruction=control_ar.get("system_instruction") or config.system_instruction,
+        system_instruction=(
+            control_ar["system_instruction"]
+            if control_ar.get("system_instruction") is not None
+            else config.system_instruction
+        ),
         block=block,
         base_seed=base_seed,
     )

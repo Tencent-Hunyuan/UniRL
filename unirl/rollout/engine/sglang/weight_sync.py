@@ -8,6 +8,7 @@ from typing import Dict, List, Optional
 import torch
 
 from unirl.rollout.engine.sglang.backends import Backend
+from unirl.rollout.engine.sglang.backends.base import CheckpointEngineIPCBackend
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +18,7 @@ class WeightSync:
 
     def __init__(self, backend: Backend, *, uses_lora: bool) -> None:
         self._backend = backend
-        self._uses_lora = bool(uses_lora)
+        self._uses_lora = uses_lora
         self._active_adapter: Optional[str] = None
         self._lora_loaded = False
         self._lora_version = 0
@@ -49,11 +50,11 @@ class WeightSync:
     ) -> None:
         self._backend.init_weights_group(
             master_address=master_address,
-            master_port=int(master_port),
-            rank_offset=int(rank_offset),
-            world_size=int(world_size),
-            group_name=str(group_name),
-            backend=str(backend),
+            master_port=master_port,
+            rank_offset=rank_offset,
+            world_size=world_size,
+            group_name=group_name,
+            backend=backend,
         )
 
     def update_weights_from_distributed(
@@ -69,15 +70,33 @@ class WeightSync:
             raise ValueError("names must be non-empty for distributed update")
         clean_dtypes = [d.replace("torch.", "") if isinstance(d, str) else d for d in dtypes]
         self._backend.update_from_distributed(
-            names=list(names),
+            names=names,
             dtypes=clean_dtypes,
-            shapes=[list(shape) for shape in shapes],
-            group_name=str(group_name),
+            shapes=shapes,
+            group_name=group_name,
             flush_cache=flush_cache,
         )
 
     def destroy_weights_update_group(self, *, group_name: str) -> None:
-        self._backend.destroy_weights_group(group_name=str(group_name))
+        self._backend.destroy_weights_group(group_name=group_name)
+
+    def update_weights_from_checkpoint_engine_ipc(
+        self,
+        *,
+        zmq_handles: Dict[str, str],
+        flush_cache: bool,
+        timeout_s: float,
+    ) -> None:
+        """Push full weights via ZMQ + CUDA IPC (checkpoint-engine protocol)."""
+        if not zmq_handles:
+            raise ValueError("zmq_handles must be non-empty for IPC update")
+        if not isinstance(self._backend, CheckpointEngineIPCBackend):
+            raise TypeError("SGLang backend does not support checkpoint-engine IPC")
+        self._backend.update_from_checkpoint_engine_ipc(
+            zmq_handles=zmq_handles,
+            flush_cache=flush_cache,
+            timeout_s=timeout_s,
+        )
 
     def set_lora_from_tensors(
         self,
@@ -87,7 +106,8 @@ class WeightSync:
         peft_config: Optional[dict] = None,
     ) -> None:
         """Push a LoRA adapter from in-memory tensors."""
-        nickname = self._next_lora_nickname(adapter_name)
+        self._lora_version += 1
+        nickname = f"{adapter_name}_v{self._lora_version}"
         self._backend.set_lora(
             lora_name=nickname,
             lora_tensors=lora_tensors,
@@ -101,10 +121,6 @@ class WeightSync:
             nickname,
             len(lora_tensors),
         )
-
-    def _next_lora_nickname(self, adapter_name: str) -> str:
-        self._lora_version += 1
-        return f"{adapter_name}_v{self._lora_version}"
 
     def mark_weights_released(self) -> None:
         """The engine released the runtime weights — the loaded LoRA pool is gone."""

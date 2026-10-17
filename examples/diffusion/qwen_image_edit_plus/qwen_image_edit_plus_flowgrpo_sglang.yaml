@@ -178,15 +178,6 @@ rollout:
     num_gpus: 1
     tp_size: 1
     local_mode: true
-    target_modules:
-      - attn.add_k_proj
-      - attn.add_q_proj
-      - attn.add_v_proj
-      - attn.to_add_out
-      - attn.to_k
-      - attn.to_out.0
-      - attn.to_q
-      - attn.to_v
     engine_kwargs:
       # Explicit pipeline pin (ServerArgs.model_id, matched by registered short
       # name "Qwen-Image-Edit-2511") — local checkpoint dirs then need no special
@@ -230,6 +221,7 @@ stack:
   micro_batch_size: 1
   max_grad_norm: 1.0
   num_updates_per_batch: 2      # PPO mini-batches per rollout (π_old frozen once); v1 parity
+  shuffle_updates: true
 
 data_source:
   _target_: unirl.data.data_source.MultimodalRLDataSource

@@ -35,6 +35,7 @@ repos:
       - id: debug-statements
       - id: requirements-txt-fixer
       - id: no-commit-to-branch
+        stages: [pre-commit]
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.15.1

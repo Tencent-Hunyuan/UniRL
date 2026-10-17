@@ -55,17 +55,42 @@ stay swappable by `_target_`.
   Parts for training. (ReFL — which differentiates
   directly through decoded media and uses no rollout Samples or advantages —
   lives outside core as `experimental/refl`.)
-- **Diffusion role residency is opt-in.** `rollout_sleep_after_generate=true`
-  preserves phase-based rollout sleep (the default; the async entry point
-  defaults it to `false` — its dedicated rollout slab stays resident); `false`
-  keeps an external engine's weights resident across rollout/reward/train. Train-state policies are
-  independent: `enable_fsdp_offload` lets an external rollout borrow train memory
-  during generation, while `offload_train_during_reward` lets a reward sharing the
-  train slab borrow it during scoring. A reward on a separate `reward_fraction`
-  slab never triggers train offload. `offload_train_during_reward` is rejected at
-  startup with EMA/DiffusionNFT algorithms (unvalidated against `backend.ema`
-  state) and with `AsyncDiffusionTrainer` (async scoring runs outside
-  `_reward_phase()`), rather than being silently ignored.
+- **Diffusion residency is one choice per role, not per phase.** `train_resident`,
+  `rollout_resident` and `reward_resident` each say whether that role keeps its
+  weights on the GPU while it is idle; only weights move, never a role's process.
+  Synchronous defaults (`true`/`false`/`true`) reproduce the historical behaviour.
+  Async defaults (`true`/`true`/`true`) keep its dedicated rollout slab resident;
+  direct `AsyncDiffusionTrainer` construction and the async entry point use the
+  same policy. `ResidencyPlanner`
+  turns a phase's needs into transitions and issues only the ones that change
+  something, so a reward phase inherits an already-parked trainer instead of
+  re-offloading it, and the trainer returns once per optimizer step rather than
+  once per rollout. Roles that do not share the slab — a reward behind
+  `reward_fraction`, or the trainer behind `layout: separate` or a trainside
+  rollout — are not tracked, so nothing moves memory the active role could not
+  use — and asking to park one of them is rejected rather than ignored. The
+  startup rejections are: `train_resident=false` where there is nothing to park
+  (`layout: separate`, or a trainside rollout, whose generation reads the very
+  weights that would go), with a full-weight sync whose single `sync()` reads the
+  trainer and loads the rollout in one call, or with EMA/DiffusionNFT plus an
+  external colocated rollout (unvalidated against `backend.ema` state); and under
+  `AsyncDiffusionTrainer`, `reward_resident=false` (async scoring runs outside
+  `_reward_phase()`) and `rollout_resident=false` (the engine owns a dedicated slab
+  and is never idle, so parking it at an evaluation or checkpoint boundary would
+  sleep an engine the loop is about to use).
+
+  Both the optimizer step and checkpointing consume the trainer, so it is made
+  resident before each; the checkpoint one sits behind
+  `maybe_save_checkpoint`'s own due-or-not predicate, so a window that evaluates
+  without saving keeps the trainer parked. A LoRA sync holds its extracted adapter
+  past the push and until the next optimizer step, so an accumulate window and an
+  eval's later chunks reuse it instead of onloading the trainer to read weights
+  that cannot have changed. A no-sync eval preserves an unpinned rollout while
+  scoring between chunks because sleeping engines such as SGLang would discard
+  the adapter that the caller deliberately did not repush. A pinned rollout
+  (`rollout_resident: true`) is not
+  slept even when generation raises: the policy says its weights stay put, and the
+  caller that set it owns the peak.
 
 The current trainer surface is:
 
@@ -78,7 +103,7 @@ The current trainer surface is:
 | `AsyncDiffusionTrainer` | FIFO diffusion generation batch → one `TrainStack` | The same update-versioned manager loop for DiT. Requires `max_inflight=1` and resolves and scores each intact batch before launching its replacement, so cross-slab transfer never queues behind fresh generation. |
 | `PETrainer` | `ar` + `diffusion` Parts → two `TrainStack`s | Composed prompt-rewrite/image rollout; image rewards propagate to AR rewrites. `freeze_llm=true` trains and checkpoints diffusion only. |
 | `UnifiedModelTrainer` | whole `Sample` → one `UnifiedModelTrainStack` | AR and image losses accumulate into shared-backbone optimizer steps while prompt-tree lineage remains intact during DP scatter. |
-| `AgenticTrainer` | variable-depth `List[Sample]` → concatenated turn `Part` | Colocated barrier multi-turn tool use. It syncs every step, waits for complete groups, scores terminal answers through `RewardService`, and excludes failed trajectories. |
+| `AgenticTrainer` | variable-depth `List[Sample]` → concatenated turn `Part` | Colocated barrier multi-turn tool use. It syncs every step, waits for complete groups, scores terminal answers through `RewardService`, and excludes failed trajectories. Overflow trajectories are scored like completed ones; `mask_overflow_loss=true` keeps them in the group baseline but drops their gradient. |
 
 All async variants use the driver-local `RolloutManager`. Batch trainers provide
 one slab-wide launcher and keep completed batches intact; the agentic trainer
@@ -97,9 +122,134 @@ cross-step buffering policies.
 remotes inside a `placement(...)` scope and implements `train_step` + `train`; the
 matching `../train_<domain>.py` entrypoint composes the recipe and calls it.
 
+## Run supervised fine-tuning
+
+The SFT path swaps the loop's producer: no rollout engine, no reward, no weight
+sync. A manifest feeds `SFTTrainer`, which reuses the RL consumer side
+(bundle → pipeline → backend → stack) verbatim; only the producer changes —
+`track_builder` turns dataset records into a standalone training `Part` on the
+workers, and the algorithm is anchor-free (`requires_advantages=False`):
+token cross-entropy (`SFT`) for text / VLM / agent, flow-matching on latents
+(`FlowMatchSFT`, Cosmos's `Cosmos3JointFlowMatchSFT`) for T2I / video. Entrypoint:
+[`unirl/train_sft.py`](../train_sft.py); builder contracts in
+[`train/sft/README.md`](../train/sft/README.md).
+
+SFT recipes read local JSONL manifests, not HF dataset ids. The
+[manifest guide](../../datasets/sft_manifests/README.md) owns the converters,
+row schemas, and the prepare → launch commands. `SFT_DATA` is required;
+`SFT_EVAL_DATA` enables validation. Sibling recipes in `examples/sft/` cover
+LoRA, VLM, agent-trajectory, T2I, and video — same entrypoint, a different
+`track_builder` and manifest modality.
+
+### What runs each step
+
+`SupervisedDataSource` on the driver yields a batch of records (epoch-aware
+cursor, seeded shuffle, optional prefetch); `track_builder.build` turns them into
+a training `Part` on the workers; `TrainStack.train_track` takes one optimizer
+step on that loss.
+
+Two geometry constraints, enforced in `SFTTrainer.__init__`:
+`stack.num_updates_per_batch` must be `1` — step, eval, checkpoint, and resume
+accounting each count one optimizer update per dataset batch — and `batch_size`
+must be divisible by the train world size (`dp`).
+
+Evaluation iterates the full validation set in bounded batches (a partial final
+batch is padded to a `dp` multiple with zero-weight rows) and reports a weighted
+mean loss; it never moves the training cursor.
+
+### Save and resume
+
+SFT saves on the generic cadence and in the generic formats from
+[Checkpointing](#checkpointing). Each `checkpoint-<step>/` additionally carries
+`sft_data_state.json`: the dataset cursor (`epoch`, `position`, `seed`,
+`shuffle`) and the train manifest's SHA-256 fingerprint.
+
+```bash
+# Resume from an existing checkpoint-200. num_steps stays the TOTAL budget;
+# ++ works whether or not the recipe defines the key.
+SFT_DATA=data/sft_alpaca/train.jsonl SFT_EVAL_DATA=data/sft_alpaca/val.jsonl \
+  ENTRY=train_sft bash examples/run_experiment_single_node.sh sft/qwen3_sft \
+  ++num_steps=400 ++save_interval=100 \
+  ++save_dir=checkpoints/qwen3_sft \
+  ++load_dir=checkpoints/qwen3_sft/checkpoint-200
+```
+
+Resume restores model / optimizer / scheduler from the backend checkpoint and
+the dataset cursor from `sft_data_state.json` (written on the same cadence as
+the checkpoints, atomically). The cursor is not a serialized sampler: the
+shuffle order is replayed deterministically from `seed` + `epoch`, and
+`position` indexes into that replayed order. Two guards refuse a mismatched
+resume rather than silently training on different data: the manifest
+fingerprint (a changed `train.jsonl` raises) and the `(seed, shuffle)` pair. A
+legacy checkpoint without `sft_data_state.json` falls back to fast-forwarding
+`start_step` batches through the seeded order, with a warning.
+
+## Run async AR or async diffusion training
+
+The async paths disaggregate the loop: training and the rollout engine each
+own a **slab** — a disjoint `placement` scope over a subset of the GPU pool,
+split by `train_fraction` — instead of time-sharing each GPU. Both are FIFO batch
+trainers driven by one shared loop ([`async_rollout.py`](async_rollout.py)); how
+each overlaps generation is in the trainer table under [How it works](#how-it-works).
+
+| Path | Entrypoint | Default recipe | Engine · sync |
+| --- | --- | --- | --- |
+| Async AR | [`unirl/train_async_ar.py`](../train_async_ar.py) | [`ar/qwen3_grpo_4b_base_dapo_sglang_async`](../../examples/ar/qwen3_grpo_4b_base_dapo_sglang_async.yaml) | SGLang · `NCCLWeightSync` (full dense) |
+| Async diffusion | [`unirl/train_async_diffusion.py`](../train_async_diffusion.py) | [`diffusion/bagel/bagel_vllmomni_async`](../../examples/diffusion/bagel/bagel_vllmomni_async.yaml) | vLLM-Omni · `RemoteLoraWeightSync` |
+
+Launch lines and required env vars are in
+[`examples/README.md · Running a recipe`](../../examples/README.md#running-a-recipe);
+each async recipe's header comment also carries a small-pool launch line.
+
+### The shared lifecycle
+
+The **train version** counts committed optimizer updates, the **published
+version** is the train version the engine serves, and every generated `Part` is
+stamped with the **output version** it was generated under (all logged under
+`rollout/async/*`: `staleness_updates` measures `train_version - output_version`
+before the batch's optimizer updates, while `train_version`, `publish_lag`, and
+`batches_since_sync` are recorded after training, before weight
+synchronization).
+Admission is bounded by `max_inflight` batch-equivalents globally and
+`per_worker_inflight` prompt trees per rollout worker, and every launch is
+clipped to the lag budget from [How it works](#how-it-works) and to the next
+hard boundary. Async AR may raise the batch-side budget with
+`buffer_max_staleness` (in batches; must stay `>= weight_sync_interval - 1`);
+async diffusion fixes it at `weight_sync_interval - 1`.
+
+Publication fires once `weight_sync_interval` batches are trained, or earlier
+at an eval/save boundary, and quiesces the manager first
+([rollout Gotchas](../rollout/README.md#gotchas)). Before publishing, the trainer
+batch-aligns the carry so a publication never splits one training batch across
+behavior-policy versions: if any carried prompt has started, the whole carry
+finishes under the old weights; otherwise only the prefix needed to top the
+ready buffer up to a whole batch finishes, and the rest is resubmitted after
+publication. **Hard boundaries** — every `eval_interval`, every
+`save_interval`, and the final rollout — admit no carry, and each raises if
+work remains after quiescing.
+
+### Variant constraints
+
+| Constraint | Async AR | Async diffusion |
+| --- | --- | --- |
+| Algorithm | must require advantages — teacher-anchored or supervised objectives are rejected; use the synchronous `ARTrainer` | no extra check beyond the sync diffusion path |
+| `reward:` block | required (reward-free AR training is sync-only) | required: every batch is scored at reap time, outside `_reward_phase()`. Not checked at startup, so a missing block fails on the first batch |
+| `sync:` block | required, and must be `NCCLWeightSync` — full dense weights cross the slab | required (the BAGEL default pushes LoRA via `RemoteLoraWeightSync`) |
+| Engine | dedicated engine (vLLM/SGLang) on the rollout slab; the trainside direct-sampling engine cannot live cross-slab | dedicated engine (vLLM-Omni — the BAGEL default — or SGLang diffusion); trainside is rejected |
+| Geometry / inflight | `train_fraction * num_devices` integral; `batch_size * samples_per_prompt` divisible by the train-slab size | all of the AR geometry rules, plus `layout: separate` and `max_inflight = 1` are enforced |
+
+### Resume
+
+`load_dir` restores the backend checkpoint; the restored **optimizer step
+count becomes the train version**; the deterministic input stream fast-forwards
+`start_rollout` batches; and a forced, empty-manager publication pushes the
+restored weights into the freshly started engine before the first batch
+(startup eval, when enabled, runs after that sync). Checkpoint formats and
+budget semantics are the generic ones in [Checkpointing](#checkpointing).
+
 ## Checkpointing
 
-Available for the single-backend trainers (including diffusion, AR, unified-model,
+Available for the single-backend trainers (including diffusion, AR, SFT, unified-model,
 ReFL, async, and agentic training) and for every trained side of `PETrainer`. A
 single-backend checkpoint bundles model state (`save_mode=auto`: LoRA-only when
 LoRA is active, otherwise full; `save_mode=full`: the whole model state;
@@ -327,14 +477,18 @@ without driver-authored x_T. `media_log_interval` does not apply
 
 ## Gotchas
 
+- **HI3 two-engine rollout returns whole chunks.** `rollout_pipeline_chunks > 1`
+  overlaps the next chunk's AR with the current chunk's DiT using one pending
+  call per engine. It preserves complete prompt trees and output order; smaller
+  chunks can reduce per-engine batch throughput, so the recipe keeps this off.
 - **Multi-update means disjoint optimizer mini-batches, not repeated full-batch
   epochs.** See [Multiple optimizer updates per rollout](#multiple-optimizer-updates-per-rollout)
   for the algorithm and divisibility constraints.
 - **Agentic evaluation remains deferred.** `AgenticTrainer` has no evaluation
   phase; its recipe configures training only.
-- **`layout` only branches on `"separate"`** (`"colocate"` == `"colocated"`). The
-  trainside direct-sampling engine cannot live on a `separate` slab — `_build_rollout`
-  raises (it needs the pipeline as a local sibling).
+- **`layout` must be `"colocate"` or `"separate"`.** The trainside direct-sampling
+  engine cannot live on a `separate` slab — `DiffusionTrainer.__init__` raises before
+  spawning actors (it needs the pipeline as a local sibling).
 - **`weight_sync` is built only when a `sync:` block is present** (dedicated engines);
   trainside sampling reads the live training weights and needs none (`self.weight_sync` stays `None`).
 - **FSDP offload during `generate` is off by default** and force-gated off for trainside

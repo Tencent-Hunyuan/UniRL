@@ -11,6 +11,7 @@ description: Create and repair UniRL pull requests. Use when creating a PR, edit
 2. Inspect the full diff against the intended base branch, not just the latest commit.
 3. Check for overlapping open PRs or issues when the user is asking to publish a substantive change.
 4. Do not include unrelated local files, generated artifacts, datasets, checkpoints, credentials, or outputs.
+5. For a substantive code or config change, finish `.claude/skills/development/pr-review/SKILL.md` first.
 
 ## Title
 

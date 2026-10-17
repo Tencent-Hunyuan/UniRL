@@ -17,24 +17,11 @@ from unirl.models.bagel.vendor.data.data_utils import (
     get_flattened_position_ids_interpolate,
     patchify, 
 )
-from .qwen2_navit import NaiveCache
+from .qwen2_navit import NaiveCache, _apply_by_sequence, _sequence_lengths
 from .modeling_utils import MLPconnector, TimestepEmbedder, PositionEmbedding
 from unirl.models.bagel.vendor.modeling.cache_utils.taylorseer import cache_init
 
 from tqdm import tqdm
-
-
-def _sequence_lengths(lengths) -> List[int]:
-    if isinstance(lengths, torch.Tensor):
-        return [int(length) for length in lengths.tolist()]
-    return [int(length) for length in lengths]
-
-
-def _apply_by_sequence(module, packed_tensor, lengths):
-    lengths = _sequence_lengths(lengths)
-    if len(lengths) <= 1:
-        return module(packed_tensor)
-    return torch.cat([module(chunk) for chunk in packed_tensor.split(lengths, dim=0)], dim=0)
 
 
 class BagelConfig(PretrainedConfig):
