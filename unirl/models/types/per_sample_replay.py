@@ -68,8 +68,8 @@ class PerSampleStepReplayMixin:
                 prev_sample=prev_sample,
                 sigma=sigma,
                 sigma_next=sigma_next,
-                guidance_scale=float(params.guidance_scale),
-                eta=float(params.eta),
+                guidance_scale=params.guidance_scale,
+                eta=params.eta,
                 sigma_max=sigma_max,
                 step_index=0,
             )
