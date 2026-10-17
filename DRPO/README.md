@@ -113,14 +113,14 @@ The practical consequence:
 
 | Math object | Repo object |
 |---|---|
-| State `s_t = (x, y_{<t})` | `track.conditions` + the packed prefix in `TextSegment` |
+| State `s_t = (x, y_{<t})` | `part.conditions` + the packed prefix in `TextSegment` |
 | Sampled token `y_t` | `segment.tokens` |
 | Behavior log-prob `log µ(y_t\|s_t)` | `segment.log_probs` (emitted by SGLang; train-side `π_old` under `old_logp_source: replay`) → `old_logp` |
 | New log-prob `log π_θ(y_t\|s_t)` | `stage.replay(segment, temperature=sampling_temperature)` → `new_logp` |
 | Ratio `r_t = π/µ` | `torch.exp(new_logp − old_logp)` |
 | Behavior prob `µ_t` | `torch.exp(old_logp).detach()` |
 | Regularization threshold `δ` (paper) / `ε` (code) | `drpo_epsilon` (default 12.5; paper §4) |
-| Sample-level advantage `Â` | `track.advantages` |
+| Sample-level advantage `Â` | `part.advantages` |
 | Token-level advantage | `GRPO._expand_advantages_to_tokens(advantages, segment.lengths, ...)` |
 | Quadratic penalty `\|Â\|·µ·(r−1)²/(2ε)` | `adv.abs() * old_prob * ratio_delta.square() / (2.0 * epsilon)` |
 | Padding/eos mask | `segment.loss_mask` |
@@ -167,7 +167,7 @@ may split the batch into several optimizer steps; the recipe uses 4.
 
 Metric source: `ratio_mean`, `ratio_max`, `approx_kl`, `drpo_penalty_mean`,
 `clipfrac_upper`, `clipfrac_lower`, and the AR-only `rollout_replay_logp_absdiff_mean` are
-emitted by `_drpo_loss`.
+emitted by `_drpo_loss` / `compute_loss_and_backward`.
 
 ## Run it
 
