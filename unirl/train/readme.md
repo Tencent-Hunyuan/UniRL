@@ -125,6 +125,9 @@ use LoRA adapter mode. Formats and export live in
 
 ## Gotchas
 
+- **`adapter_active` requires an already frozen teacher and restores adapter selection
+  and parameter trainability even if switching fails.** PEFT's `set_adapter` also
+  changes `requires_grad`; the caller owns `torch.no_grad()` around teacher replay.
 - **Unified `ar` / `image` results describe one shared optimizer step.** Their
   `optimizer_updates` (total and per update) count the same steps, so summing
   them across tracks double-counts.
