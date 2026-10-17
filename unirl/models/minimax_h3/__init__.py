@@ -1,7 +1,7 @@
 """MiniMax-H3 -- 33B omni-modal joint video + stereo audio diffusion."""
 
 from .bundle import MiniMaxH3Bundle
-from .conditions import MiniMaxH3Conditions
+from .conditions import MiniMaxH3Conditions, MiniMaxH3KeyframeCondition
 from .config import (
     MINIMAX_H3_LATENT_CHANNELS,
     MINIMAX_H3_PATCH_SIZE,
@@ -10,7 +10,7 @@ from .config import (
     MiniMaxH3PipelineConfig,
 )
 from .diffusion import MiniMaxH3DiffusionStage, MiniMaxH3DiffusionStep
-from .packing import MiniMaxH3Geometry, build_t2va_layout, row_timestep_plan
+from .packing import MiniMaxH3Geometry, build_layout, row_timestep_plan
 from .pipeline import MiniMaxH3Pipeline
 from .text_embed import MiniMaxH3TextEmbedStage
 from .vae import (
@@ -31,10 +31,11 @@ __all__ = [
     "MiniMaxH3DiffusionStage",
     "MiniMaxH3DiffusionStep",
     "MiniMaxH3Geometry",
+    "MiniMaxH3KeyframeCondition",
     "MiniMaxH3Pipeline",
     "MiniMaxH3PipelineConfig",
     "MiniMaxH3TextEmbedStage",
     "MiniMaxH3VideoDecodeStage",
-    "build_t2va_layout",
+    "build_layout",
     "row_timestep_plan",
 ]
