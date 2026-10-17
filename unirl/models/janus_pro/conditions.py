@@ -36,43 +36,6 @@ def _pad_seq_tensor(value: torch.Tensor, target_seq_len: int) -> torch.Tensor:
     return out
 
 
-def _stack_seq_rows(value: Any, target_seq_len: int) -> torch.Tensor:
-    if isinstance(value, torch.Tensor):
-        return _pad_seq_tensor(value, target_seq_len)
-    if not isinstance(value, (list, tuple)):
-        raise TypeError(f"JanusProARConditions: expected images_seq_mask tensor/list, got {type(value).__name__}")
-
-    rows = list(value)
-    if not rows:
-        return torch.empty((0, target_seq_len), dtype=torch.bool)
-    if any(not isinstance(row, torch.Tensor) for row in rows):
-        bad = next(row for row in rows if not isinstance(row, torch.Tensor))
-        raise TypeError(f"JanusProARConditions: images_seq_mask row must be tensor, got {type(bad).__name__}")
-
-    padded = []
-    for row in rows:
-        flat = row.reshape(-1)
-        if flat.shape[0] > target_seq_len:
-            raise ValueError(
-                f"Cannot pad Janus-Pro images_seq_mask row with seq_len={flat.shape[0]} "
-                f"to shorter target={target_seq_len}"
-            )
-        out = flat.new_zeros((target_seq_len,))
-        out[: flat.shape[0]] = flat
-        padded.append(out)
-    return torch.stack(padded, dim=0)
-
-
-def _require_tensor(d: Dict[str, Any], key: str) -> torch.Tensor:
-    value = d.get(key)
-    if not isinstance(value, torch.Tensor):
-        raise TypeError(
-            f"JanusProARConditions.from_dict: expected d[{key!r}] to be a "
-            f"torch.Tensor, got {type(value).__name__ if value is not None else 'None'}"
-        )
-    return value
-
-
 def _optional_tensor(d: Dict[str, Any], key: str) -> Optional[torch.Tensor]:
     value = d.get(key)
     if value is not None and not isinstance(value, torch.Tensor):
@@ -136,10 +99,44 @@ class JanusProARConditions(Batch):
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "JanusProARConditions":
         prompt = _require_text_condition(d, "prompt")
+        target_seq_len = _prompt_seq_len(prompt)
+        raw_mask = d["images_seq_mask"]
+        if isinstance(raw_mask, torch.Tensor):
+            images_seq_mask = _pad_seq_tensor(raw_mask, target_seq_len)
+        elif isinstance(raw_mask, (list, tuple)):
+            rows = list(raw_mask)
+            if not rows:
+                images_seq_mask = torch.empty((0, target_seq_len), dtype=torch.bool)
+            elif any(not isinstance(row, torch.Tensor) for row in rows):
+                bad = next(row for row in rows if not isinstance(row, torch.Tensor))
+                raise TypeError(f"JanusProARConditions: images_seq_mask row must be tensor, got {type(bad).__name__}")
+            else:
+                padded = []
+                for row in rows:
+                    flat = row.reshape(-1)
+                    if flat.shape[0] > target_seq_len:
+                        raise ValueError(
+                            f"Cannot pad Janus-Pro images_seq_mask row with seq_len={flat.shape[0]} "
+                            f"to shorter target={target_seq_len}"
+                        )
+                    out = flat.new_zeros((target_seq_len,))
+                    out[: flat.shape[0]] = flat
+                    padded.append(out)
+                images_seq_mask = torch.stack(padded, dim=0)
+        else:
+            raise TypeError(
+                f"JanusProARConditions: expected images_seq_mask tensor/list, got {type(raw_mask).__name__}"
+            )
+        images_emb_mask = d.get("images_emb_mask")
+        if not isinstance(images_emb_mask, torch.Tensor):
+            raise TypeError(
+                "JanusProARConditions.from_dict: expected d['images_emb_mask'] to be a "
+                f"torch.Tensor, got {type(images_emb_mask).__name__ if images_emb_mask is not None else 'None'}"
+            )
         return cls(
             prompt=prompt,
-            images_seq_mask=_stack_seq_rows(d["images_seq_mask"], _prompt_seq_len(prompt)),
-            images_emb_mask=_require_tensor(d, "images_emb_mask"),
+            images_seq_mask=images_seq_mask,
+            images_emb_mask=images_emb_mask,
             pixel_values=_optional_tensor(d, "pixel_values"),
             image_embeds=_optional_tensor(d, "image_embeds"),
         )

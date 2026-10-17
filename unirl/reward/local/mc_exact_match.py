@@ -21,37 +21,7 @@ _ANSWER_PATTERN = re.compile(
 _STANDALONE_LETTER = re.compile(r"\b([A-D])\b")
 
 
-def _normalize_answer(answer: str) -> str:
-    """Normalize answer to A/B/C/D letter."""
-    a = answer.strip().upper()
-    if len(a) == 1 and a in "1234":
-        return chr(ord("A") + ord(a) - ord("1"))
-    if len(a) == 1 and a in "ABCD":
-        return a
-    return a
-
-
-def _extract_answer_letter(text: str, *, require_phrase: bool = False) -> str:
-    text = text.strip()
-    tag_matches = _ANSWER_TAG.findall(text)
-    if tag_matches:
-        return tag_matches[-1].upper()
-    phrase_matches = _ANSWER_PATTERN.findall(text)
-    if require_phrase:
-        return phrase_matches[-1].upper() if phrase_matches else ""
-    if len(text) == 1 and text in "1234":
-        return chr(ord("A") + ord(text) - ord("1"))
-    if len(text) == 1 and text.upper() in "ABCD":
-        return text.upper()
-    if phrase_matches:
-        return phrase_matches[-1].upper()
-    matches = _STANDALONE_LETTER.findall(text)
-    if matches:
-        return matches[-1].upper()
-    return ""
-
-
-def _extract_answer_letter_graded(text: str) -> Tuple[str, float]:
+def _extract_answer_letter_graded(text: str, *, require_phrase: bool = False) -> Tuple[str, float]:
     """Return the extracted letter and its format-quality weight."""
     text = text.strip()
 
@@ -60,6 +30,8 @@ def _extract_answer_letter_graded(text: str) -> Tuple[str, float]:
         return tag_matches[-1].upper(), 1.0
 
     phrase_matches = _ANSWER_PATTERN.findall(text)
+    if require_phrase:
+        return (phrase_matches[-1].upper(), 0.5) if phrase_matches else ("", 0.0)
     if phrase_matches:
         return phrase_matches[-1].upper(), 0.5
 
@@ -75,11 +47,6 @@ def _extract_answer_letter_graded(text: str) -> Tuple[str, float]:
     return "", 0.0
 
 
-def _extract_tagged_answer_letter(text: str) -> str:
-    matches = _ANSWER_TAG.findall(text.strip())
-    return matches[-1].upper() if matches else ""
-
-
 class MCExactMatchRewardScorer(LocalRewardBackend):
     """Multiple-choice exact-match reward for VLM QA tasks."""
 
@@ -89,33 +56,35 @@ class MCExactMatchRewardScorer(LocalRewardBackend):
     def __init__(self, *, config: "MCExactMatchSpec", base_device: str) -> None:
         del base_device
         super().__init__()
-        self.graded_format_reward = bool(getattr(config, "graded_format_reward", False))
-        self.require_answer_tag = bool(getattr(config, "require_answer_tag", False))
-        self.require_answer_phrase = bool(getattr(config, "require_answer_phrase", False))
+        self.graded_format_reward = bool(config.graded_format_reward)
+        self.require_answer_tag = bool(config.require_answer_tag)
+        self.require_answer_phrase = bool(config.require_answer_phrase)
 
     def _load_model(self) -> None:
-        self.model = "mc_exact_match"
+        pass
 
     def _compute_model_rewards(self, request: RewardRequest) -> List[float]:
         generated = request.texts
         if generated is None:
             raise ValueError("MCExactMatchRewardScorer requires request.texts (generated answers).")
-        metadata_list = request.metadata or [None] * len(generated)
+        metadata_list = [None] * len(generated) if request.metadata is None else request.metadata
         rewards: List[float] = []
         for text, meta in zip(generated, metadata_list):
             if meta is None or "answer" not in meta:
                 rewards.append(0.0)
                 continue
-            gt = _normalize_answer(str(meta["answer"]))
+            raw_gt = str(meta["answer"]).strip().upper()
+            gt = chr(ord("A") + ord(raw_gt) - ord("1")) if len(raw_gt) == 1 and raw_gt in "1234" else raw_gt
             if self.require_answer_tag:
-                predicted = _extract_tagged_answer_letter(text)
+                matches = _ANSWER_TAG.findall(text.strip())
+                predicted = matches[-1].upper() if matches else ""
                 rewards.append(1.0 if predicted == gt else 0.0)
-            elif self.graded_format_reward:
-                predicted, fmt_weight = _extract_answer_letter_graded(text)
-                rewards.append(fmt_weight if predicted == gt else 0.0)
             else:
-                predicted = _extract_answer_letter(text, require_phrase=self.require_answer_phrase)
-                rewards.append(1.0 if predicted == gt else 0.0)
+                predicted, fmt_weight = _extract_answer_letter_graded(text, require_phrase=self.require_answer_phrase)
+                if predicted != gt:
+                    rewards.append(0.0)
+                else:
+                    rewards.append(fmt_weight if self.graded_format_reward else 1.0)
 
         return rewards
 

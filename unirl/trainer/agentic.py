@@ -70,12 +70,11 @@ class AgenticTrainer(BaseTrainer):
         per_worker_inflight: int = 8,
         mask_overflow_loss: bool = False,
     ) -> None:
-        per_worker_inflight = int(per_worker_inflight)
         configured_concurrency = cfg.get("worker_max_concurrency")
         worker_max_concurrency = (
             required_worker_concurrency(per_worker_inflight)
             if configured_concurrency is None
-            else int(configured_concurrency)
+            else configured_concurrency
         )
         self._validate_config(
             cfg=cfg,
@@ -94,7 +93,7 @@ class AgenticTrainer(BaseTrainer):
         )
 
         try:
-            self.batch_size = int(batch_size)
+            self.batch_size = batch_size
             self.data_source = instantiate(data_source_cfg)
             self.sampling_params: Dict[str, BaseSamplingParams] = build_sampling_dict(sampling_cfg)
             self._group_size = total_samples_per_prompt(self.sampling_params)
@@ -139,7 +138,7 @@ class AgenticTrainer(BaseTrainer):
         per_worker_inflight: int,
         worker_max_concurrency: int,
     ) -> None:
-        if int(batch_size) <= 0:
+        if batch_size <= 0:
             raise ValueError(f"batch_size must be positive; got {batch_size}")
         validate_worker_inflight(
             per_worker_inflight,
@@ -148,7 +147,7 @@ class AgenticTrainer(BaseTrainer):
         )
         if sync_cfg is None:
             raise ValueError("AgenticTrainer requires colocated TensorWeightSync")
-        sync_target = str(sync_cfg.get("_target_", ""))
+        sync_target = sync_cfg["_target_"]
         if not sync_target.endswith("TensorWeightSync"):
             raise ValueError(f"AgenticTrainer requires colocated TensorWeightSync; got {sync_target!r}")
         validate_memory_saver_contract(rollout_cfg, strict=True)
@@ -156,20 +155,20 @@ class AgenticTrainer(BaseTrainer):
         episode = rollout_cfg.get("config", {}).get("episode_sampling")
         if episode is None:
             raise ValueError("rollout.config.episode_sampling is required")
-        group_size = int(sampling_cfg.get("samples_per_prompt", 1))
-        episode_group_size = int(episode.get("samples_per_prompt", 1))
+        group_size = sampling_cfg.get("samples_per_prompt", 1)
+        episode_group_size = episode.get("samples_per_prompt", 1)
         if group_size != episode_group_size:
             raise ValueError(
                 "sampling.samples_per_prompt must equal rollout.config.episode_sampling.samples_per_prompt"
             )
-        sampling_temperature = float(sampling_cfg.get("temperature", 1.0))
-        episode_temperature = float(episode.get("temperature", 1.0))
-        algorithm_temperature = float(algorithm_cfg.get("sampling_temperature", 1.0))
+        sampling_temperature = sampling_cfg.get("temperature", 1.0)
+        episode_temperature = episode.get("temperature", 1.0)
+        algorithm_temperature = algorithm_cfg.get("sampling_temperature", 1.0)
         if abs(sampling_temperature - episode_temperature) > 1e-9:
             raise ValueError("sampling.temperature must equal rollout episode temperature")
         if abs(sampling_temperature - algorithm_temperature) > 1e-9:
             raise ValueError("sampling.temperature must equal algorithm.sampling_temperature")
-        if (int(batch_size) * group_size) % int(cfg.num_devices) != 0:
+        if (batch_size * group_size) % cfg.num_devices != 0:
             raise ValueError("batch_size*samples_per_prompt must be divisible by num_devices")
 
     def _build_colocated_rollout(self, rollout_cfg: DictConfig, sync_cfg: DictConfig) -> None:
@@ -249,14 +248,14 @@ class AgenticTrainer(BaseTrainer):
             answers.append((metadata or {}).get("answer"))
 
         score_count = len(valid_indices)
-        reward_dp_size = max(1, int(self.reward.dp_size))
+        reward_dp_size = self.reward.dp_size
         score_padding = (-score_count) % reward_dp_size
         if score_padding:
             questions.extend([questions[0]] * score_padding)
             predictions.extend([predictions[0]] * score_padding)
             answers.extend([answers[0]] * score_padding)
 
-        ar_sampling = self.sampling_params.get("ar")
+        ar_sampling = self.sampling_params["ar"]
         score_input = Part.input(
             [f"score{rollout_id}:{i}" for i in valid_indices]
             + [f"score{rollout_id}:padding{i}" for i in range(score_padding)],
@@ -334,6 +333,7 @@ class AgenticTrainer(BaseTrainer):
                     torch.full((generated.batch_size,), advantage, dtype=torch.float32),
                 )
                 generated = _part_with_field(generated, "primitive_metadata", {})
+                generated = _part_with_field(generated, "harness_status", None)
                 generated = _part_with_field(generated, "media_preview", None)
                 generated = _part_with_field(generated, "primitives", {})
                 generated = _part_with_field(generated, "rewards", None)
@@ -359,7 +359,7 @@ class AgenticTrainer(BaseTrainer):
                 training_progress=float(training_progress),
                 rollout_id=rollout_id,
             )
-            train_rows = int(train_part.batch_size)
+            train_rows = train_part.batch_size
         else:
             result = TrainStepResult(0.0, 0.0, 0.0, False, [], {}, optimizer_updates=0)
             train_rows = 0
@@ -394,7 +394,7 @@ class AgenticTrainer(BaseTrainer):
         if count == 0:
             return Sample(parts=[])
 
-        ar_sampling = self.sampling_params.get("ar")
+        ar_sampling = self.sampling_params["ar"]
         root = Part.input(
             [f"log{rollout_id}:{i}" for i in range(count)],
             primitives={"text": Texts(texts=[""] * count)},
@@ -409,8 +409,8 @@ class AgenticTrainer(BaseTrainer):
         return sample.with_parts([*sample.parts[:-1], frontier])
 
     def _pad_to_dp_multiple(self, part: Part) -> Part:
-        dp_size = int(getattr(self.stack, "dp_size", self.num_devices))
-        pad = (-int(part.batch_size)) % dp_size
+        dp_size = self.stack.dp_size
+        pad = (-part.batch_size) % dp_size
         if pad == 0:
             return part
         lengths = part.segment.lengths if part.segment is not None else None

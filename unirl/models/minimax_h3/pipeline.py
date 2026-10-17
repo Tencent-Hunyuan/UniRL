@@ -81,13 +81,13 @@ class MiniMaxH3Pipeline(Pipeline):
 
     def build_schedule_policy(self) -> FlowMatchSchedulePolicy:
         """The VIDEO sigma policy the hosting engine pins onto the Part."""
-        return FlowMatchSchedulePolicy.static_only(shift=float(self.config.video_shift))
+        return FlowMatchSchedulePolicy.static_only(shift=self.config.video_shift)
 
     @property
     def audio_sampling_rate(self) -> int:
         """Read the generated-audio sampling rate from the loaded VAE config."""
-        if getattr(self.bundle, "audio_vae", None) is not None:
-            return int(self.bundle.audio_vae.config.sampling_rate)
+        if self.bundle.audio_vae is not None:
+            return self.bundle.audio_vae.config.sampling_rate
         return MINIMAX_H3_AUDIO_SAMPLE_RATE
 
     @classmethod
@@ -153,11 +153,11 @@ class MiniMaxH3Pipeline(Pipeline):
             # sample_ids live on the PART, not the Sample -- `Sample` has
             # root_group_ids()/split() but no sample_ids of its own.
             denoise_seed_keys=[str(sample_id) for sample_id in gen.sample_ids],
-            denoise_base_seed=int(params.seed) if params.seed is not None else 0,
+            denoise_base_seed=params.seed if params.seed is not None else 0,
         )
 
-        final_rows = segment.latents_at(int(params.num_inference_steps))
-        final_audio_rows = segment.aux_latents_at(int(params.num_inference_steps))
+        final_rows = segment.latents_at(params.num_inference_steps)
+        final_audio_rows = segment.aux_latents_at(params.num_inference_steps)
         videos = self.video_decode.decode(final_rows, geometry)
         audios = self.audio_decode.decode(final_audio_rows, geometry)
 

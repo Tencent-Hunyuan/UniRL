@@ -6,11 +6,8 @@ from unirl.distributed.tensor.batch import (
     concat_field,
     field,
     max_field,
-    mean_field,
-    min_field,
     packed_field,
     shared_field,
-    sum_field,
 )
 from unirl.distributed.tensor.ref import (
     TensorHandle,
@@ -43,9 +40,6 @@ __all__ = [
     "hydrate",
     "map_tree",
     "max_field",
-    "mean_field",
-    "min_field",
     "packed_field",
     "shared_field",
-    "sum_field",
 ]

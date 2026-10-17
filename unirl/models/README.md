@@ -102,6 +102,14 @@ it is the authoritative bundle / pipeline / stage / conditions contract.
   wrapper's state-dict hooks strip it). Any match between module params and
   checkpoint keys goes through `canonical_param_name`, exported beside the
   deferred-op pair in `types/post_materialize.py`.
+- **Init-computed non-persistent buffers keep their construction dtype through meta-init.**
+  `build_meta_init_transformer` instantiates under `torch.set_default_dtype(dtype)`
+  (matching `from_pretrained`), `finalize_meta_init` and `veomni_parallelize` cast
+  parameters without overwriting non-persistent buffers, and `restore_init_state`
+  restores each buffer's captured dtype (including `DTensor` shards). Buffers
+  created with an explicit `dtype=torch.float32` (such as RoPE `inv_freq` /
+  `original_inv_freq`) therefore stay in float32 under a BF16 model or VeOmni
+  master, avoiding position-dependent RoPE angle drift against rollout engines.
 
 
 ## Conversation composition

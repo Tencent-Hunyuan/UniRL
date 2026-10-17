@@ -112,9 +112,9 @@ class LTX2Pipeline(Pipeline):
     @classmethod
     def latent_shape(cls, *, model_config: Any, sampling_spec: Any) -> Tuple[int, ...]:
         """Per-sample 5D latent shape ``(C, T_lat, H_lat, W_lat)`` for the driver-side x_T recipe."""
-        height = int(sampling_spec.height)
-        width = int(sampling_spec.width)
-        num_frames = int(sampling_spec.num_frames)
+        height = sampling_spec.height
+        width = sampling_spec.width
+        num_frames = sampling_spec.num_frames
         if (num_frames - 1) % _LTX2_TEMPORAL_COMPRESSION != 0:
             raise ValueError(
                 f"LTX2 VAE temporal_compression={_LTX2_TEMPORAL_COMPRESSION} requires "
@@ -125,11 +125,6 @@ class LTX2Pipeline(Pipeline):
         latent_h = height // _LTX2_SPATIAL_COMPRESSION
         latent_w = width // _LTX2_SPATIAL_COMPRESSION
         return (_LTX2_LATENT_CHANNELS, latent_t, latent_h, latent_w)
-
-    def _patch_sizes(self) -> Tuple[int, int]:
-        """``(patch_size, patch_size_t)`` off the transformer config — LTX-2 patchifies in proj_in, not by reshape."""
-        cfg = self.bundle.transformer.config
-        return int(getattr(cfg, "patch_size", 1)), int(getattr(cfg, "patch_size_t", 1))
 
     @staticmethod
     def _pack_latents(latents: torch.Tensor, patch_size: int, patch_size_t: int) -> torch.Tensor:
@@ -157,7 +152,7 @@ class LTX2Pipeline(Pipeline):
         vae = self.bundle.vae
         mean = vae.latents_mean.view(1, -1, 1, 1, 1).to(latents.device, latents.dtype)
         std = vae.latents_std.view(1, -1, 1, 1, 1).to(latents.device, latents.dtype)
-        return latents * std / float(vae.config.scaling_factor) + mean
+        return latents * std / vae.config.scaling_factor + mean
 
     def build_conditions(
         self,
@@ -200,10 +195,10 @@ class LTX2Pipeline(Pipeline):
                 "image-conditioning path in LTX2DiffusionStep.predict_noise."
             )
 
-        conditions = self.build_conditions(texts, guidance_scale=float(params.guidance_scale))
+        conditions = self.build_conditions(texts, guidance_scale=params.guidance_scale)
 
         sigmas = get_sigma_schedule(
-            num_steps=int(params.num_inference_steps),
+            num_steps=params.num_inference_steps,
             shift=self.config.shift,
             device=self.bundle.device,
         )
@@ -219,7 +214,8 @@ class LTX2Pipeline(Pipeline):
                 "DISABLE_DRIVER_XT is not supported for LTX2 (video noise needs a "
                 "driver-resolved 5D latent shape)."
             )
-        patch_size, patch_size_t = self._patch_sizes()
+        cfg = self.bundle.transformer.config
+        patch_size, patch_size_t = cfg.patch_size, cfg.patch_size_t
         initial_latents = self._pack_latents(latents_5d.to(self.bundle.device), patch_size, patch_size_t)
 
         initial_audio_latents = video_recipe.resolve(
@@ -235,11 +231,11 @@ class LTX2Pipeline(Pipeline):
             initial_audio_latents=initial_audio_latents,
             sde_indices=sde_indices,
             denoise_seed_keys=[str(sample_id) for sample_id in sample.sample_ids],
-            denoise_base_seed=int(params.seed) if params.seed is not None else 0,
+            denoise_base_seed=params.seed if params.seed is not None else 0,
         )
 
         _, latent_t, latent_h, latent_w = self.latent_shape(model_config=self.config, sampling_spec=params)
-        final_latents = segment.latents_at(int(params.num_inference_steps))
+        final_latents = segment.latents_at(params.num_inference_steps)
         unpacked = self._unpack_latents(final_latents, latent_t, latent_h, latent_w, patch_size, patch_size_t)
         unpacked = self._denormalize_latents(unpacked)
         decoded = self.vae_decode.decode(unpacked)
@@ -249,8 +245,8 @@ class LTX2Pipeline(Pipeline):
         if self.audio_decode is not None and segment.aux_latents is not None:
             from .diffusion import _LTX2_FRAME_RATE, _audio_num_frames
 
-            audio_t = _audio_num_frames(int(params.num_frames), _LTX2_FRAME_RATE)
-            final_audio = segment.aux_latents_at(int(params.num_inference_steps))
+            audio_t = _audio_num_frames(params.num_frames, _LTX2_FRAME_RATE)
+            final_audio = segment.aux_latents_at(params.num_inference_steps)
             waveforms = self.audio_decode.decode(final_audio, audio_latent_length=audio_t)
             wf = waveforms.detach().float().cpu()
             audio_list = []
@@ -260,7 +256,7 @@ class LTX2Pipeline(Pipeline):
                     w = w.mean(dim=0) if w.shape[0] <= w.shape[1] else w.mean(dim=1)
                 audio_list.append(Audio(waveform=w.reshape(-1)))
             decoded_audio = Audios.from_list(audio_list)
-            audio_sample_rate = int(self.bundle.vocoder.config.output_sampling_rate)
+            audio_sample_rate = self.bundle.vocoder.config.output_sampling_rate
 
         primitives = {"video": decoded}
         primitive_metadata = {}
