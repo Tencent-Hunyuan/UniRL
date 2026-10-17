@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 from dataclasses import dataclass
 from dataclasses import fields as dc_fields
 from typing import (
@@ -55,9 +56,6 @@ class TensorSpan(Generic[T]):
 
     @property
     def nrows(self) -> int:
-        return self.stop - self.start
-
-    def __len__(self) -> int:
         return self.stop - self.start
 
     @property
@@ -119,15 +117,14 @@ class TensorRef(Batch):
     dtype: Optional[torch.dtype] = shared_field(default=None)
     device: Optional[str] = shared_field(default=None)
     grad: Optional["TensorRef"] = shared_field(default=None)
-    retain_grad_flag: bool = shared_field(default=False)
 
     @property
     def sizes(self) -> List[int]:
-        return [s.stop - s.start for s in self.spans]
+        return [s.nrows for s in self.spans]
 
     @property
     def batch_size(self) -> int:
-        return sum(s.stop - s.start for s in self.spans)
+        return sum(s.nrows for s in self.spans)
 
     @classmethod
     def concat(cls, items: "list[TensorRef]") -> "TensorRef":
@@ -138,18 +135,20 @@ class TensorRef(Batch):
 
     def select(self, indices) -> "TensorRef":
         """Re-index along the row axis by building ref VIEWS (no data motion)."""
-        idx = [int(i) for i in (indices.tolist() if hasattr(indices, "tolist") else indices)]
-        return self._gather(idx)
-
-    def _offsets(self) -> List[int]:
-        offsets = [0]
-        for s in self.spans:
-            offsets.append(offsets[-1] + (s.stop - s.start))
-        return offsets
+        idx = [int(i) for i in (indices.tolist() if isinstance(indices, torch.Tensor) else indices)]
+        ranges: List[Tuple[int, int]] = []
+        run_start = 0
+        while run_start < len(idx):
+            run_end = run_start + 1
+            while run_end < len(idx) and idx[run_end] == idx[run_end - 1] + 1:
+                run_end += 1
+            ranges.append((idx[run_start], idx[run_end - 1] + 1))
+            run_start = run_end
+        return self.select_ranges(ranges)
 
     def select_ranges(self, ranges: List[Tuple[int, int]]) -> "TensorRef":
         """Re-index by global ``[start, stop)`` row ranges — the single selection engine."""
-        span_offsets = self._offsets()  # cumulative row boundaries; span_offsets[-1] == total rows
+        span_offsets = [0, *itertools.accumulate(s.nrows for s in self.spans)]
         selected: List[TensorSpan] = []
         for range_start, range_stop in ranges:
             range_start, range_stop = int(range_start), int(range_stop)
@@ -182,18 +181,6 @@ class TensorRef(Batch):
             device=self.device,
         )
 
-    def _gather(self, idx: List[int]) -> "TensorRef":
-        """Arbitrary re-index (gather/permute): coalesce consecutive runs into ranges."""
-        ranges: List[Tuple[int, int]] = []
-        run_start = 0
-        while run_start < len(idx):
-            run_end = run_start + 1
-            while run_end < len(idx) and idx[run_end] == idx[run_end - 1] + 1:
-                run_end += 1
-            ranges.append((int(idx[run_start]), int(idx[run_end - 1]) + 1))
-            run_start = run_end
-        return self.select_ranges(ranges)
-
     def with_spans(self, spans: List[Any]) -> "TensorRef":
         """Clone with substituted (routed) spans, preserving shape/dtype/device."""
         return TensorRef(
@@ -215,20 +202,6 @@ class TensorRef(Batch):
             return self.select_ranges([(start, stop)])
         raise NotImplementedError(f"TensorRef indexing supports slices only, got {type(key).__name__}")
 
-    def transform(self, fn: Callable[[torch.Tensor], torch.Tensor]) -> "TensorRef":
-        from unirl.distributed.tensor.transport import TensorTransportRuntime
-
-        backend = TensorTransportRuntime.current()
-        if backend is None:
-            raise RuntimeError("No TensorTransport backend installed")
-        return backend.transform(self, fn)
-
-    def reshape(self, *shape: int) -> "TensorRef":
-        return self.transform(lambda t: t.reshape(*shape))
-
-    def permute(self, *dims: int) -> "TensorRef":
-        return self.transform(lambda t: t.permute(*dims))
-
     def materialize(self, backend: "Optional[TensorTransport]" = None) -> torch.Tensor:
         """Fetch this meta into a real tensor (driver- or worker-side)."""
         if backend is None:
@@ -240,10 +213,6 @@ class TensorRef(Batch):
         if backend is not None:
             return backend.get(self.spans)
         return cat_rows([s.local() for s in self.spans])
-
-    def retain_grad(self) -> "TensorRef":
-        self.retain_grad_flag = True
-        return self
 
     @classmethod
     def from_handles(cls, handles: list) -> "TensorRef":
@@ -277,7 +246,7 @@ def map_tree(obj: Any, leaf_fn: Callable[[Any], Any]) -> Any:
     if isinstance(obj, TensorRef):
         return obj
     if isinstance(obj, Batch):
-        return obj._rebuild({f.name: map_tree(getattr(obj, f.name), leaf_fn) for f in dc_fields(obj)})
+        return obj.rebuild({f.name: map_tree(getattr(obj, f.name), leaf_fn) for f in dc_fields(obj)})
     if isinstance(obj, tuple):
         return tuple(map_tree(item, leaf_fn) for item in obj)
     if isinstance(obj, list):
@@ -287,4 +256,4 @@ def map_tree(obj: Any, leaf_fn: Callable[[Any], Any]) -> Any:
     return obj
 
 
-__all__ = ["TensorHandle", "TensorSpan", "TensorRef", "cat_rows", "map_tree"]
+__all__ = ["TensorHandle", "TensorSpan", "TensorRef", "cat_rows", "hydrate", "map_tree"]

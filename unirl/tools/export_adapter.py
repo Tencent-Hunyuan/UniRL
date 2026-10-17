@@ -71,49 +71,20 @@ def write_adapter_config(
     bias: str = "none",
     task_type: str = "FEATURE_EXTRACTION",
 ) -> None:
+    from peft import LoraConfig
+
     os.makedirs(output, exist_ok=True)
-    try:
-        from peft import LoraConfig
-
-        config = LoraConfig(
-            r=int(r),
-            lora_alpha=int(lora_alpha),
-            target_modules=target_modules,
-            exclude_modules=exclude_modules,
-            lora_dropout=float(lora_dropout),
-            bias=str(bias),
-            task_type=str(task_type),
-        )
-        config.base_model_name_or_path = str(base)
-        config.save_pretrained(output)
-    except Exception:
-        import json
-
-        with open(os.path.join(output, "adapter_config.json"), "w") as f:
-            json.dump(
-                {
-                    "alpha_pattern": {},
-                    "base_model_name_or_path": str(base),
-                    "bias": str(bias),
-                    "fan_in_fan_out": False,
-                    "inference_mode": True,
-                    "init_lora_weights": True,
-                    "lora_alpha": int(lora_alpha),
-                    "lora_dropout": float(lora_dropout),
-                    "modules_to_save": None,
-                    "exclude_modules": exclude_modules,
-                    "peft_type": "LORA",
-                    "r": int(r),
-                    "rank_pattern": {},
-                    "revision": None,
-                    "target_modules": target_modules,
-                    "task_type": str(task_type),
-                    "use_rslora": False,
-                },
-                f,
-                indent=2,
-                sort_keys=True,
-            )
+    config = LoraConfig(
+        r=r,
+        lora_alpha=lora_alpha,
+        target_modules=target_modules,
+        exclude_modules=exclude_modules,
+        lora_dropout=lora_dropout,
+        bias=bias,
+        task_type=task_type,
+    )
+    config.base_model_name_or_path = base
+    config.save_pretrained(output)
 
 
 def _split_modules(values: Optional[Iterable[str]]) -> Optional[List[str]]:
@@ -187,7 +158,8 @@ def main() -> None:
 
     checkpoint = load_training_checkpoint(args.checkpoint)
     state_dict = checkpoint["policy_state_dict"]
-    recorded = checkpoint.get("lora_config") or {}
+    lora_config = checkpoint.get("lora_config")
+    recorded = {} if lora_config is None else lora_config
 
     r = args.lora_r if args.lora_r is not None else recorded.get("rank")
     alpha = args.lora_alpha if args.lora_alpha is not None else recorded.get("alpha")
@@ -222,7 +194,7 @@ def main() -> None:
     adapter_state = export_adapter_state_dict(
         state_dict,
         adapter=args.adapter,
-        peft_prefix=str(args.peft_prefix or ""),
+        peft_prefix=args.peft_prefix,
     )
 
     os.makedirs(args.output, exist_ok=True)

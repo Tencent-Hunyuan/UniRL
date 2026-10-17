@@ -7,27 +7,27 @@ import traceback
 from multiprocessing.connection import Connection
 from typing import Any, Dict, List
 
-_SUPPORTED_VLLM_VERSION = "0.28.0"
+SUPPORTED_VLLM_VERSION = "0.28.0"
 
 
-class _ProtocolError(RuntimeError):
+class ProtocolError(RuntimeError):
     pass
 
 
-def _recv_request(connection: Connection, *, last_request_id: int) -> Dict[str, Any]:
+def recv_request(connection: Connection, *, last_request_id: int) -> Dict[str, Any]:
     message = connection.recv()
     if not isinstance(message, dict):
-        raise _ProtocolError(f"request must be a mapping, got {type(message).__name__}")
+        raise ProtocolError(f"request must be a mapping, got {type(message).__name__}")
     request_id = message.get("request_id")
     if type(request_id) is not int or request_id != last_request_id + 1:
-        raise _ProtocolError(f"request_id={request_id!r}, expected the next monotonic id {last_request_id + 1}")
+        raise ProtocolError(f"request_id={request_id!r}, expected the next monotonic id {last_request_id + 1}")
     command = message.get("command")
     if not isinstance(command, str) or not command:
-        raise _ProtocolError(f"request has invalid command={command!r}")
+        raise ProtocolError(f"request has invalid command={command!r}")
     return message
 
 
-def _send_response(
+def send_response(
     connection: Connection,
     request: Dict[str, Any],
     *,
@@ -38,7 +38,7 @@ def _send_response(
     response = {
         "request_id": request["request_id"],
         "command": request["command"],
-        "ok": bool(ok),
+        "ok": ok,
         "result": result,
     }
     if error is not None:
@@ -49,56 +49,6 @@ def _send_response(
             }
         )
     connection.send(response)
-
-
-def _shutdown_llm(llm: Any) -> None:
-    """Best-effort shutdown of the vLLM engine and all executor workers."""
-    if llm is None:
-        return
-    shutdown = getattr(getattr(llm, "llm_engine", None), "engine_core", None)
-    shutdown = getattr(shutdown, "shutdown", None)
-    if callable(shutdown):
-        shutdown(timeout=30.0)
-
-
-def _sampling_params(payload: Dict[str, Any], *, return_logprob: bool):
-    from vllm import SamplingParams
-
-    values = dict(payload)
-    if "max_new_tokens" in values:
-        values["max_tokens"] = values.pop("max_new_tokens")
-    values["logprobs"] = 0 if return_logprob else None
-    return SamplingParams(**values)
-
-
-def _plain_outputs(outputs) -> List[Dict[str, Any]]:
-    flattened: List[Dict[str, Any]] = []
-    for request in outputs:
-        for completion in sorted(request.outputs, key=lambda item: int(item.index)):
-            token_ids = [int(token) for token in completion.token_ids]
-            if completion.logprobs is None:
-                logprobs: List[float] = []
-            else:
-                if len(completion.logprobs) != len(token_ids):
-                    raise RuntimeError(
-                        "vLLM returned mismatched token/logprob lengths: "
-                        f"{len(token_ids)} vs {len(completion.logprobs)}"
-                    )
-                logprobs = []
-                for token_id, choices in zip(token_ids, completion.logprobs, strict=True):
-                    selected = choices.get(token_id)
-                    if selected is None:
-                        raise RuntimeError(f"vLLM omitted sampled token {token_id} from processed logprobs")
-                    logprobs.append(float(selected.logprob))
-            flattened.append(
-                {
-                    "text": str(completion.text or ""),
-                    "token_ids": token_ids,
-                    "logprobs": logprobs,
-                    "finish_reason": str(completion.finish_reason or ""),
-                }
-            )
-    return flattened
 
 
 def engine_process_main(
@@ -112,9 +62,9 @@ def engine_process_main(
     startup_request: Dict[str, Any] | None = None
     llm = None
     try:
-        startup_request = _recv_request(connection, last_request_id=0)
+        startup_request = recv_request(connection, last_request_id=0)
         if startup_request["command"] != "startup":
-            raise _ProtocolError(f"first vLLM command must be 'startup', got {startup_request['command']!r}")
+            raise ProtocolError(f"first vLLM command must be 'startup', got {startup_request['command']!r}")
 
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(visible_devices)
         os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
@@ -123,44 +73,44 @@ def engine_process_main(
         # client: pickle+base64 inside this trusted local runtime boundary.
         os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
-        from vllm import LLM
+        from vllm import LLM, SamplingParams
         from vllm import __version__ as vllm_version
         from vllm.config import WeightTransferConfig
 
-        if str(vllm_version) != _SUPPORTED_VLLM_VERSION:
-            raise RuntimeError(f"vLLM rollout requires vllm=={_SUPPORTED_VLLM_VERSION}; got {vllm_version}")
-        engine_kwargs = dict(config.get("engine_kwargs") or {})
-        engine_kwargs["dtype"] = str(config["dtype"])
-        engine_kwargs["trust_remote_code"] = bool(config.get("trust_remote_code", False))
-        if config.get("model_revision"):
-            engine_kwargs["revision"] = str(config["model_revision"])
-        if config.get("tokenizer_revision"):
-            engine_kwargs["tokenizer_revision"] = str(config["tokenizer_revision"])
+        if vllm_version != SUPPORTED_VLLM_VERSION:
+            raise RuntimeError(f"vLLM rollout requires vllm=={SUPPORTED_VLLM_VERSION}; got {vllm_version}")
+        engine_kwargs = dict(config["engine_kwargs"])
+        engine_kwargs["dtype"] = config["dtype"]
+        engine_kwargs["trust_remote_code"] = config["trust_remote_code"]
+        if config["model_revision"]:
+            engine_kwargs["revision"] = config["model_revision"]
+        if config["tokenizer_revision"]:
+            engine_kwargs["tokenizer_revision"] = config["tokenizer_revision"]
         engine_kwargs["distributed_executor_backend"] = "mp"
         engine_kwargs["enable_sleep_mode"] = True
-        engine_kwargs["enforce_eager"] = bool(config["enforce_eager"])
-        engine_kwargs["enable_prefix_caching"] = bool(config["enable_prefix_caching"])
-        engine_kwargs["enable_chunked_prefill"] = bool(config["enable_chunked_prefill"])
-        engine_kwargs["moe_backend"] = str(config["moe_backend"])
-        engine_kwargs["logprobs_mode"] = str(config["logprobs_mode"])
+        engine_kwargs["enforce_eager"] = config["enforce_eager"]
+        engine_kwargs["enable_prefix_caching"] = config["enable_prefix_caching"]
+        engine_kwargs["enable_chunked_prefill"] = config["enable_chunked_prefill"]
+        engine_kwargs["moe_backend"] = config["moe_backend"]
+        engine_kwargs["logprobs_mode"] = config["logprobs_mode"]
         engine_kwargs["worker_extension_cls"] = "unirl.rollout.engine.vllm.worker_extension.UniRLWeightSyncExtension"
         engine_kwargs["weight_transfer_config"] = WeightTransferConfig(backend="ipc")
-        if config.get("quantization") is not None:
-            engine_kwargs["quantization"] = str(config["quantization"])
+        if config["quantization"] is not None:
+            engine_kwargs["quantization"] = config["quantization"]
         llm = LLM(
-            model=str(config["pretrained_model_ckpt_path"]),
-            tensor_parallel_size=int(config["tp_size"]),
+            model=config["pretrained_model_ckpt_path"],
+            tensor_parallel_size=config["tp_size"],
             **engine_kwargs,
         )
         worker_capabilities = llm.collective_rpc("unirl_weight_sync_capabilities")
-        model_type = str(getattr(llm.model_config.hf_config, "model_type", ""))
-        _send_response(
+        model_type = llm.model_config.hf_config.model_type
+        send_response(
             connection,
             startup_request,
             ok=True,
             result={
                 "event": "ready",
-                "vllm_version": str(vllm_version),
+                "vllm_version": vllm_version,
                 "process_group_id": os.getpgrp(),
                 "model_type": model_type,
                 "worker_capabilities": worker_capabilities,
@@ -169,44 +119,74 @@ def engine_process_main(
     except BaseException as error:
         if startup_request is not None:
             try:
-                _send_response(connection, startup_request, ok=False, result=None, error=error)
+                send_response(connection, startup_request, ok=False, result=None, error=error)
             except (EOFError, BrokenPipeError, OSError):
                 pass
         try:
-            _shutdown_llm(llm)
+            if llm is not None:
+                llm.llm_engine.engine_core.shutdown(timeout=30.0)
         except BaseException:
             pass
         connection.close()
         return
 
-    last_request_id = int(startup_request["request_id"])
+    last_request_id = startup_request["request_id"]
     native_pending_header: Dict[str, Any] | None = None
     try:
         while True:
             try:
-                message = _recv_request(connection, last_request_id=last_request_id)
+                message = recv_request(connection, last_request_id=last_request_id)
             except EOFError:
                 break
-            except _ProtocolError:
+            except ProtocolError:
                 break
-            last_request_id = int(message["request_id"])
+            last_request_id = message["request_id"]
             command = message.get("command")
             worker_receipts: Any = []
             try:
                 if command == "generate":
                     payloads = list(message["payloads"])
-                    sampling_blocks = [dict(payload["sampling_params"]) for payload in payloads]
-                    prompts = [
-                        {"prompt_token_ids": [int(token) for token in payload["input_ids"]]} for payload in payloads
-                    ]
-                    params = [
-                        _sampling_params(block, return_logprob=bool(payload.get("return_logprob", True)))
-                        for payload, block in zip(payloads, sampling_blocks, strict=True)
-                    ]
+                    prompts = [{"prompt_token_ids": list(payload["input_ids"])} for payload in payloads]
+                    params = []
+                    for payload in payloads:
+                        values = dict(payload["sampling_params"])
+                        if "max_new_tokens" in values:
+                            values["max_tokens"] = values.pop("max_new_tokens")
+                        values["logprobs"] = 0 if payload["return_logprob"] else None
+                        params.append(SamplingParams(**values))
                     outputs = llm.generate(prompts, params, use_tqdm=False)
-                    result = _plain_outputs(outputs)
+                    result = []
+                    for req_out in outputs:
+                        for completion in sorted(req_out.outputs, key=lambda item: item.index):
+                            token_ids = [int(token) for token in completion.token_ids]
+                            if completion.logprobs is None:
+                                logprobs: List[float] = []
+                            else:
+                                if len(completion.logprobs) != len(token_ids):
+                                    raise RuntimeError(
+                                        "vLLM returned mismatched token/logprob lengths: "
+                                        f"{len(token_ids)} vs {len(completion.logprobs)}"
+                                    )
+                                logprobs = []
+                                for token_id, choices in zip(token_ids, completion.logprobs, strict=True):
+                                    selected = choices.get(token_id)
+                                    if selected is None:
+                                        raise RuntimeError(
+                                            f"vLLM omitted sampled token {token_id} from processed logprobs"
+                                        )
+                                    logprobs.append(float(selected.logprob))
+                            result.append(
+                                {
+                                    "text": completion.text,
+                                    "token_ids": token_ids,
+                                    "logprobs": logprobs,
+                                    "finish_reason": ""
+                                    if completion.finish_reason is None
+                                    else completion.finish_reason,
+                                }
+                            )
                 elif command == "sleep":
-                    llm.sleep(level=int(message.get("level", 1)))
+                    llm.sleep(level=message["level"])
                     result = None
                 elif command == "wake_up":
                     llm.wake_up(tags=message.get("tags"))
@@ -231,7 +211,7 @@ def engine_process_main(
 
                     validate_publication_header(
                         header,
-                        tp_world_size=int(header.get("tp_world_size", 0)),
+                        tp_world_size=header.get("tp_world_size", 0),
                     )
                     llm.start_weight_update()
                     native_pending_header = dict(header)
@@ -262,7 +242,7 @@ def engine_process_main(
                     validate_worker_receipts(
                         header,
                         worker_receipts,
-                        fanout=int(header["tp_world_size"]),
+                        fanout=header["tp_world_size"],
                     )
                     weight_version = str(message.get("weight_version") or header["model_version"])
                     llm.update_weight_version(weight_version)
@@ -273,7 +253,7 @@ def engine_process_main(
                             raise RuntimeError("vLLM native IPC prefix-cache reset failed")
                     result = {
                         "status": "committed",
-                        "model_version": int(header["model_version"]),
+                        "model_version": header["model_version"],
                         "worker_receipts": worker_receipts,
                         "prefix_cache_reset": prefix_cache_reset,
                     }
@@ -301,7 +281,7 @@ def engine_process_main(
                     }
                     else None
                 )
-                _send_response(connection, message, ok=False, result=result, error=error)
+                send_response(connection, message, ok=False, result=result, error=error)
                 if command in {
                     "init_native_weight_transfer",
                     "start_native_weight_update",
@@ -311,12 +291,13 @@ def engine_process_main(
                 }:
                     break
             else:
-                _send_response(connection, message, ok=True, result=result)
+                send_response(connection, message, ok=True, result=result)
                 if command == "shutdown":
                     break
     finally:
         try:
-            _shutdown_llm(llm)
+            if llm is not None:
+                llm.llm_engine.engine_core.shutdown(timeout=30.0)
             del llm
         finally:
             connection.close()

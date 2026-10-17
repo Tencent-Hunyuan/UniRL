@@ -66,6 +66,10 @@ def _normalize_media_refs(raw_media: Any, *, base_dir: Optional[str] = None) -> 
         if not modality or not role or not uri:
             raise ValueError(f"Prompt example media[{idx}] fields must be non-empty strings.")
         media_refs.append(MediaRef(modality=modality, role=role, uri=uri))
+    for modality in ("image", "video"):
+        count = sum(1 for r in media_refs if r.modality == modality and r.role == "condition")
+        if count > 1:
+            raise ValueError(f"Expected at most one condition {modality} per prompt, got {count}.")
     return media_refs
 
 
@@ -88,6 +92,10 @@ def normalize_prompt_example(
         metadata = {key: value for key, value in item.items() if key not in _PROMPT_EXAMPLE_EXCLUDED_KEYS}
     elif not isinstance(metadata, dict):
         raise TypeError(f"Prompt example metadata must be a dict when provided, got {type(metadata).__name__}.")
+    if "_media_refs" in metadata:
+        raise ValueError(
+            "metadata['_media_refs'] is no longer a model-input channel; use the dataset media/media_refs field."
+        )
 
     raw_media = item.get("media_refs", item.get("media"))
     media_refs = _normalize_media_refs(raw_media, base_dir=base_dir)
@@ -248,8 +256,4 @@ class TextPromptDataset(PromptExampleDataset):
         return self.samples[idx]
 
     def get_prompt_example(self, idx: int) -> Dict[str, Any]:
-        return normalize_prompt_example(
-            self.samples[idx],
-            default_prompt_id=f"{self._source_prefix}:{idx}",
-            base_dir=self._base_dir,
-        )
+        return self.samples[idx]

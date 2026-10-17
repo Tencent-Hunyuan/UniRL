@@ -56,7 +56,7 @@ class LTX2TextEmbedStage:
 
     def _encode_prompts(self, prompts: list[str]) -> tuple[torch.Tensor, torch.Tensor]:
         """Tokenize and return Gemma3's stacked all-layer hidden states."""
-        if getattr(self.tokenizer, "pad_token", None) is None:
+        if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.padding_side = "left"
 
@@ -123,12 +123,12 @@ class LTX2TextEmbedStage:
         connector_mask = attention_mask
         if "padding_side" in params:
             connector_hidden_states = hidden_states.to(self.dtype)
-            conn_kwargs["padding_side"] = getattr(self.tokenizer, "padding_side", "left")
+            conn_kwargs["padding_side"] = self.tokenizer.padding_side
         else:
             connector_hidden_states = self._pack_text_embeds(
                 hidden_states,
                 sequence_lengths=attention_mask.sum(dim=-1),
-                padding_side=getattr(self.tokenizer, "padding_side", "left"),
+                padding_side=self.tokenizer.padding_side,
             ).to(self.dtype)
             if "additive_mask" in params:
                 connector_mask = (1 - attention_mask.to(self.dtype)) * -1_000_000.0

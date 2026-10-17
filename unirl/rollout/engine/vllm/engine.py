@@ -36,20 +36,8 @@ class VLLMConnectionState(str, Enum):
     BROKEN = "BROKEN"
 
 
-class _ProtocolError(RuntimeError):
+class ProtocolError(RuntimeError):
     pass
-
-
-def _resolve_visible_devices(
-    tp_size: int,
-    tp_visible_devices: Optional[List[str]],
-) -> List[str]:
-    if tp_visible_devices is not None:
-        return list(tp_visible_devices)
-    inherited = [token.strip() for token in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if token.strip()]
-    if inherited:
-        return inherited[:tp_size]
-    return [str(index) for index in range(tp_size)]
 
 
 class VLLMRolloutEngine(BaseRolloutEngine):
@@ -74,47 +62,50 @@ class VLLMRolloutEngine(BaseRolloutEngine):
         ep_rank: int = 0,
         ep_size: int = 1,
     ) -> None:
-        del strategy, model_config
+        del device, strategy, model_config
         require(
             isinstance(config, VLLMEngineConfig),
             f"VLLMRolloutEngine requires VLLMEngineConfig; got {type(config).__name__}",
         )
         require(
-            int(tp_size) == int(config.tp_size),
+            tp_size == config.tp_size,
             f"vLLM injected tp_size={tp_size} does not match config.tp_size={config.tp_size}",
         )
         require(pp_size == 1 and pp_rank == 0, "vLLM rollout currently supports PP=1")
         require(ep_size == 1 and ep_rank == 0, "vLLM rollout currently supports EP=1")
 
         self.cfg = config
-        self.device = device
-        self._tp_rank = int(tp_rank)
-        self._tp_size = int(tp_size)
-        self._is_tp_zero = self._tp_rank == 0
+        self.tp_size = tp_size
+        self.is_tp_zero = tp_rank == 0
         self._is_offloaded = False
-        self._partially_awake = False
-        self._weight_sync_sleep_level = 1
-        self._preserve_next_weight_sleep = False
-        self._version = 0
-        self._lock = threading.Lock()
-        self._process = None
-        self._process_group_id = None
-        self._connection = None
-        self._connection_state = VLLMConnectionState.IDLE
-        self._next_request_id = 1
-        self._pending_native_publication = None
-        self._ipc_worker_device_uuids: List[str] = []
+        self.partially_awake = False
+        self.weight_sync_sleep_level = 1
+        self.preserve_next_weight_sleep = False
+        self.lock = threading.Lock()
+        self.process = None
+        self.process_group_id = None
+        self.connection = None
+        self.connection_state = VLLMConnectionState.IDLE
+        self.next_request_id = 1
+        self.pending_native_publication = None
+        self.ipc_worker_device_uuids: List[str] = []
         self.adapter = None
 
-        if not self._is_tp_zero:
+        if not self.is_tp_zero:
             return
 
         # Preserve Ray's physical CUDA token for each TP1 worker. Resetting a
         # spawned child to literal "0" would bypass an outer 4,5,6,7 pin.
-        visible = _resolve_visible_devices(self._tp_size, tp_visible_devices)
+        if tp_visible_devices is not None:
+            visible = list(tp_visible_devices)
+        else:
+            inherited = [
+                token.strip() for token in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if token.strip()
+            ]
+            visible = inherited[: self.tp_size] if inherited else [str(index) for index in range(self.tp_size)]
         require(
-            len(visible) == self._tp_size,
-            f"vLLM expected {self._tp_size} visible devices, got {visible}",
+            len(visible) == self.tp_size,
+            f"vLLM expected {self.tp_size} visible devices, got {visible}",
         )
 
         from transformers import AutoTokenizer
@@ -122,14 +113,14 @@ class VLLMRolloutEngine(BaseRolloutEngine):
         tokenizer = AutoTokenizer.from_pretrained(
             config.pretrained_model_ckpt_path,
             revision=config.tokenizer_revision or config.model_revision,
-            trust_remote_code=bool(config.trust_remote_code),
+            trust_remote_code=config.trust_remote_code,
         )
         self.adapter = TextLMAdapter(config, tokenizer=tokenizer)
 
         context = multiprocessing.get_context("spawn")
         parent, child = context.Pipe(duplex=True)
-        self._connection = parent
-        self._process = context.Process(
+        self.connection = parent
+        self.process = context.Process(
             target=engine_process_main,
             kwargs={
                 "connection": child,
@@ -137,8 +128,8 @@ class VLLMRolloutEngine(BaseRolloutEngine):
                     "pretrained_model_ckpt_path": config.pretrained_model_ckpt_path,
                     "model_revision": config.model_revision,
                     "tokenizer_revision": config.tokenizer_revision or config.model_revision,
-                    "tp_size": self._tp_size,
-                    "trust_remote_code": bool(config.trust_remote_code),
+                    "tp_size": self.tp_size,
+                    "trust_remote_code": config.trust_remote_code,
                     "dtype": config.dtype,
                     "moe_backend": config.moe_backend,
                     "quantization": config.quantization,
@@ -146,70 +137,96 @@ class VLLMRolloutEngine(BaseRolloutEngine):
                     "enable_prefix_caching": config.enable_prefix_caching,
                     "enable_chunked_prefill": config.enable_chunked_prefill,
                     "logprobs_mode": config.logprobs_mode,
-                    "engine_kwargs": dict(config.engine_kwargs or {}),
+                    "engine_kwargs": dict(config.engine_kwargs),
                 },
                 "visible_devices": visible,
             },
-            name=f"unirl-vllm-tp{self._tp_size}",
+            name=f"unirl-vllm-tp{self.tp_size}",
             daemon=False,
         )
         try:
-            self._process.start()
-            self._process_group_id = int(self._process.pid)
+            self.process.start()
+            self.process_group_id = self.process.pid
             child.close()
-            ready = self._request("startup")
+            ready = self.request("startup")
             if not isinstance(ready, dict) or ready.get("event") != "ready":
-                raise _ProtocolError(f"vLLM returned invalid startup result: {ready!r}")
-            self._validate_runtime_manifest(ready)
-            self._ipc_worker_device_uuids = [
-                str(item["cuda_device_uuid"])
+                raise ProtocolError(f"vLLM returned invalid startup result: {ready!r}")
+            if ready.get("model_type") != "qwen3_moe":
+                raise RuntimeError(
+                    f"vLLM native IPC sync currently supports qwen3_moe; got {ready.get('model_type')!r}"
+                )
+            if ready.get("process_group_id") != self.process.pid:
+                raise RuntimeError(f"vLLM did not create its required process group: {ready!r}")
+            capabilities = ready.get("worker_capabilities")
+            if not isinstance(capabilities, list) or len(capabilities) != self.tp_size:
+                raise RuntimeError(f"vLLM returned invalid TP capabilities: {capabilities!r}")
+            if any(not isinstance(item, dict) for item in capabilities):
+                raise RuntimeError(f"vLLM returned non-dict TP capability entry: {capabilities!r}")
+            raw_ranks = [item.get("tp_rank") for item in capabilities]
+            if any(type(r) is not int for r in raw_ranks):
+                raise RuntimeError(f"vLLM TP capability ranks must be ints: {raw_ranks!r}")
+            ranks = sorted(raw_ranks)
+            if ranks != list(range(self.tp_size)):
+                raise RuntimeError(f"vLLM TP capability ranks {ranks} != {list(range(self.tp_size))}")
+            world_sizes = [item.get("tp_world_size") for item in capabilities]
+            if any(type(ws) is not int or ws != self.tp_size for ws in world_sizes):
+                raise RuntimeError(f"vLLM TP capability world sizes {world_sizes} != {self.tp_size}")
+            device_uuids = [item.get("cuda_device_uuid") for item in capabilities]
+            if (
+                any(not isinstance(value, str) or not value for value in device_uuids)
+                or len(set(device_uuids)) != self.tp_size
+            ):
+                raise RuntimeError(f"vLLM worker CUDA UUIDs are invalid: {device_uuids!r}")
+            logger.info("vLLM runtime manifest validated: vllm=%s", ready["vllm_version"])
+            self.ipc_worker_device_uuids = [
+                item["cuda_device_uuid"]
                 for item in sorted(
-                    ready["worker_capabilities"],
-                    key=lambda capability: int(capability["tp_rank"]),
+                    capabilities,
+                    key=lambda capability: capability["tp_rank"],
                 )
             ]
-            self._process_group_id = int(ready["process_group_id"])
+            self.process_group_id = ready["process_group_id"]
         except BaseException:
             child.close()
-            self._break_connection()
+            with self.lock:
+                self.mark_broken_locked()
             raise
         logger.info(
             "vLLM ready: rank=%s tp=%d devices=%s model=%s",
             rank,
-            self._tp_size,
+            self.tp_size,
             visible,
             config.pretrained_model_ckpt_path,
         )
 
     @property
     def weight_payload_fanout(self) -> int:
-        return self._tp_size
-
-    @property
-    def ipc_worker_device_uuids(self) -> List[str]:
-        return list(self._ipc_worker_device_uuids)
-
-    @property
-    def connection_state(self) -> VLLMConnectionState:
-        with self._lock:
-            return self._connection_state
+        return self.tp_size
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
     def generate(self, sample: Sample) -> Sample:
-        if not self._is_tp_zero:
+        if not self.is_tp_zero:
             return None
         require(not self._is_offloaded, "VLLMRolloutEngine.generate called while sleeping")
         sampling = resolve_sampling(self.cfg, sample)
         prepared = self.adapter.build_inputs(sample, sampling=sampling)
-        self._truncate_prepared_prompts(prepared)
+        require(
+            len(prepared.wire) == len(prepared.prompt_token_ids),
+            "vLLM adapter returned mismatched payload and prompt-token counts",
+        )
+        max_prompt_length = self.cfg.max_prompt_length
+        for index, (payload, prompt_token_ids) in enumerate(zip(prepared.wire, prepared.prompt_token_ids, strict=True)):
+            truncated = list(prompt_token_ids[-max_prompt_length:])
+            payload["input_ids"] = truncated
+            prepared.prompt_token_ids[index] = truncated
         for payload in prepared.wire:
             block = payload["sampling_params"]
             sampling_seed = block.pop("sampling_seed", None)
             if sampling_seed is not None:
-                block["seed"] = int(sampling_seed)
+                block["seed"] = sampling_seed
             if self.cfg.ignore_eos:
                 block["ignore_eos"] = True
-        response = self._request(
+        response = self.request(
             "generate",
             payloads=prepared.wire,
             record_id="batch",
@@ -221,79 +238,75 @@ class VLLMRolloutEngine(BaseRolloutEngine):
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def sleep(self, tags: Optional[List[str]] = None) -> None:
         del tags
-        if not self._is_tp_zero or (self._is_offloaded and not self._partially_awake):
+        if not self.is_tp_zero or (self._is_offloaded and not self.partially_awake):
             return
-        level = 1 if self._preserve_next_weight_sleep else self._weight_sync_sleep_level
-        self._request("sleep", level=level)
-        self._preserve_next_weight_sleep = False
+        level = 1 if self.preserve_next_weight_sleep else self.weight_sync_sleep_level
+        self.request("sleep", level=level)
+        self.preserve_next_weight_sleep = False
         self._is_offloaded = True
-        self._partially_awake = False
+        self.partially_awake = False
 
     def set_weight_sync_sleep_level(self, level: int, *, preserve_next_sleep: bool = False) -> None:
         """Select whether future colocated sleeps offload or discard weights."""
-        if int(level) not in (1, 2):
+        if level not in (1, 2):
             raise ValueError(f"vLLM sleep level must be 1 or 2, got {level}")
-        self._weight_sync_sleep_level = int(level)
-        self._preserve_next_weight_sleep = bool(preserve_next_sleep)
+        self.weight_sync_sleep_level = level
+        self.preserve_next_weight_sleep = preserve_next_sleep
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def preserve_weights_for_next_sleep(self) -> None:
         """Force the next sleep to retain weights for a wake without sync."""
-        self._preserve_next_weight_sleep = True
+        self.preserve_next_weight_sleep = True
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def wake_up(self, tags: Optional[List[str]] = None) -> None:
-        if not self._is_tp_zero:
+        if not self.is_tp_zero:
             return
         partial = bool(tags)
         if partial:
-            if not self._is_offloaded or self._partially_awake:
+            if not self._is_offloaded or self.partially_awake:
                 return
-        elif not self._is_offloaded and not self._partially_awake:
+        elif not self._is_offloaded and not self.partially_awake:
             return
-        request_tags = ["kv_cache"] if not partial and self._partially_awake else tags
-        self._request("wake_up", tags=request_tags)
-        self._partially_awake = partial
+        request_tags = ["kv_cache"] if not partial and self.partially_awake else tags
+        self.request("wake_up", tags=request_tags)
+        self.partially_awake = partial
         self._is_offloaded = partial
-
-    def onload_weights(self, *, track_prefix: str = "") -> None:
-        del track_prefix
-        self.wake_up()
 
     @property
     def is_offloaded(self) -> bool:
         return self._is_offloaded
 
     def health_check(self) -> bool:
-        if not self._is_tp_zero:
+        if not self.is_tp_zero:
             return True
-        return bool(self._request("health"))
+        return bool(self.request("health"))
 
     def init_native_weight_transfer(self, *, init_info: Dict[str, Any]) -> None:
         """Initialize vLLM's built-in IPC Weight Transfer Engine."""
-        if not self._is_tp_zero:
+        if not self.is_tp_zero:
             return
-        self._request("init_native_weight_transfer", init_info=dict(init_info))
+        self.request("init_native_weight_transfer", init_info=dict(init_info))
 
     def start_native_weight_update(self, *, header: Dict[str, Any]) -> None:
         """Open one fail-stop publication around vLLM's native WTE."""
-        if not self._is_tp_zero:
+        if not self.is_tp_zero:
             return
-        if self._pending_native_publication is not None:
-            raise RuntimeError(f"vLLM native publication already pending: {self._pending_native_publication!r}")
-        self._request("start_native_weight_update", header=dict(header))
-        self._pending_native_publication = (
+        if self.pending_native_publication is not None:
+            raise RuntimeError(f"vLLM native publication already pending: {self.pending_native_publication!r}")
+        self.request("start_native_weight_update", header=dict(header))
+        self.pending_native_publication = (
             str(header["publication_id"]),
             int(header["model_version"]),
         )
 
     def update_native_weights(self, *, update_info: Dict[str, Any]) -> None:
         """Forward one native packed IPC chunk to all vLLM TP workers."""
-        if not self._is_tp_zero:
+        if not self.is_tp_zero:
             return
-        if self._pending_native_publication is None:
+        if self.pending_native_publication is None:
             raise RuntimeError("vLLM native weight update requires start first")
-        self._request("update_native_weights", update_info=dict(update_info))
+        self.request("update_native_weights", update_info=dict(update_info))
 
     def finish_native_weight_update(
         self,
@@ -303,21 +316,21 @@ class VLLMRolloutEngine(BaseRolloutEngine):
         weight_version: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Finalize native WTE and publish its version after TP attestation."""
-        if not self._is_tp_zero:
+        if not self.is_tp_zero:
             return {}
         identity = (str(header["publication_id"]), int(header["model_version"]))
-        if self._pending_native_publication != identity:
+        if self.pending_native_publication != identity:
             raise RuntimeError(
-                f"vLLM native finish {identity!r} does not match pending {self._pending_native_publication!r}"
+                f"vLLM native finish {identity!r} does not match pending {self.pending_native_publication!r}"
             )
         from unirl.distributed.weight_sync.transfer.vllm_native_protocol import (
             validate_publication_result,
         )
 
-        result = self._request(
+        result = self.request(
             "finish_native_weight_update",
             header=dict(header),
-            flush_cache=bool(flush_cache),
+            flush_cache=flush_cache,
             weight_version=weight_version,
         )
         try:
@@ -326,81 +339,95 @@ class VLLMRolloutEngine(BaseRolloutEngine):
             validate_publication_result(
                 header,
                 result,
-                fanout=self._tp_size,
-                flush_cache=bool(flush_cache),
+                fanout=self.tp_size,
+                flush_cache=flush_cache,
             )
         except BaseException:
-            self._break_connection()
+            with self.lock:
+                self.mark_broken_locked()
             raise
-        self._pending_native_publication = None
+        self.pending_native_publication = None
         self._version = int(header["model_version"])
         return result
 
     def release_native_ipc(self) -> None:
         """Collect worker IPC imports after trainer-side export release."""
-        if not self._is_tp_zero:
+        if not self.is_tp_zero:
             return
-        self._request("release_native_ipc")
+        self.request("release_native_ipc")
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def poison(self, reason: str = "") -> None:
         """Poison and terminate a runtime after a partial weight publication."""
-        if not self._is_tp_zero:
+        if not self.is_tp_zero:
             return
         logger.error("Poisoning vLLM runtime: %s", reason or "unspecified failure")
-        self._break_connection()
+        with self.lock:
+            self.mark_broken_locked()
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def shutdown(self) -> None:
-        if not self._is_tp_zero or self._process is None:
+        if not self.is_tp_zero or self.process is None:
             return
-        process = self._process
+        process = self.process
         try:
             if process.is_alive():
-                if self.connection_state is VLLMConnectionState.IDLE:
-                    self._request("shutdown")
+                with self.lock:
+                    idle = self.connection_state is VLLMConnectionState.IDLE
+                if idle:
+                    self.request("shutdown")
                 process.join(timeout=self.cfg.timeout_for("shutdown"))
         finally:
-            with self._lock:
-                self._dispose_runtime_locked()
+            with self.lock:
+                self.dispose_runtime_locked()
 
-    def _truncate_prepared_prompts(self, prepared: Any) -> None:
-        require(
-            len(prepared.wire) == len(prepared.prompt_token_ids),
-            "vLLM adapter returned mismatched payload and prompt-token counts",
-        )
-        max_prompt_length = int(self.cfg.max_prompt_length)
-        for index, (payload, prompt_token_ids) in enumerate(zip(prepared.wire, prepared.prompt_token_ids, strict=True)):
-            truncated = [int(token) for token in prompt_token_ids[-max_prompt_length:]]
-            payload["input_ids"] = truncated
-            prepared.prompt_token_ids[index] = truncated
-
-    def _request(self, command: str, *, timeout_s: Optional[float] = None, **payload):
-        with self._lock:
-            connection = self._require_connection()
-            if self._connection_state is not VLLMConnectionState.IDLE:
+    def request(self, command: str, *, timeout_s: Optional[float] = None, **payload):
+        with self.lock:
+            if self.connection_state is VLLMConnectionState.BROKEN:
+                raise RuntimeError("vLLM runtime connection is broken and cannot be reused")
+            if self.connection is None:
+                raise RuntimeError("vLLM runtime is not available on this rank")
+            connection = self.connection
+            if self.connection_state is not VLLMConnectionState.IDLE:
                 raise RuntimeError(
-                    f"vLLM connection is {self._connection_state.value}; cannot start command {command!r}"
+                    f"vLLM connection is {self.connection_state.value}; cannot start command {command!r}"
                 )
             reserved = {"request_id", "command"}.intersection(payload)
             if reserved:
                 raise ValueError(f"vLLM payload uses reserved protocol fields: {sorted(reserved)}")
-            request_id = self._next_request_id
-            self._next_request_id += 1
-            self._connection_state = VLLMConnectionState.INFLIGHT
-            request = {
+            request_id = self.next_request_id
+            self.next_request_id += 1
+            self.connection_state = VLLMConnectionState.INFLIGHT
+            req_msg = {
                 **payload,
                 "request_id": request_id,
                 "command": command,
             }
+            eff_timeout_s = self.cfg.timeout_for(command) if timeout_s is None else timeout_s
             try:
-                connection.send(request)
-                response = self._recv(
-                    connection=connection,
-                    timeout_s=self.cfg.timeout_for(command) if timeout_s is None else timeout_s,
-                    expected_request_id=request_id,
-                    expected_command=command,
-                )
+                connection.send(req_msg)
+                if not connection.poll(eff_timeout_s):
+                    raise TimeoutError(f"vLLM did not respond within {eff_timeout_s:.0f}s")
+                try:
+                    response = connection.recv()
+                except EOFError as error:
+                    raise EOFError("vLLM closed the response pipe") from error
+                if not isinstance(response, dict):
+                    raise ProtocolError(f"response must be a mapping, got {type(response).__name__}")
+                resp_id = response.get("request_id")
+                if type(resp_id) is not int or resp_id < 1:
+                    raise ProtocolError(f"response has invalid request_id={resp_id!r}")
+                resp_cmd = response.get("command")
+                if not isinstance(resp_cmd, str) or not resp_cmd:
+                    raise ProtocolError(f"response has invalid command={resp_cmd!r}")
+                if resp_id != request_id:
+                    raise ProtocolError(f"response request_id={resp_id}, expected {request_id}")
+                if resp_cmd != command:
+                    raise ProtocolError(f"response command={resp_cmd!r}, expected {command!r}")
+                if type(response.get("ok")) is not bool:
+                    raise ProtocolError(f"response has invalid ok={response.get('ok')!r}")
+                if "result" not in response:
+                    raise ProtocolError("response omitted result")
                 result = response["result"]
                 if not response["ok"]:
                     if command in {
@@ -410,7 +437,12 @@ class VLLMRolloutEngine(BaseRolloutEngine):
                         "finish_native_weight_update",
                         "release_native_ipc",
                     }:
-                        self._validate_update_result(result, expected_status="aborted")
+                        if not isinstance(result, dict):
+                            raise ProtocolError(f"update result must be a mapping, got {type(result).__name__}")
+                        if result.get("status") != "aborted":
+                            raise ProtocolError(f"update result status={result.get('status')!r}, expected 'aborted'")
+                        if "worker_receipts" not in result:
+                            raise ProtocolError("update result omitted worker_receipts")
                     if command in {
                         "sleep",
                         "wake_up",
@@ -420,146 +452,66 @@ class VLLMRolloutEngine(BaseRolloutEngine):
                         "finish_native_weight_update",
                         "release_native_ipc",
                     }:
-                        self._mark_broken_locked()
+                        self.mark_broken_locked()
                     else:
-                        self._connection_state = VLLMConnectionState.IDLE
+                        self.connection_state = VLLMConnectionState.IDLE
                     raise RuntimeError(
                         f"vLLM {command} request {request_id} failed: "
                         f"{response.get('error')}\n{response.get('traceback', '')}"
                     )
-                self._validate_command_result(command, result)
+                if command == "startup":
+                    if not isinstance(result, dict) or result.get("event") != "ready":
+                        raise ProtocolError(f"startup result must be a ready event, got {result!r}")
+                elif command == "generate":
+                    if not isinstance(result, list):
+                        raise ProtocolError(f"generate result must be a list, got {type(result).__name__}")
+                elif command in {
+                    "init_native_weight_transfer",
+                    "start_native_weight_update",
+                    "update_native_weights",
+                    "release_native_ipc",
+                }:
+                    if result is not None:
+                        raise ProtocolError(f"{command} result must be None, got {result!r}")
+                elif command == "finish_native_weight_update":
+                    if not isinstance(result, dict) or result.get("status") != "committed":
+                        raise ProtocolError("vLLM native IPC finish result status must be 'committed'")
+                    if "worker_receipts" not in result:
+                        raise ProtocolError("vLLM native IPC finish omitted worker_receipts")
+                elif command == "health":
+                    if type(result) is not bool:
+                        raise ProtocolError(f"health result must be bool, got {type(result).__name__}")
+                elif command in {"sleep", "wake_up", "shutdown"} and result is not None:
+                    raise ProtocolError(f"{command} result must be None, got {result!r}")
             except BaseException as error:
-                if self._connection_state is VLLMConnectionState.INFLIGHT:
-                    self._mark_broken_locked()
-                if isinstance(error, (TimeoutError, EOFError, BrokenPipeError, OSError, _ProtocolError)):
+                if self.connection_state is VLLMConnectionState.INFLIGHT:
+                    self.mark_broken_locked()
+                if isinstance(error, (TimeoutError, EOFError, BrokenPipeError, OSError, ProtocolError)):
                     raise type(error)(f"vLLM {command} request {request_id} broke the connection: {error}") from error
                 raise
-            if self._connection_state is not VLLMConnectionState.INFLIGHT:
+            if self.connection_state is not VLLMConnectionState.INFLIGHT:
                 raise RuntimeError(
-                    f"vLLM {command} request {request_id} completed after runtime became {self._connection_state.value}"
+                    f"vLLM {command} request {request_id} completed after runtime became {self.connection_state.value}"
                 )
-            self._connection_state = VLLMConnectionState.IDLE
+            self.connection_state = VLLMConnectionState.IDLE
             return result
 
-    def _recv(
-        self,
-        *,
-        connection,
-        timeout_s: float,
-        expected_request_id: Optional[int] = None,
-        expected_command: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        if not connection.poll(timeout_s):
-            raise TimeoutError(f"vLLM did not respond within {timeout_s:.0f}s")
-        try:
-            message = connection.recv()
-        except EOFError as error:
-            raise EOFError("vLLM closed the response pipe") from error
-        if not isinstance(message, dict):
-            raise _ProtocolError(f"response must be a mapping, got {type(message).__name__}")
-        request_id = message.get("request_id")
-        if type(request_id) is not int or request_id < 1:
-            raise _ProtocolError(f"response has invalid request_id={request_id!r}")
-        command = message.get("command")
-        if not isinstance(command, str) or not command:
-            raise _ProtocolError(f"response has invalid command={command!r}")
-        if expected_request_id is not None and request_id != expected_request_id:
-            raise _ProtocolError(f"response request_id={request_id}, expected {expected_request_id}")
-        if expected_command is not None and command != expected_command:
-            raise _ProtocolError(f"response command={command!r}, expected {expected_command!r}")
-        if type(message.get("ok")) is not bool:
-            raise _ProtocolError(f"response has invalid ok={message.get('ok')!r}")
-        if "result" not in message:
-            raise _ProtocolError("response omitted result")
-        return message
-
-    @staticmethod
-    def _validate_update_result(result: Any, *, expected_status: str) -> None:
-        if not isinstance(result, dict):
-            raise _ProtocolError(f"update result must be a mapping, got {type(result).__name__}")
-        if result.get("status") != expected_status:
-            raise _ProtocolError(f"update result status={result.get('status')!r}, expected {expected_status!r}")
-        if "worker_receipts" not in result:
-            raise _ProtocolError("update result omitted worker_receipts")
-
-    def _validate_command_result(self, command: str, result: Any) -> None:
-        if command == "startup":
-            if not isinstance(result, dict) or result.get("event") != "ready":
-                raise _ProtocolError(f"startup result must be a ready event, got {result!r}")
-        elif command == "generate":
-            if not isinstance(result, list):
-                raise _ProtocolError(f"generate result must be a list, got {type(result).__name__}")
-        elif command in {
-            "init_native_weight_transfer",
-            "start_native_weight_update",
-            "update_native_weights",
-            "release_native_ipc",
-        }:
-            if result is not None:
-                raise _ProtocolError(f"{command} result must be None, got {result!r}")
-        elif command == "finish_native_weight_update":
-            if not isinstance(result, dict) or result.get("status") != "committed":
-                raise _ProtocolError("vLLM native IPC finish result status must be 'committed'")
-            if "worker_receipts" not in result:
-                raise _ProtocolError("vLLM native IPC finish omitted worker_receipts")
-        elif command == "health":
-            if type(result) is not bool:
-                raise _ProtocolError(f"health result must be bool, got {type(result).__name__}")
-        elif command in {"sleep", "wake_up", "shutdown"} and result is not None:
-            raise _ProtocolError(f"{command} result must be None, got {result!r}")
-
-    def _validate_runtime_manifest(self, ready: Dict[str, Any]) -> None:
-        """Validate the vLLM runtime and TP worker capabilities."""
-        if ready.get("model_type") != "qwen3_moe":
-            raise RuntimeError(f"vLLM native IPC sync currently supports qwen3_moe; got {ready.get('model_type')!r}")
-        if int(ready.get("process_group_id", -1)) != int(self._process.pid):
-            raise RuntimeError(f"vLLM did not create its required process group: {ready!r}")
-        capabilities = ready.get("worker_capabilities")
-        if not isinstance(capabilities, list) or len(capabilities) != self._tp_size:
-            raise RuntimeError(f"vLLM returned invalid TP capabilities: {capabilities!r}")
-        ranks = sorted(int(item.get("tp_rank", -1)) for item in capabilities)
-        if ranks != list(range(self._tp_size)):
-            raise RuntimeError(f"vLLM TP capability ranks {ranks} != {list(range(self._tp_size))}")
-        world_sizes = [int(item.get("tp_world_size", -1)) for item in capabilities]
-        if any(world_size != self._tp_size for world_size in world_sizes):
-            raise RuntimeError(f"vLLM TP capability world sizes {world_sizes} != {self._tp_size}")
-        device_uuids = [item.get("cuda_device_uuid") for item in capabilities]
-        if (
-            any(not isinstance(value, str) or not value for value in device_uuids)
-            or len(set(device_uuids)) != self._tp_size
-        ):
-            raise RuntimeError(f"vLLM worker CUDA UUIDs are invalid: {device_uuids!r}")
-        logger.info("vLLM runtime manifest validated: vllm=%s", ready["vllm_version"])
-
-    def _require_connection(self):
-        if self._connection_state is VLLMConnectionState.BROKEN:
-            raise RuntimeError("vLLM runtime connection is broken and cannot be reused")
-        if self._connection is None:
-            raise RuntimeError("vLLM runtime is not available on this rank")
-        return self._connection
-
-    def _break_connection(self) -> None:
-        with self._lock:
-            if self._connection_state is VLLMConnectionState.BROKEN:
-                return
-            self._mark_broken_locked()
-
-    def _mark_broken_locked(self) -> None:
-        if self._connection_state is VLLMConnectionState.BROKEN:
+    def mark_broken_locked(self) -> None:
+        if self.connection_state is VLLMConnectionState.BROKEN:
             return
-        self._connection_state = VLLMConnectionState.BROKEN
-        self._dispose_runtime_locked()
+        self.connection_state = VLLMConnectionState.BROKEN
+        self.dispose_runtime_locked()
 
-    def _dispose_runtime_locked(self) -> None:
-        connection, self._connection = self._connection, None
+    def dispose_runtime_locked(self) -> None:
+        connection, self.connection = self.connection, None
         if connection is not None:
             try:
                 connection.close()
             except OSError:
                 pass
 
-        process, self._process = self._process, None
-        process_group_id, self._process_group_id = self._process_group_id, None
+        process, self.process = self.process, None
+        process_group_id, self.process_group_id = self.process_group_id, None
         if process is None:
             return
         try:

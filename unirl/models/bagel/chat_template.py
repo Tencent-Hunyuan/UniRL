@@ -46,7 +46,7 @@ class BagelChatTemplateStage:
         """Context length of one split (image block = patches + start/end markers)."""
         if split["kind"] == "text":
             return int(split["ids"].numel())
-        patch = int(self.bundle.model.vit_patch_size)
+        patch = self.bundle.model.vit_patch_size
         _, h, w = split["image"].shape
         return (h // patch) * (w // patch) + 2
 
@@ -149,9 +149,7 @@ class BagelChatTemplateStage:
                 f"BagelChatTemplateStage.tokenize_agent_target: record {record.get('sample_id')!r} target "
                 "turn must be non-empty text (tool_calls / image targets are unsupported on Bagel)."
             )
-        return [int(t) for t in self.bundle.tokenizer.encode(content)] + [
-            int(self.bundle.new_token_ids["eos_token_id"])
-        ]
+        return [int(t) for t in self.bundle.tokenizer.encode(content)] + [self.bundle.new_token_ids["eos_token_id"]]
 
 
 __all__ = ["BagelChatTemplateStage"]
