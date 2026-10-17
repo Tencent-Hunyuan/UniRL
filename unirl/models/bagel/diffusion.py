@@ -673,7 +673,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
 
             return ReplayResult(
                 log_probs=log_prob.reshape(1, -1).to(dtype=self.logprob_dtype),
-                prev_sample_means=prev_mean.unsqueeze(0).to(dtype=self.trajectory_dtype),
+                prev_sample_means=prev_mean.unsqueeze(0),
             )
 
         gi, gi_cfg_text, gi_cfg_img = self._build_generation_inputs(
