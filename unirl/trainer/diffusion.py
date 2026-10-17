@@ -20,7 +20,7 @@ from unirl.trainer.eval_suites import EvalRewardSuite, build_eval_suites
 from unirl.trainer.hydra import parse_hydra_cfg, remote_hydra
 from unirl.trainer.residency import DEFAULT_RESIDENCY_POLICY, ResidencyPlanner, ResidencyPolicy, Role
 from unirl.types.primitives import Texts
-from unirl.types.sample import Sample
+from unirl.types.sample import Part, Sample
 from unirl.types.sample_id import child_id
 from unirl.types.sampling import BaseSamplingParams, total_samples_per_prompt
 from unirl.utils.wandb_metrics import pooled_window_reward_metrics
@@ -897,11 +897,12 @@ class DiffusionTrainer(BaseTrainer):
 
     def _stamp_sde_index_per_sample(self, sample: Sample, sde_index: int) -> None:
         """Stamp ``segment.sde_index_per_sample`` and normalize shared step metadata for group concat."""
-        segment = sample.parts[-1].segment
+        frontier = sample.parts[-1]
+        segment = frontier.segment
         if segment is None:
             raise ValueError("FlashGRPO: a step group's rollout returned no segment to stamp sde_index_per_sample on.")
         step = int(sde_index)
-        segment.sde_index_per_sample = torch.full((int(sample.parts[-1].batch_size),), step, dtype=torch.long)
+        segment.sde_index_per_sample = torch.full((int(frontier.batch_size),), step, dtype=torch.long)
         if segment.indices is not None and segment.latents is not None:
             before = segment.latents_at(step)
             after = segment.latents_at(step + 1)
@@ -910,6 +911,8 @@ class DiffusionTrainer(BaseTrainer):
             segment.indices = torch.arange(3, dtype=torch.long, device=segment.indices.device)
         if segment.sde_indices is not None:
             segment.sde_indices = torch.zeros(1, dtype=torch.long, device=segment.sde_indices.device)
+        if frontier.sampling_params is not None and hasattr(frontier.sampling_params, "sde_indices"):
+            frontier.sampling_params = dataclasses.replace(frontier.sampling_params, sde_indices=None)
 
     def _score_and_advantage(self, sample: Sample) -> Sample:
         """Attach rewards (unless scored inline) and, when the algorithm needs them, advantages."""
@@ -1092,9 +1095,15 @@ class DiffusionTrainer(BaseTrainer):
                 self._stamp_sde_index_per_sample(item, int(step))
         # TempFlowGRPO normalizes rewards within each branch step, so it scores and
         # takes advantages per step group before merging; everyone else after.
+        # Because every branch group shares the same root prompt Parts, merge only
+        # the frontier generation Parts onto the shared ancestor prefix.
         if self._per_sample_layout == "branched":
             generated = [self._score_and_advantage(item) for item in generated]
-            sample = Sample.concat(list(generated))
+            if len(generated) == 1:
+                sample = generated[0]
+            else:
+                merged_frontier = Part.concat([item.parts[-1] for item in generated])
+                sample = generated[0].with_parts([*generated[0].parts[:-1], merged_frontier])
         else:
             sample = generated[0] if len(generated) == 1 else Sample.concat(list(generated))
             sample = self._score_and_advantage(sample)
