@@ -174,7 +174,8 @@ class FlowDPPO(StageAlgorithm):
                         "prev_sample_means=None. Ensure the stage's replay method "
                         "produces means (required for KL-ADV masking)."
                     )
-                logp_parts.append(result.log_probs.detach().cpu())
+                if self.old_logp_source == "replay":
+                    logp_parts.append(result.log_probs.detach().cpu())
                 mean_parts.append(result.prev_sample_means.detach().cpu())
         if self.old_logp_source == "replay":
             segment.sde_logp = torch.cat(logp_parts, dim=1)
@@ -196,13 +197,13 @@ class FlowDPPO(StageAlgorithm):
         typed_conds = typed_conditions(conditions, self.conditions_cls)
         num_steps = len(target_steps)
         chunks = _slice_step_chunks(target_steps, self.timestep_chunk_size)
-        policy_loss_total = 0.0
-        total_loss = 0.0
-        kl_ref_total = 0.0
-        weighted_metrics: Dict[str, float] = {}
-        ratio_min = float("inf")
-        ratio_max = float("-inf")
-        kl_max = float("-inf")
+        policy_loss_sum: Optional[torch.Tensor] = None
+        total_loss_sum: Optional[torch.Tensor] = None
+        kl_ref_sum: Optional[torch.Tensor] = None
+        weighted_metrics: Dict[str, torch.Tensor] = {}
+        ratio_mins: List[torch.Tensor] = []
+        ratio_maxs: List[torch.Tensor] = []
+        kl_maxs: List[torch.Tensor] = []
         new_logp_parts: List[torch.Tensor] = []
         old_logp_parts: List[torch.Tensor] = []
 
@@ -246,7 +247,8 @@ class FlowDPPO(StageAlgorithm):
 
             chunk_policy_loss = loss_per_elem.mean()
             chunk_loss = chunk_policy_loss
-            policy_loss_total += float(chunk_policy_loss.detach().item()) * len(chunk)
+            p_term = chunk_policy_loss.detach() * len(chunk)
+            policy_loss_sum = p_term if policy_loss_sum is None else policy_loss_sum + p_term
             if self.beta > 0.0:
                 ref_means = _reference_replay_means(
                     self.stage,
@@ -266,47 +268,49 @@ class FlowDPPO(StageAlgorithm):
                 )
                 kl_ref = _reference_kl_loss(new_means, ref_means, kl_sigma_t)
                 chunk_loss = chunk_loss + self.beta * kl_ref
-                kl_ref_total += float(kl_ref.detach().item()) * len(chunk)
+                k_term = kl_ref.detach() * len(chunk)
+                kl_ref_sum = k_term if kl_ref_sum is None else kl_ref_sum + k_term
 
             chunk_weight = 1.0 if len(chunks) == 1 else (len(chunk) / num_steps)
             (chunk_loss * (loss_scale * chunk_weight)).backward()
-            total_loss += float(chunk_loss.detach().item()) * len(chunk)
+            t_term = chunk_loss.detach() * len(chunk)
+            total_loss_sum = t_term if total_loss_sum is None else total_loss_sum + t_term
             new_logp_parts.append(new_logp.detach())
             old_logp_parts.append(old_logp.detach())
             for k, v in chunk_metrics.items():
-                val = float(v.item())
                 if k == "ratio_min":
-                    ratio_min = min(ratio_min, val)
+                    ratio_mins.append(v)
                 elif k == "ratio_max":
-                    ratio_max = max(ratio_max, val)
+                    ratio_maxs.append(v)
                 elif k == "kl_new_old_max":
-                    kl_max = max(kl_max, val)
+                    kl_maxs.append(v)
                 elif k != "ratio_std":
-                    weighted_metrics[k] = weighted_metrics.get(k, 0.0) + val * len(chunk)
+                    m_term = v * len(chunk)
+                    weighted_metrics[k] = m_term if k not in weighted_metrics else weighted_metrics[k] + m_term
 
-        policy_loss_total /= num_steps
-        total_loss /= num_steps
+        policy_loss_val = float((policy_loss_sum / num_steps).item())
+        total_loss_val = float((total_loss_sum / num_steps).item())
         new_logp_all = torch.cat(new_logp_parts, dim=1)
         old_logp_all = torch.cat(old_logp_parts, dim=1)
         ratio_all = torch.exp(new_logp_all - old_logp_all)
         ratio_std = float(ratio_all.std().item()) if ratio_all.numel() > 1 else 0.0
 
         metrics: Dict[str, Any] = {
-            "policy_loss": policy_loss_total,
+            "policy_loss": policy_loss_val,
             "kl_mask_threshold": float(self.kl_mask_threshold),
-            **{k: v / num_steps for k, v in weighted_metrics.items()},
+            **{k: float((v / num_steps).item()) for k, v in weighted_metrics.items()},
             "ratio_std": ratio_std,
-            "ratio_min": ratio_min,
-            "ratio_max": ratio_max,
-            "kl_new_old_max": kl_max,
+            "ratio_min": float(torch.stack(ratio_mins).min().item()),
+            "ratio_max": float(torch.stack(ratio_maxs).max().item()),
+            "kl_new_old_max": float(torch.stack(kl_maxs).max().item()),
         }
 
         if self.beta > 0.0:
             metrics["beta"] = float(self.beta)
-            metrics["kl_ref_mean"] = kl_ref_total / num_steps
+            metrics["kl_ref_mean"] = float((kl_ref_sum / num_steps).item())
 
         return AlgorithmStepResult(
-            loss=total_loss,
+            loss=total_loss_val,
             metrics=metrics,
             num_steps_or_tokens=num_steps,
             has_backward=True,

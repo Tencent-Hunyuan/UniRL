@@ -142,9 +142,9 @@ class FlowGRPO(StageAlgorithm):
         clip_range = _resolve_clip_range_from_schedule(self.clip_range, self.clip_schedule, training_progress)
         num_steps = len(target_steps)
         chunks = _slice_step_chunks(target_steps, self.timestep_chunk_size)
-        policy_loss_total = 0.0
-        total_loss = 0.0
-        kl_ref_total = 0.0
+        policy_loss_sum: Optional[torch.Tensor] = None
+        total_loss_sum: Optional[torch.Tensor] = None
+        kl_ref_sum: Optional[torch.Tensor] = None
         new_logp_parts: List[torch.Tensor] = []
         old_logp_parts: List[torch.Tensor] = []
 
@@ -170,7 +170,8 @@ class FlowGRPO(StageAlgorithm):
             )
             chunk_policy_loss = loss_per_elem.mean()
             chunk_loss = chunk_policy_loss
-            policy_loss_total += float(chunk_policy_loss.detach().item()) * len(chunk)
+            p_term = chunk_policy_loss.detach() * len(chunk)
+            policy_loss_sum = p_term if policy_loss_sum is None else policy_loss_sum + p_term
             if self.beta > 0.0:
                 new_means = replay_result.prev_sample_means
                 if new_means is None:
@@ -196,16 +197,18 @@ class FlowGRPO(StageAlgorithm):
                 ).to(dtype=new_means.dtype, device=new_means.device)
                 kl_ref = _reference_kl_loss(new_means, ref_means, sigma_t)
                 chunk_loss = chunk_loss + self.beta * kl_ref
-                kl_ref_total += float(kl_ref.detach().item()) * len(chunk)
+                k_term = kl_ref.detach() * len(chunk)
+                kl_ref_sum = k_term if kl_ref_sum is None else kl_ref_sum + k_term
             # len(chunk)/num_steps makes the chunk backwards sum to the full [B, S] mean backward.
             chunk_weight = 1.0 if len(chunks) == 1 else (len(chunk) / num_steps)
             (chunk_loss * (loss_scale * chunk_weight)).backward()
-            total_loss += float(chunk_loss.detach().item()) * len(chunk)
+            t_term = chunk_loss.detach() * len(chunk)
+            total_loss_sum = t_term if total_loss_sum is None else total_loss_sum + t_term
             new_logp_parts.append(new_logp.detach())
             old_logp_parts.append(old_logp.detach())
 
-        policy_loss_total /= num_steps
-        total_loss /= num_steps
+        policy_loss_val = float((policy_loss_sum / num_steps).item())
+        total_loss_val = float((total_loss_sum / num_steps).item())
         if len(chunks) > 1:
             # Ratio metrics compose only over the full [B, S] set; per-chunk std/min/max would not.
             new_logp_all = torch.cat(new_logp_parts, dim=1)
@@ -224,15 +227,15 @@ class FlowGRPO(StageAlgorithm):
             )
 
         metrics: Dict[str, Any] = {
-            "policy_loss": policy_loss_total,
+            "policy_loss": policy_loss_val,
             "clip_range": float(clip_range),
             **{k: float(v.item()) for k, v in ratio_metrics.items()},
         }
         if self.beta > 0.0:
             metrics["beta"] = float(self.beta)
-            metrics["kl_ref_mean"] = kl_ref_total / num_steps
+            metrics["kl_ref_mean"] = float((kl_ref_sum / num_steps).item())
         return AlgorithmStepResult(
-            loss=total_loss,
+            loss=total_loss_val,
             metrics=metrics,
             num_steps_or_tokens=num_steps,
             has_backward=True,
