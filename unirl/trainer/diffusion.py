@@ -896,11 +896,20 @@ class DiffusionTrainer(BaseTrainer):
         ]
 
     def _stamp_sde_index_per_sample(self, sample: Sample, sde_index: int) -> None:
-        """Stamp ``segment.sde_index_per_sample`` on this group's frontier Part."""
+        """Stamp ``segment.sde_index_per_sample`` and normalize shared step metadata for group concat."""
         segment = sample.parts[-1].segment
         if segment is None:
             raise ValueError("FlashGRPO: a step group's rollout returned no segment to stamp sde_index_per_sample on.")
-        segment.sde_index_per_sample = torch.full((int(sample.parts[-1].batch_size),), int(sde_index), dtype=torch.long)
+        step = int(sde_index)
+        segment.sde_index_per_sample = torch.full((int(sample.parts[-1].batch_size),), step, dtype=torch.long)
+        if segment.indices is not None and segment.latents is not None:
+            before = segment.latents_at(step)
+            after = segment.latents_at(step + 1)
+            final = segment.latents[:, -1]
+            segment.latents = torch.stack([before, after, final], dim=1)
+            segment.indices = torch.arange(3, dtype=torch.long, device=segment.indices.device)
+        if segment.sde_indices is not None:
+            segment.sde_indices = torch.zeros(1, dtype=torch.long, device=segment.sde_indices.device)
 
     def _score_and_advantage(self, sample: Sample) -> Sample:
         """Attach rewards (unless scored inline) and, when the algorithm needs them, advantages."""
