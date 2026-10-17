@@ -55,6 +55,13 @@ class LoraConfig:
     # as ``target_modules``).
     frozen_adapters: Any = None
 
+    def __post_init__(self) -> None:
+        require(
+            self.bias == "none",
+            f"LoraConfig.bias must be 'none', got {self.bias!r}; "
+            "trainable LoRA biases mutate shared base_layer.bias in place and are unsupported.",
+        )
+
 
 @dataclass
 class EmaLoraConfig:
@@ -73,6 +80,13 @@ class EmaLoraConfig:
     ema_uprate: float = 0.001
     ema_uphold: float = 0.5
     timing: str = "rollout_end"
+
+    def __post_init__(self) -> None:
+        require(
+            self.bias == "none",
+            f"EmaLoraConfig.bias must be 'none', got {self.bias!r}; "
+            "trainable LoRA biases mutate shared base_layer.bias in place and are unsupported.",
+        )
 
 
 @dataclass

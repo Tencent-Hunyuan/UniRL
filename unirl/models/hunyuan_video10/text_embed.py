@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 
+from unirl.models.types.embedding import dedup_prompts
 from unirl.types.conditions import TextEmbedCondition
 from unirl.types.primitives import Texts
 
@@ -47,7 +48,7 @@ class HunyuanVideo10TextEmbedStage:
 
     def embed_llama(self, p: Texts) -> TextEmbedCondition:
         """Encode prompts via LLaMA — embeds ``[B, llama_max_length, 4096]``, mask ``[B, llama_max_length]``."""
-        prompts = list(p.texts)
+        prompts, inverse = dedup_prompts(p.texts)
         bundle = self.bundle
         tokenizer = bundle.tokenizer
         text_encoder = bundle.text_encoder
@@ -92,11 +93,12 @@ class HunyuanVideo10TextEmbedStage:
             prompt_embeds = prompt_embeds[:, crop_start:]
             attention_mask = attention_mask[:, crop_start:]
 
-        return TextEmbedCondition(embeds=prompt_embeds.to(dtype=dtype), attn_mask=attention_mask, pooled=None)
+        cond = TextEmbedCondition(embeds=prompt_embeds.to(dtype=dtype), attn_mask=attention_mask, pooled=None)
+        return cond if inverse is None else cond.select(inverse)
 
     def embed_clip(self, p: Texts) -> TextEmbedCondition:
         """Encode prompts via CLIP into a TextEmbedCondition — embeds are the pooled ``[B, 768]``."""
-        prompts = list(p.texts)
+        prompts, inverse = dedup_prompts(p.texts)
         bundle = self.bundle
         tokenizer = bundle.tokenizer_2
         text_encoder = bundle.text_encoder_2
@@ -120,7 +122,8 @@ class HunyuanVideo10TextEmbedStage:
             )
         pooled_output = outputs.pooler_output
 
-        return TextEmbedCondition(embeds=pooled_output.to(dtype=dtype), attn_mask=None, pooled=None)
+        cond = TextEmbedCondition(embeds=pooled_output.to(dtype=dtype), attn_mask=None, pooled=None)
+        return cond if inverse is None else cond.select(inverse)
 
 
 __all__ = [

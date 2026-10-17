@@ -189,6 +189,11 @@ def main() -> None:
 
     dropout = args.lora_dropout if args.lora_dropout is not None else recorded.get("dropout", 0.0)
     bias = args.bias if args.bias is not None else recorded.get("bias", "none")
+    if bias != "none":
+        raise SystemExit(
+            f"export_adapter: bias must be 'none', got {bias!r}; "
+            "UniRL LoRA checkpoints only export lora_A/lora_B adapter weights."
+        )
     task_type = args.task_type if args.task_type is not None else recorded.get("task_type", "FEATURE_EXTRACTION")
 
     adapter_state = export_adapter_state_dict(
