@@ -73,6 +73,16 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
 - **`old_logp_source: rollout` with a replay-only engine** — a separate-worker
   SGLang rollout emits no per-step `sde_logp`, so the `rollout` source raises in
   `prepare_segment`. Use `replay` (the cost is one extra `torch.no_grad` replay).
+- **`timestep_chunk_size` bounds replay graph residency** — set it and
+  `FlowGRPO` / `FlowDPPO` replay and backward SDE steps in slices of that size,
+  each scaled by `len(chunk)/S` so the summed gradient matches the default
+  single backward (DiffusionNFT's `iter_scale` pattern; the optimizer boundary
+  stays with `TrainStack`). `prepare_segment` slices replay anchors with the
+  same chunks so `batch_replay_steps: true` plus `timestep_chunk_size: k`
+  evaluates `[k * B]` batches identically in anchor and training passes. `None`
+  (default) keeps the current behavior, whose resident graph grows with S even
+  at `micro_batch_size: 1`. Each extra backward adds a reduce-scatter, and bf16
+  autocast accumulation differs from the single backward (matches in fp32).
 - **`num_updates_per_batch > 1` on DiffusionNFT** raises in `TrainStack.__init__` — DiffusionNFT keeps
   the default `supports_multi_update = False`. Multi-update algorithms freeze their
   declared anchors: `FlowGRPO`/`FlowDPPO` prepare `sde_logp`; `GRPO` always reuses
