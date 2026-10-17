@@ -43,7 +43,6 @@ class HunyuanVideo10Pipeline(Pipeline):
         hidden_state_skip_layer: int = 2,
         latent_channels: Optional[int] = None,
         batch_replay_steps: bool = False,
-        allow_batched_rollout_anchor: bool = False,
     ) -> None:
         self.bundle = bundle
         self.text_embed = (
@@ -67,7 +66,6 @@ class HunyuanVideo10Pipeline(Pipeline):
                 logprob_precision=logprob_precision,
                 latent_channels=latent_channels,
                 batch_replay_steps=batch_replay_steps,
-                allow_batched_rollout_anchor=allow_batched_rollout_anchor,
             )
         self.diffusion = diffusion
         self.vae_decode = vae_decode if vae_decode is not None else HunyuanVideo10VAEDecodeStage(bundle)
@@ -76,9 +74,9 @@ class HunyuanVideo10Pipeline(Pipeline):
     @classmethod
     def latent_shape(cls, *, model_config: Any, sampling_spec: Any) -> tuple:
         """Per-sample 5D latent shape ``(C, T_lat, H_lat, W_lat)`` for driver-side noise pre-computation."""
-        height = int(sampling_spec.height)
-        width = int(sampling_spec.width)
-        num_frames = int(sampling_spec.num_frames)
+        height = sampling_spec.height
+        width = sampling_spec.width
+        num_frames = sampling_spec.num_frames
         spatial = HunyuanVideo10DiffusionStage.DEFAULT_SPATIAL_DOWNSAMPLE
         temporal = HunyuanVideo10DiffusionStage.DEFAULT_TEMPORAL_DOWNSAMPLE
         config_channels = getattr(model_config, "latent_channels", None)
@@ -118,7 +116,6 @@ class HunyuanVideo10Pipeline(Pipeline):
             logprob_precision=config.logprob_precision,
             latent_channels=config.latent_channels,
             batch_replay_steps=config.batch_replay_steps,
-            allow_batched_rollout_anchor=config.allow_batched_rollout_anchor,
         )
         vae_decode = HunyuanVideo10VAEDecodeStage(bundle)
         return cls(
@@ -126,7 +123,7 @@ class HunyuanVideo10Pipeline(Pipeline):
             text_embed=text_embed,
             diffusion=diffusion,
             vae_decode=vae_decode,
-            shift=float(config.shift),
+            shift=config.shift,
         )
 
     def build_conditions(
@@ -179,7 +176,7 @@ class HunyuanVideo10Pipeline(Pipeline):
             params=params,
             initial_latents=initial_latents,
             denoise_seed_keys=frontier.sample_ids if initial_latents is not None else None,
-            denoise_base_seed=int(params.seed) if params.seed is not None else 0,
+            denoise_base_seed=params.seed if params.seed is not None else 0,
         )
         videos = self.vae_decode.decode(latent_seg)
 

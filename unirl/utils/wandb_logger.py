@@ -22,6 +22,20 @@ if TYPE_CHECKING:
 module_logger = logging.getLogger(__name__)
 
 
+def _normalize_stereo_audio(audio: torch.Tensor) -> torch.Tensor:
+    """Normalize ``[L]``, ``[C, L]``, or ``[L, C]`` audio to interleaved ``[L, 2]`` samples."""
+    samples = audio.detach().float().cpu()
+    if samples.ndim == 1:
+        samples = samples.unsqueeze(1)
+    elif samples.ndim == 2 and samples.shape[0] in (1, 2):
+        samples = samples.T
+    elif samples.ndim != 2 or samples.shape[1] not in (1, 2):
+        raise ValueError(f"Expected mono/stereo audio shaped [L], [C, L], or [L, C], got {tuple(samples.shape)}")
+    if samples.shape[1] == 1:
+        samples = samples.expand(-1, 2)
+    return torch.clamp(samples, -1.0, 1.0)
+
+
 def _write_video_with_audio(
     frames: Any,
     fps: int,
@@ -56,13 +70,7 @@ def _write_video_with_audio(
         for packet in video_stream.encode():
             container.mux(packet)
 
-        samples = audio.float().cpu()
-        if samples.ndim == 1:
-            samples = samples.unsqueeze(0)
-        if samples.shape[0] == 1:
-            samples = samples.expand(2, -1)
-        samples = samples.T
-        samples = torch.clamp(samples, -1.0, 1.0)
+        samples = _normalize_stereo_audio(audio)
         int16_samples = (samples * 32767.0).to(torch.int16)
 
         audio_frame = av.AudioFrame.from_ndarray(
@@ -72,8 +80,8 @@ def _write_video_with_audio(
         )
         audio_frame.sample_rate = audio_sample_rate
 
-        target_format = audio_stream.codec_context.format or "fltp"
-        target_layout = audio_stream.codec_context.layout or "stereo"
+        target_format = "fltp" if audio_stream.codec_context.format is None else audio_stream.codec_context.format
+        target_layout = "stereo" if audio_stream.codec_context.layout is None else audio_stream.codec_context.layout
         resampler = av.audio.resampler.AudioResampler(
             format=target_format,
             layout=target_layout,
@@ -128,6 +136,7 @@ _STEP_PHASE_SPECS = (
     ("rollout", "sleep", "sleep"),
     ("weight_sync", "sync", "weight_sync"),
     ("reward", "score_and_attach", "reward"),
+    ("reward_stack", "rollout_and_score", "rollout_score"),
     ("stack", "train_track", "train"),
 )
 
@@ -294,9 +303,8 @@ class UniRLWandBLogger:
             wandb.define_metric("train/image/*", step_metric="train/step")
             wandb.define_metric("rollout/step")
             wandb.define_metric("rollout/*", step_metric="rollout/step")
+            wandb.define_metric("rollout/async/*", step_metric="rollout/step")
             wandb.define_metric("perf/*", step_metric="rollout/step")
-            wandb.define_metric("sync/*", step_metric="rollout/step")
-            wandb.define_metric("buffer/*", step_metric="rollout/step")
             wandb.define_metric("eval/step")
             wandb.define_metric("eval/*", step_metric="eval/step")
         except Exception as e:
@@ -405,16 +413,12 @@ class UniRLWandBLogger:
         if media_preview is None:
             return
 
-        if isinstance(media_preview, dict):
-            images = media_preview.get("images")
-            videos = media_preview.get("videos")
-            prompts = media_preview.get("prompts")
-            rewards = media_preview.get("rewards")
-        else:
-            images = getattr(media_preview, "images", None)
-            videos = getattr(media_preview, "videos", None)
-            prompts = getattr(media_preview, "prompts", None)
-            rewards = getattr(media_preview, "rewards", None)
+        images = media_preview.images
+        videos = media_preview.videos
+        prompts = media_preview.prompts
+        rewards = media_preview.rewards
+        audios = media_preview.audios
+        audio_sr = media_preview.audio_sample_rate
 
         has_images = isinstance(images, list) and bool(images)
         has_videos = isinstance(videos, list) and bool(videos)
@@ -469,8 +473,6 @@ class UniRLWandBLogger:
 
             if has_videos:
                 wandb_videos: List[Any] = []
-                audios = getattr(media_preview, "audios", None) or []
-                audio_sr = getattr(media_preview, "audio_sample_rate", None)
                 for idx in range(min(len(videos), n)):
                     vid = videos[idx]
                     if not torch.is_tensor(vid):
@@ -546,6 +548,8 @@ class UniRLWandBLogger:
         """Log one rollout's metrics to wandb. No-op when disabled."""
         mem_summary = self.memory_monitor.step_summary(step=rollout_id + 1) if self.memory_monitor is not None else None
         if not self.enabled or not self._initialized:
+            # Keep the checkpointed train axis independent of telemetry; log_step is a no-op here.
+            self._log_train(results)
             return
         from unirl.utils.wandb_metrics import compute_rollout_sample_metrics
 
@@ -571,21 +575,19 @@ class UniRLWandBLogger:
         self,
         results: Union["TrainStepResult", Dict[str, "TrainStepResult"]],
     ) -> None:
-        """Emit ``train/*`` points, one per optimizer update, single- and multi-track."""
-        if not self.enabled or not self._initialized:
-            return
+        """Advance the train axis and emit enabled ``train/*`` points."""
 
         if isinstance(results, dict):
             per_track_updates: Dict[str, List[Dict[str, Any]]] = {}
             for name, result in results.items():
-                per_update = getattr(result, "per_update", ()) or ()
+                per_update = result.per_update
                 if len(per_update) > 1:
                     per_track_updates[name] = [dict(m) for m in per_update]
                 else:
                     per_track_updates[name] = [dict(aggregate_stage_results([result]))]
             length = max((len(v) for v in per_track_updates.values()), default=0)
             if length <= 1:
-                if any(bool(getattr(r, "has_backward", False)) for r in results.values()):
+                if any(r.has_backward for r in results.values()):
                     merged = {
                         f"{name}/{key}": value
                         for name, updates in per_track_updates.items()
@@ -607,12 +609,12 @@ class UniRLWandBLogger:
                 self.log_step(self._optimizer_step, merged)
             return
 
-        per_update = getattr(results, "per_update", ()) or ()
+        per_update = results.per_update
         if len(per_update) > 1:
             for metrics in per_update:
                 self._optimizer_step += 1
                 self.log_step(self._optimizer_step, dict(metrics))
-        elif getattr(results, "has_backward", False):
+        elif results.has_backward:
             self._optimizer_step += 1
             self.log_step(self._optimizer_step, dict(aggregate_stage_results([results])))
 
@@ -630,7 +632,7 @@ class UniRLWandBLogger:
         log = logger if logger is not None else module_logger
 
         def _metric(metrics: Any, key: str) -> Optional[float]:
-            value = (metrics or {}).get(key) if metrics is not None else None
+            value = metrics.get(key) if metrics else None
             try:
                 return float(value)
             except (TypeError, ValueError):
@@ -638,7 +640,7 @@ class UniRLWandBLogger:
 
         def _fmt(result: Any) -> str:
             parts = f"loss={result.loss:.4f} gn={result.grad_norm:.4f} lr={result.lr:.2e}"
-            metrics = getattr(result, "metrics", None)
+            metrics = result.metrics
             ratio_mean = _metric(metrics, "ratio_mean")
             ratio_std = _metric(metrics, "ratio_std")
             clip_fraction = _metric(metrics, "clip_fraction")
@@ -751,7 +753,7 @@ def aggregate_stage_results(results: List[Any]) -> Dict[str, float]:
             "lr": float(r.lr),
             "has_backward": float(bool(r.has_backward)),
         }
-        metrics = getattr(r, "metrics", None)
+        metrics = r.metrics
         if metrics:
             d.update({str(k): v for k, v in dict(metrics).items()})
         per_actor_dicts.append(d)

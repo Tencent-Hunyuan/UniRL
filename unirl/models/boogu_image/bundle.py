@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 
 from unirl.models.types.bundle import Bundle
-from unirl.models.types.meta_init import build_meta_init_transformer
+from unirl.models.types.meta_init import build_meta_init_transformer, resolve_meta_init_weights
 from unirl.utils.dtypes import parse_torch_dtype
 
 from .config import BooguImagePipelineConfig
@@ -79,8 +79,8 @@ class BooguImageBundle(Bundle):
 
         import fcntl
 
-        serialize = os.environ.get("DIFFRL_MODEL_LOAD_SERIALIZE", "1") != "0"
-        lock_file = open("/tmp/diffrl_model_load.lock", "a+") if serialize else None
+        serialize = os.environ.get("UNIRL_MODEL_LOAD_SERIALIZE", "1") != "0"
+        lock_file = open("/tmp/unirl_model_load.lock", "a+") if serialize else None
         if lock_file is not None:
             fcntl.flock(lock_file, fcntl.LOCK_EX)
         try:
@@ -114,6 +114,7 @@ class BooguImageBundle(Bundle):
 
         meta_init_state = None
         if config.meta_init_transformer:
+            transformer_weights_path = resolve_meta_init_weights(path, component="transformer")
             transformer_config = BooguImageTransformer2DModel.load_config(path, subfolder="transformer")
             transformer, meta_init_state = build_meta_init_transformer(
                 lambda: BooguImageTransformer2DModel.from_config(transformer_config), dtype=dtype
@@ -123,9 +124,7 @@ class BooguImageBundle(Bundle):
                 path, subfolder="transformer", torch_dtype=dtype
             ).to(device)
 
-        if bool(getattr(transformer, "enable_teacache", False)) or bool(
-            getattr(transformer, "enable_taylorseer", False)
-        ):
+        if transformer.enable_teacache or transformer.enable_taylorseer:
             raise RuntimeError(
                 "BooguImageBundle: transformer loaded with TeaCache/TaylorSeer "
                 "enabled — RL rollout/replay must be cache-free."
@@ -145,7 +144,7 @@ class BooguImageBundle(Bundle):
             wrapper = Qwen3VLForConditionalGeneration.from_pretrained(
                 text_encoder_path, subfolder="mllm", torch_dtype=te_dtype
             )
-            text_encoder = wrapper.model if hasattr(wrapper, "lm_head") else wrapper
+            text_encoder = wrapper.model
             del wrapper
             text_encoder = text_encoder.to(device).eval()
             text_encoder.requires_grad_(False)
@@ -162,7 +161,7 @@ class BooguImageBundle(Bundle):
             pretrained_path=path,
         )
         if config.meta_init_transformer:
-            bundle._transformer_weights_path = os.path.join(path, "transformer")
+            bundle._transformer_weights_path = transformer_weights_path
             bundle._meta_init_state = meta_init_state
         return bundle
 

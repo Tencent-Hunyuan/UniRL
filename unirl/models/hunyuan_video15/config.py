@@ -21,12 +21,12 @@ class HunyuanVideo15PipelineConfig:
     text_encoder_dtype: Any = None
     model_precision: Any = "bf16"
     device: Any = None
+    attention_backend: str = "native"
 
     autocast_precision: str = "bf16"
     trajectory_precision: str = "fp16"
     logprob_precision: str = "fp32"
     batch_replay_steps: bool = False
-    allow_batched_rollout_anchor: bool = False
 
     shift: float = 5.0
 

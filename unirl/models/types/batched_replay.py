@@ -34,10 +34,8 @@ class BatchedStepReplayMixin:
         sigma_max: torch.Tensor,
         device: torch.device,
     ) -> ReplayResult:
-        """Replay all target steps in one step-major batch; output slot ``s`` is ``target[s]``."""
+        """Replay ``target`` steps in one step-major batch; log-probs ``[B, S]``, slot ``s`` is ``target[s]``."""
         S = len(target)
-        if S < 1:
-            raise ValueError(f"{type(self).__name__} received no batched replay targets")
         sample_all = torch.cat([segment.latents_at(i).to(device) for i in target], dim=0)
         prev_all = torch.cat([segment.latents_at(i + 1).to(device) for i in target], dim=0)
         B = sample_all.shape[0] // S
@@ -53,8 +51,8 @@ class BatchedStepReplayMixin:
             prev_sample=prev_all,
             sigma=sigma_all,
             sigma_next=sigma_next_all,
-            guidance_scale=float(params.guidance_scale),
-            eta=float(params.eta),
+            guidance_scale=params.guidance_scale,
+            eta=params.eta,
             sigma_max=sigma_max,
             step_index=int(target[0]),
             **self._batched_step_kwargs(segment, params),
@@ -69,7 +67,7 @@ class BatchedStepReplayMixin:
         means_t = None
         if prev_mean_all is not None:
             tail = prev_mean_all.shape[1:]
-            means_t = prev_mean_all.view(S, B, *tail).transpose(0, 1).contiguous().to(dtype=self.trajectory_dtype)
+            means_t = prev_mean_all.view(S, B, *tail).transpose(0, 1).contiguous()
         return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
 
 

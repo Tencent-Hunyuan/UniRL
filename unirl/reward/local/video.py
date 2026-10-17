@@ -10,7 +10,7 @@ from typing import List
 import torch
 from PIL import Image
 
-from unirl.reward.base import BaseRewardComponentSpec, RewardBackend
+from unirl.reward.base import PromptRewardComponentSpec, RewardBackend
 from unirl.types.reward import RewardRequest, RewardResponse
 
 from .registry import (
@@ -25,7 +25,7 @@ class VideoRewardScorer(RewardBackend):
     input_kind = "video"
 
     def __init__(self, *, config: "VideoSpec", base_device: str) -> None:
-        inner_model = str(config.inner_model_name or "pickscore").strip().lower()
+        inner_model = str(config.inner_model_name).strip().lower()
         super().__init__(
             model_name=inner_model,
             batch_size=config.batch_size,
@@ -39,7 +39,7 @@ class VideoRewardScorer(RewardBackend):
         inner_spec = inner_spec_cls()
         overrides = {
             field_name: getattr(config, field_name)
-            for field_name in ("device", "batch_size")
+            for field_name in ("device", "batch_size", "prompt_source")
             if hasattr(inner_spec, field_name)
         }
         if overrides:
@@ -52,25 +52,35 @@ class VideoRewardScorer(RewardBackend):
 
         start = time.time()
         videos = request.videos
-        prompts = request.prompts
 
         try:
+            from torchvision.transforms.functional import to_tensor
+
+            from unirl.types.primitives import Images, Texts
+
             rewards = []
             component_rewards = {
                 "alignment": [],
                 "temporal": [],
             }
 
-            for video, prompt in zip(videos, prompts):
+            for index, video in enumerate(videos):
                 frames = self._sample_frames(video)
-                from torchvision.transforms.functional import to_tensor
-
-                from unirl.types.primitives import Images, Texts
-
                 frame_pixels = torch.stack([to_tensor(f) for f in frames])
+                original = (
+                    None
+                    if request.original_prompt is None
+                    else Texts(texts=[request.original_prompt.texts[index]] * len(frames))
+                )
+                generation = (
+                    None
+                    if request.generation_prompt is None
+                    else Texts(texts=[request.generation_prompt.texts[index]] * len(frames))
+                )
                 frame_request = RewardRequest(
-                    primitives={"text": Texts(texts=[prompt] * len(frames))},
                     generated={"image": Images.from_dense(frame_pixels)},
+                    original_prompt=original,
+                    generation_prompt=generation,
                 )
                 frame_response = self.frame_scorer.compute_rewards(frame_request)
                 alignment_reward = sum(frame_response.rewards) / len(frame_response.rewards)
@@ -122,20 +132,10 @@ class VideoRewardScorer(RewardBackend):
         elif video.dim() == 5:
             video = video.squeeze(0).permute(1, 0, 2, 3)
 
-        frame_diffs = []
-        for i in range(len(video) - 1):
-            diff = (video[i] - video[i + 1]).abs().mean()
-            frame_diffs.append(diff.item())
-
-        avg_diff = sum(frame_diffs) / len(frame_diffs) if frame_diffs else 0
-        return max(0.0, 1 - avg_diff)
-
-    @property
-    def preferred_input_kind(self) -> str:
-        return self.input_kind
-
-    def is_available(self) -> bool:
-        return self.frame_scorer.is_available()
+        if len(video) <= 1:
+            return 1.0
+        avg_diff = float((video[:-1].float() - video[1:].float()).abs().mean().item())
+        return max(0.0, 1.0 - avg_diff)
 
     def offload(self) -> None:
         self.frame_scorer.offload()
@@ -148,7 +148,7 @@ class VideoRewardScorer(RewardBackend):
 
 
 @dataclass
-class VideoSpec(BaseRewardComponentSpec):
+class VideoSpec(PromptRewardComponentSpec):
     """Typed config for the Video reward component."""
 
     batch_size: int = 8

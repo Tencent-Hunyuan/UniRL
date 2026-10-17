@@ -19,7 +19,7 @@
 # PickScore and OCR stay local.
 #
 # Launch (1 node x 8 GPUs; start the geneval service first or swap that scorer out):
-#   bash examples/run_experiment_multinode_taiji.sh diffusion/sd3/sd3_opd_multi_teacher
+#   bash examples/run_experiment_multinode.sh diffusion/sd3/sd3_opd_multi_teacher
 
 num_devices: 8
 batch_size: 8

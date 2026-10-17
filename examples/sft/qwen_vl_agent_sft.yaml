@@ -17,7 +17,7 @@
 # Env:
 #   QWEN_VL_PATH    HF id or local checkpoint (default Qwen/Qwen2.5-VL-7B-Instruct)
 #   SFT_DATA        train manifest (searchgen prepare_sft train.jsonl)
-#   SFT_EVAL_DATA   eval manifest (defaults to SFT_DATA — supply a real split!)
+#   SFT_EVAL_DATA   optional eval manifest (validation is disabled when unset)
 #
 # Download/cook guide:
 #   datasets/searchgen/README.md
@@ -107,6 +107,6 @@ track_builder:
 
 data_source:
   _target_: unirl.data.sft.SupervisedDataSource
-  manifest_path: ${oc.env:SFT_DATA}
-  eval_manifest_path: ${oc.env:SFT_EVAL_DATA,${oc.env:SFT_DATA}}
+  train_manifest_path: ${oc.env:SFT_DATA}
+  eval_manifest_path: ${oc.env:SFT_EVAL_DATA,null}
   seed: 42

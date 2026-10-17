@@ -14,7 +14,7 @@
 #   TQ_MC_METADATA_SERVER_PORT   HTTP metadata server   (default 50041)
 #   TQ_MC_RPC_PORT               RPC server             (default 50051)
 #
-# NOTE (taiji H20 pods): 50041 is frequently already bound on these images and
+# NOTE: 50041 is frequently already bound on some cluster images and
 # the metadata server then fails to bind silently — export
 # TQ_MC_METADATA_SERVER_PORT=8080 for both this script and the training run.
 set -uo pipefail

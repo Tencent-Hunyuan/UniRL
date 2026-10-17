@@ -33,11 +33,11 @@ algorithm:
   cppo_delta_b: 0.02             # δ_b floor of the per-sequence dynamic prefix-average budget;
                                  #   δ_b^seq = clamp(P90(D_{1:T}), δ_b, 2·δ_b) (paper Eq. 22).
   loss_agg_mode: seq-mean-token-sum-norm  # per-seq Σ(token loss) / horizon, mean over seqs
-  horizon: 16384                 # fixed length normalizer for seq-mean-token-sum-norm
+  horizon: ${sampling.max_new_tokens}  # fixed length normalizer for seq-mean-token-sum-norm
   # 1.0 — MUST equal sampling.temperature below. Replay tempers logits
   #   (log_softmax(logits / T)) so new_logp (π) and rollout logp (μ) live on the
   #   same distribution ⇒ ratio_mean ≈ 1 on update 1.
-  sampling_temperature: 1.0
+  sampling_temperature: ${sampling.temperature}
   # rollout = anchor the ratio AND the Binary-TV divergence μ = |π − μ| on the
   #   SGLang sampler's emitted logprobs for ALL mini-batch updates. This is the
   #   behavior policy CPPO's trust region is defined against (paper Sec. 4); = the
@@ -67,9 +67,6 @@ rollout:
     backend: native
     pretrained_model_ckpt_path: ${oc.env:QWEN3_PATH,Qwen/Qwen3-30B-A3B-Base}
     tp_size: 8
-    max_new_tokens: 16384
-    temperature: 1.0             # keep == sampling.temperature / sampling_temperature
-    top_p: 1.0
     samples_pre_expanded: true   # trainer pre-expands req by samples_per_prompt; engine emits n=1
     chat_template_kwargs:
       enable_thinking: true       # base model + emergent long CoT; MUST match pipeline.enable_thinking

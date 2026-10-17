@@ -2,16 +2,55 @@
 
 from __future__ import annotations
 
-from typing import Any, Protocol, Tuple, TypeVar, runtime_checkable
+from contextlib import contextmanager
+from typing import Any, Iterator, List, Optional, Protocol, Tuple, TypeVar, runtime_checkable
 
 import torch
 
+from unirl.types.primitives import Texts
 from unirl.types.sampling import ARSamplingParams
 from unirl.types.segments import TextSegment
 
 B = TypeVar("B")
 C = TypeVar("C")
 S = TypeVar("S")
+
+
+def resolve_ar_stop_ids(sampling_params: ARSamplingParams, tokenizer: Any) -> List[int]:
+    """Return deduplicated stop token IDs from ``sampling_params.stop_token_id`` and ``tokenizer.eos_token_id``."""
+    ids: List[int] = []
+    if sampling_params.stop_token_id is not None:
+        ids.append(sampling_params.stop_token_id)
+    eos = tokenizer.eos_token_id
+    if eos is not None:
+        if isinstance(eos, (list, tuple)):
+            ids.extend(int(t) for t in eos)
+        else:
+            ids.append(int(eos))
+    return list(dict.fromkeys(ids))
+
+
+def pack_generated_text_segment(
+    generated_tokens: List[List[int]],
+    per_token_logps: List[List[float]],
+    *,
+    device: torch.device,
+) -> TextSegment:
+    """Pack per-sample token-id and log-prob lists into a varlen ``TextSegment``."""
+    return TextSegment.pack(
+        tokens=[torch.tensor(toks, dtype=torch.long, device=device) for toks in generated_tokens],
+        log_probs=[torch.tensor(lps, dtype=torch.float32, device=device) for lps in per_token_logps],
+    )
+
+
+def concat_optional_tensors(
+    per_sample: Optional[List[Optional[torch.Tensor]]],
+) -> Optional[torch.Tensor]:
+    """Concatenate non-None per-sample tensors along dim 0, or return ``None`` if none are present."""
+    if per_sample is None:
+        return None
+    parts = [t for t in per_sample if t is not None]
+    return torch.cat(parts, dim=0) if parts else None
 
 
 @runtime_checkable
@@ -45,6 +84,23 @@ class ARStep(Protocol[B, C, S]):
     def step(self, model: B, conditions: C, state: S) -> Tuple[torch.Tensor, torch.Tensor, S]: ...
 
 
+@contextmanager
+def select_last_lm_head_row(lm_head: torch.nn.Module) -> Iterator[None]:
+    """Project only the final hidden-state row for a scoped model forward."""
+
+    def _select_hidden_states(_module: torch.nn.Module, args: Tuple[Any, ...]) -> Tuple[Any, ...]:
+        if not args or not isinstance(args[0], torch.Tensor) or args[0].ndim != 3:
+            raise ValueError("select_last_lm_head_row: expected lm_head input shape [B, L, H]")
+        hidden_states = args[0]
+        return (hidden_states[:, -1:, :], *args[1:])
+
+    handle = lm_head.register_forward_pre_hook(_select_hidden_states)
+    try:
+        yield
+    finally:
+        handle.remove()
+
+
 def left_pad_prompt(
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
@@ -73,4 +129,27 @@ def left_pad_prompt(
     return lp_ids, lp_mask
 
 
-__all__ = ["ARSamplingParams", "ARStage", "ARStep", "left_pad_prompt"]
+def decode_text_segment(segment: TextSegment, tokenizer: Any) -> Texts:
+    """Decode each per-sample varlen token chunk via ``tokenizer``."""
+    if segment.tokens is None or segment.cu_seqlens is None:
+        return Texts(texts=[])
+    cu = [int(c) for c in segment.cu_seqlens.tolist()]
+    out: List[str] = []
+    for i in range(len(cu) - 1):
+        chunk = segment.tokens[cu[i] : cu[i + 1]]
+        ids = chunk.tolist() if chunk.numel() > 0 else []
+        out.append(tokenizer.decode(ids, skip_special_tokens=True))
+    return Texts(texts=out)
+
+
+__all__ = [
+    "ARSamplingParams",
+    "ARStage",
+    "ARStep",
+    "concat_optional_tensors",
+    "decode_text_segment",
+    "left_pad_prompt",
+    "pack_generated_text_segment",
+    "resolve_ar_stop_ids",
+    "select_last_lm_head_row",
+]

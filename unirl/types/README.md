@@ -24,6 +24,7 @@ breaking API change: there are no compatibility aliases for the retired types.
 - Lineage is encoded in `Part.sample_ids`: a fork appends a numeric path segment,
   such as `prompt-0/0`. `Part.group_ids` derives immediate-parent groups from
   those paths; `Sample.root_group_ids(i)` derives root-prompt groups.
+  `Sample` rejects a part with a blank, non-string, or repeated sample id.
 - Raw conditioning remains on ancestor `Part.primitives`. `Sample.conditioning()`
   and the role-aware `turns()`, `text_conditioning()`, and
   `vision_conditioning()` views align those ancestors to the frontier. Encoded
@@ -52,7 +53,6 @@ it is not inferred from `sampling_params.samples_per_prompt`.
 | `primitives` | Input `Part.primitives`, keyed by canonical modality (`text`, `image`, `video`, `audio`, or sparse URI container `media`) |
 | `request_conditions` | No single request-level replacement. Keep raw inputs on ancestor `Part.primitives`; the generated part stores the encoded replay inputs in `Part.conditions`. Precomputed diffusion `initial_latents` belong on the generated `LatentSegment.initial_latents` |
 | `sampling_params` | One typed `Part.sampling_params` per generated stage. Composed rollouts use one fork per stage |
-| `stage_config` | Root input `Part.control` |
 | `sigmas` | `DiffusionSamplingParams.sigmas` on the diffusion generation part |
 | `metadata` | Root input `Part.metadata`; use `Sample.root_metadata(part_index)` to align it with descendants |
 | `init_noise_group_ids` | Derived from generated `sample_ids` / `group_ids` by `NoiseRecipe.from_sample(...)`; deterministic eval may override them on the gen `Part` |
@@ -123,13 +123,12 @@ request = RolloutReq(
     group_ids=["prompt-0"],
     primitives={"text": Texts(texts=["Write a caption"])},
     sampling_params={"ar": ar},
-    stage_config={"ar": {"system_instruction": "Be concise"}},
 )
 response = engine.generate(request)
 text_track = response.tracks["ar"]
 ```
 
-After:
+After. Root-input overlays (task, bot_task, chat, ar) live on `Part.control`:
 
 ```python
 from unirl.types.sample import Part, Sample

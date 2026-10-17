@@ -10,6 +10,7 @@ from torch import nn
 
 from unirl.train.backend.sharded_state import (
     StateDict,
+    fresh_adamw_state,
     gather_optimizer_state_dict,
     gather_state_dict,
     load_model_state_dict,
@@ -28,14 +29,14 @@ def gather_ep_model_state_dict(model: nn.Module) -> StateDict:
     """Gather a rank-0 full model state with complete stacked expert tensors."""
     full_state = gather_state_dict(model)
     ps = _parallel_state()
-    rank0 = _current_rank() == 0
+    rank0 = not (dist.is_available() and dist.is_initialized()) or dist.get_rank() == 0
 
     for name, param in ep_named_parameters(model):
         local_block = materialize_local_block(param)
         _validate_local_shape(name, local_block, param)
         stacked = gather_stacked_expert_block(
             local_block,
-            ep_size=int(ps.ep_size),
+            ep_size=ps.ep_size,
             ep_group=ps.ep_group,
         )
         if rank0:
@@ -64,8 +65,8 @@ def load_ep_model_state_dict(
             name,
             state_dict[name],
             local_shape=tuple(param.shape),
-            ep_size=int(ps.ep_size),
-            ep_rank=_ep_rank(ps),
+            ep_size=ps.ep_size,
+            ep_rank=ps.ep_rank,
         )
 
     load_model_state_dict(
@@ -81,34 +82,37 @@ def gather_ep_optimizer_state_dict(
     optimizer: torch.optim.Optimizer,
 ) -> StateDict:
     """Gather rank-0 optimizer state with full stacked EP moments."""
-    full_state = gather_optimizer_state_dict(model, optimizer)
-    ps = _parallel_state()
-    rank0 = _current_rank() == 0
-    rank0_entries = full_state.get("state", {}) if rank0 else {}
+    with fresh_adamw_state(optimizer):
+        full_state = gather_optimizer_state_dict(model, optimizer)
+        ps = _parallel_state()
+        rank0 = not (dist.is_available() and dist.is_initialized()) or dist.get_rank() == 0
+        rank0_entries = full_state.get("state", {}) if rank0 else {}
 
-    for name, param in ep_named_parameters(model):
-        local_entry = optimizer.state.get(param, {})
-        for state_name in sorted(local_entry):
-            value = local_entry[state_name]
-            if not isinstance(value, torch.Tensor) or value.ndim == 0:
-                continue
-            if tuple(value.shape) != tuple(param.shape):
-                raise RuntimeError(
-                    f"EP checkpoint: optimizer state {name!r}/{state_name!r} has "
-                    f"shape {tuple(value.shape)}, expected parameter shape {tuple(param.shape)}."
+        for name, param in ep_named_parameters(model):
+            local_entry = optimizer.state.get(param, {})
+            for state_name in sorted(local_entry):
+                value = local_entry[state_name]
+                if not isinstance(value, torch.Tensor) or value.ndim == 0:
+                    continue
+                if tuple(value.shape) != tuple(param.shape):
+                    raise RuntimeError(
+                        f"EP checkpoint: optimizer state {name!r}/{state_name!r} has "
+                        f"shape {tuple(value.shape)}, expected parameter shape {tuple(param.shape)}."
+                    )
+                local_block = materialize_local_block(value)
+                _validate_local_shape(f"{name}/{state_name}", local_block, param)
+                stacked = gather_stacked_expert_block(
+                    local_block,
+                    ep_size=ps.ep_size,
+                    ep_group=ps.ep_group,
                 )
-            local_block = materialize_local_block(value)
-            _validate_local_shape(f"{name}/{state_name}", local_block, param)
-            stacked = gather_stacked_expert_block(
-                local_block,
-                ep_size=int(ps.ep_size),
-                ep_group=ps.ep_group,
-            )
-            if rank0:
-                entry = rank0_entries.get(name)
-                if entry is None or state_name not in entry:
-                    raise RuntimeError(f"EP checkpoint: gathered optimizer state is missing {name!r}/{state_name!r}.")
-                entry[state_name] = stacked.detach().cpu()
+                if rank0:
+                    entry = rank0_entries.get(name)
+                    if entry is None or state_name not in entry:
+                        raise RuntimeError(
+                            f"EP checkpoint: gathered optimizer state is missing {name!r}/{state_name!r}."
+                        )
+                    entry[state_name] = stacked.detach().cpu()
 
     return full_state
 
@@ -136,8 +140,8 @@ def load_ep_optimizer_state_dict(
                 f"{name}/{state_name}",
                 value,
                 local_shape=tuple(param.shape),
-                ep_size=int(ps.ep_size),
-                ep_rank=_ep_rank(ps),
+                ep_size=ps.ep_size,
+                ep_rank=ps.ep_rank,
             )
         local_entries[name] = local_entry
 
@@ -157,15 +161,9 @@ def _parallel_state():
     from veomni.distributed.parallel_state import get_parallel_state
 
     ps = get_parallel_state()
-    if not getattr(ps, "ep_enabled", False) or int(ps.ep_size) <= 1:
+    if not ps.ep_enabled or ps.ep_size <= 1:
         raise RuntimeError("EP checkpoint helper called while expert parallelism is disabled.")
     return ps
-
-
-def _ep_rank(ps) -> int:
-    if hasattr(ps, "extra_parallel_rank"):
-        return int(ps.extra_parallel_rank("ep"))
-    return int(ps.ep_rank)
 
 
 def _slice_stacked_block(
@@ -201,12 +199,6 @@ def _validate_local_shape(name: str, block: torch.Tensor, param: nn.Parameter) -
             f"EP checkpoint: materialized local block {name!r} has shape "
             f"{tuple(block.shape)}, expected {tuple(param.shape)}."
         )
-
-
-def _current_rank() -> int:
-    if dist.is_available() and dist.is_initialized():
-        return int(dist.get_rank())
-    return 0
 
 
 __all__ = [

@@ -10,7 +10,7 @@ import logging
 import os
 import sys
 import types
-from typing import Optional, Tuple
+from typing import Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -29,8 +29,9 @@ def _stub_package(name: str, path: str) -> types.ModuleType:
     return mod
 
 
-def _install_path_stubs() -> None:
-    """Stub ``veomni`` and ``veomni.models`` so their inits never execute."""
+@functools.cache
+def ensure_installed() -> None:
+    """Install the ``sys.modules`` path stubs (cached, idempotent)."""
     if "veomni" not in sys.modules:
         spec = importlib.util.find_spec("veomni")  # locates; does not execute
         if spec is None or spec.origin is None:
@@ -41,24 +42,11 @@ def _install_path_stubs() -> None:
         _stub_package("veomni", pkg_dir)
     else:
         pkg_dir = list(sys.modules["veomni"].__path__)[0]
-    _stub_package("veomni.models", os.path.join(pkg_dir, "models"))
-
-
-def _attach_models_names() -> None:
-    """Populate the ``veomni.models`` stub with the loaders ``torch_parallelize`` name-imports; must run first."""
-    models_mod = sys.modules["veomni.models"]
-    if hasattr(models_mod, "load_model_weights"):
-        return
-    module_utils = importlib.import_module("veomni.models.module_utils")
-    models_mod.load_model_weights = module_utils.load_model_weights
-    models_mod.rank0_load_and_broadcast_weights = module_utils.rank0_load_and_broadcast_weights
-
-
-@functools.cache
-def ensure_installed() -> None:
-    """Install the ``sys.modules`` path stubs (cached, idempotent)."""
-    _install_path_stubs()
-    _attach_models_names()
+    models_mod = _stub_package("veomni.models", os.path.join(pkg_dir, "models"))
+    if not hasattr(models_mod, "load_model_weights"):
+        module_utils = importlib.import_module("veomni.models.module_utils")
+        models_mod.load_model_weights = module_utils.load_model_weights
+        models_mod.rank0_load_and_broadcast_weights = module_utils.rank0_load_and_broadcast_weights
     logger.info("veomni distributed layer installed via selective-import shim")
 
 
@@ -111,19 +99,3 @@ def rank_world_local() -> Tuple[int, int, int]:
     world = int(os.environ.get("WORLD_SIZE", "1"))
     local = int(os.environ.get("LOCAL_RANK", "0"))
     return rank, world, local
-
-
-def ensure_dist_initialized(local_rank: Optional[int] = None) -> None:
-    """Idempotently bring up the default process group."""
-    import torch
-    import torch.distributed as dist
-
-    if torch.cuda.is_available() and local_rank is not None:
-        torch.cuda.set_device(local_rank)
-    if not dist.is_initialized():
-        dist.init_process_group()
-        logger.info(
-            "ensure_dist_initialized: default process group up (rank=%s world=%s)",
-            dist.get_rank(),
-            dist.get_world_size(),
-        )

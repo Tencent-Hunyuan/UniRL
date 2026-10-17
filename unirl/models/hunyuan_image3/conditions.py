@@ -2,18 +2,36 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, ClassVar, Dict, Optional
+from dataclasses import dataclass, replace
+from typing import Any, ClassVar, Dict, Optional, Tuple
 
 import torch
 
 from unirl.distributed.tensor.batch import Batch, FieldKind, concat_field, field
+from unirl.distributed.tensor.ref import hydrate
 from unirl.types.conditions import (
     Condition,
     FusedMultimodalCondition,
     ImageEmbedCondition,
     Modality,
 )
+
+
+def _pad_seq(t: Any, length: int, dim: int = -1) -> Optional[torch.Tensor]:
+    """Zero-pad negative ``dim`` up to ``length``, hydrating a ``TensorRef``; longer tensors pass through."""
+    t = hydrate(t)
+    if t is None or t.shape[dim] >= length:
+        return t
+    return torch.nn.functional.pad(t, (0, 0) * (-dim - 1) + (0, length - t.shape[dim]))
+
+
+def _pad_positions(t: Any, length: int) -> Optional[torch.Tensor]:
+    """Pad ``position_ids`` with continuing indices, since they are KV-cache write slots — README ``## Gotchas``."""
+    t = hydrate(t)
+    if t is None or t.shape[-1] >= length:
+        return t
+    tail = torch.arange(t.shape[-1], length, dtype=t.dtype, device=t.device)
+    return torch.cat([t, tail.expand(*t.shape[:-1], -1)], dim=-1)
 
 
 @dataclass
@@ -80,75 +98,26 @@ class HunyuanImage3FusedMultimodalCondition(FusedMultimodalCondition):
 
     @classmethod
     def concat(cls, items: list) -> "HunyuanImage3FusedMultimodalCondition":
-        """Override ``Batch.concat`` to pad variable-length L dims before cat."""
-        if not items or len(items) <= 1:
-            from unirl.distributed.tensor.batch import Batch
-
-            return Batch.concat.__func__(cls, items)
-
-        seq_lens = []
-        for item in items:
-            if item.input_ids is not None:
-                seq_lens.append(item.input_ids.shape[-1])
-        if not seq_lens or len(set(seq_lens)) <= 1:
-            from unirl.distributed.tensor.batch import Batch
-
-            return Batch.concat.__func__(cls, items)
+        """Override ``Batch.concat`` to pad ragged L dims before cat."""
+        seq_lens = {item.input_ids.shape[-1] for item in items}
+        if len(seq_lens) <= 1:
+            return super().concat(items)
 
         max_L = max(seq_lens)
-
-        def _materialize(t):
-            # Materialize lazy CONCAT fields before padding and merging.
-            if t is not None and not isinstance(t, torch.Tensor) and hasattr(t, "materialize"):
-                return t.materialize()
-            return t
-
-        def _pad_seq(t, dim=-1, value=0):
-            t = _materialize(t)
-            if t is None:
-                return None
-            cur = t.shape[dim]
-            if cur >= max_L:
-                return t
-            pad_size = max_L - cur
-            ndim = len(t.shape)
-            pad_spec = [0] * (2 * ndim)
-            actual_dim = dim if dim >= 0 else ndim + dim
-            pad_idx = (ndim - 1 - actual_dim) * 2
-            pad_spec[pad_idx + 1] = pad_size
-            return torch.nn.functional.pad(t, pad_spec, value=value)
-
-        def _pad_attn(mask):
-            mask = _materialize(mask)
-            if mask is None:
-                return None
-            if mask.shape[-1] >= max_L:
-                return mask
-            N, H, L, _ = mask.shape
-            padded = torch.zeros(N, H, max_L, max_L, dtype=mask.dtype, device=mask.device)
-            padded[:, :, :L, :L] = mask
-            return padded
-
-        # Materialize every shard so concatenation never mixes tensors and TensorRefs.
         padded_items = [
-            cls(
-                input_ids=_pad_seq(item.input_ids, dim=-1, value=0),
-                attention_mask=_pad_attn(item.attention_mask),
-                position_ids=_pad_seq(item.position_ids, dim=-1, value=0),
-                rope_cache=_pad_seq(item.rope_cache, dim=-2, value=0.0),
-                gen_image_mask=_pad_seq(item.gen_image_mask, dim=-1, value=False),
-                gen_timestep_scatter_index=item.gen_timestep_scatter_index,
-                cond_vae_image_mask=_pad_seq(item.cond_vae_image_mask, dim=-1, value=False),
-                cond_vit_image_mask=_pad_seq(item.cond_vit_image_mask, dim=-1, value=False),
-                cond_timestep_scatter_index=item.cond_timestep_scatter_index,
-                prompt_lengths=item.prompt_lengths,  # [B] — not L-padded
+            replace(
+                item,
+                input_ids=_pad_seq(item.input_ids, max_L),
+                attention_mask=_pad_seq(_pad_seq(item.attention_mask, max_L), max_L, dim=-2),
+                position_ids=_pad_positions(item.position_ids, max_L),
+                rope_cache=_pad_seq(item.rope_cache, max_L, dim=-2),
+                gen_image_mask=_pad_seq(item.gen_image_mask, max_L),
+                cond_vae_image_mask=_pad_seq(item.cond_vae_image_mask, max_L),
+                cond_vit_image_mask=_pad_seq(item.cond_vit_image_mask, max_L),
             )
             for item in items
         ]
-
-        from unirl.distributed.tensor.batch import Batch
-
-        return Batch.concat.__func__(cls, padded_items)
+        return super().concat(padded_items)
 
 
 @dataclass
@@ -163,9 +132,9 @@ class HunyuanImage3VAECondition(Condition):
 class HunyuanImage3DiffusionConditions(Batch):
     """Typed conditions container for HunyuanImage3 DiT-mode diffusion."""
 
-    fused: Optional[HunyuanImage3FusedMultimodalCondition] = field(kind=FieldKind.SHARED, default=None)
+    fused: Optional[HunyuanImage3FusedMultimodalCondition] = field(kind=FieldKind.CONCAT, default=None)
     # Store CFG's unconditional branch separately so B-sample transport preserves it.
-    fused_uncond: Optional[HunyuanImage3FusedMultimodalCondition] = field(kind=FieldKind.SHARED, default=None)
+    fused_uncond: Optional[HunyuanImage3FusedMultimodalCondition] = field(kind=FieldKind.CONCAT, default=None)
     cond_vae: Optional[HunyuanImage3VAECondition] = field(kind=FieldKind.CONCAT, default=None)
     cond_vit: Optional[ImageEmbedCondition] = field(kind=FieldKind.CONCAT, default=None)
     cond_timestep: Optional[torch.Tensor | list[torch.Tensor]] = field(kind=FieldKind.CONCAT, default=None)
@@ -213,7 +182,6 @@ class HunyuanImage3DiffusionConditions(Batch):
             cond_vae=cond_vae,
             cond_vit=cond_vit,
             cond_timestep=d.get("cond_timestep"),
-            tokenizer_output=d.get("tokenizer_output"),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -232,16 +200,30 @@ class HunyuanImage3DiffusionConditions(Batch):
             out["cond_vit"] = self.cond_vit
         if self.cond_timestep is not None:
             out["cond_timestep"] = self.cond_timestep
-        if self.tokenizer_output is not None:
-            out["tokenizer_output"] = self.tokenizer_output
+        # tokenizer_output stays off the wire: only the sampling KV cache reads it, and under CFG it has 2*B rows.
         return out
+
+
+def split_cfg_fused(
+    fused: HunyuanImage3FusedMultimodalCondition, batch_size: int, *, cfg: bool
+) -> Tuple[HunyuanImage3FusedMultimodalCondition, Optional[HunyuanImage3FusedMultimodalCondition]]:
+    """Split the tokenizer's guided ``[cond; uncond]`` fused batch into B-row ``(fused, fused_uncond)``."""
+    expected = batch_size * (2 if cfg else 1)
+    actual = int(fused.input_ids.shape[0])
+    if actual != expected:
+        raise ValueError(
+            f"HunyuanImage3 tokenizer batch mismatch: expected {expected} fused rows for B={batch_size}, got {actual}."
+        )
+    if not cfg:
+        return fused, None
+    return fused.slice(0, batch_size), fused.slice(batch_size, 2 * batch_size)
 
 
 @dataclass
 class HunyuanImage3ARConditions(Batch):
     """Typed conditions container for HunyuanImage3 AR-mode autoregress."""
 
-    fused: Optional[HunyuanImage3FusedMultimodalCondition] = field(kind=FieldKind.SHARED, default=None)
+    fused: Optional[HunyuanImage3FusedMultimodalCondition] = field(kind=FieldKind.CONCAT, default=None)
     cond_vae: Optional[HunyuanImage3VAECondition] = field(kind=FieldKind.CONCAT, default=None)
     cond_vit: Optional[ImageEmbedCondition] = field(kind=FieldKind.CONCAT, default=None)
     cond_timestep: Optional[torch.Tensor | list[torch.Tensor]] = field(kind=FieldKind.CONCAT, default=None)
@@ -304,4 +286,5 @@ __all__ = [
     "HunyuanImage3DiffusionConditions",
     "HunyuanImage3FusedMultimodalCondition",
     "HunyuanImage3VAECondition",
+    "split_cfg_fused",
 ]

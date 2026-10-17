@@ -6,7 +6,7 @@ from typing import Callable
 import pytest
 import torch
 
-from unirl.algorithms.base import _require_replay_anchor_for_batched_replay, _transition_sigma
+from unirl.algorithms.base import _gaussian_kl_div, _require_replay_anchor_for_batched_replay, _transition_sigma
 from unirl.models.hunyuan_video10.conditions import HunyuanVideo10Conditions
 from unirl.models.hunyuan_video10.diffusion import HunyuanVideo10DiffusionStage, HunyuanVideo10DiffusionStep
 from unirl.models.hunyuan_video15.conditions import HunyuanVideo15Conditions
@@ -139,10 +139,6 @@ class _GenericBatchedStage(BatchedStepReplayMixin):
         self.logprob_dtype = torch.float32
         self.trajectory_dtype = torch.float32
 
-    @staticmethod
-    def _tile_conditions(conditions: WAN21Conditions, repeats: int) -> WAN21Conditions:
-        return WAN21Conditions.concat([conditions] * repeats)
-
 
 def _params(*, guidance_scale: float = 1.0, num_frames: int = 5) -> DiffusionSamplingParams:
     return DiffusionSamplingParams(
@@ -198,7 +194,11 @@ def test_dense_video_grouped_replay_matches_serial_forward_and_backward(family: 
         def stage_factory(grouped: bool):
             bundle = SimpleNamespace(
                 transformer=_VideoTransformer(),
-                vae=SimpleNamespace(config=SimpleNamespace(latent_channels=CHANNELS)),
+                vae=SimpleNamespace(
+                    spatial_compression_ratio=8,
+                    temporal_compression_ratio=4,
+                    config=SimpleNamespace(latent_channels=CHANNELS),
+                ),
                 device=torch.device("cpu"),
             )
             return HunyuanVideo10DiffusionStage(
@@ -214,7 +214,11 @@ def test_dense_video_grouped_replay_matches_serial_forward_and_backward(family: 
         def stage_factory(grouped: bool):
             bundle = SimpleNamespace(
                 transformer=_VideoTransformer(),
-                vae=SimpleNamespace(config=SimpleNamespace(latent_channels=CHANNELS)),
+                vae=SimpleNamespace(
+                    spatial_compression_ratio=16,
+                    temporal_compression_ratio=4,
+                    config=SimpleNamespace(latent_channels=CHANNELS),
+                ),
                 device=torch.device("cpu"),
             )
             return HunyuanVideo15DiffusionStage(
@@ -309,7 +313,11 @@ def test_hunyuan_video15_grouped_replay_preserves_cfg_batch_order() -> None:
     def stage_factory(grouped: bool):
         bundle = SimpleNamespace(
             transformer=_VideoTransformer(),
-            vae=SimpleNamespace(config=SimpleNamespace(latent_channels=CHANNELS)),
+            vae=SimpleNamespace(
+                spatial_compression_ratio=16,
+                temporal_compression_ratio=4,
+                config=SimpleNamespace(latent_channels=CHANNELS),
+            ),
             device=torch.device("cpu"),
         )
         return HunyuanVideo15DiffusionStage(
@@ -362,14 +370,14 @@ def test_ltx2_grouped_replay_matches_serial_video_audio_backward(
 
 
 @pytest.mark.parametrize(
-    ("sample_ndim", "expected_shape"),
+    ("sample_shape", "expected_shape"),
     [
-        (6, (1, 2, 1, 1, 1, 1)),
-        (4, (1, 2, 1, 1)),
+        ((BATCH, 2, CHANNELS, 2, 2, 2), (BATCH, 2, CHANNELS, 2, 2, 2)),
+        ((BATCH, 2, 12, CHANNELS), (BATCH, 2, 12, CHANNELS)),
     ],
 )
 def test_transition_sigma_broadcasts_to_video_and_packed_av_means(
-    sample_ndim: int,
+    sample_shape: tuple[int, ...],
     expected_shape: tuple[int, ...],
 ) -> None:
     stage = SimpleNamespace(strategy=FlowSDEStrategy())
@@ -380,9 +388,12 @@ def test_transition_sigma_broadcasts_to_video_and_packed_av_means(
         target_steps=[2, 0],
         eta=0.7,
         device=torch.device("cpu"),
-        sample_ndim=sample_ndim,
     )
-    assert tuple(sigma.shape) == expected_shape
+    assert tuple(sigma.shape) == (2,)
+    p = torch.ones(sample_shape)
+    q = torch.zeros(sample_shape)
+    kl = _gaussian_kl_div(p, q, sigma)
+    assert tuple(kl.shape) == expected_shape
 
 
 def test_grouped_video_replay_requires_replay_anchor() -> None:
@@ -390,5 +401,3 @@ def test_grouped_video_replay_requires_replay_anchor() -> None:
     with pytest.raises(ValueError, match="old_logp_source='replay'"):
         _require_replay_anchor_for_batched_replay(stage, "rollout", algo="FlowGRPO")
     _require_replay_anchor_for_batched_replay(stage, "replay", algo="FlowGRPO")
-    experimental = SimpleNamespace(batch_replay_steps=True, allow_batched_rollout_anchor=True)
-    _require_replay_anchor_for_batched_replay(experimental, "rollout", algo="FlowGRPO")

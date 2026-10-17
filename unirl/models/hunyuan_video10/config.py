@@ -24,7 +24,6 @@ class HunyuanVideo10PipelineConfig:
     trajectory_precision: str = "fp16"
     logprob_precision: str = "fp32"
     batch_replay_steps: bool = False
-    allow_batched_rollout_anchor: bool = False
 
     shift: float = 5.0
 

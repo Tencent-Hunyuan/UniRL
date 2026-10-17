@@ -1,4 +1,4 @@
-"""VideoPickScore reward scorer — PickScore on the first frame of a video."""
+"""VideoPickScore reward scorer — PickScore on ONE representative frame of a video."""
 
 from __future__ import annotations
 
@@ -7,25 +7,35 @@ from typing import TYPE_CHECKING, List
 
 import torch
 
-from unirl.reward.base import BaseRewardComponentSpec
 from unirl.types.reward import RewardRequest
 from unirl.utils.media import tensor_frame_to_pil
 
-from .pickscore import PickScoreRewardScorer
+from .pickscore import PickScoreRewardScorer, PickScoreSpec
 
 if TYPE_CHECKING:
     from PIL import Image
 
 
 class VideoPickScoreScorer(PickScoreRewardScorer):
-    """PickScore applied to the first frame of each video."""
+    """PickScore applied to ONE frame of each video (``frame_selection``)."""
 
     canonical_model_name = "videopickscore"
     input_kind = "video"
 
+    def __init__(self, *, config: "VideoPickScoreSpec", base_device: str) -> None:
+        self.frame_selection = str(config.frame_selection)
+        if self.frame_selection not in ("first", "middle"):
+            raise ValueError(
+                f"VideoPickScoreSpec.frame_selection must be 'first' or 'middle'; got {self.frame_selection!r}"
+            )
+        super().__init__(config=config, base_device=base_device)
+
+    def covers_prompt_video(self) -> bool:
+        return True
+
     @staticmethod
-    def _extract_first_frame(video: torch.Tensor) -> "Image.Image":
-        """Extract the first frame of a channel-first video tensor."""
+    def _extract_frame(video: torch.Tensor, which: str) -> "Image.Image":
+        """Extract one frame of a channel-first video tensor."""
         if not isinstance(video, torch.Tensor):
             raise TypeError(f"Expected torch.Tensor, got {type(video).__name__}")
         v = video
@@ -39,7 +49,8 @@ class VideoPickScoreScorer(PickScoreRewardScorer):
                     f"got shape {tuple(v.shape)}. Verify that the upstream "
                     f"engine.decode_latents returns channel-first video tensors."
                 )
-            frame = v[:, 0, :, :]
+            t = int(v.shape[1])
+            frame = v[:, (t // 2) if which == "middle" else 0, :, :]
         elif v.dim() == 3:
             c = int(v.shape[0])
             if c not in (1, 3, 4):
@@ -64,26 +75,22 @@ class VideoPickScoreScorer(PickScoreRewardScorer):
 
             from unirl.types.primitives import Images
 
-            pil_frames = [self._extract_first_frame(v) for v in request.videos]
+            pil_frames = [self._extract_frame(v, self.frame_selection) for v in request.videos]
             frame_pixels = torch.stack([to_tensor(f) for f in pil_frames])
             request = RewardRequest(
-                primitives=dict(request.primitives),
                 generated={"image": Images.from_dense(frame_pixels)},
-                prompt_ids=request.prompt_ids,
+                conditioning=dict(request.conditioning),
+                original_prompt=request.original_prompt,
+                generation_prompt=request.generation_prompt,
                 sample_ids=request.sample_ids,
                 group_ids=request.group_ids,
                 metadata=request.metadata,
-                reward_types=request.reward_types,
-                return_components=request.return_components,
             )
         return super()._compute_model_rewards(request)
 
 
 @dataclass
-class VideoPickScoreSpec(BaseRewardComponentSpec):
+class VideoPickScoreSpec(PickScoreSpec):
     """Typed config for the VideoPickScore reward component."""
 
-    batch_size: int = 8
-    device: str = "auto"
-    processor_id: str = "laion/CLIP-ViT-H-14-laion2B-s32B-b79K"
-    model_id: str = "yuvalkirstain/PickScore_v1"
+    frame_selection: str = "first"

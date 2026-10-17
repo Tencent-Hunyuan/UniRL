@@ -9,11 +9,18 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple, Type
 import torch
 
 from unirl.sde.index_schedule import normalize_timestep_fraction
+from unirl.train.lora import adapters_disabled
 from unirl.types.conditions import Condition
 from unirl.types.segments.latent import LatentSegment
 from unirl.utils.metrics import aggregate_numeric_metrics
 
-from .base import AlgorithmStepResult, BaseAlgorithmConfig, StageAlgorithm
+from .base import (
+    AlgorithmStepResult,
+    BaseAlgorithmConfig,
+    StageAlgorithm,
+    _resolve_reference_model,
+    typed_conditions,
+)
 
 
 @dataclass
@@ -21,14 +28,14 @@ class DiffusionNFTConfig(BaseAlgorithmConfig):
     """Per-call DiffusionNFT loss hyperparameters."""
 
     beta: float = 1.0
-    adv_clip_max: float = 5.0
+    adv_std_saturate: float = 5.0
     adv_mode: str = "raw"
     use_adaptive_weight: bool = True
     train_timestep_mode: str = "all"
     shuffle_train_timesteps: bool = True
     apply_time_shift_in_loss: bool = False
     training_timestep_fraction: float = 0.99
-    kl_coef: float = 0.0
+    ref_deviation_coef: float = 0.0
 
 
 class DiffusionNFT(StageAlgorithm):
@@ -46,14 +53,14 @@ class DiffusionNFT(StageAlgorithm):
         nft_lora_policy: Any = None,
         backend: Any = None,
         beta: float = 1.0,
-        adv_clip_max: float = 5.0,
+        adv_std_saturate: float = 5.0,
         adv_mode: str = "raw",
         use_adaptive_weight: bool = True,
         train_timestep_mode: str = "all",
         shuffle_train_timesteps: bool = True,
         apply_time_shift_in_loss: bool = False,
         training_timestep_fraction: float = 0.99,
-        kl_coef: float = 0.0,
+        ref_deviation_coef: float = 0.0,
         conditions_cls: Optional[Type[Any]] = None,
     ) -> None:
         if stage is None and pipeline is not None:
@@ -61,7 +68,7 @@ class DiffusionNFT(StageAlgorithm):
         if stage is None:
             raise ValueError("DiffusionNFT: either `stage` or `pipeline` must be provided")
         if nft_lora_policy is None and backend is not None:
-            nft_lora_policy = getattr(backend, "ema", None)
+            nft_lora_policy = backend.ema
         if adv_mode != "raw":
             raise ValueError(f"DiffusionNFT: adv_mode={adv_mode!r} not supported (only 'raw' is wired).")
         if train_timestep_mode not in ("all", "random"):
@@ -74,15 +81,12 @@ class DiffusionNFT(StageAlgorithm):
             raise ValueError(
                 f"DiffusionNFT: training_timestep_fraction must lie in (0, 1]; got {training_timestep_fraction!r}."
             )
-        if float(kl_coef) > 0:
-            raise ValueError(
-                "DiffusionNFT: kl_coef > 0 not supported (KL penalty against base "
-                "model not implemented in this revision)."
-            )
+        if not math.isfinite(float(ref_deviation_coef)) or float(ref_deviation_coef) < 0:
+            raise ValueError(f"DiffusionNFT: ref_deviation_coef must be finite and >= 0; got {ref_deviation_coef!r}.")
         if not (0.0 < float(beta)):
             raise ValueError(f"DiffusionNFT: beta must be > 0; got {beta!r}.")
-        if not (0.0 < float(adv_clip_max)):
-            raise ValueError(f"DiffusionNFT: adv_clip_max must be > 0; got {adv_clip_max!r}.")
+        if not (0.0 < float(adv_std_saturate)):
+            raise ValueError(f"DiffusionNFT: adv_std_saturate must be > 0; got {adv_std_saturate!r}.")
 
         if not callable(getattr(nft_lora_policy, "use_shadow", None)):
             raise TypeError(
@@ -95,16 +99,22 @@ class DiffusionNFT(StageAlgorithm):
         self.params = params
         self.nft_lora_policy = nft_lora_policy
         self.conditions_cls = conditions_cls
+        # The reference is the LoRA-disabled base policy, not the EMA shadow: the
+        # shadow tracks the policy, so it cannot anchor drift away from it. Resolved
+        # after the scalar checks — it walks `named_parameters()` to find the adapter.
+        self._ref_model = _resolve_reference_model(
+            backend, beta=float(ref_deviation_coef), algo="DiffusionNFT", coef_name="ref_deviation_coef"
+        )
         self.config = DiffusionNFTConfig(
             beta=float(beta),
-            adv_clip_max=float(adv_clip_max),
+            adv_std_saturate=float(adv_std_saturate),
             adv_mode=str(adv_mode),
             use_adaptive_weight=bool(use_adaptive_weight),
             train_timestep_mode=str(train_timestep_mode),
             shuffle_train_timesteps=bool(shuffle_train_timesteps),
             apply_time_shift_in_loss=bool(apply_time_shift_in_loss),
             training_timestep_fraction=float(training_timestep_fraction),
-            kl_coef=float(kl_coef),
+            ref_deviation_coef=float(ref_deviation_coef),
         )
 
     def compute_loss_and_backward(
@@ -122,7 +132,7 @@ class DiffusionNFT(StageAlgorithm):
                 "the last trajectory position); got None. Forward-process "
                 "rollout must populate the dense latents path."
             )
-        x0 = segment.latents[:, -1]
+        x0 = self.stage.nft_clean_latents(segment)
         if x0.numel() == 0:
             return AlgorithmStepResult(
                 loss=0.0,
@@ -130,18 +140,19 @@ class DiffusionNFT(StageAlgorithm):
                 num_steps_or_tokens=0,
                 has_backward=False,
             )
-        B = int(x0.shape[0])
+        B = x0.shape[0]
         device = x0.device
-        compute_dtype = self._compute_dtype(x0)
+        # fp32 timestep tensor — forward-diffusion arithmetic loses too much precision in bf16 near the endpoints.
+        compute_dtype = torch.float32
 
-        if int(advantages.shape[0]) != B:
+        if advantages.shape[0] != B:
             raise ValueError(
-                f"DiffusionNFT: advantages batch size ({int(advantages.shape[0])}) "
+                f"DiffusionNFT: advantages batch size ({advantages.shape[0]}) "
                 f"does not match clean-latents batch size ({B})."
             )
 
         timesteps = self._resolve_timesteps(segment, B, device, compute_dtype)
-        K = int(timesteps.numel())
+        K = timesteps.numel()
         if K == 0:
             return AlgorithmStepResult(
                 loss=0.0,
@@ -150,16 +161,17 @@ class DiffusionNFT(StageAlgorithm):
                 has_backward=False,
             )
 
-        typed_conds = _typed_conditions(conditions, self.conditions_cls)
+        typed_conds = typed_conditions(conditions, self.conditions_cls)
         adv = advantages.detach().to(dtype=compute_dtype, device=device)
-        adv_clipped = torch.clamp(adv, -self.config.adv_clip_max, self.config.adv_clip_max)
-        r = (adv_clipped / self.config.adv_clip_max) / 2.0 + 0.5
+        sat = self.config.adv_std_saturate
+        adv_sat = torch.clamp(adv, -sat, sat)
+        r = (adv_sat / sat) / 2.0 + 0.5
         r = torch.clamp(r, 0.0, 1.0)
 
         per_iter_metrics: List[Dict[str, float]] = []
         total_loss = 0.0
         has_backward = False
-        iter_scale = float(loss_scale) / float(K)
+        iter_scale = float(loss_scale) / K
 
         for k in range(K):
             t_scalar = timesteps[k]
@@ -227,7 +239,7 @@ class DiffusionNFT(StageAlgorithm):
             )
         old_pred = old_pred.detach()
 
-        beta = float(self.config.beta)
+        beta = self.config.beta
         positive_pred = beta * new_pred + (1.0 - beta) * old_pred
         negative_pred = (1.0 + beta) * old_pred - beta * new_pred
         x0_pos = xt - t_exp * positive_pred
@@ -256,7 +268,11 @@ class DiffusionNFT(StageAlgorithm):
             neg_loss = ((x0_neg - x0_for_mse) ** 2).mean(dim=reduce_dims)
 
         policy_loss = (r * pos_loss / beta + (1.0 - r) * neg_loss / beta).mean()
-        total = policy_loss * float(self.config.adv_clip_max)
+        total = policy_loss * self.config.adv_std_saturate
+
+        ref_deviation = self._reference_deviation(conditions, xt=xt, t_batch=t_batch, new_pred=new_pred)
+        if ref_deviation is not None:
+            total = total + self.config.ref_deviation_coef * ref_deviation
 
         metrics = {
             "policy_loss": float(policy_loss.detach().item()),
@@ -269,7 +285,30 @@ class DiffusionNFT(StageAlgorithm):
             "x0_norm": float((x0**2).mean().detach().item()),
             "t_value": float(t_scalar.detach().item()),
         }
+        if ref_deviation is not None:
+            metrics["ref_prediction_deviation"] = float(ref_deviation.detach().item())
+            metrics["ref_deviation_coef"] = self.config.ref_deviation_coef
         return total, metrics
+
+    def _reference_deviation(
+        self,
+        conditions: Any,
+        *,
+        xt: torch.Tensor,
+        t_batch: torch.Tensor,
+        new_pred: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """Squared-difference penalty pulling the policy toward the LoRA-disabled base model."""
+        if self._ref_model is None:
+            return None
+        with torch.no_grad(), adapters_disabled(self._ref_model):
+            ref_pred = self.stage.predict_noise_at_step(
+                conditions,
+                sample=xt,
+                sigma=t_batch,
+                params=self.params,
+            )
+        return ((new_pred - ref_pred.detach()) ** 2).mean()
 
     def _resolve_timesteps(
         self,
@@ -280,7 +319,7 @@ class DiffusionNFT(StageAlgorithm):
     ) -> torch.Tensor:
         """Resolve the K scalar timesteps for the outer K-iteration loop."""
         mode = self.config.train_timestep_mode
-        frac = float(self.config.training_timestep_fraction)
+        frac = self.config.training_timestep_fraction
         if mode == "all":
             if segment.sigmas is None:
                 raise ValueError(
@@ -300,7 +339,7 @@ class DiffusionNFT(StageAlgorithm):
                 ts = ts[:-1]
             if ts.numel() > 0 and frac != 1.0:
                 start, end = normalize_timestep_fraction(frac)
-                n = int(ts.numel())
+                n = ts.numel()
                 eff_start = int(n * start)
                 eff_end = min(int(n * end), n)
                 ts = ts[eff_start:eff_end] if eff_start < eff_end else ts[:0]
@@ -311,26 +350,10 @@ class DiffusionNFT(StageAlgorithm):
         else:
             raise ValueError(f"DiffusionNFT: unsupported train_timestep_mode={mode!r}")
 
-        if bool(self.config.shuffle_train_timesteps):
-            perm = torch.randperm(int(ts.numel()), device=device)
+        if self.config.shuffle_train_timesteps:
+            perm = torch.randperm(ts.numel(), device=device)
             ts = ts[perm]
         return ts
-
-    @staticmethod
-    def _compute_dtype(x0: torch.Tensor) -> torch.dtype:
-        """fp32 timestep tensor — forward-diffusion arithmetic loses too much precision in bf16 near the endpoints."""
-        del x0
-        return torch.float32
-
-
-def _typed_conditions(
-    conditions: Mapping[str, Condition],
-    conditions_cls: Optional[Type[Any]],
-) -> Any:
-    """Wrap the conditions dict into the stage's typed container, or pass through when no class is given."""
-    if conditions_cls is None:
-        return conditions
-    return conditions_cls.from_dict(dict(conditions))
 
 
 __all__ = ["DiffusionNFT", "DiffusionNFTConfig"]

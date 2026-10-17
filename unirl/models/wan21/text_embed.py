@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, List, Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 import torch
 
@@ -37,9 +37,7 @@ class WAN21TextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
 
     def embed(self, p: Texts) -> TextEmbedCondition:
         """Encode prompts into a ``TextEmbedCondition``."""
-        return self._encode(list(p.texts))
-
-    def _encode(self, prompts: List[str]) -> TextEmbedCondition:
+        prompts = list(p.texts)
         bundle = self.bundle
         device = bundle.device
 

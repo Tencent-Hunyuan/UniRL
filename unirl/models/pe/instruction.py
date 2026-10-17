@@ -2,7 +2,16 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+
+def ar_child_control(control: Dict[str, Any], *, system_instruction: Optional[str]) -> Dict[str, Any]:
+    """Copy parent ``chat``/``ar`` bags for an AR child Part, optionally injecting a system instruction."""
+    child: Dict[str, Any] = {key: dict(control[key]) for key in ("chat", "ar") if key in control}
+    if system_instruction:
+        for key in ("ar", "chat"):
+            child.setdefault(key, {})["system_instruction"] = system_instruction
+    return child
 
 
 def extract_pe_text(raw_text: str, marker: str) -> str:

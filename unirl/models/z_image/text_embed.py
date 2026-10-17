@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import List, Tuple
-
 import torch
 
 from unirl.models.types.embedding import EmbedStage
@@ -27,14 +25,7 @@ class ZImageTextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
 
     def embed(self, p: Texts) -> TextEmbedCondition:
         """Encode prompts into a ``TextEmbedCondition``."""
-        prompt_embeds, prompt_embeds_mask = self._encode(list(p.texts))
-        return TextEmbedCondition(
-            embeds=prompt_embeds,
-            attn_mask=prompt_embeds_mask,
-            pooled=None,
-        )
-
-    def _encode(self, prompts: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
+        prompts = list(p.texts)
         bundle = self.bundle
         device = bundle.device
         dtype = next(bundle.text_encoder.parameters()).dtype
@@ -86,7 +77,11 @@ class ZImageTextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
             [torch.cat([item, item.new_zeros(max_seq_len - item.size(0))]) for item in attn_mask_list]
         )
 
-        return prompt_embeds.to(device=device, dtype=dtype), prompt_embeds_mask
+        return TextEmbedCondition(
+            embeds=prompt_embeds.to(device=device, dtype=dtype),
+            attn_mask=prompt_embeds_mask,
+            pooled=None,
+        )
 
 
 __all__ = ["ZImageTextEmbedStage"]

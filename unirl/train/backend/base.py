@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Dict, Optional
+
+import torch
+
+NamedTensorIterator = Iterator[tuple[str, torch.Tensor]]
+ExpertWeightExportTransform = Callable[[NamedTensorIterator], NamedTensorIterator]
 
 
 @dataclass
@@ -34,7 +40,9 @@ def resolve_trainable_module(bundle: object, trainable_attr: str):
 
 
 __all__ = [
+    "ExpertWeightExportTransform",
     "LrSchedulerConfig",
+    "NamedTensorIterator",
     "OptimizerConfig",
     "resolve_trainable_module",
 ]

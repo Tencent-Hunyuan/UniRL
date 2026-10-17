@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -19,6 +19,7 @@ from unirl.rollout.engine.sglang.utils import (
     build_text_conversations,
     pack_prompt_condition,
 )
+from unirl.rollout.engine.sglang.utils.sampling import derive_sampling_seed
 from unirl.types.primitives import Texts
 from unirl.types.sample import Sample
 from unirl.types.segments.base import SegmentStatus
@@ -39,7 +40,7 @@ class TextLMAdapter(ModelAdapter):
 
     def validate(self) -> None:
         super().validate()
-        forbidden_tokens = list(getattr(self.cfg, "response_forbidden_tokens", None) or [])
+        forbidden_tokens = list(self.cfg.response_forbidden_tokens or [])
         self._response_forbidden_token_ids: Tuple[int, ...] = ()
         if forbidden_tokens:
             vocab = self._tokenizer.get_vocab()
@@ -72,23 +73,30 @@ class TextLMAdapter(ModelAdapter):
         if use_template:
             conversations, k = build_text_conversations(sample, sampling.system_instruction)
             require(
-                k == sampling.n,
+                k == sampling.fanout,
                 f"{type(self).__name__}.build_inputs: de-expanded fan-out k={k} != "
-                f"resolved n={sampling.n}; conversation grouping and the sampling block "
+                f"resolved fanout={sampling.fanout}; conversation grouping and the sampling block "
                 "disagree on the gen branch.",
             )
-            for messages in conversations:
-                payload = self.base_payload(sampling)
+            if sampling.base_seed is not None:
+                conversations = [messages for messages in conversations for _ in range(k)]
+            sample_ids = self._wire_seed_identities(sample, sampling, expected=len(conversations))
+            for messages, sample_id in zip(conversations, sample_ids):
+                payload = self.base_payload(sampling, sample_id=sample_id)
                 ids = self.apply_chat_template(messages)
                 payload["input_ids"] = ids
                 prompt_token_ids.append(list(ids))
                 wire.append(payload)
         else:
-            for prompt in self.extract_prompts(sample):
-                payload = self.base_payload(sampling)
+            prompts = self.extract_prompts(sample)
+            if sampling.base_seed is not None:
+                prompts = [prompt for prompt in prompts for _ in range(sampling.fanout)]
+            sample_ids = self._wire_seed_identities(sample, sampling, expected=len(prompts))
+            for prompt, sample_id in zip(prompts, sample_ids):
+                payload = self.base_payload(sampling, sample_id=sample_id)
                 payload["text"] = prompt
                 ids = list(self._tokenizer.encode(prompt))
-                prompt_token_ids.append(list(ids))
+                prompt_token_ids.append(ids)
                 wire.append(payload)
 
         return PreparedInputs(
@@ -105,7 +113,31 @@ class TextLMAdapter(ModelAdapter):
         )
         return list(text_primitive.texts)
 
-    def base_payload(self, sampling: ResolvedSampling) -> Dict[str, Any]:
+    @staticmethod
+    def _wire_seed_identities(
+        sample: Sample,
+        sampling: ResolvedSampling,
+        *,
+        expected: int,
+    ) -> List[Optional[str]]:
+        """Return sample IDs aligned to wire requests, or ``None`` when no wire seed is needed."""
+        if sampling.base_seed is None:
+            return [None] * expected
+
+        identities = sample.parts[-1].sample_ids
+        require(
+            len(identities) == expected,
+            "SGLang per-request seed derivation requires one stable sample_id per wire request; "
+            f"got {len(identities)} ids for {expected} requests",
+        )
+        return identities
+
+    def base_payload(
+        self,
+        sampling: ResolvedSampling,
+        *,
+        sample_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """The sampling fields every ``/generate`` payload carries."""
         block = dict(sampling.block)
         if self._response_forbidden_token_ids:
@@ -113,10 +145,14 @@ class TextLMAdapter(ModelAdapter):
             for token_id in self._response_forbidden_token_ids:
                 logit_bias[str(token_id)] = -1.0e9
             block["logit_bias"] = logit_bias
-        return {
+        payload = {
             "sampling_params": block,
             "return_logprob": sampling.return_logprob,
         }
+        if sampling.base_seed is not None:
+            require(sample_id is not None, "SGLang per-request seed derivation requires a stable sample_id")
+            payload["sampling_params"]["sampling_seed"] = derive_sampling_seed(sampling.base_seed, sample_id)
+        return payload
 
     def apply_chat_template(self, messages: List[Dict[str, Any]]) -> List[int]:
         """Tokenize a chat conversation into ``input_ids`` via the chat template."""
@@ -125,7 +161,7 @@ class TextLMAdapter(ModelAdapter):
             "tokenize": True,
             "return_dict": False,
         }
-        template_kwargs.update(self.cfg.chat_template_kwargs or {})
+        template_kwargs.update(self.cfg.chat_template_kwargs)
         ids = self._tokenizer.apply_chat_template(messages, **template_kwargs)
         if hasattr(ids, "input_ids"):  # BatchEncoding (return_dict re-enabled)
             ids = ids["input_ids"]
@@ -138,7 +174,7 @@ class TextLMAdapter(ModelAdapter):
     def build_response(self, sample: Sample, prepared: PreparedInputs, raw: List[RawResult]) -> Sample:
         """Fill the frontier gen ``Part`` from the seam's per-candidate results."""
         gen_part = sample.parts[-1]
-        n = int(prepared.resolved_n)
+        n = prepared.resolved_n
         n_prompts = len(prepared.prompt_token_ids)
         require(
             len(raw) == n_prompts * n,
@@ -162,21 +198,21 @@ class TextLMAdapter(ModelAdapter):
     def build_segment(self, sample: Sample, prepared: PreparedInputs, raw: List[RawResult]) -> TextSegment:
         """Pack the per-candidate tokens/logprobs, each row pointing at its own slot."""
         return TextSegment.pack(
-            tokens=[torch.tensor(list(r.token_ids or []), dtype=torch.long) for r in raw],
-            log_probs=[torch.tensor(list(r.logprobs or []), dtype=torch.float32) for r in raw],
+            tokens=[torch.tensor(r.token_ids, dtype=torch.long) for r in raw],
+            log_probs=[torch.tensor(r.logprobs, dtype=torch.float32) for r in raw],
         )
 
     @staticmethod
     def build_status(raw: List[RawResult]) -> torch.Tensor:
         """Per-candidate terminal status from the seam's ``finish_reason``, as a ``[n_candidates]`` long tensor."""
         return torch.tensor(
-            [int(_FINISH_TO_STATUS.get(str(r.finish_reason), SegmentStatus.PENDING)) for r in raw],
+            [_FINISH_TO_STATUS.get(r.finish_reason, SegmentStatus.PENDING) for r in raw],
             dtype=torch.long,
         )
 
     def build_decoded(self, sample: Sample, prepared: PreparedInputs, raw: List[RawResult]) -> Texts:
         """Emit the RAW sampler text per candidate (verl-reference parity)."""
-        return Texts(texts=[r.text or "" for r in raw])
+        return Texts(texts=[r.text for r in raw])
 
     def build_conditions(self, sample: Sample, prepared: PreparedInputs, raw: List[RawResult]) -> Dict[str, Any]:
         """The replay conditions — the prompt ids the server saw, per sample."""
@@ -190,7 +226,7 @@ class TextLMAdapter(ModelAdapter):
     @staticmethod
     def replicate_per_sample(prepared: PreparedInputs) -> Tuple[List[List[int]], List[int]]:
         """Replicate per-prompt values to per-sample rows (prompt-major order)."""
-        n = int(prepared.resolved_n)
+        n = prepared.resolved_n
         per_sample: List[List[int]] = []
         prompt_index: List[int] = []
         for i, ids in enumerate(prepared.prompt_token_ids):

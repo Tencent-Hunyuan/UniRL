@@ -10,28 +10,7 @@ from typing import Any, Dict, Optional
 
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.weight_sync.full.base import FullWeightSync
-
-
-def _shared_run_id(explicit: Optional[str]) -> str:
-    """Return a filesystem-safe id shared by every rank in this Ray job."""
-    raw = str(explicit or os.environ.get("UNIRL_RUN_ID", "")).strip()
-    if not raw:
-        try:
-            import ray
-
-            job_id = ray.get_runtime_context().get_job_id()
-            as_hex = getattr(job_id, "hex", None)
-            raw = str(as_hex() if callable(as_hex) else job_id)
-        except Exception as exc:
-            raise RuntimeError(
-                "CheckpointWeightSync needs a run-unique id to avoid stale/concurrent "
-                "checkpoint markers. Set run_id=... or UNIRL_RUN_ID when no Ray job "
-                "context is available."
-            ) from exc
-    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", raw).strip("._")
-    if not safe:
-        raise ValueError(f"CheckpointWeightSync run_id {raw!r} has no filesystem-safe characters.")
-    return safe
+from unirl.utils.run_id import resolve_run_id
 
 
 class CheckpointWeightSync(FullWeightSync):
@@ -65,7 +44,7 @@ class CheckpointWeightSync(FullWeightSync):
         self._rollout = rollout  # local engine sibling (colocate)
         scope = self._track_prefix or type(rollout).__name__
         scope = re.sub(r"[^A-Za-z0-9_.-]+", "_", scope).strip("._") or "default"
-        self._dir = os.path.join(str(sync_dir), _shared_run_id(run_id), scope)
+        self._dir = os.path.join(str(sync_dir), resolve_run_id(run_id), scope)
         self._wait_timeout_s = float(wait_timeout_s)
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)

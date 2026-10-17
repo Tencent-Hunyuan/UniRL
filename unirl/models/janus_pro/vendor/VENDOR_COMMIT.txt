@@ -1,0 +1,28 @@
+source     = DeepSeek-AI/Janus  (https://github.com/deepseek-ai/Janus)
+commit     = 1daa72fa409002d40931bd7b36a9280362469ead
+short      = 1daa72f
+commit_msg = update citation
+commit_date= 2025-02-01 15:58:14 +0800
+vendored   = 2026-06-28  (into unirl/models/janus_pro/vendor/)
+target     = UniRL @ 57d06bd
+
+Declared integration deviations (see vendor/__init__.py):
+  - import-root rewrite janus.{models,utils} -> unirl.models.janus_pro.vendor.{models,utils}
+  - local minimal attrdict shim for the pinned checkpoint configs in vendor/attrdict.py
+  - dataclass mutable-default compatibility patch in models/modeling_vlm.py
+  - empty all_tied_weights_keys compatibility mapping in models/modeling_vlm.py
+  - grad-safety clone of grad-carrying embeddings before image-placeholder replacement in models/modeling_vlm.py
+  - split/accept cached aligned image embeddings in models/modeling_vlm.py for frozen-tower replay reuse
+  - preserve the input dtype after fp32 interpolation in models/vq_model.py (upstream hardcodes bf16)
+  - drop the 5 nested generic-config AutoConfig registrations (vision/aligner/gen_vision/gen_aligner/gen_head);
+    MultiModalityConfig constructs them directly. The 3 loader registrations stay: multi_modality on
+    AutoConfig + AutoModelForCausalLM (modeling_vlm.py), VLMImageProcessor on AutoImageProcessor
+    (image_processing_vlm.py)
+
+To re-vendor a newer upstream:
+  1. git -C Janus fetch && git -C Janus checkout <new_commit>
+  2. recopy janus/{models,utils} plus LICENSE-CODE into this vendor/ tree
+  3. re-apply the import-root rewrites and local attrdict import rewrites
+  4. re-apply the modeling_vlm transformers-5.x config, registration, grad-safety, and cached-embedding
+     patches plus the vq_model dtype compatibility patch
+  5. bump this file; re-run Janus-Pro import, config compose, and a training smoke

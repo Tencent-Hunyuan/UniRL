@@ -46,6 +46,7 @@ class FlowGRPO(StageAlgorithm):
     requires_backend = True
     anchor_fields = ("sde_logp",)
 
+    @property
     def recomputes_anchor(self) -> bool:
         return self.old_logp_source == "replay"
 
@@ -166,7 +167,6 @@ class FlowGRPO(StageAlgorithm):
                 eta=float(self.params.eta),
                 device=new_logp.device,
                 add_coefficient=True,
-                sample_ndim=new_means.ndim,
             )
             ref_means = _reference_replay_means(
                 self.stage,

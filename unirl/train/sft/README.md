@@ -7,13 +7,21 @@
 *Records stay opaque driver-side; media loading, tokenization and VAE encode all
 happen here, on the training workers.*
 
+**Running SFT?** See [Run supervised fine-tuning](../../trainer/README.md#run-supervised-fine-tuning)
+and the [manifest guide](../../../datasets/sft_manifests/README.md); this page
+owns the builder contracts only.
+
 ## What it is
 
-`ARSupervisedTrackBuilder` (LLM / VLM / agent), `DiffusionSupervisedTrackBuilder`
-and `VideoDiffusionSupervisedTrackBuilder`. Each turns one shard of records into
-the `Part` its algorithm consumes, using the pipeline's own stages — the prompt
-side is whatever rollout would render, so SFT trains on the token sequence
-inference will see.
+| Builder | Consumes | Produces |
+| --- | --- | --- |
+| `ARSupervisedTrackBuilder` | text / VLM / agent rows | AR `Part` — chat-template tokens, loss on targets |
+| `DiffusionSupervisedTrackBuilder` | T2I rows | diffusion `Part` with an x0-only segment (text conditions + VAE latents) |
+| `VideoDiffusionSupervisedTrackBuilder` | T2V rows | video-diffusion `Part` with a clean x0 latent |
+
+Each turns one shard of records into the `Part` its algorithm consumes, using
+the pipeline's own stages — the prompt side is whatever rollout would render,
+so SFT trains on the inputs inference will see.
 
 ## Agent chat-stage contract
 
@@ -50,3 +58,11 @@ supports. There is no base class and no `isinstance` check:
   image-bearing prompt desyncs pixel grids from the remaining pad tokens, and
   cutting a text prompt severs the prompt→target seam. Filter during manifest
   preparation instead.
+- **Encoder caches are namespaced by the frozen encoder, not by `cache_fingerprint`.**
+  Text-condition and VAE-latent cache entries are only valid while the code that
+  wrote them would write them again. An operator revision string cannot be trusted
+  to track a checkpoint, dtype or max-length change — reusing one across models
+  silently trains on stale latents — so the namespace is derived from the frozen
+  weights (structure plus sampled values) and the encode stage's scalar config
+  (e.g. SD3's `max_sequence_length`). `cache_fingerprint` is only an optional salt
+  for isolating caches by hand.
