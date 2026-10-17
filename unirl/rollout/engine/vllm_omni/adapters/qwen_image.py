@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-import torch
-
 from unirl.rollout.engine.vllm_omni.adapters.base import ModelAdapter, register_adapter
 from unirl.rollout.engine.vllm_omni.adapters.dit import DitInputAdapter, DitOutputAdapter
 from unirl.rollout.engine.vllm_omni.backends import GenerateCall, OmniRawResult
@@ -52,24 +50,8 @@ class QwenImageOutputAdapter(DitOutputAdapter):
         n_samples = len(sample.frontier_gen_part(DiffusionSamplingParams).sample_ids)
         cond_dict: Dict[str, Any] = {}
         for name, emb_key, mask_key in specs:
-            pairs = [(c[emb_key], c[mask_key]) for c in captures]
-            max_len = max(int(e.shape[1]) for e, _ in pairs)
-            embeds = [
-                torch.cat([e, e.new_zeros(e.shape[0], max_len - int(e.shape[1]), e.shape[2])], dim=1)
-                if int(e.shape[1]) < max_len
-                else e
-                for e, _ in pairs
-            ]
-            masks = [
-                torch.cat([m, m.new_zeros(m.shape[0], max_len - int(m.shape[1]))], dim=1)
-                if int(m.shape[1]) < max_len
-                else m
-                for _, m in pairs
-            ]
-            condition = TextEmbedCondition(
-                embeds=torch.cat(embeds, dim=0),
-                pooled=None,
-                attn_mask=torch.cat(masks, dim=0),
+            condition = TextEmbedCondition.concat(
+                [TextEmbedCondition(embeds=c[emb_key], attn_mask=c[mask_key]) for c in captures]
             )
             if int(condition.embeds.shape[0]) != n_samples:
                 raise RuntimeError(
