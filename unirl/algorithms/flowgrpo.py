@@ -84,8 +84,13 @@ class FlowGRPO(StageAlgorithm):
             f"FlowGRPO: old_logp_source must be 'rollout' or 'replay'; got {old_logp_source!r}",
         )
         require(
-            timestep_chunk_size is None or timestep_chunk_size >= 1,
-            f"FlowGRPO: timestep_chunk_size must be >= 1; got {timestep_chunk_size!r}",
+            timestep_chunk_size is None
+            or (
+                isinstance(timestep_chunk_size, int)
+                and not isinstance(timestep_chunk_size, bool)
+                and timestep_chunk_size >= 1
+            ),
+            f"FlowGRPO: timestep_chunk_size must be a positive int; got {timestep_chunk_size!r}",
         )
         self.timestep_chunk_size = timestep_chunk_size
         _require_replay_anchor_for_batched_replay(self.stage, self.old_logp_source, algo="FlowGRPO")
@@ -137,6 +142,7 @@ class FlowGRPO(StageAlgorithm):
         clip_range = _resolve_clip_range_from_schedule(self.clip_range, self.clip_schedule, training_progress)
         num_steps = len(target_steps)
         chunks = _slice_step_chunks(target_steps, self.timestep_chunk_size)
+        policy_loss_total = 0.0
         total_loss = 0.0
         kl_ref_total = 0.0
         new_logp_parts: List[torch.Tensor] = []
@@ -162,7 +168,9 @@ class FlowGRPO(StageAlgorithm):
                 advantages=adv_b,
                 clip_range=clip_range,
             )
-            chunk_loss = loss_per_elem.mean()
+            chunk_policy_loss = loss_per_elem.mean()
+            chunk_loss = chunk_policy_loss
+            policy_loss_total += float(chunk_policy_loss.detach().item()) * len(chunk)
             if self.beta > 0.0:
                 new_means = replay_result.prev_sample_means
                 if new_means is None:
@@ -196,6 +204,7 @@ class FlowGRPO(StageAlgorithm):
             new_logp_parts.append(new_logp.detach())
             old_logp_parts.append(old_logp.detach())
 
+        policy_loss_total /= num_steps
         total_loss /= num_steps
         if len(chunks) > 1:
             # Ratio metrics compose only over the full [B, S] set; per-chunk std/min/max would not.
@@ -215,7 +224,7 @@ class FlowGRPO(StageAlgorithm):
             )
 
         metrics: Dict[str, Any] = {
-            "policy_loss": total_loss,
+            "policy_loss": policy_loss_total,
             "clip_range": float(clip_range),
             **{k: float(v.item()) for k, v in ratio_metrics.items()},
         }

@@ -131,8 +131,13 @@ class FlowDPPO(StageAlgorithm):
             f"FlowDPPO: old_logp_source must be 'rollout' or 'replay'; got {old_logp_source!r}",
         )
         require(
-            timestep_chunk_size is None or timestep_chunk_size >= 1,
-            f"FlowDPPO: timestep_chunk_size must be >= 1; got {timestep_chunk_size!r}",
+            timestep_chunk_size is None
+            or (
+                isinstance(timestep_chunk_size, int)
+                and not isinstance(timestep_chunk_size, bool)
+                and timestep_chunk_size >= 1
+            ),
+            f"FlowDPPO: timestep_chunk_size must be a positive int; got {timestep_chunk_size!r}",
         )
         self.timestep_chunk_size = timestep_chunk_size
         _require_replay_anchor_for_batched_replay(self.stage, self.old_logp_source, algo="FlowDPPO")
@@ -191,6 +196,7 @@ class FlowDPPO(StageAlgorithm):
         typed_conds = typed_conditions(conditions, self.conditions_cls)
         num_steps = len(target_steps)
         chunks = _slice_step_chunks(target_steps, self.timestep_chunk_size)
+        policy_loss_total = 0.0
         total_loss = 0.0
         kl_ref_total = 0.0
         weighted_metrics: Dict[str, float] = {}
@@ -238,7 +244,9 @@ class FlowDPPO(StageAlgorithm):
                 kl_mask_threshold=self.kl_mask_threshold,
             )
 
-            chunk_loss = loss_per_elem.mean()
+            chunk_policy_loss = loss_per_elem.mean()
+            chunk_loss = chunk_policy_loss
+            policy_loss_total += float(chunk_policy_loss.detach().item()) * len(chunk)
             if self.beta > 0.0:
                 ref_means = _reference_replay_means(
                     self.stage,
@@ -276,6 +284,7 @@ class FlowDPPO(StageAlgorithm):
                 elif k != "ratio_std":
                     weighted_metrics[k] = weighted_metrics.get(k, 0.0) + val * len(chunk)
 
+        policy_loss_total /= num_steps
         total_loss /= num_steps
         new_logp_all = torch.cat(new_logp_parts, dim=1)
         old_logp_all = torch.cat(old_logp_parts, dim=1)
@@ -283,7 +292,7 @@ class FlowDPPO(StageAlgorithm):
         ratio_std = float(ratio_all.std().item()) if ratio_all.numel() > 1 else 0.0
 
         metrics: Dict[str, Any] = {
-            "policy_loss": total_loss,
+            "policy_loss": policy_loss_total,
             "kl_mask_threshold": float(self.kl_mask_threshold),
             **{k: v / num_steps for k, v in weighted_metrics.items()},
             "ratio_std": ratio_std,
