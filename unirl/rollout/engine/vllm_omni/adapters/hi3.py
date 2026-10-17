@@ -62,48 +62,11 @@ def hi3_fused_conditions(diff_outputs: List[OmniRawResult], *, modality: str) ->
             "the deploy config)."
         )
 
-    sequence_lengths = [int(c["input_ids"].shape[-1]) for c in captures]
-    max_L = max(sequence_lengths)
-
-    padded_captures = []
-    for c, L_i in zip(captures, sequence_lengths):
-        if L_i == max_L:
-            padded_captures.append(c)
-        else:
-            pad_size = max_L - L_i
-            mask = c.get("attention_mask")
-            pos_ids = c.get("position_ids")
-            img_mask = c.get("gen_image_mask")
-            padded_captures.append(
-                {
-                    "input_ids": torch.nn.functional.pad(c["input_ids"], (0, pad_size), value=0),
-                    "attention_mask": (
-                        torch.nn.functional.pad(mask, (0, pad_size, 0, pad_size), value=0)
-                        if isinstance(mask, torch.Tensor)
-                        else mask
-                    ),
-                    "position_ids": (
-                        torch.nn.functional.pad(pos_ids, (0, pad_size), value=0)
-                        if isinstance(pos_ids, torch.Tensor)
-                        else pos_ids
-                    ),
-                    "gen_image_mask": (
-                        torch.nn.functional.pad(img_mask, (0, pad_size), value=False)
-                        if isinstance(img_mask, torch.Tensor)
-                        else img_mask
-                    ),
-                    "gen_timestep_scatter_index": c.get("gen_timestep_scatter_index"),
-                }
-            )
-
-    fused_dict: Dict[str, Any] = {
-        "input_ids": torch.cat([c["input_ids"] for c in padded_captures], dim=0),
-        "attention_mask": torch.cat([c["attention_mask"] for c in padded_captures], dim=0),
-        "position_ids": torch.cat([c["position_ids"] for c in padded_captures], dim=0),
-        "gen_image_mask": torch.cat([c["gen_image_mask"] for c in padded_captures], dim=0),
-        "gen_timestep_scatter_index": torch.cat([c["gen_timestep_scatter_index"] for c in padded_captures], dim=0),
+    return {
+        "fused": HunyuanImage3FusedMultimodalCondition.concat(
+            [HunyuanImage3FusedMultimodalCondition.from_dict(c) for c in captures]
+        )
     }
-    return {"fused": HunyuanImage3FusedMultimodalCondition.from_dict(fused_dict)}
 
 
 def hi3_ar_fused_conditions(per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
