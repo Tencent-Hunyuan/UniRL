@@ -374,7 +374,7 @@ class LTX2DiffusionStage(BatchedStepReplayMixin, DiffusionStage[LTX2Conditions])
 
         if self.batch_replay_steps and len(target) > 1 and isinstance(self.strategy, SDEStrategy):
             with autocast_ctx:
-                return self._replay_batched_steps(
+                return self._replay_batched_joint_av_steps(
                     conditions,
                     segment=segment,
                     params=params,
@@ -382,6 +382,21 @@ class LTX2DiffusionStage(BatchedStepReplayMixin, DiffusionStage[LTX2Conditions])
                     sigmas=sigmas,
                     sigma_max=sigma_max,
                     device=device,
+                    predict_av_noise=lambda tiled, v_all, a_all, v_sigma, _a_sigma: self.step_kernel.predict_noise(
+                        self.bundle,
+                        v_all,
+                        v_sigma,
+                        tiled,
+                        guidance_scale=guidance_scale,
+                        latent_num_frames=latent_t,
+                        latent_height=latent_h,
+                        latent_width=latent_w,
+                        audio_sample=a_all,
+                        audio_num_frames=audio_t,
+                    ),
+                    audio_in_policy=self._audio_in_policy,
+                    concat_audio_mean=True,
+                    latent_dtype=self.trajectory_dtype,
                 )
 
         with autocast_ctx:
@@ -454,97 +469,6 @@ class LTX2DiffusionStage(BatchedStepReplayMixin, DiffusionStage[LTX2Conditions])
         log_probs_t = torch.stack(log_probs, dim=1).to(dtype=self.logprob_dtype)
         means_t = torch.stack(prev_sample_means, dim=1) if prev_sample_means else None
         return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
-
-    def _replay_batched_steps(
-        self,
-        conditions: LTX2Conditions,
-        *,
-        segment: LatentSegment,
-        params: DiffusionSamplingParams,
-        target: List[int],
-        sigmas: torch.Tensor,
-        sigma_max: torch.Tensor,
-        device: torch.device,
-    ) -> ReplayResult:
-        """Replay all LTX-2 targets with aligned video and audio trajectories."""
-        S = len(target)
-
-        sample_all = torch.cat(
-            [segment.latents_at(i).to(device=device, dtype=self.trajectory_dtype) for i in target],
-            dim=0,
-        )
-        prev_all = torch.cat(
-            [segment.latents_at(i + 1).to(device=device, dtype=self.trajectory_dtype) for i in target],
-            dim=0,
-        )
-        audio_all = torch.cat(
-            [segment.aux_latents_at(i).to(device=device, dtype=self.trajectory_dtype) for i in target],
-            dim=0,
-        )
-        B = sample_all.shape[0] // S
-        sigma_all = torch.cat([sigmas[i].to(torch.float32).expand(B) for i in target], dim=0)
-        sigma_next_all = torch.cat([sigmas[i + 1].to(torch.float32).expand(B) for i in target], dim=0)
-        tiled = self._tile_conditions(conditions, S)
-        latent_t, latent_h, latent_w = self._latent_geometry(params)
-        audio_t = _audio_num_frames(params.num_frames, _LTX2_FRAME_RATE)
-
-        video_pred, audio_pred = self.step_kernel.predict_noise(
-            self.bundle,
-            sample_all,
-            sigma_all,
-            tiled,
-            guidance_scale=params.guidance_scale,
-            latent_num_frames=latent_t,
-            latent_height=latent_h,
-            latent_width=latent_w,
-            audio_sample=audio_all,
-            audio_num_frames=audio_t,
-        )
-        _, log_prob_all, prev_mean_all = self.strategy.denoise(
-            noise_pred=video_pred,
-            sample=sample_all,
-            sigma=sigma_all,
-            sigma_next=sigma_next_all,
-            eta=params.eta,
-            prev_sample=prev_all,
-            sigma_max=sigma_max,
-            step_index=target[0],
-        )
-        if log_prob_all is None:
-            raise RuntimeError("LTX2 grouped replay requires a stochastic video SDE strategy")
-
-        if self._audio_in_policy:
-            audio_prev_all = torch.cat(
-                [segment.aux_latents_at(i + 1).to(device=device, dtype=self.trajectory_dtype) for i in target],
-                dim=0,
-            )
-            _, audio_log_prob_all, audio_prev_mean_all = self.strategy.denoise(
-                noise_pred=audio_pred,
-                sample=audio_all,
-                sigma=sigma_all,
-                sigma_next=sigma_next_all,
-                eta=params.eta,
-                prev_sample=audio_prev_all,
-                sigma_max=sigma_max,
-                step_index=target[0],
-            )
-            if audio_log_prob_all is None:
-                raise RuntimeError("LTX2 grouped replay requires a stochastic audio SDE strategy")
-            log_prob_all = combine_modality_logp(
-                log_prob_all,
-                audio_log_prob_all,
-                n_video=sample_all[0].numel(),
-                n_audio=audio_all[0].numel(),
-            )
-            if prev_mean_all is not None and audio_prev_mean_all is not None:
-                prev_mean_all = torch.cat([prev_mean_all, audio_prev_mean_all], dim=1)
-
-        log_probs = log_prob_all.view(S, B).transpose(0, 1).contiguous().to(dtype=self.logprob_dtype)
-        means = None
-        if prev_mean_all is not None:
-            tail = prev_mean_all.shape[1:]
-            means = prev_mean_all.view(S, B, *tail).transpose(0, 1).contiguous()
-        return ReplayResult(log_probs=log_probs, prev_sample_means=means)
 
 
 __all__ = ["LTX2DiffusionStep", "LTX2DiffusionStage"]
