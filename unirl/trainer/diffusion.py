@@ -835,11 +835,12 @@ class DiffusionTrainer(BaseTrainer):
 
     def _stamp_sde_index_per_sample(self, sample: Sample, sde_index: int) -> None:
         """Stamp ``segment.sde_index_per_sample`` and normalize shared step metadata for group concat."""
-        segment = sample.parts[-1].segment
+        frontier = sample.parts[-1]
+        segment = frontier.segment
         if segment is None:
             raise ValueError("FlashGRPO: a step group's rollout returned no segment to stamp sde_index_per_sample on.")
         step = int(sde_index)
-        segment.sde_index_per_sample = torch.full((int(sample.parts[-1].batch_size),), step, dtype=torch.long)
+        segment.sde_index_per_sample = torch.full((int(frontier.batch_size),), step, dtype=torch.long)
         if segment.indices is not None and segment.latents is not None:
             before = segment.latents_at(step)
             after = segment.latents_at(step + 1)
@@ -848,6 +849,8 @@ class DiffusionTrainer(BaseTrainer):
             segment.indices = torch.arange(3, dtype=torch.long, device=segment.indices.device)
         if segment.sde_indices is not None:
             segment.sde_indices = torch.zeros(1, dtype=torch.long, device=segment.sde_indices.device)
+        if frontier.sampling_params is not None and hasattr(frontier.sampling_params, "sde_indices"):
+            frontier.sampling_params = dataclasses.replace(frontier.sampling_params, sde_indices=None)
 
     def _prepare_for_save(self) -> None:
         """Checkpointing reads the trainer's weights, and evaluate() may have parked them."""
