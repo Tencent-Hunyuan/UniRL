@@ -111,13 +111,17 @@ class AllSDEScheduler(TimestepScheduler):
     def get_sde_indices(self, step: Optional[int] = None) -> Set[int]:
         if self.num_sde_steps == 0:
             return set()
-        pool = list(range(self._effective_start, self._effective_end))
+        pool = self.sde_candidate_pool()
         if self.num_sde_steps is None or self.num_sde_steps >= len(pool):
             return set(pool)
         seed = 0 if step is None else int(step)
         rng = np.random.default_rng(seed)
         chosen = rng.choice(pool, size=self.num_sde_steps, replace=False)
         return set(int(i) for i in chosen)
+
+    def sde_candidate_pool(self) -> List[int]:
+        """Every step eligible to carry an SDE transition, independent of how many are drawn."""
+        return list(range(self._effective_start, self._effective_end))
 
 
 class WindowScheduler(TimestepScheduler):

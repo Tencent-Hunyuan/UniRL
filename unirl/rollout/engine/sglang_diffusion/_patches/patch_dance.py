@@ -1,4 +1,4 @@
-"""REPLACE ``SchedulerRLMixin.flow_sde_sampling`` to add DanceGRPO and score the emitted transition."""
+"""REPLACE ``SchedulerRLMixin.flow_sde_sampling`` to add DanceGRPO/FlashGRPO and score the emitted transition."""
 
 from __future__ import annotations
 
@@ -10,19 +10,22 @@ _LOG_SQRT_2PI = math.log(math.sqrt(2 * math.pi))
 
 
 def patch_dance() -> None:
-    """Add ``dance`` to the rollout sde-type whitelist and install the emitted-dtype ``flow_sde_sampling``."""
+    """Add ``dance``/``flash`` to the rollout sde-type whitelist and install the emitted-dtype ``flow_sde_sampling``."""
     import sglang.multimodal_gen.configs.post_training.rl_rollout as rl_rollout
     import sglang.multimodal_gen.runtime.post_training.scheduler_rl_mixin as srm
 
-    if "dance" not in rl_rollout._VALID_ROLLOUT_SDE_TYPES:
-        rl_rollout._VALID_ROLLOUT_SDE_TYPES = tuple(rl_rollout._VALID_ROLLOUT_SDE_TYPES) + ("dance",)
+    valid = tuple(rl_rollout._VALID_ROLLOUT_SDE_TYPES)
+    for name in ("dance", "flash"):
+        if name not in valid:
+            valid = valid + (name,)
+    rl_rollout._VALID_ROLLOUT_SDE_TYPES = valid
 
-    if getattr(srm.SchedulerRLMixin.flow_sde_sampling, "_unirl_dance", False):
+    if getattr(srm.SchedulerRLMixin.flow_sde_sampling, "_unirl_sde_variants", False):
         return
-    srm.SchedulerRLMixin.flow_sde_sampling = _flow_sde_sampling_with_dance
+    srm.SchedulerRLMixin.flow_sde_sampling = _flow_sde_sampling_with_unirl_variants
 
 
-def _flow_sde_sampling_with_dance(
+def _flow_sde_sampling_with_unirl_variants(
     self,
     batch,
     model_output: "torch.FloatTensor",
@@ -31,7 +34,7 @@ def _flow_sde_sampling_with_dance(
     next_sigma: "torch.FloatTensor",
     generator: "torch.Generator",
 ) -> "torch.Tensor":
-    """Re-vendor of upstream ``SchedulerRLMixin.flow_sde_sampling`` + ``dance`` + emitted-dtype log-prob."""
+    """Re-vendor of upstream ``SchedulerRLMixin.flow_sde_sampling`` + ``dance``/``flash`` + emitted-dtype log-prob."""
     rollout_session_data = self._get_rollout_session_data(batch)
     sde_type = batch.rollout_sde_type
     noise_level = float(batch.rollout_noise_level)
@@ -114,6 +117,25 @@ def _flow_sde_sampling_with_dance(
         weighted_variance_noise = variance_noise * noise_std_dev
         prev_sample = prev_sample_mean + weighted_variance_noise
 
+    elif effective_sde_type == "flash":
+        # Flash coefficient sigma_min + (sigma_max - sigma_min) * sigma; see _patches/README.md.
+        model_output = model_output.float()
+        sample = sample.float()
+        variance_noise = self._rollout_variance_noise(batch, model_output, generator)
+        sigma_min_raw = getattr(rollout_session_data, "sigma_min", None)
+        sigma_min = current_sigma.new_tensor(0.0 if sigma_min_raw is None else float(sigma_min_raw))
+        sigma_max_raw = rollout_session_data.sigma_max
+        sigma_max = sigma_max_raw if torch.is_tensor(sigma_max_raw) else current_sigma.new_tensor(float(sigma_max_raw))
+        std_dev_t = (sigma_min + (sigma_max - sigma_min) * current_sigma) * noise_level
+        noise_std_dev = std_dev_t * torch.sqrt(-1 * dt)
+        prev_sample_mean = (
+            sample * (1 + std_dev_t**2 / (2 * current_sigma) * dt)
+            + model_output * (1 + std_dev_t**2 * (1 - current_sigma) / (2 * current_sigma)) * dt
+        )
+
+        weighted_variance_noise = variance_noise * noise_std_dev
+        prev_sample = prev_sample_mean + weighted_variance_noise
+
     elif effective_sde_type == "ode":
         prev_sample = sample + dt * model_output
         prev_sample_mean = prev_sample
@@ -163,4 +185,4 @@ def _flow_sde_sampling_with_dance(
     return prev_sample
 
 
-_flow_sde_sampling_with_dance._unirl_dance = True  # type: ignore[attr-defined]
+_flow_sde_sampling_with_unirl_variants._unirl_sde_variants = True  # type: ignore[attr-defined]
