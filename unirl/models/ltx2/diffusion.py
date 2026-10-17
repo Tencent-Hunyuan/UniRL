@@ -181,7 +181,7 @@ class LTX2DiffusionStage(BatchedStepReplayMixin, DiffusionStage[LTX2Conditions])
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="logprob_precision")
         self.audio_joint_sde = bool(audio_joint_sde)
         self._audio_in_policy = self.audio_joint_sde and bundle.has_audio
-        self.batch_replay_steps = bool(batch_replay_steps)
+        self.batch_replay_steps = batch_replay_steps
 
     def trainable_module(self) -> torch.nn.Module:
         """The trainable transformer (for FSDP wrapping)."""
@@ -508,7 +508,7 @@ class LTX2DiffusionStage(BatchedStepReplayMixin, DiffusionStage[LTX2Conditions])
             eta=params.eta,
             prev_sample=prev_all,
             sigma_max=sigma_max,
-            step_index=int(target[0]),
+            step_index=target[0],
         )
         if log_prob_all is None:
             raise RuntimeError("LTX2 grouped replay requires a stochastic video SDE strategy")
@@ -526,7 +526,7 @@ class LTX2DiffusionStage(BatchedStepReplayMixin, DiffusionStage[LTX2Conditions])
                 eta=params.eta,
                 prev_sample=audio_prev_all,
                 sigma_max=sigma_max,
-                step_index=int(target[0]),
+                step_index=target[0],
             )
             if audio_log_prob_all is None:
                 raise RuntimeError("LTX2 grouped replay requires a stochastic audio SDE strategy")

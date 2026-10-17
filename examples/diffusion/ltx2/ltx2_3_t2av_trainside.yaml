@@ -51,7 +51,6 @@ bundle:
     autocast_precision: bf16
     trajectory_precision: fp16
     logprob_precision: fp32
-    batch_replay_steps: false
     shift: 1.0
     max_sequence_length: 512
     enable_audio: true

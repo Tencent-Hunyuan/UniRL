@@ -33,7 +33,6 @@ pipeline:
   trajectory_precision: fp16
   logprob_precision: fp32
   max_sequence_length: 512
-  batch_replay_steps: false
   strategy:
     _target_: unirl.sde.kernels.FlowSDEStrategy
 

@@ -276,7 +276,7 @@ class HunyuanVideo15DiffusionStage(BatchedStepReplayMixin, DiffusionStage[Hunyua
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="logprob_precision")
         self.vision_num_semantic_tokens = int(vision_num_semantic_tokens)
         self.vision_states_dim = int(vision_states_dim)
-        self.batch_replay_steps = bool(batch_replay_steps)
+        self.batch_replay_steps = batch_replay_steps
 
         vae = model.vae
         if vae is not None:
@@ -477,11 +477,6 @@ class HunyuanVideo15DiffusionStage(BatchedStepReplayMixin, DiffusionStage[Hunyua
             else nullcontext()
         )
 
-        step_kwargs: Dict = {
-            "vision_num_semantic_tokens": self.vision_num_semantic_tokens,
-            "vision_states_dim": self.vision_states_dim,
-        }
-
         if self.batch_replay_steps and len(target) > 1 and isinstance(self.strategy, SDEStrategy):
             with autocast_ctx:
                 return self._replay_batched_steps(
@@ -494,6 +489,7 @@ class HunyuanVideo15DiffusionStage(BatchedStepReplayMixin, DiffusionStage[Hunyua
                     device=device,
                 )
 
+        step_kwargs = self._batched_step_kwargs(segment, params)
         log_probs: List[torch.Tensor] = []
         prev_sample_means: List[torch.Tensor] = []
         with autocast_ctx:
