@@ -228,7 +228,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         autocast_precision: str = "bf16",
         trajectory_precision: str = "fp32",
         logprob_precision: str = "fp32",
-        batch_replay_steps: bool = False,
+        batch_replay_steps: bool,
     ) -> None:
         self.model = model
         self.step = step if step is not None else BagelDiffusionStep()
@@ -236,7 +236,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         self.autocast_dtype = parse_torch_dtype(autocast_precision, field_name="autocast_precision")
         self.trajectory_dtype = parse_torch_dtype(trajectory_precision, field_name="trajectory_precision")
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="logprob_precision")
-        self.batch_replay_steps = bool(batch_replay_steps)
+        self.batch_replay_steps = batch_replay_steps
 
     def _autocast_ctx(self, device: torch.device):
         if device.type == "cuda" and self.autocast_dtype in (torch.float16, torch.bfloat16):
@@ -338,6 +338,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
             image_sizes=image_shapes,
             new_token_ids=self.model.new_token_ids,
         )
+        gi["query_lengths"] = gi["packed_seqlens"].tolist()
         gi_cfg_text = bagel.prepare_vae_latent_cfg(
             curr_kvlens=cfg_text["kv_lens"],
             curr_rope=cfg_text["ropes"],
@@ -642,8 +643,8 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
                 device=device,
             )
             forward_kwargs = self._forward_kwargs(packed_gen, cfg_text, cfg_img, gi, gi_cfg_text, gi_cfg_img, params)
+            forward_kwargs["query_lengths"] = gi["query_lengths"]
             num_tokens = gi["packed_vae_token_indexes"].numel() // repeats
-            forward_kwargs["query_lengths"] = [num_tokens + 2] * repeats
             x_t = torch.stack([segment.latents_at(i)[0][:num_tokens].to(device) for i in target])
             prev_sample = torch.stack([segment.latents_at(i + 1)[0][:num_tokens].to(device) for i in target])
             t_cur = torch.stack([schedule[i] for i in target])
