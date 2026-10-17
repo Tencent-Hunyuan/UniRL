@@ -101,7 +101,7 @@ class MiniMaxH3DiffusionStage(BatchedStepReplayMixin, DiffusionStage[MiniMaxH3Co
         audio_joint_sde: bool = True,
         trajectory_precision: str = "fp16",
         logprob_precision: str = "fp32",
-        batch_replay_steps: bool = False,
+        batch_replay_steps: bool,
     ) -> None:
         self.bundle = bundle
         self.step = MiniMaxH3DiffusionStep(bundle)

@@ -158,16 +158,19 @@ def row_timestep_plan(
             condition_audio_timestep=video_t,
         )
 
-    video_t = (1.0 - video_sigma.detach().reshape(-1).to(device="cpu", dtype=torch.float64)).to(torch.float32)
-    audio_t = (1.0 - audio_sigma.detach().reshape(-1).to(device="cpu", dtype=torch.float64)).to(torch.float32)
+    video_t = (1.0 - video_sigma.detach().reshape(-1).to(dtype=torch.float64)).to(dtype=torch.float32)
+    audio_t = (1.0 - audio_sigma.detach().reshape(-1).to(dtype=torch.float64)).to(
+        device=video_t.device, dtype=torch.float32
+    )
     if video_t.shape != audio_t.shape:
         raise ValueError(
             "row_timestep_plan: video_sigma and audio_sigma must have matching batch shapes, got "
             f"{tuple(video_sigma.shape)} and {tuple(audio_sigma.shape)}"
         )
 
+    audio_target_cols = layout.audio_indices[layout.num_condition_audio_rows :].to(device=video_t.device)
     row_timesteps = video_t[:, None].expand(-1, layout.sequence_length).clone()
-    row_timesteps[:, layout.audio_indices[layout.num_condition_audio_rows :]] = audio_t[:, None]
+    row_timesteps[:, audio_target_cols] = audio_t[:, None]
     return torch.unique(row_timesteps, sorted=True, return_inverse=True)
 
 
