@@ -136,8 +136,9 @@ independently of how many steps `num_sde_steps` draws per rollout.
   It follows `Shredded-Pork/Flash-GRPO@bd6051f`, where
   `std_dev_t = sigma_min + (sigma_max - sigma_min) * sigma` with `sigma_max = sigmas[1]` and
   `sigma_min` captured by `init_schedule` (normally `0` for a FlowMatch schedule). That same
-  expression is duplicated in the SGLang rollout patch, the train-side rectification weight,
-  and `WAN21DiffusionStage._replay_per_sample`; the three must move together or rollout and
+  expression is mirrored in the SGLang rollout patch. Train-side rectification reads
+  `FlashSDEStrategy.transition_std`, while `WAN21DiffusionStage._replay_per_sample` calls the
+  same strategy; these paths must move together or rollout and
   replay score different transitions. `eta` multiplies it so `eta=0` still gives the
   deterministic Euler step.
 - **`init_schedule` is not only a generation-path call.** `FlashSDEStrategy._std_dev_t` raises

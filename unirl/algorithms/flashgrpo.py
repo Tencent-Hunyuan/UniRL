@@ -142,21 +142,22 @@ class FlashGRPO(FlowGRPO):
         loss_per_elem = loss_per_elem * tgr
         loss = loss_per_elem.mean()
 
-        metrics: Dict[str, Any] = {
-            "policy_loss": float(loss.detach().item()),
-            "clip_range": float(clip_range),
-            "flash_tgr_mean": float(tgr.detach().mean().item()),
-            "flash_tgr_min": float(tgr.detach().min().item()),
-            "flash_tgr_max": float(tgr.detach().max().item()),
-            "adv_clip_fraction": float((adv_raw.abs() > self.adv_clip_max).float().mean().item()),
-            "adv_abs_max": float(adv_raw.abs().max().item()),
-            **{k: float(v.item()) for k, v in ratio_metrics.items()},
-        }
-
         (loss * loss_scale).backward()
+        metric_tensors = {
+            "policy_loss": loss.detach(),
+            "flash_tgr_mean": tgr.detach().mean(),
+            "flash_tgr_min": tgr.detach().min(),
+            "flash_tgr_max": tgr.detach().max(),
+            "adv_clip_fraction": (adv_raw.abs() > self.adv_clip_max).float().mean(),
+            "adv_abs_max": adv_raw.abs().max(),
+            **ratio_metrics,
+        }
+        metric_values = torch.stack([value.float() for value in metric_tensors.values()]).cpu().tolist()
+        metrics: Dict[str, Any] = dict(zip(metric_tensors, metric_values))
+        metrics["clip_range"] = float(clip_range)
 
         return AlgorithmStepResult(
-            loss=float(loss.detach().item()),
+            loss=metrics["policy_loss"],
             metrics=metrics,
             num_steps_or_tokens=len(target_steps),
             has_backward=True,
@@ -201,13 +202,12 @@ class FlashGRPO(FlowGRPO):
             raise ValueError("FlashGRPO requires params.eta > 0 on trained SDE steps.")
         sigma = sigmas[:-1].index_select(0, idx)
         sigma_next = sigmas[1:].index_select(0, idx)
-        sqrt_neg_dt = torch.sqrt((sigma - sigma_next).clamp_min(torch.finfo(torch.float32).eps))
         sigma_max = sigmas[1] if int(sigmas.shape[0]) > 1 else torch.tensor(0.99, device=device, dtype=sigmas.dtype)
-        sigma_min = sigmas[-1]
-        std_dev_t = (sigma_min + (sigma_max - sigma_min) * sigma) * eta
-        std_dev_t = std_dev_t.clamp_min(torch.finfo(torch.float32).eps)
+        transition_std = self.stage.strategy.transition_std(
+            sigma=sigma, sigma_next=sigma_next, eta=eta, sigma_max=sigma_max
+        ).clamp_min(torch.finfo(torch.float32).eps)
         sigma_safe = sigma.clamp_min(torch.finfo(torch.float32).eps)
-        denom = sqrt_neg_dt / std_dev_t + std_dev_t * sqrt_neg_dt * (1.0 - sigma) / (2.0 * sigma_safe)
+        denom = (sigma - sigma_next) / transition_std + transition_std * (1.0 - sigma) / (2.0 * sigma_safe)
         return denom.reciprocal()
 
 
