@@ -23,6 +23,7 @@ class HunyuanVideo10PipelineConfig:
     autocast_precision: str = "bf16"
     trajectory_precision: str = "fp16"
     logprob_precision: str = "fp32"
+    batch_replay_steps: bool = False
 
     shift: float = 5.0
 
