@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, Optional
 
 import torch
 
@@ -24,7 +24,7 @@ class PerSampleStepReplayMixin:
         *,
         segment: "LatentSegment",
         params: Any,
-        device: torch.device,
+        device: Optional[torch.device] = None,
     ) -> ReplayResult:
         """``log_probs [N, 1]``, ``prev_sample_means [N, 1, ...]`` from latent slots ``[before, after]``."""
         name = type(self).__name__
@@ -36,19 +36,28 @@ class PerSampleStepReplayMixin:
                 f"{name}._replay_per_sample: expected latents with a [before, after, ...] slot layout "
                 f"(K >= 2); got K={int(segment.latents.shape[1])}."
             )
-        sigmas = segment.sigmas.to(device)
-        step_idx = segment.sde_index_per_sample.to(device=device, dtype=torch.long)
-        if int(step_idx.shape[0]) != num_samples:
+        raw_idx = segment.sde_index_per_sample
+        if raw_idx.ndim != 1 or raw_idx.dtype not in (torch.int32, torch.int64):
             raise ValueError(
-                f"{name}._replay_per_sample: sde_index_per_sample length {int(step_idx.shape[0])} "
+                f"{name}._replay_per_sample: sde_index_per_sample must be a 1-D integer tensor; "
+                f"got dtype={raw_idx.dtype}, shape={tuple(raw_idx.shape)}."
+            )
+        if int(raw_idx.shape[0]) != num_samples:
+            raise ValueError(
+                f"{name}._replay_per_sample: sde_index_per_sample length {int(raw_idx.shape[0])} "
                 f"!= sample count {num_samples}."
             )
+        if device is None:
+            device = segment.latents.device
+        sigmas = segment.sigmas.to(device=device, dtype=torch.float32)
+        step_idx = raw_idx.to(device=device, dtype=torch.long)
         # Pin the strategy's schedule here: only the generation path calls init_schedule,
         # so a remote-engine run that replays from a segment never generates on this rank.
         self.strategy.init_schedule(sigmas)
-        sigma = sigmas[step_idx].to(dtype=torch.float32)
-        sigma_next = sigmas[step_idx + 1].to(dtype=torch.float32)
-        sigma_max = float(sigmas[1].item()) if int(sigmas.shape[0]) > 1 else 0.99
+        # index_select(0, ...) rejects negative and out-of-bounds indices without host sync.
+        sigma = sigmas.index_select(0, step_idx)
+        sigma_next = sigmas.index_select(0, step_idx + 1)
+        sigma_max = sigmas[1] if int(sigmas.shape[0]) > 1 else torch.tensor(0.99, device=device, dtype=torch.float32)
         # Fixed slots, not latents_at(): after the per-step groups merge, the shared
         # ``indices`` map holds one group's steps and is not per-sample valid.
         sample = segment.latents[:, 0].to(device)
