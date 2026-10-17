@@ -37,22 +37,16 @@ class ImageAdapter(ModelAdapter):
 
         diffusion = gen_part.sampling_params
         require(
-            diffusion is not None,
-            "build_inputs: the gen Part must carry diffusion sampling_params",
-        )
-
-        require(
             diffusion.sigmas is not None,
-            "build_inputs: diffusion.sigmas must be pinned by the engine before "
-            "conversion (see SGLangDiffusionRolloutEngine._ensure_sample_sigmas).",
+            "build_inputs: diffusion.sigmas must be pinned by the engine before conversion (see ensure_sample_sigmas).",
         )
         require(
-            int(diffusion.sigmas.shape[0]) == int(diffusion.num_inference_steps) + 1,
-            f"build_inputs: sigmas length {int(diffusion.sigmas.shape[0])} != "
-            f"num_inference_steps+1 ({int(diffusion.num_inference_steps) + 1}).",
+            diffusion.sigmas.shape[0] == diffusion.num_inference_steps + 1,
+            f"build_inputs: sigmas length {diffusion.sigmas.shape[0]} != "
+            f"num_inference_steps+1 ({diffusion.num_inference_steps + 1}).",
         )
 
-        sampler_kwargs: Dict[str, Any] = dict(diffusion.sampler_kwargs or {})
+        sampler_kwargs = diffusion.sampler_kwargs
 
         neg_prompt = sampler_kwargs.get("negative_prompt")
         return_neg_embeds = bool(sampler_kwargs.get("return_negative_prompt_embeds", False))
@@ -64,8 +58,7 @@ class ImageAdapter(ModelAdapter):
             "ratio mismatch). Set return_negative_prompt_embeds=True.",
         )
 
-        sde_indices_raw = diffusion.sde_indices
-        sde_indices = sorted(int(v) for v in sde_indices_raw) if sde_indices_raw is not None else None
+        sde_indices = sorted(diffusion.sde_indices) if diffusion.sde_indices is not None else None
 
         kwargs: Dict[str, Any] = dict(sampler_kwargs)
         kwargs.update(self.build_prompts(sample))
@@ -82,14 +75,14 @@ class ImageAdapter(ModelAdapter):
         # Request negative prompt embeds only when CFG is active.
         if self.cfg.populate_conditions:
             kwargs["return_prompt_embeds"] = True
-            if float(diffusion.guidance_scale) > 1.0 and neg_prompt is not None:
+            if diffusion.guidance_scale > 1.0 and neg_prompt is not None:
                 kwargs["return_negative_prompt_embeds"] = True
 
         # Key per-step SDE noise by sample ID to preserve within-group exploration.
         if initial_noise is not None:
             kwargs["initial_noise"] = initial_noise
             if gen_part.sample_ids:
-                kwargs["denoise_seeds"] = [str(sid) for sid in gen_part.sample_ids]
+                kwargs["denoise_seeds"] = list(gen_part.sample_ids)
 
         # RawResult must use dit_trajectory; trajectory_latents omits x_T and is not output-sliced.
         kwargs["rollout"] = True
@@ -97,7 +90,7 @@ class ImageAdapter(ModelAdapter):
         kwargs["return_trajectory_latents"] = True
         if is_forward_process(sde_indices):
             kwargs["rollout_sde_type"] = "ode"
-            kwargs["rollout_noise_level"] = float(diffusion.eta)
+            kwargs["rollout_noise_level"] = diffusion.eta
             kwargs["rollout_log_prob_no_const"] = True
             kwargs["rollout_sde_step_indices"] = []
         else:
@@ -105,8 +98,13 @@ class ImageAdapter(ModelAdapter):
                 self._sde_label is not None,
                 "build_inputs: SDE mode requires an sde_label (resolved from the strategy)",
             )
+            require(
+                diffusion.eta > 0.0,
+                f"build_inputs: SDE steps {sde_indices} require eta > 0; got eta={diffusion.eta!r}.",
+            )
             kwargs["rollout_sde_type"] = self._sde_label
-            kwargs["rollout_noise_level"] = float(diffusion.eta)
+            kwargs["rollout_noise_level"] = diffusion.eta
+            kwargs["rollout_log_prob_no_const"] = self._sde_log_prob_no_const
             kwargs["rollout_sde_step_indices"] = sde_indices
 
         return kwargs
@@ -114,8 +112,8 @@ class ImageAdapter(ModelAdapter):
     def build_prompts(self, sample: Sample) -> Dict[str, Any]:
         """Prompt payload: unique prompts + repeat count, recovered by lineage."""
         gen_part = sample.frontier_gen_part(DiffusionSamplingParams)
-        prompts = list(sample.text_conditioning()[0].content.texts)
-        unique_prompts, k = utils.deexpand_prompts_from_groups(prompts, list(gen_part.group_ids))
+        prompts = sample.text_conditioning()[0].content.texts
+        unique_prompts, k = utils.deexpand_prompts_from_groups(prompts, gen_part.group_ids)
         out: Dict[str, Any] = {
             "prompt": unique_prompts if len(unique_prompts) > 1 else unique_prompts[0],
         }
@@ -126,13 +124,13 @@ class ImageAdapter(ModelAdapter):
     def build_sampling(self, sample: Sample, *, diffusion: Any) -> Dict[str, Any]:
         """Sampling scalars + the σ schedule slice."""
         return {
-            "num_inference_steps": int(diffusion.num_inference_steps),
-            "guidance_scale": float(diffusion.guidance_scale),
-            "height": int(diffusion.height),
-            "width": int(diffusion.width),
-            "num_frames": int(diffusion.num_frames),
+            "num_inference_steps": diffusion.num_inference_steps,
+            "guidance_scale": diffusion.guidance_scale,
+            "height": diffusion.height,
+            "width": diffusion.width,
+            "num_frames": diffusion.num_frames,
             "sigmas": diffusion.sigmas.detach().cpu().tolist()[:-1],
-            "seed": int(diffusion.seed) if diffusion.seed is not None else 0,
+            "seed": diffusion.seed if diffusion.seed is not None else 0,
         }
 
     def build_response(self, sample: Sample, raw: List[RawResult]) -> Sample:
@@ -140,13 +138,12 @@ class ImageAdapter(ModelAdapter):
         gen_part = sample.frontier_gen_part(DiffusionSamplingParams)
         diffusion = gen_part.sampling_params
         require(
-            diffusion is not None and diffusion.sigmas is not None,
+            diffusion.sigmas is not None,
             "build_response: diffusion.sigmas must be set",
         )
 
-        num_steps = int(diffusion.num_inference_steps)
-        sde_indices_raw = diffusion.sde_indices
-        sde_indices = sorted(int(v) for v in sde_indices_raw) if sde_indices_raw is not None else None
+        num_steps = diffusion.num_inference_steps
+        sde_indices = sorted(diffusion.sde_indices) if diffusion.sde_indices is not None else None
         emit_native_logprob = not is_forward_process(sde_indices)
 
         segment = self.build_segment(

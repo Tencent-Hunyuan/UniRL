@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any
+import logging
+from typing import Any, Optional
 
 import torch
 from torch import nn
@@ -12,6 +13,8 @@ from unirl.models.types.meta_init import build_meta_init_transformer, resolve_me
 from unirl.utils.dtypes import parse_torch_dtype
 
 from .config import MiniMaxH3PipelineConfig
+from .offline_text_embed import OfflineTextEmbedStore
+from .text_embed import load_minimax_h3_conditioner
 from .vendor import (
     AutoencoderKLMiniMaxH3,
     AutoencoderKLMiniMaxH3Audio,
@@ -28,13 +31,14 @@ class MiniMaxH3Bundle(Bundle):
         transformer: nn.Module,
         vae: nn.Module,
         audio_vae: nn.Module,
-        text_encoder: nn.Module,
-        processor: Any,
-        tokenizer: Any,
+        text_encoder: Optional[nn.Module],
+        processor: Optional[Any],
+        tokenizer: Optional[Any],
         dtype: torch.dtype,
         device: torch.device,
         pretrained_path: str,
         text_encoder_onload_for_embed: bool,
+        text_embed_store: Optional[OfflineTextEmbedStore],
     ) -> None:
         super().__init__()
         self.transformer = transformer
@@ -50,15 +54,15 @@ class MiniMaxH3Bundle(Bundle):
         self.device = device
         self.pretrained_path = pretrained_path
         self.text_encoder_onload_for_embed = text_encoder_onload_for_embed
+        self.text_embed_store = text_embed_store
 
     @classmethod
     def from_config(cls, config: MiniMaxH3PipelineConfig) -> "MiniMaxH3Bundle":
         """Load every MiniMax-H3 component from a HuggingFace checkpoint."""
-        from transformers import AutoProcessor, AutoTokenizer, Qwen3VLForConditionalGeneration
-
         path = config.pretrained_model_ckpt_path
         vae_path = config.vae_ckpt_path or path
         te_path = config.text_encoder_ckpt_path or path
+        cache_path = config.text_embed_cache_path
 
         device = config.device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         if isinstance(device, str):
@@ -113,17 +117,19 @@ class MiniMaxH3Bundle(Bundle):
         audio_vae = audio_vae.to(vae_device).eval()
         audio_vae.requires_grad_(False)
 
-        # Conditioner -- Qwen3-VL-32B (frozen). H3 reads an intermediate hidden
-        # state from it, so it must be loaded as the full LM, not a truncated
-        # encoder.
-        text_encoder = Qwen3VLForConditionalGeneration.from_pretrained(
-            te_path, subfolder="text_encoder", torch_dtype=te_dtype
-        )
-        text_encoder = text_encoder.to(aux_device).eval()
-        text_encoder.requires_grad_(False)
+        text_embed_store = OfflineTextEmbedStore.from_dir(cache_path) if cache_path is not None else None
 
-        processor = AutoProcessor.from_pretrained(te_path, subfolder="processor")
-        tokenizer = AutoTokenizer.from_pretrained(te_path, subfolder="tokenizer")
+        # Conditioner -- Qwen3-VL-32B (frozen). A populated text_embed_cache_path
+        # replaces that load.
+        if text_embed_store is not None:
+            logging.getLogger(__name__).info(
+                "MiniMaxH3Bundle: text_embed_cache_path=%s, not loading the 32B Qwen3-VL conditioner",
+                cache_path,
+            )
+            text_encoder = processor = tokenizer = None
+        else:
+            text_encoder, processor, tokenizer = load_minimax_h3_conditioner(te_path, te_dtype)
+            text_encoder = text_encoder.to(aux_device)
 
         bundle = cls(
             transformer=transformer,
@@ -136,6 +142,7 @@ class MiniMaxH3Bundle(Bundle):
             device=device,
             pretrained_path=path,
             text_encoder_onload_for_embed=config.text_encoder_onload_for_embed,
+            text_embed_store=text_embed_store,
         )
         if config.meta_init_transformer:
             # Diffusers layout: the backend's sharded loader reads the

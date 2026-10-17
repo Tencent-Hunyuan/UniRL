@@ -1,7 +1,6 @@
 """Async autoregressive RL over separate train and rollout GPU slabs."""
 
 import inspect
-import time
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -15,7 +14,6 @@ from unirl.trainer.ar import ARTrainer, ar_preflight
 from unirl.trainer.async_rollout import (
     AsyncRolloutTrainerMixin,
     resolve_separate_worker_concurrency,
-    training_version_metrics,
 )
 from unirl.trainer.base import BaseTrainer, build_sampling_dict
 from unirl.trainer.hydra import parse_hydra_cfg, remote_hydra
@@ -25,6 +23,8 @@ from unirl.types.sampling import BaseSamplingParams, total_samples_per_prompt
 
 class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
     """Disaggregated async AR trainer (two slabs, resident engine, NCCL sync)."""
+
+    _refill_before_score = True
 
     def __init__(
         self,
@@ -75,12 +75,28 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
                 "AsyncARTrainer requires a `reward:` block. Reward-free AR training is supported "
                 "only by the synchronous ARTrainer."
             )
-        per_worker_inflight = int(per_worker_inflight)
-        self._train_fraction = float(train_fraction)
+        if sync_cfg is None:
+            raise ValueError("AsyncARTrainer requires a cross-slab weight sync; add a `sync:` block.")
+        sync_target = sync_cfg["_target_"]
+        if not sync_target.endswith("NCCLWeightSync"):
+            raise ValueError(
+                f"AsyncARTrainer (separate slabs) requires a cross-slab weight sync "
+                f"(NCCLWeightSync); got sync._target_={sync_target!r}."
+            )
+        rollout_parsed = parse_hydra_cfg(rollout_cfg)
+        if "pipeline" in inspect.signature(rollout_parsed["role_cls"]).parameters:
+            raise ValueError(
+                "AsyncARTrainer needs a dedicated-rollout engine (vllm/sglang) on the "
+                "separate slab; the trainside direct-sampling engine needs the pipeline "
+                "as a local sibling and cannot live cross-slab."
+            )
+        if advantage_mode not in ("grpo", "gae"):
+            raise ValueError(f"AsyncARTrainer: advantage_mode must be 'grpo' or 'gae', got {advantage_mode!r}")
+        self.advantage_mode = advantage_mode
+        self._train_fraction = train_fraction
         configured_concurrency = cfg.get("worker_max_concurrency")
-        configured_concurrency = None if configured_concurrency is None else int(configured_concurrency)
         self._train_devices, worker_concurrency = resolve_separate_worker_concurrency(
-            num_devices=int(cfg.num_devices),
+            num_devices=cfg.num_devices,
             train_fraction=self._train_fraction,
             per_worker_inflight=per_worker_inflight,
             configured_concurrency=configured_concurrency,
@@ -97,38 +113,23 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
         self.batch_size = batch_size
         self.adv_normalization_scope = adv_normalization_scope
         self.normalize_adv_by_std = normalize_adv_by_std
-        self.advantage_mode = str(advantage_mode).strip().lower()
-        if self.advantage_mode not in ("grpo", "gae"):
-            raise ValueError(f"AsyncARTrainer: advantage_mode must be 'grpo' or 'gae', got {advantage_mode!r}")
-        self.balance_shards = bool(balance_shards)
-        self.eval_interval = int(eval_interval)
-        _num = int(eval_num_prompts)
-        self.eval_num_prompts = -1 if _num < 0 else _num
-        self.eval_batch_size = max(1, int(eval_batch_size))
-        self.eval_samples_per_prompt = int(eval_samples_per_prompt)
-        self.eval_temperature = float(eval_temperature)
+        self.balance_shards = balance_shards
+        self.eval_interval = eval_interval
+        self.eval_num_prompts = -1 if eval_num_prompts < 0 else eval_num_prompts
+        self.eval_batch_size = max(1, eval_batch_size)
+        self.eval_samples_per_prompt = eval_samples_per_prompt
+        self.eval_temperature = eval_temperature
         self.data_source = instantiate(data_source_cfg)
         self.sampling_params: Dict[str, BaseSamplingParams] = build_sampling_dict(sampling_cfg)
-        self.weight_sync = None
-        rollout_parsed = parse_hydra_cfg(rollout_cfg)
-        if "pipeline" in inspect.signature(rollout_parsed["role_cls"]).parameters:
-            raise ValueError(
-                "AsyncARTrainer needs a dedicated-rollout engine (vllm/sglang) on the "
-                "separate slab; the trainside direct-sampling engine needs the pipeline "
-                "as a local sibling and cannot live cross-slab."
-            )
         self._rollout_anchor_device = None
 
-        self._max_inflight = max(1, int(max_inflight))
+        self._max_inflight = max(1, max_inflight)
         self._per_worker_inflight = per_worker_inflight
-        self._max_inflight_prompts = self._max_inflight * self.batch_size
-        self._weight_sync_interval = int(weight_sync_interval)
-        self._num_updates_per_batch = int(stack_cfg.get("num_updates_per_batch", 1))
+        self._weight_sync_interval = weight_sync_interval
+        self._num_updates_per_batch = stack_cfg.get("num_updates_per_batch", 1)
         if self._weight_sync_interval < 1:
             raise ValueError(f"weight_sync_interval must be >= 1, got {self._weight_sync_interval}")
-        self._max_staleness = (
-            self._weight_sync_interval - 1 if buffer_max_staleness is None else int(buffer_max_staleness)
-        )
+        self._max_staleness = self._weight_sync_interval - 1 if buffer_max_staleness is None else buffer_max_staleness
         min_staleness = self._weight_sync_interval - 1
         if self._max_staleness < min_staleness:
             raise ValueError(
@@ -152,14 +153,11 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
             self.reward = remote_hydra(reward_cfg)
             self.algorithm = remote_hydra(algorithm_cfg, pipeline=self.pipeline)
             self.stack = remote_hydra(stack_cfg, fsdp_backend=self.backend, algorithm=self.algorithm)
-            if sync_cfg is not None:
-                self.weight_sync = remote_hydra(sync_cfg, backend=self.backend)
+            self.weight_sync = remote_hydra(sync_cfg, backend=self.backend)
         with placement(self.pool, fraction=1.0 - self._train_fraction, shared_workers=True):
             self.rollout = remote(**rollout_parsed)
 
-        if self.weight_sync is None:
-            raise ValueError("AsyncARTrainer requires a cross-slab weight sync; add a `sync:` block.")
-        self._connect_separate(sync_cfg)
+        self._connect_separate()
 
     def _prepare_rollout(self, *, sync_weights: bool) -> bool:
         """Sync a resident separate-slab engine without colocate handoffs."""
@@ -172,14 +170,8 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
         if train_state_offloaded:
             raise RuntimeError("AsyncARTrainer cannot offload its disjoint training slab during rollout")
 
-    def _connect_separate(self, sync_cfg: DictConfig) -> None:
+    def _connect_separate(self) -> None:
         """One-time cross-slab handshake (NCCL branch of diffusion.py:191-208)."""
-        target = str(sync_cfg.get("_target_", ""))
-        if not target.endswith("NCCLWeightSync"):
-            raise ValueError(
-                f"AsyncARTrainer (separate slabs) requires a cross-slab weight sync "
-                f"(NCCLWeightSync); got sync._target_={target!r}."
-            )
         addr, port = self.weight_sync.pick_master()[0]
         tp_size = self.rollout.tp_size
         pp_size = self.rollout.pp_size
@@ -199,12 +191,8 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
         *,
         training_progress: float,
         rollout_id: int,
-        t0: Optional[float] = None,
-        extra_metrics: Optional[Dict[str, float]] = None,
-    ) -> Tuple[TrainStepResult, float]:
+    ) -> Tuple[Sample, TrainStepResult, float]:
         """Advantage + optimizer updates for a scored ``Sample`` (rewards already attached)."""
-        if t0 is None:
-            t0 = time.perf_counter()
         part = sample.parts[-1]
         mean_reward = 0.0
         if part.rewards is not None:
@@ -219,28 +207,12 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
         train_part = part
         if self.balance_shards:
             train_part = part.balance_shards(self._train_devices)
-        result = self.stack.train_track(train_part, training_progress=float(training_progress))
-        self._train_version += result.optimizer_updates
-        self._batches_since_sync += 1
-        if extra_metrics is not None:
-            extra_metrics.update(
-                training_version_metrics(
-                    train_version=self._train_version,
-                    published_version=self._rollout_manager.published_version,
-                    optimizer_updates=result.optimizer_updates,
-                    batches_since_sync=self._batches_since_sync,
-                )
-            )
-        self.wandb_logger.log_rollout_step(
-            rollout_id,
-            result,
-            sample,
-            step_time_s=time.perf_counter() - t0,
-            trunc_len=getattr(self.sampling_params.get("ar"), "max_new_tokens", None),
-            extra_metrics=extra_metrics,
+        result = self.stack.train_track(
+            train_part,
+            training_progress=float(training_progress),
+            rollout_id=rollout_id,
         )
-        self._reset_transport_buffers()
-        return result, mean_reward
+        return sample, result, mean_reward
 
     def train(
         self,
@@ -261,10 +233,6 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
 
     def _async_wandb_extra(self) -> Dict[str, object]:
         return {"adv_normalization_scope": self.adv_normalization_scope}
-
-    def _refill_before_score(self) -> bool:
-        """Overlap AR generation with reward scoring and training."""
-        return True
 
     def _boundary_evaluate(self, rollout_id: int, *, initial: bool) -> None:
         self.evaluate(rollout_id=-1 if initial else rollout_id)

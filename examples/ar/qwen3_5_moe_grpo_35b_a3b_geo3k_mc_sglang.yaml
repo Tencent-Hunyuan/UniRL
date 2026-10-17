@@ -102,7 +102,8 @@ rollout:
       enable_thinking: false
     engine_kwargs:
       # Colocate MoE + geo3k: cuda graph OFF and mem_fraction_static 0.15
-      # (4B dense preset is 0.3 + cuda graph ON @ bs 16).
+      # (4B dense baseline is 0.3 + cuda graph ON @ bs 16). Unlike that
+      # baseline, attention_backend is not pinned; SGLang selects it by platform.
       # See unirl/rollout/README.md (SGLang AR knobs).
       mem_fraction_static: 0.15
       disable_cuda_graph: true

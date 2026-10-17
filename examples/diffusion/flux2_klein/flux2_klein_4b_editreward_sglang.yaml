@@ -92,6 +92,7 @@ pipeline:
   logprob_precision: fp32
   max_sequence_length: 512
   qwen3_extraction_layers: [9, 18, 27]
+  batch_replay_steps: true
   strategy: ${strategy}
 
 backend:
@@ -150,7 +151,6 @@ rollout:
     num_gpus: 1
     tp_size: 1
     local_mode: true
-    target_modules: *lora_targets
     engine_kwargs:
       model_type: flux2_klein
 

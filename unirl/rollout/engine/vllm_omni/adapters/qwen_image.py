@@ -1,19 +1,12 @@
-"""Qwen-Image family: input/output sub-adapters + the ``qwen_image_t2i`` modality class."""
+"""Qwen-Image family: output sub-adapter + the ``qwen_image_t2i`` modality class."""
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Sequence, Tuple
-
-import torch
+from typing import Any, Dict, List
 
 from unirl.rollout.engine.vllm_omni.adapters.base import ModelAdapter, register_adapter
-from unirl.rollout.engine.vllm_omni.adapters.dit import (
-    DitInputAdapter,
-    DitOutputAdapter,
-    _grouped_texts_from_sample,
-    _negative_prompt_from_params,
-)
-from unirl.rollout.engine.vllm_omni.backends import GenerateCall, OmniRawResult, StageSampling
+from unirl.rollout.engine.vllm_omni.adapters.dit import DitInputAdapter, DitOutputAdapter
+from unirl.rollout.engine.vllm_omni.backends import GenerateCall, OmniRawResult
 from unirl.rollout.engine.vllm_omni.pipelines._shared.interception import read_captures
 from unirl.rollout.engine.vllm_omni.utils import collect_dit_outputs
 from unirl.types.conditions.text import TextEmbedCondition
@@ -21,83 +14,15 @@ from unirl.types.sample import Sample
 from unirl.types.sampling import DiffusionSamplingParams
 
 
-def _ragged_pad_cat(pairs: Sequence[Tuple[torch.Tensor, torch.Tensor]]) -> TextEmbedCondition:
-    """Per-request ``(embeds, mask)`` pairs into one ``TextEmbedCondition`` right-padded to the batch-max ``L``."""
-    max_len = max(int(e.shape[1]) for e, _ in pairs)
-    embeds: List[torch.Tensor] = []
-    masks: List[torch.Tensor] = []
-    for e, m in pairs:
-        pad = max_len - int(e.shape[1])
-        if pad:
-            e = torch.cat([e, e.new_zeros(e.shape[0], pad, e.shape[2])], dim=1)
-            m = torch.cat([m, m.new_zeros(m.shape[0], pad)], dim=1)
-        embeds.append(e)
-        masks.append(m)
-    return TextEmbedCondition(embeds=torch.cat(embeds, dim=0), pooled=None, attn_mask=torch.cat(masks, dim=0))
-
-
-class QwenImageInputAdapter(DitInputAdapter):
-    """SD3-style request side with the Qwen CFG mapping."""
-
-    def __init__(self, modality: str, *, model_config: Any = None) -> None:
-        super().__init__(modality)
-        self.model_config = model_config
-
-    def build_prompts(self, sample: Sample) -> List[Any]:
-        """``{"prompt"}`` dicts; ``negative_prompt`` ONLY when CFG is armed."""
-        # text-only consumer: text_conditioning() fails loud if an image turn is present.
-        texts = sample.text_conditioning()[0].content
-        diff_params = sample.frontier_gen_part(DiffusionSamplingParams).sampling_params
-        if float(diff_params.guidance_scale) > 1.0:
-            negative_prompt = _negative_prompt_from_params(diff_params, default=" ")
-            return [{"prompt": text, "negative_prompt": negative_prompt} for text in texts.texts]
-        return [{"prompt": text} for text in texts.texts]
-
-    def build_sampling(self, sample: Sample) -> List[StageSampling]:
-        sampling = super().build_sampling(sample)
-        diff_params = sample.frontier_gen_part(DiffusionSamplingParams).sampling_params
-        kwargs = sampling[0].kwargs
-        kwargs["true_cfg_scale"] = float(diff_params.guidance_scale)
-        if "max_sequence_length" not in kwargs:
-            max_seq_len = getattr(self.model_config, "max_sequence_length", None)
-            if max_seq_len is not None:
-                kwargs["max_sequence_length"] = int(max_seq_len)
-        return sampling
-
-
-class QwenImageGroupedInputAdapter(QwenImageInputAdapter):
-    """Qwen-Image request builder using vLLM-Omni's native multi-output prompt shape."""
-
-    def build_prompts(self, sample: Sample) -> List[Any]:
-        grouped_texts, _ = _grouped_texts_from_sample(
-            sample,
-            caller=f"{self.modality}.build_prompts",
-        )
-        diff_params = sample.frontier_gen_part(DiffusionSamplingParams).sampling_params
-        if float(diff_params.guidance_scale) > 1.0:
-            negative_prompt = _negative_prompt_from_params(diff_params, default=" ")
-            return [{"prompt": text, "negative_prompt": negative_prompt} for text in grouped_texts]
-        return [{"prompt": text} for text in grouped_texts]
-
-    def build_sampling(self, sample: Sample) -> List[StageSampling]:
-        _, spp = _grouped_texts_from_sample(
-            sample,
-            caller=f"{self.modality}.build_sampling",
-        )
-        sampling = super().build_sampling(sample)
-        sampling[0].kwargs["num_outputs_per_prompt"] = spp
-        return sampling
-
-
 class QwenImageOutputAdapter(DitOutputAdapter):
     """Single diffusion-Part response with Qwen text-capture conditions."""
 
-    _MISSING_CAPTURE_MSG = (
+    MISSING_CAPTURE_MSG = (
         "build_response: Qwen-Image rollout returned no 'text_capture' on "
         "the output envelope's unirl metadata. Check that RLQwenImagePipeline's "
         "encode_prompt tap ran in every DiT worker — the subclass swap may "
         "not have taken effect (verify custom_pipeline_args.pipeline_class "
-        "in the stage YAML)."
+        "in the deploy config)."
     )
 
     def build_conditions(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
@@ -108,29 +33,32 @@ class QwenImageOutputAdapter(DitOutputAdapter):
 
         captures = [read_captures(d).get("text_capture") for d in diff_outputs]
         if any(c is None for c in captures):
-            raise RuntimeError(self._MISSING_CAPTURE_MSG)
+            raise RuntimeError(self.MISSING_CAPTURE_MSG)
 
-        cond_dict: Dict[str, Any] = {
-            "text": _ragged_pad_cat([(c["prompt_embeds"], c["prompt_embeds_mask"]) for c in captures])
-        }
         neg_present = [c.get("negative_prompt_embeds") is not None for c in captures]
-        if any(neg_present):
-            if not all(neg_present):
-                raise RuntimeError(
-                    "build_response: Qwen-Image negative text captured on some "
-                    "requests but not others — CFG arming must be uniform "
-                    "across a generate call."
-                )
-            cond_dict["negative_text"] = _ragged_pad_cat(
-                [(c["negative_prompt_embeds"], c["negative_prompt_embeds_mask"]) for c in captures]
+        if any(neg_present) and not all(neg_present):
+            raise RuntimeError(
+                "build_response: Qwen-Image negative text captured on some "
+                "requests but not others — CFG arming must be uniform "
+                "across a generate call."
             )
+
+        specs = [("text", "prompt_embeds", "prompt_embeds_mask")]
+        if all(neg_present):
+            specs.append(("negative_text", "negative_prompt_embeds", "negative_prompt_embeds_mask"))
+
         n_samples = len(sample.frontier_gen_part(DiffusionSamplingParams).sample_ids)
-        for name, condition in cond_dict.items():
+        cond_dict: Dict[str, Any] = {}
+        for name, emb_key, mask_key in specs:
+            condition = TextEmbedCondition.concat(
+                [TextEmbedCondition(embeds=c[emb_key], attn_mask=c[mask_key]) for c in captures]
+            )
             if int(condition.embeds.shape[0]) != n_samples:
                 raise RuntimeError(
                     f"build_response: Qwen-Image {name} condition batch "
                     f"{int(condition.embeds.shape[0])} != diffusion sample count {n_samples}."
                 )
+            cond_dict[name] = condition
         return cond_dict
 
 
@@ -138,13 +66,14 @@ class QwenImageOutputAdapter(DitOutputAdapter):
 class QwenImageT2iAdapter(ModelAdapter):
     """Qwen-Image text → image (single diffusion stage, TP=1)."""
 
-    stage_yaml = "qwen_image_t2i_rl.yaml"
+    deploy_config = "qwen_image_t2i_rl.yaml"
     omni_mode = "text-to-image"
     needs_driver_tokenizer = False
+    packs_groups = True
 
     def __init__(self, config: Any, model_config: Any, *, strategy: Any = None, tokenize_fn: Any = None) -> None:
         super().__init__(config, model_config, strategy=strategy, tokenize_fn=tokenize_fn)
-        self.input_adapter = QwenImageGroupedInputAdapter(self.modality, model_config=model_config)
+        self.input_adapter = DitInputAdapter(self.modality)
         self.output_adapter = QwenImageOutputAdapter(self.modality)
 
     def validate_request(self, sample: Sample) -> None:
@@ -154,10 +83,24 @@ class QwenImageT2iAdapter(ModelAdapter):
             )
 
     def build_inputs(self, sample: Sample) -> List[GenerateCall]:
-        return self.input_adapter.build(sample)
+        grouped_texts, spp = self.input_adapter.build_grouped_texts(sample)
+        diff_params = sample.frontier_gen_part(DiffusionSamplingParams).sampling_params
+        if diff_params.guidance_scale > 1.0:
+            neg = diff_params.sampler_kwargs.get("negative_prompt")
+            negative_prompt = " " if neg is None else neg
+            prompts = [{"prompt": text, "negative_prompt": negative_prompt} for text in grouped_texts]
+        else:
+            prompts = [{"prompt": text} for text in grouped_texts]
+        sampling = self.input_adapter.build_sampling(sample)
+        kwargs = sampling[0].kwargs
+        kwargs["true_cfg_scale"] = diff_params.guidance_scale
+        if "max_sequence_length" not in kwargs:
+            kwargs["max_sequence_length"] = self.model_config.max_sequence_length
+        kwargs["num_outputs_per_prompt"] = spp
+        return [GenerateCall(prompts=prompts, sampling=sampling)]
 
     def build_response(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Sample:
         return self.output_adapter.build(sample, per_request)
 
 
-__all__ = ["QwenImageGroupedInputAdapter", "QwenImageInputAdapter", "QwenImageOutputAdapter", "QwenImageT2iAdapter"]
+__all__ = ["QwenImageOutputAdapter", "QwenImageT2iAdapter"]

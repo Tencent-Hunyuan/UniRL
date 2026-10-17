@@ -163,10 +163,8 @@ class GracefulShutdown:
 
     def _reclaim_after_ray_init(self) -> None:
         """Re-take the signals as soon as Ray finishes initialising."""
-        try:
-            import ray
-        except ImportError:
-            return
+        import ray
+
         if getattr(ray.init, "_unirl_reclaims_signals", False):
             return
 

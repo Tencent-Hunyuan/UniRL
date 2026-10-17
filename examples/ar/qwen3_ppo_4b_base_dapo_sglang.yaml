@@ -91,13 +91,14 @@ rollout:
       rl_on_policy_target: fsdp
       # Colocate full-FT preset (unirl/rollout/README.md): lower the SRT KV
       # reservation so FSDP can all-gather full dense weights. enable_lora must
-      # stay false for TensorWeightSync. CUDA graph ON, cuda_graph_max_bs=16
-      # (SGLang default 256 would balloon server memory + compete with the push).
+      # stay false for TensorWeightSync. CUDA graph ON,
+      # cuda_graph_max_bs_decode=16 (the auto-tuned default can be much larger
+      # and compete with the push).
       mem_fraction_static: 0.3
       skip_server_warmup: true
       attention_backend: triton
       disable_cuda_graph: false
-      cuda_graph_max_bs: 16
+      cuda_graph_max_bs_decode: 16
       enable_lora: false
 
 reward:

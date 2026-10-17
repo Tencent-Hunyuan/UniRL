@@ -146,6 +146,7 @@ stack:
   # per-worker batch = samples_per_prompt(8) * prompts_per_rollout(8) /
   # num_devices(8) = 8; two updates therefore use mini-batches of 4.
   num_updates_per_batch: 2
+  shuffle_updates: true
 
 data_source:
   _target_: unirl.data.data_source.MultimodalRLDataSource

@@ -43,18 +43,18 @@ def _import_sglang_engine() -> Dict[str, Any]:
     """Lazy import of the Engine entrypoint + the io_struct request types."""
     from sglang.srt.entrypoints.engine import Engine
     from sglang.srt.managers.io_struct import (
-        LoadLoRAAdapterFromTensorsReqInput,
+        ContinueGenerationReqInput,
+        PauseGenerationReqInput,
         UpdateWeightsFromTensorReqInput,
     )
     from sglang.srt.server_args import ServerArgs
-    from sglang.srt.utils import MultiprocessingSerializer
 
     return {
         "Engine": Engine,
         "ServerArgs": ServerArgs,
-        "MultiprocessingSerializer": MultiprocessingSerializer,
+        "ContinueGenerationReqInput": ContinueGenerationReqInput,
+        "PauseGenerationReqInput": PauseGenerationReqInput,
         "UpdateWeightsFromTensorReqInput": UpdateWeightsFromTensorReqInput,
-        "LoadLoRAAdapterFromTensorsReqInput": LoadLoRAAdapterFromTensorsReqInput,
     }
 
 
@@ -157,11 +157,11 @@ class NativeBackend:
         runtime: Dict[str, Any],
     ) -> None:
         self._engine: Optional[Any] = engine
-        self._concurrency = int(concurrency)
+        self._concurrency = concurrency
         self._rt = runtime
         self._logged_first_response = False
         self._lt = LoopThread(engine.loop, label="sglang NativeBackend")
-        self._sem = asyncio.Semaphore(int(concurrency))
+        self._sem = asyncio.Semaphore(concurrency)
 
     @classmethod
     def boot(
@@ -179,7 +179,7 @@ class NativeBackend:
             allowed=allowed,
             backend_name="native",
         )
-        tp_size = int(engine_kwargs.get("tp_size", 1) or 1)
+        tp_size = int(engine_kwargs.get("tp_size", 1))
         if tp_size > 1:
             raise NotImplementedError(
                 "SGLang native backend does not support rollout tp_size>1 in UniRL yet; "
@@ -207,11 +207,11 @@ class NativeBackend:
         multiprocessing.set_start_method("spawn", force=True)
         engine = rt["Engine"](**engine_kwargs)
 
-        settled = getattr(engine, "server_args", None)
+        settled = engine.server_args
         logger.info(
             "SGLang Engine ready (settled ServerArgs: port=%s nccl_port=%s)",
-            getattr(settled, "port", None),
-            getattr(settled, "nccl_port", None),
+            settled.port,
+            settled.nccl_port,
         )
         return cls(engine, concurrency=concurrency, runtime=rt)
 
@@ -269,35 +269,16 @@ class NativeBackend:
         self._lt.run_control(self._aresume())
 
     async def _aabort(self, *, abort_all: bool = True, rid: Optional[str] = None) -> None:
-        """Abort in-flight generation (best-effort across sglang versions)."""
-        tm = getattr(self._engine, "tokenizer_manager", None)
-        fn = getattr(tm, "abort_request", None)
-        if fn is None:
-            logger.warning("sglang NativeBackend: tokenizer_manager.abort_request unavailable; abort is a no-op")
-            return
-        try:
-            res = fn(rid=rid, abort_all=abort_all) if rid is not None else fn(abort_all=abort_all)
-        except TypeError:
-            res = fn(rid) if rid is not None else fn()
-        if asyncio.iscoroutine(res):
-            await res
+        """Abort in-flight generation through the pinned tokenizer-manager API."""
+        self._engine.tokenizer_manager.abort_request(rid=rid or "", abort_all=abort_all)
 
     async def _apause(self) -> None:
-        """Pause generation admission if the runtime supports it (best-effort)."""
-        await self._call_optional("pause_generation")
+        """Pause generation admission through the pinned tokenizer-manager API."""
+        await self._engine.tokenizer_manager.pause_generation(self._rt["PauseGenerationReqInput"]())
 
     async def _aresume(self) -> None:
-        """Resume generation admission if the runtime supports it (best-effort)."""
-        await self._call_optional("continue_generation")
-
-    async def _call_optional(self, name: str) -> None:
-        tm = getattr(self._engine, "tokenizer_manager", None)
-        fn = getattr(tm, name, None) or getattr(self._engine, name, None)
-        if fn is None:
-            return
-        res = fn()
-        if asyncio.iscoroutine(res):
-            await res
+        """Resume generation admission through the pinned tokenizer-manager API."""
+        await self._engine.tokenizer_manager.continue_generation(self._rt["ContinueGenerationReqInput"]())
 
     @staticmethod
     def _check_result(result: Any, operation: str) -> None:
@@ -408,11 +389,11 @@ class NativeBackend:
         result = self._lt.run_parked(
             lambda: self._engine.init_weights_update_group(
                 master_address=master_address,
-                master_port=int(master_port),
-                rank_offset=int(rank_offset),
-                world_size=int(world_size),
-                group_name=str(group_name),
-                backend=str(backend),
+                master_port=master_port,
+                rank_offset=rank_offset,
+                world_size=world_size,
+                group_name=group_name,
+                backend=backend,
             )
         )
         self._check_result(result, "init_weights_group")
@@ -443,10 +424,10 @@ class NativeBackend:
         self._require_alive("update_from_distributed")
         result = self._lt.run_parked(
             lambda: self._engine.update_weights_from_distributed(
-                names=list(names),
-                dtypes=list(dtypes),
-                shapes=[list(s) for s in shapes],
-                group_name=str(group_name),
+                names=names,
+                dtypes=dtypes,
+                shapes=shapes,
+                group_name=group_name,
                 flush_cache=flush_cache,
             )
         )
@@ -454,7 +435,7 @@ class NativeBackend:
 
     def destroy_weights_group(self, *, group_name: str) -> None:
         self._require_alive("destroy_weights_group")
-        result = self._lt.run_parked(lambda: self._engine.destroy_weights_update_group(group_name=str(group_name)))
+        result = self._lt.run_parked(lambda: self._engine.destroy_weights_update_group(group_name=group_name))
         self._check_result(result, "destroy_weights_group")
 
     def set_lora(
@@ -464,17 +445,15 @@ class NativeBackend:
         lora_tensors: Dict[str, Any],
         config_dict: Optional[dict] = None,
     ) -> None:
-        """Serialize the LoRA tensor bag and hot-load it on the Engine."""
+        """Hot-load a LoRA tensor bag through the public Engine API."""
         self._require_alive("set_lora")
-        serialized = self._rt["MultiprocessingSerializer"].serialize(lora_tensors, output_str=True)
-        obj = self._rt["LoadLoRAAdapterFromTensorsReqInput"](
-            lora_name=str(lora_name),
-            config_dict=dict(config_dict or {}),
-            serialized_tensors=serialized,
-        )
         engine = self._engine
         result = self._lt.run_parked(
-            lambda: engine.loop.run_until_complete(engine.tokenizer_manager.load_lora_adapter_from_tensors(obj, None))
+            lambda: engine.load_lora_adapter_from_tensors(
+                lora_name=str(lora_name),
+                tensors=lora_tensors,
+                config_dict=dict(config_dict or {}),
+            )
         )
         self._check_result(result, "set_lora")
 

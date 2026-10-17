@@ -35,6 +35,7 @@ def main(cfg: DictConfig) -> None:
             logging_cfg=cfg.get("logging"),
             stop=cfg.get("stop"),
             per_worker_inflight=cfg.get("per_worker_inflight", 8),
+            mask_overflow_loss=cfg.get("mask_overflow_loss", False),
         )
         guard.claim_signals()
         trainer.train(

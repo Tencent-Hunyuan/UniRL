@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Type
 
 import torch
+from peft.tuners.lora import LoraLayer
 
 from unirl.types.conditions import Condition
 from unirl.types.segments.latent import LatentSegment
@@ -21,21 +22,13 @@ from .flowgrpo import FlowGRPO
 
 
 @contextmanager
-def _disable_lora(module: Any) -> Iterator[bool]:
+def _disable_lora(module: Any) -> Iterator[None]:
     """Temporarily disable LoRA adapters so a forward runs the base model."""
-    try:
-        from peft.tuners.lora import LoraLayer
-    except Exception:
-        yield False
-        return
     layers = [m for m in module.modules() if isinstance(m, LoraLayer)]
-    if not layers:
-        yield False
-        return
     for layer in layers:
         layer.enable_adapters(False)
     try:
-        yield True
+        yield
     finally:
         for layer in layers:
             layer.enable_adapters(True)
@@ -78,10 +71,6 @@ class BagelFlowUniGRPO(FlowGRPO):
     @staticmethod
     def _has_lora(transformer: Any) -> bool:
         """True if the transformer carries peft LoRA layers (LoRA training)."""
-        try:
-            from peft.tuners.lora import LoraLayer
-        except Exception:
-            return False
         return any(isinstance(m, LoraLayer) for m in transformer.modules())
 
     @contextmanager
@@ -169,18 +158,8 @@ class BagelFlowUniGRPO(FlowGRPO):
         full_ft_ref = not self._has_lora(transformer)
         # Compute reference velocities before retaining trainable graphs to reduce peak memory.
         with torch.no_grad():
-            if full_ft_ref:
-                ref_ctx = self._reference_weights(transformer)
-            else:
-                ref_ctx = _disable_lora(transformer)
-            with ref_ctx as disabled:
-                if not full_ft_ref and not disabled:
-                    raise RuntimeError(
-                        "BagelFlowUniGRPO: mse_weight > 0 but found neither peft LoRA layers "
-                        "to disable nor trainable params to snapshot as v_ref on "
-                        "stage.model.transformer. Train with a lora_cfg or full fine-tuning, "
-                        "or set mse_weight=0."
-                    )
+            ref_ctx = self._reference_weights(transformer) if full_ft_ref else _disable_lora(transformer)
+            with ref_ctx:
                 # Rebuild reference conditioning only after policy weights are disabled.
                 ref_forward_kwargs = self.stage.build_forward_kwargs(
                     typed_conds,
