@@ -118,22 +118,23 @@ class PerSampleStepGRPO(FlowGRPO):
         weights = weights.to(dtype=loss_per_elem.dtype, device=loss_per_elem.device)
         loss_per_elem = loss_per_elem * weights
         loss = loss_per_elem.mean()
-
-        metrics: Dict[str, Any] = {
-            "policy_loss": float(loss.detach().item()),
-            "clip_range": float(clip_range),
-            f"{self.weight_metric}_mean": float(weights.detach().mean().item()),
-            f"{self.weight_metric}_min": float(weights.detach().min().item()),
-            f"{self.weight_metric}_max": float(weights.detach().max().item()),
-            "adv_clip_fraction": float((adv_raw.abs() > self.adv_clip_max).float().mean().item()),
-            "adv_abs_max": float(adv_raw.abs().max().item()),
-            **{k: float(v.item()) for k, v in ratio_metrics.items()},
-        }
-
         (loss * loss_scale).backward()
 
+        metric_tensors: Dict[str, torch.Tensor] = {
+            "policy_loss": loss.detach(),
+            f"{self.weight_metric}_mean": weights.detach().mean(),
+            f"{self.weight_metric}_min": weights.detach().min(),
+            f"{self.weight_metric}_max": weights.detach().max(),
+            "adv_clip_fraction": (adv_raw.abs() > self.adv_clip_max).float().mean(),
+            "adv_abs_max": adv_raw.abs().max(),
+            **ratio_metrics,
+        }
+        metric_values = torch.stack([value.float() for value in metric_tensors.values()]).cpu().tolist()
+        metrics: Dict[str, Any] = dict(zip(metric_tensors, metric_values))
+        metrics["clip_range"] = float(clip_range)
+
         return AlgorithmStepResult(
-            loss=float(loss.detach().item()),
+            loss=metrics["policy_loss"],
             metrics=metrics,
             num_steps_or_tokens=len(target_steps),
             has_backward=True,

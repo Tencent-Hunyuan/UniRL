@@ -106,13 +106,12 @@ class FlashGRPO(PerSampleStepGRPO):
             raise ValueError("FlashGRPO requires params.eta > 0 on trained SDE steps.")
         sigma = sigmas[:-1].index_select(0, idx)
         sigma_next = sigmas[1:].index_select(0, idx)
-        sqrt_neg_dt = torch.sqrt((sigma - sigma_next).clamp_min(torch.finfo(torch.float32).eps))
         sigma_max = sigmas[1] if int(sigmas.shape[0]) > 1 else torch.tensor(0.99, device=device, dtype=sigmas.dtype)
-        sigma_min = sigmas[-1]
-        std_dev_t = (sigma_min + (sigma_max - sigma_min) * sigma) * eta
-        std_dev_t = std_dev_t.clamp_min(torch.finfo(torch.float32).eps)
+        transition_std = self.stage.strategy.transition_std(
+            sigma=sigma, sigma_next=sigma_next, eta=eta, sigma_max=sigma_max
+        ).clamp_min(torch.finfo(torch.float32).eps)
         sigma_safe = sigma.clamp_min(torch.finfo(torch.float32).eps)
-        denom = sqrt_neg_dt / std_dev_t + std_dev_t * sqrt_neg_dt * (1.0 - sigma) / (2.0 * sigma_safe)
+        denom = (sigma - sigma_next) / transition_std + transition_std * (1.0 - sigma) / (2.0 * sigma_safe)
         return denom.reciprocal()
 
 

@@ -83,9 +83,6 @@ class TempFlowGRPO(PerSampleStepGRPO):
             raise ValueError(f"TempFlowGRPO: weight_scale must be > 0; got {weight_scale!r}.")
         if not float(params.eta) > 0.0:
             raise ValueError("TempFlowGRPO requires params.eta > 0 on branch steps.")
-        self.branches_per_seed = int(branches_per_seed)
-        self.advantage_group = advantage_group
-        self.branch_steps_per_rollout = None if branch_steps_per_rollout is None else int(branch_steps_per_rollout)
         self.weight_scale = float(weight_scale)
 
     def _row_weights(self, *, segment: LatentSegment, device: torch.device) -> torch.Tensor:
@@ -97,8 +94,8 @@ class TempFlowGRPO(PerSampleStepGRPO):
         std = self.stage.strategy.transition_std(
             sigma=sigmas[steps],
             sigma_next=sigmas[steps + 1],
-            eta=float(self.params.eta),
-            sigma_max=float(sigmas[1]),
+            eta=self.params.eta,
+            sigma_max=sigmas[1] if int(sigmas.shape[0]) > 1 else torch.tensor(0.99, device=device, dtype=sigmas.dtype),
         )
         return (self.weight_scale * std).reshape(-1, 1)
 
