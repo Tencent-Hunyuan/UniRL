@@ -7,7 +7,7 @@ from typing import List, Tuple
 
 import torch
 
-from unirl.models.types.embedding import EmbedStage
+from unirl.models.types.embedding import EmbedStage, dedup_prompts
 from unirl.types.conditions import TextEmbedCondition
 from unirl.types.primitives import Texts
 
@@ -34,7 +34,7 @@ class Flux2KleinTextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
         self.extraction_layers = tuple(extraction_layers)
 
     def embed(self, p: Texts) -> TextEmbedCondition:
-        prompts = list(p.texts)
+        prompts, inverse = dedup_prompts(p.texts)
         bundle = self.bundle
         device = bundle.device
         dtype = next(bundle.text_encoder.parameters()).dtype
@@ -112,10 +112,11 @@ class Flux2KleinTextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
                 index=seq_lens.unsqueeze(-1).expand(-1, -1, last_hidden.shape[-1]),
             ).squeeze(1)
             pooled = eos_hidden[..., :POOLED_DIM].to(dtype=dtype)
-        return TextEmbedCondition(
+        cond = TextEmbedCondition(
             embeds=prompt_embeds,
             pooled=pooled,
         )
+        return cond if inverse is None else cond.select(inverse)
 
 
 __all__ = ["Flux2KleinTextEmbedStage"]

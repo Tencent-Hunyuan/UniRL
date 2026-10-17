@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from unirl.models.types.embedding import EmbedStage
+from unirl.models.types.embedding import EmbedStage, dedup_prompts
 from unirl.types.conditions import TextEmbedCondition
 from unirl.types.primitives import Texts
 
@@ -42,6 +42,7 @@ class BooguImageTextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
             raise ValueError(
                 "BooguImageTextEmbedStage.embed: bundle has no text encoder/processor (load_text_encoder=False?)"
             )
+        prompts, inverse = dedup_prompts(p.texts)
         device = bundle.device
         dtype = next(bundle.text_encoder.parameters()).dtype
 
@@ -58,7 +59,7 @@ class BooguImageTextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
                 },
                 {"role": "user", "content": [{"type": "text", "text": prompt}]},
             ]
-            for prompt in p.texts
+            for prompt in prompts
         ]
         vlm_inputs = bundle.processor.apply_chat_template(
             message_lists,
@@ -80,11 +81,12 @@ class BooguImageTextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
             )
         hidden_states = encoder_out.last_hidden_state
 
-        return TextEmbedCondition(
+        cond = TextEmbedCondition(
             embeds=hidden_states.to(device=device, dtype=dtype),
             attn_mask=attention_mask,
             pooled=None,
         )
+        return cond if inverse is None else cond.select(inverse)
 
 
 __all__ = ["BooguImageTextEmbedStage", "SYSTEM_PROMPT_T2I", "SYSTEM_PROMPT_DROP"]
