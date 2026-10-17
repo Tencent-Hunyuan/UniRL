@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from unirl.models.types.embedding import EmbedStage
+from unirl.models.types.embedding import EmbedStage, dedup_prompts
 from unirl.types.conditions import TextEmbedCondition
 from unirl.types.primitives import Texts
 
@@ -27,17 +27,7 @@ class SD3TextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
 
     def embed(self, p: Texts) -> TextEmbedCondition:
         """Encode prompts into a ``TextEmbedCondition``."""
-        prompts = list(p.texts)
-        index_of: dict[str, int] = {}
-        inverse: list[int] = []
-        uniq: list[str] = []
-        for s in prompts:
-            i = index_of.get(s)
-            if i is None:
-                i = len(uniq)
-                index_of[s] = i
-                uniq.append(s)
-            inverse.append(i)
+        uniq, inverse = dedup_prompts(p.texts)
 
         bundle = self.bundle
         device = bundle.device
@@ -86,11 +76,8 @@ class SD3TextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
         clip_merged = torch.nn.functional.pad(clip_merged, (0, t5_embeds.shape[-1] - clip_merged.shape[-1]))
         embeds = torch.cat([clip_merged, t5_embeds], dim=-2)
 
-        if len(uniq) != len(prompts):
-            inv = torch.tensor(inverse, device=embeds.device)
-            embeds = embeds.index_select(0, inv)
-            pooled = pooled.index_select(0, inv)
-        return TextEmbedCondition(embeds=embeds, pooled=pooled)
+        cond = TextEmbedCondition(embeds=embeds, pooled=pooled)
+        return cond if inverse is None else cond.select(inverse)
 
 
 __all__ = ["SD3TextEmbedStage"]

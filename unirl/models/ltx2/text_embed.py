@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from unirl.models.types.embedding import dedup_prompts
 from unirl.types.conditions import TextEmbedCondition
 from unirl.types.primitives import Texts
 
@@ -38,21 +39,30 @@ class LTX2TextEmbedStage:
                 "states. Ensure the checkpoint's 'connectors' subfolder loaded."
             )
 
-        hidden_states, attention_mask = self._encode_prompts(texts.texts)
-        video_embeds, audio_embeds, conn_mask = self._apply_connectors(hidden_states, attention_mask)
-
+        video_cond, audio_cond = self._encode_branch(texts.texts)
         result = {
-            "text": TextEmbedCondition(embeds=video_embeds, attn_mask=conn_mask),
-            "audio_text": TextEmbedCondition(embeds=audio_embeds, attn_mask=conn_mask),
+            "text": video_cond,
+            "audio_text": audio_cond,
         }
 
         if negative_texts is not None:
-            neg_hidden_states, neg_mask = self._encode_prompts(negative_texts.texts)
-            neg_video, neg_audio, neg_conn_mask = self._apply_connectors(neg_hidden_states, neg_mask)
-            result["negative_text"] = TextEmbedCondition(embeds=neg_video, attn_mask=neg_conn_mask)
-            result["negative_audio_text"] = TextEmbedCondition(embeds=neg_audio, attn_mask=neg_conn_mask)
+            neg_video, neg_audio = self._encode_branch(negative_texts.texts)
+            result["negative_text"] = neg_video
+            result["negative_audio_text"] = neg_audio
 
         return result
+
+    def _encode_branch(self, prompts: list[str]) -> tuple[TextEmbedCondition, TextEmbedCondition]:
+        """Deduplicate prompts, run Gemma3 + connectors on unique entries, and restore batch order."""
+        uniq, inverse = dedup_prompts(prompts)
+        hidden_states, attention_mask = self._encode_prompts(uniq)
+        video_embeds, audio_embeds, conn_mask = self._apply_connectors(hidden_states, attention_mask)
+        video_cond = TextEmbedCondition(embeds=video_embeds, attn_mask=conn_mask)
+        audio_cond = TextEmbedCondition(embeds=audio_embeds, attn_mask=conn_mask)
+        if inverse is not None:
+            video_cond = video_cond.select(inverse)
+            audio_cond = audio_cond.select(inverse)
+        return video_cond, audio_cond
 
     def _encode_prompts(self, prompts: list[str]) -> tuple[torch.Tensor, torch.Tensor]:
         """Tokenize and return Gemma3's stacked all-layer hidden states."""

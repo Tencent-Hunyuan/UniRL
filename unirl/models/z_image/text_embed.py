@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from unirl.models.types.embedding import EmbedStage
+from unirl.models.types.embedding import EmbedStage, dedup_prompts
 from unirl.types.conditions import TextEmbedCondition
 from unirl.types.primitives import Texts
 
@@ -25,7 +25,7 @@ class ZImageTextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
 
     def embed(self, p: Texts) -> TextEmbedCondition:
         """Encode prompts into a ``TextEmbedCondition``."""
-        prompts = list(p.texts)
+        prompts, inverse = dedup_prompts(p.texts)
         bundle = self.bundle
         device = bundle.device
         dtype = next(bundle.text_encoder.parameters()).dtype
@@ -77,11 +77,12 @@ class ZImageTextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
             [torch.cat([item, item.new_zeros(max_seq_len - item.size(0))]) for item in attn_mask_list]
         )
 
-        return TextEmbedCondition(
+        cond = TextEmbedCondition(
             embeds=prompt_embeds.to(device=device, dtype=dtype),
             attn_mask=prompt_embeds_mask,
             pooled=None,
         )
+        return cond if inverse is None else cond.select(inverse)
 
 
 __all__ = ["ZImageTextEmbedStage"]
