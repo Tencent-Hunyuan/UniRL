@@ -1,7 +1,6 @@
 """Qwen2.5-VL vision-language pipeline on the typed stage/pipeline architecture."""
 
 from unirl.models.qwen_vl.ar import (
-    QwenVLARParams,
     QwenVLARStage,
     QwenVLARStep,
 )
@@ -13,7 +12,6 @@ from unirl.models.qwen_vl.pipeline import QwenVLPipeline
 
 __all__ = [
     "QwenVLARConditions",
-    "QwenVLARParams",
     "QwenVLARStage",
     "QwenVLARStep",
     "QwenVLBundle",

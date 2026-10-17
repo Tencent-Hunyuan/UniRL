@@ -4,7 +4,6 @@ from unirl.models.flux2_klein.bundle import Flux2KleinBundle
 from unirl.models.flux2_klein.conditions import Flux2KleinConditions
 from unirl.models.flux2_klein.config import Flux2KleinPipelineConfig
 from unirl.models.flux2_klein.diffusion import (
-    Flux2KleinDiffusionParams,
     Flux2KleinDiffusionStage,
     Flux2KleinDiffusionStep,
 )
@@ -19,7 +18,6 @@ from unirl.models.flux2_klein.vae import Flux2KleinVAEDecodeStage, Flux2KleinVAE
 __all__ = [
     "Flux2KleinBundle",
     "Flux2KleinConditions",
-    "Flux2KleinDiffusionParams",
     "Flux2KleinDiffusionStage",
     "Flux2KleinDiffusionStep",
     "Flux2KleinPipeline",
