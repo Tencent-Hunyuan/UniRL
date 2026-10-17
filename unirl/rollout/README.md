@@ -182,7 +182,8 @@ enabled, which UniRL's rollout backend does not do.
 - **Batch `generate` must dispatch `DP_SCATTER`.** Agentic is the intentional
   exception: its undecorated method is reached through one `Handle.slot(...)`.
 - **Direct sampling forbids a `sync:` block; dedicated requires one.** The trainside
-  engine also can't live on a `layout: separate` slab — `_build_rollout` raises.
+  engine also can't live on a `layout: separate` slab — the trainer `__init__` raises
+  before spawning actors.
 - **Quiesce before weight sync / eval / checkpoint on async paths** —
   `RolloutManager.quiesce()` pauses dispatch, drains batch work, and cooperatively
   suspends agentic trajectories at turn boundaries. `sync_weights()` rejects queued

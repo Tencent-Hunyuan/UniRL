@@ -115,7 +115,7 @@ def vae_bn_stats(vae: Any, *, device: torch.device, dtype: torch.dtype) -> tuple
     bn = getattr(vae, "bn", None)
     if bn is None or not hasattr(bn, "running_mean") or not hasattr(bn, "running_var"):
         return None
-    eps = float(getattr(getattr(vae, "config", None), "batch_norm_eps", 1e-4))
+    eps = vae.config.batch_norm_eps
     mean = bn.running_mean.view(1, -1, 1, 1).to(device=device, dtype=dtype)
     std = torch.sqrt(bn.running_var.view(1, -1, 1, 1).to(device=device, dtype=dtype) + eps)
     return mean, std

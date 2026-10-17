@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-from typing import List, Tuple
-
 import torch
 
-from unirl.models.types.embedding import EmbedStage
+from unirl.models.types.embedding import EmbedStage, dedup_prompts
 from unirl.types.conditions import TextEmbedCondition
 from unirl.types.primitives import Texts
 
@@ -39,32 +37,30 @@ class BooguImageTextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
 
     def embed(self, p: Texts) -> TextEmbedCondition:
         """Encode prompts into a ``TextEmbedCondition``."""
-        prompt_embeds, prompt_embeds_mask = self._encode(list(p.texts))
-        return TextEmbedCondition(
-            embeds=prompt_embeds,
-            attn_mask=prompt_embeds_mask,
-            pooled=None,
-        )
-
-    @staticmethod
-    def _messages(prompt: str) -> List[dict]:
-        """Build the reference chat-message list for one T2I prompt."""
-        system_prompt = SYSTEM_PROMPT_T2I if prompt and prompt.strip() else SYSTEM_PROMPT_DROP
-        return [
-            {"role": "system", "content": [{"type": "text", "text": system_prompt}]},
-            {"role": "user", "content": [{"type": "text", "text": prompt}]},
-        ]
-
-    def _encode(self, prompts: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
         bundle = self.bundle
         if bundle.text_encoder is None or bundle.processor is None:
             raise ValueError(
-                "BooguImageTextEmbedStage._encode: bundle has no text encoder/processor (load_text_encoder=False?)"
+                "BooguImageTextEmbedStage.embed: bundle has no text encoder/processor (load_text_encoder=False?)"
             )
+        prompts, inverse = dedup_prompts(p.texts)
         device = bundle.device
         dtype = next(bundle.text_encoder.parameters()).dtype
 
-        message_lists = [self._messages(prompt) for prompt in prompts]
+        message_lists = [
+            [
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": SYSTEM_PROMPT_T2I if prompt and prompt.strip() else SYSTEM_PROMPT_DROP,
+                        }
+                    ],
+                },
+                {"role": "user", "content": [{"type": "text", "text": prompt}]},
+            ]
+            for prompt in prompts
+        ]
         vlm_inputs = bundle.processor.apply_chat_template(
             message_lists,
             padding="longest",
@@ -85,7 +81,12 @@ class BooguImageTextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
             )
         hidden_states = encoder_out.last_hidden_state
 
-        return hidden_states.to(device=device, dtype=dtype), attention_mask
+        cond = TextEmbedCondition(
+            embeds=hidden_states.to(device=device, dtype=dtype),
+            attn_mask=attention_mask,
+            pooled=None,
+        )
+        return cond if inverse is None else cond.select(inverse)
 
 
 __all__ = ["BooguImageTextEmbedStage", "SYSTEM_PROMPT_T2I", "SYSTEM_PROMPT_DROP"]

@@ -229,9 +229,7 @@ class BooguImageDiffusionStage(DiffusionStage[BooguImageConditions]):
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="logprob_precision")
         self.vae_scale_factor = vae_scale_factor
         if latent_channels is None:
-            tx_cfg = getattr(model.transformer, "config", None)
-            in_channels = getattr(tx_cfg, "in_channels", 16) if tx_cfg is not None else 16
-            latent_channels = int(in_channels)
+            latent_channels = model.transformer.config.in_channels
         self.latent_channels = int(latent_channels)
         self._freqs_cis: Optional[List[torch.Tensor]] = None
         self._freqs_cis_device: Optional[torch.device] = None
@@ -249,7 +247,7 @@ class BooguImageDiffusionStage(DiffusionStage[BooguImageConditions]):
         lo, hi = params.sampler_kwargs.get("cfg_range", (0.0, 1.0))
         fraction = step_index / num_steps if num_steps > 0 else 0.0
         if float(lo) <= fraction <= float(hi):
-            return float(params.guidance_scale)
+            return params.guidance_scale
         return 1.0
 
     def diffuse(
@@ -268,16 +266,16 @@ class BooguImageDiffusionStage(DiffusionStage[BooguImageConditions]):
         prompt_embeds = conditions.text.embeds
         device = prompt_embeds.device
         batch_size = int(prompt_embeds.shape[0])
-        T = int(params.num_inference_steps)
+        T = params.num_inference_steps
         if int(schedule.shape[0]) != T + 1:
             raise ValueError(f"BooguImageDiffusionStage.diffuse: schedule length {schedule.shape[0]} != T+1={T + 1}")
         schedule = schedule.to(device)
         self.strategy.init_schedule(schedule)
 
-        vsf = int(self.vae_scale_factor)
-        latent_h = 2 * (int(params.height) // (vsf * 2))
-        latent_w = 2 * (int(params.width) // (vsf * 2))
-        expected_latent_shape = (int(self.latent_channels), latent_h, latent_w)
+        vsf = self.vae_scale_factor
+        latent_h = 2 * (params.height // (vsf * 2))
+        latent_w = 2 * (params.width // (vsf * 2))
+        expected_latent_shape = (self.latent_channels, latent_h, latent_w)
         if initial_latents is not None:
             if int(initial_latents.shape[0]) != batch_size:
                 raise ValueError(
@@ -288,7 +286,7 @@ class BooguImageDiffusionStage(DiffusionStage[BooguImageConditions]):
                 raise ValueError(
                     f"BooguImageDiffusionStage.diffuse: initial_latents.shape[1:]="
                     f"{tuple(initial_latents.shape[1:])} != expected {expected_latent_shape} "
-                    f"for height={int(params.height)}, width={int(params.width)}."
+                    f"for height={params.height}, width={params.width}."
                 )
             latents = initial_latents.to(device=device, dtype=self.trajectory_dtype)
         else:
@@ -297,13 +295,13 @@ class BooguImageDiffusionStage(DiffusionStage[BooguImageConditions]):
                 latent_shape=expected_latent_shape,
                 device=device,
                 dtype=self.trajectory_dtype,
-                init_same_noise=bool(params.init_same_noise),
-                samples_per_prompt=int(params.samples_per_prompt),
+                init_same_noise=params.init_same_noise,
+                samples_per_prompt=params.samples_per_prompt,
                 noise_group_ids=params.noise_group_ids,
-                base_seed=int(params.seed),
+                base_seed=params.seed,
             )
 
-        sde_set: Set[int] = set(int(i) for i in (params.sde_indices or []))
+        sde_set: Set[int] = set(params.sde_indices or ())
         sde_sorted: List[int] = sorted(sde_set)
 
         needed: Set[int] = set(compute_trajectory_positions(sde_set, T))
@@ -326,7 +324,7 @@ class BooguImageDiffusionStage(DiffusionStage[BooguImageConditions]):
         for i in range(T):
             sigma = schedule[i].to(device)
             sigma_next = schedule[i + 1].to(device)
-            step_eta = float(params.eta) if i in sde_set else 0.0
+            step_eta = params.eta if i in sde_set else 0.0
 
             with torch.no_grad(), autocast_ctx:
                 new_latents, log_prob, _ = self.step.step_with_logp(
@@ -380,12 +378,8 @@ class BooguImageDiffusionStage(DiffusionStage[BooguImageConditions]):
         if segment.sigmas is None:
             raise ValueError("BooguImageDiffusionStage.replay: segment.sigmas missing")
 
-        sde_set = set(int(i) for i in segment.sde_indices.tolist())
-        target = (
-            [int(i) for i in step_indices]
-            if step_indices is not None
-            else [int(i) for i in segment.sde_indices.tolist()]
-        )
+        sde_set = set(segment.sde_indices.tolist())
+        target = list(step_indices) if step_indices is not None else segment.sde_indices.tolist()
         bad = [i for i in target if i not in sde_set]
         if bad:
             raise ValueError(
@@ -420,7 +414,7 @@ class BooguImageDiffusionStage(DiffusionStage[BooguImageConditions]):
                     sigma=sigma,
                     sigma_next=sigma_next,
                     guidance_scale=self._effective_guidance_scale(step_idx, num_steps, params),
-                    eta=float(params.eta),
+                    eta=params.eta,
                     sigma_max=sigma_max,
                     step_index=step_idx,
                     freqs_cis=freqs_cis,
@@ -453,7 +447,7 @@ class BooguImageDiffusionStage(DiffusionStage[BooguImageConditions]):
             sample,
             sigma,
             conditions,
-            guidance_scale=float(params.guidance_scale),
+            guidance_scale=params.guidance_scale,
             freqs_cis=self._get_freqs_cis(torch.device(self.model.device)),
         )
 

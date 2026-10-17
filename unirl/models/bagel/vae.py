@@ -24,8 +24,8 @@ def bagel_latent_geometry(
     latent_downsample: int,
 ) -> Tuple[int, int]:
     """Token grid ``(h, w)`` for an ``(H, W)`` image: ``h = H // latent_downsample``."""
-    H, W = int(image_shape[0]), int(image_shape[1])
-    return H // int(latent_downsample), W // int(latent_downsample)
+    H, W = image_shape[0], image_shape[1]
+    return H // latent_downsample, W // latent_downsample
 
 
 def bagel_latent_shape(
@@ -37,7 +37,7 @@ def bagel_latent_shape(
 ) -> Tuple[int, int]:
     """Packed per-sample noise shape ``(seq, p²·z)`` for an ``(H, W)`` image."""
     h, w = bagel_latent_geometry(image_shape, latent_downsample=latent_downsample)
-    return h * w, int(latent_patch_size) ** 2 * int(latent_channels)
+    return h * w, latent_patch_size**2 * latent_channels
 
 
 def unpatchify_latent(
@@ -50,7 +50,7 @@ def unpatchify_latent(
 ) -> torch.Tensor:
     """Unpatchify packed ``[N, h·w, p²·z]`` → spatial ``[N, z, h·p, w·p]``."""
     n = int(packed.shape[0])
-    p, z = int(patch_size), int(latent_channels)
+    p, z = patch_size, latent_channels
     x = packed.reshape(n, h, w, p, p, z)
     x = torch.einsum("nhwpqc->nchpwq", x)
     return x.reshape(n, z, h * p, w * p)
@@ -82,10 +82,10 @@ class BagelVAEDecodeStage(DecodeStage[LatentSegment, Images]):
         clean = s.latents[:, -1]
         n, seq, _ = clean.shape
 
-        p = int(self.bundle.latent_patch_size)
-        z = int(self.bundle.latent_channels)
+        p = self.bundle.latent_patch_size
+        z = self.bundle.latent_channels
         if image_shape is not None:
-            h, w = bagel_latent_geometry(image_shape, latent_downsample=int(self.bundle.latent_downsample))
+            h, w = bagel_latent_geometry(image_shape, latent_downsample=self.bundle.latent_downsample)
         else:
             side = isqrt(seq)
             if side * side != seq:
@@ -162,9 +162,7 @@ class BagelVAEEncodeStage:
             )
         h, w = bagel_latent_geometry((height, width), latent_downsample=down)
         vae = self.bundle.vae
-        reg = getattr(vae, "reg", None)
-        if reg is None or not hasattr(reg, "sample"):
-            raise RuntimeError("BagelVAEEncodeStage: bundle.vae has no .reg gaussian — vendored API changed?")
+        reg = vae.reg
         x = (pixels.to(device=self.bundle.device, dtype=self.bundle.vae_dtype) * 2.0 - 1.0).contiguous()
         prev_sample = reg.sample
         reg.sample = False  # deterministic posterior mean, not a draw

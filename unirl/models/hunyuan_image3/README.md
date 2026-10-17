@@ -20,3 +20,17 @@ Re-check these when the checkpoint revision moves:
 - `position_ids` are also the KV-cache write indices (`cache_position`), so
   `HunyuanImage3FusedMultimodalCondition.concat` pads them with continuing indices; a `0` pad
   would overwrite the first real token's KV.
+- Upstream sizes RoPE by the wrapper's `training` flag: `True` builds a table as long as the
+  input, `False` builds `max_position_embeddings` and gathers it by `position_ids`. Its resting
+  value depends on the builder (`from_config` leaves `False`, `from_meta_config` `True`), so every
+  wrapper forward runs inside `HunyuanImage3Bundle.rope_mode`: `replay` pins `True` (no
+  `position_ids`), AR decode `False` (gathers at `real_pos + step`), and diffusion `True` only
+  when it seeds `cached_rope` at input length. Only the attribute is set; `.train()` / `.eval()`
+  would also flip the backend-owned `transformer.model` and the frozen VAE / ViT.
+- Upstream `tokenization_hunyuan_image_3.py` silently drops all but the first sample in batched
+  chat-template calls: `apply_general_template(batchify=True)` passes `prompt_list=[[]]` to
+  `batch_gen_infer` and `zip`s it against the per-sample kwargs, so
+  `apply_chat_template(batch_prompt=[...])` returns `cfg_factor` rows instead of
+  `len(batch_prompt) * cfg_factor`. `_apply_chat_template` raises on that mismatch; otherwise the
+  AR path fails later in `instantiate_continuous_tokens` (`i2t`) or `Part.fill` (`t2t` / `t2ti`),
+  and the diffusion path at `split_cfg_fused`. Shipped recipes pin `rollout.forward_batch_size: 1`.

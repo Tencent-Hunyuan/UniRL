@@ -62,8 +62,8 @@ class ZImagePipeline(Pipeline):
     @classmethod
     def latent_shape(cls, *, model_config: Any, sampling_spec: Any) -> tuple:
         """Per-sample latent shape ``(C, H_lat, W_lat)`` for driver-side noise pre-computation."""
-        height = int(sampling_spec.height)
-        width = int(sampling_spec.width)
+        height = sampling_spec.height
+        width = sampling_spec.width
         vae_scale_factor = 8
         latent_h = 2 * (height // (vae_scale_factor * 2))
         latent_w = 2 * (width // (vae_scale_factor * 2))
@@ -95,14 +95,14 @@ class ZImagePipeline(Pipeline):
             text_embed=text_embed,
             diffusion=diffusion,
             vae_decode=vae_decode,
-            shift=float(config.shift),
+            shift=config.shift,
         )
 
     def build_schedule_policy(self):
         """Static-shift FlowMatch σ policy (Z-Image uses no dynamic shift)."""
         from unirl.sde.runtime import FlowMatchSchedulePolicy
 
-        return FlowMatchSchedulePolicy.static_only(float(self.shift))
+        return FlowMatchSchedulePolicy.static_only(self.shift)
 
     def build_conditions(
         self,
@@ -147,10 +147,10 @@ class ZImagePipeline(Pipeline):
                 f"got {type(texts).__name__ if texts is not None else 'None'}"
             )
 
-        if bool(params.init_same_noise) and not params.noise_group_ids:
+        if params.init_same_noise and not params.noise_group_ids:
             params = dataclasses.replace(params, noise_group_ids=list(frontier.group_ids))
 
-        z_conds = self.build_conditions(texts, guidance_scale=float(params.guidance_scale))
+        z_conds = self.build_conditions(texts, guidance_scale=params.guidance_scale)
         schedule = params.sigmas.to(self.bundle.device)
 
         initial_latents = NoiseRecipe.from_sample(sample).resolve()
