@@ -62,13 +62,14 @@ class HunyuanVideo15Pipeline(Pipeline):
         if diffusion is None:
             diffusion = HunyuanVideo15DiffusionStage(
                 model=bundle,
-                step=HunyuanVideo15DiffusionStep(),
+                step=HunyuanVideo15DiffusionStep(
+                    vision_num_semantic_tokens=vision_num_semantic_tokens,
+                    vision_states_dim=vision_states_dim,
+                ),
                 strategy=strategy if strategy is not None else DanceSDEStrategy(),
                 autocast_precision=autocast_precision,
                 trajectory_precision=trajectory_precision,
                 logprob_precision=logprob_precision,
-                vision_num_semantic_tokens=vision_num_semantic_tokens,
-                vision_states_dim=vision_states_dim,
                 latent_channels=latent_channels,
                 batch_replay_steps=batch_replay_steps,
             )
@@ -111,7 +112,10 @@ class HunyuanVideo15Pipeline(Pipeline):
             mllm_skip_layers=config.mllm_skip_layers,
             byt5_max_length=config.byt5_max_length,
         )
-        step = HunyuanVideo15DiffusionStep()
+        step = HunyuanVideo15DiffusionStep(
+            vision_num_semantic_tokens=config.vision_num_semantic_tokens,
+            vision_states_dim=config.vision_states_dim,
+        )
         diffusion = HunyuanVideo15DiffusionStage(
             model=bundle,
             step=step,
@@ -119,8 +123,6 @@ class HunyuanVideo15Pipeline(Pipeline):
             autocast_precision=config.autocast_precision,
             trajectory_precision=config.trajectory_precision,
             logprob_precision=config.logprob_precision,
-            vision_num_semantic_tokens=config.vision_num_semantic_tokens,
-            vision_states_dim=config.vision_states_dim,
             latent_channels=config.latent_channels,
             batch_replay_steps=config.batch_replay_steps,
         )
