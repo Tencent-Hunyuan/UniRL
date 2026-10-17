@@ -90,7 +90,7 @@ class BatchedStepReplayMixin:
         audio_strategy: Optional["StepStrategy"] = None,
         audio_sigmas: Optional[torch.Tensor] = None,
         audio_sigma_max: Optional[float] = None,
-        audio_in_policy: bool = True,
+        audio_in_policy: bool,
         concat_audio_mean: bool = False,
         latent_dtype: Optional[torch.dtype] = None,
     ) -> ReplayResult:
@@ -128,7 +128,7 @@ class BatchedStepReplayMixin:
         )
         if log_prob_all is None:
             raise RuntimeError(
-                f"{type(self).__name__}._replay_batched_steps: strategy returned None "
+                f"{type(self).__name__}._replay_batched_joint_av_steps: strategy returned None "
                 f"log-prob (deterministic mode); batched replay requires a stochastic "
                 f"SDE strategy."
             )
@@ -147,7 +147,7 @@ class BatchedStepReplayMixin:
             )
             if audio_log_prob_all is None:
                 raise RuntimeError(
-                    f"{type(self).__name__}._replay_batched_steps: audio strategy returned None "
+                    f"{type(self).__name__}._replay_batched_joint_av_steps: audio strategy returned None "
                     f"log-prob; joint audio SDE requires a stochastic strategy."
                 )
             log_prob_all = combine_modality_logp(
