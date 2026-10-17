@@ -27,7 +27,7 @@ class LTX2VAEDecodeStage:
         latents_f32 = latents.to(torch.float32)
 
         timestep = None
-        if bool(getattr(vae.config, "timestep_conditioning", False)):
+        if vae.config.timestep_conditioning:
             timestep = torch.zeros(latents_f32.shape[0], device=latents_f32.device, dtype=latents_f32.dtype)
 
         decoded = vae.to(torch.float32).decode(latents_f32, timestep, return_dict=False)[0]
@@ -66,32 +66,18 @@ class LTX2AudioDecodeStage:
         self.vocoder = bundle.vocoder
         self.dtype = bundle.dtype
 
-    @staticmethod
-    def _denormalize_audio_latents(
-        latents: torch.Tensor, latents_mean: torch.Tensor, latents_std: torch.Tensor
-    ) -> torch.Tensor:
-        """Inverse of the audio VAE normalization, on the packed ``[B, S, D]`` latent (verbatim from diffusers)."""
-        latents_mean = latents_mean.to(latents.device, latents.dtype)
-        latents_std = latents_std.to(latents.device, latents.dtype)
-        return latents * latents_std + latents_mean
-
-    @staticmethod
-    def _unpack_audio_latents(latents: torch.Tensor, latent_length: int, num_mel_bins: int) -> torch.Tensor:
-        """Packed ``[B, L, C*M]`` to spectrogram ``[B, C, L, M]`` — diffusers ``_unpack_audio_latents``, verbatim."""
-        return latents.unflatten(2, (-1, num_mel_bins)).transpose(1, 2)
-
     @torch.no_grad()
     def decode(self, audio_latents: torch.Tensor, *, audio_latent_length: int) -> torch.Tensor:
         """Decode packed audio latents → waveform."""
-        mel_bins = int(getattr(self.audio_vae.config, "mel_bins", 64))
-        mel_compression = int(getattr(self.audio_vae, "mel_compression_ratio", 4))
+        mel_bins = self.audio_vae.config.mel_bins
+        mel_compression = self.audio_vae.mel_compression_ratio
         latent_mel_bins = mel_bins // mel_compression
 
-        aud = self._denormalize_audio_latents(
-            audio_latents.float(), self.audio_vae.latents_mean, self.audio_vae.latents_std
-        )
-        aud = self._unpack_audio_latents(aud, audio_latent_length, num_mel_bins=latent_mel_bins)
-        aud = aud.to(torch.float32)
+        aud = audio_latents.float()
+        latents_mean = self.audio_vae.latents_mean.to(aud.device, aud.dtype)
+        latents_std = self.audio_vae.latents_std.to(aud.device, aud.dtype)
+        aud = aud * latents_std + latents_mean
+        aud = aud.unflatten(2, (-1, latent_mel_bins)).transpose(1, 2).to(torch.float32)
         mel = self.audio_vae.to(torch.float32).decode(aud, return_dict=False)[0]
         waveform = self.vocoder.to(torch.float32)(mel)
         return waveform

@@ -16,12 +16,6 @@ _EP_PLAN = {
 }
 
 
-def _swap_gate_up_halves(gate_and_up: torch.Tensor) -> torch.Tensor:
-    """Swap the two output halves of a fused gate_and_up tensor ``[..., 2I, H]``."""
-    half = gate_and_up.shape[-2] // 2
-    return torch.cat([gate_and_up[..., half:, :], gate_and_up[..., :half, :]], dim=-2)
-
-
 def fuse_expert_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     """Stack per-expert weights into fused ``[E, ...]`` tensors (load-time converter)."""
     groups: Dict[tuple, Dict[int, torch.Tensor]] = {}
@@ -42,14 +36,15 @@ def fuse_expert_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, tor
             )
         stacked = torch.stack([per_idx[j] for j in indices], dim=0)
         if proj == "gate_and_up_proj":
-            stacked = _swap_gate_up_halves(stacked).contiguous()
+            half = stacked.shape[-2] // 2
+            stacked = torch.cat([stacked[..., half:, :], stacked[..., :half, :]], dim=-2).contiguous()
         out[f"{prefix}.{proj}"] = stacked
     return out
 
 
 def get_hi3_parallel_plan():
     """Return the VeOmni ``ParallelPlan`` for HI3 expert parallelism (Shard(0))."""
-    from torch.distributed._tensor import Shard
+    from torch.distributed.tensor import Shard
     from veomni.distributed.parallel_plan import ParallelPlan
 
     ep_plan = {fqn: Shard(dim) for fqn, dim in _EP_PLAN.items()}
@@ -119,8 +114,8 @@ def is_fused_expert_key(key: str) -> bool:
 def replace_hunyuan_moe_with_fused(decoder: nn.Module) -> int:
     """In-place: swap every ``HunyuanMoE`` mlp for a :class:`FusedHunyuanMoE` and attach ``get_parallel_plan``."""
     n = 0
-    for layer in getattr(decoder, "layers", []):
-        mlp = getattr(layer, "mlp", None)
+    for layer in decoder.layers:
+        mlp = layer.mlp
         if type(mlp).__name__ != "HunyuanMoE":
             continue
         w = mlp.experts[0].gate_and_up_proj.weight
@@ -135,6 +130,8 @@ def replace_hunyuan_moe_with_fused(decoder: nn.Module) -> int:
             device=w.device,
         )
         n += 1
+    if n == 0:
+        raise RuntimeError(f"replace_hunyuan_moe_with_fused: found 0 HunyuanMoE layers on {type(decoder).__name__}")
     decoder.get_parallel_plan = get_hi3_parallel_plan  # type: ignore[attr-defined]
     return n
 

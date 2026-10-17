@@ -1,12 +1,10 @@
-"""Qwen3.5 AR stage: typed params + per-token kernel + rollout-level stage."""
+"""Qwen3.5 AR stage: per-token kernel + rollout-level stage."""
 
 from __future__ import annotations
 
 import inspect
 import logging
 from contextlib import nullcontext
-from dataclasses import dataclass
-from dataclasses import field as dc_field
 from types import MethodType
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -15,7 +13,15 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-from unirl.models.types.ar import ARSamplingParams, ARStage, ARStep, left_pad_prompt
+from unirl.models.types.ar import (
+    ARSamplingParams,
+    ARStage,
+    ARStep,
+    concat_optional_tensors,
+    left_pad_prompt,
+    pack_generated_text_segment,
+    resolve_ar_stop_ids,
+)
 from unirl.types.segments import TextSegment
 from unirl.utils.dtypes import parse_torch_dtype
 
@@ -93,17 +99,6 @@ def _replay_aware_forward(
     return torch.cat(parts, dim=1)
 
 
-@dataclass
-class Qwen3_5ARParams:
-    """Per-request AR-mode knobs for Qwen3.5."""
-
-    max_tokens: int = 512
-    temperature: float = 0.7
-    top_p: float = 0.9
-    top_k: int = 0
-    stop_token_ids: List[int] = dc_field(default_factory=list)
-
-
 class Qwen3_5ARStep(ARStep):
     """Per-token sampling kernel (mirrors Qwen3ARStep)."""
 
@@ -156,16 +151,6 @@ class Qwen3_5ARStep(ARStep):
         token_id = torch.multinomial(probs, num_samples=1).squeeze(-1)
         log_prob = log_probs_full.gather(-1, token_id.unsqueeze(-1)).squeeze(-1)
         return token_id, log_prob
-
-
-def _merge_per_sample(
-    per_sample: Optional[List[Optional[torch.Tensor]]],
-) -> Optional[torch.Tensor]:
-    """Cat per-sample media tensors into a single flat tensor for the model."""
-    if per_sample is None:
-        return None
-    parts = [t for t in per_sample if t is not None]
-    return torch.cat(parts, dim=0) if parts else None
 
 
 def _vision_rope_positions(
@@ -253,7 +238,6 @@ class Qwen3_5ARStage(ARStage[Qwen3_5ARConditions]):
         conditions: Qwen3_5ARConditions,
         *,
         sampling_params: ARSamplingParams,
-        params: Optional[Qwen3_5ARParams] = None,
         **_kwargs: Any,
     ) -> TextSegment:
         if conditions.prompt is None or conditions.prompt.input_ids is None:
@@ -266,24 +250,25 @@ class Qwen3_5ARStage(ARStage[Qwen3_5ARConditions]):
         attention_mask: torch.Tensor = conditions.prompt.attention_mask
         device = input_ids.device
 
-        pad_id = self.model.tokenizer.pad_token_id or 0
+        raw_pad_id = self.model.tokenizer.pad_token_id
+        pad_id = 0 if raw_pad_id is None else int(raw_pad_id)
         input_ids, attention_mask = left_pad_prompt(input_ids, attention_mask, pad_id)
         batch_size = int(input_ids.shape[0])
 
         transformer.model.rope_deltas = None
 
-        stop_ids = self._resolve_stop_ids(params, sampling_params)
+        stop_ids = resolve_ar_stop_ids(sampling_params, self.model.tokenizer)
         forbidden_ids = _reserved_generation_token_ids(transformer)
         step = Qwen3_5ARStep(
-            temperature=float(sampling_params.temperature),
-            top_p=float(sampling_params.top_p),
-            top_k=int(sampling_params.top_k),
+            temperature=sampling_params.temperature,
+            top_p=sampling_params.top_p,
+            top_k=sampling_params.top_k,
             forbidden_token_ids=forbidden_ids,
         )
-        max_new = int(sampling_params.max_new_tokens)
+        max_new = sampling_params.max_new_tokens
 
-        pv = _merge_per_sample(conditions.pixel_values)
-        igt = _merge_per_sample(conditions.image_grid_thw)
+        pv = concat_optional_tensors(conditions.pixel_values)
+        igt = concat_optional_tensors(conditions.image_grid_thw)
         if pv is not None:
             pv = pv.to(device)
         if igt is not None:
@@ -401,7 +386,7 @@ class Qwen3_5ARStage(ARStage[Qwen3_5ARConditions]):
                 )
             is_first_step = False
 
-        return _pack_text_segment(generated_tokens, per_token_logps, device=device)
+        return pack_generated_text_segment(generated_tokens, per_token_logps, device=device)
 
     def replay(
         self,
@@ -433,8 +418,8 @@ class Qwen3_5ARStage(ARStage[Qwen3_5ARConditions]):
         prompt_mask = conditions.prompt.attention_mask.to(device)
         batch_size = int(prompt_ids.shape[0])
 
-        pv = _merge_per_sample(conditions.pixel_values)
-        igt = _merge_per_sample(conditions.image_grid_thw)
+        pv = concat_optional_tensors(conditions.pixel_values)
+        igt = concat_optional_tensors(conditions.image_grid_thw)
         if pv is not None:
             pv = pv.to(device)
         if igt is not None:
@@ -445,7 +430,8 @@ class Qwen3_5ARStage(ARStage[Qwen3_5ARConditions]):
         prompt_ids = prompt_ids[:, :max_real_len]
         prompt_mask = prompt_mask[:, :max_real_len]
 
-        pad_id = self.model.tokenizer.pad_token_id or 0
+        raw_pad_id = self.model.tokenizer.pad_token_id
+        pad_id = 0 if raw_pad_id is None else int(raw_pad_id)
 
         if int(real_lens.min().item()) < max_real_len:
             left_padded_ids = torch.full_like(prompt_ids, pad_id)
@@ -537,41 +523,5 @@ class Qwen3_5ARStage(ARStage[Qwen3_5ARConditions]):
             return torch.zeros(0, dtype=self.logprob_dtype, device=device)
         return torch.cat(flat, dim=0).to(dtype=self.logprob_dtype)
 
-    def _resolve_stop_ids(
-        self,
-        params: Optional[Qwen3_5ARParams],
-        sampling_params: ARSamplingParams,
-    ) -> List[int]:
-        ids: List[int] = []
-        if params is not None and params.stop_token_ids:
-            ids.extend(int(t) for t in params.stop_token_ids)
-        if sampling_params.stop_token_id is not None:
-            ids.append(int(sampling_params.stop_token_id))
-        eos = self.model.tokenizer.eos_token_id
-        if eos is not None:
-            if isinstance(eos, (list, tuple)):
-                ids.extend(int(t) for t in eos)
-            else:
-                ids.append(int(eos))
-        seen: set = set()
-        out: List[int] = []
-        for t in ids:
-            if t not in seen:
-                seen.add(t)
-                out.append(t)
-        return out
 
-
-def _pack_text_segment(
-    generated_tokens: List[List[int]],
-    per_token_logps: List[List[float]],
-    *,
-    device: torch.device,
-) -> TextSegment:
-    return TextSegment.pack(
-        tokens=[torch.tensor(toks, dtype=torch.long, device=device) for toks in generated_tokens],
-        log_probs=[torch.tensor(lps, dtype=torch.float32, device=device) for lps in per_token_logps],
-    )
-
-
-__all__ = ["Qwen3_5ARParams", "Qwen3_5ARStage", "Qwen3_5ARStep"]
+__all__ = ["Qwen3_5ARStage", "Qwen3_5ARStep"]

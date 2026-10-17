@@ -19,14 +19,6 @@ from unirl.rollout.engine.fastvideo._patches.compat import (
 from unirl.sde.unipc import UniPCSpec, UniPCStrategy
 
 
-def _scheduler_timestep_scale(scheduler: Any) -> float:
-    """Return the live scheduler's own timestep scale, which ``index_for_timestep`` matches against."""
-    actual = getattr(scheduler.config, "num_train_timesteps", None)
-    if not isinstance(actual, (int, float)) or not float(actual) > 0.0:
-        raise RuntimeError(f"FastVideo scheduler has no usable num_train_timesteps: {actual!r}")
-    return float(actual)
-
-
 @dataclass(frozen=True)
 class FastVideoUniPCPlan:
     """Per-request SDE/UniPC dispatch plan carried into FastVideo workers through ``RLData.sde_type``."""
@@ -37,7 +29,7 @@ class FastVideoUniPCPlan:
     timestep_scale: float = 0.0
 
     def __post_init__(self) -> None:
-        canonical = str(self.sde_type).strip().lower()
+        canonical = self.sde_type.strip().lower()
         if canonical not in {"flow", "dance"}:
             raise ValueError(f"FastVideo UniPC supports SDE type 'flow' or 'dance'; got {self.sde_type!r}")
         indices = tuple(int(i) for i in self.sde_indices)
@@ -55,127 +47,102 @@ class FastVideoUniPCPlan:
         object.__setattr__(self, "timestep_scale", scale)
 
 
-def _strategy_from_plan(scheduler: Any, plan: FastVideoUniPCPlan) -> UniPCStrategy:
-    """Build the canonical strategy from the plan spec after validating the live worker scheduler contract."""
-    config = scheduler.config
-    prediction_type = str(getattr(config, "prediction_type", ""))
-    if prediction_type != "flow_prediction":
-        raise RuntimeError(f"FastVideo UniPC requires prediction_type='flow_prediction'; got {prediction_type!r}")
-    if not bool(getattr(scheduler, "predict_x0", True)):
-        raise RuntimeError("FastVideo UniPC requires predict_x0=True")
-    if bool(getattr(config, "thresholding", False)):
-        raise RuntimeError("FastVideo UniPC does not support thresholding=True")
-    if getattr(scheduler, "solver_p", None) is not None:
-        raise RuntimeError("FastVideo UniPC does not support a nested solver_p")
-    # The checkpoint solver spec is verified engine-side at init (README: Solver SSOT).
-    return UniPCStrategy(config=plan.spec)
-
-
-def _patch_scheduler_set_timesteps() -> None:
-    """Wrap ``FlowUniPCMultistepScheduler.set_timesteps`` to consume canonical sigmas verbatim with float timesteps."""
-    module = import_fastvideo_module(
+def patch_unipc() -> None:
+    """Pin the scheduler to canonical sigmas, then dispatch non-SDE step indices to UniPC."""
+    sched_module = import_fastvideo_module(
         "fastvideo.models.schedulers.scheduling_flow_unipc_multistep", "FlowUniPCMultistepScheduler"
     )
-    FlowUniPCMultistepScheduler = require_attr(module, "FlowUniPCMultistepScheduler", "FlowUniPCMultistepScheduler")
+    FlowUniPCMultistepScheduler = require_attr(
+        sched_module, "FlowUniPCMultistepScheduler", "FlowUniPCMultistepScheduler"
+    )
 
-    original = FlowUniPCMultistepScheduler.set_timesteps
-    if getattr(original, "_unirl_canonical_sigmas", False):
-        return
-    require_signature(original, SET_TIMESTEPS_PARAMS, "FlowUniPCMultistepScheduler.set_timesteps")
+    orig_set_timesteps = FlowUniPCMultistepScheduler.set_timesteps
+    if not getattr(orig_set_timesteps, "_unirl_canonical_sigmas", False):
+        require_signature(orig_set_timesteps, SET_TIMESTEPS_PARAMS, "FlowUniPCMultistepScheduler.set_timesteps")
 
-    @functools.wraps(original)
-    def set_timesteps(
-        self,
-        num_inference_steps: Optional[int] = None,
-        device: Optional[torch.device | str] = None,
-        sigmas: Optional[list[float]] = None,
-        mu: Optional[float] = None,
-        shift: Optional[float] = None,
-        use_karras_sigmas: Optional[bool] = None,
-        use_kerras_sigma: Optional[bool] = None,
-    ) -> None:
-        if sigmas is None:
-            original(
-                self,
-                num_inference_steps=num_inference_steps,
-                device=device,
-                sigmas=None,
-                mu=mu,
-                shift=shift,
-                use_karras_sigmas=use_karras_sigmas,
-                use_kerras_sigma=use_kerras_sigma,
-            )
-            self._unirl_canonical_schedule = False
-            self._unirl_timestep_scale = None
+        @functools.wraps(orig_set_timesteps)
+        def set_timesteps(
+            self,
+            num_inference_steps: Optional[int] = None,
+            device: Optional[torch.device | str] = None,
+            sigmas: Optional[list[float]] = None,
+            mu: Optional[float] = None,
+            shift: Optional[float] = None,
+            use_karras_sigmas: Optional[bool] = None,
+            use_kerras_sigma: Optional[bool] = None,
+        ) -> None:
+            if sigmas is None:
+                orig_set_timesteps(
+                    self,
+                    num_inference_steps=num_inference_steps,
+                    device=device,
+                    sigmas=None,
+                    mu=mu,
+                    shift=shift,
+                    use_karras_sigmas=use_karras_sigmas,
+                    use_kerras_sigma=use_kerras_sigma,
+                )
+                self._unirl_canonical_schedule = False
+                self._unirl_timestep_scale = None
+                self._unirl_unipc_strategy = None
+                self._unirl_device_sigmas = None
+                return
+
+            if mu is not None or shift is not None or use_karras_sigmas or use_kerras_sigma:
+                raise ValueError(
+                    "FastVideo received a canonical external sigma schedule together with a schedule transform"
+                )
+
+            external = np.asarray(sigmas, dtype=np.float32)
+            if external.ndim != 1 or external.size == 0:
+                raise ValueError("FastVideo canonical sigmas must be a non-empty one-dimensional sequence")
+            if not np.isfinite(external).all():
+                raise ValueError("FastVideo canonical sigmas must all be finite")
+            if np.any(external < 0.0) or np.any(external > 1.0):
+                raise ValueError("FastVideo canonical sigmas must be normalized to [0, 1]")
+            if np.any(external[1:] >= external[:-1]):
+                raise ValueError(
+                    "FastVideo canonical sigmas must be strictly decreasing; duplicate adjacent "
+                    "sigmas alias to one index_for_timestep slot and break UniPC dispatch"
+                )
+            if external[-1] == 0.0:
+                raise ValueError("FastVideo external sigmas must omit the terminal zero")
+            if num_inference_steps is not None and num_inference_steps != external.size:
+                raise ValueError(
+                    f"FastVideo num_inference_steps={num_inference_steps} does not match "
+                    f"the external sigma count {external.size}"
+                )
+            if self.config.final_sigmas_type != "zero":
+                raise ValueError("FastVideo canonical UniPC requires final_sigmas_type='zero'")
+
+            raw_scale = self.config.num_train_timesteps
+            if not isinstance(raw_scale, (int, float)) or not raw_scale > 0:
+                raise RuntimeError(f"FastVideo scheduler has no usable num_train_timesteps: {raw_scale!r}")
+            timestep_scale = float(raw_scale)
+            terminal = np.zeros(1, dtype=np.float32)
+            schedule = np.concatenate([external, terminal])
+            self.sigmas = torch.from_numpy(schedule).cpu()
+            self.timesteps = torch.from_numpy(external * timestep_scale).to(device=device, dtype=torch.float32)
+            self.num_inference_steps = int(external.size)
+
+            solver_order = self.config.solver_order
+            self.model_outputs = [None] * solver_order
+            self.timestep_list = [None] * solver_order
+            self.lower_order_nums = 0
+            self.last_sample = None
+            self._step_index = None
+            self._begin_index = None
+
+            # The strategy is built lazily at the first UniPC-dispatched denoising
+            # call, from the request plan's model-owned spec (README: dispatch).
+            self._unirl_canonical_schedule = True
+            self._unirl_timestep_scale = timestep_scale
             self._unirl_unipc_strategy = None
             self._unirl_device_sigmas = None
-            return
 
-        if mu is not None or shift is not None or bool(use_karras_sigmas) or bool(use_kerras_sigma):
-            raise ValueError(
-                "FastVideo received a canonical external sigma schedule together with a schedule transform"
-            )
+        set_timesteps._unirl_canonical_sigmas = True  # type: ignore[attr-defined]
+        FlowUniPCMultistepScheduler.set_timesteps = set_timesteps
 
-        external = np.asarray(sigmas, dtype=np.float32)
-        if external.ndim != 1 or external.size == 0:
-            raise ValueError("FastVideo canonical sigmas must be a non-empty one-dimensional sequence")
-        if not np.isfinite(external).all():
-            raise ValueError("FastVideo canonical sigmas must all be finite")
-        if np.any(external < 0.0) or np.any(external > 1.0):
-            raise ValueError("FastVideo canonical sigmas must be normalized to [0, 1]")
-        if np.any(external[1:] >= external[:-1]):
-            raise ValueError(
-                "FastVideo canonical sigmas must be strictly decreasing; duplicate adjacent "
-                "sigmas alias to one index_for_timestep slot and break UniPC dispatch"
-            )
-        if external[-1] == 0.0:
-            raise ValueError("FastVideo external sigmas must omit the terminal zero")
-        if num_inference_steps is not None and int(num_inference_steps) != int(external.size):
-            raise ValueError(
-                f"FastVideo num_inference_steps={num_inference_steps} does not match "
-                f"the external sigma count {external.size}"
-            )
-        if str(getattr(self.config, "final_sigmas_type", "zero")) != "zero":
-            raise ValueError("FastVideo canonical UniPC requires final_sigmas_type='zero'")
-
-        timestep_scale = _scheduler_timestep_scale(self)
-        terminal = np.zeros(1, dtype=np.float32)
-        schedule = np.concatenate([external, terminal])
-        self.sigmas = torch.from_numpy(schedule).cpu()
-        self.timesteps = torch.from_numpy(external * timestep_scale).to(device=device, dtype=torch.float32)
-        self.num_inference_steps = int(external.size)
-
-        solver_order = int(self.config.solver_order)
-        self.model_outputs = [None] * solver_order
-        self.timestep_list = [None] * solver_order
-        self.lower_order_nums = 0
-        self.last_sample = None
-        self._step_index = None
-        self._begin_index = None
-
-        # The strategy is built lazily at the first UniPC-dispatched denoising
-        # call, from the request plan's model-owned spec (README: dispatch).
-        self._unirl_canonical_schedule = True
-        self._unirl_timestep_scale = timestep_scale
-        self._unirl_unipc_strategy = None
-        self._unirl_device_sigmas = None
-
-    set_timesteps._unirl_canonical_sigmas = True  # type: ignore[attr-defined]
-    FlowUniPCMultistepScheduler.set_timesteps = set_timesteps
-
-
-def _single_step_index(scheduler: Any, timestep: Any) -> int:
-    if torch.is_tensor(timestep):
-        if timestep.numel() != 1:
-            raise RuntimeError(
-                f"FastVideo canonical UniPC expects one timestep per denoising call; got shape {tuple(timestep.shape)}"
-            )
-        timestep = timestep.reshape(()).item()
-    return int(scheduler.index_for_timestep(timestep))
-
-
-def _patch_denoising_step() -> None:
-    """Wrap ``sde_step_with_logprob`` to dispatch plan indices to SDE kernels and all other indices to UniPC."""
     denoising = import_fastvideo_module(
         "fastvideo.pipelines.stages.denoising", "pipelines.stages.denoising.sde_step_with_logprob"
     )
@@ -213,7 +180,15 @@ def _patch_denoising_step() -> None:
                 sde_type=sde_type,
             )
 
-        step_index = _single_step_index(scheduler, timestep)
+        if torch.is_tensor(timestep):
+            if timestep.numel() != 1:
+                raise RuntimeError(
+                    f"FastVideo canonical UniPC expects one timestep per denoising call; got shape {tuple(timestep.shape)}"
+                )
+            timestep_val = timestep.reshape(()).item()
+        else:
+            timestep_val = timestep
+        step_index = int(scheduler.index_for_timestep(timestep_val))
         strategy = getattr(scheduler, "_unirl_unipc_strategy", None)
 
         if step_index in sde_type.sde_indices:
@@ -241,17 +216,28 @@ def _patch_denoising_step() -> None:
             raise NotImplementedError("Pixel-level log prob is not supported for canonical UniPC")
 
         if strategy is None:
-            if not bool(getattr(scheduler, "_unirl_canonical_schedule", False)):
+            if not getattr(scheduler, "_unirl_canonical_schedule", False):
                 raise RuntimeError(
                     "FastVideo worker did not install the canonical UniPC schedule patch before denoising"
                 )
-            if float(getattr(scheduler, "_unirl_timestep_scale", 0.0)) != float(sde_type.timestep_scale):
+            if scheduler._unirl_timestep_scale != sde_type.timestep_scale:
                 raise RuntimeError(
                     "FastVideo scheduler was pinned with a different model timestep scale than this request's "
-                    f"plan: scheduler={getattr(scheduler, '_unirl_timestep_scale', None)!r}, "
+                    f"plan: scheduler={scheduler._unirl_timestep_scale!r}, "
                     f"plan={sde_type.timestep_scale!r}"
                 )
-            strategy = _strategy_from_plan(scheduler, sde_type)
+            config = scheduler.config
+            if config.prediction_type != "flow_prediction":
+                raise RuntimeError(
+                    f"FastVideo UniPC requires prediction_type='flow_prediction'; got {config.prediction_type!r}"
+                )
+            if not scheduler.predict_x0:
+                raise RuntimeError("FastVideo UniPC requires predict_x0=True")
+            if config.thresholding:
+                raise RuntimeError("FastVideo UniPC does not support thresholding=True")
+            if scheduler.solver_p is not None:
+                raise RuntimeError("FastVideo UniPC does not support a nested solver_p")
+            strategy = UniPCStrategy(config=sde_type.spec)
             strategy.init_schedule(scheduler.sigmas)
             scheduler._unirl_unipc_strategy = strategy
 
@@ -283,12 +269,6 @@ def _patch_denoising_step() -> None:
 
     sde_step_with_logprob._unirl_unipc_dispatch = True  # type: ignore[attr-defined]
     denoising.sde_step_with_logprob = sde_step_with_logprob
-
-
-def patch_unipc() -> None:
-    """Pin the scheduler to canonical sigmas, then dispatch non-SDE step indices to UniPC."""
-    _patch_scheduler_set_timesteps()
-    _patch_denoising_step()
 
 
 __all__ = ["FastVideoUniPCPlan", "patch_unipc"]

@@ -65,7 +65,7 @@ class LTX2Bundle(Bundle):
         device = config.device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         if isinstance(device, str):
             device = torch.device(device)
-        aux_device = torch.device("cpu") if getattr(config, "aux_components_on_cpu", False) else device
+        aux_device = torch.device("cpu") if config.aux_components_on_cpu else device
 
         dtype = parse_torch_dtype(config.model_precision, field_name="model_precision")
         vae_raw = config.vae_dtype if config.vae_dtype is not None else config.model_precision
@@ -139,7 +139,7 @@ class LTX2Bundle(Bundle):
             dtype=dtype,
             device=device,
             pretrained_path=path,
-            max_sequence_length=int(config.max_sequence_length),
+            max_sequence_length=config.max_sequence_length,
             audio_vae=audio_vae,
             vocoder=vocoder,
         )

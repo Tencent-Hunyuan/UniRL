@@ -8,7 +8,6 @@ from unirl.train.stack.planner.types import (
     Range,
     UpdatePlan,
     _build_micro_batch_slices,
-    _positive_int,
 )
 from unirl.train.stack.planner.update import Arrangement, UpdatePlanner, arranged_slice, restore_row_order
 
@@ -25,5 +24,4 @@ __all__ = [
     "restore_row_order",
     "_build_micro_batch_slices",
     "_count_plan",
-    "_positive_int",
 ]
