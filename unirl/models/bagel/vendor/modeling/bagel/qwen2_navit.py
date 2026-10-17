@@ -1240,6 +1240,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
         mode="und",
         packed_vae_token_indexes=None,
         packed_text_indexes=None,
+        sequence_lengths: Optional[List[int]] = None,
     ) -> BaseNavitOutputWithPast:
 
         outputs = self.model(
@@ -1255,6 +1256,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel):
             mode=mode,
             packed_vae_token_indexes=packed_vae_token_indexes,
             packed_text_indexes=packed_text_indexes,
+            sequence_lengths=sequence_lengths,
         )
 
         return outputs
