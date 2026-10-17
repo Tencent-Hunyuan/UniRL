@@ -378,10 +378,10 @@ class FlashSDEStrategy(DanceSDEStrategy):
 
     def __init__(self, *, config: Optional["FlashSpec"] = None) -> None:
         del config
-        self._sigma_min: Optional[float] = None
+        self._sigma_min: Optional[torch.Tensor] = None
 
     def init_schedule(self, sigmas: torch.Tensor) -> None:
-        self._sigma_min = float(sigmas[-1].item())
+        self._sigma_min = sigmas[-1].detach()
 
     def _std_dev_t(
         self,
@@ -389,12 +389,13 @@ class FlashSDEStrategy(DanceSDEStrategy):
         sigma: torch.Tensor,
         sigma_next: torch.Tensor,
         eta: float,
-        sigma_max: float = 0.99,
+        sigma_max: Union[float, torch.Tensor] = 0.99,
     ) -> torch.Tensor:
         del sigma_next
         if self._sigma_min is None:
             raise RuntimeError("FlashSDEStrategy requires init_schedule() before stepping.")
-        return (float(self._sigma_min) + (float(sigma_max) - float(self._sigma_min)) * sigma) * float(eta)
+        sigma_min = self._sigma_min.to(device=sigma.device, dtype=sigma.dtype)
+        return (sigma_min + (sigma_max - sigma_min) * sigma) * float(eta)
 
 
 @dataclass
