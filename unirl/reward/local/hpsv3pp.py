@@ -10,7 +10,7 @@ from typing import List
 import torch
 from PIL import Image
 
-from unirl.reward.base import BaseRewardComponentSpec
+from unirl.reward.base import PromptRewardComponentSpec
 from unirl.reward.local.device import resolve_device
 from unirl.types.reward import RewardRequest
 
@@ -28,13 +28,14 @@ class HPSv3PPRewardScorer(LocalRewardBackend):
         super().__init__(
             device=resolve_device(config.device, base_device),
             batch_size=config.batch_size,
+            prompt_source=config.prompt_source,
             repo_path=config.repo_path,
             config_path=config.config_path,
             checkpoint_path=config.checkpoint_path,
         )
 
     def _load_model(self) -> None:
-        repo_path = str(self.model_kwargs.get("repo_path") or "").strip()
+        repo_path = str(self.model_kwargs["repo_path"]).strip()
         if repo_path:
             repo_path = os.path.abspath(os.path.expanduser(repo_path))
             if repo_path not in sys.path:
@@ -50,7 +51,7 @@ class HPSv3PPRewardScorer(LocalRewardBackend):
                 "and set the reward Spec's `repo_path` to that checkout (or add it to PYTHONPATH)."
             ) from exc
 
-        config_path = str(self.model_kwargs.get("config_path") or "").strip()
+        config_path = str(self.model_kwargs["config_path"]).strip()
         if not config_path and repo_path:
             config_path = os.path.join(repo_path, "hpsv3", "config", "train_stage2.yaml")
         if not config_path or not os.path.isfile(config_path):
@@ -59,7 +60,7 @@ class HPSv3PPRewardScorer(LocalRewardBackend):
                 f"Set the reward Spec's `config_path` (resolved to {config_path!r})."
             )
 
-        checkpoint_path = str(self.model_kwargs.get("checkpoint_path") or "").strip()
+        checkpoint_path = str(self.model_kwargs["checkpoint_path"]).strip()
         if not checkpoint_path:
             import huggingface_hub
 
@@ -76,7 +77,7 @@ class HPSv3PPRewardScorer(LocalRewardBackend):
 
     def _compute_model_rewards(self, request: RewardRequest) -> List[float]:
         images = request.images
-        prompts = request.prompts
+        prompts = self.prompts(request)
         all_rewards: List[float] = []
 
         for i in range(0, len(images), self.batch_size):
@@ -105,7 +106,7 @@ class HPSv3PPRewardScorer(LocalRewardBackend):
 
 
 @dataclass
-class HPSv3PPSpec(BaseRewardComponentSpec):
+class HPSv3PPSpec(PromptRewardComponentSpec):
     """Typed config for the HPSv3++ reward component."""
 
     batch_size: int = 8

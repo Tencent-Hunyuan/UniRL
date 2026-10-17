@@ -55,6 +55,13 @@ class LoraConfig:
     # as ``target_modules``).
     frozen_adapters: Any = None
 
+    def __post_init__(self) -> None:
+        require(
+            self.bias == "none",
+            f"LoraConfig.bias must be 'none', got {self.bias!r}; "
+            "trainable LoRA biases mutate shared base_layer.bias in place and are unsupported.",
+        )
+
 
 @dataclass
 class EmaLoraConfig:
@@ -74,6 +81,13 @@ class EmaLoraConfig:
     ema_uphold: float = 0.5
     timing: str = "rollout_end"
 
+    def __post_init__(self) -> None:
+        require(
+            self.bias == "none",
+            f"EmaLoraConfig.bias must be 'none', got {self.bias!r}; "
+            "trainable LoRA biases mutate shared base_layer.bias in place and are unsupported.",
+        )
+
 
 @dataclass
 class EmaFullConfig:
@@ -87,6 +101,10 @@ class FSDPConfig:
     param_dtype: str = "bf16"
     cpu_offload: bool = False
     mixed_precision: bool = True
+    # NCCL zero-CTA on WORLD so FSDP all-gather uses copy engines (communicator-wide).
+    copy_engine_all_gather: bool = False
+    # Switch the worker's CUDA caching allocator to expandable segments (process-wide).
+    expandable_segments: bool = False
     # Match FSDP2's default: cast floating block inputs to param_dtype.
     cast_forward_inputs: bool = True
     # Shard degree: full = the whole world, hybrid = hsdp_shard_size ranks

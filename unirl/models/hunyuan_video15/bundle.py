@@ -87,7 +87,8 @@ class HunyuanVideo15Bundle(Bundle):
                 path, subfolder="transformer", torch_dtype=dtype
             )
             transformer = transformer.to(device=device, dtype=dtype)
-        if bool(getattr(getattr(transformer, "config", None), "use_meanflow", False)):
+        transformer.set_attention_backend(config.attention_backend)
+        if transformer.config.use_meanflow:
             raise NotImplementedError(
                 "HunyuanVideo15Bundle does not support transformers with "
                 "use_meanflow=True; timestep_r is not threaded through the "
@@ -119,7 +120,7 @@ class HunyuanVideo15Bundle(Bundle):
 
         vision_encoder: Optional[nn.Module] = None
         image_processor: Optional[Any] = None
-        if bool(config.load_vision_encoder):
+        if config.load_vision_encoder:
             from transformers import SiglipImageProcessor, SiglipVisionModel
 
             vision_encoder = (

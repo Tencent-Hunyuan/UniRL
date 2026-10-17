@@ -47,8 +47,8 @@ class QwenVLBundle(Bundle):
         dtype = parse_torch_dtype(config.model_precision, field_name="model_precision")
 
         load_kwargs = {}
-        if getattr(config, "attn_implementation", None):
-            load_kwargs["attn_implementation"] = str(config.attn_implementation)
+        if config.attn_implementation:
+            load_kwargs["attn_implementation"] = config.attn_implementation
 
         meta_init_state = None
         if config.meta_init_transformer:
@@ -56,7 +56,7 @@ class QwenVLBundle(Bundle):
             # Restore non-persistent RoPE buffers after meta initialization.
             from transformers import AutoConfig
 
-            hf_config = AutoConfig.from_pretrained(path, trust_remote_code=bool(config.trust_remote_code))
+            hf_config = AutoConfig.from_pretrained(path, trust_remote_code=config.trust_remote_code)
             transformer, meta_init_state = build_meta_init_transformer(
                 lambda: Qwen2_5_VLForConditionalGeneration(hf_config), dtype=dtype
             )
@@ -64,7 +64,7 @@ class QwenVLBundle(Bundle):
             transformer = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                 path,
                 torch_dtype=dtype,
-                trust_remote_code=bool(config.trust_remote_code),
+                trust_remote_code=config.trust_remote_code,
                 **load_kwargs,
             ).to(device)
 
@@ -83,7 +83,7 @@ class QwenVLBundle(Bundle):
 
         processor = AutoProcessor.from_pretrained(
             path,
-            trust_remote_code=bool(config.trust_remote_code),
+            trust_remote_code=config.trust_remote_code,
             min_pixels=config.min_pixels,
             max_pixels=config.max_pixels,
         )

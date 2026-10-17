@@ -20,14 +20,14 @@
 #     sync (sd3/qwen v2 use it). Pushes the trained LoRA adapter into the
 #     co-located sibling engine in-process; the engine runs base + adapter,
 #     which is mathematically the merged model the separate recipe pushed.
-#     hv15's stage config sets enable_lora/max_lora_rank=64 so the adapter
+#     hv15's deploy config sets enable_lora/max_lora_rank=64 so the adapter
 #     actually applies. This avoids the CUDA-IPC path's SGLang dependency,
 #     which the vllm-omni-only venv (two-venv image) does not provide.
 #
 # Boot note: colocate 1x8 lands all 8 hv15 engine replicas on ONE node — the
 # worst-case parallel-boot memcg burst (each loads ~30GB DiT + Qwen2.5-VL TE +
 # ByT5 + fp32 VAE). The engine's flock boot-serializer
-# (DIFFRL_OMNI_BOOT_SERIALIZE=1, default) single-files the loads, and the ckpt
+# (UNIRL_OMNI_BOOT_SERIALIZE=1, default) single-files the loads, and the ckpt
 # MUST be pod-local (point PRETRAINED_MODEL at a local path) — serialized cephfs
 # loads would be 8x28min and blow init_timeout.
 #
@@ -54,6 +54,7 @@ bundle:
     _target_: unirl.models.hunyuan_video15.config.HunyuanVideo15PipelineConfig
     pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v}
     model_precision: bf16
+    attention_backend: flash_varlen
     shift: 5.0
     load_vae: false
 
@@ -128,6 +129,11 @@ rollout:
     omni_extra:
       init_timeout: 3600
       stage_init_timeout: 1800
+      # Overrides the deploy config's TORCH_SDPA; keep paired with bundle.config.attention_backend.
+      diffusion_attention_backend: FLASH_ATTN
+      # Reuse text-encoder outputs across GRPO siblings; size >= distinct prompts in flight per worker.
+      # enable_prompt_embed_cache: true
+      # prompt_embed_cache_size: 32
 
 reward:
   _target_: unirl.reward.service.RewardService
@@ -165,6 +171,7 @@ stack:
   # per-worker batch = samples_per_prompt(16) * prompts_per_rollout(16) /
   # train_gpus(8) = 32; 32 % 2 == 0 → mini-batch 16 (matches v1).
   num_updates_per_batch: 2
+  shuffle_updates: true
 
 data_source:
   _target_: unirl.data.data_source.MultimodalRLDataSource

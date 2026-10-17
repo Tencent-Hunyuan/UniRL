@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import random
-import socket
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -11,45 +9,16 @@ from unirl.config.require import require
 from unirl.rollout.engine.base import BaseEngineConfig
 from unirl.rollout.engine.ports import ReservedPorts
 
-_SGLANG_GRPC_PORT_OFFSET = 30000
-_SGLANG_MAX_DERIVED_GRPC_BASE_PORT = 65535 - _SGLANG_GRPC_PORT_OFFSET
-_SGLANG_SAFE_SERVER_PORT_MIN = 1024
 _REQUIRED_SERVER_ARGS_METADATA_KEY = "_unirl_required_server_args"
 _LOAD_BEARING_SERVER_ARGS = frozenset(
     {
+        "context_length",
         "ep_size",
-        "enable_expert_parallel",
         "enable_memory_saver",
         "enable_weights_cpu_backup",
         "skip_server_warmup",
     }
 )
-
-
-def _bind_tcp_port(port: int) -> socket.socket:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        sock.bind(("", int(port)))
-    except Exception:
-        sock.close()
-        raise
-    return sock
-
-
-def _reserve_safe_server_port() -> socket.socket:
-    """Reserve a SGLang server port whose derived gRPC port cannot overflow."""
-    last_error: Optional[Exception] = None
-    for _ in range(1024):
-        server_port = random.randint(_SGLANG_SAFE_SERVER_PORT_MIN, _SGLANG_MAX_DERIVED_GRPC_BASE_PORT)
-        try:
-            return _bind_tcp_port(server_port)
-        except OSError as exc:
-            last_error = exc
-            continue
-    raise OSError(
-        f"no free SGLang server port in [{_SGLANG_SAFE_SERVER_PORT_MIN}, {_SGLANG_MAX_DERIVED_GRPC_BASE_PORT}]"
-    ) from last_error
 
 
 @dataclass(frozen=True)
@@ -58,32 +27,6 @@ class SGLangPorts(ReservedPorts):
 
     server_port: int
     nccl_port: int
-
-    def __post_init__(self) -> None:
-        super().__post_init__()
-        require(
-            self.server_port <= _SGLANG_MAX_DERIVED_GRPC_BASE_PORT,
-            "SGLangPorts.server_port must be <= "
-            f"{_SGLANG_MAX_DERIVED_GRPC_BASE_PORT} because SGLang derives grpc_port as port + "
-            f"{_SGLANG_GRPC_PORT_OFFSET}; got {self.server_port}",
-        )
-
-    @classmethod
-    def reserve(cls) -> "SGLangPorts":
-        """Reserve SGLang HTTP and NCCL ports on this node."""
-        socks = []
-        try:
-            server_sock = _reserve_safe_server_port()
-            socks.append(server_sock)
-            nccl_sock = _bind_tcp_port(0)
-            socks.append(nccl_sock)
-            return cls(
-                server_port=server_sock.getsockname()[1],
-                nccl_port=nccl_sock.getsockname()[1],
-            )
-        finally:
-            for sock in socks:
-                sock.close()
 
 
 @dataclass
@@ -103,13 +46,14 @@ class SGLangEngineConfig(BaseEngineConfig):
     pp_size: Optional[int] = None
     ep_size: Optional[int] = None
     dp_size: Optional[int] = None
-    enable_expert_parallel: Optional[bool] = None
 
     host: Optional[str] = None
 
     backend: str = "http"
 
     concurrency: int = 8
+
+    context_length: Optional[int] = None  # server context window; also caps each request's max_new_tokens
 
     enable_memory_saver: Optional[bool] = None
     enable_weights_cpu_backup: Optional[bool] = None
@@ -129,6 +73,8 @@ class SGLangEngineConfig(BaseEngineConfig):
     def __post_init__(self) -> None:
         if self.engine_kwargs is None:
             self.engine_kwargs = {}
+        if self.chat_template_kwargs is None:
+            self.chat_template_kwargs = {}
         require(
             bool(self.pretrained_model_ckpt_path),
             "SGLangEngineConfig.pretrained_model_ckpt_path must be set",
@@ -177,6 +123,15 @@ class SGLangEngineConfig(BaseEngineConfig):
             self.concurrency >= 1,
             f"SGLangEngineConfig.concurrency must be >= 1; got {self.concurrency!r}",
         )
+        require(
+            self.context_length is None or self.context_length >= 1,
+            f"SGLangEngineConfig.context_length must be >= 1 when set; got {self.context_length!r}",
+        )
+        require(
+            "context_length" not in self.engine_kwargs,
+            "SGLangEngineConfig.engine_kwargs must not set context_length; set the context_length field, "
+            "which the client also clamps each request's max_new_tokens against",
+        )
 
         self.backend = str(self.backend).strip().lower()
         require(
@@ -205,27 +160,27 @@ class SGLangEngineConfig(BaseEngineConfig):
         """Spell this config (+ the reserved ports) as ServerArgs intent."""
         intent: Dict[str, Any] = {}
 
-        intent.update(self.engine_kwargs or {})
+        intent.update(self.engine_kwargs)
 
         intent["model_path"] = self.pretrained_model_ckpt_path
         if self.tp_size is not None:
-            intent["tp_size"] = int(self.tp_size)
+            intent["tp_size"] = self.tp_size
         if self.pp_size is not None:
-            intent["pp_size"] = int(self.pp_size)
+            intent["pp_size"] = self.pp_size
         if self.ep_size is not None:
-            intent["ep_size"] = int(self.ep_size)
+            intent["ep_size"] = self.ep_size
         if self.dp_size is not None:
-            intent["dp_size"] = int(self.dp_size)
-        if self.enable_expert_parallel is not None:
-            intent["enable_expert_parallel"] = bool(self.enable_expert_parallel)
+            intent["dp_size"] = self.dp_size
+        if self.context_length is not None:
+            intent["context_length"] = self.context_length
         if self.enable_memory_saver is not None:
-            intent["enable_memory_saver"] = bool(self.enable_memory_saver)
+            intent["enable_memory_saver"] = self.enable_memory_saver
         if self.enable_weights_cpu_backup is not None:
-            intent["enable_weights_cpu_backup"] = bool(self.enable_weights_cpu_backup)
+            intent["enable_weights_cpu_backup"] = self.enable_weights_cpu_backup
         if self.skip_server_warmup is not None:
-            intent["skip_server_warmup"] = bool(self.skip_server_warmup)
+            intent["skip_server_warmup"] = self.skip_server_warmup
         if self.host is not None:
-            intent["host"] = str(self.host)
+            intent["host"] = self.host
 
         if extra:
             intent.update(extra)

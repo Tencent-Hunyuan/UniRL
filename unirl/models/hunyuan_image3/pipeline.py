@@ -63,8 +63,8 @@ class HunyuanImage3Pipeline(Pipeline):
     @classmethod
     def latent_shape(cls, *, model_config: Any, sampling_spec: Any) -> tuple:
         """Per-sample latent shape ``(C, H_lat, W_lat)`` for driver-side noise"""
-        height = int(sampling_spec.height)
-        width = int(sampling_spec.width)
+        height = sampling_spec.height
+        width = sampling_spec.width
         if height <= 0 or width <= 0 or height % 16 or width % 16:
             raise NotImplementedError(
                 f"HunyuanImage3Pipeline.latent_shape: {height}x{width} is not a multiple of the "
@@ -114,7 +114,7 @@ class HunyuanImage3Pipeline(Pipeline):
             autocast_precision=config.autocast_precision,
             trajectory_precision=config.trajectory_precision,
             logprob_precision=config.logprob_precision,
-            diffuse_kv_cache=bool(config.diffuse_kv_cache),
+            diffuse_kv_cache=config.diffuse_kv_cache,
         )
         vae_decode = HunyuanImage3VAEDecodeStage(bundle)
         vae_encode = HunyuanImage3VAEEncodeStage(bundle)
@@ -128,7 +128,7 @@ class HunyuanImage3Pipeline(Pipeline):
             vae_encode=vae_encode,
             ar=ar,
             vit_encode=vit_encode,
-            shift=float(config.shift),
+            shift=config.shift,
         )
 
     def generate(self, sample: Sample) -> Sample:

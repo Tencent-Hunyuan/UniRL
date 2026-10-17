@@ -7,11 +7,10 @@ from typing import TYPE_CHECKING, List
 
 import torch
 
-from unirl.reward.base import BaseRewardComponentSpec
 from unirl.types.reward import RewardRequest
 from unirl.utils.media import tensor_frame_to_pil
 
-from .pickscore import PickScoreRewardScorer
+from .pickscore import PickScoreRewardScorer, PickScoreSpec
 
 if TYPE_CHECKING:
     from PIL import Image
@@ -24,20 +23,18 @@ class VideoPickScoreScorer(PickScoreRewardScorer):
     input_kind = "video"
 
     def __init__(self, *, config: "VideoPickScoreSpec", base_device: str) -> None:
-        # PickScoreRewardScorer.__init__ consumes only device/batch_size/
-        # processor_id/model_id, so the frame choice is captured here.
-        super().__init__(config=config, base_device=base_device)
-        self.frame_selection = str(getattr(config, "frame_selection", "first"))
+        self.frame_selection = str(config.frame_selection)
         if self.frame_selection not in ("first", "middle"):
             raise ValueError(
                 f"VideoPickScoreSpec.frame_selection must be 'first' or 'middle'; got {self.frame_selection!r}"
             )
+        super().__init__(config=config, base_device=base_device)
 
     def covers_prompt_video(self) -> bool:
         return True
 
     @staticmethod
-    def _extract_frame(video: torch.Tensor, which: str = "first") -> "Image.Image":
+    def _extract_frame(video: torch.Tensor, which: str) -> "Image.Image":
         """Extract one frame of a channel-first video tensor."""
         if not isinstance(video, torch.Tensor):
             raise TypeError(f"Expected torch.Tensor, got {type(video).__name__}")
@@ -81,28 +78,19 @@ class VideoPickScoreScorer(PickScoreRewardScorer):
             pil_frames = [self._extract_frame(v, self.frame_selection) for v in request.videos]
             frame_pixels = torch.stack([to_tensor(f) for f in pil_frames])
             request = RewardRequest(
-                primitives=dict(request.primitives),
                 generated={"image": Images.from_dense(frame_pixels)},
-                prompt_ids=request.prompt_ids,
+                conditioning=dict(request.conditioning),
+                original_prompt=request.original_prompt,
+                generation_prompt=request.generation_prompt,
                 sample_ids=request.sample_ids,
                 group_ids=request.group_ids,
                 metadata=request.metadata,
-                reward_types=request.reward_types,
-                return_components=request.return_components,
             )
         return super()._compute_model_rewards(request)
 
 
 @dataclass
-class VideoPickScoreSpec(BaseRewardComponentSpec):
+class VideoPickScoreSpec(PickScoreSpec):
     """Typed config for the VideoPickScore reward component."""
 
-    batch_size: int = 8
-    device: str = "auto"
-    processor_id: str = "laion/CLIP-ViT-H-14-laion2B-s32B-b79K"
-    model_id: str = "yuvalkirstain/PickScore_v1"
-    # Which single frame represents the clip. "first" (default) preserves the
-    # historical behaviour for every existing recipe. "middle" takes T // 2 --
-    # use it when clips can open on a fade or a reveal, where frame 0 is nearly
-    # blank and that blankness lands straight in the reward.
     frame_selection: str = "first"

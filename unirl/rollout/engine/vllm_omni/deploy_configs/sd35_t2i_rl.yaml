@@ -1,0 +1,33 @@
+# Single-stage SD3.5-medium deployment for RL rollout.
+pipeline: unirl_rl_image_diffusion
+async_chunk: false
+distributed_executor_backend: mp
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 1
+    enforce_eager: true
+    vae_use_slicing: false
+    vae_use_tiling: false
+    cache_backend: null
+    cache_config: null
+    enable_cache_dit_summary: false
+    enable_lora: true
+    max_lora_rank: 32
+    parallel_config:
+      pipeline_parallel_size: 1
+      data_parallel_size: 1
+      tensor_parallel_size: 1
+      enable_expert_parallel: false
+      sequence_parallel_size: 1
+      ulysses_degree: 1
+      ring_degree: 1
+      cfg_parallel_size: 1
+      vae_patch_parallel_size: 1
+      use_hsdp: false
+      hsdp_shard_size: -1
+      hsdp_replicate_size: 1
+    custom_pipeline_args:
+      pipeline_class: unirl.rollout.engine.vllm_omni.pipelines.sd3.pipeline.RLStableDiffusion3Pipeline
+    worker_extension_cls: unirl.rollout.engine.vllm_omni.worker.dit_extension.DiTWeightSyncExtension

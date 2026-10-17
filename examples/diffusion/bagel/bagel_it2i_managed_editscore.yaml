@@ -24,8 +24,8 @@
 #     gradient is taken under another, and no importance ratio corrects that.
 #   - bundle.enable_vit: true — the und ViT tower, needed on the TRAINER to rebuild
 #     the contexts at replay (the worker always builds its own).
-#   - packed rollout is off for it2i (upstream's grouped generate_image is cfg=1 t2i
-#     only), so every GRPO sibling is its own worker request.
+#   - at guidance_scale and cfg_img_scale <= 1 the siblings of a GRPO group share one
+#     worker request: the source image and prompt are prefilled once, as for t2i.
 #
 # Deploy (one rank-affine child per train worker; no extra Ray GPU slot):
 #   export BAGEL_PATH=/path/to/BAGEL-7B-MoT
@@ -63,12 +63,13 @@ workers_per_device: 1
 # rollouts the loop pushes the freshly-trained adapter into the vLLM-Omni engine.
 # 1 = on-policy; >1 lags rollout weights (off-policy drift).
 weight_sync_interval: 1
-# Safe default. Set false only after measuring the full training peak for the
-# exact model, reward, sampling geometry, and accelerator.
-enable_fsdp_offload: false
-offload_train_during_reward: true  # smoke: trainer params leave GPU while the
-                                   # vLLM judge child wakes (per_call choreography)
-rollout_sleep_after_generate: true
+# Per-role residency. Park a role only after measuring the full training peak
+# for the exact model, reward, sampling geometry, and accelerator.
+train_resident: false   # smoke: trainer params leave the GPU from generation
+                        # through scoring, including while the vLLM judge child
+                        # wakes (per_call choreography)
+rollout_resident: false
+reward_resident: true
 
 # NB: no `control.task: it2i` here. On the trainside recipe that pin is what
 # makes a source-image-less dataset fail loudly; on this path the modality does it —
@@ -136,7 +137,7 @@ backend:
     total_steps: 100000
   lora_cfg:
     _target_: unirl.train.configs.LoraConfig
-    rank: 64                           # must be <= the stage YAML's max_lora_rank (64)
+    rank: 64                           # must be <= the deploy config's max_lora_rank (64)
     alpha: 128
     dropout: 0.0
     bias: none
@@ -161,7 +162,7 @@ rollout:
     # Required; same checkpoint the bundle loads.
     model_path: ${oc.env:BAGEL_PATH,ByteDance-Seed/BAGEL-7B-MoT}
     # BAGEL single-stage editing modality (registers BagelIt2iAdapter + boots
-    # stage_configs/bagel_t2i_rl.yaml — one YAML serves both image-out modalities —
+    # deploy_configs/bagel_t2i_rl.yaml — one YAML serves both image-out modalities —
     # with RLBagelPipeline).
     modality: bagel_it2i
     # Required for colocate: the trainer calls sleep()/wake_up() around the train
@@ -264,9 +265,9 @@ sampling:
   cfg_renorm_min: 0.0
   cfg_renorm_type: text_channel        # CFG renorm; only active when guidance_scale>1
   eta: 1.0                             # SDE noise scale (per-step stochasticity = GRPO exploration)
-  samples_per_prompt: 8                # GRPO group size; it2i sends one worker request per sample
-  height: 512                          # the OUTPUT canvas. Fixed square: the driver's x_T recipe carries ONE
-  width: 512                           # shape for the whole request, and the worker honors it via kv_metadata
+  samples_per_prompt: 8                # GRPO group size; at cfg<=1 the siblings of a group share one worker request
+  height: 512                          # the default OUTPUT canvas and the bound for a row's metadata.canvas;
+  width: 512                           # the worker honors each request's shape via kv_metadata
   seed: 42
   init_same_noise: true                # siblings share x_T; in-group diversity comes from the SDE noise (eta>0)
   trajectory_precision: fp32           # forwarded to the worker scheduler's SDE log-prob storage round-trip

@@ -24,7 +24,8 @@ from . import rl_ops
 from .ar import BagelARStage
 from .chat_template import BagelChatTemplateStage
 from .conditions import BagelARConditions, BagelDiffusionConditions
-from .diffusion import BagelDiffusionParams, BagelDiffusionStage
+from .config import BagelPipelineConfig
+from .diffusion import BagelDiffusionParams, BagelDiffusionStage, stack_latent_segments
 from .vae import BagelVAEDecodeStage, BagelVAEEncodeStage, bagel_latent_shape
 
 if TYPE_CHECKING:
@@ -38,11 +39,8 @@ def _cfg_get(cfg: Any, key: str, default: Any) -> Any:
     if cfg is None:
         return default
     if hasattr(cfg, "get"):
-        try:
-            val = cfg.get(key, default)
-            return default if val is None else val
-        except Exception:
-            return default
+        val = cfg.get(key, default)
+        return default if val is None else val
     return getattr(cfg, key, default)
 
 
@@ -61,11 +59,17 @@ class BagelPipeline(Pipeline):
         logprob_precision: str = "fp32",
         shift: float = 3.0,
         replay_mode: str = "train",
+        replay_attention_backend: str = "sdpa",
         max_prompt_length: int = 8192,
         cache_t2i_contexts: Optional[bool] = None,
         context_cache_size: Optional[int] = None,
+        forward_batch_size: Optional[int] = 1,
     ) -> None:
         super().__init__()
+        forward_batch_size = 1 if forward_batch_size is None else int(forward_batch_size)
+        if forward_batch_size < 1:
+            raise ValueError(f"BagelPipeline.forward_batch_size must be >= 1; got {forward_batch_size}.")
+        self.forward_batch_size = forward_batch_size
         self.bundle = bundle
         if diffusion is None:
             diffusion = BagelDiffusionStage(
@@ -84,16 +88,15 @@ class BagelPipeline(Pipeline):
             autocast_precision=autocast_precision,
             logprob_precision=logprob_precision,
             replay_mode=replay_mode,
+            replay_attention_backend=replay_attention_backend,
+            forward_batch_size=self.forward_batch_size,
         )
         self.autocast_precision = autocast_precision
         self.shift = shift
-        cache_config = getattr(bundle, "config", None)
-        cache_t2i_contexts = (
-            _cfg_get(cache_config, "cache_t2i_contexts", True) if cache_t2i_contexts is None else cache_t2i_contexts
-        )
-        context_cache_size = (
-            _cfg_get(cache_config, "context_cache_size", 32) if context_cache_size is None else context_cache_size
-        )
+        if cache_t2i_contexts is None:
+            cache_t2i_contexts = bundle.config.cache_t2i_contexts
+        if context_cache_size is None:
+            context_cache_size = bundle.config.context_cache_size
         self._cache_t2i_contexts = bool(cache_t2i_contexts)
         self._context_cache_size = max(1, int(context_cache_size))
         self._t2i_context_cache: "OrderedDict[str, Tuple[Any, Any, Any]]" = OrderedDict()
@@ -103,15 +106,15 @@ class BagelPipeline(Pipeline):
     def latent_shape(cls, *, model_config: Any, sampling_spec: Any) -> Tuple[int, ...]:
         """Packed per-sample x_T shape ``(seq, p²·z)`` for the driver NoiseRecipe."""
         cfg = _cfg_get(model_config, "config", model_config)
-        patch = int(_cfg_get(cfg, "latent_patch_size", 2))
-        vae_ds = int(_cfg_get(cfg, "vae_downsample", 8))
-        z = int(_cfg_get(cfg, "latent_channels", 16))
-        H, W = int(sampling_spec.height), int(sampling_spec.width)
+        patch = int(_cfg_get(cfg, "latent_patch_size", BagelPipelineConfig.latent_patch_size))
+        vae_ds = int(_cfg_get(cfg, "vae_downsample", BagelPipelineConfig.vae_downsample))
+        z = int(_cfg_get(cfg, "latent_channels", BagelPipelineConfig.latent_channels))
+        H, W = sampling_spec.height, sampling_spec.width
         return bagel_latent_shape((H, W), latent_downsample=vae_ds * patch, latent_patch_size=patch, latent_channels=z)
 
     def build_schedule_policy(self) -> FlowMatchSchedulePolicy:
         """Static-shift FlowMatch σ policy (BAGEL uses no dynamic shifting)."""
-        return FlowMatchSchedulePolicy.static_only(float(self.shift))
+        return FlowMatchSchedulePolicy.static_only(self.shift)
 
     @classmethod
     def from_config(cls, config: Any, *, strategy: Optional[StepStrategy] = None) -> "BagelPipeline":
@@ -125,7 +128,7 @@ class BagelPipeline(Pipeline):
             autocast_precision=config.autocast_precision,
             trajectory_precision=config.trajectory_precision,
             logprob_precision=config.logprob_precision,
-            shift=float(config.shift),
+            shift=config.shift,
         )
 
     def _autocast_ctx(self):
@@ -141,7 +144,7 @@ class BagelPipeline(Pipeline):
             raise TypeError(
                 f"BagelPipeline.generate ({task}): expected an Images input in sample.conditioning(), found none"
             )
-        if getattr(self.bundle.model, "vit_model", None) is None:
+        if not self.bundle.model.config.visual_und:
             raise ValueError(
                 f"BagelPipeline.generate ({task}): the bundle was built without the und ViT; "
                 "set BagelPipelineConfig.enable_vit=true for image-input tasks."
@@ -177,12 +180,9 @@ class BagelPipeline(Pipeline):
         if not self._cache_t2i_contexts:
             return False
         if self._und_frozen is None:
-            try:
-                und_trainable = [
-                    n for n, p in self.bundle.transformer.named_parameters() if p.requires_grad and "moe_gen" not in n
-                ]
-            except Exception:  # pragma: no cover - be conservative if not introspectable
-                und_trainable = ["<introspection-failed>"]
+            und_trainable = [
+                n for n, p in self.bundle.transformer.named_parameters() if p.requires_grad and "moe_gen" not in n
+            ]
             self._und_frozen = not und_trainable
             if not self._und_frozen:
                 logger.warning(
@@ -196,19 +196,6 @@ class BagelPipeline(Pipeline):
             else:
                 logger.info("BagelPipeline: T2I context cache enabled (prompt-prefill path is frozen).")
         return self._und_frozen
-
-    def _build_contexts_cached(self, prompt: str) -> Tuple[Any, Any, Any]:
-        """Memoized :meth:`_build_contexts` for the T2I path (image-free)."""
-        cache = self._t2i_context_cache
-        hit = cache.get(prompt)
-        if hit is not None:
-            cache.move_to_end(prompt)
-            return hit
-        ctx = self._build_contexts(prompt, image=None)
-        cache[prompt] = ctx
-        while len(cache) > self._context_cache_size:
-            cache.popitem(last=False)
-        return ctx
 
     def clear_context_cache(self) -> None:
         """Drop the cached T2I prompt contexts (frees their prompt KV caches)."""
@@ -240,28 +227,25 @@ class BagelPipeline(Pipeline):
             image_shapes=[shape] * len(texts.texts),
         )
 
-    @staticmethod
-    def _resolve_task(sample: Sample) -> str:
-        """Resolve the task mode: explicit ``parts[0].control["task"]`` wins, else infer."""
-        task = sample.parts[0].control.get("task")
-        if task is not None:
-            return str(task)
-        frontier_params = sample.parts[-1].sampling_params
-        has_ar = isinstance(frontier_params, ARSamplingParams)
-        has_diff = isinstance(frontier_params, DiffusionSamplingParams)
-        has_current_ar_prelude = (
-            has_diff and len(sample.parts) >= 2 and isinstance(sample.parts[-2].sampling_params, ARSamplingParams)
-        )
-        has_image = any("image" in p.primitives for p in sample.parts[:-1])
-        if has_current_ar_prelude:
-            return "t2ti"
-        if has_ar:
-            return "it2t" if has_image else "t2t"
-        return "it2i" if has_image else "t2i"
-
     def generate(self, sample: Sample) -> Sample:
         """Dispatch on the resolved task and fill the gen Part(s)."""
-        task = self._resolve_task(sample)
+        raw_task = sample.parts[0].control.get("task")
+        if raw_task is not None:
+            task = str(raw_task)
+        else:
+            frontier_params = sample.parts[-1].sampling_params
+            has_ar = isinstance(frontier_params, ARSamplingParams)
+            has_diff = isinstance(frontier_params, DiffusionSamplingParams)
+            has_current_ar_prelude = (
+                has_diff and len(sample.parts) >= 2 and isinstance(sample.parts[-2].sampling_params, ARSamplingParams)
+            )
+            has_image = any("image" in p.primitives for p in sample.parts[:-1])
+            if has_current_ar_prelude:
+                task = "t2ti"
+            elif has_ar:
+                task = "it2t" if has_image else "t2t"
+            else:
+                task = "it2i" if has_image else "t2i"
         if task in ("t2i", "it2i"):
             return self._generate_image(sample, task)
         if task in ("t2t", "i2t", "it2t"):
@@ -300,10 +284,22 @@ class BagelPipeline(Pipeline):
 
         pil_images = self._extract_input_images(conditioning, task, n_prompts=n) if task == "it2i" else None
 
-        image_shape = (int(params.height), int(params.width))
+        image_shape = (params.height, params.width)
 
         if task == "t2i" and pil_images is None and self._t2i_cache_enabled():
-            contexts = [self._build_contexts_cached(prompt) for prompt in prompts]
+            cache = self._t2i_context_cache
+            contexts = []
+            for prompt in prompts:
+                hit = cache.get(prompt)
+                if hit is not None:
+                    cache.move_to_end(prompt)
+                    contexts.append(hit)
+                else:
+                    ctx = self._build_contexts(prompt, image=None)
+                    cache[prompt] = ctx
+                    while len(cache) > self._context_cache_size:
+                        cache.popitem(last=False)
+                    contexts.append(ctx)
         else:
             contexts = [
                 self._build_contexts(prompt, image=pil_images[i] if pil_images is not None else None)
@@ -331,33 +327,39 @@ class BagelPipeline(Pipeline):
         image_shape: Tuple[int, int],
         input_images: Optional[List[Any]] = None,
     ) -> Tuple[LatentSegment, BagelDiffusionConditions, Images]:
-        """Diffuse, batch, and decode per-sample prebuilt BAGEL contexts."""
+        """Chunk prebuilt contexts into block-diagonal diffusion forwards, then decode."""
         device = torch.device(self.bundle.device)
         schedule = params.sigmas.to(device)
         initial = NoiseRecipe.from_sample(sample).resolve(device=device, dtype=torch.float32)
 
-        gen_list: List[Any] = []
-        cfg_text_list: List[Any] = []
-        cfg_img_list: List[Any] = []
-        shapes: List[Tuple[int, int]] = []
+        gen_list = [context[0] for context in contexts]
+        cfg_text_list = [context[1] for context in contexts]
+        cfg_img_list = [context[2] for context in contexts]
+        shapes = [image_shape] * len(contexts)
         segments: List[LatentSegment] = []
-        for i, (gen_ctx, cfg_text_ctx, cfg_img_ctx) in enumerate(contexts):
-            cond_i = BagelDiffusionConditions.for_sample(
-                gen_context=gen_ctx,
-                cfg_text_context=cfg_text_ctx,
-                cfg_img_context=cfg_img_ctx,
-                image_shape=image_shape,
-                prompt=prompts[i],
+        for start in range(0, len(contexts), self.forward_batch_size):
+            end = min(start + self.forward_batch_size, len(contexts))
+            initial_chunk = None
+            if initial is not None:
+                initial_chunk = initial[start:end] if end - start > 1 else initial[start]
+            condition = BagelDiffusionConditions(
+                gen_contexts=gen_list[start:end],
+                cfg_text_contexts=cfg_text_list[start:end],
+                cfg_img_contexts=cfg_img_list[start:end],
+                prompts=list(prompts[start:end]),
+                input_images=list(input_images[start:end]) if input_images is not None else [],
+                image_shapes=shapes[start:end],
             )
-            x0_i = initial[i] if initial is not None else None
-            seg_i = self.diffusion.diffuse(cond_i, schedule=schedule, params=params, initial_latents=x0_i)
-            segments.append(seg_i)
-            gen_list.append(gen_ctx)
-            cfg_text_list.append(cfg_text_ctx)
-            cfg_img_list.append(cfg_img_ctx)
-            shapes.append(image_shape)
+            segments.append(
+                self.diffusion.diffuse(
+                    condition,
+                    schedule=schedule,
+                    params=params,
+                    initial_latents=initial_chunk,
+                )
+            )
 
-        segment = self._batch_segments(segments)
+        segment = stack_latent_segments(segments)
         conditions = BagelDiffusionConditions(
             gen_contexts=gen_list,
             cfg_text_contexts=cfg_text_list,
@@ -369,29 +371,10 @@ class BagelPipeline(Pipeline):
         images = self.vae_decode.decode(segment, image_shape=image_shape)
         return segment, conditions, images
 
-    @staticmethod
-    def _batch_segments(segments: List[LatentSegment]) -> LatentSegment:
-        """Stack per-sample 1-row segments into one ``[N, ...]`` segment."""
-        if len(segments) == 1:
-            return segments[0]
-        latents = torch.cat([s.latents for s in segments], dim=0)
-        sde_logp = torch.cat([s.sde_logp for s in segments], dim=0) if segments[0].sde_logp is not None else None
-        sde_means = torch.cat([s.sde_means for s in segments], dim=0) if segments[0].sde_means is not None else None
-        return LatentSegment(
-            latents=latents,
-            sigmas=segments[0].sigmas,
-            indices=segments[0].indices,
-            sde_logp=sde_logp,
-            sde_means=sde_means,
-            sde_indices=segments[0].sde_indices,
-        )
-
     def _generate_text(self, sample: Sample, task: str) -> Sample:
         """Run BAGEL text-out per-sample and fill the AR gen Part."""
         frontier = sample.frontier_gen_part(ARSamplingParams)
         ar_params = frontier.sampling_params
-        if ar_params is None:
-            raise TypeError(f"BagelPipeline.generate ({task}): gen Part must carry ARSamplingParams")
 
         conditioning = sample.conditioning()
         texts = conditioning[0] if conditioning else None
@@ -441,20 +424,6 @@ class BagelPipeline(Pipeline):
             toks = segment.tokens[cu[i] : cu[i + 1]].tolist()
             out.append(self.bundle.tokenizer.decode(toks).split("<|im_end|>")[0])
         return Texts(texts=out)
-
-    def _build_think_contexts(self, system_prompt: str, prompt: str, think_text: str) -> Tuple[Any, Any, Any]:
-        """Build (gen, cfg_text, cfg_img) KV contexts for native think-gen (t2ti)."""
-        inf = self.bundle.inferencer
-        gen = inf.init_gen_context()
-        cfg_img = deepcopy(gen)
-        with torch.no_grad(), self._autocast_ctx():
-            gen = inf.update_context_text(system_prompt, gen)
-            cfg_img = inf.update_context_text(system_prompt, cfg_img)
-            cfg_text = deepcopy(gen)
-            gen = inf.update_context_text(prompt, gen)
-            cfg_img = inf.update_context_text(prompt, cfg_img)
-            gen = inf.update_context_text(think_text, gen)
-        return gen, cfg_text, cfg_img
 
     def _generate_t2ti(self, sample: Sample) -> Sample:
         """Run the pre-forked P → P*N → P*N*M think-then-generate lineage."""
@@ -546,15 +515,20 @@ class BagelPipeline(Pipeline):
                 f"expected={expected_images}"
             )
 
-        image_shape = (int(diff_params.height), int(diff_params.width))
-        contexts = [
-            self._build_think_contexts(
-                GEN_THINK_SYSTEM_PROMPT,
-                image_prompts[i],
-                image_thinking[i],
-            )
-            for i in range(expected_images)
-        ]
+        image_shape = (diff_params.height, diff_params.width)
+        inf = self.bundle.inferencer
+        contexts = []
+        for i in range(expected_images):
+            gen = inf.init_gen_context()
+            cfg_img = deepcopy(gen)
+            with torch.no_grad(), self._autocast_ctx():
+                gen = inf.update_context_text(GEN_THINK_SYSTEM_PROMPT, gen)
+                cfg_img = inf.update_context_text(GEN_THINK_SYSTEM_PROMPT, cfg_img)
+                cfg_text = deepcopy(gen)
+                gen = inf.update_context_text(image_prompts[i], gen)
+                cfg_img = inf.update_context_text(image_prompts[i], cfg_img)
+                gen = inf.update_context_text(image_thinking[i], gen)
+            contexts.append((gen, cfg_text, cfg_img))
         segment, diff_conditions, images = self._diffuse_and_decode(
             contexts,
             prompts=image_prompts,

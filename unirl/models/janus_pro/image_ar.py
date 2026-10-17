@@ -18,7 +18,6 @@ from .ar import (
     _keep_fsdp_params_unsharded,
     _left_repack_token_condition,
     _position_ids_from_attention_mask,
-    _replay_temperature,
 )
 from .bundle import JanusProBundle
 from .conditions import JanusProImageARConditions, _finite_cfg_weight
@@ -42,6 +41,7 @@ class JanusProImageARSamplingParams(ARSamplingParams):
     height: Optional[int] = None
 
     def __post_init__(self) -> None:
+        super().__post_init__()
         self.cfg_weight = _finite_cfg_weight(
             self.cfg_weight,
             where="JanusProImageARSamplingParams.cfg_weight",
@@ -95,9 +95,6 @@ class JanusProImageARStage(ARStage[JanusProImageARConditions]):
     def trainable_module(self) -> torch.nn.Module:
         return self.model.transformer
 
-    def _device(self) -> torch.device:
-        return next(self.model.transformer.parameters()).device
-
     def _prepare_paired_prompt_embeds(
         self,
         conditions: JanusProImageARConditions,
@@ -127,12 +124,6 @@ class JanusProImageARStage(ARStage[JanusProImageARConditions]):
         inputs_embeds = self.model.transformer.get_input_embeddings()(paired_ids)
         return inputs_embeds, paired_mask
 
-    @staticmethod
-    def _cfg_logits(logits: torch.Tensor, cfg_weight: float) -> torch.Tensor:
-        cond = logits[0::2]
-        uncond = logits[1::2]
-        return uncond + cfg_weight * (cond - uncond)
-
     def autoregress(
         self,
         conditions: JanusProImageARConditions,
@@ -141,7 +132,7 @@ class JanusProImageARStage(ARStage[JanusProImageARConditions]):
         **_kwargs,
     ) -> TextSegment:
         _width, _height, token_count = _resolve_image_grid(sampling_params)
-        device = self._device()
+        device = next(self.model.transformer.parameters()).device
         step = JanusProARStep(
             temperature=sampling_params.temperature,
             top_p=sampling_params.top_p,
@@ -198,7 +189,8 @@ class JanusProImageARStage(ARStage[JanusProImageARConditions]):
                     )
                 past_key_values = out.past_key_values
                 logits = self.model.model.gen_head(out.last_hidden_state[:, -1, :])
-                token_id, log_prob = step.step(self._cfg_logits(logits, cfg_weight))
+                cond, uncond = logits[0::2], logits[1::2]
+                token_id, log_prob = step.step(uncond + cfg_weight * (cond - uncond))
 
                 generated_tokens[:, i] = token_id
                 generated_logps[:, i] = log_prob
@@ -228,7 +220,7 @@ class JanusProImageARStage(ARStage[JanusProImageARConditions]):
         if segment.tokens is None or segment.cu_seqlens is None or segment.lengths is None:
             raise ValueError("JanusProImageARStage.replay: segment requires tokens with cu_seqlens")
 
-        device = self._device()
+        device = next(self.model.transformer.parameters()).device
         inputs_embeds, attention_mask = self._prepare_paired_prompt_embeds(conditions, device=device)
         paired_batch = inputs_embeds.shape[0]
         batch_size = paired_batch // 2
@@ -274,7 +266,7 @@ class JanusProImageARStage(ARStage[JanusProImageARConditions]):
                 use_cache=False,
             )
 
-            temp = _replay_temperature(temperature)
+            temp = temperature if temperature > 0.0 else 1.0
             prompt_len = inputs_embeds.shape[1]
             prediction_hidden = out.last_hidden_state[:, prompt_len - 1 : prompt_len - 1 + t_max, :]
             if prediction_hidden.shape[1] != t_max:
@@ -283,7 +275,8 @@ class JanusProImageARStage(ARStage[JanusProImageARConditions]):
                     f"got {prediction_hidden.shape[1]}, expected {t_max}."
                 )
             logits = self.model.model.gen_head(prediction_hidden)
-            cfg_logits = self._cfg_logits(logits, conditions.cfg_weight)
+            cond, uncond = logits[0::2], logits[1::2]
+            cfg_logits = uncond + conditions.cfg_weight * (cond - uncond)
             log_probs_full = F.log_softmax(cfg_logits.float() / temp, dim=-1)
             per_token_logps = log_probs_full.gather(-1, response_tokens.unsqueeze(-1)).squeeze(-1)
 
@@ -304,7 +297,7 @@ class JanusProImageARStage(ARStage[JanusProImageARConditions]):
             raise ValueError("JanusProImageARStage.decode: segment requires tokens with cu_seqlens")
 
         width, height, token_count = _resolve_image_grid(sampling_params)
-        device = self._device()
+        device = next(self.model.transformer.parameters()).device
         lengths = segment.lengths.tolist()
         if any(n != token_count for n in lengths):
             raise ValueError(

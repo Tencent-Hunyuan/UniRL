@@ -7,7 +7,6 @@ from typing import Callable, List, NamedTuple, Optional, Tuple
 
 import torch
 
-from unirl.algorithms.base import StageAlgorithm
 from unirl.train.stack.planner.count import _count_plan
 from unirl.train.stack.planner.types import Plan, UpdatePlan, _positive_int, _update_ranges
 from unirl.types.sample import Part
@@ -70,11 +69,7 @@ def balance_into_k(samples: List[Sample], *, cost: Cost, k: int) -> List[List[Sa
 
 def _prompt_lengths(part: Part, total: int) -> Optional[List[int]]:
     """Per-sample prompt token counts from ``conditions['prompt'].attention_mask`` (None if absent)."""
-    conditions = getattr(part, "conditions", None)
-    if isinstance(conditions, dict):
-        prompt = conditions.get("prompt")
-    else:
-        prompt = getattr(conditions, "prompt", None) if conditions is not None else None
+    prompt = part.conditions.get("prompt")
     pmask = getattr(prompt, "attention_mask", None) if prompt is not None else None
     if isinstance(pmask, torch.Tensor) and pmask.dim() == 2 and int(pmask.shape[0]) == total:
         return [int(p) for p in pmask.long().sum(dim=-1).tolist()]
@@ -85,7 +80,7 @@ def _extract_samples(part: Part) -> Optional[List[Sample]]:
     """Clamped :class:`Sample` list from a track, or ``None`` when it exposes no per-sample lengths."""
     total = int(part.batch_size)
     segment = part.segment
-    raw = getattr(segment, "lengths", None) if segment is not None else None
+    raw = segment.lengths if segment is not None else None
     if not (isinstance(raw, torch.Tensor) and raw.numel() == total):
         return None
     resp_lens = [int(x) for x in raw.tolist()]
@@ -174,18 +169,3 @@ class TokenBudgetPlanner:
             samples, num_updates=num_updates, token_budget=self.token_budget, cost_model=self.cost_model
         )
         return part.select(perm), plan
-
-    def validate(self, algorithm: StageAlgorithm) -> None:
-        """Require a grouping-invariant loss-weighting contract."""
-        if getattr(algorithm, "loss_weighting", "sample") == "token":
-            return
-        mode = getattr(algorithm, "loss_agg_mode", None)
-        if mode is None or not str(mode).startswith("seq-mean"):
-            raise ValueError(
-                f"{type(self).__name__}: token-budget packing requires a sequence-mean loss "
-                f"aggregation (loss_agg_mode starting with 'seq-mean'), because micro losses are "
-                f"weighted by sample share. {type(algorithm).__name__} has loss_agg_mode={mode!r}, "
-                f"which is not grouping-invariant under packing — the update gradient would change. "
-                f"Use loss_agg_mode='seq-mean-token-sum-norm' (or 'seq-mean-token-mean'), or use a "
-                f"CountPlanner (omit micro_planner) for count-based micro-batching."
-            )

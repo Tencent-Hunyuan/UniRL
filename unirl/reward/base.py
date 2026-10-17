@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional, Protocol, runtime_checkable
 
-from unirl.types.reward import RewardRequest, RewardResponse
+from unirl.types.reward import DEFAULT_PROMPT_SOURCE, PROMPT_SOURCES, PromptSource, RewardRequest, RewardResponse
 
 if TYPE_CHECKING:
     import torch
@@ -21,28 +22,28 @@ class RewardBackend(ABC):
         model_name: str = "",
         batch_size: int = 8,
         timeout: float = 60.0,
-        **kwargs,
+        prompt_source: PromptSource = DEFAULT_PROMPT_SOURCE,
     ) -> None:
+        if prompt_source not in PROMPT_SOURCES:
+            raise ValueError(f"RewardBackend.prompt_source must be 'original' or 'generation', got {prompt_source!r}.")
         self.model_name = model_name
         self.batch_size = batch_size
         self.timeout = timeout
-
-    def get_model_name(self) -> str:
-        """Name of the reward model/component this backend serves."""
-        return self.model_name
+        self.prompt_source = prompt_source
 
     @property
     def preferred_input_kind(self) -> str:
         """The decoded media kind this backend consumes (image/video/text)."""
-        return str(getattr(self, "input_kind", "image") or "image").strip().lower()
+        return str(self.input_kind).strip().lower()
+
+    def prompts(self, request: RewardRequest) -> List[str]:
+        """Return the prompt semantics declared by this backend."""
+        prompt = request.original_prompt if self.prompt_source == "original" else request.generation_prompt
+        return [] if prompt is None else list(prompt.texts)
 
     @abstractmethod
     def compute_rewards(self, request: RewardRequest) -> RewardResponse:
         """Score the request."""
-
-    @abstractmethod
-    def is_available(self) -> bool:
-        """Whether this backend is ready to score."""
 
     def offload(self) -> None:
         """Optional lifecycle hook: release device memory."""
@@ -81,9 +82,17 @@ class BaseRewardComponentSpec(ABC):
     """Marker base for every reward backend spec."""
 
 
+@dataclass
+class PromptRewardComponentSpec(BaseRewardComponentSpec):
+    """Config capability for rewards that select a request prompt."""
+
+    prompt_source: PromptSource = DEFAULT_PROMPT_SOURCE
+
+
 __all__ = [
     "BaseRewardComponentSpec",
     "DifferentiableReward",
+    "PromptRewardComponentSpec",
     "PromptVideoReward",
     "RewardBackend",
 ]

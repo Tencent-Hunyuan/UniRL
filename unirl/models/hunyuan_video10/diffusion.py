@@ -207,35 +207,29 @@ class HunyuanVideo10DiffusionStage(DiffusionStage[HunyuanVideo10Conditions]):
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="logprob_precision")
 
         vae = model.vae
-        if spatial_compression_ratio is None:
+        if vae is not None:
             spatial_compression_ratio = (
-                int(getattr(vae, "spatial_compression_ratio", 0))
-                or int(getattr(getattr(vae, "config", None), "spatial_compression_ratio", 0))
-                or self.DEFAULT_SPATIAL_DOWNSAMPLE
+                vae.spatial_compression_ratio if spatial_compression_ratio is None else int(spatial_compression_ratio)
             )
-        if temporal_compression_ratio is None:
             temporal_compression_ratio = (
-                int(getattr(vae, "temporal_compression_ratio", 0))
-                or int(getattr(getattr(vae, "config", None), "temporal_compression_ratio", 0))
-                or self.DEFAULT_TEMPORAL_DOWNSAMPLE
+                vae.temporal_compression_ratio
+                if temporal_compression_ratio is None
+                else int(temporal_compression_ratio)
             )
-        self.spatial_compression_ratio = int(spatial_compression_ratio)
-        self.temporal_compression_ratio = int(temporal_compression_ratio)
-
-        if latent_channels is None:
-            cfg = getattr(vae, "config", None)
-            ch = int(getattr(cfg, "latent_channels", 0)) if cfg is not None else 0
-            if not ch:
-                tx_cfg = getattr(model.transformer, "config", None)
-                ch = int(getattr(tx_cfg, "out_channels", self.DEFAULT_LATENT_CHANNELS))
-            latent_channels = ch
-        self.latent_channels = int(latent_channels)
-
-    def _latent_shape(self, *, height: int, width: int, num_frames: int) -> Tuple[int, int, int]:
-        latent_t = (int(num_frames) - 1) // self.temporal_compression_ratio + 1
-        latent_h = max(1, int(height) // self.spatial_compression_ratio)
-        latent_w = max(1, int(width) // self.spatial_compression_ratio)
-        return latent_t, latent_h, latent_w
+            latent_channels = vae.config.latent_channels if latent_channels is None else int(latent_channels)
+        else:
+            spatial_compression_ratio = (
+                self.DEFAULT_SPATIAL_DOWNSAMPLE if spatial_compression_ratio is None else int(spatial_compression_ratio)
+            )
+            temporal_compression_ratio = (
+                self.DEFAULT_TEMPORAL_DOWNSAMPLE
+                if temporal_compression_ratio is None
+                else int(temporal_compression_ratio)
+            )
+            latent_channels = model.transformer.config.out_channels if latent_channels is None else int(latent_channels)
+        self.spatial_compression_ratio = spatial_compression_ratio
+        self.temporal_compression_ratio = temporal_compression_ratio
+        self.latent_channels = latent_channels
 
     def diffuse(
         self,
@@ -255,7 +249,7 @@ class HunyuanVideo10DiffusionStage(DiffusionStage[HunyuanVideo10Conditions]):
         prompt_embeds = conditions.text_llama.embeds
         device = prompt_embeds.device
         batch_size = int(prompt_embeds.shape[0])
-        T = int(params.num_inference_steps)
+        T = params.num_inference_steps
         if int(schedule.shape[0]) != T + 1:
             raise ValueError(
                 f"HunyuanVideo10DiffusionStage.diffuse: schedule length {schedule.shape[0]} != T+1={T + 1}"
@@ -263,9 +257,9 @@ class HunyuanVideo10DiffusionStage(DiffusionStage[HunyuanVideo10Conditions]):
         schedule = schedule.to(device)
         self.strategy.init_schedule(schedule)
 
-        latent_t, latent_h, latent_w = self._latent_shape(
-            height=params.height, width=params.width, num_frames=params.num_frames
-        )
+        latent_t = (params.num_frames - 1) // self.temporal_compression_ratio + 1
+        latent_h = max(1, params.height // self.spatial_compression_ratio)
+        latent_w = max(1, params.width // self.spatial_compression_ratio)
         expected_latent_shape = (self.latent_channels, latent_t, latent_h, latent_w)
         if initial_latents is not None:
             if int(initial_latents.shape[0]) != batch_size:
@@ -277,8 +271,8 @@ class HunyuanVideo10DiffusionStage(DiffusionStage[HunyuanVideo10Conditions]):
                 raise ValueError(
                     f"HunyuanVideo10DiffusionStage.diffuse: initial_latents.shape[1:]="
                     f"{tuple(initial_latents.shape[1:])} != expected {expected_latent_shape} "
-                    f"for num_frames={int(params.num_frames)}, "
-                    f"height={int(params.height)}, width={int(params.width)}."
+                    f"for num_frames={params.num_frames}, "
+                    f"height={params.height}, width={params.width}."
                 )
             latents = initial_latents.to(device=device, dtype=self.trajectory_dtype)
         else:
@@ -287,13 +281,13 @@ class HunyuanVideo10DiffusionStage(DiffusionStage[HunyuanVideo10Conditions]):
                 latent_shape=expected_latent_shape,
                 device=device,
                 dtype=self.trajectory_dtype,
-                init_same_noise=bool(params.init_same_noise),
-                samples_per_prompt=int(params.samples_per_prompt),
+                init_same_noise=params.init_same_noise,
+                samples_per_prompt=params.samples_per_prompt,
                 noise_group_ids=params.noise_group_ids,
-                base_seed=int(params.seed),
+                base_seed=params.seed,
             )
 
-        sde_set: Set[int] = set(int(i) for i in (params.sde_indices or []))
+        sde_set: Set[int] = set(params.sde_indices or ())
         sde_sorted: List[int] = sorted(sde_set)
 
         needed: Set[int] = set(compute_trajectory_positions(sde_set, T))
@@ -314,7 +308,7 @@ class HunyuanVideo10DiffusionStage(DiffusionStage[HunyuanVideo10Conditions]):
         for i in range(T):
             sigma = schedule[i].to(device)
             sigma_next = schedule[i + 1].to(device)
-            step_eta = float(params.eta) if i in sde_set else 0.0
+            step_eta = params.eta if i in sde_set else 0.0
             step_generators = (
                 make_denoise_step_generators(
                     base_seed=int(denoise_base_seed),
@@ -333,7 +327,7 @@ class HunyuanVideo10DiffusionStage(DiffusionStage[HunyuanVideo10Conditions]):
                     sample=latents,
                     sigma=sigma,
                     sigma_next=sigma_next,
-                    guidance_scale=float(params.guidance_scale),
+                    guidance_scale=params.guidance_scale,
                     eta=step_eta,
                     generator=step_generators,
                     sigma_max=sigma_max,
@@ -382,12 +376,8 @@ class HunyuanVideo10DiffusionStage(DiffusionStage[HunyuanVideo10Conditions]):
                 f"[B, K, C, T_lat, H_lat, W_lat], got {tuple(segment.latents.shape)}"
             )
 
-        sde_set = set(int(i) for i in segment.sde_indices.tolist())
-        target = (
-            [int(i) for i in step_indices]
-            if step_indices is not None
-            else [int(i) for i in segment.sde_indices.tolist()]
-        )
+        sde_set = set(segment.sde_indices.tolist())
+        target = list(step_indices) if step_indices is not None else segment.sde_indices.tolist()
         bad = [i for i in target if i not in sde_set]
         if bad:
             raise ValueError(
@@ -420,8 +410,8 @@ class HunyuanVideo10DiffusionStage(DiffusionStage[HunyuanVideo10Conditions]):
                     prev_sample=prev_sample,
                     sigma=sigma,
                     sigma_next=sigma_next,
-                    guidance_scale=float(params.guidance_scale),
-                    eta=float(params.eta),
+                    guidance_scale=params.guidance_scale,
+                    eta=params.eta,
                     sigma_max=sigma_max,
                     step_index=step_idx,
                 )
@@ -453,7 +443,7 @@ class HunyuanVideo10DiffusionStage(DiffusionStage[HunyuanVideo10Conditions]):
             sample,
             sigma,
             conditions,
-            guidance_scale=float(params.guidance_scale),
+            guidance_scale=params.guidance_scale,
         )
 
     def trainable_module(self) -> "torch.nn.Module":

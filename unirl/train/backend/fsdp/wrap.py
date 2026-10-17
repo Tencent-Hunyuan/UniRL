@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import socket
 from functools import partial
 from typing import Any, Dict, Optional, Tuple
 
@@ -62,6 +63,7 @@ def fsdp_wrap(
     master_dtype: Optional[str] = None,
     master_params: Tuple[torch.Tensor, ...] = (),
     root_wrap: bool = True,
+    copy_engine_all_gather: bool = False,
 ) -> None:
     """Apply FSDP2 wrapping to the model.  No handle returned — DTensors"""
     from torch.distributed.fsdp import (
@@ -177,6 +179,22 @@ def fsdp_wrap(
                 "DP-synced and replicas drift. Enable training.fsdp.root_wrap or freeze them.",
             )
 
+    if copy_engine_all_gather:
+        import torch.distributed as dist
+
+        shard_group = mesh.get_group("dp_shard") if mesh is not None else None
+        hosts = [None] * dist.get_world_size(shard_group)
+        dist.all_gather_object(hosts, socket.gethostname(), group=shard_group)
+        require(
+            len(set(hosts)) == 1,
+            "FSDP copy-engine all-gather requires each shard group to stay within one node; "
+            f"this group spans hosts {sorted(set(hosts))}. Use hybrid mode with a node-local hsdp_shard_size.",
+        )
+        fsdp_modules = tuple(module for module in model.modules() if isinstance(module, FSDPModule))
+        require(fsdp_modules, "FSDP copy-engine all-gather requires at least one fully-sharded module.")
+        for fsdp_module in fsdp_modules:
+            fsdp_module.set_symm_mem_for_comm("NCCL")
+
     if mode == "hybrid":
         _validate_hsdp_mesh(model, expected_mesh=mesh)
 
@@ -283,8 +301,14 @@ def _validate_hsdp_mesh(model: nn.Module, *, expected_mesh: object) -> None:
         actual_mesh is not None,
         "fsdp_wrap: hybrid mode produced no DTensor parameters; HSDP was not installed.",
     )
-    expected = (tuple(expected_mesh.mesh_dim_names or ()), tuple(int(size) for size in expected_mesh.shape))
-    actual = (tuple(actual_mesh.mesh_dim_names or ()), tuple(int(size) for size in actual_mesh.shape))
+    expected = (
+        () if expected_mesh.mesh_dim_names is None else expected_mesh.mesh_dim_names,
+        expected_mesh.shape,
+    )
+    actual = (
+        () if actual_mesh.mesh_dim_names is None else actual_mesh.mesh_dim_names,
+        actual_mesh.shape,
+    )
     require(
         actual == expected,
         f"fsdp_wrap: hybrid mode requested mesh {expected[0]}={expected[1]}, "

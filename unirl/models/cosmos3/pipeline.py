@@ -102,7 +102,7 @@ class Cosmos3JointStage:
             shift = cfg.flow_shift_by_resolution.get(resolution_tier(height, width))
             if shift is not None:
                 return float(shift)
-        return float(self.bundle.flow_shift)
+        return self.bundle.flow_shift
 
     def predict_velocity(
         self,
@@ -130,7 +130,7 @@ class Cosmos3JointStage:
 
             if cfg.action_domain_name not in _EMBODIMENT_TO_DOMAIN_ID:
                 raise ValueError(f"Unknown Cosmos3 action_domain_name={cfg.action_domain_name!r}.")
-            x0_action = pad_action_chunk(actions.float(), int(self.bundle.transformer.config.action_dim))
+            x0_action = pad_action_chunk(actions.float(), self.bundle.transformer.config.action_dim)
             x_t_action, action_target = noise_action_latents(
                 x0_action,
                 sigma,
@@ -159,7 +159,7 @@ class Cosmos3JointStage:
             **action_kwargs,
         )
         # Continuous fp32 sigma*T like official Cosmos training; README: timestep conditioning.
-        timestep = float(sigma.item()) * float(self.pipe.scheduler.config.num_train_timesteps)
+        timestep = float(sigma.item()) * self.pipe.scheduler.config.num_train_timesteps
         kwargs["vision_timesteps"] = torch.full(
             (meta["num_noisy_vision_tokens"],),
             timestep,
@@ -203,7 +203,7 @@ class Cosmos3JointStage:
             action_pred = preds_action[0]
             if action_pred.ndim == 3:
                 action_pred = action_pred.squeeze(0)
-            raw_dim = int(cfg.raw_action_dim)
+            raw_dim = cfg.raw_action_dim
             action_pred = action_pred[:, :raw_dim]
             assert action_target is not None
             action_target = action_target[:, :raw_dim]

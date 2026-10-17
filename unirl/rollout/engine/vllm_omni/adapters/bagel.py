@@ -1,23 +1,22 @@
-"""BAGEL-7B-MoT input/output adapters for the t2i and it2i modalities."""
+"""BAGEL-7B-MoT rollout adapters for the t2i and it2i modalities."""
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any, Dict, List
 
+from unirl.config.require import require
 from unirl.models.bagel.conditions import BagelDiffusionConditions
 from unirl.models.bagel.diffusion import BagelDiffusionParams
+from unirl.models.bagel.pipeline import BagelPipeline
 from unirl.rollout.engine.vllm_omni.adapters.base import ModelAdapter, register_adapter
-from unirl.rollout.engine.vllm_omni.adapters.dit import (
-    DitInputAdapter,
-    DitOutputAdapter,
-    _grouped_texts_from_sample,
-)
 from unirl.rollout.engine.vllm_omni.backends import (
     STAGE_KIND_DIFFUSION,
     GenerateCall,
     OmniRawResult,
     StageSampling,
 )
+from unirl.rollout.engine.vllm_omni.pipelines._shared.interception import read_captures
 from unirl.rollout.engine.vllm_omni.utils import (
     build_image_segment,
     collect_dit_outputs,
@@ -30,235 +29,18 @@ from unirl.types.primitives import Images, Texts
 from unirl.types.sample import Sample
 
 
-def _conditioning_rows(
-    sample: Sample,
-    *,
-    image_input: bool,
-    caller: str,
-) -> tuple[List[str], List[Any]]:
-    """Return frontier-aligned prompt rows and optional source PIL images."""
-    conditioning = sample.conditioning()
-    text_batches = [value for value in conditioning if isinstance(value, Texts)]
-    if len(text_batches) != 1:
-        raise ValueError(f"{caller}: expected exactly one Texts conditioning batch, got {len(text_batches)}")
-
-    prompt_rows = list(text_batches[0].texts)
-    n_samples = len(sample.frontier_gen_part(BagelDiffusionParams).sample_ids)
-    if len(prompt_rows) != n_samples:
-        raise RuntimeError(f"{caller}: prompt count {len(prompt_rows)} != diffusion sample count {n_samples}")
-
-    image_batches = [value for value in conditioning if isinstance(value, Images)]
-    if image_input:
-        if len(image_batches) != 1:
-            raise ValueError(f"{caller}: expected exactly one Images conditioning batch, got {len(image_batches)}")
-        image_rows = [image.to_pil() for image in image_batches[0].to_list()]
-        if len(image_rows) != n_samples:
-            raise RuntimeError(f"{caller}: image count {len(image_rows)} != diffusion sample count {n_samples}")
-    else:
-        if image_batches:
-            raise ValueError(f"{caller}: modality does not accept image conditioning")
-        image_rows = []
-    return prompt_rows, image_rows
-
-
-class BagelInputAdapter(DitInputAdapter):
-    """Build BAGEL prompt dictionaries and diffusion-stage sampling intent."""
-
-    def __init__(self, modality: str, *, image_input: bool = False) -> None:
-        super().__init__(modality)
-        self.image_input = bool(image_input)
-
-    def _spp(self, sample: Sample) -> int:
-        """``samples_per_prompt`` — the GRPO group size; 1 disables packing."""
-        diff_params = sample.frontier_gen_part(BagelDiffusionParams).sampling_params
-        spp = int(diff_params.samples_per_prompt)
-        if spp < 1:
-            raise ValueError(f"{self.modality}: samples_per_prompt must be >= 1, got {spp}")
-        return spp
-
-    def _is_packable_t2i(self, sample: Sample) -> bool:
-        """Collapse spp samples into one ``num_outputs_per_prompt=spp`` request."""
-        if self.image_input:
-            return False
-        if self._spp(sample) <= 1:
-            return False
-        diff_params = sample.frontier_gen_part(BagelDiffusionParams).sampling_params
-        return float(diff_params.guidance_scale) <= 1.0 and float(diff_params.cfg_img_scale) <= 1.0
-
-    def build_prompts(self, sample: Sample) -> List[Any]:
-        """Plain ``{"prompt": text}`` dicts (no ``modalities`` → image path)."""
-        caller = f"{self.modality}.build_prompts"
-        prompt_rows, pil_images = _conditioning_rows(
-            sample,
-            image_input=self.image_input,
-            caller=caller,
-        )
-        gen_part = sample.frontier_gen_part(BagelDiffusionParams)
-        n_samples = len(gen_part.sample_ids)
-        if self.image_input:
-            return [
-                {"prompt": text, "multi_modal_data": {"image": image}}
-                for text, image in zip(prompt_rows, pil_images, strict=True)
-            ]
-        spp = self._spp(sample)
-        grouped_texts, grouped_spp = _grouped_texts_from_sample(
-            sample,
-            caller=caller,
-        )
-        if grouped_spp != spp:
-            raise RuntimeError(
-                f"{self.modality}.build_prompts: inconsistent samples_per_prompt "
-                f"({grouped_spp} from grouping, {spp} from diffusion params)."
-            )
-
-        pack = self._is_packable_t2i(sample)
-        if pack:
-            prompt_texts = grouped_texts
-            num_outputs_per_prompt = spp
-        else:
-            prompt_texts = prompt_rows
-            num_outputs_per_prompt = 1
-
-        if len(prompt_texts) * num_outputs_per_prompt != n_samples:
-            raise RuntimeError(
-                f"{self.modality}.build_prompts: prompt count {len(prompt_texts)} * "
-                f"num_outputs_per_prompt={num_outputs_per_prompt} != diffusion sample count {n_samples}."
-            )
-        return [{"prompt": text} for text in prompt_texts]
-
-    def build_sampling(self, sample: Sample) -> List[StageSampling]:
-        """One diffusion-stage intent with the BAGEL-specific kwargs."""
-        spp = self._spp(sample)
-        gen_part = sample.frontier_gen_part(BagelDiffusionParams)
-        diff_params = gen_part.sampling_params
-        pack = self._is_packable_t2i(sample)
-
-        n_samples = len(gen_part.sample_ids)
-        if self.image_input:
-            n_prompts = n_samples
-        else:
-            grouped_texts, grouped_spp = _grouped_texts_from_sample(
-                sample,
-                caller=f"{self.modality}.build_sampling",
-            )
-            if grouped_spp != spp:
-                raise RuntimeError(
-                    f"{self.modality}.build_sampling: inconsistent samples_per_prompt "
-                    f"({grouped_spp} from grouping, {spp} from diffusion params)."
-                )
-            n_prompts = len(grouped_texts) if pack else n_samples
-        num_outputs_per_prompt = spp if pack else 1
-        if n_prompts * num_outputs_per_prompt != n_samples:
-            raise RuntimeError(
-                f"{self.modality}.build_sampling: prompt count {n_prompts} * "
-                f"num_outputs_per_prompt={num_outputs_per_prompt} != diffusion sample count {n_samples}."
-            )
-
-        num_steps = int(diff_params.num_inference_steps)
-        diff_kwargs: Dict[str, Any] = dict(
-            height=int(diff_params.height),
-            width=int(diff_params.width),
-            # +1: BAGEL builds linspace(1, 0, num_timesteps) and loops num_timesteps-1.
-            num_inference_steps=num_steps + 1,
-            eta=float(diff_params.eta),
-            return_trajectory_latents=True,
-            return_trajectory_decoded=False,
-            num_outputs_per_prompt=num_outputs_per_prompt,
-        )
-        seed = diff_params.seed
-        if seed is not None:
-            diff_kwargs["seed"] = int(seed)
-
-        # σ contract self-check: the engine-pinned Part schedule for num_steps
-        # steps must have num_steps+1 points. We don't send sigmas (BAGEL ignores
-        # them), but assert the engine resolved the schedule the worker will loop.
-        sigmas_list_from_diffusion(diff_params, num_steps)
-
-        extra_args: Dict[str, Any] = {
-            # Translate the canonical field to BAGEL's worker API.
-            "cfg_text_scale": float(diff_params.guidance_scale),
-            "cfg_img_scale": float(diff_params.cfg_img_scale),
-            "cfg_interval": tuple(diff_params.cfg_interval),
-            "cfg_renorm_min": float(diff_params.cfg_renorm_min),
-            "cfg_renorm_type": str(diff_params.cfg_renorm_type),
-        }
-        sde_indices = diff_params.sde_indices
-        # eta == 0 (deterministic eval) means no step is stochastic. Shipping a
-        # non-empty gate anyway makes the worker scheduler raise ("step_index=N is in
-        # the SDE gate but eta=0.0"); an absent gate is its documented pure-Euler
-        # path, and matches trainside, whose ``diffuse`` gates per-step eta on the same
-        # params.eta and simply records no log-probs. FlowSDEStrategy uses 1e-7
-        # as the deterministic cutoff; the wire gate must use the same threshold.
-        if sde_indices is not None and float(diff_params.eta) >= 1e-7:
-            extra_args["sde_indices"] = sorted({int(i) for i in sde_indices})
-        if diff_params.sigmas is not None and int(diff_params.sigmas.shape[0]) > 1:
-            extra_args["sigma_max"] = float(diff_params.sigmas[1].item())
-        extra_args["trajectory_precision"] = diff_params.trajectory_precision
-
-        pack_initial_noise_extra_args(extra_args, gen_part, diff_params, caller=self.modality)
-        diff_kwargs["extra_args"] = extra_args
-
-        return [StageSampling(kind=STAGE_KIND_DIFFUSION, kwargs=diff_kwargs)]
-
-
-class BagelOutputAdapter(DitOutputAdapter):
-    """Build one image Part with deferred BAGEL replay conditions."""
-
-    def __init__(self, modality: str, *, image_input: bool = False) -> None:
-        super().__init__(modality)
-        self.image_input = bool(image_input)
-
-    def build_segment(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Any:
-        """The DiT trajectory segment (asserts the σ echo)."""
-        diff_outputs, _, _ = collect_dit_outputs(
-            per_request, final_output_type=self.final_output_type, stage_id=self.stage_id, modality=self.modality
-        )
-        diff_params = sample.frontier_gen_part(BagelDiffusionParams).sampling_params
-        return build_image_segment(diff_outputs, expected_sigmas=diff_params.sigmas)
-
-    def build_decoded(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Any:
-        del sample
-        _, _, pil_images = collect_dit_outputs(
-            per_request, final_output_type=self.final_output_type, stage_id=self.stage_id, modality=self.modality
-        )
-        return pils_to_images(pil_images)
-
-    def build_conditions(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
-        """Ship raw prompt, shape, and optional source image for trainer-side KV rebuild."""
-        del per_request
-        prompts, input_images = _conditioning_rows(
-            sample,
-            image_input=self.image_input,
-            caller=f"{self.modality}.build_conditions",
-        )
-        gen_part = sample.frontier_gen_part(BagelDiffusionParams)
-        diff_params = gen_part.sampling_params
-        image_shape = (int(diff_params.height), int(diff_params.width))
-        conditions = BagelDiffusionConditions(
-            prompts=prompts,
-            input_images=input_images,
-            image_shapes=[image_shape] * len(prompts),
-        )
-        return conditions.to_dict()
-
-
 class BagelAdapter(ModelAdapter):
     """Bind BAGEL t2i and it2i to one single-stage DiT worker."""
 
-    stage_yaml = "bagel_t2i_rl.yaml"
+    deploy_config = "bagel_t2i_rl.yaml"
     omni_mode = "text-to-image"
     needs_driver_tokenizer = False
     image_input: bool = False  # Whether the modality requires an edit-source image.
-
-    def __init__(self, config: Any, model_config: Any, *, strategy: Any = None, tokenize_fn: Any = None) -> None:
-        super().__init__(config, model_config, strategy=strategy, tokenize_fn=tokenize_fn)
-        self.input_adapter = BagelInputAdapter(self.modality, image_input=self.image_input)
-        self.output_adapter = BagelOutputAdapter(self.modality, image_input=self.image_input)
+    supports_row_canvas = True
 
     def schedule_policy(self) -> FlowMatchSchedulePolicy:
         """Static-shift FlowMatch σ policy (BAGEL uses no dynamic shifting)."""
-        shift = float(getattr(self.model_config, "shift", 3.0))
-        return FlowMatchSchedulePolicy.static_only(shift)
+        return FlowMatchSchedulePolicy.static_only(float(self.model_config.shift))
 
     def validate_request(self, sample: Sample) -> None:
         has_image = sample.has_image_input()
@@ -271,12 +53,136 @@ class BagelAdapter(ModelAdapter):
             raise ValueError(
                 f"modality={self.modality!r} rejects image-bearing requests; use modality='bagel_it2i' instead."
             )
+        conditioning = sample.conditioning()
+        require(
+            sum(isinstance(v, Texts) for v in conditioning) == 1,
+            f"modality={self.modality!r} requires exactly one Texts conditioning batch.",
+        )
+        if self.image_input:
+            require(
+                sum(isinstance(v, Images) for v in conditioning) == 1 and len(conditioning) == 2,
+                f"modality={self.modality!r} requires exactly one Texts and one Images conditioning batch.",
+            )
+        else:
+            require(len(conditioning) == 1, f"modality={self.modality!r} accepts only Texts conditioning.")
 
     def build_inputs(self, sample: Sample) -> List[GenerateCall]:
-        return self.input_adapter.build(sample)
+        """One request per sibling run, one call per contiguous requests of equal canvas and size; see the README."""
+        gen_part = sample.frontier_gen_part(BagelDiffusionParams)
+        params = gen_part.sampling_params
+        conditioning = sample.conditioning()
+        texts = list(next(v for v in conditioning if isinstance(v, Texts)).texts)
+        images = (
+            [image.to_pil() for image in next(v for v in conditioning if isinstance(v, Images)).to_list()]
+            if self.image_input
+            else []
+        )
+        canvases = sample.canvases()
+        should_pack = params.guidance_scale <= 1.0 and params.cfg_img_scale <= 1.0
+        owner_ids = gen_part.group_ids if should_pack else gen_part.sample_ids
+        run_starts = [row for row in range(len(owner_ids)) if row == 0 or owner_ids[row] != owner_ids[row - 1]]
+        run_spans = list(zip(run_starts, run_starts[1:] + [len(owner_ids)]))
+        run_shapes = [(canvases[start], end - start) for start, end in run_spans]
+        max_tokens = BagelPipeline.latent_shape(model_config=self.model_config, sampling_spec=params)[0]
+
+        num_steps = params.num_inference_steps
+        sigmas_list_from_diffusion(params, num_steps)
+        sde_indices = sorted(set(params.sde_indices)) if params.sde_indices is not None and params.eta >= 1e-7 else None
+        sigma_max = float(params.sigmas[1].item()) if params.sigmas is not None else None
+
+        calls: List[GenerateCall] = []
+        call_start = 0
+        for call_end in range(1, len(run_spans) + 1):
+            if call_end < len(run_spans) and run_shapes[call_end] == run_shapes[call_start]:
+                continue
+            (height, width), num_outputs = run_shapes[call_start]
+            call_part = gen_part.slice(run_spans[call_start][0], run_spans[call_end - 1][1])
+            prompts = [
+                {"prompt": texts[start], "multi_modal_data": {"image": images[start]}}
+                if self.image_input
+                else {"prompt": texts[start]}
+                for start, _ in run_spans[call_start:call_end]
+            ]
+            diff_params = params
+            if (height, width) != (params.height, params.width):
+                diff_params = dataclasses.replace(params, height=height, width=width)
+                latent_shape = BagelPipeline.latent_shape(model_config=self.model_config, sampling_spec=diff_params)
+                require(
+                    0 < latent_shape[0] <= max_tokens,
+                    f"{self.modality}: row canvas {height}x{width} must hold at least one token and no more than "
+                    f"sampling.height/width ({params.height}x{params.width}), which bounds the stored trajectory.",
+                )
+                if params.init_noise_latent_shape is not None:
+                    diff_params = dataclasses.replace(diff_params, init_noise_latent_shape=list(latent_shape))
+
+            diff_kwargs: Dict[str, Any] = {
+                "height": diff_params.height,
+                "width": diff_params.width,
+                # +1: BAGEL builds linspace(1, 0, num_timesteps) and loops num_timesteps-1.
+                "num_inference_steps": num_steps + 1,
+                "eta": diff_params.eta,
+                "return_trajectory_latents": True,
+                "return_trajectory_decoded": False,
+                "num_outputs_per_prompt": num_outputs,
+            }
+            if diff_params.seed is not None:
+                diff_kwargs["seed"] = diff_params.seed
+
+            extra_args: Dict[str, Any] = {
+                "cfg_text_scale": diff_params.guidance_scale,
+                "cfg_img_scale": diff_params.cfg_img_scale,
+                "cfg_interval": tuple(diff_params.cfg_interval),
+                "cfg_renorm_min": diff_params.cfg_renorm_min,
+                "cfg_renorm_type": diff_params.cfg_renorm_type,
+                "trajectory_precision": diff_params.trajectory_precision,
+            }
+            if sde_indices is not None:
+                extra_args["sde_indices"] = sde_indices
+            if sigma_max is not None:
+                extra_args["sigma_max"] = sigma_max
+            pack_initial_noise_extra_args(extra_args, call_part, diff_params, caller=self.modality)
+            diff_kwargs["extra_args"] = extra_args
+
+            calls.append(
+                GenerateCall(
+                    prompts=prompts,
+                    sampling=[StageSampling(kind=STAGE_KIND_DIFFUSION, kwargs=diff_kwargs)],
+                )
+            )
+            call_start = call_end
+        return calls
 
     def build_response(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Sample:
-        return self.output_adapter.build(sample, per_request)
+        """Fill the frontier diffusion Part with trajectory, decoded images, and BAGEL replay conditions."""
+        if not per_request or not any(per_request):
+            raise ValueError("build_response: empty per-request outputs (Omni.generate returned nothing surfaceable).")
+        diff_outputs, frame_groups, pil_images = collect_dit_outputs(
+            per_request, final_output_type="image", stage_id=0, modality=self.modality
+        )
+        frontier = sample.frontier_gen_part(BagelDiffusionParams)
+        diff_params = frontier.sampling_params
+        max_tokens = BagelPipeline.latent_shape(model_config=self.model_config, sampling_spec=diff_params)[0]
+        segment = build_image_segment(diff_outputs, expected_sigmas=diff_params.sigmas, pad_tokens_to=max_tokens)
+        conditioning = sample.conditioning()
+        prompts = list(next(v for v in conditioning if isinstance(v, Texts)).texts)
+        input_images = (
+            [image.to_pil() for image in next(v for v in conditioning if isinstance(v, Images)).to_list()]
+            if self.image_input
+            else []
+        )
+        conditions = BagelDiffusionConditions(
+            prompts=prompts,
+            input_images=input_images,
+            image_shapes=sample.canvases(),
+            layouts=[read_captures(out)["layout"] for out, frames in zip(diff_outputs, frame_groups) for _ in frames],
+        )
+        return sample.replace_frontier(
+            frontier.fill(
+                segment=segment,
+                primitives={"image": pils_to_images(pil_images)},
+                conditions=conditions.to_dict(),
+            )
+        )
 
 
 @register_adapter("bagel_t2i")
@@ -291,4 +197,4 @@ class BagelIt2iAdapter(BagelAdapter):
     image_input = True
 
 
-__all__ = ["BagelAdapter", "BagelInputAdapter", "BagelIt2iAdapter", "BagelOutputAdapter", "BagelT2iAdapter"]
+__all__ = ["BagelAdapter", "BagelIt2iAdapter", "BagelT2iAdapter"]

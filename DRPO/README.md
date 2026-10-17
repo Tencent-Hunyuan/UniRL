@@ -31,12 +31,15 @@ that preserves the same Binary-TV trust-region geometry while providing continuo
 reweighting — attenuating diverging updates and providing corrective signals beyond the
 boundary.
 
-The reward here is **rule-based**: `MathBoxedRewardScorer`
-([`unirl/reward/local/math_boxed.py`](../unirl/reward/local/math_boxed.py)) checks the
-`\boxed{}` answer against the DAPO-Math ground truth — exactly the verifiable reward the
-paper trains on, not a learned reward model.
+The reward here is **rule-based**: `MathVerifyRewardScorer`
+([`unirl/reward/local/mathverify.py`](../unirl/reward/local/mathverify.py)) grades the
+parsed final answer against the DAPO-Math ground truth with HuggingFace
+`math-verify` — the paper's grader (Appendix D), not a learned reward model. Unlike a
+`\boxed{}`-requiring matcher, it can also extract answers from free-form text. Extraction
+is heuristic: recognized final-answer markers take priority; otherwise `math-verify` may
+fall back to the rightmost parseable expression.
 
-![drpo overview: the prompt to SGLang rollout (behavior policy mu) to group advantage to replay for new logp pi to ratio r and TV shift |pi - mu| to reweighted REINFORCE pipeline (single update), with the centerpiece contrast between DPPO's hard-mask step (full gradient, then a cliff to 0 at the threshold delta) and the paper's smooth, bounded DRPO weight that ramps down and crosses zero into a corrective region past delta.](../assets/drpo_overview.png)
+![drpo overview: the prompt to SGLang rollout (behavior policy mu) to group advantage to replay for new logp pi to ratio r and TV shift |pi - mu| to reweighted REINFORCE pipeline, with the centerpiece contrast between DPPO's hard-mask step (full gradient, then a cliff to 0 at the threshold delta) and the paper's smooth, bounded DRPO weight that ramps down and crosses zero into a corrective region past delta.](../assets/drpo_overview.png)
 
 ## The DRPO objective (paper §3, Eq. 8)
 
@@ -110,14 +113,14 @@ The practical consequence:
 
 | Math object | Repo object |
 |---|---|
-| State `s_t = (x, y_{<t})` | `track.conditions` + the packed prefix in `TextSegment` |
+| State `s_t = (x, y_{<t})` | `part.conditions` + the packed prefix in `TextSegment` |
 | Sampled token `y_t` | `segment.tokens` |
-| Behavior log-prob `log µ(y_t\|s_t)` | `segment.log_probs` (emitted by SGLang) → `old_logp` |
+| Behavior log-prob `log µ(y_t\|s_t)` | `segment.log_probs` (emitted by SGLang; train-side `π_old` under `old_logp_source: replay`) → `old_logp` |
 | New log-prob `log π_θ(y_t\|s_t)` | `stage.replay(segment, temperature=sampling_temperature)` → `new_logp` |
 | Ratio `r_t = π/µ` | `torch.exp(new_logp − old_logp)` |
 | Behavior prob `µ_t` | `torch.exp(old_logp).detach()` |
 | Regularization threshold `δ` (paper) / `ε` (code) | `drpo_epsilon` (default 12.5; paper §4) |
-| Sample-level advantage `Â` | `track.advantages` |
+| Sample-level advantage `Â` | `part.advantages` |
 | Token-level advantage | `GRPO._expand_advantages_to_tokens(advantages, segment.lengths, ...)` |
 | Quadratic penalty `\|Â\|·µ·(r−1)²/(2ε)` | `adv.abs() * old_prob * ratio_delta.square() / (2.0 * epsilon)` |
 | Padding/eos mask | `segment.loss_mask` |
@@ -127,7 +130,7 @@ The practical consequence:
 1. `unirl.train_ar` builds `ARTrainer` for the text-only Qwen3 recipe.
 2. `SGLangRolloutEngine` samples completions and fills the AR `Part` with packed
    `TextSegment.tokens`, `log_probs`, `lengths`, and masks.
-3. `MathBoxedRewardScorer` scores each completion correct/incorrect.
+3. `MathVerifyRewardScorer` scores each completion correct/incorrect.
 4. `Part.compute_advantages(normalize=False, scope="group")` mean-centers rewards
    within each prompt group; the recipe sets `normalize_adv_by_std: false`, so there is **no
    std division**.
@@ -136,18 +139,18 @@ The practical consequence:
    expands advantages to tokens, calls `_drpo_loss`, applies `segment.loss_mask`,
    reduces, and `backward()`s.
 
-Unlike FlowGRPO/FlowDPPO, `DRPO` does **not** freeze a train-side `old_logp` in
-`prepare_segment` — it reuses the rollout log-prob, so the recipe must keep
-`stack.num_updates_per_batch: 1` (`TrainStack` raises otherwise:
-`supports_multi_update = False`).
+`DRPO` sets `supports_multi_update = True`: the `old_logp` anchor is frozen once
+per rollout batch (see `old_logp_source` below), so `stack.num_updates_per_batch`
+may split the batch into several optimizer steps; the recipe uses 4.
 
 ## Key knobs ([`config.yaml`](config.yaml))
 
 | Knob | Meaning |
 |---|---|
 | `drpo_epsilon` | Regularization threshold `ε` (code) / `δ` (paper). Default `12.5` (paper §4). Larger ⇒ weaker regularization; per-token trust region is `ε_t = ε / µ`. |
+| `old_logp_source` | `rollout` (default, recipe): the rollout log-prob `µ` anchors every update, as in the paper; the ratio also absorbs the rollout-vs-train engine gap. `replay`: `prepare_segment` replaces `segment.log_probs` with a train-side `π_old` at pre-update weights. |
 | `sampling_temperature` | **MUST equal `sampling.temperature`**. Replay tempers logits so `π` and `µ` share a distribution (`ratio_mean ≈ 1`). |
-| `loss_agg_mode` | `token-mean`, or the recipe's `seq-mean-token-sum-norm`. |
+| `loss_agg_mode` | `token-mean`, `seq-mean-token-mean`, or the recipe's `seq-mean-token-sum-norm`. |
 | `horizon` | Fixed normalizer for `seq-mean-token-sum-norm`; the recipe derives it from `${sampling.max_new_tokens}`. |
 | `normalize_adv_by_std` | Recipe `false` → mean-center only (no std division). |
 
@@ -156,15 +159,15 @@ Unlike FlowGRPO/FlowDPPO, `DRPO` does **not** freeze a train-side `old_logp` in
 | Symptom | First files / variables to check |
 |---|---|
 | `ratio_mean` far from 1 at first update | `sampling_temperature` vs. `sampling.temperature`; SGLang logprob config |
-| Large `rollout_replay_logp_absdiff_mean` | train/rollout mismatch, weight sync, tokenization/chat-template mismatch |
+| Large `rollout_replay_logp_absdiff_mean` | `rl_on_policy_target: fsdp` missing from the SGLang `engine_kwargs`, weight sync, tokenization/chat-template mismatch |
 | No gradient on many tokens | `segment.loss_mask`; zero advantages from all-correct/all-wrong groups |
 | `drpo_penalty_mean` very large | `drpo_epsilon` too small for the model's off-policy gap |
-| Completion misses the boxed answer | chat template `/no_think` + `enable_thinking: false` (Qwen3 overruns on `<think>`) |
-| SGLang serves stale weights | `LocalLoraWeightSync`, adapter name `default`, rollout wake/sleep logs |
+| Completion never reaches a final answer | truncation at `sampling.max_new_tokens` (Qwen3 overruns on `<think>`) — an unboxed answer is *not* the problem, `math-verify` reads free-form text. Disabling thinking departs from the paper setup and must flip `enable_thinking` in **both** the pipeline and rollout chat templates or the prompts diverge |
+| SGLang serves stale weights | `TensorWeightSync`, `weight_sync_interval`, rollout wake/sleep logs |
 
 Metric source: `ratio_mean`, `ratio_max`, `approx_kl`, `drpo_penalty_mean`,
 `clipfrac_upper`, `clipfrac_lower`, and the AR-only `rollout_replay_logp_absdiff_mean` are
-emitted by `_drpo_loss`.
+emitted by `_drpo_loss` / `compute_loss_and_backward`.
 
 ## Run it
 
@@ -173,7 +176,7 @@ emitted by `_drpo_loss`.
 python datasets/dapo_math/prepare_dapo_math.py --out-dir data/dapo_math
 
 DATA_PATH=data/dapo_math/train.jsonl EVAL_DATA_PATH=data/dapo_math/aime_eval.jsonl \
-python -m unirl.train_ar --config-name=ar/qwen3_drpo_4b_base_dapo_sglang num_devices=64
+python -m unirl.train_ar --config-name=ar/qwen3_drpo_4b_base_dapo_sglang num_devices=32
 ```
 
 The model defaults to `Qwen/Qwen3-4B-Base`; set `QWEN3_PATH` to a local checkpoint dir to
