@@ -70,6 +70,18 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
 
 ## Gotchas
 
+- **AR GRPO rollout correction is opt-in and requires a replay anchor.** Set
+  `old_logp_source: replay` and `rollout_is_threshold: 2.0` on the GRPO algorithm
+  to multiply its clipped token loss by detached
+  `min(exp(log_pi_old - log_pi_rollout), threshold)` weights. The log-ratio is
+  safety-clamped to `[-20, 20]` before exponentiation, following verl's token TIS.
+  `None` disables correction. Both log-probability anchors remain frozen across
+  updates; weights do not change the loss-reduction denominator. Clipping trades
+  bias for bounded weights and does not fix token/temperature/support mismatches.
+  Weight mean/max, clipped fraction and `rollout_is_micro_ess_fraction` describe
+  active tokens in each micro; the latter is not a global-batch ESS. All-masked
+  micros report zeros. Default rollout anchors already use the behavior policy
+  in the PPO ratio, so enabling this additional multiplier there is rejected.
 - **`old_logp_source: rollout` with a replay-only engine** — a separate-worker
   SGLang rollout emits no per-step `sde_logp`, so the `rollout` source raises in
   `prepare_segment`. Use `replay` (the cost is one extra `torch.no_grad` replay).
