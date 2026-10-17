@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import re
-from typing import Dict, List, Optional, Tuple
+from collections import OrderedDict
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
+from unirl.config.require import require
 from unirl.types.conditions import TextEmbedCondition
 from unirl.types.primitives import Texts
 
 from .bundle import HunyuanVideo15Bundle
+
+_PROMPT_CACHE_SIZE = 8
 
 # fmt: off
 PROMPT_TEMPLATE_SYSTEM_MESSAGE = "You are a helpful assistant. Describe the video by detailing the following aspects: \
@@ -34,17 +38,6 @@ def _extract_glyph_texts(prompt: str) -> Optional[str]:
     return ". ".join([f'Text "{text}"' for text in result]) + ". "
 
 
-def _format_chat_template(prompts: List[str], system_message: str) -> List[List[Dict[str, str]]]:
-    """Build the (system, user) chat conversation list expected by Qwen2.5-VL."""
-    return [
-        [
-            {"role": "system", "content": system_message},
-            {"role": "user", "content": p if p else " "},
-        ]
-        for p in prompts
-    ]
-
-
 class HunyuanVideo15TextEmbedStage:
     """Dual-encoder text → two ``TextEmbedCondition`` instances."""
 
@@ -62,11 +55,52 @@ class HunyuanVideo15TextEmbedStage:
         self.mllm_crop_start = int(mllm_crop_start)
         self.mllm_skip_layers = int(mllm_skip_layers)
         self.byt5_max_length = int(byt5_max_length)
+        self._mllm_cache: OrderedDict[str, Tuple[torch.Tensor, torch.Tensor]] = OrderedDict()
+        self._glyph_cache: OrderedDict[str, Tuple[torch.Tensor, torch.Tensor]] = OrderedDict()
+
+    def _embed_with_cache(
+        self,
+        prompts: List[str],
+        cache: OrderedDict[str, Tuple[torch.Tensor, torch.Tensor]],
+        encode_fn: Callable[[List[str]], Tuple[torch.Tensor, torch.Tensor]],
+    ) -> TextEmbedCondition:
+        """Encode prompts with in-batch deduplication and bounded CPU LRU caching."""
+        require(len(prompts) > 0, "HunyuanVideo15TextEmbedStage: no prompts to embed")
+        uniq = list(dict.fromkeys(prompts))
+        device = self.bundle.device
+        cached_cpu = {p: cache[p] for p in uniq if p in cache}
+        on_device: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {
+            p: (emb_cpu.to(device=device), mask_cpu.to(device=device)) for p, (emb_cpu, mask_cpu) in cached_cpu.items()
+        }
+        missing = [p for p in uniq if p not in cached_cpu]
+        if missing:
+            enc_embeds, enc_masks = encode_fn(missing)
+            cpu_embeds = enc_embeds.detach().to("cpu")
+            cpu_masks = enc_masks.detach().to("cpu")
+            for i, p in enumerate(missing):
+                on_device[p] = (enc_embeds[i : i + 1], enc_masks[i : i + 1])
+                cached_cpu[p] = (cpu_embeds[i : i + 1].clone(), cpu_masks[i : i + 1].clone())
+
+        for p in uniq:
+            if p in cache:
+                cache.move_to_end(p)
+            else:
+                cache[p] = cached_cpu[p]
+                if len(cache) > _PROMPT_CACHE_SIZE:
+                    cache.popitem(last=False)
+
+        if len(prompts) == 1:
+            emb, mask = on_device[prompts[0]]
+            return TextEmbedCondition(embeds=emb, attn_mask=mask, pooled=None)
+        return TextEmbedCondition(
+            embeds=torch.cat([on_device[p][0] for p in prompts], dim=0),
+            attn_mask=torch.cat([on_device[p][1] for p in prompts], dim=0),
+            pooled=None,
+        )
 
     def embed_mllm(self, p: Texts) -> TextEmbedCondition:
         """Encode prompts via the Qwen2.5-VL MLLM into a TextEmbedCondition."""
-        embeds, mask = self._encode_mllm(list(p.texts))
-        return TextEmbedCondition(embeds=embeds, attn_mask=mask, pooled=None)
+        return self._embed_with_cache(list(p.texts), self._mllm_cache, self._encode_mllm)
 
     def _encode_mllm(self, prompts: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
         bundle = self.bundle
@@ -76,7 +110,13 @@ class HunyuanVideo15TextEmbedStage:
         dtype = next(text_encoder.parameters()).dtype
         crop_start = self.mllm_crop_start
 
-        chat = _format_chat_template(prompts, PROMPT_TEMPLATE_SYSTEM_MESSAGE)
+        chat = [
+            [
+                {"role": "system", "content": PROMPT_TEMPLATE_SYSTEM_MESSAGE},
+                {"role": "user", "content": prompt if prompt else " "},
+            ]
+            for prompt in prompts
+        ]
         text_inputs = tokenizer.apply_chat_template(
             chat,
             add_generation_prompt=True,
@@ -106,8 +146,7 @@ class HunyuanVideo15TextEmbedStage:
 
     def embed_glyph(self, p: Texts) -> TextEmbedCondition:
         """Encode prompts via the ByT5 glyph encoder into a TextEmbedCondition."""
-        embeds, mask = self._encode_byt5(list(p.texts))
-        return TextEmbedCondition(embeds=embeds, attn_mask=mask, pooled=None)
+        return self._embed_with_cache(list(p.texts), self._glyph_cache, self._encode_byt5)
 
     def _encode_byt5(self, prompts: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
         bundle = self.bundle
@@ -115,7 +154,7 @@ class HunyuanVideo15TextEmbedStage:
         text_encoder = bundle.text_encoder_2
         device = bundle.device
         max_length = self.byt5_max_length
-        d_model = int(getattr(text_encoder.config, "d_model", 1472))
+        d_model = text_encoder.config.d_model
         enc_dtype = next(text_encoder.parameters()).dtype
 
         embeds_list: List[torch.Tensor] = []

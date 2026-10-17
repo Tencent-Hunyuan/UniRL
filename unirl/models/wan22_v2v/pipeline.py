@@ -20,7 +20,7 @@ from unirl.types.primitives import Texts, Videos
 from unirl.types.sample import Sample
 from unirl.types.sampling import DiffusionSamplingParams
 
-from .config import DEFAULT_V2V_STRENGTH
+from .config import DEFAULT_V2V_STRENGTH, WAN22V2VPipelineConfig
 from .video_encode import WAN22VideoLatentEncodeStage
 
 
@@ -63,19 +63,11 @@ class WAN22V2VPipeline(Pipeline):
         self.diffusion = diffusion
         self.vae_decode = vae_decode if vae_decode is not None else WAN21VAEDecodeStage(bundle)
 
-    @staticmethod
-    def _sde_indices_in_trimmed_frame(sde_indices: Any, *, t_full: int, t_eff: int) -> list:
-        """Remap SDE step indices from the full-schedule frame to the trimmed V2V frame."""
-        if not sde_indices or int(t_full) <= 0:
-            return []
-        remapped = {min(int(t_eff) - 1, max(0, round(int(i) * int(t_eff) / int(t_full)))) for i in sde_indices}
-        return sorted(remapped)
-
     @classmethod
     def latent_shape(cls, *, model_config: Any, sampling_spec: Any) -> tuple:
-        height = int(sampling_spec.height)
-        width = int(sampling_spec.width)
-        num_frames = int(sampling_spec.num_frames)
+        height = sampling_spec.height
+        width = sampling_spec.width
+        num_frames = sampling_spec.num_frames
         if (num_frames - 1) % 4 != 0:
             raise ValueError(
                 f"WAN VAE temporal_downsample=4 requires (num_frames - 1) % 4 == 0, "
@@ -87,7 +79,7 @@ class WAN22V2VPipeline(Pipeline):
     @classmethod
     def from_config(
         cls,
-        config: Any,
+        config: WAN22V2VPipelineConfig,
         *,
         strategy: Optional[StepStrategy] = None,
     ) -> "WAN22V2VPipeline":
@@ -95,12 +87,12 @@ class WAN22V2VPipeline(Pipeline):
         return cls(
             bundle=bundle,
             strategy=strategy if strategy is not None else DanceSDEStrategy(),
-            shift=float(config.shift),
-            strength=float(getattr(config, "strength", DEFAULT_V2V_STRENGTH)),
+            shift=config.shift,
+            strength=config.strength,
             autocast_precision=config.autocast_precision,
             trajectory_precision=config.trajectory_precision,
             logprob_precision=config.logprob_precision,
-            max_sequence_length=int(config.max_sequence_length),
+            max_sequence_length=config.max_sequence_length,
         )
 
     def build_conditions(
@@ -153,16 +145,16 @@ class WAN22V2VPipeline(Pipeline):
         if len(videos) != len(texts.texts):
             raise ValueError(f"WAN22V2VPipeline.generate: video count {len(videos)} != text count {len(texts.texts)}")
 
-        primary_g = float(params.guidance_scale)
-        low_g = float(params.guidance_scale_2) if params.guidance_scale_2 is not None else primary_g
+        primary_g = params.guidance_scale
+        low_g = params.guidance_scale_2 if params.guidance_scale_2 is not None else primary_g
         wan_conds = self.build_conditions(texts, guidance_scale=max(primary_g, low_g))
 
         device = self.bundle.device
         video_latent_cond = WAN22VideoLatentEncodeStage(
             self.bundle,
-            num_frames=int(params.num_frames),
-            height=int(params.height),
-            width=int(params.width),
+            num_frames=params.num_frames,
+            height=params.height,
+            width=params.width,
         ).encode(videos)
         video_latents = video_latent_cond.latents.to(device=device, dtype=torch.float32)
         batch_size = int(video_latents.shape[0])
@@ -174,7 +166,7 @@ class WAN22V2VPipeline(Pipeline):
                 f"WAN22V2VPipeline.generate: sigma schedule must contain at least two points, "
                 f"got {int(full_schedule.shape[0])}"
             )
-        strength = float(params.strength) if params.strength is not None else self.strength
+        strength = params.strength if params.strength is not None else self.strength
         if not 0.0 < strength <= 1.0:
             raise ValueError(f"WAN22V2VPipeline.generate: strength must be in (0, 1], got {strength}")
         t_eff = max(1, min(t_full, int(round(t_full * strength))))
@@ -199,10 +191,10 @@ class WAN22V2VPipeline(Pipeline):
                 latent_shape=tuple(video_latents.shape[1:]),
                 device=device,
                 dtype=torch.float32,
-                init_same_noise=bool(params.init_same_noise),
-                samples_per_prompt=int(params.samples_per_prompt),
+                init_same_noise=params.init_same_noise,
+                samples_per_prompt=params.samples_per_prompt,
                 noise_group_ids=noise_ids,
-                base_seed=int(params.seed or 0),
+                base_seed=0 if params.seed is None else params.seed,
             )
         if tuple(noise.shape) != tuple(video_latents.shape):
             raise ValueError(
@@ -211,10 +203,10 @@ class WAN22V2VPipeline(Pipeline):
             )
 
         x_start = (1.0 - sigma_start) * video_latents + sigma_start * noise
-        sde_indices = self._sde_indices_in_trimmed_frame(
-            params.sde_indices,
-            t_full=t_full,
-            t_eff=t_eff,
+        sde_indices = (
+            sorted({min(t_eff - 1, max(0, round(i * t_eff / t_full))) for i in params.sde_indices})
+            if params.sde_indices and t_full > 0
+            else []
         )
         # The returned Part must describe the trajectory that actually ran, not the discarded full schedule.
         v2v_params = dataclasses.replace(

@@ -45,6 +45,8 @@ pipeline:
   autocast_precision: bf16
   trajectory_precision: bf16
   logprob_precision: fp32
+  # Keep false at micro_batch_size=8 (stacking S=3 SDE steps yields batch 24); flip true at smaller mbs.
+  batch_replay_steps: false
   # DanceGRPO: Dance SDE kernel (the one algorithmic difference from FlowGRPO).
   strategy:
     _target_: unirl.sde.kernels.DanceSDEStrategy

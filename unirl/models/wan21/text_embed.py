@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Any, List, Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 import torch
 
-from unirl.models.types.embedding import EmbedStage
+from unirl.models.types.embedding import EmbedStage, dedup_prompts
 from unirl.types.conditions import TextEmbedCondition
 from unirl.types.primitives import Texts
 
@@ -37,9 +37,7 @@ class WAN21TextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
 
     def embed(self, p: Texts) -> TextEmbedCondition:
         """Encode prompts into a ``TextEmbedCondition``."""
-        return self._encode(list(p.texts))
-
-    def _encode(self, prompts: List[str]) -> TextEmbedCondition:
+        prompts, inverse = dedup_prompts(p.texts)
         bundle = self.bundle
         device = bundle.device
 
@@ -62,11 +60,12 @@ class WAN21TextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
 
         embeds = embeds * attention_mask.unsqueeze(-1).to(dtype=embeds.dtype)
 
-        return TextEmbedCondition(
+        cond = TextEmbedCondition(
             embeds=embeds,
             pooled=None,
             attn_mask=attention_mask,
         )
+        return cond if inverse is None else cond.select(inverse)
 
 
 __all__ = ["WAN21TextEmbedStage"]

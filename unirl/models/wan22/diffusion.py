@@ -23,21 +23,6 @@ class WAN22DiffusionStep(DiffusionStep[WAN22Bundle, WAN21Conditions]):
 
     TIMESTEP_SCALE: ClassVar[float] = 1000.0  # sigma [0, 1] -> WAN timestep [0, 1000]
 
-    @staticmethod
-    def _select_for_sigma(
-        sigma: torch.Tensor,
-        guidance_scale: float,
-        guidance_scale_2: Optional[float],
-        *,
-        boundary_ratio: float,
-    ) -> Tuple[bool, float]:
-        """Pick the sub-transformer and guidance for this step — reads ``sigma[0]`` against ``boundary_ratio``."""
-        sigma_val = float(sigma.item()) if sigma.dim() == 0 else float(sigma.flatten()[0].item())
-        if sigma_val >= boundary_ratio:
-            return True, float(guidance_scale)
-        active = float(guidance_scale_2) if guidance_scale_2 is not None else float(guidance_scale)
-        return False, active
-
     def predict_noise(
         self,
         model: WAN22Bundle,
@@ -56,12 +41,12 @@ class WAN22DiffusionStep(DiffusionStep[WAN22Bundle, WAN21Conditions]):
         if prompt_embeds is None:
             raise ValueError("WAN22DiffusionStep.predict_noise: conditions.text.embeds is None")
 
-        use_high_noise, active_guidance = self._select_for_sigma(
-            sigma,
-            guidance_scale,
-            guidance_scale_2,
-            boundary_ratio=model.boundary_ratio,
-        )
+        sigma_val = float(sigma.item()) if sigma.dim() == 0 else float(sigma.flatten()[0].item())
+        use_high_noise = sigma_val >= model.boundary_ratio
+        if use_high_noise:
+            active_guidance = float(guidance_scale)
+        else:
+            active_guidance = float(guidance_scale_2) if guidance_scale_2 is not None else float(guidance_scale)
 
         batch_size = int(sample.shape[0])
         timestep = sigma * self.TIMESTEP_SCALE
@@ -243,19 +228,7 @@ class WAN22DiffusionStage(DiffusionStage[WAN21Conditions]):
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="logprob_precision")
         self.vae_scale_factor = self._SPATIAL_DOWNSAMPLE
         self.temporal_scale_factor = self._TEMPORAL_DOWNSAMPLE
-        self.latent_channels = int(getattr(getattr(model.vae, "config", None), "z_dim", self._DEFAULT_LATENT_CHANNELS))
-
-    def _latent_shape(self, *, num_frames: int, height: int, width: int) -> Tuple[int, int, int, int]:
-        if (int(num_frames) - 1) % self._TEMPORAL_DOWNSAMPLE != 0:
-            raise ValueError(
-                f"WAN VAE temporal_downsample={self._TEMPORAL_DOWNSAMPLE} requires "
-                f"(num_frames - 1) % {self._TEMPORAL_DOWNSAMPLE} == 0, got num_frames={num_frames}; "
-                f"valid choices: 1, 5, 9, 13, 17, 21, ..."
-            )
-        latent_t = (int(num_frames) - 1) // self.temporal_scale_factor + 1
-        latent_h = int(height) // self.vae_scale_factor
-        latent_w = int(width) // self.vae_scale_factor
-        return (self.latent_channels, latent_t, latent_h, latent_w)
+        self.latent_channels = model.vae.config.z_dim if model.vae is not None else self._DEFAULT_LATENT_CHANNELS
 
     def diffuse(
         self,
@@ -273,16 +246,23 @@ class WAN22DiffusionStage(DiffusionStage[WAN21Conditions]):
         prompt_embeds = conditions.text.embeds
         device = prompt_embeds.device
         batch_size = int(prompt_embeds.shape[0])
-        T = int(params.num_inference_steps)
+        T = params.num_inference_steps
         if int(schedule.shape[0]) != T + 1:
             raise ValueError(f"WAN22DiffusionStage.diffuse: schedule length {schedule.shape[0]} != T+1={T + 1}")
         schedule = schedule.to(device)
         self.strategy.init_schedule(schedule)
 
-        latent_shape = self._latent_shape(
-            num_frames=int(params.num_frames),
-            height=int(params.height),
-            width=int(params.width),
+        if (params.num_frames - 1) % self._TEMPORAL_DOWNSAMPLE != 0:
+            raise ValueError(
+                f"WAN VAE temporal_downsample={self._TEMPORAL_DOWNSAMPLE} requires "
+                f"(num_frames - 1) % {self._TEMPORAL_DOWNSAMPLE} == 0, got num_frames={params.num_frames}; "
+                f"valid choices: 1, 5, 9, 13, 17, 21, ..."
+            )
+        latent_shape = (
+            self.latent_channels,
+            (params.num_frames - 1) // self.temporal_scale_factor + 1,
+            params.height // self.vae_scale_factor,
+            params.width // self.vae_scale_factor,
         )
         if initial_latents is not None:
             if int(initial_latents.shape[0]) != batch_size:
@@ -294,8 +274,8 @@ class WAN22DiffusionStage(DiffusionStage[WAN21Conditions]):
                 raise ValueError(
                     f"WAN22DiffusionStage.diffuse: initial_latents.shape[1:]="
                     f"{tuple(initial_latents.shape[1:])} != expected {tuple(latent_shape)} "
-                    f"for num_frames={int(params.num_frames)}, "
-                    f"height={int(params.height)}, width={int(params.width)}."
+                    f"for num_frames={params.num_frames}, "
+                    f"height={params.height}, width={params.width}."
                 )
             latents = initial_latents.to(device=device, dtype=self.trajectory_dtype)
         else:
@@ -304,13 +284,13 @@ class WAN22DiffusionStage(DiffusionStage[WAN21Conditions]):
                 latent_shape=latent_shape,
                 device=device,
                 dtype=self.trajectory_dtype,
-                init_same_noise=bool(params.init_same_noise),
-                samples_per_prompt=int(params.samples_per_prompt),
+                init_same_noise=params.init_same_noise,
+                samples_per_prompt=params.samples_per_prompt,
                 noise_group_ids=params.noise_group_ids,
-                base_seed=int(params.seed),
+                base_seed=params.seed,
             )
 
-        sde_set: Set[int] = set(int(i) for i in (params.sde_indices or []))
+        sde_set: Set[int] = set(params.sde_indices or ())
         sde_sorted: List[int] = sorted(sde_set)
 
         needed: Set[int] = set(compute_trajectory_positions(sde_set, T))
@@ -335,7 +315,7 @@ class WAN22DiffusionStage(DiffusionStage[WAN21Conditions]):
         for i in range(T):
             sigma = schedule[i].to(device)
             sigma_next = schedule[i + 1].to(device)
-            step_eta = float(params.eta) if i in sde_set else 0.0
+            step_eta = params.eta if i in sde_set else 0.0
 
             with torch.no_grad(), autocast_ctx:
                 new_latents, log_prob, _ = self.step.step_with_logp(
@@ -345,7 +325,7 @@ class WAN22DiffusionStage(DiffusionStage[WAN21Conditions]):
                     sample=latents,
                     sigma=sigma,
                     sigma_next=sigma_next,
-                    guidance_scale=float(params.guidance_scale),
+                    guidance_scale=params.guidance_scale,
                     guidance_scale_2=guidance_scale_2,
                     eta=step_eta,
                     sigma_max=sigma_max,
@@ -389,12 +369,8 @@ class WAN22DiffusionStage(DiffusionStage[WAN21Conditions]):
         if segment.sigmas is None:
             raise ValueError("WAN22DiffusionStage.replay: segment.sigmas missing")
 
-        sde_set = set(int(i) for i in segment.sde_indices.tolist())
-        target = (
-            [int(i) for i in step_indices]
-            if step_indices is not None
-            else [int(i) for i in segment.sde_indices.tolist()]
-        )
+        sde_set = set(segment.sde_indices.tolist())
+        target = list(step_indices) if step_indices is not None else segment.sde_indices.tolist()
         bad = [i for i in target if i not in sde_set]
         if bad:
             raise ValueError(
@@ -430,9 +406,9 @@ class WAN22DiffusionStage(DiffusionStage[WAN21Conditions]):
                     prev_sample=prev_sample,
                     sigma=sigma,
                     sigma_next=sigma_next,
-                    guidance_scale=float(params.guidance_scale),
+                    guidance_scale=params.guidance_scale,
                     guidance_scale_2=guidance_scale_2,
-                    eta=float(params.eta),
+                    eta=params.eta,
                     sigma_max=sigma_max,
                     step_index=step_idx,
                 )
@@ -464,7 +440,7 @@ class WAN22DiffusionStage(DiffusionStage[WAN21Conditions]):
             sample,
             sigma,
             conditions,
-            guidance_scale=float(params.guidance_scale),
+            guidance_scale=params.guidance_scale,
             guidance_scale_2=params.guidance_scale_2,
         )
 

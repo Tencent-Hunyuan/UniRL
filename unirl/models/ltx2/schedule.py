@@ -18,7 +18,7 @@ class LTX2SchedulePolicy(FlowMatchSchedulePolicy):
     """Constant-μ (== ``max_shift``) exponential-shift policy for LTX-2."""
 
     def compute_mu(self, image_seq_len: int, num_inference_steps: int) -> float:
-        return float(self.max_shift)
+        return self.max_shift
 
 
 def build_ltx2_schedule_policy(shift: float = 1.0) -> LTX2SchedulePolicy:

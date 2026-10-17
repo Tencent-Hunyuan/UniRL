@@ -50,7 +50,7 @@ class Qwen3OmniBundle(Bundle):
 
         dtype = parse_torch_dtype(config.model_precision, field_name="model_precision")
 
-        full_cfg = AutoConfig.from_pretrained(path, trust_remote_code=bool(config.trust_remote_code))
+        full_cfg = AutoConfig.from_pretrained(path, trust_remote_code=config.trust_remote_code)
         thinker_cfg = full_cfg.thinker_config
 
         if config.meta_init_transformer:
@@ -62,8 +62,8 @@ class Qwen3OmniBundle(Bundle):
             )
 
         load_kwargs = {}
-        if getattr(config, "attn_implementation", None):
-            load_kwargs["attn_implementation"] = str(config.attn_implementation)
+        if config.attn_implementation:
+            load_kwargs["attn_implementation"] = config.attn_implementation
 
         transformer = Qwen3OmniMoeThinkerForConditionalGeneration.from_pretrained(
             path,
@@ -91,10 +91,10 @@ class Qwen3OmniBundle(Bundle):
 
         processor = AutoProcessor.from_pretrained(
             path,
-            trust_remote_code=bool(config.trust_remote_code),
+            trust_remote_code=config.trust_remote_code,
         )
-        tokenizer = getattr(processor, "tokenizer", None) or processor
-        if getattr(tokenizer, "pad_token", None) is None and getattr(tokenizer, "eos_token", None) is not None:
+        tokenizer = processor.tokenizer
+        if tokenizer.pad_token is None and tokenizer.eos_token is not None:
             tokenizer.pad_token = tokenizer.eos_token
 
         return cls(

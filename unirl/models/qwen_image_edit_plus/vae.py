@@ -15,17 +15,15 @@ from .conditions import QwenImageEditPlusLatentCondition
 
 # Resize source images to the upstream 1024-square grid so rollout latent shapes match.
 _VAE_IMAGE_AREA = 1024 * 1024
-_VAE_SIZE_ALIGN = 32  # upstream rounds to 32-pixel multiples
+_SIZE_ALIGN = 32  # upstream rounds to 32-pixel multiples
 
 
-def _vae_size_for_aspect(width: int, height: int) -> tuple[int, int]:
-    """Aspect-preserving resize target matching upstream ``VAE_IMAGE_SIZE``."""
+def aligned_size_for_aspect(width: int, height: int, *, target_area: int) -> tuple[int, int]:
+    """Aspect-preserving ``(w, h)`` at ≈``target_area``, rounded to 32-pixel multiples."""
     ratio = float(width) / float(height)
-    vae_width = math.sqrt(_VAE_IMAGE_AREA * ratio)
-    vae_height = vae_width / ratio
-    vae_width = round(vae_width / _VAE_SIZE_ALIGN) * _VAE_SIZE_ALIGN
-    vae_height = round(vae_height / _VAE_SIZE_ALIGN) * _VAE_SIZE_ALIGN
-    return int(vae_width), int(vae_height)
+    out_w = math.sqrt(target_area * ratio)
+    out_h = out_w / ratio
+    return round(out_w / _SIZE_ALIGN) * _SIZE_ALIGN, round(out_h / _SIZE_ALIGN) * _SIZE_ALIGN
 
 
 class QwenImageEditPlusVAEEncodeStage(EncodeStage[Images, QwenImageEditPlusLatentCondition]):
@@ -61,11 +59,11 @@ class QwenImageEditPlusVAEEncodeStage(EncodeStage[Images, QwenImageEditPlusLaten
         # one another's resize target.
         groups: Dict[tuple[int, int], List[int]] = {}
         for index, pil in enumerate(source_pils):
-            vae_w, vae_h = _vae_size_for_aspect(*pil.size)
+            vae_w, vae_h = aligned_size_for_aspect(pil.width, pil.height, target_area=_VAE_IMAGE_AREA)
             groups.setdefault((vae_h, vae_w), []).append(index)
 
         # Per-channel normalization mirrors the upstream Edit-Plus pipeline.
-        z_dim = int(vae.config.z_dim)
+        z_dim = vae.config.z_dim
         latents_mean = torch.tensor(vae.config.latents_mean, device=device, dtype=torch.float32).view(1, z_dim, 1, 1)
         latents_std = torch.tensor(vae.config.latents_std, device=device, dtype=torch.float32).view(1, z_dim, 1, 1)
 
@@ -93,4 +91,4 @@ class QwenImageEditPlusVAEEncodeStage(EncodeStage[Images, QwenImageEditPlusLaten
         return QwenImageEditPlusLatentCondition(latents=[by_index[index] for index in range(len(source_pils))])
 
 
-__all__ = ["QwenImageEditPlusVAEEncodeStage"]
+__all__ = ["QwenImageEditPlusVAEEncodeStage", "aligned_size_for_aspect"]

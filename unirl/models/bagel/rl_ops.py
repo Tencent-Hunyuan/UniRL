@@ -96,7 +96,7 @@ def require_inference_dispatch(model: Any) -> None:
 def init_und_context(model: Any) -> Dict[str, Any]:
     """Fresh empty KV context ``{kv_lens, ropes, past_key_values}`` (navit bs=1)."""
     lm_model = model.language_model.model
-    num_layers = int(model.config.llm_config.num_hidden_layers)
+    num_layers = model.config.llm_config.num_hidden_layers
     cache_cls = getattr(sys.modules[type(lm_model).__module__], "NaiveCache", None)
     if cache_cls is None:
         raise RuntimeError(
@@ -173,7 +173,7 @@ def resize_input_image(bundle: Any, image: Any) -> Any:
 def _encode_vae_posterior_mean(vae: Any, x: torch.Tensor) -> torch.Tensor:
     """Encode with the deterministic posterior mean, never a Gaussian draw."""
     encoded = vae.encoder(x)
-    mean, _ = torch.chunk(encoded, 2, dim=int(vae.reg.chunk_dim))
+    mean, _ = torch.chunk(encoded, 2, dim=vae.reg.chunk_dim)
     return vae.scale_factor * (mean - vae.shift_factor)
 
 
@@ -355,18 +355,17 @@ def decode_text(
     lm = model.language_model
     kv_len, pos = int(ctx["kv_lens"][0]), int(ctx["ropes"][0])
     past = ctx["past_key_values"]
-    stop_set = set(int(t) for t in stop_ids)
+    stop_set = set(stop_ids)
 
-    max_new = int(max_new_tokens)
-    all_indexes = torch.arange(kv_len + max_new, dtype=torch.long, device=device)
-    all_positions = torch.arange(pos, pos + max_new, dtype=torch.long, device=device)
-    all_kv_lens = torch.arange(kv_len, kv_len + max_new, dtype=torch.int, device=device)
+    all_indexes = torch.arange(kv_len + max_new_tokens, dtype=torch.long, device=device)
+    all_positions = torch.arange(pos, pos + max_new_tokens, dtype=torch.long, device=device)
+    all_kv_lens = torch.arange(kv_len, kv_len + max_new_tokens, dtype=torch.int, device=device)
 
-    curr = torch.tensor([int(start_token_id)], dtype=torch.long, device=device)
+    curr = torch.tensor([start_token_id], dtype=torch.long, device=device)
     tokens: List[int] = []
     logps: List[float] = []
     done = False
-    for j in range(max_new):
+    for j in range(max_new_tokens):
         emb = lm.model.embed_tokens(curr)
         out = lm.forward_inference(
             packed_query_sequence=emb,
@@ -415,14 +414,14 @@ def decode_text_batched(
     positions = torch.tensor(ctx["ropes"], dtype=torch.long, device=device)
     packed_kv_indexes = torch.arange(int(kv_lens.sum().item()), dtype=torch.long, device=device)
     past = ctx["past_key_values"]
-    stop_set = {int(token) for token in stop_ids}
+    stop_set = set(stop_ids)
 
-    current = torch.full((batch_size,), int(start_token_id), dtype=torch.long, device=device)
+    current = torch.full((batch_size,), start_token_id, dtype=torch.long, device=device)
     tokens: List[List[int]] = [[] for _ in range(batch_size)]
     logps: List[List[float]] = [[] for _ in range(batch_size)]
     done = [False] * batch_size
 
-    for _ in range(int(max_new_tokens)):
+    for _ in range(max_new_tokens):
         query_indexes = torch.cumsum(kv_lens, dim=0) + torch.arange(
             batch_size,
             dtype=kv_lens.dtype,
@@ -485,7 +484,7 @@ def score_response_with_prompt(
 
     response_ids = response_ids.to(device=device, dtype=torch.long)
     prompt = torch.as_tensor(prompt_ids, dtype=torch.long, device=device).reshape(-1)
-    start = torch.tensor([int(start_token_id)], dtype=torch.long, device=device)
+    start = torch.tensor([start_token_id], dtype=torch.long, device=device)
     query_ids = torch.cat([prompt, start, response_ids[:-1]], dim=0)
     m = int(query_ids.numel())
 

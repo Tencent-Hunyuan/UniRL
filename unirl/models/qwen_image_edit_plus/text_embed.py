@@ -2,17 +2,17 @@
 
 from __future__ import annotations
 
-import math
-from typing import List, Optional, Tuple
+from typing import Optional
 
 import torch
 
 from unirl.models.qwen_image.text_embed import extract_masked_hidden
-from unirl.models.types.embedding import ImageConditionedEmbedStage
+from unirl.models.types.embedding import ImageConditionedEmbedStage, dedup_prompts
 from unirl.types.conditions import TextEmbedCondition
 from unirl.types.primitives import Images, Texts
 
 from .bundle import QwenImageEditPlusBundle
+from .vae import aligned_size_for_aspect
 
 PROMPT_TEMPLATE = (
     "<|im_start|>system\nDescribe the key features of the input image (color, shape, size, texture, objects, "
@@ -25,17 +25,6 @@ IMG_PROMPT_TEMPLATE = "Picture {}: <|vision_start|><|image_pad|><|vision_end|>"
 TOKENIZER_MAX_LENGTH = 1024
 
 CONDITION_IMAGE_AREA = 384 * 384
-_SIZE_ALIGN = 32
-
-
-def _condition_size_for_aspect(width: int, height: int) -> Tuple[int, int]:
-    """Aspect-preserving ``(w, h)`` at ≈``CONDITION_IMAGE_AREA``, 32-aligned."""
-    ratio = float(width) / float(height)
-    cond_w = math.sqrt(CONDITION_IMAGE_AREA * ratio)
-    cond_h = cond_w / ratio
-    cond_w = round(cond_w / _SIZE_ALIGN) * _SIZE_ALIGN
-    cond_h = round(cond_h / _SIZE_ALIGN) * _SIZE_ALIGN
-    return int(cond_w), int(cond_h)
 
 
 class QwenImageEditPlusTextEmbedStage(ImageConditionedEmbedStage[Texts, Images, TextEmbedCondition]):
@@ -53,54 +42,44 @@ class QwenImageEditPlusTextEmbedStage(ImageConditionedEmbedStage[Texts, Images, 
                 f"QwenImageEditPlusTextEmbedStage.max_sequence_length cannot exceed "
                 f"{TOKENIZER_MAX_LENGTH} (tokenizer cap) but got {max_sequence_length}"
             )
-        self.bundle = bundle
-        self.max_sequence_length = int(max_sequence_length)
-        self.processor = self._load_processor(processor_path or bundle.pretrained_path)
-
-    @staticmethod
-    def _load_processor(path: str):
-        """Load Qwen2VLProcessor from the checkpoint ``processor/`` subfolder."""
         from transformers import Qwen2VLProcessor
 
-        return Qwen2VLProcessor.from_pretrained(path, subfolder="processor")
+        self.bundle = bundle
+        self.max_sequence_length = int(max_sequence_length)
+        self.processor = Qwen2VLProcessor.from_pretrained(
+            processor_path or bundle.pretrained_path,
+            subfolder="processor",
+        )
 
     def embed(self, p: Texts, images: Optional[Images] = None) -> TextEmbedCondition:
         """Encode prompts; optionally condition on source images."""
-        prompt_embeds, prompt_embeds_mask = self._encode(list(p.texts), images)
-        return TextEmbedCondition(
-            embeds=prompt_embeds,
-            attn_mask=prompt_embeds_mask,
-            pooled=None,
-        )
-
-    def _condition_pils(self, images: Images):
-        """Convert source images to per-sample PILs resized to the"""
-        import PIL.Image
-
-        pils = images.to_pils()
-        resized = []
-        for pil in pils:
-            cond_w, cond_h = _condition_size_for_aspect(pil.width, pil.height)
-            if pil.width != cond_w or pil.height != cond_h:
-                pil = pil.resize((cond_w, cond_h), PIL.Image.LANCZOS)
-            resized.append(pil)
-        return resized
-
-    def _encode(self, prompts: List[str], images: Optional[Images]) -> Tuple[torch.Tensor, torch.Tensor]:
         bundle = self.bundle
         device = bundle.device
         dtype = next(bundle.text_encoder.parameters()).dtype
 
         condition_pils = None
         if images is not None:
-            condition_pils = self._condition_pils(images)
-            if len(condition_pils) != len(prompts):
+            import PIL.Image
+
+            raw_pils = images.to_pils()
+            if len(raw_pils) != len(p.texts):
                 raise ValueError(
-                    f"QwenImageEditPlusTextEmbedStage._encode: image count {len(condition_pils)} "
-                    f"!= prompt count {len(prompts)}"
+                    f"QwenImageEditPlusTextEmbedStage.embed: image count {len(raw_pils)} != prompt count {len(p.texts)}"
                 )
+            keys = [(prompt, pil.mode, pil.size, pil.tobytes()) for prompt, pil in zip(p.texts, raw_pils)]
+            uniq_keys, inverse = dedup_prompts(keys)
+            prompts = [key[0] for key in uniq_keys]
+            if inverse is not None:
+                raw_pils = [raw_pils[inverse.index(i)] for i in range(len(uniq_keys))]
+            condition_pils = []
+            for pil in raw_pils:
+                cond_w, cond_h = aligned_size_for_aspect(pil.width, pil.height, target_area=CONDITION_IMAGE_AREA)
+                if pil.width != cond_w or pil.height != cond_h:
+                    pil = pil.resize((cond_w, cond_h), PIL.Image.LANCZOS)
+                condition_pils.append(pil)
             base_img_prompt = IMG_PROMPT_TEMPLATE.format(1)
         else:
+            prompts, inverse = dedup_prompts(p.texts)
             base_img_prompt = ""
 
         txt = [PROMPT_TEMPLATE.format(base_img_prompt + e) for e in prompts]
@@ -117,8 +96,8 @@ class QwenImageEditPlusTextEmbedStage(ImageConditionedEmbedStage[Texts, Images, 
             "attention_mask": model_inputs.attention_mask,
             "output_hidden_states": True,
         }
-        pixel_values = getattr(model_inputs, "pixel_values", None)
-        image_grid_thw = getattr(model_inputs, "image_grid_thw", None)
+        pixel_values = model_inputs["pixel_values"] if "pixel_values" in model_inputs else None
+        image_grid_thw = model_inputs["image_grid_thw"] if "image_grid_thw" in model_inputs else None
         if pixel_values is not None:
             forward_kwargs["pixel_values"] = pixel_values.to(dtype=dtype)
         if image_grid_thw is not None:
@@ -147,7 +126,12 @@ class QwenImageEditPlusTextEmbedStage(ImageConditionedEmbedStage[Texts, Images, 
 
         prompt_embeds = prompt_embeds[:, : self.max_sequence_length]
         prompt_embeds_mask = prompt_embeds_mask[:, : self.max_sequence_length]
-        return prompt_embeds.to(device=device, dtype=dtype), prompt_embeds_mask
+        cond = TextEmbedCondition(
+            embeds=prompt_embeds.to(device=device, dtype=dtype),
+            attn_mask=prompt_embeds_mask,
+            pooled=None,
+        )
+        return cond if inverse is None else cond.select(inverse)
 
 
 __all__ = ["QwenImageEditPlusTextEmbedStage"]

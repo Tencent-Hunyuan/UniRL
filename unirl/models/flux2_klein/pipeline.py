@@ -16,7 +16,6 @@ from .bundle import Flux2KleinBundle
 from .conditions import Flux2KleinConditions
 from .config import Flux2KleinPipelineConfig
 from .diffusion import (
-    Flux2KleinDiffusionParams,
     Flux2KleinDiffusionStage,
     Flux2KleinDiffusionStep,
 )
@@ -77,8 +76,8 @@ class Flux2KleinPipeline(Pipeline):
     @classmethod
     def latent_shape(cls, *, model_config: Any, sampling_spec: Any) -> tuple:
         """Per-sample patchified latent shape ``(C_pack=128, H_pat, W_pat)``"""
-        height = int(sampling_spec.height)
-        width = int(sampling_spec.width)
+        height = sampling_spec.height
+        width = sampling_spec.width
         downsample = 8 * 2
         if height % downsample != 0 or width % downsample != 0:
             raise ValueError(
@@ -118,7 +117,7 @@ class Flux2KleinPipeline(Pipeline):
             text_embed=text_embed,
             diffusion=diffusion,
             vae_decode=vae_decode,
-            shift=float(config.shift),
+            shift=config.shift,
         )
 
     def build_conditions(
@@ -143,8 +142,8 @@ class Flux2KleinPipeline(Pipeline):
     def generate(self, sample: Sample) -> Sample:
         """Run FLUX.2-klein-9B t2i/edit end-to-end, filling the frontier (pre-forked) gen Part."""
         frontier = sample.frontier_gen_part(DiffusionSamplingParams)
-        sampling = frontier.sampling_params
-        if sampling.sigmas is None:
+        params = frontier.sampling_params
+        if params.sigmas is None:
             raise ValueError(
                 "Flux2KleinPipeline.generate: gen part sampling_params.sigmas is None. The hosting "
                 "engine must pin σ before invoking pipeline.generate; see the σ ownership note "
@@ -160,14 +159,11 @@ class Flux2KleinPipeline(Pipeline):
             )
         source_image = next((c for c in conditioning[1:] if isinstance(c, Images)), None)
 
-        allowed = {f.name for f in _dc.fields(Flux2KleinDiffusionParams)}
-        params_dict = {k: getattr(sampling, k) for k in allowed if hasattr(sampling, k)}
-        params = Flux2KleinDiffusionParams(**params_dict)
         # Pass group IDs to the noise sampler when init_same_noise is enabled.
-        if bool(params.init_same_noise) and not params.noise_group_ids:
+        if params.init_same_noise and not params.noise_group_ids:
             params = _dc.replace(params, noise_group_ids=list(frontier.group_ids))
 
-        klein_conds = self.build_conditions(texts, guidance_scale=float(params.guidance_scale))
+        klein_conds = self.build_conditions(texts, guidance_scale=params.guidance_scale)
         if source_image is not None:
             if len(source_image) != len(texts.texts):
                 raise ValueError(
@@ -175,12 +171,12 @@ class Flux2KleinPipeline(Pipeline):
                 )
             image_tokens, image_ids = self.vae_encode.encode(
                 source_image,
-                height=int(params.height),
-                width=int(params.width),
+                height=params.height,
+                width=params.width,
             )
             klein_conds.image_latent = image_tokens
             klein_conds.image_latent_ids = image_ids
-        schedule = sampling.sigmas.to(self.bundle.device)
+        schedule = params.sigmas.to(self.bundle.device)
 
         initial_latents = NoiseRecipe.from_sample(sample).resolve()
 

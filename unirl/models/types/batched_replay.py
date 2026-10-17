@@ -2,14 +2,34 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Dict, List
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
 
 from unirl.models.types.replay_result import ReplayResult
+from unirl.types.conditions import TextEmbedCondition
 
 if TYPE_CHECKING:
     from unirl.types.segments.latent import LatentSegment
+
+
+def repeat_batch_tensor(t: Optional[torch.Tensor], repeats: int) -> Optional[torch.Tensor]:
+    """Repeat ``t`` along dim 0 ``repeats`` times, or return ``None``."""
+    return t.repeat(repeats, *([1] * (t.dim() - 1))) if t is not None else None
+
+
+def tile_text_embed_condition(
+    cond: Optional[TextEmbedCondition],
+    repeats: int,
+) -> Optional[TextEmbedCondition]:
+    """Tile a :class:`TextEmbedCondition` along the batch dimension ``repeats`` times."""
+    if cond is None:
+        return None
+    return TextEmbedCondition(
+        embeds=repeat_batch_tensor(cond.embeds, repeats),
+        pooled=repeat_batch_tensor(cond.pooled, repeats),
+        attn_mask=repeat_batch_tensor(cond.attn_mask, repeats),
+    )
 
 
 class BatchedStepReplayMixin:
@@ -17,7 +37,10 @@ class BatchedStepReplayMixin:
 
     def _tile_conditions(self, conditions: Any, repeats: int) -> Any:
         """Repeat EVERY conditioning field ``repeats``× along the batch dim."""
-        raise NotImplementedError(f"{type(self).__name__} must implement _tile_conditions for batched replay")
+        return type(conditions)(
+            text=tile_text_embed_condition(conditions.text, repeats),
+            negative_text=tile_text_embed_condition(conditions.negative_text, repeats),
+        )
 
     def _batched_step_kwargs(self, segment: "LatentSegment", params: Any) -> Dict[str, Any]:
         """Return model-specific arguments for the batched step call."""
@@ -51,8 +74,8 @@ class BatchedStepReplayMixin:
             prev_sample=prev_all,
             sigma=sigma_all,
             sigma_next=sigma_next_all,
-            guidance_scale=float(params.guidance_scale),
-            eta=float(params.eta),
+            guidance_scale=params.guidance_scale,
+            eta=params.eta,
             sigma_max=sigma_max,
             step_index=int(target[0]),
             **self._batched_step_kwargs(segment, params),
@@ -71,4 +94,4 @@ class BatchedStepReplayMixin:
         return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
 
 
-__all__ = ["BatchedStepReplayMixin"]
+__all__ = ["BatchedStepReplayMixin", "repeat_batch_tensor", "tile_text_embed_condition"]

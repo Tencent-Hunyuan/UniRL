@@ -2,17 +2,16 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
+from unirl.models.types.ar import decode_text_segment
 from unirl.models.types.pipeline import Pipeline
-from unirl.types.primitives import Texts
-from unirl.types.sample import Sample, Turn
+from unirl.types.sample import Sample
 from unirl.types.sampling import ARSamplingParams
 
-from .ar import Qwen3OmniARParams, Qwen3OmniARStage
+from .ar import Qwen3OmniARStage
 from .bundle import Qwen3OmniBundle
 from .chat_template import Qwen3OmniChatTemplateStage
-from .conditions import Qwen3OmniARConditions
 from .config import Qwen3OmniPipelineConfig
 from .media import build_omni_messages
 
@@ -103,13 +102,14 @@ class Qwen3OmniPipeline(Pipeline):
         )
         return cls(bundle=bundle, chat_template=chat_template, ar=ar)
 
-    def _conditions_for(
-        self,
-        turns: List[Turn],
-        control: Dict[str, Any],
-    ) -> Qwen3OmniARConditions:
-        """Render the trajectory using config plus root-Part chat overrides."""
-        chat_overrides: Dict[str, Any] = dict(control.get("chat") or {})
+    def generate(self, sample: Sample) -> Sample:
+        """Generate one Qwen3-Omni assistant turn and fill the AR frontier."""
+        frontier = sample.frontier_gen_part(ARSamplingParams)
+        ar = frontier.sampling_params
+        assert isinstance(ar, ARSamplingParams)
+
+        turns = sample.turns()
+        chat_overrides: Dict[str, Any] = dict(sample.parts[0].control.get("chat") or {})
         system_instruction = chat_overrides.get(
             "system_instruction",
             self.chat_template.system_instruction,
@@ -138,36 +138,10 @@ class Qwen3OmniPipeline(Pipeline):
             turns,
             system_instruction,
         )
-        return chat_stage.embed_messages(conversations)
+        conds = chat_stage.embed_messages(conversations)
 
-    def generate(self, sample: Sample) -> Sample:
-        """Generate one Qwen3-Omni assistant turn and fill the AR frontier."""
-        frontier = sample.frontier_gen_part(ARSamplingParams)
-        ar = frontier.sampling_params
-        assert isinstance(ar, ARSamplingParams)
-
-        turns = sample.turns()
-        conds = self._conditions_for(turns, sample.parts[0].control)
-
-        params = Qwen3OmniARParams(
-            max_tokens=ar.max_new_tokens,
-            temperature=ar.temperature,
-            top_p=ar.top_p,
-            top_k=ar.top_k,
-            stop_token_ids=([int(ar.stop_token_id)] if ar.stop_token_id is not None else []),
-        )
-
-        sampling_params = ARSamplingParams(
-            samples_per_prompt=int(ar.samples_per_prompt),
-            max_new_tokens=int(params.max_tokens),
-            temperature=float(params.temperature),
-            top_p=float(params.top_p),
-            top_k=int(params.top_k),
-            stop_token_id=ar.stop_token_id,
-        )
-
-        segment = self.ar.autoregress(conds, sampling_params=sampling_params, params=params)
-        decoded = self._detokenize(segment)
+        segment = self.ar.autoregress(conds, sampling_params=ar)
+        decoded = decode_text_segment(segment, self.bundle.tokenizer)
         return sample.replace_frontier(
             frontier.fill(
                 segment=segment,
@@ -175,18 +149,6 @@ class Qwen3OmniPipeline(Pipeline):
                 conditions=conds.to_dict(),
             )
         )
-
-    def _detokenize(self, segment) -> Texts:
-        if segment.tokens is None or segment.cu_seqlens is None:
-            return Texts(texts=[])
-        cu = [int(c) for c in segment.cu_seqlens.tolist()]
-        tokenizer = self.bundle.tokenizer
-        out: list = []
-        for i in range(len(cu) - 1):
-            chunk = segment.tokens[cu[i] : cu[i + 1]]
-            ids = chunk.tolist() if chunk.numel() > 0 else []
-            out.append(tokenizer.decode(ids, skip_special_tokens=True))
-        return Texts(texts=out)
 
 
 __all__ = ["Qwen3OmniPipeline"]

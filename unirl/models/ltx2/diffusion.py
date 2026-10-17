@@ -8,7 +8,7 @@ from typing import ClassVar, List, Optional, Set, Tuple
 
 import torch
 
-from unirl.models.types.diffusion import DiffusionStage, DiffusionStep
+from unirl.models.types.diffusion import DiffusionStage, DiffusionStep, combine_modality_logp
 from unirl.models.types.replay_result import ReplayResult
 from unirl.sde.kernels import StepStrategy
 from unirl.sde.noise import make_denoise_step_generators
@@ -49,6 +49,9 @@ _LTX2_AUDIO_TEMPORAL_COMPRESSION: int = 4
 _LTX2_AUDIO_MEL_BINS: int = 64
 _LTX2_AUDIO_MEL_COMPRESSION: int = 4
 _LTX2_AUDIO_LATENT_CHANNELS: int = 8
+_LTX2_AUDIO_PACKED_FEATURE_DIM: int = _LTX2_AUDIO_LATENT_CHANNELS * (
+    _LTX2_AUDIO_MEL_BINS // _LTX2_AUDIO_MEL_COMPRESSION
+)
 
 
 def _audio_num_frames(num_pixel_frames: int, fps: float) -> int:
@@ -58,26 +61,10 @@ def _audio_num_frames(num_pixel_frames: int, fps: float) -> int:
     return max(1, int(round(duration_s * per_s)))
 
 
-def _audio_packed_feature_dim() -> int:
-    """Packed audio feature dim ``latent_channels * (mel_bins // mel_compress)`` (128 for LTX-2)."""
-    return _LTX2_AUDIO_LATENT_CHANNELS * (_LTX2_AUDIO_MEL_BINS // _LTX2_AUDIO_MEL_COMPRESSION)
-
-
 def audio_latent_shape(params: DiffusionSamplingParams) -> Tuple[int, int]:
     """Per-sample PACKED audio-latent shape ``(audio_t, 128)`` — the LTX-2 audio stream's allocation geometry."""
-    audio_t = _audio_num_frames(int(params.num_frames), _LTX2_FRAME_RATE)
-    return (audio_t, _audio_packed_feature_dim())
-
-
-def _combine_modality_logp(
-    video_logp: torch.Tensor,
-    audio_logp: torch.Tensor,
-    n_video: int,
-    n_audio: int,
-) -> torch.Tensor:
-    """Element-weighted mean of the per-step video/audio log-probs."""
-    total = n_video + n_audio
-    return (video_logp * n_video + audio_logp * n_audio) / total
+    audio_t = _audio_num_frames(params.num_frames, _LTX2_FRAME_RATE)
+    return (audio_t, _LTX2_AUDIO_PACKED_FEATURE_DIM)
 
 
 class LTX2DiffusionStep(DiffusionStep[LTX2Bundle, LTX2Conditions]):
@@ -191,7 +178,7 @@ class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
         self.trajectory_dtype = parse_torch_dtype(trajectory_precision, field_name="trajectory_precision")
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="logprob_precision")
         self.audio_joint_sde = bool(audio_joint_sde)
-        self._audio_in_policy = self.audio_joint_sde and bool(getattr(bundle, "has_audio", False))
+        self._audio_in_policy = self.audio_joint_sde and bundle.has_audio
 
     def trainable_module(self) -> torch.nn.Module:
         """The trainable transformer (for FSDP wrapping)."""
@@ -200,9 +187,9 @@ class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
     @staticmethod
     def _latent_geometry(params: DiffusionSamplingParams) -> tuple[int, int, int]:
         """Video LATENT grid ``(T_lat, H_lat, W_lat)`` from pixel-space params."""
-        latent_t = (int(params.num_frames) - 1) // LTX2_TEMPORAL_COMPRESSION + 1
-        latent_h = int(params.height) // LTX2_SPATIAL_COMPRESSION
-        latent_w = int(params.width) // LTX2_SPATIAL_COMPRESSION
+        latent_t = (params.num_frames - 1) // LTX2_TEMPORAL_COMPRESSION + 1
+        latent_h = params.height // LTX2_SPATIAL_COMPRESSION
+        latent_w = params.width // LTX2_SPATIAL_COMPRESSION
         return latent_t, latent_h, latent_w
 
     def generate(
@@ -218,10 +205,10 @@ class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
         denoise_base_seed: int = 0,
     ) -> LatentSegment:
         """Run the full denoising loop, collecting trajectory for RL."""
-        guidance_scale = float(params.guidance_scale)
-        eta = float(params.eta)
+        guidance_scale = params.guidance_scale
+        eta = params.eta
         latent_t, latent_h, latent_w = self._latent_geometry(params)
-        audio_t = _audio_num_frames(int(params.num_frames), _LTX2_FRAME_RATE)
+        audio_t = _audio_num_frames(params.num_frames, _LTX2_FRAME_RATE)
 
         device = initial_latents.device
         if denoise_seed_keys is not None and len(denoise_seed_keys) != int(initial_latents.shape[0]):
@@ -233,7 +220,7 @@ class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
         sigmas = sigmas.to(device)
         self.strategy.init_schedule(sigmas)
 
-        sde_set: Set[int] = set(int(i) for i in sde_indices) if sde_indices else set(range(num_steps))
+        sde_set: Set[int] = set(sde_indices) if sde_indices else set(range(num_steps))
         sde_sorted: List[int] = sorted(sde_set)
 
         needed: Set[int] = set(compute_trajectory_positions(sde_set, num_steps))
@@ -244,7 +231,7 @@ class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
             a = initial_audio_latents.to(device=device, dtype=self.trajectory_dtype)
         else:
             a = torch.randn(
-                (int(x.shape[0]), audio_t, _audio_packed_feature_dim()),
+                (int(x.shape[0]), audio_t, _LTX2_AUDIO_PACKED_FEATURE_DIM),
                 device=device,
                 dtype=self.trajectory_dtype,
             )
@@ -317,7 +304,7 @@ class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
                     stored_audio.append(a.detach().clone())
                 if log_prob is not None:
                     if self._audio_in_policy and audio_log_prob is not None:
-                        log_prob = _combine_modality_logp(
+                        log_prob = combine_modality_logp(
                             log_prob,
                             audio_log_prob,
                             n_video=x[0].numel(),
@@ -359,13 +346,13 @@ class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
                 "Was the segment produced by this stage's generate()?"
             )
 
-        guidance_scale = float(params.guidance_scale)
-        eta = float(params.eta)
+        guidance_scale = params.guidance_scale
+        eta = params.eta
         latent_t, latent_h, latent_w = self._latent_geometry(params)
-        audio_t = _audio_num_frames(int(params.num_frames), _LTX2_FRAME_RATE)
+        audio_t = _audio_num_frames(params.num_frames, _LTX2_FRAME_RATE)
 
-        sde_set = set(int(i) for i in segment.sde_indices.tolist())
-        target = [int(i) for i in (step_indices if step_indices is not None else segment.sde_indices.tolist())]
+        sde_set = set(segment.sde_indices.tolist())
+        target = list(step_indices) if step_indices is not None else segment.sde_indices.tolist()
         bad = [i for i in target if i not in sde_set]
         if bad:
             raise ValueError(
@@ -436,7 +423,7 @@ class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
                             f"LTX2DiffusionStage.replay: audio strategy returned None log-prob at "
                             f"step_index={step_idx}; joint audio SDE requires a stochastic strategy."
                         )
-                    log_prob = _combine_modality_logp(
+                    log_prob = combine_modality_logp(
                         log_prob,
                         audio_log_prob,
                         n_video=sample[0].numel(),

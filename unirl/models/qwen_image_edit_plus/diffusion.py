@@ -126,7 +126,7 @@ class QwenImageEditPlusDiffusionStep(QwenImageDiffusionStep):
             timestep = sigma.to(device, dtype=dtype)
 
         guidance = None
-        if getattr(model.transformer.config, "guidance_embeds", False):
+        if model.transformer.config.guidance_embeds:
             guidance_value = guidance_scale if distilled_guidance_scale is None else float(distilled_guidance_scale)
             guidance = torch.tensor([guidance_value], device=device, dtype=torch.float32).expand(batch_size)
 

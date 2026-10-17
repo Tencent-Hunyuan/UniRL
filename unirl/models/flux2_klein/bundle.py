@@ -172,7 +172,7 @@ class Flux2KleinBundle(Bundle):
             vae.requires_grad_(False)
 
         tokenizer = AutoTokenizer.from_pretrained(text_encoder_path, subfolder="tokenizer")
-        if getattr(tokenizer, "pad_token", None) is None:
+        if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
         text_encoder = (

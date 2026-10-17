@@ -36,21 +36,15 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
         model_config: Any = None,
         ports: Optional[VLLMOmniPorts] = None,
     ) -> None:
+        del device, rank
         self.cfg = config
-        self._version = 0
-        self._generate_lock = threading.Lock()
-        self._shutdown_lock = threading.Lock()
-        self._shutdown_requested = False
-        self._shutdown_complete = False
-        self.device = device
-        self.strategy = strategy
-        self.rank = rank
-        self.model_config = model_config
+        self.lock = threading.Lock()
+        self.closed = False
         self._is_offloaded = False
         # A transition failure means sequential stage RPCs may have left the
         # engine partially awake/asleep. Normalize through sleep before another
         # wake; generate refuses until residency is consistent again.
-        self._transition_failed = False
+        self.transition_failed = False
         logger.info(
             "VLLM-Omni engine config (complete typed config): %s; model_config_available=%s model_config=%s",
             config,
@@ -59,7 +53,12 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
         )
 
         self.adapter = get_adapter(config.modality)(
-            config, model_config, strategy=strategy, tokenize_fn=self._tokenize_prompt
+            config,
+            model_config,
+            strategy=strategy,
+            tokenize_fn=lambda text, *, task, sys_type: self.backend.tokenize_prompt(
+                text, task=task, sys_type=sys_type
+            ),
         )
         self.packs_groups = self.adapter.packs_groups
 
@@ -69,96 +68,74 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
             ports = VLLMOmniPorts.reserve()
 
         intent = config.server_intent(
-            model_config=model_config,
             ports=ports,
             extra=self.adapter.boot_kwargs(),
         )
-        self._backend = VLLMOmniBackend.boot(intent)
+        self.backend = VLLMOmniBackend.boot(intent)
 
-        self._weight_sync = WeightSync(
-            self._backend,
-            uses_lora=bool(getattr(model_config, "use_lora", False)),
+        self.weight_sync = WeightSync(
+            self.backend,
             lora_copy_transport=self.adapter.lora_copy_transport,
         )
-
-    def _tokenize_prompt(self, text: str, *, task: str, sys_type: str) -> List[int]:
-        """Late-bound bridge handed to the adapter as ``tokenize_fn``."""
-        return self._backend.tokenize_prompt(text, task=task, sys_type=sys_type)
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
     def generate(self, sample: Sample) -> Sample:
         """Generate one whole DP shard synchronously."""
-        return self._generate_locked(sample)
-
-    def _generate_locked(self, sample: Sample) -> Sample:
-        with self._generate_lock:
-            if self._shutdown_requested:
+        with self.lock:
+            if self.closed:
                 raise RuntimeError("VLLMOmniRolloutEngine.generate called after shutdown")
-            return self._stamp_output_version(self._generate_core(sample))
-
-    def _generate_core(self, sample: Sample) -> Sample:
-        """Synchronous whole-Sample generation: validate, σ-pin, run, decode."""
-        # Defense-in-depth for logical and partially completed lifecycle
-        # transitions: callers that swallow a wake/sleep exception must never
-        # generate with base weights or with only a subset of stages resident.
-        require(
-            not self._is_offloaded and not self._transition_failed,
-            "VLLMOmniRolloutEngine.generate: engine is offloaded or its last lifecycle transition failed "
-            "(wake_up first).",
-        )
-        if not self.adapter.supports_row_canvas:
-            sample.reject_row_canvases(engine=f"VLLMOmniRolloutEngine[{self.cfg.modality}]")
-        self.adapter.validate_request(sample)
-        if self.adapter.needs_sigmas:
-            require(self.schedule_policy is not None, f"{type(self.adapter).__name__} has no sigma schedule policy")
-            self._ensure_sample_sigmas(sample)
-        calls = self.adapter.build_inputs(sample)
-        per_request = self._backend.generate(
-            calls,
-            attach_lora=self._weight_sync.lora_loaded,
-            ar_lora_passthrough=self.adapter.ar_lora_passthrough,
-        )
-        return self.adapter.build_response(sample, per_request)
-
-    def _ensure_sample_sigmas(self, sample: Sample) -> None:
-        """Pin the σ schedule onto the diffusion gen Part's ``DiffusionSamplingParams.sigmas``."""
-        ensure_sample_sigmas(sample, self.schedule_policy)
-
-    def _mark_consistently_offloaded(self) -> None:
-        """Record a successful all-stage sleep and invalidate worker LoRA state."""
-        self._is_offloaded = True
-        self._transition_failed = False
-        self._weight_sync.mark_weights_released()
+            # Defense-in-depth for logical and partially completed lifecycle
+            # transitions: callers that swallow a wake/sleep exception must never
+            # generate with base weights or with only a subset of stages resident.
+            require(
+                not self._is_offloaded and not self.transition_failed,
+                "VLLMOmniRolloutEngine.generate: engine is offloaded or its last lifecycle transition failed "
+                "(wake_up first).",
+            )
+            if not self.adapter.supports_row_canvas:
+                sample.reject_row_canvases(engine=f"VLLMOmniRolloutEngine[{self.cfg.modality}]")
+            self.adapter.validate_request(sample)
+            if self.adapter.needs_sigmas:
+                ensure_sample_sigmas(sample, self.schedule_policy)
+            calls = self.adapter.build_inputs(sample)
+            per_request = self.backend.generate(
+                calls,
+                attach_lora=self.weight_sync.lora_loaded,
+                ar_lora_passthrough=self.adapter.ar_lora_passthrough,
+            )
+            return self._stamp_output_version(self.adapter.build_response(sample, per_request))
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def sleep(self) -> None:
         """Sleep every stage at level 1 (AR via EngineCore, diffusion via worker task)."""
-        if self._is_offloaded and not self._transition_failed:
+        if self._is_offloaded and not self.transition_failed:
             return
         try:
-            self._backend.sleep_task()
+            self.backend.sleep_task()
         except Exception:
             # Stage RPCs are sequential. A later failure may leave only a
             # prefix asleep, so neither generate nor wake may trust the old
             # physical flag; a subsequent sleep/wake retries normalization.
             self._is_offloaded = False
-            self._transition_failed = True
+            self.transition_failed = True
             raise
-        self._mark_consistently_offloaded()
+        self._is_offloaded = True
+        self.transition_failed = False
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def wake_up(self) -> None:
         """Wake every stage (AR via EngineCore, diffusion via worker task) + restore LoRA."""
-        if self._transition_failed:
+        if self.transition_failed:
             # Recover an unknown partial stage state to one known boundary
             # before attempting another wake. If this retry fails, retain the
             # latch so generate remains blocked and cleanup can retry sleep.
             try:
-                self._backend.sleep_task()
+                self.backend.sleep_task()
             except Exception:
                 logger.exception("vLLM-Omni failed to normalize a partial lifecycle transition")
                 raise
-            self._mark_consistently_offloaded()
+            self._is_offloaded = True
+            self.transition_failed = False
 
         if not self._is_offloaded:
             return
@@ -173,35 +150,37 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         try:
-            self._backend.wake_task()
+            self.backend.wake_task()
         except Exception:
             # ``wake_task`` fans stages sequentially. Mark the physical
             # state unknown before rollback so caller cleanup never skips
             # sleep merely because the pre-wake flag was True.
             self._is_offloaded = False
-            self._transition_failed = True
+            self.transition_failed = True
             try:
-                self._backend.sleep_task()
+                self.backend.sleep_task()
             except Exception:
                 logger.exception("vLLM-Omni rollback sleep failed after partial wake")
             else:
-                self._mark_consistently_offloaded()
+                self._is_offloaded = True
+                self.transition_failed = False
             raise
         self._is_offloaded = False  # physical state changed before LoRA restore
         try:
-            self._weight_sync.restore_lora_after_wake()
+            self.weight_sync.restore_lora_after_wake()
         except Exception:
             # Roll back the physically awakened engine. Because all-stage sleep
             # is sequential, a rollback failure means physical residency is
             # unknown rather than reliably awake.
             try:
-                self._backend.sleep_task()
+                self.backend.sleep_task()
             except Exception:
                 self._is_offloaded = False
-                self._transition_failed = True
+                self.transition_failed = True
                 logger.exception("vLLM-Omni rollback sleep failed after LoRA restore error")
             else:
-                self._mark_consistently_offloaded()
+                self._is_offloaded = True
+                self.transition_failed = False
             raise
 
     @property
@@ -209,39 +188,19 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
         return self._is_offloaded
 
     def health_check(self) -> bool:
-        return self._backend.ping()
+        return self.backend.ping()
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def shutdown(self) -> None:
-        shutdown_lock = getattr(self, "_shutdown_lock", None)
-        if shutdown_lock is None:
-            backend = getattr(self, "_backend", None)
-            if backend is not None:
-                backend.shutdown()
-            return
-
-        with shutdown_lock:
-            if getattr(self, "_shutdown_complete", False):
+        with self.lock:
+            if self.closed:
                 return
-
-            generate_lock = getattr(self, "_generate_lock", None)
-            if generate_lock is None:
-                self._shutdown_requested = True
-                backend = getattr(self, "_backend", None)
-                if backend is not None:
-                    backend.shutdown()
-            else:
-                with generate_lock:
-                    self._shutdown_requested = True
-                backend = getattr(self, "_backend", None)
-                if backend is not None:
-                    with generate_lock:
-                        backend.shutdown()
-            self._shutdown_complete = True
+            self.closed = True
+            self.backend.shutdown()
 
     def tp_per_stage(self) -> Dict[int, int]:
         """``{stage_id: tensor_parallel_size}`` per stage (parsed from the"""
-        return self._backend.tp_per_stage()
+        return self.backend.tp_per_stage()
 
     def update_weights_from_ipc(
         self,
@@ -253,7 +212,7 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
         track_prefix: str = "",
     ) -> None:
         del track_prefix
-        self._weight_sync.update_weights_from_ipc(
+        self.weight_sync.update_weights_from_ipc(
             peft_config=peft_config,
             base_sync_done=base_sync_done,
             use_shm=use_shm,
@@ -272,7 +231,7 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
         track_prefix: str = "",
     ) -> None:
         del track_prefix
-        self._weight_sync.init_weights_update_group(
+        self.weight_sync.init_weights_update_group(
             master_address=master_address,
             master_port=master_port,
             rank_offset=rank_offset,
@@ -293,7 +252,7 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
         track_prefix: str = "",
     ) -> None:
         del track_prefix
-        self._weight_sync.update_weights_from_distributed(
+        self.weight_sync.update_weights_from_distributed(
             names=names,
             dtypes=dtypes,
             shapes=shapes,
@@ -309,7 +268,7 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
         track_prefix: str = "",
     ) -> None:
         del track_prefix
-        self._weight_sync.destroy_weights_update_group(group_name=group_name)
+        self.weight_sync.destroy_weights_update_group(group_name=group_name)
 
     def update_weights_from_tensor(
         self,
@@ -321,7 +280,7 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
         track_prefix: str = "",
     ) -> None:
         del track_prefix
-        self._weight_sync.update_weights_from_tensor(
+        self.weight_sync.update_weights_from_tensor(
             serialized_named_tensors=serialized_named_tensors,
             target_modules=target_modules,
             load_format=load_format,
@@ -335,7 +294,7 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
         *,
         peft_config: Optional[dict] = None,
     ) -> None:
-        self._weight_sync.set_lora_from_tensors(adapter_name, lora_tensors, peft_config=peft_config)
+        self.weight_sync.set_lora_from_tensors(adapter_name, lora_tensors, peft_config=peft_config)
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def set_lora_from_tensors_copy(
@@ -346,18 +305,13 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
         peft_config: Optional[dict] = None,
     ) -> None:
         """Byte-copy LoRA push for the HI3 two-engine trainer."""
-        self._weight_sync.set_lora_from_tensors_copy(adapter_name, lora_tensors, peft_config=peft_config)
+        self.weight_sync.set_lora_from_tensors_copy(adapter_name, lora_tensors, peft_config=peft_config)
 
     def loaded_param_checksums(self, *, names: List[str]) -> dict:
-        return self._weight_sync.loaded_param_checksums(names=names)
+        return self.weight_sync.loaded_param_checksums(names=names)
 
     def loaded_lora_checksums(self, *, adapter_id: int, names: Optional[List[str]] = None) -> dict:
-        return self._weight_sync.loaded_lora_checksums(adapter_id=adapter_id, names=names)
-
-    @property
-    def lora_dirty(self) -> bool:
-        """True when LoRA is in use but the adapter must be (re)pushed."""
-        return self._weight_sync.lora_dirty
+        return self.weight_sync.loaded_lora_checksums(adapter_id=adapter_id, names=names)
 
 
 __all__ = ["VLLMOmniRolloutEngine"]

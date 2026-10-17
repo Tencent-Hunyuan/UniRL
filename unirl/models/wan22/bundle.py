@@ -29,7 +29,7 @@ class WanDualTransformer(nn.Module):
 
 
 class WAN22Bundle(Bundle):
-    """WAN 2.2 T2V bundle: dual transformer + VAE + UMT5 text encoder."""
+    """WAN 2.2 T2V / I2V bundle: dual transformer + VAE + UMT5 text encoder (+ optional CLIP vision tower)."""
 
     def __init__(
         self,
@@ -47,6 +47,8 @@ class WAN22Bundle(Bundle):
         boundary_ratio: float,
         guidance_scale_2: Any,
         num_train_timesteps: int,
+        vision_encoder: Optional[nn.Module] = None,
+        image_processor: Optional[Any] = None,
     ) -> None:
         super().__init__()
         self.transformer = transformer
@@ -62,16 +64,18 @@ class WAN22Bundle(Bundle):
         self.boundary_ratio = float(boundary_ratio)
         self.guidance_scale_2 = guidance_scale_2
         self.num_train_timesteps = int(num_train_timesteps)
+        self.vision_encoder = vision_encoder
+        self.image_processor = image_processor
+
+    @property
+    def uses_clip_vision(self) -> bool:
+        """True iff the bundle loaded a CLIP vision tower (I2V path)."""
+        return self.vision_encoder is not None
 
     @classmethod
     def from_config(cls, config: WAN22PipelineConfig) -> "WAN22Bundle":
         """Load both WAN 2.2 transformers + reuse WAN 2.1 VAE / text loaders."""
-        try:
-            from diffusers import WanTransformer3DModel
-        except ImportError:
-            from diffusers import AutoModel
-
-            WanTransformer3DModel = AutoModel
+        from diffusers import WanTransformer3DModel
 
         aux = WAN21Bundle.from_config(config)
         high_noise_transformer = aux.transformer
@@ -101,9 +105,11 @@ class WAN22Bundle(Bundle):
             device=aux.device,
             pretrained_path=aux.pretrained_path,
             max_sequence_length=aux.max_sequence_length,
-            boundary_ratio=float(config.boundary_ratio),
+            boundary_ratio=config.boundary_ratio,
             guidance_scale_2=config.guidance_scale_2,
-            num_train_timesteps=int(config.num_train_timesteps),
+            num_train_timesteps=config.num_train_timesteps,
+            vision_encoder=aux.vision_encoder,
+            image_processor=aux.image_processor,
         )
 
     def weight_sync_name_map(self) -> Dict[str, str]:

@@ -2,17 +2,15 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
-from unirl.models.types.ar import ARSamplingParams
+from unirl.models.types.ar import ARSamplingParams, decode_text_segment
 from unirl.models.types.pipeline import Pipeline
-from unirl.types.primitives import Texts
-from unirl.types.sample import Sample, Turn
+from unirl.types.sample import Sample
 
-from .ar import Qwen3_5ARParams, Qwen3_5ARStage
+from .ar import Qwen3_5ARStage
 from .bundle import Qwen3_5Bundle
 from .chat_template import Qwen3_5ChatTemplateStage
-from .conditions import Qwen3_5ARConditions
 from .config import Qwen3_5PipelineConfig
 
 
@@ -99,25 +97,6 @@ class Qwen3_5Pipeline(Pipeline):
             logprob_precision=config.logprob_precision,
         )
 
-    def _conditions_for(
-        self,
-        turns: List[Turn],
-        control: Dict[str, Any],
-    ) -> Qwen3_5ARConditions:
-        """Render one role-aware text/image trajectory into replay conditions."""
-        chat_overrides: Dict[str, Any] = dict(control.get("chat") or {})
-        if "system_instruction" in chat_overrides:
-            chat_stage = Qwen3_5ChatTemplateStage(
-                self.bundle,
-                system_instruction=chat_overrides["system_instruction"],
-                max_prompt_length=self.chat_template.max_prompt_length,
-                enable_thinking=self.chat_template.enable_thinking,
-                pad_to_max_length=self.chat_template.pad_to_max_length,
-            )
-        else:
-            chat_stage = self.chat_template
-        return chat_stage.embed(turns)
-
     def generate(self, sample: Sample) -> Sample:
         """Run Qwen3.5 generation and fill the frontier generation Part."""
         frontier = sample.frontier_gen_part(ARSamplingParams)
@@ -128,46 +107,27 @@ class Qwen3_5Pipeline(Pipeline):
             turns, _images = sample.vision_conditioning()
         else:
             turns = sample.text_conditioning()
-        conds = self._conditions_for(turns, sample.parts[0].control)
+        chat_overrides: Dict[str, Any] = dict(sample.parts[0].control.get("chat") or {})
+        if "system_instruction" in chat_overrides:
+            chat_stage = Qwen3_5ChatTemplateStage(
+                self.bundle,
+                system_instruction=chat_overrides["system_instruction"],
+                max_prompt_length=self.chat_template.max_prompt_length,
+                enable_thinking=self.chat_template.enable_thinking,
+                pad_to_max_length=self.chat_template.pad_to_max_length,
+            )
+        else:
+            chat_stage = self.chat_template
+        conds = chat_stage.embed(turns)
 
-        params = Qwen3_5ARParams(
-            max_tokens=ar.max_new_tokens,
-            temperature=ar.temperature,
-            top_p=ar.top_p,
-            top_k=ar.top_k,
-            stop_token_ids=([int(ar.stop_token_id)] if ar.stop_token_id is not None else []),
-        )
-
-        sampling_params = ARSamplingParams(
-            samples_per_prompt=int(ar.samples_per_prompt),
-            max_new_tokens=int(params.max_tokens),
-            temperature=float(params.temperature),
-            top_p=float(params.top_p),
-            top_k=int(params.top_k),
-            stop_token_id=ar.stop_token_id,
-        )
-
-        segment = self.ar.autoregress(conds, sampling_params=sampling_params, params=params)
-        decoded = self._detokenize(segment)
+        segment = self.ar.autoregress(conds, sampling_params=ar)
+        decoded = decode_text_segment(segment, self.bundle.tokenizer)
 
         return sample.with_filled_frontier(
             segment=segment,
             primitives={"text": decoded},
             conditions=conds.to_dict(),
         )
-
-    def _detokenize(self, segment) -> Texts:
-        if segment.tokens is None or segment.cu_seqlens is None:
-            return Texts(texts=[])
-        cu = [int(c) for c in segment.cu_seqlens.tolist()]
-        tokenizer = self.bundle.tokenizer
-        out: list = []
-        n = len(cu) - 1
-        for i in range(n):
-            chunk = segment.tokens[cu[i] : cu[i + 1]]
-            ids = chunk.tolist() if chunk.numel() > 0 else []
-            out.append(tokenizer.decode(ids, skip_special_tokens=True))
-        return Texts(texts=out)
 
 
 __all__ = ["Qwen3_5Pipeline"]

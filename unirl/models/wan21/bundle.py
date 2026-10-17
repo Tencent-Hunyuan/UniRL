@@ -52,17 +52,8 @@ class WAN21Bundle(Bundle):
     @classmethod
     def from_config(cls, config: WAN21PipelineConfig) -> "WAN21Bundle":
         """Load all WAN 2.1 components from a HuggingFace checkpoint."""
-        try:
-            from diffusers import WanTransformer3DModel
-        except ImportError:
-            from diffusers import AutoModel
-
-            WanTransformer3DModel = AutoModel
-        try:
-            from transformers import AutoTokenizer, UMT5EncoderModel
-        except ImportError:
-            from transformers import AutoTokenizer
-            from transformers import T5EncoderModel as UMT5EncoderModel
+        from diffusers import WanTransformer3DModel
+        from transformers import AutoTokenizer, UMT5EncoderModel
 
         path = config.pretrained_model_ckpt_path
         vae_path = config.vae_ckpt_path or path
@@ -118,18 +109,13 @@ class WAN21Bundle(Bundle):
 
         tokenizer = AutoTokenizer.from_pretrained(te_path, subfolder="tokenizer")
 
-        image_dim = int(getattr(transformer.config, "image_dim", 0) or 0)
+        raw_image_dim = transformer.config.image_dim
+        image_dim = 0 if raw_image_dim is None else int(raw_image_dim)
         vision_encoder: Optional[nn.Module] = None
         image_processor: Optional[Any] = None
         if image_dim > 0:
-            try:
-                from transformers import CLIPImageProcessor, CLIPVisionModel
-            except ImportError as e:
-                raise ImportError(
-                    "WAN21Bundle.from_config: transformer declares image_dim>0 "
-                    "(I2V checkpoint) but `transformers.CLIPVisionModel` / "
-                    "`CLIPImageProcessor` is unavailable."
-                ) from e
+            from transformers import CLIPImageProcessor, CLIPVisionModel
+
             ie_path = config.image_encoder_ckpt_path or path
             vision_encoder = (
                 CLIPVisionModel.from_pretrained(ie_path, subfolder="image_encoder", torch_dtype=dtype).to(device).eval()
@@ -153,7 +139,7 @@ class WAN21Bundle(Bundle):
             dtype=dtype,
             device=device,
             pretrained_path=path,
-            max_sequence_length=int(config.max_sequence_length),
+            max_sequence_length=config.max_sequence_length,
             vision_encoder=vision_encoder,
             image_processor=image_processor,
         )

@@ -56,58 +56,20 @@ class SenseNovaU1DiffusionParams(DiffusionSamplingParams):
 def resolve_noise_scale(model: torch.nn.Module, image_shape: Tuple[int, int]) -> float:
     """Match the checkpoint's resolution-dependent initial pixel-noise scale."""
     height, width = (int(v) for v in image_shape)
-    patch = int(model.patch_size)
-    merge = int(1 / float(model.downsample_ratio))
+    patch = model.patch_size
+    merge = int(1 / model.downsample_ratio)
     grid_h, grid_w = height // patch, width // patch
-    scale = float(model.noise_scale)
+    scale = model.noise_scale
     if model.noise_scale_mode in {"resolution", "dynamic", "dynamic_sqrt"}:
         image_sequence = (grid_h * grid_w) / (merge**2)
-        scale *= math.sqrt(image_sequence / float(model.noise_scale_base_image_seq_len))
+        scale *= math.sqrt(image_sequence / model.noise_scale_base_image_seq_len)
         if model.noise_scale_mode == "dynamic_sqrt":
             scale = math.sqrt(scale)
-    return min(scale, float(model.noise_scale_max_value))
+    return min(scale, model.noise_scale_max_value)
 
 
 class SenseNovaU1DiffusionStep:
     """One model prediction plus a framework-owned FlowGRPO transition."""
-
-    @staticmethod
-    def _optimized_scale(positive: torch.Tensor, negative: torch.Tensor) -> torch.Tensor:
-        positive = positive.flatten(1).float()
-        negative = negative.flatten(1).float()
-        numerator = torch.sum(positive * negative, dim=1, keepdim=True)
-        denominator = torch.sum(negative.square(), dim=1, keepdim=True) + 1e-8
-        return numerator / denominator
-
-    def _apply_cfg(
-        self,
-        condition_velocity: torch.Tensor,
-        uncondition_velocity: torch.Tensor,
-        *,
-        guidance: float,
-        cfg_norm: str,
-        step_index: int,
-    ) -> torch.Tensor:
-        """Combine upstream conditional and unconditional velocity predictions."""
-        if cfg_norm == "cfg_zero_star":
-            if int(step_index) == 0:
-                return torch.zeros_like(condition_velocity)
-            alpha = self._optimized_scale(condition_velocity, uncondition_velocity).to(condition_velocity.dtype)
-            alpha = alpha.reshape(-1, 1, 1)
-            return uncondition_velocity * alpha + guidance * (condition_velocity - uncondition_velocity * alpha)
-
-        velocity = uncondition_velocity + guidance * (condition_velocity - uncondition_velocity)
-        if cfg_norm in {"global", "channel"}:
-            device_type = condition_velocity.device.type
-            if device_type == "mps":
-                device_type = "cpu"
-            norm_dims = (1, 2) if cfg_norm == "global" else -1
-            with torch.autocast(device_type=device_type, enabled=False):
-                condition_norm = torch.norm(condition_velocity, dim=norm_dims, keepdim=True)
-                guided_norm = torch.norm(velocity, dim=norm_dims, keepdim=True)
-                scale = (condition_norm / (guided_norm + 1e-8)).clamp(0.0, 1.0)
-            velocity = velocity * scale.to(velocity.dtype)
-        return velocity
 
     def predict_velocity(
         self,
@@ -129,7 +91,7 @@ class SenseNovaU1DiffusionStep:
         device = torch.device(bundle.device)
         sample = sample.to(device)
 
-        pixel_patch = int(model.patch_size) * int(1 / float(model.downsample_ratio))
+        pixel_patch = model.patch_size * int(1 / model.downsample_ratio)
         expected = packed_pixel_shape(image_shape, patch_size=pixel_patch)
         require(
             sample.ndim == 3 and tuple(sample.shape[1:]) == expected,
@@ -142,9 +104,7 @@ class SenseNovaU1DiffusionStep:
         data_time = 1.0 - sigma
         noise_scale = resolve_noise_scale(model, image_shape)
         lo, hi = (float(v) for v in params.cfg_interval)
-        use_cfg = (
-            float(params.guidance_scale) > 1.0 and uncondition_cache is not None and lo <= float(data_time.item()) <= hi
-        )
+        use_cfg = params.guidance_scale > 1.0 and uncondition_cache is not None and lo <= float(data_time.item()) <= hi
         prediction = bundle.transformer(
             "predict_velocity",
             normalized_pixels=normalized_pixels,
@@ -160,13 +120,30 @@ class SenseNovaU1DiffusionStep:
         if not use_cfg:
             return prediction
         condition_velocity, uncondition_velocity = prediction
-        return self._apply_cfg(
-            condition_velocity,
-            uncondition_velocity,
-            guidance=float(params.guidance_scale),
-            cfg_norm=params.cfg_norm,
-            step_index=step_index,
-        )
+        guidance = params.guidance_scale
+        cfg_norm = params.cfg_norm
+        if cfg_norm == "cfg_zero_star":
+            if int(step_index) == 0:
+                return torch.zeros_like(condition_velocity)
+            positive = condition_velocity.flatten(1).float()
+            negative = uncondition_velocity.flatten(1).float()
+            numerator = torch.sum(positive * negative, dim=1, keepdim=True)
+            denominator = torch.sum(negative.square(), dim=1, keepdim=True) + 1e-8
+            alpha = (numerator / denominator).to(condition_velocity.dtype).reshape(-1, 1, 1)
+            return uncondition_velocity * alpha + guidance * (condition_velocity - uncondition_velocity * alpha)
+
+        velocity = uncondition_velocity + guidance * (condition_velocity - uncondition_velocity)
+        if cfg_norm in {"global", "channel"}:
+            device_type = condition_velocity.device.type
+            if device_type == "mps":
+                device_type = "cpu"
+            norm_dims = (1, 2) if cfg_norm == "global" else -1
+            with torch.autocast(device_type=device_type, enabled=False):
+                condition_norm = torch.norm(condition_velocity, dim=norm_dims, keepdim=True)
+                guided_norm = torch.norm(velocity, dim=norm_dims, keepdim=True)
+                scale = (condition_norm / (guided_norm + 1e-8)).clamp(0.0, 1.0)
+            velocity = velocity * scale.to(velocity.dtype)
+        return velocity
 
     def step_with_logp(
         self,
@@ -251,82 +228,6 @@ class SenseNovaU1DiffusionStage(DiffusionStage[SenseNovaU1Conditions]):
             return torch.autocast("cpu", torch.bfloat16)
         return nullcontext()
 
-    def _configure_t_eps(self, params: SenseNovaU1DiffusionParams) -> None:
-        """Apply the request-level inference clamp once before model forwards."""
-        self.model.model.config.t_eps = float(params.t_eps)
-
-    @staticmethod
-    def _single_conditions(conditions: SenseNovaU1Conditions, index: int) -> SenseNovaU1Conditions:
-        return conditions.slice(index, index + 1)
-
-    def _diffuse_one(
-        self,
-        conditions: SenseNovaU1Conditions,
-        *,
-        schedule: torch.Tensor,
-        params: SenseNovaU1DiffusionParams,
-        initial_latents: torch.Tensor,
-    ) -> LatentSegment:
-        device = torch.device(self.model.device)
-        schedule = schedule.to(device)
-        total_steps = int(params.num_inference_steps)
-        require(
-            int(schedule.shape[0]) == total_steps + 1,
-            f"SenseNovaU1DiffusionStage: schedule length {schedule.shape[0]} != {total_steps + 1}.",
-        )
-        self.strategy.init_schedule(schedule)
-        sigma_max = schedule[1].float() if total_steps else schedule[0].float()
-
-        image_shape = tuple(conditions.image_shapes[0])
-        noise_scale = resolve_noise_scale(self.model.model, image_shape)
-        state = initial_latents.to(device=device, dtype=self.trajectory_dtype) * noise_scale
-
-        sde_set: Set[int] = set(int(i) for i in (params.sde_indices or []))
-        require(
-            not sde_set or float(params.eta) > 0.0,
-            "SenseNovaU1DiffusionStage: sde_indices are non-empty but eta=0, "
-            "so rollout would emit no transition log-probabilities.",
-        )
-        needed = set(compute_trajectory_positions(sde_set, total_steps))
-        needed.add(total_steps)
-        stored: List[Tuple[int, torch.Tensor]] = []
-        if 0 in needed:
-            stored.append((0, state.detach().clone()))
-        log_probs: List[torch.Tensor] = []
-        means: List[torch.Tensor] = []
-
-        for index in range(total_steps):
-            eta = float(params.eta) if index in sde_set else 0.0
-            with torch.no_grad(), self._autocast_ctx():
-                state, log_prob, mean = self.step.step_with_logp(
-                    self.model,
-                    conditions,
-                    strategy=self.strategy,
-                    sample=state,
-                    sigma=schedule[index],
-                    sigma_next=schedule[index + 1],
-                    params=params,
-                    sigma_max=sigma_max,
-                    eta=eta,
-                    step_index=index,
-                )
-            state = state.to(dtype=self.trajectory_dtype)
-            if index + 1 in needed:
-                stored.append((index + 1, state.detach().clone()))
-            if log_prob is not None:
-                log_probs.append(log_prob.to(dtype=self.logprob_dtype))
-                if mean is not None:
-                    means.append(mean.detach())
-
-        return LatentSegment(
-            latents=torch.stack([value for _, value in stored], dim=1),
-            sigmas=schedule,
-            indices=torch.tensor([index for index, _ in stored], dtype=torch.long, device=device),
-            sde_logp=torch.stack(log_probs, dim=1) if log_probs else None,
-            sde_means=torch.stack(means, dim=1) if means else None,
-            sde_indices=(torch.tensor(sorted(sde_set), dtype=torch.long, device=device) if sde_set else None),
-        )
-
     def diffuse(
         self,
         conditions: SenseNovaU1Conditions,
@@ -336,10 +237,10 @@ class SenseNovaU1DiffusionStage(DiffusionStage[SenseNovaU1Conditions]):
         initial_latents: Optional[torch.Tensor] = None,
     ) -> LatentSegment:
         """Sample each prompt independently to keep prefix caches batch-local."""
-        self._configure_t_eps(params)
+        self.model.model.config.t_eps = params.t_eps
         conditions.validate()
         device = torch.device(self.model.device)
-        pixel_patch = int(self.model.model.patch_size) * int(1 / float(self.model.model.downsample_ratio))
+        pixel_patch = self.model.model.patch_size * int(1 / self.model.model.downsample_ratio)
         shapes = [packed_pixel_shape(shape, patch_size=pixel_patch) for shape in conditions.image_shapes]
         require(
             len(set(shapes)) == 1,
@@ -353,15 +254,15 @@ class SenseNovaU1DiffusionStage(DiffusionStage[SenseNovaU1Conditions]):
 
             initial_latents = generate_latents(
                 batch_size=batch_size,
-                latent_shape=(3, int(params.height), int(params.width)),
+                latent_shape=(3, params.height, params.width),
                 device=device,
                 dtype=self.trajectory_dtype,
-                init_same_noise=bool(params.init_same_noise),
-                samples_per_prompt=int(params.samples_per_prompt),
+                init_same_noise=params.init_same_noise,
+                samples_per_prompt=params.samples_per_prompt,
                 noise_group_ids=params.noise_group_ids,
-                base_seed=int(params.seed or 0),
+                base_seed=0 if params.seed is None else params.seed,
             )
-        spatial_shape = (batch_size, 3, int(params.height), int(params.width))
+        spatial_shape = (batch_size, 3, params.height, params.width)
         packed_shape = (batch_size, *expected)
         if tuple(initial_latents.shape) == spatial_shape:
             initial_latents = patchify_pixels(initial_latents, patch_size=pixel_patch)
@@ -371,15 +272,68 @@ class SenseNovaU1DiffusionStage(DiffusionStage[SenseNovaU1Conditions]):
                 f"must be spatial {spatial_shape} or packed {packed_shape}."
             )
 
-        segments = [
-            self._diffuse_one(
-                self._single_conditions(conditions, index),
-                schedule=schedule,
-                params=params,
-                initial_latents=initial_latents[index : index + 1],
+        schedule = schedule.to(device)
+        total_steps = params.num_inference_steps
+        require(
+            int(schedule.shape[0]) == total_steps + 1,
+            f"SenseNovaU1DiffusionStage: schedule length {schedule.shape[0]} != {total_steps + 1}.",
+        )
+        sde_set: Set[int] = set(params.sde_indices or ())
+        require(
+            not sde_set or params.eta > 0.0,
+            "SenseNovaU1DiffusionStage: sde_indices are non-empty but eta=0, "
+            "so rollout would emit no transition log-probabilities.",
+        )
+        needed = set(compute_trajectory_positions(sde_set, total_steps))
+        needed.add(total_steps)
+        sigma_max = schedule[1].float() if total_steps else schedule[0].float()
+
+        segments: List[LatentSegment] = []
+        for sample_idx in range(batch_size):
+            sample_conditions = conditions.slice(sample_idx, sample_idx + 1)
+            self.strategy.init_schedule(schedule)
+            image_shape = tuple(sample_conditions.image_shapes[0])
+            noise_scale = resolve_noise_scale(self.model.model, image_shape)
+            state = initial_latents[sample_idx : sample_idx + 1].to(device=device, dtype=self.trajectory_dtype) * (
+                noise_scale
             )
-            for index in range(batch_size)
-        ]
+            stored: List[Tuple[int, torch.Tensor]] = []
+            if 0 in needed:
+                stored.append((0, state.detach().clone()))
+            log_probs: List[torch.Tensor] = []
+            means: List[torch.Tensor] = []
+            for index in range(total_steps):
+                eta = params.eta if index in sde_set else 0.0
+                with torch.no_grad(), self._autocast_ctx():
+                    state, log_prob, mean = self.step.step_with_logp(
+                        self.model,
+                        sample_conditions,
+                        strategy=self.strategy,
+                        sample=state,
+                        sigma=schedule[index],
+                        sigma_next=schedule[index + 1],
+                        params=params,
+                        sigma_max=sigma_max,
+                        eta=eta,
+                        step_index=index,
+                    )
+                state = state.to(dtype=self.trajectory_dtype)
+                if index + 1 in needed:
+                    stored.append((index + 1, state.detach().clone()))
+                if log_prob is not None:
+                    log_probs.append(log_prob.to(dtype=self.logprob_dtype))
+                    if mean is not None:
+                        means.append(mean.detach())
+            segments.append(
+                LatentSegment(
+                    latents=torch.stack([value for _, value in stored], dim=1),
+                    sigmas=schedule,
+                    indices=torch.tensor([index for index, _ in stored], dtype=torch.long, device=device),
+                    sde_logp=torch.stack(log_probs, dim=1) if log_probs else None,
+                    sde_means=torch.stack(means, dim=1) if means else None,
+                    sde_indices=(torch.tensor(sorted(sde_set), dtype=torch.long, device=device) if sde_set else None),
+                )
+            )
         if len(segments) == 1:
             return segments[0]
         return LatentSegment.concat(segments)
@@ -393,7 +347,7 @@ class SenseNovaU1DiffusionStage(DiffusionStage[SenseNovaU1Conditions]):
         step_indices: Optional[List[int]] = None,
     ) -> ReplayResult:
         """Recompute SDE transition likelihoods with gradients."""
-        self._configure_t_eps(params)
+        self.model.model.config.t_eps = params.t_eps
         if segment.sde_indices is None or segment.latents is None or segment.sigmas is None:
             raise ValueError("SenseNovaU1DiffusionStage.replay requires segment SDE indices, latents, and sigmas.")
         conditions.validate()
@@ -402,8 +356,8 @@ class SenseNovaU1DiffusionStage(DiffusionStage[SenseNovaU1Conditions]):
             f"SenseNovaU1DiffusionStage.replay batch mismatch: latents={segment.latents.shape[0]}, "
             f"conditions={conditions.batch_size}.",
         )
-        sde_set = set(int(i) for i in segment.sde_indices.tolist())
-        target = [int(i) for i in step_indices] if step_indices is not None else sorted(sde_set)
+        sde_set = set(segment.sde_indices.tolist())
+        target = list(step_indices) if step_indices is not None else sorted(sde_set)
         invalid = [i for i in target if i not in sde_set]
         require(not invalid, f"SenseNovaU1DiffusionStage.replay requested non-SDE steps {invalid}.")
 
@@ -413,7 +367,7 @@ class SenseNovaU1DiffusionStage(DiffusionStage[SenseNovaU1Conditions]):
         batch_log_probs: List[torch.Tensor] = []
         batch_means: List[torch.Tensor] = []
         for batch_index in range(conditions.batch_size):
-            single = self._single_conditions(conditions, batch_index)
+            single = conditions.slice(batch_index, batch_index + 1)
             log_probs: List[torch.Tensor] = []
             means: List[torch.Tensor] = []
             for step_index in target:
@@ -430,7 +384,7 @@ class SenseNovaU1DiffusionStage(DiffusionStage[SenseNovaU1Conditions]):
                         params=params,
                         prev_sample=previous,
                         sigma_max=sigma_max,
-                        eta=float(params.eta),
+                        eta=params.eta,
                         step_index=step_index,
                     )
                 if log_prob is None or mean is None:
@@ -456,7 +410,7 @@ class SenseNovaU1DiffusionStage(DiffusionStage[SenseNovaU1Conditions]):
         params: SenseNovaU1DiffusionParams,
     ) -> torch.Tensor:
         """Return the framework sigma-time velocity ``dx/dsigma``."""
-        self._configure_t_eps(params)
+        self.model.model.config.t_eps = params.t_eps
         with self._autocast_ctx():
             return -self.step.predict_velocity(
                 self.model,

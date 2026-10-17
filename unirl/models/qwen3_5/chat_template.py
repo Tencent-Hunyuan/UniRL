@@ -212,8 +212,8 @@ class Qwen3_5ChatTemplateStage:
         pixel_values: List[Optional[torch.Tensor]] = []
         image_grid_thw: List[Optional[torch.Tensor]] = []
         for inp in per_sample_inputs:
-            pv = inp.get("pixel_values")
-            igt = inp.get("image_grid_thw")
+            pv = inp["pixel_values"] if "pixel_values" in inp else None
+            igt = inp["image_grid_thw"] if "image_grid_thw" in inp else None
             pixel_values.append(pv.to(device=device, dtype=dtype) if pv is not None else None)
             image_grid_thw.append(igt.to(device=device) if igt is not None else None)
 

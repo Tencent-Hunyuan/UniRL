@@ -132,9 +132,9 @@ class HunyuanImage3VAECondition(Condition):
 class HunyuanImage3DiffusionConditions(Batch):
     """Typed conditions container for HunyuanImage3 DiT-mode diffusion."""
 
-    fused: Optional[HunyuanImage3FusedMultimodalCondition] = field(kind=FieldKind.SHARED, default=None)
+    fused: Optional[HunyuanImage3FusedMultimodalCondition] = field(kind=FieldKind.CONCAT, default=None)
     # Store CFG's unconditional branch separately so B-sample transport preserves it.
-    fused_uncond: Optional[HunyuanImage3FusedMultimodalCondition] = field(kind=FieldKind.SHARED, default=None)
+    fused_uncond: Optional[HunyuanImage3FusedMultimodalCondition] = field(kind=FieldKind.CONCAT, default=None)
     cond_vae: Optional[HunyuanImage3VAECondition] = field(kind=FieldKind.CONCAT, default=None)
     cond_vit: Optional[ImageEmbedCondition] = field(kind=FieldKind.CONCAT, default=None)
     cond_timestep: Optional[torch.Tensor | list[torch.Tensor]] = field(kind=FieldKind.CONCAT, default=None)
@@ -223,7 +223,7 @@ def split_cfg_fused(
 class HunyuanImage3ARConditions(Batch):
     """Typed conditions container for HunyuanImage3 AR-mode autoregress."""
 
-    fused: Optional[HunyuanImage3FusedMultimodalCondition] = field(kind=FieldKind.SHARED, default=None)
+    fused: Optional[HunyuanImage3FusedMultimodalCondition] = field(kind=FieldKind.CONCAT, default=None)
     cond_vae: Optional[HunyuanImage3VAECondition] = field(kind=FieldKind.CONCAT, default=None)
     cond_vit: Optional[ImageEmbedCondition] = field(kind=FieldKind.CONCAT, default=None)
     cond_timestep: Optional[torch.Tensor | list[torch.Tensor]] = field(kind=FieldKind.CONCAT, default=None)

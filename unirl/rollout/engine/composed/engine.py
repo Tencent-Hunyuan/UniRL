@@ -20,16 +20,6 @@ from unirl.types.sampling import ARSamplingParams, DiffusionSamplingParams
 logger = logging.getLogger(__name__)
 
 
-def _cleanup_constructed_child(name: str, child: Any) -> None:
-    shutdown = getattr(child, "shutdown", None)
-    if not callable(shutdown):
-        return
-    try:
-        shutdown()
-    except Exception as exc:
-        logger.warning("Child %r cleanup after construction failure raised: %s", name, exc)
-
-
 class ComposedRolloutEngine(BaseRolloutEngine):
     """Two-child rollout engine for prompt-enhancement (PE) serial flow."""
 
@@ -49,283 +39,198 @@ class ComposedRolloutEngine(BaseRolloutEngine):
             f"ComposedRolloutEngine requires ComposedRolloutEngineConfig; got {type(config).__name__}",
         )
         self.cfg = config
-        self._device = device
-        self._strategy = strategy
-        self._rank = rank
-        self._model_config = model_config
+        self.child_by_name: Dict[str, BaseRolloutEngine] = {}
+        self.lock = threading.Lock()
+        self.closed = False
 
         deps = dict(device=device, rank=rank, model_config=model_config)
-
-        ar = config.ar.make_engine(strategy=None, **deps)
         try:
-            require(
-                isinstance(ar, BaseRolloutEngine),
-                f"ComposedRolloutEngine ar child must be a BaseRolloutEngine; got {type(ar).__name__}",
-            )
-        except BaseException:
-            _cleanup_constructed_child("ar", ar)
-            raise
-
-        try:
-            diffusion = config.diffusion.make_engine(strategy=strategy, **deps)
-        except BaseException:
-            _cleanup_constructed_child("ar", ar)
-            raise
-        try:
-            require(
-                isinstance(diffusion, BaseRolloutEngine),
-                f"ComposedRolloutEngine diffusion child must be a BaseRolloutEngine; got {type(diffusion).__name__}",
-            )
-        except BaseException:
-            _cleanup_constructed_child("diffusion", diffusion)
-            _cleanup_constructed_child("ar", ar)
-            raise
-
-        self._ar = ar
-        self._diffusion = diffusion
-
-        self._child_by_name: Dict[str, BaseRolloutEngine] = {
-            "ar": self._ar,
-            "diffusion": self._diffusion,
-        }
-
-        self._version = 0
-        self._generate_lock = threading.Lock()
-        self._shutdown_lock = threading.Lock()
-        self._shutdown_requested = False
-        self._shutdown_complete = False
-        try:
+            self.ar = config.ar.make_engine(strategy=None, **deps)
+            self.child_by_name["ar"] = self.ar
+            self.diffusion = config.diffusion.make_engine(strategy=strategy, **deps)
+            self.child_by_name["diffusion"] = self.diffusion
             if config.sleep_diffusion_on_start:
-                self._diffusion.sleep()
+                self.diffusion.sleep()
         except BaseException:
-            _cleanup_constructed_child("diffusion", diffusion)
-            _cleanup_constructed_child("ar", ar)
+            self.shutdown()
             raise
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def shutdown(self) -> None:
-        with self._shutdown_lock:
-            if self._shutdown_complete:
+        with self.lock:
+            if self.closed:
                 return
-            with self._generate_lock:
-                self._shutdown_requested = True
-            with self._generate_lock:
-                for name, child in self._child_by_name.items():
-                    try:
-                        child.shutdown()
-                    except Exception as exc:
-                        logger.warning("Child %r shutdown raised: %s", name, exc)
-            self._shutdown_complete = True
+            self.closed = True
+            for name, child in self.child_by_name.items():
+                try:
+                    child.shutdown()
+                except Exception as exc:
+                    logger.warning("Child %r shutdown raised: %s", name, exc)
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def sleep(self) -> None:
-        for child in self._child_by_name.values():
+        for child in self.child_by_name.values():
             child.sleep()
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def wake_up(self) -> None:
-        for child in self._child_by_name.values():
+        for child in self.child_by_name.values():
             child.wake_up()
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def onload_weights(self, *, track_prefix: str = "") -> None:
-        for child in self._children_for_track_prefix(track_prefix):
+        if track_prefix:
+            self.child_by_name[track_prefix].onload_weights()
+            return
+        for child in self.child_by_name.values():
             child.onload_weights()
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def set_version(self, train_version: int) -> None:
-        for child in self._child_by_name.values():
+        for child in self.child_by_name.values():
             child.set_version(train_version)
-        self._version = train_version
 
     @property
     def is_offloaded(self) -> bool:
-        return all(child.is_offloaded for child in self._child_by_name.values())
+        return all(child.is_offloaded for child in self.child_by_name.values())
 
     def health_check(self) -> bool:
-        return all(child.health_check() for child in self._child_by_name.values())
+        return all(child.health_check() for child in self.child_by_name.values())
 
     def get_memory_info(self) -> Dict[str, float]:
         out: Dict[str, float] = {"allocated_gb": 0.0, "cached_gb": 0.0}
-        for child in self._child_by_name.values():
-            m = child.get_memory_info() or {}
-            out["allocated_gb"] += float(m.get("allocated_gb", 0.0))
-            out["cached_gb"] += float(m.get("cached_gb", 0.0))
+        for child in self.child_by_name.values():
+            m = child.get_memory_info()
+            out["allocated_gb"] += m.get("allocated_gb", 0.0)
+            out["cached_gb"] += m.get("cached_gb", 0.0)
         return out
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
     def generate(self, sample: Sample) -> Sample:
         """Run the whole PE serial flow for one DP shard synchronously."""
-        return self._generate_locked(sample)
-
-    def _generate_locked(self, sample: Sample) -> Sample:
-        with self._generate_lock:
-            if self._shutdown_requested:
+        with self.lock:
+            if self.closed:
                 raise RuntimeError("ComposedRolloutEngine.generate called after shutdown")
-            return self._generate_core(sample)
+            sample.reject_row_canvases(engine="ComposedRolloutEngine")
+            require(
+                len(sample.parts) == 3,
+                "ComposedRolloutEngine.generate: requires exactly "
+                f"[input, ar_shell, diffusion_shell]; got {len(sample.parts)} Parts.",
+            )
+            input_part, ar_shell, diffusion_shell = sample.parts
+            require(
+                isinstance(ar_shell.sampling_params, ARSamplingParams),
+                "ComposedRolloutEngine.generate: requires an AR gen-shell Part (ARSamplingParams)",
+            )
+            require(
+                isinstance(diffusion_shell.sampling_params, DiffusionSamplingParams),
+                "ComposedRolloutEngine.generate: requires a diffusion gen-shell Part (DiffusionSamplingParams)",
+            )
 
-    def _generate_core(self, sample: Sample) -> Sample:
-        """Run the PE serial flow for a whole ``Sample`` → filled 3-part output."""
-        sample.reject_row_canvases(engine="ComposedRolloutEngine")
-        input_part, ar_shell, diffusion_shell = self._unpack_request(sample)
+            P = len(input_part.sample_ids)
+            require(P > 0, "ComposedRolloutEngine.generate: empty Sample")
+            text_primitive = input_part.primitives.get("text")
+            require(
+                isinstance(text_primitive, Texts),
+                "ComposedRolloutEngine.generate: input Part.primitives['text'] must be Texts",
+            )
+            require(
+                len(ar_shell.sample_ids) > 0 and len(ar_shell.sample_ids) % P == 0,
+                f"ComposedRolloutEngine: ar shell {len(ar_shell.sample_ids)} must be a positive multiple of P={P}",
+            )
+            N = len(ar_shell.sample_ids) // P
+            require(
+                len(diffusion_shell.sample_ids) > 0 and len(diffusion_shell.sample_ids) % len(ar_shell.sample_ids) == 0,
+                f"ComposedRolloutEngine: diffusion shell {len(diffusion_shell.sample_ids)} must be a positive multiple of P*N={P * N}",
+            )
+            M = len(diffusion_shell.sample_ids) // len(ar_shell.sample_ids)
 
-        P = len(input_part.sample_ids)
-        require(P > 0, "ComposedRolloutEngine.generate: empty Sample")
-        text_primitive = input_part.primitives.get("text")
-        require(
-            isinstance(text_primitive, Texts),
-            "ComposedRolloutEngine.generate: input Part.primitives['text'] must be Texts",
-        )
-        require(
-            len(ar_shell.sample_ids) % P == 0,
-            f"ComposedRolloutEngine: ar shell {len(ar_shell.sample_ids)} not a multiple of P={P}",
-        )
-        N = len(ar_shell.sample_ids) // P
-        require(
-            N >= 1 and len(diffusion_shell.sample_ids) % len(ar_shell.sample_ids) == 0,
-            f"ComposedRolloutEngine: diffusion shell {len(diffusion_shell.sample_ids)} not a multiple of P*N={P * N}",
-        )
-        M = len(diffusion_shell.sample_ids) // len(ar_shell.sample_ids)
-        require(M >= 1, f"ComposedRolloutEngine.generate: diffusion branch M={M} must be >= 1")
+            self.ar.wake_up()
+            self.diffusion.sleep()
 
-        self._ar.wake_up()
-        self._diffusion.sleep()
+            ar_input = Part.input(
+                sample_ids=list(input_part.sample_ids),
+                primitives={"text": text_primitive},
+                control=ar_child_control(input_part.control, system_instruction=self.cfg.pe_instruction),
+            )
+            ar_out = self.ar.generate(Sample(parts=[ar_input, ar_shell]))
+            ar_part = ar_out.parts[-1]
+            require(
+                len(ar_part.sample_ids) == P * N,
+                f"ComposedRolloutEngine: AR child returned {len(ar_part.sample_ids)} samples; expected {P}*{N}={P * N}",
+            )
 
-        ar_input = Part.input(
-            sample_ids=list(input_part.sample_ids),
-            primitives={"text": text_primitive},
-            control=ar_child_control(input_part.control, system_instruction=self.cfg.pe_instruction),
-        )
-        ar_out = self._ar.generate(Sample(parts=[ar_input, ar_shell]))
-        ar_part = ar_out.parts[-1]
-        require(
-            len(ar_part.sample_ids) == P * N,
-            f"ComposedRolloutEngine: AR child returned {len(ar_part.sample_ids)} samples; expected {P}*{N}={P * N}",
-        )
+            pe_texts = ar_part.primitives.get("text")
+            require(
+                isinstance(pe_texts, Texts) and len(pe_texts.texts) == P * N,
+                f"ComposedRolloutEngine: AR Part decoded missing or wrong length "
+                f"(expected {P * N}, got {len(pe_texts.texts) if isinstance(pe_texts, Texts) else 'None'})",
+            )
+            if self.cfg.pe_marker:
+                cleaned_texts, stats = postprocess_pe_texts(
+                    pe_texts.texts,
+                    user_prompts=text_primitive.texts,
+                    samples_per_prompt=N,
+                    marker=self.cfg.pe_marker,
+                    max_chars=self.cfg.pe_max_chars,
+                )
+                if any(stats.values()):
+                    logger.info(
+                        "ComposedRolloutEngine: PE-extract — marker=%r, %d/%d empty, %d truncated, %d fallback_to_original",
+                        self.cfg.pe_marker,
+                        stats["empty"],
+                        len(pe_texts.texts),
+                        stats["truncated"],
+                        stats["fallback"],
+                    )
+                pe_texts = Texts(texts=cleaned_texts)
+            ar_part = ar_part.fill(primitives={"text": pe_texts})
 
-        pe_texts = ar_part.primitives.get("text")
-        require(
-            isinstance(pe_texts, Texts) and len(pe_texts.texts) == P * N,
-            f"ComposedRolloutEngine: AR Part decoded missing or wrong length "
-            f"(expected {P * N}, got {len(pe_texts.texts) if isinstance(pe_texts, Texts) else 'None'})",
-        )
-        pe_texts = self._extract_pe(pe_texts, text_primitive, N)
-        ar_part = ar_part.fill(primitives={"text": pe_texts})
+            self.ar.sleep()
+            self.diffusion.wake_up()
 
-        self._ar.sleep()
-        self._diffusion.wake_up()
+            # Re-root diffusion prompts because composed PE IDs are not valid child roots.
+            pe_input = Part.input(
+                sample_ids=[f"pe{k}" for k in range(P * N)],
+                primitives={"text": pe_texts},
+            )
+            diff_child_shell = pe_input.fork(
+                M,
+                sampling_params=diffusion_shell.sampling_params,
+                new_segment=diffusion_shell.segment,
+            )
+            diff_out = self.diffusion.generate(Sample(parts=[pe_input, diff_child_shell]))
+            diff_child = diff_out.parts[-1]
+            require(
+                len(diff_child.sample_ids) == len(diffusion_shell.sample_ids),
+                f"ComposedRolloutEngine: diffusion child returned {len(diff_child.sample_ids)} "
+                f"samples; expected {P}*{N}*{M}={P * N * M}",
+            )
+            diffusion_part = diffusion_shell.fill(
+                segment=diff_child.segment,
+                primitives=dict(diff_child.primitives),
+                primitive_metadata=dict(diff_child.primitive_metadata),
+                conditions=dict(diff_child.conditions),
+                media_preview=diff_child.media_preview,
+                output_version=diff_child.output_version,
+            )
 
-        # Re-root diffusion prompts because composed PE IDs are not valid child roots.
-        pe_input = Part.input(
-            sample_ids=[f"pe{k}" for k in range(P * N)],
-            primitives={"text": pe_texts},
-        )
-        diff_child_shell = pe_input.fork(
-            M,
-            sampling_params=diffusion_shell.sampling_params,
-            new_segment=diffusion_shell.segment,
-        )
-        diff_out = self._diffusion.generate(Sample(parts=[pe_input, diff_child_shell]))
-        diff_child = diff_out.parts[-1]
-        require(
-            len(diff_child.sample_ids) == len(diffusion_shell.sample_ids),
-            f"ComposedRolloutEngine: diffusion child returned {len(diff_child.sample_ids)} "
-            f"samples; expected {P}*{N}*{M}={P * N * M}",
-        )
-        diffusion_part = diffusion_shell.fill(
-            segment=diff_child.segment,
-            primitives=dict(diff_child.primitives),
-            primitive_metadata=dict(diff_child.primitive_metadata),
-            conditions=dict(diff_child.conditions),
-            media_preview=diff_child.media_preview,
-            output_version=diff_child.output_version,
-        )
-
-        return Sample(parts=[input_part, ar_part, diffusion_part])
+            return Sample(parts=[input_part, ar_part, diffusion_part])
 
     def abort(self, ids: Optional[List[str]] = None) -> List[Sample]:
         """Abort in-flight generation on both children. Partials surface via the"""
         del ids
-        for child in self._child_by_name.values():
+        for child in self.child_by_name.values():
             child.abort()
         return []
 
     def pause(self) -> None:
-        for child in self._child_by_name.values():
+        for child in self.child_by_name.values():
             child.pause()
 
     def resume(self) -> None:
-        for child in self._child_by_name.values():
+        for child in self.child_by_name.values():
             child.resume()
-
-    def _unpack_request(self, sample: Sample) -> tuple:
-        """Resolve the pre-forked ``[input, ar_shell, diffusion_shell]`` request."""
-        require(
-            bool(sample.parts) and sample.parts[0].is_root,
-            "ComposedRolloutEngine.generate: requires a root input Part at parts[0]",
-        )
-        require(
-            len(sample.parts) == 3,
-            "ComposedRolloutEngine.generate: requires exactly "
-            f"[input, ar_shell, diffusion_shell]; got {len(sample.parts)} Parts.",
-        )
-        input_part, ar_shell, diffusion_shell = sample.parts
-        require(
-            isinstance(ar_shell.sampling_params, ARSamplingParams),
-            "ComposedRolloutEngine.generate: requires an AR gen-shell Part (ARSamplingParams)",
-        )
-        require(
-            isinstance(diffusion_shell.sampling_params, DiffusionSamplingParams),
-            "ComposedRolloutEngine.generate: requires a diffusion gen-shell Part (DiffusionSamplingParams)",
-        )
-        return input_part, ar_shell, diffusion_shell
-
-    def _extract_pe(self, pe_texts: Texts, text_primitive: Texts, samples_per_prompt: int) -> Texts:
-        """Optional marker-based PE extraction: keep only the substring after the"""
-        if not self.cfg.pe_marker:
-            return pe_texts
-        cleaned_texts, stats = postprocess_pe_texts(
-            pe_texts.texts,
-            user_prompts=text_primitive.texts,
-            samples_per_prompt=samples_per_prompt,
-            marker=self.cfg.pe_marker,
-            max_chars=self.cfg.pe_max_chars,
-        )
-        if any(stats.values()):
-            logger.info(
-                "ComposedRolloutEngine: PE-extract — marker=%r, %d/%d empty, %d truncated, %d fallback_to_original",
-                self.cfg.pe_marker,
-                stats["empty"],
-                len(pe_texts.texts),
-                stats["truncated"],
-                stats["fallback"],
-            )
-        return Texts(texts=cleaned_texts)
-
-    def _demux_by_prefix(
-        self,
-        keys: Dict[str, Any],
-    ) -> Dict[str, Dict[str, Any]]:
-        """Split a dict by child-name prefix, stripping the prefix."""
-        result: Dict[str, Dict[str, Any]] = {}
-        for child_name in self._child_by_name:
-            prefix = f"{child_name}."
-            subset = {k[len(prefix) :]: v for k, v in keys.items() if k.startswith(prefix)}
-            if subset:
-                result[child_name] = subset
-        return result
-
-    def _children_for_track_prefix(self, track_prefix: str) -> List[BaseRolloutEngine]:
-        """Resolve the tensor-payload track routing hint to child engines."""
-        if not track_prefix:
-            return list(self._child_by_name.values())
-        child = self._child_by_name.get(track_prefix)
-        if child is None:
-            raise ValueError(
-                f"ComposedRolloutEngine: unknown track_prefix {track_prefix!r}; "
-                f"expected one of {sorted(self._child_by_name)}."
-            )
-        return [child]
 
     def update_weights_from_ipc(
         self,
@@ -337,17 +242,12 @@ class ComposedRolloutEngine(BaseRolloutEngine):
         track_prefix: str = "",
     ) -> None:
         """Route a bucketed-IPC weight push to one child via ``track_prefix``."""
-        if not track_prefix:
-            raise ValueError(
-                "ComposedRolloutEngine.update_weights_from_ipc requires track_prefix "
-                f"so the update can be routed to one child; expected one of {sorted(self._child_by_name)}."
-            )
-        for child in self._children_for_track_prefix(track_prefix):
-            child.update_weights_from_ipc(
-                peft_config=peft_config,
-                base_sync_done=base_sync_done,
-                use_shm=use_shm,
-            )
+        self.child_by_name[track_prefix].update_weights_from_ipc(
+            peft_config=peft_config,
+            base_sync_done=base_sync_done,
+            use_shm=use_shm,
+            replica_rank=replica_rank,
+        )
 
     def init_weights_update_group(
         self,
@@ -361,20 +261,14 @@ class ComposedRolloutEngine(BaseRolloutEngine):
         track_prefix: str = "",
     ) -> None:
         """Route NCCL group setup to one child via ``track_prefix``."""
-        if not track_prefix:
-            raise ValueError(
-                "ComposedRolloutEngine.init_weights_update_group requires track_prefix "
-                f"so the group can be routed to one child; expected one of {sorted(self._child_by_name)}."
-            )
-        for child in self._children_for_track_prefix(track_prefix):
-            child.init_weights_update_group(
-                master_address=master_address,
-                master_port=master_port,
-                rank_offset=rank_offset,
-                world_size=world_size,
-                group_name=group_name,
-                backend=backend,
-            )
+        self.child_by_name[track_prefix].init_weights_update_group(
+            master_address=master_address,
+            master_port=master_port,
+            rank_offset=rank_offset,
+            world_size=world_size,
+            group_name=group_name,
+            backend=backend,
+        )
 
     def update_weights_from_distributed(
         self,
@@ -388,20 +282,14 @@ class ComposedRolloutEngine(BaseRolloutEngine):
         track_prefix: str = "",
     ) -> None:
         """Route a NCCL-broadcast weight push to one child via ``track_prefix``."""
-        if not track_prefix:
-            raise ValueError(
-                "ComposedRolloutEngine.update_weights_from_distributed requires track_prefix "
-                f"so the update can be routed to one child; expected one of {sorted(self._child_by_name)}."
-            )
-        for child in self._children_for_track_prefix(track_prefix):
-            child.update_weights_from_distributed(
-                names=names,
-                dtypes=dtypes,
-                shapes=shapes,
-                group_name=group_name,
-                target_modules=target_modules,
-                flush_cache=flush_cache,
-            )
+        self.child_by_name[track_prefix].update_weights_from_distributed(
+            names=names,
+            dtypes=dtypes,
+            shapes=shapes,
+            group_name=group_name,
+            target_modules=target_modules,
+            flush_cache=flush_cache,
+        )
 
     def destroy_weights_update_group(
         self,
@@ -410,13 +298,7 @@ class ComposedRolloutEngine(BaseRolloutEngine):
         track_prefix: str = "",
     ) -> None:
         """Route NCCL group teardown to one child via ``track_prefix``."""
-        if not track_prefix:
-            raise ValueError(
-                "ComposedRolloutEngine.destroy_weights_update_group requires track_prefix "
-                f"so the teardown can be routed to one child; expected one of {sorted(self._child_by_name)}."
-            )
-        for child in self._children_for_track_prefix(track_prefix):
-            child.destroy_weights_update_group(group_name=group_name)
+        self.child_by_name[track_prefix].destroy_weights_update_group(group_name=group_name)
 
     def set_lora_from_tensors(
         self,
@@ -425,21 +307,23 @@ class ComposedRolloutEngine(BaseRolloutEngine):
         *,
         peft_config: Optional[dict] = None,
     ) -> None:
-        demuxed = self._demux_by_prefix(lora_tensors)
-        if demuxed:
-            for child_name, child_tensors in demuxed.items():
-                child = self._child_by_name[child_name]
+        matched = False
+        for child_name, child in self.child_by_name.items():
+            prefix = f"{child_name}."
+            subset = {k[len(prefix) :]: v for k, v in lora_tensors.items() if k.startswith(prefix)}
+            if subset:
+                matched = True
                 if child.is_offloaded:
                     child.onload_weights()
                 child.set_lora_from_tensors(
                     adapter_name,
-                    child_tensors,
+                    subset,
                     peft_config=peft_config,
                 )
-        else:
+        if not matched:
             raise ValueError(
                 "ComposedRolloutEngine.set_lora_from_tensors requires child-prefixed tensor keys; "
-                f"expected prefixes {sorted(self._child_by_name)}."
+                f"expected prefixes {sorted(self.child_by_name)}."
             )
 
     def update_weights_from_tensor(
@@ -451,19 +335,12 @@ class ComposedRolloutEngine(BaseRolloutEngine):
         flush_cache: bool = True,
         track_prefix: str = "",
     ) -> None:
-        if not track_prefix:
-            raise ValueError(
-                "ComposedRolloutEngine.update_weights_from_tensor requires track_prefix "
-                f"so the update can be routed to one child; expected one of {sorted(self._child_by_name)}."
-            )
-        children = self._children_for_track_prefix(track_prefix)
-        for child in children:
-            child.update_weights_from_tensor(
-                serialized_named_tensors=serialized_named_tensors,
-                target_modules=target_modules,
-                load_format=load_format,
-                flush_cache=flush_cache,
-            )
+        self.child_by_name[track_prefix].update_weights_from_tensor(
+            serialized_named_tensors=serialized_named_tensors,
+            target_modules=target_modules,
+            load_format=load_format,
+            flush_cache=flush_cache,
+        )
 
 
 __all__ = ["ComposedRolloutEngine"]

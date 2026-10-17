@@ -44,6 +44,8 @@ pipeline:
   autocast_precision: bf16
   trajectory_precision: bf16
   logprob_precision: fp32
+  # Stack all SDE steps into one [S*B, ...] replay forward (requires old_logp_source=replay).
+  batch_replay_steps: true
   strategy:
     _target_: unirl.sde.kernels.FlowSDEStrategy
 

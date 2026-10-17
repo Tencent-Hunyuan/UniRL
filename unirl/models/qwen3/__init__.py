@@ -1,7 +1,6 @@
 """Qwen3 causal LM pipeline on the typed stage/pipeline architecture."""
 
 from unirl.models.qwen3.ar import (
-    Qwen3ARParams,
     Qwen3ARStage,
     Qwen3ARStep,
 )
@@ -13,7 +12,6 @@ from unirl.models.qwen3.pipeline import Qwen3Pipeline
 
 __all__ = [
     "Qwen3ARConditions",
-    "Qwen3ARParams",
     "Qwen3ARStage",
     "Qwen3ARStep",
     "Qwen3Bundle",

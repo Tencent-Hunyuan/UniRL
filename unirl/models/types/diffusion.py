@@ -105,4 +105,16 @@ class DiffusionStage(Protocol[C]):
         return segment.latents[:, -1]
 
 
-__all__ = ["DiffusionStage", "DiffusionStep", "ReplayResult"]
+def combine_modality_logp(
+    video_logp: torch.Tensor,
+    audio_logp: torch.Tensor,
+    *,
+    n_video: int,
+    n_audio: int,
+) -> torch.Tensor:
+    """Element-weighted mean of the per-step video/audio log-probs."""
+    total = n_video + n_audio
+    return (video_logp * n_video + audio_logp * n_audio) / total
+
+
+__all__ = ["DiffusionStage", "DiffusionStep", "ReplayResult", "combine_modality_logp"]

@@ -120,7 +120,7 @@ class HunyuanVideo15Bundle(Bundle):
 
         vision_encoder: Optional[nn.Module] = None
         image_processor: Optional[Any] = None
-        if bool(config.load_vision_encoder):
+        if config.load_vision_encoder:
             from transformers import SiglipImageProcessor, SiglipVisionModel
 
             vision_encoder = (

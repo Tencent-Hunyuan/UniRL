@@ -50,6 +50,7 @@ pipeline:
   autocast_precision: bf16
   trajectory_precision: bf16
   logprob_precision: fp32
+  batch_replay_steps: true
   strategy:
     _target_: unirl.sde.kernels.FlowSDEStrategy
 

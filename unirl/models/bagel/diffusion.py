@@ -45,7 +45,7 @@ class BagelDiffusionParams(DiffusionSamplingParams):
     def __post_init__(self) -> None:
         super().__post_init__()
         require(
-            int(self.num_inference_steps) >= 2,
+            self.num_inference_steps >= 2,
             f"BagelDiffusionParams.num_inference_steps must be >= 2; got {self.num_inference_steps}",
         )
         require(
@@ -390,7 +390,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         """CFG scales after the per-step ``cfg_interval`` gate (matches generate_image)."""
         lo, hi = float(params.cfg_interval[0]), float(params.cfg_interval[1])
         if lo < t_value <= hi:
-            return float(params.guidance_scale), float(params.cfg_img_scale)
+            return params.guidance_scale, params.cfg_img_scale
         return 1.0, 1.0
 
     def diffuse(
@@ -405,27 +405,66 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
         batch_size = conditions.batch_size
         require(batch_size > 0, "BagelDiffusionStage.diffuse: conditions must be non-empty.")
         if batch_size > 1:
-            self._require_stackable_image_shapes(conditions)
-            if self._global_cfg_needs_serial(params) or not self._can_pack_conditions(conditions):
-                return self._diffuse_serial_batch(
-                    conditions,
-                    schedule=schedule,
-                    params=params,
-                    initial_latents=initial_latents,
-                )
+            shapes = [tuple(int(value) for value in shape) for shape in conditions.image_shapes]
+            require(
+                len(shapes) == batch_size,
+                f"BagelDiffusionStage.diffuse: image shape count {len(shapes)} != batch size {batch_size}.",
+            )
+            downsample = self.model.latent_downsample
+            lengths = [(height // downsample) * (width // downsample) for height, width in shapes]
+            require(
+                len(set(lengths)) == 1,
+                "BagelDiffusionStage.diffuse: mixed image shapes produce variable latent lengths "
+                f"{lengths}; split them into separate calls.",
+            )
+            can_pack = (
+                conditions.has_contexts()
+                and len(conditions.gen_contexts) == batch_size
+                and all(ctx is not None for ctx in conditions.gen_contexts)
+                and len(set(shapes)) == 1
+            )
+            if (params.cfg_renorm_type == "global" and params.guidance_scale > 1.0) or not can_pack:
+                segments: List[LatentSegment] = []
+                for index in range(batch_size):
+                    if conditions.has_contexts():
+                        gen = conditions.gen_contexts[index]
+                        condition = BagelDiffusionConditions.for_sample(
+                            gen_context=gen,
+                            cfg_text_context=(
+                                conditions.cfg_text_contexts[index]
+                                if conditions.cfg_text_contexts and conditions.cfg_text_contexts[index] is not None
+                                else gen
+                            ),
+                            cfg_img_context=(
+                                conditions.cfg_img_contexts[index]
+                                if conditions.cfg_img_contexts and conditions.cfg_img_contexts[index] is not None
+                                else gen
+                            ),
+                            prompt=conditions.prompts[index] if conditions.prompts else None,
+                            image_shape=tuple(conditions.image_shapes[index]),
+                        )
+                    else:
+                        condition = BagelDiffusionConditions(
+                            prompts=[conditions.prompts[index]],
+                            input_images=[conditions.input_images[index]] if conditions.input_images else [],
+                            image_shapes=[tuple(conditions.image_shapes[index])],
+                        )
+                    initial = initial_latents[index] if initial_latents is not None else None
+                    segments.append(self.diffuse(condition, schedule=schedule, params=params, initial_latents=initial))
+                return stack_latent_segments(segments)
 
         bagel = self.model.model
         device = torch.device(self.model.device)
         schedule = schedule.to(device)
         num_steps = int(schedule.shape[0]) - 1
         require(
-            num_steps == int(params.num_inference_steps),
+            num_steps == params.num_inference_steps,
             f"BagelDiffusionStage.diffuse: schedule length {schedule.shape[0]} != "
-            f"num_inference_steps+1 ({int(params.num_inference_steps) + 1})",
+            f"num_inference_steps+1 ({params.num_inference_steps + 1})",
         )
         sigma_max = schedule[1] if int(schedule.shape[0]) > 1 else schedule[0]
 
-        sde_set = {int(index) for index in (params.sde_indices or [])}
+        sde_set = set(params.sde_indices or ())
         sde_sorted = sorted(sde_set)
         gen, cfg_text, cfg_img, image_shapes = self._resolve_rollout_batch(conditions)
         gi, gi_cfg_text, gi_cfg_img = self._build_generation_inputs(
@@ -451,7 +490,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
 
         generators = (
             rl_ops.fork_sampling_generators(device, batch_size)
-            if batch_size > 1 and sde_set and float(params.eta) >= 1e-7
+            if batch_size > 1 and sde_set and params.eta >= 1e-7
             else None
         )
         self.strategy.init_schedule(schedule)
@@ -476,7 +515,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
                     t_cur=t_cur,
                     t_next=t_next,
                     sigma_max=sigma_max,
-                    eta=float(params.eta) if index in sde_set else 0.0,
+                    eta=params.eta if index in sde_set else 0.0,
                     cfg_text_scale=cfg_text_scale,
                     cfg_img_scale=cfg_img_scale,
                     forward_kwargs=forward_kwargs,
@@ -502,37 +541,6 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
             sde_logp=torch.stack(sde_logps, dim=1) if sde_logps else None,
             sde_means=torch.stack(sde_means, dim=1) if sde_means else None,
             sde_indices=torch.tensor(sde_sorted, dtype=torch.long, device=device) if sde_sorted else None,
-        )
-
-    @staticmethod
-    def _can_pack_conditions(conditions: BagelDiffusionConditions) -> bool:
-        """Accept only complete opaque contexts with one shared image geometry."""
-        batch_size = conditions.batch_size
-        if not conditions.has_contexts() or batch_size < 2:
-            return False
-        if len(conditions.gen_contexts) != batch_size or any(ctx is None for ctx in conditions.gen_contexts):
-            return False
-        shapes = [tuple(shape) for shape in conditions.image_shapes]
-        return len(shapes) == batch_size and len(set(shapes)) == 1
-
-    @staticmethod
-    def _global_cfg_needs_serial(params: BagelDiffusionParams) -> bool:
-        """Keep vendor global CFG renorm on its required one-sample path."""
-        return params.cfg_renorm_type == "global" and float(params.guidance_scale) > 1.0
-
-    def _require_stackable_image_shapes(self, conditions: BagelDiffusionConditions) -> None:
-        """Reject image batches whose latent rows cannot share one tensor."""
-        shapes = [tuple(int(value) for value in shape) for shape in conditions.image_shapes]
-        require(
-            len(shapes) == conditions.batch_size,
-            f"BagelDiffusionStage.diffuse: image shape count {len(shapes)} != batch size {conditions.batch_size}.",
-        )
-        downsample = int(self.model.latent_downsample)
-        lengths = [(height // downsample) * (width // downsample) for height, width in shapes]
-        require(
-            len(set(lengths)) == 1,
-            "BagelDiffusionStage.diffuse: mixed image shapes produce variable latent lengths "
-            f"{lengths}; split them into separate calls.",
         )
 
     def _resolve_rollout_batch(
@@ -564,44 +572,6 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
             self._merge_contexts(cfg_img_contexts),
             [tuple(shape) for shape in conditions.image_shapes],
         )
-
-    def _diffuse_serial_batch(
-        self,
-        conditions: BagelDiffusionConditions,
-        *,
-        schedule: torch.Tensor,
-        params: BagelDiffusionParams,
-        initial_latents: Optional[torch.Tensor],
-    ) -> LatentSegment:
-        """Fallback for deferred contexts, global CFG renorm, or unpackable inputs."""
-        segments: List[LatentSegment] = []
-        for index in range(conditions.batch_size):
-            if conditions.has_contexts():
-                gen = conditions.gen_contexts[index]
-                condition = BagelDiffusionConditions.for_sample(
-                    gen_context=gen,
-                    cfg_text_context=(
-                        conditions.cfg_text_contexts[index]
-                        if conditions.cfg_text_contexts and conditions.cfg_text_contexts[index] is not None
-                        else gen
-                    ),
-                    cfg_img_context=(
-                        conditions.cfg_img_contexts[index]
-                        if conditions.cfg_img_contexts and conditions.cfg_img_contexts[index] is not None
-                        else gen
-                    ),
-                    prompt=conditions.prompts[index] if conditions.prompts else None,
-                    image_shape=tuple(conditions.image_shapes[index]),
-                )
-            else:
-                condition = BagelDiffusionConditions(
-                    prompts=[conditions.prompts[index]],
-                    input_images=[conditions.input_images[index]] if conditions.input_images else [],
-                    image_shapes=[tuple(conditions.image_shapes[index])],
-                )
-            initial = initial_latents[index] if initial_latents is not None else None
-            segments.append(self.diffuse(condition, schedule=schedule, params=params, initial_latents=initial))
-        return stack_latent_segments(segments)
 
     @staticmethod
     def _merge_contexts(contexts: List[Any]) -> Dict[str, Any]:
@@ -640,8 +610,8 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
 
         bagel = self.model.model
         device = torch.device(self.model.device)
-        sde_set = set(int(i) for i in segment.sde_indices.tolist())
-        target = [int(i) for i in step_indices] if step_indices is not None else sorted(sde_set)
+        sde_set = set(segment.sde_indices.tolist())
+        target = list(step_indices) if step_indices is not None else sorted(sde_set)
         bad = [i for i in target if i not in sde_set]
         if bad:
             raise ValueError(
@@ -682,7 +652,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
                     t_cur=t_cur,
                     t_next=t_next,
                     sigma_max=sigma_max,
-                    eta=float(params.eta),
+                    eta=params.eta,
                     cfg_text_scale=cfg_text_scale,
                     cfg_img_scale=cfg_img_scale,
                     forward_kwargs=forward_kwargs,

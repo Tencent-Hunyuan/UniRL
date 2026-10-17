@@ -123,7 +123,7 @@ class MiniMaxH3Geometry:
     @classmethod
     def from_params(cls, params) -> "MiniMaxH3Geometry":
         """Resolve from a ``DiffusionSamplingParams``-shaped object."""
-        return cls.resolve(height=int(params.height), width=int(params.width), num_frames=int(params.num_frames))
+        return cls.resolve(height=params.height, width=params.width, num_frames=params.num_frames)
 
 
 def build_t2va_layout(geometry: MiniMaxH3Geometry, num_text_tokens: int) -> MiniMaxH3PackedSequence:

@@ -233,7 +233,43 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
             transformer._check_inputs = _orig_check
 
         if state is not None:
-            self._update_state(transformer, output, conditions, state, is_first=is_first)
+            fused = conditions.fused
+            assert fused is not None
+            _rope_info = [[] for _ in range(int(fused.input_ids.shape[0]))]
+            # Unbind stacked RoPE at the model boundary.
+            _cpe = None if fused.rope_cache is None else (fused.rope_cache[:, 0], fused.rope_cache[:, 1])
+            if is_first:
+                mk: Dict[str, Any] = {
+                    "mode": "gen_image",
+                    "attention_mask": fused.attention_mask,
+                    "position_ids": fused.position_ids,
+                    "image_mask": fused.gen_image_mask,
+                    "gen_timestep_scatter_index": fused.gen_timestep_scatter_index,
+                    "timesteps_index": fused.gen_timestep_scatter_index,
+                    "custom_pos_emb": _cpe,
+                    "rope_image_info": _rope_info,
+                }
+                if conditions.tokenizer_output is not None:
+                    mk["tokenizer_output"] = conditions.tokenizer_output
+            else:
+                mk = {
+                    "mode": "gen_image",
+                    "attention_mask": state.attention_mask,
+                    "position_ids": state.position_ids,
+                    "image_mask": fused.gen_image_mask,
+                    "gen_timestep_scatter_index": state.gen_timestep_scatter_index,
+                    "timesteps_index": state.gen_timestep_scatter_index,
+                    "custom_pos_emb": _cpe,
+                    "rope_image_info": _rope_info,
+                }
+            updated = transformer._update_model_kwargs_for_generation(output, mk)
+            state.past_key_values = updated.get("past_key_values")
+            if updated.get("position_ids") is not None:
+                state.position_ids = updated["position_ids"]
+            if updated.get("attention_mask") is not None:
+                state.attention_mask = updated["attention_mask"]
+            if updated.get("gen_timestep_scatter_index") is not None:
+                state.gen_timestep_scatter_index = updated["gen_timestep_scatter_index"]
 
         if isinstance(output, dict):
             pred = output["diffusion_prediction"]
@@ -250,54 +286,6 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
             result = pred
 
         return result
-
-    @staticmethod
-    def _update_state(
-        transformer,
-        output,
-        conditions: HunyuanImage3DiffusionConditions,
-        state: HunyuanImage3DiffusionState,
-        *,
-        is_first: bool,
-    ) -> None:
-        """Carry past_key_values + the gathered position/attention tensors"""
-        fused = conditions.fused
-        assert fused is not None
-        _rope_info = [[] for _ in range(int(fused.input_ids.shape[0]))]
-        # Unbind stacked RoPE at the model boundary.
-        _cpe = None if fused.rope_cache is None else (fused.rope_cache[:, 0], fused.rope_cache[:, 1])
-        if is_first:
-            mk: Dict[str, Any] = {
-                "mode": "gen_image",
-                "attention_mask": fused.attention_mask,
-                "position_ids": fused.position_ids,
-                "image_mask": fused.gen_image_mask,
-                "gen_timestep_scatter_index": fused.gen_timestep_scatter_index,
-                "timesteps_index": fused.gen_timestep_scatter_index,
-                "custom_pos_emb": _cpe,
-                "rope_image_info": _rope_info,
-            }
-            if conditions.tokenizer_output is not None:
-                mk["tokenizer_output"] = conditions.tokenizer_output
-        else:
-            mk = {
-                "mode": "gen_image",
-                "attention_mask": state.attention_mask,
-                "position_ids": state.position_ids,
-                "image_mask": fused.gen_image_mask,
-                "gen_timestep_scatter_index": state.gen_timestep_scatter_index,
-                "timesteps_index": state.gen_timestep_scatter_index,
-                "custom_pos_emb": _cpe,
-                "rope_image_info": _rope_info,
-            }
-        updated = transformer._update_model_kwargs_for_generation(output, mk)
-        state.past_key_values = updated.get("past_key_values")
-        if updated.get("position_ids") is not None:
-            state.position_ids = updated["position_ids"]
-        if updated.get("attention_mask") is not None:
-            state.attention_mask = updated["attention_mask"]
-        if updated.get("gen_timestep_scatter_index") is not None:
-            state.gen_timestep_scatter_index = updated["gen_timestep_scatter_index"]
 
     def forward(
         self,
@@ -398,31 +386,6 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
         )
 
 
-def _conditions_device_and_batch(
-    conditions: HunyuanImage3DiffusionConditions,
-    *,
-    guidance_scale: float,
-) -> Tuple[torch.device, int]:
-    """Resolve ``(device, batch_size)`` from the conditions container."""
-    fused = conditions.fused
-    if fused is None or fused.input_ids is None:
-        raise ValueError(
-            "HunyuanImage3DiffusionStage: conditions.fused.input_ids is None; cannot infer device / batch."
-        )
-    n = int(fused.input_ids.shape[0])
-    # Derive logical batch size before restacking CFG branches.
-    if conditions.fused_uncond is not None:
-        return fused.input_ids.device, n
-    cfg = 2 if guidance_scale > 1.0 else 1
-    if n % cfg != 0:
-        raise ValueError(
-            f"HunyuanImage3DiffusionStage: input_ids batch ({n}) is not a "
-            f"multiple of CFG factor ({cfg}). Did the pipeline forget to "
-            f"build CFG-batched inputs?"
-        )
-    return fused.input_ids.device, n // cfg
-
-
 def _expand_cfg_for_forward(conditions: HunyuanImage3DiffusionConditions) -> HunyuanImage3DiffusionConditions:
     """Re-stack the B-batched cond/uncond fused into the guided ``[cond; uncond]``"""
     fused_uncond = conditions.fused_uncond
@@ -497,10 +460,27 @@ class HunyuanImage3DiffusionStage(DiffusionStage[HunyuanImage3DiffusionCondition
         """Run full HunyuanImage3 DiT sampling. Returns a ``LatentSegment``."""
         from unirl.sde.noise import generate_latents
 
-        device, batch_size = _conditions_device_and_batch(conditions, guidance_scale=float(params.guidance_scale))
+        fused = conditions.fused
+        if fused is None or fused.input_ids is None:
+            raise ValueError(
+                "HunyuanImage3DiffusionStage: conditions.fused.input_ids is None; cannot infer device / batch."
+            )
+        device = fused.input_ids.device
+        n = int(fused.input_ids.shape[0])
+        if conditions.fused_uncond is not None:
+            batch_size = n
+        else:
+            cfg = 2 if params.guidance_scale > 1.0 else 1
+            if n % cfg != 0:
+                raise ValueError(
+                    f"HunyuanImage3DiffusionStage: input_ids batch ({n}) is not a "
+                    f"multiple of CFG factor ({cfg}). Did the pipeline forget to "
+                    f"build CFG-batched inputs?"
+                )
+            batch_size = n // cfg
         # Restack CFG branches after sizing initial noise.
         conditions = _expand_cfg_for_forward(conditions)
-        T = int(params.num_inference_steps)
+        T = params.num_inference_steps
         if int(schedule.shape[0]) != T + 1:
             raise ValueError(f"HunyuanImage3DiffusionStage.diffuse: schedule length {schedule.shape[0]} != T+1={T + 1}")
         schedule = schedule.to(device)
@@ -510,32 +490,32 @@ class HunyuanImage3DiffusionStage(DiffusionStage[HunyuanImage3DiffusionCondition
         info = None
         if ip is not None:
             if hasattr(ip, "build_image_info"):
-                info = ip.build_image_info(f"{int(params.height)}x{int(params.width)}")
+                info = ip.build_image_info(f"{params.height}x{params.width}")
             elif hasattr(ip, "build_gen_image_info"):
-                info = ip.build_gen_image_info(f"{int(params.height)}x{int(params.width)}")
+                info = ip.build_gen_image_info(f"{params.height}x{params.width}")
         if info is not None:
-            latent_h, latent_w = int(info.token_height), int(info.token_width)
-            snapped_hw = (latent_h * int(self.vae_scale_factor), latent_w * int(self.vae_scale_factor))
-            if snapped_hw != (int(params.height), int(params.width)):
+            latent_h, latent_w = info.token_height, info.token_width
+            snapped_hw = (latent_h * self.vae_scale_factor, latent_w * self.vae_scale_factor)
+            if snapped_hw != (params.height, params.width):
                 logger.warning(
                     "HunyuanImage3DiffusionStage.diffuse: requested %dx%d is not a supported HI3 preset; "
                     "snapped to %dx%d (nearest preset at ~%dpx base area).",
-                    int(params.height),
-                    int(params.width),
+                    params.height,
+                    params.width,
                     snapped_hw[0],
                     snapped_hw[1],
-                    int(self.vae_scale_factor) * latent_h,
+                    self.vae_scale_factor * latent_h,
                 )
         else:
-            latent_h = int(params.height) // int(self.vae_scale_factor)
-            latent_w = int(params.width) // int(self.vae_scale_factor)
-        per_sample_shape = (int(self.latent_channels), latent_h, latent_w)
+            latent_h = params.height // self.vae_scale_factor
+            latent_w = params.width // self.vae_scale_factor
+        per_sample_shape = (self.latent_channels, latent_h, latent_w)
         latents = None
         if params.noise_group_ids:
             latents = (
                 NoiseRecipe(
-                    noise_group_ids=[str(g) for g in params.noise_group_ids],
-                    base_seed=int(params.seed),
+                    noise_group_ids=list(params.noise_group_ids),
+                    base_seed=params.seed,
                 )
                 .for_batch(batch_size, latent_shape=per_sample_shape)
                 .resolve(device=device, dtype=self.trajectory_dtype)
@@ -546,13 +526,13 @@ class HunyuanImage3DiffusionStage(DiffusionStage[HunyuanImage3DiffusionCondition
                 latent_shape=per_sample_shape,
                 device=device,
                 dtype=self.trajectory_dtype,
-                init_same_noise=bool(params.init_same_noise),
-                samples_per_prompt=int(params.samples_per_prompt),
+                init_same_noise=params.init_same_noise,
+                samples_per_prompt=params.samples_per_prompt,
                 noise_group_ids=params.noise_group_ids,
                 base_seed=params.seed,
             )
 
-        sde_set: Set[int] = set(int(i) for i in (params.sde_indices or []))
+        sde_set: Set[int] = set(params.sde_indices or ())
         sde_sorted: List[int] = sorted(sde_set)
 
         needed: Set[int] = set(compute_trajectory_positions(sde_set, T))
@@ -576,7 +556,7 @@ class HunyuanImage3DiffusionStage(DiffusionStage[HunyuanImage3DiffusionCondition
         for i in range(T):
             sigma = schedule[i].to(device)
             sigma_next = schedule[i + 1].to(device)
-            step_eta = float(params.eta) if i in sde_set else 0.0
+            step_eta = params.eta if i in sde_set else 0.0
             noise_generators = None
             if step_eta > 0.0 and params.seed is not None and sde_sample_keys is not None:
                 if len(sde_sample_keys) != batch_size:
@@ -585,7 +565,7 @@ class HunyuanImage3DiffusionStage(DiffusionStage[HunyuanImage3DiffusionCondition
                         f"with batch_size={batch_size}, got {len(sde_sample_keys)}."
                     )
                 noise_generators = make_sde_step_generators(
-                    int(params.seed),
+                    params.seed,
                     sde_sample_keys,
                     i,
                 )
@@ -598,7 +578,7 @@ class HunyuanImage3DiffusionStage(DiffusionStage[HunyuanImage3DiffusionCondition
                     sample=latents,
                     sigma=sigma,
                     sigma_next=sigma_next,
-                    guidance_scale=float(params.guidance_scale),
+                    guidance_scale=params.guidance_scale,
                     eta=step_eta,
                     sigma_max=sigma_max,
                     step_index=i,
@@ -646,12 +626,8 @@ class HunyuanImage3DiffusionStage(DiffusionStage[HunyuanImage3DiffusionCondition
         # Restack CFG branches so replay matches guided rollout.
         conditions = _expand_cfg_for_forward(conditions)
 
-        sde_set = set(int(i) for i in segment.sde_indices.tolist())
-        target = (
-            [int(i) for i in step_indices]
-            if step_indices is not None
-            else [int(i) for i in segment.sde_indices.tolist()]
-        )
+        sde_set = set(segment.sde_indices.tolist())
+        target = list(step_indices) if step_indices is not None else segment.sde_indices.tolist()
         bad = [i for i in target if i not in sde_set]
         if bad:
             raise ValueError(
@@ -683,8 +659,8 @@ class HunyuanImage3DiffusionStage(DiffusionStage[HunyuanImage3DiffusionCondition
                     prev_sample=prev_sample,
                     sigma=sigma,
                     sigma_next=sigma_next,
-                    guidance_scale=float(params.guidance_scale),
-                    eta=float(params.eta),
+                    guidance_scale=params.guidance_scale,
+                    eta=params.eta,
                     sigma_max=sigma_max,
                     step_index=step_idx,
                 )
@@ -719,7 +695,7 @@ class HunyuanImage3DiffusionStage(DiffusionStage[HunyuanImage3DiffusionCondition
             sample,
             sigma,
             conditions,
-            guidance_scale=float(params.guidance_scale),
+            guidance_scale=params.guidance_scale,
         )
 
     def trainable_module(self) -> "torch.nn.Module":

@@ -62,9 +62,9 @@ class WAN22Pipeline(Pipeline):
     @classmethod
     def latent_shape(cls, *, model_config: Any, sampling_spec: Any) -> tuple:
         """Per-sample 5D latent shape ``(C, T_lat, H_lat, W_lat)`` for"""
-        height = int(sampling_spec.height)
-        width = int(sampling_spec.width)
-        num_frames = int(sampling_spec.num_frames)
+        height = sampling_spec.height
+        width = sampling_spec.width
+        num_frames = sampling_spec.num_frames
         if (num_frames - 1) % 4 != 0:
             raise ValueError(
                 f"WAN VAE temporal_downsample=4 requires "
@@ -84,7 +84,7 @@ class WAN22Pipeline(Pipeline):
         """Build the full pipeline from a config."""
         bundle = WAN22Bundle.from_config(config)
 
-        text_embed = WAN21TextEmbedStage(bundle, max_sequence_length=int(config.max_sequence_length))
+        text_embed = WAN21TextEmbedStage(bundle, max_sequence_length=config.max_sequence_length)
         step = WAN22DiffusionStep()
         diffusion = WAN22DiffusionStage(
             model=bundle,
@@ -100,7 +100,7 @@ class WAN22Pipeline(Pipeline):
             text_embed=text_embed,
             diffusion=diffusion,
             vae_decode=vae_decode,
-            shift=float(config.shift),
+            shift=config.shift,
         )
 
     def build_conditions(
@@ -147,8 +147,8 @@ class WAN22Pipeline(Pipeline):
             )
         images_prim = next((c for c in conditioning[1:] if isinstance(c, Images)), None)
 
-        primary_g = float(params.guidance_scale)
-        low_g = float(params.guidance_scale_2) if params.guidance_scale_2 is not None else primary_g
+        primary_g = params.guidance_scale
+        low_g = params.guidance_scale_2 if params.guidance_scale_2 is not None else primary_g
         effective_guidance = max(primary_g, low_g)
         wan_conds = self.build_conditions(texts, guidance_scale=effective_guidance)
 
@@ -159,14 +159,12 @@ class WAN22Pipeline(Pipeline):
                 )
             image_latent = WAN21ImageLatentEncodeStage(
                 self.bundle,
-                num_frames=int(params.num_frames),
-                height=int(params.height),
-                width=int(params.width),
+                num_frames=params.num_frames,
+                height=params.height,
+                width=params.width,
             ).encode(images_prim)
             image_embed = (
-                WAN21CLIPVisionEncodeStage(self.bundle).encode(images_prim)
-                if getattr(self.bundle, "uses_clip_vision", False)
-                else None
+                WAN21CLIPVisionEncodeStage(self.bundle).encode(images_prim) if self.bundle.uses_clip_vision else None
             )
             wan_conds = dataclasses.replace(
                 wan_conds,
