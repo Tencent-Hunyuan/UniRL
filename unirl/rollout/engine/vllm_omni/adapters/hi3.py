@@ -6,7 +6,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
-from unirl.models.hunyuan_image3.conditions import HunyuanImage3FusedMultimodalCondition
+from unirl.models.hunyuan_image3.conditions import HunyuanImage3FusedMultimodalCondition, split_cfg_fused
 from unirl.rollout.engine.vllm_omni.adapters.base import ModelAdapter, register_adapter
 from unirl.rollout.engine.vllm_omni.adapters.dit import DitOutputAdapter
 from unirl.rollout.engine.vllm_omni.backends import (
@@ -49,7 +49,12 @@ def trailing_gen_parts(sample: Sample, *params_types: type, caller: str) -> Tupl
     return trailing
 
 
-def hi3_fused_conditions(diff_outputs: List[OmniRawResult], *, modality: str) -> Dict[str, Any]:
+def hi3_fused_conditions(
+    diff_outputs: List[OmniRawResult],
+    *,
+    modality: str,
+    cfg: bool = False,
+) -> Dict[str, Any]:
     """The HI3 DiT replay conditions — concat the ``fused_mm_capture`` dicts."""
     captures = [read_captures(d).get("fused_mm_capture") for d in diff_outputs]
     if any(c is None for c in captures):
@@ -62,10 +67,14 @@ def hi3_fused_conditions(diff_outputs: List[OmniRawResult], *, modality: str) ->
             "the deploy config)."
         )
 
+    items = [HunyuanImage3FusedMultimodalCondition.from_dict(c) for c in captures]
+    if not cfg:
+        return {"fused": HunyuanImage3FusedMultimodalCondition.concat(items)}
+
+    splits = [split_cfg_fused(item, 1, cfg=True) for item in items]
     return {
-        "fused": HunyuanImage3FusedMultimodalCondition.concat(
-            [HunyuanImage3FusedMultimodalCondition.from_dict(c) for c in captures]
-        )
+        "fused": HunyuanImage3FusedMultimodalCondition.concat([cond for cond, _ in splits]),
+        "fused_uncond": HunyuanImage3FusedMultimodalCondition.concat([uncond for _, uncond in splits]),
     }
 
 
@@ -285,11 +294,11 @@ class Hi3ImageOutputAdapter(DitOutputAdapter):
         super().__init__(modality, stage_id=1)
 
     def build_conditions(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
-        del sample
         diff_outputs, _, _ = collect_dit_outputs(
             per_request, final_output_type=self.final_output_type, stage_id=self.stage_id, modality=self.modality
         )
-        return hi3_fused_conditions(diff_outputs, modality=self.modality)
+        cfg = sample.frontier_gen_part(DiffusionSamplingParams).sampling_params.guidance_scale > 1.0
+        return hi3_fused_conditions(diff_outputs, modality=self.modality, cfg=cfg)
 
     def build(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Sample:
         filled = super().build(sample, per_request)
@@ -320,11 +329,11 @@ class Hi3DitRecaptionOutputAdapter(DitOutputAdapter):
     """Single diffusion-Part response of the standalone HI3 DiT (Stage 0)."""
 
     def build_conditions(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Dict[str, Any]:
-        del sample
         diff_outputs, _, _ = collect_dit_outputs(
             per_request, final_output_type=self.final_output_type, stage_id=self.stage_id, modality=self.modality
         )
-        return hi3_fused_conditions(diff_outputs, modality=self.modality)
+        cfg = sample.frontier_gen_part(DiffusionSamplingParams).sampling_params.guidance_scale > 1.0
+        return hi3_fused_conditions(diff_outputs, modality=self.modality, cfg=cfg)
 
 
 @register_adapter("hi3_t2i")

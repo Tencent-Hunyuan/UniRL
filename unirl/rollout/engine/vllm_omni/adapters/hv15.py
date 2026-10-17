@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-import torch
-
 from unirl.rollout.engine.vllm_omni.adapters.base import ModelAdapter, register_adapter
 from unirl.rollout.engine.vllm_omni.adapters.dit import DitInputAdapter, DitOutputAdapter
 from unirl.rollout.engine.vllm_omni.backends import GenerateCall, OmniRawResult
@@ -58,14 +56,18 @@ class Hv15VideoOutputAdapter(DitOutputAdapter):
             ("negative_text_mllm", "negative_prompt_embeds", "negative_prompt_embeds_mask"),
             ("negative_text_glyph", "negative_prompt_embeds_2", "negative_prompt_embeds_mask_2"),
         ):
-            embeds = [c[embeds_key] for c in captures if c.get(embeds_key) is not None]
-            if embeds:
-                masks = [c[mask_key] for c in captures if c.get(mask_key) is not None]
-                cond_dict[cond_key] = TextEmbedCondition(
-                    embeds=torch.cat(embeds, dim=0),
-                    pooled=None,
-                    attn_mask=torch.cat(masks, dim=0) if masks else None,
-                )
+            items = [
+                TextEmbedCondition(embeds=c[embeds_key], attn_mask=c.get(mask_key))
+                for c in captures
+                if c.get(embeds_key) is not None
+            ]
+            if items:
+                if len(items) != len(captures):
+                    raise RuntimeError(
+                        f"build_response: HV1.5 {cond_key} captured on {len(items)}/{len(captures)} "
+                        "requests — conditioning must be uniform across a generate call."
+                    )
+                cond_dict[cond_key] = TextEmbedCondition.concat(items)
 
         if "text_mllm" not in cond_dict or "text_glyph" not in cond_dict:
             raise RuntimeError(self.MISSING_CAPTURE_MSG)
