@@ -21,6 +21,7 @@ from .base import (
     _reference_replay_means,
     _require_replay_anchor_for_batched_replay,
     _resolve_reference_model,
+    _slice_step_chunks,
     _transition_sigma,
     gather_sde_field,
     typed_conditions,
@@ -35,6 +36,7 @@ class FlowDPPOConfig(BaseAlgorithmConfig):
     add_kl_coefficient: bool = True
     beta: float = 0.0
     old_logp_source: str = "rollout"
+    timestep_chunk_size: Optional[int] = None
     params: Any = dc_field(default=None)
 
 
@@ -109,6 +111,7 @@ class FlowDPPO(StageAlgorithm):
         add_kl_coefficient: bool = True,
         beta: float = 0.0,
         old_logp_source: str = "rollout",
+        timestep_chunk_size: Optional[int] = None,
         backend: Any = None,
         conditions_cls: Optional[Type[Any]] = None,
     ) -> None:
@@ -127,6 +130,11 @@ class FlowDPPO(StageAlgorithm):
             self.old_logp_source in ("rollout", "replay"),
             f"FlowDPPO: old_logp_source must be 'rollout' or 'replay'; got {old_logp_source!r}",
         )
+        require(
+            timestep_chunk_size is None or timestep_chunk_size >= 1,
+            f"FlowDPPO: timestep_chunk_size must be >= 1; got {timestep_chunk_size!r}",
+        )
+        self.timestep_chunk_size = timestep_chunk_size
         _require_replay_anchor_for_batched_replay(self.stage, self.old_logp_source, algo="FlowDPPO")
         self.conditions_cls = conditions_cls
 
@@ -150,17 +158,22 @@ class FlowDPPO(StageAlgorithm):
                 "old_logp_source='replay'."
             )
         typed_conds = typed_conditions(conditions, self.conditions_cls)
+        logp_parts: List[torch.Tensor] = []
+        mean_parts: List[torch.Tensor] = []
         with torch.no_grad():
-            result = self.stage.replay(typed_conds, segment=segment, params=self.params, step_indices=target_steps)
+            for chunk in _slice_step_chunks(target_steps, self.timestep_chunk_size):
+                result = self.stage.replay(typed_conds, segment=segment, params=self.params, step_indices=chunk)
+                if result.prev_sample_means is None:
+                    raise RuntimeError(
+                        "FlowDPPO.prepare_segment: stage.replay() returned "
+                        "prev_sample_means=None. Ensure the stage's replay method "
+                        "produces means (required for KL-ADV masking)."
+                    )
+                logp_parts.append(result.log_probs.detach().cpu())
+                mean_parts.append(result.prev_sample_means.detach().cpu())
         if self.old_logp_source == "replay":
-            segment.sde_logp = result.log_probs.detach().cpu()
-        if result.prev_sample_means is None:
-            raise RuntimeError(
-                "FlowDPPO.prepare_segment: stage.replay() returned "
-                "prev_sample_means=None. Ensure the stage's replay method "
-                "produces means (required for KL-ADV masking)."
-            )
-        segment.sde_means = result.prev_sample_means.detach().cpu()
+            segment.sde_logp = torch.cat(logp_parts, dim=1)
+        segment.sde_means = torch.cat(mean_parts, dim=1)
 
     def compute_loss_and_backward(
         self,
@@ -176,78 +189,117 @@ class FlowDPPO(StageAlgorithm):
             return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
 
         typed_conds = typed_conditions(conditions, self.conditions_cls)
-        replay_result = self.stage.replay(
-            typed_conds,
-            segment=segment,
-            params=self.params,
-            step_indices=target_steps,
-        )
-        new_logp = replay_result.log_probs
-        new_means = replay_result.prev_sample_means
+        num_steps = len(target_steps)
+        chunks = _slice_step_chunks(target_steps, self.timestep_chunk_size)
+        total_loss = 0.0
+        kl_ref_total = 0.0
+        weighted_metrics: Dict[str, float] = {}
+        ratio_min = float("inf")
+        ratio_max = float("-inf")
+        kl_max = float("-inf")
+        new_logp_parts: List[torch.Tensor] = []
+        old_logp_parts: List[torch.Tensor] = []
 
-        if new_means is None:
-            raise RuntimeError(
-                "FlowDPPO requires stage.replay() to return prev_sample_means, "
-                "but got None. Ensure the stage's replay method produces means."
+        for chunk in chunks:
+            replay_result = self.stage.replay(
+                typed_conds,
+                segment=segment,
+                params=self.params,
+                step_indices=chunk,
+            )
+            new_logp = replay_result.log_probs
+            new_means = replay_result.prev_sample_means
+
+            if new_means is None:
+                raise RuntimeError(
+                    "FlowDPPO requires stage.replay() to return prev_sample_means, "
+                    "but got None. Ensure the stage's replay method produces means."
+                )
+
+            old_logp = gather_sde_field(segment.sde_logp, segment.sde_indices, chunk, field_name="sde_logp").to(
+                dtype=new_logp.dtype, device=new_logp.device
+            )
+            old_means = gather_sde_field(segment.sde_means, segment.sde_indices, chunk, field_name="sde_means").to(
+                dtype=new_means.dtype, device=new_means.device
             )
 
-        old_logp = gather_sde_field(segment.sde_logp, segment.sde_indices, target_steps, field_name="sde_logp").to(
-            dtype=new_logp.dtype, device=new_logp.device
-        )
-        old_means = gather_sde_field(segment.sde_means, segment.sde_indices, target_steps, field_name="sde_means").to(
-            dtype=new_means.dtype, device=new_means.device
-        )
+            sigma_t = self._compute_sigma_t(segment, chunk, device=new_logp.device)
+            adv_b = (
+                advantages.detach().to(dtype=new_logp.dtype, device=new_logp.device).reshape(-1, 1).expand_as(new_logp)
+            )
 
-        sigma_t = self._compute_sigma_t(segment, target_steps, device=new_logp.device)
+            loss_per_elem, chunk_metrics = _flowdppo_kl_adv_loss(
+                new_logp=new_logp,
+                old_logp=old_logp,
+                new_means=new_means,
+                old_means=old_means,
+                advantages=adv_b,
+                sigma_t=sigma_t,
+                kl_mask_threshold=self.kl_mask_threshold,
+            )
 
-        adv_b = advantages.detach().to(dtype=new_logp.dtype, device=new_logp.device).reshape(-1, 1).expand_as(new_logp)
+            chunk_loss = loss_per_elem.mean()
+            if self.beta > 0.0:
+                ref_means = _reference_replay_means(
+                    self.stage,
+                    self._ref_model,
+                    conditions=typed_conds,
+                    segment=segment,
+                    params=self.params,
+                    target_steps=chunk,
+                ).to(dtype=new_means.dtype, device=new_means.device)
+                kl_sigma_t = _transition_sigma(
+                    self.stage,
+                    segment=segment,
+                    target_steps=chunk,
+                    eta=self.params.eta,
+                    device=new_logp.device,
+                    add_coefficient=True,
+                )
+                kl_ref = _reference_kl_loss(new_means, ref_means, kl_sigma_t)
+                chunk_loss = chunk_loss + self.beta * kl_ref
+                kl_ref_total += float(kl_ref.detach().item()) * len(chunk)
 
-        loss_per_elem, ratio_metrics = _flowdppo_kl_adv_loss(
-            new_logp=new_logp,
-            old_logp=old_logp,
-            new_means=new_means,
-            old_means=old_means,
-            advantages=adv_b,
-            sigma_t=sigma_t,
-            kl_mask_threshold=self.kl_mask_threshold,
-        )
+            chunk_weight = 1.0 if len(chunks) == 1 else (len(chunk) / num_steps)
+            (chunk_loss * (loss_scale * chunk_weight)).backward()
+            total_loss += float(chunk_loss.detach().item()) * len(chunk)
+            new_logp_parts.append(new_logp.detach())
+            old_logp_parts.append(old_logp.detach())
+            for k, v in chunk_metrics.items():
+                val = float(v.item())
+                if k == "ratio_min":
+                    ratio_min = min(ratio_min, val)
+                elif k == "ratio_max":
+                    ratio_max = max(ratio_max, val)
+                elif k == "kl_new_old_max":
+                    kl_max = max(kl_max, val)
+                elif k != "ratio_std":
+                    weighted_metrics[k] = weighted_metrics.get(k, 0.0) + val * len(chunk)
 
-        policy_loss = loss_per_elem.mean()
-        loss = policy_loss
+        total_loss /= num_steps
+        new_logp_all = torch.cat(new_logp_parts, dim=1)
+        old_logp_all = torch.cat(old_logp_parts, dim=1)
+        ratio_all = torch.exp(new_logp_all - old_logp_all)
+        ratio_std = float(ratio_all.std().item()) if ratio_all.numel() > 1 else 0.0
+
         metrics: Dict[str, Any] = {
-            "policy_loss": float(policy_loss.detach().item()),
+            "policy_loss": total_loss,
             "kl_mask_threshold": float(self.kl_mask_threshold),
-            **{k: float(v.item()) for k, v in ratio_metrics.items()},
+            **{k: v / num_steps for k, v in weighted_metrics.items()},
+            "ratio_std": ratio_std,
+            "ratio_min": ratio_min,
+            "ratio_max": ratio_max,
+            "kl_new_old_max": kl_max,
         }
 
         if self.beta > 0.0:
-            ref_means = _reference_replay_means(
-                self.stage,
-                self._ref_model,
-                conditions=typed_conds,
-                segment=segment,
-                params=self.params,
-                target_steps=target_steps,
-            ).to(dtype=new_means.dtype, device=new_means.device)
-            kl_sigma_t = _transition_sigma(
-                self.stage,
-                segment=segment,
-                target_steps=target_steps,
-                eta=float(self.params.eta),
-                device=new_logp.device,
-                add_coefficient=True,
-            )
-            kl_ref = _reference_kl_loss(new_means, ref_means, kl_sigma_t)
-            loss = loss + self.beta * kl_ref
             metrics["beta"] = float(self.beta)
-            metrics["kl_ref_mean"] = float(kl_ref.detach().item())
-
-        (loss * loss_scale).backward()
+            metrics["kl_ref_mean"] = kl_ref_total / num_steps
 
         return AlgorithmStepResult(
-            loss=float(loss.detach().item()),
+            loss=total_loss,
             metrics=metrics,
-            num_steps_or_tokens=len(target_steps),
+            num_steps_or_tokens=num_steps,
             has_backward=True,
         )
 
@@ -255,7 +307,7 @@ class FlowDPPO(StageAlgorithm):
         """All SDE-recorded step indices on the segment."""
         if segment.sde_indices is None:
             return []
-        return [int(i) for i in segment.sde_indices.tolist()]
+        return segment.sde_indices.tolist()
 
     def _compute_sigma_t(
         self,
@@ -268,7 +320,7 @@ class FlowDPPO(StageAlgorithm):
             self.stage,
             segment=segment,
             target_steps=target_steps,
-            eta=float(self.params.eta),
+            eta=self.params.eta,
             device=device,
             add_coefficient=self.add_kl_coefficient,
         )

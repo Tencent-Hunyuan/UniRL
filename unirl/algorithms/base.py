@@ -298,6 +298,13 @@ def _resolve_reference_model(backend: Any, *, beta: float, algo: str, coef_name:
     return model
 
 
+def _slice_step_chunks(target_steps: List[int], chunk_size: Optional[int]) -> List[List[int]]:
+    """Slice ``target_steps`` into ``chunk_size`` windows (single full slice when ``None``)."""
+    if chunk_size is None:
+        return [target_steps]
+    return [target_steps[i : i + chunk_size] for i in range(0, len(target_steps), chunk_size)]
+
+
 def _require_replay_anchor_for_batched_replay(stage: Any, old_logp_source: str, *, algo: str) -> None:
     """Reject ``batch_replay_steps`` paired with a rollout-sourced π_old anchor."""
     if not getattr(stage, "batch_replay_steps", False):
