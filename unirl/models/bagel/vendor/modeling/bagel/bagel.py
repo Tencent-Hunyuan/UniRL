@@ -17,7 +17,7 @@ from unirl.models.bagel.vendor.data.data_utils import (
     get_flattened_position_ids_interpolate,
     patchify, 
 )
-from .qwen2_navit import NaiveCache, _apply_by_sequence, _sequence_lengths
+from .qwen2_navit import NaiveCache, _apply_by_sequence
 from .modeling_utils import MLPconnector, TimestepEmbedder, PositionEmbedding
 from unirl.models.bagel.vendor.modeling.cache_utils.taylorseer import cache_init
 
@@ -792,6 +792,7 @@ class Bagel(PreTrainedModel):
         model_pred_text_current: Optional[int] = None,
         model_pred_img_cache_dic: Optional[Dict[str, Any]] = None,
         model_pred_img_current: Optional[int] = None,
+        query_lengths: Optional[List[int]] = None,
     ):
         packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
         packed_sequence = packed_text_embedding.new_zeros((sum(packed_seqlens), self.hidden_size))
@@ -801,8 +802,7 @@ class Bagel(PreTrainedModel):
             raise ValueError(
                 f"timestep must contain one value per latent token, got {tuple(timestep.shape)} for {x_t.shape[0]}"
             )
-        query_lengths = _sequence_lengths(packed_seqlens)
-        latent_lengths = [length - 2 for length in query_lengths]
+        latent_lengths = [length - 2 for length in query_lengths] if query_lengths else None
         packed_pos_embed = _apply_by_sequence(
             self.latent_pos_embed,
             packed_vae_position_ids,
@@ -827,7 +827,8 @@ class Bagel(PreTrainedModel):
             extra_inputs = {
                 "mode": "gen",
                 "packed_vae_token_indexes": packed_vae_token_indexes,
-                "packed_text_indexes": packed_text_indexes
+                "packed_text_indexes": packed_text_indexes,
+                "sequence_lengths": query_lengths,
             }
         
         if self.language_model.model.enable_taylorseer:

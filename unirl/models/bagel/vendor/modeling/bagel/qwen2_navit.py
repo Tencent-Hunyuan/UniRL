@@ -233,27 +233,24 @@ def pad_sequence(tensor, pad_size):
     return torch.cat([tensor, pad_tensor], dim=1)
 
 
-def _sequence_lengths(query_lens) -> List[int]:
-    if isinstance(query_lens, torch.Tensor):
-        return [int(length) for length in query_lens.tolist()]
-    return [int(length) for length in query_lens]
-
-
-def _apply_by_sequence(module, packed_tensor, query_lens):
-    lengths = _sequence_lengths(query_lens)
-    if len(lengths) <= 1:
+def _apply_by_sequence(module, packed_tensor, sequence_lengths: Optional[List[int]] = None):
+    if not sequence_lengths or len(sequence_lengths) <= 1:
         return module(packed_tensor)
-    return torch.cat([module(chunk) for chunk in packed_tensor.split(lengths, dim=0)], dim=0)
+    return torch.cat([module(chunk) for chunk in packed_tensor.split(sequence_lengths, dim=0)], dim=0)
 
 
-def _apply_selected_by_sequence(module, packed_tensor, selected_indexes, query_lens):
-    lengths = _sequence_lengths(query_lens)
-    if len(lengths) <= 1:
+def _apply_selected_by_sequence(
+    module,
+    packed_tensor,
+    selected_indexes,
+    sequence_lengths: Optional[List[int]] = None,
+):
+    if not sequence_lengths or len(sequence_lengths) <= 1:
         return module(packed_tensor[selected_indexes])
 
     outputs = []
     offset = 0
-    for length in lengths:
+    for length in sequence_lengths:
         end = offset + length
         mask = (selected_indexes >= offset) & (selected_indexes < end)
         indexes = selected_indexes[mask]
@@ -550,6 +547,7 @@ class PackedAttentionMoT(Qwen2Attention):
         mode="und",
         packed_vae_token_indexes=None,
         packed_text_indexes=None,
+        sequence_lengths: Optional[List[int]] = None,
     ):
         if mode == 'und':
             packed_query_states = self.q_proj(packed_query_sequence).view(-1, self.num_heads, self.head_dim)
@@ -564,24 +562,24 @@ class PackedAttentionMoT(Qwen2Attention):
             packed_value_states = packed_query_sequence.new_zeros((packed_query_sequence.shape[0], self.num_key_value_heads * self.head_dim))
 
             packed_query_states[packed_text_indexes] = _apply_selected_by_sequence(
-                self.q_proj, packed_query_sequence, packed_text_indexes, query_lens
+                self.q_proj, packed_query_sequence, packed_text_indexes, sequence_lengths
             )
             packed_query_states[packed_vae_token_indexes] = _apply_selected_by_sequence(
-                self.q_proj_moe_gen, packed_query_sequence, packed_vae_token_indexes, query_lens
+                self.q_proj_moe_gen, packed_query_sequence, packed_vae_token_indexes, sequence_lengths
             )
 
             packed_key_states[packed_text_indexes] = _apply_selected_by_sequence(
-                self.k_proj, packed_query_sequence, packed_text_indexes, query_lens
+                self.k_proj, packed_query_sequence, packed_text_indexes, sequence_lengths
             )
             packed_key_states[packed_vae_token_indexes] = _apply_selected_by_sequence(
-                self.k_proj_moe_gen, packed_query_sequence, packed_vae_token_indexes, query_lens
+                self.k_proj_moe_gen, packed_query_sequence, packed_vae_token_indexes, sequence_lengths
             )
 
             packed_value_states[packed_text_indexes] = _apply_selected_by_sequence(
-                self.v_proj, packed_query_sequence, packed_text_indexes, query_lens
+                self.v_proj, packed_query_sequence, packed_text_indexes, sequence_lengths
             )
             packed_value_states[packed_vae_token_indexes] = _apply_selected_by_sequence(
-                self.v_proj_moe_gen, packed_query_sequence, packed_vae_token_indexes, query_lens
+                self.v_proj_moe_gen, packed_query_sequence, packed_vae_token_indexes, sequence_lengths
             )
 
             packed_query_states = packed_query_states.view(-1, self.num_heads, self.head_dim)
@@ -649,10 +647,10 @@ class PackedAttentionMoT(Qwen2Attention):
             # zeros_like pattern; this mirrors flow_grpo's identical fix. Math is unchanged.
             packed_attn_output_ = torch.zeros_like(packed_attn_output)
             packed_attn_output_[packed_text_indexes] = _apply_selected_by_sequence(
-                self.o_proj, packed_attn_output, packed_text_indexes, query_lens
+                self.o_proj, packed_attn_output, packed_text_indexes, sequence_lengths
             )
             packed_attn_output_[packed_vae_token_indexes] = _apply_selected_by_sequence(
-                self.o_proj_moe_gen, packed_attn_output, packed_vae_token_indexes, query_lens
+                self.o_proj_moe_gen, packed_attn_output, packed_vae_token_indexes, sequence_lengths
             )
             packed_attn_output = packed_attn_output_
 
@@ -831,6 +829,7 @@ class Qwen2MoTDecoderLayer(nn.Module):
         mode="und",
         packed_vae_token_indexes=None,
         packed_text_indexes=None,
+        sequence_lengths: Optional[List[int]] = None,
     ) -> BaseNavitOutputWithPast:
         
         enable_taylorseer = getattr(self, 'enable_taylorseer', False)
@@ -863,6 +862,7 @@ class Qwen2MoTDecoderLayer(nn.Module):
                 mode=mode,
                 packed_vae_token_indexes=packed_vae_token_indexes,
                 packed_text_indexes=packed_text_indexes,
+                sequence_lengths=sequence_lengths,
             )
             packed_query_sequence = residual + packed_query_sequence
 
@@ -877,7 +877,7 @@ class Qwen2MoTDecoderLayer(nn.Module):
                     lambda values: self.mlp(self.post_attention_layernorm(values).to(torch.bfloat16)),
                     packed_query_sequence,
                     packed_text_indexes,
-                    query_lens,
+                    sequence_lengths,
                 )
                 packed_query_sequence_[packed_vae_token_indexes] = _apply_selected_by_sequence(
                     lambda values: self.mlp_moe_gen(
@@ -885,7 +885,7 @@ class Qwen2MoTDecoderLayer(nn.Module):
                     ),
                     packed_query_sequence,
                     packed_vae_token_indexes,
-                    query_lens,
+                    sequence_lengths,
                 )
                 packed_query_sequence = packed_query_sequence_
 
@@ -1099,6 +1099,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
         mode="und",
         packed_vae_token_indexes=None,
         packed_text_indexes=None,
+        sequence_lengths: Optional[List[int]] = None,
     ) -> BaseNavitOutputWithPast:
         
         enable_taylorseer = getattr(self, 'enable_taylorseer', False)
@@ -1121,6 +1122,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 extra_inputs.update(
                     packed_vae_token_indexes=packed_vae_token_indexes,
                     packed_text_indexes=packed_text_indexes,
+                    sequence_lengths=sequence_lengths,
                 )
 
         for layer_idx, decoder_layer in enumerate(self.layers):

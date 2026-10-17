@@ -643,6 +643,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
             )
             forward_kwargs = self._forward_kwargs(packed_gen, cfg_text, cfg_img, gi, gi_cfg_text, gi_cfg_img, params)
             num_tokens = gi["packed_vae_token_indexes"].numel() // repeats
+            forward_kwargs["query_lengths"] = [num_tokens + 2] * repeats
             x_t = torch.stack([segment.latents_at(i)[0][:num_tokens].to(device) for i in target])
             prev_sample = torch.stack([segment.latents_at(i + 1)[0][:num_tokens].to(device) for i in target])
             t_cur = torch.stack([schedule[i] for i in target])
