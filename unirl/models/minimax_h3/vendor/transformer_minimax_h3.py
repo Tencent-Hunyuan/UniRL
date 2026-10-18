@@ -34,11 +34,6 @@ logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 MINIMAX_H3_MODALITY_NUM = 3
 
 
-def _select_rows(table: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
-    selected = table.index_select(0, indices.reshape(-1))
-    return selected.reshape(*indices.shape, table.shape[-1])
-
-
 @dataclass
 class MiniMaxH3TransformerOutput(BaseOutput):
     r"""
@@ -152,7 +147,7 @@ class MiniMaxH3AdaLayerNormOut(nn.Module):
         shift, scale = self.linear(nn.functional.silu(temb).to(self.linear.weight.dtype)).chunk(2, dim=-1)
         # The modulation itself stays at the block stack's precision; `forward` casts to the output heads' dtype.
         hidden_states = self.norm(hidden_states)
-        return hidden_states * (1.0 + _select_rows(scale, timestep_indices)) + _select_rows(shift, timestep_indices)
+        return hidden_states * (1.0 + scale[timestep_indices]) + shift[timestep_indices]
 
 
 class MiniMaxH3AttnProcessor:
@@ -355,19 +350,15 @@ class MiniMaxH3TransformerBlock(nn.Module):
 
         residual = hidden_states
         norm_hidden_states = self.norm1(hidden_states)
-        norm_hidden_states = norm_hidden_states * (1.0 + _select_rows(scale_msa, adaln_indices)) + _select_rows(
-            shift_msa, adaln_indices
-        )
+        norm_hidden_states = norm_hidden_states * (1.0 + scale_msa[adaln_indices]) + shift_msa[adaln_indices]
         attn_output = self.attn(norm_hidden_states, rotary_emb, attention_mask)
-        hidden_states = residual + _select_rows(gate_msa, adaln_indices) * attn_output
+        hidden_states = residual + gate_msa[adaln_indices] * attn_output
 
         residual = hidden_states
         norm_hidden_states = self.norm2(hidden_states)
-        norm_hidden_states = norm_hidden_states * (1.0 + _select_rows(scale_mlp, adaln_indices)) + _select_rows(
-            shift_mlp, adaln_indices
-        )
+        norm_hidden_states = norm_hidden_states * (1.0 + scale_mlp[adaln_indices]) + shift_mlp[adaln_indices]
         ff_output = self.ff(norm_hidden_states)
-        hidden_states = residual + _select_rows(gate_mlp, adaln_indices) * ff_output
+        hidden_states = residual + gate_mlp[adaln_indices] * ff_output
 
         return hidden_states
 

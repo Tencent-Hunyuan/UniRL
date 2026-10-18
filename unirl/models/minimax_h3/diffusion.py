@@ -304,7 +304,7 @@ class MiniMaxH3DiffusionStage(BatchedStepReplayMixin, DiffusionStage[MiniMaxH3Co
         targets = list(step_indices) if step_indices is not None else stored
 
         if self.batch_replay_steps and len(targets) > 1 and isinstance(self.video_strategy, SDEStrategy):
-            return self._replay_batched_joint_av_steps(
+            return self.replay_batched_joint_av_steps(
                 conditions,
                 segment=segment,
                 params=params,
@@ -320,11 +320,10 @@ class MiniMaxH3DiffusionStage(BatchedStepReplayMixin, DiffusionStage[MiniMaxH3Co
                     audio_sigma=a_sigma,
                     layout=layout,
                 ),
-                video_strategy=self.video_strategy,
+                audio_in_policy=self.audio_joint_sde,
                 audio_strategy=self.audio_strategy,
                 audio_sigmas=audio_sigmas,
                 audio_sigma_max=audio_sigma_max,
-                audio_in_policy=self.audio_joint_sde,
             )
 
         log_probs: List[torch.Tensor] = []

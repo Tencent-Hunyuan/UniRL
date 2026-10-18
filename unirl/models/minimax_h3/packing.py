@@ -148,8 +148,8 @@ def row_timestep_plan(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """``(unique_timesteps, timestep_indices)`` for one denoising step."""
     if video_sigma.numel() == 1 and audio_sigma.numel() == 1:
-        video_t = float(1.0 - float(video_sigma))
-        audio_t = float(1.0 - float(audio_sigma))
+        video_t = 1.0 - float(video_sigma)
+        audio_t = 1.0 - float(audio_sigma)
         return build_row_timesteps(
             layout,
             video_timestep=video_t,

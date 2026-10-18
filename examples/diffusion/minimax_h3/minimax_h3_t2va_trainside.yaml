@@ -38,8 +38,6 @@ bundle:
     audio_vae_dtype: fp32
     trajectory_precision: fp16
     logprob_precision: fp32
-    # Opt-in step-major replay batching; leave false unless sparse sde_indices leave enough activation memory.
-    batch_replay_steps: false
     video_shift: 12.0
     audio_shift: 3.0
     audio_joint_sde: true
