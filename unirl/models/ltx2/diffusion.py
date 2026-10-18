@@ -8,9 +8,10 @@ from typing import ClassVar, List, Optional, Set, Tuple
 
 import torch
 
+from unirl.models.types.batched_replay import BatchedStepReplayMixin
 from unirl.models.types.diffusion import DiffusionStage, DiffusionStep, combine_modality_logp
 from unirl.models.types.replay_result import ReplayResult
-from unirl.sde.kernels import StepStrategy
+from unirl.sde.kernels import SDEStrategy, StepStrategy
 from unirl.sde.noise import make_denoise_step_generators
 from unirl.types.sampling import DiffusionSamplingParams, compute_trajectory_positions
 from unirl.types.segments.latent import LatentSegment, make_video_segment
@@ -156,7 +157,7 @@ class LTX2DiffusionStep(DiffusionStep[LTX2Bundle, LTX2Conditions]):
         return video_pred, audio_pred
 
 
-class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
+class LTX2DiffusionStage(BatchedStepReplayMixin, DiffusionStage[LTX2Conditions]):
     """LTX2 diffusion stage — owns the denoising loop and replay."""
 
     _no_split_modules: ClassVar[List[str]] = ["LTX2VideoTransformerBlock"]
@@ -170,6 +171,7 @@ class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
         trajectory_precision: str = "fp16",
         logprob_precision: str = "fp32",
         audio_joint_sde: bool = True,
+        batch_replay_steps: bool,
     ) -> None:
         self.bundle = bundle
         self.step_kernel = LTX2DiffusionStep()
@@ -179,6 +181,7 @@ class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="logprob_precision")
         self.audio_joint_sde = bool(audio_joint_sde)
         self._audio_in_policy = self.audio_joint_sde and bundle.has_audio
+        self.batch_replay_steps = batch_replay_steps
 
     def trainable_module(self) -> torch.nn.Module:
         """The trainable transformer (for FSDP wrapping)."""
@@ -368,6 +371,33 @@ class LTX2DiffusionStage(DiffusionStage[LTX2Conditions]):
         autocast_ctx = (
             torch.autocast("cuda", dtype=self.autocast_dtype) if self.autocast_dtype != torch.float32 else nullcontext()
         )
+
+        if self.batch_replay_steps and len(target) > 1 and isinstance(self.strategy, SDEStrategy):
+            with autocast_ctx:
+                return self.replay_batched_joint_av_steps(
+                    conditions,
+                    segment=segment,
+                    params=params,
+                    target=target,
+                    sigmas=sigmas,
+                    sigma_max=sigma_max,
+                    device=device,
+                    predict_av_noise=lambda tiled, v_all, a_all, v_sigma, _a_sigma: self.step_kernel.predict_noise(
+                        self.bundle,
+                        v_all,
+                        v_sigma,
+                        tiled,
+                        guidance_scale=guidance_scale,
+                        latent_num_frames=latent_t,
+                        latent_height=latent_h,
+                        latent_width=latent_w,
+                        audio_sample=a_all,
+                        audio_num_frames=audio_t,
+                    ),
+                    audio_in_policy=self._audio_in_policy,
+                    concat_audio_mean=True,
+                    latent_dtype=self.trajectory_dtype,
+                )
 
         with autocast_ctx:
             for step_idx in target:
