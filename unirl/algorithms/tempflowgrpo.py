@@ -79,23 +79,25 @@ class TempFlowGRPO(PerSampleStepGRPO):
             raise ValueError(
                 f"TempFlowGRPO: branch_steps_per_rollout must be >= 1 or None; got {branch_steps_per_rollout!r}."
             )
-        if not float(weight_scale) > 0.0:
-            raise ValueError(f"TempFlowGRPO: weight_scale must be > 0; got {weight_scale!r}.")
-        if not float(params.eta) > 0.0:
-            raise ValueError("TempFlowGRPO requires params.eta > 0 on branch steps.")
         self.weight_scale = float(weight_scale)
+        if not self.weight_scale > 0.0:
+            raise ValueError(f"TempFlowGRPO: weight_scale must be > 0; got {weight_scale!r}.")
+        if not params.eta > 0.0:
+            raise ValueError("TempFlowGRPO requires params.eta > 0 on branch steps.")
 
-    def _row_weights(self, *, segment: LatentSegment, device: torch.device) -> torch.Tensor:
+    def row_weights(self, *, segment: LatentSegment, device: torch.device) -> torch.Tensor:
         """``weight_scale * transition_std`` (``std_dev_t * sqrt(-dt)``) at each row's branch step ``[N, 1]``."""
         if segment.sigmas is None:
             raise ValueError("TempFlowGRPO requires segment.sigmas to compute the noise-aware weights.")
+        if segment.sigmas.shape[0] < 2:
+            raise ValueError(f"TempFlowGRPO requires sigmas length >= 2; got {segment.sigmas.shape[0]}.")
         sigmas = segment.sigmas.to(device=device, dtype=torch.float32)
         steps = segment.sde_index_per_sample.to(device=device, dtype=torch.long)
         std = self.stage.strategy.transition_std(
             sigma=sigmas[steps],
             sigma_next=sigmas[steps + 1],
             eta=self.params.eta,
-            sigma_max=sigmas[1] if int(sigmas.shape[0]) > 1 else torch.tensor(0.99, device=device, dtype=sigmas.dtype),
+            sigma_max=sigmas[1],
         )
         return (self.weight_scale * std).reshape(-1, 1)
 

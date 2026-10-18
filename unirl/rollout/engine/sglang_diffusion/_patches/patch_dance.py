@@ -119,14 +119,11 @@ def _flow_sde_sampling_with_unirl_variants(
 
     elif effective_sde_type == "flash":
         # Flash coefficient sigma_min + (sigma_max - sigma_min) * sigma; see _patches/README.md.
+        # Upstream FlowMatchEulerDiscreteScheduler terminates at sigma_min = 0.0, so std_dev_t = sigma_max * sigma * eta.
         model_output = model_output.float()
         sample = sample.float()
         variance_noise = self._rollout_variance_noise(batch, model_output, generator)
-        sigma_min_raw = getattr(rollout_session_data, "sigma_min", None)
-        sigma_min = current_sigma.new_tensor(0.0 if sigma_min_raw is None else float(sigma_min_raw))
-        sigma_max_raw = rollout_session_data.sigma_max
-        sigma_max = sigma_max_raw if torch.is_tensor(sigma_max_raw) else current_sigma.new_tensor(float(sigma_max_raw))
-        std_dev_t = (sigma_min + (sigma_max - sigma_min) * current_sigma) * noise_level
+        std_dev_t = rollout_session_data.sigma_max * current_sigma * noise_level
         noise_std_dev = std_dev_t * torch.sqrt(-1 * dt)
         prev_sample_mean = (
             sample * (1 + std_dev_t**2 / (2 * current_sigma) * dt)

@@ -515,10 +515,12 @@ without driver-authored x_T. `media_log_interval` does not apply
   so duplicate root ids or an empty root part yield fewer groups than rows and would silently
   collapse the whole batch onto one request and one sigma. The trainer compares the two counts
   and raises instead.
-- **A merged FlashGRPO track's shared fields are not per-sample truth.** `Segment.concat` keeps each
-  `shared_field` from the first group, so `sde_indices` and `indices` on the merged track name one
-  group's steps only. `sde_index_per_sample` (a `CONCAT` field) is the authoritative per-sample step;
-  replay that reads it must index fixed latent slots, not `latents_at()`.
+- **A merged FlashGRPO track's shared fields are not per-sample truth.** `_stamp_sde_index_per_sample`
+  rewrites each step group's `segment.latents` to fixed `[before, after, final]` slots, normalizes
+  `segment.indices` / `segment.sde_indices`, and clears `frontier.sampling_params.sde_indices` so
+  `Sample.concat` / `Part.concat` can merge the groups. `sde_index_per_sample` (a `CONCAT` field) is
+  the authoritative per-sample step; `PerSampleStepReplayMixin.replay_per_sample` indexes fixed
+  latent slots `[:, 0]` / `[:, 1]`, not `latents_at()`.
 - **The SDE candidate pool must not reach the final denoising step.** Step `T-1` stores two trajectory
   latents where earlier steps store three, and `torch.cat` cannot merge different `K`. The trainer
   raises at build time rather than failing mid-rollout. Keep the scheduler's `timestep_fraction` end
@@ -532,7 +534,8 @@ without driver-authored x_T. `media_log_interval` does not apply
   carrying all prompts with `sde_indices=[step]`. A branch is a plain trajectory: x_T is keyed by
   `(prompt, seed)`, so the `branches_per_seed` rows of a seed run the same deterministic ODE prefix
   and split only at their step. That needs the driver-authored x_T, so the trainer raises without
-  it. Step groups offset their branch ordinals so sample ids stay unique after the merge.
+  it. Step groups offset their branch ordinals so sample ids stay unique, and merge via
+  `Part.concat` onto the shared root prompt prefix.
 - **TempFlowGRPO takes advantages before the merge, per step group.** Its rewards are normalized
   within one branch step (per prompt, or per seed with `advantage_group: seed`), the opposite of
   FlashGRPO, where the groups merge first. Merging first would mix steps whose reward spreads differ.

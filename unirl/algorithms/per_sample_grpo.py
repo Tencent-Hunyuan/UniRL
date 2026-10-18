@@ -15,7 +15,7 @@ from .flowgrpo import FlowGRPO
 
 
 class PerSampleStepGRPO(FlowGRPO):
-    """Shared loss of FlashGRPO and TempFlowGRPO; subclasses define ``_row_weights`` (README)."""
+    """Shared loss of FlashGRPO and TempFlowGRPO; subclasses define ``row_weights`` (README)."""
 
     # The trainer reads this to fan one rollout into per-step generates and stamp
     # ``segment.sde_index_per_sample`` before merging the groups into one track.
@@ -56,9 +56,9 @@ class PerSampleStepGRPO(FlowGRPO):
             backend=backend,
             conditions_cls=conditions_cls,
         )
-        if not float(adv_clip_max) > 0.0:
-            raise ValueError(f"{name}: adv_clip_max must be > 0; got {adv_clip_max!r}.")
         self.adv_clip_max = float(adv_clip_max)
+        if not self.adv_clip_max > 0.0:
+            raise ValueError(f"{name}: adv_clip_max must be > 0; got {adv_clip_max!r}.")
         # The trainer stamps sde_index_per_sample, so a stage whose replay ignores it
         # would score every row at one group's sigma.
         if not getattr(self.stage, "supports_per_sample_sde_index", False):
@@ -67,7 +67,7 @@ class PerSampleStepGRPO(FlowGRPO):
                 f"{type(self.stage).__name__} does not. Use FlowGRPO, or implement the "
                 "per-sample replay on that stage and declare supports_per_sample_sde_index."
             )
-        strategy = getattr(self.stage, "strategy", None)
+        strategy = self.stage.strategy
         if not isinstance(strategy, self.required_strategy):
             raise ValueError(
                 f"{name} requires the stage strategy to be {self.required_strategy.__name__}; "
@@ -89,7 +89,7 @@ class PerSampleStepGRPO(FlowGRPO):
             raise ValueError(f"{name} requires segment.sde_index_per_sample; the rollout was not split per step.")
         target_steps = self._resolve_target_steps(segment)
         if not target_steps:
-            return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
+            raise ValueError(f"{name} requires segment.sde_indices to be non-empty.")
 
         typed_conds = typed_conditions(conditions, self.conditions_cls)
         replay_result = self.stage.replay(
@@ -114,8 +114,8 @@ class PerSampleStepGRPO(FlowGRPO):
             clip_range=clip_range,
         )
 
-        weights = self._row_weights(segment=segment, device=new_logp.device)
-        weights = weights.to(dtype=loss_per_elem.dtype, device=loss_per_elem.device)
+        weights = self.row_weights(segment=segment, device=new_logp.device)
+        weights = weights.to(dtype=loss_per_elem.dtype)
         loss_per_elem = loss_per_elem * weights
         loss = loss_per_elem.mean()
         (loss * loss_scale).backward()
@@ -131,7 +131,7 @@ class PerSampleStepGRPO(FlowGRPO):
         }
         metric_values = torch.stack([value.float() for value in metric_tensors.values()]).cpu().tolist()
         metrics: Dict[str, Any] = dict(zip(metric_tensors, metric_values))
-        metrics["clip_range"] = float(clip_range)
+        metrics["clip_range"] = clip_range
 
         return AlgorithmStepResult(
             loss=metrics["policy_loss"],
@@ -140,7 +140,7 @@ class PerSampleStepGRPO(FlowGRPO):
             has_backward=True,
         )
 
-    def _row_weights(self, *, segment: LatentSegment, device: torch.device) -> torch.Tensor:
+    def row_weights(self, *, segment: LatentSegment, device: torch.device) -> torch.Tensor:
         """Per-row loss weight ``[N, 1]`` at each row's own SDE step."""
         raise NotImplementedError
 

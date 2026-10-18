@@ -327,7 +327,7 @@ class SD3DiffusionStage(PerSampleStepReplayMixin, BatchedStepReplayMixin, Diffus
     ) -> ReplayResult:
         """Log-prob replay: ``log_probs [B, len(target)]``, ``prev_sample_means [B, len(target), C, H, W]``."""
         if segment.sde_index_per_sample is not None:
-            return self._replay_per_sample(
+            return self.replay_per_sample(
                 conditions, segment=segment, params=params, device=torch.device(self.model.device)
             )
         if segment.sde_indices is None or segment.latents is None:

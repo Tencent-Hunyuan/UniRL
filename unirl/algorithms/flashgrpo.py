@@ -25,13 +25,13 @@ class FlashGRPOConfig(BaseAlgorithmConfig):
     old_logp_source: str = "rollout"
     adv_clip_max: float = 5.0
     params: Any = dc_field(default=None)
-    rectification_indices: Optional[List[int]] = None
+    rectification_indices: List[int] = dc_field(default_factory=list)
 
 
 class FlashGRPO(PerSampleStepGRPO):
     """FlowGRPO whose loss is scaled by the Flash-GRPO temporal-gradient-rectification coefficient."""
 
-    # Stratify one SDE step per prompt; the rectification hard-codes the Flash std_dev_t.
+    # Stratify one SDE step per prompt; the rectification uses FlashSDEStrategy.transition_std.
     per_sample_sde_layout = "stratified"
     required_strategy = FlashSDEStrategy
     weight_metric = "flash_tgr"
@@ -40,6 +40,7 @@ class FlashGRPO(PerSampleStepGRPO):
         self,
         *,
         params: Any,
+        rectification_indices: Sequence[int],
         stage: Any = None,
         pipeline: Any = None,
         stage_attr: str = "diffusion",
@@ -48,7 +49,6 @@ class FlashGRPO(PerSampleStepGRPO):
         beta: float = 0.0,
         old_logp_source: str = "rollout",
         adv_clip_max: float = 5.0,
-        rectification_indices: Optional[Sequence[int]] = None,
         backend: Any = None,
         conditions_cls: Optional[Type[Any]] = None,
     ) -> None:
@@ -65,9 +65,14 @@ class FlashGRPO(PerSampleStepGRPO):
             backend=backend,
             conditions_cls=conditions_cls,
         )
-        self.rectification_indices = None if rectification_indices is None else [int(i) for i in rectification_indices]
+        if not rectification_indices:
+            raise ValueError(
+                "FlashGRPO per-sample rectification requires rectification_indices (the shared "
+                "candidate timestep pool) to normalize against; got empty."
+            )
+        self.rectification_indices = [int(i) for i in rectification_indices]
 
-    def _row_weights(
+    def row_weights(
         self,
         *,
         segment: LatentSegment,
@@ -76,16 +81,9 @@ class FlashGRPO(PerSampleStepGRPO):
         """Per-sample rectification weights ``[N, 1]``, normalized over the required candidate pool."""
         if segment.sigmas is None:
             raise ValueError("FlashGRPO requires segment.sigmas to compute temporal rectification weights.")
-        if self.rectification_indices is None:
-            raise ValueError(
-                "FlashGRPO per-sample rectification requires rectification_indices (the shared "
-                "candidate timestep pool) to normalize against; got None."
-            )
         sigmas = segment.sigmas.to(device=device, dtype=torch.float32)
-        weights = self._rectification_coefficients(
-            sigmas=sigmas, steps=segment.sde_index_per_sample.to(device=device, dtype=torch.long), device=device
-        )
-        norm = self._rectification_coefficients(sigmas=sigmas, steps=list(self.rectification_indices), device=device)
+        weights = self._rectification_coefficients(sigmas=sigmas, steps=segment.sde_index_per_sample, device=device)
+        norm = self._rectification_coefficients(sigmas=sigmas, steps=self.rectification_indices, device=device)
         weights = weights / norm.detach().mean().clamp_min(torch.finfo(torch.float32).eps)
         return weights.reshape(-1, 1)
 
@@ -97,18 +95,22 @@ class FlashGRPO(PerSampleStepGRPO):
         device: torch.device,
     ) -> torch.Tensor:
         """Reciprocal of the upstream per-step temporal-gradient denominator at ``steps``; a tensor stays on device."""
-        idx = steps if isinstance(steps, torch.Tensor) else torch.tensor(list(steps), dtype=torch.long)
-        idx = idx.to(device=device, dtype=torch.long)
+        if sigmas.shape[0] < 2:
+            raise ValueError(f"FlashGRPO rectification requires sigmas length >= 2; got {sigmas.shape[0]}.")
+        idx = (
+            steps.to(device=device, dtype=torch.long)
+            if isinstance(steps, torch.Tensor)
+            else torch.tensor(steps, dtype=torch.long, device=device)
+        )
         if idx.numel() == 0:
             raise ValueError("FlashGRPO rectification requires at least one timestep index.")
-        eta = float(self.params.eta)
+        eta = self.params.eta
         if eta <= 0.0:
             raise ValueError("FlashGRPO requires params.eta > 0 on trained SDE steps.")
         sigma = sigmas[:-1].index_select(0, idx)
         sigma_next = sigmas[1:].index_select(0, idx)
-        sigma_max = sigmas[1] if int(sigmas.shape[0]) > 1 else torch.tensor(0.99, device=device, dtype=sigmas.dtype)
         transition_std = self.stage.strategy.transition_std(
-            sigma=sigma, sigma_next=sigma_next, eta=eta, sigma_max=sigma_max
+            sigma=sigma, sigma_next=sigma_next, eta=eta, sigma_max=sigmas[1]
         ).clamp_min(torch.finfo(torch.float32).eps)
         sigma_safe = sigma.clamp_min(torch.finfo(torch.float32).eps)
         denom = (sigma - sigma_next) / transition_std + transition_std * (1.0 - sigma) / (2.0 * sigma_safe)

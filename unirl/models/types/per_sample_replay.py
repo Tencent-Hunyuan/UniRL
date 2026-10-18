@@ -18,7 +18,7 @@ class PerSampleStepReplayMixin:
 
     supports_per_sample_sde_index: ClassVar[bool] = True
 
-    def _replay_per_sample(
+    def replay_per_sample(
         self,
         conditions: Any,
         *,
@@ -29,22 +29,24 @@ class PerSampleStepReplayMixin:
         """``log_probs [N, 1]``, ``prev_sample_means [N, 1, ...]`` from latent slots ``[before, after]``."""
         name = type(self).__name__
         if segment.sigmas is None or segment.latents is None:
-            raise ValueError(f"{name}._replay_per_sample: segment.sigmas / latents missing")
-        num_samples = int(segment.latents.shape[0])
-        if int(segment.latents.shape[1]) < 2:
+            raise ValueError(f"{name}.replay_per_sample: segment.sigmas / latents missing")
+        num_samples = segment.latents.shape[0]
+        if segment.latents.shape[1] < 2:
             raise ValueError(
-                f"{name}._replay_per_sample: expected latents with a [before, after, ...] slot layout "
-                f"(K >= 2); got K={int(segment.latents.shape[1])}."
+                f"{name}.replay_per_sample: expected latents with a [before, after, ...] slot layout "
+                f"(K >= 2); got K={segment.latents.shape[1]}."
             )
+        if segment.sigmas.shape[0] < 2:
+            raise ValueError(f"{name}.replay_per_sample: expected sigmas length >= 2; got {segment.sigmas.shape[0]}.")
         raw_idx = segment.sde_index_per_sample
         if raw_idx.ndim != 1 or raw_idx.dtype not in (torch.int32, torch.int64):
             raise ValueError(
-                f"{name}._replay_per_sample: sde_index_per_sample must be a 1-D integer tensor; "
+                f"{name}.replay_per_sample: sde_index_per_sample must be a 1-D integer tensor; "
                 f"got dtype={raw_idx.dtype}, shape={tuple(raw_idx.shape)}."
             )
-        if int(raw_idx.shape[0]) != num_samples:
+        if raw_idx.shape[0] != num_samples:
             raise ValueError(
-                f"{name}._replay_per_sample: sde_index_per_sample length {int(raw_idx.shape[0])} "
+                f"{name}.replay_per_sample: sde_index_per_sample length {raw_idx.shape[0]} "
                 f"!= sample count {num_samples}."
             )
         if device is None:
@@ -57,7 +59,7 @@ class PerSampleStepReplayMixin:
         # index_select(0, ...) rejects negative and out-of-bounds indices without host sync.
         sigma = sigmas.index_select(0, step_idx)
         sigma_next = sigmas.index_select(0, step_idx + 1)
-        sigma_max = sigmas[1] if int(sigmas.shape[0]) > 1 else torch.tensor(0.99, device=device, dtype=torch.float32)
+        sigma_max = sigmas[1]
         # Fixed slots, not latents_at(): after the per-step groups merge, the shared
         # ``indices`` map holds one group's steps and is not per-sample valid.
         sample = segment.latents[:, 0].to(device)
@@ -84,7 +86,7 @@ class PerSampleStepReplayMixin:
             )
         if log_prob is None:
             raise RuntimeError(
-                f"{name}._replay_per_sample: strategy returned None log-prob (deterministic mode); "
+                f"{name}.replay_per_sample: strategy returned None log-prob (deterministic mode); "
                 "per-sample replay requires a stochastic SDE strategy."
             )
         log_probs_t = log_prob.reshape(num_samples, 1).to(dtype=self.logprob_dtype)

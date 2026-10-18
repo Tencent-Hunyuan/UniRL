@@ -60,7 +60,7 @@ class AsyncDiffusionTrainer(AsyncRolloutTrainerMixin, DiffusionTrainer):
                 "trainer."
             )
         algo_cls = get_class(diffusion_kwargs["algorithm_cfg"]["_target_"])
-        if getattr(algo_cls, "per_sample_sde_layout", ""):
+        if algo_cls.per_sample_sde_layout:
             raise ValueError(
                 f"AsyncDiffusionTrainer does not split rollouts into per-step SDE groups, which "
                 f"{algo_cls.__name__} requires; use the synchronous DiffusionTrainer."
