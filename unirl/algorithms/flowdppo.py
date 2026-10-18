@@ -21,9 +21,10 @@ from .base import (
     _reference_replay_means,
     _require_replay_anchor_for_batched_replay,
     _resolve_reference_model,
-    _slice_step_chunks,
     _transition_sigma,
     gather_sde_field,
+    require_timestep_chunk_size,
+    slice_step_chunks,
     typed_conditions,
 )
 
@@ -130,15 +131,7 @@ class FlowDPPO(StageAlgorithm):
             self.old_logp_source in ("rollout", "replay"),
             f"FlowDPPO: old_logp_source must be 'rollout' or 'replay'; got {old_logp_source!r}",
         )
-        require(
-            timestep_chunk_size is None
-            or (
-                isinstance(timestep_chunk_size, int)
-                and not isinstance(timestep_chunk_size, bool)
-                and timestep_chunk_size >= 1
-            ),
-            f"FlowDPPO: timestep_chunk_size must be a positive int; got {timestep_chunk_size!r}",
-        )
+        require_timestep_chunk_size(timestep_chunk_size, algo="FlowDPPO")
         self.timestep_chunk_size = timestep_chunk_size
         _require_replay_anchor_for_batched_replay(self.stage, self.old_logp_source, algo="FlowDPPO")
         self.conditions_cls = conditions_cls
@@ -166,7 +159,7 @@ class FlowDPPO(StageAlgorithm):
         logp_parts: List[torch.Tensor] = []
         mean_parts: List[torch.Tensor] = []
         with torch.no_grad():
-            for chunk in _slice_step_chunks(target_steps, self.timestep_chunk_size):
+            for chunk in slice_step_chunks(target_steps, self.timestep_chunk_size):
                 result = self.stage.replay(typed_conds, segment=segment, params=self.params, step_indices=chunk)
                 if result.prev_sample_means is None:
                     raise RuntimeError(
@@ -196,7 +189,7 @@ class FlowDPPO(StageAlgorithm):
 
         typed_conds = typed_conditions(conditions, self.conditions_cls)
         num_steps = len(target_steps)
-        chunks = _slice_step_chunks(target_steps, self.timestep_chunk_size)
+        chunks = slice_step_chunks(target_steps, self.timestep_chunk_size)
         policy_loss_sum: Optional[torch.Tensor] = None
         total_loss_sum: Optional[torch.Tensor] = None
         kl_ref_sum: Optional[torch.Tensor] = None
@@ -230,7 +223,14 @@ class FlowDPPO(StageAlgorithm):
                 dtype=new_means.dtype, device=new_means.device
             )
 
-            sigma_t = self._compute_sigma_t(segment, chunk, device=new_logp.device)
+            sigma_t = _transition_sigma(
+                self.stage,
+                segment=segment,
+                target_steps=chunk,
+                eta=self.params.eta,
+                device=new_logp.device,
+                add_coefficient=self.add_kl_coefficient,
+            )
             adv_b = (
                 advantages.detach().to(dtype=new_logp.dtype, device=new_logp.device).reshape(-1, 1).expand_as(new_logp)
             )
@@ -271,38 +271,44 @@ class FlowDPPO(StageAlgorithm):
                 k_term = kl_ref.detach() * len(chunk)
                 kl_ref_sum = k_term if kl_ref_sum is None else kl_ref_sum + k_term
 
-            chunk_weight = 1.0 if len(chunks) == 1 else (len(chunk) / num_steps)
+            chunk_weight = len(chunk) / num_steps
             (chunk_loss * (loss_scale * chunk_weight)).backward()
             t_term = chunk_loss.detach() * len(chunk)
             total_loss_sum = t_term if total_loss_sum is None else total_loss_sum + t_term
-            new_logp_parts.append(new_logp.detach())
-            old_logp_parts.append(old_logp.detach())
-            for k, v in chunk_metrics.items():
-                if k == "ratio_min":
-                    ratio_mins.append(v)
-                elif k == "ratio_max":
-                    ratio_maxs.append(v)
-                elif k == "kl_new_old_max":
-                    kl_maxs.append(v)
-                elif k != "ratio_std":
-                    m_term = v * len(chunk)
-                    weighted_metrics[k] = m_term if k not in weighted_metrics else weighted_metrics[k] + m_term
+            if len(chunks) > 1:
+                new_logp_parts.append(new_logp.detach())
+                old_logp_parts.append(old_logp.detach())
+                for k, v in chunk_metrics.items():
+                    if k == "ratio_min":
+                        ratio_mins.append(v)
+                    elif k == "ratio_max":
+                        ratio_maxs.append(v)
+                    elif k == "kl_new_old_max":
+                        kl_maxs.append(v)
+                    elif k != "ratio_std":
+                        m_term = v * len(chunk)
+                        weighted_metrics[k] = m_term if k not in weighted_metrics else weighted_metrics[k] + m_term
 
         policy_loss_val = float((policy_loss_sum / num_steps).item())
         total_loss_val = float((total_loss_sum / num_steps).item())
-        new_logp_all = torch.cat(new_logp_parts, dim=1)
-        old_logp_all = torch.cat(old_logp_parts, dim=1)
-        ratio_all = torch.exp(new_logp_all - old_logp_all)
-        ratio_std = float(ratio_all.std().item()) if ratio_all.numel() > 1 else 0.0
+        if len(chunks) == 1:
+            resolved_metrics = {k: float(v.item()) for k, v in chunk_metrics.items()}
+        else:
+            new_logp_all = torch.cat(new_logp_parts, dim=1)
+            old_logp_all = torch.cat(old_logp_parts, dim=1)
+            ratio_all = torch.exp(new_logp_all - old_logp_all)
+            resolved_metrics = {
+                **{k: float((v / num_steps).item()) for k, v in weighted_metrics.items()},
+                "ratio_std": float(ratio_all.std().item()),
+                "ratio_min": float(torch.stack(ratio_mins).min().item()),
+                "ratio_max": float(torch.stack(ratio_maxs).max().item()),
+                "kl_new_old_max": float(torch.stack(kl_maxs).max().item()),
+            }
 
         metrics: Dict[str, Any] = {
             "policy_loss": policy_loss_val,
             "kl_mask_threshold": float(self.kl_mask_threshold),
-            **{k: float((v / num_steps).item()) for k, v in weighted_metrics.items()},
-            "ratio_std": ratio_std,
-            "ratio_min": float(torch.stack(ratio_mins).min().item()),
-            "ratio_max": float(torch.stack(ratio_maxs).max().item()),
-            "kl_new_old_max": float(torch.stack(kl_maxs).max().item()),
+            **resolved_metrics,
         }
 
         if self.beta > 0.0:
@@ -321,22 +327,6 @@ class FlowDPPO(StageAlgorithm):
         if segment.sde_indices is None:
             return []
         return segment.sde_indices.tolist()
-
-    def _compute_sigma_t(
-        self,
-        segment: "LatentSegment",
-        target_steps: List[int],
-        device: torch.device,
-    ) -> torch.Tensor:
-        """Per-step KL-normalization sigma_t ``[S']``; ones when ``add_kl_coefficient=False``."""
-        return _transition_sigma(
-            self.stage,
-            segment=segment,
-            target_steps=target_steps,
-            eta=self.params.eta,
-            device=device,
-            add_coefficient=self.add_kl_coefficient,
-        )
 
 
 __all__ = ["FlowDPPO", "FlowDPPOConfig"]

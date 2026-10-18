@@ -22,9 +22,10 @@ from .base import (
     _require_replay_anchor_for_batched_replay,
     _resolve_clip_range_from_schedule,
     _resolve_reference_model,
-    _slice_step_chunks,
     _transition_sigma,
     gather_sde_field,
+    require_timestep_chunk_size,
+    slice_step_chunks,
     typed_conditions,
 )
 
@@ -83,15 +84,7 @@ class FlowGRPO(StageAlgorithm):
             self.old_logp_source in ("rollout", "replay"),
             f"FlowGRPO: old_logp_source must be 'rollout' or 'replay'; got {old_logp_source!r}",
         )
-        require(
-            timestep_chunk_size is None
-            or (
-                isinstance(timestep_chunk_size, int)
-                and not isinstance(timestep_chunk_size, bool)
-                and timestep_chunk_size >= 1
-            ),
-            f"FlowGRPO: timestep_chunk_size must be a positive int; got {timestep_chunk_size!r}",
-        )
+        require_timestep_chunk_size(timestep_chunk_size, algo="FlowGRPO")
         self.timestep_chunk_size = timestep_chunk_size
         _require_replay_anchor_for_batched_replay(self.stage, self.old_logp_source, algo="FlowGRPO")
         self.conditions_cls = conditions_cls
@@ -121,7 +114,7 @@ class FlowGRPO(StageAlgorithm):
         with torch.no_grad():
             logp_parts = [
                 self.stage.replay(typed_conds, segment=segment, params=self.params, step_indices=chunk).log_probs
-                for chunk in _slice_step_chunks(target_steps, self.timestep_chunk_size)
+                for chunk in slice_step_chunks(target_steps, self.timestep_chunk_size)
             ]
         segment.sde_logp = torch.cat(logp_parts, dim=1).detach().cpu()
 
@@ -141,7 +134,7 @@ class FlowGRPO(StageAlgorithm):
         typed_conds = typed_conditions(conditions, self.conditions_cls)
         clip_range = _resolve_clip_range_from_schedule(self.clip_range, self.clip_schedule, training_progress)
         num_steps = len(target_steps)
-        chunks = _slice_step_chunks(target_steps, self.timestep_chunk_size)
+        chunks = slice_step_chunks(target_steps, self.timestep_chunk_size)
         policy_loss_sum: Optional[torch.Tensor] = None
         total_loss_sum: Optional[torch.Tensor] = None
         kl_ref_sum: Optional[torch.Tensor] = None
@@ -200,12 +193,13 @@ class FlowGRPO(StageAlgorithm):
                 k_term = kl_ref.detach() * len(chunk)
                 kl_ref_sum = k_term if kl_ref_sum is None else kl_ref_sum + k_term
             # len(chunk)/num_steps makes the chunk backwards sum to the full [B, S] mean backward.
-            chunk_weight = 1.0 if len(chunks) == 1 else (len(chunk) / num_steps)
+            chunk_weight = len(chunk) / num_steps
             (chunk_loss * (loss_scale * chunk_weight)).backward()
             t_term = chunk_loss.detach() * len(chunk)
             total_loss_sum = t_term if total_loss_sum is None else total_loss_sum + t_term
-            new_logp_parts.append(new_logp.detach())
-            old_logp_parts.append(old_logp.detach())
+            if len(chunks) > 1:
+                new_logp_parts.append(new_logp.detach())
+                old_logp_parts.append(old_logp.detach())
 
         policy_loss_val = float((policy_loss_sum / num_steps).item())
         total_loss_val = float((total_loss_sum / num_steps).item())

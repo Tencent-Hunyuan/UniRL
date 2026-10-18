@@ -298,11 +298,19 @@ def _resolve_reference_model(backend: Any, *, beta: float, algo: str, coef_name:
     return model
 
 
-def _slice_step_chunks(target_steps: List[int], chunk_size: Optional[int]) -> List[List[int]]:
+def slice_step_chunks(target_steps: List[int], chunk_size: Optional[int]) -> List[List[int]]:
     """Slice ``target_steps`` into ``chunk_size`` windows (single full slice when ``None``)."""
     if chunk_size is None:
         return [target_steps]
     return [target_steps[i : i + chunk_size] for i in range(0, len(target_steps), chunk_size)]
+
+
+def require_timestep_chunk_size(timestep_chunk_size: Optional[int], *, algo: str) -> None:
+    """Validate that ``timestep_chunk_size`` is ``None`` or a positive non-bool ``int``."""
+    if timestep_chunk_size is not None and (
+        not isinstance(timestep_chunk_size, int) or isinstance(timestep_chunk_size, bool) or timestep_chunk_size < 1
+    ):
+        raise ValueError(f"{algo}: timestep_chunk_size must be a positive int; got {timestep_chunk_size!r}")
 
 
 def _require_replay_anchor_for_batched_replay(stage: Any, old_logp_source: str, *, algo: str) -> None:
@@ -375,8 +383,10 @@ __all__ = [
     "StageAlgorithm",
     "aggregate_token_losses",
     "gather_sde_field",
+    "require_timestep_chunk_size",
     "rollout_replay_logp_absdiff",
     "rollout_replay_k3",
     "select_active_tokens",
+    "slice_step_chunks",
     "typed_conditions",
 ]
