@@ -7,11 +7,7 @@ from typing import ClassVar, List, Optional, Set, Tuple
 
 import torch
 
-from unirl.models.types.batched_replay import (
-    BatchedStepReplayMixin,
-    repeat_batch_tensor,
-    tile_text_embed_condition,
-)
+from unirl.models.types.batched_replay import BatchedStepReplayMixin
 from unirl.models.types.diffusion import DiffusionStage, DiffusionStep
 from unirl.models.types.replay_result import ReplayResult
 from unirl.sde.kernels import SDEStrategy, StepStrategy
@@ -392,7 +388,7 @@ class Flux2KleinDiffusionStage(BatchedStepReplayMixin, DiffusionStage[Flux2Klein
         try:
             if self.batch_replay_steps and len(target) > 1 and isinstance(self.strategy, SDEStrategy):
                 with autocast_ctx:
-                    return self._replay_batched_steps(
+                    return self.replay_batched_steps(
                         conditions,
                         segment=segment,
                         params=params,
@@ -439,15 +435,6 @@ class Flux2KleinDiffusionStage(BatchedStepReplayMixin, DiffusionStage[Flux2Klein
         log_probs_t = torch.stack(log_probs, dim=1).to(dtype=self.logprob_dtype)
         means_t = torch.stack(prev_sample_means, dim=1) if prev_sample_means else None
         return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
-
-    @staticmethod
-    def _tile_conditions(conditions: Flux2KleinConditions, repeats: int) -> Flux2KleinConditions:
-        return Flux2KleinConditions(
-            text=tile_text_embed_condition(conditions.text, repeats),
-            negative_text=tile_text_embed_condition(conditions.negative_text, repeats),
-            image_latent=repeat_batch_tensor(conditions.image_latent, repeats),
-            image_latent_ids=repeat_batch_tensor(conditions.image_latent_ids, repeats),
-        )
 
     def predict_noise_at_step(
         self,
