@@ -7,9 +7,10 @@ from typing import ClassVar, Dict, List, Optional, Set, Tuple
 
 import torch
 
+from unirl.models.types.batched_replay import BatchedStepReplayMixin
 from unirl.models.types.diffusion import DiffusionStage, DiffusionStep
 from unirl.models.types.replay_result import ReplayResult
-from unirl.sde.kernels import GeneratorLike, StepStrategy
+from unirl.sde.kernels import GeneratorLike, SDEStrategy, StepStrategy
 from unirl.sde.noise import make_denoise_step_generators
 from unirl.types.sampling import DiffusionSamplingParams, compute_trajectory_positions
 from unirl.types.segments.latent import LatentSegment, make_video_segment
@@ -177,7 +178,7 @@ class HunyuanVideo10DiffusionStep(DiffusionStep[HunyuanVideo10Bundle, HunyuanVid
         )
 
 
-class HunyuanVideo10DiffusionStage(DiffusionStage[HunyuanVideo10Conditions]):
+class HunyuanVideo10DiffusionStage(BatchedStepReplayMixin, DiffusionStage[HunyuanVideo10Conditions]):
     """HunyuanVideo-1.0 rollout-level diffusion stage."""
 
     _no_split_modules: ClassVar[Tuple[str, ...]] = ("HunyuanVideoTransformerBlock",)
@@ -198,6 +199,7 @@ class HunyuanVideo10DiffusionStage(DiffusionStage[HunyuanVideo10Conditions]):
         spatial_compression_ratio: Optional[int] = None,
         temporal_compression_ratio: Optional[int] = None,
         latent_channels: Optional[int] = None,
+        batch_replay_steps: bool,
     ) -> None:
         self.model = model
         self.step = step
@@ -205,6 +207,7 @@ class HunyuanVideo10DiffusionStage(DiffusionStage[HunyuanVideo10Conditions]):
         self.autocast_dtype = parse_torch_dtype(autocast_precision, field_name="autocast_precision")
         self.trajectory_dtype = parse_torch_dtype(trajectory_precision, field_name="trajectory_precision")
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="logprob_precision")
+        self.batch_replay_steps = batch_replay_steps
 
         vae = model.vae
         if vae is not None:
@@ -393,6 +396,18 @@ class HunyuanVideo10DiffusionStage(DiffusionStage[HunyuanVideo10Conditions]):
             if device.type == "cuda" and self.autocast_dtype in (torch.float16, torch.bfloat16)
             else nullcontext()
         )
+
+        if self.batch_replay_steps and len(target) > 1 and isinstance(self.strategy, SDEStrategy):
+            with autocast_ctx:
+                return self.replay_batched_steps(
+                    conditions,
+                    segment=segment,
+                    params=params,
+                    target=target,
+                    sigmas=sigmas,
+                    sigma_max=sigma_max,
+                    device=device,
+                )
 
         log_probs: List[torch.Tensor] = []
         prev_sample_means: List[torch.Tensor] = []

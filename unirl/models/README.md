@@ -128,6 +128,14 @@ it is the authoritative bundle / pipeline / stage / conditions contract.
   created with an explicit `dtype=torch.float32` (such as RoPE `inv_freq` /
   `original_inv_freq`) therefore stay in float32 under a BF16 model or VeOmni
   master, avoiding position-dependent RoPE angle drift against rollout engines.
+- **`BagelDiffusionStage` packs `batch_replay_steps` across Navit varlen sequences (no-CFG only).**
+  Unlike `BatchedStepReplayMixin`'s dense `[S * B]` batching, Bagel's MoT forward is
+  `B=1` varlen-packed, so `pipeline.batch_replay_steps: true` repeats the sample's KV
+  context across `S` `cu_seqlens` segments and sets `split_sequences=True` on
+  `Bagel._forward_flow` so per-sequence Linear/MLP projections (`apply_by_sequence` /
+  `_apply_selected_by_sequence`) keep the serial BF16 reduction boundaries. It raises
+  unless `guidance_scale == 1.0` and `cfg_img_scale == 1.0`, and requires
+  `old_logp_source: replay`.
 
 
 ## Conversation composition
