@@ -11,7 +11,6 @@ from unirl.models.types.batched_replay import BatchedStepReplayMixin
 from unirl.models.types.diffusion import DiffusionStage, DiffusionStep
 from unirl.models.types.replay_result import ReplayResult
 from unirl.sde.kernels import SDEStrategy, StepStrategy
-from unirl.types.conditions import TextEmbedCondition
 from unirl.types.sampling import DiffusionSamplingParams, compute_trajectory_positions
 from unirl.types.segments.latent import LatentSegment
 from unirl.utils.dtypes import parse_torch_dtype
@@ -201,9 +200,7 @@ class ZImageDiffusionStage(BatchedStepReplayMixin, DiffusionStage[ZImageConditio
         self.vae_scale_factor = vae_scale_factor
         self.batch_replay_steps = bool(batch_replay_steps)
         if latent_channels is None:
-            tx_cfg = getattr(model.transformer, "config", None)
-            in_channels = getattr(tx_cfg, "in_channels", 16) if tx_cfg is not None else 16
-            latent_channels = int(in_channels)
+            latent_channels = model.transformer.config.in_channels
         self.latent_channels = int(latent_channels)
 
     def diffuse(
@@ -222,16 +219,16 @@ class ZImageDiffusionStage(BatchedStepReplayMixin, DiffusionStage[ZImageConditio
         prompt_embeds = conditions.text.embeds
         device = prompt_embeds.device
         batch_size = int(prompt_embeds.shape[0])
-        T = int(params.num_inference_steps)
+        T = params.num_inference_steps
         if int(schedule.shape[0]) != T + 1:
             raise ValueError(f"ZImageDiffusionStage.diffuse: schedule length {schedule.shape[0]} != T+1={T + 1}")
         schedule = schedule.to(device)
         self.strategy.init_schedule(schedule)
 
-        vsf = int(self.vae_scale_factor)
-        latent_h = 2 * (int(params.height) // (vsf * 2))
-        latent_w = 2 * (int(params.width) // (vsf * 2))
-        expected_latent_shape = (int(self.latent_channels), latent_h, latent_w)
+        vsf = self.vae_scale_factor
+        latent_h = 2 * (params.height // (vsf * 2))
+        latent_w = 2 * (params.width // (vsf * 2))
+        expected_latent_shape = (self.latent_channels, latent_h, latent_w)
         if initial_latents is not None:
             if int(initial_latents.shape[0]) != batch_size:
                 raise ValueError(
@@ -242,7 +239,7 @@ class ZImageDiffusionStage(BatchedStepReplayMixin, DiffusionStage[ZImageConditio
                 raise ValueError(
                     f"ZImageDiffusionStage.diffuse: initial_latents.shape[1:]="
                     f"{tuple(initial_latents.shape[1:])} != expected {expected_latent_shape} "
-                    f"for height={int(params.height)}, width={int(params.width)}."
+                    f"for height={params.height}, width={params.width}."
                 )
             latents = initial_latents.to(device=device, dtype=self.trajectory_dtype)
         else:
@@ -251,13 +248,13 @@ class ZImageDiffusionStage(BatchedStepReplayMixin, DiffusionStage[ZImageConditio
                 latent_shape=expected_latent_shape,
                 device=device,
                 dtype=self.trajectory_dtype,
-                init_same_noise=bool(params.init_same_noise),
-                samples_per_prompt=int(params.samples_per_prompt),
+                init_same_noise=params.init_same_noise,
+                samples_per_prompt=params.samples_per_prompt,
                 noise_group_ids=params.noise_group_ids,
-                base_seed=int(params.seed),
+                base_seed=params.seed,
             )
 
-        sde_set: Set[int] = set(int(i) for i in (params.sde_indices or []))
+        sde_set: Set[int] = set(params.sde_indices or ())
         sde_sorted: List[int] = sorted(sde_set)
 
         needed: Set[int] = set(compute_trajectory_positions(sde_set, T))
@@ -278,7 +275,7 @@ class ZImageDiffusionStage(BatchedStepReplayMixin, DiffusionStage[ZImageConditio
         for i in range(T):
             sigma = schedule[i].to(device)
             sigma_next = schedule[i + 1].to(device)
-            step_eta = float(params.eta) if i in sde_set else 0.0
+            step_eta = params.eta if i in sde_set else 0.0
 
             with torch.no_grad(), autocast_ctx:
                 new_latents, log_prob, _ = self.step.step_with_logp(
@@ -288,7 +285,7 @@ class ZImageDiffusionStage(BatchedStepReplayMixin, DiffusionStage[ZImageConditio
                     sample=latents,
                     sigma=sigma,
                     sigma_next=sigma_next,
-                    guidance_scale=float(params.guidance_scale),
+                    guidance_scale=params.guidance_scale,
                     eta=step_eta,
                     sigma_max=sigma_max,
                     step_index=i,
@@ -331,12 +328,8 @@ class ZImageDiffusionStage(BatchedStepReplayMixin, DiffusionStage[ZImageConditio
         if segment.sigmas is None:
             raise ValueError("ZImageDiffusionStage.replay: segment.sigmas missing")
 
-        sde_set = set(int(i) for i in segment.sde_indices.tolist())
-        target = (
-            [int(i) for i in step_indices]
-            if step_indices is not None
-            else [int(i) for i in segment.sde_indices.tolist()]
-        )
+        sde_set = set(segment.sde_indices.tolist())
+        target = list(step_indices) if step_indices is not None else segment.sde_indices.tolist()
         bad = [i for i in target if i not in sde_set]
         if bad:
             raise ValueError(
@@ -381,8 +374,8 @@ class ZImageDiffusionStage(BatchedStepReplayMixin, DiffusionStage[ZImageConditio
                     prev_sample=prev_sample,
                     sigma=sigma,
                     sigma_next=sigma_next,
-                    guidance_scale=float(params.guidance_scale),
-                    eta=float(params.eta),
+                    guidance_scale=params.guidance_scale,
+                    eta=params.eta,
                     sigma_max=sigma_max,
                     step_index=step_idx,
                 )
@@ -400,20 +393,6 @@ class ZImageDiffusionStage(BatchedStepReplayMixin, DiffusionStage[ZImageConditio
         means_t = torch.stack(prev_sample_means, dim=1) if prev_sample_means else None
         return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
 
-    @staticmethod
-    def _tile_conditions(conditions: ZImageConditions, repeats: int) -> ZImageConditions:
-        def _rep(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-            return t.repeat(repeats, *([1] * (t.dim() - 1))) if t is not None else None
-
-        def _tile(cond: Optional[TextEmbedCondition]) -> Optional[TextEmbedCondition]:
-            if cond is None:
-                return None
-            return TextEmbedCondition(
-                embeds=_rep(cond.embeds), pooled=_rep(cond.pooled), attn_mask=_rep(cond.attn_mask)
-            )
-
-        return ZImageConditions(text=_tile(conditions.text), negative_text=_tile(conditions.negative_text))
-
     def predict_noise_at_step(
         self,
         conditions: ZImageConditions,
@@ -428,7 +407,7 @@ class ZImageDiffusionStage(BatchedStepReplayMixin, DiffusionStage[ZImageConditio
             sample,
             sigma,
             conditions,
-            guidance_scale=float(params.guidance_scale),
+            guidance_scale=params.guidance_scale,
         )
 
     def trainable_module(self) -> "torch.nn.Module":

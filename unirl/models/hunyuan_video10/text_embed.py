@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from typing import List, Tuple
-
 import torch
 
+from unirl.models.types.embedding import dedup_prompts
 from unirl.types.conditions import TextEmbedCondition
 from unirl.types.primitives import Texts
 
@@ -49,10 +48,7 @@ class HunyuanVideo10TextEmbedStage:
 
     def embed_llama(self, p: Texts) -> TextEmbedCondition:
         """Encode prompts via LLaMA — embeds ``[B, llama_max_length, 4096]``, mask ``[B, llama_max_length]``."""
-        embeds, mask = self._encode_llama(list(p.texts))
-        return TextEmbedCondition(embeds=embeds, attn_mask=mask, pooled=None)
-
-    def _encode_llama(self, prompts: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
+        prompts, inverse = dedup_prompts(p.texts)
         bundle = self.bundle
         tokenizer = bundle.tokenizer
         text_encoder = bundle.text_encoder
@@ -82,7 +78,7 @@ class HunyuanVideo10TextEmbedStage:
                 attention_mask=attention_mask,
                 output_hidden_states=True,
             )
-        hidden_states = getattr(outputs, "hidden_states", None)
+        hidden_states = outputs.hidden_states
         selected_from_end = self.hidden_state_skip_layer + 1
         if hidden_states is None or selected_from_end > len(hidden_states):
             available = 0 if hidden_states is None else len(hidden_states)
@@ -97,14 +93,12 @@ class HunyuanVideo10TextEmbedStage:
             prompt_embeds = prompt_embeds[:, crop_start:]
             attention_mask = attention_mask[:, crop_start:]
 
-        return prompt_embeds.to(dtype=dtype), attention_mask
+        cond = TextEmbedCondition(embeds=prompt_embeds.to(dtype=dtype), attn_mask=attention_mask, pooled=None)
+        return cond if inverse is None else cond.select(inverse)
 
     def embed_clip(self, p: Texts) -> TextEmbedCondition:
         """Encode prompts via CLIP into a TextEmbedCondition — embeds are the pooled ``[B, 768]``."""
-        embeds = self._encode_clip(list(p.texts))
-        return TextEmbedCondition(embeds=embeds, attn_mask=None, pooled=None)
-
-    def _encode_clip(self, prompts: List[str]) -> torch.Tensor:
+        prompts, inverse = dedup_prompts(p.texts)
         bundle = self.bundle
         tokenizer = bundle.tokenizer_2
         text_encoder = bundle.text_encoder_2
@@ -128,7 +122,8 @@ class HunyuanVideo10TextEmbedStage:
             )
         pooled_output = outputs.pooler_output
 
-        return pooled_output.to(dtype=dtype)
+        cond = TextEmbedCondition(embeds=pooled_output.to(dtype=dtype), attn_mask=None, pooled=None)
+        return cond if inverse is None else cond.select(inverse)
 
 
 __all__ = [

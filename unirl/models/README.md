@@ -102,6 +102,14 @@ it is the authoritative bundle / pipeline / stage / conditions contract.
   wrapper's state-dict hooks strip it). Any match between module params and
   checkpoint keys goes through `canonical_param_name`, exported beside the
   deferred-op pair in `types/post_materialize.py`.
+- **Init-computed non-persistent buffers keep their construction dtype through meta-init.**
+  `build_meta_init_transformer` instantiates under `torch.set_default_dtype(dtype)`
+  (matching `from_pretrained`), `finalize_meta_init` and `veomni_parallelize` cast
+  parameters without overwriting non-persistent buffers, and `restore_init_state`
+  restores each buffer's captured dtype (including `DTensor` shards). Buffers
+  created with an explicit `dtype=torch.float32` (such as RoPE `inv_freq` /
+  `original_inv_freq`) therefore stay in float32 under a BF16 model or VeOmni
+  master, avoiding position-dependent RoPE angle drift against rollout engines.
 
 
 ## Conversation composition
@@ -173,7 +181,7 @@ external engines with a UniRL adapter (see
 
 | Package | Model (recipe default) | Modality | Entrypoints | Engines with a recipe | Recipes | Restrictions | Status |
 |---|---|---|---|---|---|---|---|
-| [`wan21/`](wan21/) | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers`, `Wan-AI/Wan2.1-I2V-14B-720P-Diffusers` (I2V) | Text → Video; Image → Video | `train_diffusion`, `train_sft` | trainside, sglang_diffusion, fastvideo | [`wan21_t2v`](../../examples/diffusion/wan21/wan21_t2v.yaml), [`wan21_i2v`](../../examples/diffusion/wan21/wan21_i2v.yaml), [`wan21_t2v_sglang`](../../examples/diffusion/wan21/wan21_t2v_sglang.yaml), [`wan21_t2v_dancegrpo_fastvideo`](../../examples/diffusion/wan21/wan21_t2v_dancegrpo_fastvideo.yaml), [`sft/wan21_t2v_ucf101_full`](../../examples/sft/wan21_t2v_ucf101_full.yaml) | `wan21_t2v_videoalign_dancegrpo`: scorer-dependent; fastvideo needs the `[fastvideo]` extra | ✅ |
+| [`wan21/`](wan21/) | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers`, `Wan-AI/Wan2.1-I2V-14B-720P-Diffusers` (I2V) | Text → Video; Image → Video | `train_diffusion`, `train_sft` | trainside, sglang_diffusion, fastvideo | [`wan21_t2v`](../../examples/diffusion/wan21/wan21_t2v.yaml), [`wan21_i2v`](../../examples/diffusion/wan21/wan21_i2v.yaml), [`wan21_t2v_sglang`](../../examples/diffusion/wan21/wan21_t2v_sglang.yaml), [`wan21_t2v_dancegrpo_fastvideo`](../../examples/diffusion/wan21/wan21_t2v_dancegrpo_fastvideo.yaml), [`sft/wan21_t2v_ucf101_full`](../../examples/sft/wan21_t2v_ucf101_full.yaml) | `wan21_t2v_videoalign_dancegrpo`: scorer-dependent; fastvideo needs `$FASTVIDEO_PATH` | ✅ |
 | [`wan22/`](wan22/) | `Wan-AI/Wan2.2-T2V-A14B-Diffusers`, `Wan-AI/Wan2.2-I2V-A14B-Diffusers` (I2V) | Text → Video; Image → Video | `train_diffusion` | trainside, sglang_diffusion, fastvideo | [`wan22_t2v_14b`](../../examples/diffusion/wan22/wan22_t2v_14b.yaml), [`wan22_i2v`](../../examples/diffusion/wan22/wan22_i2v.yaml), [`wan22_t2v_14b_sglang`](../../examples/diffusion/wan22/wan22_t2v_14b_sglang.yaml), [`wan22_t2v_14b_dancegrpo_fastvideo`](../../examples/diffusion/wan22/wan22_t2v_14b_dancegrpo_fastvideo.yaml) | extends `wan21/` (dual-expert) | ✅ |
 | [`wan22_v2v/`](wan22_v2v/) | `PRETRAINED_MODEL` → `Wan-AI/Wan2.2-T2V-A14B-Diffusers` (V2V pipeline over `wan22/`) | Video → Video | `train_diffusion` | trainside | [`wan22_v2v_14b`](../../examples/diffusion/wan22_v2v/wan22_v2v_14b.yaml) | engine-specific (trainside only); checkpoint-path-required (default is a cluster path); `videoclipdelta` scorer | ✅ |
 | [`hunyuan_video10/`](hunyuan_video10/) | `hunyuanvideo-community/HunyuanVideo` | Text → Video | `train_diffusion` | trainside, sglang_diffusion | [`hunyuan_video10_t2v_trainside`](../../examples/diffusion/hunyuan_video10/hunyuan_video10_t2v_trainside.yaml), [`hunyuan_video10_t2v_sglang`](../../examples/diffusion/hunyuan_video10/hunyuan_video10_t2v_sglang.yaml) | engine-specific | ✅ |

@@ -23,7 +23,7 @@ across ranks and the grad-norm would be wrong — so `fsdp_wrap` claims them int
 root `fully_shard` group by default (`root_wrap`) and fails fast when a multi-rank
 run leaves a trainable param outside every group. The uniform wrap also keeps the
 optimizer an all-`DTensor` param bag (a mixed `Tensor` + `DTensor` bag forces
-`foreach=False` or AdamW's fused kernel raises). Centralizing wrap + step here lets
+`foreach=False` or AdamW's multi-tensor kernel raises). Centralizing wrap + step here lets
 every algorithm inherit these invariants for free; the loss module legitimately
 knows nothing about DTensor sharding or wrap topology.
 
@@ -36,7 +36,7 @@ knows nothing about DTensor sharding or wrap topology.
   `optimizer_step` is the single chokepoint: clip → step → schedule → EMA, and it
   **skips the whole step on a non-finite grad norm** (stepping would scale every
   parameter by the bad norm and poison the next rollout).
-- **`TrainStack`** (`stack/base.py`) takes one backend + one `StageAlgorithm` and runs
+- **`TrainStack`** (`stack/single.py`) takes one backend + one `StageAlgorithm` and runs
   `train_track`: move the segment onto device → `prepare_segment_anchors` (freeze
   π_old once) → `num_updates_per_batch` optimizer steps over disjoint mini-batches,
   each a micro-batch loop of `compute_loss_and_backward`. The mini/micro slicing comes
@@ -47,9 +47,14 @@ knows nothing about DTensor sharding or wrap topology.
   training uses, which is what pins the on-policy PPO ratio to 1 under bf16's
   batch-shape sensitivity. `AgenticTrainer` uses the same interface after
   concatenating every successful trajectory's generated assistant turns.
-- **`UnifiedModelTrainStack`** (`unified_model_stack.py`) drives two algorithms
+- **`UnifiedModelTrainStack`** (`stack/unified.py`) drives two algorithms
   (`ar` + `image`) backward-accumulating into one shared optimizer step on one
   shared backbone (HunyuanImage3).
+- **`BaseTrainStack`** (`stack/base.py`) is the base of both: it validates the
+  shared constructor arguments and owns the backend lifecycle, lazy profiler
+  cache, LR lookup, and track input placement: only the segment, conditions, and
+  advantages move to the backend's device, so media payloads stay on the host. The
+  same module defines the shared `TrainStepResult` and `aggregate_update_results`.
 
 **Extending it:** a new structural injection mode is an `inject_<mode>` alongside
 `inject_lora` (`lora.py`) and `inject_nft` / `inject_mirror` (`ema.py`), called
@@ -60,8 +65,69 @@ in `backend/base.py`; a multi-update-capable algorithm sets
 `recomputes_anchor` when its anchor must follow the planned micro geometry (see
 `../algorithms/README.md`).
 
+## Choosing HSDP (hybrid sharding)
+
+`fsdp_mode: hybrid` on `FSDPBackend` builds a
+`(world / hsdp_shard_size, hsdp_shard_size)` replicate × shard mesh: parameters
+shard within each `hsdp_shard_size` group, and the groups hold replicated copies
+whose gradients are all-reduced. Choose it when a shard group that fits one node
+over NVLink is a cheaper all-gather domain than the whole world;
+`hsdp_shard_size: devices_per_node` is the usual layout (world 16, shard 8 → a
+`(2, 8)` mesh). The trade is memory: per-rank weight + optimizer memory is
+`world_size / hsdp_shard_size` times the `full`-mode footprint.
+`resolve_fsdp_mesh_shape` ([`configs.py`](configs.py)) fails fast unless the
+shard size is `>= 2`, the world is strictly larger (a one-group world is
+`full`), and the world divides by the shard size.
+
+Checked-in recipes:
+[`diffusion/minimax_h3/minimax_h3_t2va_trainside_hsdp_2x8_validation`](../../examples/diffusion/minimax_h3/minimax_h3_t2va_trainside_hsdp_2x8_validation.yaml)
+— a 2×8 **validation/smoke** recipe, not a production default — and
+[`ar/bagel_grpo_arxivqa_mc_2x8_lora`](../../examples/ar/bagel_grpo_arxivqa_mc_2x8_lora.yaml).
+
+## Choosing the VeOmni backend
+
+`VeOmniBackend` ([`backend/veomni/backend.py`](backend/veomni/backend.py)) is a
+per-recipe alternative to `FSDPBackend`, selected by
+`backend._target_: unirl.train.backend.veomni.backend.VeOmniBackend`. It subclasses the same base, so the checkpoint/save/resume formats, the
+optimizer, and the `TrainStack` contract are unchanged. Install with the
+`veomni` extra (`pip install -e '.[veomni]'`; extras table in
+[INSTALL.md](../../INSTALL.md)).
+
+What it adds: Ulysses sequence parallelism (`fsdp_cfg.sp_size` — must divide
+`world_size`, and the model's attention heads) and MoE expert parallelism
+(`fsdp_cfg.ep_size` — must divide `world_size` and the expert count; each rank
+owns `num_experts / ep_size` experts, tokens routed all-to-all into fused
+grouped-GEMM). The VeOmni bundles build the transformer on the **meta device**
+— VeOmni's parallelize asserts meta init, and the backend loads real weights
+after sharding — so a bundle without meta-init support cannot run on this
+backend.
+
+Climb the ladder from a parity twin before the parallel variants; it lists
+every checked-in VeOmni recipe:
+
+| Step | Recipe | Exercises |
+| --- | --- | --- |
+| 1 | [`diffusion/sd3_trainside_veomni`](../../examples/diffusion/sd3_trainside_veomni.yaml) | parity twin of `sd3/sd3_trainside` on VeOmniBackend (`sp_size: 1`) — backend parity |
+| 2 | [`ar/qwen3_grpo_4b_veomni_sp_sglang`](../../examples/ar/qwen3_grpo_4b_veomni_sp_sglang.yaml), [`ar/qwen3_drpo_4b_veomni_sp_sglang`](../../examples/ar/qwen3_drpo_4b_veomni_sp_sglang.yaml) | Ulysses SP (`sp_size: 2`) + SGLang, GRPO and DRPO |
+| 3 | [`ar/qwen3_moe_grpo_30b_a3b_veomni_ep_sglang`](../../examples/ar/qwen3_moe_grpo_30b_a3b_veomni_ep_sglang.yaml), [`ar/qwen3_5_moe_grpo_35b_a3b_base_dapo_sglang`](../../examples/ar/qwen3_5_moe_grpo_35b_a3b_base_dapo_sglang.yaml), [`ar/qwen3_5_moe_grpo_35b_a3b_geo3k_mc_sglang`](../../examples/ar/qwen3_5_moe_grpo_35b_a3b_geo3k_mc_sglang.yaml) | expert parallelism (`ep_size: 8`) on 30B-A3B / 35B-A3B MoE |
+| 4 | [`diffusion/qwen_image_trainside_veomni`](../../examples/diffusion/qwen_image_trainside_veomni.yaml), [`unified_model/hi3_vllmomni_veomni_ep`](../../examples/unified_model/hi3_vllmomni_veomni_ep.yaml) | Qwen-Image parity twin; HI3 unified model with EP |
+
+v1 restrictions, all validated fail-fast in `_validate_fsdp_cfg`:
+`fsdp_mode='full'` only (HSDP stays on `FSDPBackend`), `mixed_precision` must
+stay enabled, and `cpu_offload` / `copy_engine_all_gather` / `expandable_segments` are
+unsupported.
+Separately, with `ep_size > 1`, full **DCP** checkpoints are rejected — the
+expert split is not encoded in the DTensor placements. This is checked at save
+and load time, not at startup, so a run with `checkpoint_format: dcp` fails at
+its first checkpoint; keep the default `checkpoint_format: torch` (EP-aware) or
+use LoRA adapter mode. Formats and export live in
+[`trainer/README.md · Checkpointing`](../trainer/README.md#checkpointing).
+
 ## Gotchas
 
+- **Unified `ar` / `image` results describe one shared optimizer step.** Their
+  `optimizer_updates` (total and per update) count the same steps, so summing
+  them across tracks double-counts.
 - **`num_updates_per_batch > 1` needs `supports_multi_update` *and* must evenly
   divide the per-worker batch** — otherwise the ctor or `_build_mini_batch_slices`
   raises (a ragged mini-batch would silently drop samples and desync grad-accum
@@ -75,9 +141,10 @@ in `backend/base.py`; a multi-update-capable algorithm sets
 - **`optimizer_step` silently *skips* (does not crash) on a non-finite grad norm**
   and zeroes grads — a flat loss curve with a logged warning means grads went
   non-finite.
-- **Checkpointing preserves a never-stepped AdamW** — DCP materializes empty
-  optimizer state with a dummy step; UniRL resets it so the first real update
-  remains step 1.
+- **Checkpointing preserves never-updated AdamW params** — export writes a param
+  without state (or a never-stepped AdamW) as the step-0 zero state its first
+  update would create, so torch and DCP checkpoints stay dense; load drops step-0
+  entries back to lazy init. Torch-format checkpoints that omitted them still load.
 - **`master_dtype` defaults to `None`, so the optimizer master follows `param_dtype`** —
   a bf16-loaded base then keeps a bf16 LoRA master and the ~1e-6 AdamW steps round
   away (the policy drifts into a degenerate reward-hack). An fp32-loaded model gets an
@@ -95,6 +162,19 @@ in `backend/base.py`; a multi-update-capable algorithm sets
   Consumers outside `train/` take the transform from
   `backend.expert_weight_export_transform()` — `distributed/weight_sync/` must not
   import the layout (the core-dependency guard rejects it).
+- **`token-mean` loss scales come from DP-global valid tokens** (`stack/loss_scale.py`) —
+  a micro's `loss_scale` is its valid tokens × the gradient-averaging world / the valid
+  tokens all-reduced over one `TrainStack._run_update` or one unified `_train_one_step`
+  track. A `TrainStack` accumulation window resolves each part on its own and scales it
+  by 1/M, so its step averages the per-part token means. Other modes and the unified
+  image track use sample share. Both stacks report the DP-global loss and, under
+  `token-mean`, `global_loss_weight`; zero valid tokens across DP raises in `TrainStack`.
+- **A zero-valid-token AR track in `UnifiedModelTrainStack` still backwards** —
+  masked micros backward at `loss_scale` 0, so AR-only params get zero grads that AdamW
+  still decays and steps (skipping them would leave `None` grads, which AdamW skips). The
+  image track steps, a warning is logged, and the update's `has_zero_valid_tokens` is 1.0
+  (a rollout-level mean over updates). A micro with no AR tokens at all is skipped by the
+  algorithm, which FSDP2 tolerates only when every DP rank skips it.
 - **Advantages are not computed here** — `train` raises if
   `part.advantages is None`; the trainer must call `compute_advantages` on the
   full shard first.
@@ -111,22 +191,15 @@ in `backend/base.py`; a multi-update-capable algorithm sets
   root `fully_shard` group by default** (`root_wrap`, on) — the root group never
   reshards after forward. Set `root_wrap: false` for models whose stages call
   submodules of the wrapped object directly (bagel) or that wrap frozen mixed-dtype
-  siblings (hunyuan_image3); a multi-rank run with a trainable param left outside
-  every group then fails fast.
+  siblings (hunyuan_image3); a trainable param left outside every group fails fast
+  at `world_size > 1`, and on a single rank forces `foreach=False` on its optimizer
+  param group (`optim.py`) and explicit norm reduction in `clip_grad_norm`
+  (`backend/fsdp/state.py`) because `_foreach_*` rejects mixed `Tensor` and `DTensor`.
 - **`defer_grad_sync` needs the last micro-batch of an optimizer step to run a
   backward** — the deferred reduce-scatter only fires inside it. If that micro
   skips backward (an all-empty micro) while earlier ones ran, `TrainStack.train`
   raises instead of silently stepping on never-synced grads (which would also
   leak the stale accumulation into the next step's reduce-scatter).
-- **`fsdp_mode: hybrid` makes the HSDP shard group explicit** —
-  `hsdp_shard_size` is the number of contiguous ranks that shard parameters;
-  the remaining `world_size / hsdp_shard_size` dimension holds replicated
-  model copies and synchronizes their gradients. Set it to `devices_per_node`
-  for the usual intra-node FSDP + inter-node replication layout (for example,
-  world 16 with shard 8 gives a `(2, 8)` mesh). Larger groups such as shard 32
-  are supported when the world is a larger divisible multiple. Hybrid fails
-  fast when the shard size does not divide the world or leaves only one replica
-  group; use `full` for that one-group case.
 - **`fsdp_mode: no_shard` trades memory for the all-gather** — a `(world, 1)` mesh
   leaves the full model on every rank, so no parameter bytes cross ranks and only
   gradients are all-reduced (DDP). It pays off where the re-gathered bytes dwarf the
@@ -149,16 +222,33 @@ in `backend/base.py`; a multi-update-capable algorithm sets
   `NCCL_CTA_POLICY` must stay unset or `2`. WORLD keeps the usual `cpu:gloo,cuda:nccl`
   pair, so in `hybrid` mode torch logs one `ProcessGroupGloo::split ... Falling back to
   default options` warning per process while splitting the gloo half; it is expected.
+- **`expandable_segments: true` is for trainside recipes near the memory ceiling** —
+  there, a large request such as an FSDP all-gather buffer that no cached block fits makes
+  the allocator free its cache and retry with a device sync (logged as `memory allocation
+  failed with OOM`). The switch is process-wide and keeps keys already set in
+  `PYTORCH_CUDA_ALLOC_CONF`. It is not validated with a dedicated rollout engine on the
+  trainer's workers: the sglang backends switch it back off, and CUDA IPC weight sync would
+  export expandable segments.
 - **`lora_cfg.frozen_adapters` (OPD teachers) have real weights only after
   `apply_deferred_ops`** — the adapter is injected pre-wrap so meta-init bundles work, but
   its weights load after materialization; reading a teacher earlier sees a null or
   uninitialized adapter. Teachers must be plain LoRA deltas: unconverted base-rewriting
   inits (pissa, olora, ...), `modules_to_save`, `layer_replication`,
   `trainable_token_indices`, DoRA, and `bias != "none"` are rejected at startup.
+- **Every rank must read the same frozen teacher weights** — each rank loads its own shard
+  from its own copy of the path, so after injection the ranks compare each teacher's
+  content sha256 and raise on any difference instead of training against a mixed teacher.
 - **Adapter checkpoints exclude frozen teachers, and resume requires the same teachers** —
   teachers reload from their paths and the checkpoint pins each by a content sha256, so a
   different teacher set or different weights raises on `load`. A checkpoint trained without
   teachers resumes into any teacher set.
+- **`first_update_ratio_tol` on `TrainStack` requires an algorithm that emits
+  `ratio_min` and `ratio_max`.** When set, each rank checks the pre-step micros of a
+  rollout's first update (where the ratio against `old_logp_source: replay` or a
+  weight-synced `old_logp_source: rollout` is 1 up to numerical noise), warns past
+  the tolerance, and reports DP rank 0's worst `|ratio - 1|` as
+  `first_update_ratio_dev`. Algorithms that omit `ratio_min` (`DPPO`, `DRPO`,
+  `CPPO`, `DiffusionNFT`, `SFT`) raise `KeyError` on the first backward micro.
 
 ## Profiling → Perfetto
 
