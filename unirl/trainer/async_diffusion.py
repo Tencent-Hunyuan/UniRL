@@ -60,7 +60,7 @@ class AsyncDiffusionTrainer(AsyncRolloutTrainerMixin, DiffusionTrainer):
                 "trainer."
             )
         algo_cls = get_class(diffusion_kwargs["algorithm_cfg"]["_target_"])
-        if getattr(algo_cls, "requires_per_sample_sde_index", False):
+        if algo_cls.requires_per_sample_sde_index:
             raise ValueError(
                 f"AsyncDiffusionTrainer does not stratify per-prompt SDE steps, which {algo_cls.__name__} "
                 "requires; use the synchronous DiffusionTrainer."

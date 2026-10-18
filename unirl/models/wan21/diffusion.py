@@ -341,7 +341,7 @@ class WAN21DiffusionStage(PerSampleStepReplayMixin, DiffusionStage[WAN21Conditio
     ) -> ReplayResult:
         """Log-prob replay: ``log_probs [B, len(target)]``, means ``[B, len(target), C, T_lat, H_lat, W_lat]``."""
         if segment.sde_index_per_sample is not None:
-            return self._replay_per_sample(conditions, segment=segment, params=params)
+            return self.replay_per_sample(conditions, segment=segment, params=params)
         if segment.sde_indices is None or segment.latents is None:
             raise ValueError("WAN21DiffusionStage.replay: segment.sde_indices / latents missing")
         if segment.sigmas is None:
