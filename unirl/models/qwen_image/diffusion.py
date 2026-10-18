@@ -431,7 +431,7 @@ class QwenImageDiffusionStage(BatchedStepReplayMixin, DiffusionStage[QwenImageCo
 
         if self.batch_replay_steps and len(target) > 1 and isinstance(self.strategy, SDEStrategy):
             with autocast_ctx:
-                return self._replay_batched_steps(
+                return self.replay_batched_steps(
                     conditions,
                     segment=segment,
                     params=params,
@@ -479,7 +479,7 @@ class QwenImageDiffusionStage(BatchedStepReplayMixin, DiffusionStage[QwenImageCo
         means_t = torch.stack(prev_sample_means, dim=1) if prev_sample_means else None
         return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
 
-    def _batched_step_kwargs(self, segment: LatentSegment, params: DiffusionSamplingParams) -> Dict[str, Any]:
+    def batched_step_kwargs(self, segment: LatentSegment, params: DiffusionSamplingParams) -> Dict[str, Any]:
         """Supply latent geometry and distilled guidance."""
         return {
             "latent_h": int(segment.latents.shape[-2]),

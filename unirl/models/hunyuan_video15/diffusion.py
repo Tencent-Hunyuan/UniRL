@@ -28,8 +28,8 @@ class HunyuanVideo15DiffusionStep(DiffusionStep[HunyuanVideo15Bundle, HunyuanVid
     def __init__(
         self,
         *,
-        vision_num_semantic_tokens: int = 729,
-        vision_states_dim: int = 1152,
+        vision_num_semantic_tokens: int,
+        vision_states_dim: int,
     ) -> None:
         self.vision_num_semantic_tokens = vision_num_semantic_tokens
         self.vision_states_dim = vision_states_dim
@@ -263,7 +263,7 @@ class HunyuanVideo15DiffusionStage(BatchedStepReplayMixin, DiffusionStage[Hunyua
         spatial_compression_ratio: Optional[int] = None,
         temporal_compression_ratio: Optional[int] = None,
         latent_channels: Optional[int] = None,
-        batch_replay_steps: bool = False,
+        batch_replay_steps: bool,
     ) -> None:
         self.model = model
         self.step = step
@@ -468,7 +468,7 @@ class HunyuanVideo15DiffusionStage(BatchedStepReplayMixin, DiffusionStage[Hunyua
 
         if self.batch_replay_steps and len(target) > 1 and isinstance(self.strategy, SDEStrategy):
             with autocast_ctx:
-                return self._replay_batched_steps(
+                return self.replay_batched_steps(
                     conditions,
                     segment=segment,
                     params=params,

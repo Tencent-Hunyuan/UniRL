@@ -348,7 +348,7 @@ class ZImageDiffusionStage(BatchedStepReplayMixin, DiffusionStage[ZImageConditio
 
         if self.batch_replay_steps and len(target) > 1 and isinstance(self.strategy, SDEStrategy):
             with autocast_ctx:
-                return self._replay_batched_steps(
+                return self.replay_batched_steps(
                     conditions,
                     segment=segment,
                     params=params,

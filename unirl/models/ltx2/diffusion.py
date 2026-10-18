@@ -171,7 +171,7 @@ class LTX2DiffusionStage(BatchedStepReplayMixin, DiffusionStage[LTX2Conditions])
         trajectory_precision: str = "fp16",
         logprob_precision: str = "fp32",
         audio_joint_sde: bool = True,
-        batch_replay_steps: bool = False,
+        batch_replay_steps: bool,
     ) -> None:
         self.bundle = bundle
         self.step_kernel = LTX2DiffusionStep()
@@ -374,7 +374,7 @@ class LTX2DiffusionStage(BatchedStepReplayMixin, DiffusionStage[LTX2Conditions])
 
         if self.batch_replay_steps and len(target) > 1 and isinstance(self.strategy, SDEStrategy):
             with autocast_ctx:
-                return self._replay_batched_joint_av_steps(
+                return self.replay_batched_joint_av_steps(
                     conditions,
                     segment=segment,
                     params=params,

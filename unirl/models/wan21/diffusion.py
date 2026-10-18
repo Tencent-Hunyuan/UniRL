@@ -200,7 +200,7 @@ class WAN21DiffusionStage(BatchedStepReplayMixin, DiffusionStage[WAN21Conditions
         autocast_precision: str = "bf16",
         trajectory_precision: str = "fp16",
         logprob_precision: str = "fp32",
-        batch_replay_steps: bool = False,
+        batch_replay_steps: bool,
     ) -> None:
         self.model = model
         self.step = step
@@ -367,7 +367,7 @@ class WAN21DiffusionStage(BatchedStepReplayMixin, DiffusionStage[WAN21Conditions
 
         if self.batch_replay_steps and len(target) > 1 and isinstance(self.strategy, SDEStrategy):
             with autocast_ctx:
-                return self._replay_batched_steps(
+                return self.replay_batched_steps(
                     conditions,
                     segment=segment,
                     params=params,
