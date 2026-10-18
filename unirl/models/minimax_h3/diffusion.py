@@ -11,7 +11,7 @@ from unirl.config.require import require
 from unirl.models.types.batched_replay import BatchedStepReplayMixin
 from unirl.models.types.diffusion import DiffusionStage, DiffusionStep, combine_modality_logp
 from unirl.models.types.replay_result import ReplayResult
-from unirl.sde.kernels import SDEStrategy, StepStrategy
+from unirl.sde.kernels import StepStrategy
 from unirl.sde.noise import make_denoise_step_generators
 from unirl.sde.runtime import get_sigma_schedule
 from unirl.types.sampling import DiffusionSamplingParams, compute_trajectory_positions
@@ -295,84 +295,26 @@ class MiniMaxH3DiffusionStage(BatchedStepReplayMixin, DiffusionStage[MiniMaxH3Co
         audio_sigmas = self.audio_schedule(sigmas)
         self.video_strategy.init_schedule(sigmas)
         self.audio_strategy.init_schedule(audio_sigmas)
-        video_sigma_max = float(sigmas[1].item()) if sigmas.numel() > 1 else 0.99
-        audio_sigma_max = float(audio_sigmas[1].item()) if audio_sigmas.numel() > 1 else 0.99
-        num_text_tokens = int(conditions.text.embeds.shape[1])
-        layout = build_t2va_layout(geometry, num_text_tokens)
+        layout = build_t2va_layout(geometry, int(conditions.text.embeds.shape[1]))
 
-        stored = segment.sde_indices.tolist()
-        targets = list(step_indices) if step_indices is not None else stored
-
-        if self.batch_replay_steps and len(targets) > 1 and isinstance(self.video_strategy, SDEStrategy):
-            return self.replay_batched_joint_av_steps(
-                conditions,
-                segment=segment,
-                params=params,
-                target=targets,
-                sigmas=sigmas,
-                sigma_max=video_sigma_max,
-                device=self.bundle.device,
-                predict_av_noise=lambda tiled, v_all, a_all, v_sigma, a_sigma: self.step.predict_noise(
-                    tiled,
-                    video_sample=v_all,
-                    audio_sample=a_all,
-                    video_sigma=v_sigma,
-                    audio_sigma=a_sigma,
-                    layout=layout,
-                ),
-                audio_in_policy=self.audio_joint_sde,
-                audio_strategy=self.audio_strategy,
-                audio_sigmas=audio_sigmas,
-                audio_sigma_max=audio_sigma_max,
-            )
-
-        log_probs: List[torch.Tensor] = []
-        means: List[torch.Tensor] = []
-        for step_idx in targets:
-            x = segment.latents_at(step_idx).to(self.bundle.device)
-            a = segment.aux_latents_at(step_idx).to(self.bundle.device)
-            prev_x = segment.latents_at(step_idx + 1).to(self.bundle.device)
-            prev_a = segment.aux_latents_at(step_idx + 1).to(self.bundle.device)
-
-            video_pred, audio_pred = self.step.predict_noise(
-                conditions,
-                video_sample=x,
-                audio_sample=a,
-                video_sigma=sigmas[step_idx],
-                audio_sigma=audio_sigmas[step_idx],
+        return self.replay_joint_av_steps(
+            conditions,
+            segment=segment,
+            params=params,
+            step_indices=step_indices,
+            sigmas=sigmas,
+            device=self.bundle.device,
+            predict_av_noise=lambda tiled, v_all, a_all, v_sigma, a_sigma: self.step.predict_noise(
+                tiled,
+                video_sample=v_all,
+                audio_sample=a_all,
+                video_sigma=v_sigma,
+                audio_sigma=a_sigma,
                 layout=layout,
-            )
-            _, log_prob, mean = self.video_strategy.denoise(
-                noise_pred=video_pred,
-                sample=x,
-                sigma=sigmas[step_idx],
-                sigma_next=sigmas[step_idx + 1],
-                eta=params.eta,
-                prev_sample=prev_x,
-                sigma_max=video_sigma_max,
-                step_index=step_idx,
-            )
-            if self.audio_joint_sde:
-                _, audio_log_prob, _ = self.audio_strategy.denoise(
-                    noise_pred=audio_pred,
-                    sample=a,
-                    sigma=audio_sigmas[step_idx],
-                    sigma_next=audio_sigmas[step_idx + 1],
-                    eta=params.eta,
-                    prev_sample=prev_a,
-                    sigma_max=audio_sigma_max,
-                    step_index=step_idx,
-                )
-                if audio_log_prob is not None:
-                    log_prob = combine_modality_logp(
-                        log_prob, audio_log_prob, n_video=x[0].numel(), n_audio=a[0].numel()
-                    )
-            log_probs.append(log_prob.to(dtype=self.logprob_dtype))
-            means.append(mean)
-
-        return ReplayResult(
-            log_probs=torch.stack(log_probs, dim=1),
-            prev_sample_means=torch.stack(means, dim=1) if means else None,
+            ),
+            audio_in_policy=self.audio_joint_sde,
+            audio_strategy=self.audio_strategy,
+            audio_sigmas=audio_sigmas,
         )
 
     def nft_clean_latents(self, segment: LatentSegment) -> torch.Tensor:

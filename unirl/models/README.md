@@ -65,21 +65,21 @@ byte-identical `x_T` recipe.
 
 ### Grouped diffusion replay
 
-`BatchedStepReplayMixin` (`types/batched_replay.py`) replays multiple same-shape
-SDE timesteps as one step-major model batch (`[S * B, ...]`). Single-stream
-image and video stages call `replay_batched_steps` (supplying model-specific
-arguments through `batched_step_kwargs`), while joint video/audio stages
-(`LTX-2`, `MiniMax-H3`) call `replay_batched_joint_av_steps` to group aligned
-video and audio trajectories together. Conditions are concatenated in step-major
-order (`type(conditions).concat([conditions] * S)`), and log-probs and
-transition means are restored to `[B, S]` order before the algorithm computes
-its loss.
+`BatchedStepReplayMixin` (`types/batched_replay.py`) unifies serial and
+step-major batched (`[S * B, ...]`) SDE replay. Single-stream image and video
+stages call `replay_steps` (supplying model-specific arguments through
+`batched_step_kwargs`), while joint video/audio stages (`LTX-2`, `MiniMax-H3`)
+call `replay_joint_av_steps` to group aligned video and audio trajectories
+together. When batching multiple steps (`S > 1`), conditions are concatenated in
+step-major order (`type(conditions).concat([conditions] * S)`), and log-probs
+(`[B, S]`) and transition means (`[B, S, *latent]`) are restored to step-second
+order before the algorithm computes its loss.
 
 Grouped replay is an opt-in dense-batch path (`pipeline.batch_replay_steps`,
-default `false`) gated on stateless `SDEStrategy` implementations, retaining the
-serial fallback for other solvers. Because changing forward batch geometry is
-not bit-identical to rollout, the algorithm guard requires
-`old_logp_source: replay`.
+default `false`) gated on `len(target) > 1` and stateless `SDEStrategy`
+implementations, retaining the serial fallback when disabled or for single-step
+slices. Because changing forward batch geometry is not bit-identical to rollout,
+the algorithm guard requires `old_logp_source: replay`.
 
 **Extending it:** a new model is a new `unirl/models/<model>/` with
 `config.py` / `bundle.py` / `diffusion.py`|`ar.py` / `conditions.py` / `pipeline.py`

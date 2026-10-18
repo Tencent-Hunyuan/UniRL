@@ -126,12 +126,12 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   with the anchor swapped from the EMA shadow to the LoRA-disabled base, so the two share a scale
   and can be read side by side as drift-from-shadow against drift-from-base. DiffusionNFT trains on
   a freshly noised `xt` rather than the rollout trajectory, so it has no `stage.replay` step indices
-  to hand `_transition_sigma`. `segment.sigmas` is present (`train_timestep_mode: all` requires it)
+  to hand `transition_sigma`. `segment.sigmas` is present (`train_timestep_mode: all` requires it)
   and so is `t_batch`, so a time weight is available if one is ever wanted; what is absent is the SDE
   transition std itself, because every NFT recipe runs `eta: 0.0` and that std vanishes with `eta` —
   the same trap the DiffusionOPD bullet above raises on. That leaves the `add_kl_coefficient=false`
   variant minus the `/2`, so the number is **not** comparable to FlowGRPO/FlowDPPO's `kl_ref_mean`, which carries
-  `_gaussian_kl_div`'s `/(2σ²)`. Measuring on the prediction rather than the reconstructed `x0`
+  `gaussian_kl_div`'s `/(2σ²)`. Measuring on the prediction rather than the reconstructed `x0`
   drops the `t²` Jacobian of `xt - t*pred`, spreading pressure uniformly over trained timesteps
   instead of `t²`-weighting it — the magnitude still moves with `t` (training lower timesteps raises
   it several-fold).

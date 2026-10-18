@@ -11,7 +11,7 @@ import torch
 from unirl.models.types.batched_replay import BatchedStepReplayMixin
 from unirl.models.types.diffusion import DiffusionStage, DiffusionStep, combine_modality_logp
 from unirl.models.types.replay_result import ReplayResult
-from unirl.sde.kernels import SDEStrategy, StepStrategy
+from unirl.sde.kernels import StepStrategy
 from unirl.sde.noise import make_denoise_step_generators
 from unirl.types.sampling import DiffusionSamplingParams, compute_trajectory_positions
 from unirl.types.segments.latent import LatentSegment, make_video_segment
@@ -349,126 +349,37 @@ class LTX2DiffusionStage(BatchedStepReplayMixin, DiffusionStage[LTX2Conditions])
                 "Was the segment produced by this stage's generate()?"
             )
 
-        guidance_scale = params.guidance_scale
-        eta = params.eta
         latent_t, latent_h, latent_w = self._latent_geometry(params)
         audio_t = _audio_num_frames(params.num_frames, _LTX2_FRAME_RATE)
-
-        sde_set = set(segment.sde_indices.tolist())
-        target = list(step_indices) if step_indices is not None else segment.sde_indices.tolist()
-        bad = [i for i in target if i not in sde_set]
-        if bad:
-            raise ValueError(
-                f"LTX2DiffusionStage.replay: step_indices {bad} not in segment.sde_indices={sorted(sde_set)}"
-            )
-
         device = segment.latents.device
         sigmas = segment.sigmas.to(device)
-        sigma_max = float(sigmas[1].item()) if int(sigmas.shape[0]) > 1 else 0.99
-
-        log_probs: List[torch.Tensor] = []
-        prev_sample_means: List[torch.Tensor] = []
         autocast_ctx = (
             torch.autocast("cuda", dtype=self.autocast_dtype) if self.autocast_dtype != torch.float32 else nullcontext()
         )
-
-        if self.batch_replay_steps and len(target) > 1 and isinstance(self.strategy, SDEStrategy):
-            with autocast_ctx:
-                return self.replay_batched_joint_av_steps(
-                    conditions,
-                    segment=segment,
-                    params=params,
-                    target=target,
-                    sigmas=sigmas,
-                    sigma_max=sigma_max,
-                    device=device,
-                    predict_av_noise=lambda tiled, v_all, a_all, v_sigma, _a_sigma: self.step_kernel.predict_noise(
-                        self.bundle,
-                        v_all,
-                        v_sigma,
-                        tiled,
-                        guidance_scale=guidance_scale,
-                        latent_num_frames=latent_t,
-                        latent_height=latent_h,
-                        latent_width=latent_w,
-                        audio_sample=a_all,
-                        audio_num_frames=audio_t,
-                    ),
-                    audio_in_policy=self._audio_in_policy,
-                    concat_audio_mean=True,
-                    latent_dtype=self.trajectory_dtype,
-                )
-
         with autocast_ctx:
-            for step_idx in target:
-                sigma = sigmas[step_idx].to(dtype=torch.float32)
-                sigma_next = sigmas[step_idx + 1].to(dtype=torch.float32)
-                sample = segment.latents_at(step_idx).to(device=device, dtype=self.trajectory_dtype)
-                prev_sample = segment.latents_at(step_idx + 1).to(device=device, dtype=self.trajectory_dtype)
-                audio_sample = segment.aux_latents_at(step_idx).to(device=device, dtype=self.trajectory_dtype)
-
-                video_pred, audio_pred = self.step_kernel.predict_noise(
+            return self.replay_joint_av_steps(
+                conditions,
+                segment=segment,
+                params=params,
+                step_indices=step_indices,
+                sigmas=sigmas,
+                device=device,
+                predict_av_noise=lambda tiled, v_all, a_all, v_sigma, audio_sigma: self.step_kernel.predict_noise(
                     self.bundle,
-                    sample,
-                    sigma.expand(sample.shape[0]),
-                    conditions,
-                    guidance_scale=guidance_scale,
+                    v_all,
+                    v_sigma,
+                    tiled,
+                    guidance_scale=params.guidance_scale,
                     latent_num_frames=latent_t,
                     latent_height=latent_h,
                     latent_width=latent_w,
-                    audio_sample=audio_sample,
+                    audio_sample=a_all,
                     audio_num_frames=audio_t,
-                )
-
-                _, log_prob, prev_mean = self.strategy.denoise(
-                    noise_pred=video_pred,
-                    sample=sample,
-                    sigma=sigma,
-                    sigma_next=sigma_next,
-                    eta=eta,
-                    prev_sample=prev_sample,
-                    sigma_max=sigma_max,
-                    step_index=step_idx,
-                )
-                if log_prob is None:
-                    raise RuntimeError(
-                        f"LTX2DiffusionStage.replay: strategy returned None log-prob at step_index={step_idx} "
-                        f"(deterministic mode); replay requires a stochastic SDE strategy."
-                    )
-
-                if self._audio_in_policy:
-                    audio_prev = segment.aux_latents_at(step_idx + 1).to(device=device, dtype=self.trajectory_dtype)
-                    _, audio_log_prob, audio_prev_mean = self.strategy.denoise(
-                        noise_pred=audio_pred,
-                        sample=audio_sample,
-                        sigma=sigma,
-                        sigma_next=sigma_next,
-                        eta=eta,
-                        prev_sample=audio_prev,
-                        sigma_max=sigma_max,
-                        step_index=step_idx,
-                    )
-                    if audio_log_prob is None:
-                        raise RuntimeError(
-                            f"LTX2DiffusionStage.replay: audio strategy returned None log-prob at "
-                            f"step_index={step_idx}; joint audio SDE requires a stochastic strategy."
-                        )
-                    log_prob = combine_modality_logp(
-                        log_prob,
-                        audio_log_prob,
-                        n_video=sample[0].numel(),
-                        n_audio=audio_sample[0].numel(),
-                    )
-                    if prev_mean is not None and audio_prev_mean is not None:
-                        prev_mean = torch.cat([prev_mean, audio_prev_mean], dim=1)
-
-                log_probs.append(log_prob)
-                if prev_mean is not None:
-                    prev_sample_means.append(prev_mean)
-
-        log_probs_t = torch.stack(log_probs, dim=1).to(dtype=self.logprob_dtype)
-        means_t = torch.stack(prev_sample_means, dim=1) if prev_sample_means else None
-        return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
+                ),
+                audio_in_policy=self._audio_in_policy,
+                concat_audio_mean=True,
+                latent_dtype=self.trajectory_dtype,
+            )
 
 
 __all__ = ["LTX2DiffusionStep", "LTX2DiffusionStage"]
