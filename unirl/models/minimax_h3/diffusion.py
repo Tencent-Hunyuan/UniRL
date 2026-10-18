@@ -8,9 +8,10 @@ from typing import ClassVar, List, Optional, Tuple
 import torch
 
 from unirl.config.require import require
+from unirl.models.types.batched_replay import BatchedStepReplayMixin
 from unirl.models.types.diffusion import DiffusionStage, DiffusionStep, combine_modality_logp
 from unirl.models.types.replay_result import ReplayResult
-from unirl.sde.kernels import StepStrategy
+from unirl.sde.kernels import SDEStrategy, StepStrategy
 from unirl.sde.noise import make_denoise_step_generators
 from unirl.sde.runtime import get_sigma_schedule
 from unirl.types.sampling import DiffusionSamplingParams, compute_trajectory_positions
@@ -86,7 +87,7 @@ class MiniMaxH3DiffusionStep(DiffusionStep[MiniMaxH3Bundle, MiniMaxH3Conditions]
         return -video_velocity, -audio_velocity
 
 
-class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
+class MiniMaxH3DiffusionStage(BatchedStepReplayMixin, DiffusionStage[MiniMaxH3Conditions]):
     """Rollout-level MiniMax-H3 stage: conditions -> ``LatentSegment``."""
 
     _no_split_modules: ClassVar[List[str]] = ["MiniMaxH3TransformerBlock"]
@@ -100,6 +101,7 @@ class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
         audio_joint_sde: bool = True,
         trajectory_precision: str = "fp16",
         logprob_precision: str = "fp32",
+        batch_replay_steps: bool,
     ) -> None:
         self.bundle = bundle
         self.step = MiniMaxH3DiffusionStep(bundle)
@@ -111,6 +113,7 @@ class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
         self.audio_joint_sde = bool(audio_joint_sde)
         self.trajectory_dtype = parse_torch_dtype(trajectory_precision, field_name="trajectory_precision")
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="logprob_precision")
+        self.batch_replay_steps = batch_replay_steps
 
     def trainable_module(self) -> torch.nn.Module:
         return self.bundle.transformer
@@ -299,6 +302,29 @@ class MiniMaxH3DiffusionStage(DiffusionStage[MiniMaxH3Conditions]):
 
         stored = segment.sde_indices.tolist()
         targets = list(step_indices) if step_indices is not None else stored
+
+        if self.batch_replay_steps and len(targets) > 1 and isinstance(self.video_strategy, SDEStrategy):
+            return self.replay_batched_joint_av_steps(
+                conditions,
+                segment=segment,
+                params=params,
+                target=targets,
+                sigmas=sigmas,
+                sigma_max=video_sigma_max,
+                device=self.bundle.device,
+                predict_av_noise=lambda tiled, v_all, a_all, v_sigma, a_sigma: self.step.predict_noise(
+                    tiled,
+                    video_sample=v_all,
+                    audio_sample=a_all,
+                    video_sigma=v_sigma,
+                    audio_sigma=a_sigma,
+                    layout=layout,
+                ),
+                audio_in_policy=self.audio_joint_sde,
+                audio_strategy=self.audio_strategy,
+                audio_sigmas=audio_sigmas,
+                audio_sigma_max=audio_sigma_max,
+            )
 
         log_probs: List[torch.Tensor] = []
         means: List[torch.Tensor] = []
