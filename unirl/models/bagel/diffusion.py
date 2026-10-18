@@ -338,7 +338,6 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
             image_sizes=image_shapes,
             new_token_ids=self.model.new_token_ids,
         )
-        gi["query_lengths"] = gi["packed_seqlens"].tolist()
         gi_cfg_text = bagel.prepare_vae_latent_cfg(
             curr_kvlens=cfg_text["kv_lens"],
             curr_rope=cfg_text["ropes"],
@@ -643,7 +642,7 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
                 device=device,
             )
             forward_kwargs = self._forward_kwargs(packed_gen, cfg_text, cfg_img, gi, gi_cfg_text, gi_cfg_img, params)
-            forward_kwargs["query_lengths"] = gi["query_lengths"]
+            forward_kwargs["split_sequences"] = True
             num_tokens = gi["packed_vae_token_indexes"].numel() // repeats
             x_t = torch.stack([segment.latents_at(i)[0][:num_tokens].to(device) for i in target])
             prev_sample = torch.stack([segment.latents_at(i + 1)[0][:num_tokens].to(device) for i in target])
@@ -657,8 +656,6 @@ class BagelDiffusionStage(DiffusionStage[BagelDiffusionConditions]):
                     bagel,
                     x_t=x_t.flatten(0, 1),
                     timestep=timestep,
-                    cfg_text_scale=1.0,
-                    cfg_img_scale=1.0,
                     **forward_kwargs,
                 ).view_as(x_t)
                 _, log_prob, prev_mean = self.strategy.denoise(

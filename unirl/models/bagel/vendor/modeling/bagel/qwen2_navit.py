@@ -233,7 +233,7 @@ def pad_sequence(tensor, pad_size):
     return torch.cat([tensor, pad_tensor], dim=1)
 
 
-def _apply_by_sequence(module, packed_tensor, sequence_lengths: Optional[List[int]] = None):
+def apply_by_sequence(module, packed_tensor, sequence_lengths: Optional[List[int]]):
     if not sequence_lengths or len(sequence_lengths) <= 1:
         return module(packed_tensor)
     return torch.cat([module(chunk) for chunk in packed_tensor.split(sequence_lengths, dim=0)], dim=0)
@@ -243,7 +243,7 @@ def _apply_selected_by_sequence(
     module,
     packed_tensor,
     selected_indexes,
-    sequence_lengths: Optional[List[int]] = None,
+    sequence_lengths: Optional[List[int]],
 ):
     if not sequence_lengths or len(sequence_lengths) <= 1:
         return module(packed_tensor[selected_indexes])
