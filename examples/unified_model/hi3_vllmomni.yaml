@@ -24,8 +24,8 @@ batch_size: 8                 # prompts per rollout; must be divisible by num_de
 weight_sync_interval: 1
 
 # >1 overlaps adjacent prompt-tree chunks across the AR and DiT engines, with
-# one pending call per engine. Keep 1 until the target batch shape is measured:
-# splitting this batch_size=2 recipe may reduce per-engine batch throughput.
+# one pending call per engine. Keep 1 on 1x8 when batch_size*samples_per_prompt <= 16
+# so the AR engine batches all sequences in one pass; raise on multi-node or larger batches.
 rollout_pipeline_chunks: 1
 
 # Intrusive debug dump (UnifiedModelTrainer._dump_rollout): per rollout, dump original
