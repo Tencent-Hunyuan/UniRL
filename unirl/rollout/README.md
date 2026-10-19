@@ -81,6 +81,28 @@ internally — and dispatch `generate` with `DP_SCATTER`). A dedicated engine al
 implements its weight-receive method and a matching `sync:` handler in
 `../distributed/weight_sync`.
 
+### Manager telemetry
+
+`RolloutPool.snapshot()` and `RolloutManager.snapshot()` return immutable local
+state without probing handles, resolving results, filtering or RPCs.
+Read the manager on the driver thread between operations. Only pool state is locked.
+
+`launch_reserved_tasks` counts dequeued tasks awaiting handle registration;
+calls may already be issued. `capacity_tasks` sums slot capacity, not the trainer
+admission limit. `pending_roots` counts incomplete terminal-sibling sets.
+`oldest_ready_output_version` is the lowest generated-Part version in ready storage.
+It excludes unresolved handles and is `None` when no generated Parts exist there.
+
+`drain_metrics()` returns `(snapshot, delta)` for one consumer. Its baseline starts
+at zero and advances only on successful reads. Other readers use `snapshot()`.
+Counters record events, not unique samples:
+
+| Counters | Counted event |
+|---|---|
+| `launched_tasks`, `completed_tasks` | Handle registration and observed readiness. Resolution can still fail. |
+| `dropped_groups` | Logical groups removed by a successful complete-buffer filter, not necessarily for staleness. |
+| `carried_tasks`, `finished_tasks` | Tasks returned by successful quiesce; inputs of successful finish after routing/filtering. |
+
 ## Engine anatomy, and adding a model to an existing engine
 
 Engine dirs use two layouts. The compact engines (`trainside`, `fastvideo`,
@@ -191,6 +213,10 @@ enabled, which UniRL's rollout backend does not do.
   `output_version`; immutable buffered groups keep their original provenance and
   remain subject to the configured filter. Eval/checkpoint admission still requires
   an empty manager. Launch and scoring order remains trainer policy.
+- **Telemetry reads reject closed or failed managers.** They may surface a
+  background pool error earlier than quiesce, without additionally poisoning
+  the manager.
+- **Telemetry counters restart with the manager.** Checkpoints do not restore them.
 - **A resolve/route failure poisons the `RolloutManager`** — samples may already be
   lost, so every later call (including `empty` / `counts`) re-raises the original
   error rather than reporting clean state; only `close()` stays safe.

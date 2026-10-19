@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple
 
 from unirl.rollout.manager import (
     RolloutManager,
@@ -15,6 +15,9 @@ from unirl.rollout.manager import (
 from unirl.trainer.base import unwrap_replicated_int
 from unirl.types.sample import Sample
 from unirl.types.sampling import total_samples_per_prompt
+
+if TYPE_CHECKING:
+    from unirl.rollout.manager import RolloutSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +51,29 @@ def resolve_separate_worker_concurrency(
         else rollout_concurrency
     )
     return train_devices, worker_concurrency
+
+
+def _rollout_manager_metrics(
+    snapshot: RolloutSnapshot,
+    *,
+    train_version: int,
+    phase: Literal["pre_sync", "step_end"],
+) -> Dict[str, Optional[float]]:
+    pool = snapshot.pool
+    oldest = snapshot.oldest_ready_output_version
+    metrics = {
+        "queued_prompts": pool.queued_tasks,
+        "ready_groups": snapshot.ready_groups,
+        "max_ready_lag_updates": None if oldest is None else train_version - oldest,
+    }
+    if phase == "pre_sync":
+        metrics.update(
+            launch_reserved_prompts=pool.launch_reserved_tasks,
+            running_prompts=pool.running_tasks,
+            completed_unrouted_prompts=pool.completed_unrouted_tasks,
+            slot_occupancy=(pool.running_tasks + pool.launch_reserved_tasks) / pool.capacity_tasks,
+        )
+    return {f"async/{phase}_{key}": value for key, value in metrics.items()}
 
 
 class AsyncRolloutTrainerMixin:
@@ -117,6 +143,9 @@ class AsyncRolloutTrainerMixin:
         try:
             for rollout_id in range(start_rollout, num_rollouts):
                 t0 = time.perf_counter()
+                self._admitted_prompts_delta = 0
+                self._carry_resubmitted_prompts_delta = 0
+                self._rollout_metrics: Dict[str, Optional[float]] = {}
                 hard_boundary = num_rollouts
                 for interval in (self.eval_interval, save_interval):
                     if interval > 0:
@@ -151,6 +180,12 @@ class AsyncRolloutTrainerMixin:
                     },
                 )
                 self._reset_transport_buffers()
+                if self.wandb_logger.enabled:
+                    self._rollout_metrics.update(
+                        _rollout_manager_metrics(
+                            self._rollout_manager.snapshot(), train_version=self._train_version, phase="pre_sync"
+                        )
+                    )
                 self.wandb_logger.log_progress(rollout_id, num_rollouts, result, mean_reward, logger=logger)
 
                 step = rollout_id + 1
@@ -162,6 +197,25 @@ class AsyncRolloutTrainerMixin:
 
                 if step >= num_rollouts and not self._rollout_manager.empty:
                     raise RuntimeError("final rollout boundary requires an empty RolloutManager")
+
+                if self.wandb_logger.enabled:
+                    snapshot, delta = self._rollout_manager.drain_metrics()
+                    self._rollout_metrics.update(
+                        _rollout_manager_metrics(snapshot, train_version=self._train_version, phase="step_end")
+                    )
+                    self._rollout_metrics.update(
+                        {
+                            "async/capacity_prompts": snapshot.pool.capacity_tasks,
+                            "async/launched_prompts_delta": delta.launched_tasks,
+                            "async/completed_prompts_delta": delta.completed_tasks,
+                            "async/dropped_groups_delta": delta.dropped_groups,
+                            "async/carried_prompts_delta": delta.carried_tasks,
+                            "async/finished_prompts_delta": delta.finished_tasks,
+                            "async/admitted_prompts_delta": self._admitted_prompts_delta,
+                            "async/carry_resubmitted_prompts_delta": self._carry_resubmitted_prompts_delta,
+                        }
+                    )
+                    self.wandb_logger.log_rollout(step, self._rollout_metrics)
 
                 if eval_due:
                     self._boundary_evaluate(rollout_id, initial=False)
@@ -226,6 +280,7 @@ class AsyncRolloutTrainerMixin:
         manager.sync_weights(self.weight_sync, output_version=self._train_version)
         if carried:
             manager.submit(carried)
+            self._carry_resubmitted_prompts_delta += len(carried)
         self._batches_since_sync = 0
 
     def _next_rollout_batch(
@@ -235,6 +290,7 @@ class AsyncRolloutTrainerMixin:
         hard_boundary: int,
     ) -> Tuple[Sample, int]:
         self._admit_prompts(
+            phase="collect",
             trained_batches=rollout_id,
             hard_boundary=hard_boundary,
             batches_since_sync=self._batches_since_sync,
@@ -257,6 +313,7 @@ class AsyncRolloutTrainerMixin:
         # for AR and after scoring for trainers that require reap-time scoring.
         if self._refill_before_score:
             self._admit_prompts(
+                phase="refill",
                 trained_batches=rollout_id + 1,
                 hard_boundary=hard_boundary,
                 batches_since_sync=self._batches_since_sync + 1,
@@ -267,6 +324,7 @@ class AsyncRolloutTrainerMixin:
 
         if not self._refill_before_score:
             self._admit_prompts(
+                phase="refill",
                 trained_batches=rollout_id + 1,
                 hard_boundary=hard_boundary,
                 batches_since_sync=self._batches_since_sync + 1,
@@ -277,6 +335,7 @@ class AsyncRolloutTrainerMixin:
     def _admit_prompts(
         self,
         *,
+        phase: Literal["collect", "refill"],
         trained_batches: int,
         hard_boundary: int,
         batches_since_sync: int,
@@ -294,8 +353,12 @@ class AsyncRolloutTrainerMixin:
         # budget permits it; unlike a sync boundary, eval/save/final remain hard.
         freshness_batches = max(0, self._max_staleness - batches_since_sync + 1)
         remaining_batches = max(0, hard_boundary - trained_batches)
-        allowed_batches = min(self._max_inflight, freshness_batches, remaining_batches)
-        for _ in range(max(0, allowed_batches - outstanding_batches)):
+        headrooms = (
+            max(0, self._max_inflight - outstanding_batches) * self.batch_size,
+            max(0, freshness_batches - outstanding_batches) * self.batch_size,
+            max(0, remaining_batches - outstanding_batches) * self.batch_size,
+        )
+        for _ in range(min(headrooms) // self.batch_size):
             request = self._build_request_sample(
                 self.data_source.get_samples(self.batch_size),
                 self._next_generation_id,
@@ -305,6 +368,15 @@ class AsyncRolloutTrainerMixin:
             if len(prompts) != self.batch_size:
                 raise RuntimeError(f"request batch split into {len(prompts)} prompts; expected {self.batch_size}")
             self._rollout_manager.submit(prompts)
+            self._admitted_prompts_delta += len(prompts)
+        if self.wandb_logger.enabled:
+            self._rollout_metrics.update(
+                {
+                    f"async/admission_{phase}_capacity_headroom_prompts": headrooms[0],
+                    f"async/admission_{phase}_freshness_headroom_prompts": headrooms[1],
+                    f"async/admission_{phase}_boundary_headroom_prompts": headrooms[2],
+                }
+            )
 
 
 __all__ = [
