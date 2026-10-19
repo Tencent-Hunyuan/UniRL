@@ -42,6 +42,7 @@ pipeline:
   trajectory_precision: fp16
   logprob_precision: fp32
   max_sequence_length: 512
+  batch_replay_steps: true
   strategy: ${strategy}
 
 backend:

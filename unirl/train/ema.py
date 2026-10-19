@@ -116,6 +116,11 @@ def inject_nft(
     """Inject dual LoRA adapters for NFT-style EMA.  Returns Shadow."""
     from peft import LoraConfig, inject_adapter_in_model
 
+    if bias != "none":
+        raise ValueError(
+            f"inject_nft: bias must be 'none', got {bias!r}; "
+            "trainable LoRA biases mutate shared base_layer.bias in place and are unsupported."
+        )
     peft_cfg = LoraConfig(
         r=int(rank),
         lora_alpha=int(alpha),

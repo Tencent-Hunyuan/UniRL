@@ -93,6 +93,11 @@ def inject_lora(
     """Inject a single LoRA adapter.  No Shadow, no EMA."""
     from peft import LoraConfig, inject_adapter_in_model
 
+    if bias != "none":
+        raise ValueError(
+            f"inject_lora: bias must be 'none', got {bias!r}; "
+            "trainable LoRA biases mutate shared base_layer.bias in place and are unsupported."
+        )
     peft_target_modules, log_target = resolve_target_modules_pattern(
         target_modules=target_modules,
         module_prefix=module_prefix,
