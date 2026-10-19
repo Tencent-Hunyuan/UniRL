@@ -46,6 +46,7 @@ class HunyuanVideo15PipelineConfig:
     load_vision_encoder: bool = False
 
     load_vae: bool = True
+    load_text_encoder: bool = True
 
     use_lora: bool = False
     lora_target_modules: Optional[List[str]] = None

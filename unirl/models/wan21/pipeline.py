@@ -42,11 +42,9 @@ class WAN21Pipeline(Pipeline):
     ) -> None:
         super().__init__()
         self.bundle = bundle
-        self.text_embed = (
-            text_embed
-            if text_embed is not None
-            else WAN21TextEmbedStage(bundle, max_sequence_length=int(max_sequence_length))
-        )
+        if text_embed is None and bundle.text_encoder is not None:
+            text_embed = WAN21TextEmbedStage(bundle, max_sequence_length=int(max_sequence_length))
+        self.text_embed = text_embed
         if diffusion is None:
             diffusion = WAN21DiffusionStage(
                 model=bundle,
@@ -85,7 +83,11 @@ class WAN21Pipeline(Pipeline):
     ) -> "WAN21Pipeline":
         """Build the full pipeline from a config."""
         bundle = WAN21Bundle.from_config(config)
-        text_embed = WAN21TextEmbedStage(bundle, max_sequence_length=config.max_sequence_length)
+        text_embed = (
+            WAN21TextEmbedStage(bundle, max_sequence_length=config.max_sequence_length)
+            if bundle.text_encoder is not None
+            else None
+        )
         step = WAN21DiffusionStep()
         diffusion = WAN21DiffusionStage(
             model=bundle,
@@ -117,6 +119,11 @@ class WAN21Pipeline(Pipeline):
             raise ValueError(
                 f"WAN21Pipeline.build_conditions: negative_text length "
                 f"{len(negatives.texts)} != text length {len(texts.texts)}"
+            )
+        if self.text_embed is None:
+            raise RuntimeError(
+                "WAN21Pipeline.build_conditions: no text_embed stage "
+                "(load_text_encoder=False); trainside conditioning requires load_text_encoder=True."
             )
         text_cond = self.text_embed.embed(texts)
         if negatives is None and float(guidance_scale) > 1.0:

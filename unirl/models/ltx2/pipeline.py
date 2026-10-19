@@ -41,7 +41,7 @@ class LTX2Pipeline(Pipeline):
         self,
         *,
         bundle: LTX2Bundle,
-        text_embed: LTX2TextEmbedStage,
+        text_embed: Optional[LTX2TextEmbedStage],
         diffusion: LTX2DiffusionStage,
         vae_decode: LTX2VAEDecodeStage,
         vae_encode: Optional[LTX2VAEEncodeStage],
@@ -82,7 +82,7 @@ class LTX2Pipeline(Pipeline):
         if strategy is None:
             strategy = FlowSDEStrategy()
 
-        text_embed = LTX2TextEmbedStage(bundle)
+        text_embed = LTX2TextEmbedStage(bundle) if bundle.text_encoder is not None else None
         diffusion = LTX2DiffusionStage(
             bundle,
             strategy=strategy,
@@ -151,6 +151,11 @@ class LTX2Pipeline(Pipeline):
     def _denormalize_latents(self, latents: torch.Tensor) -> torch.Tensor:
         """Channel-wise denormalize a 5D latent by the VAE's ``latents_mean/std`` and ``scaling_factor`` pre-decode."""
         vae = self.bundle.vae
+        if vae is None:
+            raise RuntimeError(
+                "LTX2Pipeline._denormalize_latents: no VAE loaded (load_vae=False); "
+                "trainside rollout requires load_vae=True."
+            )
         mean = vae.latents_mean.view(1, -1, 1, 1, 1).to(latents.device, latents.dtype)
         std = vae.latents_std.view(1, -1, 1, 1, 1).to(latents.device, latents.dtype)
         return latents * std / vae.config.scaling_factor + mean
@@ -167,6 +172,11 @@ class LTX2Pipeline(Pipeline):
             raise ValueError(
                 f"LTX2Pipeline.build_conditions: negative_text length "
                 f"{len(negatives.texts)} != text length {len(texts.texts)}"
+            )
+        if self.text_embed is None:
+            raise RuntimeError(
+                "LTX2Pipeline.build_conditions: no text_embed stage "
+                "(load_text_encoder=False); trainside conditioning requires load_text_encoder=True."
             )
         if negatives is None and float(guidance_scale) > 1.0:
             negatives = Texts(texts=[""] * len(texts.texts))

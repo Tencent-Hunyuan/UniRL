@@ -23,8 +23,8 @@ class WAN21Bundle(Bundle):
         *,
         transformer: nn.Module,
         vae: Optional[nn.Module],
-        text_encoder: nn.Module,
-        tokenizer: Any,
+        text_encoder: Optional[nn.Module],
+        tokenizer: Optional[Any],
         dtype: torch.dtype,
         device: torch.device,
         pretrained_path: str,
@@ -102,12 +102,16 @@ class WAN21Bundle(Bundle):
             )
             vae.requires_grad_(False)
 
-        text_encoder = (
-            UMT5EncoderModel.from_pretrained(te_path, subfolder="text_encoder", torch_dtype=te_dtype).to(device).eval()
-        )
-        text_encoder.requires_grad_(False)
-
-        tokenizer = AutoTokenizer.from_pretrained(te_path, subfolder="tokenizer")
+        text_encoder: Optional[nn.Module] = None
+        tokenizer: Optional[Any] = None
+        if config.load_text_encoder:
+            text_encoder = (
+                UMT5EncoderModel.from_pretrained(te_path, subfolder="text_encoder", torch_dtype=te_dtype)
+                .to(device)
+                .eval()
+            )
+            text_encoder.requires_grad_(False)
+            tokenizer = AutoTokenizer.from_pretrained(te_path, subfolder="tokenizer")
 
         raw_image_dim = transformer.config.image_dim
         image_dim = 0 if raw_image_dim is None else int(raw_image_dim)

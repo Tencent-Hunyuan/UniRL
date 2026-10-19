@@ -49,6 +49,8 @@ class LTX2PipelineConfig:
     lora_target_modules: Optional[list] = None
 
     aux_components_on_cpu: bool = False
+    load_vae: bool = True
+    load_text_encoder: bool = True
 
     def __post_init__(self) -> None:
         validate_precision_type(self.model_precision, field="LTX2PipelineConfig.model_precision")

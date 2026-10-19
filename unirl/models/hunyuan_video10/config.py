@@ -43,6 +43,9 @@ class HunyuanVideo10PipelineConfig:
     use_lora: bool = False
     lora_target_modules: Optional[List[str]] = None
 
+    load_vae: bool = True
+    load_text_encoder: bool = True
+
     def __post_init__(self) -> None:
         validate_precision_type(self.model_precision, field="HunyuanVideo10PipelineConfig.model_precision")
         self.hidden_state_skip_layer = int(self.hidden_state_skip_layer)

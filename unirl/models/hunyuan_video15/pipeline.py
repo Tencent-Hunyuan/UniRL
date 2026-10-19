@@ -48,17 +48,15 @@ class HunyuanVideo15Pipeline(Pipeline):
     ) -> None:
         super().__init__()
         self.bundle = bundle
-        self.text_embed = (
-            text_embed
-            if text_embed is not None
-            else HunyuanVideo15TextEmbedStage(
+        if text_embed is None and bundle.text_encoder is not None:
+            text_embed = HunyuanVideo15TextEmbedStage(
                 bundle,
                 mllm_max_length=mllm_max_length,
                 mllm_crop_start=mllm_crop_start,
                 mllm_skip_layers=mllm_skip_layers,
                 byt5_max_length=byt5_max_length,
             )
-        )
+        self.text_embed = text_embed
         if diffusion is None:
             diffusion = HunyuanVideo15DiffusionStage(
                 model=bundle,
@@ -105,12 +103,16 @@ class HunyuanVideo15Pipeline(Pipeline):
     ) -> "HunyuanVideo15Pipeline":
         """Build the full pipeline from a config."""
         bundle = HunyuanVideo15Bundle.from_config(config)
-        text_embed = HunyuanVideo15TextEmbedStage(
-            bundle,
-            mllm_max_length=config.mllm_max_length,
-            mllm_crop_start=config.mllm_crop_start,
-            mllm_skip_layers=config.mllm_skip_layers,
-            byt5_max_length=config.byt5_max_length,
+        text_embed = (
+            HunyuanVideo15TextEmbedStage(
+                bundle,
+                mllm_max_length=config.mllm_max_length,
+                mllm_crop_start=config.mllm_crop_start,
+                mllm_skip_layers=config.mllm_skip_layers,
+                byt5_max_length=config.byt5_max_length,
+            )
+            if bundle.text_encoder is not None
+            else None
         )
         step = HunyuanVideo15DiffusionStep(
             vision_num_semantic_tokens=config.vision_num_semantic_tokens,
@@ -147,6 +149,11 @@ class HunyuanVideo15Pipeline(Pipeline):
             raise ValueError(
                 f"HunyuanVideo15Pipeline.build_conditions: negative_text length "
                 f"{len(negatives.texts)} != text length {len(texts.texts)}"
+            )
+        if self.text_embed is None:
+            raise RuntimeError(
+                "HunyuanVideo15Pipeline.build_conditions: no text_embed stage "
+                "(load_text_encoder=False); trainside conditioning requires load_text_encoder=True."
             )
         if negatives is None and float(guidance_scale) > 1.0:
             negatives = Texts(texts=[""] * len(texts.texts))

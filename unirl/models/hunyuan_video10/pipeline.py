@@ -45,17 +45,15 @@ class HunyuanVideo10Pipeline(Pipeline):
         batch_replay_steps: bool = False,
     ) -> None:
         self.bundle = bundle
-        self.text_embed = (
-            text_embed
-            if text_embed is not None
-            else HunyuanVideo10TextEmbedStage(
+        if text_embed is None and bundle.text_encoder is not None:
+            text_embed = HunyuanVideo10TextEmbedStage(
                 bundle,
                 llama_max_length=llama_max_length,
                 clip_max_length=clip_max_length,
                 crop_start=crop_start,
                 hidden_state_skip_layer=hidden_state_skip_layer,
             )
-        )
+        self.text_embed = text_embed
         if diffusion is None:
             diffusion = HunyuanVideo10DiffusionStage(
                 model=bundle,
@@ -99,12 +97,16 @@ class HunyuanVideo10Pipeline(Pipeline):
     ) -> "HunyuanVideo10Pipeline":
         """Build the full pipeline from a config."""
         bundle = HunyuanVideo10Bundle.from_config(config)
-        text_embed = HunyuanVideo10TextEmbedStage(
-            bundle,
-            llama_max_length=config.llama_max_length,
-            clip_max_length=config.clip_max_length,
-            crop_start=config.crop_start,
-            hidden_state_skip_layer=config.hidden_state_skip_layer,
+        text_embed = (
+            HunyuanVideo10TextEmbedStage(
+                bundle,
+                llama_max_length=config.llama_max_length,
+                clip_max_length=config.clip_max_length,
+                crop_start=config.crop_start,
+                hidden_state_skip_layer=config.hidden_state_skip_layer,
+            )
+            if bundle.text_encoder is not None
+            else None
         )
         step = HunyuanVideo10DiffusionStep()
         diffusion = HunyuanVideo10DiffusionStage(
@@ -134,6 +136,11 @@ class HunyuanVideo10Pipeline(Pipeline):
         guidance_scale: float = 1.0,
     ) -> HunyuanVideo10Conditions:
         """Encode prompts (LLaMA + CLIP) into ``HunyuanVideo10Conditions``."""
+        if self.text_embed is None:
+            raise RuntimeError(
+                "HunyuanVideo10Pipeline.build_conditions: no text_embed stage "
+                "(load_text_encoder=False); trainside conditioning requires load_text_encoder=True."
+            )
         text_llama = self.text_embed.embed_llama(texts)
         pooled_clip = self.text_embed.embed_clip(texts)
         return HunyuanVideo10Conditions(
