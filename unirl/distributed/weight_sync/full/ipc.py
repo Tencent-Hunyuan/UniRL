@@ -41,8 +41,6 @@ class IPCWeightSync(FullWeightSync):
         flush_cache: bool = True,
         lora_merged: bool = False,
         adapter_name: Optional[str] = None,
-        verify: Optional[bool] = None,
-        param_prefix: Optional[str] = None,
         use_shm: bool = False,
         name_remap: Optional[Dict[str, Optional[str]]] = None,
         track_prefix: str = "",
@@ -50,7 +48,6 @@ class IPCWeightSync(FullWeightSync):
         gpu_memory_headroom_mb: int = 2048,
         control_timeout_s: float = 900.0,
     ) -> None:
-        del verify, param_prefix
         super().__init__(
             backend=backend,
             bucket_size_mb=bucket_size_mb,
@@ -104,9 +101,8 @@ class IPCWeightSync(FullWeightSync):
 
                 self._control_group = dist.new_group(backend="gloo", timeout=self._control_timeout)
             configure_sleep = getattr(self._rollout, "set_weight_sync_sleep_level", None)
-            if not callable(configure_sleep):
-                raise RuntimeError("vLLM native IPC sync requires configurable sleep level")
-            configure_sleep(2, preserve_next_sleep=True)
+            if callable(configure_sleep):
+                configure_sleep(2, preserve_next_sleep=True)
 
     @staticmethod
     def _dist_ready() -> bool:
@@ -293,54 +289,24 @@ class IPCWeightSync(FullWeightSync):
         config = getattr(model, "config", None)
         model_type = getattr(config, "model_type", None)
 
+        from unirl.utils.peft_merge import raw_state_dict_metadata
+
+        metadata: list[dict[str, Any]] = []
+        for raw_name, tensor in raw_state_dict_metadata(model, dtype=self._wire_dtype):
+            if raw_name.endswith((".lora_A", ".lora_B")):
+                continue
+            name = _apply_name_remap(raw_name, self._name_remap)
+            if name is not None:
+                metadata.append(self._shape_metadata(name, tuple(tensor.shape), tensor.dtype))
+        if not metadata:
+            raise RuntimeError(f"native IPC model {model_type!r} has an empty export")
         if model_type != "qwen3_moe":
-            metadata: list[dict[str, Any]] = []
-            for raw_name, tensor in model.state_dict().items():
-                name = _apply_name_remap(str(raw_name), self._name_remap)
-                if name is None:
-                    continue
-                dtype = (
-                    self._wire_dtype if self._wire_dtype is not None and tensor.is_floating_point() else tensor.dtype
-                )
-                metadata.append(self._shape_metadata(name, tuple(int(dim) for dim in tensor.shape), dtype))
-            if not metadata:
-                raise RuntimeError(f"native IPC model {model_type!r} has an empty state_dict")
             structural_manifest(metadata)
             return metadata
-
         if self._name_remap:
             raise NotImplementedError("Qwen3-MoE schema validation does not support name_remap")
 
         skip_lm_head = bool(getattr(config, "tie_word_embeddings", False))
-        metadata: list[dict[str, Any]] = []
-        for raw_name, tensor in model.state_dict().items():
-            name = str(raw_name)
-            if skip_lm_head and name == "lm_head.weight":
-                continue
-            dtype = self._wire_dtype if self._wire_dtype is not None and tensor.is_floating_point() else tensor.dtype
-            shape = tuple(int(dim) for dim in tensor.shape)
-            outputs: list[tuple[str, tuple[int, ...]]]
-            if name.endswith(".mlp.experts.gate_up_proj") and len(shape) == 3:
-                experts, doubled_intermediate, hidden = shape
-                if doubled_intermediate % 2:
-                    raise RuntimeError(f"invalid packed gate/up shape for {name!r}: {shape!r}")
-                intermediate = doubled_intermediate // 2
-                base = name.removesuffix(".gate_up_proj")
-                outputs = [
-                    (f"{base}.{expert_id}.{projection}.weight", (intermediate, hidden))
-                    for expert_id in range(experts)
-                    for projection in ("gate_proj", "up_proj")
-                ]
-            elif name.endswith(".mlp.experts.down_proj") and len(shape) == 3:
-                experts, hidden, intermediate = shape
-                base = name.removesuffix(".down_proj")
-                outputs = [
-                    (f"{base}.{expert_id}.down_proj.weight", (hidden, intermediate)) for expert_id in range(experts)
-                ]
-            else:
-                outputs = [(name, shape)]
-            metadata.extend(self._shape_metadata(out_name, out_shape, dtype) for out_name, out_shape in outputs)
-
         names = {str(item["name"]) for item in metadata}
         required = {"model.embed_tokens.weight", "model.norm.weight"}
         if not skip_lm_head:

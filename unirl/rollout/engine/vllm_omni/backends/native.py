@@ -108,8 +108,6 @@ class VLLMOmniBackend:
         self._omni: Optional[Any] = omni
         self._rt = runtime
         self._tokenizer = tokenizer
-        self._weight_sync_sleep_level = 1
-        self._preserve_next_weight_sleep = False
         self._pending_native_publication: Optional[tuple[str, int]] = None
 
     @classmethod
@@ -429,15 +427,6 @@ class VLLMOmniBackend:
         self._require_rpc_success(method, stage_id, results, allow_false=allow_false)
         return results
 
-    def set_weight_sync_sleep_level(self, level: int, *, preserve_next_sleep: bool = False) -> None:
-        if int(level) not in (1, 2):
-            raise ValueError(f"vLLM-Omni sleep level must be 1 or 2, got {level}")
-        self._weight_sync_sleep_level = int(level)
-        self._preserve_next_weight_sleep = bool(preserve_next_sleep)
-
-    def preserve_weights_for_next_sleep(self) -> None:
-        self._preserve_next_weight_sleep = True
-
     @staticmethod
     def _require_ack_success(action: str, stage_id: int, task_id: str, acks: object) -> None:
         # Worker handlers catch their own exceptions and answer
@@ -490,16 +479,14 @@ class VLLMOmniBackend:
         import uuid
 
         omni = self._require_omni()
-        level = 1 if self._preserve_next_weight_sleep else self._weight_sync_sleep_level
-        self._preserve_next_weight_sleep = False
         for sid in self._stage_ids():
             if self._stage_type(sid) != "diffusion":
-                self._collective_rpc(sid, "sleep", args=(level, "abort"))
+                self._collective_rpc(sid, "sleep", args=(1, "abort"))
                 continue
             task_id = str(uuid.uuid4())
             acks = omni.engine.collective_rpc(
                 method="handle_sleep_task",
-                # Diffusion sync updates the transformer; preserve the frozen encoder and VAE.
+                # Preserve components omitted from a weight publication.
                 args=(self._rt["OmniSleepTask"](level=1, task_id=task_id),),
                 stage_ids=[int(sid)],
             )

@@ -2,7 +2,7 @@
 # Minimal single-GPU full-parameter Qwen-Image native-IPC validation recipe.
 defaults:
   - qwen_image_grpo_vllmomni
-  - /sync: full_ipc
+  - override /sync: full_ipc
   - _self_
 
 num_devices: 1
@@ -30,6 +30,7 @@ sampling:
     num_sde_steps: 2
 
 sync:
+  name_remap: {"*": "transformer.*"}
   bucket_size_mb: 256
   wire_dtype: bf16
 

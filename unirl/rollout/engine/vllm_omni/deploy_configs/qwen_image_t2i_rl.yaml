@@ -2,8 +2,6 @@
 pipeline: unirl_rl_image_diffusion
 async_chunk: false
 distributed_executor_backend: mp
-weight_transfer_config:
-  backend: ipc
 
 stages:
   - stage_id: 0

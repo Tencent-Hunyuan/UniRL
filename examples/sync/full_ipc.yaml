@@ -4,4 +4,3 @@ lora_merged: false
 bucket_size_mb: 2048
 use_shm: false
 flush_cache: true
-name_remap: {"*": "transformer.*"}

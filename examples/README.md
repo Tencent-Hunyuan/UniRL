@@ -2,8 +2,9 @@
 
 Self-contained Hydra recipes — one YAML per experiment. A recipe is the single
 source of truth for a run: model, algorithm, rollout engine, placement, reward,
-weight sync, and batch geometry, each instantiated directly by `_target_` (no
-Hydra config-group overrides). Recipes are grouped by trainer domain or agentic
+weight sync, and batch geometry, each instantiated directly by `_target_`.
+Qwen-Image recipes replace the `sync` config group to keep LoRA-only options out
+of full-weight sync. Recipes are grouped by trainer domain or agentic
 workflow. Select one with `--config-name` set to its path under `examples/`,
 without `.yaml`. Keep every directory — `diffusion/sd3/sd3_trainside`, not
 `sd3_trainside`.

@@ -258,12 +258,6 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
     def ipc_worker_device_uuids(self) -> List[str]:
         return self._backend.ipc_worker_device_uuids
 
-    def set_weight_sync_sleep_level(self, level: int, *, preserve_next_sleep: bool = False) -> None:
-        self._backend.set_weight_sync_sleep_level(level, preserve_next_sleep=preserve_next_sleep)
-
-    def preserve_weights_for_next_sleep(self) -> None:
-        self._backend.preserve_weights_for_next_sleep()
-
     def init_native_weight_transfer(self, *, init_info: Dict[str, Any]) -> None:
         self._backend.init_native_weight_transfer(init_info=init_info)
 

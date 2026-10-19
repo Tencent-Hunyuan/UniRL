@@ -48,7 +48,8 @@ materialization.
   (separate slabs, cross-node capable), `TensorWeightSync` (colocate serialized
   handoff), `IPCWeightSync` (colocate CUDA-IPC over ZMQ). Colocate handlers take the
   engine as a same-Worker sibling; separate/NCCL need a one-time driver handshake.
-- **Routing.** `param_prefix` prepends the model's canonical key prefix;
+- **Routing.** LoRA `param_prefix` prepends the model's canonical key prefix;
+  full-weight `name_remap` rewrites or filters canonical export names;
   `track_prefix` further prefixes so a `ComposedRolloutEngine` can demux the update
   to one child (PE registers one handler per track).
 
@@ -61,6 +62,17 @@ already done), implements `sync()` as `BROADCAST` shipping each bucket, and adds
 matching receiver on the engine side (`../../rollout/engine/`).
 
 ## Gotchas
+
+- **Native IPC metadata and data use the same canonical export rules.**
+  `raw_state_dict_metadata` creates meta tensors from global shapes and shares
+  embedding filtering and packed-expert views with `raw_state_dict`; it does not
+  gather FSDP shards. Model-specific prefixes belong in model recipes, not in
+  `sync/full_ipc`. LoRA-only `verify` and `param_prefix` are not full-IPC options.
+
+- **Omni keeps weights during sleep.** Its adapter uses level 1 so that updates
+  to a subset of the pipeline preserve frozen components. Engines exposing
+  `set_weight_sync_sleep_level` opt into IPC's discard-after-first-sleep policy;
+  ordinary vLLM uses level 2 after its initial preserving sleep.
 
 - **Omni's colocated rollout replicas each receive their own IPC publication.**
   `VLLMOmniRolloutEngine.rank_local_weight_transfer` selects a TP1 receiver on

@@ -471,12 +471,8 @@ class DiffusionTrainer(BaseTrainer):
                 self._connect_separate(sync_cfg)
         else:
             with placement(self.pool, fraction=1.0 - reward_fraction, shared_workers=True):
-                omni_first = rollout_cfg["_target_"].endswith("VLLMOmniRolloutEngine")
-                if omni_first:
-                    self.rollout = self._build_rollout(rollout_cfg, allow_pipeline=True)
                 self._build_train_side(**train_cfgs)
-                if not omni_first:
-                    self.rollout = self._build_rollout(rollout_cfg, allow_pipeline=True)
+                self.rollout = self._build_rollout(rollout_cfg, allow_pipeline=True)
                 if reward_stack_cfg is not None:
                     self.reward_stack = self._build_reward_stack(reward_stack_cfg)
                 if sync_cfg is not None:
