@@ -137,6 +137,9 @@ class VideoRewardScorer(RewardBackend):
         avg_diff = float((video[:-1].float() - video[1:].float()).abs().mean().item())
         return max(0.0, 1.0 - avg_diff)
 
+    def load(self) -> None:
+        self.frame_scorer.load()
+
     def offload(self) -> None:
         self.frame_scorer.offload()
 

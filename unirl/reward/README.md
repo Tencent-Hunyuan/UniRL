@@ -238,6 +238,25 @@ new remote reward needs no UniRL code — add it to the server and list its name
   unbounded.
 - **`base_device` is ignored by the remote backend** (it's HTTP-only); local
   scorers honor it, falling back to CPU with a warning if CUDA is unavailable.
+- **`RewardBackend.load()` is the only thing that materializes an in-process model** —
+  `LocalRewardBackend.__init__` stores configuration and leaves `self.model` unset,
+  and `RewardService.__init__` calls `load()` once after its own validation, so an
+  invalid reward graph is rejected before any checkpoint read or GPU allocation.
+  `load()` is idempotent and the base implementation is a no-op, so a
+  composite/wrapper backend that delegates to children has to override `load()` to
+  fan out, exactly like `offload`/`onload`/`dispose`. The three in-repo wrappers do
+  (`T2AVCompositeScorer`, `PerDomainRewardScorer`, `VideoRewardScorer`); a composite
+  you write yourself has to do the same, or its children are never loaded. A scorer
+  built outside `RewardService` — a script, a notebook, a test — has to call `load()`
+  before `compute_rewards`, or score with `self.model is None`. `_loaded` stays
+  `False` until `_load_model()` returns successfully, so a failed load is retryable —
+  but that flag only means "loading did not complete"; it does not mean a
+  half-finished `_load_model` released whatever it had already allocated, so clean up
+  inside your own `_load_model` on the error path. The remote backends
+  (`RemoteRewardBackend`, `ManagedScorerProcessBackend`) are not a model-loading
+  path at all: they own no in-process model, so their `load()` is the inherited
+  no-op, and their models are materialized inside the remote service or the managed
+  child process, driven by that side's `onload`/`offload`/`shutdown` endpoints.
 - **Prompt-based rewards use the generation prompt by default.** Set
   `prompt_source: original` to score against the original user prompt instead.
 - **A training `reward:` must relate the prompt to the video.** `RewardService`
