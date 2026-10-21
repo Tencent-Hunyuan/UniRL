@@ -51,7 +51,8 @@ def main() -> None:
     for _ in range(args.measured_iterations):
         _run_iteration(args.samples)
     wall_clock_s = time.perf_counter() - start
-    run_id = resolve_run_id(os.environ.get("UNIRL_RUN_ID") or f"smoke-{int(time.time())}-{uuid4().hex[:6]}")
+    requested_run_id = os.environ.get("UNIRL_RUN_ID", "").strip()
+    run_id = resolve_run_id(requested_run_id or f"smoke-{int(time.time())}-{uuid4().hex[:6]}")
     result_path = args.out / f"{run_id}.json"
     write_result(
         BenchmarkResult(
