@@ -357,6 +357,9 @@ class StageAlgorithm(Remote, ABC):
     recomputes_anchor: bool = False
     anchor_fields: Tuple[str, ...] = ()
 
+    def prepare_anchor(self, part: "Part") -> None:
+        """Select per-part anchor state before the stack replays training micros."""
+
     def prepare_segment(
         self,
         *,

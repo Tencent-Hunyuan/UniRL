@@ -497,3 +497,18 @@ without driver-authored x_T. `media_log_interval` does not apply
   (it reuses the train model) and for DiffusionNFT (its EMA swap touches the backend around `generate`).
 - **The bundle must be shared, not rebuilt** — the trainer injects one bundle into both
   pipeline and backend; a second `from_config` would silently desync replay. See [`../models/README.md`](../models/README.md).
+- **AR multi-teacher OPD updates once per complete domain cycle.** Use
+  `ARMultiTeacherOPD`, `MultiDomainRLDataSource`, trainside rollout and
+  `accumulate_rollouts` equal to the domain count. The stack averages each
+  domain's token-mean gradient equally, regardless of response length. Set
+  `num_rollouts`, `save_interval` and any positive `eval_interval` to multiples
+  of the cycle length; checkpoints inside a cycle are rejected. The
+  [two-teacher recipe](../../examples/ar/qwen3_multi_teacher_opd_trainside.yaml)
+  requires `MATH_DATA_PATH`, `CODE_DATA_PATH`, `MATH_TEACHER_PATH` and
+  `CODE_TEACHER_PATH`. Each teacher is a frozen LoRA on the same Qwen3 backbone.
+- **AR cycle resume requires unchanged data, seeds, domain order and topology.**
+  Prompt streams are fast-forwarded from their configured seed. The trainside
+  engine's optional `seed` derives the Torch sampling seed from the rollout ID
+  and DP rank inside an RNG-restoring scope. This reproduces sampling at a cycle
+  boundary without replaying prior model generations. Exact update comparisons
+  also require deterministic kernels and zero model/adapter dropout.

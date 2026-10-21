@@ -1,0 +1,46 @@
+# @package _global_
+defaults:
+  - qwen3_aropd_4b_base_dapo_trainside
+  - _self_
+
+accumulate_rollouts: 2
+num_rollouts: 100
+save_interval: 20
+save_mode: adapter
+
+teacher_domains:
+  - name: math
+    data_path: ${oc.env:MATH_DATA_PATH}
+    teacher_path: ${oc.env:MATH_TEACHER_PATH}
+  - name: code
+    data_path: ${oc.env:CODE_DATA_PATH}
+    teacher_path: ${oc.env:CODE_TEACHER_PATH}
+
+backend:
+  lora_cfg:
+    frozen_adapters:
+      - name: ${teacher_domains.0.name}
+        path: ${teacher_domains.0.teacher_path}
+      - name: ${teacher_domains.1.name}
+        path: ${teacher_domains.1.teacher_path}
+
+rollout:
+  seed: 42
+
+algorithm:
+  _target_: unirl.algorithms.ar_multi_teacher_opd.ARMultiTeacherOPD
+  teacher: null
+  teachers:
+    math: math
+    code: code
+
+logging:
+  run_name: qwen3_multi_teacher_opd_trainside
+
+data_source:
+  _target_: unirl.data.data_source.MultiDomainRLDataSource
+  args:
+    run:
+      data_path: null
+      eval_data_path: null
+      domains: ${teacher_domains}

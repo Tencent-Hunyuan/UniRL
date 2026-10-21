@@ -297,6 +297,19 @@ class MultiDomainRLDataSource:
     def num_prompts(self) -> int:
         return sum(len(ds) for ds in self._datasets)
 
+    def iter_eval_batches(self, batch_size: int, *, eval_num_prompts: int = -1) -> Iterator[Sample]:
+        """Yield deterministic evaluation prompts without advancing the training cycle."""
+        if batch_size < 1:
+            raise ValueError("Evaluation batch_size must be >= 1.")
+        if self._eval_datasets is None:
+            self._eval_datasets = [
+                TextPromptDataset(file_path=domain["eval_data_path"] or domain["data_path"]) for domain in self.domains
+            ]
+        total = sum(len(dataset) for dataset in self._eval_datasets)
+        sample = self.get_eval_samples(total if eval_num_prompts < 0 else eval_num_prompts)
+        for start in range(0, sample.batch_size, batch_size):
+            yield sample.slice(start, start + batch_size)
+
     def get_eval_samples(self, batch_size: int) -> Sample:
         """One deterministic eval Sample of up to ``batch_size`` prompts."""
         batch_size = int(batch_size)

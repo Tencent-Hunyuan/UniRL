@@ -199,3 +199,9 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   this: the operands are already rounded when the forward returns them. DiffusionOPD's
   `fp32 before squaring` is not the same situation — it upcasts scheduler-computed
   `prev_sample_means`, not raw network output.
+- **Multi-teacher AR anchors are routed before micro-batch replay.**
+  `ARMultiTeacherOPD.teachers` maps each `metadata["domain"]` to a frozen adapter.
+  `prepare_segment_anchors` calls `prepare_anchor(part)` before replaying the
+  training micros; mixed or unknown domains are rejected. The loss remains
+  `AROPD`'s objective, with additional `distill_loss_<domain>`,
+  `teacher_gap_mean_<domain>` and `teacher_gap_abs_mean_<domain>` metrics.
