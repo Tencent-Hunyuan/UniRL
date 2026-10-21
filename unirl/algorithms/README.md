@@ -104,8 +104,8 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   per-sequence values. `loss_mask`-inactive tokens never enter a denominator, and a fully-masked
   sequence still counts as one sequence that contributes 0. GSPO is sequence-level and takes no
   `loss_agg_mode`. `TrainStack` and the `UnifiedModelTrainStack` AR track share the resolution
-  (`train/stack/loss_scale.py`); `train/readme.md` Gotchas define "one update" per stack (an
-  accumulation window averages its parts) and the zero-token behaviour.
+  (`StageAlgorithm.loss_units` → `train/stack/loss_scale.py`); `train/readme.md` Gotchas define
+  "one update" per stack (an accumulation window averages its parts) and the zero-token behaviour.
 - **AR `sampling_temperature` must equal the rollout `sampling.temperature`** —
   `ARStage.replay` rescales logits by it (`log_softmax(logits / T)`) to match SGLang's
   distribution; when unset it silently falls back to the `ARSamplingParams` default,
