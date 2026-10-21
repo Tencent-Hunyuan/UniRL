@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from unirl.models.types.embedding import dedup_prompts
+from unirl.models.types.embedding import embed_pair_with_cpu_cache
 from unirl.types.conditions import TextEmbedCondition
 from unirl.types.primitives import Texts
 
@@ -24,6 +25,7 @@ class LTX2TextEmbedStage:
         self.max_sequence_length = bundle.max_sequence_length
         self.dtype = bundle.dtype
         self.device = bundle.device
+        self._cache: OrderedDict[str, tuple[TextEmbedCondition, TextEmbedCondition]] = OrderedDict()
 
     @torch.no_grad()
     def encode(
@@ -39,30 +41,31 @@ class LTX2TextEmbedStage:
                 "states. Ensure the checkpoint's 'connectors' subfolder loaded."
             )
 
-        video_cond, audio_cond = self._encode_branch(texts.texts)
+        video_cond, audio_cond = embed_pair_with_cpu_cache(
+            texts.texts, self._cache, self._encode_pair, device=self.device
+        )
         result = {
             "text": video_cond,
             "audio_text": audio_cond,
         }
 
         if negative_texts is not None:
-            neg_video, neg_audio = self._encode_branch(negative_texts.texts)
+            neg_video, neg_audio = embed_pair_with_cpu_cache(
+                negative_texts.texts, self._cache, self._encode_pair, device=self.device
+            )
             result["negative_text"] = neg_video
             result["negative_audio_text"] = neg_audio
 
         return result
 
-    def _encode_branch(self, prompts: list[str]) -> tuple[TextEmbedCondition, TextEmbedCondition]:
-        """Deduplicate prompts, run Gemma3 + connectors on unique entries, and restore batch order."""
-        uniq, inverse = dedup_prompts(prompts)
-        hidden_states, attention_mask = self._encode_prompts(uniq)
+    def _encode_pair(self, prompts: list[str]) -> tuple[TextEmbedCondition, TextEmbedCondition]:
+        """Run Gemma3 + connectors on unique prompts."""
+        hidden_states, attention_mask = self._encode_prompts(prompts)
         video_embeds, audio_embeds, conn_mask = self._apply_connectors(hidden_states, attention_mask)
-        video_cond = TextEmbedCondition(embeds=video_embeds, attn_mask=conn_mask)
-        audio_cond = TextEmbedCondition(embeds=audio_embeds, attn_mask=conn_mask)
-        if inverse is not None:
-            video_cond = video_cond.select(inverse)
-            audio_cond = audio_cond.select(inverse)
-        return video_cond, audio_cond
+        return (
+            TextEmbedCondition(embeds=video_embeds, attn_mask=conn_mask),
+            TextEmbedCondition(embeds=audio_embeds, attn_mask=conn_mask),
+        )
 
     def _encode_prompts(self, prompts: list[str]) -> tuple[torch.Tensor, torch.Tensor]:
         """Tokenize and return Gemma3's stacked all-layer hidden states."""

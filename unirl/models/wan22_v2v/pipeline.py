@@ -46,11 +46,9 @@ class WAN22V2VPipeline(Pipeline):
         self.bundle = bundle
         self.shift = float(shift)
         self.strength = float(strength)
-        self.text_embed = (
-            text_embed
-            if text_embed is not None
-            else WAN21TextEmbedStage(bundle, max_sequence_length=int(max_sequence_length))
-        )
+        if text_embed is None and bundle.text_encoder is not None:
+            text_embed = WAN21TextEmbedStage(bundle, max_sequence_length=int(max_sequence_length))
+        self.text_embed = text_embed
         if diffusion is None:
             diffusion = WAN22DiffusionStage(
                 model=bundle,
@@ -107,6 +105,11 @@ class WAN22V2VPipeline(Pipeline):
             raise ValueError(
                 f"WAN22V2VPipeline.build_conditions: negative_text length "
                 f"{len(negatives.texts)} != text length {len(texts.texts)}"
+            )
+        if self.text_embed is None:
+            raise RuntimeError(
+                "WAN22V2VPipeline.build_conditions: no text_embed stage "
+                "(load_text_encoder=False); trainside conditioning requires load_text_encoder=True."
             )
         if negatives is None and float(guidance_scale) > 1.0:
             negatives = Texts(texts=[""] * len(texts.texts))

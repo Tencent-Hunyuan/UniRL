@@ -40,11 +40,9 @@ class ZImagePipeline(Pipeline):
     ) -> None:
         super().__init__()
         self.bundle = bundle
-        self.text_embed = (
-            text_embed
-            if text_embed is not None
-            else ZImageTextEmbedStage(bundle, max_sequence_length=max_sequence_length)
-        )
+        if text_embed is None and bundle.text_encoder is not None:
+            text_embed = ZImageTextEmbedStage(bundle, max_sequence_length=max_sequence_length)
+        self.text_embed = text_embed
         if diffusion is None:
             diffusion = ZImageDiffusionStage(
                 model=bundle,
@@ -78,7 +76,11 @@ class ZImagePipeline(Pipeline):
     ) -> "ZImagePipeline":
         """Build the full pipeline from a config."""
         bundle = ZImageBundle.from_config(config)
-        text_embed = ZImageTextEmbedStage(bundle, max_sequence_length=config.max_sequence_length)
+        text_embed = (
+            ZImageTextEmbedStage(bundle, max_sequence_length=config.max_sequence_length)
+            if bundle.text_encoder is not None
+            else None
+        )
         step = ZImageDiffusionStep()
         diffusion = ZImageDiffusionStage(
             model=bundle,
@@ -116,6 +118,11 @@ class ZImagePipeline(Pipeline):
             raise ValueError(
                 f"ZImagePipeline.build_conditions: negative_text length "
                 f"{len(negatives.texts)} != text length {len(texts.texts)}"
+            )
+        if self.text_embed is None:
+            raise RuntimeError(
+                "ZImagePipeline.build_conditions: no text_embed stage "
+                "(load_text_encoder=False); trainside conditioning requires load_text_encoder=True."
             )
         text_cond = self.text_embed.embed(texts)
         if negatives is None and float(guidance_scale) > 0.0:

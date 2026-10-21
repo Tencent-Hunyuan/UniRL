@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
+
 import torch
 
-from unirl.models.types.embedding import EmbedStage, dedup_prompts
+from unirl.models.types.embedding import EmbedStage, embed_with_cpu_cache
 from unirl.types.conditions import TextEmbedCondition
 from unirl.types.primitives import Texts
 
@@ -24,11 +26,13 @@ class SD3TextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
         self.bundle = bundle
         self.max_sequence_length = max_sequence_length
         self.clip_max_length = clip_max_length
+        self._cache: OrderedDict[str, TextEmbedCondition] = OrderedDict()
 
     def embed(self, p: Texts) -> TextEmbedCondition:
         """Encode prompts into a ``TextEmbedCondition``."""
-        uniq, inverse = dedup_prompts(p.texts)
+        return embed_with_cpu_cache(p.texts, self._cache, self._encode, device=self.bundle.device)
 
+    def _encode(self, uniq: list[str]) -> TextEmbedCondition:
         bundle = self.bundle
         device = bundle.device
 
@@ -76,8 +80,7 @@ class SD3TextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
         clip_merged = torch.nn.functional.pad(clip_merged, (0, t5_embeds.shape[-1] - clip_merged.shape[-1]))
         embeds = torch.cat([clip_merged, t5_embeds], dim=-2)
 
-        cond = TextEmbedCondition(embeds=embeds, pooled=pooled)
-        return cond if inverse is None else cond.select(inverse)
+        return TextEmbedCondition(embeds=embeds, pooled=pooled)
 
 
 __all__ = ["SD3TextEmbedStage"]

@@ -25,12 +25,12 @@ class SD3Bundle(Bundle):
         *,
         transformer: nn.Module,
         vae: Optional[nn.Module],
-        text_encoder: nn.Module,
-        text_encoder_2: nn.Module,
-        text_encoder_3: nn.Module,
-        tokenizer: Any,
-        tokenizer_2: Any,
-        tokenizer_3: Any,
+        text_encoder: Optional[nn.Module],
+        text_encoder_2: Optional[nn.Module],
+        text_encoder_3: Optional[nn.Module],
+        tokenizer: Optional[Any],
+        tokenizer_2: Optional[Any],
+        tokenizer_3: Optional[Any],
         scheduler: Any,
         dtype: torch.dtype,
         device: torch.device,
@@ -90,26 +90,33 @@ class SD3Bundle(Bundle):
             vae = AutoencoderKL.from_pretrained(path, subfolder="vae", torch_dtype=vae_dtype).to(device).eval()
             vae.requires_grad_(False)
 
-        text_encoder = (
-            CLIPTextModelWithProjection.from_pretrained(path, subfolder="text_encoder", torch_dtype=te_dtype)
-            .to(device)
-            .eval()
-        )
-        text_encoder.requires_grad_(False)
-        text_encoder_2 = (
-            CLIPTextModelWithProjection.from_pretrained(path, subfolder="text_encoder_2", torch_dtype=te_dtype)
-            .to(device)
-            .eval()
-        )
-        text_encoder_2.requires_grad_(False)
-        text_encoder_3 = (
-            T5EncoderModel.from_pretrained(path, subfolder="text_encoder_3", torch_dtype=te_dtype).to(device).eval()
-        )
-        text_encoder_3.requires_grad_(False)
+        text_encoder = None
+        text_encoder_2 = None
+        text_encoder_3 = None
+        tokenizer = None
+        tokenizer_2 = None
+        tokenizer_3 = None
+        if config.load_text_encoder:
+            text_encoder = (
+                CLIPTextModelWithProjection.from_pretrained(path, subfolder="text_encoder", torch_dtype=te_dtype)
+                .to(device)
+                .eval()
+            )
+            text_encoder.requires_grad_(False)
+            text_encoder_2 = (
+                CLIPTextModelWithProjection.from_pretrained(path, subfolder="text_encoder_2", torch_dtype=te_dtype)
+                .to(device)
+                .eval()
+            )
+            text_encoder_2.requires_grad_(False)
+            text_encoder_3 = (
+                T5EncoderModel.from_pretrained(path, subfolder="text_encoder_3", torch_dtype=te_dtype).to(device).eval()
+            )
+            text_encoder_3.requires_grad_(False)
 
-        tokenizer = CLIPTokenizer.from_pretrained(path, subfolder="tokenizer")
-        tokenizer_2 = CLIPTokenizer.from_pretrained(path, subfolder="tokenizer_2")
-        tokenizer_3 = T5TokenizerFast.from_pretrained(path, subfolder="tokenizer_3")
+            tokenizer = CLIPTokenizer.from_pretrained(path, subfolder="tokenizer")
+            tokenizer_2 = CLIPTokenizer.from_pretrained(path, subfolder="tokenizer_2")
+            tokenizer_3 = T5TokenizerFast.from_pretrained(path, subfolder="tokenizer_3")
 
         scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(path, subfolder="scheduler")
 
