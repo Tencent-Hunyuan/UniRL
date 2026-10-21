@@ -15,13 +15,18 @@ _SCHEMA_VERSION = 1
 def _validate_number(value: int | float, name: str, *, integer: bool = False, strictly_positive: bool = False) -> None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise TypeError(f"{name} must be an int or float")
-    if not math.isfinite(value):
+    if isinstance(value, float) and not math.isfinite(value):
         raise ValueError(f"{name} must be finite")
     if integer and not isinstance(value, int):
         raise TypeError(f"{name} must be an integer")
     if value < 0 or (strictly_positive and value == 0):
         requirement = "strictly positive" if strictly_positive else "non-negative"
         raise ValueError(f"{name} must be {requirement}")
+
+
+def _validate_string(value: object, name: str) -> None:
+    if not isinstance(value, str):
+        raise TypeError(f"{name} must be a string")
 
 
 @dataclass(frozen=True)
@@ -34,6 +39,10 @@ class Environment:
     world_size: int
 
     def __post_init__(self) -> None:
+        _validate_string(self.python, "python")
+        if self.torch is not None:
+            _validate_string(self.torch, "torch")
+        _validate_string(self.device, "device")
         _validate_number(self.world_size, "world_size", integer=True, strictly_positive=True)
 
 
@@ -63,6 +72,8 @@ class Metrics:
         _validate_number(self.wall_clock_s, "wall_clock_s", strictly_positive=True)
         if self.peak_memory_bytes is not None:
             _validate_number(self.peak_memory_bytes, "peak_memory_bytes", integer=True)
+        if self.phases_s is not None and not isinstance(self.phases_s, dict):
+            raise TypeError("phases_s must be a dict or None")
         for name, value in (self.phases_s or {}).items():
             if not isinstance(name, str):
                 raise TypeError(f"phases_s keys must be str, got {name!r}")
@@ -81,8 +92,21 @@ class BenchmarkResult:
     metrics: Metrics
 
     def __post_init__(self) -> None:
+        _validate_string(self.benchmark, "benchmark")
+        _validate_string(self.run_id, "run_id")
         if not isinstance(self.started_at, datetime) or self.started_at.utcoffset() is None:
             raise ValueError("started_at must be a timezone-aware datetime")
+        if not isinstance(self.environment, Environment):
+            raise TypeError("environment must be an Environment")
+        if not isinstance(self.workload, Workload):
+            raise TypeError("workload must be a Workload")
+        if not isinstance(self.metrics, Metrics):
+            raise TypeError("metrics must be Metrics")
+        try:
+            samples_per_second = self.workload.samples / self.metrics.wall_clock_s
+        except OverflowError as exc:
+            raise ValueError("samples_per_second must be finite") from exc
+        _validate_number(samples_per_second, "samples_per_second")
 
     def to_dict(self) -> dict[str, Any]:
         metrics: dict[str, Any] = {
