@@ -37,9 +37,10 @@ it checks the result contract and is not a UniRL performance measurement (`--hel
 for options; `UNIRL_RUN_ID` overrides the generated run id).
 Rollout, reward, and train producers build a `BenchmarkResult` from
 `unirl.utils.benchmark_result` with the total samples and wall-clock of their measured
-window, and call `write_result`; throughput is derived, and unavailable memory, phases,
-or torch version are omitted. Runtime adapters belong beside their owning `unirl`
-components, offline parsers in `benchmarks/speed_benchmarks/`.
+window, and call `write_result`; throughput is derived. Unavailable memory and phases
+are omitted. An unavailable torch version is serialized as `null`. Runtime adapters
+belong beside their owning `unirl` components, offline parsers in
+`benchmarks/speed_benchmarks/`.
 See [#414](https://github.com/Tencent-Hunyuan/UniRL/issues/414) and [#25](https://github.com/Tencent-Hunyuan/UniRL/issues/25).
 
 ## Fair-comparison protocol
