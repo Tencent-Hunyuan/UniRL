@@ -127,7 +127,7 @@ class BenchmarkResult:
             "benchmark": self.benchmark,
             "run_id": self.run_id,
             "started_at": self.started_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
-            "environment": {name: value for name, value in asdict(self.environment).items() if value is not None},
+            "environment": asdict(self.environment),
             "workload": asdict(self.workload),
             "metrics": metrics,
         }
