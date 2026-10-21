@@ -118,6 +118,8 @@ class ARTrainer(BaseTrainer):
                 raise ValueError("Every teacher must be declared in backend.lora_cfg.frozen_adapters.")
             if data_source_cfg.args.run.get("seed") is None or rollout_cfg.get("seed") is None:
                 raise ValueError("Multi-teacher resume requires data-source and rollout seeds.")
+            if algorithm_cfg["sampling_temperature"] != sampling_cfg["temperature"]:
+                raise ValueError("Teacher replay and student sampling temperatures must match.")
         elif accumulate_rollouts != 1:
             raise ValueError("AR accumulation currently requires ARMultiTeacherOPD.")
         if accumulate_rollouts > 1:

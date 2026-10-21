@@ -40,6 +40,8 @@ logging:
 data_source:
   _target_: unirl.data.data_source.MultiDomainRLDataSource
   args:
+    algorithm:
+      prompts_per_rollout: ${batch_size}
     run:
       data_path: null
       eval_data_path: null
