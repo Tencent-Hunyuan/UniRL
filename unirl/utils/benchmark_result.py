@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import math
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 _SCHEMA_VERSION = 1
@@ -66,18 +68,21 @@ class Metrics:
 
     wall_clock_s: float
     peak_memory_bytes: int | None = None
-    phases_s: dict[str, float] | None = None
+    phases_s: Mapping[str, float] | None = None
 
     def __post_init__(self) -> None:
         _validate_number(self.wall_clock_s, "wall_clock_s", strictly_positive=True)
         if self.peak_memory_bytes is not None:
             _validate_number(self.peak_memory_bytes, "peak_memory_bytes", integer=True)
-        if self.phases_s is not None and not isinstance(self.phases_s, dict):
-            raise TypeError("phases_s must be a dict or None")
-        for name, value in (self.phases_s or {}).items():
-            if not isinstance(name, str):
-                raise TypeError(f"phases_s keys must be str, got {name!r}")
-            _validate_number(value, f"phases_s[{name!r}]")
+        if self.phases_s is not None:
+            if not isinstance(self.phases_s, Mapping):
+                raise TypeError("phases_s must be a mapping or None")
+            phases = dict(self.phases_s)
+            for name, value in phases.items():
+                if not isinstance(name, str):
+                    raise TypeError(f"phases_s keys must be str, got {name!r}")
+                _validate_number(value, f"phases_s[{name!r}]")
+            object.__setattr__(self, "phases_s", MappingProxyType(phases))
 
 
 @dataclass(frozen=True)
@@ -132,5 +137,7 @@ def write_result(result: BenchmarkResult, path: Path) -> None:
     """Write one benchmark result as deterministic JSON."""
 
     payload = result.to_dict()
+    serialized = json.dumps(payload, indent=2, allow_nan=False) + "\n"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, allow_nan=False) + "\n")
+    with path.open("x", encoding="utf-8") as output:
+        output.write(serialized)
