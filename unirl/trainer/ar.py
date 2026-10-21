@@ -1,10 +1,12 @@
 import importlib
 import importlib.util
 import inspect
+import json
 import logging
 import math
 import time
 from contextlib import contextmanager, nullcontext
+from pathlib import Path
 from typing import Dict, Iterator, Optional, Set, Tuple
 
 import torch
@@ -24,6 +26,7 @@ from unirl.trainer.rollout_sleep import must_preserve_rollout_weights
 from unirl.types.sample import Sample
 from unirl.types.sampling import BaseSamplingParams, total_samples_per_prompt
 from unirl.utils.graceful_shutdown import run_with_timeout
+from unirl.utils.wandb_metrics import pooled_window_reward_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +107,7 @@ class ARTrainer(BaseTrainer):
         if isinstance(accumulate_rollouts, bool) or not isinstance(accumulate_rollouts, int) or accumulate_rollouts < 1:
             raise ValueError("accumulate_rollouts must be an integer >= 1.")
         self.accumulate_rollouts = accumulate_rollouts
+        self._teacher_cycle = None
         if issubclass(algorithm_cls, ARMultiTeacherOPD):
             teachers = algorithm_cfg["teachers"]
             if not issubclass(get_class(data_source_cfg["_target_"]), MultiDomainRLDataSource):
@@ -120,6 +124,14 @@ class ARTrainer(BaseTrainer):
                 raise ValueError("Multi-teacher resume requires data-source and rollout seeds.")
             if algorithm_cfg["sampling_temperature"] != sampling_cfg["temperature"]:
                 raise ValueError("Teacher replay and student sampling temperatures must match.")
+            self._teacher_cycle = {
+                "teachers": dict(teachers),
+                "domains": domains,
+                "data_seed": data_source_cfg.args.run.seed,
+                "rollout_seed": rollout_cfg.seed,
+                "batch_size": batch_size,
+                "num_devices": cfg.num_devices,
+            }
         elif accumulate_rollouts != 1:
             raise ValueError("AR accumulation currently requires ARMultiTeacherOPD.")
         if accumulate_rollouts > 1:
@@ -568,6 +580,11 @@ class ARTrainer(BaseTrainer):
             samples[-1],
             step_time_s=time.perf_counter() - t0,
             trunc_len=self.sampling_params["ar"].max_new_tokens,
+            extra_metrics=(
+                pooled_window_reward_metrics(parts, trunc_len=self.sampling_params["ar"].max_new_tokens)
+                if len(parts) > 1
+                else None
+            ),
         )
         return result, sum(rewards) / len(rewards)
 
@@ -752,6 +769,11 @@ class ARTrainer(BaseTrainer):
         if num_rollouts % acc or (save_interval > 0 and save_interval % acc):
             raise ValueError("num_rollouts and save_interval must align with complete teacher cycles.")
         interval = max(1, weight_sync_interval)
+        if load_dir and self._teacher_cycle is not None:
+            with (Path(load_dir) / "ar_teacher_cycle.json").open() as stream:
+                saved_cycle = json.load(stream)
+            if saved_cycle != self._teacher_cycle:
+                raise ValueError("The checkpoint's teacher mapping, domain order, seeds or batch topology changed.")
         start_rollout = self.maybe_load_checkpoint(load_dir, num_rollouts=num_rollouts)
         if start_rollout % acc:
             raise ValueError("The checkpoint ends inside an incomplete teacher cycle.")
@@ -809,6 +831,14 @@ class ARTrainer(BaseTrainer):
                 self.maybe_save_checkpoint(
                     final_id, num_rollouts, save_interval=save_interval, save_dir=save_dir, save_mode=save_mode
                 )
+                if self._teacher_cycle is not None and save_interval > 0:
+                    if next_rollout_id % save_interval == 0 or next_rollout_id == num_rollouts:
+                        path = (
+                            Path(save_dir or "checkpoints") / f"checkpoint-{next_rollout_id}" / "ar_teacher_cycle.json"
+                        )
+                        temporary = path.with_suffix(".json.tmp")
+                        temporary.write_text(json.dumps(self._teacher_cycle))
+                        temporary.replace(path)
         finally:
             try:
                 self._finish_wandb()

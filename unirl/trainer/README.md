@@ -512,3 +512,8 @@ without driver-authored x_T. `media_log_interval` does not apply
   and DP rank inside an RNG-restoring scope. This reproduces sampling at a cycle
   boundary without replaying prior model generations. Exact update comparisons
   also require deterministic kernels and zero model/adapter dropout.
+- **A3 checkpoints include `ar_teacher_cycle.json`.** Resume rejects a changed
+  domain-to-adapter mapping, domain order, data or rollout seed, batch size or
+  device count before loading model state. The teacher adapter content hashes
+  remain checked by the backend. A checkpoint without the cycle record cannot
+  resume multi-teacher training.
