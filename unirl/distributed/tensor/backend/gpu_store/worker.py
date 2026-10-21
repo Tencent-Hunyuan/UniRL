@@ -111,33 +111,6 @@ class TensorWorker:
                 raise KeyError(f"TensorWorker: unknown key '{key}'")
             return self._ref_counts[key]
 
-    def tensor_op(self, handle: GPUTensorHandle, op: str, *op_args) -> GPUTensorHandle:
-        """Execute a tensor operation directly in _store (no IPC needed)."""
-        if handle.object_ref is not None:
-            t = ray.get(handle.object_ref)
-        else:
-            with self._lock:
-                t = self._store[handle.store_key]
-
-        if op == "getitem":
-            result = t[op_args[0]]
-        elif op == "reshape":
-            result = t.reshape(op_args[0])
-        elif op == "permute":
-            result = t.permute(op_args[0])
-        else:
-            raise ValueError(f"Unknown tensor_op: '{op}'")
-
-        result = result.contiguous()
-        with self._lock:
-            key = f"tw{self.device_id}_{self._counter}"
-            self._counter += 1
-            self._store[key] = result
-            self._ref_counts[key] = 1
-        return GPUTensorHandle(
-            store_key=key, source_id=self.source_id, shape=tuple(result.shape), dtype=result.dtype, device=self.device
-        )
-
     def get_tensor_cpu(self, handle: GPUTensorHandle) -> Tensor:
         """Return tensor as CPU tensor (for TensorRef.materialize())."""
         if handle.object_ref is not None:

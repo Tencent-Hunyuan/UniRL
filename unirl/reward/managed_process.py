@@ -87,19 +87,6 @@ class ManagedScorerProcessSpec(BaseRewardComponentSpec):
         require(self.idempotency_cache_size > 0, "idempotency_cache_size must be positive")
 
 
-def _validate_visible_device(env: dict[str, str], *, allow_multiple: bool, device: str) -> None:
-    if not str(device).startswith("cuda"):
-        return
-    visible = [item.strip() for item in env.get("CUDA_VISIBLE_DEVICES", "").split(",") if item.strip()]
-    if not visible:
-        raise RuntimeError("managed CUDA scorer requires CUDA_VISIBLE_DEVICES to identify its rank-local device")
-    if len(visible) != 1 and not allow_multiple:
-        raise RuntimeError(
-            f"managed scorer expected exactly one visible GPU, got CUDA_VISIBLE_DEVICES={visible!r}; "
-            "set allow_multiple_visible_devices=true only for an intentional multi-GPU scorer"
-        )
-
-
 class ManagedScorerProcessBackend(RemoteRewardBackend):
     """Own one persistent loopback scorer child on this reward worker's GPU."""
 
@@ -121,19 +108,13 @@ class ManagedScorerProcessBackend(RemoteRewardBackend):
                 expected_scorer_version=config.scorer.version,
             )
             super().__init__(config=remote_spec, base_device=base_device)
-            # per_call means "on GPU only while scoring" — including BEFORE the
-            # first score call and before the child is even ready. The child is
-            # started with --boot-offloaded, so it leaves the GPU (or, for
-            # scorers honoring UNIRL_SCORER_BOOT_OFFLOADED, never touches it)
-            # BEFORE _start_child sees it ready; a parent-side offload here
-            # would reopen the bootstrap window it is meant to close.
         except Exception:
             self._stop_child()
             raise
         atexit.register(self._stop_child)
         self._atexit_registered = True
 
-    def _child_env(self) -> dict[str, str]:
+    def _start_child(self) -> str:
         cfg = self.spec
         env = dict(os.environ)
         existing_pythonpath = env.get("PYTHONPATH")
@@ -147,21 +128,20 @@ class ManagedScorerProcessBackend(RemoteRewardBackend):
         env.pop("RAY_ADDRESS", None)
         env["UNIRL_REWARD_PARENT_PID"] = str(os.getpid())
         if cfg.gpu_residency == "per_call":
-            # Construction-time hint: scorers that can build on CPU (e.g.
-            # EditReward) read this and never touch the GPU during boot, closing
-            # the bootstrap window entirely instead of merely shrinking it.
             env["UNIRL_SCORER_BOOT_OFFLOADED"] = "1"
         device = str(cfg.scorer.params.get("device", "cuda"))
-        _validate_visible_device(
-            env,
-            allow_multiple=cfg.process.allow_multiple_visible_devices,
-            device=device,
-        )
-        return env
+        if device.startswith("cuda"):
+            visible = [item.strip() for item in env.get("CUDA_VISIBLE_DEVICES", "").split(",") if item.strip()]
+            if not visible:
+                raise RuntimeError(
+                    "managed CUDA scorer requires CUDA_VISIBLE_DEVICES to identify its rank-local device"
+                )
+            if len(visible) != 1 and not cfg.process.allow_multiple_visible_devices:
+                raise RuntimeError(
+                    f"managed scorer expected exactly one visible GPU, got CUDA_VISIBLE_DEVICES={visible!r}; "
+                    "set allow_multiple_visible_devices=true only for an intentional multi-GPU scorer"
+                )
 
-    def _start_child(self) -> str:
-        cfg = self.spec
-        env = self._child_env()
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             listener.bind(("127.0.0.1", 0))
@@ -212,16 +192,11 @@ class ManagedScorerProcessBackend(RemoteRewardBackend):
         base_url = f"http://127.0.0.1:{port}"
         session = requests.Session()
         session.trust_env = False
-        # A per_call child boots offloaded (--boot-offloaded): the scorer must be
-        # off the GPU by the time it first reports ready, so that is the ready
-        # state to wait for. Resident children report "resident" as before.
         expected_state = "offloaded" if cfg.gpu_residency == "per_call" else "resident"
-        deadline = time.monotonic() + float(cfg.process.startup_timeout)
+        deadline = time.monotonic() + cfg.process.startup_timeout
         try:
             while time.monotonic() < deadline:
                 if self._process.poll() is not None:
-                    # A service tree predating --boot-offloaded exits at argparse
-                    # ("unrecognized arguments") before ever binding the socket.
                     hint = (
                         " (an 'unrecognized arguments: --boot-offloaded' log means "
                         f"unirl-reward-service at {cfg.process.service_root!r} predates "
@@ -236,9 +211,12 @@ class ManagedScorerProcessBackend(RemoteRewardBackend):
                     response = session.get(f"{base_url}/health", timeout=2.0)
                     if response.status_code == 200:
                         body = response.json()
-                        scorer = body.get("scorer") or {}
+                        raw_scorer = body.get("scorer")
+                        scorer = {} if raw_scorer is None else raw_scorer
+                        raw_rewards = body.get("rewards")
+                        rewards = {} if raw_rewards is None else dict(raw_rewards)
                         if (
-                            cfg.scorer.name in dict(body.get("rewards") or {})
+                            cfg.scorer.name in rewards
                             and body.get("state") == expected_state
                             and scorer.get("input_kind") == "image"
                         ):
@@ -280,19 +258,10 @@ class ManagedScorerProcessBackend(RemoteRewardBackend):
                 self._post_lifecycle("onload")
                 response = super().compute_rewards(request)
             except BaseException:
-                # A failed onload or score can also make cleanup fail; preserve
-                # the operation that caused the request to fail.
                 self._post_lifecycle("offload", tolerate_failure=True)
                 raise
-            # The direct server reports scorer failures as HTTP 200 with
-            # per-item errors. Preserve those details if cleanup also fails.
             self._post_lifecycle("offload", tolerate_failure=not all(response.successes))
             return response
-
-    def is_available(self) -> bool:
-        if self._process is None or self._process.poll() is not None:
-            return False
-        return super().is_available()
 
     def offload(self) -> None:
         with self._residency_lock:
@@ -313,7 +282,7 @@ class ManagedScorerProcessBackend(RemoteRewardBackend):
             try:
                 self._post_lifecycle(
                     "shutdown",
-                    timeout=float(self.spec.process.shutdown_timeout),
+                    timeout=self.spec.process.shutdown_timeout,
                     tolerate_failure=True,
                 )
                 super().dispose()
@@ -329,7 +298,7 @@ class ManagedScorerProcessBackend(RemoteRewardBackend):
             except ProcessLookupError:
                 pass
             try:
-                process.wait(timeout=float(self.spec.process.shutdown_timeout))
+                process.wait(timeout=self.spec.process.shutdown_timeout)
             except subprocess.TimeoutExpired:
                 try:
                     os.killpg(process.pid, signal.SIGKILL)

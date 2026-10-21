@@ -1,7 +1,6 @@
 """HunyuanImage 3.0 pipeline — concrete user of the typed Stage protocols."""
 
 from unirl.models.hunyuan_image3.ar import (
-    HunyuanImage3ARParams,
     HunyuanImage3ARStage,
     HunyuanImage3ARStep,
 )
@@ -31,7 +30,6 @@ from unirl.models.hunyuan_image3.vit_encode import (
 
 __all__ = [
     "HunyuanImage3ARConditions",
-    "HunyuanImage3ARParams",
     "HunyuanImage3ARStage",
     "HunyuanImage3ARStep",
     "HunyuanImage3Bundle",

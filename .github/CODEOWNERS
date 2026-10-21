@@ -39,7 +39,7 @@
 /unirl/train/backend/                   @celve @zzhuoxin1508 @CjhHa1
 /unirl/train/stack/                     @leviking98z-rgb @haonan3
 /unirl/train/sft/                       @haonan3 @celve
-/unirl/train/unified_model_stack.py     @Ideny42 @zzhuoxin1508
+/unirl/train/stack/unified.py           @Ideny42 @zzhuoxin1508
 /unirl/trainer/                         @celve @Ideny42 @CjhHa1
 /unirl/train_sft.py                     @haonan3 @celve
 /unirl/train_pe.py                      @Jayce-Ping @Ideny42

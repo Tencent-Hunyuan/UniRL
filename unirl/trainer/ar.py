@@ -36,7 +36,7 @@ def ar_preflight(
     stack_cfg: DictConfig,
 ) -> Set[str]:
     """Model-blind pre-flight shared by :class:`ARTrainer` and ``AsyncARTrainer``."""
-    target = str(pipeline_cfg.get("_target_", "") or "")
+    target = pipeline_cfg["_target_"]
     parts = target.split(".")
     if target.startswith("unirl.models.") and len(parts) > 3:
         validation_module = f"unirl.models.{parts[2]}.validation"
@@ -50,10 +50,9 @@ def ar_preflight(
                     stack_cfg=stack_cfg,
                 )
     allowed: Set[str] = {"text", "image", "video"}
-    if target:
-        resolved = get_object(target)
-        pipeline_cls = resolved if isinstance(resolved, type) else getattr(resolved, "__self__", None)
-        allowed.update(getattr(pipeline_cls, "extra_input_primitives", ()))
+    resolved = get_object(target)
+    pipeline_cls = resolved if isinstance(resolved, type) else getattr(resolved, "__self__", None)
+    allowed.update(getattr(pipeline_cls, "extra_input_primitives", ()))
     return allowed
 
 
@@ -99,7 +98,6 @@ class ARTrainer(BaseTrainer):
         # misconfigured recipe fails fast without a half-constructed device pool or actors.
         algorithm_cls = get_class(algorithm_cfg["_target_"])
         self._algorithm_requires_advantages = algorithm_cls.requires_advantages
-        eval_interval = int(eval_interval)
         if reward_cfg is None:
             if self._algorithm_requires_advantages:
                 raise ValueError(
@@ -113,28 +111,44 @@ class ARTrainer(BaseTrainer):
                     "but the recipe has no `reward:` block. Set eval_interval: 0 or configure a "
                     "(monitoring-only) reward."
                 )
+        if advantage_mode not in ("grpo", "gae"):
+            raise ValueError(f"ARTrainer: advantage_mode must be 'grpo' or 'gae', got {advantage_mode!r}")
+        self.advantage_mode = advantage_mode
+        self._rollout_anchor_device = rollout_anchor_device
+        rollout_parsed = parse_hydra_cfg(rollout_cfg)
+        takes_pipeline = "pipeline" in inspect.signature(rollout_parsed["role_cls"]).parameters
+        if takes_pipeline:
+            if self._rollout_anchor_device is not None:
+                raise ValueError(
+                    "ARTrainer: rollout_anchor_device requires a dedicated rollout engine; "
+                    "the trainside direct-sampling engine samples on the train actors."
+                )
+            if sync_cfg is not None:
+                raise ValueError(
+                    "ARTrainer: trainside direct-sampling engine reads the live training weights and cannot use a `sync:` block."
+                )
+        elif sync_cfg is None:
+            raise ValueError("ARTrainer: dedicated rollout engine requires a `sync:` block.")
+        if self._rollout_anchor_device is not None and self._rollout_anchor_device <= 0:
+            raise ValueError(
+                "rollout_anchor_device<=0 would colocate the TP engine with "
+                "the rank-0 RemoteLoraWeightSync sender and self-deadlock; "
+                f"use a positive anchor device (got {self._rollout_anchor_device})."
+            )
+        self._enable_fsdp_offload = enable_fsdp_offload and not takes_pipeline
+        rollout_sleeps = not takes_pipeline if self._rollout_anchor_device is None else self._enable_fsdp_offload
+        if rollout_sleeps:
+            validate_memory_saver_contract(rollout_cfg, strict=False)
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
         self.batch_size = batch_size
         self.adv_normalization_scope = adv_normalization_scope
         self.normalize_adv_by_std = normalize_adv_by_std
-        self.advantage_mode = str(advantage_mode).strip().lower()
-        if self.advantage_mode not in ("grpo", "gae"):
-            raise ValueError(f"ARTrainer: advantage_mode must be 'grpo' or 'gae', got {advantage_mode!r}")
-        self.balance_shards = bool(balance_shards)
+        self.balance_shards = balance_shards
         self.eval_interval = eval_interval
-        _num = int(eval_num_prompts)
-        self.eval_num_prompts = -1 if _num < 0 else _num
-        self.eval_batch_size = max(1, int(eval_batch_size))
-        self.eval_samples_per_prompt = int(eval_samples_per_prompt)
-        self.eval_temperature = float(eval_temperature)
-
-        self._rollout_anchor_device: Optional[int] = (
-            int(rollout_anchor_device) if rollout_anchor_device is not None else None
-        )
-        self._enable_fsdp_offload = bool(enable_fsdp_offload)
-        rollout_sleeps = sync_cfg is not None if self._rollout_anchor_device is None else self._enable_fsdp_offload
-        if rollout_sleeps:
-            validate_memory_saver_contract(rollout_cfg, strict=False)
+        self.eval_num_prompts = -1 if eval_num_prompts < 0 else eval_num_prompts
+        self.eval_batch_size = max(1, eval_batch_size)
+        self.eval_samples_per_prompt = eval_samples_per_prompt
+        self.eval_temperature = eval_temperature
         self._anchored_backend_offloaded: Optional[bool] = False
         self._anchored_rollout_awake: Optional[bool] = None
 
@@ -158,10 +172,9 @@ class ARTrainer(BaseTrainer):
             self.algorithm = remote_hydra(algorithm_cfg, pipeline=self.pipeline, **algo_extra)
             self.stack = remote_hydra(stack_cfg, fsdp_backend=self.backend, algorithm=self.algorithm)
 
-            rollout_parsed = parse_hydra_cfg(rollout_cfg)
             if self._rollout_anchor_device is None:
                 self._supports_staged_wake = "tags" in inspect.signature(rollout_parsed["role_cls"].wake_up).parameters
-                bootstrap_offload = sync_cfg is not None and self._enable_fsdp_offload
+                bootstrap_offload = self._enable_fsdp_offload
                 bootstrap_offloaded = False
                 rollout_boot_started = False
                 rollout_constructed = False
@@ -177,15 +190,13 @@ class ARTrainer(BaseTrainer):
                             raise
 
                     rollout_boot_started = True
-                    if "pipeline" in inspect.signature(rollout_parsed["role_cls"]).parameters:
+                    if takes_pipeline:
                         self.rollout = remote(**rollout_parsed, pipeline=self.pipeline)
+                        rollout_constructed = True
                     else:
                         self.rollout = remote(**rollout_parsed)
-                    rollout_constructed = True
-                    if sync_cfg is not None:
+                        rollout_constructed = True
                         self.weight_sync = remote_hydra(sync_cfg, backend=self.backend, rollout=self.rollout)
-
-                    if self.weight_sync is not None:
                         rollout_sleep_attempted = True
                         self.rollout.sleep()
                         rollout_memory_released = True
@@ -205,12 +216,6 @@ class ARTrainer(BaseTrainer):
                         pass
                     raise
             else:
-                if sync_cfg is not None and self._rollout_anchor_device == 0:
-                    raise ValueError(
-                        "rollout_anchor_device=0 would colocate the TP engine with "
-                        "the rank-0 RemoteLoraWeightSync sender and self-deadlock; "
-                        "use a nonzero anchor device."
-                    )
                 if self._enable_fsdp_offload:
                     self._anchored_backend_offloaded = None
                     self.backend.offload()
@@ -229,9 +234,8 @@ class ARTrainer(BaseTrainer):
                 else:
                     self._anchored_rollout_awake = True
 
-                if sync_cfg is not None:
-                    self.weight_sync = remote_hydra(sync_cfg, backend=self.backend)
-                    self.weight_sync.set_rollout_targets([(self.rollout.role_name, self.rollout.workers)])
+                self.weight_sync = remote_hydra(sync_cfg, backend=self.backend)
+                self.weight_sync.set_rollout_targets([(self.rollout.role_name, self.rollout.workers)])
 
         if self.weight_sync is not None:
             uses_gpu_streaming = getattr(self.weight_sync, "uses_gpu_streaming", None)
@@ -301,7 +305,7 @@ class ARTrainer(BaseTrainer):
         """Run one anchored rollout phase and restore the requested steady state."""
         original_error: Optional[BaseException] = None
         try:
-            if sync_weights and self.weight_sync is not None:
+            if sync_weights:
                 if self._uses_gpu_streaming_weight_sync():
                     raise RuntimeError(
                         "vLLM native IPC weight sync requires the SPMD one-Actor-rank-per-TP-rank "
@@ -311,7 +315,7 @@ class ARTrainer(BaseTrainer):
                 self.weight_sync.extract()
             self._ensure_anchored_backend_offloaded()
             self._ensure_anchored_rollout_awake()
-            if sync_weights and self.weight_sync is not None:
+            if sync_weights:
                 self.weight_sync.push()
             yield
         except BaseException as exc:
@@ -350,7 +354,7 @@ class ARTrainer(BaseTrainer):
 
     def _prepare_rollout(self, *, sync_weights: bool) -> bool:
         """Wake/sync the SPMD rollout and optionally offload train state."""
-        do_offload = self._enable_fsdp_offload and self.weight_sync is not None
+        do_offload = self._enable_fsdp_offload
         do_sync = sync_weights and self.weight_sync is not None
         train_state_maybe_offloaded = False
         full_wake_after_train_offload_in_progress = False
@@ -425,7 +429,7 @@ class ARTrainer(BaseTrainer):
             allowed_primitives=self._allowed_input_primitives,
             caller="ARTrainer._build_request_sample",
         )
-        return request.fork(total_samples_per_prompt(sp), sampling_params=sp.get("ar"))
+        return request.fork(total_samples_per_prompt(sp), sampling_params=sp["ar"])
 
     def train_step(
         self,
@@ -452,9 +456,6 @@ class ARTrainer(BaseTrainer):
                 if preserve_rollout_weights:
                     self._preserve_rollout_weights_for_next_sleep()
                 sample = self.rollout.generate(sample)
-                from unirl.trainer.unified_model import deep_hydrate
-
-                sample = deep_hydrate(sample)
 
         if self.reward is not None:
             sample = self.reward.score_and_attach(sample)
@@ -501,7 +502,7 @@ class ARTrainer(BaseTrainer):
             result,
             sample,
             step_time_s=time.perf_counter() - t0,
-            trunc_len=getattr(self.sampling_params.get("ar"), "max_new_tokens", None),
+            trunc_len=self.sampling_params["ar"].max_new_tokens,
         )
         return result, mean_reward
 
@@ -515,7 +516,7 @@ class ARTrainer(BaseTrainer):
         import dataclasses
 
         eval_ar = dataclasses.replace(
-            self.sampling_params.get("ar"),
+            self.sampling_params["ar"],
             samples_per_prompt=self.eval_samples_per_prompt,
             temperature=self.eval_temperature,
         )
@@ -542,7 +543,7 @@ class ARTrainer(BaseTrainer):
             train_state_offloaded = self._prepare_rollout(sync_weights=self.weight_sync is not None)
         eval_session = (
             self._anchored_rollout_session(
-                sync_weights=self.weight_sync is not None,
+                sync_weights=True,
                 restore_backend=False,
             )
             if anchored
@@ -558,13 +559,7 @@ class ARTrainer(BaseTrainer):
                     prompt_n += real_prompt_n
                     dispatch_inputs = self._pad_eval_inputs(eval_inputs)
                     sample = self._build_request_sample(dispatch_inputs, rollout_id, sampling=eval_sp)
-                    if anchored:
-                        generated = self.rollout.generate(sample)
-                        from unirl.trainer.unified_model import deep_hydrate
-
-                        generated = deep_hydrate(generated)
-                    else:
-                        generated = self.rollout.generate(sample)
+                    generated = self.rollout.generate(sample)
                     scored = self.reward.score_and_attach(generated)
                     rewards = scored.parts[-1].rewards
                     if rewards is not None:
@@ -609,9 +604,7 @@ class ARTrainer(BaseTrainer):
         n = inputs.batch_size
         if n == 0:
             return inputs
-        rollout_dp = max(1, int(getattr(self.rollout, "dp_size", 1)))
-        reward_dp = max(1, int(getattr(self.reward, "dp_size", 1)))
-        multiple = math.lcm(rollout_dp, reward_dp)
+        multiple = math.lcm(self.rollout.dp_size, self.reward.dp_size)
         pad_n = (-n) % multiple
         if pad_n == 0:
             return inputs
@@ -653,7 +646,8 @@ class ARTrainer(BaseTrainer):
             cond = sample.conditioning()
             prompts = next((list(c.texts) for c in cond if isinstance(c, Texts)), [])
             part = sample.parts[-1]
-            outputs = getattr(part.primitives.get("text"), "texts", None) or []
+            text_prim = part.primitives.get("text")
+            outputs = list(text_prim.texts) if isinstance(text_prim, Texts) else []
             rewards = part.rewards.to(torch.float32).tolist() if part.rewards is not None else []
             os.makedirs(out_dir, exist_ok=True)
             path = os.path.join(out_dir, f"rollout_{int(rollout_id):04d}.jsonl")

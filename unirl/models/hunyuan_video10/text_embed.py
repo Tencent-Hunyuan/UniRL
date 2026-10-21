@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from typing import List, Tuple
+from collections import OrderedDict
 
 import torch
 
+from unirl.models.types.embedding import embed_with_cpu_cache
 from unirl.types.conditions import TextEmbedCondition
 from unirl.types.primitives import Texts
 
@@ -46,13 +47,14 @@ class HunyuanVideo10TextEmbedStage:
             raise ValueError(
                 f"HunyuanVideo10TextEmbedStage.hidden_state_skip_layer must be >= 0, got {self.hidden_state_skip_layer}"
             )
+        self._llama_cache: OrderedDict[str, TextEmbedCondition] = OrderedDict()
+        self._clip_cache: OrderedDict[str, TextEmbedCondition] = OrderedDict()
 
     def embed_llama(self, p: Texts) -> TextEmbedCondition:
         """Encode prompts via LLaMA — embeds ``[B, llama_max_length, 4096]``, mask ``[B, llama_max_length]``."""
-        embeds, mask = self._encode_llama(list(p.texts))
-        return TextEmbedCondition(embeds=embeds, attn_mask=mask, pooled=None)
+        return embed_with_cpu_cache(p.texts, self._llama_cache, self._encode_llama, device=self.bundle.device)
 
-    def _encode_llama(self, prompts: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _encode_llama(self, prompts: list[str]) -> TextEmbedCondition:
         bundle = self.bundle
         tokenizer = bundle.tokenizer
         text_encoder = bundle.text_encoder
@@ -82,7 +84,7 @@ class HunyuanVideo10TextEmbedStage:
                 attention_mask=attention_mask,
                 output_hidden_states=True,
             )
-        hidden_states = getattr(outputs, "hidden_states", None)
+        hidden_states = outputs.hidden_states
         selected_from_end = self.hidden_state_skip_layer + 1
         if hidden_states is None or selected_from_end > len(hidden_states):
             available = 0 if hidden_states is None else len(hidden_states)
@@ -97,14 +99,13 @@ class HunyuanVideo10TextEmbedStage:
             prompt_embeds = prompt_embeds[:, crop_start:]
             attention_mask = attention_mask[:, crop_start:]
 
-        return prompt_embeds.to(dtype=dtype), attention_mask
+        return TextEmbedCondition(embeds=prompt_embeds.to(dtype=dtype), attn_mask=attention_mask, pooled=None)
 
     def embed_clip(self, p: Texts) -> TextEmbedCondition:
         """Encode prompts via CLIP into a TextEmbedCondition — embeds are the pooled ``[B, 768]``."""
-        embeds = self._encode_clip(list(p.texts))
-        return TextEmbedCondition(embeds=embeds, attn_mask=None, pooled=None)
+        return embed_with_cpu_cache(p.texts, self._clip_cache, self._encode_clip, device=self.bundle.device)
 
-    def _encode_clip(self, prompts: List[str]) -> torch.Tensor:
+    def _encode_clip(self, prompts: list[str]) -> TextEmbedCondition:
         bundle = self.bundle
         tokenizer = bundle.tokenizer_2
         text_encoder = bundle.text_encoder_2
@@ -128,7 +129,7 @@ class HunyuanVideo10TextEmbedStage:
             )
         pooled_output = outputs.pooler_output
 
-        return pooled_output.to(dtype=dtype)
+        return TextEmbedCondition(embeds=pooled_output.to(dtype=dtype), attn_mask=None, pooled=None)
 
 
 __all__ = [

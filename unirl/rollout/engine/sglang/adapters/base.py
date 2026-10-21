@@ -88,7 +88,7 @@ class ModelAdapter(ABC):
 
     def validate(self) -> None:
         require(
-            bool(getattr(self.cfg, "pretrained_model_ckpt_path", "")),
+            bool(self.cfg.pretrained_model_ckpt_path),
             f"{type(self).__name__} requires config.pretrained_model_ckpt_path",
         )
         require(
@@ -97,7 +97,9 @@ class ModelAdapter(ABC):
         )
 
     def pad_token_id(self) -> int:
-        pad = getattr(self._tokenizer, "pad_token_id", None) or getattr(self._tokenizer, "eos_token_id", None)
+        pad = getattr(self._tokenizer, "pad_token_id", None)
+        if pad is None:
+            pad = getattr(self._tokenizer, "eos_token_id", None)
         return int(pad) if pad is not None else 0
 
     @abstractmethod

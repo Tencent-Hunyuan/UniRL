@@ -23,7 +23,6 @@ class RewardBackend(ABC):
         batch_size: int = 8,
         timeout: float = 60.0,
         prompt_source: PromptSource = DEFAULT_PROMPT_SOURCE,
-        **kwargs,
     ) -> None:
         if prompt_source not in PROMPT_SOURCES:
             raise ValueError(f"RewardBackend.prompt_source must be 'original' or 'generation', got {prompt_source!r}.")
@@ -32,14 +31,10 @@ class RewardBackend(ABC):
         self.timeout = timeout
         self.prompt_source = prompt_source
 
-    def get_model_name(self) -> str:
-        """Name of the reward model/component this backend serves."""
-        return self.model_name
-
     @property
     def preferred_input_kind(self) -> str:
         """The decoded media kind this backend consumes (image/video/text)."""
-        return str(getattr(self, "input_kind", "image") or "image").strip().lower()
+        return str(self.input_kind).strip().lower()
 
     def prompts(self, request: RewardRequest) -> List[str]:
         """Return the prompt semantics declared by this backend."""
@@ -49,10 +44,6 @@ class RewardBackend(ABC):
     @abstractmethod
     def compute_rewards(self, request: RewardRequest) -> RewardResponse:
         """Score the request."""
-
-    @abstractmethod
-    def is_available(self) -> bool:
-        """Whether this backend is ready to score."""
 
     def offload(self) -> None:
         """Optional lifecycle hook: release device memory."""

@@ -57,73 +57,52 @@ class BucketedIPCReceiveMixin:
                     exc,
                 )
 
-        device = getattr(self, "device", None)
-        if device is None:
+        if self.device is None:
             raise RuntimeError(
                 f"{type(self).__name__}: worker has no `device` attribute — unexpected for a fully-initialized worker."
             )
 
         handle = zmq_handle(
-            replica_rank=int(replica_rank) if replica_rank is not None else replica_rank_from_env(),
-            stage_id=int(stage_id),
-            local_rank=int(getattr(self, "local_rank", 0)),
+            replica_rank=replica_rank if replica_rank is not None else replica_rank_from_env(),
+            stage_id=stage_id,
+            local_rank=self.local_rank,
         )
         receiver = BucketedWeightReceiver(
             zmq_handle=handle,
-            device=device,
+            device=self.device,
             use_shm=use_shm,
         )
-        receiver.receive_weights(
-            on_bucket_received=lambda weights: self._unirl_load_bucket(
-                weights, peft_config=peft_config, base_sync_done=base_sync_done
-            )
-        )
 
-    def _unirl_load_bucket(
-        self,
-        weights: list[tuple[str, torch.Tensor]],
-        peft_config: Optional[dict],
-        base_sync_done: bool,
-    ) -> None:
-        if peft_config and base_sync_done:
-            tensors = dict(weights)
-            lora_request = OmniTensorLoRARequest(
-                lora_name=UNIRL_LORA_NAME,
-                lora_int_id=UNIRL_LORA_INT_ID,
-                lora_path=UNIRL_LORA_PATH,
-                peft_config=peft_config,
-                lora_tensors=tensors,
-            )
-            self.add_lora(lora_request)
-            logger.info(
-                "%s: LoRA bucket loaded (%d tensors, adapter id=%d)",
-                type(self).__name__,
-                len(tensors),
-                UNIRL_LORA_INT_ID,
-            )
-        else:
-            logger.debug("%s: bucket loaded (%d tensors)", type(self).__name__, len(weights))
-            self._unirl_load_weights(weights)
+        def _load_bucket(weights: list[tuple[str, torch.Tensor]]) -> None:
+            if peft_config and base_sync_done:
+                tensors = dict(weights)
+                lora_request = OmniTensorLoRARequest(
+                    lora_name=UNIRL_LORA_NAME,
+                    lora_int_id=UNIRL_LORA_INT_ID,
+                    lora_path=UNIRL_LORA_PATH,
+                    peft_config=peft_config,
+                    lora_tensors=tensors,
+                )
+                self.add_lora(lora_request)
+                logger.info(
+                    "%s: LoRA bucket loaded (%d tensors, adapter id=%d)",
+                    type(self).__name__,
+                    len(tensors),
+                    UNIRL_LORA_INT_ID,
+                )
+            else:
+                logger.debug("%s: bucket loaded (%d tensors)", type(self).__name__, len(weights))
+                self.unirl_target_module().load_weights(weights)
 
-    def _unirl_load_weights(self, weights: list[tuple[str, torch.Tensor]]) -> None:
-        """Forward weights to whichever loader the underlying worker exposes."""
-        loader = getattr(self, "load_weights", None)
-        if callable(loader):
-            loader(weights)
-            return
-        runner = getattr(self, "model_runner", None)
-        if runner is None:
-            raise RuntimeError(f"{type(self).__name__}: no `load_weights` and no `model_runner`.")
-        for attr in ("model", "pipeline"):
-            obj = getattr(runner, attr, None)
-            obj_loader = getattr(obj, "load_weights", None) if obj is not None else None
-            if callable(obj_loader):
-                obj_loader(weights)
-                return
-        raise RuntimeError(
-            f"{type(self).__name__}: could not find a load_weights method on "
-            f"self, model_runner.model, or model_runner.pipeline."
-        )
+        receiver.receive_weights(on_bucket_received=_load_bucket)
+
+    def unirl_target_module(self) -> torch.nn.Module:
+        """Return the loaded model/pipeline module owned by ``self.model_runner``."""
+        runner = self.model_runner
+        module = runner.model if hasattr(runner, "model") else runner.pipeline
+        if module is None:
+            raise RuntimeError(f"{type(self).__name__}: model_runner has no loaded model/pipeline.")
+        return module
 
     def update_weights_from_tensor(
         self,
@@ -139,7 +118,7 @@ class BucketedIPCReceiveMixin:
             MultiprocessingSerializer,
         )
 
-        local_rank = int(getattr(self, "local_rank", 0))
+        local_rank = self.local_rank
         if local_rank >= len(serialized_named_tensors):
             raise IndexError(
                 f"{type(self).__name__}.update_weights_from_tensor: "
@@ -153,7 +132,7 @@ class BucketedIPCReceiveMixin:
             metadata=payload["metadata"],
         )
         named_tensors = bucket.reconstruct_tensors()
-        self._unirl_load_weights(named_tensors)
+        self.unirl_target_module().load_weights(named_tensors)
         logger.info(
             "%s: tensor-payload loaded (%d tensors, load_format=%r)",
             type(self).__name__,
@@ -173,9 +152,6 @@ class BucketedIPCReceiveMixin:
         from unirl.distributed.weight_sync.transfer.sgl_compat import (
             MultiprocessingSerializer,
         )
-        from unirl.rollout.engine.vllm_omni.patches.runtime import (
-            OmniTensorLoRARequest,
-        )
 
         lora_tensors = MultiprocessingSerializer.deserialize(lora_tensors_serialized)
         if not isinstance(lora_tensors, dict):
@@ -185,10 +161,10 @@ class BucketedIPCReceiveMixin:
                 f"{type(lora_tensors).__name__}"
             )
         request = OmniTensorLoRARequest(
-            lora_name=str(lora_name),
-            lora_int_id=int(lora_int_id),
-            lora_path=str(lora_path),
-            peft_config=dict(peft_config or {}),
+            lora_name=lora_name,
+            lora_int_id=lora_int_id,
+            lora_path=lora_path,
+            peft_config={} if peft_config is None else dict(peft_config),
             lora_tensors=lora_tensors,
         )
         return self.add_lora(request)
@@ -213,15 +189,11 @@ class BucketedIPCReceiveMixin:
                 f"deserialised lora_tensors expected dict, got "
                 f"{type(lora_tensors).__name__}"
             )
-        from unirl.rollout.engine.vllm_omni.patches.runtime import (
-            OmniTensorLoRARequest,
-        )
-
         request = OmniTensorLoRARequest(
-            lora_name=str(lora_name),
-            lora_int_id=int(lora_int_id),
-            lora_path=str(lora_path),
-            peft_config=dict(peft_config or {}),
+            lora_name=lora_name,
+            lora_int_id=lora_int_id,
+            lora_path=lora_path,
+            peft_config={} if peft_config is None else dict(peft_config),
             lora_tensors=lora_tensors,
         )
         return self.add_lora(request)
@@ -235,33 +207,7 @@ class BucketedIPCReceiveMixin:
             fingerprint_tensor,
         )
 
-        parameter_module = None
-        queue = [self]
-        seen: set[int] = set()
-        while queue:
-            obj = queue.pop(0)
-            if obj is None or id(obj) in seen:
-                continue
-            seen.add(id(obj))
-            named_parameters = getattr(obj, "named_parameters", None)
-            if callable(named_parameters) and next(iter(named_parameters()), None) is not None:
-                parameter_module = obj
-                break
-            queue.extend(
-                getattr(obj, attr, None)
-                for attr in (
-                    "worker",
-                    "model_runner",
-                    "runner",
-                    "pipeline",
-                    "transformer",
-                    "model",
-                    "bagel",
-                )
-            )
-        if parameter_module is None:
-            return {}
-
+        parameter_module = self.unirl_target_module()
         target = set(names) if names else None
         out: dict = {}
         for name, p in parameter_module.named_parameters():
@@ -280,16 +226,12 @@ class BucketedIPCReceiveMixin:
             fingerprint_tensor,
         )
 
-        manager = getattr(self, "lora_manager", None) or getattr(
-            getattr(self, "model_runner", None), "lora_manager", None
-        )
+        manager = self.lora_manager if hasattr(self, "lora_manager") else self.model_runner.lora_manager
         if manager is None:
             return {}
-        manager = getattr(manager, "_adapter_manager", manager)
-        registered = getattr(manager, "_registered_adapters", None)
-        if registered is None:
-            return {}
-        lora_model = registered.get(adapter_id)
+        if hasattr(manager, "_adapter_manager"):
+            manager = manager._adapter_manager
+        lora_model = manager._registered_adapters.get(adapter_id)
         if lora_model is None:
             return {}
         target = set(names) if names else None
@@ -298,8 +240,7 @@ class BucketedIPCReceiveMixin:
             if target is not None and layer_name not in target:
                 continue
             per_field: dict = {}
-            for field in ("lora_a", "lora_b", "bias", "embeddings_tensor"):
-                t = getattr(layer, field, None)
+            for field, t in (("lora_a", layer.lora_a), ("lora_b", layer.lora_b)):
                 if isinstance(t, torch.Tensor):
                     per_field[field] = fingerprint_tensor(t)
                 elif isinstance(t, (list, tuple)):
