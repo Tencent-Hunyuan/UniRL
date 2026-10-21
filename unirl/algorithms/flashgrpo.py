@@ -15,8 +15,8 @@ from unirl.types.segments.latent import LatentSegment
 from .base import (
     AlgorithmStepResult,
     BaseAlgorithmConfig,
-    _grpo_clip_loss,
-    _resolve_clip_range_from_schedule,
+    grpo_clip_loss,
+    resolve_clip_range_from_schedule,
     typed_conditions,
 )
 from .flowgrpo import FlowGRPO
@@ -115,9 +115,9 @@ class FlashGRPO(FlowGRPO):
             raise ValueError(
                 "FlashGRPO requires segment.sde_index_per_sample; the rollout was not stratified per prompt."
             )
-        target_steps = self._resolve_target_steps(segment)
-        if not target_steps:
+        if segment.sde_indices is None or segment.sde_indices.numel() == 0:
             raise ValueError("FlashGRPO requires segment.sde_indices to be non-empty.")
+        target_steps = segment.sde_indices.tolist()
 
         typed_conds = typed_conditions(conditions, self.conditions_cls)
         replay_result = self.stage.replay(
@@ -130,12 +130,12 @@ class FlashGRPO(FlowGRPO):
         # Each sample took its one stochastic step at its own index, so slot 0 holds its logp.
         old_logp = segment.sde_logp[:, :1].to(dtype=new_logp.dtype, device=new_logp.device)
 
-        clip_range = _resolve_clip_range_from_schedule(self.clip_range, self.clip_schedule, training_progress)
+        clip_range = resolve_clip_range_from_schedule(self.clip_range, self.clip_schedule, training_progress)
         adv_raw = advantages.detach().to(dtype=new_logp.dtype, device=new_logp.device)
         adv_clipped = adv_raw.clamp(-self.adv_clip_max, self.adv_clip_max)
         adv_b = adv_clipped.reshape(-1, 1).expand_as(new_logp)
 
-        loss_per_elem, ratio_metrics = _grpo_clip_loss(
+        loss_per_elem, ratio_metrics = grpo_clip_loss(
             new_logp=new_logp,
             old_logp=old_logp,
             advantages=adv_b,

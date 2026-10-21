@@ -7,6 +7,7 @@ from typing import Any, ClassVar, Dict, List, Optional, Set, Tuple
 
 import torch
 
+from unirl.models.types.batched_replay import BatchedStepReplayMixin
 from unirl.models.types.diffusion import DiffusionStage, DiffusionStep
 from unirl.models.types.per_sample_replay import PerSampleStepReplayMixin
 from unirl.models.types.replay_result import ReplayResult
@@ -182,7 +183,7 @@ class WAN21DiffusionStep(DiffusionStep[WAN21Bundle, WAN21Conditions]):
         )
 
 
-class WAN21DiffusionStage(PerSampleStepReplayMixin, DiffusionStage[WAN21Conditions]):
+class WAN21DiffusionStage(PerSampleStepReplayMixin, BatchedStepReplayMixin, DiffusionStage[WAN21Conditions]):
     """WAN 2.1 T2V rollout-level diffusion stage."""
 
     _no_split_modules: ClassVar[Tuple[str, ...]] = ("WanTransformerBlock",)
@@ -200,6 +201,7 @@ class WAN21DiffusionStage(PerSampleStepReplayMixin, DiffusionStage[WAN21Conditio
         autocast_precision: str = "bf16",
         trajectory_precision: str = "fp16",
         logprob_precision: str = "fp32",
+        batch_replay_steps: bool,
     ) -> None:
         self.model = model
         self.step = step
@@ -207,6 +209,7 @@ class WAN21DiffusionStage(PerSampleStepReplayMixin, DiffusionStage[WAN21Conditio
         self.autocast_dtype = parse_torch_dtype(autocast_precision, field_name="autocast_precision")
         self.trajectory_dtype = parse_torch_dtype(trajectory_precision, field_name="trajectory_precision")
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="logprob_precision")
+        self.batch_replay_steps = batch_replay_steps
         self.vae_scale_factor = self._SPATIAL_DOWNSAMPLE
         self.temporal_scale_factor = self._TEMPORAL_DOWNSAMPLE
         self.latent_channels = model.vae.config.z_dim if model.vae is not None else self._DEFAULT_LATENT_CHANNELS
@@ -342,62 +345,19 @@ class WAN21DiffusionStage(PerSampleStepReplayMixin, DiffusionStage[WAN21Conditio
         """Log-prob replay: ``log_probs [B, len(target)]``, means ``[B, len(target), C, T_lat, H_lat, W_lat]``."""
         if segment.sde_index_per_sample is not None:
             return self.replay_per_sample(conditions, segment=segment, params=params)
-        if segment.sde_indices is None or segment.latents is None:
-            raise ValueError("WAN21DiffusionStage.replay: segment.sde_indices / latents missing")
-        if segment.sigmas is None:
-            raise ValueError("WAN21DiffusionStage.replay: segment.sigmas missing")
-
-        sde_set = set(segment.sde_indices.tolist())
-        target = list(step_indices) if step_indices is not None else segment.sde_indices.tolist()
-        bad = [i for i in target if i not in sde_set]
-        if bad:
-            raise ValueError(
-                f"WAN21DiffusionStage.replay: step_indices {bad} not in segment.sde_indices={sorted(sde_set)}"
-            )
-
-        device = segment.latents.device
-        sigmas = segment.sigmas.to(device)
-        sigma_max = float(sigmas[1].item()) if int(sigmas.shape[0]) > 1 else 0.99
-
+        device = segment.latents.device if segment.latents is not None else torch.device("cpu")
         autocast_ctx = (
             torch.autocast("cuda", self.autocast_dtype)
             if device.type == "cuda" and self.autocast_dtype in (torch.float16, torch.bfloat16)
             else nullcontext()
         )
-        log_probs: List[torch.Tensor] = []
-        prev_sample_means: List[torch.Tensor] = []
         with autocast_ctx:
-            for step_idx in target:
-                sigma = sigmas[step_idx].to(dtype=torch.float32)
-                sigma_next = sigmas[step_idx + 1].to(dtype=torch.float32)
-                sample = segment.latents_at(step_idx)
-                prev_sample = segment.latents_at(step_idx + 1)
-                _, log_prob, prev_mean = self.step.step_with_logp(
-                    self.model,
-                    conditions,
-                    strategy=self.strategy,
-                    sample=sample,
-                    prev_sample=prev_sample,
-                    sigma=sigma,
-                    sigma_next=sigma_next,
-                    guidance_scale=params.guidance_scale,
-                    eta=params.eta,
-                    sigma_max=sigma_max,
-                    step_index=step_idx,
-                )
-                if log_prob is None:
-                    raise RuntimeError(
-                        f"WAN21DiffusionStage.replay: strategy returned None log-prob "
-                        f"at step_index={step_idx} (deterministic mode); replay "
-                        f"requires a stochastic SDE strategy."
-                    )
-                log_probs.append(log_prob)
-                if prev_mean is not None:
-                    prev_sample_means.append(prev_mean)
-
-        log_probs_t = torch.stack(log_probs, dim=1).to(dtype=self.logprob_dtype)
-        means_t = torch.stack(prev_sample_means, dim=1) if prev_sample_means else None
-        return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
+            return self.replay_steps(
+                conditions,
+                segment=segment,
+                params=params,
+                step_indices=step_indices,
+            )
 
     def predict_noise_at_step(
         self,
