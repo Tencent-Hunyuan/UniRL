@@ -214,8 +214,14 @@ class UnifiedModelTrainStack(BaseTrainStack):
 
         profiler = self._train_step_profiler if profile_mode() == "train" else None
         with profiler.record("train_track") if profiler is not None else nullcontext():
-            prepare_segment_anchors(self.ar_algorithm, ar_part, ar_steps, order=ar_order)
-            prepare_segment_anchors(self.image_algorithm, image_part, image_steps, order=image_order)
+            self.fsdp_backend.model.eval()
+            try:
+                prepare_segment_anchors(self.ar_algorithm, ar_part, ar_steps, order=ar_order)
+                ar_part = self.ar_algorithm.prepare_part(ar_part)
+                prepare_segment_anchors(self.image_algorithm, image_part, image_steps, order=image_order)
+                image_part = self.image_algorithm.prepare_part(image_part)
+            finally:
+                self.fsdp_backend.model.train()
 
             per_update: List[Dict[str, TrainStepResult]] = []
             for u in range(self.num_updates_per_batch):
