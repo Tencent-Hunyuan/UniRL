@@ -107,8 +107,20 @@ class TensorStore:
             is_master=(global_rank == 0),
             timeout=timedelta(seconds=30),
         )
-        self._global_pg = dist.ProcessGroupNCCL(store, global_rank, global_world_size)
-        self._global_pg.eager_connect_single_device(torch.device(self.device))
+        try:
+            self._global_pg = dist.ProcessGroupNCCL(store, global_rank, global_world_size)
+            self._global_pg.eager_connect_single_device(torch.device(self.device))
+        except Exception:
+            # GCU/ECCL: python-side ProcessGroupNCCL binding missing (native
+            # stacks) or constructor refuses non-NVIDIA devices (overlay
+            # stacks) — default group on this store (eccl p2p below).
+            dist.init_process_group(
+                backend="eccl",
+                store=store,
+                rank=global_rank,
+                world_size=global_world_size,
+            )
+            self._global_pg = dist.group.WORLD
 
     def _nccl_send(self, dst_rank: int, items: List) -> None:
         """Send stored tensors (or row ranges of them) to dst_rank via NCCL."""
@@ -118,7 +130,10 @@ class TensorStore:
             tensor = self._store[key].detach()
             if start is not None:
                 tensor = tensor[start:stop]
-            self._global_pg.send([tensor.contiguous()], dst_rank, 0).wait()
+            if hasattr(self._global_pg, "send"):
+                self._global_pg.send([tensor.contiguous()], dst_rank, 0).wait()
+            else:
+                dist.send(tensor.contiguous(), dst_rank, group=self._global_pg)
 
     def _nccl_recv(
         self,
@@ -132,7 +147,10 @@ class TensorStore:
         handles = []
         for shape, dtype in zip(shapes, dtypes):
             buf = torch.empty(shape, dtype=dtype, device=self.device)
-            self._global_pg.recv([buf], src_global_rank, 0).wait()
+            if hasattr(self._global_pg, "recv"):
+                self._global_pg.recv([buf], src_global_rank, 0).wait()
+            else:
+                dist.recv(buf, src_global_rank, group=self._global_pg)
             handles.append(self.put(buf))
         return handles
 

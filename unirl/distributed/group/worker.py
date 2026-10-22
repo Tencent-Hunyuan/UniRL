@@ -39,8 +39,16 @@ class Worker:
         self.transport_kind = transport_kind or "colocate_store"
 
         if torch.cuda.is_available():
-            torch.cuda.set_device(0)
-            self.device = "cuda:0"
+            # GCU ignores CUDA_VISIBLE_DEVICES for visibility, so per-actor env
+            # CVD (injected by device_pool as a single device id) is used here as
+            # an explicit pin target; out-of-range falls back to 0 (NVIDIA path,
+            # where ray masks visibility and device 0 is the assigned card).
+            import os as _os
+            _ids = [x.strip() for x in _os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if x.strip()]
+            _pin = int(_ids[0]) if (len(_ids) == 1 and _ids[0].isdigit()
+                                    and int(_ids[0]) < torch.cuda.device_count()) else 0
+            torch.cuda.set_device(_pin)
+            self.device = f"cuda:{_pin}"
         else:
             self.device = "cpu"
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import Any, Dict, List, Optional, Sequence, Set
 
@@ -157,7 +158,11 @@ class DevicePool:
         worker_id = f"dw{device_id}" if slot == 0 else f"dw{device_id}_s{slot}"
         pg = self._pgs[device_id // self.devices_per_node]
         bundle_index = device_id % self.devices_per_node
-        num_gpus = 1 / self.workers_per_device
+        # GCU: request no ray GPU resource so ray skips its accelerator-id
+        # remap at task execution (no accelerator plugin on GCU → remap either
+        # no-ops or crashes); per-actor CUDA_VISIBLE_DEVICES mask above is the
+        # single source of device pinning. Placement stays pinned via bundle_index.
+        num_gpus = 0
 
         options = dict(
             num_gpus=num_gpus,
@@ -169,6 +174,14 @@ class DevicePool:
         max_concurrency = self._worker_concurrency_by_device[device_id]
         if max_concurrency > 1:
             options["max_concurrency"] = max_concurrency
+        cvd_ids = [x.strip() for x in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if x.strip()]
+        if cvd_ids and device_id < len(cvd_ids):
+            # GCU: ray head started with forced --num-gpus but no accelerator plugin
+            # enumerates device ids, so ray never masks CUDA_VISIBLE_DEVICES per
+            # worker; mask here so each actor pins exactly one card (worker.py
+            # set_device(0)). NVIDIA plugin path stays equivalent; multi-node or
+            # unset CVD degrades to previous behavior.
+            env_vars = {**(env_vars or {}), "CUDA_VISIBLE_DEVICES": cvd_ids[device_id]}
         if env_vars:
             options["runtime_env"] = {"env_vars": env_vars}
 
