@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Any, List, Protocol, runtime_checkable
+from collections import OrderedDict
+from typing import Any, Protocol, runtime_checkable
 
 import torch
 
-from unirl.models.types.embedding import EmbedStage
+from unirl.models.types.embedding import EmbedStage, embed_with_cpu_cache
 from unirl.types.conditions import TextEmbedCondition
 from unirl.types.primitives import Texts
 
@@ -34,12 +35,13 @@ class WAN21TextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
         self.max_sequence_length = int(
             max_sequence_length if max_sequence_length is not None else bundle.max_sequence_length
         )
+        self._cache: OrderedDict[str, TextEmbedCondition] = OrderedDict()
 
     def embed(self, p: Texts) -> TextEmbedCondition:
         """Encode prompts into a ``TextEmbedCondition``."""
-        return self._encode(list(p.texts))
+        return embed_with_cpu_cache(p.texts, self._cache, self._encode, device=self.bundle.device)
 
-    def _encode(self, prompts: List[str]) -> TextEmbedCondition:
+    def _encode(self, prompts: list[str]) -> TextEmbedCondition:
         bundle = self.bundle
         device = bundle.device
 

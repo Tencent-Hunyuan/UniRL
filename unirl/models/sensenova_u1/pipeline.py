@@ -69,7 +69,7 @@ class SenseNovaU1Pipeline(Pipeline):
         return cls(
             bundle=SenseNovaU1Bundle.from_config(config),
             strategy=strategy,
-            shift=float(config.timestep_shift),
+            shift=config.timestep_shift,
             autocast_precision=config.autocast_precision,
             trajectory_precision=config.trajectory_precision,
             logprob_precision=config.logprob_precision,
@@ -79,7 +79,7 @@ class SenseNovaU1Pipeline(Pipeline):
     def latent_shape(cls, *, model_config: Any, sampling_spec: Any) -> tuple:
         """Driver-side NCHW pixel-noise shape, matching upstream seeded RNG."""
         del model_config
-        height, width = int(sampling_spec.height), int(sampling_spec.width)
+        height, width = sampling_spec.height, sampling_spec.width
         packed_pixel_shape((height, width), patch_size=DEFAULT_PIXEL_PATCH_SIZE)
         return (3, height, width)
 
@@ -115,9 +115,9 @@ class SenseNovaU1Pipeline(Pipeline):
         )
 
         height, width = image_shape
-        merge = int(1 / float(model.downsample_ratio))
-        token_h = height // (int(model.patch_size) * merge)
-        token_w = width // (int(model.patch_size) * merge)
+        merge = int(1 / model.downsample_ratio)
+        token_h = height // (model.patch_size * merge)
+        token_w = width // (model.patch_size * merge)
         image_indexes = model._build_t2i_image_indexes(
             token_h,
             token_w,
@@ -206,10 +206,10 @@ class SenseNovaU1Pipeline(Pipeline):
                 f"got {type(texts).__name__ if texts is not None else 'None'}."
             )
 
-        image_shape = (int(params.height), int(params.width))
+        image_shape = (params.height, params.width)
         conditions = self.build_conditions(
             texts,
-            guidance_scale=float(params.guidance_scale),
+            guidance_scale=params.guidance_scale,
             image_shape=image_shape,
         )
         initial = NoiseRecipe.from_sample(sample).resolve(

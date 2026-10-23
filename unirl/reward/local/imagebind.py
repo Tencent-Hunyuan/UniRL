@@ -54,7 +54,7 @@ class ImageBindRewardScorer(LocalRewardBackend):
         self._mode = config.mode
         if self._mode not in _IMAGEBIND_MODES:
             raise ValueError(f"ImageBindSpec.mode must be one of {_IMAGEBIND_MODES}; got {config.mode!r}.")
-        self._weights = dict(config.weights or _IMAGEBIND_DEFAULT_WEIGHTS)
+        self._weights = dict(_IMAGEBIND_DEFAULT_WEIGHTS if config.weights is None else config.weights)
         if self._mode == "all":
             if set(self._weights) != set(_IMAGEBIND_DEFAULT_WEIGHTS):
                 raise ValueError(
@@ -85,7 +85,7 @@ class ImageBindRewardScorer(LocalRewardBackend):
         self.model = imagebind_model.imagebind_huge(pretrained=True).to(self.device).eval()
 
     def _preprocess_audio_to_melspec(self, audio_list: List[torch.Tensor], src_sample_rate: int) -> torch.Tensor:
-        import torch.nn.functional as Fn
+        import torchaudio.compliance.kaldi as kaldi
         import torchaudio.functional as AF
 
         batch_clips = []
@@ -100,109 +100,78 @@ class ImageBindRewardScorer(LocalRewardBackend):
                 wf = AF.resample(wf, src_sample_rate, _IB_AUDIO_SAMPLE_RATE)
 
             duration_s = wf.shape[1] / _IB_AUDIO_SAMPLE_RATE
-            clip_starts = self._compute_clip_starts(duration_s, _IB_AUDIO_CLIP_DURATION, _IB_AUDIO_CLIPS_PER_SAMPLE)
+            if duration_s <= _IB_AUDIO_CLIP_DURATION:
+                clip_starts = [0.0] * _IB_AUDIO_CLIPS_PER_SAMPLE
+            else:
+                spacing = (duration_s - _IB_AUDIO_CLIP_DURATION) / max(_IB_AUDIO_CLIPS_PER_SAMPLE - 1, 1)
+                clip_starts = [i * spacing for i in range(_IB_AUDIO_CLIPS_PER_SAMPLE)]
+
             mel_clips = []
             for start_s in clip_starts:
                 start_idx = int(start_s * _IB_AUDIO_SAMPLE_RATE)
                 clip = wf[:, start_idx : start_idx + samples_per_clip]
                 if clip.shape[1] < samples_per_clip:
-                    clip = Fn.pad(clip, (0, samples_per_clip - clip.shape[1]))
-                mel = self._waveform_to_melspec(clip)
-                mel = (mel - _IB_AUDIO_MEAN) / _IB_AUDIO_STD
+                    clip = F.pad(clip, (0, samples_per_clip - clip.shape[1]))
+                clip = clip - clip.mean()
+                fbank = kaldi.fbank(
+                    clip,
+                    htk_compat=True,
+                    sample_frequency=_IB_AUDIO_SAMPLE_RATE,
+                    use_energy=False,
+                    window_type="hanning",
+                    num_mel_bins=_IB_AUDIO_NUM_MEL_BINS,
+                    dither=0.0,
+                    frame_length=25,
+                    frame_shift=10,
+                ).transpose(0, 1)
+                n_frames = fbank.shape[1]
+                if n_frames < _IB_AUDIO_TARGET_LENGTH:
+                    fbank = F.pad(fbank, (0, _IB_AUDIO_TARGET_LENGTH - n_frames))
+                else:
+                    fbank = fbank[:, :_IB_AUDIO_TARGET_LENGTH]
+                mel = (fbank.unsqueeze(0) - _IB_AUDIO_MEAN) / _IB_AUDIO_STD
                 mel_clips.append(mel)
             batch_clips.append(torch.stack(mel_clips, dim=0))
         return torch.stack(batch_clips, dim=0).to(self.device)
 
-    @staticmethod
-    def _waveform_to_melspec(waveform: torch.Tensor) -> torch.Tensor:
-        import torch.nn.functional as Fn
-        import torchaudio.compliance.kaldi as kaldi
-
-        waveform = waveform.float()
-        waveform = waveform - waveform.mean()
-        fbank = kaldi.fbank(
-            waveform,
-            htk_compat=True,
-            sample_frequency=_IB_AUDIO_SAMPLE_RATE,
-            use_energy=False,
-            window_type="hanning",
-            num_mel_bins=_IB_AUDIO_NUM_MEL_BINS,
-            dither=0.0,
-            frame_length=25,
-            frame_shift=10,
-        )
-        fbank = fbank.transpose(0, 1)
-        n_frames = fbank.shape[1]
-        if n_frames < _IB_AUDIO_TARGET_LENGTH:
-            fbank = Fn.pad(fbank, (0, _IB_AUDIO_TARGET_LENGTH - n_frames))
-        else:
-            fbank = fbank[:, :_IB_AUDIO_TARGET_LENGTH]
-        return fbank.unsqueeze(0)
-
-    @staticmethod
-    def _compute_clip_starts(duration_s: float, clip_duration: float, num_clips: int) -> List[float]:
-        if duration_s <= clip_duration:
-            return [0.0] * num_clips
-        spacing = (duration_s - clip_duration) / max(num_clips - 1, 1)
-        return [i * spacing for i in range(num_clips)]
-
     def _preprocess_video(self, video_list: List[torch.Tensor]) -> torch.Tensor:
         batch_result = []
+        num_clips = 5
+        frames_per_clip = 2
         for video in video_list:
             video_f = video.float() / 255.0 if video.dtype == torch.uint8 else video.float()
-            clips = self._temporal_subsample_clips(video_f, num_clips=5, frames_per_clip=2)
+            mean = torch.tensor(_IB_VISION_MEAN, device=video_f.device).view(3, 1, 1, 1)
+            std = torch.tensor(_IB_VISION_STD, device=video_f.device).view(3, 1, 1, 1)
+            T = video_f.shape[1]
             all_crops = []
-            for clip in clips:
-                clip = self._resize_short_side(clip, _IB_VISION_SIZE)
-                clip = self._normalize_video_clip(clip)
-                all_crops.extend(self._spatial_crop(clip, _IB_VISION_SIZE))
+            for i in range(num_clips):
+                center = int((i + 0.5) * T / num_clips)
+                indices = torch.linspace(
+                    max(0, center - frames_per_clip // 2),
+                    min(T - 1, center + frames_per_clip // 2 - 1),
+                    frames_per_clip,
+                ).long()
+                clip = video_f[:, indices]
+                C, Tc, H, W = clip.shape
+                if W <= H:
+                    new_w, new_h = _IB_VISION_SIZE, int(H / W * _IB_VISION_SIZE)
+                else:
+                    new_w, new_h = int(W / H * _IB_VISION_SIZE), _IB_VISION_SIZE
+                clip = F.interpolate(
+                    clip.reshape(C * Tc, 1, H, W),
+                    size=(new_h, new_w),
+                    mode="bilinear",
+                    align_corners=False,
+                ).reshape(C, Tc, new_h, new_w)
+                clip = (clip - mean) / std
+                if new_h > new_w:
+                    for y in (0, (new_h - _IB_VISION_SIZE) // 2, new_h - _IB_VISION_SIZE):
+                        all_crops.append(clip[:, :, y : y + _IB_VISION_SIZE, :])
+                else:
+                    for x in (0, (new_w - _IB_VISION_SIZE) // 2, new_w - _IB_VISION_SIZE):
+                        all_crops.append(clip[:, :, :, x : x + _IB_VISION_SIZE])
             batch_result.append(torch.stack(all_crops, dim=0))
         return torch.stack(batch_result, dim=0).to(self.device)
-
-    @staticmethod
-    def _temporal_subsample_clips(video: torch.Tensor, num_clips: int, frames_per_clip: int) -> List[torch.Tensor]:
-        T = video.shape[1]
-        clips = []
-        for i in range(num_clips):
-            center = int((i + 0.5) * T / num_clips)
-            indices = torch.linspace(
-                max(0, center - frames_per_clip // 2),
-                min(T - 1, center + frames_per_clip // 2 - 1),
-                frames_per_clip,
-            ).long()
-            clips.append(video[:, indices])
-        return clips
-
-    @staticmethod
-    def _resize_short_side(clip: torch.Tensor, size: int) -> torch.Tensor:
-        C, T, H, W = clip.shape
-        if W <= H:
-            new_w, new_h = size, int(H / W * size)
-        else:
-            new_w, new_h = int(W / H * size), size
-        clip_flat = clip.reshape(C * T, 1, H, W)
-        clip_resized = F.interpolate(clip_flat, size=(new_h, new_w), mode="bilinear", align_corners=False)
-        return clip_resized.reshape(C, T, new_h, new_w)
-
-    @staticmethod
-    def _normalize_video_clip(clip: torch.Tensor) -> torch.Tensor:
-        mean = torch.tensor(_IB_VISION_MEAN, device=clip.device).view(3, 1, 1, 1)
-        std = torch.tensor(_IB_VISION_STD, device=clip.device).view(3, 1, 1, 1)
-        return (clip - mean) / std
-
-    @staticmethod
-    def _spatial_crop(clip: torch.Tensor, crop_size: int) -> List[torch.Tensor]:
-        C, T, H, W = clip.shape
-        crops = []
-        if H > W:
-            offsets = [0, (H - crop_size) // 2, H - crop_size]
-            for y in offsets:
-                crops.append(clip[:, :, y : y + crop_size, :])
-        else:
-            offsets = [0, (W - crop_size) // 2, W - crop_size]
-            for x in offsets:
-                crops.append(clip[:, :, :, x : x + crop_size])
-        return crops
 
     def _compute_model_rewards(self, request: RewardRequest) -> List[float]:
         from imagebind.data import load_and_transform_text
@@ -233,24 +202,23 @@ class ImageBindRewardScorer(LocalRewardBackend):
 
         with torch.no_grad():
             embeddings = self.model(inputs)
-        rewards = self._compute_similarity(embeddings, ModalityType)
-        return rewards.float().cpu().tolist()
 
-    def _compute_similarity(self, embeddings: dict, ModalityType) -> torch.Tensor:
         def cos(a, b):
             return (F.normalize(a, dim=-1) * F.normalize(b, dim=-1)).sum(dim=-1)
 
         if self._mode == "audio_video":
-            return cos(embeddings[ModalityType.AUDIO], embeddings[ModalityType.VISION])
-        if self._mode == "text_audio":
-            return cos(embeddings[ModalityType.TEXT], embeddings[ModalityType.AUDIO])
-        if self._mode == "text_video":
-            return cos(embeddings[ModalityType.TEXT], embeddings[ModalityType.VISION])
-        w = self._weights
-        av = cos(embeddings[ModalityType.AUDIO], embeddings[ModalityType.VISION])
-        ta = cos(embeddings[ModalityType.TEXT], embeddings[ModalityType.AUDIO])
-        tv = cos(embeddings[ModalityType.TEXT], embeddings[ModalityType.VISION])
-        return w["audio_video"] * av + w["text_audio"] * ta + w["text_video"] * tv
+            rewards = cos(embeddings[ModalityType.AUDIO], embeddings[ModalityType.VISION])
+        elif self._mode == "text_audio":
+            rewards = cos(embeddings[ModalityType.TEXT], embeddings[ModalityType.AUDIO])
+        elif self._mode == "text_video":
+            rewards = cos(embeddings[ModalityType.TEXT], embeddings[ModalityType.VISION])
+        else:
+            w = self._weights
+            av = cos(embeddings[ModalityType.AUDIO], embeddings[ModalityType.VISION])
+            ta = cos(embeddings[ModalityType.TEXT], embeddings[ModalityType.AUDIO])
+            tv = cos(embeddings[ModalityType.TEXT], embeddings[ModalityType.VISION])
+            rewards = w["audio_video"] * av + w["text_audio"] * ta + w["text_video"] * tv
+        return rewards.float().cpu().tolist()
 
 
 @dataclass

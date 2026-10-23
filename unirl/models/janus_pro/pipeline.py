@@ -79,22 +79,6 @@ class JanusProPipeline(Pipeline):
         return cls.from_bundle(bundle, config=config)
 
     @staticmethod
-    def _resolve_task(sample: Sample) -> str:
-        """Resolve an explicit root task or infer I2T from image conditioning."""
-        task = sample.parts[0].control.get("task")
-        if task is None:
-            return "i2t" if sample.has_image_input() else "t2i"
-        return str(task).strip().lower()
-
-    def generate(self, sample: Sample) -> Sample:
-        task = self._resolve_task(sample)
-        if task in {"i2t", "it2t", "understanding", "text"}:
-            return self._generate_i2t(sample)
-        if task in {"t2i", "text2image", "image", "generation"}:
-            return self._generate_t2i(sample)
-        raise ValueError(f"JanusProPipeline.generate: unsupported task={task!r}")
-
-    @staticmethod
     def _single(turns, kind, task: str):
         """Return the sole trajectory primitive of ``kind`` or fail."""
         found = [t.content for t in turns if isinstance(t.content, kind)]
@@ -106,58 +90,60 @@ class JanusProPipeline(Pipeline):
             )
         return found[0]
 
-    def _generate_i2t(self, sample: Sample) -> Sample:
-        frontier = sample.frontier_gen_part(ARSamplingParams)
+    def generate(self, sample: Sample) -> Sample:
+        raw_task = sample.parts[0].control.get("task")
+        task = ("i2t" if sample.has_image_input() else "t2i") if raw_task is None else str(raw_task).strip().lower()
+        if task in {"i2t", "it2t", "understanding", "text"}:
+            frontier = sample.frontier_gen_part(ARSamplingParams)
 
-        # Fails loud on zero images or a non-text/image modality.
-        turns, _images = sample.vision_conditioning()
-        texts = self._single(turns, Texts, "i2t")
-        images_prim = self._single(turns, Images, "i2t")
+            # Fails loud on zero images or a non-text/image modality.
+            turns, _images = sample.vision_conditioning()
+            texts = self._single(turns, Texts, "i2t")
+            images_prim = self._single(turns, Images, "i2t")
 
-        chat_overrides: Dict[str, Any] = dict(sample.parts[0].control.get("chat") or {})
-        conds: JanusProARConditions = self.chat_template.embed(
-            texts,
-            images_prim.to_pils(),
-            system_instruction=chat_overrides.get("system_instruction"),
-        )
+            chat_overrides: Dict[str, Any] = dict(sample.parts[0].control.get("chat") or {})
+            conds: JanusProARConditions = self.chat_template.embed(
+                texts,
+                images_prim.to_pils(),
+                system_instruction=chat_overrides.get("system_instruction"),
+            )
 
-        # The frontier is authoritative; forwarding it intact preserves shared
-        # fields such as samples_per_prompt and seed as the sampling API evolves.
-        segment = self.ar.autoregress(conds, sampling_params=frontier.sampling_params)
-        decoded = self._detokenize(segment)
-        return sample.with_filled_frontier(
-            segment=segment,
-            primitives={"text": decoded},
-            conditions=conds.to_dict(),
-        )
+            # The frontier is authoritative; forwarding it intact preserves shared
+            # fields such as samples_per_prompt and seed as the sampling API evolves.
+            segment = self.ar.autoregress(conds, sampling_params=frontier.sampling_params)
+            cu = segment.cu_seqlens.tolist()
+            decoded = Texts(
+                texts=[
+                    self.bundle.tokenizer.decode(
+                        segment.tokens[cu[i] : cu[i + 1]].tolist(), skip_special_tokens=True
+                    ).strip()
+                    for i in range(len(cu) - 1)
+                ]
+            )
+            return sample.with_filled_frontier(
+                segment=segment,
+                primitives={"text": decoded},
+                conditions=conds.to_dict(),
+            )
+        if task in {"t2i", "text2image", "image", "generation"}:
+            # The image grid, CFG weight, and token count all ride on the gen shell,
+            # so the params type is part of the contract rather than a soft default.
+            frontier = sample.frontier_gen_part(JanusProImageARSamplingParams)
+            sampling_params: JanusProImageARSamplingParams = frontier.sampling_params
 
-    def _generate_t2i(self, sample: Sample) -> Sample:
-        # The image grid, CFG weight, and token count all ride on the gen shell,
-        # so the params type is part of the contract rather than a soft default.
-        frontier = sample.frontier_gen_part(JanusProImageARSamplingParams)
-        sampling_params: JanusProImageARSamplingParams = frontier.sampling_params
-
-        texts = self._single(sample.turns(), Texts, "t2i")
-        conds: JanusProImageARConditions = self.image_prompt.embed(
-            texts,
-            cfg_weight=sampling_params.cfg_weight,
-        )
-        segment = self.image_ar.autoregress(conds, sampling_params=sampling_params)
-        decoded = self.image_ar.decode(segment, sampling_params=sampling_params)
-        return sample.with_filled_frontier(
-            segment=segment,
-            primitives={"image": decoded},
-            conditions=conds.to_dict(),
-        )
-
-    def _detokenize(self, segment) -> Texts:
-        cu = segment.cu_seqlens.tolist()
-        out = []
-        for i in range(len(cu) - 1):
-            chunk = segment.tokens[cu[i] : cu[i + 1]]
-            text = self.bundle.tokenizer.decode(chunk.tolist(), skip_special_tokens=True)
-            out.append(text.strip())
-        return Texts(texts=out)
+            texts = self._single(sample.turns(), Texts, "t2i")
+            conds_t2i: JanusProImageARConditions = self.image_prompt.embed(
+                texts,
+                cfg_weight=sampling_params.cfg_weight,
+            )
+            segment = self.image_ar.autoregress(conds_t2i, sampling_params=sampling_params)
+            decoded = self.image_ar.decode(segment, sampling_params=sampling_params)
+            return sample.with_filled_frontier(
+                segment=segment,
+                primitives={"image": decoded},
+                conditions=conds_t2i.to_dict(),
+            )
+        raise ValueError(f"JanusProPipeline.generate: unsupported task={task!r}")
 
 
 __all__ = ["JanusProPipeline"]

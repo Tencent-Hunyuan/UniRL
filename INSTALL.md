@@ -64,7 +64,6 @@ uv pip install -e ".[sglang,train,infer]"
 | `vllm` | `vllm`, `vllm-omni`, torch +cu130 stack, PyAV | vLLM and vLLM-Omni recipes |
 | `flash-attn` | FlashAttention 2 | Diffusers `flash*` attention backends in diffusion training |
 | `sglang` | `sglang[diffusion]`, `checkpoint-engine`, `flash-attn-4`, `flash-linear-attention[conv1d]`, torch +cu130 stack, PyAV | SGLang-based AR/VLM and diffusion recipes |
-| `fastvideo` | FastVideo pinned to an upstream Git commit | WAN 2.1 / 2.2 rollout; [the extra does not currently resolve](#fastvideo-installation-blocker) |
 | `train` | `wandb`, `aiohttp`, `math-verify` | Training runs and local math-answer scoring |
 | `cosmos3` | `diffusers>=0.39` | [Cosmos3 SFT](unirl/models/cosmos3/README.md); uv's `diffusers==0.40.0` override already satisfies this extra |
 | `infer` | `accelerate`, `timm` | HunyuanImage3, Janus-Pro, and similar models |
@@ -92,16 +91,15 @@ uv pip install -e ".[sglang,train,infer,eval,dev]"
 Prefer these extras over the legacy [`requirements.txt`](requirements.txt) and
 `setup.py` paths, which do not match the engine stacks or uv's CUDA index.
 
-### FastVideo installation blocker
+### FastVideo
 
-The `fastvideo` extra pins
+FastVideo is not an extra. The WAN 2.1 / 2.2 FastVideo rollout targets
 [hao-ai-lab/FastVideo@2095477](https://github.com/hao-ai-lab/FastVideo/blob/2095477eac7e289c7a7ab13acb367ca60687c304/pyproject.toml),
-which requires `transformers==4.57.3` and `wandb>=0.21.0`. The transformers pin
-conflicts with UniRL's `transformers>=5.12,<5.13`, so `.[fastvideo]` does not
-resolve — a separate venv does not help, because UniRL's base deps still apply.
-Adding `train` also conflicts on `wandb`. Use `$FASTVIDEO_PATH` as in the
-[FastVideo engine README](unirl/rollout/engine/fastvideo/README.md) until the extra
-is solvable.
+which requires `transformers==4.57.3` and `wandb>=0.21.0`. Those conflict with
+UniRL's `transformers>=5.12,<5.13` and the `train` extra's `wandb` pin, and PyPI
+rejects packages that declare Git dependencies. Check out that commit and point
+`$FASTVIDEO_PATH` (or `cfg.fastvideo_path`) at it, as in the
+[FastVideo engine README](unirl/rollout/engine/fastvideo/README.md).
 
 ### Cosmos3
 

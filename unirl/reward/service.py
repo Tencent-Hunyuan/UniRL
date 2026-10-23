@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from typing import Dict, List, Optional
 
 import torch
@@ -10,52 +11,13 @@ import torch
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
 from unirl.types.primitives import PrimitiveValue, Texts, primitive_modality_key
-from unirl.types.reward import RewardRequest, RewardResponse
-from unirl.types.sample import Sample, _part_with_field
+from unirl.types.reward import RewardRequest
+from unirl.types.sample import Sample
 from unirl.types.sampling import ARSamplingParams
 
 from .base import DifferentiableReward, PromptVideoReward, RewardBackend
 
 logger = logging.getLogger(__name__)
-
-
-def _build_reward_request(sample: Sample, preferred_input_kind: str) -> RewardRequest:
-    """Assemble a :class:`RewardRequest` from a response ``Sample``."""
-    frontier = sample.parts[-1]
-    original_prompt: Optional[Texts] = None
-    generation_prompt: Optional[Texts] = None
-    conditioning: Dict[str, PrimitiveValue] = {}
-    for turn in sample.turns():
-        prim = turn.content
-        if isinstance(prim, Texts):
-            if original_prompt is None:
-                original_prompt = prim
-            generation_prompt = prim
-        else:
-            conditioning[primitive_modality_key(prim)] = prim
-
-    if preferred_input_kind not in frontier.primitives:
-        raise ValueError(
-            f"Reward backend consumes {preferred_input_kind!r} but the frontier Part generated "
-            f"{sorted(frontier.primitives)!r}; check the recipe's reward/model pairing."
-        )
-
-    metadata = sample.root_metadata(-1)
-    generated = dict(frontier.primitives)
-    audio_sample_rate: Optional[int] = None
-    audio_metadata = frontier.primitive_metadata.get("audio", {})
-    if "audio" in generated and audio_metadata.get("sample_rate") is not None:
-        audio_sample_rate = int(audio_metadata["sample_rate"])
-    return RewardRequest(
-        generated=generated,
-        conditioning=conditioning,
-        original_prompt=original_prompt,
-        generation_prompt=generation_prompt,
-        audio_sample_rate=audio_sample_rate,
-        sample_ids=list(frontier.sample_ids),
-        group_ids=list(frontier.group_ids),
-        metadata=(metadata if any(m is not None for m in metadata) else None),
-    )
 
 
 class RewardService(Remote):
@@ -80,29 +42,26 @@ class RewardService(Remote):
                 "require_prompt_video: false to train on it anyway."
             )
         self.backend = backend
+        kind = backend.preferred_input_kind
+        if kind not in {"image", "video", "text"}:
+            raise ValueError(
+                f"Reward backend must expose preferred_input_kind as 'image', 'video', or 'text'. Got {kind!r}."
+            )
+        self.preferred_input_kind = kind
         self.truncated_reward = str(truncated_reward)
         self.overlong_buffer_len = int(overlong_buffer_len)
         self.overlong_penalty_factor = float(overlong_penalty_factor)
         if self.truncated_reward not in ("zero", "keep", "soft"):
             raise ValueError(f"truncated_reward must be zero|keep|soft, got {self.truncated_reward!r}")
+        if self.truncated_reward == "soft" and self.overlong_buffer_len <= 0:
+            raise ValueError(
+                f"overlong_buffer_len must be > 0 when truncated_reward='soft', got {self.overlong_buffer_len}"
+            )
         logger.info(
             "RewardService initialized with backend=%s, truncated_reward=%s",
-            backend.get_model_name() or type(backend).__name__,
+            backend.model_name or type(backend).__name__,
             self.truncated_reward,
         )
-
-    @property
-    def preferred_input_kind(self) -> str:
-        """The decoded media kind the backend consumes (image/video/text)."""
-        kind = str(getattr(self.backend, "preferred_input_kind", "") or "").strip().lower()
-        if kind not in {"image", "video", "text"}:
-            raise ValueError(
-                f"Reward backend must expose preferred_input_kind as 'image', 'video', or 'text'. Got {kind!r}."
-            )
-        return kind
-
-    def compute_rewards(self, request: RewardRequest) -> RewardResponse:
-        return self.backend.compute_rewards(request)
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
     def score_differentiable(
@@ -118,7 +77,7 @@ class RewardService(Remote):
                 f"{type(self.backend).__name__} is not a DifferentiableReward — ReFL "
                 f"needs a differentiable in-process reward (e.g. pickscore/clip/hpsv2)."
             )
-        return self.backend.compute_rewards_differentiable(media_tensor, list(prompts), records=records)
+        return self.backend.compute_rewards_differentiable(media_tensor, prompts, records=records)
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
     def score_and_attach(self, sample: Sample) -> Sample:
@@ -129,8 +88,41 @@ class RewardService(Remote):
         if not frontier.primitives:
             raise ValueError("RewardService.score_and_attach: frontier Part has no generated primitives to score.")
 
-        request = _build_reward_request(sample, self.preferred_input_kind)
-        reward_response = self.compute_rewards(request)
+        original_prompt: Optional[Texts] = None
+        generation_prompt: Optional[Texts] = None
+        conditioning: Dict[str, PrimitiveValue] = {}
+        for turn in sample.turns():
+            prim = turn.content
+            if isinstance(prim, Texts):
+                if original_prompt is None:
+                    original_prompt = prim
+                generation_prompt = prim
+            else:
+                conditioning[primitive_modality_key(prim)] = prim
+
+        if self.preferred_input_kind not in frontier.primitives:
+            raise ValueError(
+                f"Reward backend consumes {self.preferred_input_kind!r} but the frontier Part generated "
+                f"{sorted(frontier.primitives)!r}; check the recipe's reward/model pairing."
+            )
+
+        metadata = sample.root_metadata(-1)
+        generated = dict(frontier.primitives)
+        audio_sample_rate: Optional[int] = None
+        audio_metadata = frontier.primitive_metadata.get("audio", {})
+        if "audio" in generated and audio_metadata.get("sample_rate") is not None:
+            audio_sample_rate = int(audio_metadata["sample_rate"])
+        request = RewardRequest(
+            generated=generated,
+            conditioning=conditioning,
+            original_prompt=original_prompt,
+            generation_prompt=generation_prompt,
+            audio_sample_rate=audio_sample_rate,
+            sample_ids=list(frontier.sample_ids),
+            group_ids=list(frontier.group_ids),
+            metadata=(metadata if any(m is not None for m in metadata) else None),
+        )
+        reward_response = self.backend.compute_rewards(request)
 
         failed = [(i, e) for i, (ok, e) in enumerate(zip(reward_response.successes, reward_response.errors)) if not ok]
         if failed:
@@ -150,7 +142,7 @@ class RewardService(Remote):
             and not sampling_params.emits_fixed_length
             and frontier.segment is not None
         ):
-            seg_lengths = getattr(frontier.segment, "lengths", None)
+            seg_lengths = frontier.segment.lengths
             if seg_lengths is not None and seg_lengths.numel() == rewards.numel():
                 seg_lengths = seg_lengths.to(rewards.device).float()
                 max_len = sampling_params.max_new_tokens
@@ -164,15 +156,11 @@ class RewardService(Remote):
                     rewards = rewards + penalty
 
         component_rewards = {
-            str(name): torch.tensor(list(values or []), dtype=torch.float32)
-            for name, values in dict(reward_response.component_rewards or {}).items()
+            name: torch.tensor(values, dtype=torch.float32)
+            for name, values in reward_response.component_rewards.items()
         }
-        scored = _part_with_field(frontier, "rewards", rewards)
-        scored = _part_with_field(scored, "component_rewards", component_rewards)
+        scored = replace(frontier, rewards=rewards, component_rewards=component_rewards)
         return sample.with_parts([*sample.parts[:-1], scored])
-
-    def is_available(self) -> bool:
-        return self.backend.is_available()
 
     # Broadcast, not scatter: every reward worker holds its own copy of the
     # scorer, so each has to move its own weights. Undecorated, these were
@@ -186,12 +174,9 @@ class RewardService(Remote):
     def onload(self) -> None:
         self.backend.onload()
 
-    def dispose(self) -> None:
-        self.backend.dispose()
-
     def shutdown(self) -> None:
         """Worker teardown hook: release backend sessions and managed children."""
-        self.dispose()
+        self.backend.dispose()
 
 
 __all__ = [
