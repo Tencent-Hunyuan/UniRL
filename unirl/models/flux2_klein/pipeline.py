@@ -45,15 +45,13 @@ class Flux2KleinPipeline(Pipeline):
     ) -> None:
         super().__init__()
         self.bundle = bundle
-        self.text_embed = (
-            text_embed
-            if text_embed is not None
-            else Flux2KleinTextEmbedStage(
+        if text_embed is None and bundle.text_encoder is not None:
+            text_embed = Flux2KleinTextEmbedStage(
                 bundle,
                 max_sequence_length=max_sequence_length,
                 extraction_layers=tuple(qwen3_extraction_layers),
             )
-        )
+        self.text_embed = text_embed
         if diffusion is None:
             diffusion = Flux2KleinDiffusionStage(
                 model=bundle,
@@ -96,10 +94,14 @@ class Flux2KleinPipeline(Pipeline):
     ) -> "Flux2KleinPipeline":
         """Build the full pipeline from a config."""
         bundle = Flux2KleinBundle.from_config(config)
-        text_embed = Flux2KleinTextEmbedStage(
-            bundle,
-            max_sequence_length=config.max_sequence_length,
-            extraction_layers=tuple(config.qwen3_extraction_layers),
+        text_embed = (
+            Flux2KleinTextEmbedStage(
+                bundle,
+                max_sequence_length=config.max_sequence_length,
+                extraction_layers=tuple(config.qwen3_extraction_layers),
+            )
+            if bundle.text_encoder is not None
+            else None
         )
         step = Flux2KleinDiffusionStep()
         diffusion = Flux2KleinDiffusionStage(
@@ -132,6 +134,11 @@ class Flux2KleinPipeline(Pipeline):
             raise ValueError(
                 f"Flux2KleinPipeline.build_conditions: negative_text length "
                 f"{len(negatives.texts)} != text length {len(texts.texts)}"
+            )
+        if self.text_embed is None:
+            raise RuntimeError(
+                "Flux2KleinPipeline.build_conditions: no text_embed stage "
+                "(load_text_encoder=False); trainside conditioning requires load_text_encoder=True."
             )
         text_cond = self.text_embed.embed(texts)
         if negatives is None and float(guidance_scale) > 1.0:

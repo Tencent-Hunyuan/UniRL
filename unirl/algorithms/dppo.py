@@ -15,8 +15,8 @@ from .base import (
     AlgorithmStepResult,
     BaseAlgorithmConfig,
     StageAlgorithm,
-    _prepare_ar_logp_anchor,
     aggregate_token_losses,
+    prepare_ar_logp_anchor,
     rollout_replay_logp_absdiff,
     select_active_tokens,
     typed_conditions,
@@ -140,7 +140,7 @@ class DPPO(StageAlgorithm):
         segment: "TextSegment",
     ) -> None:
         """Freeze the ``pi_old`` / ``mu`` anchor before the ``num_updates_per_batch`` loop, per ``old_logp_source``."""
-        _prepare_ar_logp_anchor(
+        prepare_ar_logp_anchor(
             stage=self.stage,
             conditions=conditions,
             segment=segment,

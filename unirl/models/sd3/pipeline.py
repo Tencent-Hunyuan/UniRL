@@ -39,7 +39,9 @@ class SD3Pipeline(Pipeline):
     ) -> None:
         super().__init__()
         self.bundle = bundle
-        self.text_embed = text_embed if text_embed is not None else SD3TextEmbedStage(bundle)
+        if text_embed is None and bundle.text_encoder is not None:
+            text_embed = SD3TextEmbedStage(bundle)
+        self.text_embed = text_embed
         if diffusion is None:
             diffusion = SD3DiffusionStage(
                 model=bundle,
@@ -93,6 +95,11 @@ class SD3Pipeline(Pipeline):
             raise ValueError(
                 f"SD3Pipeline.build_conditions: negative_text length "
                 f"{len(negatives.texts)} != text length {len(texts.texts)}"
+            )
+        if self.text_embed is None:
+            raise RuntimeError(
+                "SD3Pipeline.build_conditions: no text_embed stage "
+                "(load_text_encoder=False); trainside conditioning requires load_text_encoder=True."
             )
         text_cond = self.text_embed.embed(texts)
         if negatives is None and float(guidance_scale) > 1.0:

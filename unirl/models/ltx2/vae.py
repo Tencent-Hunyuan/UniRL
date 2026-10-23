@@ -24,6 +24,13 @@ class LTX2VAEDecodeStage:
     def decode(self, latents: torch.Tensor) -> Videos:
         """Decode (already-denormalized) video latents → packed ``Videos``."""
         vae = self.vae
+        if vae is None:
+            raise RuntimeError(
+                "LTX2VAEDecodeStage.decode: no VAE loaded (load_vae=False). "
+                "The trainer-side pipeline cannot decode latents when video "
+                "decoding is delegated to a separate rollout engine; "
+                "trainside rollout requires load_vae=True."
+            )
         latents_f32 = latents.to(torch.float32)
 
         timestep = None
@@ -49,6 +56,11 @@ class LTX2VAEEncodeStage:
     @torch.no_grad()
     def encode(self, frames: torch.Tensor) -> torch.Tensor:
         """Encode frames → latents."""
+        if self.vae is None:
+            raise RuntimeError(
+                "LTX2VAEEncodeStage.encode: no VAE loaded (load_vae=False). "
+                "Trainer-side video encoding requires load_vae=True."
+            )
         if frames.dim() == 4:
             frames = frames.unsqueeze(2)
         frames = frames.to(dtype=self.vae.dtype)
