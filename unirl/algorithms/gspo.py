@@ -14,9 +14,9 @@ from .base import (
     AlgorithmStepResult,
     BaseAlgorithmConfig,
     StageAlgorithm,
-    _grpo_clip_loss,
-    _prepare_ar_logp_anchor,
-    _resolve_clip_range_from_schedule,
+    grpo_clip_loss,
+    prepare_ar_logp_anchor,
+    resolve_clip_range_from_schedule,
     rollout_replay_k3,
     rollout_replay_logp_absdiff,
     typed_conditions,
@@ -83,7 +83,7 @@ class GSPO(StageAlgorithm):
         segment: "TextSegment",
     ) -> None:
         """Freeze the selected π_old anchor before optimizer updates."""
-        _prepare_ar_logp_anchor(
+        prepare_ar_logp_anchor(
             stage=self.stage,
             conditions=conditions,
             segment=segment,
@@ -110,11 +110,11 @@ class GSPO(StageAlgorithm):
         new_logp = self.stage.replay(typed_conds, segment=segment, temperature=self.sampling_temperature)
         old_logp = segment.log_probs.to(dtype=new_logp.dtype, device=new_logp.device)
 
-        clip_range = _resolve_clip_range_from_schedule(self.clip_range, self.clip_schedule, training_progress)
+        clip_range = resolve_clip_range_from_schedule(self.clip_range, self.clip_schedule, training_progress)
         clip_high = (
             None
             if self.clip_range_high is None
-            else _resolve_clip_range_from_schedule(self.clip_range_high, self.clip_schedule, training_progress)
+            else resolve_clip_range_from_schedule(self.clip_range_high, self.clip_schedule, training_progress)
         )
 
         seq_new, seq_old, seq_adv, valid = self._reduce_to_sequences(
@@ -128,7 +128,7 @@ class GSPO(StageAlgorithm):
             return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
 
         log_ratio = (seq_new - seq_old).clamp(max=self._MAX_LOG_RATIO)
-        loss_per_seq, ratio_metrics = _grpo_clip_loss(
+        loss_per_seq, ratio_metrics = grpo_clip_loss(
             new_logp=log_ratio,
             old_logp=torch.zeros_like(log_ratio),
             advantages=seq_adv,

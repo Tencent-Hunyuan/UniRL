@@ -548,8 +548,13 @@ class Hi3DitRecaptionAdapter(ModelAdapter):
         width = base_kwargs["width"]
 
         base_extra = sde_extra_args(diff_params)
-        recipe_gids = gen_part.group_ids if diff_params.init_same_noise else list(gen_part.sample_ids)
-        if recipe_gids and not diff_params.disable_driver_xt:
+        explicit_keys = list(gen_part.init_noise_group_ids)
+        recipe_gids = (
+            []
+            if diff_params.disable_driver_xt
+            else (explicit_keys or (gen_part.group_ids if diff_params.init_same_noise else list(gen_part.sample_ids)))
+        )
+        if recipe_gids:
             base_extra["init_noise_group_ids"] = recipe_gids
             base_extra["init_noise_seed"] = diff_params.seed if diff_params.seed is not None else 0
 
