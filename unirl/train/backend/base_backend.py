@@ -19,14 +19,11 @@ from unirl.train.backend.sharded_state import (
     StateDict,
     _current_rank,
     drop_meta_entries,
+    fresh_adamw_state,
     gather_lora_state_dict,
     gather_state_dict,
     load_model_state_dict,
-    load_sharded_model_state_dict,
-    load_sharded_optimizer_state_dict,
     move_optimizer_state,
-    sharded_model_state_dict,
-    sharded_optimizer_state_dict,
     trainable_params,
 )
 from unirl.train.configs import EmaFullConfig, EmaLoraConfig, FSDPConfig, LoraConfig
@@ -43,14 +40,6 @@ logger = logging.getLogger(__name__)
 _PENDING_DCP_SAVE_FUTURE: Optional[Future] = None
 
 
-def _set_pending_dcp_save(future: Future) -> None:
-    """Register the one async DCP upload allowed in this worker process."""
-    global _PENDING_DCP_SAVE_FUTURE
-    if _PENDING_DCP_SAVE_FUTURE is not None:
-        raise RuntimeError("an async DCP save is already pending in this worker process")
-    _PENDING_DCP_SAVE_FUTURE = future
-
-
 def _drain_pending_dcp_save() -> None:
     """Wait for the process-wide async DCP upload, if any."""
     global _PENDING_DCP_SAVE_FUTURE
@@ -64,52 +53,6 @@ def _drain_pending_dcp_save() -> None:
             _PENDING_DCP_SAVE_FUTURE = None
 
 
-def _prepare_dcp_directory(
-    path: str,
-    metadata: Dict[str, object],
-    *,
-    process_group: Optional[dist.ProcessGroup],
-) -> None:
-    """Publish app metadata and invalidate any stale DCP completion marker."""
-    local_error: Optional[str] = None
-    local_exc: Optional[Exception] = None
-    metadata_path = os.path.join(path, "metadata.pt")
-    metadata_tmp = f"{metadata_path}.tmp"
-
-    if _current_rank() == 0:
-        try:
-            os.makedirs(path, exist_ok=True)
-            torch.save(metadata, metadata_tmp)
-            dcp_metadata_path = os.path.join(path, ".metadata")
-            if os.path.exists(dcp_metadata_path):
-                os.remove(dcp_metadata_path)
-            torch_checkpoint_path = os.path.join(path, "checkpoint.pt")
-            if os.path.exists(torch_checkpoint_path):
-                os.remove(torch_checkpoint_path)
-            os.replace(metadata_tmp, metadata_path)
-        except Exception as exc:
-            local_exc = exc
-            local_error = f"{type(exc).__name__}: {exc}"
-            try:
-                if os.path.exists(metadata_tmp):
-                    os.remove(metadata_tmp)
-            except OSError:
-                pass
-
-    if dist.is_available() and dist.is_initialized():
-        error_box: List[Optional[str]] = [local_error]
-        dist.broadcast_object_list(error_box, src=0, group=process_group)
-        error = error_box[0]
-    else:
-        error = local_error
-
-    if error is not None:
-        wrapped = RuntimeError(f"failed to prepare DCP checkpoint directory {path!r}: {error}")
-        if local_exc is not None:
-            raise wrapped from local_exc
-        raise wrapped
-
-
 class BaseFSDP2Backend(Remote):
     """Shared base for the single-track FSDP2 training backends."""
 
@@ -120,12 +63,13 @@ class BaseFSDP2Backend(Remote):
     ema: Optional[EMA]
     optimizer: torch.optim.Optimizer
     scheduler: Optional[torch.optim.lr_scheduler.LRScheduler]
+    fsdp_cfg: FSDPConfig
+    lora_meta: Optional[Dict[str, object]]
+    rollout_adapter_name: str
+    grad_sync_deferred: bool
     _optimizer_step_count: int
     _eval_ema_active: bool
-    _lora_meta: Optional[Dict[str, object]]
     _frozen_adapters: FrozenAdapters
-    _rollout_adapter_name: str
-    _defer_grad_sync: bool
     _grad_sync_enabled: bool
     _loss_reduction_mesh: Optional["DeviceMesh"]
 
@@ -195,6 +139,12 @@ class BaseFSDP2Backend(Remote):
         fsdp_cfg: FSDPConfig,
     ) -> None:
         """Build EMA / optimizer / scheduler and set the shared train state."""
+        if fsdp_cfg.checkpoint_format not in ("torch", "dcp"):
+            raise ValueError(
+                f"{type(self).__name__}: fsdp_cfg.checkpoint_format must be 'torch' or 'dcp', "
+                f"got {fsdp_cfg.checkpoint_format!r}"
+            )
+        self.fsdp_cfg = fsdp_cfg
         self.model = model
         self._loss_reduction_mesh = find_dtensor_mesh(model)
 
@@ -217,15 +167,8 @@ class BaseFSDP2Backend(Remote):
             optimizer=self.optimizer,
         )
 
-        self._optimizer_step_count: int = 0
-        self._eval_ema_active: bool = False
-        checkpoint_format = str(getattr(fsdp_cfg, "checkpoint_format", "torch"))
-        if checkpoint_format not in ("torch", "dcp"):
-            raise ValueError(
-                f"{type(self).__name__}: fsdp_cfg.checkpoint_format must be 'torch' or 'dcp', got {checkpoint_format!r}"
-            )
-        self._checkpoint_format: str = checkpoint_format
-        self._checkpoint_async: bool = bool(getattr(fsdp_cfg, "checkpoint_async", False))
+        self._optimizer_step_count = 0
+        self._eval_ema_active = False
         active_lora = lora_cfg or ema_lora_cfg
         recorded_target_modules = None
         if active_lora is not None:
@@ -235,7 +178,7 @@ class BaseFSDP2Backend(Remote):
                     target_modules=lora_cfg.target_modules,
                     module_prefix=lora_cfg.module_prefix,
                 )
-        self._lora_meta = (
+        self.lora_meta = (
             {
                 "rank": active_lora.rank,
                 "alpha": active_lora.alpha,
@@ -249,9 +192,9 @@ class BaseFSDP2Backend(Remote):
             if active_lora is not None
             else None
         )
-        self._rollout_adapter_name = str(ema_lora_cfg.shadow_adapter) if ema_lora_cfg is not None else "default"
+        self.rollout_adapter_name = ema_lora_cfg.shadow_adapter if ema_lora_cfg is not None else "default"
         # Deferred gradient sync is supported only under ZeRO-2.
-        self._defer_grad_sync = bool(fsdp_cfg.defer_grad_sync) and not bool(fsdp_cfg.reshard_after_forward)
+        self.grad_sync_deferred = fsdp_cfg.defer_grad_sync and not fsdp_cfg.reshard_after_forward
         self._grad_sync_enabled = True
 
     def zero_grad(self) -> None:
@@ -259,7 +202,7 @@ class BaseFSDP2Backend(Remote):
 
     def set_grad_sync(self, enable: bool) -> None:
         """Toggle the FSDP2 gradient reduce-scatter for no-sync accumulation."""
-        if not self._defer_grad_sync or enable == self._grad_sync_enabled:
+        if not self.grad_sync_deferred or enable == self._grad_sync_enabled:
             return
         from torch.distributed.fsdp import FSDPModule
 
@@ -269,15 +212,9 @@ class BaseFSDP2Backend(Remote):
                 m.set_is_last_backward(enable)
         self._grad_sync_enabled = enable
 
-    @property
-    def grad_sync_deferred(self) -> bool:
-        """True when no-sync accumulation is active (``defer_grad_sync`` under ZeRO-2)."""
-        return self._defer_grad_sync
-
     def optimizer_step(self, *, max_grad_norm: float) -> float:
         """Clip (via the engine hook), optimizer step, scheduler step, EMA step."""
-        clipped = self._clip_grad_norm(float(max_grad_norm))
-        grad_norm = float(clipped.item()) if isinstance(clipped, torch.Tensor) else float(clipped or 0.0)
+        grad_norm = float(self._clip_grad_norm(max_grad_norm).item())
 
         if not math.isfinite(grad_norm):
             bad_params = []
@@ -321,11 +258,6 @@ class BaseFSDP2Backend(Remote):
         """Return the authoritative number of committed optimizer updates."""
         return self._optimizer_step_count
 
-    @property
-    def rollout_adapter_name(self) -> str:
-        """Adapter the rollout must sample under (single source of truth)."""
-        return self._rollout_adapter_name
-
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def apply_eval_ema(self) -> None:
         """Swap the EMA shadow ("old") adapter into live position for rollout."""
@@ -342,18 +274,93 @@ class BaseFSDP2Backend(Remote):
         self._eval_ema_active = False
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
-    def save(self, path: str, step: Optional[int] = None, mode: str = "full") -> None:
+    def save(self, path: str, step: int = 0, mode: str = "full") -> None:
         """Save training state; dispatch on ``checkpoint_format`` ("torch" | "dcp")."""
-        mode = self._resolve_save_mode(mode)
+        global _PENDING_DCP_SAVE_FUTURE
+        if mode == "auto":
+            mode = "adapter" if self.lora_meta is not None else "full"
+        elif mode not in ("full", "adapter"):
+            raise ValueError(f"FSDPBackend.save: unknown mode {mode!r} (use 'auto', 'full' or 'adapter')")
         if mode == "adapter" and not any("lora_" in name for name, _ in self.model.named_parameters()):
             raise RuntimeError(f"{type(self).__name__}.save: mode='adapter' but the model has no LoRA params")
-        if self._checkpoint_format == "dcp":
-            self._save_dcp(path, step, mode)
-        else:
-            self._save_torch(path, step, mode)
 
-    def _save_torch(self, path: str, step: Optional[int], mode: str) -> None:
-        """Legacy single-file save: gather full state to rank 0, torch.save."""
+        if self.fsdp_cfg.checkpoint_format == "dcp":
+            import torch.distributed.checkpoint as dcp
+            from torch.distributed.checkpoint.state_dict import (
+                StateDictOptions,
+                get_model_state_dict,
+                get_optimizer_state_dict,
+            )
+
+            # Finish an async save before starting another DCP collective.
+            _drain_pending_dcp_save()
+            self._reject_meta(operation="save", checkpoint_format="dcp", mode=mode)
+            sharded_options = StateDictOptions(full_state_dict=False)
+            model_sd = drop_meta_entries(dict(get_model_state_dict(self.model, options=sharded_options)))
+            if mode == "adapter":
+                model_sd = {k: v for k, v in model_sd.items() if self._frozen_adapters.is_trainable_lora_key(k)}
+            with fresh_adamw_state(self.optimizer):
+                optim_sd = get_optimizer_state_dict(self.model, self.optimizer, options=sharded_options)
+            sharded_state: Dict[str, object] = {
+                "model": model_sd,
+                "optim": optim_sd,
+            }
+            meta: Dict[str, object] = {
+                "optimizer_step_count": self._optimizer_step_count,
+                "step": step,
+                "save_mode": mode,
+                "lora_config": self.lora_meta,
+            }
+            if self.scheduler is not None:
+                meta["scheduler_state_dict"] = self.scheduler.state_dict()
+
+            pg = None
+            if self.fsdp_cfg.checkpoint_async and dist.is_available() and dist.is_initialized():
+                pg = init_gloo_group()
+
+            local_error: Optional[str] = None
+            local_exc: Optional[Exception] = None
+            metadata_path = os.path.join(path, "metadata.pt")
+            metadata_tmp = f"{metadata_path}.tmp"
+            if _current_rank() == 0:
+                try:
+                    os.makedirs(path, exist_ok=True)
+                    torch.save(meta, metadata_tmp)
+                    for stale_file in (".metadata", "checkpoint.pt"):
+                        stale_path = os.path.join(path, stale_file)
+                        if os.path.exists(stale_path):
+                            os.remove(stale_path)
+                    os.replace(metadata_tmp, metadata_path)
+                except Exception as exc:
+                    local_exc = exc
+                    local_error = f"{type(exc).__name__}: {exc}"
+                    try:
+                        if os.path.exists(metadata_tmp):
+                            os.remove(metadata_tmp)
+                    except OSError:
+                        pass
+
+            if dist.is_available() and dist.is_initialized():
+                error_box: List[Optional[str]] = [local_error]
+                dist.broadcast_object_list(error_box, src=0, group=pg)
+                error = error_box[0]
+            else:
+                error = local_error
+
+            if error is not None:
+                wrapped = RuntimeError(f"failed to prepare DCP checkpoint directory {path!r}: {error}")
+                if local_exc is not None:
+                    raise wrapped from local_exc
+                raise wrapped
+
+            if self.fsdp_cfg.checkpoint_async:
+                if _PENDING_DCP_SAVE_FUTURE is not None:
+                    raise RuntimeError("an async DCP save is already pending in this worker process")
+                _PENDING_DCP_SAVE_FUTURE = dcp.async_save(sharded_state, checkpoint_id=path, process_group=pg)
+            else:
+                dcp.save(sharded_state, checkpoint_id=path)
+            return
+
         self._reject_meta(operation="save", checkpoint_format="torch", mode=mode)
         policy_state = self._gather_model_state(mode)
         optimizer_state = self._gather_optimizer_state()
@@ -363,7 +370,7 @@ class BaseFSDP2Backend(Remote):
             "optimizer_step_count": self._optimizer_step_count,
             "step": step,
             "save_mode": mode,
-            "lora_config": self._lora_meta,
+            "lora_config": self.lora_meta,
         }
         state.update(self._torch_checkpoint_metadata())
         if self.scheduler is not None:
@@ -389,56 +396,16 @@ class BaseFSDP2Backend(Remote):
                 pass
             raise
 
-    def _save_dcp(self, path: str, step: Optional[int], mode: str) -> None:
-        """Sharded save: every rank writes its own shard under ``path``."""
-        import torch.distributed.checkpoint as dcp
-
-        # Finish an async save before starting another DCP collective.
-        self._drain_checkpoint()
-        self._reject_meta(operation="save", checkpoint_format="dcp", mode=mode)
-        model_sd = drop_meta_entries(sharded_model_state_dict(self.model))
-        if mode == "adapter":
-            model_sd = {k: v for k, v in model_sd.items() if self._frozen_adapters.is_trainable_lora_key(k)}
-        sharded_state: Dict[str, object] = {
-            "model": model_sd,
-            "optim": sharded_optimizer_state_dict(self.model, self.optimizer),
-        }
-        meta: Dict[str, object] = {
-            "optimizer_step_count": self._optimizer_step_count,
-            "step": step,
-            "save_mode": mode,
-            "lora_config": self._lora_meta,
-        }
-        if self.scheduler is not None:
-            meta["scheduler_state_dict"] = self.scheduler.state_dict()
-
-        pg = None
-        if self._checkpoint_async:
-            # Async DCP saves require a CPU-capable process group.
-            if dist.is_available() and dist.is_initialized():
-                pg = init_gloo_group()
-        _prepare_dcp_directory(path, meta, process_group=pg)
-
-        if self._checkpoint_async:
-            future = dcp.async_save(sharded_state, checkpoint_id=path, process_group=pg)
-            _set_pending_dcp_save(future)
-        else:
-            dcp.save(sharded_state, checkpoint_id=path)
-
-    def _drain_checkpoint(self) -> None:
-        """Block until a pending async DCP save finishes (no-op if none)."""
-        _drain_pending_dcp_save()
-
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def wait_for_checkpoint(self) -> None:
         """Flush the last async DCP save (driver-callable across all workers)."""
-        self._drain_checkpoint()
+        _drain_pending_dcp_save()
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def load(self, path: str) -> int:
         """Restore state written by :meth:`save`; return the saved rollout step (0 if absent)."""
         # Finish an async save before reading its checkpoint.
-        self._drain_checkpoint()
+        _drain_pending_dcp_save()
         dcp_metadata_path = os.path.join(path, ".metadata")
         metadata_path = os.path.join(path, "metadata.pt")
         checkpoint_path = os.path.join(path, "checkpoint.pt")
@@ -466,7 +433,52 @@ class BaseFSDP2Backend(Remote):
                 raise FileNotFoundError(
                     f"FSDPBackend.load: app metadata not visible on rank(s) {missing_meta}: {metadata_path}"
                 )
-            return self._load_dcp(path)
+            import torch.distributed.checkpoint as dcp
+            from torch.distributed.checkpoint.state_dict import (
+                StateDictOptions,
+                get_model_state_dict,
+                get_optimizer_state_dict,
+                set_model_state_dict,
+                set_optimizer_state_dict,
+            )
+
+            meta: Dict[str, object] = torch.load(metadata_path, map_location="cpu")
+            mode = meta["save_mode"]
+            self._reject_meta(operation="load", checkpoint_format="dcp", mode=mode)
+            has_meta_params = any(p.is_meta for p in self.model.parameters())
+            strict = mode == "full" and not has_meta_params
+
+            self._frozen_adapters.check_resume(meta.get("lora_config"))
+            sharded_options = StateDictOptions(full_state_dict=False)
+            model_sd = drop_meta_entries(dict(get_model_state_dict(self.model, options=sharded_options)))
+            if mode == "adapter":
+                model_sd = {k: v for k, v in model_sd.items() if self._frozen_adapters.is_trainable_lora_key(k)}
+            with fresh_adamw_state(self.optimizer):
+                optim_sd = get_optimizer_state_dict(self.model, self.optimizer, options=sharded_options)
+            sharded_state: Dict[str, object] = {
+                "model": model_sd,
+                "optim": optim_sd,
+            }
+            dcp.load(sharded_state, checkpoint_id=path)
+
+            set_model_state_dict(
+                self.model,
+                sharded_state["model"],
+                options=StateDictOptions(full_state_dict=False, strict=strict),
+            )
+            set_optimizer_state_dict(
+                self.model,
+                self.optimizer,
+                optim_state_dict=sharded_state["optim"],
+                options=sharded_options,
+            )
+            if isinstance(self.optimizer, torch.optim.AdamW):
+                for param in [p for p, entry in self.optimizer.state.items() if float(entry["step"]) == 0]:
+                    del self.optimizer.state[param]
+            if self.scheduler is not None and "scheduler_state_dict" in meta:
+                self.scheduler.load_state_dict(meta["scheduler_state_dict"])
+            self._optimizer_step_count = meta["optimizer_step_count"]
+            return meta["step"]
 
         missing_on = [rank for rank, ok in enumerate(verdicts) if not (ok and ok["torch"])]
         if missing_on:
@@ -474,13 +486,9 @@ class BaseFSDP2Backend(Remote):
                 f"{type(self).__name__}.load: checkpoint not visible on rank(s) {missing_on}: {checkpoint_path} "
                 "(save_dir/load_dir must live on storage mounted on every node)"
             )
-        return self._load_torch(checkpoint_path)
-
-    def _load_torch(self, checkpoint_path: str) -> int:
-        """Legacy single-file load: read full state, broadcast from rank 0, reshard."""
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
 
-        mode = checkpoint.get("save_mode", "full")
+        mode = checkpoint["save_mode"]
         strict = mode == "full"
         self._reject_meta(operation="load", checkpoint_format="torch", mode=mode)
         self._frozen_adapters.check_resume(checkpoint.get("lora_config"))
@@ -491,45 +499,8 @@ class BaseFSDP2Backend(Remote):
         self._load_optimizer_state(checkpoint["optimizer_state_dict"])
         if self.scheduler is not None and "scheduler_state_dict" in checkpoint:
             self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-        if checkpoint.get("optimizer_step_count") is not None:
-            self._optimizer_step_count = int(checkpoint["optimizer_step_count"])
-        return int(checkpoint.get("step") or 0)
-
-    def _resolve_save_mode(self, mode: str) -> str:
-        if mode == "auto":
-            return "adapter" if self._lora_meta is not None else "full"
-        if mode not in ("full", "adapter"):
-            raise ValueError(f"FSDPBackend.save: unknown mode {mode!r} (use 'auto', 'full' or 'adapter')")
-        return mode
-
-    def _load_dcp(self, path: str) -> int:
-        """Sharded load: each rank reads its own shard from DCP ``path``."""
-        import torch.distributed.checkpoint as dcp
-
-        meta_path = os.path.join(path, "metadata.pt")
-        meta: Dict[str, object] = torch.load(meta_path, map_location="cpu")
-        mode = str(meta.get("save_mode", "full"))
-        self._reject_meta(operation="load", checkpoint_format="dcp", mode=mode)
-        has_meta_params = any(p.is_meta for p in self.model.parameters())
-        strict = mode == "full" and not has_meta_params
-
-        self._frozen_adapters.check_resume(meta.get("lora_config"))
-        model_sd = drop_meta_entries(sharded_model_state_dict(self.model))
-        if mode == "adapter":
-            model_sd = {k: v for k, v in model_sd.items() if self._frozen_adapters.is_trainable_lora_key(k)}
-        sharded_state: Dict[str, object] = {
-            "model": model_sd,
-            "optim": sharded_optimizer_state_dict(self.model, self.optimizer),
-        }
-        dcp.load(sharded_state, checkpoint_id=path)
-
-        load_sharded_model_state_dict(self.model, sharded_state["model"], strict=strict)
-        load_sharded_optimizer_state_dict(self.model, self.optimizer, sharded_state["optim"])
-        if self.scheduler is not None and "scheduler_state_dict" in meta:
-            self.scheduler.load_state_dict(meta["scheduler_state_dict"])
-        if meta.get("optimizer_step_count") is not None:
-            self._optimizer_step_count = int(meta["optimizer_step_count"])
-        return int(meta.get("step") or 0)
+        self._optimizer_step_count = checkpoint["optimizer_step_count"]
+        return checkpoint["step"]
 
     def _reject_meta(
         self,

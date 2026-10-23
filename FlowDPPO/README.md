@@ -6,7 +6,7 @@ KL-ADV mask**. It computes the exact Gaussian KL between the old and new SDE tra
 policies and zeroes an update only when it *both* diverges far from the old policy *and*
 pushes too aggressively in the reward-improving direction.
 
-- **Loss:** [`unirl/algorithms/flowdppo.py`](../unirl/algorithms/flowdppo.py) (`_gaussian_kl_div`, `_flowdppo_kl_adv_loss`, `FlowDPPO`)
+- **Loss:** [`unirl/algorithms/flowdppo.py`](../unirl/algorithms/flowdppo.py) (`gaussian_kl_div`, `flowdppo_kl_adv_loss`, `FlowDPPO`)
 - **SDE / replay path:** [`unirl/models/sd3/diffusion.py`](../unirl/models/sd3/diffusion.py), [`unirl/sde/kernels.py`](../unirl/sde/kernels.py)
 - **Recipe:** [`examples/diffusion/sd3/sd3_flowdppo.yaml`](../examples/diffusion/sd3/sd3_flowdppo.yaml) · **Config extract:** [`config.yaml`](config.yaml)
 - **Checkpoints:**
@@ -57,7 +57,7 @@ $$ \text{drop} = (\mathrm{kl\_score} \ge \tau)\ \wedge\ \big[(\rho>1 \wedge A>0)
 
 $$ \mathcal{L} = \mathbb{E}_{i,k}\big[\, \ell_{i,k}\cdot\mathbb{1}[\neg\,\text{drop}]\,\big] $$
 
-The code in `_flowdppo_kl_adv_loss` follows this directly:
+The code in `flowdppo_kl_adv_loss` follows this directly:
 
 ```python
 ratio = torch.exp(new_logp - old_logp)
@@ -83,10 +83,10 @@ policy. Like the GRPO-style diffusion recipes, the recipe sets
 | New transition log-prob | `stage.replay(...).log_probs` → `new_logp` |
 | Old Gaussian mean `µ_old` | `segment.sde_means`, populated by `prepare_segment` |
 | New Gaussian mean `µ_θ` | `stage.replay(...).prev_sample_means` → `new_means` |
-| Gaussian scale `σ_t` | `FlowDPPO._compute_sigma_t` (from `segment.sigmas`, `dt`, `params.eta`) |
+| Gaussian scale `σ_t` | `transition_sigma` (from `segment.sigmas`, `dt`, `params.eta`) |
 | KL threshold `τ` (paper `δ`) | `algorithm.kl_mask_threshold` |
 | Advantage `A_i` | `part.advantages`, broadcast to `[B, S]` |
-| Masked objective | `_flowdppo_kl_adv_loss` |
+| Masked objective | `flowdppo_kl_adv_loss` |
 
 ## From rollout to update
 
@@ -115,7 +115,7 @@ pre-update policy:
 
 ## Sigma normalization
 
-With `add_kl_coefficient: true`, `_compute_sigma_t` mirrors the Flow-SDE transition
+With `add_kl_coefficient: true`, `transition_sigma` mirrors the Flow-SDE transition
 scale (`FlowSDEStrategy`):
 
 $$ \sigma_t = \sqrt{\tfrac{s_k}{1-s_k}}\;\eta\;\sqrt{-(s_{k+1}-s_k)} $$
@@ -140,12 +140,12 @@ mean-difference / 2. The canonical recipe keeps it `true`.
 |---|---|
 | Almost every update masked | `masked_fraction`, `kl_mask_fraction`, `kl_new_old_mean` — lower LR or raise `kl_mask_threshold` |
 | `RuntimeError` about missing means | `stage.replay(...).prev_sample_means`; `SD3DiffusionStage.replay`; the SDE strategy must return means |
-| KL score wrong after a scheduler change | `segment.sigmas`, `params.eta`, `_compute_sigma_t`, `add_kl_coefficient` (mean-reduced score!) |
+| KL score wrong after a scheduler change | `segment.sigmas`, `params.eta`, `transition_sigma`, `add_kl_coefficient` (mean-reduced score!) |
 | `ratio_mean` not ≈ 1 on update #1 | `old_logp` / `new_logp` source, rollout↔train sync, `prepare_segment` timing |
 | No trained steps | `segment.sde_indices`, `num_sde_steps`, `sampling.eta` |
 
 Metric source: `masked_fraction`, `kl_mask_fraction`, `kl_new_old_mean/max`, and the
-`ratio_*` values are all emitted by `_flowdppo_kl_adv_loss`.
+`ratio_*` values are all emitted by `flowdppo_kl_adv_loss`.
 
 ## Run it
 

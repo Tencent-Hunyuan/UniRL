@@ -188,7 +188,7 @@ algorithm:
 # off-policy so clip_range / RatioNorm actually engage. The shard size must be
 # divisible by num_updates_per_batch.
 stack:
-  _target_: unirl.train.unified_model_stack.UnifiedModelTrainStack
+  _target_: unirl.train.stack.unified.UnifiedModelTrainStack
   micro_batch_size: 1
   max_grad_norm: 1.0
   num_updates_per_batch: 2

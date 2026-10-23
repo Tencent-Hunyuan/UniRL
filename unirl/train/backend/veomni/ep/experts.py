@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from functools import partial
 from typing import Protocol
 
 import torch
@@ -55,33 +54,22 @@ def resolve_expert_weight_export_transform(model: nn.Module) -> ExpertWeightExpo
     from veomni.distributed.parallel_state import get_parallel_state
 
     ps = get_parallel_state()
-    if not getattr(ps, "ep_enabled", False):
+    if not ps.ep_enabled:
         raise RuntimeError("EP weight export: the model has EP-sharded parameters, but EP state is disabled.")
-    return partial(
-        _iter_exported_expert_weights,
-        layout=layout,
-        ep_size=int(ps.ep_size),
-        ep_group=ps.ep_group,
-    )
+    ep_size = ps.ep_size
+    ep_group = ps.ep_group
 
+    def _transform(stream: NamedTensorIterator) -> NamedTensorIterator:
+        for name, tensor in stream:
+            if not layout.is_fused_expert_param(name):
+                yield name, tensor
+                continue
+            stacked = gather_stacked_expert_block(tensor, ep_size=ep_size, ep_group=ep_group)
+            del tensor
+            yield from layout.iter_hf_expert_tensors(name, stacked)
+            del stacked
 
-def _iter_exported_expert_weights(
-    stream: NamedTensorIterator,
-    *,
-    layout: ExpertExportLayout,
-    ep_size: int,
-    ep_group,
-) -> NamedTensorIterator:
-    """All-gather fused expert blocks and emit per-expert Hugging Face weights."""
-
-    for name, tensor in stream:
-        if not layout.is_fused_expert_param(name):
-            yield name, tensor
-            continue
-        stacked = gather_stacked_expert_block(tensor, ep_size=ep_size, ep_group=ep_group)
-        del tensor
-        yield from layout.iter_hf_expert_tensors(name, stacked)
-        del stacked
+    return _transform
 
 
 __all__ = ["resolve_expert_weight_export_transform"]

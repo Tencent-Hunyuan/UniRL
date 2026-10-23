@@ -22,17 +22,17 @@ def main(cfg: DictConfig) -> None:
         track_builder_cfg=cfg.track_builder,
         data_source_cfg=cfg.data_source,
         logging_cfg=cfg.get("logging"),
-        eval_interval=int(cfg.get("eval_interval", 0)),
-        eval_batch_size=int(cfg.get("eval_batch_size", 8)),
-        eval_num_samples=int(cfg.get("eval_num_samples", -1)),
+        eval_interval=cfg.get("eval_interval", 0),
+        eval_batch_size=cfg.get("eval_batch_size", 8),
+        eval_num_samples=cfg.get("eval_num_samples", -1),
         prefetch_next_batch=cfg.get("prefetch_next_batch", False),
     )
     trainer.train(
-        num_steps=int(cfg.get("num_steps", 100)),
-        save_interval=int(cfg.get("save_interval", 0)),
+        num_steps=cfg.get("num_steps", 100),
+        save_interval=cfg.get("save_interval", 0),
         save_dir=cfg.get("save_dir"),
         load_dir=cfg.get("load_dir"),
-        save_mode=str(cfg.get("save_mode", "auto")),
+        save_mode=cfg.get("save_mode", "auto"),
     )
 
 

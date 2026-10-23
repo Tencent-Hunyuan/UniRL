@@ -23,7 +23,7 @@ across ranks and the grad-norm would be wrong — so `fsdp_wrap` claims them int
 root `fully_shard` group by default (`root_wrap`) and fails fast when a multi-rank
 run leaves a trainable param outside every group. The uniform wrap also keeps the
 optimizer an all-`DTensor` param bag (a mixed `Tensor` + `DTensor` bag forces
-`foreach=False` or AdamW's fused kernel raises). Centralizing wrap + step here lets
+`foreach=False` or AdamW's multi-tensor kernel raises). Centralizing wrap + step here lets
 every algorithm inherit these invariants for free; the loss module legitimately
 knows nothing about DTensor sharding or wrap topology.
 
@@ -36,7 +36,7 @@ knows nothing about DTensor sharding or wrap topology.
   `optimizer_step` is the single chokepoint: clip → step → schedule → EMA, and it
   **skips the whole step on a non-finite grad norm** (stepping would scale every
   parameter by the bad norm and poison the next rollout).
-- **`TrainStack`** (`stack/base.py`) takes one backend + one `StageAlgorithm` and runs
+- **`TrainStack`** (`stack/single.py`) takes one backend + one `StageAlgorithm` and runs
   `train_track`: move the segment onto device → `prepare_segment_anchors` (freeze
   π_old once) → `num_updates_per_batch` optimizer steps over disjoint mini-batches,
   each a micro-batch loop of `compute_loss_and_backward`. The mini/micro slicing comes
@@ -47,12 +47,14 @@ knows nothing about DTensor sharding or wrap topology.
   training uses, which is what pins the on-policy PPO ratio to 1 under bf16's
   batch-shape sensitivity. `AgenticTrainer` uses the same interface after
   concatenating every successful trajectory's generated assistant turns.
-- **`UnifiedModelTrainStack`** (`unified_model_stack.py`) drives two algorithms
+- **`UnifiedModelTrainStack`** (`stack/unified.py`) drives two algorithms
   (`ar` + `image`) backward-accumulating into one shared optimizer step on one
   shared backbone (HunyuanImage3).
-- **`BaseTrainStack`** (`stack/common.py`) is the base of both: it validates the
+- **`BaseTrainStack`** (`stack/base.py`) is the base of both: it validates the
   shared constructor arguments and owns the backend lifecycle, lazy profiler
-  cache, and LR lookup.
+  cache, LR lookup, and track input placement: only the segment, conditions, and
+  advantages move to the backend's device, so media payloads stay on the host. The
+  same module defines the shared `TrainStepResult` and `aggregate_update_results`.
 
 **Extending it:** a new structural injection mode is an `inject_<mode>` alongside
 `inject_lora` (`lora.py`) and `inject_nft` / `inject_mirror` (`ema.py`), called
@@ -189,8 +191,10 @@ use LoRA adapter mode. Formats and export live in
   root `fully_shard` group by default** (`root_wrap`, on) — the root group never
   reshards after forward. Set `root_wrap: false` for models whose stages call
   submodules of the wrapped object directly (bagel) or that wrap frozen mixed-dtype
-  siblings (hunyuan_image3); a multi-rank run with a trainable param left outside
-  every group then fails fast.
+  siblings (hunyuan_image3); a trainable param left outside every group fails fast
+  at `world_size > 1`, and on a single rank forces `foreach=False` on its optimizer
+  param group (`optim.py`) and explicit norm reduction in `clip_grad_norm`
+  (`backend/fsdp/state.py`) because `_foreach_*` rejects mixed `Tensor` and `DTensor`.
 - **`defer_grad_sync` needs the last micro-batch of an optimizer step to run a
   backward** — the deferred reduce-scatter only fires inside it. If that micro
   skips backward (an all-empty micro) while earlier ones ran, `TrainStack.train`
@@ -231,10 +235,20 @@ use LoRA adapter mode. Formats and export live in
   uninitialized adapter. Teachers must be plain LoRA deltas: unconverted base-rewriting
   inits (pissa, olora, ...), `modules_to_save`, `layer_replication`,
   `trainable_token_indices`, DoRA, and `bias != "none"` are rejected at startup.
+- **Every rank must read the same frozen teacher weights** — each rank loads its own shard
+  from its own copy of the path, so after injection the ranks compare each teacher's
+  content sha256 and raise on any difference instead of training against a mixed teacher.
 - **Adapter checkpoints exclude frozen teachers, and resume requires the same teachers** —
   teachers reload from their paths and the checkpoint pins each by a content sha256, so a
   different teacher set or different weights raises on `load`. A checkpoint trained without
   teachers resumes into any teacher set.
+- **`first_update_ratio_tol` on `TrainStack` requires an algorithm that emits
+  `ratio_min` and `ratio_max`.** When set, each rank checks the pre-step micros of a
+  rollout's first update (where the ratio against `old_logp_source: replay` or a
+  weight-synced `old_logp_source: rollout` is 1 up to numerical noise), warns past
+  the tolerance, and reports DP rank 0's worst `|ratio - 1|` as
+  `first_update_ratio_dev`. Algorithms that omit `ratio_min` (`DPPO`, `DRPO`,
+  `CPPO`, `DiffusionNFT`, `SFT`) raise `KeyError` on the first backward micro.
 
 ## Profiling → Perfetto
 

@@ -19,7 +19,7 @@ from unirl.train.stack import (
     resolve_loss_scales,
     validate_anchor_contract,
 )
-from unirl.train.stack.common import BaseTrainStack
+from unirl.train.stack.base import BaseTrainStack
 from unirl.train.stack.planner import (
     CountPlanner,
     UpdatePlanner,
@@ -63,6 +63,13 @@ class UnifiedModelTrainStack(BaseTrainStack):
             shuffle_updates=shuffle_updates,
             shuffle_seed=shuffle_seed,
         )
+        from unirl.utils.profiling import profile_mode
+
+        if profile_mode() == "one-update":
+            logger.warning(
+                "UNIRL_PROFILE=one-update is not supported on the unified-model stack "
+                "(no _run_updates loop); use UNIRL_PROFILE=train. No trace produced."
+            )
 
     def _backward_part(
         self,
@@ -194,9 +201,8 @@ class UnifiedModelTrainStack(BaseTrainStack):
         """Driver-callable: prepare → backward(ar) + backward(image) → ONE step."""
         ar_part = sample.gen_part(ARSamplingParams)
         image_part = sample.gen_part(DiffusionSamplingParams)
-        device = self.fsdp_backend._device
-        ar_part = ar_part.to_device(device)
-        image_part = image_part.to_device(device)
+        self._align_track_inputs(ar_part)
+        self._align_track_inputs(image_part)
         (_, ar_steps, ar_order), (_, image_steps, image_order) = self.update_planner.arrange_many(
             (ar_part, image_part),
             num_updates=self.num_updates_per_batch,
@@ -206,14 +212,7 @@ class UnifiedModelTrainStack(BaseTrainStack):
 
         from unirl.utils.profiling import profile_mode
 
-        scope = profile_mode()
-        if scope == "one-update" and not getattr(self, "_warned_one_update", False):
-            self._warned_one_update = True
-            logger.warning(
-                "UNIRL_PROFILE=one-update is not supported on the unified-model stack "
-                "(no _run_updates loop); use UNIRL_PROFILE=train. No trace produced."
-            )
-        profiler = self._train_step_profiler if scope == "train" else None
+        profiler = self._train_step_profiler if profile_mode() == "train" else None
         with profiler.record("train_track") if profiler is not None else nullcontext():
             prepare_segment_anchors(self.ar_algorithm, ar_part, ar_steps, order=ar_order)
             prepare_segment_anchors(self.image_algorithm, image_part, image_steps, order=image_order)

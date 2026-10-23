@@ -11,21 +11,6 @@ from unirl.reward.base import BaseRewardComponentSpec, PromptVideoReward, Reward
 from unirl.types.reward import RewardRequest, RewardResponse
 
 
-def _require_prompt_video_term(weights: Dict[str, float], scorers: Dict[str, RewardBackend]) -> None:
-    coverage = {
-        name: isinstance(scorer, PromptVideoReward) and scorer.covers_prompt_video() for name, scorer in scorers.items()
-    }
-    if any(weights[name] > 0.0 and coverage[name] for name in scorers):
-        return
-    details = ", ".join(f"{name}(weight={weights[name]}, covers_prompt_video={coverage[name]})" for name in weights)
-    raise ValueError(
-        "T2AVCompositeScorer: no positive-weight inner scorer relates the prompt to the video. "
-        f"Current mix: {details}. "
-        "Add videopickscore / videoalign, or set scorers.imagebind.config.mode to "
-        "'text_video' or 'all'. clap and imagebind mode='audio_video' do not cover this."
-    )
-
-
 class T2AVCompositeScorer(RewardBackend):
     """Weighted blend of Hydra-instantiated inner reward scorers for T2AV."""
 
@@ -67,7 +52,20 @@ class T2AVCompositeScorer(RewardBackend):
             )
 
         self._scorers: Dict[str, RewardBackend] = dict(config.scorers)
-        _require_prompt_video_term(self.weights, self._scorers)
+        coverage = {
+            name: isinstance(scorer, PromptVideoReward) and scorer.covers_prompt_video()
+            for name, scorer in self._scorers.items()
+        }
+        if not any(self.weights[name] > 0.0 and coverage[name] for name in self._scorers):
+            details = ", ".join(
+                f"{name}(weight={self.weights[name]}, covers_prompt_video={coverage[name]})" for name in self.weights
+            )
+            raise ValueError(
+                "T2AVCompositeScorer: no positive-weight inner scorer relates the prompt to the video. "
+                f"Current mix: {details}. "
+                "Add videopickscore / videoalign, or set scorers.imagebind.config.mode to "
+                "'text_video' or 'all'. clap and imagebind mode='audio_video' do not cover this."
+            )
 
     def compute_rewards(self, request: RewardRequest) -> RewardResponse:
         start = time.time()
@@ -86,7 +84,7 @@ class T2AVCompositeScorer(RewardBackend):
                         f"for a batch of {bs}."
                     )
                 if resp.successes and not all(resp.successes):
-                    error = next((error for error in (resp.errors or []) if error), "unknown inner error")
+                    error = next((error for error in resp.errors if error), "unknown inner error")
                     raise RuntimeError(f"T2AVCompositeScorer: inner scorer {name!r} failed: {error}")
                 component_rewards[name] = comp.tolist()
                 total = total + self.weights[name] * comp
@@ -108,9 +106,6 @@ class T2AVCompositeScorer(RewardBackend):
 
     def covers_prompt_video(self) -> bool:
         return True
-
-    def is_available(self) -> bool:
-        return all(s.is_available() for s in self._scorers.values())
 
     def offload(self) -> None:
         for s in self._scorers.values():
