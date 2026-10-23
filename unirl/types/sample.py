@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from dataclasses import fields as dc_fields
-from typing import Any, Callable, Dict, List, Literal, Optional, Sequence
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple
 
 import torch
 
@@ -356,7 +356,7 @@ class Part(Batch):
         segment_fields = {f.name: getattr(segment, f.name) for f in dc_fields(segment)}
         segment_fields["token_advantages"] = token_advantages
         segment_fields["returns"] = token_returns
-        updated_segment = segment._rebuild(segment_fields)
+        updated_segment = segment.rebuild(segment_fields)
 
         loss_mask = None
         if segment.loss_mask is not None:
@@ -494,6 +494,25 @@ class Sample(Batch):
         by_root_id = dict(zip(root.sample_ids, root.metadata))
         return [by_root_id.get(rgid) for rgid in self.root_group_ids(part_index)]
 
+    def canvases(self) -> List[Tuple[int, int]]:
+        """Output canvas ``(H, W)`` per frontier row: the root row's ``metadata["canvas"]``, else the sampling one."""
+        params = self.parts[-1].sampling_params
+        default = (params.height, params.width)
+        canvases = [meta["canvas"] if meta and "canvas" in meta else default for meta in self.root_metadata()]
+        for canvas in canvases:
+            is_pair = isinstance(canvas, (list, tuple)) and len(canvas) == 2
+            if not is_pair or not all(type(side) is int and side > 0 for side in canvas):
+                raise ValueError(f"metadata['canvas'] must be [height, width] in positive pixels; got {canvas!r}.")
+        return [tuple(canvas) for canvas in canvases]
+
+    def reject_row_canvases(self, *, engine: str) -> None:
+        """Raise when dataset rows ask for their own canvas on an engine that renders one canvas per request."""
+        if any(meta and "canvas" in meta for meta in self.root_metadata()):
+            raise ValueError(
+                f"{engine}: dataset rows carry metadata['canvas'], but this engine renders every row at "
+                "sampling.height/width; per-row canvases need the vLLM-Omni BAGEL engine."
+            )
+
     def gen_parts(self) -> List[Part]:
         """The generated (non-input) Parts — those with :attr:`Part.is_gen`."""
         return [p for p in self.parts if p.is_gen]
@@ -574,7 +593,7 @@ class Sample(Batch):
     def select(self, indices: "torch.Tensor") -> "Sample":
         """Gather whole root prompt-trees by index (shuffle / subsample), mirroring"""
         groups = self.split()
-        idx = indices.tolist() if hasattr(indices, "tolist") else list(indices)
+        idx = indices.tolist() if isinstance(indices, torch.Tensor) else list(indices)
         picked = [groups[int(i)] for i in idx]
         parts = Sample.concat(picked).parts if picked else []
         return type(self)(parts=parts, reward_compute_s=self.reward_compute_s)

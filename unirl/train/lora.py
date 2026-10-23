@@ -93,6 +93,11 @@ def inject_lora(
     """Inject a single LoRA adapter.  No Shadow, no EMA."""
     from peft import LoraConfig, inject_adapter_in_model
 
+    if bias != "none":
+        raise ValueError(
+            f"inject_lora: bias must be 'none', got {bias!r}; "
+            "trainable LoRA biases mutate shared base_layer.bias in place and are unsupported."
+        )
     peft_target_modules, log_target = resolve_target_modules_pattern(
         target_modules=target_modules,
         module_prefix=module_prefix,
@@ -153,8 +158,7 @@ def _set_adapter_requires_grad(model: nn.Module, name: str, requires_grad: bool)
     for m in model.modules():
         if not isinstance(m, LoraLayer):
             continue
-        for key in ("lora_A", "lora_B"):
-            bank = getattr(m, key, {})
+        for bank in (m.lora_A, m.lora_B):
             if name in bank:
                 bank[name].weight.requires_grad = requires_grad
 
@@ -166,7 +170,7 @@ def adapter_names(model: nn.Module) -> set:
     names: set = set()
     for m in model.modules():
         if isinstance(m, LoraLayer):
-            names.update(getattr(m, "lora_A", {}).keys())
+            names.update(m.lora_A.keys())
     return names
 
 
@@ -245,7 +249,7 @@ def _inject_frozen_adapter(
     peft_cfg.init_lora_weights = True
     inject_adapter_in_model(peft_cfg, model, adapter_name=name)
 
-    covered = [m for m in model.modules() if isinstance(m, LoraLayer) and name in getattr(m, "lora_A", {})]
+    covered = [m for m in model.modules() if isinstance(m, LoraLayer) and name in m.lora_A]
     if not covered:
         raise ValueError(
             f"inject_frozen_adapter: adapter {name!r} matched no module — its "
@@ -356,7 +360,7 @@ class FrozenAdapters:
     """Frozen sibling LoRA adapters: kept out of adapter checkpoints and pinned by content sha256 on resume."""
 
     def __init__(self, shas: Optional[Dict[str, str]] = None) -> None:
-        self.shas: Dict[str, str] = dict(shas or {})  # name -> content sha256
+        self.shas: Dict[str, str] = {} if shas is None else dict(shas)  # name -> content sha256
 
     @classmethod
     def inject(cls, model: nn.Module, specs: Any) -> FrozenAdapters:
@@ -379,7 +383,7 @@ class FrozenAdapters:
 
     def check_resume(self, lora_config: Optional[Dict[str, object]]) -> None:
         """Refuse a checkpoint that recorded a different frozen set; an empty or absent record imposes nothing."""
-        recorded = (lora_config or {}).get("frozen_adapters")
+        recorded = lora_config.get("frozen_adapters") if lora_config is not None else None
         if not recorded or recorded == self.shas:
             return
         added = sorted(set(self.shas) - set(recorded))
@@ -401,7 +405,7 @@ def adapters_disabled(model: nn.Module) -> Iterator[None]:
     from peft.tuners.lora import LoraLayer
 
     layers = [m for m in model.modules() if isinstance(m, LoraLayer)]
-    prev = [bool(getattr(m, "_disable_adapters", False)) for m in layers]
+    prev = [m._disable_adapters for m in layers]
     try:
         for m in layers:
             m._disable_adapters = True

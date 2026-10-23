@@ -36,6 +36,7 @@ class ZImagePipelineConfig:
     lora_target_modules: Optional[List[str]] = None
 
     load_vae: bool = True
+    load_text_encoder: bool = True
 
     def __post_init__(self) -> None:
         validate_precision_type(self.model_precision, field="ZImagePipelineConfig.model_precision")

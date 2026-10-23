@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import re
-from typing import Dict, List, Optional, Tuple
+from collections import OrderedDict
+from typing import List, Optional
 
 import torch
 
+from unirl.models.types.embedding import embed_with_cpu_cache
 from unirl.types.conditions import TextEmbedCondition
 from unirl.types.primitives import Texts
 
@@ -34,17 +36,6 @@ def _extract_glyph_texts(prompt: str) -> Optional[str]:
     return ". ".join([f'Text "{text}"' for text in result]) + ". "
 
 
-def _format_chat_template(prompts: List[str], system_message: str) -> List[List[Dict[str, str]]]:
-    """Build the (system, user) chat conversation list expected by Qwen2.5-VL."""
-    return [
-        [
-            {"role": "system", "content": system_message},
-            {"role": "user", "content": p if p else " "},
-        ]
-        for p in prompts
-    ]
-
-
 class HunyuanVideo15TextEmbedStage:
     """Dual-encoder text → two ``TextEmbedCondition`` instances."""
 
@@ -62,13 +53,14 @@ class HunyuanVideo15TextEmbedStage:
         self.mllm_crop_start = int(mllm_crop_start)
         self.mllm_skip_layers = int(mllm_skip_layers)
         self.byt5_max_length = int(byt5_max_length)
+        self._mllm_cache: OrderedDict[str, TextEmbedCondition] = OrderedDict()
+        self._glyph_cache: OrderedDict[str, TextEmbedCondition] = OrderedDict()
 
     def embed_mllm(self, p: Texts) -> TextEmbedCondition:
         """Encode prompts via the Qwen2.5-VL MLLM into a TextEmbedCondition."""
-        embeds, mask = self._encode_mllm(list(p.texts))
-        return TextEmbedCondition(embeds=embeds, attn_mask=mask, pooled=None)
+        return embed_with_cpu_cache(p.texts, self._mllm_cache, self._encode_mllm, device=self.bundle.device)
 
-    def _encode_mllm(self, prompts: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _encode_mllm(self, prompts: List[str]) -> TextEmbedCondition:
         bundle = self.bundle
         tokenizer = bundle.tokenizer
         text_encoder = bundle.text_encoder
@@ -76,7 +68,13 @@ class HunyuanVideo15TextEmbedStage:
         dtype = next(text_encoder.parameters()).dtype
         crop_start = self.mllm_crop_start
 
-        chat = _format_chat_template(prompts, PROMPT_TEMPLATE_SYSTEM_MESSAGE)
+        chat = [
+            [
+                {"role": "system", "content": PROMPT_TEMPLATE_SYSTEM_MESSAGE},
+                {"role": "user", "content": prompt if prompt else " "},
+            ]
+            for prompt in prompts
+        ]
         text_inputs = tokenizer.apply_chat_template(
             chat,
             add_generation_prompt=True,
@@ -102,20 +100,19 @@ class HunyuanVideo15TextEmbedStage:
             prompt_embeds = prompt_embeds[:, crop_start:]
             attention_mask = attention_mask[:, crop_start:]
 
-        return prompt_embeds.to(dtype=dtype), attention_mask
+        return TextEmbedCondition(embeds=prompt_embeds.to(dtype=dtype), attn_mask=attention_mask, pooled=None)
 
     def embed_glyph(self, p: Texts) -> TextEmbedCondition:
         """Encode prompts via the ByT5 glyph encoder into a TextEmbedCondition."""
-        embeds, mask = self._encode_byt5(list(p.texts))
-        return TextEmbedCondition(embeds=embeds, attn_mask=mask, pooled=None)
+        return embed_with_cpu_cache(p.texts, self._glyph_cache, self._encode_byt5, device=self.bundle.device)
 
-    def _encode_byt5(self, prompts: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _encode_byt5(self, prompts: List[str]) -> TextEmbedCondition:
         bundle = self.bundle
         tokenizer = bundle.tokenizer_2
         text_encoder = bundle.text_encoder_2
         device = bundle.device
         max_length = self.byt5_max_length
-        d_model = int(getattr(text_encoder.config, "d_model", 1472))
+        d_model = text_encoder.config.d_model
         enc_dtype = next(text_encoder.parameters()).dtype
 
         embeds_list: List[torch.Tensor] = []
@@ -146,7 +143,7 @@ class HunyuanVideo15TextEmbedStage:
 
         prompt_embeds_2 = torch.cat(embeds_list, dim=0).to(dtype=enc_dtype)
         prompt_embeds_mask_2 = torch.cat(masks_list, dim=0)
-        return prompt_embeds_2, prompt_embeds_mask_2
+        return TextEmbedCondition(embeds=prompt_embeds_2, attn_mask=prompt_embeds_mask_2, pooled=None)
 
 
 __all__ = [

@@ -21,6 +21,7 @@ from fastapi import FastAPI, HTTPException
 
 from reward_service.config import ServiceCfg
 from reward_service.logging_utils import get_logger
+from reward_service.mps import mps_daemon
 from reward_service.schemas import PROTOCOL_VERSION, RewardRequest, ScoreRequest, ScoreResponse
 from reward_service.scorers import ScoreItem
 from reward_service.wire import request_to_item
@@ -77,22 +78,25 @@ async def _await_ref(
 
 
 def create_app(cfg: ServiceCfg) -> FastAPI:
+    mps_enabled = any(r.mps is not None for r in cfg.rewards)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        # WorkerPool() blocks until every actor's __init__ has finished
-        # loading its model, so uvicorn only starts accepting requests
-        # after the service is truly ready (readiness-probe semantics).
-        app.state.pool = await asyncio.to_thread(WorkerPool, cfg)
-        logger.info(
-            "reward service ready on %s:%d — rewards=%s",
-            cfg.server.host,
-            cfg.server.port,
-            app.state.pool.reward_names(),
-        )
-        try:
-            yield
-        finally:
-            app.state.pool.shutdown()
+        with mps_daemon(enabled=mps_enabled):
+            # WorkerPool() blocks until every actor's __init__ has finished
+            # loading its model, so uvicorn only starts accepting requests
+            # after the service is truly ready (readiness-probe semantics).
+            app.state.pool = await asyncio.to_thread(WorkerPool, cfg)
+            logger.info(
+                "reward service ready on %s:%d — rewards=%s",
+                cfg.server.host,
+                cfg.server.port,
+                app.state.pool.reward_names(),
+            )
+            try:
+                yield
+            finally:
+                app.state.pool.shutdown()
 
     app = FastAPI(title="Reward Service", lifespan=lifespan)
 

@@ -44,31 +44,32 @@ class HunyuanVideo15Pipeline(Pipeline):
         vision_num_semantic_tokens: int = 729,
         vision_states_dim: int = 1152,
         latent_channels: Optional[int] = None,
+        batch_replay_steps: bool = False,
     ) -> None:
         super().__init__()
         self.bundle = bundle
-        self.text_embed = (
-            text_embed
-            if text_embed is not None
-            else HunyuanVideo15TextEmbedStage(
+        if text_embed is None and bundle.text_encoder is not None:
+            text_embed = HunyuanVideo15TextEmbedStage(
                 bundle,
                 mllm_max_length=mllm_max_length,
                 mllm_crop_start=mllm_crop_start,
                 mllm_skip_layers=mllm_skip_layers,
                 byt5_max_length=byt5_max_length,
             )
-        )
+        self.text_embed = text_embed
         if diffusion is None:
             diffusion = HunyuanVideo15DiffusionStage(
                 model=bundle,
-                step=HunyuanVideo15DiffusionStep(),
+                step=HunyuanVideo15DiffusionStep(
+                    vision_num_semantic_tokens=vision_num_semantic_tokens,
+                    vision_states_dim=vision_states_dim,
+                ),
                 strategy=strategy if strategy is not None else DanceSDEStrategy(),
                 autocast_precision=autocast_precision,
                 trajectory_precision=trajectory_precision,
                 logprob_precision=logprob_precision,
-                vision_num_semantic_tokens=vision_num_semantic_tokens,
-                vision_states_dim=vision_states_dim,
                 latent_channels=latent_channels,
+                batch_replay_steps=batch_replay_steps,
             )
         self.diffusion = diffusion
         self.vae_decode = vae_decode if vae_decode is not None else HunyuanVideo15VAEDecodeStage(bundle)
@@ -77,9 +78,9 @@ class HunyuanVideo15Pipeline(Pipeline):
     @classmethod
     def latent_shape(cls, *, model_config: Any, sampling_spec: Any) -> tuple:
         """Per-sample 5D latent shape ``(C, T_lat, H_lat, W_lat)`` for driver-side noise pre-computation."""
-        height = int(sampling_spec.height)
-        width = int(sampling_spec.width)
-        num_frames = int(sampling_spec.num_frames)
+        height = sampling_spec.height
+        width = sampling_spec.width
+        num_frames = sampling_spec.num_frames
         spatial = HunyuanVideo15DiffusionStage.DEFAULT_SPATIAL_DOWNSAMPLE
         temporal = HunyuanVideo15DiffusionStage.DEFAULT_TEMPORAL_DOWNSAMPLE
         config_channels = getattr(model_config, "latent_channels", None)
@@ -102,14 +103,21 @@ class HunyuanVideo15Pipeline(Pipeline):
     ) -> "HunyuanVideo15Pipeline":
         """Build the full pipeline from a config."""
         bundle = HunyuanVideo15Bundle.from_config(config)
-        text_embed = HunyuanVideo15TextEmbedStage(
-            bundle,
-            mllm_max_length=config.mllm_max_length,
-            mllm_crop_start=config.mllm_crop_start,
-            mllm_skip_layers=config.mllm_skip_layers,
-            byt5_max_length=config.byt5_max_length,
+        text_embed = (
+            HunyuanVideo15TextEmbedStage(
+                bundle,
+                mllm_max_length=config.mllm_max_length,
+                mllm_crop_start=config.mllm_crop_start,
+                mllm_skip_layers=config.mllm_skip_layers,
+                byt5_max_length=config.byt5_max_length,
+            )
+            if bundle.text_encoder is not None
+            else None
         )
-        step = HunyuanVideo15DiffusionStep()
+        step = HunyuanVideo15DiffusionStep(
+            vision_num_semantic_tokens=config.vision_num_semantic_tokens,
+            vision_states_dim=config.vision_states_dim,
+        )
         diffusion = HunyuanVideo15DiffusionStage(
             model=bundle,
             step=step,
@@ -117,9 +125,8 @@ class HunyuanVideo15Pipeline(Pipeline):
             autocast_precision=config.autocast_precision,
             trajectory_precision=config.trajectory_precision,
             logprob_precision=config.logprob_precision,
-            vision_num_semantic_tokens=config.vision_num_semantic_tokens,
-            vision_states_dim=config.vision_states_dim,
             latent_channels=config.latent_channels,
+            batch_replay_steps=config.batch_replay_steps,
         )
         vae_decode = HunyuanVideo15VAEDecodeStage(bundle)
         return cls(
@@ -127,7 +134,7 @@ class HunyuanVideo15Pipeline(Pipeline):
             text_embed=text_embed,
             diffusion=diffusion,
             vae_decode=vae_decode,
-            shift=float(config.shift),
+            shift=config.shift,
         )
 
     def build_conditions(
@@ -142,6 +149,11 @@ class HunyuanVideo15Pipeline(Pipeline):
             raise ValueError(
                 f"HunyuanVideo15Pipeline.build_conditions: negative_text length "
                 f"{len(negatives.texts)} != text length {len(texts.texts)}"
+            )
+        if self.text_embed is None:
+            raise RuntimeError(
+                "HunyuanVideo15Pipeline.build_conditions: no text_embed stage "
+                "(load_text_encoder=False); trainside conditioning requires load_text_encoder=True."
             )
         if negatives is None and float(guidance_scale) > 1.0:
             negatives = Texts(texts=[""] * len(texts.texts))
@@ -186,7 +198,7 @@ class HunyuanVideo15Pipeline(Pipeline):
                 f"got {type(texts).__name__ if texts is not None else 'None'}"
             )
 
-        hv_conds = self.build_conditions(texts, guidance_scale=float(params.guidance_scale))
+        hv_conds = self.build_conditions(texts, guidance_scale=params.guidance_scale)
         schedule = params.sigmas.to(self.bundle.device)
 
         initial_latents = NoiseRecipe.from_sample(sample).resolve()
@@ -197,7 +209,7 @@ class HunyuanVideo15Pipeline(Pipeline):
             params=params,
             initial_latents=initial_latents,
             denoise_seed_keys=list(frontier.sample_ids) if frontier.sample_ids else None,
-            denoise_base_seed=int(params.seed) if params.seed is not None else 0,
+            denoise_base_seed=params.seed if params.seed is not None else 0,
         )
         videos = self.vae_decode.decode(latent_seg)
 

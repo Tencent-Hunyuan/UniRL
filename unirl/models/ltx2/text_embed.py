@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from unirl.models.types.embedding import embed_pair_with_cpu_cache
 from unirl.types.conditions import TextEmbedCondition
 from unirl.types.primitives import Texts
 
@@ -23,6 +25,7 @@ class LTX2TextEmbedStage:
         self.max_sequence_length = bundle.max_sequence_length
         self.dtype = bundle.dtype
         self.device = bundle.device
+        self._cache: OrderedDict[str, tuple[TextEmbedCondition, TextEmbedCondition]] = OrderedDict()
 
     @torch.no_grad()
     def encode(
@@ -38,25 +41,35 @@ class LTX2TextEmbedStage:
                 "states. Ensure the checkpoint's 'connectors' subfolder loaded."
             )
 
-        hidden_states, attention_mask = self._encode_prompts(texts.texts)
-        video_embeds, audio_embeds, conn_mask = self._apply_connectors(hidden_states, attention_mask)
-
+        video_cond, audio_cond = embed_pair_with_cpu_cache(
+            texts.texts, self._cache, self._encode_pair, device=self.device
+        )
         result = {
-            "text": TextEmbedCondition(embeds=video_embeds, attn_mask=conn_mask),
-            "audio_text": TextEmbedCondition(embeds=audio_embeds, attn_mask=conn_mask),
+            "text": video_cond,
+            "audio_text": audio_cond,
         }
 
         if negative_texts is not None:
-            neg_hidden_states, neg_mask = self._encode_prompts(negative_texts.texts)
-            neg_video, neg_audio, neg_conn_mask = self._apply_connectors(neg_hidden_states, neg_mask)
-            result["negative_text"] = TextEmbedCondition(embeds=neg_video, attn_mask=neg_conn_mask)
-            result["negative_audio_text"] = TextEmbedCondition(embeds=neg_audio, attn_mask=neg_conn_mask)
+            neg_video, neg_audio = embed_pair_with_cpu_cache(
+                negative_texts.texts, self._cache, self._encode_pair, device=self.device
+            )
+            result["negative_text"] = neg_video
+            result["negative_audio_text"] = neg_audio
 
         return result
 
+    def _encode_pair(self, prompts: list[str]) -> tuple[TextEmbedCondition, TextEmbedCondition]:
+        """Run Gemma3 + connectors on unique prompts."""
+        hidden_states, attention_mask = self._encode_prompts(prompts)
+        video_embeds, audio_embeds, conn_mask = self._apply_connectors(hidden_states, attention_mask)
+        return (
+            TextEmbedCondition(embeds=video_embeds, attn_mask=conn_mask),
+            TextEmbedCondition(embeds=audio_embeds, attn_mask=conn_mask),
+        )
+
     def _encode_prompts(self, prompts: list[str]) -> tuple[torch.Tensor, torch.Tensor]:
         """Tokenize and return Gemma3's stacked all-layer hidden states."""
-        if getattr(self.tokenizer, "pad_token", None) is None:
+        if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.padding_side = "left"
 
@@ -123,12 +136,12 @@ class LTX2TextEmbedStage:
         connector_mask = attention_mask
         if "padding_side" in params:
             connector_hidden_states = hidden_states.to(self.dtype)
-            conn_kwargs["padding_side"] = getattr(self.tokenizer, "padding_side", "left")
+            conn_kwargs["padding_side"] = self.tokenizer.padding_side
         else:
             connector_hidden_states = self._pack_text_embeds(
                 hidden_states,
                 sequence_lengths=attention_mask.sum(dim=-1),
-                padding_side=getattr(self.tokenizer, "padding_side", "left"),
+                padding_side=self.tokenizer.padding_side,
             ).to(self.dtype)
             if "additive_mask" in params:
                 connector_mask = (1 - attention_mask.to(self.dtype)) * -1_000_000.0

@@ -17,8 +17,8 @@ from .base import (
     AlgorithmStepResult,
     BaseAlgorithmConfig,
     StageAlgorithm,
-    _grpo_clip_loss,
-    _resolve_clip_range_from_schedule,
+    grpo_clip_loss,
+    resolve_clip_range_from_schedule,
     rollout_replay_logp_absdiff,
     typed_conditions,
 )
@@ -228,13 +228,13 @@ class PPO(StageAlgorithm):
             ((new_logp.sum() + new_values.sum()) * 0.0).backward()
             return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=True)
 
-        clip_range = _resolve_clip_range_from_schedule(self.clip_range, self.clip_schedule, training_progress)
+        clip_range = resolve_clip_range_from_schedule(self.clip_range, self.clip_schedule, training_progress)
         clip_high = (
             None
             if self.clip_range_high is None
-            else _resolve_clip_range_from_schedule(self.clip_range_high, self.clip_schedule, training_progress)
+            else resolve_clip_range_from_schedule(self.clip_range_high, self.clip_schedule, training_progress)
         )
-        policy_active, ratio_metrics = _grpo_clip_loss(
+        policy_active, ratio_metrics = grpo_clip_loss(
             new_logp=new_logp[active],
             old_logp=old_logp[active],
             advantages=token_advantages[active],

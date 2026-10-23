@@ -27,31 +27,13 @@ def _select_rows(value: Any, indices: torch.Tensor) -> Any:
     )
 
 
-def _select_request(request: RewardRequest, indices: List[int]) -> RewardRequest:
-    """A fresh ``RewardRequest`` holding only the given rows."""
-    idx = torch.tensor(indices, dtype=torch.long)
-
-    def _pick(x: Optional[List[Any]]) -> Optional[List[Any]]:
-        return None if x is None else [x[i] for i in indices]
-
-    return RewardRequest(
-        generated={k: _select_rows(v, idx) for k, v in request.generated.items()},
-        conditioning={k: _select_rows(v, idx) for k, v in request.conditioning.items()},
-        original_prompt=_select_rows(request.original_prompt, idx),
-        generation_prompt=_select_rows(request.generation_prompt, idx),
-        metadata=_pick(request.metadata),
-        sample_ids=_pick(request.sample_ids),
-        group_ids=_pick(request.group_ids),
-        audio_sample_rate=request.audio_sample_rate,
-    )
-
-
 class PerDomainRewardScorer(RewardBackend):
     """Dispatch each request row to the inner scorer of its metadata domain."""
 
     input_kind = "image"
 
     def __init__(self, *, config: "PerDomainSpec", base_device: str) -> None:
+        del base_device
         super().__init__(model_name="per_domain", batch_size=config.batch_size)
         if not config.scorers:
             raise ValueError("PerDomainRewardScorer requires a non-empty `scorers` mapping (domain -> RewardBackend).")
@@ -69,7 +51,7 @@ class PerDomainRewardScorer(RewardBackend):
 
         groups: Dict[str, List[int]] = {}
         unmapped: List[int] = []
-        metadata = request.metadata or [None] * bs
+        metadata = [None] * bs if request.metadata is None else request.metadata
         for i in range(bs):
             md = metadata[i] if i < len(metadata) else None
             domain = md.get(DOMAIN_KEY) if isinstance(md, dict) else None
@@ -84,20 +66,29 @@ class PerDomainRewardScorer(RewardBackend):
         component_rewards: Dict[str, List[float]] = {d: [float("nan")] * bs for d in self._scorers}
 
         for domain, indices in groups.items():
-            resp = self._scorers[domain].compute_rewards(_select_request(request, indices))
+            idx = torch.tensor(indices, dtype=torch.long)
+            sub_request = RewardRequest(
+                generated={k: _select_rows(v, idx) for k, v in request.generated.items()},
+                conditioning={k: _select_rows(v, idx) for k, v in request.conditioning.items()},
+                original_prompt=_select_rows(request.original_prompt, idx),
+                generation_prompt=_select_rows(request.generation_prompt, idx),
+                metadata=None if request.metadata is None else [request.metadata[i] for i in indices],
+                sample_ids=None if request.sample_ids is None else [request.sample_ids[i] for i in indices],
+                group_ids=None if request.group_ids is None else [request.group_ids[i] for i in indices],
+                audio_sample_rate=request.audio_sample_rate,
+            )
+            resp = self._scorers[domain].compute_rewards(sub_request)
             if len(resp.rewards) != len(indices):
                 raise RuntimeError(
                     f"PerDomainRewardScorer: scorer for domain {domain!r} returned "
                     f"{len(resp.rewards)} rewards for {len(indices)} items."
                 )
-            inner_successes = resp.successes or [True] * len(indices)
-            inner_errors = resp.errors or [None] * len(indices)
             for local_i, global_i in enumerate(indices):
                 score = float(resp.rewards[local_i])
                 rewards[global_i] = score
                 component_rewards[domain][global_i] = score
-                successes[global_i] = bool(inner_successes[local_i])
-                errors[global_i] = inner_errors[local_i]
+                successes[global_i] = bool(resp.successes[local_i])
+                errors[global_i] = resp.errors[local_i]
 
         for i in unmapped:
             successes[i] = False
@@ -115,9 +106,6 @@ class PerDomainRewardScorer(RewardBackend):
             errors=errors,
             compute_time=time.time() - start,
         )
-
-    def is_available(self) -> bool:
-        return all(s.is_available() for s in self._scorers.values())
 
     def offload(self) -> None:
         for s in self._scorers.values():

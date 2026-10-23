@@ -3,15 +3,21 @@ from __future__ import annotations
 import functools
 import inspect
 import logging
-from dataclasses import dataclass
-from dataclasses import field as dc_field
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from unirl.models.types.ar import ARSamplingParams, ARStage, ARStep, left_pad_prompt
+from unirl.models.types.ar import (
+    ARSamplingParams,
+    ARStage,
+    ARStep,
+    concat_optional_tensors,
+    left_pad_prompt,
+    pack_generated_text_segment,
+    resolve_ar_stop_ids,
+)
 from unirl.types.segments import TextSegment
 
 from .bundle import QwenVLBundle
@@ -40,20 +46,7 @@ def _packed_replay_supported(attn_impl: Optional[str]) -> bool:
     if attn_impl not in _SPARSE_PACKED_ATTN:
         _warn_packed_disabled(str(attn_impl))
         return False
-    try:
-        from transformers.masking_utils import find_packed_sequence_indices  # noqa: F401
-    except Exception:
-        return False
     return True
-
-
-@dataclass
-class QwenVLARParams:
-    max_tokens: int = 512
-    temperature: float = 0.7
-    top_p: float = 0.9
-    top_k: int = 0
-    stop_token_ids: List[int] = dc_field(default_factory=list)
 
 
 class QwenVLARStep(ARStep):
@@ -95,22 +88,6 @@ class QwenVLARStep(ARStep):
         return token_id, log_prob
 
 
-def _merge_pv(per_sample_pv: Optional[List[Optional[torch.Tensor]]]) -> Optional[torch.Tensor]:
-    """Cat per-sample pixel_values into a single flat tensor for the model."""
-    if per_sample_pv is None:
-        return None
-    parts = [pv for pv in per_sample_pv if pv is not None]
-    return torch.cat(parts, dim=0) if parts else None
-
-
-def _merge_igt(per_sample_igt: Optional[List[Optional[torch.Tensor]]]) -> Optional[torch.Tensor]:
-    """Cat per-sample image_grid_thw into a single flat tensor for the model."""
-    if per_sample_igt is None:
-        return None
-    parts = [igt for igt in per_sample_igt if igt is not None]
-    return torch.cat(parts, dim=0) if parts else None
-
-
 def _vision_rope_positions(
     transformer: Any,
     input_ids: torch.Tensor,
@@ -148,7 +125,6 @@ class QwenVLARStage(ARStage[QwenVLARConditions]):
         conditions: QwenVLARConditions,
         *,
         sampling_params: ARSamplingParams,
-        params: Optional[QwenVLARParams] = None,
         **_kwargs: Any,
     ) -> TextSegment:
         if conditions.prompt is None or conditions.prompt.input_ids is None:
@@ -161,22 +137,23 @@ class QwenVLARStage(ARStage[QwenVLARConditions]):
         attention_mask: torch.Tensor = conditions.prompt.attention_mask
         device = input_ids.device
 
-        pad_id = self.model.tokenizer.pad_token_id or 0
+        raw_pad_id = self.model.tokenizer.pad_token_id
+        pad_id = 0 if raw_pad_id is None else int(raw_pad_id)
         input_ids, attention_mask = left_pad_prompt(input_ids, attention_mask, pad_id)
         batch_size = int(input_ids.shape[0])
 
         transformer.model.rope_deltas = None
 
-        stop_ids = self._resolve_stop_ids(params, sampling_params)
+        stop_ids = resolve_ar_stop_ids(sampling_params, self.model.tokenizer)
         step = QwenVLARStep(
-            temperature=float(sampling_params.temperature),
-            top_p=float(sampling_params.top_p),
-            top_k=int(sampling_params.top_k),
+            temperature=sampling_params.temperature,
+            top_p=sampling_params.top_p,
+            top_k=sampling_params.top_k,
         )
-        max_new = int(sampling_params.max_new_tokens)
+        max_new = sampling_params.max_new_tokens
 
-        pv = _merge_pv(conditions.pixel_values)
-        igt = _merge_igt(conditions.image_grid_thw)
+        pv = concat_optional_tensors(conditions.pixel_values)
+        igt = concat_optional_tensors(conditions.image_grid_thw)
 
         model_kwargs: Dict[str, Any] = {
             "attention_mask": attention_mask,
@@ -246,7 +223,7 @@ class QwenVLARStage(ARStage[QwenVLARConditions]):
             model_kwargs["use_cache"] = True
             is_first_step = False
 
-        return _pack_text_segment(generated_tokens, per_token_logps, device=device)
+        return pack_generated_text_segment(generated_tokens, per_token_logps, device=device)
 
     def replay(
         self,
@@ -256,7 +233,7 @@ class QwenVLARStage(ARStage[QwenVLARConditions]):
         temperature: float = 1.0,
     ) -> torch.Tensor:
         """Prefer :meth:`packed_replay` (B > 1), else :meth:`padding_replay`; returns varlen ``[total_tokens]``."""
-        attn_impl = getattr(getattr(self.model.transformer, "config", None), "_attn_implementation", None)
+        attn_impl = self.model.transformer.config._attn_implementation
         if _packed_replay_supported(attn_impl):
             packed = self.packed_replay(conditions, segment=segment, temperature=temperature)
             if packed is not None:
@@ -283,8 +260,8 @@ class QwenVLARStage(ARStage[QwenVLARConditions]):
         prompt_mask = conditions.prompt.attention_mask.to(device)
         batch_size = int(prompt_ids.shape[0])
 
-        pv = _merge_pv(conditions.pixel_values)
-        igt = _merge_igt(conditions.image_grid_thw)
+        pv = concat_optional_tensors(conditions.pixel_values)
+        igt = concat_optional_tensors(conditions.image_grid_thw)
         if pv is not None:
             pv = pv.to(device)
         if igt is not None:
@@ -300,7 +277,8 @@ class QwenVLARStage(ARStage[QwenVLARConditions]):
 
         lengths = [int(n) for n in segment.lengths.tolist()]
         T_max = max(lengths) if lengths else 0
-        pad_id = self.model.tokenizer.pad_token_id or 0
+        raw_pad_id = self.model.tokenizer.pad_token_id
+        pad_id = 0 if raw_pad_id is None else int(raw_pad_id)
         response_tokens = torch.full((batch_size, T_max), pad_id, dtype=torch.long, device=device)
         response_mask = torch.zeros((batch_size, T_max), dtype=torch.long, device=device)
         cu = [int(c) for c in segment.cu_seqlens.tolist()]
@@ -380,8 +358,8 @@ class QwenVLARStage(ARStage[QwenVLARConditions]):
         batch_size = int(prompt_ids.shape[0])
         if batch_size <= 1:
             return None
-        pv = _merge_pv(conditions.pixel_values)
-        igt = _merge_igt(conditions.image_grid_thw)
+        pv = concat_optional_tensors(conditions.pixel_values)
+        igt = concat_optional_tensors(conditions.image_grid_thw)
         if pv is not None:
             pv = pv.to(device)
         if igt is not None:
@@ -444,41 +422,5 @@ class QwenVLARStage(ARStage[QwenVLARConditions]):
         per_token = log_probs.gather(-1, flat_resp.unsqueeze(-1)).squeeze(-1)
         return per_token.to(dtype=torch.float32)
 
-    def _resolve_stop_ids(
-        self,
-        params: Optional[QwenVLARParams],
-        sampling_params: ARSamplingParams,
-    ) -> List[int]:
-        ids: List[int] = []
-        if params is not None and params.stop_token_ids:
-            ids.extend(int(t) for t in params.stop_token_ids)
-        if sampling_params.stop_token_id is not None:
-            ids.append(int(sampling_params.stop_token_id))
-        eos = self.model.tokenizer.eos_token_id
-        if eos is not None:
-            if isinstance(eos, (list, tuple)):
-                ids.extend(int(t) for t in eos)
-            else:
-                ids.append(int(eos))
-        seen: set = set()
-        out: List[int] = []
-        for t in ids:
-            if t not in seen:
-                seen.add(t)
-                out.append(t)
-        return out
 
-
-def _pack_text_segment(
-    generated_tokens: List[List[int]],
-    per_token_logps: List[List[float]],
-    *,
-    device: torch.device,
-) -> TextSegment:
-    return TextSegment.pack(
-        tokens=[torch.tensor(toks, dtype=torch.long, device=device) for toks in generated_tokens],
-        log_probs=[torch.tensor(lps, dtype=torch.float32, device=device) for lps in per_token_logps],
-    )
-
-
-__all__ = ["QwenVLARParams", "QwenVLARStage", "QwenVLARStep"]
+__all__ = ["QwenVLARStage", "QwenVLARStep"]

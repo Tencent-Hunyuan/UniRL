@@ -10,7 +10,6 @@ import torch
 
 from unirl.algorithms.base import AlgorithmStepResult
 from unirl.distributed.group.remote import Remote
-from unirl.distributed.tensor.batch import _move_value
 from unirl.types.segments import TextSegment
 from unirl.utils.metrics import aggregate_numeric_metrics
 
@@ -113,7 +112,7 @@ class BaseTrainStack(Remote):
         device = self.fsdp_backend._device
         if part.segment is not None:
             part.segment = part.segment.to_device(device)
-        part.conditions = {k: _move_value(v, device) for k, v in part.conditions.items()}
+        part.conditions = {k: None if v is None else v.to_device(device) for k, v in part.conditions.items()}
         if part.advantages is not None:
             part.advantages = part.advantages.to(device=device)
 

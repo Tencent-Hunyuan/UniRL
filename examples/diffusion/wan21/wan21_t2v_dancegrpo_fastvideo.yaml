@@ -46,6 +46,7 @@ model_config:
   max_sequence_length: 512
   # FastVideo owns video decoding; the trainer-side pipeline only replays the
   # returned latent trajectory and does not need a duplicate VAE on the same GPU.
+  load_text_encoder: false
   load_vae: false
   # LoRA is configured via backend.lora_cfg only (faithful to the official
   # wan21_t2v_dancegrpo recipe — bundle.config sets no use_lora). The
@@ -66,6 +67,7 @@ pipeline:
   trajectory_precision: fp16
   logprob_precision: fp32
   max_sequence_length: 512
+  batch_replay_steps: true
   strategy: ${strategy}
 
 backend:

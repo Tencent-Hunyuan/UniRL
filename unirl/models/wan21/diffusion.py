@@ -7,6 +7,7 @@ from typing import Any, ClassVar, Dict, List, Optional, Set, Tuple
 
 import torch
 
+from unirl.models.types.batched_replay import BatchedStepReplayMixin
 from unirl.models.types.diffusion import DiffusionStage, DiffusionStep
 from unirl.models.types.replay_result import ReplayResult
 from unirl.sde.kernels import StepStrategy
@@ -181,7 +182,7 @@ class WAN21DiffusionStep(DiffusionStep[WAN21Bundle, WAN21Conditions]):
         )
 
 
-class WAN21DiffusionStage(DiffusionStage[WAN21Conditions]):
+class WAN21DiffusionStage(BatchedStepReplayMixin, DiffusionStage[WAN21Conditions]):
     """WAN 2.1 T2V rollout-level diffusion stage."""
 
     _no_split_modules: ClassVar[Tuple[str, ...]] = ("WanTransformerBlock",)
@@ -199,6 +200,7 @@ class WAN21DiffusionStage(DiffusionStage[WAN21Conditions]):
         autocast_precision: str = "bf16",
         trajectory_precision: str = "fp16",
         logprob_precision: str = "fp32",
+        batch_replay_steps: bool,
     ) -> None:
         self.model = model
         self.step = step
@@ -206,22 +208,10 @@ class WAN21DiffusionStage(DiffusionStage[WAN21Conditions]):
         self.autocast_dtype = parse_torch_dtype(autocast_precision, field_name="autocast_precision")
         self.trajectory_dtype = parse_torch_dtype(trajectory_precision, field_name="trajectory_precision")
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="logprob_precision")
+        self.batch_replay_steps = batch_replay_steps
         self.vae_scale_factor = self._SPATIAL_DOWNSAMPLE
         self.temporal_scale_factor = self._TEMPORAL_DOWNSAMPLE
-        self.latent_channels = int(getattr(getattr(model.vae, "config", None), "z_dim", self._DEFAULT_LATENT_CHANNELS))
-
-    def _latent_shape(self, *, num_frames: int, height: int, width: int) -> Tuple[int, int, int, int]:
-        """Return ``(C, T_lat, H_lat, W_lat)``."""
-        if (int(num_frames) - 1) % self._TEMPORAL_DOWNSAMPLE != 0:
-            raise ValueError(
-                f"WAN VAE temporal_downsample={self._TEMPORAL_DOWNSAMPLE} requires "
-                f"(num_frames - 1) % {self._TEMPORAL_DOWNSAMPLE} == 0, got num_frames={num_frames}; "
-                f"valid choices: 1, 5, 9, 13, 17, 21, ..."
-            )
-        latent_t = (int(num_frames) - 1) // self.temporal_scale_factor + 1
-        latent_h = int(height) // self.vae_scale_factor
-        latent_w = int(width) // self.vae_scale_factor
-        return (self.latent_channels, latent_t, latent_h, latent_w)
+        self.latent_channels = model.vae.config.z_dim if model.vae is not None else self._DEFAULT_LATENT_CHANNELS
 
     def diffuse(
         self,
@@ -239,16 +229,23 @@ class WAN21DiffusionStage(DiffusionStage[WAN21Conditions]):
         prompt_embeds = conditions.text.embeds
         device = prompt_embeds.device
         batch_size = int(prompt_embeds.shape[0])
-        T = int(params.num_inference_steps)
+        T = params.num_inference_steps
         if int(schedule.shape[0]) != T + 1:
             raise ValueError(f"WAN21DiffusionStage.diffuse: schedule length {schedule.shape[0]} != T+1={T + 1}")
         schedule = schedule.to(device)
         self.strategy.init_schedule(schedule)
 
-        latent_shape = self._latent_shape(
-            num_frames=int(params.num_frames),
-            height=int(params.height),
-            width=int(params.width),
+        if (params.num_frames - 1) % self._TEMPORAL_DOWNSAMPLE != 0:
+            raise ValueError(
+                f"WAN VAE temporal_downsample={self._TEMPORAL_DOWNSAMPLE} requires "
+                f"(num_frames - 1) % {self._TEMPORAL_DOWNSAMPLE} == 0, got num_frames={params.num_frames}; "
+                f"valid choices: 1, 5, 9, 13, 17, 21, ..."
+            )
+        latent_shape = (
+            self.latent_channels,
+            (params.num_frames - 1) // self.temporal_scale_factor + 1,
+            params.height // self.vae_scale_factor,
+            params.width // self.vae_scale_factor,
         )
         if initial_latents is not None:
             if int(initial_latents.shape[0]) != batch_size:
@@ -260,8 +257,8 @@ class WAN21DiffusionStage(DiffusionStage[WAN21Conditions]):
                 raise ValueError(
                     f"WAN21DiffusionStage.diffuse: initial_latents.shape[1:]="
                     f"{tuple(initial_latents.shape[1:])} != expected {tuple(latent_shape)} "
-                    f"for num_frames={int(params.num_frames)}, "
-                    f"height={int(params.height)}, width={int(params.width)}."
+                    f"for num_frames={params.num_frames}, "
+                    f"height={params.height}, width={params.width}."
                 )
             latents = initial_latents.to(device=device, dtype=self.trajectory_dtype)
         else:
@@ -270,13 +267,13 @@ class WAN21DiffusionStage(DiffusionStage[WAN21Conditions]):
                 latent_shape=latent_shape,
                 device=device,
                 dtype=self.trajectory_dtype,
-                init_same_noise=bool(params.init_same_noise),
-                samples_per_prompt=int(params.samples_per_prompt),
+                init_same_noise=params.init_same_noise,
+                samples_per_prompt=params.samples_per_prompt,
                 noise_group_ids=params.noise_group_ids,
-                base_seed=int(params.seed),
+                base_seed=params.seed,
             )
 
-        sde_set: Set[int] = set(int(i) for i in (params.sde_indices or []))
+        sde_set: Set[int] = set(params.sde_indices or ())
         sde_sorted: List[int] = sorted(sde_set)
 
         needed: Set[int] = set(compute_trajectory_positions(sde_set, T))
@@ -297,7 +294,7 @@ class WAN21DiffusionStage(DiffusionStage[WAN21Conditions]):
         for i in range(T):
             sigma = schedule[i].to(device)
             sigma_next = schedule[i + 1].to(device)
-            step_eta = float(params.eta) if i in sde_set else 0.0
+            step_eta = params.eta if i in sde_set else 0.0
 
             with torch.no_grad(), autocast_ctx:
                 new_latents, log_prob, _ = self.step.step_with_logp(
@@ -307,7 +304,7 @@ class WAN21DiffusionStage(DiffusionStage[WAN21Conditions]):
                     sample=latents,
                     sigma=sigma,
                     sigma_next=sigma_next,
-                    guidance_scale=float(params.guidance_scale),
+                    guidance_scale=params.guidance_scale,
                     eta=step_eta,
                     sigma_max=sigma_max,
                     step_index=i,
@@ -345,66 +342,19 @@ class WAN21DiffusionStage(DiffusionStage[WAN21Conditions]):
         step_indices: Optional[List[int]] = None,
     ) -> ReplayResult:
         """Log-prob replay: ``log_probs [B, len(target)]``, means ``[B, len(target), C, T_lat, H_lat, W_lat]``."""
-        if segment.sde_indices is None or segment.latents is None:
-            raise ValueError("WAN21DiffusionStage.replay: segment.sde_indices / latents missing")
-        if segment.sigmas is None:
-            raise ValueError("WAN21DiffusionStage.replay: segment.sigmas missing")
-
-        sde_set = set(int(i) for i in segment.sde_indices.tolist())
-        target = (
-            [int(i) for i in step_indices]
-            if step_indices is not None
-            else [int(i) for i in segment.sde_indices.tolist()]
-        )
-        bad = [i for i in target if i not in sde_set]
-        if bad:
-            raise ValueError(
-                f"WAN21DiffusionStage.replay: step_indices {bad} not in segment.sde_indices={sorted(sde_set)}"
-            )
-
-        device = segment.latents.device
-        sigmas = segment.sigmas.to(device)
-        sigma_max = float(sigmas[1].item()) if int(sigmas.shape[0]) > 1 else 0.99
-
+        device = segment.latents.device if segment.latents is not None else torch.device("cpu")
         autocast_ctx = (
             torch.autocast("cuda", self.autocast_dtype)
             if device.type == "cuda" and self.autocast_dtype in (torch.float16, torch.bfloat16)
             else nullcontext()
         )
-        log_probs: List[torch.Tensor] = []
-        prev_sample_means: List[torch.Tensor] = []
         with autocast_ctx:
-            for step_idx in target:
-                sigma = sigmas[step_idx].to(dtype=torch.float32)
-                sigma_next = sigmas[step_idx + 1].to(dtype=torch.float32)
-                sample = segment.latents_at(step_idx)
-                prev_sample = segment.latents_at(step_idx + 1)
-                _, log_prob, prev_mean = self.step.step_with_logp(
-                    self.model,
-                    conditions,
-                    strategy=self.strategy,
-                    sample=sample,
-                    prev_sample=prev_sample,
-                    sigma=sigma,
-                    sigma_next=sigma_next,
-                    guidance_scale=float(params.guidance_scale),
-                    eta=float(params.eta),
-                    sigma_max=sigma_max,
-                    step_index=step_idx,
-                )
-                if log_prob is None:
-                    raise RuntimeError(
-                        f"WAN21DiffusionStage.replay: strategy returned None log-prob "
-                        f"at step_index={step_idx} (deterministic mode); replay "
-                        f"requires a stochastic SDE strategy."
-                    )
-                log_probs.append(log_prob)
-                if prev_mean is not None:
-                    prev_sample_means.append(prev_mean)
-
-        log_probs_t = torch.stack(log_probs, dim=1).to(dtype=self.logprob_dtype)
-        means_t = torch.stack(prev_sample_means, dim=1) if prev_sample_means else None
-        return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
+            return self.replay_steps(
+                conditions,
+                segment=segment,
+                params=params,
+                step_indices=step_indices,
+            )
 
     def predict_noise_at_step(
         self,
@@ -420,7 +370,7 @@ class WAN21DiffusionStage(DiffusionStage[WAN21Conditions]):
             sample,
             sigma,
             conditions,
-            guidance_scale=float(params.guidance_scale),
+            guidance_scale=params.guidance_scale,
         )
 
     def trainable_module(self) -> "torch.nn.Module":

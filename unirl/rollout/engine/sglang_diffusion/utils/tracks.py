@@ -33,7 +33,7 @@ def collect_trajectory_latents(results: Sequence[RawResult]) -> torch.Tensor:
 
 def collect_aux_trajectory_latents(results: Sequence[RawResult]) -> Optional[torch.Tensor]:
     """Concat per-result AUXILIARY trajectory latents (LTX-2 audio) on the batch dim."""
-    auxes = [getattr(r, "aux_trajectory_latents", None) for r in results]
+    auxes = [r.aux_trajectory_latents for r in results]
     present = [a is not None for a in auxes]
     if not any(present):
         return None
@@ -54,8 +54,8 @@ def validate_packed_trajectory(
         traj.ndim == 4,
         f"{family}: packed trajectory must be 4-D [B, T, S, C]; got rank {traj.ndim}, shape {tuple(traj.shape)}.",
     )
-    height = int(diffusion.height) if diffusion.height is not None else None
-    width = int(diffusion.width) if diffusion.width is not None else None
+    height = diffusion.height
+    width = diffusion.width
     require(
         height is not None and width is not None,
         f"{family}: need height/width from the diffusion sampling params to unpack the packed "
@@ -86,8 +86,8 @@ def derive_timestep_alignment(
     results: Sequence[RawResult],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Validate the T+1 trajectory shape and verify SGLang used the σ we sent."""
-    traj_len = int(trajectories_tensor.shape[1])
-    expected_len = int(expected_sigmas.shape[0])
+    traj_len = trajectories_tensor.shape[1]
+    expected_len = expected_sigmas.shape[0]
     require(
         traj_len == expected_len,
         f"SGLang trajectory length {traj_len} != expected_sigmas length {expected_len}. "
@@ -125,7 +125,7 @@ def build_latent_segment(
         results=results,
     )
 
-    traj_len = int(trajectories_tensor.shape[1])
+    traj_len = trajectories_tensor.shape[1]
     if aux_trajectory is not None:
         require(
             aux_trajectory.ndim >= 2,
@@ -133,19 +133,18 @@ def build_latent_segment(
             f"got rank {aux_trajectory.ndim}, shape {tuple(aux_trajectory.shape)}.",
         )
         require(
-            int(aux_trajectory.shape[0]) == int(trajectories_tensor.shape[0]),
-            "Auxiliary/video trajectory batch mismatch: "
-            f"{int(aux_trajectory.shape[0])} != {int(trajectories_tensor.shape[0])}.",
+            aux_trajectory.shape[0] == trajectories_tensor.shape[0],
+            f"Auxiliary/video trajectory batch mismatch: {aux_trajectory.shape[0]} != {trajectories_tensor.shape[0]}.",
         )
         require(
-            int(aux_trajectory.shape[1]) == traj_len,
+            aux_trajectory.shape[1] == traj_len,
             "Auxiliary/video trajectory length mismatch: "
-            f"{int(aux_trajectory.shape[1])} != {traj_len}. Both must carry T+1 states.",
+            f"{aux_trajectory.shape[1]} != {traj_len}. Both must carry T+1 states.",
         )
     indices_t: torch.Tensor = step_indices
     if sde_indices is not None and len(sde_indices) < num_steps:
         needed = set(compute_trajectory_positions(set(sde_indices), num_steps))
-        needed.add(int(num_steps))
+        needed.add(num_steps)
         keep_cols = sorted(p for p in needed if 0 <= p < traj_len)
         if keep_cols and len(keep_cols) < traj_len:
             trajectories_tensor = trajectories_tensor[:, keep_cols]
@@ -154,13 +153,32 @@ def build_latent_segment(
                 aux_trajectory = aux_trajectory[:, keep_cols]
 
     sde_indices_t: Optional[torch.Tensor] = (
-        torch.tensor(list(sde_indices), dtype=torch.long)
+        torch.tensor(sde_indices, dtype=torch.long)
         if sde_indices is not None
         else torch.arange(num_steps, dtype=torch.long)
     )
     sde_logp: Optional[torch.Tensor] = None
     if emit_native_logprob:
-        sde_logp = _native_sde_logp(results, num_steps=num_steps, sde_indices=sde_indices)
+        per_result: List[Optional[torch.Tensor]] = [
+            result.trajectory_log_probs.detach().cpu() if result.trajectory_log_probs is not None else None
+            for result in results
+        ]
+        if not any(lp is None for lp in per_result):
+            log_prob_tensor = torch.cat([lp for lp in per_result if lp is not None], dim=0)
+            s_dim = log_prob_tensor.shape[1]
+            expected_s = len(sde_indices) if sde_indices is not None else num_steps
+            if s_dim == num_steps and sde_indices is not None and expected_s < num_steps:
+                keep_idx = torch.tensor(sde_indices, dtype=torch.long)
+                log_prob_tensor = log_prob_tensor.index_select(1, keep_idx)
+                s_dim = log_prob_tensor.shape[1]
+            require(
+                s_dim == expected_s,
+                f"SGLang trajectory_log_probs shape {tuple(log_prob_tensor.shape)} second "
+                f"dim={s_dim} does not match expected SDE-step count {expected_s}. "
+                f"sigma_schedule / num_inference_steps / sde_indices drift — fix the "
+                f"source rather than fall back to replay silently.",
+            )
+            sde_logp = log_prob_tensor
 
     return segment_factory(
         latents=trajectories_tensor,
@@ -170,36 +188,6 @@ def build_latent_segment(
         sde_indices=sde_indices_t,
         aux_latents=aux_trajectory,
     )
-
-
-def _native_sde_logp(
-    results: Sequence[RawResult],
-    *,
-    num_steps: int,
-    sde_indices: Optional[List[int]],
-) -> Optional[torch.Tensor]:
-    """Best-effort extract of SGLang's native ``trajectory_log_probs`` into ``[B, S]``."""
-    per_result: List[Optional[torch.Tensor]] = [
-        result.trajectory_log_probs.detach().cpu() if result.trajectory_log_probs is not None else None
-        for result in results
-    ]
-    if any(lp is None for lp in per_result):
-        return None
-    log_prob_tensor = torch.cat([lp for lp in per_result if lp is not None], dim=0)
-    s_dim = int(log_prob_tensor.shape[1])
-    expected_s = len(sde_indices) if sde_indices is not None else num_steps
-    if s_dim == num_steps and sde_indices is not None and expected_s < num_steps:
-        keep_idx = torch.tensor(sorted(int(i) for i in sde_indices), dtype=torch.long)
-        log_prob_tensor = log_prob_tensor.index_select(1, keep_idx)
-        s_dim = int(log_prob_tensor.shape[1])
-    require(
-        s_dim == expected_s,
-        f"SGLang trajectory_log_probs shape {tuple(log_prob_tensor.shape)} second "
-        f"dim={s_dim} does not match expected SDE-step count {expected_s}. "
-        f"sigma_schedule / num_inference_steps / sde_indices drift — fix the "
-        f"source rather than fall back to replay silently.",
-    )
-    return log_prob_tensor
 
 
 def pack_decoded_images(
@@ -216,7 +204,7 @@ def pack_decoded_images(
             continue
         if canonical.dim() == 3:
             per_sample_tensors.append(canonical.to(torch.float32))
-        elif squeeze_single_frame_4d and canonical.dim() == 4 and int(canonical.shape[1]) == 1:
+        elif squeeze_single_frame_4d and canonical.dim() == 4 and canonical.shape[1] == 1:
             per_sample_tensors.append(canonical.squeeze(1).to(torch.float32))
         elif canonical.dim() == 4:
             skipped_video = True
@@ -257,15 +245,15 @@ def _cat_padded_rows(tensors: List[torch.Tensor]) -> torch.Tensor:
     """dim-0 concat tolerating per-result seq-len (dim-1) differences."""
     if len(tensors) == 1:
         return tensors[0]
-    lens = {int(t.shape[1]) for t in tensors}
+    lens = {t.shape[1] for t in tensors}
     if len(lens) <= 1:
         return torch.cat(tensors, dim=0)
     max_len = max(lens)
     padded: List[torch.Tensor] = []
     for t in tensors:
-        if int(t.shape[1]) < max_len:
+        if t.shape[1] < max_len:
             pad_shape = list(t.shape)
-            pad_shape[1] = max_len - int(t.shape[1])
+            pad_shape[1] = max_len - t.shape[1]
             t = torch.cat([t, t.new_zeros(pad_shape)], dim=1)
         padded.append(t)
     return torch.cat(padded, dim=0)
@@ -281,8 +269,8 @@ def _aligned_mask(
     if not mask_list or embeds_cat is None:
         return None
     mask_cat = _cat_padded_rows(mask_list)
-    mask_seq = int(mask_cat.shape[1])
-    embeds_seq = int(embeds_cat.shape[1])
+    mask_seq = mask_cat.shape[1]
+    embeds_seq = embeds_cat.shape[1]
     if mask_seq == embeds_seq:
         return mask_cat
     if mask_seq > embeds_seq:
