@@ -518,11 +518,12 @@ without driver-authored x_T. `media_log_interval` does not apply
   collapse the whole batch onto one request and one sigma. The trainer compares the two counts
   and raises instead.
 - **A merged FlashGRPO track's shared fields are not per-sample truth.** `_stamp_sde_index_per_sample`
-  rewrites each step group's `segment.latents` to fixed `[before, after, final]` slots, normalizes
+  requires the rollout's existing `[before, after, final]` latent slots, normalizes only
   `segment.indices` / `segment.sde_indices`, and clears `frontier.sampling_params.sde_indices` so
   `Sample.concat` / `Part.concat` can merge the groups. `sde_index_per_sample` (a `CONCAT` field) is
   the authoritative per-sample step; `PerSampleStepReplayMixin.replay_per_sample` indexes fixed
-  latent slots `[:, 0]` / `[:, 1]`, not `latents_at()`.
+  latent slots `[:, 0]` / `[:, 1]`, not `latents_at()`. The driver preserves latent
+  `TensorRef` handles without fetching or stacking their payloads.
 - **The SDE candidate pool must not reach the final denoising step.** Step `T-1` stores two trajectory
   latents where earlier steps store three, and `torch.cat` cannot merge different `K`. The trainer
   raises at build time rather than failing mid-rollout. Keep the scheduler's `timestep_fraction` end

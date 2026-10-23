@@ -839,13 +839,12 @@ class DiffusionTrainer(BaseTrainer):
             raise ValueError("FlashGRPO: a step group's rollout returned no segment to stamp sde_index_per_sample on.")
         segment.sde_index_per_sample = torch.full((frontier.batch_size,), sde_index, dtype=torch.long)
         if segment.indices is not None and segment.latents is not None:
-            before = segment.latents_at(sde_index)
-            after = segment.latents_at(sde_index + 1)
-            final = segment.latents[:, -1]
-            segment.latents = torch.stack([before, after, final], dim=1)
-            segment.indices = torch.arange(3, dtype=torch.long, device=segment.indices.device)
+            expected = [sde_index, sde_index + 1, frontier.sampling_params.num_inference_steps]
+            if segment.latents.shape[1] != 3 or segment.indices.tolist() != expected:
+                raise ValueError("FlashGRPO requires rollout latent slots [before, after, final].")
+            segment.indices = torch.arange(3, dtype=torch.long)
         if segment.sde_indices is not None:
-            segment.sde_indices = torch.zeros(1, dtype=torch.long, device=segment.sde_indices.device)
+            segment.sde_indices = torch.zeros(1, dtype=torch.long)
         if isinstance(frontier.sampling_params, DiffusionSamplingParams):
             frontier.sampling_params = dataclasses.replace(frontier.sampling_params, sde_indices=None)
 
