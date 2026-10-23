@@ -332,10 +332,14 @@ class BaseTrainer:
         trainer_state_path = os.path.join(path, "trainer_state.json")
         trainer_state_tmp = f"{trainer_state_path}.tmp"
         with open(trainer_state_tmp, "w") as f:
-            json.dump({"wandb_run_id": self.wandb_logger.run_id, "optimizer_step": self.wandb_logger.optimizer_step}, f)
+            json.dump(self._checkpoint_state(), f)
         os.replace(trainer_state_tmp, trainer_state_path)
         if step >= num_rollouts:
             self._wait_for_checkpoints()
+
+    def _checkpoint_state(self) -> dict:
+        """Driver-owned metadata saved with the backend checkpoint."""
+        return {"wandb_run_id": self.wandb_logger.run_id, "optimizer_step": self.wandb_logger.optimizer_step}
 
     def maybe_load_checkpoint(self, load_dir: Optional[str], *, num_rollouts: Optional[int] = None) -> int:
         """Restore training state from ``load_dir``; return the rollout step to resume from."""

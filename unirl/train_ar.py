@@ -37,6 +37,7 @@ def main(cfg: DictConfig) -> None:
             normalize_adv_by_std=cfg.get("normalize_adv_by_std", True),
             advantage_mode=cfg.get("advantage_mode", "grpo"),
             balance_shards=cfg.get("balance_shards", False),
+            dynamic_sampling_max_batches=cfg.get("dynamic_sampling_max_batches", 0),
             eval_interval=cfg.get("eval_interval", 0),
             eval_num_prompts=cfg.get("eval_num_prompts", -1),
             eval_batch_size=cfg.get("eval_batch_size", 8),
