@@ -11,7 +11,7 @@ import torch
 from unirl.types.primitives import Texts
 
 from .bundle import HunyuanImage3Bundle
-from .compat import repair_hi3_tokenizer_backend
+from .compat import repair_hi3_tokenizer_backend, repair_hi3_tokenizer_batchify
 from .conditions import HunyuanImage3FusedMultimodalCondition
 
 
@@ -46,6 +46,7 @@ class HunyuanImage3TextEmbedStage:
             transformer.load_tokenizer(self.bundle.pretrained_path)
         tkw = getattr(transformer, "_tkwrapper", None) or getattr(transformer, "_tokenizer", None)
         repair_hi3_tokenizer_backend(tkw, self.bundle.pretrained_path)
+        repair_hi3_tokenizer_batchify(tkw)
 
         # Two text sections tokenize independently; direct-T2I pretrain needs one BPE pass.
         if (
