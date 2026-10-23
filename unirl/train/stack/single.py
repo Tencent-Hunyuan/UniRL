@@ -247,7 +247,7 @@ class TrainStack(BaseTrainStack):
                 "optimizer steps inside the window would re-step on partial gradients."
             )
         for part in window:
-            self._align_track_inputs(part)
+            self._align_track_inputs(part, training=True)
         arranged = self.update_planner.arrange_many(
             window,
             num_updates=self.num_updates_per_batch,
@@ -307,7 +307,12 @@ class TrainStack(BaseTrainStack):
         if self.first_update_ratio_tol is None or not result.has_backward:
             return result
         worst = max(
-            max(1.0 - m.metrics["ratio_min"], m.metrics["ratio_max"] - 1.0) for m in result.micros if m.has_backward
+            (
+                max(1.0 - m.metrics["ratio_min"], m.metrics["ratio_max"] - 1.0)
+                for m in result.micros
+                if m.has_backward and m.num_steps_or_tokens > 0
+            ),
+            default=0.0,
         )
         if not worst <= self.first_update_ratio_tol:
             logger.warning(
