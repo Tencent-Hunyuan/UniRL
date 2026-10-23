@@ -73,6 +73,16 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
 - **`old_logp_source: rollout` with a replay-only engine** — a separate-worker
   SGLang rollout emits no per-step `sde_logp`, so the `rollout` source raises in
   `prepare_segment`. Use `replay` (the cost is one extra `torch.no_grad` replay).
+- **`timestep_chunk_size` bounds replay graph residency** — set it and
+  `FlowGRPO` / `FlowDPPO` replay and backward SDE steps in slices of that size,
+  each scaled by `len(chunk)/S` so the summed gradient matches the default
+  single backward (DiffusionNFT's `iter_scale` pattern; the optimizer boundary
+  stays with `TrainStack`). `prepare_segment` slices replay anchors with the
+  same chunks so `batch_replay_steps: true` plus `timestep_chunk_size: k`
+  evaluates `[k * B]` batches identically in anchor and training passes. `None`
+  (default) keeps the current behavior, whose resident graph grows with S even
+  at `micro_batch_size: 1`. Each extra backward adds a reduce-scatter, and bf16
+  autocast accumulation differs from the single backward (matches in fp32).
 - **`num_updates_per_batch > 1` on DiffusionNFT** raises in `TrainStack.__init__` — DiffusionNFT keeps
   the default `supports_multi_update = False`. Multi-update algorithms freeze their
   declared anchors: `FlowGRPO`/`FlowDPPO` prepare `sde_logp`; `GRPO` always reuses
@@ -90,11 +100,12 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   scales with `eta` (the algorithm raises at init on `eta == 0`, but cannot judge "too small").
 - **AR `loss_agg_mode` is one of `token-mean` | `seq-mean-token-mean` | `seq-mean-token-sum-norm`**
   (`unirl.types.loss_agg.LossAggMode`; anything else raises at `__init__`). `token-mean` is the
-  optimizer step's global token mean and requires `sp_size: 1`; the `seq-mean-*` modes average
+  DP-global token mean of one update and requires `sp_size: 1`; the `seq-mean-*` modes average
   per-sequence values. `loss_mask`-inactive tokens never enter a denominator, and a fully-masked
   sequence still counts as one sequence that contributes 0. GSPO is sequence-level and takes no
-  `loss_agg_mode`. `UnifiedModelTrainStack` weights micro-batches by sample share only, so its
-  `token-mean` is not a global token mean.
+  `loss_agg_mode`. `TrainStack` and the `UnifiedModelTrainStack` AR track share the resolution
+  (`train/stack/loss_scale.py`); `train/readme.md` Gotchas define "one update" per stack (an
+  accumulation window averages its parts) and the zero-token behaviour.
 - **AR `sampling_temperature` must equal the rollout `sampling.temperature`** —
   `ARStage.replay` rescales logits by it (`log_softmax(logits / T)`) to match SGLang's
   distribution; when unset it silently falls back to the `ARSamplingParams` default,
@@ -115,12 +126,12 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   with the anchor swapped from the EMA shadow to the LoRA-disabled base, so the two share a scale
   and can be read side by side as drift-from-shadow against drift-from-base. DiffusionNFT trains on
   a freshly noised `xt` rather than the rollout trajectory, so it has no `stage.replay` step indices
-  to hand `_transition_sigma`. `segment.sigmas` is present (`train_timestep_mode: all` requires it)
+  to hand `transition_sigma`. `segment.sigmas` is present (`train_timestep_mode: all` requires it)
   and so is `t_batch`, so a time weight is available if one is ever wanted; what is absent is the SDE
   transition std itself, because every NFT recipe runs `eta: 0.0` and that std vanishes with `eta` —
   the same trap the DiffusionOPD bullet above raises on. That leaves the `add_kl_coefficient=false`
   variant minus the `/2`, so the number is **not** comparable to FlowGRPO/FlowDPPO's `kl_ref_mean`, which carries
-  `_gaussian_kl_div`'s `/(2σ²)`. Measuring on the prediction rather than the reconstructed `x0`
+  `gaussian_kl_div`'s `/(2σ²)`. Measuring on the prediction rather than the reconstructed `x0`
   drops the `t²` Jacobian of `xt - t*pred`, spreading pressure uniformly over trained timesteps
   instead of `t²`-weighting it — the magnitude still moves with `t` (training lower timesteps raises
   it several-fold).

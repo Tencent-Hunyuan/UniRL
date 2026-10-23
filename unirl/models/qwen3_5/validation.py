@@ -5,6 +5,7 @@ from __future__ import annotations
 from importlib import metadata
 from typing import Any
 
+from omegaconf import DictConfig
 from packaging.version import InvalidVersion, Version
 
 from unirl.config.require import require
@@ -18,17 +19,11 @@ _MIN_SGLANG = Version("0.5.19")
 _MISSING = object()
 
 
-def _get(cfg: Any, key: str, default: Any = None) -> Any:
-    if cfg is None:
-        return default
-    getter = getattr(cfg, "get", None)
-    if callable(getter):
-        return getter(key, default)
-    return getattr(cfg, key, default)
-
-
 def _target(cfg: Any) -> str:
-    return str(_get(cfg, "_target_", "") or "")
+    if cfg is None:
+        return ""
+    target = cfg.get("_target_", "")
+    return "" if target is None else str(target)
 
 
 def _installed_version(distribution: str) -> Version:
@@ -50,22 +45,14 @@ def _require_version(distribution: str, minimum: Version, *, reason: str) -> Non
         raise RuntimeError(f"Qwen3.5 {reason} requires {distribution}>={minimum} (installed: {installed}).")
 
 
-def _is_qwen3_5_pipeline_config(pipeline_cfg: Any) -> bool:
-    """Whether a Hydra pipeline config targets the Qwen3.5 package."""
-    return "unirl.models.qwen3_5." in _target(pipeline_cfg)
-
-
 def validate_training_contract(
     *,
-    pipeline_cfg: Any,
-    backend_cfg: Any,
-    rollout_cfg: Any,
-    stack_cfg: Any = None,
+    pipeline_cfg: DictConfig,
+    backend_cfg: DictConfig,
+    rollout_cfg: DictConfig,
+    stack_cfg: DictConfig,
 ) -> None:
-    """Validate only the Qwen3.5 FSDP2/VeOmni + SGLang execution path."""
-    if not _is_qwen3_5_pipeline_config(pipeline_cfg):
-        return
-
+    """Validate the Qwen3.5 FSDP2/VeOmni + SGLang execution path."""
     backend_target = _target(backend_cfg)
     require(
         backend_target.endswith(_FSDP2_BACKEND_SUFFIXES),
@@ -76,8 +63,9 @@ def validate_training_contract(
 
     _require_version("transformers", _MIN_TRANSFORMERS, reason="model loading")
 
-    fsdp_cfg = _get(backend_cfg, "fsdp_cfg", {})
-    sp_size = int(_get(fsdp_cfg, "sp_size", 1) or 1)
+    fsdp_cfg = backend_cfg.get("fsdp_cfg")
+    raw_sp_size = None if fsdp_cfg is None else fsdp_cfg.get("sp_size", 1)
+    sp_size = 1 if raw_sp_size is None else int(raw_sp_size)
     if backend_target.endswith(".VeOmniBackend") and sp_size > 1:
         _require_version(
             "transformers",
@@ -91,7 +79,7 @@ def validate_training_contract(
         )
 
     # Token budgeting does not enable packed attention or sequence-parallel kernels.
-    micro_planner_target = _target(_get(stack_cfg, "micro_planner", {}))
+    micro_planner_target = _target(stack_cfg.get("micro_planner"))
     require(
         not micro_planner_target.endswith(".TokenBudgetPlanner") or sp_size == 1,
         "Qwen3.5 TokenBudgetPlanner is validated only with sp_size=1 in this path; "
@@ -104,9 +92,9 @@ def validate_training_contract(
 
     _require_version("sglang", _MIN_SGLANG, reason="SGLang rollout")
 
-    engine_cfg = _get(rollout_cfg, "config", {})
-    chat_kwargs = _get(engine_cfg, "chat_template_kwargs", None)
-    rollout_thinking = _get(chat_kwargs, "enable_thinking", _MISSING)
+    engine_cfg = rollout_cfg.get("config")
+    chat_kwargs = None if engine_cfg is None else engine_cfg.get("chat_template_kwargs")
+    rollout_thinking = _MISSING if chat_kwargs is None else chat_kwargs.get("enable_thinking", _MISSING)
     require(
         rollout_thinking is not _MISSING,
         "Qwen3.5 SGLang rollout must set "
@@ -117,7 +105,7 @@ def validate_training_contract(
         isinstance(rollout_thinking, bool),
         f"Qwen3.5 rollout.config.chat_template_kwargs.enable_thinking must be a bool; got {rollout_thinking!r}.",
     )
-    train_thinking = _get(pipeline_cfg, "enable_thinking", False)
+    train_thinking = pipeline_cfg.get("enable_thinking", False)
     require(
         isinstance(train_thinking, bool),
         f"Qwen3.5 pipeline.enable_thinking must be a bool; got {train_thinking!r}.",
@@ -129,7 +117,8 @@ def validate_training_contract(
         f"{rollout_thinking!r}. Rollout/train prompt IDs would diverge and corrupt the GRPO ratio.",
     )
 
-    forbidden_tokens = set(_get(engine_cfg, "response_forbidden_tokens", None) or [])
+    raw_forbidden = None if engine_cfg is None else engine_cfg.get("response_forbidden_tokens")
+    forbidden_tokens = set() if raw_forbidden is None else set(raw_forbidden)
     required_placeholders = {"<|image_pad|>", "<|video_pad|>"}
     require(
         required_placeholders.issubset(forbidden_tokens),

@@ -33,6 +33,7 @@ class SD3PipelineConfig:
     lora_target_modules: Optional[List[str]] = None
 
     load_vae: bool = True
+    load_text_encoder: bool = True
 
     meta_init_transformer: bool = False
 

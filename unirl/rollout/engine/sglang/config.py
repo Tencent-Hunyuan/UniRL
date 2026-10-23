@@ -12,6 +12,7 @@ from unirl.rollout.engine.ports import ReservedPorts
 _REQUIRED_SERVER_ARGS_METADATA_KEY = "_unirl_required_server_args"
 _LOAD_BEARING_SERVER_ARGS = frozenset(
     {
+        "context_length",
         "ep_size",
         "enable_memory_saver",
         "enable_weights_cpu_backup",
@@ -52,6 +53,8 @@ class SGLangEngineConfig(BaseEngineConfig):
 
     concurrency: int = 8
 
+    context_length: Optional[int] = None  # server context window; also caps each request's max_new_tokens
+
     enable_memory_saver: Optional[bool] = None
     enable_weights_cpu_backup: Optional[bool] = None
     skip_server_warmup: Optional[bool] = None
@@ -70,6 +73,8 @@ class SGLangEngineConfig(BaseEngineConfig):
     def __post_init__(self) -> None:
         if self.engine_kwargs is None:
             self.engine_kwargs = {}
+        if self.chat_template_kwargs is None:
+            self.chat_template_kwargs = {}
         require(
             bool(self.pretrained_model_ckpt_path),
             "SGLangEngineConfig.pretrained_model_ckpt_path must be set",
@@ -118,6 +123,15 @@ class SGLangEngineConfig(BaseEngineConfig):
             self.concurrency >= 1,
             f"SGLangEngineConfig.concurrency must be >= 1; got {self.concurrency!r}",
         )
+        require(
+            self.context_length is None or self.context_length >= 1,
+            f"SGLangEngineConfig.context_length must be >= 1 when set; got {self.context_length!r}",
+        )
+        require(
+            "context_length" not in self.engine_kwargs,
+            "SGLangEngineConfig.engine_kwargs must not set context_length; set the context_length field, "
+            "which the client also clamps each request's max_new_tokens against",
+        )
 
         self.backend = str(self.backend).strip().lower()
         require(
@@ -146,25 +160,27 @@ class SGLangEngineConfig(BaseEngineConfig):
         """Spell this config (+ the reserved ports) as ServerArgs intent."""
         intent: Dict[str, Any] = {}
 
-        intent.update(self.engine_kwargs or {})
+        intent.update(self.engine_kwargs)
 
         intent["model_path"] = self.pretrained_model_ckpt_path
         if self.tp_size is not None:
-            intent["tp_size"] = int(self.tp_size)
+            intent["tp_size"] = self.tp_size
         if self.pp_size is not None:
-            intent["pp_size"] = int(self.pp_size)
+            intent["pp_size"] = self.pp_size
         if self.ep_size is not None:
-            intent["ep_size"] = int(self.ep_size)
+            intent["ep_size"] = self.ep_size
         if self.dp_size is not None:
-            intent["dp_size"] = int(self.dp_size)
+            intent["dp_size"] = self.dp_size
+        if self.context_length is not None:
+            intent["context_length"] = self.context_length
         if self.enable_memory_saver is not None:
-            intent["enable_memory_saver"] = bool(self.enable_memory_saver)
+            intent["enable_memory_saver"] = self.enable_memory_saver
         if self.enable_weights_cpu_backup is not None:
-            intent["enable_weights_cpu_backup"] = bool(self.enable_weights_cpu_backup)
+            intent["enable_weights_cpu_backup"] = self.enable_weights_cpu_backup
         if self.skip_server_warmup is not None:
-            intent["skip_server_warmup"] = bool(self.skip_server_warmup)
+            intent["skip_server_warmup"] = self.skip_server_warmup
         if self.host is not None:
-            intent["host"] = str(self.host)
+            intent["host"] = self.host
 
         if extra:
             intent.update(extra)
