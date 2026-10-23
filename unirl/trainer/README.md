@@ -523,7 +523,8 @@ without driver-authored x_T. `media_log_interval` does not apply
   `Sample.concat` / `Part.concat` can merge the groups. `sde_index_per_sample` (a `CONCAT` field) is
   the authoritative per-sample step; `PerSampleStepReplayMixin.replay_per_sample` indexes fixed
   latent slots `[:, 0]` / `[:, 1]`, not `latents_at()`. The driver preserves latent
-  `TensorRef` handles without fetching or stacking their payloads.
+  `TensorRef` handles without fetching or stacking their payloads; only the three
+  shared trajectory indices are hydrated for layout validation.
 - **The SDE candidate pool must not reach the final denoising step.** Step `T-1` stores two trajectory
   latents where earlier steps store three, and `torch.cat` cannot merge different `K`. The trainer
   raises at build time rather than failing mid-rollout. Keep the scheduler's `timestep_fraction` end
