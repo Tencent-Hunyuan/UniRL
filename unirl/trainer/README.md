@@ -479,8 +479,10 @@ without driver-authored x_T. `media_log_interval` does not apply
 
 - **HI3 two-engine rollout returns whole chunks.** `rollout_pipeline_chunks > 1`
   overlaps the next chunk's AR with the current chunk's DiT using one pending
-  call per engine. It preserves complete prompt trees and output order; smaller
-  chunks can reduce per-engine batch throughput, so the recipe keeps this off.
+  call per engine, and `ar_num_replicas` (default: one per 8-GPU node) controls
+  how many 4-GPU engine slots on multi-node pools run AR versus DiT. It
+  preserves complete prompt trees and output order; smaller chunks can reduce
+  per-engine AR batch throughput when `b_ar` per chunk drops below `max_num_seqs`.
 - **Multi-update means disjoint optimizer mini-batches, not repeated full-batch
   epochs.** See [Multiple optimizer updates per rollout](#multiple-optimizer-updates-per-rollout)
   for the algorithm and divisibility constraints.

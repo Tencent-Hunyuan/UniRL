@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import re
+from collections import OrderedDict
 from typing import List, Optional
 
 import torch
 
+from unirl.models.types.embedding import embed_with_cpu_cache
 from unirl.types.conditions import TextEmbedCondition
 from unirl.types.primitives import Texts
 
@@ -51,10 +53,14 @@ class HunyuanVideo15TextEmbedStage:
         self.mllm_crop_start = int(mllm_crop_start)
         self.mllm_skip_layers = int(mllm_skip_layers)
         self.byt5_max_length = int(byt5_max_length)
+        self._mllm_cache: OrderedDict[str, TextEmbedCondition] = OrderedDict()
+        self._glyph_cache: OrderedDict[str, TextEmbedCondition] = OrderedDict()
 
     def embed_mllm(self, p: Texts) -> TextEmbedCondition:
         """Encode prompts via the Qwen2.5-VL MLLM into a TextEmbedCondition."""
-        prompts = list(p.texts)
+        return embed_with_cpu_cache(p.texts, self._mllm_cache, self._encode_mllm, device=self.bundle.device)
+
+    def _encode_mllm(self, prompts: List[str]) -> TextEmbedCondition:
         bundle = self.bundle
         tokenizer = bundle.tokenizer
         text_encoder = bundle.text_encoder
@@ -98,7 +104,9 @@ class HunyuanVideo15TextEmbedStage:
 
     def embed_glyph(self, p: Texts) -> TextEmbedCondition:
         """Encode prompts via the ByT5 glyph encoder into a TextEmbedCondition."""
-        prompts = list(p.texts)
+        return embed_with_cpu_cache(p.texts, self._glyph_cache, self._encode_byt5, device=self.bundle.device)
+
+    def _encode_byt5(self, prompts: List[str]) -> TextEmbedCondition:
         bundle = self.bundle
         tokenizer = bundle.tokenizer_2
         text_encoder = bundle.text_encoder_2
