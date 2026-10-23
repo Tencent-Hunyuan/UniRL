@@ -35,6 +35,7 @@ class TrainsideRolloutEngine(BaseRolloutEngine):
                 f"TrainsideRolloutEngine.forward_batch_size must be >= 1 when set; got {forward_batch_size!r}"
             )
         self.forward_batch_size = forward_batch_size
+        self._allow_post_window = all(s.supports_post_window_ode for s in stages if isinstance(s, DiffusionStage))
         if any(isinstance(s, DiffusionStage) for s in stages):
             if hasattr(pipeline, "build_schedule_policy"):
                 self.schedule_policy = pipeline.build_schedule_policy()
@@ -69,7 +70,7 @@ class TrainsideRolloutEngine(BaseRolloutEngine):
                         "diffusion sub-engine's own forward_batch_size)."
                     )
             if self.schedule_policy is not None:
-                ensure_sample_sigmas(sample, self.schedule_policy)
+                ensure_sample_sigmas(sample, self.schedule_policy, allow_post_window=self._allow_post_window)
             prev_modes = [m.training for m in self.models]
             for m in self.models:
                 m.eval()
