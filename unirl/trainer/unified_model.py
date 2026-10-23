@@ -15,8 +15,8 @@ from hydra.utils import instantiate
 from omegaconf import DictConfig
 
 from unirl.distributed.group.placement import placement, remote
-from unirl.distributed.tensor import TensorRef, hydrate
-from unirl.distributed.tensor.batch import Batch
+from unirl.distributed.tensor import hydrate
+from unirl.distributed.tensor.ref import map_tree
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample
 from unirl.trainer.eval_suites import build_eval_suites
@@ -26,31 +26,6 @@ from unirl.types.sample import Part, Sample
 from unirl.types.sampling import ARSamplingParams, BaseSamplingParams, DiffusionSamplingParams
 
 logger = logging.getLogger(__name__)
-
-
-def deep_hydrate(obj: Any) -> Any:
-    """Materialize every ``TensorRef`` leaf in ``obj`` to a real tensor, in place."""
-    if isinstance(obj, TensorRef):
-        return hydrate(obj)
-    if isinstance(obj, Batch):
-        for f in dataclasses.fields(obj):
-            v = getattr(obj, f.name)
-            if v is not None:
-                new = deep_hydrate(v)
-                if new is not v:
-                    setattr(obj, f.name, new)
-        return obj
-    if isinstance(obj, dict):
-        for k in list(obj.keys()):
-            obj[k] = deep_hydrate(obj[k])
-        return obj
-    if isinstance(obj, list):
-        for i in range(len(obj)):
-            obj[i] = deep_hydrate(obj[i])
-        return obj
-    if isinstance(obj, tuple):
-        return tuple(deep_hydrate(x) for x in obj)
-    return obj
 
 
 class UnifiedModelTrainer(BaseTrainer):
@@ -70,30 +45,95 @@ class UnifiedModelTrainer(BaseTrainer):
         stack_cfg: DictConfig,
         data_source_cfg: DictConfig,
         sampling_cfg: DictConfig,
-        control: Optional[Dict[str, Any]] = None,
-        ar_rollout_cfg: Optional[DictConfig] = None,
-        dit_rollout_cfg: Optional[DictConfig] = None,
-        rollout_cfg: Optional[DictConfig] = None,
-        sync_cfg: Optional[DictConfig] = None,
-        dump_dir: Optional[str] = None,
-        logging_cfg: Optional[DictConfig] = None,
-        enable_fsdp_offload: bool = True,
-        eval_interval: int = 0,
-        eval_num_prompts: int = 32,
-        eval_cfg_text_scale: float = 4.0,
-        eval_eta: float = 0.0,
-        eval_rewards_cfg: Optional[Any] = None,
+        control: Optional[Dict[str, Any]],
+        ar_rollout_cfg: Optional[DictConfig],
+        dit_rollout_cfg: Optional[DictConfig],
+        rollout_cfg: Optional[DictConfig],
+        sync_cfg: Optional[DictConfig],
+        dump_dir: Optional[str],
+        logging_cfg: Optional[DictConfig],
+        enable_fsdp_offload: bool,
+        rollout_pipeline_chunks: int,
+        ar_num_replicas: Optional[int],
+        eval_interval: int,
+        eval_num_prompts: int,
+        eval_cfg_text_scale: float,
+        eval_eta: float,
+        eval_rewards_cfg: Optional[Any],
     ) -> None:
+        if batch_size < 1 or batch_size % cfg.num_devices != 0:
+            raise ValueError(
+                f"UnifiedModelTrainer: batch_size ({batch_size}) must be a positive multiple of "
+                f"num_devices ({cfg.num_devices}); reward scoring and unified training scatter whole prompt trees."
+            )
+        if rollout_pipeline_chunks < 1:
+            raise ValueError(
+                f"UnifiedModelTrainer.rollout_pipeline_chunks must be >= 1; got {rollout_pipeline_chunks}."
+            )
+        self._rollout_pipeline_chunks = rollout_pipeline_chunks
+        single_engine = rollout_cfg is not None
+        if single_engine:
+            if ar_rollout_cfg is not None or dit_rollout_cfg is not None:
+                raise ValueError(
+                    "UnifiedModelTrainer: pass either rollout_cfg (single-engine mode) or "
+                    "ar_rollout_cfg + dit_rollout_cfg (two-engine mode), not both."
+                )
+            if rollout_pipeline_chunks > 1:
+                raise ValueError(
+                    "UnifiedModelTrainer.rollout_pipeline_chunks > 1 requires the two-engine "
+                    "ar_rollout_cfg/dit_rollout_cfg rollout; the single-engine rollout_cfg path does not pipeline."
+                )
+            if ar_num_replicas is not None:
+                raise ValueError(
+                    "UnifiedModelTrainer.ar_num_replicas requires the two-engine "
+                    "ar_rollout_cfg/dit_rollout_cfg rollout; the single-engine rollout_cfg path uses one engine."
+                )
+            rollout_parsed = parse_hydra_cfg(rollout_cfg)
+            if "pipeline" not in inspect.signature(rollout_parsed["role_cls"]).parameters:
+                raise ValueError(
+                    "UnifiedModelTrainer: single-engine mode supports only the trainside direct-sampling engine; "
+                    "use ar_rollout + dit_rollout for dedicated rollout engines."
+                )
+            if sync_cfg is not None:
+                raise ValueError(
+                    "UnifiedModelTrainer: single-engine mode samples on the train actors and cannot use a `sync:` block."
+                )
+        else:
+            rollout_parsed = None
+            if ar_rollout_cfg is None or dit_rollout_cfg is None:
+                raise ValueError(
+                    "UnifiedModelTrainer: two-engine mode needs ar_rollout_cfg + dit_rollout_cfg; "
+                    "pass a single rollout_cfg for single-engine (M=1 / UniGRPO) mode."
+                )
+            if sync_cfg is None:
+                raise ValueError("UnifiedModelTrainer: two-engine dedicated rollout requires a `sync:` block.")
         super().__init__(cfg=cfg, logging_cfg=logging_cfg)
+        if not single_engine:
+            per_node = self.pool.devices_per_node
+            # Require at least eight GPUs per node so engine pairs do not split across nodes.
+            if per_node < 8:
+                raise ValueError(
+                    "UnifiedModelTrainer: HI3 needs >= 8 devices/node for one "
+                    "(AR 0-3, DiT 4-7) engine pair per node; got "
+                    f"devices_per_node={per_node}."
+                )
+            num_nodes = max(1, self.pool.num_devices // per_node)
+            total_slots = 2 * num_nodes
+            ar_count = num_nodes if ar_num_replicas is None else ar_num_replicas
+            if type(ar_count) is not int or ar_count < 1 or ar_count >= total_slots:
+                raise ValueError(
+                    f"UnifiedModelTrainer.ar_num_replicas must be an int in [1, {total_slots - 1}] for "
+                    f"{num_nodes} node(s) ({total_slots} 4-GPU engine slots); got {ar_num_replicas!r}."
+                )
         self.batch_size = batch_size
-        self._enable_fsdp_offload = bool(enable_fsdp_offload)
+        self._enable_fsdp_offload = enable_fsdp_offload and not single_engine
 
-        self.eval_interval = int(eval_interval)
-        self.eval_num_prompts = int(eval_num_prompts)
-        self.eval_cfg_text_scale = float(eval_cfg_text_scale)
-        self.eval_eta = float(eval_eta)
+        self.eval_interval = eval_interval
+        self.eval_num_prompts = eval_num_prompts
+        self.eval_cfg_text_scale = eval_cfg_text_scale
+        self.eval_eta = eval_eta
 
-        self.dump_dir = str(dump_dir) if dump_dir else None
+        self.dump_dir = dump_dir or None
         self._dump_rollout_id = 0
         if self.dump_dir:
             os.makedirs(self.dump_dir, exist_ok=True)
@@ -124,70 +164,43 @@ class UnifiedModelTrainer(BaseTrainer):
                 image_algorithm=self.image_algorithm,
             )
 
-            self._single_engine = rollout_cfg is not None
-            diffusion_params = self.sampling_params.get("diffusion")
-            self._shared_advantage = int(diffusion_params.samples_per_prompt) == 1
-            self._rollout_is_trainside = False
-            if self._single_engine:
-                self.dp = 1
-                self.ar_rollouts = []
-                self.dit_rollouts = []
-                self.ar_rollout = None
-                self.dit_rollout = None
-                rollout_parsed = parse_hydra_cfg(rollout_cfg)
-                self._rollout_is_trainside = "pipeline" in inspect.signature(rollout_parsed["role_cls"]).parameters
-                if self._rollout_is_trainside:
-                    self.rollout = remote(**rollout_parsed, pipeline=self.pipeline)
-                    self._enable_fsdp_offload = False
-                else:
-                    self.rollout = remote(**rollout_parsed)
+            diffusion_params = self.sampling_params["diffusion"]
+            self._shared_advantage = diffusion_params.samples_per_prompt == 1
+            if single_engine:
+                self.rollout = remote(**rollout_parsed, pipeline=self.pipeline)
                 return
-
-            if ar_rollout_cfg is None or dit_rollout_cfg is None:
-                raise ValueError(
-                    "UnifiedModelTrainer: two-engine mode needs ar_rollout_cfg + dit_rollout_cfg; "
-                    "pass a single rollout_cfg for single-engine (M=1 / UniGRPO) mode."
-                )
 
             # Offload the frozen base before engine boot to avoid colocated OOMs.
             if self._enable_fsdp_offload:
                 self.backend.offload()
 
             # Anchor AR and DiT engines on distinct workers to prevent GPU overlap.
-            per_node = self.pool.devices_per_node
-            # Require at least eight GPUs per node so engine pairs do not split across nodes.
-            if per_node < 8:
-                raise ValueError(
-                    "UnifiedModelTrainer: HI3 needs >= 8 devices/node for one "
-                    "(AR 0-3, DiT 4-7) engine pair per node; got "
-                    f"devices_per_node={per_node}."
-                )
-            self.dp = max(1, self.pool.num_devices // per_node)
             self.ar_rollouts = []
             self.dit_rollouts = []
-            for r in range(self.dp):
+            for r in range(num_nodes):
                 base = r * per_node
                 # Boot engines serially and off rank 0 to avoid warmup and LoRA-sync deadlocks.
-                ar = self._wire_engine(ar_rollout_cfg, anchor_device=base + 1)
-                ar.sleep()
-                self.ar_rollouts.append(ar)
-                dit = self._wire_engine(dit_rollout_cfg, anchor_device=base + 4)
-                dit.sleep()
-                self.dit_rollouts.append(dit)
-            self.ar_rollout = self.ar_rollouts[0]
-            self.dit_rollout = self.dit_rollouts[0]
+                for anchor_offset, devices, is_ar in (
+                    (1, "0,1,2,3", r < ar_count),
+                    (4, "4,5,6,7", r < ar_count - num_nodes),
+                ):
+                    parsed = parse_hydra_cfg(ar_rollout_cfg if is_ar else dit_rollout_cfg)
+                    role_cls = parsed.pop("role_cls")
+                    default_devs = "0,1,2,3" if is_ar else "4,5,6,7"
+                    if devices != default_devs:
+                        config = dict(parsed["config"])
+                        omni_extra = dict(config.get("omni_extra") or {})
+                        omni_extra["stage_overrides"] = {"0": {"devices": devices}}
+                        config["omni_extra"] = omni_extra
+                        parsed["config"] = config
+                    eng = self.pool.create_remote(role_cls, device_ids=[base + anchor_offset], init_kwargs=parsed)
+                    eng.sleep()
+                    (self.ar_rollouts if is_ar else self.dit_rollouts).append(eng)
 
-            if sync_cfg is not None:
-                self.weight_sync = remote_hydra(sync_cfg, backend=self.backend)
-                self.weight_sync.set_rollout_targets(
-                    [(eng.role_name, eng.workers) for eng in self.ar_rollouts + self.dit_rollouts]
-                )
-
-    def _wire_engine(self, cfg: DictConfig, *, anchor_device: int) -> Any:
-        """Build ONE multi-GPU vLLM-Omni engine actor anchored on one worker."""
-        parsed = parse_hydra_cfg(cfg)
-        role_cls = parsed.pop("role_cls")
-        return self.pool.create_remote(role_cls, device_ids=[anchor_device], init_kwargs=parsed)
+            self.weight_sync = remote_hydra(sync_cfg, backend=self.backend)
+            self.weight_sync.set_rollout_targets(
+                [(eng.role_name, eng.workers) for eng in self.ar_rollouts + self.dit_rollouts]
+            )
 
     def _build_request_sample(
         self,
@@ -198,13 +211,10 @@ class UnifiedModelTrainer(BaseTrainer):
     ) -> Sample:
         """Turn a data-source batch of ``P`` prompts into the unified request ``Sample``."""
         base = sampling if sampling is not None else self.sampling_params
-        diff_params = base.get("diffusion")
-        ar_params = base.get("ar")
+        diff_params = base["diffusion"]
+        ar_params = base["ar"]
         sde_indices = diff_params.get_sde_indices(rollout_id)
-        disable_xt = bool(os.environ.get("DISABLE_DRIVER_XT")) or bool(getattr(diff_params, "disable_driver_xt", False))
-        diffusion = dataclasses.replace(
-            diff_params, sde_indices=sde_indices, scheduler=None, disable_driver_xt=disable_xt
-        )
+        diffusion = dataclasses.replace(diff_params, sde_indices=sde_indices, scheduler=None)
         request = prepare_input_sample(
             inputs,
             rollout_id,
@@ -231,93 +241,134 @@ class UnifiedModelTrainer(BaseTrainer):
                 f"[input, ar_shell, image_shell]; got {len(sample.parts)} Parts with sampling types "
                 f"{[type(part.sampling_params).__name__ for part in sample.parts]}."
             )
-        if self._single_engine:
+        if self.weight_sync is None:
             return self.rollout.generate(sample)
 
-        n = sample.parts[0].batch_size
-        if self.dp <= 1 or n <= 1:
-            return self._run_rollout_one(self.ar_rollouts[0], self.dit_rollouts[0], sample)
-
-        groups = sample.split()
-        bounds = [(n * r) // self.dp for r in range(self.dp + 1)]
-        shards: list[Sample] = []
-        for r in range(self.dp):
-            lo, hi = bounds[r], bounds[r + 1]
-            if lo >= hi:
-                continue
-            sub = Sample.concat(groups[lo:hi])
-            shards.append(self._run_rollout_one(self.ar_rollouts[r], self.dit_rollouts[r], sub))
-        return Sample.concat(shards)
-
-    def _run_rollout_one(self, ar_engine: Any, dit_engine: Any, sample: Sample) -> Sample:
-        """One (AR, DiT) engine pair: fill the unified ``[input, ar, image]`` lineage."""
-        input_part = sample.parts[0]
-        ar_shell = sample.gen_part(ARSamplingParams)
-        image_shell = sample.gen_part(DiffusionSamplingParams)
-        prompts = input_part.primitives.get("text")
-        if not isinstance(prompts, Texts):
+        root_part, ar_shell, image_shell = sample.parts
+        if not isinstance(root_part.primitives.get("text"), Texts):
             raise TypeError("UnifiedModelTrainer.run_rollout: input Part must contain a 'text' Texts primitive.")
         n_rec = ar_shell.sampling_params.samples_per_prompt
         n_img = image_shell.sampling_params.samples_per_prompt
         rid = self._dump_rollout_id
+        n = root_part.batch_size
+        n_ar_engines = len(self.ar_rollouts)
+        n_dit_engines = len(self.dit_rollouts)
+        n_chunks = min(self._rollout_pipeline_chunks, n)
+        if n_chunks <= 1:
+            chunks = [sample]
+        else:
+            groups = sample.split()
+            bounds = [(n * i) // n_chunks for i in range(n_chunks + 1)]
+            chunks = [Sample.concat(groups[lo:hi]) for lo, hi in zip(bounds, bounds[1:])]
 
-        ar_texts = Texts(texts=[t for t in prompts.texts for _ in range(n_rec)])
-        n_ar = len(ar_texts.texts)
-        ar_input = Part.input(
-            [f"r{rid}:a{k}" for k in range(n_ar)],
-            primitives={"text": ar_texts},
-            control=input_part.control,
-        )
-        ar_request = (
-            Sample.request(ar_input)
-            .fork(1, sampling_params=image_shell.sampling_params)
-            .fork(1, sampling_params=ar_shell.sampling_params)
-        )
-        ar_out = ar_engine.generate(ar_request)
-        ar_gen = ar_out.parts[-1]
-        recaptions = ar_gen.primitives.get("text")
-        if not isinstance(recaptions, Texts) or len(recaptions.texts) != n_ar:
-            got = len(recaptions.texts) if isinstance(recaptions, Texts) else type(recaptions).__name__
-            raise RuntimeError(
-                f"UnifiedModelTrainer.run_rollout: AR engine must return {n_ar} decoded Texts (= P*N); got {got}."
+        pending_ar: List[Any] = []
+        pending_dit: List[Any] = []
+        ar_parts: List[Part] = []
+        dit_gens: List[Part] = []
+
+        def launch_ar_chunk(chunk_sample: Sample) -> None:
+            input_part = chunk_sample.parts[0]
+            prompts = input_part.primitives["text"].texts
+            n_ar_total = len(prompts) * n_rec
+            k_ar = min(n_ar_engines, n_ar_total)
+            for r in range(k_ar):
+                lo, hi = (n_ar_total * r) // k_ar, (n_ar_total * (r + 1)) // k_ar
+                ar_texts = Texts(texts=[prompts[idx // n_rec] for idx in range(lo, hi)])
+                ar_input = Part.input(
+                    [f"r{rid}:a{idx}" for idx in range(lo, hi)],
+                    primitives={"text": ar_texts},
+                    control=input_part.control,
+                )
+                req = (
+                    Sample.request(ar_input)
+                    .fork(1, sampling_params=image_shell.sampling_params)
+                    .fork(1, sampling_params=ar_shell.sampling_params)
+                )
+                pending_ar.append(self.ar_rollouts[r].slot(0).launch("generate_on_slot", req))
+
+        try:
+            launch_ar_chunk(chunks[0])
+            for i, chunk in enumerate(chunks):
+                ar_gen = Part.concat([call.result().parts[-1] for call in pending_ar])
+                pending_ar.clear()
+                if i + 1 < len(chunks):
+                    launch_ar_chunk(chunks[i + 1])
+
+                input_part, chunk_ar_shell, chunk_image_shell = chunk.parts
+                prompts = input_part.primitives["text"].texts
+                n_ar = len(prompts) * n_rec
+                recaptions = ar_gen.primitives.get("text")
+                if not isinstance(recaptions, Texts) or len(recaptions.texts) != n_ar:
+                    got = len(recaptions.texts) if isinstance(recaptions, Texts) else type(recaptions).__name__
+                    raise RuntimeError(
+                        f"UnifiedModelTrainer.run_rollout: AR engine must return {n_ar} decoded Texts (= P*N); got {got}."
+                    )
+                ar_parts.append(
+                    chunk_ar_shell.fill(
+                        segment=ar_gen.segment,
+                        primitives={"text": recaptions},
+                        conditions=dict(ar_gen.conditions),
+                        output_version=ar_gen.output_version,
+                    )
+                )
+                if pending_dit:
+                    dit_gens.append(Part.concat([call.result().parts[-1] for call in pending_dit]))
+                    pending_dit.clear()
+                n_dit_total = n_ar * n_img
+                all_dit_prompts = [prompts[j // n_rec] for j in range(n_ar) for _ in range(n_img)]
+                all_dit_cot = [recaptions.texts[j] for j in range(n_ar) for _ in range(n_img)]
+                all_dit_ids = [sid.replace("/", "_") for sid in chunk_image_shell.sample_ids]
+                all_noise_gids = list(chunk_image_shell.init_noise_group_ids) or (
+                    chunk_image_shell.group_ids
+                    if chunk_image_shell.sampling_params.init_same_noise
+                    else list(chunk_image_shell.sample_ids)
+                )
+                k_dit = min(n_dit_engines, n_dit_total)
+                for r in range(k_dit):
+                    lo, hi = (n_dit_total * r) // k_dit, (n_dit_total * (r + 1)) // k_dit
+                    dit_input = Part.input(
+                        all_dit_ids[lo:hi],
+                        primitives={"text": Texts(texts=all_dit_prompts[lo:hi])},
+                        control=input_part.control,
+                    )
+                    cot_input = dit_input.input_child(primitives={"text": Texts(texts=all_dit_cot[lo:hi])})
+                    req = Sample.request(dit_input, cot_input).fork(
+                        1, sampling_params=chunk_image_shell.sampling_params
+                    )
+                    req = req.replace_frontier(
+                        dataclasses.replace(req.parts[-1], init_noise_group_ids=all_noise_gids[lo:hi])
+                    )
+                    pending_dit.append(self.dit_rollouts[r].slot(0).launch("generate_on_slot", req))
+
+            dit_gens.append(Part.concat([call.result().parts[-1] for call in pending_dit]))
+            pending_dit.clear()
+        except BaseException:
+            for pending in (*pending_ar, *pending_dit):
+                try:
+                    pending.wait()
+                except Exception:
+                    logger.debug("UnifiedModelTrainer: pending rollout call failed while draining", exc_info=True)
+            raise
+
+        filled: List[Sample] = []
+        for chunk, ar_part, img_gen in zip(chunks, ar_parts, dit_gens):
+            input_part, _, chunk_image_shell = chunk.parts
+            if len(img_gen.sample_ids) != len(chunk_image_shell.sample_ids):
+                raise RuntimeError(
+                    f"UnifiedModelTrainer.run_rollout: DiT engine returned {len(img_gen.sample_ids)} image(s) "
+                    f"but the image shell expects {len(chunk_image_shell.sample_ids)} (= P*N*M). "
+                    "The DiT engine must be 1:1."
+                )
+            image_part = chunk_image_shell.fill(
+                segment=img_gen.segment,
+                primitives=dict(img_gen.primitives),
+                primitive_metadata=dict(img_gen.primitive_metadata),
+                conditions=dict(img_gen.conditions),
+                media_preview=img_gen.media_preview,
+                output_version=img_gen.output_version,
             )
-        ar_part = ar_shell.fill(
-            segment=ar_gen.segment,
-            primitives={"text": recaptions},
-            conditions=dict(ar_gen.conditions),
-            output_version=ar_gen.output_version,
-        )
-
-        dit_prompts = Texts(texts=[prompts.texts[i // n_rec] for i in range(n_ar) for _ in range(n_img)])
-        dit_cot = Texts(texts=[recaptions.texts[i] for i in range(n_ar) for _ in range(n_img)])
-        dit_input = Part.input(
-            [sid.replace("/", "_") for sid in image_shell.sample_ids],
-            primitives={"text": dit_prompts},
-            control=input_part.control,
-        )
-        cot_input = dit_input.input_child(primitives={"text": dit_cot})
-        dit_out = dit_engine.generate(
-            Sample.request(dit_input, cot_input).fork(1, sampling_params=image_shell.sampling_params)
-        )
-        img_gen = dit_out.parts[-1]
-        if len(img_gen.sample_ids) != len(image_shell.sample_ids):
-            raise RuntimeError(
-                f"UnifiedModelTrainer.run_rollout: DiT engine returned {len(img_gen.sample_ids)} image(s) "
-                f"but the image shell expects {len(image_shell.sample_ids)} (= P*N*M). The DiT engine must be 1:1."
-            )
-        image_part = image_shell.fill(
-            segment=img_gen.segment,
-            primitives=dict(img_gen.primitives),
-            primitive_metadata=dict(img_gen.primitive_metadata),
-            conditions=dict(img_gen.conditions),
-            media_preview=img_gen.media_preview,
-            output_version=img_gen.output_version,
-        )
-
-        # Materialize engine outputs before DP reshards a single transport handle.
-        deep_hydrate(ar_part)
-        deep_hydrate(image_part)
-        return Sample(parts=[input_part, ar_part, image_part])
+            filled.append(Sample(parts=[input_part, ar_part, image_part]))
+        return Sample.concat(filled)
 
     def train_step(
         self,
@@ -329,10 +380,10 @@ class UnifiedModelTrainer(BaseTrainer):
     ) -> Tuple[Dict[str, TrainStepResult], float]:
         """One ``rollout → reward → credit-assign → advantage → step`` pass."""
         t0 = time.perf_counter()
-        if self._single_engine:
+        if self.weight_sync is None:
             sample = self.run_rollout(sample)
         else:
-            if sync_weights and self.weight_sync is not None:
+            if sync_weights:
                 if self._enable_fsdp_offload:
                     self.backend.onload()
                 self.weight_sync.extract()
@@ -341,7 +392,7 @@ class UnifiedModelTrainer(BaseTrainer):
             for _eng in self.ar_rollouts + self.dit_rollouts:
                 _eng.wake_up()
             try:
-                if sync_weights and self.weight_sync is not None:
+                if sync_weights:
                     self.weight_sync.push()
                 sample = self.run_rollout(sample)
             finally:
@@ -397,7 +448,7 @@ class UnifiedModelTrainer(BaseTrainer):
             extra_metrics={"sync_weights": float(bool(sync_weights))},
         )
 
-        if self._enable_fsdp_offload and not self._single_engine:
+        if self._enable_fsdp_offload:
             self.backend.offload()
         return results, mean_reward
 
@@ -429,17 +480,17 @@ class UnifiedModelTrainer(BaseTrainer):
             if isinstance(img_decoded, Images):
                 from torchvision.utils import save_image
 
-                img_decoded = deep_hydrate(img_decoded)
+                img_decoded = map_tree(img_decoded, hydrate)
                 images = img_decoded.to_list()
                 n_imgs = len(images)
                 for k, image in enumerate(images):
                     pixels = image.pixels.detach().to(torch.float32).clamp(0, 1).cpu()
                     save_image(pixels, os.path.join(out_dir, f"img_{k}.png"))
 
-            ar_params = self.sampling_params.get("ar")
-            diff_params = self.sampling_params.get("diffusion")
-            n_rec = int(ar_params.samples_per_prompt) if ar_params is not None else 1
-            n_img = max(1, int(diff_params.samples_per_prompt))
+            ar_params = self.sampling_params["ar"]
+            diff_params = self.sampling_params["diffusion"]
+            n_rec = ar_params.samples_per_prompt
+            n_img = max(1, diff_params.samples_per_prompt)
             n = max(len(sample_ids), n_imgs)
             with open(os.path.join(out_dir, "samples.jsonl"), "w") as f:
                 for k in range(n):
@@ -465,14 +516,14 @@ class UnifiedModelTrainer(BaseTrainer):
 
     def evaluate(self, step: int) -> float:
         """Periodic eval on the eval set (no training); returns the mean image reward."""
-        base_diffusion = self.sampling_params.get("diffusion")
+        base_diffusion = self.sampling_params["diffusion"]
         eval_diffusion = dataclasses.replace(
             base_diffusion,
             eta=self.eval_eta,
             guidance_scale=self.eval_cfg_text_scale,
         )
         eval_sp = {**self.sampling_params, "diffusion": eval_diffusion}
-        if not self._single_engine and self.weight_sync is not None:
+        if self.weight_sync is not None:
             if self._enable_fsdp_offload:
                 self.backend.onload()
             self.weight_sync.extract()
@@ -519,7 +570,7 @@ class UnifiedModelTrainer(BaseTrainer):
         for start in range(0, usable, chunk):
             sub = all_inputs.slice(start, min(start + chunk, n_prompts))
             request = self._build_request_sample(sub, step, sampling=eval_sp)
-            if self._single_engine:
+            if self.weight_sync is None:
                 generated = self.run_rollout(request)
             else:
                 for eng in self.ar_rollouts + self.dit_rollouts:
@@ -542,11 +593,11 @@ class UnifiedModelTrainer(BaseTrainer):
         self,
         *,
         num_rollouts: int,
-        weight_sync_interval: int = 1,
-        save_interval: int = 0,
-        save_dir: Optional[str] = None,
-        load_dir: Optional[str] = None,
-        save_mode: str = "auto",
+        weight_sync_interval: int,
+        save_interval: int,
+        save_dir: Optional[str],
+        load_dir: Optional[str],
+        save_mode: str,
     ) -> None:
         """Minimal training loop: ``num_rollouts`` iterations of ``train_step``."""
         interval = max(1, weight_sync_interval)

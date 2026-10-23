@@ -6,36 +6,29 @@ from contextlib import contextmanager
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Type
 
 import torch
+from peft.tuners.lora import LoraLayer
 
 from unirl.types.conditions import Condition
 from unirl.types.segments.latent import LatentSegment
 
 from .base import (
     AlgorithmStepResult,
-    _grpo_clip_loss,
-    _resolve_clip_range_from_schedule,
     gather_sde_field,
+    grpo_clip_loss,
+    resolve_clip_range_from_schedule,
     typed_conditions,
 )
 from .flowgrpo import FlowGRPO
 
 
 @contextmanager
-def _disable_lora(module: Any) -> Iterator[bool]:
+def _disable_lora(module: Any) -> Iterator[None]:
     """Temporarily disable LoRA adapters so a forward runs the base model."""
-    try:
-        from peft.tuners.lora import LoraLayer
-    except Exception:
-        yield False
-        return
     layers = [m for m in module.modules() if isinstance(m, LoraLayer)]
-    if not layers:
-        yield False
-        return
     for layer in layers:
         layer.enable_adapters(False)
     try:
-        yield True
+        yield
     finally:
         for layer in layers:
             layer.enable_adapters(True)
@@ -78,10 +71,6 @@ class BagelFlowUniGRPO(FlowGRPO):
     @staticmethod
     def _has_lora(transformer: Any) -> bool:
         """True if the transformer carries peft LoRA layers (LoRA training)."""
-        try:
-            from peft.tuners.lora import LoraLayer
-        except Exception:
-            return False
         return any(isinstance(m, LoraLayer) for m in transformer.modules())
 
     @contextmanager
@@ -120,11 +109,9 @@ class BagelFlowUniGRPO(FlowGRPO):
         if not (self.ratio_norm and self.old_logp_source == "replay"):
             super().prepare_segment(conditions=conditions, segment=segment)
             return
-        if segment.sde_indices is None:
+        if segment.sde_indices is None or segment.sde_indices.numel() == 0:
             return
-        target_steps = self._resolve_target_steps(segment)
-        if not target_steps:
-            return
+        target_steps = segment.sde_indices.tolist()
         typed_conds = typed_conditions(conditions, self.conditions_cls)
         with torch.no_grad():
             result = self.stage.replay(typed_conds, segment=segment, params=self.params, step_indices=target_steps)
@@ -158,9 +145,9 @@ class BagelFlowUniGRPO(FlowGRPO):
             )
         if self.mse_weight <= 0.0 or not result.has_backward:
             return result
-        target_steps = self._resolve_target_steps(segment)
-        if not target_steps or segment.sigmas is None:
+        if segment.sde_indices is None or segment.sde_indices.numel() == 0 or segment.sigmas is None:
             return result
+        target_steps = segment.sde_indices.tolist()
 
         typed_conds = typed_conditions(conditions, self.conditions_cls)
         device = next(self.stage.model.transformer.parameters()).device
@@ -169,18 +156,8 @@ class BagelFlowUniGRPO(FlowGRPO):
         full_ft_ref = not self._has_lora(transformer)
         # Compute reference velocities before retaining trainable graphs to reduce peak memory.
         with torch.no_grad():
-            if full_ft_ref:
-                ref_ctx = self._reference_weights(transformer)
-            else:
-                ref_ctx = _disable_lora(transformer)
-            with ref_ctx as disabled:
-                if not full_ft_ref and not disabled:
-                    raise RuntimeError(
-                        "BagelFlowUniGRPO: mse_weight > 0 but found neither peft LoRA layers "
-                        "to disable nor trainable params to snapshot as v_ref on "
-                        "stage.model.transformer. Train with a lora_cfg or full fine-tuning, "
-                        "or set mse_weight=0."
-                    )
+            ref_ctx = self._reference_weights(transformer) if full_ft_ref else _disable_lora(transformer)
+            with ref_ctx:
                 # Rebuild reference conditioning only after policy weights are disabled.
                 ref_forward_kwargs = self.stage.build_forward_kwargs(
                     typed_conds,
@@ -213,7 +190,7 @@ class BagelFlowUniGRPO(FlowGRPO):
         mse = torch.stack(mse_terms).mean()
         (self.mse_weight * mse * loss_scale).backward()
 
-        mse_val = float(mse.detach().item())
+        mse_val = mse.detach().item()
         return AlgorithmStepResult(
             loss=result.loss + self.mse_weight * mse_val,
             metrics={**dict(result.metrics), "velocity_mse": mse_val, "mse_weight": self.mse_weight},
@@ -231,9 +208,9 @@ class BagelFlowUniGRPO(FlowGRPO):
         loss_scale: float,
     ) -> AlgorithmStepResult:
         """FlowGRPO clipped surrogate with GRPO-Guard RatioNorm."""
-        target_steps = self._resolve_target_steps(segment)
-        if not target_steps:
+        if segment.sde_indices is None or segment.sde_indices.numel() == 0:
             return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
+        target_steps = segment.sde_indices.tolist()
         if segment.sde_means is None:
             raise RuntimeError(
                 "BagelFlowUniGRPO(ratio_norm=True): segment.sde_means is None. RatioNorm needs the rollout "
@@ -266,9 +243,9 @@ class BagelFlowUniGRPO(FlowGRPO):
         mean_dmu2 = (delta_mu**2).mean(dim=tuple(range(2, delta_mu.ndim)))
         log_r_hat = std_var * (log_r + mean_dmu2 / (2.0 * std_var**2))
 
-        clip_range = _resolve_clip_range_from_schedule(self.clip_range, self.clip_schedule, training_progress)
+        clip_range = resolve_clip_range_from_schedule(self.clip_range, self.clip_schedule, training_progress)
         adv_b = advantages.detach().to(dtype=new_logp.dtype, device=new_logp.device).reshape(-1, 1).expand_as(new_logp)
-        loss_per_elem, ratio_metrics = _grpo_clip_loss(
+        loss_per_elem, ratio_metrics = grpo_clip_loss(
             new_logp=old_logp + log_r_hat, old_logp=old_logp, advantages=adv_b, clip_range=clip_range
         )
         if self.grad_reweight:

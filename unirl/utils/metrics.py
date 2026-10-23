@@ -1,12 +1,12 @@
 """Reduce numeric metrics, preserving additive policy entropy statistics."""
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Mapping, Sequence
 
 import torch
 
 
-def aggregate_numeric_metrics(metrics_list: List[Dict[str, Any]]) -> Dict[str, float]:
-    """Average numeric keys; sum entropy statistics before computing their token-weighted mean."""
+def aggregate_numeric_metrics(metrics_list: Sequence[Mapping[str, Any]]) -> Dict[str, float]:
+    """Average numeric keys and sum entropy statistics before their token-weighted mean."""
     aggregated: Dict[str, float] = {}
     if not metrics_list:
         return aggregated
