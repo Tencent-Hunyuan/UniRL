@@ -185,7 +185,7 @@ class TrainStack(BaseTrainStack):
             has_backward=has_backward,
             micros=micro_results,
             metrics=aggregated_metrics,
-            optimizer_updates=1 if has_backward and math.isfinite(grad_norm) else 0,
+            optimizer_updates=1 if do_optimizer_step and window_backward and math.isfinite(grad_norm) else 0,
         )
 
     def _all_reduce_sums(self, values: List[float]) -> List[float]:

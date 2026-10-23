@@ -1,17 +1,21 @@
 import importlib
 import importlib.util
 import inspect
+import json
 import logging
 import math
 import time
 from contextlib import contextmanager, nullcontext
+from pathlib import Path
 from typing import Dict, Iterator, Optional, Set, Tuple
 
 import torch
 from hydra.utils import get_class, get_object, instantiate
 from omegaconf import DictConfig
 
+from unirl.algorithms.ar_multi_teacher_opd import ARMultiTeacherOPD
 from unirl.config.validation import validate_memory_saver_contract
+from unirl.data.data_source import MultiDomainRLDataSource
 from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.group.results import rank_zero_bool
 from unirl.distributed.tensor import hydrate
@@ -22,6 +26,7 @@ from unirl.trainer.rollout_sleep import must_preserve_rollout_weights
 from unirl.types.sample import Sample
 from unirl.types.sampling import BaseSamplingParams, total_samples_per_prompt
 from unirl.utils.graceful_shutdown import run_with_timeout
+from unirl.utils.wandb_metrics import pooled_window_reward_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +91,7 @@ class ARTrainer(BaseTrainer):
         eval_temperature: float = 1.0,
         rollout_anchor_device: Optional[int] = None,
         enable_fsdp_offload: bool = True,
+        accumulate_rollouts: int = 1,
     ) -> None:
         self._allowed_input_primitives = ar_preflight(
             pipeline_cfg=pipeline_cfg,
@@ -98,6 +104,43 @@ class ARTrainer(BaseTrainer):
         # misconfigured recipe fails fast without a half-constructed device pool or actors.
         algorithm_cls = get_class(algorithm_cfg["_target_"])
         self._algorithm_requires_advantages = algorithm_cls.requires_advantages
+        if isinstance(accumulate_rollouts, bool) or not isinstance(accumulate_rollouts, int) or accumulate_rollouts < 1:
+            raise ValueError("accumulate_rollouts must be an integer >= 1.")
+        self.accumulate_rollouts = accumulate_rollouts
+        self._teacher_cycle = None
+        if issubclass(algorithm_cls, ARMultiTeacherOPD):
+            teachers = algorithm_cfg["teachers"]
+            if not issubclass(get_class(data_source_cfg["_target_"]), MultiDomainRLDataSource):
+                raise ValueError("ARMultiTeacherOPD requires MultiDomainRLDataSource.")
+            domains = [entry["name"] for entry in data_source_cfg.args.run.domains]
+            if len(domains) != len(teachers) or set(domains) != set(teachers):
+                raise ValueError("Data-source domains must match algorithm.teachers exactly.")
+            if accumulate_rollouts != len(domains):
+                raise ValueError("accumulate_rollouts must equal the number of teacher domains.")
+            frozen = {entry["name"] for entry in backend_cfg.get("lora_cfg", {}).get("frozen_adapters", [])}
+            if not set(teachers.values()) <= frozen:
+                raise ValueError("Every teacher must be declared in backend.lora_cfg.frozen_adapters.")
+            if data_source_cfg.args.run.get("seed") is None or rollout_cfg.get("seed") is None:
+                raise ValueError("Multi-teacher resume requires data-source and rollout seeds.")
+            if algorithm_cfg["sampling_temperature"] != sampling_cfg["temperature"]:
+                raise ValueError("Teacher replay and student sampling temperatures must match.")
+            self._teacher_cycle = {
+                "teachers": dict(teachers),
+                "domains": domains,
+                "data_seed": data_source_cfg.args.run.seed,
+                "rollout_seed": rollout_cfg.seed,
+                "batch_size": batch_size,
+                "num_devices": cfg.num_devices,
+            }
+        elif accumulate_rollouts != 1:
+            raise ValueError("AR accumulation currently requires ARMultiTeacherOPD.")
+        if accumulate_rollouts > 1:
+            if stack_cfg.get("num_updates_per_batch", 1) != 1:
+                raise ValueError("AR accumulation requires stack.num_updates_per_batch=1.")
+            if eval_interval > 0 and eval_interval % accumulate_rollouts:
+                raise ValueError("eval_interval must align with a complete teacher cycle.")
+            if cfg.get("transport_kind", "colocate_store") in ("transfer_queue", "tq"):
+                raise ValueError("AR accumulation does not support transfer_queue transport.")
         if reward_cfg is None:
             if self._algorithm_requires_advantages:
                 raise ValueError(
@@ -127,6 +170,8 @@ class ARTrainer(BaseTrainer):
                 raise ValueError(
                     "ARTrainer: trainside direct-sampling engine reads the live training weights and cannot use a `sync:` block."
                 )
+        elif accumulate_rollouts > 1:
+            raise ValueError("AR multi-teacher accumulation currently requires trainside rollout.")
         elif sync_cfg is None:
             raise ValueError("ARTrainer: dedicated rollout engine requires a `sync:` block.")
         if self._rollout_anchor_device is not None and self._rollout_anchor_device <= 0:
@@ -431,17 +476,15 @@ class ARTrainer(BaseTrainer):
         )
         return request.fork(total_samples_per_prompt(sp), sampling_params=sp["ar"])
 
-    def train_step(
+    def _rollout_and_score(
         self,
         sample: Sample,
         *,
-        training_progress: float = 0.0,
         sync_weights: bool = False,
         rollout_id: int = 0,
         preserve_rollout_weights: bool = False,
-    ) -> Tuple[TrainStepResult, float]:
-        """One ``rollout → reward → advantage → optimizer step`` pass."""
-        t0 = time.perf_counter()
+    ) -> Tuple[Sample, float]:
+        """Generate one rollout and attach reward, advantages and domain metadata."""
         anchored = self._rollout_anchor_device is not None
         if not anchored:
             train_state_offloaded = self._prepare_rollout(sync_weights=sync_weights)
@@ -483,28 +526,67 @@ class ARTrainer(BaseTrainer):
 
         self._dump_rollout_samples(sample, rollout_id)
         self._drop_decoded(sample, rollout_id=rollout_id)
-        train_part = sample.parts[-1]
-        if self.balance_shards:
-            train_part = train_part.balance_shards(int(self.num_devices))
+        return sample, mean_reward
+
+    def train_step(
+        self,
+        sample: Sample | Tuple[Sample, ...],
+        *,
+        training_progress: float = 0.0,
+        sync_weights: bool = False,
+        rollout_id: int = 0,
+        preserve_rollout_weights: bool = False,
+    ) -> Tuple[TrainStepResult, float]:
+        """Collect one teacher cycle and apply one optimizer update."""
+        t0 = time.perf_counter()
+        requests = sample if isinstance(sample, tuple) else (sample,)
+        if len(requests) != self.accumulate_rollouts:
+            raise ValueError("train_step requires one complete accumulation window.")
+        if len(requests) > 1:
+            domains = [{row.get("domain") for row in request.parts[0].metadata} for request in requests]
+            expected = {domain["name"] for domain in self.data_source.domains}
+            if any(len(domain) != 1 for domain in domains) or {next(iter(domain)) for domain in domains} != expected:
+                raise ValueError("Each teacher cycle must contain exactly one rollout per domain.")
+        samples = []
+        rewards = []
+        for index, request in enumerate(requests):
+            generated, mean_reward = self._rollout_and_score(
+                request,
+                sync_weights=sync_weights and index == 0,
+                rollout_id=rollout_id + index,
+                preserve_rollout_weights=preserve_rollout_weights,
+            )
+            samples.append(generated)
+            rewards.append(mean_reward)
+        parts = tuple(
+            generated.parts[-1].balance_shards(int(self.num_devices)) if self.balance_shards else generated.parts[-1]
+            for generated in samples
+        )
+        anchored = self._rollout_anchor_device is not None
         if anchored:
             self._ensure_anchored_backend_loaded()
         try:
             result = self.stack.train_track(
-                train_part,
+                parts if len(parts) > 1 else parts[0],
                 training_progress=float(training_progress),
-                rollout_id=rollout_id,
+                rollout_id=rollout_id + len(requests) - 1,
             )
         finally:
             if anchored:
                 self._ensure_anchored_backend_offloaded()
         self.wandb_logger.log_rollout_step(
-            rollout_id,
+            rollout_id + len(requests) - 1,
             result,
-            sample,
+            samples[-1],
             step_time_s=time.perf_counter() - t0,
             trunc_len=self.sampling_params["ar"].max_new_tokens,
+            extra_metrics=(
+                pooled_window_reward_metrics(parts, trunc_len=self.sampling_params["ar"].max_new_tokens)
+                if len(parts) > 1
+                else None
+            ),
         )
-        return result, mean_reward
+        return result, sum(rewards) / len(rewards)
 
     def evaluate(self, rollout_id: int, *, preserve_rollout_weights: bool = False) -> float:
         """Periodic eval — ``avg@k`` accuracy on the eval prompt set."""
@@ -681,8 +763,20 @@ class ARTrainer(BaseTrainer):
         save_mode: str = "auto",
     ) -> None:
         """Minimal training loop: ``num_rollouts`` iterations of ``train_step``."""
+        num_rollouts = int(num_rollouts)
+        save_interval = int(save_interval)
+        acc = self.accumulate_rollouts
+        if num_rollouts % acc or (save_interval > 0 and save_interval % acc):
+            raise ValueError("num_rollouts and save_interval must align with complete teacher cycles.")
         interval = max(1, weight_sync_interval)
+        if load_dir and self._teacher_cycle is not None:
+            with (Path(load_dir) / "ar_teacher_cycle.json").open() as stream:
+                saved_cycle = json.load(stream)
+            if saved_cycle != self._teacher_cycle:
+                raise ValueError("The checkpoint's teacher mapping, domain order, seeds or batch topology changed.")
         start_rollout = self.maybe_load_checkpoint(load_dir, num_rollouts=num_rollouts)
+        if start_rollout % acc:
+            raise ValueError("The checkpoint ends inside an incomplete teacher cycle.")
         resumed = bool(load_dir)
         for _ in range(start_rollout):
             self.data_source.get_samples(self.batch_size)
@@ -700,14 +794,17 @@ class ARTrainer(BaseTrainer):
                         next_phase_syncs=first_rollout_syncs,
                     ),
                 )
-            for rollout_id in range(start_rollout, num_rollouts):
-                training_progress = rollout_id / max(1, num_rollouts - 1)
-                inputs = self.data_source.get_samples(self.batch_size)
-                sample = self._build_request_sample(inputs, rollout_id)
+            for rollout_id in range(start_rollout, num_rollouts, acc):
+                final_id = rollout_id + acc - 1
+                training_progress = final_id / max(1, num_rollouts - 1)
+                samples = tuple(
+                    self._build_request_sample(self.data_source.get_samples(self.batch_size), index)
+                    for index in range(rollout_id, final_id + 1)
+                )
                 sync_weights = (rollout_id > 0 and rollout_id % interval == 0) or (
                     resumed and rollout_id == start_rollout
                 )
-                next_rollout_id = rollout_id + 1
+                next_rollout_id = final_id + 1
                 periodic_eval_follows = self.eval_interval > 0 and next_rollout_id % self.eval_interval == 0
                 next_rollout_syncs = next_rollout_id < num_rollouts and next_rollout_id % interval == 0
                 preserve_rollout_weights = self._must_preserve_rollout_weights(
@@ -715,25 +812,33 @@ class ARTrainer(BaseTrainer):
                     next_phase_syncs=periodic_eval_follows or next_rollout_syncs,
                 )
                 result, mean_reward = self.train_step(
-                    sample,
+                    samples if acc > 1 else samples[0],
                     training_progress=training_progress,
                     sync_weights=sync_weights,
                     rollout_id=rollout_id,
                     preserve_rollout_weights=preserve_rollout_weights,
                 )
-                self.wandb_logger.log_progress(rollout_id, num_rollouts, result, mean_reward, logger=logger)
-                if self.eval_interval > 0 and (rollout_id + 1) % self.eval_interval == 0:
+                self.wandb_logger.log_progress(final_id, num_rollouts, result, mean_reward, logger=logger)
+                if self.eval_interval > 0 and next_rollout_id % self.eval_interval == 0:
                     next_rollout_syncs = next_rollout_id < num_rollouts and next_rollout_id % interval == 0
                     self.evaluate(
-                        rollout_id=rollout_id,
+                        rollout_id=final_id,
                         preserve_rollout_weights=self._must_preserve_rollout_weights(
                             has_next_phase=next_rollout_id < num_rollouts,
                             next_phase_syncs=next_rollout_syncs,
                         ),
                     )
                 self.maybe_save_checkpoint(
-                    rollout_id, num_rollouts, save_interval=save_interval, save_dir=save_dir, save_mode=save_mode
+                    final_id, num_rollouts, save_interval=save_interval, save_dir=save_dir, save_mode=save_mode
                 )
+                if self._teacher_cycle is not None and save_interval > 0:
+                    if next_rollout_id % save_interval == 0 or next_rollout_id == num_rollouts:
+                        path = (
+                            Path(save_dir or "checkpoints") / f"checkpoint-{next_rollout_id}" / "ar_teacher_cycle.json"
+                        )
+                        temporary = path.with_suffix(".json.tmp")
+                        temporary.write_text(json.dumps(self._teacher_cycle))
+                        temporary.replace(path)
         finally:
             try:
                 self._finish_wandb()
