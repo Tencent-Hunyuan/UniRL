@@ -1,0 +1,11 @@
+# @package _global_
+defaults:
+  - minimax_h3_t2va_trainside
+  - _self_
+
+bundle:
+  config:
+    full_finetune_blocks: true
+
+backend:
+  lora_cfg: null
