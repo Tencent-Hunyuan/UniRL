@@ -1,0 +1,18 @@
+# @package _global_
+defaults:
+  - deep_research_search_judge
+  - _self_
+
+train_fraction: 0.5
+rollout_window_size: 2
+worker_max_concurrency: null
+per_worker_inflight: 8
+
+sync:
+  _target_: unirl.distributed.weight_sync.full.nccl.NCCLWeightSync
+
+rollout:
+  config:
+    inner:
+      enable_memory_saver: false
+      enable_weights_cpu_backup: false

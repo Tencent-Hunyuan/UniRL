@@ -65,9 +65,17 @@ valid terminal answers through its configured `RewardService`.
 On manager `quiesce`, dispatch pauses and each in-flight turn finishes. A
 nonterminal trajectory is checkpointed before its next turn, so generation is
 never interrupted mid-turn. The manager returns retained queued or suspended
-tasks according to its root filter. The public `AgenticTrainer` does not resume
-these across optimizer steps: normal steps block until every requested group is
-complete, and failure cleanup quiesces and discards unfinished work.
+tasks according to its root filter. `AgenticTrainer` defaults to one complete batch
+per update. Set `rollout_window_size: 2` to admit two batches, train the first completed
+batch of sibling groups, and resume unfinished trajectories after publishing updated
+weights. Larger windows allow more carry; each window drains before admitting the next.
+Checkpoint and final boundaries shorten the window so unfinished work is never saved.
+
+Resumption skips `Environment.reset` and starts after the stored observation. Already
+executed tools are not replayed. Environments must advertise `supports_turn_resumption`
+only when all continuation state lives in the Sample and `close` does not invalidate it.
+`ToolEnvironment` supports this only without `StatefulTool` instances. Worker-local
+sessions and crash recovery are not supported by this mode.
 
 ## Included environments and tools
 
@@ -108,3 +116,17 @@ The included tools are:
 
 The runnable agentic configuration is
 [`examples/deep_research/deep_research_search_judge.yaml`](../../../examples/deep_research/deep_research_search_judge.yaml).
+
+## Gotchas
+
+- Partial rollout currently requires GRPO with `old_logp_source: rollout` and cache
+  flushing on weight publication. Each turn retains its original tokens, conditioning,
+  behavior log-probs, and `Part.output_version`. Training rows store that version in
+  `metadata["behavior_version"]`; their shared `output_version` is cleared because a
+  training batch may mix versions. Row selection and padding preserve this metadata.
+- The rollout window bounds how many training batches can occur before a trajectory
+  completes. It changes completion order and permits off-policy data; it does not
+  promise training-quality or throughput improvements. Monitor `agent/max_behavior_lag`
+  and `agent/mixed_version_trajectories`. The default window of one keeps the barrier path.
+- Suspension waits for the current generation and tool call to finish. This is turn-level
+  continuation, not token-level interruption or an exactly-once guarantee after a crash.

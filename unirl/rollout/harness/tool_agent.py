@@ -28,7 +28,11 @@ class ToolAgentHarness:
     def run(self, request: "Sample", context: HarnessContext) -> HarnessOutcome:
         sample = request
         try:
-            sample = self.env.reset(request)
+            if request.parts and request.parts[-1].harness_status == "suspended":
+                if not getattr(self.env, "supports_turn_resumption", False):
+                    raise ValueError("environment does not support turn resumption")
+            else:
+                sample = self.env.reset(request)
             turns_done = len(sample.gen_parts())
             for _ in range(self.max_turns - turns_done):
                 if context.suspend_requested():

@@ -50,6 +50,20 @@ def resolve_separate_worker_concurrency(
     return train_devices, worker_concurrency
 
 
+def connect_separate_rollout(weight_sync, rollout) -> None:
+    """Connect the training sender to the rollout slab's NCCL receivers."""
+    addr, port = weight_sync.pick_master()[0]
+    targets = rollout.tp_zero_workers
+    weight_sync.set_rollout_targets(targets, rollout.role_name)
+    weight_sync.connect(
+        master_addr=addr,
+        master_port=port,
+        num_rollout_gpus=len(targets) * rollout.tp_size,
+        tp_size=rollout.tp_size,
+        pp_size=rollout.pp_size,
+    )
+
+
 class AsyncRolloutTrainerMixin:
     """One async batch loop shared by ``AsyncARTrainer`` and ``AsyncDiffusionTrainer``."""
 
@@ -309,5 +323,6 @@ class AsyncRolloutTrainerMixin:
 
 __all__ = [
     "AsyncRolloutTrainerMixin",
+    "connect_separate_rollout",
     "resolve_separate_worker_concurrency",
 ]
