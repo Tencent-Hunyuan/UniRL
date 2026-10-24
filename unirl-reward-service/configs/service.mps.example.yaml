@@ -1,0 +1,40 @@
+server:
+  host: 0.0.0.0
+  port: 8080
+  score_timeout_s: 120
+
+# Any reward with an `mps:` block causes the single-node service to start and
+# manage a local CUDA MPS daemon before initializing Ray. To compare non-MPS
+# fractional sharing or dedicated GPUs, omit the `mps:` blocks (and set
+# `num_gpus: 1` for dedicated).
+rewards:
+  - name: clip
+    scorer: clip
+    runtime_env: envs/clip.txt
+    num_replicas: 1
+    num_gpus: 0.5
+    num_cpus: 2
+    max_concurrency: 4
+    mps:
+      # On H20 with driver 535, keep 100% for float16/bfloat16 scorers.
+      active_thread_percentage: 100
+      device_memory_limit: 20GiB
+    params:
+      model_name: openai/clip-vit-large-patch14
+      weights_path: /path/to/RewardModel/CLIP-ViT-L-14
+      dtype: float16
+
+  - name: pickscore
+    scorer: pickscore
+    runtime_env: envs/pickscore.txt
+    num_replicas: 1
+    num_gpus: 0.5
+    num_cpus: 2
+    max_concurrency: 4
+    mps:
+      active_thread_percentage: 100
+      device_memory_limit: 20GiB
+    params:
+      model_name: yuvalkirstain/PickScore_v1
+      weights_path: /path/to/RewardModel/PickScore_v1
+      dtype: float16

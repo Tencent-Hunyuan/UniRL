@@ -102,6 +102,13 @@ layout is a `placement(…)` wiring in the trainer (`trainer/diffusion.py`).
   differs. So a per-rollout field that happens to share the batch's leading dim is
   silently sliced across ranks (corrupting it); wrap it in `Broadcast(...)` to opt out.
   Neither case raises.
+- **`Batch.concat` rejects shards that disagree.** `SHARED` fields must be equal
+  across items (a `TensorRef` compares by shape and dtype only), a `TensorRef` in a
+  `CONCAT` field must have one row per sample, and a `CONCAT`/`PACKED` field may be `None` only in zero-row items.
+  A shared mismatch names the first differing path and values, e.g.
+  `Part.sampling_params.sde_indices[1]: 1 != 2`. A producer that drops a condition key
+  when its call has no such media breaks DP merge; emit the key with a `None` per row
+  instead.
 - **`transport_kind` is a cluster-wide choice.** `colocate_store` assumes one worker
   per GPU; multi-slot colocate needs `gpu_store`; cross-node production wants
   `transfer_queue: mooncake` (RDMA).

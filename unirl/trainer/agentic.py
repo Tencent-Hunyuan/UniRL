@@ -19,7 +19,6 @@ from unirl.rollout.manager import RolloutManager, required_worker_concurrency, v
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.async_rollout import (
     connect_separate_rollout,
-    next_hard_boundary,
     resolve_separate_worker_concurrency,
 )
 from unirl.trainer.base import (
@@ -88,17 +87,16 @@ class AgenticTrainer(BaseTrainer):
                 raise ValueError("partial agentic rollout requires old_logp_source=rollout")
             if sync_cfg is not None and not sync_cfg.get("flush_cache", True):
                 raise ValueError("partial agentic rollout requires sync.flush_cache=true")
-        per_worker_inflight = int(per_worker_inflight)
         configured_concurrency = cfg.get("worker_max_concurrency")
         worker_max_concurrency = (
             required_worker_concurrency(per_worker_inflight)
             if configured_concurrency is None
-            else int(configured_concurrency)
+            else configured_concurrency
         )
-        train_devices = int(cfg.num_devices)
+        train_devices = cfg.num_devices
         if train_fraction is not None:
             train_devices, worker_max_concurrency = resolve_separate_worker_concurrency(
-                num_devices=int(cfg.num_devices),
+                num_devices=cfg.num_devices,
                 train_fraction=train_fraction,
                 per_worker_inflight=per_worker_inflight,
                 configured_concurrency=configured_concurrency,
@@ -125,7 +123,7 @@ class AgenticTrainer(BaseTrainer):
             self._train_fraction = train_fraction
             self._rollout_window_size = rollout_window_size
             self._carried: List[Sample] = []
-            self.batch_size = int(batch_size)
+            self.batch_size = batch_size
             self.data_source = instantiate(data_source_cfg)
             self.sampling_params: Dict[str, BaseSamplingParams] = build_sampling_dict(sampling_cfg)
             self._group_size = total_samples_per_prompt(self.sampling_params)
@@ -181,7 +179,7 @@ class AgenticTrainer(BaseTrainer):
         train_devices: int,
         separate: bool,
     ) -> None:
-        if int(batch_size) <= 0:
+        if batch_size <= 0:
             raise ValueError(f"batch_size must be positive; got {batch_size}")
         validate_worker_inflight(
             per_worker_inflight,
@@ -191,28 +189,31 @@ class AgenticTrainer(BaseTrainer):
             engine_concurrency=None,
         )
         sync_name = "NCCLWeightSync" if separate else "TensorWeightSync"
-        if sync_cfg is None or not str(sync_cfg.get("_target_", "")).endswith(sync_name):
+        if sync_cfg is None:
             raise ValueError(f"AgenticTrainer requires {sync_name} for the selected placement")
+        sync_target = sync_cfg["_target_"]
+        if not sync_target.endswith(sync_name):
+            raise ValueError(f"AgenticTrainer requires {sync_name}; got {sync_target!r}")
         if not separate:
             validate_memory_saver_contract(rollout_cfg, strict=True)
 
         episode = rollout_cfg.get("config", {}).get("episode_sampling")
         if episode is None:
             raise ValueError("rollout.config.episode_sampling is required")
-        group_size = int(sampling_cfg.get("samples_per_prompt", 1))
-        episode_group_size = int(episode.get("samples_per_prompt", 1))
+        group_size = sampling_cfg.get("samples_per_prompt", 1)
+        episode_group_size = episode.get("samples_per_prompt", 1)
         if group_size != episode_group_size:
             raise ValueError(
                 "sampling.samples_per_prompt must equal rollout.config.episode_sampling.samples_per_prompt"
             )
-        sampling_temperature = float(sampling_cfg.get("temperature", 1.0))
-        episode_temperature = float(episode.get("temperature", 1.0))
-        algorithm_temperature = float(algorithm_cfg.get("sampling_temperature", 1.0))
+        sampling_temperature = sampling_cfg.get("temperature", 1.0)
+        episode_temperature = episode.get("temperature", 1.0)
+        algorithm_temperature = algorithm_cfg.get("sampling_temperature", 1.0)
         if abs(sampling_temperature - episode_temperature) > 1e-9:
             raise ValueError("sampling.temperature must equal rollout episode temperature")
         if abs(sampling_temperature - algorithm_temperature) > 1e-9:
             raise ValueError("sampling.temperature must equal algorithm.sampling_temperature")
-        if (int(batch_size) * group_size) % train_devices != 0:
+        if (batch_size * group_size) % train_devices != 0:
             raise ValueError("batch_size*samples_per_prompt must be divisible by the number of training devices")
 
     def _build_colocated_rollout(self, rollout_cfg: DictConfig, sync_cfg: DictConfig) -> None:
@@ -311,14 +312,14 @@ class AgenticTrainer(BaseTrainer):
             answers.append((metadata or {}).get("answer"))
 
         score_count = len(valid_indices)
-        reward_dp_size = max(1, int(self.reward.dp_size))
+        reward_dp_size = self.reward.dp_size
         score_padding = (-score_count) % reward_dp_size
         if score_padding:
             questions.extend([questions[0]] * score_padding)
             predictions.extend([predictions[0]] * score_padding)
             answers.extend([answers[0]] * score_padding)
 
-        ar_sampling = self.sampling_params.get("ar")
+        ar_sampling = self.sampling_params["ar"]
         score_input = Part.input(
             [f"score{rollout_id}:{i}" for i in valid_indices]
             + [f"score{rollout_id}:padding{i}" for i in range(score_padding)],
@@ -408,6 +409,7 @@ class AgenticTrainer(BaseTrainer):
                     torch.full((generated.batch_size,), advantage, dtype=torch.float32),
                 )
                 generated = _part_with_field(generated, "primitive_metadata", {})
+                generated = _part_with_field(generated, "harness_status", None)
                 generated = _part_with_field(generated, "media_preview", None)
                 generated = _part_with_field(generated, "primitives", {})
                 generated = _part_with_field(generated, "rewards", None)
@@ -433,7 +435,7 @@ class AgenticTrainer(BaseTrainer):
                 training_progress=float(training_progress),
                 rollout_id=rollout_id,
             )
-            train_rows = int(train_part.batch_size)
+            train_rows = train_part.batch_size
         else:
             result = TrainStepResult(0.0, 0.0, 0.0, False, [], {}, optimizer_updates=0)
             train_rows = 0
@@ -481,7 +483,7 @@ class AgenticTrainer(BaseTrainer):
         if count == 0:
             return Sample(parts=[])
 
-        ar_sampling = self.sampling_params.get("ar")
+        ar_sampling = self.sampling_params["ar"]
         root = Part.input(
             [f"log{rollout_id}:{i}" for i in range(count)],
             primitives={"text": Texts(texts=[""] * count)},
@@ -496,8 +498,8 @@ class AgenticTrainer(BaseTrainer):
         return sample.with_parts([*sample.parts[:-1], frontier])
 
     def _pad_to_dp_multiple(self, part: Part) -> Part:
-        dp_size = int(getattr(self.stack, "dp_size", self.num_devices))
-        pad = (-int(part.batch_size)) % dp_size
+        dp_size = self.stack.dp_size
+        pad = (-part.batch_size) % dp_size
         if pad == 0:
             return part
         lengths = part.segment.lengths if part.segment is not None else None
@@ -541,10 +543,10 @@ class AgenticTrainer(BaseTrainer):
                 else:
                     t0 = time.perf_counter()
                     if rollout_id == window_end:
-                        window_end = min(
-                            rollout_id + self._rollout_window_size,
-                            next_hard_boundary(rollout_id, num_rollouts=num_rollouts, save_interval=save_interval),
-                        )
+                        window_end = min(rollout_id + self._rollout_window_size, num_rollouts)
+                        if save_interval > 0:
+                            next_save = ((rollout_id // save_interval) + 1) * save_interval
+                            window_end = min(window_end, next_save)
                     requests = [
                         self._build_request_sample(self.data_source.get_samples(self.batch_size), generation_id)
                         for generation_id in range(next_generation, window_end)

@@ -63,9 +63,9 @@ class WAN21ImageLatentEncodeStage(EncodeStage[Images, ImageLatentCondition]):
         vae = self.bundle.vae
 
         batch_size = len(pixels_list)
-        target_h = int(self.height)
-        target_w = int(self.width)
-        num_frames = int(self.num_frames)
+        target_h = self.height
+        target_w = self.width
+        num_frames = self.num_frames
         latent_h = target_h // _SPATIAL_DOWNSAMPLE
         latent_w = target_w // _SPATIAL_DOWNSAMPLE
         latent_t = (num_frames - 1) // _TEMPORAL_DOWNSAMPLE + 1

@@ -56,6 +56,7 @@ bundle:
     model_precision: bf16
     attention_backend: flash_varlen
     shift: 5.0
+    load_text_encoder: false
     load_vae: false
 
 pipeline:
@@ -64,6 +65,7 @@ pipeline:
   autocast_precision: bf16
   trajectory_precision: bf16
   logprob_precision: fp32
+  batch_replay_steps: true
   strategy:
     _target_: unirl.sde.kernels.FlowSDEStrategy
 

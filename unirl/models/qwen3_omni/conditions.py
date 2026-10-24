@@ -42,7 +42,7 @@ class Qwen3OmniARConditions(Batch):
 
     def __post_init__(self) -> None:
         lengths: Dict[str, int] = {}
-        if self.prompt is not None and getattr(self.prompt, "input_ids", None) is not None:
+        if self.prompt is not None and self.prompt.input_ids is not None:
             lengths["prompt"] = int(self.prompt.input_ids.shape[0])
         for name in _LIST_FIELDS:
             value = getattr(self, name)

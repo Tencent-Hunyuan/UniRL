@@ -36,7 +36,7 @@ class Worker:
         self.slot = slot
         self.nccl_rank = nccl_rank
         self.world_size = world_size
-        self.transport_kind = transport_kind or "colocate_store"
+        self.transport_kind = transport_kind
 
         if torch.cuda.is_available():
             torch.cuda.set_device(0)
@@ -60,45 +60,22 @@ class Worker:
         if self.transport_kind in ("colocate_store", "colocate", "transfer_queue", "tq"):
             self.build_and_install_transport()
 
-    def _init_local(self, device_id: int = 0, slot: int = 0, transport=None) -> None:
-        """Initialize without GPU/Ray for unit testing."""
-        self.device_id = device_id
-        self.slot = slot
-        self.device = "cpu"
-        self.nccl_rank = 0
-        self.world_size = 1
-        self.transport_kind = "colocate_store"
-        self.worker_id = f"dw{device_id}" if slot == 0 else f"dw{device_id}_s{slot}"
-        self.tw = None
-        self.tq_handoff = None
-        self._roles = {}
-        self._reserved_sockets = {}
-        if transport is None:
-            self.build_and_install_transport()
-        else:
-            self._install_transport(transport)
-
     def set_tensor_worker(self, tw_handle) -> None:
         """Inject the per-GPU TensorWorker actor handle (gpu backend). Called by DevicePool."""
         self.tw = tw_handle
 
-    def build_and_install_transport(self):
+    def build_and_install_transport(self) -> None:
         """Build the configured transport and install it as the process backend."""
-        self._install_transport(
-            build_transport(
-                self.transport_kind,
-                worker_id=self.worker_id,
-                device=self.device,
-                device_id=self.device_id,
-                tw=self.tw,
-                tq_handoff=self.tq_handoff,
-                global_rank=self.nccl_rank,
-                world_size=self.world_size,
-            )
+        transport = build_transport(
+            self.transport_kind,
+            worker_id=self.worker_id,
+            device=self.device,
+            device_id=self.device_id,
+            tw=self.tw,
+            tq_handoff=self.tq_handoff,
+            global_rank=self.nccl_rank,
+            world_size=self.world_size,
         )
-
-    def _install_transport(self, transport: TensorTransport) -> None:
-        """Install the Worker's transport as the process backend."""
         self.transport = transport
         TensorTransportRuntime.install(transport)
 
@@ -125,11 +102,9 @@ class Worker:
         if s:
             s.close()
 
-    def add_remote(
-        self, role_name: str, role_cls, rank_info: RankInfo, init_kwargs: dict = None, dist_env: dict = None
-    ) -> None:
+    def add_remote(self, role_name: str, role_cls, rank_info: RankInfo, init_kwargs: dict, dist_env: dict) -> None:
         """Register a logical worker role on this device."""
-        resolved_kwargs = self._resolve_init_kwargs(init_kwargs or {})
+        resolved_kwargs = self._resolve_init_kwargs(init_kwargs)
         role = role_cls(**resolved_kwargs)
         role.setup(
             transport=self.transport,
@@ -178,7 +153,8 @@ class Worker:
 
         in_metas = self._collect(args, TensorRef) + self._collect(kwargs, TensorRef)
         fetched = self.transport.get_batch({str(i): m for i, m in enumerate(in_metas)})
-        in_iter = iter(fetched[str(i)] for i in range(len(in_metas)))
+        in_tensors = [fetched[str(i)] for i in range(len(in_metas))]
+        in_iter = iter(in_tensors)
 
         def resolve(o):
             return next(in_iter) if isinstance(o, TensorRef) else o
@@ -187,11 +163,10 @@ class Worker:
         resolved_kwargs = map_tree(kwargs, resolve)
 
         if grad_mode:
-            tensors = [fetched[str(i)] for i in range(len(in_metas))]
-            for t in tensors:
+            for t in in_tensors:
                 t.requires_grad_(True)
                 t.retain_grad()
-            role._grad_inputs[call_id] = tensors
+            role._grad_inputs[call_id] = in_tensors
 
         result = getattr(role, method_name)(*resolved_args, **resolved_kwargs)
 
@@ -221,7 +196,7 @@ class Worker:
 
     def transport_op(self, method: str, *args, **kwargs):
         """Relay a controller-side call into this Worker's transport."""
-        allowed = getattr(type(self.transport), "REMOTE_OPS", frozenset())
+        allowed = getattr(self.transport, "REMOTE_OPS", ())
         if method not in allowed:
             raise AttributeError(f"transport_op: {method!r} is not a remote-callable transport op")
         return getattr(self.transport, method)(*args, **kwargs)
@@ -232,18 +207,17 @@ class Worker:
 
     def teardown(self) -> None:
         """Release everything this actor owns. Idempotent, best effort."""
-        for role_name, role in reversed(list(getattr(self, "_roles", {}).items())):
-            closer = getattr(role, "shutdown", None) or getattr(role, "close", None)
+        for role_name, role in reversed(list(self._roles.items())):
+            closer = getattr(role, "shutdown", None)
             if not callable(closer):
                 continue
             try:
                 closer()
             except Exception:
                 logger.exception("Role %s failed to shut down on worker %s", role_name, self.worker_id)
-        if hasattr(self, "_roles"):
-            self._roles.clear()
+        self._roles.clear()
 
-        for port in list(getattr(self, "_reserved_sockets", {})):
+        for port in list(self._reserved_sockets):
             self._release_port(port)
 
     def get_gpu_count(self) -> int:
