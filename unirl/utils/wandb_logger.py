@@ -542,7 +542,10 @@ class UniRLWandBLogger:
                     if not preview.images and not preview.videos and preview.audio_sample_rate is not None:
                         payload = {
                             f"{phase}/{track}/generated_audio": [
-                                wandb.Audio(audio.numpy(), sample_rate=preview.audio_sample_rate)
+                                wandb.Audio(
+                                    audio.T.numpy() if audio.ndim == 2 and audio.shape[0] in (1, 2) else audio.numpy(),
+                                    sample_rate=preview.audio_sample_rate,
+                                )
                                 for audio in preview.audios
                             ],
                             step_key: step,
