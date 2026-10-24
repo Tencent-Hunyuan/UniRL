@@ -1,0 +1,33 @@
+# @package _global_
+# TempFlow-GRPO SD3.5-M (#551): sd3_trainside with per-step trajectory branching.
+# Sampling follows the official pickscore_sd3_pr: 10 steps, CFG 4.5, eta 0.7, 4 seeds x 6
+# branches = 24 rows per prompt and branch step, per-prompt std, branch pool = steps 0..8.
+# Unlike it: beta 0 (no reference KL on the per-sample path yet) and no EMA.
+# branch_steps_per_rollout: 3 trains a rotating third of the pool per rollout (72 rows per
+# prompt instead of 216); set it to null for the official every-step branching.
+#
+#   1x8:  bash examples/run_experiment_single_node.sh diffusion/sd3/sd3_tempflowgrpo
+
+defaults:
+  - sd3_trainside
+  - _self_
+
+batch_size: 16
+adv_use_global_std: false
+
+algorithm:
+  _target_: unirl.algorithms.tempflowgrpo.TempFlowGRPO
+  branches_per_seed: 6
+  advantage_group: prompt
+  branch_steps_per_rollout: 3
+  weight_scale: 2.25
+
+sampling:
+  guidance_scale: 4.5
+  samples_per_prompt: 24
+  scheduler:
+    num_sde_steps: null
+    timestep_fraction: [0, 0.99]
+
+logging:
+  tags: [sd3, tempflowgrpo, trainside]

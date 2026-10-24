@@ -9,6 +9,7 @@ import torch
 
 from unirl.models.types.batched_replay import BatchedStepReplayMixin
 from unirl.models.types.diffusion import DiffusionStage, DiffusionStep
+from unirl.models.types.per_sample_replay import PerSampleStepReplayMixin
 from unirl.models.types.replay_result import ReplayResult
 from unirl.sde.kernels import StepStrategy
 from unirl.types.sampling import DiffusionSamplingParams, compute_trajectory_positions
@@ -178,7 +179,7 @@ class SD3DiffusionStep(DiffusionStep[SD3Bundle, SD3Conditions]):
         )
 
 
-class SD3DiffusionStage(BatchedStepReplayMixin, DiffusionStage[SD3Conditions]):
+class SD3DiffusionStage(PerSampleStepReplayMixin, BatchedStepReplayMixin, DiffusionStage[SD3Conditions]):
     """SD3 rollout-level diffusion stage."""
 
     _no_split_modules: ClassVar[Tuple[str, ...]] = ("JointTransformerBlock",)
@@ -325,6 +326,10 @@ class SD3DiffusionStage(BatchedStepReplayMixin, DiffusionStage[SD3Conditions]):
         step_indices: Optional[List[int]] = None,
     ) -> ReplayResult:
         """Log-prob replay: ``log_probs [B, len(target)]``, ``prev_sample_means [B, len(target), C, H, W]``."""
+        if segment.sde_index_per_sample is not None:
+            return self.replay_per_sample(
+                conditions, segment=segment, params=params, device=torch.device(self.model.device)
+            )
         device = torch.device(self.model.device)
         autocast_ctx = (
             torch.autocast("cuda", self.autocast_dtype)
