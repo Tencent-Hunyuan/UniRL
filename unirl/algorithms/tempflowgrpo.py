@@ -71,13 +71,15 @@ class TempFlowGRPO(PerSampleStepGRPO):
             backend=backend,
             conditions_cls=conditions_cls,
         )
-        if int(branches_per_seed) < 1:
-            raise ValueError(f"TempFlowGRPO: branches_per_seed must be >= 1; got {branches_per_seed!r}.")
+        if type(branches_per_seed) is not int or branches_per_seed < 1:
+            raise ValueError(f"TempFlowGRPO: branches_per_seed must be a positive integer; got {branches_per_seed!r}.")
         if advantage_group not in ("prompt", "seed"):
             raise ValueError(f"TempFlowGRPO: advantage_group must be 'prompt' or 'seed'; got {advantage_group!r}.")
-        if branch_steps_per_rollout is not None and int(branch_steps_per_rollout) < 1:
+        if branch_steps_per_rollout is not None and (
+            type(branch_steps_per_rollout) is not int or branch_steps_per_rollout < 1
+        ):
             raise ValueError(
-                f"TempFlowGRPO: branch_steps_per_rollout must be >= 1 or None; got {branch_steps_per_rollout!r}."
+                f"TempFlowGRPO: branch_steps_per_rollout must be a positive integer or None; got {branch_steps_per_rollout!r}."
             )
         self.weight_scale = float(weight_scale)
         if not self.weight_scale > 0.0:

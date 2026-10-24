@@ -810,13 +810,13 @@ class DiffusionTrainer(BaseTrainer):
         if group not in ("prompt", "seed"):
             raise ValueError(f"TempFlowGRPO: advantage_group must be 'prompt' or 'seed'; got {group!r}.")
         samples_per_prompt = total_samples_per_prompt(self.sampling_params)
-        if branches < 1 or samples_per_prompt % branches:
+        if type(branches) is not int or branches < 1 or samples_per_prompt % branches:
             raise ValueError(
                 f"TempFlowGRPO: samples_per_prompt={samples_per_prompt} must be a multiple of "
                 f"branches_per_seed={branches} (seeds x branches per prompt)."
             )
         pool = self._sde_candidate_pool()
-        if steps is not None and not 1 <= steps <= len(pool):
+        if steps is not None and (type(steps) is not int or not 1 <= steps <= len(pool)):
             raise ValueError(f"TempFlowGRPO: branch_steps_per_rollout={steps} must be in [1, {len(pool)}].")
         self._branches_per_seed = branches
         self._branch_steps_per_rollout = steps
