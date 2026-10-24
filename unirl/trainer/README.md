@@ -203,9 +203,13 @@ each async recipe's header comment also carries a small-pool launch line.
 
 ### The shared lifecycle
 
-The **train version** counts optimizer updates, the **published version** is
-the train version the engine serves, and every generated `Part` is stamped with
-the **output version** it was generated under (all logged as `async/*`).
+The **train version** counts committed optimizer updates, the **published
+version** is the train version the engine serves, and every generated `Part` is
+stamped with the **output version** it was generated under (all logged under
+`rollout/async/*`: `staleness_updates` measures `train_version - output_version`
+before the batch's optimizer updates, while `train_version`, `publish_lag`, and
+`batches_since_sync` are recorded after training, before weight
+synchronization).
 Admission is bounded by `max_inflight` batch-equivalents globally and
 `per_worker_inflight` prompt trees per rollout worker, and every launch is
 clipped to the lag budget from [How it works](#how-it-works) and to the next
@@ -523,14 +527,20 @@ observation now respects the cap instead of exporting every image.
 
 ## Gotchas
 
+- **HI3 two-engine rollout returns whole chunks.** `rollout_pipeline_chunks > 1`
+  overlaps the next chunk's AR with the current chunk's DiT using one pending
+  call per engine, and `ar_num_replicas` (default: one per 8-GPU node) controls
+  how many 4-GPU engine slots on multi-node pools run AR versus DiT. It
+  preserves complete prompt trees and output order; smaller chunks can reduce
+  per-engine AR batch throughput when `b_ar` per chunk drops below `max_num_seqs`.
 - **Multi-update means disjoint optimizer mini-batches, not repeated full-batch
   epochs.** See [Multiple optimizer updates per rollout](#multiple-optimizer-updates-per-rollout)
   for the algorithm and divisibility constraints.
 - **Agentic evaluation remains deferred.** `AgenticTrainer` has no evaluation
   phase; its recipe configures training only.
-- **`layout` only branches on `"separate"`** (`"colocate"` == `"colocated"`). The
-  trainside direct-sampling engine cannot live on a `separate` slab — `_build_rollout`
-  raises (it needs the pipeline as a local sibling).
+- **`layout` must be `"colocate"` or `"separate"`.** The trainside direct-sampling
+  engine cannot live on a `separate` slab — `DiffusionTrainer.__init__` raises before
+  spawning actors (it needs the pipeline as a local sibling).
 - **`weight_sync` is built only when a `sync:` block is present** (dedicated engines);
   trainside sampling reads the live training weights and needs none (`self.weight_sync` stays `None`).
 - **FSDP offload during `generate` is off by default** and force-gated off for trainside

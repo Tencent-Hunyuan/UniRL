@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Optional
+from typing import Any
 
 import torch
 from accelerate import init_empty_weights, load_checkpoint_and_dispatch
@@ -49,7 +49,7 @@ class BagelBundle(Bundle):
         latent_patch_size: int,
         latent_channels: int,
         latent_downsample: int,
-        config: Optional[BagelPipelineConfig] = None,
+        config: BagelPipelineConfig,
     ) -> None:
         super().__init__()
         self.config = config
@@ -169,9 +169,9 @@ class BagelBundle(Bundle):
             vae_dtype=vae_dtype,
             device=device,
             pretrained_path=model_dir,
-            latent_patch_size=int(model.latent_patch_size),
-            latent_channels=int(model.latent_channel),
-            latent_downsample=int(model.latent_downsample),
+            latent_patch_size=model.latent_patch_size,
+            latent_channels=model.latent_channel,
+            latent_downsample=model.latent_downsample,
             config=config,
         )
 

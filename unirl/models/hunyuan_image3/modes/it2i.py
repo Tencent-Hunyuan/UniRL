@@ -2,48 +2,22 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
 from unirl.config.require import require
 from unirl.types.conditions import ImageEmbedCondition
-from unirl.types.noise_recipe import NoiseRecipe
 from unirl.types.primitives import Images, Texts
-from unirl.types.sample import Part, Sample
+from unirl.types.sample import Sample
 from unirl.types.sampling import DiffusionSamplingParams
 
 from ..conditions import HunyuanImage3DiffusionConditions, HunyuanImage3VAECondition, split_cfg_fused
-from ..seed import make_cpu_generators
+from ..seed import make_cpu_generators, prepare_seeded_sampling
+from .t2t import _as_sample_batches
 
 if TYPE_CHECKING:
     from ..pipeline import HunyuanImage3Pipeline
-
-
-def _prepare_seeded_sampling(
-    sample: Sample,
-    frontier: Part,
-    params: DiffusionSamplingParams,
-) -> Tuple[DiffusionSamplingParams, Optional[List[torch.Generator]], Optional[List[str]]]:
-    """Prepare request-local RNG streams without touching global RNG state."""
-    recipe_ids = [str(key) for key in NoiseRecipe.from_sample(sample).noise_group_ids]
-    if params.seed is None or not recipe_ids:
-        return params, None, None
-    if len(recipe_ids) != frontier.batch_size:
-        raise ValueError(
-            "HunyuanImage3 it2i seeded sampling requires noise keys aligned with "
-            f"the frontier batch; got {len(recipe_ids)} for {frontier.batch_size}."
-        )
-
-    sample_ids = [str(sample_id) for sample_id in frontier.sample_ids]
-    seeded_params = replace(params, noise_group_ids=recipe_ids)
-    condition_vae_generators = make_cpu_generators(
-        int(params.seed),
-        [f"cond-vae:{recipe_id}" for recipe_id in recipe_ids],
-    )
-    sde_sample_keys = [f"{recipe_id}:sample:{sample_id}" for recipe_id, sample_id in zip(recipe_ids, sample_ids)]
-    return seeded_params, condition_vae_generators, sde_sample_keys
 
 
 def _encode_cond_images(
@@ -52,10 +26,6 @@ def _encode_cond_images(
     generators: Optional[List[torch.Generator]],
 ):
     """Encode every source image with the matching per-sample VAE RNG."""
-
-    def _as_sample_batches(value):
-        return list(value.split(1, dim=0)) if isinstance(value, torch.Tensor) else list(value)
-
     if generators is None:
         cond_vae, cond_timestep, cond_vit = transformer._encode_cond_image(
             batch_cond_images, cfg_factor=1, generator=None
@@ -90,7 +60,12 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
     """it2i — image edit. Single diffusion stage with cond-image scatter."""
     frontier = sample.frontier_gen_part(DiffusionSamplingParams)
     params = frontier.sampling_params
-    params, condition_vae_generators, sde_sample_keys = _prepare_seeded_sampling(sample, frontier, params)
+    params, sde_sample_keys = prepare_seeded_sampling(sample, frontier, params)
+    condition_vae_generators = (
+        make_cpu_generators(params.seed, [f"cond-vae:{recipe_id}" for recipe_id in params.noise_group_ids])
+        if sde_sample_keys is not None
+        else None
+    )
     if params.sigmas is None:
         raise ValueError(
             "HunyuanImage3 it2i: gen part sampling_params.sigmas is None. The hosting engine must "
@@ -112,12 +87,12 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
     )
 
     require(
-        int(params.samples_per_prompt) <= 2,
+        params.samples_per_prompt <= 2,
         f"HunyuanImage3 it2i: samples_per_prompt={params.samples_per_prompt} is not supported yet; "
         "per-sample cond_vit lists are not transport-safe above 2.",
     )
     schedule = params.sigmas.to(pipeline.bundle.device)
-    cfg = float(params.guidance_scale) > 1.0
+    cfg = params.guidance_scale > 1.0
 
     vit = pipeline.vit_encode.encode_for_cond_vit(images)
 
@@ -128,13 +103,12 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
     )
     vit_kwargs = vit["vit_kwargs"]  # CFG duplication is deferred to the stage.
 
-    bot_task = str(sample.parts[0].control.get("bot_task", "image"))
     mm = pipeline.text_embed.embed_for_gen_image(
         texts,
         cfg=cfg,
-        height=int(params.height),
-        width=int(params.width),
-        bot_task=bot_task,
+        height=params.height,
+        width=params.width,
+        bot_task=sample.parts[0].control.get("bot_task", "image"),
         batch_cond_image_info=vit["joint_image_info"],
     )
 

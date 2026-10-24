@@ -23,7 +23,7 @@ across ranks and the grad-norm would be wrong — so `fsdp_wrap` claims them int
 root `fully_shard` group by default (`root_wrap`) and fails fast when a multi-rank
 run leaves a trainable param outside every group. The uniform wrap also keeps the
 optimizer an all-`DTensor` param bag (a mixed `Tensor` + `DTensor` bag forces
-`foreach=False` or AdamW's fused kernel raises). Centralizing wrap + step here lets
+`foreach=False` or AdamW's multi-tensor kernel raises). Centralizing wrap + step here lets
 every algorithm inherit these invariants for free; the loss module legitimately
 knows nothing about DTensor sharding or wrap topology.
 
@@ -191,8 +191,10 @@ use LoRA adapter mode. Formats and export live in
   root `fully_shard` group by default** (`root_wrap`, on) — the root group never
   reshards after forward. Set `root_wrap: false` for models whose stages call
   submodules of the wrapped object directly (bagel) or that wrap frozen mixed-dtype
-  siblings (hunyuan_image3); a multi-rank run with a trainable param left outside
-  every group then fails fast.
+  siblings (hunyuan_image3); a trainable param left outside every group fails fast
+  at `world_size > 1`, and on a single rank forces `foreach=False` on its optimizer
+  param group (`optim.py`) and explicit norm reduction in `clip_grad_norm`
+  (`backend/fsdp/state.py`) because `_foreach_*` rejects mixed `Tensor` and `DTensor`.
 - **`defer_grad_sync` needs the last micro-batch of an optimizer step to run a
   backward** — the deferred reduce-scatter only fires inside it. If that micro
   skips backward (an all-empty micro) while earlier ones ran, `TrainStack.train`
@@ -240,6 +242,13 @@ use LoRA adapter mode. Formats and export live in
   teachers reload from their paths and the checkpoint pins each by a content sha256, so a
   different teacher set or different weights raises on `load`. A checkpoint trained without
   teachers resumes into any teacher set.
+- **`first_update_ratio_tol` on `TrainStack` requires an algorithm that emits
+  `ratio_min` and `ratio_max`.** When set, each rank checks the pre-step micros of a
+  rollout's first update (where the ratio against `old_logp_source: replay` or a
+  weight-synced `old_logp_source: rollout` is 1 up to numerical noise), warns past
+  the tolerance, and reports DP rank 0's worst `|ratio - 1|` as
+  `first_update_ratio_dev`. Algorithms that omit `ratio_min` (`DPPO`, `DRPO`,
+  `CPPO`, `DiffusionNFT`, `SFT`) raise `KeyError` on the first backward micro.
 
 ## Profiling → Perfetto
 

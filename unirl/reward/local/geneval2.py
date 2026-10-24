@@ -17,20 +17,6 @@ from unirl.types.reward import RewardRequest
 
 from .base import LocalRewardBackend
 
-try:
-    from scipy.stats import gmean as _scipy_gmean
-
-    def _gmean_scores(xs: List[float]) -> float:
-        xs = [max(x, 1e-300) for x in xs]
-        return float(_scipy_gmean(xs))
-
-except ImportError:
-
-    def _gmean_scores(xs: List[float]) -> float:
-        xs = [max(x, 1e-300) for x in xs]
-        return float(math.exp(sum(math.log(x) for x in xs) / len(xs)))
-
-
 _WORD_TO_DIGIT = {
     "zero": "0",
     "one": "1",
@@ -50,7 +36,7 @@ _YES_SURFACE_FORMS = ("Yes", "yes", " Yes", " yes")
 
 def _answer_surface_forms(question: str, expected: str) -> tuple[str, ...]:
     """Surface forms of the expected answer to score at the first token."""
-    expected = (expected or "").strip()
+    expected = ("" if expected is None else str(expected)).strip()
     if question.startswith("How many"):
         forms = [expected, expected.capitalize(), " " + expected, " " + expected.capitalize()]
         digit = _WORD_TO_DIGIT.get(expected.lower())
@@ -61,42 +47,6 @@ def _answer_surface_forms(question: str, expected: str) -> tuple[str, ...]:
     if expected.lower() != "yes":
         raise ValueError(f"GenEval2 non-counting atom expects 'Yes', got {expected!r} for question {question!r}")
     return _YES_SURFACE_FORMS
-
-
-def _load_prompt_vqa_map(paths: List[Path]) -> Dict[str, List[Any]]:
-    """Build prompt -> vqa_list mapping from GenEval2-style JSONL files."""
-    out: Dict[str, List[Any]] = {}
-    for path in paths:
-        if not path.is_file():
-            raise FileNotFoundError(f"GenEval2 benchmark JSONL not found: {path}")
-        with path.open(encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                obj = json.loads(line)
-                prompt = obj.get("prompt")
-                vqa = obj.get("vqa_list")
-                if prompt is not None and vqa is not None:
-                    out[prompt] = vqa
-    return out
-
-
-def _resolve_data_paths(data_path: str) -> List[Path]:
-    """Resolve data_path to a list of JSONL file paths."""
-    if not data_path:
-        return []
-    p = Path(data_path).expanduser()
-    if p.is_file():
-        return [p]
-    if p.is_dir():
-        paths = []
-        for name in ("train.jsonl", "test.jsonl"):
-            child = p / name
-            if child.is_file():
-                paths.append(child)
-        return paths
-    return []
 
 
 class GenEval2RewardScorer(LocalRewardBackend):
@@ -118,68 +68,36 @@ class GenEval2RewardScorer(LocalRewardBackend):
         )
 
     def _load_model(self) -> None:
-        try:
-            from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
-        except ImportError:
-            raise ImportError("transformers>=4.40 is required for GenEval2 reward (Qwen3-VL support)")
+        from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
         self.processor = AutoProcessor.from_pretrained(self._model_name_or_path)
         self.model = Qwen3VLForConditionalGeneration.from_pretrained(self._model_name_or_path, torch_dtype="auto")
         self.model.to(self.device)
         self.model.eval()
 
-        data_paths = _resolve_data_paths(self._data_path)
         self._prompt_to_vqa: Optional[Dict[str, List[Any]]] = None
-        if data_paths:
-            self._prompt_to_vqa = _load_prompt_vqa_map(data_paths)
-
-    def _get_answer_probability(
-        self,
-        question: str,
-        image: Image.Image,
-        answer_token_ids: List[int],
-    ) -> float:
-        """Ask a VQA question and return the soft probability of the answer."""
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": image},
-                    {"type": "text", "text": f"{question} Answer in one word."},
-                ],
-            }
-        ]
-        inputs = self.processor.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_dict=True,
-            return_tensors="pt",
-        )
-        inputs = inputs.to(self.device)
-
-        with torch.inference_mode():
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=1,
-                do_sample=False,
-                output_scores=True,
-                return_dict_in_generate=True,
-            )
-
-        probs = torch.nn.functional.softmax(outputs.scores[0], dim=-1)
-        return sum(probs[0, tid].item() for tid in answer_token_ids)
-
-    def _answer_token_ids(self, question: str, expected: str) -> List[int]:
-        """Map a VQA atom to first-token IDs for its expected answer surface forms."""
-        if self.processor is None:
-            raise RuntimeError("GenEval2RewardScorer._answer_token_ids called before processor load")
-        token_ids: List[int] = []
-        for form in _answer_surface_forms(question, expected):
-            encoded = self.processor.tokenizer.encode(form)
-            if encoded:
-                token_ids.append(encoded[0])
-        return token_ids
+        if self._data_path:
+            p = Path(self._data_path).expanduser()
+            if p.is_file():
+                data_paths = [p]
+            elif p.is_dir():
+                data_paths = [p / name for name in ("train.jsonl", "test.jsonl") if (p / name).is_file()]
+            else:
+                data_paths = []
+            if data_paths:
+                out: Dict[str, List[Any]] = {}
+                for path in data_paths:
+                    with path.open(encoding="utf-8") as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            obj = json.loads(line)
+                            prompt = obj.get("prompt")
+                            vqa = obj.get("vqa_list")
+                            if prompt is not None and vqa is not None:
+                                out[prompt] = vqa
+                self._prompt_to_vqa = out
 
     def _soft_tifa_score(
         self,
@@ -190,17 +108,48 @@ class GenEval2RewardScorer(LocalRewardBackend):
         score_list: List[float] = []
         for vqa in vqa_list:
             question, answer = vqa[0], vqa[1]
-            token_ids = self._answer_token_ids(question, answer)
+            token_ids: List[int] = []
+            for form in _answer_surface_forms(question, answer):
+                encoded = self.processor.tokenizer.encode(form)
+                if encoded:
+                    token_ids.append(encoded[0])
             if not token_ids:
                 continue
-            prob = self._get_answer_probability(question, image, token_ids)
-            score_list.append(prob)
+
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": image},
+                        {"type": "text", "text": f"{question} Answer in one word."},
+                    ],
+                }
+            ]
+            inputs = self.processor.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=True,
+                return_tensors="pt",
+            ).to(self.device)
+
+            with torch.inference_mode():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=1,
+                    do_sample=False,
+                    output_scores=True,
+                    return_dict_in_generate=True,
+                )
+
+            probs = torch.nn.functional.softmax(outputs.scores[0], dim=-1)
+            score_list.append(float(probs[0, token_ids].sum().item()))
 
         if not score_list:
             return 0.0
 
         if self._aggregation == "gm":
-            return _gmean_scores(score_list)
+            return float(math.exp(sum(math.log(max(x, 1e-300)) for x in score_list) / len(score_list)))
         return sum(score_list) / len(score_list)
 
     def _compute_model_rewards(self, request: RewardRequest) -> List[float]:

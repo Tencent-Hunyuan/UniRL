@@ -103,6 +103,17 @@ python -m reward_service --config configs/service.yaml
 
 (The console-script entry point `unirl-reward-service --config configs/service.yaml` is equivalent to `python -m reward_service`.)
 
+### CUDA MPS (opt-in)
+
+Lightweight reward actors (such as CLIP, PickScore, HPSv2, and ImageReward) can
+share one GPU via NVIDIA MPS. Adding an `mps:` block to a reward starts a
+managed local MPS daemon before Ray initializes. On H20 with driver 535, keep
+`active_thread_percentage: 100` for float16/bfloat16 scorers.
+
+```bash
+python -m reward_service --config configs/service.mps.example.yaml
+```
+
 ### Multi-host deployment
 
 ```bash

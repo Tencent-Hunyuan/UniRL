@@ -11,24 +11,11 @@ def install() -> None:
     if _INSTALLED:
         return
 
-    candidates: list = []
-    try:
-        from transformers.tokenization_utils import PreTrainedTokenizer
+    from transformers.tokenization_utils import PreTrainedTokenizer
+    from transformers.tokenization_utils_fast import PreTrainedTokenizerFast
 
-        candidates.append(PreTrainedTokenizer)
-    except ImportError:
-        pass
-    try:
-        from transformers.tokenization_utils_fast import PreTrainedTokenizerFast
-
-        candidates.append(PreTrainedTokenizerFast)
-    except ImportError:
-        pass
-
-    for cls in candidates:
-        method = getattr(cls, "convert_tokens_to_ids", None)
-        if method is None:
-            continue
+    for cls in (PreTrainedTokenizer, PreTrainedTokenizerFast):
+        method = cls.convert_tokens_to_ids
         if getattr(method, "_unirl_none_filter", False):
             continue
 
