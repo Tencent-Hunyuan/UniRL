@@ -1,4 +1,4 @@
-"""Bounded sample records aligned through Sample lineage; see trainer/README.md."""
+"""Bounded sample records aligned through Sample lineage; see types/README.md."""
 
 from __future__ import annotations
 
