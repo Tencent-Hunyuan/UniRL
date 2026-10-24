@@ -28,7 +28,6 @@ def main(cfg: DictConfig) -> None:
         sampling_cfg=cfg.sampling,
         control=cfg.get("control"),
         sync_cfg=cfg.get("sync"),
-        dump_dir=cfg.get("dump_dir"),
         logging_cfg=cfg.get("logging"),
         enable_fsdp_offload=cfg.get("enable_fsdp_offload", True),
         rollout_pipeline_chunks=cfg.get("rollout_pipeline_chunks", 1),
