@@ -135,6 +135,7 @@ class VeOmniBackend(BaseFSDP2Backend):
             master_dtype=fsdp_cfg.master_dtype,
             reshard_after_forward=fsdp_cfg.reshard_after_forward,
             activation_checkpointing=fsdp_cfg.activation_checkpointing,
+            activation_offload=fsdp_cfg.activation_offload,
             use_torch_compile=fsdp_cfg.use_torch_compile,
         )
         model_has_ep = has_ep_params(model)
