@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Type
 
@@ -33,6 +34,7 @@ class GRPOConfig(BaseAlgorithmConfig):
     clip_range: float = 1e-4
     clip_schedule: str = "constant"
     old_logp_source: str = "rollout"
+    rollout_is_threshold: Optional[float] = None
 
 
 class GRPO(StageAlgorithm):
@@ -61,6 +63,7 @@ class GRPO(StageAlgorithm):
         conditions_cls: Optional[Type[Any]] = None,
         old_logp_source: str = "rollout",
         sampling_temperature: Optional[float] = None,
+        rollout_is_threshold: Optional[float] = None,
     ) -> None:
         super().__init__()
         if stage is None and pipeline is None:
@@ -73,6 +76,16 @@ class GRPO(StageAlgorithm):
             self.old_logp_source in ("rollout", "replay"),
             f"GRPO: old_logp_source must be 'rollout' or 'replay'; got {old_logp_source!r}",
         )
+        self.rollout_is_threshold = None if rollout_is_threshold is None else float(rollout_is_threshold)
+        if self.rollout_is_threshold is not None:
+            require(
+                math.isfinite(self.rollout_is_threshold) and self.rollout_is_threshold > 0,
+                "GRPO.rollout_is_threshold must be finite and positive",
+            )
+            require(
+                self.old_logp_source == "replay",
+                "GRPO rollout correction requires old_logp_source='replay'",
+            )
         self.clip_range = float(clip_range)
         self.clip_range_high = None if clip_range_high is None else float(clip_range_high)
         self.clip_schedule = str(clip_schedule)
@@ -115,6 +128,9 @@ class GRPO(StageAlgorithm):
         if int(segment.tokens.shape[0]) == 0:
             return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
 
+        if self.rollout_is_threshold is not None and segment.rollout_log_probs is None:
+            raise ValueError("GRPO rollout correction requires prepare_segment to preserve rollout_log_probs")
+
         typed_conds = typed_conditions(conditions, self.conditions_cls)
         new_logp = self.stage.replay(
             typed_conds, segment=segment, temperature=self.sampling_temperature
@@ -142,6 +158,24 @@ class GRPO(StageAlgorithm):
             clip_range_high=clip_high,
             mask=segment.loss_mask,
         )
+
+        if self.rollout_is_threshold is not None:
+            behavior_logp = segment.rollout_log_probs.to(device=old_logp.device, dtype=torch.float32)
+            log_weights = (old_logp.float() - behavior_logp).detach().clamp(min=-20.0, max=20.0)
+            log_cap = math.log(self.rollout_is_threshold)
+            weights = log_weights.clamp(max=log_cap).exp()  # [total_tokens], fp32, detached
+            loss_per_elem = loss_per_elem * weights
+            active = torch.ones_like(weights) if segment.loss_mask is None else segment.loss_mask.to(weights)
+            active_weights = weights * active
+            count = active.sum().clamp(min=1)
+            weight_sum = active_weights.sum()
+            ratio_metrics.update(
+                rollout_is_weight_mean=weight_sum / count,
+                rollout_is_weight_max=active_weights.max(),
+                rollout_is_clipped_fraction=((log_weights > log_cap) * active).sum() / count,
+                rollout_is_micro_ess_fraction=weight_sum.square()
+                / (count * active_weights.square().sum()).clamp(min=torch.finfo(torch.float32).tiny),
+            )
 
         loss = aggregate_token_losses(
             loss_per_elem,
