@@ -13,6 +13,7 @@ from unirl.train.stack import TrainStepResult
 from unirl.trainer.ar import ARTrainer, ar_preflight
 from unirl.trainer.async_rollout import (
     AsyncRolloutTrainerMixin,
+    connect_separate_rollout,
     resolve_separate_worker_concurrency,
 )
 from unirl.trainer.base import BaseTrainer, build_sampling_dict
@@ -157,7 +158,7 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
         with placement(self.pool, fraction=1.0 - self._train_fraction, shared_workers=True):
             self.rollout = remote(**rollout_parsed)
 
-        self._connect_separate()
+        connect_separate_rollout(self.weight_sync, self.rollout)
 
     def _prepare_rollout(self, *, sync_weights: bool) -> bool:
         """Sync a resident separate-slab engine without colocate handoffs."""
@@ -169,21 +170,6 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
         """Keep the separate rollout slab resident across train/eval phases."""
         if train_state_offloaded:
             raise RuntimeError("AsyncARTrainer cannot offload its disjoint training slab during rollout")
-
-    def _connect_separate(self) -> None:
-        """One-time cross-slab handshake (NCCL branch of diffusion.py:191-208)."""
-        addr, port = self.weight_sync.pick_master()[0]
-        tp_size = self.rollout.tp_size
-        pp_size = self.rollout.pp_size
-        targets = self.rollout.tp_zero_workers
-        self.weight_sync.set_rollout_targets(targets, self.rollout.role_name)
-        self.weight_sync.connect(
-            master_addr=addr,
-            master_port=port,
-            num_rollout_gpus=len(targets) * tp_size,
-            tp_size=tp_size,
-            pp_size=pp_size,
-        )
 
     def _advantage_and_train(
         self,
