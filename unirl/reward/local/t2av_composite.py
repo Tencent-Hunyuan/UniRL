@@ -107,6 +107,10 @@ class T2AVCompositeScorer(RewardBackend):
     def covers_prompt_video(self) -> bool:
         return True
 
+    def load(self) -> None:
+        for s in self._scorers.values():
+            s.load()
+
     def offload(self) -> None:
         for s in self._scorers.values():
             s.offload()

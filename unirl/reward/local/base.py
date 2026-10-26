@@ -46,8 +46,14 @@ class LocalRewardBackend(RewardBackend):
         self.model_kwargs = dict(model_kwargs)
         self.model = None
         self.processor = None
+        self._loaded = False
 
+    def load(self) -> None:
+        """Materialize model state once; a raising ``_load_model`` leaves the scorer unloaded and retryable."""
+        if self._loaded:
+            return
         self._load_model()
+        self._loaded = True
 
     def compute_rewards(self, request: RewardRequest) -> RewardResponse:
         start = time.time()
