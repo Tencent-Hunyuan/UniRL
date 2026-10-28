@@ -263,7 +263,7 @@ class AsyncRolloutTrainerMixin:
             )
 
         scored = self.reward.score_and_attach(completed)
-        self._drop_decoded(scored, rollout_id=rollout_id)
+        self._observe_samples(scored, step=rollout_id + 1, phase="rollout")
 
         if not self._refill_before_score:
             self._admit_prompts(
