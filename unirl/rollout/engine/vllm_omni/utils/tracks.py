@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from typing import Any, List, Optional, Sequence, Tuple
 
 import torch
@@ -11,6 +12,8 @@ from unirl.rollout.engine.sigma_verify import verify_engine_used_sigmas
 from unirl.rollout.engine.vllm_omni.pipelines._shared.interception import read_captures
 from unirl.types.primitives import Image, Images, Text, Texts, Video, Videos
 from unirl.types.segments.latent import make_image_segment
+
+logger = logging.getLogger(__name__)
 
 
 def seed_from_sample_id(sample_id: str) -> int:
@@ -214,19 +217,28 @@ def build_ar_segment(per_request: Sequence[Sequence[Any]]) -> Optional[Any]:
         logp: Optional[torch.Tensor] = None
         if isinstance(raw_logprobs, Sequence) and len(raw_logprobs) > 0:
             values: List[float] = []
+            usable = True
             for step in raw_logprobs:
                 if isinstance(step, dict) and step:
                     entry = next(iter(step.values()))
                     values.append(float(entry.logprob))
                 else:
-                    values.append(0.0)
-            if values:
+                    logger.warning(
+                        "build_ar_segment: unusable logprob step of type %s, dropping anchor (expected_len=%d)",
+                        type(step).__name__,
+                        fallback_len,
+                    )
+                    usable = False
+                    break
+            if usable and values:
                 if len(values) != fallback_len and fallback_len > 0:
-                    if len(values) > fallback_len:
-                        values = values[:fallback_len]
-                    else:
-                        values.extend([0.0] * (fallback_len - len(values)))
-                logp = torch.tensor(values, dtype=torch.float32)
+                    logger.warning(
+                        "build_ar_segment: logprob length %d != token length %d, dropping anchor",
+                        len(values),
+                        fallback_len,
+                    )
+                else:
+                    logp = torch.tensor(values, dtype=torch.float32)
         if toks:
             found_any_stage0 = True
         rows_tokens.append(toks)
