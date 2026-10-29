@@ -23,6 +23,7 @@ def veomni_parallelize(
     master_dtype: Optional[str] = None,
     reshard_after_forward: bool = True,
     activation_checkpointing: bool = False,
+    activation_offload: bool = False,
     use_torch_compile: bool = False,
 ) -> None:
     """Parallelize ``model`` (on meta) in place via VeOmni FSDP2."""
@@ -63,11 +64,10 @@ def veomni_parallelize(
         tuple(m for _, m in model.named_modules() if type(m).__name__.removeprefix("FSDP") in names) if names else ()
     )
 
-    if activation_checkpointing and not block_instances:
+    if (activation_checkpointing or activation_offload) and not block_instances:
         raise RuntimeError(
-            "veomni_parallelize: activation_checkpointing=True but no blocks of class "
-            f"{tuple(block_class_names)!r} matched — AC would silently be a no-op and "
-            "training would OOM. Check block_class_names against the model."
+            "veomni_parallelize: activation checkpointing/offload requires matching blocks of class "
+            f"{tuple(block_class_names)!r}; none matched. Check block_class_names against the model."
         )
 
     if activation_checkpointing:
@@ -81,6 +81,18 @@ def veomni_parallelize(
 
         for layer in block_instances:
             layer.forward = _make_ckpt_forward(layer.forward)
+
+    if activation_offload:
+
+        def _make_offload_forward(orig_fwd: object) -> object:
+            def wrapped(*args: object, **kwargs: object) -> object:
+                with torch.autograd.graph.save_on_cpu(pin_memory=True):
+                    return orig_fwd(*args, **kwargs)
+
+            return wrapped
+
+        for layer in block_instances:
+            layer.forward = _make_offload_forward(layer.forward)
 
     if use_torch_compile:
         for layer in block_instances:
@@ -121,12 +133,14 @@ def veomni_parallelize(
 
     if rank0:
         logger.info(
-            "veomni_parallelize: wrapped %d block(s) of class %r + root (dtype=%s, reshard=%s, ac=%s, compile=%s)",
+            "veomni_parallelize: wrapped %d block(s) of class %r + root "
+            "(dtype=%s, reshard=%s, ac=%s, activation_offload=%s, compile=%s)",
             len(block_instances),
             tuple(block_class_names),
             dtype_name,
             reshard_after_forward,
             activation_checkpointing,
+            activation_offload,
             use_torch_compile,
         )
 
