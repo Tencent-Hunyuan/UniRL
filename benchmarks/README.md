@@ -53,6 +53,7 @@ see [`video/vbench/`](video/vbench/README.md). Framework speed comparisons live 
 
 - Results: `benchmarks_results/<ckpt-tag>/<name>/{images/ | completions.jsonl, scores.jsonl, summary.json}`,
   where `<name>` is the registry name with `/` replaced by `_` (e.g. `image_geneval2`).
+- Speed benchmark results: `outputs/benchmark/`; they do not enter the evaluation `benchmarks_results/` tree.
 - Images are `p{prompt:05d}_s{k}.png` with seed `--seed + 1000*prompt + k`; specs with
   `t2i_prompt_seed` (`image/geneval2`) seed from a hash of the prompt text instead. The
   naming is the only state shared between stages.
