@@ -238,6 +238,16 @@ new remote reward needs no UniRL code — add it to the server and list its name
   unbounded.
 - **`base_device` is ignored by the remote backend** (it's HTTP-only); local
   scorers honor it, falling back to CPU with a warning if CUDA is unavailable.
+- **`RewardBackend.load()` materializes models and managed child processes after graph validation** —
+  `LocalRewardBackend.__init__` and `ManagedScorerProcessBackend.__init__` store and validate
+  configuration without loading weights or spawning a child process; `RewardService.__init__`
+  calls `load()` once after its own validation so an invalid reward graph fails before any
+  checkpoint read, child-process boot, or GPU allocation. `load()` is idempotent and the base
+  implementation is a no-op (`RemoteRewardBackend` inherits it since the external HTTP server
+  owns its own lifecycle). Composite/wrapper backends (`T2AVCompositeScorer`,
+  `PerDomainRewardScorer`, `VideoRewardScorer`, or any custom wrapper) fan `load()` out to
+  their children just like `offload`/`onload`/`dispose`, and any scorer constructed directly
+  outside `RewardService` must call `load()` before `compute_rewards`.
 - **Prompt-based rewards use the generation prompt by default.** Set
   `prompt_source: original` to score against the original user prompt instead.
 - **A training `reward:` must relate the prompt to the video.** `RewardService`

@@ -2,6 +2,7 @@
 
 from unirl.rollout.engine.vllm_omni.utils.diff_kwargs import core_diff_kwargs, sde_extra_args
 from unirl.rollout.engine.vllm_omni.utils.noise import pack_initial_noise_extra_args
+from unirl.rollout.engine.vllm_omni.utils.sampling import seed_ar_calls
 from unirl.rollout.engine.vllm_omni.utils.sigmas import sigmas_list_from_diffusion
 from unirl.rollout.engine.vllm_omni.utils.tracks import (
     build_ar_segment,
@@ -25,6 +26,7 @@ __all__ = [
     "pick_stage_output",
     "pils_to_images",
     "sde_extra_args",
+    "seed_ar_calls",
     "seed_from_sample_id",
     "sigmas_list_from_diffusion",
 ]
