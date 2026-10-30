@@ -13,7 +13,7 @@ import torch
 from unirl.algorithms.base import AlgorithmStepResult, StageAlgorithm
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.train.backend.fsdp import FSDPBackend
-from unirl.train.stack.anchor import prepare_segment_anchors, validate_anchor_contract
+from unirl.train.stack.anchor import prepare_part_for_training, validate_anchor_contract
 from unirl.train.stack.base import BaseTrainStack, TrainStepResult, aggregate_update_results
 from unirl.train.stack.loss_scale import resolve_loss_scales
 from unirl.train.stack.planner import (
@@ -270,12 +270,8 @@ class TrainStack(BaseTrainStack):
         return result
 
     def _prepare_for_training(self, part: Part, *, plans: Plan, order: Optional[torch.Tensor]) -> Part:
-        """Freeze this part's anchor in eval mode, then return the model to train mode."""
-        self.fsdp_backend.model.eval()
-        prepare_segment_anchors(self.algorithm, part, plans, order=order)
-        part = self.algorithm.prepare_part(part)
-        self.fsdp_backend.model.train()
-        return part
+        """Freeze this part's anchor in eval mode, then restore the model's incoming mode."""
+        return prepare_part_for_training(self.algorithm, part, plans, order=order, model=self.fsdp_backend.model)
 
     def _run_window(self, arranged: Tuple[Arrangement, ...], *, training_progress: float) -> TrainStepResult:
         """One optimizer step over an accumulation window of single-update parts."""

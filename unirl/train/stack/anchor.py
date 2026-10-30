@@ -53,3 +53,22 @@ def prepare_segment_anchors(
             field,
             restore_row_order(torch.cat(tensors, dim=0), order, segment=part.segment, field=field),
         )
+
+
+def prepare_part_for_training(
+    algorithm: StageAlgorithm,
+    part: Part,
+    plan: Plan,
+    *,
+    order: Optional[torch.Tensor],
+    model: torch.nn.Module,
+) -> Part:
+    """Freeze ``part``'s anchors in eval mode, run the algorithm's ``prepare_part`` hook, then restore the mode."""
+    was_training = model.training
+    model.eval()
+    try:
+        prepare_segment_anchors(algorithm, part, plan, order=order)
+        prepared = algorithm.prepare_part(part)
+    finally:
+        model.train(was_training)
+    return prepared
