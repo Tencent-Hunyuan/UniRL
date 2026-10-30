@@ -1,0 +1,40 @@
+# @package _global_
+# Minimal single-GPU full-parameter Qwen-Image native-IPC validation recipe.
+defaults:
+  - qwen_image_grpo_vllmomni
+  - override /sync: full_ipc
+  - _self_
+
+num_devices: 1
+devices_per_node: 1
+batch_size: 1
+num_rollouts: 3
+weight_sync_interval: 1
+
+backend:
+  lora_cfg: null
+  fsdp_cfg:
+    cpu_offload: false
+  optimizer_cfg:
+    learning_rate: 1.0e-5
+
+stack:
+  num_updates_per_batch: 1
+
+sampling:
+  samples_per_prompt: 2
+  height: 256
+  width: 256
+  num_inference_steps: 4
+  scheduler:
+    num_sde_steps: 2
+
+sync:
+  name_remap: {"*": "transformer.*"}
+  bucket_size_mb: 256
+  wire_dtype: bf16
+  verify: true
+
+rollout:
+  config:
+    deploy_config_override: qwen_image_t2i_full_ipc.yaml

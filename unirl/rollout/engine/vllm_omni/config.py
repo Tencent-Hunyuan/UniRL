@@ -33,6 +33,11 @@ class VLLMOmniEngineConfig(BaseEngineConfig):
 
     deploy_config_override: Optional[str] = None
 
+    # Timeout for each native Omni weight-transfer RPC. ``None`` preserves
+    # Omni's default blocking behavior; a finite value makes a stuck worker
+    # fail the publication instead of hanging the training job indefinitely.
+    weight_update_timeout_s: Optional[float] = 300.0
+
     omni_extra: Dict[str, Any] = field(default_factory=dict)
 
     max_prompt_length: Optional[int] = None
@@ -51,6 +56,10 @@ class VLLMOmniEngineConfig(BaseEngineConfig):
             self.modality in valid,
             f"VLLMOmniEngineConfig.modality must be one of {set(valid)}; got {self.modality!r}",
         )
+        require(
+            self.weight_update_timeout_s is None or self.weight_update_timeout_s > 0,
+            "VLLMOmniEngineConfig.weight_update_timeout_s must be > 0 when set",
+        )
 
     def server_intent(
         self,
@@ -66,6 +75,7 @@ class VLLMOmniEngineConfig(BaseEngineConfig):
             "model_path": self.model_path,
             "enable_sleep_mode": self.enable_sleep_mode,
             "ports": ports,
+            "weight_update_timeout_s": self.weight_update_timeout_s,
         }
         intent.update(extra)
 

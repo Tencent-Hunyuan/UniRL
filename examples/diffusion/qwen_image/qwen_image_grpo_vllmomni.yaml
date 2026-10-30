@@ -11,6 +11,10 @@
 # weight_sync_interval only; everything else is byte-identical so a
 # fixed-seed run compares cleanly against trainside.
 
+defaults:
+  - /sync: qwen_image_lora
+  - _self_
+
 num_devices: 8
 batch_size: 48                # prompts_per_rollout
 adv_use_global_std: true     # advantage: divide by ONE batch-wide std (v1 parity), not per-group
@@ -177,10 +181,3 @@ sampling:
     # SDE-step window: [0,0.5] confines SDE noise to the early high-σ steps
     # (the validated reproduce setting); [0,1] spreads it across all steps.
     timestep_fraction: [0, 0.5]
-
-# LoRA weight sync → vLLM-Omni rollout (same bridge as sd3_flowdppo_vllmomni_v2).
-sync:
-  _target_: unirl.distributed.weight_sync.lora.LocalLoraWeightSync
-  verify: true
-  param_prefix: "transformer."
-  adapter_name: default

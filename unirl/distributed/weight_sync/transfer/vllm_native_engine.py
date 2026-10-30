@@ -1,4 +1,4 @@
-"""Thin adapters around vLLM 0.27's native packed-IPC weight-transfer engine."""
+"""Thin adapters around vLLM's native packed-IPC weight-transfer engine."""
 
 from __future__ import annotations
 
@@ -59,7 +59,6 @@ class VLLMNativeWeightSyncClient(VLLMWeightSyncClient):
         self._rollout = rollout
         self._header = dict(header)
         self._flush_cache = bool(flush_cache)
-        self.last_result: Optional[dict[str, Any]] = None
 
     def init_weight_transfer_engine(self, init_info: dict[str, Any]) -> None:
         self._rollout.init_native_weight_transfer(init_info=dict(init_info))
@@ -75,7 +74,7 @@ class VLLMNativeWeightSyncClient(VLLMWeightSyncClient):
         self._rollout.update_native_weights(update_info=payload)
 
     def finish_weight_update(self, weight_version: str | None = None) -> None:
-        self.last_result = self._rollout.finish_native_weight_update(
+        self._rollout.finish_native_weight_update(
             header=self._header,
             flush_cache=self._flush_cache,
             weight_version=weight_version,
@@ -94,14 +93,14 @@ class VLLMNativeIPCTrainerEngine(IPCTrainerWeightTransferEngine):
         *,
         client: VLLMWeightSyncClient,
         source: WeightSource,
-        rank: int,
+        is_sender: bool,
         packed_buffer_size_bytes: int,
         consensus: ConsensusFn,
     ) -> None:
         super().__init__(
             client=client,
             source=source,
-            is_sender=int(rank) == 0,
+            is_sender=is_sender,
             packed=True,
             packed_buffer_size_bytes=int(packed_buffer_size_bytes),
         )

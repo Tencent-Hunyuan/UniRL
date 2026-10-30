@@ -36,6 +36,25 @@ class RLQwenImagePipeline(QwenImagePipeline):
         self.captured_conditioning: Optional[Dict[str, Any]] = None
         self.pending_initial_noise: Optional[torch.Tensor] = None
 
+    def unirl_parameter_for_verification(self, name: str) -> torch.Tensor:
+        """Read a canonical checkpoint tensor from loaded TP1 parameters, including fused QKV slices."""
+        lookup = name.removeprefix("transformer.").replace(".to_out.0.", ".to_out.")
+        module_name, _, parameter_name = lookup.rpartition(".")
+        parent_name, _, projection = module_name.rpartition(".")
+        for packed, shards in self.transformer.packed_modules_mapping.items():
+            if projection not in shards:
+                continue
+            layer = self.transformer.get_submodule(f"{parent_name}.{packed}")
+            if layer.tp_size != 1:
+                raise NotImplementedError("Qwen-Image checksum read-back requires TP1")
+            tensor = layer.get_parameter(parameter_name)
+            sizes = layer.output_sizes
+            if tensor.shape[0] != sum(sizes):
+                raise RuntimeError(f"Unsupported packed parameter layout for {name!r}")
+            index = shards.index(projection)
+            return tensor.narrow(0, sum(sizes[:index]), sizes[index])
+        return self.transformer.get_parameter(lookup)
+
     def encode_prompt(self, *args: Any, **kw: Any) -> Any:  # type: ignore[override]
         """Capture positive and optional negative text conditioning."""
         result = super().encode_prompt(*args, **kw)

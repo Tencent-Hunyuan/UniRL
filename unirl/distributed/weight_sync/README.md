@@ -48,12 +48,14 @@ materialization.
   (separate slabs, cross-node capable), `TensorWeightSync` (colocate serialized
   handoff), `IPCWeightSync` (colocate CUDA-IPC over ZMQ). Colocate handlers take the
   engine as a same-Worker sibling; separate/NCCL need a one-time driver handshake.
-- **Routing.** `param_prefix` prepends the model's canonical key prefix;
+- **Routing.** LoRA `param_prefix` prepends the model's canonical key prefix;
+  full-weight `name_remap` rewrites or filters canonical export names;
   `track_prefix` further prefixes so a `ComposedRolloutEngine` can demux the update
   to one child (PE registers one handler per track).
 
-The one bit-equality safety net is the LoRA `verify` checksum read-back — but it is
-vLLM-Omni-only, so SGLang LoRA runs have none.
+The LoRA `verify` checksum read-back and full-IPC TP1 `verify` are the available
+bit-equality safety nets. Both are vLLM-Omni-only; SGLang runs have no receiver
+read-back API.
 
 **Extending it:** a new transport subclasses `LoraWeightSyncBase` or
 `FullWeightSync` (the FSDP→full materialization, bucketing, and `name_remap` are
@@ -61,6 +63,40 @@ already done), implements `sync()` as `BROADCAST` shipping each bucket, and adds
 matching receiver on the engine side (`../../rollout/engine/`).
 
 ## Gotchas
+
+- **Native IPC metadata and data use the same canonical export rules.**
+  `raw_state_dict_metadata` creates meta tensors from global shapes and shares
+  embedding filtering and packed-expert views with `raw_state_dict`; it does not
+  gather FSDP shards. Model-specific prefixes belong in model recipes, not in
+  `sync/full_ipc`. Full-IPC `verify` is an opt-in TP1 receiver read-back;
+  `param_prefix` remains a LoRA-only option.
+
+- **Omni keeps weights during sleep.** Its adapter uses level 1 so that updates
+  to a subset of the pipeline preserve frozen components. Engines exposing
+  `set_weight_sync_sleep_level` opt into IPC's discard-after-first-sleep policy;
+  ordinary vLLM uses level 2 after its initial preserving sleep.
+
+- **Omni's colocated rollout replicas each receive their own IPC publication.**
+  `VLLMOmniRolloutEngine.rank_local_weight_transfer` selects a TP1 receiver on
+  each training rank's GPU. All training ranks gather FSDP weights and IPC
+  handles, then each publishes to its local engine and waits for its update RPCs.
+  A failed publication stops every rank before advancing the version and closes
+  the affected Omni runtimes; abort the run and restart the job. Shared
+  vLLM TP receivers retain a single rank-zero publisher.
+
+- **Native Omni IPC targets one reload-enabled diffusion stage using upstream layerwise reload.**
+  UniRL's `DiTWeightSyncExtension` supplies GPU identity through
+  `unirl_weight_sync_device_info`; Omni workers do not interpret UniRL publication
+  headers. Upstream WTE synchronizes CUDA before each update RPC returns, and
+  UniRL checks RPC errors before the training ranks agree to advance the version.
+  With `verify: true`, TP1 diffusion recipes also compare sender SHA-256
+  fingerprints with every worker's loaded parameters. Sender fingerprints are
+  collected during the transfer's single materialization pass. Qwen-Image
+  read-back resolves checkpoint names to loaded fused QKV slices and `to_out`
+  parameters; missing names or unequal values abort the publication on all ranks.
+  The ordinary vLLM
+  adapter retains its own receipt validation. AR native updates require separate
+  cache-invalidation support; diffusion does not use an AR prefix cache.
 
 - **`sync()` is a train-mesh collective** — the FSDP→full materialization runs on
   *every* train rank; never gate it behind `if rank == 0`. The rollout receiver owns
@@ -70,8 +106,8 @@ matching receiver on the engine side (`../../rollout/engine/`).
   for bulky rollout outputs (segments, conditions, decoded media); weight sync is
   trainer→rollout. Don't conflate them.
 - **`param_prefix` mismatch silently corrupts the load** (wrong/zero layers) —
-  `verify` is designed to catch it, but it's vLLM-Omni-only and off by default, so
-  most runs have no net at all.
+  LoRA `verify` catches it on vLLM-Omni, while full IPC `verify` catches full
+  parameter-value mismatches on supported TP1 diffusion workers.
 - **`RemoteLoraWeightSync` with `copy=False` breaks on TP>1 engines** — the zero-copy
   adapter handle carries a one-shot file descriptor consumed by the first worker, so
   the `collective_rpc` broadcast to ranks 2..N gets a dead handle (HI3). Set

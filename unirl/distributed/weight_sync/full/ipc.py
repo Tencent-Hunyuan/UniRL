@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import math
 import os
 import socket
 import threading
@@ -20,10 +19,23 @@ from unirl.distributed.weight_sync.transfer.vllm_native_protocol import (
     VLLM_NATIVE_PROTOCOL_VERSION,
     VLLM_NATIVE_TRANSPORT,
     structural_manifest,
-    validate_publication_result,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _apply_name_remap(name: str, rules: Dict[str, Optional[str]]) -> Optional[str]:
+    """Apply FullWeightSync's ordered first-match name rewrite locally."""
+    for key, value in rules.items():
+        prefix, _, suffix = key.partition("*")
+        if not (name.startswith(prefix) and name.endswith(suffix) and len(name) >= len(prefix) + len(suffix)):
+            continue
+        if value is None:
+            return None
+        value_prefix, _, value_suffix = value.partition("*")
+        middle_end = len(name) - len(suffix) if suffix else len(name)
+        return value_prefix + name[len(prefix) : middle_end] + value_suffix
+    return name
 
 
 class _IPCWeightSyncEngine(Enum):
@@ -49,6 +61,7 @@ class IPCWeightSync(FullWeightSync):
         wire_dtype: Any = None,
         gpu_memory_headroom_mb: int = 2048,
         control_timeout_s: float = 900.0,
+        verify: bool = False,
     ) -> None:
         super().__init__(
             backend=backend,
@@ -65,17 +78,45 @@ class IPCWeightSync(FullWeightSync):
         if float(control_timeout_s) <= 0:
             raise ValueError("control_timeout_s must be > 0")
         self._rollout = rollout
+        self._rank_local_receiver = bool(getattr(rollout, "rank_local_weight_transfer", False))
         self._use_shm = bool(use_shm)
-        receiver = getattr(rollout, "tensor_weight_sync_target", rollout)
-        self._weight_sync_engine = (
-            _IPCWeightSyncEngine.VLLM_NATIVE_WTE
-            if str(receiver.component_name()) == "vllm"
-            else _IPCWeightSyncEngine.LEGACY_ZMQ
-        )
+        self._verify = bool(verify)
+        self._weight_sync_engine = self._resolve_weight_sync_engine()
+        if self._verify and self._weight_sync_engine is _IPCWeightSyncEngine.LEGACY_ZMQ:
+            raise ValueError("IPCWeightSync verify=True requires a native vLLM/vLLM-Omni receiver")
         self._gpu_memory_headroom = int(gpu_memory_headroom_mb) << 20
         self._control_timeout = timedelta(seconds=float(control_timeout_s))
         self._control_group = None
         self._next_model_version = 1
+
+    def _receiver_component_name(self) -> str:
+        receiver = getattr(self._rollout, "tensor_weight_sync_target", self._rollout)
+        return str(receiver.component_name())
+
+    def _resolve_weight_sync_engine(self) -> _IPCWeightSyncEngine:
+        receiver = getattr(self._rollout, "tensor_weight_sync_target", self._rollout)
+        native_capability = bool(getattr(receiver, "supports_native_weight_transfer", False))
+        native_requested = bool(getattr(receiver, "native_weight_transfer_requested", False))
+        component = self._receiver_component_name()
+        if native_requested and not native_capability:
+            raise RuntimeError(
+                "The Omni deploy config requests native weight transfer, but the running runtime does not expose "
+                "the native WTE API. Install vLLM-Omni with the native layerwise reload support (upstream #7686 "
+                "or v0.32.0rc1+) instead of silently falling back to legacy ZMQ."
+            )
+        if component == "vllm" or native_capability:
+            selected = _IPCWeightSyncEngine.VLLM_NATIVE_WTE
+        else:
+            selected = _IPCWeightSyncEngine.LEGACY_ZMQ
+        logger.info(
+            "IPCWeightSync selected engine=%s component=%s native_requested=%s native_capability=%s verify=%s",
+            selected.value,
+            component,
+            native_requested,
+            native_capability,
+            self._verify,
+        )
+        return selected
 
     @distributed(dispatch_mode=Dispatch.BROADCAST, execute_mode=Execute.RANK_ZERO)
     def uses_gpu_streaming(self) -> bool:
@@ -96,9 +137,8 @@ class IPCWeightSync(FullWeightSync):
 
                 self._control_group = dist.new_group(backend="gloo", timeout=self._control_timeout)
             configure_sleep = getattr(self._rollout, "set_weight_sync_sleep_level", None)
-            if not callable(configure_sleep):
-                raise RuntimeError("vLLM native IPC sync requires configurable sleep level")
-            configure_sleep(2, preserve_next_sleep=True)
+            if callable(configure_sleep):
+                configure_sleep(2, preserve_next_sleep=True)
 
     @property
     def _global_rank(self) -> int:
@@ -151,13 +191,29 @@ class IPCWeightSync(FullWeightSync):
                 raise RuntimeError(message) from error
             raise RuntimeError(message)
 
+    def _target_topology(self) -> dict[str, Any]:
+        target: Optional[dict[str, Any]] = None
+        error: Optional[BaseException] = None
+        if self._rank_local_receiver or self._global_rank == 0:
+            try:
+                receiver = getattr(self._rollout, "tensor_weight_sync_target", self._rollout)
+                fanout = int(getattr(receiver, "weight_payload_fanout", 0))
+                device_uuids = list(getattr(receiver, "ipc_worker_device_uuids", ()))
+                if fanout <= 0 or len(device_uuids) != fanout:
+                    raise RuntimeError(f"invalid vLLM native IPC topology fanout={fanout}, UUIDs={device_uuids!r}")
+                target = {"tp_world_size": fanout, "device_uuids": device_uuids}
+            except BaseException as exc:
+                error = exc
+        self._consensus(error, "topology-discovery")
+        return dict(target if self._rank_local_receiver else self._broadcast_from_rank_zero(target))
+
     def _run_preflight(
         self,
         *,
         tp_world_size: int,
         worker_device_uuids: list[str],
         expected_metadata: list[dict[str, Any]],
-    ) -> list[str]:
+    ) -> None:
         import torch
 
         try:
@@ -182,8 +238,9 @@ class IPCWeightSync(FullWeightSync):
                 raise RuntimeError(f"rank {failures[0]['rank']}: {failures[0]['error']}")
             if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
                 raise RuntimeError("every Actor rank must see exactly one CUDA device")
-            if self._world_size != tp_world_size:
-                raise RuntimeError(f"Actor world size {self._world_size} != vLLM TP world {tp_world_size}")
+            expected_fanout = 1 if self._rank_local_receiver else self._world_size
+            if expected_fanout != int(tp_world_size):
+                raise RuntimeError(f"Expected receiver fanout {expected_fanout}, got vLLM TP world {tp_world_size}")
             visible = [
                 token.strip() for token in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if token.strip()
             ]
@@ -193,7 +250,8 @@ class IPCWeightSync(FullWeightSync):
             actor_uuids = [str(item["device_uuid"]) for item in topology]
             if len(set(hosts)) != 1:
                 raise RuntimeError(f"native CUDA IPC requires one node, got hosts={hosts!r}")
-            if actor_uuids != worker_device_uuids:
+            expected_uuids = [actor_uuids[self._global_rank]] if self._rank_local_receiver else actor_uuids
+            if expected_uuids != list(worker_device_uuids):
                 raise RuntimeError(
                     f"Actor/vLLM physical UUID mismatch: actors={actor_uuids!r}, workers={worker_device_uuids!r}"
                 )
@@ -234,62 +292,48 @@ class IPCWeightSync(FullWeightSync):
         except BaseException as exc:
             error = exc
         self._consensus(error, "topology-memory-preflight")
-        return [str(item["device_uuid"]) for item in topology]
+
+    @staticmethod
+    def _shape_metadata(name: str, shape: tuple[int, ...], dtype: Any) -> dict[str, Any]:
+        numel = 1
+        for dim in shape:
+            numel *= int(dim)
+        return {
+            "name": str(name),
+            "shape": [int(dim) for dim in shape],
+            "dtype": str(dtype),
+            "numel": numel,
+            "nbytes": numel * int(dtype.itemsize),
+        }
 
     def _expected_tensor_metadata(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        """Build an independent canonical Qwen3-MoE export plan and its manifest."""
+        """Build an export plan for fused-MoE or ordinary state-dict models."""
         model = self._backend.model
         if self._lora_merged or hasattr(model, "peft_config"):
             raise NotImplementedError("vLLM native IPC supports full fine-tuning only")
         if self._expert_weight_transform is not None:
             raise NotImplementedError("external expert export transforms are unsupported")
+        config = getattr(model, "config", None)
+        model_type = getattr(config, "model_type", None)
+
+        from unirl.utils.peft_merge import raw_state_dict_metadata
+
+        metadata: list[dict[str, Any]] = []
+        for raw_name, tensor in raw_state_dict_metadata(model, dtype=self._wire_dtype):
+            if raw_name.endswith((".lora_A", ".lora_B")):
+                continue
+            name = _apply_name_remap(raw_name, self._name_remap)
+            if name is not None:
+                metadata.append(self._shape_metadata(name, tuple(tensor.shape), tensor.dtype))
+        if not metadata:
+            raise RuntimeError(f"native IPC model {model_type!r} has an empty export")
+        if model_type != "qwen3_moe":
+            return metadata, structural_manifest(metadata)
         if self._name_remap:
             raise NotImplementedError("Qwen3-MoE schema validation does not support name_remap")
-        config = getattr(model, "config", None)
-        if getattr(config, "model_type", None) != "qwen3_moe":
-            raise NotImplementedError("vLLM native IPC supports qwen3_moe only")
 
         skip_lm_head = bool(getattr(config, "tie_word_embeddings", False))
-        metadata: list[dict[str, Any]] = []
-        for raw_name, tensor in model.state_dict().items():
-            name = str(raw_name)
-            if skip_lm_head and name == "lm_head.weight":
-                continue
-            dtype = self._wire_dtype if self._wire_dtype is not None and tensor.is_floating_point() else tensor.dtype
-            shape = tuple(int(dim) for dim in tensor.shape)
-            outputs: list[tuple[str, tuple[int, ...]]]
-            if name.endswith(".mlp.experts.gate_up_proj") and len(shape) == 3:
-                experts, doubled_intermediate, hidden = shape
-                if doubled_intermediate % 2:
-                    raise RuntimeError(f"invalid packed gate/up shape for {name!r}: {shape!r}")
-                intermediate = doubled_intermediate // 2
-                base = name.removesuffix(".gate_up_proj")
-                outputs = [
-                    (f"{base}.{expert_id}.{projection}.weight", (intermediate, hidden))
-                    for expert_id in range(experts)
-                    for projection in ("gate_proj", "up_proj")
-                ]
-            elif name.endswith(".mlp.experts.down_proj") and len(shape) == 3:
-                experts, hidden, intermediate = shape
-                base = name.removesuffix(".down_proj")
-                outputs = [
-                    (f"{base}.{expert_id}.down_proj.weight", (hidden, intermediate)) for expert_id in range(experts)
-                ]
-            else:
-                outputs = [(name, shape)]
-            for out_name, out_shape in outputs:
-                numel = math.prod(out_shape)
-                metadata.append(
-                    {
-                        "name": out_name,
-                        "shape": list(out_shape),
-                        "dtype": str(dtype),
-                        "numel": numel,
-                        "nbytes": numel * int(dtype.itemsize),
-                    }
-                )
-
-        names = {item["name"] for item in metadata}
+        names = {str(item["name"]) for item in metadata}
         required = {"model.embed_tokens.weight", "model.norm.weight"}
         if not skip_lm_head:
             required.add("lm_head.weight")
@@ -315,6 +359,58 @@ class IPCWeightSync(FullWeightSync):
         if missing:
             raise RuntimeError(f"Qwen3-MoE export schema is incomplete; missing={missing[:16]}")
         return metadata, structural_manifest(metadata)
+
+    def _verify_native_receiver(self, expected_checksums: dict[str, str]) -> None:
+        """Compare sender fingerprints with every TP1 native worker read-back."""
+        if not expected_checksums:
+            raise RuntimeError("vLLM native IPC verification produced no sender checksums")
+        receiver = getattr(self._rollout, "tensor_weight_sync_target", self._rollout)
+        checksum_fn = getattr(receiver, "param_checksums", None)
+        if not callable(checksum_fn):
+            raise RuntimeError(
+                "vLLM native IPC verification requested, but the rollout engine does not expose param_checksums"
+            )
+        topology_fn = getattr(receiver, "tp_per_stage", None)
+        topology = topology_fn() if callable(topology_fn) else {}
+        loaded = checksum_fn(names=list(expected_checksums))
+        if not isinstance(loaded, dict) or not loaded:
+            raise RuntimeError("vLLM native IPC verification returned no worker checksums")
+        loaded_stage_ids = {int(stage_id) for stage_id in loaded}
+        normalized_topology = {int(stage_id): int(tp) for stage_id, tp in topology.items()}
+        if any(normalized_topology.get(stage_id, 1) != 1 for stage_id in loaded_stage_ids):
+            raise NotImplementedError(
+                f"vLLM native IPC checksum verification currently requires TP1 workers; got topology={topology!r}"
+            )
+        for stage_id, per_rank in loaded.items():
+            if not isinstance(per_rank, (list, tuple)) or len(per_rank) != 1:
+                raise RuntimeError(
+                    f"vLLM native IPC verification expected one TP1 read-back for stage {stage_id}, got {per_rank!r}"
+                )
+            actual = per_rank[0]
+            if actual != expected_checksums:
+                actual_map = actual if isinstance(actual, dict) else {}
+                missing = sorted(set(expected_checksums) - set(actual_map))
+                extra = sorted(set(actual_map) - set(expected_checksums))
+                mismatched = sorted(
+                    name
+                    for name in set(expected_checksums).intersection(actual_map)
+                    if actual_map[name] != expected_checksums[name]
+                )
+                raise RuntimeError(
+                    f"vLLM native IPC verification failed on stage {stage_id}: "
+                    f"missing={missing[:8]} extra={extra[:8]} mismatched={mismatched[:8]}"
+                )
+        logger.info(
+            "vLLM native IPC receiver verification passed: stages=%d tensors=%d",
+            len(loaded),
+            len(expected_checksums),
+        )
+
+    def _poison_rollout(self, reason: str) -> None:
+        try:
+            self._rollout.poison(reason=reason)
+        except BaseException:
+            logger.exception("Failed to poison vLLM native IPC runtime")
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def sync(self) -> None:
@@ -345,24 +441,19 @@ class IPCWeightSync(FullWeightSync):
             metadata_error = exc
         self._consensus(metadata_error, "expected-schema")
         assert expected_metadata is not None and expected_manifest is not None
+        expected_checksums: dict[str, str] = {}
 
-        target: Optional[dict[str, Any]] = None
-        topology_error: Optional[BaseException] = None
-        if self._global_rank == 0:
-            try:
-                receiver = getattr(self._rollout, "tensor_weight_sync_target", self._rollout)
-                fanout = int(getattr(receiver, "weight_payload_fanout", 0))
-                device_uuids = list(getattr(receiver, "ipc_worker_device_uuids", ()))
-                if fanout <= 0 or len(device_uuids) != fanout:
-                    raise RuntimeError(f"invalid vLLM native IPC topology fanout={fanout}, UUIDs={device_uuids!r}")
-                target = {"tp_world_size": fanout, "device_uuids": device_uuids}
-            except BaseException as exc:
-                topology_error = exc
-        self._consensus(topology_error, "topology-discovery")
-        target = dict(self._broadcast_from_rank_zero(target))
+        def _iter_verified_tensors():
+            from unirl.distributed.weight_sync.transfer.checksum import fingerprint_tensor
 
+            for name, tensor in self._iter_full_tensors():
+                if self._verify:
+                    expected_checksums[name] = fingerprint_tensor(tensor)
+                yield name, tensor
+
+        target = self._target_topology()
         tp_world_size = int(target["tp_world_size"])
-        actor_uuids = self._run_preflight(
+        self._run_preflight(
             tp_world_size=tp_world_size,
             worker_device_uuids=list(target["device_uuids"]),
             expected_metadata=expected_metadata,
@@ -375,7 +466,7 @@ class IPCWeightSync(FullWeightSync):
             "model_version": int(self._next_model_version),
             "tp_world_size": tp_world_size,
             "expected_manifest": expected_manifest,
-            "device_uuids": actor_uuids,
+            "device_uuids": list(target["device_uuids"]),
         }
 
         source = VLLMNativeWeightSource(
@@ -387,7 +478,7 @@ class IPCWeightSync(FullWeightSync):
                 )
                 for item in expected_metadata
             ],
-            iterator_factory=self._iter_full_tensors,
+            iterator_factory=_iter_verified_tensors,
         )
         client = VLLMNativeWeightSyncClient(
             rollout=self._rollout,
@@ -397,7 +488,7 @@ class IPCWeightSync(FullWeightSync):
         engine = VLLMNativeIPCTrainerEngine(
             client=client,
             source=source,
-            rank=self._global_rank,
+            is_sender=self._rank_local_receiver or self._global_rank == 0,
             packed_buffer_size_bytes=self._bucket_bytes,
             consensus=self._consensus,
         )
@@ -418,21 +509,21 @@ class IPCWeightSync(FullWeightSync):
                 weight_version=str(self._next_model_version),
                 before_finish=_verify_actor_source,
             )
+            if self._verify:
+                verification_error: Optional[BaseException] = None
+                if engine.is_sender:
+                    try:
+                        self._verify_native_receiver(expected_checksums)
+                    except BaseException as exc:
+                        verification_error = exc
+                self._consensus(verification_error, "native-receiver-verify")
             release_error: Optional[BaseException] = None
-            if self._global_rank == 0:
+            if engine.is_sender:
                 try:
                     client.release_ipc_imports()
                 except BaseException as exc:
                     release_error = exc
             self._consensus(release_error, "native-ipc-release")
-            result = client.last_result if self._global_rank == 0 else None
-            result = self._broadcast_from_rank_zero(result)
-            validate_publication_result(
-                header,
-                result,
-                fanout=tp_world_size,
-                flush_cache=self._flush_cache,
-            )
             self._next_model_version += 1
             success = True
             logger.info(
@@ -444,11 +535,8 @@ class IPCWeightSync(FullWeightSync):
                 time.perf_counter() - started,
             )
         finally:
-            if not success and self._global_rank == 0:
-                try:
-                    self._rollout.poison(reason=f"vLLM native IPC publication {publication_id} failed")
-                except BaseException:
-                    logger.exception("Failed to poison vLLM native IPC runtime")
+            if not success and engine.is_sender:
+                self._poison_rollout(f"vLLM native IPC publication {publication_id} failed")
             torch.cuda.ipc_collect()
             torch.cuda.empty_cache()
 

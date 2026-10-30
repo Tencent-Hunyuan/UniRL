@@ -67,7 +67,6 @@ class QwenImageT2iAdapter(ModelAdapter):
     """Qwen-Image text → image (single diffusion stage, TP=1)."""
 
     deploy_config = "qwen_image_t2i_rl.yaml"
-    omni_mode = "text-to-image"
     needs_driver_tokenizer = False
     packs_groups = True
 
