@@ -222,6 +222,13 @@ new remote reward needs no UniRL code — add it to the server and list its name
   backend returns zeros with `successes=[False]`, and `score_and_attach`'s fail-fast
   then raises on those flags anyway. So it can't silently zero-poison a group; leave
   it `True`.
+- **`monitor_rewards` scores a remote component without training on it.** Each name must
+  also be in `required_rewards`, so the server still scores it. The client leaves it out of
+  the `aggregation_method` input and the `weighted_sum` weight total, and reports it in
+  `component_rewards` as `monitor_<name>`, so `required_rewards` cannot also contain that
+  name. A monitor cannot have a `reward_weights` entry, a panel with no training reward is
+  rejected, and a missing or non-finite monitor fails the sample like any other required
+  reward.
 - **`input_kind` must match the media** (`image`/`video`/`text`) — it picks which
   decoded key the backend sees. Remote allows only `image`/`video`; local scorers
   may be `text`.
