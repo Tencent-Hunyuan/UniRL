@@ -41,6 +41,7 @@ All in `runtime.py` unless noted.
 | `wrap_mp_process_for_children` | Re-installs the bundle inside every spawn child. **Must run first** | the rest of the bundle is empty |
 | `register_capture_flush` (`plugin.py`) | Flushes `_unirl_captures` into formatter `metadata["unirl"]` after postprocess. Stable 0.28 loads the general plugin in every stage process, so no child-process monkeypatch is needed | vllm-omni exposes the captured RL metadata natively |
 | `patch_dit_lora_loader` / `patch_ar_lora_loader` | Stock `DiffusionLoRAManager._load_adapter` loads only from a file path; RL pushes freshly-trained adapter tensors without a disk round-trip (`OmniTensorLoRARequest`). Lifted verbatim from verl-omni | vllm-omni's LoRA managers accept tensor-bag requests natively |
+| `patch_ar_merged_lora_fused_tensor` | vLLM's merged LoRA layers expect one `lora_b` slice per output, while a fused checkpoint row carries a single `[q+k+v, rank]` tensor. Splits it first, reusing the HI3 de-interleave when the layout requires it | vLLM's merged LoRA layers accept a fused `lora_b` |
 | `patch_dit_hi3_lora_weights` | Resolves HI3 DiT `transformer.layers.*` wrappers against PEFT `model.layers.*` keys and converts GQA-interleaved fused-QKV LoRA-B rows to vLLM's packed `[q, k, v]` slices | [vllm-omni #6411](https://github.com/vllm-project/vllm-omni/issues/6411) is fixed and the pinned release includes it |
 | `patch_fp32_skip` | Punica kernels hard-assert dtype; HI3's MoE router gate is fp32, so non-fp16/bf16 layers must be skipped for LoRA wrapping | vllm's `from_layer` skips unsupported dtypes itself |
 | `patch_hv15_packed_lora_mapping` | HV1.5 exposes `packed_modules_mapping`, while the diffusion LoRA manager only reads a model-level `stacked_params_mapping`. Consequently all six logical Q/K/V targets per main block are loaded but neither packed projection is wrapped or activated. Translate the model's packed relationship into the attribute consumed by the manager | vllm-omni's LoRA manager reads HV1.5's `packed_modules_mapping` directly |
@@ -66,7 +67,7 @@ unchanged.
 HI3's fused `qkv_proj` checkpoint rows are GQA-interleaved per KV head: each
 group contains its query heads followed by one K and one V head. The base-model
 loader converts that representation to contiguous `[q; k; v]` blocks, but the
-LoRA path does not. `_deinterleave_fused_qkv_lora_b` mirrors the base loader's
+LoRA path does not. `deinterleave_fused_qkv_lora_b` mirrors the base loader's
 reshape and split before returning `PackedLoRALayerWeights`. If the layer
 metadata cannot prove that layout, the patch raises instead of installing a
 known-invalid adapter.
