@@ -2,8 +2,9 @@
 
 Self-contained Hydra recipes — one YAML per experiment. A recipe is the single
 source of truth for a run: model, algorithm, rollout engine, placement, reward,
-weight sync, and batch geometry, each instantiated directly by `_target_` (no
-Hydra config-group overrides). Recipes are grouped by trainer domain or agentic
+weight sync, and batch geometry, each instantiated directly by `_target_`.
+Qwen-Image recipes replace the `sync` config group to keep LoRA-only options out
+of full-weight sync. Recipes are grouped by trainer domain or agentic
 workflow. Select one with `--config-name` set to its path under `examples/`,
 without `.yaml`. Keep every directory — `diffusion/sd3/sd3_trainside`, not
 `sd3_trainside`.
@@ -39,6 +40,28 @@ see [Choosing HSDP](../unirl/train/readme.md#choosing-hsdp-hybrid-sharding) and
 [async AR / diffusion](../unirl/trainer/README.md#run-async-ar-or-async-diffusion-training).
 
 ## Running a recipe
+
+The single-GPU Qwen-Image native-IPC validation recipe is
+[`diffusion/qwen_image/qwen_image_grpo_vllmomni_full_ipc_1x1`](diffusion/qwen_image/qwen_image_grpo_vllmomni_full_ipc_1x1.yaml).
+It trains the full transformer with FlowGRPO and PickScore for three rollouts,
+exercising two publications through vLLM's IPC weight transfer engine.
+Defaults disable FSDP CPU offload and use learning rate `1e-5`, two images per prompt,
+256×256 images, four denoising steps, and two SDE steps. These short trajectories
+check integration; evaluate image quality and convergence with a longer run.
+Set `QWEN_IMAGE_PATH` to the full checkpoint and use vLLM-Omni with the native
+layerwise weight-transfer support from upstream #7686 (v0.32.0rc1 or newer).
+The shared `[vllm]` extra currently pins vLLM/vLLM-Omni 0.28 and does not provide
+this API, so install a compatible Omni checkout separately for these recipes.
+The full checkpoint requires sufficient training GPU memory; diffusion sleep
+level 1 requires host RAM for rollout weight backups. The 1×2 recipe was the
+validated GPU layout; 1×1 remains a smoke recipe and has no equivalent GPU run
+claim.
+
+For two colocated GPUs, use
+[`diffusion/qwen_image/qwen_image_grpo_vllmomni_full_ipc_1x2`](diffusion/qwen_image/qwen_image_grpo_vllmomni_full_ipc_1x2.yaml).
+The trainer shards parameters across two FSDP ranks; each GPU hosts one
+independent TP1 rollout replica. Training CPU offload is disabled, training
+state remains resident, and each replica receives weights through same-GPU IPC.
 
 Launchers live in this directory. The first argument is the recipe path under
 `examples/`, without `.yaml`. Extra args are Hydra overrides.
