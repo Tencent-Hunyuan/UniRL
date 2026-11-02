@@ -4,17 +4,37 @@
 > in-process `VideoGenerator` driven one prompt at a time through
 > `executor.execute_forward`. Full map: [`../README.md`](../README.md).
 
-*Runs WAN 2.1 and WAN 2.2 A14B T2V rollouts on the pinned FastVideo RL fork and
+*Runs WAN 2.1 and WAN 2.2 A14B T2V rollouts on the pinned FastVideo commit and
 re-routes its hard-coded deterministic Euler steps through UniRL's canonical
 UniPC solver (`unirl/sde/unipc.py`), so rollouts follow the checkpoint's native
 inference solver without integer-timestep loss.*
+
+## WAN support
+
+| `model_family` | Checkpoint | Recipes | Step kernel |
+| --- | --- | --- | --- |
+| `wan2.1` (default) | WAN 2.1 T2V, single transformer | [`wan21_t2v_dancegrpo_fastvideo`](../../../../examples/diffusion/wan21/wan21_t2v_dancegrpo_fastvideo.yaml), [`wan21_t2v_fastvideo_replay`](../../../../examples/diffusion/wan21/wan21_t2v_fastvideo_replay.yaml) | `WAN21DiffusionStep` |
+| `wan2.2` (or `wan22`) | WAN 2.2 A14B T2V, dual expert | [`wan22_t2v_14b_dancegrpo_fastvideo`](../../../../examples/diffusion/wan22/wan22_t2v_14b_dancegrpo_fastvideo.yaml) | `WAN22DiffusionStep` |
+
+- **T2V only.** `_generate_batch` requires exactly one text conditioning turn and
+  sends no image or video input.
+- **Colocate only.** All three recipes pair the engine with
+  `CheckpointWeightSync` and `sync.lora_merged: true`: a LoRA run folds its adapter
+  into the base and pushes merged full weights, because the engine exposes only
+  `update_weights_from_path`.
+- **Replay log-probs by default.** The recipes set `native_logprob: false` and
+  `old_logp_source: replay`. Set `native_logprob: true` with
+  `old_logp_source: rollout` for engine log-probs.
+- **`model_family` is not validated against a list.** Anything other than `wan2.2`
+  or `wan22` takes the WAN 2.1 path.
 
 ## The pin
 
 The integration targets the **unmodified upstream**
 **`hao-ai-lab/FastVideo@2095477eac7e289c7a7ab13acb367ca60687c304`** (PR #1222's
-source snapshot), injected via `cfg.fastvideo_path` / `$FASTVIDEO_PATH` — there
-is no pip pin. Upstream ships none of the RL surface this engine needs, so
+source snapshot), imported as an installed `fastvideo` or injected via
+`cfg.fastvideo_path` / `$FASTVIDEO_PATH` — there is no pip pin
+([INSTALL](../../../../INSTALL.md#fastvideo)). Upstream ships none of the RL surface this engine needs, so
 UniRL owns it under `_patches/`: `contracts.py` adds the
 `RLData.sde_step_indices` / `sde_type` fields, `denoising.py` adds the `eta` /
 `sde_type` parameters on `sde_step_with_logprob` and the transition itself
@@ -22,7 +42,7 @@ UniRL owns it under `_patches/`: `contracts.py` adds the
 kernels), `conditions.py` restores the `rl_data` / trajectory / prompt
 embeddings that upstream's `MultiprocExecutor.execute_forward` drops when it
 rebuilds its response batch, and `weights.py` adds the full-weight update API
-upstream does not expose at all. `hijack.py` installs them in that order and
+upstream does not expose at all. `hijack.py` installs them, plus `unipc.py` and `offload.py`, in a fixed order and
 `multiproc.py` re-installs them in every spawned worker.
 
 `compat.py` fingerprints the surface at patch-install time (engine init and
@@ -123,15 +143,14 @@ monkey-patch doctrine), then update the fingerprints together with the patch.
 - **`sde_indices: null` means opposite things across engines.** This engine
   resolves `None` to *all-steps SDE*; trainside WAN21
   (`unirl/models/wan21/diffusion.py`) reads the same `None` as *no SDE*
-  (`eta=0` everywhere, no log-probs). Set `sde_indices` explicitly in the
+  (`eta=0` everywhere, no log-probs). `DiffusionTrainer` resolves `None` to a
+  concrete list first, so this only reaches callers that build their own request.
+  Set `sde_indices` explicitly in the
   recipe for engine-portable behavior.
 - **`RLData.collect_kl` with `kl_reward > 0` is unsupported** on this path:
   the fork's KL block needs `prev_latents_mean`/`std_dev_t` from every step,
   and UniPC columns return `None` for both → `ValueError`. UniRL never enables
   it; keep it off in `engine_kwargs` too.
-- **Debug replay dumps** (`DIFFUSIONRL_FASTVIDEO_DEBUG_OUTPUT_DIR`) record the
-  placeholder zero log-probs on UniPC columns — align offline ratio checks
-  against SDE columns only.
 - **Deterministic-index trajectories differ from other engines** until
   trainside/SGLang/vLLM-Omni adopt the model config's declared solver; the
   ratio stays honest regardless (`unirl/sde/README.md`).

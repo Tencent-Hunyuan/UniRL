@@ -4,15 +4,14 @@
 > `Sample`. Out: a filled `Sample`, or a trajectory `list[Sample]`.
 > Full map: [`../README.md`](../README.md).
 
-*Two halves of one design: `synchronous.py` holds the worker-side contracts every
-per-backend subpackage implements; `asynchronous.py` holds the driver-side engines
-the async trainers program against.*
+*`base.py` holds the worker-side contract every per-backend subpackage implements;
+driver-side scheduling lives in [`../manager/`](../manager/).*
 
 ## What it is
 
-The engine ABCs, the driver-side async wrappers, and the two cross-engine helpers
+The engine ABCs and the two cross-engine helpers
 (`ports.py`, `sigma_verify.py`). The per-backend engines live in the subpackages:
-`trainside`, `sglang`, `sglang_diffusion`, `vllm_omni`, `fastvideo`, `composed`,
+`trainside`, `sglang`, `sglang_diffusion`, `vllm`, `vllm_omni`, `fastvideo`, `composed`,
 and the `agentic` coordinator.
 
 ## Why it exists
@@ -24,18 +23,12 @@ down: what a worker-side engine must implement, and what the driver may assume.
 
 ## How it works
 
-- **Worker side** (`synchronous.py`). `BaseRolloutEngine` is the broad ABC
-  including coordinator engines; `SyncRolloutEngine` is the `Sample` → `Sample`
-  refinement the per-backend subpackages implement. Engines complete construction
+- **Worker side** (`base.py`). `BaseRolloutEngine` is the ABC for per-backend and
+  coordinator engines. Engines complete construction
   in `__init__` — there is no separate initialize step.
-- **Driver side** (`asynchronous.py`). Single-threaded, lock-free, ray-free;
-  non-blocking dispatch is `Handle.launch_nowait`. Mechanisms are policy-free —
-  `VersionedBuffer` (payload-agnostic freshness/staleness) and `InflightPool`
-  (non-blocking pool of distributed `generate` calls); launch ceilings, reap/launch
-  ordering and step loops live in the trainers. Both engines share one consumer
-  surface: `poll` / `drain_freshest` / `pop_evicted` / `quiesce` plus an
-  engine-owned `weight_version`.
-- **σ round-trip** (`sigma_verify.py`). The adapter pins the gen Part's sigmas via
+- **Driver side** (`../manager/`). `RolloutManager` schedules over per-slot
+  launchers; launch ceilings and step loops live in the trainers.
+- **σ round-trip** (`sigma_verify.py`). The engine pins the gen Part's sigmas via
   `ensure_sample_sigmas`, forwards them, and asserts the worker echoed back the
   exact schedule it sent.
 - **Ports** (`ports.py`). A `ReservedPorts` subclass declares one `int` field per
@@ -44,23 +37,40 @@ down: what a worker-side engine must implement, and what the driver may assume.
   before the spawn. Bind-to-zero de-synchronizes colocated engines with no
   builder-side `base + rank * stride` math.
 
-**Extending it:** subclass `SyncRolloutEngine`, implement synchronous generation
+**Extending it:** subclass `BaseRolloutEngine`, implement synchronous generation
 over the whole-`Sample` contract, and dispatch `generate` with `DP_SCATTER`. A
 dedicated engine also implements its weight-receive method and a matching `sync:`
 handler in `../../distributed/weight_sync`.
 
+## Direct vLLM
+
+`vllm` runs one vLLM instance per TP group in a spawned interpreter, reached over a
+pipe, so vLLM's imports stay out of the Worker process.
+
+- **Narrow by construction.** Text-only, PP=1, EP=1, and startup rejects any model
+  type other than `qwen3_moe`. `runtime.py` requires exactly `vllm==0.28.0`.
+- **Native IPC sync only.** The engine has no NCCL, tensor, or LoRA receive path;
+  `IPCWeightSync` selects vLLM's native transfer engine for it
+  ([weight sync](../../distributed/weight_sync/README.md)). A sync needs
+  `enable_fsdp_offload: true`.
+- **Sleep can discard weights.** Native sync sets sleep level 2, so `ARTrainer`
+  calls `preserve_weights_for_next_sleep` when the next phase will not sync
+  (`trainer/rollout_sleep.py`).
+- **Broken means broken.** After a failed publication the engine is poisoned rather
+  than retried, because the live weights may be partial.
+
 ## Gotchas
 
-- **`__init__.py` must import nothing.** The driver-side `asynchronous` module has
-  to stay ray/torch-free to import, so consumers import the halves directly.
+- **`__init__.py` must import nothing.** Importing an engine config must not pull
+  SGLang, vLLM, or FastVideo; `make_engine` imports the backend lazily.
 - **Port reservation is a hint, not a contract** — the sockets are closed
   immediately after binding so the subprocess can bind them itself, which leaves
   the usual bind-to-zero TOCTOU gap. Accepted deliberately.
 - **Never hardcode the σ scale.** `sigma_verify` detects it dynamically; dividing
   by 1000 breaks on any model whose `num_train_timesteps` is not 1000.
 - **An engine that will serve as an agentic inner must make `generate` safe for
-  concurrent callers** — the agentic coordinator drives one trajectory per drain
-  thread.
+  concurrent callers** — the agentic coordinator drives one trajectory per actor
+  call.
 - **Unknown SGLang `engine_kwargs` are dropped at boot.** HTTP/native backends
   filter intent against live `ServerArgs`. Typos used to fail silently; they now
   warn, or raise if `UNIRL_SGLANG_STRICT_SERVER_ARGS=1`. UniRL-only keys
