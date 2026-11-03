@@ -237,6 +237,7 @@ class TrainStack(BaseTrainStack):
         rollout_id: Optional[int] = None,
     ) -> TrainStepResult:
         """Driver-callable: arrange → prepare → run updates → on_rollout_end."""
+        self.fsdp_backend.model.train()
         window = parts if isinstance(parts, tuple) else (parts,)
         if not window:
             raise ValueError(f"{type(self).__name__}.train_track: empty accumulation window.")

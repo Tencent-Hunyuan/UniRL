@@ -199,6 +199,7 @@ class UnifiedModelTrainStack(BaseTrainStack):
         rollout_id: int | None = None,
     ) -> Dict[str, TrainStepResult]:
         """Driver-callable: prepare → backward(ar) + backward(image) → ONE step."""
+        self.fsdp_backend.model.train()
         ar_part = sample.gen_part(ARSamplingParams)
         image_part = sample.gen_part(DiffusionSamplingParams)
         self._align_track_inputs(ar_part)
