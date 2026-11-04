@@ -127,8 +127,9 @@ rollout:
   stage_attrs: [diffusion]
   # SD3 VAE decode on 96 fp32 latents at once (batch_size=48 × samples_per_prompt=16
   # / 8 devices) peaks ~24 GB on an H20 and OOMs alongside the resident text
-  # encoders. Chunk forward into 16-sample groups (= samples_per_prompt so groups
-  # never straddle a chunk boundary, matters once init_same_noise flips on).
+  # encoders. Cap each forward at 16 rows to bound that peak. Shared x_T under
+  # init_same_noise is seeded per (seed, group id), not per chunk, so this value
+  # need not divide samples_per_prompt.
   forward_batch_size: 16
 
 reward:
