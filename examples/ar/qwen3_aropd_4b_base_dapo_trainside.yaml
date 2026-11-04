@@ -121,11 +121,10 @@ algorithm:
   _target_: unirl.algorithms.aropd.AROPD
   stage_attr: ar # resolves stage from the trainer-injected pipeline (.ar)
   teacher: teacher # must match backend.lora_cfg.frozen_adapters[].name
-  # Per-micro z-scoring of the gap (control variate, unbiased; bounds the -15-nat
-  # spikes a teacher emits on continuations it despises — mirrors GRPO's
-  # normalize_adv_by_std). Set false for the raw-gap estimator; the gap metrics
-  # always report raw nats.
-  normalize_gap: true
+  # Elementwise |gap| clamp: grouping-invariant and mean-preserving (per-micro
+  # z-scoring would make the objective depend on micro_batch_size and erase each
+  # sequence's mean gap). Set null for fully raw gaps.
+  gap_clamp: 10.0
   # 1.0 — must equal sampling.temperature below so the teacher replay's
   # log_softmax(logits/T) matches the rollout sampler's tempered log-probs.
   sampling_temperature: ${sampling.temperature}
@@ -140,8 +139,8 @@ stack:
   # AROPD freezes the teacher anchor per rollout; multi-update against it is
   # unvalidated (supports_multi_update=False -> the stack enforces exactly 1).
   num_updates_per_batch: 1
-  # CountPlanner (no micro_planner): token-budget packing requires a
-  # seq-mean loss_agg_mode, which AROPD's masked token-mean does not declare.
+  # CountPlanner (no micro_planner) is the simple default; token-mean is
+  # grouping-invariant under packing too, so a TokenBudgetPlanner also works.
 
 data_source:
   _target_: unirl.data.data_source.MultimodalRLDataSource

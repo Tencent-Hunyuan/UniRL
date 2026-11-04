@@ -104,37 +104,28 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   *not* the request Sample's actual temperature, biasing every ratio with no raise. Watch
   `rollout_replay_logp_absdiff_mean` — it should be ~0 on an on-policy step.
 - **AROPD is a policy gradient, not token KD** — the OPD objective is
-  `max_θ E_{a~π_θ}[log π_T(a)]` over the *student's own* sampled tokens (the GKD
-  on-policy form). Its score-function estimator with the student log-prob as
-  control variate is `∇ = E[(log π_T(a) − log π_θ(a))·∇log π_θ(a)]`, implemented as
-  `loss = −Σ sg(teacher_logp − old_logp)·new_logp / Σmask`: the gap is the per-token
-  REINFORCE advantage, stopped-gradient on both sides, `new_logp` the only
-  differentiated operand. Backpropping `mean(new_logp − teacher_logp)` directly
-  instead (`∇ = ∇mean(new_logp)`, teacher constant) just pushes the student's own
-  log-prob up unboundedly — the sign of the gap never enters. By default the gap is
-  batch-normalized (`normalize_gap: true`; a control variate — `E[b·∇log π_θ] = 0`
-  keeps the estimator unbiased) because raw gaps are unbounded: a teacher that
-  despises a sampled continuation emits −15-nat gaps whose gradient swamps the step —
-  the same scale-fix GRPO applies via `normalize_adv_by_std` and DiffusionOPD via its
-  transition-sigma division (the z-stats are per micro — a per-sequence baseline at
-  `micro_batch_size: 1`). The gap metrics (`teacher_gap_mean` /
-  `teacher_gap_abs_mean`) always report the raw nats gap, not the z-scored
-  surrogate weight. Equivalence check:
-  at `θ = θ_old` (one update per rollout, `supports_multi_update = False`) the
-  surrogate's gradient equals the gap-weighted score function; across updates the
-  frozen gap keeps it an off-policy REINFORCE with the ratio absorbed into
-  `new_logp`. `prepare_segment` freezes `segment.teacher_log_probs` under
-  `adapter_active(model, teacher)` + `no_grad`, declared via
-  `anchor_fields = ("teacher_log_probs",)` + `recomputes_anchor` so the anchor is
-  replayed over the exact training micros (bf16 forwards are batch-shape
-  sensitive) — the teacher anchor adds no avoidable geometry artifact; the
-  student side still carries the rollout↔replay drift tracked by
-  `rollout_replay_logp_absdiff_mean`. The student side of the gap is the rollout's own
-  `segment.log_probs` (the trainside sampler emits tempered per-token log-probs),
-  so a missing `log_probs` raises rather than silently degrading to KD. AROPD
-  hard-declares `loss_agg_mode = 'token-mean'` — the surrogate is a flat masked
-  token mean, so the stack's token-share weighting (see the `loss_agg_mode` bullet
-  above) is what keeps it grouping-invariant; no other mode is implemented.
+  `max_θ E_{a~π_θ}[log π_T(a)]` over the *student's own* sampled tokens. Its
+  score-function estimator is `∇ = E[log π_T(a)·∇log π_θ(a)]`; implementing it as
+  `loss = −Σ sg(teacher_logp − new_logp)·new_logp / Σmask` adds the entropy term
+  `−E[log π_θ·∇log π_θ] = ∇H(π_θ)` (NOT a control variate — its expectation is
+  nonzero), turning the objective into per-token reverse-KL descent. This is a
+  per-token factorization, not the exact gradient of sequence-level `KL(π_θ‖π_T)`
+  (that would weight each token by the reward-to-go `Σ_{t'≥t}` of future gaps).
+  Both gap sides are stopped-gradient and `new_logp` is the only differentiated
+  operand; backpropping `mean(new_logp − teacher_logp)` instead (`∇ = ∇mean(new_logp)`,
+  teacher constant) pushes the student's log-prob up unboundedly — the gap's sign
+  never enters. The gap's student side is `new_logp.detach()` — current weights at
+  the teacher anchor's exact micro geometry (`anchor_fields` +
+  `recomputes_anchor`), so the advantage carries no rollout↔replay drift;
+  `segment.log_probs` only feeds the `rollout_replay_*` drift gauges. `gap_clamp`
+  (default 10) bounds per-token |gap| elementwise — grouping-invariant and
+  mean-preserving, unlike per-micro z-stats which make the objective depend on
+  `micro_batch_size` and erase each sequence's mean gap; the gap metrics report the
+  raw unclamped nats gap, so `teacher_gap_abs_mean` may legitimately exceed it.
+  AROPD hard-declares
+  `loss_agg_mode = 'token-mean'` (a class attribute — `resolve_loss_scales` reads
+  it via `getattr`), so the stack's token-share weighting keeps the flat masked
+  token mean grouping-invariant; no other mode is implemented.
 - **DiffusionNFT's `ref_deviation_coef > 0` anchors to the LoRA-disabled base, not the EMA shadow** — the
   shadow tracks the policy by construction, so anchoring to it would bound no drift. The reference
   is a third `predict_noise_at_step` per trained timestep, on top of the trainable and shadow ones;
