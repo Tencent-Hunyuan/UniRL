@@ -48,7 +48,7 @@ class SFTTrainer(BaseTrainer):
         self.eval_interval = eval_interval
         self.eval_batch_size = max(1, eval_batch_size)
         self.eval_num_samples = -1 if eval_num_samples < 0 else eval_num_samples
-        num_updates_per_batch = int(stack_cfg.get("num_updates_per_batch", 1))
+        num_updates_per_batch = stack_cfg.get("num_updates_per_batch", 1)
         if num_updates_per_batch != 1:
             raise ValueError(
                 "SFTTrainer requires stack.num_updates_per_batch=1: its num_steps, logging, "

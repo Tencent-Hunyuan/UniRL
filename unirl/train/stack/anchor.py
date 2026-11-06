@@ -35,13 +35,19 @@ def prepare_segment_anchors(
         micro = arranged_slice(part, order, start, end)
         algorithm.prepare_segment(conditions=micro.conditions, segment=micro.segment)
         for field in collected:
-            value = getattr(micro.segment, field, None)
+            value = getattr(micro.segment, field)
             if value is None:
                 raise RuntimeError(
                     f"{type(algorithm).__name__} declares anchor field {field!r} but a micro produced None."
                 )
             collected[field].append(value)
     for field, tensors in collected.items():
+        shapes = {tuple(tensor.shape[1:]) for tensor in tensors}
+        if len(shapes) != 1:
+            raise RuntimeError(
+                f"{type(algorithm).__name__} anchor field {field!r} differs in shape across micros ({sorted(shapes)}); "
+                "an anchor stored per token needs one output canvas per rollout."
+            )
         setattr(
             part.segment,
             field,

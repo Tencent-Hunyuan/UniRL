@@ -66,12 +66,12 @@ class SGLangRolloutEngine(BaseRolloutEngine):
         self._weights_onloaded_for_sync = False
         self._checkpoint_engine_sync_error: Optional[str] = None
 
-        self._tp_rank = int(tp_rank)
-        self._tp_size = int(tp_size)
-        self._pp_rank = int(pp_rank)
-        self._pp_size = int(pp_size)
-        self._ep_rank = int(ep_rank)
-        self._ep_size = int(ep_size)
+        self._tp_rank = tp_rank
+        self._tp_size = tp_size
+        self._pp_rank = pp_rank
+        self._pp_size = pp_size
+        self._ep_rank = ep_rank
+        self._ep_size = ep_size
         if tp_visible_devices is not None:
             self._tp_visible_devices = [str(token) for token in tp_visible_devices]
         else:
@@ -91,7 +91,7 @@ class SGLangRolloutEngine(BaseRolloutEngine):
             )
             return
 
-        engine_kwargs: Dict[str, Any] = dict(config.engine_kwargs or {})
+        engine_kwargs = config.engine_kwargs
 
         from transformers import AutoTokenizer
 
@@ -165,10 +165,19 @@ class SGLangRolloutEngine(BaseRolloutEngine):
 
         self._version = 0
 
-    def _prepare_generation(self, sample: Sample) -> Any:
+    @distributed(dispatch_mode=Dispatch.DP_SCATTER)
+    def generate(self, sample: Sample) -> Sample:
+        """Generate one whole Sample synchronously through the backend seam."""
+        if not self._is_tp_zero:
+            return None
+        if self._checkpoint_engine_sync_error is not None:
+            raise RuntimeError(
+                "SGLang rollout is unhealthy after a failed checkpoint-engine update: "
+                f"{self._checkpoint_engine_sync_error}"
+            )
         sampling = resolve_sampling(self.cfg, sample)
         require(
-            int(sample.parts[-1].batch_size) > 0,
+            sample.parts[-1].batch_size > 0,
             "SGLangRolloutEngine.generate requires a non-empty Sample (gen batch_size > 0)",
         )
         prepared = self.adapter.build_inputs(sample, sampling=sampling)
@@ -186,24 +195,8 @@ class SGLangRolloutEngine(BaseRolloutEngine):
         if active_adapter:
             for payload in prepared.wire:
                 payload["lora_path"] = active_adapter
-        return prepared
-
-    def _finish_generation(self, sample: Sample, prepared: Any, raw: List[Any]) -> Sample:
-        return self._stamp_output_version(self.adapter.build_response(sample, prepared, raw))
-
-    @distributed(dispatch_mode=Dispatch.DP_SCATTER)
-    def generate(self, sample: Sample) -> Sample:
-        """Generate one whole Sample synchronously through the backend seam."""
-        if not self._is_tp_zero:
-            return None
-        if self._checkpoint_engine_sync_error is not None:
-            raise RuntimeError(
-                "SGLang rollout is unhealthy after a failed checkpoint-engine update: "
-                f"{self._checkpoint_engine_sync_error}"
-            )
-        prepared = self._prepare_generation(sample)
         raw = self._backend.generate(prepared.wire)
-        return self._finish_generation(sample, prepared, raw)
+        return self._stamp_output_version(self.adapter.build_response(sample, prepared, raw))
 
     def abort(self, ids: Optional[List[str]] = None) -> List[Sample]:
         """Abort in-flight generation (best-effort). Partials surface via the"""

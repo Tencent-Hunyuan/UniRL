@@ -74,24 +74,24 @@ class MathVerifyRewardScorer(LocalRewardBackend):
             sender.close()
 
     def __init__(self, *, config: "MathVerifySpec", base_device: str) -> None:
-        del base_device
+        del config, base_device
         super().__init__()
 
     def _load_model(self) -> None:
-        self.model = "math_verify"
+        pass
 
     def _compute_model_rewards(self, request: RewardRequest) -> List[float]:
         generated = request.texts
         if generated is None:
             raise ValueError("MathVerifyRewardScorer requires request.texts (generated answers).")
-        metadata_list = request.metadata or [None] * len(generated)
+        metadata_list = [None] * len(generated) if request.metadata is None else request.metadata
         rewards = [0.0] * len(generated)
         jobs: List[Tuple[str, str]] = []
         slots: List[int] = []
         for i, (text, meta) in enumerate(zip(generated, metadata_list)):
             if meta is not None and "answer" in meta:
                 slots.append(i)
-                jobs.append((str(meta["answer"]).strip(), text or ""))
+                jobs.append((str(meta["answer"]).strip(), "" if text is None else text))
         if not jobs:
             return rewards
         for i, ok in zip(slots, self._grade_in_child(jobs, seconds=_VERIFY_TIMEOUT_S)):

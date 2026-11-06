@@ -62,7 +62,7 @@ def structural_manifest(tensors: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
         normalized.append(
             {
                 "name": name,
-                "shape": [int(dim) for dim in shape],
+                "shape": list(shape),
                 "dtype": dtype,
                 "numel": numel,
                 "nbytes": nbytes,
@@ -79,32 +79,6 @@ def structural_manifest(tensors: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
         "fingerprint": hashlib.sha256(encoded).hexdigest(),
         "tensor_count": len(normalized),
         "byte_count": byte_count,
-    }
-
-
-def _validate_manifest(manifest: Any) -> dict[str, Any]:
-    if not isinstance(manifest, Mapping):
-        raise RuntimeError(f"vLLM native IPC manifest must be a mapping, got {type(manifest).__name__}")
-    missing = sorted(_MANIFEST_FIELDS - set(manifest))
-    if missing:
-        raise RuntimeError(f"vLLM native IPC manifest missing fields: {missing}")
-    fingerprint = manifest["fingerprint"]
-    if not isinstance(fingerprint, str) or len(fingerprint) != 64:
-        raise RuntimeError("vLLM native IPC manifest fingerprint must be SHA-256")
-    try:
-        int(fingerprint, 16)
-    except ValueError as exc:
-        raise RuntimeError("vLLM native IPC manifest fingerprint is not hexadecimal") from exc
-    tensor_count = manifest["tensor_count"]
-    byte_count = manifest["byte_count"]
-    if not isinstance(tensor_count, int) or isinstance(tensor_count, bool) or tensor_count <= 0:
-        raise RuntimeError("vLLM native IPC manifest tensor_count must be > 0")
-    if not isinstance(byte_count, int) or isinstance(byte_count, bool) or byte_count < 0:
-        raise RuntimeError("vLLM native IPC manifest byte_count must be >= 0")
-    return {
-        "fingerprint": fingerprint,
-        "tensor_count": int(tensor_count),
-        "byte_count": int(byte_count),
     }
 
 
@@ -127,7 +101,27 @@ def validate_publication_header(header: Mapping[str, Any], *, tp_world_size: int
     header_world = header["tp_world_size"]
     if not isinstance(header_world, int) or isinstance(header_world, bool) or header_world != int(tp_world_size):
         raise ValueError(f"vLLM native IPC TP world mismatch: header={header_world!r}, actual={tp_world_size}")
-    _validate_manifest(header["expected_manifest"])
+
+    manifest = header["expected_manifest"]
+    if not isinstance(manifest, Mapping):
+        raise RuntimeError(f"vLLM native IPC manifest must be a mapping, got {type(manifest).__name__}")
+    missing_manifest = sorted(_MANIFEST_FIELDS - set(manifest))
+    if missing_manifest:
+        raise RuntimeError(f"vLLM native IPC manifest missing fields: {missing_manifest}")
+    fingerprint = manifest["fingerprint"]
+    if not isinstance(fingerprint, str) or len(fingerprint) != 64:
+        raise RuntimeError("vLLM native IPC manifest fingerprint must be SHA-256")
+    try:
+        int(fingerprint, 16)
+    except ValueError as exc:
+        raise RuntimeError("vLLM native IPC manifest fingerprint is not hexadecimal") from exc
+    tensor_count = manifest["tensor_count"]
+    byte_count = manifest["byte_count"]
+    if not isinstance(tensor_count, int) or isinstance(tensor_count, bool) or tensor_count <= 0:
+        raise RuntimeError("vLLM native IPC manifest tensor_count must be > 0")
+    if not isinstance(byte_count, int) or isinstance(byte_count, bool) or byte_count < 0:
+        raise RuntimeError("vLLM native IPC manifest byte_count must be >= 0")
+
     uuids = header["device_uuids"]
     if (
         not isinstance(uuids, (list, tuple))
@@ -194,7 +188,7 @@ def validate_publication_result(
         raise RuntimeError(f"vLLM native IPC returned invalid result {response!r}")
     receipts = validate_worker_receipts(
         header,
-        list(response.get("worker_receipts") or ()),
+        () if response.get("worker_receipts") is None else list(response["worker_receipts"]),
         fanout=fanout,
     )
     if int(response.get("model_version", -1)) != int(header["model_version"]):

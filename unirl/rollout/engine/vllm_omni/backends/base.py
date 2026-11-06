@@ -126,13 +126,13 @@ class Backend(Protocol):
     def set_lora_handle(
         self,
         *,
-        lora_tensors: Dict[str, Any],
+        lora_tensors: Dict[str, "torch.Tensor"],
         peft_config: Optional[dict],
     ) -> None: ...
     def set_lora_copy(
         self,
         *,
-        lora_tensors: Dict[str, Any],
+        lora_tensors: Dict[str, "torch.Tensor"],
         peft_config: Optional[dict],
     ) -> None: ...
     def param_checksums(self, *, names: List[str]) -> dict: ...

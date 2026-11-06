@@ -45,9 +45,9 @@ def main(cfg: DictConfig) -> None:
         eval_sampling_cfg=cfg.get("eval_sampling"),
         eval_rewards_cfg=cfg.get("eval_rewards"),
         control=cfg.get("control"),
-        max_inflight=int(cfg.get("max_inflight", 1)),
-        per_worker_inflight=int(cfg.get("per_worker_inflight", 1)),
-        weight_sync_interval=int(cfg.get("weight_sync_interval", 1)),
+        max_inflight=cfg.get("max_inflight", 1),
+        per_worker_inflight=cfg.get("per_worker_inflight", 1),
+        weight_sync_interval=cfg.get("weight_sync_interval", 1),
     )
     trainer.train(
         num_rollouts=cfg.get("num_rollouts", 100),

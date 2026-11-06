@@ -76,7 +76,13 @@ class WANVideoLatentEncodeStage(EncodeStage[Videos, ImageLatentCondition]):
                     f"{owner}.encode: sample {idx} expected frames [T, 3, H, W], "
                     f"got shape {None if frames is None else tuple(frames.shape)}."
                 )
-            frames = self._sample_frames(frames)
+            total = int(frames.shape[0])
+            if total < 1:
+                raise ValueError("WAN video encoder: target video has no frames.")
+            if total != self.num_frames:
+                indices = torch.linspace(0, total - 1, steps=self.num_frames, device=frames.device)
+                indices = indices.round().to(dtype=torch.long).clamp_(0, total - 1)
+                frames = frames.index_select(0, indices)
             frames = frames.to(device=self.bundle.device, dtype=torch.float32).clamp_(0.0, 1.0)
             frames = F.interpolate(
                 frames,
@@ -111,16 +117,6 @@ class WANVideoLatentEncodeStage(EncodeStage[Videos, ImageLatentCondition]):
 
     def _postprocess_latents(self, latents: torch.Tensor) -> torch.Tensor:
         return latents
-
-    def _sample_frames(self, frames: torch.Tensor) -> torch.Tensor:
-        total = int(frames.shape[0])
-        if total < 1:
-            raise ValueError("WAN video encoder: target video has no frames.")
-        if total == self.num_frames:
-            return frames
-        indices = torch.linspace(0, total - 1, steps=self.num_frames, device=frames.device)
-        indices = indices.round().to(dtype=torch.long).clamp_(0, total - 1)
-        return frames.index_select(0, indices)
 
 
 class WAN21VAEDecodeStage(DecodeStage[LatentSegment, Videos]):
@@ -157,7 +153,8 @@ class WAN21VAEDecodeStage(DecodeStage[LatentSegment, Videos]):
 
         decoded = ((decoded + 1.0) / 2.0).clamp(0.0, 1.0)
 
-        return self._pack_videos(decoded)
+        videos = [Video(frames=decoded[i].permute(1, 0, 2, 3).contiguous()) for i in range(int(decoded.shape[0]))]
+        return Videos.from_list(videos)
 
     def decode_with_grad(self, z_final: torch.Tensor) -> torch.Tensor:
         """Differentiable VAE decode: ``z_final → pixels`` with autograd alive."""
@@ -171,15 +168,8 @@ class WAN21VAEDecodeStage(DecodeStage[LatentSegment, Videos]):
     def _vae_decode(self, clean: torch.Tensor) -> torch.Tensor:
         """Run ``WanVideoVAE.decode`` and return pixels in the VAE's native ``[-1, 1]``."""
         vae = self.bundle.vae
-        vae_dtype = vae.dtype
-        latents = clean.to(dtype=vae_dtype)
-        decoded = vae.decode(latents, device=latents.device, tiled=True)
-        return decoded
-
-    def _pack_videos(self, decoded: torch.Tensor) -> Videos:
-        """Pack a dense ``[B, C, T_dec, H_dec, W_dec]`` pixel tensor into ``Videos``."""
-        videos = [Video(frames=decoded[i].permute(1, 0, 2, 3).contiguous()) for i in range(int(decoded.shape[0]))]
-        return Videos.from_list(videos)
+        latents = clean.to(dtype=vae.dtype)
+        return vae.decode(latents, device=latents.device, tiled=True)
 
 
 __all__ = ["WAN21VAEDecodeStage", "WANVideoLatentEncodeStage"]

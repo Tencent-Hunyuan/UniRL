@@ -8,7 +8,7 @@ from unirl.distributed.tensor.transport import TensorTransport
 
 
 def build_transport(
-    kind: Optional[str],
+    kind: str,
     *,
     worker_id: str,
     device: str,
@@ -18,9 +18,7 @@ def build_transport(
     global_rank: Optional[int] = None,
     world_size: int = 1,
 ) -> TensorTransport:
-    """Build the transport for ``kind`` (default ``colocate_store``)."""
-    kind = kind or "colocate_store"
-
+    """Build the transport for ``kind``."""
     if kind in ("colocate_store", "colocate"):
         from unirl.distributed.tensor.backend.colocate_store.store import TensorStore
         from unirl.distributed.tensor.backend.colocate_store.transport import ColocateStoreTransport

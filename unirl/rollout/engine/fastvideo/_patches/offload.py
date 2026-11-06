@@ -19,7 +19,7 @@ def patch_offload() -> None:
 
         @wraps(original_state_load)
         def load_state(model, full_sd_iterator, device, param_dtype, *args, **kwargs):
-            if bool(kwargs.get("cpu_offload", False)):
+            if kwargs.get("cpu_offload", False):
                 device = torch.device("cpu")
             return original_state_load(model, full_sd_iterator, device, param_dtype, *args, **kwargs)
 
@@ -35,9 +35,7 @@ def patch_offload() -> None:
         # Upstream stages the whole DiT on GPU before attaching the layerwise hooks, so two
         # 14B experts transiently exceed the device even with layerwise offload requested.
         force_cpu_load = (
-            module_name in _DIT_MODULES
-            and bool(getattr(fastvideo_args, "dit_layerwise_offload", False))
-            and not bool(getattr(fastvideo_args, "dit_cpu_offload", False))
+            module_name in _DIT_MODULES and fastvideo_args.dit_layerwise_offload and not fastvideo_args.dit_cpu_offload
         )
         if force_cpu_load:
             fastvideo_args.dit_cpu_offload = True
@@ -51,10 +49,10 @@ def patch_offload() -> None:
             if force_cpu_load:
                 fastvideo_args.dit_cpu_offload = False
         offloaded = force_cpu_load or (
-            (module_name in _DIT_MODULES and bool(getattr(fastvideo_args, "dit_cpu_offload", False)))
-            or (module_name == "text_encoder" and bool(getattr(fastvideo_args, "text_encoder_cpu_offload", False)))
-            or (module_name == "image_encoder" and bool(getattr(fastvideo_args, "image_encoder_cpu_offload", False)))
-            or (module_name == "vae" and bool(getattr(fastvideo_args, "vae_cpu_offload", False)))
+            (module_name in _DIT_MODULES and fastvideo_args.dit_cpu_offload)
+            or (module_name == "text_encoder" and fastvideo_args.text_encoder_cpu_offload)
+            or (module_name == "image_encoder" and fastvideo_args.image_encoder_cpu_offload)
+            or (module_name == "vae" and fastvideo_args.vae_cpu_offload)
         )
         if offloaded and torch.cuda.is_available():
             torch.cuda.empty_cache()

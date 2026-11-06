@@ -85,3 +85,37 @@ handler in `../../distributed/weight_sync`.
   trainer, PE, and agentic paths already stamp this. `temperature` / `top_p` /
   `top_k` / `max_new_tokens` are gone from `SGLangEngineConfig` — there is no
   engine-config fallback.
+- **Explicit vLLM-Omni AR seeds use one call per sample.** HI3 and Qwen3-Omni
+  derive each request's seed from `ARSamplingParams.seed` and the AR Part's
+  `sample_id`, using the same `derive_sampling_seed` mapping as SGLang. In
+  vLLM-Omni 0.28, each call shares one sampling-params object per stage across
+  its prompts; splitting preserves per-sample seeds under reordering and
+  sharding, but can reduce throughput because the native backend executes calls
+  sequentially. With `seed=None`, the adapters keep their existing batching and
+  omit the AR seed. Diffusion sampling and x_T recipes are unchanged. This does
+  not assign distinct engine seeds to replicas or guarantee bit-identical GPU
+  outputs across hardware or engine configurations.
+- **vLLM-Omni BAGEL ships the worker's token layout with every row.** `RLBagelPipeline`
+  records the KV length, RoPE offset, and canvas in `BagelDiffusionConditions.layouts`,
+  and `BagelDiffusionStage._resolve_single` raises when the rebuilt context differs, so
+  a prompt or source-image preprocessing change on either side fails the first replay
+  instead of silently training against a different sequence.
+- **Per-row `metadata["canvas"]` is bounded by `sampling.height` / `sampling.width`
+  and only valid for vLLM-Omni BAGEL with `FlowGRPO` (or `BagelFlowUniGRPO` with
+  `ratio_norm=False`).** `BagelAdapter.build_inputs` sends one call per contiguous
+  same-canvas run (`Sample.reject_row_canvases` rejects the key on every other
+  engine), `build_image_segment` right-pads smaller trajectories on the token axis
+  to the default canvas's token count so `LatentSegment.latents` stays dense, and
+  `BagelDiffusionStage.replay` / `predict_velocity_at` trim back to
+  `packed_vae_token_indexes`. Per-token replay anchors (`sde_means` in `FlowDPPO`
+  and `BagelFlowUniGRPO` with `ratio_norm=True`) raise in
+  `prepare_segment_anchors` when micro shapes differ, and `DiffusionNFT` reads
+  `segment.latents[:, -1]` directly and would silently train on the right-padded
+  zeros.
+- **vLLM-Omni BAGEL packs sibling runs, t2i and it2i alike.** With `guidance_scale`
+  and `cfg_img_scale` at 1 or below, each contiguous run of rows from one prompt
+  group is one worker request with `num_outputs_per_prompt` set to the run length:
+  the prompt (and for it2i the source image) is prefilled once and its KV is
+  replicated per sibling. x_T is keyed per row, so a run may be any contiguous
+  part of a group and a `RewardStack` micro may cut a group. Above 1 every row is
+  its own request.

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-import dataclasses
 import logging
-from dataclasses import field
+
+from unirl.rollout.engine.sglang_diffusion._patches.patch_sampling_io import (
+    _make_dataclass_field,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -63,45 +65,6 @@ _MERGE_SENTINEL = "_unirl_conditions_merge"
 _RESULT_COMMON_SENTINEL = "_unirl_conditions_result_common"
 
 
-def patch_conditions() -> None:
-    """Install the fork's text-encoder conditions emission on stock upstream."""
-    import sglang.multimodal_gen.runtime.entrypoints.diffusion_generator as dg_mod
-    import sglang.multimodal_gen.runtime.entrypoints.utils as utils_mod
-    import sglang.multimodal_gen.runtime.managers.gpu_worker as gw_mod
-    import sglang.multimodal_gen.runtime.pipelines_core.schedule_batch as sb_mod
-    from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
-        DecodingStage,
-    )
-
-    _inject_dataclass_fields(
-        sb_mod.OutputBatch,
-        _OUTPUT_BATCH_FIELDS_SENTINEL,
-        type_str="list[torch.Tensor] | None",
-    )
-    _inject_dataclass_fields(
-        utils_mod.GenerationResult,
-        _GEN_RESULT_FIELDS_SENTINEL,
-        type_str="Any",
-    )
-
-    _wrap_decoding_stage(DecodingStage)
-
-    _wrap_req_to_output_batch(gw_mod.GPUWorker)
-
-    _wrap_merge_expanded_output_batches(gw_mod.GPUWorker)
-
-    _wrap_result_common(dg_mod.DiffGenerator)
-
-
-def _make_dataclass_field(name: str, default, type_str: str):
-    """Build a ``dataclasses.Field`` equivalent to ``name: type = default``."""
-    f = field(default=default)
-    f.name = name
-    f.type = type_str
-    f._field_type = dataclasses._FIELD
-    return f
-
-
 def _inject_dataclass_fields(cls, sentinel: str, *, type_str: str) -> None:
     """Register the condition fields onto a plain ``@dataclass`` ``cls``."""
     if getattr(cls, sentinel, False):
@@ -109,7 +72,7 @@ def _inject_dataclass_fields(cls, sentinel: str, *, type_str: str) -> None:
 
     own_fields = cls.__dict__.get("__dataclass_fields__")
     if own_fields is None:  # pragma: no cover - both are dataclasses
-        own_fields = dict(getattr(cls, "__dataclass_fields__", {}))
+        own_fields = dict(cls.__dataclass_fields__)
         cls.__dataclass_fields__ = own_fields
 
     for name in _COND_FIELDS:
@@ -133,106 +96,6 @@ def _inject_dataclass_fields(cls, sentinel: str, *, type_str: str) -> None:
     setattr(cls, sentinel, True)
 
 
-def _wrap_req_to_output_batch(GPUWorker) -> None:
-    """AROUND-wrap the ``@staticmethod`` Req -> OutputBatch conversion."""
-    orig = GPUWorker.__dict__.get("_req_to_output_batch")
-    if orig is None:
-        raise AttributeError("GPUWorker._req_to_output_batch missing upstream")
-    raw = orig.__func__ if isinstance(orig, staticmethod) else orig
-    if getattr(raw, _REQ_TO_OB_SENTINEL, False):
-        return
-
-    def _req_to_output_batch(result):
-        output_batch = raw(result)
-        _copy_conditions(result, output_batch)
-        return output_batch
-
-    setattr(_req_to_output_batch, _REQ_TO_OB_SENTINEL, True)
-    GPUWorker._req_to_output_batch = staticmethod(_req_to_output_batch)
-
-
-def _copy_conditions(src, output_batch) -> None:
-    """Copy the gated conditions fields off ``src`` (a Req) onto ``output_batch``."""
-    if getattr(src, "return_prompt_embeds", False):
-        _copy_mapped_conditions(src, output_batch, _POS_MAP)
-    if getattr(src, "return_negative_prompt_embeds", False):
-        _copy_mapped_conditions(src, output_batch, _NEG_MAP)
-    # A request group contains replicas of one prompt, so its image latents
-    # share one token grid and can remain a regular [B, S_img, C] tensor.
-    image_latent = getattr(src, "image_latent", None)
-    if image_latent is not None:
-        values = image_latent if isinstance(image_latent, (list, tuple)) else [image_latent]
-        output_batch.image_latent = _to_cpu_embed_list(values)
-
-    vae_image_sizes = getattr(src, "vae_image_sizes", None)
-    if vae_image_sizes is not None:
-        output_batch.image_latent_sizes = [vae_image_sizes]
-
-    condition_image_latent_ids = getattr(src, "condition_image_latent_ids", None)
-    if condition_image_latent_ids is not None:
-        values = (
-            condition_image_latent_ids
-            if isinstance(condition_image_latent_ids, (list, tuple))
-            else [condition_image_latent_ids]
-        )
-        output_batch.condition_image_latent_ids = _to_cpu_embed_list(values)
-
-
-def _copy_mapped_conditions(src, output_batch, mapping) -> None:
-    """Copy each ``dst <- srcattr`` field, normalizing un-batched token embeds so"""
-    for dst, srcattr in mapping.items():
-        val = _to_cpu_embed_list(getattr(src, srcattr, None))
-        if dst in _TOKEN_EMBED_DESTS:
-            val = _ensure_batched_embed_list(val)
-            val = _coalesce_duplicate_single_sample_encodes(val)
-        setattr(output_batch, dst, val)
-
-
-def _ensure_batched_embed_list(value):
-    """Add a leading batch dim to any un-batched ``[seq, hidden]`` per-encoder tensor."""
-    if not isinstance(value, (list, tuple)):
-        return value
-    out = [t if (t is None or t.dim() >= 3) else t.unsqueeze(0) for t in value]
-    return out if isinstance(value, list) else type(value)(out)
-
-
-def _coalesce_duplicate_single_sample_encodes(value):
-    """Collapse shallow-copy duplicate prompt encodes."""
-    import torch
-
-    if not isinstance(value, (list, tuple)) or len(value) <= 1:
-        return value
-    if not all(torch.is_tensor(t) for t in value):
-        return value
-
-    first = value[0]
-    first_shape = tuple(first.shape)
-    if first.dim() < 1 or int(first.shape[0]) != 1:
-        return value
-    if any(tuple(t.shape) != first_shape for t in value[1:]):
-        return value
-    if not all(torch.equal(first, t) for t in value[1:]):
-        return value
-    return [first]
-
-
-def _wrap_decoding_stage(DecodingStage) -> None:
-    """AROUND-wrap ``DecodingStage.forward`` to carry conditions onto its OutputBatch."""
-    orig = DecodingStage.__dict__.get("forward")
-    if orig is None:
-        raise AttributeError("DecodingStage.forward missing upstream")
-    if getattr(orig, _DECODING_SENTINEL, False):
-        return
-
-    def forward(self, batch, server_args):
-        output_batch = orig(self, batch, server_args)
-        _copy_conditions(batch, output_batch)
-        return output_batch
-
-    setattr(forward, _DECODING_SENTINEL, True)
-    DecodingStage.forward = forward
-
-
 def _to_cpu_embed_list(value):
     """Detach + move a per-encoder ``list[Tensor]`` embed field to CPU."""
     if value is None:
@@ -247,75 +110,142 @@ def _to_cpu_embed_list(value):
     return value
 
 
-def _wrap_merge_expanded_output_batches(GPUWorker) -> None:
-    """AROUND-wrap the grouped-output merge to carry conditions dim-0 concatenated."""
-    orig = GPUWorker.__dict__.get("_merge_expanded_output_batches")
-    if orig is None:
-        raise AttributeError("GPUWorker._merge_expanded_output_batches missing upstream")
-    raw = orig.__func__ if isinstance(orig, staticmethod) else orig
-    if getattr(raw, _MERGE_SENTINEL, False):
-        return
-
-    def _merge_expanded_output_batches(output_batches):
-        merged = raw(output_batches)
-        _merge_conditions(merged, output_batches)
-        return merged
-
-    setattr(_merge_expanded_output_batches, _MERGE_SENTINEL, True)
-    GPUWorker._merge_expanded_output_batches = staticmethod(_merge_expanded_output_batches)
-
-
-def _merge_conditions(merged, output_batches) -> None:
-    """Concat each conditions field dim-0 across per-output batches onto ``merged``."""
+def _copy_mapped_conditions(src, output_batch, mapping) -> None:
+    """Copy each ``dst <- srcattr`` field, normalizing un-batched token embeds."""
     import torch
 
-    for name in _COND_FIELDS:
-        per_batch = [getattr(ob, name, None) for ob in output_batches]
-        if any(v is None for v in per_batch):
-            continue
-        if not per_batch:
-            continue
-        num_encoders = len(per_batch[0])
-        # All batches must agree on encoder count to concat positionally.
-        if any(len(v) != num_encoders for v in per_batch):
-            logger.warning("conditions merge: inconsistent encoder count for %s; skipping", name)
-            continue
-        merged_list = []
-        for enc_idx in range(num_encoders):
-            tensors = [v[enc_idx] for v in per_batch]
-            if any(t is None for t in tensors):
-                merged_list.append(None)
-            elif name == "image_latent_sizes":
-                # Expanded outputs share one prompt and therefore one source grid.
-                merged_list.append(tensors[0])
-            else:
-                merged_list.append(torch.cat(tensors, dim=0))
-        setattr(merged, name, merged_list)
+    for dst, srcattr in mapping.items():
+        val = _to_cpu_embed_list(getattr(src, srcattr))
+        if dst in _TOKEN_EMBED_DESTS and isinstance(val, (list, tuple)):
+            batched = [t if (t is None or t.dim() >= 3) else t.unsqueeze(0) for t in val]
+            val = batched if isinstance(val, list) else type(val)(batched)
+            if len(val) > 1 and all(torch.is_tensor(t) for t in val):
+                first = val[0]
+                first_shape = first.shape
+                if (
+                    first.dim() >= 1
+                    and first_shape[0] == 1
+                    and all(t.shape == first_shape and torch.equal(first, t) for t in val[1:])
+                ):
+                    val = [first]
+        setattr(output_batch, dst, val)
 
 
-def _wrap_result_common(DiffGenerator) -> None:
-    """AROUND-wrap ``DiffGenerator._result_common`` to add per-output embed slices."""
-    orig = DiffGenerator.__dict__.get("_result_common")
-    if orig is None:
-        raise AttributeError("DiffGenerator._result_common missing upstream")
-    raw = orig.__func__ if isinstance(orig, staticmethod) else orig
-    if getattr(raw, _RESULT_COMMON_SENTINEL, False):
-        return
+def _copy_conditions(src, output_batch) -> None:
+    """Copy the gated conditions fields off ``src`` (a Req) onto ``output_batch``."""
+    if src.return_prompt_embeds:
+        _copy_mapped_conditions(src, output_batch, _POS_MAP)
+    if src.return_negative_prompt_embeds:
+        _copy_mapped_conditions(src, output_batch, _NEG_MAP)
+    # A request group contains replicas of one prompt, so its image latents
+    # share one token grid and can remain a regular [B, S_img, C] tensor.
+    image_latent = src.image_latent
+    if image_latent is not None:
+        values = image_latent if isinstance(image_latent, (list, tuple)) else [image_latent]
+        output_batch.image_latent = _to_cpu_embed_list(values)
 
-    def _result_common(req, output_batch, generation_time, output_index=None):
-        common = raw(req, output_batch, generation_time, output_index)
-        idx = 0 if output_index is None else int(output_index)
-        for name in _COND_FIELDS:
-            val = getattr(output_batch, name, None)
-            common[name] = val if name == "image_latent_sizes" else _slice_embed_list(val, idx)
-        return common
+    vae_image_sizes = src.vae_image_sizes
+    if vae_image_sizes is not None:
+        output_batch.image_latent_sizes = [vae_image_sizes]
 
-    setattr(_result_common, _RESULT_COMMON_SENTINEL, True)
-    DiffGenerator._result_common = staticmethod(_result_common)
+    condition_image_latent_ids = src.condition_image_latent_ids
+    if condition_image_latent_ids is not None:
+        values = (
+            condition_image_latent_ids
+            if isinstance(condition_image_latent_ids, (list, tuple))
+            else [condition_image_latent_ids]
+        )
+        output_batch.condition_image_latent_ids = _to_cpu_embed_list(values)
 
 
-def _slice_embed_list(embed_list, idx: int):
-    """Slice the idx-th sample out of a per-encoder ``list[Tensor]`` field."""
-    if embed_list is None:
-        return None
-    return [t[idx : idx + 1] if t is not None else None for t in embed_list]
+def patch_conditions() -> None:
+    """Install the fork's text-encoder conditions emission on stock upstream."""
+    import sglang.multimodal_gen.runtime.entrypoints.diffusion_generator as dg_mod
+    import sglang.multimodal_gen.runtime.entrypoints.utils as utils_mod
+    import sglang.multimodal_gen.runtime.managers.gpu_worker as gw_mod
+    import sglang.multimodal_gen.runtime.pipelines_core.schedule_batch as sb_mod
+    import torch
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
+        DecodingStage,
+    )
+
+    GPUWorker = gw_mod.GPUWorker
+    DiffGenerator = dg_mod.DiffGenerator
+
+    _inject_dataclass_fields(
+        sb_mod.OutputBatch,
+        _OUTPUT_BATCH_FIELDS_SENTINEL,
+        type_str="list[torch.Tensor] | None",
+    )
+    _inject_dataclass_fields(
+        utils_mod.GenerationResult,
+        _GEN_RESULT_FIELDS_SENTINEL,
+        type_str="Any",
+    )
+
+    orig_decode = DecodingStage.forward
+    if not getattr(orig_decode, _DECODING_SENTINEL, False):
+
+        def forward(self, batch, server_args):
+            output_batch = orig_decode(self, batch, server_args)
+            _copy_conditions(batch, output_batch)
+            return output_batch
+
+        setattr(forward, _DECODING_SENTINEL, True)
+        DecodingStage.forward = forward
+
+    raw_req_to_ob = GPUWorker._req_to_output_batch
+    if not getattr(raw_req_to_ob, _REQ_TO_OB_SENTINEL, False):
+
+        def _req_to_output_batch(result):
+            output_batch = raw_req_to_ob(result)
+            _copy_conditions(result, output_batch)
+            return output_batch
+
+        setattr(_req_to_output_batch, _REQ_TO_OB_SENTINEL, True)
+        GPUWorker._req_to_output_batch = staticmethod(_req_to_output_batch)
+
+    raw_merge = GPUWorker._merge_expanded_output_batches
+    if not getattr(raw_merge, _MERGE_SENTINEL, False):
+
+        def _merge_expanded_output_batches(output_batches):
+            merged = raw_merge(output_batches)
+            for name in _COND_FIELDS:
+                per_batch = [getattr(ob, name) for ob in output_batches]
+                if not per_batch or any(v is None for v in per_batch):
+                    continue
+                num_encoders = len(per_batch[0])
+                if any(len(v) != num_encoders for v in per_batch):
+                    logger.warning("conditions merge: inconsistent encoder count for %s; skipping", name)
+                    continue
+                merged_list = []
+                for enc_idx in range(num_encoders):
+                    tensors = [v[enc_idx] for v in per_batch]
+                    if any(t is None for t in tensors):
+                        merged_list.append(None)
+                    elif name == "image_latent_sizes":
+                        merged_list.append(tensors[0])
+                    else:
+                        merged_list.append(torch.cat(tensors, dim=0))
+                setattr(merged, name, merged_list)
+            return merged
+
+        setattr(_merge_expanded_output_batches, _MERGE_SENTINEL, True)
+        GPUWorker._merge_expanded_output_batches = staticmethod(_merge_expanded_output_batches)
+
+    raw_result_common = DiffGenerator._result_common
+    if not getattr(raw_result_common, _RESULT_COMMON_SENTINEL, False):
+
+        def _result_common(req, output_batch, generation_time, output_index=None):
+            common = raw_result_common(req, output_batch, generation_time, output_index)
+            idx = 0 if output_index is None else output_index
+            for name in _COND_FIELDS:
+                val = getattr(output_batch, name)
+                if name == "image_latent_sizes" or val is None:
+                    common[name] = val
+                else:
+                    common[name] = [t[idx : idx + 1] if t is not None else None for t in val]
+            return common
+
+        setattr(_result_common, _RESULT_COMMON_SENTINEL, True)
+        DiffGenerator._result_common = staticmethod(_result_common)

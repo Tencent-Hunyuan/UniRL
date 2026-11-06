@@ -12,20 +12,10 @@ from unirl.distributed.tensor.transport import TensorTransport
 from unirl.distributed.utils import collect_leaves
 
 
-def _apply_tensor_op(t: torch.Tensor, op: str, *args) -> torch.Tensor:
-    if op == "getitem":
-        return t[args[0]]
-    if op == "reshape":
-        return t.reshape(args[0])
-    if op == "permute":
-        return t.permute(args[0])
-    raise ValueError(f"Unknown tensor op: {op!r}")
-
-
 class WorkerLocalTransport(TensorTransport):
     """Worker-resident transport: ref-count lifecycle, cross-worker NCCL, and ``localize``."""
 
-    REMOTE_OPS: ClassVar[frozenset] = frozenset({"incref", "decref", "tensor_op", "get_cpu", "nccl_send", "nccl_recv"})
+    REMOTE_OPS: ClassVar[frozenset] = frozenset({"incref", "decref", "get_cpu", "nccl_send", "nccl_recv"})
 
     def incref(self, key: Any) -> None:
         """Increment the ref count. No-op by default."""
@@ -52,7 +42,7 @@ class WorkerLocalTransport(TensorTransport):
         """A span's transfer identity wrt ``dst``, or ``None`` if already resolvable there."""
         dst_worker_id, dst_device_id = dst
         h = span.handle
-        if getattr(h, "object_ref", None) is not None:
+        if h.object_ref is not None:
             return None
         if cls._is_local(h, dst_worker_id, dst_device_id, pool):
             return None
@@ -83,13 +73,13 @@ class WorkerLocalTransport(TensorTransport):
         for src_device_id, dst_device_id in sorted(groups):
             keys = groups[(src_device_id, dst_device_id)]
             spans = [to_move[k] for k in keys]
-            recv_ref = pool.slot0_worker(dst_device_id).transport_op.remote(
+            dst_worker = pool.slot0_worker(dst_device_id)
+            recv_ref = dst_worker.transport_op.remote(
                 "nccl_recv", src_device_id, [s.shape for s in spans], [s.dtype for s in spans]
             )
             send_ref = pool.slot0_worker(src_device_id).transport_op.remote("nccl_send", dst_device_id, spans)
             new_handles, _ = ray.get([recv_ref, send_ref])
 
-            dst_worker = pool.slot0_worker(dst_device_id)
             for key, new_h in zip(keys, new_handles):
                 new_h.rebind(dst_worker)
                 moved[key] = TensorSpan(new_h, 0, int(new_h.shape[0]))
@@ -101,8 +91,8 @@ class WorkerLocalTransport(TensorTransport):
         dsts = list(zip(worker_ids, device_ids))
 
         to_move: Dict[tuple, Any] = {}
-        for (s_args, s_kwargs), dst in zip(shards, dsts):
-            for ref in collect_leaves(s_args, TensorRef) + collect_leaves(s_kwargs, TensorRef):
+        for shard, dst in zip(shards, dsts):
+            for ref in collect_leaves(shard, TensorRef):
                 for s in ref.spans:
                     key = cls._move_key(s, dst, pool)
                     if key is not None:
@@ -111,18 +101,7 @@ class WorkerLocalTransport(TensorTransport):
             return shards
 
         moved = cls._move(pool, to_move)
-        return [
-            (
-                map_tree(s_args, cls._replace_leaf(moved, dst, pool)),
-                map_tree(s_kwargs, cls._replace_leaf(moved, dst, pool)),
-            )
-            for (s_args, s_kwargs), dst in zip(shards, dsts)
-        ]
-
-    def tensor_op(self, handle: Any, op: str, *op_args) -> Any:
-        """Round-trip resolve → op → put. Backends with on-worker compute override."""
-        result = _apply_tensor_op(self._resolve_handles([handle])[0], op, *op_args).contiguous()
-        return self.put(result)
+        return [map_tree(shard, cls._replace_leaf(moved, dst, pool)) for shard, dst in zip(shards, dsts)]
 
     def get_cpu(self, handle: Any) -> torch.Tensor:
         """Return the stored tensor as a CPU tensor."""

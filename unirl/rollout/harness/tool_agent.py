@@ -23,7 +23,7 @@ class ToolAgentHarness:
     def __init__(self, *, env: "Environment", sampling: Any, max_turns: int) -> None:
         self.env = env
         self.sampling = sampling
-        self.max_turns = int(max_turns)
+        self.max_turns = max_turns
 
     def run(self, request: "Sample", context: HarnessContext) -> HarnessOutcome:
         sample = request
@@ -51,12 +51,10 @@ class ToolAgentHarness:
             logger.warning("ToolAgentHarness: trajectory failed: %s", exc, exc_info=True)
             return HarnessOutcome(sample, "failed")
         finally:
-            close = getattr(self.env, "close", None)
-            if close is not None:
-                try:
-                    close(sample)
-                except Exception:  # noqa: BLE001 — teardown must not sink the drain
-                    logger.warning("ToolAgentHarness: env.close failed during teardown", exc_info=True)
+            try:
+                self.env.close(sample)
+            except Exception:  # noqa: BLE001 — teardown must not sink the drain
+                logger.warning("ToolAgentHarness: env.close failed during teardown", exc_info=True)
 
 
 __all__ = ["ToolAgentHarness"]

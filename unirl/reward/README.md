@@ -115,15 +115,16 @@ reward_stack:
 ```
 
 A micro can be as small as one row. The exception is an engine that packs a whole
-`samples_per_prompt` group into one request (the vLLM-Omni t2i adapters: SD3, Qwen-Image
-and BAGEL t2i), which the engine reports through `packs_groups(sample)`; there a micro is
+`samples_per_prompt` group into one request (the vLLM-Omni SD3 and Qwen-Image t2i
+adapters), which the engine reports through `packs_groups`; there a micro is
 extended to the end of the group it would otherwise split, so the group is the floor.
-BAGEL it2i, SGLang and the trainside engine take micros of any size.
+vLLM-Omni BAGEL packs whatever contiguous siblings a micro holds, so it, SGLang and the
+trainside engine take micros of any size.
 
 It pays for a reward that costs real time relative to generation, which in practice
 means one served from other GPUs: colocated with PickScore the stack recovers 0.15 s of a
-108.8 s step. Measured with one 8-GPU training node (BAGEL it2i, 256 rows per rollout,
-4 micros per rank) and EditScore behind `reward_service.direct_server` on another node,
+108.8 s step. Measured with one 8-GPU training node (BAGEL it2i at one request per
+sample, 256 rows per rollout, 4 micros per rank) and EditScore behind `reward_service.direct_server` on another node,
 the serial micro loop takes generate+reward from 127.5 s to 111.6 s with an 8B judge and
 from 180.1 s to 144.7 s with a 72B one. Two things change: each rank's micros reach the
 scorer as they finish instead of every rank arriving together after the whole shard, and
@@ -134,6 +135,11 @@ the driver's scoring dispatch round trip disappears; making the POSTs smaller on
 waits for a score. It adds to the serial loop only while the scorer has headroom (8B:
 111.6 s to 106.8 s); a saturated scorer (72B) bounds the step by its throughput however
 the calls are scheduled. A scorer that fails raises after the next micro generates.
+
+The BAGEL it2i times above predate #547: the vLLM-Omni rollout then ran upstream's own
+img2img prefill (a 4902-token ViT prefix at 512x512) instead of the trainside contexts
+(1227 tokens), and it2i generation has taken about a quarter less time since. They have
+not been re-measured.
 
 Once the shard has left the worker the driver has the stack collect garbage (the memory
 monitor's `gc.collect` + `empty_cache` loop): the micro loop leaves enough Python garbage
@@ -216,6 +222,13 @@ new remote reward needs no UniRL code — add it to the server and list its name
   backend returns zeros with `successes=[False]`, and `score_and_attach`'s fail-fast
   then raises on those flags anyway. So it can't silently zero-poison a group; leave
   it `True`.
+- **`monitor_rewards` scores a remote component without training on it.** Each name must
+  also be in `required_rewards`, so the server still scores it. The client leaves it out of
+  the `aggregation_method` input and the `weighted_sum` weight total, and reports it in
+  `component_rewards` as `monitor_<name>`, so `required_rewards` cannot also contain that
+  name. A monitor cannot have a `reward_weights` entry, a panel with no training reward is
+  rejected, and a missing or non-finite monitor fails the sample like any other required
+  reward.
 - **`input_kind` must match the media** (`image`/`video`/`text`) — it picks which
   decoded key the backend sees. Remote allows only `image`/`video`; local scorers
   may be `text`.
@@ -232,6 +245,16 @@ new remote reward needs no UniRL code — add it to the server and list its name
   unbounded.
 - **`base_device` is ignored by the remote backend** (it's HTTP-only); local
   scorers honor it, falling back to CPU with a warning if CUDA is unavailable.
+- **`RewardBackend.load()` materializes models and managed child processes after graph validation** —
+  `LocalRewardBackend.__init__` and `ManagedScorerProcessBackend.__init__` store and validate
+  configuration without loading weights or spawning a child process; `RewardService.__init__`
+  calls `load()` once after its own validation so an invalid reward graph fails before any
+  checkpoint read, child-process boot, or GPU allocation. `load()` is idempotent and the base
+  implementation is a no-op (`RemoteRewardBackend` inherits it since the external HTTP server
+  owns its own lifecycle). Composite/wrapper backends (`T2AVCompositeScorer`,
+  `PerDomainRewardScorer`, `VideoRewardScorer`, or any custom wrapper) fan `load()` out to
+  their children just like `offload`/`onload`/`dispose`, and any scorer constructed directly
+  outside `RewardService` must call `load()` before `compute_rewards`.
 - **Prompt-based rewards use the generation prompt by default.** Set
   `prompt_source: original` to score against the original user prompt instead.
 - **A training `reward:` must relate the prompt to the video.** `RewardService`

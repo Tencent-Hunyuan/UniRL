@@ -30,6 +30,8 @@ pipeline:
   autocast_precision: bf16
   trajectory_precision: bf16
   logprob_precision: fp32
+  # Keep false at micro_batch_size=8 (stacking S=4 SDE steps yields batch 32); flip true at smaller mbs.
+  batch_replay_steps: false
   strategy:
     _target_: unirl.sde.kernels.FlowSDEStrategy
 

@@ -5,11 +5,11 @@
 #     examples/ar/qwen3_drpo_4b_base_dapo_sglang.yaml
 # Build the data once (datasets/dapo_math/prepare_dapo_math.py), then launch (see README.md):
 #     DATA_PATH=data/dapo_math/train.jsonl EVAL_DATA_PATH=data/dapo_math/aime_eval.jsonl \
-#     python -m unirl.train_ar --config-name=ar/qwen3_drpo_4b_base_dapo_sglang num_devices=64
+#     python -m unirl.train_ar --config-name=ar/qwen3_drpo_4b_base_dapo_sglang num_devices=32
 #
 # Shown here: the algorithm + sampling blocks (what the loss does), the advantage
-# flag, and the SGLang rollout + LoRA-sync wiring. Omitted: bundle / pipeline /
-# backend(FSDP+LoRA) / reward / stack / data_source — model & infra, not algorithm.
+# flag, and the SGLang rollout + full-weight sync wiring. Omitted: bundle / pipeline /
+# backend (FSDP full fine-tuning) / reward / stack / data_source — model & infra, not algorithm.
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Advantage normalization (top-level _global_ keys):
@@ -33,6 +33,8 @@ algorithm:
   #   (log_softmax(logits / T)) so new_logp (π) and rollout logp (µ) live on the
   #   same distribution ⇒ ratio_mean ≈ 1 on update 1.
   sampling_temperature: ${sampling.temperature}
+  old_logp_source: rollout       # anchor on the rollout logp µ for every update;
+                                 #   replay = frozen train-side π_old (see README).
   conditions_cls:
     _target_: hydra.utils.get_class
     path: unirl.models.qwen3.conditions.Qwen3ARConditions
@@ -43,8 +45,9 @@ sampling:
   _target_: unirl.types.sampling.ARSamplingParams
   samples_per_prompt: 8          # group size G for the per-prompt advantage (n=8 × batch=64 = 512/rollout)
   temperature: 1.0
-  top_p: 0.9
-  top_k: 20
+  top_p: 1.0                     # no truncation: SGLang's returned logp (log_softmax(logits/T))
+  top_k: 0                       #   is then the exact sampling distribution µ. top_k=20 (Qwen3
+                                 #   default) also collapses group diversity and stalls training.
   max_new_tokens: 8192
 
 # ── SGLang rollout engine (colocate): time-shares each GPU with the FSDP train
@@ -57,25 +60,28 @@ rollout:
     backend: native
     pretrained_model_ckpt_path: ${oc.env:QWEN3_PATH,Qwen/Qwen3-4B-Base}
     tp_size: 1
+    concurrency: 16              # = per-engine sequences at 32 GPUs (64 × 8 / 32)
     samples_pre_expanded: true   # trainer pre-expands req by samples_per_prompt; engine emits n=1
-    system_instruction: /no_think         # keep the base model from emitting a long <think>
-    chat_template_kwargs:                  #   block before \boxed{}
-      enable_thinking: false
+    chat_template_kwargs:
+      enable_thinking: true      # paper setup (long CoT); MUST match pipeline.enable_thinking
     engine_kwargs:
-      mem_fraction_static: 0.6   # colocate headroom (FSDP shard shares the card)
-      attention_backend: triton  # the LoRA-pool sync rides the triton attention path
-      enable_lora: true          # serve the trained LoRA adapter (hot-loaded each sync)
-      max_lora_rank: 16
-      lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
+      rl_on_policy_target: fsdp  # deterministic sampling + log_softmax and FSDP-matching
+                                 #   kernels, so rollout logp µ tracks the trainer's replay
+      mem_fraction_static: 0.3   # leave FSDP headroom for the per-rollout full-weight all-gather
+      skip_server_warmup: true
+      attention_backend: triton
+      disable_cuda_graph: false
+      cuda_graph_max_bs_decode: 16  # cap captured buffers so they don't compete with the weight push
+      enable_lora: false         # full fine-tuning: no LoRA pool
 
-# ── Weight sync: extract the trained LoRA tensors from the FSDP model and
-# hot-load them into the SGLang server as an adapter (POST
-# /load_lora_adapter_from_tensors). This LoRA-pool path tracks the trained policy. ──
+# ── Weight sync: push the full dense FSDP weights into the SGLang server every
+# rollout (update_weights_from_tensor). Qwen3's HF param names match SGLang's
+# weight map, so no name_remap is needed. ──
 sync:
-  _target_: unirl.distributed.weight_sync.lora.LocalLoraWeightSync
-  param_prefix: ""               # send HF-native key names
-  adapter_name: default
-  verify: false                  # verify path is vLLM-Omni-only
+  _target_: unirl.distributed.weight_sync.full.tensor.TensorWeightSync
+  lora_merged: false
+  bucket_size_mb: 64
+  flush_cache: true
 
-# Trust region is single-update: DRPO reuses the rollout logp as old_logp, so
-# stack.num_updates_per_batch must stay 1 (TrainStack raises otherwise).
+# Multi-update is supported: the old_logp anchor is frozen per rollout batch, so
+# the full recipe sets stack.num_updates_per_batch: 4.

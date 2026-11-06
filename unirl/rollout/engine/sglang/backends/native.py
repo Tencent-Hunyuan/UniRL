@@ -157,11 +157,11 @@ class NativeBackend:
         runtime: Dict[str, Any],
     ) -> None:
         self._engine: Optional[Any] = engine
-        self._concurrency = int(concurrency)
+        self._concurrency = concurrency
         self._rt = runtime
         self._logged_first_response = False
         self._lt = LoopThread(engine.loop, label="sglang NativeBackend")
-        self._sem = asyncio.Semaphore(int(concurrency))
+        self._sem = asyncio.Semaphore(concurrency)
 
     @classmethod
     def boot(
@@ -179,7 +179,7 @@ class NativeBackend:
             allowed=allowed,
             backend_name="native",
         )
-        tp_size = int(engine_kwargs.get("tp_size", 1) or 1)
+        tp_size = int(engine_kwargs.get("tp_size", 1))
         if tp_size > 1:
             raise NotImplementedError(
                 "SGLang native backend does not support rollout tp_size>1 in UniRL yet; "
@@ -207,11 +207,11 @@ class NativeBackend:
         multiprocessing.set_start_method("spawn", force=True)
         engine = rt["Engine"](**engine_kwargs)
 
-        settled = getattr(engine, "server_args", None)
+        settled = engine.server_args
         logger.info(
             "SGLang Engine ready (settled ServerArgs: port=%s nccl_port=%s)",
-            getattr(settled, "port", None),
-            getattr(settled, "nccl_port", None),
+            settled.port,
+            settled.nccl_port,
         )
         return cls(engine, concurrency=concurrency, runtime=rt)
 
@@ -389,11 +389,11 @@ class NativeBackend:
         result = self._lt.run_parked(
             lambda: self._engine.init_weights_update_group(
                 master_address=master_address,
-                master_port=int(master_port),
-                rank_offset=int(rank_offset),
-                world_size=int(world_size),
-                group_name=str(group_name),
-                backend=str(backend),
+                master_port=master_port,
+                rank_offset=rank_offset,
+                world_size=world_size,
+                group_name=group_name,
+                backend=backend,
             )
         )
         self._check_result(result, "init_weights_group")
@@ -424,10 +424,10 @@ class NativeBackend:
         self._require_alive("update_from_distributed")
         result = self._lt.run_parked(
             lambda: self._engine.update_weights_from_distributed(
-                names=list(names),
-                dtypes=list(dtypes),
-                shapes=[list(s) for s in shapes],
-                group_name=str(group_name),
+                names=names,
+                dtypes=dtypes,
+                shapes=shapes,
+                group_name=group_name,
                 flush_cache=flush_cache,
             )
         )
@@ -435,7 +435,7 @@ class NativeBackend:
 
     def destroy_weights_group(self, *, group_name: str) -> None:
         self._require_alive("destroy_weights_group")
-        result = self._lt.run_parked(lambda: self._engine.destroy_weights_update_group(group_name=str(group_name)))
+        result = self._lt.run_parked(lambda: self._engine.destroy_weights_update_group(group_name=group_name))
         self._check_result(result, "destroy_weights_group")
 
     def set_lora(

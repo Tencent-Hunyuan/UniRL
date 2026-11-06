@@ -1,7 +1,7 @@
 accelerate>=0.30
 aiohttp>=3.9
 av>=14.2,<19
-diffusers>=0.37.0
+diffusers>=0.38.0
 einops>=0.7
 hydra-core>=1.3
 # Core dependency set aligned with:
@@ -24,7 +24,7 @@ hydra-core>=1.3
 # python-Levenshtein is kept below because it is ~45 KB and pure tooling.
 numpy>=1.24,<3
 omegaconf>=2.3
-peft>=0.14.0
+peft>=0.20
 Pillow>=10
 psutil>=5.9
 python-Levenshtein>=0.27
@@ -34,7 +34,7 @@ safetensors>=0.4
 sglang[diffusion]==0.5.19
 tensordict>=0.5
 timm>=0.9.16
-torch>=2.1
-torchvision>=0.16
+torch>=2.13.0
+torchvision>=0.28.0
 transformers>=5.12,<5.13
 wandb>=0.16,<0.20

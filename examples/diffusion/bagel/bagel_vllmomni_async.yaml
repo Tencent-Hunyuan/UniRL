@@ -22,7 +22,6 @@ transport_kind: colocate_store
 workers_per_device: 1
 
 # AsyncDiffusionTrainer requires disjoint train/rollout slabs.
-layout: separate
 train_fraction: 0.5            # 4 train GPUs + 4 rollout GPUs on an 8-GPU pool
 
 max_inflight: 1                # must stay 1: protects cross-slab transfer and one SDE schedule per batch

@@ -37,129 +37,109 @@ class AgenticRolloutEngine(BaseRolloutEngine):
             f"AgenticRolloutEngine requires AgenticRolloutEngineConfig; got {type(config).__name__}",
         )
         self.cfg = config
-        self.rank = rank
 
         deps = dict(device=device, rank=rank, model_config=model_config)
-        self._env = config.env
-        require(self._env is not None, "AgenticRolloutEngine requires an env (config.env)")
-        self._maybe_inject_tool_schemas(config.inner, self._env)
-        inner = config.inner.make_engine(strategy=strategy, **deps)
-        if not isinstance(inner, BaseRolloutEngine):
-            shutdown = getattr(inner, "shutdown", None)
-            if callable(shutdown):
-                shutdown()
-            raise ValueError(
-                f"AgenticRolloutEngine inner must implement the single-turn engine contract; got {type(inner).__name__}"
-            )
-        self._inner: BaseRolloutEngine = inner
+        env = config.env
+        require(env is not None, "AgenticRolloutEngine requires an env (config.env)")
+        raw_kwargs = config.inner.chat_template_kwargs
+        chat_template_kwargs = {} if raw_kwargs is None else dict(raw_kwargs)
+        chat_template_kwargs.setdefault("tools", env.tool_schemas())
+        config.inner.chat_template_kwargs = chat_template_kwargs
+        self.inner: BaseRolloutEngine = config.inner.make_engine(strategy=strategy, **deps)
 
-        self._max_turns = int(config.max_turns)
-        env_max_turns = getattr(self._env, "max_turns", None)
         require(
-            env_max_turns is None or int(env_max_turns) == self._max_turns,
-            f"env.max_turns ({env_max_turns}) must equal config.max_turns ({self._max_turns})",
+            env.max_turns == config.max_turns,
+            f"env.max_turns ({env.max_turns}) must equal config.max_turns ({config.max_turns})",
         )
-        self._stopping = False
-        self._harness: RolloutHarness = ToolAgentHarness(
-            env=self._env,
+        self.stopping = False
+        self.harness: RolloutHarness = ToolAgentHarness(
+            env=env,
             sampling=config.episode_sampling,
-            max_turns=self._max_turns,
+            max_turns=config.max_turns,
         )
-        self._harness_ctx = HarnessContext(
-            engines={"policy": self._inner.generate},
-            suspend=lambda: self._stopping,
+        self.harness_ctx = HarnessContext(
+            engines={"policy": self.inner.generate},
+            suspend=lambda: self.stopping,
         )
-
-    @staticmethod
-    def _maybe_inject_tool_schemas(inner_cfg: Any, env: Any) -> None:
-        get_schemas = getattr(env, "tool_schemas", None)
-        if not callable(get_schemas) or not hasattr(inner_cfg, "chat_template_kwargs"):
-            return
-        chat_template_kwargs = dict(inner_cfg.chat_template_kwargs or {})
-        chat_template_kwargs.setdefault("tools", get_schemas())
-        inner_cfg.chat_template_kwargs = chat_template_kwargs
 
     def generate(self, sample: Sample) -> Sample:
         try:
-            outcome = self._harness.run(sample, self._harness_ctx)
+            outcome = self.harness.run(sample, self.harness_ctx)
             if outcome.status not in ("completed", "suspended", "failed", "overflow"):
                 raise ValueError(f"unknown harness outcome status: {outcome.status!r}")
-            return self._stamp_outcome(outcome.sample, outcome.status)
+            target, status = outcome.sample, outcome.status
         except Exception:  # noqa: BLE001 — last-resort net: a harness bug fails one trajectory, not the run
             logger.warning(
                 "AgenticRolloutEngine: harness escaped its own net; marking trajectory failed", exc_info=True
             )
-            return self._stamp_outcome(sample, "failed")
-
-    @staticmethod
-    def _stamp_outcome(sample: Sample, status: str) -> Sample:
-        if not sample.parts:
-            return sample
-        last = _part_with_field(sample.parts[-1], "harness_status", status)
-        return sample.with_parts([*sample.parts[:-1], last])
+            target, status = sample, "failed"
+        if not target.parts:
+            return target
+        last = _part_with_field(target.parts[-1], "harness_status", status)
+        return target.with_parts([*target.parts[:-1], last])
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def set_stopping(self, stopping: bool = True) -> None:
-        self._stopping = bool(stopping)
+        self.stopping = stopping
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def shutdown(self) -> None:
-        self._inner.shutdown()
+        self.inner.shutdown()
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def sleep(self) -> None:
-        self._inner.sleep()
+        self.inner.sleep()
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def wake_up(self) -> None:
-        self._inner.wake_up()
+        self.inner.wake_up()
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def onload_weights(self, *, track_prefix: str = "") -> None:
-        self._inner.onload_weights(track_prefix=track_prefix)
+        self.inner.onload_weights(track_prefix=track_prefix)
 
     @property
     def is_offloaded(self) -> bool:
-        return self._inner.is_offloaded
+        return self.inner.is_offloaded
 
     @property
     def tensor_weight_sync_target(self) -> BaseRolloutEngine:
         """The concrete receiver whose serializer contract tensor sync follows."""
-        return self._inner
+        return self.inner
 
     def health_check(self) -> bool:
-        return self._inner.health_check()
+        return self.inner.health_check()
 
     def get_memory_info(self) -> Dict[str, float]:
-        return self._inner.get_memory_info()
+        return self.inner.get_memory_info()
 
     def pause(self) -> None:
-        self._inner.pause()
+        self.inner.pause()
 
     def resume(self) -> None:
-        self._inner.resume()
+        self.inner.resume()
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def set_version(self, train_version: int) -> None:
-        self._inner.set_version(train_version)
+        self.inner.set_version(train_version)
 
     def init_weights_update_group(self, **kwargs: Any) -> None:
-        self._inner.init_weights_update_group(**kwargs)
+        self.inner.init_weights_update_group(**kwargs)
 
     def update_weights_from_distributed(self, **kwargs: Any) -> None:
-        self._inner.update_weights_from_distributed(**kwargs)
+        self.inner.update_weights_from_distributed(**kwargs)
 
     def destroy_weights_update_group(self, **kwargs: Any) -> None:
-        self._inner.destroy_weights_update_group(**kwargs)
+        self.inner.destroy_weights_update_group(**kwargs)
 
     def update_weights_from_ipc(self, **kwargs: Any) -> None:
-        self._inner.update_weights_from_ipc(**kwargs)
+        self.inner.update_weights_from_ipc(**kwargs)
 
     def update_weights_from_tensor(self, **kwargs: Any) -> None:
-        self._inner.update_weights_from_tensor(**kwargs)
+        self.inner.update_weights_from_tensor(**kwargs)
 
     def set_lora_from_tensors(self, adapter_name: str, lora_tensors: Dict[str, Any], **kwargs: Any) -> None:
-        self._inner.set_lora_from_tensors(adapter_name, lora_tensors, **kwargs)
+        self.inner.set_lora_from_tensors(adapter_name, lora_tensors, **kwargs)
 
 
 __all__ = ["AgenticRolloutEngine"]

@@ -2,8 +2,8 @@
 # MiniMax-H3 t2va Flow-GRPO — 2 nodes x 8 GPUs, trainside HSDP validation.
 #
 # This inherits the model, mixed-dtype, and LoRA settings from
-# minimax_h3_t2va_trainside and pins the canvas, group size, and reward
-# placement it was validated with. Otherwise only the distributed topology
+# minimax_h3_t2va_trainside and pins the canvas, group size, reward placement,
+# and allocator mode it was validated with. Otherwise only the distributed topology
 # changes: each 8-rank group shards the 33B transformer, and the two groups
 # hold replicated model copies whose gradients are synchronized.
 #
@@ -32,6 +32,7 @@ backend:
   fsdp_cfg:
     fsdp_mode: hybrid
     hsdp_shard_size: 8
+    expandable_segments: false
 
 reward:
   backend:

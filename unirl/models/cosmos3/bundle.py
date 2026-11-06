@@ -194,11 +194,7 @@ def _patch_h20_strided_gemm(transformer: torch.nn.Module) -> None:
             ),
             "dispatch_attention_fn",
         )
-        try:
-            from torch.nn.attention import SDPBackend, sdpa_kernel
-        except ImportError:  # pragma: no cover
-            sdpa_kernel = None
-            SDPBackend = None
+        from torch.nn.attention import SDPBackend, sdpa_kernel
 
         def wrapped(query, key, value, *args, **kwargs):
             q = query.contiguous()
@@ -215,8 +211,6 @@ def _patch_h20_strided_gemm(transformer: torch.nn.Module) -> None:
                 v = v.repeat_interleave(nrep, dim=-2).contiguous()
                 kwargs = dict(kwargs)
                 kwargs["enable_gqa"] = False
-            if sdpa_kernel is None:
-                return orig(q, k, v, *args, **kwargs)
             if q.dtype == torch.float32:
                 backends = SDPBackend.EFFICIENT_ATTENTION
             else:
@@ -326,7 +320,7 @@ class Cosmos3Bundle(Bundle):
     def flow_shift(self) -> float:
         """Effective flow shift: config override, else the checkpoint scheduler's."""
         if self.config.flow_shift is not None:
-            return float(self.config.flow_shift)
+            return self.config.flow_shift
         return float(getattr(self.scheduler.config, "flow_shift", 5.0))
 
 

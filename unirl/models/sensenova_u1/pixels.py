@@ -78,7 +78,7 @@ class SenseNovaU1PixelDecodeStage(DecodeStage[LatentSegment, Images]):
     @property
     def pixel_patch_size(self) -> int:
         model = self.bundle.model
-        return int(model.patch_size) * int(1 / float(model.downsample_ratio))
+        return model.patch_size * int(1 / model.downsample_ratio)
 
     def decode(
         self,

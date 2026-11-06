@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 import sys
 from typing import Any, Callable, Dict, NamedTuple
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 
@@ -38,52 +40,6 @@ def _sp() -> _SP:
     return _SP(
         get_parallel_state, slice_input_tensor, gather_outputs, gather_seq_scatter_heads, gather_heads_scatter_seq
     )
-
-
-def _reject_attn_mask(args: Any, kwargs: Any) -> None:
-    """diffusion SP v1 has no masked path; refuse if diffusers built an attn mask."""
-    if kwargs.get("attn_mask", args[0] if args else None) is not None:
-        raise NotImplementedError(
-            "diffusion SP v1 does not support an attention mask under Ulysses; "
-            "ensure each stream length is divisible by sp_size so no mask is built."
-        )
-
-
-def _make_ulysses_dispatch(orig_dispatch: Callable) -> Callable:
-    import functools
-
-    sp = _sp()
-    get_parallel_state = sp.get_parallel_state
-    gather_seq_scatter_heads = sp.gather_seq_scatter_heads
-    gather_heads_scatter_seq = sp.gather_heads_scatter_seq
-
-    @functools.wraps(orig_dispatch)
-    def ulysses_dispatch(query: Tensor, key: Tensor, value: Tensor, *args: Any, **kwargs: Any):
-        ps = get_parallel_state()
-        if not ps.ulysses_enabled or query.shape[1] != key.shape[1]:
-            return orig_dispatch(query, key, value, *args, **kwargs)
-        _reject_attn_mask(args, kwargs)
-
-        g = ps.sp_group
-        query = gather_seq_scatter_heads(query, seq_dim=1, head_dim=2, group=g)
-        key = gather_seq_scatter_heads(key, seq_dim=1, head_dim=2, group=g)
-        value = gather_seq_scatter_heads(value, seq_dim=1, head_dim=2, group=g)
-        out = orig_dispatch(query, key, value, *args, **kwargs)
-        return gather_heads_scatter_seq(out, head_dim=2, seq_dim=1, group=g)
-
-    ulysses_dispatch._unirl_sp_patched = True
-    return ulysses_dispatch
-
-
-def _patch_attention_dispatch(model: nn.Module) -> bool:
-    """Wrap the model module's ``dispatch_attention_fn`` with the Ulysses all-to-all."""
-    module = sys.modules.get(type(model).__module__)
-    if module is None or not hasattr(module, "dispatch_attention_fn"):
-        return False
-    if not getattr(module.dispatch_attention_fn, "_unirl_sp_patched", False):
-        module.dispatch_attention_fn = _make_ulysses_dispatch(module.dispatch_attention_fn)
-        logger.info("diffusion SP: patched %s.dispatch_attention_fn with Ulysses all-to-all", module.__name__)
-    return True
 
 
 def apply_rotary_emb(x: Tensor, freqs_cis: tuple[Tensor, Tensor]) -> Tensor:
@@ -144,7 +100,19 @@ class SPAttentionProcessor:
         kv_in = hidden_states if (has_added_kv or not is_cross) else encoder_hidden_states
         query, key, value, inner = self._project_qkv(attn, hidden_states, kv_in, b)
         if has_added_kv:
-            query, key, value = self._prepend_added_kv(attn, encoder_hidden_states, query, key, value, b, inner)
+            hd = inner // attn.heads
+            enc_q = attn.add_q_proj(encoder_hidden_states).view(b, -1, attn.heads, hd)
+            enc_k = attn.add_k_proj(encoder_hidden_states).view(b, -1, attn.heads, hd)
+            enc_v = attn.add_v_proj(encoder_hidden_states).view(b, -1, attn.heads, hd)
+            if getattr(attn, "norm_added_q", None) is not None:
+                enc_q = attn.norm_added_q(enc_q)
+            if getattr(attn, "norm_added_k", None) is not None:
+                enc_k = attn.norm_added_k(enc_k)
+            query, key, value = (
+                torch.cat([enc_q, query], 1),
+                torch.cat([enc_k, key], 1),
+                torch.cat([enc_v, value], 1),
+            )
 
         if image_rotary_emb is not None:
             query = apply_rotary_emb(query, image_rotary_emb)
@@ -152,10 +120,42 @@ class SPAttentionProcessor:
         scale = attn.scale if hasattr(attn, "scale") else (inner // attn.heads) ** -0.5
 
         if has_added_kv:
-            return self._dual_stream_attend(
-                attn, query, key, value, encoder_hidden_states.shape[1], scale, attention_mask, b, inner
+            enc_len = encoder_hidden_states.shape[1]
+            encoder_first = type(self.original_processor).__name__ != "JointAttnProcessor2_0"
+            enc_q, img_q = query[:, :enc_len], query[:, enc_len:]
+            enc_k, img_k = key[:, :enc_len], key[:, enc_len:]
+            enc_v, img_v = value[:, :enc_len], value[:, enc_len:]
+            enc_q, enc_k, enc_v = self._a2a_sh(enc_q), self._a2a_sh(enc_k), self._a2a_sh(enc_v)
+            img_q, img_k, img_v = self._a2a_sh(img_q), self._a2a_sh(img_k), self._a2a_sh(img_v)
+            if encoder_first:
+                q, k, v = torch.cat([enc_q, img_q], 1), torch.cat([enc_k, img_k], 1), torch.cat([enc_v, img_v], 1)
+            else:
+                q, k, v = torch.cat([img_q, enc_q], 1), torch.cat([img_k, enc_k], 1), torch.cat([img_v, enc_v], 1)
+            out = _sdpa(q, k, v, scale, attention_mask)
+            full_enc, full_img = enc_q.shape[1], img_q.shape[1]
+            enc_out, img_out = (
+                (out[:, :full_enc], out[:, full_enc:]) if encoder_first else (out[:, full_img:], out[:, :full_img])
             )
-        return self._single_stream_attend(attn, query, key, value, is_cross, scale, attention_mask, b, inner)
+            enc_out, img_out = self._a2a_hs(enc_out), self._a2a_hs(img_out)
+            hs = attn.to_out[0](img_out.reshape(b, -1, inner))
+            if len(attn.to_out) > 1:
+                hs = attn.to_out[1](hs)
+            enc = enc_out.reshape(b, -1, inner)
+            if not getattr(attn, "context_pre_only", False):
+                enc = attn.to_add_out(enc)
+            return hs, enc
+
+        if is_cross:
+            out = _sdpa(query, key, value, scale, attention_mask)
+        else:
+            query, key, value = self._a2a_sh(query), self._a2a_sh(key), self._a2a_sh(value)
+            out = self._a2a_hs(_sdpa(query, key, value, scale, attention_mask))
+        hs = out.reshape(b, -1, inner)
+        if getattr(attn, "to_out", None) is not None:
+            hs = attn.to_out[0](hs)
+            if len(attn.to_out) > 1:
+                hs = attn.to_out[1](hs)
+        return hs
 
     def _project_qkv(self, attn, hidden_states, kv_in, b):
         """Project Q/K/V and apply QK-norm before or after the head-reshape, matching ``normalized_shape``."""
@@ -183,62 +183,8 @@ class SPAttentionProcessor:
                 key = attn.norm_k(key)
         return query, key, value, inner
 
-    def _prepend_added_kv(self, attn, encoder_hidden_states, query, key, value, b, inner):
-        """Joint attention: project the encoder stream's added Q/K/V (+QK-norm) and prepend it."""
-        hd = inner // attn.heads
-        enc_q = attn.add_q_proj(encoder_hidden_states).view(b, -1, attn.heads, hd)
-        enc_k = attn.add_k_proj(encoder_hidden_states).view(b, -1, attn.heads, hd)
-        enc_v = attn.add_v_proj(encoder_hidden_states).view(b, -1, attn.heads, hd)
-        if getattr(attn, "norm_added_q", None) is not None:
-            enc_q = attn.norm_added_q(enc_q)
-        if getattr(attn, "norm_added_k", None) is not None:
-            enc_k = attn.norm_added_k(enc_k)
-        return torch.cat([enc_q, query], 1), torch.cat([enc_k, key], 1), torch.cat([enc_v, value], 1)
-
-    def _dual_stream_attend(self, attn, query, key, value, enc_len, scale, attention_mask, b, inner):
-        """Joint streams: split, all-to-all each, attend in the processor's order, invert, then split back."""
-        encoder_first = type(self.original_processor).__name__ != "JointAttnProcessor2_0"
-        enc_q, img_q = query[:, :enc_len], query[:, enc_len:]
-        enc_k, img_k = key[:, :enc_len], key[:, enc_len:]
-        enc_v, img_v = value[:, :enc_len], value[:, enc_len:]
-        enc_q, enc_k, enc_v = self._a2a_sh(enc_q), self._a2a_sh(enc_k), self._a2a_sh(enc_v)
-        img_q, img_k, img_v = self._a2a_sh(img_q), self._a2a_sh(img_k), self._a2a_sh(img_v)
-        if encoder_first:
-            q, k, v = torch.cat([enc_q, img_q], 1), torch.cat([enc_k, img_k], 1), torch.cat([enc_v, img_v], 1)
-        else:
-            q, k, v = torch.cat([img_q, enc_q], 1), torch.cat([img_k, enc_k], 1), torch.cat([img_v, enc_v], 1)
-        out = _sdpa(q, k, v, scale, attention_mask)
-        full_enc, full_img = enc_q.shape[1], img_q.shape[1]
-        enc_out, img_out = (
-            (out[:, :full_enc], out[:, full_enc:]) if encoder_first else (out[:, full_img:], out[:, :full_img])
-        )
-        enc_out, img_out = self._a2a_hs(enc_out), self._a2a_hs(img_out)
-        hs = attn.to_out[0](img_out.reshape(b, -1, inner))
-        if len(attn.to_out) > 1:
-            hs = attn.to_out[1](hs)
-        enc = enc_out.reshape(b, -1, inner)
-        if not getattr(attn, "context_pre_only", False):
-            enc = attn.to_add_out(enc)
-        return hs, enc
-
-    def _single_stream_attend(self, attn, query, key, value, is_cross, scale, attention_mask, b, inner):
-        """Cross-attention: attend locally (no all-to-all). Self-attention: full all-to-all."""
-        if is_cross:
-            out = _sdpa(query, key, value, scale, attention_mask)
-        else:
-            query, key, value = self._a2a_sh(query), self._a2a_sh(key), self._a2a_sh(value)
-            out = self._a2a_hs(_sdpa(query, key, value, scale, attention_mask))
-        hs = out.reshape(b, -1, inner)
-        if getattr(attn, "to_out", None) is not None:
-            hs = attn.to_out[0](hs)
-            if len(attn.to_out) > 1:
-                hs = attn.to_out[1](hs)
-        return hs
-
 
 def inject_sp_processors(model: nn.Module, sp_group: Any) -> int:
-    import torch.distributed as dist
-
     sp_size = dist.get_world_size(sp_group)
     count = 0
     for name, module in model.named_modules():
@@ -250,6 +196,10 @@ def inject_sp_processors(model: nn.Module, sp_group: Any) -> int:
                 )
             module.set_processor(SPAttentionProcessor(sp_group, original_processor=module.get_processor()))
             count += 1
+    if count == 0:
+        raise RuntimeError(
+            f"inject_sp_processors: found 0 attention modules with set_processor/get_processor on {type(model).__name__}"
+        )
     logger.info("diffusion SP: injected SPAttentionProcessor into %d attention modules", count)
     return count
 
@@ -276,8 +226,6 @@ def _install_boundary_hooks(
         sp.gather_outputs,
     )
     state: Dict[str, int] = {}
-    import torch.distributed as dist
-
     sp_size = dist.get_world_size(sp_group)
 
     def block0_pre(_m, args, kwargs):
@@ -348,9 +296,38 @@ def register(class_name: str) -> Callable[[Callable], Callable]:
 
 def apply_diffusion_sequence_parallelism(model: nn.Module, sp_size: int) -> None:
     """Attention SP (dispatch-patch or processor-injection, auto-detected) + boundary hooks."""
-    sp_group = _sp().get_parallel_state().sp_group
+    sp = _sp()
+    sp_group = sp.get_parallel_state().sp_group
 
-    if not _patch_attention_dispatch(model):
+    module = sys.modules.get(type(model).__module__)
+    if module is not None and hasattr(module, "dispatch_attention_fn"):
+        if not getattr(module.dispatch_attention_fn, "_unirl_sp_patched", False):
+            orig_dispatch = module.dispatch_attention_fn
+            get_parallel_state = sp.get_parallel_state
+            gather_seq_scatter_heads = sp.gather_seq_scatter_heads
+            gather_heads_scatter_seq = sp.gather_heads_scatter_seq
+
+            @functools.wraps(orig_dispatch)
+            def ulysses_dispatch(query: Tensor, key: Tensor, value: Tensor, *args: Any, **kwargs: Any):
+                ps = get_parallel_state()
+                if not ps.ulysses_enabled or query.shape[1] != key.shape[1]:
+                    return orig_dispatch(query, key, value, *args, **kwargs)
+                if kwargs.get("attn_mask", args[0] if args else None) is not None:
+                    raise NotImplementedError(
+                        "diffusion SP v1 does not support an attention mask under Ulysses; "
+                        "ensure each stream length is divisible by sp_size so no mask is built."
+                    )
+                g = ps.sp_group
+                query = gather_seq_scatter_heads(query, seq_dim=1, head_dim=2, group=g)
+                key = gather_seq_scatter_heads(key, seq_dim=1, head_dim=2, group=g)
+                value = gather_seq_scatter_heads(value, seq_dim=1, head_dim=2, group=g)
+                out = orig_dispatch(query, key, value, *args, **kwargs)
+                return gather_heads_scatter_seq(out, head_dim=2, seq_dim=1, group=g)
+
+            ulysses_dispatch._unirl_sp_patched = True
+            module.dispatch_attention_fn = ulysses_dispatch
+            logger.info("diffusion SP: patched %s.dispatch_attention_fn with Ulysses all-to-all", module.__name__)
+    else:
         inject_sp_processors(model, sp_group)
 
     cls = type(model).__name__

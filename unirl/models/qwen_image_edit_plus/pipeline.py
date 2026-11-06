@@ -75,8 +75,8 @@ class QwenImageEditPlusPipeline(Pipeline):
         from unirl.sde.runtime import FlowMatchSchedulePolicy
 
         return FlowMatchSchedulePolicy.from_pretrained(
-            getattr(self.bundle, "pretrained_path", None),
-            shift=float(self.shift),
+            self.bundle.pretrained_path,
+            shift=self.shift,
             require_dynamic=True,
             dynamic_overrides=_qwen_image_dynamic_overrides(),
         )
@@ -84,8 +84,8 @@ class QwenImageEditPlusPipeline(Pipeline):
     @classmethod
     def latent_shape(cls, *, model_config: Any, sampling_spec: Any) -> tuple:
         """Per-sample latent shape ``(C, H_lat, W_lat)`` for driver-side"""
-        height = int(sampling_spec.height)
-        width = int(sampling_spec.width)
+        height = sampling_spec.height
+        width = sampling_spec.width
         vae_scale_factor = 8
         latent_h = 2 * (height // (vae_scale_factor * 2))
         latent_w = 2 * (width // (vae_scale_factor * 2))
@@ -125,7 +125,7 @@ class QwenImageEditPlusPipeline(Pipeline):
             diffusion=diffusion,
             vae_encode=vae_encode,
             vae_decode=vae_decode,
-            shift=float(config.shift),
+            shift=config.shift,
             max_sequence_length=config.max_sequence_length,
             use_condition_image_prompt=config.use_condition_image_prompt,
             processor_path=config.text_encoder_ckpt_path or config.pretrained_model_ckpt_path,
@@ -171,7 +171,7 @@ class QwenImageEditPlusPipeline(Pipeline):
                 "QwenImageEditPlusPipeline.generate: frontier sampling_params.sigmas is None; "
                 "the hosting engine must pin the schedule before pipeline.generate."
             )
-        if int(params.height) % 16 or int(params.width) % 16:
+        if params.height % 16 or params.width % 16:
             raise ValueError(
                 f"QwenImageEditPlusPipeline.generate: height ({params.height}) and width "
                 f"({params.width}) must be divisible by 16"
@@ -199,7 +199,7 @@ class QwenImageEditPlusPipeline(Pipeline):
         edit_conds = self.build_conditions(
             texts,
             images=images,
-            guidance_scale=float(params.guidance_scale),
+            guidance_scale=params.guidance_scale,
         )
         image_latent = self.vae_encode.encode(images)
         edit_conds.image_latent = image_latent

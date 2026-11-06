@@ -61,6 +61,8 @@ model_config:
   model_precision: bf16
   max_sequence_length: 512
   shift: 1.0
+  load_text_encoder: false
+  load_vae: false
   use_lora: true
   lora_target_modules: &lora_targets
     - to_q
@@ -92,6 +94,7 @@ pipeline:
   logprob_precision: fp32
   max_sequence_length: 512
   qwen3_extraction_layers: [9, 18, 27]
+  batch_replay_steps: true
   strategy: ${strategy}
 
 backend:

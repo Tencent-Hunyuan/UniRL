@@ -38,7 +38,7 @@ class QwenImageVAEDecodeStage(DecodeStage[LatentSegment, Images]):
         clean = s.latents[:, -1]
 
         vae = self.bundle.vae
-        z_dim = int(vae.config.z_dim)
+        z_dim = vae.config.z_dim
         device = clean.device
 
         def _decode(lat: torch.Tensor) -> torch.Tensor:

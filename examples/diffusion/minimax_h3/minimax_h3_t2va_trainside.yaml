@@ -67,6 +67,10 @@ backend:
     param_dtype: bf16
     # bf16 masters round a ~1e-4 Adam step to zero once |w| > 2^-5.
     master_dtype: fp32
+    # The step peaks near the H20's 96 GB. Without it the 1.3 GB per-block
+    # all-gather buffer misses the allocator cache, and each miss frees cached
+    # blocks and syncs the device: ~6k retries per 3 rollouts, +11% train time.
+    expandable_segments: true
     cpu_offload: false
     mixed_precision: true
     # Keep the fp32 timestep embedding intact until each block casts the

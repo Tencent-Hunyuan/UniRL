@@ -3,7 +3,8 @@
 One RewardModelCfg per reward (e.g. hpsv2, clip, unified_reward). The
 scorer field selects which BaseScorer subclass to instantiate; params is
 forwarded to its constructor verbatim. num_gpus and replicas control how
-many Ray actors start and how many GPUs each one owns exclusively.
+many Ray actors start and which integer or opt-in fractional resources they
+reserve.
 
 For multi-host deployments, ClusterCfg tells the WorkerPool to
 ``ray.init(address=...)`` against an externally-managed Ray cluster
@@ -13,6 +14,8 @@ the matching pdsh bootstrap.
 
 from __future__ import annotations
 
+import math
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -29,6 +32,16 @@ _DEFAULT_SCORE_TIMEOUT_S = 120.0
 # before spilling to the next). "spread" asks Ray to distribute this
 # group's actors across nodes — a soft hint, not a hard placement group.
 _VALID_SCHEDULING = ("pack", "spread")
+_MEMORY_RE = re.compile(r"^([1-9][0-9]*)\s*(M|MiB|G|GiB)$", re.IGNORECASE)
+_DEFAULT_MPS_ACTIVE_THREAD_PCT = 100
+
+
+@dataclass(frozen=True)
+class MpsClientCfg:
+    """Limits applied by CUDA when an actor creates its first MPS context."""
+
+    active_thread_percentage: int = _DEFAULT_MPS_ACTIVE_THREAD_PCT
+    device_memory_limit_mib: int | None = None
 
 
 @dataclass(frozen=True)
@@ -54,6 +67,7 @@ class RewardModelCfg:
     # cluster with num_replicas > 1. Single-replica groups ignore this.
     scheduling: str = "pack"
     params: dict[str, Any] = field(default_factory=dict)
+    mps: MpsClientCfg | None = None
 
 
 @dataclass(frozen=True)
@@ -101,12 +115,15 @@ def _parse_bounded_number(
 ):
     """Coerce ``raw[key]`` with ``caster`` and require ``value >= min_value``.
 
-    Used for the four numeric fields in a reward config that share the same
+    Used for the numeric fields in a reward config that share the same
     "coerce to type, check lower bound, raise with context" shape. Returns
     the validated value.
     """
-    value = caster(raw.get(key, default))
-    if value < min_value:
+    raw_value = raw.get(key, default)
+    if isinstance(raw_value, bool):
+        raise ValueError(f"{context} must be a number, got {raw_value!r}")
+    value = caster(raw_value)
+    if not math.isfinite(value) or value < min_value:
         raise ValueError(f"{context} must be >= {min_value}, got {value}")
     return value
 
@@ -205,6 +222,36 @@ def load_config(path: str | Path) -> ServiceCfg:
                 f"{ctx} scheduling must be one of {_VALID_SCHEDULING}, got {scheduling!r}"
             )
         params = dict(entry.get("params") or {})
+        mps_entry = entry.get("mps")
+        if mps_entry is None:
+            mps_client = None
+        else:
+            if not isinstance(mps_entry, dict):
+                raise ValueError(f"{ctx} mps must be a mapping")
+            if not 0 < num_gpus <= 1:
+                raise ValueError(f"{ctx} MPS requires 0 < num_gpus <= 1, got {num_gpus}")
+            active = mps_entry.get(
+                "active_thread_percentage", _DEFAULT_MPS_ACTIVE_THREAD_PCT
+            )
+            if isinstance(active, bool) or not isinstance(active, int) or not 1 <= active <= 100:
+                raise ValueError(
+                    f"{ctx} mps.active_thread_percentage must be an integer in [1, 100]"
+                )
+            memory = mps_entry.get("device_memory_limit")
+            if memory is None:
+                memory_mib = None
+            else:
+                match = _MEMORY_RE.fullmatch(memory.strip()) if isinstance(memory, str) else None
+                if match is None:
+                    raise ValueError(
+                        f"{ctx} mps.device_memory_limit must use M/MiB/G/GiB units, got {memory!r}"
+                    )
+                amount = int(match.group(1))
+                memory_mib = amount * 1024 if match.group(2).lower().startswith("g") else amount
+            mps_client = MpsClientCfg(
+                active_thread_percentage=active,
+                device_memory_limit_mib=memory_mib,
+            )
         # vLLM scorers place `tensor_parallel_size` N GPUs inside one Ray
         # actor via `ScorerActor.options(num_gpus=...)`. If the actor was
         # allocated fewer than N GPUs, vLLM's initialize_ray_cluster can't
@@ -236,10 +283,14 @@ def load_config(path: str | Path) -> ServiceCfg:
                 max_concurrency=max_concurrency,
                 scheduling=scheduling,
                 params=params,
+                mps=mps_client,
             )
         )
 
     if not rewards:
         raise ValueError("at least one reward must be configured")
+
+    if cluster.ray_address and any(reward.mps for reward in rewards):
+        raise ValueError("MPS is single-node only and cannot be used with cluster.ray_address")
 
     return ServiceCfg(server=server, rewards=rewards, cluster=cluster)

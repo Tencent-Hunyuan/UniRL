@@ -21,6 +21,13 @@ class HunyuanVideo10VAEDecodeStage(DecodeStage[LatentSegment, Videos]):
 
     def decode(self, s: LatentSegment, *, grad: bool = False, activation_checkpoint: bool = False) -> Videos:
         """Decode the final-step latents in *s* into a packed ``Videos`` payload."""
+        if self.bundle.vae is None:
+            raise RuntimeError(
+                "HunyuanVideo10VAEDecodeStage.decode: no VAE loaded "
+                "(load_vae=False). The trainer-side pipeline cannot decode "
+                "latents when video decoding is delegated to a separate "
+                "rollout engine; trainside rollout requires load_vae=True."
+            )
         if s.latents is None:
             raise ValueError("HunyuanVideo10VAEDecodeStage.decode: segment.latents is None")
         if s.latents.ndim != 6:
@@ -36,7 +43,7 @@ class HunyuanVideo10VAEDecodeStage(DecodeStage[LatentSegment, Videos]):
             )
 
         vae = self.bundle.vae
-        scaling_factor = float(getattr(vae.config, "scaling_factor", 0.476986))
+        scaling_factor = vae.config.scaling_factor
 
         def _decode(lat: torch.Tensor) -> torch.Tensor:
             latents_f32 = lat.to(dtype=torch.float32) / scaling_factor

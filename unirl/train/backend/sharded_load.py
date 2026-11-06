@@ -7,14 +7,14 @@ import logging
 import os
 import re
 from collections.abc import Callable, Collection, Sequence
-from fnmatch import fnmatchcase
 from typing import Dict
 
 import torch
 from torch import nn
+from torch.distributed.tensor import Shard
 
 from unirl.models.types.post_materialize import canonical_param_name
-from unirl.train.backend.sharded_state import _build_state_dict_options, _current_rank
+from unirl.train.backend.sharded_state import _current_rank
 from unirl.train.backend.veomni.ep.models.qwen3_moe import build_local_fused_block
 from unirl.train.backend.veomni.ep.placement import assign_local_block, ep_named_parameters
 
@@ -92,8 +92,25 @@ def load_sharded(
         _load_state_dict_ep_sliced(module, weights_dir, device=device, strict=strict)
         return
 
+    from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
+
     state_dict = _read_safetensors_dir(weights_dir) if _current_rank() == 0 else {}
-    _load_state_dict_sharded(module, state_dict, device=device, strict=strict)
+    if _module_has_meta_param(module):
+        module.to_empty(device=device)
+
+    if _current_rank() == 0:
+        state_dict = _remap_hf_checkpoint_keys(state_dict, module)
+        state_dict = _pack_qwen_moe_expert_keys(state_dict, module)
+        state_dict = _remap_lora_base_keys(state_dict, module)
+        _assert_state_dict_covers_model(state_dict, module)
+
+    options = StateDictOptions(
+        full_state_dict=True,
+        broadcast_from_rank0=True,
+        cpu_offload=False,
+        strict=strict,
+    )
+    set_model_state_dict(module, state_dict, options=options)
 
 
 def _ep_shard_dims_from_plan(module: nn.Module) -> Dict[str, int]:
@@ -103,31 +120,13 @@ def _ep_shard_dims_from_plan(module: nn.Module) -> Dict[str, int]:
         return {}
 
     resolved: Dict[str, int] = {}
-    spec_by_fqn = getattr(module, "_fqn2spec_info", None) or {}
+    spec_by_fqn = module._fqn2spec_info
     for name, param in named_ep.items():
         spec = spec_by_fqn.get(name)
-        if spec is None or getattr(spec, "para_name", None) != "ep":
+        if spec is None or spec.para_name != "ep":
             continue
-        dim = getattr(getattr(spec, "placement", None), "dim", None)
-        if dim is not None:
-            resolved[name] = _validate_ep_shard_dim(name, int(dim), param)
-
-    missing = [name for name in named_ep if name not in resolved]
-    if missing:
-        get_plan = getattr(module, "get_parallel_plan", None)
-        if callable(get_plan):
-            plan = get_plan()
-            ep_plan = getattr(plan, "extra_parallel_plan", {}).get("ep", {})
-            for name in missing:
-                matches = [
-                    int(placement.dim)
-                    for pattern, placement in ep_plan.items()
-                    if hasattr(placement, "dim") and fnmatchcase(name, pattern)
-                ]
-                if len(set(matches)) > 1:
-                    raise RuntimeError(f"EP load: conflicting shard dims for {name!r}: {matches}.")
-                if matches:
-                    resolved[name] = _validate_ep_shard_dim(name, matches[0], named_ep[name])
+        if isinstance(spec.placement, Shard):
+            resolved[name] = _validate_ep_shard_dim(name, spec.placement.dim, param)
 
     unresolved = [name for name in named_ep if name not in resolved]
     if unresolved:
@@ -294,37 +293,6 @@ def _load_state_dict_ep_sliced(
         )
 
 
-def _load_state_dict_sharded(
-    module: nn.Module,
-    state_dict: StateDict,
-    *,
-    device: torch.device,
-    strict: bool = False,
-) -> None:
-    """Allocate storage for any meta params, then broadcast-load ``state_dict``."""
-    from torch.distributed.checkpoint.state_dict import set_model_state_dict
-
-    if _module_has_meta_param(module):
-        module.to_empty(device=device)
-
-    if _current_rank() == 0:
-        state_dict = _remap_hf_checkpoint_keys(state_dict, module)
-        state_dict = _pack_qwen_moe_expert_keys(state_dict, module)
-        state_dict = _remap_lora_base_keys(state_dict, module)
-        _assert_state_dict_covers_model(state_dict, module)
-
-    options = _build_state_dict_options(
-        full_state_dict=True,
-        broadcast_from_rank0=True,
-        cpu_offload=False,
-        strict=strict,
-    )
-    try:
-        set_model_state_dict(module, state_dict, options=options)
-    except TypeError:
-        set_model_state_dict(module, state_dict)
-
-
 def _module_has_meta_param(module: nn.Module) -> bool:
     """True if any parameter of ``module`` (recursing into children) is on the"""
     return any(p.is_meta for p in module.parameters(recurse=True))
@@ -352,7 +320,7 @@ def _qwen_moe_source_base_candidates(target: str, model: nn.Module) -> list[str]
     """Return checkpoint prefix candidates for one packed model parameter."""
     base = target.removesuffix(".gate_up_proj").removesuffix(".down_proj")
     candidates = [base]
-    prefix = str(getattr(model, "base_model_prefix", "") or "")
+    prefix = model.base_model_prefix
     if prefix:
         dotted = f"{prefix}."
         candidates.append(base.removeprefix(dotted) if base.startswith(dotted) else f"{prefix}.{base}")
@@ -503,7 +471,7 @@ def _remap_hf_checkpoint_keys(state_dict: StateDict, model: nn.Module) -> StateD
         from transformers import PreTrainedModel
         from transformers.conversion_mapping import get_model_conversion_mapping
         from transformers.core_model_loading import WeightRenaming
-    except Exception as exc:
+    except ImportError as exc:
         logger.warning("sharded_load: HF key-renaming unavailable (%s); skipping", exc)
         return state_dict
 
@@ -586,4 +554,4 @@ def _remap_lora_base_keys(state_dict: StateDict, model: nn.Module) -> StateDict:
     return remapped
 
 
-__all__ = ["load_trainable_weights", "load_sharded", "_load_state_dict_sharded", "StateDict"]
+__all__ = ["load_trainable_weights", "load_sharded", "StateDict"]

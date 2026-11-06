@@ -31,7 +31,7 @@ def resolve_device(spec_device: str, base_device: str) -> str:
 
 
 def _resolve_one(value: str) -> str:
-    pref = str(value or "").strip().lower()
+    pref = "" if value is None else str(value).strip().lower()
     if pref in {"cpu", "cuda", "auto"}:
         return pref
     if pref.startswith("cuda:"):

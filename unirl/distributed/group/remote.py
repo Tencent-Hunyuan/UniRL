@@ -35,10 +35,6 @@ class RankInfo:
     def is_pipeline_last_stage(self) -> bool:
         return self.pp_rank == self.pp_size - 1
 
-    @property
-    def is_dp_rank_zero(self) -> bool:
-        return self.dp_rank == 0
-
     def __repr__(self) -> str:
         parts = [f"rank={self.rank}", f"world_size={self.world_size}"]
         if self.dp_size > 1:
@@ -61,10 +57,14 @@ class Remote:
         self.transport: Optional[TensorTransport] = None
         self.device: Optional[str] = None
         self.rank_info: Optional[RankInfo] = None
-        self.dist_env: Dict[str, str] = {}
         self._get_sibling = None
         self._grad_inputs: Dict[str, List[torch.Tensor]] = {}
         self._grad_outputs: Dict[str, List[torch.Tensor]] = {}
+
+    @property
+    def _my_rank(self) -> int:
+        ri = self.rank_info
+        return ri.rank if ri is not None else 0
 
     def setup(
         self,
@@ -78,10 +78,9 @@ class Remote:
         self.transport = transport
         self.device = device
         self.rank_info = rank_info
-        self.dist_env = dist_env or {}
         self._get_sibling = get_sibling
-        if self.dist_env:
-            os.environ.update(self.dist_env)
+        if dist_env:
+            os.environ.update(dist_env)
 
     def get_sibling(self, name: str) -> "Remote":
         """Look up a colocated Remote by name on the same Worker."""

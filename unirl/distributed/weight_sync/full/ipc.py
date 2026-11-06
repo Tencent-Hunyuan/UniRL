@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import socket
 import threading
@@ -65,20 +66,16 @@ class IPCWeightSync(FullWeightSync):
             raise ValueError("control_timeout_s must be > 0")
         self._rollout = rollout
         self._use_shm = bool(use_shm)
-        self._weight_sync_engine = self._resolve_weight_sync_engine()
+        receiver = getattr(rollout, "tensor_weight_sync_target", rollout)
+        self._weight_sync_engine = (
+            _IPCWeightSyncEngine.VLLM_NATIVE_WTE
+            if str(receiver.component_name()) == "vllm"
+            else _IPCWeightSyncEngine.LEGACY_ZMQ
+        )
         self._gpu_memory_headroom = int(gpu_memory_headroom_mb) << 20
         self._control_timeout = timedelta(seconds=float(control_timeout_s))
         self._control_group = None
         self._next_model_version = 1
-
-    def _receiver_component_name(self) -> str:
-        receiver = getattr(self._rollout, "tensor_weight_sync_target", self._rollout)
-        return str(receiver.component_name())
-
-    def _resolve_weight_sync_engine(self) -> _IPCWeightSyncEngine:
-        if self._receiver_component_name() == "vllm":
-            return _IPCWeightSyncEngine.VLLM_NATIVE_WTE
-        return _IPCWeightSyncEngine.LEGACY_ZMQ
 
     @distributed(dispatch_mode=Dispatch.BROADCAST, execute_mode=Execute.RANK_ZERO)
     def uses_gpu_streaming(self) -> bool:
@@ -103,22 +100,13 @@ class IPCWeightSync(FullWeightSync):
                 raise RuntimeError("vLLM native IPC sync requires configurable sleep level")
             configure_sleep(2, preserve_next_sleep=True)
 
-    @staticmethod
-    def _dist_ready() -> bool:
-        try:
-            import torch.distributed as dist
-
-            return dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
-        except Exception:
-            return False
-
     @property
     def _global_rank(self) -> int:
         if self._dist_ready():
             import torch.distributed as dist
 
             return int(dist.get_rank())
-        return int(self.rank_info.rank) if self.rank_info is not None else 0
+        return self._my_rank
 
     @property
     def _world_size(self) -> int:
@@ -126,7 +114,7 @@ class IPCWeightSync(FullWeightSync):
             import torch.distributed as dist
 
             return int(dist.get_world_size())
-        return int(self.rank_info.world_size) if self.rank_info is not None else 1
+        return self.rank_info.world_size if self.rank_info is not None else 1
 
     def _all_gather(self, value: Any) -> list[Any]:
         if not self._dist_ready():
@@ -163,22 +151,6 @@ class IPCWeightSync(FullWeightSync):
                 raise RuntimeError(message) from error
             raise RuntimeError(message)
 
-    def _target_topology(self) -> dict[str, Any]:
-        target: Optional[dict[str, Any]] = None
-        error: Optional[BaseException] = None
-        if self._global_rank == 0:
-            try:
-                receiver = getattr(self._rollout, "tensor_weight_sync_target", self._rollout)
-                fanout = int(getattr(receiver, "weight_payload_fanout", 0))
-                device_uuids = list(getattr(receiver, "ipc_worker_device_uuids", ()))
-                if fanout <= 0 or len(device_uuids) != fanout:
-                    raise RuntimeError(f"invalid vLLM native IPC topology fanout={fanout}, UUIDs={device_uuids!r}")
-                target = {"tp_world_size": fanout, "device_uuids": device_uuids}
-            except BaseException as exc:
-                error = exc
-        self._consensus(error, "topology-discovery")
-        return dict(self._broadcast_from_rank_zero(target))
-
     def _run_preflight(
         self,
         *,
@@ -210,7 +182,7 @@ class IPCWeightSync(FullWeightSync):
                 raise RuntimeError(f"rank {failures[0]['rank']}: {failures[0]['error']}")
             if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
                 raise RuntimeError("every Actor rank must see exactly one CUDA device")
-            if self._world_size != int(tp_world_size):
+            if self._world_size != tp_world_size:
                 raise RuntimeError(f"Actor world size {self._world_size} != vLLM TP world {tp_world_size}")
             visible = [
                 token.strip() for token in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if token.strip()
@@ -221,13 +193,13 @@ class IPCWeightSync(FullWeightSync):
             actor_uuids = [str(item["device_uuid"]) for item in topology]
             if len(set(hosts)) != 1:
                 raise RuntimeError(f"native CUDA IPC requires one node, got hosts={hosts!r}")
-            if actor_uuids != list(worker_device_uuids):
+            if actor_uuids != worker_device_uuids:
                 raise RuntimeError(
                     f"Actor/vLLM physical UUID mismatch: actors={actor_uuids!r}, workers={worker_device_uuids!r}"
                 )
 
             largest = max(int(item["nbytes"]) for item in expected_metadata)
-            if largest > int(self._bucket_bytes):
+            if largest > self._bucket_bytes:
                 raise RuntimeError(
                     f"largest export tensor is {largest / 2**20:.1f} MiB, larger than "
                     f"native packed IPC buffer {self._bucket_bytes / 2**20:.1f} MiB"
@@ -242,19 +214,19 @@ class IPCWeightSync(FullWeightSync):
                     owner = name
                 layer_bytes[owner] = layer_bytes.get(owner, 0) + int(item["nbytes"])
             largest_layer = max(layer_bytes.values(), default=largest)
-            required = 3 * int(self._bucket_bytes) + largest_layer + self._gpu_memory_headroom
+            required = 3 * self._bucket_bytes + largest_layer + self._gpu_memory_headroom
             free_bytes, total_bytes = torch.cuda.mem_get_info()
-            if int(free_bytes) < required:
+            if free_bytes < required:
                 raise RuntimeError(
-                    f"free GPU memory {int(free_bytes) / 2**30:.2f} GiB is below "
+                    f"free GPU memory {free_bytes / 2**30:.2f} GiB is below "
                     f"the conservative vLLM native IPC estimate {required / 2**30:.2f} GiB"
                 )
             logger.info(
                 "vLLM native IPC preflight rank=%d free=%.2f/%.2f GiB "
                 "required=%.2f GiB largest_tensor=%.2f GiB largest_layer=%.2f GiB",
                 self._global_rank,
-                int(free_bytes) / 2**30,
-                int(total_bytes) / 2**30,
+                free_bytes / 2**30,
+                total_bytes / 2**30,
                 required / 2**30,
                 largest / 2**30,
                 largest_layer / 2**30,
@@ -264,21 +236,8 @@ class IPCWeightSync(FullWeightSync):
         self._consensus(error, "topology-memory-preflight")
         return [str(item["device_uuid"]) for item in topology]
 
-    @staticmethod
-    def _shape_metadata(name: str, shape: tuple[int, ...], dtype: Any) -> dict[str, Any]:
-        numel = 1
-        for dim in shape:
-            numel *= int(dim)
-        return {
-            "name": str(name),
-            "shape": [int(dim) for dim in shape],
-            "dtype": str(dtype),
-            "numel": numel,
-            "nbytes": numel * int(dtype.itemsize),
-        }
-
-    def _expected_tensor_metadata(self) -> list[dict[str, Any]]:
-        """Build an independent canonical Qwen3-MoE export plan."""
+    def _expected_tensor_metadata(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Build an independent canonical Qwen3-MoE export plan and its manifest."""
         model = self._backend.model
         if self._lora_merged or hasattr(model, "peft_config"):
             raise NotImplementedError("vLLM native IPC supports full fine-tuning only")
@@ -318,9 +277,19 @@ class IPCWeightSync(FullWeightSync):
                 ]
             else:
                 outputs = [(name, shape)]
-            metadata.extend(self._shape_metadata(out_name, out_shape, dtype) for out_name, out_shape in outputs)
+            for out_name, out_shape in outputs:
+                numel = math.prod(out_shape)
+                metadata.append(
+                    {
+                        "name": out_name,
+                        "shape": list(out_shape),
+                        "dtype": str(dtype),
+                        "numel": numel,
+                        "nbytes": numel * int(dtype.itemsize),
+                    }
+                )
 
-        names = {str(item["name"]) for item in metadata}
+        names = {item["name"] for item in metadata}
         required = {"model.embed_tokens.weight", "model.norm.weight"}
         if not skip_lm_head:
             required.add("lm_head.weight")
@@ -345,14 +314,7 @@ class IPCWeightSync(FullWeightSync):
         missing = sorted(required - names)
         if missing:
             raise RuntimeError(f"Qwen3-MoE export schema is incomplete; missing={missing[:16]}")
-        structural_manifest(metadata)
-        return metadata
-
-    def _poison_rollout(self, reason: str) -> None:
-        try:
-            self._rollout.poison(reason=reason)
-        except BaseException:
-            logger.exception("Failed to poison vLLM native IPC runtime")
+        return metadata, structural_manifest(metadata)
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def sync(self) -> None:
@@ -375,16 +337,30 @@ class IPCWeightSync(FullWeightSync):
 
         started = time.perf_counter()
         expected_metadata: Optional[list[dict[str, Any]]] = None
+        expected_manifest: Optional[dict[str, Any]] = None
         metadata_error: Optional[BaseException] = None
         try:
-            expected_metadata = self._expected_tensor_metadata()
+            expected_metadata, expected_manifest = self._expected_tensor_metadata()
         except BaseException as exc:
             metadata_error = exc
         self._consensus(metadata_error, "expected-schema")
-        assert expected_metadata is not None
-        expected_manifest = structural_manifest(expected_metadata)
+        assert expected_metadata is not None and expected_manifest is not None
 
-        target = self._target_topology()
+        target: Optional[dict[str, Any]] = None
+        topology_error: Optional[BaseException] = None
+        if self._global_rank == 0:
+            try:
+                receiver = getattr(self._rollout, "tensor_weight_sync_target", self._rollout)
+                fanout = int(getattr(receiver, "weight_payload_fanout", 0))
+                device_uuids = list(getattr(receiver, "ipc_worker_device_uuids", ()))
+                if fanout <= 0 or len(device_uuids) != fanout:
+                    raise RuntimeError(f"invalid vLLM native IPC topology fanout={fanout}, UUIDs={device_uuids!r}")
+                target = {"tp_world_size": fanout, "device_uuids": device_uuids}
+            except BaseException as exc:
+                topology_error = exc
+        self._consensus(topology_error, "topology-discovery")
+        target = dict(self._broadcast_from_rank_zero(target))
+
         tp_world_size = int(target["tp_world_size"])
         actor_uuids = self._run_preflight(
             tp_world_size=tp_world_size,
@@ -405,13 +381,13 @@ class IPCWeightSync(FullWeightSync):
         source = VLLMNativeWeightSource(
             metadata=[
                 ParamMeta(
-                    name=str(item["name"]),
-                    dtype=getattr(torch, str(item["dtype"]).removeprefix("torch.")),
-                    shape=tuple(int(dim) for dim in item["shape"]),
+                    name=item["name"],
+                    dtype=getattr(torch, item["dtype"].removeprefix("torch.")),
+                    shape=tuple(item["shape"]),
                 )
                 for item in expected_metadata
             ],
-            iterator_factory=lambda: self._iter_full_tensors(),
+            iterator_factory=self._iter_full_tensors,
         )
         client = VLLMNativeWeightSyncClient(
             rollout=self._rollout,
@@ -462,21 +438,24 @@ class IPCWeightSync(FullWeightSync):
             logger.info(
                 "vLLM native IPC TP%d committed version=%d tensors=%d bytes=%d elapsed=%.2fs",
                 tp_world_size,
-                int(header["model_version"]),
-                int(expected_manifest["tensor_count"]),
-                int(expected_manifest["byte_count"]),
+                header["model_version"],
+                expected_manifest["tensor_count"],
+                expected_manifest["byte_count"],
                 time.perf_counter() - started,
             )
         finally:
             if not success and self._global_rank == 0:
-                self._poison_rollout(f"vLLM native IPC publication {publication_id} failed")
+                try:
+                    self._rollout.poison(reason=f"vLLM native IPC publication {publication_id} failed")
+                except BaseException:
+                    logger.exception("Failed to poison vLLM native IPC runtime")
             torch.cuda.ipc_collect()
             torch.cuda.empty_cache()
 
     def _sync_with_legacy_zmq(self) -> None:
         """Pump full weights to the co-located engine over per-stage sockets."""
-        rank_info = getattr(self, "rank_info", None)
-        if int(getattr(rank_info, "tp_size", 1) or 1) > 1:
+        ri = self.rank_info
+        if ri is not None and ri.tp_size > 1:
             raise NotImplementedError(
                 "IPCWeightSync does not support tp_size>1: it opens only the "
                 "local_rank=0 receiver socket. Use CkptEngineIPCWeightSync for "
@@ -522,7 +501,7 @@ class IPCWeightSync(FullWeightSync):
         thread.start()
         try:
             for sid in stage_ids:
-                handle = zmq_handle(replica_rank=replica_rank, stage_id=int(sid), local_rank=0)
+                handle = zmq_handle(replica_rank=replica_rank, stage_id=sid, local_rank=0)
                 sender = BucketedWeightSender(
                     zmq_handle=handle,
                     bucket_size_mb=self._bucket_bytes // (1024 * 1024),
@@ -549,7 +528,7 @@ class IPCWeightSync(FullWeightSync):
             try:
                 dist.destroy_process_group(group)
             except Exception:
-                pass
+                logger.debug("Failed to destroy IPCWeightSync control process group", exc_info=True)
 
 
 __all__ = ["IPCWeightSync"]

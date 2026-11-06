@@ -24,18 +24,8 @@ _DTYPE_FROM_STR: Dict[str, torch.dtype] = {
 }
 
 
-def _resolve_dtype(name: str) -> torch.dtype:
-    if name in _DTYPE_FROM_STR:
-        return _DTYPE_FROM_STR[name]
-    short = name.replace("torch.", "")
-    full = f"torch.{short}"
-    if full in _DTYPE_FROM_STR:
-        return _DTYPE_FROM_STR[full]
-    raise KeyError(f"_resolve_dtype: unsupported dtype name {name!r}")
-
-
 class NcclBroadcastReceiveMixin:
-    """Adds NCCL weight receive to a worker; requires ``BucketedIPCReceiveMixin`` for ``_unirl_load_weights``."""
+    """Adds NCCL weight receive to a worker; requires ``BucketedIPCReceiveMixin`` for ``unirl_target_module``."""
 
     _unirl_weight_groups: Dict[str, "dist.ProcessGroup"] = {}
 
@@ -52,12 +42,12 @@ class NcclBroadcastReceiveMixin:
         """Join the trainer-coordinated process group as the receiver."""
         from unirl.utils.distributed_utils import init_process_group
 
-        local_rank = int(getattr(self, "local_rank", 0))
-        global_rank = int(rank_offset) + local_rank
+        local_rank = self.local_rank
+        global_rank = rank_offset + local_rank
         new_group = init_process_group(
             backend=backend,
-            init_method=f"tcp://{master_address}:{int(master_port)}",
-            world_size=int(world_size),
+            init_method=f"tcp://{master_address}:{master_port}",
+            world_size=world_size,
             rank=global_rank,
             group_name=group_name,
         )
@@ -67,9 +57,9 @@ class NcclBroadcastReceiveMixin:
             type(self).__name__,
             group_name,
             global_rank,
-            int(world_size),
+            world_size,
             master_address,
-            int(master_port),
+            master_port,
             backend,
         )
 
@@ -95,8 +85,7 @@ class NcclBroadcastReceiveMixin:
                 f"{type(self).__name__}.update_weights_from_distributed: no "
                 f"process group {group_name!r}; call init_weights_update_group first."
             )
-        device = getattr(self, "device", None)
-        if device is None:
+        if self.device is None:
             raise RuntimeError(
                 f"{type(self).__name__}.update_weights_from_distributed: worker has no `device` attribute."
             )
@@ -105,12 +94,12 @@ class NcclBroadcastReceiveMixin:
 
         bucket: list[tuple[str, torch.Tensor]] = []
         for name, dtype_name, shape in zip(names, dtypes, shapes):
-            dt = _resolve_dtype(dtype_name)
-            tensor = torch.empty(tuple(shape), dtype=dt, device=device)
+            dt = _DTYPE_FROM_STR.get(dtype_name) or _DTYPE_FROM_STR[f"torch.{dtype_name.removeprefix('torch.')}"]
+            tensor = torch.empty(tuple(shape), dtype=dt, device=self.device)
             dist.broadcast(tensor, src=0, group=group)
-            bucket.append((str(name), tensor))
+            bucket.append((name, tensor))
 
-        self._unirl_load_weights(bucket)
+        self.unirl_target_module().load_weights(bucket)
         logger.debug(
             "%s.update_weights_from_distributed: received %d tensors via group %r",
             type(self).__name__,

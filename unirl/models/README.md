@@ -63,6 +63,24 @@ and raises if it's `None` — it doesn't compute σ at generate time. Diffusion
 pipelines also implement `latent_shape()` so the trainer can author the
 byte-identical `x_T` recipe.
 
+### Grouped diffusion replay
+
+`BatchedStepReplayMixin` (`types/batched_replay.py`) unifies serial and
+step-major batched (`[S * B, ...]`) SDE replay. Single-stream image and video
+stages call `replay_steps` (supplying model-specific arguments through
+`batched_step_kwargs`), while joint video/audio stages (`LTX-2`, `MiniMax-H3`)
+call `replay_joint_av_steps` to group aligned video and audio trajectories
+together. When batching multiple steps (`S > 1`), conditions are concatenated in
+step-major order (`type(conditions).concat([conditions] * S)`), and log-probs
+(`[B, S]`) and transition means (`[B, S, *latent]`) are restored to step-second
+order before the algorithm computes its loss.
+
+Grouped replay is an opt-in dense-batch path (`pipeline.batch_replay_steps`,
+default `false`) gated on `len(target) > 1` and stateless `SDEStrategy`
+implementations, retaining the serial fallback when disabled or for single-step
+slices. Because changing forward batch geometry is not bit-identical to rollout,
+the algorithm guard requires `old_logp_source: replay`.
+
 **Extending it:** a new model is a new `unirl/models/<model>/` with
 `config.py` / `bundle.py` / `diffusion.py`|`ar.py` / `conditions.py` / `pipeline.py`
 mirroring an existing one — there is no registry, models are selected purely by
@@ -102,6 +120,22 @@ it is the authoritative bundle / pipeline / stage / conditions contract.
   wrapper's state-dict hooks strip it). Any match between module params and
   checkpoint keys goes through `canonical_param_name`, exported beside the
   deferred-op pair in `types/post_materialize.py`.
+- **Init-computed non-persistent buffers keep their construction dtype through meta-init.**
+  `build_meta_init_transformer` instantiates under `torch.set_default_dtype(dtype)`
+  (matching `from_pretrained`), `finalize_meta_init` and `veomni_parallelize` cast
+  parameters without overwriting non-persistent buffers, and `restore_init_state`
+  restores each buffer's captured dtype (including `DTensor` shards). Buffers
+  created with an explicit `dtype=torch.float32` (such as RoPE `inv_freq` /
+  `original_inv_freq`) therefore stay in float32 under a BF16 model or VeOmni
+  master, avoiding position-dependent RoPE angle drift against rollout engines.
+- **`BagelDiffusionStage` packs `batch_replay_steps` across Navit varlen sequences (no-CFG only).**
+  Unlike `BatchedStepReplayMixin`'s dense `[S * B]` batching, Bagel's MoT forward is
+  `B=1` varlen-packed, so `pipeline.batch_replay_steps: true` repeats the sample's KV
+  context across `S` `cu_seqlens` segments and sets `split_sequences=True` on
+  `Bagel._forward_flow` so per-sequence Linear/MLP projections (`apply_by_sequence` /
+  `_apply_selected_by_sequence`) keep the serial BF16 reduction boundaries. It raises
+  unless `guidance_scale == 1.0` and `cfg_img_scale == 1.0`, and requires
+  `old_logp_source: replay`.
 
 
 ## Conversation composition
