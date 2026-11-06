@@ -89,6 +89,11 @@ it is the authoritative bundle / pipeline / stage / conditions contract.
 
 ## Gotchas
 
+- **Qwen3 disables cuDNN SDPA before its first generation.** Its bf16 replay
+  backward can produce NaNs with that kernel. `Qwen3ARStage` sets the process-wide
+  flag at construction so generation and replay keep the same backend across
+  checkpoint resumes. The first rollout can differ from older runs that disabled
+  it only when replay began.
 - **`trainable_module()` is on the stage, not the bundle.** The backend reaches the
   model via `getattr(bundle, trainable_attr)`; engines via
   `getattr(pipeline, stage_attr).trainable_module()`. Keep both pointing at the same

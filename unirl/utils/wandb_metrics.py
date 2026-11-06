@@ -103,8 +103,8 @@ def compute_rollout_sample_metrics(*, sample: Any, trunc_len: Optional[int] = No
     return metrics
 
 
-def pooled_window_reward_metrics(parts: Sequence[Any]) -> Dict[str, float]:
-    """Reward metrics pooled over an accumulation window's gen Parts."""
+def pooled_window_reward_metrics(parts: Sequence[Any], *, trunc_len: Optional[int] = None) -> Dict[str, float]:
+    """Pool window rewards and, when requested, AR response lengths."""
     metrics: Dict[str, float] = {"num_samples": sum(p.batch_size for p in parts)}
     rewards = [p.rewards for p in parts]
     if all(torch.is_tensor(r) and r.numel() > 0 for r in rewards):
@@ -123,4 +123,9 @@ def pooled_window_reward_metrics(parts: Sequence[Any]) -> Dict[str, float]:
             if all(torch.is_tensor(t) and t.numel() > 0 for t in tensors):
                 pooled_c = torch.cat([t.detach().to(dtype=torch.float32).reshape(-1).cpu() for t in tensors])
                 metrics.update(_tensor_stats(f"reward_{str(cname).replace('/', '_')}", pooled_c))
+    if trunc_len is not None:
+        lengths = torch.cat([p.segment.lengths.detach().to(dtype=torch.float32).cpu() for p in parts])
+        metrics.update(_tensor_stats("response_len", lengths))
+        if trunc_len > 0:
+            metrics["trunc_ratio"] = float((lengths >= trunc_len).to(dtype=torch.float32).mean().item())
     return metrics
