@@ -72,6 +72,8 @@ class DiffusionStep(Protocol[B, C]):
 class DiffusionStage(Protocol[C]):
     """Rollout-level diffusion stage: ``C → LatentSegment``."""
 
+    supports_post_window_ode: bool = False
+
     def diffuse(
         self,
         conditions: C,

@@ -75,7 +75,8 @@ per-model σ override subclasses `FlowMatchSchedulePolicy` and overrides only
 (`index_schedule.py`), wired under `sampling.scheduler`. DanceGRPO/MixGRPO
 add no kernel: DanceGRPO swaps in `DanceSDEStrategy` under `pipeline.strategy`,
 MixGRPO keeps `FlowSDEStrategy` and adds a `WindowScheduler` under
-`sampling.scheduler`.
+`sampling.scheduler`. MixGRPO-Flash also sets `sampling.post_window_ode`, which wraps the
+strategy in `PostWindowDPMStrategy` for the steps after the window.
 
 ## Gotchas
 
@@ -129,3 +130,11 @@ MixGRPO keeps `FlowSDEStrategy` and adds a `WindowScheduler` under
 - **`exp_decay_threshold` defaults to 13.** Decay starts only once a window start passes it.
   Shipped mixgrpo schedules are shorter, so `strategy=exp_decay` stays at `iters_per_window`
   until the threshold is lowered.
+- **`PostWindowDPMStrategy` (MixGRPO-Flash) needs a stage that opts in.** It runs the base
+  strategy through `max(sde_indices)` while recording each step's x0, then solves the rest
+  with deterministic DPM-Solver++ on the compressed σ from `compute_post_window_sigma`.
+  `PostWindowODE.num_steps` is the one step count both sides check. Only stages with
+  `supports_post_window_ode` (SD3) accept it; every other stage, and every server engine that pins σ, is rejected in
+  `ensure_sample_sigmas`. The tail keeps at least 2 points where the reference allows 1,
+  because a 1-point tail never reaches σ=0, except when the window ends on the last step,
+  where the schedule is the full one. `compress_ratio=1, order=1` is the plain Euler ODE.
