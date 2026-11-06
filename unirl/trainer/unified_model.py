@@ -130,8 +130,6 @@ class UnifiedModelTrainer(BaseTrainer):
         self.eval_cfg_text_scale = eval_cfg_text_scale
         self.eval_eta = eval_eta
 
-        self._rollout_id = 0
-
         self.data_source = instantiate(data_source_cfg)
 
         self.sampling_params: Dict[str, BaseSamplingParams] = build_sampling_dict(sampling_cfg)
@@ -243,7 +241,6 @@ class UnifiedModelTrainer(BaseTrainer):
             raise TypeError("UnifiedModelTrainer.run_rollout: input Part must contain a 'text' Texts primitive.")
         n_rec = ar_shell.sampling_params.samples_per_prompt
         n_img = image_shell.sampling_params.samples_per_prompt
-        rid = self._rollout_id
         n = root_part.batch_size
         n_ar_engines = len(self.ar_rollouts)
         n_dit_engines = len(self.dit_rollouts)
@@ -261,15 +258,16 @@ class UnifiedModelTrainer(BaseTrainer):
         dit_gens: List[Part] = []
 
         def launch_ar_chunk(chunk_sample: Sample) -> None:
-            input_part = chunk_sample.parts[0]
+            input_part, chunk_ar_shell, _ = chunk_sample.parts
             prompts = input_part.primitives["text"].texts
             n_ar_total = len(prompts) * n_rec
+            all_ar_ids = [sid.replace("/", "_") for sid in chunk_ar_shell.sample_ids]
             k_ar = min(n_ar_engines, n_ar_total)
             for r in range(k_ar):
                 lo, hi = (n_ar_total * r) // k_ar, (n_ar_total * (r + 1)) // k_ar
                 ar_texts = Texts(texts=[prompts[idx // n_rec] for idx in range(lo, hi)])
                 ar_input = Part.input(
-                    [f"r{rid}:a{idx}" for idx in range(lo, hi)],
+                    all_ar_ids[lo:hi],
                     primitives={"text": ar_texts},
                     control=input_part.control,
                 )
@@ -552,7 +550,6 @@ class UnifiedModelTrainer(BaseTrainer):
                 self.evaluate(start_rollout)
             for rollout_id in range(start_rollout, num_rollouts):
                 training_progress = rollout_id / max(1, num_rollouts - 1)
-                self._rollout_id = rollout_id
                 inputs = self.data_source.get_samples(self.batch_size)
                 sample = self._build_request_sample(inputs, rollout_id)
                 force_sync = (resumed and rollout_id == start_rollout) or (

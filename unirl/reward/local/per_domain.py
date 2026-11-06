@@ -107,6 +107,10 @@ class PerDomainRewardScorer(RewardBackend):
             compute_time=time.time() - start,
         )
 
+    def load(self) -> None:
+        for s in self._scorers.values():
+            s.load()
+
     def offload(self) -> None:
         for s in self._scorers.values():
             s.offload()

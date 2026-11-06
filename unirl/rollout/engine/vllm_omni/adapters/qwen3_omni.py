@@ -17,7 +17,7 @@ from unirl.rollout.engine.vllm_omni.backends import (
     OmniRawResult,
     StageSampling,
 )
-from unirl.rollout.engine.vllm_omni.utils import build_ar_segment, decoded_text_from_ar
+from unirl.rollout.engine.vllm_omni.utils import build_ar_segment, decoded_text_from_ar, seed_ar_calls
 from unirl.types.conditions import TextTokenCondition
 from unirl.types.sample import Sample
 from unirl.types.sampling import ARSamplingParams
@@ -300,12 +300,16 @@ class Qwen3OmniThinkerAdapter(ModelAdapter):
         if ar.stop_token_id is not None:
             base_sampling_kwargs["stop_token_ids"] = [ar.stop_token_id]
 
-        return [
-            GenerateCall(
-                prompts=prompts,
-                sampling=[StageSampling(kind=STAGE_KIND_AR, kwargs=base_sampling_kwargs)],
-            )
-        ]
+        return seed_ar_calls(
+            [
+                GenerateCall(
+                    prompts=prompts,
+                    sampling=[StageSampling(kind=STAGE_KIND_AR, kwargs=base_sampling_kwargs)],
+                )
+            ],
+            ar.seed,
+            frontier.sample_ids,
+        )
 
     def build_response(self, sample: Sample, per_request: List[List[OmniRawResult]]) -> Sample:
         """Fill the existing AR frontier and assemble replay conditions from cached processor outputs."""

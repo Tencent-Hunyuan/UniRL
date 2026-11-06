@@ -45,6 +45,9 @@ class RewardBackend(ABC):
     def compute_rewards(self, request: RewardRequest) -> RewardResponse:
         """Score the request."""
 
+    def load(self) -> None:
+        """Optional lifecycle hook: materialize model state once; implementations are idempotent."""
+
     def offload(self) -> None:
         """Optional lifecycle hook: release device memory."""
 
