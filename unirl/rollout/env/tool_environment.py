@@ -96,6 +96,11 @@ class ToolEnvironment:
         self.max_turns = max_turns
         self._max_observation_chars = max_observation_chars
 
+    @property
+    def supports_turn_resumption(self) -> bool:
+        """Whether a suspended Sample contains all state needed on any rollout worker."""
+        return not self._stateful_tools
+
     def tool_schemas(self) -> List[Dict[str, Any]]:
         """The tools' JSON schemas, for ``apply_chat_template(tools=...)`` prompt injection."""
         return [tool.json_schema() for tool in self._tools.values()]
