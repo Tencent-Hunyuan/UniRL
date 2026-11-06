@@ -9,6 +9,7 @@ import torch
 
 from unirl.models.types.batched_replay import BatchedStepReplayMixin
 from unirl.models.types.diffusion import DiffusionStage, DiffusionStep
+from unirl.models.types.per_sample_replay import PerSampleStepReplayMixin
 from unirl.models.types.replay_result import ReplayResult
 from unirl.sde.kernels import StepStrategy
 from unirl.types.sampling import DiffusionSamplingParams, compute_trajectory_positions
@@ -182,7 +183,7 @@ class WAN21DiffusionStep(DiffusionStep[WAN21Bundle, WAN21Conditions]):
         )
 
 
-class WAN21DiffusionStage(BatchedStepReplayMixin, DiffusionStage[WAN21Conditions]):
+class WAN21DiffusionStage(PerSampleStepReplayMixin, BatchedStepReplayMixin, DiffusionStage[WAN21Conditions]):
     """WAN 2.1 T2V rollout-level diffusion stage."""
 
     _no_split_modules: ClassVar[Tuple[str, ...]] = ("WanTransformerBlock",)
@@ -342,6 +343,8 @@ class WAN21DiffusionStage(BatchedStepReplayMixin, DiffusionStage[WAN21Conditions
         step_indices: Optional[List[int]] = None,
     ) -> ReplayResult:
         """Log-prob replay: ``log_probs [B, len(target)]``, means ``[B, len(target), C, T_lat, H_lat, W_lat]``."""
+        if segment.sde_index_per_sample is not None:
+            return self.replay_per_sample(conditions, segment=segment, params=params)
         device = segment.latents.device if segment.latents is not None else torch.device("cpu")
         autocast_ctx = (
             torch.autocast("cuda", self.autocast_dtype)
