@@ -18,6 +18,7 @@ except ImportError:
 
 if TYPE_CHECKING:
     from unirl.train.stack import TrainStepResult
+    from unirl.types.sample_record import SampleRecord
 
 module_logger = logging.getLogger(__name__)
 
@@ -512,6 +513,61 @@ class UniRLWandBLogger:
                     os.unlink(_p)
                 except OSError:
                     pass
+
+    def log_sample_records(self, records: List["SampleRecord"], *, multi_track: bool) -> None:
+        """Log the existing media panels and a lineage table from the same selected rows."""
+        from unirl.types.media_preview import MediaPreview
+
+        if not records or not self.initialized or not self.log_media:
+            return
+        try:
+            by_track: Dict[str, List["SampleRecord"]] = {}
+            for record in records:
+                by_track.setdefault(record.track, []).append(record)
+            for track, rows in by_track.items():
+                phase, step = rows[0].phase, rows[0].step
+                step_key = "rollout/step" if phase == "rollout" else "eval/step"
+                media_rows = [row for row in rows if row.media is not None]
+                if media_rows:
+                    preview = MediaPreview(
+                        images=[row.media.image for row in media_rows if row.media.image is not None],
+                        videos=[row.media.video for row in media_rows if row.media.video is not None],
+                        audios=[row.media.audio for row in media_rows],
+                        audio_sample_rate=media_rows[0].media.audio_sample_rate,
+                        prompts=[row.prompt or "" for row in media_rows],
+                        rewards=[row.reward if row.reward is not None else 0.0 for row in media_rows],
+                    )
+                    key = f"{phase}/{track}/generated_media" if multi_track else f"{phase}/generated_media"
+                    self.log_generated_media(step, preview, key=key, step_key=step_key)
+                    if not preview.images and not preview.videos and preview.audio_sample_rate is not None:
+                        payload = {
+                            f"{phase}/{track}/generated_audio": [
+                                wandb.Audio(
+                                    audio.T.numpy() if audio.ndim == 2 and audio.shape[0] in (1, 2) else audio.numpy(),
+                                    sample_rate=preview.audio_sample_rate,
+                                )
+                                for audio in preview.audios
+                            ],
+                            step_key: step,
+                        }
+                        wandb.log(payload)
+                columns = [
+                    "sample_id",
+                    "group_id",
+                    "root_id",
+                    "prompt",
+                    "context_texts",
+                    "output_text",
+                    "reward",
+                    "component_rewards",
+                    "metadata",
+                ]
+                table = wandb.Table(
+                    columns=columns, data=[[getattr(row, column) for column in columns] for row in rows]
+                )
+                wandb.log({f"{phase}/{track}/samples": table, step_key: step})
+        except Exception as exc:
+            module_logger.warning("W&B sample observation failed: %s", exc)
 
     def log_eval(
         self,

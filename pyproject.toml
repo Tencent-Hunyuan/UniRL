@@ -99,6 +99,7 @@ flash-attn = [
 ]
 train = [
   "wandb>=0.16,<0.20",
+  "soundfile>=0.12",
   "aiohttp>=3.9",
   # MathVerifyRewardScorer (unirl/reward/local/mathverify.py) — the paper's grader.
   "math-verify>=0.6",

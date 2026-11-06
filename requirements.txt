@@ -32,6 +32,7 @@ ray[default]>=2.9,<3
 requests>=2.31
 safetensors>=0.4
 sglang[diffusion]==0.5.19
+soundfile>=0.12
 tensordict>=0.5
 timm>=0.9.16
 torch>=2.13.0
