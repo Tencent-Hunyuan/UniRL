@@ -64,7 +64,8 @@ class AROPD(StageAlgorithm):
         # the anchor on the wrong temperature with no raise (see the algorithms README).
         self.sampling_temperature = float(sampling_temperature)
         # Elementwise |gap| bound: grouping-invariant (a per-token op) and it biases
-        # the estimator only when it clips (gap_clipped_frac reports how often).
+        # the estimator only when it clips (the gap_clipped_tokens / gap_active_tokens
+        # counters report how often).
         # None = raw gaps.
         if gap_clamp is not None and (not math.isfinite(gap_clamp) or gap_clamp <= 0):
             raise ValueError(f"AROPD: gap_clamp must be a finite positive bound or None; got {gap_clamp!r}.")
@@ -136,7 +137,7 @@ class AROPD(StageAlgorithm):
         # anchor's micro geometry, so the gap carries no rollout-vs-replay drift;
         # segment.log_probs only feeds the drift metrics below. gap_clamp is an
         # elementwise, grouping-invariant bound that biases the estimator when it
-        # clips; gap_clipped_frac reports how often it fires.
+        # clips; the gap_clipped_tokens / gap_active_tokens counters report how often.
         raw_gap = teacher_logp - new_logp.detach()
         gap = raw_gap if self.gap_clamp is None else raw_gap.clamp(-self.gap_clamp, self.gap_clamp)
         loss = aggregate_token_losses(
@@ -158,8 +159,12 @@ class AROPD(StageAlgorithm):
             **rollout_replay_k3(new_logp, rollout_logp, segment.loss_mask),
         }
         if self.gap_clamp is not None:
+            # Additive counters: the metric aggregator plain-averages values, so a
+            # per-micro fraction would be micro-weighted; the ratio of the two
+            # averaged counters equals the true token-level clip fraction.
             metric_clipped = select_active_tokens(segment.loss_mask, raw_gap)[0]
-            metrics["gap_clipped_frac"] = float((metric_clipped.abs() > self.gap_clamp).float().mean().item())
+            metrics["gap_clipped_tokens"] = int((metric_clipped.abs() > self.gap_clamp).sum().item())
+            metrics["gap_active_tokens"] = int(metric_clipped.numel())
         return AlgorithmStepResult(
             loss=float(loss.detach().item()),
             metrics=metrics,

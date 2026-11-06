@@ -121,8 +121,9 @@ algorithm:
   stage_attr: ar # resolves stage from the trainer-injected pipeline (.ar)
   teacher: teacher # must match backend.lora_cfg.frozen_adapters[].name
   # gap_clamp: the algorithm default (10.0) bounds per-token |gap| elementwise;
-  # gap_clipped_frac logs how often it fires — tune it from that, or set null
-  # for fully raw gaps.
+  # the gap_clipped_tokens / gap_active_tokens counters log how often it
+  # fires (aggregate ratio = true token fraction) — tune it from that, or set
+  # null for fully raw gaps.
   # 1.0 — must equal sampling.temperature below so the teacher replay's
   # log_softmax(logits/T) matches the rollout sampler's tempered log-probs.
   sampling_temperature: ${sampling.temperature}

@@ -115,7 +115,8 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   anchor's micro geometry — so the advantage carries no rollout↔replay drift;
   `segment.log_probs` only feeds the `rollout_replay_*` gauges. `gap_clamp`
   (default 10) is an elementwise, grouping-invariant bound that biases the
-  estimator when it clips (`gap_clipped_frac` reports how often); the gap
+  estimator when it clips (`gap_clipped_tokens` / `gap_active_tokens` — the ratio
+  of the two aggregated counters is the true token fraction); the gap
   metrics report raw unclamped nats, so `teacher_gap_abs_mean` may exceed it.
 - **DiffusionNFT's `ref_deviation_coef > 0` anchors to the LoRA-disabled base, not the EMA shadow** — the
   shadow tracks the policy by construction, so anchoring to it would bound no drift. The reference
