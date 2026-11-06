@@ -27,10 +27,9 @@ Re-check these when the checkpoint revision moves:
   `position_ids`), AR decode `False` (gathers at `real_pos + step`), and diffusion `True` only
   when it seeds `cached_rope` at input length. Only the attribute is set; `.train()` / `.eval()`
   would also flip the backend-owned `transformer.model` and the frozen VAE / ViT.
-- Upstream `tokenization_hunyuan_image_3.py` silently drops all but the first sample in batched
-  chat-template calls: `apply_general_template(batchify=True)` passes `prompt_list=[[]]` to
-  `batch_gen_infer` and `zip`s it against the per-sample kwargs, so
-  `apply_chat_template(batch_prompt=[...])` returns `cfg_factor` rows instead of
-  `len(batch_prompt) * cfg_factor`. `_apply_chat_template` raises on that mismatch; otherwise the
-  AR path fails later in `instantiate_continuous_tokens` (`i2t`) or `Part.fill` (`t2t` / `t2ti`),
-  and the diffusion path at `split_cfg_fused`. Shipped recipes pin `rollout.forward_batch_size: 1`.
+- **The Instruct tokenizer at revision `2ec2c78bee7d4b94157341fba86c4c2c7b1858b2` drops batched samples.**
+  Its `apply_general_template(batchify=True)` passes one `prompt_list` entry to
+  `batch_gen_infer` for multiple message lists. `repair_hi3_tokenizer_batchify` patches the
+  tokenizer instance before AR and diffusion encoding; `_apply_chat_template` still checks the
+  returned row count. Recheck and remove the patch when the checkpoint fixes this path.
+  Shipped recipes keep `rollout.forward_batch_size: 1` pending real-checkpoint GPU validation.

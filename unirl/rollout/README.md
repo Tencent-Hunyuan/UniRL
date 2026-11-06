@@ -179,6 +179,10 @@ enabled, which UniRL's rollout backend does not do.
 - **Never recompute σ inside an engine** — the generated Part's pinned sigmas are
   the single source of truth; `engine/sigma_verify.py` checks the backend echo (it
   guards the GRPO log-prob ratio).
+- **vLLM-Omni AR logprobs fail closed.** `build_ar_segment` requires one
+  non-empty dict logprob step per emitted token and raises `RuntimeError` on
+  missing, non-dict, or length-mismatched logprobs instead of padding or
+  truncating with `0.0`.
 - **Batch `generate` must dispatch `DP_SCATTER`.** Agentic is the intentional
   exception: its undecorated method is reached through one `Handle.slot(...)`.
 - **Direct sampling forbids a `sync:` block; dedicated requires one.** The trainside

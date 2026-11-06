@@ -193,58 +193,60 @@ def build_ar_segment(per_request: Sequence[Sequence[Any]]) -> Optional[Any]:
     """Build a ``TextSegment`` from the AR Stage-0 outputs of one batch."""
     from unirl.types.segments.text import TextSegment
 
-    rows_tokens: List[List[int]] = []
-    rows_logps: List[Optional[torch.Tensor]] = []
-    found_any_stage0 = False
+    tokens: List[torch.Tensor] = []
+    log_probs: List[torch.Tensor] = []
+    has_tokens = False
 
     for outputs in per_request:
-        stage0 = None
-        for out in outputs:
-            if out.stage_id == 0:
-                stage0 = out
-                break
+        stage0 = next((output for output in outputs if output.stage_id == 0), None)
         if stage0 is None or not stage0.outputs:
-            rows_tokens.append([])
-            rows_logps.append(None)
+            tokens.append(torch.zeros(0, dtype=torch.long))
+            log_probs.append(torch.zeros(0, dtype=torch.float32))
             continue
         completion = stage0.outputs[0]
-        toks = list(completion.token_ids)
-        fallback_len = len(toks)
-        raw_logprobs = completion.logprobs
-        logp: Optional[torch.Tensor] = None
-        if isinstance(raw_logprobs, Sequence) and len(raw_logprobs) > 0:
-            values: List[float] = []
-            for step in raw_logprobs:
-                if isinstance(step, dict) and step:
-                    entry = next(iter(step.values()))
-                    values.append(float(entry.logprob))
-                else:
-                    values.append(0.0)
-            if values:
-                if len(values) != fallback_len and fallback_len > 0:
-                    if len(values) > fallback_len:
-                        values = values[:fallback_len]
-                    else:
-                        values.extend([0.0] * (fallback_len - len(values)))
-                logp = torch.tensor(values, dtype=torch.float32)
-        if toks:
-            found_any_stage0 = True
-        rows_tokens.append(toks)
-        rows_logps.append(logp)
+        token_ids = list(completion.token_ids)
+        step_logprobs = completion.logprobs
+        if step_logprobs is None:
+            if token_ids:
+                raise RuntimeError(
+                    "build_ar_segment: vLLM-Omni returned mismatched token/logprob lengths: "
+                    f"{len(token_ids)} tokens vs None logprobs"
+                )
+        elif not isinstance(step_logprobs, Sequence) or len(step_logprobs) != len(token_ids):
+            actual = len(step_logprobs) if isinstance(step_logprobs, Sequence) else type(step_logprobs).__name__
+            raise RuntimeError(
+                "build_ar_segment: vLLM-Omni returned mismatched token/logprob lengths: "
+                f"{len(token_ids)} tokens vs {actual} logprobs"
+            )
+        if not token_ids:
+            tokens.append(torch.zeros(0, dtype=torch.long))
+            log_probs.append(torch.zeros(0, dtype=torch.float32))
+            continue
+        token_logprobs: List[float] = []
+        for token_id, choices in zip(token_ids, step_logprobs, strict=True):
+            if not isinstance(choices, dict) or not choices:
+                raise RuntimeError(
+                    f"build_ar_segment: expected non-empty dict logprob step for token {token_id}, "
+                    f"got {type(choices).__name__}"
+                )
+            selected = choices.get(token_id)
+            if selected is None:
+                raise RuntimeError(f"build_ar_segment: vLLM-Omni omitted sampled token {token_id} from logprobs")
+            token_logprobs.append(float(selected.logprob))
+        row_log_probs = torch.tensor(token_logprobs, dtype=torch.float32)
+        if not torch.isfinite(row_log_probs).all():
+            raise RuntimeError("build_ar_segment: vLLM-Omni returned non-finite float32 logprobs")
+        has_tokens = True
+        tokens.append(torch.tensor(token_ids, dtype=torch.long))
+        log_probs.append(row_log_probs)
 
-    if not found_any_stage0:
+    if not has_tokens:
         return None
 
-    tokens_list: List[torch.Tensor] = [torch.tensor(toks, dtype=torch.long) for toks in rows_tokens]
-    have_logp = all(lp is not None for toks, lp in zip(rows_tokens, rows_logps) if toks)
-    log_probs_list: Optional[List[torch.Tensor]] = None
-    if have_logp:
-        log_probs_list = [lp if lp is not None else torch.zeros(0, dtype=torch.float32) for lp in rows_logps]
-
     return TextSegment.pack(
-        tokens=tokens_list,
-        log_probs=log_probs_list,
-        rollout_log_probs=log_probs_list,
+        tokens=tokens,
+        log_probs=log_probs,
+        rollout_log_probs=log_probs,
     )
 
 

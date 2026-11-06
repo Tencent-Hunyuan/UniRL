@@ -330,9 +330,6 @@ class FastVideoRolloutEngine(BaseRolloutEngine):
             sde_indices = list(range(num_steps))
         else:
             sde_indices = sorted(set(params.sde_indices))
-            bad = [i for i in sde_indices if i < 0 or i >= num_steps]
-            if bad:
-                raise ValueError(f"FastVideo SDE indices out of range for num_steps={num_steps}: {bad}")
         raw = self._drive_fastvideo(prompts, params, params.sigmas, seeds, sde_indices)
         frames = raw["decoded"]
         require(
