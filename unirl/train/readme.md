@@ -65,6 +65,41 @@ in `backend/base.py`; a multi-update-capable algorithm sets
 `recomputes_anchor` when its anchor must follow the planned micro geometry (see
 `../algorithms/README.md`).
 
+## Activation offload
+
+Set `backend.fsdp_cfg.activation_offload=true` on `FSDPBackend` or `VeOmniBackend` to store tensors
+saved for backward by the selected transformer blocks in pinned CPU memory.
+The default is `false`. For example:
+
+```yaml
+backend:
+  fsdp_cfg:
+    activation_checkpointing: true
+    activation_offload: true
+```
+
+For recipes that omit the field, pass `+backend.fsdp_cfg.activation_offload=true`.
+
+`fsdp_wrap` uses PyTorch's `offload_wrapper` (`save_on_cpu(pin_memory=True)`),
+preserving tensor dtype. With activation checkpointing, offload wraps the
+checkpoint wrapper and moves its saved inputs; recomputed intermediates stay
+on the GPU. `ac_wrap_order` still chooses whether FSDP wraps the outer activation
+wrapper (`outside`) or the original block (`inside`). Checkpoint and weight-export
+keys retain their canonical names. Blocks must match `block_class_names`;
+an unmatched selection raises.
+
+`veomni_parallelize` applies the same `save_on_cpu(pin_memory=True)` context to
+each selected block's forward, outside its optional checkpoint call. It keeps
+the existing module hierarchy, EP parameter groups, and weight names intact.
+This path works with the pinned `veomni==0.1.11`; it does not use newer VeOmni
+async-offload APIs. `ac_wrap_order` applies only to `FSDPBackend`.
+
+CPU memory and CPU–GPU transfers replace GPU storage. Without checkpointing,
+PyTorch also copies parameter tensors saved by operations inside these blocks.
+The native wrapper does not prefetch future layers; pinned memory alone does not
+guarantee transfer/computation overlap or faster training. Compare peak GPU/host
+memory and step time at fixed batch size before changing training geometry.
+
 ## Choosing HSDP (hybrid sharding)
 
 `fsdp_mode: hybrid` on `FSDPBackend` builds a
@@ -125,6 +160,10 @@ use LoRA adapter mode. Formats and export live in
 
 ## Gotchas
 
+- **Activation offload preserves dtype, not a bitwise-equivalence guarantee.**
+  PyTorch's pinned CPU copies may change saved tensor layouts; validate loss,
+  gradients and updates against the same recipe with offload disabled. GPU
+  memory savings and transfer overhead depend on the model and hardware.
 - **Unified `ar` / `image` results describe one shared optimizer step.** Their
   `optimizer_updates` (total and per update) count the same steps, so summing
   them across tracks double-counts.

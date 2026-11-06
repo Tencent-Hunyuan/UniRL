@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import socket
-from functools import partial
 from typing import Any, Dict, Optional, Tuple
 
 import torch
@@ -58,6 +57,7 @@ def fsdp_wrap(
     reshard_after_forward: bool = True,
     forward_prefetch: bool = False,
     activation_checkpointing: bool = False,
+    activation_offload: bool = False,
     ac_wrap_order: str = "outside",
     use_torch_compile: bool = False,
     master_dtype: Optional[str] = None,
@@ -103,6 +103,10 @@ def fsdp_wrap(
     if block_class_names is None:
         block_class_names = _discover_block_classes(model, stage)
     block_instances = _enumerate_block_instances(model, block_class_names)
+    require(
+        not activation_offload or bool(block_instances),
+        "fsdp_wrap: activation_offload=True requires matching block_class_names; no blocks were found.",
+    )
 
     casts = 0
     master_param_ids = {id(p) for p in master_params}
@@ -120,22 +124,35 @@ def fsdp_wrap(
             p.data = p.data.to(dst)
             casts += 1
 
-    if activation_checkpointing:
+    if activation_checkpointing or activation_offload:
         from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
             CheckpointImpl,
-            CheckpointWrapper,
             apply_activation_checkpointing,
             checkpoint_wrapper,
+            offload_wrapper,
         )
 
         block_ids = {id(layer) for layer in block_instances}
+        wrapped_blocks: Dict[int, nn.Module] = {}
+
+        def wrap_block(block: nn.Module) -> nn.Module:
+            wrapped = (
+                checkpoint_wrapper(
+                    block,
+                    checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+                    checkpoint_fn=_checkpoint_with_kwarg_snapshots,
+                )
+                if activation_checkpointing
+                else block
+            )
+            if activation_offload:
+                wrapped = offload_wrapper(wrapped)
+            wrapped_blocks[id(block)] = wrapped
+            return wrapped
+
         apply_activation_checkpointing(
             model,
-            checkpoint_wrapper_fn=partial(
-                checkpoint_wrapper,
-                checkpoint_impl=CheckpointImpl.NO_REENTRANT,
-                checkpoint_fn=_checkpoint_with_kwarg_snapshots,
-            ),
+            checkpoint_wrapper_fn=wrap_block,
             check_fn=lambda module: id(module) in block_ids,
         )
         # Where fully_shard lands relative to the AC wrapper decides whether the
@@ -150,13 +167,12 @@ def fsdp_wrap(
         #   the module's __call__, re-running the pre-forward gather and the
         #   mp_policy cast. Opt in per recipe where this order was actually
         #   smoke-validated (the stacked BAGEL it2i consumer pins it).
-        if ac_wrap_order == "outside":
-            wrapped = [m for m in model.modules() if isinstance(m, CheckpointWrapper)]
+        if not activation_checkpointing or ac_wrap_order == "outside":
             require(
-                len(wrapped) == len(block_instances),
-                f"fsdp_wrap: expected {len(block_instances)} checkpoint wrappers, found {len(wrapped)}",
+                len(wrapped_blocks) == len(block_instances),
+                f"fsdp_wrap: expected {len(block_instances)} activation wrappers, found {len(wrapped_blocks)}",
             )
-            block_instances = wrapped
+            block_instances = tuple(wrapped_blocks[id(layer)] for layer in block_instances)
 
     for layer in block_instances:
         fully_shard(layer, **fsdp_kwargs)
@@ -220,7 +236,7 @@ def fsdp_wrap(
         logger.info(
             "fsdp_wrap: wrapped %d block(s) of class %r "
             "(%s, cpu_offload=%s, mixed_precision=%s, cast_forward_inputs=%s, reshard=%s, prefetch=%s, "
-            "ac=%s, compile=%s, dtype_casts=%d, master_dtype=%s, root_wrap=%s)",
+            "ac=%s, activation_offload=%s, compile=%s, dtype_casts=%d, master_dtype=%s, root_wrap=%s)",
             len(block_instances),
             tuple(block_class_names),
             fsdp_mode,
@@ -230,6 +246,7 @@ def fsdp_wrap(
             reshard_after_forward,
             forward_prefetch,
             activation_checkpointing,
+            activation_offload,
             use_torch_compile,
             casts,
             master_dtype,
