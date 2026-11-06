@@ -135,6 +135,10 @@ class DiffusionSamplingParams(BaseSamplingParams):
         super().__post_init__()
         cls = type(self).__name__
         self.num_inference_steps = _coerce_type(self.num_inference_steps, int, f"{cls}.num_inference_steps")
+        require(
+            self.num_inference_steps >= 1,
+            f"{cls}.num_inference_steps must be >= 1, got {self.num_inference_steps}",
+        )
         self.guidance_scale = _coerce_type(self.guidance_scale, float, f"{cls}.guidance_scale")
         self.height = _coerce_type(self.height, int, f"{cls}.height")
         self.width = _coerce_type(self.width, int, f"{cls}.width")
@@ -175,6 +179,20 @@ class DiffusionSamplingParams(BaseSamplingParams):
             self.sde_indices = [
                 _coerce_type(item, int, f"{name}[{index}]") for index, item in enumerate(self.sde_indices)
             ]
+            # Indices address the transitions of the num_inference_steps schedule, so they live in
+            # [0, num_inference_steps); membership-gated engines drop anything else without a word.
+            steps = self.num_inference_steps
+            outside = [i for i in self.sde_indices if i < 0 or i >= steps]
+            if outside:
+                raise ValueError(f"{name} {outside} outside the {steps}-step schedule [0, {steps - 1}].")
+        elif self.scheduler is not None and self.scheduler.num_timesteps > self.num_inference_steps:
+            # A scheduler may gate only a prefix of the schedule (num_timesteps < steps), but it can never
+            # reach past it; beyond that every index it returns is dropped by the engines' membership gate.
+            raise ValueError(
+                f"{cls}.scheduler.num_timesteps={self.scheduler.num_timesteps} exceeds "
+                f"{cls}.num_inference_steps={self.num_inference_steps}; the scheduler can gate at most "
+                f"the {self.num_inference_steps}-step schedule."
+            )
         reserved = {f.name for f in fields(self) if f.name != "sampler_kwargs"}
         shadowed = reserved & set(self.sampler_kwargs)
         require(

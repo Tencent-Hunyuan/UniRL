@@ -57,6 +57,7 @@ class RewardService(Remote):
             raise ValueError(
                 f"overlong_buffer_len must be > 0 when truncated_reward='soft', got {self.overlong_buffer_len}"
             )
+        self.backend.load()
         logger.info(
             "RewardService initialized with backend=%s, truncated_reward=%s",
             backend.model_name or type(backend).__name__,
