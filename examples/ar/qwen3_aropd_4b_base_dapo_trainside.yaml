@@ -28,7 +28,6 @@
 num_devices: 8
 batch_size: 16 # prompts_per_rollout
 num_rollouts: 100
-weight_sync_interval: 1 # unused without a serving rollout; kept for symmetry
 eval_interval: 0 # no reward -> no eval scoring (ARTrainer rejects eval_interval>0)
 
 logging:
@@ -121,10 +120,9 @@ algorithm:
   _target_: unirl.algorithms.aropd.AROPD
   stage_attr: ar # resolves stage from the trainer-injected pipeline (.ar)
   teacher: teacher # must match backend.lora_cfg.frozen_adapters[].name
-  # Elementwise |gap| clamp: grouping-invariant and mean-preserving (per-micro
-  # z-scoring would make the objective depend on micro_batch_size and erase each
-  # sequence's mean gap). Set null for fully raw gaps.
-  gap_clamp: 10.0
+  # gap_clamp: the algorithm default (10.0) bounds per-token |gap| elementwise;
+  # gap_clipped_frac logs how often it fires — tune it from that, or set null
+  # for fully raw gaps.
   # 1.0 — must equal sampling.temperature below so the teacher replay's
   # log_softmax(logits/T) matches the rollout sampler's tempered log-probs.
   sampling_temperature: ${sampling.temperature}
@@ -139,14 +137,13 @@ stack:
   # AROPD freezes the teacher anchor per rollout; multi-update against it is
   # unvalidated (supports_multi_update=False -> the stack enforces exactly 1).
   num_updates_per_batch: 1
-  # CountPlanner (no micro_planner) is the simple default; token-mean is
-  # grouping-invariant under packing too, so a TokenBudgetPlanner also works.
 
 data_source:
   _target_: unirl.data.data_source.MultimodalRLDataSource
   args:
     run:
       data_path: ${oc.env:DATA_PATH} # local jsonl; build with datasets/dapo_math/prepare_dapo_math.py
+      # unused with eval_interval: 0, but MultimodalRLDataSource reads it directly
       eval_data_path: ${oc.env:EVAL_DATA_PATH,${oc.env:DATA_PATH}}
       seed: 42
     algorithm:
@@ -155,6 +152,10 @@ data_source:
 sampling:
   _target_: unirl.types.sampling.ARSamplingParams
   # A2 scope: one sample per prompt (the gap estimator needs no group).
+  # Validated setting: the fixed-reference gap closes at temperature 0.7 (18
+  # fixed prompts, 48 rollouts, -20%); at temperature 1.0 with fresh prompts the
+  # per-token mean gap is answer-token dominated while response length halves —
+  # sequence-level movement the reference gauge captures.
   samples_per_prompt: 1
   temperature: 1.0
   top_p: 1.0

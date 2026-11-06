@@ -104,28 +104,19 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   *not* the request Sample's actual temperature, biasing every ratio with no raise. Watch
   `rollout_replay_logp_absdiff_mean` — it should be ~0 on an on-policy step.
 - **AROPD is a policy gradient, not token KD** — the OPD objective is
-  `max_θ E_{a~π_θ}[log π_T(a)]` over the *student's own* sampled tokens. Its
-  score-function estimator is `∇ = E[log π_T(a)·∇log π_θ(a)]`; implementing it as
-  `loss = −Σ sg(teacher_logp − new_logp)·new_logp / Σmask` adds the entropy term
-  `−E[log π_θ·∇log π_θ] = ∇H(π_θ)` (NOT a control variate — its expectation is
-  nonzero), turning the objective into per-token reverse-KL descent. This is a
-  per-token factorization, not the exact gradient of sequence-level `KL(π_θ‖π_T)`
-  (that would weight each token by the reward-to-go `Σ_{t'≥t}` of future gaps).
-  Both gap sides are stopped-gradient and `new_logp` is the only differentiated
-  operand; backpropping `mean(new_logp − teacher_logp)` instead (`∇ = ∇mean(new_logp)`,
-  teacher constant) pushes the student's log-prob up unboundedly — the gap's sign
-  never enters. The gap's student side is `new_logp.detach()` — current weights at
-  the teacher anchor's exact micro geometry (`anchor_fields` +
-  `recomputes_anchor`), so the advantage carries no rollout↔replay drift;
-  `segment.log_probs` only feeds the `rollout_replay_*` drift gauges. `gap_clamp`
-  (default 10) bounds per-token |gap| elementwise — grouping-invariant and
-  mean-preserving, unlike per-micro z-stats which make the objective depend on
-  `micro_batch_size` and erase each sequence's mean gap; the gap metrics report the
-  raw unclamped nats gap, so `teacher_gap_abs_mean` may legitimately exceed it.
-  AROPD hard-declares
-  `loss_agg_mode = 'token-mean'` (a class attribute — `resolve_loss_scales` reads
-  it via `getattr`), so the stack's token-share weighting keeps the flat masked
-  token mean grouping-invariant; no other mode is implemented.
+  `max_θ E_{a~π_θ}[log π_T(a)]` over the *student's own* sampled tokens.
+  `loss = −Σ sg(teacher_logp − new_logp)·new_logp / Σmask` implements its
+  score-function estimator plus the entropy term `∇H(π_θ)`, i.e. per-token
+  reverse-KL descent (a per-token factorization, not the exact gradient of
+  sequence-level `KL(π_θ‖π_T)`, which weights each token by the reward-to-go).
+  Backpropping `mean(new_logp − teacher_logp)` instead has gradient
+  `mean(∇log π_θ)` — zero in expectation, and the gap's sign never enters. The
+  gap's student side is `new_logp.detach()` — current weights at the teacher
+  anchor's micro geometry — so the advantage carries no rollout↔replay drift;
+  `segment.log_probs` only feeds the `rollout_replay_*` gauges. `gap_clamp`
+  (default 10) is an elementwise, grouping-invariant bound that biases the
+  estimator when it clips (`gap_clipped_frac` reports how often); the gap
+  metrics report raw unclamped nats, so `teacher_gap_abs_mean` may exceed it.
 - **DiffusionNFT's `ref_deviation_coef > 0` anchors to the LoRA-disabled base, not the EMA shadow** — the
   shadow tracks the policy by construction, so anchoring to it would bound no drift. The reference
   is a third `predict_noise_at_step` per trained timestep, on top of the trainable and shadow ones;

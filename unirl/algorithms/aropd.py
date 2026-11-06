@@ -63,9 +63,9 @@ class AROPD(StageAlgorithm):
         # matches the student's tempered replay; required — a silent default would put
         # the anchor on the wrong temperature with no raise (see the algorithms README).
         self.sampling_temperature = float(sampling_temperature)
-        # Elementwise |gap| bound: grouping-invariant (a per-token op, unlike per-micro
-        # z-stats which make the objective depend on micro_batch_size), and it keeps
-        # each sequence's mean gap — the dominant reverse-KL signal. None = raw gaps.
+        # Elementwise |gap| bound: grouping-invariant (a per-token op) and it biases
+        # the estimator only when it clips (gap_clipped_frac reports how often).
+        # None = raw gaps.
         if gap_clamp is not None and (not math.isfinite(gap_clamp) or gap_clamp <= 0):
             raise ValueError(f"AROPD: gap_clamp must be a finite positive bound or None; got {gap_clamp!r}.")
         self.gap_clamp = None if gap_clamp is None else float(gap_clamp)
@@ -77,7 +77,7 @@ class AROPD(StageAlgorithm):
                 "requires_backend=True."
             )
         self._model = model
-        self.teacher = str(teacher)
+        self.teacher = teacher
         present = adapter_names(model)
         if self.teacher not in present:
             raise ValueError(
@@ -93,13 +93,6 @@ class AROPD(StageAlgorithm):
         segment: "TextSegment",
     ) -> None:
         """Freeze the packed teacher log-prob anchor under the frozen adapter."""
-        if segment.tokens is None:
-            return
-        if segment.log_probs is None:
-            raise RuntimeError(
-                "AROPD.prepare_segment: segment.log_probs is None — the rollout log-probs "
-                "feed the drift metrics (rollout_replay_*)."
-            )
         if int(segment.tokens.shape[0]) == 0:
             # Empty micro: still write the anchor so the multi-micro anchor path
             # does not raise "a micro produced None" (GRPO's anchors are pre-populated).
@@ -122,7 +115,7 @@ class AROPD(StageAlgorithm):
         loss_scale: float,
     ) -> AlgorithmStepResult:
         """Gap-weighted student score: ``-sum(sg(teacher_logp - new_logp) * new_logp)``."""
-        if segment.tokens is None or segment.lengths is None or int(segment.tokens.shape[0]) == 0:
+        if int(segment.tokens.shape[0]) == 0:
             return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
         if segment.teacher_log_probs is None:
             raise RuntimeError(
@@ -137,12 +130,13 @@ class AROPD(StageAlgorithm):
         teacher_logp = segment.teacher_log_probs.to(dtype=new_logp.dtype, device=new_logp.device)
 
         # The stop-gradient teacher-student gap is the per-token advantage; never
-        # backprop into mean(student_logp - teacher_logp) directly (see the algorithms
-        # README for the derivation). The student side is new_logp.detach() — the
-        # current weights at the same micro geometry as the teacher anchor, so the
-        # gap carries no rollout-vs-replay drift; segment.log_probs only feeds the
-        # drift metrics below. The clamp is a per-token bound: grouping-invariant
-        # and mean-preserving, unlike per-micro z-scoring.
+        # backprop into mean(student_logp - teacher_logp) directly (its gradient is
+        # mean(grad log pi) — zero in expectation, and the gap's sign never enters).
+        # The student side is new_logp.detach() — current weights at the teacher
+        # anchor's micro geometry, so the gap carries no rollout-vs-replay drift;
+        # segment.log_probs only feeds the drift metrics below. gap_clamp is an
+        # elementwise, grouping-invariant bound that biases the estimator when it
+        # clips; gap_clipped_frac reports how often it fires.
         raw_gap = teacher_logp - new_logp.detach()
         gap = raw_gap if self.gap_clamp is None else raw_gap.clamp(-self.gap_clamp, self.gap_clamp)
         loss = aggregate_token_losses(
@@ -154,9 +148,7 @@ class AROPD(StageAlgorithm):
         )
         (loss * loss_scale).backward()
 
-        rollout_logp = (segment.rollout_log_probs if segment.rollout_log_probs is not None else segment.log_probs).to(
-            dtype=new_logp.dtype, device=new_logp.device
-        )
+        rollout_logp = segment.log_probs.to(dtype=new_logp.dtype, device=new_logp.device)
         metric_gap = select_active_tokens(segment.loss_mask, raw_gap)[0]
         metrics: Dict[str, Any] = {
             "distill_loss": float(loss.detach().item()),
@@ -165,6 +157,9 @@ class AROPD(StageAlgorithm):
             **rollout_replay_logp_absdiff(new_logp, rollout_logp, segment.loss_mask),
             **rollout_replay_k3(new_logp, rollout_logp, segment.loss_mask),
         }
+        if self.gap_clamp is not None:
+            metric_clipped = select_active_tokens(segment.loss_mask, raw_gap)[0]
+            metrics["gap_clipped_frac"] = float((metric_clipped.abs() > self.gap_clamp).float().mean().item())
         return AlgorithmStepResult(
             loss=float(loss.detach().item()),
             metrics=metrics,
