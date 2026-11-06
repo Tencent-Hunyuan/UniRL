@@ -97,22 +97,29 @@ class ManagedScorerProcessBackend(RemoteRewardBackend):
         self._disposed = False
         self._atexit_registered = False
         self._residency_lock = threading.RLock()
-        try:
-            base_url = self._start_child()
-            remote_spec = replace(
-                config.client,
-                base_url=base_url,
-                required_rewards=(config.scorer.name,),
-                input_kind="image",
-                require_identity_echo=True,
-                expected_scorer_version=config.scorer.version,
-            )
-            super().__init__(config=remote_spec, base_device=base_device)
-        except Exception:
-            self._stop_child()
-            raise
-        atexit.register(self._stop_child)
-        self._atexit_registered = True
+        remote_spec = replace(
+            config.client,
+            required_rewards=(config.scorer.name,),
+            input_kind="image",
+            require_identity_echo=True,
+            expected_scorer_version=config.scorer.version,
+        )
+        super().__init__(config=remote_spec, base_device=base_device)
+
+    def load(self) -> None:
+        """Spawn the rank-affine scorer child once and wait for its health check."""
+        with self._residency_lock:
+            if self._process is not None and self._process.poll() is None:
+                return
+            self._disposed = False
+            try:
+                self.base_url = self._start_child().rstrip("/")
+            except Exception:
+                self._stop_child()
+                raise
+            if not self._atexit_registered:
+                atexit.register(self._stop_child)
+                self._atexit_registered = True
 
     def _start_child(self) -> str:
         cfg = self.spec

@@ -21,6 +21,7 @@ from unirl.rollout.engine.vllm_omni.utils import (
     build_ar_segment,
     collect_dit_outputs,
     decoded_text_from_ar,
+    seed_ar_calls,
     seed_from_sample_id,
 )
 from unirl.rollout.engine.vllm_omni.utils.diff_kwargs import core_diff_kwargs, sde_extra_args
@@ -104,7 +105,7 @@ def hi3_ar_fused_conditions(per_request: List[List[OmniRawResult]]) -> Dict[str,
 
 
 class Hi3InputAdapter:
-    """Request ``Sample`` → HI3 AR-bearing :class:`GenerateCall` (one, whole batch)."""
+    """Request ``Sample`` → HI3 AR-bearing calls, split by row when AR seeds or x_T recipes require it."""
 
     def __init__(
         self,
@@ -208,7 +209,9 @@ class Hi3InputAdapter:
             ),
         )
         if "dit" not in self.stages:
-            return [GenerateCall(prompts=prompts, sampling=[ar_sampling])]
+            return seed_ar_calls(
+                [GenerateCall(prompts=prompts, sampling=[ar_sampling])], ar_params.seed, ar_part.sample_ids
+            )
 
         seg = diff_part.segment
         if isinstance(seg, LatentSegment) and seg.initial_latents is not None:
@@ -235,33 +238,34 @@ class Hi3InputAdapter:
             diff_kwargs = dict(base_diff_kwargs)
             if base_extra:
                 diff_kwargs["extra_args"] = dict(base_extra)
-            return [
+            calls = [
                 GenerateCall(
                     prompts=prompts,
                     sampling=[ar_sampling, StageSampling(kind=STAGE_KIND_DIFFUSION, kwargs=diff_kwargs)],
                 )
             ]
-        if len(recipe_keys) != len(prompts):
-            raise ValueError(
-                f"{self.modality}: x_T recipe key count {len(recipe_keys)} != prompt count {len(prompts)}."
-            )
-
-        noise_seed = seed if seed is not None else 0
-        calls: List[GenerateCall] = []
-        for index, prompt in enumerate(prompts):
-            diff_kwargs = dict(base_diff_kwargs)
-            diff_kwargs["extra_args"] = {
-                **base_extra,
-                "init_noise_group_ids": [recipe_keys[index]],
-                "init_noise_seed": noise_seed,
-            }
-            calls.append(
-                GenerateCall(
-                    prompts=[prompt],
-                    sampling=[ar_sampling, StageSampling(kind=STAGE_KIND_DIFFUSION, kwargs=diff_kwargs)],
+        else:
+            if len(recipe_keys) != len(prompts):
+                raise ValueError(
+                    f"{self.modality}: x_T recipe key count {len(recipe_keys)} != prompt count {len(prompts)}."
                 )
-            )
-        return calls
+
+            noise_seed = seed if seed is not None else 0
+            calls = []
+            for index, prompt in enumerate(prompts):
+                diff_kwargs = dict(base_diff_kwargs)
+                diff_kwargs["extra_args"] = {
+                    **base_extra,
+                    "init_noise_group_ids": [recipe_keys[index]],
+                    "init_noise_seed": noise_seed,
+                }
+                calls.append(
+                    GenerateCall(
+                        prompts=[prompt],
+                        sampling=[ar_sampling, StageSampling(kind=STAGE_KIND_DIFFUSION, kwargs=diff_kwargs)],
+                    )
+                )
+        return seed_ar_calls(calls, ar_params.seed, ar_part.sample_ids)
 
 
 class Hi3TextOutputAdapter:
