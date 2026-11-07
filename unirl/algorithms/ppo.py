@@ -9,6 +9,7 @@ import torch
 
 from unirl.models.types.replay_result import ReplayResult
 from unirl.types.conditions import Condition
+from unirl.types.loss_agg import LossAggMode, parse_loss_agg_mode
 from unirl.types.sample import Part
 from unirl.types.segments.text import TextSegment
 
@@ -16,13 +17,11 @@ from .base import (
     AlgorithmStepResult,
     BaseAlgorithmConfig,
     StageAlgorithm,
-    _grpo_clip_loss,
-    _resolve_clip_range_from_schedule,
+    grpo_clip_loss,
+    resolve_clip_range_from_schedule,
     rollout_replay_logp_absdiff,
     typed_conditions,
 )
-
-_LOSS_AGG_MODES = frozenset({"token-mean", "seq-mean-token-sum-norm", "seq-mean-token-mean"})
 
 
 @dataclass
@@ -64,7 +63,7 @@ def _aggregate_token_loss(
     horizon: int,
 ) -> torch.Tensor:
     """Reduce only trainable tokens while preserving the configured sequence weighting."""
-    if loss_agg_mode == "token-mean":
+    if loss_agg_mode == LossAggMode.TOKEN_MEAN:
         return loss_per_token[active].mean()
     if segment.lengths is None:
         raise ValueError(f"PPO: loss_agg_mode={loss_agg_mode!r} requires packed segment lengths")
@@ -74,7 +73,7 @@ def _aggregate_token_loss(
     sequence_losses = []
     for losses, mask in zip(loss_chunks, mask_chunks):
         selected = losses[mask]
-        if loss_agg_mode == "seq-mean-token-sum-norm":
+        if loss_agg_mode == LossAggMode.SEQ_MEAN_TOKEN_SUM_NORM:
             sequence_losses.append(selected.sum() / float(horizon))
         else:
             sequence_losses.append(selected.mean() if selected.numel() else losses.new_zeros(()))
@@ -117,8 +116,7 @@ class PPO(StageAlgorithm):
             raise ValueError("PPO: vf_coef must be non-negative")
         if not (0.0 <= float(gae_gamma) <= 1.0 and 0.0 <= float(gae_lambda) <= 1.0):
             raise ValueError("PPO: gae_gamma and gae_lambda must be in [0, 1]")
-        if str(loss_agg_mode) not in _LOSS_AGG_MODES:
-            raise ValueError(f"PPO: unsupported loss_agg_mode={loss_agg_mode!r}")
+        mode = parse_loss_agg_mode(loss_agg_mode, owner="PPO")
         if int(horizon) <= 0:
             raise ValueError("PPO: horizon must be positive")
 
@@ -130,8 +128,7 @@ class PPO(StageAlgorithm):
         self.vf_coef = float(vf_coef)
         self.gae_gamma = float(gae_gamma)
         self.gae_lambda = float(gae_lambda)
-        self.loss_agg_mode = str(loss_agg_mode)
-        self.loss_weighting = "token" if self.loss_agg_mode == "token-mean" else "sample"
+        self.loss_agg_mode = mode.value
         self.horizon = int(horizon)
         self.conditions_cls = conditions_cls
         if sampling_temperature is None:
@@ -230,13 +227,13 @@ class PPO(StageAlgorithm):
         if active_count == 0:
             return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
 
-        clip_range = _resolve_clip_range_from_schedule(self.clip_range, self.clip_schedule, training_progress)
+        clip_range = resolve_clip_range_from_schedule(self.clip_range, self.clip_schedule, training_progress)
         clip_high = (
             None
             if self.clip_range_high is None
-            else _resolve_clip_range_from_schedule(self.clip_range_high, self.clip_schedule, training_progress)
+            else resolve_clip_range_from_schedule(self.clip_range_high, self.clip_schedule, training_progress)
         )
-        policy_active, ratio_metrics = _grpo_clip_loss(
+        policy_active, ratio_metrics = grpo_clip_loss(
             new_logp=new_logp[active],
             old_logp=old_logp[active],
             advantages=token_advantages[active],

@@ -21,8 +21,8 @@ class ZImageBundle(Bundle):
         *,
         transformer: nn.Module,
         vae: Optional[nn.Module],
-        text_encoder: nn.Module,
-        tokenizer: Any,
+        text_encoder: Optional[nn.Module],
+        tokenizer: Optional[Any],
         scheduler: Any,
         dtype: torch.dtype,
         device: torch.device,
@@ -68,14 +68,16 @@ class ZImageBundle(Bundle):
             vae = AutoencoderKL.from_pretrained(vae_path, subfolder="vae", torch_dtype=vae_dtype).to(device).eval()
             vae.requires_grad_(False)
 
-        text_encoder = (
-            AutoModel.from_pretrained(text_encoder_path, subfolder="text_encoder", torch_dtype=te_dtype)
-            .to(device)
-            .eval()
-        )
-        text_encoder.requires_grad_(False)
-
-        tokenizer = AutoTokenizer.from_pretrained(text_encoder_path, subfolder="tokenizer")
+        text_encoder = None
+        tokenizer = None
+        if config.load_text_encoder:
+            text_encoder = (
+                AutoModel.from_pretrained(text_encoder_path, subfolder="text_encoder", torch_dtype=te_dtype)
+                .to(device)
+                .eval()
+            )
+            text_encoder.requires_grad_(False)
+            tokenizer = AutoTokenizer.from_pretrained(text_encoder_path, subfolder="tokenizer")
 
         scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(path, subfolder="scheduler")
 

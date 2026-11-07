@@ -57,6 +57,8 @@ pipeline:
   trajectory_precision: bf16
   logprob_precision: fp32
   max_sequence_length: 512
+  # Keep false at micro_batch_size=8 (stacking S=3 SDE steps yields batch 24); flip true at smaller mbs.
+  batch_replay_steps: false
   strategy:
     _target_: unirl.sde.kernels.FlowSDEStrategy
 
@@ -149,6 +151,7 @@ stack:
   micro_batch_size: 8
   max_grad_norm: 1.0
   num_updates_per_batch: 2      # PPO mini-batches per rollout (π_old frozen once); v1 parity
+  shuffle_updates: true
 
 data_source:
   _target_: unirl.data.data_source.MultimodalRLDataSource

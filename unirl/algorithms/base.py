@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple, Typ
 import torch
 
 from unirl.distributed.group.remote import Remote
+from unirl.types.loss_agg import LossAggMode, parse_loss_agg_mode
 
 if TYPE_CHECKING:
     from unirl.types.conditions import Condition
@@ -28,7 +29,7 @@ def typed_conditions(
     return conditions_cls.from_dict(dict(conditions))
 
 
-def _prepare_ar_logp_anchor(
+def prepare_ar_logp_anchor(
     *,
     stage: Any,
     conditions: Mapping[str, "Condition"],
@@ -79,9 +80,65 @@ def gather_sde_field(
     return tensor[:, positions.tolist()]
 
 
-def rollout_replay_logp_absdiff(new_logp: torch.Tensor, old_logp: torch.Tensor) -> Dict[str, float]:
+def select_active_tokens(mask: Optional[torch.Tensor], *tensors: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+    """Detached ``loss_mask``-active elements for metrics; all elements when none are active (``max`` never empty)."""
+    detached = tuple(t.detach() for t in tensors)
+    if mask is None:
+        return detached
+    active = mask.to(device=detached[0].device) > 0
+    if not bool(active.any()):
+        return detached
+    return tuple(t[active] for t in detached)
+
+
+def aggregate_token_losses(
+    loss_per_elem: torch.Tensor,
+    *,
+    lengths: torch.Tensor,
+    loss_mask: Optional[torch.Tensor],
+    loss_agg_mode: str,
+    horizon: int,
+) -> torch.Tensor:
+    """Reduce packed ``[total_tokens]`` losses per :class:`LossAggMode`; raises ``ValueError`` on an unknown mode."""
+    mode = parse_loss_agg_mode(loss_agg_mode, owner="aggregate_token_losses")
+    mask: Optional[torch.Tensor] = None
+    if loss_mask is not None:
+        mask = loss_mask.to(dtype=loss_per_elem.dtype, device=loss_per_elem.device)
+        loss_per_elem = loss_per_elem * mask
+
+    if mode is LossAggMode.TOKEN_MEAN:
+        # Σ ℓ·m / Σ m over the whole micro.
+        if mask is None:
+            return loss_per_elem.mean()
+        return loss_per_elem.sum() / mask.sum().clamp(min=1)
+
+    split_sizes = lengths.tolist()
+    seq_losses = torch.split(loss_per_elem, split_sizes)
+
+    if mode is LossAggMode.SEQ_MEAN_TOKEN_SUM_NORM:
+        # mean_s(Σ_t ℓ·m) / horizon; a fully-masked sequence contributes 0 and still counts in mean_s.
+        return torch.stack([s.sum() for s in seq_losses]).mean() / float(horizon)
+
+    if mode is LossAggMode.SEQ_MEAN_TOKEN_MEAN:
+        # mean_s(Σ_t ℓ·m / max(Σ_t m, 1)); a fully-masked sequence contributes 0 and still counts in mean_s.
+        if mask is None:
+            seq_means = [s.mean() if s.numel() else s.new_zeros(()) for s in seq_losses]
+        else:
+            seq_mask_sums = [m.sum().clamp(min=1) for m in torch.split(mask, split_sizes)]
+            seq_means = [s.sum() / n for s, n in zip(seq_losses, seq_mask_sums)]
+        return torch.stack(seq_means).mean()
+
+    raise ValueError(f"aggregate_token_losses: no reduction implemented for {mode!r}")
+
+
+def rollout_replay_logp_absdiff(
+    new_logp: torch.Tensor,
+    old_logp: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+) -> Dict[str, float]:
     """Per-token |Δlogp| between rollout and replay — AR train-rollout drift gauge."""
     with torch.no_grad():
+        new_logp, old_logp = select_active_tokens(mask, new_logp, old_logp)
         absdiff = (new_logp - old_logp).abs()
     return {
         "rollout_replay_logp_absdiff_mean": float(absdiff.mean()),
@@ -89,9 +146,14 @@ def rollout_replay_logp_absdiff(new_logp: torch.Tensor, old_logp: torch.Tensor) 
     }
 
 
-def rollout_replay_k3(new_logp: torch.Tensor, old_logp: torch.Tensor) -> Dict[str, float]:
+def rollout_replay_k3(
+    new_logp: torch.Tensor,
+    old_logp: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+) -> Dict[str, float]:
     """Per-token K3 KL estimator between rollout and replay log-probs."""
     with torch.no_grad():
+        new_logp, old_logp = select_active_tokens(mask, new_logp, old_logp)
         log_r = (new_logp.float() - old_logp.float()).clamp(min=-20.0, max=20.0)
         k3 = torch.expm1(log_r) - log_r
         out = {
@@ -105,7 +167,7 @@ def rollout_replay_k3(new_logp: torch.Tensor, old_logp: torch.Tensor) -> Dict[st
     return out
 
 
-def _resolve_clip_range_from_schedule(clip_range: float, schedule: str, progress: float) -> float:
+def resolve_clip_range_from_schedule(clip_range: float, schedule: str, progress: float) -> float:
     """Schedule-aware clip range. Mirrors ``GRPOAlgorithm.get_clip_range``."""
     if schedule == "linear_decay":
         return clip_range * (1.0 - 0.5 * float(progress))
@@ -114,13 +176,14 @@ def _resolve_clip_range_from_schedule(clip_range: float, schedule: str, progress
     return clip_range
 
 
-def _grpo_clip_loss(
+def grpo_clip_loss(
     *,
     new_logp: torch.Tensor,
     old_logp: torch.Tensor,
     advantages: torch.Tensor,
     clip_range: float,
     clip_range_high: Optional[float] = None,
+    mask: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """PPO-style clipped objective. Element-wise; reduction is the caller's job."""
     high = clip_range if clip_range_high is None else clip_range_high
@@ -131,6 +194,7 @@ def _grpo_clip_loss(
     clipped = -adv * torch.clamp(ratio, 1.0 - clip_range, 1.0 + high)
     loss_per_elem = torch.maximum(unclipped, clipped)
 
+    ratio, log_diff = select_active_tokens(mask, ratio, log_diff)
     if ratio.numel() > 1:
         ratio_std = ratio.std()
     else:
@@ -150,13 +214,13 @@ def _grpo_clip_loss(
     return loss_per_elem, metrics
 
 
-def _gaussian_kl_div(p: torch.Tensor, q: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+def gaussian_kl_div(p: torch.Tensor, q: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
     """Per-element Gaussian KL ``(p-q)^2 / (2 sigma^2)``; ``sigma`` ``[S']`` broadcasts over ``[B, S', *latent]``."""
     sigma = sigma.reshape(1, -1, *([1] * (p.ndim - 2)))
     return (p - q) ** 2 / (2 * sigma**2)
 
 
-def _transition_sigma(
+def transition_sigma(
     stage: Any,
     *,
     segment: "Segment",
@@ -165,20 +229,20 @@ def _transition_sigma(
     device: torch.device,
     add_coefficient: bool = True,
 ) -> torch.Tensor:
-    """Per-step SDE transition std ``sigma_t`` ``[S']``; ``_gaussian_kl_div`` broadcasts it against the means."""
+    """Per-step SDE transition std ``sigma_t`` ``[S']``; ``gaussian_kl_div`` broadcasts it against the means."""
     if not add_coefficient:
         return torch.ones(len(target_steps), device=device)
     if segment.sigmas is None:
-        raise ValueError("_transition_sigma requires segment.sigmas (add_coefficient=True).")
+        raise ValueError("transition_sigma requires segment.sigmas (add_coefficient=True).")
     sigmas = segment.sigmas.to(device=device, dtype=torch.float32)
     idx = torch.tensor(target_steps, dtype=torch.long, device=device)
     s = sigmas[idx]
     s_next = sigmas[idx + 1]
     sigma_max = sigmas[1] if int(sigmas.shape[0]) > 1 else torch.tensor(0.99, device=device, dtype=sigmas.dtype)
-    return stage.strategy.transition_std(sigma=s, sigma_next=s_next, eta=float(eta), sigma_max=sigma_max)
+    return stage.strategy.transition_std(sigma=s, sigma_next=s_next, eta=eta, sigma_max=sigma_max)
 
 
-def _reference_replay_means(
+def reference_kl_loss(
     stage: Any,
     ref_model: Any,
     *,
@@ -186,45 +250,51 @@ def _reference_replay_means(
     segment: "Segment",
     params: Any,
     target_steps: List[int],
+    new_means: Optional[torch.Tensor],
+    algo: str,
 ) -> torch.Tensor:
-    """Replay the reference policy (LoRA adapter disabled) → detached ``prev_sample_means``."""
+    """Mean Gaussian KL(pi_theta || pi_ref) over ``[B, S']`` per-step means; grad flows through ``new_means`` only."""
+    if new_means is None:
+        raise RuntimeError(
+            f"{algo}: beta>0 requires stage.replay() to return prev_sample_means, "
+            "but got None. Ensure the stage's replay method produces means."
+        )
     from unirl.train.lora import adapters_disabled
 
     with torch.no_grad(), adapters_disabled(ref_model):
         result = stage.replay(conditions, segment=segment, params=params, step_indices=target_steps)
     if result.prev_sample_means is None:
         raise RuntimeError(
-            "_reference_replay_means: stage.replay() returned prev_sample_means=None "
+            "reference_kl_loss: stage.replay() returned prev_sample_means=None "
             "for the adapter-disabled reference forward."
         )
-    return result.prev_sample_means.detach()
+    ref_means = result.prev_sample_means.detach().to(dtype=new_means.dtype, device=new_means.device)
+    sigma_t = transition_sigma(
+        stage,
+        segment=segment,
+        target_steps=target_steps,
+        eta=params.eta,
+        device=new_means.device,
+        add_coefficient=True,
+    )
+    kl_per_elem = gaussian_kl_div(new_means, ref_means, sigma_t)
+    return kl_per_elem.mean(dim=tuple(range(2, kl_per_elem.ndim))).mean()
 
 
-def _reference_kl_loss(
-    new_means: torch.Tensor,
-    ref_means: torch.Tensor,
-    sigma_t: torch.Tensor,
-) -> torch.Tensor:
-    """Mean Gaussian KL(pi_theta || pi_ref) over ``[B, S']`` per-step means; grad flows through ``new_means`` only."""
-    kl_per_elem = _gaussian_kl_div(new_means, ref_means, sigma_t)
-    kl_per_sample = kl_per_elem.mean(dim=tuple(range(2, kl_per_elem.ndim)))
-    return kl_per_sample.mean()
-
-
-def _resolve_reference_model(backend: Any, *, beta: float, algo: str, coef_name: str = "beta") -> Any:
+def resolve_reference_model(backend: Any, *, beta: float, algo: str, coef_name: str = "beta") -> Any:
     """Resolve the trainable model for the adapter-disabled reference replay, or None."""
     coef = float(beta)
     if not math.isfinite(coef) or coef < 0.0:
         raise ValueError(f"{algo}: {coef_name} must be finite and >= 0; got {beta!r}.")
     if coef == 0.0:
         return None
-    model = getattr(backend, "model", None) if backend is not None else None
-    if model is None:
+    if backend is None or backend.model is None:
         raise ValueError(
             f"{algo}: {coef_name}>0 needs the trainable model to define the reference policy, but "
             f"no `backend` was injected. The v2 DiffusionTrainer injects it when the "
             f"algorithm declares requires_backend=True or requires_ema_rollout=True."
         )
+    model = backend.model
     if not any("lora_" in name for name, _ in model.named_parameters()):
         raise ValueError(
             f"{algo}: {coef_name}>0 anchors the policy to the LoRA-disabled base model (reference "
@@ -234,7 +304,22 @@ def _resolve_reference_model(backend: Any, *, beta: float, algo: str, coef_name:
     return model
 
 
-def _require_replay_anchor_for_batched_replay(stage: Any, old_logp_source: str, *, algo: str) -> None:
+def slice_step_chunks(target_steps: List[int], chunk_size: Optional[int]) -> List[List[int]]:
+    """Slice ``target_steps`` into ``chunk_size`` windows (single full slice when ``None``)."""
+    if chunk_size is None:
+        return [target_steps]
+    return [target_steps[i : i + chunk_size] for i in range(0, len(target_steps), chunk_size)]
+
+
+def require_timestep_chunk_size(timestep_chunk_size: Optional[int], *, algo: str) -> None:
+    """Validate that ``timestep_chunk_size`` is ``None`` or a positive non-bool ``int``."""
+    if timestep_chunk_size is not None and (
+        not isinstance(timestep_chunk_size, int) or isinstance(timestep_chunk_size, bool) or timestep_chunk_size < 1
+    ):
+        raise ValueError(f"{algo}: timestep_chunk_size must be a positive int; got {timestep_chunk_size!r}")
+
+
+def require_replay_anchor_for_batched_replay(stage: Any, old_logp_source: str, *, algo: str) -> None:
     """Reject ``batch_replay_steps`` paired with a rollout-sourced π_old anchor."""
     if not getattr(stage, "batch_replay_steps", False):
         return
@@ -269,7 +354,6 @@ class StageAlgorithm(Remote, ABC):
     supports_multi_update: bool = False
     requires_backend: bool = False
     requires_advantages: bool = True
-    loss_weighting: str = "sample"
     recomputes_anchor: bool = False
     anchor_fields: Tuple[str, ...] = ()
 
@@ -302,9 +386,22 @@ class StageAlgorithm(Remote, ABC):
 
 __all__ = [
     "AlgorithmStepResult",
+    "BaseAlgorithmConfig",
     "StageAlgorithm",
+    "aggregate_token_losses",
     "gather_sde_field",
-    "rollout_replay_logp_absdiff",
+    "gaussian_kl_div",
+    "grpo_clip_loss",
+    "prepare_ar_logp_anchor",
+    "reference_kl_loss",
+    "require_replay_anchor_for_batched_replay",
+    "require_timestep_chunk_size",
+    "resolve_clip_range_from_schedule",
+    "resolve_reference_model",
     "rollout_replay_k3",
+    "rollout_replay_logp_absdiff",
+    "select_active_tokens",
+    "slice_step_chunks",
+    "transition_sigma",
     "typed_conditions",
 ]

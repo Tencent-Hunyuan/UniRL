@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import logging
-from typing import Dict, Iterator, Optional
+from contextlib import contextmanager
+from typing import Callable, Dict, Iterator, List
 
 import torch
+import torch.distributed as dist
 from torch import nn
+from torch.distributed.tensor import DTensor
 from torch.nn.parameter import Parameter
 
 from unirl.distributed.local import local_view
@@ -16,19 +19,28 @@ logger = logging.getLogger(__name__)
 StateDict = Dict[str, object]
 
 
+def _current_rank() -> int:
+
+    if dist.is_available() and dist.is_initialized():
+        return int(dist.get_rank())
+    return 0
+
+
 def gather_state_dict(model: nn.Module) -> StateDict:
     """Rank-0 DCP gather.  Returns full state on rank 0, empty on others."""
-    from torch.distributed.checkpoint.state_dict import get_model_state_dict
+    from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
 
-    options = _build_state_dict_options(full_state_dict=True, cpu_offload=True)
-    try:
-        full = dict(get_model_state_dict(model, options=options))
-    except TypeError:
-        full = dict(get_model_state_dict(model))
+    options = StateDictOptions(full_state_dict=True, cpu_offload=True)
+    full = dict(get_model_state_dict(model, options=options))
 
     if _current_rank() != 0:
         return {}
-    return _to_cpu_state_dict(full)
+    converted: StateDict = {}
+    for key, value in full.items():
+        if isinstance(value, DTensor):
+            value = value.full_tensor()
+        converted[key] = value.detach().cpu() if isinstance(value, torch.Tensor) else value
+    return converted
 
 
 def load_model_state_dict(
@@ -37,42 +49,45 @@ def load_model_state_dict(
     *,
     strict: bool = True,
     broadcast_from_rank0: bool = True,
-) -> None:
-    """Load a full state dict and reshard it into ``model``."""
-    from torch.distributed.checkpoint.state_dict import set_model_state_dict
+) -> object:
+    """Load a full state dict and reshard it into ``model``; returns torch's ``(missing_keys, unexpected_keys)``."""
+    from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
 
-    options = _build_state_dict_options(
+    options = StateDictOptions(
         full_state_dict=True,
         broadcast_from_rank0=broadcast_from_rank0,
         cpu_offload=False,
         strict=strict,
     )
-    try:
-        set_model_state_dict(model, state_dict, options=options)
-    except TypeError:
-        set_model_state_dict(model, state_dict)
+    return set_model_state_dict(model, state_dict, options=options)
 
 
 def gather_optimizer_state_dict(model: nn.Module, optimizer: torch.optim.Optimizer) -> StateDict:
-    """Rank-0 DCP optimizer gather; preserves cold AdamW state."""
-    options = _build_state_dict_options(full_state_dict=True, cpu_offload=True)
-    full = _export_optimizer_state_dict(model, optimizer, options=options)
+    """Rank-0 DCP optimizer gather; never-updated AdamW params export as step-0 zero state."""
+    from torch.distributed.checkpoint.state_dict import StateDictOptions, get_optimizer_state_dict
+
+    options = StateDictOptions(full_state_dict=True, cpu_offload=True)
+    with fresh_adamw_state(optimizer):
+        full = get_optimizer_state_dict(model, optimizer, options=options)
     return full if _current_rank() == 0 else {}
 
 
-def gather_lora_state_dict(model: nn.Module) -> StateDict:
-    """Gather every adapter's LoRA tensors, preserving the model state-dict key format."""
+def gather_lora_state_dict(model: nn.Module, keep: Callable[[str], bool]) -> StateDict:
+    """Gather the LoRA tensors whose keys pass ``keep``, preserving the model state-dict key format."""
     gathered: StateDict = {}
     for key, value in model.state_dict().items():
-        if "lora_A" not in key and "lora_B" not in key:
+        if not keep(key):
             continue
         if isinstance(value, torch.Tensor) and value.is_meta:
             raise RuntimeError(f"gather_lora_state_dict: LoRA tensor {key!r} is still on meta")
-        materialized = _materialize_checkpoint_tensor(value)
-        if isinstance(materialized, torch.Tensor):
-            materialized = materialized.detach().cpu()
+        if isinstance(value, DTensor):
+            if value.device.type == "cpu" and torch.cuda.is_available():
+                value = value.cuda()
+            value = value.full_tensor()
+        if isinstance(value, torch.Tensor):
+            value = value.detach().cpu()
         if _current_rank() == 0:
-            gathered[key] = materialized
+            gathered[key] = value
     if _current_rank() != 0:
         return {}
     return gathered
@@ -86,58 +101,43 @@ def load_optimizer_state_dict(
     broadcast_from_rank0: bool = True,
 ) -> None:
     """Load a full optimizer state dict and reshard it into ``optimizer``."""
-    from torch.distributed.checkpoint.state_dict import set_optimizer_state_dict
+    from torch.distributed.checkpoint.state_dict import StateDictOptions, set_optimizer_state_dict
 
-    options = _build_state_dict_options(
+    options = StateDictOptions(
         full_state_dict=True,
         broadcast_from_rank0=broadcast_from_rank0,
         cpu_offload=False,
     )
+    if isinstance(optimizer, torch.optim.AdamW) and "state" in state_dict:
+        # Sparse checkpoints list never-updated params without state; a step-0 entry is dropped back to lazy init.
+        for group in state_dict["param_groups"]:
+            for name in group["params"]:
+                state_dict["state"].setdefault(name, {"step": torch.tensor(0.0)})
+    set_optimizer_state_dict(model, optimizer, optim_state_dict=state_dict, options=options)
+    if isinstance(optimizer, torch.optim.AdamW):
+        for param in [p for p, entry in optimizer.state.items() if float(entry["step"]) == 0]:
+            del optimizer.state[param]
+
+
+@contextmanager
+def fresh_adamw_state(optimizer: torch.optim.Optimizer) -> Iterator[None]:
+    """Temporarily give never-updated AdamW params the step-0 zero state their first update would create."""
+    added: List[Parameter] = []
+    if isinstance(optimizer, torch.optim.AdamW):
+        for group in optimizer.param_groups:
+            moments = ("exp_avg", "exp_avg_sq", "max_exp_avg_sq") if group["amsgrad"] else ("exp_avg", "exp_avg_sq")
+            for param in group["params"]:
+                if param not in optimizer.state:
+                    optimizer.state[param] = {
+                        "step": torch.tensor(0.0),
+                        **{k: torch.zeros_like(param) for k in moments},
+                    }
+                    added.append(param)
     try:
-        set_optimizer_state_dict(model, optimizer, optim_state_dict=state_dict, options=options)
-    except TypeError:
-        set_optimizer_state_dict(model, optimizer, optim_state_dict=state_dict)
-
-
-def sharded_model_state_dict(model: nn.Module) -> StateDict:
-    """Per-rank sharded model state for DCP."""
-    from torch.distributed.checkpoint.state_dict import get_model_state_dict
-
-    options = _build_state_dict_options(full_state_dict=False)
-    try:
-        return dict(get_model_state_dict(model, options=options))
-    except TypeError:
-        return dict(get_model_state_dict(model))
-
-
-def sharded_optimizer_state_dict(model: nn.Module, optimizer: torch.optim.Optimizer) -> StateDict:
-    """Per-rank sharded optimizer state for DCP; preserves cold AdamW state."""
-    options = _build_state_dict_options(full_state_dict=False)
-    return _export_optimizer_state_dict(model, optimizer, options=options)
-
-
-def load_sharded_model_state_dict(model: nn.Module, state_dict: StateDict, *, strict: bool = True) -> None:
-    """Load a per-rank sharded model state read by ``dcp.load`` in place."""
-    from torch.distributed.checkpoint.state_dict import set_model_state_dict
-
-    options = _build_state_dict_options(full_state_dict=False, strict=strict)
-    try:
-        set_model_state_dict(model, state_dict, options=options)
-    except TypeError:
-        set_model_state_dict(model, state_dict)
-
-
-def load_sharded_optimizer_state_dict(
-    model: nn.Module, optimizer: torch.optim.Optimizer, state_dict: StateDict
-) -> None:
-    """Load a per-rank sharded optimizer state read by ``dcp.load`` in place."""
-    from torch.distributed.checkpoint.state_dict import set_optimizer_state_dict
-
-    options = _build_state_dict_options(full_state_dict=False)
-    try:
-        set_optimizer_state_dict(model, optimizer, optim_state_dict=state_dict, options=options)
-    except TypeError:
-        set_optimizer_state_dict(model, optimizer, optim_state_dict=state_dict)
+        yield
+    finally:
+        for param in added:
+            del optimizer.state[param]
 
 
 def drop_meta_entries(state_dict: StateDict) -> StateDict:
@@ -152,147 +152,18 @@ def drop_meta_entries(state_dict: StateDict) -> StateDict:
 
 
 def move_optimizer_state(optimizer: torch.optim.Optimizer, device: object) -> None:
-    """Move every tensor in the optimizer state to ``device`` (the on/offload loop)."""
-    for state in optimizer.state.values():
-        for k, v in state.items():
-            if isinstance(v, torch.Tensor):
-                state[k] = v.to(device)
-
-
-def lora_state_dict(
-    model: nn.Module,
-    full_sd: Optional[StateDict] = None,
-) -> StateDict:
-    """Adapter-only state for inference export."""
-    if full_sd is None:
-        full_sd = gather_state_dict(model)
-    if _current_rank() != 0:
-        return {}
-    return {k: v for k, v in full_sd.items() if _is_lora_key(k)}
-
-
-def nft_state_dict(
-    model: nn.Module,
-    full_sd: Optional[StateDict] = None,
-    shadow_adapter: str = "old",
-) -> StateDict:
-    """Export the shadow ('old') adapter state for DiffusionNFT checkpoint."""
-    if full_sd is None:
-        full_sd = gather_state_dict(model)
-    if _current_rank() != 0:
-        return {}
-    token = f".{shadow_adapter}."
-    return {k: v for k, v in full_sd.items() if ("lora_A" in k or "lora_B" in k) and token in k}
-
-
-def is_materialized(model: nn.Module) -> bool:
-    return not any(p.is_meta for p in model.parameters())
+    """Move optimizer state to ``device``; non-fused/capturable ``step`` stays on CPU as it is read via ``.item()``."""
+    for group in optimizer.param_groups:
+        step_device = device if group.get("capturable", False) or group.get("fused", False) else "cpu"
+        for param in group["params"]:
+            state = optimizer.state.get(param, {})
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.to(step_device if k == "step" else device)
 
 
 def trainable_params(model: nn.Module) -> Iterator[Parameter]:
     return (p for p in model.parameters() if p.requires_grad)
-
-
-def infer_device(model: nn.Module) -> torch.device:
-    """First non-meta parameter's device, else current cuda, else cpu."""
-    for param in model.parameters():
-        if param.is_meta:
-            continue
-        return param.device
-    if torch.cuda.is_available():
-        return torch.device(f"cuda:{torch.cuda.current_device()}")
-    return torch.device("cpu")
-
-
-def _current_rank() -> int:
-    import torch.distributed as dist
-
-    if dist.is_available() and dist.is_initialized():
-        return int(dist.get_rank())
-    return 0
-
-
-def _is_lora_key(key: str) -> bool:
-    """True for default-adapter LoRA keys (excludes shadow/old adapter)."""
-    return ("lora_A" in key or "lora_B" in key) and ".old." not in key
-
-
-def _build_state_dict_options(**kwargs: object) -> object:
-    """Construct ``StateDictOptions`` degrading gracefully on older torch."""
-    from torch.distributed.checkpoint.state_dict import StateDictOptions
-
-    candidates = [
-        dict(kwargs),
-        {k: v for k, v in kwargs.items() if k != "strict"},
-        {k: v for k, v in kwargs.items() if k not in {"strict", "broadcast_from_rank0"}},
-        {k: v for k, v in kwargs.items() if k in {"full_state_dict", "cpu_offload"}},
-        {},
-    ]
-    for candidate in candidates:
-        try:
-            return StateDictOptions(**candidate)
-        except TypeError:
-            continue
-    return StateDictOptions()
-
-
-def _maybe_dtensor_to_tensor(value: object) -> object:
-    if hasattr(value, "full_tensor") and callable(getattr(value, "full_tensor")):
-        try:
-            return value.full_tensor()
-        except Exception:
-            return value
-    return value
-
-
-def _materialize_checkpoint_tensor(value: object) -> object:
-    if hasattr(value, "full_tensor") and callable(getattr(value, "full_tensor")):
-        device = getattr(value, "device", None)
-        if (
-            getattr(device, "type", None) == "cpu"
-            and torch.cuda.is_available()
-            and hasattr(value, "cuda")
-            and callable(getattr(value, "cuda"))
-        ):
-            value = value.cuda()
-    return _maybe_dtensor_to_tensor(value)
-
-
-def _to_cpu_state_dict(state_dict: StateDict) -> StateDict:
-    converted: StateDict = {}
-    for key, value in state_dict.items():
-        tensor_or_obj = _maybe_dtensor_to_tensor(value)
-        if isinstance(tensor_or_obj, torch.Tensor):
-            converted[key] = tensor_or_obj.detach().cpu()
-        else:
-            converted[key] = tensor_or_obj
-    return converted
-
-
-def _export_optimizer_state_dict(
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    *,
-    options: object,
-) -> StateDict:
-    """Export without advancing a cold AdamW clock."""
-    from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
-
-    cold = (
-        isinstance(optimizer, torch.optim.AdamW)
-        and not optimizer.state
-        and all(param.grad is None for group in optimizer.param_groups for param in group["params"])
-    )
-    try:
-        exported = get_optimizer_state_dict(model, optimizer, options=options)
-        if cold:
-            for entry in exported.get("state", {}).values():
-                entry["step"] = torch.zeros_like(entry["step"])
-        return exported
-    finally:
-        if cold:
-            optimizer.state.clear()
-            optimizer.zero_grad(set_to_none=True)
 
 
 __all__ = [
@@ -300,16 +171,10 @@ __all__ = [
     "gather_state_dict",
     "load_model_state_dict",
     "gather_optimizer_state_dict",
+    "gather_lora_state_dict",
     "load_optimizer_state_dict",
-    "sharded_model_state_dict",
-    "sharded_optimizer_state_dict",
-    "load_sharded_model_state_dict",
-    "load_sharded_optimizer_state_dict",
+    "fresh_adamw_state",
     "drop_meta_entries",
     "move_optimizer_state",
-    "lora_state_dict",
-    "nft_state_dict",
-    "is_materialized",
     "trainable_params",
-    "infer_device",
 ]

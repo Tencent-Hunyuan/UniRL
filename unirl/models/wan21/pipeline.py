@@ -38,14 +38,13 @@ class WAN21Pipeline(Pipeline):
         trajectory_precision: str = "fp16",
         logprob_precision: str = "fp32",
         max_sequence_length: int = 512,
+        batch_replay_steps: bool = False,
     ) -> None:
         super().__init__()
         self.bundle = bundle
-        self.text_embed = (
-            text_embed
-            if text_embed is not None
-            else WAN21TextEmbedStage(bundle, max_sequence_length=int(max_sequence_length))
-        )
+        if text_embed is None and bundle.text_encoder is not None:
+            text_embed = WAN21TextEmbedStage(bundle, max_sequence_length=int(max_sequence_length))
+        self.text_embed = text_embed
         if diffusion is None:
             diffusion = WAN21DiffusionStage(
                 model=bundle,
@@ -54,6 +53,7 @@ class WAN21Pipeline(Pipeline):
                 autocast_precision=autocast_precision,
                 trajectory_precision=trajectory_precision,
                 logprob_precision=logprob_precision,
+                batch_replay_steps=batch_replay_steps,
             )
         self.diffusion = diffusion
         self.vae_decode = vae_decode if vae_decode is not None else WAN21VAEDecodeStage(bundle)
@@ -62,9 +62,9 @@ class WAN21Pipeline(Pipeline):
     @classmethod
     def latent_shape(cls, *, model_config: Any, sampling_spec: Any) -> tuple:
         """Per-sample 5D latent shape ``(C, T_lat, H_lat, W_lat)`` for"""
-        height = int(sampling_spec.height)
-        width = int(sampling_spec.width)
-        num_frames = int(sampling_spec.num_frames)
+        height = sampling_spec.height
+        width = sampling_spec.width
+        num_frames = sampling_spec.num_frames
         if (num_frames - 1) % 4 != 0:
             raise ValueError(
                 f"WAN VAE temporal_downsample=4 requires "
@@ -83,7 +83,11 @@ class WAN21Pipeline(Pipeline):
     ) -> "WAN21Pipeline":
         """Build the full pipeline from a config."""
         bundle = WAN21Bundle.from_config(config)
-        text_embed = WAN21TextEmbedStage(bundle, max_sequence_length=int(config.max_sequence_length))
+        text_embed = (
+            WAN21TextEmbedStage(bundle, max_sequence_length=config.max_sequence_length)
+            if bundle.text_encoder is not None
+            else None
+        )
         step = WAN21DiffusionStep()
         diffusion = WAN21DiffusionStage(
             model=bundle,
@@ -92,6 +96,7 @@ class WAN21Pipeline(Pipeline):
             autocast_precision=config.autocast_precision,
             trajectory_precision=config.trajectory_precision,
             logprob_precision=config.logprob_precision,
+            batch_replay_steps=config.batch_replay_steps,
         )
         vae_decode = WAN21VAEDecodeStage(bundle)
         return cls(
@@ -99,7 +104,7 @@ class WAN21Pipeline(Pipeline):
             text_embed=text_embed,
             diffusion=diffusion,
             vae_decode=vae_decode,
-            shift=float(config.shift),
+            shift=config.shift,
         )
 
     def build_conditions(
@@ -114,6 +119,11 @@ class WAN21Pipeline(Pipeline):
             raise ValueError(
                 f"WAN21Pipeline.build_conditions: negative_text length "
                 f"{len(negatives.texts)} != text length {len(texts.texts)}"
+            )
+        if self.text_embed is None:
+            raise RuntimeError(
+                "WAN21Pipeline.build_conditions: no text_embed stage "
+                "(load_text_encoder=False); trainside conditioning requires load_text_encoder=True."
             )
         text_cond = self.text_embed.embed(texts)
         if negatives is None and float(guidance_scale) > 1.0:
@@ -160,7 +170,7 @@ class WAN21Pipeline(Pipeline):
             )
         images_prim = next((c for c in conditioning[1:] if isinstance(c, Images)), None)
 
-        wan_conds = self.build_conditions(texts, guidance_scale=float(params.guidance_scale))
+        wan_conds = self.build_conditions(texts, guidance_scale=params.guidance_scale)
 
         if images_prim is not None:
             if len(images_prim) != len(texts.texts):
@@ -169,9 +179,9 @@ class WAN21Pipeline(Pipeline):
                 )
             image_latent = WAN21ImageLatentEncodeStage(
                 self.bundle,
-                num_frames=int(params.num_frames),
-                height=int(params.height),
-                width=int(params.width),
+                num_frames=params.num_frames,
+                height=params.height,
+                width=params.width,
             ).encode(images_prim)
             image_embed = (
                 WAN21CLIPVisionEncodeStage(self.bundle).encode(images_prim) if self.bundle.uses_clip_vision else None

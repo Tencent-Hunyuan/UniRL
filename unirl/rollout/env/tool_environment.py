@@ -82,9 +82,11 @@ def parse_tool_call(text: str) -> Optional[Dict[str, Any]]:
 class ToolEnvironment:
     """Agentic :class:`Environment`: parse tool calls, run tools, observe results, stop on a final answer."""
 
-    def __init__(self, tools: Sequence[Tool], max_turns: int = 6) -> None:
+    def __init__(self, tools: Sequence[Tool], max_turns: int = 6, max_observation_chars: Optional[int] = None) -> None:
         if not tools:
             raise ValueError("ToolEnvironment requires at least one tool")
+        if max_observation_chars is not None and max_observation_chars < 1:
+            raise ValueError(f"max_observation_chars must be >= 1 when set; got {max_observation_chars}")
         self._tools: Dict[str, Tool] = {}
         for tool in tools:
             if tool.name in self._tools:
@@ -92,6 +94,7 @@ class ToolEnvironment:
             self._tools[tool.name] = tool
         self._stateful_tools: List[StatefulTool] = [t for t in self._tools.values() if isinstance(t, StatefulTool)]
         self.max_turns = max_turns
+        self._max_observation_chars = max_observation_chars
 
     def tool_schemas(self) -> List[Dict[str, Any]]:
         """The tools' JSON schemas, for ``apply_chat_template(tools=...)`` prompt injection."""
@@ -122,7 +125,9 @@ class ToolEnvironment:
 
         sessions = sample.parts[0].control.get("tool_sessions", {})
         calls = [parse_tool_call(t) for t in texts]
-        results: List[Optional[str]] = [self._run(c, sessions) if c is not None else None for c in calls]
+        results: List[Optional[str]] = [
+            self._clip_observation(self._run(c, sessions)) if c is not None else None for c in calls
+        ]
         per_sample_done = [c is None for c in calls]
         any_call = any(c is not None for c in calls)
 
@@ -155,6 +160,14 @@ class ToolEnvironment:
             return tool.execute(args)
         except Exception as exc:  # noqa: BLE001 — tool errors are fed back to the model, not raised
             return f"Error: {exc}"
+
+    def _clip_observation(self, result: str) -> str:
+        """Cap one observation so an unsummarized tool dump cannot eat the whole context."""
+        cap = self._max_observation_chars
+        if cap is None or len(result) <= cap:
+            return result
+        logger.info("ToolEnvironment: clipped a %d-char observation to %d", len(result), cap)
+        return f"{result[:cap]}\n[observation truncated to {cap} characters]"
 
     def close(self, sample: Sample) -> None:
         """Guaranteed teardown: end every open tool session for this trajectory."""

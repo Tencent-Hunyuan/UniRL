@@ -102,8 +102,7 @@ def _prepare_qwen_moe_dtensor(
 
 def _unpack_qwen_moe(model: torch.nn.Module) -> bool:
     """Whether this model uses a supported packed Qwen MoE checkpoint layout."""
-    parallel_groups = getattr(model, "_extra_parallel_param_groups", None) or {}
-    if parallel_groups.get("ep"):
+    if hasattr(model, "_extra_parallel_param_groups"):
         return False
     model_type = getattr(getattr(model, "config", None), "model_type", None)
     return model_type in _PACKED_QWEN_MOE_MODEL_TYPES
@@ -315,7 +314,6 @@ def extract_lora_tensors(
 ) -> dict[str, torch.Tensor]:
     """Extract LoRA tensors in canonical wire format."""
     result: dict[str, torch.Tensor] = {}
-    prefix = str(param_prefix or "")
     for raw_name, param in model.state_dict().items():
         name = _strip_peft_prefix(raw_name)
         for marker, suffix in ((".lora_A.", "lora_A"), (".lora_B.", "lora_B")):
@@ -325,7 +323,7 @@ def extract_lora_tensors(
             adapter, *_rest = adapter_suffix.split(".", 1)
             if adapter != adapter_name:
                 break
-            out_name = f"{prefix}{head}.{suffix}.weight"
+            out_name = f"{param_prefix}{head}.{suffix}.weight"
             result[out_name] = _to_full_tensor(param, dtype).detach().cpu()
             break
 
@@ -346,7 +344,12 @@ def extract_lora_tensors(
 
 
 def adapt_lora_for_vllm(tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    """Wrap canonical-format LoRA keys in the vllm-omni PEFT envelope."""
+    """Idempotently wrap canonical LoRA keys in the vllm-omni PEFT envelope."""
+    enveloped = [name.startswith(_PEFT_PREFIX) for name in tensors]
+    if all(enveloped):
+        return tensors
+    if any(enveloped):
+        raise ValueError("LoRA tensors mix canonical and PEFT-enveloped keys")
     return {f"{_PEFT_PREFIX}{k}": v for k, v in tensors.items()}
 
 
@@ -357,11 +360,10 @@ def adapt_lora_for_sglang(
     peft_config: dict | None = None,
 ) -> dict[str, torch.Tensor]:
     """Convert canonical-format LoRA tensors to SGLang's native key format."""
-    prefix = str(pipeline_prefix or "")
     result: dict[str, torch.Tensor] = {}
     for key, tensor in tensors.items():
-        if prefix and key.startswith(prefix):
-            key = key[len(prefix) :]
+        if pipeline_prefix and key.startswith(pipeline_prefix):
+            key = key[len(pipeline_prefix) :]
         result[key] = tensor
 
     if peft_config:

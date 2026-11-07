@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Optional, Protocol, Tuple
+from typing import Any, Dict, List, Optional, Protocol, Tuple
 
 from unirl.types.primitives import PrimitiveValue
 from unirl.types.sample import Sample
@@ -10,6 +10,12 @@ from unirl.types.sample import Sample
 
 class Environment(Protocol):
     """The world side of a harness turn; concrete environments are separate."""
+
+    max_turns: int
+
+    def tool_schemas(self) -> List[Dict[str, Any]]:
+        """The tools' JSON schemas, for ``apply_chat_template(tools=...)`` prompt injection."""
+        ...
 
     def reset(self, request: Sample) -> Sample:
         """Optional per-episode setup; return the (possibly augmented) request Sample."""

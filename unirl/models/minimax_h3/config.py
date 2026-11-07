@@ -44,6 +44,7 @@ class MiniMaxH3PipelineConfig:
     # Stage-level precision / numerical policy.
     trajectory_precision: str = "fp16"
     logprob_precision: str = "fp32"
+    batch_replay_steps: bool = False
 
     # Per-modality rectified-flow shifts. These are the released inference
     # values; they are NOT free parameters -- the model was distilled against
@@ -94,6 +95,11 @@ class MiniMaxH3PipelineConfig:
     # spends ~2 minutes denoising. Set True only if GPU memory genuinely forces
     # it, and expect decode to become the bottleneck.
     vae_components_on_cpu: bool = False
+
+    # Directory of ``index.json`` + sharded ``.safetensors`` from
+    # ``python -m unirl.tools.precompute_minimax_h3``. When set, the bundle
+    # skips the 32B Qwen3-VL load and generate reads embeddings from the store.
+    text_embed_cache_path: Optional[str] = None
 
     weight_sync_param_name_prefix: str = "transformer."
 

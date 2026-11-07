@@ -28,14 +28,11 @@ class ClipRewardScorer(LocalRewardBackend):
         )
 
     def _load_model(self) -> None:
-        try:
-            import torch.nn as nn
-            import torchvision.transforms as T
-            from transformers import CLIPModel, CLIPProcessor
-        except ImportError:
-            raise ImportError("transformers and torchvision are required for CLIP")
+        import torch.nn as nn
+        import torchvision.transforms as T
+        from transformers import CLIPModel, CLIPProcessor
 
-        model_id = self.model_kwargs.get("model_id", "openai/clip-vit-large-patch14")
+        model_id = self.model_kwargs["model_id"]
         self.model = CLIPModel.from_pretrained(model_id).to(self.device)
         self.processor = CLIPProcessor.from_pretrained(model_id)
 

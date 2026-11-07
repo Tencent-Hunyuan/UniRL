@@ -10,6 +10,7 @@ import ray
 
 from reward_service.config import RewardModelCfg
 from reward_service.logging_utils import get_logger
+from reward_service.mps import MPS_PIPE_DIRECTORY
 from reward_service.scorers import ScoreItem
 from reward_service.workers.actor import ScorerActor
 
@@ -77,11 +78,24 @@ def _build_runtime_env(requirements_path: str) -> dict[str, Any]:
 
 def _actor_options(cfg: RewardModelCfg) -> dict[str, Any]:
     """Build the dict passed to ``ScorerActor.options(...)``."""
+    runtime_env = _build_runtime_env(cfg.runtime_env)
+    if cfg.mps is not None:
+        env_vars = {
+            "CUDA_MPS_PIPE_DIRECTORY": str(MPS_PIPE_DIRECTORY),
+            "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE": str(
+                cfg.mps.active_thread_percentage
+            ),
+        }
+        if cfg.mps.device_memory_limit_mib is not None:
+            env_vars["CUDA_MPS_PINNED_DEVICE_MEM_LIMIT"] = (
+                f"0={cfg.mps.device_memory_limit_mib}M"
+            )
+        runtime_env["env_vars"] = env_vars
     options: dict[str, Any] = {
         "num_gpus": cfg.num_gpus,
         "num_cpus": cfg.num_cpus,
         "max_concurrency": cfg.max_concurrency,
-        "runtime_env": _build_runtime_env(cfg.runtime_env),
+        "runtime_env": runtime_env,
     }
     if cfg.scheduling == "spread":
         options["scheduling_strategy"] = _SPREAD_STRATEGY

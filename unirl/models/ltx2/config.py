@@ -28,6 +28,7 @@ class LTX2PipelineConfig:
     autocast_precision: str = "bf16"
     trajectory_precision: str = "fp16"
     logprob_precision: str = "fp32"
+    batch_replay_steps: bool = False
 
     shift: float = 1.0
 
@@ -48,6 +49,8 @@ class LTX2PipelineConfig:
     lora_target_modules: Optional[list] = None
 
     aux_components_on_cpu: bool = False
+    load_vae: bool = True
+    load_text_encoder: bool = True
 
     def __post_init__(self) -> None:
         validate_precision_type(self.model_precision, field="LTX2PipelineConfig.model_precision")

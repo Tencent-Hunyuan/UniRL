@@ -49,6 +49,7 @@ class ModelAdapter(ABC):
         self.cfg = config
         self.model_config = model_config
         self._sde_label = self.resolve_sde_label(strategy)
+        self._sde_log_prob_no_const = strategy is not None and strategy.log_prob_no_const
         self.validate()
 
     @staticmethod
@@ -81,20 +82,19 @@ class ModelAdapter(ABC):
         mc = self.model_config
         return FlowMatchSchedulePolicy.from_pretrained(
             mc.pretrained_model_ckpt_path,
-            shift=float(mc.shift),
-            require_dynamic=bool(getattr(mc, "use_dynamic_shifting", False)),
+            shift=mc.shift,
+            require_dynamic=getattr(mc, "use_dynamic_shifting", False),
             dynamic_overrides=getattr(mc, "dynamic_shift_overrides", None),
         )
 
     def lora_spec(self) -> Tuple[str, List[str]]:
-        prefix = str(self.model_config.weight_sync_param_name_prefix or "")
-        target_modules = list(self.cfg.target_modules or ("transformer",))
-        return prefix, target_modules
+        prefix = self.model_config.weight_sync_param_name_prefix
+        return (prefix if prefix is not None else ""), ["transformer"]
 
     def validate(self) -> None:
         mc = self.model_config
         require(
-            mc is not None and bool(getattr(mc, "pretrained_model_ckpt_path", None)),
+            mc is not None and bool(mc.pretrained_model_ckpt_path),
             f"{type(self).__name__} requires model_config.pretrained_model_ckpt_path",
         )
         require(

@@ -3,7 +3,7 @@
 #
 # Same algorithm/bundle/sampling/conditions_cls as qwen_image_edit_plus_nft.yaml
 # (the trainside recipe, which doubles as the parity oracle), but the rollout
-# runs on an in-process SGLang v2 engine (stock upstream 0.5.12.post1
+# runs on an in-process SGLang v2 engine (stock upstream 0.5.19
 # QwenImageEditPlusPipeline + the _patches stack) instead of the in-process
 # trainsite engine. Mirrors how qwen_image_sglang.yaml relates to its trainside
 # twin.
@@ -182,20 +182,6 @@ rollout:
     num_gpus: 1
     tp_size: 1
     local_mode: true
-    target_modules:
-      - attn.add_k_proj
-      - attn.add_q_proj
-      - attn.add_v_proj
-      - attn.to_add_out
-      - attn.to_k
-      - attn.to_out.0
-      - attn.to_q
-      - attn.to_v
-      # Match ema_lora_cfg.target_modules (12-module DiffusionNFT set).
-      - img_mlp.net.0.proj
-      - img_mlp.net.2
-      - txt_mlp.net.0.proj
-      - txt_mlp.net.2
     engine_kwargs:
       # Explicit pipeline pin (ServerArgs.model_id, matched by registered short
       # name "Qwen-Image-Edit-2511") — local checkpoint dirs then need no special

@@ -31,6 +31,7 @@ model_config:
   model_precision: bf16
   shift: 5.0
   max_sequence_length: 512
+  load_text_encoder: false
   load_vae: false
   use_lora: false
 
@@ -119,6 +120,7 @@ stack:
   micro_batch_size: 1
   max_grad_norm: 1.0
   num_updates_per_batch: 2
+  shuffle_updates: true
 
 data_source:
   _target_: unirl.data.data_source.MultimodalRLDataSource
@@ -156,7 +158,6 @@ sync:
   group_name: weight_sync
   bucket_size_mb: 512
   flush_cache: true
-  name_remap: {"*": "transformer.*"}
 
 logging:
   report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,true}}

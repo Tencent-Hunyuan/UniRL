@@ -1,7 +1,6 @@
 """Public API for the typed Qwen3-Omni thinker AR pipeline."""
 
 from unirl.models.qwen3_omni.ar import (
-    Qwen3OmniARParams,
     Qwen3OmniARStage,
     Qwen3OmniARStep,
 )
@@ -13,7 +12,6 @@ from unirl.models.qwen3_omni.pipeline import Qwen3OmniPipeline
 
 __all__ = [
     "Qwen3OmniARConditions",
-    "Qwen3OmniARParams",
     "Qwen3OmniARStage",
     "Qwen3OmniARStep",
     "Qwen3OmniBundle",

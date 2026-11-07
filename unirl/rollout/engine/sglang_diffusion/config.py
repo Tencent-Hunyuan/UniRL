@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from dataclasses import field as dc_field
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 from omegaconf import SI
 
@@ -48,10 +48,6 @@ class SGLangDiffusionEngineConfig(BaseEngineConfig):
 
     forward_batch_size: Optional[int] = None
 
-    target_modules: Optional[Tuple[str, ...]] = None
-
-    lora_merge_mode: Optional[str] = None
-
     host: Optional[str] = None
     port: Optional[int] = None
     scheduler_port: Optional[int] = None
@@ -62,7 +58,7 @@ class SGLangDiffusionEngineConfig(BaseEngineConfig):
         if self.engine_kwargs is None:
             self.engine_kwargs = {}
 
-        self.model_family = str(self.model_family or "").strip().lower()
+        self.model_family = str(self.model_family).strip().lower()
         from unirl.rollout.engine.sglang_diffusion.adapters import registered_adapters
 
         valid_families = registered_adapters()
@@ -71,14 +67,17 @@ class SGLangDiffusionEngineConfig(BaseEngineConfig):
             f"SGLangDiffusionEngineConfig.model_family must be one of {set(valid_families)}; got {self.model_family!r}",
         )
 
-        require(self.num_gpus >= 1, f"num_gpus must be >= 1; got {self.num_gpus!r}")
         require(
-            self.tp_size is None or self.tp_size >= 1,
-            f"tp_size must be >= 1 when set; got {self.tp_size!r}",
+            self.num_gpus == 1,
+            f"SGLang diffusion supports one GPU per UniRL rollout worker; got num_gpus={self.num_gpus!r}",
         )
         require(
-            self.sp_degree is None or self.sp_degree >= 1,
-            f"sp_degree must be >= 1 when set; got {self.sp_degree!r}",
+            self.tp_size in (None, 1),
+            f"SGLang diffusion internal TP is unsupported; got tp_size={self.tp_size!r}",
+        )
+        require(
+            self.sp_degree in (None, 1),
+            f"SGLang diffusion internal SP is unsupported; got sp_degree={self.sp_degree!r}",
         )
         require(
             self.forward_batch_size is None or self.forward_batch_size >= 1,
@@ -106,29 +105,35 @@ class SGLangDiffusionEngineConfig(BaseEngineConfig):
         """Spell this config (+ model config + reserved ports) as ServerArgs intent."""
         intent: Dict[str, Any] = {}
 
-        intent.update(self.engine_kwargs or {})
+        intent.update(self.engine_kwargs)
 
         if model_config.pretrained_model_ckpt_path:
             intent["model_path"] = model_config.pretrained_model_ckpt_path
-        intent["num_gpus"] = int(self.num_gpus)
+        intent["num_gpus"] = self.num_gpus
         if self.tp_size is not None:
-            intent["tp_size"] = int(self.tp_size)
+            intent["tp_size"] = self.tp_size
         if self.sp_degree is not None:
-            intent["sp_degree"] = int(self.sp_degree)
-        intent["disable_autocast"] = bool(self.disable_autocast)
+            intent["sp_degree"] = self.sp_degree
+        intent["disable_autocast"] = self.disable_autocast
 
-        if self.lora_merge_mode is not None:
-            intent["lora_merge_mode"] = self.lora_merge_mode
-        elif model_config.use_lora:
-            intent.setdefault("lora_merge_mode", "online")
-        if model_config.use_lora and model_config.lora_target_modules is not None:
-            intent["lora_target_modules"] = list(model_config.lora_target_modules)
+        if model_config.use_lora:
+            intent.setdefault("lora_merge_mode", "dynamic")
+            lora_targets = model_config.lora_target_modules
+            if lora_targets is not None:
+                intent["lora_target_modules"] = list(lora_targets)
 
         if self.host is not None:
-            intent["host"] = str(self.host)
+            intent["host"] = self.host
 
         if extra:
             intent.update(extra)
+
+        for key in ("num_gpus", "tp_size", "sp_degree", "dp_size"):
+            require(
+                int(intent.get(key, 1)) == 1,
+                f"SGLang diffusion {key} must be 1 because UniRL runs one GPU per rollout worker; "
+                f"got {intent.get(key)!r}",
+            )
 
         if ports is not None:
             intent["port"] = ports.server_port
@@ -136,9 +141,9 @@ class SGLangDiffusionEngineConfig(BaseEngineConfig):
             intent["master_port"] = ports.master_port
         else:
             if self.port is not None:
-                intent["port"] = int(self.port)
+                intent["port"] = self.port
             if self.scheduler_port is not None:
-                intent["scheduler_port"] = int(self.scheduler_port)
+                intent["scheduler_port"] = self.scheduler_port
 
         return intent
 

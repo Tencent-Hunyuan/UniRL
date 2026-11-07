@@ -37,7 +37,7 @@ class ZImageVAEDecodeStage(DecodeStage[LatentSegment, Images]):
         clean = s.latents[:, -1]
 
         scaling_factor = self.bundle.vae.config.scaling_factor
-        shift_factor = getattr(self.bundle.vae.config, "shift_factor", None)
+        shift_factor = self.bundle.vae.config.shift_factor
 
         def _decode(lat: torch.Tensor) -> torch.Tensor:
             latents_f32 = lat.to(dtype=torch.float32) / scaling_factor

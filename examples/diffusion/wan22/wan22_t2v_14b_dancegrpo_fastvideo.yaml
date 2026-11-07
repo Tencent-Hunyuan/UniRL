@@ -51,6 +51,7 @@ model_config:
   unipc_lower_order_final: true
   # FastVideo owns video decoding; the trainer-side pipeline only replays the
   # returned latent trajectory and does not need a duplicate VAE on the same GPU.
+  load_text_encoder: false
   load_vae: false
 
 strategy:

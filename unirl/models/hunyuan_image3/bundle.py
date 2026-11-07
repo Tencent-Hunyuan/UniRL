@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from contextlib import contextmanager
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -45,6 +46,7 @@ class HunyuanImage3Bundle(Bundle):
         self.device = device
         self.pretrained_path = pretrained_path
         self.mrope_section = mrope_section
+        self._ep_enabled = False
 
     @property
     def vae(self) -> Optional[nn.Module]:
@@ -57,6 +59,16 @@ class HunyuanImage3Bundle(Bundle):
     def trainable_module(self) -> nn.Module:
         """The sharded trainable subtree the backend wraps: the bare decoder"""
         return self.transformer.model
+
+    @contextmanager
+    def rope_mode(self, *, training: bool) -> Iterator[None]:
+        """Pin the wrapper ``training`` flag that sizes upstream RoPE around one forward (README ``## Gotchas``)."""
+        previous = self.transformer.training
+        self.transformer.training = training
+        try:
+            yield
+        finally:
+            self.transformer.training = previous
 
     def prepare_for_expert_parallel(self) -> None:
         """Make the decoder expert-parallel-ready (backend hook; called only when"""
@@ -273,14 +285,14 @@ class HunyuanImage3Bundle(Bundle):
             plan.append(("vision_model", vit))
 
         for _attr, module in plan:
-            if _module_has_meta_param(module):
+            if any(p.is_meta for p in module.parameters(recurse=True)):
                 module.to_empty(device=device)
 
         if _current_rank() == 0:
             prefixes = tuple(attr for attr, _ in plan)
             sd = _collect_filtered_state_dict(self.pretrained_path, prefixes=prefixes)
 
-            if getattr(self, "_ep_enabled", False):
+            if self._ep_enabled:
                 from unirl.train.backend.veomni.ep.models.hi3 import fuse_expert_state_dict
 
                 sd = fuse_expert_state_dict(sd)
@@ -312,7 +324,7 @@ class HunyuanImage3Bundle(Bundle):
             sd = {}
 
         expert_sd = {}
-        if getattr(self, "_ep_enabled", False):
+        if self._ep_enabled:
             from unirl.train.backend.veomni.ep.models.hi3 import is_fused_expert_key
 
             expert_sd = {k: sd.pop(k) for k in list(sd) if is_fused_expert_key(k)}
@@ -327,7 +339,7 @@ class HunyuanImage3Bundle(Bundle):
             ),
         )
 
-        if getattr(self, "_ep_enabled", False):
+        if self._ep_enabled:
             from unirl.train.backend.veomni.ep import load_ep_experts
             from unirl.train.backend.veomni.ep.models.hi3 import is_fused_expert_key
 
@@ -399,14 +411,6 @@ class HunyuanImage3Bundle(Bundle):
             self._vit = vit_module
 
 
-def _module_has_meta_param(module: nn.Module) -> bool:
-    """True if any parameter of ``module`` (recursing into children) is on"""
-    for p in module.parameters(recurse=True):
-        if p.is_meta:
-            return True
-    return False
-
-
 def _current_rank() -> int:
     """Return the current torch.distributed rank, or 0 if not initialized."""
     import torch.distributed as dist
@@ -430,10 +434,6 @@ def _collect_filtered_state_dict(
     single_path = os.path.join(pretrained_path, "model.safetensors")
 
     prefix_dots = tuple(p + "." for p in prefixes)
-
-    def _matches(key: str) -> bool:
-        return any(key.startswith(pd) for pd in prefix_dots)
-
     out: Dict[str, torch.Tensor] = {}
 
     if os.path.isfile(index_path):
@@ -442,7 +442,7 @@ def _collect_filtered_state_dict(
         weight_map: Dict[str, str] = index.get("weight_map", {})
         files_to_keys: Dict[str, List[str]] = {}
         for key, fname in weight_map.items():
-            if not _matches(key):
+            if not key.startswith(prefix_dots):
                 continue
             files_to_keys.setdefault(fname, []).append(key)
         for fname, keys in files_to_keys.items():
@@ -455,7 +455,7 @@ def _collect_filtered_state_dict(
     if os.path.isfile(single_path):
         with safe_open(single_path, framework="pt") as f:
             for key in f.keys():
-                if _matches(key):
+                if key.startswith(prefix_dots):
                     out[key] = f.get_tensor(key)
         return out
 

@@ -61,6 +61,7 @@ class BagelDiffusionConditions(Condition):
     prompts: List[Any] = concat_field(default_factory=list)
     input_images: List[Any] = concat_field(default_factory=list)  # Raw it2i PILs retained for context rebuilds.
     image_shapes: List[Tuple[int, int]] = concat_field(default_factory=list)
+    layouts: List[Dict[str, Any]] = concat_field(default_factory=list)
 
     @property
     def batch_size(self) -> int:

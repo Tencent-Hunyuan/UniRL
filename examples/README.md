@@ -31,6 +31,13 @@ The AR default is written for 4×8 (32 GPUs) and requires `DATA_PATH`. Launchers
 override `num_devices` from the node GPU count. Engine extras are in
 [INSTALL.md](../INSTALL.md).
 
+HSDP and the VeOmni train backend are recipe-level selections, not entrypoints:
+see [Choosing HSDP](../unirl/train/readme.md#choosing-hsdp-hybrid-sharding) and
+[Choosing the VeOmni backend](../unirl/train/readme.md#choosing-the-veomni-backend)
+(which lists every VeOmni recipe). End-to-end walkthroughs:
+[SFT](../unirl/trainer/README.md#run-supervised-fine-tuning) and
+[async AR / diffusion](../unirl/trainer/README.md#run-async-ar-or-async-diffusion-training).
+
 ## Running a recipe
 
 Launchers live in this directory. The first argument is the recipe path under
@@ -51,15 +58,18 @@ python -m unirl.train_diffusion --config-name=diffusion/sd3/sd3_trainside --cfg 
 # Single node
 bash examples/run_experiment_single_node.sh diffusion/sd3/sd3_trainside
 ENTRY=train_ar bash examples/run_experiment_single_node.sh ar/qwen_vl_grpo_geo3k_mc_4x8
-# SFT: set SFT_DATA to the training manifest.
-ENTRY=train_sft bash examples/run_experiment_single_node.sh sft/qwen3_sft
+# SFT: SFT_DATA is the train manifest (required); SFT_EVAL_DATA adds validation.
+SFT_DATA=data/sft_alpaca/train.jsonl SFT_EVAL_DATA=data/sft_alpaca/val.jsonl \
+  ENTRY=train_sft bash examples/run_experiment_single_node.sh sft/qwen3_sft
 ENTRY=train_pe  bash examples/run_experiment_single_node.sh pe/pe_trainside_pickscore
 ENTRY=train_unified_model bash examples/run_experiment_single_node.sh unified_model/hi3_vllmomni
 ENTRY=train_agentic bash examples/run_experiment_single_node.sh deep_research/deep_research_search_judge
-# Async AR: SGLang environment; set DATA_PATH to the training data.
-ENTRY=train_async_ar bash examples/run_experiment_single_node.sh ar/qwen3_grpo_4b_base_dapo_sglang_async
-# Async diffusion: vLLM-Omni environment; set BAGEL_PATH to the model checkpoint.
-ENTRY=train_async_diffusion bash examples/run_experiment_single_node.sh diffusion/bagel/bagel_vllmomni_async
+# Async AR: SGLang environment; DATA_PATH is the train prompt file, EVAL_DATA_PATH the eval set.
+DATA_PATH=data/dapo_math/train.jsonl EVAL_DATA_PATH=data/dapo_math/aime_eval.jsonl \
+  ENTRY=train_async_ar bash examples/run_experiment_single_node.sh ar/qwen3_grpo_4b_base_dapo_sglang_async
+# Async diffusion: vLLM-Omni environment; BAGEL_PATH is the model checkpoint.
+BAGEL_PATH=/path/to/BAGEL-7B-MoT \
+  ENTRY=train_async_diffusion bash examples/run_experiment_single_node.sh diffusion/bagel/bagel_vllmomni_async
 
 # Multi-node
 bash examples/run_experiment_multinode.sh diffusion/sd3/sd3_sglang_rollout_colocate
@@ -108,18 +118,19 @@ apply** — so a name carries only what distinguishes it from its siblings, and
 related recipes sort together.
 
 ```
-<model>[_<task>][_<size>][_<algorithm>][_<engine>][_<adapter>][_<topology>]
+<model>[_<task>][_<size>][_<algorithm>][_<engine>][_<backend>][_<adapter>][_<topology>]
 ```
 
 | Segment | Position | Values (examples) | Omit when |
 |---|---|---|---|
 | `model` | required, first | `sd3`, `qwen_image`, `flux2_klein`, `sensenova_u1_5`, `wan21`, `wan22`, `hunyuan_video10`, `hunyuan_video15`, `qwen_vl`, `qwen3`, `hi3` | never |
-| `task` | after model | `t2v`, `i2v` | text-to-image (the implicit default) |
+| `task` | after model | `t2v`, `i2v`, `t2va` (text-to-video + audio) | text-to-image (the implicit default) |
 | `size` | after task | `4b`, `14b` | only one size in the family |
 | `algorithm` | middle | `dancegrpo`, `mixgrpo`, `nft`, `flowdppo`, `grpo`, `drpo` | plain FlowGRPO (diffusion default); GRPO (AR default) |
 | `engine` | after algorithm | `trainside`, `sglang`, `vllmomni` | — |
-| `adapter` | after engine | `full`, `lora` | unambiguous from the rest |
-| `topology` | last | placement `colocate`/`separate`; sync `nccl`/`tensor`/`ipc`; engine mode `rollout`/`replay` | single-slab colocate default |
+| `backend` | after engine | `veomni` (the VeOmni train backend) | `FSDPBackend` (the implicit default) |
+| `adapter` | after backend (after engine when backend is omitted) | `full`, `lora` | unambiguous from the rest |
+| `topology` | last | placement `colocate`/`separate`; sync `nccl`/`tensor`/`ipc`; engine mode `rollout`/`replay`; sharding `hsdp`; parallel degree `sp`/`ep`; cluster `<N>x<G>` | single-slab colocate default |
 
 Worked examples:
 
@@ -132,6 +143,9 @@ Worked examples:
 | `hunyuan_video10_t2v_trainside` | HunyuanVideo-1.0 · text-to-video · trainside engine |
 | `hunyuan_video15_t2v_dancegrpo_trainside` | HunyuanVideo-1.5 · text-to-video · DanceGRPO · trainside engine |
 | `sd3_vllmomni_full_nccl_separate` | SD3 · vLLM-Omni engine · full-weight · NCCL sync · separate slabs |
+| `sd3_trainside_veomni` | SD3 · trainside engine · VeOmni train backend |
+| `hi3_vllmomni_veomni_ep` | HI3 · vLLM-Omni engine · VeOmni train backend · expert parallel |
+| `minimax_h3_t2va_trainside_hsdp_2x8_validation` | MiniMax-H3 · text-to-video + audio · trainside engine · HSDP · 2 nodes × 8 GPUs · validation recipe |
 | `qwen_vl_grpo_geo3k_mc_4x8` | Qwen-VL · GRPO · geo3k multiple-choice · 4 nodes × 8 GPUs |
 
 Domain-specific trailing qualifiers extend the chain:
@@ -139,6 +153,13 @@ Domain-specific trailing qualifiers extend the chain:
 - **`pe/`** appends the reward: `pe_sglang_full_pickscore`, `pe_sglang_full_wise`.
 - **`ar/`** (vision-language) appends dataset + task: `qwen_vl_grpo_geo3k_mc_4x8` (`geo3k` · multiple-choice).
 - AR recipes (`ar/`) append the cluster shape `<N>x<G>` (nodes × GPUs): `..._4x8`.
+
+AR recipes also reorder the middle of the chain: `size` follows the algorithm,
+and the VeOmni backend and its parallel degree precede the engine —
+`qwen3_moe_grpo_30b_a3b_veomni_ep_sglang` reads Qwen3-30B-A3B MoE · GRPO ·
+VeOmni backend · expert parallel · SGLang. The `qwen3_5_moe_*` recipes select
+VeOmniBackend without a `veomni` segment; check `backend._target_` rather than
+the name.
 
 ## Adding or editing a recipe
 

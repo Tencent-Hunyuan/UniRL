@@ -120,11 +120,11 @@ class BaseTrainer:
         self.num_devices = cfg.num_devices
         if worker_max_concurrency is None:
             configured_concurrency = cfg.get("worker_max_concurrency")
-            worker_max_concurrency = 1 if configured_concurrency is None else int(configured_concurrency)
+            worker_max_concurrency = 1 if configured_concurrency is None else configured_concurrency
         self.pool = DevicePool(
             num_devices=cfg.num_devices,
-            devices_per_node=int(cfg.get("devices_per_node", 8)),
-            workers_per_device=int(cfg.get("workers_per_device", 1)),
+            devices_per_node=cfg.get("devices_per_node", 8),
+            workers_per_device=cfg.get("workers_per_device", 1),
             transport_kind=cfg.get("transport_kind", "colocate_store"),
             tq_handoff=init_transfer_queue(cfg),
             worker_max_concurrency=worker_max_concurrency,
@@ -302,6 +302,9 @@ class BaseTrainer:
             if self.wandb_logger is not None:
                 self.wandb_logger.finish()
 
+    def _prepare_for_save(self) -> None:
+        """Make whatever ``backend.save`` reads reachable. Default no-op."""
+
     def maybe_save_checkpoint(
         self,
         rollout_id: int,
@@ -317,6 +320,7 @@ class BaseTrainer:
         step = rollout_id + 1
         if step % save_interval != 0 and step < num_rollouts:
             return
+        self._prepare_for_save()
         base_dir = os.path.abspath(save_dir) if save_dir else os.path.join(os.getcwd(), "checkpoints")
         path = os.path.join(base_dir, f"checkpoint-{step}")
         logger.info("Saving checkpoint at rollout %d/%d -> %s", step, num_rollouts, path)

@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import logging
 from contextlib import nullcontext
-from dataclasses import dataclass
-from dataclasses import field as dc_field
 from types import MethodType
 from typing import Any, List, Optional, Tuple
 
@@ -14,7 +12,16 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-from unirl.models.types.ar import ARSamplingParams, ARStage, ARStep, left_pad_prompt, select_last_lm_head_row
+from unirl.models.types.ar import (
+    ARSamplingParams,
+    ARStage,
+    ARStep,
+    concat_optional_tensors,
+    left_pad_prompt,
+    pack_generated_text_segment,
+    resolve_ar_stop_ids,
+    select_last_lm_head_row,
+)
 from unirl.types.segments import TextSegment
 from unirl.utils.dtypes import parse_torch_dtype
 
@@ -113,45 +120,31 @@ def _fuse_mm_embeds(
     masks = [mask[..., 0] for mask in (image_mask, video_mask) if mask is not None]
     if masks:
         visual_mask = torch.stack(masks).any(dim=0)
-    visual_multiscale = _merge_visual_multiscale(
-        image_multiscale,
-        video_multiscale,
-        image_mask[..., 0] if image_mask is not None else None,
-        video_mask[..., 0] if video_mask is not None else None,
-    )
+    if image_multiscale is None:
+        visual_multiscale = video_multiscale
+    elif video_multiscale is None:
+        visual_multiscale = image_multiscale
+    else:
+        if image_mask is None or video_mask is None:
+            raise ValueError("Qwen3-Omni visual features require matching placeholder masks.")
+        if len(image_multiscale) != len(video_multiscale):
+            raise ValueError("Qwen3-Omni image/video DeepStack feature counts do not match.")
+        img_m = image_mask[..., 0]
+        vid_m = video_mask[..., 0]
+        joint_mask = img_m | vid_m
+        image_mask_joint = img_m[joint_mask]
+        video_mask_joint = vid_m[joint_mask]
+        visual_multiscale = []
+        for image_level, video_level in zip(image_multiscale, video_multiscale):
+            joint = image_level.new_zeros((int(joint_mask.sum().item()), image_level.shape[-1]))
+            joint[image_mask_joint, :] = image_level
+            joint[video_mask_joint, :] = video_level
+            visual_multiscale.append(joint)
     visual_pos_masks = None
     if visual_mask is not None:
         legacy_visual_outputs = image_legacy or video_legacy
         visual_pos_masks = visual_mask.unsqueeze(-1).expand_as(inputs_embeds) if legacy_visual_outputs else visual_mask
     return inputs_embeds, visual_multiscale, visual_pos_masks
-
-
-def _merge_visual_multiscale(
-    image_features: Optional[List[torch.Tensor]],
-    video_features: Optional[List[torch.Tensor]],
-    image_mask: Optional[torch.Tensor],
-    video_mask: Optional[torch.Tensor],
-) -> Optional[List[torch.Tensor]]:
-    """Merge image/video DeepStack features exactly in placeholder order."""
-    if image_features is None:
-        return video_features
-    if video_features is None:
-        return image_features
-    if image_mask is None or video_mask is None:
-        raise ValueError("Qwen3-Omni visual features require matching placeholder masks.")
-    if len(image_features) != len(video_features):
-        raise ValueError("Qwen3-Omni image/video DeepStack feature counts do not match.")
-
-    visual_mask = image_mask | video_mask
-    image_mask_joint = image_mask[visual_mask]
-    video_mask_joint = video_mask[visual_mask]
-    merged: List[torch.Tensor] = []
-    for image_level, video_level in zip(image_features, video_features):
-        joint = image_level.new_zeros((int(visual_mask.sum().item()), image_level.shape[-1]))
-        joint[image_mask_joint, :] = image_level
-        joint[video_mask_joint, :] = video_level
-        merged.append(joint)
-    return merged
 
 
 def _replay_aware_forward(
@@ -228,17 +221,6 @@ def _replay_aware_forward(
     return torch.cat(parts, dim=1)
 
 
-@dataclass
-class Qwen3OmniARParams:
-    """Per-request AR-mode knobs. ``stop_token_ids`` is unioned with EOS in-stage."""
-
-    max_tokens: int = 512
-    temperature: float = 0.7
-    top_p: float = 0.9
-    top_k: int = 0
-    stop_token_ids: List[int] = dc_field(default_factory=list)
-
-
 class Qwen3OmniARStep(ARStep):
     """Sample tokens while recording pre-truncation behavior log-probabilities."""
 
@@ -280,14 +262,6 @@ class Qwen3OmniARStep(ARStep):
         return token_id, log_prob
 
 
-def _merge_video(per_sample: Optional[List[Optional[torch.Tensor]]]) -> Optional[torch.Tensor]:
-    """Cat per-sample video tensors into one flat tensor for the thinker forward."""
-    if per_sample is None:
-        return None
-    parts = [t for t in per_sample if t is not None]
-    return torch.cat(parts, dim=0) if parts else None
-
-
 def _merge_audio(
     input_features: Optional[List[Optional[torch.Tensor]]],
     feature_attention_mask: Optional[List[Optional[torch.Tensor]]],
@@ -316,31 +290,6 @@ def _merge_audio(
     return torch.cat(features, dim=0), torch.cat(masks, dim=0)
 
 
-def _validate_audio_in_video_modes(conditions: Qwen3OmniARConditions, batch_size: int) -> None:
-    """Reject video-only/audio-in-video mixing unsupported by Qwen3-Omni generation."""
-    flags = conditions.use_audio_in_video
-    video_grids = conditions.video_grid_thw
-    if flags is None or video_grids is None:
-        return
-    if len(flags) != batch_size or len(video_grids) != batch_size:
-        raise ValueError(
-            "Qwen3-Omni per-row media conditions must match the text batch size: "
-            f"batch={batch_size}, use_audio_in_video={len(flags)}, video_grid_thw={len(video_grids)}."
-        )
-
-    video_modes = {bool(flags[row]) for row, grid in enumerate(video_grids) if grid is not None}
-    if len(video_modes) > 1:
-        raise ValueError(
-            "Qwen3-Omni does not currently support mixing video-only and audio-in-video rows "
-            "in one batch. Configure the training run uniformly with use_audio_in_video=false "
-            "or use_audio_in_video=true."
-        )
-
-    # TODO(qwen3-omni): Add end-to-end support for training video-only and
-    # audio-in-video rows together. This requires a separate design and parity
-    # validation across generation, model forward, and replay.
-
-
 def _per_sample_rope(
     transformer: Any,
     input_ids: torch.Tensor,
@@ -349,7 +298,21 @@ def _per_sample_rope(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Build per-row TMRoPE positions for one supported, uniform video mode."""
     batch_size = int(input_ids.shape[0])
-    _validate_audio_in_video_modes(conditions, batch_size)
+    flags = conditions.use_audio_in_video
+    video_grids = conditions.video_grid_thw
+    if flags is not None and video_grids is not None:
+        if len(flags) != batch_size or len(video_grids) != batch_size:
+            raise ValueError(
+                "Qwen3-Omni per-row media conditions must match the text batch size: "
+                f"batch={batch_size}, use_audio_in_video={len(flags)}, video_grid_thw={len(video_grids)}."
+            )
+        video_modes = {bool(flags[row]) for row, grid in enumerate(video_grids) if grid is not None}
+        if len(video_modes) > 1:
+            raise ValueError(
+                "Qwen3-Omni does not currently support mixing video-only and audio-in-video rows "
+                "in one batch. Configure the training run uniformly with use_audio_in_video=false "
+                "or use_audio_in_video=true."
+            )
     device = input_ids.device
     image_grids = conditions.image_grid_thw or [None] * batch_size
     video_grids = conditions.video_grid_thw or [None] * batch_size
@@ -407,7 +370,6 @@ class Qwen3OmniARStage(ARStage[Qwen3OmniARConditions]):
         conditions: Qwen3OmniARConditions,
         *,
         sampling_params: ARSamplingParams,
-        params: Optional[Qwen3OmniARParams] = None,
         **_kwargs: Any,
     ) -> TextSegment:
         """Generate a packed segment, including TMRoPE video inputs when present."""
@@ -421,17 +383,18 @@ class Qwen3OmniARStage(ARStage[Qwen3OmniARConditions]):
         attention_mask: torch.Tensor = conditions.prompt.attention_mask
         device = input_ids.device
 
-        pad_id = self.model.tokenizer.pad_token_id or 0
+        raw_pad_id = self.model.tokenizer.pad_token_id
+        pad_id = 0 if raw_pad_id is None else int(raw_pad_id)
         input_ids, attention_mask = left_pad_prompt(input_ids, attention_mask, pad_id)
         batch_size = int(input_ids.shape[0])
 
-        stop_ids = self._resolve_stop_ids(params, sampling_params)
+        stop_ids = resolve_ar_stop_ids(sampling_params, self.model.tokenizer)
         step = Qwen3OmniARStep(
-            temperature=float(sampling_params.temperature),
-            top_p=float(sampling_params.top_p),
-            top_k=int(sampling_params.top_k),
+            temperature=sampling_params.temperature,
+            top_p=sampling_params.top_p,
+            top_k=sampling_params.top_k,
         )
-        max_new = int(sampling_params.max_new_tokens)
+        max_new = sampling_params.max_new_tokens
 
         if hasattr(transformer, "model") and hasattr(transformer.model, "rope_deltas"):
             transformer.model.rope_deltas = None
@@ -442,11 +405,11 @@ class Qwen3OmniARStage(ARStage[Qwen3OmniARConditions]):
             "past_key_values": None,
             "cache_position": torch.arange(int(input_ids.shape[1]), device=device, dtype=torch.long),
         }
-        pv = _merge_video(conditions.pixel_values)
-        igt = _merge_video(conditions.image_grid_thw)
-        pvv = _merge_video(conditions.pixel_values_videos)
-        vgt = _merge_video(conditions.video_grid_thw)
-        vspg = _merge_video(conditions.video_second_per_grid)
+        pv = concat_optional_tensors(conditions.pixel_values)
+        igt = concat_optional_tensors(conditions.image_grid_thw)
+        pvv = concat_optional_tensors(conditions.pixel_values_videos)
+        vgt = concat_optional_tensors(conditions.video_grid_thw)
+        vspg = concat_optional_tensors(conditions.video_second_per_grid)
         ivf, fam = _merge_audio(conditions.input_features, conditions.feature_attention_mask)
         if pv is not None:
             model_kwargs["pixel_values"] = pv
@@ -531,7 +494,7 @@ class Qwen3OmniARStage(ARStage[Qwen3OmniARConditions]):
             model_kwargs["use_cache"] = True
             is_first_step = False
 
-        return _pack_text_segment(generated_tokens, per_token_logps, device=device)
+        return pack_generated_text_segment(generated_tokens, per_token_logps, device=device)
 
     def replay(
         self,
@@ -556,7 +519,8 @@ class Qwen3OmniARStage(ARStage[Qwen3OmniARConditions]):
 
         lengths = [int(n) for n in segment.lengths.tolist()]
         T_max = max(lengths) if lengths else 0
-        pad_id = self.model.tokenizer.pad_token_id or 0
+        raw_pad_id = self.model.tokenizer.pad_token_id
+        pad_id = 0 if raw_pad_id is None else int(raw_pad_id)
 
         response_tokens = torch.full((batch_size, T_max), pad_id, dtype=torch.long, device=device)
         response_mask = torch.zeros((batch_size, T_max), dtype=torch.long, device=device)
@@ -598,10 +562,10 @@ class Qwen3OmniARStage(ARStage[Qwen3OmniARConditions]):
         if hasattr(transformer, "model") and hasattr(transformer.model, "rope_deltas"):
             transformer.model.rope_deltas = None
 
-        pv = _merge_video(conditions.pixel_values)
-        igt = _merge_video(conditions.image_grid_thw)
-        pvv = _merge_video(conditions.pixel_values_videos)
-        vgt = _merge_video(conditions.video_grid_thw)
+        pv = concat_optional_tensors(conditions.pixel_values)
+        igt = concat_optional_tensors(conditions.image_grid_thw)
+        pvv = concat_optional_tensors(conditions.pixel_values_videos)
+        vgt = concat_optional_tensors(conditions.video_grid_thw)
         ivf, fam = _merge_audio(conditions.input_features, conditions.feature_attention_mask)
 
         forward_kwargs: dict = {
@@ -646,41 +610,5 @@ class Qwen3OmniARStage(ARStage[Qwen3OmniARConditions]):
             return torch.zeros(0, dtype=self.logprob_dtype, device=device)
         return torch.cat(flat, dim=0).to(dtype=self.logprob_dtype)
 
-    def _resolve_stop_ids(
-        self,
-        params: Optional[Qwen3OmniARParams],
-        sampling_params: ARSamplingParams,
-    ) -> List[int]:
-        ids: List[int] = []
-        if params is not None and params.stop_token_ids:
-            ids.extend(int(t) for t in params.stop_token_ids)
-        if sampling_params.stop_token_id is not None:
-            ids.append(int(sampling_params.stop_token_id))
-        eos = self.model.tokenizer.eos_token_id
-        if eos is not None:
-            if isinstance(eos, (list, tuple)):
-                ids.extend(int(t) for t in eos)
-            else:
-                ids.append(int(eos))
-        seen: set = set()
-        out: List[int] = []
-        for t in ids:
-            if t not in seen:
-                seen.add(t)
-                out.append(t)
-        return out
 
-
-def _pack_text_segment(
-    generated_tokens: List[List[int]],
-    per_token_logps: List[List[float]],
-    *,
-    device: torch.device,
-) -> TextSegment:
-    return TextSegment.pack(
-        tokens=[torch.tensor(toks, dtype=torch.long, device=device) for toks in generated_tokens],
-        log_probs=[torch.tensor(lps, dtype=torch.float32, device=device) for lps in per_token_logps],
-    )
-
-
-__all__ = ["Qwen3OmniARParams", "Qwen3OmniARStage", "Qwen3OmniARStep"]
+__all__ = ["Qwen3OmniARStage", "Qwen3OmniARStep"]

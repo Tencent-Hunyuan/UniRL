@@ -40,6 +40,7 @@ class BagelPipelineConfig:
     autocast_precision: str = "bf16"
     trajectory_precision: str = "bf16"
     logprob_precision: str = "fp32"
+    batch_replay_steps: bool = False
 
     shift: float = 3.0
 

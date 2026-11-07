@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import List, Optional
+from typing import Any, List
 
 from unirl.distributed.group.dispatch import Dispatch, Execute, distributed
 from unirl.distributed.weight_sync.lora.base import LoraWeightSyncBase
@@ -14,26 +14,10 @@ logger = logging.getLogger(__name__)
 class RemoteLoraWeightSync(LoraWeightSyncBase):
     """Cross-process LoRA push to engine(s) that are NOT same-Worker siblings."""
 
-    def __init__(
-        self,
-        *,
-        backend,
-        param_prefix: str = "",
-        adapter_name: Optional[str] = None,
-        verify: bool = False,
-        track_prefix: str = "",
-        copy: bool = False,
-    ) -> None:
-        super().__init__(
-            backend=backend,
-            param_prefix=param_prefix,
-            adapter_name=adapter_name,
-            verify=verify,
-            track_prefix=track_prefix,
-        )
+    def __init__(self, *, backend: Any, copy: bool = False, **kwargs: Any) -> None:
+        super().__init__(backend=backend, **kwargs)
         self._copy = bool(copy)
         self._targets: List[tuple] = []
-        self._cached = None
 
     @distributed(dispatch_mode=Dispatch.BROADCAST, execute_mode=Execute.RANK_ZERO)
     def set_rollout_targets(self, targets: List[tuple]) -> None:
@@ -59,21 +43,22 @@ class RemoteLoraWeightSync(LoraWeightSyncBase):
     def _extract_to_cache(self) -> None:
         """Collective gather on every rank; rank 0 caches ``(tensors, peft_config)``."""
         lora_tensors, peft_config = self._extract()
-        rank = self.rank_info.rank if self.rank_info is not None else 0
-        if rank == 0:
+        if self._my_rank == 0:
             self._cached = (lora_tensors, peft_config)
 
     def _push_from_cache(self) -> None:
-        """Rank 0 ships the cached adapter to the targets, then clears the cache."""
-        rank = self.rank_info.rank if self.rank_info is not None else 0
-        if rank != 0:
+        """Rank 0 ships the cached adapter to the targets, keeping the cache for reuse."""
+        if self._my_rank != 0:
             return
         if self._cached is None:
             raise RuntimeError("RemoteLoraWeightSync.push: call extract() (or sync()) first")
         if not self._targets:
             raise RuntimeError("RemoteLoraWeightSync.push: call set_rollout_targets() first")
+        # Held past the push, like LocalLoraWeightSync: the adapter only changes
+        # when the optimizer steps, so a caller that pushes again before the next
+        # step reuses it rather than reading a parked trainer. The trainer tracks
+        # that with one flag for both implementations, so they have to agree.
         lora_tensors, peft_config = self._cached
-        self._cached = None
 
         import ray
 
@@ -93,41 +78,33 @@ class RemoteLoraWeightSync(LoraWeightSyncBase):
             self._track_prefix or "<single>",
         )
         if self._verify:
-            self._verify_loaded(lora_tensors, peft_config)
+            from unirl.distributed.weight_sync.transfer.ipc_dispatch import UNIRL_LORA_INT_ID
 
-    def _verify_loaded(self, lora_tensors, peft_config) -> None:
-        """Assert each rollout engine's loaded LoRA matches what we just pushed."""
-        import ray
-
-        from unirl.distributed.weight_sync.transfer.ipc_dispatch import (
-            DIFFRL_LORA_INT_ID,
-        )
-
-        exp_a, exp_b = self._expected_checksums(lora_tensors, peft_config)
-        pending = [
-            (
-                role,
-                worker.call.remote(role, "tp_per_stage", (), {}),
-                worker.call.remote(role, "loaded_lora_checksums", (), {"adapter_id": int(DIFFRL_LORA_INT_ID)}),
+            exp_a, exp_b = self._expected_checksums(lora_tensors, peft_config)
+            pending = [
+                (
+                    role,
+                    worker.call.remote(role, "tp_per_stage", (), {}),
+                    worker.call.remote(role, "loaded_lora_checksums", (), {"adapter_id": UNIRL_LORA_INT_ID}),
+                )
+                for role, workers in self._targets
+                for worker in workers
+            ]
+            for role, topology_ref, loaded_ref in pending:
+                topology, loaded = ray.get([topology_ref, loaded_ref])
+                self._assert_loaded(
+                    exp_a,
+                    exp_b,
+                    loaded,
+                    topology=topology,
+                    label=f"engine {role!r}",
+                )
+            logger.info(
+                "[LoRA-SYNC] rank 0: verify OK across %d engine(s) (%d lora_A / %d lora_B layers match)",
+                len(self._targets),
+                len(exp_a),
+                len(exp_b),
             )
-            for role, workers in self._targets
-            for worker in workers
-        ]
-        for role, topology_ref, loaded_ref in pending:
-            topology, loaded = ray.get([topology_ref, loaded_ref])
-            self._assert_loaded(
-                exp_a,
-                exp_b,
-                loaded,
-                topology=topology,
-                label=f"engine {role!r}",
-            )
-        logger.info(
-            "[LoRA-SYNC] rank 0: verify OK across %d engine(s) (%d lora_A / %d lora_B layers match)",
-            len(self._targets),
-            len(exp_a),
-            len(exp_b),
-        )
 
 
 __all__ = ["RemoteLoraWeightSync"]

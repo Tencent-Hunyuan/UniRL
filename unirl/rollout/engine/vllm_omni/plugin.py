@@ -9,6 +9,14 @@ logger = logging.getLogger(__name__)
 _PATCH_FLAG = "_unirl_capture_flush"
 
 
+def register_unirl_runtime() -> None:
+    """Register UniRL topology and output hooks in this vllm-omni process."""
+    from unirl.rollout.engine.vllm_omni.pipeline_configs import register_unirl_pipeline_configs
+
+    register_unirl_pipeline_configs()
+    register_capture_flush()
+
+
 def register_capture_flush() -> None:
     """Flush pipeline captures into formatter metadata after postprocess sees raw media."""
     from vllm_omni.diffusion import diffusion_engine, output_formatter
@@ -33,3 +41,6 @@ def register_capture_flush() -> None:
     # diffusion_engine took a from-import, so it holds its own binding.
     diffusion_engine.format_diffusion_outputs = patched
     logger.info("unirl: diffusion formatter flushes capture metadata after postprocess")
+
+
+__all__ = ["register_capture_flush", "register_unirl_runtime"]

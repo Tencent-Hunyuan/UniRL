@@ -24,6 +24,7 @@ class BaseRolloutEngine(Remote, ABC):
     """Rollout engine ABC: fill and return one ``Sample``; ``generate`` may be called concurrently."""
 
     _component_name = "base"
+    packs_groups: bool = False  # Whether requests need whole samples_per_prompt groups.
 
     @classmethod
     def component_name(cls) -> str:

@@ -76,8 +76,8 @@ class SenseNovaU1TrainableModel(nn.Module):
     ) -> Any:
         model = self.model
         height, width = (int(v) for v in image_shape)
-        patch = int(model.patch_size)
-        merge = int(1 / float(model.downsample_ratio))
+        patch = model.patch_size
+        merge = int(1 / model.downsample_ratio)
         grid_h, grid_w = height // patch, width // patch
         image_tokens = (height // (patch * merge)) * (width // (patch * merge))
         device = normalized_pixels.device
@@ -92,8 +92,8 @@ class SenseNovaU1TrainableModel(nn.Module):
 
         timestep = data_time.expand(image_tokens)
         timestep_embeddings = model.fm_modules["timestep_embedder"](timestep).reshape(1, image_tokens, -1)
-        if bool(model.add_noise_scale_embedding):
-            noise_value = torch.full_like(timestep, float(noise_scale) / float(model.noise_scale_max_value))
+        if model.add_noise_scale_embedding:
+            noise_value = torch.full_like(timestep, float(noise_scale) / model.noise_scale_max_value)
             timestep_embeddings = timestep_embeddings + model.fm_modules["noise_scale_embedder"](noise_value).reshape(
                 1, image_tokens, -1
             )
@@ -153,8 +153,8 @@ class SenseNovaU1Bundle(Bundle):
         """Load a local or Hub-format SenseNova-U1 checkpoint."""
         import fcntl
 
-        serialize = os.environ.get("DIFFRL_MODEL_LOAD_SERIALIZE", "1") != "0"
-        lock_file = open("/tmp/diffrl_model_load.lock", "a+") if serialize else None
+        serialize = os.environ.get("UNIRL_MODEL_LOAD_SERIALIZE", "1") != "0"
+        lock_file = open("/tmp/unirl_model_load.lock", "a+") if serialize else None
         if lock_file is not None:
             fcntl.flock(lock_file, fcntl.LOCK_EX)
         try:
@@ -180,12 +180,11 @@ class SenseNovaU1Bundle(Bundle):
         dtype = parse_torch_dtype(config.model_precision, field_name="model_precision")
 
         hf_config = AutoConfig.from_pretrained(path)
-        if getattr(hf_config, "model_type", None) != "neo_chat":
+        if hf_config.model_type != "neo_chat":
             raise ValueError(
-                f"SenseNovaU1Bundle expected model_type='neo_chat' at {path!r}, "
-                f"got {getattr(hf_config, 'model_type', None)!r}."
+                f"SenseNovaU1Bundle expected model_type='neo_chat' at {path!r}, got {hf_config.model_type!r}."
             )
-        if not bool(getattr(hf_config, "use_pixel_head", False)):
+        if not hf_config.use_pixel_head:
             raise ValueError(
                 "SenseNovaU1Bundle currently supports the U1.5 pixel-head checkpoint; "
                 "config.use_pixel_head must be true."
@@ -205,7 +204,7 @@ class SenseNovaU1Bundle(Bundle):
 
         trainable = _set_generation_trainability(
             model,
-            enabled=bool(config.full_finetune_generation),
+            enabled=config.full_finetune_generation,
         )
         model.eval()
         logger.info(

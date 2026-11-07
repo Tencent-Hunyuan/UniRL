@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List
+from typing import TYPE_CHECKING, List
 
 import torch
 import torch.nn.functional as F
@@ -13,6 +13,9 @@ from unirl.reward.local.device import resolve_device
 from unirl.types.reward import RewardRequest
 
 from .base import LocalRewardBackend
+
+if TYPE_CHECKING:
+    import numpy as np
 
 
 class CLAPRewardScorer(LocalRewardBackend):
@@ -31,19 +34,14 @@ class CLAPRewardScorer(LocalRewardBackend):
         )
 
     def _load_model(self) -> None:
-        try:
-            from transformers import ClapModel, ClapProcessor
-        except ImportError as e:
-            raise ImportError("transformers with ClapModel/ClapProcessor is required for the CLAP reward") from e
+        from transformers import ClapModel, ClapProcessor
 
-        model_id = self.model_kwargs.get("model_id", "laion/larger_clap_general")
-        self.model = ClapModel.from_pretrained(model_id).to(self.device).eval()
-        self.model = self.model.to(dtype=torch.float32)
+        model_id = self.model_kwargs["model_id"]
+        self.model = ClapModel.from_pretrained(model_id).to(device=self.device, dtype=torch.float32).eval()
         self.processor = ClapProcessor.from_pretrained(model_id)
 
-    def _preprocess_audio(self, audio_list: List[torch.Tensor], src_sample_rate: int) -> List["torch.Tensor"]:
+    def _preprocess_audio(self, audio_list: List[torch.Tensor], src_sample_rate: int) -> List["np.ndarray"]:
         """Downmix and resample each ``[L]`` / ``[C, L]`` / ``[L, C]`` waveform to CLAP's 48 kHz mono ``[L']``."""
-        import numpy as np
         import torchaudio.functional as AF
 
         processed: List[np.ndarray] = []
@@ -59,7 +57,7 @@ class CLAPRewardScorer(LocalRewardBackend):
             if src_sample_rate != self.CLAP_SAMPLE_RATE:
                 wf = AF.resample(
                     wf.unsqueeze(0),
-                    orig_freq=int(src_sample_rate),
+                    orig_freq=src_sample_rate,
                     new_freq=self.CLAP_SAMPLE_RATE,
                 ).squeeze(0)
 
@@ -87,10 +85,6 @@ class CLAPRewardScorer(LocalRewardBackend):
 
             inputs = self.processor(
                 text=batch_prompts,
-                # `audios=` was deprecated and is now rejected outright by
-                # ClapProcessor (transformers 5.x): "You passed keyword argument
-                # `audios` which is deprecated. Please use `audio` instead."
-                # It surfaces as every sample failing scoring, not as a crash.
                 audio=waveforms_np,
                 sampling_rate=self.CLAP_SAMPLE_RATE,
                 return_tensors="pt",

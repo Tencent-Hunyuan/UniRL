@@ -5,23 +5,10 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional
 
+from unirl.distributed.group.dispatch import Dispatch, Execute, distributed
 from unirl.distributed.group.remote import Remote
 
 logger = logging.getLogger(__name__)
-
-
-def _extract_canonical_lora(backend: Any, *, param_prefix: str, adapter_name: str):
-    """Extract canonical-format LoRA tensors + the PEFT config from the backend."""
-    from unirl.distributed.weight_sync.payload import _peft_config_dict
-    from unirl.utils.peft_merge import extract_lora_tensors
-
-    model = backend.model
-    weight_sync_dtype = getattr(backend, "weight_sync_dtype", None)
-    lora_tensors = extract_lora_tensors(
-        model, param_prefix=param_prefix, adapter_name=adapter_name, dtype=weight_sync_dtype
-    )
-    peft_config = _peft_config_dict(model, adapter_name)
-    return lora_tensors, peft_config
 
 
 class LoraWeightSyncBase(Remote):
@@ -45,16 +32,35 @@ class LoraWeightSyncBase(Remote):
                 f"{type(self).__name__}: LoRA targeting EP-sharded fused experts "
                 "is unsupported; target attention/shared non-EP modules instead."
             )
-        self._param_prefix = str(param_prefix or "")
-        self._adapter_name = str(adapter_name) if adapter_name is not None else str(backend.rollout_adapter_name)
+        self._param_prefix = "" if param_prefix is None else str(param_prefix)
+        self._adapter_name = str(adapter_name) if adapter_name is not None else backend.rollout_adapter_name
         self._verify = bool(verify)
-        self._track_prefix = str(track_prefix or "")
+        self._track_prefix = "" if track_prefix is None else str(track_prefix)
+        self._cached = None
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST, execute_mode=Execute.RANK_ZERO)
+    def has_staged_adapter(self) -> bool:
+        """Whether the current adapter is already staged for another push."""
+        return self._cached is not None
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def invalidate(self) -> None:
+        """Discard the staged adapter before an optimizer step can change it."""
+        self._cached = None
 
     def _extract(self):
         """Extract the canonical adapter (+ ``track_prefix``) and PEFT config."""
-        lora_tensors, peft_config = _extract_canonical_lora(
-            self._backend, param_prefix=self._param_prefix, adapter_name=self._adapter_name
+        from unirl.distributed.weight_sync.payload import _peft_config_dict
+        from unirl.utils.peft_merge import extract_lora_tensors
+
+        model = self._backend.model
+        lora_tensors = extract_lora_tensors(
+            model,
+            param_prefix=self._param_prefix,
+            adapter_name=self._adapter_name,
+            dtype=self._backend.weight_sync_dtype,
         )
+        peft_config = _peft_config_dict(model, self._adapter_name)
         if self._track_prefix:
             lora_tensors = {f"{self._track_prefix}.{k}": v for k, v in lora_tensors.items()}
         return lora_tensors, peft_config

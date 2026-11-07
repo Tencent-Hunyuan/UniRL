@@ -16,13 +16,14 @@ from .base import (
     AlgorithmStepResult,
     BaseAlgorithmConfig,
     StageAlgorithm,
-    _gaussian_kl_div,
-    _reference_kl_loss,
-    _reference_replay_means,
-    _require_replay_anchor_for_batched_replay,
-    _resolve_reference_model,
-    _transition_sigma,
     gather_sde_field,
+    gaussian_kl_div,
+    reference_kl_loss,
+    require_replay_anchor_for_batched_replay,
+    require_timestep_chunk_size,
+    resolve_reference_model,
+    slice_step_chunks,
+    transition_sigma,
     typed_conditions,
 )
 
@@ -35,10 +36,11 @@ class FlowDPPOConfig(BaseAlgorithmConfig):
     add_kl_coefficient: bool = True
     beta: float = 0.0
     old_logp_source: str = "rollout"
+    timestep_chunk_size: Optional[int] = None
     params: Any = dc_field(default=None)
 
 
-def _flowdppo_kl_adv_loss(
+def flowdppo_kl_adv_loss(
     *,
     new_logp: torch.Tensor,
     old_logp: torch.Tensor,
@@ -54,7 +56,7 @@ def _flowdppo_kl_adv_loss(
     adv = advantages.detach()
     unclipped_loss = -adv * ratio
 
-    kl_per_elem = _gaussian_kl_div(new_means, old_means, sigma_t)
+    kl_per_elem = gaussian_kl_div(new_means, old_means, sigma_t)
     kl_per_sample = kl_per_elem.mean(dim=tuple(range(2, kl_per_elem.ndim)))
 
     # KL mask: keep samples where KL < threshold (low divergence → safe to update)
@@ -109,6 +111,7 @@ class FlowDPPO(StageAlgorithm):
         add_kl_coefficient: bool = True,
         beta: float = 0.0,
         old_logp_source: str = "rollout",
+        timestep_chunk_size: Optional[int] = None,
         backend: Any = None,
         conditions_cls: Optional[Type[Any]] = None,
     ) -> None:
@@ -121,13 +124,15 @@ class FlowDPPO(StageAlgorithm):
         self.kl_mask_threshold = float(kl_mask_threshold)
         self.add_kl_coefficient = bool(add_kl_coefficient)
         self.beta = float(beta)
-        self._ref_model = _resolve_reference_model(backend, beta=self.beta, algo="FlowDPPO")
+        self.ref_model = resolve_reference_model(backend, beta=self.beta, algo="FlowDPPO")
         self.old_logp_source = str(old_logp_source).strip().lower()
         require(
             self.old_logp_source in ("rollout", "replay"),
             f"FlowDPPO: old_logp_source must be 'rollout' or 'replay'; got {old_logp_source!r}",
         )
-        _require_replay_anchor_for_batched_replay(self.stage, self.old_logp_source, algo="FlowDPPO")
+        require_timestep_chunk_size(timestep_chunk_size, algo="FlowDPPO")
+        self.timestep_chunk_size = timestep_chunk_size
+        require_replay_anchor_for_batched_replay(self.stage, self.old_logp_source, algo="FlowDPPO")
         self.conditions_cls = conditions_cls
 
     def prepare_segment(
@@ -137,10 +142,7 @@ class FlowDPPO(StageAlgorithm):
         segment: "LatentSegment",
     ) -> None:
         """Freeze the π_old anchor and means at pre-update weights, before the ``num_updates_per_batch`` loop."""
-        if segment.sde_indices is None:
-            return
-        target_steps = self._resolve_target_steps(segment)
-        if not target_steps:
+        if segment.sde_indices is None or segment.sde_indices.numel() == 0:
             return
         if self.old_logp_source == "rollout" and segment.sde_logp is None:
             raise RuntimeError(
@@ -149,18 +151,25 @@ class FlowDPPO(StageAlgorithm):
                 "None). Pin a rollout build that emits trajectory log-probs, or set "
                 "old_logp_source='replay'."
             )
+        target_steps = segment.sde_indices.tolist()
         typed_conds = typed_conditions(conditions, self.conditions_cls)
+        logp_parts: List[torch.Tensor] = []
+        mean_parts: List[torch.Tensor] = []
         with torch.no_grad():
-            result = self.stage.replay(typed_conds, segment=segment, params=self.params, step_indices=target_steps)
+            for chunk in slice_step_chunks(target_steps, self.timestep_chunk_size):
+                result = self.stage.replay(typed_conds, segment=segment, params=self.params, step_indices=chunk)
+                if result.prev_sample_means is None:
+                    raise RuntimeError(
+                        "FlowDPPO.prepare_segment: stage.replay() returned "
+                        "prev_sample_means=None. Ensure the stage's replay method "
+                        "produces means (required for KL-ADV masking)."
+                    )
+                if self.old_logp_source == "replay":
+                    logp_parts.append(result.log_probs.detach().cpu())
+                mean_parts.append(result.prev_sample_means.detach().cpu())
         if self.old_logp_source == "replay":
-            segment.sde_logp = result.log_probs.detach().cpu()
-        if result.prev_sample_means is None:
-            raise RuntimeError(
-                "FlowDPPO.prepare_segment: stage.replay() returned "
-                "prev_sample_means=None. Ensure the stage's replay method "
-                "produces means (required for KL-ADV masking)."
-            )
-        segment.sde_means = result.prev_sample_means.detach().cpu()
+            segment.sde_logp = torch.cat(logp_parts, dim=1)
+        segment.sde_means = torch.cat(mean_parts, dim=1)
 
     def compute_loss_and_backward(
         self,
@@ -171,106 +180,124 @@ class FlowDPPO(StageAlgorithm):
         training_progress: float,
         loss_scale: float,
     ) -> AlgorithmStepResult:
-        target_steps = self._resolve_target_steps(segment)
-        if not target_steps:
+        if segment.sde_indices is None or segment.sde_indices.numel() == 0:
             return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
 
+        target_steps = segment.sde_indices.tolist()
         typed_conds = typed_conditions(conditions, self.conditions_cls)
-        replay_result = self.stage.replay(
-            typed_conds,
-            segment=segment,
-            params=self.params,
-            step_indices=target_steps,
-        )
-        new_logp = replay_result.log_probs
-        new_means = replay_result.prev_sample_means
+        num_steps = len(target_steps)
+        chunks = slice_step_chunks(target_steps, self.timestep_chunk_size)
+        policy_terms: List[torch.Tensor] = []
+        total_terms: List[torch.Tensor] = []
+        kl_ref_terms: List[torch.Tensor] = []
+        chunk_metrics_list: List[Dict[str, torch.Tensor]] = []
+        new_logp_parts: List[torch.Tensor] = []
+        old_logp_parts: List[torch.Tensor] = []
 
-        if new_means is None:
-            raise RuntimeError(
-                "FlowDPPO requires stage.replay() to return prev_sample_means, "
-                "but got None. Ensure the stage's replay method produces means."
+        for chunk in chunks:
+            chunk_weight = len(chunk) / num_steps
+            replay_result = self.stage.replay(
+                typed_conds,
+                segment=segment,
+                params=self.params,
+                step_indices=chunk,
+            )
+            new_logp = replay_result.log_probs
+            new_means = replay_result.prev_sample_means
+
+            if new_means is None:
+                raise RuntimeError(
+                    "FlowDPPO requires stage.replay() to return prev_sample_means, "
+                    "but got None. Ensure the stage's replay method produces means."
+                )
+
+            old_logp = gather_sde_field(segment.sde_logp, segment.sde_indices, chunk, field_name="sde_logp").to(
+                dtype=new_logp.dtype, device=new_logp.device
+            )
+            old_means = gather_sde_field(segment.sde_means, segment.sde_indices, chunk, field_name="sde_means").to(
+                dtype=new_means.dtype, device=new_means.device
             )
 
-        old_logp = gather_sde_field(segment.sde_logp, segment.sde_indices, target_steps, field_name="sde_logp").to(
-            dtype=new_logp.dtype, device=new_logp.device
-        )
-        old_means = gather_sde_field(segment.sde_means, segment.sde_indices, target_steps, field_name="sde_means").to(
-            dtype=new_means.dtype, device=new_means.device
-        )
+            sigma_t = transition_sigma(
+                self.stage,
+                segment=segment,
+                target_steps=chunk,
+                eta=self.params.eta,
+                device=new_logp.device,
+                add_coefficient=self.add_kl_coefficient,
+            )
+            adv_b = (
+                advantages.detach().to(dtype=new_logp.dtype, device=new_logp.device).reshape(-1, 1).expand_as(new_logp)
+            )
 
-        sigma_t = self._compute_sigma_t(segment, target_steps, device=new_logp.device)
+            loss_per_elem, chunk_metrics = flowdppo_kl_adv_loss(
+                new_logp=new_logp,
+                old_logp=old_logp,
+                new_means=new_means,
+                old_means=old_means,
+                advantages=adv_b,
+                sigma_t=sigma_t,
+                kl_mask_threshold=self.kl_mask_threshold,
+            )
 
-        adv_b = advantages.detach().to(dtype=new_logp.dtype, device=new_logp.device).reshape(-1, 1).expand_as(new_logp)
+            chunk_policy_loss = loss_per_elem.mean()
+            chunk_loss = chunk_policy_loss
+            policy_terms.append(chunk_policy_loss.detach() * chunk_weight)
+            if self.beta > 0.0:
+                kl_ref = reference_kl_loss(
+                    self.stage,
+                    self.ref_model,
+                    conditions=typed_conds,
+                    segment=segment,
+                    params=self.params,
+                    target_steps=chunk,
+                    new_means=new_means,
+                    algo="FlowDPPO",
+                )
+                chunk_loss = chunk_loss + self.beta * kl_ref
+                kl_ref_terms.append(kl_ref.detach() * chunk_weight)
 
-        loss_per_elem, ratio_metrics = _flowdppo_kl_adv_loss(
-            new_logp=new_logp,
-            old_logp=old_logp,
-            new_means=new_means,
-            old_means=old_means,
-            advantages=adv_b,
-            sigma_t=sigma_t,
-            kl_mask_threshold=self.kl_mask_threshold,
-        )
+            (chunk_loss * (loss_scale * chunk_weight)).backward()
+            total_terms.append(chunk_loss.detach() * chunk_weight)
+            if len(chunks) > 1:
+                chunk_metrics_list.append(chunk_metrics)
+                new_logp_parts.append(new_logp.detach())
+                old_logp_parts.append(old_logp.detach())
 
-        policy_loss = loss_per_elem.mean()
-        loss = policy_loss
+        if len(chunks) == 1:
+            resolved_metrics = {k: v.item() for k, v in chunk_metrics.items()}
+        else:
+            weights = torch.tensor(
+                [len(c) / num_steps for c in chunks], dtype=torch.float32, device=new_logp_parts[0].device
+            )
+            mean_keys = [
+                k for k in chunk_metrics_list[0] if k not in ("ratio_std", "ratio_min", "ratio_max", "kl_new_old_max")
+            ]
+            ratio_all = torch.exp(torch.cat(new_logp_parts, dim=1) - torch.cat(old_logp_parts, dim=1))
+            resolved_metrics = {
+                **{k: (torch.stack([m[k] for m in chunk_metrics_list]) * weights).sum().item() for k in mean_keys},
+                "ratio_std": ratio_all.std().item(),
+                "ratio_min": torch.stack([m["ratio_min"] for m in chunk_metrics_list]).min().item(),
+                "ratio_max": torch.stack([m["ratio_max"] for m in chunk_metrics_list]).max().item(),
+                "kl_new_old_max": torch.stack([m["kl_new_old_max"] for m in chunk_metrics_list]).max().item(),
+            }
+
+        total_loss_val = torch.stack(total_terms).sum().item()
         metrics: Dict[str, Any] = {
-            "policy_loss": float(policy_loss.detach().item()),
-            "kl_mask_threshold": float(self.kl_mask_threshold),
-            **{k: float(v.item()) for k, v in ratio_metrics.items()},
+            "policy_loss": torch.stack(policy_terms).sum().item(),
+            "kl_mask_threshold": self.kl_mask_threshold,
+            **resolved_metrics,
         }
 
         if self.beta > 0.0:
-            ref_means = _reference_replay_means(
-                self.stage,
-                self._ref_model,
-                conditions=typed_conds,
-                segment=segment,
-                params=self.params,
-                target_steps=target_steps,
-            ).to(dtype=new_means.dtype, device=new_means.device)
-            kl_sigma_t = _transition_sigma(
-                self.stage,
-                segment=segment,
-                target_steps=target_steps,
-                eta=float(self.params.eta),
-                device=new_logp.device,
-                add_coefficient=True,
-            )
-            kl_ref = _reference_kl_loss(new_means, ref_means, kl_sigma_t)
-            loss = loss + self.beta * kl_ref
-            metrics["beta"] = float(self.beta)
-            metrics["kl_ref_mean"] = float(kl_ref.detach().item())
-
-        (loss * loss_scale).backward()
+            metrics["beta"] = self.beta
+            metrics["kl_ref_mean"] = torch.stack(kl_ref_terms).sum().item()
 
         return AlgorithmStepResult(
-            loss=float(loss.detach().item()),
+            loss=total_loss_val,
             metrics=metrics,
-            num_steps_or_tokens=len(target_steps),
+            num_steps_or_tokens=num_steps,
             has_backward=True,
-        )
-
-    def _resolve_target_steps(self, segment: "LatentSegment") -> List[int]:
-        """All SDE-recorded step indices on the segment."""
-        if segment.sde_indices is None:
-            return []
-        return [int(i) for i in segment.sde_indices.tolist()]
-
-    def _compute_sigma_t(
-        self,
-        segment: "LatentSegment",
-        target_steps: List[int],
-        device: torch.device,
-    ) -> torch.Tensor:
-        """Per-step KL-normalization sigma_t ``[S']``; ones when ``add_kl_coefficient=False``."""
-        return _transition_sigma(
-            self.stage,
-            segment=segment,
-            target_steps=target_steps,
-            eta=float(self.params.eta),
-            device=device,
-            add_coefficient=self.add_kl_coefficient,
         )
 
 

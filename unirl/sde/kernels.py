@@ -106,6 +106,9 @@ class StepStrategy(ABC):
 class SDEStrategy(StepStrategy, ABC):
     """Base class for SDE log probability computation strategies."""
 
+    # True when compute_log_prob returns the unscaled -(x - mean)**2 (SGLang's rollout_log_prob_no_const).
+    log_prob_no_const: ClassVar[bool] = False
+
     @abstractmethod
     def compute_log_prob(
         self,
@@ -244,6 +247,7 @@ class CPSSDEStrategy(SDEStrategy):
     """Coefficient-preserving sampling."""
 
     canonical_name: ClassVar[str] = "cps"
+    log_prob_no_const: ClassVar[bool] = True
 
     def __init__(self, *, config: Optional["CPSSpec"] = None) -> None:
         del config

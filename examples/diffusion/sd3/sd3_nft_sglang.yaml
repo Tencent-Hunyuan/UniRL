@@ -31,6 +31,7 @@ bundle:
     pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,stabilityai/stable-diffusion-3.5-medium}
     model_precision: bf16
     shift: 3.0
+    load_text_encoder: false
     load_vae: false
 
 pipeline:
@@ -180,7 +181,6 @@ sync:
   group_name: weight_sync
   bucket_size_mb: 512
   flush_cache: true
-  name_remap: {"*": "transformer.*"}
 
 logging:
   report_to_wandb: ${oc.decode:${oc.env:REPORT_TO_WANDB,true}}

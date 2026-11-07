@@ -11,14 +11,14 @@ from torch import nn
 
 def has_ep_params(model: nn.Module) -> bool:
     """Whether ``model`` carries VeOmni's non-empty EP parameter group."""
-    groups = getattr(model, "_extra_parallel_param_groups", None)
-    return bool(groups and groups.get("ep"))
+    return hasattr(model, "_extra_parallel_param_groups")
 
 
 def ep_named_parameters(model: nn.Module) -> Tuple[Tuple[str, nn.Parameter], ...]:
     """Return EP parameters in deterministic model order."""
-    groups = getattr(model, "_extra_parallel_param_groups", None) or {}
-    ep_params = tuple(groups.get("ep", ()))
+    if not hasattr(model, "_extra_parallel_param_groups"):
+        return ()
+    ep_params = model._extra_parallel_param_groups["ep"]
     ep_ids = {id(param) for param in ep_params}
     named = tuple((name, param) for name, param in model.named_parameters() if id(param) in ep_ids)
     if len(named) != len(ep_params):
@@ -31,14 +31,11 @@ def ep_named_parameters(model: nn.Module) -> Tuple[Tuple[str, nn.Parameter], ...
 
 def materialize_local_block(value: torch.Tensor) -> torch.Tensor:
     """Replicate a DTensor over its own mesh, preserving the outer EP block."""
-    try:
-        from torch.distributed.tensor import DTensor, Replicate
-    except ImportError:  # pragma: no cover - older torch
-        from torch.distributed._tensor import DTensor, Replicate
+    from torch.distributed.tensor import DTensor, Replicate
 
     if isinstance(value, DTensor):
         work = value
-        mesh_device = getattr(work.device_mesh, "device_type", None)
+        mesh_device = work.device_mesh.device_type
         if work.to_local().device.type == "cpu" and mesh_device != "cpu":
             if not torch.cuda.is_available():
                 raise RuntimeError("EP placement: cannot gather a CPU DTensor over an NCCL mesh without CUDA.")
@@ -56,19 +53,28 @@ def gather_stacked_expert_block(
 ) -> torch.Tensor:
     """Gather contiguous ``[E/ep,...]`` blocks and concatenate the expert axis."""
     block = local_block.contiguous()
-    if block.device.type == "cpu" and dist.is_initialized() and dist.get_backend(ep_group) == "nccl":
+    backend = dist.get_backend(ep_group)
+    group_size = dist.get_world_size(ep_group)
+    if group_size != ep_size:
+        raise RuntimeError(f"EP placement: ep_size={ep_size} does not match group world_size={group_size}.")
+    if block.device.type == "cpu" and backend == "nccl":
         block = block.cuda()
-    gathered = [torch.empty_like(block) for _ in range(ep_size)]
-    dist.all_gather(gathered, block, group=ep_group)
-    return torch.cat(gathered, dim=0)
+
+    if backend != "nccl":
+        gathered = [torch.empty_like(block) for _ in range(ep_size)]
+        dist.all_gather(gathered, block, group=ep_group)
+        return torch.cat(gathered, dim=0)
+
+    # Write rank-contiguous blocks directly into the final tensor, avoiding the
+    # extra full-size allocation and copy made by list all_gather + torch.cat.
+    stacked = block.new_empty((ep_size * block.shape[0], *block.shape[1:]))
+    dist.all_gather_single(stacked, block, group=ep_group)
+    return stacked
 
 
 def assign_local_block(param: torch.Tensor, block: torch.Tensor) -> None:
     """Copy a full local EP block into a plain tensor or its DTensor shard."""
-    try:
-        from torch.distributed.tensor import DTensor, distribute_tensor
-    except ImportError:  # pragma: no cover - older torch
-        from torch.distributed._tensor import DTensor, distribute_tensor
+    from torch.distributed.tensor import DTensor, distribute_tensor
 
     with torch.no_grad():
         if isinstance(param, DTensor):

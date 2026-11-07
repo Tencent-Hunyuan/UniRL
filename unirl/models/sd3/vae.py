@@ -37,7 +37,7 @@ class SD3VAEDecodeStage(DecodeStage[LatentSegment, Images]):
             )
         clean = s.latents[:, -1]
         scaling_factor = self.bundle.vae.config.scaling_factor
-        shift_factor = getattr(self.bundle.vae.config, "shift_factor", None)
+        shift_factor = self.bundle.vae.config.shift_factor
         vae = self.bundle.vae.to(torch.float32)
 
         def _decode(lat: torch.Tensor) -> torch.Tensor:
@@ -84,7 +84,7 @@ class SD3VAEEncodeStage(EncodeStage[Images, ImageLatentCondition]):
                 f"{tuple(pixels.shape) if isinstance(pixels, torch.Tensor) else type(pixels).__name__}"
             )
         scaling_factor = self.bundle.vae.config.scaling_factor
-        shift_factor = getattr(self.bundle.vae.config, "shift_factor", None)
+        shift_factor = self.bundle.vae.config.shift_factor
         vae = self.bundle.vae.to(torch.float32)
         x = pixels.to(device=self.bundle.device, dtype=torch.float32) * 2.0 - 1.0
         z = vae.encode(x).latent_dist.mode()

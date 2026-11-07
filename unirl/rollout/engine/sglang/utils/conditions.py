@@ -19,7 +19,7 @@ def pack_prompt_condition(
         return None
     max_plen = max(len(p) for p in per_sample_prompt_ids)
     batch = len(per_sample_prompt_ids)
-    input_ids = torch.full((batch, max_plen), int(pad_token_id), dtype=torch.long)
+    input_ids = torch.full((batch, max_plen), pad_token_id, dtype=torch.long)
     attention_mask = torch.zeros((batch, max_plen), dtype=torch.long)
     for i, p in enumerate(per_sample_prompt_ids):
         n_real = len(p)

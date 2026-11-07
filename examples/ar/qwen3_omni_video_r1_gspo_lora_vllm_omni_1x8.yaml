@@ -109,7 +109,7 @@ rollout:
     _target_: unirl.rollout.engine.vllm_omni.config.VLLMOmniEngineConfig
     model_path: ${oc.env:QWEN3_OMNI_PATH,/path/to/Qwen3-Omni-30B-A3B-Instruct}
     modality: qwen3_omni_thinker
-    stage_yaml_override: qwen3_omni_thinker_only_rl_1x4.yaml   # TP=4 (audio tower 20 heads)
+    deploy_config_override: qwen3_omni_thinker_only_rl_1x4.yaml   # TP=4 (audio tower 20 heads)
     enable_sleep_mode: true
     omni_extra:
       stage_init_timeout: 1200
@@ -140,10 +140,11 @@ reward:
 algorithm:
   _target_: unirl.algorithms.gspo.GSPO
   stage_attr: ar
-  clip_range: 3.0e-4
-  clip_range_high: 4.0e-4
+  clip_range: 1.0e-3
+  clip_range_high: 2.0e-3
   clip_schedule: constant
   sampling_temperature: 1.0
+  old_logp_source: replay
   conditions_cls:
     _target_: hydra.utils.get_class
     path: unirl.models.qwen3_omni.conditions.Qwen3OmniARConditions

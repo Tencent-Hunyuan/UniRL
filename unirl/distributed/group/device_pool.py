@@ -36,7 +36,7 @@ class DevicePool:
         self.num_devices = num_devices
         self.devices_per_node = devices_per_node
         self.workers_per_device = workers_per_device
-        self.transport_kind = transport_kind or "colocate_store"
+        self.transport_kind = "colocate_store" if transport_kind is None else transport_kind
         if self.transport_kind in ("colocate_store", "colocate") and self.workers_per_device != 1:
             raise ValueError(
                 f"colocate_store supports one worker per device (got workers_per_device="
@@ -54,9 +54,6 @@ class DevicePool:
                     f"{len(per_device_concurrency)} != {num_devices}"
                 )
         self._worker_concurrency_by_device = per_device_concurrency
-        self.max_worker_concurrency = max(per_device_concurrency)
-
-        self.workers: List[ray.actor.ActorHandle] = []
 
         self._tw_by_device: Dict[int, Any] = {}
 
@@ -64,19 +61,13 @@ class DevicePool:
         self._master_port: Optional[str] = None
 
         self._pgs: List = []
-        self._next_device: int = 0
 
         self._claimed: Set[int] = set()
 
         self._worker_id_to_device_id: Dict[str, int] = {}
-        self._worker_id_to_slot: Dict[str, int] = {}
         self._device_to_workers: Dict[int, List] = {}  # device_id → [slot0, slot1, ...]
         self._worker_by_id: Dict[str, Any] = {}  # worker_id → handle
         self._poison_reason: Optional[str] = None
-
-    @property
-    def num_gpus(self) -> int:
-        return self.num_devices
 
     def mark_poisoned(self, *, rank: int, role_name: str, method_name: str, error: BaseException) -> None:
         """Poison the pool with the first rank-local failure context."""
@@ -118,13 +109,6 @@ class DevicePool:
         """Create PlacementGroups, Worker actors, and (for worker-local backends) NCCL."""
         from unirl.distributed.tensor import WorkerLocalTransport
 
-        self._create_placement_groups()
-        self._create_workers()
-        if self.num_devices > 1 and issubclass(self.transport_cls, WorkerLocalTransport):
-            self._setup_nccl()
-
-    def _create_placement_groups(self) -> None:
-        """Create one STRICT_PACK PlacementGroup per node."""
         num_nodes = self.num_devices // self.devices_per_node
         extra_cpu = 1 if self.transport_kind in ("gpu_store", "gpu") else 0
         bundles = [{"GPU": 1, "CPU": self.workers_per_device + extra_cpu} for _ in range(self.devices_per_node)]
@@ -132,20 +116,20 @@ class DevicePool:
         ray.get([pg.ready() for pg in pgs])
         self._pgs = pgs
 
-    def _create_workers(self) -> None:
-        """Create slot0 Worker per device. Slot1+ are created lazily."""
         master_addr, master_port = get_node_ip_and_port(self._pgs[0], bundle_index=0)
         self._master_addr, self._master_port = master_addr, str(master_port)
         env_vars_base = {
             "MASTER_ADDR": master_addr,
-            "MASTER_PORT": str(master_port),
+            "MASTER_PORT": self._master_port,
             "WORLD_SIZE": str(self.num_devices),
         }
         for device_id in range(self.num_devices):
             self._device_to_workers[device_id] = []
             env_vars = {**env_vars_base, "RANK": str(device_id)}
-            w = self._spawn_worker(device_id, slot=0, env_vars=env_vars)
-            self.workers.append(w)
+            self._spawn_worker(device_id, slot=0, env_vars=env_vars)
+
+        if self.num_devices > 1 and issubclass(self.transport_cls, WorkerLocalTransport):
+            ray.get([self.slot0_worker(d).setup_global_pg.remote() for d in range(self.num_devices)])
 
     def _spawn_worker(self, device_id: int, slot: int, env_vars: dict = None) -> ray.actor.ActorHandle:
         """Spawn a Worker actor and register it in internal mappings."""
@@ -187,7 +171,6 @@ class DevicePool:
         self._device_to_workers[device_id].append(w)
         self._worker_by_id[worker_id] = w
         self._worker_id_to_device_id[worker_id] = device_id
-        self._worker_id_to_slot[worker_id] = slot
 
         if self.transport_kind in ("gpu_store", "gpu"):
             tw = self._get_or_create_tw(device_id)
@@ -238,11 +221,6 @@ class DevicePool:
         assert slot < self.workers_per_device, f"slot={slot} >= workers_per_device={self.workers_per_device}"
         return self._spawn_worker(device_id, slot)
 
-    def _setup_nccl(self) -> None:
-        """Initialize NCCL ProcessGroup on all slot0 workers."""
-        slot0_workers = [self._device_to_workers[d][0] for d in range(self.num_devices)]
-        ray.get([w.setup_global_pg.remote() for w in slot0_workers])
-
     def slot0_worker(self, device_id: int) -> ray.actor.ActorHandle:
         """Return the slot0 worker handle for device_id."""
         return self._device_to_workers[device_id][0]
@@ -268,13 +246,6 @@ class DevicePool:
         if rt.backend is not None and rt.backend.manager_type == "MooncakeStorageManager":
             rt.reset_zero_copy_buffer_free()
 
-    def get_worker(self, worker_id: str) -> ray.actor.ActorHandle:
-        """Return the worker handle for the given worker_id."""
-        try:
-            return self._worker_by_id[worker_id]
-        except KeyError:
-            raise KeyError(f"Unknown worker_id '{worker_id}'. Known: {sorted(self._worker_by_id)}")
-
     def device_id_of(self, worker_id: str) -> int:
         """Return the device_id for a worker_id (e.g. 'dw3' → 3, 'dw3_s1' → 3)."""
         try:
@@ -282,53 +253,28 @@ class DevicePool:
         except KeyError:
             raise KeyError(f"Unknown worker_id '{worker_id}'. Known: {sorted(self._worker_id_to_device_id)}")
 
-    def slot_of(self, worker_id: str) -> int:
-        """Return the slot for a worker_id (e.g. 'dw3' → 0, 'dw3_s1' → 1)."""
-        try:
-            return self._worker_id_to_slot[worker_id]
-        except KeyError:
-            raise KeyError(f"Unknown worker_id '{worker_id}'.")
-
-    def allocate(self, n: int) -> List[int]:
-        """Auto-allocate n devices sequentially. Returns device_ids."""
-        if self._next_device + n > self.num_devices:
-            raise ValueError(
-                f"Cannot allocate {n} devices: only "
-                f"{self.num_devices - self._next_device} remaining "
-                f"(total={self.num_devices}, allocated={self._next_device})"
-            )
-        ids = list(range(self._next_device, self._next_device + n))
-        self._next_device += n
-        return ids
-
     def create_remote(
         self,
         role_cls,
-        device_ids=None,
-        n_gpus: int = None,
-        role_name: str = None,
-        init_kwargs: dict = None,
-        slot_id: Optional[int] = None,
+        device_ids: Optional[List[int]] = None,
+        init_kwargs: Optional[dict] = None,
     ) -> Handle:
         """Create a Handle for role_cls on this pool."""
         self.assert_usable()
 
         from unirl.distributed.group.placement import current_placement
 
+        slot_id = 0
         if device_ids is None:
             scope = current_placement()
             if scope is not None:
-                device_ids, auto_slot = scope.assign()
-                if slot_id is None:
-                    slot_id = auto_slot
-            elif n_gpus is not None:
-                device_ids = self.allocate(n_gpus)
+                device_ids, slot_id = scope.assign()
             else:
                 device_ids = list(range(self.num_devices))
-        if slot_id is None:
-            slot_id = 0
+        else:
+            device_ids = list(device_ids)
 
-        for d in list(device_ids):
+        for d in device_ids:
             self._get_or_create_worker(d, slot_id)
 
         return Handle(
@@ -336,13 +282,19 @@ class DevicePool:
             self,
             device_ids=device_ids,
             slot_id=slot_id,
-            role_name=role_name,
             init_kwargs=init_kwargs,
         )
 
     def shutdown(self) -> None:
         """Release roles, then kill all Worker actors and remove PlacementGroups."""
-        self._release_roles()
+        if self._worker_by_id:
+            pending = {wid: w.teardown.remote() for wid, w in self._worker_by_id.items()}
+            deadline = time.monotonic() + _ROLE_TEARDOWN_TIMEOUT_S
+            for wid, ref in pending.items():
+                try:
+                    ray.get(ref, timeout=max(0.0, deadline - time.monotonic()))
+                except Exception:
+                    logger.warning("Worker %s did not release its roles before shutdown; killing it", wid)
         for tw in self._tw_by_device.values():
             ray.kill(tw, no_restart=True)
         for w in self._worker_by_id.values():
@@ -352,26 +304,11 @@ class DevicePool:
                 ray.get(w.get_gpu_count.remote(), timeout=10)
             except Exception:
                 logger.debug("Worker did not respond after ray.kill during DevicePool shutdown.", exc_info=True)
-        self.workers.clear()
         self._worker_by_id.clear()
         self._device_to_workers.clear()
         self._worker_id_to_device_id.clear()
-        self._worker_id_to_slot.clear()
         self._tw_by_device.clear()
-        self._next_device = 0
         self._claimed.clear()
         for pg in self._pgs:
             ray.util.remove_placement_group(pg)
         self._pgs = []
-
-    def _release_roles(self) -> None:
-        """Give every worker a chance to close its roles before we kill it."""
-        if not self._worker_by_id:
-            return
-        pending = {wid: w.teardown.remote() for wid, w in self._worker_by_id.items()}
-        deadline = time.monotonic() + _ROLE_TEARDOWN_TIMEOUT_S
-        for wid, ref in pending.items():
-            try:
-                ray.get(ref, timeout=max(0.0, deadline - time.monotonic()))
-            except Exception:
-                logger.warning("Worker %s did not release its roles before shutdown; killing it", wid)

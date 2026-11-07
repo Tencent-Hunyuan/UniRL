@@ -125,13 +125,13 @@ rollout:
       # FULL fine-tuning: lower the SRT KV reservation to give FSDP headroom for
       # the per-rollout full-weight all-gather. No LoRA pool — full dense weights
       # pushed via TensorWeightSync. CUDA graph ON for decode speed, but capped at
-      # cuda_graph_max_bs=16 so its captured buffers stay small (the default 256
-      # would balloon server memory + compete with the weight push).
+      # cuda_graph_max_bs_decode=16 so its captured buffers stay small (the
+      # auto-tuned default can be much larger and compete with the weight push).
       mem_fraction_static: 0.3
       skip_server_warmup: true
       attention_backend: triton
       disable_cuda_graph: false
-      cuda_graph_max_bs: 16
+      cuda_graph_max_bs_decode: 16
       enable_lora: false
 
 reward:
@@ -156,7 +156,7 @@ reward:
       _target_: unirl.reward.local.mathverify.MathVerifySpec
 
 algorithm:
-  # Plain PPO-clip GRPO (shares _grpo_clip_loss with FlowGRPO). old_logp =
+  # Plain PPO-clip GRPO (shares grpo_clip_loss with FlowGRPO). old_logp =
   # the SGLang rollout log-prob (segment.log_probs), frozen across the 4 mini-batch
   # updates below (rollout-anchored ratio, = verl bypass_mode=True parity; the
   # ratio also absorbs the rollout-vs-train engine gap — same trade-off as DRPO's

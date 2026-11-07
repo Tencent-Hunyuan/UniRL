@@ -118,7 +118,7 @@ diffusion:
     # Rollout samples the whole shard in one forward (no forward_batch_size set)
     # but trains at micro_batch_size=1; bf16 GEMMs are batch-shape sensitive, so
     # the on-policy ratio is exactly 1 only when pi_old is replayed at the train
-    # micro-geometry. See sd3_trainside.yaml / TrainStack.prepare_segment.
+    # micro-geometry. See sd3_trainside.yaml / unirl.train.stack.prepare_segment_anchors.
     old_logp_source: replay
     conditions_cls:
       _target_: hydra.utils.get_class
@@ -131,6 +131,7 @@ diffusion:
     micro_batch_size: 1
     max_grad_norm: 1.0
     num_updates_per_batch: 2      # diffusion-side PPO mini-batches; ar stays 1 (GRPO is single-update only)
+    shuffle_updates: true
 
 # ── AR side (Qwen3) ───────────────────────────────────────────────────────
 ar:
@@ -243,7 +244,7 @@ sampling:
     # Sparse SDE-index schedule (FlowDPPO-style, mirrors sd3_flowdppo.yaml):
     # num_sde_steps random steps drawn from the first half of the denoising
     # schedule, resolved PER ROLLOUT (seeded by rollout_id) by
-    # PETrainer._build_req via resolve_sde_indices. Replaces the static all-SDE
+    # PETrainer._build_req via get_sde_indices. Replaces the static all-SDE
     # list with selective stochastic steps.
     scheduler:
       _target_: unirl.sde.index_schedule.AllSDEScheduler

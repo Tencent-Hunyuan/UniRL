@@ -60,6 +60,7 @@ pipeline:
   logprob_precision: fp32
   max_sequence_length: 512
   qwen3_extraction_layers: [9, 18, 27]
+  batch_replay_steps: true
   strategy:
     _target_: unirl.sde.kernels.DanceSDEStrategy
 

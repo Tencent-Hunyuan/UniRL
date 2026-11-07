@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import weakref
-from typing import Any
 
 import ray
 import torch
@@ -47,17 +46,6 @@ class GPUTensorHandle:
         self.worker_handle = worker_handle
         if self.object_ref is None:
             weakref.finalize(self, GPUTensorHandle._release, worker_handle, self.store_key)
-
-    def remote_op_async(self, op: str, *args) -> Any:
-        """Fire remote tensor_op on the worker, return ObjectRef (does not wait)."""
-        assert self.worker_handle is not None, "GPUTensorHandle not bound"
-        return self.worker_handle.transport_op.remote("tensor_op", self, op, *args)
-
-    def remote_op(self, op: str, *args) -> GPUTensorHandle:
-        """Execute remote tensor_op synchronously, return new bound GPUTensorHandle."""
-        new_h = ray.get(self.remote_op_async(op, *args))
-        new_h.rebind(self.worker_handle)
-        return new_h
 
     def local(self) -> Tensor:
         """Fetch the actual tensor to controller CPU."""

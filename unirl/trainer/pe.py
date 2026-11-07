@@ -67,27 +67,39 @@ class PETrainer(BaseTrainer):
         eval_eta: float = 0.0,
         eval_rewards_cfg: Optional[Any] = None,
     ) -> None:
-        super().__init__(cfg=cfg, logging_cfg=logging_cfg)
-        self.batch_size = batch_size
-        self._enable_fsdp_offload = bool(enable_fsdp_offload)
-        self._rollout_is_trainside = False
-        self._freeze_llm = bool(freeze_llm)
+        self._freeze_llm = freeze_llm
         self._train_tracks: Tuple[str, ...] = ("diffusion",) if self._freeze_llm else TRACK_NAMES
-        self._diffusion_group_scope = str(diffusion_group_scope)
-        if self._diffusion_group_scope not in ("rewrite", "prompt"):
+        if diffusion_group_scope not in ("rewrite", "prompt"):
             raise ValueError(
                 f"PETrainer.diffusion_group_scope must be 'rewrite' or 'prompt'; got {diffusion_group_scope!r}."
             )
+        self._diffusion_group_scope = diffusion_group_scope
+        rollout_parsed = parse_hydra_cfg(rollout_cfg)
+        takes_pipeline = "pipeline" in inspect.signature(rollout_parsed["role_cls"]).parameters
+        if takes_pipeline:
+            if sync_cfg is not None:
+                raise ValueError(
+                    "PETrainer: trainside direct-sampling engine reads the live training weights and cannot use a `sync:` block."
+                )
+        else:
+            if sync_cfg is None or any(sync_cfg.get(track) is None for track in self._train_tracks):
+                raise ValueError(
+                    f"PETrainer: dedicated rollout engine requires `sync:` tracks {list(self._train_tracks)}."
+                )
+        super().__init__(cfg=cfg, logging_cfg=logging_cfg)
+        self.batch_size = batch_size
+        # Trainside samples the live FSDP modules → must not FSDP-offload.
+        self._enable_fsdp_offload = enable_fsdp_offload and not takes_pipeline
 
-        self.eval_interval = int(eval_interval)
-        self.eval_num_prompts = int(eval_num_prompts)
-        self.eval_cfg_text_scale = float(eval_cfg_text_scale)
-        self.eval_eta = float(eval_eta)
+        self.eval_interval = eval_interval
+        self.eval_num_prompts = eval_num_prompts
+        self.eval_cfg_text_scale = eval_cfg_text_scale
+        self.eval_eta = eval_eta
 
         pe = pe_cfg if pe_cfg is not None else {}
-        self._pe_instruction = pe.get("pe_instruction", None)
-        self._pe_marker = pe.get("pe_marker", None)
-        self._pe_max_chars = pe.get("pe_max_chars", None)
+        pe_instruction = pe.get("pe_instruction", None)
+        pe_marker = pe.get("pe_marker", None)
+        pe_max_chars = pe.get("pe_max_chars", None)
 
         self.data_source = instantiate(data_source_cfg)
 
@@ -100,22 +112,17 @@ class PETrainer(BaseTrainer):
             self.diffusion = self._wire_side(diffusion_cfg)
             self.ar = self._wire_rollout_only_side(ar_cfg) if self._freeze_llm else self._wire_side(ar_cfg)
 
-            rollout_parsed = parse_hydra_cfg(rollout_cfg)
-            takes_pipeline = "pipeline" in inspect.signature(rollout_parsed["role_cls"]).parameters
-            # Trainside samples the live FSDP modules → must not FSDP-offload.
-            self._rollout_is_trainside = bool(takes_pipeline)
             if takes_pipeline:
-                self.pe_pipeline = remote(
+                pe_pipeline = remote(
                     PEPipeline,
                     diffusion_pipeline=self.diffusion.pipeline,
                     llm_pipeline=self.ar.pipeline,
-                    pe_instruction=self._pe_instruction,
-                    pe_marker=self._pe_marker,
-                    pe_max_chars=self._pe_max_chars,
+                    pe_instruction=pe_instruction,
+                    pe_marker=pe_marker,
+                    pe_max_chars=pe_max_chars,
                 )
-                self.rollout = remote(**rollout_parsed, pipeline=self.pe_pipeline)
+                self.rollout = remote(**rollout_parsed, pipeline=pe_pipeline)
             else:
-                self.pe_pipeline = None
                 self.rollout = remote(**rollout_parsed)
 
             self.reward = remote_hydra(reward_cfg)
@@ -154,9 +161,9 @@ class PETrainer(BaseTrainer):
     ) -> Sample:
         """Turn a data-source batch of ``P`` prompts into the composed request ``Sample``."""
         base = sampling if sampling is not None else self.sampling_params
-        diff_params = base.get("diffusion")
-        ar_params = base.get("ar")
-        sde_indices = diff_params.resolve_sde_indices(rollout_id)
+        diff_params = base["diffusion"]
+        ar_params = base["ar"]
+        sde_indices = diff_params.get_sde_indices(rollout_id)
         diffusion = dataclasses.replace(diff_params, sde_indices=sde_indices, scheduler=None)
         request = prepare_input_sample(
             inputs,
@@ -185,14 +192,13 @@ class PETrainer(BaseTrainer):
             self.diffusion_sync.sync()
             if self.ar_sync is not None:
                 self.ar_sync.sync()
-        do_fsdp_offload = self._enable_fsdp_offload and not self._rollout_is_trainside
-        if do_fsdp_offload:
+        if self._enable_fsdp_offload:
             self.diffusion.backend.offload()
             if self.ar.backend is not None:
                 self.ar.backend.offload()
         sample = self.rollout.generate(sample)
         self.rollout.sleep()
-        if do_fsdp_offload:
+        if self._enable_fsdp_offload:
             self.diffusion.backend.onload()
             if self.ar.backend is not None:
                 self.ar.backend.onload()
@@ -225,7 +231,9 @@ class PETrainer(BaseTrainer):
         self._drop_decoded(sample, rollout_id=rollout_id)
         results: Dict[str, TrainStepResult] = {
             name: getattr(self, name).stack.train_track(
-                sample.parts[parts_by_name[name]], training_progress=float(training_progress)
+                sample.parts[parts_by_name[name]],
+                training_progress=float(training_progress),
+                rollout_id=rollout_id,
             )
             for name in self._train_tracks
         }
@@ -234,7 +242,7 @@ class PETrainer(BaseTrainer):
 
     def evaluate(self, step: int) -> float:
         """Periodic eval on the eval set (no training); returns the mean image reward."""
-        base_diffusion = self.sampling_params.get("diffusion")
+        base_diffusion = self.sampling_params["diffusion"]
         eval_diffusion = dataclasses.replace(
             base_diffusion,
             eta=self.eval_eta,
