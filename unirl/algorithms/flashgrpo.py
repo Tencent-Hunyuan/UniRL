@@ -40,7 +40,7 @@ class FlashGRPOConfig(BaseAlgorithmConfig):
 
 
 class FlashGRPO(FlowGRPO):
-    """FlowGRPO whose loss is scaled by the Flash-GRPO temporal-gradient-rectification coefficient."""
+    """FlowGRPO with TGR-weighted policy loss and optional unrectified reference KL."""
 
     # The trainer gates its per-sample SDE-index orchestration on this flag: stratify
     # one SDE step per prompt, stamp ``segment.sde_index_per_sample``, then merge the
