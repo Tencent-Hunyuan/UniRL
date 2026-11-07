@@ -853,13 +853,13 @@ class DiffusionTrainer(BaseTrainer):
         )
         return request
 
-    def _build_flash_request_samples(self, inputs: Sample, rollout_id: int) -> List[Tuple[int, Sample]]:
-        """Stratify one SDE step per prompt; return ``(step, request Sample)`` per step group."""
+    def _build_flash_request_samples(self, inputs: Sample, rollout_id: int) -> List[Sample]:
+        """Stratify one SDE step per prompt; return one request Sample per step group."""
         positions_by_step: Dict[int, List[int]] = {}
         for position, step in enumerate(self._flash_prompt_steps(inputs, rollout_id)):
             positions_by_step.setdefault(step, []).append(position)
 
-        groups: List[Tuple[int, Sample]] = []
+        groups: List[Sample] = []
         for step in sorted(positions_by_step):
             request = self._build_request_sample(
                 inputs.select(torch.tensor(positions_by_step[step], dtype=torch.long)),
@@ -868,7 +868,7 @@ class DiffusionTrainer(BaseTrainer):
             )
             frontier = request.parts[-1]
             frontier.sde_index_per_sample = torch.full((frontier.batch_size,), step, dtype=torch.long)
-            groups.append((step, request))
+            groups.append(request)
         return groups
 
     def _prepare_for_save(self) -> None:
@@ -1072,8 +1072,7 @@ class DiffusionTrainer(BaseTrainer):
             if self._flash_engine_per_sample_sde:
                 request_samples = [self._build_flash_engine_request(inputs, rollout_id)]
             elif self._flash_per_sample_sde:
-                groups = self._build_flash_request_samples(inputs, rollout_id)
-                request_samples = [item for _, item in groups]
+                request_samples = self._build_flash_request_samples(inputs, rollout_id)
             else:
                 request_samples = [self._build_request_sample(inputs, rollout_id)]
             sync_weights = (rollout_id > 0 and rollout_id % weight_sync_interval == 0) or (rollout_id == force_sync_at)
