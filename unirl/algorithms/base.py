@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple, Type
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple, Type, Union
 
 import torch
 
@@ -13,6 +13,7 @@ from unirl.distributed.group.remote import Remote
 from unirl.types.loss_agg import LossAggMode, parse_loss_agg_mode
 
 if TYPE_CHECKING:
+    from unirl.models.types.replay_result import ReplayResult
     from unirl.types.conditions import Condition
     from unirl.types.sample import Part
     from unirl.types.segments.base import Segment
@@ -215,8 +216,9 @@ def grpo_clip_loss(
 
 
 def gaussian_kl_div(p: torch.Tensor, q: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
-    """Per-element Gaussian KL ``(p-q)^2 / (2 sigma^2)``; ``sigma`` ``[S']`` broadcasts over ``[B, S', *latent]``."""
-    sigma = sigma.reshape(1, -1, *([1] * (p.ndim - 2)))
+    """Elementwise Gaussian KL over ``[B, S', *latent]`` with std ``[S']`` or ``[B, S']``."""
+    shape = (1, -1) if sigma.ndim == 1 else sigma.shape
+    sigma = sigma.reshape(*shape, *([1] * (p.ndim - 2)))
     return (p - q) ** 2 / (2 * sigma**2)
 
 
@@ -224,7 +226,7 @@ def transition_sigma(
     stage: Any,
     *,
     segment: "Segment",
-    target_steps: List[int],
+    target_steps: Union[List[int], torch.Tensor],
     eta: float,
     device: torch.device,
     add_coefficient: bool = True,
@@ -235,7 +237,7 @@ def transition_sigma(
     if segment.sigmas is None:
         raise ValueError("transition_sigma requires segment.sigmas (add_coefficient=True).")
     sigmas = segment.sigmas.to(device=device, dtype=torch.float32)
-    idx = torch.tensor(target_steps, dtype=torch.long, device=device)
+    idx = torch.as_tensor(target_steps, dtype=torch.long, device=device)
     s = sigmas[idx]
     s_next = sigmas[idx + 1]
     sigma_max = sigmas[1] if int(sigmas.shape[0]) > 1 else torch.tensor(0.99, device=device, dtype=sigmas.dtype)
@@ -252,8 +254,9 @@ def reference_kl_loss(
     target_steps: List[int],
     new_means: Optional[torch.Tensor],
     algo: str,
+    new_replay: Optional["ReplayResult"] = None,
 ) -> torch.Tensor:
-    """Mean Gaussian KL(pi_theta || pi_ref) over ``[B, S']`` per-step means; grad flows through ``new_means`` only."""
+    """Mean reference KL with detached reference/stds; per-row dual-stream semantics in algorithms/README.md."""
     if new_means is None:
         raise RuntimeError(
             f"{algo}: beta>0 requires stage.replay() to return prev_sample_means, "
@@ -269,16 +272,33 @@ def reference_kl_loss(
             "for the adapter-disabled reference forward."
         )
     ref_means = result.prev_sample_means.detach().to(dtype=new_means.dtype, device=new_means.device)
-    sigma_t = transition_sigma(
-        stage,
-        segment=segment,
-        target_steps=target_steps,
-        eta=params.eta,
-        device=new_means.device,
-        add_coefficient=True,
-    )
+    per_sample_steps = segment.sde_index_per_sample
+    if new_replay is not None and new_replay.video_transition_stds is not None:
+        sigma_t = new_replay.video_transition_stds.detach()
+    else:
+        sigma_t = transition_sigma(
+            stage,
+            segment=segment,
+            target_steps=target_steps if per_sample_steps is None else per_sample_steps,
+            eta=params.eta,
+            device=new_means.device,
+            add_coefficient=True,
+        )
+        if per_sample_steps is not None:
+            sigma_t = sigma_t.reshape(-1, 1)  # [B, 1]
     kl_per_elem = gaussian_kl_div(new_means, ref_means, sigma_t)
-    return kl_per_elem.mean(dim=tuple(range(2, kl_per_elem.ndim))).mean()
+    kl_per_step = kl_per_elem.mean(dim=tuple(range(2, kl_per_elem.ndim)))
+    if new_replay is not None and new_replay.audio_prev_sample_means is not None:
+        audio_means = new_replay.audio_prev_sample_means
+        if result.audio_prev_sample_means is None or new_replay.audio_transition_stds is None:
+            raise RuntimeError(f"{algo}: joint reference KL requires audio reference means and transition stds.")
+        ref_audio = result.audio_prev_sample_means.detach().to(audio_means)
+        audio_kl = gaussian_kl_div(audio_means, ref_audio, new_replay.audio_transition_stds.detach())
+        n_video, n_audio = new_means[0, 0].numel(), audio_means[0, 0].numel()
+        kl_per_step = kl_per_step * (n_video / (n_video + n_audio)) + audio_kl.mean(
+            dim=tuple(range(2, audio_kl.ndim))
+        ) * (n_audio / (n_video + n_audio))
+    return kl_per_step.mean()
 
 
 def resolve_reference_model(backend: Any, *, beta: float, algo: str, coef_name: str = "beta") -> Any:

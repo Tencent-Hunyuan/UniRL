@@ -289,9 +289,22 @@ class BatchedStepReplayMixin:
                     prev_mean_all = torch.cat([prev_mean_all, audio_prev_mean_all], dim=1)
 
             if per_sample:
+                video_std = self.strategy.transition_std(
+                    sigma=video_sigma_all, sigma_next=video_sigma_next_all, eta=params.eta, sigma_max=sigma_max
+                ).reshape(B, 1)
+                audio_std = (
+                    a_strat.transition_std(
+                        sigma=audio_sigma_all, sigma_next=audio_sigma_next_all, eta=params.eta, sigma_max=a_sigma_max
+                    ).reshape(B, 1)
+                    if audio_in_policy
+                    else None
+                )
                 return ReplayResult(
                     log_probs=log_prob_all.reshape(B, 1).to(dtype=self.logprob_dtype),
                     prev_sample_means=prev_mean_all.unsqueeze(1),
+                    audio_prev_sample_means=audio_prev_mean_all.unsqueeze(1) if audio_in_policy else None,
+                    video_transition_stds=video_std,
+                    audio_transition_stds=audio_std,
                 )
 
             log_prob_parts.append(log_prob_all.view(S, B).transpose(0, 1).contiguous().to(dtype=self.logprob_dtype))

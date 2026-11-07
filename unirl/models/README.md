@@ -97,6 +97,10 @@ it is the authoritative bundle / pipeline / stage / conditions contract.
   point, matching single-stream replay and Flash's upstream coefficient. Callers
   initialize both strategies with their schedules before joint replay so each
   terminal sigma is preserved; H3 does this in `MiniMaxH3DiffusionStage.replay`.
+  For reference KL, the per-sample branch returns video means in `prev_sample_means`,
+  plus `audio_prev_sample_means`, `video_transition_stds`, and `audio_transition_stds`.
+  Audio statistics are unset for video-only policy; the shared-step path leaves
+  the three optional stream statistics unset.
 - **`trainable_module()` is on the stage, not the bundle.** The backend reaches the
   model via `getattr(bundle, trainable_attr)`; engines via
   `getattr(pipeline, stage_attr).trainable_module()`. Keep both pointing at the same
