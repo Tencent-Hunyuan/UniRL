@@ -347,14 +347,17 @@ class DiffusionTrainer(BaseTrainer):
         self._uses_ema = algo_cls.requires_ema_rollout
         self._flash_per_sample_sde = algo_cls.requires_per_sample_sde_index
         self._flash_engine_per_sample_sde = bool(algorithm_cfg.get("engine_per_sample_sde", False))
+        if self._flash_per_sample_sde and not getattr(
+            rollout_parsed["role_cls"], "supports_per_sample_sde_index", False
+        ):
+            raise ValueError(
+                "FlashGRPO requires a supporting rollout engine with supports_per_sample_sde_index (trainside) "
+                "in both modes; remote engines (sglang_diffusion/fastvideo) do not support the Flash strategy "
+                "and pre-return stamping. Use trainside or a supported non-Flash algorithm."
+            )
         if self._flash_engine_per_sample_sde:
             if not self._flash_per_sample_sde or not algorithm_cfg.get("batch_normalize_tgr", False):
                 raise ValueError("engine_per_sample_sde requires FlashGRPO with algorithm.batch_normalize_tgr=true.")
-            if not getattr(rollout_parsed["role_cls"], "supports_per_sample_sde_index", False):
-                raise ValueError(
-                    "engine_per_sample_sde requires a supporting rollout engine (trainside); "
-                    "disable it to retain driver-side grouping on remote engines."
-                )
             if rollout_cfg.get("forward_batch_size") != 1:
                 raise ValueError(
                     "engine_per_sample_sde requires rollout.forward_batch_size=1 so FSDP ranks run equal forwards."
@@ -856,17 +859,17 @@ class DiffusionTrainer(BaseTrainer):
         for position, step in enumerate(self._flash_prompt_steps(inputs, rollout_id)):
             positions_by_step.setdefault(step, []).append(position)
 
-        return [
-            (
-                step,
-                self._build_request_sample(
-                    inputs.select(torch.tensor(positions_by_step[step], dtype=torch.long)),
-                    rollout_id,
-                    sde_index_override=step,
-                ),
+        groups: List[Tuple[int, Sample]] = []
+        for step in sorted(positions_by_step):
+            request = self._build_request_sample(
+                inputs.select(torch.tensor(positions_by_step[step], dtype=torch.long)),
+                rollout_id,
+                sde_index_override=step,
             )
-            for step in sorted(positions_by_step)
-        ]
+            frontier = request.parts[-1]
+            frontier.sde_index_per_sample = torch.full((frontier.batch_size,), step, dtype=torch.long)
+            groups.append((step, request))
+        return groups
 
     def _prepare_for_save(self) -> None:
         """Checkpointing reads the trainer's weights, and evaluate() may have parked them."""
@@ -1013,7 +1016,6 @@ class DiffusionTrainer(BaseTrainer):
         *,
         sync_weights: bool = False,
         rollout_id: int = 0,
-        group_sde_indices: Optional[Sequence[int]],
     ) -> Tuple[Sample, float]:
         """One ``rollout → reward → advantage`` pass over one or more request Samples."""
         generated = self._generate_many_with_residency(
@@ -1022,10 +1024,6 @@ class DiffusionTrainer(BaseTrainer):
             sleep_rollout=not self._residency.policy.rollout_resident,
             score_inline=self.reward_stack is not None,
         )
-        if group_sde_indices is not None:
-            generated = [
-                self.rollout.stamp_sde_index_per_sample(item, step) for item, step in zip(generated, group_sde_indices)
-            ]
         sample = generated[0] if len(generated) == 1 else Sample.concat(generated)
         # With no reward configured, ``part.rewards`` stays None and the block below no-ops.
         if self.reward is not None and self.reward_stack is None:
@@ -1073,20 +1071,16 @@ class DiffusionTrainer(BaseTrainer):
             # algorithm builds one request.
             if self._flash_engine_per_sample_sde:
                 request_samples = [self._build_flash_engine_request(inputs, rollout_id)]
-                group_steps = None
             elif self._flash_per_sample_sde:
                 groups = self._build_flash_request_samples(inputs, rollout_id)
                 request_samples = [item for _, item in groups]
-                group_steps: Optional[List[int]] = [step for step, _ in groups]
             else:
                 request_samples = [self._build_request_sample(inputs, rollout_id)]
-                group_steps = None
             sync_weights = (rollout_id > 0 and rollout_id % weight_sync_interval == 0) or (rollout_id == force_sync_at)
             sample, mean_reward = self._rollout_and_score(
                 request_samples,
                 sync_weights=sync_weights,
                 rollout_id=rollout_id,
-                group_sde_indices=group_steps,
             )
             samples.append(sample)
             window_rewards.append(mean_reward)

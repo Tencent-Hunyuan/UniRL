@@ -83,7 +83,20 @@ class TrainsideRolloutEngine(BaseRolloutEngine):
                     fbs = self.forward_batch_size
                     gen = sample.parts[-1]
                     bs = gen.batch_size
+                    single_sde_index = None
                     if gen.sde_index_per_sample is not None:
+                        steps = gen.sde_index_per_sample.unique().tolist()
+                        if len(steps) == 1:
+                            single_sde_index = steps[0]
+                            if not isinstance(gen.sampling_params, DiffusionSamplingParams):
+                                raise ValueError("Per-sample SDE requests require DiffusionSamplingParams.")
+                            if not 0 <= single_sde_index < gen.sampling_params.num_inference_steps - 1:
+                                raise ValueError(
+                                    "Per-sample SDE steps must be in [0, num_inference_steps-2]; "
+                                    "narrow the scheduler candidate pool."
+                                )
+                            gen.sampling_params = replace(gen.sampling_params, sde_indices=[single_sde_index])
+                    if gen.sde_index_per_sample is not None and single_sde_index is None:
                         out = self._generate_per_sample_sde(sample)
                     elif fbs is None or bs <= fbs:
                         out = self.pipeline.generate(sample)
@@ -95,6 +108,9 @@ class TrainsideRolloutEngine(BaseRolloutEngine):
                             chunk = self.pipeline.generate(Sample(parts=[*input_parts, gen.slice(start, end)]))
                             gen_chunks.append(chunk.parts[-1])
                         out = Sample(parts=[*input_parts, Part.concat(gen_chunks)])
+                    if single_sde_index is not None:
+                        stamp_sde_index_per_sample(out.parts[-1], single_sde_index)
+                        out.parts[-1].sde_index_per_sample = None
             finally:
                 for m, mode in zip(self.models, prev_modes):
                     m.train(mode)

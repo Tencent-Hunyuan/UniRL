@@ -499,7 +499,8 @@ without driver-authored x_T. `media_log_interval` does not apply
   pipeline and backend; a second `from_config` would silently desync replay. See [`../models/README.md`](../models/README.md).
 - **By default, FlashGRPO groups requests on the driver.** `requires_per_sample_sde_index`
   makes the trainer put prompt `i` in stratum `i % pool_size` and issue one `generate` per step
-  group inside a single residency window, then stamp and concatenate the groups into one track.
+  group inside a single residency window. Each request carries its step on the frontier Part;
+  the engine stamps before returning, and the driver concatenates the groups into one track.
   Flash-GRPO wants exactly this granularity: the paper assigns one timestep per
   prompt with all of that prompt's rollouts sharing it, and asks for stratified assignment so the
   whole candidate pool is covered each rollout. Per-trajectory timesteps are not required.
@@ -519,8 +520,9 @@ without driver-authored x_T. `media_log_interval` does not apply
   clears the Part's request-only field; `segment.sde_index_per_sample` is the output authority.
   Only `batch_size % rollout.dp_size == 0` remains; reward/train geometry checks still apply.
   Equal row counts and fixed denoising lengths preserve FSDP forward/collective counts even
-  if ranks visit different steps. Remote engines keep driver grouping unless explicitly
-  requested, in which case unsupported engines fail rather than falling back.
+  if ranks visit different steps. Both FlashGRPO modes require an engine declaring
+  `supports_per_sample_sde_index`: sglang_diffusion/fastvideo do not support the Flash
+  strategy and pre-return stamp, so the trainer rejects them at startup in either mode.
 - **Engine grouping requires sample/step-keyed noise.** H3 declares
   `supports_order_independent_sde_noise` because its pipeline passes sample ids to both
   stream generators. Wan does not declare it and is rejected at algorithm construction:
@@ -534,13 +536,15 @@ without driver-authored x_T. `media_log_interval` does not apply
   so duplicate root ids or an empty root part yield fewer groups than rows and would silently
   collapse the whole batch onto one request and one sigma. The trainer compares the two counts
   and raises instead.
-- **Driver-grouped Flash stamping runs on the producing workers.** `Worker.call` returns
-  TensorRef proxies, including trajectory indices; DP collect and inline reward scoring do
-  not materialize them on the driver. The trainer issues one
-  `BaseRolloutEngine.stamp_sde_index_per_sample` DP RPC per generated group before concat.
-  `Worker.call` resolves the shard locally, and the shared helper slices both streams there;
-  no trajectory is hydrated on the driver. This RPC uses no model forward or RNG and can run
-  after rollout weights have been parked. It preserves each engine's generation batch size.
+- **Both FlashGRPO modes stamp inside trainside `generate`, before `Worker.call` packs proxies.**
+  A request whose `Part.sde_index_per_sample` contains only one step pins `sde_indices=[k]`
+  and uses the original generation batch/chunk path, then stamps the output once. It requires
+  neither `forward_batch_size=1` nor sample-keyed noise: Wan's batching and RNG order remain
+  unchanged. Multiple step values use the existing per-row grouping path and its stricter
+  guards. Both branches clear the output Part's request field; the segment owns the result.
+  There is no stamp RPC or driver-side hydration for normalization. Decoded media and
+  conditions are not re-stored for stamping, and SP non-head ranks do not receive
+  collected trajectories a second time.
 - **A merged FlashGRPO track's shared fields are not per-sample truth.** The worker-side helper
   `models.types.per_sample_replay.stamp_sde_index_per_sample` packs both
   `segment.latents` and `segment.aux_latents` into `[before, after, final]` slots, normalizes

@@ -9,7 +9,6 @@ import torch
 
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
-from unirl.models.types.per_sample_replay import stamp_sde_index_per_sample
 from unirl.types.sample import Sample
 
 
@@ -76,12 +75,6 @@ class BaseRolloutEngine(Remote, ABC):
     @abstractmethod
     def generate(self, sample: Sample) -> Sample:
         """Synchronously fill and return one request ``Sample``; each concrete contract owns its dispatch mode."""
-
-    @distributed(dispatch_mode=Dispatch.DP_SCATTER)
-    def stamp_sde_index_per_sample(self, sample: Sample, sde_index: int) -> Sample:
-        """Normalize a driver-grouped Flash rollout on its workers; see trainer/README.md."""
-        stamp_sde_index_per_sample(sample.parts[-1], sde_index)
-        return sample
 
     def generate_on_slot(self, sample: Sample) -> Sample:
         """Undecorated per-engine entry point for driver-side lane dispatch."""
