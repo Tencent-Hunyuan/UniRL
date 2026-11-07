@@ -13,7 +13,6 @@ from omegaconf import DictConfig, OmegaConf
 
 from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
-from unirl.models.types.per_sample_replay import stamp_sde_index_per_sample
 from unirl.sde.index_schedule import AllSDEScheduler
 from unirl.train.configs import FSDPConfig, resolve_fsdp_mesh_shape
 from unirl.train.stack import TrainStepResult
@@ -1024,8 +1023,9 @@ class DiffusionTrainer(BaseTrainer):
             score_inline=self.reward_stack is not None,
         )
         if group_sde_indices is not None:
-            for item, step in zip(generated, group_sde_indices):
-                stamp_sde_index_per_sample(item.parts[-1], step)
+            generated = [
+                self.rollout.stamp_sde_index_per_sample(item, step) for item, step in zip(generated, group_sde_indices)
+            ]
         sample = generated[0] if len(generated) == 1 else Sample.concat(generated)
         # With no reward configured, ``part.rewards`` stays None and the block below no-ops.
         if self.reward is not None and self.reward_stack is None:

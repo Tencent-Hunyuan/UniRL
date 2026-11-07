@@ -498,9 +498,9 @@ without driver-authored x_T. `media_log_interval` does not apply
 - **The bundle must be shared, not rebuilt** — the trainer injects one bundle into both
   pipeline and backend; a second `from_config` would silently desync replay. See [`../models/README.md`](../models/README.md).
 - **By default, FlashGRPO groups requests on the driver.** `requires_per_sample_sde_index`
-  makes the trainer put prompt `i` in stratum `i % pool_size`, issue one `generate` per step group,
-  stamp `segment.sde_index_per_sample`, and concatenate the groups into one track *inside a single
-  residency window*. Flash-GRPO wants exactly this granularity: the paper assigns one timestep per
+  makes the trainer put prompt `i` in stratum `i % pool_size` and issue one `generate` per step
+  group inside a single residency window, then stamp and concatenate the groups into one track.
+  Flash-GRPO wants exactly this granularity: the paper assigns one timestep per
   prompt with all of that prompt's rollouts sharing it, and asks for stratified assignment so the
   whole candidate pool is covered each rollout. Per-trajectory timesteps are not required.
 - **Driver-grouped FlashGRPO requires `batch_size % (pool_size * rollout dp_size) == 0`.** Each step
@@ -534,8 +534,15 @@ without driver-authored x_T. `media_log_interval` does not apply
   so duplicate root ids or an empty root part yield fewer groups than rows and would silently
   collapse the whole batch onto one request and one sigma. The trainer compares the two counts
   and raises instead.
-- **A merged FlashGRPO track's shared fields are not per-sample truth.** The trainer calls
-  `models.types.per_sample_replay.stamp_sde_index_per_sample`, which packs both
+- **Driver-grouped Flash stamping runs on the producing workers.** `Worker.call` returns
+  TensorRef proxies, including trajectory indices; DP collect and inline reward scoring do
+  not materialize them on the driver. The trainer issues one
+  `BaseRolloutEngine.stamp_sde_index_per_sample` DP RPC per generated group before concat.
+  `Worker.call` resolves the shard locally, and the shared helper slices both streams there;
+  no trajectory is hydrated on the driver. This RPC uses no model forward or RNG and can run
+  after rollout weights have been parked. It preserves each engine's generation batch size.
+- **A merged FlashGRPO track's shared fields are not per-sample truth.** The worker-side helper
+  `models.types.per_sample_replay.stamp_sde_index_per_sample` packs both
   `segment.latents` and `segment.aux_latents` into `[before, after, final]` slots, normalizes
   `segment.indices` / `segment.sde_indices`, and clears `frontier.sampling_params.sde_indices` so
   `Sample.concat` / `Part.concat` can merge the groups. `sde_index_per_sample` (a `CONCAT` field) is
