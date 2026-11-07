@@ -534,8 +534,8 @@ without driver-authored x_T. `media_log_interval` does not apply
   so duplicate root ids or an empty root part yield fewer groups than rows and would silently
   collapse the whole batch onto one request and one sigma. The trainer compares the two counts
   and raises instead.
-- **A merged FlashGRPO track's shared fields are not per-sample truth.** `_stamp_sde_index_per_sample`
-  delegates to `models.types.per_sample_replay.stamp_sde_index_per_sample`, which packs both
+- **A merged FlashGRPO track's shared fields are not per-sample truth.** The trainer calls
+  `models.types.per_sample_replay.stamp_sde_index_per_sample`, which packs both
   `segment.latents` and `segment.aux_latents` into `[before, after, final]` slots, normalizes
   `segment.indices` / `segment.sde_indices`, and clears `frontier.sampling_params.sde_indices` so
   `Sample.concat` / `Part.concat` can merge the groups. `sde_index_per_sample` (a `CONCAT` field) is

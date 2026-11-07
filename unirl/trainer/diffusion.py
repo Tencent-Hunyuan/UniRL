@@ -869,10 +869,6 @@ class DiffusionTrainer(BaseTrainer):
             for step in sorted(positions_by_step)
         ]
 
-    def _stamp_sde_index_per_sample(self, sample: Sample, sde_index: int) -> None:
-        """Stamp ``segment.sde_index_per_sample`` and normalize shared step metadata for group concat."""
-        stamp_sde_index_per_sample(sample.parts[-1], sde_index)
-
     def _prepare_for_save(self) -> None:
         """Checkpointing reads the trainer's weights, and evaluate() may have parked them."""
         self._residency.enter(Role.TRAIN)
@@ -1029,7 +1025,7 @@ class DiffusionTrainer(BaseTrainer):
         )
         if group_sde_indices is not None:
             for item, step in zip(generated, group_sde_indices):
-                self._stamp_sde_index_per_sample(item, step)
+                stamp_sde_index_per_sample(item.parts[-1], step)
         sample = generated[0] if len(generated) == 1 else Sample.concat(generated)
         # With no reward configured, ``part.rewards`` stays None and the block below no-ops.
         if self.reward is not None and self.reward_stack is None:
