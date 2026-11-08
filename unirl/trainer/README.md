@@ -529,9 +529,10 @@ without driver-authored x_T. `media_log_interval` does not apply
   subtree, so its rows share one SDE step and use the existing chunked generation path.
   Equal row counts give each rank `ceil(samples_per_prompt / forward_batch_size)` pipeline
   calls without `reward_stack`; with it, calls are counted per micro as
-  `ceil(rows_per_rank_in_micro / forward_batch_size)`. Mixed-step shards still require
-  `forward_batch_size=1`; reward/train geometry
-  checks and model-specific batch limits still apply. Both FlashGRPO modes require an engine declaring
+  `ceil(rows_per_rank_in_micro / forward_batch_size)`.
+  Mixed-step shards still require `forward_batch_size=1`.
+  Reward/train geometry checks and model-specific batch limits still apply.
+  Both FlashGRPO modes require an engine declaring
   `supports_per_sample_sde_index`: sglang_diffusion/fastvideo do not support the Flash
   strategy and pre-return stamp, so the trainer rejects them at startup in either mode.
 - **Engine-mode eval chunks must stay within one prompt.** When `eval_interval>0`,
