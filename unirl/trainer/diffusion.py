@@ -355,10 +355,10 @@ class DiffusionTrainer(BaseTrainer):
                 "in both modes; remote engines (sglang_diffusion/fastvideo) do not support the Flash strategy "
                 "and pre-return stamping. Use trainside or a supported non-Flash algorithm."
             )
+        forward_batch_size = rollout_cfg.get("forward_batch_size")
         if self._flash_engine_per_sample_sde:
             if not self._flash_per_sample_sde or not algorithm_cfg.get("batch_normalize_tgr", False):
                 raise ValueError("engine_per_sample_sde requires FlashGRPO with algorithm.batch_normalize_tgr=true.")
-            forward_batch_size = rollout_cfg.get("forward_batch_size")
             if type(forward_batch_size) is not int or forward_batch_size < 1:
                 raise ValueError("engine_per_sample_sde requires rollout.forward_batch_size to be a positive integer.")
         if algorithm_cfg.get("batch_normalize_tgr", False):

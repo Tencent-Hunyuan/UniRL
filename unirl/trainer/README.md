@@ -515,7 +515,7 @@ without driver-authored x_T. `media_log_interval` does not apply
   positive integer `rollout.forward_batch_size`. The driver uses the same rollout-id permutation and
   `position % pool_size` prompt assignment, but sends one request with CONCAT
   `Part.sde_index_per_sample`, mapped by root id to the actual frontier row order.
-  With `forward_batch_size=1`, each rank groups locally, generates every row separately,
+  With `forward_batch_size=1`, a mixed-step rank groups locally, generates every row separately,
   stamps both latent streams with the shared helper, and restores original row order.
   After stamping, the engine clears the Part's request-only field;
   `segment.sde_index_per_sample` is the output authority.
