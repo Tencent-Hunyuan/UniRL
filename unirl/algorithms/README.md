@@ -210,8 +210,9 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   `policy_loss` is the TGR-weighted clipped objective, `kl_ref_mean` the raw KL,
   `kl_loss` is `beta * kl_ref_mean`, and `total_loss` is their sum. These are micro
   means before the trainer's `loss_scale`, matching UniRL's metric aggregation.
-  Enabling KL adds one no-gradient replay per micro (one extra forward per row
-  with H3's batch-1 geometry), with no extra backward or reference weight copy.
+  Enabling KL adds one batched no-gradient replay forward per micro and another
+  FSDP parameter all-gather; the reference forward runs while the policy graph
+  remains resident in GPU memory. It adds no backward or reference weight copy.
   The default `beta: 0` resolves no reference, performs no reference forward,
   emits no new KL metrics, and preserves the existing loss/gradient path bit-for-bit.
 - **`adv_clip_max` defaults to `5.0`, copying upstream.** Advantages are clamped before the ratio

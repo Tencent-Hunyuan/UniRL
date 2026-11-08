@@ -288,10 +288,14 @@ def reference_kl_loss(
             sigma_t = sigma_t.reshape(-1, 1)  # [B, 1]
     kl_per_elem = gaussian_kl_div(new_means, ref_means, sigma_t)
     kl_per_step = kl_per_elem.mean(dim=tuple(range(2, kl_per_elem.ndim)))
-    if new_replay is not None and new_replay.audio_prev_sample_means is not None:
+    if new_replay is not None and (
+        getattr(stage, "_audio_in_policy", getattr(stage, "audio_joint_sde", False))
+        or new_replay.audio_prev_sample_means is not None
+        or new_replay.audio_transition_stds is not None
+    ):
         audio_means = new_replay.audio_prev_sample_means
-        if result.audio_prev_sample_means is None or new_replay.audio_transition_stds is None:
-            raise RuntimeError(f"{algo}: joint reference KL requires audio reference means and transition stds.")
+        if audio_means is None or result.audio_prev_sample_means is None or new_replay.audio_transition_stds is None:
+            raise RuntimeError(f"{algo}: joint reference KL requires audio policy/reference means and transition stds.")
         ref_audio = result.audio_prev_sample_means.detach().to(audio_means)
         audio_kl = gaussian_kl_div(audio_means, ref_audio, new_replay.audio_transition_stds.detach())
         n_video, n_audio = new_means[0, 0].numel(), audio_means[0, 0].numel()
