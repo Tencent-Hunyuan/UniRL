@@ -93,7 +93,7 @@ class MiniMaxH3Pipeline(Pipeline):
             self.audio_decode.audio_vae = module
 
     def sleep(self) -> None:
-        """Release CUDA rollout-only modules without CPU copies; see trainer/README.md."""
+        """Release CUDA rollout-only modules without CPU copies; see README.md."""
         if self.config.vae_components_on_cpu:
             return
         for name in ("vae", "audio_vae", "text_encoder"):
