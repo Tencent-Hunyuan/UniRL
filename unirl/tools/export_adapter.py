@@ -35,12 +35,13 @@ def export_adapter_state_dict(
     *,
     adapter: str = "default",
     peft_prefix: str = PEFT_PREFIX,
+    shadow_prefix: str = "",
 ) -> Dict[str, torch.Tensor]:
     """Convert UniRL PEFT-injected LoRA keys to PEFT adapter-file keys."""
     pairs: Dict[str, Dict[str, torch.Tensor]] = {}
     out: Dict[str, torch.Tensor] = {}
     for suffix in ("lora_A", "lora_B"):
-        marker = f".{suffix}.{adapter}.weight"
+        marker = f".{suffix}.{adapter}.{shadow_prefix}weight"
         for key, value in state_dict.items():
             if not key.endswith(marker):
                 continue
@@ -132,6 +133,7 @@ def main() -> None:
     parser.add_argument("--base", required=True, help="HF repo id / local path of the base model")
     parser.add_argument("--output", required=True, help="output folder for the PEFT adapter")
     parser.add_argument("--adapter", default="default", help='adapter name to export, e.g. "default" or "old"')
+    parser.add_argument("--ema", action="store_true", help="export the ema_cfg mirror instead of live LoRA weights")
     parser.add_argument(
         "--peft-prefix",
         default=PEFT_PREFIX,
@@ -158,6 +160,12 @@ def main() -> None:
 
     checkpoint = load_training_checkpoint(args.checkpoint)
     state_dict = checkpoint["policy_state_dict"]
+    shadow_prefix = ""
+    if args.ema:
+        ema_config = checkpoint.get("ema_config")
+        if ema_config is None:
+            parser.error("--ema requires a checkpoint saved with backend.ema_cfg")
+        shadow_prefix = ema_config["shadow_prefix"]
     lora_config = checkpoint.get("lora_config")
     recorded = {} if lora_config is None else lora_config
 
@@ -200,6 +208,7 @@ def main() -> None:
         state_dict,
         adapter=args.adapter,
         peft_prefix=args.peft_prefix,
+        shadow_prefix=shadow_prefix,
     )
 
     os.makedirs(args.output, exist_ok=True)

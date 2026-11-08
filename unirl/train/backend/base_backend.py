@@ -6,6 +6,7 @@ import logging
 import math
 import os
 from concurrent.futures import Future
+from dataclasses import asdict
 from typing import TYPE_CHECKING, Dict, List, Literal, Optional
 
 import torch
@@ -61,6 +62,7 @@ class BaseFSDP2Backend(Remote):
     _device: torch.device
     model: nn.Module
     ema: Optional[EMA]
+    _ema_config: Optional[Dict[str, object]]
     optimizer: torch.optim.Optimizer
     scheduler: Optional[torch.optim.lr_scheduler.LRScheduler]
     fsdp_cfg: FSDPConfig
@@ -149,12 +151,14 @@ class BaseFSDP2Backend(Remote):
         self._loss_reduction_mesh = find_dtensor_mesh(model)
 
         self.ema = None
+        self._ema_config = asdict(ema_cfg) if ema_cfg is not None else None
         if shadow is not None:
             active_cfg = ema_lora_cfg or ema_cfg
             self.ema = EMA(
                 shadow=shadow,
                 decay_fn=make_decay_fn(active_cfg),
                 timing=active_cfg.timing,
+                update_interval=ema_cfg.update_interval if ema_cfg is not None else 1,
             )
 
         self.optimizer = build_optimizer(
@@ -311,6 +315,8 @@ class BaseFSDP2Backend(Remote):
                 "save_mode": mode,
                 "lora_config": self.lora_meta,
             }
+            if self._ema_config is not None:
+                meta["ema_config"] = self._ema_config
             if self.scheduler is not None:
                 meta["scheduler_state_dict"] = self.scheduler.state_dict()
 
@@ -372,6 +378,8 @@ class BaseFSDP2Backend(Remote):
             "save_mode": mode,
             "lora_config": self.lora_meta,
         }
+        if self._ema_config is not None:
+            state["ema_config"] = self._ema_config
         state.update(self._torch_checkpoint_metadata())
         if self.scheduler is not None:
             state["scheduler_state_dict"] = self.scheduler.state_dict()
@@ -443,6 +451,7 @@ class BaseFSDP2Backend(Remote):
             )
 
             meta: Dict[str, object] = torch.load(metadata_path, map_location="cpu")
+            self._check_ema_resume(meta)
             mode = meta["save_mode"]
             self._reject_meta(operation="load", checkpoint_format="dcp", mode=mode)
             has_meta_params = any(p.is_meta for p in self.model.parameters())
@@ -487,6 +496,7 @@ class BaseFSDP2Backend(Remote):
                 "(save_dir/load_dir must live on storage mounted on every node)"
             )
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        self._check_ema_resume(checkpoint)
 
         mode = checkpoint["save_mode"]
         strict = mode == "full"
@@ -501,6 +511,11 @@ class BaseFSDP2Backend(Remote):
             self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         self._optimizer_step_count = checkpoint["optimizer_step_count"]
         return checkpoint["step"]
+
+    def _check_ema_resume(self, metadata: Dict[str, object]) -> None:
+        """Refuse a missing or changed mirror EMA schedule before loading weights."""
+        if metadata.get("ema_config") != self._ema_config:
+            raise ValueError("EMA configuration differs from checkpoint; resume with the same ema_cfg.")
 
     def _reject_meta(
         self,

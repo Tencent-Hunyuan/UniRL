@@ -44,9 +44,11 @@ class EMA:
     decay_fn: Callable[[int], float]
     timing: str
     name: str = "ema"
+    update_interval: int = 1
 
     def step(self, t: int) -> None:
-        if self.timing == "optimizer_step":
+        """Consume the zero-based committed optimizer index; see readme.md for interval semantics."""
+        if self.timing == "optimizer_step" and (t + 1) % self.update_interval == 0:
             self._run(self.decay_fn(t))
 
     def on_rollout_end(self, t: int) -> None:

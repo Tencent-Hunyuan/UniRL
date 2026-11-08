@@ -94,6 +94,17 @@ class EmaFullConfig:
     target_decay: float = 0.9999
     timing: str = "optimizer_step"
     shadow_prefix: str = "shadow_"
+    update_interval: int = 1
+
+    def __post_init__(self) -> None:
+        require(
+            type(self.update_interval) is int and self.update_interval >= 1,
+            "EmaFullConfig.update_interval must be a positive integer.",
+        )
+        require(
+            self.update_interval == 1 or self.timing == "optimizer_step",
+            "EmaFullConfig.update_interval > 1 requires timing='optimizer_step'.",
+        )
 
 
 @dataclass
