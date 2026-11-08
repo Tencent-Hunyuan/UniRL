@@ -109,8 +109,7 @@ class MiniMaxH3PipelineConfig:
 
     def __post_init__(self) -> None:
         validate_precision_type(self.model_precision, field="MiniMaxH3PipelineConfig.model_precision")
-        for name in ("video_shift", "audio_shift"):
-            shift = getattr(self, name)
+        for name, shift in (("video_shift", self.video_shift), ("audio_shift", self.audio_shift)):
             if not math.isfinite(shift) or shift <= 0:
                 raise ValueError(f"MiniMaxH3PipelineConfig.{name} must be finite and > 0; got {shift!r}.")
 

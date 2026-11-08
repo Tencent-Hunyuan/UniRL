@@ -523,11 +523,10 @@ without driver-authored x_T. `media_log_interval` does not apply
   if ranks visit different steps. Both FlashGRPO modes require an engine declaring
   `supports_per_sample_sde_index`: sglang_diffusion/fastvideo do not support the Flash
   strategy and pre-return stamp, so the trainer rejects them at startup in either mode.
-- **Engine grouping requires sample/step-keyed noise.** H3 declares
-  `supports_order_independent_sde_noise` because its pipeline passes sample ids to both
-  stream generators. Wan does not declare it and is rejected at algorithm construction:
-  regrouping its global RNG draws would change trajectories. The engine checks this again
-  for directly supplied per-sample requests.
+- **Engine grouping requires a stage declaring sample/step-keyed noise.**
+  `supports_order_independent_sde_noise` must be true: regrouping global RNG draws
+  would change trajectories. The algorithm rejects stages without this capability;
+  the engine checks it again for directly supplied per-sample requests.
 - **The FlashGRPO groups merge before advantages.** The concatenation must happen before
   `compute_advantages`, because advantage normalization is batch-wide over the merged track. Each
   prompt's own rollouts already share one step, so the merged track still compares like with like.
@@ -539,8 +538,8 @@ without driver-authored x_T. `media_log_interval` does not apply
 - **Both FlashGRPO modes stamp inside trainside `generate`, before `Worker.call` packs proxies.**
   A request whose `Part.sde_index_per_sample` contains only one step pins `sde_indices=[k]`
   and uses the original generation batch/chunk path, then stamps the output once. It requires
-  neither `forward_batch_size=1` nor sample-keyed noise: Wan's batching and RNG order remain
-  unchanged. Multiple step values use the existing per-row grouping path and its stricter
+  neither `forward_batch_size=1` nor sample-keyed noise: the original batching and RNG order
+  remain unchanged. Multiple step values use the existing per-row grouping path and its stricter
   guards. Both branches clear the output Part's request field; the segment owns the result.
   There is no stamp RPC or driver-side hydration for normalization. Decoded media and
   conditions are not re-stored for stamping, and SP non-head ranks do not receive

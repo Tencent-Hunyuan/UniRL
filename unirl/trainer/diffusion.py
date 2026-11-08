@@ -362,7 +362,7 @@ class DiffusionTrainer(BaseTrainer):
         if self._flash_engine_per_sample_sde:
             if not self._flash_per_sample_sde or not batch_normalize_tgr:
                 raise ValueError("engine_per_sample_sde requires FlashGRPO with algorithm.batch_normalize_tgr=true.")
-            if rollout_cfg.get("forward_batch_size") != 1:
+            if rollout_cfg["forward_batch_size"] != 1:
                 raise ValueError(
                     "engine_per_sample_sde requires rollout.forward_batch_size=1 so FSDP ranks run equal forwards."
                 )
