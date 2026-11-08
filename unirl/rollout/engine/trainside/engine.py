@@ -150,19 +150,15 @@ class TrainsideRolloutEngine(BaseRolloutEngine):
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def sleep(self) -> None:
-        """Delegate optional rollout-only offload to the pipeline, outside generation."""
+        """Release pipeline-owned rollout resources outside generation."""
         with self.lock:
-            sleep = getattr(self.pipeline, "sleep", None)
-            if sleep is not None:
-                sleep()
+            self.pipeline.sleep()
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def wake_up(self) -> None:
-        """Restore optional pipeline-owned rollout resources before generation."""
+        """Restore pipeline-owned rollout resources before generation."""
         with self.lock:
-            wake_up = getattr(self.pipeline, "wake_up", None)
-            if wake_up is not None:
-                wake_up()
+            self.pipeline.wake_up()
 
     def shutdown(self) -> None:
         with self.lock:

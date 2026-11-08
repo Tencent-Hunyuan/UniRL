@@ -91,8 +91,9 @@ stay swappable by `_target_`.
   (`rollout_resident: true`) is not
   slept even when generation raises: the policy says its weights stay put, and the
   caller that set it owns the peak.
-  For H3 trainside with `rollout_resident=false` and `vae_components_on_cpu=false`,
-  engine `sleep`/`wake_up` delegate to the pipeline to release CUDA video/audio
+  Trainside engine `sleep`/`wake_up` call the typed `Pipeline` lifecycle directly;
+  the base methods keep resources resident by default. With `rollout_resident=false`
+  and `vae_components_on_cpu=false`, H3 overrides release CUDA video/audio
   VAEs and any CUDA text encoder after decoding (and inline `reward_stack`
   scoring), without retaining per-rank CPU weight copies, then reload through the
   initial loaders on the original devices before the next rollout or eval, while

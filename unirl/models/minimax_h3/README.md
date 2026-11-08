@@ -12,3 +12,7 @@
   The [FlashGRPO recipe](../../../examples/diffusion/minimax_h3/minimax_h3_t2va_flashgrpo.yaml)
   enables this path; its shared engine requirements live in
   [`trainer/README.md`](../../trainer/README.md#gotchas).
+- **Checkpoint overrides default only when `None`.** `vae_ckpt_path` and
+  `text_encoder_ckpt_path` otherwise reach their loaders unchanged, including
+  invalid empty paths. Initial construction and wake use the same loaders;
+  see the [residency contract](../../trainer/README.md#gotchas).

@@ -29,9 +29,8 @@ def load_minimax_h3_vae(config: MiniMaxH3PipelineConfig, *, component: str, devi
         "audio_vae": (AutoencoderKLMiniMaxH3Audio, config.audio_vae_dtype),
     }[component]
     dtype = parse_torch_dtype(raw_dtype, field_name=f"{component}_dtype")
-    module = model_cls.from_pretrained(
-        config.vae_ckpt_path or config.pretrained_model_ckpt_path, subfolder=component, torch_dtype=dtype
-    )
+    path = config.pretrained_model_ckpt_path if config.vae_ckpt_path is None else config.vae_ckpt_path
+    module = model_cls.from_pretrained(path, subfolder=component, torch_dtype=dtype)
     return module.to(device).eval().requires_grad_(False)
 
 
@@ -41,9 +40,8 @@ def load_minimax_h3_text_encoder(
     """Load the frozen conditioner and its assets identically for construction and wake."""
     raw_dtype = config.text_encoder_dtype if config.text_encoder_dtype is not None else config.model_precision
     dtype = parse_torch_dtype(raw_dtype, field_name="text_encoder_dtype")
-    module, processor, tokenizer = load_minimax_h3_conditioner(
-        config.text_encoder_ckpt_path or config.pretrained_model_ckpt_path, dtype
-    )
+    path = config.pretrained_model_ckpt_path if config.text_encoder_ckpt_path is None else config.text_encoder_ckpt_path
+    module, processor, tokenizer = load_minimax_h3_conditioner(path, dtype)
     return module.to(device), processor, tokenizer
 
 
