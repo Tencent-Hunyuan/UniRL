@@ -1,6 +1,6 @@
 # MiniMax-H3
 
-> **Where it fits:** text-to-video/audio rollout and replay over one shared bundle.
+> **Where it fits:** trainside text-to-video/audio rollout and replay over one shared bundle.
 > In: prompts and sampling parameters. Out: video, audio, and diffusion trajectories.
 > Full map: [`../README.md`](../README.md).
 
@@ -36,3 +36,26 @@
 - **Checkpoint overrides default only when `None`.** `vae_ckpt_path` and
   `text_encoder_ckpt_path` otherwise reach their loaders unchanged, including
   invalid empty paths.
+- **A batched rollout shares one packed layout and one SDE step list.**
+  `MiniMaxH3DiffusionStage.generate` accepts `[B, rows, channels]` video/audio
+  latents with the same geometry, text length after trimming right-padding, and
+  `sde_indices` for every row. Geometry and schedules are request-shared;
+  mismatched latent shapes or text lengths are rejected before the forward.
+  The existing transformer batch axis keeps attention documents independent;
+  it does not concatenate samples into one sequence.
+- **Flash-GRPO engine-mode batching requires one prompt per rank.**
+  Set trainer `batch_size == rollout dp_size` to use
+  `rollout.forward_batch_size > 1`; the trainside engine pins the shared
+  `sde_indices` before chunking and rejects mixed-step shards for batched
+  forwards. Keep `stack.micro_batch_size=1` for training. See
+  [`../../trainer/README.md`](../../trainer/README.md).
+- **Batched forwards need not be bit-identical to serial forwards.**
+  GEMM batch geometry can change rounding. B=1 keeps its original operations;
+  each row's denoising noise remains keyed by sample ID, step and base seed,
+  with a separate audio salt. Supply one seed key per row for order-independent
+  noise. The engine retains each row's `[before, after, final]` video/audio
+  slots and joint SDE log-probability.
+- **Both VAEs decode one row at a time and return CPU media.**
+  This keeps decode activations at B=1 even when denoising is batched. The audio
+  VAE's batch axis is the two stereo channels of a single sample, not rollout
+  rows. Decoded media retain input row order; CPU media storage grows with B.

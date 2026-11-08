@@ -45,7 +45,7 @@ class MiniMaxH3Conditions(Batch):
         require(
             lengths.numel() > 0 and bool((lengths == lengths[0]).all()),
             f"MiniMaxH3Conditions.trim_text_padding: one packed forward requires one text length, got "
-            f"{lengths.tolist()}; slice to micro_batch_size=1 first",
+            f"{lengths.tolist()}; batch only equal-length prompts or use forward_batch_size=1",
         )
         expected = torch.arange(mask.shape[1], device=mask.device).unsqueeze(0) < lengths.unsqueeze(1)
         require(
