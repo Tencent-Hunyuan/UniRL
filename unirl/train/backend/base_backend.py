@@ -95,6 +95,8 @@ class BaseFSDP2Backend(Remote):
         ema_cfg: Optional[EmaFullConfig],
     ) -> Optional[Shadow]:
         """Structural injection on the (possibly meta) trainable module."""
+        if ema_lora_cfg is not None and ema_cfg is not None:
+            raise ValueError("ema_lora_cfg and ema_cfg are mutually exclusive.")
         self._frozen_adapters = FrozenAdapters()
         shadow: Optional[Shadow] = None
         if ema_lora_cfg is not None:

@@ -378,7 +378,8 @@ The LoRA scaling comes from the `lora_config` recorded in the checkpoint;
 `--lora-alpha` overrides it (needed only for checkpoints predating the record).
 AR models: `--library transformers`, no `--subfolder`. For adapter artifacts,
 use `python -m unirl.tools.export_adapter --checkpoint ... --base ... --output ...`.
-NFT runs can export the EMA shadow adapter with `--adapter old`.
+NFT runs can export the EMA shadow adapter with `--adapter old`. For mirror EMA,
+use `--ema`; see [`train/readme.md`](../train/readme.md#export-only-lora-ema-for-h3-flashgrpo).
 
 For PE, point the exporter at one side's directory, for example
 `checkpoint-1000/diffusion` or `checkpoint-1000/ar`, rather than at the common

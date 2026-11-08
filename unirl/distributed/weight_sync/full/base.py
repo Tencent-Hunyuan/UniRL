@@ -30,6 +30,8 @@ class FullWeightSync(Remote):
         from unirl.utils.dtypes import parse_torch_dtype
 
         self._backend = backend
+        if getattr(backend, "_ema_config", None) is not None and not hasattr(backend.model, "peft_config"):
+            raise ValueError("FullWeightSync does not support full-model mirror EMA; shadow parameters would be sent.")
         self._bucket_bytes = int(bucket_size_mb) * 1024 * 1024
         self._flush_cache = bool(flush_cache)
         self._lora_merged = bool(lora_merged)

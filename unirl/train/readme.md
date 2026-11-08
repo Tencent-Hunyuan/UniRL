@@ -67,53 +67,25 @@ in `backend/base.py`; a multi-update-capable algorithm sets
 
 ## Export-only LoRA EMA for H3 FlashGRPO
 
-The [H3 FlashGRPO recipe](../../examples/diffusion/minimax_h3/minimax_h3_t2va_flashgrpo.yaml)
-keeps EMA **off by default**. Keep its `backend.lora_cfg` unchanged and opt in with:
-
-```bash
-python -m unirl.train_diffusion --config-name=diffusion/minimax_h3/minimax_h3_t2va_flashgrpo \
+- **Enable:** The [H3 FlashGRPO recipe](../../examples/diffusion/minimax_h3/minimax_h3_t2va_flashgrpo.yaml)
+  defaults to off. Keep `backend.lora_cfg` and add:
+  ```bash
   +backend.ema_cfg._target_=unirl.train.configs.EmaFullConfig \
-  +backend.ema_cfg.target_decay=0.9 \
-  +backend.ema_cfg.update_interval=8
-```
-
-- **Only LoRA A/B are mirrored.** `inject_mirror` copies the trainable parameters
-  after LoRA injection and materialization. Shadows are frozen, sharded alongside
-  live parameters, and kept at the same master dtype (fp32 in this recipe).
-  This adds one LoRA-sized shadow per rank, including its FSDP all-gather traffic,
-  but no additional forward pass. EMA updates operate on local shards.
-- **Training and rollout use live weights.** Do not replace `lora_cfg` with NFT's
-  `ema_lora_cfg` or change `FlashGRPO.requires_ema_rollout`. Online evaluation also
-  stays live; export the EMA adapter below for separate evaluation.
-- **The schedule counts committed optimizer updates, not EMA updates.** With
-  `timing: optimizer_step` (the default), update at committed counts 8, 16, 24, …,
-  using `s = committed_count - 1` and `min((1+s)/(10+s), 0.9)`; the first decay is
-  `8/17`. Non-finite skipped steps and rollout boundaries do not advance it.
-  This follows Flash-GRPO's helper formula and decay/interval configuration,
-  with framecode's committed-update convention rather than the author's
-  microbatch-level call placement. Floating-point arithmetic remains UniRL's
-  `shadow.mul_(decay).add_(live, alpha=1-decay)`, not the author's difference form.
-- **Both checkpoint formats preserve the shadow and schedule.** In `torch`,
-  `checkpoint.pt` contains `policy_state_dict`, `ema_config`, and
-  `optimizer_step_count`; in `dcp`, tensors are under `model` in the shards and
-  those metadata fields are in `metadata.pt`. Adapter (`auto` for this recipe)
-  and full saves retain `<module>.lora_{A,B}.default.shadow_weight` beside live
-  `…default.weight`. The saved optimizer count is the sole schedule clock;
-  the number of EMA updates is `optimizer_step_count // update_interval`.
-
-Export either checkpoint format without loading the base model:
-
-```bash
-python -m unirl.tools.export_adapter --checkpoint "$CHECKPOINT" --base "$BASE_MODEL" \
-  --output exports/ema --ema
-python -m unirl.tools.export_adapter --checkpoint "$CHECKPOINT" --base "$BASE_MODEL" \
-  --output exports/live
-```
-
-Both folders contain `adapter_model.safetensors` and `adapter_config.json`, with
-identical key names `base_model.model.<module>.lora_{A,B}.weight` and the same rank,
-alpha, and target-module regex. The same downstream ComfyUI conversion can consume
-either folder; `--ema` selects `shadow_weight`, not live `weight`.
+  +backend.ema_cfg.target_decay=0.9 +backend.ema_cfg.update_interval=8
+  ```
+  Only LoRA A/B are mirrored; training, rollout and online evaluation use live
+  weights. Each rank holds a 1/N shadow shard and FSDP all-gathers it during
+  forward; framecode instead stores shadow on CPU outside the gather.
+- **Count and resume:** After committed updates 8, 16, …, decay is
+  `min((1+s)/(10+s), 0.9)`, `s=optimizer_step_count-1` (first: `8/17`).
+  Skipped non-finite steps do not count. Torch `checkpoint.pt` and DCP
+  `metadata.pt` store `ema_config` and `optimizer_step_count`; both formats
+  retain `<module>.lora_{A,B}.default.shadow_weight` alongside live weights.
+  Resume requires the same `ema_cfg`; EMA updates equal `optimizer_step_count // 8`.
+- **Export:** Run `python -m unirl.tools.export_adapter --checkpoint "$CHECKPOINT"
+  --base "$BASE_MODEL" --output exports/ema --ema` (omit `--ema` for live).
+  Both produce `adapter_model.safetensors` and `adapter_config.json`, with keys
+  `base_model.model.<module>.lora_{A,B}.weight` for the same conversion tool.
 
 ## Choosing HSDP (hybrid sharding)
 

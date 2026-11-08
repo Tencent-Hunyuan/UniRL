@@ -264,12 +264,16 @@ def raw_state_dict(
         elif ".lora_A." in name:
             prefix, adapter_suffix = name.split(".lora_A.", 1)
             adapter, *_rest = adapter_suffix.split(".", 1)
-            if adapter == adapter_name:
+            if adapter == adapter_name and (
+                _rest == ["weight"] or (not _rest and unpack_qwen_moe and prefix.endswith(".mlp.experts"))
+            ):
                 lora_a_keys[prefix] = raw_name
         elif ".lora_B." in name:
             prefix, adapter_suffix = name.split(".lora_B.", 1)
             adapter, *_rest = adapter_suffix.split(".", 1)
-            if adapter == adapter_name:
+            if adapter == adapter_name and (
+                _rest == ["weight"] or (not _rest and unpack_qwen_moe and prefix.endswith(".mlp.experts"))
+            ):
                 lora_b_keys[prefix] = raw_name
         else:
             regular_keys.append(raw_name)
@@ -321,7 +325,7 @@ def extract_lora_tensors(
                 continue
             head, adapter_suffix = name.split(marker, 1)
             adapter, *_rest = adapter_suffix.split(".", 1)
-            if adapter != adapter_name:
+            if adapter != adapter_name or _rest != ["weight"]:
                 break
             out_name = f"{param_prefix}{head}.{suffix}.weight"
             result[out_name] = _to_full_tensor(param, dtype).detach().cpu()

@@ -62,6 +62,8 @@ matching receiver on the engine side (`../../rollout/engine/`).
 
 ## Gotchas
 
+- **Full-weight sync rejects full-model mirror EMA without LoRA.** Otherwise the
+  mirror parameters would be sent as ordinary weights; use trainside rollout.
 - **`sync()` is a train-mesh collective** — the FSDP→full materialization runs on
   *every* train rank; never gate it behind `if rank == 0`. The rollout receiver owns
   routing after materialization: SGLang TP performs the push only on each group's
