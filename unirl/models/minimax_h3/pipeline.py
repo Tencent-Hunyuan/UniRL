@@ -14,7 +14,7 @@ from unirl.types.noise_recipe import NoiseRecipe
 from unirl.types.primitives import Texts
 from unirl.types.sample import Sample
 
-from .bundle import MiniMaxH3Bundle
+from .bundle import MiniMaxH3Bundle, load_minimax_h3_text_encoder, load_minimax_h3_vae
 from .conditions import MiniMaxH3Conditions
 from .config import (
     MINIMAX_H3_AUDIO_LATENT_CHANNELS,
@@ -52,7 +52,7 @@ class MiniMaxH3Pipeline(Pipeline):
         self.video_decode = video_decode
         self.audio_decode = audio_decode
         self.config = config
-        self._offloaded_modules: Dict[torch.nn.Module, torch.device] = {}
+        self._offloaded_modules: Dict[str, torch.device] = {}
 
     @classmethod
     def from_config(cls, config: MiniMaxH3PipelineConfig, strategy: StepStrategy) -> "MiniMaxH3Pipeline":
@@ -83,25 +83,42 @@ class MiniMaxH3Pipeline(Pipeline):
             config=config,
         )
 
+    def _set_rollout_module(self, name: str, module: torch.nn.Module | None) -> None:
+        """Update every auxiliary-module owner, including the text encoder's VAE lease."""
+        setattr(self.bundle, name, module)
+        setattr(self.text_embed, name, module)
+        if name == "vae":
+            self.video_decode.vae = module
+        elif name == "audio_vae":
+            self.audio_decode.audio_vae = module
+
     def sleep(self) -> None:
-        """Park CUDA rollout-only modules; see trainer/README.md for the residency contract."""
+        """Release CUDA rollout-only modules without CPU copies; see trainer/README.md."""
         if self.config.vae_components_on_cpu:
             return
-        for module in (self.bundle.vae, self.bundle.audio_vae, self.bundle.text_encoder):
+        for name in ("vae", "audio_vae", "text_encoder"):
+            module = getattr(self.bundle, name)
             if module is None:
                 continue
             device = next(module.parameters()).device
             if device.type == "cuda":
-                self._offloaded_modules[module] = device
-                module.to("cpu")
+                self._offloaded_modules[name] = device
+                self._set_rollout_module(name, None)
+            del module
         if self._offloaded_modules:
             torch.cuda.empty_cache()
 
     def wake_up(self) -> None:
-        """Restore parked modules to their original devices without changing tensor dtypes."""
-        for module, device in self._offloaded_modules.items():
-            module.to(device)
-        self._offloaded_modules.clear()
+        """Reload released modules with their original loaders; see trainer/README.md."""
+        for name, device in list(self._offloaded_modules.items()):
+            if name == "text_encoder":
+                module, processor, tokenizer = load_minimax_h3_text_encoder(self.config, device=device)
+                self.bundle.processor = self.text_embed.processor = processor
+                self.bundle.tokenizer = self.text_embed.tokenizer = tokenizer
+            else:
+                module = load_minimax_h3_vae(self.config, component=name, device=device)
+            self._set_rollout_module(name, module)
+            del self._offloaded_modules[name]
 
     def build_schedule_policy(self) -> FlowMatchSchedulePolicy:
         """The VIDEO sigma policy the hosting engine pins onto the Part."""

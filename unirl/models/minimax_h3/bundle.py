@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
 import torch
 from torch import nn
@@ -20,6 +20,31 @@ from .vendor import (
     AutoencoderKLMiniMaxH3Audio,
     MiniMaxH3Transformer3DModel,
 )
+
+
+def load_minimax_h3_vae(config: MiniMaxH3PipelineConfig, *, component: str, device: torch.device) -> nn.Module:
+    """Load a frozen VAE identically for initial construction and rollout wake."""
+    model_cls, raw_dtype = {
+        "vae": (AutoencoderKLMiniMaxH3, config.vae_dtype),
+        "audio_vae": (AutoencoderKLMiniMaxH3Audio, config.audio_vae_dtype),
+    }[component]
+    dtype = parse_torch_dtype(raw_dtype, field_name=f"{component}_dtype")
+    module = model_cls.from_pretrained(
+        config.vae_ckpt_path or config.pretrained_model_ckpt_path, subfolder=component, torch_dtype=dtype
+    )
+    return module.to(device).eval().requires_grad_(False)
+
+
+def load_minimax_h3_text_encoder(
+    config: MiniMaxH3PipelineConfig, *, device: torch.device
+) -> Tuple[nn.Module, Any, Any]:
+    """Load the frozen conditioner and its assets identically for construction and wake."""
+    raw_dtype = config.text_encoder_dtype if config.text_encoder_dtype is not None else config.model_precision
+    dtype = parse_torch_dtype(raw_dtype, field_name="text_encoder_dtype")
+    module, processor, tokenizer = load_minimax_h3_conditioner(
+        config.text_encoder_ckpt_path or config.pretrained_model_ckpt_path, dtype
+    )
+    return module.to(device), processor, tokenizer
 
 
 class MiniMaxH3Bundle(Bundle):
@@ -60,8 +85,6 @@ class MiniMaxH3Bundle(Bundle):
     def from_config(cls, config: MiniMaxH3PipelineConfig) -> "MiniMaxH3Bundle":
         """Load every MiniMax-H3 component from a HuggingFace checkpoint."""
         path = config.pretrained_model_ckpt_path
-        vae_path = config.vae_ckpt_path or path
-        te_path = config.text_encoder_ckpt_path or path
         cache_path = config.text_embed_cache_path
 
         device = config.device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -79,10 +102,6 @@ class MiniMaxH3Bundle(Bundle):
         vae_device = torch.device("cpu") if config.vae_components_on_cpu else device
 
         dtype = parse_torch_dtype(config.model_precision, field_name="model_precision")
-        vae_dtype = parse_torch_dtype(config.vae_dtype, field_name="vae_dtype")
-        audio_vae_dtype = parse_torch_dtype(config.audio_vae_dtype, field_name="audio_vae_dtype")
-        te_raw = config.text_encoder_dtype if config.text_encoder_dtype is not None else config.model_precision
-        te_dtype = parse_torch_dtype(te_raw, field_name="text_encoder_dtype")
 
         # Transformer (trainable). MiniMax-H3 ships a MIXED-DTYPE checkpoint:
         # `_keep_in_fp32_modules` (patch projections, timestep MLP, output heads,
@@ -105,17 +124,11 @@ class MiniMaxH3Bundle(Bundle):
             ).to(device)
 
         # Video VAE (frozen, fp32).
-        vae = AutoencoderKLMiniMaxH3.from_pretrained(vae_path, subfolder="vae", torch_dtype=vae_dtype)
-        vae = vae.to(vae_device).eval()
-        vae.requires_grad_(False)
+        vae = load_minimax_h3_vae(config, component="vae", device=vae_device)
 
         # Audio VAE (frozen, fp32). Do NOT let a global bf16 cast reach this:
         # the reference reports bf16 output roughly 20 dB too quiet.
-        audio_vae = AutoencoderKLMiniMaxH3Audio.from_pretrained(
-            vae_path, subfolder="audio_vae", torch_dtype=audio_vae_dtype
-        )
-        audio_vae = audio_vae.to(vae_device).eval()
-        audio_vae.requires_grad_(False)
+        audio_vae = load_minimax_h3_vae(config, component="audio_vae", device=vae_device)
 
         text_embed_store = OfflineTextEmbedStore.from_dir(cache_path) if cache_path is not None else None
 
@@ -128,8 +141,7 @@ class MiniMaxH3Bundle(Bundle):
             )
             text_encoder = processor = tokenizer = None
         else:
-            text_encoder, processor, tokenizer = load_minimax_h3_conditioner(te_path, te_dtype)
-            text_encoder = text_encoder.to(aux_device)
+            text_encoder, processor, tokenizer = load_minimax_h3_text_encoder(config, device=aux_device)
 
         bundle = cls(
             transformer=transformer,
@@ -155,4 +167,4 @@ class MiniMaxH3Bundle(Bundle):
         return self.transformer
 
 
-__all__ = ["MiniMaxH3Bundle"]
+__all__ = ["MiniMaxH3Bundle", "load_minimax_h3_text_encoder", "load_minimax_h3_vae"]
