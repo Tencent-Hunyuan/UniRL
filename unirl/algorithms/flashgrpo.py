@@ -8,7 +8,6 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Type, Union
 
 import torch
 
-from unirl.sde.index_schedule import AllSDEScheduler
 from unirl.sde.kernels import FlashSDEStrategy
 from unirl.types.conditions import Condition
 from unirl.types.sample import Part
@@ -53,8 +52,8 @@ class FlashGRPO(FlowGRPO):
         *,
         params: Any,
         rectification_indices: Sequence[int] = (),
-        batch_normalize_tgr: bool = False,
-        engine_per_sample_sde: bool = False,
+        batch_normalize_tgr: bool = FlashGRPOConfig.batch_normalize_tgr,
+        engine_per_sample_sde: bool = FlashGRPOConfig.engine_per_sample_sde,
         stage: Any = None,
         pipeline: Any = None,
         stage_attr: str = "diffusion",
@@ -84,37 +83,20 @@ class FlashGRPO(FlowGRPO):
             conditions_cls=conditions_cls,
         )
         self.batch_normalize_tgr = bool(batch_normalize_tgr)
-        if engine_per_sample_sde:
-            if not self.batch_normalize_tgr:
-                raise ValueError(
-                    "FlashGRPO engine_per_sample_sde requires batch_normalize_tgr=true for unequal strata."
-                )
-            if not getattr(self.stage, "supports_order_independent_sde_noise", False):
-                raise ValueError(
-                    "FlashGRPO engine_per_sample_sde requires sample/step-keyed SDE noise; "
-                    f"{type(self.stage).__name__} does not declare it (Wan uses global RNG). "
-                    "Disable engine_per_sample_sde or use a stage with request-local generators."
-                )
+        if engine_per_sample_sde and not getattr(self.stage, "supports_order_independent_sde_noise", False):
+            raise ValueError(
+                "FlashGRPO engine_per_sample_sde requires sample/step-keyed SDE noise; "
+                f"{type(self.stage).__name__} does not declare it (Wan uses global RNG). "
+                "Disable engine_per_sample_sde or use a stage with request-local generators."
+            )
         self.backend = backend
         self._batch_tgr_metrics: Dict[str, float] = {}
         if self.batch_normalize_tgr:
-            if not isinstance(params.scheduler, AllSDEScheduler):
-                raise ValueError("FlashGRPO batch_normalize_tgr requires params.scheduler=AllSDEScheduler.")
-            pool = params.scheduler.sde_candidate_pool()
-            if not pool or max(pool) >= params.num_inference_steps - 1:
-                raise ValueError("FlashGRPO: choose a nonempty candidate pool excluding the final denoising step.")
-            if rectification_indices and sorted(rectification_indices) != sorted(pool):
-                raise ValueError("FlashGRPO: omit rectification_indices or set it to the scheduler candidate pool.")
             if not rectification_indices:
-                rectification_indices = pool
+                rectification_indices = params.scheduler.sde_candidate_pool()
             self.supports_multi_update = False
             if backend is None:
                 raise ValueError("FlashGRPO batch_normalize_tgr requires the training backend, including on one rank.")
-        if not rectification_indices:
-            raise ValueError(
-                "FlashGRPO per-sample rectification requires rectification_indices (the shared "
-                "candidate timestep pool) to normalize against; got empty."
-            )
         self.rectification_indices = [int(i) for i in rectification_indices]
         self.adv_clip_max = float(adv_clip_max)
         if not self.adv_clip_max > 0.0:

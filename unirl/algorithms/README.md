@@ -168,6 +168,11 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   this: the operands are already rounded when the forward returns them. DiffusionOPD's
   `fp32 before squaring` is not the same situation — it upcasts scheduler-computed
   `prev_sample_means`, not raw network output.
+- **`DiffusionTrainer` owns FlashGRPO configuration checks before model loading.**
+  It validates engine-mode requirements, the nonempty `AllSDEScheduler` pool excluding
+  the final step, and agreement with `rectification_indices`. Direct algorithm callers
+  must supply a validated configuration; the algorithm checks stage/backend capabilities.
+  `FlashGRPOConfig` owns the engine-mode and batch-normalization defaults.
 - **By default, `FlashGRPO.rectification_indices` is a required pool normalizer, not a target list.**
   Each sample's coefficient is divided by the candidate-pool mean, which equals the actual
   batch mean only with equal step counts. `batch_normalize_tgr: true` instead normalizes the

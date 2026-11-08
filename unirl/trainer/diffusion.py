@@ -11,6 +11,7 @@ import torch
 from hydra.utils import get_class, get_object, instantiate
 from omegaconf import DictConfig, OmegaConf
 
+from unirl.algorithms.flashgrpo import FlashGRPOConfig
 from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
 from unirl.sde.index_schedule import AllSDEScheduler
@@ -346,7 +347,10 @@ class DiffusionTrainer(BaseTrainer):
         algo_cls = get_class(algorithm_cfg["_target_"])
         self._uses_ema = algo_cls.requires_ema_rollout
         self._flash_per_sample_sde = algo_cls.requires_per_sample_sde_index
-        self._flash_engine_per_sample_sde = bool(algorithm_cfg.get("engine_per_sample_sde", False))
+        self._flash_engine_per_sample_sde = algorithm_cfg.get(
+            "engine_per_sample_sde", FlashGRPOConfig.engine_per_sample_sde
+        )
+        batch_normalize_tgr = algorithm_cfg.get("batch_normalize_tgr", FlashGRPOConfig.batch_normalize_tgr)
         if self._flash_per_sample_sde and not getattr(
             rollout_parsed["role_cls"], "supports_per_sample_sde_index", False
         ):
@@ -356,13 +360,13 @@ class DiffusionTrainer(BaseTrainer):
                 "and pre-return stamping. Use trainside or a supported non-Flash algorithm."
             )
         if self._flash_engine_per_sample_sde:
-            if not self._flash_per_sample_sde or not algorithm_cfg.get("batch_normalize_tgr", False):
+            if not self._flash_per_sample_sde or not batch_normalize_tgr:
                 raise ValueError("engine_per_sample_sde requires FlashGRPO with algorithm.batch_normalize_tgr=true.")
             if rollout_cfg.get("forward_batch_size") != 1:
                 raise ValueError(
                     "engine_per_sample_sde requires rollout.forward_batch_size=1 so FSDP ranks run equal forwards."
                 )
-        if algorithm_cfg.get("batch_normalize_tgr", False):
+        if batch_normalize_tgr:
             if stack_cfg.get("num_updates_per_batch", 1) != 1 or accumulate_rollouts != 1:
                 raise ValueError(
                     "FlashGRPO batch_normalize_tgr normalizes one rollout/update; set "
@@ -792,7 +796,9 @@ class DiffusionTrainer(BaseTrainer):
     def _check_flash_rectification_pool(self, algorithm_cfg: Any) -> None:
         """Fail fast when the rectification normalizer disagrees with the SDE candidate pool."""
         pool = sorted(self._flash_candidate_pool())
-        if algorithm_cfg.get("batch_normalize_tgr", False) and not algorithm_cfg.get("rectification_indices"):
+        if algorithm_cfg.get("batch_normalize_tgr", FlashGRPOConfig.batch_normalize_tgr) and not algorithm_cfg.get(
+            "rectification_indices"
+        ):
             return
         if "rectification_indices" not in algorithm_cfg or algorithm_cfg["rectification_indices"] is None:
             raise ValueError(
@@ -820,22 +826,7 @@ class DiffusionTrainer(BaseTrainer):
                 f"{n_prompts} root groups for {root_rows} root rows, so the per-prompt SDE "
                 "draw cannot address the batch."
             )
-        # Driver groups require equal DP-divisible strata; engine groups need only equal DP shards.
-        dp_size = self.rollout.dp_size
         pool_size = len(pool)
-        if self._flash_engine_per_sample_sde:
-            if not n_prompts or n_prompts % dp_size:
-                raise ValueError(
-                    f"FlashGRPO engine_per_sample_sde requires a positive batch_size divisible by rollout dp_size={dp_size}; "
-                    f"got {n_prompts}. Resize batch_size."
-                )
-        elif n_prompts % (pool_size * dp_size):
-            raise ValueError(
-                f"FlashGRPO stratifies {n_prompts} prompts across the {pool_size}-step SDE candidate "
-                f"pool, so batch_size must be a multiple of pool_size * rollout dp_size = "
-                f"{pool_size * dp_size}; got {n_prompts}. Widen or narrow the scheduler's "
-                "timestep_fraction, or resize batch_size."
-            )
         rng = np.random.default_rng(rollout_id)
         # Keep the permutation and position modulo identical in both dispatch modes.
         order = rng.permutation(pool_size)
