@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Any, Tuple
+from typing import Any, Dict, Tuple
+
+import torch
 
 from unirl.config.require import require
 from unirl.models.types.pipeline import Pipeline
@@ -50,6 +52,7 @@ class MiniMaxH3Pipeline(Pipeline):
         self.video_decode = video_decode
         self.audio_decode = audio_decode
         self.config = config
+        self._offloaded_modules: Dict[torch.nn.Module, torch.device] = {}
 
     @classmethod
     def from_config(cls, config: MiniMaxH3PipelineConfig, strategy: StepStrategy) -> "MiniMaxH3Pipeline":
@@ -79,6 +82,26 @@ class MiniMaxH3Pipeline(Pipeline):
             audio_decode=MiniMaxH3AudioDecodeStage(bundle),
             config=config,
         )
+
+    def sleep(self) -> None:
+        """Park CUDA rollout-only modules; see trainer/README.md for the residency contract."""
+        if self.config.vae_components_on_cpu:
+            return
+        for module in (self.bundle.vae, self.bundle.audio_vae, self.bundle.text_encoder):
+            if module is None:
+                continue
+            device = next(module.parameters()).device
+            if device.type == "cuda":
+                self._offloaded_modules[module] = device
+                module.to("cpu")
+        if self._offloaded_modules:
+            torch.cuda.empty_cache()
+
+    def wake_up(self) -> None:
+        """Restore parked modules to their original devices without changing tensor dtypes."""
+        for module, device in self._offloaded_modules.items():
+            module.to(device)
+        self._offloaded_modules.clear()
 
     def build_schedule_policy(self) -> FlowMatchSchedulePolicy:
         """The VIDEO sigma policy the hosting engine pins onto the Part."""

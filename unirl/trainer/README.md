@@ -91,6 +91,11 @@ stay swappable by `_target_`.
   (`rollout_resident: true`) is not
   slept even when generation raises: the policy says its weights stay put, and the
   caller that set it owns the peak.
+  For H3 trainside with `rollout_resident=false` and `vae_components_on_cpu=false`,
+  engine `sleep`/`wake_up` delegate to the pipeline to park CUDA video/audio VAEs
+  and any CUDA text encoder on CPU after decoding (and inline `reward_stack`
+  scoring), restoring their original devices without dtype conversion before the
+  next rollout or eval, while leaving the shared trainable transformer untouched.
 
 The current trainer surface is:
 
