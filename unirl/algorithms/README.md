@@ -193,10 +193,29 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   the policy ratio uses the element-weighted joint video/audio log-probability.
   The H3 recipe's schedules differ (`video_shift: 12.0`, `audio_shift: 3.0`);
   TGR does not compute a separate audio coefficient.
-- **`FlashGRPO` runs only the per-sample path, with `beta: 0`.** It raises at construction on
-  `beta > 0` (a KL against one group's means would be wrong) or a non-`FlashSDEStrategy` stage, and
-  at the first step on a segment without `sde_index_per_sample`, which means the trainer never
-  stratified the rollout (the async trainer refuses FlashGRPO for that reason).
+- **`FlashGRPO` runs only the per-sample path.** It raises at construction on a
+  non-`FlashSDEStrategy` stage, and at the first step on a segment without
+  `sde_index_per_sample`, which means the trainer never stratified the rollout
+  (the async trainer refuses FlashGRPO for that reason).
+- **`FlashGRPO.beta > 0` adds reference KL without TGR scaling.** The reference is the
+  same backend model with LoRA adapters disabled under `torch.no_grad`, not an EMA
+  model or another loaded checkpoint; a LoRA backend is required. Replay uses each
+  row's `sde_index_per_sample`, stored before/after latents, and conditions.
+  `reference_kl_loss` computes `(new_mean - ref_mean)^2 / (2 * transition_std^2)`.
+  H3's `audio_joint_sde: true` includes both streams using their own transition
+  standard deviations and latent-element-count weights, not equal stream weights;
+  `false` includes video only. Per-row A/V stages declare audio participation through
+  `ReplayResult.audio_in_policy` and must return audio means and stds when it is true;
+  KL does not infer policy membership from stage internals or missing statistics. Gradients flow only
+  through current-policy means; reference means and supplied stds are detached.
+  `policy_loss` is the TGR-weighted clipped objective, `kl_ref_mean` the raw KL,
+  `kl_loss` is `beta * kl_ref_mean`, and `total_loss` is their sum. These are micro
+  means before the trainer's `loss_scale`, matching UniRL's metric aggregation.
+  Enabling KL adds one batched no-gradient replay forward per micro and another
+  FSDP parameter all-gather; the reference forward runs while the policy graph
+  remains resident in GPU memory. It adds no backward or reference weight copy.
+  The default `beta: 0` resolves no reference, performs no reference forward,
+  emits no new KL metrics, and preserves the existing loss/gradient path bit-for-bit.
 - **`adv_clip_max` defaults to `5.0`, copying upstream.** Advantages are clamped before the ratio
   because a collapsed reward spread drives `|adv|` arbitrarily high through the global-std
   denominator. `adv_clip_fraction` in the metrics is the fraction of samples that hit the clamp:

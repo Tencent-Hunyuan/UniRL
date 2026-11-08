@@ -65,6 +65,28 @@ in `backend/base.py`; a multi-update-capable algorithm sets
 `recomputes_anchor` when its anchor must follow the planned micro geometry (see
 `../algorithms/README.md`).
 
+## Export-only LoRA EMA for H3 FlashGRPO
+
+- **Enable:** The [H3 FlashGRPO recipe](../../examples/diffusion/minimax_h3/minimax_h3_t2va_flashgrpo.yaml)
+  defaults to off. Keep `backend.lora_cfg` and add:
+  ```bash
+  +backend.ema_cfg._target_=unirl.train.configs.EmaFullConfig \
+  +backend.ema_cfg.target_decay=0.9 +backend.ema_cfg.update_interval=8
+  ```
+  Only LoRA A/B are mirrored; training, rollout and online evaluation use live
+  weights. Each rank holds a 1/N shadow shard and FSDP all-gathers it during
+  forward.
+- **Count and resume:** After committed updates 8, 16, …, decay is
+  `min((1+s)/(10+s), 0.9)`, `s=optimizer_step_count-1` (first: `8/17`).
+  Skipped non-finite steps do not count. Torch `checkpoint.pt` and DCP
+  `metadata.pt` store `ema_config` and `optimizer_step_count`; both formats
+  retain `<module>.lora_{A,B}.default.shadow_weight` alongside live weights.
+  Resume requires the same `ema_cfg`; EMA updates equal `optimizer_step_count // 8`.
+- **Export:** Run `python -m unirl.tools.export_adapter --checkpoint "$CHECKPOINT"
+  --base "$BASE_MODEL" --output exports/ema --ema` (omit `--ema` for live).
+  Both produce `adapter_model.safetensors` and `adapter_config.json`, with keys
+  `base_model.model.<module>.lora_{A,B}.weight` for the same conversion tool.
+
 ## Choosing HSDP (hybrid sharding)
 
 `fsdp_mode: hybrid` on `FSDPBackend` builds a
@@ -125,6 +147,11 @@ use LoRA adapter mode. Formats and export live in
 
 ## Gotchas
 
+- **Mirror EMA resume requires the same `ema_cfg`.** A missing or changed
+  `ema_config` (including older mirror checkpoints without schedule metadata)
+  raises before loading weights; starting EMA from a live-only checkpoint is not
+  an exact resume. With EMA off, no shadow or EMA metadata is added and the
+  optimizer/rollout arithmetic is unchanged.
 - **Unified `ar` / `image` results describe one shared optimizer step.** Their
   `optimizer_updates` (total and per update) count the same steps, so summing
   them across tracks double-counts.

@@ -17,6 +17,7 @@ from .base import (
     AlgorithmStepResult,
     BaseAlgorithmConfig,
     grpo_clip_loss,
+    reference_kl_loss,
     resolve_clip_range_from_schedule,
     typed_conditions,
 )
@@ -39,7 +40,7 @@ class FlashGRPOConfig(BaseAlgorithmConfig):
 
 
 class FlashGRPO(FlowGRPO):
-    """FlowGRPO whose loss is scaled by the Flash-GRPO temporal-gradient-rectification coefficient."""
+    """FlowGRPO with TGR-weighted policy loss and optional unrectified reference KL."""
 
     # The trainer gates its per-sample SDE-index orchestration on this flag: stratify
     # one SDE step per prompt, stamp ``segment.sde_index_per_sample``, then merge the
@@ -65,11 +66,6 @@ class FlashGRPO(FlowGRPO):
         backend: Any = None,
         conditions_cls: Optional[Type[Any]] = None,
     ) -> None:
-        # Checked before super() so a beta>0 recipe never loads the reference model.
-        if float(beta) != 0.0:
-            raise ValueError(
-                f"FlashGRPO: reference-KL is not supported on the per-sample SDE-index path; got beta={beta!r}."
-            )
         super().__init__(
             params=params,
             stage=stage,
@@ -226,11 +222,26 @@ class FlashGRPO(FlowGRPO):
             tgr = self._rectification_weights_per_sample(segment=segment, device=new_logp.device)
         tgr = tgr.to(dtype=loss_per_elem.dtype)
         loss_per_elem = loss_per_elem * tgr
-        loss = loss_per_elem.mean()
+        policy_loss = loss_per_elem.mean()
+        loss = policy_loss
+        if self.beta > 0.0:
+            kl_ref = reference_kl_loss(
+                self.stage,
+                self.ref_model,
+                conditions=typed_conds,
+                segment=segment,
+                params=self.params,
+                target_steps=target_steps,
+                new_means=replay_result.prev_sample_means,
+                algo="FlashGRPO",
+                new_replay=replay_result,
+            )
+            kl_loss = self.beta * kl_ref
+            loss = loss + kl_loss
 
         (loss * loss_scale).backward()
         metric_tensors = {
-            "policy_loss": loss.detach(),
+            "policy_loss": policy_loss.detach(),
             "flash_tgr_mean": tgr.detach().mean(),
             "flash_tgr_min": tgr.detach().min(),
             "flash_tgr_max": tgr.detach().max(),
@@ -238,14 +249,18 @@ class FlashGRPO(FlowGRPO):
             "adv_abs_max": adv_raw.abs().max(),
             **ratio_metrics,
         }
+        if self.beta > 0.0:
+            metric_tensors.update(kl_ref_mean=kl_ref.detach(), kl_loss=kl_loss.detach(), total_loss=loss.detach())
         metric_values = torch.stack([value.float() for value in metric_tensors.values()]).cpu().tolist()
         metrics: Dict[str, Any] = dict(zip(metric_tensors, metric_values))
         metrics["clip_range"] = clip_range
+        if self.beta > 0.0:
+            metrics["beta"] = self.beta
         if self.batch_normalize_tgr:
             metrics.update(self._batch_tgr_metrics)
 
         return AlgorithmStepResult(
-            loss=metrics["policy_loss"],
+            loss=metrics["total_loss"] if self.beta > 0.0 else metrics["policy_loss"],
             metrics=metrics,
             num_steps_or_tokens=len(target_steps),
             has_backward=True,
