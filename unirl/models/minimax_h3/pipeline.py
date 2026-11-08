@@ -94,8 +94,6 @@ class MiniMaxH3Pipeline(Pipeline):
 
     def sleep(self) -> None:
         """Release CUDA rollout-only modules without CPU copies; see README.md."""
-        if self.config.vae_components_on_cpu:
-            return
         for name in ("vae", "audio_vae", "text_encoder"):
             module = getattr(self.bundle, name)
             if module is None:
@@ -109,7 +107,7 @@ class MiniMaxH3Pipeline(Pipeline):
             torch.cuda.empty_cache()
 
     def wake_up(self) -> None:
-        """Reload released modules with their original loaders; see trainer/README.md."""
+        """Reload released modules with their original loaders; see README.md."""
         for name, device in list(self._offloaded_modules.items()):
             if name == "text_encoder":
                 module, processor, tokenizer = load_minimax_h3_text_encoder(self.config, device=device)

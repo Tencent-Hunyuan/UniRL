@@ -91,13 +91,9 @@ stay swappable by `_target_`.
   (`rollout_resident: true`) is not
   slept even when generation raises: the policy says its weights stay put, and the
   caller that set it owns the peak.
-  Trainside engine `sleep`/`wake_up` call the typed `Pipeline` lifecycle directly;
-  the base methods keep resources resident by default. With `rollout_resident=false`
-  and `vae_components_on_cpu=false`, H3 overrides release CUDA video/audio
-  VAEs and any CUDA text encoder after decoding (and inline `reward_stack`
-  scoring), without retaining per-rank CPU weight copies, then reload through the
-  initial loaders on the original devices before the next rollout or eval, while
-  leaving the shared trainable transformer untouched.
+  The trainside engine calls the pipeline's typed `wake_up`/`sleep` methods before/after
+  each rollout window; these default to no-ops and models may override them (see
+  [H3 residency](../models/minimax_h3/README.md#gotchas)).
 
 The current trainer surface is:
 
@@ -484,15 +480,6 @@ without driver-authored x_T. `media_log_interval` does not apply
 
 ## Gotchas
 
-- **H3 auxiliary checkpoints and construction config must stay unchanged between wakes.**
-  `load_minimax_h3_vae` and `load_minimax_h3_text_encoder` in
-  [`bundle.py`](../models/minimax_h3/bundle.py) serve both initial load and wake,
-  preserving checkpoint paths, dtype, eval mode, and freezing; `from_bundle` must
-  receive the bundle's construction config so reloading reproduces its weights.
-- **H3's audio VAE has unregistered `weight_norm` tensors.** Moving only registered
-  parameters/buffers to meta leaves those allocations alive; sleep drops every
-  bundle, decode-stage, and text-embed-stage module reference, and wake rebinds
-  all of them, including the text encoder's VAE lease.
 - **HI3 two-engine rollout returns whole chunks.** `rollout_pipeline_chunks > 1`
   overlaps the next chunk's AR with the current chunk's DiT using one pending
   call per engine, and `ar_num_replicas` (default: one per 8-GPU node) controls
