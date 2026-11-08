@@ -145,9 +145,8 @@ class MiniMaxH3DiffusionStage(BatchedStepReplayMixin, DiffusionStage[MiniMaxH3Co
         conditions = conditions.trim_text_padding()
         batch = conditions.batch_size
         require(
-            tuple(initial_latents.shape) == (batch, geometry.num_video_rows, geometry.video_token_dim)
-            and tuple(initial_audio_latents.shape)
-            == (batch, geometry.num_audio_rows, MINIMAX_H3_AUDIO_LATENT_CHANNELS),
+            initial_latents.shape == (batch, geometry.num_video_rows, geometry.video_token_dim)
+            and initial_audio_latents.shape == (batch, geometry.num_audio_rows, MINIMAX_H3_AUDIO_LATENT_CHANNELS),
             "MiniMaxH3DiffusionStage.generate: all rows must share the same geometry and text batch size; "
             f"got video={tuple(initial_latents.shape)}, audio={tuple(initial_audio_latents.shape)}, "
             f"text batch={batch}, geometry={geometry}.",
