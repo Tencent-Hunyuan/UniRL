@@ -75,7 +75,7 @@ in `backend/base.py`; a multi-update-capable algorithm sets
   ```
   Only LoRA A/B are mirrored; training, rollout and online evaluation use live
   weights. Each rank holds a 1/N shadow shard and FSDP all-gathers it during
-  forward; framecode instead stores shadow on CPU outside the gather.
+  forward.
 - **Count and resume:** After committed updates 8, 16, …, decay is
   `min((1+s)/(10+s), 0.9)`, `s=optimizer_step_count-1` (first: `8/17`).
   Skipped non-finite steps do not count. Torch `checkpoint.pt` and DCP
