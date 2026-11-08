@@ -199,7 +199,7 @@ class DiffusionNFT(StageAlgorithm):
             )
 
         return AlgorithmStepResult(
-            loss=float(total_loss),
+            loss=float(total_loss / K),
             metrics=agg,
             num_steps_or_tokens=K,
             has_backward=has_backward,
