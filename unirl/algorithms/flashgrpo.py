@@ -260,7 +260,7 @@ class FlashGRPO(FlowGRPO):
             metrics.update(self._batch_tgr_metrics)
 
         return AlgorithmStepResult(
-            loss=metrics.get("total_loss", metrics["policy_loss"]),
+            loss=metrics["total_loss"] if self.beta > 0.0 else metrics["policy_loss"],
             metrics=metrics,
             num_steps_or_tokens=len(target_steps),
             has_backward=True,

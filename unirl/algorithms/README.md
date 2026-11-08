@@ -204,8 +204,9 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   `reference_kl_loss` computes `(new_mean - ref_mean)^2 / (2 * transition_std^2)`.
   H3's `audio_joint_sde: true` includes both streams using their own transition
   standard deviations and latent-element-count weights, not equal stream weights;
-  `false` includes video only. Per-row A/V stages must return audio means and stds
-  in `ReplayResult` when audio participates in the policy. Gradients flow only
+  `false` includes video only. Per-row A/V stages declare audio participation through
+  `ReplayResult.audio_in_policy` and must return audio means and stds when it is true;
+  KL does not infer policy membership from stage internals or missing statistics. Gradients flow only
   through current-policy means; reference means and supplied stds are detached.
   `policy_loss` is the TGR-weighted clipped objective, `kl_ref_mean` the raw KL,
   `kl_loss` is `beta * kl_ref_mean`, and `total_loss` is their sum. These are micro
