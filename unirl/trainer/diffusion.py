@@ -116,8 +116,8 @@ def _preflight_trainside_geometry(
     prompt_local_rollout: bool,
     has_reward: bool,
     backend_cfg: DictConfig,
-) -> None:
-    """Reject statically-known trainside DP geometry before constructing heavy model roles."""
+) -> int:
+    """Validate trainside geometry and return its DP size before constructing heavy model roles."""
     shared_devices_f = (1.0 - reward_fraction) * num_devices
     shared_devices = int(round(shared_devices_f))
     if abs(shared_devices_f - shared_devices) > 1e-9:
@@ -167,6 +167,7 @@ def _preflight_trainside_geometry(
         train_dp_size=shared_dp_size,
         require_rollout_dp_divisibility=not prompt_local_rollout,
     )
+    return shared_dp_size
 
 
 # Per-field eval knobs the overlay replaced (or dropped), and what to write instead.
@@ -452,6 +453,13 @@ class DiffusionTrainer(BaseTrainer):
             samples_per_prompt=self.eval_samples_per_prompt,
             overrides=eval_sampling_cfg,
         )
+        if self._flash_engine_per_sample_sde and self.eval_interval > 0:
+            if total_samples_per_prompt(self._eval_sampling_params) % rollout_cfg["forward_batch_size"]:
+                raise ValueError(
+                    "FlashGRPO engine_per_sample_sde requires resolved eval samples_per_prompt to be divisible by "
+                    "rollout.forward_batch_size so pipeline chunks cannot cross prompt boundaries. "
+                    "Adjust eval_samples_per_prompt (or eval_sampling.samples_per_prompt), or use forward_batch_size=1."
+                )
 
         self._noise_latent_shape: Optional[list] = self._resolve_noise_latent_shape(
             pipeline_cfg=pipeline_cfg,
@@ -489,7 +497,7 @@ class DiffusionTrainer(BaseTrainer):
         self.reward_stack = None
 
         if takes_pipeline:
-            _preflight_trainside_geometry(
+            rollout_dp_size = _preflight_trainside_geometry(
                 num_devices=self.num_devices,
                 reward_fraction=reward_fraction,
                 batch_size=batch_size,
@@ -499,6 +507,14 @@ class DiffusionTrainer(BaseTrainer):
                 has_reward=reward_cfg is not None,
                 backend_cfg=backend_cfg,
             )
+            if self._flash_engine_per_sample_sde and rollout_cfg["forward_batch_size"] != 1:
+                if batch_size != rollout_dp_size:
+                    raise ValueError(
+                        f"FlashGRPO engine_per_sample_sde with rollout.forward_batch_size={rollout_cfg['forward_batch_size']} "
+                        f"requires batch_size == rollout dp_size={rollout_dp_size}; got {batch_size}. "
+                        "Only one prompt per rank guarantees a single SDE step and equal FSDP forward counts. "
+                        "Set batch_size to rollout dp_size or rollout.forward_batch_size=1."
+                    )
 
         needs_backend = self._uses_ema or algo_cls.requires_backend
         train_cfgs = dict(
@@ -558,13 +574,6 @@ class DiffusionTrainer(BaseTrainer):
             train_dp_size=self.stack.dp_size,
             require_rollout_dp_divisibility=not self._prompt_local_rollout,
         )
-        if self._flash_engine_per_sample_sde and forward_batch_size != 1 and batch_size != self.rollout.dp_size:
-            raise ValueError(
-                f"FlashGRPO engine_per_sample_sde with rollout.forward_batch_size={forward_batch_size} requires "
-                f"batch_size == rollout dp_size={self.rollout.dp_size}; got {batch_size}. "
-                "Only one prompt per rank guarantees a single SDE step and equal FSDP forward counts. "
-                "Set batch_size to rollout dp_size or rollout.forward_batch_size=1."
-            )
         if self._flash_per_sample_sde and not self._flash_engine_per_sample_sde:
             strata = len(self._flash_candidate_pool()) * self.rollout.dp_size
             if batch_size % strata:
