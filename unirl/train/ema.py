@@ -43,8 +43,8 @@ class EMA:
     shadow: Shadow
     decay_fn: Callable[[int], float]
     timing: str
+    update_interval: int
     name: str = "ema"
-    update_interval: int = 1
 
     def step(self, t: int) -> None:
         """Consume the zero-based committed optimizer index; see readme.md for interval semantics."""
