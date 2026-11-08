@@ -362,10 +362,9 @@ class DiffusionTrainer(BaseTrainer):
         if self._flash_engine_per_sample_sde:
             if not self._flash_per_sample_sde or not batch_normalize_tgr:
                 raise ValueError("engine_per_sample_sde requires FlashGRPO with algorithm.batch_normalize_tgr=true.")
-            if rollout_cfg["forward_batch_size"] != 1:
-                raise ValueError(
-                    "engine_per_sample_sde requires rollout.forward_batch_size=1 so FSDP ranks run equal forwards."
-                )
+            forward_batch_size = rollout_cfg["forward_batch_size"]
+            if type(forward_batch_size) is not int or forward_batch_size < 1:
+                raise ValueError("engine_per_sample_sde requires rollout.forward_batch_size to be a positive integer.")
         if batch_normalize_tgr:
             if stack_cfg.get("num_updates_per_batch", 1) != 1 or accumulate_rollouts != 1:
                 raise ValueError(
@@ -559,6 +558,13 @@ class DiffusionTrainer(BaseTrainer):
             train_dp_size=self.stack.dp_size,
             require_rollout_dp_divisibility=not self._prompt_local_rollout,
         )
+        if self._flash_engine_per_sample_sde and forward_batch_size != 1 and batch_size != self.rollout.dp_size:
+            raise ValueError(
+                f"FlashGRPO engine_per_sample_sde with rollout.forward_batch_size={forward_batch_size} requires "
+                f"batch_size == rollout dp_size={self.rollout.dp_size}; got {batch_size}. "
+                "Only one prompt per rank guarantees a single SDE step and equal FSDP forward counts. "
+                "Set batch_size to rollout dp_size or rollout.forward_batch_size=1."
+            )
         if self._flash_per_sample_sde and not self._flash_engine_per_sample_sde:
             strata = len(self._flash_candidate_pool()) * self.rollout.dp_size
             if batch_size % strata:

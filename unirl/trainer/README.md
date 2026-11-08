@@ -514,16 +514,22 @@ without driver-authored x_T. `media_log_interval` does not apply
   scheduler's `timestep_fraction` must be narrowed to match. The trainer checks this at startup, once
   the rollout is built, rather than letting a group of 1-5 prompts reach the handle.
 - **`algorithm.engine_per_sample_sde: true` moves grouping into trainside.** It defaults to
-  `false` and requires `algorithm.batch_normalize_tgr: true`, a capable engine, and
-  `rollout.forward_batch_size: 1`. The driver uses the same rollout-id permutation and
+  `false` and requires `algorithm.batch_normalize_tgr: true`, a capable engine, and a
+  positive integer `rollout.forward_batch_size`. The driver uses the same rollout-id permutation and
   `position % pool_size` prompt assignment, but sends one request with CONCAT
   `Part.sde_index_per_sample`, mapped by root id to the actual frontier row order.
-  Each rank groups locally, generates every row separately, stamps both latent streams
-  with the shared helper, and restores original row order. After stamping, the engine
-  clears the Part's request-only field; `segment.sde_index_per_sample` is the output authority.
-  Only `batch_size % rollout.dp_size == 0` remains; reward/train geometry checks still apply.
-  Equal row counts and fixed denoising lengths preserve FSDP forward/collective counts even
-  if ranks visit different steps. Both FlashGRPO modes require an engine declaring
+  With `forward_batch_size=1`, each rank groups locally, generates every row separately,
+  stamps both latent streams with the shared helper, and restores original row order.
+  After stamping, the engine clears the Part's request-only field;
+  `segment.sde_index_per_sample` is the output authority.
+  With `forward_batch_size=1`, only `batch_size % rollout.dp_size == 0` remains;
+  equal row counts and fixed denoising lengths preserve FSDP forward/collective counts
+  even if ranks visit different steps. With `forward_batch_size>1`, startup requires
+  `batch_size == rollout.dp_size`: DP_SCATTER gives each rank one prompt's whole subtree,
+  so its rows share one SDE step and use the existing chunked generation path. Equal
+  row counts give each rank `ceil(samples_per_prompt / forward_batch_size)` pipeline
+  calls. Mixed-step shards still require `forward_batch_size=1`; reward/train geometry
+  checks and model-specific batch limits still apply. Both FlashGRPO modes require an engine declaring
   `supports_per_sample_sde_index`: sglang_diffusion/fastvideo do not support the Flash
   strategy and pre-return stamp, so the trainer rejects them at startup in either mode.
 - **Engine grouping requires a stage declaring sample/step-keyed noise.**
