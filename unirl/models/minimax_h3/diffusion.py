@@ -152,11 +152,6 @@ class MiniMaxH3DiffusionStage(BatchedStepReplayMixin, DiffusionStage[MiniMaxH3Co
             f"text batch={batch}, geometry={geometry}.",
         )
         require(
-            sde_indices is None or all(isinstance(index, int) for index in sde_indices),
-            "MiniMaxH3DiffusionStage.generate: sde_indices must be one shared list of step integers, "
-            "not per-row lists; group rows by SDE steps before batching.",
-        )
-        require(
             denoise_seed_keys is None or len(denoise_seed_keys) == batch,
             "MiniMaxH3DiffusionStage.generate: provide one denoise seed key per row.",
         )
