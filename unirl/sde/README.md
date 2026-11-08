@@ -136,12 +136,15 @@ independently of how many steps `num_sde_steps` draws per rollout.
   It follows `Shredded-Pork/Flash-GRPO@bd6051f`, where
   `std_dev_t = sigma_min + (sigma_max - sigma_min) * sigma` with `sigma_max = sigmas[1]` and
   `sigma_min` captured by `init_schedule` (normally `0` for a FlowMatch schedule). The
-  train-side rectification weight calls `FlashSDEStrategy.transition_std`, and
-  `PerSampleStepReplayMixin.replay_per_sample` pins the schedule from `segment.sigmas`. `eta`
-  multiplies it so `eta=0` still gives the deterministic Euler step.
+  train-side rectification weight calls `FlashSDEStrategy.transition_std`. Wan's
+  `PerSampleStepReplayMixin.replay_per_sample` pins the schedule from `segment.sigmas`;
+  H3's `MiniMaxH3DiffusionStage.replay` initializes its video and audio strategies
+  before `BatchedStepReplayMixin` joint replay. `eta` multiplies the coefficient
+  so `eta=0` still gives the deterministic Euler step.
 - **`init_schedule` is not only a generation-path call.** `FlashSDEStrategy._std_dev_t` raises
   without it rather than defaulting `sigma_min` to 0, matching `UniPCStrategy`'s convention.
   `diffuse` pins the schedule, but a remote rollout engine means the trainer rank never
-  generates, so `PerSampleStepReplayMixin.replay_per_sample` pins it from `segment.sigmas` itself.
+  generates, so replay must initialize it too: Wan does so in
+  `PerSampleStepReplayMixin.replay_per_sample`, H3 in `MiniMaxH3DiffusionStage.replay`.
   Any new replay path that reads this coefficient must do the same: a silent 0 default would be
   correct only while every schedule's terminal σ happens to be 0.

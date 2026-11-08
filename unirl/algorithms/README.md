@@ -188,6 +188,11 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   renormalizes a micro. No persistent algorithm state is added: prepare recomputes weights
   after resume. This mode requires `num_updates_per_batch=1` and `accumulate_rollouts=1`.
   Omit `rectification_indices` to use the scheduler pool, or supply that exact pool.
+- **H3's TGR coefficient intentionally approximates the joint A/V objective with video sigma only.**
+  `FlashGRPO` uses `segment.sigmas` and the stage's video strategy for TGR, while
+  the policy ratio uses the element-weighted joint video/audio log-probability.
+  The H3 recipe's schedules differ (`video_shift: 12.0`, `audio_shift: 3.0`);
+  TGR does not compute a separate audio coefficient.
 - **`FlashGRPO` runs only the per-sample path, with `beta: 0`.** It raises at construction on
   `beta > 0` (a KL against one group's means would be wrong) or a non-`FlashSDEStrategy` stage, and
   at the first step on a segment without `sde_index_per_sample`, which means the trainer never

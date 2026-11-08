@@ -146,7 +146,7 @@ class FlashGRPO(FlowGRPO):
                 raise ValueError("TGR coefficients must be finite and positive; check sigmas and eta")
             weights = coefficients[matches.long().argmax(dim=1)]
             statistics = [weights.double().sum().item(), float(weights.numel()), 0.0, *matches.sum(dim=0).tolist()]
-        except ValueError as exc:
+        except Exception as exc:
             error = exc
             statistics[2] = 1.0
         total, count, invalid, *counts = self.backend.all_reduce_loss_sums(statistics)
