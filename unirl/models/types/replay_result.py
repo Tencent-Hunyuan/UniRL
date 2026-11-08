@@ -32,10 +32,5 @@ class ReplayResult:
     """Per-token critic predictions ``V_t``. Packed ``[total_tokens]`` for AR.
     ``None`` when replay did not request a value head."""
 
-    video_prev_sample_means: Optional[torch.Tensor] = None  # [B, 1, *video_shape], fp32
-    audio_prev_sample_means: Optional[torch.Tensor] = None  # [B, 1, *audio_shape], fp32
-    video_transition_stds: Optional[torch.Tensor] = None  # [B, 1], fp32
-    audio_transition_stds: Optional[torch.Tensor] = None  # [B, 1], fp32
-
 
 __all__ = ["ReplayResult"]
