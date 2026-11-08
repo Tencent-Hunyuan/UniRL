@@ -740,7 +740,7 @@ def aggregate_metrics(metrics_list: List[Dict[str, Any]]) -> Dict[str, float]:
 
 
 def aggregate_stage_results(results: List[Any]) -> Dict[str, float]:
-    """Average :class:`TrackMiniBatchResult` metrics across the per-actor list."""
+    """Reduce :class:`TrackMiniBatchResult` metrics across the per-actor list via ``aggregate_numeric_metrics``."""
     if not results:
         return {}
     from unirl.utils.metrics import aggregate_numeric_metrics
