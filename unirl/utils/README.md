@@ -93,6 +93,18 @@ it installs no runtime wrappers or FSDP patches; the stage recorder is unchanged
   the real update, without stepping the optimizer, and writes
   `<index>_micro<size>/grad_rank<rank>.pt` plus `meta_rank<rank>.json`. All
   variants share one process, one LoRA init, and one batch.
+- `H3_DIAG_STATE_SAVE=<directory>` writes `state_rank<rank>.pt` at each rank's
+  first `train_track` call: the incoming Parts' `sample_ids`, `segment`,
+  `conditions`, and `advantages` (no decoded media or rewards) and every trainable
+  parameter's local shard in its own dtype, keyed by name.
+- `H3_DIAG_STATE_LOAD=<directory>` reads that file at the same point, replaces
+  the incoming Parts, and copies the saved shards into the live trainable
+  parameters; names and shard shapes must match. Each loaded floating tensor is
+  cast to the dtype of this process's own tensor at the same path, and a path the
+  own Part lacks raises. EMA shadows, optimizer state, and later calls are
+  untouched. Both run before the `H3_DIAG_GRAD_AB` variants, so those and the
+  real update use the loaded state. The file is a pickle (`weights_only=False`);
+  load only files this code wrote, with the same rank count and per-rank batch.
 - `H3_DIAG_REWARDS=<directory>` writes `rewards_rollout<id>.json` on the driver,
   in request order, with `sample_id`, zero-based `prompt_index` within that rollout,
   and `reward`. Use fresh directories for separate runs.

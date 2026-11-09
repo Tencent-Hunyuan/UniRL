@@ -4,6 +4,7 @@ import inspect
 import json
 import os
 from contextlib import contextmanager
+from dataclasses import fields, is_dataclass
 from functools import wraps
 from pathlib import Path
 from threading import Lock
@@ -16,6 +17,8 @@ GRAD_DUMP_DIR = os.environ.get("H3_DIAG_GRAD_DUMP")
 REWARDS_DIR = os.environ.get("H3_DIAG_REWARDS")
 GRAD_AB_DIR = os.environ.get("H3_DIAG_GRAD_AB")
 GRAD_AB_MICROS = tuple(int(size) for size in os.environ.get("H3_DIAG_GRAD_AB_MICROS", "1,8,8,4,2").split(","))
+STATE_SAVE_DIR = os.environ.get("H3_DIAG_STATE_SAVE")
+STATE_LOAD_DIR = os.environ.get("H3_DIAG_STATE_LOAD")
 
 
 def dump_first_gradients(function):
@@ -93,6 +96,79 @@ def compare_micro_gradients(function):
                 (directory / f"meta_rank{rank}.json").write_text(json.dumps(meta) + "\n")
             del backend.optimizer_step
             stack.micro_batch_size = configured
+        return function(stack, parts, **kwargs)
+
+    return wrapped
+
+
+def _trainable_shards(backend):
+    """This rank's live trainable parameters as local shards, keyed by parameter name."""
+    from unirl.distributed.local import local_view
+
+    return {name: local_view(p) for name, p in backend.model.named_parameters() if p.requires_grad}
+
+
+def _training_fields(part):
+    """CPU copy of the Part fields train_track reads; decoded media and reward bookkeeping are left out."""
+    kept = type(part)(
+        sample_ids=part.sample_ids, segment=part.segment, conditions=part.conditions, advantages=part.advantages
+    )
+    return kept.to_device("cpu").clone()
+
+
+def _cast_like(loaded, own, path):
+    """``loaded`` with each floating tensor cast to the dtype of this process's tensor at the same path."""
+    if isinstance(loaded, torch.Tensor):
+        if not loaded.is_floating_point():
+            return loaded
+        if not (isinstance(own, torch.Tensor) and own.is_floating_point()):
+            raise ValueError(f"H3_DIAG_STATE_LOAD: {path} has no floating tensor in this process's own Part.")
+        return loaded.to(own.dtype)
+    if isinstance(loaded, dict):
+        own = own if isinstance(own, dict) else {}
+        return {key: _cast_like(value, own.get(key), f"{path}[{key!r}]") for key, value in loaded.items()}
+    if is_dataclass(loaded):
+        for field in fields(loaded):
+            value = _cast_like(getattr(loaded, field.name), getattr(own, field.name, None), f"{path}.{field.name}")
+            setattr(loaded, field.name, value)
+    return loaded
+
+
+def exchange_first_state(function):
+    """At each rank's first train_track call, save and/or load its training Parts and trainable local shards."""
+    if not (STATE_SAVE_DIR or STATE_LOAD_DIR):
+        return function
+    done = False
+
+    @wraps(function)
+    def wrapped(stack, parts, **kwargs):
+        nonlocal done
+        if not done:
+            done = True
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            window = parts if isinstance(parts, tuple) else (parts,)
+            shards = _trainable_shards(stack.fsdp_backend)
+            if STATE_SAVE_DIR:
+                directory = Path(STATE_SAVE_DIR)
+                directory.mkdir(parents=True, exist_ok=True)
+                state = {
+                    "parts": [_training_fields(part) for part in window],
+                    "parameters": {name: shard.detach().to("cpu", copy=True) for name, shard in shards.items()},
+                }
+                torch.save(state, directory / f"state_rank{rank}.pt")
+            if STATE_LOAD_DIR:
+                state = torch.load(Path(STATE_LOAD_DIR) / f"state_rank{rank}.pt", weights_only=False)
+                saved = state["parameters"]
+                if {name: value.shape for name, value in saved.items()} != {n: s.shape for n, s in shards.items()}:
+                    raise ValueError("H3_DIAG_STATE_LOAD: trainable parameter names or local shard shapes differ.")
+                with torch.no_grad():
+                    for name, shard in shards.items():
+                        shard.copy_(saved[name])
+                loaded = tuple(
+                    _cast_like(part, own, f"parts[{index}]")
+                    for index, (part, own) in enumerate(zip(state["parts"], window, strict=True))
+                )
+                parts = loaded if isinstance(parts, tuple) else loaded[0]
         return function(stack, parts, **kwargs)
 
     return wrapped

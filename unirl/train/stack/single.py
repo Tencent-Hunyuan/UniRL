@@ -27,7 +27,7 @@ from unirl.train.stack.planner import (
 )
 from unirl.types.sample import Part
 from unirl.utils.metrics import aggregate_numeric_metrics
-from unirl.utils.h3_diag import compare_micro_gradients
+from unirl.utils.h3_diag import compare_micro_gradients, exchange_first_state
 from unirl.utils.stage_metrics import record, record_parameter_sums, take
 
 logger = logging.getLogger(__name__)
@@ -241,6 +241,7 @@ class TrainStack(BaseTrainStack):
         return {"loss": global_loss / global_weight, "weight": global_weight}
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
+    @exchange_first_state
     @compare_micro_gradients
     def train_track(
         self,
