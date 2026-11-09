@@ -6,8 +6,10 @@ from dataclasses import dataclass
 from dataclasses import field as dc_field
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Type, Union
 
+import numpy as np
 import torch
 
+from unirl.sde.index_schedule import AllSDEScheduler
 from unirl.sde.kernels import FlashSDEStrategy
 from unirl.types.conditions import Condition
 from unirl.types.sample import Part
@@ -111,6 +113,73 @@ class FlashGRPO(FlowGRPO):
             raise ValueError(
                 f"FlashGRPO requires the stage strategy to be FlashSDEStrategy; got {type(strategy).__name__}."
             )
+
+    @staticmethod
+    def engine_groups_sde_steps(
+        algorithm_cfg: Mapping[str, Any], *, num_updates_per_batch: int, accumulate_rollouts: int
+    ) -> bool:
+        """Reject per-sample rollout config before model loading; return ``engine_per_sample_sde``."""
+        engine_groups = algorithm_cfg.get("engine_per_sample_sde", FlashGRPOConfig.engine_per_sample_sde)
+        batch_normalize_tgr = algorithm_cfg.get("batch_normalize_tgr", FlashGRPOConfig.batch_normalize_tgr)
+        if engine_groups and not batch_normalize_tgr:
+            raise ValueError("engine_per_sample_sde requires FlashGRPO with algorithm.batch_normalize_tgr=true.")
+        if batch_normalize_tgr and (num_updates_per_batch != 1 or accumulate_rollouts != 1):
+            raise ValueError(
+                "FlashGRPO batch_normalize_tgr normalizes one rollout/update; set "
+                "stack.num_updates_per_batch=1 and accumulate_rollouts=1."
+            )
+        return engine_groups
+
+    @staticmethod
+    def per_sample_sde_pool(algorithm_cfg: Mapping[str, Any], diffusion: Any) -> List[int]:
+        """Validate the scheduler's per-prompt SDE candidate pool against ``rectification_indices``; return it."""
+        scheduler = diffusion.scheduler
+        if not isinstance(scheduler, AllSDEScheduler):
+            raise ValueError(
+                "FlashGRPO per-sample SDE-index path requires sampling_params['diffusion'] to carry "
+                f"an AllSDEScheduler; got scheduler={type(scheduler).__name__ if scheduler is not None else None}."
+            )
+        pool = scheduler.sde_candidate_pool()
+        if not pool:
+            raise ValueError("FlashGRPO per-sample SDE-index path: the scheduler candidate pool is empty.")
+        # The last denoising step stores only {T-1, T} latents while earlier steps
+        # store three, so a group that drew it cannot be concatenated with the rest.
+        num_inference_steps = diffusion.num_inference_steps
+        if max(pool) >= num_inference_steps - 1:
+            raise ValueError(
+                f"FlashGRPO per-sample SDE candidate pool reaches step {max(pool)}, but the last denoising "
+                f"step (num_inference_steps-1 = {num_inference_steps - 1}) stores a different number of "
+                "trajectory latents, so mixed-shape rollout groups cannot be concatenated. Narrow the "
+                "scheduler timestep_fraction so its end maps below the final step."
+            )
+        sorted_pool = sorted(pool)
+        if algorithm_cfg.get("batch_normalize_tgr", FlashGRPOConfig.batch_normalize_tgr) and not algorithm_cfg.get(
+            "rectification_indices"
+        ):
+            return pool
+        if "rectification_indices" not in algorithm_cfg or algorithm_cfg["rectification_indices"] is None:
+            raise ValueError(
+                "FlashGRPO per-sample path requires algorithm.rectification_indices set to the SDE "
+                f"candidate pool {sorted_pool}; got None."
+            )
+        rectification_sorted = sorted(int(i) for i in algorithm_cfg["rectification_indices"])
+        if rectification_sorted != sorted_pool:
+            raise ValueError(
+                f"FlashGRPO rectification_indices {rectification_sorted} must equal the SDE candidate "
+                f"pool {sorted_pool}: each sample draws its step from the pool but is normalized over "
+                "rectification_indices, so a mismatch silently mis-scales the loss."
+            )
+        return pool
+
+    @staticmethod
+    def per_prompt_sde_steps(pool: Sequence[int], *, num_prompts: int, rollout_id: int) -> List[int]:
+        """One stratified step per prompt: a rollout-seeded pool permutation cycled by prompt position."""
+        pool_size = len(pool)
+        rng = np.random.default_rng(rollout_id)
+        # Keep the permutation and position modulo identical in both dispatch modes.
+        order = rng.permutation(pool_size)
+        steps = [pool[int(s)] for s in order]
+        return [steps[position % pool_size] for position in range(num_prompts)]
 
     def prepare_part(self, part: Part) -> Part:
         """Attach detached [B, 1] weights before micro slicing; see algorithms/README.md Gotchas."""
