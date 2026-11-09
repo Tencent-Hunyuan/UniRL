@@ -19,6 +19,12 @@ GRAD_AB_DIR = os.environ.get("H3_DIAG_GRAD_AB")
 GRAD_AB_MICROS = tuple(int(size) for size in os.environ.get("H3_DIAG_GRAD_AB_MICROS", "1,8,8,4,2").split(","))
 STATE_SAVE_DIR = os.environ.get("H3_DIAG_STATE_SAVE")
 STATE_LOAD_DIR = os.environ.get("H3_DIAG_STATE_LOAD")
+REPLAY_ONLY = os.environ.get("H3_DIAG_REPLAY_ONLY") == "1"
+GRAD_AB_ONLY = os.environ.get("H3_DIAG_GRAD_AB_ONLY") == "1"
+if REPLAY_ONLY and not STATE_LOAD_DIR:
+    raise ValueError("H3_DIAG_REPLAY_ONLY=1 requires H3_DIAG_STATE_LOAD=<directory>.")
+if GRAD_AB_ONLY and not GRAD_AB_DIR:
+    raise ValueError("H3_DIAG_GRAD_AB_ONLY=1 requires H3_DIAG_GRAD_AB=<directory>.")
 
 
 def dump_first_gradients(function):
@@ -96,6 +102,8 @@ def compare_micro_gradients(function):
                 (directory / f"meta_rank{rank}.json").write_text(json.dumps(meta) + "\n")
             del backend.optimizer_step
             stack.micro_batch_size = configured
+            if GRAD_AB_ONLY:
+                return result
         return function(stack, parts, **kwargs)
 
     return wrapped
@@ -172,6 +180,16 @@ def exchange_first_state(function):
         return function(stack, parts, **kwargs)
 
     return wrapped
+
+
+def replayed_first_part(ranks):
+    """Driver: every rank's saved first-update Part joined in rank order; DP_SCATTER hands rank r its own rows back."""
+    directory = Path(STATE_LOAD_DIR)
+    found = len(list(directory.glob("state_rank*.pt")))
+    if found != ranks:
+        raise ValueError(f"H3_DIAG_REPLAY_ONLY: {directory} holds {found} state_rank*.pt files, not {ranks}.")
+    parts = [torch.load(directory / f"state_rank{rank}.pt", weights_only=False)["parts"][0] for rank in range(ranks)]
+    return type(parts[0]).concat(parts)
 
 
 def dump_rewards(function):

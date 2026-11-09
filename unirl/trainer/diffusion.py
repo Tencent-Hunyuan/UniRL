@@ -21,7 +21,7 @@ from unirl.trainer.residency import DEFAULT_RESIDENCY_POLICY, ResidencyPlanner, 
 from unirl.types.primitives import Texts
 from unirl.types.sample import Sample
 from unirl.types.sampling import BaseSamplingParams, total_samples_per_prompt
-from unirl.utils.h3_diag import dump_rewards
+from unirl.utils.h3_diag import REPLAY_ONLY, dump_rewards, replayed_first_part
 from unirl.utils.stage_metrics import aggregate as aggregate_stage_metrics
 from unirl.utils.stage_metrics import aggregate_training
 from unirl.utils.wandb_metrics import pooled_window_reward_metrics
@@ -1010,7 +1010,7 @@ class DiffusionTrainer(BaseTrainer):
         t0 = time.perf_counter()
         samples: List[Sample] = []
         window_rewards: List[float] = []
-        for rollout_id in window_ids:
+        for rollout_id in () if REPLAY_ONLY else window_ids:
             inputs = self.data_source.get_samples(self.batch_size)
             # Per-sample SDE: one engine-grouped request, or one request per SDE-step group.
             if self._engine_per_sample_sde:
@@ -1030,6 +1030,9 @@ class DiffusionTrainer(BaseTrainer):
         final_id = window_ids[-1]
         training_progress = final_id / max(1, num_rollouts - 1)
         parts = tuple(sample.parts[-1] for sample in samples)
+        if REPLAY_ONLY:
+            parts = (replayed_first_part(self.stack.dp_size),)
+            samples, window_rewards = [None], [float("nan")]
         # First point in the window that needs the trainer on the GPU. With
         # accumulate_rollouts > 1 it stayed parked across every rollout and
         # reward above, so this is one onload per optimizer step rather than one

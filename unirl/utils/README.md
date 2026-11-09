@@ -93,6 +93,10 @@ it installs no runtime wrappers or FSDP patches; the stage recorder is unchanged
   the real update, without stepping the optimizer, and writes
   `<index>_micro<size>/grad_rank<rank>.pt` plus `meta_rank<rank>.json`. All
   variants share one process, one LoRA init, and one batch.
+- `H3_DIAG_GRAD_AB_ONLY=1` (requires `H3_DIAG_GRAD_AB`) skips that real update:
+  the first `train_track` returns the last variant's result, so no optimizer,
+  scheduler, or step-timed EMA update happens and its `grad_norm` is the
+  variants' placeholder `0.0`. Later calls update normally.
 - `H3_DIAG_STATE_SAVE=<directory>` writes `state_rank<rank>.pt` at each rank's
   first `train_track` call: the incoming Parts' `sample_ids`, `segment`,
   `conditions`, and `advantages` (no decoded media or rewards) and every trainable
@@ -105,12 +109,38 @@ it installs no runtime wrappers or FSDP patches; the stage recorder is unchanged
   untouched. Both run before the `H3_DIAG_GRAD_AB` variants, so those and the
   real update use the loaded state. The file is a pickle (`weights_only=False`);
   load only files this code wrote, with the same rank count and per-rank batch.
+- `H3_DIAG_REPLAY_ONLY=1` (requires `H3_DIAG_STATE_LOAD`) makes every
+  `DiffusionTrainer.train_step` skip the data source, rollout, and scoring. The
+  driver joins `parts[0]` of `state_rank0.pt` … `state_rank<N-1>.pt` in rank
+  order, `N` being the train stack's `dp_size`, and passes that one Part to
+  `train_track`; the directory must hold exactly `N` state files. The saved
+  per-rank batches are equal, so `DP_SCATTER`'s contiguous split returns rank `r`
+  the rows of its own file, and the rank-side load above then installs that
+  file's Parts and LoRA shards as usual. No rollout Sample exists, so the step
+  logs `rollout/num_samples: 0` and no reward metrics, and returns a NaN mean
+  reward; `train/` and `perf/` are logged as usual.
 - `H3_DIAG_REWARDS=<directory>` writes `rewards_rollout<id>.json` on the driver,
   in request order, with `sample_id`, zero-based `prompt_index` within that rollout,
   and `reward`. Use fresh directories for separate runs.
 
 ## Gotchas
 
+- **Replay-only never wakes or sleeps the rollout engine.** The engine and the
+  reward are still built, so their startup requirements stand, but the modules a
+  normal run releases in `rollout.sleep()` before its first update are still
+  loaded during the replayed one.
+- **Replay-only applies to every `train_step` and skips nothing else.**
+  Evaluation and checkpoints run as configured, and each later step replays the
+  same rows into a real update. Run it with `num_rollouts=1`, `eval_interval=0`,
+  and `save_interval=0`.
+- **Replayed data keeps the saved dtypes.** The rank-side cast compares the file
+  with the replayed Part, which is the same data, so it changes nothing; a
+  process at another precision receives conditions in the saving run's dtype.
+- **Joining ranks with different text lengths pads the shorter ones.** The
+  driver right-pads their text embeds with masked zeros. The first call's
+  rank-side load restores each file's own shape; later calls train on the padded
+  rows, whose trimmed view differs from the unpadded tensor in the last bits
+  once a micro holds more than one row.
 - **All-gather timing serializes communication.** The patch measures synchronized
   `FSDPParamGroup.unshard` plus `wait_for_unshard` intervals, including launch and
   copy-out, not isolated NCCL latency. The count increments once per newly launched
