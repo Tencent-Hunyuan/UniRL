@@ -3,6 +3,7 @@
 import inspect
 import json
 import os
+import re
 from contextlib import contextmanager
 from dataclasses import fields, is_dataclass
 from functools import partial, wraps
@@ -16,7 +17,10 @@ ALL_GATHER = os.environ.get("H3_DIAG_AG") == "1"
 GRAD_DUMP_DIR = os.environ.get("H3_DIAG_GRAD_DUMP")
 REWARDS_DIR = os.environ.get("H3_DIAG_REWARDS")
 GRAD_AB_DIR = os.environ.get("H3_DIAG_GRAD_AB")
-GRAD_AB_MICROS = tuple(int(size) for size in os.environ.get("H3_DIAG_GRAD_AB_MICROS", "1,8,8,4,2").split(","))
+GRAD_AB_MICROS = tuple(os.environ.get("H3_DIAG_GRAD_AB_MICROS", "1,8,8,4,2").split(","))
+_bad_variants = [spec for spec in GRAD_AB_MICROS if not re.fullmatch(r"[1-9][0-9]*(lo|hi|ra|rb)?", spec)]
+if _bad_variants:
+    raise ValueError(f"H3_DIAG_GRAD_AB_MICROS: {_bad_variants} are not <micro>[lo|hi|ra|rb].")
 STATE_SAVE_DIR = os.environ.get("H3_DIAG_STATE_SAVE")
 STATE_LOAD_DIR = os.environ.get("H3_DIAG_STATE_LOAD")
 REPLAY_ONLY = os.environ.get("H3_DIAG_REPLAY_ONLY") == "1"
@@ -150,6 +154,19 @@ class _FixedMeans:
         del self.stage.replay
 
 
+def _masked_advantages(advantages, mask, rank, world):
+    """``advantages`` [B] zeroed outside the ``mask`` half: rows (lo/hi) or ranks (ra/rb); empty mask keeps all."""
+    if not mask:
+        return advantages
+    if mask in ("lo", "hi"):
+        keep = (torch.arange(advantages.shape[0], device=advantages.device) < advantages.shape[0] // 2) == (
+            mask == "lo"
+        )
+    else:
+        keep = torch.full_like(advantages, (rank < world // 2) == (mask == "ra"), dtype=torch.bool)
+    return torch.where(keep, advantages, torch.zeros_like(advantages))
+
+
 def fixed_means_rows(sample_ids):
     """Name the current micro's rows for the installed H3_DIAG_FIX_MEANS substitution; no-op outside the variants."""
     if _fixed_means is not None:
@@ -173,8 +190,10 @@ def compare_micro_gradients(function):
             rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
             if FIX_MEANS_DIR:
                 _fixed_means = _FixedMeans(stack.algorithm.stage, rank)
-            for index, micro in enumerate(GRAD_AB_MICROS):
-                directory = Path(GRAD_AB_DIR) / f"{index}_micro{micro}"
+            world = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+            for index, spec in enumerate(GRAD_AB_MICROS):
+                micro, mask = int(spec.rstrip("lohirab")), spec.lstrip("0123456789")
+                directory = Path(GRAD_AB_DIR) / f"{index}_micro{spec}"
                 directory.mkdir(parents=True, exist_ok=True)
 
                 def dump(*, max_grad_norm, directory=directory):
@@ -184,9 +203,15 @@ def compare_micro_gradients(function):
 
                 stack.micro_batch_size = micro
                 backend.optimizer_step = dump
+                window = parts if isinstance(parts, tuple) else (parts,)
+                originals = [part.advantages for part in window]
+                for part in window:
+                    part.advantages = _masked_advantages(part.advantages, mask, rank, world)
                 started = perf_counter()
                 result = function(stack, parts, **kwargs)
-                meta = {"micro": micro, "seconds": perf_counter() - started, "loss": result.loss}
+                for part, advantages in zip(window, originals):
+                    part.advantages = advantages
+                meta = {"micro": micro, "mask": mask, "seconds": perf_counter() - started, "loss": result.loss}
                 meta.update({key: value for key, value in result.metrics.items() if isinstance(value, (int, float))})
                 if _fixed_means is not None:
                     meta.update(_fixed_means.finish(micro))
