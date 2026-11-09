@@ -21,6 +21,7 @@ from unirl.trainer.residency import DEFAULT_RESIDENCY_POLICY, ResidencyPlanner, 
 from unirl.types.primitives import Texts
 from unirl.types.sample import Sample
 from unirl.types.sampling import BaseSamplingParams, total_samples_per_prompt
+from unirl.utils.h3_diag import dump_rewards
 from unirl.utils.stage_metrics import aggregate as aggregate_stage_metrics
 from unirl.utils.stage_metrics import aggregate_training
 from unirl.utils.wandb_metrics import pooled_window_reward_metrics
@@ -954,6 +955,7 @@ class DiffusionTrainer(BaseTrainer):
             timer.phases["stack_generate"] = timer.phases.get("stack_generate", 0.0) + peak["generate_s"]
             timer.phases["stack_score"] = timer.phases.get("stack_score", 0.0) + peak["score_s"]
 
+    @dump_rewards
     def _rollout_and_score(
         self,
         samples: Sequence[Sample],

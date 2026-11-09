@@ -8,6 +8,8 @@ from time import perf_counter
 
 import torch
 
+from unirl.utils.h3_diag import ALL_GATHER, install_all_gather
+
 STAGES = ("denoise", "decode", "score", "policy_forward", "kl_ref_forward", "backward", "optimizer_step")
 
 
@@ -127,3 +129,7 @@ def aggregate_training(readings: list[dict[str, dict[str, float]]]) -> dict[str,
     for name in set().union(*(rank["parameter_sums"] for rank in readings)):
         metrics[name] = math.sqrt(math.fsum(rank["parameter_sums"].get(name, 0.0) for rank in readings))
     return metrics
+
+
+if ALL_GATHER:
+    record, take, aggregate = install_all_gather(record, take, aggregate, STAGES)

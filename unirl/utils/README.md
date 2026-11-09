@@ -78,6 +78,34 @@ For each `stage` in `denoise`, `decode`, `score`, `policy_forward`,
   totals, not a separate point for each internal optimizer update. FlashGRPO batch
   normalization requires one update per track.
 
+# H3 Heavy Diagnostics
+
+`h3_diag.py` reads these environment variables once at import. With all unset,
+it installs no runtime wrappers or FSDP patches; the stage recorder is unchanged.
+
+- `H3_DIAG_AG=1` adds `perf/stage/<stage>_ag_s` and
+  `perf/stage/<stage>_ag_count`, each the mean of per-rank step totals.
+- `H3_DIAG_GRAD_DUMP=<directory>` writes `grad_rank<rank>.pt` once per worker
+  process, at its first optimizer step before clipping. Values are detached fp32
+  local gradient shards, keyed by parameter name; no DTensor gather occurs.
+- `H3_DIAG_REWARDS=<directory>` writes `rewards_rollout<id>.json` on the driver,
+  in request order, with `sample_id`, zero-based `prompt_index` within that rollout,
+  and `reward`. Use fresh directories for separate runs.
+
+## Gotchas
+
+- **All-gather timing serializes communication.** The patch measures synchronized
+  `FSDPParamGroup.unshard` plus `wait_for_unshard` intervals, including launch and
+  copy-out, not isolated NCCL latency. The count increments once per newly launched
+  multi-rank collective, not again at wait or for no-ops. During score/generate
+  overlap, H3 transformer collectives belong to denoise, not the non-FSDP scorer.
+- **The patch depends on private FSDP2 APIs.** Torch 2.13 uses
+  `torch.distributed.fsdp._fully_shard._fsdp_param_group.FSDPParamGroup`,
+  `FSDPMeshInfo`, `_all_gather_result`, and `_all_gather_process_group`;
+  `unshard(async_op=False)` sets the pending result and `wait_for_unshard()` clears
+  it. Verify these contracts after a torch upgrade. Retire the patch when native
+  profiler events provide the required stage-level communication totals.
+
 # GPU Memory Monitoring
 
 verl-parity GPU memory observability. Answers one question fast: **when a run

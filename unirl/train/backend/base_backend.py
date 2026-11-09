@@ -34,6 +34,7 @@ from unirl.train.ema import EMA, Shadow, inject_mirror, inject_nft, make_decay_f
 from unirl.train.lora import FrozenAdapters, inject_lora, resolve_target_modules_pattern
 from unirl.train.optim import build_lr_scheduler, build_optimizer
 from unirl.utils.distributed_utils import find_dtensor_mesh, init_gloo_group
+from unirl.utils.h3_diag import dump_first_gradients
 
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
@@ -220,6 +221,7 @@ class BaseFSDP2Backend(Remote):
                 m.set_is_last_backward(enable)
         self._grad_sync_enabled = enable
 
+    @dump_first_gradients
     def optimizer_step(self, *, max_grad_norm: float) -> float:
         """Clip (via the engine hook), optimizer step, scheduler step, EMA step."""
         grad_norm = float(self._clip_grad_norm(max_grad_norm).item())
