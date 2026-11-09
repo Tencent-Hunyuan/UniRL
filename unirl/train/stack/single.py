@@ -27,6 +27,7 @@ from unirl.train.stack.planner import (
 )
 from unirl.types.sample import Part
 from unirl.utils.metrics import aggregate_numeric_metrics
+from unirl.utils.stage_metrics import record, take
 
 logger = logging.getLogger(__name__)
 
@@ -158,7 +159,8 @@ class TrainStack(BaseTrainStack):
             # Accumulation-only part: the window's final part steps.
             grad_norm = 0.0
         elif window_backward:
-            grad_norm = self.fsdp_backend.optimizer_step(max_grad_norm=self.max_grad_norm)
+            with record("optimizer_step"):
+                grad_norm = self.fsdp_backend.optimizer_step(max_grad_norm=self.max_grad_norm)
         else:
             grad_norm = 0.0
             logger.warning(
@@ -187,6 +189,11 @@ class TrainStack(BaseTrainStack):
             metrics=aggregated_metrics,
             optimizer_updates=1 if has_backward and math.isfinite(grad_norm) else 0,
         )
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def collect_stage_metrics(self) -> Dict[str, Dict[str, float]]:
+        """Drain process-local rollout, score and training counters in one driver collection."""
+        return take()
 
     def _all_reduce_sums(self, values: List[float]) -> List[float]:
         """SUM scalars over the backend's FSDP mesh (no-op single-rank)."""

@@ -13,15 +13,50 @@ several independent owners across the tree.
 
 Each module (`dtypes.py`, `media.py`, `metrics.py`, `video.py`,
 `wandb_logger.py`, `profiling.py`, …) is named for what it does and carries a
-one-line docstring — read the one you need directly; it is short enough. The one
-cross-module feature documented here is **GPU memory monitoring**, because it
-spans two files (`memory_utils.py` + `memory_monitor.py`) and three subsystems
-(sampling on the workers, orchestration here, hooks in the trainer).
+one-line docstring — read the one you need directly; it is short enough. The cross-module features documented here are **stage metrics** and **GPU memory
+monitoring**: workers sample them, the driver aggregates them, and the logger
+publishes them.
 
 The one non-obvious helper is `profiling.py`: `UNIRL_PROFILE` is a single switch
 whose *value* names the region to record.
 
 ---
+
+# Stage Metrics
+
+`stage_metrics.py` records H3 denoising and decode, `RewardService` scoring,
+FlashGRPO policy replay and backward, reference replay, and `TrainStack` optimizer
+steps. `DiffusionTrainer` drains the colocated workers once after each training
+track via `TrainStack.collect_stage_metrics`, then uses the existing `log_perf`
+wandb path. Evaluation drains and discards its counters separately.
+
+For each `stage` in `denoise`, `decode`, `score`, `policy_forward`,
+`kl_ref_forward`, `backward`, `optimizer_step`:
+
+| Key | Reduction |
+|---|---|
+| `perf/stage/<stage>_s` | sum calls per worker, then mean across workers |
+| `perf/stage/<stage>_s_max` | sum calls per worker, then maximum across workers |
+| `perf/mem/<stage>_peak_alloc_gb` | maximum allocated GiB across calls and workers |
+| `perf/mem/<stage>_peak_reserved_gb` | maximum reserved GiB across calls and workers |
+
+## Gotchas
+
+- **Stage timing synchronizes at both boundaries.** It adds no model calls, but
+  reduces asynchronous overlap; it is not a zero-overhead profiler. With `G`
+  pipeline calls, `S` score calls, and `M` training micros per rank, one optimizer
+  update adds `4G + 2S + 4M + 2` synchronizations, plus `2M` when `beta>0`.
+  `optimizer_step` includes clipping, scheduler and EMA updates.
+- **Stage peaks are device-wide, not allocation deltas.** A worker owns one CUDA
+  device. Concurrent score/generate stages include each other's live allocations;
+  their times are not additive wall time. The recorder folds every active interval
+  before resetting the allocator, preserving peaks across overlapping stages.
+  `memory_peaks` also preserves the outer `MemoryMonitor` high-water mark until
+  that monitor explicitly resets it. CPU peaks are zero.
+- **The collection covers colocated roles.** Separate rollout/reward worker pools
+  are not collected by the training stack. Multi-update tracks report track-wide
+  totals, not a separate point for each internal optimizer update. FlashGRPO batch
+  normalization requires one update per track.
 
 # GPU Memory Monitoring
 

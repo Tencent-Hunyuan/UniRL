@@ -231,6 +231,11 @@ own reference KL.
   `policy_loss` is the TGR-weighted clipped objective, `kl_ref_mean` the raw KL,
   `kl_loss` is `beta * kl_ref_mean`, and `total_loss` is their sum, matching UniRL's
   metric aggregation.
+  With `beta>0`, `train/kl_video` and `train/kl_audio` report each policy stream's
+  KL before element-count weighting; audio is omitted for a video-only policy.
+  `train/kl_mean_shift_video` and `train/kl_mean_shift_audio` are fp32 L2 norms of
+  detached policy-minus-reference means over all latent elements per row, averaged
+  over rows. They reuse the same replays and add no forward or backward calls.
 - **`adv_clip_max` defaults to `5.0`, copying upstream.** Advantages are clamped before the ratio
   because a collapsed reward spread drives `|adv|` arbitrarily high through the global-std
   denominator. `adv_clip_fraction` in the metrics is the fraction of samples that hit the clamp:

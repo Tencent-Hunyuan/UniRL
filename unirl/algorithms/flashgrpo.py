@@ -16,6 +16,7 @@ from unirl.train.lora import adapters_disabled
 from unirl.types.conditions import Condition
 from unirl.types.sample import Part
 from unirl.types.segments.latent import LatentSegment
+from unirl.utils.stage_metrics import record
 
 from .base import (
     AlgorithmStepResult,
@@ -271,12 +272,13 @@ class FlashGRPO(FlowGRPO):
         target_steps = segment.sde_indices.tolist()
 
         typed_conds = typed_conditions(conditions, self.conditions_cls)
-        replay_result = self.stage.replay(
-            typed_conds,
-            segment=segment,
-            params=self.params,
-            step_indices=target_steps,
-        )
+        with record("policy_forward"):
+            replay_result = self.stage.replay(
+                typed_conds,
+                segment=segment,
+                params=self.params,
+                step_indices=target_steps,
+            )
         new_logp = replay_result.log_probs
         # Each sample took its one stochastic step at its own index, so slot 0 holds its logp.
         old_logp = segment.sde_logp[:, :1].to(dtype=new_logp.dtype, device=new_logp.device)
@@ -303,14 +305,20 @@ class FlashGRPO(FlowGRPO):
         loss_per_elem = loss_per_elem * tgr
         policy_loss = loss_per_elem.mean()
         loss = policy_loss
+        kl_metrics: Dict[str, torch.Tensor] = {}
         if self.beta > 0.0:
             kl_ref = self._reference_kl(
-                conditions=typed_conds, segment=segment, target_steps=target_steps, replay=replay_result
+                conditions=typed_conds,
+                segment=segment,
+                target_steps=target_steps,
+                replay=replay_result,
+                metrics=kl_metrics,
             )
             kl_loss = self.beta * kl_ref
             loss = loss + kl_loss
 
-        (loss * loss_scale).backward()
+        with record("backward"):
+            (loss * loss_scale).backward()
         metric_tensors = {
             "policy_loss": policy_loss.detach(),
             "flash_tgr_mean": tgr.detach().mean(),
@@ -319,6 +327,7 @@ class FlashGRPO(FlowGRPO):
             "adv_clip_fraction": (adv_raw.abs() > self.adv_clip_max).float().mean(),
             "adv_abs_max": adv_raw.abs().max(),
             **ratio_metrics,
+            **kl_metrics,
         }
         if self.beta > 0.0:
             metric_tensors.update(kl_ref_mean=kl_ref.detach(), kl_loss=kl_loss.detach(), total_loss=loss.detach())
@@ -338,7 +347,13 @@ class FlashGRPO(FlowGRPO):
         )
 
     def _reference_kl(
-        self, *, conditions: Any, segment: LatentSegment, target_steps: List[int], replay: "ReplayResult"
+        self,
+        *,
+        conditions: Any,
+        segment: LatentSegment,
+        target_steps: List[int],
+        replay: "ReplayResult",
+        metrics: Dict[str, torch.Tensor],
     ) -> torch.Tensor:
         """Mean per-row dual-stream KL to the LoRA-disabled reference; see algorithms/README.md Gotchas."""
         new_means = replay.prev_sample_means
@@ -347,7 +362,7 @@ class FlashGRPO(FlowGRPO):
                 "FlashGRPO: beta>0 requires stage.replay() to return prev_sample_means, "
                 "but got None. Ensure the stage's replay method produces means."
             )
-        with torch.no_grad(), adapters_disabled(self.ref_model):
+        with record("kl_ref_forward"), torch.no_grad(), adapters_disabled(self.ref_model):
             result = self.stage.replay(conditions, segment=segment, params=self.params, step_indices=target_steps)
         if result.prev_sample_means is None:
             raise RuntimeError(
@@ -367,6 +382,8 @@ class FlashGRPO(FlowGRPO):
             ).reshape(-1, 1)  # [B, 1]
         kl_per_elem = gaussian_kl_div(new_means, ref_means, sigma_t)
         kl_per_step = kl_per_elem.mean(dim=tuple(range(2, kl_per_elem.ndim)))
+        metrics["kl_video"] = kl_per_step.detach().mean()
+        metrics["kl_mean_shift_video"] = (new_means.detach().float() - ref_means.float()).flatten(1).norm(dim=1).mean()
         if replay.audio_in_policy:
             audio_means = replay.audio_prev_sample_means
             if audio_means is None or result.audio_prev_sample_means is None or replay.audio_transition_stds is None:
@@ -375,6 +392,10 @@ class FlashGRPO(FlowGRPO):
                 )
             ref_audio = result.audio_prev_sample_means.detach().to(audio_means)
             audio_kl = gaussian_kl_div(audio_means, ref_audio, replay.audio_transition_stds.detach())
+            metrics["kl_audio"] = audio_kl.detach().mean()
+            metrics["kl_mean_shift_audio"] = (
+                (audio_means.detach().float() - ref_audio.float()).flatten(1).norm(dim=1).mean()
+            )
             n_video, n_audio = new_means[0, 0].numel(), audio_means[0, 0].numel()
             kl_per_step = kl_per_step * (n_video / (n_video + n_audio)) + audio_kl.mean(
                 dim=tuple(range(2, audio_kl.ndim))

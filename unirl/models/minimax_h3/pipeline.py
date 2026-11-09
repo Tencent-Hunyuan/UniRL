@@ -13,6 +13,7 @@ from unirl.sde.runtime import FlowMatchSchedulePolicy
 from unirl.types.noise_recipe import NoiseRecipe
 from unirl.types.primitives import Texts
 from unirl.types.sample import Sample
+from unirl.utils.stage_metrics import record
 
 from .bundle import MiniMaxH3Bundle, load_minimax_h3_text_encoder, load_minimax_h3_vae
 from .conditions import MiniMaxH3Conditions
@@ -181,24 +182,26 @@ class MiniMaxH3Pipeline(Pipeline):
         )
         initial_audio_latents = audio_noise.reshape(batch, geometry.num_audio_rows, -1)
 
-        segment = self.diffusion.generate(
-            conditions,
-            params=params,
-            sigmas=params.sigmas.to(self.bundle.device),
-            geometry=geometry,
-            initial_latents=initial_latents,
-            initial_audio_latents=initial_audio_latents,
-            sde_indices=list(params.sde_indices) if params.sde_indices is not None else None,
-            # sample_ids live on the PART, not the Sample -- `Sample` has
-            # root_group_ids()/split() but no sample_ids of its own.
-            denoise_seed_keys=[str(sample_id) for sample_id in gen.sample_ids],
-            denoise_base_seed=params.seed if params.seed is not None else 0,
-        )
+        with record("denoise"):
+            segment = self.diffusion.generate(
+                conditions,
+                params=params,
+                sigmas=params.sigmas.to(self.bundle.device),
+                geometry=geometry,
+                initial_latents=initial_latents,
+                initial_audio_latents=initial_audio_latents,
+                sde_indices=list(params.sde_indices) if params.sde_indices is not None else None,
+                # sample_ids live on the PART, not the Sample -- `Sample` has
+                # root_group_ids()/split() but no sample_ids of its own.
+                denoise_seed_keys=[str(sample_id) for sample_id in gen.sample_ids],
+                denoise_base_seed=params.seed if params.seed is not None else 0,
+            )
 
         final_rows = segment.latents_at(params.num_inference_steps)
         final_audio_rows = segment.aux_latents_at(params.num_inference_steps)
-        videos = self.video_decode.decode(final_rows, geometry)
-        audios = self.audio_decode.decode(final_audio_rows, geometry)
+        with record("decode"):
+            videos = self.video_decode.decode(final_rows, geometry)
+            audios = self.audio_decode.decode(final_audio_rows, geometry)
 
         filled = gen.fill(
             segment=segment,

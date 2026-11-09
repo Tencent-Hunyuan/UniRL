@@ -10,6 +10,8 @@ from typing import Dict, Optional
 
 import torch
 
+from unirl.utils.stage_metrics import memory_peaks
+
 logger = logging.getLogger(__name__)
 
 _GB = float(2**30)
@@ -59,12 +61,13 @@ def get_memory_info(device: Optional[int] = None) -> Dict[str, float]:
     dev = torch.cuda.current_device() if device is None else device
     allocated = torch.cuda.memory_allocated(dev) / _GB
     reserved = torch.cuda.memory_reserved(dev) / _GB
+    peak_allocated, peak_reserved = memory_peaks(dev)
     info: Dict[str, float] = {
         "allocated_gb": allocated,
         "reserved_gb": reserved,
         "cached_gb": reserved - allocated,
-        "max_allocated_gb": torch.cuda.max_memory_allocated(dev) / _GB,
-        "max_reserved_gb": torch.cuda.max_memory_reserved(dev) / _GB,
+        "max_allocated_gb": peak_allocated,
+        "max_reserved_gb": peak_reserved,
     }
     try:
         free_b, total_b = torch.cuda.mem_get_info(dev)

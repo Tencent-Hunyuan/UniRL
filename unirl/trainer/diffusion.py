@@ -21,6 +21,7 @@ from unirl.trainer.residency import DEFAULT_RESIDENCY_POLICY, ResidencyPlanner, 
 from unirl.types.primitives import Texts
 from unirl.types.sample import Sample
 from unirl.types.sampling import BaseSamplingParams, total_samples_per_prompt
+from unirl.utils.stage_metrics import aggregate as aggregate_stage_metrics
 from unirl.utils.wandb_metrics import pooled_window_reward_metrics
 
 logger = logging.getLogger(__name__)
@@ -1045,9 +1046,11 @@ class DiffusionTrainer(BaseTrainer):
         # leave every other domain's curve empty. The pooled keys override the
         # final sample's partial ones inside log_rollout_step.
         extra = pooled_window_reward_metrics(list(parts)) if len(parts) > 1 else None
+        stage_metrics = aggregate_stage_metrics(self.stack.collect_stage_metrics())
         self.wandb_logger.log_rollout_step(
             final_id, result, samples[-1], step_time_s=time.perf_counter() - t0, extra_metrics=extra
         )
+        self.wandb_logger.log_perf(final_id + 1, stage_metrics)
         return result, sum(window_rewards) / len(window_rewards)
 
     def evaluate(
@@ -1128,6 +1131,7 @@ class DiffusionTrainer(BaseTrainer):
             eval_diffusion.eta,
             "  ".join(f"{k}={v:.4f}" for k, v in metrics.items()),
         )
+        self.stack.collect_stage_metrics()
         self.wandb_logger.log_eval(step, metrics)
         return metrics["reward"]
 
