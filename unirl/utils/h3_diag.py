@@ -208,9 +208,11 @@ def compare_micro_gradients(function):
                 for part in window:
                     part.advantages = _masked_advantages(part.advantages, mask, rank, world)
                 started = perf_counter()
-                result = function(stack, parts, **kwargs)
-                for part, advantages in zip(window, originals):
-                    part.advantages = advantages
+                try:
+                    result = function(stack, parts, **kwargs)
+                finally:
+                    for part, advantages in zip(window, originals):
+                        part.advantages = advantages
                 meta = {"micro": micro, "mask": mask, "seconds": perf_counter() - started, "loss": result.loss}
                 meta.update({key: value for key, value in result.metrics.items() if isinstance(value, (int, float))})
                 if _fixed_means is not None:

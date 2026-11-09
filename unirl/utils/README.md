@@ -91,14 +91,16 @@ it installs no runtime wrappers or FSDP patches; the stage recorder is unchanged
 - `H3_DIAG_GRAD_AB=<directory>` recomputes the first update's synced, pre-clip
   gradient once per size in `H3_DIAG_GRAD_AB_MICROS` (default `1,8,8,4,2`) before
   the real update, without stepping the optimizer, and writes
-  `<index>_micro<size>/grad_rank<rank>.pt` plus `meta_rank<rank>.json`. All
+  `<index>_micro<spec>/grad_rank<rank>.pt` plus `meta_rank<rank>.json`. All
   variants share one process, one LoRA init, and one batch. An entry may carry a
   mask suffix that zeroes the advantages outside one half for that variant only:
   `lo`/`hi` keep the first/second half of each rank's rows, `ra`/`rb` keep the
   ranks below/at-or-above `world_size // 2` (one root prompt per rank in the H3
-  8x8 layout). The policy loss is linear in advantages, so `lo + hi` and
-  `ra + rb` each sum to the unmasked gradient up to rounding; the reference KL
-  term is not masked.
+  8x8 layout). The policy loss is linear in advantages, so the policy parts of
+  `lo + hi` and `ra + rb` each sum to the unmasked policy gradient up to
+  rounding. The reference KL term is not masked, so each half carries one full
+  KL gradient: compare sums with `beta=0`, or where the KL gradient is zero
+  (first update from a zero LoRA B), or subtract one KL gradient.
 - `H3_DIAG_GRAD_AB_ONLY=1` (requires `H3_DIAG_GRAD_AB`) skips that real update:
   the first `train_track` returns the last variant's result, so no optimizer,
   scheduler, or step-timed EMA update happens and its `grad_norm` is the
