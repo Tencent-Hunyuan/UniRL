@@ -4,13 +4,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from dataclasses import field as dc_field
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Type, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, Type, Union
 
 import numpy as np
 import torch
 
 from unirl.sde.index_schedule import AllSDEScheduler
 from unirl.sde.kernels import FlashSDEStrategy
+from unirl.train.lora import adapters_disabled
 from unirl.types.conditions import Condition
 from unirl.types.sample import Part
 from unirl.types.segments.latent import LatentSegment
@@ -18,12 +19,16 @@ from unirl.types.segments.latent import LatentSegment
 from .base import (
     AlgorithmStepResult,
     BaseAlgorithmConfig,
+    gaussian_kl_div,
     grpo_clip_loss,
-    reference_kl_loss,
     resolve_clip_range_from_schedule,
+    transition_sigma,
     typed_conditions,
 )
 from .flowgrpo import FlowGRPO
+
+if TYPE_CHECKING:
+    from unirl.models.types.replay_result import ReplayResult
 
 
 @dataclass
@@ -294,16 +299,8 @@ class FlashGRPO(FlowGRPO):
         policy_loss = loss_per_elem.mean()
         loss = policy_loss
         if self.beta > 0.0:
-            kl_ref = reference_kl_loss(
-                self.stage,
-                self.ref_model,
-                conditions=typed_conds,
-                segment=segment,
-                params=self.params,
-                target_steps=target_steps,
-                new_means=replay_result.prev_sample_means,
-                algo="FlashGRPO",
-                new_replay=replay_result,
+            kl_ref = self._reference_kl(
+                conditions=typed_conds, segment=segment, target_steps=target_steps, replay=replay_result
             )
             kl_loss = self.beta * kl_ref
             loss = loss + kl_loss
@@ -334,6 +331,50 @@ class FlashGRPO(FlowGRPO):
             num_steps_or_tokens=len(target_steps),
             has_backward=True,
         )
+
+    def _reference_kl(
+        self, *, conditions: Any, segment: LatentSegment, target_steps: List[int], replay: "ReplayResult"
+    ) -> torch.Tensor:
+        """Mean per-row dual-stream KL to the LoRA-disabled reference; see algorithms/README.md Gotchas."""
+        new_means = replay.prev_sample_means
+        if new_means is None:
+            raise RuntimeError(
+                "FlashGRPO: beta>0 requires stage.replay() to return prev_sample_means, "
+                "but got None. Ensure the stage's replay method produces means."
+            )
+        with torch.no_grad(), adapters_disabled(self.ref_model):
+            result = self.stage.replay(conditions, segment=segment, params=self.params, step_indices=target_steps)
+        if result.prev_sample_means is None:
+            raise RuntimeError(
+                "FlashGRPO: stage.replay() returned prev_sample_means=None for the adapter-disabled reference forward."
+            )
+        ref_means = result.prev_sample_means.detach().to(dtype=new_means.dtype, device=new_means.device)
+        if replay.video_transition_stds is not None:
+            sigma_t = replay.video_transition_stds.detach()
+        else:
+            sigma_t = transition_sigma(
+                self.stage,
+                segment=segment,
+                target_steps=segment.sde_index_per_sample,
+                eta=self.params.eta,
+                device=new_means.device,
+                add_coefficient=True,
+            ).reshape(-1, 1)  # [B, 1]
+        kl_per_elem = gaussian_kl_div(new_means, ref_means, sigma_t)
+        kl_per_step = kl_per_elem.mean(dim=tuple(range(2, kl_per_elem.ndim)))
+        if replay.audio_in_policy:
+            audio_means = replay.audio_prev_sample_means
+            if audio_means is None or result.audio_prev_sample_means is None or replay.audio_transition_stds is None:
+                raise RuntimeError(
+                    "FlashGRPO: joint reference KL requires audio policy/reference means and transition stds."
+                )
+            ref_audio = result.audio_prev_sample_means.detach().to(audio_means)
+            audio_kl = gaussian_kl_div(audio_means, ref_audio, replay.audio_transition_stds.detach())
+            n_video, n_audio = new_means[0, 0].numel(), audio_means[0, 0].numel()
+            kl_per_step = kl_per_step * (n_video / (n_video + n_audio)) + audio_kl.mean(
+                dim=tuple(range(2, audio_kl.ndim))
+            ) * (n_audio / (n_video + n_audio))
+        return kl_per_step.mean()
 
     def _rectification_weights_per_sample(
         self,
