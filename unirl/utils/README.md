@@ -88,6 +88,11 @@ it installs no runtime wrappers or FSDP patches; the stage recorder is unchanged
 - `H3_DIAG_GRAD_DUMP=<directory>` writes `grad_rank<rank>.pt` once per worker
   process, at its first optimizer step before clipping. Values are detached fp32
   local gradient shards, keyed by parameter name; no DTensor gather occurs.
+- `H3_DIAG_GRAD_AB=<directory>` recomputes the first update's synced, pre-clip
+  gradient once per size in `H3_DIAG_GRAD_AB_MICROS` (default `1,8,8,4,2`) before
+  the real update, without stepping the optimizer, and writes
+  `<index>_micro<size>/grad_rank<rank>.pt` plus `meta_rank<rank>.json`. All
+  variants share one process, one LoRA init, and one batch.
 - `H3_DIAG_REWARDS=<directory>` writes `rewards_rollout<id>.json` on the driver,
   in request order, with `sample_id`, zero-based `prompt_index` within that rollout,
   and `reward`. Use fresh directories for separate runs.

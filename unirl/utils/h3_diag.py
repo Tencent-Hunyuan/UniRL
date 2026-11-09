@@ -14,6 +14,8 @@ import torch
 ALL_GATHER = os.environ.get("H3_DIAG_AG") == "1"
 GRAD_DUMP_DIR = os.environ.get("H3_DIAG_GRAD_DUMP")
 REWARDS_DIR = os.environ.get("H3_DIAG_REWARDS")
+GRAD_AB_DIR = os.environ.get("H3_DIAG_GRAD_AB")
+GRAD_AB_MICROS = tuple(int(size) for size in os.environ.get("H3_DIAG_GRAD_AB_MICROS", "1,8,8,4,2").split(","))
 
 
 def dump_first_gradients(function):
@@ -41,6 +43,57 @@ def dump_first_gradients(function):
             torch.save(gradients, directory / f"grad_rank{rank}.pt")
             dumped = True
         return function(backend, *args, **kwargs)
+
+    return wrapped
+
+
+def _local_gradients(backend):
+    """Detached fp32 CPU copies of this rank's trainable gradient shards, keyed by parameter name."""
+    from torch.distributed.tensor import DTensor
+
+    gradients = {}
+    for name, parameter in backend.model.named_parameters():
+        if parameter.requires_grad and parameter.grad is not None:
+            gradient = parameter.grad
+            if isinstance(gradient, DTensor):
+                gradient = gradient.to_local()
+            gradients[name] = gradient.detach().float().cpu()
+    return gradients
+
+
+def compare_micro_gradients(function):
+    """Before the first real update, recompute its synced gradient at each requested micro size without stepping."""
+    if not GRAD_AB_DIR:
+        return function
+    done = False
+
+    @wraps(function)
+    def wrapped(stack, parts, **kwargs):
+        nonlocal done
+        if not done:
+            done = True
+            backend = stack.fsdp_backend
+            configured = stack.micro_batch_size
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            for index, micro in enumerate(GRAD_AB_MICROS):
+                directory = Path(GRAD_AB_DIR) / f"{index}_micro{micro}"
+                directory.mkdir(parents=True, exist_ok=True)
+
+                def dump(*, max_grad_norm, directory=directory):
+                    torch.save(_local_gradients(backend), directory / f"grad_rank{rank}.pt")
+                    backend.optimizer.zero_grad(set_to_none=True)
+                    return 0.0
+
+                stack.micro_batch_size = micro
+                backend.optimizer_step = dump
+                started = perf_counter()
+                result = function(stack, parts, **kwargs)
+                meta = {"micro": micro, "seconds": perf_counter() - started, "loss": result.loss}
+                meta.update({key: value for key, value in result.metrics.items() if isinstance(value, (int, float))})
+                (directory / f"meta_rank{rank}.json").write_text(json.dumps(meta) + "\n")
+            del backend.optimizer_step
+            stack.micro_batch_size = configured
+        return function(stack, parts, **kwargs)
 
     return wrapped
 
