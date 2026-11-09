@@ -70,6 +70,10 @@ if it needs multi-update, set `anchor_fields` and `supports_multi_update = True`
 declare `recomputes_anchor` when `prepare_segment` must follow the planned micro
 geometry (see `FlowGRPO`). A new AR loss mirrors `GRPO` (early-return on an empty
 segment, expand advantages per token), keeping `supports_multi_update = False`.
+An algorithm that sets `requires_per_sample_sde_index = True` also owns the rollout
+policy the trainer calls on its class before model loading: `engine_groups_sde_steps`
+(config checks, returns `engine_per_sample_sde`), `per_sample_sde_pool` (validated
+candidate pool) and `per_prompt_sde_steps` (the stratified per-prompt draw); see `FlashGRPO`.
 
 ## Gotchas
 
@@ -168,11 +172,6 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   this: the operands are already rounded when the forward returns them. DiffusionOPD's
   `fp32 before squaring` is not the same situation — it upcasts scheduler-computed
   `prev_sample_means`, not raw network output.
-- **`DiffusionTrainer` owns FlashGRPO configuration checks before model loading.**
-  It validates engine-mode requirements, the nonempty `AllSDEScheduler` pool excluding
-  the final step, and agreement with `rectification_indices`. Direct algorithm callers
-  must supply a validated configuration; the algorithm checks stage/backend capabilities.
-  `FlashGRPOConfig` owns the engine-mode and batch-normalization defaults.
 - **By default, `FlashGRPO.rectification_indices` is a required pool normalizer, not a target list.**
   Each sample's coefficient is divided by the candidate-pool mean, which equals the actual
   batch mean only with equal step counts. `batch_normalize_tgr: true` instead normalizes the
@@ -201,7 +200,7 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   same backend model with LoRA adapters disabled under `torch.no_grad`, not an EMA
   model or another loaded checkpoint; a LoRA backend is required. Replay uses each
   row's `sde_index_per_sample`, stored before/after latents, and conditions.
-  `reference_kl_loss` computes `(new_mean - ref_mean)^2 / (2 * transition_std^2)`.
+  `FlashGRPO._reference_kl` computes `(new_mean - ref_mean)^2 / (2 * transition_std^2)`.
   H3's `audio_joint_sde: true` includes both streams using their own transition
   standard deviations and latent-element-count weights, not equal stream weights;
   `false` includes video only. Per-row A/V stages declare audio participation through

@@ -65,7 +65,7 @@ in `backend/base.py`; a multi-update-capable algorithm sets
 `recomputes_anchor` when its anchor must follow the planned micro geometry (see
 `../algorithms/README.md`).
 
-## Export-only LoRA EMA for H3 FlashGRPO
+## Export-only LoRA EMA
 
 - **Enable:** The [H3 FlashGRPO recipe](../../examples/diffusion/minimax_h3/minimax_h3_t2va_flashgrpo.yaml)
   defaults to off. Keep `backend.lora_cfg` and add:

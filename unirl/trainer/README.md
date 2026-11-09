@@ -379,7 +379,7 @@ The LoRA scaling comes from the `lora_config` recorded in the checkpoint;
 AR models: `--library transformers`, no `--subfolder`. For adapter artifacts,
 use `python -m unirl.tools.export_adapter --checkpoint ... --base ... --output ...`.
 NFT runs can export the EMA shadow adapter with `--adapter old`. For mirror EMA,
-use `--ema`; see [`train/readme.md`](../train/readme.md#export-only-lora-ema-for-h3-flashgrpo).
+use `--ema`; see [`train/readme.md`](../train/readme.md#export-only-lora-ema).
 
 For PE, point the exporter at one side's directory, for example
 `checkpoint-1000/diffusion` or `checkpoint-1000/ar`, rather than at the common
@@ -502,7 +502,8 @@ without driver-authored x_T. `media_log_interval` does not apply
 - **The bundle must be shared, not rebuilt** — the trainer injects one bundle into both
   pipeline and backend; a second `from_config` would silently desync replay. See [`../models/README.md`](../models/README.md).
 - **By default, FlashGRPO groups requests on the driver.** `requires_per_sample_sde_index`
-  makes the trainer put prompt `i` in stratum `i % pool_size` and issue one `generate` per step
+  makes the trainer take `FlashGRPO.per_prompt_sde_steps` (prompt `i` in stratum `i % pool_size`
+  of a rollout-seeded pool permutation) and issue one `generate` per step
   group inside a single residency window. Each request carries its step on the frontier Part;
   the engine stamps before returning, and the driver concatenates the groups into one track.
   Flash-GRPO wants exactly this granularity: the paper assigns one timestep per
@@ -575,8 +576,8 @@ without driver-authored x_T. `media_log_interval` does not apply
   the authoritative per-sample step; `PerSampleStepReplayMixin.replay_per_sample` indexes fixed
   latent slots `[:, 0]` / `[:, 1]`, not `latents_at()`.
 - **The SDE candidate pool must not reach the final denoising step.** Step `T-1` stores two trajectory
-  latents where earlier steps store three, and `torch.cat` cannot merge different `K`. The trainer
-  raises at build time rather than failing mid-rollout. Keep the scheduler's `timestep_fraction` end
+  latents where earlier steps store three, and `torch.cat` cannot merge different `K`.
+  `FlashGRPO.per_sample_sde_pool` raises at trainer build time rather than failing mid-rollout. Keep the scheduler's `timestep_fraction` end
   below `(num_inference_steps - 1) / num_inference_steps`.
 - **An explicit `rectification_indices` must equal the scheduler's candidate pool.** With
   `algorithm.batch_normalize_tgr: true` it may be omitted: weights use the actual global
@@ -585,4 +586,4 @@ without driver-authored x_T. `media_log_interval` does not apply
   In the default pool-normalized mode, the per-sample rectification
   weight normalizes each sample's coefficient by the mean over `rectification_indices` while the step
   itself is drawn from `sde_candidate_pool()`; the two live in different config blocks, and a mismatch
-  silently rescales the loss. The trainer fails fast instead.
+  silently rescales the loss. `FlashGRPO.per_sample_sde_pool` fails fast at trainer build time instead.
