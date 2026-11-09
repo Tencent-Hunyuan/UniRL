@@ -26,8 +26,8 @@ from unirl.train.stack.planner import (
     arranged_slice,
 )
 from unirl.types.sample import Part
+from unirl.utils.h3_diag import FIX_MEANS_DIR, compare_micro_gradients, exchange_first_state, fixed_means_rows
 from unirl.utils.metrics import aggregate_numeric_metrics
-from unirl.utils.h3_diag import compare_micro_gradients, exchange_first_state
 from unirl.utils.stage_metrics import record, record_parameter_sums, take
 
 logger = logging.getLogger(__name__)
@@ -124,6 +124,8 @@ class TrainStack(BaseTrainStack):
             # Defer gradient reduce-scatter until the stepping rollout's final microbatch.
             self.fsdp_backend.set_grad_sync(do_optimizer_step and i == last_micro)
             micro_part = part if single_micro else arranged_slice(part, order, start, end)
+            if FIX_MEANS_DIR:
+                fixed_means_rows(micro_part.sample_ids)
             result = self.algorithm.compute_loss_and_backward(
                 conditions=micro_part.conditions,
                 segment=micro_part.segment,

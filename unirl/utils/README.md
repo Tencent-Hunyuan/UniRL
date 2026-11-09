@@ -97,6 +97,20 @@ it installs no runtime wrappers or FSDP patches; the stage recorder is unchanged
   the first `train_track` returns the last variant's result, so no optimizer,
   scheduler, or step-timed EMA update happens and its `grad_norm` is the
   variants' placeholder `0.0`. Later calls update normally.
+- `H3_DIAG_FIX_MEANS=<directory>` (requires `H3_DIAG_GRAD_AB`) pins the start of
+  every variant's backward. While the variants run, each policy log-prob is
+  computed from `mu_ref + (mu - mu.detach())`, `mu_ref` being the stored video
+  and audio transition mean of the same sample id: its value is that of `mu_ref`
+  and `mu` receives `(x_next - mu_ref) / std**2` times the unchanged log-prob
+  factor, so variants differ only in `d mu / d theta`. Without
+  `means_rank<rank>.pt` the first variant captures it from its own forward (so
+  run the rollout's per-rank batch as that variant's micro size) and saves it with
+  the variant's metadata; a later process, e.g. fp32, loads it and casts to its
+  own means. Each `meta_rank<rank>.json` adds `means_file`, `means_captured`,
+  per-modality `substitutions`, `logp_rows`, `logp_equal_rows` and
+  `logp_max_abs_diff` against the stored `old_logp`, and `policy_loss_micros`. A
+  micro row id missing from the file raises. The reference KL, its no-grad
+  replay, TGR weights, clipping and advantages keep the live means and values.
 - `H3_DIAG_STATE_SAVE=<directory>` writes `state_rank<rank>.pt` at each rank's
   first `train_track` call: the incoming Parts' `sample_ids`, `segment`,
   `conditions`, and `advantages` (no decoded media or rewards) and every trainable

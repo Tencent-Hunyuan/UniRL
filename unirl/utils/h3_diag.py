@@ -5,7 +5,7 @@ import json
 import os
 from contextlib import contextmanager
 from dataclasses import fields, is_dataclass
-from functools import wraps
+from functools import partial, wraps
 from pathlib import Path
 from threading import Lock
 from time import perf_counter
@@ -21,10 +21,14 @@ STATE_SAVE_DIR = os.environ.get("H3_DIAG_STATE_SAVE")
 STATE_LOAD_DIR = os.environ.get("H3_DIAG_STATE_LOAD")
 REPLAY_ONLY = os.environ.get("H3_DIAG_REPLAY_ONLY") == "1"
 GRAD_AB_ONLY = os.environ.get("H3_DIAG_GRAD_AB_ONLY") == "1"
+FIX_MEANS_DIR = os.environ.get("H3_DIAG_FIX_MEANS")
 if REPLAY_ONLY and not STATE_LOAD_DIR:
     raise ValueError("H3_DIAG_REPLAY_ONLY=1 requires H3_DIAG_STATE_LOAD=<directory>.")
 if GRAD_AB_ONLY and not GRAD_AB_DIR:
     raise ValueError("H3_DIAG_GRAD_AB_ONLY=1 requires H3_DIAG_GRAD_AB=<directory>.")
+if FIX_MEANS_DIR and not GRAD_AB_DIR:
+    raise ValueError("H3_DIAG_FIX_MEANS=<directory> requires H3_DIAG_GRAD_AB=<directory>.")
+_fixed_means = None
 
 
 def dump_first_gradients(function):
@@ -70,6 +74,88 @@ def _local_gradients(backend):
     return gradients
 
 
+class _FixedMeans:
+    """Straight-through policy means pinned to stored per-sample-id means while installed; see utils/README.md."""
+
+    def __init__(self, stage, rank):
+        self.path = Path(FIX_MEANS_DIR) / f"means_rank{rank}.pt"
+        self.capture = not self.path.exists()
+        self.means = {} if self.capture else torch.load(self.path, weights_only=True)["means"]
+        self.stage = stage
+        self.strategies = {"video": stage.strategy, "audio": getattr(stage, "audio_strategy", None)}
+        for modality, strategy in self.strategies.items():
+            if strategy is not None:
+                strategy.compute_log_prob = partial(self._log_prob, modality, strategy.compute_log_prob)
+        stage.replay = partial(self._replay, stage.replay)
+        self._reset()
+
+    def _reset(self):
+        self.rows = None
+        self.substitutions = {"video": 0, "audio": 0}
+        self.logp_rows = self.logp_equal_rows = 0
+        self.logp_max_abs_diff = 0.0
+
+    def _log_prob(self, modality, original, prev_sample, prev_sample_mean, **kwargs):
+        if self.rows is None or not torch.is_grad_enabled():
+            return original(prev_sample, prev_sample_mean, **kwargs)
+        if len(self.rows) != prev_sample_mean.shape[0]:
+            raise ValueError(f"H3_DIAG_FIX_MEANS: {len(self.rows)} sample ids for {prev_sample_mean.shape[0]} rows.")
+        if self.capture:
+            for sample_id, mean in zip(self.rows, prev_sample_mean.detach().cpu()):
+                self.means.setdefault(sample_id, {})[modality] = mean.clone()
+        missing = [sample_id for sample_id in self.rows if modality not in self.means.get(sample_id, {})]
+        if missing:
+            raise KeyError(f"H3_DIAG_FIX_MEANS: {self.path} has no {modality} mean for sample ids {missing}.")
+        reference = torch.stack([self.means[sample_id][modality] for sample_id in self.rows]).to(prev_sample_mean)
+        if reference.shape != prev_sample_mean.shape:
+            raise ValueError(
+                f"H3_DIAG_FIX_MEANS: stored {modality} means {tuple(reference.shape)} for rows of "
+                f"{tuple(prev_sample_mean.shape)}."
+            )
+        self.substitutions[modality] += 1
+        return original(prev_sample, reference + (prev_sample_mean - prev_sample_mean.detach()), **kwargs)
+
+    def _replay(self, original, conditions, *, segment, **kwargs):
+        result = original(conditions, segment=segment, **kwargs)
+        if self.rows is not None and torch.is_grad_enabled():
+            new = result.log_probs.detach()
+            old = segment.sde_logp[:, :1].to(dtype=new.dtype, device=new.device)
+            self.logp_rows += new.shape[0]
+            self.logp_equal_rows += int((new == old).all(dim=1).sum())
+            self.logp_max_abs_diff = max(self.logp_max_abs_diff, (new - old).abs().max().item())
+        return result
+
+    def finish(self, micro):
+        """This variant's metadata; a capturing first variant also saves its means and the old_logp check."""
+        meta = {
+            "fix_means": True,
+            "means_file": str(self.path),
+            "means_captured": self.capture,
+            "substitutions": self.substitutions,
+            "logp_rows": self.logp_rows,
+            "logp_equal_rows": self.logp_equal_rows,
+            "logp_max_abs_diff": self.logp_max_abs_diff,
+        }
+        if self.capture:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save({"means": self.means, "capture": {**meta, "micro": micro}}, self.path)
+            self.capture = False
+        self._reset()
+        return meta
+
+    def remove(self):
+        for strategy in self.strategies.values():
+            if strategy is not None:
+                del strategy.compute_log_prob
+        del self.stage.replay
+
+
+def fixed_means_rows(sample_ids):
+    """Name the current micro's rows for the installed H3_DIAG_FIX_MEANS substitution; no-op outside the variants."""
+    if _fixed_means is not None:
+        _fixed_means.rows = list(sample_ids)
+
+
 def compare_micro_gradients(function):
     """Before the first real update, recompute its synced gradient at each requested micro size without stepping."""
     if not GRAD_AB_DIR:
@@ -78,12 +164,15 @@ def compare_micro_gradients(function):
 
     @wraps(function)
     def wrapped(stack, parts, **kwargs):
+        global _fixed_means
         nonlocal done
         if not done:
             done = True
             backend = stack.fsdp_backend
             configured = stack.micro_batch_size
             rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            if FIX_MEANS_DIR:
+                _fixed_means = _FixedMeans(stack.algorithm.stage, rank)
             for index, micro in enumerate(GRAD_AB_MICROS):
                 directory = Path(GRAD_AB_DIR) / f"{index}_micro{micro}"
                 directory.mkdir(parents=True, exist_ok=True)
@@ -99,7 +188,13 @@ def compare_micro_gradients(function):
                 result = function(stack, parts, **kwargs)
                 meta = {"micro": micro, "seconds": perf_counter() - started, "loss": result.loss}
                 meta.update({key: value for key, value in result.metrics.items() if isinstance(value, (int, float))})
+                if _fixed_means is not None:
+                    meta.update(_fixed_means.finish(micro))
+                    meta["policy_loss_micros"] = [m.metrics["policy_loss"] for m in result.micros]
                 (directory / f"meta_rank{rank}.json").write_text(json.dumps(meta) + "\n")
+            if _fixed_means is not None:
+                _fixed_means.remove()
+                _fixed_means = None
             del backend.optimizer_step
             stack.micro_batch_size = configured
             if GRAD_AB_ONLY:
