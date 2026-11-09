@@ -18,7 +18,8 @@
 a `StageAlgorithm` that takes a rollout track with advantages already attached,
 replays the stage at the current weights, computes a policy-gradient loss, and
 calls `backward()`. It owns the loss math and nothing else — no optimizer, no
-model, no data.
+model, no data — except that a per-sample-SDE algorithm also owns its rollout
+step policy (see **Extending it**).
 
 ## Why it exists
 
@@ -71,9 +72,13 @@ declare `recomputes_anchor` when `prepare_segment` must follow the planned micro
 geometry (see `FlowGRPO`). A new AR loss mirrors `GRPO` (early-return on an empty
 segment, expand advantages per token), keeping `supports_multi_update = False`.
 An algorithm that sets `requires_per_sample_sde_index = True` also owns the rollout
-policy the trainer calls on its class before model loading: `engine_groups_sde_steps`
-(config checks, returns `engine_per_sample_sde`), `per_sample_sde_pool` (validated
-candidate pool) and `per_prompt_sde_steps` (the stratified per-prompt draw); see `FlashGRPO`.
+policy the trainer calls on its class: at trainer init, before model loading,
+`engine_groups_sde_steps` (config checks, returns `engine_per_sample_sde`) and
+`per_sample_sde_pool` (validated candidate pool, fixed for the run); at each rollout
+request, `per_prompt_sde_steps` (the stratified per-prompt draw); see `FlashGRPO`.
+Building the algorithm directly skips these trainer-side checks. The shared
+`reference_kl_loss` rejects per-sample SDE-index segments; such an algorithm needs its
+own reference KL.
 
 ## Gotchas
 

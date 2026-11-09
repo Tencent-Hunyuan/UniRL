@@ -260,6 +260,11 @@ def reference_kl_loss(
             f"{algo}: beta>0 requires stage.replay() to return prev_sample_means, "
             "but got None. Ensure the stage's replay method produces means."
         )
+    if segment.sde_index_per_sample is not None:
+        raise ValueError(
+            f"{algo}: reference_kl_loss uses one shared sigma per target step; a per-sample SDE-index "
+            "segment needs its algorithm's own reference KL (see FlashGRPO._reference_kl)."
+        )
     from unirl.train.lora import adapters_disabled
 
     with torch.no_grad(), adapters_disabled(ref_model):
