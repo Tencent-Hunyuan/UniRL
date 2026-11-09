@@ -525,13 +525,14 @@ without driver-authored x_T. `media_log_interval` does not apply
   lengths preserve FSDP forward/collective counts even if ranks visit different steps.
   After stamping, the engine clears the Part's request-only field;
   `segment.sde_index_per_sample` is the output authority.
-  With `forward_batch_size>1`, startup requires `batch_size == rollout.dp_size` before
-  constructing trainside model roles: DP_SCATTER gives each rank one prompt's whole
-  subtree, so its rows share one SDE step and use the existing chunked generation path.
-  Equal row counts give each rank `ceil(samples_per_prompt / forward_batch_size)` pipeline
-  calls without `reward_stack`; with it, calls are counted per micro as
-  `ceil(rows_per_rank_in_micro / forward_batch_size)`.
-  Mixed-step shards still require `forward_batch_size=1`.
+  With `forward_batch_size>1`, startup requires a positive `batch_size` divisible by
+  `rollout.dp_size` before constructing trainside model roles. DP_SCATTER preserves whole
+  prompt subtrees; the engine splits each shard at contiguous root-group boundaries,
+  even when adjacent prompts share a step, then uses the existing single-step chunk path.
+  Each prompt must carry one SDE step. Equal prompt counts give each rank
+  `(batch_size / rollout.dp_size) * ceil(samples_per_prompt / forward_batch_size)` pipeline
+  calls without `reward_stack`. With it, count `ceil(rows / forward_batch_size)` for each
+  prompt fragment in each micro; equal shard sizes and micro boundaries keep ranks in lockstep.
   Reward/train geometry checks and model-specific batch limits still apply.
   Both FlashGRPO modes require an engine declaring
   `supports_per_sample_sde_index`: sglang_diffusion/fastvideo do not support the Flash
@@ -557,11 +558,12 @@ without driver-authored x_T. `media_log_interval` does not apply
   collapse the whole batch onto one request and one sigma. The trainer compares the two counts
   and raises instead.
 - **Both FlashGRPO modes stamp inside trainside `generate`, before `Worker.call` packs proxies.**
-  A request whose `Part.sde_index_per_sample` contains only one step pins `sde_indices=[k]`
-  and uses the original generation batch/chunk path, then stamps the output once. It requires
-  neither `forward_batch_size=1` nor sample-keyed noise: the original batching and RNG order
-  remain unchanged. Multiple step values use the existing per-row grouping path and its stricter
-  guards. Both branches clear the output Part's request field; the segment owns the result.
+  After any batched prompt splitting, a request whose `Part.sde_index_per_sample` contains
+  only one step pins `sde_indices=[k]` and uses the original generation batch/chunk path,
+  then stamps the output once. A single-prompt request retains its original batching and
+  RNG order. With `forward_batch_size=1`, multiple step values use the existing per-row
+  grouping path and its stricter guards. Both paths clear the output Part's request field;
+  the segment owns the result.
   There is no stamp RPC or driver-side hydration for normalization. Decoded media and
   conditions are not re-stored for stamping, and SP non-head ranks do not receive
   collected trajectories a second time.

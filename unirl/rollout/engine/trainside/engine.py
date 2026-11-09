@@ -51,7 +51,7 @@ class TrainsideRolloutEngine(BaseRolloutEngine):
         else:
             self.schedule_policy = None
 
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.closed = False
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
@@ -83,6 +83,15 @@ class TrainsideRolloutEngine(BaseRolloutEngine):
                     fbs = self.forward_batch_size
                     gen = sample.parts[-1]
                     bs = gen.batch_size
+                    if fbs is not None and fbs > 1 and gen.sde_index_per_sample is not None:
+                        roots = sample.root_group_ids(-1)
+                        bounds = [0, *[i for i in range(1, bs) if roots[i] != roots[i - 1]], bs]
+                        if len(bounds) > 2:
+                            outputs = [
+                                self.generate(sample.replace_frontier(gen.slice(start, end))).parts[-1]
+                                for start, end in zip(bounds[:-1], bounds[1:])
+                            ]
+                            return self._stamp_output_version(sample.replace_frontier(Part.concat(outputs)))
                     single_sde_index = None
                     if gen.sde_index_per_sample is not None:
                         steps = gen.sde_index_per_sample.unique().tolist()

@@ -497,7 +497,7 @@ class DiffusionTrainer(BaseTrainer):
         self.reward_stack = None
 
         if takes_pipeline:
-            rollout_dp_size = _preflight_trainside_geometry(
+            _preflight_trainside_geometry(
                 num_devices=self.num_devices,
                 reward_fraction=reward_fraction,
                 batch_size=batch_size,
@@ -507,14 +507,6 @@ class DiffusionTrainer(BaseTrainer):
                 has_reward=reward_cfg is not None,
                 backend_cfg=backend_cfg,
             )
-            if self._flash_engine_per_sample_sde and rollout_cfg["forward_batch_size"] != 1:
-                if batch_size != rollout_dp_size:
-                    raise ValueError(
-                        f"FlashGRPO engine_per_sample_sde with rollout.forward_batch_size={rollout_cfg['forward_batch_size']} "
-                        f"requires batch_size == rollout dp_size={rollout_dp_size}; got {batch_size}. "
-                        "Only one prompt per rank guarantees a single SDE step and equal FSDP forward counts. "
-                        "Set batch_size to rollout dp_size or rollout.forward_batch_size=1."
-                    )
 
         needs_backend = self._uses_ema or algo_cls.requires_backend
         train_cfgs = dict(
