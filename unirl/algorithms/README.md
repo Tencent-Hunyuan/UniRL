@@ -235,7 +235,13 @@ own reference KL.
   KL before element-count weighting; audio is omitted for a video-only policy.
   `train/kl_mean_shift_video` and `train/kl_mean_shift_audio` are fp32 L2 norms of
   detached policy-minus-reference means over all latent elements per row, averaged
-  over rows. They reuse the same replays and add no forward or backward calls.
+  over rows. The driver reports these four keys as row-weighted means across all
+  micros and ranks. `train/kl_ref_mean_global` likewise averages the combined KL.
+  Their sums/counts use the existing stage-metrics collection, not the loss
+  all-reduce. They reuse the same replays and add no forward or backward calls.
+  Other `train/*` algorithm metrics, including `kl_ref_mean`, `kl_loss` and
+  `ratio_*`, remain rank 0's local values; the separate `loss` field is globally
+  reduced. Their reduction paths are unchanged for bitwise run comparisons.
 - **`adv_clip_max` defaults to `5.0`, copying upstream.** Advantages are clamped before the ratio
   because a collapsed reward spread drives `|adv|` arbitrarily high through the global-std
   denominator. `adv_clip_fraction` in the metrics is the fraction of samples that hit the clamp:

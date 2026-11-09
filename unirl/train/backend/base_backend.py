@@ -12,9 +12,11 @@ from typing import TYPE_CHECKING, Dict, Iterable, List, Literal, Optional
 import torch
 import torch.distributed as dist
 from torch import nn
+from torch.distributed.tensor import DTensor
 
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
+from unirl.distributed.local import local_view
 from unirl.train.backend.base import ExpertWeightExportTransform, LrSchedulerConfig, OptimizerConfig
 from unirl.train.backend.sharded_state import (
     StateDict,
@@ -254,6 +256,24 @@ class BaseFSDP2Backend(Remote):
         # Release consumed grads before train-state offload.
         self.optimizer.zero_grad(set_to_none=True)
         return grad_norm
+
+    @torch.no_grad()
+    def parameter_squared_sums(self) -> torch.Tensor:
+        """Queue CPU fp64 [1 or 2] local sums; caller must synchronize before reading (see utils/README.md)."""
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        sums = torch.zeros(1 if self.ema is None else 2, dtype=torch.float64, device=self._device)
+        for parameter in self.model.parameters():
+            if parameter.requires_grad and (isinstance(parameter, DTensor) or rank == 0):
+                sums[0].add_(local_view(parameter).detach().float().square().sum())
+        if self.ema is not None:
+            for live, shadow in self.ema.shadow.iter_pairs():
+                if isinstance(live, DTensor) or rank == 0:
+                    delta = local_view(live).detach().float() - local_view(shadow).detach().float()
+                    sums[1].add_(delta.square_().sum())
+                    del delta
+        host = torch.empty(sums.shape, dtype=torch.float64, device="cpu", pin_memory=self._device.type == "cuda")
+        host.copy_(sums, non_blocking=True)
+        return host
 
     def on_rollout_end(self) -> None:
         if self.ema is not None:

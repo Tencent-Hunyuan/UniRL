@@ -27,7 +27,7 @@ from unirl.train.stack.planner import (
 )
 from unirl.types.sample import Part
 from unirl.utils.metrics import aggregate_numeric_metrics
-from unirl.utils.stage_metrics import record, take
+from unirl.utils.stage_metrics import record, record_parameter_sums, take
 
 logger = logging.getLogger(__name__)
 
@@ -161,6 +161,10 @@ class TrainStack(BaseTrainStack):
         elif window_backward:
             with record("optimizer_step"):
                 grad_norm = self.fsdp_backend.optimizer_step(max_grad_norm=self.max_grad_norm)
+                if math.isfinite(grad_norm):
+                    parameter_sums = self.fsdp_backend.parameter_squared_sums()
+            if math.isfinite(grad_norm):
+                record_parameter_sums(parameter_sums)
         else:
             grad_norm = 0.0
             logger.warning(

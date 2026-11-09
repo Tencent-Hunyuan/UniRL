@@ -13,7 +13,8 @@ several independent owners across the tree.
 
 Each module (`dtypes.py`, `media.py`, `metrics.py`, `video.py`,
 `wandb_logger.py`, `profiling.py`, …) is named for what it does and carries a
-one-line docstring — read the one you need directly; it is short enough. The cross-module features documented here are **stage metrics** and **GPU memory
+one-line docstring — read the one you need directly; it is short enough. The
+cross-module features documented here are **stage metrics** and **GPU memory
 monitoring**: workers sample them, the driver aggregates them, and the logger
 publishes them.
 
@@ -28,7 +29,9 @@ whose *value* names the region to record.
 FlashGRPO policy replay and backward, reference replay, and `TrainStack` optimizer
 steps. `DiffusionTrainer` drains the colocated workers once after each training
 track via `TrainStack.collect_stage_metrics`, then uses the existing `log_perf`
-wandb path. Evaluation drains and discards its counters separately.
+wandb path. The same collection carries row-weighted KL sums/counts and parameter
+squared sums; the driver merges their global values into `TrainStepResult.metrics`
+for the existing `train/` logging path. Evaluation discards its counters separately.
 
 For each `stage` in `denoise`, `decode`, `score`, `policy_forward`,
 `kl_ref_forward`, `backward`, `optimizer_step`:
@@ -39,6 +42,11 @@ For each `stage` in `denoise`, `decode`, `score`, `policy_forward`,
 | `perf/stage/<stage>_s_max` | sum calls per worker, then maximum across workers |
 | `perf/mem/<stage>_peak_alloc_gb` | maximum allocated GiB across calls and workers |
 | `perf/mem/<stage>_peak_reserved_gb` | maximum reserved GiB across calls and workers |
+| `train/lora_norm` | square root of the global sum of squares of all live trainable parameters |
+| `train/ema_live_distance` | square root of the global live-minus-shadow squared sum; absent without EMA |
+| `train/kl_video`, `train/kl_audio` | per-stream KL, row-weighted across all micros and ranks |
+| `train/kl_mean_shift_video`, `train/kl_mean_shift_audio` | row-weighted mean of each row's fp32 mean-shift L2 norm |
+| `train/kl_ref_mean_global` | row-weighted global mean of the element-count-weighted joint KL |
 
 ## Gotchas
 
@@ -46,7 +54,19 @@ For each `stage` in `denoise`, `decode`, `score`, `policy_forward`,
   reduces asynchronous overlap; it is not a zero-overhead profiler. With `G`
   pipeline calls, `S` score calls, and `M` training micros per rank, one optimizer
   update adds `4G + 2S + 4M + 2` synchronizations, plus `2M` when `beta>0`.
-  `optimizer_step` includes clipping, scheduler and EMA updates.
+  `optimizer_step` includes clipping, scheduler, EMA updates and parameter metrics.
+- **Parameter metrics sample after a successful optimizer step.**
+  `BaseFSDP2Backend.parameter_squared_sums` reads `local_view` of live trainable
+  parameters and `ema.shadow.iter_pairs()`, reducing each tensor in fp32 and
+  accumulating in fp64. It queues one pinned CPU copy of one or two fp64 scalars;
+  the enclosing optimizer stage's existing end synchronization must finish before
+  `record_parameter_sums` reads them. No new collective or loss-buffer element is
+  added. fp32 tensor reductions and EMA updates can differ from an fp64 oracle.
+- **Parameter norms assume full FSDP, not HSDP.** Plain replicated Tensor parameters
+  contribute only on process-group rank 0. H3's `transformer_blocks` LoRA targets
+  are all inside fully-sharded blocks; `root_wrap=false` rejects stray trainable
+  tensors on multiple ranks. DTensor replicate dimensions, including HSDP's
+  replicate dimension, are not deduplicated and overcount the squared sums.
 - **Stage peaks are device-wide, not allocation deltas.** A worker owns one CUDA
   device. Concurrent score/generate stages include each other's live allocations;
   their times are not additive wall time. The recorder folds every active interval

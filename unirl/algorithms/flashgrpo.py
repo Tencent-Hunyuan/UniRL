@@ -16,7 +16,7 @@ from unirl.train.lora import adapters_disabled
 from unirl.types.conditions import Condition
 from unirl.types.sample import Part
 from unirl.types.segments.latent import LatentSegment
-from unirl.utils.stage_metrics import record
+from unirl.utils.stage_metrics import record, record_means
 
 from .base import (
     AlgorithmStepResult,
@@ -336,6 +336,10 @@ class FlashGRPO(FlowGRPO):
         metrics["clip_range"] = clip_range
         if self.beta > 0.0:
             metrics["beta"] = self.beta
+            record_means(
+                {**{name: metrics[name] for name in kl_metrics}, "kl_ref_mean_global": metrics["kl_ref_mean"]},
+                rows=advantages.shape[0],
+            )
         if self.batch_normalize_tgr:
             metrics.update(self._batch_tgr_metrics)
 
