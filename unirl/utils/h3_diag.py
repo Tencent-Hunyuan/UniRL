@@ -37,7 +37,8 @@ def dump_first_gradients(function):
                     gradients[name] = gradient.detach().float().cpu()
             directory = Path(GRAD_DUMP_DIR)
             directory.mkdir(parents=True, exist_ok=True)
-            torch.save(gradients, directory / f"grad_rank{backend._rank}.pt")
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            torch.save(gradients, directory / f"grad_rank{rank}.pt")
             dumped = True
         return function(backend, *args, **kwargs)
 
