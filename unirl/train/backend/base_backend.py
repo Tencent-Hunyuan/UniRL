@@ -7,7 +7,7 @@ import math
 import os
 from concurrent.futures import Future
 from dataclasses import asdict
-from typing import TYPE_CHECKING, Dict, List, Literal, Optional
+from typing import TYPE_CHECKING, Dict, Iterable, List, Literal, Optional
 
 import torch
 import torch.distributed as dist
@@ -453,7 +453,7 @@ class BaseFSDP2Backend(Remote):
             )
 
             meta: Dict[str, object] = torch.load(metadata_path, map_location="cpu")
-            self._check_ema_resume(meta)
+            self._check_ema_resume(meta, dcp.FileSystemReader(path).read_metadata().state_dict_metadata)
             mode = meta["save_mode"]
             self._reject_meta(operation="load", checkpoint_format="dcp", mode=mode)
             has_meta_params = any(p.is_meta for p in self.model.parameters())
@@ -498,7 +498,7 @@ class BaseFSDP2Backend(Remote):
                 "(save_dir/load_dir must live on storage mounted on every node)"
             )
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
-        self._check_ema_resume(checkpoint)
+        self._check_ema_resume(checkpoint, checkpoint["policy_state_dict"])
 
         mode = checkpoint["save_mode"]
         strict = mode == "full"
@@ -514,9 +514,15 @@ class BaseFSDP2Backend(Remote):
         self._optimizer_step_count = checkpoint["optimizer_step_count"]
         return checkpoint["step"]
 
-    def _check_ema_resume(self, metadata: Dict[str, object]) -> None:
-        """Refuse a missing or changed mirror EMA schedule before loading weights."""
-        if metadata.get("ema_config") != self._ema_config:
+    def _check_ema_resume(self, metadata: Dict[str, object], state_keys: Iterable[str]) -> None:
+        """Refuse a changed mirror EMA schedule, or enabled EMA without checkpointed shadows; see train/readme.md."""
+        recorded = metadata.get("ema_config")
+        if recorded is None and self._ema_config is not None:
+            prefix = self._ema_config["shadow_prefix"]
+            if any(key.rpartition(".")[2].startswith(prefix) for key in state_keys):
+                return
+            raise ValueError("Checkpoint has no EMA shadow weights; resume without ema_cfg or from an EMA checkpoint.")
+        if recorded != self._ema_config:
             raise ValueError("EMA configuration differs from checkpoint; resume with the same ema_cfg.")
 
     def _reject_meta(

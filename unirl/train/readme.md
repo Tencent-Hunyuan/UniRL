@@ -81,7 +81,7 @@ in `backend/base.py`; a multi-update-capable algorithm sets
   Skipped non-finite steps do not count. Torch `checkpoint.pt` and DCP
   `metadata.pt` store `ema_config` and `optimizer_step_count`; both formats
   retain `<module>.lora_{A,B}.default.shadow_weight` alongside live weights.
-  Resume requires the same `ema_cfg`; EMA updates equal `optimizer_step_count // 8`.
+  Resume with the same `ema_cfg` (see Gotchas); EMA updates then equal `optimizer_step_count // 8`.
 - **Export:** Run `python -m unirl.tools.export_adapter --checkpoint "$CHECKPOINT"
   --base "$BASE_MODEL" --output exports/ema --ema` (omit `--ema` for live).
   Both produce `adapter_model.safetensors` and `adapter_config.json`, with keys
@@ -147,11 +147,14 @@ use LoRA adapter mode. Formats and export live in
 
 ## Gotchas
 
-- **Mirror EMA resume requires the same `ema_cfg`.** A missing or changed
-  `ema_config` (including older mirror checkpoints without schedule metadata)
-  raises before loading weights; starting EMA from a live-only checkpoint is not
-  an exact resume. With EMA off, no shadow or EMA metadata is added and the
-  optimizer/rollout arithmetic is unchanged.
+- **Mirror EMA resume rejects a changed `ema_cfg`.** A checkpoint whose recorded
+  `ema_config` differs from the backend's, including one loaded with EMA now off,
+  raises before loading weights. A checkpoint that holds shadow weights but no
+  `ema_config` (written before the schedule was recorded) is accepted and imposes
+  no schedule: its shadows continue under the current `ema_cfg`. A checkpoint with
+  neither raises when `ema_cfg` is set, because an adapter-mode load would silently
+  leave the shadows at their injection-time copy. With EMA off, no shadow or EMA
+  metadata is added and the optimizer/rollout arithmetic is unchanged.
 - **Unified `ar` / `image` results describe one shared optimizer step.** Their
   `optimizer_updates` (total and per update) count the same steps, so summing
   them across tracks double-counts.
