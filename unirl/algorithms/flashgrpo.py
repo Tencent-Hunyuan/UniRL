@@ -237,7 +237,7 @@ class FlashGRPO(FlowGRPO):
             raise ValueError(
                 "FlashGRPO batch_normalize_tgr: normalized weights must be finite and positive; check sigmas."
             )
-        segment.flash_tgr_weights = (weights / norm).reshape(-1, 1).detach()
+        segment.policy_loss_weights = (weights / norm).reshape(-1, 1).detach()
         global_counts = torch.tensor(counts, dtype=torch.float64, device=device)
         active = pool_weights[global_counts > 0]
         self._batch_tgr_metrics = {
@@ -289,9 +289,9 @@ class FlashGRPO(FlowGRPO):
         )
 
         if self.batch_normalize_tgr:
-            if segment.flash_tgr_weights is None:
+            if segment.policy_loss_weights is None:
                 raise ValueError("FlashGRPO batch_normalize_tgr requires prepare_part before micro-batch slicing.")
-            tgr = segment.flash_tgr_weights.to(device=new_logp.device)
+            tgr = segment.policy_loss_weights.to(device=new_logp.device)
         else:
             tgr = self._rectification_weights_per_sample(segment=segment, device=new_logp.device)
         tgr = tgr.to(dtype=loss_per_elem.dtype)

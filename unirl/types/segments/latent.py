@@ -29,7 +29,7 @@ class LatentSegment(Segment):
     # [N_segs] long, FlashGRPO's per-sample SDE step; None for the shared-schedule algorithms.
     # CONCAT so it stacks when per-step group tracks merge; then it, not sde_indices, is authoritative.
     sde_index_per_sample: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
-    flash_tgr_weights: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)  # [B, 1], detached fp32
+    policy_loss_weights: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)  # [B, 1], detached fp32
     log_probs: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
     loss_mask: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
     aux_latents: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)

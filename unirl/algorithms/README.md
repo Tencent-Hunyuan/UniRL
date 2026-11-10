@@ -188,7 +188,7 @@ own reference KL.
   sum/count. The clamp can leave the actual mean below one, which the metrics report
   without adjustment. Counts also select the global weight extrema for
   `flash_tgr_global_mean/min/max` metrics, without a second collective.
-  Detached `part.segment.flash_tgr_weights` travels with concat/select/slice; loss never
+  Detached `part.segment.policy_loss_weights` travels with concat/select/slice; loss never
   renormalizes a micro. No persistent algorithm state is added: prepare recomputes weights
   after resume. This mode requires `num_updates_per_batch=1` and `accumulate_rollouts=1`.
   Omit `rectification_indices` to use the scheduler pool, or supply that exact pool.
