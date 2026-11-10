@@ -3,17 +3,132 @@
 from __future__ import annotations
 
 import re
-from typing import Dict, Optional
+from collections.abc import Callable, Iterator, Set
+from typing import Dict, Literal, Optional
 
 import torch
 from torch import nn
 
+_PEFT_PREFIX = "base_model.model."
+_GATE_AND_UP_SUFFIXES = (".experts.gate_and_up_proj", ".experts.gate_up_proj")
+_DOWN_SUFFIX = ".experts.down_proj"
 _EXPERT_RE = re.compile(r"^(?P<prefix>.*\.experts)\.(?P<idx>\d+)\.(?P<proj>gate_and_up_proj|down_proj)\.weight$")
 
 _EP_PLAN = {
     "layers.*.mlp.experts.gate_and_up_proj": 0,
+    "layers.*.mlp.experts.gate_up_proj": 0,
     "layers.*.mlp.experts.down_proj": 0,
 }
+
+HunyuanFusedExpertKind = Literal["gate_and_up", "down"]
+
+
+def normalize_fused_param_name(name: str) -> str:
+    """Normalize PEFT's envelope/base-layer hop to the fused model FQN."""
+    return name.removeprefix(_PEFT_PREFIX).replace(".base_layer.", ".").removesuffix(".weight")
+
+
+def fused_expert_kind(name: str) -> HunyuanFusedExpertKind | None:
+    """Classify a fused HunyuanImage-3.0 expert parameter name."""
+    name = normalize_fused_param_name(name)
+    if name.endswith(_GATE_AND_UP_SUFFIXES):
+        return "gate_and_up"
+    if name.endswith(_DOWN_SUFFIX):
+        return "down"
+    return None
+
+
+def is_fused_expert_param(name: str) -> bool:
+    """Whether ``name`` is a fused HI3 expert parameter (protocol hook for ``ep/experts.py``)."""
+    return fused_expert_kind(name) is not None
+
+
+def _swap_gate_up_halves(gate_and_up: torch.Tensor) -> torch.Tensor:
+    """Swap the two output halves of a fused gate_and_up tensor ``[..., 2I, H]``."""
+    if gate_and_up.ndim < 2 or gate_and_up.shape[-2] % 2 != 0:
+        raise RuntimeError(f"HI3 layout: invalid fused gate_and_up shape {tuple(gate_and_up.shape)}.")
+    half = gate_and_up.shape[-2] // 2
+    return torch.cat([gate_and_up[..., half:, :], gate_and_up[..., :half, :]], dim=-2)
+
+
+def _candidate_expert_prefixes(prefix: str) -> tuple[str, ...]:
+    """Return checkpoint prefix candidates for bare-decoder or wrapped model FQNs."""
+    candidates = [prefix]
+    if prefix.startswith("model."):
+        candidates.append(prefix.removeprefix("model."))
+    else:
+        candidates.append(f"model.{prefix}")
+    return tuple(dict.fromkeys(candidates))
+
+
+def build_local_fused_block(
+    *,
+    fused_param_name: str,
+    expected_shape: tuple[int, ...],
+    ep_rank: int,
+    available_keys: Set[str],
+    get_tensor: Callable[[str], torch.Tensor],
+) -> torch.Tensor | None:
+    """Build this EP rank's fused HI3 expert block directly from per-expert HF keys."""
+    kind = fused_expert_kind(fused_param_name)
+    if kind is None:
+        return None
+
+    name = normalize_fused_param_name(fused_param_name)
+    prefix = name.rsplit(".experts.", 1)[0]
+    num_local = int(expected_shape[0])
+    start = ep_rank * num_local
+    experts = range(start, start + num_local)
+    proj = "gate_and_up_proj" if kind == "gate_and_up" else "down_proj"
+
+    resolved_keys: list[str] | None = None
+    for cand_prefix in _candidate_expert_prefixes(prefix):
+        keys = [f"{cand_prefix}.experts.{expert}.{proj}.weight" for expert in experts]
+        present = [key for key in keys if key in available_keys]
+        if not present:
+            continue
+        if len(present) != len(keys):
+            missing = next(key for key in keys if key not in available_keys)
+            raise RuntimeError(
+                f"HI3 layout: incomplete checkpoint for {name!r}: "
+                f"{len(present)}/{len(keys)} keys present (e.g. missing {missing!r})."
+            )
+        resolved_keys = keys
+        break
+
+    if resolved_keys is None:
+        return None
+
+    block = torch.stack([get_tensor(key) for key in resolved_keys], dim=0)
+    if kind == "gate_and_up":
+        block = _swap_gate_up_halves(block).contiguous()
+
+    if tuple(block.shape) != expected_shape:
+        raise RuntimeError(
+            f"HI3 layout: rebuilt {name!r} shape {tuple(block.shape)} != expected {expected_shape} "
+            f"(ep_rank={ep_rank}, num_local={num_local})."
+        )
+    return block
+
+
+def iter_hf_expert_tensors(
+    fused_param_name: str,
+    stacked: torch.Tensor,
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Yield HF per-expert tensors from a full VeOmni fused HI3 stack."""
+    kind = fused_expert_kind(fused_param_name)
+    if kind is None:
+        raise RuntimeError(f"HI3 layout: unsupported fused parameter {fused_param_name!r}.")
+    name = normalize_fused_param_name(fused_param_name)
+    prefix = name.rsplit(".experts.", 1)[0]
+
+    if kind == "gate_and_up":
+        unswapped = _swap_gate_up_halves(stacked)
+        for expert in range(int(unswapped.shape[0])):
+            yield f"{prefix}.experts.{expert}.gate_and_up_proj.weight", unswapped[expert].contiguous()
+    else:
+        for expert in range(int(stacked.shape[0])):
+            yield f"{prefix}.experts.{expert}.down_proj.weight", stacked[expert].contiguous()
 
 
 def fuse_expert_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -36,8 +151,7 @@ def fuse_expert_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, tor
             )
         stacked = torch.stack([per_idx[j] for j in indices], dim=0)
         if proj == "gate_and_up_proj":
-            half = stacked.shape[-2] // 2
-            stacked = torch.cat([stacked[..., half:, :], stacked[..., :half, :]], dim=-2).contiguous()
+            stacked = _swap_gate_up_halves(stacked).contiguous()
         out[f"{prefix}.{proj}"] = stacked
     return out
 
@@ -107,8 +221,9 @@ class FusedHunyuanMoE(nn.Module):
 
 
 def is_fused_expert_key(key: str) -> bool:
-    """A fused-expert param key (``*.experts.gate_and_up_proj`` / ``.down_proj``)."""
-    return key.endswith((".experts.gate_and_up_proj", ".experts.down_proj"))
+    """A fused-expert param key (``*.experts.gate_and_up_proj`` / ``.gate_up_proj`` / ``.down_proj``)."""
+    norm = normalize_fused_param_name(key)
+    return norm.endswith((".experts.gate_and_up_proj", ".experts.gate_up_proj", ".experts.down_proj"))
 
 
 def replace_hunyuan_moe_with_fused(decoder: nn.Module) -> int:
@@ -137,6 +252,12 @@ def replace_hunyuan_moe_with_fused(decoder: nn.Module) -> int:
 
 
 __all__ = [
+    "HunyuanFusedExpertKind",
+    "normalize_fused_param_name",
+    "fused_expert_kind",
+    "is_fused_expert_param",
+    "build_local_fused_block",
+    "iter_hf_expert_tensors",
     "fuse_expert_state_dict",
     "get_hi3_parallel_plan",
     "FusedHunyuanMoE",

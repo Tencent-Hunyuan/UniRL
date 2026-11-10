@@ -219,18 +219,18 @@ class HunyuanImage3DiffusionStep(DiffusionStep[HunyuanImage3Bundle, HunyuanImage
         }
         _orig_check = getattr(transformer, "_check_inputs", None)
         transformer._check_inputs = lambda *a, **kw: None
+        try:
+            transformer.post_token_len = None
+            n_img = int(fused.gen_image_mask.sum(dim=-1).max().item()) if fused.gen_image_mask is not None else 0
+            transformer.num_image_tokens = n_img
+            transformer.num_special_tokens = None if is_first else (int(input_ids_in.shape[1]) - n_img)
 
-        transformer.post_token_len = None
-        n_img = int(fused.gen_image_mask.sum(dim=-1).max().item()) if fused.gen_image_mask is not None else 0
-        transformer.num_image_tokens = n_img
-        transformer.num_special_tokens = None if is_first else (int(input_ids_in.shape[1]) - n_img)
-
-        # The seeded table is hit only at input length; otherwise gather from the full table.
-        with model.rope_mode(training=fused.rope_cache is not None):
-            output = transformer(**model_inputs, first_step=is_first)
-
-        if _orig_check is not None:
-            transformer._check_inputs = _orig_check
+            # The seeded table is hit only at input length; otherwise gather from the full table.
+            with model.rope_mode(training=fused.rope_cache is not None):
+                output = transformer(**model_inputs, first_step=is_first)
+        finally:
+            if _orig_check is not None:
+                transformer._check_inputs = _orig_check
 
         if state is not None:
             fused = conditions.fused
