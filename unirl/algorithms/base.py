@@ -263,7 +263,7 @@ def reference_kl_loss(
     if segment.sde_index_per_sample is not None:
         raise ValueError(
             f"{algo}: reference_kl_loss uses one shared sigma per target step; a per-sample SDE-index "
-            "segment needs its algorithm's own reference KL (see FlashGRPO._reference_kl)."
+            "segment needs its algorithm's own reference KL."
         )
     from unirl.train.lora import adapters_disabled
 

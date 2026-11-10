@@ -344,19 +344,20 @@ class DiffusionTrainer(BaseTrainer):
         algo_cls = get_class(algorithm_cfg["_target_"])
         self._algo_cls = algo_cls
         self._uses_ema = algo_cls.requires_ema_rollout
+        num_updates_per_batch = stack_cfg.get("num_updates_per_batch", 1)
         # Per-sample SDE algorithms own their pool and draw policy; see trainer/README.md.
         self._per_sample_sde = algo_cls.requires_per_sample_sde_index
         self._engine_per_sample_sde = False
         if self._per_sample_sde:
             if not rollout_parsed["role_cls"].supports_per_sample_sde_index:
                 raise ValueError(
-                    f"{algo_cls.__name__} requires a supporting rollout engine with supports_per_sample_sde_index "
-                    "(trainside) in both modes; remote engines (sglang_diffusion/fastvideo) do not support "
-                    "per-sample SDE steps and pre-return stamping. Use trainside or another algorithm."
+                    f"{algo_cls.__name__} requires a rollout engine that declares supports_per_sample_sde_index; "
+                    f"{rollout_parsed['role_cls'].__name__} does not honour per-sample SDE steps or stamp them "
+                    "before returning. Use an engine that does, or another algorithm."
                 )
             self._engine_per_sample_sde = algo_cls.engine_groups_sde_steps(
                 algorithm_cfg,
-                num_updates_per_batch=stack_cfg.get("num_updates_per_batch", 1),
+                num_updates_per_batch=num_updates_per_batch,
                 accumulate_rollouts=accumulate_rollouts,
             )
             if self._engine_per_sample_sde:
@@ -495,7 +496,7 @@ class DiffusionTrainer(BaseTrainer):
                 reward_fraction=reward_fraction,
                 batch_size=batch_size,
                 samples_per_prompt=total_samples_per_prompt(self.sampling_params),
-                num_updates_per_batch=stack_cfg.get("num_updates_per_batch", 1),
+                num_updates_per_batch=num_updates_per_batch,
                 prompt_local_rollout=self._prompt_local_rollout,
                 has_reward=reward_cfg is not None,
                 backend_cfg=backend_cfg,
@@ -553,7 +554,7 @@ class DiffusionTrainer(BaseTrainer):
         _validate_dp_geometry(
             batch_size=batch_size,
             samples_per_prompt=total_samples_per_prompt(self.sampling_params),
-            num_updates_per_batch=stack_cfg.get("num_updates_per_batch", 1),
+            num_updates_per_batch=num_updates_per_batch,
             rollout_dp_size=self.rollout.dp_size,
             reward_dp_size=self.reward.dp_size if self.reward is not None else 1,
             train_dp_size=self.stack.dp_size,

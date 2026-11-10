@@ -20,7 +20,7 @@ def stamp_sde_index_per_sample(part: "Part", sde_index: int) -> None:
     """Normalize both streams to [before, after, final]; see models/README.md Gotchas."""
     segment = part.segment
     if segment is None:
-        raise ValueError("FlashGRPO: a step group's rollout returned no segment to stamp sde_index_per_sample on.")
+        raise ValueError("stamp_sde_index_per_sample: the rollout returned no segment to stamp.")
     segment.sde_index_per_sample = torch.full((part.batch_size,), sde_index, dtype=torch.long)
     if segment.indices is not None and segment.latents is not None:
         before = segment.latents_at(sde_index)
