@@ -86,6 +86,9 @@ in `backend/base.py`; a multi-update-capable algorithm sets
   --base "$BASE_MODEL" --output exports/ema --ema` (omit `--ema` for live).
   Both produce `adapter_model.safetensors` and `adapter_config.json`, with keys
   `base_model.model.<module>.lora_{A,B}.weight` for the same conversion tool.
+  `--ema` reads `shadow_prefix` from the checkpoint's `ema_config` and exits with
+  an error when that record is missing; resume a checkpoint written without it
+  and save once before exporting its shadow.
 
 ## Choosing HSDP (hybrid sharding)
 
@@ -149,12 +152,13 @@ use LoRA adapter mode. Formats and export live in
 
 - **Mirror EMA resume rejects a changed `ema_cfg`.** A checkpoint whose recorded
   `ema_config` differs from the backend's, including one loaded with EMA now off,
-  raises before loading weights. A checkpoint that holds shadow weights but no
-  `ema_config` (written before the schedule was recorded) is accepted and imposes
-  no schedule: its shadows continue under the current `ema_cfg`. A checkpoint with
-  neither raises when `ema_cfg` is set, because an adapter-mode load would silently
-  leave the shadows at their injection-time copy. With EMA off, no shadow or EMA
-  metadata is added and the optimizer/rollout arithmetic is unchanged.
+  raises before loading weights. An absent or empty `ema_config` imposes no
+  schedule: a checkpoint that holds shadow weights without it (written before the
+  schedule was recorded) is accepted, and its shadows continue under the current
+  `ema_cfg`. Independently, a checkpoint without shadow weights raises when
+  `ema_cfg` is set, because an adapter-mode load would silently leave the shadows
+  at their injection-time copy. With EMA off, no shadow or EMA metadata is added
+  and the optimizer/rollout arithmetic is unchanged.
 - **Unified `ar` / `image` results describe one shared optimizer step.** Their
   `optimizer_updates` (total and per update) count the same steps, so summing
   them across tracks double-counts.

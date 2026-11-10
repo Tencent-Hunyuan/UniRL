@@ -517,13 +517,14 @@ class BaseFSDP2Backend(Remote):
     def _check_ema_resume(self, metadata: Dict[str, object], state_keys: Iterable[str]) -> None:
         """Refuse a changed mirror EMA schedule, or enabled EMA without checkpointed shadows; see train/readme.md."""
         recorded = metadata.get("ema_config")
-        if recorded is None and self._ema_config is not None:
-            prefix = self._ema_config["shadow_prefix"]
-            if any(key.rpartition(".")[2].startswith(prefix) for key in state_keys):
-                return
-            raise ValueError("Checkpoint has no EMA shadow weights; resume without ema_cfg or from an EMA checkpoint.")
-        if recorded != self._ema_config:
+        if recorded and recorded != self._ema_config:
             raise ValueError("EMA configuration differs from checkpoint; resume with the same ema_cfg.")
+        if self._ema_config is not None:
+            prefix = self._ema_config["shadow_prefix"]
+            if not any(key.rpartition(".")[2].startswith(prefix) for key in state_keys):
+                raise ValueError(
+                    "Checkpoint has no EMA shadow weights; resume without ema_cfg or from an EMA checkpoint."
+                )
 
     def _reject_meta(
         self,
