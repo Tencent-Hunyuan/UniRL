@@ -32,6 +32,11 @@ if GRAD_AB_ONLY and not GRAD_AB_DIR:
     raise ValueError("H3_DIAG_GRAD_AB_ONLY=1 requires H3_DIAG_GRAD_AB=<directory>.")
 if FIX_MEANS_DIR and not GRAD_AB_DIR:
     raise ValueError("H3_DIAG_FIX_MEANS=<directory> requires H3_DIAG_GRAD_AB=<directory>.")
+FP32_OPS = frozenset(filter(None, os.environ.get("H3_DIAG_FP32_OPS", "").split(",")))
+if FP32_OPS - {"norm", "resid"}:
+    raise ValueError(f"H3_DIAG_FP32_OPS: {sorted(FP32_OPS)} is not a subset of norm,resid.")
+if FP32_OPS and not GRAD_AB_DIR:
+    raise ValueError("H3_DIAG_FP32_OPS requires H3_DIAG_GRAD_AB=<directory>.")
 _fixed_means = None
 
 
@@ -154,6 +159,40 @@ class _FixedMeans:
         del self.stage.replay
 
 
+def _fp32_norm(norm, x):
+    """``nn.RMSNorm`` computed in fp32 and cast back to ``x``'s dtype."""
+    weight = None if norm.weight is None else norm.weight.float()
+    return torch.nn.functional.rms_norm(x.float(), norm.normalized_shape, weight, norm.eps).to(x.dtype)
+
+
+def _fp32_residual(block, last, hidden_states, temb, adaln_indices, rotary_emb, attention_mask=None):
+    """H3 block forward with an fp32 residual stream [B, S, C]; branches stay at the block's parameter dtype."""
+    low = block.norm1.weight.dtype
+    shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = block.adaln_proj(temb)
+    stream = hidden_states.float()
+    normed = block.norm1(stream if "norm" in FP32_OPS else stream.to(low)).to(low)
+    normed = normed * (1.0 + scale_msa[adaln_indices]) + shift_msa[adaln_indices]
+    stream = stream + gate_msa[adaln_indices].float() * block.attn(normed, rotary_emb, attention_mask).float()
+    normed = block.norm2(stream if "norm" in FP32_OPS else stream.to(low)).to(low)
+    normed = normed * (1.0 + scale_mlp[adaln_indices]) + shift_mlp[adaln_indices]
+    stream = stream + gate_mlp[adaln_indices].float() * block.ff(normed).float()
+    return stream.to(low) if last else stream
+
+
+def install_fp32_ops(model):
+    """Patch the H3 transformer's RMSNorms and/or block residual stream to fp32 per H3_DIAG_FP32_OPS."""
+    if "norm" in FP32_OPS:
+        for module in model.modules():
+            if isinstance(module, torch.nn.RMSNorm):
+                module.forward = partial(_fp32_norm, module)
+    if "resid" in FP32_OPS:
+        blocks = [module for module in model.modules() if type(module).__name__ == "MiniMaxH3TransformerBlock"]
+        if not blocks:
+            raise ValueError("H3_DIAG_FP32_OPS=resid: the trainable model has no MiniMaxH3TransformerBlock.")
+        for block in blocks:
+            block.forward = partial(_fp32_residual, block, block is blocks[-1])
+
+
 def _masked_advantages(advantages, mask, rank, world):
     """``advantages`` [B] zeroed outside the ``mask`` half: rows (lo/hi) or ranks (ra/rb); empty mask keeps all."""
     if not mask:
@@ -190,6 +229,7 @@ def compare_micro_gradients(function):
             rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
             if FIX_MEANS_DIR:
                 _fixed_means = _FixedMeans(stack.algorithm.stage, rank)
+            install_fp32_ops(backend.model)
             world = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
             for index, spec in enumerate(GRAD_AB_MICROS):
                 micro, mask = int(spec.rstrip("lohirab")), spec.lstrip("0123456789")
@@ -214,6 +254,7 @@ def compare_micro_gradients(function):
                     for part, advantages in zip(window, originals):
                         part.advantages = advantages
                 meta = {"micro": micro, "mask": mask, "seconds": perf_counter() - started, "loss": result.loss}
+                meta["fp32_ops"] = sorted(FP32_OPS)
                 meta.update({key: value for key, value in result.metrics.items() if isinstance(value, (int, float))})
                 if _fixed_means is not None:
                     meta.update(_fixed_means.finish(micro))
