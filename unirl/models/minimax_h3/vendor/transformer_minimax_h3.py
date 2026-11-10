@@ -345,8 +345,14 @@ class MiniMaxH3TransformerBlock(nn.Module):
         adaln_indices: torch.Tensor,
         rotary_emb: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None = None,
+        adaln_cache_entry=None,
     ) -> torch.Tensor:
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(temb)
+        if adaln_cache_entry is None:
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(temb)
+        else:
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = adaln_cache_entry.get(
+                self.adaln_proj, temb
+            )
 
         residual = hidden_states
         norm_hidden_states = self.norm1(hidden_states)
@@ -532,6 +538,7 @@ class MiniMaxH3Transformer3DModel(ModelMixin, ConfigMixin, AttentionMixin, PeftA
         text_indices: torch.Tensor,
         attention_kwargs: dict[str, Any] | None = None,
         return_dict: bool = True,
+        adaln_cache_entry=None,
     ) -> MiniMaxH3TransformerOutput | tuple[torch.Tensor, torch.Tensor]:
         r"""
         Args:
@@ -619,7 +626,11 @@ class MiniMaxH3Transformer3DModel(ModelMixin, ConfigMixin, AttentionMixin, PeftA
             attention_mask = is_pad[None, :] == is_pad[:, None]
 
         for block in self.transformer_blocks:
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
+            if adaln_cache_entry is not None:
+                hidden_states = adaln_cache_entry.run(
+                    self, block, hidden_states, temb, adaln_indices, rotary_emb, attention_mask
+                )
+            elif torch.is_grad_enabled() and self.gradient_checkpointing:
                 hidden_states = self._gradient_checkpointing_func(
                     block, hidden_states, temb, adaln_indices, rotary_emb, attention_mask
                 )

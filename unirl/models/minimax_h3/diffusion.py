@@ -127,6 +127,16 @@ class MiniMaxH3DiffusionStage(BatchedStepReplayMixin, DiffusionStage[MiniMaxH3Co
                 raise ValueError("rollout_keep_unsharded_layers exceeds the loaded H3 transformer's layer count.")
             self._keep_unsharded_logged = False
             self.generate = self._keep_fsdp_params_unsharded()(self.generate)
+        if hasattr(bundle.transformer, "_h3_adaln_cache"):
+            self.generate = self._log_adaln_cache()(self.generate)
+
+    @contextmanager
+    def _log_adaln_cache(self):
+        """Log complete cache statistics at generate boundaries, including preceding training."""
+        try:
+            yield
+        finally:
+            self.bundle.transformer._h3_adaln_cache.log()
 
     @contextmanager
     def _keep_fsdp_params_unsharded(self):
@@ -140,7 +150,11 @@ class MiniMaxH3DiffusionStage(BatchedStepReplayMixin, DiffusionStage[MiniMaxH3Co
         blocks = list(model.transformer_blocks[: self.rollout_keep_unsharded_layers])
         modules = []
         for block in blocks:
-            wrapped = [module for module in block.modules() if isinstance(module, FSDPModule)]
+            wrapped = [
+                module
+                for module in block.modules()
+                if isinstance(module, FSDPModule) and not getattr(module, "_h3_adaln_group", False)
+            ]
             require(len(wrapped) == 1, "H3 retained rollout parameters require one FSDP module per selected block.")
             modules.extend(wrapped)
         changed = []
@@ -151,7 +165,17 @@ class MiniMaxH3DiffusionStage(BatchedStepReplayMixin, DiffusionStage[MiniMaxH3Co
             yield
             if not self._keep_unsharded_logged:
                 if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-                    sizes = [sum(p.numel() * p.element_size() for p in block.parameters()) for block in blocks]
+                    excluded = {
+                        id(p)
+                        for block in blocks
+                        for module in block.modules()
+                        if getattr(module, "_h3_adaln_group", False)
+                        for p in module.parameters()
+                    }
+                    sizes = [
+                        sum(p.numel() * p.element_size() for p in block.parameters() if id(p) not in excluded)
+                        for block in blocks
+                    ]
                     logger.info(
                         "H3 rollout keeps %d layers unsharded: bytes_per_layer=%s, total_gb=%.6f (GiB)",
                         len(blocks),

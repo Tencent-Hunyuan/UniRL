@@ -121,6 +121,11 @@ class MiniMaxH3Bundle(Bundle):
                 path, subfolder="transformer", torch_dtype=dtype
             ).to(device)
 
+        if config.frozen_adaln_cache:
+            from .adaln_cache import install_adaln_cache
+
+            install_adaln_cache(transformer)
+
         # Video VAE (frozen, fp32).
         vae = load_minimax_h3_vae(config, component="vae", device=vae_device)
 
