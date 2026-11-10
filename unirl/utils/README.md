@@ -119,14 +119,17 @@ it installs no runtime wrappers or FSDP patches; the stage recorder is unchanged
   `logp_max_abs_diff` against the stored `old_logp`, and `policy_loss_micros`. A
   micro row id missing from the file raises. The reference KL, its no-grad
   replay, TGR weights, clipping and advantages keep the live means and values.
-- `H3_DIAG_FP32_OPS=norm|resid|norm,resid` (requires `H3_DIAG_GRAD_AB`) patches the
+- `H3_DIAG_FP32_OPS=<comma list of norm, resid, gemm>` (requires `H3_DIAG_GRAD_AB`) patches the
   trainable H3 transformer before the variants run, for the rest of the process:
   `norm` computes every `nn.RMSNorm` in fp32 and casts the result back; `resid`
   keeps each `MiniMaxH3TransformerBlock`'s residual stream in fp32 across the
   block stack (branches stay at the block parameter dtype; the last block casts
   back). `resid` needs `backend.fsdp_cfg.cast_forward_inputs=false`, otherwise
   FSDP rounds the stream at every block entry. On an fp32 model both patches are
-  bitwise no-ops. Each `meta_rank<rank>.json` records `fp32_ops`.
+  bitwise no-ops. `gemm` sets
+  `torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False` in
+  the worker (PyTorch enables reduced-precision bf16 GEMM accumulation by
+  default). Each `meta_rank<rank>.json` records `fp32_ops`.
 - `H3_DIAG_STATE_SAVE=<directory>` writes `state_rank<rank>.pt` at each rank's
   first `train_track` call: the incoming Parts' `sample_ids`, `segment`,
   `conditions`, and `advantages` (no decoded media or rewards) and every trainable

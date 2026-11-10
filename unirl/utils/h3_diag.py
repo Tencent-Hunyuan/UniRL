@@ -33,8 +33,8 @@ if GRAD_AB_ONLY and not GRAD_AB_DIR:
 if FIX_MEANS_DIR and not GRAD_AB_DIR:
     raise ValueError("H3_DIAG_FIX_MEANS=<directory> requires H3_DIAG_GRAD_AB=<directory>.")
 FP32_OPS = frozenset(filter(None, os.environ.get("H3_DIAG_FP32_OPS", "").split(",")))
-if FP32_OPS - {"norm", "resid"}:
-    raise ValueError(f"H3_DIAG_FP32_OPS: {sorted(FP32_OPS)} is not a subset of norm,resid.")
+if FP32_OPS - {"norm", "resid", "gemm"}:
+    raise ValueError(f"H3_DIAG_FP32_OPS: {sorted(FP32_OPS)} is not a subset of norm,resid,gemm.")
 if FP32_OPS and not GRAD_AB_DIR:
     raise ValueError("H3_DIAG_FP32_OPS requires H3_DIAG_GRAD_AB=<directory>.")
 _fixed_means = None
@@ -180,7 +180,9 @@ def _fp32_residual(block, last, hidden_states, temb, adaln_indices, rotary_emb, 
 
 
 def install_fp32_ops(model):
-    """Patch the H3 transformer's RMSNorms and/or block residual stream to fp32 per H3_DIAG_FP32_OPS."""
+    """Apply the H3_DIAG_FP32_OPS precision patches to this process and ``model``; see utils/README.md."""
+    if "gemm" in FP32_OPS:
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
     if "norm" in FP32_OPS:
         for module in model.modules():
             if isinstance(module, torch.nn.RMSNorm):
