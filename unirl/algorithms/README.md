@@ -181,19 +181,22 @@ own reference KL.
   `prev_sample_means`, not raw network output.
 - **By default, `FlashGRPO.rectification_indices` is a required pool normalizer, not a target list.**
   Each sample's coefficient is divided by the candidate-pool mean, which equals the actual
-  batch mean only with equal step counts. `batch_normalize_tgr: true` instead normalizes the
-  complete arranged batch in `prepare_part`, before micro slicing. Its single unconditional
-  `backend.all_reduce_loss_sums` reduces fp64 sum/count, invalid-rank flags, and step counts
-  over the gradient mesh. Invalid data makes every rank fail after the collective.
-  Equal global step counts retain the explicit pool order, fp32 mean, and epsilon clamp
-  for bit identity with the same legacy configuration; unequal counts use the global
-  sum/count. The clamp can leave the actual mean below one, which the metrics report
-  without adjustment. Counts also select the global weight extrema for
-  `flash_tgr_global_mean/min/max` metrics, without a second collective.
+  batch mean only with equal step counts.
+- **`batch_normalize_tgr: true` normalizes the complete arranged batch in `prepare_part`, before micro slicing.**
   Detached `part.segment.policy_loss_weights` travels with concat/select/slice; loss never
   renormalizes a micro. No persistent algorithm state is added: prepare recomputes weights
   after resume. This mode requires `num_updates_per_batch=1` and `accumulate_rollouts=1`.
   Omit `rectification_indices` to use the scheduler pool, or supply that exact pool.
+- **Batch-normalized TGR runs one unconditional collective per rollout.**
+  `backend.all_reduce_loss_sums` reduces fp64 sum/count, invalid-rank flags, and step counts
+  over the gradient mesh. A shard that fails validation (`ValueError`) still joins the
+  collective, then every rank raises; any other exception propagates from the failing rank
+  before the collective. Counts also select the global weight extrema for
+  `flash_tgr_global_mean/min/max` metrics, without a second collective.
+- **Equal global step counts reuse the pool-normalized default's normalizer bit for bit.**
+  They retain the explicit pool order, fp32 mean, and epsilon clamp; unequal counts use the
+  global sum/count. The clamp can leave the actual mean below one, which the metrics report
+  without adjustment.
 - **H3's TGR coefficient intentionally approximates the joint A/V objective with video sigma only.**
   `FlashGRPO` uses `segment.sigmas` and the stage's video strategy for TGR, while
   the policy ratio uses the element-weighted joint video/audio log-probability.
@@ -208,20 +211,23 @@ own reference KL.
   model or another loaded checkpoint; a LoRA backend is required. Replay uses each
   row's `sde_index_per_sample`, stored before/after latents, and conditions.
   `FlashGRPO._reference_kl` computes `(new_mean - ref_mean)^2 / (2 * transition_std^2)`.
+  Gradients flow only through current-policy means; reference means and supplied stds
+  are detached.
+- **Joint A/V reference KL weights each stream by its latent element count, not equally.**
   H3's `audio_joint_sde: true` includes both streams using their own transition
-  standard deviations and latent-element-count weights, not equal stream weights;
-  `false` includes video only. Per-row A/V stages declare audio participation through
-  `ReplayResult.audio_in_policy` and must return audio means and stds when it is true;
-  KL does not infer policy membership from stage internals or missing statistics. Gradients flow only
-  through current-policy means; reference means and supplied stds are detached.
-  `policy_loss` is the TGR-weighted clipped objective, `kl_ref_mean` the raw KL,
-  `kl_loss` is `beta * kl_ref_mean`, and `total_loss` is their sum. These are micro
-  means before the trainer's `loss_scale`, matching UniRL's metric aggregation.
-  Enabling KL adds one batched no-gradient replay forward per micro and another
-  FSDP parameter all-gather; the reference forward runs while the policy graph
+  standard deviations; `false` includes video only. Per-row A/V stages declare audio
+  participation through `ReplayResult.audio_in_policy` and must return audio means and
+  stds when it is true; KL does not infer policy membership from stage internals or
+  missing statistics.
+- **Reference KL adds one batched no-gradient replay forward per micro.** It also adds
+  another FSDP parameter all-gather, and the reference forward runs while the policy graph
   remains resident in GPU memory. It adds no backward or reference weight copy.
   The default `beta: 0` resolves no reference, performs no reference forward,
   emits no new KL metrics, and preserves the existing loss/gradient path bit-for-bit.
+- **FlashGRPO loss metrics are micro means before the trainer's `loss_scale`.**
+  `policy_loss` is the TGR-weighted clipped objective, `kl_ref_mean` the raw KL,
+  `kl_loss` is `beta * kl_ref_mean`, and `total_loss` is their sum, matching UniRL's
+  metric aggregation.
 - **`adv_clip_max` defaults to `5.0`, copying upstream.** Advantages are clamped before the ratio
   because a collapsed reward spread drives `|adv|` arbitrarily high through the global-std
   denominator. `adv_clip_fraction` in the metrics is the fraction of samples that hit the clamp:

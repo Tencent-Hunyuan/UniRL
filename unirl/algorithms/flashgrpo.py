@@ -50,11 +50,7 @@ class FlashGRPOConfig(BaseAlgorithmConfig):
 class FlashGRPO(FlowGRPO):
     """FlowGRPO with TGR-weighted policy loss and optional unrectified reference KL."""
 
-    # The trainer gates its per-sample SDE-index orchestration on this flag: stratify
-    # one SDE step per prompt, stamp ``segment.sde_index_per_sample``, then merge the
-    # groups into one training track. Without it every sample shares the one step
-    # ``get_sde_indices`` draws and the optimizer step sees a single sigma.
-    requires_per_sample_sde_index = True
+    requires_per_sample_sde_index = True  # One stratified SDE step per prompt; see trainer/README.md.
 
     def __init__(
         self,
@@ -105,8 +101,7 @@ class FlashGRPO(FlowGRPO):
         self.adv_clip_max = float(adv_clip_max)
         if not self.adv_clip_max > 0.0:
             raise ValueError(f"FlashGRPO: adv_clip_max must be > 0; got {adv_clip_max!r}.")
-        # The trainer stamps sde_index_per_sample for every FlashGRPO recipe, so a
-        # stage whose replay ignores it would score every row at one group's sigma.
+        # Every rollout segment carries sde_index_per_sample; a replay that ignores it scores all rows at one sigma.
         if not getattr(self.stage, "supports_per_sample_sde_index", False):
             raise ValueError(
                 f"FlashGRPO requires a stage that honours segment.sde_index_per_sample; "
@@ -148,8 +143,7 @@ class FlashGRPO(FlowGRPO):
         pool = scheduler.sde_candidate_pool()
         if not pool:
             raise ValueError("FlashGRPO per-sample SDE-index path: the scheduler candidate pool is empty.")
-        # The last denoising step stores only {T-1, T} latents while earlier steps
-        # store three, so a group that drew it cannot be concatenated with the rest.
+        # The last denoising step stores two latents, not three, so its group cannot be concatenated.
         num_inference_steps = diffusion.num_inference_steps
         if max(pool) >= num_inference_steps - 1:
             raise ValueError(
@@ -258,7 +252,7 @@ class FlashGRPO(FlowGRPO):
         training_progress: float,
         loss_scale: float,
     ) -> AlgorithmStepResult:
-        # The trainer stamps every FlashGRPO rollout; a missing stamp means it never stratified.
+        # The rollout engine stamps every per-sample request; a missing stamp means the request carried no steps.
         if segment.sde_index_per_sample is None:
             raise ValueError(
                 "FlashGRPO requires segment.sde_index_per_sample; the rollout was not stratified per prompt."

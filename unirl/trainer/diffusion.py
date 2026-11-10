@@ -772,8 +772,7 @@ class DiffusionTrainer(BaseTrainer):
 
     def _prompt_sde_steps(self, inputs: Sample, rollout_id: int) -> List[int]:
         """Draw one stratified step per root prompt; see README.md for the two dispatch geometries."""
-        # ``Sample.select`` indexes this same list, which groups by root id, so a
-        # duplicate or empty root id set would collapse the batch onto one request.
+        # Sample.select indexes these root groups; duplicate or empty root ids would collapse the batch.
         n_prompts = len(inputs.split())
         root_rows = inputs.parts[0].batch_size
         if n_prompts != root_rows:
@@ -1009,9 +1008,7 @@ class DiffusionTrainer(BaseTrainer):
         window_rewards: List[float] = []
         for rollout_id in window_ids:
             inputs = self.data_source.get_samples(self.batch_size)
-            # Per-sample SDE algorithms fan the rollout into one generate per SDE-step
-            # group so a single optimizer step averages over a spread of sigmas; every
-            # other algorithm builds one request.
+            # Per-sample SDE: one engine-grouped request, or one request per SDE-step group.
             if self._engine_per_sample_sde:
                 request_samples = [self._build_per_sample_engine_request(inputs, rollout_id)]
             elif self._per_sample_sde:

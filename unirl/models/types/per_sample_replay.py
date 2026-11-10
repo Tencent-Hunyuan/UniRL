@@ -78,15 +78,13 @@ class PerSampleStepReplayMixin:
             device = segment.latents.device
         sigmas = segment.sigmas.to(device=device, dtype=torch.float32)
         step_idx = raw_idx.to(device=device, dtype=torch.long)
-        # Pin the strategy's schedule here: only the generation path calls init_schedule,
-        # so a remote-engine run that replays from a segment never generates on this rank.
+        # Replay can run on a rank that never generated this schedule; see sde/README.md Gotchas.
         self.strategy.init_schedule(sigmas)
         # index_select(0, ...) rejects negative and out-of-bounds indices without host sync.
         sigma = sigmas.index_select(0, step_idx)
         sigma_next = sigmas.index_select(0, step_idx + 1)
         sigma_max = sigmas[1]
-        # Fixed slots, not latents_at(): after the per-step groups merge, the shared
-        # ``indices`` map holds one group's steps and is not per-sample valid.
+        # Fixed [before, after] slots, not latents_at(): merged ``indices`` is not per-sample valid.
         sample = segment.latents[:, 0].to(device)
         prev_sample = segment.latents[:, 1].to(device)
 
