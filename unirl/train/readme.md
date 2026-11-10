@@ -67,8 +67,8 @@ in `backend/base.py`; a multi-update-capable algorithm sets
 
 ## Export-only LoRA EMA
 
-- **Enable:** The [H3 FlashGRPO recipe](../../examples/diffusion/minimax_h3/minimax_h3_t2va_flashgrpo.yaml)
-  defaults to off. Keep `backend.lora_cfg` and add:
+- **Enable:** `backend.ema_cfg` defaults to off. On a LoRA recipe, keep
+  `backend.lora_cfg` and add:
   ```bash
   +backend.ema_cfg._target_=unirl.train.configs.EmaFullConfig \
   +backend.ema_cfg.target_decay=0.9 +backend.ema_cfg.update_interval=8
