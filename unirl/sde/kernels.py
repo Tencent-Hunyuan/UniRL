@@ -376,8 +376,7 @@ class FlashSDEStrategy(DanceSDEStrategy):
 
     canonical_name: ClassVar[str] = "flash"
 
-    def __init__(self, *, config: Optional["FlashSpec"] = None) -> None:
-        del config
+    def __init__(self) -> None:
         self._sigma_min: Optional[torch.Tensor] = None
 
     def init_schedule(self, sigmas: torch.Tensor) -> None:
@@ -590,11 +589,6 @@ class DanceSpec:
 
 
 @dataclass
-class FlashSpec:
-    """Empty Spec: FlashSDEStrategy has no per-strategy config fields."""
-
-
-@dataclass
 class DPM2Spec:
     """Empty Spec: DPM2Strategy has no per-strategy config fields."""
 
@@ -610,6 +604,5 @@ __all__ = [
     "FlowSpec",
     "CPSSpec",
     "DanceSpec",
-    "FlashSpec",
     "DPM2Spec",
 ]
