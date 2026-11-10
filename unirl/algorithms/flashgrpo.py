@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from dataclasses import field as dc_field
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, Type, Union
@@ -216,16 +217,17 @@ class FlashGRPO(FlowGRPO):
                 raise ValueError("TGR coefficients must be finite and positive; check sigmas and eta")
             weights = coefficients[matches.long().argmax(dim=1)]
             statistics = [weights.double().sum().item(), float(weights.numel()), 0.0, *matches.sum(dim=0).tolist()]
-        except Exception as exc:
+        except ValueError as exc:
             error = exc
             statistics[2] = 1.0
         total, count, invalid, *counts = self.backend.all_reduce_loss_sums(statistics)
         if invalid:
             raise ValueError(
                 "FlashGRPO batch_normalize_tgr: invalid input on a training rank; "
-                f"{error or 'check the failing rank for its schedule/step error'}. Fix the rollout schedule and step pool."
+                f"{error or 'check the failing rank for its schedule/step error'}. "
+                "Fix the rollout schedule and step pool."
             ) from error
-        if count <= 0 or not torch.isfinite(torch.tensor(total / count)) or total <= 0:
+        if count <= 0 or not math.isfinite(total / count) or total <= 0:
             raise ValueError("FlashGRPO batch_normalize_tgr: global coefficient sum/count must be finite and positive.")
         norm = (
             coefficients.detach().mean().clamp_min(torch.finfo(torch.float32).eps)
