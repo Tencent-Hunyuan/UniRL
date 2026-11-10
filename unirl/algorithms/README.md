@@ -187,12 +187,15 @@ own reference KL.
   renormalizes a micro. No persistent algorithm state is added: prepare recomputes weights
   after resume. This mode requires `num_updates_per_batch=1` and `accumulate_rollouts=1`.
   Omit `rectification_indices` to use the scheduler pool, or supply that exact pool.
-- **Batch-normalized TGR runs one unconditional collective per rollout.**
-  `backend.all_reduce_loss_sums` reduces fp64 sum/count, invalid-rank flags, and step counts
-  over the gradient mesh. A shard that fails validation (`ValueError`) still joins the
-  collective, then every rank raises; any other exception propagates from the failing rank
-  before the collective. Counts also select the global weight extrema for
-  `flash_tgr_global_mean/min/max` metrics, without a second collective.
+- **Batch-normalized TGR makes one unconditional `backend.all_reduce_loss_sums` call per rollout.**
+  It reduces fp64 sum/count, invalid-rank flags, and step counts over the gradient mesh, with one
+  `all_reduce` per mesh group. An exception a rank raises while preparing its shard is held until
+  that rank has made the call; every rank then raises `ValueError`, chained to the original on the
+  failing rank. A rank that cannot reach the call (lost process, broken CUDA context) still relies
+  on job teardown. `prepare_part` reads device values back three times per rollout: two before the
+  call (input checks with step counts, then coefficient check with the fp64 sum) and one after it.
+  Counts also select the global weight extrema for `flash_tgr_global_mean/min/max` metrics, without
+  a second call.
 - **Equal global step counts reuse the pool-normalized default's normalizer bit for bit.**
   They retain the explicit pool order, fp32 mean, and epsilon clamp; unequal counts use the
   global sum/count. The clamp can leave the actual mean below one, which the metrics report

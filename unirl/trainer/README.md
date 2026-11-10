@@ -575,10 +575,12 @@ without driver-authored x_T. `media_log_interval` does not apply
   `Sample.concat` / `Part.concat` can merge the groups. `sde_index_per_sample` (a `CONCAT` field) is
   the authoritative per-sample step; `PerSampleStepReplayMixin.replay_per_sample` indexes fixed
   latent slots `[:, 0]` / `[:, 1]`, not `latents_at()`.
-- **The SDE candidate pool must not reach the final denoising step.** Step `T-1` stores two trajectory
-  latents where earlier steps store three, and `torch.cat` cannot merge different `K`.
-  `FlashGRPO.per_sample_sde_pool` raises at trainer build time rather than failing mid-rollout. Keep the scheduler's `timestep_fraction` end
-  below `(num_inference_steps - 1) / num_inference_steps`.
+- **The SDE candidate pool must not reach the final denoising step.** `FlashGRPO.per_sample_sde_pool`
+  rejects such a pool at trainer build time, and the trainside engine rejects a request whose step is outside
+  `[0, num_inference_steps-2]`. Step `T-1` stores two trajectory latents where earlier steps store three, but
+  `stamp_sde_index_per_sample` packs both into `[before, after, final]` before any concat, so merging is not what
+  forbids it: per-sample rollout, replay and TGR have only been validated on steps that store three latents.
+  Keep the scheduler's `timestep_fraction` end below `(num_inference_steps - 1) / num_inference_steps`.
 - **An explicit `rectification_indices` must equal the scheduler's candidate pool.** With
   `algorithm.batch_normalize_tgr: true` it may be omitted: weights use the actual global
   batch in `prepare_part`, and each row's step must belong to the scheduler pool. This mode

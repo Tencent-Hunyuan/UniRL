@@ -99,8 +99,8 @@ class FlashGRPO(FlowGRPO):
                 raise ValueError("FlashGRPO batch_normalize_tgr requires the training backend, including on one rank.")
         self.rectification_indices = [int(i) for i in rectification_indices]
         self.adv_clip_max = float(adv_clip_max)
-        if not self.adv_clip_max > 0.0:
-            raise ValueError(f"FlashGRPO: adv_clip_max must be > 0; got {adv_clip_max!r}.")
+        if not (math.isfinite(self.adv_clip_max) and self.adv_clip_max > 0.0):
+            raise ValueError(f"FlashGRPO: adv_clip_max must be finite and > 0; got {adv_clip_max!r}.")
         # Every rollout segment carries sde_index_per_sample; a replay that ignores it scores all rows at one sigma.
         if not getattr(self.stage, "supports_per_sample_sde_index", False):
             raise ValueError(
@@ -143,14 +143,13 @@ class FlashGRPO(FlowGRPO):
         pool = scheduler.sde_candidate_pool()
         if not pool:
             raise ValueError("FlashGRPO per-sample SDE-index path: the scheduler candidate pool is empty.")
-        # The last denoising step stores two latents, not three, so its group cannot be concatenated.
+        # The per-sample path is validated only on steps that store three latents; see trainer/README.md.
         num_inference_steps = diffusion.num_inference_steps
         if max(pool) >= num_inference_steps - 1:
             raise ValueError(
-                f"FlashGRPO per-sample SDE candidate pool reaches step {max(pool)}, but the last denoising "
-                f"step (num_inference_steps-1 = {num_inference_steps - 1}) stores a different number of "
-                "trajectory latents, so mixed-shape rollout groups cannot be concatenated. Narrow the "
-                "scheduler timestep_fraction so its end maps below the final step."
+                f"FlashGRPO per-sample SDE candidate pool reaches step {max(pool)}, but per-sample SDE steps "
+                f"must stay below the last denoising step (num_inference_steps-1 = {num_inference_steps - 1}). "
+                "Narrow the scheduler timestep_fraction so its end maps below the final step."
             )
         sorted_pool = sorted(pool)
         if algorithm_cfg.get("batch_normalize_tgr", FlashGRPOConfig.batch_normalize_tgr) and not algorithm_cfg.get(
@@ -196,22 +195,28 @@ class FlashGRPO(FlowGRPO):
             if idx.ndim != 1 or idx.dtype not in (torch.int32, torch.int64) or idx.numel() != part.batch_size:
                 raise ValueError("sde_index_per_sample must be a 1-D integer tensor with one step per sample")
             sigmas = segment.sigmas.to(dtype=torch.float32)
-            if sigmas.ndim != 1 or not torch.isfinite(sigmas).all():
+            if sigmas.ndim != 1:
+                raise ValueError("sigmas must be a finite 1-D schedule")
+            device = sigmas.device
+            candidates = torch.tensor(pool, device=device, dtype=torch.long)
+            matches = idx.to(device=device)[:, None] == candidates[None, :]  # [B, P] bool
+            flags = torch.stack([torch.isfinite(sigmas).all(), matches.any(dim=1).all()])
+            finite, matched, *step_counts = torch.cat([flags.long(), matches.sum(dim=0)]).tolist()
+            if not finite:
                 raise ValueError("sigmas must be a finite 1-D schedule")
             if sigmas.shape[0] < 2 or min(pool) < 0 or max(pool) >= sigmas.shape[0] - 1:
                 raise ValueError("sigmas must cover every candidate step and its successor; fix the rollout schedule")
-            device = sigmas.device
-            candidates = torch.tensor(pool, device=device, dtype=torch.long)
-            matches = idx.to(device=device)[:, None] == candidates[None, :]
-            if not matches.any(dim=1).all():
+            if not matched:
                 raise ValueError(f"each sample's SDE step must belong to candidate pool {pool}")
             self.stage.strategy.init_schedule(sigmas)
             coefficients = self._rectification_coefficients(sigmas=sigmas, steps=pool, device=device).detach()
-            if not (torch.isfinite(coefficients) & (coefficients > 0)).all():
-                raise ValueError("TGR coefficients must be finite and positive; check sigmas and eta")
             weights = coefficients[matches.long().argmax(dim=1)]
-            statistics = [weights.double().sum().item(), float(weights.numel()), 0.0, *matches.sum(dim=0).tolist()]
-        except ValueError as exc:
+            valid = (torch.isfinite(coefficients) & (coefficients > 0)).all()
+            valid, total = torch.stack([valid.double(), weights.double().sum()]).tolist()
+            if not valid:
+                raise ValueError("TGR coefficients must be finite and positive; check sigmas and eta")
+            statistics = [total, float(weights.numel()), 0.0, *step_counts]
+        except Exception as exc:  # Held until this rank has joined the collective below; re-raised with its cause.
             error = exc
             statistics[2] = 1.0
         total, count, invalid, *counts = self.backend.all_reduce_loss_sums(statistics)
@@ -229,17 +234,20 @@ class FlashGRPO(FlowGRPO):
             else coefficients.new_tensor(total / count)
         )
         pool_weights = coefficients / norm
-        if not (torch.isfinite(pool_weights) & (pool_weights > 0)).all():
+        global_counts = torch.tensor(counts, dtype=torch.float64, device=device)
+        active = pool_weights[global_counts > 0].double()
+        valid = (torch.isfinite(pool_weights) & (pool_weights > 0)).all().double()
+        weighted_sum = (pool_weights.double() * global_counts).sum()
+        valid, weighted_sum, lowest, highest = torch.stack([valid, weighted_sum, active.min(), active.max()]).tolist()
+        if not valid:
             raise ValueError(
                 "FlashGRPO batch_normalize_tgr: normalized weights must be finite and positive; check sigmas."
             )
         segment.policy_loss_weights = (weights / norm).reshape(-1, 1).detach()
-        global_counts = torch.tensor(counts, dtype=torch.float64, device=device)
-        active = pool_weights[global_counts > 0]
         self._batch_tgr_metrics = {
-            "flash_tgr_global_mean": (pool_weights.double() * global_counts).sum().item() / count,
-            "flash_tgr_global_min": active.min().item(),
-            "flash_tgr_global_max": active.max().item(),
+            "flash_tgr_global_mean": weighted_sum / count,
+            "flash_tgr_global_min": lowest,
+            "flash_tgr_global_max": highest,
         }
         return part
 
