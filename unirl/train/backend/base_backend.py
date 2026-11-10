@@ -160,7 +160,7 @@ class BaseFSDP2Backend(Remote):
                 shadow=shadow,
                 decay_fn=make_decay_fn(active_cfg),
                 timing=active_cfg.timing,
-                update_interval=ema_cfg.update_interval if ema_cfg is not None else 1,
+                update_interval=ema_cfg.update_interval if ema_cfg is not None else EmaFullConfig.update_interval,
             )
 
         self.optimizer = build_optimizer(
