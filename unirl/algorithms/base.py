@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple, Type, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, Tuple, Type, Union
 
 import torch
 
@@ -360,9 +360,26 @@ class StageAlgorithm(Remote, ABC):
     supports_multi_update: bool = False
     requires_backend: bool = False
     requires_advantages: bool = True
-    requires_per_sample_sde_index: bool = False
+    requires_per_sample_sde_index: bool = False  # True: implement the three per-sample SDE hooks below.
     recomputes_anchor: bool = False
     anchor_fields: Tuple[str, ...] = ()
+
+    @staticmethod
+    def engine_groups_sde_steps(
+        algorithm_cfg: Mapping[str, Any], *, num_updates_per_batch: int, accumulate_rollouts: int
+    ) -> bool:
+        """Per-sample SDE hook: validate rollout config before model loading; True groups steps in the engine."""
+        raise NotImplementedError
+
+    @staticmethod
+    def per_sample_sde_pool(algorithm_cfg: Mapping[str, Any], diffusion: Any) -> List[int]:
+        """Per-sample SDE hook: validate and return the run's candidate SDE steps from the sampling params."""
+        raise NotImplementedError
+
+    @staticmethod
+    def per_prompt_sde_steps(pool: Sequence[int], *, num_prompts: int, rollout_id: int) -> List[int]:
+        """Per-sample SDE hook: one SDE step per prompt for this rollout, drawn from ``pool``."""
+        raise NotImplementedError
 
     def prepare_segment(
         self,
