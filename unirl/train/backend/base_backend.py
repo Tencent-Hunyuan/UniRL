@@ -17,6 +17,7 @@ from torch.distributed.tensor import DTensor
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
 from unirl.distributed.local import local_view
+from unirl.models.types.post_materialize import canonical_param_name
 from unirl.train.backend.base import ExpertWeightExportTransform, LrSchedulerConfig, OptimizerConfig
 from unirl.train.backend.sharded_state import (
     StateDict,
@@ -544,7 +545,7 @@ class BaseFSDP2Backend(Remote):
             raise ValueError("EMA configuration differs from checkpoint; resume with the same ema_cfg.")
         if self._ema_config is not None:
             shadows = {id(shadow) for _, shadow in self.ema.shadow.iter_pairs()}
-            names = {name for name, param in self.model.named_parameters() if id(param) in shadows}
+            names = {canonical_param_name(n) for n, param in self.model.named_parameters() if id(param) in shadows}
             if not names.issubset(model_keys):
                 raise ValueError(
                     "Checkpoint is missing EMA shadow weights; resume without ema_cfg or from an EMA checkpoint."
