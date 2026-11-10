@@ -235,7 +235,8 @@ class FlashGRPO(FlowGRPO):
         )
         pool_weights = coefficients / norm
         global_counts = torch.tensor(counts, dtype=torch.float64, device=device)
-        active = pool_weights[global_counts > 0].double()
+        drawn = torch.tensor([i for i, n in enumerate(counts) if n > 0], dtype=torch.long, device=device)
+        active = pool_weights.index_select(0, drawn).double()  # host-built index: a bool mask would sync via nonzero
         valid = (torch.isfinite(pool_weights) & (pool_weights > 0)).all().double()
         weighted_sum = (pool_weights.double() * global_counts).sum()
         valid, weighted_sum, lowest, highest = torch.stack([valid, weighted_sum, active.min(), active.max()]).tolist()
