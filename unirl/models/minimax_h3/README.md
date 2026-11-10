@@ -20,10 +20,11 @@
   `aux_components_on_cpu` independently control placement: CPU modules stay resident,
   so CPU VAEs do not prevent a CUDA text encoder from being released. Before the next
   rollout or eval, `wake_up` reloads released modules on their original devices;
-  the shared trainable transformer stays untouched. Sleep calls
-  `torch.cuda.empty_cache()` so allocations outside the PyTorch allocator can use
-  the freed memory for the cuBLAS handle and NCCL buffers. Removing this call
-  caused `CUBLAS_STATUS_ALLOC_FAILED`; keep it after dropping the module references.
+  the shared trainable transformer stays untouched. Sleep then calls
+  `torch.cuda.empty_cache()`, after the module references are dropped and whenever
+  a module is recorded as released: freed blocks otherwise stay in PyTorch's
+  caching allocator, where allocations made outside it (the cuBLAS handle, NCCL
+  buffers) cannot use them.
 - **H3 auxiliary checkpoints and construction config must stay unchanged between wakes.**
   `load_minimax_h3_vae` and `load_minimax_h3_text_encoder` in
   [`bundle.py`](bundle.py) serve both initial load and wake, preserving checkpoint
