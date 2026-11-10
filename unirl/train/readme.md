@@ -155,8 +155,10 @@ use LoRA adapter mode. Formats and export live in
   raises before loading weights. An absent or empty `ema_config` imposes no
   schedule: a checkpoint that holds shadow weights without it (written before the
   schedule was recorded) is accepted, and its shadows continue under the current
-  `ema_cfg`. Independently, a checkpoint without shadow weights raises when
-  `ema_cfg` is set, because an adapter-mode load would silently leave the shadows
+  `ema_cfg`. Independently, when `ema_cfg` is set the checkpoint must hold every
+  shadow parameter of the model, matched by full parameter name rather than by
+  `shadow_prefix` (a prefix such as `weight` also matches live names); otherwise
+  loading raises, because an adapter-mode load would silently leave the shadows
   at their injection-time copy. With EMA off, no shadow or EMA metadata is added
   and the optimizer/rollout arithmetic is unchanged.
 - **Unified `ar` / `image` results describe one shared optimizer step.** Their

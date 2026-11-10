@@ -453,7 +453,8 @@ class BaseFSDP2Backend(Remote):
             )
 
             meta: Dict[str, object] = torch.load(metadata_path, map_location="cpu")
-            self._check_ema_resume(meta, dcp.FileSystemReader(path).read_metadata().state_dict_metadata)
+            dcp_keys = dcp.FileSystemReader(path).read_metadata().state_dict_metadata
+            self._check_ema_resume(meta, [key.removeprefix("model.") for key in dcp_keys if key.startswith("model.")])
             mode = meta["save_mode"]
             self._reject_meta(operation="load", checkpoint_format="dcp", mode=mode)
             has_meta_params = any(p.is_meta for p in self.model.parameters())
@@ -514,16 +515,17 @@ class BaseFSDP2Backend(Remote):
         self._optimizer_step_count = checkpoint["optimizer_step_count"]
         return checkpoint["step"]
 
-    def _check_ema_resume(self, metadata: Dict[str, object], state_keys: Iterable[str]) -> None:
+    def _check_ema_resume(self, metadata: Dict[str, object], model_keys: Iterable[str]) -> None:
         """Refuse a changed mirror EMA schedule, or enabled EMA without checkpointed shadows; see train/readme.md."""
         recorded = metadata.get("ema_config")
         if recorded and recorded != self._ema_config:
             raise ValueError("EMA configuration differs from checkpoint; resume with the same ema_cfg.")
         if self._ema_config is not None:
-            prefix = self._ema_config["shadow_prefix"]
-            if not any(key.rpartition(".")[2].startswith(prefix) for key in state_keys):
+            shadows = {id(shadow) for _, shadow in self.ema.shadow.iter_pairs()}
+            names = {name for name, param in self.model.named_parameters() if id(param) in shadows}
+            if not names.issubset(model_keys):
                 raise ValueError(
-                    "Checkpoint has no EMA shadow weights; resume without ema_cfg or from an EMA checkpoint."
+                    "Checkpoint is missing EMA shadow weights; resume without ema_cfg or from an EMA checkpoint."
                 )
 
     def _reject_meta(
