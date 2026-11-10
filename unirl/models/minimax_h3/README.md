@@ -6,6 +6,29 @@
 
 ## Gotchas
 
+- **`rollout_keep_unsharded_layers: N` retains only the first N transformer blocks during one generate.**
+  The H3 config accepts integers in `[0, 50]`; the stage also checks the loaded
+  layer count. The default `0` leaves `generate` unwrapped, without FSDP scans,
+  flag changes, logging, or extra tensor/RNG operations. Opt-in requires no-grad
+  generation and UniRL FSDP2 with `reshard_after_forward=true`, one FSDP group
+  per selected block; activation-checkpoint wrappers in either order and
+  `root_wrap=false` are supported. All ranks must use the same N.
+  Each selected block gathers on first use, then reuses its compute parameters;
+  `finally` reshards it and restores the flag before generate returns or raises.
+  Nothing stays retained across VAE decode, another forward batch, sleep/wake,
+  policy replay, reference KL, or backward. Eval uses the same scope.
+- **Retained compute parameters consume additional device memory, not just their local shard size.**
+  Rank 0's first successful enabled generate logs each selected block's actual
+  unsharded parameter bytes and total GiB (including adapters/shadows, excluding
+  allocator padding, activations and communication buffers). The original shards
+  remain resident. VAEs are already awake during denoising; size N against that
+  combined peak, not the lower decode peak. Crossing decode to retain across
+  batches would add these bytes to decode activations too, so is not supported.
+  With L block gathers per step and S steps, each generate uses `S*(L-N)+N`
+  gathers; K forward batches use `K*(S*(L-N)+N)`. `H3_DIAG_AG=1` counts actual
+  launches, so retained blocks' no-op unshards do not inflate the count. Measure
+  GPU headroom before increasing N; return to `0` after an OOM and restart the run.
+
 - **H3 supports engine-grouped per-sample SDE requests.**
   `MiniMaxH3DiffusionStage.supports_order_independent_sde_noise` is true because
   `MiniMaxH3Pipeline.generate` passes sample ids as `denoise_seed_keys` to both

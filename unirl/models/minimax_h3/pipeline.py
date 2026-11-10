@@ -78,6 +78,7 @@ class MiniMaxH3Pipeline(Pipeline):
                 trajectory_precision=config.trajectory_precision,
                 logprob_precision=config.logprob_precision,
                 batch_replay_steps=config.batch_replay_steps,
+                rollout_keep_unsharded_layers=config.rollout_keep_unsharded_layers,
             ),
             video_decode=MiniMaxH3VideoDecodeStage(bundle),
             audio_decode=MiniMaxH3AudioDecodeStage(bundle),

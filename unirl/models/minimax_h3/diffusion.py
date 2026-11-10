@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+from contextlib import contextmanager
 from copy import deepcopy
 from typing import ClassVar, List, Optional, Tuple
 
@@ -22,6 +24,8 @@ from .bundle import MiniMaxH3Bundle
 from .conditions import MiniMaxH3Conditions
 from .config import MINIMAX_H3_AUDIO_LATENT_CHANNELS
 from .packing import MiniMaxH3Geometry, build_t2va_layout, row_timestep_plan
+
+logger = logging.getLogger(__name__)
 
 
 def pack_dual_streams(video_rows: torch.Tensor, audio_rows: torch.Tensor) -> torch.Tensor:
@@ -104,6 +108,7 @@ class MiniMaxH3DiffusionStage(BatchedStepReplayMixin, DiffusionStage[MiniMaxH3Co
         trajectory_precision: str = "fp16",
         logprob_precision: str = "fp32",
         batch_replay_steps: bool,
+        rollout_keep_unsharded_layers: int = 0,
     ) -> None:
         self.bundle = bundle
         self.step = MiniMaxH3DiffusionStep(bundle)
@@ -116,6 +121,51 @@ class MiniMaxH3DiffusionStage(BatchedStepReplayMixin, DiffusionStage[MiniMaxH3Co
         self.trajectory_dtype = parse_torch_dtype(trajectory_precision, field_name="trajectory_precision")
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="logprob_precision")
         self.batch_replay_steps = batch_replay_steps
+        self.rollout_keep_unsharded_layers = rollout_keep_unsharded_layers
+        if rollout_keep_unsharded_layers:
+            if not 0 < rollout_keep_unsharded_layers <= len(bundle.transformer.transformer_blocks):
+                raise ValueError("rollout_keep_unsharded_layers exceeds the loaded H3 transformer's layer count.")
+            self._keep_unsharded_logged = False
+            self.generate = self._keep_fsdp_params_unsharded()(self.generate)
+
+    @contextmanager
+    def _keep_fsdp_params_unsharded(self):
+        """Retain the first N FSDP blocks for one no-grad generate; see README.md Gotchas."""
+        from torch.distributed.fsdp import FSDPModule
+
+        model = self.bundle.transformer
+        previous = getattr(model, "_unirl_fsdp_reshard_after_forward", None)
+        require(not torch.is_grad_enabled(), "H3 retained rollout parameters require torch.no_grad().")
+        require(previous is True, "H3 retained rollout parameters require FSDP reshard_after_forward=true.")
+        blocks = list(model.transformer_blocks[: self.rollout_keep_unsharded_layers])
+        modules = []
+        for block in blocks:
+            wrapped = [module for module in block.modules() if isinstance(module, FSDPModule)]
+            require(len(wrapped) == 1, "H3 retained rollout parameters require one FSDP module per selected block.")
+            modules.extend(wrapped)
+        changed = []
+        try:
+            for module in modules:
+                module.set_reshard_after_forward(False, recurse=False)
+                changed.append(module)
+            yield
+            if not self._keep_unsharded_logged:
+                if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                    sizes = [sum(p.numel() * p.element_size() for p in block.parameters()) for block in blocks]
+                    logger.info(
+                        "H3 rollout keeps %d layers unsharded: bytes_per_layer=%s, total_gb=%.6f (GiB)",
+                        len(blocks),
+                        sizes,
+                        sum(sizes) / 2**30,
+                    )
+                self._keep_unsharded_logged = True
+        finally:
+            try:
+                for module in reversed(changed):
+                    module.reshard()
+            finally:
+                for module in changed:
+                    module.set_reshard_after_forward(previous, recurse=False)
 
     def trainable_module(self) -> torch.nn.Module:
         return self.bundle.transformer

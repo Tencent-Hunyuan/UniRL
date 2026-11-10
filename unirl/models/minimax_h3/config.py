@@ -46,6 +46,7 @@ class MiniMaxH3PipelineConfig:
     trajectory_precision: str = "fp16"
     logprob_precision: str = "fp32"
     batch_replay_steps: bool = False
+    rollout_keep_unsharded_layers: int = 0
 
     # Per-modality rectified-flow shifts. These are the released inference
     # values; they are NOT free parameters -- the model was distilled against
@@ -109,6 +110,8 @@ class MiniMaxH3PipelineConfig:
 
     def __post_init__(self) -> None:
         validate_precision_type(self.model_precision, field="MiniMaxH3PipelineConfig.model_precision")
+        if type(self.rollout_keep_unsharded_layers) is not int or not 0 <= self.rollout_keep_unsharded_layers <= 50:
+            raise ValueError("MiniMaxH3PipelineConfig.rollout_keep_unsharded_layers must be an integer in [0, 50].")
         for name, shift in (("video_shift", self.video_shift), ("audio_shift", self.audio_shift)):
             if not math.isfinite(shift) or shift <= 0:
                 raise ValueError(f"MiniMaxH3PipelineConfig.{name} must be finite and > 0; got {shift!r}.")
