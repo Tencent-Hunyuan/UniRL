@@ -32,6 +32,7 @@ if GRAD_AB_ONLY and not GRAD_AB_DIR:
     raise ValueError("H3_DIAG_GRAD_AB_ONLY=1 requires H3_DIAG_GRAD_AB=<directory>.")
 if FIX_MEANS_DIR and not GRAD_AB_DIR:
     raise ValueError("H3_DIAG_FIX_MEANS=<directory> requires H3_DIAG_GRAD_AB=<directory>.")
+DUMP_FWD_DIR = os.environ.get("H3_DIAG_DUMP_FWD")
 FP32_OPS = frozenset(filter(None, os.environ.get("H3_DIAG_FP32_OPS", "").split(",")))
 if FP32_OPS - {"norm", "resid", "gemm"}:
     raise ValueError(f"H3_DIAG_FP32_OPS: {sorted(FP32_OPS)} is not a subset of norm,resid,gemm.")
@@ -179,6 +180,36 @@ def _fp32_residual(block, last, hidden_states, temb, adaln_indices, rotary_emb, 
     return stream.to(low) if last else stream
 
 
+def dump_first_forward(model, rank):
+    """Rank 0 saves the first grad-enabled model call's kwargs, outputs and output cotangents; see utils/README.md."""
+    if not DUMP_FWD_DIR or rank != 0:
+        return
+    seen = {}
+
+    def before(module, args, kwargs):
+        if torch.is_grad_enabled() and "kwargs" not in seen:
+            seen["kwargs"] = {k: v.detach().cpu() if torch.is_tensor(v) else v for k, v in kwargs.items()}
+            seen["pending"] = True
+
+    def after(module, args, kwargs, output):
+        if not seen.pop("pending", False):
+            return
+        grads = [None] * len(output)
+
+        def save(index, grad):
+            grads[index] = grad.detach().cpu()
+            if all(g is not None for g in grads):
+                Path(DUMP_FWD_DIR).mkdir(parents=True, exist_ok=True)
+                payload = {"kwargs": seen["kwargs"], "outputs": [o.detach().cpu() for o in output], "out_grads": grads}
+                torch.save(payload, Path(DUMP_FWD_DIR) / "fwd_rank0.pt")
+
+        for index, tensor in enumerate(output):
+            tensor.register_hook(partial(save, index))
+
+    model.register_forward_pre_hook(before, with_kwargs=True)
+    model.register_forward_hook(after, with_kwargs=True)
+
+
 def install_fp32_ops(model):
     """Apply the H3_DIAG_FP32_OPS precision patches to this process and ``model``; see utils/README.md."""
     if "gemm" in FP32_OPS:
@@ -232,6 +263,7 @@ def compare_micro_gradients(function):
             if FIX_MEANS_DIR:
                 _fixed_means = _FixedMeans(stack.algorithm.stage, rank)
             install_fp32_ops(backend.model)
+            dump_first_forward(backend.model, rank)
             world = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
             for index, spec in enumerate(GRAD_AB_MICROS):
                 micro, mask = int(spec.rstrip("lohirab")), spec.lstrip("0123456789")

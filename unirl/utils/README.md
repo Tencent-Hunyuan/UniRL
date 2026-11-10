@@ -130,6 +130,11 @@ it installs no runtime wrappers or FSDP patches; the stage recorder is unchanged
   `torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False` in
   the worker (PyTorch enables reduced-precision bf16 GEMM accumulation by
   default). Each `meta_rank<rank>.json` records `fp32_ops`.
+- `H3_DIAG_DUMP_FWD=<directory>` (requires `H3_DIAG_GRAD_AB`) makes rank 0 write
+  `fwd_rank0.pt` once: the keyword arguments of the first grad-enabled call of
+  the trainable model, its outputs, and the gradients that reach those outputs
+  (all on CPU in their own dtypes). It feeds a standalone backward comparison
+  outside the train stack; the hooks stay installed for the rest of the process.
 - `H3_DIAG_STATE_SAVE=<directory>` writes `state_rank<rank>.pt` at each rank's
   first `train_track` call: the incoming Parts' `sample_ids`, `segment`,
   `conditions`, and `advantages` (no decoded media or rewards) and every trainable
