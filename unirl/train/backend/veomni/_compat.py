@@ -47,6 +47,10 @@ def ensure_installed() -> None:
         module_utils = importlib.import_module("veomni.models.module_utils")
         models_mod.load_model_weights = module_utils.load_model_weights
         models_mod.rank0_load_and_broadcast_weights = module_utils.rank0_load_and_broadcast_weights
+        # veomni 0.1.12's torch_parallelize imports this from the package root;
+        # 0.1.11 has no such symbol, so attach it only when present.
+        if hasattr(module_utils, "load_model_weights_ep_sharded"):
+            models_mod.load_model_weights_ep_sharded = module_utils.load_model_weights_ep_sharded
     logger.info("veomni distributed layer installed via selective-import shim")
 
 
