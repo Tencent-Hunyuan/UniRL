@@ -50,7 +50,9 @@ not just three-tensor arithmetic.
   DiffusionOPD is the teacher-anchored family — a per-step Gaussian KL against frozen
   teacher LoRA adapters (backend-owned `frozen_adapters`), distillation rather than RL:
   it ignores advantages and picks its teacher from the batch's `metadata["domain"]`
-  (`diffusionopd.py`).
+  (`diffusionopd.py`). AROPD is its AR sibling — a gap-weighted stop-gradient policy
+  gradient over the student's own sampled tokens against one frozen-LoRA same-backbone
+  teacher (`aropd.py`).
 - **The anchor contract — the subtle part.** bf16 forwards are batch-shape
   sensitive, so a π_old anchor computed at a different geometry than `new_logp`
   drifts the on-policy ratio off 1 (and FlowDPPO's KL off 0). Algorithms just declare
@@ -111,6 +113,21 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   distribution; when unset it silently falls back to the `ARSamplingParams` default,
   *not* the request Sample's actual temperature, biasing every ratio with no raise. Watch
   `rollout_replay_logp_absdiff_mean` — it should be ~0 on an on-policy step.
+- **AROPD is a policy gradient, not token KD** — the OPD objective is
+  `max_θ E_{a~π_θ}[log π_T(a)]` over the *student's own* sampled tokens.
+  `loss = −Σ sg(teacher_logp − new_logp)·new_logp / Σmask` implements its
+  score-function estimator plus the entropy term `∇H(π_θ)`, i.e. per-token
+  reverse-KL descent (a per-token factorization, not the exact gradient of
+  sequence-level `KL(π_θ‖π_T)`, which weights each token by the reward-to-go).
+  Backpropping `mean(new_logp − teacher_logp)` instead has gradient
+  `mean(∇log π_θ)` — zero in expectation, and the gap's sign never enters. The
+  gap's student side is `new_logp.detach()` — current weights at the teacher
+  anchor's micro geometry — so the advantage carries no rollout↔replay drift;
+  `segment.log_probs` only feeds the `rollout_replay_*` gauges. `gap_clamp`
+  (default 10) is an elementwise, grouping-invariant bound that biases the
+  estimator when it clips (`gap_clipped_tokens` / `gap_active_tokens` — the ratio
+  of the two aggregated counters is the true token fraction); the gap
+  metrics report raw unclamped nats, so `teacher_gap_abs_mean` may exceed it.
 - **DiffusionNFT's `ref_deviation_coef > 0` anchors to the LoRA-disabled base, not the EMA shadow** — the
   shadow tracks the policy by construction, so anchoring to it would bound no drift. The reference
   is a third `predict_noise_at_step` per trained timestep, on top of the trainable and shadow ones;
