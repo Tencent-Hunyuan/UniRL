@@ -29,6 +29,14 @@ def _stub_package(name: str, path: str) -> types.ModuleType:
     return mod
 
 
+def _drop_stub(name: str) -> None:
+    """Evict a loader-less stub of ``name`` so a real import can execute it."""
+    mod = sys.modules.get(name)
+    spec = getattr(mod, "__spec__", None)
+    if mod is not None and spec is not None and spec.loader is None:
+        del sys.modules[name]
+
+
 @functools.cache
 def ensure_installed() -> None:
     """Install the ``sys.modules`` path stubs (cached, idempotent)."""
@@ -47,10 +55,9 @@ def ensure_installed() -> None:
         module_utils = importlib.import_module("veomni.models.module_utils")
         models_mod.load_model_weights = module_utils.load_model_weights
         models_mod.rank0_load_and_broadcast_weights = module_utils.rank0_load_and_broadcast_weights
-        # veomni 0.1.12's torch_parallelize imports this from the package root;
-        # 0.1.11 has no such symbol, so attach it only when present.
-        if hasattr(module_utils, "load_model_weights_ep_sharded"):
-            models_mod.load_model_weights_ep_sharded = module_utils.load_model_weights_ep_sharded
+        models_mod.load_model_weights_ep_sharded = module_utils.load_model_weights_ep_sharded
+    _stub_package("veomni.ops", os.path.join(pkg_dir, "ops"))
+    _stub_package("veomni.ops.kernels", os.path.join(pkg_dir, "ops", "kernels"))
     logger.info("veomni distributed layer installed via selective-import shim")
 
 
@@ -64,6 +71,8 @@ def ensure_qwen3_moe_installed() -> None:
         os.path.join(pkg_dir, "models", "transformers"),
     )
     importlib.import_module("veomni.models.transformers.qwen3_moe")
+    _drop_stub("veomni.ops.kernels")
+    _drop_stub("veomni.ops")
     importlib.import_module("veomni.ops")
     ensure_attention_patch_installed()
     logger.info("veomni Qwen3-MoE modeling registered via selective import")
@@ -79,6 +88,8 @@ def ensure_qwen3_5_moe_installed() -> None:
         os.path.join(pkg_dir, "models", "transformers"),
     )
     importlib.import_module("veomni.models.transformers.qwen3_5_moe")
+    _drop_stub("veomni.ops.kernels")
+    _drop_stub("veomni.ops")
     importlib.import_module("veomni.ops")
     ensure_attention_patch_installed()
     logger.info("veomni Qwen3.5-MoE modeling registered via selective import")
@@ -88,9 +99,6 @@ def ensure_qwen3_5_moe_installed() -> None:
 def ensure_attention_patch_installed() -> None:
     """Register VeOmni's Ulysses SP attention into HF ``ALL_ATTENTION_FUNCTIONS``."""
     ensure_installed()
-    pkg_dir = list(sys.modules["veomni"].__path__)[0]
-    _stub_package("veomni.ops", os.path.join(pkg_dir, "ops"))
-    _stub_package("veomni.ops.kernels", os.path.join(pkg_dir, "ops", "kernels"))
     from veomni.ops.kernels.attention import apply_veomni_attention_patch
 
     apply_veomni_attention_patch()
