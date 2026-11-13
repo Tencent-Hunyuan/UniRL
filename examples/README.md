@@ -150,7 +150,7 @@ Worked examples:
 
 Domain-specific trailing qualifiers extend the chain:
 
-- **`pe/`** appends the reward: `pe_sglang_full_pickscore`, `pe_sglang_full_wise`.
+- **`pe/`** appends the reward: `pe_sglang_full_pickscore`, `pe_sglang_full_wise`. An image-editing recipe puts the task `it2i` first: `pe_it2i_trainside_editreward`.
 - **`ar/`** (vision-language) appends dataset + task: `qwen_vl_grpo_geo3k_mc_4x8` (`geo3k` · multiple-choice).
 - AR recipes (`ar/`) append the cluster shape `<N>x<G>` (nodes × GPUs): `..._4x8`.
 
