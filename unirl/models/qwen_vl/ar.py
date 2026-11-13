@@ -159,15 +159,21 @@ class QwenVLARStage(ARStage[QwenVLARConditions]):
             "attention_mask": attention_mask,
             "use_cache": True,
             "past_key_values": None,
-            "cache_position": torch.arange(int(input_ids.shape[1]), device=device, dtype=torch.long),
         }
 
         if pv is not None:
             model_kwargs["pixel_values"] = pv
         if igt is not None:
             model_kwargs["image_grid_thw"] = igt
+            vision_pos = _vision_rope_positions(
+                transformer, input_ids, image_grid_thw=igt, attention_mask=attention_mask
+            )
+            text_pos = attention_mask.long().cumsum(-1) - 1
+            text_pos.masked_fill_(attention_mask == 0, 1)
+            model_kwargs["position_ids"] = torch.cat([text_pos[None], vision_pos], dim=0)  # [4, B, L]
 
         cur_input_ids = input_ids
+        next_sequence_length = int(input_ids.shape[1])
 
         generated_tokens: List[List[int]] = [[] for _ in range(batch_size)]
         per_token_logps: List[List[float]] = [[] for _ in range(batch_size)]
@@ -178,7 +184,8 @@ class QwenVLARStage(ARStage[QwenVLARConditions]):
             prep_kwargs: Dict[str, Any] = {
                 "past_key_values": model_kwargs.get("past_key_values"),
                 "attention_mask": model_kwargs.get("attention_mask"),
-                "cache_position": model_kwargs.get("cache_position"),
+                "position_ids": model_kwargs.get("position_ids"),
+                "next_sequence_length": next_sequence_length,
                 "use_cache": True,
                 "logits_to_keep": 1,
             }
@@ -221,6 +228,7 @@ class QwenVLARStage(ARStage[QwenVLARConditions]):
             cur_input_ids = torch.cat([cur_input_ids, token_id.unsqueeze(-1)], dim=1)
             model_kwargs = transformer._update_model_kwargs_for_generation(out, model_kwargs)
             model_kwargs["use_cache"] = True
+            next_sequence_length = 1
             is_first_step = False
 
         return pack_generated_text_segment(generated_tokens, per_token_logps, device=device)
