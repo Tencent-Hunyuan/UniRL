@@ -12,14 +12,20 @@
 # builds no backend / algorithm / stack for it. Trainside engine only.
 #
 # Pairs with unirl/train_pe.py (PETrainer). Geometry:
-# P=4 prompts × N=4 rewrites × M=2 edits = 32 edits / 16 rewrites per rollout.
+# P=1 prompt × N=4 rewrites × M=2 edits = 8 edits / 4 rewrites per rollout and device.
+# The trainside engine cannot chunk a two-gen-Part Sample (no forward_batch_size), so
+# P*N*M edits per device run in ONE editor forward. Scale P by raising num_devices and
+# batch_size together (one prompt per device).
 #
-# Needs REWARD_SERVICE_URL (unirl-reward-service with the editreward scorer, see
-# unirl-reward-service/configs/editreward_service.yaml). Optional overrides:
-# QWEN_VL_PATH, QWEN_IMAGE_EDIT_PLUS_PATH.
+# Needs REWARD_SERVICE_URL (unirl-reward-service with the editreward scorer on its
+# own GPU, see unirl-reward-service/configs/editreward_service.yaml). Optional
+# overrides: QWEN_VL_PATH, QWEN_IMAGE_EDIT_PLUS_PATH.
+#
+# Validated as written on 1x H200 (peak 130 GB used) for 2 rollouts, with the scorer
+# on a separate L40S. Multi-GPU and training efficacy are not validated.
 
 num_devices: 1
-batch_size: 4                 # P prompts per rollout; PEPipeline fans out to P*N*M
+batch_size: 1                 # P prompts per rollout; PEPipeline fans out to P*N*M
 
 # Frozen editor: the diffusion side is a rollout-only renderer (no diffusion training).
 freeze_diffusion: true
@@ -76,9 +82,9 @@ ar:
     _target_: unirl.models.qwen_vl.bundle.QwenVLBundle.from_config
     config:
       _target_: unirl.models.qwen_vl.config.QwenVLPipelineConfig
-      pretrained_model_ckpt_path: ${oc.env:QWEN_VL_PATH,Qwen/Qwen2.5-VL-3B-Instruct}
+      pretrained_model_ckpt_path: ${oc.env:QWEN_VL_PATH,Qwen/Qwen2.5-VL-7B-Instruct}
       model_precision: bf16
-      attn_implementation: sdpa
+      attn_implementation: flash_attention_2
       freeze_vision_tower: true # train the LLM only; ViT frozen
       use_gradient_checkpointing: true
       max_prompt_length: 2048
