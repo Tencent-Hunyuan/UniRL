@@ -25,6 +25,7 @@ def main(cfg: DictConfig) -> None:
         enable_fsdp_offload=cfg.get("enable_fsdp_offload", False),
         pe_cfg=cfg.get("pe"),
         freeze_llm=cfg.get("freeze_llm", False),
+        freeze_diffusion=cfg.get("freeze_diffusion", False),
         diffusion_group_scope=cfg.get("diffusion_group_scope", "rewrite"),
         eval_interval=cfg.get("eval_interval", 0),
         eval_num_prompts=cfg.get("eval_num_prompts", cfg.batch_size),
