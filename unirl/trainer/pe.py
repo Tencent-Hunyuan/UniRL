@@ -76,6 +76,7 @@ class PETrainer(BaseTrainer):
         self._diffusion_group_scope = diffusion_group_scope
         rollout_parsed = parse_hydra_cfg(rollout_cfg)
         takes_pipeline = "pipeline" in inspect.signature(rollout_parsed["role_cls"]).parameters
+        self._takes_pipeline = takes_pipeline
         if takes_pipeline:
             if sync_cfg is not None:
                 raise ValueError(
@@ -165,10 +166,14 @@ class PETrainer(BaseTrainer):
         ar_params = base["ar"]
         sde_indices = diff_params.get_sde_indices(rollout_id)
         diffusion = dataclasses.replace(diff_params, sde_indices=sde_indices, scheduler=None)
+        if self._takes_pipeline and len(inputs.parts) == 2 and set(inputs.parts[1].primitives) == {"image"}:
+            # PEPipeline reads the source image off the root; the composed engine cannot carry one.
+            root, source = inputs.parts
+            inputs = Sample.request(dataclasses.replace(root, primitives={**root.primitives, **source.primitives}))
         request = prepare_input_sample(
             inputs,
             rollout_id,
-            allowed_primitives={"text"},
+            allowed_primitives={"text", "image"} if self._takes_pipeline else {"text"},
             caller="PETrainer._build_request_sample",
             control={"ar": {}, "chat": {}},
             require_single_input_part=True,
