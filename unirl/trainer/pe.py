@@ -118,7 +118,9 @@ class PETrainer(BaseTrainer):
 
         with placement(self.pool, fraction=1.0, shared_workers=True):
             self.diffusion = (
-                self._wire_rollout_only_side(diffusion_cfg) if self._freeze_diffusion else self._wire_side(diffusion_cfg)
+                self._wire_rollout_only_side(diffusion_cfg)
+                if self._freeze_diffusion
+                else self._wire_side(diffusion_cfg)
             )
             self.ar = self._wire_rollout_only_side(ar_cfg) if self._freeze_llm else self._wire_side(ar_cfg)
 
