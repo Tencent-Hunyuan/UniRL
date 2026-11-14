@@ -21,7 +21,7 @@ from unirl.utils.dtypes import parse_torch_dtype
 from .bundle import MiniMaxH3Bundle
 from .conditions import MiniMaxH3Conditions
 from .config import MINIMAX_H3_AUDIO_LATENT_CHANNELS
-from .packing import MiniMaxH3Geometry, build_t2va_layout, row_timestep_plan
+from .packing import MiniMaxH3Geometry, build_layout, row_timestep_plan
 
 
 def pack_dual_streams(video_rows: torch.Tensor, audio_rows: torch.Tensor) -> torch.Tensor:
@@ -65,9 +65,12 @@ class MiniMaxH3DiffusionStep(DiffusionStep[MiniMaxH3Bundle, MiniMaxH3Conditions]
         audio_sigma: torch.Tensor,
         layout,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """One forward -> ``(video_velocity, audio_velocity)``, sign-corrected."""
+        """One forward -> target-row ``(video_velocity, audio_velocity)``, sign-corrected."""
         unique_timesteps, timestep_indices = row_timestep_plan(layout, video_sigma=video_sigma, audio_sigma=audio_sigma)
         device = video_sample.device
+        if layout.num_condition_video_rows:
+            condition_rows = torch.stack(conditions.keyframes.rows).to(device=device)  # [B, C, 96] fp32
+            video_sample = torch.cat([condition_rows, video_sample], dim=1)  # [B, C + V, 96] fp32
         video_velocity, audio_velocity = self.bundle.transformer(
             hidden_states=video_sample,
             audio_hidden_states=audio_sample,
@@ -84,7 +87,7 @@ class MiniMaxH3DiffusionStep(DiffusionStep[MiniMaxH3Bundle, MiniMaxH3Conditions]
         # The one line that reconciles H3's data-ward velocity with the
         # noise-ward convention every downstream SDE path assumes. See module
         # docstring for the algebra.
-        return -video_velocity, -audio_velocity
+        return -video_velocity[:, layout.num_condition_video_rows :], -audio_velocity
 
 
 class MiniMaxH3DiffusionStage(BatchedStepReplayMixin, DiffusionStage[MiniMaxH3Conditions]):
@@ -147,8 +150,7 @@ class MiniMaxH3DiffusionStage(BatchedStepReplayMixin, DiffusionStage[MiniMaxH3Co
             f"stack.micro_batch_size=1. Mirrors the bagel navit recipe.",
         )
         conditions = conditions.trim_text_padding()
-        num_text_tokens = int(conditions.text.embeds.shape[1])
-        layout = build_t2va_layout(geometry, num_text_tokens)
+        layout = build_layout(geometry, conditions)
         audio_sigmas = self.audio_schedule(sigmas)
 
         num_steps = int(sigmas.shape[0]) - 1
@@ -295,7 +297,7 @@ class MiniMaxH3DiffusionStage(BatchedStepReplayMixin, DiffusionStage[MiniMaxH3Co
         audio_sigmas = self.audio_schedule(sigmas)
         self.video_strategy.init_schedule(sigmas)
         self.audio_strategy.init_schedule(audio_sigmas)
-        layout = build_t2va_layout(geometry, int(conditions.text.embeds.shape[1]))
+        layout = build_layout(geometry, conditions)
 
         return self.replay_joint_av_steps(
             conditions,
@@ -344,7 +346,7 @@ class MiniMaxH3DiffusionStage(BatchedStepReplayMixin, DiffusionStage[MiniMaxH3Co
         conditions = conditions.trim_text_padding()
         geometry = MiniMaxH3Geometry.from_params(params)
         video_sample, audio_sample = unpack_dual_streams(sample, geometry)
-        layout = build_t2va_layout(geometry, int(conditions.text.embeds.shape[1]))
+        layout = build_layout(geometry, conditions)
         shared_sigma = sigma.detach().reshape(-1)[0]
         video_pred, audio_pred = self.step.predict_noise(
             conditions,
