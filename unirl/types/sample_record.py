@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class MediaItem:
-    """One driver-resident image, video [C, T, H, W], or audio [L] / [L, C]."""
+    """One driver-resident image, video [C, T, H, W], or audio [L] / [C, L]."""
 
     image: Optional[Any] = None
     video: Optional[Any] = None
