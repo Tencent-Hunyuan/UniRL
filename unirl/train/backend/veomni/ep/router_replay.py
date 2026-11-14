@@ -14,6 +14,7 @@ from torch import nn
 
 ReplayMode = Literal["record", "replay"]
 
+
 def _is_in_checkpoint_recompute() -> bool:
     """Detect whether execution is inside ``torch.utils.checkpoint`` backward recomputation."""
     frame = sys._getframe(1)
