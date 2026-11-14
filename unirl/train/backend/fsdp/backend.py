@@ -123,6 +123,7 @@ class FSDPBackend(BaseFSDP2Backend):
             reshard_after_forward=fsdp_cfg.reshard_after_forward,
             forward_prefetch=fsdp_cfg.forward_prefetch,
             activation_checkpointing=fsdp_cfg.activation_checkpointing,
+            activation_offload=fsdp_cfg.activation_offload,
             ac_wrap_order=fsdp_cfg.ac_wrap_order,
             use_torch_compile=fsdp_cfg.use_torch_compile,
             master_dtype=fsdp_cfg.master_dtype,
