@@ -65,41 +65,14 @@ def get_hi3_parallel_plan():
     return ParallelPlan(extra_parallel_plan={"ep": ep_plan})
 
 
-def _resolve_veomni_moe_op(moe_implementation: str = "fused_triton"):
-    try:
-        from veomni.ops import OP_REGISTRY, VeomniOp
-
-        impl = moe_implementation
-        available = OP_REGISTRY.list_available("moe_experts", "standard")
-        if impl not in available:
-            impl = "fused_triton" if "fused_triton" in available else "eager"
-        return VeomniOp("moe_experts", "standard", impl)
-    except (ImportError, AttributeError, TypeError, ValueError, KeyError):
-        return None
-
-
 class FusedExperts(nn.Module):
     """Holds the fused expert weights so their FQN matches what :data:`_EP_PLAN` and the converter target."""
 
-    def __init__(
-        self,
-        num_experts: int,
-        hidden: int,
-        inter: int,
-        dtype,
-        device,
-        *,
-        moe_implementation: str = "fused_triton",
-    ):
+    def __init__(self, num_experts: int, hidden: int, inter: int, dtype, device):
         super().__init__()
         self.num_experts = num_experts
-        self.hidden_dim = hidden
-        self.intermediate_dim = inter
-        self.act_fn = F.silu
-        self.moe_implementation = moe_implementation
         self.gate_and_up_proj = nn.Parameter(torch.empty(num_experts, 2 * inter, hidden, dtype=dtype, device=device))
         self.down_proj = nn.Parameter(torch.empty(num_experts, hidden, inter, dtype=dtype, device=device))
-        self.veomni_moe = _resolve_veomni_moe_op(moe_implementation)
 
     def forward(
         self,
@@ -108,6 +81,7 @@ class FusedExperts(nn.Module):
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
         from torch.distributed.tensor import DTensor
+        from veomni.ops.kernels.moe.group_gemm import group_gemm_fused_moe_forward
 
         gate_up = self.gate_and_up_proj
         down = self.down_proj
@@ -115,26 +89,7 @@ class FusedExperts(nn.Module):
             gate_up = gate_up.to_local()
         if isinstance(down, DTensor):
             down = down.to_local()
-
-        if self.veomni_moe is not None:
-            unused = gate_up.new_empty(0)
-            return self.veomni_moe(
-                hidden_states,
-                top_k_weights,
-                top_k_index,
-                unused,
-                unused,
-                down,
-                gate_up,
-                num_experts=self.num_experts,
-            )
-
-        if self.moe_implementation == "fused_quack":
-            from veomni.ops.kernels.moe.quack_gemm import quack_gemm_fused_moe_forward as moe_fn
-        else:
-            from veomni.ops.kernels.moe.group_gemm import group_gemm_fused_moe_forward as moe_fn
-
-        return moe_fn(
+        return group_gemm_fused_moe_forward(
             num_experts=self.num_experts,
             routing_weights=top_k_weights,
             selected_experts=top_k_index,
@@ -160,23 +115,12 @@ class FusedHunyuanMoE(nn.Module):
         inter: int,
         dtype,
         device,
-        *,
-        moe_implementation: str = "fused_triton",
-        overlap_shared_expert: bool = True,
     ):
         super().__init__()
         self.gate = gate
         self.shared_mlp = shared_mlp
         self.num_experts = num_experts
-        self.overlap_shared_expert = bool(overlap_shared_expert)
-        self.experts = FusedExperts(
-            num_experts,
-            hidden,
-            inter,
-            dtype,
-            device,
-            moe_implementation=moe_implementation,
-        )
+        self.experts = FusedExperts(num_experts, hidden, inter, dtype, device)
 
     def _apply_router_replay(
         self,
@@ -213,7 +157,7 @@ class FusedHunyuanMoE(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         bsz, seq, hidden = hidden_states.shape
-        use_overlap = self.shared_mlp is not None and self.overlap_shared_expert and hidden_states.is_cuda
+        use_overlap = self.shared_mlp is not None and hidden_states.is_cuda
 
         if use_overlap:
             main_stream = torch.cuda.current_stream(hidden_states.device)
@@ -247,12 +191,7 @@ def is_fused_expert_key(key: str) -> bool:
     return key.endswith((".experts.gate_and_up_proj", ".experts.down_proj"))
 
 
-def replace_hunyuan_moe_with_fused(
-    decoder: nn.Module,
-    *,
-    moe_implementation: str = "fused_triton",
-    overlap_shared_expert: bool = True,
-) -> int:
+def replace_hunyuan_moe_with_fused(decoder: nn.Module) -> int:
     """In-place: swap every ``HunyuanMoE`` mlp for a :class:`FusedHunyuanMoE` and attach ``get_parallel_plan``."""
     n = 0
     for layer in decoder.layers:
@@ -269,8 +208,6 @@ def replace_hunyuan_moe_with_fused(
             inter=two_i // 2,
             dtype=w.dtype,
             device=w.device,
-            moe_implementation=moe_implementation,
-            overlap_shared_expert=overlap_shared_expert,
         )
         n += 1
     if n == 0:

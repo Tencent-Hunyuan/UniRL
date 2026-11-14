@@ -14,9 +14,6 @@ from torch import nn
 
 ReplayMode = Literal["record", "replay"]
 
-_FALLBACK_ACTIVE_REPLAY: Optional["MoERouterReplayController"] = None
-
-
 def _is_in_checkpoint_recompute() -> bool:
     """Detect whether execution is inside ``torch.utils.checkpoint`` backward recomputation."""
     frame = sys._getframe(1)
@@ -33,33 +30,24 @@ def _is_in_checkpoint_recompute() -> bool:
     return False
 
 
-def _get_veomni_replay_mod():
-    try:
-        from unirl.train.backend.veomni import _compat
+def _upstream():
+    """Return VeOmni's router-replay module, which owns the active controller."""
+    from unirl.train.backend.veomni import _compat
 
-        _compat.ensure_installed()
-        import importlib
+    _compat.ensure_installed()
+    import importlib
 
-        return importlib.import_module("veomni.utils.moe_router_replay")
-    except Exception:
-        return None
+    return importlib.import_module("veomni.utils.moe_router_replay")
 
 
 def get_active_replay() -> Optional["MoERouterReplayController"]:
     """Return the currently active MoE router-replay controller, or ``None``."""
-    mod = _get_veomni_replay_mod()
-    if mod is not None:
-        return mod.get_active_replay()
-    return _FALLBACK_ACTIVE_REPLAY
+    return _upstream().get_active_replay()
 
 
 def set_active_replay(controller: Optional["MoERouterReplayController"]) -> None:
     """Install or clear the active MoE router-replay controller."""
-    global _FALLBACK_ACTIVE_REPLAY
-    _FALLBACK_ACTIVE_REPLAY = controller
-    mod = _get_veomni_replay_mod()
-    if mod is not None:
-        mod.set_active_replay(controller)
+    _upstream().set_active_replay(controller)
 
 
 def maybe_replay_indices(
@@ -67,14 +55,8 @@ def maybe_replay_indices(
     routing_scores: torch.Tensor,
     top_indices: torch.Tensor,
 ) -> torch.Tensor:
-    """Forward-time router hook compatible with ``veomni.utils.moe_router_replay``."""
-    mod = _get_veomni_replay_mod()
-    if mod is not None:
-        return mod.maybe_replay_indices(module, routing_scores, top_indices)
-    controller = _FALLBACK_ACTIVE_REPLAY
-    if controller is None:
-        return top_indices
-    return controller.on_router_forward(module, routing_scores, top_indices)
+    """Forward-time router hook delegating to ``veomni.utils.moe_router_replay``."""
+    return _upstream().maybe_replay_indices(module, routing_scores, top_indices)
 
 
 class MoERouterReplayController:

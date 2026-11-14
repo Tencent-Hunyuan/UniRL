@@ -1,34 +1,31 @@
-# VeOmni Training Backend (`unirl.train.backend.veomni`)
+# VeOmni backend (`unirl/train/backend/veomni`)
 
-> **Where it fits:** the distributed training backend under `unirl/train/` that wraps
-> trainable model modules with FSDP2, Ulysses Sequence Parallelism (`sp/`), and Expert
-> Parallelism (`ep/`). Full map: [`../../../README.md`](../../../README.md).
+> **Where it fits:** training backend. In: a foundation model on meta + an FSDP/EP parallel config. Out: a `fully_shard`ed trainable model behind `VeOmniBackend`.
+> Full map: [`../../../README.md`](../../../README.md).
+
+Wraps VeOmni's torch-native distributed layer (FSDP2, EP, Ulysses SP) behind the same `BaseFSDP2Backend` surface `fsdp` uses, reaching it through a selective-import shim so the wheel's transformers-locked model zoo never loads.
 
 ## What it is
 
-`unirl/train/backend/veomni/` integrates ByteDance-Seed's VeOmni distributed runtime
-into UniRL's `TrainStack`, providing composable FSDP2 (`wrap.py`), Ulysses SP (`sp/`),
-and MoE Expert Parallelism (`ep/`) across autoregressive, diffusion, and unified
-multimodal models (`Qwen3-MoE`, `Qwen3.5-MoE`, `HunyuanImage-3.0`).
+`VeOmniBackend` owns the parallel state, the optimizer, and the gradient clip; `wrap.py` builds the `MixedPrecisionConfig` and calls `parallelize_model_fsdp2`; `ep/` and `sp/` hold the expert-parallel and sequence-parallel specializations. `_compat.py` is the selective-import gate every other `veomni` import goes through — it stubs the package in `sys.modules` so `veomni/__init__.py` and `veomni/models/__init__.py` are never executed, and the rest of the backend only imports from `veomni.*` after an `ensure_*()` call has installed those stubs.
+
+## Why it exists
+
+VeOmni's wheel ships a model zoo pinned to its own `transformers` version. UniRL pins a different one, and importing the zoo would drag the wrong classes into `ALL_ATTENTION_FUNCTIONS` and the auto-model registry. The shim imports only the distributed modules and the specific patched modelings UniRL asks for, so the two dependency trees coexist.
 
 ## How it works
 
-- **MoE Router Replay (`ep/router_replay.py`)** — `MoERouterReplayController` records
-  top-k expert indices during reference/rollout forward and replays them during actor
-  policy updates and activation-checkpointing recomputation while re-gathering live
-  gate scores so router gradients remain differentiable.
-- **Shared Expert + EP All-to-All overlap (`ep/models/hi3.py`)** — `FusedHunyuanMoE`
-  dispatches `shared_mlp` on a side CUDA stream concurrently with routed-expert EP
-  All-to-All dispatch/GEMM/combine collectives.
+- **Selective import via `sys.modules` stubs.** `ensure_installed()` locates the wheel with `importlib.util.find_spec` (which does not execute it), installs package-shaped stub modules, and re-attaches `load_model_weights` / `rank0_load_and_broadcast_weights` / `load_model_weights_ep_sharded` from `veomni.models.module_utils`. It also stubs `veomni.ops` and `veomni.ops.kernels`; the MoE registrars evict those two stubs before importing the real `veomni.ops`, which is the only consumer that needs its `register_op()` side effects.
+- **Model registration is opt-in per architecture.** `ensure_qwen3_moe_installed()` / `ensure_qwen3_5_moe_installed()` import exactly one `veomni.models.transformers.*` modeling and then register VeOmni's Ulysses attention patch.
+- **MoE router replay (`ep/router_replay.py`).** `MoERouterReplayController` records each router's top-k expert indices during the reference or rollout forward and replays them during the actor update, re-gathering live gate scores so router gradients stay differentiable. The active controller lives in `veomni.utils.moe_router_replay`; this module records and replays against it rather than keeping its own.
+- **Shared expert overlaps the EP all-to-all (`ep/models/hi3.py`).** On CUDA, `FusedHunyuanMoE.forward` runs `shared_mlp` on a side stream so its GEMMs overlap the routed experts' dispatch and combine collectives.
+- **Parallel state comes from `init_parallel_state`.** `backend.py` calls the public `veomni.distributed.parallel_state.init_parallel_state(dp_size=..., ulysses_size=..., dp_mode="fsdp2", ...)`, folding Ulysses into the FSDP shard mesh so gradients reduce-scatter across SP ranks.
 
 ## Gotchas
 
-- **Activation Checkpointing under Router Replay.** During `loss.backward()`, AC
-  re-runs each MoE block's forward pass. `MoERouterReplayController.on_router_forward`
-  detects `torch.utils.checkpoint` recomputation frames and pops the microbatch index
-  from its per-router recompute stack so multi-microbatch gradient accumulation replays
-  each microbatch's own routing indices during both forward and AC backward.
-- **Shared Expert + EP All-to-All stream overlap.** In `FusedHunyuanMoE.forward`, when
-  `overlap_shared_expert=True` under `ep_size > 1`, `shared_mlp` runs on a dedicated
-  side CUDA stream synchronized via CUDA events so shared-expert GEMMs overlap with
-  routed-expert EP dispatch/combine collectives.
+- **The `veomni` pin is load-bearing; 0.1.12 is the first release that works.** 0.1.11's generated Qwen3-MoE passes `cache_position` to `transformers.masking_utils.create_causal_mask`, which dropped that keyword in 5.x; against UniRL's `transformers>=5.12,<5.13` pin the first MoE forward raises `TypeError: create_causal_mask() got an unexpected keyword argument 'cache_position'` (issue #627). Both generated modelings are affected in 0.1.11 — `patched_modeling_qwen3_moe_{gpu,npu}.py` and `patched_modeling_qwen3_5_moe_{gpu,npu}.py:2038`. Three shipped recipes take that path: `qwen3_moe_grpo_30b_a3b_veomni_ep_sglang`, `qwen3_5_moe_grpo_35b_a3b_base_dapo_sglang`, `qwen3_5_moe_grpo_35b_a3b_geo3k_mc_sglang`. Fixed upstream in 0.1.12, whose remaining `cache_position=` arguments go to `linear_attn`/`self_attn`/`language_model`, never to a mask constructor. (`DELETE-WHEN`: the Qwen3-MoE path stops routing through VeOmni's patched modeling.)
+- **Do not move the pin to 0.1.13.** That tag was never published to PyPI — the index stops at 0.1.12 and the `v0.1.13` tree still stamps `_version.py = "0.1.12"` — so the extra would not resolve at install. The tag also renames the public `init_parallel_state` to `_init_parallel_state`, leaving only `init_parallel_state_from_config`, which `backend.py` does not call. 0.1.12 keeps the public name with the signature `backend.py` passes (`dp_size`, `ulysses_size`, `dp_mode`, `device_type`, `extra_parallel_sizes`, `extra_parallel_names`).
+- **0.1.12 moved two things the shim depends on.** `load_model_weights_ep_sharded` now lives in `veomni/models/module_utils.py` and `veomni/distributed/torch_parallelize.py` imports it from the package root, so `ensure_installed()` must re-attach it onto the `veomni.models` stub or every `parallelize_model_fsdp2` import raises `ImportError`. Separately, `veomni.distributed.sequence_parallel` now reaches `veomni.ops.config.singleton`, and executing the real `veomni/ops/__init__.py` re-enters the partially initialised `sequence_parallel` through `ops/kernels/attention/ulysses.py` — on 0.1.12 the diffusion Ulysses SP path raises `ImportError: cannot import name 'gather_heads_scatter_seq' from partially initialized module 'veomni.distributed.sequence_parallel'` unless `veomni.ops` is stubbed first. (`DELETE-WHEN`: upstream breaks that cycle, or `sequence_parallel` stops importing the ops config.)
+- **Re-check symbols, not just modules, on any bump.** The shim imports sixteen names by path (`MixedPrecisionConfig`, `OpsImplementationConfig`, `clip_grad_norm`, `load_model_to_gpu`, `offload_model_to_cpu`, `ParallelPlan`, `get_parallel_state`, `init_parallel_state`, `gather_outputs`, `slice_input_tensor`, `gather_heads_scatter_seq`, `gather_seq_scatter_heads`, `parallelize_model_fsdp2`, `build_foundation_model`, `apply_veomni_attention_patch`, `group_gemm_fused_moe_forward`). A module can survive a release while a symbol inside it is renamed or made private, and nothing in the repo's lint gate would notice — there is no `tests/` tree to catch it.
+- **Activation checkpointing re-runs routers.** During `loss.backward()`, activation checkpointing re-runs each MoE block's forward. `MoERouterReplayController.on_router_forward` detects `torch.utils.checkpoint` recomputation frames and pops the microbatch index off its per-router recompute stack, so multi-microbatch gradient accumulation replays each microbatch's own indices in both the forward and the recomputed backward. `torch.utils.checkpoint` exposes no supported "am I recomputing" flag, so this reads the interpreter frames and has to be re-checked on a torch bump.
+- **VeOmni only wires replay for its own MoE families.** `veomni.utils.moe_router_replay.SUPPORTED_MOE_MODEL_TYPES` lists `qwen3_moe`, `qwen3_5_moe` and `deepseek_v4`; HunyuanImage-3.0 reaches the hook because `FusedHunyuanMoE` calls `maybe_replay_indices` itself and sets `_supports_native_router_replay`, which is also what keeps `patch_moe_router_replay` from wrapping its gate a second time.
