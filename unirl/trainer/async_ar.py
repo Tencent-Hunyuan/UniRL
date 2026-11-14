@@ -57,6 +57,9 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
         weight_sync_interval: int = 1,
         buffer_max_staleness: Optional[int] = None,
     ) -> None:
+        if cfg.get("dynamic_sampling_max_batches", 0):
+            raise ValueError("DAPO dynamic sampling is supported only by the synchronous ARTrainer.")
+        self.dynamic_sampling_max_batches = 0
         self._allowed_input_primitives = ar_preflight(
             pipeline_cfg=pipeline_cfg,
             backend_cfg=backend_cfg,
