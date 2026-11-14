@@ -14,7 +14,7 @@ from omegaconf import DictConfig
 from unirl.config.validation import validate_memory_saver_contract
 from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.group.results import rank_zero_bool
-from unirl.distributed.tensor import hydrate
+from unirl.reward.service import score_and_attach
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample
 from unirl.trainer.hydra import parse_hydra_cfg, remote_hydra
@@ -458,14 +458,11 @@ class ARTrainer(BaseTrainer):
                 sample = self.rollout.generate(sample)
 
         if self.reward is not None:
-            sample = self.reward.score_and_attach(sample)
+            sample = score_and_attach(self.reward, sample)
 
         part = sample.parts[-1]
         mean_reward = 0.0
         if part.rewards is not None:
-            part.rewards = hydrate(part.rewards)
-            if isinstance(part.component_rewards, dict):
-                part.component_rewards = {name: hydrate(value) for name, value in part.component_rewards.items()}
             mean_reward = float(part.rewards.to(torch.float32).mean().item())
             if self._algorithm_requires_advantages and self.advantage_mode == "grpo":
                 part = part.compute_advantages(
@@ -560,10 +557,10 @@ class ARTrainer(BaseTrainer):
                     dispatch_inputs = self._pad_eval_inputs(eval_inputs)
                     sample = self._build_request_sample(dispatch_inputs, rollout_id, sampling=eval_sp)
                     generated = self.rollout.generate(sample)
-                    scored = self.reward.score_and_attach(generated)
+                    scored = score_and_attach(self.reward, generated)
                     rewards = scored.parts[-1].rewards
                     if rewards is not None:
-                        rewards = hydrate(rewards).to(torch.float32)
+                        rewards = rewards.to(torch.float32)
                         fanout = total_samples_per_prompt(eval_sp)
                         expected_total = dispatch_inputs.batch_size * fanout
                         if int(rewards.numel()) != expected_total:
