@@ -60,6 +60,7 @@ class PETrainer(BaseTrainer):
         enable_fsdp_offload: bool = False,
         pe_cfg: Optional[DictConfig] = None,
         freeze_llm: bool = False,
+        freeze_diffusion: bool = False,
         diffusion_group_scope: str = "rewrite",
         eval_interval: int = 0,
         eval_num_prompts: int = 8,
@@ -67,8 +68,12 @@ class PETrainer(BaseTrainer):
         eval_eta: float = 0.0,
         eval_rewards_cfg: Optional[Any] = None,
     ) -> None:
+        if freeze_llm and freeze_diffusion:
+            raise ValueError("PETrainer: freeze_llm and freeze_diffusion cannot both be true.")
         self._freeze_llm = freeze_llm
-        self._train_tracks: Tuple[str, ...] = ("diffusion",) if self._freeze_llm else TRACK_NAMES
+        self._freeze_diffusion = freeze_diffusion
+        frozen = {"ar": freeze_llm, "diffusion": freeze_diffusion}
+        self._train_tracks: Tuple[str, ...] = tuple(name for name in TRACK_NAMES if not frozen[name])
         if diffusion_group_scope not in ("rewrite", "prompt"):
             raise ValueError(
                 f"PETrainer.diffusion_group_scope must be 'rewrite' or 'prompt'; got {diffusion_group_scope!r}."
@@ -76,12 +81,15 @@ class PETrainer(BaseTrainer):
         self._diffusion_group_scope = diffusion_group_scope
         rollout_parsed = parse_hydra_cfg(rollout_cfg)
         takes_pipeline = "pipeline" in inspect.signature(rollout_parsed["role_cls"]).parameters
+        self._takes_pipeline = takes_pipeline
         if takes_pipeline:
             if sync_cfg is not None:
                 raise ValueError(
                     "PETrainer: trainside direct-sampling engine reads the live training weights and cannot use a `sync:` block."
                 )
         else:
+            if freeze_diffusion:
+                raise ValueError("PETrainer: freeze_diffusion requires the trainside rollout engine.")
             if sync_cfg is None or any(sync_cfg.get(track) is None for track in self._train_tracks):
                 raise ValueError(
                     f"PETrainer: dedicated rollout engine requires `sync:` tracks {list(self._train_tracks)}."
@@ -109,7 +117,11 @@ class PETrainer(BaseTrainer):
         self.ar_sync = None
 
         with placement(self.pool, fraction=1.0, shared_workers=True):
-            self.diffusion = self._wire_side(diffusion_cfg)
+            self.diffusion = (
+                self._wire_rollout_only_side(diffusion_cfg)
+                if self._freeze_diffusion
+                else self._wire_side(diffusion_cfg)
+            )
             self.ar = self._wire_rollout_only_side(ar_cfg) if self._freeze_llm else self._wire_side(ar_cfg)
 
             if takes_pipeline:
@@ -165,10 +177,14 @@ class PETrainer(BaseTrainer):
         ar_params = base["ar"]
         sde_indices = diff_params.get_sde_indices(rollout_id)
         diffusion = dataclasses.replace(diff_params, sde_indices=sde_indices, scheduler=None)
+        if self._takes_pipeline and len(inputs.parts) == 2 and set(inputs.parts[1].primitives) == {"image"}:
+            # PEPipeline reads the source image off the root; the composed engine cannot carry one.
+            root, source = inputs.parts
+            inputs = Sample.request(dataclasses.replace(root, primitives={**root.primitives, **source.primitives}))
         request = prepare_input_sample(
             inputs,
             rollout_id,
-            allowed_primitives={"text"},
+            allowed_primitives={"text", "image"} if self._takes_pipeline else {"text"},
             caller="PETrainer._build_request_sample",
             control={"ar": {}, "chat": {}},
             require_single_input_part=True,
@@ -304,8 +320,8 @@ class PETrainer(BaseTrainer):
         return {name: sums[name] / max(1, counts[name]) for name, _ in scorers}
 
     def _ckpt_sides(self):
-        """The trained sides to checkpoint: diffusion always; ar only when it trains."""
-        sides = [("diffusion", self.diffusion)]
+        """The trained sides to checkpoint: diffusion and ar, each only when it trains."""
+        sides = [] if self._freeze_diffusion else [("diffusion", self.diffusion)]
         if not self._freeze_llm and self.ar.backend is not None:
             sides.append(("ar", self.ar))
         return sides

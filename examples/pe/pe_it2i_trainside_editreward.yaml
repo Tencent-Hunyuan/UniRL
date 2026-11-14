@@ -1,0 +1,207 @@
+# @package _global_
+# Image-aware PE for image editing — colocate trainside, FROZEN editor.
+#
+# A Qwen2.5-VL rewriter sees (source image, edit instruction) and writes N
+# rewritten instructions; a frozen Qwen-Image-Edit renders M edits per rewrite
+# from the same source image; EditReward scores each edit against the source
+# image and the ORIGINAL instruction; the reward is credit-assigned up the
+# lineage and GRPO trains the rewriter only.
+#
+# Enabled by the top-level `freeze_diffusion: true` below. The diffusion side
+# therefore needs ONLY `bundle` + `pipeline` — PETrainer._wire_rollout_only_side
+# builds no backend / algorithm / stack for it. Trainside engine only.
+#
+# Pairs with unirl/train_pe.py (PETrainer). Geometry:
+# P=1 prompt × N=4 rewrites × M=2 edits = 8 edits / 4 rewrites per rollout and device.
+# The trainside engine cannot chunk a two-gen-Part Sample (no forward_batch_size), so
+# P*N*M edits per device run in ONE editor forward. Scale P by raising num_devices and
+# batch_size together (one prompt per device).
+#
+# Needs REWARD_SERVICE_URL (unirl-reward-service with the editreward scorer on its
+# own GPU, see unirl-reward-service/configs/editreward_service.yaml). Optional
+# overrides: QWEN_VL_PATH, QWEN_IMAGE_EDIT_PLUS_PATH.
+#
+# Validated as written on real datasets/image_edit rows, with the scorer on a separate
+# L40S: 1x H200 for 30 rollouts with eval and a checkpoint resume (peak 114 GB allocated,
+# 128 GB reserved), and 2x H200 with num_devices=2 batch_size=2 for 6 rollouts.
+# Training efficacy is not validated.
+
+num_devices: 1
+batch_size: 1                 # P prompts per rollout; PEPipeline fans out to P*N*M
+
+# Frozen editor: the diffusion side is a rollout-only renderer (no diffusion training).
+freeze_diffusion: true
+
+# The default eval CFG scale (4.0) would switch on negative-prompt CFG for Qwen-Image-Edit.
+eval_cfg_text_scale: 1.0
+
+logging:
+  report_to_wandb: false        # flip to true to enable wandb (rank-0/driver only)
+  project_name: unirl
+  run_name: null
+  entity: null
+  tags: null
+
+pe:
+  pe_instruction: |
+    You are an instruction rewriter for an image editing model. You are given a source image and a short edit instruction.
+    Rewrite the instruction so the editing model can carry it out precisely:
+    1. Look at the source image and name the exact object or region the edit applies to (position, color, size).
+    2. State what the result should look like after the edit.
+    3. State that everything the instruction does not mention must stay unchanged.
+    4. Do not add edits the user did not ask for. Keep the user's intent.
+    First explain your reasoning briefly. Then output the final rewritten instruction after the fixed marker "Revised Instruction:" on a new line.
+  # Keep only the substring after the marker; off-format / empty → original instruction.
+  pe_marker: "Revised Instruction:"
+
+# ── Diffusion side (Qwen-Image-Edit) — FROZEN editor: bundle + pipeline ONLY ─
+# Copied from diffusion/qwen_image_edit_plus/qwen_image_edit_plus_nft.yaml.
+diffusion:
+  bundle:
+    _target_: unirl.models.qwen_image_edit_plus.bundle.QwenImageEditPlusBundle.from_config
+    config:
+      _target_: unirl.models.qwen_image_edit_plus.config.QwenImageEditPlusPipelineConfig
+      pretrained_model_ckpt_path: ${oc.env:QWEN_IMAGE_EDIT_PLUS_PATH,Qwen/Qwen-Image-Edit-2511}
+      model_precision: bf16
+      max_sequence_length: 512
+      use_condition_image_prompt: true
+      shift: 3.0
+  pipeline:
+    _target_: unirl.models.qwen_image_edit_plus.pipeline.QwenImageEditPlusPipeline
+    shift: 3.0
+    autocast_precision: bf16
+    trajectory_precision: bf16
+    logprob_precision: fp32
+    max_sequence_length: 512
+    use_condition_image_prompt: ${diffusion.bundle.config.use_condition_image_prompt}
+    strategy:
+      _target_: unirl.sde.kernels.FlowSDEStrategy
+
+# ── AR side (Qwen2.5-VL rewriter) — trained, LoRA ───────────────────────────
+# Copied from ar/qwen_vl_grpo_geo3k_mc_4x8_lora.yaml.
+ar:
+  bundle:
+    _target_: unirl.models.qwen_vl.bundle.QwenVLBundle.from_config
+    config:
+      _target_: unirl.models.qwen_vl.config.QwenVLPipelineConfig
+      pretrained_model_ckpt_path: ${oc.env:QWEN_VL_PATH,Qwen/Qwen2.5-VL-7B-Instruct}
+      model_precision: bf16
+      attn_implementation: flash_attention_2
+      freeze_vision_tower: true # train the LLM only; ViT frozen
+      use_gradient_checkpointing: true
+      max_prompt_length: 2048
+  pipeline:
+    _target_: unirl.models.qwen_vl.pipeline.QwenVLPipeline.from_bundle
+    max_prompt_length: 2048
+  backend:
+    _target_: unirl.train.backend.fsdp.FSDPBackend
+    block_class_names: ["Qwen2_5_VLDecoderLayer"]
+    trainable_attr: transformer
+    fsdp_cfg:
+      _target_: unirl.train.configs.FSDPConfig
+      param_dtype: bf16
+      cpu_offload: false
+      mixed_precision: true
+      fsdp_mode: full
+      reshard_after_forward: true
+      forward_prefetch: true
+      activation_checkpointing: false # bundle already enables HF gradient checkpointing
+      use_torch_compile: false
+    optimizer_cfg:
+      _target_: unirl.train.backend.base.OptimizerConfig
+      learning_rate: 1.0e-4
+      adam_beta1: 0.9
+      adam_beta2: 0.999
+      adam_epsilon: 1.0e-8
+      weight_decay: 0.0
+    scheduler_cfg:
+      _target_: unirl.train.backend.base.LrSchedulerConfig
+      type: constant
+      warmup_steps: 0
+      total_steps: 10000
+    lora_cfg:
+      _target_: unirl.train.configs.LoraConfig
+      rank: 16
+      alpha: 32
+      dropout: 0.0
+      bias: none
+      task_type: CAUSAL_LM
+      target_modules:
+        - q_proj
+        - k_proj
+        - v_proj
+        - o_proj
+  algorithm:
+    _target_: unirl.algorithms.grpo.GRPO
+    stage_attr: ar
+    clip_range: 1.0e-2
+    clip_schedule: constant
+    conditions_cls:
+      _target_: hydra.utils.get_class
+      path: unirl.models.qwen_vl.conditions.QwenVLARConditions
+    sampling_temperature: ${sampling.ar.temperature}
+  stack:
+    _target_: unirl.train.stack.TrainStack
+    micro_batch_size: 4
+    max_grad_norm: 1.0
+
+# ── Composed trainside rollout: shares both pipelines, eval-scopes both ──────
+# No forward_batch_size: the engine rejects it for a Sample with two gen Parts.
+rollout:
+  _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
+  stage_attrs: [diffusion, ar]
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.remote.RemoteRewardBackend
+    base_device: cpu
+    config:
+      _target_: unirl.reward.remote.RemoteRewardSpec
+      base_url: ${oc.env:REWARD_SERVICE_URL,http://localhost:8080}
+      required_rewards: [editreward]
+      reward_weights:
+        editreward: 1.0
+      batch_size: 8
+      timeout: 300.0
+      sub_metric_reduce: first
+      aggregation_method: weighted_sum
+      # Score against the user's instruction, not the rewrite, so the rewriter cannot lower the bar.
+      prompt_source: original
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: datasets/image_edit/train.jsonl
+      eval_data_path: datasets/image_edit/test.jsonl
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+# Modality-keyed sampling dict drives PEPipeline's fan-out: ar.samples_per_prompt = N
+# rewrites, diffusion.samples_per_prompt = M edits per rewrite.
+sampling:
+  ar:
+    _target_: unirl.types.sampling.ARSamplingParams
+    samples_per_prompt: 4       # N rewrites per prompt
+    temperature: 0.7
+    top_p: 0.9
+    top_k: 1024
+    max_new_tokens: 256
+  diffusion:
+    _target_: unirl.types.sampling.DiffusionSamplingParams
+    samples_per_prompt: 2       # M edits per rewrite
+    num_inference_steps: 12
+    guidance_scale: 1.0
+    height: 384
+    width: 384
+    eta: 0.0                    # frozen editor: deterministic sampling, no log-prob needed
+    seed: 42
+    init_same_noise: false
+    scheduler:
+      _target_: unirl.sde.index_schedule.AllSDEScheduler
+      num_timesteps: ${..num_inference_steps}
+      num_sde_steps: 0          # no SDE steps recorded for a frozen editor
+
+num_rollouts: 300
