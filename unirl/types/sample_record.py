@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -12,8 +11,6 @@ from unirl.types.primitives import Images, Texts
 from unirl.types.sample import Part, Sample
 from unirl.types.sample_id import ancestor_id
 from unirl.types.sampling import ARSamplingParams
-
-logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -53,17 +50,13 @@ def build_sample_records(
     limit = min(max_items, part.batch_size)
     if limit <= 0:
         return []
-    try:
-        selected = Sample(
-            parts=[
-                *sample.parts[:part_index],
-                Part(sample_ids=part.sample_ids[:limit], sampling_params=part.sampling_params),
-            ]
-        )
-        conditioning = selected.conditioning_at(part_index)
-    except (ValueError, IndexError) as exc:
-        logger.warning("Sample observation has malformed lineage: %s", exc)
-        conditioning = []
+    selected = Sample(
+        parts=[
+            *sample.parts[:part_index],
+            Part(sample_ids=part.sample_ids[:limit], sampling_params=part.sampling_params),
+        ]
+    )
+    conditioning = selected.conditioning()
     texts = [value.texts for value in conditioning if isinstance(value, Texts)]
     prompts = texts[0] if texts else None
     input_image = next((value for value in conditioning if isinstance(value, Images)), None)
@@ -78,6 +71,7 @@ def build_sample_records(
     }
     records = []
     groups = part.group_ids
+    root_metadata = sample.root_metadata(part_index)
     for row, sample_id in enumerate(part.sample_ids[:limit]):
         media = None
         if preview is not None and row < len(preview):
@@ -101,7 +95,7 @@ def build_sample_records(
                 media=media,
                 reward=float(rewards[row]) if rewards is not None else None,
                 component_rewards={name: float(values[row]) for name, values in components.items()},
-                metadata=part.metadata[row] if part.metadata else {},
+                metadata=root_metadata[row] or {},
             )
         )
     return records

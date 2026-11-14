@@ -1,6 +1,7 @@
 """WandB Logger for unirl Training."""
 
 import functools
+import json
 import logging
 import os
 import time
@@ -8,6 +9,8 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Union
 
 import torch
+
+from unirl.utils.media import normalize_waveform
 
 try:
     import wandb
@@ -23,18 +26,16 @@ if TYPE_CHECKING:
 module_logger = logging.getLogger(__name__)
 
 
-def _normalize_stereo_audio(audio: torch.Tensor) -> torch.Tensor:
-    """Normalize ``[L]``, ``[C, L]``, or ``[L, C]`` audio to interleaved ``[L, 2]`` samples."""
-    samples = audio.detach().float().cpu()
-    if samples.ndim == 1:
-        samples = samples.unsqueeze(1)
-    elif samples.ndim == 2 and samples.shape[0] in (1, 2):
-        samples = samples.T
-    elif samples.ndim != 2 or samples.shape[1] not in (1, 2):
-        raise ValueError(f"Expected mono/stereo audio shaped [L], [C, L], or [L, C], got {tuple(samples.shape)}")
-    if samples.shape[1] == 1:
-        samples = samples.expand(-1, 2)
-    return torch.clamp(samples, -1.0, 1.0)
+def _sample_table(rows: List["SampleRecord"]) -> Any:
+    """Build the lineage table, serializing per-row containers whose keys differ between rows."""
+    columns = ["sample_id", "group_id", "root_id", "prompt", "output_text", "reward"]
+    containers = ["context_texts", "component_rewards", "metadata"]
+    data = [
+        [getattr(row, column) for column in columns]
+        + [json.dumps(getattr(row, name), ensure_ascii=False, default=str) for name in containers]
+        for row in rows
+    ]
+    return wandb.Table(columns=columns + containers, data=data)
 
 
 def _write_video_with_audio(
@@ -71,7 +72,9 @@ def _write_video_with_audio(
         for packet in video_stream.encode():
             container.mux(packet)
 
-        samples = _normalize_stereo_audio(audio)
+        samples = normalize_waveform(audio)
+        if samples.shape[1] == 1:
+            samples = samples.expand(-1, 2)
         int16_samples = (samples * 32767.0).to(torch.int16)
 
         audio_frame = av.AudioFrame.from_ndarray(
@@ -516,58 +519,71 @@ class UniRLWandBLogger:
 
     def log_sample_records(self, records: List["SampleRecord"], *, multi_track: bool) -> None:
         """Log the existing media panels and a lineage table from the same selected rows."""
+        if not records or not self.initialized:
+            return
+        by_track: Dict[str, List["SampleRecord"]] = {}
+        for record in records:
+            by_track.setdefault(record.track, []).append(record)
+        for track, rows in by_track.items():
+            phase, step = rows[0].phase, rows[0].step
+            step_key = "rollout/step" if phase == "rollout" else "eval/step"
+            prefix = f"{phase}/{track}" if multi_track else phase
+            if self.log_media:
+                try:
+                    self._log_sample_media(rows, prefix=prefix, step=step, step_key=step_key)
+                except Exception as exc:
+                    module_logger.warning("W&B sample media failed for %s: %s", prefix, exc)
+            try:
+                wandb.log({f"{prefix}/samples": _sample_table(rows), step_key: step})
+            except Exception as exc:
+                module_logger.warning("W&B sample table failed for %s: %s", prefix, exc)
+
+    def _log_sample_media(self, rows: List["SampleRecord"], *, prefix: str, step: int, step_key: str) -> None:
+        """Log one media panel per modality, each aligned to the rows that carry it."""
         from unirl.types.media_preview import MediaPreview
 
-        if not records or not self.initialized or not self.log_media:
-            return
-        try:
-            by_track: Dict[str, List["SampleRecord"]] = {}
-            for record in records:
-                by_track.setdefault(record.track, []).append(record)
-            for track, rows in by_track.items():
-                phase, step = rows[0].phase, rows[0].step
-                step_key = "rollout/step" if phase == "rollout" else "eval/step"
-                media_rows = [row for row in rows if row.media is not None]
-                if media_rows:
-                    preview = MediaPreview(
-                        images=[row.media.image for row in media_rows if row.media.image is not None],
-                        videos=[row.media.video for row in media_rows if row.media.video is not None],
-                        audios=[row.media.audio for row in media_rows],
-                        audio_sample_rate=media_rows[0].media.audio_sample_rate,
-                        prompts=[row.prompt or "" for row in media_rows],
-                        rewards=[row.reward if row.reward is not None else 0.0 for row in media_rows],
-                    )
-                    key = f"{phase}/{track}/generated_media" if multi_track else f"{phase}/generated_media"
-                    self.log_generated_media(step, preview, key=key, step_key=step_key)
-                    if not preview.images and not preview.videos and preview.audio_sample_rate is not None:
-                        payload = {
-                            f"{phase}/{track}/generated_audio": [
-                                wandb.Audio(
-                                    audio.T.numpy() if audio.ndim == 2 and audio.shape[0] in (1, 2) else audio.numpy(),
-                                    sample_rate=preview.audio_sample_rate,
-                                )
-                                for audio in preview.audios
-                            ],
-                            step_key: step,
-                        }
-                        wandb.log(payload)
-                columns = [
-                    "sample_id",
-                    "group_id",
-                    "root_id",
-                    "prompt",
-                    "context_texts",
-                    "output_text",
-                    "reward",
-                    "component_rewards",
-                    "metadata",
-                ]
-                table = wandb.Table(
-                    columns=columns, data=[[getattr(row, column) for column in columns] for row in rows]
-                )
-                wandb.log({f"{phase}/{track}/samples": table, step_key: step})
-        except Exception as exc:
-            module_logger.warning("W&B sample observation failed: %s", exc)
+        for modality in ("image", "video"):
+            selected = [row for row in rows if row.media is not None and getattr(row.media, modality) is not None]
+            if not selected:
+                continue
+            panel = {f"{modality}s": [getattr(row.media, modality) for row in selected]}
+            preview = MediaPreview(
+                prompts=[row.prompt or "" for row in selected],
+                rewards=[row.reward if row.reward is not None else 0.0 for row in selected],
+                audios=[row.media.audio for row in selected],
+                audio_sample_rate=next(
+                    (row.media.audio_sample_rate for row in selected if row.media.audio_sample_rate is not None),
+                    None,
+                ),
+                **panel,
+            )
+            self.log_generated_media(step, preview, key=f"{prefix}/generated_media", step_key=step_key)
+        audio_only = [
+            row
+            for row in rows
+            if row.media is not None
+            and row.media.audio is not None
+            and row.media.image is None
+            and row.media.video is None
+        ]
+        missing_rate = [
+            row.sample_id
+            for row in rows
+            if row.media is not None and row.media.audio is not None and row.media.audio_sample_rate is None
+        ]
+        if missing_rate:
+            module_logger.warning(
+                "W&B sample audio needs primitive_metadata['audio']['sample_rate']; dropping %d row(s): %s",
+                len(missing_rate),
+                missing_rate[:3],
+            )
+        clips = [
+            wandb.Audio(normalize_waveform(row.media.audio).numpy(), sample_rate=row.media.audio_sample_rate)
+            for row in audio_only
+            if row.media.audio_sample_rate is not None
+        ]
+        if clips:
+            wandb.log({f"{prefix}/generated_audio": clips, step_key: step})
 
     def log_eval(
         self,

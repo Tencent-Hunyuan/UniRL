@@ -57,7 +57,7 @@ def _ref_aligned_prefix_len(decoded: Any, min_items: int) -> int:
     from unirl.distributed.tensor import TensorRef
 
     total = len(decoded)
-    want = max(1, min(int(min_items), total))
+    want = min(max(1, int(min_items)), total)
     if isinstance(decoded, Images):
         meta = decoded.packed_pixels
         cu = decoded.cu_seqlens
@@ -135,8 +135,6 @@ def build_media_preview_for_part(
             input_pixels = [image.pixels for image in input_image.to_list()]
         show_edit_pairs = input_pixels is not None and len(input_pixels) >= len(per_sample)
         for idx, image in enumerate(per_sample):
-            if len(selected_indices) >= limit:
-                break
             out_pil = tensor_frame_to_pil(image.pixels[:3])
             if show_edit_pairs:
                 input_tensor = input_pixels[idx]
@@ -148,8 +146,6 @@ def build_media_preview_for_part(
     elif isinstance(decoded, Videos):
         per_sample = decoded.slice(0, min(limit, len(decoded))).to_list()
         for idx, video in enumerate(per_sample):
-            if len(selected_indices) >= limit:
-                break
             frames = video.frames
             if frames.dim() != 4:
                 raise ValueError(f"Expected video frames [T, C, H, W], got {tuple(frames.shape)}")

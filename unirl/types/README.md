@@ -188,9 +188,24 @@ conditions and segments unchanged. Rewards and selected media move to the driver
 TensorRef block boundaries can materialize additional rows beyond the record cap.
 
 `dump_sample_records` writes one JSONL index with relative PNG, MP4 and WAV paths
-per phase and step. Repeating a phase and step replaces its index. Video uses
-8 frames/s; audio requires `primitive_metadata["audio"]["sample_rate"]`.
-`UniRLWandBLogger.log_sample_records` consumes the same records for media panels
-and sample tables. Both sinks warn on output failures. In `dump_sample_records` a
+per phase and step. Repeating a phase and step replaces the index and the media
+files it had written. Video uses 8 frames/s; audio requires a positive
+`primitive_metadata["audio"]["sample_rate"]`.
+`UniRLWandBLogger.log_sample_records` consumes the same records, logging one media
+panel per modality over the rows carrying it plus one lineage table per track.
+Both sinks warn on output failures instead of interrupting training.
+
+### Gotchas
+
+Each record is decoded and serialized before any of its files is created, and files
+already written for a record are removed when a later modality fails, so a skipped
+record leaves no media behind. Losing the process between the media writes and the
+index write still leaves that step's media unreferenced; the next run of the same
+phase and step clears them.
+
+`log_sample_records` serializes `context_texts`, `component_rewards` and `metadata`
+into the table as JSON strings, because `wandb.Table` infers one schema from the
+first row and rejects later rows whose keys differ. Audio rows without a sample rate
+are warned about and dropped. In `dump_sample_records` a
 record whose media cannot be written is warned about by its `{track}_{index}` stem
 and skipped, and the remaining rows still reach the index.
