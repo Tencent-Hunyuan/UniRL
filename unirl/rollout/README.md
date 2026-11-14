@@ -4,10 +4,6 @@
 > **rollout** → reward → advantage → train → sync. In: a request `Sample` from
 > the trainer. Out: a filled `Sample`. Full map: [`../README.md`](../README.md).
 
-<div align="center">
-  <img src="../../assets/rollout-engines-new.png" alt="UniRL rollout engines selected by _target_ across direct, separate, and colocated deployment modes" width="100%">
-</div>
-
 *Every rollout engine fills one `Sample`. Agentic scheduling and group assembly live
 in the driver-side rollout manager.*
 
@@ -19,8 +15,8 @@ model/environment turns for one trajectory. It does not compute reward or loss.
 
 ## Why it exists
 
-The rollout can come from two unrelated codebases — the in-process training
-`Pipeline`, or the SGLang fork sampling in its own subprocess. For on-policy RL they
+The rollout can come from unrelated codebases — the in-process training
+`Pipeline`, or a dedicated backend sampling in its own processes. For on-policy RL they
 must walk a *numerically identical* trajectory, because the trainer replays the
 rollout to recompute log-probs and any drift silently pushes the GRPO ratio off 1.0.
 So this module is a **verification boundary**, not just a backend-hiding shim: it
@@ -34,7 +30,8 @@ wrong objective.
 
 - **One generation interface.** `BaseRolloutEngine` (`engine/base.py`)
   is a `Remote` whose concrete engines implement synchronous `generate(sample)`;
-  each returns one `Sample`. Batch engines dispatch `generate` with `DP_SCATTER`.
+  each returns one `Sample`. Batch engines dispatch `generate` with `DP_SCATTER`;
+  `RolloutManager` launchers address one replica through `generate_on_slot`.
   Agentic `generate` is undecorated because the driver manager addresses one
   engine slot per trajectory; Ray actor concurrency lets the inner backend batch
   concurrent calls.
@@ -44,12 +41,13 @@ wrong objective.
   media. Single-stage flows fill one generated Part; composed PE fills its chained
   AR and diffusion Parts.
 - **The engines.** `trainside` (in-process — the train actor's pipeline *is* the
-  sampler), `sglang_diffusion` (dedicated diffusion), `sglang` (dedicated AR), `vllm_omni`
-  (dedicated; BAGEL / HI3 / SD3 / HunyuanVideo), `fastvideo` (dedicated accelerated video
-  sampling), and `composed` (chains an AR child + a
-  diffusion child for prompt enhancement) are the six single-turn engines.
+  sampler), `sglang_diffusion` (dedicated diffusion), `sglang` (dedicated AR), `vllm`
+  (dedicated direct AR), `vllm_omni`
+  (dedicated; BAGEL / HI3 / SD3 / HunyuanVideo / Qwen-Image / Qwen3-Omni), `fastvideo`
+  (dedicated accelerated video sampling), and `composed` (chains an AR child + a
+  diffusion child for prompt enhancement) are the seven single-turn engines.
   `agentic` wraps one of them with an environment to produce multi-turn
-  trajectories. Each diffusion engine consumes the Part's pinned sigmas verbatim
+  trajectories; see the [engine matrix](#engine-matrix). Each diffusion engine consumes the Part's pinned sigmas verbatim
   and reads the same driver-authored `NoiseRecipe` (`../types/noise_recipe.py`),
   but realizes it differently: `trainside`, `sglang_diffusion` and `vllm_omni`
   resolve the recipe to an `x_T` tensor, so those three start a rollout from
@@ -60,7 +58,11 @@ wrong objective.
 - **Deployment modes:** *direct sampling* — the trainside engine, no `sync:`, the
   ratio is 1 on the first update; *separate* — a dedicated engine on its own GPUs
   plus a `sync:` block; *colocate* — a dedicated engine sharing GPUs with train,
-  plus offload/onload and `sync:`.
+  plus offload/onload and `sync:`; *anchored* — a dedicated engine hosted on one
+  train-slab Worker (`rollout_anchor_device`, or `ar_rollout` + `dit_rollout`) and
+  reached by `RemoteLoraWeightSync`. The mode does not pick how rollout outputs reach
+  train: that is the cluster-wide `transport_kind`
+  ([data plane](../distributed/README.md#how-it-works)).
 - **Driver-side scheduling.** One `manager.RolloutManager` serves batch and
   agentic trainers. Its progress thread dispatches bounded work and observes
   readiness; trainer-thread collection resolves results, assembles agentic
@@ -81,6 +83,55 @@ internally — and dispatch `generate` with `DP_SCATTER`). A dedicated engine al
 implements its weight-receive method and a matching `sync:` handler in
 `../distributed/weight_sync`.
 
+## Engine matrix
+
+Layouts and `sync:` handlers below are the ones checked-in recipes use, not the
+full set each class could accept.
+
+| Engine package | Runs | Layouts in recipes | `sync:` in recipes | Example recipe |
+| --- | --- | --- | --- | --- |
+| `trainside` | The train actor's own `Pipeline`, in-process | Direct | None (forbidden) | [`sd3_trainside`](../../examples/diffusion/sd3/sd3_trainside.yaml) |
+| `sglang` | AR/VLM through the `text` and `vlm` adapters | Colocate, separate (async only) | `TensorWeightSync`, `LocalLoraWeightSync`, `CkptEngineIPCWeightSync`, `NCCLWeightSync` | [`qwen3_grpo_4b_base_dapo_sglang_async`](../../examples/ar/qwen3_grpo_4b_base_dapo_sglang_async.yaml) |
+| `sglang_diffusion` | Diffusion by `model_family`: `flux2_klein`, `hunyuan_video10`, `ltx2`, `qwen_image`, `qwen_image_edit_plus`, `sd3`, `wan21`, `wan22`, `z_image` (`flux` and `mochi` adapters have no recipe) | Colocate, separate | `LocalLoraWeightSync`, `TensorWeightSync`, `NCCLWeightSync`, `RemoteLoraWeightSync` | [`sd3_sglang_full_nccl_separate`](../../examples/diffusion/sd3/sd3_sglang_full_nccl_separate.yaml) |
+| `vllm` | Direct text-only AR; startup rejects any model type except `qwen3_moe` | Colocate (requires `enable_fsdp_offload: true`) | `IPCWeightSync` (native engine) | [`qwen3_moe_grpo_30b_a3b_gsm8k_fsdp_vllm_tp4`](../../examples/ar/qwen3_moe_grpo_30b_a3b_gsm8k_fsdp_vllm_tp4.yaml) |
+| `vllm_omni` | By `modality`: `bagel_t2i`, `bagel_it2i`, `sd3_t2i`, `qwen_image_t2i`, `hv15_t2v`, `hi3_ar_recaption`, `hi3_dit_recaption`, `qwen3_omni_thinker` (`hi3_t2i`, `hi3_it2i`, `hi3_i2t`, `hi3_t2t` adapters have no recipe) | Colocate, anchored, separate | `LocalLoraWeightSync`, `RemoteLoraWeightSync`, `NCCLWeightSync`, `TensorWeightSync`, `IPCWeightSync` (legacy ZMQ) | [`sd3_vllmomni`](../../examples/diffusion/sd3/sd3_vllmomni.yaml) |
+| `fastvideo` | WAN 2.1 and WAN 2.2 A14B T2V ([details](engine/fastvideo/README.md#wan-support)) | Colocate | `CheckpointWeightSync` | [`wan21_t2v_dancegrpo_fastvideo`](../../examples/diffusion/wan21/wan21_t2v_dancegrpo_fastvideo.yaml) |
+| `composed` | Coordinator: AR child, then diffusion child, for prompt enhancement. Recipes use `sglang` + `sglang_diffusion` | Colocate | One per track: `LocalLoraWeightSync`, `TensorWeightSync` | [`pe_sglang_full_pickscore`](../../examples/pe/pe_sglang_full_pickscore.yaml) |
+| `agentic` | Coordinator: wraps one inner engine with an environment for multi-turn trajectories. The recipe uses `sglang` | Colocate | `TensorWeightSync` (`AgenticTrainer` rejects any other) | [`deep_research_search_judge`](../../examples/deep_research/deep_research_search_judge.yaml) |
+
+## Sampling ownership
+
+The driver decides what to sample; the engine executes it and proves what it used.
+
+| Decision | Owner | Mechanism |
+| --- | --- | --- |
+| Sampling parameters | Recipe `sampling:` block | Canonical `DiffusionSamplingParams` / `ARSamplingParams` (`../types/sampling.py`), normalized at construction |
+| Request stamping | Trainer | `Sample.fork(..., sampling_params=...)` places the parameters on each generated Part |
+| SDE step indices | `DiffusionTrainer`, per rollout | `get_sde_indices(rollout_id)` is resolved to a concrete list before dispatch; `null` with no scheduler becomes every step |
+| σ schedule | Engine, once | `ensure_sample_sigmas` fills `sigmas` only when unset, from the engine's schedule policy; `sigma_verify` checks the backend echo on `sglang_diffusion`, `vllm_omni`, and `fastvideo` |
+| SDE kernel | Recipe `strategy:` | Injected into the engine as well as the pipeline; `fastvideo` refuses to boot without it |
+| Per-request AR extras | Trainer `control` | `Part.control["ar"]`, for example `stop` |
+
+SGLang reads AR sampling from the Sample only, and raises if it is missing. Direct
+vLLM keeps fallback fields on `VLLMEngineConfig`, used only when a Part has no
+sampling parameters; in-tree trainers always stamp them.
+
+## Replay and anchors
+
+The trainer replays each rollout at current weights, so an engine must return
+everything replay needs: the `segment`, conditions, and the schedule it used.
+
+- **`old_logp_source` picks the π_old anchor.** `rollout` trusts log-probs the
+  engine emitted, so the engine must produce them from the same kernel as replay.
+  `replay` recomputes them on the trainer once, before the update loop, and is
+  required by `batch_replay_steps: true`. Per-algorithm behavior lives in
+  [`algorithms`](../algorithms/README.md#gotchas).
+- **EMA rollout depends on the engine.** For `requires_ema_rollout` algorithms,
+  trainside swaps EMA weights onto the train module around generation; a dedicated
+  engine receives them through weight sync.
+- **`rollout_anchor_device` is unrelated.** It places an engine on a device; it has
+  nothing to do with the π_old anchor.
+
 ## Engine anatomy, and adding a model to an existing engine
 
 Engine dirs use two layouts. The compact engines (`trainside`, `fastvideo`,
@@ -90,7 +141,9 @@ Engine dirs use two layouts. The compact engines (`trainside`, `fastvideo`,
 management), `utils/`, `weight_sync.py`, and a
 runtime-patch dir for the pinned upstream (`sglang_diffusion/_patches/`,
 `vllm_omni/patches/`). `vllm_omni` additionally carries worker-subprocess code
-(`pipelines/`, `worker/`) and deployment configs (`deploy_configs/`).
+(`pipelines/`, `worker/`) and deployment configs (`deploy_configs/`). `fastvideo`
+also carries `_patches/`, and `vllm` carries `runtime.py`, `sampling.py`, and
+`worker_extension.py`.
 
 Model onboarding is per-engine, and the adapter file is usually **not** the whole
 change surface:
@@ -194,7 +247,9 @@ enabled, which UniRL's rollout backend does not do.
   or in-flight work, pushes weights, and publishes the optimizer-update
   `output_version`; immutable buffered groups keep their original provenance and
   remain subject to the configured filter. Eval/checkpoint admission still requires
-  an empty manager. Launch and scoring order remains trainer policy.
+  an empty manager. Launch and scoring order remains trainer policy. Versions, lag
+  budgets, and batch alignment live in the
+  [trainer lifecycle](../trainer/README.md#the-shared-lifecycle).
 - **A resolve/route failure poisons the `RolloutManager`** — samples may already be
   lost, so every later call (including `empty` / `counts`) re-raises the original
   error rather than reporting clean state; only `close()` stays safe.
