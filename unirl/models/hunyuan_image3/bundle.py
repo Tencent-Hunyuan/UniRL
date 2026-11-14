@@ -290,12 +290,11 @@ class HunyuanImage3Bundle(Bundle):
 
         if _current_rank() == 0:
             prefixes = tuple(attr for attr, _ in plan)
-            sd = _collect_filtered_state_dict(self.pretrained_path, prefixes=prefixes)
-
-            if self._ep_enabled:
-                from unirl.train.backend.veomni.ep.models.hi3 import fuse_expert_state_dict
-
-                sd = fuse_expert_state_dict(sd)
+            sd = _collect_filtered_state_dict(
+                self.pretrained_path,
+                prefixes=prefixes,
+                skip_experts=bool(self._ep_enabled),
+            )
 
             # Remap LoRA base_layer keys before loading to avoid skipped parameters.
             # Canonical names: ``set_model_state_dict`` below matches against
@@ -323,12 +322,6 @@ class HunyuanImage3Bundle(Bundle):
         else:
             sd = {}
 
-        expert_sd = {}
-        if self._ep_enabled:
-            from unirl.train.backend.veomni.ep.models.hi3 import is_fused_expert_key
-
-            expert_sd = {k: sd.pop(k) for k in list(sd) if is_fused_expert_key(k)}
-
         set_model_state_dict(
             self.transformer,
             sd,
@@ -340,18 +333,18 @@ class HunyuanImage3Bundle(Bundle):
         )
 
         if self._ep_enabled:
-            from unirl.train.backend.veomni.ep import load_ep_experts
+            from unirl.train.backend.veomni.ep import load_ep_experts_sliced
             from unirl.train.backend.veomni.ep.models.hi3 import is_fused_expert_key
 
-            n_exp = load_ep_experts(self.transformer, expert_sd, is_fused_expert_key)
+            n_exp = load_ep_experts_sliced(self.transformer, self.pretrained_path, is_fused_expert_key)
             if n_exp == 0:
                 raise RuntimeError(
-                    "expert-parallel: load_ep_experts loaded 0 EP-sharded expert params — "
+                    "expert-parallel: load_ep_experts_sliced loaded 0 EP-sharded expert params — "
                     "expert weights would stay meta/uninitialized. Check is_fused_expert_key "
                     "against the checkpoint keys."
                 )
             if _current_rank() == 0:
-                logger.info("expert-parallel: loaded %d EP-sharded expert param(s)", n_exp)
+                logger.info("expert-parallel: sliced-loaded %d EP-sharded expert param(s)", n_exp)
 
             from unirl.train.backend.veomni.ep import register_unsharded_param_hooks
 
@@ -424,16 +417,27 @@ def _collect_filtered_state_dict(
     pretrained_path: str,
     *,
     prefixes: Sequence[str],
+    skip_experts: bool = False,
 ) -> Dict[str, torch.Tensor]:
     """Stream the HF safetensors checkpoint, returning all keys whose"""
     import json
 
     from safetensors.torch import safe_open
 
+    from unirl.train.backend.veomni.ep.models.hi3 import _EXPERT_RE
+
     index_path = os.path.join(pretrained_path, "model.safetensors.index.json")
     single_path = os.path.join(pretrained_path, "model.safetensors")
 
     prefix_dots = tuple(p + "." for p in prefixes)
+
+    def _matches(key: str) -> bool:
+        if not key.startswith(prefix_dots):
+            return False
+        if skip_experts and _EXPERT_RE.match(key) is not None:
+            return False
+        return True
+
     out: Dict[str, torch.Tensor] = {}
 
     if os.path.isfile(index_path):
@@ -442,7 +446,7 @@ def _collect_filtered_state_dict(
         weight_map: Dict[str, str] = index.get("weight_map", {})
         files_to_keys: Dict[str, List[str]] = {}
         for key, fname in weight_map.items():
-            if not key.startswith(prefix_dots):
+            if not _matches(key):
                 continue
             files_to_keys.setdefault(fname, []).append(key)
         for fname, keys in files_to_keys.items():
@@ -455,7 +459,7 @@ def _collect_filtered_state_dict(
     if os.path.isfile(single_path):
         with safe_open(single_path, framework="pt") as f:
             for key in f.keys():
-                if key.startswith(prefix_dots):
+                if _matches(key):
                     out[key] = f.get_tensor(key)
         return out
 

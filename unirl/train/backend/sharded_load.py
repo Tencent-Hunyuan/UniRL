@@ -15,13 +15,14 @@ from torch.distributed.tensor import Shard
 
 from unirl.models.types.post_materialize import canonical_param_name
 from unirl.train.backend.sharded_state import _current_rank
+from unirl.train.backend.veomni.ep.models.hi3 import build_local_fused_block as build_hi3_local_fused_block
 from unirl.train.backend.veomni.ep.models.qwen3_moe import build_local_fused_block
 from unirl.train.backend.veomni.ep.placement import assign_local_block, ep_named_parameters
 
 logger = logging.getLogger(__name__)
 
 StateDict = Dict[str, object]
-_PACKED_QWEN_MOE_MODEL_TYPES = frozenset({"qwen2_moe", "qwen3_moe", "qwen3_5_moe"})
+_PACKED_QWEN_MOE_MODEL_TYPES = frozenset({"qwen2_moe", "qwen3_moe", "qwen3_5_moe", "qwen3_vl_moe", "qwen3_omni_moe"})
 _QWEN_MOE_EXPERT_RE = re.compile(r"(^|.*\.)mlp\.experts\.\d+\.(gate_proj|up_proj|down_proj)\.weight$")
 
 
@@ -241,6 +242,14 @@ def _load_state_dict_ep_sliced(
                 available_keys=ckpt_keys,
                 get_tensor=get_checkpoint_tensor,
             )
+            if block is None:
+                block = build_hi3_local_fused_block(
+                    fused_param_name=name,
+                    expected_shape=tuple(dst.shape),
+                    ep_rank=ep_rank,
+                    available_keys=ckpt_keys,
+                    get_tensor=get_checkpoint_tensor,
+                )
             if block is not None:
                 block = block.to(device=device, dtype=dst.dtype)
                 local_elems += block.numel()
@@ -395,9 +404,13 @@ def _qwen_moe_num_experts(model: nn.Module) -> int:
 
 
 def _pack_qwen_moe_expert_keys(state_dict: StateDict, model: nn.Module) -> StateDict:
-    """Convert a complete split Qwen-MoE checkpoint to packed model keys."""
+    """Convert a complete split Qwen-MoE or HI3 checkpoint to packed model keys."""
     config = getattr(model, "config", None)
     model_type = getattr(config, "model_type", None)
+    if model_type in ("hunyuan_image_3", "hunyuan_image3", "hunyuan", "hunyuan_vl"):
+        from unirl.train.backend.veomni.ep.models.hi3 import fuse_expert_state_dict
+
+        return fuse_expert_state_dict(state_dict)  # type: ignore[arg-type,return-value]
     if model_type not in _PACKED_QWEN_MOE_MODEL_TYPES:
         return state_dict
     if not any(_QWEN_MOE_EXPERT_RE.match(key) for key in state_dict):
