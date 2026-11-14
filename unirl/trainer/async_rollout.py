@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple
 
+from unirl.reward.service import score_and_attach
 from unirl.rollout.manager import (
     RolloutManager,
     keep_within_lag,
@@ -326,7 +327,7 @@ class AsyncRolloutTrainerMixin:
                 batches_since_sync=self._batches_since_sync + 1,
             )
 
-        scored = self.reward.score_and_attach(completed)
+        scored = score_and_attach(self.reward, completed)
         self._drop_decoded(scored, rollout_id=rollout_id)
 
         if not self._refill_before_score:

@@ -20,7 +20,7 @@ _MEM_PHASE_SPECS: Tuple[Tuple[str, str, str], ...] = (
     ("weight_sync", "push", "ws_push"),
     ("backend", "offload", "offload"),
     ("backend", "onload", "onload"),
-    ("reward", "score_and_attach", "reward"),
+    ("reward", "score", "reward"),
     ("reward_stack", "rollout_and_score", "rollout_score"),
     ("stack", "train_track", "train"),
     ("diffusion.stack", "train_track", "diffusion_train"),
