@@ -1,0 +1,18 @@
+source     = huggingface/diffusers  (https://github.com/huggingface/diffusers)
+commit     = 6256aa7666cedd47443adc8f82da9a10e110b09c
+short      = 6256aa7
+commit_msg = Add Qwen-Image 2.1 (#14804)
+commit_date= 2026-09-18
+vendored   = 2026-09-27  (into unirl/models/qwen_image21/vendor/)
+license    = Apache-2.0 (headers retained)
+
+Files (upstream path -> vendor file):
+  src/diffusers/models/transformers/transformer_qwenimage21.py -> transformer_qwenimage21.py
+  src/diffusers/models/autoencoders/autoencoder_kl_qwenimage21.py -> autoencoder_kl_qwenimage21.py
+
+Only mechanical change: relative imports rewritten to absolute `diffusers.*` imports.
+Every imported diffusers symbol exists at the repo floor (diffusers>=0.37.0).
+
+To remove: once the diffusers floor includes Qwen-Image 2.1 (first release after
+0.40.0), import QwenImage21Transformer2DModel / AutoencoderKLQwenImage21 from
+diffusers in ../bundle.py and delete this directory plus its lint excludes.
