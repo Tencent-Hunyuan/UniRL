@@ -8,6 +8,7 @@ from typing import Any
 _EXPORTS = (
     ("SFT", "sft"),
     ("FlowMatchSFT", "sft"),
+    ("AROPD", "aropd"),
     ("GRPO", "grpo"),
     ("GRPOConfig", "grpo"),
     ("GSPO", "gspo"),

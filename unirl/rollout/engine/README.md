@@ -85,6 +85,16 @@ handler in `../../distributed/weight_sync`.
   trainer, PE, and agentic paths already stamp this. `temperature` / `top_p` /
   `top_k` / `max_new_tokens` are gone from `SGLangEngineConfig` — there is no
   engine-config fallback.
+- **Explicit vLLM-Omni AR seeds use one call per sample.** HI3 and Qwen3-Omni
+  derive each request's seed from `ARSamplingParams.seed` and the AR Part's
+  `sample_id`, using the same `derive_sampling_seed` mapping as SGLang. In
+  vLLM-Omni 0.28, each call shares one sampling-params object per stage across
+  its prompts; splitting preserves per-sample seeds under reordering and
+  sharding, but can reduce throughput because the native backend executes calls
+  sequentially. With `seed=None`, the adapters keep their existing batching and
+  omit the AR seed. Diffusion sampling and x_T recipes are unchanged. This does
+  not assign distinct engine seeds to replicas or guarantee bit-identical GPU
+  outputs across hardware or engine configurations.
 - **vLLM-Omni BAGEL ships the worker's token layout with every row.** `RLBagelPipeline`
   records the KV length, RoPE offset, and canvas in `BagelDiffusionConditions.layouts`,
   and `BagelDiffusionStage._resolve_single` raises when the rebuilt context differs, so

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -25,48 +26,29 @@ class VideoAlignRewardScorer(LocalRewardBackend):
     input_kind = "video"
 
     def __init__(self, *, config: "VideoAlignSpec", base_device: str) -> None:
+        self._spec = config
         super().__init__(
             model_name=self.canonical_model_name,
             device=resolve_device(config.device, base_device),
-            batch_size=int(config.batch_size),
-            reward_model_path=config.reward_model_path,
-            resize_height=config.resize_height,
-            resize_width=config.resize_width,
-            micro_batch_size=config.micro_batch_size,
-            reward_num_frames=config.reward_num_frames,
-            use_norm=config.use_norm,
-            w_vq=config.w_vq,
-            w_mq=config.w_mq,
-            w_ta=config.w_ta,
+            batch_size=config.batch_size,
         )
+
+    def covers_prompt_video(self) -> bool:
+        return self._spec.w_ta > 0.0
 
     def _load_model(self) -> None:
-        reward_model_path = str(self.model_kwargs["reward_model_path"])
-        if not reward_model_path:
-            raise ValueError(
-                "VideoAlignRewardScorer: ``reward_model_path`` must be set "
-                "(the directory containing ``model_config.json`` + the "
-                "``checkpoint-*`` subdir)."
-            )
-
-        self._w_vq = float(self.model_kwargs["w_vq"])
-        self._w_mq = float(self.model_kwargs["w_mq"])
-        self._w_ta = float(self.model_kwargs["w_ta"])
-        self._use_norm = bool(self.model_kwargs["use_norm"])
-        self._reward_num_frames = int(self.model_kwargs["reward_num_frames"])
-
         logger.info(
             "VideoAlignRewardScorer: loading VideoRewardWrapper from %s",
-            reward_model_path,
+            self._spec.reward_model_path,
         )
         self.model = VideoRewardWrapper(
-            checkpoint_dir=reward_model_path,
+            checkpoint_dir=self._spec.reward_model_path,
             device=self.device,
             dtype=torch.bfloat16,
-            use_norm=self._use_norm,
-            resize_height=int(self.model_kwargs["resize_height"]),
-            resize_width=int(self.model_kwargs["resize_width"]),
-            micro_batch_size=int(self.model_kwargs["micro_batch_size"]),
+            use_norm=self._spec.use_norm,
+            resize_height=self._spec.resize_height,
+            resize_width=self._spec.resize_width,
+            micro_batch_size=self._spec.micro_batch_size,
         )
 
     def _compute_model_rewards(self, request: RewardRequest) -> List[float]:
@@ -91,14 +73,14 @@ class VideoAlignRewardScorer(LocalRewardBackend):
             v = v.to(self.device).permute(1, 0, 2, 3).clamp(-1.0, 1.0).contiguous()
             per_sample_videos.append(v)
 
-        if self._reward_num_frames > 0:
+        if self._spec.reward_num_frames > 0:
             ds: List[torch.Tensor] = []
             for v in per_sample_videos:
-                if v.shape[0] > self._reward_num_frames:
+                if v.shape[0] > self._spec.reward_num_frames:
                     idx = torch.linspace(
                         0,
                         v.shape[0] - 1,
-                        self._reward_num_frames,
+                        self._spec.reward_num_frames,
                         device=v.device,
                     ).long()
                     v = v[idx]
@@ -109,17 +91,21 @@ class VideoAlignRewardScorer(LocalRewardBackend):
             scores = self.model.forward_scores(
                 per_sample_videos,
                 prompts,
-                use_norm=self._use_norm,
+                use_norm=self._spec.use_norm,
             )
 
-        reward = self._w_vq * scores["VQ"] + self._w_mq * scores["MQ"] + self._w_ta * scores["TA"]
+        reward = self._spec.w_vq * scores["VQ"] + self._spec.w_mq * scores["MQ"] + self._spec.w_ta * scores["TA"]
         return reward.float()
 
     def offload(self) -> None:
+        if self.model is None:
+            return
         self.model.model.cpu()
         torch.cuda.empty_cache()
 
     def onload(self) -> None:
+        if self.model is None:
+            return
         self.model.model.to(self.device)
 
     def dispose(self) -> None:
@@ -144,6 +130,23 @@ class VideoAlignSpec(BaseRewardComponentSpec):
     w_vq: float = 1.0
     w_mq: float = 1.0
     w_ta: float = 1.0
+
+    def __post_init__(self) -> None:
+        if not self.reward_model_path:
+            raise ValueError(
+                "VideoAlignRewardScorer: ``reward_model_path`` must be set "
+                "(the directory containing ``model_config.json`` + the "
+                "``checkpoint-*`` subdir)."
+            )
+        if self.resize_height <= 0 or self.resize_width <= 0:
+            raise ValueError(
+                f"VideoAlignSpec: resize_height and resize_width must be > 0; "
+                f"got ({self.resize_height}, {self.resize_width})."
+            )
+        if self.micro_batch_size <= 0:
+            raise ValueError(f"VideoAlignSpec: micro_batch_size must be > 0; got {self.micro_batch_size}.")
+        if not (math.isfinite(self.w_vq) and math.isfinite(self.w_mq) and math.isfinite(self.w_ta)):
+            raise ValueError("VideoAlignSpec: w_vq, w_mq, and w_ta must be finite numbers.")
 
 
 __all__ = [
