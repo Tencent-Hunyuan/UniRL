@@ -94,6 +94,47 @@ To save: `++save_interval=100 ++save_dir=checkpoints`. To resume:
 [`unified_model/hi3_vllmomni`](unified_model/hi3_vllmomni.yaml), needs DCP —
 see [Checkpointing](../unirl/trainer/README.md#checkpointing).
 
+## WAN2.1 on-policy distillation
+
+[`diffusion/wan21/wan21_t2v_opd`](diffusion/wan21/wan21_t2v_opd.yaml) trains a
+LoRA student at CFG 1 against an independent, frozen full-model teacher at CFG 6.
+Both load `Wan-AI/Wan2.1-T2V-1.3B-Diffusers`; the teacher loads only the
+transformer and parks it on CPU between replays. The synchronous train-side
+engine generates student trajectories, and `FullModelTeacherProvider` replays
+those same transitions. No reward model is required; `eval_interval` stays 0.
+
+Use a complete local Diffusers checkpoint, including the transformer, UMT5,
+tokenizer, and VAE. Keep the checkpoint files and configuration identical when
+resuming; the student's checkpoint excludes the full teacher. `DATA_PATH` may
+point to a fixed prompt subset with at least `batch_size` rows.
+
+The recipe defaults to two GPUs. `num_devices` also sets the single-node device
+count and prompt batch size; use `num_devices=1` for a single-GPU run.
+
+```bash
+PRETRAINED_MODEL=/path/to/Wan2.1-T2V-1.3B-Diffusers \
+DATA_PATH=/path/to/prompts.txt \
+GPUS_PER_NODE=2 \
+  bash examples/run_experiment_single_node.sh diffusion/wan21/wan21_t2v_opd \
+  num_devices=2
+```
+
+The recipe uses 256×256, 5-frame videos and four sampling steps, with three
+replayed transitions. It keeps one sample per prompt and one optimizer update
+per rollout. `eta=1e-6` enables the existing stochastic replay contract while
+`add_kl_coefficient=false` matches transition means without dividing by the tiny
+variance. Since CFG 1 does not encode negative text, the teacher uses WAN's
+existing zero-embedding fallback; this differs from encoding an empty string.
+
+Keep `backend.fsdp_cfg.cast_forward_inputs=false`: WAN passes fp32 timesteps
+to its transformer. Casting them to bf16 at the student FSDP root changes the
+time embedding relative to the unwrapped teacher, even with a zero LoRA adapter.
+
+The recipe uses the existing DCP format for sharded adapter and optimizer state.
+`D4_SAVE_DIR` selects the checkpoint directory; `++load_dir=<checkpoint-dir>`
+restores the student and optimizer. `num_rollouts` is the total rollout budget,
+including steps already completed before the checkpoint.
+
 ## WAN2.1 UCF-101 full-transformer SFT
 
 [`sft/wan21_t2v_ucf101_full`](sft/wan21_t2v_ucf101_full.yaml) performs full
