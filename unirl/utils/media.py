@@ -7,6 +7,18 @@ from typing import Any, List
 import torch
 
 
+def normalize_waveform(audio: torch.Tensor) -> torch.Tensor:
+    """Normalize ``[L]``, ``[C, L]``, or ``[L, C]`` audio to channel-last ``[L, C]`` clamped to ``[-1, 1]``."""
+    samples = audio.detach().float().cpu()
+    if samples.ndim == 1:
+        samples = samples.unsqueeze(1)
+    elif samples.ndim == 2 and samples.shape[0] in (1, 2):
+        samples = samples.T
+    elif samples.ndim != 2 or samples.shape[1] not in (1, 2):
+        raise ValueError(f"Expected mono/stereo audio shaped [L], [C, L], or [L, C], got {tuple(samples.shape)}")
+    return torch.clamp(samples, -1.0, 1.0)
+
+
 def tensor_frame_to_pil(frame: torch.Tensor) -> Any:
     """Convert one CHW image tensor to a PIL image."""
     from PIL import Image
@@ -51,4 +63,4 @@ def hstack_pils(left: Any, right: Any) -> Any:
     return canvas
 
 
-__all__ = ["tensor_frame_to_pil", "tensor_to_pil", "hstack_pils"]
+__all__ = ["normalize_waveform", "tensor_frame_to_pil", "tensor_to_pil", "hstack_pils"]

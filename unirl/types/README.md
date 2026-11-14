@@ -179,3 +179,37 @@ Those decoded modality keys remain the contract for **condition** media
 `build_omni_messages` (`unirl/models/qwen3_omni/media.py`) accepts `MediaRefs`
 prompt media only; waveform `Audios` and decoded frame `Videos` / `Images` are
 rejected for Omni prompts.
+
+## Sample observation records
+
+`build_sample_records` selects at most `max_items` generated rows and takes their
+prompts and ancestor context from `Sample.conditioning()` over the parts up to
+`part_index`. It leaves training
+conditions and segments unchanged. Rewards and selected media move to the driver;
+TensorRef block boundaries can materialize additional rows beyond the record cap.
+
+`dump_sample_records` writes one JSONL index with relative PNG, MP4 and WAV paths
+per phase and step. Repeating a phase and step replaces the index and the media
+files it had written. Video uses 8 frames/s; audio requires a positive
+`primitive_metadata["audio"]["sample_rate"]`.
+`UniRLWandBLogger.log_sample_records` consumes the same records, logging an image and
+a video panel over the rows carrying each, with a row's audio muxed into its video, an
+audio panel for rows that carry only audio, and one lineage table per track.
+Both sinks warn on output failures instead of interrupting training.
+
+### Gotchas
+
+Each record is decoded and serialized before any of its files is created, and files
+already written for a record are removed when a later modality fails, so a skipped
+record leaves no media behind. A step's media are written before its index, and media
+the new index no longer names are removed only after the index is replaced. A failure
+or lost process before that point keeps the previous index, which can then name files
+the new run already overwrote or, after a failed index write, removed; rerunning the
+same phase and step rewrites both.
+
+`log_sample_records` serializes `context_texts`, `component_rewards` and `metadata`
+into the table as JSON strings, because `wandb.Table` infers one schema from the
+first row and rejects later rows whose keys differ. Audio without a sample rate is
+warned about and dropped, including audio attached to a video row. In `dump_sample_records` a
+record whose media cannot be written is warned about by its `{track}_{index}` stem
+and skipped, and the remaining rows still reach the index.
