@@ -40,7 +40,27 @@ def _iter_rollout_tensors(
     unpack_qwen_moe: bool = False,
     moe_intermediate: int | None = None,
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    """Yield rollout-compatible full tensors, streaming packed MoE experts."""
+    """Materialize canonical tensor views, streaming packed MoE experts."""
+    packed = (
+        unpack_qwen_moe and tensor.ndim == 3 and name.endswith((".mlp.experts.gate_up_proj", ".mlp.experts.down_proj"))
+    )
+    if packed:
+        tensor, dtype = _prepare_qwen_moe_dtensor(tensor, dtype)
+    for out_name, view in _iter_rollout_tensor_views(
+        name, tensor, unpack_qwen_moe=unpack_qwen_moe, moe_intermediate=moe_intermediate
+    ):
+        full = _to_full_tensor(view, dtype)
+        yield out_name, full.contiguous() if packed else full
+
+
+def _iter_rollout_tensor_views(
+    name: str,
+    tensor: torch.Tensor,
+    *,
+    unpack_qwen_moe: bool = False,
+    moe_intermediate: int | None = None,
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Yield canonical names and tensor views without gathering or moving storage."""
     if unpack_qwen_moe and tensor.ndim == 3 and name.endswith(".mlp.experts.gate_up_proj"):
         if tensor.shape[1] % 2 != 0 or (moe_intermediate is not None and tensor.shape[1] != 2 * moe_intermediate):
             expected = f"2 * moe_intermediate_size = {2 * moe_intermediate}" if moe_intermediate else "even"
@@ -49,18 +69,17 @@ def _iter_rollout_tensors(
                 f"but dim 1 must be {expected} for the [E, 2*I, H] layout this splitter assumes — "
                 "the packed expert layout may have changed."
             )
-        tensor, dtype = _prepare_qwen_moe_dtensor(tensor, dtype)
         base = name.removesuffix(".gate_up_proj")
         split = tensor.shape[1] // 2
         for expert_id in range(tensor.shape[0]):
             expert = tensor[expert_id]
             yield (
                 f"{base}.{expert_id}.gate_proj.weight",
-                _to_full_tensor(expert[:split], dtype).contiguous(),
+                expert[:split],
             )
             yield (
                 f"{base}.{expert_id}.up_proj.weight",
-                _to_full_tensor(expert[split:], dtype).contiguous(),
+                expert[split:],
             )
         return
 
@@ -71,16 +90,15 @@ def _iter_rollout_tensors(
                 f"but dim 2 must be moe_intermediate_size = {moe_intermediate} for the [E, H, I] "
                 "layout this exporter assumes — the packed expert layout may have changed."
             )
-        tensor, dtype = _prepare_qwen_moe_dtensor(tensor, dtype)
         base = name.removesuffix(".down_proj")
         for expert_id in range(tensor.shape[0]):
             yield (
                 f"{base}.{expert_id}.down_proj.weight",
-                _to_full_tensor(tensor[expert_id], dtype).contiguous(),
+                tensor[expert_id],
             )
         return
 
-    yield name, _to_full_tensor(tensor, dtype)
+    yield name, tensor
 
 
 def _prepare_qwen_moe_dtensor(
@@ -118,6 +136,29 @@ def _moe_intermediate_size(model: torch.nn.Module) -> int | None:
     return None
 
 
+def _base_state_dict(model: torch.nn.Module) -> Iterator[tuple[str, torch.Tensor]]:
+    """Filter shared output embeddings consistently for metadata and tensor export."""
+    skip_lm_head = bool(getattr(getattr(model, "config", None), "tie_word_embeddings", False))
+    for name, tensor in model.state_dict().items():
+        if not (skip_lm_head and name == "lm_head.weight"):
+            yield name, tensor
+
+
+def raw_state_dict_metadata(
+    model: torch.nn.Module,
+    dtype: torch.dtype | None = None,
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Yield canonical full-weight metadata as meta tensors without device work or collectives."""
+    if hasattr(model, "peft_config"):
+        raise NotImplementedError("raw_state_dict_metadata supports full fine-tuning only")
+    unpack = _unpack_qwen_moe(model)
+    intermediate = _moe_intermediate_size(model) if unpack else None
+    for name, tensor in _base_state_dict(model):
+        wire_dtype = dtype if dtype is not None and tensor.is_floating_point() else tensor.dtype
+        metadata = torch.empty(tensor.shape, dtype=wire_dtype, device="meta")
+        yield from _iter_rollout_tensor_views(name, metadata, unpack_qwen_moe=unpack, moe_intermediate=intermediate)
+
+
 def merged_state_dict(
     model: torch.nn.Module,
     adapter_name: str = "default",
@@ -134,9 +175,7 @@ def merged_state_dict(
         return t
 
     if not hasattr(model, "peft_config"):
-        for name, param in model.state_dict().items():
-            if skip_lm_head and name == "lm_head.weight":
-                continue
+        for name, param in _base_state_dict(model):
             yield from _iter_rollout_tensors(
                 name, param, dtype, unpack_qwen_moe=unpack_qwen_moe, moe_intermediate=moe_intermediate
             )
@@ -241,9 +280,7 @@ def raw_state_dict(
     moe_intermediate = _moe_intermediate_size(model) if unpack_qwen_moe else None
     skip_lm_head = bool(getattr(getattr(model, "config", None), "tie_word_embeddings", False))
     if not hasattr(model, "peft_config"):
-        for name, param in model.state_dict().items():
-            if skip_lm_head and name == "lm_head.weight":
-                continue
+        for name, param in _base_state_dict(model):
             yield from _iter_rollout_tensors(
                 name, param, dtype, unpack_qwen_moe=unpack_qwen_moe, moe_intermediate=moe_intermediate
             )

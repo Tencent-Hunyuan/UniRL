@@ -208,6 +208,9 @@ class BucketedIPCReceiveMixin:
         )
 
         parameter_module = self.unirl_target_module()
+        resolve_parameter = getattr(parameter_module, "unirl_parameter_for_verification", None)
+        if names and callable(resolve_parameter):
+            return {name: fingerprint_tensor(resolve_parameter(name)) for name in names}
         target = set(names) if names else None
         out: dict = {}
         for name, p in parameter_module.named_parameters():

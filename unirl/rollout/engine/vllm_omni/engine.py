@@ -25,6 +25,7 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
     """Rollout engine backed by vllm-omni's ``Omni`` orchestrator (v2 layout)."""
 
     _component_name = "vllm_omni"
+    rank_local_weight_transfer = True
 
     def __init__(
         self,
@@ -77,6 +78,16 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
             self.backend,
             lora_copy_transport=self.adapter.lora_copy_transport,
         )
+
+    @property
+    def supports_native_weight_transfer(self) -> bool:
+        """Expose native WTE only when the deployed Omni stages enable it."""
+        return bool(self.backend.supports_native_weight_transfer)
+
+    @property
+    def native_weight_transfer_requested(self) -> bool:
+        """Expose whether the deploy config explicitly asks for native WTE."""
+        return bool(self.backend.native_weight_transfer_requested)
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
     def generate(self, sample: Sample) -> Sample:
@@ -201,6 +212,47 @@ class VLLMOmniRolloutEngine(BaseRolloutEngine):
     def tp_per_stage(self) -> Dict[int, int]:
         """``{stage_id: tensor_parallel_size}`` per stage (parsed from the"""
         return self.backend.tp_per_stage()
+
+    @property
+    def weight_payload_fanout(self) -> int:
+        return self.backend.weight_payload_fanout
+
+    @property
+    def ipc_worker_device_uuids(self) -> List[str]:
+        return self.backend.ipc_worker_device_uuids
+
+    def init_native_weight_transfer(self, *, init_info: Dict[str, Any]) -> None:
+        self.backend.init_native_weight_transfer(init_info=init_info)
+
+    def start_native_weight_update(self, *, header: Dict[str, Any]) -> None:
+        self.backend.start_native_weight_update(header=header)
+
+    def update_native_weights(self, *, update_info: Dict[str, Any]) -> None:
+        self.backend.update_native_weights(update_info=update_info)
+
+    def finish_native_weight_update(
+        self,
+        *,
+        header: Dict[str, Any],
+        flush_cache: bool,
+        weight_version: Optional[str] = None,
+    ) -> Optional[dict]:
+        return self.backend.finish_native_weight_update(
+            header=header,
+            flush_cache=flush_cache,
+            weight_version=weight_version,
+        )
+
+    def param_checksums(self, *, names: List[str]) -> dict:
+        """Read back loaded parameter fingerprints from native Omni workers."""
+        return self.backend.param_checksums(names=list(names))
+
+    def release_native_ipc(self) -> None:
+        self.backend.release_native_ipc()
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def poison(self, reason: str = "") -> None:
+        self.backend.poison_native_weight_transfer(reason)
 
     def update_weights_from_ipc(
         self,
