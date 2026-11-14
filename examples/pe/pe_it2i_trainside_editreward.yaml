@@ -21,8 +21,10 @@
 # own GPU, see unirl-reward-service/configs/editreward_service.yaml). Optional
 # overrides: QWEN_VL_PATH, QWEN_IMAGE_EDIT_PLUS_PATH.
 #
-# Validated as written on 1x H200 (peak 130 GB used) for 2 rollouts, with the scorer
-# on a separate L40S. Multi-GPU and training efficacy are not validated.
+# Validated as written on 1x H200 for 2 rollouts, with the scorer on a separate L40S.
+# The card is essentially full (142 GB used with full-length rewrites); lower
+# sampling.diffusion.samples_per_prompt or use a larger GPU for headroom.
+# Multi-GPU and training efficacy are not validated.
 
 num_devices: 1
 batch_size: 1                 # P prompts per rollout; PEPipeline fans out to P*N*M
