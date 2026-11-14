@@ -23,6 +23,7 @@ from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_s
 from unirl.trainer.eval_suites import build_eval_suites
 from unirl.trainer.hydra import parse_hydra_cfg, remote_hydra
 from unirl.types.sample import Sample
+from unirl.types.sample_id import parent_id
 from unirl.types.sampling import ARSamplingParams, BaseSamplingParams, DiffusionSamplingParams
 
 logger = logging.getLogger(__name__)
@@ -180,7 +181,12 @@ class PETrainer(BaseTrainer):
         if self._takes_pipeline and len(inputs.parts) == 2 and set(inputs.parts[1].primitives) == {"image"}:
             # PEPipeline reads the source image off the root; the composed engine cannot carry one.
             root, source = inputs.parts
-            inputs = Sample.request(dataclasses.replace(root, primitives={**root.primitives, **source.primitives}))
+            parents = [parent_id(sid) for sid in source.sample_ids]
+            if sorted(parents) != sorted(root.sample_ids):
+                raise ValueError("PETrainer: each prompt needs exactly one source image row.")
+            row = {pid: k for k, pid in enumerate(parents)}
+            image = source.primitives["image"].select([row[sid] for sid in root.sample_ids])  # [P]
+            inputs = Sample.request(dataclasses.replace(root, primitives={**root.primitives, "image": image}))
         request = prepare_input_sample(
             inputs,
             rollout_id,
