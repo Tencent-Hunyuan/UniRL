@@ -17,6 +17,7 @@ from omegaconf import DictConfig
 from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
 from unirl.distributed.tensor.ref import map_tree
+from unirl.reward.service import score_and_attach
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample
 from unirl.trainer.eval_suites import build_eval_suites
@@ -404,19 +405,14 @@ class UnifiedModelTrainer(BaseTrainer):
         ar_idx = sample.gen_part_index(ARSamplingParams)
         img_idx = sample.gen_part_index(DiffusionSamplingParams)
 
-        sample = self.reward.score_and_attach(sample)
-        img_part = sample.parts[img_idx]
-        if img_part.rewards is not None:
-            img_part.rewards = hydrate(img_part.rewards)
-        if isinstance(img_part.component_rewards, dict):
-            img_part.component_rewards = {name: hydrate(value) for name, value in img_part.component_rewards.items()}
+        sample = score_and_attach(self.reward, sample)
 
         sample = sample.propagate_rewards(op="mean")
 
         mean_reward = 0.0
         di_rewards = sample.parts[img_idx].rewards
         if di_rewards is not None:
-            mean_reward = float(hydrate(di_rewards).to(torch.float32).mean().item())
+            mean_reward = float(di_rewards.to(torch.float32).mean().item())
 
         if self.dump_dir:
             self._dump_rollout(self._dump_rollout_id, sample)
@@ -474,7 +470,7 @@ class UnifiedModelTrainer(BaseTrainer):
 
             rewards = None
             if image_part is not None and image_part.rewards is not None:
-                rewards = hydrate(image_part.rewards).to(torch.float32).tolist()
+                rewards = image_part.rewards.to(torch.float32).tolist()
 
             n_imgs = 0
             if isinstance(img_decoded, Images):
@@ -581,10 +577,10 @@ class UnifiedModelTrainer(BaseTrainer):
                     for eng in self.ar_rollouts + self.dit_rollouts:
                         eng.sleep()
             for name, reward in scorers:
-                scored = reward.score_and_attach(generated)
+                scored = score_and_attach(reward, generated)
                 rewards = scored.parts[-1].rewards
                 if rewards is not None:
-                    r = hydrate(rewards).to(torch.float32)
+                    r = rewards.to(torch.float32)
                     sums[name] += float(r.sum().item())
                     counts[name] += int(r.numel())
         return {name: sums[name] / max(1, counts[name]) for name, _ in scorers}

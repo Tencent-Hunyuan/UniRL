@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Tuple
 
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
+from unirl.reward.service import score_and_attach
 from unirl.types.sample import Part, Sample
 from unirl.utils.memory_utils import aggressive_empty_cache
 
@@ -103,7 +104,7 @@ class RewardStack(Remote):
 
     def _score(self, generated: Sample) -> Sample:
         t0 = time.perf_counter()
-        scored = self.reward.score_and_attach(generated)
+        scored = score_and_attach(self.reward, generated)
         self._score_s += time.perf_counter() - t0
         return scored
 

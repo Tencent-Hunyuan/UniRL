@@ -14,7 +14,7 @@ from omegaconf import DictConfig
 
 from unirl.config.validation import validate_memory_saver_contract
 from unirl.distributed.group.placement import placement, remote
-from unirl.distributed.tensor import hydrate
+from unirl.reward.service import score_and_attach
 from unirl.rollout.manager import RolloutManager, required_worker_concurrency, validate_worker_inflight
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import (
@@ -267,11 +267,11 @@ class AgenticTrainer(BaseTrainer):
             .fork(1, sampling_params=ar_sampling)
             .with_filled_frontier(primitives={"text": Texts(texts=predictions)})
         )
-        scored = self.reward.score_and_attach(scoring)
+        scored = score_and_attach(self.reward, scoring)
         scored_rewards = scored.parts[-1].rewards
         if scored_rewards is None:
             raise RuntimeError("reward service returned no rewards")
-        values = hydrate(scored_rewards).to(torch.float32).flatten()
+        values = scored_rewards.to(torch.float32).flatten()
         if values.numel() != score_count + score_padding:
             raise RuntimeError(
                 f"reward service returned {values.numel()} rewards for {score_count + score_padding} scoring rows"
