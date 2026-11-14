@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import logging
 from collections import Counter, defaultdict
+from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence
 
 from unirl.rollout.manager.buffers import CompleteGroups, PendingGroups, roots_of
-from unirl.rollout.manager.dispatch import RolloutPool
+from unirl.rollout.manager.dispatch import PoolSnapshot, RolloutPool
 from unirl.rollout.manager.filters import RolloutFilter, identity, validate_filter_output
 
 if TYPE_CHECKING:
@@ -15,6 +16,26 @@ if TYPE_CHECKING:
     from unirl.types.sample import Sample
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class RolloutCounters:
+    """Event counts: cumulative in snapshots, differences from drain_metrics; see ../README.md."""
+
+    launched_tasks: int = 0
+    completed_tasks: int = 0
+    dropped_groups: int = 0
+    carried_tasks: int = 0
+    finished_tasks: int = 0
+
+
+@dataclass(frozen=True)
+class RolloutSnapshot:
+    pool: PoolSnapshot
+    ready_groups: int
+    pending_roots: int
+    oldest_ready_output_version: Optional[int]
+    counters: RolloutCounters
 
 
 class RolloutManager:
@@ -38,6 +59,10 @@ class RolloutManager:
         self._published_version = 0
         self._failure: Optional[BaseException] = None
         self._closed = False
+        self._dropped_groups_total = 0
+        self._carried_tasks_total = 0
+        self._finished_tasks_total = 0
+        self._metrics_baseline = RolloutCounters()
 
     def submit(self, tasks: List["Sample"]) -> None:
         self._ensure_open()
@@ -101,6 +126,7 @@ class RolloutManager:
                         len(tails),
                         discarded,
                     )
+            self._carried_tasks_total += len(carried)
             return carried
         except BaseException as exc:
             self._poison(exc)
@@ -117,6 +143,7 @@ class RolloutManager:
             completed = self._resolve(self._pool.run_to_completion(list(tasks)))
             self._route(completed, allow_suspended=False)
             self._filter_complete(current_version)
+            self._finished_tasks_total += len(tasks)
         except BaseException as exc:
             self._poison(exc)
             raise
@@ -149,6 +176,36 @@ class RolloutManager:
         self._raise_if_failed()
         inflight_count, completed_count = self._pool.counts
         return inflight_count, completed_count + self._complete.group_count
+
+    def snapshot(self) -> RolloutSnapshot:
+        """Read local state between driver operations without consuming counters; see ../README.md."""
+        self._ensure_open()
+        pool = self._pool.snapshot()
+        return RolloutSnapshot(
+            pool=pool,
+            ready_groups=self._complete.group_count,
+            pending_roots=len(self._pending),
+            oldest_ready_output_version=self._complete.oldest_output_version,
+            counters=RolloutCounters(
+                launched_tasks=pool.launched_tasks_total,
+                completed_tasks=pool.completed_tasks_total,
+                dropped_groups=self._dropped_groups_total,
+                carried_tasks=self._carried_tasks_total,
+                finished_tasks=self._finished_tasks_total,
+            ),
+        )
+
+    def drain_metrics(self) -> tuple[RolloutSnapshot, RolloutCounters]:
+        """Read a snapshot and advance the single driver's delta baseline; see ../README.md."""
+        snapshot = self.snapshot()
+        delta = RolloutCounters(
+            **{
+                field.name: getattr(snapshot.counters, field.name) - getattr(self._metrics_baseline, field.name)
+                for field in fields(RolloutCounters)
+            }
+        )
+        self._metrics_baseline = snapshot.counters
+        return snapshot, delta
 
     @property
     def empty(self) -> bool:
@@ -208,6 +265,7 @@ class RolloutManager:
         before = self._complete.group_count
         self._complete.filter(lambda samples: self._apply_filter(samples, current_version=current_version))
         dropped = before - self._complete.group_count
+        self._dropped_groups_total += dropped
         if dropped:
             logger.warning(
                 "rollout filter dropped %d/%d buffered rollout group(s) at version %d",
@@ -250,4 +308,4 @@ class RolloutManager:
             raise RuntimeError("RolloutManager is closed")
 
 
-__all__ = ["RolloutManager"]
+__all__ = ["RolloutCounters", "RolloutManager", "RolloutSnapshot"]
