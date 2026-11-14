@@ -89,6 +89,16 @@ def _ref_aligned_prefix_len(decoded: Any, min_items: int) -> int:
     return total
 
 
+def _hydrate_prefix(batch: Any, limit: int) -> Any:
+    """Hydrate the shortest TensorRef-aligned prefix of ``batch`` covering ``limit`` rows."""
+    from unirl.distributed.tensor import hydrate, map_tree
+
+    prefix = _ref_aligned_prefix_len(batch, limit)
+    if 0 < prefix < len(batch):
+        batch = batch.slice(0, prefix)
+    return map_tree(batch, hydrate)
+
+
 def build_media_preview_for_part(
     *,
     part: "Part",
@@ -106,12 +116,7 @@ def build_media_preview_for_part(
         return None
     limit = max(1, int(max_items))
 
-    from unirl.distributed.tensor import hydrate, map_tree
-
-    prefix = _ref_aligned_prefix_len(decoded, limit)
-    if 0 < prefix < len(decoded):
-        decoded = decoded.slice(0, prefix)
-    decoded = map_tree(decoded, hydrate)
+    decoded = _hydrate_prefix(decoded, limit)
 
     prompt_texts: List[str] = [str(p) for p in prompts] if prompts is not None else []
     rewards_flat: List[float] = []
@@ -130,8 +135,7 @@ def build_media_preview_for_part(
             return None
         input_pixels: Optional[List[Any]] = None
         if isinstance(input_image, Images):
-            input_prefix = _ref_aligned_prefix_len(input_image, limit)
-            input_image = map_tree(input_image.slice(0, input_prefix), hydrate)
+            input_image = _hydrate_prefix(input_image, limit)
             input_pixels = [image.pixels for image in input_image.to_list()]
         show_edit_pairs = input_pixels is not None and len(input_pixels) >= len(per_sample)
         for idx, image in enumerate(per_sample):
@@ -165,8 +169,7 @@ def build_media_preview_for_part(
         if isinstance(decoded, Audios):
             decoded_audio = decoded
         else:
-            audio_prefix = _ref_aligned_prefix_len(decoded_audio, limit)
-            decoded_audio = map_tree(decoded_audio.slice(0, audio_prefix), hydrate)
+            decoded_audio = _hydrate_prefix(decoded_audio, limit)
         audio_list = decoded_audio.to_list()
         for idx in selected_indices:
             if idx < len(audio_list):

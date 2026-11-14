@@ -101,13 +101,13 @@ def dump_sample_records(root: str, records: List[SampleRecord]) -> None:
                 continue
             written.extend(record_files)
             rows.append(row)
+        staged = directory / ".samples.jsonl"
+        staged.write_text("".join(f"{row}\n" for row in rows), encoding="utf-8")
+        os.replace(staged, directory / "samples.jsonl")
         fresh = {path.name for path in written}
         for stale in directory.iterdir():
             if stale.suffix in (".png", ".mp4", ".wav") and stale.name not in fresh:
                 stale.unlink()
-        staged = directory / ".samples.jsonl"
-        staged.write_text("".join(f"{row}\n" for row in rows), encoding="utf-8")
-        os.replace(staged, directory / "samples.jsonl")
     except Exception as exc:
         for path in written:
             path.unlink(missing_ok=True)

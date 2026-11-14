@@ -550,7 +550,7 @@ class UniRLWandBLogger:
             preview = MediaPreview(
                 prompts=[row.prompt or "" for row in selected],
                 rewards=[row.reward if row.reward is not None else 0.0 for row in selected],
-                audios=[row.media.audio for row in selected],
+                audios=[row.media.audio if row.media.audio_sample_rate is not None else None for row in selected],
                 audio_sample_rate=next(
                     (row.media.audio_sample_rate for row in selected if row.media.audio_sample_rate is not None),
                     None,

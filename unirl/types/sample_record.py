@@ -15,7 +15,7 @@ from unirl.types.sampling import ARSamplingParams
 
 @dataclass
 class MediaItem:
-    """One driver-resident image, video [C, T, H, W], or audio [L] / [C, L]."""
+    """One driver-resident image, video [C, T, H, W], or audio [L] / [C, L] / [L, C]."""
 
     image: Optional[Any] = None
     video: Optional[Any] = None
