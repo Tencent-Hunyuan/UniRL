@@ -191,4 +191,6 @@ TensorRef block boundaries can materialize additional rows beyond the record cap
 per phase and step. Repeating a phase and step replaces its index. Video uses
 8 frames/s; audio requires `primitive_metadata["audio"]["sample_rate"]`.
 `UniRLWandBLogger.log_sample_records` consumes the same records for media panels
-and sample tables. Both sinks warn on output failures.
+and sample tables. Both sinks warn on output failures. In `dump_sample_records` a
+record whose media cannot be written is warned about by its `{track}_{index}` stem
+and skipped, and the remaining rows still reach the index.
