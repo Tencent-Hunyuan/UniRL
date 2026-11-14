@@ -14,7 +14,7 @@ from .base import LocalRewardBackend
 _ANSWER_TAG = re.compile(r"<answer>\s*([A-D])\s*</answer>", re.IGNORECASE)
 
 _ANSWER_PATTERN = re.compile(
-    r"(?:(?:answer|option)\s*(?:is|:)\s*)[\(\[]?\s*([A-D])\s*[\)\]]?",
+    r"(?:(?:answer|option)\s*(?:is|:)\s*)[\(\[]?\s*([A-D])\b\s*[\)\]]?",
     re.IGNORECASE,
 )
 
