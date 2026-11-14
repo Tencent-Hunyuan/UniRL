@@ -6,8 +6,11 @@ from dataclasses import dataclass, replace
 from functools import cached_property
 from typing import TYPE_CHECKING, List, Mapping, Sequence, Tuple
 
+import torch
+
 from unirl.algorithms.base import AlgorithmStepResult
 from unirl.distributed.group.remote import Remote
+from unirl.types.segments import TextSegment
 from unirl.utils.metrics import aggregate_numeric_metrics
 
 if TYPE_CHECKING:
@@ -102,8 +105,10 @@ class BaseTrainStack(Remote):
         """Delegate the rollout boundary to the backend's EMA."""
         self.fsdp_backend.on_rollout_end()
 
-    def _align_track_inputs(self, part: Part) -> None:
+    def _align_track_inputs(self, part: Part, *, training: bool = False) -> None:
         """Move the segment, conditions, and advantages to the training device; media payloads stay on the host."""
+        if training and isinstance(part.segment, TextSegment):
+            _pad_empty_ar_rows(part.segment)
         device = self.fsdp_backend._device
         if part.segment is not None:
             part.segment = part.segment.to_device(device)
@@ -121,3 +126,26 @@ class BaseTrainStack(Remote):
     def _current_lr(self) -> float:
         """Learning rate of the optimizer's first param group."""
         return self.fsdp_backend.optimizer.param_groups[0]["lr"]
+
+
+def _pad_empty_ar_rows(segment: TextSegment) -> None:
+    """Insert loss-masked token 0 in empty rows for FSDP lockstep; see ``../readme.md`` Gotchas."""
+    if segment.tokens is None or segment.cu_seqlens is None:
+        return
+    lengths = segment.lengths.tolist()
+    if 0 not in lengths:
+        return
+    if segment.loss_mask is None:
+        segment.loss_mask = torch.ones_like(segment.tokens, dtype=torch.float32)
+    for name in ("tokens", "log_probs", "rollout_log_probs", "loss_mask", "values", "returns", "token_advantages"):
+        value = getattr(segment, name)
+        if value is not None:
+            rows = value.split(lengths)
+            setattr(
+                segment,
+                name,
+                torch.cat([row if n else value.new_zeros((1, *value.shape[1:])) for row, n in zip(rows, lengths)]),
+            )
+    cu = segment.cu_seqlens
+    padded_lengths = cu.new_tensor([max(n, 1) for n in lengths])
+    segment._packed_cu_seqlens = torch.nn.functional.pad(padded_lengths.cumsum(0, dtype=cu.dtype), (1, 0))

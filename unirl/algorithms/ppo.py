@@ -225,7 +225,8 @@ class PPO(StageAlgorithm):
                 )
         active_count = int(active.sum().item())
         if active_count == 0:
-            return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
+            ((new_logp.sum() + new_values.sum()) * 0.0).backward()
+            return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=True)
 
         clip_range = resolve_clip_range_from_schedule(self.clip_range, self.clip_schedule, training_progress)
         clip_high = (
