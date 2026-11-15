@@ -148,9 +148,10 @@ class ComposedRolloutEngine(BaseRolloutEngine):
             self.ar.wake_up()
             self.diffusion.sleep()
 
+            source = input_part.primitives.get("image")
             ar_input = Part.input(
                 sample_ids=list(input_part.sample_ids),
-                primitives={"text": text_primitive},
+                primitives={"text": text_primitive} if source is None else {"text": text_primitive, "image": source},
                 control=ar_child_control(input_part.control, system_instruction=self.cfg.pe_instruction),
             )
             ar_out = self.ar.generate(Sample(parts=[ar_input, ar_shell]))
@@ -190,10 +191,10 @@ class ComposedRolloutEngine(BaseRolloutEngine):
             self.diffusion.wake_up()
 
             # Re-root diffusion prompts because composed PE IDs are not valid child roots.
-            pe_input = Part.input(
-                sample_ids=[f"pe{k}" for k in range(P * N)],
-                primitives={"text": pe_texts},
-            )
+            pe_primitives = {"text": pe_texts}
+            if source is not None:
+                pe_primitives["image"] = source.select(torch.arange(P).repeat_interleave(N))  # [P*N]
+            pe_input = Part.input(sample_ids=[f"pe{k}" for k in range(P * N)], primitives=pe_primitives)
             diff_child_shell = pe_input.fork(
                 M,
                 sampling_params=diffusion_shell.sampling_params,
